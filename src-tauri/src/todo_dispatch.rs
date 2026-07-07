@@ -10818,6 +10818,7 @@ mod todo_dispatch_backend_tests {
             turn_status: "completed".to_string(),
             session_state: "session_attached".to_string(),
             input_ready,
+            background_work_active: false,
             input_ready_at: input_ready.then(|| "2026-06-19T00:00:00Z".to_string()),
             prompt_ready_at: None,
             completed_at: None,

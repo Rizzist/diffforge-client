@@ -19,6 +19,7 @@ import { Description } from "@styled-icons/material-rounded/Description";
 import { Draw } from "@styled-icons/material-rounded/Draw";
 import { DragIndicator } from "@styled-icons/material-rounded/DragIndicator";
 import { DarkMode } from "@styled-icons/material-rounded/DarkMode";
+import { Edit } from "@styled-icons/material-rounded/Edit";
 import { ErrorOutline } from "@styled-icons/material-rounded/ErrorOutline";
 import { ExpandMore } from "@styled-icons/material-rounded/ExpandMore";
 import { FolderOpen } from "@styled-icons/material-rounded/FolderOpen";
@@ -21066,7 +21067,8 @@ export const SettingsPage = styled.section`
 
 export const SettingsTabNav = styled.nav`
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
   gap: 6px;
   width: min(100%, 620px);
   padding: 4px;
@@ -22772,6 +22774,10 @@ export const ButtonCloseIcon = styled(Close)`
 `;
 
 export const ButtonCopyIcon = styled(ContentCopy)`
+  ${buttonIconSize}
+`;
+
+export const ButtonEditIcon = styled(Edit)`
   ${buttonIconSize}
 `;
 

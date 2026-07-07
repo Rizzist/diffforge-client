@@ -8435,47 +8435,6 @@ const TodoQueueStatusPill = styled.span`
   }
 `;
 
-const TodoQueueRecoverActions = styled.div`
-  display: inline-flex;
-  width: max-content;
-  max-width: 100%;
-  align-items: center;
-  gap: 4px;
-`;
-
-const TodoQueueRecoverButton = styled.button`
-  display: inline-grid;
-  width: 23px;
-  height: 23px;
-  place-items: center;
-  padding: 0;
-  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.28);
-  border-radius: 7px;
-  color: #e8eef8;
-  background: rgba(255, 255, 255, 0.06);
-  cursor: pointer;
-
-  svg {
-    width: 14px;
-    height: 14px;
-  }
-
-  &:hover {
-    border-color: rgba(var(--forge-tint-rgb), 0.55);
-    background: rgba(var(--forge-tint-rgb), 0.16);
-  }
-
-  &:focus-visible {
-    outline: 2px solid rgba(var(--forge-tint-rgb), 0.72);
-    outline-offset: 2px;
-  }
-
-  html[data-forge-theme="light"] & {
-    color: #1d1d1f;
-    background: rgba(0, 0, 0, 0.04);
-  }
-`;
-
 const TodoQueueDispatchSelectWrap = styled.div`
   position: absolute;
   top: 6px;
@@ -20506,24 +20465,6 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     commitItemEdit();
   }, [clearItemEdit, commitItemEdit]);
 
-  const handleRecoverableRedo = useCallback((event, item) => {
-    event.preventDefault();
-    event.stopPropagation();
-    if (!todoSelectionEditable || !item?.id || pendingItems[item.id]) {
-      return;
-    }
-    onQueueItem?.(item.id, item);
-  }, [onQueueItem, pendingItems, todoSelectionEditable]);
-
-  const handleRecoverableEditAndSend = useCallback((event, item) => {
-    event.preventDefault();
-    event.stopPropagation();
-    if (!todoSelectionEditable || !item?.id || pendingItems[item.id]) {
-      return;
-    }
-    beginItemEdit(item, { queueAfterCommit: true });
-  }, [beginItemEdit, pendingItems, todoSelectionEditable]);
-
   const focusDraftTextArea = useCallback(() => {
     draftTextAreaRef.current?.focus?.();
   }, []);
@@ -21738,12 +21679,6 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
                     const hasPreview = Boolean(images.length || note);
                     const recoverableStatus = getTodoQueueRecoverableStatus(item);
                     const recoverableStatusLabel = todoQueueRecoverableStatusLabel(recoverableStatus);
-                    const canRecoverTodo = Boolean(
-                      recoverableStatusLabel
-                        && !itemReadOnly
-                        && !isPending
-                        && normalizeTodoQueueText(item.text),
-                    );
                     const mirrorStatusLabel = itemReadOnly && item.displayStatusLabel
                       ? item.displayStatusLabel
                       : "";
@@ -21965,34 +21900,6 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
                               <TodoQueueStatusPill data-todo-status={recoverableStatus}>
                                 {recoverableStatusLabel}
                               </TodoQueueStatusPill>
-                            )}
-                            {!isEditing && canRecoverTodo && (
-                              <TodoQueueRecoverActions data-todo-control="true">
-                                <TodoQueueRecoverButton
-                                  aria-label="Redo todo"
-                                  onClick={(event) => handleRecoverableRedo(event, item)}
-                                  onPointerDown={(event) => {
-                                    event.preventDefault();
-                                    event.stopPropagation();
-                                  }}
-                                  title="Redo todo"
-                                  type="button"
-                                >
-                                  <PlayArrow aria-hidden="true" />
-                                </TodoQueueRecoverButton>
-                                <TodoQueueRecoverButton
-                                  aria-label="Edit and send todo"
-                                  onClick={(event) => handleRecoverableEditAndSend(event, item)}
-                                  onPointerDown={(event) => {
-                                    event.preventDefault();
-                                    event.stopPropagation();
-                                  }}
-                                  title="Edit and send"
-                                  type="button"
-                                >
-                                  <Edit aria-hidden="true" />
-                                </TodoQueueRecoverButton>
-                              </TodoQueueRecoverActions>
                             )}
                             {!isEditing && !recoverableStatusLabel && mirrorStatusLabel && (
                               <TodoQueueStatusPill data-todo-status={item.displayStatus || "listed"}>

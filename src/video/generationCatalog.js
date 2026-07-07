@@ -29,12 +29,54 @@ export function readGenerationRouting() {
   }
 }
 
+// Fired on this window whenever routing or auto-describe settings change, so
+// live consumers (the auto-describe queue) react immediately instead of on
+// the next unrelated media refresh. localStorage "storage" events only fire
+// on OTHER windows, hence the explicit event.
+export const GENERATION_SETTINGS_EVENT = "diffforge-video-gen-settings";
+
+function emitGenerationSettingsChanged() {
+  try {
+    window.dispatchEvent(new Event(GENERATION_SETTINGS_EVENT));
+  } catch {
+    /* best-effort */
+  }
+}
+
 export function writeGenerationRouting(mode) {
   try {
     window.localStorage.setItem(GENERATION_ROUTING_STORAGE_KEY, mode);
   } catch {
     /* best-effort */
   }
+  emitGenerationSettingsChanged();
+}
+
+// Photo describe (cloud vision annotation). Typical low-detail gpt-4o-mini
+// call settles around this many credits — display estimate only; actual
+// billing is token-metered in cloud-diffforge src/media_description.rs.
+export const DESCRIBE_CREDITS_ESTIMATE = 3;
+// Credits floor under which auto-describe stays quiet instead of draining
+// the last of a user's balance on background annotation.
+export const AUTO_DESCRIBE_CREDITS_FLOOR = 50;
+
+export const AUTO_DESCRIBE_STORAGE_KEY = "diffforge.video.autoDescribe";
+
+export function readAutoDescribeEnabled() {
+  try {
+    return window.localStorage.getItem(AUTO_DESCRIBE_STORAGE_KEY) !== "off";
+  } catch {
+    return true;
+  }
+}
+
+export function writeAutoDescribeEnabled(enabled) {
+  try {
+    window.localStorage.setItem(AUTO_DESCRIBE_STORAGE_KEY, enabled ? "on" : "off");
+  } catch {
+    /* best-effort */
+  }
+  emitGenerationSettingsChanged();
 }
 
 const VIDEO_ASPECTS = ["16:9", "9:16", "1:1", "4:3"];

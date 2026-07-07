@@ -62,6 +62,10 @@ import {
   writeAudioRealtimeTranscriptOverlayEnabled,
   AUDIO_LOCAL_WHISPER_REALTIME_MODE_OFF,
   AUDIO_LOCAL_WHISPER_REALTIME_MODE_OPTIONS,
+  AUDIO_WIDGET_CAPTURE_VISIBILITY_OPTIONS,
+  audioWidgetCaptureVisibleFor,
+  readAudioWidgetCaptureVisibility,
+  writeAudioWidgetCaptureVisibility,
   AUDIO_LOCAL_WHISPER_SILENCE_HOLD_OPTIONS,
   readLocalWhisperPartialTuning,
   readLocalWhisperRealtimeMode,
@@ -2965,6 +2969,9 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
   const [localWhisperSilenceHoldMs, setLocalWhisperSilenceHoldMs] = useState(
     readLocalWhisperSilenceHoldMs,
   );
+  const [widgetCaptureVisibility, setWidgetCaptureVisibility] = useState(
+    readAudioWidgetCaptureVisibility,
+  );
   const [recorderMode, setRecorderMode] = useState(readAudioRecorderMode);
   const [orchestratorSubmissionMode, setOrchestratorSubmissionMode] = useState(readOrchestratorVoiceSubmissionMode);
   const [orchestratorRealtimeEnabled, setOrchestratorRealtimeEnabled] = useState(readOrchestratorRealtimeEnabled);
@@ -3939,6 +3946,17 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
     setLocalWhisperRealtimeMode(nextMode);
     writeLocalWhisperRealtimeMode(nextMode);
     notifyAudioSettingsChanged("local-whisper-realtime-mode");
+  }, []);
+
+  const updateWidgetCaptureVisibility = useCallback((nextMode) => {
+    setWidgetCaptureVisibility(nextMode);
+    writeAudioWidgetCaptureVisibility(nextMode);
+    // Apply immediately for the idle widget; the widget window re-applies
+    // state-aware (auto mode) on its own settings sync.
+    invoke("audio_widget_set_capture_visible", {
+      visible: audioWidgetCaptureVisibleFor(nextMode, false),
+    }).catch(() => {});
+    notifyAudioSettingsChanged("widget-capture-visibility");
   }, []);
 
   const updateLocalWhisperSilenceHoldMs = useCallback((nextMs) => {
@@ -5407,6 +5425,45 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                   </AccountCardHeader>
                   <TrayClickGroup>
                     <div>
+                      <SettingsLabel>Show in captures</SettingsLabel>
+                      <SettingsHint>
+                        {AUDIO_WIDGET_CAPTURE_VISIBILITY_OPTIONS
+                          .find((option) => option.id === widgetCaptureVisibility)?.detail
+                          || "Whether screen shares and recordings see the floating recorder."}
+                      </SettingsHint>
+                    </div>
+                    <AudioModeGrid aria-label="Recorder capture visibility" role="group">
+                      {AUDIO_WIDGET_CAPTURE_VISIBILITY_OPTIONS.map((option) => (
+                        <AudioModeButton
+                          aria-pressed={widgetCaptureVisibility === option.id}
+                          key={option.id}
+                          onClick={() => updateWidgetCaptureVisibility(option.id)}
+                          title={option.detail}
+                          type="button"
+                        >
+                          {option.id === "hidden" ? (
+                            <ButtonCloseIcon aria-hidden="true" />
+                          ) : option.id === "auto" ? (
+                            <ButtonMicIcon aria-hidden="true" />
+                          ) : (
+                            <ButtonCheckIcon aria-hidden="true" />
+                          )}
+                          <span>
+                            <strong>{option.label}</strong>
+                            <span>
+                              {option.id === "hidden"
+                                ? "Never in captures"
+                                : option.id === "auto"
+                                  ? "Only while recording"
+                                  : "Always in captures"}
+                            </span>
+                          </span>
+                        </AudioModeButton>
+                      ))}
+                    </AudioModeGrid>
+                  </TrayClickGroup>
+                  <TrayClickGroup>
+                    <div>
                       <SettingsLabel>Widget theme</SettingsLabel>
                       <SettingsHint>
                         {AUDIO_WIDGET_THEME_OPTIONS.find((option) => option.id === audioWidgetTheme)?.detail
@@ -6310,6 +6367,9 @@ export function AudioWidgetWindow() {
   const [widgetRealtimeOverlayEnabled, setWidgetRealtimeOverlayEnabled] = useState(
     readAudioRealtimeTranscriptOverlayEnabled,
   );
+  const [widgetCaptureVisibilityMode, setWidgetCaptureVisibilityMode] = useState(
+    readAudioWidgetCaptureVisibility,
+  );
   const [widgetHistory, setWidgetHistory] = useState(readAudioTranscriptionHistory);
   const [historyTrayOpen, setHistoryTrayOpen] = useState(false);
   const [historyTrayClosing, setHistoryTrayClosing] = useState(false);
@@ -6322,6 +6382,16 @@ export function AudioWidgetWindow() {
   const [barClosing, setBarClosing] = useState(false);
   const [bubbleHover, setBubbleHover] = useState(false);
   const [barPlacementReadyKey, setBarPlacementReadyKey] = useState("");
+  // Capture visibility follows the Audio-tab mode; "auto" tracks whether a
+  // take is in flight so shares only see the recorder while dictating.
+  useEffect(() => {
+    const takeInFlight = finishPending
+      || ["arming", "recording", "transcribing", "warming"].includes(widgetState);
+    invoke("audio_widget_set_capture_visible", {
+      visible: audioWidgetCaptureVisibleFor(widgetCaptureVisibilityMode, takeInFlight),
+    }).catch(() => {});
+  }, [finishPending, widgetCaptureVisibilityMode, widgetState]);
+
   const audioBufferRef = useRef(null);
   const audioBufferGenerationRef = useRef(0);
   const audioBufferReadyAtRef = useRef(0);
@@ -10114,6 +10184,7 @@ export function AudioWidgetWindow() {
       setAudioWidgetTheme(readAudioWidgetTheme());
       setWidgetStyle(nextWidgetStyle);
       setWidgetRealtimeOverlayEnabled(readAudioRealtimeTranscriptOverlayEnabled());
+      setWidgetCaptureVisibilityMode(readAudioWidgetCaptureVisibility());
       setTranscriptionProvider(readAudioTranscriptionProvider());
       setDeepgramApiKey(readDeepgramApiKey());
       setDeepgramLanguage(readDeepgramLanguage());

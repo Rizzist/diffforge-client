@@ -62,6 +62,9 @@ static FORGE_VOICE_ROUTE_CACHE: OnceLock<StdMutex<HashMap<String, ForgeVoiceCach
     OnceLock::new();
 static AUDIO_INPUT_DEVICE_CACHE: OnceLock<StdMutex<Vec<AudioInputDeviceSummary>>> = OnceLock::new();
 static VOICE_TTS_PLAYING_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+// Default true preserves the historical always-visible widget until the UI
+// pushes its current capture preference into Rust.
+static AUDIO_WIDGET_CAPTURE_VISIBLE: AtomicBool = AtomicBool::new(true);
 
 #[cfg(target_os = "macos")]
 #[link(name = "AVFoundation", kind = "framework")]
@@ -1003,11 +1006,11 @@ fn macos_voice_processing_dead_signal_reason(
         return None;
     }
     let delivery_started_at = session.voice_processing_delivery_started_at?;
-    let (last_callback_at, digital_zero_started_at) = session
+    let last_callback_at = session
         .shared
         .lock()
         .ok()
-        .map(|shared| (shared.last_callback_at, shared.digital_zero_started_at))?;
+        .map(|shared| shared.last_callback_at)?;
     let now = Instant::now();
     let callback_reference_at = last_callback_at
         .filter(|last_callback_at| *last_callback_at >= delivery_started_at)
@@ -1016,17 +1019,12 @@ fn macos_voice_processing_dead_signal_reason(
         .saturating_duration_since(callback_reference_at)
         .as_millis() as u64;
 
-    if no_callback_ms >= MACOS_VPIO_SILENCE_DOWNGRADE_MS {
-        return Some(("no_callbacks", no_callback_ms));
-    }
-
-    let digital_zero_started_at =
-        digital_zero_started_at.filter(|started_at| *started_at >= delivery_started_at)?;
-    let digital_zero_ms = now
-        .saturating_duration_since(digital_zero_started_at)
-        .as_millis() as u64;
-    (digital_zero_ms >= MACOS_VPIO_SILENCE_DOWNGRADE_MS)
-        .then_some(("digital_zero", digital_zero_ms))
+    // ONLY missing callbacks count as dead. Exact-zero samples looked like a
+    // second dead signal, but VoiceProcessingIO's noise suppression gates
+    // healthy room silence to digital zero — that trigger tore down working
+    // sessions during normal quiet pauses and killed audio entirely when the
+    // raw rebuild then failed.
+    (no_callback_ms >= MACOS_VPIO_SILENCE_DOWNGRADE_MS).then_some(("no_callbacks", no_callback_ms))
 }
 
 #[cfg(target_os = "macos")]
@@ -1044,11 +1042,6 @@ fn downgrade_macos_voice_processing_session_to_raw(
     let previous_label = active_session.label.clone();
     let previous_sample_rate = active_session.sample_rate;
     let owners = active_session.owners.clone();
-    let (device, device_id, label) = cpal_input_device_by_id(&requested_device_id)?;
-    let handoff = native_audio_take_session_handoff(active_session)?;
-    let old_session = session
-        .take()
-        .ok_or_else(|| "Native audio session is not active.".to_string())?;
 
     MACOS_VPIO_SILENCE_COOLDOWN_UNTIL_MS.store(
         audio_epoch_ms().saturating_add(MACOS_VPIO_SILENCE_COOLDOWN_MS),
@@ -1068,9 +1061,19 @@ fn downgrade_macos_voice_processing_session_to_raw(
         }),
     );
 
-    drop(old_session);
+    // Transactional: the (silent but alive) session is the only one there is.
+    // Build its raw replacement FIRST; any failure here keeps the current
+    // session installed instead of leaving `session = None`, which killed all
+    // audio until the next monitor start.
+    let (device, device_id, label) = cpal_input_device_by_id(&requested_device_id)?;
     let (next_session, sample_format, channels) =
-        build_raw_native_audio_session(app, device, device_id, label, owners, Some(handoff))?;
+        build_raw_native_audio_session(app, device, device_id, label, owners, None)?;
+    let handoff = native_audio_take_session_handoff(active_session)?;
+    native_audio_apply_session_handoff(&next_session.shared, handoff)?;
+    let old_session = session
+        .take()
+        .ok_or_else(|| "Native audio session is not active.".to_string())?;
+    drop(old_session);
     let status = native_audio_status(&next_session);
     *session = Some(next_session);
 
@@ -1108,6 +1111,16 @@ fn maintain_macos_voice_processing_session(
     else {
         return;
     };
+
+    // Downgrades tear down and rebuild CoreAudio state on the worker thread;
+    // space attempts out so a failing rebuild cannot hot-loop and starve
+    // command handling (a starved command gets the whole worker replaced).
+    let now_ms = audio_epoch_ms();
+    let last_attempt_ms = MACOS_VPIO_DOWNGRADE_LAST_ATTEMPT_MS.load(Ordering::Acquire);
+    if now_ms.saturating_sub(last_attempt_ms) < MACOS_VPIO_DOWNGRADE_RETRY_MS {
+        return;
+    }
+    MACOS_VPIO_DOWNGRADE_LAST_ATTEMPT_MS.store(now_ms, Ordering::Release);
 
     if let Err(error) =
         downgrade_macos_voice_processing_session_to_raw(session, reason, elapsed_ms)
@@ -2159,7 +2172,14 @@ const MACOS_VOICE_PROCESSING_SAMPLE_RATE: u32 = 48_000;
 #[cfg(target_os = "macos")]
 const MACOS_VOICE_STANDBY_BUFFER_FRAMES: u32 = 4096;
 #[cfg(target_os = "macos")]
-const MACOS_VPIO_SILENCE_DOWNGRADE_MS: u64 = 1_500;
+// No render callbacks for this long while the DSP should be delivering =
+// dead unit. Generous on purpose: a false downgrade destroys a healthy
+// session, while a true one only delays raw fallback by a few seconds.
+const MACOS_VPIO_SILENCE_DOWNGRADE_MS: u64 = 4_000;
+// Minimum spacing between downgrade attempts so a failing raw rebuild cannot
+// hot-loop teardown/build on the worker (which would starve command handling
+// and get the worker replaced mid-wedge).
+const MACOS_VPIO_DOWNGRADE_RETRY_MS: u64 = 5_000;
 #[cfg(target_os = "macos")]
 const MACOS_VPIO_SILENCE_COOLDOWN_MS: u64 = 60_000;
 
@@ -2171,6 +2191,8 @@ const MACOS_VPIO_SILENCE_COOLDOWN_MS: u64 = 60_000;
 static MACOS_VOICE_PROCESSING_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static MACOS_VPIO_SILENCE_COOLDOWN_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static MACOS_VPIO_DOWNGRADE_LAST_ATTEMPT_MS: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 static MACOS_VOICE_PLAYBACK_QUEUE: OnceLock<Arc<StdMutex<VecDeque<f32>>>> = OnceLock::new();
 /// Hard cap on queued native playback (30s at the unit rate) so a runaway
@@ -5231,6 +5253,7 @@ fn ensure_audio_widget_window(app: &AppHandle) -> Result<tauri::WebviewWindow, S
         );
         #[cfg(target_os = "macos")]
         audio_widget_apply_macos_space_style(&window);
+        audio_widget_apply_capture_visibility(&window);
         return Ok(window);
     }
 
@@ -5301,6 +5324,7 @@ fn ensure_audio_widget_window(app: &AppHandle) -> Result<tauri::WebviewWindow, S
 
     #[cfg(target_os = "macos")]
     audio_widget_apply_macos_space_style(&window);
+    audio_widget_apply_capture_visibility(&window);
 
     let app_handle = app.clone();
     let window_for_events = window.clone();
@@ -5347,6 +5371,7 @@ fn ensure_audio_widget_error_overlay_window(
         let _ = window.set_ignore_cursor_events(true);
         #[cfg(target_os = "macos")]
         audio_widget_apply_macos_space_style(&window);
+        audio_widget_apply_capture_visibility(&window);
         return Ok(window);
     }
 
@@ -5376,8 +5401,24 @@ fn ensure_audio_widget_error_overlay_window(
     let _ = window.set_ignore_cursor_events(true);
     #[cfg(target_os = "macos")]
     audio_widget_apply_macos_space_style(&window);
+    audio_widget_apply_capture_visibility(&window);
 
     Ok(window)
+}
+
+fn audio_widget_apply_capture_visibility(window: &tauri::WebviewWindow) {
+    snipping_set_window_capture_exclusion(
+        window,
+        !AUDIO_WIDGET_CAPTURE_VISIBLE.load(Ordering::Acquire),
+    );
+}
+
+fn audio_widget_apply_capture_visibility_to_existing_windows(app: &AppHandle) {
+    for label in [AUDIO_WIDGET_WINDOW_LABEL, AUDIO_WIDGET_ERROR_WINDOW_LABEL] {
+        if let Some(window) = app.get_webview_window(label) {
+            audio_widget_apply_capture_visibility(&window);
+        }
+    }
 }
 
 /// Cross-Space style for the always-available audio widget. Tauri's
@@ -14503,6 +14544,13 @@ async fn stop_forge_dictation_transcription(
 async fn audio_widget_status(app: AppHandle) -> Result<AudioWidgetVisibility, String> {
     log_audio_diagnostic_event("audio.widget.status.command", json!({}));
     audio_widget_status_for(&app)
+}
+
+#[tauri::command]
+fn audio_widget_set_capture_visible(app: AppHandle, visible: bool) -> Result<(), String> {
+    AUDIO_WIDGET_CAPTURE_VISIBLE.store(visible, Ordering::Release);
+    audio_widget_apply_capture_visibility_to_existing_windows(&app);
+    Ok(())
 }
 
 #[tauri::command]

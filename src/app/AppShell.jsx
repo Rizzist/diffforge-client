@@ -1007,6 +1007,7 @@ import AudioWorkspaceView, {
 } from "../audio/AudioWorkspaceView.jsx";
 import TerminalWindowHost, { TERMINAL_WINDOW_HASH } from "../terminals/TerminalWindowHost.jsx";
 import PcbWindowHost, { PCB_WINDOW_HASH } from "../pcb/PcbWindowHost.jsx";
+import { SshSettingsPanel } from "../ssh/SshSettingsPanel.jsx";
 import SnippingWorkspaceView, {
   SnippingOverlayWindow,
   SnippingRecordingControlsWindow,
@@ -1086,6 +1087,7 @@ const WINDOW_RESIZE_EDGES = [
 const DEFAULT_WORKSPACE_VIEW = "terminals";
 const SETTINGS_TAB_GENERAL = "general";
 const SETTINGS_TAB_PERMISSIONS = "permissions";
+const SETTINGS_TAB_SSH = "ssh";
 const SETTINGS_PERMISSION_HIGHLIGHT_MS = 4200;
 const APP_CONTROL_DOCUMENT_SELECTION_SNAPSHOT_TTL_MS = 5 * 60 * 1000;
 const MACOS_NOTIFICATIONS_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.notifications";
@@ -12507,62 +12509,62 @@ function LoopspaceRuntimeView({
 	                  <LoopspaceGraphMessageSettingsField>
 	                    <span>Agent</span>
 	                    <AppSelect
-	                      isDisabled={busy}
-	                      onChange={(value) => {
-	                        const targetAgentId = normalizeLoopspaceSendMessageAgentId(value);
-	                        const launchDefault = getAgentLaunchDefault(targetAgentId, agentLaunchDefaults);
-	                        updateSendMessageSettingsDraft(node.id, {
-	                          model: launchDefault.model,
-	                          reasoning_effort: launchDefault.effort,
-	                          speed: launchDefault.speed,
-	                          target_agent_id: targetAgentId,
-	                        });
-	                      }}
-	                      options={LOOPSPACE_SEND_MESSAGE_AGENT_OPTIONS.map((agent) => ({ value: agent.id, label: agent.label }))}
-	                      value={sendMessageDraft.target_agent_id}
+                      isDisabled={busy}
+                      onChange={(value) => {
+                        const targetAgentId = normalizeLoopspaceSendMessageAgentId(value);
+                        const launchDefault = getAgentLaunchDefault(targetAgentId, agentLaunchDefaults);
+                        updateSendMessageSettingsDraft(node.id, {
+                          model: launchDefault.model,
+                          reasoning_effort: launchDefault.effort,
+                          speed: launchDefault.speed,
+                          target_agent_id: targetAgentId,
+                        });
+                      }}
+                      options={LOOPSPACE_SEND_MESSAGE_AGENT_OPTIONS.map((agent) => ({ value: agent.id, label: agent.label }))}
+                      value={sendMessageDraft.target_agent_id}
 	                    />
 	                  </LoopspaceGraphMessageSettingsField>
 	                  <LoopspaceGraphMessageSettingsField>
 	                    <span>Model</span>
 	                    <AppSelect
-	                      isDisabled={busy}
-	                      onChange={(value) => {
-	                        const model = cleanAgentLaunchModelId(value, sendMessageDraft.model);
-	                        const resolved = resolveAgentLaunchDefaultForModel(
-	                          sendMessageDraft.target_agent_id,
-	                          agentLaunchDefaults,
-	                          model,
-	                        );
-	                        updateSendMessageSettingsDraft(node.id, {
-	                          model: resolved.model,
-	                          reasoning_effort: resolved.effort,
-	                          speed: resolved.speed,
-	                        });
-	                      }}
-	                      options={[...(!sendMessageModelOptionValues.has(sendMessageDraft.model) ? [{ value: sendMessageDraft.model, label: sendMessageDraft.model }] : []), ...sendMessageModelOptions.map((modelOption) => ({ value: modelOption.value, label: modelOption.label }))]}
-	                      value={sendMessageDraft.model}
+                      isDisabled={busy}
+                      onChange={(value) => {
+                        const model = cleanAgentLaunchModelId(value, sendMessageDraft.model);
+                        const resolved = resolveAgentLaunchDefaultForModel(
+                          sendMessageDraft.target_agent_id,
+                          agentLaunchDefaults,
+                          model,
+                        );
+                        updateSendMessageSettingsDraft(node.id, {
+                          model: resolved.model,
+                          reasoning_effort: resolved.effort,
+                          speed: resolved.speed,
+                        });
+                      }}
+                      options={[...(!sendMessageModelOptionValues.has(sendMessageDraft.model) ? [{ value: sendMessageDraft.model, label: sendMessageDraft.model }] : []), ...sendMessageModelOptions.map((modelOption) => ({ value: modelOption.value, label: modelOption.label }))]}
+                      value={sendMessageDraft.model}
 	                    />
 	                  </LoopspaceGraphMessageSettingsField>
 	                  <LoopspaceGraphMessageSettingsField>
 	                    <span>Thinking</span>
 	                    <AppSelect
-	                      isDisabled={busy}
-	                      onChange={(value) => updateSendMessageSettingsDraft(node.id, {
-	                        reasoning_effort: value,
-	                      })}
-	                      options={sendMessageEffortOptions.map((effortOption) => ({ value: effortOption.value, label: effortOption.label }))}
-	                      value={sendMessageDraft.reasoning_effort}
+                      isDisabled={busy}
+                      onChange={(value) => updateSendMessageSettingsDraft(node.id, {
+                        reasoning_effort: value,
+                      })}
+                      options={sendMessageEffortOptions.map((effortOption) => ({ value: effortOption.value, label: effortOption.label }))}
+                      value={sendMessageDraft.reasoning_effort}
 	                    />
 	                  </LoopspaceGraphMessageSettingsField>
 	                  <LoopspaceGraphMessageSettingsField>
 	                    <span>Speed</span>
 	                    <AppSelect
-	                      isDisabled={busy || sendMessageSpeedOptions.length <= 1}
-	                      onChange={(value) => updateSendMessageSettingsDraft(node.id, {
-	                        speed: value,
-	                      })}
-	                      options={sendMessageSpeedOptions.map((speedOption) => ({ value: speedOption.value, label: speedOption.label }))}
-	                      value={sendMessageDraft.speed}
+                      isDisabled={busy || sendMessageSpeedOptions.length <= 1}
+                      onChange={(value) => updateSendMessageSettingsDraft(node.id, {
+                        speed: value,
+                      })}
+                      options={sendMessageSpeedOptions.map((speedOption) => ({ value: speedOption.value, label: speedOption.label }))}
+                      value={sendMessageDraft.speed}
 	                    />
 	                  </LoopspaceGraphMessageSettingsField>
 	                </LoopspaceGraphMessageSettingsGrid>
@@ -12588,52 +12590,52 @@ function LoopspaceRuntimeView({
 		                    const stepTitle = loopspaceGraphStepTitle(checkpoint, checkpointIndex);
 		                    const stepDescription = loopspaceGraphStepDescription(checkpoint);
 		                    return (
-	                      <LoopspaceGraphMessageSubnodeItem data-mode="step" key={checkpoint.id}>
-	                        <LoopspaceGraphMessageSubnodeMain>
-	                          <LoopspaceGraphMessageStepHeader>
-	                            <LoopspaceGraphMessageStepNumber>{checkpointIndex + 1}</LoopspaceGraphMessageStepNumber>
-	                            <LoopspaceGraphMessageStepInput
-	                              aria-label={`Title for step ${checkpointIndex + 1}`}
-	                              disabled={busy}
-	                              onBlur={(event) => {
-	                                const nextTitle = event.target.value;
-	                                if (nextTitle !== stepTitle) {
-	                                  void updateSendMessageStep(checkpoint, { title: nextTitle });
-	                                }
-	                              }}
-	                              onKeyDown={(event) => {
-	                                if (event.key === "Enter") {
-	                                  event.preventDefault();
-	                                  event.currentTarget.blur();
-	                                }
-	                              }}
-	                              placeholder={`Step ${checkpointIndex + 1}`}
-	                              defaultValue={stepTitle}
-	                            />
-	                          </LoopspaceGraphMessageStepHeader>
-	                          <LoopspaceGraphMessageStepDescription
-	                            aria-label={`Description for step ${checkpointIndex + 1}`}
-	                            disabled={busy}
-	                            onBlur={(event) => {
-	                              const description = event.target.value;
-	                              if (description !== stepDescription) {
-	                                void updateSendMessageStep(checkpoint, { description });
-	                              }
-	                            }}
-	                            placeholder="Describe what the agent should complete at this checkpoint."
-	                            defaultValue={stepDescription}
-	                          />
-	                        </LoopspaceGraphMessageSubnodeMain>
-	                        <button
-	                          aria-label={`Remove ${stepTitle || "step"}`}
-	                          disabled={busy}
-	                          onClick={() => {
-	                            void detachGraphNodeFromLoop(checkpoint);
-	                          }}
-	                          type="button"
-	                        >
-	                          <ButtonCloseIcon aria-hidden="true" />
-	                        </button>
+                      <LoopspaceGraphMessageSubnodeItem data-mode="step" key={checkpoint.id}>
+                        <LoopspaceGraphMessageSubnodeMain>
+                          <LoopspaceGraphMessageStepHeader>
+                            <LoopspaceGraphMessageStepNumber>{checkpointIndex + 1}</LoopspaceGraphMessageStepNumber>
+                            <LoopspaceGraphMessageStepInput
+                              aria-label={`Title for step ${checkpointIndex + 1}`}
+                              disabled={busy}
+                              onBlur={(event) => {
+                                const nextTitle = event.target.value;
+                                if (nextTitle !== stepTitle) {
+                                  void updateSendMessageStep(checkpoint, { title: nextTitle });
+                                }
+                              }}
+                              onKeyDown={(event) => {
+                                if (event.key === "Enter") {
+                                  event.preventDefault();
+                                  event.currentTarget.blur();
+                                }
+                              }}
+                              placeholder={`Step ${checkpointIndex + 1}`}
+                              defaultValue={stepTitle}
+                            />
+                          </LoopspaceGraphMessageStepHeader>
+                          <LoopspaceGraphMessageStepDescription
+                            aria-label={`Description for step ${checkpointIndex + 1}`}
+                            disabled={busy}
+                            onBlur={(event) => {
+                              const description = event.target.value;
+                              if (description !== stepDescription) {
+                                void updateSendMessageStep(checkpoint, { description });
+                              }
+                            }}
+                            placeholder="Describe what the agent should complete at this checkpoint."
+                            defaultValue={stepDescription}
+                          />
+                        </LoopspaceGraphMessageSubnodeMain>
+                        <button
+                          aria-label={`Remove ${stepTitle || "step"}`}
+                          disabled={busy}
+                          onClick={() => {
+                            void detachGraphNodeFromLoop(checkpoint);
+                          }}
+                          type="button"
+                        >
+                          <ButtonCloseIcon aria-hidden="true" />
+                        </button>
 		                      </LoopspaceGraphMessageSubnodeItem>
 		                    );
 		                  })}
@@ -12997,24 +12999,24 @@ function LoopspaceRuntimeView({
 	                const sendMessageFlowSuccessX = loopspaceGraphMessageFlowParentOutputX(nodeLayout);
 	                const sendMessageFlowEdges = sendMessageFlowBounds && sendMessageFlowNodes.length
 	                  ? [
-	                      {
-	                        id: `${node.id}:in`,
-	                        from: { x: sendMessageFlowInputX, y: sendMessageFlowInputY },
-	                        to: loopspaceGraphMessageFlowNodeInputPoint(sendMessageFlowNodes[0]),
-	                      },
-	                      ...sendMessageFlowNodes.slice(0, -1).map((flowNode, flowIndex) => {
-	                        const nextFlowNode = sendMessageFlowNodes[flowIndex + 1];
-	                        return {
-	                          id: `${flowNode.item.id}:${nextFlowNode.item.id}`,
-	                          from: loopspaceGraphMessageFlowNodeFlowOutputPoint(flowNode),
-	                          to: loopspaceGraphMessageFlowNodeInputPoint(nextFlowNode),
-	                        };
-	                      }),
-	                      {
-	                        id: `${node.id}:success`,
-	                        from: loopspaceGraphMessageFlowNodeFlowOutputPoint(sendMessageFlowNodes[sendMessageFlowNodes.length - 1]),
-	                        to: {
-	                          x: sendMessageFlowSuccessX,
+                      {
+                        id: `${node.id}:in`,
+                        from: { x: sendMessageFlowInputX, y: sendMessageFlowInputY },
+                        to: loopspaceGraphMessageFlowNodeInputPoint(sendMessageFlowNodes[0]),
+                      },
+                      ...sendMessageFlowNodes.slice(0, -1).map((flowNode, flowIndex) => {
+                        const nextFlowNode = sendMessageFlowNodes[flowIndex + 1];
+                        return {
+                          id: `${flowNode.item.id}:${nextFlowNode.item.id}`,
+                          from: loopspaceGraphMessageFlowNodeFlowOutputPoint(flowNode),
+                          to: loopspaceGraphMessageFlowNodeInputPoint(nextFlowNode),
+                        };
+                      }),
+                      {
+                        id: `${node.id}:success`,
+                        from: loopspaceGraphMessageFlowNodeFlowOutputPoint(sendMessageFlowNodes[sendMessageFlowNodes.length - 1]),
+                        to: {
+                          x: sendMessageFlowSuccessX,
                           y: sendMessageFlowSuccessY,
                         },
                       },
@@ -13088,81 +13090,81 @@ function LoopspaceRuntimeView({
                     onPointerUp={finishGraphNodeDrag}
                     ref={registerGraphNodeElement(node.id)}
 	                    style={{
-	                      ...(isSizedGraphNode ? {
-	                        "--loopspace-node-height": `${nodeLayout.height}px`,
-	                        ...(nodeVisualDefaults.outputGutter ? {
-	                          "--loopspace-node-output-gutter": `${nodeVisualDefaults.outputGutter}px`,
-	                        } : {}),
-	                        "--loopspace-node-width": `${nodeLayout.width}px`,
-	                      } : {}),
-	                      ...(Number.isFinite(nodeLayout.inputY) ? {
-	                        "--loopspace-node-input-y": `${nodeLayout.inputY}px`,
-	                      } : {}),
-	                      ...(Number.isFinite(nodeLayout.outputStackCenterY) ? {
-	                        "--loopspace-node-output-y": `${nodeLayout.outputStackCenterY}px`,
-	                      } : {}),
-	                      "--loopspace-node-x": `${nodeLayout.x}px`,
-	                      "--loopspace-node-y": `${nodeLayout.y}px`,
+                      ...(isSizedGraphNode ? {
+                        "--loopspace-node-height": `${nodeLayout.height}px`,
+                        ...(nodeVisualDefaults.outputGutter ? {
+                          "--loopspace-node-output-gutter": `${nodeVisualDefaults.outputGutter}px`,
+                        } : {}),
+                        "--loopspace-node-width": `${nodeLayout.width}px`,
+                      } : {}),
+                      ...(Number.isFinite(nodeLayout.inputY) ? {
+                        "--loopspace-node-input-y": `${nodeLayout.inputY}px`,
+                      } : {}),
+                      ...(Number.isFinite(nodeLayout.outputStackCenterY) ? {
+                        "--loopspace-node-output-y": `${nodeLayout.outputStackCenterY}px`,
+                      } : {}),
+                      "--loopspace-node-x": `${nodeLayout.x}px`,
+                      "--loopspace-node-y": `${nodeLayout.y}px`,
 	                    }}
 	                  >
 	                    {nodeInputPorts.map((port, portIndex) => {
-	                      const baseInputY = Number.isFinite(nodeLayout.inputY)
-	                        ? `${nodeLayout.inputY}px`
-	                        : "50%";
-	                      const inputPortY = nodeInputPorts.length <= 1
-	                        ? baseInputY
-	                        : `calc(${baseInputY} + ${(portIndex - ((nodeInputPorts.length - 1) / 2)) * (LOOPSPACE_GRAPH_PORT_SIZE + LOOPSPACE_GRAPH_PORT_GAP)}px)`;
-	                      return (
-	                        <LoopspaceGraphNodePort
-	                          aria-label={`Connect ${port.label || port.id} into ${trigger?.name || node.label}`}
-	                          data-loopspace-graph-input-id={node.id}
-	                          data-loopspace-graph-input-port={port.id}
-	                          data-loopspace-graph-port="true"
-	                          data-side="input"
-	                          key={port.id}
-	                          onPointerDown={(event) => {
-	                            if (!event.altKey) return;
-	                            event.preventDefault();
-	                            event.stopPropagation();
-	                            void disconnectGraphPort(node.id, "input", port.id);
-	                          }}
-	                          style={{ "--loopspace-node-input-y": inputPortY }}
-	                          type="button"
-	                        />
-	                      );
+                      const baseInputY = Number.isFinite(nodeLayout.inputY)
+                        ? `${nodeLayout.inputY}px`
+                        : "50%";
+                      const inputPortY = nodeInputPorts.length <= 1
+                        ? baseInputY
+                        : `calc(${baseInputY} + ${(portIndex - ((nodeInputPorts.length - 1) / 2)) * (LOOPSPACE_GRAPH_PORT_SIZE + LOOPSPACE_GRAPH_PORT_GAP)}px)`;
+                      return (
+                        <LoopspaceGraphNodePort
+                          aria-label={`Connect ${port.label || port.id} into ${trigger?.name || node.label}`}
+                          data-loopspace-graph-input-id={node.id}
+                          data-loopspace-graph-input-port={port.id}
+                          data-loopspace-graph-port="true"
+                          data-side="input"
+                          key={port.id}
+                          onPointerDown={(event) => {
+                            if (!event.altKey) return;
+                            event.preventDefault();
+                            event.stopPropagation();
+                            void disconnectGraphPort(node.id, "input", port.id);
+                          }}
+                          style={{ "--loopspace-node-input-y": inputPortY }}
+                          type="button"
+                        />
+                      );
 	                    })}
 	                    <LoopspaceGraphNodeIcon>
-	                      <Icon aria-hidden="true" />
+                      <Icon aria-hidden="true" />
 	                    </LoopspaceGraphNodeIcon>
 	                    <LoopspaceGraphNodeText>
-	                      <LoopspaceGraphNodeTitleRow>
-	                        <strong>{nodeTitle}</strong>
-	                        {isSendMessageRegion && sendMessageRuntimeLabel ? (
-	                          <LoopspaceGraphNodeStateBadge
-	                            data-tone={sendMessageRuntimeTone}
-	                            onPointerDown={(event) => event.stopPropagation()}
-	                            title={sendMessageRuntimeLabel}
-	                          >
-	                            <span>{sendMessageRuntimeLabel}</span>
-	                            {sendMessageCanResume ? (
-	                              <LoopspaceGraphNodeResumeButton
-	                                aria-label={`Resume ${nodeTitle}`}
-	                                disabled={busy}
-	                                onClick={(event) => {
-	                                  event.stopPropagation();
-	                                  resumeSendMessageNode(node, sendMessageRuntimeState);
-	                                }}
-	                                onPointerDown={(event) => event.stopPropagation()}
-	                                title="Resume this interrupted send message"
-	                                type="button"
-	                              >
-	                                Resume
-	                              </LoopspaceGraphNodeResumeButton>
-	                            ) : null}
-	                          </LoopspaceGraphNodeStateBadge>
-	                        ) : null}
-	                      </LoopspaceGraphNodeTitleRow>
-	                      {nodeSubtitle ? <span>{nodeSubtitle}</span> : null}
+                      <LoopspaceGraphNodeTitleRow>
+                        <strong>{nodeTitle}</strong>
+                        {isSendMessageRegion && sendMessageRuntimeLabel ? (
+                          <LoopspaceGraphNodeStateBadge
+                            data-tone={sendMessageRuntimeTone}
+                            onPointerDown={(event) => event.stopPropagation()}
+                            title={sendMessageRuntimeLabel}
+                          >
+                            <span>{sendMessageRuntimeLabel}</span>
+                            {sendMessageCanResume ? (
+                              <LoopspaceGraphNodeResumeButton
+                                aria-label={`Resume ${nodeTitle}`}
+                                disabled={busy}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  resumeSendMessageNode(node, sendMessageRuntimeState);
+                                }}
+                                onPointerDown={(event) => event.stopPropagation()}
+                                title="Resume this interrupted send message"
+                                type="button"
+                              >
+                                Resume
+                              </LoopspaceGraphNodeResumeButton>
+                            ) : null}
+                          </LoopspaceGraphNodeStateBadge>
+                        ) : null}
+                      </LoopspaceGraphNodeTitleRow>
+                      {nodeSubtitle ? <span>{nodeSubtitle}</span> : null}
                       {node.triggerId && nodeTriggerType === "cron" ? (
                         <LoopspaceCronCountdownBadge
                           nextDueAtMs={trigger?.nextDueAtMs}
@@ -13280,16 +13282,16 @@ function LoopspaceRuntimeView({
                               onContentTemplateChange={(value) => void updateDocumentWriteContentTemplate(node, value)}
 		                          onCreateNameChange={(value) => void updateResourceContextCreateName(node, value)}
 		                          onOperationChange={(value) => void updateDocumentWriteOperation(node, value)}
-	                          onRefsChange={(refs) => void updateDocumentContextNodeRefs(node, refs)}
-	                          operation={isDocumentWriteNode ? loopspaceGraphPropValue(node.props, [
-	                            "operation",
-	                            "write_operation",
-	                            "writeOperation",
-	                            "document_operation",
-	                            "documentOperation",
-	                          ]) : "append"}
-	                          options={loopspaceGraphDocumentOptions}
-	                          refs={nodeDocumentRefs}
+                          onRefsChange={(refs) => void updateDocumentContextNodeRefs(node, refs)}
+                          operation={isDocumentWriteNode ? loopspaceGraphPropValue(node.props, [
+                            "operation",
+                            "write_operation",
+                            "writeOperation",
+                            "document_operation",
+                            "documentOperation",
+                          ]) : "append"}
+                          options={loopspaceGraphDocumentOptions}
+                          refs={nodeDocumentRefs}
                           search={nodeDocumentSearch}
                           setSearch={(value) => setDocumentContextSearchByNode((current) => ({
                             ...current,
@@ -13323,31 +13325,31 @@ function LoopspaceRuntimeView({
                       ) : null}
 		                    </LoopspaceGraphNodeText>
 	                    {hasGraphNodeSettings ? (
-	                      <LoopspaceGraphMessageSettingsButton
-	                        aria-label={`Open ${nodeTitle} settings`}
-	                        data-open={nodeSettingsSelected ? "true" : undefined}
-	                        disabled={busy}
-	                        onClick={(event) => {
-	                          event.stopPropagation();
-	                          openLoopspaceGraphNodeSettings(node);
-	                        }}
-	                        onPointerDown={(event) => event.stopPropagation()}
-	                        title={`${nodeTitle} settings`}
-	                        type="button"
-	                      >
-	                        <ButtonSettingsIcon aria-hidden="true" />
-	                      </LoopspaceGraphMessageSettingsButton>
+                      <LoopspaceGraphMessageSettingsButton
+                        aria-label={`Open ${nodeTitle} settings`}
+                        data-open={nodeSettingsSelected ? "true" : undefined}
+                        disabled={busy}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          openLoopspaceGraphNodeSettings(node);
+                        }}
+                        onPointerDown={(event) => event.stopPropagation()}
+                        title={`${nodeTitle} settings`}
+                        type="button"
+                      >
+                        <ButtonSettingsIcon aria-hidden="true" />
+                      </LoopspaceGraphMessageSettingsButton>
 	                    ) : null}
 		                    {node.nodeKind === "send_message" ? (
 		                      <>
 			                        <LoopspaceGraphMessageRegion
 		                          style={sendMessageFlowBounds && sendMessageFlowOrigin ? {
-	                            "--loopspace-message-flow-height": `${sendMessageFlowBounds.height}px`,
-	                            "--loopspace-message-flow-origin-x": `${sendMessageFlowOrigin.x}px`,
-	                            "--loopspace-message-flow-origin-y": `${sendMessageFlowOrigin.y}px`,
-	                            "--loopspace-message-flow-width": `${sendMessageFlowBounds.width}px`,
-	                          } : undefined}
-	                        >
+                            "--loopspace-message-flow-height": `${sendMessageFlowBounds.height}px`,
+                            "--loopspace-message-flow-origin-x": `${sendMessageFlowOrigin.x}px`,
+                            "--loopspace-message-flow-origin-y": `${sendMessageFlowOrigin.y}px`,
+                            "--loopspace-message-flow-width": `${sendMessageFlowBounds.width}px`,
+                          } : undefined}
+                        >
                           {sendMessageSettingsOpen ? (
                             <LoopspaceGraphMessageSettingsPanel
                               onPointerDown={(event) => event.stopPropagation()}
@@ -13574,7 +13576,7 @@ function LoopspaceRuntimeView({
                               </LoopspaceGraphMessageFlowEdges>
                               {sendMessageFlowNodes.map(({ item: stepNode, itemIndex, layout: stepLayout }, flowIndex) => {
                                 const stepTitle = loopspaceGraphMessageChildTitle(stepNode, itemIndex);
-	                                const stepSubtitle = loopspaceGraphMessageChildSubtitle(stepNode, itemIndex);
+                                const stepSubtitle = loopspaceGraphMessageChildSubtitle(stepNode, itemIndex);
 		                                const flowInputPorts = loopspaceGraphInputPortsForNode(stepNode);
 		                                const flowOutputPorts = loopspaceGraphDisplayedOutputPortsForNode(stepNode);
                                 const flowPortY = (portIndex, portCount) => `${loopspaceGraphMessageFlowNodePortY(
@@ -13597,15 +13599,15 @@ function LoopspaceRuntimeView({
                                   ? `${stepRuntimeAssetIds.length} asset${stepRuntimeAssetIds.length === 1 ? "" : "s"}`
                                   : "";
                                 return (
-	                                  <LoopspaceGraphMessageFlowNode
-	                                    aria-label={[
-	                                      stepTitle,
-	                                      stepRuntimeStatus,
-	                                      stepRuntimeAssetIds.length ? `Assets: ${stepRuntimeAssetIds.join(", ")}` : "",
-	                                    ].filter(Boolean).join(" - ")}
-	                                    data-status={stepRuntimeStatus || undefined}
-	                                    data-kind={stepNode.nodeKind || stepNode.kind || "step"}
-	                                    key={stepNode.id}
+                                  <LoopspaceGraphMessageFlowNode
+                                    aria-label={[
+                                      stepTitle,
+                                      stepRuntimeStatus,
+                                      stepRuntimeAssetIds.length ? `Assets: ${stepRuntimeAssetIds.join(", ")}` : "",
+                                    ].filter(Boolean).join(" - ")}
+                                    data-status={stepRuntimeStatus || undefined}
+                                    data-kind={stepNode.nodeKind || stepNode.kind || "step"}
+                                    key={stepNode.id}
                                     onPointerDown={(event) => startSendMessageCheckpointDrag(event, node, stepNode, flowIndex, stepLayout)}
                                     style={{
                                       "--loopspace-flow-node-height": `${stepLayout.height}px`,
@@ -13613,16 +13615,16 @@ function LoopspaceRuntimeView({
                                       "--loopspace-flow-node-x": `${stepLayout.x}px`,
                                       "--loopspace-flow-node-y": `${stepLayout.y}px`,
                                     }}
-	                                  >
-	                                    {flowInputPorts.map((port, portIndex) => (
-	                                      <LoopspaceGraphMessageFlowNodePort
-	                                        aria-label={`Attach context to ${stepTitle}`}
-	                                        as="button"
-	                                        data-loopspace-graph-input-id={stepNode.id}
-	                                        data-loopspace-graph-input-port={port.id}
-	                                        data-loopspace-graph-port="true"
-	                                        data-side="input"
-	                                        key={port.id}
+                                  >
+                                    {flowInputPorts.map((port, portIndex) => (
+                                      <LoopspaceGraphMessageFlowNodePort
+                                        aria-label={`Attach context to ${stepTitle}`}
+                                        as="button"
+                                        data-loopspace-graph-input-id={stepNode.id}
+                                        data-loopspace-graph-input-port={port.id}
+                                        data-loopspace-graph-port="true"
+                                        data-side="input"
+                                        key={port.id}
                                         onPointerDown={(event) => {
                                           if (!event.altKey) {
                                             event.stopPropagation();
@@ -13630,12 +13632,12 @@ function LoopspaceRuntimeView({
                                           }
                                           event.preventDefault();
                                           event.stopPropagation();
-	                                          void disconnectGraphPort(stepNode.id, "input", port.id);
-	                                        }}
+                                          void disconnectGraphPort(stepNode.id, "input", port.id);
+                                        }}
 		                                        style={{ "--loopspace-flow-port-y": flowPortY(portIndex, flowInputPorts.length) }}
-	                                        type="button"
-	                                      />
-	                                    ))}
+                                        type="button"
+                                      />
+                                    ))}
                                     <LoopspaceGraphMessageFlowNodeText>
                                       <strong>{stepTitle}</strong>
                                       {stepSubtitle ? <span>{stepSubtitle}</span> : null}
@@ -13656,11 +13658,11 @@ function LoopspaceRuntimeView({
                                         key={port.id}
                                         onPointerCancel={finishGraphConnection}
                                         onPointerDown={(event) => startGraphConnection(event, stepNode, port.id)}
-	                                        onPointerMove={moveGraphConnection}
-	                                        onPointerUp={finishGraphConnection}
+                                        onPointerMove={moveGraphConnection}
+                                        onPointerUp={finishGraphConnection}
 		                                        style={{ "--loopspace-flow-port-y": flowPortY(portIndex, flowOutputPorts.length) }}
-	                                        type="button"
-	                                      />
+                                        type="button"
+                                      />
                                     ))}
                                   </LoopspaceGraphMessageFlowNode>
                                 );
@@ -13716,11 +13718,11 @@ function LoopspaceRuntimeView({
                             data-loopspace-graph-port="true"
                             data-side="output"
                             onPointerCancel={finishGraphConnection}
-	                            onPointerDown={(event) => startGraphConnection(event, node, port.id)}
-	                            onPointerMove={moveGraphConnection}
-	                            onPointerUp={finishGraphConnection}
-	                            type="button"
-	                          />
+                            onPointerDown={(event) => startGraphConnection(event, node, port.id)}
+                            onPointerMove={moveGraphConnection}
+                            onPointerUp={finishGraphConnection}
+                            type="button"
+                          />
                         </LoopspaceGraphNodeOutputPort>
                       ))}
                     </LoopspaceGraphNodeOutputPorts>
@@ -14137,10 +14139,10 @@ function LoopspaceRuntimeView({
 	                    renderSelectedSettingsPanel()
 	                  ) : settingsPanelRows.length ? (
 	                    <LoopspaceRuntimePanelSettingsList
-	                      aria-label="Graph node settings"
-	                      style={{
-	                        "--loopspace-settings-list-height": `${settingsPanelListHeight}px`,
-	                      }}
+                      aria-label="Graph node settings"
+                      style={{
+                        "--loopspace-settings-list-height": `${settingsPanelListHeight}px`,
+                      }}
 		                    >
 		                      {visibleSettingsPanelRows.map(({ row, index }) => {
 		                        const settingsCardColumn = index % settingsPanelColumnCount;
@@ -14149,19 +14151,19 @@ function LoopspaceRuntimeView({
 		                          ? AdsClick
                               : row.kind === "dispatch_todos"
                                 ? Send
-	                          : row.kind === "run_script"
-	                            ? Terminal
-	                            : row.kind === "asset_read" || row.kind === "asset_write"
-	                              ? PermMedia
-	                              : row.kind === "manual" || row.kind === "cron" || row.kind === "webhook"
-	                                ? loopspaceTriggerTypeIcon(row.kind || "manual")
-	                                : AccountTree;
-	                        return (
-	                          <LoopspaceRuntimePanelSettingsRow
-	                            data-active={settingsNodeId === row.id ? "true" : undefined}
-	                            data-kind={row.kind || "loop"}
-	                            data-runtime={row.runtimeTone || undefined}
-	                            key={row.id}
+                          : row.kind === "run_script"
+                            ? Terminal
+                            : row.kind === "asset_read" || row.kind === "asset_write"
+                              ? PermMedia
+                              : row.kind === "manual" || row.kind === "cron" || row.kind === "webhook"
+                                ? loopspaceTriggerTypeIcon(row.kind || "manual")
+                                : AccountTree;
+                        return (
+                          <LoopspaceRuntimePanelSettingsRow
+                            data-active={settingsNodeId === row.id ? "true" : undefined}
+                            data-kind={row.kind || "loop"}
+                            data-runtime={row.runtimeTone || undefined}
+                            key={row.id}
 		                            onClick={() => centerLoopspaceGraphOnNode(row.node)}
 		                            onKeyDown={(event) => {
 		                              if (event.key === "Enter" || event.key === " ") {
@@ -14176,15 +14178,15 @@ function LoopspaceRuntimeView({
 		                              "--loopspace-settings-card-x": `${LOOPSPACE_RUNTIME_SETTINGS_GRID_PADDING + (settingsCardColumn * (settingsPanelCardWidth + LOOPSPACE_RUNTIME_SETTINGS_CARD_GAP))}px`,
 		                              "--loopspace-settings-card-y": `${LOOPSPACE_RUNTIME_SETTINGS_GRID_PADDING + (settingsCardRow * settingsPanelGridStride)}px`,
 		                            }}
-	                            tabIndex={0}
-	                          >
-	                            <LoopspaceGraphPaletteIcon>
-	                              <SettingsIcon aria-hidden="true" />
-	                            </LoopspaceGraphPaletteIcon>
-	                            <LoopspaceRuntimePanelSettingsMain>
-	                              <strong>{row.title}</strong>
-	                              <span>{row.subtitle}</span>
-	                            </LoopspaceRuntimePanelSettingsMain>
+                            tabIndex={0}
+                          >
+                            <LoopspaceGraphPaletteIcon>
+                              <SettingsIcon aria-hidden="true" />
+                            </LoopspaceGraphPaletteIcon>
+                            <LoopspaceRuntimePanelSettingsMain>
+                              <strong>{row.title}</strong>
+                              <span>{row.subtitle}</span>
+                            </LoopspaceRuntimePanelSettingsMain>
 		                            <LoopspaceRuntimePanelSettingsAction
 		                              aria-label={`Open settings for ${row.title}`}
 		                              onClick={(event) => {
@@ -14197,16 +14199,16 @@ function LoopspaceRuntimeView({
 		                              title="Settings"
 		                              type="button"
 		                            >
-	                              <ButtonSettingsIcon aria-hidden="true" />
-	                            </LoopspaceRuntimePanelSettingsAction>
-	                          </LoopspaceRuntimePanelSettingsRow>
-	                        );
-	                      })}
+                              <ButtonSettingsIcon aria-hidden="true" />
+                            </LoopspaceRuntimePanelSettingsAction>
+                          </LoopspaceRuntimePanelSettingsRow>
+                        );
+                      })}
 	                    </LoopspaceRuntimePanelSettingsList>
 	                  ) : (
 	                    <LoopspaceRuntimePanelEmpty>
-	                      <strong>No graph nodes</strong>
-	                      <span>Add nodes from the library.</span>
+                      <strong>No graph nodes</strong>
+                      <span>Add nodes from the library.</span>
 	                    </LoopspaceRuntimePanelEmpty>
 	                  )
 	                ) : visibleRuntimeEvents.length ? (
@@ -14224,19 +14226,19 @@ function LoopspaceRuntimeView({
                       </LoopspaceRuntimeConsoleLoader>
                     ) : null}
 	                    {visibleRuntimeEvents.map((event) => {
-	                      const selected = selectedRuntimeEvent?.id === event.id;
-	                      const logIcon = loopspaceRuntimeLogIcon(event);
-	                      const eventStatusLabel = loopspaceRuntimeEventStatusLabel(event, "Event", { preferRaw: true });
-	                      const detailsText = selected
-	                        ? JSON.stringify(event.details && Object.keys(event.details).length ? event.details : event, null, 2)
-	                        : "";
+                      const selected = selectedRuntimeEvent?.id === event.id;
+                      const logIcon = loopspaceRuntimeLogIcon(event);
+                      const eventStatusLabel = loopspaceRuntimeEventStatusLabel(event, "Event", { preferRaw: true });
+                      const detailsText = selected
+                        ? JSON.stringify(event.details && Object.keys(event.details).length ? event.details : event, null, 2)
+                        : "";
                       return (
                         <Fragment key={event.id}>
                           <LoopspaceRuntimeConsoleRow
                             aria-expanded={selected}
-	                            data-clickable="true"
-	                            data-selected={selected ? "true" : undefined}
-	                            data-tone={loopspaceRuntimeEventTone(event)}
+                            data-clickable="true"
+                            data-selected={selected ? "true" : undefined}
+                            data-tone={loopspaceRuntimeEventTone(event)}
                             onClick={() => setSelectedHistoryRunId((current) => (current === event.id ? "" : event.id))}
                             onKeyDown={(rowEvent) => {
                               if (rowEvent.key === "Enter" || rowEvent.key === " ") {
@@ -14244,34 +14246,34 @@ function LoopspaceRuntimeView({
                                 setSelectedHistoryRunId((current) => (current === event.id ? "" : event.id));
                               }
                             }}
-	                            role="button"
-	                            tabIndex={0}
-	                          >
-	                            <LoopspaceRuntimeConsoleIcon data-icon={logIcon}>
-	                              {logIcon === "sent" ? (
-	                                <Send aria-hidden="true" />
-	                              ) : logIcon === "trigger" ? (
-	                                <AdsClick aria-hidden="true" />
-	                              ) : logIcon === "running" ? (
-	                                <PlayArrow aria-hidden="true" />
-	                              ) : logIcon === "queued" ? (
-	                                <HourglassEmpty aria-hidden="true" />
-	                              ) : logIcon === "completed" ? (
-	                                <ButtonCheckIcon aria-hidden="true" />
-	                              ) : logIcon === "failed" ? (
-	                                <ErrorOutline aria-hidden="true" />
-	                              ) : logIcon === "cancelled" ? (
-	                                <ButtonCloseIcon aria-hidden="true" />
-	                              ) : logIcon === "interrupted" ? (
-	                                <PauseCircle aria-hidden="true" />
-	                              ) : (
-	                                <RadioButtonChecked aria-hidden="true" />
-	                              )}
-	                            </LoopspaceRuntimeConsoleIcon>
-	                            <span>{formatLoopspaceRuntimeConsoleTime(event.createdAtMs)}</span>
-	                            <strong>{eventStatusLabel}</strong>
-	                            <em>{event.message || event.status || "Runtime event"}</em>
-	                          </LoopspaceRuntimeConsoleRow>
+                            role="button"
+                            tabIndex={0}
+                          >
+                            <LoopspaceRuntimeConsoleIcon data-icon={logIcon}>
+                              {logIcon === "sent" ? (
+                                <Send aria-hidden="true" />
+                              ) : logIcon === "trigger" ? (
+                                <AdsClick aria-hidden="true" />
+                              ) : logIcon === "running" ? (
+                                <PlayArrow aria-hidden="true" />
+                              ) : logIcon === "queued" ? (
+                                <HourglassEmpty aria-hidden="true" />
+                              ) : logIcon === "completed" ? (
+                                <ButtonCheckIcon aria-hidden="true" />
+                              ) : logIcon === "failed" ? (
+                                <ErrorOutline aria-hidden="true" />
+                              ) : logIcon === "cancelled" ? (
+                                <ButtonCloseIcon aria-hidden="true" />
+                              ) : logIcon === "interrupted" ? (
+                                <PauseCircle aria-hidden="true" />
+                              ) : (
+                                <RadioButtonChecked aria-hidden="true" />
+                              )}
+                            </LoopspaceRuntimeConsoleIcon>
+                            <span>{formatLoopspaceRuntimeConsoleTime(event.createdAtMs)}</span>
+                            <strong>{eventStatusLabel}</strong>
+                            <em>{event.message || event.status || "Runtime event"}</em>
+                          </LoopspaceRuntimeConsoleRow>
                           {selected ? (
                             <LoopspaceRuntimeConsoleDetail>
                               {detailsText}
@@ -18635,6 +18637,132 @@ function normalizeWorkspaceVideoCount(value) {
   return Math.min(MAX_WORKSPACE_VIDEO_PANEL_COUNT, Math.max(MIN_WORKSPACE_VIDEO_PANEL_COUNT, count));
 }
 
+function workspacePanelCountField(value, keys, fallback) {
+  if (!value || typeof value !== "object") {
+    return fallback;
+  }
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) {
+      return value[key];
+    }
+  }
+  return fallback;
+}
+
+const REMOTE_WORKSPACE_PANEL_COUNT_KEY_ALIASES = {
+  browser: "web",
+  browsers: "web",
+  doc: "document",
+  docs: "document",
+  document: "document",
+  documentCount: "document",
+  document_count: "document",
+  documents: "document",
+  documentsCount: "document",
+  documents_count: "document",
+  pcb: "pcb-design",
+  pcbCount: "pcb-design",
+  pcbDesign: "pcb-design",
+  "pcb-design": "pcb-design",
+  pcb_count: "pcb-design",
+  pcbs: "pcb-design",
+  video: "video-editor",
+  videoCount: "video-editor",
+  videoEditor: "video-editor",
+  "video-editor": "video-editor",
+  video_count: "video-editor",
+  videos: "video-editor",
+  vm: "vm-sandbox",
+  vmCount: "vm-sandbox",
+  vmSandbox: "vm-sandbox",
+  "vm-sandbox": "vm-sandbox",
+  vm_count: "vm-sandbox",
+  vms: "vm-sandbox",
+  web: "web",
+  webCount: "web",
+  web_count: "web",
+};
+
+function remoteWorkspacePanelCountsRequest(value) {
+  const rejectedFields = [];
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {
+      hasSupportedKeys: false,
+      panelCounts: null,
+      provided: false,
+      rejectedFields,
+    };
+  }
+
+  const supportedInput = {};
+  Object.entries(value).forEach(([key, fieldValue]) => {
+    const canonicalKey = REMOTE_WORKSPACE_PANEL_COUNT_KEY_ALIASES[key];
+    if (!canonicalKey) {
+      rejectedFields.push({
+        field: `panel_counts.${key}`,
+        reason: "unsupported_panel_kind",
+        value: fieldValue,
+      });
+      return;
+    }
+    supportedInput[canonicalKey] = fieldValue;
+  });
+
+  const hasSupportedKeys = Object.keys(supportedInput).length > 0;
+  return {
+    hasSupportedKeys,
+    panelCounts: hasSupportedKeys ? normalizeWorkspacePanelCountsInput(supportedInput) : null,
+    provided: true,
+    rejectedFields,
+  };
+}
+
+function normalizeWorkspacePanelCountsInput(value, fallback = {}) {
+  return {
+    document: normalizeWorkspaceDocumentCount(workspacePanelCountField(value, [
+      "docs",
+      "doc",
+      "document",
+      "documents",
+      "document_count",
+      "documentCount",
+      "documents_count",
+      "documentsCount",
+    ], fallback.document ?? fallback.documents ?? fallback.docs)),
+    web: normalizeWorkspaceWebPanelCount(workspacePanelCountField(value, [
+      "web",
+      "web_count",
+      "webCount",
+      "browser",
+      "browsers",
+    ], fallback.web)),
+    "pcb-design": normalizeWorkspacePcbCount(workspacePanelCountField(value, [
+      "pcb",
+      "pcbs",
+      "pcb_count",
+      "pcbCount",
+      "pcb-design",
+      "pcbDesign",
+    ], fallback["pcb-design"] ?? fallback.pcb)),
+    "vm-sandbox": normalizeWorkspaceVmCount(workspacePanelCountField(value, [
+      "vm",
+      "vms",
+      "vm_count",
+      "vmCount",
+      "vm-sandbox",
+      "vmSandbox",
+    ], fallback["vm-sandbox"] ?? fallback.vm)),
+    "video-editor": normalizeWorkspaceVideoCount(workspacePanelCountField(value, [
+      "video",
+      "videos",
+      "video_count",
+      "videoCount",
+      "video-editor",
+      "videoEditor",
+    ], fallback["video-editor"] ?? fallback.video)),
+  };
+}
+
 function getWorkspaceDocumentCount(workspaceSettings, workspaceId) {
   const settings = workspaceSettings?.[workspaceId];
   const paneRecords = normalizeWorkspacePaneRecords(settings?.panes, { workspaceId });
@@ -18754,6 +18882,80 @@ function getWorkspaceTerminalRoleCountMap(roles, roleOptions = WORKSPACE_TERMINA
   return Object.fromEntries(
     getWorkspaceTerminalRoleCounts(roles, roleOptions).map((role) => [role.id, role.count]),
   );
+}
+
+const REMOTE_WORKSPACE_TERMINAL_ROLE_COUNT_ALIASES = {
+  claude: "claude",
+  codex: "codex",
+  generic: WORKSPACE_TERMINAL_ROLE_GENERIC,
+  opencode: "opencode",
+  shell: WORKSPACE_TERMINAL_ROLE_GENERIC,
+  terminal: WORKSPACE_TERMINAL_ROLE_GENERIC,
+};
+
+function remoteWorkspaceTerminalRolesRequest(value) {
+  const rejectedFields = [];
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {
+      hasValidRoleCount: false,
+      provided: false,
+      rejectedFields,
+      roles: null,
+    };
+  }
+
+  const roleCounts = new Map();
+  Object.entries(value).forEach(([key, fieldValue]) => {
+    const roleId = REMOTE_WORKSPACE_TERMINAL_ROLE_COUNT_ALIASES[String(key || "").trim()];
+    if (!roleId || !WORKSPACE_TERMINAL_ROLE_IDS.has(roleId)) {
+      rejectedFields.push({
+        field: `terminal_roles.${key}`,
+        reason: "unsupported_terminal_role",
+        value: fieldValue,
+      });
+      return;
+    }
+
+    const count = Number(fieldValue);
+    if (!Number.isInteger(count) || count < 0) {
+      rejectedFields.push({
+        field: `terminal_roles.${key}`,
+        reason: "invalid_value",
+        value: fieldValue,
+      });
+      return;
+    }
+
+    roleCounts.set(roleId, (roleCounts.get(roleId) || 0) + count);
+  });
+
+  const roles = [];
+  ["codex", "claude", "opencode", WORKSPACE_TERMINAL_ROLE_GENERIC].forEach((roleId) => {
+    const count = roleCounts.get(roleId) || 0;
+    for (let index = 0; index < count && roles.length < MAX_WORKSPACE_TERMINAL_COUNT; index += 1) {
+      roles.push(roleId);
+    }
+  });
+
+  return {
+    hasValidRoleCount: roleCounts.size > 0,
+    provided: true,
+    rejectedFields,
+    roles,
+  };
+}
+
+function remoteWorkspaceTerminalRoleCountsForAck(roles) {
+  const counts = getWorkspaceTerminalRoleCountMap(
+    Array.isArray(roles) ? roles : [],
+    WORKSPACE_TERMINAL_ROLE_OPTIONS,
+  );
+  return {
+    claude: counts.claude || 0,
+    codex: counts.codex || 0,
+    opencode: counts.opencode || 0,
+    terminal: counts[WORKSPACE_TERMINAL_ROLE_GENERIC] || 0,
+  };
 }
 
 function buildWorkspaceTerminalRolesFromCounts(
@@ -20969,6 +21171,47 @@ function normalizeAgentSessionMode(value, gitWorktreesEnabled = false, safeModeA
     : AGENT_SESSION_MODE_COORDINATED;
 }
 
+function normalizeRemoteWorkspaceSafetyMode(value) {
+  if (value === null || typeof value === "undefined") {
+    return { provided: false, valid: true, safetyMode: "", agentSessionMode: "" };
+  }
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return { provided: false, valid: true, safetyMode: "", agentSessionMode: "" };
+  }
+  const mode = raw.toLowerCase().replace(/[\s-]+/g, "_");
+  if (["safe", "worktree", "worktree_coordination", "isolated"].includes(mode)) {
+    return {
+      provided: true,
+      valid: true,
+      safetyMode: "safe",
+      agentSessionMode: AGENT_SESSION_MODE_WORKTREE,
+    };
+  }
+  if (["coordinated", "coordination", "direct_coordination"].includes(mode)) {
+    return {
+      provided: true,
+      valid: true,
+      safetyMode: "coordinated",
+      agentSessionMode: AGENT_SESSION_MODE_COORDINATED,
+    };
+  }
+  if (["full", "direct", "direct_unmanaged", "unmanaged"].includes(mode)) {
+    return {
+      provided: true,
+      valid: true,
+      safetyMode: "full",
+      agentSessionMode: AGENT_SESSION_MODE_DIRECT,
+    };
+  }
+  return {
+    provided: true,
+    valid: false,
+    safetyMode: raw,
+    agentSessionMode: "",
+  };
+}
+
 function getWorkspaceRootGitRepositoryKnown(workspaceSettings, workspaceId) {
   const settings = workspaceSettings?.[workspaceId];
   return Boolean(settings && Object.prototype.hasOwnProperty.call(settings, "rootGitRepository"));
@@ -21886,6 +22129,75 @@ function workspacePaneKindsSwarmIndexes(paneKinds) {
   return workspacePaneKindsIndexes(paneKinds, WORKSPACE_PANE_KIND_SWARM);
 }
 
+function buildWorkspaceInitialLayoutSettings(requestedTerminalRoles, requestedPanelCounts) {
+  const terminalRoles = Array.isArray(requestedTerminalRoles)
+    ? requestedTerminalRoles.slice(0, MAX_WORKSPACE_TERMINAL_COUNT)
+    : null;
+  const panelCounts = normalizeWorkspacePanelCountsInput(requestedPanelCounts);
+  const documentsCount = panelCounts.document;
+  const pcbCount = panelCounts["pcb-design"];
+  const vmCount = panelCounts["vm-sandbox"];
+  const videoCount = panelCounts["video-editor"];
+  const webPanelCount = panelCounts.web;
+  let seededTerminalRoles = terminalRoles;
+  let seededPaneKinds = null;
+  let seededPcbCount = pcbCount;
+  let seededVmCount = vmCount;
+  let seededVideoCount = videoCount;
+  let seededWebCount = webPanelCount;
+  const requestedGridPanels = [
+    ...Array.from({ length: webPanelCount }, () => WORKSPACE_PANE_KIND_WEB),
+    ...Array.from({ length: pcbCount }, () => WORKSPACE_PANE_KIND_PCB),
+    ...Array.from({ length: vmCount }, () => WORKSPACE_PANE_KIND_VM),
+    ...Array.from({ length: videoCount }, () => WORKSPACE_PANE_KIND_VIDEO),
+  ];
+
+  if (requestedGridPanels.length > 0) {
+    const baseTerminalRoles = terminalRoles && terminalRoles.length ? terminalRoles : [];
+    const panelStartIndex = baseTerminalRoles.length;
+    const combinedRoles = [
+      ...baseTerminalRoles,
+      ...Array.from({ length: requestedGridPanels.length }, () => "codex"),
+    ].slice(0, MAX_WORKSPACE_TERMINAL_COUNT);
+    seededTerminalRoles = combinedRoles;
+    seededPaneKinds = {};
+    for (let index = panelStartIndex; index < combinedRoles.length; index += 1) {
+      const panelKind = requestedGridPanels[index - panelStartIndex];
+      if (panelKind) {
+        seededPaneKinds[index] = panelKind;
+      }
+    }
+    seededWebCount = workspacePaneKindsWebIndexes(seededPaneKinds).length;
+    seededPcbCount = workspacePaneKindsPcbIndexes(seededPaneKinds).length;
+    seededVmCount = workspacePaneKindsVmIndexes(seededPaneKinds).length;
+    seededVideoCount = workspacePaneKindsVideoIndexes(seededPaneKinds).length;
+  }
+
+  const seededLogicalIndexes = Array.isArray(seededTerminalRoles)
+    ? normalizeWorkspaceTerminalIndexes(undefined, seededTerminalRoles.length)
+    : null;
+  const seededDisplayRows = Array.isArray(seededLogicalIndexes)
+    ? getDefaultWorkspaceDisplayTerminalRows(seededLogicalIndexes)
+    : null;
+  const seededExplicitEmptyWorkspace = Array.isArray(seededLogicalIndexes)
+    && seededLogicalIndexes.length === 0
+    && requestedGridPanels.length === 0
+    && documentsCount === 0;
+
+  return {
+    documentsCount,
+    pcbCount: seededPcbCount,
+    vmCount: seededVmCount,
+    videoCount: seededVideoCount,
+    seededDisplayRows,
+    seededExplicitEmptyWorkspace,
+    seededLogicalIndexes,
+    seededPaneKinds,
+    seededTerminalRoles,
+    webCount: seededWebCount,
+  };
+}
+
 function getWorkspaceTerminalOnlyRolesForPaneKinds(
   logicalIndexes,
   terminalRoles,
@@ -22119,6 +22431,171 @@ function reconcileWorkspaceTerminalSlotIndexesExcluding(indexes, count, excludeI
   }
 
   return nextIndexes;
+}
+
+function buildWorkspaceSettingsLayoutPatch({
+  displayLayouts,
+  fallbackRole = WORKSPACE_TERMINAL_ROLE_GENERIC,
+  panelCounts,
+  rootChanged = false,
+  terminalCount,
+  terminalRoles,
+  workspaceId,
+  workspaceSettings,
+  workspaceTerminalLogicalIndexes,
+  workspaceTerminalRoleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS,
+}) {
+  const currentTerminalCount = getWorkspaceTerminalCount(workspaceSettings, workspaceId);
+  const currentTerminalRoles = getWorkspaceTerminalRoles(
+    workspaceSettings,
+    workspaceId,
+    currentTerminalCount,
+    fallbackRole,
+    workspaceTerminalRoleOptions,
+  );
+  const currentTerminalIndexes = getWorkspaceLogicalTerminalIndexes(
+    workspaceTerminalLogicalIndexes,
+    workspaceId,
+    currentTerminalCount,
+  );
+  const settingsPaneKinds = getWorkspacePaneKinds(workspaceSettings, workspaceId);
+  const currentPanelIndexes = workspacePaneKindsIndexes(settingsPaneKinds);
+  const currentPanelIndexSet = new Set(currentPanelIndexes);
+  const settingsTerminalCurrentIndexes = currentTerminalIndexes.filter((index) => !currentPanelIndexSet.has(index));
+  const currentTerminalRoleByIndex = new Map(currentTerminalIndexes.map((slotIndex, index) => [
+    slotIndex,
+    currentTerminalRoles[index] || fallbackRole,
+  ]));
+  const currentTerminalOnlyRoles = settingsTerminalCurrentIndexes.map((slotIndex) => (
+    currentTerminalRoleByIndex.get(slotIndex) || fallbackRole
+  ));
+  const terminalRolesProvided = Array.isArray(terminalRoles);
+  const nextTerminalCount = terminalRolesProvided
+    ? Math.min(MAX_WORKSPACE_TERMINAL_COUNT, terminalRoles.length)
+    : normalizeWorkspaceTerminalCount(
+      terminalCount,
+      currentTerminalOnlyRoles.length,
+    );
+  const nextTerminalOnlyRoles = normalizeWorkspaceTerminalRoles(
+    terminalRolesProvided ? terminalRoles : currentTerminalOnlyRoles,
+    nextTerminalCount,
+    fallbackRole,
+    terminalRolesProvided ? WORKSPACE_TERMINAL_ROLE_OPTIONS : workspaceTerminalRoleOptions,
+  );
+  const currentPanelCounts = {
+    document: getWorkspaceDocumentCount(workspaceSettings, workspaceId),
+    web: getWorkspaceWebPaneIndexes(workspaceSettings, workspaceId).length,
+    "pcb-design": getWorkspacePcbPaneIndexes(workspaceSettings, workspaceId).length,
+    "vm-sandbox": getWorkspaceVmPaneIndexes(workspaceSettings, workspaceId).length,
+    "video-editor": getWorkspaceVideoPaneIndexes(workspaceSettings, workspaceId).length,
+  };
+  const nextPanelCounts = normalizeWorkspacePanelCountsInput(panelCounts, currentPanelCounts);
+  const panelSlotCapacity = Math.max(0, MAX_WORKSPACE_TERMINAL_COUNT - nextTerminalCount);
+  const desiredWebPanelCount = Math.min(nextPanelCounts.web, panelSlotCapacity);
+  const desiredPcbPanelCount = Math.min(
+    nextPanelCounts["pcb-design"],
+    Math.max(0, panelSlotCapacity - desiredWebPanelCount),
+  );
+  const desiredVmPanelCount = Math.min(
+    nextPanelCounts["vm-sandbox"],
+    Math.max(0, panelSlotCapacity - desiredWebPanelCount - desiredPcbPanelCount),
+  );
+  const desiredVideoPanelCount = Math.min(
+    nextPanelCounts["video-editor"],
+    Math.max(0, panelSlotCapacity - desiredWebPanelCount - desiredPcbPanelCount - desiredVmPanelCount),
+  );
+  let nextPaneKinds = getWorkspaceDraftPanelPaneKinds(
+    settingsPaneKinds,
+    desiredWebPanelCount,
+    desiredPcbPanelCount,
+    desiredVmPanelCount,
+    desiredVideoPanelCount,
+  );
+  const keptPanelIndexes = workspacePaneKindsIndexes(nextPaneKinds);
+  const terminalNextIndexes = rootChanged
+    ? reconcileWorkspaceTerminalSlotIndexesExcluding(getDefaultTerminalIndexes(nextTerminalCount), nextTerminalCount, keptPanelIndexes)
+    : reconcileWorkspaceTerminalSlotIndexesExcluding(settingsTerminalCurrentIndexes, nextTerminalCount, keptPanelIndexes);
+  const terminalRoleByIndex = new Map(terminalNextIndexes.map((slotIndex, index) => [
+    slotIndex,
+    nextTerminalOnlyRoles[index],
+  ]));
+  const usedDraftSlotIndexes = new Set([
+    ...terminalNextIndexes,
+    ...keptPanelIndexes,
+  ]);
+  nextPaneKinds = fillWorkspaceDraftPanelPaneKinds(
+    nextPaneKinds,
+    usedDraftSlotIndexes,
+    WORKSPACE_PANE_KIND_WEB,
+    desiredWebPanelCount,
+  );
+  nextPaneKinds = fillWorkspaceDraftPanelPaneKinds(
+    nextPaneKinds,
+    usedDraftSlotIndexes,
+    WORKSPACE_PANE_KIND_PCB,
+    desiredPcbPanelCount,
+  );
+  nextPaneKinds = fillWorkspaceDraftPanelPaneKinds(
+    nextPaneKinds,
+    usedDraftSlotIndexes,
+    WORKSPACE_PANE_KIND_VM,
+    desiredVmPanelCount,
+  );
+  nextPaneKinds = fillWorkspaceDraftPanelPaneKinds(
+    nextPaneKinds,
+    usedDraftSlotIndexes,
+    WORKSPACE_PANE_KIND_VIDEO,
+    desiredVideoPanelCount,
+  );
+  const panelIndexes = workspacePaneKindsIndexes(nextPaneKinds);
+  const panelIndexSet = new Set(panelIndexes);
+  const logicalTerminalIndexes = normalizeWorkspaceTerminalSlotIndexes([
+    ...terminalNextIndexes,
+    ...panelIndexes,
+  ]);
+  const effectiveTerminalRoles = logicalTerminalIndexes.map((slotIndex) => (
+    panelIndexSet.has(slotIndex)
+      ? fallbackRole
+      : (terminalRoleByIndex.get(slotIndex) || fallbackRole)
+  ));
+  const minimizedPaneIndexes = normalizeWorkspaceMinimizedPaneIndexes(
+    getWorkspaceMinimizedPaneIndexes(workspaceSettings, workspaceId, currentTerminalIndexes),
+    logicalTerminalIndexes,
+  );
+  const visibleLogicalTerminalIndexes = getWorkspaceVisibleLogicalTerminalIndexes(
+    logicalTerminalIndexes,
+    minimizedPaneIndexes,
+  );
+  const layoutPaneCountChanged = logicalTerminalIndexes.length !== currentTerminalCount;
+  const displayRows = layoutPaneCountChanged
+    ? getDefaultWorkspaceDisplayTerminalRows(visibleLogicalTerminalIndexes)
+    : getWorkspaceDisplayTerminalRows(
+      displayLayouts,
+      workspaceId,
+      visibleLogicalTerminalIndexes,
+    ).map((row) => row.terminalIndexes.slice());
+
+  return {
+    displayRows,
+    documentsCount: nextPanelCounts.document,
+    logicalTerminalIndexes,
+    minimizedPaneIndexes,
+    panelCounts: {
+      document: nextPanelCounts.document,
+      web: workspacePaneKindsWebIndexes(nextPaneKinds).length,
+      "pcb-design": workspacePaneKindsPcbIndexes(nextPaneKinds).length,
+      "vm-sandbox": workspacePaneKindsVmIndexes(nextPaneKinds).length,
+      "video-editor": workspacePaneKindsVideoIndexes(nextPaneKinds).length,
+    },
+    paneKinds: nextPaneKinds,
+    pcbCount: workspacePaneKindsPcbIndexes(nextPaneKinds).length,
+    terminalCount: logicalTerminalIndexes.length,
+    terminalRoles: effectiveTerminalRoles,
+    terminalOnlyCount: nextTerminalCount,
+    terminalOnlyRoles: nextTerminalOnlyRoles,
+    videoCount: workspacePaneKindsVideoIndexes(nextPaneKinds).length,
+    vmCount: workspacePaneKindsVmIndexes(nextPaneKinds).length,
+  };
 }
 
 function getWorkspaceLogicalTerminalIndexes(workspaceTerminalLogicalIndexes, workspaceId, terminalCount) {
@@ -22697,6 +23174,7 @@ export default function App() {
   const [workspaceGraphState, setWorkspaceGraphState] = useState({});
   const [workspaceArchitectureTerminalActivity, setWorkspaceArchitectureTerminalActivity] = useState({});
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState("");
+  const [workspaceTerminalEffectsWorkspaceId, setWorkspaceTerminalEffectsWorkspaceId] = useState("");
   const [workspaceWebTabSessions, setWorkspaceWebTabSessions] = useState({});
   const [spaceMode, setSpaceMode] = useState(APP_SPACE_MODE_DEFAULT);
   const [loopspaces, setLoopspaces] = useState(readLoopspaces);
@@ -22885,6 +23363,8 @@ export default function App() {
   const workspaceRailRef = useRef(null);
   const workspaceRailAnimationFrameRef = useRef(0);
   const workspaceRailAnimatingRef = useRef(false);
+  const workspaceTerminalEffectsFirstFrameRef = useRef(0);
+  const workspaceTerminalEffectsSecondFrameRef = useRef(0);
   const workspaceGitPullPromptCheckRef = useRef("");
   const workspaceGitPullPromptSkippedRef = useRef(new Set());
   const viewTransitionTimeoutRef = useRef(null);
@@ -22923,6 +23403,8 @@ export default function App() {
   const workspaceNotificationCueIdsRef = useRef(new Set());
   const workspaceNotificationHighlightTimersRef = useRef(new Map());
   const workspaceNotificationsStateRef = useRef(null);
+  const workspaceNotificationsSeenFirstFrameRef = useRef(0);
+  const workspaceNotificationsSeenSecondFrameRef = useRef(0);
   const workspaceTerminalNotificationAttentionTimersRef = useRef(new Map());
   const workspaceNotificationSfxRef = useRef(null);
   const workspaceNotificationSnapshotKeyRef = useRef("");
@@ -26106,49 +26588,76 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    window.cancelAnimationFrame(workspaceNotificationsSeenFirstFrameRef.current);
+    window.cancelAnimationFrame(workspaceNotificationsSeenSecondFrameRef.current);
+    workspaceNotificationsSeenFirstFrameRef.current = 0;
+    workspaceNotificationsSeenSecondFrameRef.current = 0;
+
     if (
       !selectedWorkspaceId
       || activeView !== DEFAULT_WORKSPACE_VIEW
       || visibleView !== DEFAULT_WORKSPACE_VIEW
       || !mainWindowFocused
     ) {
-      return;
+      return undefined;
     }
 
-    // Capture which terminals produced the unread notifications BEFORE the
-    // mark-seen below wipes the unread flags; the workspace's terminal grid
-    // renders this as a per-pane attention flash so the badge count has a
-    // visible source when the user switches back.
-    const attentionPanes = collectWorkspaceNotificationAttentionPanes(
-      workspaceNotificationsStateRef.current,
-      selectedWorkspaceId,
-    );
-    if (attentionPanes.length) {
-      const attentionWorkspaceId = selectedWorkspaceId;
-      const attentionId = Date.now();
-      setWorkspaceTerminalNotificationAttention((current) => ({
-        ...current,
-        [attentionWorkspaceId]: { id: attentionId, panes: attentionPanes },
-      }));
-      const existingTimer = workspaceTerminalNotificationAttentionTimersRef.current.get(attentionWorkspaceId);
-      if (existingTimer) {
-        window.clearTimeout(existingTimer);
-      }
-      const timer = window.setTimeout(() => {
-        workspaceTerminalNotificationAttentionTimersRef.current.delete(attentionWorkspaceId);
-        setWorkspaceTerminalNotificationAttention((current) => {
-          if (current[attentionWorkspaceId]?.id !== attentionId) {
-            return current;
+    const attentionWorkspaceId = selectedWorkspaceId;
+    workspaceNotificationsSeenFirstFrameRef.current = window.requestAnimationFrame(() => {
+      workspaceNotificationsSeenFirstFrameRef.current = 0;
+      workspaceNotificationsSeenSecondFrameRef.current = window.requestAnimationFrame(() => {
+        workspaceNotificationsSeenSecondFrameRef.current = 0;
+        if (
+          selectedWorkspaceIdRef.current !== attentionWorkspaceId
+          || activeViewRef.current !== DEFAULT_WORKSPACE_VIEW
+          || visibleViewRef.current !== DEFAULT_WORKSPACE_VIEW
+          || !mainWindowFocusedRef.current
+        ) {
+          return;
+        }
+
+        // Capture which terminals produced the unread notifications BEFORE the
+        // mark-seen below wipes the unread flags; the workspace's terminal grid
+        // renders this as a per-pane attention flash so the badge count has a
+        // visible source when the user switches back.
+        const attentionPanes = collectWorkspaceNotificationAttentionPanes(
+          workspaceNotificationsStateRef.current,
+          attentionWorkspaceId,
+        );
+        if (attentionPanes.length) {
+          const attentionId = Date.now();
+          setWorkspaceTerminalNotificationAttention((current) => ({
+            ...current,
+            [attentionWorkspaceId]: { id: attentionId, panes: attentionPanes },
+          }));
+          const existingTimer = workspaceTerminalNotificationAttentionTimersRef.current.get(attentionWorkspaceId);
+          if (existingTimer) {
+            window.clearTimeout(existingTimer);
           }
-          const next = { ...current };
-          delete next[attentionWorkspaceId];
-          return next;
-        });
-      }, 9000);
-      workspaceTerminalNotificationAttentionTimersRef.current.set(attentionWorkspaceId, timer);
-    }
+          const timer = window.setTimeout(() => {
+            workspaceTerminalNotificationAttentionTimersRef.current.delete(attentionWorkspaceId);
+            setWorkspaceTerminalNotificationAttention((current) => {
+              if (current[attentionWorkspaceId]?.id !== attentionId) {
+                return current;
+              }
+              const next = { ...current };
+              delete next[attentionWorkspaceId];
+              return next;
+            });
+          }, 9000);
+          workspaceTerminalNotificationAttentionTimersRef.current.set(attentionWorkspaceId, timer);
+        }
 
-    setWorkspaceNotifications((current) => markWorkspaceNotificationsSeen(current, selectedWorkspaceId));
+        setWorkspaceNotifications((current) => markWorkspaceNotificationsSeen(current, attentionWorkspaceId));
+      });
+    });
+
+    return () => {
+      window.cancelAnimationFrame(workspaceNotificationsSeenFirstFrameRef.current);
+      window.cancelAnimationFrame(workspaceNotificationsSeenSecondFrameRef.current);
+      workspaceNotificationsSeenFirstFrameRef.current = 0;
+      workspaceNotificationsSeenSecondFrameRef.current = 0;
+    };
   }, [activeView, mainWindowFocused, selectedWorkspaceId, visibleView]);
 
   // Attention mirror: Rust notification paths gate native banners on what the
@@ -28530,8 +29039,6 @@ export default function App() {
       currentPendingId && currentPendingId !== workspace.id ? "" : currentPendingId
     ));
 
-    setWorkspaceNotifications((current) => markWorkspaceNotificationsSeen(current, workspace.id));
-
     const isReselect = selectedWorkspaceIdRef.current === workspace.id
       && spaceModeRef.current === APP_SPACE_MODE_WORKSPACES;
     if (!isReselect) {
@@ -30656,59 +31163,17 @@ export default function App() {
       const existingCatalog = Array.isArray(workspaceCatalogRef.current) ? workspaceCatalogRef.current : [];
       const nextCatalog = updateCatalogWorkspace(existingCatalog, workspace);
       const nextWorkspaces = visibleWorkspaceCatalog(nextCatalog);
-      const terminalRoles = Array.isArray(requestedTerminalRoles)
-        ? requestedTerminalRoles.slice(0, MAX_WORKSPACE_TERMINAL_COUNT)
-        : null;
-      const documentsCount = normalizeWorkspaceDocumentCount(
-        requestedPanelCounts?.document ?? requestedPanelCounts?.documents,
-      );
-      const pcbCount = normalizeWorkspacePcbCount(requestedPanelCounts?.["pcb-design"]);
-      const vmCount = normalizeWorkspaceVmCount(requestedPanelCounts?.["vm-sandbox"] ?? requestedPanelCounts?.vm);
-      const videoCount = normalizeWorkspaceVideoCount(requestedPanelCounts?.["video-editor"] ?? requestedPanelCounts?.video);
-      const webPanelCount = normalizeWorkspaceWebPanelCount(requestedPanelCounts?.web);
-      // Panel panes occupy slots after the terminal slots. Their terminalRoles
-      // entry is a never-read placeholder; paneKinds marks them so the grid
-      // renders panel content (no PTY/agent) instead of a terminal.
-      let seededTerminalRoles = terminalRoles;
-      let seededPaneKinds = null;
-      let seededPcbCount = pcbCount;
-      let seededVmCount = vmCount;
-      let seededVideoCount = videoCount;
-      const requestedGridPanels = [
-        ...Array.from({ length: webPanelCount }, () => WORKSPACE_PANE_KIND_WEB),
-        ...Array.from({ length: pcbCount }, () => WORKSPACE_PANE_KIND_PCB),
-        ...Array.from({ length: vmCount }, () => WORKSPACE_PANE_KIND_VM),
-        ...Array.from({ length: videoCount }, () => WORKSPACE_PANE_KIND_VIDEO),
-      ];
-      if (requestedGridPanels.length > 0) {
-        const baseTerminalRoles = terminalRoles && terminalRoles.length ? terminalRoles : [];
-        const panelStartIndex = baseTerminalRoles.length;
-        const combinedRoles = [
-          ...baseTerminalRoles,
-          ...Array.from({ length: requestedGridPanels.length }, () => "codex"),
-        ].slice(0, MAX_WORKSPACE_TERMINAL_COUNT);
-        seededTerminalRoles = combinedRoles;
-        seededPaneKinds = {};
-        for (let index = panelStartIndex; index < combinedRoles.length; index += 1) {
-          const panelKind = requestedGridPanels[index - panelStartIndex];
-          if (panelKind) {
-            seededPaneKinds[index] = panelKind;
-          }
-        }
-        seededPcbCount = workspacePaneKindsPcbIndexes(seededPaneKinds).length;
-        seededVmCount = workspacePaneKindsVmIndexes(seededPaneKinds).length;
-        seededVideoCount = workspacePaneKindsVideoIndexes(seededPaneKinds).length;
-      }
-      const seededLogicalIndexes = Array.isArray(seededTerminalRoles)
-        ? normalizeWorkspaceTerminalIndexes(undefined, seededTerminalRoles.length)
-        : null;
-      const seededDisplayRows = Array.isArray(seededLogicalIndexes)
-        ? getDefaultWorkspaceDisplayTerminalRows(seededLogicalIndexes)
-        : null;
-      const seededExplicitEmptyWorkspace = Array.isArray(seededLogicalIndexes)
-        && seededLogicalIndexes.length === 0
-        && requestedGridPanels.length === 0
-        && documentsCount === 0;
+      const {
+        documentsCount,
+        pcbCount: seededPcbCount,
+        vmCount: seededVmCount,
+        videoCount: seededVideoCount,
+        seededDisplayRows,
+        seededExplicitEmptyWorkspace,
+        seededLogicalIndexes,
+        seededPaneKinds,
+        seededTerminalRoles,
+      } = buildWorkspaceInitialLayoutSettings(requestedTerminalRoles, requestedPanelCounts);
       const agentPermissions = normalizeWorkspaceAgentPermissions(
         requestedAgentPermissions,
         WORKSPACE_TERMINAL_ROLE_OPTIONS,
@@ -37072,6 +37537,37 @@ export default function App() {
     shouldKeepWorkspaceTerminalMounted
       && selectedWorkspaceIsActivated,
   );
+  const workspaceTerminalEffectsTargetId = shouldRevealWorkspaceTerminal
+    ? selectedWorkspace?.id || ""
+    : "";
+  useEffect(() => {
+    window.cancelAnimationFrame(workspaceTerminalEffectsFirstFrameRef.current);
+    window.cancelAnimationFrame(workspaceTerminalEffectsSecondFrameRef.current);
+    workspaceTerminalEffectsFirstFrameRef.current = 0;
+    workspaceTerminalEffectsSecondFrameRef.current = 0;
+
+    if (workspaceTerminalEffectsWorkspaceId === workspaceTerminalEffectsTargetId) {
+      return undefined;
+    }
+
+    workspaceTerminalEffectsFirstFrameRef.current = window.requestAnimationFrame(() => {
+      workspaceTerminalEffectsFirstFrameRef.current = 0;
+      workspaceTerminalEffectsSecondFrameRef.current = window.requestAnimationFrame(() => {
+        workspaceTerminalEffectsSecondFrameRef.current = 0;
+        setWorkspaceTerminalEffectsWorkspaceId(workspaceTerminalEffectsTargetId);
+      });
+    });
+
+    return () => {
+      window.cancelAnimationFrame(workspaceTerminalEffectsFirstFrameRef.current);
+      window.cancelAnimationFrame(workspaceTerminalEffectsSecondFrameRef.current);
+      workspaceTerminalEffectsFirstFrameRef.current = 0;
+      workspaceTerminalEffectsSecondFrameRef.current = 0;
+    };
+  }, [
+    workspaceTerminalEffectsTargetId,
+    workspaceTerminalEffectsWorkspaceId,
+  ]);
   const shouldShowDefaultWorkspaceIdle = Boolean(
     !shouldShowWorkspaceSetup
       && (shouldShowWorkspacePendingActivation || !hasSelectedWorkspace || !selectedWorkspaceIsActivated),
@@ -39631,7 +40127,7 @@ export default function App() {
       }
       await recordRemoteCommandStatus(
         event,
-        "applied",
+        confirmationRecorded ? "applied" : "pending",
         confirmationRecorded
           ? "Model configuration command applied to the live terminal."
           : "Model configuration command was written; waiting for session history detection before confirming.",
@@ -40017,6 +40513,8 @@ export default function App() {
         return;
       }
       if (["workspace_create", "create_workspace"].includes(normalizedKind)) {
+        const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+        const request = event?.request && typeof event.request === "object" ? event.request : {};
         const requestedName = remoteCommandStringField(event, [
           "workspace_name",
           "workspaceName",
@@ -40029,6 +40527,78 @@ export default function App() {
           "rootDirectory",
           "root",
         ]));
+        const requestedInitializeGit = remoteCommandBooleanField(event, [
+          "initialize_git",
+          "initializeGit",
+        ]);
+        const requestedSafetyModeInput = event?.safety_mode ?? event?.safetyMode
+          ?? payload.safety_mode ?? payload.safetyMode
+          ?? request.safety_mode ?? request.safetyMode;
+        const requestedSafetyMode = normalizeRemoteWorkspaceSafetyMode(requestedSafetyModeInput);
+        if (!requestedSafetyMode.valid) {
+          await recordRemoteCommandStatus(event, "failed", "Unsupported safety_mode. Use safe, coordinated, or full.", {
+            commandId,
+            commandKind,
+            rejectedFields: [{
+              field: "safety_mode",
+              reason: "unsupported_value",
+              value: requestedSafetyMode.safetyMode,
+            }],
+          });
+          return;
+        }
+        const requestedTerminalCountInput = event?.terminal_count ?? event?.terminalCount
+          ?? payload.terminal_count ?? payload.terminalCount
+          ?? request.terminal_count ?? request.terminalCount;
+        const wantsTerminalCount = requestedTerminalCountInput !== undefined && requestedTerminalCountInput !== null;
+        const requestedTerminalRolesInput = [
+          event?.terminal_roles,
+          event?.terminalRoles,
+          payload.terminal_roles,
+          payload.terminalRoles,
+          request.terminal_roles,
+          request.terminalRoles,
+        ].find((value) => value && typeof value === "object" && !Array.isArray(value)) || null;
+        const requestedTerminalRoles = remoteWorkspaceTerminalRolesRequest(requestedTerminalRolesInput);
+        const requestedTerminalCountNumber = wantsTerminalCount
+          ? Number.parseInt(String(requestedTerminalCountInput), 10)
+          : null;
+        if (wantsTerminalCount
+          && !requestedTerminalRoles.hasValidRoleCount
+          && (!Number.isInteger(requestedTerminalCountNumber) || requestedTerminalCountNumber < 0)) {
+          await recordRemoteCommandStatus(event, "failed", `terminal_count must be an integer between 0 and ${MAX_WORKSPACE_TERMINAL_COUNT}.`, {
+            commandId,
+            commandKind,
+            rejectedFields: [{
+              field: "terminal_count",
+              reason: "invalid_value",
+              value: requestedTerminalCountInput,
+            }],
+          });
+          return;
+        }
+        const requestedTerminalCount = wantsTerminalCount
+          ? Math.min(MAX_WORKSPACE_TERMINAL_COUNT, requestedTerminalCountNumber)
+          : null;
+        const requestedPanelCountsInput = [
+          event?.panel_counts,
+          event?.panelCounts,
+          payload.panel_counts,
+          payload.panelCounts,
+          request.panel_counts,
+          request.panelCounts,
+        ].find((value) => value && typeof value === "object" && !Array.isArray(value)) || null;
+        const requestedPanelCounts = remoteWorkspacePanelCountsRequest(requestedPanelCountsInput);
+        if (requestedTerminalRoles.provided && !requestedTerminalRoles.hasValidRoleCount) {
+          await recordRemoteCommandStatus(event, "failed", "terminal_roles must include supported integer role counts.", {
+            commandId,
+            commandKind,
+            rejectedFields: requestedTerminalRoles.rejectedFields.length
+              ? requestedTerminalRoles.rejectedFields
+              : [{ field: "terminal_roles", reason: "invalid_value" }],
+          });
+          return;
+        }
         if (!requestedName || requestedName.length > 80) {
           await recordRemoteCommandStatus(event, "failed", "Workspace create needs a workspace_name of 80 characters or fewer.", {
             commandId,
@@ -40050,7 +40620,14 @@ export default function App() {
             throw new Error("Workspace root directory was not returned by validation.");
           }
           const rootIdentity = normalizedRoot?.rootIdentity || getWorkspaceRootIdentity(rootDirectory);
-          const rootGitRepository = Boolean(normalizedRoot?.gitRepository || normalizedRoot?.git_repository);
+          let rootGitRepository = Boolean(normalizedRoot?.gitRepository || normalizedRoot?.git_repository);
+          const initialAgentSessionMode = normalizeAgentSessionMode(
+            requestedSafetyMode.provided
+              ? requestedSafetyMode.agentSessionMode
+              : AGENT_SESSION_MODE_COORDINATED,
+            false,
+            true,
+          );
           const duplicateWorkspace = findWorkspaceByEffectiveRoot(
             workspaceCatalogRef.current,
             workspaceSettingsRef.current,
@@ -40065,6 +40642,15 @@ export default function App() {
             });
             return;
           }
+          if ((requestedInitializeGit || initialAgentSessionMode === AGENT_SESSION_MODE_WORKTREE) && !rootGitRepository) {
+            await invoke("workspace_initialize_git", { repoPath: rootDirectory });
+            rootGitRepository = true;
+          }
+          const agentSessionMode = normalizeAgentSessionMode(
+            initialAgentSessionMode,
+            false,
+            rootGitRepository,
+          );
           // Mirror the local-first create: revive a tombstoned id for a folder
           // that previously hosted a workspace so settings/threads re-link.
           let revivedWorkspaceId = "";
@@ -40091,10 +40677,43 @@ export default function App() {
           const existingCatalog = Array.isArray(workspaceCatalogRef.current) ? workspaceCatalogRef.current : [];
           const nextCatalog = updateCatalogWorkspace(existingCatalog, workspace);
           const nextWorkspaces = visibleWorkspaceCatalog(nextCatalog);
+          const requestedTerminalRoleList = requestedTerminalRoles.hasValidRoleCount
+            ? requestedTerminalRoles.roles
+            : wantsTerminalCount
+            ? Array.from(
+              { length: requestedTerminalCount },
+              () => workspaceTerminalFallbackRole || WORKSPACE_TERMINAL_ROLE_GENERIC,
+            )
+            : null;
+          const {
+            documentsCount,
+            pcbCount,
+            vmCount,
+            videoCount,
+            seededDisplayRows,
+            seededLogicalIndexes,
+            seededPaneKinds,
+            seededTerminalRoles,
+            webCount: seededWebCount,
+          } = buildWorkspaceInitialLayoutSettings(
+            requestedTerminalRoleList,
+            requestedPanelCounts.hasSupportedKeys ? requestedPanelCounts.panelCounts : null,
+          );
           const nextWorkspaceSettings = updateWorkspaceLocalSettings(workspaceSettingsRef.current, workspace.id, {
             rootDirectory,
             rootWasEmptyAtSelection: Boolean(normalizedRoot?.emptyDirectory),
             rootGitRepository,
+            agentSessionMode,
+            documentsCount,
+            pcbCount,
+            vmCount,
+            videoCount,
+            ...(seededTerminalRoles
+              ? { terminalCount: seededTerminalRoles.length, terminalRoles: seededTerminalRoles }
+              : {}),
+            ...(seededPaneKinds ? { paneKinds: seededPaneKinds } : {}),
+            ...(seededLogicalIndexes ? { logicalTerminalIndexes: seededLogicalIndexes } : {}),
+            ...(seededDisplayRows ? { displayRows: seededDisplayRows } : {}),
           });
           workspaceSettingsRef.current = nextWorkspaceSettings;
           persistWorkspaceSettings(nextWorkspaceSettings);
@@ -40109,17 +40728,47 @@ export default function App() {
           }).catch(() => {});
           void invoke("coordination_bootstrap_workspace", {
             repoPath: rootDirectory,
-            agentSessionMode: normalizeAgentSessionMode(AGENT_SESSION_MODE_COORDINATED, false, rootGitRepository),
+            agentSessionMode,
           }).catch(() => {});
           // Registered but not runtime-enabled and not selected: an API create
           // must not yank the desktop UI; the activate action does that.
           await syncRemoteControlState("remote_workspace_create");
+          const rejectedFields = [
+            ...requestedTerminalRoles.rejectedFields,
+            ...requestedPanelCounts.rejectedFields,
+          ];
           await recordRemoteCommandStatus(event, "completed", `Workspace "${requestedName}" created on this desktop.`, {
             commandId,
             commandKind,
+            appliedFields: [
+              "workspace_name",
+              "workspace_root",
+              ...(requestedSafetyMode.provided ? ["safety_mode"] : []),
+              ...(requestedTerminalRoles.hasValidRoleCount ? ["terminal_roles"] : wantsTerminalCount ? ["terminal_count"] : []),
+              ...(requestedPanelCounts.hasSupportedKeys ? ["panel_counts"] : []),
+              ...(requestedInitializeGit ? ["initialize_git"] : []),
+            ],
+            appliedSettings: {
+              ...(requestedSafetyMode.provided ? { safetyMode: requestedSafetyMode.safetyMode } : {}),
+              ...(requestedTerminalRoles.hasValidRoleCount ? {
+                terminalCount: requestedTerminalRoleList.length,
+                terminalRoles: remoteWorkspaceTerminalRoleCountsForAck(requestedTerminalRoleList),
+              } : wantsTerminalCount ? { terminalCount: seededTerminalRoles?.length ?? requestedTerminalCount } : {}),
+              ...(requestedPanelCounts.hasSupportedKeys ? {
+                panelCounts: {
+                  document: documentsCount,
+                  web: seededWebCount,
+                  "pcb-design": seededPcbCount,
+                  "vm-sandbox": seededVmCount,
+                  "video-editor": seededVideoCount,
+                },
+              } : {}),
+              initializeGit: requestedInitializeGit,
+            },
             workspaceId: workspace.id,
             workspaceRoot: rootDirectory,
             revived: Boolean(revivedWorkspaceId),
+            rejectedFields,
           });
         } catch (error) {
           await recordRemoteCommandStatus(event, "failed", getErrorMessage(error, "Unable to create the workspace on this desktop."), {
@@ -40433,16 +41082,117 @@ export default function App() {
       ].includes(normalizedKind)) {
         const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
         const request = event?.request && typeof event.request === "object" ? event.request : {};
-        const settingsInput = [event?.settings, payload.settings, request.settings]
+        const nestedSettingsInput = [event?.settings, payload.settings, request.settings]
           .find((value) => value && typeof value === "object") || null;
+        const legacySettingsInput = {};
+        const assignLegacySetting = (targetKey, values) => {
+          const value = values.find((candidate) => candidate !== undefined && candidate !== null);
+          if (value !== undefined && value !== null) {
+            legacySettingsInput[targetKey] = value;
+          }
+        };
+        assignLegacySetting("workspace_name", [
+          event?.workspace_name,
+          event?.workspaceName,
+          event?.name,
+          payload.workspace_name,
+          payload.workspaceName,
+          payload.name,
+          request.workspace_name,
+          request.workspaceName,
+          request.name,
+        ]);
+        assignLegacySetting("workspace_root", [
+          event?.workspace_root,
+          event?.workspaceRoot,
+          event?.root_directory,
+          event?.rootDirectory,
+          event?.root,
+          payload.workspace_root,
+          payload.workspaceRoot,
+          payload.root_directory,
+          payload.rootDirectory,
+          payload.root,
+          request.workspace_root,
+          request.workspaceRoot,
+          request.root_directory,
+          request.rootDirectory,
+          request.root,
+        ]);
+        assignLegacySetting("terminal_count", [
+          event?.terminal_count,
+          event?.terminalCount,
+          payload.terminal_count,
+          payload.terminalCount,
+          request.terminal_count,
+          request.terminalCount,
+        ]);
+        assignLegacySetting("terminal_roles", [
+          event?.terminal_roles,
+          event?.terminalRoles,
+          payload.terminal_roles,
+          payload.terminalRoles,
+          request.terminal_roles,
+          request.terminalRoles,
+        ]);
+        assignLegacySetting("safety_mode", [
+          event?.safety_mode,
+          event?.safetyMode,
+          payload.safety_mode,
+          payload.safetyMode,
+          request.safety_mode,
+          request.safetyMode,
+        ]);
+        assignLegacySetting("panel_counts", [
+          event?.panel_counts,
+          event?.panelCounts,
+          payload.panel_counts,
+          payload.panelCounts,
+          request.panel_counts,
+          request.panelCounts,
+        ]);
+        assignLegacySetting("archived", [
+          event?.archived,
+          payload.archived,
+          request.archived,
+        ]);
+        assignLegacySetting("is_default", [
+          event?.is_default,
+          event?.isDefault,
+          payload.is_default,
+          payload.isDefault,
+          request.is_default,
+          request.isDefault,
+        ]);
+        const settingsInput = nestedSettingsInput
+          || (Object.keys(legacySettingsInput).length ? legacySettingsInput : null);
         if (!settingsInput) {
-          await recordRemoteCommandStatus(event, "failed", "Workspace settings update did not include a settings object.", {
+          await recordRemoteCommandStatus(event, "failed", "Workspace settings update did not include any supported settings.", {
             commandId,
             commandKind,
             workspaceId,
           });
           return;
         }
+        const settingsHas = (...keys) => keys.some((key) => (
+          Object.prototype.hasOwnProperty.call(settingsInput, key)
+        ));
+        const settingsValue = (...keys) => {
+          for (const key of keys) {
+            if (Object.prototype.hasOwnProperty.call(settingsInput, key)) {
+              return settingsInput[key];
+            }
+          }
+          return undefined;
+        };
+        const settingsBoolean = (value) => {
+          if (typeof value === "boolean") return { valid: true, value };
+          if (typeof value === "number") return { valid: true, value: value !== 0 };
+          const text = String(value ?? "").trim().toLowerCase();
+          if (["1", "true", "yes", "on"].includes(text)) return { valid: true, value: true };
+          if (["0", "false", "no", "off"].includes(text)) return { valid: true, value: false };
+          return { valid: false, value: false };
+        };
         const requestedName = String(settingsInput.workspace_name ?? settingsInput.workspaceName ?? settingsInput.name ?? "").trim();
         const requestedRootInput = String(
           settingsInput.workspace_root ?? settingsInput.workspaceRoot
@@ -40450,28 +41200,36 @@ export default function App() {
         ).trim();
         const requestedTerminalCountInput = settingsInput.terminal_count ?? settingsInput.terminalCount;
         const wantsTerminalCount = requestedTerminalCountInput !== undefined && requestedTerminalCountInput !== null;
-        if (!requestedName && !requestedRootInput && !wantsTerminalCount) {
-          await recordRemoteCommandStatus(event, "failed", "Workspace settings update supports workspace_name, workspace_root, and terminal_count; none were provided.", {
+        const requestedSafetyMode = normalizeRemoteWorkspaceSafetyMode(
+          settingsValue("safety_mode", "safetyMode"),
+        );
+        const requestedPanelCountsInput = settingsValue("panel_counts", "panelCounts");
+        const requestedPanelCounts = remoteWorkspacePanelCountsRequest(requestedPanelCountsInput);
+        const wantsPanelCounts = requestedPanelCounts.provided;
+        const requestedTerminalRolesInput = settingsValue("terminal_roles", "terminalRoles");
+        const requestedTerminalRoles = remoteWorkspaceTerminalRolesRequest(requestedTerminalRolesInput);
+        const wantsTerminalRoles = requestedTerminalRoles.provided;
+        const wantsArchived = settingsHas("archived");
+        const wantsDefault = settingsHas("is_default", "isDefault");
+        if (
+          !requestedName
+          && !requestedRootInput
+          && !wantsTerminalCount
+          && !wantsTerminalRoles
+          && !requestedSafetyMode.provided
+          && !wantsPanelCounts
+          && !wantsArchived
+          && !wantsDefault
+        ) {
+          await recordRemoteCommandStatus(event, "failed", "Workspace settings update supports workspace_name, workspace_root, terminal_count, terminal_roles, safety_mode, panel_counts, archived, and is_default; none were provided.", {
             commandId,
             commandKind,
             workspaceId,
           });
           return;
         }
-        // Root and terminal-count changes rewire live panes/PTYs; the local
-        // settings panel runs a full slot reconciliation for that. Remotely we
-        // only apply them to deactivated workspaces, where activation rebuilds
-        // the grid from settings anyway.
         const runtimeActive = normalizeEnabledWorkspaceIds(workspaceLifecycleSettingsRef.current?.enabledWorkspaceIds).includes(workspaceId)
           || activatedWorkspaceIdRef.current === workspaceId;
-        if ((requestedRootInput || wantsTerminalCount) && runtimeActive) {
-          await recordRemoteCommandStatus(event, "blocked", "Deactivate the workspace before changing its root or terminal count remotely; only workspace_name can change while it is active.", {
-            commandId,
-            commandKind,
-            workspaceId,
-          });
-          return;
-        }
         if (requestedName && requestedName.length > 80) {
           await recordRemoteCommandStatus(event, "failed", "Workspace name must be 80 characters or fewer.", {
             commandId,
@@ -40483,22 +41241,33 @@ export default function App() {
         const requestedTerminalCount = wantsTerminalCount
           ? Number.parseInt(String(requestedTerminalCountInput), 10)
           : null;
-        if (wantsTerminalCount
-          && (!Number.isInteger(requestedTerminalCount)
-            || requestedTerminalCount < 1
-            || requestedTerminalCount > MAX_WORKSPACE_TERMINAL_COUNT)) {
-          await recordRemoteCommandStatus(event, "failed", `terminal_count must be an integer between 1 and ${MAX_WORKSPACE_TERMINAL_COUNT}.`, {
-            commandId,
-            commandKind,
-            workspaceId,
-          });
-          return;
-        }
         try {
+          const appliedFields = [];
+          const rejectedFields = [];
           const appliedSettings = {};
+          const rejectField = (field, reason, extra = {}) => {
+            rejectedFields.push({ field, reason, ...extra });
+          };
+          requestedTerminalRoles.rejectedFields.forEach((field) => rejectedFields.push(field));
+          requestedPanelCounts.rejectedFields.forEach((field) => rejectedFields.push(field));
           let nextSettingsValues = null;
           let catalogPatch = null;
+          let rootChanged = false;
+          let effectiveRootDirectory = cleanWorkspaceRootDirectory(
+            getWorkspaceRootDirectory(workspaceSettingsRef.current, workspaceId),
+          );
+          let effectiveRootGitRepositoryKnown = getWorkspaceRootGitRepositoryKnown(
+            workspaceSettingsRef.current,
+            workspaceId,
+          );
+          let effectiveRootGitRepository = getWorkspaceRootGitRepository(
+            workspaceSettingsRef.current,
+            workspaceId,
+          );
           if (requestedRootInput) {
+            if (runtimeActive) {
+              rejectField("workspace_root", "workspace_active");
+            } else {
             const normalizedRoot = await invoke("validate_workspace_root_directory", { path: requestedRootInput });
             const rootDirectory = normalizedRoot?.workingDirectory || "";
             if (!rootDirectory) {
@@ -40520,11 +41289,15 @@ export default function App() {
               });
               return;
             }
+            rootChanged = getWorkspaceRootIdentity(rootDirectory) !== getWorkspaceRootIdentity(effectiveRootDirectory);
+            effectiveRootDirectory = rootDirectory;
+            effectiveRootGitRepositoryKnown = true;
+            effectiveRootGitRepository = Boolean(normalizedRoot?.gitRepository || normalizedRoot?.git_repository);
             nextSettingsValues = {
               ...(nextSettingsValues || {}),
               rootDirectory,
               rootWasEmptyAtSelection: Boolean(normalizedRoot?.emptyDirectory),
-              rootGitRepository: Boolean(normalizedRoot?.gitRepository || normalizedRoot?.git_repository),
+              rootGitRepository: effectiveRootGitRepository,
             };
             catalogPatch = {
               ...(catalogPatch || {}),
@@ -40532,23 +41305,130 @@ export default function App() {
               rootIdentity: normalizedRoot?.rootIdentity || getWorkspaceRootIdentity(rootDirectory),
             };
             appliedSettings.workspaceRoot = rootDirectory;
-            void invoke("coordination_bootstrap_workspace", {
-              repoPath: rootDirectory,
-              agentSessionMode: getWorkspaceAgentSessionMode(workspaceSettingsRef.current, workspaceId),
-            }).catch(() => {});
+            appliedFields.push("workspace_root");
+            }
           }
-          if (wantsTerminalCount) {
-            // Stored count only; activation normalizes roles/slot indexes for
-            // the new count when the workspace next boots.
+          if (wantsTerminalCount
+            && (!Number.isInteger(requestedTerminalCount)
+              || requestedTerminalCount < 0)) {
+            rejectField("terminal_count", "invalid_value", { value: requestedTerminalCountInput });
+          }
+          if (wantsTerminalCount && runtimeActive) {
+            rejectField("terminal_count", "workspace_active");
+          }
+          if (wantsTerminalRoles && !requestedTerminalRoles.hasValidRoleCount) {
+            if (!requestedTerminalRoles.rejectedFields.length) {
+              rejectField("terminal_roles", "invalid_value");
+            }
+          }
+          if (wantsTerminalRoles && runtimeActive) {
+            rejectField("terminal_roles", "workspace_active");
+          }
+          if (wantsPanelCounts && runtimeActive) {
+            rejectField("panel_counts", "workspace_active");
+          }
+          const terminalCountCanApply = wantsTerminalCount
+            && !wantsTerminalRoles
+            && !rejectedFields.some((field) => field.field === "terminal_count");
+          const terminalRolesCanApply = wantsTerminalRoles
+            && requestedTerminalRoles.hasValidRoleCount
+            && !rejectedFields.some((field) => field.field === "terminal_roles");
+          const panelCountsCanApply = wantsPanelCounts
+            && requestedPanelCounts.hasSupportedKeys
+            && !rejectedFields.some((field) => field.field === "panel_counts");
+          if ((terminalCountCanApply || terminalRolesCanApply || panelCountsCanApply)
+            && !runtimeActive
+          ) {
+            const layoutPatch = buildWorkspaceSettingsLayoutPatch({
+              displayLayouts: workspaceTerminalDisplayLayoutsRef.current,
+              fallbackRole: workspaceTerminalFallbackRole,
+              panelCounts: panelCountsCanApply ? requestedPanelCounts.panelCounts : null,
+              rootChanged,
+              terminalCount: terminalCountCanApply
+                ? Math.min(MAX_WORKSPACE_TERMINAL_COUNT, requestedTerminalCount)
+                : undefined,
+              terminalRoles: terminalRolesCanApply ? requestedTerminalRoles.roles : undefined,
+              workspaceId,
+              workspaceSettings: workspaceSettingsRef.current,
+              workspaceTerminalLogicalIndexes: workspaceTerminalLogicalIndexesRef.current,
+              workspaceTerminalRoleOptions: terminalRolesCanApply
+                ? WORKSPACE_TERMINAL_ROLE_OPTIONS
+                : workspaceTerminalRoleOptions,
+            });
             nextSettingsValues = {
               ...(nextSettingsValues || {}),
-              terminalCount: requestedTerminalCount,
+              terminalCount: layoutPatch.terminalCount,
+              terminalRoles: layoutPatch.terminalRoles,
+              documentsCount: layoutPatch.documentsCount,
+              pcbCount: layoutPatch.pcbCount,
+              vmCount: layoutPatch.vmCount,
+              videoCount: layoutPatch.videoCount,
+              paneKinds: layoutPatch.paneKinds,
+              logicalTerminalIndexes: layoutPatch.logicalTerminalIndexes,
+              displayRows: layoutPatch.displayRows,
+              minimizedPaneIndexes: layoutPatch.minimizedPaneIndexes,
             };
-            appliedSettings.terminalCount = requestedTerminalCount;
+            const nextLogicalIndexesByWorkspace = {
+              ...workspaceTerminalLogicalIndexesRef.current,
+              [workspaceId]: layoutPatch.logicalTerminalIndexes,
+            };
+            const nextDisplayLayouts = {
+              ...workspaceTerminalDisplayLayoutsRef.current,
+              [workspaceId]: layoutPatch.displayRows,
+            };
+            workspaceTerminalLogicalIndexesRef.current = nextLogicalIndexesByWorkspace;
+            workspaceTerminalDisplayLayoutsRef.current = nextDisplayLayouts;
+            setWorkspaceTerminalLogicalIndexes(nextLogicalIndexesByWorkspace);
+              setWorkspaceTerminalDisplayLayouts(nextDisplayLayouts);
+            if (terminalRolesCanApply) {
+              appliedSettings.terminalCount = layoutPatch.terminalOnlyCount;
+              appliedSettings.terminalRoles = remoteWorkspaceTerminalRoleCountsForAck(layoutPatch.terminalOnlyRoles);
+              appliedFields.push("terminal_roles");
+            } else if (terminalCountCanApply) {
+              appliedSettings.terminalCount = layoutPatch.terminalOnlyCount;
+              appliedFields.push("terminal_count");
+            }
+            if (panelCountsCanApply) {
+              appliedSettings.panelCounts = layoutPatch.panelCounts;
+              appliedFields.push("panel_counts");
+            }
+          }
+          if (requestedSafetyMode.provided) {
+            if (!requestedSafetyMode.valid) {
+              rejectField("safety_mode", "unsupported_value", { value: requestedSafetyMode.safetyMode });
+            } else if (
+              requestedSafetyMode.agentSessionMode === AGENT_SESSION_MODE_WORKTREE
+              && effectiveRootGitRepositoryKnown
+              && !effectiveRootGitRepository
+            ) {
+              rejectField("safety_mode", "safe_requires_git");
+            } else {
+              const agentSessionMode = normalizeAgentSessionMode(
+                requestedSafetyMode.agentSessionMode,
+                false,
+                !effectiveRootGitRepositoryKnown || effectiveRootGitRepository,
+              );
+              nextSettingsValues = {
+                ...(nextSettingsValues || {}),
+                agentSessionMode,
+                gitWorktreesEnabled: agentSessionMode === AGENT_SESSION_MODE_WORKTREE,
+              };
+              appliedSettings.safetyMode = requestedSafetyMode.safetyMode;
+              appliedFields.push("safety_mode");
+              if (effectiveRootDirectory) {
+                await invoke("coordination_update_repo_policy", {
+                  repoPath: effectiveRootDirectory,
+                  input: {
+                    agent_session_mode: agentSessionMode,
+                  },
+                }).catch(() => {});
+              }
+            }
           }
           if (requestedName) {
             catalogPatch = { ...(catalogPatch || {}), name: requestedName };
             appliedSettings.workspaceName = requestedName;
+            appliedFields.push("workspace_name");
           }
           if (nextSettingsValues) {
             const nextWorkspaceSettings = updateWorkspaceLocalSettings(
@@ -40577,11 +41457,136 @@ export default function App() {
               workspaces: nextCatalog,
             }).catch(() => {});
           }
+          if (requestedRootInput && appliedFields.includes("workspace_root")) {
+            void invoke("coordination_bootstrap_workspace", {
+              repoPath: effectiveRootDirectory,
+              agentSessionMode: getWorkspaceAgentSessionMode(workspaceSettingsRef.current, workspaceId),
+            }).catch(() => {});
+          }
+          if (wantsDefault) {
+            const parsedDefault = settingsBoolean(settingsValue("is_default", "isDefault"));
+            if (!parsedDefault.valid) {
+              rejectField("is_default", "invalid_value");
+            } else {
+              const currentDefaultWorkspaceId = workspaceLifecycleSettingsRef.current?.defaultWorkspaceId || "";
+              if (parsedDefault.value) {
+                setDefaultWorkspace(workspaceId, "remote_workspace_settings_update");
+              } else if (currentDefaultWorkspaceId === workspaceId) {
+                setDefaultWorkspace("", "remote_workspace_settings_update");
+              }
+              appliedSettings.isDefault = parsedDefault.value;
+              appliedFields.push("is_default");
+            }
+          }
+          if (wantsArchived) {
+            const parsedArchived = settingsBoolean(settingsValue("archived"));
+            if (!parsedArchived.valid) {
+              rejectField("archived", "invalid_value");
+            } else if (parsedArchived.value) {
+              await archiveWorkspaceLocally(workspaceId);
+              const archivedWorkspace = findWorkspaceById(workspaceCatalogRef.current, workspaceId);
+              if (workspaceIsLocallyArchived(archivedWorkspace)) {
+                appliedSettings.archived = true;
+                appliedFields.push("archived");
+              } else {
+                rejectField("archived", "archive_failed");
+              }
+            } else {
+              const archivedWorkspace = findWorkspaceById(workspaceCatalogRef.current, workspaceId);
+              if (!workspaceIsLocallyArchived(archivedWorkspace)) {
+                rejectField("archived", "already_unarchived");
+              } else {
+                const requestedRoot = workspaceCatalogEntryRootDirectory(
+                  archivedWorkspace,
+                  workspaceSettingsRef.current,
+                  defaultWorkingDirectoryRef.current,
+                );
+                if (!requestedRoot) {
+                  rejectField("archived", "unarchive_unsupported");
+                } else {
+                  try {
+                    const normalizedRoot = await invoke("validate_workspace_root_directory", { path: requestedRoot });
+                    const rootDirectory = normalizedRoot?.workingDirectory || "";
+                    if (!rootDirectory) {
+                      throw new Error("Workspace root directory was not returned by validation.");
+                    }
+                    const duplicateWorkspace = findWorkspaceByEffectiveRoot(
+                      workspaceCatalogRef.current,
+                      workspaceSettingsRef.current,
+                      rootDirectory,
+                      defaultWorkingDirectoryRef.current,
+                      workspaceId,
+                    );
+                    if (duplicateWorkspace) {
+                      rejectField("archived", "duplicate_workspace_root", {
+                        duplicateWorkspaceId: duplicateWorkspace.id,
+                      });
+                    } else {
+                      const rootIdentity = normalizedRoot?.rootIdentity || getWorkspaceRootIdentity(rootDirectory);
+                      const restoredAtIso = new Date().toISOString();
+                      const nextCatalog = (Array.isArray(workspaceCatalogRef.current) ? workspaceCatalogRef.current : [])
+                        .map((workspace) => (workspace.id === workspaceId ? {
+                          ...workspace,
+                          rootDirectory,
+                          rootIdentity,
+                          localArchived: false,
+                          localArchivedAt: "",
+                          locallyArchived: false,
+                          locallyArchivedAt: "",
+                          updatedAt: restoredAtIso,
+                        } : workspace));
+                      const nextWorkspaces = visibleWorkspaceCatalog(nextCatalog);
+                      const nextWorkspaceSettings = updateWorkspaceLocalSettings(
+                        workspaceSettingsRef.current,
+                        workspaceId,
+                        {
+                          rootDirectory,
+                          rootWasEmptyAtSelection: Boolean(normalizedRoot?.emptyDirectory),
+                          rootGitRepository: Boolean(normalizedRoot?.gitRepository || normalizedRoot?.git_repository),
+                        },
+                      );
+                      workspaceSettingsRef.current = nextWorkspaceSettings;
+                      persistWorkspaceSettings(nextWorkspaceSettings);
+                      setWorkspaceSettings(nextWorkspaceSettings);
+                      workspaceCatalogRef.current = nextCatalog;
+                      setWorkspaceCatalog(nextCatalog);
+                      workspacesRef.current = nextWorkspaces;
+                      setWorkspaces(nextWorkspaces);
+                      void invoke("local_workspaces_store", {
+                        scopeKey: activeAccountScopeKey,
+                        workspaces: nextCatalog,
+                      }).catch(() => {});
+                      appliedSettings.archived = false;
+                      appliedFields.push("archived");
+                    }
+                  } catch (error) {
+                    rejectField("archived", "unarchive_unsupported", {
+                      message: getErrorMessage(error, "Unable to restore workspace."),
+                    });
+                  }
+                }
+              }
+            }
+          }
           await syncRemoteControlState("remote_workspace_settings_update");
-          await recordRemoteCommandStatus(event, "completed", "Workspace settings updated on this desktop.", {
+          const appliedCount = appliedFields.length;
+          const rejectedCount = rejectedFields.length;
+          const status = appliedCount > 0
+            ? "completed"
+            : rejectedFields.some((field) => field.reason === "workspace_active")
+              ? "blocked"
+              : "failed";
+          const message = appliedCount > 0
+            ? rejectedCount > 0
+              ? "Workspace settings partially updated on this desktop."
+              : "Workspace settings updated on this desktop."
+            : "No requested workspace settings were applied.";
+          await recordRemoteCommandStatus(event, status, message, {
+            appliedFields,
             appliedSettings,
             commandId,
             commandKind,
+            rejectedFields,
             workspaceId,
           });
         } catch (error) {
@@ -40696,6 +41701,21 @@ export default function App() {
       if (["terminal_close", "close_terminal", "terminal_force_close", "force_close_terminal"].includes(normalizedKind)) {
         const { terminal } = findRemoteControlTerminal(workspaceId, target);
         if (!terminal) {
+          if (Number.isInteger(targetTerminalIndex)) {
+            closeWorkspaceTerminal({
+              terminalIndex: targetTerminalIndex,
+              workspaceId,
+            });
+            await syncRemoteControlState("remote_terminal_closed_slot_removed");
+            await recordRemoteCommandStatus(event, "completed", "Terminal slot removed from this desktop.", {
+              commandId,
+              commandKind,
+              target,
+              terminalIndex: targetTerminalIndex,
+              workspaceId,
+            });
+            return;
+          }
           await recordRemoteCommandStatus(event, "failed", "Target terminal was not found on this desktop.", {
             commandId,
             commandKind,
@@ -50622,6 +51642,10 @@ export default function App() {
   ]);
 
   useEffect(() => {
+    if (!workspaceSettingsModalId || !selectedWorkspace) {
+      return;
+    }
+
     setWorkspaceNameDraft(selectedWorkspace?.name || "");
     setWorkspaceTerminalCountDraft(String(selectedWorkspace ? selectedWorkspaceTerminalOnlyCount : DEFAULT_WORKSPACE_TERMINAL_COUNT));
     setWorkspaceDocumentCountDraft(String(selectedWorkspace ? selectedWorkspaceDocumentCount : DEFAULT_WORKSPACE_DOCUMENT_COUNT));
@@ -51641,12 +52665,17 @@ export default function App() {
                           && runtimeWorkspace.id === selectedWorkspace?.id
                           && shouldRevealWorkspaceTerminal,
                       );
+                      const runtimeEffectsVisible = Boolean(
+                        runtimeVisible
+                          && runtimeWorkspace?.id
+                          && runtimeWorkspace.id === workspaceTerminalEffectsWorkspaceId,
+                      );
                       const runtimeIsDeactivating = Boolean(
                         workspaceDeactivationState.isActive
                           && workspaceDeactivationState.workspaceId === runtimeWorkspace?.id,
                       );
                       const runtimeAgentLaunchReady = Boolean(
-                        runtimeVisible
+                        runtimeEffectsVisible
                           && workspaceState === "ready"
                           && workspaceHydrationReady
                           && !workspaceActivationDeferred
@@ -51731,8 +52760,8 @@ export default function App() {
                             ] || null}
                             handlePreparedTerminalChange={handlePreparedTerminalChange}
                             isAppClosing={workspaceCloseState.isActive}
-                            isWorkspaceRuntimeVisible={runtimeVisible}
-                            isWorkspaceSurfaceVisible={visibleView === DEFAULT_WORKSPACE_VIEW && runtimeVisible}
+                            isWorkspaceRuntimeVisible={runtimeEffectsVisible}
+                            isWorkspaceSurfaceVisible={visibleView === DEFAULT_WORKSPACE_VIEW && runtimeEffectsVisible}
                             isWorkspaceRuntimeDeactivating={runtimeIsDeactivating}
                             manageWorkspaceAgents={manageWorkspaceAgents}
                             onShowWorkspaceTerminals={requestWorkspaceActivation}
@@ -51765,7 +52794,7 @@ export default function App() {
                             minimizedPaneIndexes={runtimeDescriptor.minimizedPaneIndexes}
                             terminalThreadsByIndex={runtimeDescriptor.threadsByIndex}
                             viewMotion={viewMotion}
-                            workspaceAgentLaunchEpoch={runtimeVisible ? workspaceAgentLaunchEpoch : 0}
+                            workspaceAgentLaunchEpoch={runtimeEffectsVisible ? workspaceAgentLaunchEpoch : 0}
                             workspaceError={workspaceError}
                             workspaceName={runtimeWorkspace.name || workspaceName}
                             workspaceSyncState={workspaceSyncState}
@@ -52297,6 +53326,14 @@ export default function App() {
                     >
                       <ButtonSecurityIcon aria-hidden="true" />
                       <span>Permissions</span>
+                    </SettingsTabButton>
+                    <SettingsTabButton
+                      data-active={settingsTab === SETTINGS_TAB_SSH ? "true" : undefined}
+                      onClick={() => setSettingsTab(SETTINGS_TAB_SSH)}
+                      type="button"
+                    >
+                      <ButtonTerminalIcon aria-hidden="true" />
+                      <span>SSH clients</span>
                     </SettingsTabButton>
                   </SettingsTabNav>
 
@@ -52948,6 +53985,8 @@ export default function App() {
                     </AccountCard>
                   </AccountSettingsPanel>
                     </>
+                  ) : settingsTab === SETTINGS_TAB_SSH ? (
+                    <SshSettingsPanel />
                   ) : (
                     <AccountSettingsPanel>
                       <SettingsSectionHeader>

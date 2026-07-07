@@ -282,13 +282,13 @@ fn agent_chat_session_sync_test_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poison| poison.into_inner())
 }
 
-fn agent_chat_session_history_source_fingerprints(
-) -> &'static StdMutex<HashMap<String, AgentChatSessionHistorySourceFingerprint>> {
+fn agent_chat_session_history_source_fingerprints()
+-> &'static StdMutex<HashMap<String, AgentChatSessionHistorySourceFingerprint>> {
     AGENT_CHAT_SESSION_HISTORY_SOURCE_FINGERPRINTS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
-fn agent_chat_session_history_backfill_workspaces(
-) -> &'static StdMutex<HashMap<String, AgentChatSessionHistoryBackfillWorkspace>> {
+fn agent_chat_session_history_backfill_workspaces()
+-> &'static StdMutex<HashMap<String, AgentChatSessionHistoryBackfillWorkspace>> {
     AGENT_CHAT_SESSION_HISTORY_BACKFILL_WORKSPACES.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
@@ -2362,6 +2362,62 @@ fn agent_chat_session_sync_claude_messages_for_line(
     messages
 }
 
+struct AgentChatSessionSyncPendingCodexUserRecord {
+    line_index: usize,
+    timestamp: String,
+    normalized_text: String,
+    normalized_messages: Vec<Value>,
+    record: Option<Value>,
+}
+
+fn agent_chat_session_sync_flush_pending_codex_user_records(
+    pending: &mut Vec<AgentChatSessionSyncPendingCodexUserRecord>,
+    current: Option<(usize, &str)>,
+    records: &mut Vec<Value>,
+    thread_detail_messages: &mut Vec<Value>,
+) {
+    let mut index = 0usize;
+    while index < pending.len() {
+        let should_flush = match current {
+            Some((line_index, timestamp)) => !codex_user_message_in_dedupe_window(
+                pending[index].line_index,
+                &pending[index].timestamp,
+                line_index,
+                timestamp,
+            ),
+            None => true,
+        };
+        if should_flush {
+            let pending_record = pending.remove(index);
+            thread_detail_messages.extend(pending_record.normalized_messages);
+            if let Some(record) = pending_record.record {
+                records.push(record);
+            }
+        } else {
+            index = index.saturating_add(1);
+        }
+    }
+}
+
+fn agent_chat_session_sync_drop_pending_codex_user_records(
+    pending: &mut Vec<AgentChatSessionSyncPendingCodexUserRecord>,
+    line_index: usize,
+    timestamp: &str,
+    normalized_text: &str,
+) -> usize {
+    let before = pending.len();
+    pending.retain(|entry| {
+        entry.normalized_text != normalized_text
+            || !codex_user_message_in_dedupe_window(
+                entry.line_index,
+                &entry.timestamp,
+                line_index,
+                timestamp,
+            )
+    });
+    before.saturating_sub(pending.len())
+}
+
 fn agent_chat_session_sync_jsonl_source(
     provider: &str,
     source_kind: &str,
@@ -2395,6 +2451,8 @@ fn agent_chat_session_sync_jsonl_source(
     let mut tool_metadata = HashMap::<String, TranscriptToolCallMetadata>::new();
     let mut active_codex_subagents = Vec::<Value>::new();
     let mut claude_sidechains = TranscriptClaudeSidechainTracker::default();
+    let mut codex_user_dedupe = CodexUserMessageDedupeTracker::default();
+    let mut pending_codex_user_records = Vec::<AgentChatSessionSyncPendingCodexUserRecord>::new();
 
     loop {
         buffer.clear();
@@ -2416,7 +2474,6 @@ fn agent_chat_session_sync_jsonl_source(
             line_index = line_index.saturating_add(1);
             continue;
         };
-        total_record_count = total_record_count.saturating_add(1);
         let candidate_model_config = agent_chat_session_sync_model_config_from_raw(&value);
         let candidate_model_config_fingerprint =
             agent_chat_session_sync_model_config_fingerprint(&candidate_model_config);
@@ -2432,6 +2489,16 @@ fn agent_chat_session_sync_jsonl_source(
             latest_timestamp = timestamp.clone();
         }
         if provider == "codex" {
+            if codex_value_is_internal_context_record(&value) {
+                line_index = line_index.saturating_add(1);
+                continue;
+            }
+            agent_chat_session_sync_flush_pending_codex_user_records(
+                &mut pending_codex_user_records,
+                Some((line_index, &timestamp)),
+                &mut records,
+                &mut thread_detail_messages,
+            );
             if value.get("type").and_then(Value::as_str) == Some("session_meta") {
                 let payload = value.get("payload").unwrap_or(&Value::Null);
                 let candidate_session_id = clean_codex_id(value_string(payload.get("id")));
@@ -2490,8 +2557,29 @@ fn agent_chat_session_sync_jsonl_source(
                 _ => {}
             }
         }
+        total_record_count = total_record_count.saturating_add(1);
 
         let codex_payload = value.get("payload").unwrap_or(&Value::Null);
+        let codex_event_user_text = (provider == "codex")
+            .then(|| codex_event_user_message_normalized_text(codex_payload))
+            .flatten();
+        let codex_response_user_text = (provider == "codex")
+            .then(|| codex_response_item_user_message_normalized_text(codex_payload))
+            .flatten();
+        let codex_response_user_matches_event =
+            codex_response_user_text
+                .as_deref()
+                .is_some_and(|normalized_text| {
+                    codex_user_dedupe.matches_recent_event(line_index, &timestamp, normalized_text)
+                });
+        if provider == "codex" && codex_event_user_text.is_none() {
+            agent_chat_session_sync_flush_pending_codex_user_records(
+                &mut pending_codex_user_records,
+                None,
+                &mut records,
+                &mut thread_detail_messages,
+            );
+        }
         let mut parsed_messages = if provider == "claude" {
             agent_chat_session_sync_claude_messages_for_line(
                 line_index,
@@ -2514,7 +2602,6 @@ fn agent_chat_session_sync_jsonl_source(
             transcript_record_tool_call_metadata(&mut tool_metadata, message);
         }
         let normalized_messages = agent_chat_session_sync_messages_value(parsed_messages);
-        thread_detail_messages.extend(normalized_messages.iter().cloned());
         let record_kind = value
             .get("type")
             .and_then(Value::as_str)
@@ -2524,7 +2611,7 @@ fn agent_chat_session_sync_jsonl_source(
         let record_key = format!(
             "{provider}:{session_id}:jsonl:v{AGENT_CHAT_SESSION_SYNC_RECORD_KEY_VERSION}:{line_index}:{start_offset}:{line_hash}"
         );
-        if let Some(record) = agent_chat_session_sync_record(
+        let record = agent_chat_session_sync_record(
             acked,
             provider,
             &session_id,
@@ -2540,8 +2627,78 @@ fn agent_chat_session_sync_jsonl_source(
             }),
             timestamp.clone(),
             value,
-            normalized_messages,
-        ) {
+            normalized_messages.clone(),
+        );
+        if provider == "codex" {
+            if let Some(normalized_text) = codex_event_user_text.as_ref() {
+                let dropped_count = agent_chat_session_sync_drop_pending_codex_user_records(
+                    &mut pending_codex_user_records,
+                    line_index,
+                    &timestamp,
+                    normalized_text,
+                );
+                total_record_count = total_record_count.saturating_sub(dropped_count);
+                agent_chat_session_sync_flush_pending_codex_user_records(
+                    &mut pending_codex_user_records,
+                    None,
+                    &mut records,
+                    &mut thread_detail_messages,
+                );
+                codex_user_dedupe.observe_event(line_index, &timestamp, normalized_text.clone());
+            }
+        }
+        if provider == "codex" && codex_response_user_matches_event {
+            total_record_count = total_record_count.saturating_sub(1);
+            if should_emit_model_config {
+                if let Some(record) = agent_chat_session_sync_model_config_record(
+                    acked,
+                    provider,
+                    &session_id,
+                    line_index,
+                    start_offset,
+                    &timestamp,
+                    &candidate_model_config,
+                ) {
+                    records.push(record);
+                }
+            }
+            if !candidate_model_config_fingerprint.is_empty() {
+                last_model_config_fingerprint = candidate_model_config_fingerprint;
+            }
+            line_index = line_index.saturating_add(1);
+            continue;
+        }
+        if provider == "codex" {
+            if let Some(normalized_text) = codex_response_user_text {
+                pending_codex_user_records.push(AgentChatSessionSyncPendingCodexUserRecord {
+                    line_index,
+                    timestamp: timestamp.clone(),
+                    normalized_text,
+                    normalized_messages,
+                    record,
+                });
+                if should_emit_model_config {
+                    if let Some(record) = agent_chat_session_sync_model_config_record(
+                        acked,
+                        provider,
+                        &session_id,
+                        line_index,
+                        start_offset,
+                        &timestamp,
+                        &candidate_model_config,
+                    ) {
+                        records.push(record);
+                    }
+                }
+                if !candidate_model_config_fingerprint.is_empty() {
+                    last_model_config_fingerprint = candidate_model_config_fingerprint;
+                }
+                line_index = line_index.saturating_add(1);
+                continue;
+            }
+        }
+        thread_detail_messages.extend(normalized_messages.iter().cloned());
+        if let Some(record) = record {
             records.push(record);
         }
         if should_emit_model_config {
@@ -2562,6 +2719,12 @@ fn agent_chat_session_sync_jsonl_source(
         }
         line_index = line_index.saturating_add(1);
     }
+    agent_chat_session_sync_flush_pending_codex_user_records(
+        &mut pending_codex_user_records,
+        None,
+        &mut records,
+        &mut thread_detail_messages,
+    );
 
     let model_id = agent_chat_session_sync_provider_enum(provider)
         .and_then(|provider| agent_session_last_model(provider, &session_id))
@@ -4285,6 +4448,38 @@ mod agent_chat_session_sync_tests {
         }
     }
 
+    fn codex_sync_source_from_lines(name: &str, lines: Vec<Value>) -> AgentChatSessionSyncSource {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = env::temp_dir().join(format!("{name}-{suffix}"));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout-test.jsonl");
+        let body = lines
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, format!("{body}\n")).unwrap();
+        let source = agent_chat_session_sync_jsonl_source(
+            "codex",
+            "codex_jsonl",
+            &path,
+            "codex-session",
+            CodexRolloutMeta {
+                session_id: "codex-session".to_string(),
+                cwd: "/tmp/project".to_string(),
+                latest_timestamp: String::new(),
+                title: String::new(),
+            },
+            &HashMap::new(),
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(root);
+        source
+    }
+
     #[test]
     fn agent_chat_session_sync_chunks_records_by_session_packet_limit() {
         let records = (0..=AGENT_CHAT_SESSION_SYNC_MAX_RECORDS_PER_PACKET)
@@ -4338,18 +4533,18 @@ mod agent_chat_session_sync_tests {
             );
         }
 
-        assert!(agent_chat_session_sync_cached_turn_summary_message(
-            "codex",
-            "session-0",
-            "turn-a"
-        )
-        .is_none());
-        assert!(agent_chat_session_sync_cached_turn_summary_message(
-            "codex",
-            &format!("session-{AGENT_CHAT_SESSION_SYNC_TURN_SUMMARY_CACHE_SESSION_MAX}"),
-            "turn-a"
-        )
-        .is_some());
+        assert!(
+            agent_chat_session_sync_cached_turn_summary_message("codex", "session-0", "turn-a")
+                .is_none()
+        );
+        assert!(
+            agent_chat_session_sync_cached_turn_summary_message(
+                "codex",
+                &format!("session-{AGENT_CHAT_SESSION_SYNC_TURN_SUMMARY_CACHE_SESSION_MAX}"),
+                "turn-a"
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -4506,10 +4701,117 @@ mod agent_chat_session_sync_tests {
                 <= CODEX_TRANSCRIPT_MAX_RECORD_MESSAGES_BYTES
         );
         assert_eq!(messages[0]["truncated"], json!(true));
-        assert!(messages[0]["text"]
-            .as_str()
-            .unwrap_or_default()
-            .ends_with("[truncated]"));
+        assert!(
+            messages[0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("[truncated]")
+        );
+    }
+
+    #[test]
+    fn agent_chat_session_sync_skips_codex_internal_context_and_turn_context_records() {
+        let source = codex_sync_source_from_lines(
+            "codex-sync-skips-internal",
+            vec![
+                json!({
+                    "type": "response_item",
+                    "timestamp": "2026-07-02T00:00:00Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "# AGENTS.md instructions for /tmp/project\n<INSTRUCTIONS>"
+                        }]
+                    }
+                }),
+                json!({
+                    "type": "turn_context",
+                    "timestamp": "2026-07-02T00:00:01Z",
+                    "payload": {"cwd": "/tmp/project"}
+                }),
+                json!({
+                    "type": "environment_context",
+                    "timestamp": "2026-07-02T00:00:02Z",
+                    "cwd": "/tmp/project"
+                }),
+            ],
+        );
+
+        assert!(source.records.is_empty());
+        assert!(source.thread_detail_messages.is_empty());
+        assert_eq!(source.total_record_count, 0);
+    }
+
+    #[test]
+    fn agent_chat_session_sync_prefers_event_user_message_over_response_item() {
+        let source = codex_sync_source_from_lines(
+            "codex-sync-user-dedupe",
+            vec![
+                json!({
+                    "type": "response_item",
+                    "timestamp": "2026-07-02T00:00:00Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "typed prompt"}]
+                    }
+                }),
+                json!({
+                    "type": "environment_context",
+                    "timestamp": "2026-07-02T00:00:00.500Z",
+                    "cwd": "/tmp/project"
+                }),
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-07-02T00:00:01Z",
+                    "payload": {"type": "user_message", "message": "typed prompt"}
+                }),
+            ],
+        );
+
+        assert_eq!(source.records.len(), 1);
+        assert_eq!(source.records[0]["record_kind"], json!("event_msg"));
+        assert_eq!(
+            source.records[0]["messages"][0]["id"],
+            json!("codex-2-user")
+        );
+        assert_eq!(source.thread_detail_messages.len(), 1);
+        assert_eq!(
+            source.thread_detail_messages[0]["id"],
+            json!("codex-2-user")
+        );
+        assert_eq!(source.total_record_count, 1);
+    }
+
+    #[test]
+    fn agent_chat_session_sync_keeps_response_item_only_user_message() {
+        let source = codex_sync_source_from_lines(
+            "codex-sync-response-user-only",
+            vec![json!({
+                "type": "response_item",
+                "timestamp": "2026-07-02T00:00:00Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "queued prompt"}]
+                }
+            })],
+        );
+
+        assert_eq!(source.records.len(), 1);
+        assert_eq!(source.records[0]["record_kind"], json!("response_item"));
+        assert_eq!(
+            source.records[0]["messages"][0]["id"],
+            json!("codex-0-user")
+        );
+        assert_eq!(source.thread_detail_messages.len(), 1);
+        assert_eq!(
+            source.thread_detail_messages[0]["text"],
+            json!("queued prompt")
+        );
+        assert_eq!(source.total_record_count, 1);
     }
 
     #[test]
@@ -4740,11 +5042,13 @@ mod agent_chat_session_sync_tests {
             "gpt-5.5",
             &json!({}),
         );
-        assert!(detail["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|message| message["kind"] == json!("turn_summary")));
+        assert!(
+            detail["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| message["kind"] == json!("turn_summary"))
+        );
     }
 
     #[test]
@@ -4789,10 +5093,12 @@ mod agent_chat_session_sync_tests {
 
         assert_eq!(source.records.len(), 1);
         assert_eq!(source.records[0], record_before);
-        assert!(source
-            .thread_detail_messages
-            .iter()
-            .any(agent_chat_session_sync_message_has_file_change));
+        assert!(
+            source
+                .thread_detail_messages
+                .iter()
+                .any(agent_chat_session_sync_message_has_file_change)
+        );
     }
 
     #[test]
@@ -5168,9 +5474,11 @@ mod agent_chat_session_sync_tests {
         assert_eq!(detail["stats"]["fileCount"], json!(1));
         assert_eq!(detail["stats"]["additions"], json!(2));
         assert_eq!(detail["stats"]["deletions"], json!(1));
-        assert!(!items
-            .iter()
-            .any(|item| item["id"].as_str() == Some("summary-edit")));
+        assert!(
+            !items
+                .iter()
+                .any(|item| item["id"].as_str() == Some("summary-edit"))
+        );
     }
 
     #[test]

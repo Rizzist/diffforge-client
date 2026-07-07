@@ -626,6 +626,70 @@ function threadToolMetadataHasContent(metadata) {
   return Object.keys(normalizeThreadToolMetadata(metadata)).length > 0;
 }
 
+function normalizeThreadStructuredTranscriptMetadata(value = {}) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const metadata = {};
+  const copyValue = (targetKey, keys) => {
+    const entry = pickThreadToolValue(source, keys);
+    if (threadToolValueHasContent(entry)) {
+      metadata[targetKey] = entry;
+    }
+  };
+  const copyText = (targetKey, keys) => {
+    const entry = cleanText(keys.map((key) => source[key]).find((candidate) => cleanText(candidate)));
+    if (entry) {
+      metadata[targetKey] = entry;
+    }
+  };
+  const copyNumber = (targetKey, keys) => {
+    const entry = keys.map((key) => Number(source[key])).find(Number.isFinite);
+    if (Number.isFinite(entry)) {
+      metadata[targetKey] = entry;
+    }
+  };
+  const copyBool = (targetKey, keys) => {
+    const key = keys.find((candidate) => Object.prototype.hasOwnProperty.call(source, candidate));
+    if (!key) return;
+    metadata[targetKey] = source[key] === true
+      || source[key] === 1
+      || cleanText(source[key]).toLowerCase() === "true";
+  };
+
+  copyText("canonicalKind", ["canonicalKind", "canonical_kind"]);
+  copyText("canonical_kind", ["canonical_kind", "canonicalKind"]);
+  copyText("legacyKind", ["legacyKind", "legacy_kind"]);
+  copyText("legacy_kind", ["legacy_kind", "legacyKind"]);
+  copyText("recordId", ["recordId", "record_id"]);
+  copyText("record_id", ["record_id", "recordId"]);
+  copyText("startedAt", ["startedAt", "started_at"]);
+  copyText("started_at", ["started_at", "startedAt"]);
+  copyText("completedAt", ["completedAt", "completed_at"]);
+  copyText("completed_at", ["completed_at", "completedAt"]);
+  copyNumber("recordSeq", ["recordSeq", "record_seq"]);
+  copyNumber("record_seq", ["record_seq", "recordSeq"]);
+  copyNumber("durationMs", ["durationMs", "duration_ms"]);
+  copyNumber("duration_ms", ["duration_ms", "durationMs"]);
+  copyBool("truncated", ["truncated", "is_truncated", "isTruncated", "partial"]);
+  copyBool("is_truncated", ["is_truncated", "isTruncated", "truncated", "partial"]);
+  copyBool("isTruncated", ["isTruncated", "is_truncated", "truncated", "partial"]);
+  copyBool("partial", ["partial", "truncated", "is_truncated", "isTruncated"]);
+  copyValue("tool", ["tool", "tool_call", "toolCall"]);
+  copyValue("tool_call", ["tool_call", "tool", "toolCall"]);
+  copyValue("toolCall", ["toolCall", "tool", "tool_call"]);
+  copyValue("file_change", ["file_change", "fileChange"]);
+  copyValue("fileChange", ["fileChange", "file_change"]);
+  copyValue("subagent", ["subagent", "subAgent"]);
+  copyValue("subAgent", ["subAgent", "subagent"]);
+  copyValue("usage", ["usage", "usage_report", "usageReport", "token_usage", "tokenUsage"]);
+  copyValue("usage_report", ["usage_report", "usage", "usageReport", "token_usage", "tokenUsage"]);
+  copyValue("usageReport", ["usageReport", "usage", "usage_report", "token_usage", "tokenUsage"]);
+  copyValue("files", ["files", "changed_files", "changedFiles"]);
+  copyValue("changed_files", ["changed_files", "files", "changedFiles"]);
+  copyValue("changedFiles", ["changedFiles", "files", "changed_files"]);
+
+  return metadata;
+}
+
 function normalizeThreadArtifact(artifact) {
   if (!artifact || typeof artifact !== "object" || Array.isArray(artifact)) {
     return null;
@@ -1658,6 +1722,7 @@ function normalizeThreadMessage(message) {
       : cleanMessageText(rawText);
   const artifacts = normalizeThreadArtifacts(message.artifacts || message.attachments);
   const toolMetadata = normalizeThreadToolMetadata(message);
+  const structuredMetadata = normalizeThreadStructuredTranscriptMetadata(message);
   const title = cleanText(message.title);
   const status = cleanText(message.status, "submitted");
   const projectionHash = getThreadMessageProjectionHash(message);
@@ -1668,10 +1733,11 @@ function normalizeThreadMessage(message) {
       || status.toLowerCase() === "task_complete"
     );
   const hasToolMetadata = safeRole === "activity" && threadToolMetadataHasContent(toolMetadata);
+  const hasStructuredMetadata = Object.keys(structuredMetadata).length > 0;
   const hasActivityTitle = safeRole === "activity" && Boolean(title);
   if (
     !id
-    || (!text && !isTurnCompleteMessage && !artifacts.length && !hasToolMetadata && !hasActivityTitle)
+    || (!text && !isTurnCompleteMessage && !artifacts.length && !hasToolMetadata && !hasStructuredMetadata && !hasActivityTitle)
     || kind === "live_output"
     || source === "terminal-live"
     || (safeRole === "user" && isTerminalArtifactMessage(message.text || message.message))
@@ -1692,6 +1758,7 @@ function normalizeThreadMessage(message) {
     text,
     title,
     turnId: cleanText(message.turnId || message.turn_id),
+    ...structuredMetadata,
     ...toolMetadata,
   };
 
@@ -1846,7 +1913,8 @@ function threadMessageProjectionHash(message) {
   const text = cleanMessageText(message?.text);
   const artifacts = threadArtifactsSignature(message?.artifacts);
   const toolMetadata = JSON.stringify(normalizeThreadToolMetadata(message));
-  return stableProjectionHash(`${id}:${message?.role || ""}:${message?.kind || ""}:${text}:${artifacts}:${toolMetadata}`);
+  const structuredMetadata = JSON.stringify(normalizeThreadStructuredTranscriptMetadata(message));
+  return stableProjectionHash(`${id}:${message?.role || ""}:${message?.kind || ""}:${text}:${artifacts}:${toolMetadata}:${structuredMetadata}`);
 }
 
 function stableProjectionKey(value, fallback = "event") {
@@ -1935,8 +2003,10 @@ function normalizeThreadProjectionEvent(event, fallbackSequence = 0) {
   const title = cleanText(event.title);
   const artifacts = normalizeThreadArtifacts(event.artifacts || event.attachments);
   const toolMetadata = normalizeThreadToolMetadata(event);
+  const structuredMetadata = normalizeThreadStructuredTranscriptMetadata(event);
   const hasToolMetadata = isActivityProjectionEventType(type)
     && threadToolMetadataHasContent(toolMetadata);
+  const hasStructuredMetadata = Object.keys(structuredMetadata).length > 0;
   if (
     (!messageId || (isTurnProjectionEventType(type) && !(turnId || messageId)))
     || (
@@ -1945,6 +2015,7 @@ function normalizeThreadProjectionEvent(event, fallbackSequence = 0) {
       && !artifacts.length
       && !title
       && !hasToolMetadata
+      && !hasStructuredMetadata
       && type !== "thread.message.assistant.complete"
       && !isTurnProjectionEventType(type)
     )
@@ -2001,6 +2072,7 @@ function normalizeThreadProjectionEvent(event, fallbackSequence = 0) {
     title,
     turnId: turnId || (isTurnProjectionEventType(type) ? messageId : ""),
     type,
+    ...structuredMetadata,
     ...toolMetadata,
   };
 }
@@ -2129,12 +2201,13 @@ function projectThreadProjectionMessagesFromNormalizedEvents(projectionEvents, f
         artifacts: event.artifacts,
         createdAt: event.createdAt,
         id: event.messageId,
-        kind: "message",
+        kind: event.type === "thread.message.system" ? event.kind || "message" : "message",
         role: event.type === "thread.message.system" ? "system" : "user",
         source: event.source || "projection",
         status: event.status || "submitted",
         text: event.text || event.delta,
         turnId: event.turnId,
+        ...normalizeThreadStructuredTranscriptMetadata(event),
       });
       return;
     }
@@ -2161,6 +2234,7 @@ function projectThreadProjectionMessagesFromNormalizedEvents(projectionEvents, f
         status: "streaming",
         text: eventText,
         turnId: event.turnId,
+        ...normalizeThreadStructuredTranscriptMetadata(event),
       });
       return;
     }
@@ -2193,6 +2267,7 @@ function projectThreadProjectionMessagesFromNormalizedEvents(projectionEvents, f
         status: "complete",
         text: eventText,
         turnId: event.turnId || existing?.turnId || "",
+        ...normalizeThreadStructuredTranscriptMetadata(event),
       });
       return;
     }
@@ -2211,6 +2286,7 @@ function projectThreadProjectionMessagesFromNormalizedEvents(projectionEvents, f
         text: event.text || event.delta,
         title: event.title,
         turnId: event.turnId,
+        ...normalizeThreadStructuredTranscriptMetadata(event),
         ...normalizeThreadToolMetadata(event),
       });
     }
@@ -2257,6 +2333,7 @@ function projectionEventsFromMessages(messages, options = {}) {
       text: message.text,
       title: message.title,
       turnId: message.turnId,
+      ...normalizeThreadStructuredTranscriptMetadata(message),
       ...normalizeThreadToolMetadata(message),
     };
     if (message.role === "assistant") {
@@ -3172,6 +3249,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
       source,
       title: message.title,
       turnId: messageTurnId,
+      ...normalizeThreadStructuredTranscriptMetadata(message),
       ...normalizeThreadToolMetadata(message),
     };
 
@@ -3385,6 +3463,22 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
           type: "thread.turn.error",
         });
       }
+    } else if (message.role === "system") {
+      if (projectedMessage) {
+        return;
+      }
+      events.push({
+        ...eventBase,
+        id: [
+          "projection-system",
+          safeKey(messageId, "message"),
+          stableProjectionHash(`${message.kind}:${message.title}:${message.text}:${JSON.stringify(normalizeThreadStructuredTranscriptMetadata(message))}`),
+        ].join("-"),
+        role: "system",
+        status: message.status || "complete",
+        text: message.text,
+        type: "thread.message.system",
+      });
     }
 
     if (events.length > eventStartCount) {

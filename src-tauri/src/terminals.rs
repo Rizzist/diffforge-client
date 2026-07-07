@@ -8,6 +8,9 @@ fn terminal_now_ms() -> u64 {
 const TERMINAL_STARTING_IDLE_BUFFER_MS: u64 = 5_000;
 const TERMINAL_ACTIVITY_IDLE_QUIESCE_MS: u64 = 1_750;
 const TERMINAL_PROMPT_READY_BUSY_DEBOUNCE_MS: u64 = 750;
+const TERMINAL_STARTING_WATCHDOG_MS: u64 = 30_000;
+const TERMINAL_WATCHDOG_OUTPUT_QUIET_MS: u64 = 2_500;
+const TERMINAL_HOT_STALE_WATCHDOG_MS: u64 = 10 * 60_000;
 const TERMINAL_STARTUP_READY_SCAN_BYTES: usize = 16 * 1024;
 
 fn terminal_output_latest_working_indicator_index(text: &str) -> Option<usize> {
@@ -2339,9 +2342,16 @@ fn poll_terminal_child_exit(child: &mut dyn Child) -> bool {
 #[derive(Default)]
 struct TerminalKillReport {
     pid: Option<u32>,
+    process_group_id: Option<i32>,
     taskkill_exit_code: Option<i32>,
     taskkill_success: Option<bool>,
     taskkill_error: Option<String>,
+    sigterm_process_group_ok: Option<bool>,
+    sigterm_process_group_error: Option<String>,
+    sigkill_process_group_ok: Option<bool>,
+    sigkill_process_group_error: Option<String>,
+    exited_after_sigterm: Option<bool>,
+    exited_after_sigkill: Option<bool>,
     child_kill_ok: bool,
     child_kill_error: Option<String>,
 }
@@ -2350,7 +2360,14 @@ fn terminal_kill_report_json(report: &TerminalKillReport) -> Value {
     json!({
         "child_kill_error": report.child_kill_error.clone(),
         "child_kill_ok": report.child_kill_ok,
+        "exited_after_sigkill": report.exited_after_sigkill,
+        "exited_after_sigterm": report.exited_after_sigterm,
         "pid": report.pid,
+        "process_group_id": report.process_group_id,
+        "sigkill_process_group_error": report.sigkill_process_group_error.clone(),
+        "sigkill_process_group_ok": report.sigkill_process_group_ok,
+        "sigterm_process_group_error": report.sigterm_process_group_error.clone(),
+        "sigterm_process_group_ok": report.sigterm_process_group_ok,
         "taskkill_error": report.taskkill_error.clone(),
         "taskkill_exit_code": report.taskkill_exit_code,
         "taskkill_success": report.taskkill_success,
@@ -2380,7 +2397,10 @@ fn terminal_input_forensics_kind(data: &str) -> &'static str {
 }
 
 #[cfg(windows)]
-fn kill_terminal_process_tree(child: &mut dyn Child) -> TerminalKillReport {
+fn kill_terminal_process_tree(
+    child: &mut dyn Child,
+    _process_group_leader: Option<i32>,
+) -> TerminalKillReport {
     use std::os::windows::process::CommandExt;
 
     const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -2500,11 +2520,69 @@ fn signal_opencode_theme_refresh(_root_pid: u32) -> Result<Vec<u32>, String> {
 }
 
 #[cfg(not(windows))]
-fn kill_terminal_process_tree(child: &mut dyn Child) -> TerminalKillReport {
+fn signal_terminal_process_group(
+    process_group_leader: Option<i32>,
+    signal: i32,
+) -> Result<bool, String> {
+    let Some(process_group_leader) = process_group_leader.filter(|pid| *pid > 0) else {
+        return Ok(false);
+    };
+    let result = unsafe { libc::killpg(process_group_leader, signal) };
+    if result == 0 {
+        Ok(true)
+    } else {
+        Err(clean_terminal_telemetry_text(
+            &std::io::Error::last_os_error().to_string(),
+        ))
+    }
+}
+
+#[cfg(not(windows))]
+fn kill_terminal_process_tree_with_waits<WaitForExit, SignalProcessGroup>(
+    child: &mut dyn Child,
+    process_group_leader: Option<i32>,
+    mut wait_for_exit: WaitForExit,
+    mut signal_process_group: SignalProcessGroup,
+) -> TerminalKillReport
+where
+    WaitForExit: FnMut(&mut dyn Child) -> bool,
+    SignalProcessGroup: FnMut(Option<i32>, i32) -> Result<bool, String>,
+{
     let mut report = TerminalKillReport {
         pid: child.process_id(),
+        process_group_id: process_group_leader,
         ..TerminalKillReport::default()
     };
+
+    match signal_process_group(process_group_leader, libc::SIGTERM) {
+        Ok(sent) => report.sigterm_process_group_ok = Some(sent),
+        Err(error) => {
+            report.sigterm_process_group_ok = Some(false);
+            report.sigterm_process_group_error = Some(error);
+        }
+    }
+    if report.sigterm_process_group_ok == Some(true) {
+        let exited = wait_for_exit(child);
+        report.exited_after_sigterm = Some(exited);
+        if exited {
+            return report;
+        }
+    }
+
+    match signal_process_group(process_group_leader, libc::SIGKILL) {
+        Ok(sent) => report.sigkill_process_group_ok = Some(sent),
+        Err(error) => {
+            report.sigkill_process_group_ok = Some(false);
+            report.sigkill_process_group_error = Some(error);
+        }
+    }
+    if report.sigkill_process_group_ok == Some(true) {
+        let exited = wait_for_exit(child);
+        report.exited_after_sigkill = Some(exited);
+        if exited {
+            return report;
+        }
+    }
 
     match child.kill() {
         Ok(()) => report.child_kill_ok = true,
@@ -2514,6 +2592,19 @@ fn kill_terminal_process_tree(child: &mut dyn Child) -> TerminalKillReport {
     }
 
     report
+}
+
+#[cfg(not(windows))]
+fn kill_terminal_process_tree(
+    child: &mut dyn Child,
+    process_group_leader: Option<i32>,
+) -> TerminalKillReport {
+    kill_terminal_process_tree_with_waits(
+        child,
+        process_group_leader,
+        poll_terminal_child_exit,
+        signal_terminal_process_group,
+    )
 }
 
 fn interrupt_terminal_coordination_session(
@@ -2776,6 +2867,13 @@ fn cleanup_terminal_instance_with_context(
         let mut child = child.blocking_lock();
         child.take()
     };
+    #[cfg(not(windows))]
+    let process_group_leader = {
+        let master = master.blocking_lock();
+        master.process_group_leader()
+    };
+    #[cfg(windows)]
+    let process_group_leader: Option<i32> = None;
     let Some(mut child) = maybe_child else {
         log_terminal_crash_forensics_event(
             "backend.terminal_cleanup.no_child",
@@ -2845,7 +2943,7 @@ fn cleanup_terminal_instance_with_context(
                 "stage": "initial_kill_first",
             }),
         );
-        let report = kill_terminal_process_tree(child.as_mut());
+        let report = kill_terminal_process_tree(child.as_mut(), process_group_leader);
         log_terminal_crash_forensics_event(
             "backend.terminal_cleanup.kill.done",
             json!({
@@ -2864,7 +2962,7 @@ fn cleanup_terminal_instance_with_context(
                 "stage": "poll_timeout",
             }),
         );
-        let report = kill_terminal_process_tree(child.as_mut());
+        let report = kill_terminal_process_tree(child.as_mut(), process_group_leader);
         log_terminal_crash_forensics_event(
             "backend.terminal_cleanup.kill.done",
             json!({
@@ -2885,7 +2983,7 @@ fn cleanup_terminal_instance_with_context(
                 "stage": "final_poll_timeout",
             }),
         );
-        let report = kill_terminal_process_tree(child.as_mut());
+        let report = kill_terminal_process_tree(child.as_mut(), process_group_leader);
         log_terminal_crash_forensics_event(
             "backend.terminal_cleanup.kill.done",
             json!({
@@ -5325,6 +5423,12 @@ fn spawn_terminal_reader(
                     {
                         auth_failure_marked = true;
                     }
+                    ssh_password_autofill_observe_output(
+                        &terminals,
+                        &reader_pane_id,
+                        instance_id,
+                        chunk,
+                    );
 
                     forensics_chunks += 1;
                     forensics_bytes += bytes_read as u64;
@@ -5404,6 +5508,7 @@ fn spawn_terminal_reader(
         let cleanup_state = cloud_mcp_state.clone();
         let cleanup_pane_id = reader_pane_id.clone();
         tauri::async_runtime::spawn(async move {
+            ssh_password_autofill_disarm_if_instance(&cleanup_pane_id, instance_id);
             if let Some(instance) = remove_terminal_instance_if_current(
                 &cleanup_terminals,
                 &cleanup_pane_id,
@@ -5541,6 +5646,7 @@ async fn close_terminal_session(
 
     if let Some(instance) = instance {
         let cleanup_instance_id = instance.id;
+        ssh_password_autofill_disarm_if_instance(pane_id, cleanup_instance_id);
         remove_terminal_parked_prompts_for_close(
             state,
             pane_id,
@@ -6540,8 +6646,25 @@ async fn terminal_open(
             activity_transport.as_ref(),
         );
         coordination_env_vars.extend(cloud_mcp_runtime_env_vars(cloud_mcp_state.inner()).await?);
-        let mut launch_env_vars =
-            terminal_env_vars_with_opencode_tui_config(launch_provider_id, &coordination_env_vars)?;
+        let mut launch_env_vars = match terminal_env_vars_with_opencode_tui_config(
+            launch_provider_id,
+            &coordination_env_vars,
+        ) {
+            Ok(env_vars) => env_vars,
+            Err(error) => {
+                log_terminal_status_event(
+                    "backend.opencode_plugin_load.failed",
+                    json!({
+                        "error": clean_terminal_diagnostic_log_text(&error),
+                        "instance_id": instance_id,
+                        "launch_mode": "terminal_open",
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                        "provider": launch_provider_id,
+                    }),
+                );
+                return Err(error);
+            }
+        };
         if let Some((app_control_command, app_control_args)) = app_control_mcp_launch.as_ref() {
             launch_env_vars = terminal_env_vars_with_app_control_mcp_identity(
                 launch_provider_id,
@@ -6550,12 +6673,27 @@ async fn terminal_open(
                 app_control_args,
             )?;
         }
-        launch_env_vars = terminal_env_vars_with_opencode_coordination_config(
+        launch_env_vars = match terminal_env_vars_with_opencode_coordination_config(
             launch_provider_id,
             &launch_env_vars,
             terminal_coordination.as_ref(),
             resolved_launch.permission_mode.as_deref(),
-        )?;
+        ) {
+            Ok(env_vars) => env_vars,
+            Err(error) => {
+                log_terminal_status_event(
+                    "backend.opencode_plugin_load.failed",
+                    json!({
+                        "error": clean_terminal_diagnostic_log_text(&error),
+                        "instance_id": instance_id,
+                        "launch_mode": "terminal_open",
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                        "provider": launch_provider_id,
+                    }),
+                );
+                return Err(error);
+            }
+        };
 
         let warm_pty = match create_agent_terminal_pty(
             size,
@@ -6694,6 +6832,7 @@ async fn terminal_open(
     )
     .await;
     if let Some(displaced_instance) = displaced_instance {
+        ssh_password_autofill_disarm_if_instance(&pane_id, displaced_instance.id);
         cleanup_terminal_instance_async(
             displaced_instance,
             true,
@@ -7734,6 +7873,16 @@ async fn start_terminal_agent_in_prepared_pty(
             {
                 Ok(env_vars) => env_vars,
                 Err(error) => {
+                    log_terminal_status_event(
+                        "backend.opencode_plugin_load.failed",
+                        json!({
+                            "error": clean_terminal_diagnostic_log_text(&error),
+                            "instance_id": instance.id,
+                            "launch_mode": "terminal_start_agent",
+                            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                            "provider": definition.id,
+                        }),
+                    );
                     return TerminalStartAgentPaneResult {
                         pane_id,
                         instance_id: Some(instance.id),
@@ -7778,6 +7927,16 @@ async fn start_terminal_agent_in_prepared_pty(
         ) {
             Ok(env_vars) => env_vars,
             Err(error) => {
+                log_terminal_status_event(
+                    "backend.opencode_plugin_load.failed",
+                    json!({
+                        "error": clean_terminal_diagnostic_log_text(&error),
+                        "instance_id": instance.id,
+                        "launch_mode": "terminal_start_agent",
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                        "provider": definition.id,
+                    }),
+                );
                 return TerminalStartAgentPaneResult {
                     pane_id,
                     instance_id: Some(instance.id),
@@ -10977,6 +11136,7 @@ fn emit_terminal_prompt_submitted_activity_started(
         turn_status: projected_runtime.turn_status,
         session_state: projected_runtime.session_state,
         input_ready: false,
+        background_work_active: false,
         input_ready_at: None,
         prompt_ready_at: Some(event_time),
         completed_at: None,
@@ -11605,6 +11765,38 @@ fn terminal_activity_hook_claude_stop_has_background_work(event: &Value) -> bool
             "session_crons",
         ],
     )
+}
+
+fn terminal_activity_hook_background_stop_forces_busy(
+    metadata: &TerminalInstanceMetadata,
+    hook_key: &str,
+    event: &Value,
+) -> bool {
+    hook_key == "stop"
+        && terminal_metadata_is_claude(metadata)
+        && terminal_activity_hook_claude_stop_has_background_work(event)
+        && terminal_activity_hook_explicit_input_not_ready(event)
+}
+
+fn terminal_activity_hook_explicit_input_not_ready(event: &Value) -> bool {
+    [
+        "inputReady",
+        "input_ready",
+        "isInputReady",
+        "is_input_ready",
+        "readyForInput",
+        "ready_for_input",
+    ]
+    .iter()
+    .filter_map(|key| event.get(*key))
+    .any(|value| match value {
+        Value::Bool(value) => !*value,
+        Value::String(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "false" | "0" | "no" | "busy" | "not_ready" | "not-ready"
+        ),
+        _ => false,
+    })
 }
 
 fn terminal_activity_hook_status_key(event: &Value, keys: &[&str]) -> Option<String> {
@@ -12791,6 +12983,7 @@ fn terminal_activity_hook_payload(
     )?;
     let manual_prompt = terminal_activity_hook_manual_prompt(&hook_event_name, event);
     let metadata = instance.metadata.clone();
+    let mut background_work_active = false;
     let (event_type, activity_status, status, command_phase, input_ready, completion_evidence) =
         if manual_prompt.is_some() {
             (
@@ -12810,7 +13003,10 @@ fn terminal_activity_hook_payload(
                     let claude_stop_has_background_work = hook_key == "stop"
                         && terminal_metadata_is_claude(&metadata)
                         && terminal_activity_hook_claude_stop_has_background_work(event);
-                    if claude_stop_has_background_work {
+                    background_work_active = claude_stop_has_background_work;
+                    if terminal_activity_hook_background_stop_forces_busy(
+                        &metadata, &hook_key, event,
+                    ) {
                         (
                             "provider-turn-background-active",
                             "thinking",
@@ -13155,11 +13351,11 @@ fn terminal_activity_hook_payload(
             activity_status: activity_status.to_string(),
             command_phase: command_phase.to_string(),
             input_ready,
-            input_ready_at: input_ready_at.clone(),
-            prompt_ready_at: prompt_ready_at.clone(),
-            completed_at: completed_at.clone(),
-            provider_session_id: provider_session_id.clone(),
-            native_session_id: provider_session_id.clone(),
+                        input_ready_at: input_ready_at.clone(),
+                        prompt_ready_at: prompt_ready_at.clone(),
+                        completed_at: completed_at.clone(),
+                        provider_session_id: provider_session_id.clone(),
+                        native_session_id: provider_session_id.clone(),
             fork_from_provider_session_id: current_runtime.fork_from_provider_session_id.clone(),
             provider_turn_id: provider_turn_id.clone(),
             turn_id: provider_turn_id.clone(),
@@ -13210,6 +13406,7 @@ fn terminal_activity_hook_payload(
         turn_status: projected_runtime.turn_status,
         session_state: projected_runtime.session_state,
         input_ready,
+        background_work_active,
         input_ready_at,
         prompt_ready_at,
         completed_at,
@@ -13662,6 +13859,180 @@ fn terminal_activity_hook_next_poll_ms(current_poll_ms: u64) -> u64 {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalActivityWatchdogAction {
+    StartupStop,
+    StartupDowngradeRunning,
+    StaleHotStop,
+}
+
+fn terminal_activity_watchdog_launch_mode(runtime: &TerminalRuntimeSnapshot) -> &'static str {
+    if runtime.source.contains("start-agent") {
+        "terminal_start_agent"
+    } else {
+        "terminal_open"
+    }
+}
+
+fn terminal_activity_watchdog_runtime_is_paused_or_manual(
+    runtime: &TerminalRuntimeSnapshot,
+) -> bool {
+    let status = terminal_projection_text(&runtime.status, "");
+    let activity_status = terminal_projection_text(&runtime.activity_status, "");
+    let command_phase = terminal_projection_text(&runtime.command_phase, "");
+    [status.as_str(), activity_status.as_str(), command_phase.as_str()]
+        .iter()
+        .any(|value| {
+            matches!(
+                *value,
+                "paused"
+                    | "awaiting_input"
+                    | "awaiting-input"
+                    | "awaiting_permission"
+                    | "awaiting-permission"
+                    | "awaiting_user"
+                    | "awaiting-user"
+                    | "manual_prompt"
+                    | "manual-prompt"
+                    | "permission"
+                    | "permission_requested"
+                    | "permission-requested"
+            )
+        })
+}
+
+fn terminal_activity_watchdog_runtime_is_active_tool(runtime: &TerminalRuntimeSnapshot) -> bool {
+    let activity_status = terminal_projection_text(&runtime.activity_status, "");
+    let command_phase = terminal_projection_text(&runtime.command_phase, "");
+    matches!(
+        activity_status.as_str(),
+        "shell" | "editing" | "mcp" | "tool_running" | "tool-running"
+    ) || matches!(
+        command_phase.as_str(),
+        "tool_running" | "tool-running" | "shell" | "editing" | "mcp"
+    )
+}
+
+fn terminal_activity_watchdog_runtime_is_stale_hot_candidate(
+    runtime: &TerminalRuntimeSnapshot,
+) -> bool {
+    terminal_runtime_snapshot_is_busy_turn(runtime)
+        && !terminal_runtime_snapshot_is_starting(runtime)
+        && !terminal_activity_watchdog_runtime_is_paused_or_manual(runtime)
+        && !terminal_activity_watchdog_runtime_is_active_tool(runtime)
+}
+
+fn terminal_activity_watchdog_starting_action(
+    runtime: &TerminalRuntimeSnapshot,
+    starting_age_ms: u64,
+    live_process: bool,
+    prompt_marker_visible: bool,
+    output_quiet: bool,
+    output_flowing: bool,
+) -> Option<TerminalActivityWatchdogAction> {
+    if !terminal_runtime_snapshot_is_starting(runtime)
+        || starting_age_ms < TERMINAL_STARTING_WATCHDOG_MS
+        || !live_process
+        || terminal_activity_watchdog_runtime_is_paused_or_manual(runtime)
+    {
+        return None;
+    }
+    if prompt_marker_visible || output_quiet {
+        return Some(TerminalActivityWatchdogAction::StartupStop);
+    }
+    if output_flowing {
+        return Some(TerminalActivityWatchdogAction::StartupDowngradeRunning);
+    }
+    None
+}
+
+fn terminal_activity_watchdog_stale_hot_action(
+    runtime: &TerminalRuntimeSnapshot,
+    quiet_age_ms: u64,
+) -> Option<TerminalActivityWatchdogAction> {
+    if quiet_age_ms >= TERMINAL_HOT_STALE_WATCHDOG_MS
+        && terminal_activity_watchdog_runtime_is_stale_hot_candidate(runtime)
+    {
+        Some(TerminalActivityWatchdogAction::StaleHotStop)
+    } else {
+        None
+    }
+}
+
+fn terminal_activity_watchdog_headless_total_bytes(
+    headless_output: &Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
+) -> u64 {
+    headless_output
+        .lock()
+        .map(|output| output.total_bytes)
+        .unwrap_or_default()
+}
+
+fn terminal_headless_tail_has_prompt_marker(
+    headless_output: &Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
+) -> bool {
+    let Ok(output) = headless_output.lock() else {
+        return false;
+    };
+    let tail = output.tail.iter().copied().collect::<Vec<_>>();
+    if tail.is_empty() {
+        return false;
+    }
+    let start = tail.len().saturating_sub(TERMINAL_STARTUP_READY_SCAN_BYTES);
+    let text = String::from_utf8_lossy(&tail[start..]);
+    let mut recent_lines = text.lines().rev().take(8).collect::<Vec<_>>();
+    recent_lines.reverse();
+    let recent_text = recent_lines.join("\n");
+    terminal_output_current_prompt_marker(&recent_text)
+}
+
+async fn terminal_activity_watchdog_child_is_live(instance: &TerminalInstance) -> bool {
+    let mut child = instance.child.lock().await;
+    child
+        .as_mut()
+        .is_some_and(|child| !poll_terminal_child_exit(child.as_mut()))
+}
+
+fn terminal_activity_watchdog_event(
+    instance: &TerminalInstance,
+    runtime: &TerminalRuntimeSnapshot,
+    hook_event_name: &str,
+    source: &str,
+    reason: &str,
+) -> Value {
+    let mut event = json!({
+        "hookEventName": hook_event_name,
+        "provider": instance.metadata.agent_kind.clone(),
+        "source": source,
+        "timestamp": crate::coordination::kernel::now_rfc3339(),
+        "backendWatchdog": true,
+        "watchdogReason": reason,
+    });
+    if let Some(object) = event.as_object_mut() {
+        if let Some(provider_session_id) = runtime
+            .provider_session_id
+            .as_deref()
+            .or(runtime.native_session_id.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            object.insert("sessionId".to_string(), json!(provider_session_id));
+            object.insert("providerSessionId".to_string(), json!(provider_session_id));
+            object.insert("nativeSessionId".to_string(), json!(provider_session_id));
+        }
+        if let Some(turn_id) = runtime
+            .turn_id
+            .as_deref()
+            .or(runtime.provider_turn_id.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            object.insert("turnId".to_string(), json!(turn_id));
+        }
+    }
+    event
+}
+
 async fn handle_terminal_activity_hook_event(
     app: &AppHandle,
     terminals: &Arc<RwLock<HashMap<String, TerminalInstance>>>,
@@ -13738,6 +14109,14 @@ fn terminal_activity_payload_is_idle_ready(payload: &TerminalActivityHookPayload
             ))
 }
 
+fn terminal_activity_hook_pane_scoped_payload_matches_target(
+    payload: &TerminalActivityHookPayload,
+    pane_id: &str,
+    instance_id: u64,
+) -> bool {
+    payload.pane_id == pane_id && payload.instance_id == instance_id
+}
+
 fn terminal_activity_hook_should_ignore_startup_idle_candidate(
     event: &Value,
     current_runtime_is_starting: bool,
@@ -13751,6 +14130,8 @@ fn terminal_activity_hook_session_id_mismatches_busy_runtime(
     payload: &TerminalActivityHookPayload,
     current_runtime: &TerminalRuntimeSnapshot,
     current_runtime_is_busy_turn: bool,
+    pane_id: &str,
+    instance_id: u64,
 ) -> bool {
     if !current_runtime_is_busy_turn || !terminal_activity_payload_is_idle_ready(payload) {
         return false;
@@ -13776,6 +14157,7 @@ fn terminal_activity_hook_session_id_mismatches_busy_runtime(
     ) || (payload_session_id.is_none()
         && runtime_session_id.is_some()
         && terminal_activity_hook_is_idle_stop_payload(payload))
+        && !terminal_activity_hook_pane_scoped_payload_matches_target(payload, pane_id, instance_id)
 }
 
 fn terminal_activity_hook_should_quiesce_idle(
@@ -13961,6 +14343,8 @@ fn terminal_activity_hook_idle_stop_already_settled(
     payload: &TerminalActivityHookPayload,
     current_runtime: &TerminalRuntimeSnapshot,
     current_runtime_is_busy_turn: bool,
+    pane_id: &str,
+    instance_id: u64,
 ) -> bool {
     if current_runtime_is_busy_turn || !terminal_activity_hook_is_idle_stop_payload(payload) {
         return false;
@@ -13969,7 +14353,12 @@ fn terminal_activity_hook_idle_stop_already_settled(
     let payload_session_id = terminal_activity_payload_session_id(payload);
     if !runtime_session_id.is_empty()
         && (!payload_session_id.is_empty() && payload_session_id != runtime_session_id
-            || payload_session_id.is_empty())
+            || (payload_session_id.is_empty()
+                && !terminal_activity_hook_pane_scoped_payload_matches_target(
+                    payload,
+                    pane_id,
+                    instance_id,
+                )))
     {
         return true;
     }
@@ -14359,6 +14748,8 @@ async fn process_terminal_activity_hook_event(
         &payload,
         &current_runtime,
         current_runtime_is_busy_turn,
+        pane_id,
+        instance_id,
     ) {
         log_terminal_status_event(
             "backend.terminal_activity_hook.idle_session_mismatch_ignored",
@@ -14377,6 +14768,8 @@ async fn process_terminal_activity_hook_event(
         &payload,
         &current_runtime,
         current_runtime_is_busy_turn,
+        pane_id,
+        instance_id,
     ) {
         log_terminal_status_event(
             "backend.terminal_activity_hook.duplicate_idle_stop_ignored",
@@ -14516,6 +14909,9 @@ fn spawn_terminal_activity_hook_watcher(
         let mut last_debug_fingerprint: Option<TerminalActivityHookFileFingerprint> = None;
         let mut current_poll_ms = poll_ms;
         let mut unchanged_polls = 0u32;
+        let mut last_output_total_bytes = 0u64;
+        let mut last_output_activity_ms = terminal_now_ms();
+        let mut last_hook_or_output_activity_ms = last_output_activity_ms;
         loop {
             if app_shutdown_requested() {
                 break;
@@ -14525,6 +14921,103 @@ fn spawn_terminal_activity_hook_watcher(
             else {
                 break;
             };
+            let now_ms = terminal_now_ms();
+            let runtime = terminal_runtime_snapshot(&instance);
+            let headless_output = Arc::clone(&instance.headless_output);
+            let output_total_bytes =
+                terminal_activity_watchdog_headless_total_bytes(&headless_output);
+            let output_changed = output_total_bytes != last_output_total_bytes;
+            if output_changed {
+                last_output_total_bytes = output_total_bytes;
+                last_output_activity_ms = now_ms;
+                last_hook_or_output_activity_ms = now_ms;
+            }
+            let output_quiet =
+                now_ms.saturating_sub(last_output_activity_ms) >= TERMINAL_WATCHDOG_OUTPUT_QUIET_MS;
+            let output_flowing = output_changed && !output_quiet;
+            let prompt_marker_visible = terminal_headless_tail_has_prompt_marker(&headless_output);
+            let live_process = terminal_activity_watchdog_child_is_live(&instance).await;
+            let starting_age_ms = now_ms.saturating_sub(runtime.updated_at_ms);
+            if let Some(action) = terminal_activity_watchdog_starting_action(
+                &runtime,
+                starting_age_ms,
+                live_process,
+                prompt_marker_visible,
+                output_quiet,
+                output_flowing,
+            )
+            .or_else(|| {
+                terminal_activity_watchdog_stale_hot_action(
+                    &runtime,
+                    now_ms.saturating_sub(last_hook_or_output_activity_ms),
+                )
+            }) {
+                let (hook_event_name, source, reason) = match action {
+                    TerminalActivityWatchdogAction::StartupStop => (
+                        "Stop",
+                        "backend-startup-watchdog",
+                        if prompt_marker_visible {
+                            "starting_prompt_marker_visible"
+                        } else {
+                            "starting_output_quiet"
+                        },
+                    ),
+                    TerminalActivityWatchdogAction::StartupDowngradeRunning => (
+                        "Notification",
+                        "backend-startup-output-flowing",
+                        "starting_output_flowing",
+                    ),
+                    TerminalActivityWatchdogAction::StaleHotStop => (
+                        "Stop",
+                        "backend-stale-hot-watchdog",
+                        "stale_hot_no_hook_or_output",
+                    ),
+                };
+                log_terminal_status_event(
+                    "backend.terminal_activity_watchdog.transition",
+                    json!({
+                        "action": format!("{action:?}"),
+                        "agent_id": clean_terminal_diagnostic_log_text(&instance.metadata.agent_id),
+                        "hook_event_name": hook_event_name,
+                        "instance_id": instance_id,
+                        "launch_mode": terminal_activity_watchdog_launch_mode(&runtime),
+                        "output_quiet": output_quiet,
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                        "prompt_marker_visible": prompt_marker_visible,
+                        "provider": clean_terminal_diagnostic_log_text(&instance.metadata.agent_kind),
+                        "reason": reason,
+                        "runtime_source": clean_terminal_diagnostic_log_text(&runtime.source),
+                        "starting_age_ms": starting_age_ms,
+                        "stale_age_ms": now_ms.saturating_sub(last_hook_or_output_activity_ms),
+                    }),
+                );
+                let event = terminal_activity_watchdog_event(
+                    &instance,
+                    &runtime,
+                    hook_event_name,
+                    source,
+                    reason,
+                );
+                process_terminal_activity_hook_event(
+                    &app,
+                    &terminals,
+                    &cloud_mcp_state,
+                    &pane_id,
+                    instance_id,
+                    &instance,
+                    &event,
+                    source,
+                )
+                .await;
+                last_hook_or_output_activity_ms = now_ms;
+                if matches!(
+                    action,
+                    TerminalActivityWatchdogAction::StartupStop
+                        | TerminalActivityWatchdogAction::StaleHotStop
+                ) {
+                    last_output_activity_ms = now_ms;
+                }
+            }
 
             let activity_fingerprint =
                 terminal_activity_hook_file_fingerprint(&activity_events_path).await;
@@ -14532,6 +15025,11 @@ fn spawn_terminal_activity_hook_watcher(
                 terminal_activity_hook_file_fingerprint(&activity_debug_path).await;
             let activity_changed = activity_fingerprint != last_activity_fingerprint;
             let debug_changed = debug_fingerprint != last_debug_fingerprint;
+            if activity_changed && activity_fingerprint.is_some()
+                || debug_changed && debug_fingerprint.is_some()
+            {
+                last_hook_or_output_activity_ms = terminal_now_ms();
+            }
             if activity_changed || debug_changed {
                 current_poll_ms = TERMINAL_ACTIVITY_HOOK_POLL_MS;
                 unchanged_polls = 0;
@@ -15577,13 +16075,75 @@ fn terminal_write_is_prompt_answer(
         })
 }
 
+fn terminal_write_source_is_model_change(prompt_event_source: Option<&str>) -> bool {
+    prompt_event_source
+        .map(|source| terminal_projection_text(source, ""))
+        .is_some_and(|source| {
+            matches!(
+                source.as_str(),
+                "model_change"
+                    | "model-change"
+                    | "remote_model_config"
+                    | "remote-model-config"
+                    | "startup_model_restore"
+                    | "startup-model-restore"
+            )
+        })
+}
+
+fn terminal_codex_model_change_command_from_input(data: &str) -> Option<String> {
+    let command = data
+        .replace(TERMINAL_ENTER_SEQUENCE_MOD1, "")
+        .replace(TERMINAL_ENTER_SEQUENCE, "")
+        .trim_matches(|ch| ch == '\r' || ch == '\n')
+        .trim()
+        .to_string();
+    if !command.starts_with("/model ") || command.contains('\r') || command.contains('\n') {
+        return None;
+    }
+    let mut parts = command.split_whitespace();
+    let slash = parts.next()?;
+    let model = parts.next()?;
+    let effort = parts.next();
+    if slash != "/model"
+        || model.len() > 160
+        || !model
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | ':' | '/' | '-'))
+        || parts.next().is_some()
+    {
+        return None;
+    }
+    if let Some(effort) = effort {
+        if !matches!(effort, "low" | "medium" | "high" | "xhigh") {
+            return None;
+        }
+    }
+    Some(command)
+}
+
+fn terminal_codex_model_change_input_requests_submit(data: &str) -> bool {
+    data.contains(TERMINAL_ENTER_SEQUENCE)
+        || data.contains(TERMINAL_ENTER_SEQUENCE_MOD1)
+        || data.contains('\r')
+        || data.contains('\n')
+}
+
+fn terminal_codex_model_change_pty_input(command: &str, submit: bool) -> String {
+    if submit {
+        format!("\u{15}{command}\r")
+    } else {
+        format!("\u{15}{command}")
+    }
+}
+
 async fn terminal_write_inner(
     app: AppHandle,
     state: &TerminalState,
     cloud_mcp_state: &CloudMcpState,
     pane_id: String,
     instance_id: Option<u64>,
-    data: String,
+    mut data: String,
     prompt_event_id: Option<String>,
     prompt_event_revision: Option<u64>,
     prompt_event_source: Option<String>,
@@ -15645,6 +16205,34 @@ async fn terminal_write_inner(
         return Ok(());
     };
     let mut prompt_event_id = prompt_event_id;
+    let mut prompt_event_text = prompt_event_text;
+    if terminal_metadata_is_codex(&instance.metadata)
+        && terminal_write_source_is_model_change(prompt_event_source.as_deref())
+    {
+        if let Some(command) = terminal_codex_model_change_command_from_input(&data) {
+            let runtime = terminal_runtime_snapshot(&instance);
+            let submit = terminal_codex_model_change_input_requests_submit(&data);
+            log_terminal_status_event(
+                "backend.agent_chat_model_change.inject",
+                json!({
+                    "agent_id": clean_terminal_diagnostic_log_text(&instance.metadata.agent_id),
+                    "command_len": command.len(),
+                    "had_enhanced_enter": data.contains(TERMINAL_ENTER_SEQUENCE) || data.contains(TERMINAL_ENTER_SEQUENCE_MOD1),
+                    "had_plain_enter": data.contains('\r') || data.contains('\n'),
+                    "instance_id": instance.id,
+                    "launch_mode": terminal_activity_watchdog_launch_mode(&runtime),
+                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    "provider": clean_terminal_diagnostic_log_text(&instance.metadata.agent_kind),
+                    "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
+                    "runtime_source": clean_terminal_diagnostic_log_text(&runtime.source),
+                    "sequence": if submit { "ctrl_u_slash_model_plain_cr" } else { "ctrl_u_slash_model_defer_submit" },
+                }),
+            );
+            data = terminal_codex_model_change_pty_input(&command, submit);
+            prompt_event_id = None;
+            prompt_event_text = None;
+        }
+    }
     let prompt_submission_text = prompt_event_text
         .as_deref()
         .map(str::trim)
@@ -18253,6 +18841,31 @@ mod terminal_tests {
     }
 
     #[test]
+    fn codex_model_change_rewrite_uses_plain_submit_after_clear() {
+        let input = format!("/model gpt-5.1-codex high{TERMINAL_ENTER_SEQUENCE}");
+        let command = terminal_codex_model_change_command_from_input(&input)
+            .expect("valid model command");
+        assert_eq!(command, "/model gpt-5.1-codex high");
+        assert_eq!(
+            terminal_codex_model_change_pty_input(&command, true),
+            "\u{15}/model gpt-5.1-codex high\r"
+        );
+        assert_eq!(
+            terminal_codex_model_change_pty_input(&command, false),
+            "\u{15}/model gpt-5.1-codex high"
+        );
+        assert!(terminal_codex_model_change_input_requests_submit(&input));
+        assert!(!terminal_codex_model_change_input_requests_submit(
+            "/model gpt-5.1-codex high"
+        ));
+        assert!(terminal_write_source_is_model_change(Some("model-change")));
+        assert!(terminal_write_source_is_model_change(Some("remote-model-config")));
+        assert!(terminal_codex_model_change_command_from_input("/model\r").is_none());
+        assert!(terminal_codex_model_change_command_from_input("/model bad model\r").is_none());
+        assert!(terminal_codex_model_change_command_from_input("/model gpt-5 max\r").is_none());
+    }
+
+    #[test]
     fn opencode_provider_session_recording_requires_native_session_id() {
         assert!(terminal_provider_session_id_is_recordable_for_agent(
             "opencode",
@@ -18307,6 +18920,95 @@ mod terminal_tests {
         assert!(terminal_provider_turn_should_reconcile_coordination(Some(
             true
         )));
+    }
+
+    #[cfg(not(windows))]
+    #[derive(Debug, Default)]
+    struct FakeTerminalChild {
+        kill_calls: usize,
+    }
+
+    #[cfg(not(windows))]
+    impl portable_pty::ChildKiller for FakeTerminalChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.kill_calls += 1;
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(FakeTerminalChild::default())
+        }
+    }
+
+    #[cfg(not(windows))]
+    impl Child for FakeTerminalChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Ok(portable_pty::ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(1234)
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn terminal_kill_sequence_signals_process_group_before_child_kill() {
+        let mut child = FakeTerminalChild::default();
+        let mut signals = Vec::new();
+        let mut waits = 0usize;
+        let report = kill_terminal_process_tree_with_waits(
+            &mut child,
+            Some(1234),
+            |_child| {
+                waits += 1;
+                waits >= 2
+            },
+            |process_group_leader, signal| {
+                signals.push((process_group_leader, signal));
+                Ok(true)
+            },
+        );
+
+        assert_eq!(
+            signals,
+            vec![(Some(1234), libc::SIGTERM), (Some(1234), libc::SIGKILL)]
+        );
+        assert_eq!(waits, 2);
+        assert_eq!(child.kill_calls, 0);
+        assert_eq!(report.exited_after_sigterm, Some(false));
+        assert_eq!(report.exited_after_sigkill, Some(true));
+        assert!(!report.child_kill_ok);
+
+        let mut child = FakeTerminalChild::default();
+        let mut signals = Vec::new();
+        let mut waits = 0usize;
+        let report = kill_terminal_process_tree_with_waits(
+            &mut child,
+            Some(4321),
+            |_child| {
+                waits += 1;
+                false
+            },
+            |process_group_leader, signal| {
+                signals.push((process_group_leader, signal));
+                Ok(true)
+            },
+        );
+
+        assert_eq!(
+            signals,
+            vec![(Some(4321), libc::SIGTERM), (Some(4321), libc::SIGKILL)]
+        );
+        assert_eq!(waits, 2);
+        assert_eq!(child.kill_calls, 1);
+        assert_eq!(report.exited_after_sigterm, Some(false));
+        assert_eq!(report.exited_after_sigkill, Some(false));
+        assert!(report.child_kill_ok);
     }
 
     fn terminal_test_repo(name: &str) -> PathBuf {
@@ -19401,6 +20103,7 @@ mod terminal_tests {
             turn_status: if input_ready { "completed" } else { "running" }.to_string(),
             session_state: "session_attached".to_string(),
             input_ready,
+            background_work_active: false,
             input_ready_at: input_ready.then(|| "2026-07-02T00:00:00Z".to_string()),
             prompt_ready_at: None,
             completed_at: input_ready.then(|| "2026-07-02T00:00:00Z".to_string()),
@@ -19627,6 +20330,95 @@ mod terminal_tests {
     }
 
     #[test]
+    fn activity_watchdog_transitions_stuck_starting_by_prompt_or_quiet_output() {
+        let runtime = TerminalRuntimeSnapshot::opened_starting(None, "terminal-open");
+        assert_eq!(
+            terminal_activity_watchdog_starting_action(
+                &runtime,
+                TERMINAL_STARTING_WATCHDOG_MS,
+                true,
+                true,
+                false,
+                false,
+            ),
+            Some(TerminalActivityWatchdogAction::StartupStop)
+        );
+        assert_eq!(
+            terminal_activity_watchdog_starting_action(
+                &runtime,
+                TERMINAL_STARTING_WATCHDOG_MS,
+                true,
+                false,
+                true,
+                false,
+            ),
+            Some(TerminalActivityWatchdogAction::StartupStop)
+        );
+        assert_eq!(
+            terminal_activity_watchdog_starting_action(
+                &runtime,
+                TERMINAL_STARTING_WATCHDOG_MS,
+                true,
+                false,
+                false,
+                true,
+            ),
+            Some(TerminalActivityWatchdogAction::StartupDowngradeRunning)
+        );
+        assert_eq!(
+            terminal_activity_watchdog_starting_action(
+                &runtime,
+                TERMINAL_STARTING_WATCHDOG_MS - 1,
+                true,
+                true,
+                true,
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn activity_watchdog_stale_hot_skips_manual_and_active_tool_states() {
+        let mut runtime = TerminalRuntimeSnapshot {
+            status: "active".to_string(),
+            activity_status: "thinking".to_string(),
+            command_phase: "running".to_string(),
+            input_ready: false,
+            input_ready_at: None,
+            prompt_ready_at: None,
+            completed_at: None,
+            provider_session_id: Some("session-1".to_string()),
+            native_session_id: Some("session-1".to_string()),
+            fork_from_provider_session_id: None,
+            provider_turn_id: Some("turn-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            source: "cli-hook:provider-turn-started".to_string(),
+            event_type: "provider-turn-started".to_string(),
+            hook_event_name: "UserPromptSubmit".to_string(),
+            updated_at_ms: 1,
+        };
+        assert_eq!(
+            terminal_activity_watchdog_stale_hot_action(&runtime, TERMINAL_HOT_STALE_WATCHDOG_MS),
+            Some(TerminalActivityWatchdogAction::StaleHotStop)
+        );
+
+        runtime.activity_status = "paused".to_string();
+        runtime.command_phase = "awaiting_permission".to_string();
+        assert_eq!(
+            terminal_activity_watchdog_stale_hot_action(&runtime, TERMINAL_HOT_STALE_WATCHDOG_MS),
+            None
+        );
+
+        runtime.activity_status = "shell".to_string();
+        runtime.command_phase = "tool_running".to_string();
+        assert_eq!(
+            terminal_activity_watchdog_stale_hot_action(&runtime, TERMINAL_HOT_STALE_WATCHDOG_MS),
+            None
+        );
+    }
+
+    #[test]
     fn stray_startup_idle_is_ignored_during_busy_turns() {
         let startup_idle = json!({
             "hookEventName": "Stop",
@@ -19715,16 +20507,20 @@ mod terminal_tests {
             &child_idle_payload,
             &runtime,
             true,
+            "pane-1",
+            1,
         ));
         assert!(!terminal_activity_hook_session_id_mismatches_busy_runtime(
             &child_idle_payload,
             &runtime,
             false,
+            "pane-1",
+            1,
         ));
     }
 
     #[test]
-    fn busy_runtime_rejects_idle_completion_without_session() {
+    fn busy_runtime_allows_pane_scoped_idle_completion_without_session() {
         let runtime = TerminalRuntimeSnapshot {
             status: "active".to_string(),
             activity_status: "thinking".to_string(),
@@ -19751,10 +20547,66 @@ mod terminal_tests {
             None,
         );
 
+        assert!(!terminal_activity_hook_session_id_mismatches_busy_runtime(
+            &missing_session_idle_payload,
+            &runtime,
+            true,
+            "pane-1",
+            1,
+        ));
         assert!(terminal_activity_hook_session_id_mismatches_busy_runtime(
             &missing_session_idle_payload,
             &runtime,
             true,
+            "other-pane",
+            1,
+        ));
+        assert!(terminal_activity_hook_session_id_mismatches_busy_runtime(
+            &missing_session_idle_payload,
+            &runtime,
+            true,
+            "pane-1",
+            2,
+        ));
+    }
+
+    #[test]
+    fn claude_stop_with_background_work_settles_foreground_unless_input_blocked() {
+        let mut claude_metadata = terminal_projection_test_metadata();
+        claude_metadata.agent_id = "claude".to_string();
+        claude_metadata.agent_kind = "claude".to_string();
+        let background_stop = json!({
+            "hookEventName": "Stop",
+            "backgroundTasks": [{ "status": "running" }],
+        });
+        assert!(terminal_activity_hook_claude_stop_has_background_work(
+            &background_stop
+        ));
+        assert!(!terminal_activity_hook_background_stop_forces_busy(
+            &claude_metadata,
+            "stop",
+            &background_stop,
+        ));
+        assert_eq!(
+            terminal_activity_hook_lifecycle_kind("Stop"),
+            Some((
+                "provider-turn-completed",
+                "idle",
+                "active",
+                "completed",
+                true,
+            ))
+        );
+
+        let blocked_background_stop = json!({
+            "hookEventName": "Stop",
+            "backgroundTasks": [{ "status": "running" }],
+            "inputReady": false,
+        });
+        assert!(terminal_activity_hook_background_stop_forces_busy(
+            &claude_metadata,
+            "stop",
+            &blocked_background_stop,
         ));
     }
 
@@ -19841,7 +20693,7 @@ mod terminal_tests {
         duplicate.provider_turn_id = Some("turn-1".to_string());
 
         assert!(terminal_activity_hook_idle_stop_already_settled(
-            &duplicate, &runtime, false,
+            &duplicate, &runtime, false, "pane-main", 42,
         ));
     }
 

@@ -5610,6 +5610,11 @@ fn snipping_recording_loop(
 
 #[cfg(target_os = "macos")]
 fn snipping_recording_excluded_targets() -> Option<Vec<scap::Target>> {
+    if !snipping_capture_exclusion_enabled() {
+        // Match visible-in-captures so local area recordings include our own controls.
+        return None;
+    }
+
     let targets = std::panic::catch_unwind(scap::get_all_targets)
         .unwrap_or_default()
         .into_iter()

@@ -174,6 +174,72 @@ export function writeAudioRealtimeTranscriptOverlayEnabled(enabled) {
   }
 }
 
+const AUDIO_WIDGET_CAPTURE_VISIBILITY_STORAGE_KEY = "diffforge.audio.widgetCaptureVisibility.v1";
+
+export const AUDIO_WIDGET_CAPTURE_VISIBILITY_VISIBLE = "visible";
+export const AUDIO_WIDGET_CAPTURE_VISIBILITY_AUTO = "auto";
+export const AUDIO_WIDGET_CAPTURE_VISIBILITY_HIDDEN = "hidden";
+
+export const AUDIO_WIDGET_CAPTURE_VISIBILITY_OPTIONS = Object.freeze([
+  Object.freeze({
+    id: AUDIO_WIDGET_CAPTURE_VISIBILITY_VISIBLE,
+    label: "Visible",
+    detail: "Screen shares and recordings always see the recorder.",
+  }),
+  Object.freeze({
+    id: AUDIO_WIDGET_CAPTURE_VISIBILITY_AUTO,
+    label: "Auto",
+    detail: "Hidden while idle; appears in captures while a take is in flight.",
+  }),
+  Object.freeze({
+    id: AUDIO_WIDGET_CAPTURE_VISIBILITY_HIDDEN,
+    label: "Hidden",
+    detail: "Screen shares and recordings never see the recorder.",
+  }),
+]);
+
+export function normalizeAudioWidgetCaptureVisibility(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (
+    normalized === AUDIO_WIDGET_CAPTURE_VISIBILITY_AUTO
+    || normalized === AUDIO_WIDGET_CAPTURE_VISIBILITY_HIDDEN
+  ) {
+    return normalized;
+  }
+  // Default "visible" — the widget was always capture-visible before this
+  // setting existed.
+  return AUDIO_WIDGET_CAPTURE_VISIBILITY_VISIBLE;
+}
+
+export function readAudioWidgetCaptureVisibility() {
+  if (!canUseStorage()) {
+    return AUDIO_WIDGET_CAPTURE_VISIBILITY_VISIBLE;
+  }
+  return normalizeAudioWidgetCaptureVisibility(
+    window.localStorage.getItem(AUDIO_WIDGET_CAPTURE_VISIBILITY_STORAGE_KEY),
+  );
+}
+
+export function writeAudioWidgetCaptureVisibility(mode) {
+  if (canUseStorage()) {
+    window.localStorage.setItem(
+      AUDIO_WIDGET_CAPTURE_VISIBILITY_STORAGE_KEY,
+      normalizeAudioWidgetCaptureVisibility(mode),
+    );
+  }
+}
+
+export function audioWidgetCaptureVisibleFor(mode, takeInFlight) {
+  const normalized = normalizeAudioWidgetCaptureVisibility(mode);
+  if (normalized === AUDIO_WIDGET_CAPTURE_VISIBILITY_HIDDEN) {
+    return false;
+  }
+  if (normalized === AUDIO_WIDGET_CAPTURE_VISIBILITY_AUTO) {
+    return Boolean(takeInFlight);
+  }
+  return true;
+}
+
 const AUDIO_LOCAL_WHISPER_REALTIME_MODE_STORAGE_KEY = "diffforge.audio.localWhisperRealtimeMode.v1";
 const AUDIO_LOCAL_WHISPER_SILENCE_HOLD_MS_STORAGE_KEY = "diffforge.audio.localWhisperSilenceHoldMs.v1";
 

@@ -22,11 +22,18 @@ import GeneratePanel from "./GeneratePanel.jsx";
 import ExportPanel from "./ExportPanel.jsx";
 import { createPlaybackStore } from "./videoPlaybackStore.js";
 import {
+  VIDEO_DESCRIBE_PROGRESS_EVENT,
   VIDEO_GENERATE_PROGRESS_EVENT,
   VIDEO_STORE_CHANGED_EVENT,
   VIDEO_TOOLS_INSTALL_PROGRESS_EVENT,
   VIDEO_TRANSCRIBE_PROGRESS_EVENT,
 } from "./videoPanelBridge.js";
+import {
+  AUTO_DESCRIBE_CREDITS_FLOOR,
+  GENERATION_SETTINGS_EVENT,
+  readAutoDescribeEnabled,
+  readGenerationRouting,
+} from "./generationCatalog.js";
 import TranscriptPanel from "./TranscriptPanel.jsx";
 import {
   addCaptionsForClip,
@@ -1062,6 +1069,105 @@ export default function VideoWorkspacePane({
       .then((manifest) => setFolders(Array.isArray(manifest?.folders) ? manifest.folders : []))
       .catch(() => {});
   }, [repoPath]);
+
+  // Auto-describe: photos without an annotation get a cloud vision blurb in
+  // the background — cloud routing only, gated on the user toggle and a
+  // credits floor; one image at a time, each path tried once per session so
+  // failures can't loop. Completion emits video-store-changed, which
+  // refreshes assets and re-runs this effect for the next candidate.
+  const autoDescribeAttemptedRef = useRef(new Set());
+  const autoDescribeRunningRef = useRef(false);
+  const autoDescribeJobIdRef = useRef("");
+  const autoDescribeBillingRef = useRef({ checkedAtMs: 0, credits: null });
+  // Bumped when routing / auto-describe settings change so the queue effect
+  // re-evaluates immediately instead of waiting for the next media refresh.
+  const [genSettingsTick, setGenSettingsTick] = useState(0);
+  useEffect(() => {
+    const bump = () => setGenSettingsTick((tick) => tick + 1);
+    window.addEventListener(GENERATION_SETTINGS_EVENT, bump);
+    return () => window.removeEventListener(GENERATION_SETTINGS_EVENT, bump);
+  }, []);
+  useEffect(() => {
+    if (!repoPath || autoDescribeRunningRef.current) {
+      return;
+    }
+    if (!readAutoDescribeEnabled() || readGenerationRouting() !== "cloud") {
+      return;
+    }
+    const candidate = assets.find(
+      (item) =>
+        item?.kind === "image"
+        && !item.pending
+        && !item.hasAnnotation
+        && !autoDescribeAttemptedRef.current.has(item.path),
+    );
+    if (!candidate) {
+      return;
+    }
+    autoDescribeRunningRef.current = true;
+    const billing = autoDescribeBillingRef.current;
+    const billingFresh = Date.now() - billing.checkedAtMs < 5 * 60 * 1000;
+    (billingFresh
+      ? Promise.resolve(billing.credits)
+      : invoke("cloud_mcp_get_billing_status").then((status) => {
+          const credits = status?.credits || {};
+          const remaining = Number(
+            credits.termRemainingCredits ?? credits.term_remaining_credits,
+          );
+          autoDescribeBillingRef.current = {
+            checkedAtMs: Date.now(),
+            credits: Number.isFinite(remaining) ? remaining : null,
+          };
+          return autoDescribeBillingRef.current.credits;
+        })
+    )
+      .then((remaining) => {
+        if (remaining == null || remaining < AUTO_DESCRIBE_CREDITS_FLOOR) {
+          autoDescribeRunningRef.current = false;
+          return undefined;
+        }
+        autoDescribeAttemptedRef.current.add(candidate.path);
+        return invoke("video_describe_start", { repoPath, path: candidate.path }).then(
+          (result) => {
+            autoDescribeJobIdRef.current = result?.jobId || "";
+          },
+        );
+      })
+      .catch(() => {
+        autoDescribeAttemptedRef.current.add(candidate.path);
+        autoDescribeRunningRef.current = false;
+      });
+  }, [assets, genSettingsTick, repoPath]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    listen(VIDEO_DESCRIBE_PROGRESS_EVENT, (event) => {
+      // Only our own queue job frees the slot — a manual describe from the
+      // asset panel finishing must not let the queue double-run.
+      if (
+        !disposed
+        && event?.payload?.done
+        && event.payload.jobId
+        && event.payload.jobId === autoDescribeJobIdRef.current
+      ) {
+        autoDescribeJobIdRef.current = "";
+        autoDescribeRunningRef.current = false;
+      }
+    })
+      .then((next) => {
+        if (disposed) {
+          next();
+        } else {
+          unlisten = next;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, []);
 
   const createFolder = useCallback(
     (name) =>

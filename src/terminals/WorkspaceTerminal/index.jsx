@@ -31,6 +31,7 @@ import {
   TODO_QUEUE_SOURCE_TERMINAL_DIRECT,
 } from "../todoQueueSources.js";
 import { createTerminalOutputWorkerSession } from "./terminalOutputWorkerClient.js";
+import { SshClientPicker } from "../../ssh/SshClientPicker.jsx";
 import { guardXtermDuringPushToTalk } from "../xtermPushToTalkGuard.js";
 import {
   GlobalStyle,
@@ -611,6 +612,50 @@ function terminalInputDataIsSubmit(value) {
     || text.includes("\n")
     || text.includes(TERMINAL_ENTER_SEQUENCE)
     || text.includes(TERMINAL_ENTER_SEQUENCE_MOD1);
+}
+
+const WORKSPACE_THREAD_MODEL_CHANGE_CONFIRM_TIMEOUT_MS = 15_000;
+const WORKSPACE_THREAD_MODEL_CHANGE_CONFIRM_POLL_MS = 250;
+
+function getWorkspaceThreadObservedModelChange(workspaceThreads, {
+  agentId,
+  threadId,
+  workspaceId,
+} = {}) {
+  const safeWorkspaceId = String(workspaceId || "").trim();
+  const safeThreadId = String(threadId || "").trim();
+  const safeAgentId = getTerminalAgentKind(agentId);
+  const observedThread = workspaceThreads?.[safeWorkspaceId]?.threads?.[safeThreadId] || null;
+  const providerBinding = getWorkspaceThreadProviderBinding(observedThread, safeAgentId);
+  return {
+    model: String(
+      providerBinding?.modelId
+        || providerBinding?.model
+        || providerBinding?.activeModel
+        || "",
+    ).trim(),
+    modelSource: String(providerBinding?.modelSource || "").trim(),
+    modelUpdatedAt: String(providerBinding?.modelUpdatedAt || "").trim(),
+    providerSessionId: String(providerBinding?.nativeSessionId || "").trim(),
+  };
+}
+
+function workspaceThreadModelChangeMatchesObservation(observation, {
+  initialObservation,
+  model,
+  requireFreshObservation = false,
+} = {}) {
+  const requestedModel = String(model || "").trim();
+  if (!requestedModel || observation?.model !== requestedModel) {
+    return false;
+  }
+  if (!requireFreshObservation) {
+    return true;
+  }
+  return Boolean(
+    observation.modelUpdatedAt
+      && observation.modelUpdatedAt !== String(initialObservation?.modelUpdatedAt || "").trim(),
+  );
 }
 
 const TERMINAL_INPUT_TRANSPORT_BUFFERED_LIMIT_BYTES = 512 * 1024;
@@ -2468,6 +2513,7 @@ function WorkspaceTerminal({
   const terminalThreadIdRef = useRef(terminalThreadId);
   const terminalThreadSlotKeyRef = useRef(terminalThreadSlotKey);
   const terminalThreadActivityStatusRef = useRef(terminalThreadActivityStatus);
+  const workspaceThreadsLatestRef = useRef(workspaceThreads);
   const [terminalRuntimeActivityStatus, setTerminalRuntimeActivityStatus] = useState(terminalThreadActivityStatus);
   const terminalRuntimeActivityStatusRef = useRef(terminalThreadActivityStatus);
   const terminalThreadThinkingTraceSignatureRef = useRef("");
@@ -2494,6 +2540,9 @@ function WorkspaceTerminal({
       && shellLauncherLaunchedAgentId
       && shellLauncherLaunchedAgentId === shellLauncherSelectedAgentId,
   );
+  useEffect(() => {
+    workspaceThreadsLatestRef.current = workspaceThreads;
+  }, [workspaceThreads]);
   useEffect(() => {
     if (isGenericTerminal) {
       return;
@@ -3374,6 +3423,49 @@ function WorkspaceTerminal({
     if (!acceptsInteractiveInput && previousState.acceptsInteractiveInput !== false) {
       terminal.blur?.();
     }
+  }, []);
+  // Selecting a terminal pane must paint its active highlight immediately. The
+  // heavy activation side effects — flushing buffered xterm output (which
+  // rewrites the terminal DOM and triggers full style recalcs), attaching the
+  // WebGL renderer, and forcing a size reconcile — previously ran synchronously
+  // inside the pointerdown handler and inside a useLayoutEffect, so the browser
+  // could not paint the new selection border until hundreds of ms of xterm work
+  // finished. We coalesce that work into a single post-paint animation frame so
+  // the highlight is instant while the terminal catches up one frame later.
+  const activationDeferHandleRef = useRef(0);
+  const activationDeferWorkRef = useRef(null);
+  const [deferredXtermActive, setDeferredXtermActive] = useState(Boolean(isActive));
+  const deferTerminalActivationWork = useCallback((work) => {
+    if (typeof work !== "function") {
+      return;
+    }
+    // Coalesce: the last work scheduled before the frame fires wins, so the
+    // pointerdown flush and the prop-driven activation collapse into one pass.
+    activationDeferWorkRef.current = work;
+    if (activationDeferHandleRef.current) {
+      return;
+    }
+    if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") {
+      const immediate = activationDeferWorkRef.current;
+      activationDeferWorkRef.current = null;
+      immediate?.();
+      return;
+    }
+    activationDeferHandleRef.current = window.requestAnimationFrame(() => {
+      activationDeferHandleRef.current = 0;
+      const pending = activationDeferWorkRef.current;
+      activationDeferWorkRef.current = null;
+      if (typeof pending === "function") {
+        pending();
+      }
+    });
+  }, []);
+  useEffect(() => () => {
+    if (activationDeferHandleRef.current && typeof window !== "undefined") {
+      window.cancelAnimationFrame(activationDeferHandleRef.current);
+    }
+    activationDeferHandleRef.current = 0;
+    activationDeferWorkRef.current = null;
   }, []);
   useEffect(() => {
     // Pause the xterm cursor-blink repaint whenever the app window is unfocused
@@ -5155,6 +5247,11 @@ function WorkspaceTerminal({
     const command = agentId === "codex" && thinkingPower
       ? `/model ${nextModel} ${thinkingPower}`
       : `/model ${nextModel}`;
+    const initialModelObservation = getWorkspaceThreadObservedModelChange(workspaceThreadsLatestRef.current, {
+      agentId,
+      threadId: latestThread.id,
+      workspaceId: latestThread.workspaceId || workspace?.id || "",
+    });
     logBigViewSyncDiagnosticEvent("bigview.model_change.terminal_write_start", {
       agentId,
       bindingInstanceId: binding.instanceId,
@@ -5163,6 +5260,9 @@ function WorkspaceTerminal({
       model: nextModel,
       modelTerminalSnapshot,
       modelThreadSnapshot,
+      observedModel: initialModelObservation.model,
+      observedModelSource: initialModelObservation.modelSource,
+      observedModelUpdatedAt: initialModelObservation.modelUpdatedAt,
       requestIncludesThinkingPower,
       thinkingPower,
       thinkingPowerSource,
@@ -5213,29 +5313,73 @@ function WorkspaceTerminal({
       threadId: latestThread.id,
       workspaceId: latestThread.workspaceId || workspace?.id || "",
     });
-    logBigViewSyncDiagnosticEvent("bigview.model_state.terminal_selected_emit", {
+    const waitStartedAt = Date.now();
+    const confirmationFields = {
       agentId,
       bindingInstanceId: binding.instanceId,
       bindingPaneId: binding.paneId,
+      initialObservedModel: initialModelObservation.model,
+      initialObservedModelSource: initialModelObservation.modelSource,
+      initialObservedModelUpdatedAt: initialModelObservation.modelUpdatedAt,
       model: nextModel,
-      modelSource: "user",
+      requestIncludesThinkingPower,
       terminalIndex: latestThread.terminalIndex ?? binding.terminalIndex,
+      thinkingPower,
+      thinkingPowerSource,
       threadId: latestThread.id,
+      timeoutMs: WORKSPACE_THREAD_MODEL_CHANGE_CONFIRM_TIMEOUT_MS,
       workspaceId: latestThread.workspaceId || workspace?.id || "",
+    };
+    logBigViewSyncDiagnosticEvent("bigview.model_change.confirm_wait_start", confirmationFields);
+    let confirmedObservation = null;
+    try {
+      confirmedObservation = await new Promise((resolve, reject) => {
+        const checkObservedModel = () => {
+          const observation = getWorkspaceThreadObservedModelChange(workspaceThreadsLatestRef.current, {
+            agentId,
+            threadId: latestThread.id,
+            workspaceId: latestThread.workspaceId || workspace?.id || "",
+          });
+          if (workspaceThreadModelChangeMatchesObservation(observation, {
+            initialObservation: initialModelObservation,
+            model: nextModel,
+          })) {
+            resolve(observation);
+            return;
+          }
+          if (Date.now() - waitStartedAt >= WORKSPACE_THREAD_MODEL_CHANGE_CONFIRM_TIMEOUT_MS) {
+            reject(new Error("Model change was written to the terminal but was not confirmed by session history yet."));
+            return;
+          }
+          window.setTimeout(checkObservedModel, WORKSPACE_THREAD_MODEL_CHANGE_CONFIRM_POLL_MS);
+        };
+        window.setTimeout(checkObservedModel, 0);
+      });
+    } catch (error) {
+      const latestObservation = getWorkspaceThreadObservedModelChange(workspaceThreadsLatestRef.current, {
+        agentId,
+        threadId: latestThread.id,
+        workspaceId: latestThread.workspaceId || workspace?.id || "",
+      });
+      logBigViewSyncDiagnosticEvent("bigview.model_change.confirm_timeout", {
+        ...confirmationFields,
+        elapsedMs: Date.now() - waitStartedAt,
+        message: error?.message || String(error || ""),
+        observedModel: latestObservation.model,
+        observedModelSource: latestObservation.modelSource,
+        observedModelUpdatedAt: latestObservation.modelUpdatedAt,
+      });
+      throw error;
+    }
+    logBigViewSyncDiagnosticEvent("bigview.model_change.confirmed", {
+      ...confirmationFields,
+      elapsedMs: Date.now() - waitStartedAt,
+      observedModel: confirmedObservation.model,
+      observedModelSource: confirmedObservation.modelSource,
+      observedModelUpdatedAt: confirmedObservation.modelUpdatedAt,
+      providerSessionPresent: Boolean(confirmedObservation.providerSessionId),
     });
-    onThreadTerminalLifecycle?.({
-      agentId,
-      instanceId: binding.instanceId,
-      model: nextModel,
-      modelId: nextModel,
-      modelSource: "user",
-      paneId: binding.paneId,
-      terminalIndex: latestThread.terminalIndex ?? binding.terminalIndex,
-      threadId: latestThread.id,
-      type: "model-selected",
-      workspaceId: latestThread.workspaceId || workspace?.id || "",
-    });
-  }, [onThreadTerminalLifecycle, terminalAgentKind, workspace, workspaceThreads]);
+  }, [terminalAgentKind, workspace, workspaceThreads]);
   const changeWorkspaceThreadAgent = useCallback(async ({ agentId, thread: targetThread, workspace: targetWorkspace }) => {
     const nextAgentId = getTerminalAgentKind(agentId);
     const targetTerminalIndex = Number.parseInt(
@@ -5266,14 +5410,18 @@ function WorkspaceTerminal({
 
     if (!alreadyActive) {
       terminalActiveRef.current = true;
+      // Route keyboard + update selection (border) synchronously so the highlight
+      // paints this frame; defer the xterm output flush past paint.
       setActiveTerminalKeyboardTarget(paneId, instanceId);
-      updateTerminalInteractiveState(true);
       onActivateTerminal?.({
         instanceId,
         paneId,
         source,
         terminalIndex,
         workspaceId: workspace?.id || "",
+      });
+      deferTerminalActivationWork(() => {
+        updateTerminalInteractiveState(true);
       });
     } else if (focusKeyboard) {
       setActiveTerminalKeyboardTarget(paneId, instanceId);
@@ -5284,6 +5432,7 @@ function WorkspaceTerminal({
       focusTerminalKeyboardInput(true);
     }
   }, [
+    deferTerminalActivationWork,
     focusTerminalKeyboardInput,
     onActivateTerminal,
     paneId,
@@ -5430,32 +5579,43 @@ function WorkspaceTerminal({
     const wasActiveProp = terminalActivePropRef.current === true;
     terminalActivePropRef.current = nextActive;
     terminalActiveRef.current = nextActive;
-    updateTerminalInteractiveState(nextActive);
 
     if (nextActive) {
       const instanceId = terminalInstanceIdRef.current || 0;
+      // Keyboard + audio routing stays synchronous (cheap) so input is correct
+      // immediately; the expensive xterm work runs after the highlight paints.
       setActiveTerminalKeyboardTarget(paneId, instanceId);
       setTerminalAudioInputTarget(true, instanceId, "terminal_active_prop");
-      touchTerminalWebglRendererRef.current?.("terminal_active_prop");
-      if (!wasActiveProp) {
-        attachDeferredWebglRef.current?.("terminal_activated");
-        // Resizes are skipped while a pane's surface is hidden; activation is
-        // the reveal path, so reconcile any size drift now.
-        resizeControllerRef.current?.schedule("terminal_activated", 0, {
-          force: true,
-          forceNative: true,
-          nativeDelayMs: 0,
-        });
-      }
+      deferTerminalActivationWork(() => {
+        updateTerminalInteractiveState(nextActive);
+        // Flip the xterm-subtree data-active attribute (cursor/helper selectors)
+        // after paint so its descendant-selector recalc does not gate the border.
+        setDeferredXtermActive(true);
+        touchTerminalWebglRendererRef.current?.("terminal_active_prop");
+        if (!wasActiveProp) {
+          attachDeferredWebglRef.current?.("terminal_activated");
+          // Resizes are skipped while a pane's surface is hidden; activation is
+          // the reveal path, so reconcile any size drift now.
+          resizeControllerRef.current?.schedule("terminal_activated", 0, {
+            force: true,
+            forceNative: true,
+            nativeDelayMs: 0,
+          });
+        }
+      });
       return undefined;
     }
 
     const instanceId = terminalInstanceIdRef.current || 0;
     clearActiveTerminalKeyboardTargetIfCurrent(paneId, instanceId);
     setTerminalAudioInputTarget(false, instanceId, "terminal_inactive_prop");
-    resetTerminalWebglRendererRef.current?.("terminal_deactivated");
+    deferTerminalActivationWork(() => {
+      updateTerminalInteractiveState(nextActive);
+      setDeferredXtermActive(false);
+      resetTerminalWebglRendererRef.current?.("terminal_deactivated");
+    });
     return undefined;
-  }, [isActive, paneId, setTerminalAudioInputTarget, updateTerminalInteractiveState]);
+  }, [deferTerminalActivationWork, isActive, paneId, setTerminalAudioInputTarget, updateTerminalInteractiveState]);
 
   useEffect(() => {
     const controller = resizeControllerRef.current;
@@ -16737,7 +16897,7 @@ function WorkspaceTerminal({
 
   const xtermSurface = (
     <XtermSurface
-      data-active={isActive ? "true" : "false"}
+      data-active={deferredXtermActive ? "true" : "false"}
       data-pty-reveal-ready={terminalPtyRevealReady ? "true" : "false"}
       data-terminal-breakout={terminalBreakoutActive ? "true" : undefined}
       data-scrollbar-platform={TERMINAL_SCROLLBAR_PLATFORM}
@@ -16896,6 +17056,12 @@ function WorkspaceTerminal({
           >
             <ButtonBrowserIcon aria-hidden="true" />
           </TerminalRestartButton>
+          {isGenericTerminal && !terminalChromeDocked && !windowBreakoutHosted && (
+            <SshClientPicker
+              disabled={terminalClosed || terminalClosing || threadsViewActive || !paneId}
+              paneId={paneId}
+            />
+          )}
           {!terminalChromeDocked && (
             <TerminalRestartButton
               aria-label="Open this terminal in its own window"

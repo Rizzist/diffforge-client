@@ -80,9 +80,18 @@ const WORKSPACE_MCP_GATEWAY_TOOLS: &[&str] = &[
     "secrets__list",
     "secrets__get",
     "secrets__write_env_file",
+    "secrets__ssh_list",
+    "secrets__ssh_connect",
+    "secrets__ssh_get",
 ];
-const WORKSPACE_MCP_SECRETS_TOOLS: &[&str] =
-    &["secrets__list", "secrets__get", "secrets__write_env_file"];
+const WORKSPACE_MCP_SECRETS_TOOLS: &[&str] = &[
+    "secrets__list",
+    "secrets__get",
+    "secrets__write_env_file",
+    "secrets__ssh_list",
+    "secrets__ssh_connect",
+    "secrets__ssh_get",
+];
 const WORKSPACE_MCP_APPROVAL_ALWAYS_ALLOW: &str = "always_allow";
 const WORKSPACE_MCP_APPROVAL_PROMPT: &str = "prompt";
 const WORKSPACE_MCP_EXPOSURE_LAZY: &str = "lazy";
@@ -466,6 +475,103 @@ fn workspace_mcp_secret_public_row(mut row: Value) -> Value {
     row
 }
 
+fn workspace_mcp_ssh_target_public_row(mut row: Value) -> Value {
+    row["has_secret"] = json!(row["has_secret"].as_i64().unwrap_or_default() != 0);
+    row["agent_enabled"] = json!(row["agent_enabled"].as_i64().unwrap_or_default() != 0);
+    row["reveal_password"] = json!(row["reveal_password"].as_i64().unwrap_or_default() != 0);
+    row
+}
+
+fn workspace_mcp_ssh_target_full_row(mut row: Value) -> Value {
+    row["agent_enabled"] = json!(row["agent_enabled"].as_i64().unwrap_or_default() != 0);
+    row["reveal_password"] = json!(row["reveal_password"].as_i64().unwrap_or_default() != 0);
+    row
+}
+
+fn workspace_mcp_optional_trimmed_text(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn workspace_mcp_optional_bool(value: &Value, keys: &[&str]) -> Option<bool> {
+    keys.iter().find_map(|key| {
+        value.get(*key).and_then(|candidate| {
+            candidate
+                .as_bool()
+                .or_else(|| candidate.as_i64().map(|number| number != 0))
+                .or_else(|| {
+                    candidate.as_str().and_then(|text| {
+                        match text.trim().to_ascii_lowercase().as_str() {
+                            "true" | "1" | "yes" | "on" => Some(true),
+                            "false" | "0" | "no" | "off" => Some(false),
+                            _ => None,
+                        }
+                    })
+                })
+        })
+    })
+}
+
+fn workspace_mcp_ssh_auth_method(value: &str) -> Result<String, String> {
+    let auth_method = required_trimmed(value, "authMethod")?.to_ascii_lowercase();
+    if !matches!(auth_method.as_str(), "agent" | "password" | "key") {
+        return Err("SSH target auth method must be agent, password, or key.".to_string());
+    }
+    Ok(auth_method)
+}
+
+fn workspace_mcp_ssh_port(input: &Value) -> Result<Option<u16>, String> {
+    let Some(value) = input.get("port") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(port) = value.as_u64().or_else(|| {
+        value
+            .as_str()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+    }) else {
+        return Err("SSH target port must be a number.".to_string());
+    };
+    if port == 0 {
+        return Err("SSH target port must be greater than 0.".to_string());
+    }
+    if port > u16::MAX as u64 {
+        return Err("SSH target port must be in the u16 range.".to_string());
+    }
+    Ok(Some(port as u16))
+}
+
+fn workspace_mcp_ssh_target_name_from_input(input: &Value) -> Result<String, String> {
+    Ok(required_json_text(input, "name")?.to_string())
+}
+
+fn workspace_mcp_ssh_target_host_from_input(input: &Value) -> Result<String, String> {
+    let host = required_json_text(input, "host")?;
+    if host.chars().any(char::is_whitespace) {
+        return Err("SSH target host must not contain whitespace.".to_string());
+    }
+    if host.starts_with('-') {
+        return Err("SSH target host must not start with '-'.".to_string());
+    }
+    Ok(host.to_string())
+}
+
+fn workspace_mcp_ssh_target_username_from_input(input: &Value) -> Result<Option<String>, String> {
+    let username = workspace_mcp_optional_trimmed_text(input.get("username"));
+    if username
+        .as_deref()
+        .is_some_and(|value| value.starts_with('-'))
+    {
+        return Err("SSH target username must not start with '-'.".to_string());
+    }
+    Ok(username)
+}
+
 fn json_text_or_default(value: Option<&Value>, default: Value) -> Result<String, String> {
     match value {
         Some(value) if !value.is_null() => serde_json::to_string(value),
@@ -718,6 +824,7 @@ fn coordination_workspace_mcp_server(status: &Value) -> Value {
 
 fn workspace_mcp_secrets_server(
     secrets: &[Value],
+    ssh_targets: &[Value],
     client_mount_summary: &Value,
     enabled: bool,
 ) -> Value {
@@ -762,7 +869,9 @@ fn workspace_mcp_secrets_server(
         "agent_visibility": workspace_mcp_visibility(enabled, true, client_mount_summary, enabled),
         "runtime_note": "Local-only built-in secrets vault. Values are not synced to Cloud.",
         "secret_count": secrets.len(),
+        "ssh_target_count": ssh_targets.len(),
         "secrets": secrets,
+        "ssh_targets": ssh_targets,
     })
 }
 
@@ -8746,10 +8855,12 @@ impl CoordinationKernel {
             &[&workspace_id],
         )?;
         let secret_rows = self.workspace_mcp_secret_public_rows(workspace_id)?;
+        let ssh_target_rows = self.workspace_mcp_ssh_target_public_rows(workspace_id)?;
 
         let mut servers = vec![coordination_workspace_mcp_server(&coordination_status)];
         servers.push(workspace_mcp_secrets_server(
             &secret_rows,
+            &ssh_target_rows,
             &client_mount_summary,
             self.workspace_mcp_secrets_enabled(workspace_id)?,
         ));
@@ -8837,7 +8948,13 @@ impl CoordinationKernel {
                 &[&workspace_id],
             )?
             .is_empty();
-        if has_servers || has_secrets {
+        let has_ssh_targets = !self
+            .query_json(
+                "SELECT id FROM workspace_mcp_ssh_targets WHERE workspace_id=?1 LIMIT 1",
+                &[&workspace_id],
+            )?
+            .is_empty();
+        if has_servers || has_secrets || has_ssh_targets {
             // Established registries keep their own configuration.
             return self.mark_workspace_mcp_registry_seeded(&workspace_id, "existing_registry");
         }
@@ -8863,7 +8980,18 @@ impl CoordinationKernel {
             "SELECT key, value FROM workspace_mcp_secrets WHERE workspace_id=?1 ORDER BY key ASC",
             &[&GLOBAL_MCP_DEFAULTS_WORKSPACE_ID],
         )?;
-        if default_servers.is_empty() && default_secrets.is_empty() {
+        let default_ssh_targets = defaults_kernel.query_json(
+            "SELECT name, host, port, username, auth_method, key_path, certificate_path,
+                    secret, agent_enabled, reveal_password
+             FROM workspace_mcp_ssh_targets
+             WHERE workspace_id=?1
+             ORDER BY name ASC",
+            &[&GLOBAL_MCP_DEFAULTS_WORKSPACE_ID],
+        )?;
+        if default_servers.is_empty()
+            && default_secrets.is_empty()
+            && default_ssh_targets.is_empty()
+        {
             return Ok(());
         }
 
@@ -8952,6 +9080,45 @@ impl CoordinationKernel {
                     format!("Unable to copy global default MCP secret into workspace: {error}")
                 })?;
         }
+        for row in &default_ssh_targets {
+            let name = text(row, "name");
+            let host = text(row, "host");
+            let auth_method = text(row, "auth_method");
+            if name.is_empty() || host.is_empty() || auth_method.is_empty() {
+                continue;
+            }
+            self.conn
+                .execute(
+                    "INSERT INTO workspace_mcp_ssh_targets(
+                        id, workspace_id, name, host, port, username, auth_method,
+                        key_path, certificate_path, secret, agent_enabled, reveal_password,
+                        created_at, updated_at
+                    ) VALUES(
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                        ?8, ?9, ?10, ?11, ?12,
+                        ?13, ?13
+                    )
+                    ON CONFLICT(workspace_id, name) DO NOTHING",
+                    params![
+                        uuid(),
+                        workspace_id,
+                        name,
+                        host,
+                        row["port"].as_i64(),
+                        optional_text(row, "username"),
+                        auth_method,
+                        optional_text(row, "key_path"),
+                        optional_text(row, "certificate_path"),
+                        optional_text(row, "secret"),
+                        flag(row, "agent_enabled", 0),
+                        flag(row, "reveal_password", 0),
+                        now,
+                    ],
+                )
+                .map_err(|error| {
+                    format!("Unable to copy global default MCP SSH target into workspace: {error}")
+                })?;
+        }
         self.mark_workspace_mcp_registry_seeded(&workspace_id, "global_defaults")?;
         let _ = self.emit_event(
             "workspace_mcp_defaults_seeded",
@@ -8962,6 +9129,7 @@ impl CoordinationKernel {
                 "workspace_id": workspace_id,
                 "server_count": default_servers.len(),
                 "secret_count": default_secrets.len(),
+                "ssh_target_count": default_ssh_targets.len(),
             }),
         );
         Ok(())
@@ -8998,6 +9166,241 @@ impl CoordinationKernel {
                 "secret_count": secrets.len(),
             },
         }))
+    }
+
+    pub fn workspace_mcp_ssh_target_public_rows(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<Value>, String> {
+        let workspace_id = required_trimmed(workspace_id, "workspace_id")?;
+        let rows = self.query_json(
+            "SELECT id,
+                    name,
+                    host,
+                    port,
+                    username,
+                    auth_method,
+                    key_path,
+                    certificate_path,
+                    CASE WHEN COALESCE(secret, '') <> '' THEN 1 ELSE 0 END AS has_secret,
+                    agent_enabled,
+                    reveal_password,
+                    created_at,
+                    updated_at,
+                    last_used_at
+             FROM workspace_mcp_ssh_targets
+             WHERE workspace_id=?1
+             ORDER BY name ASC",
+            &[&workspace_id],
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(workspace_mcp_ssh_target_public_row)
+            .collect())
+    }
+
+    pub fn workspace_mcp_ssh_targets(&self, workspace_id: &str) -> Result<Value, String> {
+        let workspace_id = required_trimmed(workspace_id, "workspace_id")?;
+        let ssh_targets = self.workspace_mcp_ssh_target_public_rows(workspace_id)?;
+        Ok(json!({
+            "workspace_id": workspace_id,
+            "ssh_targets": ssh_targets,
+            "summary": {
+                "ssh_target_count": ssh_targets.len(),
+            },
+        }))
+    }
+
+    pub fn upsert_workspace_mcp_ssh_target(
+        &self,
+        workspace_id: &str,
+        input: &Value,
+    ) -> Result<Value, String> {
+        let workspace_id = required_trimmed(workspace_id, "workspace_id")?;
+        let id = workspace_mcp_optional_trimmed_text(input.get("id"));
+        let existing = if let Some(id) = id.as_deref() {
+            Some(
+                self.query_json(
+                    "SELECT * FROM workspace_mcp_ssh_targets
+                     WHERE workspace_id=?1 AND id=?2",
+                    &[&workspace_id, &id],
+                )?
+                .into_iter()
+                .next()
+                .ok_or_else(|| "Workspace MCP SSH target does not exist.".to_string())?,
+            )
+        } else {
+            None
+        };
+
+        let name = workspace_mcp_ssh_target_name_from_input(input)?;
+        let host = workspace_mcp_ssh_target_host_from_input(input)?;
+        let port = workspace_mcp_ssh_port(input)?;
+        let port_i64 = port.map(i64::from);
+        let username = workspace_mcp_ssh_target_username_from_input(input)?;
+        let auth_method_value = input
+            .get("authMethod")
+            .or_else(|| input.get("auth_method"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| "authMethod is required.".to_string())?;
+        let auth_method = workspace_mcp_ssh_auth_method(auth_method_value)?;
+        let key_path = workspace_mcp_optional_trimmed_text(
+            input.get("keyPath").or_else(|| input.get("key_path")),
+        );
+        if auth_method == "key" && key_path.is_none() {
+            return Err("SSH key path is required for key auth.".to_string());
+        }
+        let certificate_path = workspace_mcp_optional_trimmed_text(
+            input
+                .get("certificatePath")
+                .or_else(|| input.get("certificate_path")),
+        );
+        let secret_update = match input.get("secret") {
+            Some(Value::String(value)) if value.is_empty() => Some(None),
+            Some(Value::String(value)) => Some(Some(value.to_string())),
+            Some(Value::Null) => Some(None),
+            Some(_) => return Err("SSH target secret must be a string.".to_string()),
+            None => None,
+        };
+        let existing_secret = existing
+            .as_ref()
+            .and_then(|row| row["secret"].as_str().map(str::to_string))
+            .filter(|value| !value.is_empty());
+        let secret = secret_update.unwrap_or(existing_secret);
+        let agent_enabled = workspace_mcp_optional_bool(input, &["agentEnabled", "agent_enabled"])
+            .unwrap_or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|row| row["agent_enabled"].as_i64().unwrap_or_default() != 0)
+                    .unwrap_or(false)
+            });
+        let reveal_password =
+            workspace_mcp_optional_bool(input, &["revealPassword", "reveal_password"])
+                .unwrap_or_else(|| {
+                    existing
+                        .as_ref()
+                        .map(|row| row["reveal_password"].as_i64().unwrap_or_default() != 0)
+                        .unwrap_or(false)
+                });
+        let now = now_rfc3339();
+        let created_at = existing
+            .as_ref()
+            .and_then(|row| row["created_at"].as_str().map(str::to_string))
+            .unwrap_or_else(|| now.clone());
+        let id = id.unwrap_or_else(uuid);
+
+        if existing.is_some() {
+            self.conn
+                .execute(
+                    "UPDATE workspace_mcp_ssh_targets
+                     SET name=?1,
+                         host=?2,
+                         port=?3,
+                         username=?4,
+                         auth_method=?5,
+                         key_path=?6,
+                         certificate_path=?7,
+                         secret=?8,
+                         agent_enabled=?9,
+                         reveal_password=?10,
+                         updated_at=?11
+                     WHERE workspace_id=?12 AND id=?13",
+                    params![
+                        &name,
+                        &host,
+                        port_i64,
+                        username.as_deref(),
+                        &auth_method,
+                        key_path.as_deref(),
+                        certificate_path.as_deref(),
+                        secret.as_deref(),
+                        bool_i64(agent_enabled),
+                        bool_i64(reveal_password),
+                        &now,
+                        &workspace_id,
+                        &id,
+                    ],
+                )
+                .map_err(|error| format!("Unable to update workspace MCP SSH target: {error}"))?;
+        } else {
+            self.conn
+                .execute(
+                    "INSERT INTO workspace_mcp_ssh_targets(
+                        id, workspace_id, name, host, port, username, auth_method,
+                        key_path, certificate_path, secret, agent_enabled, reveal_password,
+                        created_at, updated_at
+                    ) VALUES(
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                        ?8, ?9, ?10, ?11, ?12,
+                        ?13, ?14
+                    )",
+                    params![
+                        &id,
+                        &workspace_id,
+                        &name,
+                        &host,
+                        port_i64,
+                        username.as_deref(),
+                        &auth_method,
+                        key_path.as_deref(),
+                        certificate_path.as_deref(),
+                        secret.as_deref(),
+                        bool_i64(agent_enabled),
+                        bool_i64(reveal_password),
+                        &created_at,
+                        &now,
+                    ],
+                )
+                .map_err(|error| format!("Unable to save workspace MCP SSH target: {error}"))?;
+        }
+        self.emit_event(
+            "workspace_mcp_ssh_target_saved",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({
+                "workspace_id": workspace_id,
+                "name": name,
+                "auth_method": auth_method,
+                "agent_enabled": agent_enabled,
+                "reveal_password": reveal_password,
+            }),
+        )?;
+        self.workspace_mcp_ssh_targets(workspace_id)
+    }
+
+    pub fn delete_workspace_mcp_ssh_target(
+        &self,
+        workspace_id: &str,
+        ssh_target_id: &str,
+    ) -> Result<Value, String> {
+        let workspace_id = required_trimmed(workspace_id, "workspace_id")?;
+        let ssh_target_id = required_trimmed(ssh_target_id, "ssh_target_id")?;
+        let row = self
+            .query_json(
+                "SELECT name FROM workspace_mcp_ssh_targets WHERE workspace_id=?1 AND id=?2",
+                &[&workspace_id, &ssh_target_id],
+            )?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Workspace MCP SSH target does not exist.".to_string())?;
+        self.conn
+            .execute(
+                "DELETE FROM workspace_mcp_ssh_targets WHERE workspace_id=?1 AND id=?2",
+                params![workspace_id, ssh_target_id],
+            )
+            .map_err(|error| format!("Unable to delete workspace MCP SSH target: {error}"))?;
+        self.emit_event(
+            "workspace_mcp_ssh_target_deleted",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({
+                "workspace_id": workspace_id,
+                "name": row["name"].clone(),
+            }),
+        )?;
+        self.workspace_mcp_ssh_targets(workspace_id)
     }
 
     pub fn upsert_workspace_mcp_secret(
@@ -9137,6 +9540,49 @@ impl CoordinationKernel {
             "value": value,
             "secret": true,
         }))
+    }
+
+    pub fn read_workspace_mcp_ssh_target_for_agent(
+        &self,
+        workspace_id: &str,
+        name: &str,
+    ) -> Result<Value, String> {
+        let workspace_id = required_trimmed(workspace_id, "workspace_id")?;
+        let name = required_trimmed(name, "name")?;
+        let mut row = self
+            .query_json(
+                "SELECT * FROM workspace_mcp_ssh_targets
+                 WHERE workspace_id=?1 AND name=?2",
+                &[&workspace_id, &name],
+            )?
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("Workspace MCP SSH target `{name}` does not exist."))?;
+        if row["agent_enabled"].as_i64().unwrap_or_default() == 0 {
+            return Err(format!("SSH target `{name}` is not enabled for agents."));
+        }
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE workspace_mcp_ssh_targets
+                 SET last_used_at=?1
+                 WHERE workspace_id=?2 AND name=?3",
+                params![&now, &workspace_id, &name],
+            )
+            .map_err(|error| format!("Unable to record workspace MCP SSH target usage: {error}"))?;
+        row["last_used_at"] = json!(now);
+        self.emit_event(
+            "workspace_mcp_ssh_target_used",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({
+                "workspace_id": workspace_id,
+                "name": name,
+                "auth_method": row["auth_method"].clone(),
+            }),
+        )?;
+        Ok(workspace_mcp_ssh_target_full_row(row))
     }
 
     fn spawn_workspace_mcp_background_job<F>(

@@ -195,9 +195,9 @@ const THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const THREAD_BRIDGE_DIAGNOSTIC_LOG_FILE: &str = "thread-bridge.jsonl";
 const BIGVIEW_SYNC_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const BIGVIEW_SYNC_DIAGNOSTIC_LOG_FILE: &str = "bigview-sync.jsonl";
-// Dev builds trace every workspace activation (logs/workspace-activation.jsonl)
-// so "switching is laggy" reports are attributable without an env-var launch.
-const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED: bool = cfg!(debug_assertions);
+// Off by default (user request 2026-07-07); the env-var launch path below
+// still re-enables workspace-activation tracing per run when needed.
+const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOG_FILE: &str = "workspace-activation.jsonl";
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOG_FILE: &str = "voice-orchestrator.jsonl";
@@ -2192,6 +2192,7 @@ struct TerminalActivityHookPayload {
     turn_status: String,
     session_state: String,
     input_ready: bool,
+    background_work_active: bool,
     input_ready_at: Option<String>,
     prompt_ready_at: Option<String>,
     completed_at: Option<String>,
@@ -2717,6 +2718,7 @@ include!("pcb.rs");
 include!("video_editor.rs");
 include!("video_code.rs");
 include!("video_polish.rs");
+include!("video_annotate.rs");
 include!("workspace_web.rs");
 include!("developer_processes.rs");
 include!("app_control_mcp.rs");
@@ -2737,6 +2739,7 @@ include!("api.rs");
 include!("activity_overlay.rs");
 include!("todo_dispatch.rs");
 include!("agent_accounts.rs");
+include!("ssh_profiles.rs");
 include!("background_mode.rs");
 include!("app_updater.rs");
 include!("vm_sandbox.rs");
@@ -9888,6 +9891,7 @@ fn run_app(daemon: bool) {
             tray_click_settings_state,
             tray_click_settings_update,
             agent_statuses,
+            opencode_list_models,
             start_agent_login,
             start_agent_account_login,
             agent_accounts_start_profile_login,
@@ -9977,6 +9981,11 @@ fn run_app(daemon: bool) {
             video_code_preview_stop,
             video_polish_start,
             video_polish_cancel,
+            video_annotation_get,
+            video_annotation_update,
+            video_annotation_delete,
+            video_describe_start,
+            video_describe_cancel,
             video_jobs_list,
             video_generation_providers,
             video_lora_list,
@@ -10082,6 +10091,7 @@ fn run_app(daemon: bool) {
             snipping_copy_text_to_clipboard,
             snipping_cancel_area_snip,
             audio_widget_status,
+            audio_widget_set_capture_visible,
             audio_widget_bar_hover_snapshot,
             audio_widget_log_bubble_position,
             audio_widget_position_bottom_bar,
@@ -10221,6 +10231,9 @@ fn run_app(daemon: bool) {
             agent_accounts_set_active,
             agent_accounts_remove,
             agent_accounts_pane_profiles,
+            ssh_profiles_list,
+            ssh_profile_save,
+            ssh_profile_delete,
             app_enter_background,
             app_exit_background,
             app_background_mode_state,
@@ -10271,6 +10284,7 @@ fn run_app(daemon: bool) {
             set_terminal_audio_route_gate,
             terminal_write_to_audio_input_target,
             terminal_write,
+            terminal_ssh_connect,
             terminal_request_fork,
             terminal_input_transport_endpoint,
             terminal_output_transport_endpoint,
@@ -10338,6 +10352,8 @@ fn run_app(daemon: bool) {
             coordination::tauri_commands::coordination_uninstall_workspace_mcp_server,
             coordination::tauri_commands::coordination_upsert_workspace_mcp_secret,
             coordination::tauri_commands::coordination_delete_workspace_mcp_secret,
+            coordination::tauri_commands::coordination_upsert_workspace_mcp_ssh_target,
+            coordination::tauri_commands::coordination_delete_workspace_mcp_ssh_target,
             coordination::tauri_commands::coordination_activate_shared_mcp_daemon,
             coordination::tauri_commands::coordination_activate_shared_mcp_daemon_background,
             coordination::tauri_commands::coordination_deactivate_shared_mcp_daemon,

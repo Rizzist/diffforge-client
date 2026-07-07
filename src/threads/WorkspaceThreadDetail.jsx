@@ -62,6 +62,14 @@ import {
   getWorkspaceThreadProviderBinding,
   setWorkspaceThreadDetailVisibility,
 } from "./workspaceThreads";
+import {
+  AgentTranscript,
+  SessionUsageChip,
+  buildDesktopTranscriptItems,
+  desktopTimestampMs,
+  normalizeDesktopDiffSummary,
+  normalizeDesktopTranscriptMessages,
+} from "./transcript";
 
 const thinkingPulse = keyframes`
   0%, 100% {
@@ -5804,10 +5812,16 @@ function WorkspaceThreadDetail({
     visibilityTokenRef.current = `thread-detail-${Math.random().toString(36).slice(2)}`;
   }
   const detailVisible = visible !== false;
-  const messages = detailVisible && Array.isArray(thread?.messages)
-    ? thread.messages.filter(isChatProjectionMessage)
-    : [];
-  const transcriptItems = useMemo(() => buildTranscriptItems(messages), [messages]);
+  const messages = useMemo(() => {
+    if (!detailVisible || !Array.isArray(thread?.messages)) {
+      return [];
+    }
+    return normalizeDesktopTranscriptMessages(thread.messages.filter(isChatProjectionMessage));
+  }, [detailVisible, thread?.messages]);
+  const transcriptItems = useMemo(
+    () => buildDesktopTranscriptItems(messages, { itemIdPrefix: "workspace-thread-message" }),
+    [messages],
+  );
   const latestAssistantBlock = useMemo(() => {
     for (let index = transcriptItems.length - 1; index >= 0; index -= 1) {
       const item = transcriptItems[index];
@@ -5844,6 +5858,17 @@ function WorkspaceThreadDetail({
     [messages, thread, threadGroundTruth],
   );
   const latestActivity = activityItems[activityItems.length - 1] || null;
+  const transcriptBusy = activityItems.some((item) => item?.live === true);
+  const transcriptWorkingStartedAtMs = transcriptBusy
+    ? desktopTimestampMs(
+      threadGroundTruth?.turnStartedAt,
+      thread?.latestTurn?.startedAt,
+      thread?.latestTurn?.requestedAt,
+      latestMessage?.createdAt,
+      latestMessage?.created_at,
+    )
+    : 0;
+  const transcriptWorkingLabel = latestActivity?.text || "Working";
   const diffWorktreePath = getThreadDiffWorktreePath(thread, activeProviderBinding, effectiveLiveTerminal);
   const diffRepoPath = String(
     workspaceRoot
@@ -5868,6 +5893,32 @@ function WorkspaceThreadDetail({
   const visibleLiveDiffSummary = liveDiffSummary?.fileCount && !visibleFinalDiffSummary?.fileCount
     ? liveDiffSummary
     : null;
+  const transcriptDiffSummaries = useMemo(() => {
+    const byKey = new Map();
+    const addSummary = (summary, fallbackTurnId = "") => {
+      const normalized = normalizeDesktopDiffSummary(summary, fallbackTurnId);
+      if (!normalized) {
+        return;
+      }
+      const key = normalized.summaryKey
+        || normalized.summary_key
+        || normalized.turnId
+        || normalized.turn_id
+        || `summary-${byKey.size}`;
+      byKey.set(key, normalized);
+    };
+    Object.entries(diffSummariesByTurnId || {}).forEach(([turnId, summary]) => {
+      addSummary(summary, turnId);
+    });
+    addSummary(visibleFinalDiffSummary, diffTurnId);
+    addSummary(visibleLiveDiffSummary, diffTurnId);
+    return [...byKey.values()];
+  }, [
+    diffSummariesByTurnId,
+    diffTurnId,
+    visibleFinalDiffSummary,
+    visibleLiveDiffSummary,
+  ]);
   const assistantBlockDiffTurnIds = useMemo(() => {
     const seen = new Set();
     const turnIds = [];
@@ -6766,6 +6817,16 @@ function WorkspaceThreadDetail({
     }
   };
 
+  const handleTranscriptUserMessageAction = (action, message, text = "") => {
+    if (action === "edit") {
+      editMessageForResend(message, text);
+      return;
+    }
+    if (action === "resend" || action === "continue") {
+      void redoMessage(message, text);
+    }
+  };
+
   useEffect(() => {
     const handleWindowPasteCapture = (event) => {
       if (event.defaultPrevented) {
@@ -7544,6 +7605,7 @@ function WorkspaceThreadDetail({
             {messages.length} msg
           </HeaderStat>
         ) : null}
+        <SessionUsageChip messages={messages} stats={thread?.stats || null} />
         {headerDiffFileCount > 0 ? (
           <HeaderStat data-tone="diff" title={`${headerDiffFileCount} files changed this turn`}>
             ±{headerDiffFileCount} files
@@ -7570,69 +7632,25 @@ function WorkspaceThreadDetail({
         </HeaderIconButton>
       </DetailHeader>
       <TranscriptScroll ref={transcriptScrollRef}>
-        <TranscriptInner>
-          {transcriptItems.map((item) => (
-            item.type === "assistant-block" ? (() => {
-              const blockTurnId = getAssistantBlockDiffTurnId(item);
-              const blockDiffSummary = blockTurnId
-                ? diffSummariesByTurnId[blockTurnId] || null
-                : null;
-              const diffSummaryExpanded = blockTurnId
-                ? diffSummaryExpandedByTurnId[blockTurnId] !== false
-                : true;
-
-              return (
-                <AssistantResponseBlock
-                  copyAlwaysVisible={item.id === latestAssistantBlockId}
-                  diffSummary={blockDiffSummary}
-                  diffSummaryExpanded={diffSummaryExpanded}
-                  isCopied={copiedMessageId === item.id}
-                  item={item}
-                  key={item.id}
-                  onCopyMessage={handleCopyMessage}
-                  onReviewDiffSummary={reviewDiffSummary}
-                  onToggleDiffSummary={() => {
-                    if (!blockTurnId) {
-                      return;
-                    }
-                    setDiffSummaryExpandedByTurnId((current) => ({
-                      ...current,
-                      [blockTurnId]: !(current[blockTurnId] !== false),
-                    }));
-                  }}
-                  onUndoDiffSummary={undoDiffSummary}
-                  undoingDiff={Boolean(undoingDiffKey && undoingDiffKey === blockDiffSummary?.summaryKey)}
-                  workspace={workspace}
-                />
-              );
-            })() : item.type === "activity-group" ? (
-              <ActivityMessage
-                key={item.id}
-                messages={item.messages}
-              />
-            ) : (
-              <ThreadMessage
-                isCopied={copiedMessageId === item.id}
-                key={item.id}
-                message={item.message}
-                messageId={item.id}
-                onEditMessage={editMessageForResend}
-                onCopyMessage={handleCopyMessage}
-                onRedoMessage={redoMessage}
-                recoverableStatus={getRecoverableThreadMessageStatus(item.message, thread)}
-                workspace={workspace}
-              />
-            )
-          ))}
-
-          <LiveDiffActivity summary={visibleLiveDiffSummary} />
-          {activityItems.map((item) => (
-            <ActivityCell key={item.id}>
-              <ActivityBullet aria-hidden="true">{"\u2022"}</ActivityBullet>
-              <ActivityText data-live={item.live ? "true" : "false"}>{item.text}</ActivityText>
-            </ActivityCell>
-          ))}
-        </TranscriptInner>
+        <AgentTranscript
+          busy={transcriptBusy}
+          diffSummaries={transcriptDiffSummaries}
+          emptyLabel="No synced chat records yet."
+          itemIdPrefix="workspace-thread-message"
+          items={transcriptItems}
+          messages={messages}
+          onUserMessageAction={handleTranscriptUserMessageAction}
+          scrollRef={transcriptScrollRef}
+          windowKey={[
+            workspace?.id || thread?.workspaceId || "workspace",
+            thread?.id || "thread",
+            activeAgentId,
+            thread?.transcriptSessionId || activeProviderBinding?.nativeSessionId || "",
+            density,
+          ].join(":")}
+          workingLabel={transcriptWorkingLabel}
+          workingStartedAtMs={transcriptWorkingStartedAtMs}
+        />
       </TranscriptScroll>
 
       <ComposerShell

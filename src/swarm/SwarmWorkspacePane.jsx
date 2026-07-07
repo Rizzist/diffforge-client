@@ -1,4 +1,5 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import styled, { keyframes } from "styled-components";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -7,6 +8,7 @@ import { ArrowUpward } from "@styled-icons/material-rounded/ArrowUpward";
 import { CenterFocusStrong } from "@styled-icons/material-rounded/CenterFocusStrong";
 import { Remove } from "@styled-icons/material-rounded/Remove";
 import { Stop } from "@styled-icons/material-rounded/Stop";
+import { Tune } from "@styled-icons/material-rounded/Tune";
 import {
   WorkspaceCreateAgentClaudeIcon,
   WorkspaceCreateAgentCodexIcon,
@@ -16,6 +18,7 @@ import {
 import {
   BUILTIN_AGENT_LAUNCH_DEFAULTS,
   getAgentLaunchModelOption,
+  getAgentLaunchModelOptions,
 } from "../agents/agentLaunchDefaults.js";
 
 // Contract: docs/swarm-panel-v1-contract.md. The swarm id is deterministic per
@@ -127,6 +130,160 @@ function memberModelText(member) {
   }
   const option = getAgentLaunchModelOption(provider, modelId);
   return String(option?.label || modelId);
+}
+
+// Model catalog per harness (contract §v1.4): claude/codex use the static app
+// launch catalog; opencode prefers the locally enumerated `opencode models`
+// list and falls back to the static entries when the CLI list is unavailable.
+function swarmModelOptionsForProvider(provider, opencodeModels) {
+  const normalized = String(provider || "").trim().toLowerCase();
+  if (normalized === "opencode"
+    && opencodeModels?.status === "ready"
+    && Array.isArray(opencodeModels.models)
+    && opencodeModels.models.length > 0) {
+    return opencodeModels.models.map((id) => ({ id: String(id), label: String(id) }));
+  }
+  return getAgentLaunchModelOptions(normalized).map((option) => ({
+    id: String(option.id),
+    label: String(option.label || option.id),
+  }));
+}
+
+// Searchable model picker popover for one member (or the add-member row).
+// Enter picks the top match, or applies the typed text as a custom model id
+// when nothing matches. Empty model = harness default. Rendered through a
+// body portal with fixed positioning so the Members-tab scroll container and
+// narrow pane edges can't clip it; flips above the trigger when the space
+// below is too short.
+function SwarmModelMenuPanel({ anchorRef, currentModel, onClose, onRefresh, onSelect, opencodeModels, provider }) {
+  const [query, setQuery] = useState("");
+  const [placement, setPlacement] = useState(null);
+  const menuRef = useRef(null);
+
+  useLayoutEffect(() => {
+    const place = () => {
+      const anchor = anchorRef?.current;
+      if (!anchor || !anchor.isConnected) {
+        return;
+      }
+      const rect = anchor.getBoundingClientRect();
+      const viewportWidth = window.innerWidth;
+      const viewportHeight = window.innerHeight;
+      const width = Math.min(250, Math.max(170, viewportWidth - 16));
+      const left = Math.max(8, Math.min(rect.right - width, viewportWidth - width - 8));
+      const spaceBelow = viewportHeight - rect.bottom - 12;
+      const spaceAbove = rect.top - 12;
+      const openUp = spaceBelow < 190 && spaceAbove > spaceBelow;
+      const maxHeight = Math.max(120, Math.min(300, openUp ? spaceAbove : spaceBelow));
+      setPlacement(openUp
+        ? { left, width, maxHeight, bottom: Math.max(8, viewportHeight - rect.top + 4) }
+        : { left, width, maxHeight, top: rect.bottom + 4 });
+    };
+    place();
+    window.addEventListener("resize", place);
+    return () => window.removeEventListener("resize", place);
+  }, [anchorRef]);
+
+  // Close on any pointer-down outside the menu and its trigger. Ref-based so
+  // it works through the portal without relying on stopPropagation.
+  useEffect(() => {
+    const onWindowMouseDown = (event) => {
+      const target = event.target;
+      if (menuRef.current?.contains(target) || anchorRef?.current?.contains(target)) {
+        return;
+      }
+      onClose();
+    };
+    window.addEventListener("mousedown", onWindowMouseDown);
+    return () => window.removeEventListener("mousedown", onWindowMouseDown);
+  }, [anchorRef, onClose]);
+
+  const normalizedQuery = query.trim().toLowerCase();
+  const options = swarmModelOptionsForProvider(provider, opencodeModels);
+  const filtered = normalizedQuery
+    ? options.filter((option) => option.id.toLowerCase().includes(normalizedQuery)
+      || option.label.toLowerCase().includes(normalizedQuery))
+    : options;
+  const isOpencode = String(provider || "").trim().toLowerCase() === "opencode";
+  const cliListLive = isOpencode
+    && opencodeModels?.status === "ready"
+    && (opencodeModels.models || []).length > 0;
+  if (!placement) {
+    return null;
+  }
+  return createPortal(
+    <SwarmModelMenu
+      ref={menuRef}
+      style={{
+        left: placement.left,
+        width: placement.width,
+        maxHeight: placement.maxHeight,
+        top: placement.top,
+        bottom: placement.bottom,
+      }}
+    >
+      <input
+        autoFocus
+        onChange={(event) => setQuery(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            onClose();
+            return;
+          }
+          if (event.key === "Enter") {
+            event.preventDefault();
+            const typed = query.trim();
+            if (filtered.length > 0) {
+              onSelect(filtered[0].id);
+            } else if (typed) {
+              onSelect(typed);
+            }
+          }
+        }}
+        placeholder="Search models…"
+        spellCheck={false}
+        value={query}
+      />
+      <SwarmModelMenuList>
+        <SwarmModelMenuItem
+          data-active={!String(currentModel || "").trim() ? "true" : undefined}
+          onClick={() => onSelect("")}
+          type="button"
+        >
+          Harness default
+        </SwarmModelMenuItem>
+        {filtered.map((option) => (
+          <SwarmModelMenuItem
+            data-active={option.id === String(currentModel || "").trim() ? "true" : undefined}
+            key={option.id}
+            onClick={() => onSelect(option.id)}
+            title={option.id}
+            type="button"
+          >
+            {option.label}
+            {option.label !== option.id ? <small>{option.id}</small> : null}
+          </SwarmModelMenuItem>
+        ))}
+        {filtered.length === 0 ? (
+          <SwarmModelMenuHint>No matches — press Enter to use the text as a custom model id.</SwarmModelMenuHint>
+        ) : null}
+      </SwarmModelMenuList>
+      {isOpencode ? (
+        <SwarmModelMenuHint data-footer="true">
+          <span>
+            {opencodeModels?.status === "loading"
+              ? "Loading models from opencode…"
+              : cliListLive
+                ? `${opencodeModels.models.length} models from opencode${opencodeModels.source === "stale-cache" ? " (stale)" : ""}`
+                : "opencode model list unavailable — showing defaults"}
+          </span>
+          <button onClick={onRefresh} type="button">Refresh</button>
+        </SwarmModelMenuHint>
+      ) : null}
+    </SwarmModelMenu>,
+    document.body,
+  );
 }
 
 function describeSwarmRunEvent(event, membersById) {
@@ -1229,7 +1386,8 @@ const SwarmEmptyHint = styled.div`
 const SwarmMemberRow = styled.div`
   display: flex;
   align-items: center;
-  gap: 9px;
+  flex-wrap: wrap; /* narrow panes: status/buttons drop below the name */
+  gap: 6px 9px;
   padding: 7px 9px;
   border-radius: 8px;
   border: 1px solid rgba(139, 148, 158, 0.16);
@@ -1261,7 +1419,7 @@ const SwarmMemberBadge = styled.span`
 `;
 
 const SwarmMemberMain = styled.div`
-  flex: 1 1 auto;
+  flex: 1 1 140px; /* basis forces trailing controls to wrap before the name crushes */
   min-width: 0;
   display: flex;
   flex-direction: column;
@@ -1307,6 +1465,7 @@ const SwarmMemberStatus = styled.span`
 const SwarmAddMemberRow = styled.div`
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
   padding: 6px 8px;
   border-radius: 8px;
@@ -1329,6 +1488,121 @@ const SwarmAddMemberRow = styled.div`
     background: #ffffff;
     color: #1f2328;
     border-color: rgba(31, 35, 40, 0.2);
+  }
+`;
+
+const SwarmModelMenuWrap = styled.div`
+  position: relative;
+  flex: 0 0 auto;
+  display: inline-flex;
+`;
+
+const SwarmModelMenu = styled.div`
+  /* left/width/top|bottom/max-height come from inline style: the menu is
+     portaled to <body> and clamped to the viewport so pane/scroll containers
+     can't clip or squash it. */
+  position: fixed;
+  z-index: 2000;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 6px;
+  border-radius: 8px;
+  border: 1px solid rgba(139, 148, 158, 0.32);
+  background: #161b22;
+  box-shadow: 0 12px 28px rgba(1, 4, 9, 0.55);
+
+  input {
+    flex: 0 0 auto;
+    appearance: none;
+    border: 1px solid rgba(139, 148, 158, 0.3);
+    border-radius: 6px;
+    background: #0d1117;
+    color: #e6edf3;
+    font-size: 11px;
+    padding: 4px 6px;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+    border-color: rgba(31, 35, 40, 0.18);
+    box-shadow: 0 12px 28px rgba(31, 35, 40, 0.18);
+
+    input {
+      background: #ffffff;
+      color: #1f2328;
+      border-color: rgba(31, 35, 40, 0.2);
+    }
+  }
+`;
+
+const SwarmModelMenuList = styled.div`
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+`;
+
+const SwarmModelMenuItem = styled.button`
+  appearance: none;
+  flex: 0 0 auto;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(230, 237, 243, 0.88);
+  text-align: left;
+  font-size: 11px;
+  padding: 4px 6px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  small {
+    display: block;
+    font-size: 9.5px;
+    color: rgba(139, 148, 158, 0.85);
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  &:hover { background: rgba(110, 118, 129, 0.16); }
+  &[data-active="true"] { color: #79b8ff; background: rgba(76, 141, 255, 0.12); }
+
+  html[data-forge-theme="light"] & {
+    color: rgba(31, 35, 40, 0.9);
+    &:hover { background: rgba(31, 35, 40, 0.06); }
+    &[data-active="true"] { color: #0969da; background: rgba(9, 105, 218, 0.08); }
+  }
+`;
+
+const SwarmModelMenuHint = styled.div`
+  flex: 0 0 auto;
+  font-size: 9.5px;
+  line-height: 1.4;
+  color: rgba(139, 148, 158, 0.9);
+  padding: 3px 4px;
+
+  &[data-footer="true"] {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    border-top: 1px solid rgba(139, 148, 158, 0.18);
+    padding-top: 5px;
+  }
+
+  button {
+    appearance: none;
+    border: none;
+    background: transparent;
+    color: #4c8dff;
+    font-size: 9.5px;
+    cursor: pointer;
+    padding: 0;
+    flex: 0 0 auto;
   }
 `;
 
@@ -1645,6 +1919,9 @@ export default function SwarmWorkspacePane({
   const [addProvider, setAddProvider] = useState("codex");
   const [addModel, setAddModel] = useState("");
   const [verifyDraft, setVerifyDraft] = useState(null); // null = mirror backend value
+  const [modelMenuKey, setModelMenuKey] = useState(""); // memberId (or "add") with an open model menu
+  const modelMenuAnchorRef = useRef(null); // trigger button of the open menu (portal anchor)
+  const [opencodeModels, setOpencodeModels] = useState({ status: "idle", models: [], source: "", error: "" });
   const [stageView, setStageView] = useState({ x: 0, y: 0, zoom: 1 });
   const [stagePanning, setStagePanning] = useState(false);
 
@@ -1918,6 +2195,60 @@ export default function SwarmWorkspacePane({
     }));
     applyMembers(specs, undefined, next);
   }, [applyMembers, members]);
+
+  // Contract §v1.4: the backend caches `opencode models` output for 5 minutes,
+  // so refetching on every menu open is cheap and self-heals stale lists.
+  const loadOpencodeModels = useCallback(async (forceRefresh = false) => {
+    setOpencodeModels((current) => (current.status === "loading" ? current : { ...current, status: "loading" }));
+    try {
+      const result = await invoke("opencode_list_models", { forceRefresh });
+      if (!mountedRef.current) {
+        return;
+      }
+      setOpencodeModels({
+        status: "ready",
+        models: Array.isArray(result?.models) ? result.models.map(String) : [],
+        source: String(result?.source || ""),
+        error: String(result?.error || ""),
+      });
+    } catch (caught) {
+      if (mountedRef.current) {
+        setOpencodeModels({ status: "error", models: [], source: "error", error: invokeErrorMessage(caught) });
+      }
+    }
+  }, []);
+
+  const toggleModelMenu = useCallback((key, provider) => {
+    setModelMenuKey((current) => {
+      const next = current === key ? "" : key;
+      if (next && String(provider || "").trim().toLowerCase() === "opencode") {
+        loadOpencodeModels(false);
+      }
+      return next;
+    });
+  }, [loadOpencodeModels]);
+
+  // Feed the add-member datalist as soon as opencode is the selected harness.
+  useEffect(() => {
+    if (activeTab === "members" && addProvider === "opencode" && opencodeModels.status === "idle") {
+      loadOpencodeModels(false);
+    }
+  }, [activeTab, addProvider, loadOpencodeModels, opencodeModels.status]);
+
+  const handleMemberModelChange = useCallback((memberId, model) => {
+    const nextModel = String(model || "").trim();
+    const target = membersById.get(memberId);
+    if (!target || nextModel === String(target.model || "").trim()) {
+      return;
+    }
+    const specs = members.map((member) => ({
+      memberId: member.memberId,
+      provider: member.provider,
+      model: member.memberId === memberId ? nextModel : (member.model || ""),
+      label: member.label || "",
+    }));
+    applyMembers(specs);
+  }, [applyMembers, members, membersById]);
 
   const handleActivateSwarm = useCallback(async (memberId = "") => {
     if (!workspaceId || busy) {
@@ -2665,6 +2996,34 @@ export default function SwarmWorkspacePane({
                     <SwarmMemberStatus data-status={member.status || "offline"}>
                       {member.status || "offline"}
                     </SwarmMemberStatus>
+                    <SwarmModelMenuWrap>
+                      <SwarmGhostButton
+                        disabled={busy || backendMissing}
+                        onClick={(event) => {
+                          modelMenuAnchorRef.current = event.currentTarget;
+                          toggleModelMenu(member.memberId, member.provider);
+                        }}
+                        style={{ padding: "5px 7px", display: "inline-flex", alignItems: "center" }}
+                        title={`Model: ${memberModelText(member) || "harness default"} — click to change (member relaunches)`}
+                        type="button"
+                      >
+                        <Tune size={13} />
+                      </SwarmGhostButton>
+                      {modelMenuKey === member.memberId ? (
+                        <SwarmModelMenuPanel
+                          anchorRef={modelMenuAnchorRef}
+                          currentModel={member.model || ""}
+                          onClose={() => setModelMenuKey("")}
+                          onRefresh={() => loadOpencodeModels(true)}
+                          onSelect={(model) => {
+                            setModelMenuKey("");
+                            handleMemberModelChange(member.memberId, model);
+                          }}
+                          opencodeModels={opencodeModels}
+                          provider={member.provider}
+                        />
+                      ) : null}
+                    </SwarmModelMenuWrap>
                     {member.status === "offline" || member.status === "dead" || member.status === "error" ? (
                       <SwarmGhostButton
                         disabled={busy}
@@ -2693,10 +3052,17 @@ export default function SwarmWorkspacePane({
                     ))}
                   </select>
                   <input
+                    list={`swarm-model-options-${swarmId}`}
                     onChange={(event) => setAddModel(event.target.value)}
                     placeholder="model (optional)"
+                    spellCheck={false}
                     value={addModel}
                   />
+                  <datalist id={`swarm-model-options-${swarmId}`}>
+                    {swarmModelOptionsForProvider(addProvider, opencodeModels).map((option) => (
+                      <option key={option.id} label={option.label !== option.id ? option.label : undefined} value={option.id} />
+                    ))}
+                  </datalist>
                   <SwarmGhostButton disabled={busy || backendMissing} onClick={handleAddMember} type="button">
                     Add member
                   </SwarmGhostButton>

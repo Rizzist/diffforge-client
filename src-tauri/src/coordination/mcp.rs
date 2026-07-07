@@ -65,6 +65,9 @@ const WORKSPACE_GATEWAY_BUILTIN_TOOLS: &[&str] = &[
     "secrets__list",
     "secrets__get",
     "secrets__write_env_file",
+    "secrets__ssh_list",
+    "secrets__ssh_connect",
+    "secrets__ssh_get",
     "video_context",
     "video_edit",
     "video_transcribe",
@@ -86,6 +89,8 @@ const DIFFFORGE_APP_BRIDGE_ENDPOINT_ENV: &str = "DIFFFORGE_APP_BRIDGE_ENDPOINT";
 const DIFFFORGE_APP_BRIDGE_TOKEN_ENV: &str = "DIFFFORGE_APP_BRIDGE_TOKEN";
 const WORKSPACE_GATEWAY_VIDEO_NO_WORKSPACE_MESSAGE: &str =
     "No video workspace here — open a Video Editor pane (media/ folder) first.";
+const WORKSPACE_GATEWAY_SECRET_HANDLING_NOTE: &str =
+    "Use this value only for the requested local operation. Do not print it, checkpoint it, summarize it, or include it in todos, architecture files, patches, logs, or cloud payloads.";
 const WORKSPACE_GATEWAY_VIDEO_BRIDGE_TIMEOUT_MS: u64 = 60 * 60 * 1000;
 const WORKSPACE_MCP_EXPOSURE_LAZY: &str = "lazy";
 const WORKSPACE_MCP_EXPOSURE_PINNED: &str = "pinned";
@@ -1841,6 +1846,18 @@ fn workspace_gateway_builtin_tool(
                 Err(error) => workspace_gateway_error_content(error),
             }
         }
+        "secrets__ssh_list" => match workspace_gateway_list_ssh_targets(context) {
+            Ok(result) => workspace_gateway_content(result),
+            Err(error) => workspace_gateway_error_content(error),
+        },
+        "secrets__ssh_connect" => match workspace_gateway_ssh_connect(context, &input) {
+            Ok(result) => workspace_gateway_content(result),
+            Err(error) => workspace_gateway_error_content(error),
+        },
+        "secrets__ssh_get" => match workspace_gateway_ssh_get(context, &input) {
+            Ok(result) => workspace_gateway_content(result),
+            Err(error) => workspace_gateway_error_content(error),
+        },
         _ => workspace_gateway_error_content(format!("Unknown gateway tool: {tool}")),
     }
 }
@@ -1933,6 +1950,15 @@ fn workspace_gateway_builtin_tool_description(tool: &str) -> &'static str {
         "secrets__write_env_file" => {
             "Write selected local-only workspace secrets into an env file without returning secret values in the tool result. Each secret must be enabled for agent access."
         }
+        "secrets__ssh_list" => {
+            "List enabled local-only SSH targets without returning passwords."
+        }
+        "secrets__ssh_connect" => {
+            "Return a runnable ssh command for one enabled local-only SSH target. Key/agent-auth targets work directly. Password targets require the user to enable Reveal password for that target; then call secrets__ssh_get for the password to enter at the prompt."
+        }
+        "secrets__ssh_get" => {
+            "Read non-secret SSH target connection metadata, and only return a password when the target's reveal_password setting is enabled."
+        }
         "video_context" => {
             "Read Video Editor timeline, selection, transcripts, and jobs. Call this first; clip ids are stable only within one context/edit exchange, so re-fetch after edits."
         }
@@ -1946,7 +1972,7 @@ fn workspace_gateway_builtin_tool_description(tool: &str) -> &'static str {
             "Render exact composited Video Editor timeline frame(s) as JPEG image content blocks. Use after video_context when visual inspection is needed."
         }
         "video_media" => {
-            "List, search, import, and organize Video Editor media. Search returns filename matches plus transcript moments from cached transcripts."
+            "List, search, import, annotate, and organize Video Editor media. Search returns filename matches plus transcript moments and image annotation matches. Image assets carry annotations (blurb/description/tags/ocrText) — list/search rows include the blurb; use action annotation to read the full record and action annotate to write one yourself after viewing the image (free, no cloud call). Consult annotations plus width/height when picking stills for timeline slot-in, motion presets, or hyperframes compositions."
         }
         "video_generate" => {
             "List models, start, poll, or cancel media generation. Cloud models cover video/image/audio; model \"hyperframes\" (kind code) renders an HTML composition locally: start scaffolds media/code/<slug>/index.html and returns jobId+sourcePath+plannedPaths (add plannedPaths[0] to the timeline now for a placeholder clip at the expected duration), author the HTML per its AGENTS.md, then action render with that jobId; re-render by starting a new job with sourcePath."
@@ -2052,6 +2078,19 @@ fn workspace_gateway_builtin_tool_input_schema(tool: &str) -> Value {
             "required": ["keys"],
             "additionalProperties": true
         }),
+        "secrets__ssh_list" => json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": true
+        }),
+        "secrets__ssh_connect" | "secrets__ssh_get" => json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Required local SSH target name."}
+            },
+            "required": ["name"],
+            "additionalProperties": true
+        }),
         "video_context" => json!({
             "type": "object",
             "properties": {
@@ -2108,18 +2147,30 @@ fn workspace_gateway_builtin_tool_input_schema(tool: &str) -> Value {
                 "repoPath": {"type": "string"},
                 "action": {
                     "type": "string",
-                    "enum": ["list", "search", "import", "folders", "createFolder", "setFolder"]
+                    "enum": ["list", "search", "import", "folders", "createFolder", "setFolder", "annotation", "annotate"]
                 },
                 "kind": {"type": "string", "enum": ["video", "audio", "image"]},
                 "folderId": {"type": "string"},
-                "query": {"type": "string", "description": "Required for search. Matches filenames and cached transcript segment text."},
+                "query": {"type": "string", "description": "Required for search. Matches filenames, cached transcript segment text, and image annotation text (blurb/description/tags/ocrText)."},
                 "sourcePaths": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Required absolute file paths for import."
                 },
                 "name": {"type": "string", "description": "Required for createFolder."},
-                "path": {"type": "string", "description": "Required media path for setFolder."}
+                "path": {"type": "string", "description": "Required media path for setFolder, annotation, and annotate."},
+                "annotation": {
+                    "type": "object",
+                    "description": "Required for annotate (image assets only). Partial update merged onto any existing annotation; upscaled versions inherit the original's annotation automatically.",
+                    "properties": {
+                        "blurb": {"type": "string", "description": "One sentence, what the image shows (<=280 chars)."},
+                        "description": {"type": "string", "description": "2-4 sentences: subjects, setting, composition, mood."},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "dominantColors": {"type": "array", "items": {"type": "string"}},
+                        "ocrText": {"type": "string", "description": "Legible text visible in the image."}
+                    },
+                    "additionalProperties": true
+                }
             },
             "required": ["action"],
             "additionalProperties": true
@@ -2685,7 +2736,7 @@ fn workspace_gateway_get_secret(context: &McpContext, input: &Value) -> Result<V
         "server_key": "secrets",
         "secret": secret,
         "secret_values_returned": true,
-        "handling": "Use this value only for the requested local operation. Do not print it, checkpoint it, summarize it, or include it in todos, architecture files, patches, logs, or cloud payloads.",
+        "handling": WORKSPACE_GATEWAY_SECRET_HANDLING_NOTE,
     }))
 }
 
@@ -2734,6 +2785,202 @@ fn workspace_gateway_write_secrets_env_file(
         "written": written,
         "secret_values_returned": false,
     }))
+}
+
+fn workspace_gateway_ssh_target_name_from_input(input: &Value) -> Result<&str, String> {
+    input["name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "name is required.".to_string())
+}
+
+fn workspace_gateway_list_ssh_targets(context: &McpContext) -> Result<Value, String> {
+    let (kernel, workspace_id) = workspace_gateway_kernel(context)?;
+    let ssh_targets = kernel
+        .workspace_mcp_ssh_target_public_rows(&workspace_id)?
+        .into_iter()
+        .filter(|target| target["agent_enabled"].as_bool() == Some(true))
+        .map(|target| {
+            json!({
+                "name": target["name"].clone(),
+                "host": target["host"].clone(),
+                "port": target["port"].clone(),
+                "username": target["username"].clone(),
+                "auth_method": target["auth_method"].clone(),
+                "has_secret": target["has_secret"].clone(),
+                "reveal_password": target["reveal_password"].clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "ok": true,
+        "ssh_targets": ssh_targets,
+        "secret_values_returned": false,
+    }))
+}
+
+fn workspace_gateway_ssh_connect(context: &McpContext, input: &Value) -> Result<Value, String> {
+    let name = workspace_gateway_ssh_target_name_from_input(input)?;
+    let (kernel, workspace_id) = workspace_gateway_kernel(context)?;
+    let target = kernel.read_workspace_mcp_ssh_target_for_agent(&workspace_id, name)?;
+    let auth_method = target["auth_method"]
+        .as_str()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    let command_parts = workspace_gateway_ssh_command_parts(&target)?;
+    // Password targets are not agent-usable through the MCP unless the user has
+    // turned on Reveal password for that target: a coding agent runs as the
+    // same OS user, so any command handed to it cannot truly hide the password.
+    // With reveal on, the agent gets the raw password via secrets__ssh_get and
+    // enters it at the prompt. Key/agent auth carry no secret and always work.
+    let note = if auth_method == "password" {
+        let reveal_password = workspace_gateway_value_bool(&target["reveal_password"]);
+        if !reveal_password {
+            return Err(format!(
+                "SSH target `{name}` uses password auth, which is not exposed to agents. Enable Reveal password for this target in the Secrets MCP, or use a key-based target."
+            ));
+        }
+        let has_password = target["secret"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty());
+        if !has_password {
+            return Err(format!("SSH target `{name}` has no password."));
+        }
+        "Password auth: call secrets__ssh_get for the password, then run this command and enter it at the prompt."
+    } else {
+        "Run this command in your terminal."
+    };
+    Ok(json!({
+        "ok": true,
+        "name": target["name"].clone(),
+        "auth_method": auth_method,
+        "command": command_parts.join(" "),
+        "note": note,
+    }))
+}
+
+fn workspace_gateway_ssh_get(context: &McpContext, input: &Value) -> Result<Value, String> {
+    let name = workspace_gateway_ssh_target_name_from_input(input)?;
+    let (kernel, workspace_id) = workspace_gateway_kernel(context)?;
+    let target = kernel.read_workspace_mcp_ssh_target_for_agent(&workspace_id, name)?;
+    let auth_method = target["auth_method"]
+        .as_str()
+        .map(str::trim)
+        .unwrap_or_default();
+    let reveal_password = workspace_gateway_value_bool(&target["reveal_password"]);
+    let password = target["secret"].as_str().filter(|value| !value.is_empty());
+    let mut result = json!({
+        "ok": true,
+        "name": target["name"].clone(),
+        "host": target["host"].clone(),
+        "port": target["port"].clone(),
+        "username": target["username"].clone(),
+        "auth_method": target["auth_method"].clone(),
+        "key_path": target["key_path"].clone(),
+        "certificate_path": target["certificate_path"].clone(),
+        "handling": WORKSPACE_GATEWAY_SECRET_HANDLING_NOTE,
+    });
+    if reveal_password && auth_method == "password" {
+        if let Some(password) = password {
+            result["password"] = json!(password);
+            result["secret_values_returned"] = json!(true);
+            return Ok(result);
+        }
+    }
+    result["secret_values_returned"] = json!(false);
+    if auth_method == "password" {
+        result["note"] = json!(
+            "Password is shielded. Use secrets__ssh_connect to get a runnable SSH_ASKPASS command."
+        );
+    }
+    Ok(result)
+}
+
+fn workspace_gateway_value_bool(value: &Value) -> bool {
+    value
+        .as_bool()
+        .or_else(|| value.as_i64().map(|number| number != 0))
+        .unwrap_or(false)
+}
+
+fn workspace_gateway_ssh_optional_text(target: &Value, key: &str) -> Option<String> {
+    target[key]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn workspace_gateway_ssh_command_parts(target: &Value) -> Result<Vec<String>, String> {
+    let host = workspace_gateway_ssh_optional_text(target, "host")
+        .ok_or_else(|| "SSH target host is required.".to_string())?;
+    if host.chars().any(char::is_whitespace) {
+        return Err("SSH target host must not contain whitespace.".to_string());
+    }
+    if host.starts_with('-') {
+        return Err("SSH target host must not start with '-'.".to_string());
+    }
+    let username = workspace_gateway_ssh_optional_text(target, "username");
+    if username
+        .as_deref()
+        .is_some_and(|value| value.starts_with('-'))
+    {
+        return Err("SSH target username must not start with '-'.".to_string());
+    }
+    let auth_method = workspace_gateway_ssh_optional_text(target, "auth_method")
+        .ok_or_else(|| "SSH target auth method is required.".to_string())?;
+    let mut parts = vec![
+        "ssh".to_string(),
+        "-o ServerAliveInterval=30".to_string(),
+        "-o ServerAliveCountMax=4".to_string(),
+    ];
+    if let Some(port) = target["port"].as_i64() {
+        if port <= 0 || port > u16::MAX as i64 {
+            return Err("SSH target port must be in the u16 range and greater than 0.".to_string());
+        }
+        parts.push("-p".to_string());
+        parts.push(port.to_string());
+    }
+    match auth_method.as_str() {
+        "key" => {
+            let key_path = workspace_gateway_ssh_optional_text(target, "key_path")
+                .ok_or_else(|| "SSH key path is required for key auth.".to_string())?;
+            parts.push("-i".to_string());
+            parts.push(crate::ssh_shell_quote(&crate::ssh_expand_home_path(
+                &key_path,
+            )));
+            parts.push("-o IdentitiesOnly=yes".to_string());
+            if let Some(certificate_path) =
+                workspace_gateway_ssh_optional_text(target, "certificate_path")
+            {
+                parts.push(format!(
+                    "-o CertificateFile={}",
+                    crate::ssh_shell_quote(&crate::ssh_expand_home_path(&certificate_path))
+                ));
+            }
+        }
+        "password" => {
+            parts.push("-o PreferredAuthentications=password,keyboard-interactive".to_string());
+            parts.push("-o PubkeyAuthentication=no".to_string());
+            parts.push("-o NumberOfPasswordPrompts=1".to_string());
+        }
+        "agent" => {}
+        _ => return Err("SSH target auth method must be agent, password, or key.".to_string()),
+    }
+    let destination = username
+        .as_deref()
+        .map(|username| {
+            format!(
+                "{}@{}",
+                crate::ssh_shell_quote(username),
+                crate::ssh_shell_quote(&host)
+            )
+        })
+        .unwrap_or_else(|| crate::ssh_shell_quote(&host));
+    parts.push(destination);
+    Ok(parts)
 }
 
 fn workspace_gateway_secret_keys_from_input(input: &Value) -> Result<Vec<String>, String> {
@@ -3107,6 +3354,10 @@ fn workspace_gateway_generation(
             SELECT updated_at FROM workspace_mcp_marketplace_indexes WHERE workspace_id=?1
             UNION ALL
             SELECT updated_at FROM workspace_mcp_secrets WHERE workspace_id=?1
+            UNION ALL
+            SELECT updated_at FROM workspace_mcp_secrets_state WHERE workspace_id=?1
+            UNION ALL
+            SELECT updated_at FROM workspace_mcp_ssh_targets WHERE workspace_id=?1
          )",
         &[&workspace_id],
     )?;
@@ -3161,6 +3412,16 @@ fn workspace_gateway_secrets_server_public(
     workspace_id: &str,
 ) -> Result<Value, String> {
     let secrets = kernel.workspace_mcp_secrets(workspace_id)?;
+    let enabled = kernel.workspace_mcp_secrets_enabled(workspace_id)?;
+    let ssh_targets = if enabled {
+        kernel
+            .workspace_mcp_ssh_target_public_rows(workspace_id)?
+            .into_iter()
+            .filter(|target| target["agent_enabled"].as_bool() == Some(true))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     Ok(json!({
         "id": "secrets",
         "server_key": "secrets",
@@ -3169,17 +3430,27 @@ fn workspace_gateway_secrets_server_public(
         "source_label": "Diff Forge",
         "package_ref": "local-only",
         "transport": "stdio",
-        "workspace_enabled": true,
+        "workspace_enabled": enabled,
         "approval_policy": "always_allow",
         "agent_config_access_enabled": true,
         "agent_secret_config_access_enabled": true,
         "agent_env_file_write_enabled": true,
-        "runtime_status": "enabled",
+        "runtime_status": if enabled { "enabled" } else { "disabled" },
         "missing_required_config": [],
         "tool_namespace": "secrets",
         "tool_prefix": "secrets__",
-        "tools": ["list", "get", "write_env_file"],
-        "secret_count": secrets["summary"]["secret_count"].clone(),
+        "tools": if enabled {
+            json!(["list", "get", "write_env_file", "ssh_list", "ssh_connect", "ssh_get"])
+        } else {
+            json!([])
+        },
+        "secret_count": if enabled {
+            secrets["summary"]["secret_count"].clone()
+        } else {
+            json!(0)
+        },
+        "ssh_target_count": ssh_targets.len(),
+        "ssh_targets": ssh_targets,
     }))
 }
 

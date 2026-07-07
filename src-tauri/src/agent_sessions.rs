@@ -5,6 +5,8 @@ const CODEX_TRANSCRIPT_MAX_TOOL_TEXT: usize = 65_536;
 const CODEX_TRANSCRIPT_MAX_REASONING_TEXT: usize = 65_536;
 const CODEX_TRANSCRIPT_MAX_RECORD_MESSAGES_BYTES: usize = 512 * 1024;
 const CODEX_ROLLOUT_SCAN_LIMIT: usize = 2_500;
+const CODEX_USER_MESSAGE_DEDUPE_LINE_WINDOW: usize = 4;
+const CODEX_USER_MESSAGE_DEDUPE_TIME_WINDOW_MS: i64 = 15_000;
 const AGENT_THREAD_TRANSCRIPT_UPDATED_EVENT: &str = "forge-agent-thread-transcript-updated";
 const AGENT_THREAD_TRANSCRIPT_WATCH_DEBOUNCE_MS: u64 = 300;
 const AGENT_THREAD_TRANSCRIPT_WATCH_MAX_WAIT_MS: u64 = 750;
@@ -423,6 +425,153 @@ fn normalize_prompt_match_text(value: impl AsRef<str>) -> String {
     }
 
     output.trim().to_string()
+}
+
+fn codex_normalize_user_prompt_text(value: impl AsRef<str>) -> String {
+    normalize_prompt_match_text(clean_codex_transcript_text(
+        value,
+        CODEX_TRANSCRIPT_MAX_TEXT,
+    ))
+}
+
+fn codex_transcript_timestamp_ms(value: &str) -> Option<i64> {
+    let text = value.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Ok(number) = text.parse::<f64>() {
+        if number.is_finite() && number > 0.0 {
+            return Some(
+                (if number < 1_000_000_000_000.0 {
+                    number * 1000.0
+                } else {
+                    number
+                })
+                .round() as i64,
+            );
+        }
+    }
+    let year = text.get(0..4)?.parse::<i64>().ok()?;
+    let month = text.get(5..7)?.parse::<i64>().ok()?;
+    let day = text.get(8..10)?.parse::<i64>().ok()?;
+    let hour = text.get(11..13)?.parse::<i64>().ok()?;
+    let minute = text.get(14..16)?.parse::<i64>().ok()?;
+    let second = text.get(17..19)?.parse::<i64>().ok()?;
+    let bytes = text.as_bytes();
+    let mut index = 19usize;
+    let mut millis = 0i64;
+    if bytes.get(index) == Some(&b'.') {
+        index = index.saturating_add(1);
+        let start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index = index.saturating_add(1);
+        }
+        let fraction = &text[start..index];
+        if !fraction.is_empty() {
+            let mut digits = fraction.chars().take(3).collect::<String>();
+            while digits.len() < 3 {
+                digits.push('0');
+            }
+            millis = digits.parse::<i64>().ok()?;
+        }
+    }
+    let mut offset_ms = 0i64;
+    if bytes
+        .get(index)
+        .is_some_and(|ch| *ch == b'+' || *ch == b'-')
+    {
+        let sign = if bytes[index] == b'-' { -1 } else { 1 };
+        let offset_hour = text.get(index + 1..index + 3)?.parse::<i64>().ok()?;
+        let offset_minute = text.get(index + 4..index + 6)?.parse::<i64>().ok()?;
+        offset_ms = sign * (offset_hour * 3_600_000 + offset_minute * 60_000);
+    }
+    Some(
+        (cloud_mcp_tokenomics_days_from_civil(year, month, day) * 86_400
+            + hour.clamp(0, 23) * 3_600
+            + minute.clamp(0, 59) * 60
+            + second.clamp(0, 59))
+            * 1000
+            + millis
+            - offset_ms,
+    )
+}
+
+#[derive(Clone)]
+struct CodexUserMessageDedupeEntry {
+    line_index: usize,
+    timestamp: String,
+    normalized_text: String,
+}
+
+#[derive(Default)]
+struct CodexUserMessageDedupeTracker {
+    recent_events: VecDeque<CodexUserMessageDedupeEntry>,
+}
+
+fn codex_user_message_in_dedupe_window(
+    left_line_index: usize,
+    left_timestamp: &str,
+    right_line_index: usize,
+    right_timestamp: &str,
+) -> bool {
+    if left_line_index.abs_diff(right_line_index) > CODEX_USER_MESSAGE_DEDUPE_LINE_WINDOW {
+        return false;
+    }
+    match (
+        codex_transcript_timestamp_ms(left_timestamp),
+        codex_transcript_timestamp_ms(right_timestamp),
+    ) {
+        (Some(left), Some(right)) => {
+            left.abs_diff(right) <= CODEX_USER_MESSAGE_DEDUPE_TIME_WINDOW_MS as u64
+        }
+        _ => true,
+    }
+}
+
+impl CodexUserMessageDedupeTracker {
+    fn prune(&mut self, line_index: usize, timestamp: &str) {
+        self.recent_events.retain(|entry| {
+            codex_user_message_in_dedupe_window(
+                entry.line_index,
+                &entry.timestamp,
+                line_index,
+                timestamp,
+            )
+        });
+    }
+
+    fn observe_event(&mut self, line_index: usize, timestamp: &str, normalized_text: String) {
+        if normalized_text.is_empty() {
+            return;
+        }
+        self.prune(line_index, timestamp);
+        self.recent_events.push_back(CodexUserMessageDedupeEntry {
+            line_index,
+            timestamp: timestamp.to_string(),
+            normalized_text,
+        });
+    }
+
+    fn matches_recent_event(
+        &mut self,
+        line_index: usize,
+        timestamp: &str,
+        normalized_text: &str,
+    ) -> bool {
+        if normalized_text.is_empty() {
+            return false;
+        }
+        self.prune(line_index, timestamp);
+        self.recent_events.iter().any(|entry| {
+            entry.normalized_text == normalized_text
+                && codex_user_message_in_dedupe_window(
+                    entry.line_index,
+                    &entry.timestamp,
+                    line_index,
+                    timestamp,
+                )
+        })
+    }
 }
 
 fn transcript_has_exact_user_prompt(
@@ -874,6 +1023,96 @@ fn codex_content_text(value: &Value) -> String {
         }
         _ => String::new(),
     }
+}
+
+fn codex_first_content_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(codex_first_content_text)
+            .find(|text| !text.trim().is_empty())
+            .unwrap_or_default(),
+        Value::Object(object) => {
+            for key in ["text", "input_text", "output_text", "message"] {
+                if let Some(text) = object.get(key).and_then(Value::as_str) {
+                    return text.to_string();
+                }
+            }
+
+            if let Some(content) = object.get("content") {
+                return codex_first_content_text(content);
+            }
+
+            String::new()
+        }
+        _ => String::new(),
+    }
+}
+
+fn codex_user_message_internal_context_text(text: &str) -> bool {
+    let text = text.trim();
+    [
+        "# AGENTS.md instructions",
+        "<INSTRUCTIONS>",
+        "<!-- DIFFFORGE_AGENT_CONTRACT_BEGIN -->",
+        "<environment_context>",
+    ]
+    .iter()
+    .any(|marker| text.starts_with(marker))
+}
+
+fn codex_response_item_user_message_is_internal_context(payload: &Value) -> bool {
+    if payload.get("type").and_then(Value::as_str) != Some("message")
+        || payload.get("role").and_then(Value::as_str) != Some("user")
+    {
+        return false;
+    }
+    let content = payload.get("content").unwrap_or(&Value::Null);
+    codex_user_message_internal_context_text(&codex_first_content_text(content))
+}
+
+fn codex_response_item_user_message_normalized_text(payload: &Value) -> Option<String> {
+    if payload.get("type").and_then(Value::as_str) != Some("message")
+        || payload.get("role").and_then(Value::as_str) != Some("user")
+    {
+        return None;
+    }
+    let text = codex_normalize_user_prompt_text(codex_content_text(
+        payload.get("content").unwrap_or(&Value::Null),
+    ));
+    (!text.is_empty()).then_some(text)
+}
+
+fn codex_event_user_message_normalized_text(payload: &Value) -> Option<String> {
+    if payload.get("type").and_then(Value::as_str) != Some("user_message") {
+        return None;
+    }
+    let text = codex_normalize_user_prompt_text(value_string(payload.get("message")));
+    (!text.is_empty()).then_some(text)
+}
+
+fn codex_value_is_turn_context(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("turn_context")
+}
+
+fn codex_value_is_environment_context(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("environment_context")
+        || value.get("environment_context").is_some()
+        || value.get("environmentContext").is_some()
+}
+
+fn codex_value_internal_context_response_item(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("response_item")
+        && codex_response_item_user_message_is_internal_context(
+            value.get("payload").unwrap_or(&Value::Null),
+        )
+}
+
+fn codex_value_is_internal_context_record(value: &Value) -> bool {
+    codex_value_is_turn_context(value)
+        || codex_value_is_environment_context(value)
+        || codex_value_internal_context_response_item(value)
 }
 
 fn clean_codex_artifact_reference(value: &str) -> String {
@@ -3155,6 +3394,9 @@ fn codex_messages_from_response_item(
                 }];
             }
             if role == "user" {
+                if codex_response_item_user_message_is_internal_context(payload) {
+                    return Vec::new();
+                }
                 if text.is_empty() && artifacts.is_empty() {
                     return Vec::new();
                 }
@@ -3495,6 +3737,121 @@ mod agent_sessions_tests {
         assert_eq!(user_message.len(), 1);
         assert_eq!(user_message[0].role, "user");
         assert!(user_message[0].text.contains("queued prompt"));
+    }
+
+    #[test]
+    fn codex_response_item_skips_internal_context_user_messages() {
+        for (index, marker) in [
+            "# AGENTS.md instructions for /tmp/project",
+            "<INSTRUCTIONS>",
+            "<!-- DIFFFORGE_AGENT_CONTRACT_BEGIN -->",
+            "<environment_context>",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let messages = codex_messages_from_response_item(
+                index,
+                "2026-07-02T00:00:00Z",
+                &json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": format!("{marker}\ninternal")}]
+                }),
+            );
+
+            assert!(messages.is_empty());
+        }
+    }
+
+    #[test]
+    fn codex_rollout_prefers_event_user_message_over_adjacent_response_item() {
+        let root = unique_test_dir("codex-user-dedupe");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout-test.jsonl");
+        let lines = [
+            json!({
+                "type": "session_meta",
+                "timestamp": "2026-07-02T00:00:00Z",
+                "payload": {"id": "codex-session", "cwd": "/tmp/project"}
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-07-02T00:00:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "typed prompt"}]
+                }
+            }),
+            json!({
+                "type": "environment_context",
+                "timestamp": "2026-07-02T00:00:01.500Z",
+                "cwd": "/tmp/project"
+            }),
+            json!({
+                "type": "event_msg",
+                "timestamp": "2026-07-02T00:00:02Z",
+                "payload": {"type": "user_message", "message": "typed prompt"}
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(&path, format!("{lines}\n")).unwrap();
+
+        let (_, messages) = parse_codex_rollout(&path, 20).unwrap();
+        let user_messages = messages
+            .iter()
+            .filter(|message| message.role == "user")
+            .collect::<Vec<_>>();
+
+        assert_eq!(user_messages.len(), 1);
+        assert_eq!(user_messages[0].id, "codex-3-user");
+        assert_eq!(user_messages[0].text, "typed prompt");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_rollout_keeps_response_item_only_user_message() {
+        let root = unique_test_dir("codex-response-user-only");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout-test.jsonl");
+        let lines = [
+            json!({
+                "type": "session_meta",
+                "timestamp": "2026-07-02T00:00:00Z",
+                "payload": {"id": "codex-session", "cwd": "/tmp/project"}
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-07-02T00:00:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "queued prompt"}]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(&path, format!("{lines}\n")).unwrap();
+
+        let (_, messages) = parse_codex_rollout(&path, 20).unwrap();
+        let user_messages = messages
+            .iter()
+            .filter(|message| message.role == "user")
+            .collect::<Vec<_>>();
+
+        assert_eq!(user_messages.len(), 1);
+        assert_eq!(user_messages[0].id, "codex-1-user");
+        assert_eq!(user_messages[0].text, "queued prompt");
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3903,17 +4260,21 @@ mod agent_sessions_tests {
 
         let (_, messages) = parse_claude_session(&path, 20).unwrap();
 
-        assert!(messages
-            .iter()
-            .any(|message| message.role == "user" && message.text == "hey there"));
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.role == "user" && message.text == "hey there")
+        );
         assert!(messages.iter().any(|message| {
             message.role == "assistant"
                 && message.kind == "message"
                 && message.text == "Hey! How can I help you today?"
         }));
-        assert!(messages
-            .iter()
-            .any(|message| message.kind == "task_complete"));
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.kind == "task_complete")
+        );
     }
 
     #[test]
@@ -3936,9 +4297,11 @@ mod agent_sessions_tests {
         assert!(messages.iter().any(|message| {
             message.role == "assistant" && message.kind == "message" && message.text == "Done."
         }));
-        assert!(messages
-            .iter()
-            .any(|message| message.kind == "task_complete" && message.text == "Done."));
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.kind == "task_complete" && message.text == "Done.")
+        );
     }
 
     #[test]
@@ -4411,6 +4774,62 @@ mod agent_sessions_tests {
     }
 }
 
+struct CodexPendingResponseUserMessage {
+    line_index: usize,
+    timestamp: String,
+    normalized_text: String,
+    message: CodexThreadTranscriptMessage,
+}
+
+fn codex_flush_pending_response_user_messages(
+    pending: &mut Vec<CodexPendingResponseUserMessage>,
+    current: Option<(usize, &str)>,
+    messages: &mut Vec<CodexThreadTranscriptMessage>,
+    seen: &mut HashSet<String>,
+    tool_metadata: &mut HashMap<String, TranscriptToolCallMetadata>,
+) {
+    let mut index = 0usize;
+    while index < pending.len() {
+        let should_flush = match current {
+            Some((line_index, timestamp)) => !codex_user_message_in_dedupe_window(
+                pending[index].line_index,
+                &pending[index].timestamp,
+                line_index,
+                timestamp,
+            ),
+            None => true,
+        };
+        if should_flush {
+            let pending_message = pending.remove(index);
+            push_codex_message_with_tool_metadata(
+                messages,
+                seen,
+                Some(pending_message.message),
+                tool_metadata,
+            );
+        } else {
+            index = index.saturating_add(1);
+        }
+    }
+}
+
+fn codex_drop_pending_response_user_messages(
+    pending: &mut Vec<CodexPendingResponseUserMessage>,
+    line_index: usize,
+    timestamp: &str,
+    normalized_text: &str,
+) {
+    pending.retain(|entry| {
+        entry.normalized_text != normalized_text
+            || !codex_user_message_in_dedupe_window(
+                entry.line_index,
+                &entry.timestamp,
+                line_index,
+                timestamp,
+            )
+    });
+}
+
 fn parse_codex_rollout(
     path: &Path,
     max_messages: usize,
@@ -4428,6 +4847,8 @@ fn parse_codex_rollout(
     let mut seen = HashSet::new();
     let mut tool_metadata = HashMap::<String, TranscriptToolCallMetadata>::new();
     let mut active_subagents = Vec::<Value>::new();
+    let mut user_dedupe = CodexUserMessageDedupeTracker::default();
+    let mut pending_response_users = Vec::<CodexPendingResponseUserMessage>::new();
 
     for (line_index, line) in std::io::BufRead::lines(reader).enumerate() {
         let Ok(line) = line else {
@@ -4440,12 +4861,33 @@ fn parse_codex_rollout(
         if !timestamp.is_empty() {
             meta.latest_timestamp = timestamp.clone();
         }
-
         let record_type = value
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
         let payload = value.get("payload").unwrap_or(&Value::Null);
+        if codex_value_is_internal_context_record(&value) {
+            continue;
+        }
+        codex_flush_pending_response_user_messages(
+            &mut pending_response_users,
+            Some((line_index, &timestamp)),
+            &mut messages,
+            &mut seen,
+            &mut tool_metadata,
+        );
+        let event_user_text = (record_type == "event_msg")
+            .then(|| codex_event_user_message_normalized_text(payload))
+            .flatten();
+        if event_user_text.is_none() {
+            codex_flush_pending_response_user_messages(
+                &mut pending_response_users,
+                None,
+                &mut messages,
+                &mut seen,
+                &mut tool_metadata,
+            );
+        }
         match record_type {
             "session_meta" => {
                 meta.session_id = clean_codex_id(value_string(payload.get("id")));
@@ -4454,6 +4896,22 @@ fn parse_codex_rollout(
             "event_msg" => {
                 if payload.get("type").and_then(Value::as_str) == Some("thread_name_updated") {
                     meta.title = clean_codex_title(value_string(payload.get("thread_name")), "");
+                }
+                if let Some(normalized_text) = event_user_text {
+                    codex_drop_pending_response_user_messages(
+                        &mut pending_response_users,
+                        line_index,
+                        &timestamp,
+                        &normalized_text,
+                    );
+                    codex_flush_pending_response_user_messages(
+                        &mut pending_response_users,
+                        None,
+                        &mut messages,
+                        &mut seen,
+                        &mut tool_metadata,
+                    );
+                    user_dedupe.observe_event(line_index, &timestamp, normalized_text);
                 }
                 let mut parsed_messages =
                     codex_messages_from_event(line_index, &timestamp, payload);
@@ -4479,6 +4937,29 @@ fn parse_codex_rollout(
                     payload,
                     &mut parsed_messages,
                 );
+                if let Some(normalized_text) =
+                    codex_response_item_user_message_normalized_text(payload)
+                {
+                    if user_dedupe.matches_recent_event(line_index, &timestamp, &normalized_text) {
+                        continue;
+                    }
+                    let mut remaining = Vec::new();
+                    for message in parsed_messages {
+                        if message.role == "user"
+                            && codex_normalize_user_prompt_text(&message.text) == normalized_text
+                        {
+                            pending_response_users.push(CodexPendingResponseUserMessage {
+                                line_index,
+                                timestamp: timestamp.clone(),
+                                normalized_text: normalized_text.clone(),
+                                message,
+                            });
+                        } else {
+                            remaining.push(message);
+                        }
+                    }
+                    parsed_messages = remaining;
+                }
                 for message in parsed_messages {
                     push_codex_message_with_tool_metadata(
                         &mut messages,
@@ -4491,6 +4972,14 @@ fn parse_codex_rollout(
             _ => {}
         }
     }
+
+    codex_flush_pending_response_user_messages(
+        &mut pending_response_users,
+        None,
+        &mut messages,
+        &mut seen,
+        &mut tool_metadata,
+    );
 
     if messages.len() > max_messages {
         messages = messages[messages.len() - max_messages..].to_vec();

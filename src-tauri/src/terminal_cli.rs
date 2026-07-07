@@ -511,6 +511,323 @@ fn clear_agent_command_candidate_cache(provider: AgentProvider) {
     }
 }
 
+const OPENCODE_MODELS_TIMEOUT: Duration = Duration::from_secs(10);
+const OPENCODE_MODELS_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+static OPENCODE_MODEL_LIST_CACHE: OnceLock<StdMutex<Option<OpencodeModelCacheEntry>>> =
+    OnceLock::new();
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpencodeModelList {
+    models: Vec<String>,
+    source: String,
+    fetched_at_ms: u64,
+    error: Option<String>,
+}
+
+#[derive(Clone)]
+struct OpencodeModelCacheEntry {
+    models: Vec<String>,
+    fetched_at_ms: u64,
+    fetched_instant: Instant,
+}
+
+enum OpencodeModelsCommandError {
+    Spawn(String),
+    Run(String),
+}
+
+fn parse_opencode_models_stdout(stdout: &str) -> Vec<String> {
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+
+    for line in stdout.lines() {
+        let model = line.trim();
+        if model.is_empty()
+            || !model.contains('/')
+            || model.chars().any(char::is_whitespace)
+        {
+            continue;
+        }
+
+        if seen.insert(model.to_string()) {
+            models.push(model.to_string());
+        }
+    }
+
+    models
+}
+
+fn opencode_model_list_cache() -> &'static StdMutex<Option<OpencodeModelCacheEntry>> {
+    OPENCODE_MODEL_LIST_CACHE.get_or_init(|| StdMutex::new(None))
+}
+
+fn opencode_model_list_response(
+    entry: &OpencodeModelCacheEntry,
+    source: &str,
+    error: Option<String>,
+) -> OpencodeModelList {
+    OpencodeModelList {
+        models: entry.models.clone(),
+        source: source.to_string(),
+        fetched_at_ms: entry.fetched_at_ms,
+        error,
+    }
+}
+
+fn opencode_model_list_cached_response_for(
+    entry: Option<&OpencodeModelCacheEntry>,
+    now: Instant,
+    force_refresh: bool,
+) -> Option<OpencodeModelList> {
+    if force_refresh {
+        return None;
+    }
+
+    let entry = entry?;
+    if now.saturating_duration_since(entry.fetched_instant) < OPENCODE_MODELS_CACHE_TTL {
+        Some(opencode_model_list_response(entry, "cache", None))
+    } else {
+        None
+    }
+}
+
+fn opencode_model_list_cached_response(force_refresh: bool) -> Option<OpencodeModelList> {
+    let entry = opencode_model_list_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.as_ref().cloned());
+
+    opencode_model_list_cached_response_for(entry.as_ref(), Instant::now(), force_refresh)
+}
+
+fn opencode_model_list_failure_response(error: String) -> OpencodeModelList {
+    let entry = opencode_model_list_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.as_ref().cloned());
+
+    if let Some(entry) = entry {
+        opencode_model_list_response(&entry, "stale-cache", Some(error))
+    } else {
+        OpencodeModelList {
+            models: Vec::new(),
+            source: "error".to_string(),
+            fetched_at_ms: 0,
+            error: Some(error),
+        }
+    }
+}
+
+fn store_opencode_model_list_cache(entry: OpencodeModelCacheEntry) {
+    if let Ok(mut cache) = opencode_model_list_cache().lock() {
+        *cache = Some(entry);
+    }
+}
+
+fn opencode_models_nonzero_exit_message(capture: &CommandCapture) -> String {
+    let detail = first_output_line(&command_output_text(&capture.stdout, &capture.stderr));
+
+    if detail.is_empty() {
+        "opencode models exited with an error.".to_string()
+    } else {
+        format!("opencode models failed: {detail}")
+    }
+}
+
+fn spawn_opencode_models_pipe_reader<R>(
+    stream_name: &'static str,
+    mut pipe: R,
+) -> thread::JoinHandle<Result<String, String>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        pipe.read_to_end(&mut output)
+            .map_err(|error| format!("Unable to read opencode {stream_name}: {error}"))?;
+        Ok(String::from_utf8_lossy(&output).to_string())
+    })
+}
+
+fn join_opencode_models_pipe_reader(
+    reader: Option<thread::JoinHandle<Result<String, String>>>,
+    stream_name: &str,
+) -> Result<String, OpencodeModelsCommandError> {
+    let Some(reader) = reader else {
+        return Ok(String::new());
+    };
+
+    reader
+        .join()
+        .map_err(|_| {
+            OpencodeModelsCommandError::Run(format!("OpenCode {stream_name} reader panicked."))
+        })?
+        .map_err(OpencodeModelsCommandError::Run)
+}
+
+fn finish_opencode_models_pipe_readers(
+    stdout_reader: Option<thread::JoinHandle<Result<String, String>>>,
+    stderr_reader: Option<thread::JoinHandle<Result<String, String>>>,
+) -> Result<(String, String), OpencodeModelsCommandError> {
+    let stdout = join_opencode_models_pipe_reader(stdout_reader, "stdout")?;
+    let stderr = join_opencode_models_pipe_reader(stderr_reader, "stderr")?;
+
+    Ok((stdout, stderr))
+}
+
+fn discard_opencode_models_pipe_readers(
+    stdout_reader: Option<thread::JoinHandle<Result<String, String>>>,
+    stderr_reader: Option<thread::JoinHandle<Result<String, String>>>,
+) {
+    let _ = finish_opencode_models_pipe_readers(stdout_reader, stderr_reader);
+}
+
+fn run_opencode_models_candidate(
+    candidate: &str,
+) -> Result<CommandCapture, OpencodeModelsCommandError> {
+    if app_shutdown_requested() {
+        return Err(OpencodeModelsCommandError::Run(
+            app_shutdown_blocked_message(candidate),
+        ));
+    }
+
+    let mut command = Command::new(candidate);
+    command.env("PATH", desktop_command_path());
+    command.arg("models");
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = command.spawn().map_err(|error| {
+        let message = if error.kind() == std::io::ErrorKind::NotFound {
+            format!("{candidate} is not installed or not available on PATH.")
+        } else {
+            format!("Unable to start {candidate}: {error}")
+        };
+        OpencodeModelsCommandError::Spawn(message)
+    })?;
+
+    let stdout_reader = child
+        .stdout
+        .take()
+        .map(|stdout| spawn_opencode_models_pipe_reader("stdout", stdout));
+    let stderr_reader = child
+        .stderr
+        .take()
+        .map(|stderr| spawn_opencode_models_pipe_reader("stderr", stderr));
+    let started_at = Instant::now();
+
+    loop {
+        if app_shutdown_requested() {
+            let _ = child.kill();
+            let _ = child.wait();
+            discard_opencode_models_pipe_readers(stdout_reader, stderr_reader);
+            return Err(OpencodeModelsCommandError::Run(
+                app_shutdown_blocked_message(candidate),
+            ));
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let (stdout, stderr) =
+                    finish_opencode_models_pipe_readers(stdout_reader, stderr_reader)?;
+
+                return Ok(CommandCapture {
+                    exit_code: status.code(),
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => {
+                if started_at.elapsed() >= OPENCODE_MODELS_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    discard_opencode_models_pipe_readers(stdout_reader, stderr_reader);
+                    return Err(OpencodeModelsCommandError::Run(format!(
+                        "{candidate} timed out."
+                    )));
+                }
+
+                thread::sleep(Duration::from_millis(80));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                discard_opencode_models_pipe_readers(stdout_reader, stderr_reader);
+                return Err(OpencodeModelsCommandError::Run(format!(
+                    "Unable to wait for {candidate}: {error}"
+                )));
+            }
+        }
+    }
+}
+
+fn fetch_opencode_models_from_cli() -> Result<OpencodeModelCacheEntry, String> {
+    let definition = agent_definition(AgentProvider::OpenCode);
+    let mut last_error = format!(
+        "{} is not installed or not available on PATH.",
+        definition.label
+    );
+
+    for candidate in agent_command_candidates(definition) {
+        let capture = match run_opencode_models_candidate(&candidate) {
+            Ok(capture) => capture,
+            Err(OpencodeModelsCommandError::Spawn(error)) => {
+                last_error = error;
+                continue;
+            }
+            Err(OpencodeModelsCommandError::Run(error)) => return Err(error),
+        };
+
+        if capture.exit_code != Some(0) {
+            return Err(opencode_models_nonzero_exit_message(&capture));
+        }
+
+        return Ok(OpencodeModelCacheEntry {
+            models: parse_opencode_models_stdout(&capture.stdout),
+            fetched_at_ms: current_time_ms(),
+            fetched_instant: Instant::now(),
+        });
+    }
+
+    Err(last_error)
+}
+
+#[tauri::command]
+async fn opencode_list_models(force_refresh: Option<bool>) -> OpencodeModelList {
+    let force_refresh = force_refresh.unwrap_or(false);
+
+    if let Some(response) = opencode_model_list_cached_response(force_refresh) {
+        return response;
+    }
+
+    let fetch_result = tauri::async_runtime::spawn_blocking(fetch_opencode_models_from_cli)
+        .await
+        .unwrap_or_else(|error| {
+            Err(format!(
+                "OpenCode model list worker failed before completion: {error}"
+            ))
+        });
+
+    match fetch_result {
+        Ok(entry) => {
+            store_opencode_model_list_cache(entry.clone());
+            opencode_model_list_response(&entry, "cli", None)
+        }
+        Err(error) => opencode_model_list_failure_response(error),
+    }
+}
+
 #[cfg(windows)]
 fn quote_powershell_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
@@ -808,6 +1125,9 @@ const TERMINAL_WORKSPACE_MCP_GATEWAY_TOOLS: &[&str] = &[
     "secrets__list",
     "secrets__get",
     "secrets__write_env_file",
+    "secrets__ssh_list",
+    "secrets__ssh_connect",
+    "secrets__ssh_get",
     "video_context",
     "video_edit",
     "video_transcribe",
@@ -3717,6 +4037,62 @@ mod terminal_cli_tests {
     }
 
     #[test]
+    fn opencode_list_models_parser_filters_garbage_and_dedupes() {
+        let output = r#"
+            anthropic/claude-sonnet-4-5
+        provider/model
+        Provider Heading
+        openai/gpt-5
+        openai/gpt-5
+        bad model/id
+        missing-slash
+        openrouter/google/gemini-2.5-pro
+        tabs/are	bad
+        "#;
+
+        assert_eq!(
+            parse_opencode_models_stdout(output),
+            vec![
+                "anthropic/claude-sonnet-4-5".to_string(),
+                "provider/model".to_string(),
+                "openai/gpt-5".to_string(),
+                "openrouter/google/gemini-2.5-pro".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn opencode_list_models_cache_uses_ttl_and_force_refresh() {
+        let now = Instant::now();
+        let entry = OpencodeModelCacheEntry {
+            models: vec!["anthropic/claude-sonnet-4-5".to_string()],
+            fetched_at_ms: 1234,
+            fetched_instant: now
+                .checked_sub(Duration::from_secs(30))
+                .expect("fresh instant"),
+        };
+
+        let cached = opencode_model_list_cached_response_for(Some(&entry), now, false)
+            .expect("fresh cache response");
+        assert_eq!(cached.source, "cache");
+        assert_eq!(cached.models, entry.models);
+        assert_eq!(cached.fetched_at_ms, 1234);
+        assert_eq!(cached.error, None);
+
+        assert!(opencode_model_list_cached_response_for(Some(&entry), now, true).is_none());
+
+        let expired_entry = OpencodeModelCacheEntry {
+            models: vec!["openai/gpt-5".to_string()],
+            fetched_at_ms: 5678,
+            fetched_instant: now
+                .checked_sub(OPENCODE_MODELS_CACHE_TTL + Duration::from_secs(1))
+                .expect("expired instant"),
+        };
+
+        assert!(opencode_model_list_cached_response_for(Some(&expired_entry), now, false).is_none());
+    }
+
+    #[test]
     fn activity_hook_record_preserves_prompt_options() {
         let record = diff_forge_activity_hook_record(
             "opencode",
@@ -3856,6 +4232,10 @@ mod terminal_cli_tests {
             .contains("const assistantTextPartsByMessage = new Map()"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("rememberAssistantPartSnapshot"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("scheduleStop(sessionId"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("emitStartupIdleCandidate"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("startup_idle_candidate: true"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("scheduleIdle(sessionId, \"session.status\")"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("scheduleIdle(sessionId, \"session.idle\")"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("clearTimeout(timer)"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("texts.join(\"\\n\")"));
         assert!(!DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains(
@@ -5010,6 +5390,7 @@ export const DiffForgeActivityPlugin = async () => {
   const completedAssistantMessages = new Set();
   const pendingStopTimers = new Map();
   const partKinds = new Map();
+  let startupIdleCandidateEmitted = false;
   const cancelPendingStop = (sessionId) => {
     if (!sessionId) return;
     const timer = pendingStopTimers.get(sessionId);
@@ -5099,6 +5480,18 @@ export const DiffForgeActivityPlugin = async () => {
       ...stopExtra,
     });
   };
+  const emitStartupIdleCandidate = (sessionId, source = "startup-idle") => {
+    if (startupIdleCandidateEmitted) return;
+    startupIdleCandidateEmitted = true;
+    emit({
+      hook_event_name: "Stop",
+      session_id: sessionId || "",
+      startup_idle_candidate: true,
+      session_idle_without_prompt: true,
+      opencode_idle_source: source,
+      input_ready: true,
+    });
+  };
   const scheduleStop = (sessionId, extra = {}) => {
     if (!sessionId || !rememberStopCandidate(sessionId, extra)) return;
     cancelPendingStop(sessionId);
@@ -5107,6 +5500,13 @@ export const DiffForgeActivityPlugin = async () => {
       emitStop(sessionId, extra);
     }, IDLE_STOP_DELAY_MS);
     pendingStopTimers.set(sessionId, timer);
+  };
+  const scheduleIdle = (sessionId, source) => {
+    if (sessionId && activeTurn(sessionId)) {
+      scheduleStop(sessionId, { opencode_idle_source: source });
+      return;
+    }
+    setTimeout(() => emitStartupIdleCandidate(sessionId, source), IDLE_STOP_DELAY_MS);
   };
   return {
     "chat.message": async (input, output) => {
@@ -5276,15 +5676,15 @@ export const DiffForgeActivityPlugin = async () => {
             ? (raw.type || raw.phase || raw.state || raw.status)
             : raw) || ""
         ).toLowerCase();
-	        if (statusValue === "idle" || statusValue === "cooldown") {
-	          scheduleStop(sessionId, { opencode_idle_source: "session.status" });
-	        } else if (statusValue) {
-	          noteActivity(sessionId, "session.status");
-	        }
-      }
-      if (type === "session.idle") {
-        scheduleStop(sessionId, { opencode_idle_source: "session.idle" });
-      } else if (type === "session.error") {
+		        if (statusValue === "idle" || statusValue === "cooldown") {
+		          scheduleIdle(sessionId, "session.status");
+		        } else if (statusValue) {
+		          noteActivity(sessionId, "session.status");
+		        }
+	      }
+	      if (type === "session.idle") {
+	        scheduleIdle(sessionId, "session.idle");
+	      } else if (type === "session.error") {
         cancelPendingStop(sessionId);
         const turn = activeTurn(sessionId);
         if (turn) {
@@ -5692,7 +6092,11 @@ fn cleanup_warm_pty_with_context(warm_pty: WarmPty) {
         size: _,
     } = warm_pty;
     log_terminal_crash_forensics_event("backend.warm_pty_cleanup.kill.begin", json!({}));
-    let report = kill_terminal_process_tree(child.as_mut());
+    #[cfg(not(windows))]
+    let process_group_leader = master.process_group_leader();
+    #[cfg(windows)]
+    let process_group_leader: Option<i32> = None;
+    let report = kill_terminal_process_tree(child.as_mut(), process_group_leader);
     log_terminal_crash_forensics_event(
         "backend.warm_pty_cleanup.kill.done",
         json!({

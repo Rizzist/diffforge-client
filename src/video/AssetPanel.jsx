@@ -3,10 +3,21 @@ import { createPortal } from "react-dom";
 import styled from "styled-components";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { estimateModelCredits, resolutionClass, upscaleModelsFor } from "./generationCatalog.js";
+import {
+  DESCRIBE_CREDITS_ESTIMATE,
+  estimateModelCredits,
+  readAutoDescribeEnabled,
+  resolutionClass,
+  upscaleModelsFor,
+  writeAutoDescribeEnabled,
+} from "./generationCatalog.js";
 import { formatTimecode } from "./videoEditorModel.js";
 import { emitVideoAssetDrag } from "./videoDragEvents.js";
-import { VIDEO_POLISH_PROGRESS_EVENT } from "./videoPanelBridge.js";
+import {
+  VIDEO_ANNOTATION_UPDATED_EVENT,
+  VIDEO_DESCRIBE_PROGRESS_EVENT,
+  VIDEO_POLISH_PROGRESS_EVENT,
+} from "./videoPanelBridge.js";
 import { buildKeepRanges, detectTakeGroups } from "./videoTakes.js";
 import {
   VideoDangerButton,
@@ -335,6 +346,100 @@ const AiPickBadge = styled.span`
   align-self: center;
 `;
 
+// Photo annotation (Description section) pieces.
+const AnnotationBlurb = styled.div`
+  font-size: 11px;
+  font-weight: 750;
+  line-height: 1.45;
+  color: rgba(226, 232, 240, 0.94);
+  overflow-wrap: anywhere;
+`;
+
+const AnnotationBody = styled.p`
+  margin: 0;
+  font-size: 10.5px;
+  font-weight: 550;
+  line-height: 1.5;
+  color: rgba(203, 213, 225, 0.88);
+  overflow-wrap: anywhere;
+`;
+
+const TagRow = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+`;
+
+const TagChip = styled.span`
+  font-size: 8.5px;
+  font-weight: 750;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  color: #a5b4cf;
+`;
+
+const AnnotationInput = styled.input`
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 7px;
+  background: rgba(4, 8, 14, 0.6);
+  color: rgba(226, 232, 240, 0.94);
+  font-size: 10.5px;
+  font-weight: 600;
+
+  &:focus {
+    outline: none;
+    border-color: rgba(16, 185, 129, 0.45);
+  }
+`;
+
+const AnnotationTextarea = styled.textarea`
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 64px;
+  resize: vertical;
+  padding: 6px 8px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 7px;
+  background: rgba(4, 8, 14, 0.6);
+  color: rgba(226, 232, 240, 0.94);
+  font-size: 10.5px;
+  font-weight: 550;
+  line-height: 1.5;
+  font-family: inherit;
+
+  &:focus {
+    outline: none;
+    border-color: rgba(16, 185, 129, 0.45);
+  }
+`;
+
+const ToggleRow = styled.label`
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 9.5px;
+  font-weight: 650;
+  color: #7d8ca3;
+  cursor: pointer;
+
+  input {
+    accent-color: #10b981;
+  }
+`;
+
+const ANNOTATION_STATUS_BADGES = {
+  describing: { label: "Describing…", color: "rgba(251, 191, 36, 0.5)", text: "#fcd34d" },
+  shared: { label: "Shared", color: "rgba(96, 165, 250, 0.5)", text: "#93c5fd" },
+  edited: { label: "Edited", color: "rgba(16, 185, 129, 0.5)", text: "#6ee7b7" },
+  agent: { label: "By agent", color: "rgba(192, 132, 252, 0.5)", text: "#d8b4fe" },
+  llm: { label: "AI", color: "rgba(148, 163, 184, 0.45)", text: "#cbd5f5" },
+  none: { label: "None", color: "rgba(148, 163, 184, 0.3)", text: "#7d8ca3" },
+};
+
 function formatBytes(bytes) {
   const value = Number(bytes) || 0;
   if (value >= 1_000_000_000) {
@@ -421,14 +526,148 @@ export default function AssetPanel({
   const [takes, setTakes] = useState(null); // null | { status, groups }
   const [takeSelections, setTakeSelections] = useState({});
   const [polishJob, setPolishJob] = useState(null); // live progress payload
+
+  // Photo annotation state (image assets).
+  const [annotationInfo, setAnnotationInfo] = useState(null); // video_annotation_get result
+  const [describeJob, setDescribeJob] = useState(null); // live progress payload
+  const [editingAnnotation, setEditingAnnotation] = useState(false);
+  const [annotationDraft, setAnnotationDraft] = useState({ blurb: "", description: "", tags: "" });
+  const [autoDescribe, setAutoDescribe] = useState(() => readAutoDescribeEnabled());
+
   const assetPathRef = useRef("");
   useEffect(() => {
     assetPathRef.current = asset?.path || "";
     setTakes(null);
     setTakeSelections({});
     setPolishJob(null);
+    setDescribeJob(null);
+    setEditingAnnotation(false);
     setError("");
   }, [asset?.path]);
+
+  const refreshAnnotation = useCallback(() => {
+    if (!repoPath || !asset?.path || asset.kind !== "image" || asset.pending) {
+      setAnnotationInfo(null);
+      return;
+    }
+    const path = asset.path;
+    invoke("video_annotation_get", { repoPath, path })
+      .then((result) => {
+        if (assetPathRef.current === path) {
+          setAnnotationInfo(result || null);
+        }
+      })
+      .catch(() => {});
+  }, [asset, repoPath]);
+  const refreshAnnotationRef = useRef(refreshAnnotation);
+  refreshAnnotationRef.current = refreshAnnotation;
+
+  useEffect(() => {
+    refreshAnnotation();
+  }, [refreshAnnotation]);
+
+  useEffect(() => {
+    let disposed = false;
+    const unlistens = [];
+    listen(VIDEO_DESCRIBE_PROGRESS_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      if (!payload.jobId || payload.path !== assetPathRef.current) {
+        return;
+      }
+      setDescribeJob(payload);
+      if (payload.done && !payload.error) {
+        refreshAnnotationRef.current();
+      }
+    })
+      .then((next) => (disposed ? next() : unlistens.push(next)))
+      .catch(() => {});
+    listen(VIDEO_ANNOTATION_UPDATED_EVENT, (event) => {
+      if (!disposed && event?.payload?.path === assetPathRef.current) {
+        refreshAnnotationRef.current();
+      }
+    })
+      .then((next) => (disposed ? next() : unlistens.push(next)))
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlistens.forEach((unlisten) => unlisten());
+    };
+  }, []);
+
+  const startDescribe = useCallback(
+    (force) => {
+      if (!repoPath || !asset?.path) {
+        return;
+      }
+      if (
+        force
+        && annotationInfo?.annotation?.edited
+        && !window.confirm("Re-describe will overwrite your edits to this description. Continue?")
+      ) {
+        return;
+      }
+      setError("");
+      setEditingAnnotation(false);
+      setDescribeJob({ state: "starting", percent: 0, done: false });
+      invoke("video_describe_start", { repoPath, path: asset.path, force: Boolean(force) }).catch(
+        (err) => {
+          setDescribeJob(null);
+          setError(String(err));
+        },
+      );
+    },
+    [annotationInfo, asset, repoPath],
+  );
+
+  const beginEditAnnotation = useCallback(() => {
+    const annotation = annotationInfo?.annotation || {};
+    setAnnotationDraft({
+      blurb: annotation.blurb || "",
+      description: annotation.description || "",
+      tags: Array.isArray(annotation.tags) ? annotation.tags.join(", ") : "",
+    });
+    setEditingAnnotation(true);
+  }, [annotationInfo]);
+
+  const saveAnnotation = useCallback(() => {
+    if (!repoPath || !asset?.path) {
+      return;
+    }
+    const tags = annotationDraft.tags
+      .split(",")
+      .map((tag) => tag.trim())
+      .filter(Boolean);
+    setError("");
+    invoke("video_annotation_update", {
+      repoPath,
+      path: asset.path,
+      annotation: {
+        blurb: annotationDraft.blurb,
+        description: annotationDraft.description,
+        tags,
+      },
+    })
+      .then((result) => {
+        setEditingAnnotation(false);
+        setAnnotationInfo({
+          available: true,
+          inherited: false,
+          inheritedFrom: null,
+          annotation: result,
+        });
+      })
+      .catch((err) => setError(String(err)));
+  }, [annotationDraft, asset, repoPath]);
+
+  const toggleAutoDescribe = useCallback(() => {
+    setAutoDescribe((enabled) => {
+      writeAutoDescribeEnabled(!enabled);
+      return !enabled;
+    });
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -617,6 +856,21 @@ export default function AssetPanel({
   const resClass = resolutionClass(asset.width, asset.height);
   const durationSecEstimate = Math.max(1, Math.round((Number(asset.durationMs) || 0) / 1000));
   const polishBusy = Boolean(polishJob && !polishJob.done);
+  const annotation = annotationInfo?.annotation || null;
+  const annotationAvailable = Boolean(annotationInfo?.available && annotation);
+  const describeBusy = Boolean(describeJob && !describeJob.done);
+  const annotationStatusKey = describeBusy
+    ? "describing"
+    : !annotationAvailable
+      ? "none"
+      : annotationInfo.inherited
+        ? "shared"
+        : annotation.source === "user"
+          ? "edited"
+          : annotation.source === "agent"
+            ? "agent"
+            : "llm";
+  const annotationStatus = ANNOTATION_STATUS_BADGES[annotationStatusKey];
   const polishedOutput = polishJob?.done && !polishJob.error && polishJob.outputPath
     ? assetsByPath[polishJob.outputPath] || null
     : null;
@@ -676,6 +930,127 @@ export default function AssetPanel({
         </InlineRow>
         {error ? <VideoErrorText>{error}</VideoErrorText> : null}
       </Section>
+
+      {asset.kind === "image" && !asset.pending ? (
+        <Section>
+          <InlineRow style={{ justifyContent: "space-between" }}>
+            <SectionTitle>Description</SectionTitle>
+            <VersionBadge $color={annotationStatus.color} $text={annotationStatus.text}>
+              {annotationStatus.label}
+            </VersionBadge>
+          </InlineRow>
+          {annotationInfo?.inherited ? (
+            <VideoHint>
+              Description is shared from the original image — an upscale shows identical content.
+            </VideoHint>
+          ) : null}
+          {describeBusy ? (
+            <div style={{ display: "grid", gap: 4 }}>
+              <VideoProgressTrack>
+                <VideoProgressFill
+                  style={{ width: `${Math.min(100, Math.max(3, describeJob?.percent || 3))}%` }}
+                />
+              </VideoProgressTrack>
+              <InlineRow>
+                <VideoHint>
+                  {describeJob?.state === "uploading"
+                    ? "Uploading image…"
+                    : describeJob?.state === "describing"
+                      ? "The vision model is looking at the photo…"
+                      : "Preparing image…"}
+                </VideoHint>
+                <VideoSecondaryButton
+                  onClick={() =>
+                    invoke("video_describe_cancel", { jobId: describeJob?.jobId }).catch(() => {})
+                  }
+                  type="button"
+                >
+                  Cancel
+                </VideoSecondaryButton>
+              </InlineRow>
+            </div>
+          ) : editingAnnotation ? (
+            <>
+              <AnnotationInput
+                onChange={(event) =>
+                  setAnnotationDraft((draft) => ({ ...draft, blurb: event.target.value }))
+                }
+                placeholder="One-line blurb — what the image shows"
+                value={annotationDraft.blurb}
+              />
+              <AnnotationTextarea
+                onChange={(event) =>
+                  setAnnotationDraft((draft) => ({ ...draft, description: event.target.value }))
+                }
+                placeholder="Longer description: subjects, setting, composition, mood"
+                value={annotationDraft.description}
+              />
+              <AnnotationInput
+                onChange={(event) =>
+                  setAnnotationDraft((draft) => ({ ...draft, tags: event.target.value }))
+                }
+                placeholder="Tags, comma separated"
+                value={annotationDraft.tags}
+              />
+              <InlineRow>
+                <VideoPaneButton onClick={saveAnnotation} type="button">
+                  Save description
+                </VideoPaneButton>
+                <VideoSecondaryButton onClick={() => setEditingAnnotation(false)} type="button">
+                  Cancel
+                </VideoSecondaryButton>
+              </InlineRow>
+            </>
+          ) : annotationAvailable ? (
+            <>
+              {annotation.blurb ? <AnnotationBlurb>{annotation.blurb}</AnnotationBlurb> : null}
+              {annotation.description ? (
+                <AnnotationBody>{annotation.description}</AnnotationBody>
+              ) : null}
+              {Array.isArray(annotation.tags) && annotation.tags.length ? (
+                <TagRow>
+                  {annotation.tags.map((tag) => (
+                    <TagChip key={tag}>{tag}</TagChip>
+                  ))}
+                </TagRow>
+              ) : null}
+              {annotation.ocrText ? (
+                <VideoHint>Text in image: “{annotation.ocrText}”</VideoHint>
+              ) : null}
+              <InlineRow>
+                <VideoSecondaryButton onClick={beginEditAnnotation} type="button">
+                  Edit
+                </VideoSecondaryButton>
+                <VideoSecondaryButton onClick={() => startDescribe(true)} type="button">
+                  Re-describe · ≈{DESCRIBE_CREDITS_ESTIMATE} credits
+                </VideoSecondaryButton>
+              </InlineRow>
+            </>
+          ) : (
+            <>
+              <VideoHint>
+                No description yet. A short AI blurb makes this photo searchable and tells coding
+                agents what it shows.
+              </VideoHint>
+              <InlineRow>
+                <VideoPaneButton onClick={() => startDescribe(false)} type="button">
+                  ✦ Describe · ≈{DESCRIBE_CREDITS_ESTIMATE} credits
+                </VideoPaneButton>
+                <VideoSecondaryButton onClick={beginEditAnnotation} type="button">
+                  Write manually
+                </VideoSecondaryButton>
+              </InlineRow>
+            </>
+          )}
+          {describeJob?.done && describeJob.error ? (
+            <VideoErrorText>{describeJob.error}</VideoErrorText>
+          ) : null}
+          <ToggleRow>
+            <input checked={autoDescribe} onChange={toggleAutoDescribe} type="checkbox" />
+            Auto-describe new photos (Diff Forge Cloud credits)
+          </ToggleRow>
+        </Section>
+      ) : null}
 
       {family.length > 1 ? (
         <Section>

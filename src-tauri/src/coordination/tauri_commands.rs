@@ -908,6 +908,45 @@ pub fn coordination_delete_workspace_mcp_secret(
 }
 
 #[tauri::command]
+pub fn coordination_upsert_workspace_mcp_ssh_target(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    workspace_id: String,
+    workspace_name: Option<String>,
+    input: Value,
+) -> Result<Value, String> {
+    let kernel = kernel(repo_path, db_path)?;
+    let workspace_id = req_text(&workspace_id, "workspace_id")?;
+    kernel.upsert_workspace_mcp_ssh_target(workspace_id, &input)?;
+    result(
+        kernel
+            .workspace_mcp_registry(workspace_id, workspace_name.as_deref())
+            .map(api_ok_from_data),
+    )
+}
+
+#[tauri::command]
+pub fn coordination_delete_workspace_mcp_ssh_target(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    workspace_id: String,
+    workspace_name: Option<String>,
+    ssh_target_id: String,
+) -> Result<Value, String> {
+    let kernel = kernel(repo_path, db_path)?;
+    let workspace_id = req_text(&workspace_id, "workspace_id")?;
+    kernel.delete_workspace_mcp_ssh_target(
+        workspace_id,
+        req_text(&ssh_target_id, "ssh_target_id")?,
+    )?;
+    result(
+        kernel
+            .workspace_mcp_registry(workspace_id, workspace_name.as_deref())
+            .map(api_ok_from_data),
+    )
+}
+
+#[tauri::command]
 pub fn coordination_activate_shared_mcp_daemon(
     repo_path: Option<String>,
     db_path: Option<String>,

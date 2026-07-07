@@ -20,6 +20,8 @@ const CLOUD_MCP_ROUTE_INITIALIZING_TIMEOUT_SECS: u64 = 150;
 const CLOUD_MCP_ROUTE_INITIALIZING_MIN_POLL_MS: u64 = 1_500;
 const CLOUD_MCP_ROUTE_INITIALIZING_MAX_POLL_MS: u64 = 8_000;
 const CLOUD_MCP_ROUTE_INITIALIZING_DEFAULT_POLL_MS: u64 = 2_500;
+const CLOUD_MCP_DIRECT_ROUTE_NO_OFFER_RETRY_ATTEMPTS: u64 = 3;
+const CLOUD_MCP_DIRECT_ROUTE_NO_OFFER_RETRY_DELAY_MS: u64 = 1_500;
 const CLOUD_MCP_WS_READY_TIMEOUT_SECS: u64 = 30;
 const CLOUD_MCP_WS_KEEPALIVE_INTERVAL_SECS: u64 = 30;
 const CLOUD_MCP_WS_SILENCE_WATCHDOG_SECS: u64 = 45;
@@ -20993,6 +20995,100 @@ fn cloud_mcp_defer_remote_command_for_foreground(app: &AppHandle, event: &Value)
     dropped
 }
 
+fn cloud_mcp_headless_terminal_panel_close_command(
+    original_event: &Value,
+    workspace_id: &str,
+    terminal: &Value,
+) -> Option<Value> {
+    let workspace_id = workspace_id.trim();
+    if workspace_id.is_empty() {
+        return None;
+    }
+    let target_panel_index = cloud_mcp_payload_i64(
+        terminal,
+        &[
+            "terminal_index",
+            "terminalIndex",
+            "target_terminal_index",
+            "targetTerminalIndex",
+            "index",
+        ],
+    )?;
+    if target_panel_index < 0 {
+        return None;
+    }
+    let target_panel_id = cloud_mcp_payload_text(
+        terminal,
+        &[
+            "pane_id",
+            "paneId",
+            "target_terminal_id",
+            "targetTerminalId",
+            "terminal_id",
+            "terminalId",
+            "panel_id",
+            "panelId",
+        ],
+    )
+    .filter(|value| !value.trim().is_empty())?;
+    let original_command_id = cloud_mcp_remote_command_id(original_event);
+    let command_id = if original_command_id.is_empty() {
+        format!(
+            "headless-terminal-panel-close-{}-{}-{}",
+            workspace_id, target_panel_index, target_panel_id
+        )
+    } else {
+        format!("{original_command_id}:panel-close")
+    };
+    let target_device_id =
+        cloud_mcp_remote_command_field_text(original_event, &["target_device_id", "targetDeviceId"]);
+    let client_id = cloud_mcp_payload_text(original_event, &["client_id", "clientId"]);
+    let source = cloud_mcp_payload_text(original_event, &["source"])
+        .unwrap_or_else(|| "rust-diffforge-headless".to_string());
+    let mut command = json!({
+        "command_id": command_id,
+        "commandId": command_id,
+        "command_kind": "workspace_panel_close",
+        "commandKind": "workspace_panel_close",
+        "event_kind": "remote_command_requested",
+        "source": source,
+        "workspace_id": workspace_id,
+        "workspaceId": workspace_id,
+        "target_panel_id": target_panel_id,
+        "targetPanelId": target_panel_id,
+        "panel_id": target_panel_id,
+        "panelId": target_panel_id,
+        "pane_id": target_panel_id,
+        "paneId": target_panel_id,
+        "target_terminal_id": target_panel_id,
+        "targetTerminalId": target_panel_id,
+        "target_panel_index": target_panel_index,
+        "targetPanelIndex": target_panel_index,
+        "panel_index": target_panel_index,
+        "panelIndex": target_panel_index,
+        "target_terminal_index": target_panel_index,
+        "targetTerminalIndex": target_panel_index,
+        "terminal_index": target_panel_index,
+        "terminalIndex": target_panel_index,
+        "synthetic": true,
+        "synthetic_reason": "headless_terminal_close",
+        "syntheticReason": "headless_terminal_close",
+    });
+    if let Some(target_device_id) = target_device_id.filter(|value| !value.trim().is_empty()) {
+        if let Some(object) = command.as_object_mut() {
+            object.insert("target_device_id".to_string(), json!(target_device_id.clone()));
+            object.insert("targetDeviceId".to_string(), json!(target_device_id));
+        }
+    }
+    if let Some(client_id) = client_id.filter(|value| !value.trim().is_empty()) {
+        if let Some(object) = command.as_object_mut() {
+            object.insert("client_id".to_string(), json!(client_id.clone()));
+            object.insert("clientId".to_string(), json!(client_id));
+        }
+    }
+    Some(command)
+}
+
 fn cloud_mcp_terminal_agent_identity(value: &str) -> String {
     let normalized = value.trim().to_ascii_lowercase().replace(['_', ' '], "-");
     match normalized.as_str() {
@@ -21540,7 +21636,30 @@ fn cloud_mcp_apply_remote_terminal_lever(
             )
             .await
             {
-                Ok(_) => closed += 1,
+                Ok(true) => {
+                    closed += 1;
+                    if let Some(panel_close_command) =
+                        cloud_mcp_headless_terminal_panel_close_command(
+                            &event,
+                            &workspace_id,
+                            &terminal,
+                        )
+                    {
+                        let dropped =
+                            cloud_mcp_defer_remote_command_for_foreground(&app, &panel_close_command);
+                        for dropped_event in dropped {
+                            let _ = cloud_mcp_send_remote_command_status_event(
+                                &state,
+                                &dropped_event,
+                                "dropped",
+                                "Queued remote command was dropped because the foreground replay queue is full.",
+                                None,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Ok(false) => failed += 1,
                 Err(_) => failed += 1,
             }
         }
@@ -25068,6 +25187,35 @@ async fn cloud_mcp_resolve_ws_target(
                     .await;
                     return Ok(target);
                 }
+                if cloud_mcp_should_retry_no_direct_route_offer(route_attempt) {
+                    cloud_mcp_set_global_ws_phase(
+                        state,
+                        "route_initializing",
+                        "route_initializing",
+                    )
+                    .await;
+                    let sleep_for = cloud_mcp_no_direct_route_offer_retry_delay();
+                    cloud_mcp_record_signin_diagnostic(
+                        state,
+                        "route.resolve",
+                        "info",
+                        "Balancer offered no direct route; retrying briefly for transient route state",
+                        json!({
+                            "attempt": route_attempt,
+                            "elapsed_ms": route_started.elapsed().as_millis() as u64,
+                            "poll_ms": sleep_for.as_millis() as u64,
+                            "transport": "direct_route_unavailable",
+                        }),
+                    )
+                    .await;
+                    tokio::select! {
+                        _ = sleep(sleep_for) => {}
+                        _ = state.global_ws_reconnect.notified() => {
+                            return Err("Cloud MCP route retry was interrupted by a reconnect request.".to_string());
+                        }
+                    }
+                    continue;
+                }
                 cloud_mcp_record_signin_diagnostic(
                     state,
                     "route.resolve",
@@ -25866,6 +26014,26 @@ fn cloud_mcp_direct_route_rejected_error(route: &Value) -> Option<String> {
     ))
 }
 
+fn cloud_mcp_direct_route_unusable_error(route: &Value, endpoint_path: &str) -> Option<String> {
+    let direct = route.get("direct").filter(|value| value.is_object())?;
+    if direct.get("enabled").and_then(Value::as_bool) == Some(false) {
+        return Some("Cloud MCP direct route disabled by balancer.".to_string());
+    }
+    let transport = direct
+        .get("transport")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let route_token_present = direct
+        .get("route_token")
+        .or_else(|| direct.get("routeToken"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    Some(format!(
+        "Cloud MCP direct route payload was unusable for {endpoint_path}; transport={transport}; route_token_present={route_token_present}"
+    ))
+}
+
 async fn cloud_mcp_fetch_direct_route_async(
     base_url: &str,
     endpoint_path: &str,
@@ -25953,6 +26121,9 @@ async fn cloud_mcp_fetch_direct_route_async(
         if let Some(error) = cloud_mcp_direct_route_rejected_error(&parsed) {
             return Err(error);
         }
+        if let Some(error) = cloud_mcp_direct_route_unusable_error(&parsed, endpoint_path) {
+            return Err(error);
+        }
     }
     Ok(target)
 }
@@ -25986,6 +26157,7 @@ fn cloud_mcp_route_error_runtime_status(error: &str) -> Option<&'static str> {
         || error.contains("backend_status=pending")
         || error.contains("backend_status=starting")
         || error.contains("backend_status=provisioning")
+        || error.contains("backend_status=deactivated")
     {
         return Some("route_initializing");
     }
@@ -26011,6 +26183,14 @@ fn cloud_mcp_route_initializing_poll_delay(error: &str) -> Duration {
             CLOUD_MCP_ROUTE_INITIALIZING_MAX_POLL_MS,
         );
     Duration::from_millis(delay_ms)
+}
+
+fn cloud_mcp_should_retry_no_direct_route_offer(route_attempt: u64) -> bool {
+    route_attempt <= CLOUD_MCP_DIRECT_ROUTE_NO_OFFER_RETRY_ATTEMPTS
+}
+
+fn cloud_mcp_no_direct_route_offer_retry_delay() -> Duration {
+    Duration::from_millis(CLOUD_MCP_DIRECT_ROUTE_NO_OFFER_RETRY_DELAY_MS)
 }
 
 fn cloud_mcp_direct_target_from_route(
@@ -28167,7 +28347,13 @@ fn cloud_mcp_workspace_panel_kind(panel: &Value) -> Option<String> {
             Some("web".to_string())
         }
         "pcb" | "pcb-panel" | "pcb-design" | "workspace-pcb" => Some("pcb".to_string()),
-        "video" | "video-editor" | "videoeditor" => Some("video".to_string()),
+        "vm" | "vm-sandbox" | "vmsandbox" | "workspace-vm" | "vm-panel"
+        | "sandbox-vm" | "virtual-machine" | "virtualmachine" => Some("vm".to_string()),
+        "video" | "video-editor" | "videoeditor" | "video-panel" | "workspace-video" => {
+            Some("video".to_string())
+        }
+        "swarm" | "agent-swarm" | "agents-swarm" | "swarm-agents" | "workspace-swarm"
+        | "swarm-panel" => Some("swarm".to_string()),
         _ => None,
     }
 }
@@ -32594,6 +32780,10 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
                 .unwrap_or_else(|| match panel_kind.as_str() {
                     "docs" => "Docs".to_string(),
                     "pcb" => "PCB".to_string(),
+                    "vm" => "VM Sandbox".to_string(),
+                    "video" => "Video editor".to_string(),
+                    "swarm" => "Swarm agents".to_string(),
+                    "web" => "Web".to_string(),
                     _ => "Web".to_string(),
                 });
                 let panel_id = cloud_mcp_payload_text(
@@ -53683,6 +53873,7 @@ mod cloud_mcp_tests {
             turn_status: "running".to_string(),
             session_state: "session_attached".to_string(),
             input_ready: false,
+            background_work_active: false,
             input_ready_at: None,
             prompt_ready_at: None,
             completed_at: None,
@@ -54345,6 +54536,57 @@ mod cloud_mcp_tests {
             cloud_mcp_workspace_panel_kind(&docs_panel).as_deref(),
             Some("docs"),
         );
+    }
+
+    #[test]
+    fn workspace_panel_kind_accepts_vm_and_swarm_aliases() {
+        for (kind, expected) in [
+            ("vm", "vm"),
+            ("vm-sandbox", "vm"),
+            ("virtual_machine", "vm"),
+            ("swarm", "swarm"),
+            ("swarm-panel", "swarm"),
+            ("agent-swarm", "swarm"),
+        ] {
+            assert_eq!(
+                cloud_mcp_workspace_panel_kind(&json!({ "panel_kind": kind })).as_deref(),
+                Some(expected),
+                "{kind} should map to {expected}",
+            );
+        }
+    }
+
+    #[test]
+    fn headless_terminal_close_builds_panel_close_command_payload() {
+        let original = json!({
+            "client_id": "client-a",
+            "command_id": "terminal-close-1",
+            "command_kind": "terminal_close",
+            "source": "next-diffforge",
+            "target_device_id": "device-a",
+            "workspace_id": "workspace-a",
+        });
+        let terminal = json!({
+            "pane_id": "workspace-terminal-workspace-a-2-codex",
+            "terminal_index": 2,
+        });
+
+        let command = cloud_mcp_headless_terminal_panel_close_command(
+            &original,
+            "workspace-a",
+            &terminal,
+        )
+        .expect("synthetic panel close command");
+
+        assert_eq!(command["command_kind"], json!("workspace_panel_close"));
+        assert_eq!(command["commandId"], json!("terminal-close-1:panel-close"));
+        assert_eq!(command["workspace_id"], json!("workspace-a"));
+        assert_eq!(command["target_panel_id"], json!("workspace-terminal-workspace-a-2-codex"));
+        assert_eq!(command["paneId"], json!("workspace-terminal-workspace-a-2-codex"));
+        assert_eq!(command["target_panel_index"], json!(2));
+        assert_eq!(command["targetTerminalIndex"], json!(2));
+        assert_eq!(command["synthetic_reason"], json!("headless_terminal_close"));
+        assert_eq!(command["target_device_id"], json!("device-a"));
     }
 
     #[test]
@@ -56730,6 +56972,56 @@ mod cloud_mcp_tests {
             cloud_mcp_route_error_runtime_status(legacy_waiting_error),
             Some("route_initializing")
         );
+
+        let deactivated_error = "Cloud MCP route request returned 503: backend_status=deactivated";
+        assert_eq!(
+            cloud_mcp_route_error_runtime_status(deactivated_error),
+            Some("route_initializing")
+        );
+    }
+
+    #[test]
+    fn no_direct_route_offer_retries_are_bounded() {
+        assert!(cloud_mcp_should_retry_no_direct_route_offer(1));
+        assert!(cloud_mcp_should_retry_no_direct_route_offer(
+            CLOUD_MCP_DIRECT_ROUTE_NO_OFFER_RETRY_ATTEMPTS
+        ));
+        assert!(!cloud_mcp_should_retry_no_direct_route_offer(
+            CLOUD_MCP_DIRECT_ROUTE_NO_OFFER_RETRY_ATTEMPTS + 1
+        ));
+        assert_eq!(
+            cloud_mcp_no_direct_route_offer_retry_delay(),
+            Duration::from_millis(CLOUD_MCP_DIRECT_ROUTE_NO_OFFER_RETRY_DELAY_MS)
+        );
+    }
+
+    #[test]
+    fn explicit_unusable_direct_route_is_terminal() {
+        let disabled = json!({
+            "direct": {
+                "enabled": false,
+                "transport": "direct_cloud_container"
+            }
+        });
+        let disabled_error = cloud_mcp_direct_route_unusable_error(&disabled, "/v1/voice/dictation/ws")
+            .expect("disabled direct route should be terminal");
+        assert_eq!(
+            disabled_error,
+            "Cloud MCP direct route disabled by balancer."
+        );
+        assert_eq!(cloud_mcp_route_error_runtime_status(&disabled_error), None);
+
+        let malformed = json!({
+            "direct": {
+                "enabled": true,
+                "transport": "node_dns_gateway"
+            }
+        });
+        let malformed_error =
+            cloud_mcp_direct_route_unusable_error(&malformed, "/v1/voice/dictation/ws")
+                .expect("malformed direct route should be terminal");
+        assert!(malformed_error.contains("route_token_present=false"));
+        assert_eq!(cloud_mcp_route_error_runtime_status(&malformed_error), None);
     }
 
     #[test]
@@ -65189,6 +65481,9 @@ fn cloud_mcp_fetch_direct_route_blocking(
             return Err(error);
         }
         if let Some(error) = cloud_mcp_direct_route_rejected_error(&parsed) {
+            return Err(error);
+        }
+        if let Some(error) = cloud_mcp_direct_route_unusable_error(&parsed, endpoint_path) {
             return Err(error);
         }
     }

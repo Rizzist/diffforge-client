@@ -65,6 +65,9 @@ CREATE TABLE IF NOT EXISTS workspace_mcp_seed_state(
 pub const WORKSPACE_MCP_SECRETS_STATE_MIGRATION_VERSION: i64 = 24;
 pub const WORKSPACE_MCP_SECRETS_STATE_MIGRATION_NAME: &str =
     "coordination_kernel_workspace_mcp_secrets_state";
+pub const WORKSPACE_MCP_SSH_TARGETS_MIGRATION_VERSION: i64 = 25;
+pub const WORKSPACE_MCP_SSH_TARGETS_MIGRATION_NAME: &str =
+    "coordination_kernel_workspace_mcp_ssh_targets";
 
 // Stores whether the built-in Secrets MCP is exposed to coding agents for a
 // workspace. No row means disabled: the vault and its data stay available in
@@ -76,6 +79,30 @@ CREATE TABLE IF NOT EXISTS workspace_mcp_secrets_state(
   enabled INTEGER NOT NULL,
   updated_at TEXT NOT NULL
 );
+"#;
+
+pub const WORKSPACE_MCP_SSH_TARGETS_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS workspace_mcp_ssh_targets(
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  host TEXT NOT NULL,
+  port INTEGER,
+  username TEXT,
+  auth_method TEXT NOT NULL,
+  key_path TEXT,
+  certificate_path TEXT,
+  secret TEXT,
+  agent_enabled INTEGER NOT NULL DEFAULT 0,
+  reveal_password INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  last_used_at TEXT,
+  UNIQUE(workspace_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_mcp_ssh_targets_workspace
+ON workspace_mcp_ssh_targets(workspace_id, name);
 "#;
 
 pub const CREATE_SCHEMA_SQL: &str = r#"

@@ -231,6 +231,11 @@ struct VideoMediaItem {
     has_audio: Option<bool>,
     has_transcript: bool,
     transcript_inherited: bool,
+    has_annotation: bool,
+    annotation_inherited: bool,
+    // The annotation's one-line blurb (image assets only) so library rows and
+    // agent listings can show content without another round-trip.
+    annotation_blurb: Option<String>,
     thumbnail_data_url: Option<String>,
     // Generation model for pending placeholders (e.g. "hyperframes"), so the
     // frontend can label ghost tiles/clips before the asset exists.
@@ -1611,6 +1616,8 @@ fn video_build_media_item(
             .is_some()
     };
     let has_transcript = has_own_transcript || transcript_inherited;
+    let (has_annotation, annotation_inherited, annotation_blurb) =
+        video_annotation_row_fields(root, media_root, manifest, kind, &path, &metadata);
     let thumbnail_data_url = if matches!(kind, "video" | "image") {
         ffmpeg_path.and_then(|ffmpeg| {
             let thumb_path = media_root
@@ -1652,6 +1659,9 @@ fn video_build_media_item(
         has_audio,
         has_transcript,
         transcript_inherited,
+        has_annotation,
+        annotation_inherited,
+        annotation_blurb,
         thumbnail_data_url,
         model: None,
     })
@@ -1703,6 +1713,9 @@ fn video_pending_generated_media_items(
                 has_audio: None,
                 has_transcript: false,
                 transcript_inherited: false,
+                has_annotation: false,
+                annotation_inherited: false,
+                annotation_blurb: None,
                 thumbnail_data_url: None,
                 model: Some(job.model.clone()),
             });
@@ -6325,6 +6338,15 @@ fn video_mcp_media_row(item: &VideoMediaItem) -> serde_json::Value {
         "hasTranscript".to_string(),
         serde_json::json!(item.has_transcript),
     );
+    if item.kind == "image" {
+        row.insert(
+            "hasAnnotation".to_string(),
+            serde_json::json!(item.has_annotation),
+        );
+        if let Some(blurb) = item.annotation_blurb.as_deref() {
+            row.insert("annotation".to_string(), serde_json::json!(blurb));
+        }
+    }
     row.insert("folderId".to_string(), serde_json::json!(item.folder_id));
     row.insert("pending".to_string(), serde_json::json!(item.pending));
     serde_json::Value::Object(row)
@@ -6613,7 +6635,7 @@ async fn video_mcp_media(
                     ffprobe_path,
                     true,
                 );
-                let filename_matches = items
+                let mut matches = items
                     .iter()
                     .filter(|item| {
                         kind_filter
@@ -6624,6 +6646,26 @@ async fn video_mcp_media(
                     })
                     .cloned()
                     .collect::<Vec<_>>();
+                // Images also match on annotation content ("the photo with the
+                // red car"), the still-image counterpart of transcript moments.
+                let annotations = video_mcp_media_search_annotations(
+                    &root,
+                    &media_root,
+                    &manifest,
+                    &items,
+                    &query_lower,
+                    kind_filter.as_deref(),
+                );
+                for entry in &annotations {
+                    let Some(path) = entry.get("path").and_then(serde_json::Value::as_str) else {
+                        continue;
+                    };
+                    if !matches.iter().any(|item| item.path == path) {
+                        if let Some(item) = items.iter().find(|item| item.path == path) {
+                            matches.push(item.clone());
+                        }
+                    }
+                }
                 let moments = video_mcp_media_search_moments(
                     &root,
                     &media_root,
@@ -6633,8 +6675,9 @@ async fn video_mcp_media(
                     kind_filter.as_deref(),
                 );
                 Ok(serde_json::json!({
-                    "items": video_mcp_media_rows(&filename_matches),
+                    "items": video_mcp_media_rows(&matches),
                     "moments": moments,
+                    "annotations": annotations,
                 }))
             }
             "import" => {
@@ -6709,11 +6752,126 @@ async fn video_mcp_media(
                 video_emit_manifest_changed(&app, &root, &manifest_path);
                 Ok(serde_json::json!({ "path": rel_path, "folderId": folder_id }))
             }
+            "annotation" => {
+                let path = video_mcp_input_text(&input, &["path"])
+                    .ok_or_else(|| "Video media path is required.".to_string())?;
+                let (_abs, rel_path, kind, metadata) =
+                    video_resolve_existing_media_file(&root, &media_root, path.as_str())?;
+                if kind != "image" {
+                    return Err("Annotations are only available for image media.".to_string());
+                }
+                let manifest = video_read_media_manifest(&video_media_manifest_path(&media_root));
+                match video_resolve_annotation_cache(
+                    &root,
+                    &media_root,
+                    &manifest,
+                    &rel_path,
+                    &metadata,
+                )? {
+                    Some((inherited_from, annotation)) => Ok(serde_json::json!({
+                        "path": rel_path,
+                        "available": true,
+                        "inherited": inherited_from.is_some(),
+                        "inheritedFrom": inherited_from,
+                        "annotation": annotation,
+                    })),
+                    None => Ok(serde_json::json!({
+                        "path": rel_path,
+                        "available": false,
+                    })),
+                }
+            }
+            "annotate" => {
+                let path = video_mcp_input_text(&input, &["path"])
+                    .ok_or_else(|| "Video media path is required.".to_string())?;
+                let (_abs, rel_path, kind, metadata) =
+                    video_resolve_existing_media_file(&root, &media_root, path.as_str())?;
+                if kind != "image" {
+                    return Err("Annotations are only available for image media.".to_string());
+                }
+                let annotation_input = input
+                    .get("annotation")
+                    .filter(|value| value.is_object())
+                    .cloned()
+                    .ok_or_else(|| {
+                        "video_media annotate requires an annotation object (blurb, description, tags, dominantColors, ocrText)."
+                            .to_string()
+                    })?;
+                let annotation_input =
+                    serde_json::from_value::<VideoAnnotationUpdateInput>(annotation_input)
+                        .map_err(|error| format!("Invalid annotation payload: {error}"))?;
+                let updated = video_annotation_apply_update(
+                    &root,
+                    &media_root,
+                    &rel_path,
+                    &metadata,
+                    annotation_input,
+                    "agent",
+                )?;
+                video_annotation_write(&app, &root, &media_root, &rel_path, &metadata, &updated)?;
+                Ok(serde_json::json!({
+                    "path": rel_path,
+                    "annotation": updated,
+                }))
+            }
             _ => Err(format!("Unknown video_media action: {action}")),
         }
     })
     .await
     .map_err(|error| format!("Video MCP media worker failed: {error}"))?
+}
+
+// Annotation search matches for image assets: [{ path, excerpt }].
+fn video_mcp_media_search_annotations(
+    root: &std::path::Path,
+    media_root: &std::path::Path,
+    manifest: &VideoMediaManifest,
+    items: &[VideoMediaItem],
+    query: &str,
+    kind_filter: Option<&str>,
+) -> Vec<serde_json::Value> {
+    let mut matches = Vec::new();
+    for item in items {
+        if matches.len() >= 20 {
+            break;
+        }
+        if kind_filter.is_some_and(|kind| item.kind != kind) {
+            continue;
+        }
+        if item.kind != "image" || item.pending || !item.has_annotation {
+            continue;
+        }
+        let Ok((_abs, rel_path, _kind, metadata)) =
+            video_resolve_existing_media_file(root, media_root, &item.path)
+        else {
+            continue;
+        };
+        let Ok(Some((inherited_from, annotation))) =
+            video_resolve_annotation_cache(root, media_root, manifest, &rel_path, &metadata)
+        else {
+            continue;
+        };
+        let search_text = video_annotation_search_text(&annotation);
+        if !search_text.contains(query) {
+            continue;
+        }
+        let full_text = if annotation.description.is_empty() {
+            annotation.blurb.clone()
+        } else {
+            format!("{} {}", annotation.blurb, annotation.description)
+        };
+        let mut entry = serde_json::Map::new();
+        entry.insert("path".to_string(), serde_json::json!(item.path));
+        entry.insert(
+            "excerpt".to_string(),
+            serde_json::json!(video_mcp_excerpt(&full_text, query)),
+        );
+        if inherited_from.is_some() {
+            entry.insert("inheritedFrom".to_string(), serde_json::json!(inherited_from));
+        }
+        matches.push(serde_json::Value::Object(entry));
+    }
+    matches
 }
 
 fn video_mcp_context_guide_value(include: &[String]) -> serde_json::Value {
