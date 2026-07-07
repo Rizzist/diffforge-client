@@ -161,6 +161,28 @@ if ! security find-identity -v -p codesigning | grep -Fq "\"$signing_identity\""
   exit 1
 fi
 
+# macOS TCC grants (Accessibility, Screen Recording) pin the signing cert's
+# leaf hash, not just the bundle identifier. If the dev cert is ever recreated
+# (keychain password change, keychain replacement), System Settings keeps the
+# toggles ON but validation fails silently — AXIsProcessTrusted() returns
+# false while everything looks granted. Track the cert hash across runs and
+# reset the now-dead grants on rotation so the app re-prompts cleanly.
+cert_hash="$(security find-identity -v -p codesigning "$dev_keychain" \
+  | awk -v name="\"$signing_identity\"" 'index($0, name) {print $2; exit}')"
+cert_hash_file="$HOME/.diffforge/dev-signing-cert-hash"
+tcc_reset_performed=false
+if [[ -n "$cert_hash" ]]; then
+  if [[ -f "$cert_hash_file" ]] && [[ "$(<"$cert_hash_file")" != "$cert_hash" ]]; then
+    echo "Dev signing certificate rotated ($(<"$cert_hash_file") -> $cert_hash)."
+    echo "Existing Accessibility/Screen Recording grants pin the old certificate and no longer validate; resetting them for $dev_bundle_identifier."
+    tccutil reset Accessibility "$dev_bundle_identifier" || true
+    tccutil reset ScreenCapture "$dev_bundle_identifier" || true
+    tcc_reset_performed=true
+  fi
+  mkdir -p "$(dirname "$cert_hash_file")"
+  printf '%s\n' "$cert_hash" >"$cert_hash_file"
+fi
+
 if [[ -d "$legacy_conflicting_app_path" ]]; then
   "$lsregister" -u "$legacy_conflicting_app_path" 2>/dev/null || true
   rm -rf "$legacy_conflicting_app_path"
@@ -192,8 +214,16 @@ fi
 
 open -n "$app_path"
 
+"$repo_root/scripts/prune-target-cache.sh" || true
+
 echo "Launched $app_path"
 echo "Signed with $signing_identity"
 echo "Bundle identifier: $dev_bundle_identifier"
 echo "Microphone entitlement present"
 echo "macOS should now route $dev_deeplink_scheme:// URLs to Diff Forge AI Dev."
+if [[ "$tcc_reset_performed" == true ]]; then
+  echo ""
+  echo "NOTE: the signing certificate rotated, so Accessibility and Screen Recording"
+  echo "were reset for $dev_bundle_identifier. Re-enable Diff Forge AI Dev in"
+  echo "System Settings > Privacy & Security when the app prompts for them again."
+fi

@@ -21,6 +21,7 @@ enigo = "0.6"
 futures-util = "0.3"
 hmac = "0.12"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+jsonwebtoken = "9"
 libc = "0.2"
 # lzma-rs + tar: pure-Rust extraction of ffmpeg static-build .tar.xz archives
 # (Linux managed install); zip below stays the Windows/macOS path.

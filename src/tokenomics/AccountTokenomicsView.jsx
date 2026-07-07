@@ -33,6 +33,7 @@ import {
   providerLimitKey,
   providerLimitSampleKey,
 } from "./tokenomicsProviderLimitMerge.js";
+import { ByocWizard } from "./ByocWizard.jsx";
 
 const TOKENOMICS_SCAN_PROGRESS_EVENT = "diffforge://tokenomics-scan-progress";
 const TOKENOMICS_UPDATED_EVENT = "diffforge://tokenomics-updated";
@@ -1915,11 +1916,22 @@ function activeProviderAccountKeyForLimits(limits, selectedProvider, selectedSco
   if (selectedProvider === "all") return "";
   const rows = (Array.isArray(limits) ? limits : []).filter((row) => (
     providerKey(row) === selectedProvider
-      && providerLimitUsesActiveAccount(row)
+      && rowProviderAccountKey(row)
       && (selectedDeviceId === "all" || !rowDeviceId(row) || rowDeviceId(row) === selectedDeviceId)
       && (selectedScopeKey === "all" || rowScopeKey(row) === selectedScopeKey)
   ));
-  return rowProviderAccountKey(rows[0]) || "";
+  const activeRow = rows.find(providerLimitUsesActiveAccount);
+  if (activeRow) return rowProviderAccountKey(activeRow) || "";
+  // No active-account tag (e.g. a keychain-based Claude profile publishes no
+  // flagged row): fall back to the most recently observed account with live
+  // data so the gauge tracks one plan instead of averaging every account.
+  const candidates = rows.filter(hasKnownLimitPercent);
+  const pool = candidates.length ? candidates : rows;
+  const latest = pool.reduce(
+    (best, row) => (best == null || limitTimestampMs(row) > limitTimestampMs(best) ? row : best),
+    null,
+  );
+  return rowProviderAccountKey(latest) || "";
 }
 
 function limitAccountKeyForDisplay(limits, selectedProvider, selectedAccountKey = "all", selectedScopeKey = "all", selectedDeviceId = "all") {
@@ -2113,12 +2125,41 @@ function clientProjectedLimit(limit = {}) {
   };
 }
 
+// One account per provider: limit gauges always describe a single plan (the
+// active account when tagged, else the freshest live account), never an
+// average across every logged-in account of that provider.
+function limitDisplayAccountRows(rows) {
+  const byProvider = new Map();
+  for (const row of rows) {
+    const provider = providerKey(row);
+    const group = byProvider.get(provider) || [];
+    group.push(row);
+    byProvider.set(provider, group);
+  }
+  const kept = [];
+  for (const group of byProvider.values()) {
+    const accountKeys = new Set(group.map((row) => rowProviderAccountKey(row) || ""));
+    if (accountKeys.size <= 1) {
+      kept.push(...group);
+      continue;
+    }
+    const activeRows = group.filter(providerLimitUsesActiveAccount);
+    const liveRows = group.filter(hasKnownLimitPercent);
+    const pool = activeRows.length ? activeRows : (liveRows.length ? liveRows : group);
+    const chosen = pool.reduce((best, row) => (limitTimestampMs(row) > limitTimestampMs(best) ? row : best), pool[0]);
+    const chosenKey = rowProviderAccountKey(chosen) || "";
+    kept.push(...group.filter((row) => (rowProviderAccountKey(row) || "") === chosenKey));
+  }
+  return kept;
+}
+
 function mergeLimits(limits, windowKind) {
   const normalizedWindowKind = normalizedLimitWindowKind(windowKind);
-  const rows = limits
-    .map(normalizeLimitRowForDisplay)
-    .filter((limit) => normalizedLimitWindowKind(limit?.window_kind || limit?.windowKind || limit?.limit_kind || limit?.limitKind || "") === normalizedWindowKind)
-    .map(clientProjectedLimit);
+  const rows = limitDisplayAccountRows(
+    limits
+      .map(normalizeLimitRowForDisplay)
+      .filter((limit) => normalizedLimitWindowKind(limit?.window_kind || limit?.windowKind || limit?.limit_kind || limit?.limitKind || "") === normalizedWindowKind),
+  ).map(clientProjectedLimit);
   if (!rows.length) {
     return {
       windowKind: normalizedWindowKind,
@@ -4008,6 +4049,8 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
         </StorageCard>
 
         <AgentAccountsManager active={active} />
+
+        <ByocWizard />
 
         <TokenomicsFooter>
           <span>{lastUpdatedText(summary?.updated_at || summary?.updatedAt)}</span>

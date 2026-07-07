@@ -21,10 +21,11 @@ const TOKENOMICS_USAGE_EVENT_VACUUM_STARTUP_GRACE_SECS: u64 = 3 * 60;
 const TOKENOMICS_SQLITE_BUSY_TIMEOUT_MS: u64 = 30_000;
 const TOKENOMICS_CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/codex/usage";
 const TOKENOMICS_CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-const TOKENOMICS_CODEX_SCANNER_VERSION: &str = "codex-token-count-v7-ledger-tail-30d";
-const TOKENOMICS_GENERIC_SCANNER_VERSION: &str = "generic-tokenomics-v6-request-dedupe-30d";
+const TOKENOMICS_CODEX_SCANNER_VERSION: &str = "codex-token-count-v8-uncached-input-30d";
+const TOKENOMICS_GENERIC_SCANNER_VERSION: &str = "generic-tokenomics-v7-large-jsonl-30d";
 const TOKENOMICS_ROLLUP_ID_VERSION: &str = "tokenomics-v2-utc-hour-rollups-v2";
 const TOKENOMICS_CODEX_IMPORT_LEDGER_REPAIR_VERSION: &str = "codex-import-ledger-orphan-prune-v1";
+const TOKENOMICS_CODEX_UNCACHED_INPUT_VERSION: &str = "codex-uncached-input-v1";
 const TOKENOMICS_PROVIDER_API_PRICING_VERSION: &str = "claude-api-pricing-v1";
 const TOKENOMICS_INITIAL_BACKFILL_DAYS: u64 = 30;
 const TOKENOMICS_UNKNOWN_OFFSET_COVERAGE_START_UNIX: u64 = i64::MAX as u64;
@@ -1104,6 +1105,7 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
     // process-global Tokenomics write lock is held. Only cheap meta-gated
     // repair hooks belong here; retention work runs from the prune path.
     tokenomics_repair_codex_orphaned_import_rows(conn)?;
+    tokenomics_normalize_codex_cached_input(conn)?;
     tokenomics_rebuild_rollups_for_identity_version(conn)?;
     tokenomics_repair_provider_api_costs(conn)?;
     Ok(())
@@ -9061,10 +9063,14 @@ fn tokenomics_scan_codex_state_db(
             } else {
                 0
             };
+            // A full from-zero rescan replaces the source's rows. This must
+            // also fire when the offset survives from an older scanner
+            // version: rescanning without clearing is what historically
+            // double-counted rollout files whose line indexing drifted.
             let should_clear_existing_source_events = !scan_mode.is_realtime()
                 && !can_resume_from_offset
-                && offset.scanner_version == TOKENOMICS_CODEX_SCANNER_VERSION
-                && offset.last_byte_offset > 0;
+                && (offset.scanner_version != TOKENOMICS_CODEX_SCANNER_VERSION
+                    || offset.last_byte_offset > 0);
             files_scanned += 1;
             let file_scan = tokenomics_run_write_batch(conn, || {
                 let mut scoped_rollup_keys = Vec::new();
@@ -9391,6 +9397,12 @@ fn tokenomics_scan_codex_session_file(
         if input_tokens <= 0 && cache_read_tokens <= 0 && output_tokens <= 0 {
             continue;
         }
+        // Codex reports input_tokens INCLUDING cached input; stored rows use
+        // the Claude convention (input excludes cache reads) so cross-provider
+        // sums don't double-display cache. The event identity and cost math
+        // keep using the raw inclusive value: identities must stay stable
+        // against rows and prune tombstones recorded before this change.
+        let uncached_input_tokens = input_tokens.saturating_sub(cache_read_tokens);
         let total_tokens = input_tokens.saturating_add(output_tokens);
         let timestamp = value
             .get("timestamp")
@@ -9445,7 +9457,7 @@ fn tokenomics_scan_codex_session_file(
             source_path: Some(format!("{}:{source}", path.display())),
             bucket_day,
             bucket_hour,
-            input_tokens,
+            input_tokens: uncached_input_tokens,
             output_tokens,
             cache_read_tokens,
             cache_write_tokens: 0,
@@ -9548,9 +9560,12 @@ fn tokenomics_estimated_api_microusd(
         || provider_key.contains("codex")
         || agent_key.contains("codex")
     {
+        // Stored Codex rows keep uncached input (Claude convention); the
+        // credit estimator expects the OpenAI-style inclusive input, so
+        // reconstruct it before pricing.
         return tokenomics_codex_estimated_api_microusd(
             model,
-            input_tokens,
+            input_tokens.saturating_add(cache_read_tokens),
             cache_read_tokens,
             output_tokens,
         );
@@ -9721,7 +9736,7 @@ fn tokenomics_collect_candidate_files_inner(
             );
             continue;
         }
-        if !metadata.is_file() || metadata.len() > TOKENOMICS_SCAN_MAX_FILE_BYTES {
+        if !metadata.is_file() {
             continue;
         }
         let extension = path
@@ -9730,6 +9745,12 @@ fn tokenomics_collect_candidate_files_inner(
             .unwrap_or_default()
             .to_ascii_lowercase();
         if !matches!(extension.as_str(), "jsonl" | "json" | "ndjson") {
+            continue;
+        }
+        // JSONL sources stream line-by-line with resume offsets, so file size
+        // is safe; the byte cap only guards whole-file .json parses. Heavy
+        // Claude Code sessions routinely exceed 25MB and must stay scannable.
+        if extension == "json" && metadata.len() > TOKENOMICS_SCAN_MAX_FILE_BYTES {
             continue;
         }
         let modified = metadata
@@ -10244,6 +10265,19 @@ fn tokenomics_usage_event_from_value(
             "cacheCreationInputTokens",
         ],
     );
+    // OpenAI-style payloads report input/prompt tokens INCLUDING cached
+    // tokens; stored rows use the Claude convention (input excludes cache
+    // reads), which the cost estimator also assumes.
+    let provider_lower = provider.trim().to_ascii_lowercase();
+    let agent_lower = agent_kind.trim().to_ascii_lowercase();
+    let input_tokens = if provider_lower.contains("openai")
+        || provider_lower.contains("codex")
+        || agent_lower.contains("codex")
+    {
+        input_tokens.saturating_sub(cache_read_tokens.min(input_tokens))
+    } else {
+        input_tokens
+    };
     let total_tokens = tokenomics_usage_number(value, &["total_tokens", "totalTokens", "total"])
         .max(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens);
     if total_tokens <= 0 {
@@ -10929,7 +10963,6 @@ fn tokenomics_repair_codex_orphaned_import_rows(conn: &rusqlite::Connection) -> 
                  WHERE imported.provider=tokenomics_usage_events.provider
                    AND imported.agent_kind=tokenomics_usage_events.agent_kind
                    AND imported.source_kind='codex_token_count_jsonl'
-                   AND imported.scanner_version=?1
                    AND imported.import_status IN (
                      'complete',
                      'indexed_empty',
@@ -10945,7 +10978,7 @@ fn tokenomics_repair_codex_orphaned_import_rows(conn: &rusqlite::Connection) -> 
                      ELSE tokenomics_usage_events.source_path
                    END
                )",
-            rusqlite::params![TOKENOMICS_CODEX_SCANNER_VERSION],
+            [],
         )
         .map_err(|error| format!("Unable to prune orphaned Codex Tokenomics rows: {error}"))?;
     if deleted > 0 {
@@ -10959,6 +10992,74 @@ fn tokenomics_repair_codex_orphaned_import_rows(conn: &rusqlite::Connection) -> 
     )
     .map_err(|error| format!("Unable to record Codex Tokenomics import repair: {error}"))?;
     Ok(())
+}
+
+fn tokenomics_normalize_codex_cached_input(conn: &rusqlite::Connection) -> Result<(), String> {
+    let current = conn
+        .query_row(
+            "SELECT value FROM tokenomics_meta WHERE key='codex_uncached_input_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    if current.as_deref() == Some(TOKENOMICS_CODEX_UNCACHED_INPUT_VERSION) {
+        return Ok(());
+    }
+
+    // Codex rows historically stored input_tokens INCLUDING cached input
+    // (OpenAI usage convention), while Claude rows store uncached input only,
+    // so cross-provider "Input" sums double-displayed every cache read.
+    // Rewrite stored rows to the uncached convention. total_tokens already
+    // equals uncached + cache_read + output for these rows, and costs were
+    // computed from the uncached split at ingest, so neither changes.
+    //
+    // The subtraction is not data-idempotent, so the rewrite, rollup rebuild,
+    // and meta marker must land atomically: a crash between them would
+    // double-subtract on the next startup.
+    conn.execute_batch("SAVEPOINT codex_uncached_input")
+        .map_err(|error| format!("Unable to begin Codex Tokenomics input normalization: {error}"))?;
+    let result = (|| {
+        let mut changed = 0usize;
+        for table in ["tokenomics_usage_events", "tokenomics_pruned_usage_rollups"] {
+            changed += conn
+                .execute(
+                    &format!(
+                        "UPDATE {table}
+                         SET input_tokens=input_tokens - MIN(cache_read_tokens, input_tokens)
+                         WHERE provider='openai' AND agent_kind='codex'
+                           AND cache_read_tokens>0 AND input_tokens>0"
+                    ),
+                    [],
+                )
+                .map_err(|error| format!("Unable to normalize Codex Tokenomics input: {error}"))?;
+        }
+        if changed > 0 {
+            tokenomics_rebuild_provider_rollups_from_events(conn, "openai", "codex")?;
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO tokenomics_meta(key, value)
+             VALUES('codex_uncached_input_version', ?1)",
+            rusqlite::params![TOKENOMICS_CODEX_UNCACHED_INPUT_VERSION],
+        )
+        .map_err(|error| {
+            format!("Unable to record Codex Tokenomics input normalization: {error}")
+        })?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn
+            .execute_batch("RELEASE SAVEPOINT codex_uncached_input")
+            .map_err(|error| {
+                format!("Unable to commit Codex Tokenomics input normalization: {error}")
+            }),
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT codex_uncached_input;
+                 RELEASE SAVEPOINT codex_uncached_input",
+            );
+            Err(error)
+        }
+    }
 }
 
 fn tokenomics_repair_provider_api_costs(conn: &rusqlite::Connection) -> Result<(), String> {

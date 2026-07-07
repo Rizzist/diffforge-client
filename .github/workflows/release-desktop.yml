@@ -61,6 +61,44 @@ jobs:
           workspaces: src-tauri
           key: ${{ matrix.label }}
       - run: npm ci
+      # Without a stable signing identity Tauri ad-hoc signs the app, whose
+      # code requirement is a per-build cdhash — macOS TCC grants
+      # (Accessibility, Screen Recording) then break on EVERY update. Until we
+      # have an Apple Developer ID, sign with a persistent self-signed cert
+      # (from ~/.diffforge/dist-signing on the maintainer machine) so grants
+      # survive updates. Gatekeeper friction is unchanged either way.
+      # Secrets: MACOS_SIGNING_CERT_P12_BASE64 (base64 .p12) and
+      # MACOS_SIGNING_CERT_PASSWORD (its export password).
+      - name: Import macOS signing certificate
+        env:
+          MACOS_SIGNING_CERT_P12_BASE64: ${{ secrets.MACOS_SIGNING_CERT_P12_BASE64 }}
+          MACOS_SIGNING_CERT_PASSWORD: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
+        run: |
+          if [ -z "$MACOS_SIGNING_CERT_P12_BASE64" ]; then
+            echo "::warning::MACOS_SIGNING_CERT_P12_BASE64 not set — this release will be ad-hoc signed and macOS permission grants will break on update"
+            exit 0
+          fi
+          p12="$RUNNER_TEMP/dist-cert.p12"
+          cert="$RUNNER_TEMP/dist-cert.pem"
+          keychain="$RUNNER_TEMP/diffforge-sign.keychain-db"
+          keychain_password="$(openssl rand -hex 16)"
+          printf '%s' "$MACOS_SIGNING_CERT_P12_BASE64" | base64 -d > "$p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$p12" -k "$keychain" -P "$MACOS_SIGNING_CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          # codesign only offers identities whose certs chain to trust; the
+          # cert is self-signed, so trust it explicitly (runner-local only).
+          /usr/bin/openssl pkcs12 -in "$p12" -clcerts -nokeys -out "$cert" \
+            -passin "pass:$MACOS_SIGNING_CERT_PASSWORD"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+            -k /Library/Keychains/System.keychain "$cert"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          security find-identity -v -p codesigning "$keychain"
+          echo "APPLE_SIGNING_IDENTITY=Diff Forge AI Distribution" >> "$GITHUB_ENV"
       - name: Build dmg and updater archive
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}

@@ -341,7 +341,10 @@ fn audio_shortcut_permission_status() -> AudioShortcutPermissionStatus {
             })
             .unwrap_or_default();
         let message = if !accessibility_granted {
-            "Enable Accessibility for Diff Forge AI, then restart the app.".to_string()
+            // A grant can show as enabled in System Settings yet fail here:
+            // TCC pins the app's code signature, so an update or re-signed
+            // build invalidates the old grant without flipping the toggle.
+            "Enable Accessibility for Diff Forge AI, then restart the app. If it already shows enabled, the grant went stale after an app update — remove Diff Forge AI from the Accessibility list and add it back.".to_string()
         } else if quarantine_path.is_some() {
             "Remove the macOS quarantine attribute, then restart the app.".to_string()
         } else {

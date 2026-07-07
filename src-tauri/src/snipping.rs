@@ -1662,7 +1662,7 @@ fn snipping_permission_status() -> SnippingPermissionStatus {
         let message = if !screen_capture_granted {
             "Enable Screen Recording for Diff Forge AI, then retry the snip.".to_string()
         } else if !shortcut_accessibility_granted {
-            "Enable Accessibility if the global snipping shortcuts do not fire.".to_string()
+            "Enable Accessibility if the global snipping shortcuts do not fire. If it already shows enabled, remove Diff Forge AI from the Accessibility list and add it back — grants go stale after an app update.".to_string()
         } else {
             "Snipping permissions look ready.".to_string()
         };

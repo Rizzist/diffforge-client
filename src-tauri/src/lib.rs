@@ -2720,6 +2720,7 @@ include!("terminal_cli.rs");
 include!("tokenomics.rs");
 include!("native_notifications.rs");
 include!("cloud_mcp.rs");
+include!("byoc.rs");
 include!("local_scripts.rs");
 include!("assets.rs");
 include!("agent_sessions.rs");
@@ -8058,9 +8059,13 @@ fn local_workspace_catalog_entry_is_deleted(entry: &Value) -> bool {
 /// replace webview localStorage for state that headless flows must read or
 /// mutate (workspace settings, lifecycle defaults, remote-control intents).
 /// The webview keeps localStorage as a synchronous cache and writes through.
-fn app_local_state_path(app: &AppHandle, key: &str) -> Result<PathBuf, String> {
-    let safe_key = key
-        .trim()
+// The on-disk filename is derived by mapping every non-[a-z0-9_-] char to '-',
+// so "byoc.providers", "byoc/providers", and "byoc-providers" all resolve to
+// the SAME file. Redaction/ownership gates MUST compare this canonical key,
+// not the raw one, or an aliased key slips past them and leaks/overwrites the
+// underlying file.
+fn app_local_state_canonical_key(key: &str) -> String {
+    key.trim()
         .to_ascii_lowercase()
         .chars()
         .map(|character| {
@@ -8071,7 +8076,11 @@ fn app_local_state_path(app: &AppHandle, key: &str) -> Result<PathBuf, String> {
             }
         })
         .take(80)
-        .collect::<String>();
+        .collect::<String>()
+}
+
+fn app_local_state_path(app: &AppHandle, key: &str) -> Result<PathBuf, String> {
+    let safe_key = app_local_state_canonical_key(key);
     if safe_key.is_empty() {
         return Err("App local state key is required.".to_string());
     }
@@ -8105,12 +8114,29 @@ pub(crate) fn app_local_state_write(
     key: &str,
     value: &Value,
 ) -> Result<(), String> {
+    app_local_state_write_with_mode(app, key, value, None)
+}
+
+// `mode` (unix) is applied to the temp file BEFORE the rename, so a
+// secret-bearing file (e.g. byoc-providers) is never briefly world-readable.
+pub(crate) fn app_local_state_write_with_mode(
+    app: &AppHandle,
+    key: &str,
+    value: &Value,
+    #[allow(unused_variables)] mode: Option<u32>,
+) -> Result<(), String> {
     let path = app_local_state_path(app, key)?;
     let serialized = serde_json::to_vec_pretty(value)
         .map_err(|error| format!("Unable to serialize app state: {error}"))?;
     let temp_path = path.with_extension("json.tmp");
     fs::write(&temp_path, serialized)
         .map_err(|error| format!("Unable to write app state: {error}"))?;
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp_path, fs::Permissions::from_mode(mode))
+            .map_err(|error| format!("Unable to secure app state permissions: {error}"))?;
+    }
     fs::rename(&temp_path, &path)
         .map_err(|error| format!("Unable to finalize app state: {error}"))?;
     Ok(())
@@ -8140,14 +8166,29 @@ pub(crate) fn app_local_state_merge(
 }
 
 fn app_local_state_public_value(key: &str, value: Value) -> Value {
-    if key.trim().eq_ignore_ascii_case(DESKTOP_AUTH_STATE_KEY) {
+    let canonical = app_local_state_canonical_key(key);
+    if canonical.eq_ignore_ascii_case(DESKTOP_AUTH_STATE_KEY) {
         return desktop_auth_public_snapshot(&desktop_auth_snapshot_from_raw(value));
+    }
+    if canonical.eq_ignore_ascii_case(BYOC_PROVIDERS_STATE_KEY) {
+        return byoc_saved_providers_from_state(&value);
     }
     value
 }
 
 fn app_local_state_is_desktop_auth_key(key: &str) -> bool {
-    key.trim().eq_ignore_ascii_case(DESKTOP_AUTH_STATE_KEY)
+    app_local_state_canonical_key(key).eq_ignore_ascii_case(DESKTOP_AUTH_STATE_KEY)
+}
+
+// BYOC provider credentials are Rust-owned (written only by byoc_provision when
+// the user opts to save). JS must never store/merge the key directly — that
+// would both bypass the mask and rewrite the file with a lax umask.
+fn app_local_state_is_byoc_providers_key(key: &str) -> bool {
+    app_local_state_canonical_key(key).eq_ignore_ascii_case(BYOC_PROVIDERS_STATE_KEY)
+}
+
+fn app_local_state_is_rust_owned_key(key: &str) -> bool {
+    app_local_state_is_desktop_auth_key(key) || app_local_state_is_byoc_providers_key(key)
 }
 
 #[tauri::command]
@@ -8160,6 +8201,8 @@ async fn app_local_state_load(app: AppHandle, key: String) -> Result<Value, Stri
             return Ok(desktop_auth_public_snapshot(&desktop_auth_snapshot(&app)));
         }
         let value = app_local_state_read(&app, &key);
+        // Redaction keys on the canonical form, so an aliased key ("byoc.providers")
+        // still lands on the masked branch instead of returning raw secrets.
         Ok(app_local_state_public_value(&key, value))
     })
     .await
@@ -8170,6 +8213,9 @@ async fn app_local_state_load(app: AppHandle, key: String) -> Result<Value, Stri
 async fn app_local_state_store(app: AppHandle, key: String, value: Value) -> Result<Value, String> {
     if app_local_state_is_desktop_auth_key(&key) {
         return Err("Desktop auth state is owned by the native auth core.".to_string());
+    }
+    if app_local_state_is_byoc_providers_key(&key) {
+        return Err("Cloud provider credentials are owned by the native BYOC core.".to_string());
     }
     tauri::async_runtime::spawn_blocking(move || {
         app_local_state_write(&app, &key, &value)?;
@@ -8187,6 +8233,9 @@ async fn app_local_state_merge_command(
 ) -> Result<Value, String> {
     if app_local_state_is_desktop_auth_key(&key) {
         return Err("Desktop auth state is owned by the native auth core.".to_string());
+    }
+    if app_local_state_is_byoc_providers_key(&key) {
+        return Err("Cloud provider credentials are owned by the native BYOC core.".to_string());
     }
     tauri::async_runtime::spawn_blocking(move || {
         let value = app_local_state_merge(&app, &key, &patch)?;
@@ -9897,6 +9946,11 @@ fn run_app(daemon: bool) {
             cloud_mcp_get_desktop_device_profile,
             cloud_mcp_get_status,
             cloud_mcp_get_network_diagnostics,
+            byoc_provider_catalog,
+            byoc_list_server_options,
+            byoc_provision,
+            byoc_saved_providers,
+            byoc_delete_saved_provider,
             cloud_mcp_get_cached_workspace_todos,
             cloud_mcp_get_billing_status,
             cloud_mcp_refresh_billing_status,

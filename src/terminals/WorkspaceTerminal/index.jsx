@@ -2321,6 +2321,10 @@ function WorkspaceTerminal({
   const forceFreshSessionOnNextOpenRef = useRef(false);
   const providerSessionOverrideOnNextOpenRef = useRef("");
   const forkFromProviderSessionOnNextOpenRef = useRef("");
+  // opencode's Bun runtime segfaults mid-session (bun.report crashes); the
+  // budget survives pane restarts so a crash loop degrades to the normal
+  // exited overlay instead of respawning forever.
+  const crashAutoRestartRef = useRef({ attempts: 0 });
   const forkTerminalActionRef = useRef(null);
   const canRequestForkTerminalRef = useRef(false);
   const parkedPromptRef = useRef(null);
@@ -2347,6 +2351,7 @@ function WorkspaceTerminal({
   const [terminalClosed, setTerminalClosed] = useState(false);
   const [terminalClosing, setTerminalClosing] = useState(false);
   const [restartRoleMenuOpen, setRestartRoleMenuOpen] = useState(false);
+  const [restartMenuAlign, setRestartMenuAlign] = useState("right");
   const [terminalLaunchInfo, setTerminalLaunchInfo] = useState(null);
   const [parkedPrompt, setParkedPrompt] = useState(null);
   const [terminalUiViewActive, setTerminalUiViewActive] = useState(false);
@@ -5479,6 +5484,31 @@ function WorkspaceTerminal({
       document.removeEventListener("keydown", handleRestartMenuKeyDown, true);
     };
   }, [restartRoleMenuOpen]);
+
+  const toggleRestartRoleMenu = useCallback(() => {
+    setRestartRoleMenuOpen((isOpen) => {
+      if (isOpen) {
+        return false;
+      }
+
+      // The dropdown is right-aligned to its button; with the button near the
+      // pane's left edge that hangs the menu outside the pane, where ancestor
+      // overflow clips it. Open toward whichever side of the rail has room.
+      const wrapper = restartMenuRef.current;
+      const rail = wrapper?.closest('[data-terminal-rail-pill="true"]');
+      const wrapperRect = wrapper?.getBoundingClientRect();
+      const railRect = rail?.getBoundingClientRect();
+      if (wrapperRect && railRect) {
+        const menuWidth = 224;
+        const spaceLeftward = wrapperRect.right - railRect.left;
+        const spaceRightward = railRect.right - wrapperRect.left;
+        setRestartMenuAlign(
+          spaceLeftward >= menuWidth || spaceLeftward >= spaceRightward ? "right" : "left",
+        );
+      }
+      return true;
+    });
+  }, []);
 
   const materializeFreshThreadForTerminalSession = useCallback((target = {}) => {
     const targetWorkspaceId = String(target.workspaceId || workspace?.id || "").trim();
@@ -11415,6 +11445,54 @@ function WorkspaceTerminal({
             && !isDisposed
           ) {
             hasOpenPty = false;
+            // opencode's Bun runtime segfaults mid-session (bun.report panics),
+            // killing the PTY with a crash exit. Resume the same provider
+            // session instead of stranding the pane on the exited overlay.
+            // Only sessions that reached "running" qualify — a launch-time
+            // crash falls through to the overlay so resume failures can never
+            // loop — and a stable run must precede each budget refill.
+            const runningUptimeMs = terminalRunningSinceRef.current > 0
+              ? performance.now() - terminalRunningSinceRef.current
+              : 0;
+            if (runningUptimeMs > 120000) {
+              crashAutoRestartRef.current.attempts = 0;
+            }
+            const crashRestartSessionId = String(
+              capturedProviderSessionId || startupThreadProviderSessionId || "",
+            ).trim();
+            if (
+              terminalAgentKind === "opencode"
+              && event.payload.exitCode !== 0
+              && crashRestartSessionId
+              && runningUptimeMs > 0
+              && !terminalClosingRef.current
+              && crashAutoRestartRef.current.attempts < 3
+            ) {
+              crashAutoRestartRef.current.attempts += 1;
+              logThreadBridgeDiagnostic("frontend.terminal_crash_auto_restart", {
+                agentId: terminalAgentKind,
+                attempt: crashAutoRestartRef.current.attempts,
+                exitCode: event.payload.exitCode ?? null,
+                instanceId: terminalInstanceId,
+                paneId,
+                runningUptimeMs: Math.round(runningUptimeMs),
+                terminalIndex,
+                threadId: terminalThreadIdRef.current || "",
+                workspaceId: workspace?.id || "",
+              });
+              setPaneStage(
+                "starting",
+                "Restarting Terminal",
+                "opencode crashed — resuming the session.",
+              );
+              reloadTerminalWithProviderSession({
+                agentId: terminalAgentKind,
+                providerSessionId: crashRestartSessionId,
+                reason: "opencode_crash_auto_restart",
+                threadId: terminalThreadIdRef.current || "",
+              });
+              return;
+            }
             setPaneStage(
               "exited",
               "Terminal Exited",
@@ -16709,7 +16787,7 @@ function WorkspaceTerminal({
       onPointerDownCapture={handleTerminalSurfacePointerDownCapture}
       ref={surfaceRef}
     >
-      <TerminalRestartPill data-terminal-control="true">
+      <TerminalRestartPill data-terminal-control="true" data-terminal-rail-pill="true">
         <TerminalRailIdentity data-docked={terminalChromeDocked ? "true" : undefined}>
           {terminalDragHandleVisible && (
             <TerminalRestartButton
@@ -16903,13 +16981,13 @@ function WorkspaceTerminal({
               aria-haspopup="menu"
               aria-label={threadsViewActive ? "Start new session" : "Restart terminal"}
               disabled={terminalClosed || terminalClosing}
-              onClick={() => setRestartRoleMenuOpen((isOpen) => !isOpen)}
+              onClick={toggleRestartRoleMenu}
               title={threadsViewActive ? "Start a new session in this terminal" : "Restart terminal or choose runtime"}
               type="button"
             >
               <ButtonRefreshIcon aria-hidden="true" />
             </TerminalRestartButton>
-              <TerminalRestartDropdown data-open={restartRoleMenuOpen ? "true" : "false"} role="menu">
+              <TerminalRestartDropdown data-align={restartMenuAlign} data-open={restartRoleMenuOpen ? "true" : "false"} role="menu">
                 {restartRoleOptions.map((option) => {
                   const optionSelected = option.id === restartMenuAgentKind;
                   return (

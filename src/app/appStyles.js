@@ -20157,6 +20157,11 @@ export const TerminalRestartDropdown = styled.div`
     box-shadow: none;
   }
 
+  &[data-align="left"] {
+    right: auto;
+    left: 0;
+  }
+
   &[data-open="false"] {
     display: none;
   }
