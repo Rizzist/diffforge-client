@@ -15371,8 +15371,11 @@ export const AudioWidgetShell = styled.main`
   }
 
   /* Error frame: the window grew upward to fit the error card, so the pill
-     pins to the bottom 64px and keeps its shape. */
-  &[data-error-frame="true"] {
+     pins to the bottom 64px and keeps its shape. The live-transcript frame
+     uses the same mechanics — without this pin the bubble surface stretches
+     over the transcript headroom and renders double height. */
+  &[data-error-frame="true"],
+  &[data-transcript-frame="true"] {
     position: fixed;
     top: auto;
     right: 0;

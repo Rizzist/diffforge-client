@@ -11243,6 +11243,7 @@ export function AudioWidgetWindow() {
         data-dragging={widgetDragging ? "true" : undefined}
         data-error-frame={errorFrameActive ? "true" : undefined}
         data-focus={isFocusedWidget ? "true" : undefined}
+        data-transcript-frame={bubbleTranscriptFrameActive && !widgetDragging ? "true" : undefined}
         data-handoff={isCompactHandoff ? "true" : undefined}
         data-hover={bubbleHover && !widgetDragging ? "true" : undefined}
         data-opening={isOpeningFocus ? "true" : undefined}
