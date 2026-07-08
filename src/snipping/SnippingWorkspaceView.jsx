@@ -42,7 +42,7 @@ export const SNIPPING_PERMISSION_ATTENTION_EVENT = "forge-snipping-permission-at
 export const SNIPPING_CAPTURE_ATTENTION_EVENT = "forge-snipping-capture-attention";
 const SNIPPING_AREA_OVERLAY_STARTED_EVENT = "forge-snipping-area-overlay-started";
 const SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT = "forge-snipping-area-overlay-snapshot";
-const SNIPPING_AREA_CURSOR_DEBUG_LOGGING_ENABLED = true;
+const SNIPPING_AREA_CURSOR_DEBUG_LOGGING_ENABLED = false;
 const SNIPPING_AREA_CURSOR_DEBUG_MOUSE_SAMPLE_MS = 120;
 const SNIPPING_ACTION_FULL = "full-screenshot";
 const SNIPPING_ACTION_AREA = "area-snip";
@@ -1122,8 +1122,25 @@ export function SnippingOverlayWindow() {
     }
   }, []);
 
+  const readVisualStyle = useCallback((element) => {
+    try {
+      if (!element) return null;
+      const style = window.getComputedStyle(element);
+      return {
+        backgroundColor: style.backgroundColor,
+        display: style.display,
+        opacity: style.opacity,
+        pointerEvents: style.pointerEvents,
+        visibility: style.visibility,
+      };
+    } catch {
+      return null;
+    }
+  }, []);
+
   const cursorDebugSnapshot = useCallback((event, extra = {}) => {
     const rootElement = event?.currentTarget || document.getElementById("app");
+    const appElement = document.getElementById("app");
     const rootViewport = currentOverlayViewport(rootElement || overlayRootRef.current);
     const pointer = event ? {
       type: event.type,
@@ -1151,7 +1168,13 @@ export function SnippingOverlayWindow() {
         target: readCursorStyle(rootElement),
         html: readCursorStyle(document.documentElement),
         body: readCursorStyle(document.body),
-        app: readCursorStyle(document.getElementById("app")),
+        app: readCursorStyle(appElement),
+      },
+      cssVisual: {
+        target: readVisualStyle(rootElement),
+        html: readVisualStyle(document.documentElement),
+        body: readVisualStyle(document.body),
+        app: readVisualStyle(appElement),
       },
       viewport: {
         width: window.innerWidth,
@@ -1162,7 +1185,7 @@ export function SnippingOverlayWindow() {
       },
       ...extra,
     };
-  }, [readCursorStyle, windowLabel]);
+  }, [readCursorStyle, readVisualStyle, windowLabel]);
 
   const logCursorDebug = useCallback((phase, fields = {}) => {
     if (!SNIPPING_AREA_CURSOR_DEBUG_LOGGING_ENABLED) return;

@@ -222,8 +222,10 @@ const AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOGGING_ENABLED: bool = false;
 const AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOG_FILE: &str = "audio-widget-bottom-bar.jsonl";
 const AUDIO_WIDGET_BUBBLE_POSITION_DEBUG_LOGGING_ENABLED: bool = false;
 const AUDIO_WIDGET_BUBBLE_POSITION_DEBUG_LOG_FILE: &str = "audio-widget-bubble-position.jsonl";
-const SNIPPING_AREA_CURSOR_DEBUG_LOGGING_ENABLED: bool = false;
-const SNIPPING_AREA_CURSOR_DEBUG_LOG_FILE: &str = "snipping-area-cursor.jsonl";
+const SNIPPING_WINDOWS_DEBUG_LOGGING_ENABLED: bool = false;
+const SNIPPING_WINDOWS_DEBUG_LOG_FILE: &str = "snipping-windows-debug.jsonl";
+const SNIPPING_AREA_CURSOR_DEBUG_LOGGING_ENABLED: bool = SNIPPING_WINDOWS_DEBUG_LOGGING_ENABLED;
+const SNIPPING_AREA_CURSOR_DEBUG_LOG_FILE: &str = SNIPPING_WINDOWS_DEBUG_LOG_FILE;
 const APP_SHUTDOWN_PROGRESS_EVENT: &str = "forge-app-shutdown-progress";
 const APP_SHUTDOWN_TOTAL_STEPS: u8 = 6;
 const DEEP_LINK_NEW_URL_EVENT: &str = "deep-link://new-url";
@@ -10096,7 +10098,10 @@ fn run_app(daemon: bool) {
             snipping_close_snip_strip,
             snipping_set_strip_interaction_guard,
             snipping_float_assigned_path,
+            snipping_windows_debug_log,
             snipping_preview_drag_started,
+            snipping_preview_drag_moved,
+            snipping_preview_drag_released,
             snipping_consume_snip_preview,
             snipping_set_dispatch_targets,
             snipping_dispatch_targets,

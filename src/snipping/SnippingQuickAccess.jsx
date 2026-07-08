@@ -173,6 +173,25 @@ function readForgeSpaceMode() {
   return FORGE_SPACE_MODE_WORKSPACES;
 }
 
+function runtimeLooksWindows() {
+  if (typeof navigator === "undefined") return false;
+  return [
+    navigator.userAgentData?.platform,
+    navigator.platform,
+    navigator.userAgent,
+  ].filter(Boolean).join(" ").toLowerCase().includes("win");
+}
+
+const SNIPPING_WINDOWS_DEBUG_LOGGING_ENABLED = false;
+
+function logWindowsSnippingDebug(windowsRuntime, phase, details = {}) {
+  if (!SNIPPING_WINDOWS_DEBUG_LOGGING_ENABLED || !windowsRuntime) return;
+  invoke("snipping_windows_debug_log", {
+    details,
+    phase,
+  }).catch(() => {});
+}
+
 function applyForgeSpaceDataset(spaceMode = readForgeSpaceMode()) {
   if (typeof document === "undefined") {
     return normalizeForgeSpaceMode(spaceMode);
@@ -1318,9 +1337,11 @@ export function SnippingFloatWindow() {
   const localPathRef = useRef(initialPath);
   const closingRef = useRef(false);
   const isVideo = useMemo(() => assetIsVideoPath(localPath), [localPath]);
+  const windowsRuntime = useMemo(() => runtimeLooksWindows(), []);
   const videoRef = useRef(null);
   const [videoPlaying, setVideoPlaying] = useState(false);
   const { previewUrl: filePreviewUrl, onImageError } = useStripTilePreviewUrl(localPath, imageVersion, {
+    assetFallback: true,
     readDataUrl: !isVideo,
   });
   const previewUrl = useMemo(() => {
@@ -1338,10 +1359,51 @@ export function SnippingFloatWindow() {
   const [hoverArmed, setHoverArmed] = useState(false);
   const [syntheticHoverKey, setSyntheticHoverKey] = useState("");
   const rootRef = useRef(null);
+  const floatDragRef = useRef(null);
   const syntheticHoverFrameRef = useRef(0);
   const statusTimerRef = useRef(0);
 
   useFloatingWindowBody("float");
+
+  useEffect(() => {
+    const label = getCurrentWindow().label;
+    logWindowsSnippingDebug(windowsRuntime, "webview.float_mounted", {
+      href: window.location.href,
+      initialPath,
+      label,
+      localPath: localPathRef.current,
+      windowsRuntime,
+    });
+    return () => {
+      logWindowsSnippingDebug(windowsRuntime, "webview.float_unmounted", {
+        label,
+        localPath: localPathRef.current,
+      });
+    };
+  }, [initialPath, windowsRuntime]);
+
+  useEffect(() => {
+    let previewUrlKind = "none";
+    if (previewUrl) {
+      if (previewUrl.startsWith("data:")) previewUrlKind = "data";
+      else if (previewUrl.startsWith("asset:")) previewUrlKind = "asset";
+      else if (previewUrl.startsWith("blob:")) previewUrlKind = "blob";
+      else if (previewUrl.startsWith("file:")) previewUrlKind = "file";
+      else previewUrlKind = "url";
+    }
+    logWindowsSnippingDebug(windowsRuntime, "webview.float_preview_state", {
+      closing,
+      filePreviewReady: !!filePreviewUrl,
+      hasLiveFrame: !!liveFrameUrl,
+      hasPreviewUrl: !!previewUrl,
+      isVideo,
+      label: getCurrentWindow().label,
+      localPath,
+      name,
+      previewUrlKind,
+      previewUrlLength: previewUrl ? previewUrl.length : 0,
+    });
+  }, [closing, filePreviewUrl, isVideo, liveFrameUrl, localPath, name, previewUrl, windowsRuntime]);
 
   useEffect(() => {
     busyRef.current = busy;
@@ -1360,6 +1422,30 @@ export function SnippingFloatWindow() {
     setLiveFrameUrl("");
     setStatus("");
   }, []);
+
+  const adoptAssignedPath = useCallback((path) => {
+    const nextPath = text(path);
+    if (!nextPath) return;
+    logWindowsSnippingDebug(windowsRuntime, "webview.float_adopt_path", {
+      label: getCurrentWindow().label,
+      nextPath,
+      previousPath: localPathRef.current,
+    });
+    closingRef.current = false;
+    setClosing(false);
+    setBusy(false);
+    setStatus("");
+    setHoverArmed(false);
+    if (syntheticHoverFrameRef.current) {
+      window.cancelAnimationFrame(syntheticHoverFrameRef.current);
+      syntheticHoverFrameRef.current = 0;
+    }
+    setSyntheticHoverKey("");
+    localPathRef.current = nextPath;
+    setLocalPath(nextPath);
+    setImageVersion((version) => version + 1);
+    setLiveFrameUrl("");
+  }, [windowsRuntime]);
 
   useEffect(() => {
     closingRef.current = closing;
@@ -1400,20 +1486,7 @@ export function SnippingFloatWindow() {
     const ownLabel = getCurrentWindow().label;
     const adopt = (path) => {
       if (disposed || !path) return;
-      closingRef.current = false;
-      setClosing(false);
-      setBusy(false);
-      setStatus("");
-      setHoverArmed(false);
-      if (syntheticHoverFrameRef.current) {
-        window.cancelAnimationFrame(syntheticHoverFrameRef.current);
-        syntheticHoverFrameRef.current = 0;
-      }
-      setSyntheticHoverKey("");
-      localPathRef.current = path;
-      setLocalPath(path);
-      setImageVersion((version) => version + 1);
-      setLiveFrameUrl("");
+      adoptAssignedPath(path);
     };
 
     listen(SNIPPING_FLOAT_ASSIGN_EVENT, (event) => {
@@ -1440,7 +1513,31 @@ export function SnippingFloatWindow() {
       disposed = true;
       unlisten();
     };
-  }, [initialPath]);
+  }, [adoptAssignedPath, initialPath]);
+
+  useEffect(() => {
+    let disposed = false;
+    const refreshAssignedPath = () => {
+      invoke("snipping_float_assigned_path")
+        .then((result) => {
+          if (disposed) return;
+          const assignedPath = text(result?.path);
+          if (!assignedPath) return;
+          if (assignedPath !== localPathRef.current) {
+            adoptAssignedPath(assignedPath);
+          }
+        })
+        .catch(() => {});
+    };
+    refreshAssignedPath();
+    const retryTimer = window.setTimeout(refreshAssignedPath, 80);
+    const interval = window.setInterval(refreshAssignedPath, 650);
+    return () => {
+      disposed = true;
+      window.clearTimeout(retryTimer);
+      window.clearInterval(interval);
+    };
+  }, [adoptAssignedPath]);
 
   const updateSyntheticHoverFromPoint = useCallback((clientX, clientY) => {
     const x = Number(clientX);
@@ -1650,8 +1747,23 @@ export function SnippingFloatWindow() {
   }, [closeFloat, localPath]);
 
   const runAction = useCallback(async (action) => {
-    if (!localPath || busyRef.current || closingRef.current) return;
+    const label = getCurrentWindow().label;
+    if (!localPath || busyRef.current || closingRef.current) {
+      logWindowsSnippingDebug(windowsRuntime, "webview.float_action_ignored", {
+        action,
+        busy: busyRef.current,
+        closing: closingRef.current,
+        hasLocalPath: !!localPath,
+        label,
+      });
+      return;
+    }
     const actionPath = localPath;
+    logWindowsSnippingDebug(windowsRuntime, "webview.float_action_start", {
+      action,
+      label,
+      localPath: actionPath,
+    });
     if (action === "delete") {
       beginClosing();
     }
@@ -1680,13 +1792,29 @@ export function SnippingFloatWindow() {
       } else if (action === "deleteCloud") {
         await deleteCloudUpload();
       }
+      logWindowsSnippingDebug(windowsRuntime, "webview.float_action_ok", {
+        action,
+        label,
+        localPath: actionPath,
+      });
     } catch (error) {
+      logWindowsSnippingDebug(windowsRuntime, "webview.float_action_error", {
+        action,
+        error: error?.message || String(error || "unknown"),
+        label,
+        localPath: actionPath,
+      });
       if (action === "delete") {
         closingRef.current = false;
         setClosing(false);
       }
       showStatus(error?.message || String(error || "Action failed"));
     } finally {
+      logWindowsSnippingDebug(windowsRuntime, "webview.float_action_finish", {
+        action,
+        label,
+        localPath: actionPath,
+      });
       if (action !== "delete") {
         setBusy(false);
       }
@@ -1703,6 +1831,7 @@ export function SnippingFloatWindow() {
     showStatus,
     uploadState,
     uploadToCloud,
+    windowsRuntime,
   ]);
 
   const toggleVideoPlayback = useCallback(async () => {
@@ -1721,12 +1850,144 @@ export function SnippingFloatWindow() {
     }
   }, [showStatus]);
 
+  const pointFromPointerEvent = useCallback((event) => {
+    if (!event) return null;
+    const screenX = Number(event.screenX);
+    const screenY = Number(event.screenY);
+    if (!Number.isFinite(screenX) || !Number.isFinite(screenY)) return null;
+    return { screenX, screenY };
+  }, []);
+
+  const releaseWindowsFloatDrag = useCallback((drag) => {
+    const label = text(drag?.label);
+    if (!label) return;
+    logWindowsSnippingDebug(windowsRuntime, "webview.float_drag_release_send", {
+      label,
+      lastPointer: drag?.lastPointer || null,
+      releasePending: drag?.releasePending === true,
+      started: drag?.started === true,
+    });
+    invoke("snipping_preview_drag_released", { label }).catch(() => {});
+  }, [windowsRuntime]);
+
+  const moveWindowsFloatDrag = useCallback((drag, point, force = false) => {
+    if (!windowsRuntime || !drag || !drag.started) return;
+    const label = text(drag.label);
+    const nextPoint = point || drag.lastPointer;
+    if (!label || !nextPoint) return;
+    const now = performance.now();
+    if (!force && now - (Number(drag.lastMoveSentAt) || 0) < 12) return;
+    drag.lastMoveSentAt = now;
+    if (force || now - (Number(drag.lastDebugSentAt) || 0) > 250) {
+      drag.lastDebugSentAt = now;
+      logWindowsSnippingDebug(windowsRuntime, "webview.float_drag_move_send", {
+        force,
+        label,
+        point: nextPoint,
+      });
+    }
+    invoke("snipping_preview_drag_moved", {
+      label,
+      screenX: Number.isFinite(nextPoint.screenX) ? nextPoint.screenX : null,
+      screenY: Number.isFinite(nextPoint.screenY) ? nextPoint.screenY : null,
+    }).catch(() => {});
+  }, [windowsRuntime]);
+
+  const finishWindowsFloatDrag = useCallback((event) => {
+    const drag = floatDragRef.current;
+    if (!drag) return;
+    if (
+      event?.pointerId !== undefined
+      && drag.pointerId !== undefined
+      && event.pointerId !== drag.pointerId
+    ) {
+      logWindowsSnippingDebug(windowsRuntime, "webview.float_drag_finish_ignored", {
+        activePointerId: drag.pointerId,
+        eventPointerId: event.pointerId,
+        label: drag.label,
+        reason: "pointer_mismatch",
+      });
+      return;
+    }
+    const point = pointFromPointerEvent(event);
+    logWindowsSnippingDebug(windowsRuntime, "webview.float_drag_finish", {
+      eventType: text(event?.type),
+      label: drag.label,
+      point,
+      started: drag.started === true,
+    });
+    if (point) {
+      drag.lastPointer = point;
+      moveWindowsFloatDrag(drag, point, true);
+    }
+    drag.releasePending = true;
+    if (drag.started) {
+      releaseWindowsFloatDrag(drag);
+    }
+    try {
+      drag.target?.releasePointerCapture?.(drag.pointerId);
+    } catch (_) {
+      // Pointer capture can already be gone after a native-level handoff.
+    }
+    floatDragRef.current = null;
+    event?.preventDefault?.();
+  }, [moveWindowsFloatDrag, pointFromPointerEvent, releaseWindowsFloatDrag, windowsRuntime]);
+
+  const updateWindowsFloatDrag = useCallback((event) => {
+    const drag = floatDragRef.current;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    const point = pointFromPointerEvent(event);
+    if (!point) return;
+    drag.lastPointer = point;
+    moveWindowsFloatDrag(drag, point);
+    event.preventDefault();
+  }, [moveWindowsFloatDrag, pointFromPointerEvent]);
+
+  useEffect(() => {
+    if (!windowsRuntime) return undefined;
+    const cancelActiveDrag = () => finishWindowsFloatDrag();
+    document.addEventListener("pointermove", updateWindowsFloatDrag, true);
+    document.addEventListener("pointerup", finishWindowsFloatDrag, true);
+    document.addEventListener("pointercancel", finishWindowsFloatDrag, true);
+    window.addEventListener("blur", cancelActiveDrag, true);
+    return () => {
+      document.removeEventListener("pointermove", updateWindowsFloatDrag, true);
+      document.removeEventListener("pointerup", finishWindowsFloatDrag, true);
+      document.removeEventListener("pointercancel", finishWindowsFloatDrag, true);
+      window.removeEventListener("blur", cancelActiveDrag, true);
+    };
+  }, [finishWindowsFloatDrag, updateWindowsFloatDrag, windowsRuntime]);
+
+  useEffect(() => () => {
+    const drag = floatDragRef.current;
+    if (drag) {
+      drag.releasePending = true;
+      if (drag.started) {
+        releaseWindowsFloatDrag(drag);
+      }
+      floatDragRef.current = null;
+    }
+  }, [releaseWindowsFloatDrag]);
+
   // Manual double-press detection: the native window drag begins on the
   // first press, so a synthetic dblclick event is not reliable here.
   const lastPressAtRef = useRef(0);
   const beginDrag = useCallback((event) => {
-    if (closing) return;
-    if (event.button !== 0 || event.target.closest("button, video")) return;
+    if (closing) {
+      logWindowsSnippingDebug(windowsRuntime, "webview.float_drag_down_ignored", {
+        reason: "closing",
+      });
+      return;
+    }
+    const blockedTarget = event.target.closest("button, video");
+    if (event.button !== 0 || blockedTarget) {
+      logWindowsSnippingDebug(windowsRuntime, "webview.float_drag_down_ignored", {
+        button: event.button,
+        reason: event.button !== 0 ? "non_primary_button" : "interactive_target",
+        targetTag: text(event.target?.tagName),
+      });
+      return;
+    }
     // Stop WebKit from starting a selection highlight while the native
     // window drag takes over.
     event.preventDefault();
@@ -1734,17 +1995,111 @@ export function SnippingFloatWindow() {
     const now = Date.now();
     if (now - lastPressAtRef.current < 360) {
       lastPressAtRef.current = 0;
+      logWindowsSnippingDebug(windowsRuntime, "webview.float_drag_double_press_edit", {
+        pointerId: event.pointerId,
+      });
       void runAction("edit");
       return;
     }
     lastPressAtRef.current = now;
     // Rust tracks the drag so releasing this preview over a drop target in
     // the main window (todo card, terminal pane) can consume it.
+    const bounds = event.currentTarget?.getBoundingClientRect?.();
+    const width = Number(bounds?.width) || 0;
+    const height = Number(bounds?.height) || 0;
+    const grabOffsetX = width > 0 ? event.clientX - bounds.left : null;
+    const grabOffsetY = height > 0 ? event.clientY - bounds.top : null;
+    const windowHandle = getCurrentWindow();
+    logWindowsSnippingDebug(windowsRuntime, "webview.float_drag_down", {
+      bounds: { height, width },
+      clientX: event.clientX,
+      clientY: event.clientY,
+      grabOffsetX,
+      grabOffsetY,
+      label: windowHandle.label,
+      pointerId: event.pointerId,
+      screenX: event.screenX,
+      screenY: event.screenY,
+      type: text(event.type),
+    });
+    if (windowsRuntime) {
+      const drag = {
+        label: windowHandle.label,
+        lastDebugSentAt: 0,
+        lastMoveSentAt: 0,
+        lastPointer: pointFromPointerEvent(event),
+        pointerId: event.pointerId,
+        releasePending: false,
+        started: false,
+        target: event.currentTarget,
+      };
+      floatDragRef.current = drag;
+      try {
+        event.currentTarget?.setPointerCapture?.(event.pointerId);
+        logWindowsSnippingDebug(windowsRuntime, "webview.float_drag_pointer_capture_set", {
+          label: windowHandle.label,
+          pointerId: event.pointerId,
+        });
+      } catch (_) {
+        // Document-level listeners below still receive WebView2's stream.
+        logWindowsSnippingDebug(windowsRuntime, "webview.float_drag_pointer_capture_failed", {
+          label: windowHandle.label,
+          pointerId: event.pointerId,
+        });
+      }
+      logWindowsSnippingDebug(windowsRuntime, "webview.float_drag_start_send", {
+        grabOffsetX,
+        grabOffsetY,
+        height,
+        label: windowHandle.label,
+        width,
+      });
+      invoke("snipping_preview_drag_started", {
+        grabOffsetX,
+        grabOffsetY,
+        height,
+        label: windowHandle.label,
+        width,
+      })
+        .then(() => {
+          drag.started = true;
+          logWindowsSnippingDebug(windowsRuntime, "webview.float_drag_start_ok", {
+            label: drag.label,
+            lastPointer: drag.lastPointer,
+            releasePending: drag.releasePending === true,
+          });
+          moveWindowsFloatDrag(drag, drag.lastPointer, true);
+          if (drag.releasePending) {
+            releaseWindowsFloatDrag(drag);
+          }
+        })
+        .catch((error) => {
+          logWindowsSnippingDebug(windowsRuntime, "webview.float_drag_start_error", {
+            error: error?.message || String(error || "unknown"),
+            label: drag.label,
+          });
+          if (floatDragRef.current === drag) {
+            floatDragRef.current = null;
+          }
+        });
+      return;
+    }
     invoke("snipping_preview_drag_started", {
-      label: getCurrentWindow().label,
+      grabOffsetX,
+      grabOffsetY,
+      height,
+      label: windowHandle.label,
+      width,
     }).catch(() => {});
-    getCurrentWindow().startDragging().catch(() => {});
-  }, [closing, runAction]);
+    windowHandle.startDragging().catch(() => {});
+  }, [
+    closing,
+    moveWindowsFloatDrag,
+    pointFromPointerEvent,
+    releaseWindowsFloatDrag,
+    runAction,
+    windowsRuntime,
+  ]);
 
   useEffect(() => {
     const onKeyDown = (event) => {
@@ -1756,6 +2111,39 @@ export function SnippingFloatWindow() {
     window.addEventListener("keydown", onKeyDown, true);
     return () => window.removeEventListener("keydown", onKeyDown, true);
   }, [closeFloat]);
+
+  const handlePreviewImageError = useCallback((event) => {
+    const currentSrc = text(event?.currentTarget?.currentSrc || event?.currentTarget?.src);
+    logWindowsSnippingDebug(windowsRuntime, "webview.float_preview_image_error", {
+      currentSrcKind: currentSrc.startsWith("data:")
+        ? "data"
+        : currentSrc.startsWith("asset:")
+          ? "asset"
+          : currentSrc.startsWith("blob:")
+            ? "blob"
+            : currentSrc.startsWith("file:")
+              ? "file"
+              : currentSrc
+                ? "url"
+                : "none",
+      currentSrcLength: currentSrc.length,
+      label: getCurrentWindow().label,
+      localPath,
+      name,
+      previewUrlLength: previewUrl ? previewUrl.length : 0,
+    });
+    onImageError(event);
+  }, [localPath, name, onImageError, previewUrl, windowsRuntime]);
+
+  const handlePreviewImageLoad = useCallback((event) => {
+    logWindowsSnippingDebug(windowsRuntime, "webview.float_preview_image_load", {
+      label: getCurrentWindow().label,
+      localPath,
+      name,
+      naturalHeight: event?.currentTarget?.naturalHeight || 0,
+      naturalWidth: event?.currentTarget?.naturalWidth || 0,
+    });
+  }, [localPath, name, windowsRuntime]);
 
   return (
     <>
@@ -1774,7 +2162,8 @@ export function SnippingFloatWindow() {
         }}
         onMouseMove={updateSyntheticHoverFromMouseEvent}
         onDoubleClick={() => runAction("edit")}
-        onMouseDown={beginDrag}
+        onMouseDown={windowsRuntime ? undefined : beginDrag}
+        onPointerDown={windowsRuntime ? beginDrag : undefined}
         ref={rootRef}
         title={`${name} — drag anywhere, double-click to annotate`}
       >
@@ -1791,7 +2180,13 @@ export function SnippingFloatWindow() {
               src={previewUrl}
             />
           ) : (
-            <img alt={name} draggable={false} onError={onImageError} src={previewUrl} />
+            <img
+              alt={name}
+              draggable={false}
+              onError={handlePreviewImageError}
+              onLoad={handlePreviewImageLoad}
+              src={previewUrl}
+            />
           )
         ) : (
           <span data-empty="true">Preview unavailable</span>
@@ -2481,6 +2876,7 @@ function StripSnipTile({
   const name = useMemo(() => assetName(item), [item]);
   const imageVersion = useMemo(() => Number(item?.modifiedMs || item?.modified_ms || 0) || 0, [item]);
   const isVideo = useMemo(() => assetIsVideoPath(localPath), [localPath]);
+  const windowsRuntime = useMemo(() => runtimeLooksWindows(), []);
   const {
     loading: thumbnailLoading,
     previewUrl,
@@ -2557,7 +2953,21 @@ function StripSnipTile({
   }, [busy, item, localPath, onOpened, showStatus, stripOrigin]);
 
   const runAction = useCallback(async (action) => {
-    if (!localPath || busy) return;
+    const label = getCurrentWindow().label;
+    if (!localPath || busy) {
+      logWindowsSnippingDebug(windowsRuntime, "webview.strip_action_ignored", {
+        action,
+        busy,
+        hasLocalPath: !!localPath,
+        label,
+      });
+      return;
+    }
+    logWindowsSnippingDebug(windowsRuntime, "webview.strip_action_start", {
+      action,
+      label,
+      localPath,
+    });
     setBusy(true);
     try {
       if (action === "copy") {
@@ -2583,9 +2993,25 @@ function StripSnipTile({
       } else if (action === "deleteCloud") {
         await deleteCloudUpload();
       }
+      logWindowsSnippingDebug(windowsRuntime, "webview.strip_action_ok", {
+        action,
+        label,
+        localPath,
+      });
     } catch (error) {
+      logWindowsSnippingDebug(windowsRuntime, "webview.strip_action_error", {
+        action,
+        error: error?.message || String(error || "unknown"),
+        label,
+        localPath,
+      });
       showStatus(error?.message || String(error || "Action failed"));
     } finally {
+      logWindowsSnippingDebug(windowsRuntime, "webview.strip_action_finish", {
+        action,
+        label,
+        localPath,
+      });
       if (mountedRef.current) setBusy(false);
     }
   }, [
@@ -2601,12 +3027,67 @@ function StripSnipTile({
     showStatus,
     uploadState,
     uploadToCloud,
+    windowsRuntime,
   ]);
+
+  const rememberDragPointer = useCallback((drag, event) => {
+    if (!drag || !event) return null;
+    const point = {
+      screenX: Number(event.screenX),
+      screenY: Number(event.screenY),
+    };
+    drag.lastPointer = point;
+    return point;
+  }, []);
+
+  const moveDragOutPreview = useCallback((drag, point, force = false) => {
+    if (!windowsRuntime || !drag || drag.mode !== "drag-out") return;
+    const label = text(drag.floatLabel);
+    if (!label || !point) return;
+    const now = performance.now();
+    if (!force && now - (Number(drag.lastMoveSentAt) || 0) < 12) return;
+    drag.lastMoveSentAt = now;
+    if (force || now - (Number(drag.lastDebugSentAt) || 0) > 250) {
+      drag.lastDebugSentAt = now;
+      logWindowsSnippingDebug(windowsRuntime, "webview.strip_drag_out_move_send", {
+        force,
+        label,
+        point,
+      });
+    }
+    invoke("snipping_preview_drag_moved", {
+      label,
+      screenX: Number.isFinite(point.screenX) ? point.screenX : null,
+      screenY: Number.isFinite(point.screenY) ? point.screenY : null,
+    }).catch(() => {});
+  }, [windowsRuntime]);
+
+  const finishDragOutPreview = useCallback((drag) => {
+    const label = text(drag?.floatLabel);
+    if (!label) return;
+    logWindowsSnippingDebug(windowsRuntime, "webview.strip_drag_out_release_send", {
+      label,
+      lastPointer: drag?.lastPointer || null,
+      released: drag?.released === true,
+    });
+    invoke("snipping_preview_drag_released", { label }).catch(() => {});
+  }, [windowsRuntime]);
 
   const clearDrag = useCallback((event) => {
     const drag = dragRef.current;
     if (drag?.mode === "reorder") {
       onReorderEnd?.(localPath);
+    } else if (drag?.mode === "drag-out") {
+      drag.released = true;
+      rememberDragPointer(drag, event);
+      logWindowsSnippingDebug(windowsRuntime, "webview.strip_drag_out_clear", {
+        eventType: text(event?.type),
+        label: drag.floatLabel || "",
+        point: drag.lastPointer || null,
+        pointerId: drag.pointerId,
+      });
+      moveDragOutPreview(drag, drag.lastPointer, true);
+      finishDragOutPreview(drag);
     }
     if (drag && event?.currentTarget) {
       try {
@@ -2618,15 +3099,54 @@ function StripSnipTile({
     dragRef.current = null;
     onDragActivityChange?.(false);
     if (mountedRef.current) setPanning(false);
-  }, [localPath, onDragActivityChange, onReorderEnd]);
+  }, [
+    finishDragOutPreview,
+    localPath,
+    moveDragOutPreview,
+    onDragActivityChange,
+    onReorderEnd,
+    rememberDragPointer,
+  ]);
 
   const startDrag = useCallback((event) => {
-    if (!localPath || busy || event.button !== 0 || event.target.closest("button")) return;
+    if (!localPath || busy || event.button !== 0 || event.target.closest("button")) {
+      logWindowsSnippingDebug(windowsRuntime, "webview.strip_drag_down_ignored", {
+        busy,
+        button: event.button,
+        hasLocalPath: !!localPath,
+        reason: !localPath
+          ? "missing_path"
+          : busy
+            ? "busy"
+            : event.button !== 0
+              ? "non_primary_button"
+              : "interactive_target",
+        targetTag: text(event.target?.tagName),
+      });
+      return;
+    }
     const rail = railRef?.current;
     const railRect = rail?.getBoundingClientRect();
     const rect = event.currentTarget.getBoundingClientRect();
     event.preventDefault();
-    event.currentTarget.setPointerCapture?.(event.pointerId);
+    logWindowsSnippingDebug(windowsRuntime, "webview.strip_drag_capture_attempt", {
+      localPath,
+      pointerId: event.pointerId,
+      targetTag: text(event.currentTarget?.tagName),
+    });
+    try {
+      event.currentTarget.setPointerCapture?.(event.pointerId);
+      logWindowsSnippingDebug(windowsRuntime, "webview.strip_drag_capture_set", {
+        localPath,
+        pointerId: event.pointerId,
+      });
+    } catch (error) {
+      logWindowsSnippingDebug(windowsRuntime, "webview.strip_drag_capture_error", {
+        error: error?.message || String(error || "unknown"),
+        localPath,
+        pointerId: event.pointerId,
+      });
+    }
     dragRef.current = {
       pointerId: event.pointerId,
       grabOffsetX: event.clientX - rect.left,
@@ -2637,12 +3157,31 @@ function StripSnipTile({
       railTop: railRect?.top ?? 0,
       mode: "pending",
     };
+    logWindowsSnippingDebug(windowsRuntime, "webview.strip_drag_down", {
+      grabOffsetX: event.clientX - rect.left,
+      grabOffsetY: event.clientY - rect.top,
+      localPath,
+      pointerId: event.pointerId,
+      railBottom: railRect?.bottom ?? 0,
+      railTop: railRect?.top ?? 0,
+      screenX: event.screenX,
+      screenY: event.screenY,
+      tileHeight: rect.height,
+      tileWidth: rect.width,
+    });
     onDragActivityChange?.(true);
-  }, [busy, localPath, onDragActivityChange, railRef]);
+  }, [busy, localPath, onDragActivityChange, railRef, windowsRuntime]);
 
   const continueDrag = useCallback((event) => {
     const drag = dragRef.current;
-    if (!drag || drag.pointerId !== event.pointerId || drag.mode === "drag-out" || busy) return;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    if (drag.mode === "drag-out") {
+      const point = rememberDragPointer(drag, event);
+      moveDragOutPreview(drag, point);
+      event.preventDefault();
+      return;
+    }
+    if (busy) return;
     const rail = railRef?.current;
     const dx = event.clientX - drag.startX;
     const dy = event.clientY - drag.startY;
@@ -2678,6 +3217,13 @@ function StripSnipTile({
 
     if (horizontalIntent && !outsideRailY) {
       drag.mode = "reorder";
+      logWindowsSnippingDebug(windowsRuntime, "webview.strip_drag_reorder_start", {
+        absX,
+        absY,
+        distance,
+        localPath,
+        pointerId: event.pointerId,
+      });
       onReorderStart?.(localPath, event.clientX);
       nudgeStripRailForClientX(rail, event.clientX);
       onReorderMove?.(localPath, event.clientX);
@@ -2688,10 +3234,32 @@ function StripSnipTile({
     if (!verticalIntent && !outsideRailY) return;
 
     drag.mode = "drag-out";
+    drag.floatLabel = "";
+    drag.lastDebugSentAt = 0;
+    drag.openFailed = false;
+    drag.released = false;
+    drag.lastMoveSentAt = 0;
+    rememberDragPointer(drag, event);
+    logWindowsSnippingDebug(windowsRuntime, "webview.strip_drag_out_start", {
+      absX,
+      absY,
+      distance,
+      grabOffsetX: drag.grabOffsetX,
+      grabOffsetY: drag.grabOffsetY,
+      localPath,
+      point: drag.lastPointer,
+      pointerId: event.pointerId,
+    });
     onReorderEnd?.(localPath);
     setPanning(false);
     setBusy(true);
     setLaunching(true);
+    logWindowsSnippingDebug(windowsRuntime, "webview.strip_drag_out_open_send", {
+      localPath,
+      pointerId: event.pointerId,
+      x: event.screenX - Math.max(0, Math.min(STRIP_TILE_WIDTH_PX, drag.grabOffsetX)),
+      y: event.screenY - Math.max(0, Math.min(STRIP_TILE_HEIGHT_PX, drag.grabOffsetY)),
+    });
     invoke("snipping_open_snip_float_for_drag", {
       grabOffsetX: Math.max(0, Math.min(STRIP_TILE_WIDTH_PX, drag.grabOffsetX)),
       grabOffsetY: Math.max(0, Math.min(STRIP_TILE_HEIGHT_PX, drag.grabOffsetY)),
@@ -2704,6 +3272,19 @@ function StripSnipTile({
     })
       .then((result) => {
         const openedPath = text(result?.path || result?.localPath || result?.local_path, localPath);
+        drag.floatLabel = text(result?.label);
+        logWindowsSnippingDebug(windowsRuntime, "webview.strip_drag_out_open_ok", {
+          dragStarted: result?.dragStarted === true,
+          floatLabel: drag.floatLabel,
+          openedPath,
+          released: drag.released === true,
+        });
+        if (windowsRuntime && drag.floatLabel) {
+          moveDragOutPreview(drag, drag.lastPointer, true);
+          if (drag.released) {
+            finishDragOutPreview(drag);
+          }
+        }
         onOpened(openedPath, {
           dragStarted: result?.dragStarted === true,
           item,
@@ -2712,12 +3293,23 @@ function StripSnipTile({
         });
       })
       .catch((error) => {
+        drag.openFailed = true;
+        logWindowsSnippingDebug(windowsRuntime, "webview.strip_drag_out_open_error", {
+          error: error?.message || String(error || "unknown"),
+          localPath,
+        });
+        if (dragRef.current === drag) {
+          dragRef.current = null;
+          onDragActivityChange?.(false);
+        }
         if (mountedRef.current) setLaunching(false);
         showStatus(error?.message || String(error || "Unable to drag snip preview."));
       })
       .finally(() => {
-        dragRef.current = null;
-        onDragActivityChange?.(false);
+        if ((drag.openFailed || drag.released) && dragRef.current === drag) {
+          dragRef.current = null;
+          onDragActivityChange?.(false);
+        }
         if (mountedRef.current) setPanning(false);
         if (mountedRef.current) setBusy(false);
       });
@@ -2725,14 +3317,18 @@ function StripSnipTile({
     busy,
     item,
     localPath,
+    finishDragOutPreview,
+    moveDragOutPreview,
     onDragActivityChange,
     onOpened,
     onReorderEnd,
     onReorderMove,
     onReorderStart,
     railRef,
+    rememberDragPointer,
     showStatus,
     stripOrigin,
+    windowsRuntime,
   ]);
 
   if (!localPath) return null;

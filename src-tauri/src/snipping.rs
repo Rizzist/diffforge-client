@@ -289,6 +289,22 @@ fn log_snipping_area_cursor_debug_event(phase: &str, fields: Value) {
     );
 }
 
+#[tauri::command]
+fn snipping_windows_debug_log(phase: String, details: Value) -> Result<Value, String> {
+    log_snipping_area_cursor_debug_event(
+        &phase,
+        json!({
+            "source": "webview",
+            "details": details,
+        }),
+    );
+    Ok(json!({
+        "ok": true,
+        "enabled": SNIPPING_AREA_CURSOR_DEBUG_LOGGING_ENABLED,
+        "log_file": snipping_area_cursor_debug_log_path().display().to_string(),
+    }))
+}
+
 fn snipping_area_cursor_debug_should_sample_mouse() -> bool {
     let now = current_time_ms();
     let previous = SNIPPING_AREA_CURSOR_DEBUG_LAST_MOUSE_LOG_MS.load(Ordering::Acquire);
@@ -309,6 +325,35 @@ fn snipping_app_cursor_position_debug_value(app: &AppHandle) -> Value {
             })
         })
         .unwrap_or(Value::Null)
+}
+
+fn snipping_window_debug_value(window: &tauri::WebviewWindow) -> Value {
+    let position = window
+        .outer_position()
+        .map(|position| {
+            json!({
+                "x": position.x,
+                "y": position.y,
+            })
+        })
+        .unwrap_or(Value::Null);
+    let size = window
+        .outer_size()
+        .map(|size| {
+            json!({
+                "width": size.width,
+                "height": size.height,
+            })
+        })
+        .unwrap_or(Value::Null);
+    json!({
+        "label": window.label(),
+        "visible": window.is_visible().unwrap_or(false),
+        "focused": window.is_focused().unwrap_or(false),
+        "scale_factor": window.scale_factor().unwrap_or(1.0),
+        "outer_position": position,
+        "outer_size": size,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -625,6 +670,12 @@ struct SnippingState {
     /// Later resize/hover handoff steps scale this so the cursor stays on the
     /// same image point instead of recentering the window.
     preview_drag_grab_ratios: Arc<StdMutex<HashMap<String, (f64, f64)>>>,
+    /// Windows WebView2 preview creation can complete after the strip has
+    /// already sent drag move/release events. Keep the latest event keyed by
+    /// the scheduled label so the fresh float can catch up as soon as it
+    /// exists.
+    preview_pending_drag_points: Arc<StdMutex<HashMap<String, (Option<f64>, Option<f64>)>>>,
+    preview_pending_drag_releases: Arc<StdMutex<HashSet<String>>>,
     /// Monotonic ticket source for per-preview drag follow watchdogs.
     preview_drag_follow_generation: Arc<AtomicU64>,
     /// Preview window label -> active drag follow watchdog ticket. Replacing the
@@ -692,6 +743,8 @@ impl SnippingState {
             preview_strip_hover_labels: Arc::new(StdMutex::new(HashSet::new())),
             preview_drag_handoff_until_ms: Arc::new(StdMutex::new(HashMap::new())),
             preview_drag_grab_ratios: Arc::new(StdMutex::new(HashMap::new())),
+            preview_pending_drag_points: Arc::new(StdMutex::new(HashMap::new())),
+            preview_pending_drag_releases: Arc::new(StdMutex::new(HashSet::new())),
             preview_drag_follow_generation: Arc::new(AtomicU64::new(0)),
             preview_drag_follow_generations: Arc::new(StdMutex::new(HashMap::new())),
             preview_strip_origins: Arc::new(StdMutex::new(HashMap::new())),
@@ -1901,29 +1954,72 @@ fn register_snipping_shortcut_handler(
     }
     let shortcut = parse_snipping_shortcut(shortcut_text)?;
 
-    app.global_shortcut()
-        .on_shortcut(shortcut, move |app, shortcut, event| {
+    log_snipping_area_cursor_debug_event(
+        "native.shortcut_register_attempt",
+        json!({
+            "action": action.label(),
+            "shortcut": shortcut_text,
+        }),
+    );
+
+    let register_result = app.global_shortcut().on_shortcut(shortcut, move |app, shortcut, event| {
             if event.state != ShortcutState::Pressed {
                 return;
             }
 
             let shortcut_text = shortcut.into_string();
             let app_handle = app.clone();
+            log_snipping_area_cursor_debug_event(
+                "native.shortcut_pressed",
+                json!({
+                    "action": action.label(),
+                    "shortcut": &shortcut_text,
+                    "cursor_position": snipping_app_cursor_position_debug_value(&app_handle),
+                    "area_session_active": snipping_area_session_active(&app_handle),
+                    "begin_in_flight": SNIPPING_AREA_BEGIN_IN_FLIGHT.load(Ordering::Acquire),
+                    "begin_in_flight_age_ms": snipping_area_begin_age_ms(current_time_ms()),
+                }),
+            );
             match action {
                 SnippingShortcutAction::FullScreenshot => {
                     thread::spawn(move || {
+                        log_snipping_area_cursor_debug_event(
+                            "native.shortcut_worker_started",
+                            json!({
+                                "action": "full screenshot",
+                                "shortcut": &shortcut_text,
+                            }),
+                        );
                         let result = snipping_capture_full_for(
                             &app_handle,
                             "shortcut",
                             shortcut_text.clone(),
                         );
-                        if let Err(error) = result {
-                            emit_snipping_hotkey_failure_attention(
-                                &app_handle,
-                                "shortcut",
-                                &shortcut_text,
-                                &error,
-                            );
+                        match result {
+                            Ok(value) => log_snipping_area_cursor_debug_event(
+                                "native.shortcut_worker_ok",
+                                json!({
+                                    "action": "full screenshot",
+                                    "shortcut": &shortcut_text,
+                                    "result": value,
+                                }),
+                            ),
+                            Err(error) => {
+                                log_snipping_area_cursor_debug_event(
+                                    "native.shortcut_worker_error",
+                                    json!({
+                                        "action": "full screenshot",
+                                        "shortcut": &shortcut_text,
+                                        "error": &error,
+                                    }),
+                                );
+                                emit_snipping_hotkey_failure_attention(
+                                    &app_handle,
+                                    "shortcut",
+                                    &shortcut_text,
+                                    &error,
+                                );
+                            }
                         }
                     });
                 }
@@ -1931,41 +2027,115 @@ fn register_snipping_shortcut_handler(
                     // Capture + overlay prep must never block the shortcut
                     // dispatch thread, or the overlay appears with a visible lag.
                     thread::spawn(move || {
+                        log_snipping_area_cursor_debug_event(
+                            "native.shortcut_worker_started",
+                            json!({
+                                "action": "area snip",
+                                "shortcut": &shortcut_text,
+                            }),
+                        );
                         let result = snipping_begin_area_snip_for(
                             &app_handle,
                             "shortcut",
                             shortcut_text.clone(),
                         );
-                        if let Err(error) = result {
-                            emit_snipping_hotkey_failure_attention(
-                                &app_handle,
-                                "shortcut",
-                                &shortcut_text,
-                                &error,
-                            );
+                        match result {
+                            Ok(value) => log_snipping_area_cursor_debug_event(
+                                "native.shortcut_worker_ok",
+                                json!({
+                                    "action": "area snip",
+                                    "shortcut": &shortcut_text,
+                                    "result": value,
+                                }),
+                            ),
+                            Err(error) => {
+                                log_snipping_area_cursor_debug_event(
+                                    "native.shortcut_worker_error",
+                                    json!({
+                                        "action": "area snip",
+                                        "shortcut": &shortcut_text,
+                                        "error": &error,
+                                    }),
+                                );
+                                emit_snipping_hotkey_failure_attention(
+                                    &app_handle,
+                                    "shortcut",
+                                    &shortcut_text,
+                                    &error,
+                                );
+                            }
                         }
                     });
                 }
                 SnippingShortcutAction::AreaRecording => {
                     thread::spawn(move || {
+                        log_snipping_area_cursor_debug_event(
+                            "native.shortcut_worker_started",
+                            json!({
+                                "action": "area recording",
+                                "shortcut": &shortcut_text,
+                            }),
+                        );
                         let result = snipping_toggle_area_recording_shortcut_for(
                             &app_handle,
                             "shortcut",
                             shortcut_text.clone(),
                         );
-                        if let Err(error) = result {
-                            emit_snipping_hotkey_failure_attention(
-                                &app_handle,
-                                "shortcut",
-                                &shortcut_text,
-                                &error,
-                            );
+                        match result {
+                            Ok(value) => log_snipping_area_cursor_debug_event(
+                                "native.shortcut_worker_ok",
+                                json!({
+                                    "action": "area recording",
+                                    "shortcut": &shortcut_text,
+                                    "result": value,
+                                }),
+                            ),
+                            Err(error) => {
+                                log_snipping_area_cursor_debug_event(
+                                    "native.shortcut_worker_error",
+                                    json!({
+                                        "action": "area recording",
+                                        "shortcut": &shortcut_text,
+                                        "error": &error,
+                                    }),
+                                );
+                                emit_snipping_hotkey_failure_attention(
+                                    &app_handle,
+                                    "shortcut",
+                                    &shortcut_text,
+                                    &error,
+                                );
+                            }
                         }
                     });
                 }
             }
-        })
-        .map_err(|error| format!("Unable to register {} shortcut: {error}", action.label()))
+        });
+
+    match register_result {
+        Ok(()) => {
+            log_snipping_area_cursor_debug_event(
+                "native.shortcut_registered",
+                json!({
+                    "action": action.label(),
+                    "shortcut": shortcut_text,
+                }),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            let message = format!("Unable to register {} shortcut: {error}", action.label());
+            log_snipping_area_cursor_debug_event(
+                "native.shortcut_register_error",
+                json!({
+                    "action": action.label(),
+                    "shortcut": shortcut_text,
+                    "error": &message,
+                }),
+            );
+            Err(message)
+        }
+    }
 }
 
 fn unregister_snipping_shortcut(app: &AppHandle, shortcut_text: &str) {
@@ -4142,15 +4312,18 @@ fn snipping_emit_untracked_image_saved_with_toast(
         // start; new captures stack in the bottom-left column. Open it FIRST
         // — the asset item/library payload below scans the asset store, and
         // the preview should not wait on that.
-        let app_for_preview = app.clone();
         let preview_path = target.display().to_string();
-        let _ = app.run_on_main_thread(move || {
-            if let Err(error) =
-                snipping_open_snip_preview_window_for(&app_for_preview, &preview_path, None, false)
-            {
-                eprintln!("Diff Forge snip preview failed to open: {error}");
-            }
-        });
+        log_snipping_area_cursor_debug_event(
+            "native.capture_preview_open_scheduled",
+            json!({
+                "asset_kind": "image",
+                "mode": mode,
+                "path": preview_path.as_str(),
+                "reason": reason,
+                "shortcut": shortcut.as_str(),
+            }),
+        );
+        snipping_schedule_capture_preview_open(app, "image", preview_path);
     }
     let root = diffforge_prepare_untracked_asset_root()?;
     let item = diffforge_untracked_asset_item(&root, target).ok();
@@ -4193,15 +4366,19 @@ fn snipping_emit_untracked_video_saved_with_toast(
     show_toast: bool,
 ) -> Result<Value, String> {
     if show_toast {
-        let app_for_preview = app.clone();
         let preview_path = target.display().to_string();
-        let _ = app.run_on_main_thread(move || {
-            if let Err(error) =
-                snipping_open_snip_preview_window_for(&app_for_preview, &preview_path, None, false)
-            {
-                eprintln!("Diff Forge snip preview failed to open: {error}");
-            }
-        });
+        log_snipping_area_cursor_debug_event(
+            "native.capture_preview_open_scheduled",
+            json!({
+                "asset_kind": "video",
+                "duration_ms": duration_ms,
+                "mode": mode,
+                "path": preview_path.as_str(),
+                "reason": reason,
+                "shortcut": shortcut.as_str(),
+            }),
+        );
+        snipping_schedule_capture_preview_open(app, "video", preview_path);
     }
     let root = diffforge_prepare_untracked_asset_root()?;
     let item = diffforge_untracked_asset_item(&root, target).ok();
@@ -8034,6 +8211,70 @@ fn snipping_url_token(value: &str) -> String {
     general_purpose::URL_SAFE_NO_PAD.encode(value.as_bytes())
 }
 
+const SNIPPING_WINDOWS_CAPTURE_PREVIEW_OPEN_DELAY_MS: u64 = 0;
+
+fn snipping_open_capture_preview_now(app: &AppHandle, asset_kind: &'static str, preview_path: &str) {
+    log_snipping_area_cursor_debug_event(
+        "native.capture_preview_open_begin",
+        json!({
+            "asset_kind": asset_kind,
+            "path": preview_path,
+        }),
+    );
+    match snipping_open_snip_preview_window_for(app, preview_path, None, false) {
+        Ok(result) => log_snipping_area_cursor_debug_event(
+            "native.capture_preview_open_ok",
+            json!({
+                "asset_kind": asset_kind,
+                "path": preview_path,
+                "result": result,
+            }),
+        ),
+        Err(error) => {
+            log_snipping_area_cursor_debug_event(
+                "native.capture_preview_open_error",
+                json!({
+                    "asset_kind": asset_kind,
+                    "error": error.clone(),
+                    "path": preview_path,
+                }),
+            );
+            eprintln!("Diff Forge snip preview failed to open: {error}");
+        }
+    }
+}
+
+fn snipping_schedule_capture_preview_open(
+    app: &AppHandle,
+    asset_kind: &'static str,
+    preview_path: String,
+) {
+    let app_for_preview = app.clone();
+    if cfg!(target_os = "windows") {
+        thread::spawn(move || {
+            if SNIPPING_WINDOWS_CAPTURE_PREVIEW_OPEN_DELAY_MS > 0 {
+                thread::sleep(Duration::from_millis(
+                    SNIPPING_WINDOWS_CAPTURE_PREVIEW_OPEN_DELAY_MS,
+                ));
+            }
+            log_snipping_area_cursor_debug_event(
+                "native.capture_preview_open_deferred_worker",
+                json!({
+                    "asset_kind": asset_kind,
+                    "delay_ms": SNIPPING_WINDOWS_CAPTURE_PREVIEW_OPEN_DELAY_MS,
+                    "path": preview_path.as_str(),
+                    "platform": "windows",
+                }),
+            );
+            snipping_open_capture_preview_now(&app_for_preview, asset_kind, &preview_path);
+        });
+    } else {
+        let _ = app.run_on_main_thread(move || {
+            snipping_open_capture_preview_now(&app_for_preview, asset_kind, &preview_path);
+        });
+    }
+}
+
 fn snipping_window_token(path: &Path) -> String {
     let seed = format!("{}:{}", path.display(), uuid::Uuid::new_v4());
     cloud_mcp_short_hash(&seed)
@@ -8200,7 +8441,18 @@ fn snipping_open_annotation_editor_for_paths(
     let min_inner_height = 560.0;
     inner_width = inner_width.max(min_inner_width);
     inner_height = inner_height.max(min_inner_height);
-    let window = WebviewWindowBuilder::new(
+    log_snipping_area_cursor_debug_event(
+        "native.editor_open_build_begin",
+        json!({
+            "encoded_paths_len": encoded_paths.len(),
+            "height": inner_height,
+            "label": label.as_str(),
+            "path_count": path_values.len(),
+            "paths": path_values.clone(),
+            "width": inner_width,
+        }),
+    );
+    let built = WebviewWindowBuilder::new(
         app,
         label.clone(),
         WebviewUrl::App(format!("index.html#/snipping-editor/{encoded_paths}").into()),
@@ -8226,8 +8478,32 @@ fn snipping_open_annotation_editor_for_paths(
     .background_color(Color(0, 0, 0, 0))
     .visible(false)
     .shadow(true)
-    .build()
-    .map_err(|error| format!("Unable to create annotation editor window: {error}"))?;
+    .build();
+    let window = match built {
+        Ok(window) => {
+            log_snipping_area_cursor_debug_event(
+                "native.editor_open_build_done",
+                json!({
+                    "label": label.as_str(),
+                    "window": snipping_window_debug_value(&window),
+                }),
+            );
+            window
+        }
+        Err(error) => {
+            if let Ok(mut open) = app.state::<SnippingState>().editor_paths.lock() {
+                open.remove(&label);
+            }
+            log_snipping_area_cursor_debug_event(
+                "native.editor_open_build_error",
+                json!({
+                    "error": error.to_string(),
+                    "label": label.as_str(),
+                }),
+            );
+            return Err(format!("Unable to create annotation editor window: {error}"));
+        }
+    };
     snipping_set_window_capture_exclusion(&window, snipping_capture_exclusion_enabled());
     {
         let editor_paths = app.state::<SnippingState>().editor_paths.clone();
@@ -8270,6 +8546,51 @@ fn snipping_open_annotation_editor_for_paths(
         "label": label,
         "paths": path_values,
     }))
+}
+
+fn snipping_open_annotation_editor_for_paths_command(
+    app: &AppHandle,
+    paths: Vec<String>,
+) -> Result<Value, String> {
+    if !cfg!(target_os = "windows") {
+        return snipping_open_annotation_editor_for_paths(app, paths);
+    }
+
+    let app_for_worker = app.clone();
+    let paths_for_worker = paths.clone();
+    thread::spawn(move || {
+        log_snipping_area_cursor_debug_event(
+            "native.editor_open_command_worker_start",
+            json!({
+                "path_count": paths_for_worker.len(),
+                "paths": paths_for_worker.clone(),
+                "platform": "windows",
+            }),
+        );
+        let result = snipping_open_annotation_editor_for_paths(&app_for_worker, paths_for_worker);
+        log_snipping_area_cursor_debug_event(
+            "native.editor_open_command_worker_done",
+            json!({
+                "ok": result.is_ok(),
+                "error": result.as_ref().err().map(String::as_str),
+                "platform": "windows",
+            }),
+        );
+    });
+    let result = json!({
+        "kind": "snipping_floating_asset_window_scheduled",
+        "scheduled": true,
+        "path_count": paths.len(),
+        "paths": paths,
+    });
+    log_snipping_area_cursor_debug_event(
+        "native.editor_open_command_scheduled",
+        json!({
+            "result": result.clone(),
+            "platform": "windows",
+        }),
+    );
+    Ok(result)
 }
 
 fn snipping_upload_untracked_asset_for(
@@ -8488,8 +8809,18 @@ fn ensure_snipping_overlay_window(
     monitor: &SnippingAreaMonitor,
 ) -> Result<tauri::WebviewWindow, String> {
     if let Some(window) = app.get_webview_window(label) {
+        let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
         size_snipping_overlay_window(&window, monitor);
         snipping_set_window_capture_exclusion(&window, snipping_capture_exclusion_enabled());
+        log_snipping_area_cursor_debug_event(
+            "native.overlay_reused",
+            json!({
+                "background_reasserted": true,
+                "monitor": monitor,
+                "overlay_label": label,
+                "window": snipping_window_debug_value(&window),
+            }),
+        );
         return Ok(window);
     }
 
@@ -8533,6 +8864,14 @@ fn ensure_snipping_overlay_window(
         snipping_convert_overlay_window_to_panel(&window);
         snipping_apply_overlay_fullscreen_window_style(&window);
     }
+    log_snipping_area_cursor_debug_event(
+        "native.overlay_created",
+        json!({
+            "monitor": monitor,
+            "overlay_label": label,
+            "window": snipping_window_debug_value(&window),
+        }),
+    );
     Ok(window)
 }
 
@@ -10390,12 +10729,14 @@ fn snipping_hide_area_overlay(app: &AppHandle) {
 }
 
 fn snipping_hide_area_overlay_with_desktop_restore(app: &AppHandle, restore_desktop_icons: bool) {
+    let overlay_windows = snipping_overlay_windows(app);
     log_snipping_area_cursor_debug_event(
         "native.hide_overlay_begin",
         json!({
             "cursor_position": snipping_app_cursor_position_debug_value(app),
-            "overlay_count": snipping_overlay_windows(app).len(),
+            "overlay_count": overlay_windows.len(),
             "context": snipping_area_native_cursor_context_debug_value(),
+            "restore_desktop_icons": restore_desktop_icons,
         }),
     );
     #[cfg(target_os = "macos")]
@@ -10410,10 +10751,19 @@ fn snipping_hide_area_overlay_with_desktop_restore(app: &AppHandle, restore_desk
         snipping_invalidate_current_warm_frames();
     }
     snipping_unregister_escape_cancel(app);
-    for (_, window) in snipping_overlay_windows(app) {
+    for (label, window) in overlay_windows {
+        let before = snipping_window_debug_value(&window);
         #[cfg(target_os = "macos")]
         snipping_restore_area_overlay_cursor_rects(&window);
         snipping_hide_window_now(&window, "hide_area_overlay");
+        log_snipping_area_cursor_debug_event(
+            "native.hide_overlay_window",
+            json!({
+                "after": snipping_window_debug_value(&window),
+                "before": before,
+                "overlay_label": label,
+            }),
+        );
     }
     #[cfg(target_os = "macos")]
     snipping_restore_default_cursor_now();
@@ -10427,6 +10777,7 @@ fn snipping_hide_area_overlay_with_desktop_restore(app: &AppHandle, restore_desk
         json!({
             "cursor_position": snipping_app_cursor_position_debug_value(app),
             "context": snipping_area_native_cursor_context_debug_value(),
+            "restore_desktop_icons": restore_desktop_icons,
         }),
     );
 }
@@ -11071,13 +11422,16 @@ const SNIPPING_STRIP_DRAG_EVENT: &str = "forge-snip-strip-drag";
 const SNIPPING_PREVIEW_DRAG_OVER_THROTTLE_MS: u64 = 16;
 // Anything closer than this to the grab position is a click, not a drop.
 const SNIPPING_PREVIEW_DRAG_MIN_DISTANCE: i32 = 8;
+#[cfg(target_os = "macos")]
 const SNIPPING_PREVIEW_DRAG_FOLLOW_POLL_MS: u64 = 12;
+#[cfg(target_os = "macos")]
 const SNIPPING_PREVIEW_DRAG_FOLLOW_SLACK_LOGICAL_PX: f64 = 24.0;
 const SNIPPING_FLOAT_DISPOSE_EVENT: &str = "forge-snip-float-dispose";
 // One paint turn for the webview to unhook live-preview listeners and clear its
 // image src before the native WebKit window starts teardown.
 const SNIPPING_FLOAT_CLOSE_GRACE_MS: u64 = 45;
 const SNIPPING_FLOAT_CLOSE_RELEASE_WAIT_MS: u64 = 1200;
+static SNIPPING_PREVIEW_POOL_DISABLED_LOGGED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug)]
 struct SnippingPreviewStripOrigin {
@@ -11208,6 +11562,50 @@ fn snipping_preview_drag_offset_for_size(
         .unwrap_or((width * 0.5, height * 0.5))
 }
 
+fn snipping_store_pending_preview_drag_point(
+    app: &AppHandle,
+    label: &str,
+    screen_x: Option<f64>,
+    screen_y: Option<f64>,
+) {
+    if let Ok(mut points) = app
+        .state::<SnippingState>()
+        .preview_pending_drag_points
+        .lock()
+    {
+        points.insert(label.to_string(), (screen_x, screen_y));
+    }
+}
+
+fn snipping_take_pending_preview_drag_point(
+    app: &AppHandle,
+    label: &str,
+) -> Option<(Option<f64>, Option<f64>)> {
+    app.state::<SnippingState>()
+        .preview_pending_drag_points
+        .lock()
+        .ok()
+        .and_then(|mut points| points.remove(label))
+}
+
+fn snipping_store_pending_preview_drag_release(app: &AppHandle, label: &str) {
+    if let Ok(mut releases) = app
+        .state::<SnippingState>()
+        .preview_pending_drag_releases
+        .lock()
+    {
+        releases.insert(label.to_string());
+    }
+}
+
+fn snipping_take_pending_preview_drag_release(app: &AppHandle, label: &str) -> bool {
+    app.state::<SnippingState>()
+        .preview_pending_drag_releases
+        .lock()
+        .map(|mut releases| releases.remove(label))
+        .unwrap_or(false)
+}
+
 fn snipping_preview_closing_labels(app: &AppHandle) -> HashSet<String> {
     app.state::<SnippingState>()
         .preview_closing
@@ -11250,6 +11648,7 @@ fn snipping_clear_preview_drag_follow_generation(app: &AppHandle, label: &str) {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn snipping_preview_drag_follow_generation_is_current(
     app: &AppHandle,
     label: &str,
@@ -11262,6 +11661,7 @@ fn snipping_preview_drag_follow_generation_is_current(
         .unwrap_or(false)
 }
 
+#[cfg(target_os = "macos")]
 fn snipping_finish_preview_drag_follow_generation(app: &AppHandle, label: &str, generation: u64) {
     if let Ok(mut generations) = app
         .state::<SnippingState>()
@@ -11359,6 +11759,12 @@ fn snipping_cleanup_preview_registry(app: &AppHandle, label: &str) {
     if let Ok(mut ratios) = state.preview_drag_grab_ratios.lock() {
         ratios.remove(label);
     }
+    if let Ok(mut points) = state.preview_pending_drag_points.lock() {
+        points.remove(label);
+    }
+    if let Ok(mut releases) = state.preview_pending_drag_releases.lock() {
+        releases.remove(label);
+    }
     snipping_clear_preview_drag_follow_generation(app, label);
     if let Ok(mut origins) = state.preview_strip_origins.lock() {
         origins.remove(label);
@@ -11401,6 +11807,12 @@ fn snipping_begin_preview_close(app: &AppHandle, label: &str) -> bool {
     }
     if let Ok(mut ratios) = state.preview_drag_grab_ratios.lock() {
         ratios.remove(label);
+    }
+    if let Ok(mut points) = state.preview_pending_drag_points.lock() {
+        points.remove(label);
+    }
+    if let Ok(mut releases) = state.preview_pending_drag_releases.lock() {
+        releases.remove(label);
     }
     snipping_clear_preview_drag_follow_generation(app, label);
     if let Ok(mut origins) = state.preview_strip_origins.lock() {
@@ -11445,6 +11857,12 @@ fn snipping_park_preview_window(app: &AppHandle, label: &str, window: &tauri::We
     }
     if let Ok(mut ratios) = state.preview_drag_grab_ratios.lock() {
         ratios.remove(label);
+    }
+    if let Ok(mut points) = state.preview_pending_drag_points.lock() {
+        points.remove(label);
+    }
+    if let Ok(mut releases) = state.preview_pending_drag_releases.lock() {
+        releases.remove(label);
     }
     snipping_clear_preview_drag_follow_generation(app, label);
     state
@@ -12794,10 +13212,25 @@ fn snipping_build_preview_window(
     encoded_path: &str,
     focused: bool,
 ) -> Result<tauri::WebviewWindow, String> {
-    let window = WebviewWindowBuilder::new(
+    let route = if cfg!(target_os = "windows") && !encoded_path.is_empty() {
+        "index.html#/snipping-float/".to_string()
+    } else {
+        format!("index.html#/snipping-float/{encoded_path}")
+    };
+    log_snipping_area_cursor_debug_event(
+        "native.preview_build_window_before_build",
+        json!({
+            "encoded_path_len": encoded_path.len(),
+            "focused": focused,
+            "label": label,
+            "route_has_path": route != "index.html#/snipping-float/",
+            "windows_empty_route": cfg!(target_os = "windows") && !encoded_path.is_empty(),
+        }),
+    );
+    let built = WebviewWindowBuilder::new(
         app,
         label.to_string(),
-        WebviewUrl::App(format!("index.html#/snipping-float/{encoded_path}").into()),
+        WebviewUrl::App(route.into()),
     )
     .title("Snip")
     .inner_size(SNIPPING_FLOAT_LOGICAL_WIDTH, SNIPPING_FLOAT_LOGICAL_HEIGHT)
@@ -12812,8 +13245,29 @@ fn snipping_build_preview_window(
     .background_color(Color(0, 0, 0, 0))
     .visible(false)
     .shadow(true)
-    .build()
-    .map_err(|error| format!("Unable to create snip preview window: {error}"))?;
+    .build();
+    let window = match built {
+        Ok(window) => {
+            log_snipping_area_cursor_debug_event(
+                "native.preview_build_window_after_build",
+                json!({
+                    "label": label,
+                    "window": snipping_window_debug_value(&window),
+                }),
+            );
+            window
+        }
+        Err(error) => {
+            log_snipping_area_cursor_debug_event(
+                "native.preview_build_window_error",
+                json!({
+                    "error": error.to_string(),
+                    "label": label,
+                }),
+            );
+            return Err(format!("Unable to create snip preview window: {error}"));
+        }
+    };
     // The builder's background_color alone does not reliably reach the
     // WebView2 controller on Windows: the float then paints on an opaque
     // white webview backdrop instead of transparency. Re-apply post-build,
@@ -12959,6 +13413,41 @@ fn snipping_preview_cursor_and_scale_for_offset(
     Some((cursor, scale))
 }
 
+fn snipping_preview_logical_drag_point(
+    screen_x: Option<f64>,
+    screen_y: Option<f64>,
+) -> Option<(f64, f64)> {
+    let x = screen_x?;
+    let y = screen_y?;
+    (x.is_finite() && y.is_finite()).then_some((x, y))
+}
+
+fn snipping_preview_scale_for_logical_drag_point(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+    x: f64,
+    y: f64,
+) -> f64 {
+    app.available_monitors()
+        .ok()
+        .and_then(|monitors| {
+            monitors.into_iter().find(|monitor| {
+                let scale = monitor.scale_factor().max(0.1);
+                let position = monitor.position();
+                let size = monitor.size();
+                let left = f64::from(position.x) / scale;
+                let top = f64::from(position.y) / scale;
+                let right = left + f64::from(size.width.max(1)) / scale;
+                let bottom = top + f64::from(size.height.max(1)) / scale;
+                x >= left && x <= right && y >= top && y <= bottom
+            })
+        })
+        .or_else(|| window.current_monitor().ok().flatten())
+        .or_else(|| app.primary_monitor().ok().flatten())
+        .map(|monitor| monitor.scale_factor().max(0.1))
+        .unwrap_or_else(|| window.scale_factor().unwrap_or(1.0).max(0.1))
+}
+
 fn snipping_preview_position_for_cursor_with_offset(
     cursor: tauri::PhysicalPosition<f64>,
     scale: f64,
@@ -12991,6 +13480,7 @@ fn snipping_preview_position_under_cursor_with_offset(
     ))
 }
 
+#[cfg(target_os = "macos")]
 fn snipping_start_preview_drag_follow_watchdog_with_takeover(
     app: &AppHandle,
     label: &str,
@@ -13089,6 +13579,18 @@ fn snipping_start_preview_drag_follow_watchdog_with_takeover(
 /// — the slow part of opening a preview on every platform — happen ahead of
 /// time, off the interaction hot path.
 fn snipping_warm_preview_pool(app: &AppHandle) {
+    if cfg!(target_os = "windows") {
+        if !SNIPPING_PREVIEW_POOL_DISABLED_LOGGED.swap(true, Ordering::SeqCst) {
+            log_snipping_area_cursor_debug_event(
+                "native.preview_pool_disabled",
+                json!({
+                    "platform": "windows",
+                    "reason": "hidden WebView2 preview pool is unstable during capture/open",
+                }),
+            );
+        }
+        return;
+    }
     let state = app.state::<SnippingState>();
     let parked = state
         .preview_pool
@@ -13123,12 +13625,41 @@ fn snipping_warm_preview_pool(app: &AppHandle) {
 }
 
 fn snipping_take_pooled_preview_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
+    if cfg!(target_os = "windows") {
+        log_snipping_area_cursor_debug_event(
+            "native.preview_pool_take_skipped",
+            json!({
+                "platform": "windows",
+                "reason": "preview_pool_disabled",
+            }),
+        );
+        return None;
+    }
     let state = app.state::<SnippingState>();
     loop {
         let label = state.preview_pool.lock().ok()?.pop()?;
+        log_snipping_area_cursor_debug_event(
+            "native.preview_pool_take_label",
+            json!({
+                "label": label.as_str(),
+            }),
+        );
         if let Some(window) = app.get_webview_window(&label) {
+            log_snipping_area_cursor_debug_event(
+                "native.preview_pool_take_found",
+                json!({
+                    "label": label.as_str(),
+                    "window": snipping_window_debug_value(&window),
+                }),
+            );
             return Some(window);
         }
+        log_snipping_area_cursor_debug_event(
+            "native.preview_pool_take_stale",
+            json!({
+                "label": label.as_str(),
+            }),
+        );
     }
 }
 
@@ -13170,6 +13701,53 @@ fn snipping_open_snip_preview_window_for(
     snipping_open_snip_preview_window_for_with_size(app, path, explicit_position, focused, None)
 }
 
+struct SnippingPreparedPreviewOpen {
+    resolved_path: String,
+    path_string: String,
+    label: String,
+    width: f64,
+    height: f64,
+}
+
+fn snipping_prepare_preview_open_request(
+    app: &AppHandle,
+    path: &str,
+    initial_size: Option<(f64, f64)>,
+) -> Result<SnippingPreparedPreviewOpen, String> {
+    let resolved_path = snipping_preview_current_path_string(app, path)?;
+    let file = diffforge_local_asset_file(&resolved_path)?;
+    let (width, height) =
+        initial_size.unwrap_or((SNIPPING_FLOAT_LOGICAL_WIDTH, SNIPPING_FLOAT_LOGICAL_HEIGHT));
+    let path_string = file.display().to_string();
+    let closing_labels = snipping_preview_closing_labels(app);
+    let existing_label = app
+        .state::<SnippingState>()
+        .preview_paths
+        .lock()
+        .ok()
+        .and_then(|paths| {
+            paths.iter().find_map(|(open_label, open_path)| {
+                (open_path == &path_string
+                    && !closing_labels.contains(open_label)
+                    && app.get_webview_window(open_label).is_some())
+                .then(|| open_label.clone())
+            })
+        });
+    let label = existing_label.unwrap_or_else(|| {
+        format!(
+            "{SNIPPING_FLOAT_WINDOW_PREFIX}-{}",
+            snipping_window_token(&file)
+        )
+    });
+    Ok(SnippingPreparedPreviewOpen {
+        resolved_path,
+        path_string,
+        label,
+        width,
+        height,
+    })
+}
+
 fn snipping_open_snip_preview_window_for_with_size(
     app: &AppHandle,
     path: &str,
@@ -13177,16 +13755,48 @@ fn snipping_open_snip_preview_window_for_with_size(
     focused: bool,
     initial_size: Option<(f64, f64)>,
 ) -> Result<Value, String> {
-    let resolved_path = snipping_preview_current_path_string(app, path)?;
-    let file = diffforge_local_asset_file(&resolved_path)?;
-    let (width, height) =
-        initial_size.unwrap_or((SNIPPING_FLOAT_LOGICAL_WIDTH, SNIPPING_FLOAT_LOGICAL_HEIGHT));
-    let path_string = file.display().to_string();
-    let label = format!(
-        "{SNIPPING_FLOAT_WINDOW_PREFIX}-{}",
-        snipping_window_token(&file)
-    );
+    snipping_open_snip_preview_window_for_with_size_and_label(
+        app,
+        path,
+        explicit_position,
+        focused,
+        initial_size,
+        None,
+    )
+}
+
+fn snipping_open_snip_preview_window_for_with_size_and_label(
+    app: &AppHandle,
+    path: &str,
+    explicit_position: Option<(f64, f64)>,
+    focused: bool,
+    initial_size: Option<(f64, f64)>,
+    label_override: Option<String>,
+) -> Result<Value, String> {
+    let prepared = snipping_prepare_preview_open_request(app, path, initial_size)?;
+    let resolved_path = prepared.resolved_path;
+    let path_string = prepared.path_string;
+    let label = label_override.unwrap_or(prepared.label);
+    let width = prepared.width;
+    let height = prepared.height;
     let closing_labels = snipping_preview_closing_labels(app);
+    log_snipping_area_cursor_debug_event(
+        "native.preview_open_requested",
+        json!({
+            "closing_label_count": closing_labels.len(),
+            "explicit_position": explicit_position.map(|(x, y)| json!({ "x": x, "y": y })),
+            "focused": focused,
+            "height": height,
+            "initial_size": initial_size.map(|(width, height)| json!({
+                "height": height,
+                "width": width,
+            })),
+            "label": label.as_str(),
+            "path": path_string.as_str(),
+            "resolved_path": resolved_path.as_str(),
+            "width": width,
+        }),
+    );
 
     // The path registry is authoritative: parked preview windows are reused
     // across snips, so a native window label may outlive the path it was first
@@ -13204,6 +13814,13 @@ fn snipping_open_snip_preview_window_for_with_size(
                 .then(|| open_label.clone())
             })
         });
+    log_snipping_area_cursor_debug_event(
+        "native.preview_existing_lookup",
+        json!({
+            "found": existing_label.as_deref(),
+            "path": path_string.as_str(),
+        }),
+    );
     if let Some(existing_label) = existing_label {
         if let Some(existing) = app.get_webview_window(&existing_label) {
             let was_visible = existing.is_visible().unwrap_or(false);
@@ -13225,19 +13842,34 @@ fn snipping_open_snip_preview_window_for_with_size(
             }
             snipping_start_float_hover_watcher(app);
             snipping_emit_floats_changed(app);
-            return Ok(json!({
+            let result = json!({
                 "kind": "snip_float_opened",
                 "label": existing_label,
                 "path": path_string,
                 "already_open": true,
                 "width": width,
                 "height": height,
-            }));
+            });
+            log_snipping_area_cursor_debug_event(
+                "native.preview_open_existing",
+                json!({
+                    "result": result.clone(),
+                    "was_visible": was_visible,
+                    "window": snipping_window_debug_value(&existing),
+                }),
+            );
+            return Ok(result);
         }
     }
 
     // Fast path: adopt a parked pre-booted window. The webview is already
     // running, so the preview appears the moment the capture file lands.
+    log_snipping_area_cursor_debug_event(
+        "native.preview_pool_take_attempt",
+        json!({
+            "path": path_string.as_str(),
+        }),
+    );
     if let Some(window) = snipping_take_pooled_preview_window(app) {
         let pooled_label = window.label().to_string();
         let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
@@ -13269,22 +13901,97 @@ fn snipping_open_snip_preview_window_for_with_size(
         snipping_start_float_hover_watcher(app);
         snipping_warm_preview_pool(app);
         snipping_emit_floats_changed(app);
-        return Ok(json!({
+        let result = json!({
             "kind": "snip_float_opened",
             "label": pooled_label,
             "path": path_string,
             "width": width,
             "height": height,
             "pooled": true,
-        }));
+        });
+        log_snipping_area_cursor_debug_event(
+            "native.preview_open_pooled",
+            json!({
+                "result": result.clone(),
+                "window": snipping_window_debug_value(&window),
+            }),
+        );
+        return Ok(result);
     }
 
     let encoded_path = snipping_url_token(&path_string);
-    let window = snipping_build_preview_window(app, &label, &encoded_path, focused)?;
+    log_snipping_area_cursor_debug_event(
+        "native.preview_open_build_new_begin",
+        json!({
+            "encoded_path_len": encoded_path.len(),
+            "label": label.as_str(),
+            "path": path_string.as_str(),
+        }),
+    );
+    let assign_path_before_build = cfg!(target_os = "windows");
+    if assign_path_before_build {
+        if let Ok(mut paths) = app.state::<SnippingState>().preview_paths.lock() {
+            paths.insert(label.clone(), path_string.clone());
+        }
+        log_snipping_area_cursor_debug_event(
+            "native.preview_open_path_preinserted",
+            json!({
+                "label": label.as_str(),
+                "path": path_string.as_str(),
+                "platform": "windows",
+            }),
+        );
+    }
+    let window = match snipping_build_preview_window(app, &label, &encoded_path, focused) {
+        Ok(window) => window,
+        Err(error) => {
+            if assign_path_before_build {
+                if let Ok(mut paths) = app.state::<SnippingState>().preview_paths.lock() {
+                    paths.remove(&label);
+                }
+            }
+            log_snipping_area_cursor_debug_event(
+                "native.preview_open_build_new_error",
+                json!({
+                    "error": error.as_str(),
+                    "label": label.as_str(),
+                    "path": path_string.as_str(),
+                }),
+            );
+            return Err(error);
+        }
+    };
+    log_snipping_area_cursor_debug_event(
+        "native.preview_open_build_new_done",
+        json!({
+            "label": label.as_str(),
+            "window": snipping_window_debug_value(&window),
+        }),
+    );
     let _ = window.set_size(tauri::LogicalSize::new(width, height));
     snipping_position_preview_window(app, &window, explicit_position);
-    if let Ok(mut paths) = app.state::<SnippingState>().preview_paths.lock() {
-        paths.insert(label.clone(), path_string.clone());
+    if !assign_path_before_build {
+        if let Ok(mut paths) = app.state::<SnippingState>().preview_paths.lock() {
+            paths.insert(label.clone(), path_string.clone());
+        }
+    } else {
+        let _ = app.emit_to(
+            label.as_str(),
+            SNIPPING_FLOAT_ASSIGN_EVENT,
+            json!({
+                "kind": "snip_float_assign",
+                "label": label.as_str(),
+                "path": path_string.as_str(),
+            }),
+        );
+        log_snipping_area_cursor_debug_event(
+            "native.preview_open_assign_sent",
+            json!({
+                "label": label.as_str(),
+                "path": path_string.as_str(),
+                "platform": "windows",
+            }),
+        );
     }
     #[cfg(target_os = "macos")]
     snipping_preview_apply_macos_space_style(&window);
@@ -13298,13 +14005,97 @@ fn snipping_open_snip_preview_window_for_with_size(
     snipping_warm_preview_pool(app);
     snipping_emit_floats_changed(app);
 
-    Ok(json!({
+    let result = json!({
         "kind": "snip_float_opened",
         "label": label,
         "path": path_string,
         "width": width,
         "height": height,
-    }))
+    });
+    log_snipping_area_cursor_debug_event(
+        "native.preview_open_new",
+        json!({
+            "result": result.clone(),
+            "window": snipping_window_debug_value(&window),
+        }),
+    );
+    Ok(result)
+}
+
+fn snipping_open_snip_preview_window_for_command_with_size(
+    app: &AppHandle,
+    path: &str,
+    explicit_position: Option<(f64, f64)>,
+    focused: bool,
+    initial_size: Option<(f64, f64)>,
+) -> Result<Value, String> {
+    if !cfg!(target_os = "windows") {
+        return snipping_open_snip_preview_window_for_with_size(
+            app,
+            path,
+            explicit_position,
+            focused,
+            initial_size,
+        );
+    }
+
+    let prepared = snipping_prepare_preview_open_request(app, path, initial_size)?;
+    let label = prepared.label;
+    let path_string = prepared.path_string;
+    let width = prepared.width;
+    let height = prepared.height;
+    let app_for_worker = app.clone();
+    let path_for_worker = path.to_string();
+    let label_for_worker = label.clone();
+    thread::spawn(move || {
+        log_snipping_area_cursor_debug_event(
+            "native.preview_open_command_worker_start",
+            json!({
+                "focused": focused,
+                "initial_size": initial_size.map(|(width, height)| json!({
+                    "height": height,
+                    "width": width,
+                })),
+                "label": label_for_worker.as_str(),
+                "path": path_for_worker.as_str(),
+                "platform": "windows",
+            }),
+        );
+        let result = snipping_open_snip_preview_window_for_with_size_and_label(
+            &app_for_worker,
+            &path_for_worker,
+            explicit_position,
+            focused,
+            initial_size,
+            Some(label_for_worker.clone()),
+        );
+        log_snipping_area_cursor_debug_event(
+            "native.preview_open_command_worker_done",
+            json!({
+                "ok": result.is_ok(),
+                "error": result.as_ref().err().map(String::as_str),
+                "label": label_for_worker.as_str(),
+                "path": path_for_worker.as_str(),
+                "platform": "windows",
+            }),
+        );
+    });
+    let result = json!({
+        "kind": "snip_float_open_scheduled",
+        "scheduled": true,
+        "label": label,
+        "path": path_string,
+        "width": width,
+        "height": height,
+    });
+    log_snipping_area_cursor_debug_event(
+        "native.preview_open_command_scheduled",
+        json!({
+            "result": result.clone(),
+            "platform": "windows",
+        }),
+    );
+    Ok(result)
 }
 
 const SNIPPING_FLOAT_HOVER_EVENT: &str = "snipping-float-hover";
@@ -14222,8 +15013,13 @@ fn snipping_open_snip_float(
     };
     // `focused: false` keeps quick-access opens from stealing focus away from
     // the strip/background workflow.
-    let opened =
-        snipping_open_snip_preview_window_for(&app, &path, explicit_position, focused.unwrap_or(true))?;
+    let opened = snipping_open_snip_preview_window_for_command_with_size(
+        &app,
+        &path,
+        explicit_position,
+        focused.unwrap_or(true),
+        None,
+    )?;
     if strip_index.is_some() {
         if let (Some(label), Some(opened_path)) = (
             opened.get("label").and_then(Value::as_str),
@@ -14254,6 +15050,20 @@ fn snipping_open_snip_float_for_drag(
     strip_before_path: Option<String>,
     strip_after_path: Option<String>,
 ) -> Result<Value, String> {
+    log_snipping_area_cursor_debug_event(
+        "native.preview_drag_open_requested",
+        json!({
+            "path": &path,
+            "requested_x": x,
+            "requested_y": y,
+            "grab_offset_x": grab_offset_x,
+            "grab_offset_y": grab_offset_y,
+            "strip_index": strip_index,
+            "strip_before_path": strip_before_path.as_deref(),
+            "strip_after_path": strip_after_path.as_deref(),
+            "cursor_position": snipping_app_cursor_position_debug_value(&app),
+        }),
+    );
     let drag_size = (
         SNIPPING_STRIP_TILE_LOGICAL_WIDTH,
         SNIPPING_STRIP_TILE_LOGICAL_HEIGHT,
@@ -14275,7 +15085,183 @@ fn snipping_open_snip_float_for_drag(
         grab_offset_y,
     )
     .or(fallback_position);
-    let opened = snipping_open_snip_preview_window_for_with_size(
+    log_snipping_area_cursor_debug_event(
+        "native.preview_drag_initial_position",
+        json!({
+            "path": &path,
+            "initial_position": initial_position,
+            "fallback_position": fallback_position,
+            "drag_width": drag_size.0,
+            "drag_height": drag_size.1,
+            "grab_offset_x": grab_offset_x,
+            "grab_offset_y": grab_offset_y,
+        }),
+    );
+    if cfg!(target_os = "windows") {
+        let prepared = snipping_prepare_preview_open_request(&app, &path, Some(drag_size))?;
+        let label = prepared.label;
+        let opened_path = prepared.path_string;
+        let opened = json!({
+            "kind": "snip_float_open_scheduled",
+            "scheduled": true,
+            "label": label,
+            "path": opened_path,
+            "width": drag_size.0,
+            "height": drag_size.1,
+            "dragStarted": false,
+        });
+        let label = opened
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let opened_path = opened
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if strip_index.is_some() {
+            snipping_register_preview_strip_origin(
+                &app,
+                &label,
+                &opened_path,
+                strip_index,
+                strip_before_path.clone(),
+                strip_after_path.clone(),
+            );
+        }
+        let app_for_worker = app.clone();
+        let path_for_worker = path.clone();
+        let label_for_worker = label.clone();
+        let opened_path_for_worker = opened_path.clone();
+        thread::spawn(move || {
+            log_snipping_area_cursor_debug_event(
+                "native.preview_drag_open_worker_start",
+                json!({
+                    "drag_height": drag_size.1,
+                    "drag_width": drag_size.0,
+                    "label": label_for_worker.as_str(),
+                    "path": opened_path_for_worker.as_str(),
+                    "platform": "windows",
+                }),
+            );
+            let result = snipping_open_snip_preview_window_for_with_size_and_label(
+                &app_for_worker,
+                &path_for_worker,
+                initial_position,
+                false,
+                Some(drag_size),
+                Some(label_for_worker.clone()),
+            );
+            let opened_result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    snipping_cleanup_preview_registry(&app_for_worker, &label_for_worker);
+                    log_snipping_area_cursor_debug_event(
+                        "native.preview_drag_open_worker_error",
+                        json!({
+                            "error": error,
+                            "label": label_for_worker.as_str(),
+                            "path": opened_path_for_worker.as_str(),
+                            "platform": "windows",
+                        }),
+                    );
+                    return;
+                }
+            };
+            let opened_label = opened_result
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or(label_for_worker.as_str())
+                .to_string();
+            let Some(window) = app_for_worker.get_webview_window(&opened_label) else {
+                log_snipping_area_cursor_debug_event(
+                    "native.preview_drag_open_worker_missing_window",
+                    json!({
+                        "label": opened_label,
+                        "path": opened_path_for_worker.as_str(),
+                        "platform": "windows",
+                    }),
+                );
+                return;
+            };
+            log_snipping_area_cursor_debug_event(
+                "native.preview_drag_window_opened",
+                json!({
+                    "label": &opened_label,
+                    "path": opened_path_for_worker.as_str(),
+                    "window": snipping_window_debug_value(&window),
+                }),
+            );
+            snipping_set_preview_logical_size_now(
+                &app_for_worker,
+                &window,
+                drag_size.0,
+                drag_size.1,
+            );
+            let _ = snipping_position_preview_under_cursor_with_offset(
+                &app_for_worker,
+                &window,
+                drag_size.0,
+                drag_size.1,
+                grab_offset_x,
+                grab_offset_y,
+            );
+            let position = window
+                .outer_position()
+                .unwrap_or_else(|_| tauri::PhysicalPosition::new(0, 0));
+            snipping_begin_preview_drag_session(&app_for_worker, &opened_label, position);
+            snipping_set_preview_drag_grab_ratio(
+                &app_for_worker,
+                &opened_label,
+                grab_offset_x,
+                grab_offset_y,
+                drag_size.0,
+                drag_size.1,
+            );
+            snipping_begin_preview_drag_handoff(&app_for_worker, &opened_label);
+            if let Some((screen_x, screen_y)) =
+                snipping_take_pending_preview_drag_point(&app_for_worker, &opened_label)
+            {
+                let _ = snipping_preview_drag_moved(
+                    app_for_worker.clone(),
+                    opened_label.clone(),
+                    screen_x,
+                    screen_y,
+                );
+            } else {
+                let _ = snipping_position_preview_under_cursor_with_offset(
+                    &app_for_worker,
+                    &window,
+                    drag_size.0,
+                    drag_size.1,
+                    grab_offset_x,
+                    grab_offset_y,
+                );
+            }
+            if snipping_take_pending_preview_drag_release(&app_for_worker, &opened_label) {
+                let _ = snipping_preview_drag_released(app_for_worker.clone(), opened_label.clone());
+            }
+            log_snipping_area_cursor_debug_event(
+                "native.preview_drag_open_ready",
+                json!({
+                    "drag_started": false,
+                    "label": &opened_label,
+                    "scheduled": true,
+                    "window": snipping_window_debug_value(&window),
+                }),
+            );
+        });
+        log_snipping_area_cursor_debug_event(
+            "native.preview_drag_open_scheduled",
+            json!({
+                "result": opened.clone(),
+                "platform": "windows",
+            }),
+        );
+        return Ok(opened);
+    }
+    let opened = snipping_open_snip_preview_window_for_command_with_size(
         &app,
         &path,
         initial_position,
@@ -14290,6 +15276,14 @@ fn snipping_open_snip_float_for_drag(
     let window = app
         .get_webview_window(&label)
         .ok_or_else(|| "Snip preview window is not open.".to_string())?;
+    log_snipping_area_cursor_debug_event(
+        "native.preview_drag_window_opened",
+        json!({
+            "label": &label,
+            "path": &path,
+            "window": snipping_window_debug_value(&window),
+        }),
+    );
     snipping_set_preview_logical_size_now(&app, &window, drag_size.0, drag_size.1);
     let _ = snipping_position_preview_under_cursor_with_offset(
         &app,
@@ -14344,11 +15338,21 @@ fn snipping_open_snip_float_for_drag(
     let drag_started = window.start_dragging().is_ok();
     #[cfg(windows)]
     let drag_started = false;
-    // Without a native drag the watchdog is the only mover: take over from
-    // the first poll instead of waiting for drift past the slack radius.
+    // macOS still uses the native drag plus a small drift watchdog. Windows
+    // strip drag-out is driven by WebView pointer events instead; the Win32
+    // cursor/button probes are not reliable under pointer capture.
+    #[cfg(target_os = "macos")]
     snipping_start_preview_drag_follow_watchdog_with_takeover(&app, &label, !drag_started);
     let mut opened = opened;
     opened["dragStarted"] = json!(drag_started);
+    log_snipping_area_cursor_debug_event(
+        "native.preview_drag_open_ready",
+        json!({
+            "label": &label,
+            "drag_started": drag_started,
+            "window": snipping_window_debug_value(&window),
+        }),
+    );
     Ok(opened)
 }
 
@@ -14570,30 +15574,288 @@ fn snipping_handle_untracked_asset_deleted(app: &AppHandle, deleted_path: &str) 
     }
 }
 
+#[tauri::command]
+fn snipping_preview_drag_moved(
+    app: AppHandle,
+    label: String,
+    screen_x: Option<f64>,
+    screen_y: Option<f64>,
+) -> Result<Value, String> {
+    let label = label.trim().to_string();
+    log_snipping_area_cursor_debug_event(
+        "native.preview_drag_moved_requested",
+        json!({
+            "label": &label,
+            "screen_x": screen_x,
+            "screen_y": screen_y,
+            "app_cursor_position": snipping_app_cursor_position_debug_value(&app),
+        }),
+    );
+    if !label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX) {
+        log_snipping_area_cursor_debug_event(
+            "native.preview_drag_moved_rejected",
+            json!({
+                "label": &label,
+                "reason": "invalid_label",
+            }),
+        );
+        return Err("Not a snip preview window.".to_string());
+    }
+    let Some(window) = app.get_webview_window(&label) else {
+        snipping_store_pending_preview_drag_point(&app, &label, screen_x, screen_y);
+        log_snipping_area_cursor_debug_event(
+            "native.preview_drag_moved_pending_window",
+            json!({
+                "label": &label,
+                "screen_x": screen_x,
+                "screen_y": screen_y,
+            }),
+        );
+        return Ok(json!({
+            "ok": true,
+            "label": label,
+            "pending": true,
+        }));
+    };
+    let size = match window.outer_size() {
+        Ok(size) => size,
+        Err(error) => {
+            log_snipping_area_cursor_debug_event(
+                "native.preview_drag_moved_rejected",
+                json!({
+                    "label": &label,
+                    "reason": "outer_size_failed",
+                    "error": error.to_string(),
+                    "window": snipping_window_debug_value(&window),
+                }),
+            );
+            return Err(format!("Unable to read snip preview size: {error}"));
+        }
+    };
+    let (position, move_debug) = if let Some((screen_x, screen_y)) =
+        snipping_preview_logical_drag_point(screen_x, screen_y)
+    {
+        let cursor_scale =
+            snipping_preview_scale_for_logical_drag_point(&app, &window, screen_x, screen_y);
+        let logical_width = f64::from(size.width.max(1)) / cursor_scale;
+        let logical_height = f64::from(size.height.max(1)) / cursor_scale;
+        let (offset_x, offset_y) =
+            snipping_preview_drag_offset_for_size(&app, &label, logical_width, logical_height);
+        window
+            .set_position(tauri::LogicalPosition::new(
+                screen_x - offset_x,
+                screen_y - offset_y,
+            ))
+            .map_err(|error| format!("Unable to move snip preview: {error}"))?;
+        let position = window.outer_position().unwrap_or_else(|_| {
+            tauri::PhysicalPosition::new(
+                ((screen_x - offset_x) * cursor_scale).round() as i32,
+                ((screen_y - offset_y) * cursor_scale).round() as i32,
+            )
+        });
+        (
+            position,
+            json!({
+                "coordinate_source": "js_screen_point",
+                "screen_x": screen_x,
+                "screen_y": screen_y,
+                "cursor_scale": cursor_scale,
+                "logical_width": logical_width,
+                "logical_height": logical_height,
+                "offset_x": offset_x,
+                "offset_y": offset_y,
+            }),
+        )
+    } else {
+        let (cursor, cursor_scale) = snipping_preview_cursor_and_scale_for_offset(&app, &window)
+            .ok_or_else(|| "Unable to read cursor position.".to_string())?;
+        let logical_width = f64::from(size.width.max(1)) / cursor_scale;
+        let logical_height = f64::from(size.height.max(1)) / cursor_scale;
+        let (offset_x, offset_y) =
+            snipping_preview_drag_offset_for_size(&app, &label, logical_width, logical_height);
+        let position = snipping_preview_position_for_cursor_with_offset(
+            cursor,
+            cursor_scale,
+            logical_width,
+            logical_height,
+            offset_x,
+            offset_y,
+        );
+        window
+            .set_position(position)
+            .map_err(|error| format!("Unable to move snip preview: {error}"))?;
+        (
+            position,
+            json!({
+                "coordinate_source": "native_cursor",
+                "cursor_x": cursor.x,
+                "cursor_y": cursor.y,
+                "cursor_scale": cursor_scale,
+                "logical_width": logical_width,
+                "logical_height": logical_height,
+                "offset_x": offset_x,
+                "offset_y": offset_y,
+            }),
+        )
+    };
+    snipping_update_preview_strip_drag_state(&app, &label, false);
+    snipping_emit_preview_drag_over(&app, &label);
+    snipping_live_reflow_on_drag(&app, &label);
+    schedule_snipping_preview_stack_reflow(&app);
+    log_snipping_area_cursor_debug_event(
+        "native.preview_drag_moved_applied",
+        json!({
+            "label": &label,
+            "position_x": position.x,
+            "position_y": position.y,
+            "move": move_debug,
+            "window": snipping_window_debug_value(&window),
+        }),
+    );
+    Ok(json!({
+        "ok": true,
+        "label": label,
+        "x": position.x,
+        "y": position.y,
+    }))
+}
+
+#[tauri::command]
+fn snipping_preview_drag_released(app: AppHandle, label: String) -> Result<Value, String> {
+    let label = label.trim().to_string();
+    log_snipping_area_cursor_debug_event(
+        "native.preview_drag_released_requested",
+        json!({
+            "label": &label,
+            "app_cursor_position": snipping_app_cursor_position_debug_value(&app),
+        }),
+    );
+    if !label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX) {
+        log_snipping_area_cursor_debug_event(
+            "native.preview_drag_released_rejected",
+            json!({
+                "label": &label,
+                "reason": "invalid_label",
+            }),
+        );
+        return Err("Not a snip preview window.".to_string());
+    }
+    let Some(window) = app.get_webview_window(&label) else {
+        snipping_store_pending_preview_drag_release(&app, &label);
+        log_snipping_area_cursor_debug_event(
+            "native.preview_drag_released_pending_window",
+            json!({
+                "label": &label,
+            }),
+        );
+        schedule_snipping_preview_stack_reflow(&app);
+        return Ok(json!({
+            "ok": true,
+            "label": label,
+            "pending": true,
+        }));
+    };
+    let window_debug = {
+        snipping_update_preview_strip_drag_state(&app, &label, false);
+        snipping_emit_preview_drag_over(&app, &label);
+        snipping_window_debug_value(&window)
+    };
+    schedule_snipping_preview_stack_reflow(&app);
+    log_snipping_area_cursor_debug_event(
+        "native.preview_drag_released_applied",
+        json!({
+            "label": &label,
+            "window": window_debug,
+        }),
+    );
+    Ok(json!({
+        "ok": true,
+        "label": label,
+    }))
+}
+
 /// Called by a preview window's webview right before it starts the native
 /// window drag. Marks the drag session so the settle pass can tell a real
 /// user drag (drop candidate) from programmatic restacking.
 #[tauri::command]
-fn snipping_preview_drag_started(app: AppHandle, label: String) -> Result<Value, String> {
+fn snipping_preview_drag_started(
+    app: AppHandle,
+    label: String,
+    grab_offset_x: Option<f64>,
+    grab_offset_y: Option<f64>,
+    width: Option<f64>,
+    height: Option<f64>,
+) -> Result<Value, String> {
     let label = label.trim().to_string();
+    log_snipping_area_cursor_debug_event(
+        "native.preview_drag_started_requested",
+        json!({
+            "label": &label,
+            "grab_offset_x": grab_offset_x,
+            "grab_offset_y": grab_offset_y,
+            "width": width,
+            "height": height,
+            "app_cursor_position": snipping_app_cursor_position_debug_value(&app),
+        }),
+    );
     if !label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX) {
+        log_snipping_area_cursor_debug_event(
+            "native.preview_drag_started_rejected",
+            json!({
+                "label": &label,
+                "reason": "invalid_label",
+            }),
+        );
         return Err("Not a snip preview window.".to_string());
     }
     if snipping_preview_is_closing(&app, &label) {
+        log_snipping_area_cursor_debug_event(
+            "native.preview_drag_started_rejected",
+            json!({
+                "label": &label,
+                "reason": "closing",
+            }),
+        );
         return Err("Snip preview window is closing.".to_string());
     }
     let Some(window) = app.get_webview_window(&label) else {
+        log_snipping_area_cursor_debug_event(
+            "native.preview_drag_started_rejected",
+            json!({
+                "label": &label,
+                "reason": "window_not_open",
+            }),
+        );
         return Err("Snip preview window is not open.".to_string());
     };
     let position = window
         .outer_position()
         .map_err(|error| format!("Unable to read snip preview position: {error}"))?;
     snipping_begin_preview_drag_session(&app, &label, position);
+    if let (Some(offset_x), Some(offset_y), Some(width), Some(height)) =
+        (grab_offset_x, grab_offset_y, width, height)
+    {
+        if offset_x.is_finite() && offset_y.is_finite() && width.is_finite() && height.is_finite()
+        {
+            snipping_set_preview_drag_grab_ratio(&app, &label, offset_x, offset_y, width, height);
+        }
+    }
     snipping_update_preview_strip_drag_state(&app, &label, false);
     // A plain click never emits Moved events, so make sure the session still
     // gets settled (and cleared) shortly after.
     schedule_snipping_preview_stack_reflow(&app);
-    Ok(json!({ "ok": true }))
+    log_snipping_area_cursor_debug_event(
+        "native.preview_drag_started_applied",
+        json!({
+            "label": &label,
+            "drag_started": !cfg!(windows),
+            "window": snipping_window_debug_value(&window),
+        }),
+    );
+    Ok(json!({
+        "ok": true,
+        "dragStarted": !cfg!(windows),
+    }))
 }
 
 /// A drop target in the main webview accepted the snip: the preview window
@@ -14673,7 +15935,7 @@ fn snipping_read_asset_data_url(path: String) -> Result<String, String> {
 fn snipping_open_annotation_editor(app: AppHandle, path: String) -> Result<Value, String> {
     // Same builder as the batch path: transparent rounded window sized to the
     // snip, plus the one-editor-per-asset focus dedupe.
-    snipping_open_annotation_editor_for_paths(&app, vec![path])
+    snipping_open_annotation_editor_for_paths_command(&app, vec![path])
 }
 
 #[tauri::command]
@@ -14681,7 +15943,7 @@ fn snipping_open_annotation_editor_batch(
     app: AppHandle,
     request: SnippingAnnotationEditorRequest,
 ) -> Result<Value, String> {
-    snipping_open_annotation_editor_for_paths(&app, request.paths)
+    snipping_open_annotation_editor_for_paths_command(&app, request.paths)
 }
 
 #[tauri::command]
