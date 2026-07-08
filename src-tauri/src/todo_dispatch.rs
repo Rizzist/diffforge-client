@@ -10478,7 +10478,7 @@ async fn todo_dispatch_backend_item_text_with_remote_attachments(
     };
     match timeout(
         Duration::from_secs(30),
-        tauri::async_runtime::spawn_blocking(move || stage_chat_attachment_refs_for(request)),
+        tauri::async_runtime::spawn_blocking(move || stage_chat_attachment_refs_for_dispatch(request)),
     )
     .await
     {

@@ -4331,6 +4331,64 @@ mod terminal_cli_tests {
     }
 
     #[test]
+    fn chat_attachment_dispatch_rehash_bypasses_poisoned_verify_cache() {
+        let bytes = chat_attachment_test_png(8);
+        let attachment =
+            chat_attachment_test_ref("att-dispatch-cache-poison", "dispatch.png", &bytes);
+        let sha = attachment.sha256.clone();
+        cleanup_chat_attachment_test_sha(&sha);
+        let staged_path = chat_attachment_test_stage_path(&attachment, 0);
+        fs::write(&staged_path, chat_attachment_tampered_bytes(&bytes)).unwrap();
+        let poisoned_key = chat_attachment_verify_cache_key(&staged_path).unwrap();
+        if let Ok(mut cache) = chat_attachment_verify_cache().lock() {
+            cache.insert(
+                poisoned_key,
+                ChatAttachmentVerifiedFile {
+                    sha256: attachment.sha256.clone(),
+                    signature_mime: Some("image/png".to_string()),
+                },
+            );
+        }
+
+        let cached = verify_staged_chat_attachment_path(&attachment, &staged_path)
+            .expect("poisoned cached verification should pass");
+        assert!(cached.cache_hit);
+
+        let mut downloads = 0usize;
+        let mut downloader = |_attachment: &ChatAttachmentRef| {
+            downloads += 1;
+            Ok(ChatAttachmentDownload {
+                bytes: bytes.clone(),
+                content_type: "image/png".to_string(),
+            })
+        };
+        let result = stage_chat_attachment_refs_with_cache_mode(
+            ChatAttachmentStageRequest {
+                workspace_id: "workspace-1".to_string(),
+                attachments: vec![attachment.clone()],
+                ack_cloud: false,
+                marker_start_index: 0,
+            },
+            &mut downloader,
+            false,
+            false,
+        );
+
+        assert_eq!(downloads, 1);
+        assert_eq!(result.staged, vec!["att-dispatch-cache-poison".to_string()]);
+        assert!(result.failed.is_empty());
+        assert_eq!(fs::read(&staged_path).expect("staged file readable"), bytes);
+        let refreshed_key = chat_attachment_verify_cache_key(&staged_path).unwrap();
+        let refreshed = chat_attachment_verify_cache()
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&refreshed_key).cloned())
+            .expect("dispatch full rehash refreshes cache");
+        assert_eq!(refreshed.sha256, sha);
+        cleanup_chat_attachment_test_sha(&sha);
+    }
+
+    #[test]
     fn chat_attachment_missing_inline_fetch_returns_warning_marker() {
         let bytes = chat_attachment_test_png(3);
         let attachment = chat_attachment_test_ref("att-missing", "lost.png", &bytes);
@@ -7833,10 +7891,13 @@ fn chat_attachment_verify_cache_key(path: &Path) -> Result<ChatAttachmentVerifyC
 fn chat_attachment_verified_file_for_key(
     path: &Path,
     key: &ChatAttachmentVerifyCacheKey,
+    use_cache: bool,
 ) -> Result<(ChatAttachmentVerifiedFile, bool), String> {
-    if let Ok(cache) = chat_attachment_verify_cache().lock() {
-        if let Some(verified) = cache.get(key) {
-            return Ok((verified.clone(), true));
+    if use_cache {
+        if let Ok(cache) = chat_attachment_verify_cache().lock() {
+            if let Some(verified) = cache.get(key) {
+                return Ok((verified.clone(), true));
+            }
         }
     }
 
@@ -7860,6 +7921,14 @@ fn verify_staged_chat_attachment_path(
     attachment: &ChatAttachmentRef,
     path: &Path,
 ) -> Result<ChatAttachmentVerifyOutcome, String> {
+    verify_staged_chat_attachment_path_with_cache(attachment, path, true)
+}
+
+fn verify_staged_chat_attachment_path_with_cache(
+    attachment: &ChatAttachmentRef,
+    path: &Path,
+    use_cache: bool,
+) -> Result<ChatAttachmentVerifyOutcome, String> {
     let expected_size = attachment.bytes;
     let expected_sha = normalized_chat_attachment_sha(&attachment.sha256);
     let expected_mime = normalized_chat_attachment_mime(&attachment.mime);
@@ -7868,7 +7937,7 @@ fn verify_staged_chat_attachment_path(
         return Err("Staged attachment size did not match.".to_string());
     }
 
-    let (verified, cache_hit) = chat_attachment_verified_file_for_key(path, &key)?;
+    let (verified, cache_hit) = chat_attachment_verified_file_for_key(path, &key, use_cache)?;
     if verified.sha256 != expected_sha {
         return Err("Staged attachment hash did not match.".to_string());
     }
@@ -7946,6 +8015,7 @@ fn chat_attachment_staged_file_from_path(
 fn find_staged_chat_attachment(
     attachment: &ChatAttachmentRef,
     fallback_index: usize,
+    use_verify_cache: bool,
 ) -> Option<ChatAttachmentStagedFile> {
     let sha = normalized_chat_attachment_sha(&attachment.sha256);
     if sha.is_empty() {
@@ -7958,7 +8028,9 @@ fn find_staged_chat_attachment(
     if let Some(staged) = indexed_staged {
         let path = PathBuf::from(&staged.path);
         if path.is_file() {
-            if verify_staged_chat_attachment_path(attachment, &path).is_ok() {
+            if verify_staged_chat_attachment_path_with_cache(attachment, &path, use_verify_cache)
+                .is_ok()
+            {
                 return Some(staged);
             }
             discard_staged_chat_attachment_file(&path);
@@ -7973,7 +8045,9 @@ fn find_staged_chat_attachment(
             .and_then(|value| value.to_str())
             .unwrap_or_default();
         if path.is_file() && file_name.starts_with(&format!("{sha}-")) {
-            if verify_staged_chat_attachment_path(attachment, &path).is_err() {
+            if verify_staged_chat_attachment_path_with_cache(attachment, &path, use_verify_cache)
+                .is_err()
+            {
                 discard_staged_chat_attachment_file(&path);
                 continue;
             }
@@ -8045,11 +8119,14 @@ fn write_staged_chat_attachment(
     bytes: &[u8],
     file_name: &str,
     fallback_index: usize,
+    use_verify_cache: bool,
 ) -> Result<ChatAttachmentStagedFile, String> {
     let root = chat_attachment_stage_root()?;
     let path = root.join(file_name);
     if path.is_file() {
-        if verify_staged_chat_attachment_path(attachment, &path).is_err() {
+        if verify_staged_chat_attachment_path_with_cache(attachment, &path, use_verify_cache)
+            .is_err()
+        {
             discard_staged_chat_attachment_file(&path);
         } else {
             let staged = chat_attachment_staged_file_from_path(path, attachment, fallback_index);
@@ -8111,6 +8188,18 @@ fn stage_chat_attachment_refs_with<F>(
     request: ChatAttachmentStageRequest,
     mut downloader: F,
     ack_cloud: bool,
+) -> ChatAttachmentStageResult
+where
+    F: FnMut(&ChatAttachmentRef) -> Result<ChatAttachmentDownload, String>,
+{
+    stage_chat_attachment_refs_with_cache_mode(request, &mut downloader, ack_cloud, true)
+}
+
+fn stage_chat_attachment_refs_with_cache_mode<F>(
+    request: ChatAttachmentStageRequest,
+    downloader: &mut F,
+    ack_cloud: bool,
+    use_verify_cache: bool,
 ) -> ChatAttachmentStageResult
 where
     F: FnMut(&ChatAttachmentRef) -> Result<ChatAttachmentDownload, String>,
@@ -8186,7 +8275,7 @@ where
             }
         };
 
-        if let Some(staged) = find_staged_chat_attachment(attachment, index) {
+        if let Some(staged) = find_staged_chat_attachment(attachment, index, use_verify_cache) {
             result.staged.push(attachment_id.clone());
             ack_ids.push(attachment_id);
             result
@@ -8197,7 +8286,13 @@ where
 
         let staged = match downloader(attachment).and_then(|download| {
             verify_chat_attachment_download(attachment, &download)?;
-            write_staged_chat_attachment(attachment, &download.bytes, &file_name, index)
+            write_staged_chat_attachment(
+                attachment,
+                &download.bytes,
+                &file_name,
+                index,
+                use_verify_cache,
+            )
         }) {
             Ok(staged) => staged,
             Err(reason) => {
@@ -8209,6 +8304,20 @@ where
                 continue;
             }
         };
+        if !use_verify_cache {
+            let staged_path = Path::new(&staged.path);
+            if let Err(reason) =
+                verify_staged_chat_attachment_path_with_cache(attachment, staged_path, false)
+            {
+                discard_staged_chat_attachment_file(staged_path);
+                result.failed.push(ChatAttachmentStageFailure {
+                    id: attachment_id,
+                    name: display_name,
+                    reason,
+                });
+                continue;
+            }
+        }
 
         if let Ok(mut index) = chat_attachment_stage_index().lock() {
             index.insert(sha, staged.clone());
@@ -8247,13 +8356,29 @@ fn stage_chat_attachment_refs_for(
     request: ChatAttachmentStageRequest,
 ) -> ChatAttachmentStageResult {
     let ack_cloud = request.ack_cloud;
-    stage_chat_attachment_refs_with(
+    stage_chat_attachment_refs_with_cache_mode(
         request,
-        |attachment| {
+        &mut |attachment: &ChatAttachmentRef| {
             let attachment_id = sanitized_chat_attachment_id(&attachment.attachment_id);
             cloud_mcp_download_chat_attachment_blocking(&attachment_id)
         },
         ack_cloud,
+        true,
+    )
+}
+
+fn stage_chat_attachment_refs_for_dispatch(
+    request: ChatAttachmentStageRequest,
+) -> ChatAttachmentStageResult {
+    let ack_cloud = request.ack_cloud;
+    stage_chat_attachment_refs_with_cache_mode(
+        request,
+        &mut |attachment: &ChatAttachmentRef| {
+            let attachment_id = sanitized_chat_attachment_id(&attachment.attachment_id);
+            cloud_mcp_download_chat_attachment_blocking(&attachment_id)
+        },
+        ack_cloud,
+        false,
     )
 }
 
