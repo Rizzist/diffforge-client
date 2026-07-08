@@ -16,9 +16,9 @@
 
 <br/>
 
-### [▶️ Watch Diff Forge in action](https://www.diffforge.ai/media/diff-forge-demo.webm)
+[![Watch Diff Forge in action](.github/diffforge-demo-thumb.jpg)](https://www.diffforge.ai)
 
-*The forge at work — agents, voice, snips, loops, and the grid.*
+*The forge at work — agents, voice, snips, loops, and the grid. **[See it live at diffforge.ai →](https://www.diffforge.ai)***
 
 </div>
 
