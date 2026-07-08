@@ -418,6 +418,9 @@ struct VideoExportOptions {
     preset: Option<String>,
     range_start_ms: Option<u64>,
     range_end_ms: Option<u64>,
+    // Absolute directory picked by the user (native folder dialog); empty or
+    // absent → the default media/exports/ inside the workspace.
+    output_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -10455,6 +10458,30 @@ fn video_export_window_clips_for_range(
     ))
 }
 
+// Custom export destination: must be an absolute path to an existing
+// directory (it came from the native folder picker; nothing is created
+// implicitly outside the workspace).
+fn video_export_custom_dir(options: &VideoExportOptions) -> Result<Option<std::path::PathBuf>, String> {
+    let Some(raw) = options
+        .output_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let path = std::path::PathBuf::from(raw);
+    if !path.is_absolute() {
+        return Err("Export folder must be an absolute path.".to_string());
+    }
+    if !path.is_dir() {
+        return Err(format!(
+            "Export folder does not exist or is not a directory: {raw}"
+        ));
+    }
+    Ok(Some(path))
+}
+
 fn video_export_output_path(
     media_root: &std::path::Path,
     project: &serde_json::Value,
@@ -10607,7 +10634,20 @@ fn video_run_export_blocking(
     if total_ms == 0 {
         return Err("Video project has no clips to export.".to_string());
     }
-    let output_abs = video_export_output_path(&media_root, &project, &options);
+    let output_abs = match video_export_custom_dir(&options)? {
+        Some(custom_dir) => {
+            // User-picked folders (Downloads, Desktop, …) hold files the app
+            // doesn't own — never overwrite, always pick a free name.
+            let default_path = video_export_output_path(&media_root, &project, &options);
+            let file_name = default_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("export.mp4")
+                .to_string();
+            video_destination_with_collision(&custom_dir, &file_name)
+        }
+        None => video_export_output_path(&media_root, &project, &options),
+    };
     if let Some(parent) = output_abs.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Unable to create video exports directory: {error}"))?;
@@ -11031,6 +11071,9 @@ async fn video_mcp_export(
                 preset: None,
                 range_start_ms: range.map(|(start_ms, _end_ms)| start_ms),
                 range_end_ms: range.map(|(_start_ms, end_ms)| end_ms),
+                // Agent exports always land in media/exports so their
+                // outputs stay inside the workspace the agent can see.
+                output_dir: None,
             };
             let result = video_export_start(app, repo_path, project_path, options).await?;
             Ok(serde_json::json!({ "jobId": result.job_id }))

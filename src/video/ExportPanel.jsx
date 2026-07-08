@@ -3,6 +3,7 @@ import styled from "styled-components";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
 import AppSelect from "../app/AppSelect.jsx";
 import { VIDEO_EXPORT_PROGRESS_EVENT } from "./videoPanelBridge.js";
 import { formatTimecode, projectDurationMs } from "./videoEditorModel.js";
@@ -16,6 +17,18 @@ import {
   VideoProgressTrack,
   VideoSecondaryButton,
 } from "./videoStyles.js";
+
+// Last custom export folder, remembered across sessions; empty = default
+// media/exports inside the workspace.
+const EXPORT_DIR_STORAGE_KEY = "diffforge.video.exportDir";
+
+function readStoredExportDir() {
+  try {
+    return window.localStorage.getItem(EXPORT_DIR_STORAGE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
 
 const SIZE_PRESETS = [
   { id: "project", label: "Project" },
@@ -105,6 +118,35 @@ export default function ExportPanel({
   const [error, setError] = useState("");
   const ownJobIdRef = useRef("");
   const [agentJob, setAgentJob] = useState(null); // exports started by agents (MCP)
+  const [outputDir, setOutputDir] = useState(readStoredExportDir);
+
+  const applyOutputDir = useCallback((dir) => {
+    setOutputDir(dir);
+    try {
+      if (dir) {
+        window.localStorage.setItem(EXPORT_DIR_STORAGE_KEY, dir);
+      } else {
+        window.localStorage.removeItem(EXPORT_DIR_STORAGE_KEY);
+      }
+    } catch {
+      /* best-effort */
+    }
+  }, []);
+
+  const chooseOutputDir = useCallback(async () => {
+    try {
+      const picked = await openFolderDialog({
+        directory: true,
+        multiple: false,
+        title: "Choose export folder",
+      });
+      if (typeof picked === "string" && picked.trim()) {
+        applyOutputDir(picked);
+      }
+    } catch {
+      /* user cancelled or dialog unavailable */
+    }
+  }, [applyOutputDir]);
 
   useEffect(() => {
     if (preset === "project") {
@@ -192,6 +234,7 @@ export default function ExportPanel({
           format,
           crf: Number(crf) || 20,
           preset: speedPreset,
+          outputDir: outputDir || null,
         },
       });
       ownJobIdRef.current = String(result?.jobId || "");
@@ -199,7 +242,7 @@ export default function ExportPanel({
     } catch (err) {
       setError(String(err));
     }
-  }, [crf, durationMs, fileName, format, fps, height, projectPath, repoPath, speedPreset, width]);
+  }, [crf, durationMs, fileName, format, fps, height, outputDir, projectPath, repoPath, speedPreset, width]);
 
   const cancelExport = useCallback(() => {
     if (job?.jobId && !job.done) {
@@ -212,7 +255,8 @@ export default function ExportPanel({
   return (
     <PanelRoot data-video-export="true">
       <VideoHint>
-        Timeline: <strong>{formatTimecode(durationMs)}</strong> · renders to <code>media/exports/</code>
+        Timeline: <strong>{formatTimecode(durationMs)}</strong> · renders to{" "}
+        <code>{outputDir || "media/exports/"}</code>
       </VideoHint>
       {!ffmpegReady ? (
         <VideoErrorText>ffmpeg is not installed — use the Install chip in the top bar first.</VideoErrorText>
@@ -310,6 +354,30 @@ export default function ExportPanel({
           placeholder={`${project?.name || "project"}-export.${format}`}
           value={fileName}
         />
+      </VideoLabel>
+      <VideoLabel as="div">
+        Save to
+        <PresetRow>
+          <PresetChip
+            data-active={outputDir ? "false" : "true"}
+            onClick={() => applyOutputDir("")}
+            title="Render into this workspace's media/exports/ folder"
+            type="button"
+          >
+            Default · media/exports
+          </PresetChip>
+          <PresetChip
+            data-active={outputDir ? "true" : "false"}
+            onClick={chooseOutputDir}
+            title={outputDir ? `Exports render to ${outputDir} — click to change` : "Pick any folder (e.g. Downloads)"}
+            type="button"
+          >
+            {outputDir ? "Custom folder…" : "Choose folder…"}
+          </PresetChip>
+        </PresetRow>
+        {outputDir ? (
+          <VideoHint style={{ overflowWrap: "anywhere" }}>→ {outputDir}</VideoHint>
+        ) : null}
       </VideoLabel>
       {error ? <VideoErrorText>{error}</VideoErrorText> : null}
       <InlineRow>
