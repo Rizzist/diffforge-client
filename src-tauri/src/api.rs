@@ -100,6 +100,81 @@ async fn read_api_response(
     Err(api_error.to_string())
 }
 
+fn desktop_auth_failure_kind_for_status(status: reqwest::StatusCode) -> DesktopAuthSessionFailureKind {
+    if matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        DesktopAuthSessionFailureKind::AuthRejected
+    } else {
+        DesktopAuthSessionFailureKind::Transport
+    }
+}
+
+#[cfg(test)]
+fn desktop_auth_classify_error_message(message: &str) -> DesktopAuthSessionFailureKind {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("desktop session expired")
+        || lower.contains("desktop session is invalid")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("access_denied")
+    {
+        DesktopAuthSessionFailureKind::AuthRejected
+    } else {
+        DesktopAuthSessionFailureKind::Transport
+    }
+}
+
+async fn read_desktop_auth_api_response(
+    response: reqwest::Response,
+    fallback_message: &str,
+) -> Result<Value, DesktopAuthSessionFailure> {
+    let status = response.status();
+    let response_text = response.text().await.map_err(|error| {
+        DesktopAuthSessionFailure::new(
+            DesktopAuthSessionFailureKind::Transport,
+            format!("Unable to read Diff Forge AI API response: {error}"),
+        )
+    })?;
+    let response_body = if response_text.trim().is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_str::<Value>(&response_text) {
+            Ok(body) => body,
+            Err(error) => {
+                let kind = desktop_auth_failure_kind_for_status(status);
+                let message = if kind == DesktopAuthSessionFailureKind::AuthRejected {
+                    fallback_message.to_string()
+                } else {
+                    non_json_api_response_message(status, fallback_message, error)
+                };
+                return Err(DesktopAuthSessionFailure::new(
+                    kind,
+                    message,
+                ));
+            }
+        }
+    };
+
+    if status.is_success() {
+        return Ok(response_body);
+    }
+
+    let kind = desktop_auth_failure_kind_for_status(status);
+    let api_error = response_body
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback_message);
+    let message = if kind == DesktopAuthSessionFailureKind::AuthRejected {
+        fallback_message
+    } else {
+        api_error
+    };
+
+    Err(DesktopAuthSessionFailure::new(kind, message.to_string()))
+}
+
 fn read_blocking_api_response(
     response: reqwest::blocking::Response,
     fallback_message: &str,
@@ -192,7 +267,66 @@ async fn backend_ping() -> Result<BackendStatus, String> {
 const DESKTOP_AUTH_STATE_KEY: &str = "desktop-auth";
 const DESKTOP_AUTH_STATE_CHANGED_EVENT: &str = "desktop-auth-state-changed";
 const DESKTOP_AUTH_DEFAULT_MESSAGE: &str = "Sign in with your Diff Forge AI web account.";
+const DESKTOP_AUTH_SESSION_EXPIRED_MESSAGE: &str = "Desktop session expired.";
 const DESKTOP_AUTH_BILLING_HISTORY_LIMIT: usize = 100;
+const SESSION_RENEW_TIMEOUT_SECS: u64 = 5;
+const DESKTOP_AUTH_RENEWAL_STARTUP_MIN_SECS: u64 = 30;
+const DESKTOP_AUTH_RENEWAL_STARTUP_JITTER_SECS: u64 = 300;
+const DESKTOP_AUTH_RENEWAL_INTERVAL_SECS: u64 = 24 * 60 * 60;
+const DESKTOP_AUTH_RENEWAL_JITTER_SECS: u64 = 60 * 60;
+const DESKTOP_AUTH_RENEWAL_NO_SESSION_SECS: u64 = 15 * 60;
+const DESKTOP_AUTH_RENEWAL_MIN_BACKOFF_SECS: u64 = 15 * 60;
+const DESKTOP_AUTH_RENEWAL_MAX_BACKOFF_SECS: u64 = 6 * 60 * 60;
+const DESKTOP_AUTH_RENEWAL_CONNECTIVITY_POLL_SECS: u64 = 60;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DesktopAuthSessionFailureKind {
+    AuthRejected,
+    Transport,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DesktopAuthSessionFailure {
+    kind: DesktopAuthSessionFailureKind,
+    message: String,
+}
+
+impl DesktopAuthSessionFailure {
+    fn new(kind: DesktopAuthSessionFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DesktopAuthRenewOutcome {
+    NoSession,
+    Renewed,
+    AuthRejected(String),
+    TransportError(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DesktopAuthPreflightStatus {
+    AuthOk,
+    NoSession,
+    AuthRejected,
+    TransportError,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DesktopAuthPreflightResult {
+    status: DesktopAuthPreflightStatus,
+    error: Option<String>,
+}
+
+impl DesktopAuthPreflightResult {
+    fn new(status: DesktopAuthPreflightStatus, error: Option<String>) -> Self {
+        Self { status, error }
+    }
+}
 
 fn desktop_auth_text(value: &Value, keys: &[&str]) -> Option<String> {
     let mut current = value;
@@ -1037,6 +1171,12 @@ fn desktop_auth_snapshot_from_raw(raw: Value) -> Value {
     let billing_status = desktop_auth_slim_billing_status(
         raw.get("billingStatus").cloned().unwrap_or(Value::Null),
     );
+    let expires_at = raw
+        .get("expiresAt")
+        .or_else(|| raw.get("expires_at"))
+        .cloned()
+        .filter(|value| value.as_str().is_some_and(|text| !text.trim().is_empty()))
+        .unwrap_or(Value::Null);
     let mut snapshot = json!({
         "status": status,
         "stage": stage,
@@ -1044,6 +1184,7 @@ fn desktop_auth_snapshot_from_raw(raw: Value) -> Value {
         "error": error,
         "user": user.clone().unwrap_or(Value::Null),
         "token": token,
+        "expiresAt": expires_at,
         "activeScope": active_scope,
         "accountScopes": account_scopes,
         "pendingState": pending_state,
@@ -1202,6 +1343,22 @@ fn desktop_auth_snapshot_pending_state(snapshot: &Value) -> String {
         .to_string()
 }
 
+fn desktop_auth_snapshot_has_rejected_session(snapshot: &Value) -> bool {
+    if snapshot.get("status").and_then(Value::as_str) != Some("signedOut") {
+        return false;
+    }
+    let text = [
+        snapshot.get("error").and_then(Value::as_str).unwrap_or(""),
+        snapshot.get("message").and_then(Value::as_str).unwrap_or(""),
+    ]
+    .join(" ")
+    .to_ascii_lowercase();
+    text.contains("desktop session expired")
+        || text.contains("desktop session is invalid")
+        || text.contains("unauthorized")
+        || text.contains("forbidden")
+}
+
 fn desktop_auth_current_validation_snapshot(app: &AppHandle, token: &str) -> Option<Value> {
     let current = desktop_auth_snapshot(app);
     let current_token = desktop_auth_snapshot_token(&current)?;
@@ -1209,6 +1366,21 @@ fn desktop_auth_current_validation_snapshot(app: &AppHandle, token: &str) -> Opt
         return None;
     }
     Some(current)
+}
+
+fn desktop_auth_snapshot_version(snapshot: &Value) -> Option<u64> {
+    snapshot.get("version").and_then(Value::as_u64)
+}
+
+fn desktop_auth_snapshot_still_current(app: &AppHandle, snapshot: &Value) -> bool {
+    let current = desktop_auth_snapshot(app);
+    if let Some(expected_version) = desktop_auth_snapshot_version(snapshot) {
+        return desktop_auth_snapshot_version(&current) == Some(expected_version);
+    }
+    current.get("status").and_then(Value::as_str)
+        == snapshot.get("status").and_then(Value::as_str)
+        && desktop_auth_snapshot_token(&current) == desktop_auth_snapshot_token(snapshot)
+        && desktop_auth_snapshot_pending_state(&current) == desktop_auth_snapshot_pending_state(snapshot)
 }
 
 fn desktop_auth_persist_snapshot(app: &AppHandle, mut snapshot: Value) -> Result<Value, String> {
@@ -1312,6 +1484,13 @@ fn desktop_auth_sync_cloud_state_background(
     let cloud_mcp_state = cloud_mcp_state.clone();
     let snapshot = snapshot.clone();
     tauri::async_runtime::spawn(async move {
+        if !desktop_auth_snapshot_still_current(&app, &snapshot) {
+            log_terminal_status_event(
+                "backend.desktop_auth.cloud_sync_skipped_stale_snapshot",
+                json!({}),
+            );
+            return;
+        }
         let _ = desktop_auth_sync_cloud_state(&app, &cloud_mcp_state, &snapshot).await;
     });
 }
@@ -1335,13 +1514,18 @@ pub(crate) async fn desktop_auth_restore_cloud_session_for_startup(
     if token.is_empty() {
         return false;
     }
-    match validate_desktop_session(token.to_string()).await {
+    match validate_desktop_session_checked(token.to_string()).await {
         Ok(session) => {
             let Some(current) = desktop_auth_current_validation_snapshot(app, token) else {
                 return false;
             };
-            let user = match desktop_auth_extract_session_user(&session) {
-                Ok(user) => user,
+            let next = match desktop_auth_authenticated_snapshot_from_session(
+                &current,
+                token,
+                &session,
+                Some("Initializing workspace..."),
+            ) {
+                Ok(next) => next,
                 Err(error) => {
                     let Some(_current) = desktop_auth_current_validation_snapshot(app, token)
                     else {
@@ -1360,19 +1544,6 @@ pub(crate) async fn desktop_auth_restore_cloud_session_for_startup(
                     return false;
                 }
             };
-            let active_scope = desktop_auth_normalize_scope(
-                current.get("activeScope").unwrap_or(&Value::Null),
-                Some(&user),
-            );
-            let mut next = current.clone();
-            next["status"] = json!("authenticated");
-            next["stage"] = json!("authenticated");
-            next["message"] = json!("Initializing workspace...");
-            next["error"] = json!("");
-            next["token"] = json!(token);
-            next["user"] = user;
-            next["activeScope"] = active_scope;
-            next["pendingState"] = json!("");
             let Ok(next) = desktop_auth_persist_snapshot(app, next) else {
                 return false;
             };
@@ -1384,14 +1555,20 @@ pub(crate) async fn desktop_auth_restore_cloud_session_for_startup(
             let Some(_current) = desktop_auth_current_validation_snapshot(app, token) else {
                 return false;
             };
-            let message = if desktop_auth_network_restore_error(&error) {
-                "Secure session could not be verified. Sign in again with the web app."
-            } else {
-                "Your desktop session expired. Sign in again with the web app."
-            };
+            if error.kind == DesktopAuthSessionFailureKind::Transport {
+                log_terminal_status_event(
+                    "backend.desktop_auth.startup_restore_transport_error",
+                    json!({ "error": clean_terminal_telemetry_text(&error.message) }),
+                );
+                return false;
+            }
             if let Ok(next) = desktop_auth_persist_snapshot(
                 app,
-                desktop_auth_signed_out_snapshot(message, &error, true),
+                desktop_auth_signed_out_snapshot(
+                    "Your desktop session expired. Sign in again with the web app.",
+                    DESKTOP_AUTH_SESSION_EXPIRED_MESSAGE,
+                    true,
+                ),
             ) {
                 let _ = desktop_auth_sync_cloud_state(app, cloud_mcp_state, &next).await;
             }
@@ -1503,17 +1680,45 @@ fn desktop_auth_extract_session_user(session: &Value) -> Result<Value, String> {
         .ok_or_else(|| "Desktop session response did not include a valid user.".to_string())
 }
 
-fn desktop_auth_network_restore_error(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("unable to validate desktop session")
-        || lower.contains("unable to read diff forge ai api response")
-        || lower.contains("returned 500")
-        || lower.contains("returned 501")
-        || lower.contains("returned 502")
-        || lower.contains("returned 503")
-        || lower.contains("returned 504")
-        || lower.contains("unable to prepare backend request")
-        || lower.contains("timed out")
+fn desktop_auth_session_expires_at(session: &Value) -> Value {
+    session
+        .get("expiresAt")
+        .or_else(|| session.get("expires_at"))
+        .cloned()
+        .filter(|value| value.as_str().is_some_and(|text| !text.trim().is_empty()))
+        .unwrap_or(Value::Null)
+}
+
+fn desktop_auth_authenticated_snapshot_from_session(
+    current: &Value,
+    token: &str,
+    session: &Value,
+    message: Option<&str>,
+) -> Result<Value, String> {
+    let user = desktop_auth_extract_session_user(session)?;
+    let active_scope = desktop_auth_normalize_scope(
+        current.get("activeScope").unwrap_or(&Value::Null),
+        Some(&user),
+    );
+    let mut next = current.clone();
+    next["status"] = json!("authenticated");
+    next["stage"] = json!("authenticated");
+    next["message"] = json!(message
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            current
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("Initializing workspace...")
+        }));
+    next["error"] = json!("");
+    next["token"] = json!(token);
+    next["expiresAt"] = desktop_auth_session_expires_at(session);
+    next["user"] = user;
+    next["activeScope"] = active_scope;
+    next["pendingState"] = json!("");
+    Ok(next)
 }
 
 const DESKTOP_AUTH_CALLBACK_SCHEME_ENV: &str = "RUST_DIFFFORGE_DESKTOP_CALLBACK_SCHEME";
@@ -1677,25 +1882,17 @@ async fn desktop_auth_validate_session(
         let _ = desktop_auth_persist_snapshot(&app, checking);
     }
 
-    match validate_desktop_session(token.clone()).await {
+    match validate_desktop_session_checked(token.clone()).await {
         Ok(session) => {
             let Some(current) = desktop_auth_current_validation_snapshot(&app, &token) else {
                 return Ok(desktop_auth_public_snapshot(&desktop_auth_snapshot(&app)));
             };
-            let user = desktop_auth_extract_session_user(&session)?;
-            let active_scope = desktop_auth_normalize_scope(
-                current.get("activeScope").unwrap_or(&Value::Null),
-                Some(&user),
-            );
-            let mut next = current.clone();
-            next["status"] = json!("authenticated");
-            next["stage"] = json!("authenticated");
-            next["message"] = json!("Initializing workspace...");
-            next["error"] = json!("");
-            next["token"] = json!(token);
-            next["user"] = user;
-            next["activeScope"] = active_scope;
-            next["pendingState"] = json!("");
+            let next = desktop_auth_authenticated_snapshot_from_session(
+                &current,
+                &token,
+                &session,
+                Some("Initializing workspace..."),
+            )?;
             let next = desktop_auth_persist_snapshot(&app, next)?;
             desktop_auth_sync_cloud_state_background(&app, cloud_mcp_state.inner(), &next);
             Ok(desktop_auth_public_snapshot(&next))
@@ -1704,13 +1901,26 @@ async fn desktop_auth_validate_session(
             if desktop_auth_current_validation_snapshot(&app, &token).is_none() {
                 return Ok(desktop_auth_public_snapshot(&desktop_auth_snapshot(&app)));
             }
-            let message = if desktop_auth_network_restore_error(&error) {
-                "Secure session could not be verified. Sign in again with the web app."
-            } else {
-                "Your desktop session expired. Sign in again with the web app."
-            };
-            let next =
-                desktop_auth_persist_snapshot(&app, desktop_auth_signed_out_snapshot(message, &error, true))?;
+            if error.kind == DesktopAuthSessionFailureKind::Transport {
+                log_terminal_status_event(
+                    "backend.desktop_auth.validate_transport_error",
+                    json!({ "error": clean_terminal_telemetry_text(&error.message) }),
+                );
+                let current = desktop_auth_snapshot(&app);
+                if current.get("status").and_then(Value::as_str) == Some("checking") {
+                    let restored = desktop_auth_persist_snapshot(&app, snapshot)?;
+                    return Ok(desktop_auth_public_snapshot(&restored));
+                }
+                return Ok(desktop_auth_public_snapshot(&current));
+            }
+            let next = desktop_auth_persist_snapshot(
+                &app,
+                desktop_auth_signed_out_snapshot(
+                    "Your desktop session expired. Sign in again with the web app.",
+                    DESKTOP_AUTH_SESSION_EXPIRED_MESSAGE,
+                    true,
+                ),
+            )?;
             desktop_auth_sync_cloud_state_background(&app, cloud_mcp_state.inner(), &next);
             Ok(desktop_auth_public_snapshot(&next))
         }
@@ -1774,24 +1984,19 @@ async fn desktop_auth_handle_deep_link(
                 }));
             }
             let token = desktop_auth_extract_session_token(&session)?;
-            let user = desktop_auth_extract_session_user(&session)?;
-            let active_scope = desktop_auth_normalize_scope(
-                current.get("activeScope").unwrap_or(&Value::Null),
-                Some(&user),
-            );
+            let next = desktop_auth_authenticated_snapshot_from_session(
+                &current,
+                &token,
+                &session,
+                Some("Initializing workspace..."),
+            )?;
             let next = desktop_auth_persist_snapshot(
                 &app,
-                json!({
-                    "status": "authenticated",
-                    "stage": "authenticated",
-                    "message": "Initializing workspace...",
-                    "error": "",
-                    "token": token,
-                    "user": user,
-                    "activeScope": active_scope,
-                    "pendingState": "",
-                    "billingStatus": Value::Null,
-                }),
+                {
+                    let mut next = next;
+                    next["billingStatus"] = Value::Null;
+                    next
+                },
             )?;
             desktop_auth_sync_cloud_state_background(&app, cloud_mcp_state.inner(), &next);
             Ok(json!({
@@ -1899,6 +2104,297 @@ async fn desktop_auth_sign_out(
     Ok(desktop_auth_public_snapshot(&next))
 }
 
+async fn desktop_auth_mark_stored_session_rejected(
+    app: &AppHandle,
+    cloud_mcp_state: &CloudMcpState,
+    token: &str,
+    _error: &str,
+) -> bool {
+    if desktop_auth_current_validation_snapshot(app, token).is_none() {
+        return false;
+    }
+    match desktop_auth_persist_snapshot(
+        app,
+        desktop_auth_signed_out_snapshot(
+            "Your desktop session expired. Sign in again with the web app.",
+            DESKTOP_AUTH_SESSION_EXPIRED_MESSAGE,
+            true,
+        ),
+    ) {
+        Ok(next) => {
+            let _ = desktop_auth_sync_cloud_state(app, cloud_mcp_state, &next).await;
+            true
+        }
+        Err(persist_error) => {
+            log_terminal_status_event(
+                "backend.desktop_auth.reject_persist_failed",
+                json!({ "error": clean_terminal_telemetry_text(&persist_error) }),
+            );
+            false
+        }
+    }
+}
+
+async fn desktop_auth_renew_stored_session_once(
+    app: &AppHandle,
+    cloud_mcp_state: &CloudMcpState,
+    reason: &str,
+    timeout_secs: u64,
+) -> DesktopAuthRenewOutcome {
+    let snapshot = desktop_auth_snapshot(app);
+    let Some(token) = desktop_auth_snapshot_token(&snapshot) else {
+        return DesktopAuthRenewOutcome::NoSession;
+    };
+    if token.is_empty() || !desktop_auth_snapshot_pending_state(&snapshot).is_empty() {
+        return DesktopAuthRenewOutcome::NoSession;
+    }
+
+    match renew_desktop_session_checked(token.clone(), timeout_secs).await {
+        Ok(session) => {
+            let Some(current) = desktop_auth_current_validation_snapshot(app, &token) else {
+                return DesktopAuthRenewOutcome::NoSession;
+            };
+            let next = match desktop_auth_authenticated_snapshot_from_session(
+                &current,
+                &token,
+                &session,
+                None,
+            ) {
+                Ok(next) => next,
+                Err(error) => {
+                    return DesktopAuthRenewOutcome::TransportError(error);
+                }
+            };
+            match desktop_auth_persist_snapshot(app, next) {
+                Ok(next) => {
+                    desktop_auth_sync_cloud_state_background(app, cloud_mcp_state, &next);
+                    log_terminal_status_event(
+                        "backend.desktop_auth.session_renewed",
+                        json!({
+                            "reason": reason,
+                            "expiresAt": next.get("expiresAt").cloned().unwrap_or(Value::Null),
+                        }),
+                    );
+                    DesktopAuthRenewOutcome::Renewed
+                }
+                Err(error) => DesktopAuthRenewOutcome::TransportError(error),
+            }
+        }
+        Err(error) => match error.kind {
+            DesktopAuthSessionFailureKind::AuthRejected => {
+                desktop_auth_mark_stored_session_rejected(
+                    app,
+                    cloud_mcp_state,
+                    &token,
+                    &error.message,
+                )
+                .await;
+                DesktopAuthRenewOutcome::AuthRejected(error.message)
+            }
+            DesktopAuthSessionFailureKind::Transport => {
+                DesktopAuthRenewOutcome::TransportError(error.message)
+            }
+        },
+    }
+}
+
+fn desktop_auth_renewal_startup_delay_secs(seed_ms: u64) -> u64 {
+    DESKTOP_AUTH_RENEWAL_STARTUP_MIN_SECS
+        + (seed_ms % DESKTOP_AUTH_RENEWAL_STARTUP_JITTER_SECS.max(1))
+}
+
+fn desktop_auth_renewal_interval_secs(seed_ms: u64) -> u64 {
+    let jitter_window = DESKTOP_AUTH_RENEWAL_JITTER_SECS.saturating_mul(2).saturating_add(1);
+    let offset = seed_ms % jitter_window.max(1);
+    DESKTOP_AUTH_RENEWAL_INTERVAL_SECS
+        .saturating_sub(DESKTOP_AUTH_RENEWAL_JITTER_SECS)
+        .saturating_add(offset)
+}
+
+fn desktop_auth_next_renew_backoff_secs(current_secs: u64) -> u64 {
+    current_secs
+        .saturating_mul(2)
+        .clamp(DESKTOP_AUTH_RENEWAL_MIN_BACKOFF_SECS, DESKTOP_AUTH_RENEWAL_MAX_BACKOFF_SECS)
+}
+
+async fn desktop_auth_cloud_connected(cloud_mcp_state: &CloudMcpState) -> bool {
+    let status = cloud_mcp_status_snapshot(cloud_mcp_state).await;
+    status.connected || status.global_ws_connected
+}
+
+fn desktop_auth_renewal_log_state(
+    last_logged_state: &mut String,
+    state: &str,
+    error: Option<&str>,
+) {
+    if last_logged_state == state {
+        return;
+    }
+    *last_logged_state = state.to_string();
+    log_terminal_status_event(
+        "backend.desktop_auth.renewal_loop_state",
+        json!({
+            "state": state,
+            "error": error.map(clean_terminal_telemetry_text),
+        }),
+    );
+}
+
+pub(crate) fn desktop_auth_start_renewal_loop(
+    app: AppHandle,
+    cloud_mcp_state: CloudMcpState,
+) {
+    static DESKTOP_AUTH_RENEWAL_LOOP_STARTED: AtomicBool = AtomicBool::new(false);
+    if DESKTOP_AUTH_RENEWAL_LOOP_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    tauri::async_runtime::spawn(async move {
+        let mut backoff_secs = DESKTOP_AUTH_RENEWAL_MIN_BACKOFF_SECS;
+        let mut transport_failed = false;
+        let mut was_cloud_connected = false;
+        let mut last_logged_state = String::new();
+        let mut next_attempt = Instant::now()
+            + Duration::from_secs(desktop_auth_renewal_startup_delay_secs(current_time_ms()));
+
+        loop {
+            let cloud_connected = desktop_auth_cloud_connected(&cloud_mcp_state).await;
+            if transport_failed && cloud_connected && !was_cloud_connected {
+                next_attempt = Instant::now();
+                desktop_auth_renewal_log_state(
+                    &mut last_logged_state,
+                    "cloud_reconnected_retry",
+                    None,
+                );
+            }
+            was_cloud_connected = cloud_connected;
+
+            let now = Instant::now();
+            if now >= next_attempt {
+                let outcome = desktop_auth_renew_stored_session_once(
+                    &app,
+                    &cloud_mcp_state,
+                    "background_loop",
+                    SESSION_RENEW_TIMEOUT_SECS,
+                )
+                .await;
+                let now = Instant::now();
+                match outcome {
+                    DesktopAuthRenewOutcome::Renewed => {
+                        transport_failed = false;
+                        backoff_secs = DESKTOP_AUTH_RENEWAL_MIN_BACKOFF_SECS;
+                        desktop_auth_renewal_log_state(&mut last_logged_state, "renewed", None);
+                        next_attempt = now
+                            + Duration::from_secs(desktop_auth_renewal_interval_secs(
+                                current_time_ms(),
+                            ));
+                    }
+                    DesktopAuthRenewOutcome::NoSession => {
+                        transport_failed = false;
+                        backoff_secs = DESKTOP_AUTH_RENEWAL_MIN_BACKOFF_SECS;
+                        desktop_auth_renewal_log_state(&mut last_logged_state, "no_session", None);
+                        next_attempt =
+                            now + Duration::from_secs(DESKTOP_AUTH_RENEWAL_NO_SESSION_SECS);
+                    }
+                    DesktopAuthRenewOutcome::AuthRejected(error) => {
+                        transport_failed = false;
+                        backoff_secs = DESKTOP_AUTH_RENEWAL_MIN_BACKOFF_SECS;
+                        desktop_auth_renewal_log_state(
+                            &mut last_logged_state,
+                            "auth_rejected",
+                            Some(&error),
+                        );
+                        next_attempt =
+                            now + Duration::from_secs(DESKTOP_AUTH_RENEWAL_NO_SESSION_SECS);
+                    }
+                    DesktopAuthRenewOutcome::TransportError(error) => {
+                        transport_failed = true;
+                        desktop_auth_renewal_log_state(
+                            &mut last_logged_state,
+                            "transport_error",
+                            Some(&error),
+                        );
+                        next_attempt = now + Duration::from_secs(backoff_secs);
+                        backoff_secs = desktop_auth_next_renew_backoff_secs(backoff_secs);
+                    }
+                }
+            }
+
+            let now = Instant::now();
+            let until_next = next_attempt
+                .checked_duration_since(now)
+                .unwrap_or(Duration::ZERO);
+            let sleep_for = until_next
+                .min(Duration::from_secs(DESKTOP_AUTH_RENEWAL_CONNECTIVITY_POLL_SECS))
+                .max(Duration::from_secs(1));
+            sleep(sleep_for).await;
+        }
+    });
+}
+
+pub(crate) async fn desktop_auth_preflight_automatic_restart(
+    app: &AppHandle,
+    cloud_mcp_state: &CloudMcpState,
+) -> DesktopAuthPreflightResult {
+    let snapshot = desktop_auth_snapshot(app);
+    let Some(token) = desktop_auth_snapshot_token(&snapshot) else {
+        if desktop_auth_snapshot_has_rejected_session(&snapshot) {
+            return DesktopAuthPreflightResult::new(
+                DesktopAuthPreflightStatus::AuthRejected,
+                Some(DESKTOP_AUTH_SESSION_EXPIRED_MESSAGE.to_string()),
+            );
+        }
+        return DesktopAuthPreflightResult::new(DesktopAuthPreflightStatus::NoSession, None);
+    };
+    if token.is_empty() || !desktop_auth_snapshot_pending_state(&snapshot).is_empty() {
+        return DesktopAuthPreflightResult::new(DesktopAuthPreflightStatus::NoSession, None);
+    }
+
+    match validate_desktop_session_checked(token.clone()).await {
+        Ok(_) => {}
+        Err(error) => {
+            if error.kind == DesktopAuthSessionFailureKind::AuthRejected {
+                desktop_auth_mark_stored_session_rejected(
+                    app,
+                    cloud_mcp_state,
+                    &token,
+                    &error.message,
+                )
+                .await;
+                return DesktopAuthPreflightResult::new(
+                    DesktopAuthPreflightStatus::AuthRejected,
+                    Some(error.message),
+                );
+            }
+            return DesktopAuthPreflightResult::new(
+                DesktopAuthPreflightStatus::TransportError,
+                Some(error.message),
+            );
+        }
+    }
+
+    match desktop_auth_renew_stored_session_once(
+        app,
+        cloud_mcp_state,
+        "automatic_restart_preflight",
+        SESSION_RENEW_TIMEOUT_SECS,
+    )
+    .await
+    {
+        DesktopAuthRenewOutcome::Renewed | DesktopAuthRenewOutcome::NoSession => {
+            DesktopAuthPreflightResult::new(DesktopAuthPreflightStatus::AuthOk, None)
+        }
+        DesktopAuthRenewOutcome::AuthRejected(error) => DesktopAuthPreflightResult::new(
+            DesktopAuthPreflightStatus::AuthRejected,
+            Some(error),
+        ),
+        DesktopAuthRenewOutcome::TransportError(error) => DesktopAuthPreflightResult::new(
+            DesktopAuthPreflightStatus::TransportError,
+            Some(error),
+        ),
+    }
+}
+
 async fn exchange_desktop_auth_code(code: String, state: String) -> Result<Value, String> {
     validate_auth_value("Desktop auth code", &code)?;
     validate_auth_value("Desktop auth state", &state)?;
@@ -1917,18 +2413,55 @@ async fn exchange_desktop_auth_code(code: String, state: String) -> Result<Value
     read_api_response(response, "Desktop login expired. Try again.").await
 }
 
-async fn validate_desktop_session(token: String) -> Result<Value, String> {
-    validate_auth_value("Desktop session", &token)?;
+async fn validate_desktop_session_checked(
+    token: String,
+) -> Result<Value, DesktopAuthSessionFailure> {
+    validate_auth_value("Desktop session", &token).map_err(|error| {
+        DesktopAuthSessionFailure::new(DesktopAuthSessionFailureKind::AuthRejected, error)
+    })?;
 
-    let client = http_client(Duration::from_secs(SESSION_VALIDATE_TIMEOUT_SECS))?;
+    let client = http_client(Duration::from_secs(SESSION_VALIDATE_TIMEOUT_SECS)).map_err(|error| {
+        DesktopAuthSessionFailure::new(DesktopAuthSessionFailureKind::Transport, error)
+    })?;
     let response = client
         .get(api_endpoint("desktop/session"))
         .bearer_auth(token)
         .send()
         .await
-        .map_err(|error| format!("Unable to validate desktop session: {error}"))?;
+        .map_err(|error| {
+            DesktopAuthSessionFailure::new(
+                DesktopAuthSessionFailureKind::Transport,
+                format!("Unable to validate desktop session: {error}"),
+            )
+        })?;
 
-    read_api_response(response, "Desktop session expired.").await
+    read_desktop_auth_api_response(response, "Desktop session expired.").await
+}
+
+async fn renew_desktop_session_checked(
+    token: String,
+    timeout_secs: u64,
+) -> Result<Value, DesktopAuthSessionFailure> {
+    validate_auth_value("Desktop session", &token).map_err(|error| {
+        DesktopAuthSessionFailure::new(DesktopAuthSessionFailureKind::AuthRejected, error)
+    })?;
+
+    let client = http_client(Duration::from_secs(timeout_secs)).map_err(|error| {
+        DesktopAuthSessionFailure::new(DesktopAuthSessionFailureKind::Transport, error)
+    })?;
+    let response = client
+        .post(api_endpoint("desktop/session/renew"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|error| {
+            DesktopAuthSessionFailure::new(
+                DesktopAuthSessionFailureKind::Transport,
+                format!("Unable to renew desktop session: {error}"),
+            )
+        })?;
+
+    read_desktop_auth_api_response(response, "Desktop session expired.").await
 }
 
 async fn logout_desktop_session(token: String) -> Result<Value, String> {
@@ -2289,6 +2822,7 @@ fn desktop_auth_cli_snapshot_from_session(session: Value) -> Result<Value, Strin
         "message": "Signed in from the command line.",
         "error": "",
         "token": token,
+        "expiresAt": desktop_auth_session_expires_at(&session),
         "user": user,
         "pendingState": "",
         "billingStatus": Value::Null,
@@ -2619,11 +3153,13 @@ mod desktop_auth_tests {
     fn public_snapshot_redacts_private_auth_values() {
         let token = "a".repeat(MIN_AUTH_VALUE_LENGTH);
         let pending_state = "b".repeat(MIN_AUTH_VALUE_LENGTH);
+        let expires_at = "2026-08-07T00:00:00.000Z";
         let snapshot = desktop_auth_snapshot_from_raw(json!({
             "status": "authenticated",
             "stage": "authenticated",
             "message": "ok",
             "token": token,
+            "expiresAt": expires_at,
             "pendingState": pending_state,
             "user": { "id": "user-1", "email": "user@example.com" },
         }));
@@ -2641,6 +3177,70 @@ mod desktop_auth_tests {
             public_snapshot.get("accountKey").and_then(Value::as_str),
             Some("user-1")
         );
+        assert_eq!(
+            public_snapshot.get("expiresAt").and_then(Value::as_str),
+            Some(expires_at)
+        );
+    }
+
+    #[test]
+    fn desktop_auth_failure_classifier_separates_auth_from_transport() {
+        assert_eq!(
+            desktop_auth_failure_kind_for_status(reqwest::StatusCode::UNAUTHORIZED),
+            DesktopAuthSessionFailureKind::AuthRejected
+        );
+        assert_eq!(
+            desktop_auth_failure_kind_for_status(reqwest::StatusCode::FORBIDDEN),
+            DesktopAuthSessionFailureKind::AuthRejected
+        );
+        assert_eq!(
+            desktop_auth_failure_kind_for_status(reqwest::StatusCode::BAD_REQUEST),
+            DesktopAuthSessionFailureKind::Transport
+        );
+        assert_eq!(
+            desktop_auth_failure_kind_for_status(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            DesktopAuthSessionFailureKind::Transport
+        );
+        assert_eq!(
+            desktop_auth_failure_kind_for_status(reqwest::StatusCode::BAD_GATEWAY),
+            DesktopAuthSessionFailureKind::Transport
+        );
+        assert_eq!(
+            desktop_auth_classify_error_message("Desktop session expired."),
+            DesktopAuthSessionFailureKind::AuthRejected
+        );
+        assert_eq!(
+            desktop_auth_classify_error_message("Unable to validate desktop session: timed out"),
+            DesktopAuthSessionFailureKind::Transport
+        );
+    }
+
+    #[test]
+    fn rejected_signed_out_snapshot_blocks_automatic_restart() {
+        let rejected = desktop_auth_signed_out_snapshot(
+            "Your desktop session expired. Sign in again with the web app.",
+            DESKTOP_AUTH_SESSION_EXPIRED_MESSAGE,
+            true,
+        );
+        let manual = desktop_auth_signed_out_snapshot(DESKTOP_AUTH_DEFAULT_MESSAGE, "", true);
+
+        assert!(desktop_auth_snapshot_has_rejected_session(&rejected));
+        assert!(!desktop_auth_snapshot_has_rejected_session(&manual));
+    }
+
+    #[test]
+    fn desktop_auth_renewal_backoff_is_capped() {
+        assert_eq!(
+            desktop_auth_next_renew_backoff_secs(DESKTOP_AUTH_RENEWAL_MIN_BACKOFF_SECS),
+            DESKTOP_AUTH_RENEWAL_MIN_BACKOFF_SECS * 2
+        );
+        assert_eq!(
+            desktop_auth_next_renew_backoff_secs(DESKTOP_AUTH_RENEWAL_MAX_BACKOFF_SECS),
+            DESKTOP_AUTH_RENEWAL_MAX_BACKOFF_SECS
+        );
+        let interval = desktop_auth_renewal_interval_secs(0);
+        assert!(interval >= DESKTOP_AUTH_RENEWAL_INTERVAL_SECS - DESKTOP_AUTH_RENEWAL_JITTER_SECS);
+        assert!(interval <= DESKTOP_AUTH_RENEWAL_INTERVAL_SECS + DESKTOP_AUTH_RENEWAL_JITTER_SECS);
     }
 
     #[test]

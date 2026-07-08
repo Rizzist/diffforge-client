@@ -9710,6 +9710,7 @@ fn run_app(daemon: bool) {
             });
             let cloud_mcp_state = app.state::<CloudMcpState>().inner().clone();
             let cloud_mcp_app = app.handle().clone();
+            desktop_auth_start_renewal_loop(app.handle().clone(), cloud_mcp_state.clone());
             tauri::async_runtime::spawn(async move {
                 // Restore the persisted desktop session before the first
                 // connect so cloud auth comes up without waiting for the

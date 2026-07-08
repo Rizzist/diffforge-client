@@ -33,9 +33,12 @@ static APP_UPDATE_INSTALLING: AtomicBool = AtomicBool::new(false);
 // GUI mode is opt-in. Daemons default to on unless DIFFFORGE_DAEMON_AUTO_UPDATE=0.
 static APP_UPDATE_AUTO_WHEN_IDLE: AtomicBool = AtomicBool::new(false);
 static APP_UPDATE_REMOTE_RESTART_WATCH_ACTIVE: AtomicBool = AtomicBool::new(false);
+static APP_UPDATE_AUTH_TRANSPORT_RESTART_DEFERRED: AtomicBool = AtomicBool::new(false);
+static APP_UPDATE_AUTH_RESTART_BLOCKED: AtomicBool = AtomicBool::new(false);
 static APP_UPDATE_STATE: AtomicU8 = AtomicU8::new(APP_UPDATE_STATE_IDLE);
 static APP_UPDATE_AVAILABLE: StdMutex<Option<AppUpdateInfo>> = StdMutex::new(None);
 static APP_UPDATE_STAGED: StdMutex<Option<AppUpdateStaged>> = StdMutex::new(None);
+static APP_UPDATE_LAST_ERROR: StdMutex<Option<String>> = StdMutex::new(None);
 
 #[derive(Clone, Serialize)]
 struct AppUpdateInfo {
@@ -65,6 +68,13 @@ struct AppUpdateStagedRestart {
     bytes: Option<Vec<u8>>,
     #[cfg(windows)]
     update: Option<tauri_plugin_updater::Update>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppUpdateAutomaticRestartAuthDecision {
+    Proceed,
+    Block,
+    Defer,
 }
 
 fn app_update_available_snapshot() -> Option<AppUpdateInfo> {
@@ -111,6 +121,19 @@ fn app_update_store_staged(staged: Option<AppUpdateStaged>) {
     *APP_UPDATE_STAGED
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = staged;
+}
+
+fn app_update_last_error() -> Option<String> {
+    APP_UPDATE_LAST_ERROR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn app_update_store_last_error(error: Option<String>) {
+    *APP_UPDATE_LAST_ERROR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = error;
 }
 
 fn app_update_settings_to_value() -> Value {
@@ -261,6 +284,7 @@ fn app_update_status_snapshot() -> Value {
         "ready": staged.is_some(),
         "staged": staged,
         "autoRestartWhenIdle": APP_UPDATE_AUTO_WHEN_IDLE.load(Ordering::Acquire),
+        "error": app_update_last_error(),
         "currentVersion": env!("CARGO_PKG_VERSION"),
     })
 }
@@ -277,7 +301,15 @@ fn app_update_state_label(state: u8) -> &'static str {
 }
 
 fn app_update_store_state(state: u8) {
+    if state != APP_UPDATE_STATE_FAILED {
+        app_update_store_last_error(None);
+    }
     APP_UPDATE_STATE.store(state, Ordering::Release);
+}
+
+fn app_update_store_failed_state(error: &str) {
+    app_update_store_last_error(Some(error.to_string()));
+    app_update_store_state(APP_UPDATE_STATE_FAILED);
 }
 
 fn app_update_publish_device_state(app: &AppHandle, reason: &str) {
@@ -291,6 +323,128 @@ fn app_update_publish_device_state(app: &AppHandle, reason: &str) {
 async fn app_update_publish_device_state_now(app: &AppHandle, reason: &str) {
     let state = app.state::<CloudMcpState>().inner().clone();
     cloud_mcp_publish_device_live_state_snapshot(&state, reason).await;
+}
+
+fn app_update_automatic_restart_auth_decision(
+    status: DesktopAuthPreflightStatus,
+    _daemon_mode: bool,
+    transport_deferred_once: bool,
+) -> AppUpdateAutomaticRestartAuthDecision {
+    match status {
+        DesktopAuthPreflightStatus::AuthOk | DesktopAuthPreflightStatus::NoSession => {
+            AppUpdateAutomaticRestartAuthDecision::Proceed
+        }
+        DesktopAuthPreflightStatus::AuthRejected => AppUpdateAutomaticRestartAuthDecision::Block,
+        DesktopAuthPreflightStatus::TransportError if transport_deferred_once => {
+            AppUpdateAutomaticRestartAuthDecision::Proceed
+        }
+        DesktopAuthPreflightStatus::TransportError => AppUpdateAutomaticRestartAuthDecision::Defer,
+    }
+}
+
+fn app_update_emit_auth_restart_blocked(
+    app: &AppHandle,
+    source: &str,
+    error: &str,
+    detail: Option<&str>,
+) {
+    app_update_store_failed_state(error);
+    app_update_publish_device_state(app, "app_update_auth_restart_blocked");
+    let detail = detail
+        .map(clean_terminal_telemetry_text)
+        .unwrap_or_default();
+    let _ = app.emit(
+        APP_UPDATE_STATE_EVENT,
+        json!({
+            "state": "failed",
+            "error": error,
+            "detail": detail,
+            "source": source,
+        }),
+    );
+    log_terminal_status_event(
+        "backend.app_update.auth_restart_blocked",
+        json!({
+            "source": source,
+            "error": error,
+            "detail": detail,
+        }),
+    );
+}
+
+async fn app_update_automatic_restart_auth_gate(
+    app: &AppHandle,
+    source: &str,
+) -> Result<(), String> {
+    let cloud_mcp_state = app.state::<CloudMcpState>().inner().clone();
+    let preflight = desktop_auth_preflight_automatic_restart(app, &cloud_mcp_state).await;
+    let transport_deferred_once =
+        APP_UPDATE_AUTH_TRANSPORT_RESTART_DEFERRED.load(Ordering::Acquire);
+    let decision = app_update_automatic_restart_auth_decision(
+        preflight.status,
+        crate::daemon_mode_active(),
+        transport_deferred_once,
+    );
+
+    match decision {
+        AppUpdateAutomaticRestartAuthDecision::Proceed => {
+            if preflight.status == DesktopAuthPreflightStatus::NoSession
+                && APP_UPDATE_AUTH_RESTART_BLOCKED.load(Ordering::Acquire)
+            {
+                app_update_emit_auth_restart_blocked(
+                    app,
+                    source,
+                    "auth_expired_restart_blocked",
+                    Some("Stored desktop session was rejected before restart."),
+                );
+                return Err("auth_expired_restart_blocked".to_string());
+            }
+            if preflight.status == DesktopAuthPreflightStatus::AuthOk {
+                APP_UPDATE_AUTH_RESTART_BLOCKED.store(false, Ordering::Release);
+            }
+            if preflight.status == DesktopAuthPreflightStatus::TransportError {
+                log_terminal_status_event(
+                    "backend.app_update.auth_transport_restart_allowed_after_defer",
+                    json!({
+                        "source": source,
+                        "error": preflight.error.as_deref().map(clean_terminal_telemetry_text),
+                    }),
+                );
+            }
+            APP_UPDATE_AUTH_TRANSPORT_RESTART_DEFERRED.store(false, Ordering::Release);
+            Ok(())
+        }
+        AppUpdateAutomaticRestartAuthDecision::Block => {
+            APP_UPDATE_AUTH_TRANSPORT_RESTART_DEFERRED.store(false, Ordering::Release);
+            APP_UPDATE_AUTH_RESTART_BLOCKED.store(true, Ordering::Release);
+            app_update_emit_auth_restart_blocked(
+                app,
+                source,
+                "auth_expired_restart_blocked",
+                preflight.error.as_deref(),
+            );
+            Err("auth_expired_restart_blocked".to_string())
+        }
+        AppUpdateAutomaticRestartAuthDecision::Defer => {
+            APP_UPDATE_AUTH_TRANSPORT_RESTART_DEFERRED.store(true, Ordering::Release);
+            APP_UPDATE_AUTH_RESTART_BLOCKED.store(false, Ordering::Release);
+            app_update_emit_auth_restart_blocked(
+                app,
+                source,
+                "auth_transport_restart_deferred",
+                preflight.error.as_deref(),
+            );
+            Err("auth_transport_restart_deferred".to_string())
+        }
+    }
+}
+
+async fn app_update_install_and_restart_automatic(
+    app: AppHandle,
+    source: &str,
+) -> Result<(), String> {
+    app_update_automatic_restart_auth_gate(&app, source).await?;
+    app_update_install_and_restart(app).await
 }
 
 fn app_update_restart_or_exit(app: &AppHandle) {
@@ -335,11 +489,19 @@ pub(crate) fn app_update_device_payload() -> Value {
         "current_version": env!("CARGO_PKG_VERSION"),
         "available_version": available_version,
         "state": app_update_state_label(state),
+        "error": app_update_last_error(),
     })
 }
 
 fn app_update_operation_in_progress_error(error: &str) -> bool {
     error.contains("already in progress")
+}
+
+fn app_update_auth_restart_gate_error(error: &str) -> bool {
+    matches!(
+        error,
+        "auth_expired_restart_blocked" | "auth_transport_restart_deferred"
+    )
 }
 
 fn app_update_already_running_response(daemon_mode: bool) -> Value {
@@ -366,13 +528,31 @@ fn app_update_remote_restart_queued_response(daemon_mode: bool, newly_queued: bo
     })
 }
 
+fn app_update_remote_restart_gate_response(
+    daemon_mode: bool,
+    newly_queued: bool,
+    error: &str,
+) -> Value {
+    let clean_error = clean_terminal_telemetry_text(error);
+    json!({
+        "ok": false,
+        "daemon_mode": daemon_mode,
+        "queued": true,
+        "restart_when_idle": true,
+        "already_queued": !newly_queued,
+        "error": clean_error,
+        "app_update": app_update_device_payload(),
+        "status": app_update_status_snapshot(),
+    })
+}
+
 async fn app_updater_run_check(app: &AppHandle) -> Result<Option<AppUpdateInfo>, String> {
     app_update_store_state(APP_UPDATE_STATE_CHECKING);
     app_update_publish_device_state(app, "app_update_checking");
     let updater = match app_updater_instance(app) {
         Ok(updater) => updater,
         Err(error) => {
-            app_update_store_state(APP_UPDATE_STATE_FAILED);
+            app_update_store_failed_state(&error);
             app_update_publish_device_state(app, "app_update_failed");
             return Err(error);
         }
@@ -380,9 +560,10 @@ async fn app_updater_run_check(app: &AppHandle) -> Result<Option<AppUpdateInfo>,
     let update = match updater.check().await {
         Ok(update) => update,
         Err(error) => {
-            app_update_store_state(APP_UPDATE_STATE_FAILED);
+            let error = format!("Update check failed: {error}");
+            app_update_store_failed_state(&error);
             app_update_publish_device_state(app, "app_update_failed");
-            return Err(format!("Update check failed: {error}"));
+            return Err(error);
         }
     };
     let Some(update) = update else {
@@ -481,7 +662,12 @@ async fn app_update_auto_restart_watch(app: &AppHandle) {
                 log_terminal_status_event("backend.app_update.auto_restart_idle", json!({}));
                 // Shares the manual path: installing guard, failure events,
                 // and the restart (on success this never returns).
-                if let Err(error) = app_update_install_and_restart(app.clone()).await {
+                if let Err(error) = app_update_install_and_restart_automatic(
+                    app.clone(),
+                    "idle_watcher",
+                )
+                .await
+                {
                     log_terminal_status_event(
                         "backend.app_update.auto_restart_failed",
                         json!({ "error": error }),
@@ -489,6 +675,9 @@ async fn app_update_auto_restart_watch(app: &AppHandle) {
                     // Back off before the outer loop re-checks, so a
                     // persistent failure can't turn into a download storm.
                     sleep(Duration::from_secs(APP_UPDATE_IDLE_POLL_SECS)).await;
+                    if app_update_auth_restart_gate_error(&error) {
+                        continue;
+                    }
                     return;
                 }
             }
@@ -535,7 +724,7 @@ async fn app_update_install_and_restart(app: AppHandle) -> Result<(), String> {
     let result = app_update_install_inner(&app).await;
     if let Err(error) = &result {
         APP_UPDATE_INSTALLING.store(false, Ordering::Release);
-        app_update_store_state(APP_UPDATE_STATE_FAILED);
+        app_update_store_failed_state(error);
         app_update_publish_device_state(&app, "app_update_failed");
         let _ = app.emit(
             APP_UPDATE_STATE_EVENT,
@@ -557,7 +746,7 @@ async fn app_update_download(app: AppHandle) -> Result<Value, String> {
     let result = app_update_download_inner(&app).await;
     APP_UPDATE_INSTALLING.store(false, Ordering::Release);
     if let Err(error) = &result {
-        app_update_store_state(APP_UPDATE_STATE_FAILED);
+        app_update_store_failed_state(error);
         app_update_publish_device_state(&app, "app_update_failed");
         let _ = app.emit(
             APP_UPDATE_STATE_EVENT,
@@ -579,7 +768,7 @@ async fn app_update_restart(app: AppHandle) -> Result<(), String> {
     let result = app_update_restart_inner(&app).await;
     if let Err(error) = &result {
         APP_UPDATE_INSTALLING.store(false, Ordering::Release);
-        app_update_store_state(APP_UPDATE_STATE_FAILED);
+        app_update_store_failed_state(error);
         app_update_publish_device_state(&app, "app_update_failed");
         let _ = app.emit(
             APP_UPDATE_STATE_EVENT,
@@ -601,7 +790,12 @@ pub(crate) async fn app_update_remote_now(app: AppHandle) -> Value {
 
     if app_update_staged_info().is_some() {
         if daemon_mode {
+            let gate_result =
+                app_update_automatic_restart_auth_gate(&app, "remote_app_update_now_ack").await;
             let newly_queued = app_update_spawn_remote_restart_when_idle(app.clone());
+            if let Err(error) = gate_result {
+                return app_update_remote_restart_gate_response(daemon_mode, newly_queued, &error);
+            }
             return app_update_remote_restart_queued_response(daemon_mode, newly_queued);
         }
         return json!({
@@ -616,22 +810,34 @@ pub(crate) async fn app_update_remote_now(app: AppHandle) -> Value {
 
     let download_result = app_update_download(app.clone()).await;
     let mut remote_restart_queued = None;
+    let mut remote_restart_gate_error = None;
     if daemon_mode && download_result.is_ok() && app_update_staged_info().is_some() {
+        remote_restart_gate_error =
+            app_update_automatic_restart_auth_gate(&app, "remote_app_update_now_ack")
+                .await
+                .err();
         remote_restart_queued = Some(app_update_spawn_remote_restart_when_idle(app.clone()));
     }
 
     match download_result {
-        Ok(status) => json!({
-            "ok": true,
-            "daemon_mode": daemon_mode,
-            "queued": remote_restart_queued.is_some(),
-            "restart_when_idle": remote_restart_queued.is_some(),
-            "already_queued": remote_restart_queued
-                .map(|newly_queued| !newly_queued)
-                .unwrap_or(false),
-            "app_update": app_update_device_payload(),
-            "status": status,
-        }),
+        Ok(status) => {
+            if let (Some(newly_queued), Some(error)) =
+                (remote_restart_queued, remote_restart_gate_error)
+            {
+                return app_update_remote_restart_gate_response(daemon_mode, newly_queued, &error);
+            }
+            json!({
+                "ok": true,
+                "daemon_mode": daemon_mode,
+                "queued": remote_restart_queued.is_some(),
+                "restart_when_idle": remote_restart_queued.is_some(),
+                "already_queued": remote_restart_queued
+                    .map(|newly_queued| !newly_queued)
+                    .unwrap_or(false),
+                "app_update": app_update_device_payload(),
+                "status": status,
+            })
+        }
         Err(error) => {
             if app_update_operation_in_progress_error(&error) {
                 return app_update_already_running_response(daemon_mode);
@@ -682,12 +888,20 @@ async fn app_update_remote_restart_when_idle(app: AppHandle) {
                 return;
             }
             if app_update_all_terminals_idle(&app).await {
-                let result = app_update_install_and_restart(app.clone()).await;
+                let result = app_update_install_and_restart_automatic(
+                    app.clone(),
+                    "remote_app_update_now",
+                )
+                .await;
                 if let Err(error) = result {
                     log_terminal_status_event(
                         "backend.app_update.remote_restart_failed",
                         json!({ "error": clean_terminal_telemetry_text(&error) }),
                     );
+                    if app_update_auth_restart_gate_error(&error) {
+                        sleep(Duration::from_secs(APP_UPDATE_IDLE_POLL_SECS)).await;
+                        continue;
+                    }
                 }
                 return;
             }
@@ -904,5 +1118,57 @@ mod app_update_tests {
             false,
             Some("0")
         ));
+    }
+
+    #[test]
+    fn automatic_restart_auth_decision_blocks_auth_rejection() {
+        for daemon_mode in [false, true] {
+            assert_eq!(
+                app_update_automatic_restart_auth_decision(
+                    DesktopAuthPreflightStatus::AuthOk,
+                    daemon_mode,
+                    false,
+                ),
+                AppUpdateAutomaticRestartAuthDecision::Proceed
+            );
+            assert_eq!(
+                app_update_automatic_restart_auth_decision(
+                    DesktopAuthPreflightStatus::NoSession,
+                    daemon_mode,
+                    false,
+                ),
+                AppUpdateAutomaticRestartAuthDecision::Proceed
+            );
+            assert_eq!(
+                app_update_automatic_restart_auth_decision(
+                    DesktopAuthPreflightStatus::AuthRejected,
+                    daemon_mode,
+                    false,
+                ),
+                AppUpdateAutomaticRestartAuthDecision::Block
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_restart_auth_decision_defers_one_transport_cycle() {
+        for daemon_mode in [false, true] {
+            assert_eq!(
+                app_update_automatic_restart_auth_decision(
+                    DesktopAuthPreflightStatus::TransportError,
+                    daemon_mode,
+                    false,
+                ),
+                AppUpdateAutomaticRestartAuthDecision::Defer
+            );
+            assert_eq!(
+                app_update_automatic_restart_auth_decision(
+                    DesktopAuthPreflightStatus::TransportError,
+                    daemon_mode,
+                    true,
+                ),
+                AppUpdateAutomaticRestartAuthDecision::Proceed
+            );
+        }
     }
 }
