@@ -22962,6 +22962,10 @@ export const WorkspaceCreateSurface = styled.div`
 
 export const WorkspaceCreateCard = styled.form`
   display: grid;
+  /* Cap the content column so the form doesn't sprawl on wide/full-screen
+     windows; the surface background still fills edge-to-edge and scrolls. */
+  grid-template-columns: min(100%, 1180px);
+  justify-content: center;
   width: 100%;
   height: 100%;
   min-width: 0;

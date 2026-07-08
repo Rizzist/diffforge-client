@@ -13132,6 +13132,67 @@ function getTodoQueueItemImages(item) {
   ].filter(Boolean));
 }
 
+function normalizeTodoQueueChatAttachmentRef(value) {
+  const attachment = value && typeof value === "object" ? value : null;
+  if (!attachment) {
+    return null;
+  }
+  const attachmentId = String(
+    attachment.attachment_id || attachment.attachmentId || attachment.id || "",
+  ).trim();
+  const sha256 = String(attachment.sha256 || attachment.hash || "").trim().toLowerCase();
+  const bytes = Number.parseInt(String(
+    attachment.bytes ?? attachment.size ?? attachment.sizeBytes ?? attachment.size_bytes ?? "",
+  ), 10);
+  const mime = String(
+    attachment.mime || attachment.mimeType || attachment.mime_type || attachment.type || "",
+  ).trim().toLowerCase().split(";")[0];
+  const name = String(attachment.name || attachment.fileName || attachment.file_name || "").trim();
+  if (!attachmentId || !/^[a-f0-9]{64}$/.test(sha256) || !Number.isFinite(bytes) || bytes <= 0 || !mime) {
+    return null;
+  }
+  return {
+    attachment_id: attachmentId,
+    attachmentId,
+    bytes,
+    mime,
+    name,
+    sha256,
+  };
+}
+
+function dedupeTodoQueueChatAttachments(attachments) {
+  const seen = new Set();
+  return (Array.isArray(attachments) ? attachments : [])
+    .map(normalizeTodoQueueChatAttachmentRef)
+    .filter((attachment) => {
+      if (!attachment || seen.has(attachment.sha256)) {
+        return false;
+      }
+      seen.add(attachment.sha256);
+      return true;
+    });
+}
+
+function getTodoQueueItemChatAttachments(item) {
+  if (!item || typeof item !== "object") {
+    return [];
+  }
+  const remoteCommand = item.remoteCommand && typeof item.remoteCommand === "object"
+    ? item.remoteCommand
+    : item.remote_command && typeof item.remote_command === "object"
+      ? item.remote_command
+      : {};
+  return dedupeTodoQueueChatAttachments([
+    ...(Array.isArray(item.attachments) ? item.attachments : []),
+    ...(Array.isArray(item.chatAttachments) ? item.chatAttachments : []),
+    ...(Array.isArray(item.chat_attachments) ? item.chat_attachments : []),
+    ...(Array.isArray(remoteCommand.attachments) ? remoteCommand.attachments : []),
+    ...(Array.isArray(remoteCommand.chatAttachments) ? remoteCommand.chatAttachments : []),
+    ...(Array.isArray(remoteCommand.chat_attachments) ? remoteCommand.chat_attachments : []),
+  ]);
+}
+
 function getTodoQueueItemWithImages(item, images) {
   const nextItem = item && typeof item === "object" ? { ...item } : {};
   const nextImages = dedupeTodoQueueImages(images);
@@ -14937,8 +14998,10 @@ function getTodoQueueItemLogSummary(items) {
     .map((item) => {
       const images = getTodoQueueItemImages(item);
       const image = images[0] || null;
+      const attachments = getTodoQueueItemChatAttachments(item);
       const note = getTodoQueueItemNote(item);
       return {
+        attachmentCount: attachments.length,
         hasImage: images.length > 0,
         hasNote: Boolean(note),
         id: String(item?.id || ""),
@@ -15431,6 +15494,7 @@ function createTodoQueueItem(text, options = {}) {
     ? options.images
     : [options.image]);
   const image = images[0] || null;
+  const attachments = getTodoQueueItemChatAttachments(options);
   const note = normalizeTodoQueueNote(options.note);
   const kind = normalizeTodoQueueKind(options.kind);
   const source = normalizeTodoQueueSource(options.source);
@@ -15495,6 +15559,7 @@ function createTodoQueueItem(text, options = {}) {
     ...(options.updatedAt || options.updated_at ? { updatedAt: String(options.updatedAt || options.updated_at) } : {}),
     ...(image ? { image } : {}),
     ...(images.length > 1 ? { images } : {}),
+    ...(attachments.length ? { attachments } : {}),
     kind,
     ...(note ? { note } : {}),
     ...(planTask ? { planTask } : {}),
@@ -15546,6 +15611,7 @@ function normalizeTodoQueueItem(item) {
   const text = normalizeTodoQueueText(item.text);
   const images = getTodoQueueItemImages(item);
   const image = images[0] || null;
+  const attachments = getTodoQueueItemChatAttachments(item);
   const note = getTodoQueueItemNote(item);
   const kind = normalizeTodoQueueKind(item.kind || item.type);
   const source = normalizeTodoQueueSource(item.source);
@@ -15605,7 +15671,7 @@ function normalizeTodoQueueItem(item) {
       ? item.reason || item.todoStatusReason || item.todo_status_reason || item.statusReason || item.status_reason || ""
       : item.todoStatusReason || item.todo_status_reason || item.statusReason || item.status_reason || item.reason || "",
   ).trim();
-  if (!text && !images.length && !note) {
+  if (!text && !images.length && !note && !attachments.length) {
     return null;
   }
 
@@ -15617,6 +15683,7 @@ function normalizeTodoQueueItem(item) {
     ...(item.updatedAt || item.updated_at ? { updatedAt: String(item.updatedAt || item.updated_at) } : {}),
     ...(image ? { image } : {}),
     ...(images.length > 1 ? { images } : {}),
+    ...(attachments.length ? { attachments } : {}),
     kind,
     ...(note ? { note } : {}),
     ...(planTask ? { planTask } : {}),
@@ -15733,6 +15800,7 @@ function buildTodoQueueCloudSyncItem(item, {
   }
   const images = getTodoQueueItemImages(normalizedItem);
   const image = images[0] || null;
+  const attachments = getTodoQueueItemChatAttachments(normalizedItem);
   const note = getTodoQueueItemNote(normalizedItem);
   const queuedAt = getTodoQueueItemQueuedAt(normalizedItem);
   const agentSessionFields = getTodoQueueAgentSessionCloudFields(normalizedItem);
@@ -15793,6 +15861,7 @@ function buildTodoQueueCloudSyncItem(item, {
         type: nextImage.type || "",
       })),
     } : {}),
+    ...(attachments.length ? { attachments } : {}),
     ...(normalizedItem.planTask ? { planTask: normalizedItem.planTask } : {}),
     ...(normalizedItem.remoteCommand ? { remoteCommand: normalizedItem.remoteCommand } : {}),
     ...(providerSessionCleared ? {
@@ -22945,7 +23014,6 @@ function WorkspaceVideoGridPane({
           </TerminalCloseButton>
         </TerminalRailControls>
         <TerminalRailControls data-rail-row="secondary">
-          <PanelAgentPromptActivity items={panelAgentPromptActivityItems} />
           <TerminalRestartButton
             aria-label="Prompt terminal agents"
             aria-pressed={agentPromptOpen ? "true" : "false"}
@@ -23045,6 +23113,7 @@ function WorkspaceVideoGridPane({
       <TerminalVideoPanelBody>
         <VideoWorkspacePane
           key={`video-${paneId}-${repoPath}-${resumeNonce}`}
+          agentPromptActivity={panelAgentPromptActivityItems}
           controlCommand={controlCommand}
           createRequestName={createRequestName}
           createRequestNonce={createRequestNonce}
@@ -32619,6 +32688,7 @@ function TerminalView({
 
   const dispatchTodoQueueItemToTarget = useCallback((item, target, options = {}) => {
     const text = normalizeTodoQueueText(item?.text || "");
+    const attachments = getTodoQueueItemChatAttachments(item);
     const todoId = String(item?.todoId || item?.todo_id || item?.id || "").trim();
     const targetDeviceId = String(target?.targetDeviceId || "").trim();
     const targetWorkspaceId = String(target?.targetWorkspaceId || "").trim();
@@ -32699,6 +32769,7 @@ function TerminalView({
         trigger_run_id: item.remoteCommand.triggerRunId || item.remoteCommand.trigger_run_id,
       } : {}),
       source: queuedMode ? "cloud-diffforge-todo-dispatch" : "cloud-diffforge-listed-todo",
+      ...(attachments.length ? { attachments } : {}),
       todoDeviceId: sourceDeviceId,
       todoDispatchId: dispatchId,
       todoId,
@@ -32715,6 +32786,7 @@ function TerminalView({
       todoId,
       todoWorkspaceId: sourceWorkspaceId,
       dispatchSource,
+      ...(attachments.length ? { attachments } : {}),
       ...(item?.accountId ? { todoAccountId: item.accountId } : {}),
       ...(sourceDeviceId ? { todoDeviceId: sourceDeviceId } : {}),
     };
@@ -32733,6 +32805,7 @@ function TerminalView({
       const queuedItem = normalizeTodoQueueItem(
         options.source === "peer"
           ? createTodoQueueItem(text, {
+            attachments,
             id: commandId,
             remoteCommand,
             source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,

@@ -380,6 +380,24 @@ const AgentUnseenDot = styled.span`
   flex: none;
 `;
 
+// Tiny loader on the Agent rail button while prompts sent from this pane are
+// still queued/running — the row-by-row detail lives inside the Agents tab.
+const AgentBusySpinner = styled.span`
+  width: 9px;
+  height: 9px;
+  flex: none;
+  border: 1.5px solid rgba(147, 197, 253, 0.28);
+  border-top-color: #93c5fd;
+  border-radius: 999px;
+  animation: video-agent-busy-spin 760ms linear infinite;
+
+  @keyframes video-agent-busy-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+`;
+
 // Transient chip announcing an agent's MCP edit, with one-tap undo.
 const AgentEditToast = styled.div`
   position: absolute;
@@ -861,6 +879,7 @@ function sameTimelineRanges(left, right) {
 // Generate / Export are toggleable panels around the always-visible
 // preview + timeline, resizable in wide panes, overlay sheets in narrow ones.
 export default function VideoWorkspacePane({
+  agentPromptActivity = [],
   controlCommand = null,
   createRequestNonce = 0,
   createRequestName = "",
@@ -1682,6 +1701,10 @@ export default function VideoWorkspacePane({
   // done/error event, matched by id. Rendered icon-first in the Agent tab.
   const [agentActivity, setAgentActivity] = useState([]);
   const [agentActivityUnseen, setAgentActivityUnseen] = useState(0);
+  const agentPromptBusy = useMemo(() => (
+    Array.isArray(agentPromptActivity)
+    && agentPromptActivity.some((item) => ["queued", "running"].includes(String(item?.status || "").trim()))
+  ), [agentPromptActivity]);
   const sidePanelRef = useRef(sidePanel);
   sidePanelRef.current = sidePanel;
   useEffect(() => {
@@ -2853,7 +2876,11 @@ export default function VideoWorkspacePane({
       repoPath={repoPath}
     />
   ) : sidePanel === "agent" ? (
-    <AgentActivityPanel entries={agentActivity} onNavigate={handleAgentActivityNavigate} />
+    <AgentActivityPanel
+      entries={agentActivity}
+      onNavigate={handleAgentActivityNavigate}
+      promptItems={agentPromptActivity}
+    />
   ) : null;
 
   return (
@@ -3022,7 +3049,9 @@ export default function VideoWorkspacePane({
               >
                 <SmartToy aria-hidden="true" />
                 Agent
-                {agentActivityUnseen > 0 && sidePanel !== "agent" ? (
+                {agentPromptBusy ? (
+                  <AgentBusySpinner aria-hidden />
+                ) : agentActivityUnseen > 0 && sidePanel !== "agent" ? (
                   <AgentUnseenDot aria-hidden />
                 ) : null}
               </VideoRailButton>

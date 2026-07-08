@@ -1372,7 +1372,9 @@ export function artifactImageUrl(artifact = {}) {
     source.url || source.href || source.asset_url || source.assetUrl
       || source.public_url || source.publicUrl,
   );
-  if (!/^https?:\/\//i.test(url)) return "";
+  // Local previews (the composer's optimistic sent-bubble attachment
+  // thumbnails) ride blob:/data:image URLs; everything else must be http(s).
+  if (!/^https?:\/\//i.test(url) && !/^blob:/i.test(url) && !/^data:image\//i.test(url)) return "";
   const kind = transcriptToken(source.kind || source.type || source.content_type || source.contentType);
   if (kind.includes("image") || kind.includes("screenshot") || kind.includes("png") || kind.includes("jpeg")) {
     return url;

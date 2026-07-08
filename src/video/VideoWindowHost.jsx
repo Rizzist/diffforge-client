@@ -21,7 +21,6 @@ import {
 } from "../app/appStyles.js";
 import { usePopoutWindowFullscreen } from "../app/usePopoutWindowFullscreen.js";
 import VideoWorkspacePane from "./VideoWorkspacePane.jsx";
-import PanelAgentPromptActivity from "../terminals/PanelAgentPromptActivity.jsx";
 import PanelAgentPromptComposer from "../terminals/PanelAgentPromptComposer.jsx";
 import {
   PANEL_AGENT_PROMPT_ACTIVITY_EVENT,
@@ -439,7 +438,6 @@ export default function VideoWindowHost() {
           </PanelCloseButton>
         </TerminalRailControls>
         <TerminalRailControls data-rail-row="secondary">
-          <PanelAgentPromptActivity items={agentPromptActivityItems} />
           <PanelIconButton
             aria-label="Prompt terminal agents"
             aria-pressed={agentPromptOpen ? "true" : "false"}
@@ -464,6 +462,7 @@ export default function VideoWindowHost() {
       </PanelChrome>
       <PanelBody>
         <VideoWorkspacePane
+          agentPromptActivity={agentPromptActivityItems}
           controlCommand={panelCommand}
           isActive
           onProjectChange={handleProjectChange}

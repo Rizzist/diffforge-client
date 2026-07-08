@@ -42,8 +42,15 @@ fn todo_dispatch_app_started_ms() -> u64 {
 
 fn todo_dispatch_text(value: &Value, keys: &[&str]) -> String {
     let payload = value.get("payload").filter(|nested| nested.is_object());
+    let request = value.get("request").filter(|nested| nested.is_object());
+    let payload_request = payload
+        .and_then(|nested| nested.get("request"))
+        .filter(|nested| nested.is_object());
     for key in keys {
-        for source in [Some(value), payload].into_iter().flatten() {
+        for source in [Some(value), payload, request, payload_request]
+            .into_iter()
+            .flatten()
+        {
             if let Some(text) = source
                 .get(*key)
                 .and_then(Value::as_str)
@@ -59,8 +66,15 @@ fn todo_dispatch_text(value: &Value, keys: &[&str]) -> String {
 
 fn todo_dispatch_i64(value: &Value, keys: &[&str]) -> Option<i64> {
     let payload = value.get("payload").filter(|nested| nested.is_object());
+    let request = value.get("request").filter(|nested| nested.is_object());
+    let payload_request = payload
+        .and_then(|nested| nested.get("request"))
+        .filter(|nested| nested.is_object());
     for key in keys {
-        for source in [Some(value), payload].into_iter().flatten() {
+        for source in [Some(value), payload, request, payload_request]
+            .into_iter()
+            .flatten()
+        {
             if let Some(number) = source.get(*key).and_then(Value::as_i64) {
                 return Some(number);
             }
@@ -76,6 +90,107 @@ fn todo_dispatch_i64(value: &Value, keys: &[&str]) -> Option<i64> {
         }
     }
     None
+}
+
+fn todo_dispatch_u64(value: &Value, keys: &[&str]) -> Option<u64> {
+    let payload = value.get("payload").filter(|nested| nested.is_object());
+    let request = value.get("request").filter(|nested| nested.is_object());
+    let payload_request = payload
+        .and_then(|nested| nested.get("request"))
+        .filter(|nested| nested.is_object());
+    for key in keys {
+        for source in [Some(value), payload, request, payload_request]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(number) = source.get(*key).and_then(Value::as_u64) {
+                return Some(number);
+            }
+            if let Some(number) = source
+                .get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .and_then(|text| text.parse::<u64>().ok())
+            {
+                return Some(number);
+            }
+        }
+    }
+    None
+}
+
+fn todo_dispatch_array(value: &Value, keys: &[&str]) -> Vec<Value> {
+    let payload = value.get("payload").filter(|nested| nested.is_object());
+    let request = value.get("request").filter(|nested| nested.is_object());
+    let payload_request = payload
+        .and_then(|nested| nested.get("request"))
+        .filter(|nested| nested.is_object());
+    let remote_command = value
+        .get("remoteCommand")
+        .or_else(|| value.get("remote_command"))
+        .filter(|nested| nested.is_object());
+    for key in keys {
+        for source in [Some(value), payload, request, payload_request, remote_command]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(values) = source.get(*key).and_then(Value::as_array) {
+                return values.clone();
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn todo_dispatch_chat_attachment_ref(value: &Value) -> Option<ChatAttachmentRef> {
+    let attachment_id = todo_dispatch_text(value, &["attachment_id", "attachmentId", "id"]);
+    let sha256 = todo_dispatch_text(value, &["sha256", "hash"]);
+    let mime = todo_dispatch_text(value, &["mime", "mimeType", "mime_type", "type"]);
+    let name = todo_dispatch_text(value, &["name", "fileName", "file_name"]);
+    let bytes = todo_dispatch_u64(value, &["bytes", "size", "sizeBytes", "size_bytes"])?;
+    if attachment_id.trim().is_empty() || sha256.trim().is_empty() || mime.trim().is_empty() {
+        return None;
+    }
+    Some(ChatAttachmentRef {
+        attachment_id,
+        sha256,
+        bytes,
+        mime,
+        name,
+    })
+}
+
+fn todo_dispatch_chat_attachment_refs(value: &Value) -> Vec<ChatAttachmentRef> {
+    let mut seen = HashSet::new();
+    todo_dispatch_array(value, &["attachments", "chatAttachments", "chat_attachments"])
+        .into_iter()
+        .filter_map(|entry| todo_dispatch_chat_attachment_ref(&entry))
+        .filter(|entry| {
+            let key = normalized_chat_attachment_sha(&entry.sha256);
+            if key.is_empty() || seen.contains(&key) {
+                return false;
+            }
+            seen.insert(key);
+            true
+        })
+        .collect()
+}
+
+fn todo_dispatch_chat_attachment_refs_value(refs: &[ChatAttachmentRef]) -> Value {
+    Value::Array(
+        refs.iter()
+            .map(|entry| {
+                json!({
+                    "attachment_id": sanitized_chat_attachment_id(&entry.attachment_id),
+                    "sha256": normalized_chat_attachment_sha(&entry.sha256),
+                    "bytes": entry.bytes,
+                    "mime": normalized_chat_attachment_mime(&entry.mime),
+                    "name": entry.name.trim(),
+                })
+            })
+            .collect(),
+    )
 }
 
 fn todo_dispatch_nested_text(value: &Value, keys: &[&str], containers: &[&str]) -> String {
@@ -657,6 +772,7 @@ fn todo_dispatch_remote_intake_already_current(
     text: &str,
     status: &str,
     todo_id: &str,
+    attachments: &[ChatAttachmentRef],
     target_terminal_id: &str,
     target_terminal_index: Option<i64>,
     target_terminal_name: &str,
@@ -677,6 +793,11 @@ fn todo_dispatch_remote_intake_already_current(
     if !todo_id.trim().is_empty()
         && !todo_store_item_matches_id(item, todo_id)
         && todo_dispatch_text(item, &["todoId", "todo_id"]).trim() != todo_id.trim()
+    {
+        return false;
+    }
+    if todo_dispatch_chat_attachment_refs_value(&todo_dispatch_chat_attachment_refs(item))
+        != todo_dispatch_chat_attachment_refs_value(attachments)
     {
         return false;
     }
@@ -835,6 +956,8 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
         TodoDispatchRemoteIntakeScopeDecision::Continue => {}
     }
     let text = todo_dispatch_text(event, &["body", "message", "prompt", "text"]);
+    let chat_attachments = todo_dispatch_chat_attachment_refs(event);
+    let chat_attachments_value = todo_dispatch_chat_attachment_refs_value(&chat_attachments);
     let workspace_name = todo_dispatch_text(event, &["workspace_name", "workspaceName"]);
     let requested_status = todo_dispatch_normalize_status(&todo_dispatch_text(
         event,
@@ -1032,6 +1155,7 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                             &text,
                             intake_status,
                             &todo_id,
+                            &chat_attachments,
                             &target_terminal_id,
                             target_terminal_index,
                             &target_terminal_name,
@@ -1132,6 +1256,14 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                                 }
                                 if target_explicit {
                                     object.insert("targetExplicit".to_string(), json!(true));
+                                }
+                                if chat_attachments.is_empty() {
+                                    object.remove("attachments");
+                                } else {
+                                    object.insert(
+                                        "attachments".to_string(),
+                                        chat_attachments_value.clone(),
+                                    );
                                 }
                                 if !todo_id.is_empty() {
                                     object.insert("todoId".to_string(), json!(todo_id.clone()));
@@ -1263,6 +1395,14 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                                         "originWorkspaceId".to_string(),
                                         json!(origin_workspace_id.clone()),
                                     );
+                                    if chat_attachments.is_empty() {
+                                        remote_object.remove("attachments");
+                                    } else {
+                                        remote_object.insert(
+                                            "attachments".to_string(),
+                                            chat_attachments_value.clone(),
+                                        );
+                                    }
                                     remote_object
                                         .insert("source".to_string(), json!(remote_intake_source));
                                 }
@@ -1333,6 +1473,7 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                     "reasoningEffort": requested_reasoning_effort.clone(),
                     "effort": requested_reasoning_effort.clone(),
                     "speed": requested_speed.clone(),
+                    "attachments": chat_attachments_value.clone(),
                         "remoteCommand": {
                         "commandId": command_id,
                         "todoId": todo_id,
@@ -1353,6 +1494,7 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                         "reasoningEffort": requested_reasoning_effort.clone(),
                         "effort": requested_reasoning_effort,
                         "speed": requested_speed,
+                        "attachments": chat_attachments_value,
                             "source": remote_intake_source,
                         },
                         "lifecycleOwner": lifecycle_owner,
@@ -10294,6 +10436,75 @@ fn todo_dispatch_backend_item_text(item: &Value) -> String {
     }
 }
 
+fn todo_dispatch_attachment_warning_block(refs: &[ChatAttachmentRef]) -> String {
+    refs.iter()
+        .enumerate()
+        .map(|(index, attachment)| {
+            format!(
+                "[attachment {} unavailable]",
+                chat_attachment_display_name(attachment, index)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn todo_dispatch_append_attachment_blocks(
+    text: &str,
+    marker_block: &str,
+    warning_block: &str,
+) -> String {
+    [text.trim(), marker_block.trim(), warning_block.trim()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+async fn todo_dispatch_backend_item_text_with_remote_attachments(
+    item: &Value,
+    workspace_id: &str,
+) -> String {
+    let text = todo_dispatch_backend_item_text(item);
+    let attachments = todo_dispatch_chat_attachment_refs(item);
+    if attachments.is_empty() {
+        return text;
+    }
+    let request = ChatAttachmentStageRequest {
+        workspace_id: workspace_id.trim().to_string(),
+        attachments: attachments.clone(),
+        ack_cloud: true,
+        marker_start_index: 0,
+    };
+    match timeout(
+        Duration::from_secs(30),
+        tauri::async_runtime::spawn_blocking(move || stage_chat_attachment_refs_for(request)),
+    )
+    .await
+    {
+        Ok(Ok(result)) => {
+            todo_dispatch_append_attachment_blocks(&text, &result.marker_block, &result.warning_block)
+        }
+        Ok(Err(error)) => todo_dispatch_append_attachment_blocks(
+            &text,
+            "",
+            &format!(
+                "{}\n[attachment staging unavailable: {}]",
+                todo_dispatch_attachment_warning_block(&attachments),
+                error
+            ),
+        ),
+        Err(_) => todo_dispatch_append_attachment_blocks(
+            &text,
+            "",
+            &format!(
+                "{}\n[attachment staging unavailable: timed out]",
+                todo_dispatch_attachment_warning_block(&attachments)
+            ),
+        ),
+    }
+}
+
 fn todo_dispatch_backend_agent_id(value: &str) -> String {
     let normalized = value.trim().to_ascii_lowercase();
     if normalized.contains("claude") {
@@ -10515,6 +10726,96 @@ mod todo_dispatch_backend_tests {
         assert_eq!(
             todo_dispatch_backend_submit_sequence(&claude_item, &generic_target),
             TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE,
+        );
+    }
+
+    #[test]
+    fn dispatch_attachment_refs_parse_payload_and_remote_command() {
+        let event = json!({
+            "payload": {
+                "attachments": [
+                    {
+                        "attachment_id": "att-1",
+                        "sha256": "A".repeat(64),
+                        "bytes": "120",
+                        "mime": "image/png",
+                        "name": "one.png"
+                    },
+                    {
+                        "attachmentId": "att-duplicate",
+                        "sha256": "a".repeat(64),
+                        "bytes": 120,
+                        "mimeType": "image/png",
+                        "name": "duplicate.png"
+                    }
+                ]
+            }
+        });
+        let refs = todo_dispatch_chat_attachment_refs(&event);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].attachment_id, "att-1");
+        assert_eq!(refs[0].sha256, "A".repeat(64));
+
+        let item = json!({
+            "remoteCommand": {
+                "attachments": [{
+                    "id": "att-remote",
+                    "hash": "b".repeat(64),
+                    "sizeBytes": 64,
+                    "type": "image/webp",
+                    "fileName": "remote.webp"
+                }]
+            }
+        });
+        let refs = todo_dispatch_chat_attachment_refs(&item);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].attachment_id, "att-remote");
+        assert_eq!(refs[0].mime, "image/webp");
+
+        let nested_request = json!({
+            "payload": {
+                "request": {
+                    "workspace_id": "workspace-nested",
+                    "attachments": [{
+                        "id": "att-nested",
+                        "sha256": "d".repeat(64),
+                        "bytes": 32,
+                        "mime": "image/gif",
+                        "name": "nested.gif"
+                    }]
+                }
+            }
+        });
+        let refs = todo_dispatch_chat_attachment_refs(&nested_request);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].attachment_id, "att-nested");
+        assert_eq!(
+            todo_dispatch_text(&nested_request, &["workspace_id", "workspaceId"]),
+            "workspace-nested"
+        );
+    }
+
+    #[test]
+    fn dispatch_attachment_prompt_blocks_keep_markers_and_unavailable_lines() {
+        assert_eq!(
+            todo_dispatch_append_attachment_blocks(
+                "ship it",
+                "[image-attached 1] one.png -> /tmp/one.png",
+                "[attachment lost.png unavailable]",
+            ),
+            "ship it\n\n[image-attached 1] one.png -> /tmp/one.png\n\n[attachment lost.png unavailable]",
+        );
+
+        let warning = todo_dispatch_attachment_warning_block(&[ChatAttachmentRef {
+            attachment_id: "att-lost".to_string(),
+            sha256: "c".repeat(64),
+            bytes: 1,
+            mime: "image/png".to_string(),
+            name: "lost.png".to_string(),
+        }]);
+        assert_eq!(
+            todo_dispatch_append_attachment_blocks("text only", "", &warning),
+            "text only\n\n[attachment lost.png unavailable]",
         );
     }
 
@@ -11847,7 +12148,7 @@ async fn todo_dispatch_backend_submit_swarm(
     target: &Value,
 ) -> bool {
     let swarm_id = todo_dispatch_text(target, &["targetSwarmId", "target_swarm_id"]);
-    let prompt = todo_dispatch_backend_item_text(item);
+    let prompt = todo_dispatch_backend_item_text_with_remote_attachments(item, workspace_id).await;
     if swarm_id.is_empty() || prompt.is_empty() {
         return false;
     }
@@ -12066,7 +12367,7 @@ async fn todo_dispatch_backend_submit(
         .get("instanceId")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let prompt = todo_dispatch_backend_item_text(item);
+    let prompt = todo_dispatch_backend_item_text_with_remote_attachments(item, workspace_id).await;
     if pane_id.is_empty() || prompt.is_empty() {
         return false;
     }

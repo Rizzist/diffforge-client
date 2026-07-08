@@ -556,10 +556,7 @@ fn parse_opencode_models_stdout(stdout: &str) -> Vec<String> {
 
     for line in stdout.lines() {
         let model = line.trim();
-        if model.is_empty()
-            || !model.contains('/')
-            || model.chars().any(char::is_whitespace)
-        {
+        if model.is_empty() || !model.contains('/') || model.chars().any(char::is_whitespace) {
             continue;
         }
 
@@ -4101,7 +4098,326 @@ mod terminal_cli_tests {
                 .expect("expired instant"),
         };
 
-        assert!(opencode_model_list_cached_response_for(Some(&expired_entry), now, false).is_none());
+        assert!(
+            opencode_model_list_cached_response_for(Some(&expired_entry), now, false).is_none()
+        );
+    }
+
+    fn chat_attachment_test_png(seed: u8) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\nchat-attachment-test".to_vec();
+        bytes.push(seed);
+        bytes
+    }
+
+    fn chat_attachment_test_ref(id: &str, name: &str, bytes: &[u8]) -> ChatAttachmentRef {
+        ChatAttachmentRef {
+            attachment_id: id.to_string(),
+            sha256: chat_attachment_sha256_hex(bytes),
+            bytes: bytes.len() as u64,
+            mime: "image/png".to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    fn cleanup_chat_attachment_test_sha(sha: &str) {
+        if let Ok(mut index) = chat_attachment_stage_index().lock() {
+            index.remove(sha);
+        }
+        let Ok(root) = chat_attachment_stage_root() else {
+            return;
+        };
+        if let Ok(entries) = fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let file_name = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if file_name.starts_with(&format!("{sha}-")) {
+                    discard_staged_chat_attachment_file(&path);
+                }
+            }
+        }
+    }
+
+    fn chat_attachment_test_stage_path(
+        attachment: &ChatAttachmentRef,
+        fallback_index: usize,
+    ) -> PathBuf {
+        chat_attachment_stage_root()
+            .expect("stage root")
+            .join(chat_attachment_file_name(attachment, fallback_index))
+    }
+
+    fn chat_attachment_tampered_bytes(bytes: &[u8]) -> Vec<u8> {
+        let mut tampered = bytes.to_vec();
+        let last_index = tampered.len().saturating_sub(1);
+        tampered[last_index] = tampered[last_index].wrapping_add(1);
+        tampered
+    }
+
+    #[test]
+    fn chat_attachment_stage_verify_persist() {
+        let bytes = chat_attachment_test_png(1);
+        let attachment = chat_attachment_test_ref("att-stage-persist", "screenshot.png", &bytes);
+        let sha = attachment.sha256.clone();
+        cleanup_chat_attachment_test_sha(&sha);
+
+        let result = stage_chat_attachment_refs_with(
+            ChatAttachmentStageRequest {
+                workspace_id: "workspace-1".to_string(),
+                attachments: vec![attachment.clone()],
+                ack_cloud: false,
+                marker_start_index: 0,
+            },
+            |requested| {
+                assert_eq!(requested.attachment_id, "att-stage-persist");
+                Ok(ChatAttachmentDownload {
+                    bytes: bytes.clone(),
+                    content_type: "image/png".to_string(),
+                })
+            },
+            false,
+        );
+
+        assert_eq!(result.staged, vec!["att-stage-persist".to_string()]);
+        assert!(result.failed.is_empty());
+        assert_eq!(result.attachments.len(), 1);
+        assert!(result
+            .marker_block
+            .contains("[image-attached 1] screenshot.png -> "));
+        let staged_path = Path::new(&result.attachments[0].path);
+        assert_eq!(fs::read(staged_path).expect("staged file readable"), bytes);
+        cleanup_chat_attachment_test_sha(&sha);
+    }
+
+    #[test]
+    fn chat_attachment_dedupe_instant_ack() {
+        let bytes = chat_attachment_test_png(2);
+        let first = chat_attachment_test_ref("att-dedupe-first", "dedupe.png", &bytes);
+        let sha = first.sha256.clone();
+        cleanup_chat_attachment_test_sha(&sha);
+
+        let first_result = stage_chat_attachment_refs_with(
+            ChatAttachmentStageRequest {
+                workspace_id: "workspace-1".to_string(),
+                attachments: vec![first.clone()],
+                ack_cloud: false,
+                marker_start_index: 0,
+            },
+            |_| {
+                Ok(ChatAttachmentDownload {
+                    bytes: bytes.clone(),
+                    content_type: "image/png".to_string(),
+                })
+            },
+            false,
+        );
+        assert_eq!(first_result.staged, vec!["att-dedupe-first".to_string()]);
+
+        let mut second = first;
+        second.attachment_id = "att-dedupe-second".to_string();
+        let mut downloads = 0usize;
+        let second_result = stage_chat_attachment_refs_with(
+            ChatAttachmentStageRequest {
+                workspace_id: "workspace-1".to_string(),
+                attachments: vec![second],
+                ack_cloud: false,
+                marker_start_index: 0,
+            },
+            |_| {
+                downloads += 1;
+                Err("download should have been skipped".to_string())
+            },
+            false,
+        );
+
+        assert_eq!(downloads, 0);
+        assert_eq!(second_result.staged, vec!["att-dedupe-second".to_string()]);
+        assert!(second_result.failed.is_empty());
+        cleanup_chat_attachment_test_sha(&sha);
+    }
+
+    #[test]
+    fn chat_attachment_tampered_staged_file_is_redownloaded() {
+        let bytes = chat_attachment_test_png(5);
+        let attachment = chat_attachment_test_ref("att-tamper-redownload", "tamper.png", &bytes);
+        let sha = attachment.sha256.clone();
+        cleanup_chat_attachment_test_sha(&sha);
+        let staged_path = chat_attachment_test_stage_path(&attachment, 0);
+        fs::write(&staged_path, chat_attachment_tampered_bytes(&bytes)).unwrap();
+
+        let mut downloads = 0usize;
+        let result = stage_chat_attachment_refs_with(
+            ChatAttachmentStageRequest {
+                workspace_id: "workspace-1".to_string(),
+                attachments: vec![attachment.clone()],
+                ack_cloud: false,
+                marker_start_index: 0,
+            },
+            |_| {
+                downloads += 1;
+                Ok(ChatAttachmentDownload {
+                    bytes: bytes.clone(),
+                    content_type: "image/png".to_string(),
+                })
+            },
+            false,
+        );
+
+        assert_eq!(downloads, 1);
+        assert_eq!(result.staged, vec!["att-tamper-redownload".to_string()]);
+        assert!(result.failed.is_empty());
+        assert_eq!(fs::read(&staged_path).expect("staged file readable"), bytes);
+        cleanup_chat_attachment_test_sha(&sha);
+    }
+
+    #[test]
+    fn chat_attachment_tampered_staged_file_warns_without_ack() {
+        let bytes = chat_attachment_test_png(6);
+        let attachment =
+            chat_attachment_test_ref("att-tamper-warning", "tamper-warning.png", &bytes);
+        let sha = attachment.sha256.clone();
+        cleanup_chat_attachment_test_sha(&sha);
+        let staged_path = chat_attachment_test_stage_path(&attachment, 0);
+        fs::write(&staged_path, chat_attachment_tampered_bytes(&bytes)).unwrap();
+
+        let mut downloads = 0usize;
+        let result = stage_chat_attachment_refs_with(
+            ChatAttachmentStageRequest {
+                workspace_id: "workspace-1".to_string(),
+                attachments: vec![attachment.clone()],
+                ack_cloud: true,
+                marker_start_index: 0,
+            },
+            |_| {
+                downloads += 1;
+                Err("not found".to_string())
+            },
+            true,
+        );
+
+        assert_eq!(downloads, 1);
+        assert!(result.staged.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(
+            result.warning_block,
+            "[attachment tamper-warning.png unavailable]"
+        );
+        assert!(!result.cloud_acked);
+        assert!(result.cloud_ack_error.is_empty());
+        assert!(!staged_path.exists());
+        cleanup_chat_attachment_test_sha(&sha);
+    }
+
+    #[test]
+    fn chat_attachment_verification_cache_hits_unchanged_file() {
+        let bytes = chat_attachment_test_png(7);
+        let attachment = chat_attachment_test_ref("att-cache-hit", "cache.png", &bytes);
+        let sha = attachment.sha256.clone();
+        cleanup_chat_attachment_test_sha(&sha);
+        let staged_path = chat_attachment_test_stage_path(&attachment, 0);
+        fs::write(&staged_path, &bytes).unwrap();
+
+        let first = verify_staged_chat_attachment_path(&attachment, &staged_path)
+            .expect("first verification");
+        let second = verify_staged_chat_attachment_path(&attachment, &staged_path)
+            .expect("second verification");
+
+        assert!(!first.cache_hit);
+        assert!(second.cache_hit);
+        cleanup_chat_attachment_test_sha(&sha);
+    }
+
+    #[test]
+    fn chat_attachment_missing_inline_fetch_returns_warning_marker() {
+        let bytes = chat_attachment_test_png(3);
+        let attachment = chat_attachment_test_ref("att-missing", "lost.png", &bytes);
+        cleanup_chat_attachment_test_sha(&attachment.sha256);
+
+        let result = stage_chat_attachment_refs_with(
+            ChatAttachmentStageRequest {
+                workspace_id: "workspace-1".to_string(),
+                attachments: vec![attachment.clone()],
+                ack_cloud: false,
+                marker_start_index: 0,
+            },
+            |_| Err("not found".to_string()),
+            false,
+        );
+
+        assert!(result.staged.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.warning_block, "[attachment lost.png unavailable]");
+        assert!(result.marker_block.is_empty());
+        cleanup_chat_attachment_test_sha(&attachment.sha256);
+    }
+
+    #[test]
+    fn chat_attachment_caps_validate_five_images_and_twenty_mb() {
+        let bytes = chat_attachment_test_png(4);
+        let six = (0..6)
+            .map(|index| chat_attachment_test_ref(&format!("att-cap-{index}"), "cap.png", &bytes))
+            .collect::<Vec<_>>();
+        let too_many = stage_chat_attachment_refs_with(
+            ChatAttachmentStageRequest {
+                workspace_id: "workspace-1".to_string(),
+                attachments: six,
+                ack_cloud: false,
+                marker_start_index: 0,
+            },
+            |_| Err("download should not run".to_string()),
+            false,
+        );
+        assert_eq!(too_many.failed.len(), 6);
+        assert!(too_many.failed[0].reason.contains("Attach up to 5 images"));
+
+        let oversized = ChatAttachmentRef {
+            attachment_id: "att-too-large".to_string(),
+            sha256: "a".repeat(64),
+            bytes: (MAX_FORGE_IMAGE_BYTES + 1) as u64,
+            mime: "image/png".to_string(),
+            name: "large.png".to_string(),
+        };
+        let oversized_result = stage_chat_attachment_refs_with(
+            ChatAttachmentStageRequest {
+                workspace_id: "workspace-1".to_string(),
+                attachments: vec![oversized],
+                ack_cloud: false,
+                marker_start_index: 0,
+            },
+            |_| Err("download should not run".to_string()),
+            false,
+        );
+        assert_eq!(
+            oversized_result.failed[0].reason,
+            "Images must be 5 MB or smaller."
+        );
+
+        let total = (0..5)
+            .map(|index| ChatAttachmentRef {
+                attachment_id: format!("att-total-{index}"),
+                sha256: format!("{index:064x}"),
+                bytes: MAX_FORGE_IMAGE_BYTES as u64,
+                mime: "image/png".to_string(),
+                name: format!("total-{index}.png"),
+            })
+            .collect::<Vec<_>>();
+        let total_result = stage_chat_attachment_refs_with(
+            ChatAttachmentStageRequest {
+                workspace_id: "workspace-1".to_string(),
+                attachments: total,
+                ack_cloud: false,
+                marker_start_index: 0,
+            },
+            |_| Err("download should not run".to_string()),
+            false,
+        );
+        assert_eq!(
+            total_result.failed[0].reason,
+            "Images must be 20 MB total or smaller."
+        );
     }
 
     #[test]
@@ -4246,8 +4562,10 @@ mod terminal_cli_tests {
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("scheduleStop(sessionId"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("emitStartupIdleCandidate"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("startup_idle_candidate: true"));
-        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("scheduleIdle(sessionId, \"session.status\")"));
-        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("scheduleIdle(sessionId, \"session.idle\")"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("scheduleIdle(sessionId, \"session.status\")"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("scheduleIdle(sessionId, \"session.idle\")"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("clearTimeout(timer)"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("texts.join(\"\\n\")"));
         assert!(!DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains(
@@ -7274,6 +7592,93 @@ fn image_extension(mime_type: &str) -> Option<&'static str> {
     }
 }
 
+const CHAT_ATTACHMENT_STAGE_DIR: &str = "chat-images-staged";
+const CHAT_ATTACHMENT_SWEEP_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+static CHAT_ATTACHMENT_STAGE_INDEX: OnceLock<StdMutex<HashMap<String, ChatAttachmentStagedFile>>> =
+    OnceLock::new();
+static CHAT_ATTACHMENT_VERIFY_CACHE: OnceLock<
+    StdMutex<HashMap<ChatAttachmentVerifyCacheKey, ChatAttachmentVerifiedFile>>,
+> = OnceLock::new();
+
+#[derive(Clone, Debug, Deserialize)]
+struct ChatAttachmentRef {
+    #[serde(default, alias = "attachmentId", alias = "id")]
+    attachment_id: String,
+    #[serde(default)]
+    sha256: String,
+    #[serde(default, alias = "size", alias = "sizeBytes", alias = "size_bytes")]
+    bytes: u64,
+    #[serde(default, alias = "mimeType", alias = "mime_type", alias = "type")]
+    mime: String,
+    #[serde(default, alias = "fileName", alias = "file_name")]
+    name: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ChatAttachmentStageRequest {
+    #[serde(default, alias = "workspaceId")]
+    workspace_id: String,
+    #[serde(default)]
+    attachments: Vec<ChatAttachmentRef>,
+    #[serde(default, alias = "ackCloud")]
+    ack_cloud: bool,
+    #[serde(default, alias = "markerStartIndex")]
+    marker_start_index: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ChatAttachmentStagedFile {
+    name: String,
+    mime_type: String,
+    path: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ChatAttachmentVerifyCacheKey {
+    path: String,
+    modified_ns: u128,
+    size: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ChatAttachmentVerifiedFile {
+    sha256: String,
+    signature_mime: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct ChatAttachmentVerifyOutcome {
+    cache_hit: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ChatAttachmentDownload {
+    bytes: Vec<u8>,
+    content_type: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatAttachmentStageFailure {
+    id: String,
+    name: String,
+    reason: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatAttachmentStageResult {
+    staged: Vec<String>,
+    failed: Vec<ChatAttachmentStageFailure>,
+    attachments: Vec<SavedTodoImageAttachment>,
+    marker_block: String,
+    warning_block: String,
+    cloud_acked: bool,
+    cloud_ack_error: String,
+    workspace_id: String,
+}
+
 fn sanitized_image_stem(name: &str, fallback_index: usize) -> String {
     let stem = Path::new(name)
         .file_stem()
@@ -7290,6 +7695,566 @@ fn sanitized_image_stem(name: &str, fallback_index: usize) -> String {
     } else {
         cleaned
     }
+}
+
+fn sanitized_chat_attachment_id(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        .take(96)
+        .collect()
+}
+
+fn normalized_chat_attachment_sha(value: &str) -> String {
+    let cleaned = value
+        .trim()
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .take(64)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if cleaned.len() == 64 {
+        cleaned
+    } else {
+        String::new()
+    }
+}
+
+fn normalized_chat_attachment_mime(value: &str) -> String {
+    value
+        .trim()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn chat_attachment_display_name(attachment: &ChatAttachmentRef, fallback_index: usize) -> String {
+    let raw_name = attachment.name.trim();
+    if raw_name.is_empty() {
+        return format!("image-{}", fallback_index + 1);
+    }
+    let sanitized = raw_name
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric()
+                || character.is_ascii_whitespace()
+                || matches!(*character, '-' | '_' | '.' | '(' | ')')
+        })
+        .take(120)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if sanitized.is_empty() {
+        format!("image-{}", fallback_index + 1)
+    } else {
+        sanitized
+    }
+}
+
+fn chat_attachment_file_name(attachment: &ChatAttachmentRef, fallback_index: usize) -> String {
+    let sha = normalized_chat_attachment_sha(&attachment.sha256);
+    let mime = normalized_chat_attachment_mime(&attachment.mime);
+    let extension = image_extension(&mime).unwrap_or("img");
+    let stem = sanitized_image_stem(&attachment.name, fallback_index);
+    format!("{sha}-{stem}.{extension}")
+}
+
+fn chat_attachment_stage_root() -> Result<PathBuf, String> {
+    let directory = env::temp_dir()
+        .join("diffforge-todo-attachments")
+        .join(CHAT_ATTACHMENT_STAGE_DIR);
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("Unable to prepare chat attachment staging directory: {error}"))?;
+    Ok(directory)
+}
+
+fn chat_attachment_stage_index() -> &'static StdMutex<HashMap<String, ChatAttachmentStagedFile>> {
+    CHAT_ATTACHMENT_STAGE_INDEX.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn chat_attachment_verify_cache(
+) -> &'static StdMutex<HashMap<ChatAttachmentVerifyCacheKey, ChatAttachmentVerifiedFile>> {
+    CHAT_ATTACHMENT_VERIFY_CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn chat_attachment_signature_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.len() >= 3 && bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
+}
+
+fn chat_attachment_sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn chat_attachment_file_modified_ms(path: &Path) -> Option<u64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    modified
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as u64)
+}
+
+fn chat_attachment_verify_cache_key(path: &Path) -> Result<ChatAttachmentVerifyCacheKey, String> {
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("Unable to inspect staged attachment: {error}"))?;
+    if !metadata.is_file() {
+        return Err("Staged attachment is not a file.".to_string());
+    }
+    let modified_ns = metadata
+        .modified()
+        .map_err(|error| format!("Unable to inspect staged attachment modified time: {error}"))?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("Unable to inspect staged attachment modified time: {error}"))?
+        .as_nanos();
+
+    Ok(ChatAttachmentVerifyCacheKey {
+        path: path.to_string_lossy().to_string(),
+        modified_ns,
+        size: metadata.len(),
+    })
+}
+
+fn chat_attachment_verified_file_for_key(
+    path: &Path,
+    key: &ChatAttachmentVerifyCacheKey,
+) -> Result<(ChatAttachmentVerifiedFile, bool), String> {
+    if let Ok(cache) = chat_attachment_verify_cache().lock() {
+        if let Some(verified) = cache.get(key) {
+            return Ok((verified.clone(), true));
+        }
+    }
+
+    let bytes =
+        fs::read(path).map_err(|error| format!("Unable to read staged attachment: {error}"))?;
+    if bytes.len() as u64 != key.size {
+        return Err("Staged attachment changed while being verified.".to_string());
+    }
+    let verified = ChatAttachmentVerifiedFile {
+        sha256: chat_attachment_sha256_hex(&bytes),
+        signature_mime: chat_attachment_signature_mime(&bytes).map(str::to_string),
+    };
+    if let Ok(mut cache) = chat_attachment_verify_cache().lock() {
+        cache.insert(key.clone(), verified.clone());
+    }
+
+    Ok((verified, false))
+}
+
+fn verify_staged_chat_attachment_path(
+    attachment: &ChatAttachmentRef,
+    path: &Path,
+) -> Result<ChatAttachmentVerifyOutcome, String> {
+    let expected_size = attachment.bytes;
+    let expected_sha = normalized_chat_attachment_sha(&attachment.sha256);
+    let expected_mime = normalized_chat_attachment_mime(&attachment.mime);
+    let key = chat_attachment_verify_cache_key(path)?;
+    if key.size != expected_size {
+        return Err("Staged attachment size did not match.".to_string());
+    }
+
+    let (verified, cache_hit) = chat_attachment_verified_file_for_key(path, &key)?;
+    if verified.sha256 != expected_sha {
+        return Err("Staged attachment hash did not match.".to_string());
+    }
+    if verified.signature_mime.as_deref() != Some(expected_mime.as_str()) {
+        return Err("Staged attachment MIME did not match its bytes.".to_string());
+    }
+
+    Ok(ChatAttachmentVerifyOutcome { cache_hit })
+}
+
+fn remove_chat_attachment_stage_index_path(path: &Path) {
+    let path_string = path.to_string_lossy().to_string();
+    if let Ok(mut index) = chat_attachment_stage_index().lock() {
+        index.retain(|_, staged| staged.path != path_string);
+    }
+}
+
+fn remove_chat_attachment_verify_cache_path(path: &Path) {
+    let path_string = path.to_string_lossy().to_string();
+    if let Ok(mut cache) = chat_attachment_verify_cache().lock() {
+        cache.retain(|key, _| key.path != path_string);
+    }
+}
+
+fn discard_staged_chat_attachment_file(path: &Path) {
+    remove_chat_attachment_stage_index_path(path);
+    remove_chat_attachment_verify_cache_path(path);
+    let _ = fs::remove_file(path);
+}
+
+fn sweep_stale_chat_attachments_at(now_ms: u64) -> usize {
+    let Ok(root) = chat_attachment_stage_root() else {
+        return 0;
+    };
+    let Ok(entries) = fs::read_dir(&root) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(modified_ms) = chat_attachment_file_modified_ms(&path) else {
+            continue;
+        };
+        if now_ms.saturating_sub(modified_ms) >= CHAT_ATTACHMENT_SWEEP_AGE_MS {
+            discard_staged_chat_attachment_file(&path);
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn sweep_stale_chat_attachments() -> usize {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    sweep_stale_chat_attachments_at(now_ms)
+}
+
+fn chat_attachment_staged_file_from_path(
+    path: PathBuf,
+    attachment: &ChatAttachmentRef,
+    fallback_index: usize,
+) -> ChatAttachmentStagedFile {
+    ChatAttachmentStagedFile {
+        name: chat_attachment_display_name(attachment, fallback_index),
+        mime_type: normalized_chat_attachment_mime(&attachment.mime),
+        path: path.to_string_lossy().to_string(),
+    }
+}
+
+fn find_staged_chat_attachment(
+    attachment: &ChatAttachmentRef,
+    fallback_index: usize,
+) -> Option<ChatAttachmentStagedFile> {
+    let sha = normalized_chat_attachment_sha(&attachment.sha256);
+    if sha.is_empty() {
+        return None;
+    }
+    let indexed_staged = chat_attachment_stage_index()
+        .lock()
+        .ok()
+        .and_then(|index| index.get(&sha).cloned());
+    if let Some(staged) = indexed_staged {
+        let path = PathBuf::from(&staged.path);
+        if path.is_file() {
+            if verify_staged_chat_attachment_path(attachment, &path).is_ok() {
+                return Some(staged);
+            }
+            discard_staged_chat_attachment_file(&path);
+        }
+    }
+    let root = chat_attachment_stage_root().ok()?;
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if path.is_file() && file_name.starts_with(&format!("{sha}-")) {
+            if verify_staged_chat_attachment_path(attachment, &path).is_err() {
+                discard_staged_chat_attachment_file(&path);
+                continue;
+            }
+            let staged = chat_attachment_staged_file_from_path(path, attachment, fallback_index);
+            if let Ok(mut index) = chat_attachment_stage_index().lock() {
+                index.insert(sha, staged.clone());
+            }
+            return Some(staged);
+        }
+    }
+    None
+}
+
+fn validate_chat_attachment_ref(
+    attachment: &ChatAttachmentRef,
+    fallback_index: usize,
+) -> Result<(String, String, String), String> {
+    let attachment_id = sanitized_chat_attachment_id(&attachment.attachment_id);
+    if attachment_id.is_empty() {
+        return Err("Attachment id is invalid.".to_string());
+    }
+    let sha = normalized_chat_attachment_sha(&attachment.sha256);
+    if sha.is_empty() {
+        return Err("Attachment hash is invalid.".to_string());
+    }
+    let mime = normalized_chat_attachment_mime(&attachment.mime);
+    if image_extension(&mime).is_none() {
+        return Err("Images must be PNG, JPEG, WebP, or GIF.".to_string());
+    }
+    if attachment.bytes == 0 || attachment.bytes as usize > MAX_FORGE_IMAGE_BYTES {
+        return Err("Images must be 5 MB or smaller.".to_string());
+    }
+    let file_name = chat_attachment_file_name(attachment, fallback_index);
+    Ok((attachment_id, sha, file_name))
+}
+
+fn verify_chat_attachment_download(
+    attachment: &ChatAttachmentRef,
+    download: &ChatAttachmentDownload,
+) -> Result<(), String> {
+    let expected_mime = normalized_chat_attachment_mime(&attachment.mime);
+    let expected_sha = normalized_chat_attachment_sha(&attachment.sha256);
+    if download.bytes.len() != attachment.bytes as usize {
+        return Err("Downloaded attachment size did not match.".to_string());
+    }
+    if download.bytes.is_empty() || download.bytes.len() > MAX_FORGE_IMAGE_BYTES {
+        return Err("Images must be 5 MB or smaller.".to_string());
+    }
+    let actual_sha = chat_attachment_sha256_hex(&download.bytes);
+    if actual_sha != expected_sha {
+        return Err("Downloaded attachment hash did not match.".to_string());
+    }
+    if chat_attachment_signature_mime(&download.bytes) != Some(expected_mime.as_str()) {
+        return Err("Downloaded attachment MIME did not match its bytes.".to_string());
+    }
+    let response_mime = normalized_chat_attachment_mime(&download.content_type);
+    if !response_mime.is_empty()
+        && response_mime != "unknown"
+        && response_mime != "application/octet-stream"
+        && response_mime != expected_mime
+    {
+        return Err("Downloaded attachment content type did not match.".to_string());
+    }
+    Ok(())
+}
+
+fn write_staged_chat_attachment(
+    attachment: &ChatAttachmentRef,
+    bytes: &[u8],
+    file_name: &str,
+    fallback_index: usize,
+) -> Result<ChatAttachmentStagedFile, String> {
+    let root = chat_attachment_stage_root()?;
+    let path = root.join(file_name);
+    if path.is_file() {
+        if verify_staged_chat_attachment_path(attachment, &path).is_err() {
+            discard_staged_chat_attachment_file(&path);
+        } else {
+            let staged = chat_attachment_staged_file_from_path(path, attachment, fallback_index);
+            return Ok(staged);
+        }
+    }
+    let tmp_path = root.join(format!(".{}-{}.tmp", file_name, uuid::Uuid::new_v4()));
+    fs::write(&tmp_path, bytes)
+        .map_err(|error| format!("Unable to write staged attachment: {error}"))?;
+    fs::rename(&tmp_path, &path).map_err(|error| {
+        let _ = fs::remove_file(&tmp_path);
+        format!("Unable to finalize staged attachment: {error}")
+    })?;
+    Ok(chat_attachment_staged_file_from_path(
+        path,
+        attachment,
+        fallback_index,
+    ))
+}
+
+fn saved_todo_image_from_staged(staged: &ChatAttachmentStagedFile) -> SavedTodoImageAttachment {
+    SavedTodoImageAttachment {
+        name: staged.name.clone(),
+        mime_type: staged.mime_type.clone(),
+        path: staged.path.clone(),
+    }
+}
+
+fn format_saved_todo_image_attachment_markers(
+    attachments: &[SavedTodoImageAttachment],
+    start_index: usize,
+) -> String {
+    attachments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, image)| {
+            let name = image.name.trim();
+            let path = image.path.trim();
+            if path.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "[image-attached {}] {} -> {}",
+                    start_index + index + 1,
+                    if name.is_empty() {
+                        format!("image-{}", start_index + index + 1)
+                    } else {
+                        name.to_string()
+                    },
+                    path
+                ))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn stage_chat_attachment_refs_with<F>(
+    request: ChatAttachmentStageRequest,
+    mut downloader: F,
+    ack_cloud: bool,
+) -> ChatAttachmentStageResult
+where
+    F: FnMut(&ChatAttachmentRef) -> Result<ChatAttachmentDownload, String>,
+{
+    sweep_stale_chat_attachments();
+    let mut result = ChatAttachmentStageResult {
+        staged: Vec::new(),
+        failed: Vec::new(),
+        attachments: Vec::new(),
+        marker_block: String::new(),
+        warning_block: String::new(),
+        cloud_acked: false,
+        cloud_ack_error: String::new(),
+        workspace_id: request.workspace_id.trim().to_string(),
+    };
+
+    if request.attachments.len() > MAX_FORGE_IMAGES {
+        result.failed = request
+            .attachments
+            .iter()
+            .enumerate()
+            .map(|(index, attachment)| ChatAttachmentStageFailure {
+                id: sanitized_chat_attachment_id(&attachment.attachment_id),
+                name: chat_attachment_display_name(attachment, index),
+                reason: format!("Attach up to {MAX_FORGE_IMAGES} images per todo."),
+            })
+            .collect();
+        result.warning_block = result
+            .failed
+            .iter()
+            .map(|failure| format!("[attachment {} unavailable]", failure.name))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return result;
+    }
+
+    let total_bytes = request.attachments.iter().fold(0u64, |total, attachment| {
+        total.saturating_add(attachment.bytes)
+    });
+    if total_bytes > MAX_FORGE_IMAGE_TOTAL_BYTES as u64 {
+        result.failed = request
+            .attachments
+            .iter()
+            .enumerate()
+            .map(|(index, attachment)| ChatAttachmentStageFailure {
+                id: sanitized_chat_attachment_id(&attachment.attachment_id),
+                name: chat_attachment_display_name(attachment, index),
+                reason: "Images must be 20 MB total or smaller.".to_string(),
+            })
+            .collect();
+        result.warning_block = result
+            .failed
+            .iter()
+            .map(|failure| format!("[attachment {} unavailable]", failure.name))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return result;
+    }
+
+    let mut ack_ids = Vec::new();
+    for (index, attachment) in request.attachments.iter().enumerate() {
+        let display_name = chat_attachment_display_name(attachment, index);
+        let (attachment_id, sha, file_name) = match validate_chat_attachment_ref(attachment, index)
+        {
+            Ok(valid) => valid,
+            Err(reason) => {
+                result.failed.push(ChatAttachmentStageFailure {
+                    id: sanitized_chat_attachment_id(&attachment.attachment_id),
+                    name: display_name,
+                    reason,
+                });
+                continue;
+            }
+        };
+
+        if let Some(staged) = find_staged_chat_attachment(attachment, index) {
+            result.staged.push(attachment_id.clone());
+            ack_ids.push(attachment_id);
+            result
+                .attachments
+                .push(saved_todo_image_from_staged(&staged));
+            continue;
+        }
+
+        let staged = match downloader(attachment).and_then(|download| {
+            verify_chat_attachment_download(attachment, &download)?;
+            write_staged_chat_attachment(attachment, &download.bytes, &file_name, index)
+        }) {
+            Ok(staged) => staged,
+            Err(reason) => {
+                result.failed.push(ChatAttachmentStageFailure {
+                    id: attachment_id,
+                    name: display_name,
+                    reason,
+                });
+                continue;
+            }
+        };
+
+        if let Ok(mut index) = chat_attachment_stage_index().lock() {
+            index.insert(sha, staged.clone());
+        }
+        result.staged.push(attachment_id.clone());
+        ack_ids.push(attachment_id);
+        result
+            .attachments
+            .push(saved_todo_image_from_staged(&staged));
+    }
+
+    result.marker_block =
+        format_saved_todo_image_attachment_markers(&result.attachments, request.marker_start_index);
+    result.warning_block = result
+        .failed
+        .iter()
+        .map(|failure| format!("[attachment {} unavailable]", failure.name))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if ack_cloud && !ack_ids.is_empty() {
+        match cloud_mcp_ack_chat_attachments_staged_blocking(&ack_ids) {
+            Ok(_) => {
+                result.cloud_acked = true;
+            }
+            Err(error) => {
+                result.cloud_ack_error = error;
+            }
+        }
+    }
+
+    result
+}
+
+fn stage_chat_attachment_refs_for(
+    request: ChatAttachmentStageRequest,
+) -> ChatAttachmentStageResult {
+    let ack_cloud = request.ack_cloud;
+    stage_chat_attachment_refs_with(
+        request,
+        |attachment| {
+            let attachment_id = sanitized_chat_attachment_id(&attachment.attachment_id);
+            cloud_mcp_download_chat_attachment_blocking(&attachment_id)
+        },
+        ack_cloud,
+    )
 }
 
 fn decode_prompt_image(
@@ -7311,7 +8276,7 @@ fn decode_prompt_image(
         .map_err(|_| "Image attachment could not be decoded.".to_string())?;
 
     if decoded.is_empty() || decoded.len() > MAX_FORGE_IMAGE_BYTES {
-        return Err("Images must be 4 MB or smaller.".to_string());
+        return Err("Images must be 5 MB or smaller.".to_string());
     }
 
     let file_name = format!("{}.{}", sanitized_image_stem(&image.name, index), extension);
@@ -7345,7 +8310,7 @@ fn prepare_prompt_images(
         total_bytes += decoded.1.len();
 
         if total_bytes > MAX_FORGE_IMAGE_TOTAL_BYTES {
-            return Err("Images must be 8 MB total or smaller.".to_string());
+            return Err("Images must be 20 MB total or smaller.".to_string());
         }
 
         decoded_images.push(decoded);
@@ -7411,7 +8376,7 @@ fn save_todo_image_attachments_for(
         total_bytes += decoded.1.len();
 
         if total_bytes > MAX_FORGE_IMAGE_TOTAL_BYTES {
-            return Err("Images must be 8 MB total or smaller.".to_string());
+            return Err("Images must be 20 MB total or smaller.".to_string());
         }
 
         decoded_images.push((decoded.0, decoded.1, mime_type));
@@ -7965,6 +8930,15 @@ async fn save_todo_image_attachments(
     tauri::async_runtime::spawn_blocking(move || save_todo_image_attachments_for(images))
         .await
         .map_err(|error| format!("Unable to prepare todo image attachments: {error}"))?
+}
+
+#[tauri::command]
+async fn stage_chat_attachment_refs(
+    request: ChatAttachmentStageRequest,
+) -> Result<ChatAttachmentStageResult, String> {
+    tauri::async_runtime::spawn_blocking(move || stage_chat_attachment_refs_for(request))
+        .await
+        .map_err(|error| format!("Unable to stage chat attachments: {error}"))
 }
 
 #[tauri::command]

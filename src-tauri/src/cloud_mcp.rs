@@ -846,6 +846,10 @@ const CLOUD_MCP_BACKGROUND_SCHEDULER_SHUTDOWN_POLL_SECS: u64 = 30;
 static CLOUD_MCP_TOKENOMICS_SOURCE_WATCHER: OnceLock<StdMutex<Option<notify::RecommendedWatcher>>> =
     OnceLock::new();
 
+fn cloud_mcp_run_periodic_local_temp_cleanups() -> usize {
+    sweep_stale_chat_attachments()
+}
+
 #[cfg(target_os = "macos")]
 struct CloudMcpMacosThreadQosGuard {
     previous: Option<(libc::qos_class_t, libc::c_int)>,
@@ -1116,6 +1120,7 @@ pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudM
         let tokenomics_wake = Arc::new(tokio::sync::Notify::new());
         let _watching_tokenomics =
             cloud_mcp_start_tokenomics_source_watcher(tokenomics_wake.clone());
+        cloud_mcp_run_periodic_local_temp_cleanups();
 
         sleep(Duration::from_secs(
             CLOUD_MCP_TOKENOMICS_PERIODIC_STARTUP_DELAY_SECS,
@@ -1150,6 +1155,7 @@ pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudM
             if app_shutdown_requested() {
                 break;
             }
+            cloud_mcp_run_periodic_local_temp_cleanups();
 
             // Stamp/scan runs off the async runtime: it opens SQLite and may
             // issue blocking HTTP for the live provider limits.
@@ -21053,8 +21059,10 @@ fn cloud_mcp_headless_terminal_panel_close_command(
     } else {
         format!("{original_command_id}:panel-close")
     };
-    let target_device_id =
-        cloud_mcp_remote_command_field_text(original_event, &["target_device_id", "targetDeviceId"]);
+    let target_device_id = cloud_mcp_remote_command_field_text(
+        original_event,
+        &["target_device_id", "targetDeviceId"],
+    );
     let client_id = cloud_mcp_payload_text(original_event, &["client_id", "clientId"]);
     let source = cloud_mcp_payload_text(original_event, &["source"])
         .unwrap_or_else(|| "rust-diffforge-headless".to_string());
@@ -21089,7 +21097,10 @@ fn cloud_mcp_headless_terminal_panel_close_command(
     });
     if let Some(target_device_id) = target_device_id.filter(|value| !value.trim().is_empty()) {
         if let Some(object) = command.as_object_mut() {
-            object.insert("target_device_id".to_string(), json!(target_device_id.clone()));
+            object.insert(
+                "target_device_id".to_string(),
+                json!(target_device_id.clone()),
+            );
             object.insert("targetDeviceId".to_string(), json!(target_device_id));
         }
     }
@@ -21658,8 +21669,10 @@ fn cloud_mcp_apply_remote_terminal_lever(
                             &terminal,
                         )
                     {
-                        let dropped =
-                            cloud_mcp_defer_remote_command_for_foreground(&app, &panel_close_command);
+                        let dropped = cloud_mcp_defer_remote_command_for_foreground(
+                            &app,
+                            &panel_close_command,
+                        );
                         for dropped_event in dropped {
                             let _ = cloud_mcp_send_remote_command_status_event(
                                 &state,
@@ -22052,9 +22065,7 @@ fn cloud_mcp_apply_remote_device_lever(
     let action = match command_kind.as_str() {
         "app_show_window" | "show_window" | "open_app_window" | "app_open_window" => "show",
         "app_hide_window" | "hide_window" | "app_background" | "hide_app_window" => "hide",
-        "device_notify" | "notify_device" | "device_notification" | "send_notification" => {
-            "notify"
-        }
+        "device_notify" | "notify_device" | "device_notification" | "send_notification" => "notify",
         "app_update_now" | "update_app" | "app_update" => "app_update_now",
         "agent_account_switch"
         | "switch_agent_account"
@@ -24963,7 +24974,11 @@ fn cloud_mcp_clean_host(value: &str) -> String {
             return rest[..end].to_string();
         }
     }
-    raw.split(':').next().unwrap_or_default().trim_end_matches('.').to_string()
+    raw.split(':')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('.')
+        .to_string()
 }
 
 fn cloud_mcp_direct_gateway_parts(pathname: &str) -> Option<(String, String)> {
@@ -25017,8 +25032,12 @@ fn cloud_mcp_route_token_compatible_with_url(
         .unwrap_or_default();
     route_mode == "node_dns_gateway"
         && payload.get("backend_id").and_then(Value::as_str) == Some(instance_id.as_str())
-        && cloud_mcp_clean_host(node_dns) == cloud_mcp_clean_host(url.host_str().unwrap_or_default())
-        && !payload.get("container_port").unwrap_or(&Value::Null).is_null()
+        && cloud_mcp_clean_host(node_dns)
+            == cloud_mcp_clean_host(url.host_str().unwrap_or_default())
+        && !payload
+            .get("container_port")
+            .unwrap_or(&Value::Null)
+            .is_null()
 }
 
 fn cloud_mcp_note_direct_route(target: &CloudMcpWsTarget) {
@@ -28482,8 +28501,8 @@ fn cloud_mcp_workspace_panel_kind(panel: &Value) -> Option<String> {
             Some("web".to_string())
         }
         "pcb" | "pcb-panel" | "pcb-design" | "workspace-pcb" => Some("pcb".to_string()),
-        "vm" | "vm-sandbox" | "vmsandbox" | "workspace-vm" | "vm-panel"
-        | "sandbox-vm" | "virtual-machine" | "virtualmachine" => Some("vm".to_string()),
+        "vm" | "vm-sandbox" | "vmsandbox" | "workspace-vm" | "vm-panel" | "sandbox-vm"
+        | "virtual-machine" | "virtualmachine" => Some("vm".to_string()),
         "video" | "video-editor" | "videoeditor" | "video-panel" | "workspace-video" => {
             Some("video".to_string())
         }
@@ -28515,7 +28534,13 @@ fn cloud_mcp_workspace_project_rows(workspace: &Value, keys: &[&str]) -> Vec<Val
         }
         let Some(path) = cloud_mcp_payload_text(
             &item,
-            &["path", "project_path", "projectPath", "board_path", "boardPath"],
+            &[
+                "path",
+                "project_path",
+                "projectPath",
+                "board_path",
+                "boardPath",
+            ],
         )
         .map(|value| clean_text(value, CLOUD_MCP_WORKSPACE_PROJECT_PATH_LIMIT))
         .filter(|value| !value.is_empty()) else {
@@ -28540,8 +28565,7 @@ fn cloud_mcp_workspace_project_rows(workspace: &Value, keys: &[&str]) -> Vec<Val
             "name": name,
             "path": path,
         });
-        if let Some(updated_at_ms) =
-            cloud_mcp_payload_u64(&item, &["updated_at_ms", "updatedAtMs"])
+        if let Some(updated_at_ms) = cloud_mcp_payload_u64(&item, &["updated_at_ms", "updatedAtMs"])
         {
             if let Some(object) = row.as_object_mut() {
                 object.insert("updated_at_ms".to_string(), json!(updated_at_ms));
@@ -34278,14 +34302,7 @@ fn cloud_mcp_agent_chat_turn_git_run_with_timeout(
     owned_args.extend(args.iter().map(|arg| (*arg).to_string()));
     let borrowed_args = owned_args.iter().map(String::as_str).collect::<Vec<_>>();
     let env_vars = cloud_mcp_agent_chat_turn_git_env(index_path);
-    run_command_capture_with_env(
-        "git",
-        &borrowed_args,
-        None,
-        timeout,
-        Some(root),
-        &env_vars,
-    )
+    run_command_capture_with_env("git", &borrowed_args, None, timeout, Some(root), &env_vars)
 }
 
 fn cloud_mcp_agent_chat_turn_git_root(cwd: &str) -> Option<PathBuf> {
@@ -34613,7 +34630,12 @@ fn cloud_mcp_agent_chat_turn_git_name_status_entries(
         let (path, old_path) = if status.starts_with('R') || status.starts_with('C') {
             (
                 parts.get(2).copied().unwrap_or_default().trim().to_string(),
-                parts.get(1).copied().map(str::trim).filter(|value| !value.is_empty()).map(str::to_string),
+                parts
+                    .get(1)
+                    .copied()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
             )
         } else {
             (
@@ -34880,10 +34902,7 @@ fn cloud_mcp_agent_chat_turn_git_attach_patches(
     let mut files = files;
     let mut per_file_truncated = 0usize;
     for file in files.iter_mut() {
-        let binary = file
-            .get("binary")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let binary = file.get("binary").and_then(Value::as_bool).unwrap_or(false);
         if binary {
             continue;
         }
@@ -35066,8 +35085,8 @@ fn cloud_mcp_agent_chat_turn_git_diff_with_patch_timeout(
     )
     .ok()
     .filter(|output| output.exit_code == Some(0))
-        .map(|output| output.stdout)
-        .unwrap_or_default();
+    .map(|output| output.stdout)
+    .unwrap_or_default();
     let files =
         cloud_mcp_agent_chat_turn_git_parse_numstat(&snapshot.repo_root, &numstat, &name_status);
     let additions = files
@@ -35131,8 +35150,7 @@ fn cloud_mcp_agent_chat_turn_git_diff_with_patch_timeout(
         turn_diff_files_omitted,
         turn_diff_truncated,
         caps,
-    ) =
-        cloud_mcp_agent_chat_turn_git_attach_patches(files.clone(), &patches);
+    ) = cloud_mcp_agent_chat_turn_git_attach_patches(files.clone(), &patches);
     let patch_generation = json!({
         "patch_timeout_ms": u64::try_from(patch_timeout.as_millis()).unwrap_or(u64::MAX),
         "patch_skipped": patch_skip_reason.is_some(),
@@ -35384,7 +35402,10 @@ fn cloud_mcp_agent_chat_turn_contexts_from_hook(
     payload: &TerminalActivityHookPayload,
     provider: &str,
     provider_session_id: &str,
-) -> (AgentChatTurnSummaryContext, Option<AgentChatTurnDiffContext>) {
+) -> (
+    AgentChatTurnSummaryContext,
+    Option<AgentChatTurnDiffContext>,
+) {
     let native_turn_id = cloud_mcp_agent_chat_turn_native_id(payload);
     let snapshot = cloud_mcp_agent_chat_turn_git_take_completion_snapshot(
         payload,
@@ -43450,6 +43471,114 @@ fn cloud_mcp_internal_api_get_blocking(
         ));
     }
     Ok(parsed)
+}
+
+fn cloud_mcp_internal_api_url_blocking(
+    endpoint_path: &str,
+) -> Result<(reqwest::Url, Option<String>), String> {
+    let base_url = cloud_mcp_base_url();
+    let target = cloud_mcp_internal_api_http_target_blocking(&base_url, endpoint_path)
+        .map_err(|error| format!("Cloud internal API route unavailable: {error}"))?;
+    let mut url = reqwest::Url::parse(&target.url)
+        .map_err(|error| format!("Cloud internal API route URL is invalid: {error}"))?;
+    if let Some(route_token) = target.route_token.as_deref() {
+        if !route_token.trim().is_empty() {
+            url.query_pairs_mut()
+                .append_pair("route_token", route_token);
+        }
+    }
+    Ok((url, target.route_token))
+}
+
+fn cloud_mcp_internal_api_post_json_blocking(
+    endpoint_path: &str,
+    payload: &Value,
+) -> Result<Value, String> {
+    let (url, route_token) = cloud_mcp_internal_api_url_blocking(endpoint_path)?;
+    let response = shared_blocking_http_client()
+        .post(url)
+        .timeout(Duration::from_secs(CLOUD_MCP_SYNC_TIMEOUT_SECS))
+        .header("Accept", "application/json")
+        .headers(cloud_mcp_internal_api_http_headers(route_token.as_deref())?)
+        .json(payload)
+        .send()
+        .map_err(|error| format!("Cloud internal API request failed: {error}"))?;
+    let (status, parsed) = cloud_mcp_read_route_response_blocking(response)?;
+    if !status.is_success() {
+        return Err(format!(
+            "Cloud internal API returned {}: {}",
+            status.as_u16(),
+            cloud_mcp_route_response_message(&parsed, "request failed")
+        ));
+    }
+    Ok(parsed)
+}
+
+fn cloud_mcp_download_chat_attachment_blocking(
+    attachment_id: &str,
+) -> Result<ChatAttachmentDownload, String> {
+    let attachment_id = sanitized_chat_attachment_id(attachment_id);
+    if attachment_id.is_empty() {
+        return Err("Attachment id is invalid.".to_string());
+    }
+    let endpoint_path = format!("/v1/chat-attachments/download/{attachment_id}");
+    let (url, route_token) = cloud_mcp_internal_api_url_blocking(&endpoint_path)?;
+    let response = shared_blocking_http_client()
+        .get(url)
+        .timeout(Duration::from_secs(30))
+        .header("Accept", "application/octet-stream")
+        .headers(cloud_mcp_internal_api_http_headers(route_token.as_deref())?)
+        .send()
+        .map_err(|error| format!("Cloud chat attachment download failed: {error}"))?;
+    let status = response.status();
+    let content_type = cloud_mcp_route_response_content_type(response.headers());
+    if !status.is_success() {
+        let response_text = response
+            .text()
+            .map_err(|error| format!("Unable to read chat attachment error response: {error}"))?;
+        let message = serde_json::from_str::<Value>(&response_text)
+            .ok()
+            .map(|value| cloud_mcp_route_response_message(&value, "download failed"))
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| cloud_mcp_route_response_preview(&response_text));
+        return Err(format!(
+            "Cloud chat attachment download returned {}: {}",
+            status.as_u16(),
+            if message.is_empty() {
+                "download failed".to_string()
+            } else {
+                message
+            }
+        ));
+    }
+    let bytes = response
+        .bytes()
+        .map_err(|error| format!("Unable to read chat attachment bytes: {error}"))?
+        .to_vec();
+    Ok(ChatAttachmentDownload {
+        bytes,
+        content_type,
+    })
+}
+
+fn cloud_mcp_ack_chat_attachments_staged_blocking(
+    attachment_ids: &[String],
+) -> Result<Value, String> {
+    let attachment_ids = attachment_ids
+        .iter()
+        .map(|id| sanitized_chat_attachment_id(id))
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>();
+    if attachment_ids.is_empty() {
+        return Ok(json!({ "ok": true, "attachment_ids": [] }));
+    }
+    cloud_mcp_internal_api_post_json_blocking(
+        "/v1/chat-attachments/staged",
+        &json!({
+            "attachment_ids": attachment_ids,
+            "attachmentIds": attachment_ids,
+        }),
+    )
 }
 
 #[tauri::command]
@@ -54658,11 +54787,28 @@ mod cloud_mcp_tests {
     }
 
     #[test]
+    fn tokenomics_periodic_local_cleanup_sweeps_staged_chat_attachments() {
+        let path = chat_attachment_stage_root()
+            .unwrap()
+            .join(format!("periodic-cleanup-{}.tmp", uuid::Uuid::new_v4()));
+        fs::write(&path, b"stale staged attachment").unwrap();
+        let old_time =
+            SystemTime::now() - Duration::from_millis(CHAT_ATTACHMENT_SWEEP_AGE_MS + 10_000);
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+        drop(file);
+
+        let removed = cloud_mcp_run_periodic_local_temp_cleanups();
+
+        assert!(removed >= 1);
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn agent_chat_turn_git_numstat_rename_path_expands_subdir_braces() {
         assert_eq!(
-            cloud_mcp_agent_chat_turn_git_numstat_rename_path(
-                "arch/{i386 => x86}/Makefile"
-            ),
+            cloud_mcp_agent_chat_turn_git_numstat_rename_path("arch/{i386 => x86}/Makefile"),
             Some("arch/x86/Makefile".to_string())
         );
         assert_eq!(
@@ -54861,10 +55007,7 @@ mod cloud_mcp_tests {
             assert!(patch.contains("@@"));
         }
         assert!(binary.get("patch").is_none());
-        assert_eq!(
-            turn_diff.raw["generation"]["patch_skipped"],
-            json!(false)
-        );
+        assert_eq!(turn_diff.raw["generation"]["patch_skipped"], json!(false));
         let total_additions = files
             .iter()
             .filter_map(|file| file["additions"].as_i64())
@@ -54987,8 +55130,10 @@ mod cloud_mcp_tests {
 
         let snapshot =
             cloud_mcp_agent_chat_turn_git_take_snapshot("codex", "session-timeout", "turn-timeout");
-        let diff =
-            cloud_mcp_agent_chat_turn_git_diff_with_patch_timeout(snapshot, Duration::from_millis(0));
+        let diff = cloud_mcp_agent_chat_turn_git_diff_with_patch_timeout(
+            snapshot,
+            Duration::from_millis(0),
+        );
         let turn_diff = diff.turn_diff.expect("turn diff");
         assert_eq!(turn_diff.files.len(), 1);
         assert_eq!(turn_diff.files[0]["additions"], json!(1));
@@ -55639,21 +55784,27 @@ mod cloud_mcp_tests {
             "terminal_index": 2,
         });
 
-        let command = cloud_mcp_headless_terminal_panel_close_command(
-            &original,
-            "workspace-a",
-            &terminal,
-        )
-        .expect("synthetic panel close command");
+        let command =
+            cloud_mcp_headless_terminal_panel_close_command(&original, "workspace-a", &terminal)
+                .expect("synthetic panel close command");
 
         assert_eq!(command["command_kind"], json!("workspace_panel_close"));
         assert_eq!(command["commandId"], json!("terminal-close-1:panel-close"));
         assert_eq!(command["workspace_id"], json!("workspace-a"));
-        assert_eq!(command["target_panel_id"], json!("workspace-terminal-workspace-a-2-codex"));
-        assert_eq!(command["paneId"], json!("workspace-terminal-workspace-a-2-codex"));
+        assert_eq!(
+            command["target_panel_id"],
+            json!("workspace-terminal-workspace-a-2-codex")
+        );
+        assert_eq!(
+            command["paneId"],
+            json!("workspace-terminal-workspace-a-2-codex")
+        );
         assert_eq!(command["target_panel_index"], json!(2));
         assert_eq!(command["targetTerminalIndex"], json!(2));
-        assert_eq!(command["synthetic_reason"], json!("headless_terminal_close"));
+        assert_eq!(
+            command["synthetic_reason"],
+            json!("headless_terminal_close")
+        );
         assert_eq!(command["target_device_id"], json!("device-a"));
     }
 
@@ -57290,13 +57441,15 @@ mod cloud_mcp_tests {
             .unwrap_or_default()
             .as_secs();
         let make_token = |exp: u64| {
-            let payload = general_purpose::URL_SAFE_NO_PAD
-                .encode(serde_json::to_vec(&json!({
+            let payload = general_purpose::URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(&json!({
                     "scope": "cloud_ws",
                     "route_mode": "direct_cloud_container",
                     "allowed_paths": ["/v1/app/ws", "/v1/voice/ws"],
                     "exp": exp
-                })).expect("encode claims"));
+                }))
+                .expect("encode claims"),
+            );
             format!("{payload}.test-signature")
         };
         let make_scoped_gateway_token = |exp: u64, allowed_paths: Value| {
@@ -57327,10 +57480,7 @@ mod cloud_mcp_tests {
         });
         let derived =
             cloud_mcp_last_direct_route_fresh("/v1/voice/ws").expect("fresh cached route");
-        assert_eq!(
-            derived.ws_url,
-            "wss://mcp-abc.diffforge.ai/v1/voice/ws"
-        );
+        assert_eq!(derived.ws_url, "wss://mcp-abc.diffforge.ai/v1/voice/ws");
         assert_eq!(derived.transport, "direct_cloud_container");
         assert!(derived.route_token.is_some());
 
@@ -58109,8 +58259,9 @@ mod cloud_mcp_tests {
                 "transport": "direct_cloud_container"
             }
         });
-        let disabled_error = cloud_mcp_direct_route_unusable_error(&disabled, "/v1/voice/dictation/ws")
-            .expect("disabled direct route should be terminal");
+        let disabled_error =
+            cloud_mcp_direct_route_unusable_error(&disabled, "/v1/voice/dictation/ws")
+                .expect("disabled direct route should be terminal");
         assert_eq!(
             disabled_error,
             "Cloud MCP direct route disabled by balancer."

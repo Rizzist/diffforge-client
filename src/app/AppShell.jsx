@@ -39707,6 +39707,8 @@ export default function App() {
 
     const remoteCommandText = (event) => {
       const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+      const request = event?.request && typeof event.request === "object" ? event.request : {};
+      const payloadRequest = payload?.request && typeof payload.request === "object" ? payload.request : {};
       return String(
         event?.body
           || event?.message
@@ -39716,14 +39718,23 @@ export default function App() {
           || payload.message
           || payload.prompt
           || payload.text
+          || request.body
+          || request.message
+          || request.prompt
+          || request.text
+          || payloadRequest.body
+          || payloadRequest.message
+          || payloadRequest.prompt
+          || payloadRequest.text
           || "",
       ).trim();
     };
     const remoteCommandStringField = (event, keys) => {
       const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
       const request = event?.request && typeof event.request === "object" ? event.request : {};
+      const payloadRequest = payload?.request && typeof payload.request === "object" ? payload.request : {};
       for (const key of keys) {
-        const value = event?.[key] ?? payload?.[key] ?? request?.[key];
+        const value = event?.[key] ?? payload?.[key] ?? request?.[key] ?? payloadRequest?.[key];
         const text = String(value || "").trim();
         if (text) {
           return text;
@@ -39734,8 +39745,9 @@ export default function App() {
     const remoteCommandBooleanField = (event, keys) => {
       const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
       const request = event?.request && typeof event.request === "object" ? event.request : {};
+      const payloadRequest = payload?.request && typeof payload.request === "object" ? payload.request : {};
       for (const key of keys) {
-        const value = event?.[key] ?? payload?.[key] ?? request?.[key];
+        const value = event?.[key] ?? payload?.[key] ?? request?.[key] ?? payloadRequest?.[key];
         if (typeof value === "boolean") return value;
         if (typeof value === "number") return value !== 0;
         const text = String(value || "").trim().toLowerCase();
@@ -39746,8 +39758,10 @@ export default function App() {
     };
     const remoteCommandObjectField = (event, keys) => {
       const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+      const request = event?.request && typeof event.request === "object" ? event.request : {};
+      const payloadRequest = payload?.request && typeof payload.request === "object" ? payload.request : {};
       for (const key of keys) {
-        const value = event?.[key] ?? payload?.[key];
+        const value = event?.[key] ?? payload?.[key] ?? request?.[key] ?? payloadRequest?.[key];
         if (value && typeof value === "object" && !Array.isArray(value)) {
           return value;
         }
@@ -39756,13 +39770,47 @@ export default function App() {
     };
     const remoteCommandArrayField = (event, keys) => {
       const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+      const request = event?.request && typeof event.request === "object" ? event.request : {};
+      const payloadRequest = payload?.request && typeof payload.request === "object" ? payload.request : {};
       for (const key of keys) {
-        const value = event?.[key] ?? payload?.[key];
+        const value = event?.[key] ?? payload?.[key] ?? request?.[key] ?? payloadRequest?.[key];
         if (Array.isArray(value)) {
           return value;
         }
       }
       return [];
+    };
+    const normalizeRemoteChatAttachmentRefs = (attachments) => {
+      const seen = new Set();
+      return (Array.isArray(attachments) ? attachments : [])
+        .map((attachment) => {
+          if (!attachment || typeof attachment !== "object") return null;
+          const attachmentId = String(
+            attachment.attachment_id || attachment.attachmentId || attachment.id || "",
+          ).trim();
+          const sha256 = String(attachment.sha256 || attachment.hash || "").trim().toLowerCase();
+          const bytes = Number.parseInt(String(
+            attachment.bytes ?? attachment.size ?? attachment.sizeBytes ?? attachment.size_bytes ?? "",
+          ), 10);
+          const mime = String(
+            attachment.mime || attachment.mimeType || attachment.mime_type || attachment.type || "",
+          ).trim().toLowerCase().split(";")[0];
+          const name = String(attachment.name || attachment.fileName || attachment.file_name || "").trim();
+          if (!attachmentId || !/^[a-f0-9]{64}$/.test(sha256) || !Number.isFinite(bytes) || bytes <= 0 || !mime) {
+            return null;
+          }
+          if (seen.has(sha256)) return null;
+          seen.add(sha256);
+          return {
+            attachment_id: attachmentId,
+            attachmentId,
+            bytes,
+            mime,
+            name,
+            sha256,
+          };
+        })
+        .filter(Boolean);
     };
     const hydrateRemoteCommandTodoText = async (event, workspaceId, currentText = "") => {
       const existingText = String(currentText || "").trim();
@@ -39838,8 +39886,9 @@ export default function App() {
     const remoteCommandIntegerField = (event, keys) => {
       const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
       const request = event?.request && typeof event.request === "object" ? event.request : {};
+      const payloadRequest = payload?.request && typeof payload.request === "object" ? payload.request : {};
       for (const key of keys) {
-        const value = event?.[key] ?? payload?.[key] ?? request?.[key];
+        const value = event?.[key] ?? payload?.[key] ?? request?.[key] ?? payloadRequest?.[key];
         const number = Number.parseInt(value, 10);
         if (Number.isInteger(number) && number >= 0) {
           return number;
@@ -39850,6 +39899,7 @@ export default function App() {
     const remoteCommandWorkspaceId = (event) => {
       const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
       const request = event?.request && typeof event.request === "object" ? event.request : {};
+      const payloadRequest = payload?.request && typeof payload.request === "object" ? payload.request : {};
       const requestedWorkspaceId = String(
         event?.workspace_id
           || event?.workspaceId
@@ -39857,6 +39907,8 @@ export default function App() {
           || payload.workspaceId
           || request.workspace_id
           || request.workspaceId
+          || payloadRequest.workspace_id
+          || payloadRequest.workspaceId
           || "",
       ).trim();
       if (requestedWorkspaceId && findWorkspaceById(workspaces, requestedWorkspaceId)) {
@@ -41306,6 +41358,90 @@ export default function App() {
         }
         return;
       }
+      if ([
+        "chat_attachment_stage",
+        "chat_attachments_stage",
+        "stage_chat_attachment",
+        "stage_chat_attachments",
+      ].includes(normalizedKind)) {
+        const explicitWorkspaceId = remoteCommandStringField(event, ["workspace_id", "workspaceId"]);
+        if (!explicitWorkspaceId) {
+          await recordRemoteCommandStatus(event, "failed", "chat_attachment_stage requires an explicit workspace_id.", {
+            commandId,
+            commandKind,
+          });
+          return;
+        }
+        const explicitWorkspace = findWorkspaceById(workspacesRef.current, explicitWorkspaceId);
+        if (!explicitWorkspace) {
+          await recordRemoteCommandStatus(event, "failed", "Workspace is not available on this desktop.", {
+            commandId,
+            commandKind,
+            workspaceId: explicitWorkspaceId,
+          });
+          return;
+        }
+        const attachments = normalizeRemoteChatAttachmentRefs(remoteCommandArrayField(event, [
+          "attachments",
+          "chatAttachments",
+          "chat_attachments",
+        ]));
+        if (!attachments.length) {
+          await recordRemoteCommandStatus(event, "failed", "chat_attachment_stage did not include any valid attachment refs.", {
+            commandId,
+            commandKind,
+            workspaceId: explicitWorkspaceId,
+          });
+          return;
+        }
+        try {
+          await recordRemoteCommandStatus(event, "running", "Staging chat attachments on this desktop.", {
+            attachmentCount: attachments.length,
+            commandId,
+            commandKind,
+            workspaceId: explicitWorkspaceId,
+          });
+          const result = await invoke("stage_chat_attachment_refs", {
+            request: {
+              ackCloud: true,
+              attachments,
+              workspaceId: explicitWorkspaceId,
+              workspace_id: explicitWorkspaceId,
+            },
+          });
+          const staged = Array.isArray(result?.staged)
+            ? result.staged.map((id) => String(id || "").trim()).filter(Boolean)
+            : [];
+          const failed = Array.isArray(result?.failed) ? result.failed : [];
+          const status = staged.length > 0 ? "completed" : "failed";
+          await recordRemoteCommandStatus(
+            event,
+            status,
+            failed.length
+              ? `${staged.length} attachment${staged.length === 1 ? "" : "s"} staged; ${failed.length} failed.`
+              : `${staged.length} attachment${staged.length === 1 ? "" : "s"} staged.`,
+            {
+              attachmentCount: attachments.length,
+              cloudAcked: Boolean(result?.cloudAcked),
+              cloudAckError: String(result?.cloudAckError || ""),
+              commandId,
+              commandKind,
+              failed,
+              staged,
+              workspaceId: explicitWorkspaceId,
+              workspaceName: explicitWorkspace?.name || "",
+            },
+          );
+        } catch (error) {
+          await recordRemoteCommandStatus(event, "failed", getErrorMessage(error, "Unable to stage chat attachments on this desktop."), {
+            attachmentCount: attachments.length,
+            commandId,
+            commandKind,
+	            workspaceId: explicitWorkspaceId,
+	          });
+	        }
+	        return;
+	      }
 	      if (!targetWorkspace) {
 	        await recordRemoteCommandStatus(event, "failed", "Workspace is not available on this desktop.", {
 	          commandId,
@@ -43493,6 +43629,11 @@ export default function App() {
             "service_tier",
             "serviceTier",
           ]);
+          const chatAttachments = normalizeRemoteChatAttachmentRefs(remoteCommandArrayField(event, [
+            "attachments",
+            "chatAttachments",
+            "chat_attachments",
+          ]));
           let targetTerminalId = remoteCommandStringField(event, [
             "target_terminal_id",
             "targetTerminalId",
@@ -43597,13 +43738,19 @@ export default function App() {
           const navigationAction = remoteCommandIsNavigationAction(commandKind);
           const deviceOnlyNavigationAction = remoteCommandIsDeviceOnlyNavigationAction(commandKind);
           const terminalOrchestratorMessageAction = sendMessageTask;
+          const attachmentStageAction = [
+            "chat_attachment_stage",
+            "chat_attachments_stage",
+            "stage_chat_attachment",
+            "stage_chat_attachments",
+          ].includes(normalizeRemoteCommandName(commandKind));
           const receiptWorkspaceId = workspaceId
             || (terminalOrchestratorMessageAction
               ? DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID
-              : agentPackageAction || deviceOnlyNavigationAction
+              : agentPackageAction || deviceOnlyNavigationAction || attachmentStageAction
                 ? "device"
                 : "");
-          if (!workspaceId && !agentPackageAction && !deviceOnlyNavigationAction && !terminalOrchestratorMessageAction) {
+          if (!workspaceId && !agentPackageAction && !deviceOnlyNavigationAction && !terminalOrchestratorMessageAction && !attachmentStageAction) {
             await recordRemoteCommandStatus(
               event,
               "failed",
@@ -43739,7 +43886,7 @@ export default function App() {
             }
             return;
           }
-          if (navigationAction || !remoteCommandIsCreateTask(commandKind)) {
+          if (navigationAction || attachmentStageAction || !remoteCommandIsCreateTask(commandKind)) {
             try {
               await handleRemoteLifecycleControl({
                 agentId,
@@ -43840,6 +43987,7 @@ export default function App() {
                   todoId,
                   todoDeviceId,
                   todoWorkspaceId,
+                  ...(chatAttachments.length ? { attachments: chatAttachments } : {}),
                   ...(requestedModel ? { model: requestedModel, model_id: requestedModel, modelId: requestedModel } : {}),
                   ...(requestedReasoningEffort ? {
                     effort: requestedReasoningEffort,
@@ -43857,6 +44005,7 @@ export default function App() {
                 source: "next-remote-control",
                 targetAgentId: agentId || "",
                 targetAgentLabel: agentId ? getManagedAgentLabel(agentId) : "",
+                ...(chatAttachments.length ? { attachments: chatAttachments } : {}),
                 ...(requestedModel ? { model: requestedModel, modelId: requestedModel } : {}),
                 ...(requestedReasoningEffort ? {
                   effort: requestedReasoningEffort,

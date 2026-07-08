@@ -101,9 +101,9 @@ const MAX_FORGE_PROMPT_LENGTH: usize = 12_000;
 // Long enough for OpenCode `providerID/modelID` ids, whose model segment can
 // itself be a slash path (e.g. `fireworks-ai/accounts/fireworks/routers/...`).
 const MAX_FORGE_MODEL_LENGTH: usize = 128;
-const MAX_FORGE_IMAGES: usize = 4;
-const MAX_FORGE_IMAGE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_FORGE_IMAGE_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_FORGE_IMAGES: usize = 5;
+const MAX_FORGE_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+const MAX_FORGE_IMAGE_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 const MAX_HTML_DOCUMENT_OPEN_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TODO_TEXT_ATTACHMENT_BYTES: usize = 256 * 1024;
 const TERMINAL_DEFAULT_COLS: u16 = 80;
@@ -10014,6 +10014,7 @@ fn run_app(daemon: bool) {
             run_forge_prompt,
             agent_thread_turn_start,
             save_todo_image_attachments,
+            stage_chat_attachment_refs,
             save_todo_text_attachment,
             whisper_model_status,
             download_whisper_model,
