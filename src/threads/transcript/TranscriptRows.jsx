@@ -3,16 +3,20 @@
 // group, error card, turn fold header, dividers, command rows, and the
 // active "working" row.
 
-import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { CallMade as OpenSessionIcon } from "@styled-icons/material-rounded/CallMade";
 import { Edit as EditIcon } from "@styled-icons/material-rounded/Edit";
 import { KeyboardArrowDown as ChevronIcon } from "@styled-icons/material-rounded/KeyboardArrowDown";
 import { PlayArrow as ContinueIcon } from "@styled-icons/material-rounded/PlayArrow";
 import { SmartToy as SubagentIcon } from "@styled-icons/material-rounded/SmartToy";
 import { Send as RetryIcon } from "@styled-icons/material-rounded/Send";
+import { UnfoldLess as CollapseAllIcon } from "@styled-icons/material-rounded/UnfoldLess";
+import { UnfoldMore as ExpandAllIcon } from "@styled-icons/material-rounded/UnfoldMore";
 
 import { AnsiText, CommandItemRow } from "./TerminalChatKit";
 import {
   artifactImageUrl,
+  codeLanguageToken,
   foldHeaderLabel,
   formatDurationMs,
   messageContentText,
@@ -23,6 +27,7 @@ import {
   normalizeFileChangeFile,
   prettyPrintValue,
   reasoningDurationMs,
+  subagentGroupStats,
   toolDurationMs,
   toolExitCode,
   toolInputSummary,
@@ -32,22 +37,39 @@ import {
   transcriptText,
   transcriptTimestampMs,
   transcriptToken,
+  turnDiffSyntheticMessage,
   usageTooltip,
 } from "./builders.mjs";
+import {
+  hunkHeaderLabel,
+  hunkLinesText,
+  languageFromPath,
+  parseUnifiedPatch,
+} from "./diffHunks.mjs";
+import { cachedHighlightLines, highlightCodeLines } from "./shikiHighlight";
 import { BottomSheet, useIsMobileViewport } from "./BottomSheet";
-import { CopyButton, TranscriptMarkdown } from "./MarkdownContent";
+import { CopyButton, ShikiLineCode, TranscriptMarkdown } from "./MarkdownContent";
 import {
   ArtifactChip,
   ArtifactImageLink,
   ArtifactList,
   AssistantRow,
   CollapseOuter,
+  DiffHunkBlock,
+  DiffHunkHeader,
+  DiffHunkScroll,
+  DiffHunksWrap,
+  DiffLineList,
+  DiffLineRow,
+  DiffNote,
   DividerRow,
   ErrorCardFrame,
   FileChangeFrame,
   FileChangeHeader,
+  FileChangeHeaderActions,
   FileChangeList,
   FileChangeRowLine,
+  FileDiffRowButton,
   FoldChevron,
   FoldErrorDot,
   FoldHeaderRow,
@@ -60,7 +82,9 @@ import {
   StatusPill,
   SubagentChildren,
   SubagentFrame,
-  SubagentHeader,
+  SubagentHeaderButton,
+  SubagentOpenSessionChip,
+  SubagentStatusDot,
   ToolCardBody,
   ToolCardChip,
   ToolCardFrame,
@@ -106,10 +130,16 @@ function formatRelative(value, nowMs = Date.now()) {
   return formatAbsolute(timestamp);
 }
 
+// Matches the header elapsed formatter (dashboard formatTerminalChatElapsedMs):
+// m:ss below an hour, h:mm:ss from 60 minutes on.
 function formatElapsedClock(durationMs) {
   const totalSeconds = Math.max(0, Math.floor(Number(durationMs) / 1000));
-  const minutes = Math.floor(totalSeconds / 60);
+  const hours = Math.floor(totalSeconds / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
   const seconds = totalSeconds % 60;
+  if (hours) {
+    return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  }
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
 
@@ -546,18 +576,32 @@ export function ToolCardRow({ message = {}, open: openProp = false, onToggleOpen
 }
 
 /* ------------------------------------------------------------------ */
-/* File-change card                                                    */
+/* File-change card + reviewable diff hunks (turn_diff)                */
 /* ------------------------------------------------------------------ */
 
 const FILE_CHANGE_PREVIEW_COUNT = 8;
+const PATCH_TRUNCATED_NOTE = "patch truncated at source — counts preserved";
+const RECORD_TRUNCATED_NOTE = "diff truncated at source — largest patches omitted, counts preserved";
 
 function fileChangeRowFiles(row = {}) {
+  if (row.turnDiff?.files?.length) {
+    return {
+      files: transcriptArray(row.turnDiff.files),
+      additions: Math.max(0, Number(row.turnDiff.totalAdditions) || 0),
+      deletions: Math.max(0, Number(row.turnDiff.totalDeletions) || 0),
+      summary: transcriptText(row.summary || row.message?.title),
+      recordTruncated: Boolean(row.turnDiff.truncated),
+      filesOmitted: Math.max(0, Number(row.turnDiff.filesOmitted) || 0),
+    };
+  }
   if (row.synthetic) {
     return {
       files: transcriptArray(row.files),
       additions: row.additions || 0,
       deletions: row.deletions || 0,
       summary: row.summary || "",
+      recordTruncated: false,
+      filesOmitted: 0,
     };
   }
   const fileChange = row.message ? messageFileChange(row.message) : null;
@@ -573,51 +617,298 @@ function fileChangeRowFiles(row = {}) {
     additions,
     deletions,
     summary: transcriptText(fileChange?.summary || row.message?.title),
+    recordTruncated: false,
+    filesOmitted: 0,
   };
 }
 
-function FileChangeLine({ file = {} }) {
+// One hunk: per-line syntax highlighting via the shared shiki pipeline
+// (language from the file extension), with +/− row tints and line numbers
+// from the @@ headers.
+function DiffHunkView({ hunk, language = "" }) {
+  const text = useMemo(() => hunkLinesText(hunk), [hunk]);
+  // htmlLines: string[] = highlighted, null = not attempted, false = plain.
+  const [state, setState] = useState(() => ({
+    text,
+    language,
+    htmlLines: language ? cachedHighlightLines(text, language) : false,
+  }));
+  if (state.text !== text || state.language !== language) {
+    setState({
+      text,
+      language,
+      htmlLines: language ? cachedHighlightLines(text, language) : false,
+    });
+  }
+  const pending = state.htmlLines === null;
+  useEffect(() => {
+    if (!pending) return undefined;
+    let cancelled = false;
+    void highlightCodeLines(text, language).then((result) => {
+      if (cancelled) return;
+      setState((current) => (
+        current.text === text && current.language === language
+          ? { ...current, htmlLines: result ?? false }
+          : current
+      ));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [language, pending, text]);
+  const htmlLines = Array.isArray(state.htmlLines) ? state.htmlLines : null;
+  const lines = transcriptArray(hunk.lines);
+  return (
+    <DiffHunkBlock>
+      <DiffHunkHeader>
+        <span>{hunkHeaderLabel(hunk)}</span>
+      </DiffHunkHeader>
+      <DiffHunkScroll>
+        <DiffLineList>
+          {lines.map((line, index) => (
+            <DiffLineRow data-type={line.type} key={index}>
+              <i>{line.oldLine ?? ""}</i>
+              <i>{line.newLine ?? ""}</i>
+              <b>{line.type === "add" ? "+" : line.type === "del" ? "−" : " "}</b>
+              {htmlLines?.[index] ? (
+                <ShikiLineCode html={htmlLines[index]} />
+              ) : (
+                <code>{line.text || " "}</code>
+              )}
+              {line.noNewline ? (
+                <em data-no-newline title="No newline at end of file">no ⏎</em>
+              ) : null}
+            </DiffLineRow>
+          ))}
+        </DiffLineList>
+      </DiffHunkScroll>
+    </DiffHunkBlock>
+  );
+}
+
+export function DiffFileHunks({ file = {} }) {
+  const parsed = useMemo(() => parseUnifiedPatch(file.patch || ""), [file.patch]);
+  const language = useMemo(
+    () => codeLanguageToken(languageFromPath(file.path || file.oldPath || "")),
+    [file.oldPath, file.path],
+  );
+  return (
+    <>
+      {file.patchTruncated ? <DiffNote>{PATCH_TRUNCATED_NOTE}</DiffNote> : null}
+      <DiffHunksWrap>
+        <ToolPaneHeader as="div">
+          <span>{language || "patch"}</span>
+          <CopyButton label="Copy patch" text={file.patch || ""} />
+        </ToolPaneHeader>
+        {parsed.hunks.map((hunk, index) => (
+          <DiffHunkView hunk={hunk} key={`${hunk.oldStart}:${hunk.newStart}:${index}`} language={language} />
+        ))}
+        {!parsed.hunks.length ? (
+          <DiffNote style={{ padding: "0 2px 2px" }}>
+            {parsed.binary ? "binary file — no textual diff" : "no textual hunks in this patch"}
+          </DiffNote>
+        ) : null}
+      </DiffHunksWrap>
+    </>
+  );
+}
+
+function fileDisplayPath(file = {}) {
+  if (file.kind === "rename" && file.oldPath && file.oldPath !== file.path) {
+    return `${file.oldPath} → ${file.path}`;
+  }
+  return file.path || "";
+}
+
+function FileChangeLine({ file = {}, expandable = false, expanded = false, onToggle = null }) {
   const additions = Number.isFinite(file.additions) ? file.additions : null;
   const deletions = Number.isFinite(file.deletions) ? file.deletions : null;
+  const displayPath = fileDisplayPath(file);
+  const Frame = expandable ? FileDiffRowButton : FileChangeRowLine;
   return (
-    <FileChangeRowLine>
-      <span title={file.path}>{middleEllipsis(file.path, 64)}</span>
+    <Frame
+      aria-expanded={expandable ? expanded : undefined}
+      onClick={expandable ? onToggle : undefined}
+      type={expandable ? "button" : undefined}
+    >
+      {expandable ? (
+        <FoldChevron $open={expanded} aria-hidden="true">
+          <ChevronIcon />
+        </FoldChevron>
+      ) : null}
+      <span title={displayPath}>{middleEllipsis(displayPath, 64)}</span>
       {file.kind && file.kind !== "edit" ? <i>{file.kind}</i> : null}
+      {file.binary ? <i>binary</i> : null}
       <em>
         {additions !== null ? <b data-tone="add">+{additions}</b> : null}
         {additions !== null && deletions !== null ? " " : null}
         {deletions !== null ? <b data-tone="delete">−{deletions}</b> : null}
       </em>
-    </FileChangeRowLine>
+    </Frame>
   );
 }
 
-export function FileChangeCardRow({ row = {}, open: openProp = false, onToggleOpen = null }) {
+export function FileChangeCardRow({
+  row = {},
+  open: openProp = false,
+  onToggleOpen = null,
+  openRowKeys = null,
+  onToggleRowOpen = null,
+  onSetRowsOpen = null,
+  onFetchTruncated = null,
+}) {
   const [showAll, toggleShowAll] = useRowDisclosure(openProp, onToggleOpen);
+  // Per-file hunk expansion is hoisted (openRowKeys) when the host wires it;
+  // standalone usage falls back to a local set.
+  const [localOpenKeys, setLocalOpenKeys] = useState(() => new Set());
   const isMobile = useIsMobileViewport();
-  const { files, additions, deletions, summary } = fileChangeRowFiles(row);
+  const {
+    files, additions, deletions, summary, recordTruncated, filesOmitted,
+  } = fileChangeRowFiles(row);
+  // A truncated turn_diff card whose message carries the durable record refs
+  // gets the standard fetchable TruncatedChip. When the diff rides an
+  // existing file-change row, the turn_diff's own record identity wins over
+  // the unrelated file-change message.
+  const cardMessage = (row.turnDiff ? turnDiffSyntheticMessage(row.turnDiff) : null)
+    || row.message
+    || null;
+  const cardRecordRef = messageRecordRef(cardMessage || {});
+  const truncatedFetchable = Boolean(
+    cardMessage
+      && messageTruncated(cardMessage)
+      && (cardRecordRef.recordId || cardRecordRef.recordSeq),
+  );
   if (!files.length) return null;
+
+  const hoisted = typeof onToggleRowOpen === "function" && openRowKeys instanceof Set;
+  const fileKey = (index) => `${row.key}:file:${index}`;
+  const isFileOpen = (index) => (hoisted ? openRowKeys.has(fileKey(index)) : localOpenKeys.has(fileKey(index)));
+  const toggleFile = (index) => {
+    if (hoisted) {
+      onToggleRowOpen(fileKey(index));
+      return;
+    }
+    setLocalOpenKeys((current) => {
+      const next = new Set(current);
+      if (next.has(fileKey(index))) {
+        next.delete(fileKey(index));
+      } else {
+        next.add(fileKey(index));
+      }
+      return next;
+    });
+  };
+  const reviewableIndexes = files
+    .map((file, index) => (file.patch && !file.binary ? index : -1))
+    .filter((index) => index >= 0);
+  const anyReviewable = reviewableIndexes.length > 0;
+  const anyOpen = reviewableIndexes.some((index) => isFileOpen(index));
+  const setAllFiles = (openValue) => {
+    const keys = reviewableIndexes.map(fileKey);
+    if (hoisted && typeof onSetRowsOpen === "function") {
+      onSetRowsOpen(keys, openValue);
+      return;
+    }
+    if (hoisted) {
+      // Toggle-only host: flip just the keys that differ.
+      reviewableIndexes.forEach((index) => {
+        if (isFileOpen(index) !== openValue) onToggleRowOpen(fileKey(index));
+      });
+      return;
+    }
+    setLocalOpenKeys(openValue ? new Set(keys) : new Set());
+  };
+
   const preview = files.slice(0, FILE_CHANGE_PREVIEW_COUNT);
   const hidden = files.length - preview.length;
+  const renderFile = (file, index, { sheetMode = false } = {}) => {
+    const expandable = Boolean(file.patch && !file.binary);
+    const expanded = expandable && isFileOpen(index);
+    return (
+      <div key={`${file.path || "file"}-${index}`} style={{ display: "grid", minWidth: 0 }}>
+        <FileChangeLine
+          expandable={expandable}
+          expanded={expanded && (!isMobile || sheetMode)}
+          file={file}
+          onToggle={expandable ? () => toggleFile(index) : null}
+        />
+        {expandable && !isMobile ? (
+          <Collapse open={expanded}>
+            <DiffFileHunks file={file} />
+          </Collapse>
+        ) : null}
+        {expandable && sheetMode && expanded ? <DiffFileHunks file={file} /> : null}
+        {expandable && isMobile && !sheetMode && expanded ? (
+          <BottomSheet
+            onClose={() => toggleFile(index)}
+            title={(
+              <strong title={fileDisplayPath(file)}>
+                {middleEllipsis(fileDisplayPath(file), 44)}
+              </strong>
+            )}
+          >
+            <DiffFileHunks file={file} />
+          </BottomSheet>
+        ) : null}
+        {file.patchTruncated && !expandable ? <DiffNote>{PATCH_TRUNCATED_NOTE}</DiffNote> : null}
+      </div>
+    );
+  };
+
   const header = (
     <FileChangeHeader>
       <strong>{files.length} file{files.length === 1 ? "" : "s"} changed</strong>
       <b data-tone="add">+{additions}</b>
       <b data-tone="delete">−{deletions}</b>
       {summary ? <i title={summary}>{summary}</i> : null}
+      {anyReviewable && !isMobile ? (
+        <FileChangeHeaderActions data-transcript-diff-actions>
+          {anyOpen ? (
+            <GhostActionButton
+              aria-label="Collapse all diffs"
+              onClick={() => setAllFiles(false)}
+              title="Collapse all diffs"
+              type="button"
+            >
+              <CollapseAllIcon aria-hidden="true" />
+              Collapse all
+            </GhostActionButton>
+          ) : (
+            <GhostActionButton
+              aria-label="Expand all diffs"
+              onClick={() => setAllFiles(true)}
+              title="Expand all diffs"
+              type="button"
+            >
+              <ExpandAllIcon aria-hidden="true" />
+              Expand all
+            </GhostActionButton>
+          )}
+        </FileChangeHeaderActions>
+      ) : null}
     </FileChangeHeader>
   );
+
   return (
     <FileChangeFrame data-message-role="file-change">
       {header}
+      {recordTruncated ? (
+        <DiffNote>
+          {RECORD_TRUNCATED_NOTE}
+          {truncatedFetchable ? (
+            <TruncatedChip message={cardMessage} onFetchTruncated={onFetchTruncated} />
+          ) : null}
+        </DiffNote>
+      ) : null}
+      {filesOmitted > 0 ? (
+        <DiffNote>{filesOmitted} more file{filesOmitted === 1 ? "" : "s"} not shown</DiffNote>
+      ) : null}
       <FileChangeList>
-        {preview.map((file, index) => (
-          <FileChangeLine file={file} key={file.path || index} />
-        ))}
+        {preview.map((file, index) => renderFile(file, index))}
         {hidden > 0 && !isMobile ? (
           <Collapse open={showAll}>
             {files.slice(FILE_CHANGE_PREVIEW_COUNT).map((file, index) => (
-              <FileChangeLine file={file} key={file.path || `rest-${index}`} />
+              renderFile(file, FILE_CHANGE_PREVIEW_COUNT + index)
             ))}
           </Collapse>
         ) : null}
@@ -637,9 +928,7 @@ export function FileChangeCardRow({ row = {}, open: openProp = false, onToggleOp
           onClose={toggleShowAll}
           title={<strong>{files.length} files changed · +{additions} −{deletions}</strong>}
         >
-          {files.map((file, index) => (
-            <FileChangeLine file={file} key={file.path || `sheet-${index}`} />
-          ))}
+          {files.map((file, index) => renderFile(file, index, { sheetMode: true }))}
         </BottomSheet>
       ) : null}
     </FileChangeFrame>
@@ -650,27 +939,120 @@ export function FileChangeCardRow({ row = {}, open: openProp = false, onToggleOp
 /* Subagent group                                                      */
 /* ------------------------------------------------------------------ */
 
-export function SubagentGroupRow({ row = {}, live = false, openRowKeys = null, onToggleRowOpen = null, onFetchTruncated }) {
+function subagentCountsLabel(stats = {}) {
+  const parts = [];
+  parts.push(`${stats.messages || 0} message${stats.messages === 1 ? "" : "s"}`);
+  if (stats.toolCalls > 0) {
+    parts.push(`${stats.toolCalls} tool call${stats.toolCalls === 1 ? "" : "s"}`);
+  }
+  return parts.join(" · ");
+}
+
+// Collapsible subagent group (same interaction pattern as turn folds):
+// expanded while the turn is active, collapsed by default once settled.
+// A hoisted openRowKeys entry flips the state relative to that default so
+// virtualization unmounts never lose it; the toggle clears whenever the
+// default transitions (live → settled) so a collapse made during streaming
+// stays collapsed after settle. Nested groups (parent_id chains) render
+// recursively through TranscriptRowBody.
+export function SubagentGroupRow({
+  row = {},
+  live = false,
+  openRowKeys = null,
+  onToggleRowOpen = null,
+  onFetchTruncated,
+  onOpenSession = null,
+  onUserMessageAction = null,
+}) {
   const status = toolStatusToken(row.status);
+  const stats = useMemo(() => subagentGroupStats(row), [row]);
+  const defaultOpen = Boolean(live);
+  const toggled = Boolean(openRowKeys?.has?.(row.key));
+  const [localToggled, setLocalToggled] = useState(false);
+  const hoisted = typeof onToggleRowOpen === "function";
+  // The stored toggle is relative to defaultOpen, so the live→settled
+  // default flip would invert a collapse made during streaming into a
+  // spurious re-open. Clear the toggle when the default transitions (and
+  // ignore it for the in-between renders) so the group lands on the new
+  // default in its last visible state.
+  const prevDefaultOpenRef = useRef(defaultOpen);
+  const defaultTransitioned = prevDefaultOpenRef.current !== defaultOpen;
+  useEffect(() => {
+    if (!defaultTransitioned) return;
+    prevDefaultOpenRef.current = defaultOpen;
+    if (hoisted) {
+      if (toggled) onToggleRowOpen(row.key);
+    } else if (localToggled) {
+      setLocalToggled(false);
+    }
+  }, [defaultOpen, defaultTransitioned, hoisted, localToggled, onToggleRowOpen, row.key, toggled]);
+  const open = ((hoisted ? toggled : localToggled) && !defaultTransitioned)
+    ? !defaultOpen
+    : defaultOpen;
+  const toggleOpen = () => {
+    if (hoisted) {
+      onToggleRowOpen(row.key);
+    } else {
+      setLocalToggled((value) => !value);
+    }
+  };
+  const durationLabel = formatDurationMs(stats.durationMs);
+  const sessionRef = row.sessionRef || null;
+  const openSession = sessionRef && typeof onOpenSession === "function"
+    ? (event) => {
+      event.stopPropagation();
+      onOpenSession(sessionRef);
+    }
+    : null;
   return (
     <SubagentFrame data-message-role="subagent">
-      <SubagentHeader>
-        <SubagentIcon aria-hidden="true" />
-        <span>Subagent · {row.title || "Task"}</span>
-        {row.status ? <StatusPill data-status={status}>{row.status}</StatusPill> : null}
-      </SubagentHeader>
-      <SubagentChildren>
-        {transcriptArray(row.childRows).map((child) => (
-          <TranscriptRowBody
-            key={child.key}
-            live={live}
-            onFetchTruncated={onFetchTruncated}
-            onToggleRowOpen={onToggleRowOpen}
-            openRowKeys={openRowKeys}
-            row={child}
-          />
-        ))}
-      </SubagentChildren>
+      <div style={{ display: "flex", minWidth: 0, alignItems: "center", gap: 6 }}>
+        <SubagentHeaderButton
+          aria-expanded={open}
+          onClick={toggleOpen}
+          type="button"
+        >
+          <FoldChevron $open={open} aria-hidden="true">
+            <ChevronIcon />
+          </FoldChevron>
+          <SubagentIcon aria-hidden="true" />
+          <SubagentStatusDot aria-hidden="true" data-status={status} />
+          <span>Subagent · {row.title || "Task"}</span>
+          <em>{subagentCountsLabel(stats)}</em>
+          {durationLabel ? <em>{durationLabel}</em> : null}
+          {row.status ? <StatusPill data-status={status}>{row.status}</StatusPill> : null}
+        </SubagentHeaderButton>
+        {sessionRef ? (
+          <SubagentOpenSessionChip
+            aria-label={openSession ? "Open the subagent's session" : "Session outside this view"}
+            disabled={!openSession}
+            onClick={openSession || undefined}
+            title={openSession
+              ? (sessionRef.agentChatSessionId || sessionRef.providerSessionId)
+              : "session outside this view"}
+            type="button"
+          >
+            Open session
+            <OpenSessionIcon aria-hidden="true" />
+          </SubagentOpenSessionChip>
+        ) : null}
+      </div>
+      <Collapse open={open}>
+        <SubagentChildren>
+          {transcriptArray(row.childRows).map((child) => (
+            <TranscriptRowBody
+              key={child.key}
+              live={live}
+              onFetchTruncated={onFetchTruncated}
+              onOpenSession={onOpenSession}
+              onToggleRowOpen={onToggleRowOpen}
+              onUserMessageAction={onUserMessageAction}
+              openRowKeys={openRowKeys}
+              row={child}
+            />
+          ))}
+        </SubagentChildren>
+      </Collapse>
     </SubagentFrame>
   );
 }
@@ -769,7 +1151,7 @@ export function WorkingRow({ label = "Working", startedAtMs = 0 }) {
 /* Dispatch                                                            */
 /* ------------------------------------------------------------------ */
 
-export const TranscriptRowBody = memo(function TranscriptRowBody({ row = {}, live = false, onToggleTurn, openRowKeys = null, onToggleRowOpen = null, onFetchTruncated, onUserMessageAction = null }) {
+export const TranscriptRowBody = memo(function TranscriptRowBody({ row = {}, live = false, onToggleTurn, openRowKeys = null, onToggleRowOpen = null, onSetRowsOpen = null, onFetchTruncated, onUserMessageAction = null, onOpenSession = null }) {
   const rowOpen = Boolean(openRowKeys?.has?.(row.key));
   const toggleRowOpen = typeof onToggleRowOpen === "function"
     ? () => onToggleRowOpen(row.key)
@@ -788,9 +1170,19 @@ export const TranscriptRowBody = memo(function TranscriptRowBody({ row = {}, liv
     case "tool":
       return <ToolCardRow message={row.message || {}} onFetchTruncated={onFetchTruncated} onToggleOpen={toggleRowOpen} open={rowOpen} />;
     case "file-change":
-      return <FileChangeCardRow onToggleOpen={toggleRowOpen} open={rowOpen} row={row} />;
+      return (
+        <FileChangeCardRow
+          onFetchTruncated={onFetchTruncated}
+          onSetRowsOpen={onSetRowsOpen}
+          onToggleOpen={toggleRowOpen}
+          onToggleRowOpen={onToggleRowOpen}
+          open={rowOpen}
+          openRowKeys={openRowKeys}
+          row={row}
+        />
+      );
     case "subagent-group":
-      return <SubagentGroupRow live={live} onFetchTruncated={onFetchTruncated} onToggleRowOpen={onToggleRowOpen} openRowKeys={openRowKeys} row={row} />;
+      return <SubagentGroupRow live={live} onFetchTruncated={onFetchTruncated} onOpenSession={onOpenSession} onToggleRowOpen={onToggleRowOpen} onUserMessageAction={onUserMessageAction} openRowKeys={openRowKeys} row={row} />;
     case "subagent-note":
       return <SubagentNoteRow message={row.message || {}} />;
     case "error":

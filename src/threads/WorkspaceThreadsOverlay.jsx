@@ -64,94 +64,52 @@ const OverlayRoot = styled.div`
   display: grid;
   min-width: 0;
   min-height: 0;
-  --thread-bg: #050505;
-  --thread-bg-soft: #080808;
-  --thread-card: rgba(32, 32, 32, 0.92);
-  --thread-fg: #f4f7fa;
-  --thread-muted: #a5a7ad;
-  --thread-muted-soft: rgba(165, 167, 173, 0.58);
-  --thread-border: rgba(255, 255, 255, 0.08);
-  --thread-accent: rgba(255, 255, 255, 0.07);
-  --thread-accent-strong: rgba(255, 255, 255, 0.1);
-  --thread-primary: rgba(255, 255, 255, 0.1);
-  --thread-primary-hover: rgba(255, 255, 255, 0.13);
-  --thread-blue: #a8a8a8;
-  --thread-ember: #dfa55a;
+  /* Palette mirrors next-diffforge src/styles/tokens.js (dashboard family). */
+  --thread-bg: #030508;
+  --thread-bg-soft: #0a0f17;
+  --thread-card: rgba(13, 20, 31, 0.92);
+  --thread-fg: #e8eef8;
+  --thread-muted: #a7b2c2;
+  --thread-muted-soft: #687386;
+  --thread-border: rgba(255, 255, 255, 0.1);
+  --thread-accent: rgba(255, 255, 255, 0.045);
+  --thread-accent-strong: rgba(255, 255, 255, 0.08);
+  --thread-primary: rgba(47, 128, 255, 0.14);
+  --thread-primary-hover: rgba(47, 128, 255, 0.2);
+  --thread-blue: #62a0ff;
+  --thread-ember: #ff9a3d;
   --thread-green: #3ccb7f;
-  --thread-red: #ef6b6b;
-  --thread-rail-bg: #101820;
-  --thread-rail-image: url("/textures/thread-rail-carbon-fiber.png");
-  --thread-rail-image-size: 64px 64px;
-  --thread-rail-sheen: rgba(255, 255, 255, 0.045);
-  --thread-rail-tint: rgba(6, 10, 16, 0.28);
-  --thread-rail-edge: rgba(0, 0, 0, 0.5);
-  --thread-rail-fg: #e9e9e9;
-  --thread-rail-fg-soft: rgba(233, 233, 233, 0.72);
-  --thread-rail-icon: rgba(233, 233, 233, 0.78);
-  --thread-rail-icon-soft: rgba(233, 233, 233, 0.68);
-  --thread-rail-muted: rgba(225, 225, 225, 0.52);
-  --thread-rail-muted-soft: rgba(225, 225, 225, 0.48);
-  --thread-rail-placeholder: rgba(233, 233, 233, 0.42);
+  --thread-red: #ff6b6b;
+  --thread-rail-bg: #060910;
+  --thread-rail-fg: #e8eef8;
+  --thread-rail-fg-soft: #a7b2c2;
+  --thread-rail-icon: #a7b2c2;
+  --thread-rail-icon-soft: #687386;
+  --thread-rail-muted: #687386;
+  --thread-rail-muted-soft: #687386;
+  --thread-rail-placeholder: rgba(166, 178, 194, 0.55);
   --thread-rail-search-border: rgba(255, 255, 255, 0.1);
-  --thread-rail-search-bg: rgba(0, 0, 0, 0.18);
-  --thread-rail-search-focus-border: rgba(255, 255, 255, 0.2);
-  --thread-rail-search-focus-bg: rgba(0, 0, 0, 0.24);
-  --thread-rail-row-fg: rgba(236, 236, 236, 0.86);
-  --thread-rail-row-hover: rgba(255, 255, 255, 0.075);
-  --thread-rail-row-selected: rgba(255, 255, 255, 0.105);
-  --thread-rail-row-selected-hover: rgba(255, 255, 255, 0.13);
-  --thread-rail-action-hover: rgba(255, 255, 255, 0.095);
+  --thread-rail-search-bg: rgba(255, 255, 255, 0.03);
+  --thread-rail-search-focus-border: rgba(47, 128, 255, 0.36);
+  --thread-rail-search-focus-bg: rgba(255, 255, 255, 0.05);
+  --thread-rail-row-fg: #a7b2c2;
+  --thread-rail-row-hover: rgba(255, 255, 255, 0.035);
+  --thread-rail-row-selected: rgba(47, 128, 255, 0.1);
+  --thread-rail-row-selected-hover: rgba(47, 128, 255, 0.14);
+  --thread-rail-action-hover: rgba(255, 255, 255, 0.045);
+  --thread-rail-accent-line: rgba(47, 128, 255, 0.36);
+  --thread-rail-accent-soft: rgba(47, 128, 255, 0.14);
+  --thread-rail-accent-bright: #62a0ff;
   color: var(--thread-fg);
   background:
-    linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.014) 1px, transparent 1px),
-    #050505;
-  background-size: 86px 86px, 86px 86px, auto;
+    linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.026) 1px, transparent 1px),
+    var(--thread-bg);
+  background-size: 96px 96px, 96px 96px, auto;
   animation: ${overlayFadeIn} 140ms ease both;
   backdrop-filter: blur(10px);
   pointer-events: auto;
   user-select: text;
-
-  html[data-forge-theme="light"] & {
-    --thread-bg: #f5f5f7;
-    --thread-bg-soft: #ffffff;
-    --thread-card: #ffffff;
-    --thread-fg: #1d1d1f;
-    --thread-muted: #7a7a7a;
-    --thread-muted-soft: rgba(122, 122, 122, 0.64);
-    --thread-border: rgba(0, 0, 0, 0.08);
-    --thread-accent: rgba(0, 0, 0, 0.045);
-    --thread-accent-strong: rgba(0, 0, 0, 0.08);
-    --thread-primary: rgba(0, 102, 204, 0.09);
-    --thread-primary-hover: rgba(0, 102, 204, 0.13);
-    --thread-blue: #0066cc;
-    --thread-ember: #0066cc;
-    --thread-green: #0a7f45;
-    --thread-red: #b42318;
-    --thread-rail-bg: #f1ead2;
-    --thread-rail-image: url("/textures/thread-rail-carbon-fiber-light.png");
-    --thread-rail-sheen: rgba(255, 255, 255, 0.55);
-    --thread-rail-tint: rgba(255, 251, 240, 0.4);
-    --thread-rail-edge: rgba(88, 66, 22, 0.16);
-    --thread-rail-fg: rgba(45, 38, 24, 0.9);
-    --thread-rail-fg-soft: rgba(68, 55, 28, 0.66);
-    --thread-rail-icon: rgba(62, 52, 35, 0.68);
-    --thread-rail-icon-soft: rgba(62, 52, 35, 0.56);
-    --thread-rail-muted: rgba(92, 75, 41, 0.62);
-    --thread-rail-muted-soft: rgba(92, 75, 41, 0.54);
-    --thread-rail-placeholder: rgba(72, 60, 42, 0.44);
-    --thread-rail-search-border: rgba(128, 95, 24, 0.16);
-    --thread-rail-search-bg: rgba(255, 255, 255, 0.34);
-    --thread-rail-search-focus-border: rgba(150, 112, 28, 0.3);
-    --thread-rail-search-focus-bg: rgba(255, 255, 255, 0.5);
-    --thread-rail-row-fg: rgba(47, 40, 28, 0.82);
-    --thread-rail-row-hover: rgba(132, 100, 31, 0.1);
-    --thread-rail-row-selected: rgba(132, 100, 31, 0.17);
-    --thread-rail-row-selected-hover: rgba(132, 100, 31, 0.22);
-    --thread-rail-action-hover: rgba(132, 100, 31, 0.12);
-    background: rgba(245, 245, 247, 0.88);
-    backdrop-filter: saturate(180%) blur(20px);
-  }
 `;
 
 const OverlayPanel = styled.section`
@@ -163,9 +121,7 @@ const OverlayPanel = styled.section`
   overflow: hidden;
   border: 0;
   border-radius: 0;
-  background:
-    linear-gradient(90deg, rgba(255, 255, 255, 0.018), transparent 28%),
-    var(--thread-bg);
+  background: transparent;
   box-shadow: none;
   animation: ${overlayPanelIn} 160ms cubic-bezier(0.16, 1, 0.3, 1) both;
   transition: grid-template-columns 180ms cubic-bezier(0.16, 1, 0.3, 1);
@@ -191,14 +147,9 @@ const ThreadRail = styled.aside`
   min-height: 0;
   overflow: visible;
   border-right: 1px solid var(--thread-border);
-  background-color: var(--thread-rail-bg);
-  background-image:
-    linear-gradient(180deg, var(--thread-rail-sheen), transparent 150px),
-    linear-gradient(var(--thread-rail-tint), var(--thread-rail-tint)),
-    var(--thread-rail-image);
-  background-repeat: no-repeat, no-repeat, repeat;
-  background-size: 100% 100%, 100% 100%, var(--thread-rail-image-size);
-  box-shadow: inset -16px 0 26px -20px var(--thread-rail-edge);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.028), rgba(255, 255, 255, 0)),
+    var(--thread-rail-bg);
 `;
 
 const DrawerToggle = styled.button`
@@ -211,10 +162,10 @@ const DrawerToggle = styled.button`
   height: 28px;
   place-items: center;
   padding: 0;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid var(--thread-border);
   border-radius: 999px;
-  color: #d6d6d6;
-  background: rgba(45, 45, 45, 0.96);
+  color: var(--thread-rail-fg-soft);
+  background: rgba(10, 15, 23, 0.96);
   box-shadow: 0 6px 16px rgba(0, 0, 0, 0.28);
   transition:
     border-color 130ms ease,
@@ -223,30 +174,15 @@ const DrawerToggle = styled.button`
     transform 130ms ease;
 
   &:hover {
-    border-color: rgba(255, 255, 255, 0.16);
-    color: var(--thread-fg);
-    background: rgba(58, 58, 58, 0.98);
+    border-color: var(--thread-rail-accent-line);
+    color: var(--thread-rail-accent-bright);
+    background: rgba(17, 26, 38, 0.98);
     transform: translateX(1px);
   }
 
   &:focus-visible {
-    outline: 2px solid rgba(255, 255, 255, 0.22);
+    outline: 2px solid rgba(125, 176, 255, 0.56);
     outline-offset: 2px;
-  }
-
-  html[data-forge-theme="light"] & {
-    border-color: rgba(128, 95, 24, 0.16);
-    color: var(--thread-rail-fg);
-    background: rgba(255, 255, 255, 0.72);
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.6),
-      0 10px 22px rgba(88, 66, 22, 0.16);
-  }
-
-  html[data-forge-theme="light"] &:hover {
-    border-color: rgba(128, 95, 24, 0.24);
-    color: var(--thread-fg);
-    background: rgba(255, 255, 255, 0.88);
   }
 
   svg {
@@ -259,14 +195,14 @@ const WorkspaceList = styled.div`
   display: grid;
   min-height: 0;
   align-content: start;
-  gap: 12px;
+  gap: 14px;
   overflow-x: hidden;
   overflow-y: auto;
   padding: 26px 12px 16px;
   background: transparent;
 
   @media (max-width: 1180px) {
-    gap: 10px;
+    gap: 12px;
     padding-inline: 8px;
   }
 
@@ -280,7 +216,7 @@ const WorkspaceList = styled.div`
 
   &::-webkit-scrollbar-thumb {
     border-radius: 999px;
-    background: rgba(170, 170, 170, 0.16);
+    background: rgba(110, 142, 190, 0.3);
   }
 `;
 
@@ -295,25 +231,25 @@ const RailHeader = styled.div`
   strong {
     min-width: 0;
     overflow: hidden;
-    color: var(--thread-rail-fg);
-    font-size: 12px;
-    font-weight: 660;
-    letter-spacing: 0.02em;
+    color: var(--thread-rail-muted);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
     line-height: 1.2;
     text-overflow: ellipsis;
+    text-transform: uppercase;
     white-space: nowrap;
   }
 `;
 
 const RailHeaderCount = styled.span`
   flex: 0 0 auto;
-  padding: 1px 7px;
-  border-radius: 999px;
   color: var(--thread-rail-muted);
-  background: var(--thread-rail-search-bg);
-  font-size: 10px;
-  font-weight: 620;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  font-weight: 500;
   line-height: 1.6;
+  white-space: nowrap;
 `;
 
 const RailActionStack = styled.div`
@@ -327,32 +263,38 @@ const RailActionStack = styled.div`
 const RailActionButton = styled.button`
   display: flex;
   min-width: 0;
-  height: 30px;
+  height: 32px;
   align-items: center;
   gap: 8px;
   padding: 0 8px;
   border: 1px solid transparent;
   border-radius: 10px;
-  color: var(--thread-rail-fg);
+  color: var(--thread-rail-fg-soft);
   background: transparent;
   text-align: left;
   font: inherit;
   opacity: 1;
   transition:
     background 130ms ease,
+    border-color 130ms ease,
     color 130ms ease,
     opacity 130ms ease;
 
-  &:hover:not(:disabled),
-  &[data-active="true"] {
-    color: var(--thread-fg);
-    border-color: transparent;
+  &:hover:not(:disabled) {
+    color: var(--thread-rail-fg);
     background: var(--thread-rail-action-hover);
     opacity: 1;
   }
 
+  &[data-active="true"] {
+    color: var(--thread-rail-fg);
+    border-color: var(--thread-rail-accent-line);
+    background: var(--thread-rail-accent-soft);
+    opacity: 1;
+  }
+
   &:disabled {
-    color: var(--thread-rail-fg-soft);
+    color: var(--thread-rail-muted);
     opacity: 1;
     cursor: not-allowed;
   }
@@ -366,8 +308,8 @@ const RailActionButton = styled.button`
   span {
     min-width: 0;
     overflow: hidden;
-    font-size: 12px;
-    font-weight: 480;
+    font-size: 12.5px;
+    font-weight: 600;
     line-height: 1.2;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -390,10 +332,10 @@ const ThreadSearchField = styled.div`
   gap: 5px;
   padding: 0 5px 0 8px;
   border: 1px solid var(--thread-rail-search-border);
-  border-radius: 9px;
+  border-radius: 10px;
   color: var(--thread-rail-icon);
   background: var(--thread-rail-search-bg);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.025);
+  transition: border-color 130ms ease, background 130ms ease;
 
   &:focus-within {
     border-color: var(--thread-rail-search-focus-border);
@@ -413,8 +355,8 @@ const ThreadSearchInput = styled.input`
   color: var(--thread-fg);
   background: transparent;
   font: inherit;
-  font-size: 12px;
-  font-weight: 480;
+  font-size: 12.5px;
+  font-weight: 500;
   line-height: 1.2;
   outline: 0;
 
@@ -452,7 +394,7 @@ const ThreadSearchClearButton = styled.button`
 
   &:focus-visible {
     opacity: 1;
-    outline: 2px solid rgba(255, 255, 255, 0.22);
+    outline: 2px solid rgba(125, 176, 255, 0.56);
     outline-offset: 1px;
   }
 
@@ -466,24 +408,24 @@ const ThreadSearchSummary = styled.div`
   min-width: 0;
   padding: 0 6px;
   color: var(--thread-rail-muted-soft);
-  font-size: 11px;
-  font-weight: 460;
+  font-size: 10.5px;
+  font-weight: 500;
   line-height: 1.2;
 `;
 
 const WorkspaceGroup = styled.section`
   display: grid;
   min-width: 0;
-  gap: 5px;
+  gap: 4px;
 `;
 
 const WorkspaceTopline = styled.div`
   min-width: 0;
-  padding: 0 5px;
+  padding: 0 6px 1px;
   color: var(--thread-rail-muted);
-  font-size: 10px;
-  font-weight: 620;
-  letter-spacing: 0.07em;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
   line-height: 1.2;
   text-transform: uppercase;
 
@@ -539,23 +481,30 @@ const CollapsedRailActionButton = styled.button`
   padding: 0;
   border: 1px solid transparent;
   border-radius: 10px;
-  color: var(--thread-rail-fg);
+  color: var(--thread-rail-fg-soft);
   background: transparent;
   opacity: 1;
   transition:
     background 130ms ease,
+    border-color 130ms ease,
     color 130ms ease,
     opacity 130ms ease;
 
-  &:hover:not(:disabled),
-  &[data-active="true"] {
-    color: var(--thread-fg);
+  &:hover:not(:disabled) {
+    color: var(--thread-rail-fg);
     background: var(--thread-rail-action-hover);
     opacity: 1;
   }
 
+  &[data-active="true"] {
+    color: var(--thread-rail-accent-bright);
+    border-color: var(--thread-rail-accent-line);
+    background: var(--thread-rail-accent-soft);
+    opacity: 1;
+  }
+
   &:disabled {
-    color: var(--thread-rail-fg-soft);
+    color: var(--thread-rail-muted);
     opacity: 1;
     cursor: not-allowed;
   }
@@ -622,7 +571,7 @@ const CollapsedThreadButton = styled.button`
     border-color 130ms ease;
 
   &[data-selected="true"] {
-    border-color: transparent;
+    border-color: var(--thread-rail-accent-line);
     background: var(--thread-rail-row-selected);
   }
 
@@ -631,7 +580,7 @@ const CollapsedThreadButton = styled.button`
   }
 
   &:focus-visible {
-    outline: 2px solid rgba(255, 255, 255, 0.22);
+    outline: 2px solid rgba(125, 176, 255, 0.56);
     outline-offset: 2px;
   }
 `;
@@ -646,7 +595,7 @@ const ThreadRow = styled.div`
   gap: 3px;
   padding: 4px 4px 4px 8px;
   border: 1px solid transparent;
-  border-radius: 8px;
+  border-radius: 10px;
   color: var(--thread-rail-row-fg);
   background: transparent;
   font: inherit;
@@ -656,37 +605,19 @@ const ThreadRow = styled.div`
     border-color 130ms ease,
     color 130ms ease;
 
-  &::before {
-    content: "";
-    position: absolute;
-    top: 9px;
-    bottom: 9px;
-    left: 0;
-    width: 2px;
-    border-radius: 999px;
-    background: var(--thread-rail-fg);
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity 130ms ease;
-  }
-
   &[data-selected="true"] {
-    border-color: transparent;
+    border-color: var(--thread-rail-accent-line);
     color: var(--thread-fg);
     background: var(--thread-rail-row-selected);
   }
 
-  &[data-selected="true"]::before {
-    opacity: 0.75;
-  }
-
   &:hover {
     color: var(--thread-fg);
-    border-color: transparent;
     background: var(--thread-rail-row-hover);
   }
 
   &[data-selected="true"]:hover {
+    border-color: var(--thread-rail-accent-line);
     background: var(--thread-rail-row-selected-hover);
   }
 `;
@@ -704,7 +635,7 @@ const ThreadSelectButton = styled.button`
   text-align: left;
 
   &:focus-visible {
-    outline: 2px solid rgba(255, 255, 255, 0.22);
+    outline: 2px solid rgba(125, 176, 255, 0.56);
     outline-offset: 2px;
   }
 `;
@@ -726,11 +657,11 @@ const ThreadRowMeta = styled.span`
   display: flex;
   min-width: 0;
   align-items: center;
-  gap: 4px;
+  gap: 5px;
   color: var(--thread-rail-muted-soft);
-  font-size: 9.5px;
-  font-weight: 520;
-  letter-spacing: 0.02em;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0;
   line-height: 1.2;
   white-space: nowrap;
 
@@ -755,8 +686,8 @@ const ThreadRowTitle = styled.strong`
   align-items: center;
   overflow: visible;
   padding-bottom: 2px;
-  font-size: 11px;
-  font-weight: 540;
+  font-size: 12px;
+  font-weight: 550;
   line-height: 1.25;
   text-overflow: clip;
   white-space: normal;
@@ -775,17 +706,17 @@ const ThreadRowTitle = styled.strong`
 
   &::before {
     right: 0;
-    background: rgba(255, 255, 255, 0.16);
+    background: rgba(98, 160, 255, 0.28);
   }
 
   &::after {
     width: 50%;
     background: linear-gradient(
       90deg,
-      rgba(255, 255, 255, 0),
-      rgba(255, 255, 255, 0.94) 42%,
-      rgba(255, 255, 255, 0.94) 62%,
-      rgba(255, 255, 255, 0)
+      rgba(98, 160, 255, 0),
+      rgba(98, 160, 255, 0.92) 42%,
+      rgba(98, 160, 255, 0.92) 62%,
+      rgba(98, 160, 255, 0)
     );
     animation: ${threadActivitySweep} 1180ms linear infinite;
   }
@@ -796,20 +727,6 @@ const ThreadRowTitle = styled.strong`
 
   &[data-working="true"]::after {
     opacity: 1;
-  }
-
-  html[data-forge-theme="light"] &::before {
-    background: rgba(45, 38, 24, 0.2);
-  }
-
-  html[data-forge-theme="light"] &::after {
-    background: linear-gradient(
-      90deg,
-      rgba(45, 38, 24, 0),
-      rgba(45, 38, 24, 0.72) 42%,
-      rgba(45, 38, 24, 0.72) 62%,
-      rgba(45, 38, 24, 0)
-    );
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -843,8 +760,9 @@ const ThreadPinButton = styled.button`
   padding: 0;
   border: 0;
   border-radius: 7px;
-  color: rgba(244, 244, 244, 0.74);
-  background: rgba(58, 58, 58, 0.98);
+  color: var(--thread-rail-fg-soft);
+  background: rgba(11, 14, 20, 0.94);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.34);
   opacity: 0;
   transform: translateY(-50%);
   transition:
@@ -859,36 +777,18 @@ const ThreadPinButton = styled.button`
   }
 
   ${ThreadRow}[data-pinned="true"] & {
-    color: #f2c24e;
-    background: rgba(62, 52, 30, 0.9);
+    color: var(--thread-ember);
+    background: rgba(255, 122, 24, 0.14);
   }
 
   &:hover {
-    color: #ffe39a;
-    background: rgba(84, 68, 34, 0.98);
-  }
-
-  html[data-forge-theme="light"] & {
-    color: var(--thread-rail-muted);
-    background: rgba(255, 255, 255, 0.88);
-    box-shadow:
-      0 1px 2px rgba(0, 0, 0, 0.08),
-      inset 0 1px 0 rgba(255, 255, 255, 0.96);
-  }
-
-  html[data-forge-theme="light"] ${ThreadRow}[data-pinned="true"] & {
-    color: var(--thread-blue);
-    background: rgba(0, 102, 204, 0.08);
-  }
-
-  html[data-forge-theme="light"] &:hover {
-    color: var(--thread-blue);
-    background: rgba(0, 102, 204, 0.1);
+    color: var(--thread-ember);
+    background: rgba(255, 122, 24, 0.2);
   }
 
   &:focus-visible {
     opacity: 1;
-    outline: 2px solid rgba(242, 194, 78, 0.48);
+    outline: 2px solid rgba(255, 154, 61, 0.48);
     outline-offset: 1px;
   }
 
@@ -912,7 +812,7 @@ const TerminalStateDot = styled.span`
   height: 6px;
   flex: 0 0 auto;
   border-radius: 99px;
-  background: #7a8493;
+  background: var(--thread-rail-muted, #687386);
 
   &[data-view-state="${THREAD_VIEW_STATE.LIVE_SESSION}"] {
     background: var(--thread-green);
@@ -920,23 +820,23 @@ const TerminalStateDot = styled.span`
   }
 
   &[data-view-state="${THREAD_VIEW_STATE.LIVE_NO_SESSION}"] {
-    background: #f2c24e;
-    box-shadow: 0 0 11px rgba(242, 194, 78, 0.3);
+    background: #ffb347;
+    box-shadow: 0 0 11px rgba(255, 179, 71, 0.3);
   }
 
   &[data-view-state="${THREAD_VIEW_STATE.LIVE_SESSION}"][data-state="starting"] {
-    background: #dfa55a;
-    box-shadow: 0 0 11px rgba(223, 165, 90, 0.28);
+    background: var(--thread-ember);
+    box-shadow: 0 0 11px rgba(255, 154, 61, 0.28);
   }
 
   &[data-view-state="${THREAD_VIEW_STATE.LIVE_SESSION}"][data-state="error"] {
     background: var(--thread-red);
-    box-shadow: 0 0 11px rgba(239, 107, 107, 0.28);
+    box-shadow: 0 0 11px rgba(255, 107, 107, 0.28);
   }
 
   &[data-view-state="${THREAD_VIEW_STATE.LIVE_SESSION}"][data-state="running"] {
-    background: #f2c24e;
-    box-shadow: 0 0 11px rgba(242, 194, 78, 0.3);
+    background: #ffb347;
+    box-shadow: 0 0 11px rgba(255, 179, 71, 0.3);
   }
 
   &[data-view-state="${THREAD_VIEW_STATE.LIVE_SESSION}"][data-state="completed"] {
@@ -945,8 +845,8 @@ const TerminalStateDot = styled.span`
   }
 
   &[data-view-state="${THREAD_VIEW_STATE.LIVE_SESSION}"][data-state="interrupted"] {
-    background: #dfa55a;
-    box-shadow: 0 0 11px rgba(223, 165, 90, 0.28);
+    background: var(--thread-ember);
+    box-shadow: 0 0 11px rgba(255, 154, 61, 0.28);
   }
 `;
 
@@ -954,7 +854,7 @@ const EmptyThreads = styled.div`
   padding: 4px 10px;
   color: var(--thread-muted-soft);
   font-size: 12px;
-  font-weight: 460;
+  font-weight: 500;
 `;
 
 function threadTimestampMs(value) {
@@ -1520,6 +1420,35 @@ function WorkspaceThreadsOverlay({
     });
     onSelectThread?.(workspaceId, threadId);
   };
+  // Subagent "Open session" chips in the transcript: resolve the referenced
+  // session id to a known thread (transcriptSessionId or a provider binding's
+  // nativeSessionId, across all workspaces) and select it. Sessions that do
+  // not map to a known thread no-op.
+  const openTranscriptSessionRef = (sessionRef = {}) => {
+    const sessionIds = [sessionRef?.agentChatSessionId, sessionRef?.providerSessionId]
+      .map((value) => String(value || "").trim())
+      .filter(Boolean);
+    if (!sessionIds.length) {
+      return;
+    }
+    for (const workspace of workspaces || []) {
+      const entry = workspaceThreads?.[workspace?.id];
+      for (const candidate of Object.values(entry?.threads || {})) {
+        if (!candidate?.id) {
+          continue;
+        }
+        const candidateIds = [
+          candidate?.transcriptSessionId,
+          ...Object.values(candidate?.providerBindings || {})
+            .map((binding) => binding?.nativeSessionId),
+        ].map((value) => String(value || "").trim());
+        if (candidateIds.some((value) => value && sessionIds.includes(value))) {
+          selectThread(workspace.id, candidate.id);
+          return;
+        }
+      }
+    }
+  };
   const togglePinnedThread = (event, workspaceId, threadId) => {
     event.preventDefault();
     event.stopPropagation();
@@ -1661,8 +1590,6 @@ function WorkspaceThreadsOverlay({
                         const isSelected = visibleActiveWorkspaceId === workspace.id
                           && visibleActiveThreadId === thread.id;
                         const {
-                          isLive,
-                          isNonSessionActive,
                           label,
                           state,
                           threadViewState,
@@ -1683,8 +1610,6 @@ function WorkspaceThreadsOverlay({
                           >
                             <TerminalStateDot
                               aria-hidden="true"
-                              data-live={isLive ? "true" : "false"}
-                              data-nosession={isNonSessionActive ? "true" : "false"}
                               data-state={state}
                               data-view-state={threadViewState}
                             />
@@ -1764,8 +1689,6 @@ function WorkspaceThreadsOverlay({
                           && visibleActiveThreadId === thread.id;
                         const {
                           canPin,
-                          isLive,
-                          isNonSessionActive,
                           isWorking,
                           label,
                           pinned,
@@ -1824,8 +1747,6 @@ function WorkspaceThreadsOverlay({
                             <ThreadStatusSlot>
                               <TerminalStateDot
                                 aria-hidden="true"
-                                data-live={isLive ? "true" : "false"}
-                                data-nosession={isNonSessionActive ? "true" : "false"}
                                 data-state={state}
                                 data-view-state={threadViewState}
                               />
@@ -1850,6 +1771,7 @@ function WorkspaceThreadsOverlay({
           newChatActive={newChatActive}
           onCreateChat={createChat}
           onDraftInput={onDraftInput}
+          onOpenTranscriptSession={openTranscriptSessionRef}
           onSelectModel={onSelectModel}
           onSubmitMessage={onSubmitMessage}
           thread={newChatActive ? null : activeThread}

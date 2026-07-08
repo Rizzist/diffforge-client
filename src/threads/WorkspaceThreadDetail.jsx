@@ -87,25 +87,22 @@ const DetailRoot = styled.main`
   min-width: 0;
   min-height: 0;
   grid-template-rows: minmax(0, 1fr) auto;
-
-  &[data-has-header="true"] {
-    grid-template-rows: auto minmax(0, 1fr) auto;
-  }
-  --thread-bg: #141414;
-  --thread-composer-bg: #2d2d2d;
-  --thread-bg-soft: #1b1b1b;
-  --thread-card: rgba(28, 28, 28, 0.92);
-  --thread-card-raised: rgba(34, 34, 34, 0.94);
-  --thread-fg: #f4f7fa;
-  --thread-muted: #a5a7ad;
-  --thread-muted-soft: rgba(165, 167, 173, 0.58);
-  --thread-border: rgba(255, 255, 255, 0.08);
-  --thread-border-strong: rgba(255, 255, 255, 0.16);
-  --thread-accent: rgba(255, 255, 255, 0.07);
-  --thread-secondary: #222222;
-  --thread-ring: rgba(255, 255, 255, 0.22);
-  --thread-ember: #dfa55a;
-  --thread-blue: #c6c6c6;
+  /* Palette mirrors next-diffforge src/styles/tokens.js (dashboard family). */
+  --thread-bg: #070b11;
+  --thread-composer-bg: rgba(255, 255, 255, 0.095);
+  --thread-bg-soft: #0d141f;
+  --thread-card: rgba(13, 20, 31, 0.92);
+  --thread-card-raised: rgba(17, 26, 38, 0.94);
+  --thread-fg: #e8eef8;
+  --thread-muted: #a7b2c2;
+  --thread-muted-soft: #687386;
+  --thread-border: rgba(255, 255, 255, 0.1);
+  --thread-border-strong: rgba(255, 255, 255, 0.18);
+  --thread-accent: rgba(255, 255, 255, 0.055);
+  --thread-secondary: #111a26;
+  --thread-ring: rgba(125, 176, 255, 0.58);
+  --thread-ember: #ff9a3d;
+  --thread-blue: #62a0ff;
   --thread-green: #3ccb7f;
   --thread-detail-font-size: 12px;
   --thread-detail-small-font-size: 11px;
@@ -115,7 +112,7 @@ const DetailRoot = styled.main`
   --thread-composer-shell-gap: 6px;
   --thread-composer-shell-padding: 0 22px 18px;
   --thread-composer-box-min-height: 70px;
-  --thread-composer-box-radius: 20px;
+  --thread-composer-box-radius: 24px;
   --thread-composer-input-min-height: 36px;
   --thread-composer-input-max-height: 96px;
   --thread-composer-input-padding: 9px 15px 0;
@@ -143,7 +140,7 @@ const DetailRoot = styled.main`
     --thread-composer-shell-gap: 5px;
     --thread-composer-shell-padding: 0 20px 10px;
     --thread-composer-box-min-height: 58px;
-    --thread-composer-box-radius: 18px;
+    --thread-composer-box-radius: 20px;
     --thread-composer-input-min-height: 28px;
     --thread-composer-input-max-height: 84px;
     --thread-composer-input-padding: 8px 14px 0;
@@ -160,24 +157,6 @@ const DetailRoot = styled.main`
     --thread-send-icon-size: 15px;
   }
 
-  html[data-forge-theme="light"] & {
-    --thread-bg: #f5f5f7;
-    --thread-composer-bg: #ffffff;
-    --thread-bg-soft: #ffffff;
-    --thread-card: #ffffff;
-    --thread-card-raised: #fafafc;
-    --thread-fg: #1d1d1f;
-    --thread-muted: #7a7a7a;
-    --thread-muted-soft: rgba(122, 122, 122, 0.64);
-    --thread-border: rgba(0, 0, 0, 0.08);
-    --thread-border-strong: rgba(0, 0, 0, 0.14);
-    --thread-accent: rgba(0, 0, 0, 0.045);
-    --thread-secondary: #fafafc;
-    --thread-ring: rgba(0, 113, 227, 0.28);
-    --thread-ember: #0066cc;
-    --thread-blue: #0066cc;
-    --thread-green: #0a7f45;
-  }
   font-family:
     Inter,
     "Segoe UI Variable",
@@ -193,7 +172,7 @@ const DetailRoot = styled.main`
 
   *::selection {
     color: #ffffff;
-    background: rgba(120, 120, 120, 0.46);
+    background: rgba(47, 128, 255, 0.4);
   }
 
   @media (min-width: 1920px) and (min-height: 980px) {
@@ -204,28 +183,78 @@ const DetailRoot = styled.main`
   }
 `;
 
+/* Floating chip cluster over the transcript (web dashboard's
+   TerminalChatHeaderBar pattern) instead of a full-width header band. The
+   root grid ignores it, so the transcript owns the full height and its
+   column padding keeps the first rows clear of the chips. */
 const DetailHeader = styled.header`
-  position: relative;
-  z-index: 3;
+  position: absolute;
+  z-index: 9;
+  top: 10px;
+  right: 14px;
+  left: 14px;
   display: flex;
   min-width: 0;
   align-items: center;
-  gap: 9px;
-  padding: 9px 16px;
-  border-bottom: 1px solid var(--thread-border);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.018), transparent),
-    var(--thread-bg);
+  gap: 8px;
+  pointer-events: none;
 
-  html[data-forge-theme="light"] & {
-    background:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.6), transparent),
-      var(--thread-bg);
+  > * {
+    pointer-events: auto;
   }
 
   [data-density="compact"] & {
-    gap: 7px;
-    padding: 5px 12px;
+    top: 8px;
+    right: 10px;
+    left: 10px;
+    gap: 6px;
+  }
+`;
+
+const headerChipPulse = keyframes`
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(255, 179, 71, 0.22);
+  }
+
+  50% {
+    box-shadow: 0 0 0 5px rgba(255, 179, 71, 0.05);
+  }
+`;
+
+const HeaderStateChip = styled.span`
+  display: inline-flex;
+  flex: 0 0 auto;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 11px;
+  border: 1px solid var(--thread-border-strong);
+  border-radius: 999px;
+  background: rgba(8, 12, 19, 0.78);
+  backdrop-filter: blur(12px);
+
+  &[data-state="ready"] {
+    border-color: rgba(60, 203, 127, 0.32);
+  }
+
+  &[data-state="working"] {
+    border-color: rgba(255, 179, 71, 0.36);
+    animation: ${headerChipPulse} 1.8s ease-in-out infinite;
+  }
+
+  &[data-state="error"] {
+    border-color: rgba(255, 107, 107, 0.4);
+  }
+
+  [data-density="compact"] & {
+    gap: 6px;
+    padding: 3px 9px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    &[data-state="working"] {
+      animation: none;
+    }
   }
 `;
 
@@ -234,7 +263,7 @@ const HeaderStatusDot = styled.span`
   height: 7px;
   flex: 0 0 auto;
   border-radius: 99px;
-  background: #7a8493;
+  background: var(--thread-muted-soft);
 
   &[data-state="ready"] {
     background: var(--thread-green);
@@ -242,24 +271,24 @@ const HeaderStatusDot = styled.span`
   }
 
   &[data-state="working"] {
-    background: #f2c24e;
-    box-shadow: 0 0 10px rgba(242, 194, 78, 0.4);
+    background: #ffb347;
+    box-shadow: 0 0 10px rgba(255, 179, 71, 0.4);
     animation: ${thinkingPulse} 1400ms ease-in-out infinite;
   }
 
   &[data-state="error"] {
-    background: #ef6b6b;
-    box-shadow: 0 0 10px rgba(239, 107, 107, 0.4);
+    background: #ff6b6b;
+    box-shadow: 0 0 10px rgba(255, 107, 107, 0.4);
   }
 `;
 
 const HeaderAgentName = styled.strong`
   flex: 0 0 auto;
   color: var(--thread-fg);
-  font-size: var(--thread-detail-font-size);
-  font-weight: 640;
-  letter-spacing: 0.01em;
-  line-height: 1.2;
+  font-size: var(--thread-detail-small-font-size);
+  font-weight: 750;
+  letter-spacing: 0.02em;
+  line-height: 1.5;
   white-space: nowrap;
 `;
 
@@ -267,55 +296,40 @@ const HeaderStateLabel = styled.span`
   flex: 0 0 auto;
   color: var(--thread-muted-soft);
   font-size: var(--thread-detail-mini-font-size);
-  font-weight: 540;
-  letter-spacing: 0.04em;
-  line-height: 1.2;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  line-height: 1.5;
   text-transform: uppercase;
   white-space: nowrap;
 
+  &[data-state="ready"] {
+    color: #7ddf9a;
+  }
+
   &[data-state="working"] {
-    color: #f2c24e;
+    color: #ffb347;
   }
 
   &[data-state="error"] {
-    color: #ef6b6b;
-  }
-
-  html[data-forge-theme="light"] &[data-state="working"] {
-    color: #9a6700;
-  }
-
-  html[data-forge-theme="light"] &[data-state="error"] {
-    color: #b42318;
+    color: #ff6b6b;
   }
 `;
 
 const HeaderThreadTitle = styled.span`
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
+  padding: 4px 11px;
+  border: 1px solid var(--thread-border);
+  border-radius: 999px;
   color: var(--thread-muted);
+  background: rgba(8, 12, 19, 0.78);
+  backdrop-filter: blur(12px);
   font-size: var(--thread-detail-small-font-size);
-  font-weight: 480;
-  line-height: 1.2;
+  font-weight: 600;
+  line-height: 1.5;
   text-overflow: ellipsis;
   white-space: nowrap;
-
-  [data-density="compact"] & {
-    display: none;
-  }
-
-  @media (max-width: 860px) {
-    display: none;
-  }
-`;
-
-const HeaderDividerDot = styled.span`
-  flex: 0 0 auto;
-  width: 3px;
-  height: 3px;
-  border-radius: 99px;
-  background: var(--thread-muted-soft);
-  opacity: 0.6;
 
   [data-density="compact"] & {
     display: none;
@@ -336,21 +350,21 @@ const HeaderStat = styled.span`
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 2px 8px;
+  padding: 4px 10px;
   border: 1px solid var(--thread-border);
   border-radius: 999px;
   color: var(--thread-muted);
-  background: var(--thread-accent);
+  background: rgba(8, 12, 19, 0.78);
+  backdrop-filter: blur(12px);
   font-size: var(--thread-detail-mini-font-size);
-  font-weight: 560;
-  letter-spacing: 0.01em;
+  font-weight: 700;
+  letter-spacing: 0.02em;
   line-height: 1.5;
   white-space: nowrap;
 
   &[data-tone="diff"] {
-    color: var(--thread-green);
-    border-color: rgba(60, 203, 127, 0.22);
-    background: rgba(60, 203, 127, 0.08);
+    color: #7ddf9a;
+    border-color: rgba(60, 203, 127, 0.32);
   }
 
   [data-density="compact"] &[data-optional="true"] {
@@ -365,15 +379,16 @@ const HeaderChipButton = styled.button`
   max-width: 220px;
   align-items: center;
   gap: 5px;
-  padding: 2px 8px;
+  padding: 4px 10px;
   border: 1px solid var(--thread-border);
   border-radius: 999px;
   color: var(--thread-muted);
-  background: transparent;
+  background: rgba(8, 12, 19, 0.78);
+  backdrop-filter: blur(12px);
   font: inherit;
   font-size: var(--thread-detail-mini-font-size);
-  font-weight: 560;
-  letter-spacing: 0.01em;
+  font-weight: 700;
+  letter-spacing: 0.02em;
   line-height: 1.5;
   cursor: pointer;
   transition:
@@ -396,8 +411,8 @@ const HeaderChipButton = styled.button`
 
   &:hover {
     color: var(--thread-fg);
-    border-color: var(--thread-border-strong);
-    background: var(--thread-accent);
+    border-color: rgba(255, 255, 255, 0.4);
+    background: rgba(17, 26, 38, 0.9);
   }
 
   &:focus-visible {
@@ -406,8 +421,8 @@ const HeaderChipButton = styled.button`
   }
 
   &[data-copied="true"] {
-    color: var(--thread-green);
-    border-color: rgba(60, 203, 127, 0.3);
+    color: #7ddf9a;
+    border-color: rgba(60, 203, 127, 0.32);
   }
 
   [data-density="compact"] & {
@@ -418,14 +433,15 @@ const HeaderChipButton = styled.button`
 const HeaderIconButton = styled.button`
   flex: 0 0 auto;
   display: grid;
-  width: 24px;
-  height: 24px;
+  width: 26px;
+  height: 26px;
   place-items: center;
   padding: 0;
-  border: 1px solid transparent;
-  border-radius: 8px;
+  border: 1px solid var(--thread-border-strong);
+  border-radius: 999px;
   color: var(--thread-muted);
-  background: transparent;
+  background: rgba(8, 12, 19, 0.78);
+  backdrop-filter: blur(12px);
   cursor: pointer;
   transition:
     border-color 130ms ease,
@@ -439,7 +455,7 @@ const HeaderIconButton = styled.button`
 
   &:hover {
     color: var(--thread-fg);
-    background: var(--thread-accent);
+    border-color: rgba(255, 255, 255, 0.4);
   }
 
   &:focus-visible {
@@ -448,8 +464,8 @@ const HeaderIconButton = styled.button`
   }
 
   [data-density="compact"] & {
-    width: 22px;
-    height: 22px;
+    width: 24px;
+    height: 24px;
   }
 `;
 
@@ -472,7 +488,7 @@ const TranscriptScroll = styled.div`
 
   &::-webkit-scrollbar-thumb {
     border-radius: 999px;
-    background: rgba(170, 170, 170, 0.16);
+    background: rgba(110, 142, 190, 0.3);
   }
 `;
 
@@ -540,24 +556,15 @@ const MessageBody = styled.div`
     width: 100%;
     max-width: none;
     border: 0;
-    border-radius: 18px;
+    border-radius: 22px;
     padding: 11px 14px 12px;
-    color: #dedede;
-    background: #202020;
+    color: var(--thread-fg);
+    background: rgba(255, 255, 255, 0.115);
     box-shadow: none;
   }
 
   article[data-message-role="user"] & ${MessageText} {
     color: inherit;
-  }
-
-  html[data-forge-theme="light"] article[data-message-role="user"] & {
-    border: 1px solid rgba(0, 0, 0, 0.08);
-    color: #1d1d1f;
-    background: #ffffff;
-    box-shadow:
-      0 1px 2px rgba(0, 0, 0, 0.045),
-      inset 0 1px 0 rgba(255, 255, 255, 0.96);
   }
 
   article[data-message-role="assistant"] & {
@@ -1530,7 +1537,7 @@ const DiffInline = styled.span`
 const DiffFileName = styled.span`
   min-width: 0;
   overflow: hidden;
-  color: #4eb4ff;
+  color: var(--thread-blue);
   font-weight: 720;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1542,11 +1549,11 @@ const DiffCount = styled.span`
   font-weight: 720;
 
   &[data-tone="add"] {
-    color: #74d28a;
+    color: #86efac;
   }
 
   &[data-tone="delete"] {
-    color: #ff6d61;
+    color: #fca5a5;
   }
 `;
 
@@ -1558,7 +1565,7 @@ const ThreadDiffLiveBanner = styled.div`
   gap: 12px;
   padding: 9px 12px;
   border: 1px solid var(--thread-border-strong);
-  border-radius: 8px;
+  border-radius: 10px;
   color: var(--thread-fg);
   background: var(--thread-card-raised);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
@@ -1590,7 +1597,7 @@ const ThreadDiffCard = styled.section`
   overflow: hidden;
   margin: 12px 0 4px 3px;
   border: 1px solid var(--thread-border-strong);
-  border-radius: 8px;
+  border-radius: 10px;
   color: var(--thread-fg);
   background: var(--thread-card-raised);
 `;
@@ -1718,7 +1725,7 @@ const ThreadDiffFileRow = styled.button`
 const ThreadDiffFilePath = styled.span`
   min-width: 0;
   overflow: hidden;
-  color: #d4d4d4;
+  color: var(--thread-muted);
   font-size: var(--thread-detail-font-size);
   font-weight: 650;
   text-overflow: ellipsis;
@@ -1749,26 +1756,23 @@ const ComposerBox = styled.div`
   grid-template-rows: auto minmax(var(--thread-composer-input-min-height, 42px), auto) auto;
   position: relative;
   overflow: visible;
-  border: 1px solid var(--thread-border);
-  border-radius: var(--thread-composer-box-radius, 22px);
+  border: 1px solid rgba(230, 236, 245, 0.14);
+  border-radius: var(--thread-composer-box-radius, 24px);
   background: var(--thread-composer-bg);
-  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.18);
+  box-shadow:
+    0 14px 34px rgba(0, 0, 0, 0.26),
+    inset 0 1px 0 rgba(255, 255, 255, 0.045);
   transition:
     border-color 160ms ease,
     background 160ms ease,
     box-shadow 160ms ease;
 
   &:focus-within {
-    border-color: var(--thread-border-strong);
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.24);
-  }
-
-  html[data-forge-theme="light"] & {
-    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.07);
-  }
-
-  html[data-forge-theme="light"] &:focus-within {
-    box-shadow: 0 8px 26px rgba(0, 0, 0, 0.1);
+    border-color: rgba(125, 176, 255, 0.46);
+    background: rgba(255, 255, 255, 0.115);
+    box-shadow:
+      0 14px 34px rgba(0, 0, 0, 0.3),
+      inset 0 1px 0 rgba(255, 255, 255, 0.045);
   }
 `;
 
@@ -1780,7 +1784,7 @@ const ComposerInput = styled.textarea`
   padding: var(--thread-composer-input-padding, 13px 16px 5px);
   border: 0;
   outline: none;
-  color: #d6d6d6;
+  color: #f7fafc;
   background: transparent;
   font: inherit;
   font-size: var(--thread-composer-font-size);
@@ -1790,7 +1794,7 @@ const ComposerInput = styled.textarea`
   -webkit-user-select: text;
 
   &::placeholder {
-    color: #808080;
+    color: rgba(166, 178, 194, 0.58);
   }
 
   &:disabled {
@@ -1812,7 +1816,7 @@ const ComposerFooter = styled.div`
 const ComposerHint = styled.span`
   min-width: 0;
   overflow: hidden;
-  color: rgba(170, 170, 170, 0.5);
+  color: var(--thread-muted-soft);
   font-size: var(--thread-composer-font-size);
   font-weight: 640;
   line-height: 1;
@@ -1845,7 +1849,7 @@ const ComposerToolButton = styled.button`
   padding: 0 9px;
   border: 1px solid transparent;
   border-radius: 8px;
-  color: #a8a8a8;
+  color: var(--thread-muted);
   background: rgba(255, 255, 255, 0.04);
   font: inherit;
   font-size: var(--thread-detail-small-font-size, 11px);
@@ -1859,7 +1863,7 @@ const ComposerToolButton = styled.button`
     opacity 120ms ease;
 
   &:hover:not(:disabled) {
-    color: #f2f2f2;
+    color: var(--thread-fg);
     border-color: rgba(255, 255, 255, 0.1);
     background: rgba(255, 255, 255, 0.075);
   }
@@ -1887,8 +1891,8 @@ const ComposerAttachButton = styled(ComposerToolButton)`
 
   &:hover:not(:disabled) {
     border-color: transparent;
-    color: #f2f2f2;
-    background: rgba(255, 255, 255, 0.07);
+    color: var(--thread-fg);
+    background: rgba(255, 255, 255, 0.08);
   }
 
   svg {
@@ -1905,7 +1909,7 @@ const ComposerStatusLine = styled.div`
   gap: var(--thread-composer-status-gap, 8px);
   overflow: hidden;
   padding: var(--thread-composer-status-padding, 2px 0);
-  color: rgba(232, 232, 232, 0.82);
+  color: var(--thread-muted-soft);
   font-size: var(--thread-detail-small-font-size, 11px);
   font-weight: 620;
   line-height: 1.35;
@@ -1918,7 +1922,8 @@ const ComposerStatusLine = styled.div`
   }
 
   span:first-child {
-    color: #f0f0f0;
+    color: var(--thread-muted);
+    font-weight: 700;
   }
 `;
 
@@ -1930,7 +1935,7 @@ const ModelMenuWrap = styled.div`
 
 const ModelButton = styled(ComposerToolButton)`
   max-width: min(260px, 38vw);
-  color: #e6e6e6;
+  color: var(--thread-fg);
   background: rgba(255, 255, 255, 0.045);
 
   &[data-empty="true"] {
@@ -1962,11 +1967,11 @@ const ModelDropdown = styled.div`
   max-height: min(320px, 48vh);
   overflow-x: hidden;
   overflow-y: auto;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 8px;
-  background: rgba(32, 32, 32, 0.98);
+  border: 1px solid var(--thread-border-strong, rgba(255, 255, 255, 0.18));
+  border-radius: 10px;
+  background: #0d141f;
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    inset 0 1px 0 rgba(255, 255, 255, 0.03),
     0 18px 48px rgba(0, 0, 0, 0.48);
 
   &[data-open="true"] {
@@ -1986,9 +1991,12 @@ const ModelOption = styled.button`
   font: inherit;
   user-select: none;
 
-  &:hover,
+  &:hover {
+    background: rgba(255, 255, 255, 0.05);
+  }
+
   &[data-selected="true"] {
-    background: rgba(255, 255, 255, 0.08);
+    background: rgba(47, 128, 255, 0.14);
   }
 
   strong {
@@ -2028,11 +2036,11 @@ const AttachmentChip = styled.span`
   min-height: 44px;
   align-items: center;
   gap: 6px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--thread-border, rgba(255, 255, 255, 0.1));
   border-radius: 10px;
   padding: 5px 6px;
   color: var(--thread-fg);
-  background: rgba(255, 255, 255, 0.045);
+  background: rgba(255, 255, 255, 0.035);
   font-size: var(--thread-detail-small-font-size, 11px);
   line-height: 1;
   user-select: none;
@@ -2095,24 +2103,30 @@ const SendButton = styled.button`
   flex: 0 0 auto;
   place-items: center;
   padding: 0;
-  border: 0;
+  border: 1px solid rgba(125, 176, 255, 0.32);
   border-radius: 999px;
-  color: #1a1a1a;
-  background: #d8d8d8;
-  box-shadow: 0 10px 22px rgba(0, 0, 0, 0.32);
+  color: #cfe2ff;
+  background: rgba(37, 99, 235, 0.24);
   user-select: none;
   transition:
     background 130ms ease,
     border-color 130ms ease,
-    opacity 130ms ease;
+    color 130ms ease,
+    opacity 130ms ease,
+    transform 130ms ease;
 
   &:hover:not(:disabled) {
-    background: #eeeeee;
+    border-color: rgba(255, 255, 255, 0.42);
+    color: #ffffff;
+    background: rgba(59, 130, 246, 0.36);
+    transform: translateY(-1px);
   }
 
   &:disabled {
-    background: #8c8c8c;
-    opacity: 0.46;
+    border-color: rgba(125, 176, 255, 0.16);
+    color: rgba(207, 226, 255, 0.6);
+    background: rgba(37, 99, 235, 0.12);
+    opacity: 0.55;
     cursor: not-allowed;
   }
 
@@ -2124,7 +2138,7 @@ const SendButton = styled.button`
 `;
 
 const ComposerError = styled.div`
-  color: #ef6b6b;
+  color: #ff6b6b;
   font-size: var(--thread-detail-small-font-size, 11px);
   line-height: 1.35;
 `;
@@ -2137,30 +2151,19 @@ const NewChatRoot = styled.main`
   padding: 36px 24px;
   overflow-x: hidden;
   overflow-y: auto;
-  --thread-bg: #1b1b1b;
-  --thread-composer-bg: #2d2d2d;
-  --thread-card: rgba(32, 32, 32, 0.92);
-  --thread-fg: #f4f7fa;
-  --thread-muted: #a5a7ad;
-  --thread-muted-soft: rgba(165, 167, 173, 0.58);
-  --thread-border: rgba(255, 255, 255, 0.08);
-  --thread-accent: rgba(255, 255, 255, 0.07);
-  --thread-ring: rgba(255, 255, 255, 0.22);
+  --thread-bg: #070b11;
+  --thread-composer-bg: rgba(255, 255, 255, 0.095);
+  --thread-card: rgba(13, 20, 31, 0.92);
+  --thread-fg: #e8eef8;
+  --thread-muted: #a7b2c2;
+  --thread-muted-soft: #687386;
+  --thread-border: rgba(255, 255, 255, 0.1);
+  --thread-border-strong: rgba(255, 255, 255, 0.18);
+  --thread-accent: rgba(255, 255, 255, 0.055);
+  --thread-ring: rgba(125, 176, 255, 0.58);
   color: var(--thread-fg);
   background: var(--thread-bg);
   outline: none;
-
-  html[data-forge-theme="light"] & {
-    --thread-bg: #f5f5f7;
-    --thread-composer-bg: #ffffff;
-    --thread-card: #ffffff;
-    --thread-fg: #1d1d1f;
-    --thread-muted: #7a7a7a;
-    --thread-muted-soft: rgba(122, 122, 122, 0.64);
-    --thread-border: rgba(0, 0, 0, 0.08);
-    --thread-accent: rgba(0, 0, 0, 0.045);
-    --thread-ring: rgba(0, 113, 227, 0.28);
-  }
 `;
 
 const NewChatCenter = styled.form`
@@ -2185,14 +2188,19 @@ const NewChatBox = styled.div`
   grid-template-rows: minmax(46px, auto) auto;
   position: relative;
   overflow: visible;
-  border: 1px solid transparent;
-  border-radius: 22px;
+  border: 1px solid rgba(230, 236, 245, 0.14);
+  border-radius: 24px;
   background: var(--thread-composer-bg);
-  box-shadow: none;
+  box-shadow:
+    0 14px 34px rgba(0, 0, 0, 0.26),
+    inset 0 1px 0 rgba(255, 255, 255, 0.045);
+  transition:
+    border-color 160ms ease,
+    background 160ms ease;
 
   &:focus-within {
-    border-color: transparent;
-    box-shadow: none;
+    border-color: rgba(125, 176, 255, 0.46);
+    background: rgba(255, 255, 255, 0.115);
   }
 `;
 
@@ -2204,7 +2212,7 @@ const NewChatInput = styled.textarea`
   padding: 13px 16px 5px;
   border: 0;
   outline: 0;
-  color: #d6d6d6;
+  color: #f7fafc;
   background: transparent;
   font: inherit;
   font-size: 12px;
@@ -2214,7 +2222,7 @@ const NewChatInput = styled.textarea`
   -webkit-user-select: text;
 
   &::placeholder {
-    color: #808080;
+    color: rgba(166, 178, 194, 0.58);
   }
 
   &:disabled {
@@ -2250,15 +2258,15 @@ const NewChatAgentButton = styled(ComposerToolButton)`
   height: 32px;
   min-width: 116px;
   justify-content: flex-start;
-  border-color: rgba(255, 255, 255, 0.08);
+  border-color: var(--thread-border);
   border-radius: 8px;
   padding: 0 8px 0 10px;
-  color: #e6e6e6;
+  color: var(--thread-fg);
   background: rgba(255, 255, 255, 0.045);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
 
   &[aria-expanded="true"] {
-    border-color: rgba(255, 255, 255, 0.16);
+    border-color: var(--thread-border-strong);
     color: #ffffff;
     background: rgba(255, 255, 255, 0.075);
   }
@@ -2315,9 +2323,12 @@ const NewChatAgentOption = styled.button`
   font: inherit;
   user-select: none;
 
-  &:hover:not(:disabled),
+  &:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.05);
+  }
+
   &[data-selected="true"] {
-    background: rgba(255, 255, 255, 0.08);
+    background: rgba(47, 128, 255, 0.14);
   }
 
   &:disabled {
@@ -2333,7 +2344,7 @@ const NewChatAgentOption = styled.button`
   }
 
   strong {
-    color: #f2f2f2;
+    color: var(--thread-fg);
     font-size: 12px;
     font-weight: 650;
     line-height: 1.2;
@@ -5776,6 +5787,7 @@ function WorkspaceThreadDetail({
   newChatActive = false,
   onCreateChat,
   onDraftInput,
+  onOpenTranscriptSession,
   onSelectModel,
   onSubmitMessage,
   thread,
@@ -5799,11 +5811,13 @@ function WorkspaceThreadDetail({
   const [diffRefreshToken, setDiffRefreshToken] = useState(0);
   const [undoingDiffKey, setUndoingDiffKey] = useState("");
   const [workspacePathCopied, setWorkspacePathCopied] = useState(false);
+  const [transcriptAnchorInsetPx, setTranscriptAnchorInsetPx] = useState(0);
   const detailRootRef = useRef(null);
   const composerBoxRef = useRef(null);
   const composerInputRef = useRef(null);
   const fileInputRef = useRef(null);
   const transcriptScrollRef = useRef(null);
+  const detailHeaderRef = useRef(null);
   const copyResetTimeoutRef = useRef(null);
   const detailRenderDiagnosticRef = useRef("");
   const lastComposerFocusTokenRef = useRef(0);
@@ -6218,6 +6232,46 @@ function WorkspaceThreadDetail({
     : "";
   const todoDropOverlayUnsupported = Boolean(todoDropOverlayMessage);
   const detailDensity = density === "compact" ? "compact" : undefined;
+  // The DetailHeader chip cluster floats absolutely over the scroller's top
+  // edge (web dashboard TerminalChatHeaderBar pattern) and its height varies
+  // with chips and density, so measure its overlay clearance (header bottom
+  // minus scroller top plus breathing room) and feed it to the transcript's
+  // anchor-to-top spacer as anchorTopInsetPx.
+  useEffect(() => {
+    if (!detailVisible || newChatActive || !thread) {
+      setTranscriptAnchorInsetPx(0);
+      return undefined;
+    }
+    const measure = () => {
+      const headerBar = detailHeaderRef.current;
+      const scroller = transcriptScrollRef.current;
+      if (!headerBar || !scroller) {
+        setTranscriptAnchorInsetPx(0);
+        return;
+      }
+      const inset = Math.max(
+        0,
+        Math.round(
+          headerBar.getBoundingClientRect().bottom
+            - scroller.getBoundingClientRect().top
+            + 10,
+        ),
+      );
+      setTranscriptAnchorInsetPx((current) => (Math.abs(current - inset) > 1 ? inset : current));
+    };
+    measure();
+    let observer = null;
+    if (typeof ResizeObserver !== "undefined") {
+      observer = new ResizeObserver(measure);
+      if (detailHeaderRef.current) observer.observe(detailHeaderRef.current);
+      if (transcriptScrollRef.current) observer.observe(transcriptScrollRef.current);
+    }
+    window.addEventListener("resize", measure);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", measure);
+    };
+  }, [detailVisible, newChatActive, thread?.id, density]);
   const headerAgentLabel = getWorkspaceThreadAgentLabel(activeAgentId);
   const headerTurnState = String(
     threadGroundTruth?.effectiveLatestTurnState
@@ -7586,11 +7640,12 @@ function WorkspaceThreadDetail({
       ref={detailRootRef}
       tabIndex={-1}
     >
-      <DetailHeader aria-label="Thread session details">
-        <HeaderStatusDot aria-hidden="true" data-state={headerState} />
-        <HeaderAgentName title={headerAgentLabel}>{headerAgentLabel}</HeaderAgentName>
-        <HeaderStateLabel data-state={headerState}>{headerStateLabel}</HeaderStateLabel>
-        <HeaderDividerDot aria-hidden="true" />
+      <DetailHeader aria-label="Thread session details" ref={detailHeaderRef}>
+        <HeaderStateChip data-state={headerState}>
+          <HeaderStatusDot aria-hidden="true" data-state={headerState} />
+          <HeaderAgentName title={headerAgentLabel}>{headerAgentLabel}</HeaderAgentName>
+          <HeaderStateLabel data-state={headerState}>{headerStateLabel}</HeaderStateLabel>
+        </HeaderStateChip>
         <HeaderThreadTitle title={getWorkspaceThreadLabel(thread)}>
           {getWorkspaceThreadLabel(thread)}
         </HeaderThreadTitle>
@@ -7633,14 +7688,17 @@ function WorkspaceThreadDetail({
       </DetailHeader>
       <TranscriptScroll ref={transcriptScrollRef}>
         <AgentTranscript
+          anchorTopInsetPx={transcriptAnchorInsetPx}
           busy={transcriptBusy}
           diffSummaries={transcriptDiffSummaries}
           emptyLabel="No synced chat records yet."
           itemIdPrefix="workspace-thread-message"
           items={transcriptItems}
           messages={messages}
+          onOpenSession={typeof onOpenTranscriptSession === "function" ? onOpenTranscriptSession : null}
           onUserMessageAction={handleTranscriptUserMessageAction}
           scrollRef={transcriptScrollRef}
+          sessionId={thread?.transcriptSessionId || activeProviderBinding?.nativeSessionId || ""}
           windowKey={[
             workspace?.id || thread?.workspaceId || "workspace",
             thread?.id || "thread",

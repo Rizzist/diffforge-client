@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { emit } from "@tauri-apps/api/event";
 import {
   availableMonitors,
   currentMonitor,
@@ -18,6 +19,7 @@ import { History } from "@styled-icons/material-rounded/History";
 import { HourglassEmpty } from "@styled-icons/material-rounded/HourglassEmpty";
 import { KeyboardArrowDown } from "@styled-icons/material-rounded/KeyboardArrowDown";
 import { Movie } from "@styled-icons/material-rounded/Movie";
+import { NotificationsActive } from "@styled-icons/material-rounded/NotificationsActive";
 import { PauseCircle } from "@styled-icons/material-rounded/PauseCircle";
 import { PermMedia } from "@styled-icons/material-rounded/PermMedia";
 import { PlayArrow } from "@styled-icons/material-rounded/PlayArrow";
@@ -32,6 +34,18 @@ import { createPortal } from "react-dom";
 import { onRuntimeProfilerRender } from "../diagnostics/commitProfiler.js";
 import { authStore, DEFAULT_AUTH_MESSAGE, useAuthSnapshot } from "../authStore";
 import { listenShared } from "./sharedTauriEvents.js";
+import {
+  buildPcbProjectInventory,
+  buildVideoProjectInventory,
+  findWorkspaceProjectMatch,
+  normalizeWorkspaceProjectEntry,
+  pcbProjectIdFromPath,
+  validateWorkspaceProjectCommandPayload,
+  validateWorkspaceProjectCommandWorkspace,
+  videoProjectIdFromPath,
+  workspaceProjectInventoriesEqual,
+} from "./workspaceProjectInventory.js";
+import { VIDEO_PROJECT_DELETED_EVENT } from "../video/videoPanelBridge.js";
 import { getRenderabilitySnapshot, subscribeToRenderability } from "./renderability.js";
 import {
   cleanAgentLaunchModelId,
@@ -1522,6 +1536,8 @@ function loopspaceRuntimeNodeKindLabel(node = null, trigger = null) {
   switch (String(node?.nodeKind || node?.kind || "").trim()) {
     case "send_message":
       return "Send message";
+    case "notify_device":
+      return "Notify device";
     case "run_script":
       return "Run script";
     case "document_read":
@@ -5986,6 +6002,7 @@ const LOOPSPACE_GRAPH_NAV_NODE_ACCENTS = {
   document_read: "96, 165, 250",
   document_write: "96, 165, 250",
   manual: "251, 191, 36",
+  notify_device: "251, 146, 60",
   run_script: "251, 191, 36",
   send_message: "125, 176, 255",
   webhook: "45, 212, 191",
@@ -6482,6 +6499,39 @@ function loopspaceDispatchTodosLinesFromText(value = "") {
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean);
+}
+
+const LOOPSPACE_NOTIFY_DEVICE_DELIVERY_OPTIONS = [
+  { value: "auto", label: "Auto (native, then push)" },
+  { value: "native", label: "Native only" },
+  { value: "push", label: "Push only" },
+];
+
+function normalizeLoopspaceNotifyDeviceDraft(value = {}) {
+  const input = value && typeof value === "object" ? value : { body: String(value || "") };
+  const delivery = String(input.delivery || input.delivery_mode || input.deliveryMode || input.channel || "auto")
+    .trim()
+    .toLowerCase();
+  return {
+    body: String(input.body || input.message || input.notification_body || input.notificationBody || "").trim(),
+    delivery: delivery === "native" || delivery === "push" ? delivery : "auto",
+    device_id: String(input.device_id || input.deviceId || input.target_device_id || input.targetDeviceId || "").trim(),
+    device_label: String(input.device_label || input.deviceLabel || input.target_device_label || input.targetDeviceLabel || "").trim(),
+    title: String(input.title || input.notification_title || input.notificationTitle || "").trim(),
+    url: String(input.url || input.link || "").trim(),
+  };
+}
+
+function loopspaceNotifyDeviceDraftFromNode(node) {
+  const props = node?.props || {};
+  return normalizeLoopspaceNotifyDeviceDraft({
+    body: loopspaceGraphPropValue(props, ["body", "message", "notification_body", "notificationBody"]),
+    delivery: loopspaceGraphPropValue(props, ["delivery", "delivery_mode", "deliveryMode", "channel"]),
+    device_id: loopspaceGraphPropValue(props, ["device_id", "deviceId", "target_device_id", "targetDeviceId"]),
+    device_label: loopspaceGraphPropValue(props, ["device_label", "deviceLabel", "target_device_label", "targetDeviceLabel"]),
+    title: loopspaceGraphPropValue(props, ["title", "notification_title", "notificationTitle"]),
+    url: loopspaceGraphPropValue(props, ["url", "link"]),
+  });
 }
 
 function normalizeLoopspaceDispatchTodosDraft(value = {}, agentLaunchDefaults = null) {
@@ -8724,6 +8774,7 @@ function LoopspaceRuntimeView({
   const [sendMessageSettingsTab, setSendMessageSettingsTab] = useState("model");
   const [sendMessageSettingsDrafts, setSendMessageSettingsDrafts] = useState({});
   const [dispatchTodosSettingsDrafts, setDispatchTodosSettingsDrafts] = useState({});
+  const [notifyDeviceSettingsDrafts, setNotifyDeviceSettingsDrafts] = useState({});
   const [dispatchTodosLocalItemsByBatch, setDispatchTodosLocalItemsByBatch] = useState({});
   const [dispatchTodosPendingNodeId, setDispatchTodosPendingNodeId] = useState("");
   const [sendMessageCheckpointDragPositions, setSendMessageCheckpointDragPositions] = useState({});
@@ -9943,6 +9994,59 @@ function LoopspaceRuntimeView({
     });
   }, [busy, loopspaceId, updateDispatchTodosNodeProps]);
 
+  const updateNotifyDeviceNodeProps = useCallback(async (node, patch = {}) => {
+    const nodeId = String(node?.id || "").trim();
+    if (!loopspaceId || !nodeId || busy) return;
+    const nextSource = updateDfBlueprintNodeProps(graphSourceRef.current || graphSource, nodeId, patch);
+    await commitLoopspaceGraphSource(nextSource, "Unable to update notify device node.");
+  }, [busy, commitLoopspaceGraphSource, graphSource, loopspaceId]);
+
+  const updateNotifyDeviceSettingsDraft = useCallback((nodeId, patch = {}) => {
+    const key = String(nodeId || "").trim();
+    if (!key) return;
+    setNotifyDeviceSettingsDrafts((current) => ({
+      ...current,
+      [key]: {
+        ...(current[key] && typeof current[key] === "object" ? current[key] : {}),
+        ...(patch && typeof patch === "object" ? patch : {}),
+      },
+    }));
+  }, []);
+
+  const cancelNotifyDeviceSettings = useCallback((nodeId) => {
+    const key = String(nodeId || "").trim();
+    if (!key) return;
+    setSettingsNodeId((current) => (current === key ? "" : current));
+    setNotifyDeviceSettingsDrafts((current) => {
+      if (!Object.prototype.hasOwnProperty.call(current, key)) return current;
+      const next = { ...current };
+      delete next[key];
+      return next;
+    });
+  }, []);
+
+  const saveNotifyDeviceSettings = useCallback(async (node, draft) => {
+    const nodeId = String(node?.id || "").trim();
+    if (!nodeId || busy) return;
+    const normalized = normalizeLoopspaceNotifyDeviceDraft(draft);
+    await updateNotifyDeviceNodeProps(node, {
+      props: {
+        body: normalized.body,
+        delivery: normalized.delivery,
+        device_id: normalized.device_id,
+        device_label: normalized.device_label,
+        title: normalized.title,
+        url: normalized.url,
+      },
+    });
+    setSettingsNodeId("");
+    setNotifyDeviceSettingsDrafts((current) => {
+      const next = { ...current };
+      delete next[nodeId];
+      return next;
+    });
+  }, [busy, updateNotifyDeviceNodeProps]);
+
   const dispatchLoopspaceTodosNode = useCallback(async (node, draft) => {
     const nodeId = String(node?.id || "").trim();
     if (!loopspaceId || !nodeId || busy || dispatchTodosPendingNodeId) return;
@@ -10071,6 +10175,17 @@ function LoopspaceRuntimeView({
         loopspaceRef.current,
       );
       setDispatchTodosSettingsDrafts((current) => (
+        Object.prototype.hasOwnProperty.call(current, nodeId)
+          ? current
+          : {
+              ...current,
+              [nodeId]: draft,
+            }
+      ));
+    }
+    if (node.nodeKind === "notify_device") {
+      const draft = loopspaceNotifyDeviceDraftFromNode(node);
+      setNotifyDeviceSettingsDrafts((current) => (
         Object.prototype.hasOwnProperty.call(current, nodeId)
           ? current
           : {
@@ -11526,6 +11641,7 @@ function LoopspaceRuntimeView({
           "dispatch_todos",
           "document_read",
           "document_write",
+          "notify_device",
           "send_message",
         ].includes(node.nodeKind),
         detailRows: [
@@ -11641,6 +11757,8 @@ function LoopspaceRuntimeView({
           ? "Send message"
           : node.nodeKind === "dispatch_todos"
             ? "Dispatch todos"
+          : node.nodeKind === "notify_device"
+            ? "Notify device"
           : node.nodeKind === "run_script"
             ? "Run script"
             : node.nodeKind === "document_read"
@@ -11673,6 +11791,7 @@ function LoopspaceRuntimeView({
           "dispatch_todos",
           "document_read",
           "document_write",
+          "notify_device",
           "send_message",
         ].includes(node.nodeKind),
         id: node.id || `node-${index}`,
@@ -12428,6 +12547,115 @@ function LoopspaceRuntimeView({
         </LoopspaceRuntimePanelSettingsInspector>
       );
     }
+    if (node.nodeKind === "notify_device") {
+      const notifyNodeDraft = loopspaceNotifyDeviceDraftFromNode(node);
+      const notifyDraft = Object.prototype.hasOwnProperty.call(notifyDeviceSettingsDrafts, node.id)
+        ? normalizeLoopspaceNotifyDeviceDraft(notifyDeviceSettingsDrafts[node.id])
+        : notifyNodeDraft;
+      return (
+        <LoopspaceRuntimePanelSettingsInspector data-kind="notify_device">
+          {renderSettingsHeader("Notify device")}
+          <LoopspaceGraphMessageSettingsPanel
+            data-layout="tabs"
+            onPointerDown={(event) => event.stopPropagation()}
+            onWheel={(event) => event.stopPropagation()}
+          >
+            <LoopspaceGraphMessageSettingsTabPanel role="tabpanel">
+              <LoopspaceGraphMessageSettingsSection data-column="model">
+                <LoopspaceGraphMessageSettingsGrid>
+                  <LoopspaceGraphMessageSettingsField>
+                    <span>Device</span>
+                    <AppSelect
+                      isDisabled={busy}
+                      onChange={(value) => {
+                        const deviceId = String(value || "").trim();
+                        const device = loopspaceGraphDeviceOptions.find((option) => (
+                          option.id === deviceId || loopspaceGraphDeviceOptionMatches(option, deviceId)
+                        ));
+                        updateNotifyDeviceSettingsDraft(node.id, {
+                          device_id: device?.id || "",
+                          device_label: device?.label || "",
+                        });
+                      }}
+                      options={[
+                        { value: "", label: "All devices" },
+                        ...loopspaceGraphDeviceOptions.map((device) => ({ value: device.id, label: device.label })),
+                      ]}
+                      value={notifyDraft.device_id}
+                    />
+                  </LoopspaceGraphMessageSettingsField>
+                  <LoopspaceGraphMessageSettingsField>
+                    <span>Delivery</span>
+                    <AppSelect
+                      isDisabled={busy}
+                      onChange={(value) => updateNotifyDeviceSettingsDraft(node.id, {
+                        delivery: value,
+                      })}
+                      options={LOOPSPACE_NOTIFY_DEVICE_DELIVERY_OPTIONS}
+                      value={notifyDraft.delivery}
+                    />
+                  </LoopspaceGraphMessageSettingsField>
+                  <LoopspaceGraphMessageSettingsField>
+                    <span>Title</span>
+                    <LoopspaceGraphDocumentSearch
+                      aria-label="Notification title"
+                      disabled={busy}
+                      onChange={(event) => updateNotifyDeviceSettingsDraft(node.id, {
+                        title: event.target.value,
+                      })}
+                      placeholder={'Loop "{{loop_name}}": {{branch}}'}
+                      value={notifyDraft.title}
+                    />
+                  </LoopspaceGraphMessageSettingsField>
+                  <LoopspaceGraphMessageSettingsField>
+                    <span>Open URL</span>
+                    <LoopspaceGraphDocumentSearch
+                      aria-label="Notification click-through URL"
+                      disabled={busy}
+                      onChange={(event) => updateNotifyDeviceSettingsDraft(node.id, {
+                        url: event.target.value,
+                      })}
+                      placeholder="Optional dashboard link"
+                      value={notifyDraft.url}
+                    />
+                  </LoopspaceGraphMessageSettingsField>
+                </LoopspaceGraphMessageSettingsGrid>
+              </LoopspaceGraphMessageSettingsSection>
+              <LoopspaceGraphMessageSettingsSection data-column="prompt" data-grow="true">
+                <LoopspaceGraphMessagePrompt
+                  aria-label={`Notification body for ${node.label}`}
+                  disabled={busy}
+                  onChange={(event) => updateNotifyDeviceSettingsDraft(node.id, {
+                    body: event.target.value,
+                  })}
+                  placeholder={'Defaults to "{{from_node}}" → {{branch}}. Vars: {{loop_name}}, {{node_title}}, {{from_node}}, {{branch}}, {{device_name}}, {{run_id}}, {{date}}'}
+                  value={notifyDraft.body}
+                />
+              </LoopspaceGraphMessageSettingsSection>
+            </LoopspaceGraphMessageSettingsTabPanel>
+            <LoopspaceGraphMessageSettingsActions>
+              <LoopspaceGraphMessageSaveButton
+                disabled={busy}
+                onClick={() => {
+                  void saveNotifyDeviceSettings(node, notifyDraft);
+                }}
+                type="button"
+              >
+                Save
+              </LoopspaceGraphMessageSaveButton>
+              <LoopspaceGraphMessageSaveButton
+                data-variant="secondary"
+                disabled={busy}
+                onClick={() => cancelNotifyDeviceSettings(node.id)}
+                type="button"
+              >
+                Cancel
+              </LoopspaceGraphMessageSaveButton>
+            </LoopspaceGraphMessageSettingsActions>
+          </LoopspaceGraphMessageSettingsPanel>
+        </LoopspaceRuntimePanelSettingsInspector>
+      );
+    }
     if (node.nodeKind !== "send_message") {
       return (
         <LoopspaceRuntimePanelSettingsInspector data-kind={row?.kind || node.nodeKind || "loop"}>
@@ -12784,6 +13012,8 @@ function LoopspaceRuntimeView({
                         ? AdsClick
                         : node.nodeKind === "dispatch_todos"
                           ? Send
+                          : node.nodeKind === "notify_device"
+                            ? NotificationsActive
                           : node.nodeKind === "asset_read" || node.nodeKind === "asset_write"
                             ? PermMedia
                             : AccountTree;
@@ -12885,6 +13115,43 @@ function LoopspaceRuntimeView({
                   : "";
                 const isSendMessageRegion = node.nodeKind === "send_message";
                 const isDispatchTodosNode = node.nodeKind === "dispatch_todos";
+                const isNotifyDeviceNode = node.nodeKind === "notify_device";
+                const notifyDeviceDraft = isNotifyDeviceNode
+                  ? loopspaceNotifyDeviceDraftFromNode(node)
+                  : null;
+                const notifyDeviceTarget = isNotifyDeviceNode && notifyDeviceDraft.device_id
+                  ? loopspaceGraphDeviceLookup.get(notifyDeviceDraft.device_id.toLowerCase())
+                  : null;
+                const notifyDeviceTargetLabel = isNotifyDeviceNode
+                  ? notifyDeviceDraft.device_id
+                    ? String(
+                      notifyDeviceDraft.device_label
+                        || notifyDeviceTarget?.displayName
+                        || notifyDeviceTarget?.display_name
+                        || notifyDeviceTarget?.device_label
+                        || notifyDeviceTarget?.deviceLabel
+                        || notifyDeviceTarget?.device_name
+                        || notifyDeviceTarget?.deviceName
+                        || notifyDeviceTarget?.name
+                        || notifyDeviceDraft.device_id,
+                    ).trim()
+                    : "All devices"
+                  : "";
+                const notifyDeviceTargetStatus = notifyDeviceTarget
+                  ? loopspaceGraphDeviceStatus(notifyDeviceTarget)
+                  : notifyDeviceDraft?.device_id
+                    ? "offline"
+                    : "";
+                const notifyDeviceDeliveryLabel = isNotifyDeviceNode
+                  ? notifyDeviceDraft.delivery === "native"
+                    ? "Native only"
+                    : notifyDeviceDraft.delivery === "push"
+                      ? "Push only"
+                      : "Native + push"
+                  : "";
+                const notifyDeviceBodyPreview = isNotifyDeviceNode
+                  ? String(notifyDeviceDraft.title || notifyDeviceDraft.body || "").trim()
+                  : "";
                 const dispatchTodosDraft = isDispatchTodosNode
                   ? loopspaceDispatchTodosDraftFromNode(node, agentLaunchDefaults, loopspace)
                   : null;
@@ -12924,7 +13191,7 @@ function LoopspaceRuntimeView({
                   && loopspaceRuntimeStateCanResume(sendMessageRuntimeState);
 	                const nodeVisualDefaults = contractLoopspaceGraphVisualDefaultsForNode(node);
 	                const isSizedGraphNode = Boolean(nodeVisualDefaults.sized);
-	                const hasGraphNodeSettings = isSendMessageRegion || isResourceContextNode || isDispatchTodosNode;
+	                const hasGraphNodeSettings = isSendMessageRegion || isResourceContextNode || isDispatchTodosNode || isNotifyDeviceNode;
 	                const nodeSettingsSelected = hasGraphNodeSettings && settingsNodeId === node.id && runtimePanelTab === "settings";
 	                const sendMessageSettingsOpen = false;
                 const sendMessageCheckpoints = isSendMessageRegion
@@ -13028,6 +13295,8 @@ function LoopspaceRuntimeView({
                     ? graphDeviceLabel
                     : isDispatchTodosNode
                       ? "Dispatch todos"
+                    : isNotifyDeviceNode
+                      ? "Notify device"
                     : isDocumentContextNode
                       ? (isDocumentReadNode ? "Document read" : "Document write")
                       : isAssetContextNode
@@ -13049,6 +13318,11 @@ function LoopspaceRuntimeView({
                             dispatchTodosTodoCount ? `${dispatchTodosTodoCount} todo${dispatchTodosTodoCount === 1 ? "" : "s"}` : "Queued todos",
                             dispatchTodosTargetLabel,
                           ].filter(Boolean).join(" - ")
+                        : isNotifyDeviceNode
+                          ? [
+                              notifyDeviceDeliveryLabel,
+                              notifyDeviceTargetLabel,
+                            ].filter(Boolean).join(" - ")
                         : isDocumentReadNode
                           ? "Readable docs"
                         : isDocumentWriteNode
@@ -13266,6 +13540,29 @@ function LoopspaceRuntimeView({
                           />
                           <span>{runScriptDeviceLabel}</span>
                         </LoopspaceGraphNodeDeviceBadge>
+                      ) : null}
+                      {isNotifyDeviceNode ? (
+                        <>
+                          <LoopspaceGraphNodeDeviceBadge
+                            title={[
+                              notifyDeviceTargetLabel,
+                              notifyDeviceDeliveryLabel,
+                              notifyDeviceTargetStatus,
+                            ].filter(Boolean).join(" - ")}
+                          >
+                            <Devices aria-hidden="true" />
+                            {notifyDeviceDraft.device_id ? (
+                              <LoopspaceGraphNodeDeviceDot
+                                aria-hidden="true"
+                                data-status={notifyDeviceTargetStatus || "offline"}
+                              />
+                            ) : null}
+                            <span>{notifyDeviceTargetLabel}</span>
+                          </LoopspaceGraphNodeDeviceBadge>
+                          <LoopspaceDispatchTodoEmpty>
+                            {notifyDeviceBodyPreview || 'Dynamic: "{{from_node}}" → {{branch}}'}
+                          </LoopspaceDispatchTodoEmpty>
+                        </>
                       ) : null}
 		                      {isDocumentContextNode ? (
 		                        <LoopspaceDocumentContextPicker
@@ -13711,7 +14008,7 @@ function LoopspaceRuntimeView({
                           data-tone={port.tone}
                           key={port.id}
                         >
-                          {node.nodeKind === "run_script" || node.nodeKind === "send_message" || node.nodeKind === "dispatch_todos" ? <span>{port.label}</span> : null}
+                          {node.nodeKind === "run_script" || node.nodeKind === "send_message" || node.nodeKind === "dispatch_todos" || node.nodeKind === "notify_device" ? <span>{port.label}</span> : null}
                           <LoopspaceGraphNodePort
                             aria-label={`Connect ${port.label} from ${trigger?.name || node.label}`}
                             data-active={pendingConnection?.fromId === node.id && pendingConnection?.fromPort === port.id ? "true" : undefined}
@@ -13763,6 +14060,8 @@ function LoopspaceRuntimeView({
                     ? AdsClick
                     : node.nodeKind === "dispatch_todos"
                       ? Send
+                      : node.nodeKind === "notify_device"
+                        ? NotificationsActive
                       : node.nodeKind === "document_read" || node.nodeKind === "document_write"
                         ? AccountTree
                       : node.nodeKind === "asset_read" || node.nodeKind === "asset_write"
@@ -13792,7 +14091,7 @@ function LoopspaceRuntimeView({
                     </LoopspaceGraphNodeIcon>
                     <LoopspaceGraphNodeText>
                       <strong>{node.label || "Drop node"}</strong>
-                      <span>{node.nodeKind === "device" ? "Device" : node.nodeKind === "run_script" ? "Run script" : node.nodeKind === "send_message" ? "Send message region" : node.nodeKind === "dispatch_todos" ? "Dispatch todos" : node.nodeKind === "document_read" || node.nodeKind === "document_write" ? "Document context" : node.nodeKind === "asset_read" || node.nodeKind === "asset_write" ? "Asset context" : "Pending drop"}</span>
+                      <span>{node.nodeKind === "device" ? "Device" : node.nodeKind === "run_script" ? "Run script" : node.nodeKind === "send_message" ? "Send message region" : node.nodeKind === "dispatch_todos" ? "Dispatch todos" : node.nodeKind === "notify_device" ? "Notify device" : node.nodeKind === "document_read" || node.nodeKind === "document_write" ? "Document context" : node.nodeKind === "asset_read" || node.nodeKind === "asset_write" ? "Asset context" : "Pending drop"}</span>
                     </LoopspaceGraphNodeText>
                   </LoopspaceGraphNode>
                 );
@@ -14104,6 +14403,8 @@ function LoopspaceRuntimeView({
                           ? AdsClick
                           : template.id === "dispatch_todos"
                             ? Send
+                          : template.id === "notify_device"
+                            ? NotificationsActive
                           : template.id === "document_read" || template.id === "document_write"
                             ? AccountTree
                           : template.id === "asset_read" || template.id === "asset_write"
@@ -14151,6 +14452,8 @@ function LoopspaceRuntimeView({
 		                          ? AdsClick
                               : row.kind === "dispatch_todos"
                                 ? Send
+                              : row.kind === "notify_device"
+                                ? NotificationsActive
                           : row.kind === "run_script"
                             ? Terminal
                             : row.kind === "asset_read" || row.kind === "asset_write"
@@ -36330,6 +36633,176 @@ export default function App() {
   useEffect(() => {
     terminalStatusEventEmitterRef.current = emitTerminalStatusEvent;
   }, [emitTerminalStatusEvent]);
+  // Level 1 remote PCB/Video project management: per-workspace project
+  // inventories (hardware/ boards + media/projects timelines) that ride the
+  // workspace catalog snapshot as `pcb_projects` / `video_projects`.
+  const [workspaceProjectInventories, setWorkspaceProjectInventories] = useState({});
+  const workspaceProjectInventoriesRef = useRef({});
+  useEffect(() => {
+    workspaceProjectInventoriesRef.current = workspaceProjectInventories;
+  }, [workspaceProjectInventories]);
+  const workspaceProjectInventoryScanInFlightRef = useRef(false);
+  const workspaceProjectInventoryScanQueuedRef = useRef(null);
+  const refreshWorkspaceProjectInventoriesRef = useRef(() => {});
+  const refreshWorkspaceProjectInventories = useCallback(async (reason = "refresh", options = {}) => {
+    const onlyWorkspaceId = String(options.workspaceId || "").trim();
+    const forceVideo = Boolean(options.forceVideo);
+    // forceVideo targets stay per-workspace: video_projects_list scaffolds
+    // media/ in the scanned root, so a queued merge must never widen a
+    // workspace-scoped force into a global one.
+    const forceVideoIds = new Set(
+      (Array.isArray(options.forceVideoIds) ? options.forceVideoIds : [])
+        .map((value) => String(value || "").trim())
+        .filter(Boolean),
+    );
+    if (forceVideo && onlyWorkspaceId) {
+      forceVideoIds.add(onlyWorkspaceId);
+    }
+    if (workspaceProjectInventoryScanInFlightRef.current) {
+      const queued = workspaceProjectInventoryScanQueuedRef.current;
+      const queuedForceVideoIds = new Set(
+        Array.isArray(queued?.options?.forceVideoIds) ? queued.options.forceVideoIds : [],
+      );
+      for (const id of forceVideoIds) {
+        queuedForceVideoIds.add(id);
+      }
+      workspaceProjectInventoryScanQueuedRef.current = {
+        options: {
+          forceVideo: (forceVideo && !onlyWorkspaceId) || Boolean(queued?.options?.forceVideo),
+          forceVideoIds: [...queuedForceVideoIds],
+          workspaceId: queued && queued.options.workspaceId !== onlyWorkspaceId ? "" : onlyWorkspaceId,
+        },
+        reason,
+      };
+      return;
+    }
+    workspaceProjectInventoryScanInFlightRef.current = true;
+    try {
+      const catalog = Array.isArray(workspacesRef.current) ? workspacesRef.current : [];
+      const settings = workspaceSettingsRef.current;
+      const nextEntries = {};
+      for (const workspace of catalog.slice(0, 64)) {
+        const workspaceId = String(workspace?.id || "").trim();
+        if (!workspaceId) {
+          continue;
+        }
+        const previous = workspaceProjectInventoriesRef.current[workspaceId] || null;
+        if (onlyWorkspaceId && workspaceId !== onlyWorkspaceId) {
+          if (previous) {
+            nextEntries[workspaceId] = previous;
+          }
+          continue;
+        }
+        const rootDirectory = cleanWorkspaceRootDirectory(
+          getWorkspaceRootDirectory(settings, workspaceId)
+            || workspace?.rootDirectory
+            || "",
+        );
+        if (!rootDirectory) {
+          continue;
+        }
+        // Same local flow the PCB panel uses to list boards: hardware/ scan
+        // filtered by .agents/pcb-workspaces.json ownership (orphan reclaim
+        // included).
+        let pcbProjects = Array.isArray(previous?.pcb_projects) ? previous.pcb_projects : [];
+        try {
+          const listing = await invoke("pcb_documents_list", {
+            repoPath: rootDirectory,
+            workspaceId,
+          });
+          pcbProjects = buildPcbProjectInventory(listing?.boards);
+        } catch {
+          // Keep the last known list; the next scan retries.
+        }
+        // video_projects_list creates the media/ scaffold on first touch, so
+        // only scan roots the video pane itself would touch: a configured
+        // video pane, previously seen projects, or an explicit remote video
+        // project command (forceVideo).
+        let videoProjects = Array.isArray(previous?.video_projects) ? previous.video_projects : [];
+        const shouldScanVideoProjects = (forceVideo && !onlyWorkspaceId)
+          || forceVideoIds.has(workspaceId)
+          || getWorkspaceVideoPaneIndexes(settings, workspaceId).length > 0
+          || videoProjects.length > 0;
+        if (shouldScanVideoProjects) {
+          try {
+            const listing = await invoke("video_projects_list", { repoPath: rootDirectory });
+            videoProjects = buildVideoProjectInventory(listing?.projects);
+          } catch {
+            // Keep the last known list; the next scan retries.
+          }
+        }
+        nextEntries[workspaceId] = {
+          pcb_projects: pcbProjects,
+          video_projects: videoProjects,
+        };
+      }
+      setWorkspaceProjectInventories((current) => (
+        workspaceProjectInventoriesEqual(current, nextEntries) ? current : nextEntries
+      ));
+    } finally {
+      workspaceProjectInventoryScanInFlightRef.current = false;
+      const queued = workspaceProjectInventoryScanQueuedRef.current;
+      if (queued) {
+        workspaceProjectInventoryScanQueuedRef.current = null;
+        void refreshWorkspaceProjectInventoriesRef.current(queued.reason, queued.options);
+      }
+    }
+  }, []);
+  useEffect(() => {
+    refreshWorkspaceProjectInventoriesRef.current = refreshWorkspaceProjectInventories;
+  }, [refreshWorkspaceProjectInventories]);
+  const workspaceProjectInventoryScanKey = useMemo(() => JSON.stringify(
+    visibleWorkspaceCatalog(workspaces).map((workspace) => {
+      const workspaceId = String(workspace?.id || "").trim();
+      return [
+        workspaceId,
+        cleanWorkspaceRootDirectory(
+          getWorkspaceRootDirectory(workspaceSettings, workspaceId)
+            || workspace?.rootDirectory
+            || "",
+        ),
+        getWorkspacePcbPaneIndexes(workspaceSettings, workspaceId).length > 0,
+        getWorkspaceVideoPaneIndexes(workspaceSettings, workspaceId).length > 0,
+      ];
+    }),
+  ), [workspaces, workspaceSettings]);
+  useEffect(() => {
+    if (authState !== "authenticated" || !workspaceListHydrated) {
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      void refreshWorkspaceProjectInventoriesRef.current("workspace_catalog_changed");
+    }, 400);
+    return () => window.clearTimeout(timer);
+  }, [authState, workspaceListHydrated, workspaceProjectInventoryScanKey]);
+  useEffect(() => {
+    if (authState !== "authenticated") {
+      return undefined;
+    }
+    let rescanTimer = 0;
+    const scheduleProjectInventoryRescan = (reason) => {
+      if (rescanTimer) {
+        window.clearTimeout(rescanTimer);
+      }
+      rescanTimer = window.setTimeout(() => {
+        rescanTimer = 0;
+        void refreshWorkspaceProjectInventoriesRef.current(reason);
+      }, 400);
+    };
+    const unlistenPcbStore = listenShared("pcb-store-changed", () => (
+      scheduleProjectInventoryRescan("pcb_store_changed")
+    ));
+    const unlistenVideoStore = listenShared("video-store-changed", () => (
+      scheduleProjectInventoryRescan("video_store_changed")
+    ));
+    return () => {
+      if (rescanTimer) {
+        window.clearTimeout(rescanTimer);
+      }
+      unlistenPcbStore();
+      unlistenVideoStore();
+    };
+  }, [authState]);
   const workspaceCatalogSyncTargets = useMemo(() => {
     if (shouldShowWorkspaceSetup) {
       return [];
@@ -36489,6 +36962,7 @@ export default function App() {
       const workspaceMcpServers = safeCloudMcpArray(workspaceMcpRegistry?.servers)
         .map(sanitizeWorkspaceMcpServerForCloud)
         .filter(Boolean);
+      const workspaceProjectInventory = workspaceProjectInventories[workspaceId] || null;
       targets.push({
         dashboardWorkspace: true,
         displaySurface: "dashboard_workspace",
@@ -36507,6 +36981,12 @@ export default function App() {
         panel_list_empty_authoritative: panelListEmptyAuthoritative,
         panelListAuthoritative,
         panel_list_authoritative: panelListAuthoritative,
+        pcb_projects: Array.isArray(workspaceProjectInventory?.pcb_projects)
+          ? workspaceProjectInventory.pcb_projects
+          : [],
+        video_projects: Array.isArray(workspaceProjectInventory?.video_projects)
+          ? workspaceProjectInventory.video_projects
+          : [],
         terminalClearReason: terminalListEmptyAuthoritative ? "all_terminals_closed" : "",
         terminalCount: terminals.length,
         terminals,
@@ -36542,6 +37022,7 @@ export default function App() {
     selectedWorkspace,
     selectedWorkspaceRootDirectory,
     shouldShowWorkspaceSetup,
+    workspaceProjectInventories,
     workspaceTerminalsWorkspaces,
     workspaceSettings,
     workspaceMcpRegistries,
@@ -41670,6 +42151,327 @@ export default function App() {
         });
         return;
       }
+      // Level 1 remote PCB/Video project management: create/delete reuse the
+      // same tauri flows the panels call (pcb_document_create/delete,
+      // video_project_create/delete); open selects the project in the
+      // workspace's PCB/Video pane through the live terminals bridge, opening
+      // a pane via the existing panel machinery when caps allow.
+      if ([
+        "pcb_project_create",
+        "pcb_project_delete",
+        "pcb_project_open",
+        "video_project_create",
+        "video_project_delete",
+        "video_project_open",
+      ].includes(normalizedKind)) {
+        const projectWorkspaceCheck = validateWorkspaceProjectCommandWorkspace(
+          event,
+          (candidateWorkspaceId) => findWorkspaceById(workspaces, candidateWorkspaceId),
+        );
+        if (!projectWorkspaceCheck.ok) {
+          await recordRemoteCommandStatus(event, "failed", "Workspace was not found for this project command.", {
+            applied: false,
+            commandId,
+            commandKind,
+            reason: "workspace_not_found",
+            workspaceId: projectWorkspaceCheck.workspaceId,
+          });
+          return;
+        }
+        const workspaceId = projectWorkspaceCheck.workspaceId;
+        const targetWorkspace = projectWorkspaceCheck.workspace;
+        const projectSurface = normalizedKind.startsWith("pcb_") ? "pcb" : "video";
+        const projectAction = normalizedKind.endsWith("_create")
+          ? "create"
+          : normalizedKind.endsWith("_delete")
+            ? "delete"
+            : "open";
+        const projectLabel = projectSurface === "pcb" ? "PCB project" : "video project";
+        const projectAckKey = projectSurface === "pcb" ? "pcb_project" : "video_project";
+        const rejectProjectCommand = (status, reason, message, details = {}) => (
+          recordRemoteCommandStatus(event, status, message, {
+            applied: false,
+            commandId,
+            commandKind,
+            reason,
+            workspaceId,
+            ...details,
+          })
+        );
+        const repoPath = cleanWorkspaceRootDirectory(
+          getWorkspaceRootDirectory(workspaceSettingsRef.current, workspaceId)
+            || targetWorkspace?.rootDirectory
+            || targetWorkspace?.repoPath
+            || "",
+        );
+        if (!repoPath) {
+          await rejectProjectCommand(
+            "failed",
+            "workspace_root_unavailable",
+            `The workspace root folder is not available for this ${projectLabel} command.`,
+          );
+          return;
+        }
+        const requestedProjectName = remoteCommandStringField(event, [
+          "name",
+          "project_name",
+          "projectName",
+          "board_name",
+          "boardName",
+        ]);
+        const requestedProjectId = remoteCommandStringField(event, [
+          "project_id",
+          "projectId",
+          "board_id",
+          "boardId",
+          "target_project_id",
+          "targetProjectId",
+        ]);
+        const requestedProjectPath = remoteCommandStringField(event, [
+          "path",
+          "project_path",
+          "projectPath",
+          "board_path",
+          "boardPath",
+          "file_path",
+          "filePath",
+        ]);
+        const payloadCheck = validateWorkspaceProjectCommandPayload({
+          action: projectAction,
+          name: requestedProjectName,
+          path: requestedProjectPath,
+          projectId: requestedProjectId,
+        });
+        if (!payloadCheck.ok) {
+          await rejectProjectCommand("failed", payloadCheck.reason, payloadCheck.message);
+          return;
+        }
+        const refreshProjectInventory = () => {
+          void refreshWorkspaceProjectInventoriesRef.current(`remote_${normalizedKind}`, {
+            forceVideo: projectSurface === "video",
+            workspaceId,
+          });
+        };
+        const listWorkspaceProjects = async () => {
+          if (projectSurface === "pcb") {
+            const listing = await invoke("pcb_documents_list", { repoPath, workspaceId });
+            return buildPcbProjectInventory(listing?.boards);
+          }
+          const listing = await invoke("video_projects_list", { repoPath });
+          return buildVideoProjectInventory(listing?.projects);
+        };
+        const projectFailureReason = (message) => {
+          if (projectSurface === "pcb" && /different workspace/i.test(message)) {
+            return "board_owned_by_other_workspace";
+          }
+          if (projectSurface === "pcb" && /not assigned to this workspace/i.test(message)) {
+            return "board_not_owned_by_workspace";
+          }
+          return `${projectAction}_failed`;
+        };
+        try {
+          if (projectAction === "create") {
+            let project = null;
+            if (projectSurface === "pcb") {
+              const created = await invoke("pcb_document_create", {
+                name: requestedProjectName,
+                repoPath,
+                workspaceId,
+              });
+              project = normalizeWorkspaceProjectEntry({
+                id: pcbProjectIdFromPath(created?.path),
+                name: created?.name,
+                path: created?.path,
+              });
+            } else {
+              const created = await invoke("video_project_create", {
+                name: requestedProjectName,
+                repoPath,
+              });
+              project = normalizeWorkspaceProjectEntry({
+                id: videoProjectIdFromPath(created?.path),
+                name: created?.project?.name,
+                path: created?.path,
+                updated_at_ms: created?.project?.updatedAtMs,
+              });
+            }
+            if (!project) {
+              throw new Error(`The local ${projectLabel} create flow did not return a project.`);
+            }
+            refreshProjectInventory();
+            await recordRemoteCommandStatus(event, "completed", `${projectSurface === "pcb" ? "PCB" : "Video"} project "${project.name}" created on this desktop.`, {
+              applied: true,
+              appliedFields: ["name"],
+              commandId,
+              commandKind,
+              [projectAckKey]: project,
+              workspaceId,
+            });
+            return;
+          }
+          const projects = await listWorkspaceProjects();
+          const project = findWorkspaceProjectMatch(projects, {
+            path: requestedProjectPath,
+            projectId: requestedProjectId,
+          });
+          if (!project) {
+            await rejectProjectCommand("failed", "project_not_found", `That ${projectLabel} was not found in the workspace.`, {
+              projectId: requestedProjectId,
+              projectPath: requestedProjectPath,
+            });
+            return;
+          }
+          if (projectAction === "delete") {
+            if (projectSurface === "pcb") {
+              await invoke("pcb_document_delete", {
+                boardPath: project.path,
+                repoPath,
+                workspaceId,
+              });
+            } else {
+              await emit(VIDEO_PROJECT_DELETED_EVENT, {
+                projectPath: project.path,
+                repoPath,
+                source: "remote_project_command",
+                workspaceId,
+              }).catch(() => {});
+              await invoke("video_project_delete", {
+                projectPath: project.path,
+                repoPath,
+              });
+            }
+            refreshProjectInventory();
+            await recordRemoteCommandStatus(event, "completed", `${projectSurface === "pcb" ? "PCB" : "Video"} project "${project.name}" deleted on this desktop.`, {
+              applied: true,
+              commandId,
+              commandKind,
+              [projectAckKey]: project,
+              workspaceId,
+            });
+            return;
+          }
+          // open
+          const enabledWorkspaceIds = normalizeEnabledWorkspaceIds(
+            workspaceLifecycleSettingsRef.current?.enabledWorkspaceIds,
+          );
+          const workspaceRuntimeActive = enabledWorkspaceIds.includes(workspaceId)
+            || activatedWorkspaceIdRef.current === workspaceId;
+          if (!workspaceRuntimeActive) {
+            await rejectProjectCommand(
+              "blocked",
+              "workspace_inactive",
+              "Workspace is not active on this desktop; activate it before opening projects.",
+              { [projectAckKey]: project },
+            );
+            return;
+          }
+          const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+          const rawShowWindow = event?.show_window ?? event?.showWindow ?? payload.show_window ?? payload.showWindow;
+          const shouldShowWindow = typeof rawShowWindow === "undefined"
+            ? true
+            : remoteCommandBooleanField(event, ["show_window", "showWindow"]);
+          if (shouldShowWindow) {
+            void invoke("app_exit_background").catch(() => {});
+          }
+          requestWorkspaceActivation(workspaceId, `remote_${normalizedKind}`);
+          showView(WORKSPACE_TAB_VIEW_BY_ID.terminals || DEFAULT_WORKSPACE_VIEW, {
+            immediate: true,
+            telemetrySource: `remote_${normalizedKind}`,
+            telemetryWorkspaceId: workspaceId,
+          });
+          await recordRemoteCommandStatus(event, "running", `Opening ${projectLabel} "${project.name}" on this desktop.`, {
+            commandId,
+            commandKind,
+            [projectAckKey]: project,
+            workspaceId,
+          });
+          const panelSelectInput = projectSurface === "pcb"
+            ? {
+              action: "select",
+              boardName: project.name,
+              boardPath: project.path,
+              kind: "pcb",
+              workspaceId,
+            }
+            : {
+              action: "select",
+              kind: "video",
+              projectName: project.name,
+              projectPath: project.path,
+              workspaceId,
+            };
+          const runPanelSelect = async () => {
+            const bridge = workspaceToolRuntimeBridgesRef.current[workspaceId] || null;
+            if (typeof bridge?.runWorkspacePanelAction !== "function") {
+              return { ok: false, reason: "panel_bridge_unavailable" };
+            }
+            try {
+              const result = await bridge.runWorkspacePanelAction(panelSelectInput);
+              return { ok: true, result };
+            } catch (error) {
+              const message = getErrorMessage(error, `Unable to open the ${projectLabel}.`);
+              return {
+                message,
+                ok: false,
+                reason: /panel limit reached/i.test(message) ? "panel_cap_reached" : "panel_action_failed",
+              };
+            }
+          };
+          // The terminals view (and its panel bridge) may still be mounting
+          // right after activation/navigation; wait briefly for it.
+          let selectAttempt = await runPanelSelect();
+          for (let retry = 0; retry < 14 && !disposed && !selectAttempt.ok
+            && selectAttempt.reason === "panel_bridge_unavailable"; retry += 1) {
+            await waitMs(200);
+            selectAttempt = await runPanelSelect();
+          }
+          if (!selectAttempt.ok) {
+            await rejectProjectCommand(
+              selectAttempt.reason === "panel_cap_reached" ? "blocked" : "failed",
+              selectAttempt.reason,
+              selectAttempt.message || (selectAttempt.reason === "panel_bridge_unavailable"
+                ? "The workspace terminals view was not ready to open the project."
+                : `Unable to open the ${projectLabel} on this desktop.`),
+              { [projectAckKey]: project },
+            );
+            return;
+          }
+          const selectedPanel = selectAttempt.result?.panel && typeof selectAttempt.result.panel === "object"
+            ? selectAttempt.result.panel
+            : null;
+          const panelAck = selectedPanel
+            ? {
+              kind: String(selectedPanel.kind || projectSurface),
+              pane_id: String(selectedPanel.paneId || selectedPanel.pane_id || selectedPanel.panelId || selectedPanel.panel_id || ""),
+              terminal_index: Number.isInteger(selectedPanel.terminalIndex)
+                ? selectedPanel.terminalIndex
+                : Number.isInteger(selectedPanel.terminal_index)
+                  ? selectedPanel.terminal_index
+                  : null,
+            }
+            : null;
+          await syncRemoteControlState(`remote_${normalizedKind}`);
+          await recordRemoteCommandStatus(event, "completed", `${projectSurface === "pcb" ? "PCB" : "Video"} project "${project.name}" opened on this desktop.`, {
+            applied: true,
+            commandId,
+            commandKind,
+            opened_panel: Boolean(selectAttempt.result?.opened),
+            ...(panelAck ? { panel: panelAck } : {}),
+            [projectAckKey]: project,
+            workspaceId,
+          });
+          return;
+        } catch (error) {
+          const message = getErrorMessage(error, `Unable to ${projectAction} the ${projectLabel} on this desktop.`);
+          const reason = projectFailureReason(message);
+          await rejectProjectCommand(
+            reason === "board_owned_by_other_workspace" ? "blocked" : "failed",
+            reason,
+            message,
+          );
+          return;
+        }
+      }
       if (normalizedKind === "terminal_close_idle" || normalizedKind === "close_idle_terminal") {
         const { terminal } = findRemoteControlTerminal(workspaceId, target);
         const assessment = assessRemoteControlTerminalIdle(terminal);
@@ -46515,7 +47317,7 @@ export default function App() {
               result,
               source_format: DFBLUEPRINT_SOURCE_FORMAT,
               blueprint: parseDfBlueprintSource(String(result?.graph?.source || result?.graph?.sourceText || result?.graph?.source_text || "")),
-              instructions: "Loopspace graphs use .dfblueprint source. Prefer patch_loopspace_graph for small edits. Trigger nodes are references to trigger inventory only: call list_loopspace_triggers, use create_loopspace_trigger with explicit trigger_type if needed, then patch with attach_trigger and trigger_id. Edges must use legal node contract ports: triggers expose out; run_script/send_message/dispatch_todos expose exec, success, failure, interrupt; document_read/document_write expose docs; asset_read/asset_write expose assets; most executable targets accept in. Specify from_port/fromPort and to_port/toPort on connect operations, especially from action nodes. Supported add_node kinds are document_read, document_write, asset_read, asset_write, run_script, send_message, dispatch_todos, and step. Resource nodes use doc_refs or asset_refs for selected inputs, create_name for generated outputs, h for height, and target_mode for selection/create behavior. dispatch_todos uses target_workspace_ids and todo_lines, plus optional target_terminal_id, target_agent_id, model, reasoning_effort, and speed. document_write accepts operation append|replace|prepend|create_if_missing|delete and optional content_template for deterministic webhook/body writes without an agent. asset_write accepts operation add_version|replace|create_if_missing|delete and optional content_template for deterministic webhook/body assets without an agent. To guide a send-message substep, connect step.success -> run_script.in, send_message.in, or dispatch_todos.in when a completed substep should start another action; connect document_read.docs or document_write.docs -> step.in for readable document context, asset_read.assets or asset_write.assets -> step.in for readable asset context, step.docs -> document_write.in for document generation, and step.assets -> asset_write.in for asset generation. Do not connect send_message.exec, send_message.success, dispatch_todos.exec, dispatch_todos.success, run_script.exec, run_script.success, or other action execution branches directly into asset_write. add_node and update_node_props accept resource metadata as top-level fields or nested under props. Never invent standalone cron/manual/webhook trigger nodes.",
+              instructions: "Loopspace graphs use .dfblueprint source. Prefer patch_loopspace_graph for small edits. Trigger nodes are references to trigger inventory only: call list_loopspace_triggers, use create_loopspace_trigger with explicit trigger_type if needed, then patch with attach_trigger and trigger_id. Edges must use legal node contract ports: triggers expose out; run_script/send_message/dispatch_todos/notify_device expose exec, success, failure, interrupt; document_read/document_write expose docs; asset_read/asset_write expose assets; most executable targets accept in. Specify from_port/fromPort and to_port/toPort on connect operations, especially from action nodes. Supported add_node kinds are document_read, document_write, asset_read, asset_write, run_script, send_message, dispatch_todos, notify_device, and step. Resource nodes use doc_refs or asset_refs for selected inputs, create_name for generated outputs, h for height, and target_mode for selection/create behavior. dispatch_todos uses target_workspace_ids and todo_lines, plus optional target_terminal_id, target_agent_id, model, reasoning_effort, and speed. notify_device sends a native/push notification when reached and uses optional device_id (empty targets all account devices), title, body, url, and delivery auto|native|push; title/body support {{loop_name}}, {{node_title}}, {{from_node}}, {{branch}}, {{device_name}}, {{run_id}}, and {{date}} template variables. document_write accepts operation append|replace|prepend|create_if_missing|delete and optional content_template for deterministic webhook/body writes without an agent. asset_write accepts operation add_version|replace|create_if_missing|delete and optional content_template for deterministic webhook/body assets without an agent. To guide a send-message substep, connect step.success -> run_script.in, send_message.in, dispatch_todos.in, or notify_device.in when a completed substep should start another action; connect document_read.docs or document_write.docs -> step.in for readable document context, asset_read.assets or asset_write.assets -> step.in for readable asset context, step.docs -> document_write.in for document generation, and step.assets -> asset_write.in for asset generation. Do not connect send_message.exec, send_message.success, dispatch_todos.exec, dispatch_todos.success, run_script.exec, run_script.success, or other action execution branches directly into asset_write. add_node and update_node_props accept resource metadata as top-level fields or nested under props. Never invent standalone cron/manual/webhook trigger nodes.",
               loopspace: { id: loopspace.id, name: loopspace.name },
               state: buildAppControlState(),
             },
@@ -52106,8 +52908,7 @@ export default function App() {
       // Wait for the low-credits decision so the two startup overlays never
       // stack; a shown/dismissed low-credits moment consumes this sign-in.
       && lowCreditsUpsellState === "skipped"
-      // TEMP: show for every plan while testing — restore the free-plan gate:
-      // && billingPlanName === "free"
+      && billingPlanName === "free"
     ) {
       // The overlay is opaque and stacks above the startup overlay, so the
       // tier-up plays BEFORE the user ever sees the main app area.

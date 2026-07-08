@@ -5317,10 +5317,11 @@ async fn video_projects_list(repo_path: String) -> Result<VideoProjectsListRespo
 
 #[tauri::command]
 async fn video_project_create(
+    app: tauri::AppHandle,
     repo_path: String,
     name: String,
 ) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let (root, media_root) = video_workspace_media_root(repo_path.as_str())?;
         video_ensure_media_dirs(&media_root)?;
         let projects_dir = media_root.join(VIDEO_PROJECTS_DIR);
@@ -5372,13 +5373,31 @@ async fn video_project_create(
         if let Some(object) = project.as_object_mut() {
             object.insert("updatedAtMs".to_string(), serde_json::json!(updated_at_ms));
         }
-        Ok(serde_json::json!({
+        Ok::<serde_json::Value, String>(serde_json::json!({
             "project": project,
             "path": video_relative_path(&root, &project_path),
+            "repoPath": root.to_string_lossy().to_string(),
         }))
     })
     .await
-    .map_err(|error| format!("Video project create worker failed: {error}"))?
+    .map_err(|error| format!("Video project create worker failed: {error}"))??;
+    let path = result
+        .get("path")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let repo_path = result
+        .get("repoPath")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let _ = app.emit(
+        VIDEO_STORE_CHANGED_EVENT,
+        serde_json::json!({
+            "repoPath": repo_path,
+            "paths": [path],
+            "changedAtMs": video_now_millis(),
+        }),
+    );
+    Ok(result)
 }
 
 #[tauri::command]
@@ -6959,16 +6978,43 @@ async fn video_mcp_context(
 }
 
 #[tauri::command]
-async fn video_project_delete(repo_path: String, project_path: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
+async fn video_project_delete(
+    app: tauri::AppHandle,
+    repo_path: String,
+    project_path: String,
+) -> Result<(), String> {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let (root, media_root) = video_workspace_media_root(repo_path.as_str())?;
         video_ensure_media_dirs(&media_root)?;
         let abs = video_resolve_project_abs(&root, &media_root, project_path.as_str())?;
+        let rel_path = video_relative_path(&root, &abs);
         std::fs::remove_file(&abs)
-            .map_err(|error| format!("Unable to delete video project: {error}"))
+            .map_err(|error| format!("Unable to delete video project: {error}"))?;
+        Ok::<serde_json::Value, String>(serde_json::json!({
+            "path": rel_path,
+            "repoPath": root.to_string_lossy().to_string(),
+        }))
     })
     .await
-    .map_err(|error| format!("Video project delete worker failed: {error}"))?
+    .map_err(|error| format!("Video project delete worker failed: {error}"))??;
+    let path = result
+        .get("path")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let repo_path = result
+        .get("repoPath")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let _ = app.emit(
+        VIDEO_STORE_CHANGED_EVENT,
+        serde_json::json!({
+            "repoPath": repo_path,
+            "paths": [path],
+            "deletedPaths": [path],
+            "changedAtMs": video_now_millis(),
+        }),
+    );
+    Ok(())
 }
 
 fn video_mcp_round_u64(value: f64) -> u64 {

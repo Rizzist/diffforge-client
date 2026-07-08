@@ -3658,14 +3658,13 @@ fn tokenomics_sources() -> Vec<TokenomicsSource> {
     // account's usage would be invisible to tokenomics.
     for (profile_id, profile_label, profile_dir) in agent_accounts_profiles_for_tokenomics("claude")
     {
+        let account =
+            tokenomics_claude_profile_provider_account(&profile_id, &profile_label, &profile_dir);
         sources.push(TokenomicsSource {
             provider: "anthropic",
             agent_kind: "claude",
             roots: vec![profile_dir.join("projects")],
-            account: Some(TokenomicsProviderAccount {
-                key: format!("anthropic:claude:profile:{profile_id}"),
-                label: format!("Claude · {profile_label}"),
-            }),
+            account: Some(account),
         });
     }
     sources
@@ -4191,6 +4190,15 @@ fn tokenomics_claude_account_display_label(
     account_suffix: &str,
 ) -> Option<String> {
     let account = tokenomics_claude_oauth_account(auth_value).unwrap_or(auth_value);
+    // A registered agent-accounts profile with this login's email names the
+    // account exactly as the accounts settings UI does — prefer that over the
+    // oauth display name (whatever personal name Anthropic has on file, which
+    // reads as a stranger in the filter chips) and over the letter fallback.
+    if let Some(email) = tokenomics_text_field(account, &["emailAddress", "email"]) {
+        if let Some(label) = agent_accounts_profile_label_for_email("claude", &email) {
+            return Some(label);
+        }
+    }
     if let Some(label) = tokenomics_text_field(account, &["displayName", "display_name", "name"]) {
         return Some(label);
     }
@@ -4398,6 +4406,92 @@ fn tokenomics_claude_auth_value() -> Option<Value> {
         "credentials": credentials,
         "claude_config": claude_config,
     }))
+}
+
+/// A captured profile dir IS a CLAUDE_CONFIG_DIR: the CLI keeps that login's
+/// `.claude.json` (and file-based `.credentials.json`, where the platform
+/// uses one) inside it — the same shape the default-home auth value carries.
+fn tokenomics_claude_profile_auth_value(profile_dir: &Path) -> Option<Value> {
+    let credentials = tokenomics_read_json_file(profile_dir.join(".credentials.json"));
+    let claude_config = tokenomics_read_json_file(profile_dir.join(".claude.json"));
+    if credentials.is_none() && claude_config.is_none() {
+        return None;
+    }
+    Some(json!({
+        "credentials": credentials,
+        "claude_config": claude_config,
+    }))
+}
+
+/// Identity-first account for a captured Claude profile, mirroring the Codex
+/// profile path: resolve the profile dir's own oauth identity so usage keys
+/// to the SAME account hash wherever that login runs (default home or
+/// profile) instead of splitting one account into an oauth-keyed and a
+/// profile-keyed chip. The synthetic `profile:` key survives only as the
+/// no-identity fallback (profile registered but never logged in).
+pub(crate) fn tokenomics_claude_profile_provider_account(
+    profile_id: &str,
+    profile_label: &str,
+    profile_dir: &Path,
+) -> TokenomicsProviderAccount {
+    let auth_value = tokenomics_claude_profile_auth_value(profile_dir);
+    // Require real oauth identifiers before trusting the identity path: a
+    // credential-only dir (tokens without an oauthAccount) would fall through
+    // to token-hash keys that churn on every refresh and that the retirement
+    // machinery can never match — the stable profile key is strictly better.
+    let identity_ready = auth_value
+        .as_ref()
+        .is_some_and(|auth| !tokenomics_claude_account_key_identifiers(auth).is_empty());
+    if !identity_ready {
+        return TokenomicsProviderAccount {
+            key: format!("anthropic:claude:profile:{profile_id}"),
+            label: format!("Claude · {profile_label}"),
+        };
+    }
+    let account =
+        tokenomics_provider_account_from_auth("anthropic", "claude", auth_value.as_ref());
+    if tokenomics_provider_account_key_is_unknown(&account.key) {
+        return TokenomicsProviderAccount {
+            key: format!("anthropic:claude:profile:{profile_id}"),
+            label: format!("Claude · {profile_label}"),
+        };
+    }
+    // The registry label ("syedmraza99", "admin") matches the accounts
+    // settings UI; the oauth display name is whatever name Anthropic has on
+    // the account and reads as a stranger in the filter chips.
+    let label = tokenomics_clean_non_profile_provider_account_label(profile_label)
+        .unwrap_or(account.label);
+    TokenomicsProviderAccount {
+        key: account.key,
+        label,
+    }
+}
+
+/// The stable tokenomics account key for a Claude config state (`.claude.json`
+/// contents), for the agent-accounts identity payload. Only oauth-derived
+/// identities count: without them the generic fallback would fingerprint the
+/// whole config JSON, which is unstable and never matches scanner keys.
+/// Deliberately label-free: the full `tokenomics_provider_account_from_auth`
+/// resolves a display label, which consults the agent-accounts registry,
+/// which (for profiles without a stored email) live-probes identity, which
+/// computes this key — calling it here would recurse.
+pub(crate) fn tokenomics_claude_account_key_for_claude_config(
+    claude_config: &Value,
+) -> Option<String> {
+    let auth_value = json!({ "claude_config": claude_config });
+    let identifiers = tokenomics_claude_account_key_identifiers(&auth_value);
+    if identifiers.is_empty() {
+        return None;
+    }
+    // Mirrors the key arm of tokenomics_provider_account_from_auth (the
+    // identifiers list arrives sorted + deduped); the paired unit test pins
+    // the two derivations together.
+    let fingerprint = identifiers.join("|");
+    let hash = tokenomics_hash(&format!("anthropic:claude:{fingerprint}"));
+    Some(format!(
+        "anthropic:claude:{}",
+        hash.get(0..32).unwrap_or(hash.as_str())
+    ))
 }
 
 fn tokenomics_read_json_file(path: PathBuf) -> Option<Value> {
@@ -16101,10 +16195,8 @@ fn tokenomics_provider_limits(
             continue;
         };
         let profile_plan = tokenomics_claude_plan_state_from_credentials(credentials.as_ref());
-        let profile_account = TokenomicsProviderAccount {
-            key: format!("anthropic:claude:profile:{profile_id}"),
-            label: format!("Claude · {profile_label}"),
-        };
+        let profile_account =
+            tokenomics_claude_profile_provider_account(&profile_id, &profile_label, &profile_dir);
         let profile_refresh_keys =
             tokenomics_provider_account_refresh_keys(conn, "anthropic", "claude", &profile_account);
         let profile_should_fetch_live = refresh_scope.should_fetch_live_for_account_keys(
@@ -20971,6 +21063,107 @@ mod tokenomics_tests {
         assert_eq!(account_a.key, account_b.key);
         assert_eq!(account_a.label, "Claude Syed");
         assert_eq!(account_b.label, "Claude Renamed");
+    }
+
+    #[test]
+    fn claude_profile_provider_account_resolves_profile_dir_identity() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let profile_dir = std::env::temp_dir().join(format!(
+            "diffforge-tokenomics-claude-profile-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join(".claude.json"),
+            serde_json::to_vec(&json!({
+                "oauthAccount": {
+                    "accountUuid": "profile-account-uuid",
+                    "displayName": "Provider Side Name",
+                    "emailAddress": "profile@example.test"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let account = tokenomics_claude_profile_provider_account(
+            "cap-profile-1234",
+            "profileuser",
+            &profile_dir,
+        );
+        // Same key as the default-home path for the same login: one account,
+        // one chip, wherever the login runs.
+        let default_shaped = tokenomics_provider_account_from_auth(
+            "anthropic",
+            "claude",
+            Some(&json!({
+                "claude_config": {
+                    "oauthAccount": { "accountUuid": "profile-account-uuid" }
+                }
+            })),
+        );
+        assert_eq!(account.key, default_shaped.key);
+        assert!(!account.key.contains(":profile:"));
+        // Registry label wins over the provider-side display name.
+        assert_eq!(account.label, "profileuser");
+
+        let config_key = tokenomics_claude_account_key_for_claude_config(&json!({
+            "oauthAccount": { "accountUuid": "profile-account-uuid" }
+        }));
+        assert_eq!(config_key.as_deref(), Some(account.key.as_str()));
+
+        let _ = fs::remove_dir_all(&profile_dir);
+    }
+
+    #[test]
+    fn claude_profile_provider_account_falls_back_to_profile_key_without_identity() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let profile_dir = std::env::temp_dir().join(format!(
+            "diffforge-tokenomics-claude-profile-empty-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&profile_dir).unwrap();
+
+        let account = tokenomics_claude_profile_provider_account(
+            "cap-empty-1234",
+            "pending",
+            &profile_dir,
+        );
+        assert_eq!(account.key, "anthropic:claude:profile:cap-empty-1234");
+        assert_eq!(account.label, "Claude · pending");
+
+        // Credential-only dir (tokens, no oauthAccount): token-hash keys
+        // churn on refresh, so the stable profile key must win here too.
+        fs::write(
+            profile_dir.join(".credentials.json"),
+            serde_json::to_vec(&json!({
+                "claudeAiOauth": {
+                    "accessToken": "access-token-1",
+                    "refreshToken": "refresh-token-1"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let credential_only = tokenomics_claude_profile_provider_account(
+            "cap-empty-1234",
+            "pending",
+            &profile_dir,
+        );
+        assert_eq!(credential_only.key, "anthropic:claude:profile:cap-empty-1234");
+
+        assert_eq!(
+            tokenomics_claude_account_key_for_claude_config(&json!({ "hasCompletedOnboarding": true })),
+            None
+        );
+
+        let _ = fs::remove_dir_all(&profile_dir);
     }
 
     #[test]

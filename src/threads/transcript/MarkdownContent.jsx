@@ -161,6 +161,13 @@ function HighlightedCode({ code = "", language = "", live = false }) {
   return <div dangerouslySetInnerHTML={{ __html: state.html }} />;
 }
 
+// Renders one shiki-highlighted line (diff hunk rows). The html is shiki
+// output (trusted generated markup — shiki HTML-escapes all content); this
+// component keeps every raw-html injection scoped to this file.
+export function ShikiLineCode({ html = "" }) {
+  return <code className="shiki" dangerouslySetInnerHTML={{ __html: html }} />;
+}
+
 export const TranscriptCodeBlock = memo(function TranscriptCodeBlock({
   code = "",
   language = "",

@@ -21,6 +21,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 
 import {
   buildTranscriptRows,
+  extractTurnDiffs,
   extractTurnSummaries,
   rowHeightEstimate,
   transcriptArray,
@@ -71,7 +72,8 @@ function rowContainsDomId(row, domId) {
   if (!row || !domId) return false;
   if (row.domId === domId) return true;
   if (row.kind === "subagent-group") {
-    return transcriptArray(row.childRows).some((child) => child.domId === domId);
+    // Subagent groups can nest (parent_id chains) — recurse.
+    return transcriptArray(row.childRows).some((child) => rowContainsDomId(child, domId));
   }
   return false;
 }
@@ -103,9 +105,16 @@ export const AgentTranscript = memo(function AgentTranscript({
   // Optional (action, message, contentText) callback enabling user-bubble
   // affordances (Edit / Resend / Continue) on interrupted/queued/failed rows.
   onUserMessageAction = null,
+  // The current session's id(s); subagent rows whose session reference
+  // matches are treated as local (no "Open session" chip).
+  sessionId = "",
+  // Optional (sessionRef) => void wiring the subagent "Open session" chip to
+  // the host's session-open navigation.
+  onOpenSession = null,
 }) {
   const safeItems = useMemo(() => transcriptArray(items), [items]);
   const turnSummaries = useMemo(() => extractTurnSummaries(messages), [messages]);
+  const turnDiffs = useMemo(() => extractTurnDiffs(messages), [messages]);
   const usageByTurn = useMemo(() => usageTotalsByTurn(messages), [messages]);
 
   // Fold state is keyed by windowKey so switching sessions resets it and
@@ -141,15 +150,33 @@ export const AgentTranscript = memo(function AgentTranscript({
       return { key: windowKey, open };
     });
   }, [windowKey]);
+  // Batch setter (expand-all / collapse-all in the file-change card).
+  const setRowsOpen = useCallback((rowKeys, openValue) => {
+    const keys = Array.isArray(rowKeys) ? rowKeys.filter(Boolean) : [];
+    if (!keys.length) return;
+    setRowOpenState((current) => {
+      const open = new Set(current.key === windowKey ? current.open : []);
+      keys.forEach((key) => {
+        if (openValue) {
+          open.add(key);
+        } else {
+          open.delete(key);
+        }
+      });
+      return { key: windowKey, open };
+    });
+  }, [windowKey]);
 
   const built = useMemo(() => buildTranscriptRows(safeItems, {
     itemIdPrefix,
     diffSummaries,
     turnSummaries,
+    turnDiffs,
     usageByTurn,
     expandedTurnKeys,
     busy,
-  }), [busy, diffSummaries, expandedTurnKeys, itemIdPrefix, safeItems, turnSummaries, usageByTurn]);
+    sessionId,
+  }), [busy, diffSummaries, expandedTurnKeys, itemIdPrefix, safeItems, sessionId, turnDiffs, turnSummaries, usageByTurn]);
 
   const rows = useMemo(() => {
     if (!busy || !built.rows.length) return built.rows;
@@ -372,6 +399,8 @@ export const AgentTranscript = memo(function AgentTranscript({
                 <TranscriptRowBody
                   live={row.groupKey === liveGroupKey && Boolean(liveGroupKey)}
                   onFetchTruncated={onFetchTruncated}
+                  onOpenSession={onOpenSession}
+                  onSetRowsOpen={setRowsOpen}
                   onToggleRowOpen={toggleRowOpen}
                   onToggleTurn={toggleTurn}
                   onUserMessageAction={onUserMessageAction}
@@ -413,6 +442,8 @@ export const AgentTranscript = memo(function AgentTranscript({
                   <TranscriptRowBody
                     live={live}
                     onFetchTruncated={onFetchTruncated}
+                    onOpenSession={onOpenSession}
+                    onSetRowsOpen={setRowsOpen}
                     onToggleRowOpen={toggleRowOpen}
                     onToggleTurn={toggleTurn}
                     onUserMessageAction={onUserMessageAction}

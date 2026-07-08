@@ -155,6 +155,19 @@ fn agent_accounts_profile_identity(kind: &str, dir: Option<&Path>) -> Value {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            let display_name = state
+                .as_ref()
+                .and_then(|state| state.pointer("/oauthAccount/displayName"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            // The oauth-derived tokenomics key lets the usage view fold
+            // historical rows (keyed by account hash OR by legacy profile id)
+            // into this profile's account group.
+            let tokenomics_account_key = state
+                .as_ref()
+                .and_then(tokenomics_claude_account_key_for_claude_config)
+                .unwrap_or_default();
             let credentials_present = dir
                 .map(|dir| dir.join(".credentials.json").is_file())
                 .unwrap_or_else(|| {
@@ -163,7 +176,12 @@ fn agent_accounts_profile_identity(kind: &str, dir: Option<&Path>) -> Value {
                         .unwrap_or(false)
                 });
             let auth_ready = !email.is_empty() || credentials_present;
-            json!({ "email": email, "authReady": auth_ready })
+            json!({
+                "email": email,
+                "authReady": auth_ready,
+                "displayName": display_name,
+                "tokenomicsAccountKey": tokenomics_account_key,
+            })
         }
         "opencode" => {
             let auth_path = match dir {
@@ -998,6 +1016,32 @@ pub(crate) fn agent_accounts_apply_spawn_env(
 
 fn agent_accounts_email_key(email: &str) -> String {
     email.trim().to_ascii_lowercase()
+}
+
+/// The registry's display label for whichever profile holds this login email,
+/// so tokenomics account chips name accounts exactly like the accounts
+/// settings UI ("syedmraza99", "admin") instead of the provider-side display
+/// name. Returns None for logins the registry doesn't know. STORED emails
+/// only — the live probe (`agent_accounts_profile_email` fallback) derives a
+/// tokenomics key whose label resolution calls back into this function, so
+/// probing here would recurse for profiles missing a stored email.
+pub(crate) fn agent_accounts_profile_label_for_email(kind: &str, email: &str) -> Option<String> {
+    let wanted = agent_accounts_email_key(email);
+    if wanted.is_empty() {
+        return None;
+    }
+    let registry = agent_accounts_registry_read();
+    let (_, profiles) = agent_accounts_kind_entry(&registry, kind);
+    profiles
+        .iter()
+        .find(|profile| {
+            profile
+                .get("email")
+                .and_then(Value::as_str)
+                .map(agent_accounts_email_key)
+                .is_some_and(|stored| stored == wanted)
+        })
+        .map(agent_accounts_profile_display_label)
 }
 
 fn agent_accounts_email_slug(email: &str) -> String {

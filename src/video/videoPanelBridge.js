@@ -1,4 +1,5 @@
 export const VIDEO_STORE_CHANGED_EVENT = "video-store-changed";
+export const VIDEO_PROJECT_DELETED_EVENT = "video-project-deleted";
 export const VIDEO_TOOLS_INSTALL_PROGRESS_EVENT = "video-tools-install-progress";
 export const VIDEO_EXPORT_PROGRESS_EVENT = "video-export-progress";
 export const VIDEO_GENERATE_PROGRESS_EVENT = "video-generate-progress";

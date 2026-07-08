@@ -265,6 +265,7 @@ export const StatusPill = styled.span`
   &[data-status="running"],
   &[data-status="pending"],
   &[data-status="sending"],
+  &[data-status="submitted"],
   &[data-status="queued"] {
     color: #fde68a;
     border-color: rgba(251, 191, 36, 0.26);
@@ -872,6 +873,7 @@ export const FileChangeHeader = styled.div`
   display: flex;
   min-width: 0;
   min-height: 36px;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   padding: 4px 12px;
@@ -883,7 +885,7 @@ export const FileChangeHeader = styled.div`
   }
 
   b[data-tone="add"] {
-    color: #86efac;
+    color: #7ee2a8;
     font-size: 11px;
     font-weight: 800;
   }
@@ -903,6 +905,16 @@ export const FileChangeHeader = styled.div`
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+`;
+
+// Right-aligned action cluster in the file-change header (expand all /
+// collapse all).
+export const FileChangeHeaderActions = styled.span`
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
 `;
 
 export const FileChangeList = styled.div`
@@ -949,7 +961,7 @@ export const FileChangeRowLine = styled.div`
     font-weight: 760;
 
     b[data-tone="add"] {
-      color: #86efac;
+      color: #7ee2a8;
       font-weight: 760;
     }
 
@@ -960,6 +972,180 @@ export const FileChangeRowLine = styled.div`
   }
 `;
 
+// Expandable per-file row: the same layout as FileChangeRowLine, rendered
+// as a full-width button when the file carries a reviewable patch.
+export const FileDiffRowButton = styled(FileChangeRowLine).attrs({ as: "button" })`
+  width: 100%;
+  -webkit-appearance: none;
+  border: 0;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  font-family: ${MONO};
+  font-size: 11px;
+  text-align: left;
+
+  ${FoldChevron} {
+    flex: 0 0 auto;
+    overflow: visible;
+  }
+
+  &:hover {
+    background: rgba(255, 255, 255, 0.03);
+    color: ${C.text};
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(125, 176, 255, 0.45);
+    outline-offset: -2px;
+  }
+`;
+
+/* ------------------------------------------------------------------ */
+/* Diff hunks (reviewable per-file patches)                            */
+/* ------------------------------------------------------------------ */
+
+export const DiffHunksWrap = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  margin: 2px 10px 8px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 8px;
+  padding: 8px;
+  background: rgba(5, 9, 15, 0.78);
+`;
+
+export const DiffHunkBlock = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 6px;
+`;
+
+export const DiffHunkHeader = styled.div`
+  display: flex;
+  min-height: 24px;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+  color: ${C.textMuted};
+  background: rgba(255, 255, 255, 0.035);
+  font-family: ${MONO};
+  font-size: 10px;
+  font-weight: 700;
+
+  > span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+export const DiffHunkScroll = styled.div`
+  min-width: 0;
+  max-height: 420px;
+  overflow: auto;
+`;
+
+export const DiffLineList = styled.div`
+  display: grid;
+  width: max-content;
+  min-width: 100%;
+  font-family: ${MONO};
+  font-size: 11.5px;
+  line-height: 1.55;
+`;
+
+export const DiffLineRow = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: stretch;
+
+  &[data-type="add"] {
+    background: rgba(46, 160, 67, 0.16);
+  }
+
+  &[data-type="del"] {
+    background: rgba(248, 81, 73, 0.14);
+  }
+
+  > i {
+    display: inline-block;
+    flex: 0 0 auto;
+    width: 4ch;
+    padding: 0 6px 0 4px;
+    color: ${C.textMuted};
+    font-style: normal;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    user-select: none;
+  }
+
+  &[data-type="add"] > i {
+    background: rgba(46, 160, 67, 0.28);
+  }
+
+  &[data-type="del"] > i {
+    background: rgba(248, 81, 73, 0.26);
+  }
+
+  > b {
+    flex: 0 0 auto;
+    width: 1.4ch;
+    padding-left: 4px;
+    font-weight: 760;
+    user-select: none;
+  }
+
+  &[data-type="add"] > b {
+    color: #7ee2a8;
+  }
+
+  &[data-type="del"] > b {
+    color: #fca5a5;
+  }
+
+  > code {
+    flex: 1 0 auto;
+    padding-right: 12px;
+    color: #cbd5e1;
+    background: transparent;
+    font-family: ${MONO};
+    white-space: pre;
+  }
+
+  > em[data-no-newline] {
+    flex: 0 0 auto;
+    align-self: center;
+    padding: 0 6px;
+    color: ${C.textMuted};
+    font-size: 9.5px;
+    font-style: normal;
+    user-select: none;
+  }
+`;
+
+// Honest truncation notes ("patch truncated at source — counts preserved")
+// and binary labels inside the file card.
+export const DiffNote = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px 6px;
+  color: ${C.textMuted};
+  font-size: 10.5px;
+  font-style: italic;
+  font-weight: 550;
+`;
+
 /* ------------------------------------------------------------------ */
 /* Subagent group                                                      */
 /* ------------------------------------------------------------------ */
@@ -967,22 +1153,33 @@ export const FileChangeRowLine = styled.div`
 export const SubagentFrame = styled.section`
   display: grid;
   min-width: 0;
-  gap: 8px;
+  gap: 0;
   border: 1px solid ${C.lineBlue};
   border-radius: 10px;
-  padding: 8px 10px 10px;
+  padding: 4px 6px;
   background: rgba(47, 128, 255, 0.045);
 `;
 
-export const SubagentHeader = styled.header`
+export const SubagentHeaderButton = styled.button`
   display: flex;
+  width: 100%;
   min-width: 0;
+  min-height: 30px;
   align-items: center;
   gap: 8px;
+  -webkit-appearance: none;
+  border: 0;
+  border-radius: 7px;
+  padding: 3px 6px;
+  appearance: none;
+  background: transparent;
   color: ${C.blueBright};
+  cursor: pointer;
+  font: inherit;
   font-size: 11px;
   font-weight: 800;
   letter-spacing: 0.05em;
+  text-align: left;
   text-transform: uppercase;
 
   svg {
@@ -997,12 +1194,99 @@ export const SubagentHeader = styled.header`
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+
+  em {
+    flex: 0 0 auto;
+    color: ${C.textMuted};
+    font-size: 10px;
+    font-style: normal;
+    font-weight: 650;
+    letter-spacing: 0.02em;
+    text-transform: none;
+  }
+
+  &:hover {
+    background: rgba(255, 255, 255, 0.03);
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(125, 176, 255, 0.45);
+    outline-offset: 2px;
+  }
+`;
+
+export const SubagentStatusDot = styled.span`
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: ${C.textMuted};
+
+  &[data-status="running"] {
+    background: ${C.warning};
+    box-shadow: 0 0 0 3px rgba(255, 179, 71, 0.14);
+  }
+
+  &[data-status="completed"] {
+    background: #4ade80;
+  }
+
+  &[data-status="failed"] {
+    background: ${C.danger};
+    box-shadow: 0 0 0 3px rgba(255, 107, 107, 0.12);
+  }
+`;
+
+export const SubagentOpenSessionChip = styled.button`
+  display: inline-flex;
+  flex: 0 0 auto;
+  min-height: 20px;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  border: 1px solid ${C.lineBlue};
+  border-radius: 999px;
+  color: #93c5fd;
+  background: ${C.blueSoft};
+  cursor: pointer;
+  font: inherit;
+  font-size: 9.5px;
+  font-weight: 750;
+  letter-spacing: 0.02em;
+  text-transform: none;
+  white-space: nowrap;
+
+  svg {
+    width: 11px;
+    height: 11px;
+  }
+
+  &:hover {
+    color: #bfdbfe;
+    border-color: #93c5fd;
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(125, 176, 255, 0.58);
+    outline-offset: 2px;
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.55;
+
+    &:hover {
+      color: #93c5fd;
+      border-color: ${C.lineBlue};
+    }
+  }
 `;
 
 export const SubagentChildren = styled.div`
   display: grid;
   min-width: 0;
   gap: 8px;
+  padding: 4px 4px 6px;
 `;
 
 /* ------------------------------------------------------------------ */

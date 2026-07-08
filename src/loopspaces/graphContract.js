@@ -83,6 +83,13 @@ export const LOOPSPACE_GRAPH_NODE_TEMPLATES = [
     label: "Send message",
     role: "action",
   },
+  {
+    description: "Send a push notification to a device (laptop or phone).",
+    icon: "bell",
+    id: "notify_device",
+    label: "Notify device",
+    role: "action",
+  },
 ];
 
 export const LOOPSPACE_GRAPH_NODE_CONTRACTS = {
@@ -163,6 +170,19 @@ export const LOOPSPACE_GRAPH_NODE_CONTRACTS = {
       region: true,
       sized: true,
       width: 680,
+    },
+  },
+  notify_device: {
+    inputs: [INPUT_PORTS_BY_ID.in],
+    outputs: EXECUTION_OUTPUT_PORTS,
+    role: "action",
+    visual: {
+      height: 148,
+      minHeight: 148,
+      minWidth: 380,
+      outputGutter: 104,
+      sized: true,
+      width: 380,
     },
   },
   step: {
@@ -318,7 +338,7 @@ export function validateLoopspaceGraphEdgeCandidate(fromNode, toNode, options = 
   const nodeLookup = options.nodeById || options.nodeLookup || options.nodes || null;
   const isSendMessageSubstepSuccessEdge = (
     fromKind === "step"
-      && (toKind === "run_script" || toKind === "send_message" || toKind === "dispatch_todos")
+      && (toKind === "run_script" || toKind === "send_message" || toKind === "dispatch_todos" || toKind === "notify_device")
       && fromPort === "success"
       && toPort === "in"
       && graphContractIsSendMessageSubstep(fromNode, nodeLookup)
@@ -365,7 +385,7 @@ export function validateLoopspaceGraphEdgeCandidate(fromNode, toNode, options = 
   }
   if (
     toKind === "asset_write"
-      && (fromKind === "run_script" || fromKind === "send_message" || fromKind === "dispatch_todos")
+      && (fromKind === "run_script" || fromKind === "send_message" || fromKind === "dispatch_todos" || fromKind === "notify_device")
       && EXECUTION_OUTPUT_PORT_IDS.has(fromPort)
   ) {
     return {

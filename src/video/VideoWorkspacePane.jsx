@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createPortal } from "react-dom";
 import styled from "styled-components";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { useNativeWebview } from "../web/webNative.js";
 import { Group, Panel, Separator } from "react-resizable-panels";
@@ -24,6 +24,7 @@ import { createPlaybackStore } from "./videoPlaybackStore.js";
 import {
   VIDEO_DESCRIBE_PROGRESS_EVENT,
   VIDEO_GENERATE_PROGRESS_EVENT,
+  VIDEO_PROJECT_DELETED_EVENT,
   VIDEO_STORE_CHANGED_EVENT,
   VIDEO_TOOLS_INSTALL_PROGRESS_EVENT,
   VIDEO_TRANSCRIBE_PROGRESS_EVENT,
@@ -224,6 +225,10 @@ const WIDE_MIN_WIDTH = 680;
 
 function normalizeRepoIdentity(repoPath) {
   return String(repoPath || "").trim().replace(/\\/g, "/").replace(/\/+$/g, "");
+}
+
+function normalizeVideoProjectIdentity(projectPath) {
+  return String(projectPath || "").trim().replace(/\\/g, "/");
 }
 
 function slotStorageKey(workspaceId, paneId, repoPath) {
@@ -1500,6 +1505,58 @@ export default function VideoWorkspacePane({
   // Autosave: target path captured at edit time (switching projects inside
   // the debounce window must not cross-write), flushed on unmount.
   const pendingSaveRef = useRef(null);
+
+  useEffect(() => {
+    if (!repoPath) {
+      return undefined;
+    }
+    let disposed = false;
+    let unlisten = () => {};
+    listen(VIDEO_PROJECT_DELETED_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      const eventRepo = normalizeRepoIdentity(payload.repoPath);
+      if (eventRepo && eventRepo !== normalizeRepoIdentity(repoPath)) {
+        return;
+      }
+      const deletedPath = normalizeVideoProjectIdentity(payload.projectPath || payload.project_path || payload.path);
+      if (!deletedPath) {
+        return;
+      }
+      const pendingPath = normalizeVideoProjectIdentity(pendingSaveRef.current?.projectPath);
+      if (pendingPath && pendingPath === deletedPath) {
+        pendingSaveRef.current = null;
+        window.clearTimeout(saveTimerRef.current);
+      }
+      const currentPath = normalizeVideoProjectIdentity(projectPathRef.current);
+      if (currentPath && currentPath === deletedPath) {
+        setPlaybackPlaying(false);
+        setProject(null);
+        setProjectPath("");
+        setSelectedClipIds([]);
+        setRanges([]);
+        setSelectionContext("");
+        setView("menu");
+        resetHistory();
+      }
+      void refreshProjects();
+    })
+      .then((next) => {
+        if (disposed) {
+          next();
+        } else {
+          unlisten = next;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [refreshProjects, repoPath, resetHistory, setPlaybackPlaying]);
+
   const flushPendingSave = useCallback(() => {
     const pending = pendingSaveRef.current;
     pendingSaveRef.current = null;
@@ -1769,6 +1826,12 @@ export default function VideoWorkspacePane({
       if (!repoPath || !path) {
         return;
       }
+      emit(VIDEO_PROJECT_DELETED_EVENT, {
+        projectPath: path,
+        repoPath,
+        source: "video_workspace_pane",
+        workspaceId,
+      }).catch(() => {});
       if (pendingSaveRef.current?.projectPath === path) {
         pendingSaveRef.current = null;
         window.clearTimeout(saveTimerRef.current);
@@ -1784,7 +1847,7 @@ export default function VideoWorkspacePane({
         })
         .catch((err) => setPaneError(String(err)));
     },
-    [refreshProjects, repoPath],
+    [refreshProjects, repoPath, workspaceId],
   );
 
   const backToMenu = useCallback(() => {

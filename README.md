@@ -12,7 +12,7 @@
 
 *Where AI agents, voice, screenshots, assets, loops, and your entire dev workflow are forged into one native desktop app.*
 
-![Version](https://img.shields.io/github/v/release/Rizzist/diffforge-client?label=Diff%20Forge&color=2f80ff) ![Rust](https://img.shields.io/badge/Rust-core-orange?logo=rust) ![Tauri](https://img.shields.io/badge/Tauri-v2-24C8DB?logo=tauri) ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react) ![macOS](https://img.shields.io/badge/macOS-✓-black?logo=apple) ![Windows](https://img.shields.io/badge/Windows-✓-0078D4) ![Linux](https://img.shields.io/badge/Linux-✓-FCC624?logo=linux&logoColor=black)
+![Version](https://img.shields.io/github/v/release/Rizzist/diffforge-client?label=Diff%20Forge&color=2f80ff) ![Rust](https://img.shields.io/badge/Rust-core-orange?logo=rust) ![Tauri](https://img.shields.io/badge/Tauri-v2-24C8DB?logo=tauri) ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react) ![macOS](https://img.shields.io/badge/macOS-✓-black?logo=apple) ![Windows](https://img.shields.io/badge/Windows-✓-0078D4) ![Linux](https://img.shields.io/badge/Linux-✓-FCC624?logo=linux&logoColor=black) [![Google Play](https://img.shields.io/badge/Google%20Play-Android%20app-3DDC84?logo=googleplay&logoColor=white)](https://play.google.com/store/apps/details?id=ai.diffforge.twa)
 
 <br/>
 

@@ -59,6 +59,15 @@ function isTurnSummary(message = {}) {
   return messageKind(message) === "turn-summary" || canonicalKind(message) === "turn-summary";
 }
 
+// Rust emits kind "turn_diff" system messages into thread_detail messages.
+// They stay in the normalized message list (TranscriptView feature-detects
+// them via extractTurnDiffs) but never become transcript items — exactly
+// like turn_summary. When absent, the file-change card degrades to the
+// counts-only rendering.
+function isTurnDiff(message = {}) {
+  return messageKind(message) === "turn-diff" || canonicalKind(message) === "turn-diff";
+}
+
 function desktopToolFromMessage(message = {}) {
   const existing = plainObject(message.tool || message.tool_call || message.toolCall);
   if (existing) return cloneValue(existing);
@@ -132,6 +141,10 @@ function desktopToolFromMessage(message = {}) {
 function desktopFileChangeFromMessage(message = {}) {
   const existing = plainObject(message.file_change || message.fileChange);
   if (existing) return cloneValue(existing);
+  // turn_diff records carry per-file unified patches in `files`; they are
+  // consumed by extractTurnDiffs, not the file_change detector — never
+  // clone the (potentially large) patches into a synthesized file_change.
+  if (isTurnDiff(message)) return null;
   const files = transcriptArray(
     message.files || message.changed_files || message.changedFiles,
   );
@@ -257,7 +270,7 @@ export function buildDesktopTranscriptItems(messages = [], {
   };
 
   normalizeDesktopTranscriptMessages(messages).forEach((message, index) => {
-    if (isTurnSummary(message)) return;
+    if (isTurnSummary(message) || isTurnDiff(message)) return;
     const role = transcriptToken(message.role);
     if (role === "activity") {
       ensureAssistantBlock(message, index);

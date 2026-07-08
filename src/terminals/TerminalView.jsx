@@ -322,25 +322,31 @@ const TERMINAL_EMPTY_AGENT_LAUNCHERS = Object.freeze([
   { id: "opencode", label: "OpenCode" },
   { id: "generic", label: "Shell" },
 ]);
+// Panel order mirrors the Create/Edit Workspace panels grid (WORKSPACE_PANEL_CARDS
+// in AppShell.jsx); non-settings extras (swarm, canvas, windows) trail.
 const TERMINAL_EMPTY_PANEL_LAUNCHERS = Object.freeze([
+  { id: "pcb", label: "PCB" },
+  { id: "video", label: "Video editor" },
   { id: "web", label: "Web" },
   { id: "docs", label: "Docs" },
-  { id: "pcb", label: "PCB" },
   { id: "vm", label: "VM Sandbox" },
-  { id: "video", label: "Video editor" },
   { id: "swarm", label: "Swarm agents" },
   { id: "canvas", label: "Terminal canvas" },
   { id: "windows", label: "Window breakout" },
 ]);
 const TERMINAL_FLAME_PLAN_KEYS = new Set(["free", "plus", "pro", "ultra"]);
+// Stable identity for the zero-pane state: a fresh [] per render makes every
+// downstream useCallback/useMemo (panel snapshots, runtime bridge) re-key each
+// render, which ping-pongs setState with AppShell until React throws #185.
+const EMPTY_LOGICAL_TERMINAL_INDEXES = Object.freeze([]);
 const TERMINAL_TOOLBOX_PANEL_LAUNCHERS = Object.freeze([
+  { id: "pcb", label: "PCB" },
+  { id: "video", label: "Video editor" },
   { id: "web", label: "Web" },
   { id: "docs", label: "Docs" },
-  { id: "pcb", label: "PCB" },
-  { id: "vm", label: "VM Sandbox" },
-  { id: "video", label: "Video editor" },
-  { id: "swarm", label: "Swarm agents" },
   { id: "whiteboard", label: "Whiteboard", unavailable: true },
+  { id: "vm", label: "VM Sandbox" },
+  { id: "swarm", label: "Swarm agents" },
 ]);
 const TERMINAL_BREAKOUT_PHASE_GRID = "grid";
 const TERMINAL_BREAKOUT_PHASE_BREAKING_OUT = "breaking-out";
@@ -23300,7 +23306,7 @@ function TerminalView({
   );
   const logicalTerminalIndexes = !terminalWorkspaceExplicitEmpty && Array.isArray(terminalWorkspaceLogicalIndexes)
     ? terminalWorkspaceLogicalIndexes
-    : [];
+    : EMPTY_LOGICAL_TERMINAL_INDEXES;
   const logicalTerminalIndexSignature = logicalTerminalIndexes.join(",");
   const normalizedMinimizedPaneIndexes = useMemo(() => {
     const logicalIndexSet = new Set(logicalTerminalIndexes);

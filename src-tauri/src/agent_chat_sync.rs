@@ -17,6 +17,7 @@ struct AgentChatSessionSyncContext {
     fork_from_provider_session_id: String,
     metadata_only: bool,
     turn_summary: Option<AgentChatTurnSummaryContext>,
+    turn_diff: Option<AgentChatTurnDiffContext>,
 }
 
 #[derive(Clone, Default)]
@@ -28,6 +29,19 @@ struct AgentChatTurnSummaryContext {
     duration_ms: Option<u64>,
     raw: Value,
     file_change: Option<Value>,
+}
+
+#[derive(Clone, Default)]
+struct AgentChatTurnDiffContext {
+    turn_id: String,
+    turn_key: String,
+    completed_at: String,
+    raw: Value,
+    files: Vec<Value>,
+    total_additions: i64,
+    total_deletions: i64,
+    files_omitted: usize,
+    truncated: bool,
 }
 
 struct AgentChatSessionSyncSource {
@@ -127,6 +141,12 @@ fn agent_chat_session_sync_turn_summary_message_id(message: &Value) -> String {
     cloud_mcp_payload_text(message, &["id"]).unwrap_or_default()
 }
 
+fn agent_chat_session_sync_turn_artifact_cache_key(kind: &str, turn_key: &str) -> Option<String> {
+    let kind = agent_chat_session_sync_normalize_kind_token(kind);
+    let turn_key = turn_key.trim();
+    (!kind.is_empty() && !turn_key.is_empty()).then(|| format!("{kind}:{turn_key}"))
+}
+
 fn agent_chat_session_sync_touch_turn_summary_cache_session(
     cache: &mut AgentChatTurnSummaryCache,
     session_key: &str,
@@ -167,17 +187,19 @@ fn agent_chat_session_sync_cached_turn_summary_message(
     turn_key: &str,
 ) -> Option<Value> {
     let session_key = agent_chat_session_sync_turn_summary_cache_session_key(provider, session_id)?;
+    let cache_key = agent_chat_session_sync_turn_artifact_cache_key("turn_summary", turn_key)?;
     let mut cache = agent_chat_session_sync_turn_summary_cache().lock().ok()?;
     agent_chat_session_sync_touch_turn_summary_cache_session(&mut cache, &session_key);
     cache
         .sessions
         .get(&session_key)
-        .and_then(|session| session.messages.get(turn_key.trim()).cloned())
+        .and_then(|session| session.messages.get(&cache_key).cloned())
 }
 
-fn agent_chat_session_sync_put_turn_summary_cache(
+fn agent_chat_session_sync_put_turn_artifact_cache(
     provider: &str,
     session_id: &str,
+    kind: &str,
     turn_key: &str,
     message: Value,
 ) {
@@ -186,18 +208,17 @@ fn agent_chat_session_sync_put_turn_summary_cache(
     else {
         return;
     };
-    let turn_key = turn_key.trim();
-    if turn_key.is_empty() {
+    let Some(cache_key) = agent_chat_session_sync_turn_artifact_cache_key(kind, turn_key) else {
         return;
-    }
+    };
     let Ok(mut cache) = agent_chat_session_sync_turn_summary_cache().lock() else {
         return;
     };
     {
         let session = cache.sessions.entry(session_key.clone()).or_default();
-        session.order.retain(|key| key != turn_key);
-        session.order.push_back(turn_key.to_string());
-        session.messages.insert(turn_key.to_string(), message);
+        session.order.retain(|key| key != &cache_key);
+        session.order.push_back(cache_key.clone());
+        session.messages.insert(cache_key, message);
         while session.order.len() > AGENT_CHAT_SESSION_SYNC_TURN_SUMMARY_CACHE_MAX {
             if let Some(oldest) = session.order.pop_front() {
                 session.messages.remove(&oldest);
@@ -205,6 +226,36 @@ fn agent_chat_session_sync_put_turn_summary_cache(
         }
     }
     agent_chat_session_sync_touch_turn_summary_cache_session(&mut cache, &session_key);
+}
+
+fn agent_chat_session_sync_put_turn_summary_cache(
+    provider: &str,
+    session_id: &str,
+    turn_key: &str,
+    message: Value,
+) {
+    agent_chat_session_sync_put_turn_artifact_cache(
+        provider,
+        session_id,
+        "turn_summary",
+        turn_key,
+        message,
+    );
+}
+
+fn agent_chat_session_sync_put_turn_diff_cache(
+    provider: &str,
+    session_id: &str,
+    turn_key: &str,
+    message: Value,
+) {
+    agent_chat_session_sync_put_turn_artifact_cache(
+        provider,
+        session_id,
+        "turn_diff",
+        turn_key,
+        agent_chat_session_sync_strip_turn_diff_message_patches(&message),
+    );
 }
 
 fn agent_chat_session_sync_cached_turn_summary_messages(
@@ -619,8 +670,8 @@ fn agent_chat_session_sync_subagent_has_explicit_sidechain(subagent: &Value) -> 
 }
 
 fn agent_chat_session_sync_canonical_kind(message: &Value, legacy_kind: &str) -> String {
-    if legacy_kind == "turn_summary" {
-        return "turn_summary".to_string();
+    if matches!(legacy_kind, "turn_summary" | "turn_diff") {
+        return legacy_kind.to_string();
     }
     if message
         .get("file_change")
@@ -869,10 +920,10 @@ fn agent_chat_session_sync_message_role(message: &Value) -> String {
 
 fn agent_chat_session_sync_normalize_kind_token(kind: &str) -> String {
     let kind = kind.trim().to_ascii_lowercase();
-    if kind == "turn-summary" {
-        "turn_summary".to_string()
-    } else {
-        kind
+    match kind.as_str() {
+        "turn-summary" => "turn_summary".to_string(),
+        "turn-diff" => "turn_diff".to_string(),
+        _ => kind,
     }
 }
 
@@ -881,6 +932,24 @@ fn agent_chat_session_sync_message_kind(message: &Value) -> String {
         &cloud_mcp_payload_text(message, &["kind", "type"])
             .unwrap_or_else(|| "message".to_string()),
     )
+}
+
+fn agent_chat_session_sync_strip_turn_diff_message_patches(message: &Value) -> Value {
+    let mut message = message.clone();
+    if agent_chat_session_sync_message_kind(&message) != "turn_diff" {
+        return message;
+    }
+    if let Some(files) = message
+        .get_mut("files")
+        .and_then(Value::as_array_mut)
+    {
+        for file in files {
+            if let Some(file_object) = file.as_object_mut() {
+                file_object.remove("patch");
+            }
+        }
+    }
+    message
 }
 
 fn agent_chat_session_sync_message_turn_id(message: &Value) -> String {
@@ -920,6 +989,7 @@ fn agent_chat_session_sync_message_status(message: &Value) -> String {
             | "patch"
             | "file"
             | "file_change"
+            | "turn_diff"
             | "subagent"
             | "reasoning"
             | "usage_report"
@@ -1080,10 +1150,13 @@ fn agent_chat_session_sync_thread_detail_diff_summaries(
     let mut total_additions = 0i64;
     let mut total_deletions = 0i64;
     for (index, message) in messages.iter().enumerate() {
+        let message_kind = agent_chat_session_sync_message_kind(message);
+        if message_kind == "turn_diff" {
+            continue;
+        }
         let Some(file_change) = agent_chat_session_sync_file_change_value(message) else {
             continue;
         };
-        let message_kind = agent_chat_session_sync_message_kind(message);
         let turn_id = agent_chat_session_sync_message_turn_id(message);
         if message_kind != "turn_summary"
             && !turn_id.trim().is_empty()
@@ -1432,9 +1505,12 @@ fn agent_chat_session_sync_usage_rollup_from_messages<'a>(
 
 fn agent_chat_session_sync_thread_usage_rollup(messages: &[Value]) -> Value {
     agent_chat_session_sync_usage_rollup_from_messages(
-        messages
-            .iter()
-            .filter(|message| agent_chat_session_sync_message_kind(message) != "turn_summary"),
+        messages.iter().filter(|message| {
+            !matches!(
+                agent_chat_session_sync_message_kind(message).as_str(),
+                "turn_summary" | "turn_diff"
+            )
+        }),
     )
 }
 
@@ -1521,6 +1597,16 @@ fn agent_chat_session_sync_thread_detail(
     model_id: &str,
     model_config: &Value,
 ) -> Value {
+    agent_chat_session_sync_thread_detail_with_options(source, context, model_id, model_config, false)
+}
+
+fn agent_chat_session_sync_thread_detail_with_options(
+    source: &AgentChatSessionSyncSource,
+    context: &AgentChatSessionSyncContext,
+    model_id: &str,
+    model_config: &Value,
+    strip_turn_diff_patches: bool,
+) -> Value {
     let mut effective_messages = source.thread_detail_messages.clone();
     agent_chat_session_sync_merge_cached_turn_summary_messages(
         &source.provider,
@@ -1529,7 +1615,14 @@ fn agent_chat_session_sync_thread_detail(
     );
     let thread_detail_messages = effective_messages
         .iter()
-        .map(agent_chat_session_sync_thread_detail_message)
+        .map(|message| {
+            let message = agent_chat_session_sync_thread_detail_message(message);
+            if strip_turn_diff_patches {
+                agent_chat_session_sync_strip_turn_diff_message_patches(&message)
+            } else {
+                message
+            }
+        })
         .collect::<Vec<_>>();
     let usage = agent_chat_session_sync_thread_usage_rollup(&effective_messages);
     let (diff_summaries, file_count, additions, deletions) =
@@ -1545,7 +1638,10 @@ fn agent_chat_session_sync_thread_detail(
     let mut artifact_count = 0usize;
 
     for (index, message) in thread_detail_messages.iter().enumerate() {
-        if agent_chat_session_sync_message_kind(message) == "turn_summary" {
+        if matches!(
+            agent_chat_session_sync_message_kind(message).as_str(),
+            "turn_summary" | "turn_diff"
+        ) {
             continue;
         }
         let role = agent_chat_session_sync_message_role(message);
@@ -1969,6 +2065,141 @@ fn agent_chat_session_sync_turn_summary_record(
         raw,
         vec![message],
     )
+}
+
+fn agent_chat_session_sync_turn_diff_started_at(diff: &AgentChatTurnDiffContext) -> String {
+    diff.raw
+        .get("hook")
+        .and_then(|hook| cloud_mcp_payload_text(hook, &["started_at", "startedAt"]))
+        .or_else(|| cloud_mcp_payload_text(&diff.raw, &["started_at", "startedAt"]))
+        .unwrap_or_default()
+}
+
+fn agent_chat_session_sync_turn_diff_message(
+    provider: &str,
+    session_id: &str,
+    diff: &AgentChatTurnDiffContext,
+) -> Value {
+    let turn_id = if diff.turn_id.trim().is_empty() {
+        diff.turn_key.as_str()
+    } else {
+        diff.turn_id.as_str()
+    };
+    let mut message = serde_json::Map::new();
+    message.insert(
+        "id".to_string(),
+        json!(format!("turn-diff:{provider}:{session_id}:{}", diff.turn_key)),
+    );
+    message.insert("role".to_string(), json!("system"));
+    message.insert("kind".to_string(), json!("turn_diff"));
+    message.insert("turn_id".to_string(), json!(turn_id));
+    let started_at = agent_chat_session_sync_turn_diff_started_at(diff);
+    if !started_at.trim().is_empty() {
+        message.insert("started_at".to_string(), json!(started_at.clone()));
+        message.insert("startedAt".to_string(), json!(started_at));
+    }
+    message.insert(
+        "completed_at".to_string(),
+        json!(diff.completed_at.clone()),
+    );
+    message.insert(
+        "completedAt".to_string(),
+        json!(diff.completed_at.clone()),
+    );
+    message.insert("files".to_string(), json!(diff.files.clone()));
+    message.insert("total_additions".to_string(), json!(diff.total_additions));
+    message.insert("total_deletions".to_string(), json!(diff.total_deletions));
+    if diff.files_omitted > 0 {
+        message.insert("files_omitted".to_string(), json!(diff.files_omitted));
+        message.insert("filesOmitted".to_string(), json!(diff.files_omitted));
+    }
+    if diff.truncated {
+        message.insert("truncated".to_string(), json!(true));
+    }
+    agent_chat_session_sync_normalize_message_value(Value::Object(message))
+}
+
+fn agent_chat_session_sync_turn_diff_record(
+    acked: &HashMap<String, String>,
+    provider: &str,
+    session_id: &str,
+    diff: &AgentChatTurnDiffContext,
+    message: Value,
+) -> Option<Value> {
+    let turn_key = diff.turn_key.trim();
+    if turn_key.is_empty() || diff.files.is_empty() {
+        return None;
+    }
+    let timestamp = if diff.completed_at.trim().is_empty() {
+        chrono_like_now_iso()
+    } else {
+        diff.completed_at.clone()
+    };
+    let message_hash = agent_chat_session_sync_hash(&message);
+    let mut raw = diff.raw.clone();
+    if let Some(object) = raw.as_object_mut() {
+        object.insert("message_hash".to_string(), json!(message_hash));
+    } else {
+        raw = json!({
+            "value": raw,
+            "message_hash": message_hash,
+        });
+    }
+    agent_chat_session_sync_record(
+        acked,
+        provider,
+        session_id,
+        format!("turn-diff:{provider}:{session_id}:{turn_key}"),
+        "turn_diff",
+        json!({
+            "synthetic": true,
+            "source_kind": "terminal_activity_hook_turn_diff",
+            "turn_key": turn_key,
+        }),
+        timestamp,
+        raw,
+        vec![message],
+    )
+}
+
+fn agent_chat_session_sync_apply_turn_diff(
+    source: &mut AgentChatSessionSyncSource,
+    diff: &AgentChatTurnDiffContext,
+    acked: &HashMap<String, String>,
+) {
+    if diff.turn_key.trim().is_empty() || diff.files.is_empty() {
+        return;
+    }
+    let message =
+        agent_chat_session_sync_turn_diff_message(&source.provider, &source.session_id, diff);
+    let message_id = agent_chat_session_sync_turn_summary_message_id(&message);
+    if !message_id.trim().is_empty() {
+        source.thread_detail_messages.retain(|existing| {
+            agent_chat_session_sync_turn_summary_message_id(existing) != message_id
+        });
+    }
+    agent_chat_session_sync_put_turn_diff_cache(
+        &source.provider,
+        &source.session_id,
+        &diff.turn_key,
+        message.clone(),
+    );
+    source.thread_detail_messages.push(message.clone());
+    if let Some(record) = agent_chat_session_sync_turn_diff_record(
+        acked,
+        &source.provider,
+        &source.session_id,
+        diff,
+        message,
+    ) {
+        source.records.push(record);
+    }
+    if !diff.completed_at.trim().is_empty()
+        && (source.latest_timestamp.trim().is_empty()
+            || source.latest_timestamp.as_str() < diff.completed_at.as_str())
+    {
+        source.latest_timestamp = diff.completed_at.clone();
+    }
 }
 
 fn agent_chat_session_sync_apply_turn_summary(
@@ -3215,6 +3446,22 @@ fn agent_chat_session_sync_record_is_synthetic_turn_summary(record: &Value) -> b
     record_kind == "turn_summary" && synthetic
 }
 
+fn agent_chat_session_sync_record_is_synthetic_turn_artifact(record: &Value) -> bool {
+    if agent_chat_session_sync_record_is_synthetic_turn_summary(record) {
+        return true;
+    }
+    let record_kind = agent_chat_session_sync_normalize_kind_token(
+        &cloud_mcp_payload_text(record, &["record_kind", "recordKind"]).unwrap_or_default(),
+    );
+    let synthetic = record
+        .get("source_cursor")
+        .or_else(|| record.get("sourceCursor"))
+        .and_then(|cursor| cursor.get("synthetic"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    synthetic && record_kind == "turn_diff"
+}
+
 fn agent_chat_session_sync_base_mode(
     changed_record_count: usize,
     changed_native_record_count: usize,
@@ -3449,6 +3696,16 @@ fn agent_chat_session_sync_payloads(
         );
         agent_chat_session_sync_apply_turn_summary(&mut source, summary, &acked);
     }
+    if let Some(diff) = context.turn_diff.as_ref() {
+        let acked = agent_chat_session_sync_acked_record_hashes(
+            &scope_key,
+            &device_id,
+            &workspace_id,
+            &source.provider,
+            &source.session_id,
+        );
+        agent_chat_session_sync_apply_turn_diff(&mut source, diff, &acked);
+    }
     agent_chat_session_sync_merge_cached_turn_summary_messages(
         &source.provider,
         &source.session_id,
@@ -3481,8 +3738,13 @@ fn agent_chat_session_sync_payloads(
         );
     }
     let model_id = agent_chat_session_sync_latest_model_id(&model_config, &source.model_id);
-    let thread_detail =
-        agent_chat_session_sync_thread_detail(&source, &context, &model_id, &model_config);
+    let thread_detail = agent_chat_session_sync_thread_detail_with_options(
+        &source,
+        &context,
+        &model_id,
+        &model_config,
+        true,
+    );
     let thread_detail_hash = agent_chat_session_sync_hash(&thread_detail);
     let metadata_hash = agent_chat_session_sync_hash(&json!({
         "provider": source.provider.as_str(),
@@ -3532,7 +3794,7 @@ fn agent_chat_session_sync_payloads(
     let changed_native_record_count = source
         .records
         .iter()
-        .filter(|record| !agent_chat_session_sync_record_is_synthetic_turn_summary(record))
+        .filter(|record| !agent_chat_session_sync_record_is_synthetic_turn_artifact(record))
         .count();
     let chunks = if changed_record_count == 0 {
         vec![Vec::new()]
@@ -3962,6 +4224,7 @@ fn agent_chat_session_sync_spawn_from_history_record(
         fork_from_provider_session_id: record.fork_from_provider_session_id.clone(),
         metadata_only: false,
         turn_summary: None,
+        turn_diff: None,
     };
     agent_chat_session_sync_spawn(
         app,
@@ -4402,6 +4665,7 @@ fn agent_chat_session_sync_spawn_from_payload_repair(
         .unwrap_or_default(),
         metadata_only: false,
         turn_summary: None,
+        turn_diff: None,
     };
     agent_chat_session_sync_spawn(app, provider, provider_session_id, cwd, context, reason);
     true
@@ -4518,6 +4782,43 @@ mod agent_chat_session_sync_tests {
         assert_eq!(agent_chat_session_sync_base_mode(1, 0, 0), "delta");
         assert_eq!(agent_chat_session_sync_base_mode(2, 1, 2), "delta");
         assert_eq!(agent_chat_session_sync_base_mode(3, 2, 2), "snapshot");
+    }
+
+    #[test]
+    fn agent_chat_session_sync_base_mode_ignores_all_synthetic_turn_artifacts_for_snapshot() {
+        let records = vec![
+            json!({
+                "record_kind": "response_item",
+                "source_cursor": { "synthetic": false }
+            }),
+            json!({
+                "record_kind": "turn_summary",
+                "source_cursor": { "synthetic": true }
+            }),
+            json!({
+                "recordKind": "turn_diff",
+                "sourceCursor": { "synthetic": true }
+            }),
+        ];
+        assert!(agent_chat_session_sync_record_is_synthetic_turn_artifact(
+            &records[1]
+        ));
+        assert!(agent_chat_session_sync_record_is_synthetic_turn_artifact(
+            &records[2]
+        ));
+        assert!(!agent_chat_session_sync_record_is_synthetic_turn_artifact(
+            &records[0]
+        ));
+        let changed_native_record_count = records
+            .iter()
+            .filter(|record| !agent_chat_session_sync_record_is_synthetic_turn_artifact(record))
+            .count();
+
+        assert_eq!(changed_native_record_count, 1);
+        assert_eq!(
+            agent_chat_session_sync_base_mode(records.len(), changed_native_record_count, 1),
+            "snapshot"
+        );
     }
 
     #[test]
@@ -4989,6 +5290,255 @@ mod agent_chat_session_sync_tests {
     }
 
     #[test]
+    fn agent_chat_session_sync_turn_diff_record_shape_and_identity_are_stable() {
+        let _guard = agent_chat_session_sync_test_lock();
+        let mut source = AgentChatSessionSyncSource {
+            provider: "codex".to_string(),
+            source_kind: "codex_jsonl".to_string(),
+            source_path: "/tmp/session.jsonl".to_string(),
+            session_id: "session-a".to_string(),
+            title: "Session A".to_string(),
+            cwd: "/tmp/workspace-a".to_string(),
+            latest_timestamp: "2026-07-02T00:00:00.000Z".to_string(),
+            model_id: "gpt-5.5".to_string(),
+            model_config: json!({}),
+            records: Vec::new(),
+            thread_detail_messages: Vec::new(),
+            total_record_count: 0,
+        };
+        let diff = AgentChatTurnDiffContext {
+            turn_id: "turn-a".to_string(),
+            turn_key: "turn-a".to_string(),
+            completed_at: "2026-07-02T00:00:03.000Z".to_string(),
+            raw: json!({
+                "hook": {
+                    "started_at": "2026-07-02T00:00:00.000Z",
+                    "completed_at": "2026-07-02T00:00:03.000Z"
+                },
+                "numstat": "2\t1\tsrc/lib.rs\n",
+                "name_status": "M\tsrc/lib.rs\n",
+                "generation": { "caps": { "record_truncated": false } }
+            }),
+            files: vec![json!({
+                "path": "src/lib.rs",
+                "kind": "edit",
+                "additions": 2,
+                "deletions": 1,
+                "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n-old\n+new\n+line\n"
+            })],
+            total_additions: 2,
+            total_deletions: 1,
+            files_omitted: 0,
+            truncated: false,
+        };
+
+        agent_chat_session_sync_apply_turn_diff(&mut source, &diff, &HashMap::new());
+
+        assert_eq!(source.records.len(), 1);
+        let record = &source.records[0];
+        assert_eq!(
+            record["record_key"],
+            json!("turn-diff:codex:session-a:turn-a")
+        );
+        assert_eq!(record["recordKind"], json!("turn_diff"));
+        assert_eq!(record["source_cursor"]["synthetic"], json!(true));
+        assert_eq!(record["source_cursor"]["turn_key"], json!("turn-a"));
+        assert_eq!(record["messages"].as_array().unwrap().len(), 1);
+        let message = &record["messages"][0];
+        assert_eq!(message["id"], json!("turn-diff:codex:session-a:turn-a"));
+        assert_eq!(message["role"], json!("system"));
+        assert_eq!(message["kind"], json!("turn_diff"));
+        assert_eq!(message["turn_id"], json!("turn-a"));
+        assert_eq!(
+            message["started_at"],
+            json!("2026-07-02T00:00:00.000Z")
+        );
+        assert_eq!(
+            message["completed_at"],
+            json!("2026-07-02T00:00:03.000Z")
+        );
+        assert_eq!(message["files"][0]["path"], json!("src/lib.rs"));
+        assert_eq!(message["total_additions"], json!(2));
+        assert_eq!(message["total_deletions"], json!(1));
+        assert!(record["raw"]["message_hash"].as_str().is_some());
+        assert_eq!(
+            source.thread_detail_messages.last().unwrap()["kind"],
+            json!("turn_diff")
+        );
+
+        let recaptured = AgentChatTurnDiffContext {
+            raw: json!({
+                "hook": {
+                    "started_at": "2026-07-02T00:00:00.000Z",
+                    "completed_at": "2026-07-02T00:00:03.000Z"
+                },
+                "numstat": "2\t1\tsrc/lib.rs\n",
+                "name_status": "M\tsrc/lib.rs\n",
+                "generation": { "caps": { "record_truncated": false }, "recapture": true }
+            }),
+            files: vec![json!({
+                "path": "src/lib.rs",
+                "kind": "edit",
+                "additions": 2,
+                "deletions": 1,
+                "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n-old\n+other\n+line\n"
+            })],
+            ..diff
+        };
+        let message = agent_chat_session_sync_turn_diff_message("codex", "session-a", &recaptured);
+        let recaptured_record = agent_chat_session_sync_turn_diff_record(
+            &HashMap::new(),
+            "codex",
+            "session-a",
+            &recaptured,
+            message,
+        )
+        .expect("recaptured turn diff");
+        assert_eq!(recaptured_record["record_key"], record["record_key"]);
+        assert_eq!(
+            recaptured_record["messages"][0]["id"],
+            record["messages"][0]["id"]
+        );
+        assert_ne!(recaptured_record["record_hash"], record["record_hash"]);
+    }
+
+    #[test]
+    fn agent_chat_session_sync_turn_diff_acked_hash_suppresses_unchanged_recapture() {
+        let _guard = agent_chat_session_sync_test_lock();
+        let diff = AgentChatTurnDiffContext {
+            turn_id: "turn-acked".to_string(),
+            turn_key: "turn-acked".to_string(),
+            completed_at: "2026-07-02T00:00:03.000Z".to_string(),
+            raw: json!({
+                "hook": {
+                    "started_at": "2026-07-02T00:00:00.000Z",
+                    "completed_at": "2026-07-02T00:00:03.000Z"
+                },
+                "numstat": "1\t0\tsrc/lib.rs\n",
+                "name_status": "M\tsrc/lib.rs\n",
+                "generation": { "caps": { "record_truncated": false } }
+            }),
+            files: vec![json!({
+                "path": "src/lib.rs",
+                "kind": "edit",
+                "additions": 1,
+                "deletions": 0,
+                "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n line\n+more\n"
+            })],
+            total_additions: 1,
+            total_deletions: 0,
+            files_omitted: 0,
+            truncated: false,
+        };
+        let message = agent_chat_session_sync_turn_diff_message("codex", "session-a", &diff);
+        let record = agent_chat_session_sync_turn_diff_record(
+            &HashMap::new(),
+            "codex",
+            "session-a",
+            &diff,
+            message.clone(),
+        )
+        .expect("initial turn diff");
+        let mut acked = HashMap::new();
+        acked.insert(
+            record["record_key"].as_str().unwrap().to_string(),
+            record["record_hash"].as_str().unwrap().to_string(),
+        );
+
+        assert!(agent_chat_session_sync_turn_diff_record(
+            &acked,
+            "codex",
+            "session-a",
+            &diff,
+            message,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn agent_chat_session_sync_turn_diff_strips_patches_only_from_cloud_thread_detail_and_cache() {
+        let _guard = agent_chat_session_sync_test_lock();
+        agent_chat_session_sync_clear_turn_summary_cache();
+        let mut source = AgentChatSessionSyncSource {
+            provider: "codex".to_string(),
+            source_kind: "codex_jsonl".to_string(),
+            source_path: "/tmp/session.jsonl".to_string(),
+            session_id: "session-strip".to_string(),
+            title: "Session Strip".to_string(),
+            cwd: "/tmp/workspace-a".to_string(),
+            latest_timestamp: "2026-07-02T00:00:00.000Z".to_string(),
+            model_id: "gpt-5.5".to_string(),
+            model_config: json!({}),
+            records: Vec::new(),
+            thread_detail_messages: Vec::new(),
+            total_record_count: 0,
+        };
+        let diff = AgentChatTurnDiffContext {
+            turn_id: "turn-strip".to_string(),
+            turn_key: "turn-strip".to_string(),
+            completed_at: "2026-07-02T00:00:03.000Z".to_string(),
+            raw: json!({
+                "hook": {
+                    "started_at": "2026-07-02T00:00:00.000Z",
+                    "completed_at": "2026-07-02T00:00:03.000Z"
+                },
+                "numstat": "1\t1\tsrc/lib.rs\n",
+                "name_status": "M\tsrc/lib.rs\n",
+                "generation": { "caps": { "record_truncated": false } }
+            }),
+            files: vec![json!({
+                "path": "src/lib.rs",
+                "kind": "edit",
+                "additions": 1,
+                "deletions": 1,
+                "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n",
+                "patch_truncated": true
+            })],
+            total_additions: 1,
+            total_deletions: 1,
+            files_omitted: 0,
+            truncated: true,
+        };
+
+        agent_chat_session_sync_apply_turn_diff(&mut source, &diff, &HashMap::new());
+
+        assert_eq!(
+            source.records[0]["messages"][0]["files"][0]["patch"],
+            json!("--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n")
+        );
+        assert!(source.thread_detail_messages[0]["files"][0]
+            .get("patch")
+            .is_some());
+        let local_detail = agent_chat_session_sync_thread_detail(
+            &source,
+            &AgentChatSessionSyncContext::default(),
+            "gpt-5.5",
+            &json!({}),
+        );
+        assert!(local_detail["messages"][0]["files"][0]
+            .get("patch")
+            .is_some());
+        let cloud_detail = agent_chat_session_sync_thread_detail_with_options(
+            &source,
+            &AgentChatSessionSyncContext::default(),
+            "gpt-5.5",
+            &json!({}),
+            true,
+        );
+        assert!(cloud_detail["messages"][0]["files"][0]
+            .get("patch")
+            .is_none());
+        assert_eq!(
+            cloud_detail["messages"][0]["files"][0]["patch_truncated"],
+            json!(true)
+        );
+        let cached = agent_chat_session_sync_cached_turn_summary_messages("codex", "session-strip");
+        assert_eq!(cached.len(), 1);
+        assert!(cached[0]["files"][0].get("patch").is_none());
+        assert_eq!(cached[0]["files"][0]["patch_truncated"], json!(true));
+    }
+
+    #[test]
     fn agent_chat_session_sync_cached_turn_summary_survives_projection_rebuild() {
         let _guard = agent_chat_session_sync_test_lock();
         agent_chat_session_sync_clear_turn_summary_cache();
@@ -5023,6 +5573,32 @@ mod agent_chat_session_sync_tests {
         };
 
         agent_chat_session_sync_apply_turn_summary(&mut source, &summary, &HashMap::new());
+        let diff = AgentChatTurnDiffContext {
+            turn_id: "turn-cache".to_string(),
+            turn_key: "turn-cache".to_string(),
+            completed_at: "2026-07-02T00:00:03.000Z".to_string(),
+            raw: json!({
+                "hook": {
+                    "started_at": "2026-07-02T00:00:00.000Z",
+                    "completed_at": "2026-07-02T00:00:03.000Z"
+                },
+                "numstat": "1\t0\tsrc/lib.rs\n",
+                "name_status": "M\tsrc/lib.rs\n",
+                "generation": { "caps": { "record_truncated": false } }
+            }),
+            files: vec![json!({
+                "path": "src/lib.rs",
+                "kind": "edit",
+                "additions": 1,
+                "deletions": 0,
+                "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n line\n+more\n"
+            })],
+            total_additions: 1,
+            total_deletions: 0,
+            files_omitted: 0,
+            truncated: false,
+        };
+        agent_chat_session_sync_apply_turn_diff(&mut source, &diff, &HashMap::new());
         let rebuilt_source = AgentChatSessionSyncSource {
             records: Vec::new(),
             thread_detail_messages: vec![json!({
@@ -5048,6 +5624,13 @@ mod agent_chat_session_sync_tests {
                 .unwrap()
                 .iter()
                 .any(|message| message["kind"] == json!("turn_summary"))
+        );
+        assert!(
+            detail["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| message["kind"] == json!("turn_diff"))
         );
     }
 
@@ -5479,6 +6062,85 @@ mod agent_chat_session_sync_tests {
                 .iter()
                 .any(|item| item["id"].as_str() == Some("summary-edit"))
         );
+    }
+
+    #[test]
+    fn agent_chat_session_sync_thread_detail_ignores_turn_diff_in_file_totals() {
+        let source = AgentChatSessionSyncSource {
+            provider: "codex".to_string(),
+            source_kind: "codex_jsonl".to_string(),
+            source_path: "/tmp/session.jsonl".to_string(),
+            session_id: "session-a".to_string(),
+            title: "Session A".to_string(),
+            cwd: "/tmp/workspace-a".to_string(),
+            latest_timestamp: "2026-06-30T00:00:00Z".to_string(),
+            model_id: "gpt-5.5".to_string(),
+            model_config: json!({}),
+            records: Vec::new(),
+            thread_detail_messages: vec![
+                json!({
+                    "id": "summary-edit",
+                    "role": "system",
+                    "kind": "turn_summary",
+                    "turn_id": "turn-1",
+                    "started_at": "2026-06-30T00:00:00Z",
+                    "completed_at": "2026-06-30T00:00:30Z",
+                    "file_change": {
+                        "files": [
+                            { "path": "src/lib.rs", "kind": "edit", "additions": 2, "deletions": 1 }
+                        ],
+                        "summary": "summary edit"
+                    }
+                }),
+                json!({
+                    "id": "turn-diff",
+                    "role": "system",
+                    "kind": "turn-diff",
+                    "turn_id": "turn-1",
+                    "files": [
+                        { "path": "src/lib.rs", "kind": "edit", "additions": 2, "deletions": 1, "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n" }
+                    ],
+                    "file_change": {
+                        "files": [
+                            { "path": "src/lib.rs", "kind": "edit", "additions": 99, "deletions": 99 }
+                        ],
+                        "summary": "must be ignored"
+                    },
+                    "total_additions": 2,
+                    "total_deletions": 1,
+                    "usage": { "input_tokens": 100 }
+                }),
+            ],
+            total_record_count: 2,
+        };
+
+        let detail = agent_chat_session_sync_thread_detail(
+            &source,
+            &AgentChatSessionSyncContext::default(),
+            "gpt-5.5",
+            &json!({}),
+        );
+        let messages = detail["messages"].as_array().expect("messages");
+        let turn_diff = messages
+            .iter()
+            .find(|message| message["id"] == json!("turn-diff"))
+            .expect("turn diff message");
+        assert_eq!(turn_diff["kind"], json!("turn_diff"));
+        assert_eq!(turn_diff["canonical_kind"], json!("turn_diff"));
+        assert_eq!(detail["diffSummaries"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            detail["diffSummaries"][0]["messageId"],
+            json!("summary-edit")
+        );
+        assert_eq!(detail["stats"]["fileCount"], json!(1));
+        assert_eq!(detail["stats"]["additions"], json!(2));
+        assert_eq!(detail["stats"]["deletions"], json!(1));
+        assert!(detail["stats"]["usage"]["input_tokens"].is_null());
+        assert!(!detail["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == json!("turn-diff")));
     }
 
     #[test]

@@ -28483,6 +28483,65 @@ fn cloud_mcp_workspace_panel_kind(panel: &Value) -> Option<String> {
     }
 }
 
+// Level 1 remote PCB/Video project management: the frontend catalog snapshot
+// carries per-workspace `pcb_projects` / `video_projects` rows. The workspace
+// snapshot normalization below is an explicit whitelist, so pass these arrays
+// through with their pinned snake_case shape ({ id, name, path,
+// updated_at_ms? }), dedupe by path, and cap the list so the cloud payload
+// stays small.
+const CLOUD_MCP_WORKSPACE_PROJECT_LIMIT: usize = 50;
+const CLOUD_MCP_WORKSPACE_PROJECT_TEXT_LIMIT: usize = 256;
+const CLOUD_MCP_WORKSPACE_PROJECT_PATH_LIMIT: usize = 1024;
+
+fn cloud_mcp_workspace_project_rows(workspace: &Value, keys: &[&str]) -> Vec<Value> {
+    let clean_text = |value: String, limit: usize| -> String {
+        value.trim().chars().take(limit).collect::<String>()
+    };
+    let mut rows = Vec::new();
+    let mut seen_paths = std::collections::BTreeSet::new();
+    for item in cloud_mcp_payload_items(workspace, keys, CLOUD_MCP_WORKSPACE_PROJECT_LIMIT) {
+        if !item.is_object() {
+            continue;
+        }
+        let Some(path) = cloud_mcp_payload_text(
+            &item,
+            &["path", "project_path", "projectPath", "board_path", "boardPath"],
+        )
+        .map(|value| clean_text(value, CLOUD_MCP_WORKSPACE_PROJECT_PATH_LIMIT))
+        .filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        if !seen_paths.insert(path.clone()) {
+            continue;
+        }
+        let id = cloud_mcp_payload_text(
+            &item,
+            &["id", "project_id", "projectId", "board_id", "boardId"],
+        )
+        .map(|value| clean_text(value, CLOUD_MCP_WORKSPACE_PROJECT_TEXT_LIMIT))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| path.clone());
+        let name = cloud_mcp_payload_text(&item, &["name", "project_name", "projectName", "title"])
+            .map(|value| clean_text(value, CLOUD_MCP_WORKSPACE_PROJECT_TEXT_LIMIT))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| id.clone());
+        let mut row = json!({
+            "id": id,
+            "name": name,
+            "path": path,
+        });
+        if let Some(updated_at_ms) =
+            cloud_mcp_payload_u64(&item, &["updated_at_ms", "updatedAtMs"])
+        {
+            if let Some(object) = row.as_object_mut() {
+                object.insert("updated_at_ms".to_string(), json!(updated_at_ms));
+            }
+        }
+        rows.push(row);
+    }
+    rows
+}
+
 fn cloud_mcp_workspace_panel_is_last_known(panel: &Value) -> bool {
     cloud_mcp_payload_bool(panel, &["last_known_runtime"], false)
         || cloud_mcp_payload_bool(panel, &["lastKnownRuntime"], false)
@@ -33028,6 +33087,10 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
 
         let (workspace_runtime_seq, workspace_runtime_epoch) =
             cloud_mcp_workspace_runtime_ordering(state, workspace);
+        let pcb_projects =
+            cloud_mcp_workspace_project_rows(workspace, &["pcb_projects", "pcbProjects"]);
+        let video_projects =
+            cloud_mcp_workspace_project_rows(workspace, &["video_projects", "videoProjects"]);
         let servers = cloud_mcp_normalize_workspace_mcp_servers_for_snapshot(workspace);
         let workspace_order = cloud_mcp_payload_u64(
             workspace,
@@ -33122,6 +33185,8 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
             "last_known_panel_fallback": panel_list_last_known_fallback,
             "lastKnownPanelFallback": panel_list_last_known_fallback,
             "panels": panels,
+            "pcb_projects": pcb_projects,
+            "video_projects": video_projects,
             "servers": servers.clone(),
             "mcps": servers,
             "terminals": terminals,
@@ -33276,6 +33341,7 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
         "platform": device_profile["platform"].clone(),
         "form_factor": device_profile["form_factor"].clone(),
         "client_kind": device_profile["client_kind"].clone(),
+        "app_update": app_update_device_payload(),
         "agent_id": "rust-diffforge",
         "agent_label": "Diff Forge Desktop",
         "reason": reason,
@@ -34009,7 +34075,15 @@ struct CloudMcpAgentChatTurnGitSnapshot {
 
 struct CloudMcpAgentChatTurnGitDiff {
     file_change: Option<Value>,
+    turn_diff: Option<AgentChatTurnDiffContext>,
     raw: Value,
+}
+
+#[derive(Clone, Default)]
+struct CloudMcpAgentChatTurnGitStatusEntry {
+    status: String,
+    path: String,
+    old_path: Option<String>,
 }
 
 #[derive(Clone)]
@@ -34035,6 +34109,10 @@ static CLOUD_MCP_AGENT_CHAT_TURN_GIT_SNAPSHOTS: OnceLock<(
 static CLOUD_MCP_AGENT_CHAT_TURN_GIT_TEMP_INDEX_SEQ: AtomicU64 = AtomicU64::new(1);
 const CLOUD_MCP_AGENT_CHAT_TURN_GIT_SNAPSHOT_MAX: usize = 512;
 const CLOUD_MCP_AGENT_CHAT_TURN_GIT_SNAPSHOT_TTL_MS: u64 = 6 * 60 * 60 * 1000;
+const CLOUD_MCP_AGENT_CHAT_TURN_DIFF_PATCH_MAX_CHARS: usize = 48_000;
+const CLOUD_MCP_AGENT_CHAT_TURN_DIFF_MESSAGES_MAX_BYTES: usize = 384 * 1024;
+const CLOUD_MCP_AGENT_CHAT_TURN_DIFF_MESSAGES_CAP_HEADROOM_BYTES: usize = 4 * 1024;
+const CLOUD_MCP_AGENT_CHAT_TURN_DIFF_PATCH_TIMEOUT_MS: u64 = 3_000;
 
 fn cloud_mcp_agent_chat_turn_git_snapshots() -> &'static (
     StdMutex<HashMap<String, CloudMcpAgentChatTurnGitSnapshotState>>,
@@ -34172,10 +34250,21 @@ fn cloud_mcp_agent_chat_turn_git_run(
     args: &[&str],
     index_path: Option<&Path>,
 ) -> Result<CommandCapture, String> {
+    cloud_mcp_agent_chat_turn_git_run_with_timeout(root, args, index_path, Duration::from_secs(2))
+}
+
+fn cloud_mcp_agent_chat_turn_git_run_with_timeout(
+    root: &Path,
+    args: &[&str],
+    index_path: Option<&Path>,
+    timeout: Duration,
+) -> Result<CommandCapture, String> {
     let safe_directory = format!("safe.directory={}", root.to_string_lossy());
-    let mut owned_args = Vec::with_capacity(args.len() + 2);
+    let mut owned_args = Vec::with_capacity(args.len() + 4);
     owned_args.push("-c".to_string());
     owned_args.push(safe_directory);
+    owned_args.push("-c".to_string());
+    owned_args.push("core.quotepath=off".to_string());
     owned_args.extend(args.iter().map(|arg| (*arg).to_string()));
     let borrowed_args = owned_args.iter().map(String::as_str).collect::<Vec<_>>();
     let env_vars = cloud_mcp_agent_chat_turn_git_env(index_path);
@@ -34183,7 +34272,7 @@ fn cloud_mcp_agent_chat_turn_git_run(
         "git",
         &borrowed_args,
         None,
-        Duration::from_secs(2),
+        timeout,
         Some(root),
         &env_vars,
     )
@@ -34501,17 +34590,70 @@ fn cloud_mcp_agent_chat_turn_git_clear_all_snapshots() {
     }
 }
 
-fn cloud_mcp_agent_chat_turn_git_name_status_map(name_status: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
+fn cloud_mcp_agent_chat_turn_git_name_status_entries(
+    name_status: &str,
+) -> Vec<CloudMcpAgentChatTurnGitStatusEntry> {
+    let mut entries = Vec::new();
     for line in name_status.lines() {
-        let mut parts = line.split('\t');
-        let status = parts.next().unwrap_or_default().to_string();
-        let path = parts.last().unwrap_or_default().trim().to_string();
+        let parts = line.split('\t').collect::<Vec<_>>();
+        let status = parts.first().copied().unwrap_or_default().trim();
+        if status.is_empty() {
+            continue;
+        }
+        let (path, old_path) = if status.starts_with('R') || status.starts_with('C') {
+            (
+                parts.get(2).copied().unwrap_or_default().trim().to_string(),
+                parts.get(1).copied().map(str::trim).filter(|value| !value.is_empty()).map(str::to_string),
+            )
+        } else {
+            (
+                parts.get(1).copied().unwrap_or_default().trim().to_string(),
+                None,
+            )
+        };
         if !path.is_empty() {
-            map.insert(path, status);
+            entries.push(CloudMcpAgentChatTurnGitStatusEntry {
+                status: status.to_string(),
+                path,
+                old_path,
+            });
         }
     }
-    map
+    entries
+}
+
+fn cloud_mcp_agent_chat_turn_git_name_status_map(
+    name_status: &str,
+) -> HashMap<String, CloudMcpAgentChatTurnGitStatusEntry> {
+    cloud_mcp_agent_chat_turn_git_name_status_entries(name_status)
+        .into_iter()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect()
+}
+
+fn cloud_mcp_agent_chat_turn_git_numstat_rename_path(path: &str) -> Option<String> {
+    let path = path.trim();
+    if path.is_empty() || !path.contains("=>") {
+        return None;
+    }
+    if let Some(arrow) = path.find("=>") {
+        if let Some(open) = path[..arrow].rfind('{') {
+            if let Some(close_offset) = path[arrow + 2..].find('}') {
+                let close = arrow + 2 + close_offset;
+                let base = path[..open].trim_end();
+                let renamed = path[arrow + 2..close].trim();
+                let suffix = path[close + 1..].trim_start();
+                if !renamed.is_empty() {
+                    return Some(format!("{base}{renamed}{suffix}"));
+                }
+            }
+        }
+        let renamed = path[arrow + 2..].trim();
+        if !renamed.is_empty() {
+            return Some(renamed.to_string());
+        }
+    }
+    None
 }
 
 fn cloud_mcp_agent_chat_turn_git_parse_numstat(
@@ -34520,23 +34662,45 @@ fn cloud_mcp_agent_chat_turn_git_parse_numstat(
     name_status: &str,
 ) -> Vec<Value> {
     let status_by_path = cloud_mcp_agent_chat_turn_git_name_status_map(name_status);
+    let status_entries = cloud_mcp_agent_chat_turn_git_name_status_entries(name_status);
     let mut files = Vec::new();
-    for line in numstat.lines() {
+    for (line_index, line) in numstat.lines().enumerate() {
         let mut parts = line.splitn(3, '\t');
         let additions_text = parts.next().unwrap_or_default().trim();
         let deletions_text = parts.next().unwrap_or_default().trim();
-        let path = parts.next().unwrap_or_default().trim();
+        let raw_path = parts.next().unwrap_or_default().trim();
+        let mut path = raw_path.to_string();
         if path.is_empty() {
             continue;
         }
+        if !status_by_path.contains_key(&path) {
+            if let Some(rename_path) = cloud_mcp_agent_chat_turn_git_numstat_rename_path(&path) {
+                path = rename_path;
+            }
+        }
+        let mut status_entry = status_by_path.get(&path).cloned();
+        if status_entry.is_none() {
+            if let Some(entry) = status_entries.get(line_index) {
+                if entry.status.starts_with('R')
+                    || entry.status.starts_with('C')
+                    || raw_path.contains("=>")
+                {
+                    path = entry.path.clone();
+                    status_entry = Some(entry.clone());
+                }
+            }
+        }
         let additions = additions_text.parse::<i64>().ok();
         let deletions = deletions_text.parse::<i64>().ok();
-        let status = status_by_path
-            .get(path)
-            .map(String::as_str)
+        let binary = additions.is_none() || deletions.is_none();
+        let status = status_entry
+            .as_ref()
+            .map(|entry| entry.status.as_str())
             .unwrap_or_default();
-        let missing_path = !repo_root.join(path).exists();
-        let kind = if status.starts_with('A') {
+        let missing_path = !repo_root.join(&path).exists();
+        let kind = if status.starts_with('R') {
+            "rename"
+        } else if status.starts_with('A') || status.starts_with('C') {
             "create"
         } else if status.starts_with('D')
             || (missing_path && additions.unwrap_or(0) == 0 && deletions.unwrap_or(0) >= 0)
@@ -34548,23 +34712,304 @@ fn cloud_mcp_agent_chat_turn_git_parse_numstat(
         let mut file = serde_json::Map::new();
         file.insert("path".to_string(), json!(path));
         file.insert("kind".to_string(), json!(kind));
-        if let Some(additions) = additions {
-            file.insert("additions".to_string(), json!(additions));
+        if let Some(old_path) = status_entry
+            .as_ref()
+            .and_then(|entry| entry.old_path.as_ref())
+            .filter(|old_path| !old_path.trim().is_empty())
+        {
+            file.insert("old_path".to_string(), json!(old_path));
         }
-        if let Some(deletions) = deletions {
-            file.insert("deletions".to_string(), json!(deletions));
+        file.insert("additions".to_string(), json!(additions.unwrap_or(0)));
+        file.insert("deletions".to_string(), json!(deletions.unwrap_or(0)));
+        if binary {
+            file.insert("binary".to_string(), json!(true));
         }
         files.push(Value::Object(file));
     }
     files
 }
 
+fn cloud_mcp_agent_chat_turn_git_diff_header_path(raw: &str) -> Option<String> {
+    let mut path = raw.trim();
+    if path == "/dev/null" || path.is_empty() {
+        return None;
+    }
+    if let Some(stripped) = path.strip_prefix("a/").or_else(|| path.strip_prefix("b/")) {
+        path = stripped;
+    }
+    Some(path.trim_matches('"').to_string())
+}
+
+fn cloud_mcp_agent_chat_turn_git_patch_section_path(section: &str) -> Option<String> {
+    let mut deleted_path = None;
+    for line in section.lines() {
+        if line.starts_with("@@ ") {
+            break;
+        }
+        if let Some(path) = line.strip_prefix("+++ ") {
+            if let Some(path) = cloud_mcp_agent_chat_turn_git_diff_header_path(path) {
+                return Some(path);
+            }
+        } else if let Some(path) = line.strip_prefix("--- ") {
+            deleted_path = cloud_mcp_agent_chat_turn_git_diff_header_path(path);
+        }
+    }
+    deleted_path
+}
+
+fn cloud_mcp_agent_chat_turn_git_unified_patch(section: &str) -> Option<String> {
+    let start = section
+        .find("\n--- ")
+        .map(|index| index + 1)
+        .or_else(|| section.find("--- "))?;
+    let patch = section[start..].to_string();
+    if patch.contains("\n@@ ") || patch.starts_with("@@ ") {
+        Some(patch)
+    } else {
+        None
+    }
+}
+
+fn cloud_mcp_agent_chat_turn_git_patch_map(patch_output: &str) -> HashMap<String, String> {
+    let mut patches = HashMap::new();
+    let mut section = String::new();
+    let flush = |section: &mut String, patches: &mut HashMap<String, String>| {
+        if section.trim().is_empty() {
+            section.clear();
+            return;
+        }
+        if let (Some(path), Some(patch)) = (
+            cloud_mcp_agent_chat_turn_git_patch_section_path(section),
+            cloud_mcp_agent_chat_turn_git_unified_patch(section),
+        ) {
+            patches.insert(path, patch);
+        }
+        section.clear();
+    };
+    for chunk in patch_output.split_inclusive('\n') {
+        if chunk.starts_with("diff --git ") {
+            flush(&mut section, &mut patches);
+        }
+        section.push_str(chunk);
+    }
+    flush(&mut section, &mut patches);
+    patches
+}
+
+fn cloud_mcp_agent_chat_turn_diff_totals(files: &[Value]) -> (i64, i64) {
+    let total_additions = files
+        .iter()
+        .filter_map(|file| file.get("additions").and_then(Value::as_i64))
+        .sum::<i64>();
+    let total_deletions = files
+        .iter()
+        .filter_map(|file| file.get("deletions").and_then(Value::as_i64))
+        .sum::<i64>();
+    (total_additions, total_deletions)
+}
+
+fn cloud_mcp_agent_chat_turn_diff_message(
+    files: &[Value],
+    files_omitted: usize,
+    truncated: bool,
+    total_additions: i64,
+    total_deletions: i64,
+) -> Value {
+    let mut message = json!({
+        "id": "cap-check",
+        "role": "system",
+        "kind": "turn_diff",
+        "turn_id": "cap-check",
+        "files": files,
+        "total_additions": total_additions,
+        "total_deletions": total_deletions,
+    });
+    if files_omitted > 0 {
+        if let Some(object) = message.as_object_mut() {
+            object.insert("files_omitted".to_string(), json!(files_omitted));
+            object.insert("filesOmitted".to_string(), json!(files_omitted));
+        }
+    }
+    if truncated {
+        if let Some(object) = message.as_object_mut() {
+            object.insert("truncated".to_string(), json!(true));
+        }
+    }
+    message
+}
+
+fn cloud_mcp_agent_chat_turn_diff_messages_effective_max_bytes() -> usize {
+    CLOUD_MCP_AGENT_CHAT_TURN_DIFF_MESSAGES_MAX_BYTES
+        .saturating_sub(CLOUD_MCP_AGENT_CHAT_TURN_DIFF_MESSAGES_CAP_HEADROOM_BYTES)
+}
+
+fn cloud_mcp_agent_chat_turn_diff_messages_bytes(
+    files: &[Value],
+    files_omitted: usize,
+    truncated: bool,
+    total_additions: i64,
+    total_deletions: i64,
+) -> usize {
+    serde_json::to_vec(&vec![cloud_mcp_agent_chat_turn_diff_message(
+        files,
+        files_omitted,
+        truncated,
+        total_additions,
+        total_deletions,
+    )])
+    .map(|bytes| bytes.len())
+    .unwrap_or(usize::MAX)
+}
+
+fn cloud_mcp_agent_chat_turn_git_attach_patches(
+    files: Vec<Value>,
+    patches: &HashMap<String, String>,
+) -> (Vec<Value>, i64, i64, usize, bool, Value) {
+    let original_file_count = files.len();
+    let (total_additions, total_deletions) = cloud_mcp_agent_chat_turn_diff_totals(&files);
+    let mut files = files;
+    let mut per_file_truncated = 0usize;
+    for file in files.iter_mut() {
+        let binary = file
+            .get("binary")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if binary {
+            continue;
+        }
+        let Some(path) = file.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(patch) = patches.get(path) else {
+            continue;
+        };
+        let truncated = patch.chars().count() > CLOUD_MCP_AGENT_CHAT_TURN_DIFF_PATCH_MAX_CHARS;
+        let patch = if truncated {
+            per_file_truncated = per_file_truncated.saturating_add(1);
+            cloud_mcp_truncate_chars(patch, CLOUD_MCP_AGENT_CHAT_TURN_DIFF_PATCH_MAX_CHARS)
+        } else {
+            patch.clone()
+        };
+        if let Some(object) = file.as_object_mut() {
+            object.insert("patch".to_string(), json!(patch));
+            if truncated {
+                object.insert("patch_truncated".to_string(), json!(true));
+            }
+        }
+    }
+
+    let mut record_truncated = per_file_truncated > 0;
+    let mut patches_dropped = 0usize;
+    let effective_messages_max = cloud_mcp_agent_chat_turn_diff_messages_effective_max_bytes();
+    while cloud_mcp_agent_chat_turn_diff_messages_bytes(
+        &files,
+        0,
+        record_truncated,
+        total_additions,
+        total_deletions,
+    ) > effective_messages_max
+    {
+        let largest = files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, file)| {
+                file.get("patch")
+                    .and_then(Value::as_str)
+                    .map(|patch| (index, patch.chars().count()))
+            })
+            .max_by_key(|(_, len)| *len);
+        let Some((index, _)) = largest else {
+            break;
+        };
+        if let Some(object) = files.get_mut(index).and_then(Value::as_object_mut) {
+            object.remove("patch");
+            object.insert("patch_truncated".to_string(), json!(true));
+            patches_dropped = patches_dropped.saturating_add(1);
+            record_truncated = true;
+        } else {
+            break;
+        }
+    }
+
+    let mut files_omitted = 0usize;
+    let mut final_bytes = cloud_mcp_agent_chat_turn_diff_messages_bytes(
+        &files,
+        files_omitted,
+        record_truncated,
+        total_additions,
+        total_deletions,
+    );
+    if final_bytes > effective_messages_max {
+        record_truncated = true;
+        let mut low = 0usize;
+        let mut high = files.len();
+        while low < high {
+            let keep = low + (high - low).div_ceil(2);
+            let omitted = original_file_count.saturating_sub(keep);
+            let candidate_bytes = cloud_mcp_agent_chat_turn_diff_messages_bytes(
+                &files[..keep],
+                omitted,
+                record_truncated,
+                total_additions,
+                total_deletions,
+            );
+            if candidate_bytes <= effective_messages_max {
+                low = keep;
+            } else {
+                high = keep.saturating_sub(1);
+            }
+        }
+        files.truncate(low);
+        files_omitted = original_file_count.saturating_sub(files.len());
+        final_bytes = cloud_mcp_agent_chat_turn_diff_messages_bytes(
+            &files,
+            files_omitted,
+            record_truncated,
+            total_additions,
+            total_deletions,
+        );
+    }
+    (
+        files,
+        total_additions,
+        total_deletions,
+        files_omitted,
+        record_truncated,
+        json!({
+            "per_file_patch_chars": CLOUD_MCP_AGENT_CHAT_TURN_DIFF_PATCH_MAX_CHARS,
+            "serialized_messages_bytes": final_bytes,
+            "serialized_messages_limit_bytes": CLOUD_MCP_AGENT_CHAT_TURN_DIFF_MESSAGES_MAX_BYTES,
+            "serialized_messages_effective_limit_bytes": effective_messages_max,
+            "serialized_messages_cap_headroom_bytes": CLOUD_MCP_AGENT_CHAT_TURN_DIFF_MESSAGES_CAP_HEADROOM_BYTES,
+            "original_file_count": original_file_count,
+            "files_emitted": original_file_count.saturating_sub(files_omitted),
+            "files_omitted": files_omitted,
+            "per_file_patches_truncated": per_file_truncated,
+            "patches_dropped_for_record_cap": patches_dropped,
+            "files_dropped_for_record_cap": files_omitted,
+            "files_omitted_for_record_cap": files_omitted,
+            "record_truncated": record_truncated,
+        }),
+    )
+}
+
 fn cloud_mcp_agent_chat_turn_git_diff(
     snapshot: Option<CloudMcpAgentChatTurnGitSnapshot>,
+) -> CloudMcpAgentChatTurnGitDiff {
+    cloud_mcp_agent_chat_turn_git_diff_with_patch_timeout(
+        snapshot,
+        Duration::from_millis(CLOUD_MCP_AGENT_CHAT_TURN_DIFF_PATCH_TIMEOUT_MS),
+    )
+}
+
+fn cloud_mcp_agent_chat_turn_git_diff_with_patch_timeout(
+    snapshot: Option<CloudMcpAgentChatTurnGitSnapshot>,
+    patch_timeout: Duration,
 ) -> CloudMcpAgentChatTurnGitDiff {
     let Some(snapshot) = snapshot else {
         return CloudMcpAgentChatTurnGitDiff {
             file_change: None,
+            turn_diff: None,
             raw: json!({
                 "skipped": "missing_start_snapshot",
             }),
@@ -34573,6 +35018,7 @@ fn cloud_mcp_agent_chat_turn_git_diff(
     let Some(end_tree) = cloud_mcp_agent_chat_turn_git_snapshot_tree(&snapshot.repo_root) else {
         return CloudMcpAgentChatTurnGitDiff {
             file_change: None,
+            turn_diff: None,
             raw: json!({
                 "repo_root": snapshot.repo_root.to_string_lossy(),
                 "start_tree": snapshot.start_tree,
@@ -34585,6 +35031,7 @@ fn cloud_mcp_agent_chat_turn_git_diff(
         &[
             "diff-tree",
             "-r",
+            "--find-renames",
             "--numstat",
             &snapshot.start_tree,
             &end_tree,
@@ -34600,6 +35047,7 @@ fn cloud_mcp_agent_chat_turn_git_diff(
         &[
             "diff-tree",
             "-r",
+            "--find-renames",
             "--name-status",
             &snapshot.start_tree,
             &end_tree,
@@ -34608,8 +35056,8 @@ fn cloud_mcp_agent_chat_turn_git_diff(
     )
     .ok()
     .filter(|output| output.exit_code == Some(0))
-    .map(|output| output.stdout)
-    .unwrap_or_default();
+        .map(|output| output.stdout)
+        .unwrap_or_default();
     let files =
         cloud_mcp_agent_chat_turn_git_parse_numstat(&snapshot.repo_root, &numstat, &name_status);
     let additions = files
@@ -34622,19 +35070,90 @@ fn cloud_mcp_agent_chat_turn_git_diff(
         .sum::<i64>();
     let file_change = (!files.is_empty()).then(|| {
         json!({
-            "files": files,
+            "files": files.clone(),
             "summary": format!("{} file{} changed (+{} -{})", files.len(), if files.len() == 1 { "" } else { "s" }, additions, deletions),
         })
     });
+    let mut patch_skip_reason = None::<String>;
+    let mut patch_error = None::<String>;
+    let patches = if files.is_empty() {
+        HashMap::new()
+    } else if patch_timeout == Duration::from_millis(0) {
+        patch_skip_reason = Some("timeout".to_string());
+        HashMap::new()
+    } else {
+        match cloud_mcp_agent_chat_turn_git_run_with_timeout(
+            &snapshot.repo_root,
+            &[
+                "diff-tree",
+                "-r",
+                "--find-renames",
+                "-p",
+                &snapshot.start_tree,
+                &end_tree,
+            ],
+            None,
+            patch_timeout,
+        ) {
+            Ok(output) if output.exit_code == Some(0) => {
+                cloud_mcp_agent_chat_turn_git_patch_map(&output.stdout)
+            }
+            Ok(output) => {
+                patch_skip_reason = Some("patch_command_failed".to_string());
+                patch_error = Some(clean_terminal_telemetry_text(&output.stderr));
+                HashMap::new()
+            }
+            Err(error) => {
+                patch_skip_reason = Some(if error.contains("timed out") {
+                    "timeout".to_string()
+                } else {
+                    "patch_command_failed".to_string()
+                });
+                patch_error = Some(clean_terminal_telemetry_text(&error));
+                HashMap::new()
+            }
+        }
+    };
+    let (
+        turn_diff_files,
+        turn_diff_total_additions,
+        turn_diff_total_deletions,
+        turn_diff_files_omitted,
+        turn_diff_truncated,
+        caps,
+    ) =
+        cloud_mcp_agent_chat_turn_git_attach_patches(files.clone(), &patches);
+    let patch_generation = json!({
+        "patch_timeout_ms": u64::try_from(patch_timeout.as_millis()).unwrap_or(u64::MAX),
+        "patch_skipped": patch_skip_reason.is_some(),
+        "patch_skip_reason": patch_skip_reason,
+        "patch_error": patch_error,
+        "patch_count": patches.len(),
+        "caps": caps,
+    });
+    let raw = json!({
+        "repo_root": snapshot.repo_root.to_string_lossy(),
+        "start_tree": snapshot.start_tree,
+        "end_tree": end_tree,
+        "numstat": numstat,
+        "name_status": name_status,
+        "generation": patch_generation,
+    });
+    let turn_diff = (!turn_diff_files.is_empty()).then(|| AgentChatTurnDiffContext {
+        turn_id: String::new(),
+        turn_key: snapshot.turn_key,
+        completed_at: String::new(),
+        raw: raw.clone(),
+        files: turn_diff_files,
+        total_additions: turn_diff_total_additions,
+        total_deletions: turn_diff_total_deletions,
+        files_omitted: turn_diff_files_omitted,
+        truncated: turn_diff_truncated,
+    });
     CloudMcpAgentChatTurnGitDiff {
         file_change,
-        raw: json!({
-            "repo_root": snapshot.repo_root.to_string_lossy(),
-            "start_tree": snapshot.start_tree,
-            "end_tree": end_tree,
-            "numstat": numstat,
-            "name_status": name_status,
-        }),
+        turn_diff,
+        raw,
     }
 }
 
@@ -34840,11 +35359,22 @@ fn cloud_mcp_agent_chat_turn_git_should_clear(
         || matches!(turn_status, "failed" | "interrupted" | "cancelled")
 }
 
+#[cfg(test)]
 fn cloud_mcp_agent_chat_turn_summary_context_from_hook(
     payload: &TerminalActivityHookPayload,
     provider: &str,
     provider_session_id: &str,
 ) -> AgentChatTurnSummaryContext {
+    let (summary, _) =
+        cloud_mcp_agent_chat_turn_contexts_from_hook(payload, provider, provider_session_id);
+    summary
+}
+
+fn cloud_mcp_agent_chat_turn_contexts_from_hook(
+    payload: &TerminalActivityHookPayload,
+    provider: &str,
+    provider_session_id: &str,
+) -> (AgentChatTurnSummaryContext, Option<AgentChatTurnDiffContext>) {
     let native_turn_id = cloud_mcp_agent_chat_turn_native_id(payload);
     let snapshot = cloud_mcp_agent_chat_turn_git_take_completion_snapshot(
         payload,
@@ -34892,18 +35422,30 @@ fn cloud_mcp_agent_chat_turn_summary_context_from_hook(
         "hook_timestamp_ms": payload.hook_timestamp_ms,
         "observed_at_ms": payload.observed_at_ms,
     });
-    AgentChatTurnSummaryContext {
-        turn_id: native_turn_id,
-        turn_key,
-        started_at,
-        completed_at,
-        duration_ms,
-        raw: json!({
-            "hook": hook_raw,
-            "git": git_diff.raw,
-        }),
-        file_change: git_diff.file_change,
+    let mut turn_diff = git_diff.turn_diff;
+    if let Some(diff) = turn_diff.as_mut() {
+        diff.turn_id = native_turn_id.clone();
+        diff.turn_key = turn_key.clone();
+        diff.completed_at = completed_at.clone();
+        if let Some(object) = diff.raw.as_object_mut() {
+            object.insert("hook".to_string(), hook_raw.clone());
+        }
     }
+    (
+        AgentChatTurnSummaryContext {
+            turn_id: native_turn_id,
+            turn_key,
+            started_at,
+            completed_at,
+            duration_ms,
+            raw: json!({
+                "hook": hook_raw,
+                "git": git_diff.raw,
+            }),
+            file_change: git_diff.file_change,
+        },
+        turn_diff,
+    )
 }
 
 fn cloud_mcp_agent_chat_turn_summary_has_stable_key(payload: &TerminalActivityHookPayload) -> bool {
@@ -34968,7 +35510,7 @@ fn cloud_mcp_sync_agent_chat_turn_summary_from_hook(
     let payload = payload.clone();
     let state = state.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let summary = cloud_mcp_agent_chat_turn_summary_context_from_hook(
+        let (summary, turn_diff) = cloud_mcp_agent_chat_turn_contexts_from_hook(
             &payload,
             &request.provider,
             &request.provider_session_id,
@@ -34977,6 +35519,7 @@ fn cloud_mcp_sync_agent_chat_turn_summary_from_hook(
         context.metadata_only = false;
         context.source = "terminal_activity_hook_turn_summary".to_string();
         context.turn_summary = Some(summary);
+        context.turn_diff = turn_diff;
         agent_chat_session_sync_spawn_with_state(
             state,
             request.provider,
@@ -54105,6 +54648,37 @@ mod cloud_mcp_tests {
     }
 
     #[test]
+    fn agent_chat_turn_git_numstat_rename_path_expands_subdir_braces() {
+        assert_eq!(
+            cloud_mcp_agent_chat_turn_git_numstat_rename_path(
+                "arch/{i386 => x86}/Makefile"
+            ),
+            Some("arch/x86/Makefile".to_string())
+        );
+        assert_eq!(
+            cloud_mcp_agent_chat_turn_git_numstat_rename_path("src/{old.rs => new.rs}"),
+            Some("src/new.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn agent_chat_turn_git_deleted_sql_patch_ignores_hunk_comment_headers() {
+        let patches = cloud_mcp_agent_chat_turn_git_patch_map(
+            "diff --git a/db/schema.sql b/db/schema.sql\n\
+             deleted file mode 100644\n\
+             index 1111111..0000000\n\
+             --- a/db/schema.sql\n\
+             +++ /dev/null\n\
+             @@ -1,2 +0,0 @@\n\
+             --- comment line\n\
+             -SELECT 1;\n",
+        );
+
+        assert!(patches.contains_key("db/schema.sql"));
+        assert!(!patches.contains_key("comment line"));
+    }
+
+    #[test]
     fn agent_chat_status_hooks_map_to_metadata_only_sync_requests() {
         for event_type in [
             "provider-turn-started",
@@ -54202,6 +54776,316 @@ mod cloud_mcp_tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn agent_chat_turn_git_capture_builds_turn_diff_patches() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
+        let root = cloud_mcp_test_dir("diffforge-turn-diff");
+        if !cloud_mcp_init_test_repo(&root) {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        let rename_seed = (0..20)
+            .map(|index| format!("rename line {index}\n"))
+            .collect::<String>();
+        fs::write(root.join("rename.txt"), rename_seed.clone()).unwrap();
+        if !cloud_mcp_test_git(&root, &["add", "rename.txt"])
+            || !cloud_mcp_test_git(&root, &["commit", "-m", "add rename fixture"])
+        {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        let root_text = root.to_string_lossy().to_string();
+        cloud_mcp_agent_chat_turn_git_record_start(
+            "codex",
+            "session-diff",
+            "turn-diff",
+            &root_text,
+            "2026-07-02T00:00:00.000Z",
+            cloud_mcp_now_ms(),
+        );
+
+        fs::write(root.join("edit.txt"), "old\nnew\n").unwrap();
+        fs::remove_file(root.join("delete.txt")).unwrap();
+        fs::write(root.join("create.txt"), "created\n").unwrap();
+        fs::rename(root.join("rename.txt"), root.join("renamed.txt")).unwrap();
+        fs::write(
+            root.join("renamed.txt"),
+            rename_seed.replacen("rename line 19", "rename line nineteen", 1),
+        )
+        .unwrap();
+        fs::write(root.join("binary.bin"), [0_u8, 159, 146, 150]).unwrap();
+
+        let snapshot =
+            cloud_mcp_agent_chat_turn_git_take_snapshot("codex", "session-diff", "turn-diff");
+        let diff = cloud_mcp_agent_chat_turn_git_diff(snapshot);
+        let turn_diff = diff.turn_diff.expect("turn diff");
+        let files = turn_diff.files;
+        let file_for = |path: &str| {
+            files
+                .iter()
+                .find(|file| file["path"] == json!(path))
+                .unwrap_or_else(|| panic!("missing turn diff file for {path}"))
+        };
+        let create = file_for("create.txt");
+        let edit = file_for("edit.txt");
+        let delete = file_for("delete.txt");
+        let rename = file_for("renamed.txt");
+        let binary = file_for("binary.bin");
+
+        assert_eq!(create["kind"], json!("create"));
+        assert_eq!(edit["kind"], json!("edit"));
+        assert_eq!(delete["kind"], json!("delete"));
+        assert_eq!(rename["kind"], json!("rename"));
+        assert_eq!(rename["old_path"], json!("rename.txt"));
+        assert_eq!(binary["binary"], json!(true));
+        for file in [create, edit, delete, rename] {
+            let patch = file["patch"].as_str().expect("text patch");
+            assert!(patch.contains("--- "));
+            assert!(patch.contains("+++ "));
+            assert!(patch.contains("@@"));
+        }
+        assert!(binary.get("patch").is_none());
+        assert_eq!(
+            turn_diff.raw["generation"]["patch_skipped"],
+            json!(false)
+        );
+        let total_additions = files
+            .iter()
+            .filter_map(|file| file["additions"].as_i64())
+            .sum::<i64>();
+        let total_deletions = files
+            .iter()
+            .filter_map(|file| file["deletions"].as_i64())
+            .sum::<i64>();
+        assert_eq!(turn_diff.total_additions, total_additions);
+        assert_eq!(turn_diff.total_deletions, total_deletions);
+        assert!(turn_diff.total_additions >= 3);
+        assert!(turn_diff.total_deletions >= 2);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn agent_chat_turn_git_capture_matches_non_ascii_numstat_and_patch_paths() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
+        let root = cloud_mcp_test_dir("diffforge-turn-nonascii");
+        if !cloud_mcp_init_test_repo(&root) {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        let path = "café.txt";
+        fs::write(root.join(path), "old\n").unwrap();
+        if !cloud_mcp_test_git(&root, &["add", path])
+            || !cloud_mcp_test_git(&root, &["commit", "-m", "add non-ascii fixture"])
+        {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        cloud_mcp_agent_chat_turn_git_record_start(
+            "codex",
+            "session-nonascii",
+            "turn-nonascii",
+            &root.to_string_lossy(),
+            "2026-07-02T00:00:00.000Z",
+            cloud_mcp_now_ms(),
+        );
+        fs::write(root.join(path), "old\nnew\n").unwrap();
+
+        let snapshot = cloud_mcp_agent_chat_turn_git_take_snapshot(
+            "codex",
+            "session-nonascii",
+            "turn-nonascii",
+        );
+        let diff = cloud_mcp_agent_chat_turn_git_diff(snapshot);
+        let turn_diff = diff.turn_diff.expect("turn diff");
+        let file = turn_diff
+            .files
+            .iter()
+            .find(|file| file["path"] == json!(path))
+            .expect("non-ascii path should match numstat and patch headers");
+
+        assert_eq!(file["additions"], json!(1));
+        assert_eq!(file["deletions"], json!(0));
+        assert!(file["patch"]
+            .as_str()
+            .is_some_and(|patch| patch.contains("+++ b/café.txt")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn agent_chat_turn_git_no_changes_has_no_turn_diff() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
+        let root = cloud_mcp_test_dir("diffforge-turn-no-diff");
+        if !cloud_mcp_init_test_repo(&root) {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        cloud_mcp_agent_chat_turn_git_record_start(
+            "codex",
+            "session-no-diff",
+            "turn-no-diff",
+            &root.to_string_lossy(),
+            "2026-07-02T00:00:00.000Z",
+            cloud_mcp_now_ms(),
+        );
+
+        let snapshot =
+            cloud_mcp_agent_chat_turn_git_take_snapshot("codex", "session-no-diff", "turn-no-diff");
+        let diff = cloud_mcp_agent_chat_turn_git_diff(snapshot);
+
+        assert!(diff.file_change.is_none());
+        assert!(diff.turn_diff.is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn agent_chat_turn_git_patch_timeout_emits_counts_only_turn_diff() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
+        let root = cloud_mcp_test_dir("diffforge-turn-diff-timeout");
+        if !cloud_mcp_init_test_repo(&root) {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        cloud_mcp_agent_chat_turn_git_record_start(
+            "codex",
+            "session-timeout",
+            "turn-timeout",
+            &root.to_string_lossy(),
+            "2026-07-02T00:00:00.000Z",
+            cloud_mcp_now_ms(),
+        );
+        fs::write(root.join("edit.txt"), "old\nnew\n").unwrap();
+
+        let snapshot =
+            cloud_mcp_agent_chat_turn_git_take_snapshot("codex", "session-timeout", "turn-timeout");
+        let diff =
+            cloud_mcp_agent_chat_turn_git_diff_with_patch_timeout(snapshot, Duration::from_millis(0));
+        let turn_diff = diff.turn_diff.expect("turn diff");
+        assert_eq!(turn_diff.files.len(), 1);
+        assert_eq!(turn_diff.files[0]["additions"], json!(1));
+        assert_eq!(turn_diff.files[0]["deletions"], json!(0));
+        assert!(turn_diff.files[0].get("patch").is_none());
+        assert_eq!(
+            turn_diff.raw["generation"]["patch_skip_reason"],
+            json!("timeout")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn agent_chat_turn_diff_caps_per_file_and_drops_largest_patches_first() {
+        let one_file = vec![json!({
+            "path": "large.rs",
+            "kind": "edit",
+            "additions": 1,
+            "deletions": 1
+        })];
+        let mut one_patch = HashMap::new();
+        one_patch.insert("large.rs".to_string(), "x".repeat(50_000));
+        let (files, total_additions, total_deletions, files_omitted, truncated, caps) =
+            cloud_mcp_agent_chat_turn_git_attach_patches(one_file, &one_patch);
+        assert_eq!(total_additions, 1);
+        assert_eq!(total_deletions, 1);
+        assert_eq!(files_omitted, 0);
+        assert!(truncated);
+        assert_eq!(
+            files[0]["patch"].as_str().unwrap().chars().count(),
+            CLOUD_MCP_AGENT_CHAT_TURN_DIFF_PATCH_MAX_CHARS
+        );
+        assert_eq!(files[0]["patch_truncated"], json!(true));
+        assert_eq!(caps["per_file_patches_truncated"], json!(1));
+
+        let files = (0..10)
+            .map(|index| {
+                json!({
+                    "path": format!("file-{index}.rs"),
+                    "kind": "edit",
+                    "additions": 1,
+                    "deletions": 1
+                })
+            })
+            .collect::<Vec<_>>();
+        let patches = (0..10)
+            .map(|index| {
+                (
+                    format!("file-{index}.rs"),
+                    "x".repeat(40_000 + (index * 500)),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let (files, total_additions, total_deletions, files_omitted, truncated, caps) =
+            cloud_mcp_agent_chat_turn_git_attach_patches(files, &patches);
+        assert_eq!(total_additions, 10);
+        assert_eq!(total_deletions, 10);
+        assert_eq!(files_omitted, 0);
+        assert!(truncated);
+        assert!(caps["patches_dropped_for_record_cap"].as_u64().unwrap_or(0) > 0);
+        let dropped = files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, file)| file.get("patch").is_none().then_some(index))
+            .collect::<Vec<_>>();
+        assert!(dropped.contains(&9));
+        let smallest_dropped = dropped.iter().copied().min().unwrap_or(10);
+        for (index, file) in files.iter().enumerate() {
+            if index > smallest_dropped {
+                assert!(file.get("patch").is_none());
+            }
+        }
+
+        let metadata_only_files = (0..7000)
+            .map(|index| {
+                json!({
+                    "path": format!("very/long/generated/path/{index}/module/file-{index}.rs"),
+                    "kind": "edit",
+                    "additions": 1,
+                    "deletions": 1
+                })
+            })
+            .collect::<Vec<_>>();
+        let (files, total_additions, total_deletions, files_omitted, truncated, caps) =
+            cloud_mcp_agent_chat_turn_git_attach_patches(metadata_only_files, &HashMap::new());
+        assert!(truncated);
+        assert_eq!(total_additions, 7000);
+        assert_eq!(total_deletions, 7000);
+        assert_eq!(files_omitted, 7000usize.saturating_sub(files.len()));
+        assert_eq!(caps["files_omitted"], json!(files_omitted));
+        let message = cloud_mcp_agent_chat_turn_diff_message(
+            &files,
+            files_omitted,
+            truncated,
+            total_additions,
+            total_deletions,
+        );
+        assert_eq!(message["files_omitted"], json!(files_omitted));
+        assert!(caps["files_dropped_for_record_cap"].as_u64().unwrap_or(0) > 0);
+        assert!(
+            caps["serialized_messages_bytes"]
+                .as_u64()
+                .unwrap_or(u64::MAX)
+                <= u64::try_from(CLOUD_MCP_AGENT_CHAT_TURN_DIFF_MESSAGES_MAX_BYTES).unwrap()
+        );
+        assert!(files.len() < 7000);
     }
 
     #[test]
@@ -54661,6 +55545,55 @@ mod cloud_mcp_tests {
             cloud_mcp_workspace_panel_kind(&docs_panel).as_deref(),
             Some("docs"),
         );
+    }
+
+    #[test]
+    fn workspace_project_rows_normalize_shape_dedupe_and_cap() {
+        let mut projects = (0..60)
+            .map(|index| {
+                json!({
+                    "id": format!("board-{index}"),
+                    "name": format!("Board {index}"),
+                    "path": format!("hardware/board-{index}/board-{index}.board.tsx"),
+                    "updatedAtMs": 1000 + index,
+                    "extra_field": "dropped",
+                })
+            })
+            .collect::<Vec<_>>();
+        // Duplicate path is dropped; missing-path row is skipped.
+        projects.insert(1, projects[0].clone());
+        projects.insert(2, json!({ "name": "no path" }));
+        let workspace = json!({ "pcb_projects": projects });
+
+        let rows = cloud_mcp_workspace_project_rows(&workspace, &["pcb_projects", "pcbProjects"]);
+        assert!(rows.len() <= CLOUD_MCP_WORKSPACE_PROJECT_LIMIT);
+        let first = &rows[0];
+        assert_eq!(first["id"], json!("board-0"));
+        assert_eq!(first["name"], json!("Board 0"));
+        assert_eq!(first["path"], json!("hardware/board-0/board-0.board.tsx"));
+        assert_eq!(first["updated_at_ms"], json!(1000));
+        assert!(first.get("extra_field").is_none());
+        let unique_paths = rows
+            .iter()
+            .filter_map(|row| row.get("path").and_then(Value::as_str))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique_paths.len(), rows.len());
+    }
+
+    #[test]
+    fn workspace_project_rows_fall_back_to_camel_case_and_path_identity() {
+        let workspace = json!({
+            "videoProjects": [{
+                "path": "media/projects/launch.video.pipe",
+            }],
+        });
+
+        let rows =
+            cloud_mcp_workspace_project_rows(&workspace, &["video_projects", "videoProjects"]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], json!("media/projects/launch.video.pipe"));
+        assert_eq!(rows[0]["name"], json!("media/projects/launch.video.pipe"));
+        assert!(rows[0].get("updated_at_ms").is_none());
     }
 
     #[test]

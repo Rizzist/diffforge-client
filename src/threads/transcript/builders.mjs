@@ -120,11 +120,21 @@ export function messageSubagent(message = {}) {
     owner.subagent_id || owner.subagentId || owner.sub_agent_id || owner.subAgentId
       || (source ? owner.id : ""),
   );
+  const agentChatSessionId = transcriptText(
+    owner.agent_chat_session_id || owner.agentChatSessionId,
+  );
+  const providerSessionId = transcriptText(
+    owner.provider_session_id || owner.providerSessionId,
+  );
   return {
     ...(source || {}),
     id,
+    parentId: transcriptText(owner.parent_id || owner.parentId),
     title: transcriptText(owner.title || owner.name || message.title),
     status: transcriptToken(owner.status || owner.state || message.status),
+    sessionRef: agentChatSessionId || providerSessionId
+      ? { agentChatSessionId, providerSessionId }
+      : null,
   };
 }
 
@@ -242,6 +252,108 @@ export function extractTurnSummaries(messages = []) {
     }
   });
   return summaries;
+}
+
+/* ------------------------------------------------------------------ */
+/* turn_diff contract (per-file unified patches; degrade when absent)   */
+/* ------------------------------------------------------------------ */
+
+export function isTurnDiffMessage(message = {}) {
+  return messageKindToken(message) === "turn-diff";
+}
+
+const TURN_DIFF_FILE_KINDS = new Set(["edit", "create", "delete", "rename"]);
+
+export function normalizeTurnDiffFile(file = {}) {
+  const source = plainObject(file);
+  if (!source) return null;
+  const path = transcriptText(source.path || source.file || source.new_path || source.newPath);
+  if (!path) return null;
+  const kind = transcriptToken(source.kind || source.change_kind || source.changeKind);
+  const patch = typeof source.patch === "string" && source.patch ? source.patch : null;
+  return {
+    path,
+    oldPath: transcriptText(source.old_path || source.oldPath || source.from) || null,
+    kind: TURN_DIFF_FILE_KINDS.has(kind) ? kind : "edit",
+    additions: finiteNumber(source.additions, source.lines_added, source.linesAdded),
+    deletions: finiteNumber(source.deletions, source.lines_removed, source.linesRemoved),
+    binary: transcriptBool(source.binary, false),
+    patch,
+    patchTruncated: transcriptBool(source.patch_truncated ?? source.patchTruncated, false),
+  };
+}
+
+// Normalizes one §1 turn_diff message. The record has no explicit time
+// window, so the message timestamp doubles as a point window for the same
+// time-overlap fallback the turn_summary attachment uses. The source
+// message's durable record refs (the fields agentChatMessageWithRecordRef
+// attaches) are carried through so a fanout-truncated record stays
+// fetchable from the synthetic file-change row.
+export function normalizeTurnDiff(message = {}) {
+  if (!isTurnDiffMessage(message)) return null;
+  const turnId = transcriptText(message.turn_id || message.turnId);
+  const files = transcriptArray(message.files)
+    .map(normalizeTurnDiffFile)
+    .filter(Boolean);
+  if (!turnId && !files.length) return null;
+  const totals = fileChangeTotals(files);
+  const timestampMs = transcriptTimestampMs(
+    message.timestamp || message.created_at || message.createdAt,
+  );
+  const startedAtMs = transcriptTimestampMs(message.started_at || message.startedAt) ?? timestampMs;
+  const completedAtMs = transcriptTimestampMs(message.completed_at || message.completedAt)
+    ?? timestampMs;
+  const recordSeqRaw = finiteNumber(
+    message.record_seq, message.recordSeq, message.server_seq, message.serverSeq,
+  );
+  const filesOmittedRaw = finiteNumber(message.files_omitted, message.filesOmitted);
+  return {
+    turnId,
+    files,
+    totalAdditions: finiteNumber(message.total_additions, message.totalAdditions)
+      ?? totals.additions,
+    totalDeletions: finiteNumber(message.total_deletions, message.totalDeletions)
+      ?? totals.deletions,
+    truncated: transcriptBool(message.truncated ?? message.is_truncated ?? message.isTruncated, false),
+    filesOmitted: filesOmittedRaw != null && filesOmittedRaw > 0 ? Math.floor(filesOmittedRaw) : 0,
+    recordId: transcriptText(message.record_id || message.recordId),
+    recordSeq: recordSeqRaw != null && recordSeqRaw > 0 ? recordSeqRaw : null,
+    startedAtMs,
+    completedAtMs,
+  };
+}
+
+function turnDiffOrderTimestampMs(diff = {}) {
+  return diff.completedAtMs ?? diff.startedAtMs ?? null;
+}
+
+// Order-independent same-turn replacement: a higher positive recordSeq wins;
+// a seq-bearing record beats a seqless one; with equal/absent seqs the later
+// timestamp wins; otherwise the existing entry stays.
+function turnDiffReplaces(existing, incoming) {
+  const existingSeq = existing.recordSeq;
+  const incomingSeq = incoming.recordSeq;
+  if (existingSeq != null && incomingSeq != null && existingSeq !== incomingSeq) {
+    return incomingSeq > existingSeq;
+  }
+  if (existingSeq == null && incomingSeq != null) return true;
+  if (existingSeq != null && incomingSeq == null) return false;
+  const existingTs = turnDiffOrderTimestampMs(existing);
+  const incomingTs = turnDiffOrderTimestampMs(incoming);
+  return incomingTs != null && (existingTs == null || incomingTs > existingTs);
+}
+
+export function extractTurnDiffs(messages = []) {
+  const diffs = new Map();
+  transcriptArray(messages).forEach((message) => {
+    const diff = normalizeTurnDiff(message);
+    if (!diff || !diff.turnId) return;
+    const existing = diffs.get(diff.turnId);
+    if (!existing || turnDiffReplaces(existing, diff)) {
+      diffs.set(diff.turnId, diff);
+    }
+  });
+  return diffs;
 }
 
 /* ------------------------------------------------------------------ */
@@ -435,7 +547,7 @@ export function flattenTranscriptItems(items = [], { itemIdPrefix = "agent-threa
     if (type === "activitygroup" || type === "activity-group") {
       const groupTurnId = transcriptText(item.turnId || item.turn_id) || inheritedTurnId;
       transcriptArray(item.messages).forEach((message, messageIndex) => {
-        if (isTurnSummaryMessage(message || {})) return;
+        if (isTurnSummaryMessage(message || {}) || isTurnDiffMessage(message || {})) return;
         const kind = messageRowKind(message || {});
         if (kind === "user" && isInternalContextUserMessage(message || {})) return;
         pushRow({
@@ -461,7 +573,7 @@ export function flattenTranscriptItems(items = [], { itemIdPrefix = "agent-threa
       return;
     }
     const message = item.message || item;
-    if (isTurnSummaryMessage(message)) return;
+    if (isTurnSummaryMessage(message) || isTurnDiffMessage(message)) return;
     const messageKind = messageRowKind(message);
     if (messageKind === "user" && isInternalContextUserMessage(message)) return;
     pushRow({
@@ -487,7 +599,7 @@ export function flattenTranscriptItems(items = [], { itemIdPrefix = "agent-threa
 // and whenever an explicit turn id changes. Divider rows stand alone between
 // turns (model changes / compaction markers are timeline-level). Recurring
 // turn ids get per-occurrence keys so interleaved turns never collide.
-export function groupRowsIntoTurns(rows = []) {
+export function groupRowsIntoTurns(rows = [], options = {}) {
   const groups = [];
   const turnIdOccurrences = new Map();
   let current = null;
@@ -542,10 +654,10 @@ export function groupRowsIntoTurns(rows = []) {
     }
   });
   close();
-  return groups.map((group) => (group.divider ? group : splitTurnGroup(group)));
+  return groups.map((group) => (group.divider ? group : splitTurnGroup(group, options)));
 }
 
-function splitTurnGroup(group) {
+function splitTurnGroup(group, options = {}) {
   const anchorRows = [];
   const rest = [];
   let anchorDone = false;
@@ -565,7 +677,7 @@ function splitTurnGroup(group) {
   ) {
     tailStart -= 1;
   }
-  const workRows = wrapSubagentRuns(rest.slice(0, tailStart));
+  const workRows = wrapSubagentRuns(rest.slice(0, tailStart), options);
   const tailRows = rest.slice(tailStart);
   return {
     ...group,
@@ -575,45 +687,127 @@ function splitTurnGroup(group) {
   };
 }
 
+// Subagent groups nest via parent_id chains up to this depth; deeper
+// linkage flattens into the depth-cap group.
+export const SUBAGENT_NESTING_DEPTH_CAP = 3;
+
+function subagentRefMatchesSession(sessionRef = null, sessionId = "") {
+  if (!sessionRef || !sessionId) return false;
+  return sessionRef.agentChatSessionId === sessionId
+    || sessionRef.providerSessionId === sessionId;
+}
+
 // Consecutive work rows carrying the same subagent linkage nest inside a
-// single subagent-group row.
-function wrapSubagentRuns(rows = []) {
+// single subagent-group row. Rows whose subagent carries a parent_id that
+// points at an open group nest recursively (depth cap 3, deeper rows
+// flatten into the depth-cap group). Any non-subagent row closes the run.
+function wrapSubagentRuns(rows = [], { sessionId = "" } = {}) {
   const wrapped = [];
-  let run = null;
-  const closeRun = () => {
-    if (!run) return;
-    if (run.childRows.length) {
-      wrapped.push(run);
-    }
-    run = null;
-  };
+  let stack = [];
+  // runIds flattened into a depth-cap group get no group of their own, so
+  // their descendants' parent_id would never resolve against the stack.
+  // Map each flattened runId to its owning cap group so those descendants
+  // route into the same group instead of spawning bogus top-level groups.
+  const capGroupByFlattenedRunId = new Map();
+  const makeGroup = (subagent, runId, row, depth) => ({
+    kind: "subagent-group",
+    key: `subagent:${runId}:${row.key}`,
+    domId: row.domId,
+    turnId: row.turnId,
+    subagentId: runId,
+    title: subagent.title || "Subagent",
+    status: subagent.status || "",
+    depth,
+    sessionRef: subagent.sessionRef && !subagentRefMatchesSession(subagent.sessionRef, sessionId)
+      ? subagent.sessionRef
+      : null,
+    childRows: [],
+  });
   rows.forEach((row) => {
     const subagent = row.message ? messageSubagent(row.message) : null;
     const runId = subagent ? (subagent.id || subagent.title || "subagent") : "";
     if (!runId) {
-      closeRun();
+      stack = [];
       wrapped.push(row);
       return;
     }
-    if (!run || run.subagentId !== runId) {
-      closeRun();
-      run = {
-        kind: "subagent-group",
-        key: `subagent:${runId}:${row.key}`,
-        domId: row.domId,
-        turnId: row.turnId,
-        subagentId: runId,
-        title: subagent.title || "Subagent",
-        status: subagent.status || "",
-        childRows: [],
-      };
+    const openIndex = stack.findIndex((group) => group.subagentId === runId);
+    if (openIndex >= 0) {
+      stack = stack.slice(0, openIndex + 1);
+    } else {
+      const parentId = subagent.parentId || "";
+      const parentIndex = parentId
+        ? stack.findIndex((group) => group.subagentId === parentId)
+        : -1;
+      if (parentIndex >= 0) {
+        stack = stack.slice(0, parentIndex + 1);
+        const parent = stack[parentIndex];
+        if (parent.depth < SUBAGENT_NESTING_DEPTH_CAP) {
+          const child = makeGroup(subagent, runId, row, parent.depth + 1);
+          parent.childRows.push(child);
+          stack.push(child);
+        } else {
+          // parent.depth >= cap: flatten this row into the depth-cap group.
+          capGroupByFlattenedRunId.set(runId, parent);
+        }
+      } else {
+        const capGroup = parentId ? capGroupByFlattenedRunId.get(parentId) : undefined;
+        const capIndex = capGroup ? stack.indexOf(capGroup) : -1;
+        if (capIndex >= 0) {
+          // The parent was itself flattened into a still-open cap group:
+          // this deeper run flattens into that same group.
+          stack = stack.slice(0, capIndex + 1);
+          capGroupByFlattenedRunId.set(runId, capGroup);
+        } else {
+          stack = [];
+          const root = makeGroup(subagent, runId, row, 1);
+          wrapped.push(root);
+          stack.push(root);
+        }
+      }
     }
-    if (!run.title && subagent.title) run.title = subagent.title;
-    if (subagent.status) run.status = subagent.status;
-    run.childRows.push(row);
+    const target = stack[stack.length - 1];
+    if (target.subagentId === runId) {
+      if ((!target.title || target.title === "Subagent") && subagent.title) {
+        target.title = subagent.title;
+      }
+      if (subagent.status) target.status = subagent.status;
+      if (
+        !target.sessionRef
+        && subagent.sessionRef
+        && !subagentRefMatchesSession(subagent.sessionRef, sessionId)
+      ) {
+        target.sessionRef = subagent.sessionRef;
+      }
+    }
+    target.childRows.push(row);
   });
-  closeRun();
   return wrapped;
+}
+
+// Header stats for a subagent group: descendant message rows, tool calls,
+// and the timestamp spread when derivable.
+export function subagentGroupStats(group = {}) {
+  let messages = 0;
+  let toolCalls = 0;
+  const stamps = [];
+  const walk = (row) => {
+    if (row.kind === "subagent-group") {
+      transcriptArray(row.childRows).forEach(walk);
+      return;
+    }
+    messages += 1;
+    if (row.kind === "tool") toolCalls += 1;
+    const ts = rowTimestampMs(row);
+    if (Number.isFinite(ts)) stamps.push(ts);
+  };
+  transcriptArray(group.childRows).forEach(walk);
+  const spread = stamps.length >= 2 ? Math.max(...stamps) - Math.min(...stamps) : null;
+  return {
+    messages,
+    toolCalls,
+    durationMs: Number.isFinite(spread) && spread > 0 ? spread : null,
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -622,18 +816,25 @@ function wrapSubagentRuns(rows = []) {
 
 export function countToolCalls(workRows = []) {
   let count = 0;
-  transcriptArray(workRows).forEach((row) => {
+  const walk = (row) => {
     if (row.kind === "tool") count += 1;
     if (row.kind === "subagent-group") {
-      count += transcriptArray(row.childRows).filter((child) => child.kind === "tool").length;
+      transcriptArray(row.childRows).forEach(walk);
     }
-  });
+  };
+  transcriptArray(workRows).forEach(walk);
   return count;
 }
 
-function groupFileTotals(group, turnSummary, diffSummary) {
+function groupFileTotals(group, turnSummary, diffSummary, turnDiff = null) {
   if (turnSummary?.fileChange?.files?.length) {
     return fileChangeTotals(turnSummary.fileChange.files);
+  }
+  if (turnDiff?.files?.length) {
+    return {
+      additions: Math.max(0, Number(turnDiff.totalAdditions) || 0),
+      deletions: Math.max(0, Number(turnDiff.totalDeletions) || 0),
+    };
   }
   if (diffSummary) {
     const additions = Math.max(0, Number(diffSummary.additions) || 0);
@@ -682,21 +883,22 @@ function groupTimestampSpreadMs(group) {
   return spread > 0 ? spread : null;
 }
 
-// Turn summaries attach by turn id when the rows carry one; native transcript
-// messages often do not, so summaries fall back to the turn group whose row
-// timestamps overlap the summary's [started_at, completed_at] window
-// (±2s tolerance, best overlap wins). Unmatched summaries stay unattached.
+// Turn records (turn_summary / turn_diff) attach by turn id when the rows
+// carry one; native transcript messages often do not, so records fall back to
+// the turn group whose row timestamps overlap the record's
+// [startedAtMs, completedAtMs] window (±2s tolerance, best overlap wins).
+// Unmatched records stay unattached.
 const TURN_SUMMARY_WINDOW_TOLERANCE_MS = 2000;
 
-export function attachTurnSummariesToGroups(groups = [], summaries = new Map()) {
+export function attachTurnRecordsToGroups(groups = [], records = new Map()) {
   const byGroupKey = new Map();
-  if (!(summaries instanceof Map) || !summaries.size) return byGroupKey;
+  if (!(records instanceof Map) || !records.size) return byGroupKey;
   const matchedTurnIds = new Set();
   transcriptArray(groups).forEach((group) => {
     if (group.divider || !group.turnId) return;
-    const summary = summaries.get(group.turnId);
-    if (summary) {
-      byGroupKey.set(group.key, summary);
+    const record = records.get(group.turnId);
+    if (record) {
+      byGroupKey.set(group.key, record);
       matchedTurnIds.add(group.turnId);
     }
   });
@@ -704,11 +906,11 @@ export function attachTurnSummariesToGroups(groups = [], summaries = new Map()) 
     .filter((group) => !group.divider && !byGroupKey.has(group.key))
     .map((group) => ({ group, range: groupTimestampRange(group) }))
     .filter((candidate) => candidate.range);
-  summaries.forEach((summary) => {
-    if (matchedTurnIds.has(summary.turnId)) return;
-    if (!Number.isFinite(summary.startedAtMs) || !Number.isFinite(summary.completedAtMs)) return;
-    const windowStart = summary.startedAtMs - TURN_SUMMARY_WINDOW_TOLERANCE_MS;
-    const windowEnd = summary.completedAtMs + TURN_SUMMARY_WINDOW_TOLERANCE_MS;
+  records.forEach((record) => {
+    if (matchedTurnIds.has(record.turnId)) return;
+    if (!Number.isFinite(record.startedAtMs) || !Number.isFinite(record.completedAtMs)) return;
+    const windowStart = record.startedAtMs - TURN_SUMMARY_WINDOW_TOLERANCE_MS;
+    const windowEnd = record.completedAtMs + TURN_SUMMARY_WINDOW_TOLERANCE_MS;
     let best = null;
     let bestOverlap = -1;
     candidates.forEach((candidate) => {
@@ -721,10 +923,14 @@ export function attachTurnSummariesToGroups(groups = [], summaries = new Map()) 
       }
     });
     if (best) {
-      byGroupKey.set(best.group.key, summary);
+      byGroupKey.set(best.group.key, record);
     }
   });
   return byGroupKey;
+}
+
+export function attachTurnSummariesToGroups(groups = [], summaries = new Map()) {
+  return attachTurnRecordsToGroups(groups, summaries);
 }
 
 function groupUsage(group, turnSummary, usageByTurn) {
@@ -766,9 +972,10 @@ function groupHasError(group) {
 export function computeFoldSummary(group, {
   turnSummary = null,
   diffSummary = null,
+  turnDiff = null,
   usageByTurn = null,
 } = {}) {
-  const { additions, deletions } = groupFileTotals(group, turnSummary, diffSummary);
+  const { additions, deletions } = groupFileTotals(group, turnSummary, diffSummary, turnDiff);
   const usage = groupUsage(group, turnSummary, usageByTurn);
   return {
     durationMs: turnSummary?.durationMs ?? groupTimestampSpreadMs(group),
@@ -801,6 +1008,25 @@ function diffSummariesByTurn(diffSummaries = []) {
   return { byTurn, unattached };
 }
 
+// Minimal message for the synthetic turn_diff card: it bears the durable
+// record refs + truncated flag so the standard TruncatedChip can fetch the
+// full record when the fanout copy was truncated. Null when there is
+// nothing to carry (no refs, not truncated).
+export function turnDiffSyntheticMessage(turnDiff = null) {
+  if (!turnDiff) return null;
+  const recordId = transcriptText(turnDiff.recordId);
+  const recordSeq = Number.isFinite(turnDiff.recordSeq) && turnDiff.recordSeq > 0
+    ? turnDiff.recordSeq
+    : null;
+  const truncated = Boolean(turnDiff.truncated);
+  if (!recordId && recordSeq == null && !truncated) return null;
+  return {
+    ...(recordId ? { record_id: recordId, recordId } : {}),
+    ...(recordSeq != null ? { record_seq: recordSeq, recordSeq } : {}),
+    truncated,
+  };
+}
+
 export function syntheticFileChangeRow(source, key, turnId = "") {
   const files = transcriptArray(source?.files).map(normalizeFileChangeFile).filter(Boolean);
   if (!files.length) return null;
@@ -826,15 +1052,21 @@ export function buildTranscriptRows(items = [], {
   itemIdPrefix = "agent-thread-item",
   diffSummaries = [],
   turnSummaries = null,
+  turnDiffs = null,
   usageByTurn = null,
   expandedTurnKeys = null,
   busy = false,
+  sessionId = "",
 } = {}) {
   const flat = flattenTranscriptItems(items, { itemIdPrefix });
-  const groups = groupRowsIntoTurns(flat);
+  const groups = groupRowsIntoTurns(flat, { sessionId });
   const { byTurn: diffByTurn, unattached: unattachedDiffs } = diffSummariesByTurn(diffSummaries);
   const summaries = turnSummaries instanceof Map ? turnSummaries : new Map();
   const summariesByGroupKey = attachTurnSummariesToGroups(groups, summaries);
+  const turnDiffsByGroupKey = attachTurnRecordsToGroups(
+    groups,
+    turnDiffs instanceof Map ? turnDiffs : new Map(),
+  );
   const expanded = expandedTurnKeys instanceof Set ? expandedTurnKeys : new Set();
   const turnGroups = groups.filter((group) => !group.divider);
   const latestGroupKey = turnGroups.length ? turnGroups[turnGroups.length - 1].key : "";
@@ -848,17 +1080,41 @@ export function buildTranscriptRows(items = [], {
     }
     const tagRow = (row) => ({ ...row, groupKey: group.key });
     const turnSummary = summariesByGroupKey.get(group.key) || null;
+    const turnDiff = turnDiffsByGroupKey.get(group.key) || null;
     const diffSummary = group.turnId ? diffByTurn.get(group.turnId) || null : null;
     if (group.turnId && diffSummary) consumedDiffTurnIds.add(group.turnId);
 
-    const workRows = [...group.workRows];
+    let workRows = [...group.workRows];
     const hasFileChangeRow = workRows.some((row) => row.kind === "file-change");
+    if (hasFileChangeRow && turnDiff) {
+      // The turn's reviewable diff rides on the last file-change row.
+      const lastIndex = workRows.map((row) => row.kind).lastIndexOf("file-change");
+      workRows = workRows.map((row, index) => (
+        index === lastIndex ? { ...row, turnDiff } : row
+      ));
+    }
     if (!hasFileChangeRow) {
-      const source = turnSummary?.fileChange
-        || (diffSummary ? { files: diffSummary.files, summary: diffSummary.summary } : null);
-      if (source) {
-        const synthetic = syntheticFileChangeRow(source, `file-change:${group.key}`, group.turnId);
-        if (synthetic) workRows.push(synthetic);
+      if (turnDiff?.files?.length) {
+        workRows.push({
+          kind: "file-change",
+          key: `file-change:${group.key}`,
+          turnId: group.turnId,
+          synthetic: true,
+          files: turnDiff.files,
+          additions: Math.max(0, Number(turnDiff.totalAdditions) || 0),
+          deletions: Math.max(0, Number(turnDiff.totalDeletions) || 0),
+          summary: transcriptText(turnSummary?.fileChange?.summary),
+          turnDiff,
+          item: null,
+          message: turnDiffSyntheticMessage(turnDiff),
+        });
+      } else {
+        const source = turnSummary?.fileChange
+          || (diffSummary ? { files: diffSummary.files, summary: diffSummary.summary } : null);
+        if (source) {
+          const synthetic = syntheticFileChangeRow(source, `file-change:${group.key}`, group.turnId);
+          if (synthetic) workRows.push(synthetic);
+        }
       }
     }
 
@@ -866,7 +1122,7 @@ export function buildTranscriptRows(items = [], {
     const foldable = workRows.length > 0 && !isLatest;
     const isExpanded = !foldable || expanded.has(group.key);
     const summary = workRows.length
-      ? computeFoldSummary({ ...group, workRows }, { turnSummary, diffSummary, usageByTurn })
+      ? computeFoldSummary({ ...group, workRows }, { turnSummary, diffSummary, turnDiff, usageByTurn })
       : null;
 
     rows.push(...group.anchorRows.map(tagRow));
@@ -1085,12 +1341,6 @@ export function prettyPrintValue(value, limit = 60000) {
   }
 }
 
-const SHIKI_PRELOAD_LANGS = new Set([
-  "ts", "typescript", "js", "javascript", "tsx", "jsx",
-  "json", "rust", "rs", "python", "py", "bash", "sh", "shell", "zsh",
-  "html", "css", "md", "markdown",
-]);
-
 export function codeLanguageToken(language = "") {
   const token = transcriptToken(language).replace(/[^a-z0-9+#-]/g, "");
   if (!token) return "";
@@ -1099,10 +1349,6 @@ export function codeLanguageToken(language = "") {
     shell: "bash", sh: "bash", zsh: "bash", rs: "rust", py: "python",
   };
   return aliases[token] || token;
-}
-
-export function isPreloadedLanguage(language = "") {
-  return SHIKI_PRELOAD_LANGS.has(transcriptToken(language));
 }
 
 export function artifactImageUrl(artifact = {}) {

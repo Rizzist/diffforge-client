@@ -219,6 +219,9 @@ fn background_monitor_show_at(app: &AppHandle, anchor: Option<(f64, f64)>) {
     }
     #[cfg(target_os = "macos")]
     background_monitor_apply_macos_popover_style(&window);
+    // Like the popover style above, the cleared webview backdrop is plain
+    // window state — re-assert it so the full-size square never comes back.
+    let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
     let _ = window.show();
     #[cfg(target_os = "macos")]
     background_monitor_order_front_regardless(&window);

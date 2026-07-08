@@ -200,8 +200,11 @@ const MonitorShell = styled.div`
   border: 1px solid rgba(148, 163, 184, 0.22);
   border-radius: 14px;
   color: #f4f7fa;
-  background: rgba(7, 10, 15, 0.98);
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55);
+  background: #070a0f;
+  /* The transparent popover window leaves only the viewport's 8px ring around
+     this shell, so the shadow must fade out within it — anything larger gets
+     hard-clipped at the window edge and shows as a dark translucent band. */
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   opacity: 0;
   transform: translateY(-8px) scale(0.97);

@@ -394,6 +394,34 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
       },
     };
   }
+  if (templateId === "notify_device") {
+    const deviceLabel = safeText(template?.device_label || template?.target_device_label);
+    const deliveryRaw = safeText(template?.delivery || template?.delivery_mode || template?.channel, "auto").toLowerCase();
+    const visualDefaults = loopspaceGraphVisualDefaultsForNode("notify_device");
+    return {
+      id: `${templateId}-${suffix}`,
+      icon: safeText(template?.icon, "bell"),
+      label: safeText(template?.label, "Notify device"),
+      mode: "",
+      nodeKind: "notify_device",
+      kind: "notify_device",
+      role: safeText(template?.role, "action"),
+      triggerId: "",
+      hasPosition: Boolean(position),
+      x: position ? Math.round(Number(position.x) || 0) : 0,
+      y: position ? Math.round(Number(position.y) || 0) : 0,
+      props: {
+        body: safeText(template?.body || template?.message || template?.notification_body),
+        delivery: deliveryRaw === "native" || deliveryRaw === "push" ? deliveryRaw : "auto",
+        device_id: deviceId || safeText(template?.target_device_id),
+        device_label: deviceLabel,
+        h: safeText(template?.h || template?.height, String(visualDefaults.height || 148)),
+        title: safeText(template?.title || template?.notification_title),
+        url: safeText(template?.url || template?.link),
+        w: safeText(template?.w || template?.width, String(visualDefaults.width || 380)),
+      },
+    };
+  }
   if (templateId === "dispatch_todos") {
     const deviceLabel = safeText(template?.device_label || template?.target_device_label);
     const visualDefaults = loopspaceGraphVisualDefaultsForNode("dispatch_todos");
@@ -686,6 +714,14 @@ function dfBlueprintResourcePropsFromPatchOperation(op = {}, node = null) {
   if (nodeKind === "asset_read" || nodeKind === "asset_write") {
     putFirst("asset_refs", ["asset_refs", "assetRefs", "assets", "asset_id", "assetId", "path_key", "pathKey"]);
   }
+  if (nodeKind === "notify_device") {
+    putFirst("body", ["body", "message", "notification_body", "notificationBody"]);
+    putFirst("delivery", ["delivery", "delivery_mode", "deliveryMode", "channel"]);
+    putFirst("device_id", ["device_id", "deviceId", "target_device_id", "targetDeviceId"]);
+    putFirst("device_label", ["device_label", "deviceLabel", "target_device_label", "targetDeviceLabel"]);
+    putFirst("title", ["title", "notification_title", "notificationTitle"]);
+    putFirst("url", ["url", "link"]);
+  }
   return props;
 }
 
@@ -734,6 +770,10 @@ export function applyDfBlueprintPatchOperations(source, operations = [], options
         parent_id: op.parent_id || op.parentId || op.parent,
         status: op.status,
         target_mode: op.target_mode || op.targetMode,
+        title: op.title || op.notification_title || op.notificationTitle,
+        body: op.body || op.message || op.notification_body || op.notificationBody,
+        url: op.url || op.link,
+        delivery: op.delivery || op.delivery_mode || op.deliveryMode || op.channel,
       }, op.position || { x: op.x, y: op.y });
       if (op.id) node.id = sanitizeDfBlueprintId(op.id, node.id);
       const existingIndex = ast.nodes.findIndex((item) => item.id === node.id);

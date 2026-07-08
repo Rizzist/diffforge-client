@@ -4916,6 +4916,7 @@ export const LoopspaceGraphNode = styled.div`
   &[data-kind="manual"] { --loop-node-accent: 251, 191, 36; }
   &[data-kind="send_message"] { --loop-node-accent: 125, 176, 255; }
   &[data-kind="dispatch_todos"] { --loop-node-accent: 56, 189, 248; }
+  &[data-kind="notify_device"] { --loop-node-accent: 251, 146, 60; }
   &[data-kind="document_read"] { --loop-node-accent: 96, 165, 250; }
   &[data-kind="document_write"] { --loop-node-accent: 96, 165, 250; }
   &[data-kind="asset_read"] { --loop-node-accent: 45, 212, 191; }
@@ -4959,6 +4960,15 @@ export const LoopspaceGraphNode = styled.div`
     width: var(--loopspace-node-width, 420px);
     max-width: none;
     min-height: var(--loopspace-node-height, 178px);
+    align-items: start;
+    padding-right: var(--loopspace-output-gutter);
+  }
+  &[data-kind="notify_device"] {
+    --loopspace-output-gutter: var(--loopspace-node-output-gutter, 104px);
+    box-sizing: border-box;
+    width: var(--loopspace-node-width, 380px);
+    max-width: none;
+    min-height: var(--loopspace-node-height, 148px);
     align-items: start;
     padding-right: var(--loopspace-output-gutter);
   }
@@ -15553,8 +15563,10 @@ export const AudioRealtimeTranscriptPill = styled.div`
   border-radius: 999px;
   color: #e6ebf2;
   background: linear-gradient(180deg, rgba(10, 14, 22, 0.95), rgba(5, 8, 13, 0.9));
+  /* Rendered in the transparent widget window with as little as 2px of
+     margin to the window edge — a soft shadow would hard-clip there. */
   box-shadow:
-    0 10px 24px rgba(0, 0, 0, 0.34),
+    0 1px 2px rgba(0, 0, 0, 0.34),
     inset 0 1px 0 rgba(255, 255, 255, 0.1);
   font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12.5px;
@@ -15598,7 +15610,7 @@ export const AudioRealtimeTranscriptPill = styled.div`
     color: #1d1d1f;
     background: linear-gradient(180deg, rgba(255, 255, 255, 0.97), rgba(244, 246, 250, 0.94));
     box-shadow:
-      0 10px 24px rgba(0, 0, 0, 0.14),
+      0 1px 2px rgba(0, 0, 0, 0.14),
       inset 0 1px 0 rgba(255, 255, 255, 0.85);
   }
 
@@ -15655,9 +15667,11 @@ export const AudioWidgetErrorOverlayCard = styled.div`
   border-radius: 14px;
   color: #ffd9d9;
   background: rgba(46, 14, 18, 0.96);
+  /* Only 3px of transparent window ring around this card — the shadow must
+     stay inside it or it hard-clips at the window edge. */
   box-shadow:
     0 1px 0 rgba(255, 255, 255, 0.08) inset,
-    0 12px 24px rgba(0, 0, 0, 0.3);
+    0 1px 2px rgba(0, 0, 0, 0.3);
   font-size: 10px;
   font-weight: 650;
   line-height: 1.35;
@@ -15671,7 +15685,7 @@ export const AudioWidgetErrorOverlayCard = styled.div`
     background: rgba(255, 236, 236, 0.97);
     box-shadow:
       0 1px 0 rgba(255, 255, 255, 0.9) inset,
-      0 10px 22px rgba(120, 20, 20, 0.14);
+      0 1px 2px rgba(120, 20, 20, 0.14);
   }
 
   @keyframes audioWidgetErrorOverlayIn {
@@ -15815,9 +15829,12 @@ export const AudioBarSurface = styled.div`
   background:
     radial-gradient(circle at 16% 0%, rgba(var(--forge-accent-soft-rgb), 0.12), transparent 36%),
     linear-gradient(180deg, rgba(37, 42, 49, 0.96), rgba(12, 15, 19, 0.97));
+  /* The transparent widget window leaves only the shell's 3px ring around
+     this surface, so the drop shadow must fade out within it — anything
+     larger hard-clips at the window edge as a dark translucent band. */
   box-shadow:
     0 1px 0 rgba(255, 255, 255, 0.07) inset,
-    0 12px 30px rgba(0, 0, 0, 0.38);
+    0 1px 2px rgba(0, 0, 0, 0.38);
 
   ${AudioBarShell}[data-mode="notice"] & {
     width: min(100%, 386px);
@@ -15886,7 +15903,7 @@ export const AudioBarSurface = styled.div`
       linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(247, 247, 250, 0.97));
     box-shadow:
       0 1px 0 rgba(255, 255, 255, 0.96) inset,
-      0 10px 26px rgba(29, 29, 31, 0.16);
+      0 1px 2px rgba(29, 29, 31, 0.16);
   }
 `;
 
@@ -16165,7 +16182,9 @@ export const AudioBarRecordButton = styled.button`
   background:
     radial-gradient(circle at 30% 18%, rgba(var(--forge-accent-soft-rgb), 0.14), transparent 55%),
     var(--forge-surface-control);
-  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.32);
+  /* The hover-reveal row sits ~20px above the widget window edge — shadows
+     any softer than this hard-clip against it. */
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.32);
   cursor: pointer;
   transition: transform 130ms ease, border-color 130ms ease;
 
@@ -16192,7 +16211,7 @@ export const AudioBarRecordButton = styled.button`
     background:
       radial-gradient(circle at 30% 18%, rgba(var(--forge-accent-rgb), 0.08), transparent 55%),
       linear-gradient(180deg, rgba(255, 255, 255, 0.99), rgba(247, 247, 250, 0.98));
-    box-shadow: 0 10px 22px rgba(29, 29, 31, 0.2);
+    box-shadow: 0 4px 10px rgba(29, 29, 31, 0.2);
   }
 `;
 
@@ -16213,7 +16232,7 @@ export const AudioHistoryQuickButton = styled.button`
     rgba(19, 23, 30, 0.88);
   box-shadow:
     0 1px 0 rgba(255, 255, 255, 0.08) inset,
-    0 10px 22px rgba(0, 0, 0, 0.26);
+    0 4px 10px rgba(0, 0, 0, 0.26);
   cursor: pointer;
   transform: translateY(0) scale(1);
   transition:
@@ -16313,7 +16332,7 @@ export const AudioHistoryQuickButton = styled.button`
       rgba(255, 255, 255, 0.96);
     box-shadow:
       0 1px 0 rgba(255, 255, 255, 0.9) inset,
-      0 9px 18px rgba(29, 29, 31, 0.12);
+      0 4px 10px rgba(29, 29, 31, 0.12);
   }
 
   html[data-audio-widget-theme="light"] &[data-slot="previous"]::after,
@@ -16448,7 +16467,8 @@ export const AudioBarIdleLine = styled.span`
   border: 1px solid rgba(230, 236, 245, 0.2);
   border-radius: 999px;
   background: rgba(230, 236, 245, 0.34);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  /* Only 6px of idle window below the line — the shadow must fit there. */
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
   transition: background 150ms ease, width 160ms cubic-bezier(0.3, 0, 0.2, 1);
 
   ${AudioBarIdleShell}[data-hover="true"] & {
@@ -16459,7 +16479,7 @@ export const AudioBarIdleLine = styled.span`
   ${AudioBarIdleShell}[data-theme="light"] & {
     border-color: rgba(0, 0, 0, 0.16);
     background: rgba(29, 29, 31, 0.32);
-    box-shadow: 0 2px 8px rgba(29, 29, 31, 0.18);
+    box-shadow: 0 1px 4px rgba(29, 29, 31, 0.18);
   }
 
   ${AudioBarIdleShell}[data-theme="light"][data-hover="true"] & {
@@ -16547,9 +16567,11 @@ export const AudioWidgetHistoryTray = styled.div`
   background:
     radial-gradient(circle at 28% 0%, rgba(var(--forge-accent-soft-rgb), 0.12), transparent 46%),
     rgba(7, 10, 14, 0.88);
+  /* The tray spans the full 64px bubble window width — any shadow wider
+     than a couple px hard-clips at the window's side edges. */
   box-shadow:
     0 1px 0 rgba(255, 255, 255, 0.08) inset,
-    0 14px 28px rgba(0, 0, 0, 0.26);
+    0 2px 5px rgba(0, 0, 0, 0.26);
   opacity: 0;
   pointer-events: none;
   transform: translateX(-50%) translateY(-5px) scale(0.96);
@@ -16589,7 +16611,7 @@ export const AudioWidgetHistoryTray = styled.div`
       rgba(247, 248, 251, 0.94);
     box-shadow:
       0 1px 0 rgba(255, 255, 255, 0.92) inset,
-      0 12px 24px rgba(29, 29, 31, 0.14);
+      0 2px 5px rgba(29, 29, 31, 0.14);
   }
 `;
 

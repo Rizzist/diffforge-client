@@ -1277,20 +1277,51 @@ function buildTokenomicsAccountIdentityIndex(agentAccounts) {
   for (const providerId of PROVIDER_ACCOUNT_FILTER_PROVIDERS) {
     const entry = agentAccounts?.[providerId];
     const profiles = Array.isArray(entry?.profiles) ? entry.profiles : [];
+    // Provider-side display names are not unique across accounts — only use
+    // one as a row-matching alias when a single profile claims it.
+    const displayNameCounts = new Map();
+    for (const profile of profiles) {
+      const name = normalizeProviderAccountLabel(profile?.identity?.displayName);
+      if (name) displayNameCounts.set(name, (displayNameCounts.get(name) || 0) + 1);
+    }
     for (const profile of profiles) {
       const email = normalizeTokenomicsEmail(profile?.identity?.email || profile?.email);
       if (!email) continue;
       const group = tokenomicsEnsureAccountGroup(groups, providerId, email);
       const label = profile?.alias || (!profile?.isDefault ? profile?.label : "") || tokenomicsEmailLocalPart(email) || email;
       group.label = preferredTokenomicsAccountLabel(label, group.label, providerId);
+      if (providerId === "claude") {
+        // Claude registry labels name accounts exactly like the accounts
+        // settings UI; row labels (oauth display names, "Claude · x"
+        // fallbacks) must never override them during the summary passes.
+        // Other providers keep the historical row-label preference.
+        group.labelPinned = true;
+      }
       const profileId = String(profile?.id || "").trim();
       if (profileId) {
         index.byProfileId.set(tokenomicsIndexKey(providerId, profileId), group);
       }
       tokenomicsAddGroupKey(index, group, tokenomicsProviderProfileAccountKey(providerId, profile?.id));
+      // The oauth-derived key from the profile's own login state folds in
+      // rows recorded while this account was the Default login (historical
+      // "display name" chips) and everything the identity-first scanner
+      // records going forward. First registry owner wins: if a second group
+      // claims the same key (stale email after an account rename), leave the
+      // key with the first rather than flip-flopping rows between groups.
+      const oauthKey = String(profile?.identity?.tokenomicsAccountKey || "").trim();
+      if (oauthKey) {
+        const owner = index.byKey.get(tokenomicsIndexKey(providerId, oauthKey));
+        if (!owner || owner === group) {
+          tokenomicsAddGroupKey(index, group, oauthKey);
+        }
+      }
       tokenomicsProfileLabelCandidates(profile, providerId).forEach((candidate) => {
         tokenomicsAddGroupLabel(index, group, candidate);
       });
+      const displayName = normalizeProviderAccountLabel(profile?.identity?.displayName);
+      if (displayName && displayNameCounts.get(displayName) === 1) {
+        tokenomicsAddGroupLabel(index, group, profile.identity.displayName);
+      }
       if (profile?.isActive) {
         index.activeByProvider.set(providerId, group);
       }
@@ -1406,7 +1437,9 @@ function canonicalizeTokenomicsAccountSummary(summary = {}, agentAccounts = null
       if (!group) return;
       const key = rowProviderAccountKey(row);
       tokenomicsAddGroupKey(index, group, key, rowTotal(row));
-      group.label = preferredTokenomicsAccountLabel(rowProviderAccountLabel(row), group.label, group.providerId);
+      if (!group.labelPinned) {
+        group.label = preferredTokenomicsAccountLabel(rowProviderAccountLabel(row), group.label, group.providerId);
+      }
       tokenomicsAddGroupLabel(index, group, rowProviderAccountLabel(row));
     });
   }

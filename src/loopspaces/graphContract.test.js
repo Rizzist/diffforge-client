@@ -872,3 +872,133 @@ test("graph patches preserve deterministic asset write operation metadata", () =
   assert.equal(assetNode?.props?.operation, "replace");
   assert.equal(assetNode?.props?.content_template, "Latest: {{body_json}}");
 });
+
+test("graph contract exposes execution branches for notify device nodes", () => {
+  const notifyDeviceNode = { id: "notify-device-1", kind: "notify_device", label: "Notify device" };
+
+  assert.deepEqual(
+    loopspaceGraphOutputPortsForNode(notifyDeviceNode).map((port) => port.id),
+    ["exec", "success", "failure", "interrupt"],
+  );
+  assert.equal(loopspaceGraphVisualDefaultsForNode(notifyDeviceNode).sized, true);
+});
+
+test("graph contract accepts completed send-message step edges to notify device nodes", () => {
+  const notifyDeviceNode = { id: "notify-device-1", kind: "notify_device", label: "Notify device" };
+  const validation = validateLoopspaceGraphAst({
+    nodes: [sendMessageNode, stepNode, notifyDeviceNode],
+    edges: [{
+      id: "edge-step-notify",
+      from: stepNode.id,
+      fromPort: "success",
+      to: notifyDeviceNode.id,
+      toPort: "in",
+    }],
+  });
+
+  assert.equal(validation.ok, true);
+});
+
+test("graph contract rejects notify device execution branches into asset write", () => {
+  const notifyDeviceNode = { id: "notify-device-1", kind: "notify_device", label: "Notify device" };
+  for (const fromPort of ["exec", "success", "failure", "interrupt"]) {
+    const validation = validateLoopspaceGraphEdgeCandidate(notifyDeviceNode, assetWriteNode, {
+      fromPort,
+      toPort: "in",
+    });
+    assert.equal(validation.ok, false);
+    assert.match(validation.error, /Asset write nodes/);
+  }
+});
+
+test("graph contract rejects legacy out edges from notify device nodes", () => {
+  const notifyDeviceNode = { id: "notify-device-1", kind: "notify_device", label: "Notify device" };
+  const validation = validateLoopspaceGraphEdgeCandidate(notifyDeviceNode, runScriptNode, {
+    fromPort: "out",
+    toPort: "in",
+    allowLegacy: true,
+  });
+
+  assert.equal(validation.ok, false);
+});
+
+test("graph patches create notify device nodes with notification metadata", () => {
+  const patched = applyDfBlueprintPatchOperations("", [
+    {
+      op: "add_node",
+      id: "notify-phone",
+      kind: "notify_device",
+      label: "Notify phone",
+      device_id: "web-ios-phone-1",
+      device_label: "iPhone",
+      title: "Loop update",
+      body: "\"{{from_node}}\" -> {{branch}}",
+      url: "https://diffforge.ai/dashboard",
+      delivery: "push",
+    },
+    {
+      op: "connect",
+      from: "notify-phone",
+      from_port: "success",
+      to: "notify-phone-followup",
+      to_port: "in",
+    },
+  ].filter((op) => op.op === "add_node"));
+  const ast = parseDfBlueprintSource(patched);
+  const notifyNode = ast.nodes.find((node) => node.id === "notify-phone");
+
+  assert.equal(notifyNode?.kind, "notify_device");
+  assert.equal(notifyNode?.props?.device_id, "web-ios-phone-1");
+  assert.equal(notifyNode?.props?.device_label, "iPhone");
+  assert.equal(notifyNode?.props?.title, "Loop update");
+  assert.equal(notifyNode?.props?.body, '"{{from_node}}" -> {{branch}}');
+  assert.equal(notifyNode?.props?.url, "https://diffforge.ai/dashboard");
+  assert.equal(notifyNode?.props?.delivery, "push");
+});
+
+test("graph patches default and clamp notify device delivery", () => {
+  const patched = applyDfBlueprintPatchOperations("", [
+    {
+      op: "add_node",
+      id: "notify-any",
+      kind: "notify_device",
+      label: "Notify device",
+      delivery: "carrier-pigeon",
+    },
+  ]);
+  const ast = parseDfBlueprintSource(patched);
+  const notifyNode = ast.nodes.find((node) => node.id === "notify-any");
+
+  assert.equal(notifyNode?.props?.delivery, "auto");
+  assert.equal(notifyNode?.props?.device_id || "", "");
+});
+
+test("graph patches update notify device props through aliases", () => {
+  const source = applyDfBlueprintPatchOperations("", [
+    {
+      op: "add_node",
+      id: "notify-laptop",
+      kind: "notify_device",
+      label: "Notify laptop",
+      device_id: "macbook-1",
+    },
+  ]);
+  const updated = applyDfBlueprintPatchOperations(source, [
+    {
+      op: "update_node_props",
+      id: "notify-laptop",
+      notification_title: "Build finished",
+      message: "{{loop_name}} completed",
+      link: "https://diffforge.ai/dashboard?tab=loops",
+      delivery_mode: "native",
+    },
+  ]);
+  const ast = parseDfBlueprintSource(updated);
+  const notifyNode = ast.nodes.find((node) => node.id === "notify-laptop");
+
+  assert.equal(notifyNode?.props?.title, "Build finished");
+  assert.equal(notifyNode?.props?.body, "{{loop_name}} completed");
+  assert.equal(notifyNode?.props?.url, "https://diffforge.ai/dashboard?tab=loops");
+  assert.equal(notifyNode?.props?.delivery, "native");
+  assert.equal(notifyNode?.props?.device_id, "macbook-1");
+});
