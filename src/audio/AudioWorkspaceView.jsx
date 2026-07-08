@@ -4907,6 +4907,28 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                       />
                     )}
                   </AudioInputInitializeButton>
+                  {/* The recorder is the natural next step after initializing,
+                      but its own section lives further down the page — surface
+                      the action here and pulse it while the mic is live and
+                      the recorder is still closed. */}
+                  <AudioInputInitializeButton
+                    aria-label={recorderOpen ? "Close floating recorder" : "Open floating recorder"}
+                    data-active={recorderOpen ? "true" : "false"}
+                    disabled={recorderActionDisabled}
+                    onClick={recorderAction}
+                    title={recorderOpen ? "Close the floating recorder." : "Open the floating recorder widget."}
+                    type="button"
+                  >
+                    {recorderOpen ? (
+                      <ButtonCloseIcon aria-hidden="true" />
+                    ) : (
+                      <ButtonMicIcon aria-hidden="true" />
+                    )}
+                    <span>{recorderButtonLabel}</span>
+                    {audioInputState === "previewing" && !recorderOpen && !recorderActionDisabled && (
+                      <AudioButtonAttentionFlash aria-hidden="true" />
+                    )}
+                  </AudioInputInitializeButton>
                 </SettingsSectionHeader>
 
                 <AudioSettingsCard aria-label="Audio input settings" ref={audioInputSourcePanelRef}>
