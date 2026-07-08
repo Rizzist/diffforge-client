@@ -65,6 +65,7 @@ import {
 import {
   AgentTranscript,
   SessionUsageChip,
+  WorkingRow,
   buildDesktopTranscriptItems,
   desktopTimestampMs,
   normalizeDesktopDiffSummary,
@@ -195,8 +196,12 @@ const DetailHeader = styled.header`
   left: 14px;
   display: flex;
   min-width: 0;
+  /* Narrow panes (UI View can sit near ~500px): chips wrap instead of
+     overflowing horizontally; the measured anchor inset picks up the taller
+     header so the transcript still clears it. */
+  flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 6px 8px;
   pointer-events: none;
 
   > * {
@@ -5855,6 +5860,17 @@ function WorkspaceThreadDetail({
     [activeAgentId, agentStatuses],
   );
   const activeProviderBinding = getWorkspaceThreadProviderBinding(thread, activeAgentId);
+  // First-open transcript hydration: the thread already knows its native
+  // session, but the transcript tail hasn't landed yet (transcriptHydratedAt
+  // is only stamped by hydrateWorkspaceThreadSessionTranscript, which also
+  // flips transcriptStatus to "ready"). Show a loading row instead of the
+  // empty transcript until the hydrated messages arrive.
+  const transcriptHydrating = Boolean(
+    !transcriptItems.length
+      && !thread?.transcriptHydratedAt
+      && thread?.transcriptStatus !== "ready"
+      && (thread?.transcriptSessionId || activeProviderBinding?.nativeSessionId),
+  );
   const activeLiveTerminal = getLiveTerminalForThread(
     thread,
     activeProviderBinding,
@@ -7686,29 +7702,46 @@ function WorkspaceThreadDetail({
           <ExpandMore aria-hidden="true" />
         </HeaderIconButton>
       </DetailHeader>
-      <TranscriptScroll ref={transcriptScrollRef}>
-        <AgentTranscript
-          anchorTopInsetPx={transcriptAnchorInsetPx}
-          busy={transcriptBusy}
-          diffSummaries={transcriptDiffSummaries}
-          emptyLabel="No synced chat records yet."
-          itemIdPrefix="workspace-thread-message"
-          items={transcriptItems}
-          messages={messages}
-          onOpenSession={typeof onOpenTranscriptSession === "function" ? onOpenTranscriptSession : null}
-          onUserMessageAction={handleTranscriptUserMessageAction}
-          scrollRef={transcriptScrollRef}
-          sessionId={thread?.transcriptSessionId || activeProviderBinding?.nativeSessionId || ""}
-          windowKey={[
-            workspace?.id || thread?.workspaceId || "workspace",
-            thread?.id || "thread",
-            activeAgentId,
-            thread?.transcriptSessionId || activeProviderBinding?.nativeSessionId || "",
-            density,
-          ].join(":")}
-          workingLabel={transcriptWorkingLabel}
-          workingStartedAtMs={transcriptWorkingStartedAtMs}
-        />
+      <TranscriptScroll
+        ref={transcriptScrollRef}
+        style={transcriptAnchorInsetPx > 0
+          // TranscriptColumn's top padding reads this var so the first rows
+          // start below the floating chip header (both densities, any rail
+          // state — the inset is re-measured by ResizeObserver).
+          ? { "--transcript-top-inset": `${transcriptAnchorInsetPx}px` }
+          : undefined}
+      >
+        {transcriptHydrating ? (
+          // transcriptHydrating implies zero transcript items, so the
+          // transcript below would only render its empty label; show the
+          // shimmering working row instead until hydration lands.
+          <TranscriptInner>
+            <WorkingRow label="Loading history" />
+          </TranscriptInner>
+        ) : (
+          <AgentTranscript
+            anchorTopInsetPx={transcriptAnchorInsetPx}
+            busy={transcriptBusy}
+            diffSummaries={transcriptDiffSummaries}
+            emptyLabel="No synced chat records yet."
+            itemIdPrefix="workspace-thread-message"
+            items={transcriptItems}
+            messages={messages}
+            onOpenSession={typeof onOpenTranscriptSession === "function" ? onOpenTranscriptSession : null}
+            onUserMessageAction={handleTranscriptUserMessageAction}
+            scrollRef={transcriptScrollRef}
+            sessionId={thread?.transcriptSessionId || activeProviderBinding?.nativeSessionId || ""}
+            windowKey={[
+              workspace?.id || thread?.workspaceId || "workspace",
+              thread?.id || "thread",
+              activeAgentId,
+              thread?.transcriptSessionId || activeProviderBinding?.nativeSessionId || "",
+              density,
+            ].join(":")}
+            workingLabel={transcriptWorkingLabel}
+            workingStartedAtMs={transcriptWorkingStartedAtMs}
+          />
+        )}
       </TranscriptScroll>
 
       <ComposerShell

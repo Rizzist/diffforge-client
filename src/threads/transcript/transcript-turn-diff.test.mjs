@@ -311,6 +311,42 @@ test("turn_diff messages never surface as transcript rows", () => {
   assert.equal(rows.some((row) => isTurnDiffMessage(row.message || {})), false);
 });
 
+test("internal context user messages never surface as transcript rows", () => {
+  const items = [
+    ...turnItems(),
+    {
+      id: "noise-aborted",
+      type: "message",
+      turnId: "turn-1",
+      message: {
+        id: "noise-aborted",
+        role: "user",
+        content: "<turn_aborted>codex marked the previous turn aborted</turn_aborted>",
+      },
+    },
+    {
+      id: "ag-noise",
+      type: "activityGroup",
+      turnId: "turn-1",
+      messages: [
+        {
+          id: "noise-interrupted",
+          role: "user",
+          content: "<turn_interrupted>user interrupted the turn</turn_interrupted>",
+        },
+        {
+          id: "noise-env",
+          role: "user",
+          content: "<environment_context>cwd=/repo</environment_context>",
+        },
+      ],
+    },
+  ];
+  const rows = flattenTranscriptItems(items);
+  const userRows = rows.filter((row) => row.kind === "user");
+  assert.deepEqual(userRows.map((row) => row.message.id), ["u-1", "u-2"]);
+});
+
 /* ------------------------------------------------------------------ */
 /* Attachment (turn_id match + time-window fallback)                    */
 /* ------------------------------------------------------------------ */

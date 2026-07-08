@@ -198,6 +198,10 @@ struct VideoToolAvailability {
     path: Option<String>,
     version: Option<String>,
     source: Option<String>,
+    // ffmpeg only: whether the build can render text/captions (drawtext).
+    // Homebrew's ffmpeg 8 formula ships without it; the managed static
+    // builds always have it. None for ffprobe / not-installed.
+    text_support: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2126,6 +2130,40 @@ fn video_scan_media_files(folder_root: &std::path::Path) -> Vec<std::path::PathB
     files
 }
 
+static VIDEO_FFMPEG_DRAWTEXT_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, bool>>,
+> = std::sync::OnceLock::new();
+
+// Homebrew's ffmpeg 8 formula dropped libfreetype, so a system build can be
+// missing the drawtext filter entirely — text/caption rendering must know up
+// front instead of failing mid-export with a raw ffmpeg error. Cached per
+// binary path for the app's lifetime.
+fn video_ffmpeg_supports_drawtext(ffmpeg_path: &str) -> bool {
+    let cache = VIDEO_FFMPEG_DRAWTEXT_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(known) = guard.get(ffmpeg_path) {
+            return *known;
+        }
+    }
+    let supported = run_command_capture(
+        ffmpeg_path,
+        &["-hide_banner", "-filters"],
+        None,
+        std::time::Duration::from_secs(5),
+        None,
+    )
+    .ok()
+    .map(|capture| {
+        command_output_text(&capture.stdout, &capture.stderr).contains(" drawtext ")
+    })
+    .unwrap_or(false);
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(ffmpeg_path.to_string(), supported);
+    }
+    supported
+}
+
 fn video_version_for_tool(path: &str) -> Option<String> {
     let capture = run_command_capture(
         path,
@@ -2201,6 +2239,9 @@ fn video_find_common_tool(binary: &str) -> Option<String> {
 
 fn video_detect_tool(app: &tauri::AppHandle, binary: &str) -> VideoToolAvailability {
     let executable = video_executable_name(binary);
+    let text_support_for = |path: &str| -> Option<bool> {
+        (binary == "ffmpeg").then(|| video_ffmpeg_supports_drawtext(path))
+    };
     if let Ok(managed_dir) = video_app_tools_bin_directory(app) {
         let candidate = managed_dir.join(&executable);
         if video_unix_executable(&candidate) {
@@ -2208,6 +2249,7 @@ fn video_detect_tool(app: &tauri::AppHandle, binary: &str) -> VideoToolAvailabil
             return VideoToolAvailability {
                 installed: true,
                 version: video_version_for_tool(&path),
+                text_support: text_support_for(&path),
                 path: Some(path),
                 source: Some("managed".to_string()),
             };
@@ -2217,6 +2259,7 @@ fn video_detect_tool(app: &tauri::AppHandle, binary: &str) -> VideoToolAvailabil
         return VideoToolAvailability {
             installed: true,
             version: video_version_for_tool(&path),
+            text_support: text_support_for(&path),
             path: Some(path),
             source: Some("system".to_string()),
         };
@@ -2225,6 +2268,7 @@ fn video_detect_tool(app: &tauri::AppHandle, binary: &str) -> VideoToolAvailabil
         return VideoToolAvailability {
             installed: true,
             version: video_version_for_tool(&path),
+            text_support: text_support_for(&path),
             path: Some(path),
             source: Some("system".to_string()),
         };
@@ -2234,6 +2278,7 @@ fn video_detect_tool(app: &tauri::AppHandle, binary: &str) -> VideoToolAvailabil
         path: None,
         version: None,
         source: None,
+        text_support: None,
     }
 }
 
@@ -2292,6 +2337,24 @@ async fn video_download_to_path(
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     progress_message: &str,
 ) -> Result<(), String> {
+    video_download_to_path_windowed(app, job_id, url, target_path, cancel, progress_message, 0.0, 100.0)
+        .await
+}
+
+// Downloads reporting into a [base, base+span] slice of the overall install
+// bar, so multi-archive installs read as ONE monotonic 0→100 instead of the
+// bar snapping back to 0 for each file.
+#[allow(clippy::too_many_arguments)]
+async fn video_download_to_path_windowed(
+    app: &tauri::AppHandle,
+    job_id: &str,
+    url: &str,
+    target_path: &std::path::Path,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    progress_message: &str,
+    percent_base: f64,
+    percent_span: f64,
+) -> Result<(), String> {
     use std::io::Write as _;
     if let Some(parent) = target_path.parent() {
         std::fs::create_dir_all(parent)
@@ -2329,7 +2392,8 @@ async fn video_download_to_path(
         downloaded_bytes += chunk.len() as u64;
         let percent = total_bytes
             .filter(|total| *total > 0)
-            .map(|total| (downloaded_bytes as f64 / total as f64) * 100.0);
+            .map(|total| percent_base + (downloaded_bytes as f64 / total as f64) * percent_span)
+            .or(Some(percent_base));
         video_emit_tools_install_progress(
             app,
             job_id,
@@ -2566,32 +2630,36 @@ async fn video_install_from_archives(
     {
         let ffmpeg_zip = downloads_dir.join("ffmpeg.zip");
         let ffprobe_zip = downloads_dir.join("ffprobe.zip");
-        video_download_to_path(
+        video_download_to_path_windowed(
             app,
             job_id,
             video_tool_download_url("macos-ffmpeg-zip"),
             &ffmpeg_zip,
             cancel,
-            "Downloading ffmpeg.",
+            "Downloading ffmpeg (1/2)…",
+            0.0,
+            60.0,
         )
         .await?;
-        video_download_to_path(
+        video_download_to_path_windowed(
             app,
             job_id,
             video_tool_download_url("macos-ffprobe-zip"),
             &ffprobe_zip,
             cancel,
-            "Downloading ffprobe.",
+            "Downloading ffprobe (2/2)…",
+            60.0,
+            30.0,
         )
         .await?;
         video_emit_tools_install_progress(
             app,
             job_id,
             "extracting",
-            "Extracting video tools.",
+            "Extracting video tools…",
             0,
             None,
-            None,
+            Some(92.0),
             false,
             None,
         );
@@ -2606,23 +2674,25 @@ async fn video_install_from_archives(
     #[cfg(windows)]
     {
         let archive_path = downloads_dir.join("ffmpeg-win64.zip");
-        video_download_to_path(
+        video_download_to_path_windowed(
             app,
             job_id,
             video_tool_download_url("windows-win64-zip"),
             &archive_path,
             cancel,
-            "Downloading ffmpeg for Windows.",
+            "Downloading ffmpeg for Windows…",
+            0.0,
+            88.0,
         )
         .await?;
         video_emit_tools_install_progress(
             app,
             job_id,
             "extracting",
-            "Extracting video tools.",
+            "Extracting video tools…",
             0,
             None,
-            None,
+            Some(92.0),
             false,
             None,
         );
@@ -2640,23 +2710,25 @@ async fn video_install_from_archives(
         };
         let xz_path = downloads_dir.join("ffmpeg-linux.tar.xz");
         let tar_path = downloads_dir.join("ffmpeg-linux.tar");
-        video_download_to_path(
+        video_download_to_path_windowed(
             app,
             job_id,
             archive_url,
             &xz_path,
             cancel,
-            "Downloading ffmpeg for Linux.",
+            "Downloading ffmpeg for Linux…",
+            0.0,
+            88.0,
         )
         .await?;
         video_emit_tools_install_progress(
             app,
             job_id,
             "extracting",
-            "Extracting video tools.",
+            "Extracting video tools…",
             0,
             None,
-            None,
+            Some(92.0),
             false,
             None,
         );
@@ -2698,7 +2770,11 @@ async fn video_tools_install_worker(
             None,
         );
         let status = video_tools_status_for(&app);
-        if status.ffmpeg.installed && status.ffprobe.installed {
+        // A detected build without drawtext (Homebrew's ffmpeg 8 dropped
+        // libfreetype) can't render text/captions — treat it as incomplete so
+        // the install replaces it with the full static build.
+        let needs_full_build = status.ffmpeg.text_support == Some(false);
+        if status.ffmpeg.installed && status.ffprobe.installed && !needs_full_build {
             let message = status
                 .ffmpeg
                 .version
@@ -2720,9 +2796,14 @@ async fn video_tools_install_worker(
         }
 
         #[cfg(target_os = "macos")]
-        if video_install_with_homebrew(&app, &job_id, &cancel)? {
+        if !needs_full_build && video_install_with_homebrew(&app, &job_id, &cancel)? {
             let status = video_tools_status_for(&app);
-            if status.ffmpeg.installed && status.ffprobe.installed {
+            // Homebrew's success only counts when its build can render text;
+            // otherwise fall through to the full static archives.
+            if status.ffmpeg.installed
+                && status.ffprobe.installed
+                && status.ffmpeg.text_support != Some(false)
+            {
                 let message = status
                     .ffmpeg
                     .version
@@ -7777,10 +7858,12 @@ fn video_mcp_pending_planned_asset_info(
         return None;
     }
     let jobs = video_read_generation_jobs(&video_generation_jobs_path(media_root)).ok()?;
+    // Any live job's planned path is addable as a ghost clip: a missing
+    // expected duration falls back to the caller's durationMs (or the clip
+    // default) in video_mcp_clip_duration_for_asset.
     let job = jobs.iter().find(|job| {
         !job.done
             && job.error.is_none()
-            && job.expected_duration_ms.is_some()
             && job.planned_paths.iter().any(|planned| {
                 video_normalize_relative_path(planned)
                     .map(|planned| planned == normalized)
@@ -7789,7 +7872,7 @@ fn video_mcp_pending_planned_asset_info(
     })?;
     Some(VideoMcpAssetInfo {
         rel_path: video_relative_path(root, &abs),
-        kind: "video",
+        kind: video_media_kind_for_extension(&abs).unwrap_or("video"),
         duration_ms: job.expected_duration_ms,
         has_audio: false,
         width: None,
@@ -9746,20 +9829,59 @@ fn video_ffmpeg_number(value: f64) -> String {
     }
 }
 
+// drawtext text values ride through TWO stacked parsers before reaching the
+// filter: the filtergraph splitter consumes one escape layer, the per-option
+// tokenizer the next (the filter's own third layer is disabled with
+// expansion=none). Quoting with '…' does NOT work — a \' inside quotes
+// terminates the quote (ffmpeg quoting has no in-quote escapes), which is how
+// "don't" once broke the whole graph into a filter named "5.920000". This is
+// the double-escape recipe from ffmpeg's "Notes on filtergraph escaping",
+// verified against the managed evermeet build.
 fn video_escape_drawtext(value: &str) -> String {
     let mut escaped = String::new();
     for ch in value.chars() {
         match ch {
-            '\\' => escaped.push_str("\\\\"),
-            '\'' => escaped.push_str("\\'"),
-            ':' => escaped.push_str("\\:"),
-            '%' => escaped.push_str("\\%"),
+            '\\' => escaped.push_str("\\\\\\\\"),
+            '\'' => escaped.push_str("\\\\\\'"),
+            ':' => escaped.push_str("\\\\:"),
             ',' => escaped.push_str("\\,"),
+            ';' => escaped.push_str("\\;"),
+            '[' => escaped.push_str("\\["),
+            ']' => escaped.push_str("\\]"),
             '\n' | '\r' => escaped.push(' '),
             _ => escaped.push(ch),
         }
     }
     escaped
+}
+
+// Static ffmpeg builds (evermeet on macOS, BtbN on Windows) can't load the
+// system fontconfig, so drawtext without an explicit fontfile dies with
+// "Cannot load default config file". Point it at a font that ships with the
+// OS; when none of the known paths exist, fall back to fontconfig.
+fn video_drawtext_fontfile() -> Option<&'static str> {
+    #[cfg(target_os = "macos")]
+    const CANDIDATES: &[&str] = &[
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/SFNS.ttf",
+    ];
+    #[cfg(target_os = "windows")]
+    const CANDIDATES: &[&str] = &[
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
+        "C:/Windows/Fonts/calibri.ttf",
+    ];
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    const CANDIDATES: &[&str] = &[
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ];
+    CANDIDATES
+        .iter()
+        .copied()
+        .find(|path| std::path::Path::new(path).is_file())
 }
 
 fn video_escape_filter_color(value: &str, fallback: &str) -> String {
@@ -10082,9 +10204,13 @@ fn video_build_export_filter(
         } else {
             clip.text.clone()
         };
+        let fontfile = video_drawtext_fontfile()
+            .map(|path| format!("fontfile={}:", video_escape_drawtext(path)))
+            .unwrap_or_default();
         let mut draw = format!(
-            "[{}]drawtext=text='{}':fontsize={}:fontcolor={}:x=(w-text_w)*{}:y=(h-text_h)*{}:enable='between(t,{},{})'",
+            "[{}]drawtext=expansion=none:{}text={}:fontsize={}:fontcolor={}:x=(w-text_w)*{}:y=(h-text_h)*{}:enable='between(t,{},{})'",
             previous,
+            fontfile,
             video_escape_drawtext(&text),
             video_ffmpeg_number(clip.font_size),
             video_escape_filter_color(&clip.color, "#ffffff"),
@@ -10485,6 +10611,12 @@ fn video_run_export_blocking(
     if let Some(parent) = output_abs.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Unable to create video exports directory: {error}"))?;
+    }
+    if !text_clips.is_empty() && !video_ffmpeg_supports_drawtext(&ffmpeg_path) {
+        return Err(
+            "This export includes text or caption clips, but the detected ffmpeg build cannot render text (no drawtext filter — Homebrew's ffmpeg 8 dropped it). Install the bundled video tools from the editor's Install chip, then export again."
+                .to_string(),
+        );
     }
     let (filter_complex, video_output, audio_output) = video_build_export_filter(
         &project,
@@ -10933,6 +11065,13 @@ fn video_render_frame_jpeg_bytes_blocking(
         video_collect_export_clips(&root, &media_root, &project, status.ffprobe.path.as_deref())?;
     let (media_clips, text_clips, input_seek_ms, render_seek_ms, render_total_ms) =
         video_render_frame_window_clips(&media_clips, &text_clips, seek_ms);
+    // Preview frames degrade gracefully on drawtext-less ffmpeg builds:
+    // render the frame without text overlays rather than failing video_look.
+    let text_clips = if text_clips.is_empty() || video_ffmpeg_supports_drawtext(&ffmpeg_path) {
+        text_clips
+    } else {
+        Vec::new()
+    };
     let render_total_ms = render_total_ms.max(render_seek_ms.saturating_add(1)).max(1);
     let (mut filter_complex, video_output, _) = video_build_export_filter(
         &project,
@@ -13392,6 +13531,20 @@ async fn video_generate_start(
     let recorded_request = video_recorded_generate_request(kind, &model, &request);
     let planned_paths =
         video_plan_generated_paths(&root, &media_root, provider, &request, kind, created_at_ms);
+    // The requested duration sizes the timeline/library ghost from the moment
+    // the job is submitted (0% included) — video defaults to the cloud's 5s
+    // when unspecified; audio only when explicitly requested.
+    let requested_duration_sec = request
+        .params
+        .as_ref()
+        .and_then(|params| params.duration_sec)
+        .filter(|value| value.is_finite() && *value > 0.0);
+    let expected_duration_ms = match kind {
+        "video" => Some(requested_duration_sec.unwrap_or(5.0)),
+        "audio" => requested_duration_sec,
+        _ => None,
+    }
+    .map(|sec| (sec.clamp(0.2, 600.0) * 1000.0).round() as u64);
     let registry_path = video_generation_jobs_path(&media_root);
     let entry = VideoPersistentGenerateJob {
         job_id: job_id.clone(),
@@ -13406,7 +13559,7 @@ async fn video_generate_start(
         created_at_ms,
         done: false,
         error: None,
-        expected_duration_ms: None,
+        expected_duration_ms,
         source_path: None,
     };
     video_upsert_generation_job(&registry_path, entry)?;
@@ -13424,7 +13577,7 @@ async fn video_generate_start(
         created_at_ms,
         registry_path,
         last_registry_write_ms: std::sync::Arc::new(std::sync::Mutex::new(created_at_ms)),
-        expected_duration_ms: None,
+        expected_duration_ms,
         source_path: None,
     };
     tauri::async_runtime::spawn(video_generate_worker(context, request, cancel));
@@ -14419,6 +14572,10 @@ async fn video_mcp_generate(
                 row["note"] = serde_json::json!(
                     "Composition declared. Author the HTML at sourcePath (see the AGENTS.md beside it; keep the root data-duration accurate), then call video_generate with action \"render\" and this jobId. The mp4 lands at plannedPaths[0]; a timeline clip added at that path shows as a placeholder until then."
                 );
+            } else {
+                row["note"] = serde_json::json!(
+                    "Generation started. For timeline use, add plannedPaths[0] as a clip NOW (video_edit addClip) — it renders as a generating placeholder and swaps to the real media when the job lands. Poll with action \"status\" and this jobId."
+                );
             }
             Ok(row)
         }
@@ -14919,6 +15076,34 @@ async fn video_panel_close(
         emit_video_panel_closed(&app, &workspace_text, &pane_text, &label);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod video_drawtext_tests {
+    use super::*;
+
+    // Pinned to strings verified against the managed evermeet ffmpeg build:
+    // both parser layers consume one escape each, expansion=none disables the
+    // filter's own third layer.
+    #[test]
+    fn video_escape_drawtext_double_escapes_for_filtergraph() {
+        assert_eq!(video_escape_drawtext("don't"), "don\\\\\\'t");
+        assert_eq!(video_escape_drawtext("a, b"), "a\\, b");
+        assert_eq!(video_escape_drawtext("time: now"), "time\\\\: now");
+        assert_eq!(video_escape_drawtext("[hi]; ok"), "\\[hi\\]\\; ok");
+        assert_eq!(video_escape_drawtext("50% off"), "50% off");
+        assert_eq!(video_escape_drawtext("back\\slash"), "back\\\\\\\\slash");
+        assert_eq!(video_escape_drawtext("line\nbreak"), "line break");
+    }
+
+    // The full caption from the field failure: an apostrophe used to
+    // terminate the quoted text value and shatter the graph into a filter
+    // named after the enable timestamp ("No such filter: '5.920000'").
+    #[test]
+    fn video_escape_drawtext_survives_apostrophe_comma_caption() {
+        let escaped = video_escape_drawtext("You don't chat, you queue.");
+        assert_eq!(escaped, "You don\\\\\\'t chat\\, you queue.");
+    }
 }
 
 #[cfg(test)]

@@ -944,6 +944,29 @@ fn macos_push_to_talk_shortcut_is_reserved(_shortcut: &str) -> bool {
     false
 }
 
+/// A single left/right modifier keycode with no other key ("ShiftLeft",
+/// "AltRight", …), as produced by the capture UI for bare modifier presses.
+#[cfg(not(target_os = "macos"))]
+fn audio_shortcut_is_bare_modifier_key(shortcut: &str) -> bool {
+    matches!(
+        shortcut
+            .trim()
+            .replace([' ', '-', '_'], "")
+            .to_ascii_uppercase()
+            .as_str(),
+        "SHIFTLEFT"
+            | "SHIFTRIGHT"
+            | "ALTLEFT"
+            | "ALTRIGHT"
+            | "CONTROLLEFT"
+            | "CONTROLRIGHT"
+            | "METALEFT"
+            | "METARIGHT"
+            | "SUPERLEFT"
+            | "SUPERRIGHT"
+    )
+}
+
 fn validate_audio_shortcut_for_action(
     action: AudioShortcutAction,
     shortcut: &str,
@@ -957,6 +980,17 @@ fn validate_audio_shortcut_for_action(
         return Ok(());
         #[cfg(not(target_os = "macos"))]
         return Err(audio_fn_key_unsupported_message());
+    }
+
+    // Windows/Linux global-hotkey registration cannot bind a bare modifier
+    // key (RegisterHotKey has no left/right modifier keycodes), and the
+    // failure otherwise surfaces as a cryptic registration error mid-save.
+    #[cfg(not(target_os = "macos"))]
+    if audio_shortcut_is_bare_modifier_key(shortcut) {
+        return Err(
+            "A modifier key on its own can't be a global shortcut on this platform. Use a combo like Ctrl+Space, or the Menu key."
+                .to_string(),
+        );
     }
 
     if action == AudioShortcutAction::PushToTalk
@@ -1952,7 +1986,10 @@ fn register_audio_context_menu_keyboard_hook(app: &AppHandle) -> Result<(), Stri
         return Ok(());
     }
 
-    Err("Unable to install the Windows Menu key hook for hold-to-record.".to_string())
+    Err(format!(
+        "Unable to install the Windows Menu key hook for hold-to-record: {}",
+        std::io::Error::last_os_error()
+    ))
 }
 
 #[cfg(not(windows))]

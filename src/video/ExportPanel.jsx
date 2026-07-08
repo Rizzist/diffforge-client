@@ -85,7 +85,13 @@ const InlineRow = styled.div`
 `;
 
 // Render the timeline through ffmpeg into media/exports with live progress.
-export default function ExportPanel({ ffmpegReady = false, project, projectPath = "", repoPath = "" }) {
+export default function ExportPanel({
+  ffmpegReady = false,
+  ffmpegTextSupport = null,
+  project,
+  projectPath = "",
+  repoPath = "",
+}) {
   const durationMs = useMemo(() => projectDurationMs(project), [project]);
   const [fileName, setFileName] = useState("");
   const [preset, setPreset] = useState("project");
@@ -210,6 +216,13 @@ export default function ExportPanel({ ffmpegReady = false, project, projectPath 
       </VideoHint>
       {!ffmpegReady ? (
         <VideoErrorText>ffmpeg is not installed — use the Install chip in the top bar first.</VideoErrorText>
+      ) : null}
+      {ffmpegReady && ffmpegTextSupport === false ? (
+        <VideoErrorText>
+          Your ffmpeg build can’t render text or captions (Homebrew’s ffmpeg 8 removed the
+          drawtext filter). Use the Install chip in the top bar to get the bundled build —
+          exports with text clips will fail until then.
+        </VideoErrorText>
       ) : null}
       {agentJob ? (
         <VideoHint>

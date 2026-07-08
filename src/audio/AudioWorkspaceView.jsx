@@ -628,6 +628,23 @@ const AUDIO_WIDGET_CLOSE_ANIMATION_MS = 240;
 const EMPTY_AUDIO_INPUT_STATS = { bufferMs: 0, peak: 0, rms: 0 };
 const AUDIO_SHORTCUT_ACTION_PUSH_TO_TALK = "push-to-talk";
 const AUDIO_SHORTCUT_ACTION_CANCEL = "cancel";
+const AUDIO_SHORTCUT_CAPTURE_HINT_MS = 7000;
+// The save path re-registers global hotkeys on the native main thread; if
+// that thread is wedged the invoke would otherwise hang forever with the
+// badge stuck on "Saving" and capture stuck on "Listening…".
+const AUDIO_SHORTCUT_SAVE_TIMEOUT_MS = 10000;
+
+function audioShortcutInvokeWithTimeout(promise, message) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      window.setTimeout(() => {
+        reject(new Error(message));
+      }, AUDIO_SHORTCUT_SAVE_TIMEOUT_MS);
+    }),
+  ]);
+}
+
 const AUDIO_MODIFIER_CODES = new Set([
   "AltLeft",
   "AltRight",
@@ -4475,12 +4492,15 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
     setAudioShortcutError("");
 
     try {
-      const status = await invoke("set_audio_shortcut", {
-        request: {
-          action,
-          shortcut,
-        },
-      });
+      const status = await audioShortcutInvokeWithTimeout(
+        invoke("set_audio_shortcut", {
+          request: {
+            action,
+            shortcut,
+          },
+        }),
+        "Saving the shortcut timed out — the app may be busy. Press the key again to retry.",
+      );
       setAudioShortcutStatus(status || fallbackShortcutStatus());
       setCapturingAudioShortcut("");
       await onRefreshStatus?.();
@@ -4496,7 +4516,10 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
     setAudioShortcutError("");
 
     try {
-      const status = await invoke("reset_audio_shortcuts");
+      const status = await audioShortcutInvokeWithTimeout(
+        invoke("reset_audio_shortcuts"),
+        "Resetting the shortcuts timed out — the app may be busy. Try again.",
+      );
       setAudioShortcutStatus(status || fallbackShortcutStatus());
       setCapturingAudioShortcut("");
       await onRefreshStatus?.();
@@ -4631,6 +4654,15 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
       return undefined;
     }
 
+    // If nothing reaches this webview shortly after arming (keyboard focus
+    // stuck in another window, a remapper eating the key), say so instead of
+    // sitting on "Listening…" with zero feedback.
+    const noKeyHintTimer = window.setTimeout(() => {
+      setAudioShortcutError(
+        "No key press detected yet. Click inside this window, then press the key you want.",
+      );
+    }, AUDIO_SHORTCUT_CAPTURE_HINT_MS);
+
     const onKeyDown = (event) => {
       if (event.repeat) {
         return;
@@ -4642,14 +4674,40 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
         return;
       }
 
+      window.clearTimeout(noKeyHintTimer);
       event.preventDefault();
       event.stopPropagation();
+
+      // Bare modifiers can't register as global hotkeys outside macOS
+      // (RegisterHotKey has no left/right modifier keycodes) — reject at
+      // capture time with a usable message and keep listening.
+      if (!isMacPlatform() && AUDIO_MODIFIER_CODES.has(shortcut)) {
+        setAudioShortcutError(
+          "A modifier key on its own can't be a global shortcut here. Use a combo like Ctrl+Space, or the Menu key.",
+        );
+        return;
+      }
+
       applyAudioShortcut(capturingAudioShortcut, shortcut);
     };
 
+    // Some keyboards and remappers deliver the Menu key only as a contextmenu
+    // event, never as a keydown. Mouse right-clicks (button 2) stay ignored.
+    const onContextMenu = (event) => {
+      if (event.button !== 0) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      applyAudioShortcut(capturingAudioShortcut, "ContextMenu");
+    };
+
     window.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("contextmenu", onContextMenu, true);
     return () => {
+      window.clearTimeout(noKeyHintTimer);
       window.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("contextmenu", onContextMenu, true);
     };
   }, [active, applyAudioShortcut, capturingAudioShortcut]);
 
@@ -5568,7 +5626,7 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                           : "green"}
                   >
                     {isSavingShortcut || isOpeningShortcutPermissions
-                      ? "Checking"
+                      ? "Saving"
                       : shortcutPermissionMissing || shortcutQuarantineDetected
                         ? "Needs access"
                         : pushToTalkShortcutError || cancelShortcutError
@@ -5645,7 +5703,10 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                       <AudioShortcutActions>
                         <SecondaryButton
                           disabled={isSavingShortcut}
-                          onClick={() => setCapturingAudioShortcut(AUDIO_SHORTCUT_ACTION_PUSH_TO_TALK)}
+                          onClick={() => {
+                            setAudioShortcutError("");
+                            setCapturingAudioShortcut(AUDIO_SHORTCUT_ACTION_PUSH_TO_TALK);
+                          }}
                           type="button"
                         >
                           <ButtonKeyIcon aria-hidden="true" />
@@ -5676,7 +5737,10 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                       <AudioShortcutActions>
                         <SecondaryButton
                           disabled={isSavingShortcut}
-                          onClick={() => setCapturingAudioShortcut(AUDIO_SHORTCUT_ACTION_CANCEL)}
+                          onClick={() => {
+                            setAudioShortcutError("");
+                            setCapturingAudioShortcut(AUDIO_SHORTCUT_ACTION_CANCEL);
+                          }}
                           type="button"
                         >
                           <ButtonKeyIcon aria-hidden="true" />
@@ -8900,8 +8964,12 @@ export function AudioWidgetWindow() {
     scheduleWidgetDragFinish(5000);
 
     runWidgetWindowAction(async (windowHandle) => {
+      // The diagnostics snapshots do position/size IPC roundtrips. Awaiting
+      // them before startDragging() delays the native drag past the mouse-down
+      // gesture — on Windows the move loop then never engages and the bubble
+      // simply doesn't drag. Fire them without blocking the drag start.
       if (trayWasActive) {
-        await logAudioWidgetBubbleWindowSnapshot(windowHandle, "audio.widget.bubble.drag.collapse_tray_before", {
+        void logAudioWidgetBubbleWindowSnapshot(windowHandle, "audio.widget.bubble.drag.collapse_tray_before", {
           pointer,
           widgetState: widgetStateRef.current,
         });
@@ -8909,12 +8977,12 @@ export function AudioWidgetWindow() {
           AUDIO_WIDGET_COMPACT_SIZE.width,
           AUDIO_WIDGET_COMPACT_SIZE.height,
         )).catch(() => {});
-        await logAudioWidgetBubbleWindowSnapshot(windowHandle, "audio.widget.bubble.drag.collapse_tray_after", {
+        void logAudioWidgetBubbleWindowSnapshot(windowHandle, "audio.widget.bubble.drag.collapse_tray_after", {
           pointer,
           widgetState: widgetStateRef.current,
         });
       }
-      await logAudioWidgetBubbleWindowSnapshot(windowHandle, "audio.widget.bubble.drag.start", {
+      void logAudioWidgetBubbleWindowSnapshot(windowHandle, "audio.widget.bubble.drag.start", {
         pointer,
         trayWasActive,
         widgetState: widgetStateRef.current,

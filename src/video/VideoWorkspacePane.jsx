@@ -984,6 +984,9 @@ export default function VideoWorkspacePane({
   const externalProjectProvided = externalProject !== undefined;
   const externalProjectPath = String(externalProject?.path || "").trim();
   const ffmpegReady = Boolean(tools?.ffmpeg?.installed && tools?.ffprobe?.installed);
+  // Installed but can't render text/captions (Homebrew ffmpeg 8 has no
+  // drawtext): offer the full bundled build everywhere the install offer shows.
+  const ffmpegLimited = ffmpegReady && tools?.ffmpeg?.textSupport === false;
   const wide = paneWidth >= WIDE_MIN_WIDTH;
 
   const commitSeek = useCallback(
@@ -1054,7 +1057,7 @@ export default function VideoWorkspacePane({
   }, []);
 
   const refreshTools = useCallback(() => {
-    invoke("video_tools_status")
+    return invoke("video_tools_status")
       .then((status) => setTools(status || null))
       .catch(() => {});
   }, []);
@@ -1435,9 +1438,18 @@ export default function VideoWorkspacePane({
       }
       const payload = event?.payload || {};
       setInstallProgress(payload);
-      if (payload.done || payload.error) {
+      if (payload.error) {
         setInstalling(false);
         refreshTools();
+      } else if (payload.done) {
+        // Hold the chip in its busy state until the refreshed tool status
+        // lands — otherwise "Install ffmpeg" flashes for a beat between the
+        // done event and the status update that hides it.
+        Promise.resolve(refreshTools()).finally(() => {
+          if (!disposed) {
+            setInstalling(false);
+          }
+        });
       }
     })
       .then((next) => {
@@ -2160,6 +2172,7 @@ export default function VideoWorkspacePane({
   // Placeholder-first: a reserved generation path becomes a clip immediately.
   // A failed generation must take its timeline placeholder with it — the
   // ghost clip's assetPath is one of the job's plannedPaths.
+  const ghostRefreshRequestedRef = useRef(new Set());
   useEffect(() => {
     let disposed = false;
     let unlisten = () => {};
@@ -2188,6 +2201,19 @@ export default function VideoWorkspacePane({
           }
           return next;
         });
+        // Agent-started jobs (MCP) never pass through the Generate panel's
+        // refresh: fetch the pending library tiles once per planned path so
+        // ghost clips dress as generating from the very first 0% event.
+        if (!payload.done && !payload.error) {
+          const known = assetsByPathRef.current;
+          const unknown = planned.filter(
+            (path) => !known[path] && !ghostRefreshRequestedRef.current.has(path),
+          );
+          if (unknown.length) {
+            unknown.forEach((path) => ghostRefreshRequestedRef.current.add(path));
+            refreshAssets();
+          }
+        }
       }
       // A finished re-render swaps every clip from the old mp4 onto the
       // freshly rendered one (versioned path — the old file stays).
@@ -2737,7 +2763,13 @@ export default function VideoWorkspacePane({
       repoPath={repoPath}
     />
   ) : sidePanel === "export" ? (
-    <ExportPanel ffmpegReady={ffmpegReady} project={project} projectPath={projectPath} repoPath={repoPath} />
+    <ExportPanel
+      ffmpegReady={ffmpegReady}
+      ffmpegTextSupport={tools?.ffmpeg?.textSupport ?? null}
+      project={project}
+      projectPath={projectPath}
+      repoPath={repoPath}
+    />
   ) : sidePanel === "agent" ? (
     <AgentActivityPanel entries={agentActivity} onNavigate={handleAgentActivityNavigate} />
   ) : null;
@@ -2760,7 +2792,7 @@ export default function VideoWorkspacePane({
                   </MenuHint>
                 </MenuHeaderText>
               </MenuHeader>
-              {tools && !ffmpegReady ? (
+              {tools && (!ffmpegReady || ffmpegLimited) ? (
                 installBusy ? (
                   <div style={{ display: "grid", gap: 4 }}>
                     <VideoProgressTrack>
@@ -2773,9 +2805,13 @@ export default function VideoWorkspacePane({
                 ) : (
                   <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
                     <VideoSecondaryButton onClick={installTools} type="button">
-                      Install ffmpeg (~90 MB)
+                      {ffmpegLimited ? "Install full ffmpeg (~90 MB)" : "Install ffmpeg (~90 MB)"}
                     </VideoSecondaryButton>
-                    <MenuHint>Powers thumbnails, preview metadata, and export.</MenuHint>
+                    <MenuHint>
+                      {ffmpegLimited
+                        ? "Your system ffmpeg can't render text or captions — the bundled build can."
+                        : "Powers thumbnails, preview metadata, and export."}
+                    </MenuHint>
                   </div>
                 )
               ) : null}
@@ -2857,11 +2893,22 @@ export default function VideoWorkspacePane({
               <VideoRailDivider />
               <VideoRailTitle title={project.name}>{project.name}</VideoRailTitle>
               <VideoRailSpacer />
-              {tools && !ffmpegReady ? (
-                <InstallChip disabled={Boolean(installBusy)} onClick={installTools} type="button">
+              {tools && (!ffmpegReady || ffmpegLimited) ? (
+                <InstallChip
+                  disabled={Boolean(installBusy)}
+                  onClick={installTools}
+                  title={
+                    ffmpegLimited
+                      ? "Your system ffmpeg can't render text or captions — install the full bundled build"
+                      : undefined
+                  }
+                  type="button"
+                >
                   {installBusy
                     ? `ffmpeg ${Math.round(installProgress?.percent || 0)}%`
-                    : "Install ffmpeg"}
+                    : ffmpegLimited
+                      ? "Install full ffmpeg"
+                      : "Install ffmpeg"}
                 </InstallChip>
               ) : null}
               <VideoRailButton

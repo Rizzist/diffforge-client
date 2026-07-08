@@ -610,6 +610,24 @@ fn desktop_auth_plan_name_from_snapshot(snapshot: &Value) -> String {
     cloud_mcp_plan_name_from_value(Some(plan_name))
 }
 
+/// Whether the currently persisted desktop session is an authenticated PAID
+/// account, decided entirely from local state (no cloud round-trip). Free
+/// accounts have no personal cloud instance, so this gates whether the app
+/// should open the account websocket at all. Unknown/signed-out reads as not
+/// paid — the paid-gated webview warmup connects later if the plan upgrades.
+pub(crate) fn desktop_auth_account_is_paid(app: &AppHandle) -> bool {
+    let snapshot = desktop_auth_snapshot(app);
+    if snapshot.get("status").and_then(Value::as_str) != Some("authenticated") {
+        return false;
+    }
+    let plan_status = desktop_auth_user_plan_status(snapshot.get("user"));
+    if plan_status == "paid" {
+        return true;
+    }
+    let plan_name = desktop_auth_plan_name_from_snapshot(&snapshot);
+    !plan_name.is_empty() && plan_name != "free"
+}
+
 fn desktop_auth_device_limit_from_snapshot(snapshot: &Value, plan_name: &str) -> u64 {
     let billing = snapshot.get("billingStatus").unwrap_or(&Value::Null);
     let user = snapshot.get("user").unwrap_or(&Value::Null);

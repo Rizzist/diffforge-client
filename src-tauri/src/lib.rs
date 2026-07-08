@@ -9747,7 +9747,17 @@ fn run_app(daemon: bool) {
                         );
                     }
                 }
-                let cloud_connected = cloud_mcp_connect_state(&cloud_mcp_state).await.is_ok();
+                // Free accounts have no personal cloud instance, so skip the
+                // account websocket entirely (permanent-offline mode). Daemon
+                // mode always connects — it is a headless, cloud-first setup.
+                // If the plan upgrades later, the webview's paid-gated warmup
+                // opens the connection.
+                let should_auto_connect = daemon || desktop_auth_account_is_paid(&cloud_mcp_app);
+                let cloud_connected = if should_auto_connect {
+                    cloud_mcp_connect_state(&cloud_mcp_state).await.is_ok()
+                } else {
+                    false
+                };
                 if cloud_connected
                     && env::var_os("DIFFFORGE_PREWARM_CLOUD_VOICE_ON_STARTUP").is_some()
                 {

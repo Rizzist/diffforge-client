@@ -713,6 +713,27 @@ export const WindowTitle = styled.div`
   }
 `;
 
+export const WindowTitleVersion = styled.span`
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.07);
+  color: #9aa7b4;
+  font-size: 10.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+
+  /* WindowTitle's generic span ellipsis rule would otherwise squeeze this. */
+  overflow: visible;
+  text-overflow: clip;
+
+  html[data-forge-theme="light"] & {
+    background: rgba(0, 0, 0, 0.06);
+    color: var(--forge-text-muted, #6b7683);
+  }
+`;
+
 export const WindowControls = styled.div`
   display: inline-flex;
   height: 100%;

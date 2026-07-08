@@ -1975,7 +1975,7 @@ fn workspace_gateway_builtin_tool_description(tool: &str) -> &'static str {
             "List, search, import, annotate, and organize Video Editor media. Search returns filename matches plus transcript moments and image annotation matches. Image assets carry annotations (blurb/description/tags/ocrText) — list/search rows include the blurb; use action annotation to read the full record and action annotate to write one yourself after viewing the image (free, no cloud call). Consult annotations plus width/height when picking stills for timeline slot-in, motion presets, or hyperframes compositions."
         }
         "video_generate" => {
-            "List models, start, poll, or cancel media generation. Cloud models cover video/image/audio; model \"hyperframes\" (kind code) renders an HTML composition locally: start scaffolds media/code/<slug>/index.html and returns jobId+sourcePath+plannedPaths (add plannedPaths[0] to the timeline now for a placeholder clip at the expected duration), author the HTML per its AGENTS.md, then action render with that jobId; re-render by starting a new job with sourcePath."
+            "List models, start, poll, or cancel media generation. Every start returns jobId+plannedPaths — when the output is destined for the timeline, IMMEDIATELY video_edit addClip plannedPaths[0] so the user sees a generating placeholder clip (it is sized from params.durationSec and swaps to the real media when the job lands; a failed job removes it). Cloud models cover video/image/audio; model \"hyperframes\" (kind code) renders an HTML composition locally: start scaffolds media/code/<slug>/index.html and also returns sourcePath, author the HTML per its AGENTS.md, then action render with that jobId; re-render by starting a new job with sourcePath."
         }
         "video_export" => {
             "Start full or draft Video Editor exports and poll progress. start returns jobId; poll status."
@@ -2197,7 +2197,7 @@ fn workspace_gateway_builtin_tool_input_schema(tool: &str) -> Value {
                 "sourcePath": {"type": "string", "description": "hyperframes start: existing media/code/ composition entry HTML to re-render as a new output instead of scaffolding."}
             },
             "required": ["action"],
-            "description": "models first. Cloud (video/image/audio): start returns jobId; poll status. Local code render (model \"hyperframes\"): start declares the job and scaffolds sourcePath; author the HTML; then action render with jobId; poll status until done.",
+            "description": "models first. Cloud (video/image/audio): start returns jobId+plannedPaths; addClip plannedPaths[0] right away for a timeline placeholder, then poll status. Local code render (model \"hyperframes\"): start declares the job and scaffolds sourcePath; author the HTML; then action render with jobId; poll status until done.",
             "additionalProperties": true
         }),
         "video_export" => json!({

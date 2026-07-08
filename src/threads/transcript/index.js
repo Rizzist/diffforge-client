@@ -1,5 +1,6 @@
 export { AgentTranscript, TRANSCRIPT_SCROLL_TO_ITEM_EVENT } from "./TranscriptView";
 export { SessionUsageChip } from "./SessionUsageChip";
+export { WorkingRow } from "./TranscriptRows";
 export {
   buildTranscriptRows,
   extractTurnSummaries,

@@ -494,8 +494,20 @@ fn agent_command_candidates(definition: AgentDefinition) -> Vec<String> {
 
     let candidates = resolve_agent_command_candidates(definition);
 
-    if let Ok(mut cache) = cache.lock() {
-        cache.insert(definition.id, candidates.clone());
+    // On Windows a resolution with no on-disk candidate fails the launch
+    // ("not installed"), so never cache the miss: installing the CLI
+    // mid-session must be picked up by the next launch retry, not pinned
+    // to the failure until app restart. Unix keeps caching either way
+    // because the bare-name fallback stays a valid shell-resolved launch.
+    let cacheable = cfg!(not(windows))
+        || candidates
+            .iter()
+            .any(|candidate| Path::new(candidate).exists());
+
+    if cacheable {
+        if let Ok(mut cache) = cache.lock() {
+            cache.insert(definition.id, candidates.clone());
+        }
     }
 
     candidates

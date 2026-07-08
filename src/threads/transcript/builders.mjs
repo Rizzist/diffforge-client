@@ -199,6 +199,8 @@ const INTERNAL_CONTEXT_USER_PREFIXES = Object.freeze([
   "<INSTRUCTIONS>",
   "<!-- DIFFFORGE_AGENT_CONTRACT_BEGIN -->",
   "<environment_context>",
+  "<turn_aborted",
+  "<turn_interrupted",
 ]);
 
 export function isInternalContextUserMessage(message = {}) {
@@ -1046,8 +1048,12 @@ export function syntheticFileChangeRow(source, key, turnId = "") {
 }
 
 // Builds the final render row list. Settled prior turns fold their work rows
-// behind a fold-header row; anchor (user/command) rows and the trailing
-// assistant answer stay visible. The latest turn is always expanded.
+// (tool cards, reasoning, file changes, subagent groups) behind a fold-header
+// row; anchor (user/command) rows and the turn's assistant answer rows stay
+// visible even while folded (t3-style: folding hides the WORK, never the
+// reply). Expanding re-emits every row in original order — the answer rows
+// are the same rows, so nothing duplicates. The latest turn is always
+// expanded.
 export function buildTranscriptRows(items = [], {
   itemIdPrefix = "agent-thread-item",
   diffSummaries = [],
@@ -1143,6 +1149,14 @@ export function buildTranscriptRows(items = [], {
       }
       if (!foldable || isExpanded) {
         rows.push(...workRows.map(tagRow));
+      } else {
+        // Folded: only the work rows hide. Assistant text rows that sit
+        // between work rows (the turn's answer when tool calls settle after
+        // the final message) stay visible beneath the fold header. Turns
+        // without assistant text fold fully.
+        rows.push(
+          ...workRows.filter((row) => row.kind === "assistant").map(tagRow),
+        );
       }
     }
     rows.push(...group.tailRows.map(tagRow));

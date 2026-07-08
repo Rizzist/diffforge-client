@@ -2229,6 +2229,7 @@ function ButtonFontPlusIcon(props) {
 function WorkspaceTerminal({
   agent,
   agentLaunchEpoch = 0,
+  agentLaunchAlert = null,
   agentLaunchDefaults = null,
   agentLaunchReady = true,
   agentStatuses,
@@ -5865,6 +5866,41 @@ function WorkspaceTerminal({
       startAgentInPrewarmedTerminalRef.current("agent_launch_epoch", agentLaunchEpoch);
     }
   }, [agentLaunchEpoch, agentLaunchReady]);
+
+  // Surface repeated agent-batch launch failures (missing CLI, cloud auth,
+  // backend timeouts) on the waiting pane. AppShell keeps retrying with
+  // backoff; without this the pane just shows "starting" forever and the
+  // real failure message never reaches the user.
+  useEffect(() => {
+    if (terminalClosed || terminalClosingRef.current) {
+      return;
+    }
+    // Only prewarmed panes are genuinely parked behind the batch launch;
+    // panes in "starting" run their own open flow with its own status UI
+    // (and their failures surface through terminalError instead).
+    if (terminalState !== "prewarmed") {
+      return;
+    }
+    const alertMessage = String(agentLaunchAlert?.message || "").trim();
+    if (alertMessage) {
+      setTerminalStatus({
+        detail: alertMessage,
+        mode: "detail",
+        title: "Agent Launch Stalled",
+        visible: true,
+      });
+      return;
+    }
+    setTerminalStatus((current) => (
+      current?.title === "Agent Launch Stalled"
+        ? {
+          detail: "Waiting for the agent launch gate.",
+          title: "Terminal Prepared",
+          visible: false,
+        }
+        : current
+    ));
+  }, [agentLaunchAlert, terminalClosed, terminalState]);
 
   useEffect(() => {
     patchTerminalMetrics({ terminalCount });

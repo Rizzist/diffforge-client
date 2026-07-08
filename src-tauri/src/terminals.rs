@@ -12,6 +12,13 @@ const TERMINAL_STARTING_WATCHDOG_MS: u64 = 30_000;
 const TERMINAL_WATCHDOG_OUTPUT_QUIET_MS: u64 = 2_500;
 const TERMINAL_HOT_STALE_WATCHDOG_MS: u64 = 10 * 60_000;
 const TERMINAL_STARTUP_READY_SCAN_BYTES: usize = 16 * 1024;
+// Agent-start commands must never hang the frontend launch pipeline: a
+// wedged lifecycle holder (slow terminal_open, close teardown) or a stuck
+// pane future previously left the invoke pending forever, so panes sat at
+// "starting" with no retry and no error. Bound both waits and let the
+// frontend's retry/backoff loop recover.
+const TERMINAL_AGENT_START_LIFECYCLE_LOCK_TIMEOUT_SECS: u64 = 60;
+const TERMINAL_AGENT_START_PANE_TIMEOUT_SECS: u64 = 120;
 
 fn terminal_output_latest_working_indicator_index(text: &str) -> Option<usize> {
     let lower = text.to_lowercase();
@@ -6094,11 +6101,23 @@ async fn close_all_terminal_sessions(
 }
 
 fn choose_terminal_command_path(command_candidates: &[String]) -> Option<String> {
-    command_candidates
+    let existing = command_candidates
         .iter()
-        .find(|candidate| Path::new(candidate.as_str()).exists())
-        .or_else(|| command_candidates.first())
-        .cloned()
+        .find(|candidate| Path::new(candidate.as_str()).exists());
+
+    // Windows candidate resolution already scanned PATH (.cmd/.exe/.bat) and
+    // the npm global prefix with the same environment PowerShell inherits, so
+    // a miss means a bare-name launch would only print "not recognized"
+    // inside the shell while the pane reports a started agent. Fail fast so
+    // the pane can surface an actionable install error instead.
+    if cfg!(windows) {
+        return existing.cloned();
+    }
+
+    // Unix login shells routinely carry more PATH than the GUI app (Homebrew,
+    // nvm, custom profiles), so the bare binary name stays a valid last-resort
+    // candidate for the shell to resolve.
+    existing.or_else(|| command_candidates.first()).cloned()
 }
 
 // Long agent launch commands (Codex/Claude with many `-c`/MCP overrides) can
@@ -6152,9 +6171,63 @@ fn stage_agent_launch_input_as_source_command(input: &str) -> Option<String> {
     Some(format!(". {quoted_path}\n"))
 }
 
+// Windows console line input is hard-capped well below our launch payloads
+// (ConPTY cooked input; cmd/PowerShell reject with "The command line is too
+// long."), and the agent launch input routinely exceeds it with `-c`/MCP
+// overrides and env exports. Same cure as Unix: stage the full launch
+// sequence in a temp script and inject only a short dot-source line.
 #[cfg(windows)]
-fn stage_agent_launch_input_as_source_command(_input: &str) -> Option<String> {
-    None
+fn stage_agent_launch_input_as_source_command(input: &str) -> Option<String> {
+    use std::io::Write as _;
+
+    if input.trim().is_empty() {
+        return None;
+    }
+
+    static LAUNCH_SCRIPT_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let counter = LAUNCH_SCRIPT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!(
+        "difflaunch-{}-{}-{}.ps1",
+        std::process::id(),
+        nanos,
+        counter
+    ));
+
+    // PowerShell reads and parses the whole file before executing a
+    // dot-sourced script, so the self-delete can run first: by execution
+    // time the handle is closed and the launch continues from memory even
+    // though the script is already gone from disk. Dot-sourcing runs in the
+    // caller scope, so Set-Location and $env: assignments persist in the
+    // interactive shell exactly like the previous inline injection.
+    let body = format!(
+        "Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue\r\n{}",
+        // PTY line injection terminates lines with bare `\r`; a script file
+        // needs real CRLF line endings.
+        input.replace('\r', "\r\n"),
+    );
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .ok()?;
+
+    // UTF-8 BOM: Windows PowerShell 5.1 otherwise reads .ps1 files as ANSI
+    // and mangles non-ASCII working directories and env values.
+    file.write_all(b"\xEF\xBB\xBF").ok()?;
+    file.write_all(body.as_bytes()).ok()?;
+    file.flush().ok()?;
+    drop(file);
+
+    Some(format!(
+        ". {}\r",
+        quote_powershell_literal(&path.to_string_lossy())
+    ))
 }
 
 fn write_agent_start_input_to_writer(
@@ -7344,7 +7417,17 @@ async fn terminal_start_agent(
     validate_terminal_pane_id(&pane_id)?;
     ensure_app_not_shutting_down("terminal agent start")?;
     let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
-    let _lifecycle_guard = lifecycle_lock.lock().await;
+    let Ok(_lifecycle_guard) = tokio::time::timeout(
+        Duration::from_secs(TERMINAL_AGENT_START_LIFECYCLE_LOCK_TIMEOUT_SECS),
+        lifecycle_lock.lock(),
+    )
+    .await
+    else {
+        return Err(
+            "Terminal lifecycle is busy with another terminal operation; retry agent start shortly."
+                .to_string(),
+        );
+    };
     ensure_app_not_shutting_down("terminal agent start")?;
     let provider = parse_agent_provider(&provider)?;
     let definition = agent_definition(provider);
@@ -7356,22 +7439,12 @@ async fn terminal_start_agent(
     terminal_append_provider_launch_args(provider, &mut args, &launch);
 
     let command_candidates = agent_command_candidates(definition);
-    let command_path = command_candidates
-        .iter()
-        .find(|candidate| Path::new(candidate.as_str()).exists())
-        .or_else(|| {
-            command_candidates
-                .iter()
-                .find(|candidate| candidate.as_str() == definition.binary)
-        })
-        .or_else(|| command_candidates.first())
-        .cloned()
-        .ok_or_else(|| {
-            format!(
-                "{} is not installed or not available on PATH.",
-                definition.label
-            )
-        })?;
+    let command_path = choose_terminal_command_path(&command_candidates).ok_or_else(|| {
+        format!(
+            "{} is not installed or not available on PATH.",
+            definition.label
+        )
+    })?;
 
     let Some(instance) = get_terminal_instance_if_current(&state, &pane_id, instance_id).await?
     else {
@@ -7743,8 +7816,8 @@ async fn start_terminal_agent_in_prepared_pty(
                 started: false,
                 skipped: false,
                 message: format!(
-                    "{} is not installed or not available on PATH.",
-                    definition.label
+                    "{} is not installed or not available on PATH. Install it with `{}`; the agent will start automatically once it is installed.",
+                    definition.label, definition.install_command
                 ),
             };
         };
@@ -8062,7 +8135,17 @@ async fn terminal_start_agent_many(
 ) -> Result<TerminalStartAgentManyResult, String> {
     ensure_app_not_shutting_down("terminal agent batch start")?;
     let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
-    let _lifecycle_guard = lifecycle_lock.lock().await;
+    let Ok(_lifecycle_guard) = tokio::time::timeout(
+        Duration::from_secs(TERMINAL_AGENT_START_LIFECYCLE_LOCK_TIMEOUT_SECS),
+        lifecycle_lock.lock(),
+    )
+    .await
+    else {
+        return Err(
+            "Terminal lifecycle is busy with another terminal operation; retry agent start shortly."
+                .to_string(),
+        );
+    };
     ensure_app_not_shutting_down("terminal agent batch start")?;
     if requests.len() > MAX_TERMINAL_START_AGENT_BATCH {
         return Err(format!(
@@ -8079,14 +8162,32 @@ async fn terminal_start_agent_many(
         let cloud_mcp_state = cloud_mcp_state.inner().clone();
 
         join_set.spawn(async move {
-            start_terminal_agent_in_prepared_pty(
-                app,
-                cloud_mcp_state,
-                terminals,
-                parked_prompts,
-                request,
+            let pane_id = request.pane_id.clone();
+            let instance_id = request.instance_id;
+            match tokio::time::timeout(
+                Duration::from_secs(TERMINAL_AGENT_START_PANE_TIMEOUT_SECS),
+                start_terminal_agent_in_prepared_pty(
+                    app,
+                    cloud_mcp_state,
+                    terminals,
+                    parked_prompts,
+                    request,
+                ),
             )
             .await
+            {
+                Ok(result) => result,
+                Err(_) => TerminalStartAgentPaneResult {
+                    pane_id,
+                    instance_id,
+                    model: None,
+                    model_source: None,
+                    started: false,
+                    skipped: false,
+                    message: "Terminal agent start timed out; it will be retried automatically."
+                        .to_string(),
+                },
+            }
         });
     }
 
@@ -18767,6 +18868,54 @@ async fn terminal_live_sessions(
 #[cfg(test)]
 mod terminal_tests {
     use super::*;
+
+    #[test]
+    fn choose_terminal_command_path_prefers_existing_candidates() {
+        let existing = std::env::temp_dir().to_string_lossy().to_string();
+        let candidates = vec!["/definitely/missing/claude".to_string(), existing.clone()];
+        assert_eq!(
+            choose_terminal_command_path(&candidates),
+            Some(existing.clone())
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn choose_terminal_command_path_keeps_bare_name_fallback_on_unix() {
+        let candidates = vec!["claude".to_string()];
+        assert_eq!(
+            choose_terminal_command_path(&candidates),
+            Some("claude".to_string())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn choose_terminal_command_path_fails_fast_when_missing_on_windows() {
+        let candidates = vec!["claude".to_string()];
+        assert_eq!(choose_terminal_command_path(&candidates), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn staged_windows_agent_launch_input_dot_sources_a_script() {
+        let staged = stage_agent_launch_input_as_source_command("Set-Location -LiteralPath 'C:\\work'\r& 'claude'\r")
+            .expect("staging should succeed");
+        assert!(staged.starts_with(". '"));
+        assert!(staged.ends_with("\r"));
+        let path = staged
+            .trim_start_matches(". '")
+            .trim_end_matches("'\r")
+            .replace("''", "'");
+        // The staged script self-deletes on execution, so at staging time it
+        // must exist with a BOM and CRLF line endings.
+        let bytes = std::fs::read(&path).expect("staged script exists");
+        assert!(bytes.starts_with(b"\xEF\xBB\xBF"));
+        let text = String::from_utf8(bytes[3..].to_vec()).expect("utf-8 script body");
+        assert!(text.starts_with("Remove-Item -LiteralPath $PSCommandPath"));
+        assert!(text.contains("& 'claude'\r\n"));
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn terminal_agent_kind_normalization_keeps_prewarm_from_becoming_identity() {

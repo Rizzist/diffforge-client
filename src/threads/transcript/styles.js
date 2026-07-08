@@ -1,7 +1,11 @@
 // Styled components for the rebuilt transcript. The visual language follows
 // the dashboard's dark shell: C tokens, hairline borders, muted card fills,
-// SF Mono details, 15.5px reading text. The transcript column never scrolls
-// horizontally — wide content scrolls inside its own container.
+// SF Mono details. The desktop mount renders a compact type scale (13px
+// reading text vs the web dashboard's 15.5px); an ancestor stamped with
+// [data-density="compact"] (the terminal-inline UI View) tightens it further.
+// The transcript column never scrolls horizontally — wide content scrolls
+// inside its own container. --transcript-top-inset (set by the host from the
+// measured floating chip header) keeps the first rows clear of the header.
 
 import styled, { css, keyframes } from "styled-components";
 
@@ -38,15 +42,25 @@ export const MONO = '"SFMono-Regular", Consolas, "Liberation Mono", monospace';
 /* ------------------------------------------------------------------ */
 
 export const TranscriptColumn = styled.div`
+  --transcript-top-clearance: clamp(46px, 7vh, 72px);
   width: min(100%, var(--terminal-chat-column, 48rem));
   min-width: 0;
   flex: 0 0 auto;
   margin: 0 auto;
-  padding: clamp(54px, 8vh, 88px) 0 34px;
+  /* The floating chip header overlays the scroller's top edge; the measured
+     header clearance (--transcript-top-inset) wins over the static clearance
+     so the first rows never start underneath the chips. */
+  padding: max(var(--transcript-top-inset, 0px), var(--transcript-top-clearance)) 0 30px;
+
+  [data-density="compact"] & {
+    --transcript-top-clearance: clamp(40px, 6vh, 60px);
+    padding-bottom: 24px;
+  }
 
   @media (max-width: 720px) {
+    --transcript-top-clearance: 50px;
     width: 100%;
-    padding: 58px 0 26px;
+    padding-bottom: 22px;
   }
 `;
 
@@ -63,7 +77,11 @@ export const TranscriptRowShell = styled.div`
   display: grid;
   width: 100%;
   min-width: 0;
-  padding-bottom: ${({ $spacing }) => ($spacing === "tight" ? "8px" : $spacing === "none" ? "0" : "18px")};
+  padding-bottom: ${({ $spacing }) => ($spacing === "tight" ? "6px" : $spacing === "none" ? "0" : "12px")};
+
+  [data-density="compact"] & {
+    padding-bottom: ${({ $spacing }) => ($spacing === "tight" ? "5px" : $spacing === "none" ? "0" : "10px")};
+  }
 `;
 
 export const TranscriptStaticList = styled.div`
@@ -157,21 +175,27 @@ export const UserRow = styled.article`
 export const UserBubble = styled.div`
   display: grid;
   width: fit-content;
-  max-width: min(78%, 42rem);
+  max-width: min(78%, 36rem);
   min-width: 0;
-  gap: 7px;
-  border-radius: 22px;
-  padding: 11px 16px;
+  gap: 6px;
+  border-radius: 14px;
+  padding: 8px 12px;
   color: ${C.text};
   background: rgba(255, 255, 255, 0.115);
-  font-size: 15.5px;
+  font-size: 13px;
   font-weight: 460;
-  line-height: 1.66;
+  line-height: 1.55;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 
+  [data-density="compact"] & {
+    border-radius: 12px;
+    padding: 7px 11px;
+    font-size: 12.5px;
+  }
+
   @media (max-width: 720px) {
-    max-width: min(88%, 34rem);
+    max-width: min(88%, 32rem);
   }
 `;
 
@@ -190,9 +214,9 @@ export const RowMetaLine = styled.div`
   align-items: center;
   justify-content: ${({ $user }) => ($user ? "flex-end" : "flex-start")};
   gap: 7px;
-  min-height: 20px;
+  min-height: 18px;
   color: ${C.textDim};
-  font-size: 11px;
+  font-size: 10.5px;
   font-weight: 650;
 `;
 
@@ -208,12 +232,12 @@ export const GhostActionButton = styled.button`
   background: transparent;
   cursor: pointer;
   font: inherit;
-  font-size: 10.5px;
+  font-size: 10px;
   font-weight: 650;
 
   svg {
-    width: 13px;
-    height: 13px;
+    width: 12px;
+    height: 12px;
   }
 
   &:hover {
@@ -288,13 +312,17 @@ export const StatusPill = styled.span`
 export const MarkdownBody = styled.div`
   display: grid;
   min-width: 0;
-  gap: 9px;
+  gap: 7px;
   overflow: hidden;
   overflow-wrap: anywhere;
   color: ${C.text};
-  font-size: 15.5px;
+  font-size: 13px;
   font-weight: 430;
-  line-height: 1.66;
+  line-height: 1.58;
+
+  [data-density="compact"] & {
+    font-size: 12.5px;
+  }
 
   > :first-child {
     margin-top: 0;
@@ -322,17 +350,17 @@ export const MarkdownBody = styled.div`
   h6 {
     margin: 4px 0 0;
     color: #f8fafc;
-    font-size: 16px;
+    font-size: 13.5px;
     font-weight: 650;
     line-height: 1.32;
   }
 
   h1 {
-    font-size: 18px;
+    font-size: 15px;
   }
 
   h2 {
-    font-size: 17px;
+    font-size: 14px;
   }
 
   ul,
@@ -376,6 +404,7 @@ export const MarkdownBody = styled.div`
 
 export const InlineCode = styled.code`
   display: inline;
+  max-width: 100%;
   padding: 1px 4px;
   border: 1px solid rgba(148, 163, 184, 0.18);
   border-radius: 5px;
@@ -388,6 +417,7 @@ export const InlineCode = styled.code`
 
 export const PathChip = styled.span`
   display: inline;
+  max-width: 100%;
   padding: 1px 4px;
   border: 1px solid rgba(148, 163, 184, 0.18);
   border-radius: 5px;
@@ -440,7 +470,7 @@ export const TableScroll = styled.div`
     border-collapse: collapse;
     color: #e5e7eb;
     background: rgba(2, 6, 12, 0.3);
-    font-size: 12.5px;
+    font-size: 12px;
     line-height: 1.4;
   }
 
@@ -489,7 +519,7 @@ export const CodeBlockFrame = styled.div`
 
 export const CodeBlockHeader = styled.div`
   display: flex;
-  min-height: 30px;
+  min-height: 26px;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
@@ -513,7 +543,7 @@ export const CodeBlockScroll = styled.div`
 
   pre {
     margin: 0;
-    padding: 10px 12px;
+    padding: 8px 10px;
     background: transparent !important;
     font-family: ${MONO};
     font-size: 12px;
@@ -531,6 +561,11 @@ export const CodeBlockScroll = styled.div`
     white-space: pre;
   }
 
+  [data-density="compact"] & pre,
+  [data-density="compact"] & code {
+    font-size: 11.5px;
+  }
+
   .shiki {
     background: transparent !important;
   }
@@ -544,7 +579,7 @@ export const FoldHeaderRow = styled.button`
   display: flex;
   width: 100%;
   min-width: 0;
-  min-height: 34px;
+  min-height: 30px;
   align-items: center;
   gap: 8px;
   -webkit-appearance: none;
@@ -557,16 +592,21 @@ export const FoldHeaderRow = styled.button`
   color: ${C.textMuted};
   cursor: ${({ $interactive }) => ($interactive ? "pointer" : "default")};
   font: inherit;
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 650;
   text-align: left;
 
   em {
     flex: 0 0 auto;
     color: ${C.textMuted};
-    font-size: 11px;
+    font-size: 10.5px;
     font-style: normal;
     font-weight: 650;
+  }
+
+  [data-density="compact"] & {
+    min-height: 28px;
+    font-size: 11px;
   }
 
   ${({ $interactive }) => ($interactive ? css`
@@ -666,13 +706,17 @@ export const ToolCardHeader = styled.button`
   display: flex;
   width: 100%;
   min-width: 0;
-  min-height: 38px;
+  min-height: 32px;
   align-items: center;
-  gap: 9px;
+  gap: 8px;
   -webkit-appearance: none;
   border: 0;
   border-radius: 10px;
-  padding: 6px 10px;
+  padding: 4px 9px;
+
+  [data-density="compact"] & {
+    min-height: 30px;
+  }
   appearance: none;
   background: transparent;
   color: ${C.textMuted};
@@ -719,7 +763,7 @@ export const ToolCardName = styled.strong`
   min-width: 0;
   overflow: hidden;
   color: ${C.textDim};
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 700;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -731,7 +775,7 @@ export const ToolCardSummary = styled.span`
   overflow: hidden;
   color: ${C.textMuted};
   font-family: ${MONO};
-  font-size: 11px;
+  font-size: 10.5px;
   text-overflow: ellipsis;
   white-space: nowrap;
 `;
@@ -755,8 +799,8 @@ export const ToolCardChip = styled.em`
 export const ToolCardBody = styled.div`
   display: grid;
   min-width: 0;
-  gap: 8px;
-  padding: 2px 10px 10px;
+  gap: 7px;
+  padding: 2px 9px 9px;
 `;
 
 export const ToolPane = styled.section`
@@ -771,7 +815,7 @@ export const ToolPane = styled.section`
 
 export const ToolPaneHeader = styled.header`
   display: flex;
-  min-height: 26px;
+  min-height: 24px;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
@@ -793,10 +837,10 @@ export const ToolPaneScroll = styled.div`
 
   pre {
     margin: 0;
-    padding: 4px 10px 10px;
+    padding: 4px 10px 9px;
     color: #cbd5e1;
     font-family: ${MONO};
-    font-size: 11.5px;
+    font-size: 11px;
     line-height: 1.5;
     white-space: pre;
   }
@@ -812,7 +856,7 @@ export const ReasoningRowFrame = styled.div`
 
 export const ReasoningToggle = styled.button`
   display: inline-flex;
-  min-height: 28px;
+  min-height: 26px;
   align-items: center;
   gap: 7px;
   -webkit-appearance: none;
@@ -825,7 +869,7 @@ export const ReasoningToggle = styled.button`
   color: ${C.textMuted};
   cursor: pointer;
   font: inherit;
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 650;
   font-style: italic;
 
@@ -849,9 +893,9 @@ export const ReasoningBody = styled.pre`
   padding: 2px 0 2px 14px;
   color: ${C.textMuted};
   font-family: inherit;
-  font-size: 12.5px;
+  font-size: 11.5px;
   font-weight: 500;
-  line-height: 1.58;
+  line-height: 1.55;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 `;
@@ -872,15 +916,15 @@ export const FileChangeFrame = styled.section`
 export const FileChangeHeader = styled.div`
   display: flex;
   min-width: 0;
-  min-height: 36px;
+  min-height: 32px;
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  padding: 4px 12px;
+  padding: 4px 11px;
 
   strong {
     color: ${C.text};
-    font-size: 12px;
+    font-size: 11.5px;
     font-weight: 760;
   }
 
@@ -928,13 +972,13 @@ export const FileChangeList = styled.div`
 export const FileChangeRowLine = styled.div`
   display: flex;
   min-width: 0;
-  min-height: 26px;
+  min-height: 24px;
   align-items: center;
   gap: 10px;
-  padding: 0 12px;
+  padding: 0 11px;
   color: ${C.textDim};
   font-family: ${MONO};
-  font-size: 11px;
+  font-size: 10.5px;
 
   > span {
     flex: 1 1 auto;
@@ -983,7 +1027,7 @@ export const FileDiffRowButton = styled(FileChangeRowLine).attrs({ as: "button" 
   cursor: pointer;
   font: inherit;
   font-family: ${MONO};
-  font-size: 11px;
+  font-size: 10.5px;
   text-align: left;
 
   ${FoldChevron} {
@@ -1059,7 +1103,7 @@ export const DiffLineList = styled.div`
   width: max-content;
   min-width: 100%;
   font-family: ${MONO};
-  font-size: 11.5px;
+  font-size: 11px;
   line-height: 1.55;
 `;
 
@@ -1164,7 +1208,7 @@ export const SubagentHeaderButton = styled.button`
   display: flex;
   width: 100%;
   min-width: 0;
-  min-height: 30px;
+  min-height: 28px;
   align-items: center;
   gap: 8px;
   -webkit-appearance: none;
@@ -1176,7 +1220,7 @@ export const SubagentHeaderButton = styled.button`
   color: ${C.blueBright};
   cursor: pointer;
   font: inherit;
-  font-size: 11px;
+  font-size: 10.5px;
   font-weight: 800;
   letter-spacing: 0.05em;
   text-align: left;
@@ -1307,7 +1351,7 @@ export const ErrorCardFrame = styled.section`
     align-items: center;
     gap: 8px;
     color: #fca5a5;
-    font-size: 11px;
+    font-size: 10.5px;
     font-weight: 800;
     letter-spacing: 0.06em;
     text-transform: uppercase;
@@ -1319,7 +1363,7 @@ export const ErrorCardFrame = styled.section`
     overflow: auto;
     color: ${C.text};
     font-family: ${MONO};
-    font-size: 12px;
+    font-size: 11.5px;
     line-height: 1.5;
     overflow-wrap: anywhere;
     white-space: pre-wrap;
@@ -1384,17 +1428,17 @@ const workingPulse = keyframes`
 export const WorkingRowFrame = styled.div`
   display: flex;
   min-width: 0;
-  min-height: 34px;
+  min-height: 30px;
   align-items: center;
   gap: 10px;
   color: ${C.textDim};
-  font-size: 12.5px;
+  font-size: 12px;
   font-weight: 650;
 
   em {
     color: ${C.textMuted};
     font-family: ${MONO};
-    font-size: 11px;
+    font-size: 10.5px;
     font-style: normal;
     font-variant-numeric: tabular-nums;
   }
@@ -1450,7 +1494,7 @@ export const ArtifactChip = styled.div`
 
   strong {
     color: ${C.text};
-    font-size: 12px;
+    font-size: 11.5px;
     font-weight: 760;
   }
 
@@ -1458,7 +1502,7 @@ export const ArtifactChip = styled.div`
     overflow: hidden;
     color: ${C.textMuted};
     font-family: ${MONO};
-    font-size: 11px;
+    font-size: 10.5px;
     text-overflow: ellipsis;
     white-space: nowrap;
   }

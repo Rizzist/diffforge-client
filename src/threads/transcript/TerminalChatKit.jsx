@@ -134,13 +134,16 @@ export function ansiToPlainText(rawText) {
 const AnsiPre = styled.pre`
   margin: 0;
   padding: 0;
+  min-width: 0;
+  max-width: 100%;
   background: transparent;
   color: ${C.text};
   font-family: "SF Mono", ui-monospace, Menlo, monospace;
-  font-size: 12.5px;
+  font-size: 11.5px;
   line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;
+  overflow-wrap: anywhere;
 `;
 
 export function AnsiText({ text = "", maxChars = 0 }) {
@@ -172,26 +175,31 @@ export function AnsiText({ text = "", maxChars = 0 }) {
 
 const CommandRowShell = styled.div`
   display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 6px 8px;
   padding: 4px 2px;
   color: ${C.textDim};
-  font-size: 12px;
+  font-size: 11.5px;
 `;
 
 const CommandChip = styled.span`
+  min-width: 0;
+  max-width: 100%;
   padding: 2px 8px;
   border-radius: 6px;
   border: 1px solid ${C.lineBlue};
   background: ${C.blueSoft};
   color: ${C.blueBright};
   font-family: "SF Mono", ui-monospace, Menlo, monospace;
-  font-size: 11.5px;
+  font-size: 11px;
+  overflow-wrap: anywhere;
 `;
 
 const CommandRowNote = styled.span`
   color: ${C.textMuted};
-  font-size: 11px;
+  font-size: 10.5px;
 `;
 
 export function CommandItemRow({ command = "", note = "", source = "" }) {

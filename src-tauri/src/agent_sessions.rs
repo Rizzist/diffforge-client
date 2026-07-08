@@ -649,11 +649,78 @@ fn collect_codex_rollout_files(root: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
+fn authoritative_model_text(value: Option<&Value>) -> Option<String> {
+    let value = value_string(value);
+    if value.is_empty()
+        || value.len() > 120
+        || value == "<synthetic>"
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/')
+        })
+    {
+        return None;
+    }
+    Some(value)
+}
+
+fn authoritative_model_from_direct_keys(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| authoritative_model_text(value.get(*key)))
+}
+
+fn codex_jsonl_record_authoritative_model(value: &Value) -> Option<String> {
+    let record_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if record_type == "turn_context" {
+        return authoritative_model_from_direct_keys(value, &["model", "model_id", "modelId"])
+            .or_else(|| {
+                authoritative_model_from_direct_keys(
+                    value.get("payload").unwrap_or(&Value::Null),
+                    &["model", "model_id", "modelId"],
+                )
+            });
+    }
+
+    let payload = value.get("payload").unwrap_or(&Value::Null);
+    let payload_type = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if record_type == "token_count" || (record_type == "event_msg" && payload_type == "token_count")
+    {
+        return authoritative_model_from_direct_keys(payload, &["model", "model_id", "modelId"])
+            .or_else(|| {
+                authoritative_model_from_direct_keys(value, &["model", "model_id", "modelId"])
+            });
+    }
+
+    None
+}
+
+fn claude_jsonl_record_authoritative_model(value: &Value) -> Option<String> {
+    if value.get("type").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let message = value.get("message").unwrap_or(&Value::Null);
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    authoritative_model_from_direct_keys(message, &["model"])
+}
+
+fn jsonl_record_authoritative_model(provider: AgentProvider, value: &Value) -> Option<String> {
+    match provider {
+        AgentProvider::Codex => codex_jsonl_record_authoritative_model(value),
+        AgentProvider::Claude => claude_jsonl_record_authoritative_model(value),
+        AgentProvider::OpenCode => None,
+    }
+}
+
 /// Scans the tail of a provider session transcript for the last model the
-/// session actually used. Both Claude Code and Codex write compact JSONL
-/// where assistant/turn entries carry a `"model":"..."` field, so the last
-/// occurrence is the model that was active when the session closed.
-fn jsonl_tail_last_model(path: &Path) -> Option<String> {
+/// session actually used, but only from provider-owned model metadata fields.
+fn jsonl_tail_last_model(provider: AgentProvider, path: &Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
@@ -662,25 +729,14 @@ fn jsonl_tail_last_model(path: &Path) -> Option<String> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).ok()?;
     let text = String::from_utf8_lossy(&bytes);
-    let needle = "\"model\":\"";
     let mut last = None;
-    let mut cursor = 0usize;
-    while let Some(position) = text[cursor..].find(needle) {
-        let value_start = cursor + position + needle.len();
-        let Some(value_length) = text[value_start..].find('"') else {
-            break;
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
         };
-        let value = text[value_start..value_start + value_length].trim();
-        if !value.is_empty()
-            && value.len() <= 120
-            && value != "<synthetic>"
-            && value.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/')
-            })
-        {
-            last = Some(value.to_string());
+        if let Some(model) = jsonl_record_authoritative_model(provider, &value) {
+            last = Some(model);
         }
-        cursor = value_start + value_length;
     }
     last
 }
@@ -734,19 +790,24 @@ pub(crate) fn agent_session_last_model(
         // transcript, so the tail-scan above does not apply.
         AgentProvider::OpenCode => return opencode_session_last_model(session_id),
     };
-    jsonl_tail_last_model(&transcript)
+    jsonl_tail_last_model(provider, &transcript)
 }
 
 /// Builds an OpenCode `--model` value (`providerID/modelID`) from a value that
 /// carries the model. Handles both the assistant message shape
 /// (`{modelID, providerID}`) and the session column shape (`{id, providerID}`).
 fn opencode_model_from_value(value: &Value) -> Option<String> {
-    let model_id = first_value_string(&[
-        value.get("modelID"),
-        value.get("model_id"),
-        value.get("id"),
-        value.get("model"),
-    ]);
+    let is_assistant_message = value.get("role").and_then(Value::as_str) == Some("assistant");
+    let model_id = if is_assistant_message {
+        first_value_string(&[value.get("modelID"), value.get("model_id")])
+    } else {
+        first_value_string(&[
+            value.get("modelID"),
+            value.get("model_id"),
+            value.get("id"),
+            value.get("model"),
+        ])
+    };
     let model_id = model_id.trim();
     if model_id.is_empty() {
         return None;
@@ -1057,6 +1118,8 @@ fn codex_user_message_internal_context_text(text: &str) -> bool {
         "<INSTRUCTIONS>",
         "<!-- DIFFFORGE_AGENT_CONTRACT_BEGIN -->",
         "<environment_context>",
+        "<turn_aborted",
+        "<turn_interrupted",
     ]
     .iter()
     .any(|marker| text.starts_with(marker))
@@ -3746,6 +3809,8 @@ mod agent_sessions_tests {
             "<INSTRUCTIONS>",
             "<!-- DIFFFORGE_AGENT_CONTRACT_BEGIN -->",
             "<environment_context>",
+            "<turn_aborted reason=\"user_cancelled\">",
+            "<turn_interrupted reason=\"user_interrupt\">",
         ]
         .iter()
         .enumerate()
@@ -3855,6 +3920,57 @@ mod agent_sessions_tests {
     }
 
     #[test]
+    fn codex_rollout_keeps_angle_bracket_user_messages_without_internal_prefixes() {
+        let root = unique_test_dir("codex-angle-bracket-user");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout-test.jsonl");
+        let lines = [
+            json!({
+                "type": "session_meta",
+                "timestamp": "2026-07-02T00:00:00Z",
+                "payload": {"id": "codex-session", "cwd": "/tmp/project"}
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-07-02T00:00:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "<div> is my favorite tag"}]
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-07-02T00:00:02Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "<turnip recipes>"}]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(&path, format!("{lines}\n")).unwrap();
+
+        let (_, messages) = parse_codex_rollout(&path, 20).unwrap();
+        let user_texts = messages
+            .iter()
+            .filter(|message| message.role == "user")
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            user_texts,
+            vec!["<div> is my favorite tag", "<turnip recipes>"]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn codex_token_count_event_emits_cumulative_usage() {
         let messages = codex_messages_from_event(
             6,
@@ -3958,7 +4074,108 @@ mod agent_sessions_tests {
             opencode_model_from_value(&json!({"providerID": "opencode-go"})),
             None
         );
+        assert_eq!(
+            opencode_model_from_value(
+                &json!({"role": "assistant", "model": "seedance_2_0", "providerID": "video"})
+            ),
+            None,
+            "assistant rows must not accept generic tool-style model fields"
+        );
         assert_eq!(opencode_model_from_value(&json!({})), None);
+    }
+
+    #[test]
+    fn codex_last_model_ignores_nested_tool_payload_model() {
+        let root = unique_test_dir("codex-last-model-tool-payload");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout-session.jsonl");
+        let lines = [
+            json!({
+                "type": "turn_context",
+                "timestamp": "2026-07-02T00:00:00Z",
+                "model": "gpt-5.5"
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-07-02T00:00:01Z",
+                "payload": {
+                    "type": "function_call",
+                    "name": "generate_video",
+                    "input": {
+                        "prompt": "make a clip",
+                        "model": "seedance_2_0"
+                    }
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-07-02T00:00:02Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Video generation started."}]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(&path, format!("{lines}\n")).unwrap();
+
+        assert_eq!(
+            jsonl_tail_last_model(AgentProvider::Codex, &path),
+            Some("gpt-5.5".to_string())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_last_model_ignores_nested_tool_result_model() {
+        let root = unique_test_dir("claude-last-model-tool-result");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("claude-session.jsonl");
+        let lines = [
+            json!({
+                "type": "assistant",
+                "sessionId": "claude-session",
+                "timestamp": "2026-07-02T00:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-5",
+                    "content": [{"type": "text", "text": "I will generate it."}]
+                }
+            }),
+            json!({
+                "type": "user",
+                "sessionId": "claude-session",
+                "timestamp": "2026-07-02T00:00:01Z",
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu-video",
+                        "content": {
+                            "status": "queued",
+                            "model": "seedance_2_0"
+                        }
+                    }]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(&path, format!("{lines}\n")).unwrap();
+
+        assert_eq!(
+            jsonl_tail_last_model(AgentProvider::Claude, &path),
+            Some("claude-sonnet-4-5".to_string())
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4260,21 +4477,17 @@ mod agent_sessions_tests {
 
         let (_, messages) = parse_claude_session(&path, 20).unwrap();
 
-        assert!(
-            messages
-                .iter()
-                .any(|message| message.role == "user" && message.text == "hey there")
-        );
+        assert!(messages
+            .iter()
+            .any(|message| message.role == "user" && message.text == "hey there"));
         assert!(messages.iter().any(|message| {
             message.role == "assistant"
                 && message.kind == "message"
                 && message.text == "Hey! How can I help you today?"
         }));
-        assert!(
-            messages
-                .iter()
-                .any(|message| message.kind == "task_complete")
-        );
+        assert!(messages
+            .iter()
+            .any(|message| message.kind == "task_complete"));
     }
 
     #[test]
@@ -4297,11 +4510,9 @@ mod agent_sessions_tests {
         assert!(messages.iter().any(|message| {
             message.role == "assistant" && message.kind == "message" && message.text == "Done."
         }));
-        assert!(
-            messages
-                .iter()
-                .any(|message| message.kind == "task_complete" && message.text == "Done.")
-        );
+        assert!(messages
+            .iter()
+            .any(|message| message.kind == "task_complete" && message.text == "Done."));
     }
 
     #[test]

@@ -23278,6 +23278,7 @@ function TerminalView({
   minimizedPaneIndexes = [],
   viewMotion,
   workspaceAgentLaunchEpoch,
+  workspaceAgentLaunchAlert = null,
   workspaceError,
   workspaceName,
   workspaceNotificationAttention = null,
@@ -41166,6 +41167,7 @@ function TerminalView({
                 key={`${terminalWorkspace.id}-${terminalIndex}`}
                 agent={terminalAgent}
                 agentLaunchEpoch={workspaceAgentLaunchEpoch}
+                agentLaunchAlert={workspaceAgentLaunchAlert}
                 agentLaunchDefaults={agentLaunchDefaults}
                 agentLaunchReady={workspaceTerminalAgentLaunchReady}
                 agentStatuses={agentStatuses}

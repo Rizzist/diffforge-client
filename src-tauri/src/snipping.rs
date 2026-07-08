@@ -4145,8 +4145,11 @@ fn snipping_emit_untracked_image_saved_with_toast(
         let app_for_preview = app.clone();
         let preview_path = target.display().to_string();
         let _ = app.run_on_main_thread(move || {
-            let _ =
-                snipping_open_snip_preview_window_for(&app_for_preview, &preview_path, None, false);
+            if let Err(error) =
+                snipping_open_snip_preview_window_for(&app_for_preview, &preview_path, None, false)
+            {
+                eprintln!("Diff Forge snip preview failed to open: {error}");
+            }
         });
     }
     let root = diffforge_prepare_untracked_asset_root()?;
@@ -4193,8 +4196,11 @@ fn snipping_emit_untracked_video_saved_with_toast(
         let app_for_preview = app.clone();
         let preview_path = target.display().to_string();
         let _ = app.run_on_main_thread(move || {
-            let _ =
-                snipping_open_snip_preview_window_for(&app_for_preview, &preview_path, None, false);
+            if let Err(error) =
+                snipping_open_snip_preview_window_for(&app_for_preview, &preview_path, None, false)
+            {
+                eprintln!("Diff Forge snip preview failed to open: {error}");
+            }
         });
     }
     let root = diffforge_prepare_untracked_asset_root()?;
@@ -11871,25 +11877,6 @@ fn snipping_animate_preview_logical_size_to_full(
     );
 }
 
-fn snipping_animate_preview_logical_size_to_full_under_cursor(
-    app: &AppHandle,
-    window: &tauri::WebviewWindow,
-    from_width: f64,
-    from_height: f64,
-    duration_ms: f64,
-) {
-    snipping_animate_preview_logical_size(
-        app,
-        window,
-        from_width,
-        from_height,
-        SNIPPING_FLOAT_LOGICAL_WIDTH,
-        SNIPPING_FLOAT_LOGICAL_HEIGHT,
-        duration_ms,
-        true,
-    );
-}
-
 /// Tweens preview windows to their stack slots instead of snapping them. A
 /// new animation (or a re-targeted reflow mid-drag) bumps the generation,
 /// which stops in-flight tween threads at their next frame — the new tween
@@ -12164,14 +12151,24 @@ fn snipping_begin_preview_drag_handoff(app: &AppHandle, label: &str) {
                 snipping_update_preview_strip_drag_state(&app_for_main, &label_for_main, false);
                 return;
             }
-            snipping_animate_preview_logical_size_to_full_under_cursor(
+            // A drag session alone doesn't prove the button is still down: a
+            // fast release before this delayed expansion (likelier on Windows,
+            // where no native drag consumes the gesture) must still grow the
+            // float to full size, but in place — re-centering it under a
+            // cursor that already let go teleports the window post-release.
+            let cursor_still_dragging = !snipping_mouse_button_state_supported()
+                || snipping_left_mouse_button_pressed();
+            snipping_animate_preview_logical_size(
                 &app_for_main,
                 &window,
                 SNIPPING_STRIP_TILE_LOGICAL_WIDTH,
                 SNIPPING_STRIP_TILE_LOGICAL_HEIGHT,
+                SNIPPING_FLOAT_LOGICAL_WIDTH,
+                SNIPPING_FLOAT_LOGICAL_HEIGHT,
                 (SNIPPING_FLOAT_DRAG_HANDOFF_GRACE_MS
                     .saturating_sub(SNIPPING_FLOAT_DRAG_HANDOFF_EXPAND_DELAY_MS))
                     as f64,
+                cursor_still_dragging,
             );
         });
 
@@ -12817,6 +12814,11 @@ fn snipping_build_preview_window(
     .shadow(true)
     .build()
     .map_err(|error| format!("Unable to create snip preview window: {error}"))?;
+    // The builder's background_color alone does not reliably reach the
+    // WebView2 controller on Windows: the float then paints on an opaque
+    // white webview backdrop instead of transparency. Re-apply post-build,
+    // matching the audio widget windows.
+    let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
     snipping_set_window_capture_exclusion(&window, snipping_capture_exclusion_enabled());
     #[cfg(target_os = "macos")]
     snipping_preview_apply_macos_space_style(&window);
@@ -12989,7 +12991,11 @@ fn snipping_preview_position_under_cursor_with_offset(
     ))
 }
 
-fn snipping_start_preview_drag_follow_watchdog(app: &AppHandle, label: &str) {
+fn snipping_start_preview_drag_follow_watchdog_with_takeover(
+    app: &AppHandle,
+    label: &str,
+    take_over_immediately: bool,
+) {
     if !snipping_mouse_button_state_supported() {
         return;
     }
@@ -13011,7 +13017,10 @@ fn snipping_start_preview_drag_follow_watchdog(app: &AppHandle, label: &str) {
 
     let app = app.clone();
     thread::spawn(move || {
-        let mut correcting = false;
+        // With no native drag running (Windows), this loop is the only thing
+        // moving the window — correct from the first poll instead of waiting
+        // for drift to exceed the slack radius.
+        let mut correcting = take_over_immediately;
         loop {
             thread::sleep(Duration::from_millis(SNIPPING_PREVIEW_DRAG_FOLLOW_POLL_MS));
             if !snipping_left_mouse_button_pressed()
@@ -13198,6 +13207,7 @@ fn snipping_open_snip_preview_window_for_with_size(
     if let Some(existing_label) = existing_label {
         if let Some(existing) = app.get_webview_window(&existing_label) {
             let was_visible = existing.is_visible().unwrap_or(false);
+            let _ = existing.set_background_color(Some(Color(0, 0, 0, 0)));
             let _ = existing.set_size(tauri::LogicalSize::new(width, height));
             snipping_set_window_capture_exclusion(&existing, snipping_capture_exclusion_enabled());
             if explicit_position.is_some() || !was_visible {
@@ -13208,6 +13218,8 @@ fn snipping_open_snip_preview_window_for_with_size(
             snipping_show_window_now(&existing, "open_existing_preview_show");
             #[cfg(target_os = "macos")]
             snipping_preview_order_front_regardless(&existing);
+            #[cfg(not(target_os = "macos"))]
+            let _ = existing.set_always_on_top(true);
             if focused {
                 snipping_focus_window_now(&existing, "open_existing_preview_focus");
             }
@@ -13228,6 +13240,7 @@ fn snipping_open_snip_preview_window_for_with_size(
     // running, so the preview appears the moment the capture file lands.
     if let Some(window) = snipping_take_pooled_preview_window(app) {
         let pooled_label = window.label().to_string();
+        let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
         let _ = window.set_size(tauri::LogicalSize::new(width, height));
         snipping_set_window_capture_exclusion(&window, snipping_capture_exclusion_enabled());
         snipping_position_preview_window(app, &window, explicit_position);
@@ -13248,6 +13261,8 @@ fn snipping_open_snip_preview_window_for_with_size(
         snipping_show_window_now(&window, "open_pooled_preview_show");
         #[cfg(target_os = "macos")]
         snipping_preview_order_front_regardless(&window);
+        #[cfg(not(target_os = "macos"))]
+        let _ = window.set_always_on_top(true);
         if focused {
             snipping_focus_window_now(&window, "open_pooled_preview_focus");
         }
@@ -13276,6 +13291,8 @@ fn snipping_open_snip_preview_window_for_with_size(
     snipping_show_window_now(&window, "open_preview_show");
     #[cfg(target_os = "macos")]
     snipping_preview_order_front_regardless(&window);
+    #[cfg(not(target_os = "macos"))]
+    let _ = window.set_always_on_top(true);
     snipping_start_float_hover_watcher(app);
     // Park a warm window so the next capture takes the fast path.
     snipping_warm_preview_pool(app);
@@ -14315,8 +14332,21 @@ fn snipping_open_snip_float_for_drag(
         grab_offset_x,
         grab_offset_y,
     );
+    // Native drag here runs inside a sync command on the main thread. On
+    // Windows start_dragging enters the Win32 nested modal move loop while
+    // the strip webview still owns pointer capture from the in-flight drag
+    // gesture — observed as a full app freeze. The cursor-follow watchdog
+    // below moves the float instead (the Windows button-state probe ends it
+    // on release). macOS (non-blocking performWindowDrag) and Linux (no
+    // button-state probe, so the watchdog can't replace the drag) keep the
+    // native drag.
+    #[cfg(not(windows))]
     let drag_started = window.start_dragging().is_ok();
-    snipping_start_preview_drag_follow_watchdog(&app, &label);
+    #[cfg(windows)]
+    let drag_started = false;
+    // Without a native drag the watchdog is the only mover: take over from
+    // the first poll instead of waiting for drift past the slack radius.
+    snipping_start_preview_drag_follow_watchdog_with_takeover(&app, &label, !drag_started);
     let mut opened = opened;
     opened["dragStarted"] = json!(drag_started);
     Ok(opened)

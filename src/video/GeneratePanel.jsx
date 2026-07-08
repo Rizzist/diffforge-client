@@ -8,6 +8,7 @@ import AppSelect from "../app/AppSelect.jsx";
 import { emitVideoAssetDrag } from "./videoDragEvents.js";
 import {
   GENERATION_KINDS,
+  GENERATION_MODELS,
   estimateModelCredits,
   estimateModelUsd,
   generationModels,
@@ -199,6 +200,51 @@ const TopUpPill = styled.button`
   html[data-forge-theme="light"] & {
     color: #1d4ed8;
     border-color: rgba(29, 78, 216, 0.45);
+  }
+`;
+
+// Per-provider key entry inside the chooser's API card: populated keys get
+// the green tick, and only those providers' models show in the model list.
+const KeyProviderRow = styled.div`
+  display: grid;
+  gap: 5px;
+  padding: 8px 9px;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  background: rgba(4, 8, 14, 0.5);
+
+  &[data-ready="true"] {
+    border-color: rgba(16, 185, 129, 0.4);
+  }
+
+  html[data-forge-theme="light"] & {
+    background: #f8fafc;
+  }
+`;
+
+const KeyProviderName = styled.span`
+  font-size: 10.5px;
+  font-weight: 800;
+  color: rgba(226, 232, 240, 0.94);
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+  }
+`;
+
+const KeyReadyBadge = styled.span`
+  font-size: 8.5px;
+  font-weight: 850;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  color: #7d8ca3;
+
+  &[data-ready="true"] {
+    border-color: rgba(16, 185, 129, 0.5);
+    color: #6ee7b7;
   }
 `;
 
@@ -692,9 +738,27 @@ export default function GeneratePanel({
   seed = null,
 }) {
   const [kind, setKind] = useState("video");
-  const models = useMemo(() => generationModels(kind), [kind]);
+  // Billing routing: Diff Forge Cloud credits vs the user's own provider
+  // keys. Unset on first open → the chooser slide is forced until picked.
+  const [routing, setRouting] = useState(readGenerationRouting);
+  // Bumped whenever a key field changes so key-derived render state refreshes
+  // (the keys themselves live in localStorage via videoProviders.js).
+  const [providerKeysVersion, setProviderKeysVersion] = useState(0);
+  const models = useMemo(() => {
+    const list = generationModels(kind);
+    if (routing !== "api" || kind === "code") {
+      return list;
+    }
+    // API mode only offers models the user's populated keys can actually
+    // run: direct-routed models whose provider key shows the green tick.
+    return list.filter(
+      (entry) => entry.direct && videoProviderKeyReady(entry.direct.providerId),
+    );
+    // providerKeysVersion re-runs this when keys change in localStorage.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [kind, providerKeysVersion, routing]);
   const [modelId, setModelId] = useState("");
-  const model = getGenerationModel(modelId) || models[0] || null;
+  const model = models.find((entry) => entry.id === modelId) || models[0] || null;
   const caps = model?.caps || {};
 
   const [prompt, setPrompt] = useState("");
@@ -791,18 +855,36 @@ export default function GeneratePanel({
     [repoPath],
   );
 
-  // Billing routing: Diff Forge Cloud credits vs the user's own provider
-  // keys. Unset on first open → the chooser slide is forced until picked.
-  const [routing, setRouting] = useState(readGenerationRouting);
   const [routingOpen, setRoutingOpen] = useState(false);
-  // Bumped whenever a key field changes so key-derived render state refreshes
-  // (the keys themselves live in localStorage via videoProviders.js).
-  const [, setProviderKeysVersion] = useState(0);
   const chooseRouting = useCallback((mode) => {
     writeGenerationRouting(mode);
     setRouting(mode);
-    setRoutingOpen(false);
+    if (mode === "api") {
+      // Key setup happens in this same slide — Continue closes it once at
+      // least one provider key is populated.
+      setRoutingOpen(true);
+    } else {
+      setRoutingOpen(false);
+    }
   }, []);
+
+  // Providers backing the catalog's direct API routes — the key-entry list in
+  // the routing chooser, each with a ready (green tick) state.
+  const directKeyProviders = useMemo(() => {
+    const ids = [];
+    GENERATION_MODELS.forEach((entry) => {
+      const providerId = entry.direct?.providerId;
+      if (providerId && !ids.includes(providerId)) {
+        ids.push(providerId);
+      }
+    });
+    return ids.map(getVideoProvider).filter(Boolean);
+  }, []);
+  const readyKeyCount = useMemo(
+    () => directKeyProviders.filter((provider) => videoProviderKeyReady(provider.id)).length,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [directKeyProviders, providerKeysVersion],
+  );
 
   // Remaining Diff Forge credit balance — shown beside the cloud estimate so
   // "do I have enough for this run?" is answered before submitting.
@@ -1344,12 +1426,6 @@ export default function GeneratePanel({
           )}
           <span style={{ flex: 1 }} />
         </ProviderRow>
-        {routing === "api" && !isCodeKind && model && !model.direct ? (
-          <VideoHint>
-            {model.displayName} has no direct API route yet — this one runs on Diff Forge Cloud
-            credits.
-          </VideoHint>
-        ) : null}
         {isCodeKind ? (
           codeInstall ? (
             <div style={{ display: "grid", gap: 4 }}>
@@ -1399,6 +1475,16 @@ export default function GeneratePanel({
               renders land in media/generated/.
             </VideoHint>
           ) : null
+        ) : null}
+        {routing === "api" && !isCodeKind && !models.length ? (
+          <InlineRow>
+            <VideoErrorText>
+              No ✓ provider keys cover {kind} models yet.
+            </VideoErrorText>
+            <VideoSecondaryButton onClick={() => setRoutingOpen(true)} type="button">
+              Add keys
+            </VideoSecondaryButton>
+          </InlineRow>
         ) : null}
         <VideoLabel>
           Model
@@ -1730,9 +1816,50 @@ export default function GeneratePanel({
             <ModeCardBody>
               Bring your own provider keys (Higgsfield platform, OpenAI, …). Generations bill the
               provider directly at cost — usually the cheapest way to generate a lot. Keys stay on
-              this device and go straight to the provider with each request. Models without a
-              direct route automatically fall back to Cloud.
+              this device and go straight to the provider with each request. Only models from
+              providers with a ✓ key appear in the model list.
             </ModeCardBody>
+            {routing === "api" ? (
+              <div
+                onClick={(event) => event.stopPropagation()}
+                style={{ display: "grid", gap: 7 }}
+              >
+                {directKeyProviders.map((provider) => {
+                  const ready = videoProviderKeyReady(provider.id);
+                  const auth = videoProviderAuth(provider.id);
+                  return (
+                    <KeyProviderRow data-ready={ready ? "true" : "false"} key={provider.id}>
+                      <InlineRow style={{ justifyContent: "space-between" }}>
+                        <KeyProviderName>{provider.label}</KeyProviderName>
+                        <KeyReadyBadge data-ready={ready ? "true" : "false"}>
+                          {ready ? "✓ Ready" : "No key"}
+                        </KeyReadyBadge>
+                      </InlineRow>
+                      <VideoInput
+                        autoComplete="off"
+                        onChange={(event) =>
+                          setProviderKeyField(provider.id, "apiKey", event.target.value)
+                        }
+                        placeholder={provider.keyHint || "API key"}
+                        type="password"
+                        value={auth.apiKey}
+                      />
+                      {provider.requiresSecretKey ? (
+                        <VideoInput
+                          autoComplete="off"
+                          onChange={(event) =>
+                            setProviderKeyField(provider.id, "secretKey", event.target.value)
+                          }
+                          placeholder="Secret key"
+                          type="password"
+                          value={auth.secretKey}
+                        />
+                      ) : null}
+                    </KeyProviderRow>
+                  );
+                })}
+              </div>
+            ) : null}
           </ModeCard>
           <ModeCard
             as="div"
@@ -1777,7 +1904,22 @@ export default function GeneratePanel({
               regular use we recommend your own API keys.
             </ModeWarn>
           </ModeCard>
-          {routing ? (
+          {routing === "api" ? (
+            <InlineRow>
+              <VideoPaneButton
+                disabled={!readyKeyCount}
+                onClick={() => setRoutingOpen(false)}
+                type="button"
+              >
+                Continue ›
+              </VideoPaneButton>
+              <VideoHint>
+                {readyKeyCount
+                  ? `${readyKeyCount} provider${readyKeyCount === 1 ? "" : "s"} ready`
+                  : "Add at least one key to continue — or pick Cloud."}
+              </VideoHint>
+            </InlineRow>
+          ) : routing ? (
             <InlineRow>
               <VideoSecondaryButton onClick={() => setRoutingOpen(false)} type="button">
                 ‹ Back

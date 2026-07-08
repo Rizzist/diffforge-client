@@ -1,3 +1,4 @@
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { emit } from "@tauri-apps/api/event";
 import {
@@ -404,6 +405,7 @@ import {
   WindowResizeHandle,
   WindowTitleBar,
   WindowTitle,
+  WindowTitleVersion,
   WindowControls,
   WindowControlButton,
   AppContent,
@@ -2896,9 +2898,13 @@ const WORKSPACE_APP_STARTUP_MCP_INDEX_IDLE_DELAY_MS = 1600;
 const WORKSPACE_APP_STARTUP_WARMUP_STAGGER_MS = 350;
 const WORKSPACE_APP_STARTUP_IDLE_TIMEOUT_MS = 5000;
 const WORKSPACE_THREADS_HYDRATION_BASELINE_IDLE_TIMEOUT_MS = 80;
+const WORKSPACE_THREADS_HYDRATION_BASELINE_HARD_SEED_MS = 2000;
 const WORKSPACE_THREADS_HYDRATION_READ_STALE_MS = 15000;
 const WORKSPACE_ARCHITECTURE_GRAPH_LIST_PRELOAD_STAGGER_MS = 90;
 const WORKSPACE_AGENT_BATCH_RETRY_MS = 1500;
+const WORKSPACE_AGENT_BATCH_RETRY_MAX_MS = 15000;
+const WORKSPACE_AGENT_BATCH_INVOKE_TIMEOUT_MS = 90000;
+const WORKSPACE_AGENT_BATCH_ALERT_AFTER_FAILURES = 3;
 const FILE_EXPLORER_LAYOUT_STORAGE_KEY = "diffforge.fileExplorerLayout.v1";
 const FILE_EXPLORER_DEFAULT_SIZE = 28;
 const FILE_EXPLORER_MIN_SIZE = 16;
@@ -23609,7 +23615,13 @@ export default function App() {
     workspaceAgentBatchSentKeyRef.current = safeKey;
     setWorkspaceAgentBatchSentKey(safeKey);
   }, []);
+  // Launch failures used to vanish into an infinite silent 1.5s retry loop
+  // (missing CLI, cloud auth failure, hung backend command) while panes sat
+  // at "starting" forever. Track consecutive failures per launch key so the
+  // retry can back off and the panes can surface the real failure message.
+  const [workspaceAgentLaunchAlert, setWorkspaceAgentLaunchAlert] = useState(null);
   const [windowFrameState, setWindowFrameState] = useState(WINDOW_FRAME_STATE_DEFAULT);
+  const [appVersion, setAppVersion] = useState("");
   const [mainWindowFocused, setMainWindowFocused] = useState(readMainWindowFocusedFallback);
   const [workspaceCloseState, setWorkspaceCloseState] = useState(WORKSPACE_CLOSE_INITIAL_STATE);
   const [appCloseConfirmState, setAppCloseConfirmState] = useState(APP_CLOSE_CONFIRM_INITIAL_STATE);
@@ -23762,6 +23774,7 @@ export default function App() {
   const workspaceAgentBatchStartedSessionKeysRef = useRef(new Set());
   const workspaceAgentBatchInFlightSessionKeysRef = useRef(new Set());
   const workspaceAgentBatchRetryTimerRef = useRef(0);
+  const workspaceAgentBatchFailureRef = useRef({ count: 0, key: "", message: "" });
   const workspaceCloseInFlightRef = useRef(false);
   const workspaceCloseExpectedTotalRef = useRef(0);
   const appCloseConfirmStateRef = useRef(APP_CLOSE_CONFIRM_INITIAL_STATE);
@@ -24051,6 +24064,18 @@ export default function App() {
   // Let a two-finger trackpad gesture (or mouse wheel) scroll the script
   // shelf horizontally even when the gesture is mostly vertical. The listener
   // must be non-passive so we can preventDefault and keep the page still.
+  useEffect(() => {
+    let active = true;
+    getVersion()
+      .then((version) => {
+        if (active && version) setAppVersion(String(version));
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
+
   useEffect(() => {
     const shelf = appScriptsShelfRef.current;
     if (!shelf) return undefined;
@@ -26221,7 +26246,7 @@ export default function App() {
         };
         workspaceThreadsPersistenceReadyRef.current = false;
         workspaceThreadsPersistTargetsRef.current = targets;
-        workspaceThreadsBaselineSeedCancelRef.current = scheduleWorkspaceStartupIdleTask(() => {
+        const cancelBaselineIdleSeed = scheduleWorkspaceStartupIdleTask(() => {
           if (workspaceThreadsBaselinePendingKeyRef.current !== storeKey) {
             return;
           }
@@ -26238,6 +26263,28 @@ export default function App() {
         }, {
           timeoutMs: WORKSPACE_THREADS_HYDRATION_BASELINE_IDLE_TIMEOUT_MS,
         });
+        // A lost idle callback used to leave this baseline pending forever:
+        // workspaceThreadsHydrated stayed false, which gates the agent launch
+        // key, so panes sat at "starting" with no recovery. Seeding is
+        // idempotent — back the idle path with a hard timer.
+        const baselineHardSeedTimer = window.setTimeout(() => {
+          if (workspaceThreadsBaselinePendingKeyRef.current !== storeKey) {
+            return;
+          }
+          const seededBaseline = seedWorkspaceThreadsPersistBaseline(storeKey);
+          if (!seededBaseline) {
+            return;
+          }
+          logWorkspaceActivationTrace("workspace.open.threads_hydration.baseline_seeded_fallback", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
+            elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - startedAtMs),
+            storeKey,
+            targetCount: targets.length,
+          });
+        }, WORKSPACE_THREADS_HYDRATION_BASELINE_HARD_SEED_MS);
+        workspaceThreadsBaselineSeedCancelRef.current = () => {
+          cancelBaselineIdleSeed();
+          window.clearTimeout(baselineHardSeedTimer);
+        };
       })
       .catch((error) => {
         if (disposed) {
@@ -51922,10 +51969,49 @@ export default function App() {
       workspaceAgentBatchRetryTimerRef.current = 0;
     };
 
+    // Async batch callbacks can settle after the launch key moved on (workspace
+    // switch, terminal-count change); stale results must not touch the current
+    // launch's failure/alert state.
+    const launchKeyIsCurrent = () => workspaceAgentLaunchKeyRef.current === workspaceAgentLaunchKey;
+    const recordPreparedWorkspaceAgentBatchFailure = (message) => {
+      if (!launchKeyIsCurrent()) {
+        return;
+      }
+      const failureState = workspaceAgentBatchFailureRef.current;
+      const nextCount = failureState.key === workspaceAgentLaunchKey ? failureState.count + 1 : 1;
+      const nextMessage = String(message || "").trim() || failureState.message || "";
+      workspaceAgentBatchFailureRef.current = {
+        count: nextCount,
+        key: workspaceAgentLaunchKey,
+        message: nextMessage,
+      };
+      if (nextCount >= WORKSPACE_AGENT_BATCH_ALERT_AFTER_FAILURES) {
+        setWorkspaceAgentLaunchAlert({
+          attempts: nextCount,
+          message: nextMessage || "Agent launch is failing; Diff Forge keeps retrying.",
+          workspaceId: activatedWorkspace?.id || "",
+        });
+      }
+    };
+    const clearPreparedWorkspaceAgentBatchFailure = () => {
+      workspaceAgentBatchFailureRef.current = { count: 0, key: "", message: "" };
+      setWorkspaceAgentLaunchAlert((current) => (current ? null : current));
+    };
+
     const schedulePreparedWorkspaceAgentBatchRetry = (reason, fields = {}) => {
       clearPreparedWorkspaceAgentBatchRetry();
+      const failureState = workspaceAgentBatchFailureRef.current;
+      const failureCount = failureState.key === workspaceAgentLaunchKey ? failureState.count : 0;
+      // Exponential backoff on repeated failures: a permanent condition
+      // (missing CLI, offline cloud auth) must not hammer the backend and
+      // its upstream endpoints every 1.5s forever.
+      const delayMs = Math.min(
+        WORKSPACE_AGENT_BATCH_RETRY_MS * (2 ** Math.max(0, failureCount - 1)),
+        WORKSPACE_AGENT_BATCH_RETRY_MAX_MS,
+      );
       logWorkspaceActivationTrace("workspace.open.agent_batch.retry_scheduled", activatedWorkspace?.id || "", {
-        delayMs: WORKSPACE_AGENT_BATCH_RETRY_MS,
+        delayMs,
+        failureCount,
         launchKey: workspaceAgentLaunchKey,
         reason,
         ...fields,
@@ -51933,7 +52019,7 @@ export default function App() {
       workspaceAgentBatchRetryTimerRef.current = window.setTimeout(() => {
         workspaceAgentBatchRetryTimerRef.current = 0;
         setPreparedTerminalVersion((version) => version + 1);
-      }, WORKSPACE_AGENT_BATCH_RETRY_MS);
+      }, delayMs);
     };
 
     if (workspaceDeactivationInFlightRef.current) {
@@ -51980,6 +52066,7 @@ export default function App() {
       workspaceAgentBatchInFlightSessionKeysRef.current.clear();
       setWorkspaceAgentBatchSentLaunchKey("");
       clearPreparedWorkspaceAgentBatchRetry();
+      clearPreparedWorkspaceAgentBatchFailure();
       return;
     }
 
@@ -51991,6 +52078,7 @@ export default function App() {
       workspaceAgentBatchInFlightSessionKeysRef.current.clear();
       setWorkspaceAgentBatchSentLaunchKey("");
       clearPreparedWorkspaceAgentBatchRetry();
+      clearPreparedWorkspaceAgentBatchFailure();
     }
 
     if (!workspaceThreadsHydrated) {
@@ -52067,6 +52155,7 @@ export default function App() {
         && workspaceAgentBatchSentKeyRef.current !== workspaceAgentLaunchKey
       ) {
         workspaceAgentBatchWaitLogKeyRef.current = "";
+        clearPreparedWorkspaceAgentBatchFailure();
         setWorkspaceAgentBatchSentLaunchKey(workspaceAgentLaunchKey);
         setWorkspaceAgentLaunchEpoch((epoch) => epoch + 1);
         logWorkspaceActivationTrace("workspace.open.agent_batch.direct_ready", activatedWorkspace.id, {
@@ -52138,7 +52227,11 @@ export default function App() {
       workspaceId: activatedWorkspace.id,
     });
 
-    invoke("terminal_start_agent_many", { requests: pendingPreparedWorkspaceTerminalRequests })
+    withTimeout(
+      invoke("terminal_start_agent_many", { requests: pendingPreparedWorkspaceTerminalRequests }),
+      WORKSPACE_AGENT_BATCH_INVOKE_TIMEOUT_MS,
+      "Terminal agent batch start timed out.",
+    )
       .then((result) => {
         const results = Array.isArray(result?.results) ? result.results : [];
         const confirmedPaneResults = results
@@ -52217,13 +52310,24 @@ export default function App() {
             unconfirmedCount: unconfirmedRequests.length,
             workspaceId: activatedWorkspace.id,
           });
+          const unconfirmedMessage = results.find((paneResult) => (
+            paneResult
+            && !preparedWorkspaceAgentStartResultIsConfirmed(paneResult)
+            && String(paneResult.message || "").trim()
+          ))?.message || "";
+          recordPreparedWorkspaceAgentBatchFailure(unconfirmedMessage);
           schedulePreparedWorkspaceAgentBatchRetry("partial_result", {
             confirmedCount: confirmedPaneResults.length,
+            message: String(unconfirmedMessage || ""),
             requestCount: pendingPreparedWorkspaceTerminalRequests.length,
             resultCount: results.length,
             unconfirmedCount: unconfirmedRequests.length,
           });
           return;
+        }
+
+        if (launchKeyIsCurrent()) {
+          clearPreparedWorkspaceAgentBatchFailure();
         }
 
         confirmedPaneResults.forEach(({ paneResult, request }) => {
@@ -52421,6 +52525,7 @@ export default function App() {
         if (workspaceAgentBatchInFlightSessionKeysRef.current.size === 0) {
           workspaceAgentBatchInFlightKeyRef.current = "";
         }
+        recordPreparedWorkspaceAgentBatchFailure(error?.message || String(error || ""));
         schedulePreparedWorkspaceAgentBatchRetry("error", {
           requestCount: pendingPreparedWorkspaceTerminalRequests.length,
         });
@@ -52978,6 +53083,7 @@ export default function App() {
           <WindowTitle>
             <img src="/logo.webp" alt="" />
             <span>{BRAND_NAME}</span>
+            {appVersion ? <WindowTitleVersion>v{appVersion}</WindowTitleVersion> : null}
           </WindowTitle>
           <WindowControls aria-label="Window controls" data-platform={windowControlPlatform}>
             <WindowBackgroundPill
@@ -53008,8 +53114,10 @@ export default function App() {
                       // toggle can be turned back off.
                       ? openNetworkingOverlay
                       : () => {
-                          // Open the pricing/upgrade page in the system default browser.
-                          openUrl("https://diffforge.ai/pricing").catch(() => {});
+                          // Start the Plus subscription checkout on the website in the
+                          // system browser — the page opens Stripe checkout for the
+                          // signed-in account (or routes through sign-in first).
+                          openUrl("https://diffforge.ai/billing/checkout?plan=plus").catch(() => {});
                         }
                     : openNetworkingOverlay
                 }
@@ -53023,7 +53131,7 @@ export default function App() {
                   />
                 )}
                 <span>{cloudSyncPillLabel}</span>
-                {cloudSyncUpCount > 0 || cloudSyncDownCount > 0 ? (
+                {cloudSyncPillState !== "upgrade" && (cloudSyncUpCount > 0 || cloudSyncDownCount > 0) ? (
                   <WindowSyncDirectionCounts aria-hidden="true">
                     {cloudSyncUpCount > 0 ? (
                       <WindowSyncDirectionCount data-direction="up">
@@ -53596,6 +53704,11 @@ export default function App() {
                             terminalThreadsByIndex={runtimeDescriptor.threadsByIndex}
                             viewMotion={viewMotion}
                             workspaceAgentLaunchEpoch={runtimeEffectsVisible ? workspaceAgentLaunchEpoch : 0}
+                            workspaceAgentLaunchAlert={
+                              workspaceAgentLaunchAlert?.workspaceId === runtimeWorkspace.id
+                                ? workspaceAgentLaunchAlert
+                                : null
+                            }
                             workspaceError={workspaceError}
                             workspaceName={runtimeWorkspace.name || workspaceName}
                             workspaceSyncState={workspaceSyncState}

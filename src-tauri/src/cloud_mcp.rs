@@ -12198,8 +12198,18 @@ async fn cloud_mcp_runtime_env_vars(
         ("CLOUD_MCP_BASE_URL".to_string(), base_url),
     ];
 
-    if let Some(token) = cloud_mcp_authorization_bearer(state).await? {
-        env_vars.push(("CLOUD_DIFFFORGE_APPWRITE_JWT".to_string(), token));
+    // A failed JWT mint (offline, firewalled auth endpoint, expired desktop
+    // session) must degrade to a launch without cloud auth instead of failing
+    // the terminal/agent start outright: the launch retry loop upstream would
+    // re-fail forever and the pane never leaves "starting".
+    match cloud_mcp_authorization_bearer(state).await {
+        Ok(Some(token)) => {
+            env_vars.push(("CLOUD_DIFFFORGE_APPWRITE_JWT".to_string(), token));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("Diff Forge cloud auth unavailable for terminal launch: {error}");
+        }
     }
 
     Ok(env_vars)

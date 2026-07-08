@@ -43,7 +43,7 @@ const WORKING_ROW_KEY = "__transcript-working";
 const EMPTY_EXPANDED_SET = new Set();
 // Bottom padding of TranscriptColumn plus breathing room, used when sizing
 // the anchor-to-top end spacer.
-const COLUMN_BOTTOM_PAD_PX = 46;
+const COLUMN_BOTTOM_PAD_PX = 40;
 
 function rowSpacing(row = {}) {
   switch (row.kind) {

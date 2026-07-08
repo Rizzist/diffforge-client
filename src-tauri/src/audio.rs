@@ -5237,10 +5237,8 @@ fn ensure_audio_widget_window(app: &AppHandle) -> Result<tauri::WebviewWindow, S
         }),
     );
     #[cfg(target_os = "macos")]
-    {
-        register_audio_widget_space_change_observer(app);
-        register_audio_widget_bar_hover_mouse_monitors(app);
-    }
+    register_audio_widget_space_change_observer(app);
+    register_audio_widget_bar_hover_mouse_monitors(app);
 
     if let Some(window) = app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) {
         let visible = window.is_visible().ok();
@@ -5517,13 +5515,9 @@ const AUDIO_WIDGET_BOTTOM_BAR_DEBUG_SAMPLE_MS: u64 = 500;
 const AUDIO_WIDGET_BOTTOM_BAR_FRAME_EPSILON: f64 = 0.5;
 #[cfg(target_os = "macos")]
 static AUDIO_WIDGET_MACOS_SPACE_OBSERVER_STARTED: AtomicBool = AtomicBool::new(false);
-#[cfg(target_os = "macos")]
 static AUDIO_WIDGET_BAR_HOVER_MONITORS_STARTED: AtomicBool = AtomicBool::new(false);
-#[cfg(target_os = "macos")]
 static AUDIO_WIDGET_BAR_HOVER_ACTIVE: AtomicBool = AtomicBool::new(false);
-#[cfg(target_os = "macos")]
 static AUDIO_WIDGET_BUBBLE_HOVER_ENABLED: AtomicBool = AtomicBool::new(false);
-#[cfg(target_os = "macos")]
 static AUDIO_WIDGET_BUBBLE_HOVER_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static MACOS_ACTIVE_SPACE_USES_FULL_MONITOR_BOUNDS: AtomicBool = AtomicBool::new(false);
@@ -6158,7 +6152,6 @@ fn register_audio_widget_space_change_observer(app: &AppHandle) {
     });
 }
 
-#[cfg(target_os = "macos")]
 fn audio_widget_emit_bar_hover_changed(app: &AppHandle, hovering: bool) {
     let previous = AUDIO_WIDGET_BAR_HOVER_ACTIVE.swap(hovering, Ordering::AcqRel);
     if previous == hovering {
@@ -6171,7 +6164,6 @@ fn audio_widget_emit_bar_hover_changed(app: &AppHandle, hovering: bool) {
     );
 }
 
-#[cfg(target_os = "macos")]
 fn audio_widget_emit_bubble_hover_changed(app: &AppHandle, hovering: bool) {
     let previous = AUDIO_WIDGET_BUBBLE_HOVER_ACTIVE.swap(hovering, Ordering::AcqRel);
     if previous == hovering {
@@ -6184,7 +6176,6 @@ fn audio_widget_emit_bubble_hover_changed(app: &AppHandle, hovering: bool) {
     );
 }
 
-#[cfg(target_os = "macos")]
 fn audio_widget_set_bubble_hover_enabled(app: &AppHandle, enabled: bool) {
     let previous = AUDIO_WIDGET_BUBBLE_HOVER_ENABLED.swap(enabled, Ordering::AcqRel);
     if previous && !enabled {
@@ -6512,6 +6503,91 @@ fn register_audio_widget_bar_hover_mouse_monitors(app: &AppHandle) {
                 std::mem::forget(token);
             }
         });
+    });
+}
+
+/// Non-macOS hover detection. AppKit mouse monitors don't exist here, and the
+/// webview's own :hover never fires while the always-on-top widget is
+/// unfocused, so poll the global cursor against the widget frame with the same
+/// top-left hit predicates the snapshot command uses. Without this the hover
+/// chrome (bar expansion, the two bubble buttons) never appears on Windows.
+#[cfg(not(target_os = "macos"))]
+const AUDIO_WIDGET_BAR_HOVER_POLL_MS: u64 = 66;
+#[cfg(not(target_os = "macos"))]
+const AUDIO_WIDGET_BAR_HOVER_HIDDEN_POLL_MS: u64 = 500;
+
+#[cfg(not(target_os = "macos"))]
+fn audio_widget_bar_evaluate_hover_from_cursor(app: &AppHandle) {
+    let visible_window = app
+        .get_webview_window(AUDIO_WIDGET_WINDOW_LABEL)
+        .filter(|window| window.is_visible().unwrap_or(false));
+    let Some(window) = visible_window else {
+        audio_widget_emit_bar_hover_changed(app, false);
+        audio_widget_emit_bubble_hover_changed(app, false);
+        return;
+    };
+
+    let frame = (|| {
+        let cursor = app.cursor_position().ok()?;
+        let position = window.outer_position().ok()?;
+        let size = window.outer_size().ok()?;
+        let scale = window.scale_factor().unwrap_or(1.0).max(0.1);
+        Some((
+            f64::from(size.width.max(1)) / scale,
+            f64::from(size.height.max(1)) / scale,
+            (cursor.x - f64::from(position.x)) / scale,
+            (cursor.y - f64::from(position.y)) / scale,
+        ))
+    })();
+    let Some((width, height, local_x, local_y)) = frame else {
+        audio_widget_emit_bar_hover_changed(app, false);
+        audio_widget_emit_bubble_hover_changed(app, false);
+        return;
+    };
+
+    let hovering_bar = audio_widget_bar_hover_from_top_left(
+        width,
+        height,
+        local_x,
+        local_y,
+        AUDIO_WIDGET_BAR_HOVER_ACTIVE.load(Ordering::Acquire),
+    );
+    let bubble_enabled = AUDIO_WIDGET_BUBBLE_HOVER_ENABLED.load(Ordering::Acquire);
+    let hovering_bubble = bubble_enabled
+        && audio_widget_bubble_hover_from_top_left(
+            width,
+            height,
+            local_x,
+            local_y,
+            AUDIO_WIDGET_BUBBLE_HOVER_ACTIVE.load(Ordering::Acquire),
+        );
+
+    audio_widget_emit_bar_hover_changed(app, hovering_bar);
+    if bubble_enabled {
+        audio_widget_emit_bubble_hover_changed(app, hovering_bubble);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn register_audio_widget_bar_hover_mouse_monitors(app: &AppHandle) {
+    if AUDIO_WIDGET_BAR_HOVER_MONITORS_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let app = app.clone();
+    thread::spawn(move || loop {
+        let widget_visible = app
+            .get_webview_window(AUDIO_WIDGET_WINDOW_LABEL)
+            .and_then(|window| window.is_visible().ok())
+            .unwrap_or(false);
+        if widget_visible {
+            audio_widget_bar_evaluate_hover_from_cursor(&app);
+            thread::sleep(Duration::from_millis(AUDIO_WIDGET_BAR_HOVER_POLL_MS));
+        } else {
+            audio_widget_emit_bar_hover_changed(&app, false);
+            audio_widget_emit_bubble_hover_changed(&app, false);
+            thread::sleep(Duration::from_millis(AUDIO_WIDGET_BAR_HOVER_HIDDEN_POLL_MS));
+        }
     });
 }
 
@@ -9390,7 +9466,6 @@ fn audio_widget_bar_hover_snapshot_for(
     request: &AudioWidgetBarHoverSnapshotRequest,
 ) -> AudioWidgetBarHoverSnapshot {
     let hover_enabled = !request.bubble || request.enabled.unwrap_or(true);
-    #[cfg(target_os = "macos")]
     if request.bubble {
         audio_widget_set_bubble_hover_enabled(app, hover_enabled);
     }
@@ -9434,8 +9509,8 @@ fn audio_widget_bar_hover_snapshot_for(
         })
         .unwrap_or(false);
 
-    #[cfg(target_os = "macos")]
     if request.focus {
+        #[cfg(target_os = "macos")]
         audio_widget_apply_bar_hover_focus(app, hovering);
         if request.bubble {
             audio_widget_emit_bubble_hover_changed(app, hovering);

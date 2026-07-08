@@ -333,13 +333,13 @@ fn agent_chat_session_sync_test_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poison| poison.into_inner())
 }
 
-fn agent_chat_session_history_source_fingerprints()
--> &'static StdMutex<HashMap<String, AgentChatSessionHistorySourceFingerprint>> {
+fn agent_chat_session_history_source_fingerprints(
+) -> &'static StdMutex<HashMap<String, AgentChatSessionHistorySourceFingerprint>> {
     AGENT_CHAT_SESSION_HISTORY_SOURCE_FINGERPRINTS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
-fn agent_chat_session_history_backfill_workspaces()
--> &'static StdMutex<HashMap<String, AgentChatSessionHistoryBackfillWorkspace>> {
+fn agent_chat_session_history_backfill_workspaces(
+) -> &'static StdMutex<HashMap<String, AgentChatSessionHistoryBackfillWorkspace>> {
     AGENT_CHAT_SESSION_HISTORY_BACKFILL_WORKSPACES.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
@@ -939,10 +939,7 @@ fn agent_chat_session_sync_strip_turn_diff_message_patches(message: &Value) -> V
     if agent_chat_session_sync_message_kind(&message) != "turn_diff" {
         return message;
     }
-    if let Some(files) = message
-        .get_mut("files")
-        .and_then(Value::as_array_mut)
-    {
+    if let Some(files) = message.get_mut("files").and_then(Value::as_array_mut) {
         for file in files {
             if let Some(file_object) = file.as_object_mut() {
                 file_object.remove("patch");
@@ -1504,14 +1501,12 @@ fn agent_chat_session_sync_usage_rollup_from_messages<'a>(
 }
 
 fn agent_chat_session_sync_thread_usage_rollup(messages: &[Value]) -> Value {
-    agent_chat_session_sync_usage_rollup_from_messages(
-        messages.iter().filter(|message| {
-            !matches!(
-                agent_chat_session_sync_message_kind(message).as_str(),
-                "turn_summary" | "turn_diff"
-            )
-        }),
-    )
+    agent_chat_session_sync_usage_rollup_from_messages(messages.iter().filter(|message| {
+        !matches!(
+            agent_chat_session_sync_message_kind(message).as_str(),
+            "turn_summary" | "turn_diff"
+        )
+    }))
 }
 
 fn agent_chat_session_sync_turn_usage_rollup(
@@ -1550,6 +1545,7 @@ fn agent_chat_session_sync_turn_usage_rollup(
     let first_selected = selected.iter().position(|value| *value);
     let started_at_ms = agent_chat_session_sync_timestamp_ms(started_at);
     let mut totals = AgentChatSessionSyncUsageTotals::default();
+    let mut first_cumulative_in_window = None::<AgentChatSessionSyncUsageTotals>;
     let mut last_cumulative_in_window = None::<AgentChatSessionSyncUsageTotals>;
     let mut last_cumulative_before_window = None::<AgentChatSessionSyncUsageTotals>;
 
@@ -1561,6 +1557,9 @@ fn agent_chat_session_sync_turn_usage_rollup(
         let is_cumulative = agent_chat_session_sync_usage_is_cumulative(usage);
         if selected.get(index).copied().unwrap_or(false) {
             if is_cumulative {
+                if first_cumulative_in_window.is_none() {
+                    first_cumulative_in_window = Some(usage_totals.clone());
+                }
                 last_cumulative_in_window = Some(usage_totals);
             } else {
                 totals.add_totals(&usage_totals);
@@ -1586,7 +1585,10 @@ fn agent_chat_session_sync_turn_usage_rollup(
     }
 
     if let Some(usage) = last_cumulative_in_window {
-        totals.add_totals(&usage.delta_from(last_cumulative_before_window.as_ref()));
+        let baseline = last_cumulative_before_window
+            .as_ref()
+            .or(first_cumulative_in_window.as_ref());
+        totals.add_totals(&usage.delta_from(baseline));
     }
     totals.into_value()
 }
@@ -1597,7 +1599,13 @@ fn agent_chat_session_sync_thread_detail(
     model_id: &str,
     model_config: &Value,
 ) -> Value {
-    agent_chat_session_sync_thread_detail_with_options(source, context, model_id, model_config, false)
+    agent_chat_session_sync_thread_detail_with_options(
+        source,
+        context,
+        model_id,
+        model_config,
+        false,
+    )
 }
 
 fn agent_chat_session_sync_thread_detail_with_options(
@@ -1774,54 +1782,35 @@ fn agent_chat_session_sync_thread_detail_with_options(
     })
 }
 
-fn agent_chat_session_sync_find_text_deep(value: &Value, keys: &[&str], depth: usize) -> String {
-    if depth > 5 {
-        return String::new();
-    }
-    if let Some(text) = cloud_mcp_payload_text(value, keys) {
-        return text;
-    }
-    match value {
-        Value::Array(items) => {
-            for item in items {
-                let text = agent_chat_session_sync_find_text_deep(item, keys, depth + 1);
-                if !text.is_empty() {
-                    return text;
-                }
-            }
-        }
-        Value::Object(object) => {
-            for child in object.values() {
-                let text = agent_chat_session_sync_find_text_deep(child, keys, depth + 1);
-                if !text.is_empty() {
-                    return text;
-                }
-            }
-        }
-        _ => {}
-    }
-    String::new()
+fn agent_chat_session_sync_direct_text(value: &Value, keys: &[&str]) -> String {
+    cloud_mcp_payload_text(value, keys)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
-fn agent_chat_session_sync_model_config_from_raw(value: &Value) -> Value {
-    let model_id = agent_chat_session_sync_find_text_deep(
-        value,
-        &[
-            "model_id",
-            "modelId",
-            "model",
-            "modelID",
-            "provider_model_id",
-            "providerModelId",
-        ],
-        0,
-    );
-    let model_source = agent_chat_session_sync_find_text_deep(
+fn agent_chat_session_sync_first_direct_text(
+    primary: &Value,
+    secondary: &Value,
+    keys: &[&str],
+) -> String {
+    let text = agent_chat_session_sync_direct_text(primary, keys);
+    if text.is_empty() {
+        agent_chat_session_sync_direct_text(secondary, keys)
+    } else {
+        text
+    }
+}
+
+fn agent_chat_session_sync_model_config_from_direct_fields(
+    value: &Value,
+    model_id: String,
+) -> Value {
+    let model_source = agent_chat_session_sync_direct_text(
         value,
         &["model_source", "modelSource", "providerID", "provider_id"],
-        0,
     );
-    let reasoning_effort = agent_chat_session_sync_find_text_deep(
+    let reasoning_effort = agent_chat_session_sync_direct_text(
         value,
         &[
             "reasoning_effort",
@@ -1829,13 +1818,12 @@ fn agent_chat_session_sync_model_config_from_raw(value: &Value) -> Value {
             "model_reasoning_effort",
             "effort",
         ],
-        0,
     );
     let service_tier =
-        agent_chat_session_sync_find_text_deep(value, &["service_tier", "serviceTier", "tier"], 0);
+        agent_chat_session_sync_direct_text(value, &["service_tier", "serviceTier", "tier"]);
     let speed_mode = {
         let explicit =
-            agent_chat_session_sync_find_text_deep(value, &["speed_mode", "speedMode", "speed"], 0);
+            agent_chat_session_sync_direct_text(value, &["speed_mode", "speedMode", "speed"]);
         if !explicit.is_empty() {
             explicit
         } else if service_tier.eq_ignore_ascii_case("fast") {
@@ -1861,6 +1849,122 @@ fn agent_chat_session_sync_model_config_from_raw(value: &Value) -> Value {
     })
 }
 
+fn agent_chat_session_sync_codex_model_config_from_raw(value: &Value) -> Value {
+    let record_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let payload = value.get("payload").unwrap_or(&Value::Null);
+    let payload_type = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let is_model_record = record_type == "turn_context"
+        || record_type == "token_count"
+        || (record_type == "event_msg" && payload_type == "token_count");
+    if !is_model_record {
+        return json!({});
+    }
+
+    let model_id = agent_chat_session_sync_first_direct_text(
+        payload,
+        value,
+        &[
+            "model_id",
+            "modelId",
+            "model",
+            "provider_model_id",
+            "providerModelId",
+        ],
+    );
+    let model_source = agent_chat_session_sync_first_direct_text(
+        payload,
+        value,
+        &["model_source", "modelSource", "providerID", "provider_id"],
+    );
+    let reasoning_effort = agent_chat_session_sync_first_direct_text(
+        payload,
+        value,
+        &[
+            "reasoning_effort",
+            "reasoningEffort",
+            "model_reasoning_effort",
+            "effort",
+        ],
+    );
+    let service_tier = agent_chat_session_sync_first_direct_text(
+        payload,
+        value,
+        &["service_tier", "serviceTier", "tier"],
+    );
+    let speed_mode = {
+        let explicit = agent_chat_session_sync_first_direct_text(
+            payload,
+            value,
+            &["speed_mode", "speedMode", "speed"],
+        );
+        if !explicit.is_empty() {
+            explicit
+        } else if service_tier.eq_ignore_ascii_case("fast") {
+            "fast".to_string()
+        } else if cloud_mcp_payload_bool(
+            payload,
+            &["xfast", "xFast", "fastMode", "fast_mode"],
+            false,
+        ) || cloud_mcp_payload_bool(
+            value,
+            &["xfast", "xFast", "fastMode", "fast_mode"],
+            false,
+        ) {
+            "xfast".to_string()
+        } else {
+            String::new()
+        }
+    };
+
+    json!({
+        "modelId": model_id,
+        "model_id": model_id,
+        "modelSource": model_source,
+        "model_source": model_source,
+        "reasoningEffort": reasoning_effort,
+        "reasoning_effort": reasoning_effort,
+        "serviceTier": service_tier,
+        "service_tier": service_tier,
+        "speedMode": speed_mode,
+        "speed_mode": speed_mode,
+    })
+}
+
+fn agent_chat_session_sync_claude_model_config_from_raw(value: &Value) -> Value {
+    if value.get("type").and_then(Value::as_str) != Some("assistant") {
+        return json!({});
+    }
+    let message = value.get("message").unwrap_or(&Value::Null);
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return json!({});
+    }
+    let model_id = agent_chat_session_sync_direct_text(message, &["model"]);
+    agent_chat_session_sync_model_config_from_direct_fields(message, model_id)
+}
+
+fn agent_chat_session_sync_opencode_model_config_from_raw(value: &Value) -> Value {
+    if value.get("role").and_then(Value::as_str) != Some("assistant") {
+        return json!({});
+    }
+    let model_id = opencode_model_from_value(value).unwrap_or_default();
+    agent_chat_session_sync_model_config_from_direct_fields(value, model_id)
+}
+
+fn agent_chat_session_sync_model_config_from_raw(provider: &str, value: &Value) -> Value {
+    match provider {
+        "codex" => agent_chat_session_sync_codex_model_config_from_raw(value),
+        "claude" => agent_chat_session_sync_claude_model_config_from_raw(value),
+        "opencode" => agent_chat_session_sync_opencode_model_config_from_raw(value),
+        _ => json!({}),
+    }
+}
+
 fn agent_chat_session_sync_merge_model_config(current: &mut Value, candidate: Value) {
     let Some(current_object) = current.as_object_mut() else {
         *current = candidate;
@@ -1879,6 +1983,20 @@ fn agent_chat_session_sync_merge_model_config(current: &mut Value, candidate: Va
             current_object.insert(key.clone(), value.clone());
         }
     }
+}
+
+fn agent_chat_session_sync_merge_authoritative_model_id(model_config: &mut Value, model_id: &str) {
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return;
+    }
+    agent_chat_session_sync_merge_model_config(
+        model_config,
+        json!({
+            "modelId": model_id,
+            "model_id": model_id,
+        }),
+    );
 }
 
 fn agent_chat_session_sync_latest_model_id(model_config: &Value, fallback: &str) -> String {
@@ -2088,7 +2206,10 @@ fn agent_chat_session_sync_turn_diff_message(
     let mut message = serde_json::Map::new();
     message.insert(
         "id".to_string(),
-        json!(format!("turn-diff:{provider}:{session_id}:{}", diff.turn_key)),
+        json!(format!(
+            "turn-diff:{provider}:{session_id}:{}",
+            diff.turn_key
+        )),
     );
     message.insert("role".to_string(), json!("system"));
     message.insert("kind".to_string(), json!("turn_diff"));
@@ -2098,14 +2219,8 @@ fn agent_chat_session_sync_turn_diff_message(
         message.insert("started_at".to_string(), json!(started_at.clone()));
         message.insert("startedAt".to_string(), json!(started_at));
     }
-    message.insert(
-        "completed_at".to_string(),
-        json!(diff.completed_at.clone()),
-    );
-    message.insert(
-        "completedAt".to_string(),
-        json!(diff.completed_at.clone()),
-    );
+    message.insert("completed_at".to_string(), json!(diff.completed_at.clone()));
+    message.insert("completedAt".to_string(), json!(diff.completed_at.clone()));
     message.insert("files".to_string(), json!(diff.files.clone()));
     message.insert("total_additions".to_string(), json!(diff.total_additions));
     message.insert("total_deletions".to_string(), json!(diff.total_deletions));
@@ -2705,7 +2820,8 @@ fn agent_chat_session_sync_jsonl_source(
             line_index = line_index.saturating_add(1);
             continue;
         };
-        let candidate_model_config = agent_chat_session_sync_model_config_from_raw(&value);
+        let candidate_model_config =
+            agent_chat_session_sync_model_config_from_raw(provider, &value);
         let candidate_model_config_fingerprint =
             agent_chat_session_sync_model_config_fingerprint(&candidate_model_config);
         let should_emit_model_config = !candidate_model_config_fingerprint.is_empty()
@@ -2960,6 +3076,7 @@ fn agent_chat_session_sync_jsonl_source(
     let model_id = agent_chat_session_sync_provider_enum(provider)
         .and_then(|provider| agent_session_last_model(provider, &session_id))
         .unwrap_or_else(|| agent_chat_session_sync_latest_model_id(&model_config, ""));
+    agent_chat_session_sync_merge_authoritative_model_id(&mut model_config, &model_id);
     Ok(AgentChatSessionSyncSource {
         provider: provider.to_string(),
         source_kind: source_kind.to_string(),
@@ -3024,10 +3141,6 @@ fn agent_chat_session_sync_opencode_model_config(model: &str) -> Value {
     }
     let mut config = json!({});
     if let Ok(value) = serde_json::from_str::<Value>(model) {
-        agent_chat_session_sync_merge_model_config(
-            &mut config,
-            agent_chat_session_sync_model_config_from_raw(&value),
-        );
         if let Some(model_id) = opencode_model_from_value(&value) {
             agent_chat_session_sync_merge_model_config(
                 &mut config,
@@ -3046,6 +3159,19 @@ fn agent_chat_session_sync_opencode_model_config(model: &str) -> Value {
                 json!({
                     "modelId": model_text,
                     "model_id": model_text,
+                }),
+            );
+        }
+        let model_source = agent_chat_session_sync_direct_text(
+            &value,
+            &["providerID", "provider_id", "modelSource", "model_source"],
+        );
+        if !model_source.is_empty() {
+            agent_chat_session_sync_merge_model_config(
+                &mut config,
+                json!({
+                    "modelSource": model_source.clone(),
+                    "model_source": model_source,
                 }),
             );
         }
@@ -3191,7 +3317,7 @@ fn agent_chat_session_sync_opencode_source(
         let message_data = serde_json::from_str::<Value>(&row.2).unwrap_or(Value::Null);
         agent_chat_session_sync_merge_model_config(
             &mut model_config,
-            agent_chat_session_sync_model_config_from_raw(&message_data),
+            agent_chat_session_sync_model_config_from_raw("opencode", &message_data),
         );
         let role = opencode_message_role(&message_data);
         role_by_message.insert(row.0.clone(), role.clone());
@@ -3258,7 +3384,7 @@ fn agent_chat_session_sync_opencode_source(
         let part_data = serde_json::from_str::<Value>(&row.3).unwrap_or(Value::Null);
         agent_chat_session_sync_merge_model_config(
             &mut model_config,
-            agent_chat_session_sync_model_config_from_raw(&part_data),
+            agent_chat_session_sync_model_config_from_raw("opencode", &part_data),
         );
         let timestamp = opencode_timestamp(row.2);
         if !timestamp.is_empty() {
@@ -3302,6 +3428,7 @@ fn agent_chat_session_sync_opencode_source(
 
     let model_id = agent_session_last_model(AgentProvider::OpenCode, &session_id)
         .unwrap_or_else(|| agent_chat_session_sync_latest_model_id(&model_config, ""));
+    agent_chat_session_sync_merge_authoritative_model_id(&mut model_config, &model_id);
     Ok(AgentChatSessionSyncSource {
         provider: "opencode".to_string(),
         source_kind: "opencode_sqlite".to_string(),
@@ -3318,14 +3445,15 @@ fn agent_chat_session_sync_opencode_source(
     })
 }
 
-fn agent_chat_session_sync_source(
+fn agent_chat_session_sync_source_with_acked<F>(
     provider: &str,
     provider_session_id: &str,
     cwd: &str,
-    scope_key: &str,
-    device_id: &str,
-    workspace_id: &str,
-) -> Result<AgentChatSessionSyncSource, String> {
+    mut acked_for: F,
+) -> Result<AgentChatSessionSyncSource, String>
+where
+    F: FnMut(&str, &str) -> HashMap<String, String>,
+{
     let requested_session_id = clean_codex_id(provider_session_id);
     if requested_session_id.is_empty() {
         return Err("Provider session id is required for agent chat sync.".to_string());
@@ -3338,13 +3466,7 @@ fn agent_chat_session_sync_source(
             } else {
                 initial_meta.session_id.clone()
             };
-            let acked = agent_chat_session_sync_acked_record_hashes(
-                scope_key,
-                device_id,
-                workspace_id,
-                provider,
-                &session_id,
-            );
+            let acked = acked_for(provider, &session_id);
             agent_chat_session_sync_jsonl_source(
                 provider,
                 "claude_jsonl",
@@ -3357,13 +3479,7 @@ fn agent_chat_session_sync_source(
         "opencode" => {
             let (session_id, title, session_cwd, _) =
                 find_opencode_session(&requested_session_id, cwd)?;
-            let acked = agent_chat_session_sync_acked_record_hashes(
-                scope_key,
-                device_id,
-                workspace_id,
-                provider,
-                &session_id,
-            );
+            let acked = acked_for(provider, &session_id);
             agent_chat_session_sync_opencode_source(&session_id, &title, &session_cwd, &acked)
         }
         "codex" => {
@@ -3373,13 +3489,7 @@ fn agent_chat_session_sync_source(
             } else {
                 initial_meta.session_id.clone()
             };
-            let acked = agent_chat_session_sync_acked_record_hashes(
-                scope_key,
-                device_id,
-                workspace_id,
-                provider,
-                &session_id,
-            );
+            let acked = acked_for(provider, &session_id);
             agent_chat_session_sync_jsonl_source(
                 provider,
                 "codex_jsonl",
@@ -3391,6 +3501,40 @@ fn agent_chat_session_sync_source(
         }
         _ => Err("Agent chat sync supports Codex, Claude Code, and OpenCode only.".to_string()),
     }
+}
+
+fn agent_chat_session_sync_source(
+    provider: &str,
+    provider_session_id: &str,
+    cwd: &str,
+    scope_key: &str,
+    device_id: &str,
+    workspace_id: &str,
+) -> Result<AgentChatSessionSyncSource, String> {
+    agent_chat_session_sync_source_with_acked(
+        provider,
+        provider_session_id,
+        cwd,
+        |provider, session_id| {
+            agent_chat_session_sync_acked_record_hashes(
+                scope_key,
+                device_id,
+                workspace_id,
+                provider,
+                session_id,
+            )
+        },
+    )
+}
+
+fn agent_chat_session_sync_unacked_source(
+    provider: &str,
+    provider_session_id: &str,
+    cwd: &str,
+) -> Result<AgentChatSessionSyncSource, String> {
+    agent_chat_session_sync_source_with_acked(provider, provider_session_id, cwd, |_, _| {
+        HashMap::new()
+    })
 }
 
 fn agent_chat_session_sync_record_refs(records: &[Value]) -> Vec<Value> {
@@ -3600,6 +3744,23 @@ fn agent_chat_session_sync_enrich_context_from_history(
         context.terminal_index = terminal_index;
     }
     context
+}
+
+fn agent_chat_session_sync_resolve_local_history_model_id(
+    agent_id: &str,
+    provider_session_id: &str,
+    cwd: &str,
+    fallback_model_id: &str,
+) -> String {
+    let fallback = fallback_model_id.trim().to_string();
+    let Some(provider) = agent_chat_session_sync_provider(agent_id) else {
+        return fallback;
+    };
+    agent_chat_session_sync_unacked_source(provider, provider_session_id, cwd)
+        .ok()
+        .map(|source| source.model_id.trim().to_string())
+        .filter(|model_id| !model_id.is_empty())
+        .unwrap_or(fallback)
 }
 
 fn agent_chat_session_sync_mark_build_failed(
@@ -4098,6 +4259,14 @@ fn agent_chat_session_sync_spawn_from_result(
             &agent_id,
             &provider_session_id,
         );
+        let model_id = agent_chat_session_sync_resolve_local_history_model_id(
+            &agent_id,
+            &provider_session_id,
+            &result.cwd,
+            &context.model_id,
+        );
+        let mut sync_context = context.clone();
+        sync_context.model_id = model_id.clone();
         let record = WorkspaceAgentSessionHistoryRecord {
             id: history_id,
             workspace_id: context.workspace_id.clone(),
@@ -4109,7 +4278,7 @@ fn agent_chat_session_sync_spawn_from_result(
             shared_history_id: context.shared_history_id.clone(),
             agent_id: agent_id.clone(),
             provider: agent_id.clone(),
-            model_id: context.model_id.clone(),
+            model_id,
             model_source: context.model_source.clone(),
             session_mode: context.session_mode.clone(),
             file_authority: context.file_authority.clone(),
@@ -4154,7 +4323,7 @@ fn agent_chat_session_sync_spawn_from_result(
                     agent_id,
                     provider_session_id,
                     result.cwd,
-                    context,
+                    sync_context,
                     reason,
                 );
             }
@@ -4720,6 +4889,7 @@ mod agent_chat_session_sync_tests {
         let root = env::temp_dir().join(format!("{name}-{suffix}"));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("rollout-test.jsonl");
+        let session_id = format!("{name}-{suffix}");
         let body = lines
             .into_iter()
             .map(|value| value.to_string())
@@ -4730,9 +4900,9 @@ mod agent_chat_session_sync_tests {
             "codex",
             "codex_jsonl",
             &path,
-            "codex-session",
+            &session_id,
             CodexRolloutMeta {
-                session_id: "codex-session".to_string(),
+                session_id: session_id.clone(),
                 cwd: "/tmp/project".to_string(),
                 latest_timestamp: String::new(),
                 title: String::new(),
@@ -4742,6 +4912,101 @@ mod agent_chat_session_sync_tests {
         .unwrap();
         let _ = fs::remove_dir_all(root);
         source
+    }
+
+    fn claude_sync_source_from_lines(name: &str, lines: Vec<Value>) -> AgentChatSessionSyncSource {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = env::temp_dir().join(format!("{name}-{suffix}"));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("claude-session.jsonl");
+        let session_id = format!("{name}-{suffix}");
+        let body = lines
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, format!("{body}\n")).unwrap();
+        let source = agent_chat_session_sync_jsonl_source(
+            "claude",
+            "claude_jsonl",
+            &path,
+            &session_id,
+            CodexRolloutMeta {
+                session_id: session_id.clone(),
+                cwd: "/tmp/project".to_string(),
+                latest_timestamp: String::new(),
+                title: String::new(),
+            },
+            &HashMap::new(),
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(root);
+        source
+    }
+
+    fn test_history_record(
+        workspace_id: &str,
+        workspace_root: &str,
+        provider: &str,
+        provider_session_id: &str,
+        model_id: &str,
+        observed_at_ms: u64,
+    ) -> WorkspaceAgentSessionHistoryRecord {
+        WorkspaceAgentSessionHistoryRecord {
+            id: workspace_agent_session_history_record_id(
+                workspace_id,
+                provider,
+                provider_session_id,
+            ),
+            workspace_id: workspace_id.to_string(),
+            workspace_name: "Workspace A".to_string(),
+            coordination_session_id: String::new(),
+            provider_session_id: provider_session_id.to_string(),
+            native_session_id: provider_session_id.to_string(),
+            fork_from_provider_session_id: String::new(),
+            shared_history_id: String::new(),
+            agent_id: provider.to_string(),
+            provider: provider.to_string(),
+            model_id: model_id.to_string(),
+            model_source: "launch".to_string(),
+            session_mode: "direct".to_string(),
+            file_authority: "workspace".to_string(),
+            coordination_mode: "direct".to_string(),
+            thread_id: "thread-a".to_string(),
+            pane_id: "pane-a".to_string(),
+            terminal_instance_id: Some(42),
+            terminal_index: Some(0),
+            slot_key: String::new(),
+            cwd: workspace_root.to_string(),
+            status: "observed".to_string(),
+            title: "Test session".to_string(),
+            source: "test".to_string(),
+            observed_at_ms: Some(observed_at_ms),
+            created_at_ms: Some(1),
+        }
+    }
+
+    struct TestEnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for TestEnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => env::set_var(self.key, value),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn set_test_env_var(key: &'static str, value: &Path) -> TestEnvVarGuard {
+        let previous = env::var_os(key);
+        env::set_var(key, value);
+        TestEnvVarGuard { key, previous }
     }
 
     #[test]
@@ -4834,18 +5099,18 @@ mod agent_chat_session_sync_tests {
             );
         }
 
-        assert!(
-            agent_chat_session_sync_cached_turn_summary_message("codex", "session-0", "turn-a")
-                .is_none()
-        );
-        assert!(
-            agent_chat_session_sync_cached_turn_summary_message(
-                "codex",
-                &format!("session-{AGENT_CHAT_SESSION_SYNC_TURN_SUMMARY_CACHE_SESSION_MAX}"),
-                "turn-a"
-            )
-            .is_some()
-        );
+        assert!(agent_chat_session_sync_cached_turn_summary_message(
+            "codex",
+            "session-0",
+            "turn-a"
+        )
+        .is_none());
+        assert!(agent_chat_session_sync_cached_turn_summary_message(
+            "codex",
+            &format!("session-{AGENT_CHAT_SESSION_SYNC_TURN_SUMMARY_CACHE_SESSION_MAX}"),
+            "turn-a"
+        )
+        .is_some());
     }
 
     #[test]
@@ -5002,12 +5267,10 @@ mod agent_chat_session_sync_tests {
                 <= CODEX_TRANSCRIPT_MAX_RECORD_MESSAGES_BYTES
         );
         assert_eq!(messages[0]["truncated"], json!(true));
-        assert!(
-            messages[0]["text"]
-                .as_str()
-                .unwrap_or_default()
-                .ends_with("[truncated]")
-        );
+        assert!(messages[0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("[truncated]"));
     }
 
     #[test]
@@ -5028,6 +5291,18 @@ mod agent_chat_session_sync_tests {
                     }
                 }),
                 json!({
+                    "type": "response_item",
+                    "timestamp": "2026-07-02T00:00:00.500Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<turn_aborted reason=\"user_cancelled\">stopped</turn_aborted>"
+                        }]
+                    }
+                }),
+                json!({
                     "type": "turn_context",
                     "timestamp": "2026-07-02T00:00:01Z",
                     "payload": {"cwd": "/tmp/project"}
@@ -5043,6 +5318,251 @@ mod agent_chat_session_sync_tests {
         assert!(source.records.is_empty());
         assert!(source.thread_detail_messages.is_empty());
         assert_eq!(source.total_record_count, 0);
+    }
+
+    #[test]
+    fn agent_chat_session_sync_keeps_angle_bracket_user_messages_without_internal_prefixes() {
+        let source = codex_sync_source_from_lines(
+            "codex-sync-angle-bracket-user",
+            vec![
+                json!({
+                    "type": "response_item",
+                    "timestamp": "2026-07-02T00:00:00Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<div> is my favorite tag"
+                        }]
+                    }
+                }),
+                json!({
+                    "type": "response_item",
+                    "timestamp": "2026-07-02T00:00:01Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<turnip recipes>"
+                        }]
+                    }
+                }),
+            ],
+        );
+        let thread_texts = source
+            .thread_detail_messages
+            .iter()
+            .map(|message| message["text"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        let record_texts = source
+            .records
+            .iter()
+            .flat_map(|record| {
+                record["messages"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|message| message["text"].as_str().unwrap_or_default())
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            thread_texts,
+            vec!["<div> is my favorite tag", "<turnip recipes>"]
+        );
+        assert_eq!(
+            record_texts,
+            vec!["<div> is my favorite tag", "<turnip recipes>"]
+        );
+        assert_eq!(source.total_record_count, 2);
+    }
+
+    #[test]
+    fn agent_chat_session_sync_codex_model_config_ignores_tool_payload_model() {
+        let source = codex_sync_source_from_lines(
+            "codex-sync-model-tool-payload",
+            vec![
+                json!({
+                    "type": "turn_context",
+                    "timestamp": "2026-07-02T00:00:00Z",
+                    "payload": {
+                        "cwd": "/tmp/project",
+                        "model": "gpt-5.5"
+                    }
+                }),
+                json!({
+                    "type": "response_item",
+                    "timestamp": "2026-07-02T00:00:01Z",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "generate_video",
+                        "input": {
+                            "prompt": "make a clip",
+                            "model": "seedance_2_0"
+                        }
+                    }
+                }),
+            ],
+        );
+
+        assert_eq!(source.model_id, "gpt-5.5");
+        assert_eq!(source.model_config["modelId"], json!("gpt-5.5"));
+        assert_eq!(source.model_config["model_id"], json!("gpt-5.5"));
+        assert!(!source.model_config.to_string().contains("seedance_2_0"));
+    }
+
+    #[test]
+    fn agent_chat_session_sync_claude_model_config_ignores_tool_result_model() {
+        let source = claude_sync_source_from_lines(
+            "claude-sync-model-tool-result",
+            vec![
+                json!({
+                    "type": "assistant",
+                    "sessionId": "claude-session",
+                    "timestamp": "2026-07-02T00:00:00Z",
+                    "message": {
+                        "role": "assistant",
+                        "model": "claude-sonnet-4-5",
+                        "content": [{"type": "text", "text": "I will generate it."}]
+                    }
+                }),
+                json!({
+                    "type": "user",
+                    "sessionId": "claude-session",
+                    "timestamp": "2026-07-02T00:00:01Z",
+                    "message": {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu-video",
+                            "content": {
+                                "status": "queued",
+                                "model": "seedance_2_0"
+                            }
+                        }]
+                    }
+                }),
+            ],
+        );
+
+        assert_eq!(source.model_id, "claude-sonnet-4-5");
+        assert_eq!(source.model_config["modelId"], json!("claude-sonnet-4-5"));
+        assert_eq!(source.model_config["model_id"], json!("claude-sonnet-4-5"));
+        assert!(!source.model_config.to_string().contains("seedance_2_0"));
+    }
+
+    #[test]
+    fn agent_chat_session_sync_history_upsert_heals_poisoned_local_model_from_scan() {
+        let _guard = agent_chat_session_sync_test_lock();
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = env::temp_dir().join(format!("codex-history-model-heal-{suffix}"));
+        let workspace_root = root.join("workspace");
+        let codex_home = root.join("codex-home");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let _codex_home_guard = set_test_env_var("CODEX_HOME", &codex_home);
+
+        let workspace_root_text = workspace_root.to_string_lossy().to_string();
+        let workspace_id = "workspace-local-model-heal";
+        let provider_session_id = "codex-local-history-model";
+        let poisoned_model = "seedance_2_0";
+        let real_model = "gpt-5.5";
+        let rollout_path = sessions_dir.join(format!("rollout-{provider_session_id}.jsonl"));
+        let lines = [
+            json!({
+                "type": "session_meta",
+                "timestamp": "2026-07-02T00:00:00Z",
+                "payload": {
+                    "id": provider_session_id,
+                    "cwd": workspace_root_text.as_str()
+                }
+            }),
+            json!({
+                "type": "turn_context",
+                "timestamp": "2026-07-02T00:00:01Z",
+                "payload": {
+                    "cwd": workspace_root_text.as_str(),
+                    "model": real_model
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-07-02T00:00:02Z",
+                "payload": {
+                    "type": "function_call",
+                    "name": "generate_video",
+                    "input": {
+                        "prompt": "make a clip",
+                        "model": poisoned_model
+                    }
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(&rollout_path, format!("{lines}\n")).unwrap();
+
+        let poisoned_record = test_history_record(
+            workspace_id,
+            &workspace_root_text,
+            "codex",
+            provider_session_id,
+            poisoned_model,
+            100,
+        );
+        assert!(workspace_agent_session_history_upsert_blocking(
+            Some(workspace_root_text.as_str()),
+            poisoned_record,
+        )
+        .unwrap());
+
+        let healed_model_id = agent_chat_session_sync_resolve_local_history_model_id(
+            "codex",
+            provider_session_id,
+            &workspace_root_text,
+            poisoned_model,
+        );
+        assert_eq!(healed_model_id, real_model);
+        let healed_record = test_history_record(
+            workspace_id,
+            &workspace_root_text,
+            "codex",
+            provider_session_id,
+            &healed_model_id,
+            200,
+        );
+        assert!(workspace_agent_session_history_upsert_blocking(
+            Some(workspace_root_text.as_str()),
+            healed_record,
+        )
+        .unwrap());
+
+        let history = workspace_agent_session_history_list_blocking(
+            WorkspaceAgentSessionHistoryListRequest {
+                workspace_id: workspace_id.to_string(),
+                root_directory: Some(workspace_root_text.clone()),
+                limit: Some(20),
+                fast: Some(true),
+            },
+        )
+        .unwrap();
+        let item = history
+            .items
+            .iter()
+            .find(|item| item.provider_session_id == provider_session_id)
+            .expect("history item");
+        assert_eq!(item.model_id, real_model);
+        assert_ne!(item.model_id, poisoned_model);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5349,14 +5869,8 @@ mod agent_chat_session_sync_tests {
         assert_eq!(message["role"], json!("system"));
         assert_eq!(message["kind"], json!("turn_diff"));
         assert_eq!(message["turn_id"], json!("turn-a"));
-        assert_eq!(
-            message["started_at"],
-            json!("2026-07-02T00:00:00.000Z")
-        );
-        assert_eq!(
-            message["completed_at"],
-            json!("2026-07-02T00:00:03.000Z")
-        );
+        assert_eq!(message["started_at"], json!("2026-07-02T00:00:00.000Z"));
+        assert_eq!(message["completed_at"], json!("2026-07-02T00:00:03.000Z"));
         assert_eq!(message["files"][0]["path"], json!("src/lib.rs"));
         assert_eq!(message["total_additions"], json!(2));
         assert_eq!(message["total_deletions"], json!(1));
@@ -5618,20 +6132,16 @@ mod agent_chat_session_sync_tests {
             "gpt-5.5",
             &json!({}),
         );
-        assert!(
-            detail["messages"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|message| message["kind"] == json!("turn_summary"))
-        );
-        assert!(
-            detail["messages"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|message| message["kind"] == json!("turn_diff"))
-        );
+        assert!(detail["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["kind"] == json!("turn_summary")));
+        assert!(detail["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["kind"] == json!("turn_diff")));
     }
 
     #[test]
@@ -5676,12 +6186,10 @@ mod agent_chat_session_sync_tests {
 
         assert_eq!(source.records.len(), 1);
         assert_eq!(source.records[0], record_before);
-        assert!(
-            source
-                .thread_detail_messages
-                .iter()
-                .any(agent_chat_session_sync_message_has_file_change)
-        );
+        assert!(source
+            .thread_detail_messages
+            .iter()
+            .any(agent_chat_session_sync_message_has_file_change));
     }
 
     #[test]
@@ -5846,6 +6354,52 @@ mod agent_chat_session_sync_tests {
         assert_eq!(turn_b["cache_read_tokens"], json!(3));
         assert_eq!(thread["input_tokens"], json!(25));
         assert_eq!(thread["output_tokens"], json!(10));
+    }
+
+    #[test]
+    fn agent_chat_session_sync_turn_usage_rollup_deltas_cumulative_tail_without_prior_sample() {
+        let messages = vec![
+            json!({
+                "id": "first-tail-count",
+                "created_at": "2026-07-02T00:00:01.000Z",
+                "usage": {
+                    "input_tokens": 2_180_000,
+                    "output_tokens": 40,
+                    "cache_read_tokens": 2_000_000,
+                    "cumulative": true
+                }
+            }),
+            json!({
+                "id": "last-tail-count",
+                "created_at": "2026-07-02T00:00:02.000Z",
+                "usage": {
+                    "input_tokens": 2_200_000,
+                    "output_tokens": 45,
+                    "cache_read_tokens": 2_010_000,
+                    "cumulative": true
+                }
+            }),
+        ];
+
+        let usage = agent_chat_session_sync_turn_usage_rollup(
+            &messages,
+            "",
+            "2026-07-02T00:00:00.500Z",
+            "2026-07-02T00:00:02.500Z",
+        );
+        let single_sample = agent_chat_session_sync_turn_usage_rollup(
+            &messages[..1],
+            "",
+            "2026-07-02T00:00:00.500Z",
+            "2026-07-02T00:00:01.500Z",
+        );
+
+        assert_eq!(usage["input_tokens"], json!(20_000));
+        assert_eq!(usage["output_tokens"], json!(5));
+        assert_eq!(usage["cache_read_tokens"], json!(10_000));
+        assert_eq!(single_sample["input_tokens"], json!(0));
+        assert_eq!(single_sample["output_tokens"], json!(0));
+        assert_ne!(single_sample["input_tokens"], json!(2_180_000));
     }
 
     #[test]
@@ -6057,11 +6611,9 @@ mod agent_chat_session_sync_tests {
         assert_eq!(detail["stats"]["fileCount"], json!(1));
         assert_eq!(detail["stats"]["additions"], json!(2));
         assert_eq!(detail["stats"]["deletions"], json!(1));
-        assert!(
-            !items
-                .iter()
-                .any(|item| item["id"].as_str() == Some("summary-edit"))
-        );
+        assert!(!items
+            .iter()
+            .any(|item| item["id"].as_str() == Some("summary-edit")));
     }
 
     #[test]
