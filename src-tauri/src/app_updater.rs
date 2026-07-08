@@ -5,7 +5,8 @@
 //
 // Env overrides: DIFFFORGE_UPDATER_URL replaces the manifest endpoint;
 // DIFFFORGE_UPDATER_FORCE=1 enables checks in debug builds (off by default
-// so `npm run dev` never talks to the release feed).
+// so `npm run dev` never talks to the release feed);
+// DIFFFORGE_DAEMON_AUTO_UPDATE=0 disables daemon-mode idle auto-restart.
 
 use tauri_plugin_updater::UpdaterExt as AppUpdaterExt;
 
@@ -21,11 +22,18 @@ const APP_UPDATE_PROGRESS_STEP_BYTES: u64 = 1024 * 1024;
 const APP_UPDATE_IDLE_POLL_SECS: u64 = 5 * 60;
 const APP_UPDATE_IDLE_CONFIRM_SECS: u64 = 60;
 const APP_UPDATE_SETTINGS_STATE_KEY: &str = "app-update-settings";
+const APP_UPDATE_STATE_IDLE: u8 = 0;
+const APP_UPDATE_STATE_CHECKING: u8 = 1;
+const APP_UPDATE_STATE_DOWNLOADING: u8 = 2;
+const APP_UPDATE_STATE_READY: u8 = 3;
+const APP_UPDATE_STATE_RESTARTING: u8 = 4;
+const APP_UPDATE_STATE_FAILED: u8 = 5;
 
 static APP_UPDATE_INSTALLING: AtomicBool = AtomicBool::new(false);
-// Opt-in, disabled by default: restart into a pending update on our own
-// only when every terminal is idle. Cache of the persisted setting.
+// GUI mode is opt-in. Daemons default to on unless DIFFFORGE_DAEMON_AUTO_UPDATE=0.
 static APP_UPDATE_AUTO_WHEN_IDLE: AtomicBool = AtomicBool::new(false);
+static APP_UPDATE_REMOTE_RESTART_WATCH_ACTIVE: AtomicBool = AtomicBool::new(false);
+static APP_UPDATE_STATE: AtomicU8 = AtomicU8::new(APP_UPDATE_STATE_IDLE);
 static APP_UPDATE_AVAILABLE: StdMutex<Option<AppUpdateInfo>> = StdMutex::new(None);
 static APP_UPDATE_STAGED: StdMutex<Option<AppUpdateStaged>> = StdMutex::new(None);
 
@@ -111,12 +119,45 @@ fn app_update_settings_to_value() -> Value {
     })
 }
 
+fn app_update_daemon_auto_update_disabled_from_env_value(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .map(|value| {
+            value == "0"
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("off")
+                || value.eq_ignore_ascii_case("no")
+        })
+        .unwrap_or(false)
+}
+
+fn app_update_effective_auto_restart_when_idle(
+    persisted_auto: bool,
+    daemon_mode: bool,
+    daemon_auto_env: Option<&str>,
+) -> bool {
+    if daemon_mode && app_update_daemon_auto_update_disabled_from_env_value(daemon_auto_env) {
+        return false;
+    }
+    persisted_auto || daemon_mode
+}
+
+fn app_update_effective_auto_restart_when_idle_for_current_process(persisted_auto: bool) -> bool {
+    let daemon_auto_env = std::env::var("DIFFFORGE_DAEMON_AUTO_UPDATE").ok();
+    app_update_effective_auto_restart_when_idle(
+        persisted_auto,
+        crate::daemon_mode_active(),
+        daemon_auto_env.as_deref(),
+    )
+}
+
 pub(crate) fn app_update_settings_initialize(app: &AppHandle) {
     let raw = app_local_state_read(app, APP_UPDATE_SETTINGS_STATE_KEY);
-    let auto = raw
+    let persisted_auto = raw
         .get("autoRestartWhenIdle")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let auto = app_update_effective_auto_restart_when_idle_for_current_process(persisted_auto);
     APP_UPDATE_AUTO_WHEN_IDLE.store(auto, Ordering::Release);
 }
 
@@ -124,9 +165,15 @@ fn app_update_settings_save(
     app: &AppHandle,
     auto_restart_when_idle: bool,
 ) -> Result<Value, String> {
-    APP_UPDATE_AUTO_WHEN_IDLE.store(auto_restart_when_idle, Ordering::Release);
+    let effective_auto =
+        app_update_effective_auto_restart_when_idle_for_current_process(auto_restart_when_idle);
+    APP_UPDATE_AUTO_WHEN_IDLE.store(effective_auto, Ordering::Release);
     let value = app_update_settings_to_value();
-    app_local_state_write(app, APP_UPDATE_SETTINGS_STATE_KEY, &value)?;
+    app_local_state_write(
+        app,
+        APP_UPDATE_SETTINGS_STATE_KEY,
+        &json!({ "autoRestartWhenIdle": auto_restart_when_idle }),
+    )?;
     Ok(value)
 }
 
@@ -154,7 +201,31 @@ async fn app_update_all_terminals_idle(app: &AppHandle) -> bool {
     true
 }
 
+#[cfg(target_os = "linux")]
+fn app_update_validate_platform_install_target() -> Result<(), String> {
+    let appimage = std::env::var_os("APPIMAGE")
+        .map(|value| value.to_string_lossy().trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "Linux app updates require an AppImage launch with APPIMAGE set; refusing to run the updater for this install."
+                .to_string()
+        })?;
+    if !std::path::Path::new(&appimage).is_file() {
+        return Err(format!(
+            "Linux app updates require APPIMAGE to point at the running AppImage; path is not a file: {}",
+            clean_terminal_telemetry_text(&appimage)
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn app_update_validate_platform_install_target() -> Result<(), String> {
+    Ok(())
+}
+
 fn app_updater_instance(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
+    app_update_validate_platform_install_target()?;
     let override_url = std::env::var("DIFFFORGE_UPDATER_URL")
         .ok()
         .map(|value| value.trim().to_string())
@@ -194,14 +265,134 @@ fn app_update_status_snapshot() -> Value {
     })
 }
 
+fn app_update_state_label(state: u8) -> &'static str {
+    match state {
+        APP_UPDATE_STATE_CHECKING => "checking",
+        APP_UPDATE_STATE_DOWNLOADING => "downloading",
+        APP_UPDATE_STATE_READY => "ready",
+        APP_UPDATE_STATE_RESTARTING => "restarting",
+        APP_UPDATE_STATE_FAILED => "failed",
+        _ => "idle",
+    }
+}
+
+fn app_update_store_state(state: u8) {
+    APP_UPDATE_STATE.store(state, Ordering::Release);
+}
+
+fn app_update_publish_device_state(app: &AppHandle, reason: &str) {
+    let state = app.state::<CloudMcpState>().inner().clone();
+    let reason = reason.to_string();
+    tauri::async_runtime::spawn(async move {
+        cloud_mcp_publish_device_live_state_snapshot_debounced(&state, &reason).await;
+    });
+}
+
+async fn app_update_publish_device_state_now(app: &AppHandle, reason: &str) {
+    let state = app.state::<CloudMcpState>().inner().clone();
+    cloud_mcp_publish_device_live_state_snapshot(&state, reason).await;
+}
+
+fn app_update_restart_or_exit(app: &AppHandle) {
+    if crate::daemon_mode_active() && cfg!(target_os = "linux") {
+        log_terminal_status_event(
+            "backend.app_update.daemon_exit_for_systemd_restart",
+            json!({}),
+        );
+        app.exit(0);
+    } else {
+        app.restart();
+    }
+}
+
+pub(crate) fn app_update_device_payload() -> Value {
+    let available = app_update_available_snapshot();
+    let staged = app_update_staged_info();
+    let available_version = staged
+        .as_ref()
+        .map(|info| info.version.clone())
+        .or_else(|| available.as_ref().map(|info| info.version.clone()));
+    let stored_state = APP_UPDATE_STATE.load(Ordering::Acquire);
+    let state = if APP_UPDATE_INSTALLING.load(Ordering::Acquire)
+        && !matches!(
+            stored_state,
+            APP_UPDATE_STATE_CHECKING | APP_UPDATE_STATE_DOWNLOADING | APP_UPDATE_STATE_RESTARTING
+        ) {
+        APP_UPDATE_STATE_RESTARTING
+    } else if staged.is_some()
+        && !matches!(
+            stored_state,
+            APP_UPDATE_STATE_CHECKING
+                | APP_UPDATE_STATE_DOWNLOADING
+                | APP_UPDATE_STATE_RESTARTING
+                | APP_UPDATE_STATE_FAILED
+        ) {
+        APP_UPDATE_STATE_READY
+    } else {
+        stored_state
+    };
+    json!({
+        "current_version": env!("CARGO_PKG_VERSION"),
+        "available_version": available_version,
+        "state": app_update_state_label(state),
+    })
+}
+
+fn app_update_operation_in_progress_error(error: &str) -> bool {
+    error.contains("already in progress")
+}
+
+fn app_update_already_running_response(daemon_mode: bool) -> Value {
+    json!({
+        "ok": true,
+        "queued": false,
+        "already_running": true,
+        "daemon_mode": daemon_mode,
+        "auto_restart_when_idle": APP_UPDATE_AUTO_WHEN_IDLE.load(Ordering::Acquire),
+        "app_update": app_update_device_payload(),
+        "status": app_update_status_snapshot(),
+    })
+}
+
+fn app_update_remote_restart_queued_response(daemon_mode: bool, newly_queued: bool) -> Value {
+    json!({
+        "ok": true,
+        "daemon_mode": daemon_mode,
+        "queued": true,
+        "restart_when_idle": true,
+        "already_queued": !newly_queued,
+        "app_update": app_update_device_payload(),
+        "status": app_update_status_snapshot(),
+    })
+}
+
 async fn app_updater_run_check(app: &AppHandle) -> Result<Option<AppUpdateInfo>, String> {
-    let updater = app_updater_instance(app)?;
-    let update = updater
-        .check()
-        .await
-        .map_err(|error| format!("Update check failed: {error}"))?;
+    app_update_store_state(APP_UPDATE_STATE_CHECKING);
+    app_update_publish_device_state(app, "app_update_checking");
+    let updater = match app_updater_instance(app) {
+        Ok(updater) => updater,
+        Err(error) => {
+            app_update_store_state(APP_UPDATE_STATE_FAILED);
+            app_update_publish_device_state(app, "app_update_failed");
+            return Err(error);
+        }
+    };
+    let update = match updater.check().await {
+        Ok(update) => update,
+        Err(error) => {
+            app_update_store_state(APP_UPDATE_STATE_FAILED);
+            app_update_publish_device_state(app, "app_update_failed");
+            return Err(format!("Update check failed: {error}"));
+        }
+    };
     let Some(update) = update else {
         app_update_store_available(None);
+        if app_update_staged_info().is_none() {
+            app_update_store_state(APP_UPDATE_STATE_IDLE);
+        } else {
+            app_update_store_state(APP_UPDATE_STATE_READY);
+        }
+        app_update_publish_device_state(app, "app_update_idle");
         return Ok(None);
     };
     let info = AppUpdateInfo {
@@ -209,6 +400,12 @@ async fn app_updater_run_check(app: &AppHandle) -> Result<Option<AppUpdateInfo>,
         notes: update.body.clone(),
     };
     app_update_store_available(Some(info.clone()));
+    if app_update_staged_info().is_none() {
+        app_update_store_state(APP_UPDATE_STATE_IDLE);
+    } else {
+        app_update_store_state(APP_UPDATE_STATE_READY);
+    }
+    app_update_publish_device_state(app, "app_update_available");
     let _ = app.emit(
         APP_UPDATE_AVAILABLE_EVENT,
         json!({ "version": info.version, "notes": info.notes }),
@@ -338,6 +535,8 @@ async fn app_update_install_and_restart(app: AppHandle) -> Result<(), String> {
     let result = app_update_install_inner(&app).await;
     if let Err(error) = &result {
         APP_UPDATE_INSTALLING.store(false, Ordering::Release);
+        app_update_store_state(APP_UPDATE_STATE_FAILED);
+        app_update_publish_device_state(&app, "app_update_failed");
         let _ = app.emit(
             APP_UPDATE_STATE_EVENT,
             json!({ "state": "failed", "error": error }),
@@ -358,6 +557,8 @@ async fn app_update_download(app: AppHandle) -> Result<Value, String> {
     let result = app_update_download_inner(&app).await;
     APP_UPDATE_INSTALLING.store(false, Ordering::Release);
     if let Err(error) = &result {
+        app_update_store_state(APP_UPDATE_STATE_FAILED);
+        app_update_publish_device_state(&app, "app_update_failed");
         let _ = app.emit(
             APP_UPDATE_STATE_EVENT,
             json!({ "state": "failed", "error": error }),
@@ -378,6 +579,8 @@ async fn app_update_restart(app: AppHandle) -> Result<(), String> {
     let result = app_update_restart_inner(&app).await;
     if let Err(error) = &result {
         APP_UPDATE_INSTALLING.store(false, Ordering::Release);
+        app_update_store_state(APP_UPDATE_STATE_FAILED);
+        app_update_publish_device_state(&app, "app_update_failed");
         let _ = app.emit(
             APP_UPDATE_STATE_EVENT,
             json!({ "state": "failed", "error": error }),
@@ -390,7 +593,112 @@ async fn app_update_restart(app: AppHandle) -> Result<(), String> {
     result
 }
 
+pub(crate) async fn app_update_remote_now(app: AppHandle) -> Value {
+    let daemon_mode = crate::daemon_mode_active();
+    if APP_UPDATE_INSTALLING.load(Ordering::Acquire) {
+        return app_update_already_running_response(daemon_mode);
+    }
+
+    if app_update_staged_info().is_some() {
+        if daemon_mode {
+            let newly_queued = app_update_spawn_remote_restart_when_idle(app.clone());
+            return app_update_remote_restart_queued_response(daemon_mode, newly_queued);
+        }
+        return json!({
+            "ok": true,
+            "daemon_mode": daemon_mode,
+            "queued": false,
+            "restart_when_idle": false,
+            "app_update": app_update_device_payload(),
+            "status": app_update_status_snapshot(),
+        });
+    }
+
+    let download_result = app_update_download(app.clone()).await;
+    let mut remote_restart_queued = None;
+    if daemon_mode && download_result.is_ok() && app_update_staged_info().is_some() {
+        remote_restart_queued = Some(app_update_spawn_remote_restart_when_idle(app.clone()));
+    }
+
+    match download_result {
+        Ok(status) => json!({
+            "ok": true,
+            "daemon_mode": daemon_mode,
+            "queued": remote_restart_queued.is_some(),
+            "restart_when_idle": remote_restart_queued.is_some(),
+            "already_queued": remote_restart_queued
+                .map(|newly_queued| !newly_queued)
+                .unwrap_or(false),
+            "app_update": app_update_device_payload(),
+            "status": status,
+        }),
+        Err(error) => {
+            if app_update_operation_in_progress_error(&error) {
+                return app_update_already_running_response(daemon_mode);
+            }
+            let no_update = error.contains("No update is available");
+            if no_update {
+                app_update_store_state(APP_UPDATE_STATE_IDLE);
+            }
+            let clean_error = clean_terminal_telemetry_text(&error);
+            let message = if no_update {
+                "No update is available.".to_string()
+            } else {
+                clean_error.clone()
+            };
+            json!({
+                "ok": no_update,
+                "daemon_mode": daemon_mode,
+                "error": if no_update { Value::Null } else { json!(clean_error) },
+                "message": message,
+                "app_update": app_update_device_payload(),
+                "status": app_update_status_snapshot(),
+            })
+        }
+    }
+}
+
+fn app_update_spawn_remote_restart_when_idle(app: AppHandle) -> bool {
+    if APP_UPDATE_REMOTE_RESTART_WATCH_ACTIVE.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    tauri::async_runtime::spawn(async move {
+        app_update_remote_restart_when_idle(app).await;
+        APP_UPDATE_REMOTE_RESTART_WATCH_ACTIVE.store(false, Ordering::Release);
+    });
+    true
+}
+
+async fn app_update_remote_restart_when_idle(app: AppHandle) {
+    loop {
+        if crate::app_shutdown_requested() {
+            return;
+        }
+        if !APP_UPDATE_INSTALLING.load(Ordering::Acquire)
+            && app_update_all_terminals_idle(&app).await
+        {
+            sleep(Duration::from_secs(APP_UPDATE_IDLE_CONFIRM_SECS)).await;
+            if crate::app_shutdown_requested() {
+                return;
+            }
+            if app_update_all_terminals_idle(&app).await {
+                let result = app_update_install_and_restart(app.clone()).await;
+                if let Err(error) = result {
+                    log_terminal_status_event(
+                        "backend.app_update.remote_restart_failed",
+                        json!({ "error": clean_terminal_telemetry_text(&error) }),
+                    );
+                }
+                return;
+            }
+        }
+        sleep(Duration::from_secs(APP_UPDATE_IDLE_POLL_SECS)).await;
+    }
+}
+
 async fn app_update_download_inner(app: &AppHandle) -> Result<Value, String> {
+    app_update_store_state(APP_UPDATE_STATE_CHECKING);
+    app_update_publish_device_state(app, "app_update_checking");
     let updater = app_updater_instance(app)?;
     let update = updater
         .check()
@@ -408,6 +716,8 @@ async fn app_update_download_inner(app: &AppHandle) -> Result<Value, String> {
         APP_UPDATE_STATE_EVENT,
         json!({ "state": "downloading", "version": update.version }),
     );
+    app_update_store_state(APP_UPDATE_STATE_DOWNLOADING);
+    app_update_publish_device_state(app, "app_update_downloading");
     log_terminal_status_event(
         "backend.app_update.download_started",
         json!({ "version": update.version }),
@@ -424,6 +734,8 @@ async fn app_update_download_inner(app: &AppHandle) -> Result<Value, String> {
             bytes: Some(bytes),
             update: Some(update),
         }));
+        app_update_store_state(APP_UPDATE_STATE_READY);
+        app_update_publish_device_state(app, "app_update_ready");
         let _ = app.emit(
             APP_UPDATE_STATE_EVENT,
             json!({ "state": "ready", "version": version, "installed": false }),
@@ -444,6 +756,8 @@ async fn app_update_download_inner(app: &AppHandle) -> Result<Value, String> {
             #[cfg(windows)]
             update: None,
         }));
+        app_update_store_state(APP_UPDATE_STATE_READY);
+        app_update_publish_device_state(app, "app_update_ready");
         let _ = app.emit(
             APP_UPDATE_STATE_EVENT,
             json!({ "state": "ready", "version": version, "installed": true }),
@@ -458,6 +772,8 @@ async fn app_update_install_inner(app: &AppHandle) -> Result<(), String> {
         return app_update_restart_inner(app).await;
     }
 
+    app_update_store_state(APP_UPDATE_STATE_CHECKING);
+    app_update_publish_device_state(app, "app_update_checking");
     let updater = app_updater_instance(app)?;
     let update = updater
         .check()
@@ -469,6 +785,8 @@ async fn app_update_install_inner(app: &AppHandle) -> Result<(), String> {
         APP_UPDATE_STATE_EVENT,
         json!({ "state": "downloading", "version": update.version }),
     );
+    app_update_store_state(APP_UPDATE_STATE_DOWNLOADING);
+    app_update_publish_device_state(app, "app_update_downloading");
     log_terminal_status_event(
         "backend.app_update.install_started",
         json!({ "version": update.version }),
@@ -482,9 +800,11 @@ async fn app_update_install_inner(app: &AppHandle) -> Result<(), String> {
     // On Windows the NSIS installer takes over and the process exits inside
     // install; on macOS/Linux the swapped bundle only takes effect after this
     // relaunch.
-    let _ = app.emit(APP_UPDATE_STATE_EVENT, json!({ "state": "installed" }));
+    app_update_store_state(APP_UPDATE_STATE_RESTARTING);
+    app_update_publish_device_state_now(app, "app_update_restarting").await;
+    let _ = app.emit(APP_UPDATE_STATE_EVENT, json!({ "state": "restarting" }));
     log_terminal_status_event("backend.app_update.installed", json!({}));
-    app.restart();
+    app_update_restart_or_exit(app);
     #[allow(unreachable_code)]
     Ok(())
 }
@@ -519,6 +839,8 @@ async fn app_update_download_bytes(
 async fn app_update_restart_inner(app: &AppHandle) -> Result<(), String> {
     let staged = app_update_staged_for_restart()
         .ok_or_else(|| "No downloaded update is ready.".to_string())?;
+    app_update_store_state(APP_UPDATE_STATE_RESTARTING);
+    app_update_publish_device_state_now(app, "app_update_restarting").await;
     let _ = app.emit(
         APP_UPDATE_STATE_EVENT,
         json!({ "state": "restarting", "version": staged.version }),
@@ -549,7 +871,38 @@ async fn app_update_restart_inner(app: &AppHandle) -> Result<(), String> {
         }
         log_terminal_status_event("backend.app_update.restarting", json!({}));
     }
-    app.restart();
+    app_update_restart_or_exit(app);
     #[allow(unreachable_code)]
     Ok(())
+}
+
+#[cfg(test)]
+mod app_update_tests {
+    use super::*;
+
+    #[test]
+    fn effective_auto_restart_uses_daemon_default() {
+        assert!(app_update_effective_auto_restart_when_idle(false, true, None));
+        assert!(app_update_effective_auto_restart_when_idle(true, false, None));
+        assert!(!app_update_effective_auto_restart_when_idle(false, false, None));
+    }
+
+    #[test]
+    fn daemon_auto_update_env_zero_disables_daemon_default() {
+        assert!(!app_update_effective_auto_restart_when_idle(
+            false,
+            true,
+            Some("0")
+        ));
+        assert!(!app_update_effective_auto_restart_when_idle(
+            true,
+            true,
+            Some("false")
+        ));
+        assert!(app_update_effective_auto_restart_when_idle(
+            true,
+            false,
+            Some("0")
+        ));
+    }
 }

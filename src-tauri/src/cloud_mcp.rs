@@ -18394,6 +18394,7 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             "device_name": device_profile["device_name"].clone(),
             "machine_name": device_profile["machine_name"].clone(),
             "platform": device_profile["platform"].clone(),
+            "app_update": app_update_device_payload(),
             "form_factor": device_profile["form_factor"].clone(),
             "client_kind": device_profile["client_kind"].clone(),
             "client_type": device_profile["client_type"].clone(),
@@ -18944,6 +18945,7 @@ async fn cloud_mcp_send_liveness_pong_event(
         "device_name": device_profile["device_name"].clone(),
         "machine_name": device_profile["machine_name"].clone(),
         "platform": device_profile["platform"].clone(),
+        "app_update": app_update_device_payload(),
         "form_factor": device_profile["form_factor"].clone(),
         "client_kind": device_profile["client_kind"].clone(),
         "client_type": device_profile["client_type"].clone(),
@@ -19177,6 +19179,7 @@ async fn cloud_mcp_send_lifecycle_event(
         "device_name": device_profile["device_name"].clone(),
         "machine_name": device_profile["machine_name"].clone(),
         "platform": device_profile["platform"].clone(),
+        "app_update": app_update_device_payload(),
         "form_factor": device_profile["form_factor"].clone(),
         "client_kind": device_profile["client_kind"].clone(),
         "client_type": device_profile["client_type"].clone(),
@@ -22039,7 +22042,10 @@ fn cloud_mcp_apply_remote_device_lever(
     let action = match command_kind.as_str() {
         "app_show_window" | "show_window" | "open_app_window" | "app_open_window" => "show",
         "app_hide_window" | "hide_window" | "app_background" | "hide_app_window" => "hide",
-        "device_notify" | "notify_device" | "device_notification" | "send_notification" => "notify",
+        "device_notify" | "notify_device" | "device_notification" | "send_notification" => {
+            "notify"
+        }
+        "app_update_now" | "update_app" | "app_update" => "app_update_now",
         "agent_account_switch"
         | "switch_agent_account"
         | "agent_profile_switch"
@@ -22178,6 +22184,38 @@ fn cloud_mcp_apply_remote_device_lever(
             "output_status" => {
                 cloud_mcp_report_terminal_output_status(&app, &state, &event).await;
             }
+            "app_update_now" => {
+                let result = app_update_remote_now(app.clone()).await;
+                let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                let queued = result
+                    .get("queued")
+                    .or_else(|| result.get("restart_when_idle"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let message = if ok && queued {
+                    "App update accepted; daemon will restart when terminals are idle."
+                } else if ok {
+                    "App update command completed on this desktop."
+                } else {
+                    "App update command failed on this desktop."
+                };
+                let status = if ok && queued {
+                    "queued"
+                } else if ok {
+                    "completed"
+                } else {
+                    "failed"
+                };
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state,
+                    &event,
+                    status,
+                    message,
+                    Some(&result),
+                )
+                .await;
+                cloud_mcp_emit_sync_status(None);
+            }
             "plan_release" => {
                 let _ = cloud_mcp_send_remote_command_status_event(
                     &state,
@@ -22217,6 +22255,9 @@ fn cloud_mcp_remote_command_is_rust_owned(event: &Value) -> bool {
             | "notify_device"
             | "device_notification"
             | "send_notification"
+            | "app_update_now"
+            | "update_app"
+            | "app_update"
             | "agent_account_switch"
             | "switch_agent_account"
             | "agent_profile_switch"
@@ -24655,6 +24696,7 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
         "device_name": device_profile["device_name"].clone(),
         "machine_name": device_profile["machine_name"].clone(),
         "platform": device_profile["platform"].clone(),
+        "app_update": app_update_device_payload(),
         "form_factor": device_profile["form_factor"].clone(),
         "client_kind": device_profile["client_kind"].clone(),
         "client_type": device_profile["client_type"].clone(),
