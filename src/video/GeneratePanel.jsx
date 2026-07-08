@@ -157,20 +157,48 @@ const ModeCardBody = styled.div`
   color: #8fa0b8;
 `;
 
+// Deliberately quiet: a text-only caution line, not a boxed callout — the
+// card itself is the click target and nothing inside it may upstage that.
 const ModeWarn = styled.div`
-  display: grid;
-  gap: 6px;
-  padding: 8px 9px;
-  border-radius: 8px;
-  border: 1px solid rgba(251, 191, 36, 0.35);
-  background: rgba(251, 191, 36, 0.08);
   font-size: 10px;
   font-weight: 600;
   line-height: 1.45;
-  color: #fcd34d;
+  color: rgba(252, 211, 77, 0.82);
 
   html[data-forge-theme="light"] & {
     color: #92400e;
+  }
+`;
+
+// Small utility pill in the cloud card's title row (next to the credits
+// chip): tops up credits without reading as the card's primary action.
+const TopUpPill = styled.button`
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  color: #93c5fd;
+  border: 1px dashed rgba(96, 165, 250, 0.45);
+  background: transparent;
+  border-radius: 999px;
+  padding: 1px 8px;
+  cursor: pointer;
+
+  &:hover {
+    border-style: solid;
+    background: rgba(96, 165, 250, 0.12);
+  }
+
+  &:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #1d4ed8;
+    border-color: rgba(29, 78, 216, 0.45);
   }
 `;
 
@@ -1729,29 +1757,24 @@ export default function GeneratePanel({
                   {creditsRemaining.toLocaleString()} credits left
                 </span>
               ) : null}
+              <TopUpPill
+                disabled={buyingCredits}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  buyCredits();
+                }}
+                title="Top up Diff Forge credits (Stripe checkout)"
+                type="button"
+              >
+                {buyingCredits ? "Opening checkout…" : "＋ Top up"}
+              </TopUpPill>
             </ModeCardTitle>
             <ModeCardBody>
               Zero setup — every model works out of the box and bills your Diff Forge credits.
             </ModeCardBody>
             <ModeWarn>
-              <span>
-                ⚠ AI video generation is expensive and can burn through your credits quickly — a
-                single clip can cost the equivalent of several dollars. For regular use we
-                recommend your own API keys.
-              </span>
-              <span>
-                <VideoSecondaryButton
-                  disabled={buyingCredits}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    buyCredits();
-                  }}
-                  title="Top up Diff Forge credits (Stripe checkout)"
-                  type="button"
-                >
-                  {buyingCredits ? "Opening checkout…" : "＋ Buy credits"}
-                </VideoSecondaryButton>
-              </span>
+              ⚠ Generation is credit-hungry — a single clip can cost several dollars' worth. For
+              regular use we recommend your own API keys.
             </ModeWarn>
           </ModeCard>
           {routing ? (
