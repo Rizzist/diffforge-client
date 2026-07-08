@@ -10000,6 +10000,7 @@ fn run_app(daemon: bool) {
             video_describe_start,
             video_describe_cancel,
             video_jobs_list,
+            video_jobs_delete,
             video_generation_providers,
             video_lora_list,
             video_lora_delete,

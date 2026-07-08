@@ -10940,6 +10940,29 @@ fn video_export_cancel(job_id: String) -> Result<(), String> {
     video_job_registry_cancel(&VIDEO_EXPORT_JOBS, &job_id)
 }
 
+// Removes a settled (failed or done) generation from the job-history
+// registry. Running jobs must be cancelled first — deleting a live entry
+// would orphan its ghost tiles and progress events.
+#[tauri::command]
+async fn video_jobs_delete(repo_path: String, job_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (_root, media_root) = video_workspace_media_root(repo_path.as_str())?;
+        let registry_path = video_generation_jobs_path(&media_root);
+        let _guard = video_generation_jobs_guard()?;
+        let mut jobs = video_read_generation_jobs(&registry_path)?;
+        let Some(index) = jobs.iter().position(|job| job.job_id == job_id) else {
+            return Err("Generation job not found.".to_string());
+        };
+        if !jobs[index].done && jobs[index].error.is_none() {
+            return Err("This generation is still running — cancel it first.".to_string());
+        }
+        jobs.remove(index);
+        video_write_generation_jobs(&registry_path, &mut jobs)
+    })
+    .await
+    .map_err(|error| format!("Video job delete worker failed: {error}"))?
+}
+
 fn video_mcp_export_range(
     input: &serde_json::Value,
     required: bool,

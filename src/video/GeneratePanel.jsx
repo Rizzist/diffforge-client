@@ -555,6 +555,50 @@ const HistRow = styled.div`
   border: 1px solid rgba(148, 163, 184, 0.12);
   border-radius: 8px;
   background: rgba(4, 8, 14, 0.6);
+
+  /* Jump-to-job flash (from a failed timeline ghost) — amber, same feel as
+     the terminals/audio navigate-highlight. */
+  @keyframes video-hist-focus-flash {
+    0%,
+    55% {
+      outline-color: rgba(251, 191, 36, 0.95);
+      background: rgba(251, 191, 36, 0.14);
+    }
+    100% {
+      outline-color: transparent;
+      background: rgba(4, 8, 14, 0.6);
+    }
+  }
+
+  &[data-flash="true"] {
+    outline: 2px solid transparent;
+    outline-offset: -1px;
+    animation: video-hist-focus-flash 2s ease-out;
+  }
+`;
+
+// Hover-revealed trash for settled (failed/done) history rows.
+const HistDelete = styled.button`
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: 6px;
+  color: #fca5a5;
+  font-size: 11px;
+  font-weight: 800;
+  padding: 3px 7px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease;
+
+  ${HistRow}:hover & {
+    opacity: 1;
+  }
+
+  &:hover {
+    border-color: rgba(248, 113, 113, 0.45);
+    background: rgba(248, 113, 113, 0.1);
+  }
 `;
 
 const HistThumb = styled.div`
@@ -729,8 +773,10 @@ const SectionTitle = styled.div`
 // qualities, sound) appear only when that model supports them.
 export default function GeneratePanel({
   assets = [],
+  historyFocus = null,
   onGenerated,
   onInsertAsset,
+  onJobDeleted,
   onPlannedClip,
   onPreviewCode,
   paneToken = "video-pane",
@@ -954,6 +1000,19 @@ export default function GeneratePanel({
       })
       .catch(() => {});
   }, [repoPath]);
+
+  // Jump-to-job from a failed timeline ghost: open the history slide, load
+  // fresh rows, and flash-highlight the job (amber, terminals-style).
+  const [focusJob, setFocusJob] = useState(null); // { jobId, at }
+  const focusScrolledAtRef = useRef(0);
+  useEffect(() => {
+    if (!historyFocus?.jobId) {
+      return;
+    }
+    setFocusJob(historyFocus);
+    setHistoryOpen(true);
+    loadHistory();
+  }, [historyFocus, loadHistory]);
 
   const reuseJob = useCallback((job) => {
     const request = job?.request;
@@ -1950,7 +2009,26 @@ export default function GeneratePanel({
                 job.request.kind !== "upscale" &&
                 !String(job.request.mode || "").startsWith("upscale");
               return (
-                <HistRow key={`hist-${job.jobId}`}>
+                <HistRow
+                  data-flash={focusJob?.jobId === job.jobId ? "true" : "false"}
+                  // Re-focusing the same job bumps `at` into the key, so the
+                  // remount replays the flash animation.
+                  key={
+                    focusJob?.jobId === job.jobId
+                      ? `hist-${job.jobId}-${focusJob.at}`
+                      : `hist-${job.jobId}`
+                  }
+                  ref={(node) => {
+                    if (
+                      node
+                      && focusJob?.jobId === job.jobId
+                      && focusScrolledAtRef.current !== focusJob.at
+                    ) {
+                      focusScrolledAtRef.current = focusJob.at;
+                      node.scrollIntoView({ behavior: "smooth", block: "center" });
+                    }
+                  }}
+                >
                   <HistThumb
                     data-draggable={previewAsset ? "true" : "false"}
                     data-status={status}
@@ -2041,6 +2119,30 @@ export default function GeneratePanel({
                       >
                         ↺ Reuse
                       </VideoSecondaryButton>
+                    ) : null}
+                    {status === "error" ? (
+                      <HistDelete
+                        onClick={() => {
+                          invoke("video_jobs_delete", { repoPath, jobId: job.jobId })
+                            .then(() => {
+                              // Also drop the live-event copy — displayJobs
+                              // would resurrect the row as an "extra" if the
+                              // jobId lingers in local state after the
+                              // registry entry is gone.
+                              setJobs((current) =>
+                                current.filter((entry) => entry.jobId !== job.jobId),
+                              );
+                              loadHistory();
+                              // The pane removes the job's red ghost clips.
+                              onJobDeleted?.(job);
+                            })
+                            .catch(() => {});
+                        }}
+                        title="Remove this failed generation from the history"
+                        type="button"
+                      >
+                        🗑 Delete
+                      </HistDelete>
                     ) : null}
                   </HistSide>
                 </HistRow>

@@ -2014,6 +2014,7 @@ export default function VideoWorkspacePane({
     },
     [paneWidth],
   );
+  openSidePanelRef.current = openSidePanel;
 
   const openTranscript = useCallback(
     (asset) => {
@@ -2189,13 +2190,24 @@ export default function VideoWorkspacePane({
         setGenerationByPath((current) => {
           const next = { ...current };
           for (const path of planned) {
-            if (payload.done || payload.error) {
+            if (payload.error) {
+              // Failed ghosts stay on the timeline, painted red — clicking
+              // one jumps to the job's history row for the error details.
+              next[path] = {
+                model: payload.model || "",
+                percent: null,
+                state: "error",
+                error: String(payload.error),
+                jobId: payload.jobId || "",
+              };
+            } else if (payload.done) {
               delete next[path];
             } else {
               next[path] = {
                 model: payload.model || "",
                 percent: payload.percent ?? null,
                 state: payload.state || "",
+                jobId: payload.jobId || "",
               };
             }
           }
@@ -2247,28 +2259,11 @@ export default function VideoWorkspacePane({
       if (payload.done && !payload.error && planned.length) {
         refreshAssets();
       }
-      if (!payload.error || !planned.length) {
-        return;
-      }
-      const current = projectStateRef.current;
-      if (!current) {
+      if (payload.error && planned.length) {
+        // The failed ghost clip stays (red, clickable → history); only the
+        // pending library tile disappears with this refresh.
         refreshAssets();
-        return;
       }
-      const doomed = new Set(planned);
-      let changed = false;
-      const tracks = (current.tracks || []).map((track) => {
-        const clips = (track.clips || []).filter((clip) => {
-          const hit = Boolean(clip.assetPath) && doomed.has(clip.assetPath);
-          changed = changed || hit;
-          return !hit;
-        });
-        return clips.length === (track.clips || []).length ? track : { ...track, clips };
-      });
-      if (changed) {
-        handleProjectChange({ ...current, tracks }, { transient: false });
-      }
-      refreshAssets(); // pending library tiles for the job disappear too
     })
       .then((next) => {
         if (disposed) {
@@ -2305,6 +2300,90 @@ export default function VideoWorkspacePane({
       }));
     },
     [currentPlayheadMs, handleProjectChange],
+  );
+
+  // Restart-safe failed ghosts: errored jobs have no pending library tile, so
+  // on load the registry seeds red-ghost entries for their planned paths
+  // (live progress entries win over hydrated ones).
+  useEffect(() => {
+    if (!repoPath) {
+      return;
+    }
+    invoke("video_jobs_list", { repoPath })
+      .then((result) => {
+        const jobs = Array.isArray(result?.jobs) ? result.jobs : [];
+        const failed = {};
+        jobs.forEach((job) => {
+          if (!job?.error) {
+            return;
+          }
+          (job.plannedPaths || []).forEach((path) => {
+            if (path) {
+              failed[path] = {
+                model: job.model || job.request?.model || "",
+                percent: null,
+                state: "error",
+                error: String(job.error),
+                jobId: job.jobId || "",
+              };
+            }
+          });
+        });
+        if (Object.keys(failed).length) {
+          setGenerationByPath((current) => ({ ...failed, ...current }));
+        }
+      })
+      .catch(() => {});
+  }, [repoPath]);
+
+  // Clicking a failed ghost clip opens the Generate panel's history and
+  // flash-highlights the job row (the terminals/audio jump-to pattern).
+  // openSidePanel is declared further down — ref-indirection per this file's
+  // declaration-order convention.
+  const openSidePanelRef = useRef(() => {});
+  const [generateHistoryFocus, setGenerateHistoryFocus] = useState(null);
+  const handleGhostClipClick = useCallback(
+    (_clip, generation) => {
+      if (!generation?.jobId) {
+        return;
+      }
+      setGenerateHistoryFocus({ jobId: generation.jobId, at: Date.now() });
+      openSidePanelRef.current("generate");
+    },
+    [],
+  );
+
+  // Deleting a job from history takes its ghost clips + map entries with it.
+  const removeJobGhosts = useCallback(
+    (job) => {
+      const planned = Array.isArray(job?.plannedPaths) ? job.plannedPaths.filter(Boolean) : [];
+      if (!planned.length) {
+        return;
+      }
+      setGenerationByPath((current) => {
+        const next = { ...current };
+        planned.forEach((path) => delete next[path]);
+        return next;
+      });
+      const current = projectStateRef.current;
+      if (!current) {
+        return;
+      }
+      const doomed = new Set(planned);
+      let changed = false;
+      const tracks = (current.tracks || []).map((track) => {
+        const clips = (track.clips || []).filter((clip) => {
+          const hit = Boolean(clip.assetPath) && doomed.has(clip.assetPath);
+          changed = changed || hit;
+          return !hit;
+        });
+        return clips.length === (track.clips || []).length ? track : { ...track, clips };
+      });
+      if (changed) {
+        handleProjectChange({ ...current, tracks }, { transient: false });
+      }
+    },
+    [handleProjectChange],
   );
 
   // Hyperframes code clips: a rendered mp4 carries a hyperframes-render
@@ -2714,6 +2793,7 @@ export default function VideoWorkspacePane({
       generationByPath={generationByPath}
       onChange={handleProjectChange}
       onClipContextMenu={handleClipContextMenu}
+      onGhostClick={handleGhostClipClick}
       onRangesChange={setRanges}
       onRedo={redo}
       onSeek={commitSeek}
@@ -2732,8 +2812,10 @@ export default function VideoWorkspacePane({
   const sidePanelContent = sidePanel === "generate" ? (
     <GeneratePanel
       assets={assets}
+      historyFocus={generateHistoryFocus}
       onGenerated={refreshAssets}
       onInsertAsset={insertAssetPath}
+      onJobDeleted={removeJobGhosts}
       onPlannedClip={addPlannedClip}
       onPreviewCode={setCodePreviewSource}
       paneToken={paneId || "video-pane"}

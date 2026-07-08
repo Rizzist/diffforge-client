@@ -347,6 +347,20 @@ const ClipBlock = styled.div`
     box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.45);
   }
 
+  /* Failed generation: the ghost turns red and stays put — clicking it jumps
+     to the job's history row for the error details. */
+  &[data-generation-failed="true"] {
+    border: 1.5px dashed rgba(248, 113, 113, 0.8);
+    background: rgba(239, 68, 68, 0.12);
+    animation: none;
+    cursor: pointer;
+  }
+
+  &[data-generation-failed="true"][data-selected="true"] {
+    border-color: rgba(252, 165, 165, 0.95);
+    box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.45);
+  }
+
   @keyframes video-clip-ghost-pulse {
     0%,
     100% {
@@ -371,6 +385,11 @@ const ClipLabel = styled.div`
 
   &[data-generating="true"] {
     color: #6ee7b7;
+    font-weight: 800;
+  }
+
+  &[data-generation-failed="true"] {
+    color: #fca5a5;
     font-weight: 800;
   }
 `;
@@ -636,6 +655,7 @@ export default function Timeline({
   generationByPath = {},
   onChange,
   onClipContextMenu,
+  onGhostClick,
   onRangesChange,
   onRedo,
   onSeek,
@@ -1604,9 +1624,13 @@ export default function Timeline({
                     track.kind === "video" && widthPx > 90 && visuals?.frames?.length ? visuals.frames : null;
                   const waveformPeaks = track.kind === "audio" && visuals?.peaks?.length ? visuals.peaks : null;
                   // Placeholder-first generation clip: the reserved path has no
-                  // file yet, so dress it as a pulsing ghost until the job lands.
-                  const generating = Boolean(asset?.pending);
-                  const generation = generating ? generationByPath[clip.assetPath] : null;
+                  // file yet, so dress it as a pulsing ghost until the job
+                  // lands. Failed jobs keep their ghost (red) — the pending
+                  // library tile disappears on error, so the generation map
+                  // entry alone must be able to dress the clip.
+                  const generation = generationByPath[clip.assetPath] || null;
+                  const generationFailed = generation?.state === "error";
+                  const generating = (Boolean(asset?.pending) || Boolean(generation)) && !generationFailed;
                   // Restart-safe: pending library items carry the job's model
                   // even before any live progress event has been seen.
                   const generationModelId = generation?.model || asset?.model || "";
@@ -1623,8 +1647,17 @@ export default function Timeline({
                     <ClipBlock
                       $kind={track.kind}
                       data-generating={generating ? "true" : "false"}
+                      data-generation-failed={generationFailed ? "true" : "false"}
                       data-selected={selectedSet.has(clip.id) ? "true" : "false"}
                       key={clip.id}
+                      onClick={
+                        generationFailed
+                          ? (event) => {
+                              event.stopPropagation();
+                              onGhostClick?.(clip, generation);
+                            }
+                          : undefined
+                      }
                       onContextMenu={(event) => onClipContextMenu?.(event, clip, track)}
                       onDoubleClick={() => {
                         selectClip(clip.id);
@@ -1633,9 +1666,11 @@ export default function Timeline({
                       onPointerDown={(event) => beginClipDrag(event, track.id, clip, "move")}
                       style={{ left: `${clip.timelineStartMs * pxPerMs}px`, width: `${widthPx}px` }}
                       title={
-                        generating
-                          ? `Generating${generationModel ? ` with ${generationModel}` : ""} — the clip fills in when the job finishes`
-                          : `${clipDisplayName(clip, track)} · ${formatTimecode(clip.timelineStartMs)} → ${formatTimecode(clipEndMs(clip))}`
+                        generationFailed
+                          ? `Generation failed${generation?.error ? `: ${generation.error}` : ""} — click for the job details`
+                          : generating
+                            ? `Generating${generationModel ? ` with ${generationModel}` : ""} — the clip fills in when the job finishes`
+                            : `${clipDisplayName(clip, track)} · ${formatTimecode(clip.timelineStartMs)} → ${formatTimecode(clipEndMs(clip))}`
                       }
                     >
                       {filmstripFrames ? (
@@ -1658,10 +1693,15 @@ export default function Timeline({
                           />
                         </WaveformSvg>
                       ) : null}
-                      <ClipLabel data-generating={generating ? "true" : "false"}>
-                        {generating
-                          ? `✦ ${generationModel || "AI"} · ${generationVerb}${generationPercent}`
-                          : clipDisplayName(clip, track)}
+                      <ClipLabel
+                        data-generating={generating ? "true" : "false"}
+                        data-generation-failed={generationFailed ? "true" : "false"}
+                      >
+                        {generationFailed
+                          ? `✦ ${generationModel || "AI"} · failed — click for details`
+                          : generating
+                            ? `✦ ${generationModel || "AI"} · ${generationVerb}${generationPercent}`
+                            : clipDisplayName(clip, track)}
                       </ClipLabel>
                       {clip.linkId ? (
                         <LinkBadge title="Linked clip">
