@@ -13,7 +13,6 @@ use tauri_plugin_updater::UpdaterExt as AppUpdaterExt;
 const APP_UPDATE_AVAILABLE_EVENT: &str = "forge-app-update-available";
 const APP_UPDATE_PROGRESS_EVENT: &str = "forge-app-update-progress";
 const APP_UPDATE_STATE_EVENT: &str = "forge-app-update-state";
-const APP_UPDATE_INITIAL_DELAY_SECS: u64 = 60;
 const APP_UPDATE_RECHECK_INTERVAL_SECS: u64 = 4 * 60 * 60;
 const APP_UPDATE_PROGRESS_STEP_BYTES: u64 = 1024 * 1024;
 // While an update is pending and auto-restart is enabled, poll terminal
@@ -604,7 +603,10 @@ pub(crate) fn app_updater_start(app: &AppHandle) {
 
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        sleep(Duration::from_secs(APP_UPDATE_INITIAL_DELAY_SECS)).await;
+        // Check immediately on startup so the update button is present the
+        // moment the main window paints (the webview reads app_update_status
+        // on mount and also listens for the available event). Subsequent
+        // checks fall on the recheck interval at the bottom of the loop.
         loop {
             let pending = match app_updater_run_check(&app).await {
                 Ok(Some(info)) => {

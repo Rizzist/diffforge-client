@@ -43,6 +43,10 @@ const Section = styled.div`
   gap: 8px;
   padding: 10px;
   border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(15, 23, 42, 0.1);
+  }
 `;
 
 const PreviewThumb = styled.div`
@@ -59,6 +63,10 @@ const PreviewThumb = styled.div`
     height: 100%;
     object-fit: contain;
   }
+
+  html[data-forge-theme="light"] & {
+    background: #eef1f6;
+  }
 `;
 
 const AssetName = styled.div`
@@ -66,6 +74,10 @@ const AssetName = styled.div`
   font-weight: 800;
   color: rgba(226, 232, 240, 0.94);
   overflow-wrap: anywhere;
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+  }
 `;
 
 const MetaGrid = styled.div`
@@ -95,6 +107,19 @@ const MetaCell = styled.div`
     text-transform: uppercase;
     color: #7d8ca3;
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.1);
+    background: #f8fafc;
+  }
+
+  html[data-forge-theme="light"] & b {
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: #64748b;
+  }
 `;
 
 const SectionTitle = styled.div`
@@ -103,6 +128,10 @@ const SectionTitle = styled.div`
   letter-spacing: 0.07em;
   text-transform: uppercase;
   color: rgba(167, 243, 208, 0.9);
+
+  html[data-forge-theme="light"] & {
+    color: #047857;
+  }
 `;
 
 const UpscaleRow = styled.div`
@@ -113,6 +142,11 @@ const UpscaleRow = styled.div`
   border: 1px solid rgba(148, 163, 184, 0.13);
   border-radius: 8px;
   background: rgba(4, 8, 14, 0.6);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.1);
+    background: #f8fafc;
+  }
 `;
 
 const UpscaleInfo = styled.div`
@@ -132,6 +166,14 @@ const UpscaleInfo = styled.div`
     font-weight: 650;
     color: #7d8ca3;
   }
+
+  html[data-forge-theme="light"] & b {
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: #64748b;
+  }
 `;
 
 const SpeedBadge = styled.span`
@@ -149,6 +191,16 @@ const SpeedBadge = styled.span`
           ? "rgba(248, 113, 113, 0.4)"
           : "rgba(251, 191, 36, 0.4)"};
   color: ${(props) => (props.$speed === "Fast" ? "#6ee7b7" : props.$speed === "Slow" ? "#fca5a5" : "#fcd34d")};
+
+  html[data-forge-theme="light"] & {
+    border-color: ${(props) =>
+      props.$speed === "Fast"
+        ? "rgba(5, 150, 105, 0.5)"
+        : props.$speed === "Slow"
+          ? "rgba(220, 38, 38, 0.45)"
+          : "rgba(180, 83, 9, 0.45)"};
+    color: ${(props) => (props.$speed === "Fast" ? "#047857" : props.$speed === "Slow" ? "#dc2626" : "#b45309")};
+  }
 `;
 
 const InlineRow = styled.div`
@@ -171,6 +223,16 @@ const VersionRow = styled.div`
 
   &[data-current="true"] {
     border-color: rgba(96, 165, 250, 0.5);
+    background: rgba(37, 99, 235, 0.08);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.1);
+    background: #f8fafc;
+  }
+
+  html[data-forge-theme="light"] &[data-current="true"] {
+    border-color: rgba(37, 99, 235, 0.45);
     background: rgba(37, 99, 235, 0.08);
   }
 `;
@@ -199,6 +261,15 @@ const VersionThumb = styled.div`
     font-size: 14px;
     color: rgba(148, 163, 184, 0.7);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.12);
+    background: #eef1f6;
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: rgba(100, 116, 139, 0.85);
+  }
 `;
 
 const VersionInfo = styled.div`
@@ -222,7 +293,37 @@ const VersionInfo = styled.div`
     font-weight: 600;
     color: #7d8ca3;
   }
+
+  html[data-forge-theme="light"] & b {
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: #64748b;
+  }
 `;
+
+// Badge colors are picked at call sites from VERSION_BADGES / ANNOTATION_STATUS_BADGES
+// (dark palette); these tables give the light-theme equivalent for each known value.
+const LIGHT_BADGE_BORDER = {
+  "rgba(148, 163, 184, 0.45)": "rgba(15, 23, 42, 0.18)",
+  "rgba(148, 163, 184, 0.4)": "rgba(15, 23, 42, 0.16)",
+  "rgba(148, 163, 184, 0.3)": "rgba(15, 23, 42, 0.12)",
+  "rgba(16, 185, 129, 0.5)": "rgba(5, 150, 105, 0.5)",
+  "rgba(96, 165, 250, 0.5)": "rgba(37, 99, 235, 0.45)",
+  "rgba(192, 132, 252, 0.5)": "rgba(147, 51, 234, 0.45)",
+  "rgba(251, 191, 36, 0.5)": "rgba(180, 83, 9, 0.45)",
+};
+
+const LIGHT_BADGE_TEXT = {
+  "#cbd5f5": "#475569",
+  "#6ee7b7": "#047857",
+  "#93c5fd": "#1d4ed8",
+  "#d8b4fe": "#7e22ce",
+  "#fcd34d": "#b45309",
+  "#fca5a5": "#dc2626",
+  "#7d8ca3": "#64748b",
+};
 
 const VersionBadge = styled.span`
   display: inline-flex;
@@ -235,6 +336,11 @@ const VersionBadge = styled.span`
   border-radius: 999px;
   border: 1px solid ${(props) => props.$color || "rgba(148, 163, 184, 0.4)"};
   color: ${(props) => props.$text || "#cbd5f5"};
+
+  html[data-forge-theme="light"] & {
+    border-color: ${(props) => LIGHT_BADGE_BORDER[props.$color] || "rgba(15, 23, 42, 0.16)"};
+    color: ${(props) => LIGHT_BADGE_TEXT[props.$text] || "#334155"};
+  }
 `;
 
 const DragGhost = styled.div`
@@ -267,6 +373,16 @@ const DragGhost = styled.div`
     overflow: hidden;
     text-overflow: ellipsis;
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(5, 150, 105, 0.5);
+    background: #ffffff;
+    box-shadow: 0 10px 26px rgba(15, 23, 42, 0.16);
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: #0f172a;
+  }
 `;
 
 // Take-group card for the Polish flow.
@@ -277,6 +393,11 @@ const TakeGroup = styled.div`
   border: 1px solid rgba(148, 163, 184, 0.14);
   border-radius: 8px;
   background: rgba(4, 8, 14, 0.6);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.1);
+    background: #f8fafc;
+  }
 `;
 
 const TakeGroupTitle = styled.div`
@@ -285,6 +406,10 @@ const TakeGroupTitle = styled.div`
   letter-spacing: 0.05em;
   text-transform: uppercase;
   color: #93c5fd;
+
+  html[data-forge-theme="light"] & {
+    color: #1d4ed8;
+  }
 `;
 
 const TakeOption = styled.label`
@@ -304,6 +429,11 @@ const TakeOption = styled.label`
   input {
     margin-top: 2px;
     accent-color: #10b981;
+  }
+
+  html[data-forge-theme="light"] &[data-selected="true"] {
+    border-color: rgba(5, 150, 105, 0.4);
+    background: rgba(16, 185, 129, 0.08);
   }
 `;
 
@@ -331,6 +461,14 @@ const TakeText = styled.div`
     -webkit-box-orient: vertical;
     overflow: hidden;
   }
+
+  html[data-forge-theme="light"] & em {
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] & p {
+    color: #0f172a;
+  }
 `;
 
 const AiPickBadge = styled.span`
@@ -344,6 +482,11 @@ const AiPickBadge = styled.span`
   border: 1px solid rgba(16, 185, 129, 0.45);
   color: #6ee7b7;
   align-self: center;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(5, 150, 105, 0.45);
+    color: #047857;
+  }
 `;
 
 // Photo annotation (Description section) pieces.
@@ -353,6 +496,10 @@ const AnnotationBlurb = styled.div`
   line-height: 1.45;
   color: rgba(226, 232, 240, 0.94);
   overflow-wrap: anywhere;
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+  }
 `;
 
 const AnnotationBody = styled.p`
@@ -362,6 +509,10 @@ const AnnotationBody = styled.p`
   line-height: 1.5;
   color: rgba(203, 213, 225, 0.88);
   overflow-wrap: anywhere;
+
+  html[data-forge-theme="light"] & {
+    color: #1e293b;
+  }
 `;
 
 const TagRow = styled.div`
@@ -377,6 +528,11 @@ const TagChip = styled.span`
   border-radius: 999px;
   border: 1px solid rgba(148, 163, 184, 0.25);
   color: #a5b4cf;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.16);
+    color: #475569;
+  }
 `;
 
 const AnnotationInput = styled.input`
@@ -393,6 +549,16 @@ const AnnotationInput = styled.input`
   &:focus {
     outline: none;
     border-color: rgba(16, 185, 129, 0.45);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.14);
+    background: #ffffff;
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] &:focus {
+    border-color: rgba(5, 150, 105, 0.45);
   }
 `;
 
@@ -415,6 +581,16 @@ const AnnotationTextarea = styled.textarea`
     outline: none;
     border-color: rgba(16, 185, 129, 0.45);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.14);
+    background: #ffffff;
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] &:focus {
+    border-color: rgba(5, 150, 105, 0.45);
+  }
 `;
 
 const ToggleRow = styled.label`
@@ -428,6 +604,10 @@ const ToggleRow = styled.label`
 
   input {
     accent-color: #10b981;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
   }
 `;
 

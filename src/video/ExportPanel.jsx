@@ -77,6 +77,17 @@ const PresetChip = styled.button`
     background: rgba(37, 99, 235, 0.18);
     color: #dbeafe;
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.16);
+    color: #475569;
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    border-color: rgba(37, 99, 235, 0.45);
+    background: rgba(37, 99, 235, 0.12);
+    color: #1d4ed8;
+  }
 `;
 
 const DoneRow = styled.div`
@@ -88,6 +99,10 @@ const DoneRow = styled.div`
   font-weight: 700;
   color: #a7f3d0;
   overflow-wrap: anywhere;
+
+  html[data-forge-theme="light"] & {
+    color: #047857;
+  }
 `;
 
 const InlineRow = styled.div`

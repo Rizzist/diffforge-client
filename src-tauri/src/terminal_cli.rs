@@ -1201,7 +1201,10 @@ Default routing:
 - For background local script inventory questions, use list_scripts or get_script. These tools do not switch tabs or disturb the user's selected script. For selected/visible local Scripts tab questions, use get_selected_script_context or get_visible_context(includeContent=true). For creating or editing a local script, call update_selected_script with title, shell, content/content_md, and mode=\"draft\" unless the user asks to save or run. For save locally use save_selected_script or update_selected_script(mode=\"local\"). For saved selected or named scripts, prefer run_local_script with script_id when available or an exact script_name; use run_selected_script when a selected draft may need saving first. Script run tools are fire-and-forget: once accepted, tell the user it started and stop; do not monitor logs unless the user explicitly asks.
 - For readable input assets, call list_assets and use an existing local_path when present; if an asset is Cloud-only, call download_asset first and use download_asset_status if you need to verify transfer state. For generated screenshots, images, media, or reusable file assets, call get_asset_root with a filename first, write the generated file to the returned local_path, then call upload_asset with that path. Use upload_asset_status to verify uploads. When completing a Loopspace checkpoint that generated assets, include asset_id or asset_ids in record_loopspace_step_progress.
 - For Loopspace manual trigger requests, call run_loopspace_trigger with a trigger_id or trigger_name and optional payload. For trigger inventory edits, always specify trigger_type when creating, use update_loopspace_trigger for rename/enable/disable/rotate/auth changes, and use delete_loopspace_trigger only when the user clearly asks to remove a trigger.
-- For Loopspace graph edits, call get_loopspace_graph and list_loopspace_triggers first. Loopspace graphs use .dfblueprint source with explicit node ids, typed node kinds, and edge node.port -> node.port connections. Trigger nodes are references to reusable trigger inventory: if the requested cron/webhook/manual trigger does not exist, call create_loopspace_trigger first with an explicit trigger_type, then patch_loopspace_graph with op=\"attach_trigger\" and trigger_id. Webhook triggers are inbound; they default to signed_hmac, and public_token is allowed only when the user explicitly asks for a public URL and public_webhook_confirmed=true is set. Never invent standalone cron/manual/webhook trigger nodes in the graph source. For add_node, use supported node kinds: document_read, document_write, asset_read, asset_write, run_script, send_message, dispatch_todos, or step. Device nodes are legacy saved-graph compatibility only; target devices are selected on send_message, dispatch_todos, and run_script nodes. Legal ports include trigger.out; run_script/send_message/dispatch_todos exec, success, failure, and interrupt; document_read/document_write docs; asset_read/asset_write assets; and target .in ports. Resource nodes use doc_refs or asset_refs for selected inputs, create_name for generated outputs, h for height, and target_mode for selection/create behavior. Dispatch todo nodes use target_workspace_ids and todo_lines, plus optional target_terminal_id, target_agent_id, model, reasoning_effort, and speed. For send-message substeps, connect step.success -> run_script.in, send_message.in, or dispatch_todos.in when a completed substep should start another action. For substep resource guidance, connect document_read.docs or document_write.docs -> step.in for readable document context, asset_read.assets or asset_write.assets -> step.in for readable asset context, step.docs -> document_write.in for generated documents, and step.assets -> asset_write.in for generated assets; do not connect send_message.exec, send_message.success, dispatch_todos.exec, dispatch_todos.success, run_script.exec, or other action execution branches directly into asset_write. Prefer patch_loopspace_graph for attach_trigger, add_node, move_node, remove_node, connect, disconnect, and update_node_props; specify from_port/fromPort and to_port/toPort on connect operations, especially from run_script/send_message/dispatch_todos action nodes. Use update_loopspace_graph only for larger full-source rewrites, preserve existing ids, and wait for the hydrated result.
+- For Loopspace graph edits, call get_loopspace_graph and list_loopspace_triggers first. Loopspace graphs use .dfblueprint source with explicit node ids, typed node kinds, and edge node.port -> node.port connections. Trigger nodes are references to reusable trigger inventory: if the requested cron/webhook/manual trigger does not exist, call create_loopspace_trigger first with an explicit trigger_type, then patch_loopspace_graph with op=\"attach_trigger\" and trigger_id. Webhook triggers are inbound; they default to signed_hmac, and public_token is allowed only when the user explicitly asks for a public URL and public_webhook_confirmed=true is set. Never invent standalone cron/manual/webhook trigger nodes in the graph source.
+- For add_node, use supported node kinds: document_read, document_write, asset_read, asset_write, run_script, send_message, dispatch_todos, notify_device, or step. Device nodes are legacy saved-graph compatibility only; target devices are selected on send_message, dispatch_todos, run_script, and notify_device nodes. When a Loopspace should send a message to the terminal orchestrator or coding agent, model it as a send_message action region; do not model that as queue_todo, dispatch_todos, or a loose terminal edge. When a Loopspace should dispatch queued todos to workspace terminals, model it as a dispatch_todos action region. send_message and dispatch_todos can both contain child step nodes for internal checkpoints with parent_id set to the action node id; dispatch_todos can also be direct with target_workspace_ids and todo_lines and no children.
+- Connect trigger.out -> send_message.in or dispatch_todos.in; connect document_read.docs or asset_read.assets -> step.in for readable context; connect step.docs -> document_write.in and step.assets -> asset_write.in for generated outputs; and connect step.success -> run_script.in/send_message.in/dispatch_todos.in/notify_device.in for follow-up actions. Legal ports include trigger.out; run_script/send_message/dispatch_todos/notify_device exec, success, failure, and interrupt; document_read/document_write docs; asset_read/asset_write assets; step success/docs/assets; and target .in ports. Resource nodes use doc_refs or asset_refs for selected inputs, create_name for generated outputs, h for height, and target_mode for selection/create behavior. Send-message nodes use prompt plus optional device_id/target_device_id, device_label/target_device_label, target_agent_id, target_terminal_id, model, reasoning_effort, and speed. Dispatch todo nodes use target_workspace_ids and todo_lines plus device_id/target_device_id, target_agent_id, model, reasoning_effort, speed, and terminal targeting; set target_terminal_mode=\"auto\" or omit terminal selectors for any terminal, and set target_terminal_mode=\"pinned\" with target_terminal_id, target_terminal_index, or target_terminal_name for a specific terminal.
+- Loopspace packets use compact LS/1 lines instead of verbose JSON. When executing a Dispatch Todo with loop_runtime_run_id, the initial todo carries run identity only, not the child loop contents. Call coordination-kernel.start_task with loopspace_id, loop_runtime_run_id, loop_runtime_node_id, loop_runtime_edge_id, trigger_id, and trigger_run_id when present, wait for its response, and use the LS/1 run_context in loopspace_run_context. It returns only the connected subloop slice, the main Dispatch Todo action for direct runs or the first/current child checkpoint for stepped runs, and the exact docs/assets read-write resources. coordination-kernel.start_task creates the local task and injects the Cloud-backed Loopspace run context; coordination-kernel.checkpoint remains local visibility only. After each local checkpoint, call record_loopspace_step_progress, include the loop runtime ids, wait for the response, and follow nextCheckpoint before moving on. For dispatch_todos, todo queue status is the final source of completed/failed/interrupted state; checkpoint progress only updates the internal step display. Do not connect send_message.exec, send_message.success, dispatch_todos.exec, dispatch_todos.success, run_script.exec, or other action execution branches directly into document_write or asset_write; route generated docs/assets through child step docs/assets ports. Prefer patch_loopspace_graph for attach_trigger, add_node, move_node, remove_node, connect, disconnect, and update_node_props; specify from_port/fromPort and to_port/toPort on connect operations, especially from run_script/send_message/dispatch_todos/notify_device action nodes. Use update_loopspace_graph only for larger full-source rewrites, preserve existing ids, and wait for the hydrated result.
 - For tab or workspace navigation and terminal management, use select_tab, select_workspace, list_terminals, open_terminals, close_terminals, or focus_terminal.
 
 Do not search for legacy account-skills.md or random files when the app-control tools can answer or edit the live UI state. Ask a brief clarifying question only when the visible context is missing and the user's target cannot be inferred.";
@@ -1588,6 +1591,8 @@ fn terminal_workspace_gateway_args_from_coordination_args(args: &[String]) -> Ve
 const TERMINAL_PERMISSION_MODE_PLAN: &str = "plan";
 const TERMINAL_PERMISSION_MODE_ASK: &str = "ask";
 const TERMINAL_PERMISSION_MODE_ACCEPT_EDITS: &str = "accept_edits";
+const TERMINAL_PERMISSION_MODE_AUTO: &str = "auto";
+const TERMINAL_PERMISSION_MODE_FULL_ACCESS: &str = "full_access";
 const TERMINAL_PERMISSION_MODE_BYPASS: &str = "bypass";
 
 fn terminal_normalize_permission_mode(value: Option<String>) -> Result<Option<String>, String> {
@@ -1604,6 +1609,10 @@ fn terminal_normalize_permission_mode(value: Option<String>) -> Result<Option<St
         "ask" | "ask_each" | "ask_each_time" | "default" => TERMINAL_PERMISSION_MODE_ASK,
         "accept" | "accept_edit" | "accept_edits" | "acceptedits" => {
             TERMINAL_PERMISSION_MODE_ACCEPT_EDITS
+        }
+        "auto" | "auto_mode" | "automode" => TERMINAL_PERMISSION_MODE_AUTO,
+        "full" | "full_access" | "fullaccess" | "danger_full_access" | "dangerfullaccess" => {
+            TERMINAL_PERMISSION_MODE_FULL_ACCESS
         }
         "bypass" | "bypass_permissions" | "bypasspermissions" => TERMINAL_PERMISSION_MODE_BYPASS,
         _ => return Err("Agent permission mode is invalid.".to_string()),
@@ -1679,6 +1688,7 @@ fn apply_codex_coordinated_auto_approval_args(
         let (approval, sandbox) = match permission_mode {
             TERMINAL_PERMISSION_MODE_PLAN => ("never", "read-only"),
             TERMINAL_PERMISSION_MODE_ASK => ("on-request", "workspace-write"),
+            TERMINAL_PERMISSION_MODE_FULL_ACCESS => ("never", "danger-full-access"),
             _ => ("never", "workspace-write"),
         };
         args.push("--ask-for-approval".to_string());
@@ -1831,6 +1841,7 @@ fn claude_permission_mode_arg(permission_mode: &str) -> &'static str {
     match permission_mode {
         TERMINAL_PERMISSION_MODE_PLAN => "plan",
         TERMINAL_PERMISSION_MODE_ASK => "default",
+        TERMINAL_PERMISSION_MODE_AUTO | TERMINAL_PERMISSION_MODE_FULL_ACCESS => "auto",
         TERMINAL_PERMISSION_MODE_BYPASS => "bypassPermissions",
         _ => "acceptEdits",
     }
@@ -1844,7 +1855,12 @@ fn claude_allowed_tools_arg(
         .into_iter()
         .map(str::to_string)
         .collect::<Vec<_>>();
-    if permission_mode == TERMINAL_PERMISSION_MODE_ACCEPT_EDITS {
+    if matches!(
+        permission_mode,
+        TERMINAL_PERMISSION_MODE_ACCEPT_EDITS
+            | TERMINAL_PERMISSION_MODE_AUTO
+            | TERMINAL_PERMISSION_MODE_FULL_ACCESS
+    ) {
         let workspace_files = claude_workspace_permission_glob(coordination);
         tools.push(format!("Edit({workspace_files})"));
         tools.push(format!("Write({workspace_files})"));
@@ -1913,7 +1929,12 @@ fn claude_write_authority_guard_settings(
     activity_transport: Option<&TerminalActivityTransportEndpoint>,
 ) -> String {
     let workspace_files = claude_workspace_permission_glob(coordination);
-    let allowed_permissions = if permission_mode == TERMINAL_PERMISSION_MODE_ACCEPT_EDITS {
+    let allowed_permissions = if matches!(
+        permission_mode,
+        TERMINAL_PERMISSION_MODE_ACCEPT_EDITS
+            | TERMINAL_PERMISSION_MODE_AUTO
+            | TERMINAL_PERMISSION_MODE_FULL_ACCESS
+    ) {
         vec![
             format!("Edit({workspace_files})"),
             format!("Write({workspace_files})"),
@@ -4656,6 +4677,15 @@ mod terminal_cli_tests {
         assert!(prompt.contains("list_scripts"));
         assert!(prompt.contains("modify this selection"));
         assert!(prompt.contains("update_selected_document"));
+        assert!(prompt.contains("When a Loopspace should send a message to the terminal orchestrator"));
+        assert!(prompt.contains("send_message action region"));
+        assert!(prompt.contains("dispatch_todos action region"));
+        assert!(prompt.contains("loopspace_run_context"));
+        assert!(prompt.contains("coordination-kernel.start_task"));
+        assert!(prompt.contains("target_terminal_mode=\"auto\""));
+        assert!(prompt.contains("run identity only"));
+        assert!(prompt.contains("trigger.out -> send_message.in"));
+        assert!(prompt.contains("step.docs -> document_write.in"));
 
         let allowed_tools = args
             .windows(2)
@@ -4713,6 +4743,15 @@ mod terminal_cli_tests {
         assert!(prompt.contains("save_doc"));
         assert!(prompt.contains("list_scripts"));
         assert!(prompt.contains("update_selected_document"));
+        assert!(prompt.contains("When a Loopspace should send a message to the terminal orchestrator"));
+        assert!(prompt.contains("send_message action region"));
+        assert!(prompt.contains("dispatch_todos action region"));
+        assert!(prompt.contains("loopspace_run_context"));
+        assert!(prompt.contains("coordination-kernel.start_task"));
+        assert!(prompt.contains("target_terminal_mode=\"auto\""));
+        assert!(prompt.contains("run identity only"));
+        assert!(prompt.contains("trigger.out -> send_message.in"));
+        assert!(prompt.contains("step.docs -> document_write.in"));
         assert!(args.iter().any(|arg| {
             arg.contains("mcp_servers.diffforge-app-control.command") && arg.contains("diff-forge")
         }));

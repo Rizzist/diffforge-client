@@ -9542,6 +9542,36 @@ impl CoordinationKernel {
         }))
     }
 
+    /// Reveal a single local workspace secret value to the owning device UI.
+    /// Unlike `read_workspace_mcp_secret_for_agent`, this records no usage and
+    /// emits no event — it is a plain local read for the settings surface.
+    pub fn reveal_workspace_mcp_secret(
+        &self,
+        workspace_id: &str,
+        key: &str,
+    ) -> Result<Value, String> {
+        let workspace_id = required_trimmed(workspace_id, "workspace_id")?;
+        let key = workspace_mcp_secret_key(key)?;
+        let row = self
+            .query_json(
+                "SELECT key, value FROM workspace_mcp_secrets
+                 WHERE workspace_id=?1 AND key=?2",
+                &[&workspace_id, &key],
+            )?
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("Workspace MCP secret `{key}` does not exist."))?;
+        let value = row["value"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("Workspace MCP secret `{key}` has no value."))?
+            .to_string();
+        Ok(json!({
+            "key": row["key"].clone(),
+            "value": value,
+        }))
+    }
+
     pub fn read_workspace_mcp_ssh_target_for_agent(
         &self,
         workspace_id: &str,
@@ -28309,7 +28339,15 @@ mod tests {
     }
 
     fn fake_cloud_mcp_url(default_task_id: &str, omit_task_id: bool) -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return format!(
+                    "diffforge-test://fake-cloud/start-task/{default_task_id}?omit_task_id={omit_task_id}"
+                );
+            }
+            Err(error) => panic!("failed to bind fake Cloud MCP listener: {error}"),
+        };
         let url = format!("http://{}", listener.local_addr().unwrap());
         let default_task_id = default_task_id.to_string();
         thread::spawn(move || {

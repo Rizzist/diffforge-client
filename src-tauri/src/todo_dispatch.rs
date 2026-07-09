@@ -4438,6 +4438,78 @@ fn todo_store_build_created_item(
             ][..],
         ),
         (
+            "loopRuntimeRunId",
+            &[
+                "loopRuntimeRunId",
+                "loop_runtime_run_id",
+                "runId",
+                "run_id",
+            ][..],
+        ),
+        (
+            "loop_runtime_run_id",
+            &[
+                "loop_runtime_run_id",
+                "loopRuntimeRunId",
+                "run_id",
+                "runId",
+            ][..],
+        ),
+        (
+            "loopRuntimeEdgeId",
+            &[
+                "loopRuntimeEdgeId",
+                "loop_runtime_edge_id",
+                "edgeId",
+                "edge_id",
+            ][..],
+        ),
+        (
+            "loop_runtime_edge_id",
+            &[
+                "loop_runtime_edge_id",
+                "loopRuntimeEdgeId",
+                "edge_id",
+                "edgeId",
+            ][..],
+        ),
+        ("triggerId", &["triggerId", "trigger_id"][..]),
+        ("trigger_id", &["trigger_id", "triggerId"][..]),
+        (
+            "triggerRunId",
+            &["triggerRunId", "trigger_run_id"][..],
+        ),
+        (
+            "trigger_run_id",
+            &["trigger_run_id", "triggerRunId"][..],
+        ),
+        (
+            "commandKind",
+            &["commandKind", "command_kind", "kind", "type", "action"][..],
+        ),
+        (
+            "command_kind",
+            &["command_kind", "commandKind", "kind", "type", "action"][..],
+        ),
+        (
+            "targetTerminalMode",
+            &[
+                "targetTerminalMode",
+                "target_terminal_mode",
+                "terminalMode",
+                "terminal_mode",
+            ][..],
+        ),
+        (
+            "target_terminal_mode",
+            &[
+                "target_terminal_mode",
+                "targetTerminalMode",
+                "terminal_mode",
+                "terminalMode",
+            ][..],
+        ),
+        (
             "todoNumber",
             &["todoNumber", "todo_number", "todoSequence", "todo_sequence"][..],
         ),
@@ -4520,6 +4592,117 @@ fn todo_store_build_created_item(
         ),
     ] {
         todo_store_insert_if_present(&mut object, draft, target_key, source_keys);
+    }
+
+    let item_source = Value::Object(object.clone());
+    let loop_runtime_run_id = todo_dispatch_text(
+        &item_source,
+        &["loopRuntimeRunId", "loop_runtime_run_id", "runId", "run_id"],
+    );
+    let source_kind = todo_dispatch_text(&item_source, &["source", "sourceKind", "source_kind"]);
+    let existing_remote_command = object
+        .get("remoteCommand")
+        .or_else(|| object.get("remote_command"))
+        .and_then(Value::as_object)
+        .cloned();
+    if existing_remote_command.is_some()
+        || !loop_runtime_run_id.is_empty()
+        || source_kind == "loopspace-dispatch-todos"
+    {
+        let mut remote_command = existing_remote_command.unwrap_or_default();
+        for (target_key, source_keys) in [
+            ("commandId", &["commandId", "command_id", "id"][..]),
+            ("command_id", &["command_id", "commandId", "id"][..]),
+            ("commandKind", &["commandKind", "command_kind"][..]),
+            ("command_kind", &["command_kind", "commandKind"][..]),
+            ("loopspaceId", &["loopspaceId", "loopspace_id"][..]),
+            ("loopspace_id", &["loopspace_id", "loopspaceId"][..]),
+            (
+                "loopRuntimeRunId",
+                &["loopRuntimeRunId", "loop_runtime_run_id", "runId", "run_id"][..],
+            ),
+            (
+                "loop_runtime_run_id",
+                &["loop_runtime_run_id", "loopRuntimeRunId", "run_id", "runId"][..],
+            ),
+            (
+                "loopRuntimeNodeId",
+                &[
+                    "loopRuntimeNodeId",
+                    "loop_runtime_node_id",
+                    "nodeId",
+                    "node_id",
+                ][..],
+            ),
+            (
+                "loop_runtime_node_id",
+                &[
+                    "loop_runtime_node_id",
+                    "loopRuntimeNodeId",
+                    "node_id",
+                    "nodeId",
+                ][..],
+            ),
+            (
+                "loopRuntimeEdgeId",
+                &[
+                    "loopRuntimeEdgeId",
+                    "loop_runtime_edge_id",
+                    "edgeId",
+                    "edge_id",
+                ][..],
+            ),
+            (
+                "loop_runtime_edge_id",
+                &[
+                    "loop_runtime_edge_id",
+                    "loopRuntimeEdgeId",
+                    "edge_id",
+                    "edgeId",
+                ][..],
+            ),
+            ("triggerId", &["triggerId", "trigger_id"][..]),
+            ("trigger_id", &["trigger_id", "triggerId"][..]),
+            (
+                "triggerRunId",
+                &["triggerRunId", "trigger_run_id"][..],
+            ),
+            (
+                "trigger_run_id",
+                &["trigger_run_id", "triggerRunId"][..],
+            ),
+            ("source", &["source", "sourceKind", "source_kind"][..]),
+            (
+                "targetTerminalMode",
+                &["targetTerminalMode", "target_terminal_mode"][..],
+            ),
+            (
+                "target_terminal_mode",
+                &["target_terminal_mode", "targetTerminalMode"][..],
+            ),
+        ] {
+            let value = todo_dispatch_text(&item_source, source_keys);
+            if !value.is_empty() {
+                remote_command.insert(target_key.to_string(), json!(value));
+            }
+        }
+        if source_kind == "loopspace-dispatch-todos" && !remote_command.contains_key("commandKind") {
+            remote_command.insert(
+                "commandKind".to_string(),
+                json!("loopspace_dispatch_todos"),
+            );
+        }
+        if source_kind == "loopspace-dispatch-todos" && !remote_command.contains_key("command_kind") {
+            remote_command.insert(
+                "command_kind".to_string(),
+                json!("loopspace_dispatch_todos"),
+            );
+        }
+        if source_kind == "loopspace-dispatch-todos" {
+            remote_command.remove("checkpointPlan");
+            remote_command.remove("checkpoint_plan");
+        }
+        object.insert("remoteCommand".to_string(), Value::Object(remote_command));
     }
 
     if draft.get("targetExplicit").and_then(Value::as_bool) == Some(true)
@@ -4723,6 +4906,39 @@ fn todo_store_dispatch_todo_drafts(request: &Value) -> Vec<Value> {
         .collect()
 }
 
+fn todo_store_sanitize_loopspace_dispatch_draft(
+    draft_object: &mut serde_json::Map<String, Value>,
+    sequence: usize,
+) {
+    for text_key in [
+        "body",
+        "items",
+        "longText",
+        "long_text",
+        "message",
+        "name",
+        "note",
+        "noteText",
+        "note_text",
+        "prompt",
+        "text",
+        "title",
+        "todoLines",
+        "todo_lines",
+        "todos",
+    ] {
+        draft_object.remove(text_key);
+    }
+    draft_object.insert(
+        "text".to_string(),
+        json!(format!("Loopspace Dispatch Todo run #{}", sequence)),
+    );
+    draft_object.insert(
+        "title".to_string(),
+        json!(format!("Loopspace Dispatch Todo #{}", sequence)),
+    );
+}
+
 fn todo_store_dispatch_optional_i64(value: &Value, keys: &[&str]) -> Option<i64> {
     let payload = value.get("payload").filter(|nested| nested.is_object());
     for key in keys {
@@ -4916,8 +5132,105 @@ async fn todo_store_dispatch_loopspace_batch(
                     "loop_runtime_node_id",
                 ][..],
             ),
+            (
+                "loopRuntimeRunId",
+                &[
+                    "loopRuntimeRunId",
+                    "loop_runtime_run_id",
+                    "runId",
+                    "run_id",
+                ][..],
+            ),
+            (
+                "loop_runtime_run_id",
+                &[
+                    "loop_runtime_run_id",
+                    "loopRuntimeRunId",
+                    "run_id",
+                    "runId",
+                ][..],
+            ),
+            (
+                "loopRuntimeEdgeId",
+                &[
+                    "loopRuntimeEdgeId",
+                    "loop_runtime_edge_id",
+                    "edgeId",
+                    "edge_id",
+                ][..],
+            ),
+            (
+                "loop_runtime_edge_id",
+                &[
+                    "loop_runtime_edge_id",
+                    "loopRuntimeEdgeId",
+                    "edge_id",
+                    "edgeId",
+                ][..],
+            ),
+            (
+                "triggerId",
+                &["triggerId", "trigger_id"][..],
+            ),
+            (
+                "trigger_id",
+                &["trigger_id", "triggerId"][..],
+            ),
+            (
+                "triggerRunId",
+                &["triggerRunId", "trigger_run_id"][..],
+            ),
+            (
+                "trigger_run_id",
+                &["trigger_run_id", "triggerRunId"][..],
+            ),
+            (
+                "commandKind",
+                &["commandKind", "command_kind", "kind", "type", "action"][..],
+            ),
+            (
+                "command_kind",
+                &["command_kind", "commandKind", "kind", "type", "action"][..],
+            ),
+            (
+                "targetTerminalMode",
+                &["targetTerminalMode", "target_terminal_mode", "terminalMode", "terminal_mode"][..],
+            ),
+            (
+                "target_terminal_mode",
+                &["target_terminal_mode", "targetTerminalMode", "terminal_mode", "terminalMode"][..],
+            ),
         ] {
             todo_store_dispatch_insert_text(&mut base, &request, target_key, source_keys);
+        }
+        if !base.contains_key("commandKind") {
+            base.insert(
+                "commandKind".to_string(),
+                json!("loopspace_dispatch_todos"),
+            );
+        }
+        if !base.contains_key("command_kind") {
+            base.insert(
+                "command_kind".to_string(),
+                json!("loopspace_dispatch_todos"),
+            );
+        }
+        let default_target_terminal_mode = if !target_terminal_id.is_empty() || target_terminal_index.is_some() {
+            "pinned"
+        } else {
+            "auto"
+        };
+        if !base.contains_key("targetTerminalMode") {
+            base.insert(
+                "targetTerminalMode".to_string(),
+                json!(default_target_terminal_mode),
+            );
+        }
+        if !base.contains_key("target_terminal_mode") {
+            base.insert(
+                "target_terminal_mode".to_string(),
+                json!(default_target_terminal_mode),
+            );
         }
         if let Some(index) = target_terminal_index {
             base.insert("targetTerminalIndex".to_string(), json!(index));
@@ -4965,6 +5278,7 @@ async fn todo_store_dispatch_loopspace_batch(
                         draft_object.insert(key.clone(), value.clone());
                     }
                 }
+                todo_store_sanitize_loopspace_dispatch_draft(&mut draft_object, sequence);
                 let requested_todo_id = todo_dispatch_text(
                     &Value::Object(draft_object.clone()),
                     &["id", "todoId", "todo_id", "commandId", "command_id"],
@@ -8430,6 +8744,84 @@ mod todo_store_tests {
     }
 
     #[test]
+    fn draft_create_preserves_loopspace_dispatch_runtime_identity() {
+        let item = todo_store_build_created_item(
+            "workspace-1",
+            &json!({
+                "commandKind": "loopspace_dispatch_todos",
+                "loopRuntimeEdgeId": "edge-1",
+                "loopRuntimeNodeId": "dispatch-1",
+                "loopRuntimeRunId": "run-1",
+                "loopspaceId": "loopspace-1",
+                "remoteCommand": {
+                    "checkpointPlan": [{ "id": "step-1" }],
+                    "checkpoint_plan": [{ "id": "step-1" }],
+                    "source": "loopspace-dispatch-todos"
+                },
+                "source": "loopspace-dispatch-todos",
+                "targetTerminalMode": "auto",
+                "text": "Run the dispatched todo",
+                "triggerId": "trigger-1",
+                "triggerRunId": "trigger-run-1"
+            }),
+            "loopspace_dispatch",
+        )
+        .expect("dispatch todo should create");
+
+        assert_eq!(item["loopRuntimeRunId"], "run-1");
+        assert_eq!(item["loop_runtime_run_id"], "run-1");
+        assert_eq!(item["loopRuntimeNodeId"], "dispatch-1");
+        assert_eq!(item["loopRuntimeEdgeId"], "edge-1");
+        assert_eq!(item["triggerId"], "trigger-1");
+        assert_eq!(item["triggerRunId"], "trigger-run-1");
+        assert_eq!(item["commandKind"], "loopspace_dispatch_todos");
+        assert_eq!(
+            item["remoteCommand"]["commandKind"],
+            "loopspace_dispatch_todos"
+        );
+        assert_eq!(item["remoteCommand"]["loopRuntimeRunId"], "run-1");
+        assert_eq!(item["remoteCommand"]["loop_runtime_run_id"], "run-1");
+        assert_eq!(item["remoteCommand"]["loopRuntimeNodeId"], "dispatch-1");
+        assert!(item["remoteCommand"].get("checkpointPlan").is_none());
+        assert!(item["remoteCommand"].get("checkpoint_plan").is_none());
+    }
+
+    #[test]
+    fn loopspace_dispatch_draft_sanitizer_keeps_terminal_text_identity_only() {
+        let mut draft = json!({
+            "body": "body content",
+            "items": ["hidden item"],
+            "message": "message content",
+            "note": { "text": "note content" },
+            "prompt": "prompt content",
+            "text": "todo content",
+            "title": "title content",
+            "todoLines": "line content",
+            "todos": ["todo content"]
+        })
+        .as_object()
+        .cloned()
+        .expect("draft object");
+
+        todo_store_sanitize_loopspace_dispatch_draft(&mut draft, 2);
+
+        let value = Value::Object(draft);
+        assert_eq!(value["text"], "Loopspace Dispatch Todo run #2");
+        assert_eq!(value["title"], "Loopspace Dispatch Todo #2");
+        for key in [
+            "body",
+            "items",
+            "message",
+            "note",
+            "prompt",
+            "todoLines",
+            "todos",
+        ] {
+            assert!(value.get(key).is_none(), "{key} should be removed");
+        }
+    }
+
+    #[test]
     fn update_patch_changes_text_without_restamping_status() {
         let mut item = json!({
             "id": "todo-1",
@@ -11155,6 +11547,7 @@ mod todo_dispatch_backend_tests {
             prompt_default_option: None,
             prompt_ttl_ms: None,
             prompt_options: Vec::new(),
+            allows_free_text: false,
             prompt_answer_option: None,
             manual_prompt_source: None,
             manual_approval_required: false,

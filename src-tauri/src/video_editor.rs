@@ -490,9 +490,12 @@ const VIDEO_GENERATION_PROVIDERS: &[VideoProviderDefinition] = &[
             "kling3_0",
             "kling2_6",
             "seedance_2_0",
+            "seedance_1_5_pro",
             "veo3_1",
+            "veo3_1_lite",
             "wan2_7",
             "minimax_hailuo",
+            "grok_video_1_5",
             "higgsfield_dop_lite",
             "higgsfield_dop_standard",
             "kling_v2_5_turbo_pro_text_to_video",
@@ -501,6 +504,18 @@ const VIDEO_GENERATION_PROVIDERS: &[VideoProviderDefinition] = &[
             "seedance_v1_pro_image_to_video",
             "higgsfield_soul_standard",
             "reve_text_to_image",
+            "gpt_image_2",
+            "nano_banana_pro",
+            "nano_banana_2",
+            "nano_banana_flash",
+            "flux_2",
+            "seedream_v4_text_to_image",
+            "seedream_v4_edit",
+            "seedream_v4_5",
+            "seedream_v5_lite",
+            "recraft_v4_1",
+            "flux_kontext",
+            "mirelo_sfx",
             "seedvr2-video-upscaler",
             "esrgan-image-upscaler",
             "topaz-video-upscale",
@@ -563,7 +578,11 @@ const VIDEO_GENERATION_PROVIDERS: &[VideoProviderDefinition] = &[
         label: "Nano Banana",
         kind: "image",
         default_base_url: "https://generativelanguage.googleapis.com",
-        models: &["gemini-2.5-flash-image"],
+        models: &[
+            "gemini-3-pro-image",
+            "gemini-3.1-flash-image",
+            "gemini-2.5-flash-image",
+        ],
         requires_secret_key: false,
     },
     VideoProviderDefinition {
@@ -584,9 +603,14 @@ const VIDEO_GENERATION_PROVIDERS: &[VideoProviderDefinition] = &[
             "fal-ai/veo3.1/image-to-video",
             "fal-ai/veo3.1/first-last-frame-to-video",
             "fal-ai/veo3.1/reference-to-video",
+            "fal-ai/veo3.1/lite",
+            "fal-ai/veo3.1/lite/image-to-video",
+            "fal-ai/veo3.1/lite/first-last-frame-to-video",
             "bytedance/seedance-2.0/text-to-video",
             "bytedance/seedance-2.0/image-to-video",
             "bytedance/seedance-2.0/reference-to-video",
+            "fal-ai/bytedance/seedance/v1.5/pro/text-to-video",
+            "fal-ai/bytedance/seedance/v1.5/pro/image-to-video",
             "fal-ai/kling-video/v3/pro/text-to-video",
             "fal-ai/kling-video/v3/pro/image-to-video",
             "fal-ai/kling-video/v3/standard/text-to-video",
@@ -599,6 +623,15 @@ const VIDEO_GENERATION_PROVIDERS: &[VideoProviderDefinition] = &[
             "fal-ai/wan/v2.7/image-to-video",
             "fal-ai/minimax/hailuo-02/standard/text-to-video",
             "fal-ai/minimax/hailuo-02/standard/image-to-video",
+            "xai/grok-imagine-video/v1.5/image-to-video",
+            "fal-ai/flux-2",
+            "fal-ai/bytedance/seedream/v4/text-to-image",
+            "fal-ai/bytedance/seedream/v4/edit",
+            "fal-ai/bytedance/seedream/v4.5/text-to-image",
+            "fal-ai/bytedance/seedream/v5/lite/text-to-image",
+            "fal-ai/recraft/v4.1/text-to-image",
+            "fal-ai/flux-pro/kontext",
+            "mirelo-ai/sfx-v1.5/video-to-audio",
             "fal-ai/seedvr/upscale/video",
             "fal-ai/esrgan",
         ],
@@ -6130,11 +6163,26 @@ fn video_mcp_generate_models(kind: Option<&str>) -> Vec<serde_json::Value> {
         serde_json::json!({"id":"kling3_0","kind":"video","name":"Kling 3.0","caps":{"durations":[3,4,5,6,7,8,9,10,11,12,13,14,15],"aspects":["16:9","9:16","1:1"],"maxReferenceImages":0,"sound":true,"modes":["pro","standard"]},"estUsdPerSecond":0.112}),
         serde_json::json!({"id":"kling2_6","kind":"video","name":"Kling 2.6","caps":{"durations":[5,10],"aspects":["16:9","9:16","1:1"],"maxReferenceImages":0,"sound":true},"estUsdPerSecond":0.14}),
         serde_json::json!({"id":"seedance_2_0","kind":"video","name":"Seedance 2.0","caps":{"durations":[4,5,6,7,8,9,10,11,12,13,14,15],"resolutions":["480p","720p","1080p","4k"],"aspects":["21:9","16:9","4:3","1:1","3:4","9:16"],"maxReferenceImages":9,"sound":true},"estUsdPerSecond":0.30}),
+        serde_json::json!({"id":"seedance_1_5_pro","kind":"video","name":"Seedance 1.5 Pro","caps":{"durations":[4,5,6,7,8,9,10,11,12],"resolutions":["480p","720p","1080p"],"aspects":["21:9","16:9","4:3","1:1","3:4","9:16","auto"],"maxReferenceImages":0,"sound":true},"estUsdPerSecond":0.14}),
         serde_json::json!({"id":"veo3_1","kind":"video","name":"Veo 3.1","caps":{"durations":[4,6,8],"resolutions":["720p","1080p","4k"],"aspects":["16:9","9:16"],"maxReferenceImages":3,"sound":true},"estUsdPerSecond":0.40}),
+        serde_json::json!({"id":"veo3_1_lite","kind":"video","name":"Veo 3.1 Lite","caps":{"durations":[4,6,8],"resolutions":["720p","1080p"],"aspects":["16:9","9:16"],"maxReferenceImages":0,"sound":true},"estUsdPerSecond":0.25}),
         serde_json::json!({"id":"wan2_7","kind":"video","name":"Wan 2.7","caps":{"durations":[2,3,4,5,6,7,8,9,10,11,12,13,14,15],"resolutions":["720p","1080p"],"aspects":["16:9","9:16","1:1","4:3","3:4"],"maxReferenceImages":0},"estUsdPerSecond":0.15}),
         serde_json::json!({"id":"minimax_hailuo","kind":"video","name":"MiniMax Hailuo","caps":{"durations":[6,10],"maxReferenceImages":0},"estUsdPerSecond":0.045}),
+        serde_json::json!({"id":"grok_video_1_5","kind":"video","name":"Grok Imagine Video 1.5","caps":{"durations":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],"resolutions":["480p","720p","1080p"],"requiresStartFrame":true,"maxReferenceImages":0},"estUsdPerSecond":0.12}),
         serde_json::json!({"id":"higgsfield_soul_standard","kind":"image","name":"Soul Standard","caps":{"resolutions":["2K","4K"],"aspects":["16:9","9:16","1:1","3:4","4:3","2:3","3:2"],"maxReferenceImages":0},"estUsdPerImage":0.05}),
         serde_json::json!({"id":"reve_text_to_image","kind":"image","name":"Reve","caps":{"aspects":["16:9","9:16","1:1","3:4","4:3","2:3","3:2"],"maxReferenceImages":0},"estUsdPerImage":0.04}),
+        serde_json::json!({"id":"gpt_image_2","kind":"image","name":"GPT Image 2","caps":{"aspects":["16:9","9:16","1:1","3:4","4:3","2:3","3:2"],"maxReferenceImages":10},"estUsdPerImage":0.08}),
+        serde_json::json!({"id":"nano_banana_pro","kind":"image","name":"Nano Banana Pro","caps":{"aspects":["16:9","9:16","1:1","3:4","4:3","2:3","3:2"],"maxReferenceImages":8},"estUsdPerImage":0.10}),
+        serde_json::json!({"id":"nano_banana_2","kind":"image","name":"Nano Banana 2","caps":{"aspects":["16:9","9:16","1:1","3:4","4:3","2:3","3:2"],"maxReferenceImages":8},"estUsdPerImage":0.06}),
+        serde_json::json!({"id":"nano_banana_flash","kind":"image","name":"Nano Banana Flash","caps":{"aspects":["16:9","9:16","1:1","3:4","4:3","2:3","3:2"],"maxReferenceImages":8},"estUsdPerImage":0.03}),
+        serde_json::json!({"id":"flux_2","kind":"image","name":"FLUX.2","caps":{"aspects":["16:9","9:16","1:1","3:4","4:3"],"maxReferenceImages":0},"estUsdPerImage":0.04}),
+        serde_json::json!({"id":"seedream_v4_text_to_image","kind":"image","name":"Seedream v4","caps":{"aspects":["16:9","9:16","1:1","3:4","4:3"],"maxReferenceImages":0},"estUsdPerImage":0.06}),
+        serde_json::json!({"id":"seedream_v4_edit","kind":"image","name":"Seedream v4 Edit","caps":{"aspects":["16:9","9:16","1:1","3:4","4:3"],"requiresStartFrame":true,"maxReferenceImages":10},"estUsdPerImage":0.06}),
+        serde_json::json!({"id":"seedream_v4_5","kind":"image","name":"Seedream v4.5","caps":{"aspects":["16:9","9:16","1:1","3:4","4:3"],"maxReferenceImages":0},"estUsdPerImage":0.07}),
+        serde_json::json!({"id":"seedream_v5_lite","kind":"image","name":"Seedream v5 Lite","caps":{"resolutions":["auto_2K","auto_4K"],"maxReferenceImages":0},"estUsdPerImage":0.05}),
+        serde_json::json!({"id":"recraft_v4_1","kind":"image","name":"Recraft v4.1","caps":{"aspects":["16:9","9:16","1:1","3:4","4:3"],"maxReferenceImages":0},"estUsdPerImage":0.04}),
+        serde_json::json!({"id":"flux_kontext","kind":"image","name":"FLUX Kontext","caps":{"requiresStartFrame":true,"maxReferenceImages":1},"estUsdPerImage":0.04}),
+        serde_json::json!({"id":"mirelo_sfx","kind":"audio","name":"Mirelo SFX","caps":{"requiresInputVideo":true,"durations":[1,2,3,4,5,6,7,8,9,10,15,20,30]},"estUsdPerSecond":0.04}),
         serde_json::json!({"id":"hyperframes","kind":"code","name":"Hyperframes (HTML code render)","caps":{"twoPhase":true,"localRender":true},"estUsdPerSecond":0.0}),
     ];
     match kind {
@@ -6150,6 +6198,7 @@ fn video_mcp_generate_model_for_kind(kind: &str, model: &str) -> Result<serde_js
     if !matches!(kind, "video" | "image" | "audio") {
         return Err("kind must be video, image, or audio.".to_string());
     }
+    let model = video_cloud_model_canonical_id(model);
     let models = video_mcp_generate_models(Some(kind));
     if let Some(row) = models
         .iter()
@@ -6220,6 +6269,19 @@ fn video_mcp_validate_generate_start(
         return Err(format!(
             "{model} requires audioAssetPaths[0] as input audio."
         ));
+    }
+    if video_mcp_generate_model_cap(&model_row, "requiresInputVideo") {
+        let input_path = input_asset_paths
+            .first()
+            .ok_or_else(|| format!("{model} requires inputAssetPaths[0] as a source video."))?;
+        let (_abs, _rel_path, asset_kind, _metadata) =
+            video_resolve_existing_media_file(root, media_root, input_path)
+                .map_err(|error| format!("Invalid inputAssetPaths[0] entry {input_path}: {error}"))?;
+        if asset_kind != "video" {
+            return Err(format!(
+                "{model} requires inputAssetPaths[0] to be a video asset under media/."
+            ));
+        }
     }
     video_mcp_validate_generate_asset_paths(root, media_root, input_asset_paths, audio_asset_paths)
 }
@@ -11657,8 +11719,15 @@ fn video_emit_generate_progress_event(
 }
 
 fn video_cloud_model_is_audio(model: &str) -> bool {
-    let _ = model;
-    false
+    matches!(model, "mirelo_sfx")
+}
+
+fn video_cloud_model_canonical_id(model: &str) -> &str {
+    match model.trim() {
+        "seedance1_5" => "seedance_1_5_pro",
+        "grok_video_v15" => "grok_video_1_5",
+        value => value,
+    }
 }
 
 fn video_generate_request_kind(
@@ -11894,6 +11963,64 @@ async fn video_poll_sleep(
     Ok(())
 }
 
+fn video_decode_data_uri(url: &str) -> Result<(Vec<u8>, String), String> {
+    use base64::Engine as _;
+    let data = url
+        .strip_prefix("data:")
+        .ok_or_else(|| "Generated media data URI is missing data: prefix.".to_string())?;
+    let (header, payload) = data
+        .split_once(',')
+        .ok_or_else(|| "Generated media data URI is missing base64 payload.".to_string())?;
+    if !header
+        .split(';')
+        .any(|part| part.eq_ignore_ascii_case("base64"))
+    {
+        return Err("Generated media data URI must be base64 encoded.".to_string());
+    }
+    let mime = header
+        .split(';')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload.trim())
+        .map_err(|error| format!("Unable to decode generated media data URI: {error}"))?;
+    Ok((bytes, mime))
+}
+
+fn video_save_generated_data_uri(
+    context: &VideoGenerateJobContext,
+    url: &str,
+    mime_type: Option<&str>,
+    index: usize,
+) -> Result<String, String> {
+    let (bytes, response_mime_type) = video_decode_data_uri(url)?;
+    std::fs::create_dir_all(&context.generated_dir)
+        .map_err(|error| format!("Unable to create generated media directory: {error}"))?;
+    let planned_output = video_planned_output_abs(
+        &context.root,
+        &context.media_root,
+        &context.planned_paths,
+        index,
+    )?;
+    let output = video_corrected_audio_output_abs(
+        context,
+        &planned_output,
+        mime_type,
+        Some(&response_mime_type),
+        url,
+    )?;
+    let output_path = video_relative_path(&context.root, &output);
+    if output != planned_output {
+        video_update_generation_job_planned_path(context, index, &output_path)?;
+    }
+    std::fs::write(&output, bytes)
+        .map_err(|error| format!("Unable to write generated media: {error}"))?;
+    Ok(output_path)
+}
+
 async fn video_download_generated_url(
     context: &VideoGenerateJobContext,
     client: &reqwest::Client,
@@ -11912,6 +12039,9 @@ async fn video_download_generated_url(
         None,
         &[],
     );
+    if url.trim_start().starts_with("data:") {
+        return video_save_generated_data_uri(context, url.trim(), mime_type, index);
+    }
     let mut response = client
         .get(url)
         .send()
@@ -12443,7 +12573,24 @@ fn video_cloud_generate_payload(
     input.insert("mode".to_string(), serde_json::json!(request.mode.clone()));
 
     let mut total_b64 = 0usize;
-    if request.mode == "upscale-video" || request.mode == "upscale-image" {
+    if video_cloud_model_is_audio(&context.model) {
+        let source_path = request
+            .input_asset_paths
+            .first()
+            .ok_or_else(|| "Cloud Mirelo SFX requires a source video asset.".to_string())?;
+        let source_abs = video_resolve_media_abs(&context.root, &context.media_root, source_path)?;
+        if video_media_kind_for_extension(&source_abs) != Some("video") {
+            return Err("Cloud Mirelo SFX requires a video asset under media/.".to_string());
+        }
+        let (b64, mime) = video_cloud_append_b64_asset(
+            &context.root,
+            &context.media_root,
+            source_path,
+            &mut total_b64,
+        )?;
+        input.insert("sourceB64".to_string(), serde_json::json!(b64));
+        input.insert("sourceMime".to_string(), serde_json::json!(mime));
+    } else if request.mode == "upscale-video" || request.mode == "upscale-image" {
         let source_path = request
             .input_asset_paths
             .first()
@@ -13024,6 +13171,30 @@ async fn video_generate_kling(
     }
 }
 
+fn video_openai_image_size(params: Option<&VideoGenerateParams>) -> String {
+    if let Some(resolution) = params
+        .and_then(|params| params.resolution.as_deref())
+        .map(str::trim)
+        .filter(|value| {
+            value
+                .split_once('x')
+                .or_else(|| value.split_once('X'))
+                .map(|(width, height)| {
+                    width.chars().all(|ch| ch.is_ascii_digit())
+                        && height.chars().all(|ch| ch.is_ascii_digit())
+                })
+                .unwrap_or(false)
+        })
+    {
+        return resolution.to_string();
+    }
+    match params.and_then(|params| params.aspect.as_deref()) {
+        Some("16:9") | Some("3:2") | Some("4:3") => "1536x1024".to_string(),
+        Some("9:16") | Some("2:3") | Some("3:4") => "1024x1536".to_string(),
+        _ => "1024x1024".to_string(),
+    }
+}
+
 async fn video_generate_openai_image(
     context: &VideoGenerateJobContext,
     request: &VideoGenerateRequest,
@@ -13034,26 +13205,12 @@ async fn video_generate_openai_image(
     let base = video_provider_base_url(provider, &request.auth);
     let api_key = video_auth_api_key(&request.auth)?;
     let response = if request.mode == "image-edit" {
-        let input = request
-            .input_asset_paths
-            .first()
-            .ok_or_else(|| "Image edit requires an input asset.".to_string())?;
-        let abs = video_resolve_media_abs(&context.root, &context.media_root, input)?;
-        let bytes = std::fs::read(&abs)
-            .map_err(|error| format!("Unable to read image edit input: {error}"))?;
-        let filename = abs
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("image.png")
-            .to_string();
-        let mime = video_mime_for_path(&abs);
-        let part = reqwest::multipart::Part::bytes(bytes)
-            .file_name(filename)
-            .mime_str(mime)
-            .map_err(|error| format!("Unable to prepare image edit upload: {error}"))?;
-        let form = reqwest::multipart::Form::new()
-            .part("image", part)
+        if request.input_asset_paths.is_empty() {
+            return Err("Image edit requires an input asset.".to_string());
+        }
+        let mut form = reqwest::multipart::Form::new()
             .text("prompt", request.prompt.clone())
+            .text("size", video_openai_image_size(request.params.as_ref()))
             .text(
                 "model",
                 if request.model.trim().is_empty() {
@@ -13062,6 +13219,22 @@ async fn video_generate_openai_image(
                     request.model.clone()
                 },
             );
+        for input in request.input_asset_paths.iter().take(10) {
+            let abs = video_resolve_media_abs(&context.root, &context.media_root, input)?;
+            let bytes = std::fs::read(&abs)
+                .map_err(|error| format!("Unable to read image edit input {input}: {error}"))?;
+            let filename = abs
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("image.png")
+                .to_string();
+            let mime = video_mime_for_path(&abs);
+            let part = reqwest::multipart::Part::bytes(bytes)
+                .file_name(filename)
+                .mime_str(mime)
+                .map_err(|error| format!("Unable to prepare image edit upload: {error}"))?;
+            form = form.part("image", part);
+        }
         client
             .post(format!("{base}/v1/images/edits"))
             .bearer_auth(api_key)
@@ -13076,7 +13249,7 @@ async fn video_generate_openai_image(
             .json(&serde_json::json!({
                 "model": if request.model.trim().is_empty() { provider.models[0] } else { request.model.as_str() },
                 "prompt": request.prompt,
-                "size": request.params.as_ref().and_then(|params| params.resolution.as_deref()).unwrap_or("1024x1024"),
+                "size": video_openai_image_size(request.params.as_ref()),
                 "n": request.params.as_ref().and_then(|params| params.num_images).unwrap_or(1).clamp(1, 16),
             }))
             .send()
@@ -13105,6 +13278,46 @@ async fn video_generate_openai_image(
     Ok(outputs)
 }
 
+fn video_collect_gemini_image_data(
+    value: &serde_json::Value,
+    outputs: &mut Vec<(String, String)>,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for key in ["output_image", "outputImage", "inlineData", "inline_data"] {
+                if let Some(child) = object.get(key) {
+                    if let Some(data) = child.get("data").and_then(serde_json::Value::as_str) {
+                        let mime = video_cloud_output_mime(child)
+                            .unwrap_or_else(|| "image/png".to_string());
+                        outputs.push((data.trim().to_string(), mime));
+                    }
+                }
+            }
+            if object
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| value.eq_ignore_ascii_case("image"))
+                .unwrap_or(false)
+            {
+                if let Some(data) = object.get("data").and_then(serde_json::Value::as_str) {
+                    let mime =
+                        video_cloud_output_mime(value).unwrap_or_else(|| "image/png".to_string());
+                    outputs.push((data.trim().to_string(), mime));
+                }
+            }
+            for child in object.values() {
+                video_collect_gemini_image_data(child, outputs);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                video_collect_gemini_image_data(item, outputs);
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn video_generate_nano_banana(
     context: &VideoGenerateJobContext,
     request: &VideoGenerateRequest,
@@ -13119,42 +13332,53 @@ async fn video_generate_nano_banana(
     } else {
         request.model.as_str()
     };
-    let mut parts = vec![serde_json::json!({ "text": request.prompt })];
-    for input in &request.input_asset_paths {
-        let (_, base64, mime, _) = video_asset_data_uri(&context.root, &context.media_root, input)?;
-        parts.push(serde_json::json!({
-            "inline_data": {
-                "mime_type": mime,
-                "data": base64,
-            },
+    let mut input = vec![serde_json::json!({ "type": "text", "text": request.prompt })];
+    for input_path in &request.input_asset_paths {
+        let (_, base64, mime, _) =
+            video_asset_data_uri(&context.root, &context.media_root, input_path)?;
+        input.push(serde_json::json!({
+            "type": "image",
+            "mime_type": mime,
+            "data": base64,
         }));
     }
+    let mut response_format = serde_json::json!({ "type": "image" });
+    if let Some(aspect) = request
+        .params
+        .as_ref()
+        .and_then(|params| params.aspect.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        response_format["aspect_ratio"] = serde_json::json!(aspect);
+    }
+    if let Some(resolution) = request
+        .params
+        .as_ref()
+        .and_then(|params| params.resolution.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        response_format["image_size"] = serde_json::json!(resolution);
+    }
     let response = client
-        .post(format!("{base}/v1beta/models/{model}:generateContent"))
+        .post(format!("{base}/v1beta/interactions"))
         .header("x-goog-api-key", api_key)
-        .json(&serde_json::json!({ "contents": [{ "parts": parts }] }))
+        .json(&serde_json::json!({
+            "model": model,
+            "input": input,
+            "response_format": response_format,
+        }))
         .send()
         .await
         .map_err(|error| format!("Unable to submit Gemini image generation: {error}"))?;
     let json = video_response_json(response, "Gemini image").await?;
+    let mut image_data = Vec::new();
+    video_collect_gemini_image_data(&json, &mut image_data);
+    image_data.sort_by(|left, right| left.0.cmp(&right.0));
+    image_data.dedup_by(|left, right| left.0 == right.0);
     let mut outputs = Vec::new();
-    let parts = json
-        .get("candidates")
-        .and_then(|value| value.as_array())
-        .and_then(|candidates| candidates.first())
-        .and_then(|candidate| candidate.get("content"))
-        .and_then(|content| content.get("parts"))
-        .and_then(|value| value.as_array())
-        .cloned()
-        .unwrap_or_default();
-    for part in parts {
-        let inline = part.get("inlineData").or_else(|| part.get("inline_data"));
-        let Some(inline) = inline else {
-            continue;
-        };
-        let Some(data) = inline.get("data").and_then(|value| value.as_str()) else {
-            continue;
-        };
+    for (data, _mime) in image_data {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(data)
             .map_err(|error| format!("Unable to decode Gemini image: {error}"))?;
@@ -13294,7 +13518,10 @@ fn video_fal_output_urls(result: &serde_json::Value) -> Vec<String> {
     if let Some(url) = video_json_path_string(result, &["image", "url"]) {
         urls.push(url.to_string());
     }
-    for key in ["videos", "images"] {
+    if let Some(url) = video_json_path_string(result, &["audio", "url"]) {
+        urls.push(url.to_string());
+    }
+    for key in ["videos", "images", "audios", "audio"] {
         urls.extend(
             result
                 .get(key)
@@ -13481,6 +13708,15 @@ fn video_fal_concrete_model(request: &VideoGenerateRequest) -> Result<String, St
         }
         return Ok(model);
     }
+    if model == "fal-ai/veo3.1/lite" {
+        if request.mode == "image-to-video" && request.input_asset_paths.len() >= 2 {
+            return Ok("fal-ai/veo3.1/lite/first-last-frame-to-video".to_string());
+        }
+        if request.mode == "image-to-video" && !request.input_asset_paths.is_empty() {
+            return Ok("fal-ai/veo3.1/lite/image-to-video".to_string());
+        }
+        return Ok(model);
+    }
     if model == "bytedance/seedance-2.0/text-to-video" {
         if request.mode == "image-to-video" && !request.input_asset_paths.is_empty() {
             return Ok("bytedance/seedance-2.0/image-to-video".to_string());
@@ -13489,6 +13725,12 @@ fn video_fal_concrete_model(request: &VideoGenerateRequest) -> Result<String, St
             return Ok("bytedance/seedance-2.0/reference-to-video".to_string());
         }
         return Ok(model);
+    }
+    if model == "fal-ai/bytedance/seedance/v1.5/pro/text-to-video"
+        && request.mode == "image-to-video"
+        && !request.input_asset_paths.is_empty()
+    {
+        return Ok("fal-ai/bytedance/seedance/v1.5/pro/image-to-video".to_string());
     }
     if request.mode == "image-to-video" {
         for base in [
@@ -13550,6 +13792,89 @@ fn video_fal_audio_data_uri(
     .0)
 }
 
+fn video_fal_video_data_uri(
+    context: &VideoGenerateJobContext,
+    input_path: &str,
+) -> Result<String, String> {
+    let abs = video_resolve_media_abs(&context.root, &context.media_root, input_path)?;
+    if video_media_kind_for_extension(&abs) != Some("video") {
+        return Err("fal video-to-audio requires a video input asset.".to_string());
+    }
+    Ok(video_asset_data_uri_with_limit(
+        &context.root,
+        &context.media_root,
+        input_path,
+        Some(VIDEO_DIRECT_UPSCALE_VIDEO_LIMIT_BYTES),
+        "Video too large for direct generation",
+        60,
+    )?
+    .0)
+}
+
+fn video_fal_image_size_param(
+    params: Option<&VideoGenerateParams>,
+    prefer_auto_size: bool,
+) -> Option<String> {
+    if let Some(resolution) = video_fal_param_text(params, "resolution") {
+        let normalized = resolution
+            .trim()
+            .to_ascii_lowercase()
+            .replace([' ', '-'], "_");
+        match normalized.as_str() {
+            "auto" | "auto_1k" | "auto_2k" | "auto_3k" | "auto_4k" | "square"
+            | "square_hd" | "landscape_16_9" | "portrait_16_9" | "landscape_4_3"
+            | "portrait_4_3" => return Some(normalized),
+            _ => {}
+        }
+    }
+    if prefer_auto_size {
+        return None;
+    }
+    Some(video_flux_image_size(params.and_then(|params| params.aspect.as_deref())).to_string())
+}
+
+fn video_fal_insert_image_fields(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+    params: Option<&VideoGenerateParams>,
+    model: &str,
+) {
+    let prefer_auto_size = model.contains("/seedream/v5/");
+    if let Some(image_size) = video_fal_image_size_param(params, prefer_auto_size) {
+        body.insert("image_size".to_string(), serde_json::json!(image_size));
+    }
+    if let Some(seed) = params.and_then(|params| params.seed) {
+        body.insert("seed".to_string(), serde_json::json!(seed));
+    }
+    if let Some(enable_safety_checker) =
+        video_fal_param_bool(params, &["enableSafetyChecker", "enable_safety_checker"])
+    {
+        body.insert(
+            "enable_safety_checker".to_string(),
+            serde_json::json!(enable_safety_checker),
+        );
+    }
+    if matches!(
+        model,
+        "fal-ai/flux-2"
+            | "fal-ai/bytedance/seedream/v4/text-to-image"
+            | "fal-ai/bytedance/seedream/v4/edit"
+            | "fal-ai/bytedance/seedream/v4.5/text-to-image"
+            | "fal-ai/bytedance/seedream/v5/lite/text-to-image"
+    ) {
+        if let Some(num_images) = params.and_then(|params| params.num_images) {
+            body.insert(
+                "num_images".to_string(),
+                serde_json::json!(num_images.clamp(1, 8)),
+            );
+        }
+    }
+    if let Some(output_format) =
+        video_fal_param_allowed(params, "outputFormat", &["jpeg", "png", "webp"])
+    {
+        body.insert("output_format".to_string(), serde_json::json!(output_format));
+    }
+}
+
 fn video_fal_build_body(
     context: &VideoGenerateJobContext,
     request: &VideoGenerateRequest,
@@ -13580,6 +13905,41 @@ fn video_fal_build_body(
             body.insert(
                 "image_url".to_string(),
                 serde_json::json!(video_fal_image_data_uri(context, input)?),
+            );
+        }
+        return Ok(body);
+    }
+
+    if model == "mirelo-ai/sfx-v1.5/video-to-audio" {
+        let params = request.params.as_ref();
+        let input = request
+            .input_asset_paths
+            .first()
+            .ok_or_else(|| "fal Mirelo SFX requires a source video asset.".to_string())?;
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "video_url".to_string(),
+            serde_json::json!(video_fal_video_data_uri(context, input)?),
+        );
+        if !request.prompt.trim().is_empty() {
+            body.insert(
+                "text_prompt".to_string(),
+                serde_json::json!(request.prompt.trim()),
+            );
+        }
+        if let Some(num_samples) = params.and_then(|params| params.num_images) {
+            body.insert(
+                "num_samples".to_string(),
+                serde_json::json!(num_samples.clamp(1, 4)),
+            );
+        }
+        if let Some(seed) = params.and_then(|params| params.seed) {
+            body.insert("seed".to_string(), serde_json::json!(seed));
+        }
+        if let Some(duration) = params.and_then(|params| params.duration_sec) {
+            body.insert(
+                "duration".to_string(),
+                serde_json::json!(duration.clamp(1.0, 120.0)),
             );
         }
         return Ok(body);
@@ -13679,6 +14039,66 @@ fn video_fal_build_body(
                 "generate_audio",
             );
         }
+        "fal-ai/veo3.1/lite" => {
+            body.insert(
+                "duration".to_string(),
+                serde_json::json!(format!(
+                    "{}s",
+                    video_fal_duration_nearest(params, &[4, 6, 8], 8)
+                )),
+            );
+            video_fal_insert_common_video_fields(
+                &mut body,
+                params,
+                &["auto", "16:9", "9:16"],
+                &["720p", "1080p"],
+                "generate_audio",
+            );
+        }
+        "fal-ai/veo3.1/lite/image-to-video" => {
+            body.insert(
+                "image_url".to_string(),
+                serde_json::json!(video_fal_input_image_url(context, request, 0, "image-to-video")?),
+            );
+            body.insert(
+                "duration".to_string(),
+                serde_json::json!(format!(
+                    "{}s",
+                    video_fal_duration_nearest(params, &[4, 6, 8], 8)
+                )),
+            );
+            video_fal_insert_common_video_fields(
+                &mut body,
+                params,
+                &["auto", "16:9", "9:16"],
+                &["720p", "1080p"],
+                "generate_audio",
+            );
+        }
+        "fal-ai/veo3.1/lite/first-last-frame-to-video" => {
+            body.insert(
+                "first_frame_url".to_string(),
+                serde_json::json!(video_fal_input_image_url(context, request, 0, "first frame")?),
+            );
+            body.insert(
+                "last_frame_url".to_string(),
+                serde_json::json!(video_fal_input_image_url(context, request, 1, "last frame")?),
+            );
+            body.insert(
+                "duration".to_string(),
+                serde_json::json!(format!(
+                    "{}s",
+                    video_fal_duration_nearest(params, &[4, 6, 8], 8)
+                )),
+            );
+            video_fal_insert_common_video_fields(
+                &mut body,
+                params,
+                &["auto", "16:9", "9:16"],
+                &["720p", "1080p"],
+                "generate_audio",
+            );
+        }
         "bytedance/seedance-2.0/text-to-video" => {
             video_fal_insert_seedance20_fields(&mut body, params);
         }
@@ -13721,6 +14141,45 @@ fn video_fal_build_body(
                 body.insert("audio_urls".to_string(), serde_json::json!(audio_urls));
             }
             video_fal_insert_seedance20_fields(&mut body, params);
+        }
+        "fal-ai/bytedance/seedance/v1.5/pro/text-to-video"
+        | "fal-ai/bytedance/seedance/v1.5/pro/image-to-video" => {
+            if model.ends_with("/image-to-video") {
+                body.insert(
+                    "image_url".to_string(),
+                    serde_json::json!(video_fal_input_image_url(context, request, 0, "image-to-video")?),
+                );
+                if request.input_asset_paths.len() > 1 {
+                    body.insert(
+                        "end_image_url".to_string(),
+                        serde_json::json!(video_fal_input_image_url(context, request, 1, "end frame")?),
+                    );
+                }
+            }
+            body.insert(
+                "duration".to_string(),
+                serde_json::json!(video_fal_duration_clamped(params, 4, 12, 5).to_string()),
+            );
+            video_fal_insert_common_video_fields(
+                &mut body,
+                params,
+                &["auto", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"],
+                &["480p", "720p", "1080p"],
+                "generate_audio",
+            );
+            if let Some(enable_safety_checker) =
+                video_fal_param_bool(params, &["enableSafetyChecker", "enable_safety_checker"])
+            {
+                body.insert(
+                    "enable_safety_checker".to_string(),
+                    serde_json::json!(enable_safety_checker),
+                );
+            }
+            if let Some(camera_fixed) =
+                video_fal_param_bool(params, &["cameraFixed", "camera_fixed"])
+            {
+                body.insert("camera_fixed".to_string(), serde_json::json!(camera_fixed));
+            }
         }
         "fal-ai/kling-video/v3/pro/text-to-video"
         | "fal-ai/kling-video/v3/standard/text-to-video" => {
@@ -13871,6 +14330,53 @@ fn video_fal_build_body(
                 "duration".to_string(),
                 serde_json::json!(video_fal_duration_nearest(params, &[6, 10], 6).to_string()),
             );
+        }
+        "xai/grok-imagine-video/v1.5/image-to-video" => {
+            body.insert(
+                "image_url".to_string(),
+                serde_json::json!(video_fal_input_image_url(context, request, 0, "image-to-video")?),
+            );
+            body.insert(
+                "duration".to_string(),
+                serde_json::json!(video_fal_duration_clamped(params, 1, 15, 6)),
+            );
+            if let Some(resolution) =
+                video_fal_param_allowed(params, "resolution", &["480p", "720p", "1080p"])
+            {
+                body.insert("resolution".to_string(), serde_json::json!(resolution));
+            }
+        }
+        "fal-ai/flux-2"
+        | "fal-ai/bytedance/seedream/v4/text-to-image"
+        | "fal-ai/bytedance/seedream/v4.5/text-to-image"
+        | "fal-ai/bytedance/seedream/v5/lite/text-to-image"
+        | "fal-ai/recraft/v4.1/text-to-image" => {
+            video_fal_insert_image_fields(&mut body, params, model);
+        }
+        "fal-ai/bytedance/seedream/v4/edit" => {
+            let image_urls = request
+                .input_asset_paths
+                .iter()
+                .take(10)
+                .map(|input| video_fal_image_data_uri(context, input))
+                .collect::<Result<Vec<_>, _>>()?;
+            if image_urls.is_empty() {
+                return Err("fal Seedream v4 edit requires at least one input image.".to_string());
+            }
+            body.insert("image_urls".to_string(), serde_json::json!(image_urls));
+            video_fal_insert_image_fields(&mut body, params, model);
+        }
+        "fal-ai/flux-pro/kontext" => {
+            body.insert(
+                "image_url".to_string(),
+                serde_json::json!(video_fal_input_image_url(context, request, 0, "image edit")?),
+            );
+            if let Some(output_format) =
+                video_fal_param_allowed(params, "outputFormat", &["jpeg", "png"])
+            {
+                body.insert("output_format".to_string(), serde_json::json!(output_format));
+            }
+            video_fal_insert_seed(&mut body, params);
         }
         _ => {
             return Err(format!(
@@ -14090,7 +14596,7 @@ async fn video_generate_start(
     }
     let (job_id, cancel) = video_job_registry_insert(&VIDEO_GENERATE_JOBS)?;
     let created_at_ms = video_now_millis();
-    let model = if request.model.trim().is_empty() {
+    let raw_model = if request.model.trim().is_empty() {
         provider
             .models
             .first()
@@ -14099,6 +14605,11 @@ async fn video_generate_start(
             .to_string()
     } else {
         request.model.clone()
+    };
+    let model = if provider.id == "cloud" {
+        video_cloud_model_canonical_id(&raw_model).to_string()
+    } else {
+        raw_model
     };
     video_validate_provider_model(provider, &model)?;
     let kind = video_generate_request_kind(provider, &model, &request);

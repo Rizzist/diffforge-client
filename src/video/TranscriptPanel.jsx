@@ -29,6 +29,10 @@ const HeaderBlock = styled.div`
   padding: 8px 10px;
   border-bottom: 1px solid rgba(148, 163, 184, 0.1);
   flex: 0 0 auto;
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(15, 23, 42, 0.1);
+  }
 `;
 
 const AssetName = styled.div`
@@ -38,6 +42,10 @@ const AssetName = styled.div`
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+  }
 `;
 
 const ActionRow = styled.div`
@@ -64,6 +72,16 @@ const ModeChip = styled.button`
     border-color: rgba(96, 165, 250, 0.5);
     background: rgba(37, 99, 235, 0.18);
     color: #dbeafe;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    border-color: rgba(37, 99, 235, 0.45);
+    background: rgba(37, 99, 235, 0.12);
+    color: #1d4ed8;
   }
 `;
 
@@ -96,6 +114,19 @@ const SegmentRow = styled.div`
   &:hover {
     border-color: rgba(148, 163, 184, 0.3);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.1);
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    border-color: rgba(16, 185, 129, 0.55);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(15, 23, 42, 0.18);
+  }
 `;
 
 const SegmentMeta = styled.div`
@@ -118,6 +149,14 @@ const SegmentIndex = styled.button`
   &:hover {
     color: #a7f3d0;
   }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    color: #047857;
+  }
 `;
 
 const TimeField = styled.input`
@@ -137,6 +176,16 @@ const TimeField = styled.input`
   &:focus {
     border-color: rgba(148, 163, 184, 0.3);
     background: rgba(2, 6, 12, 0.8);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #1d4ed8;
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus {
+    border-color: rgba(15, 23, 42, 0.14);
+    background: #f8fafc;
   }
 `;
 
@@ -162,6 +211,16 @@ const SegmentText = styled.textarea`
   &:focus {
     border-color: rgba(148, 163, 184, 0.3);
     background: rgba(2, 6, 12, 0.8);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus {
+    border-color: rgba(15, 23, 42, 0.14);
+    background: #f8fafc;
   }
 `;
 
@@ -210,6 +269,22 @@ const RowActionButton = styled.button`
     border-color: rgba(248, 113, 113, 0.6);
     color: #fca5a5;
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.16);
+    background: #ffffff;
+    color: #475569;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(16, 185, 129, 0.55);
+    color: #047857;
+  }
+
+  html[data-forge-theme="light"] &[data-danger="true"]:hover {
+    border-color: rgba(220, 38, 38, 0.55);
+    color: #dc2626;
+  }
 `;
 
 const WordFlow = styled.div`
@@ -241,6 +316,19 @@ const WordChip = styled.button`
     color: #fca5a5;
     background: rgba(127, 29, 29, 0.25);
   }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    background: rgba(15, 23, 42, 0.06);
+  }
+
+  html[data-forge-theme="light"] &[data-struck="true"] {
+    color: #dc2626;
+    background: rgba(220, 38, 38, 0.1);
+  }
 `;
 
 const FooterBar = styled.div`
@@ -251,6 +339,10 @@ const FooterBar = styled.div`
   padding: 7px 10px;
   border-top: 1px solid rgba(148, 163, 184, 0.1);
   flex: 0 0 auto;
+
+  html[data-forge-theme="light"] & {
+    border-top-color: rgba(15, 23, 42, 0.1);
+  }
 `;
 
 const EmptyState = styled.div`

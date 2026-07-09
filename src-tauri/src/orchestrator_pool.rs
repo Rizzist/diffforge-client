@@ -243,6 +243,23 @@ fn orchestrator_pool_requested_index(event: &Value) -> Option<u16> {
     .map(|index| index + 1)
 }
 
+fn orchestrator_pool_permission_mode(agent_id: &str) -> Option<String> {
+    match workspace_activation_clean_role(Some(agent_id)).as_str() {
+        "claude" => Some("auto".to_string()),
+        "codex" => Some("full_access".to_string()),
+        "generic" => None,
+        _ => Some("accept_edits".to_string()),
+    }
+}
+
+fn orchestrator_pool_session_mode(agent_id: &str) -> &'static str {
+    if workspace_activation_clean_role(Some(agent_id)) == "generic" {
+        "general"
+    } else {
+        "direct_edit"
+    }
+}
+
 async fn orchestrator_pool_entry_current(app: &AppHandle, entry: &OrchestratorPoolEntry) -> bool {
     let terminal_state = app.state::<TerminalState>();
     let guard = terminal_state.terminals.read().await;
@@ -361,15 +378,11 @@ async fn orchestrator_pool_spawn_entry(
             ],
         ),
         speed: cloud_mcp_remote_command_field_text(event, &["speed", "service_tier", "serviceTier"]),
-        permission_mode: workspace_activation_clean_permission_mode(
-            cloud_mcp_remote_command_field_text(event, &["permission_mode", "permissionMode"])
-                .as_deref(),
-            &agent_id,
-        ),
+        permission_mode: orchestrator_pool_permission_mode(&agent_id),
         plain_shell: Some(plain_shell),
         fresh_session: Some(false),
         preserve_coordination_session: Some(true),
-        session_mode: Some("general".to_string()),
+        session_mode: Some(orchestrator_pool_session_mode(&agent_id).to_string()),
         slot_key: Some((usize::from(index) + 1).to_string()),
         terminal_index: Some(index),
         thread_id: Some(thread_id.clone()),
@@ -796,4 +809,26 @@ pub(crate) fn orchestrator_pool_apply_remote_send_lever(
         }
     });
     true
+}
+
+#[cfg(test)]
+#[test]
+fn orchestrator_pool_agent_spawns_use_auto_direct_edit_authority() {
+    assert_eq!(
+        orchestrator_pool_permission_mode("claude").as_deref(),
+        Some("auto")
+    );
+    assert_eq!(
+        orchestrator_pool_permission_mode("codex").as_deref(),
+        Some("full_access")
+    );
+    assert_eq!(orchestrator_pool_session_mode("claude"), "direct_edit");
+    assert_eq!(orchestrator_pool_session_mode("codex"), "direct_edit");
+}
+
+#[cfg(test)]
+#[test]
+fn orchestrator_pool_plain_shell_keeps_agent_permission_flags_empty() {
+    assert_eq!(orchestrator_pool_permission_mode("generic"), None);
+    assert_eq!(orchestrator_pool_session_mode("generic"), "general");
 }

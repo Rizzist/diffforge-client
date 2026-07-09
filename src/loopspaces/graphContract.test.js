@@ -29,6 +29,12 @@ const stepNode = {
   label: "Read checkpoint",
   props: { parent_id: sendMessageNode.id },
 };
+const dispatchStepNode = {
+  id: "dispatch-step-1",
+  kind: "step",
+  label: "Dispatch checkpoint",
+  props: { parent_id: dispatchTodosNode.id },
+};
 const orphanStepNode = { id: "orphan-step-1", kind: "step", label: "Loose checkpoint" };
 const wrongParentStepNode = {
   id: "wrong-parent-step-1",
@@ -142,13 +148,12 @@ test("graph contract accepts legal flow and document ports", () => {
     }).ok,
     true,
   );
-  assert.equal(
-    validateLoopspaceGraphEdgeCandidate(sendMessageNode, documentWriteNode, {
-      fromPort: "failure",
-      toPort: "in",
-    }).ok,
-    true,
-  );
+  const directDocumentWrite = validateLoopspaceGraphEdgeCandidate(sendMessageNode, documentWriteNode, {
+    fromPort: "failure",
+    toPort: "in",
+  });
+  assert.equal(directDocumentWrite.ok, false);
+  assert.match(directDocumentWrite.error, /Document write nodes/);
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(triggerNode, assetWriteNode, {
       fromPort: "out",
@@ -212,12 +217,13 @@ test("graph contract accepts completed send-message step edges to action nodes",
   );
 });
 
-test("graph contract accepts document context edges for send-message steps only", () => {
+test("graph contract accepts document context edges for internal action steps only", () => {
   const nodeById = new Map([
     [sendMessageNode.id, sendMessageNode],
     [runScriptNode.id, runScriptNode],
     [dispatchTodosNode.id, dispatchTodosNode],
     [stepNode.id, stepNode],
+    [dispatchStepNode.id, dispatchStepNode],
     [orphanStepNode.id, orphanStepNode],
     [wrongParentStepNode.id, wrongParentStepNode],
     [missingParentStepNode.id, missingParentStepNode],
@@ -232,6 +238,22 @@ test("graph contract accepts document context edges for send-message steps only"
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(stepNode, documentWriteNode, {
+      fromPort: "docs",
+      nodeById,
+      toPort: "in",
+    }).ok,
+    true,
+  );
+  assert.equal(
+    validateLoopspaceGraphEdgeCandidate(documentReadNode, dispatchStepNode, {
+      fromPort: "docs",
+      nodeById,
+      toPort: "in",
+    }).ok,
+    true,
+  );
+  assert.equal(
+    validateLoopspaceGraphEdgeCandidate(dispatchStepNode, documentWriteNode, {
       fromPort: "docs",
       nodeById,
       toPort: "in",
@@ -287,12 +309,13 @@ test("graph contract accepts document context edges for send-message steps only"
   );
 });
 
-test("graph contract accepts asset context edges for send-message steps only", () => {
+test("graph contract accepts asset context edges for internal action steps only", () => {
   const nodeById = new Map([
     [sendMessageNode.id, sendMessageNode],
     [runScriptNode.id, runScriptNode],
     [dispatchTodosNode.id, dispatchTodosNode],
     [stepNode.id, stepNode],
+    [dispatchStepNode.id, dispatchStepNode],
     [orphanStepNode.id, orphanStepNode],
     [wrongParentStepNode.id, wrongParentStepNode],
     [missingParentStepNode.id, missingParentStepNode],
@@ -315,6 +338,22 @@ test("graph contract accepts asset context edges for send-message steps only", (
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(assetWriteNode, stepNode, {
+      fromPort: "assets",
+      nodeById,
+      toPort: "in",
+    }).ok,
+    true,
+  );
+  assert.equal(
+    validateLoopspaceGraphEdgeCandidate(assetReadNode, dispatchStepNode, {
+      fromPort: "assets",
+      nodeById,
+      toPort: "in",
+    }).ok,
+    true,
+  );
+  assert.equal(
+    validateLoopspaceGraphEdgeCandidate(dispatchStepNode, assetWriteNode, {
       fromPort: "assets",
       nodeById,
       toPort: "in",
@@ -483,12 +522,52 @@ test("graph ast validation accepts document context edges to internal steps", ()
   assert.equal(validation.ok, true);
 });
 
+test("graph ast validation accepts document context edges to dispatch todo steps", () => {
+  const validation = validateLoopspaceGraphAst({
+    nodes: [dispatchTodosNode, documentReadNode, dispatchStepNode, documentWriteNode],
+    edges: [
+      {
+        id: "edge-read-dispatch-step",
+        from: documentReadNode.id,
+        fromPort: "docs",
+        to: dispatchStepNode.id,
+        toPort: "in",
+      },
+      {
+        id: "edge-dispatch-step-write",
+        from: dispatchStepNode.id,
+        fromPort: "docs",
+        to: documentWriteNode.id,
+        toPort: "in",
+      },
+    ],
+  });
+
+  assert.equal(validation.ok, true);
+});
+
 test("dfblueprint validation accepts document edges to hyphenated internal steps", () => {
   const source = `dfblueprint "Document step graph"
 format diffforge.dfblueprint.v1
 direction right
 node "Send message" [id: send-message-mqruul0w-r330x, kind: send_message, role: action]
 node "List docs" [id: step-mqruul0w-r330x, kind: step, role: checkpoint, parent_id: send-message-mqruul0w-r330x]
+node "Read docs" [id: document-read-mqruul0w-r330x, kind: document_read, role: context]
+node "Write docs" [id: document-write-mqruul0w-r330x, kind: document_write, role: context]
+edge document-read-mqruul0w-r330x.docs -> step-mqruul0w-r330x.in [id: edge-read-step, branch: docs]
+edge step-mqruul0w-r330x.docs -> document-write-mqruul0w-r330x.in [id: edge-step-write, branch: docs]
+`;
+  const validation = validateDfBlueprintSource(source);
+
+  assert.equal(validation.ok, true, validation.errors.join("\n"));
+});
+
+test("dfblueprint validation accepts dispatch todo document edges to internal steps", () => {
+  const source = `dfblueprint "Dispatch document step graph"
+format diffforge.dfblueprint.v1
+direction right
+node "Dispatch todos" [id: dispatch-todos-mqruul0w-r330x, kind: dispatch_todos, role: action]
+node "Step 1" [id: step-mqruul0w-r330x, kind: step, role: checkpoint, parent_id: dispatch-todos-mqruul0w-r330x]
 node "Read docs" [id: document-read-mqruul0w-r330x, kind: document_read, role: context]
 node "Write docs" [id: document-write-mqruul0w-r330x, kind: document_write, role: context]
 edge document-read-mqruul0w-r330x.docs -> step-mqruul0w-r330x.in [id: edge-read-step, branch: docs]
@@ -531,18 +610,30 @@ edge step-mqruul0w-r330x.success -> send-message-follow-up.in [id: edge-step-mes
   assert.equal(validation.ok, true, validation.errors.join("\n"));
 });
 
-test("dfblueprint validation rejects action execution branches to asset write", () => {
-  const source = `dfblueprint "Invalid asset write branch"
+test("dfblueprint validation rejects action execution branches to resource writes", () => {
+  const assetSource = `dfblueprint "Invalid asset write branch"
 format diffforge.dfblueprint.v1
 direction right
 node "Send message" [id: send-message-mqruul0w-r330x, kind: send_message, role: action]
 node "Write assets" [id: asset-write-mqruul0w-r330x, kind: asset_write, role: context]
 edge send-message-mqruul0w-r330x.exec -> asset-write-mqruul0w-r330x.in [id: edge-send-asset-write, branch: exec]
 `;
-  const validation = validateDfBlueprintSource(source);
+  const assetValidation = validateDfBlueprintSource(assetSource);
 
-  assert.equal(validation.ok, false);
-  assert.match(validation.errors.join("\n"), /Asset write nodes/);
+  assert.equal(assetValidation.ok, false);
+  assert.match(assetValidation.errors.join("\n"), /Asset write nodes/);
+
+  const documentSource = `dfblueprint "Invalid document write branch"
+format diffforge.dfblueprint.v1
+direction right
+node "Dispatch todos" [id: dispatch-todos-mqruul0w-r330x, kind: dispatch_todos, role: action]
+node "Write docs" [id: document-write-mqruul0w-r330x, kind: document_write, role: context]
+edge dispatch-todos-mqruul0w-r330x.success -> document-write-mqruul0w-r330x.in [id: edge-dispatch-document-write, branch: success]
+`;
+  const documentValidation = validateDfBlueprintSource(documentSource);
+
+  assert.equal(documentValidation.ok, false);
+  assert.match(documentValidation.errors.join("\n"), /Document write nodes/);
 });
 
 test("graph ast validation accepts asset context edges to internal steps", () => {
@@ -576,7 +667,31 @@ test("graph ast validation accepts asset context edges to internal steps", () =>
   assert.equal(validation.ok, true);
 });
 
-test("graph ast validation rejects document context edges to orphan or non-message steps", () => {
+test("graph ast validation accepts asset context edges to dispatch todo steps", () => {
+  const validation = validateLoopspaceGraphAst({
+    nodes: [dispatchTodosNode, assetReadNode, dispatchStepNode, assetWriteNode],
+    edges: [
+      {
+        id: "edge-asset-read-dispatch-step",
+        from: assetReadNode.id,
+        fromPort: "assets",
+        to: dispatchStepNode.id,
+        toPort: "in",
+      },
+      {
+        id: "edge-dispatch-step-asset-write",
+        from: dispatchStepNode.id,
+        fromPort: "assets",
+        to: assetWriteNode.id,
+        toPort: "in",
+      },
+    ],
+  });
+
+  assert.equal(validation.ok, true);
+});
+
+test("graph ast validation rejects document context edges to orphan or non-action steps", () => {
   const orphanValidation = validateLoopspaceGraphAst({
     nodes: [documentReadNode, orphanStepNode, documentWriteNode],
     edges: [
@@ -597,7 +712,7 @@ test("graph ast validation rejects document context edges to orphan or non-messa
     ],
   });
   assert.equal(orphanValidation.ok, false);
-  assert.match(orphanValidation.errors.join("\n"), /Internal send-message steps/);
+  assert.match(orphanValidation.errors.join("\n"), /Internal action steps/);
 
   const wrongParentValidation = validateLoopspaceGraphAst({
     nodes: [runScriptNode, documentReadNode, wrongParentStepNode, documentWriteNode],
@@ -619,7 +734,7 @@ test("graph ast validation rejects document context edges to orphan or non-messa
     ],
   });
   assert.equal(wrongParentValidation.ok, false);
-  assert.match(wrongParentValidation.errors.join("\n"), /Internal send-message steps/);
+  assert.match(wrongParentValidation.errors.join("\n"), /Internal action steps/);
 
   const missingParentValidation = validateLoopspaceGraphAst({
     nodes: [documentReadNode, missingParentStepNode, documentWriteNode],
@@ -641,7 +756,7 @@ test("graph ast validation rejects document context edges to orphan or non-messa
     ],
   });
   assert.equal(missingParentValidation.ok, false);
-  assert.match(missingParentValidation.errors.join("\n"), /Internal send-message steps/);
+  assert.match(missingParentValidation.errors.join("\n"), /Internal action steps/);
 });
 
 test("graph ast validation reports illegal ports with edge context", () => {
@@ -683,6 +798,54 @@ test("graph patches do not create deprecated device nodes", () => {
   assert.equal(ast.nodes.some((node) => node.id === "send-message-added" && node.kind === "send_message"), true);
 });
 
+test("graph patches create send message nodes with orchestrator metadata", () => {
+  const patched = applyDfBlueprintPatchOperations("", [
+    {
+      op: "add_node",
+      id: "message-agent",
+      kind: "send_message",
+      label: "Research Blog Ideas",
+      device_id: "macbook-air",
+      device_label: "Syed's MacBook Air",
+      prompt: "Research blog ideas",
+      target_agent_id: "codex",
+      model: "gpt-5.5",
+      reasoning_effort: "medium",
+      speed: "fast",
+    },
+    {
+      op: "add_node",
+      id: "step-research",
+      kind: "step",
+      label: "Step 1",
+      parent_id: "message-agent",
+    },
+    {
+      op: "update_node_props",
+      id: "message-agent",
+      target_terminal_id: "pane-1",
+      target_terminal_name: "Codex",
+      message: "Research better ideas",
+    },
+  ]);
+  const ast = parseDfBlueprintSource(patched);
+  const node = ast.nodes.find((item) => item.id === "message-agent");
+  const step = ast.nodes.find((item) => item.id === "step-research");
+
+  assert.equal(node?.kind, "send_message");
+  assert.equal(node?.props?.device_id, "macbook-air");
+  assert.equal(node?.props?.target_device_id, "macbook-air");
+  assert.equal(node?.props?.device_label, "Syed's MacBook Air");
+  assert.equal(node?.props?.prompt, "Research better ideas");
+  assert.equal(node?.props?.target_agent_id, "codex");
+  assert.equal(node?.props?.target_terminal_id, "pane-1");
+  assert.equal(node?.props?.target_terminal_name, "Codex");
+  assert.equal(node?.props?.model, "gpt-5.5");
+  assert.equal(node?.props?.reasoning_effort, "medium");
+  assert.equal(node?.props?.speed, "fast");
+  assert.equal(step?.props?.parent_id, "message-agent");
+});
+
 test("graph patches create dispatch todo nodes with targeting metadata", () => {
   const patched = applyDfBlueprintPatchOperations("", [
     {
@@ -690,6 +853,8 @@ test("graph patches create dispatch todo nodes with targeting metadata", () => {
       id: "dispatch-qa",
       kind: "dispatch_todos",
       label: "Dispatch QA",
+      device_id: "macbook-air",
+      target_terminal_mode: "pinned",
       target_workspace_ids: "workspace-a, workspace-b",
       target_terminal_id: "pane-1",
       todo_lines: "Audit login\nFix regression",
@@ -699,6 +864,10 @@ test("graph patches create dispatch todo nodes with targeting metadata", () => {
   const node = ast.nodes.find((item) => item.id === "dispatch-qa");
 
   assert.equal(node?.kind, "dispatch_todos");
+  assert.equal(node?.props?.device_id, "macbook-air");
+  assert.equal(node?.props?.target_device_id, "macbook-air");
+  assert.equal(node?.props?.display, "region");
+  assert.equal(node?.props?.target_terminal_mode, "pinned");
   assert.equal(node?.props?.target_workspace_ids, "workspace-a, workspace-b");
   assert.equal(node?.props?.target_terminal_id, "pane-1");
   assert.equal(node?.props?.todo_lines, "Audit login\nFix regression");
@@ -725,16 +894,24 @@ test("graph contract owns action node visual gutters", () => {
   assert.equal(loopspaceGraphVisualDefaultsForNode(sendMessageNode).outputGutter, 92);
   assert.equal(loopspaceGraphVisualDefaultsForNode(sendMessageNode).width, 680);
   assert.deepEqual(loopspaceGraphVisualDefaultsForNode(dispatchTodosNode), {
-    height: 178,
-    minHeight: 178,
-    minWidth: 420,
-    outputGutter: 104,
+    height: 260,
+    minHeight: 220,
+    minWidth: 560,
+    outputGutter: 92,
+    region: true,
     sized: true,
-    width: 420,
+    width: 680,
   });
   assert.deepEqual(loopspaceGraphVisualDefaultsForNode(documentReadNode), {
     height: 128,
     minHeight: 128,
+    minWidth: 270,
+    sized: true,
+    width: 270,
+  });
+  assert.deepEqual(loopspaceGraphVisualDefaultsForNode(documentWriteNode), {
+    height: 248,
+    minHeight: 248,
     minWidth: 270,
     sized: true,
     width: 270,
@@ -899,15 +1076,22 @@ test("graph contract accepts completed send-message step edges to notify device 
   assert.equal(validation.ok, true);
 });
 
-test("graph contract rejects notify device execution branches into asset write", () => {
+test("graph contract rejects notify device execution branches into resource writes", () => {
   const notifyDeviceNode = { id: "notify-device-1", kind: "notify_device", label: "Notify device" };
   for (const fromPort of ["exec", "success", "failure", "interrupt"]) {
-    const validation = validateLoopspaceGraphEdgeCandidate(notifyDeviceNode, assetWriteNode, {
+    const assetValidation = validateLoopspaceGraphEdgeCandidate(notifyDeviceNode, assetWriteNode, {
       fromPort,
       toPort: "in",
     });
-    assert.equal(validation.ok, false);
-    assert.match(validation.error, /Asset write nodes/);
+    assert.equal(assetValidation.ok, false);
+    assert.match(assetValidation.error, /Asset write nodes/);
+
+    const documentValidation = validateLoopspaceGraphEdgeCandidate(notifyDeviceNode, documentWriteNode, {
+      fromPort,
+      toPort: "in",
+    });
+    assert.equal(documentValidation.ok, false);
+    assert.match(documentValidation.error, /Document write nodes/);
   }
 });
 

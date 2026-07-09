@@ -96,6 +96,11 @@ import {
   getTerminalSubmitSequence,
 } from "../terminals/WorkspaceTerminal/threadRuntime.js";
 import {
+  REMOTE_PERMISSION_CONFIG_REQUEST_EVENT,
+  REMOTE_PERMISSION_CONFIG_RESULT_EVENT,
+  normalizePermissionModeForProvider,
+} from "../terminals/permissionModeAutomation.js";
+import {
   getProviderTurnCompletionIntent,
   shouldReconcileProviderTurnCompletion,
 } from "../terminals/providerTurnIntent.js";
@@ -152,6 +157,7 @@ import TerminalView, {
   TodoQueuePanel,
   useTerminalGridSeparatorDragGate,
 } from "../terminals/TerminalView.jsx";
+import { buildAccountLiveDeviceRows } from "../terminals/todoQueueDeviceSwitcher.js";
 import { useWorkspaceToolPanelBridge } from "../terminals/workspaceToolPanelBridge.js";
 
 const TODO_STORE_CHANGED_TAURI_EVENT = "todo-store-changed";
@@ -324,14 +330,29 @@ import {
 } from "../loopspaces/graphContract.js";
 import {
   disposeSharedNotificationSfx,
+  readNotificationSfxSettings,
   getSharedNotificationSfx,
   playNotificationSfx,
+  writeNotificationSfxSettings,
 } from "../notifications/notificationSfx";
 import {
   getNativeNotificationPermissionStatus,
+  readNativeNotificationSettings,
   requestNativeNotificationPermission,
   sendNativeNotification,
+  writeNativeNotificationSettings,
 } from "../notifications/nativeNotifications";
+import {
+  LOOPSPACE_NOTIFICATION_OVERRIDE_KEYS,
+  LOOPSPACE_NOTIFICATION_OVERRIDE_OPTIONS,
+  NOTIFICATION_PREFERENCE_PUSH_OPTIONS,
+  loopspaceOverrideSelectValue,
+  loopspaceOverrideValueFromSelect,
+  normalizeNotificationPreferences,
+  notificationPreferencesStatusLabel,
+  setLoopspaceNotificationOverride,
+  setNotificationPreferencePushValue,
+} from "../notifications/notificationPreferences.js";
 import {
   collectWorkspaceNotificationAttentionPanes,
   formatWorkspaceNotificationBadgeCount,
@@ -495,6 +516,7 @@ import {
   RailActionButton,
   RailAssetsIcon,
   RailAudioIcon,
+  RailDevicesIcon,
   RailFilesIcon,
   RailHelpIcon,
   RailHistoryIcon,
@@ -1049,6 +1071,7 @@ import SnippingQuickAccess, {
   SNIPPING_TOAST_HASH,
 } from "../snipping/SnippingQuickAccess.jsx";
 import AccountTokenomicsView, { warmAccountTokenomics } from "../tokenomics/AccountTokenomicsView.jsx";
+import DevicesView from "../devices/DevicesView.jsx";
 
 const BRAND_NAME = "Diff Forge AI";
 const LAUNCH_MINIMUM_MS = 1400;
@@ -1109,8 +1132,17 @@ const WINDOW_RESIZE_EDGES = [
 ];
 const DEFAULT_WORKSPACE_VIEW = "terminals";
 const SETTINGS_TAB_GENERAL = "general";
+const SETTINGS_TAB_NOTIFICATIONS = "notifications";
 const SETTINGS_TAB_PERMISSIONS = "permissions";
 const SETTINGS_TAB_SSH = "ssh";
+const NOTIFICATION_PREFERENCES_CHANGED_EVENT = "forge-notification-preferences-changed";
+const WEB_NOTIFICATION_SETTINGS_URL = "https://diffforge.ai/dashboard?tab=settings&settings=notifications";
+const LOOPSPACE_NOTIFICATION_OVERRIDE_LABELS = {
+  started: "Started",
+  completed: "Completed",
+  failed: "Failed",
+  blocked: "Blocked",
+};
 const SETTINGS_PERMISSION_HIGHLIGHT_MS = 4200;
 const APP_CONTROL_DOCUMENT_SELECTION_SNAPSHOT_TTL_MS = 5 * 60 * 1000;
 const MACOS_NOTIFICATIONS_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.notifications";
@@ -1125,8 +1157,8 @@ const WORKSPACE_TAB_VIEW_BY_ID = {
   history: "architecture",
 };
 const WORKSPACE_TAB_IDS = new Set(Object.keys(WORKSPACE_TAB_VIEW_BY_ID));
-const ACCOUNT_APP_VIEW_IDS = new Set(["tools", "assets", "snipping", "audio", "tokenomics", "settings"]);
-const ACCOUNT_KEEP_ALIVE_VIEW_IDS = new Set(["audio", "tokenomics"]);
+const ACCOUNT_APP_VIEW_IDS = new Set(["tools", "assets", "snipping", "audio", "tokenomics", "devices", "settings"]);
+const ACCOUNT_KEEP_ALIVE_VIEW_IDS = new Set(["audio", "tokenomics", "devices"]);
 const DEVICE_LEVEL_APP_VIEW_IDS = new Set([...ACCOUNT_APP_VIEW_IDS, "architectures", "mcps", "clis", "scripts"]);
 const APP_SCRIPT_LEGACY_WORKSPACE_BUTTON_COLOR = "#1f3f7a";
 const APP_SCRIPT_LEGACY_LOOPSPACE_BUTTON_COLOR = "#4b3512";
@@ -6006,19 +6038,21 @@ function loopspaceGraphFiniteNumber(value, fallback = 0) {
 const LOOPSPACE_GRAPH_MIN_ZOOM = 0.35;
 const LOOPSPACE_GRAPH_MAX_ZOOM = 2.4;
 const LOOPSPACE_GRAPH_ZOOM_STEP = 1.18;
+const LOOPSPACE_GRAPH_TRIGGER_ACCENT = "255, 209, 102";
 const LOOPSPACE_GRAPH_NAV_NODE_ACCENTS = {
   asset_read: "45, 212, 191",
   asset_write: "45, 212, 191",
-  cron: "96, 165, 250",
+  cron: LOOPSPACE_GRAPH_TRIGGER_ACCENT,
   device: "255, 209, 102",
   dispatch_todos: "56, 189, 248",
   document_read: "96, 165, 250",
   document_write: "96, 165, 250",
-  manual: "251, 191, 36",
+  manual: LOOPSPACE_GRAPH_TRIGGER_ACCENT,
   notify_device: "251, 146, 60",
   run_script: "251, 191, 36",
   send_message: "125, 176, 255",
-  webhook: "45, 212, 191",
+  trigger: LOOPSPACE_GRAPH_TRIGGER_ACCENT,
+  webhook: LOOPSPACE_GRAPH_TRIGGER_ACCENT,
 };
 const LOOPSPACE_GRAPH_NODE_WIDTH = 220;
 const LOOPSPACE_GRAPH_NODE_HEIGHT = 66;
@@ -6424,6 +6458,11 @@ function getLoopspaceSendMessageAgentLabel(agentId) {
     || normalizedAgentId;
 }
 
+function normalizeLoopspaceDispatchTerminalAgentId(value) {
+  const agentId = normalizeAgentLaunchAgentId(value);
+  return LOOPSPACE_SEND_MESSAGE_AGENT_IDS.has(agentId) ? agentId : "";
+}
+
 function normalizeLoopspaceSendMessageLaunchSettings(value = {}, agentLaunchDefaults = null) {
   const targetAgentId = normalizeLoopspaceSendMessageAgentId(
     value.target_agent_id
@@ -6514,6 +6553,210 @@ function loopspaceDispatchTodosLinesFromText(value = "") {
     .filter(Boolean);
 }
 
+function loopspaceDispatchNormalizeId(value) {
+  return safeCloudMcpText(String(value || ""), "").toLowerCase();
+}
+
+function loopspaceDispatchDeviceRowMatches(deviceRow, selectedDeviceId = "") {
+  const selectedId = loopspaceDispatchNormalizeId(selectedDeviceId);
+  if (!selectedId || !deviceRow) return false;
+  const aliases = uniqueCloudDeviceAliases(
+    deviceRow.deviceAliases,
+    deviceRow.device_aliases,
+    deviceRow.aliases,
+    deviceRow.deviceId,
+    deviceRow.device_id,
+    deviceRow.id,
+  );
+  return aliases.includes(selectedId);
+}
+
+function loopspaceDispatchSelectedDeviceRow(deviceRows = [], selectedDeviceId = "") {
+  return safeCloudMcpArray(deviceRows)
+    .find((deviceRow) => loopspaceDispatchDeviceRowMatches(deviceRow, selectedDeviceId)) || null;
+}
+
+function loopspaceDispatchTargetIsLocalDevice(selectedDeviceId = "", localDesktopProfile = null, deviceRows = []) {
+  const selectedId = loopspaceDispatchNormalizeId(selectedDeviceId);
+  if (!selectedId) return true;
+  const selectedDevice = loopspaceDispatchSelectedDeviceRow(deviceRows, selectedId);
+  if (selectedDevice?.isLocal) return true;
+  const localAliases = cloudDeviceAliasList(localDesktopProfile, localDesktopProfile?.deviceId || localDesktopProfile?.device_id);
+  return cloudDeviceAliasesIntersect(localAliases, [selectedId]);
+}
+
+function loopspaceDispatchWorkspaceStatusLabel(workspace = {}) {
+  const rawStatus = normalizeCloudDeviceText(
+    workspace.status
+      || workspace.workspaceStatus
+      || workspace.workspace_status
+      || workspace.state
+      || "",
+  );
+  if (workspace.workspaceActive === true || workspace.active === true || rawStatus === "active") return "active";
+  if (["idle", "inactive", "closed", "offline", "stopped"].includes(rawStatus)) return "inactive";
+  return rawStatus || "known";
+}
+
+function loopspaceDispatchWorkspaceOptionLabel(workspace = {}, includeStatus = false) {
+  const id = String(workspace.id || workspace.workspaceId || workspace.workspace_id || "").trim();
+  const name = String(workspace.name || workspace.workspaceName || workspace.workspace_name || id).trim() || id;
+  if (!includeStatus) return name;
+  return `${name} · ${loopspaceDispatchWorkspaceStatusLabel(workspace)}`;
+}
+
+function buildLoopspaceDispatchWorkspaceOptions({
+  includeStatus = false,
+  selectedWorkspaceIds = [],
+  workspaceRows = [],
+} = {}) {
+  const seen = new Set();
+  const options = [];
+  safeCloudMcpArray(workspaceRows).forEach((workspace) => {
+    const id = String(workspace?.id || workspace?.workspaceId || workspace?.workspace_id || "").trim();
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    options.push({
+      value: id,
+      label: loopspaceDispatchWorkspaceOptionLabel(workspace, includeStatus),
+      status: loopspaceDispatchWorkspaceStatusLabel(workspace),
+      terminals: safeCloudMcpArray(workspace?.terminals),
+      workspace,
+    });
+  });
+  safeCloudMcpArray(selectedWorkspaceIds).forEach((idValue) => {
+    const id = String(idValue || "").trim();
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    options.push({ value: id, label: id, status: "unknown", terminals: [] });
+  });
+  return options.sort((left, right) => (
+    String(left.label || left.value).localeCompare(String(right.label || right.value), undefined, { sensitivity: "base" })
+  ));
+}
+
+function loopspaceDispatchTerminalIndexFromRecord(terminal = {}) {
+  const index = Number(
+    terminal.terminalIndex
+      ?? terminal.terminal_index
+      ?? terminal.targetTerminalIndex
+      ?? terminal.target_terminal_index
+      ?? terminal.index
+      ?? terminal.logicalIndex
+      ?? terminal.logical_index
+      ?? terminal.panelIndex
+      ?? terminal.panel_index,
+  );
+  return Number.isInteger(index) && index >= 0 ? index : null;
+}
+
+function loopspaceDispatchTerminalIdFromRecord(terminal = {}) {
+  return String(
+    terminal.paneId
+      || terminal.pane_id
+      || terminal.terminalId
+      || terminal.terminal_id
+      || terminal.targetTerminalId
+      || terminal.target_terminal_id
+      || terminal.panelId
+      || terminal.panel_id
+      || terminal.id
+      || "",
+  ).trim();
+}
+
+function loopspaceDispatchTerminalProviderSessionIdFromRecord(terminal = {}) {
+  return String(
+    terminal.providerSessionId
+      || terminal.provider_session_id
+      || terminal.nativeSessionId
+      || terminal.native_session_id
+      || terminal.sessionId
+      || terminal.session_id
+      || "",
+  ).trim();
+}
+
+function loopspaceDispatchTerminalNameFromRecord(terminal = {}, terminalIndex = null) {
+  return String(
+    terminal.terminalNickname
+      || terminal.terminal_nickname
+      || terminal.terminalName
+      || terminal.terminal_name
+      || terminal.displayName
+      || terminal.display_name
+      || terminal.name
+      || terminal.agentDisplayName
+      || terminal.agent_display_name
+      || "",
+  ).trim() || (Number.isInteger(terminalIndex) ? `Terminal ${terminalIndex + 1}` : "Terminal");
+}
+
+function loopspaceDispatchTerminalHarnessFromRecord(terminal = {}) {
+  return String(
+    terminal.agentLabel
+      || terminal.agent_label
+      || terminal.agentType
+      || terminal.agent_type
+      || terminal.agentKind
+      || terminal.agent_kind
+      || terminal.harness
+      || terminal.provider
+      || terminal.role
+      || "",
+  ).trim();
+}
+
+function loopspaceDispatchTerminalAgentIdFromRecord(terminal = {}) {
+  return normalizeLoopspaceDispatchTerminalAgentId(
+    terminal.targetAgentId
+      || terminal.target_agent_id
+      || terminal.agentId
+      || terminal.agent_id
+      || terminal.agentKind
+      || terminal.agent_kind
+      || terminal.agentType
+      || terminal.agent_type
+      || terminal.role
+      || "",
+  );
+}
+
+function loopspaceDispatchTerminalConnectedFromRecord(terminal = {}) {
+  if (terminal.connected === false || terminal.active === false || terminal.online === false) return false;
+  const status = normalizeCloudDeviceText(
+    terminal.activityStatus
+      || terminal.activity_status
+      || terminal.lifecycleStatus
+      || terminal.lifecycle_status
+      || terminal.presenceStatus
+      || terminal.presence_status
+      || terminal.status
+      || terminal.state
+      || "",
+  );
+  if (["closed", "exited", "offline", "disconnected", "stopped", "inactive"].includes(status)) {
+    return false;
+  }
+  return true;
+}
+
+function loopspaceDispatchWorkspaceRowsFromAccountDevice(deviceRow = null) {
+  return safeCloudMcpArray(deviceRow?.workspaces)
+    .map((workspace) => {
+      const id = String(workspace?.id || workspace?.workspaceId || workspace?.workspace_id || "").trim();
+      if (!id) return null;
+      return {
+        ...workspace,
+        id,
+        workspaceId: id,
+        workspaceName: String(workspace?.name || workspace?.workspaceName || workspace?.workspace_name || id).trim() || id,
+        terminals: safeCloudMcpArray(workspace?.terminals),
+      };
+    })
+    .filter(Boolean);
+}
+
 // Build the rich terminal picker options (color · name · harness · index) for a
 // dispatch-todos node, scoped to the currently-targeted workspace ids. Falls back
 // to every known workspace's terminals when no target is set yet so the picker is
@@ -6534,46 +6777,35 @@ function buildLoopspaceDispatchTerminalOptions(workspaceTerminalsWorkspaces = []
     const workspaceName = String(row?.workspaceName || row?.name || row?.workspace_name || workspaceId).trim();
     const terminals = Array.isArray(row?.terminals) ? row.terminals : [];
     terminals.forEach((terminal) => {
-      const terminalIndex = Number(terminal?.terminalIndex ?? terminal?.terminal_index);
-      if (!Number.isInteger(terminalIndex)) return;
-      const value = `${workspaceId}::${terminalIndex}`;
+      const terminalIndex = loopspaceDispatchTerminalIndexFromRecord(terminal);
+      const terminalId = loopspaceDispatchTerminalIdFromRecord(terminal);
+      const providerSessionId = loopspaceDispatchTerminalProviderSessionIdFromRecord(terminal);
+      if (!terminalId && !providerSessionId && !Number.isInteger(terminalIndex)) return;
+      const value = `${workspaceId}::${terminalId || providerSessionId || terminalIndex}`;
       if (seen.has(value)) return;
       seen.add(value);
-      const name = String(
-        terminal?.terminalNickname
-          || terminal?.terminalName
-          || terminal?.displayName
-          || terminal?.agentDisplayName
-          || "",
-      ).trim() || `Terminal ${terminalIndex + 1}`;
-      const harness = String(terminal?.agentLabel || terminal?.agent_label || terminal?.agentType || "").trim();
-      const providerSessionId = String(
-        terminal?.providerSessionId
-          || terminal?.provider_session_id
-          || terminal?.nativeSessionId
-          || terminal?.native_session_id
-          || terminal?.sessionId
-          || terminal?.session_id
-          || "",
-      ).trim();
       options.push({
         value,
         workspaceId,
         workspaceName,
         terminalIndex,
-        name,
-        harness,
-        color: String(terminal?.color || "").trim(),
-        paneId: String(terminal?.paneId || terminal?.pane_id || "").trim(),
+        name: loopspaceDispatchTerminalNameFromRecord(terminal, terminalIndex),
+        harness: loopspaceDispatchTerminalHarnessFromRecord(terminal),
+        agentId: loopspaceDispatchTerminalAgentIdFromRecord(terminal),
+        color: String(terminal?.color || terminal?.terminalColor || terminal?.terminal_color || "").trim(),
+        paneId: terminalId,
         providerSessionId,
-        connected: terminal?.connected === false ? false : true,
+        terminalId,
+        connected: loopspaceDispatchTerminalConnectedFromRecord(terminal),
         multiWorkspace,
       });
     });
   });
   return options.sort((left, right) => (
     left.workspaceName.localeCompare(right.workspaceName, undefined, { sensitivity: "base" })
-      || left.terminalIndex - right.terminalIndex
+      || (Number.isInteger(left.terminalIndex) ? left.terminalIndex : Number.MAX_SAFE_INTEGER)
+        - (Number.isInteger(right.terminalIndex) ? right.terminalIndex : Number.MAX_SAFE_INTEGER)
+      || left.name.localeCompare(right.name, undefined, { sensitivity: "base" })
   ));
 }
 
@@ -6612,6 +6844,9 @@ function loopspaceNotifyDeviceDraftFromNode(node) {
 
 function normalizeLoopspaceDispatchTodosDraft(value = {}, agentLaunchDefaults = null) {
   const input = value && typeof value === "object" ? value : { todo_lines: String(value || "") };
+  const rawTargetTerminalMode = String(input.target_terminal_mode || input.targetTerminalMode || input.terminal_mode || input.terminalMode || "")
+    .trim()
+    .toLowerCase();
   return {
     ...normalizeLoopspaceSendMessageLaunchSettings(input, agentLaunchDefaults),
     device_id: String(input.device_id || input.deviceId || input.target_device_id || input.targetDeviceId || "").trim(),
@@ -6620,6 +6855,9 @@ function normalizeLoopspaceDispatchTodosDraft(value = {}, agentLaunchDefaults = 
     enable_wait_ms: String(input.enable_wait_ms || input.enableWaitMs || "30000").trim() || "30000",
     target_terminal_id: String(input.target_terminal_id || input.targetTerminalId || input.terminal_id || input.terminalId || input.pane_id || input.paneId || "").trim(),
     target_terminal_index: String(input.target_terminal_index || input.targetTerminalIndex || input.terminal_index || input.terminalIndex || "").trim(),
+    target_terminal_mode: rawTargetTerminalMode === "pinned" || rawTargetTerminalMode === "specific"
+      ? "pinned"
+      : "auto",
     target_terminal_name: String(input.target_terminal_name || input.targetTerminalName || input.terminal_name || input.terminalName || "").trim(),
     target_thread_id: String(input.target_thread_id || input.targetThreadId || input.thread_id || input.threadId || "").trim(),
     target_workspace_ids: String(input.target_workspace_ids || input.targetWorkspaceIds || input.workspace_ids || input.workspaceIds || input.workspace_id || input.workspaceId || "").trim(),
@@ -6653,6 +6891,7 @@ function loopspaceDispatchTodosDraftFromNode(node, agentLaunchDefaults = null, l
     ]),
     target_terminal_id: loopspaceGraphPropValue(props, ["target_terminal_id", "targetTerminalId", "terminal_id", "terminalId", "pane_id", "paneId"]),
     target_terminal_index: loopspaceGraphPropValue(props, ["target_terminal_index", "targetTerminalIndex", "terminal_index", "terminalIndex"]),
+    target_terminal_mode: loopspaceGraphPropValue(props, ["target_terminal_mode", "targetTerminalMode", "terminal_mode", "terminalMode"]),
     target_terminal_name: loopspaceGraphPropValue(props, ["target_terminal_name", "targetTerminalName", "terminal_name", "terminalName"]),
     target_thread_id: loopspaceGraphPropValue(props, ["target_thread_id", "targetThreadId", "thread_id", "threadId"]),
     target_workspace_ids: loopspaceGraphPropValue(props, [
@@ -6685,6 +6924,13 @@ function loopspaceDispatchTodosBatchId(loopspaceId = "", node = null, draft = nu
   ).trim();
   if (explicit) return explicit;
   return `loopspace-${loopspaceDispatchTodosSafeIdPart(loopspaceId, "loop")}-${loopspaceDispatchTodosSafeIdPart(node?.id, "node")}`;
+}
+
+function loopspaceDispatchTodosRunId(loopspaceId = "", node = null) {
+  const uuid = (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function")
+    ? crypto.randomUUID()
+    : `${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}`;
+  return `loopspace-dispatch-${loopspaceDispatchTodosSafeIdPart(loopspaceId, "loop")}-${loopspaceDispatchTodosSafeIdPart(node?.id, "node")}-${uuid}`;
 }
 
 function loopspaceWorkspaceTodoArraysFromSnapshot(value, depth = 0, rows = []) {
@@ -6943,6 +7189,212 @@ function loopspaceGraphCheckpointPlanForSendMessage(source = "", nodeId = "") {
       }));
   } catch {
     return [];
+  }
+}
+
+function loopspaceGraphNodeKindForId(source = "", nodeId = "") {
+  const safeNodeId = String(nodeId || "").trim();
+  if (!safeNodeId || !String(source || "").trim()) {
+    return "";
+  }
+  try {
+    const ast = parseDfBlueprintSource(String(source || ""));
+    const node = (Array.isArray(ast.nodes) ? ast.nodes : [])
+      .find((item) => String(item?.id || "").trim() === safeNodeId);
+    return String(node?.nodeKind || node?.node_kind || node?.kind || "").trim().toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function loopspaceGraphSubloopNodeSummary(node = null, index = 0) {
+  if (!node) return null;
+  const id = String(node.id || "").trim();
+  const kind = String(node.nodeKind || node.node_kind || node.kind || "").trim();
+  const props = node.props && typeof node.props === "object" ? node.props : {};
+  const parentId = loopspaceGraphNodeParentId(node);
+  const summary = {
+    id,
+    index,
+    kind,
+    label: String(node.label || "").trim(),
+    ...(parentId ? { parent_id: parentId, parentId } : {}),
+  };
+  if (loopspaceGraphNodeIsMessageStep(node)) {
+    summary.title = loopspaceGraphStepTitle(node, index);
+    summary.description = loopspaceGraphStepDescription(node);
+    summary.order = loopspaceGraphStepOrder(node, index + 1) || index + 1;
+  }
+  if (kind === "dispatch_todos") {
+    [
+      "device_id",
+      "device_label",
+      "dispatch_mode",
+      "enable_wait_ms",
+      "model",
+      "reasoning_effort",
+      "speed",
+      "target_agent_id",
+      "target_device_id",
+      "target_device_label",
+      "target_terminal_id",
+      "target_terminal_index",
+      "target_terminal_mode",
+      "target_terminal_name",
+      "target_thread_id",
+      "target_workspace_ids",
+      "todo_batch_id",
+      "todo_lines",
+    ].forEach((key) => {
+      const value = props[key];
+      if (value !== undefined && value !== null && String(value).trim()) {
+        summary[key] = value;
+      }
+    });
+  }
+  if (kind === "send_message") {
+    [
+      "device_id",
+      "device_label",
+      "model",
+      "prompt",
+      "reasoning_effort",
+      "speed",
+      "target_agent_id",
+      "target_device_id",
+      "target_device_label",
+      "target_terminal_id",
+      "target_terminal_name",
+    ].forEach((key) => {
+      const value = props[key];
+      if (value !== undefined && value !== null && String(value).trim()) {
+        summary[key] = value;
+      }
+    });
+  }
+  if (kind === "document_read" || kind === "document_write") {
+    summary.resource = loopspaceGraphResourcePlanEntryFromNode(node, "document");
+  }
+  if (kind === "asset_read" || kind === "asset_write") {
+    summary.resource = loopspaceGraphResourcePlanEntryFromNode(node, "asset");
+  }
+  return summary;
+}
+
+function loopspaceGraphSubloopEdgeSummary(edge = null) {
+  if (!edge) return null;
+  return {
+    branch: String(edge.branch || edge.label || "").trim(),
+    from: String(edge.from || "").trim(),
+    fromPort: String(edge.fromPort || edge.from_port || "").trim(),
+    from_port: String(edge.fromPort || edge.from_port || "").trim(),
+    id: String(edge.id || "").trim(),
+    to: String(edge.to || "").trim(),
+    toPort: String(edge.toPort || edge.to_port || "").trim(),
+    to_port: String(edge.toPort || edge.to_port || "").trim(),
+  };
+}
+
+function loopspaceGraphCheckpointPlanWithStatus(checkpointPlan = [], progressMap = new Map()) {
+  return (Array.isArray(checkpointPlan) ? checkpointPlan : [])
+    .map((checkpoint, index) => {
+      const oneBasedIndex = checkpoint.index || index + 1;
+      const status = loopspaceCheckpointStatusForNode(
+        { id: checkpoint.id },
+        oneBasedIndex,
+        progressMap,
+      );
+      const progress = loopspaceCheckpointProgressForNode(
+        { id: checkpoint.id },
+        oneBasedIndex,
+        progressMap,
+      );
+      return {
+        ...checkpoint,
+        index: oneBasedIndex,
+        ...(progress ? { progress, checkpointProgress: progress, checkpoint_progress: progress } : {}),
+        status,
+      };
+    });
+}
+
+function loopspaceGraphFirstOpenCheckpoint(checkpointPlan = []) {
+  return (Array.isArray(checkpointPlan) ? checkpointPlan : [])
+    .find((checkpoint) => !["completed", "skipped"].includes(
+      normalizeLoopspaceCheckpointProgressStatus(checkpoint?.status),
+    )) || null;
+}
+
+function loopspaceGraphRunSubloopContext(source = "", nodeId = "", options = {}) {
+  const safeNodeId = String(nodeId || "").trim();
+  if (!safeNodeId || !String(source || "").trim()) {
+    return null;
+  }
+  try {
+    const ast = parseDfBlueprintSource(String(source || ""));
+    const nodes = Array.isArray(ast.nodes) ? ast.nodes : [];
+    const edges = Array.isArray(ast.edges) ? ast.edges : [];
+    const nodeById = new Map(nodes
+      .map((node) => [String(node?.id || "").trim(), node])
+      .filter(([id]) => id));
+    if (!nodeById.has(safeNodeId)) return null;
+    const adjacency = new Map();
+    const connect = (left, right) => {
+      const from = String(left || "").trim();
+      const to = String(right || "").trim();
+      if (!from || !to) return;
+      if (!adjacency.has(from)) adjacency.set(from, new Set());
+      if (!adjacency.has(to)) adjacency.set(to, new Set());
+      adjacency.get(from).add(to);
+      adjacency.get(to).add(from);
+    };
+    nodes.forEach((node) => {
+      const id = String(node?.id || "").trim();
+      if (id && !adjacency.has(id)) adjacency.set(id, new Set());
+      const parentId = loopspaceGraphNodeParentId(node);
+      if (id && parentId) connect(id, parentId);
+    });
+    edges.forEach((edge) => connect(edge?.from, edge?.to));
+    const selectedIds = new Set();
+    const queue = [safeNodeId];
+    while (queue.length) {
+      const current = queue.shift();
+      if (!current || selectedIds.has(current)) continue;
+      selectedIds.add(current);
+      for (const next of adjacency.get(current) || []) {
+        if (!selectedIds.has(next)) queue.push(next);
+      }
+    }
+    const selectedNodes = nodes
+      .filter((node) => selectedIds.has(String(node?.id || "").trim()))
+      .map(loopspaceGraphSubloopNodeSummary)
+      .filter(Boolean);
+    const selectedEdges = edges
+      .filter((edge) => selectedIds.has(String(edge?.from || "").trim()) && selectedIds.has(String(edge?.to || "").trim()))
+      .map(loopspaceGraphSubloopEdgeSummary)
+      .filter(Boolean);
+    const parentNode = nodeById.get(safeNodeId);
+    const checkpointPlan = Array.isArray(options.checkpointPlan) && options.checkpointPlan.length
+      ? options.checkpointPlan
+      : loopspaceGraphCheckpointPlanForSendMessage(source, safeNodeId);
+    const currentCheckpoint = loopspaceGraphFirstOpenCheckpoint(checkpointPlan);
+    const parentSummary = loopspaceGraphSubloopNodeSummary(parentNode, 0);
+    return {
+      checkpointPlan,
+      checkpoint_plan: checkpointPlan,
+      current: currentCheckpoint || parentSummary,
+      currentCheckpoint,
+      current_checkpoint: currentCheckpoint,
+      edges: selectedEdges,
+      nodeCount: selectedNodes.length,
+      node_count: selectedNodes.length,
+      nodes: selectedNodes,
+      parentNode: parentSummary,
+      parent_node: parentSummary,
+      source: "connected_subloop",
+    };
+  } catch {
+    return null;
   }
 }
 
@@ -7505,11 +7957,11 @@ function loopspaceGraphSourceWithoutTrigger(source, triggerId) {
 }
 
 function loopspaceGraphNodeLayout(node, index = 0) {
-  const isSendMessage = node?.nodeKind === "send_message";
   const isDocumentContext = node?.nodeKind === "document_read" || node?.nodeKind === "document_write";
   const isAssetContext = node?.nodeKind === "asset_read" || node?.nodeKind === "asset_write";
   const isResourceContext = isDocumentContext || isAssetContext;
   const visualDefaults = contractLoopspaceGraphVisualDefaultsForNode(node);
+  const isActionRegion = Boolean(visualDefaults.region);
   const defaultHeight = visualDefaults.height || LOOPSPACE_GRAPH_NODE_HEIGHT;
   const defaultWidth = visualDefaults.width || LOOPSPACE_GRAPH_NODE_WIDTH;
   const minHeight = visualDefaults.minHeight || defaultHeight;
@@ -7522,7 +7974,7 @@ function loopspaceGraphNodeLayout(node, index = 0) {
   const resourceHeight = isResourceContext
     ? loopspaceGraphFiniteNumber(loopspaceGraphPropValue(node?.props || {}, ["h", "height"]), 0)
     : 0;
-  const nodeHeight = isSendMessage
+  const nodeHeight = isActionRegion
     ? Math.max(
         minHeight,
         loopspaceGraphFiniteNumber(loopspaceGraphPropValue(node.props, ["h", "height"]), defaultHeight),
@@ -7544,7 +7996,7 @@ function loopspaceGraphNodeLayout(node, index = 0) {
           ),
         )
       : LOOPSPACE_GRAPH_NODE_HEIGHT;
-  const nodeWidth = isSendMessage
+  const nodeWidth = isActionRegion
     ? Math.max(
         minWidth,
         loopspaceGraphFiniteNumber(loopspaceGraphPropValue(node.props, ["w", "width"]), defaultWidth),
@@ -7569,7 +8021,7 @@ function loopspaceGraphNodeLayout(node, index = 0) {
 }
 
 function loopspaceGraphNodePositionedForDrop(node, pointerPosition) {
-  if (!node || !pointerPosition || node.nodeKind !== "send_message") return node;
+  if (!node || !pointerPosition || !loopspaceGraphNodeIsActionRegion(node)) return node;
   const layout = loopspaceGraphNodeLayout(node, 0);
   return {
     ...node,
@@ -7916,6 +8368,11 @@ function loopspaceGraphNodeIsResourceContextNode(node) {
     || node?.nodeKind === "document_write"
     || node?.nodeKind === "asset_read"
     || node?.nodeKind === "asset_write";
+}
+
+function loopspaceGraphNodeIsActionRegion(node) {
+  if (!node) return false;
+  return Boolean(contractLoopspaceGraphVisualDefaultsForNode(node).region);
 }
 
 function loopspaceGraphEdgeNeedsForegroundLayer(edge, nodeLookup) {
@@ -8385,6 +8842,8 @@ function LoopspaceDocumentContextPicker({
 
   return (
     <LoopspaceGraphDocumentPicker
+      data-has-results={filteredOptions.length ? "true" : undefined}
+      data-has-selected={selectedRefs.length ? "true" : undefined}
       data-mode={mode}
       onClick={stopEvent}
       onPointerDown={stopEvent}
@@ -8650,6 +9109,8 @@ function LoopspaceAssetContextPicker({
 
   return (
     <LoopspaceGraphDocumentPicker
+      data-has-results={filteredOptions.length ? "true" : undefined}
+      data-has-selected={selectedRefs.length ? "true" : undefined}
       data-mode={mode}
       data-resource="asset"
       onClick={stopEvent}
@@ -8804,6 +9265,7 @@ function LoopspaceRuntimeView({
   agentLaunchDefaults = null,
   error,
   assetLibrary = null,
+  deviceLiveState = null,
   knownDevices = [],
   localDesktopProfile = null,
   localScripts = [],
@@ -9467,14 +9929,22 @@ function LoopspaceRuntimeView({
     loopspaceGraphAssetOptionsFromLibrary(assetLibrary || {})
   ), [assetLibrary]);
 
+  const loopspaceGraphAccountDeviceRows = useMemo(() => buildAccountLiveDeviceRows({
+    deviceLiveState,
+    knownDevices,
+    localProfile: localDesktopProfile,
+    maxRows: "all",
+  }), [deviceLiveState, knownDevices, localDesktopProfile]);
+
   const loopspaceGraphLiveDeviceRows = useMemo(() => (
     loopspaceGraphDeviceRowsFromSources([
       { options: { registered: true }, rows: registeredDevices },
       { options: { registered: true }, rows: loopspace?.registered_devices },
+      { rows: loopspaceGraphAccountDeviceRows },
       { rows: knownDevices },
       { rows: localDesktopProfile ? [{ ...localDesktopProfile, connected: true, native_connected: true }] : [] },
     ])
-  ), [knownDevices, localDesktopProfile, loopspace?.registered_devices, registeredDevices]);
+  ), [knownDevices, localDesktopProfile, loopspace?.registered_devices, loopspaceGraphAccountDeviceRows, registeredDevices]);
 
   const loopspaceGraphDeviceOptions = useMemo(() => {
     const seen = new Set();
@@ -9606,7 +10076,7 @@ function LoopspaceRuntimeView({
           y: dragPosition.y,
         } : {}),
       };
-      if (node.nodeKind === "send_message") {
+      if (loopspaceGraphNodeIsActionRegion(node)) {
         const priorityChild = sendMessageCheckpointLayoutPriorityId
           ? parsedGraph.nodes.find((item) => item.id === sendMessageCheckpointLayoutPriorityId)
           : null;
@@ -9625,7 +10095,7 @@ function LoopspaceRuntimeView({
       map.set(loopspaceGraphNodeIdFromLabel(node.label), layout);
     });
     visibleGraphNodes.forEach((node) => {
-      if (node.nodeKind !== "send_message") return;
+      if (!loopspaceGraphNodeIsActionRegion(node)) return;
       const parentLayout = map.get(node.id);
       if (!parentLayout) return;
       const children = parsedGraph.nodes
@@ -9858,7 +10328,7 @@ function LoopspaceRuntimeView({
   const findSendMessageParentForPosition = useCallback((position = null) => {
     if (!position) return null;
     for (const node of visibleGraphNodes) {
-      if (node.nodeKind !== "send_message") continue;
+      if (!loopspaceGraphNodeIsActionRegion(node)) continue;
       const layout = graphNodeLayouts.get(node.id);
       if (!layout) continue;
       if (
@@ -9879,7 +10349,13 @@ function LoopspaceRuntimeView({
     const sendMessageDefaults = template.id === "send_message"
       ? normalizeLoopspaceSendMessageDraft(template, loopspaceAgentLaunchDefaultsRef.current)
       : null;
+    const dispatchTodosDefaults = template.id === "dispatch_todos"
+      ? normalizeLoopspaceDispatchTodosDraft(template, loopspaceAgentLaunchDefaultsRef.current)
+      : null;
     const sendMessageTemplateDevice = template.id === "send_message" && template.device_id
+      ? loopspaceGraphDeviceOptions.find((option) => loopspaceGraphDeviceOptionMatches(option, template.device_id))
+      : null;
+    const dispatchTodosTemplateDevice = template.id === "dispatch_todos" && template.device_id
       ? loopspaceGraphDeviceOptions.find((option) => loopspaceGraphDeviceOptionMatches(option, template.device_id))
       : null;
     const templateWithDefaults = template.id === "send_message"
@@ -9892,7 +10368,20 @@ function LoopspaceRuntimeView({
           speed: template.speed || sendMessageDefaults?.speed || "",
           target_agent_id: sendMessageDefaults?.target_agent_id || "codex",
         }
-      : template;
+      : template.id === "dispatch_todos"
+        ? {
+            ...template,
+            device_id: dispatchTodosTemplateDevice?.id || template.device_id || "",
+            device_label: dispatchTodosTemplateDevice?.label || template.device_label || "",
+            dispatch_mode: dispatchTodosDefaults?.dispatch_mode || "queued",
+            enable_wait_ms: dispatchTodosDefaults?.enable_wait_ms || "30000",
+            model: template.model || dispatchTodosDefaults?.model || "",
+            reasoning_effort: template.reasoning_effort || template.effort || dispatchTodosDefaults?.reasoning_effort || "",
+            speed: template.speed || dispatchTodosDefaults?.speed || "",
+            target_agent_id: dispatchTodosDefaults?.target_agent_id || "codex",
+            target_terminal_mode: dispatchTodosDefaults?.target_terminal_mode || "auto",
+          }
+        : template;
     const node = loopspaceGraphNodePositionedForDrop(
       createDfBlueprintNodeFromTemplate(templateWithDefaults, position),
       position,
@@ -10057,6 +10546,11 @@ function LoopspaceRuntimeView({
         target_device_label: normalized.device_label,
         target_terminal_id: normalized.target_terminal_id,
         target_terminal_index: normalized.target_terminal_index,
+        target_terminal_mode: (
+          normalized.target_terminal_id
+          || normalized.target_terminal_index
+          || normalized.target_terminal_name
+        ) ? "pinned" : "auto",
         target_terminal_name: normalized.target_terminal_name,
         target_thread_id: normalized.target_thread_id,
         target_workspace_ids: normalized.target_workspace_ids,
@@ -10140,6 +10634,7 @@ function LoopspaceRuntimeView({
       return;
     }
     const batchId = loopspaceDispatchTodosBatchId(loopspaceId, node, normalized);
+    const loopRuntimeRunId = loopspaceDispatchTodosRunId(loopspaceId, node);
     const targetTerminalIndex = Number.parseInt(normalized.target_terminal_index, 10);
     setDispatchTodosPendingNodeId(nodeId);
     setRuntimeError("");
@@ -10158,6 +10653,11 @@ function LoopspaceRuntimeView({
           target_device_label: normalized.device_label,
           target_terminal_id: normalized.target_terminal_id,
           target_terminal_index: normalized.target_terminal_index,
+          target_terminal_mode: (
+            normalized.target_terminal_id
+            || normalized.target_terminal_index
+            || normalized.target_terminal_name
+          ) ? "pinned" : "auto",
           target_terminal_name: normalized.target_terminal_name,
           target_thread_id: normalized.target_thread_id,
           target_workspace_ids: normalized.target_workspace_ids,
@@ -10166,7 +10666,12 @@ function LoopspaceRuntimeView({
         },
       });
       const enableWaitMs = Number.parseInt(normalized.enable_wait_ms, 10);
-      if (typeof onActivateWorkspaceForTodoDispatch === "function") {
+      const shouldActivateLocalWorkspaces = loopspaceDispatchTargetIsLocalDevice(
+        normalized.device_id,
+        localDesktopProfile,
+        loopspaceGraphAccountDeviceRows,
+      );
+      if (shouldActivateLocalWorkspaces && typeof onActivateWorkspaceForTodoDispatch === "function") {
         await onActivateWorkspaceForTodoDispatch({
           source: "loopspace_dispatch_todos_node",
           waitMs: Number.isFinite(enableWaitMs) && enableWaitMs > 0 ? enableWaitMs : 0,
@@ -10177,10 +10682,13 @@ function LoopspaceRuntimeView({
         reason: "loopspace_dispatch_todos_node",
         request: {
           batchId,
+          commandKind: "loopspace_dispatch_todos",
+          command_kind: "loopspace_dispatch_todos",
           deviceId: normalized.device_id,
           deviceLabel: normalized.device_label,
           dispatchMode: normalized.dispatch_mode,
           enableWaitMs: normalized.enable_wait_ms,
+          loopRuntimeRunId,
           loopRuntimeNodeId: nodeId,
           loopspaceId,
           model: normalized.model,
@@ -10192,6 +10700,11 @@ function LoopspaceRuntimeView({
           targetDeviceLabel: normalized.device_label,
           targetTerminalId: normalized.target_terminal_id,
           ...(Number.isFinite(targetTerminalIndex) ? { targetTerminalIndex } : {}),
+          targetTerminalMode: (
+            normalized.target_terminal_id
+            || Number.isFinite(targetTerminalIndex)
+            || normalized.target_terminal_name
+          ) ? "pinned" : "auto",
           targetTerminalName: normalized.target_terminal_name,
           targetThreadId: normalized.target_thread_id,
           todoBatchId: batchId,
@@ -10220,7 +10733,15 @@ function LoopspaceRuntimeView({
     } finally {
       setDispatchTodosPendingNodeId((current) => (current === nodeId ? "" : current));
     }
-  }, [busy, dispatchTodosPendingNodeId, loopspaceId, onActivateWorkspaceForTodoDispatch, updateDispatchTodosNodeProps]);
+  }, [
+    busy,
+    dispatchTodosPendingNodeId,
+    localDesktopProfile,
+    loopspaceGraphAccountDeviceRows,
+    loopspaceId,
+    onActivateWorkspaceForTodoDispatch,
+    updateDispatchTodosNodeProps,
+  ]);
 
   const openLoopspaceGraphNodeSettings = useCallback((node) => {
     const nodeId = String(node?.id || "").trim();
@@ -10247,6 +10768,7 @@ function LoopspaceRuntimeView({
       ));
     }
     if (node.nodeKind === "dispatch_todos") {
+      setSendMessageSettingsTab("target");
       const draft = loopspaceDispatchTodosDraftFromNode(
         node,
         loopspaceAgentLaunchDefaultsRef.current,
@@ -12422,30 +12944,34 @@ function LoopspaceRuntimeView({
       const dispatchWorkspaceIds = loopspaceDispatchTodosSplitList(dispatchDraft.target_workspace_ids);
       const dispatchWorkspaceCount = dispatchWorkspaceIds.length;
       const dispatchTodoCount = loopspaceDispatchTodosLinesFromText(dispatchDraft.todo_lines).length;
-      const dispatchWorkspaceCatalog = Array.isArray(workspaces) ? workspaces : [];
-      const dispatchWorkspaceKnownIds = new Set(
-        dispatchWorkspaceCatalog.map((workspace) => String(workspace?.id || "").trim()).filter(Boolean),
+      const dispatchSelectedAccountDevice = loopspaceDispatchSelectedDeviceRow(
+        loopspaceGraphAccountDeviceRows,
+        dispatchDraft.device_id,
       );
-      const dispatchWorkspaceOptions = [
-        ...dispatchWorkspaceCatalog
-          .map((workspace) => {
-            const id = String(workspace?.id || "").trim();
-            if (!id) return null;
-            return { value: id, label: String(workspace?.name || "").trim() || id };
-          })
-          .filter(Boolean),
-        // Keep ids that are still targeted but no longer in the catalog visible.
-        ...dispatchWorkspaceIds
-          .filter((id) => !dispatchWorkspaceKnownIds.has(id))
-          .map((id) => ({ value: id, label: id })),
-      ];
+      const dispatchTargetIsLocalDevice = loopspaceDispatchTargetIsLocalDevice(
+        dispatchDraft.device_id,
+        localDesktopProfile,
+        loopspaceGraphAccountDeviceRows,
+      );
+      const dispatchRemoteWorkspaceRows = dispatchTargetIsLocalDevice
+        ? []
+        : loopspaceDispatchWorkspaceRowsFromAccountDevice(dispatchSelectedAccountDevice);
+      const dispatchWorkspaceRows = dispatchTargetIsLocalDevice
+        ? (Array.isArray(workspaces) ? workspaces : [])
+        : dispatchRemoteWorkspaceRows;
+      const dispatchWorkspaceOptions = buildLoopspaceDispatchWorkspaceOptions({
+        includeStatus: !dispatchTargetIsLocalDevice,
+        selectedWorkspaceIds: dispatchWorkspaceIds,
+        workspaceRows: dispatchWorkspaceRows,
+      });
       const dispatchTerminalOptions = buildLoopspaceDispatchTerminalOptions(
-        workspaceTerminalsWorkspaces,
+        dispatchTargetIsLocalDevice ? workspaceTerminalsWorkspaces : dispatchRemoteWorkspaceRows,
         dispatchWorkspaceIds,
       );
       const dispatchTerminalPaneId = String(dispatchDraft.target_terminal_id || "").trim();
       const dispatchTerminalName = String(dispatchDraft.target_terminal_name || "").trim();
       const dispatchTerminalIndexRaw = String(dispatchDraft.target_terminal_index || "").trim();
+      const dispatchTerminalIndexNumber = Number(dispatchTerminalIndexRaw);
       const dispatchTerminalMatch = dispatchTerminalOptions.find((option) => (
         (dispatchTerminalPaneId && (option.paneId === dispatchTerminalPaneId || option.providerSessionId === dispatchTerminalPaneId))
           || (dispatchTerminalIndexRaw !== ""
@@ -12458,7 +12984,9 @@ function LoopspaceRuntimeView({
       );
       const dispatchTerminalCustomLabel = dispatchTerminalName
         || dispatchTerminalPaneId
-        || (dispatchTerminalIndexRaw !== "" ? `Terminal ${Number(dispatchTerminalIndexRaw) + 1}` : "");
+        || (dispatchTerminalIndexRaw !== "" && Number.isFinite(dispatchTerminalIndexNumber)
+          ? `Terminal ${dispatchTerminalIndexNumber + 1}`
+          : dispatchTerminalIndexRaw);
       const dispatchTerminalMenuOptions = [
         { value: "", name: "Any terminal", harness: "", color: "", terminalIndex: null, __any: true },
         ...dispatchTerminalOptions,
@@ -12468,7 +12996,9 @@ function LoopspaceRuntimeView({
             name: dispatchTerminalCustomLabel || "Custom terminal",
             harness: "",
             color: "",
-            terminalIndex: dispatchTerminalIndexRaw !== "" ? Number(dispatchTerminalIndexRaw) : null,
+            terminalIndex: dispatchTerminalIndexRaw !== "" && Number.isInteger(dispatchTerminalIndexNumber)
+              ? dispatchTerminalIndexNumber
+              : null,
             workspaceName: "",
             __custom: true,
           }]
@@ -12497,16 +13027,55 @@ function LoopspaceRuntimeView({
           ) : null}
         </LoopspaceDispatchTerminalOption>
       );
+      const dispatchCheckpoints = parsedGraph.nodes.filter((item) => (
+        loopspaceGraphNodeParentId(item) === node.id
+      ));
+      const dispatchSteps = dispatchCheckpoints
+        .filter(loopspaceGraphNodeIsMessageStep)
+        .map((item, itemIndex) => ({ item, itemIndex }))
+        .sort((left, right) => {
+          const orderDelta = loopspaceGraphStepOrder(left.item, left.itemIndex + 1)
+            - loopspaceGraphStepOrder(right.item, right.itemIndex + 1);
+          return orderDelta
+            || loopspaceGraphStepTitle(left.item, left.itemIndex).localeCompare(
+              loopspaceGraphStepTitle(right.item, right.itemIndex),
+            );
+        });
+      const activeDispatchSettingsTab = ["target", "todos", "steps"].includes(sendMessageSettingsTab)
+        ? sendMessageSettingsTab
+        : "target";
+      const dispatchSettingsTabs = [
+        { id: "target", label: "Target" },
+        { id: "todos", label: "Todos" },
+        { id: "steps", label: "Steps" },
+      ];
+      const dispatchSettingsTabList = (
+        <LoopspaceGraphMessageSettingsTabList aria-label="Dispatch todo settings sections" role="tablist">
+          {dispatchSettingsTabs.map((tab) => (
+            <LoopspaceGraphMessageSettingsTabButton
+              aria-selected={activeDispatchSettingsTab === tab.id}
+              data-active={activeDispatchSettingsTab === tab.id ? "true" : undefined}
+              key={tab.id}
+              onClick={() => setSendMessageSettingsTab(tab.id)}
+              role="tab"
+              type="button"
+            >
+              {tab.label}
+            </LoopspaceGraphMessageSettingsTabButton>
+          ))}
+        </LoopspaceGraphMessageSettingsTabList>
+      );
       return (
         <LoopspaceRuntimePanelSettingsInspector data-kind="dispatch_todos">
-          {renderSettingsHeader("Dispatch todos")}
+          {renderSettingsHeader("Dispatch todos", dispatchSettingsTabList)}
           <LoopspaceGraphMessageSettingsPanel
             data-layout="tabs"
             onPointerDown={(event) => event.stopPropagation()}
             onWheel={(event) => event.stopPropagation()}
           >
             <LoopspaceGraphMessageSettingsTabPanel role="tabpanel">
-              <LoopspaceGraphMessageSettingsSection data-column="model">
+              {activeDispatchSettingsTab === "target" ? (
+                <LoopspaceGraphMessageSettingsSection data-column="model">
                 <LoopspaceGraphMessageSettingsGrid>
                   <LoopspaceGraphMessageSettingsField>
                     <span>Device</span>
@@ -12520,6 +13089,11 @@ function LoopspaceRuntimeView({
                         updateDispatchTodosSettingsDraft(node.id, {
                           device_id: device?.id || "",
                           device_label: device?.label || "",
+                          target_terminal_id: "",
+                          target_terminal_index: "",
+                          target_terminal_mode: "auto",
+                          target_terminal_name: "",
+                          target_workspace_ids: "",
                         });
                       }}
                       options={[
@@ -12549,6 +13123,10 @@ function LoopspaceRuntimeView({
                       isMulti
                       isSearchable
                       onChange={(values) => updateDispatchTodosSettingsDraft(node.id, {
+                        target_terminal_id: "",
+                        target_terminal_index: "",
+                        target_terminal_mode: "auto",
+                        target_terminal_name: "",
                         target_workspace_ids: (Array.isArray(values) ? values : []).join(", "),
                       })}
                       options={dispatchWorkspaceOptions}
@@ -12566,24 +13144,40 @@ function LoopspaceRuntimeView({
                       getOptionLabel={(option) => (
                         option.__any || option.__custom
                           ? option.name
-                          : `${option.name} ${option.harness || ""} #${option.terminalIndex + 1}`
+                          : [
+                            option.name,
+                            option.harness || "",
+                            Number.isInteger(option.terminalIndex) ? `#${option.terminalIndex + 1}` : "",
+                          ].filter(Boolean).join(" ")
                       )}
                       onChange={(value, option) => {
                         if (!option || option.__any || value === "") {
                           updateDispatchTodosSettingsDraft(node.id, {
                             target_terminal_id: "",
                             target_terminal_index: "",
+                            target_terminal_mode: "auto",
                             target_terminal_name: "",
                           });
                           return;
                         }
                         if (option.__custom) return;
+                        const selectedAgentId = normalizeLoopspaceDispatchTerminalAgentId(option.agentId || option.harness || "");
+                        const launchDefault = selectedAgentId
+                          ? getAgentLaunchDefault(selectedAgentId, agentLaunchDefaults)
+                          : null;
                         updateDispatchTodosSettingsDraft(node.id, {
                           target_terminal_id: option.paneId || option.providerSessionId || "",
                           target_terminal_index: Number.isInteger(option.terminalIndex)
                             ? String(option.terminalIndex)
                             : "",
+                          target_terminal_mode: "pinned",
                           target_terminal_name: option.name || "",
+                          ...(selectedAgentId ? {
+                            model: launchDefault.model,
+                            reasoning_effort: launchDefault.effort,
+                            speed: launchDefault.speed,
+                            target_agent_id: selectedAgentId,
+                          } : {}),
                         });
                       }}
                       options={dispatchTerminalMenuOptions}
@@ -12659,7 +13253,9 @@ function LoopspaceRuntimeView({
                   </LoopspaceGraphMessageSettingsField>
                 </LoopspaceGraphMessageSettingsGrid>
               </LoopspaceGraphMessageSettingsSection>
-              <LoopspaceGraphMessageSettingsSection data-column="prompt" data-grow="true">
+              ) : null}
+              {activeDispatchSettingsTab === "todos" ? (
+                <LoopspaceGraphMessageSettingsSection data-column="prompt" data-grow="true">
                 <LoopspaceGraphMessagePrompt
                   aria-label={`Todos for ${node.label}`}
                   disabled={busy || dispatchPending}
@@ -12670,8 +13266,95 @@ function LoopspaceRuntimeView({
                   value={dispatchDraft.todo_lines}
                 />
               </LoopspaceGraphMessageSettingsSection>
+              ) : null}
+              {activeDispatchSettingsTab === "steps" ? (
+                <LoopspaceGraphMessageSettingsSection data-column="steps">
+                  <LoopspaceGraphMessageSubnodeList aria-label="Dispatch todo steps" data-orientation="horizontal">
+                    {dispatchSteps.map(({ item: checkpoint }, checkpointIndex) => {
+                      const stepTitle = loopspaceGraphStepTitle(checkpoint, checkpointIndex);
+                      const stepDescription = loopspaceGraphStepDescription(checkpoint);
+                      return (
+                        <LoopspaceGraphMessageSubnodeItem data-mode="step" key={checkpoint.id}>
+                          <LoopspaceGraphMessageSubnodeMain>
+                            <LoopspaceGraphMessageStepHeader>
+                              <LoopspaceGraphMessageStepNumber>{checkpointIndex + 1}</LoopspaceGraphMessageStepNumber>
+                              <LoopspaceGraphMessageStepInput
+                                aria-label={`Title for dispatch step ${checkpointIndex + 1}`}
+                                disabled={busy || dispatchPending}
+                                onBlur={(event) => {
+                                  const nextTitle = event.target.value;
+                                  if (nextTitle !== stepTitle) {
+                                    void updateSendMessageStep(checkpoint, { title: nextTitle });
+                                  }
+                                }}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Enter") {
+                                    event.preventDefault();
+                                    event.currentTarget.blur();
+                                  }
+                                }}
+                                placeholder={`Step ${checkpointIndex + 1}`}
+                                defaultValue={stepTitle}
+                              />
+                            </LoopspaceGraphMessageStepHeader>
+                            <LoopspaceGraphMessageStepDescription
+                              aria-label={`Description for dispatch step ${checkpointIndex + 1}`}
+                              disabled={busy || dispatchPending}
+                              onBlur={(event) => {
+                                const description = event.target.value;
+                                if (description !== stepDescription) {
+                                  void updateSendMessageStep(checkpoint, { description });
+                                }
+                              }}
+                              placeholder="Describe what the terminal agent should checkpoint before the todo completes."
+                              defaultValue={stepDescription}
+                            />
+                          </LoopspaceGraphMessageSubnodeMain>
+                          <button
+                            aria-label={`Remove ${stepTitle || "step"}`}
+                            disabled={busy || dispatchPending}
+                            onClick={() => {
+                              void detachGraphNodeFromLoop(checkpoint);
+                            }}
+                            type="button"
+                          >
+                            <ButtonCloseIcon aria-hidden="true" />
+                          </button>
+                        </LoopspaceGraphMessageSubnodeItem>
+                      );
+                    })}
+                    <LoopspaceGraphMessageSubnodeItem
+                      aria-label="Create new dispatch step"
+                      as="button"
+                      data-action="add"
+                      data-empty={dispatchSteps.length ? undefined : "true"}
+                      disabled={busy || dispatchPending}
+                      onClick={() => {
+                        void addSendMessageStep(node);
+                      }}
+                      type="button"
+                    >
+                      <LoopspaceGraphNodeText>
+                        <strong>New step</strong>
+                        <span>Add an internal checkpoint for this dispatch.</span>
+                      </LoopspaceGraphNodeText>
+                    </LoopspaceGraphMessageSubnodeItem>
+                  </LoopspaceGraphMessageSubnodeList>
+                </LoopspaceGraphMessageSettingsSection>
+              ) : null}
             </LoopspaceGraphMessageSettingsTabPanel>
             <LoopspaceGraphMessageSettingsActions>
+              {activeDispatchSettingsTab === "steps" ? (
+                <LoopspaceGraphMessageSubnodeButton
+                  disabled={busy || dispatchPending}
+                  onClick={() => {
+                    void addSendMessageStep(node);
+                  }}
+                  type="button"
+                >
+                  + Step
+                </LoopspaceGraphMessageSubnodeButton>
+              ) : null}
               <LoopspaceGraphMessageSubnodeButton
                 disabled={busy || dispatchPending || !dispatchWorkspaceCount || !dispatchTodoCount}
                 onClick={() => {
@@ -13271,6 +13954,7 @@ function LoopspaceRuntimeView({
                   : "";
                 const isSendMessageRegion = node.nodeKind === "send_message";
                 const isDispatchTodosNode = node.nodeKind === "dispatch_todos";
+                const isActionRegion = isSendMessageRegion || isDispatchTodosNode;
                 const isNotifyDeviceNode = node.nodeKind === "notify_device";
                 const notifyDeviceDraft = isNotifyDeviceNode
                   ? loopspaceNotifyDeviceDraftFromNode(node)
@@ -13338,7 +14022,7 @@ function LoopspaceRuntimeView({
                         ? `${dispatchTodosWorkspaceCount} workspace${dispatchTodosWorkspaceCount === 1 ? "" : "s"}`
                         : "Choose workspaces"
                   : "";
-                const sendMessageRuntimeState = isSendMessageRegion
+                const sendMessageRuntimeState = isActionRegion
                   ? runtimeStateByNodeId.get(node.id)
                   : null;
                 const sendMessageRuntimeLabel = sendMessageRuntimeState?.label || "";
@@ -13350,7 +14034,7 @@ function LoopspaceRuntimeView({
 	                const hasGraphNodeSettings = isSendMessageRegion || isResourceContextNode || isDispatchTodosNode || isNotifyDeviceNode;
 	                const nodeSettingsSelected = hasGraphNodeSettings && settingsNodeId === node.id && runtimePanelTab === "settings";
 	                const sendMessageSettingsOpen = false;
-                const sendMessageCheckpoints = isSendMessageRegion
+                const sendMessageCheckpoints = isActionRegion
                   ? parsedGraph.nodes.filter((item) => (
                     String(loopspaceGraphPropValue(item.props, ["parent_id", "parentId", "parent"]) || "").trim() === node.id
                   ))
@@ -13378,7 +14062,7 @@ function LoopspaceRuntimeView({
                     .map(({ item }, stepIndex) => [String(item.id || "").trim(), stepIndex + 1])
                     .filter(([id]) => id),
                 );
-                const sendMessageFlowBounds = isSendMessageRegion
+                const sendMessageFlowBounds = isActionRegion
                   ? loopspaceGraphMessageFlowBounds(
                     nodeLayout,
                     node,
@@ -13499,7 +14183,7 @@ function LoopspaceRuntimeView({
                 return (
                   <LoopspaceGraphNode
                     data-kind={node.triggerId ? (nodeTriggerType || "manual") : (node.nodeKind || "loop")}
-                    data-region={isSendMessageRegion ? "true" : undefined}
+                    data-region={isActionRegion ? "true" : undefined}
                     data-loopspace-graph-node-id={node.id}
                     data-loopspace-graph-node="true"
                     data-dragging={nodeDragPositions[node.id] ? "true" : undefined}
@@ -13569,7 +14253,7 @@ function LoopspaceRuntimeView({
 	                    <LoopspaceGraphNodeText>
                       <LoopspaceGraphNodeTitleRow>
                         <strong>{nodeTitle}</strong>
-                        {isSendMessageRegion && sendMessageRuntimeLabel ? (
+                        {isActionRegion && sendMessageRuntimeLabel ? (
                           <LoopspaceGraphNodeStateBadge
                             data-tone={sendMessageRuntimeTone}
                             onPointerDown={(event) => event.stopPropagation()}
@@ -13664,7 +14348,7 @@ function LoopspaceRuntimeView({
                             <Send aria-hidden="true" />
                             <span>{dispatchTodosPending ? "Queueing" : dispatchTodosTargetLabel}</span>
                           </LoopspaceGraphNodeDeviceBadge>
-                          {dispatchTodosRows.length ? (
+                          {dispatchTodosRows.length && !isActionRegion ? (
                             <LoopspaceDispatchTodoCarousel aria-label="Dispatched todo status">
                               {dispatchTodosRows.map((row) => (
                                 <LoopspaceDispatchTodoRow
@@ -13682,7 +14366,9 @@ function LoopspaceRuntimeView({
                             </LoopspaceDispatchTodoCarousel>
                           ) : (
                             <LoopspaceDispatchTodoEmpty>
-                              {dispatchTodosTodoCount ? "Ready to queue" : "No todos configured"}
+                              {dispatchTodosTodoCount
+                                ? `${dispatchTodosTodoCount} todo${dispatchTodosTodoCount === 1 ? "" : "s"} configured`
+                                : "No todos configured"}
                             </LoopspaceDispatchTodoEmpty>
                           )}
                         </>
@@ -13793,7 +14479,7 @@ function LoopspaceRuntimeView({
                         <ButtonSettingsIcon aria-hidden="true" />
                       </LoopspaceGraphMessageSettingsButton>
 	                    ) : null}
-		                    {node.nodeKind === "send_message" ? (
+		                    {isActionRegion ? (
 		                      <>
 			                        <LoopspaceGraphMessageRegion
 		                          style={sendMessageFlowBounds && sendMessageFlowOrigin ? {
@@ -14009,7 +14695,7 @@ function LoopspaceRuntimeView({
                             </LoopspaceGraphMessageSettingsPanel>
                           ) : (
                             <LoopspaceGraphMessageFlow
-                              aria-label="Internal send message steps"
+                              aria-label={isDispatchTodosNode ? "Internal dispatch todo steps" : "Internal send message steps"}
                               data-empty={sendMessageFlowNodes.length ? undefined : "true"}
                               style={{
                                 "--loopspace-message-flow-height": `${sendMessageFlowBounds?.height || LOOPSPACE_GRAPH_MESSAGE_FLOW_MIN_HEIGHT}px`,
@@ -14127,7 +14813,7 @@ function LoopspaceRuntimeView({
                           aria-label={`Resize ${node.label}`}
                           disabled={busy}
                           onPointerDown={(event) => startSendMessageResize(event, node, nodeLayout)}
-                          title="Resize send message region"
+                          title={isDispatchTodosNode ? "Resize dispatch todo region" : "Resize send message region"}
                           type="button"
                         />
                       </>
@@ -14202,10 +14888,10 @@ function LoopspaceRuntimeView({
                 visible={visible}
               />
 		              {graphDragGhost?.node ? (() => {
-		                const node = graphDragGhost.node;
+                const node = graphDragGhost.node;
                 const nodeLayout = loopspaceGraphNodeLayout(node, 0);
                 const type = node.nodeKind || node.role || "node";
-                const isGhostRegion = node.nodeKind === "send_message";
+                const isGhostRegion = loopspaceGraphNodeIsActionRegion(node);
                 const ghostVisualDefaults = contractLoopspaceGraphVisualDefaultsForNode(node);
                 const isGhostSizedNode = Boolean(ghostVisualDefaults.sized);
                 const Icon = node.nodeKind === "device"
@@ -14316,7 +15002,9 @@ function LoopspaceRuntimeView({
                       data-tone={tone && tone !== "neutral" ? tone : undefined}
                       key={`nav:${node.id}`}
                       style={{
-                        "--loop-node-accent": LOOPSPACE_GRAPH_NAV_NODE_ACCENTS[node.nodeKind] || "255, 209, 102",
+                        "--loop-node-accent": node.triggerId
+                          ? LOOPSPACE_GRAPH_TRIGGER_ACCENT
+                          : LOOPSPACE_GRAPH_NAV_NODE_ACCENTS[node.nodeKind] || "255, 209, 102",
                         "--loopspace-nav-node-x": `${Math.max(-34, Math.min(34, (layout.x + (layout.width / 2)) * 0.045))}px`,
                         "--loopspace-nav-node-y": `${Math.max(-22, Math.min(22, (layout.y + (layout.height / 2)) * 0.045))}px`,
                       }}
@@ -18455,6 +19143,13 @@ function buildRustTerminalAuthorityTerminalOrchestrators(payload) {
           || session.session_id
           || "",
       ).trim();
+      const threadId = String(
+        session.threadId
+          || session.thread_id
+          || session.targetThreadId
+          || session.target_thread_id
+          || "",
+      ).trim();
       return {
         agentId,
         agentKind: agentId,
@@ -18503,6 +19198,8 @@ function buildRustTerminalAuthorityTerminalOrchestrators(payload) {
         terminal_name: displayName,
         terminalNickname: displayName,
         terminal_nickname: displayName,
+        threadId,
+        thread_id: threadId,
         terminalScope: "device",
         terminal_scope: "device",
         terminalStatus,
@@ -18514,6 +19211,8 @@ function buildRustTerminalAuthorityTerminalOrchestrators(payload) {
         turn_status: session.turnStatus || "",
         updatedAtMs: session.runtimeUpdatedAtMs || liveSnapshot.generatedAtMs || Date.now(),
         updated_at_ms: session.runtimeUpdatedAtMs || liveSnapshot.generatedAtMs || Date.now(),
+        workspaceId: DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID,
+        workspace_id: DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID,
         workspaceScoped: false,
         workspace_scoped: false,
       };
@@ -18700,10 +19399,17 @@ function getReadyAgent(agentStatuses, preferredAgentId = "codex") {
 
 function normalizeManagedAgentProviderId(value) {
   const providerId = String(value || "").trim().toLowerCase();
-  if (providerId === "claude-code" || providerId === "claude_code") {
+  const providerKey = providerId.replace(/[\s_-]+/g, "");
+  if (providerKey === "codex" || providerKey === "openai" || providerKey === "chatgpt") {
+    return "codex";
+  }
+  if (providerKey === "claude" || providerKey === "anthropic" || providerKey === "claudecode") {
     return "claude";
   }
-  return ["codex", "claude", "opencode"].includes(providerId) ? providerId : "";
+  if (providerKey === "opencode") {
+    return "opencode";
+  }
+  return "";
 }
 
 function normalizeWorkspaceLiveTerminalAgentId(value) {
@@ -23665,6 +24371,7 @@ export default function App() {
   const [visitedAccountViews, setVisitedAccountViews] = useState(() => ({
     audio: false,
     tokenomics: false,
+    devices: false,
   }));
   const [viewMotion, setViewMotion] = useState("entered");
   const [activeAgent, setActiveAgent] = useState("codex");
@@ -23739,6 +24446,11 @@ export default function App() {
   const [snippingCaptureAttention, setSnippingCaptureAttention] = useState(null);
   const [audioHotkeyAttention, setAudioHotkeyAttention] = useState(null);
   const [settingsTab, setSettingsTab] = useState(SETTINGS_TAB_GENERAL);
+  const [nativeNotificationSettings, setNativeNotificationSettings] = useState(readNativeNotificationSettings);
+  const [notificationSfxSettings, setNotificationSfxSettings] = useState(readNotificationSfxSettings);
+  const [notificationPreferences, setNotificationPreferences] = useState(() => normalizeNotificationPreferences(null));
+  const [notificationPreferencesState, setNotificationPreferencesState] = useState("idle");
+  const [notificationPreferencesError, setNotificationPreferencesError] = useState("");
   const [settingsPermissionState, setSettingsPermissionState] = useState({
     status: "idle",
     audioInput: null,
@@ -24400,6 +25112,7 @@ export default function App() {
   const terminalStatusEventEmitterRef = useRef(null);
   const remoteCommandReceiptsRef = useRef(new Map());
   const remoteModelConfigQueueRef = useRef(new Map());
+  const remotePermissionConfigQueueRef = useRef(new Map());
   const workspaceMcpSyncKeyRef = useRef("");
   const cloudMcpSessionContextSyncKeyRef = useRef("");
 
@@ -27221,15 +27934,7 @@ export default function App() {
   // user is watching and on the native-notification setting — signals only
   // the webview knows. Pushed on every change; cheap fire-and-forget.
   useEffect(() => {
-    let nativeNotificationsEnabled = true;
-    try {
-      const parsed = JSON.parse(
-        window.localStorage?.getItem?.("diffforge.nativeNotifications.v1") || "{}",
-      );
-      nativeNotificationsEnabled = parsed?.enabled !== false;
-    } catch {
-      // default enabled
-    }
+    const nativeNotificationsEnabled = nativeNotificationSettings.enabled !== false;
     invoke("attention_state_update", {
       focused: Boolean(mainWindowFocused),
       selectedWorkspaceId: selectedWorkspaceId || "",
@@ -27238,7 +27943,7 @@ export default function App() {
       ),
       nativeNotificationsEnabled,
     }).catch(() => {});
-  }, [activeView, mainWindowFocused, selectedWorkspaceId, visibleView]);
+  }, [activeView, mainWindowFocused, nativeNotificationSettings.enabled, selectedWorkspaceId, visibleView]);
 
   useEffect(() => {
     const snapshotTargets = workspaceNotificationRoots.filter((entry) => (
@@ -28473,6 +29178,78 @@ export default function App() {
     }
   }, [highlightSettingsPermission, loadSettingsPermissionState, setSettingsPermissionError]);
 
+  const loadNotificationPreferences = useCallback(async ({ silent = false } = {}) => {
+    if (!silent) {
+      setNotificationPreferencesState("loading");
+    }
+    try {
+      const result = await invoke("cloud_mcp_get_notification_preferences");
+      const preferences = normalizeNotificationPreferences(result?.preferences || result?.notification_preferences || result);
+      setNotificationPreferences(preferences);
+      setNotificationPreferencesState("ready");
+      setNotificationPreferencesError("");
+      return preferences;
+    } catch (error) {
+      setNotificationPreferencesState("error");
+      setNotificationPreferencesError(getErrorMessage(error, "Unable to load notification preferences."));
+      return null;
+    }
+  }, []);
+
+  const saveNotificationPreferences = useCallback(async (nextPreferences, reason) => {
+    const preferences = normalizeNotificationPreferences(nextPreferences);
+    setNotificationPreferences(preferences);
+    setNotificationPreferencesState("saving");
+    setNotificationPreferencesError("");
+    try {
+      const result = await invoke("cloud_mcp_set_notification_preferences", {
+        preferences,
+        reason,
+      });
+      const synced = normalizeNotificationPreferences(result?.preferences || result?.notification_preferences || preferences);
+      setNotificationPreferences(synced);
+      setNotificationPreferencesState("ready");
+      setNotificationPreferencesError("");
+      return synced;
+    } catch (error) {
+      setNotificationPreferencesState("error");
+      setNotificationPreferencesError(getErrorMessage(error, "Unable to save notification preferences."));
+      return null;
+    }
+  }, []);
+
+  const updateNotificationPushPreference = useCallback((key, enabled) => {
+    const nextPreferences = setNotificationPreferencePushValue(notificationPreferences, key, enabled);
+    void saveNotificationPreferences(nextPreferences, `notification_push_${key}`);
+  }, [notificationPreferences, saveNotificationPreferences]);
+
+  const updateLoopspaceNotificationPreference = useCallback((loopspaceId, status, value) => {
+    const nextPreferences = setLoopspaceNotificationOverride(
+      notificationPreferences,
+      loopspaceId,
+      status,
+      loopspaceOverrideValueFromSelect(value),
+    );
+    void saveNotificationPreferences(nextPreferences, `loopspace_notification_${status}`);
+  }, [notificationPreferences, saveNotificationPreferences]);
+
+  const updateNativeNotificationsEnabled = useCallback((enabled) => {
+    setNativeNotificationSettings(writeNativeNotificationSettings({
+      ...nativeNotificationSettings,
+      enabled,
+    }));
+    if (enabled) {
+      void requestSettingsNotificationPermission();
+    }
+  }, [nativeNotificationSettings, requestSettingsNotificationPermission]);
+
+  const updateNotificationSfxSettings = useCallback((patch = {}) => {
+    setNotificationSfxSettings(writeNotificationSfxSettings({
+      ...notificationSfxSettings,
+      ...patch,
+    }));
+  }, [notificationSfxSettings]);
+
   const openSettingsPermissionUrl = useCallback(async (target, url, fallbackMessage) => {
     highlightSettingsPermission(target);
     if (!url) {
@@ -28487,7 +29264,11 @@ export default function App() {
   }, [highlightSettingsPermission, setSettingsPermissionError]);
 
   const showSettingsView = useCallback((tab = SETTINGS_TAB_GENERAL) => {
-    setSettingsTab(tab === SETTINGS_TAB_PERMISSIONS ? SETTINGS_TAB_PERMISSIONS : SETTINGS_TAB_GENERAL);
+    setSettingsTab(
+      [SETTINGS_TAB_NOTIFICATIONS, SETTINGS_TAB_PERMISSIONS, SETTINGS_TAB_SSH].includes(tab)
+        ? tab
+        : SETTINGS_TAB_GENERAL,
+    );
     showView("settings");
   }, [showView]);
 
@@ -28498,6 +29279,34 @@ export default function App() {
 
     loadSettingsPermissionState();
   }, [loadSettingsPermissionState, settingsTab, visibleView]);
+
+  useEffect(() => {
+    if (visibleView !== "settings" || settingsTab !== SETTINGS_TAB_NOTIFICATIONS) {
+      return;
+    }
+
+    void loadNotificationPreferences({ silent: notificationPreferencesState === "ready" });
+  }, [loadNotificationPreferences, notificationPreferencesState, settingsTab, visibleView]);
+
+  useEffect(() => {
+    if (!loopspaceSettingsPanelId) {
+      return;
+    }
+
+    void loadNotificationPreferences({ silent: notificationPreferencesState === "ready" });
+  }, [loadNotificationPreferences, loopspaceSettingsPanelId, notificationPreferencesState]);
+
+  useEffect(() => {
+    const unsubscribe = listenShared(NOTIFICATION_PREFERENCES_CHANGED_EVENT, (event) => {
+      const preferences = normalizeNotificationPreferences(event?.payload?.preferences || event?.payload);
+      setNotificationPreferences(preferences);
+      setNotificationPreferencesState("ready");
+      setNotificationPreferencesError("");
+    });
+    return () => {
+      unsubscribe();
+    };
+  }, []);
 
   useEffect(() => {
     const highlightId = Number(settingsPermissionHighlight?.id || 0);
@@ -31961,16 +32770,18 @@ export default function App() {
       );
       const gitWorktreesEnabled = agentSessionMode === AGENT_SESSION_MODE_WORKTREE;
       const effectiveRootDirectory = rootDirectory || cleanWorkspaceRootDirectory(defaultWorkingDirectory);
-      const duplicateWorkspace = findWorkspaceByEffectiveRoot(
-        workspaceCatalogRef.current,
-        workspaceSettingsRef.current,
-        effectiveRootDirectory,
-        defaultWorkingDirectoryRef.current,
-        selectedWorkspace.id,
-      );
+      if (rootChanged) {
+        const duplicateWorkspace = findWorkspaceByEffectiveRoot(
+          workspaceCatalogRef.current,
+          workspaceSettingsRef.current,
+          effectiveRootDirectory,
+          defaultWorkingDirectoryRef.current,
+          selectedWorkspace.id,
+        );
 
-      if (duplicateWorkspace) {
-        throw new Error(`That folder is already attached to ${duplicateWorkspace.name || "another workspace"}.`);
+        if (duplicateWorkspace) {
+          throw new Error(`That folder is already attached to ${duplicateWorkspace.name || "another workspace"}.`);
+        }
       }
 
       const currentTerminalIndexes = getWorkspaceLogicalTerminalIndexes(
@@ -35938,6 +36749,14 @@ export default function App() {
       .map((runtimeWorkspace) => {
         const rootDirectory = getWorkspaceRootDirectory(workspaceSettings, runtimeWorkspace.id);
         const workingDirectory = rootDirectory || defaultWorkingDirectory;
+        // Identity of the terminal execution environment. When it changes
+        // (root re-pointed, or git-worktree/session-mode toggled) saveWorkspaceSettings
+        // tears the PTYs down; folding this into the pane React key remounts each
+        // pane so a fresh terminal_open runs at the new cwd/isolation. Role and
+        // permission are deliberately excluded — those have live (non-restart)
+        // update paths and must not force a PTY restart.
+        const runtimeAgentSessionMode = getWorkspaceAgentSessionMode(workspaceSettings, runtimeWorkspace.id);
+        const terminalRuntimeRestartKey = `${getWorkspaceRootIdentity(workingDirectory)}:${runtimeAgentSessionMode}`;
         const rootWasEmptyAtSelection = getWorkspaceRootWasEmptyAtSelection(
           workspaceSettings,
           runtimeWorkspace.id,
@@ -36048,6 +36867,7 @@ export default function App() {
           terminalRolesByIndex,
           threadsByIndex,
           rootWasEmptyAtSelection,
+          terminalRuntimeRestartKey,
           workingDirectory,
           workspace: runtimeWorkspace,
         };
@@ -38342,11 +39162,14 @@ export default function App() {
   const audioViewVisible = visibleView === "audio";
   const snippingViewVisible = visibleView === "snipping";
   const tokenomicsViewVisible = visibleView === "tokenomics";
-  const accountKeepAliveViewVisible = audioViewVisible || tokenomicsViewVisible;
+  const devicesViewVisible = visibleView === "devices";
+  const accountKeepAliveViewVisible = audioViewVisible || tokenomicsViewVisible || devicesViewVisible;
   const audioViewActive = audioViewVisible && viewMotion !== "exiting";
   const tokenomicsViewActive = tokenomicsViewVisible && viewMotion !== "exiting";
+  const devicesViewActive = devicesViewVisible && viewMotion !== "exiting";
   const audioViewMounted = audioViewVisible || visitedAccountViews.audio;
   const tokenomicsViewMounted = tokenomicsViewVisible || visitedAccountViews.tokenomics;
+  const devicesViewMounted = devicesViewVisible || visitedAccountViews.devices;
   const workspaceToolPaneAvailable = !shouldShowWorkspaceSetup && visibleView === DEFAULT_WORKSPACE_VIEW;
   const workspaceToolPaneVisible = workspaceToolPaneAvailable;
   const workspaceToolPaneMinimized = workspaceToolPaneMode === TODO_QUEUE_PANE_MODE_MINIMIZED;
@@ -40156,6 +40979,9 @@ export default function App() {
           || payloadRequest.workspaceId
           || "",
       ).trim();
+      if (isDeviceTerminalOrchestratorWorkspaceId(requestedWorkspaceId)) {
+        return DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID;
+      }
       if (requestedWorkspaceId && findWorkspaceById(workspaces, requestedWorkspaceId)) {
         return requestedWorkspaceId;
       }
@@ -40247,6 +41073,9 @@ export default function App() {
       || commandKind === "terminal_send_message"
       || commandKind === "orchestrator_send_message"
       || commandKind === "loopspace_send_message"
+      || commandKind === "dispatch_todos"
+      || commandKind === "loopspace_dispatch_todos"
+      || commandKind === "loopspace_workspace_todo_dispatch"
       || commandKind === "send_message"
     );
     const remoteCommandIsSendMessageTask = (commandKind) => (
@@ -40361,6 +41190,11 @@ export default function App() {
         if (agentId) {
           append(`${baseId}-${agentId}`);
         }
+        if (isDeviceTerminalOrchestratorWorkspaceId(safeWorkspaceId)) {
+          append(terminalIndex === 0
+            ? DEVICE_TERMINAL_ORCHESTRATOR_PANE_ID
+            : `${DEVICE_TERMINAL_ORCHESTRATOR_PANE_ID}-${terminalIndex}`);
+        }
       }
       return values;
     };
@@ -40440,9 +41274,38 @@ export default function App() {
       return { idle: false, reason: "unknown" };
     };
     const findRemoteControlPresenceWorkspace = (workspaceId) => (
-      (workspaceTerminalsWorkspacesRef.current || []).find((workspace) => (
-        String(workspace?.workspaceId || workspace?.workspace_id || "").trim() === workspaceId
-      )) || null
+      isDeviceTerminalOrchestratorWorkspaceId(workspaceId)
+        ? {
+          commandable: true,
+          repoPath: defaultWorkingDirectoryRef.current || "",
+          terminalCount: rustTerminalAuthorityOrchestrators.length,
+          terminal_count: rustTerminalAuthorityOrchestrators.length,
+          terminals: rustTerminalAuthorityOrchestrators.map((terminal, index) => {
+            const parsedTerminalIndex = Number.parseInt(
+              String(terminal?.terminalIndex ?? terminal?.terminal_index ?? ""),
+              10,
+            );
+            const safeTerminalIndex = Number.isInteger(parsedTerminalIndex) && parsedTerminalIndex >= 0
+              ? parsedTerminalIndex
+              : index;
+            return {
+              ...terminal,
+              terminalIndex: safeTerminalIndex,
+              terminal_index: safeTerminalIndex,
+              workspaceId: DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID,
+              workspace_id: DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID,
+            };
+          }),
+          workspaceActive: true,
+          workspace_active: true,
+          workspaceId: DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID,
+          workspace_id: DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID,
+          workspaceName: "Terminal Orchestrators",
+          workspace_name: "Terminal Orchestrators",
+        }
+        : (workspaceTerminalsWorkspacesRef.current || []).find((workspace) => (
+          String(workspace?.workspaceId || workspace?.workspace_id || "").trim() === workspaceId
+        )) || null
     );
     const findRemoteControlTerminal = (workspaceId, target = {}) => {
       const presenceWorkspace = findRemoteControlPresenceWorkspace(workspaceId);
@@ -40860,6 +41723,38 @@ export default function App() {
         sessionFields.agentChatSessionId || "",
       ].join("|");
     };
+    const remoteAgentChatPermissionMode = (event, provider) => (
+      normalizePermissionModeForProvider(provider, remoteCommandStringField(event, [
+        "permission_mode",
+        "permissionMode",
+        "approval_mode",
+        "approvalMode",
+        "mode",
+      ]))
+    );
+    const remoteAgentChatPermissionDedupeKey = ({
+      event,
+      provider,
+      target,
+      terminal,
+      workspaceId,
+    }) => {
+      const paneId = remoteControlTerminalText(terminal, ["paneId", "pane_id", "terminalId", "terminal_id"])
+        || String(target?.targetTerminalId || "").trim();
+      const threadId = remoteControlTerminalText(terminal, ["threadId", "thread_id"])
+        || String(target?.targetThreadId || "").trim();
+      const sessionFields = remoteAgentChatConfigSessionFields(event, terminal);
+      return [
+        String(workspaceId || "").trim(),
+        paneId,
+        threadId,
+        provider || "",
+        "permission",
+        remoteAgentChatPermissionMode(event, provider),
+        sessionFields.providerSessionId || "",
+        sessionFields.agentChatSessionId || "",
+      ].join("|");
+    };
     const recordRemoteAgentChatConfigConfirmation = async ({
       commandId,
       event,
@@ -40896,6 +41791,94 @@ export default function App() {
         turnId: remoteCommandStringField(event, ["turn_id", "turnId"]) || null,
         workspaceId,
         workspaceName: findWorkspaceById(workspacesRef.current, workspaceId)?.name || "",
+      });
+    };
+    const recordRemoteAgentChatPermissionConfirmation = async ({
+      commandId,
+      event,
+      origin = "remote_permission_config_change",
+      permissionMode,
+      provider,
+      sessionFields = null,
+      terminal,
+      workspaceId,
+    }) => {
+      const { agentChatSessionId, providerSessionId } = sessionFields
+        || remoteAgentChatConfigSessionFields(event, terminal);
+      const paneId = remoteControlTerminalText(terminal, ["paneId", "pane_id", "terminalId", "terminal_id"]);
+      const terminalInstanceId = remoteControlTerminalNumber(terminal, ["terminalInstanceId", "terminal_instance_id", "instanceId", "instance_id"]);
+      const terminalIndex = remoteControlTerminalNumber(terminal, ["terminalIndex", "terminal_index", "index"]);
+      const threadId = remoteControlTerminalText(terminal, ["threadId", "thread_id"]);
+      if (!providerSessionId && !agentChatSessionId) {
+        throw new Error("Permission configuration confirmation requires provider_session_id or agent_chat_session_id.");
+      }
+      await invoke("cloud_mcp_record_agent_chat_permission_config", {
+        agentChatSessionId: agentChatSessionId || null,
+        commandId,
+        origin,
+        paneId,
+        permissionMode,
+        provider,
+        providerSessionId: providerSessionId || null,
+        terminalIndex: Number.isInteger(terminalIndex) ? terminalIndex : null,
+        terminalInstanceId: Number.isInteger(terminalInstanceId) ? terminalInstanceId : null,
+        threadId: threadId || null,
+        timestamp: new Date().toISOString(),
+        turnId: remoteCommandStringField(event, ["turn_id", "turnId"]) || null,
+        workspaceId,
+        workspaceName: findWorkspaceById(workspacesRef.current, workspaceId)?.name || "",
+      });
+    };
+    const requestRemoteAgentChatPermissionAutomation = ({
+      commandId,
+      event,
+      permissionMode,
+      provider,
+      target,
+      terminal,
+      workspaceId,
+    }) => {
+      const paneId = remoteControlTerminalText(terminal, ["paneId", "pane_id", "terminalId", "terminal_id"]);
+      const terminalInstanceId = remoteControlTerminalNumber(terminal, ["terminalInstanceId", "terminal_instance_id", "instanceId", "instance_id"]);
+      const terminalIndex = remoteControlTerminalNumber(terminal, ["terminalIndex", "terminal_index", "index"]);
+      const threadId = remoteControlTerminalText(terminal, ["threadId", "thread_id"]);
+      const permissionRequestId = `${commandId || "permission"}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      return new Promise((resolve, reject) => {
+        const timeout = window.setTimeout(() => {
+          window.removeEventListener(REMOTE_PERMISSION_CONFIG_RESULT_EVENT, handleResult);
+          reject(new Error("Timed out waiting for permission mode automation."));
+        }, 20_000);
+        function handleResult(resultEvent) {
+          const detail = resultEvent?.detail && typeof resultEvent.detail === "object" ? resultEvent.detail : {};
+          if (String(detail.permissionRequestId || "") !== permissionRequestId) {
+            return;
+          }
+          window.clearTimeout(timeout);
+          window.removeEventListener(REMOTE_PERMISSION_CONFIG_RESULT_EVENT, handleResult);
+          if (detail.ok === false || detail.status === "failed") {
+            reject(new Error(String(detail.error || "Permission mode automation failed.")));
+            return;
+          }
+          resolve(detail);
+        }
+        window.addEventListener(REMOTE_PERMISSION_CONFIG_RESULT_EVENT, handleResult);
+        window.dispatchEvent(new CustomEvent(REMOTE_PERMISSION_CONFIG_REQUEST_EVENT, {
+          detail: {
+            commandId,
+            event,
+            instanceId: Number.isInteger(terminalInstanceId) ? terminalInstanceId : null,
+            permissionMode,
+            permissionRequestId,
+            provider,
+            targetPaneId: paneId,
+            targetTerminalId: paneId || String(target?.targetTerminalId || "").trim(),
+            targetTerminalIndex: Number.isInteger(terminalIndex) ? terminalIndex : target?.targetTerminalIndex,
+            targetThreadId: threadId || String(target?.targetThreadId || "").trim(),
+            terminalIndex: Number.isInteger(terminalIndex) ? terminalIndex : null,
+            threadId,
+            workspaceId,
+          },
+        }));
       });
     };
     const applyRemoteAgentChatConfigChange = async (request) => {
@@ -41092,6 +42075,205 @@ export default function App() {
         });
       } catch (error) {
         await recordRemoteCommandStatus(event, "error", getErrorMessage(error, "Unable to apply model configuration."), {
+          commandId,
+          commandKind,
+          terminal: remoteControlTerminalSummary(terminal, target),
+          workspaceId,
+        });
+      }
+    };
+    const applyRemoteAgentChatPermissionChange = async (request) => {
+      const {
+        commandId,
+        commandKind,
+        event,
+        target,
+        workspaceId,
+      } = request;
+      const { terminal } = findRemoteControlTerminal(workspaceId, target);
+      const provider = remoteAgentChatConfigProvider(event, request.agentId, terminal);
+      const paneId = remoteControlTerminalText(terminal, ["paneId", "pane_id", "terminalId", "terminal_id"]);
+      if (!terminal || !paneId) {
+        throw new Error("Target terminal was not found on this desktop.");
+      }
+      if (!["codex", "claude", "opencode"].includes(provider)) {
+        throw new Error("Remote permission configuration requires provider codex, claude, or opencode.");
+      }
+      const permissionMode = remoteAgentChatPermissionMode(event, provider);
+      if (!permissionMode) {
+        throw new Error("Remote permission change did not include permission_mode.");
+      }
+      const sessionValidation = remoteAgentChatConfigValidateSessionTarget(event, terminal);
+      if (!sessionValidation.ok) {
+        throw new Error(sessionValidation.message || "Remote permission configuration session target did not match.");
+      }
+      await recordRemoteCommandStatus(event, "running", "Applying permission mode to the live terminal.", {
+        commandId,
+        commandKind,
+        paneId,
+        permissionMode,
+        provider,
+        terminal: remoteControlTerminalSummary(terminal, target),
+        workspaceId,
+      });
+      const automationResult = await requestRemoteAgentChatPermissionAutomation({
+        commandId,
+        event,
+        permissionMode,
+        provider,
+        target,
+        terminal,
+        workspaceId,
+      });
+      const appliedPermissionMode = normalizePermissionModeForProvider(
+        provider,
+        automationResult.permissionMode || permissionMode,
+      ) || permissionMode;
+      await recordRemoteAgentChatPermissionConfirmation({
+        commandId,
+        event,
+        permissionMode: appliedPermissionMode,
+        provider,
+        sessionFields: sessionValidation.sessionFields,
+        terminal,
+        workspaceId,
+      });
+      await recordRemoteCommandStatus(event, "applied", "Permission mode applied to the live terminal.", {
+        commandId,
+        commandKind,
+        confirmation: "recorded",
+        paneId,
+        permissionMode: appliedPermissionMode,
+        provider,
+        seenModes: automationResult.seenModes || [],
+        labelsSeen: automationResult.labelsSeen || [],
+        terminal: remoteControlTerminalSummary(terminal, target),
+        workspaceId,
+      });
+    };
+    const scheduleRemoteAgentChatPermissionDrain = (commandId) => {
+      const queued = remotePermissionConfigQueueRef.current.get(commandId);
+      if (!queued || queued.timer) {
+        return;
+      }
+      const timer = window.setTimeout(async () => {
+        const request = remotePermissionConfigQueueRef.current.get(commandId);
+        if (!request) {
+          return;
+        }
+        remotePermissionConfigQueueRef.current.set(commandId, {
+          ...request,
+          timer: null,
+        });
+        const { terminal } = findRemoteControlTerminal(request.workspaceId, request.target);
+        const assessment = assessRemoteControlTerminalIdle(terminal);
+        if (!terminal || !assessment.idle) {
+          if (Date.now() - Number(request.queuedAtMs || 0) > 10 * 60 * 1000) {
+            remotePermissionConfigQueueRef.current.delete(commandId);
+            await recordRemoteCommandStatus(request.event, "failed", "Timed out waiting for the terminal to become idle for permission configuration.", {
+              assessment,
+              commandId,
+              commandKind: request.commandKind,
+              workspaceId: request.workspaceId,
+            });
+            return;
+          }
+          scheduleRemoteAgentChatPermissionDrain(commandId);
+          return;
+        }
+        remotePermissionConfigQueueRef.current.delete(commandId);
+        try {
+          await applyRemoteAgentChatPermissionChange(request);
+        } catch (error) {
+          await recordRemoteCommandStatus(request.event, "failed", getErrorMessage(error, "Unable to apply permission configuration."), {
+            commandId,
+            commandKind: request.commandKind,
+            workspaceId: request.workspaceId,
+          });
+        }
+      }, 2_000);
+      remotePermissionConfigQueueRef.current.set(commandId, {
+        ...queued,
+        timer,
+      });
+    };
+    const handleRemoteAgentChatPermissionChange = async ({
+      agentId,
+      commandId,
+      commandKind,
+      event,
+      target,
+      workspaceId,
+    }) => {
+      const { terminal } = findRemoteControlTerminal(workspaceId, target);
+      const assessment = assessRemoteControlTerminalIdle(terminal);
+      if (!terminal) {
+        await recordRemoteCommandStatus(event, "failed", "Target terminal was not found on this desktop.", {
+          commandId,
+          commandKind,
+          target,
+          workspaceId,
+        });
+        return;
+      }
+      if (!assessment.idle) {
+        const provider = remoteAgentChatConfigProvider(event, agentId, terminal);
+        const dedupeKey = remoteAgentChatPermissionDedupeKey({
+          event,
+          provider,
+          target,
+          terminal,
+          workspaceId,
+        });
+        const duplicateQueued = Array.from(remotePermissionConfigQueueRef.current.values()).find((request) => (
+          request
+            && request.commandId !== commandId
+            && request.dedupeKey
+            && request.dedupeKey === dedupeKey
+        ));
+        if (duplicateQueued) {
+          await recordRemoteCommandStatus(event, "queued", "Duplicate permission configuration command coalesced with an already queued request.", {
+            assessment,
+            commandId,
+            commandKind,
+            coalescedWithCommandId: duplicateQueued.commandId,
+            terminal: remoteControlTerminalSummary(terminal, target),
+            workspaceId,
+          });
+          return;
+        }
+        const queued = {
+          agentId,
+          commandId,
+          commandKind,
+          dedupeKey,
+          event,
+          queuedAtMs: Date.now(),
+          target,
+          workspaceId,
+        };
+        remotePermissionConfigQueueRef.current.set(commandId, queued);
+        scheduleRemoteAgentChatPermissionDrain(commandId);
+        await recordRemoteCommandStatus(event, "queued", "Terminal is busy; permission configuration will apply when it is ready.", {
+          assessment,
+          commandId,
+          commandKind,
+          terminal: remoteControlTerminalSummary(terminal, target),
+          workspaceId,
+        });
+        return;
+      }
+      try {
+        await applyRemoteAgentChatPermissionChange({
+          agentId,
+          commandId,
+          commandKind,
+          event,
+          target,
+          workspaceId,
+        });
+      } catch (error) {
+        await recordRemoteCommandStatus(event, "failed", getErrorMessage(error, "Unable to apply permission configuration."), {
           commandId,
           commandKind,
           terminal: remoteControlTerminalSummary(terminal, target),
@@ -41300,6 +42482,29 @@ export default function App() {
     }) => {
       const normalizedKind = normalizeRemoteCommandName(commandKind);
       const targetWorkspace = findWorkspaceById(workspacesRef.current, workspaceId);
+      const workspaceIsDeviceOrchestrator = isDeviceTerminalOrchestratorWorkspaceId(workspaceId);
+      const deviceOrchestratorConfigOrInterruptAction = workspaceIsDeviceOrchestrator && [
+        "agent_chat_change_model",
+        "change_agent_chat_model",
+        "agent_chat_model_change",
+        "change_session_model",
+        "session_model_change",
+        "agent_chat_change_effort",
+        "change_agent_chat_effort",
+        "agent_chat_effort_change",
+        "change_session_effort",
+        "session_effort_change",
+        "agent_chat_change_permission_mode",
+        "change_agent_chat_permission_mode",
+        "agent_chat_permission_mode_change",
+        "change_session_permission_mode",
+        "session_permission_mode_change",
+        "terminal_interrupt",
+        "interrupt_terminal",
+        "terminal_stop",
+        "stop_terminal",
+        "terminal_cancel",
+      ].includes(normalizedKind);
       const target = { targetTerminalId, targetTerminalIndex, targetTerminalName, targetThreadId };
       await recordRemoteCommandStatus(event, "validating", "Desktop is validating the remote control command.");
       if ([
@@ -41617,8 +42822,11 @@ export default function App() {
           });
           return;
         }
-        const explicitWorkspace = findWorkspaceById(workspacesRef.current, explicitWorkspaceId);
-        if (!explicitWorkspace) {
+        const explicitWorkspaceIsAppControl = isDeviceTerminalOrchestratorWorkspaceId(explicitWorkspaceId);
+        const explicitWorkspace = explicitWorkspaceIsAppControl
+          ? null
+          : findWorkspaceById(workspacesRef.current, explicitWorkspaceId);
+        if (!explicitWorkspace && !explicitWorkspaceIsAppControl) {
           await recordRemoteCommandStatus(event, "failed", "Workspace is not available on this desktop.", {
             commandId,
             commandKind,
@@ -41674,7 +42882,7 @@ export default function App() {
               failed,
               staged,
               workspaceId: explicitWorkspaceId,
-              workspaceName: explicitWorkspace?.name || "",
+              workspaceName: explicitWorkspace?.name || (explicitWorkspaceIsAppControl ? "Terminal Orchestrators" : ""),
             },
           );
         } catch (error) {
@@ -41682,43 +42890,60 @@ export default function App() {
             attachmentCount: attachments.length,
             commandId,
             commandKind,
-	            workspaceId: explicitWorkspaceId,
-	          });
-	        }
-	        return;
-	      }
-	      if (!targetWorkspace) {
-	        await recordRemoteCommandStatus(event, "failed", "Workspace is not available on this desktop.", {
-	          commandId,
-	          commandKind,
-	          workspaceId,
-	        });
-	        return;
-	      }
-	      if ([
-	        "agent_chat_change_model",
-	        "change_agent_chat_model",
-	        "agent_chat_model_change",
-	        "change_session_model",
-	        "session_model_change",
-	        "agent_chat_change_effort",
-	        "change_agent_chat_effort",
-	        "agent_chat_effort_change",
-	        "change_session_effort",
-	        "session_effort_change",
-	      ].includes(normalizedKind)) {
-	        await handleRemoteAgentChatConfigChange({
-	          agentId,
-	          commandId,
-	          commandKind,
-	          event,
-	          target,
-	          workspaceId,
-	        });
-	        return;
-	      }
-	      if ([
-	        "todo_queue",
+            workspaceId: explicitWorkspaceId,
+          });
+        }
+        return;
+      }
+      if (!targetWorkspace && !deviceOrchestratorConfigOrInterruptAction) {
+        await recordRemoteCommandStatus(event, "failed", "Workspace is not available on this desktop.", {
+          commandId,
+          commandKind,
+          workspaceId,
+        });
+        return;
+      }
+      if ([
+        "agent_chat_change_model",
+        "change_agent_chat_model",
+        "agent_chat_model_change",
+        "change_session_model",
+        "session_model_change",
+        "agent_chat_change_effort",
+        "change_agent_chat_effort",
+        "agent_chat_effort_change",
+        "change_session_effort",
+        "session_effort_change",
+      ].includes(normalizedKind)) {
+        await handleRemoteAgentChatConfigChange({
+          agentId,
+          commandId,
+          commandKind,
+          event,
+          target,
+          workspaceId,
+        });
+        return;
+      }
+      if ([
+        "agent_chat_change_permission_mode",
+        "change_agent_chat_permission_mode",
+        "agent_chat_permission_mode_change",
+        "change_session_permission_mode",
+        "session_permission_mode_change",
+      ].includes(normalizedKind)) {
+        await handleRemoteAgentChatPermissionChange({
+          agentId,
+          commandId,
+          commandKind,
+          event,
+          target,
+          workspaceId,
+        });
+        return;
+      }
+      if ([
+        "todo_queue",
         "queue_todo",
         "workspace_todo_queue",
       ].includes(normalizedKind)) {
@@ -41746,16 +42971,16 @@ export default function App() {
         window.dispatchEvent(new CustomEvent(REMOTE_TODO_REQUEUE_EVENT, {
           detail: {
             commandId,
-	            item: {
-	              aliasIds: [todoId, commandId].filter(Boolean),
-	              commandId,
-	              command_id: commandId,
-	              createdAt: event.created_at || event.createdAt || new Date().toISOString(),
-	              id: todoId,
-	              identityTokens: [todoId, commandId].filter(Boolean),
-	              kind: "todo",
-	              remoteCommand: {
-	                commandId,
+            item: {
+              aliasIds: [todoId, commandId].filter(Boolean),
+              commandId,
+              command_id: commandId,
+              createdAt: event.created_at || event.createdAt || new Date().toISOString(),
+              id: todoId,
+              identityTokens: [todoId, commandId].filter(Boolean),
+              kind: "todo",
+              remoteCommand: {
+                commandId,
                 source: event.source || "next-diffforge",
                 targetAgentId: agentId || "",
                 targetTerminalId,
@@ -41763,12 +42988,12 @@ export default function App() {
                 targetTerminalName,
                 targetThreadId,
                 todoId,
-	              },
-	              source: "next-remote-control",
-	              todoId,
-	              todo_id: todoId,
-	              targetAgentId: agentId || "",
-	              targetAgentLabel: agentId ? getManagedAgentLabel(agentId) : "",
+              },
+              source: "next-remote-control",
+              todoId,
+              todo_id: todoId,
+              targetAgentId: agentId || "",
+              targetAgentLabel: agentId ? getManagedAgentLabel(agentId) : "",
               targetTerminalId,
               targetTerminalIndex,
               targetTerminalName,
@@ -42177,44 +43402,46 @@ export default function App() {
             if (runtimeActive) {
               rejectField("workspace_root", "workspace_active");
             } else {
-            const normalizedRoot = await invoke("validate_workspace_root_directory", { path: requestedRootInput });
-            const rootDirectory = normalizedRoot?.workingDirectory || "";
-            if (!rootDirectory) {
-              throw new Error("Workspace root directory was not returned by validation.");
-            }
-            const duplicateWorkspace = findWorkspaceByEffectiveRoot(
-              workspaceCatalogRef.current,
-              workspaceSettingsRef.current,
-              rootDirectory,
-              defaultWorkingDirectoryRef.current,
-              workspaceId,
-            );
-            if (duplicateWorkspace) {
-              await recordRemoteCommandStatus(event, "failed", `That folder is already attached to ${duplicateWorkspace.name || "another workspace"}.`, {
-                commandId,
-                commandKind,
-                duplicateWorkspaceId: duplicateWorkspace.id,
-                workspaceId,
-              });
-              return;
-            }
-            rootChanged = getWorkspaceRootIdentity(rootDirectory) !== getWorkspaceRootIdentity(effectiveRootDirectory);
-            effectiveRootDirectory = rootDirectory;
-            effectiveRootGitRepositoryKnown = true;
-            effectiveRootGitRepository = Boolean(normalizedRoot?.gitRepository || normalizedRoot?.git_repository);
-            nextSettingsValues = {
-              ...(nextSettingsValues || {}),
-              rootDirectory,
-              rootWasEmptyAtSelection: Boolean(normalizedRoot?.emptyDirectory),
-              rootGitRepository: effectiveRootGitRepository,
-            };
-            catalogPatch = {
-              ...(catalogPatch || {}),
-              rootDirectory,
-              rootIdentity: normalizedRoot?.rootIdentity || getWorkspaceRootIdentity(rootDirectory),
-            };
-            appliedSettings.workspaceRoot = rootDirectory;
-            appliedFields.push("workspace_root");
+              const normalizedRoot = await invoke("validate_workspace_root_directory", { path: requestedRootInput });
+              const rootDirectory = normalizedRoot?.workingDirectory || "";
+              if (!rootDirectory) {
+                throw new Error("Workspace root directory was not returned by validation.");
+              }
+              rootChanged = getWorkspaceRootIdentity(rootDirectory) !== getWorkspaceRootIdentity(effectiveRootDirectory);
+              if (rootChanged) {
+                const duplicateWorkspace = findWorkspaceByEffectiveRoot(
+                  workspaceCatalogRef.current,
+                  workspaceSettingsRef.current,
+                  rootDirectory,
+                  defaultWorkingDirectoryRef.current,
+                  workspaceId,
+                );
+                if (duplicateWorkspace) {
+                  await recordRemoteCommandStatus(event, "failed", `That folder is already attached to ${duplicateWorkspace.name || "another workspace"}.`, {
+                    commandId,
+                    commandKind,
+                    duplicateWorkspaceId: duplicateWorkspace.id,
+                    workspaceId,
+                  });
+                  return;
+                }
+              }
+              effectiveRootDirectory = rootDirectory;
+              effectiveRootGitRepositoryKnown = true;
+              effectiveRootGitRepository = Boolean(normalizedRoot?.gitRepository || normalizedRoot?.git_repository);
+              nextSettingsValues = {
+                ...(nextSettingsValues || {}),
+                rootDirectory,
+                rootWasEmptyAtSelection: Boolean(normalizedRoot?.emptyDirectory),
+                rootGitRepository: effectiveRootGitRepository,
+              };
+              catalogPatch = {
+                ...(catalogPatch || {}),
+                rootDirectory,
+                rootIdentity: normalizedRoot?.rootIdentity || getWorkspaceRootIdentity(rootDirectory),
+              };
+              appliedSettings.workspaceRoot = rootDirectory;
+              appliedFields.push("workspace_root");
             }
           }
           if (wantsTerminalCount
@@ -43983,6 +45210,11 @@ export default function App() {
           const navigationAction = remoteCommandIsNavigationAction(commandKind);
           const deviceOnlyNavigationAction = remoteCommandIsDeviceOnlyNavigationAction(commandKind);
           const terminalOrchestratorMessageAction = sendMessageTask;
+          const dispatchTodosAction = [
+            "dispatch_todos",
+            "loopspace_dispatch_todos",
+            "loopspace_workspace_todo_dispatch",
+          ].includes(normalizeRemoteCommandName(commandKind));
           const attachmentStageAction = [
             "chat_attachment_stage",
             "chat_attachments_stage",
@@ -44018,7 +45250,12 @@ export default function App() {
             });
             return;
           }
-          if (terminalOrchestratorMessageAction && loopspaceRuntimeId && loopRuntimeNodeId) {
+          let graphCheckpointParentKind = dispatchTodosAction
+            ? "dispatch_todos"
+            : terminalOrchestratorMessageAction
+              ? "send_message"
+              : "";
+          if ((terminalOrchestratorMessageAction || dispatchTodosAction) && loopspaceRuntimeId && loopRuntimeNodeId) {
             let graphResult = await invoke("cloud_mcp_get_loopspace_graph", {
               loopspaceId: loopspaceRuntimeId,
             }).catch(() => null);
@@ -44033,7 +45270,27 @@ export default function App() {
               graphSourceText,
               loopRuntimeNodeId,
             );
+            graphCheckpointParentKind = loopspaceGraphNodeKindForId(graphSourceText, loopRuntimeNodeId)
+              || graphCheckpointParentKind;
             checkpointPlan = loopspaceGraphMergeCheckpointPlansForDispatch(checkpointPlan, graphCheckpointPlan);
+          }
+          if ((terminalOrchestratorMessageAction || dispatchTodosAction) && loopRuntimeRunId && checkpointPlan.length) {
+            const plansByRunId = appControlLoopspaceCheckpointPlansByRunIdRef.current;
+            plansByRunId.set(loopRuntimeRunId, {
+              commandKind: dispatchTodosAction ? "loopspace_dispatch_todos" : "terminal_orchestrator_send_message",
+              checkpointPlan: loopspaceGraphCheckpointPlanFromDispatch(checkpointPlan),
+              createdAtMs: Date.now(),
+              loopRuntimeNodeId,
+              loopRuntimeNodeKind: graphCheckpointParentKind,
+              loopspaceId: loopspaceRuntimeId,
+            });
+            if (plansByRunId.size > 200) {
+              const staleKeys = [...plansByRunId.entries()]
+                .sort((left, right) => Number(left[1]?.createdAtMs || 0) - Number(right[1]?.createdAtMs || 0))
+                .slice(0, plansByRunId.size - 200)
+                .map(([key]) => key);
+              staleKeys.forEach((key) => plansByRunId.delete(key));
+            }
           }
           if (terminalOrchestratorMessageAction) {
             if (!text) {
@@ -44048,6 +45305,7 @@ export default function App() {
             setWorkspaceToolPaneMode(TODO_QUEUE_PANE_MODE_NORMAL);
             await recordRemoteCommandStatus(event, "queued", "Queued for the terminal orchestrator.", {
               agentId,
+              attachmentCount: chatAttachments.length,
               commandId,
               commandKind,
               targetTerminalId,
@@ -44060,9 +45318,11 @@ export default function App() {
             if (loopRuntimeRunId && checkpointPlan.length) {
               const plansByRunId = appControlLoopspaceCheckpointPlansByRunIdRef.current;
               plansByRunId.set(loopRuntimeRunId, {
+                commandKind: "terminal_orchestrator_send_message",
                 checkpointPlan: loopspaceGraphCheckpointPlanFromDispatch(checkpointPlan),
                 createdAtMs: Date.now(),
                 loopRuntimeNodeId,
+                loopRuntimeNodeKind: graphCheckpointParentKind || "send_message",
                 loopspaceId: loopspaceRuntimeId,
               });
               if (plansByRunId.size > 200) {
@@ -44076,6 +45336,11 @@ export default function App() {
             window.dispatchEvent(new CustomEvent(REMOTE_APP_CONTROL_SEND_MESSAGE_EVENT, {
               detail: {
                 agentId,
+                ...(chatAttachments.length ? {
+                  attachments: chatAttachments,
+                  chatAttachments,
+                  chat_attachments: chatAttachments,
+                } : {}),
                 body: text,
                 commandId,
                 commandKind,
@@ -44155,6 +45420,9 @@ export default function App() {
           }
           const targetWorkspace = findWorkspaceById(workspaces, workspaceId);
           text = await hydrateRemoteCommandTodoText(event, workspaceId, text);
+          if (!text && dispatchTodosAction && loopRuntimeRunId) {
+            text = "Loopspace Dispatch Todo run";
+          }
           if (!text) {
             await recordRemoteCommandStatus(event, "failed", "Remote command did not include a task message.", {
               commandId,
@@ -44201,6 +45469,12 @@ export default function App() {
                 kind: "todo",
                 remoteCommand: {
                   commandId,
+                  commandKind,
+                  command_kind: commandKind,
+                  ...(checkpointPlan.length && !dispatchTodosAction ? {
+                    checkpointPlan: loopspaceGraphCheckpointPlanFromDispatch(checkpointPlan),
+                    checkpoint_plan: loopspaceGraphCheckpointPlanFromDispatch(checkpointPlan),
+                  } : {}),
                   ...(dispatchSource ? { dispatchSource } : {}),
                   ...(dispatchTarget ? { dispatchTarget } : {}),
                   ...(loopRuntimeRunId ? {
@@ -44340,7 +45614,7 @@ export default function App() {
         unlistenDeviceDeleted();
       }
     };
-  }, [activateWorkspace, activeAccountScopeKey, addWorkspaceTerminal, agentStatuses, changeWorkspaceTerminalRole, closeWorkspaceTerminal, deactivateWorkspace, deleteWorkspaceFromForge, logout, manageWorkspaceAgents, refreshAgentStatuses, requestWorkspaceActivation, requestWorkspaceTerminalFocus, showView, syncAgentInstallationsToCloud, workspaces]);
+  }, [activateWorkspace, activeAccountScopeKey, addWorkspaceTerminal, agentStatuses, changeWorkspaceTerminalRole, closeWorkspaceTerminal, deactivateWorkspace, deleteWorkspaceFromForge, logout, manageWorkspaceAgents, refreshAgentStatuses, requestWorkspaceActivation, requestWorkspaceTerminalFocus, rustTerminalAuthorityOrchestrators, showView, syncAgentInstallationsToCloud, workspaces]);
 
   useEffect(() => {
     let disposed = false;
@@ -44558,6 +45832,11 @@ export default function App() {
         append(baseId);
         if (agentId) {
           append(`${baseId}-${agentId}`);
+        }
+        if (isDeviceTerminalOrchestratorWorkspaceId(safeWorkspaceId)) {
+          append(terminalIndex === 0
+            ? DEVICE_TERMINAL_ORCHESTRATOR_PANE_ID
+            : `${DEVICE_TERMINAL_ORCHESTRATOR_PANE_ID}-${terminalIndex}`);
         }
       }
       return values;
@@ -47579,6 +48858,8 @@ export default function App() {
           };
           let checkpointPlan = [];
           let checkpointPlanSource = "";
+          let checkpointParentKind = "";
+          let checkpointCommandKind = appControlText(input, ["command_kind", "commandKind", "kind", "type"]);
           const cachedCheckpointPlan = appControlLoopspaceCheckpointPlansByRunIdRef.current.get(loopRuntimeRunId);
           if (
             cachedCheckpointPlan
@@ -47587,6 +48868,9 @@ export default function App() {
             if (!loopRuntimeNodeId && cachedCheckpointPlan.loopRuntimeNodeId) {
               loopRuntimeNodeId = cachedCheckpointPlan.loopRuntimeNodeId;
             }
+            checkpointParentKind = String(cachedCheckpointPlan.loopRuntimeNodeKind || "").trim().toLowerCase();
+            checkpointCommandKind = checkpointCommandKind
+              || String(cachedCheckpointPlan.commandKind || cachedCheckpointPlan.command_kind || "").trim();
             checkpointPlan = Array.isArray(cachedCheckpointPlan.checkpointPlan)
               ? cachedCheckpointPlan.checkpointPlan
               : [];
@@ -47596,6 +48880,10 @@ export default function App() {
           const selectedLoopspaceId = String(selectedLoopspaceIdRef.current || "").trim();
           const localGraphSource = loopspaceGraphSourceTextFromRow(loopspace)
             || (selectedLoopspaceId === loopspaceId ? graphSourceRef.current : "");
+          if (localGraphSource && loopRuntimeNodeId) {
+            checkpointParentKind = loopspaceGraphNodeKindForId(localGraphSource, loopRuntimeNodeId)
+              || checkpointParentKind;
+          }
           if (!checkpointPlan.length && localGraphSource) {
             checkpointPlan = loopspaceGraphCheckpointPlanForSendMessage(localGraphSource, loopRuntimeNodeId);
             checkpointPlanSource = "local";
@@ -47614,6 +48902,8 @@ export default function App() {
                 || "",
             );
             if (remoteSource) {
+              checkpointParentKind = loopspaceGraphNodeKindForId(remoteSource, loopRuntimeNodeId)
+                || checkpointParentKind;
               checkpointPlan = loopspaceGraphCheckpointPlanForSendMessage(remoteSource, loopRuntimeNodeId);
               checkpointPlanSource = "cloud";
             }
@@ -47642,11 +48932,36 @@ export default function App() {
               && Number.isFinite(stepIndex)
               && stepIndex === explicitCheckpointCount
             );
-          const parentStatus = stepStatus === "failed"
-            ? "failed"
-            : finalCheckpoint && (stepStatus === "completed" || stepStatus === "skipped")
-              ? "completed"
-              : "running";
+          const currentCheckpoint = checkpointMatched
+            ? checkpointPlan[checkpointIndex]
+            : Number.isFinite(stepIndex) && stepIndex > 0
+              ? checkpointPlan[stepIndex - 1] || null
+              : null;
+          const nextCheckpoint = checkpointPlan.length
+            ? (stepStatus === "completed" || stepStatus === "skipped")
+              ? checkpointMatched
+                ? checkpointPlan[checkpointIndex + 1] || null
+                : Number.isFinite(stepIndex) && stepIndex > 0
+                  ? checkpointPlan[stepIndex] || null
+                  : loopspaceGraphFirstOpenCheckpoint(checkpointPlan)
+              : currentCheckpoint || loopspaceGraphFirstOpenCheckpoint(checkpointPlan)
+            : null;
+          const normalizedCheckpointCommandKind = normalizeRemoteCommandName(checkpointCommandKind);
+          const parentIsDispatchTodos = checkpointParentKind === "dispatch_todos"
+            || [
+              "dispatch_todos",
+              "loopspace_dispatch_todos",
+              "loopspace_workspace_todo_dispatch",
+            ].includes(normalizedCheckpointCommandKind);
+          const progressCommandKind = checkpointCommandKind
+            || (parentIsDispatchTodos ? "loopspace_dispatch_todos" : "terminal_orchestrator_send_message");
+          const parentStatus = parentIsDispatchTodos
+            ? "running"
+            : stepStatus === "failed"
+              ? "failed"
+              : finalCheckpoint && (stepStatus === "completed" || stepStatus === "skipped")
+                ? "completed"
+                : "running";
           if (checkpointPlan.length) {
             checkpointProgress.checkpointCount = checkpointPlan.length;
             checkpointProgress.checkpoint_count = checkpointPlan.length;
@@ -47659,11 +48974,19 @@ export default function App() {
             checkpointProgress.finalCheckpoint = true;
             checkpointProgress.final_checkpoint = true;
           }
+          if (currentCheckpoint) {
+            checkpointProgress.currentCheckpoint = currentCheckpoint;
+            checkpointProgress.current_checkpoint = currentCheckpoint;
+          }
+          if (nextCheckpoint) {
+            checkpointProgress.nextCheckpoint = nextCheckpoint;
+            checkpointProgress.next_checkpoint = nextCheckpoint;
+          }
           const remoteEvent = {
             command_id: loopRuntimeRunId,
             commandId: loopRuntimeRunId,
-            command_kind: "terminal_orchestrator_send_message",
-            commandKind: "terminal_orchestrator_send_message",
+            command_kind: progressCommandKind,
+            commandKind: progressCommandKind,
             loop_runtime_run_id: loopRuntimeRunId,
             loopRuntimeRunId,
             loop_runtime_node_id: loopRuntimeNodeId,
@@ -47672,6 +48995,8 @@ export default function App() {
             loopRuntimeEdgeId,
             loopspace_id: loopspaceId,
             loopspaceId,
+            loop_runtime_node_kind: checkpointParentKind,
+            loopRuntimeNodeKind: checkpointParentKind,
             trigger_id: triggerId,
             triggerId,
             trigger_run_id: triggerRunId,
@@ -47681,24 +49006,28 @@ export default function App() {
             details: {
               checkpointProgress,
               checkpoint_progress: checkpointProgress,
+              commandKind: progressCommandKind,
               checkpointPlanSource,
+              loopRuntimeNodeKind: checkpointParentKind,
               source: "app_control_mcp",
             },
             event: remoteEvent,
             message: progressMessage || (
               parentStatus === "completed"
                 ? "Loopspace send-message checkpoints completed."
+                : parentIsDispatchTodos
+                  ? "Loopspace dispatch-todo checkpoint updated."
                 : stepTitle
                   ? `${stepTitle} ${stepStatus}.`
                   : `Loopspace checkpoint ${stepStatus}.`
             ),
             status: parentStatus,
           });
-          if (["completed", "failed", "interrupted"].includes(parentStatus)) {
+          if (!parentIsDispatchTodos && ["completed", "failed", "interrupted"].includes(parentStatus)) {
             window.dispatchEvent(new CustomEvent(APP_CONTROL_REMOTE_COMMAND_SETTLED_EVENT, {
               detail: {
                 commandId: loopRuntimeRunId,
-                commandKind: "terminal_orchestrator_send_message",
+                commandKind: progressCommandKind,
                 loopRuntimeEdgeId,
                 loopRuntimeNodeId,
                 loopRuntimeRunId,
@@ -47719,6 +49048,12 @@ export default function App() {
             ok: result?.ok !== false,
             data: {
               checkpointProgress,
+              checkpointPlan: loopspaceGraphCheckpointPlanFromDispatch(checkpointPlan),
+              checkpoint_plan: loopspaceGraphCheckpointPlanFromDispatch(checkpointPlan),
+              currentCheckpoint,
+              current_checkpoint: currentCheckpoint,
+              nextCheckpoint,
+              next_checkpoint: nextCheckpoint,
               parentStatus,
               result: verboseReply ? result : {
                 ok: result?.ok !== false,
@@ -47758,7 +49093,17 @@ export default function App() {
               result,
               source_format: DFBLUEPRINT_SOURCE_FORMAT,
               blueprint: parseDfBlueprintSource(String(result?.graph?.source || result?.graph?.sourceText || result?.graph?.source_text || "")),
-              instructions: "Loopspace graphs use .dfblueprint source. Prefer patch_loopspace_graph for small edits. Trigger nodes are references to trigger inventory only: call list_loopspace_triggers, use create_loopspace_trigger with explicit trigger_type if needed, then patch with attach_trigger and trigger_id. Edges must use legal node contract ports: triggers expose out; run_script/send_message/dispatch_todos/notify_device expose exec, success, failure, interrupt; document_read/document_write expose docs; asset_read/asset_write expose assets; most executable targets accept in. Specify from_port/fromPort and to_port/toPort on connect operations, especially from action nodes. Supported add_node kinds are document_read, document_write, asset_read, asset_write, run_script, send_message, dispatch_todos, notify_device, and step. Resource nodes use doc_refs or asset_refs for selected inputs, create_name for generated outputs, h for height, and target_mode for selection/create behavior. dispatch_todos uses target_workspace_ids and todo_lines, plus optional target_terminal_id, target_agent_id, model, reasoning_effort, and speed. notify_device sends a native/push notification when reached and uses optional device_id (empty targets all account devices), title, body, url, and delivery auto|native|push; title/body support {{loop_name}}, {{node_title}}, {{from_node}}, {{branch}}, {{device_name}}, {{run_id}}, and {{date}} template variables. document_write accepts operation append|replace|prepend|create_if_missing|delete and optional content_template for deterministic webhook/body writes without an agent. asset_write accepts operation add_version|replace|create_if_missing|delete and optional content_template for deterministic webhook/body assets without an agent. To guide a send-message substep, connect step.success -> run_script.in, send_message.in, dispatch_todos.in, or notify_device.in when a completed substep should start another action; connect document_read.docs or document_write.docs -> step.in for readable document context, asset_read.assets or asset_write.assets -> step.in for readable asset context, step.docs -> document_write.in for document generation, and step.assets -> asset_write.in for asset generation. Do not connect send_message.exec, send_message.success, dispatch_todos.exec, dispatch_todos.success, run_script.exec, run_script.success, or other action execution branches directly into asset_write. add_node and update_node_props accept resource metadata as top-level fields or nested under props. Never invent standalone cron/manual/webhook trigger nodes.",
+              instructions: [
+                "Loopspace graphs use .dfblueprint source. Prefer patch_loopspace_graph for small edits. Trigger nodes are references to trigger inventory only: call list_loopspace_triggers, use create_loopspace_trigger with explicit trigger_type if needed, then patch with attach_trigger and trigger_id.",
+                "Edges must use legal node contract ports: triggers expose out; run_script/send_message/dispatch_todos/notify_device expose exec, success, failure, interrupt; document_read/document_write expose docs; asset_read/asset_write expose assets; most executable targets accept in. Specify from_port/fromPort and to_port/toPort on connect operations, especially from action nodes.",
+                "Supported add_node kinds are document_read, document_write, asset_read, asset_write, run_script, send_message, dispatch_todos, notify_device, and step. Resource nodes use doc_refs or asset_refs for selected inputs, create_name for generated outputs, h for height, and target_mode for selection/create behavior.",
+                "send_message is the action region for terminal-orchestrator/coding-agent messages. dispatch_todos is the action region for queued workspace todos; it uses target_workspace_ids and todo_lines, target_terminal_mode auto|pinned, optional target_terminal_id/index/name, target_agent_id, model, reasoning_effort, and speed. dispatch_todos can be direct with no child steps or can contain internal step checkpoints parented to the dispatch_todos node, exactly like send_message.",
+                "Loopspace packets use compact LS/1 lines instead of verbose JSON. When executing a Dispatch Todo with loop_runtime_run_id, the initial todo carries run identity only, not the child loop contents. Pass the runtime ids to coordination-kernel.start_task, wait for its response, and use the LS/1 run_context in loopspace_run_context to resolve only the connected subloop slice, the main Dispatch Todo action for direct runs or the first/current child checkpoint for stepped runs, and the exact docs/assets read-write resources. After each local checkpoint, call record_loopspace_step_progress, wait for the response, and follow nextCheckpoint.",
+                "notify_device sends a native/push notification when reached and uses optional device_id (empty targets all account devices), title, body, url, and delivery auto|native|push; title/body support {{loop_name}}, {{node_title}}, {{from_node}}, {{branch}}, {{device_name}}, {{run_id}}, and {{date}} template variables.",
+                "document_write accepts operation append|replace|prepend|create_if_missing|delete and optional content_template for deterministic webhook/body writes without an agent. asset_write accepts operation add_version|replace|create_if_missing|delete and optional content_template for deterministic webhook/body assets without an agent.",
+                "To guide an internal action substep, connect step.success -> run_script.in, send_message.in, dispatch_todos.in, or notify_device.in when a completed substep should start another action; connect document_read.docs or document_write.docs -> step.in for readable document context, asset_read.assets or asset_write.assets -> step.in for readable asset context, step.docs -> document_write.in for document generation, and step.assets -> asset_write.in for asset generation.",
+                "Do not connect send_message.exec, send_message.success, dispatch_todos.exec, dispatch_todos.success, run_script.exec, run_script.success, or other action execution branches directly into document_write or asset_write. add_node and update_node_props accept resource metadata as top-level fields or nested under props. Never invent standalone cron/manual/webhook trigger nodes.",
+              ].join(" "),
               loopspace: { id: loopspace.id, name: loopspace.name },
               state: buildAppControlState(),
             },
@@ -52971,23 +54316,8 @@ export default function App() {
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
     setWorkspaceDeleteConfirmId("");
-  }, [
-    selectedWorkspace?.id,
-    selectedWorkspace?.name,
-    selectedWorkspaceRootDirectory,
-    selectedWorkspaceAgentSessionMode,
-    selectedWorkspaceAgentPermissions,
-    selectedWorkspaceDocumentCount,
-    selectedWorkspacePcbPanelCount,
-    selectedWorkspaceVmPanelCount,
-    selectedWorkspaceVideoPanelCount,
-    selectedWorkspaceWebPanelCount,
-    selectedWorkspaceTerminalOnlyCount,
-    selectedWorkspaceTerminalOnlyRoles,
-    workspaceTerminalFallbackRole,
-    workspaceTerminalRoleOptions,
-    workspaceSettingsModalId,
-  ]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspaceSettingsModalId, selectedWorkspace?.id]);
 
   useEffect(() => {
     if (
@@ -53883,6 +55213,17 @@ export default function App() {
                         <span>Tokenomics</span>
                       </RailActionButton>
                       <RailActionButton
+                        aria-label="Devices"
+                        data-active={activeView === "devices"}
+                        data-scope="global"
+                        onClick={() => showView("devices")}
+                        title="Devices"
+                        type="button"
+                      >
+                        <RailDevicesIcon aria-hidden="true" />
+                        <span>Devices</span>
+                      </RailActionButton>
+                      <RailActionButton
                         aria-label="Settings"
                         data-active={activeView === "settings"}
                         data-scope="global"
@@ -54025,6 +55366,7 @@ export default function App() {
                             terminalRolesByIndex={runtimeDescriptor.terminalRolesByIndex}
                             terminalWorkspaceRootWasEmptyAtSelection={runtimeDescriptor.rootWasEmptyAtSelection}
                             terminalWorkspaceWorkingDirectory={runtimeDescriptor.workingDirectory}
+                            terminalRuntimeRestartKey={runtimeDescriptor.terminalRuntimeRestartKey}
                             terminalWorkspaceCoordinationTargets={
                               workspaceRuntimeCoordinationTargetsByWorkspaceId.get(runtimeWorkspace.id) || EMPTY_ARRAY
                             }
@@ -54137,6 +55479,7 @@ export default function App() {
                           agentLaunchDefaults={agentLaunchDefaults}
                           error={loopspaceError}
                           assetLibrary={accountAssetsLibrary.library}
+                          deviceLiveState={cloudWorkspaceProgress.deviceLiveState}
                           knownDevices={cloudWorkspaceProgress.knownDevices}
                           localDesktopProfile={cloudDesktopDeviceProfile}
                           localScripts={appScriptsLibrary.scripts}
@@ -54264,10 +55607,10 @@ export default function App() {
                             />
                           </WorkspaceCreateSection>
 
-                          <WorkspaceCreateSection>
-                            <SettingsLabel>Storage</SettingsLabel>
-                            <SettingsHint>Cloud is selected for this loop. Local-only loopspaces are not enabled yet.</SettingsHint>
-                            <AppearanceThemeGrid>
+	                          <WorkspaceCreateSection>
+	                            <SettingsLabel>Storage</SettingsLabel>
+	                            <SettingsHint>Cloud is selected for this loop. Local-only loopspaces are not enabled yet.</SettingsHint>
+	                            <AppearanceThemeGrid>
                               <AppearanceThemeButton
                                 data-selected="false"
                                 disabled
@@ -54289,10 +55632,36 @@ export default function App() {
                                   <small>Selected</small>
                                 </div>
                               </AppearanceThemeButton>
-                            </AppearanceThemeGrid>
+	                            </AppearanceThemeGrid>
+	                          </WorkspaceCreateSection>
+
+                          <WorkspaceCreateSection>
+                            <SettingsLabel>Notifications</SettingsLabel>
+                            <SettingsHint>Loop lifecycle push notifications inherit account defaults unless overridden here.</SettingsHint>
+                            <AgentLaunchDefaultsGrid>
+                              {LOOPSPACE_NOTIFICATION_OVERRIDE_KEYS.map((status) => {
+                                const currentOverride = notificationPreferences.loopspace_overrides?.[loopspaceSettingsLoop.id]?.[status];
+                                return (
+                                  <AgentLaunchField key={status}>
+                                    <SettingsLabel>{LOOPSPACE_NOTIFICATION_OVERRIDE_LABELS[status]}</SettingsLabel>
+                                    <AppSelect
+                                      isDisabled={notificationPreferencesState === "loading" || notificationPreferencesState === "saving"}
+                                      onChange={(value) => updateLoopspaceNotificationPreference(
+                                        loopspaceSettingsLoop.id,
+                                        status,
+                                        value,
+                                      )}
+                                      options={LOOPSPACE_NOTIFICATION_OVERRIDE_OPTIONS}
+                                      value={loopspaceOverrideSelectValue(currentOverride)}
+                                    />
+                                  </AgentLaunchField>
+                                );
+                              })}
+                            </AgentLaunchDefaultsGrid>
+                            {notificationPreferencesError && <FormMessage $state="error">{notificationPreferencesError}</FormMessage>}
                           </WorkspaceCreateSection>
 
-                          {loopspaceError && <FormMessage $state="error">{loopspaceError}</FormMessage>}
+	                          {loopspaceError && <FormMessage $state="error">{loopspaceError}</FormMessage>}
 
                           <WorkspaceCreateFooter>
                             <PrimaryDangerButton
@@ -54629,6 +55998,14 @@ export default function App() {
                     >
                       <ButtonSettingsIcon aria-hidden="true" />
                       <span>General</span>
+                    </SettingsTabButton>
+                    <SettingsTabButton
+                      data-active={settingsTab === SETTINGS_TAB_NOTIFICATIONS ? "true" : undefined}
+                      onClick={() => setSettingsTab(SETTINGS_TAB_NOTIFICATIONS)}
+                      type="button"
+                    >
+                      <ButtonNotificationIcon aria-hidden="true" />
+                      <span>Notifications</span>
                     </SettingsTabButton>
                     <SettingsTabButton
                       data-active={settingsTab === SETTINGS_TAB_PERMISSIONS ? "true" : undefined}
@@ -55296,6 +56673,175 @@ export default function App() {
                     </AccountCard>
                   </AccountSettingsPanel>
                     </>
+                  ) : settingsTab === SETTINGS_TAB_NOTIFICATIONS ? (
+                    <>
+                      <AccountSettingsPanel>
+                        <SettingsSectionHeader>
+                          <span>Device notifications</span>
+                          <em data-tone={nativeNotificationSettings.enabled !== false ? "blue" : "orange"}>
+                            {nativeNotificationSettings.enabled !== false ? "Enabled" : "Muted"}
+                          </em>
+                          <SecondaryButton onClick={requestSettingsNotificationPermission} type="button">
+                            <ButtonNotificationIcon aria-hidden="true" />
+                            <span>Request permission</span>
+                          </SecondaryButton>
+                        </SettingsSectionHeader>
+
+                        <AccountCard data-tone={nativeNotificationSettings.enabled !== false ? "blue" : "orange"}>
+                          <AccountCardHeader>
+                            <div>
+                              <SettingsLabel>Native OS banners</SettingsLabel>
+                              <SettingsHint>
+                                Used for agent questions, failures, parked work, and finished tasks on this desktop.
+                              </SettingsHint>
+                            </div>
+                            <McpSwitchButton
+                              aria-checked={nativeNotificationSettings.enabled !== false}
+                              aria-label={nativeNotificationSettings.enabled !== false ? "Disable native notifications" : "Enable native notifications"}
+                              aria-pressed={nativeNotificationSettings.enabled !== false ? "true" : "false"}
+                              onClick={() => updateNativeNotificationsEnabled(nativeNotificationSettings.enabled === false)}
+                              role="switch"
+                              type="button"
+                            >
+                              <span aria-hidden="true" />
+                              {nativeNotificationSettings.enabled !== false ? "On" : "Off"}
+                            </McpSwitchButton>
+                          </AccountCardHeader>
+                          <SettingsIdentityGrid>
+                            <SettingsIdentityItem>
+                              <span>Permission</span>
+                              <strong>{notificationPermissionLabel}</strong>
+                            </SettingsIdentityItem>
+                            <SettingsIdentityItem>
+                              <span>App setting</span>
+                              <strong>{nativeNotificationSettings.enabled !== false ? "Enabled" : "Muted"}</strong>
+                            </SettingsIdentityItem>
+                            <SettingsIdentityItem>
+                              <span>Surface</span>
+                              <strong>Desktop only</strong>
+                            </SettingsIdentityItem>
+                          </SettingsIdentityGrid>
+                          <AccountCardFooter>
+                            <SettingsHint>
+                              OS permission is separate from account push preferences.
+                            </SettingsHint>
+                            {settingsPlatformIsMac && (
+                              <SecondaryButton
+                                onClick={() => openSettingsPermissionUrl(
+                                  "notifications",
+                                  MACOS_NOTIFICATIONS_SETTINGS_URL,
+                                  "Unable to open notification settings.",
+                                )}
+                                type="button"
+                              >
+                                <ButtonSettingsIcon aria-hidden="true" />
+                                <span>Open Settings</span>
+                              </SecondaryButton>
+                            )}
+                          </AccountCardFooter>
+                        </AccountCard>
+
+                        <AccountCard data-tone={notificationSfxSettings.enabled !== false ? "blue" : "orange"}>
+                          <AccountCardHeader>
+                            <div>
+                              <SettingsLabel>Notification sounds</SettingsLabel>
+                              <SettingsHint>
+                                Plays the local SFX ladder for approval prompts, completed work, and failures.
+                              </SettingsHint>
+                            </div>
+                            <McpSwitchButton
+                              aria-checked={notificationSfxSettings.enabled !== false}
+                              aria-label={notificationSfxSettings.enabled !== false ? "Disable notification sounds" : "Enable notification sounds"}
+                              aria-pressed={notificationSfxSettings.enabled !== false ? "true" : "false"}
+                              onClick={() => updateNotificationSfxSettings({ enabled: notificationSfxSettings.enabled === false })}
+                              role="switch"
+                              type="button"
+                            >
+                              <span aria-hidden="true" />
+                              {notificationSfxSettings.enabled !== false ? "On" : "Off"}
+                            </McpSwitchButton>
+                          </AccountCardHeader>
+                          <SetupField>
+                            <SettingsLabel>Volume</SettingsLabel>
+                            <input
+                              aria-label="Notification sound volume"
+                              max="1"
+                              min="0"
+                              onChange={(event) => updateNotificationSfxSettings({ volume: Number(event.target.value) })}
+                              step="0.01"
+                              type="range"
+                              value={notificationSfxSettings.volume}
+                            />
+                            <SettingsHint>{Math.round(notificationSfxSettings.volume * 100)}%</SettingsHint>
+                          </SetupField>
+                        </AccountCard>
+                      </AccountSettingsPanel>
+
+                      <AccountSettingsPanel>
+                        <SettingsSectionHeader>
+                          <span>Push & account notifications</span>
+                          <em data-tone={notificationPreferencesState === "error" ? "orange" : "blue"}>
+                            {notificationPreferencesStatusLabel(notificationPreferencesState, notificationPreferences)}
+                          </em>
+                          <SecondaryButton
+                            disabled={notificationPreferencesState === "loading" || notificationPreferencesState === "saving"}
+                            onClick={() => loadNotificationPreferences()}
+                            type="button"
+                          >
+                            <ButtonRefreshIcon aria-hidden="true" />
+                            <span>{notificationPreferencesState === "loading" ? "Loading..." : "Refresh"}</span>
+                          </SecondaryButton>
+                        </SettingsSectionHeader>
+
+                        {notificationPreferencesError && (
+                          <FormMessage $state="error">{notificationPreferencesError}</FormMessage>
+                        )}
+
+                        {NOTIFICATION_PREFERENCE_PUSH_OPTIONS.map((option) => {
+                          const enabled = notificationPreferences.push[option.key] !== false;
+                          return (
+                            <AccountCard data-tone={enabled ? "blue" : "orange"} key={option.key}>
+                              <AccountCardHeader>
+                                <div>
+                                  <SettingsLabel>{option.label}</SettingsLabel>
+                                  <SettingsHint>{option.detail}</SettingsHint>
+                                </div>
+                                <McpSwitchButton
+                                  aria-checked={enabled}
+                                  aria-label={enabled ? `Disable ${option.label}` : `Enable ${option.label}`}
+                                  aria-pressed={enabled ? "true" : "false"}
+                                  disabled={notificationPreferencesState === "loading" || notificationPreferencesState === "saving"}
+                                  onClick={() => updateNotificationPushPreference(option.key, !enabled)}
+                                  role="switch"
+                                  type="button"
+                                >
+                                  <span aria-hidden="true" />
+                                  {enabled ? "On" : "Off"}
+                                </McpSwitchButton>
+                              </AccountCardHeader>
+                            </AccountCard>
+                          );
+                        })}
+
+                        <AccountCard data-tone="blue">
+                          <AccountCardHeader>
+                            <div>
+                              <SettingsLabel>Web notification center</SettingsLabel>
+                              <SettingsHint>
+                                Push subscription controls and mobile PWA device rows are managed by the web dashboard.
+                              </SettingsHint>
+                            </div>
+                            <SecondaryButton
+                              onClick={() => openUrl(WEB_NOTIFICATION_SETTINGS_URL).catch(() => {})}
+                              type="button"
+                            >
+                              <ButtonWebIcon aria-hidden="true" />
+                              <span>Manage on web</span>
+                            </SecondaryButton>
+                          </AccountCardHeader>
+                        </AccountCard>
+                      </AccountSettingsPanel>
+                    </>
                   ) : settingsTab === SETTINGS_TAB_SSH ? (
                     <SshSettingsPanel />
                   ) : (
@@ -55432,6 +56978,10 @@ export default function App() {
                               </SettingsPermissionStatus>
                             </SettingsPermissionTopline>
                             <SettingsPermissionActions>
+                              <SecondaryButton onClick={() => setSettingsTab(SETTINGS_TAB_NOTIFICATIONS)} type="button">
+                                <ButtonNotificationIcon aria-hidden="true" />
+                                <span>Notification settings</span>
+                              </SecondaryButton>
                               <SecondaryButton onClick={requestSettingsNotificationPermission} type="button">
                                 <ButtonNotificationIcon aria-hidden="true" />
                                 <span>Request</span>
@@ -55684,6 +57234,23 @@ export default function App() {
                         motion={viewMotion}
                         storageUsage={cloudWorkspaceProgress.storageUsage}
                       />
+                    </WorkspaceRuntimeLayer>
+                  ) : null}
+                  {devicesViewMounted ? (
+                    <WorkspaceRuntimeLayer
+                      aria-hidden={!devicesViewVisible}
+                      data-visible={devicesViewVisible}
+                    >
+                      <ForgeWorkspace
+                        aria-label="Devices"
+                        data-motion={devicesViewActive ? viewMotion : "entered"}
+                      >
+                        <DevicesView
+                          active={devicesViewActive}
+                          deviceRows={loopspaceGraphAccountDeviceRows}
+                          localDeviceId={localDesktopProfile?.deviceId || localDesktopProfile?.device_id || ""}
+                        />
+                      </ForgeWorkspace>
                     </WorkspaceRuntimeLayer>
                   ) : null}
                   {audioViewMounted ? (

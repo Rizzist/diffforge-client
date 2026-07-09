@@ -869,6 +869,11 @@ export default function McpsWorkspaceView({
   const [marketplaceDraft, setMarketplaceDraft] = useState(EMPTY_MARKETPLACE);
   const [secretDraftRows, setSecretDraftRows] = useState([]);
   const [secretValueDrafts, setSecretValueDrafts] = useState({});
+  // Per-row local reveal/edit state for stored secrets. Values never leave the
+  // device; `revealedSecrets` only holds a plaintext after an explicit reveal.
+  const [revealedSecrets, setRevealedSecrets] = useState({});
+  const [revealingKey, setRevealingKey] = useState("");
+  const [editingSecretKeys, setEditingSecretKeys] = useState(() => new Set());
   const [actionState, setActionState] = useState("idle");
   const [actionContext, setActionContext] = useState({});
   const scrollRef = useRef(null);
@@ -972,6 +977,9 @@ export default function McpsWorkspaceView({
       if (!isSecretsServer(selectedServer)) {
         setSecretDraftRows([]);
         setSecretValueDrafts({});
+        setRevealedSecrets({});
+        setRevealingKey("");
+        setEditingSecretKeys(new Set());
       }
     }
   }, [selectedServer?.id]);
@@ -1345,9 +1353,25 @@ export default function McpsWorkspaceView({
       if (row.draftId) {
         removeSecretDraftRow(row.draftId);
       }
+      const rowKey = row.id || key;
+      // Return the row to its masked, at-rest state: drop the edit buffer, exit
+      // edit mode, and forget any revealed plaintext so the value is never left
+      // dangling on screen after a save.
       setSecretValueDrafts((drafts) => {
         const next = { ...drafts };
-        delete next[row.id || key];
+        delete next[rowKey];
+        return next;
+      });
+      setEditingSecretKeys((keys) => {
+        if (!keys.has(rowKey)) return keys;
+        const next = new Set(keys);
+        next.delete(rowKey);
+        return next;
+      });
+      setRevealedSecrets((values) => {
+        if (!(rowKey in values)) return values;
+        const next = { ...values };
+        delete next[rowKey];
         return next;
       });
     } catch (caught) {
@@ -1364,6 +1388,65 @@ export default function McpsWorkspaceView({
     workspaceId,
     workspaceName,
   ]);
+
+  const revealSecret = useCallback(
+    async (secret) => {
+      const rowKey = secret?.id || secret?.key;
+      if (!workspaceId || !secret?.key || !rowKey) return;
+      // Toggle: a second click hides the plaintext again.
+      if (rowKey in revealedSecrets) {
+        setRevealedSecrets((values) => {
+          const next = { ...values };
+          delete next[rowKey];
+          return next;
+        });
+        return;
+      }
+      setRevealingKey(rowKey);
+      setError("");
+      try {
+        const response = await invoke("coordination_reveal_workspace_mcp_secret", {
+          ...commandBase,
+          workspaceId,
+          key: secret.key,
+        });
+        const value = String(unwrapData(response)?.value ?? "");
+        setRevealedSecrets((values) => ({ ...values, [rowKey]: value }));
+      } catch (caught) {
+        setError(errorMessage(caught));
+      } finally {
+        setRevealingKey("");
+      }
+    },
+    [commandBase, revealedSecrets, workspaceId],
+  );
+
+  const startEditSecret = useCallback((secret) => {
+    const rowKey = secret?.id || secret?.key;
+    if (!rowKey) return;
+    setEditingSecretKeys((keys) => {
+      const next = new Set(keys);
+      next.add(rowKey);
+      return next;
+    });
+    setSecretValueDrafts((drafts) => ({ ...drafts, [rowKey]: "" }));
+  }, []);
+
+  const cancelEditSecret = useCallback((secret) => {
+    const rowKey = secret?.id || secret?.key;
+    if (!rowKey) return;
+    setEditingSecretKeys((keys) => {
+      if (!keys.has(rowKey)) return keys;
+      const next = new Set(keys);
+      next.delete(rowKey);
+      return next;
+    });
+    setSecretValueDrafts((drafts) => {
+      const next = { ...drafts };
+      delete next[rowKey];
+      return next;
+    });
+  }, []);
 
   const deleteSecret = useCallback(
     async (secret) => {
@@ -1382,6 +1465,19 @@ export default function McpsWorkspaceView({
           const next = { ...drafts };
           delete next[secret.id];
           delete next[secret.key];
+          return next;
+        });
+        setRevealedSecrets((values) => {
+          const next = { ...values };
+          delete next[secret.id];
+          delete next[secret.key];
+          return next;
+        });
+        setEditingSecretKeys((keys) => {
+          if (!keys.has(secret.id) && !keys.has(secret.key)) return keys;
+          const next = new Set(keys);
+          next.delete(secret.id);
+          next.delete(secret.key);
           return next;
         });
       } catch (caught) {
@@ -1988,15 +2084,20 @@ export default function McpsWorkspaceView({
             {secrets.length}
           </McpStatusBadge>
         </McpAccessTopline>
-        <McpEditorActions>
-          <button
+        <SecretsToolbar>
+          <SecretsToolbarHint>
+            Stored on this device only — never synced to Cloud.
+          </SecretsToolbarHint>
+          <SecretButton
+            data-variant="primary"
             disabled={actionState !== "idle"}
             onClick={addSecretDraftRow}
             type="button"
           >
-            Add
-          </button>
-        </McpEditorActions>
+            <SecretButtonGlyph aria-hidden="true">+</SecretButtonGlyph>
+            Add secret
+          </SecretButton>
+        </SecretsToolbar>
         {scopeValue === "global-defaults" && (
           <McpEmptyAccess>
             Global secrets vault: these values (with the rest of the global
@@ -2009,11 +2110,14 @@ export default function McpsWorkspaceView({
           <McpSecretRows>
             {secrets.map((secret) => {
               const rowKey = secret.id || secret.key;
-              const value = secretValueDrafts[rowKey] || "";
+              const draftValue = secretValueDrafts[rowKey] || "";
+              const editing = editingSecretKeys.has(rowKey) || !secret.available;
+              const revealed = rowKey in revealedSecrets;
+              const revealingThis = revealingKey === rowKey;
               const savingThis = actionState === "saving_secret" && actionContext.name === secret.key;
               const deletingThis =
                 actionState === "deleting_secret" && actionContext.name === secret.key;
-              const saveDisabled = actionState !== "idle" || !value;
+              const busy = actionState !== "idle";
               return (
                 <McpSecretRow key={rowKey}>
                   <McpSecretField data-size="key">
@@ -2022,33 +2126,83 @@ export default function McpsWorkspaceView({
                   </McpSecretField>
                   <McpSecretField data-size="value">
                     <PanelKicker>Value</PanelKicker>
-                    <McpInput
-                      onChange={(event) =>
-                        setSecretValueDrafts((drafts) => ({
-                          ...drafts,
-                          [rowKey]: event.target.value,
-                        }))
-                      }
-                      placeholder={secret.available ? "Stored value" : ""}
-                      type="password"
-                      value={value}
-                    />
+                    {editing ? (
+                      <McpInput
+                        aria-label={`New value for ${secret.key}`}
+                        autoFocus
+                        onChange={(event) =>
+                          setSecretValueDrafts((drafts) => ({
+                            ...drafts,
+                            [rowKey]: event.target.value,
+                          }))
+                        }
+                        placeholder={secret.available ? "Enter a new value" : "Enter a value"}
+                        type="password"
+                        value={draftValue}
+                      />
+                    ) : (
+                      <SecretValueBox
+                        data-revealed={revealed ? "true" : "false"}
+                        title={revealed ? "Stored secret value" : "Hidden — click View to reveal"}
+                      >
+                        {revealed ? (
+                          <SecretRevealedText>{revealedSecrets[rowKey]}</SecretRevealedText>
+                        ) : (
+                          <>
+                            <SecretMaskDots aria-hidden="true">••••••••••••</SecretMaskDots>
+                            <SecretStoredHint>Stored</SecretStoredHint>
+                          </>
+                        )}
+                      </SecretValueBox>
+                    )}
                   </McpSecretField>
                   <McpSecretActions>
-                    <button
-                      disabled={saveDisabled}
-                      onClick={() => saveSecretRow({ ...secret, value })}
-                      type="button"
-                    >
-                      {buttonContent(savingThis, "Save", "Saving")}
-                    </button>
-                    <button
-                      disabled={actionState !== "idle"}
+                    {editing ? (
+                      <>
+                        <SecretButton
+                          data-variant="primary"
+                          disabled={busy || !draftValue}
+                          onClick={() => saveSecretRow({ ...secret, value: draftValue })}
+                          type="button"
+                        >
+                          {buttonContent(savingThis, "Save", "Saving")}
+                        </SecretButton>
+                        {secret.available && (
+                          <SecretButton
+                            disabled={busy}
+                            onClick={() => cancelEditSecret(secret)}
+                            type="button"
+                          >
+                            Cancel
+                          </SecretButton>
+                        )}
+                      </>
+                    ) : (
+                      <>
+                        <SecretButton
+                          disabled={revealingThis}
+                          onClick={() => revealSecret(secret)}
+                          type="button"
+                        >
+                          {buttonContent(revealingThis, revealed ? "Hide" : "View", "…")}
+                        </SecretButton>
+                        <SecretButton
+                          disabled={busy}
+                          onClick={() => startEditSecret(secret)}
+                          type="button"
+                        >
+                          Edit
+                        </SecretButton>
+                      </>
+                    )}
+                    <SecretButton
+                      data-variant="danger"
+                      disabled={busy}
                       onClick={() => deleteSecret(secret)}
                       type="button"
                     >
                       {buttonContent(deletingThis, "Delete", "Deleting")}
-                    </button>
+                    </SecretButton>
                   </McpSecretActions>
                 </McpSecretRow>
               );
@@ -2057,7 +2211,7 @@ export default function McpsWorkspaceView({
               const canSave = row.key.trim() && row.value;
               const savingThis = actionState === "saving_secret" && actionContext.name === row.key.trim();
               return (
-                <McpSecretRow key={row.draftId}>
+                <McpSecretRow key={row.draftId} data-draft="true">
                   <McpSecretField data-size="key">
                     <PanelKicker>Key</PanelKicker>
                     <McpInput
@@ -2074,25 +2228,27 @@ export default function McpsWorkspaceView({
                       onChange={(event) =>
                         updateSecretDraftRow(row.draftId, { value: event.target.value })
                       }
+                      placeholder="Enter a value"
                       type="password"
                       value={row.value}
                     />
                   </McpSecretField>
                   <McpSecretActions>
-                    <button
+                    <SecretButton
+                      data-variant="primary"
                       disabled={!canSave || actionState !== "idle"}
                       onClick={() => saveSecretRow(row)}
                       type="button"
                     >
                       {buttonContent(savingThis, "Save", "Saving")}
-                    </button>
-                    <button
+                    </SecretButton>
+                    <SecretButton
                       disabled={actionState !== "idle"}
                       onClick={() => removeSecretDraftRow(row.draftId)}
                       type="button"
                     >
                       Cancel
-                    </button>
+                    </SecretButton>
                   </McpSecretActions>
                 </McpSecretRow>
               );
@@ -2882,8 +3038,124 @@ const McpSecretActions = styled(McpInlineActions)`
   align-self: end;
   justify-content: flex-end;
   flex-wrap: nowrap;
+  gap: 6px;
 
   @container (max-width: 680px) {
     justify-content: flex-start;
   }
+`;
+
+const SecretsToolbar = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 2px 0 2px;
+`;
+
+const SecretsToolbarHint = styled.span`
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--forge-text-muted);
+`;
+
+const SecretButton = styled.button`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 34px;
+  padding: 0 13px;
+  border-radius: 8px;
+  border: 1px solid var(--forge-border);
+  background: var(--forge-surface-control, rgba(21, 27, 35, 0.72));
+  color: var(--forge-text-soft);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: border-color 140ms ease, background 140ms ease,
+    color 140ms ease, box-shadow 140ms ease;
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+  }
+
+  &:hover:not(:disabled) {
+    border-color: rgba(var(--forge-accent-rgb), 0.42);
+    color: var(--forge-text);
+  }
+
+  &:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  &[data-variant="primary"] {
+    border-color: rgba(var(--forge-accent-rgb), 0.5);
+    background: rgba(var(--forge-accent-rgb), 0.16);
+    color: var(--forge-text);
+  }
+
+  &[data-variant="primary"]:hover:not(:disabled) {
+    background: rgba(var(--forge-accent-rgb), 0.26);
+    box-shadow: 0 0 0 1px rgba(var(--forge-accent-rgb), 0.32);
+  }
+
+  &[data-variant="danger"]:hover:not(:disabled) {
+    border-color: var(--forge-red, #e5484d);
+    color: var(--forge-red, #e5484d);
+  }
+`;
+
+const SecretButtonGlyph = styled.span`
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+  margin-top: -1px;
+`;
+
+const SecretValueBox = styled.div`
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  background: var(--forge-surface-control, rgba(21, 27, 35, 0.55));
+  color: var(--forge-text-soft);
+  font-size: 12px;
+
+  &[data-revealed="true"] {
+    overflow-x: auto;
+  }
+`;
+
+const SecretMaskDots = styled.span`
+  letter-spacing: 3px;
+  font-size: 15px;
+  line-height: 1;
+  color: var(--forge-text-muted);
+`;
+
+const SecretStoredHint = styled.span`
+  margin-left: auto;
+  padding-left: 12px;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--forge-text-muted);
+`;
+
+const SecretRevealedText = styled.span`
+  font-family: var(--forge-mono, ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace);
+  font-size: 12px;
+  color: var(--forge-text);
+  white-space: nowrap;
+  user-select: text;
 `;

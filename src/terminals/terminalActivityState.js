@@ -47,11 +47,17 @@ const TERMINAL_ACTIVITY_IDLE_STATES = new Set([
 ]);
 
 const TERMINAL_ACTIVITY_PAUSED_STATES = new Set([
+  "awaiting_input",
+  "awaiting_user",
   "needs_input",
   "parked",
   "paused",
   "prompting_user",
+  "requires_input",
+  "requires_user_input",
   "resume_ready",
+  "uir",
+  "user_input_required",
   "waiting",
 ]);
 
@@ -127,7 +133,8 @@ export function workspaceTerminalStatusFromActivityStatus(activityStatus, option
   if (terminalLifecycle === "closing" || liveStatus === "closing") return "closing";
   if (terminalLifecycle === "exited" || liveStatus === "exited") return "closed";
   if (terminalLifecycle === "offline" || liveStatus === "offline") return "offline";
-  if (options.terminalIsParked || options.terminalIsPromptingUser) return "paused";
+  if (options.terminalIsParked) return "paused";
+  if (options.terminalIsPromptingUser) return "awaiting_input";
   return terminalRailStateFromActivityStatus(activityStatus, options.fallbackStatus || "idle");
 }
 
@@ -241,7 +248,15 @@ export function terminalRailStateFromExecutionPhase(executionPhase, fallback = "
   const phase = normalizeActivityText(executionPhase, "");
   if (["offline", "closed", "closing", "exited"].includes(phase)) return phase;
   if (phase === "failed") return "error";
-  if (phase === "needs_input" || phase === "paused" || phase === "parked" || phase === "resume_ready") return "paused";
+  if (
+    phase === "awaiting_input"
+      || phase === "needs_input"
+      || phase === "paused"
+      || phase === "parked"
+      || phase === "resume_ready"
+      || phase === "uir"
+      || phase === "user_input_required"
+  ) return "paused";
   if (phase === "compacting" || phase === "compaction") return "compacting";
   if (["queued", "submitted", "input_written", "accepted", "running", "cancelling"].includes(phase)) return "thinking";
   if (["cancelled", "canceled", "interrupted"].includes(phase)) return "interrupted";

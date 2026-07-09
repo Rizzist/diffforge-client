@@ -108,6 +108,10 @@ const TransportTime = styled.span`
   font-variant-numeric: tabular-nums;
   color: #cbd5f5;
   white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    color: #334155;
+  }
 `;
 
 const TransportScrub = styled.input`

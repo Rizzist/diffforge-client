@@ -1,5 +1,6 @@
-const NOTIFICATION_SFX_STORAGE_KEY = "diffforge.notificationSfx.v1";
-const DEFAULT_VOLUME = 0.32;
+export const NOTIFICATION_SFX_STORAGE_KEY = "diffforge.notificationSfx.v1";
+export const DEFAULT_NOTIFICATION_SFX_VOLUME = 0.32;
+const DEFAULT_VOLUME = DEFAULT_NOTIFICATION_SFX_VOLUME;
 const DING_SOUND_PATH = "/ding.mp3";
 const DING_SOUND_MIN_INTERVAL_MS = 1200;
 const TONE_MIN_INTERVAL_MS = 180;
@@ -145,6 +146,26 @@ function readSettings() {
   } catch {
     return { enabled: true, volume: DEFAULT_VOLUME };
   }
+}
+
+export function readNotificationSfxSettings() {
+  return readSettings();
+}
+
+export function writeNotificationSfxSettings(settings = {}) {
+  const volume = Number.parseFloat(settings?.volume);
+  const nextSettings = {
+    enabled: settings?.enabled !== false,
+    volume: Number.isFinite(volume) ? Math.max(0, Math.min(1, volume)) : DEFAULT_VOLUME,
+  };
+  try {
+    if (typeof window !== "undefined" && window.localStorage) {
+      window.localStorage.setItem(NOTIFICATION_SFX_STORAGE_KEY, JSON.stringify(nextSettings));
+    }
+  } catch {
+    // SFX playback reads defaults if local persistence is unavailable.
+  }
+  return nextSettings;
 }
 
 function getAudioContextConstructor() {

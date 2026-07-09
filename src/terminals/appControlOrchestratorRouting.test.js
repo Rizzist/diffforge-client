@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   appControlMessageHasExplicitTerminalTarget,
+  buildAppControlPromptWithAttachmentMarkers,
   getLoopspaceAutomationAutoSpawnMaxTotal,
   isLoopspaceAutomationAppControlMessage,
   selectLoopspaceAutomationAppControlTerminal,
@@ -100,4 +101,65 @@ test("loopspace automation honors lower max-total dispatch hints", () => {
 
   assert.equal(result.autoSpawned, false);
   assert.equal(result.reason, "least_loaded_queue");
+});
+
+test("app-control prompt attachment markers append below the user message", () => {
+  assert.equal(
+    buildAppControlPromptWithAttachmentMarkers("inspect this", {
+      markerBlock: "[image-attached 1] screenshot.png -> /tmp/screenshot.png",
+    }),
+    "inspect this\n\n[image-attached 1] screenshot.png -> /tmp/screenshot.png",
+  );
+});
+
+test("app-control prompt attachment warnings are preserved with marker block", () => {
+  assert.equal(
+    buildAppControlPromptWithAttachmentMarkers("inspect this", {
+      marker_block: "[image-attached 1] ok.png -> /tmp/ok.png",
+      warning_block: "[attachment missing.png unavailable]",
+    }),
+    "inspect this\n\n[image-attached 1] ok.png -> /tmp/ok.png\n[attachment missing.png unavailable]",
+  );
+});
+
+test("LS/1 structured prompts keep attachment markers inside the msg section", () => {
+  const structuredPrompt = [
+    "LS/1 send_message",
+    "msg:",
+    "inspect this",
+    "",
+    "steps:",
+    "1 step_1 checkpoint Step 1",
+    "done checkpoint=record_loopspace_step_progress final=terminal_run",
+  ].join("\n");
+  assert.equal(
+    buildAppControlPromptWithAttachmentMarkers(structuredPrompt, {
+      markerBlock: "[image-attached 1] screenshot.png -> /tmp/screenshot.png",
+    }),
+    [
+      "LS/1 send_message",
+      "msg:",
+      "inspect this",
+      "[image-attached 1] screenshot.png -> /tmp/screenshot.png",
+      "",
+      "steps:",
+      "1 step_1 checkpoint Step 1",
+      "done checkpoint=record_loopspace_step_progress final=terminal_run",
+    ].join("\n"),
+  );
+});
+
+test("LS/1 prompts without a msg section append attachment markers at the end", () => {
+  const dispatchPrompt = [
+    "LS/1 dispatch_todo",
+    "steps:",
+    "1 step_1 checkpoint Step 1",
+    "done checkpoint=record_loopspace_step_progress final=todo_status",
+  ].join("\n");
+  assert.equal(
+    buildAppControlPromptWithAttachmentMarkers(dispatchPrompt, {
+      markerBlock: "[image-attached 1] screenshot.png -> /tmp/screenshot.png",
+    }),
+    `${dispatchPrompt}\n\n[image-attached 1] screenshot.png -> /tmp/screenshot.png`,
+  );
 });

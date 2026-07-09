@@ -82,6 +82,10 @@ const HistoryHeader = styled.div`
   padding: 10px;
   border-bottom: 1px solid rgba(148, 163, 184, 0.1);
   flex: 0 0 auto;
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(15, 23, 42, 0.1);
+  }
 `;
 
 const HistoryList = styled.div`
@@ -156,6 +160,10 @@ const ModeCardBody = styled.div`
   font-weight: 550;
   line-height: 1.45;
   color: #8fa0b8;
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
 `;
 
 // Deliberately quiet: a text-only caution line, not a boxed callout — the
@@ -246,6 +254,16 @@ const KeyReadyBadge = styled.span`
     border-color: rgba(16, 185, 129, 0.5);
     color: #6ee7b7;
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.16);
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] &[data-ready="true"] {
+    border-color: rgba(5, 150, 105, 0.5);
+    color: #047857;
+  }
 `;
 
 const ModeChip = styled.button`
@@ -276,6 +294,26 @@ const ModeChip = styled.button`
 
   &:hover {
     border-color: rgba(226, 232, 240, 0.5);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.18);
+    background: #f8fafc;
+    color: #334155;
+  }
+
+  html[data-forge-theme="light"] &[data-route="cloud"] {
+    border-color: rgba(37, 99, 235, 0.45);
+    color: #1d4ed8;
+  }
+
+  html[data-forge-theme="light"] &[data-route="api"] {
+    border-color: rgba(5, 150, 105, 0.45);
+    color: #047857;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(15, 23, 42, 0.3);
   }
 `;
 
@@ -309,6 +347,18 @@ const KindTab = styled.button`
     opacity: 0.4;
     cursor: default;
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.16);
+    background: #f8fafc;
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    border-color: rgba(37, 99, 235, 0.45);
+    background: rgba(37, 99, 235, 0.12);
+    color: #1d4ed8;
+  }
 `;
 
 const Section = styled.div`
@@ -316,6 +366,10 @@ const Section = styled.div`
   gap: 8px;
   padding: 10px;
   border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(15, 23, 42, 0.1);
+  }
 `;
 
 // Compact react-select sizing (model/resolution/quality/voice pickers).
@@ -357,6 +411,12 @@ const ProviderChip = styled.span`
   padding: 4px 10px;
   border-radius: 999px;
   white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(5, 150, 105, 0.4);
+    background: rgba(16, 185, 129, 0.12);
+    color: #047857;
+  }
 `;
 
 const ChipRow = styled.div`
@@ -380,6 +440,17 @@ const ParamChip = styled.button`
     border-color: rgba(96, 165, 250, 0.6);
     background: rgba(37, 99, 235, 0.2);
     color: #dbeafe;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.16);
+    color: #334155;
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    border-color: rgba(37, 99, 235, 0.45);
+    background: rgba(37, 99, 235, 0.12);
+    color: #1d4ed8;
   }
 `;
 
@@ -431,6 +502,20 @@ const Slot = styled.button`
   &:hover {
     border-color: rgba(96, 165, 250, 0.6);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.22);
+    background: #f8fafc;
+    color: rgba(71, 85, 105, 0.85);
+  }
+
+  html[data-forge-theme="light"] &[data-filled="true"] {
+    border-color: rgba(5, 150, 105, 0.55);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(37, 99, 235, 0.55);
+  }
 `;
 
 const SlotLabel = styled.span`
@@ -441,6 +526,28 @@ const SlotLabel = styled.span`
   letter-spacing: 0.05em;
   text-transform: uppercase;
   text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+
+  /* When a model takes both a start and an end frame, tint the two labels so
+     the slots are tellable at a glance (start = emerald, end = amber). */
+  &[data-frame-role="start"] {
+    color: #34d399;
+  }
+
+  &[data-frame-role="end"] {
+    color: #fbbf24;
+  }
+
+  /* Over a thumbnail the bright tints + dark shadow stay; on an empty slot in
+     light mode the shadow reads as smudge, so switch to the dark shades. */
+  html[data-forge-theme="light"] ${Slot}[data-filled="false"] &[data-frame-role="start"] {
+    color: #047857;
+    text-shadow: none;
+  }
+
+  html[data-forge-theme="light"] ${Slot}[data-filled="false"] &[data-frame-role="end"] {
+    color: #b45309;
+    text-shadow: none;
+  }
 `;
 
 const SlotClear = styled.span`
@@ -471,6 +578,11 @@ const PickerPop = styled.div`
 
   &::-webkit-scrollbar {
     display: none;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.14);
+    background: #ffffff;
   }
 `;
 
@@ -511,6 +623,15 @@ const PickerThumb = styled.button`
   &:hover {
     border-color: rgba(16, 185, 129, 0.6);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.16);
+    background: #f8fafc;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(5, 150, 105, 0.55);
+  }
 `;
 
 const CountStepper = styled.div`
@@ -543,6 +664,18 @@ const CountStepper = styled.div`
     min-width: 14px;
     text-align: center;
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.16);
+
+    button {
+      color: #334155;
+    }
+
+    span {
+      color: #0f172a;
+    }
+  }
 `;
 
 // History rows: preview thumb (draggable onto the timeline once media
@@ -570,10 +703,31 @@ const HistRow = styled.div`
     }
   }
 
+  @keyframes video-hist-focus-flash-light {
+    0%,
+    55% {
+      outline-color: rgba(217, 119, 6, 0.9);
+      background: rgba(251, 191, 36, 0.22);
+    }
+    100% {
+      outline-color: transparent;
+      background: #ffffff;
+    }
+  }
+
   &[data-flash="true"] {
     outline: 2px solid transparent;
     outline-offset: -1px;
     animation: video-hist-focus-flash 2s ease-out;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.12);
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &[data-flash="true"] {
+    animation-name: video-hist-focus-flash-light;
   }
 `;
 
@@ -598,6 +752,15 @@ const HistDelete = styled.button`
   &:hover {
     border-color: rgba(248, 113, 113, 0.45);
     background: rgba(248, 113, 113, 0.1);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #dc2626;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(220, 38, 38, 0.4);
+    background: rgba(220, 38, 38, 0.1);
   }
 `;
 
@@ -633,6 +796,20 @@ const HistThumb = styled.div`
       linear-gradient(150deg, rgba(45, 20, 24, 0.95), rgba(10, 6, 8, 0.98));
     border-color: rgba(248, 113, 113, 0.3);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.14);
+    background:
+      radial-gradient(90% 120% at 20% 0%, rgba(37, 99, 235, 0.1), transparent 60%),
+      #f1f5f9;
+  }
+
+  html[data-forge-theme="light"] &[data-status="error"] {
+    background:
+      radial-gradient(90% 120% at 20% 0%, rgba(220, 38, 38, 0.12), transparent 60%),
+      #fef2f2;
+    border-color: rgba(220, 38, 38, 0.3);
+  }
 `;
 
 const HistGlyph = styled.span`
@@ -655,6 +832,18 @@ const HistGlyph = styled.span`
     to {
       transform: rotate(360deg);
     }
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] &[data-status="running"] {
+    color: #1d4ed8;
+  }
+
+  html[data-forge-theme="light"] &[data-status="error"] {
+    color: #dc2626;
   }
 `;
 
@@ -683,6 +872,16 @@ const HistInfo = styled.div`
     -webkit-box-orient: vertical;
     overflow: hidden;
   }
+
+  html[data-forge-theme="light"] & {
+    b {
+      color: #0f172a;
+    }
+
+    p {
+      color: #64748b;
+    }
+  }
 `;
 
 const HistError = styled.div`
@@ -692,6 +891,10 @@ const HistError = styled.div`
   color: #fca5a5;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
+
+  html[data-forge-theme="light"] & {
+    color: #dc2626;
+  }
 `;
 
 const HistSide = styled.div`
@@ -714,6 +917,18 @@ const HistStatus = styled.span`
 
   &[data-status="done"] {
     color: #a7f3d0;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #1d4ed8;
+  }
+
+  html[data-forge-theme="light"] &[data-status="error"] {
+    color: #dc2626;
+  }
+
+  html[data-forge-theme="light"] &[data-status="done"] {
+    color: #047857;
   }
 `;
 
@@ -747,6 +962,16 @@ const HistDragGhost = styled.div`
     overflow: hidden;
     text-overflow: ellipsis;
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(5, 150, 105, 0.5);
+    background: #ffffff;
+    box-shadow: 0 10px 26px rgba(15, 23, 42, 0.16);
+
+    span {
+      color: #334155;
+    }
+  }
 `;
 
 const InlineRow = styled.div`
@@ -762,7 +987,23 @@ const SectionTitle = styled.div`
   letter-spacing: 0.07em;
   text-transform: uppercase;
   color: rgba(167, 243, 208, 0.9);
+
+  html[data-forge-theme="light"] & {
+    color: #047857;
+  }
 `;
+
+function maxReferenceSlotsFor(model, caps) {
+  const max = Math.max(0, Number(caps?.maxReferenceImages) || 0);
+  if (model?.kind === "image" && caps?.requiresStartFrame) {
+    return Math.max(0, max - 1);
+  }
+  return max;
+}
+
+function promptIsOptionalFor(model, caps) {
+  return model?.kind === "audio" && Boolean(caps?.requiresSourceVideo);
+}
 
 // Generation panel — palmier-style: Image / Video / Audio type tabs, one
 // provider (Higgsfield, keys held by your cloud), a real model catalog, and a
@@ -814,7 +1055,7 @@ export default function GeneratePanel({
   const [sound, setSound] = useState(true);
   const [genMode, setGenMode] = useState("");
   const [voice, setVoice] = useState("");
-  const [slots, setSlots] = useState({ startFrame: "", endFrame: "", references: [], audio: "" });
+  const [slots, setSlots] = useState({ startFrame: "", endFrame: "", references: [], audio: "", sourceVideo: "" });
   const [picker, setPicker] = useState(null); // { slot, index? }
   const [jobs, setJobs] = useState([]);
   const [error, setError] = useState("");
@@ -1059,9 +1300,14 @@ export default function GeneratePanel({
       stillExists.has(path),
     );
     if (request.mode === "image-to-video") {
-      setSlots({ startFrame: inputPaths[0] || "", endFrame: inputPaths[1] || "", references: [], audio: audioPaths[0] || "" });
+      setSlots({ startFrame: inputPaths[0] || "", endFrame: inputPaths[1] || "", references: [], audio: audioPaths[0] || "", sourceVideo: "" });
+    } else if (request.mode === "image-edit" && catalogEntry?.caps?.supportsStartFrame) {
+      const referenceCap = maxReferenceSlotsFor(catalogEntry, catalogEntry.caps);
+      setSlots({ startFrame: inputPaths[0] || "", endFrame: "", references: inputPaths.slice(1, 1 + referenceCap).filter(Boolean), audio: audioPaths[0] || "", sourceVideo: "" });
+    } else if (request.mode === "video-to-audio" || request.model === "mirelo_sfx") {
+      setSlots({ startFrame: "", endFrame: "", references: [], audio: audioPaths[0] || "", sourceVideo: inputPaths[0] || "" });
     } else {
-      setSlots({ startFrame: "", endFrame: "", references: inputPaths.filter(Boolean), audio: audioPaths[0] || "" });
+      setSlots({ startFrame: "", endFrame: "", references: inputPaths.filter(Boolean), audio: audioPaths[0] || "", sourceVideo: "" });
     }
     setHistoryOpen(false);
   }, [assets]);
@@ -1097,8 +1343,12 @@ export default function GeneratePanel({
     setSlots((current) => ({
       startFrame: caps.supportsStartFrame ? current.startFrame : "",
       endFrame: caps.supportsEndFrame ? current.endFrame : "",
-      references: (current.references || []).slice(0, caps.maxReferenceImages || 0),
+      references:
+        model.kind === "video" && (current.startFrame || current.endFrame)
+          ? []
+          : (current.references || []).slice(0, maxReferenceSlotsFor(model, caps)),
       audio: caps.requiresInputAudio ? current.audio : "",
+      sourceVideo: caps.requiresSourceVideo ? current.sourceVideo : "",
     }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [model?.id]);
@@ -1122,7 +1372,7 @@ export default function GeneratePanel({
     } else if (seed.action === "image-edit") {
       setKind("image");
       setModelId("flux-kontext");
-      setSlots((current) => ({ ...current, references: seed.asset?.path ? [seed.asset.path] : [] }));
+      setSlots((current) => ({ ...current, startFrame: seed.asset?.path || "", references: [] }));
     }
   }, [seed]);
 
@@ -1194,6 +1444,7 @@ export default function GeneratePanel({
 
   const imageAssets = useMemo(() => assets.filter((asset) => asset.kind === "image" && !asset.pending), [assets]);
   const audioAssets = useMemo(() => assets.filter((asset) => asset.kind === "audio" && !asset.pending), [assets]);
+  const videoAssets = useMemo(() => assets.filter((asset) => asset.kind === "video" && !asset.pending), [assets]);
 
   // A history job's preview = the first output (or planned) path that exists
   // as a real, non-pending library asset.
@@ -1270,12 +1521,17 @@ export default function GeneratePanel({
       if (slotKey === "references") {
         const references = [...(current.references || [])];
         references[index] = path;
-        return { ...current, references: references.filter(Boolean) };
+        return model?.kind === "video"
+          ? { ...current, startFrame: "", endFrame: "", references: references.filter(Boolean) }
+          : { ...current, references: references.filter(Boolean) };
+      }
+      if (model?.kind === "video" && (slotKey === "startFrame" || slotKey === "endFrame")) {
+        return { ...current, [slotKey]: path, references: [] };
       }
       return { ...current, [slotKey]: path };
     });
     setPicker(null);
-  }, []);
+  }, [model?.kind]);
 
   const clearSlot = useCallback((slotKey, index) => {
     setSlots((current) => {
@@ -1291,7 +1547,7 @@ export default function GeneratePanel({
     if (!model) {
       return;
     }
-    if (!prompt.trim() && !caps.requiresReferenceImage) {
+    if (!prompt.trim() && !caps.requiresReferenceImage && !promptIsOptionalFor(model, caps)) {
       setError(caps.promptLabel ? `${caps.promptLabel} first.` : "Write a prompt first.");
       return;
     }
@@ -1305,6 +1561,14 @@ export default function GeneratePanel({
     }
     if (caps.requiresInputAudio && !slots.audio) {
       setError(`${model.displayName} needs a voice audio input.`);
+      return;
+    }
+    if (caps.requiresSourceVideo && !slots.sourceVideo) {
+      setError(`${model.displayName} needs a source video.`);
+      return;
+    }
+    if (model.kind === "video" && slots.endFrame && !slots.startFrame) {
+      setError(`${model.displayName} needs a start image before an end image.`);
       return;
     }
     if (directRoute && !directKeyReady) {
@@ -1342,13 +1606,21 @@ export default function GeneratePanel({
         setHistoryOpen(true);
         return;
       }
-      const referenceImagePaths = slots.references.filter(Boolean);
+      const referenceImagePaths =
+        model.kind === "video" && (slots.startFrame || slots.endFrame)
+          ? []
+          : slots.references.filter(Boolean).slice(0, maxReferenceSlotsFor(model, caps));
       const isImageToVideo = model.kind === "video" && Boolean(slots.startFrame);
+      const isImageEdit = model.kind === "image" && (Boolean(slots.startFrame) || referenceImagePaths.length > 0);
       // The cloud glue reads inputAssetPaths POSITIONALLY by mode:
       // image-to-video → [startFrame, endFrame?]; other modes → reference images.
-      const inputAssetPaths = isImageToVideo
-        ? [slots.startFrame, ...(slots.endFrame ? [slots.endFrame] : [])]
-        : referenceImagePaths;
+      const inputAssetPaths = caps.requiresSourceVideo
+        ? [slots.sourceVideo].filter(Boolean)
+        : isImageToVideo
+          ? [slots.startFrame, ...(slots.endFrame ? [slots.endFrame] : [])]
+          : isImageEdit
+            ? [slots.startFrame, ...referenceImagePaths].filter(Boolean)
+            : referenceImagePaths;
       const result = await invoke("video_generate_start", {
         repoPath,
         request: {
@@ -1360,9 +1632,11 @@ export default function GeneratePanel({
           kind: model.kind,
           mode:
             model.kind === "audio"
-              ? "text-to-audio"
+              ? caps.requiresSourceVideo
+                ? "video-to-audio"
+                : "text-to-audio"
               : model.kind === "image"
-                ? referenceImagePaths.length
+                ? isImageEdit
                   ? "image-edit"
                   : "text-to-image"
                 : isImageToVideo
@@ -1395,7 +1669,7 @@ export default function GeneratePanel({
       // Submitted: clear the form and jump to history where the new job
       // shows up live.
       setPrompt("");
-      setSlots({ startFrame: "", endFrame: "", references: [], audio: "" });
+      setSlots({ startFrame: "", endFrame: "", references: [], audio: "", sourceVideo: "" });
       loadHistory();
       setHistoryOpen(true);
     } catch (err) {
@@ -1412,11 +1686,31 @@ export default function GeneratePanel({
     && creditsRemaining != null
     && creditsRemaining < estCredits;
 
-  const referenceSlotCount = Math.min(caps.maxReferenceImages || 0, 4);
-  const showSlots = caps.supportsStartFrame || caps.supportsEndFrame || referenceSlotCount > 0 || caps.requiresInputAudio;
+  const videoReferenceMode = model?.kind === "video" && Boolean((slots.references || []).length);
+  const videoFrameMode = model?.kind === "video" && Boolean(slots.startFrame || slots.endFrame);
+  const showFrameInputs = !videoReferenceMode;
+  const showReferenceInputs = !videoFrameMode;
+  const referenceSlotCount = showReferenceInputs ? maxReferenceSlotsFor(model, caps) : 0;
+  const showSlots =
+    (showFrameInputs && caps.supportsStartFrame)
+    || (showFrameInputs && caps.supportsEndFrame)
+    || referenceSlotCount > 0
+    || caps.requiresInputAudio
+    || caps.requiresSourceVideo;
 
+  // Both frame slots visible at once → tint their labels so start/end are
+  // tellable at a glance. Single-frame models keep the neutral label.
+  const frameSlotPairVisible =
+    showFrameInputs && Boolean(caps.supportsStartFrame) && Boolean(caps.supportsEndFrame);
   const renderSlot = (slotKey, label, path, index = 0) => {
     const asset = path ? assetsByPath[path] : null;
+    const frameRole = frameSlotPairVisible
+      ? slotKey === "startFrame"
+        ? "start"
+        : slotKey === "endFrame"
+          ? "end"
+          : undefined
+      : undefined;
     return (
       <Slot
         data-filled={path ? "true" : "false"}
@@ -1426,7 +1720,7 @@ export default function GeneratePanel({
         type="button"
       >
         {asset?.thumbnailDataUrl ? <img alt="" src={asset.thumbnailDataUrl} /> : null}
-        <SlotLabel>{label}</SlotLabel>
+        <SlotLabel data-frame-role={frameRole}>{label}</SlotLabel>
         {path ? (
           <SlotClear
             onClick={(event) => {
@@ -1440,6 +1734,9 @@ export default function GeneratePanel({
       </Slot>
     );
   };
+
+  const pickerAssets =
+    picker?.slot === "audio" ? audioAssets : picker?.slot === "sourceVideo" ? videoAssets : imageAssets;
 
   return (
     <PanelRoot data-video-generate="true">
@@ -1622,8 +1919,9 @@ export default function GeneratePanel({
           <div style={{ display: "grid", gap: 4 }}>
             <VideoLabel as="div">Inputs</VideoLabel>
             <SlotStrip>
-              {caps.supportsStartFrame ? renderSlot("startFrame", "Start", slots.startFrame) : null}
-              {caps.supportsEndFrame ? renderSlot("endFrame", "End", slots.endFrame) : null}
+              {caps.requiresSourceVideo ? renderSlot("sourceVideo", "Source", slots.sourceVideo) : null}
+              {showFrameInputs && caps.supportsStartFrame ? renderSlot("startFrame", "Start", slots.startFrame) : null}
+              {showFrameInputs && caps.supportsEndFrame ? renderSlot("endFrame", "End", slots.endFrame) : null}
               {caps.requiresInputAudio ? renderSlot("audio", "♪ Voice", slots.audio) : null}
               {Array.from({ length: referenceSlotCount }, (_, index) =>
                 index <= slots.references.length
@@ -1632,9 +1930,9 @@ export default function GeneratePanel({
               )}
             </SlotStrip>
             {picker ? (
-              (picker.slot === "audio" ? audioAssets : imageAssets).length ? (
+              pickerAssets.length ? (
                 <PickerPop>
-                  {(picker.slot === "audio" ? audioAssets : imageAssets).map((asset) => (
+                  {pickerAssets.map((asset) => (
                     <PickerThumb
                       key={asset.path}
                       onClick={() => fillSlot(picker.slot, picker.index, asset.path)}
@@ -1650,6 +1948,8 @@ export default function GeneratePanel({
                 <VideoHint>
                   {picker.slot === "audio"
                     ? "No audio in the library — import a voice track or generate one in the Audio tab."
+                    : picker.slot === "sourceVideo"
+                      ? "No videos in the library — import a source clip first."
                     : "No images in the library — import or generate one first."}
                 </VideoHint>
               )

@@ -932,6 +932,15 @@ const PanelShell = styled.section`
   &[data-active="true"] {
     border-color: rgba(16, 185, 129, 0.4);
   }
+
+  html[data-forge-theme="light"] & {
+    background: #f5f7fa;
+    border-color: rgba(15, 23, 42, 0.1);
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    border-color: rgba(16, 185, 129, 0.45);
+  }
 `;
 
 const PanelHeader = styled.header`
@@ -943,6 +952,11 @@ const PanelHeader = styled.header`
   background: rgba(15, 23, 42, 0.6);
   border-bottom: 1px solid rgba(148, 163, 184, 0.14);
   flex: 0 0 auto;
+
+  html[data-forge-theme="light"] & {
+    background: #f8fafc;
+    border-bottom-color: rgba(15, 23, 42, 0.1);
+  }
 `;
 
 const PanelTitle = styled.span`
@@ -952,6 +966,10 @@ const PanelTitle = styled.span`
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+
+  html[data-forge-theme="light"] & {
+    color: #047857;
+  }
 `;
 
 const PanelActions = styled.div`
@@ -975,6 +993,15 @@ const HeaderButton = styled.button`
   &:hover {
     background: rgba(148, 163, 184, 0.16);
     color: #ffffff;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #475569;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    background: rgba(15, 23, 42, 0.06);
+    color: #0f172a;
   }
 `;
 
@@ -1012,6 +1039,16 @@ const ViewTabRail = styled.div`
     background: rgba(148, 163, 184, 0.35);
     border-radius: 999px;
   }
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(15, 23, 42, 0.1);
+    background: #f5f7fa;
+    scrollbar-color: rgba(15, 23, 42, 0.18) transparent;
+  }
+
+  html[data-forge-theme="light"] &::-webkit-scrollbar-thumb {
+    background: rgba(15, 23, 42, 0.18);
+  }
 `;
 
 const ViewTabButton = styled.button`
@@ -1040,6 +1077,25 @@ const ViewTabButton = styled.button`
     background: rgba(37, 99, 235, 0.22);
     color: #dbeafe;
     box-shadow: inset 0 0 0 1px rgba(147, 197, 253, 0.18);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.12);
+    background: #ffffff;
+    color: #475569;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(37, 99, 235, 0.45);
+    color: #1d4ed8;
+    background: rgba(37, 99, 235, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    border-color: rgba(37, 99, 235, 0.5);
+    background: rgba(37, 99, 235, 0.12);
+    color: #1d4ed8;
+    box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.18);
   }
 `;
 
@@ -1121,6 +1177,10 @@ const RenderErrorBanner = styled.div`
     background: rgba(255, 251, 235, 0.96);
     color: #92400e;
   }
+
+  html[data-forge-theme="light"] & {
+    box-shadow: 0 12px 28px rgba(15, 23, 42, 0.1);
+  }
 `;
 
 const PanelMessage = styled.div`
@@ -1133,6 +1193,14 @@ const PanelMessage = styled.div`
 
   &[data-tone="error"] {
     color: #fca5a5;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] &[data-tone="error"] {
+    color: #dc2626;
   }
 `;
 

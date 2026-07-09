@@ -359,12 +359,18 @@ impl TerminalCoordinationContext {
             let authority_note = match self.enforcement_mode.as_str() {
                 "general_worker" => "This terminal is a general workspace worker. It starts in the workspace root and has full filesystem edit access.",
                 "bounded_direct_edit" => "This terminal has full filesystem edit access. It does not have git worktree isolation and must finish with complete_task instead of submit_patch.",
+                "direct_unmanaged" => "This terminal is in Full mode: ordinary work is unmanaged, cannot pause/resume, and does not use start_task, checkpoint, complete_task, submit_patch, or leases. Loopspace Dispatch Todo runs are the exception: use start_task only with loopspace runtime ids to receive loopspace_run_context, and checkpoint only for local Loopspace step visibility; todo status remains final.",
                 "activity_only" => "This terminal is for coordinated activity tracking and has full filesystem edit access; use start_task/checkpoint/complete_task for visible work logs.",
                 "remote_unmanaged" => "This terminal is for remote or external operations and has full filesystem edit access; use start_task/checkpoint/complete_task for visible work logs.",
                 _ => "This terminal is coordinated for task tracking only. It has no patch submission authority.",
             };
+            let lifecycle_note = if self.enforcement_mode == "direct_unmanaged" {
+                "Ordinary Full-mode work should proceed directly without lifecycle calls. For Loopspace Dispatch Todo runs only, call coordination-kernel.start_task with loopspace_id, loop_runtime_run_id, and loop_runtime_node_id, then use coordination-kernel.checkpoint only for local step progress."
+            } else {
+                "Read-only inspection is free: open, search, and inspect files normally without calling start_task or checkpoint.\nWhen work begins, call coordination-kernel.start_task with a short plan. Local file edits are not lease-gated; edit the path that matches the user's request and use coordination calls for activity state. Checkpoint only meaningful active progress. Finish with submit_patch when an isolated worktree is assigned, otherwise complete_task."
+            };
             format!(
-                "COORDINATION ENABLED\nProject root: {}\nCoordination root: {}\nAgent: {}\nSlot: {}\nSession: {}\nWorkspace: {}\nObjective Key: {}\nTask: {}\nMCP config: {}\nCoordinator MCP: always on\nCloud MCP lifecycle: task/history sync disabled; todos remain the shared cloud work state\nMode: {}\nFile authority: {}\nCompletion: complete_task\n{}\nRead-only inspection is free: open, search, and inspect files normally without calling start_task or checkpoint.\nWhen work begins, call coordination-kernel.start_task with a short plan. Local file edits are not lease-gated; edit the path that matches the user's request and use coordination calls for activity state. Checkpoint only meaningful active progress. Finish with submit_patch when an isolated worktree is assigned, otherwise complete_task.\n",
+                "COORDINATION ENABLED\nProject root: {}\nCoordination root: {}\nAgent: {}\nSlot: {}\nSession: {}\nWorkspace: {}\nObjective Key: {}\nTask: {}\nMCP config: {}\nCoordinator MCP: always on\nCloud MCP lifecycle: task/history sync disabled; todos remain the shared cloud work state\nMode: {}\nFile authority: {}\nCompletion: {}\n{}\n{}\n",
                 self.repo_path,
                 self.write_root,
                 self.agent_id,
@@ -376,7 +382,9 @@ impl TerminalCoordinationContext {
                 self.mcp_config_path,
                 self.session_mode(),
                 self.file_authority(),
+                self.completion_mode(),
                 authority_note,
+                lifecycle_note,
             )
         };
 

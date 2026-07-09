@@ -2159,6 +2159,8 @@ struct TerminalActivityHookPromptOption {
     description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    danger: Option<bool>,
 }
 
 #[derive(Serialize, Clone)]
@@ -2230,6 +2232,7 @@ struct TerminalActivityHookPayload {
     prompt_default_option: Option<String>,
     prompt_ttl_ms: Option<u64>,
     prompt_options: Vec<TerminalActivityHookPromptOption>,
+    allows_free_text: bool,
     prompt_answer_option: Option<String>,
     manual_prompt_source: Option<String>,
     manual_approval_required: bool,
@@ -10178,8 +10181,11 @@ fn run_app(daemon: bool) {
             cloud_mcp_start_remote_command_listener,
             cloud_mcp_record_remote_command_status,
             cloud_mcp_record_agent_chat_model_config,
+            cloud_mcp_record_agent_chat_permission_config,
             cloud_mcp_get_audio_preferences,
             cloud_mcp_set_audio_preferences,
+            cloud_mcp_get_notification_preferences,
+            cloud_mcp_set_notification_preferences,
             cloud_mcp_record_voice_plan_task_status,
             cloud_mcp_update_voice_plan_steps,
             cloud_mcp_get_loopspaces,
@@ -10249,6 +10255,7 @@ fn run_app(daemon: bool) {
             agent_accounts_state,
             agent_accounts_update_display,
             agent_accounts_set_active,
+            agent_account_push_to_device,
             agent_accounts_remove,
             agent_accounts_pane_profiles,
             ssh_profiles_list,
@@ -10372,6 +10379,7 @@ fn run_app(daemon: bool) {
             coordination::tauri_commands::coordination_uninstall_workspace_mcp_server,
             coordination::tauri_commands::coordination_upsert_workspace_mcp_secret,
             coordination::tauri_commands::coordination_delete_workspace_mcp_secret,
+            coordination::tauri_commands::coordination_reveal_workspace_mcp_secret,
             coordination::tauri_commands::coordination_upsert_workspace_mcp_ssh_target,
             coordination::tauri_commands::coordination_delete_workspace_mcp_ssh_target,
             coordination::tauri_commands::coordination_activate_shared_mcp_daemon,

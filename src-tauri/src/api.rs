@@ -265,6 +265,7 @@ async fn backend_ping() -> Result<BackendStatus, String> {
 }
 
 const DESKTOP_AUTH_STATE_KEY: &str = "desktop-auth";
+const DESKTOP_AUTH_PROVISION_TOKEN_CONSUMED_MARKER: &str = "provision-token-consumed";
 const DESKTOP_AUTH_STATE_CHANGED_EVENT: &str = "desktop-auth-state-changed";
 const DESKTOP_AUTH_DEFAULT_MESSAGE: &str = "Sign in with your Diff Forge AI web account.";
 const DESKTOP_AUTH_SESSION_EXPIRED_MESSAGE: &str = "Desktop session expired.";
@@ -2610,6 +2611,61 @@ fn desktop_auth_provisioning_token_from_env() -> Option<String> {
     Some(token.to_string())
 }
 
+fn desktop_auth_provisioning_token_hash(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    format!("{digest:x}")
+}
+
+fn desktop_auth_provisioning_token_consumed_marker_matches(
+    marker: &str,
+    token_hash: &str,
+) -> bool {
+    marker.trim() == token_hash
+}
+
+fn desktop_auth_provisioning_token_consumed_marker_matches_path(
+    path: &Path,
+    token_hash: &str,
+) -> bool {
+    fs::read_to_string(path)
+        .map(|marker| {
+            desktop_auth_provisioning_token_consumed_marker_matches(&marker, token_hash)
+        })
+        .unwrap_or(false)
+}
+
+fn desktop_auth_provisioning_token_consumed_marker_matches_hash(token_hash: &str) -> bool {
+    let Ok(path) = desktop_auth_provisioning_token_consumed_marker_path() else {
+        return false;
+    };
+    desktop_auth_provisioning_token_consumed_marker_matches_path(&path, token_hash)
+}
+
+fn desktop_auth_write_provisioning_token_consumed_marker_hash_to_path(
+    path: &Path,
+    token_hash: &str,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Unable to create auth state directory: {error}"))?;
+    }
+    fs::write(path, token_hash)
+        .map_err(|error| format!("Unable to write provisioning token marker: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+fn desktop_auth_write_provisioning_token_consumed_marker_hash(
+    token_hash: &str,
+) -> Result<(), String> {
+    let path = desktop_auth_provisioning_token_consumed_marker_path()?;
+    desktop_auth_write_provisioning_token_consumed_marker_hash_to_path(&path, token_hash)
+}
+
 fn redeem_desktop_provisioning_token_blocking(token: &str) -> Result<Value, String> {
     if !is_safe_desktop_provisioning_token_value(token) {
         return Err("Provisioning token is invalid.".to_string());
@@ -2654,6 +2710,14 @@ fn desktop_auth_try_provision_from_environment() -> Result<bool, String> {
         );
     }
 
+    let token_hash = desktop_auth_provisioning_token_hash(&token);
+    if desktop_auth_provisioning_token_consumed_marker_matches_hash(&token_hash) {
+        eprintln!(
+            "diffforge auth: provisioning token already consumed by this device; not re-redeeming (mint a fresh token to reprovision)."
+        );
+        return Ok(false);
+    }
+
     let token_file = if desktop_auth_provisioning_token_env_has_inline_token() {
         None
     } else {
@@ -2664,6 +2728,7 @@ fn desktop_auth_try_provision_from_environment() -> Result<bool, String> {
     // The token is consumed server-side the moment the redeem succeeds —
     // clear the file before anything else can fail, or the next boot
     // re-redeems a burned token and loops on access_denied.
+    let _ = desktop_auth_write_provisioning_token_consumed_marker_hash(&token_hash);
     if let Some(path) = token_file {
         let _ = fs::write(path, "");
     }
@@ -2741,11 +2806,20 @@ fn desktop_auth_cli_legacy_app_data_dir() -> Result<PathBuf, String> {
     Err("Unable to resolve Diff Forge app data directory.".to_string())
 }
 
-fn desktop_auth_cli_state_path() -> Result<PathBuf, String> {
+fn desktop_auth_cli_state_dir() -> Result<PathBuf, String> {
     let state_dir = desktop_auth_cli_app_data_dir()?.join("app-state");
     fs::create_dir_all(&state_dir)
         .map_err(|error| format!("Unable to create auth state directory: {error}"))?;
+    Ok(state_dir)
+}
+
+fn desktop_auth_cli_state_path() -> Result<PathBuf, String> {
+    let state_dir = desktop_auth_cli_state_dir()?;
     Ok(state_dir.join(format!("{DESKTOP_AUTH_STATE_KEY}.json")))
+}
+
+fn desktop_auth_provisioning_token_consumed_marker_path() -> Result<PathBuf, String> {
+    Ok(desktop_auth_cli_state_dir()?.join(DESKTOP_AUTH_PROVISION_TOKEN_CONSUMED_MARKER))
 }
 
 fn desktop_auth_cli_legacy_state_path() -> Result<PathBuf, String> {
@@ -3244,6 +3318,59 @@ mod desktop_auth_tests {
 
         assert!(desktop_auth_snapshot_has_rejected_session(&rejected));
         assert!(!desktop_auth_snapshot_has_rejected_session(&manual));
+    }
+
+    #[test]
+    fn provisioning_token_consumed_marker_matches_only_same_token_hash() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after unix epoch")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "diffforge-provision-token-marker-test-{}-{nanos}",
+            std::process::id()
+        ));
+        let marker_path = temp_dir.join(DESKTOP_AUTH_PROVISION_TOKEN_CONSUMED_MARKER);
+        let token_hash = desktop_auth_provisioning_token_hash("inline-token-A_123");
+        let different_token_hash = desktop_auth_provisioning_token_hash("inline-token-B_456");
+
+        assert_ne!(token_hash, different_token_hash);
+        assert!(!desktop_auth_provisioning_token_consumed_marker_matches_path(
+            &marker_path,
+            &token_hash
+        ));
+
+        desktop_auth_write_provisioning_token_consumed_marker_hash_to_path(
+            &marker_path,
+            &token_hash,
+        )
+        .expect("write consumed token marker");
+
+        assert_eq!(
+            std::fs::read_to_string(&marker_path).expect("read consumed token marker"),
+            token_hash
+        );
+        assert!(desktop_auth_provisioning_token_consumed_marker_matches_path(
+            &marker_path,
+            &token_hash
+        ));
+        assert!(!desktop_auth_provisioning_token_consumed_marker_matches_path(
+            &marker_path,
+            &different_token_hash
+        ));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&marker_path)
+                .expect("marker metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]

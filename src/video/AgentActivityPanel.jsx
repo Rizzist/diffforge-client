@@ -37,6 +37,15 @@ const Row = styled.button`
   &:hover {
     border-color: rgba(16, 185, 129, 0.45);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.1);
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(16, 185, 129, 0.55);
+  }
 `;
 
 const ToolIcon = styled.span`
@@ -54,6 +63,10 @@ const ToolIcon = styled.span`
   svg {
     width: 16px;
     height: 16px;
+  }
+
+  html[data-forge-theme="light"] & {
+    filter: brightness(0.6) saturate(1.3);
   }
 `;
 
@@ -84,6 +97,19 @@ const StatusRing = styled.span`
       transform: rotate(360deg);
     }
   }
+
+  html[data-forge-theme="light"] &[data-status="pending"] {
+    border-color: rgba(37, 99, 235, 0.25);
+    border-top-color: #1d4ed8;
+  }
+
+  html[data-forge-theme="light"] &[data-status="done"] {
+    border-color: rgba(4, 120, 87, 0.6);
+  }
+
+  html[data-forge-theme="light"] &[data-status="error"] {
+    border-color: rgba(220, 38, 38, 0.65);
+  }
 `;
 
 const RowInfo = styled.span`
@@ -110,6 +136,16 @@ const RowInfo = styled.span`
     overflow: hidden;
     text-overflow: ellipsis;
   }
+
+  html[data-forge-theme="light"] & {
+    b {
+      color: #0f172a;
+    }
+
+    i {
+      color: #64748b;
+    }
+  }
 `;
 
 const StatusGlyph = styled.span`
@@ -117,6 +153,10 @@ const StatusGlyph = styled.span`
   font-size: 12px;
   font-weight: 800;
   color: ${(props) => (props.$status === "error" ? "#fca5a5" : props.$status === "done" ? "#6ee7b7" : "#93c5fd")};
+
+  html[data-forge-theme="light"] & {
+    filter: brightness(0.6) saturate(1.3);
+  }
 `;
 
 const TimeStamp = styled.span`
@@ -124,6 +164,10 @@ const TimeStamp = styled.span`
   font-size: 8.5px;
   font-weight: 650;
   color: rgba(125, 140, 163, 0.8);
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
 `;
 
 const promptSpin = keyframes`
@@ -154,6 +198,10 @@ const PromptSectionTitle = styled.div`
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: rgba(125, 140, 163, 0.9);
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
 `;
 
 const PromptRow = styled.div`
@@ -179,6 +227,26 @@ const PromptRow = styled.div`
   &[data-status="interrupted"] {
     border-color: rgba(251, 191, 36, 0.34);
     background: rgba(120, 53, 15, 0.32);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.12);
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &[data-status="completed"] {
+    border-color: rgba(16, 185, 129, 0.35);
+    background: rgba(16, 185, 129, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-status="failed"] {
+    border-color: rgba(220, 38, 38, 0.32);
+    background: rgba(220, 38, 38, 0.06);
+  }
+
+  html[data-forge-theme="light"] &[data-status="interrupted"] {
+    border-color: rgba(217, 119, 6, 0.32);
+    background: rgba(217, 119, 6, 0.08);
   }
 `;
 
@@ -249,6 +317,14 @@ const PromptDot = styled.span`
     background: rgba(245, 158, 11, 0.78);
     animation: none;
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: color-mix(in srgb, var(--prompt-activity-color) 24%, rgba(15, 23, 42, 0.18));
+  }
+
+  html[data-forge-theme="light"] &[data-status="running"] {
+    border-color: color-mix(in srgb, var(--prompt-activity-color) 30%, rgba(15, 23, 42, 0.16));
+  }
 `;
 
 const PromptInfo = styled.span`
@@ -275,6 +351,16 @@ const PromptInfo = styled.span`
     overflow: hidden;
     text-overflow: ellipsis;
   }
+
+  html[data-forge-theme="light"] & {
+    b {
+      color: #0f172a;
+    }
+
+    i {
+      color: #64748b;
+    }
+  }
 `;
 
 const PromptStatusWord = styled.span`
@@ -296,12 +382,32 @@ const PromptStatusWord = styled.span`
   [data-status="interrupted"] & {
     color: rgba(253, 230, 138, 0.92);
   }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] [data-status="completed"] & {
+    color: #047857;
+  }
+
+  html[data-forge-theme="light"] [data-status="failed"] & {
+    color: #dc2626;
+  }
+
+  html[data-forge-theme="light"] [data-status="interrupted"] & {
+    color: #b45309;
+  }
 `;
 
 const SectionDivider = styled.div`
   height: 1px;
   margin: 2px 0;
   background: rgba(148, 163, 184, 0.12);
+
+  html[data-forge-theme="light"] & {
+    background: rgba(15, 23, 42, 0.1);
+  }
 `;
 
 const TOOL_META = {

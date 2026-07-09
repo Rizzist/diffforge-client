@@ -37,6 +37,8 @@ const CLOUD_MCP_REMOTE_COMMAND_EVENT: &str = "cloud-mcp-remote-command";
 const CLOUD_MCP_DEVICE_DELETED_EVENT: &str = "cloud-mcp-device-deleted";
 const CLOUD_MCP_ACCOUNT_DEVICE_LIVE_STATE_EVENT: &str = "cloud-mcp-account-device-live-state";
 const CLOUD_MCP_AUDIO_PREFERENCES_CHANGED_EVENT: &str = "forge-audio-preferences-changed";
+const CLOUD_MCP_NOTIFICATION_PREFERENCES_CHANGED_EVENT: &str =
+    "forge-notification-preferences-changed";
 const CLOUD_MCP_ACCOUNT_USAGE_EVENT: &str = "cloud-mcp-account-usage";
 const CLOUD_MCP_ACCOUNT_TOOLS_UPDATED_EVENT: &str = "cloud-mcp-account-tools-updated";
 const CLOUD_MCP_NATIVE_SESSIONS_UPDATED_EVENT: &str = "cloud-mcp-native-sessions-updated";
@@ -175,6 +177,7 @@ const CLOUD_MCP_TOKENOMICS_INGEST_ACK_EVENT: &str = "tokenomics_ingest_ack";
 const CLOUD_MCP_TOKENOMICS_DELIVERY_ACK_EVENT: &str = "tokenomics_delivery_ack";
 const CLOUD_MCP_WORKSPACE_MCP_TOOL_NAME_LIMIT: usize = 32;
 const CLOUD_MCP_AUDIO_PREFERENCES_STATE_KEY: &str = "audio-preferences";
+const CLOUD_MCP_NOTIFICATION_PREFERENCES_STATE_KEY: &str = "notification-preferences";
 const CLOUD_MCP_AUDIO_POLISHING_SYSTEM_PROMPT_MAX_CHARS: usize = 4_000;
 const CLOUD_MCP_DEFAULT_AUDIO_POLISHING_SYSTEM_PROMPT: &str = r#"You clean up raw speech-to-text dictation for a software developer. Reply with only the cleaned transcript text: no preamble, no quotes, no commentary, no markdown beyond list markers.
 
@@ -554,6 +557,7 @@ struct CloudMcpProcessAuthCache {
 struct CloudMcpRuntimeSnapshots {
     app_context: Option<Value>,
     audio_preferences: Option<Value>,
+    notification_preferences: Option<Value>,
     workspace_catalog: Option<Value>,
     workspace_terminals: Option<Value>,
     workspace_servers: Option<Value>,
@@ -8032,6 +8036,94 @@ async fn cloud_mcp_send_event_over_app_ws_once(
             .unwrap_or("Cloud MCP app websocket event request failed.");
         cloud_mcp_fail_sync_activity_key(&sync_activity_key);
         return Err(message.to_string());
+    }
+    cloud_mcp_clear_sync_activity_key(&sync_activity_key);
+    Ok(response)
+}
+
+async fn cloud_mcp_send_remote_command_over_app_ws_once(
+    state: &CloudMcpState,
+    request: &Value,
+    request_prefix: &str,
+) -> Result<Value, String> {
+    cloud_mcp_start_global_ws(state).await;
+    let tx = cloud_mcp_wait_for_ws_sender(state).await?;
+    let auth = cloud_mcp_ws_auth_object(state).await?;
+    if tx.is_closed() {
+        return Err("Cloud MCP app websocket sender is closed.".to_string());
+    }
+
+    let command_kind = cloud_mcp_payload_text(request, &["command_kind", "commandKind"])
+        .unwrap_or_else(|| "remote_command".to_string());
+    let request_id = format!(
+        "{}-{}-{}",
+        request_prefix,
+        cloud_mcp_now_ms(),
+        uuid::Uuid::new_v4()
+    );
+    let bytes = cloud_mcp_sync_payload_bytes(request);
+    let sync_activity_key = cloud_mcp_record_sync_activity(
+        "system",
+        "up",
+        "active",
+        1,
+        bytes,
+        false,
+        cloud_mcp_sync_activity_size_class("active", 1, bytes, "system"),
+        &format!("app_ws_remote_command:{command_kind}:{request_id}"),
+    );
+    let (response_tx, response_rx) = oneshot::channel::<Value>();
+    state
+        .global_ws_pending
+        .lock()
+        .await
+        .insert(request_id.clone(), response_tx);
+    let envelope = json!({
+        "kind": "remote_command",
+        "id": request_id,
+        "contract": "diffforge.app_ws.v1",
+        "auth": auth,
+        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+        "repo_id": cloud_mcp_payload_text(request, &["repo_id", "repoId"]),
+        "workspace_id": cloud_mcp_payload_text(request, &["workspace_id", "workspaceId"]),
+        "request": request,
+    });
+    if tx.send(envelope).is_err() {
+        state.global_ws_pending.lock().await.remove(&request_id);
+        cloud_mcp_fail_sync_activity_key(&sync_activity_key);
+        cloud_mcp_mark_global_ws_disconnected(
+            state,
+            "Cloud MCP app websocket is not accepting messages.",
+        )
+        .await;
+        return Err("Cloud MCP app websocket is not accepting messages.".to_string());
+    }
+
+    let response = match timeout(
+        Duration::from_millis(CLOUD_MCP_APP_WS_FAST_LANE_ACK_TIMEOUT_MS),
+        response_rx,
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) => {
+            state.global_ws_pending.lock().await.remove(&request_id);
+            cloud_mcp_fail_sync_activity_key(&sync_activity_key);
+            return Err("Cloud MCP app websocket remote command response was cancelled.".to_string());
+        }
+        Err(_) => {
+            state.global_ws_pending.lock().await.remove(&request_id);
+            cloud_mcp_fail_sync_activity_key(&sync_activity_key);
+            return Err("Cloud MCP app websocket remote command request timed out.".to_string());
+        }
+    };
+    if response.get("ok").and_then(Value::as_bool) == Some(false) {
+        cloud_mcp_fail_sync_activity_key(&sync_activity_key);
+        let message = cloud_mcp_payload_text(&response, &["message"])
+            .or_else(|| cloud_mcp_payload_text(&response, &["error", "message"]))
+            .or_else(|| cloud_mcp_payload_text(&response, &["data", "message"]))
+            .unwrap_or_else(|| "Cloud MCP app websocket rejected the remote command.".to_string());
+        return Err(message);
     }
     cloud_mcp_clear_sync_activity_key(&sync_activity_key);
     Ok(response)
@@ -15881,6 +15973,15 @@ fn cloud_mcp_loopspace_graph_result_source(value: &Value) -> String {
         .unwrap_or_default()
 }
 
+pub(crate) fn cloud_mcp_loopspace_graph_source_from_local_mirror(
+    loopspace_id: &str,
+) -> Result<Option<String>, String> {
+    let snapshot = cloud_mcp_get_loopspaces_snapshot()?;
+    Ok(cloud_mcp_loopspace_graph_from_snapshot(&snapshot, loopspace_id)
+        .map(|graph| cloud_mcp_loopspace_graph_result_source(&graph))
+        .filter(|source| !source.trim().is_empty()))
+}
+
 #[tauri::command]
 async fn cloud_mcp_get_loopspace_graph(
     _state: State<'_, CloudMcpState>,
@@ -20058,7 +20159,22 @@ async fn cloud_mcp_start_remote_command_listener(
                     &event,
                 )
                 .await;
+                cloud_mcp_apply_notification_preferences_from_account_live_state(
+                    &app,
+                    &state_clone,
+                    &event,
+                )
+                .await;
                 let _ = app.emit(CLOUD_MCP_ACCOUNT_DEVICE_LIVE_STATE_EVENT, event.clone());
+                continue;
+            }
+            if cloud_mcp_is_notification_preferences_sync_unit_event(&event_kind, &event) {
+                cloud_mcp_apply_notification_preferences_from_account_live_state(
+                    &app,
+                    &state_clone,
+                    &event,
+                )
+                .await;
                 continue;
             }
             if cloud_mcp_is_account_documents_sync_wake_event(&event_kind, &event) {
@@ -20143,6 +20259,9 @@ async fn cloud_mcp_start_remote_command_listener(
                         "reason": "client_owned_tokenomics",
                     }),
                 );
+                continue;
+            }
+            if agent_account_push_handle_remote_status(&app, &event) {
                 continue;
             }
             if cloud_mcp_is_workspace_todo_wake_event(&event_kind, &event) {
@@ -22071,6 +22190,7 @@ fn cloud_mcp_apply_remote_device_lever(
         | "switch_agent_account"
         | "agent_profile_switch"
         | "account_switch" => "account_switch",
+        "agent_account_push" | "push_agent_account" | "account_push" => "agent_account_push",
         "terminal_output_status"
         | "terminal_status"
         | "terminal_output"
@@ -22202,6 +22322,103 @@ fn cloud_mcp_apply_remote_device_lever(
                 )
                 .await;
             }
+            "agent_account_push" => {
+                let push_id =
+                    cloud_mcp_remote_command_field_text(&event, &["push_id", "pushId"])
+                        .or_else(|| {
+                            cloud_mcp_remote_command_field_text(&event, &["intent_id", "intentId"])
+                        })
+                        .unwrap_or_default();
+                let agent_kind = cloud_mcp_remote_command_field_text(
+                    &event,
+                    &["agent_kind", "agentKind", "provider", "agent_provider", "agentProvider"],
+                )
+                .unwrap_or_default();
+                let sealed_blob =
+                    cloud_mcp_remote_command_field_text(&event, &["sealed_blob", "sealedBlob"])
+                        .unwrap_or_default();
+                let sealed_algorithm = cloud_mcp_remote_command_field_text(
+                    &event,
+                    &["sealed_algorithm", "sealedAlgorithm"],
+                )
+                .unwrap_or_default();
+                let result = (|| -> Result<Value, String> {
+                    if push_id.trim().is_empty() {
+                        return Err("Agent account push is missing push_id.".to_string());
+                    }
+                    if sealed_blob.trim().is_empty() {
+                        return Err("Agent account push is missing the sealed payload.".to_string());
+                    }
+                    if sealed_algorithm != AGENT_ACCOUNT_PUSH_SEALED_ALGORITHM {
+                        return Err("Agent account push uses an unsupported sealed payload algorithm.".to_string());
+                    }
+                    let expected_kind = agent_accounts_supported_kind(&agent_kind)
+                        .ok_or_else(|| "Agent account push is missing a supported agent kind.".to_string())?;
+                    let plaintext = agent_account_push_open_blob(&sealed_blob)?;
+                    let blob = agent_account_push_decode_blob(&plaintext)?;
+                    let now_ms = todo_dispatch_now_ms();
+                    let current_device = cloud_mcp_desktop_device_profile();
+                    let current_device_id =
+                        cloud_mcp_payload_text(&current_device, &["device_id", "deviceId"])
+                            .unwrap_or_default();
+                    let blob = agent_account_push_verify_received_blob(
+                        blob,
+                        &push_id,
+                        &current_device_id,
+                        now_ms,
+                    )?;
+                    agent_account_push_reject_if_applied(&push_id, now_ms)?;
+                    if blob.agent_kind != expected_kind {
+                        return Err("Agent account push kind does not match the sealed payload.".to_string());
+                    }
+                    let expires_at_ms = blob.expires_at_ms;
+                    let mut details = agent_accounts_materialize_pushed_account(blob)?;
+                    agent_account_push_mark_applied(&push_id, expires_at_ms, now_ms)?;
+                    if let Some(object) = details.as_object_mut() {
+                        object.insert("push_id".to_string(), json!(push_id.clone()));
+                        object.insert("pushId".to_string(), json!(push_id.clone()));
+                        object.insert("sealed_algorithm".to_string(), json!(sealed_algorithm.clone()));
+                        object.insert("sealedAlgorithm".to_string(), json!(sealed_algorithm.clone()));
+                    }
+                    Ok(details)
+                })();
+                match result {
+                    Ok(details) => {
+                        let kind = details
+                            .get("agent_kind")
+                            .and_then(Value::as_str)
+                            .unwrap_or(agent_kind.as_str());
+                        let _ = app.emit(AGENT_ACCOUNTS_CHANGED_EVENT, json!({ "kind": kind }));
+                        let _ = cloud_mcp_send_remote_command_status_event(
+                            &state,
+                            &event,
+                            "completed",
+                            "Agent account push applied on this desktop.",
+                            Some(&details),
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        let details = json!({
+                            "push_id": push_id,
+                            "pushId": push_id,
+                            "agent_kind": agent_kind,
+                            "agentKind": agent_kind,
+                            "sealed_algorithm": sealed_algorithm,
+                            "sealedAlgorithm": sealed_algorithm,
+                            "error": clean_terminal_telemetry_text(&error),
+                        });
+                        let _ = cloud_mcp_send_remote_command_status_event(
+                            &state,
+                            &event,
+                            "failed",
+                            &error,
+                            Some(&details),
+                        )
+                        .await;
+                    }
+                }
+            }
             "output_status" => {
                 cloud_mcp_report_terminal_output_status(&app, &state, &event).await;
             }
@@ -22283,6 +22500,9 @@ fn cloud_mcp_remote_command_is_rust_owned(event: &Value) -> bool {
             | "switch_agent_account"
             | "agent_profile_switch"
             | "account_switch"
+            | "agent_account_push"
+            | "push_agent_account"
+            | "account_push"
             | "terminal_output_status"
             | "terminal_status"
             | "terminal_output"
@@ -22948,6 +23168,518 @@ async fn cloud_mcp_set_audio_preferences(
     }))
 }
 
+fn cloud_mcp_notification_preferences_timestamp(value: &Value) -> u64 {
+    ["updated_at_ms", "updatedAtMs"]
+        .iter()
+        .find_map(|key| {
+            value.get(*key).and_then(|candidate| {
+                candidate
+                    .as_u64()
+                    .or_else(|| {
+                        candidate
+                            .as_i64()
+                            .and_then(|number| u64::try_from(number).ok())
+                    })
+                    .or_else(|| {
+                        candidate
+                            .as_str()
+                            .and_then(|text| text.trim().parse::<u64>().ok())
+                    })
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn cloud_mcp_notification_preferences_source(value: &Value) -> &Value {
+    value
+        .get("preferences")
+        .or_else(|| value.get("notification_preferences"))
+        .or_else(|| value.get("notificationPreferences"))
+        .unwrap_or(value)
+}
+
+fn cloud_mcp_notification_preferences_bool(
+    source: &Value,
+    keys: &[&str],
+    fallback: bool,
+) -> bool {
+    for key in keys {
+        let Some(candidate) = source.get(*key) else {
+            continue;
+        };
+        if let Some(value) = candidate.as_bool() {
+            return value;
+        }
+        if let Some(value) = candidate.as_i64() {
+            return value != 0;
+        }
+        if let Some(text) = candidate.as_str() {
+            match text.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" | "enabled" => return true,
+                "false" | "0" | "no" | "off" | "disabled" => return false,
+                _ => {}
+            }
+        }
+    }
+    fallback
+}
+
+fn cloud_mcp_notification_preferences_push_alias(key: &str) -> bool {
+    matches!(
+        key,
+        "uir_prompts"
+            | "uirPrompts"
+            | "loop_run_started"
+            | "loopRunStarted"
+            | "loop_run_completed"
+            | "loopRunCompleted"
+            | "loop_run_failed"
+            | "loopRunFailed"
+            | "loop_run_blocked"
+            | "loopRunBlocked"
+            | "awaiting_device"
+            | "awaitingDevice"
+            | "account_events"
+            | "accountEvents"
+    )
+}
+
+fn cloud_mcp_notification_preferences_top_level_alias(key: &str) -> bool {
+    matches!(
+        key,
+        "version"
+            | "push"
+            | "loopspace_overrides"
+            | "loopspaceOverrides"
+            | "updated_at_ms"
+            | "updatedAtMs"
+    )
+}
+
+fn cloud_mcp_notification_override_value(value: Option<&Value>) -> Value {
+    let Some(candidate) = value else {
+        return Value::Null;
+    };
+    if candidate.is_null() {
+        return Value::Null;
+    }
+    if let Some(value) = candidate.as_bool() {
+        return json!(value);
+    }
+    if let Some(value) = candidate.as_i64() {
+        return json!(value != 0);
+    }
+    if let Some(text) = candidate.as_str() {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" | "enabled" => return json!(true),
+            "false" | "0" | "no" | "off" | "disabled" => return json!(false),
+            _ => return Value::Null,
+        }
+    }
+    Value::Null
+}
+
+fn cloud_mcp_default_notification_preferences() -> Value {
+    json!({
+        "version": 1,
+        "push": {
+            "uir_prompts": true,
+            "loop_run_started": false,
+            "loop_run_completed": true,
+            "loop_run_failed": true,
+            "loop_run_blocked": true,
+            "awaiting_device": true,
+            "account_events": true,
+        },
+        "loopspace_overrides": {},
+        "updated_at_ms": 0,
+    })
+}
+
+fn cloud_mcp_sanitize_notification_preferences(value: &Value) -> Option<Value> {
+    let source = cloud_mcp_notification_preferences_source(value);
+    let source_object = source.as_object()?;
+    let has_shape = source_object.contains_key("push")
+        || source_object.contains_key("loopspace_overrides")
+        || source_object.contains_key("loopspaceOverrides")
+        || source_object.contains_key("updated_at_ms")
+        || source_object.contains_key("updatedAtMs")
+        || source_object.contains_key("version");
+    if !has_shape {
+        return None;
+    }
+
+    let mut object = serde_json::Map::new();
+    for (key, entry) in source_object {
+        if !cloud_mcp_notification_preferences_top_level_alias(key) {
+            object.insert(key.clone(), entry.clone());
+        }
+    }
+
+    let source_push = source
+        .get("push")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut push = serde_json::Map::new();
+    for (key, entry) in &source_push {
+        if !cloud_mcp_notification_preferences_push_alias(key) {
+            push.insert(key.clone(), entry.clone());
+        }
+    }
+    let source_push_value = Value::Object(source_push);
+    for (key, aliases, fallback) in [
+        ("uir_prompts", ["uir_prompts", "uirPrompts"], true),
+        (
+            "loop_run_started",
+            ["loop_run_started", "loopRunStarted"],
+            false,
+        ),
+        (
+            "loop_run_completed",
+            ["loop_run_completed", "loopRunCompleted"],
+            true,
+        ),
+        ("loop_run_failed", ["loop_run_failed", "loopRunFailed"], true),
+        (
+            "loop_run_blocked",
+            ["loop_run_blocked", "loopRunBlocked"],
+            true,
+        ),
+        ("awaiting_device", ["awaiting_device", "awaitingDevice"], true),
+        ("account_events", ["account_events", "accountEvents"], true),
+    ] {
+        push.insert(
+            key.to_string(),
+            json!(cloud_mcp_notification_preferences_bool(
+                &source_push_value,
+                &aliases,
+                fallback,
+            )),
+        );
+    }
+
+    let source_overrides = source
+        .get("loopspace_overrides")
+        .or_else(|| source.get("loopspaceOverrides"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut loopspace_overrides = serde_json::Map::new();
+    for (loopspace_id, raw_override) in source_overrides {
+        let loopspace_id = loopspace_id.trim();
+        if loopspace_id.is_empty() {
+            continue;
+        }
+        let Some(source_override) = raw_override.as_object() else {
+            continue;
+        };
+        let mut override_object = serde_json::Map::new();
+        for (key, entry) in source_override {
+            if !matches!(key.as_str(), "started" | "completed" | "failed" | "blocked") {
+                override_object.insert(key.clone(), entry.clone());
+            }
+        }
+        for key in ["started", "completed", "failed", "blocked"] {
+            override_object.insert(
+                key.to_string(),
+                cloud_mcp_notification_override_value(source_override.get(key)),
+            );
+        }
+        loopspace_overrides.insert(loopspace_id.to_string(), Value::Object(override_object));
+    }
+
+    object.insert("version".to_string(), json!(1));
+    object.insert("push".to_string(), Value::Object(push));
+    object.insert(
+        "loopspace_overrides".to_string(),
+        Value::Object(loopspace_overrides),
+    );
+    object.insert(
+        "updated_at_ms".to_string(),
+        json!(cloud_mcp_notification_preferences_timestamp(source)),
+    );
+    Some(Value::Object(object))
+}
+
+fn cloud_mcp_notification_preferences_from_app(app: &AppHandle) -> Value {
+    let current = app_local_state_read(app, CLOUD_MCP_NOTIFICATION_PREFERENCES_STATE_KEY);
+    cloud_mcp_sanitize_notification_preferences(&current)
+        .unwrap_or_else(cloud_mcp_default_notification_preferences)
+}
+
+fn cloud_mcp_notification_preferences_write_app(
+    app: &AppHandle,
+    preferences: &Value,
+) -> Result<(), String> {
+    app_local_state_write(app, CLOUD_MCP_NOTIFICATION_PREFERENCES_STATE_KEY, preferences)
+}
+
+async fn cloud_mcp_notification_preferences_set_runtime_snapshot(
+    state: &CloudMcpState,
+    preferences: Value,
+) {
+    let mut snapshots = state.runtime_snapshots.lock().await;
+    snapshots.notification_preferences = Some(preferences);
+}
+
+fn cloud_mcp_notification_preferences_unit_payload(preferences: &Value, reason: &str) -> Value {
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
+        .unwrap_or_else(|| "desktop".to_string());
+    let content_hash = cloud_mcp_outbox_payload_hash(&json!({
+        "device_id": device_id,
+        "sync_unit": "notification_preferences",
+        "notification_preferences": preferences,
+    }));
+    json!({
+        "source": "rust-diffforge-device-live-unit",
+        "reason": reason,
+        "event_kind": "device_notification_preferences",
+        "sync_unit": "notification_preferences",
+        "sync_content_hash": content_hash,
+        "device_id": device_id.clone(),
+        "device": {
+            "id": device_id,
+            "name": device_profile["device_name"].clone(),
+            "host": device_profile["machine_name"].clone(),
+            "os": device_profile["platform"].clone(),
+            "platform": device_profile["platform"].clone(),
+            "kind": device_profile["form_factor"].clone(),
+            "native": true,
+            "web": false,
+            "connected": true,
+        },
+        "notification_preferences": preferences.clone(),
+    })
+}
+
+async fn cloud_mcp_publish_notification_preferences_unit(
+    state: &CloudMcpState,
+    preferences: &Value,
+    reason: &str,
+) -> Result<Value, String> {
+    cloud_mcp_sync_device_live_unit_event(
+        state,
+        "device_notification_preferences",
+        cloud_mcp_notification_preferences_unit_payload(preferences, reason),
+    )
+    .await
+}
+
+fn cloud_mcp_notification_preferences_consider_candidate(
+    latest: &mut Option<(Value, bool)>,
+    candidate: &Value,
+    is_account_root: bool,
+) {
+    let Some(preferences) = cloud_mcp_sanitize_notification_preferences(candidate) else {
+        return;
+    };
+    let candidate_timestamp = cloud_mcp_notification_preferences_timestamp(&preferences);
+    let should_replace = latest
+        .as_ref()
+        .map(|(current, current_is_account_root)| {
+            let current_timestamp = cloud_mcp_notification_preferences_timestamp(current);
+            candidate_timestamp > current_timestamp
+                || (candidate_timestamp == current_timestamp
+                    && is_account_root
+                    && !*current_is_account_root)
+        })
+        .unwrap_or(true);
+    if should_replace {
+        *latest = Some((preferences, is_account_root));
+    }
+}
+
+fn cloud_mcp_notification_preferences_from_account_live_state(value: &Value) -> Option<Value> {
+    let live = cloud_mcp_account_live_state_from_value(value).unwrap_or_else(|| value.clone());
+    let mut latest: Option<(Value, bool)> = None;
+    for candidate in [
+        live.get("notification_preferences"),
+        live.get("notificationPreferences"),
+        live.pointer("/data/notification_preferences"),
+        live.pointer("/data/notificationPreferences"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        cloud_mcp_notification_preferences_consider_candidate(&mut latest, candidate, true);
+    }
+
+    let devices = live
+        .get("devices")
+        .or_else(|| live.get("device_map"))
+        .or_else(|| live.get("deviceMap"));
+    match devices {
+        Some(Value::Object(map)) => {
+            for device in map.values() {
+                for candidate in [
+                    device.get("notification_preferences"),
+                    device.get("notificationPreferences"),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    cloud_mcp_notification_preferences_consider_candidate(
+                        &mut latest,
+                        candidate,
+                        false,
+                    );
+                }
+            }
+        }
+        Some(Value::Array(items)) => {
+            for device in items {
+                for candidate in [
+                    device.get("notification_preferences"),
+                    device.get("notificationPreferences"),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    cloud_mcp_notification_preferences_consider_candidate(
+                        &mut latest,
+                        candidate,
+                        false,
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+    latest.map(|(preferences, _)| preferences)
+}
+
+fn cloud_mcp_is_notification_preferences_sync_unit_event(event_kind: &str, event: &Value) -> bool {
+    if event_kind
+        .trim()
+        .eq_ignore_ascii_case("device_notification_preferences")
+    {
+        return true;
+    }
+    cloud_mcp_payload_text(event, &["sync_unit", "syncUnit"])
+        .map(|sync_unit| sync_unit.trim().eq_ignore_ascii_case("notification_preferences"))
+        .unwrap_or(false)
+}
+
+fn cloud_mcp_notification_preferences_should_apply(current: &Value, incoming: &Value) -> bool {
+    let incoming_updated_at_ms = cloud_mcp_notification_preferences_timestamp(incoming);
+    if incoming_updated_at_ms == 0 {
+        return false;
+    }
+    let current_updated_at_ms = cloud_mcp_notification_preferences_timestamp(current);
+    current_updated_at_ms < incoming_updated_at_ms
+        || (current_updated_at_ms == incoming_updated_at_ms && current != incoming)
+}
+
+async fn cloud_mcp_apply_notification_preferences_from_account_live_state_inner<F>(
+    state: &CloudMcpState,
+    event: &Value,
+    current: Value,
+    mut write_preferences: F,
+) -> Option<Value>
+where
+    F: FnMut(&Value) -> bool,
+{
+    let preferences = cloud_mcp_notification_preferences_from_account_live_state(event)?;
+    if !cloud_mcp_notification_preferences_should_apply(&current, &preferences) {
+        return None;
+    }
+    if !write_preferences(&preferences) {
+        return None;
+    }
+    cloud_mcp_notification_preferences_set_runtime_snapshot(state, preferences.clone()).await;
+    Some(preferences)
+}
+
+async fn cloud_mcp_apply_notification_preferences_from_account_live_state(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    event: &Value,
+) {
+    let current = cloud_mcp_notification_preferences_from_app(app);
+    let Some(preferences) = cloud_mcp_apply_notification_preferences_from_account_live_state_inner(
+        state,
+        event,
+        current,
+        |preferences| cloud_mcp_notification_preferences_write_app(app, preferences).is_ok(),
+    )
+    .await
+    else {
+        return;
+    };
+    let _ = app.emit(
+        CLOUD_MCP_NOTIFICATION_PREFERENCES_CHANGED_EVENT,
+        json!({
+            "preferences": preferences,
+            "reason": "account_device_live_state_snapshot",
+            "source": "cloud",
+        }),
+    );
+}
+
+#[tauri::command]
+async fn cloud_mcp_get_notification_preferences(
+    app: AppHandle,
+    state: State<'_, CloudMcpState>,
+) -> Result<Value, String> {
+    let preferences = cloud_mcp_notification_preferences_from_app(&app);
+    if cloud_mcp_notification_preferences_timestamp(&preferences) > 0 {
+        cloud_mcp_notification_preferences_set_runtime_snapshot(state.inner(), preferences.clone())
+            .await;
+    }
+    Ok(json!({
+        "ok": true,
+        "contract": "diffforge.notification_prefs.v1",
+        "preferences": preferences.clone(),
+        "notification_preferences": preferences,
+    }))
+}
+
+#[tauri::command]
+async fn cloud_mcp_set_notification_preferences(
+    app: AppHandle,
+    state: State<'_, CloudMcpState>,
+    preferences: Value,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let now_ms = cloud_mcp_now_ms();
+    let mut preferences = cloud_mcp_sanitize_notification_preferences(&preferences)
+        .unwrap_or_else(cloud_mcp_default_notification_preferences);
+    if cloud_mcp_notification_preferences_timestamp(&preferences) == 0 {
+        if let Some(object) = preferences.as_object_mut() {
+            object.insert("updated_at_ms".to_string(), json!(now_ms));
+        }
+    }
+    cloud_mcp_notification_preferences_write_app(&app, &preferences)?;
+    cloud_mcp_notification_preferences_set_runtime_snapshot(state.inner(), preferences.clone())
+        .await;
+    let reason = reason
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "notification_preferences_changed".to_string());
+    let _ = app.emit(
+        CLOUD_MCP_NOTIFICATION_PREFERENCES_CHANGED_EVENT,
+        json!({
+            "preferences": preferences.clone(),
+            "reason": reason.clone(),
+            "source": "local",
+        }),
+    );
+    let sync_result =
+        cloud_mcp_publish_notification_preferences_unit(state.inner(), &preferences, &reason)
+            .await?;
+    Ok(json!({
+        "ok": true,
+        "contract": "diffforge.notification_prefs.v1",
+        "preferences": preferences,
+        "event_kind": "device_notification_preferences",
+        "eventKind": "device_notification_preferences",
+        "sync": sync_result,
+        "reason": reason,
+    }))
+}
+
 #[tauri::command]
 async fn cloud_mcp_record_remote_command_status(
     state: State<'_, CloudMcpState>,
@@ -23224,6 +23956,245 @@ async fn cloud_mcp_record_agent_chat_model_config(
     }))
 }
 
+#[tauri::command]
+async fn cloud_mcp_record_agent_chat_permission_config(
+    provider: String,
+    provider_session_id: Option<String>,
+    agent_chat_session_id: Option<String>,
+    workspace_id: String,
+    workspace_name: Option<String>,
+    pane_id: String,
+    terminal_instance_id: Option<u64>,
+    terminal_index: Option<i64>,
+    thread_id: Option<String>,
+    permission_mode: String,
+    origin: Option<String>,
+    command_id: Option<String>,
+    turn_id: Option<String>,
+    timestamp: Option<String>,
+) -> Result<Value, String> {
+    let provider = terminal_normalize_agent_kind(Some(&provider))
+        .unwrap_or_else(|| provider.trim().to_ascii_lowercase().replace('-', "_"));
+    if !matches!(provider.as_str(), "codex" | "claude" | "opencode") {
+        return Err(
+            "Agent chat permission config record requires provider codex, claude, or opencode."
+                .to_string(),
+        );
+    }
+    let permission_mode = permission_mode.trim().to_string();
+    if permission_mode.is_empty() {
+        return Err("Agent chat permission config record requires permission_mode.".to_string());
+    }
+    let provider_session_id = provider_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let agent_chat_session_id = agent_chat_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let session_id = provider_session_id
+        .clone()
+        .or_else(|| agent_chat_session_id.clone())
+        .ok_or_else(|| {
+            "Agent chat permission config record requires provider_session_id or agent_chat_session_id."
+                .to_string()
+        })?;
+    let workspace_id = workspace_id.trim().to_string();
+    if workspace_id.is_empty() {
+        return Err("Agent chat permission config record requires workspace_id.".to_string());
+    }
+    let pane_id = pane_id.trim().to_string();
+    if pane_id.is_empty() {
+        return Err("Agent chat permission config record requires pane_id.".to_string());
+    }
+
+    let now = timestamp
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(chrono_like_now_iso);
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
+        .unwrap_or_else(|| "desktop-primary".to_string());
+    let scope_key = cloud_mcp_process_account_scope_key();
+    let command_id = command_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("permission-config-{}", cloud_mcp_now_ms()));
+    let turn_id = turn_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let origin = origin
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("remote_permission_config_change")
+        .to_string();
+    let record_identity = json!({
+        "command_id": command_id.as_str(),
+        "origin": origin.as_str(),
+        "permission_mode": permission_mode.as_str(),
+        "provider": provider.as_str(),
+        "session_id": session_id.as_str(),
+        "turn_id": turn_id.as_deref().unwrap_or(""),
+        "workspace_id": workspace_id.as_str(),
+    });
+    let record_key = format!(
+        "permission-config-{}",
+        &cloud_mcp_outbox_payload_hash(&record_identity)[..24]
+    );
+    let record = json!({
+        "record_key": record_key,
+        "recordKind": "permission_config",
+        "record_kind": "permission_config",
+        "record_hash": cloud_mcp_outbox_payload_hash(&json!({
+            "identity": record_identity,
+            "timestamp": now.as_str(),
+        })),
+        "timestamp": now.as_str(),
+        "messages": [],
+        "permission_mode": permission_mode.as_str(),
+        "permissionMode": permission_mode.as_str(),
+        "origin": origin.as_str(),
+        "command_id": command_id.as_str(),
+        "commandId": command_id.as_str(),
+        "turn_id": turn_id.clone(),
+        "turnId": turn_id.clone(),
+        "raw": {
+            "permission_mode": permission_mode.as_str(),
+            "origin": origin.as_str(),
+            "command_id": command_id.as_str(),
+            "turn_id": turn_id.clone(),
+        },
+    });
+    let permission_config = json!({
+        "permission_mode": permission_mode.as_str(),
+        "permissionMode": permission_mode.as_str(),
+    });
+    let payload_hash_seed = json!({
+        "record": record.clone(),
+        "provider": provider.as_str(),
+        "session_id": session_id.as_str(),
+        "workspace_id": workspace_id.as_str(),
+    });
+    let content_hash = cloud_mcp_outbox_payload_hash(&payload_hash_seed);
+    let payload_hash = cloud_mcp_outbox_payload_hash(&json!({
+        "content_hash": content_hash.as_str(),
+        "packet": "permission_config",
+    }));
+    let idempotency_key = format!(
+        "agent-chat-session:permission-config:v1:{scope_key}:{device_id}:{workspace_id}:{provider}:{session_id}:{command_id}:{payload_hash}"
+    );
+    let provider_session_id_value = provider_session_id
+        .clone()
+        .unwrap_or_else(|| session_id.clone());
+    let agent_chat_session_id_value = agent_chat_session_id.clone().unwrap_or_default();
+    let workspace_name_value = workspace_name.unwrap_or_default();
+    let thread_id_value = thread_id.unwrap_or_default();
+    let metadata_hash = cloud_mcp_outbox_payload_hash(&json!({
+        "permission_config": permission_config.clone(),
+        "provider": provider.as_str(),
+        "session_id": session_id.as_str(),
+        "workspace_id": workspace_id.as_str(),
+    }));
+    let payload = json!({
+        "c": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_CONTRACT,
+        "contract": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_CONTRACT,
+        "m": "delta",
+        "mode": "delta",
+        "v": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_SCHEMA_VERSION,
+        "schemaVersion": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_SCHEMA_VERSION,
+        "schema_version": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_SCHEMA_VERSION,
+        "pid": idempotency_key.as_str(),
+        "idempotency_key": idempotency_key.as_str(),
+        "idempotencyKey": idempotency_key.as_str(),
+        "ph": payload_hash.as_str(),
+        "payload_hash": payload_hash.as_str(),
+        "payloadHash": payload_hash.as_str(),
+        "content_hash": content_hash.as_str(),
+        "contentHash": content_hash.as_str(),
+        "metadata_hash": metadata_hash,
+        "scope_key": scope_key.as_str(),
+        "scopeKey": scope_key.as_str(),
+        "device": device_profile,
+        "device_id": device_id.as_str(),
+        "deviceId": device_id.as_str(),
+        "source": "rust-diffforge",
+        "reason": "remote_permission_config_change",
+        "provider": provider.as_str(),
+        "agent_kind": provider.as_str(),
+        "agentKind": provider.as_str(),
+        "session_id": session_id.as_str(),
+        "sessionId": session_id.as_str(),
+        "provider_session_id": provider_session_id_value.as_str(),
+        "providerSessionId": provider_session_id_value.as_str(),
+        "agent_chat_session_id": agent_chat_session_id_value.as_str(),
+        "agentChatSessionId": agent_chat_session_id_value.as_str(),
+        "source_kind": "remote_permission_config",
+        "sourceKind": "remote_permission_config",
+        "title": "Permission configuration",
+        "latest_timestamp": now.as_str(),
+        "latestTimestamp": now.as_str(),
+        "record_count": 1,
+        "recordCount": 1,
+        "changed_record_count": 1,
+        "changedRecordCount": 1,
+        "total_record_count": 1,
+        "totalRecordCount": 1,
+        "packet_key": "permission_config",
+        "packetKey": "permission_config",
+        "packet_index": 0,
+        "packetIndex": 0,
+        "packet_count": 1,
+        "packetCount": 1,
+        "packet_record_offset": 0,
+        "packetRecordOffset": 0,
+        "records_remaining": 0,
+        "recordsRemaining": 0,
+        "has_more_records": false,
+        "hasMoreRecords": false,
+        "workspace_id": workspace_id.as_str(),
+        "workspaceId": workspace_id.as_str(),
+        "workspace_name": workspace_name_value.as_str(),
+        "workspaceName": workspace_name_value.as_str(),
+        "thread_id": thread_id_value.as_str(),
+        "threadId": thread_id_value.as_str(),
+        "pane_id": pane_id.as_str(),
+        "paneId": pane_id.as_str(),
+        "terminal_instance_id": terminal_instance_id,
+        "terminalInstanceId": terminal_instance_id,
+        "terminal_index": terminal_index,
+        "terminalIndex": terminal_index,
+        "status": "completed",
+        "permission_mode": permission_mode.as_str(),
+        "permissionMode": permission_mode.as_str(),
+        "permission_config": permission_config.clone(),
+        "permissionConfig": permission_config,
+        "records": [record],
+    });
+    let queued = cloud_mcp_outbox_enqueue_event(
+        CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT,
+        &payload,
+        cloud_mcp_outbox_priority_for_event(CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT),
+        "remote_permission_config_change",
+    )?;
+    Ok(json!({
+        "ok": true,
+        "queued": true,
+        "outbox_id": queued.outbox_id,
+        "event_kind": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT,
+        "payload_hash": payload_hash,
+    }))
+}
+
 fn cloud_mcp_desktop_device_profile() -> Value {
     static DEVICE_PROFILE: OnceLock<Value> = OnceLock::new();
     DEVICE_PROFILE
@@ -23233,6 +24204,16 @@ fn cloud_mcp_desktop_device_profile() -> Value {
             let device_id = cloud_mcp_stable_desktop_device_id(&device_name, platform);
             let (device_key_id, device_public_key) =
                 cloud_mcp_stable_desktop_device_key_metadata(&device_id);
+            let push_key_metadata = agent_account_push_public_key_metadata().ok();
+            let push_public_key = push_key_metadata
+                .as_ref()
+                .map(|metadata| metadata.public_key_b64.clone())
+                .unwrap_or_default();
+            let push_key_algorithm = push_key_metadata
+                .as_ref()
+                .map(|metadata| metadata.algorithm.clone())
+                .unwrap_or_else(|| AGENT_ACCOUNT_PUSH_SEALED_ALGORITHM.to_string());
+            let push_capable = push_key_metadata.is_some() && !push_public_key.is_empty();
             json!({
                     "device_id": device_id,
                     "device_name": device_name,
@@ -23241,6 +24222,12 @@ fn cloud_mcp_desktop_device_profile() -> Value {
                 "device_key_id": device_key_id,
                 "device_public_key": device_public_key,
                 "device_key_algorithm": "sha256-local-anchor-v1",
+                "push_capable": push_capable,
+                "pushCapable": push_capable,
+                "push_public_key": push_public_key,
+                "pushPublicKey": push_public_key,
+                "push_key_algorithm": push_key_algorithm,
+                "pushKeyAlgorithm": push_key_algorithm,
                     "platform": platform,
                     "os": platform,
                     "architecture": env::consts::ARCH,
@@ -24343,6 +25330,7 @@ fn cloud_mcp_device_live_unit_event_kind(event_kind: &str) -> bool {
         "device_agent_installation_status"
             | "workspace_mcp_server_status"
             | "device_audio_preferences"
+            | "device_notification_preferences"
             | "provider_account_identity"
     )
 }
@@ -24649,6 +25637,8 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
     let mut has_app_context = false;
     let mut audio_preferences = Value::Null;
     let mut has_audio_preferences = false;
+    let mut notification_preferences = Value::Null;
+    let mut has_notification_preferences = false;
     let mut has_workspace_state = false;
     let mut cli_states = Value::Null;
     let mut has_cli_state = false;
@@ -24673,6 +25663,10 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
         if let Some(snapshot) = snapshots.audio_preferences.as_ref() {
             has_audio_preferences = true;
             audio_preferences = snapshot.clone();
+        }
+        if let Some(snapshot) = snapshots.notification_preferences.as_ref() {
+            has_notification_preferences = true;
+            notification_preferences = snapshot.clone();
         }
         for snapshot in [
             snapshots.workspace_catalog.as_ref(),
@@ -24760,6 +25754,12 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
         if has_audio_preferences {
             object.insert("audio_preferences".to_string(), audio_preferences.clone());
             object.insert("audioPreferences".to_string(), audio_preferences);
+        }
+        if has_notification_preferences {
+            object.insert(
+                "notification_preferences".to_string(),
+                notification_preferences,
+            );
         }
         if has_workspace_state {
             object.insert(
@@ -32358,11 +33358,39 @@ fn cloud_mcp_normalize_device_terminal_orchestrator(
         ],
     )
     .unwrap_or_else(|| "terminal".to_string());
+    let thread_id = cloud_mcp_payload_text(
+        terminal,
+        &[
+            "thread_id",
+            "threadId",
+            "target_thread_id",
+            "targetThreadId",
+        ],
+    );
+    let provider_session_id = cloud_mcp_payload_text(
+        terminal,
+        &[
+            "provider_session_id",
+            "providerSessionId",
+            "native_session_id",
+            "nativeSessionId",
+            "session_id",
+            "sessionId",
+        ],
+    );
 
     let mut normalized = terminal.clone();
     let Some(object) = normalized.as_object_mut() else {
         return None;
     };
+    object.insert(
+        "workspace_id".to_string(),
+        json!(CLOUD_MCP_APP_CONTROL_WORKSPACE_ID),
+    );
+    object.insert(
+        "workspaceId".to_string(),
+        json!(CLOUD_MCP_APP_CONTROL_WORKSPACE_ID),
+    );
     object.insert("terminal_scope".to_string(), json!("device"));
     object.insert("terminalScope".to_string(), json!("device"));
     object.insert("terminal_kind".to_string(), json!("terminal_orchestrator"));
@@ -32384,6 +33412,24 @@ fn cloud_mcp_normalize_device_terminal_orchestrator(
     object.insert("targetTerminalId".to_string(), json!(terminal_id));
     object.insert("pane_id".to_string(), json!(pane_id.clone()));
     object.insert("paneId".to_string(), json!(pane_id));
+    if let Some(thread_id) = thread_id.filter(|value| !value.trim().is_empty()) {
+        object.insert("thread_id".to_string(), json!(thread_id.clone()));
+        object.insert("threadId".to_string(), json!(thread_id));
+    }
+    if let Some(provider_session_id) =
+        provider_session_id.filter(|value| !value.trim().is_empty())
+    {
+        object.insert(
+            "provider_session_id".to_string(),
+            json!(provider_session_id.clone()),
+        );
+        object.insert(
+            "providerSessionId".to_string(),
+            json!(provider_session_id.clone()),
+        );
+        object.insert("session_id".to_string(), json!(provider_session_id.clone()));
+        object.insert("sessionId".to_string(), json!(provider_session_id));
+    }
     object.insert("agent_kind".to_string(), json!(agent_kind.clone()));
     object.insert("agentKind".to_string(), json!(agent_kind));
     object.insert("status".to_string(), json!(status));
@@ -32835,6 +33881,31 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
                     .or_else(|| terminal.get("inputReady"))
                     .cloned()
                     .unwrap_or(Value::Null);
+                let prompt_options = terminal
+                    .get("prompt_options")
+                    .or_else(|| terminal.get("promptOptions"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let allows_free_text = terminal
+                    .get("allows_free_text")
+                    .or_else(|| terminal.get("allowsFreeText"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let manual_approval_required = terminal
+                    .get("manual_approval_required")
+                    .or_else(|| terminal.get("manualApprovalRequired"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let provider_blocked_for_user = terminal
+                    .get("provider_blocked_for_user")
+                    .or_else(|| terminal.get("providerBlockedForUser"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let terminal_is_prompting_user = terminal
+                    .get("terminal_is_prompting_user")
+                    .or_else(|| terminal.get("terminalIsPromptingUser"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
                 let pane_id = cloud_mcp_payload_text(
                     terminal,
                     &[
@@ -32881,6 +33952,34 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
                     "statusSource": status_source,
                     "visible_terminal": visible_terminal.clone(),
                     "visibleTerminal": visible_terminal,
+                    "prompt_id": cloud_mcp_payload_text(terminal, &["prompt_id", "promptId"]),
+                    "promptId": cloud_mcp_payload_text(terminal, &["prompt_id", "promptId"]),
+                    "prompt_kind": cloud_mcp_payload_text(terminal, &["prompt_kind", "promptKind"]),
+                    "promptKind": cloud_mcp_payload_text(terminal, &["prompt_kind", "promptKind"]),
+                    "prompt_options": prompt_options.clone(),
+                    "promptOptions": prompt_options,
+                    "allows_free_text": allows_free_text.clone(),
+                    "allowsFreeText": allows_free_text,
+                    "prompt_default_option": cloud_mcp_payload_text(terminal, &["prompt_default_option", "promptDefaultOption"]),
+                    "promptDefaultOption": cloud_mcp_payload_text(terminal, &["prompt_default_option", "promptDefaultOption"]),
+                    "prompt_ttl_ms": terminal
+                        .get("prompt_ttl_ms")
+                        .or_else(|| terminal.get("promptTtlMs"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    "promptTtlMs": terminal
+                        .get("prompt_ttl_ms")
+                        .or_else(|| terminal.get("promptTtlMs"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    "manual_approval_required": manual_approval_required.clone(),
+                    "manualApprovalRequired": manual_approval_required,
+                    "provider_blocked_for_user": provider_blocked_for_user.clone(),
+                    "providerBlockedForUser": provider_blocked_for_user,
+                    "terminal_is_prompting_user": terminal_is_prompting_user.clone(),
+                    "terminalIsPromptingUser": terminal_is_prompting_user,
+                    "prompting_user_text": cloud_mcp_payload_text(terminal, &["prompting_user_text", "promptingUserText"]),
+                    "promptingUserText": cloud_mcp_payload_text(terminal, &["prompting_user_text", "promptingUserText"]),
                     "command_phase": cloud_mcp_payload_text(terminal, &["command_phase", "commandPhase"]),
                     "execution_phase": cloud_mcp_payload_text(terminal, &["execution_phase", "executionPhase"]),
                     "turn_id": cloud_mcp_payload_text(terminal, &["turn_id", "turnId", "latest_turn_id", "latestTurnId"]),
@@ -35752,6 +36851,32 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         "status_seq": status_seq,
         "observed_at_ms": payload.observed_at_ms,
         "hook_timestamp_ms": payload.hook_timestamp_ms,
+        "prompt_id": payload.prompt_id.clone(),
+        "promptId": payload.prompt_id.clone(),
+        "prompt_kind": payload.prompt_kind.clone(),
+        "promptKind": payload.prompt_kind.clone(),
+        "prompt_default_option": payload.prompt_default_option.clone(),
+        "promptDefaultOption": payload.prompt_default_option.clone(),
+        "prompt_ttl_ms": payload.prompt_ttl_ms,
+        "promptTtlMs": payload.prompt_ttl_ms,
+        "prompt_options": payload.prompt_options.clone(),
+        "promptOptions": payload.prompt_options.clone(),
+        "allows_free_text": payload.allows_free_text,
+        "allowsFreeText": payload.allows_free_text,
+        "manual_approval_required": payload.manual_approval_required,
+        "manualApprovalRequired": payload.manual_approval_required,
+        "provider_blocked_for_user": payload.provider_blocked_for_user,
+        "providerBlockedForUser": payload.provider_blocked_for_user,
+        "terminal_is_prompting_user": payload.terminal_is_prompting_user,
+        "terminalIsPromptingUser": payload.terminal_is_prompting_user,
+        "prompting_user_kind": payload.prompting_user_kind.clone(),
+        "promptingUserKind": payload.prompting_user_kind.clone(),
+        "prompting_user_source": payload.prompting_user_source.clone(),
+        "promptingUserSource": payload.prompting_user_source.clone(),
+        "prompting_user_confidence": payload.prompting_user_confidence.clone(),
+        "promptingUserConfidence": payload.prompting_user_confidence.clone(),
+        "prompting_user_text": payload.prompting_user_text.clone(),
+        "promptingUserText": payload.prompting_user_text.clone(),
         "turn_id": payload.turn_id,
         "provider_turn_id": payload.provider_turn_id,
         "provider_session_id": provider_session_id.clone(),
@@ -54672,6 +55797,176 @@ mod cloud_mcp_tests {
 
     static CLOUD_MCP_TEST_ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 
+    #[test]
+    fn notification_preferences_sanitize_preserves_unknowns_and_canonicalizes() {
+        let preferences = cloud_mcp_sanitize_notification_preferences(&json!({
+            "notificationPreferences": {
+                "version": 99,
+                "push": {
+                    "uirPrompts": false,
+                    "loopRunStarted": true,
+                    "loop_run_completed": false,
+                    "customChannel": "kept",
+                },
+                "loopspaceOverrides": {
+                    "loop-1": {
+                        "started": "on",
+                        "completed": "inherit",
+                        "failed": "off",
+                        "blocked": true,
+                        "webOnly": "kept",
+                    },
+                },
+                "updatedAtMs": "42",
+                "future": {"kept": true},
+            }
+        }))
+        .expect("notification preferences");
+
+        assert_eq!(preferences["version"], json!(1));
+        assert_eq!(preferences["updated_at_ms"], json!(42));
+        assert_eq!(preferences["push"]["uir_prompts"], json!(false));
+        assert_eq!(preferences["push"]["loop_run_started"], json!(true));
+        assert_eq!(preferences["push"]["loop_run_completed"], json!(false));
+        assert_eq!(preferences["push"]["loop_run_failed"], json!(true));
+        assert_eq!(preferences["push"]["customChannel"], json!("kept"));
+        assert_eq!(
+            preferences["loopspace_overrides"]["loop-1"]["started"],
+            json!(true)
+        );
+        assert_eq!(
+            preferences["loopspace_overrides"]["loop-1"]["completed"],
+            Value::Null
+        );
+        assert_eq!(
+            preferences["loopspace_overrides"]["loop-1"]["failed"],
+            json!(false)
+        );
+        assert_eq!(
+            preferences["loopspace_overrides"]["loop-1"]["blocked"],
+            json!(true)
+        );
+        assert_eq!(
+            preferences["loopspace_overrides"]["loop-1"]["webOnly"],
+            json!("kept")
+        );
+        assert_eq!(preferences["future"], json!({"kept": true}));
+        assert!(preferences.get("updatedAtMs").is_none());
+        assert!(preferences.get("loopspaceOverrides").is_none());
+    }
+
+    #[test]
+    fn notification_preferences_from_account_live_state_uses_latest_device() {
+        let preferences = cloud_mcp_notification_preferences_from_account_live_state(&json!({
+            "account_live_state": {
+                "devices": {
+                    "old": {
+                        "notification_preferences": {
+                            "push": {"loop_run_failed": false},
+                            "updated_at_ms": 10,
+                        },
+                    },
+                    "new": {
+                        "notificationPreferences": {
+                            "push": {"loopRunFailed": true, "awaitingDevice": false},
+                            "updatedAtMs": 20,
+                        },
+                    },
+                },
+            },
+        }))
+        .expect("latest preferences");
+
+        assert_eq!(preferences["updated_at_ms"], json!(20));
+        assert_eq!(preferences["push"]["loop_run_failed"], json!(true));
+        assert_eq!(preferences["push"]["awaiting_device"], json!(false));
+    }
+
+    #[test]
+    fn notification_preferences_from_account_live_state_uses_newer_device_than_root() {
+        let preferences = cloud_mcp_notification_preferences_from_account_live_state(&json!({
+            "account_live_state": {
+                "notification_preferences": {
+                    "push": {"loop_run_completed": false},
+                    "updated_at_ms": 100,
+                },
+                "devices": {
+                    "web": {
+                        "notification_preferences": {
+                            "push": {"loop_run_completed": true, "account_events": false},
+                            "updated_at_ms": 200,
+                        },
+                    },
+                },
+            },
+        }))
+        .expect("newer device preferences");
+
+        assert_eq!(preferences["updated_at_ms"], json!(200));
+        assert_eq!(preferences["push"]["loop_run_completed"], json!(true));
+        assert_eq!(preferences["push"]["account_events"], json!(false));
+    }
+
+    #[test]
+    fn notification_preferences_from_account_live_state_tie_prefers_root() {
+        let preferences = cloud_mcp_notification_preferences_from_account_live_state(&json!({
+            "account_live_state": {
+                "notification_preferences": {
+                    "push": {"loop_run_blocked": true},
+                    "updated_at_ms": 300,
+                },
+                "devices": [
+                    {
+                        "notification_preferences": {
+                            "push": {"loop_run_blocked": false},
+                            "updated_at_ms": 300,
+                        },
+                    },
+                ],
+            },
+        }))
+        .expect("root tie preferences");
+
+        assert_eq!(preferences["updated_at_ms"], json!(300));
+        assert_eq!(preferences["push"]["loop_run_blocked"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn notification_preferences_standalone_sync_unit_updates_runtime_snapshot() {
+        let event = json!({
+            "eventKind": "device_notification_preferences",
+            "syncUnit": "notification_preferences",
+            "notification_preferences": {
+                "push": {"awaiting_device": false},
+                "updated_at_ms": 400,
+            },
+        });
+        let event_kind = cloud_mcp_payload_text(&event, &["event_kind"])
+            .or_else(|| cloud_mcp_payload_text(&event, &["eventKind"]))
+            .unwrap_or_default();
+        assert!(cloud_mcp_is_notification_preferences_sync_unit_event(
+            &event_kind,
+            &event
+        ));
+
+        let state = CloudMcpState::new();
+        let applied = cloud_mcp_apply_notification_preferences_from_account_live_state_inner(
+            &state,
+            &event,
+            json!({"updated_at_ms": 100}),
+            |_| true,
+        )
+        .await;
+        assert!(applied.is_some());
+        let snapshots = state.runtime_snapshots.lock().await;
+        let stored = snapshots
+            .notification_preferences
+            .as_ref()
+            .expect("runtime notification preferences");
+        assert_eq!(stored["updated_at_ms"], json!(400));
+        assert_eq!(stored["push"]["awaiting_device"], json!(false));
+    }
+
     fn agent_chat_status_hook_test_payload(event_type: &str) -> TerminalActivityHookPayload {
         TerminalActivityHookPayload {
             pane_id: "pane-1".to_string(),
@@ -54740,6 +56035,7 @@ mod cloud_mcp_tests {
             prompt_default_option: None,
             prompt_ttl_ms: None,
             prompt_options: Vec::new(),
+            allows_free_text: false,
             prompt_answer_option: None,
             manual_prompt_source: None,
             manual_approval_required: false,
@@ -54756,6 +56052,43 @@ mod cloud_mcp_tests {
             observed_at_ms: 0,
             completion_evidence: String::new(),
         }
+    }
+
+    #[test]
+    fn device_terminal_orchestrator_normalizer_forces_sentinel_identity() {
+        let normalized = cloud_mcp_normalize_device_terminal_orchestrator(
+            &json!({
+                "paneId": "forge-app-control-agent-terminal",
+                "agentKind": "codex",
+                "providerSessionId": "session-app-control",
+                "threadId": "thread-app-control",
+                "workspaceId": "missing-workspace"
+            }),
+            0,
+            123,
+        )
+        .expect("normalized orchestrator");
+
+        assert_eq!(
+            normalized["workspace_id"],
+            json!(CLOUD_MCP_APP_CONTROL_WORKSPACE_ID)
+        );
+        assert_eq!(
+            normalized["workspaceId"],
+            json!(CLOUD_MCP_APP_CONTROL_WORKSPACE_ID)
+        );
+        assert_eq!(normalized["thread_id"], json!("thread-app-control"));
+        assert_eq!(normalized["threadId"], json!("thread-app-control"));
+        assert_eq!(
+            normalized["provider_session_id"],
+            json!("session-app-control")
+        );
+        assert_eq!(
+            normalized["providerSessionId"],
+            json!("session-app-control")
+        );
+        assert_eq!(normalized["session_id"], json!("session-app-control"));
+        assert_eq!(normalized["sessionId"], json!("session-app-control"));
     }
 
     fn cloud_mcp_test_dir(prefix: &str) -> PathBuf {
@@ -54886,6 +56219,143 @@ mod cloud_mcp_tests {
             &payload, None, "", "thinking", "running",
         )
         .is_none());
+
+        let mut payload = agent_chat_status_hook_test_payload("provider-user-prompt-started");
+        payload.source = "screen_detector:manual-prompt".to_string();
+        payload.activity_status = "awaiting_input".to_string();
+        payload.command_phase = "awaiting_input".to_string();
+        payload.terminal_is_prompting_user = true;
+        payload.prompt_id = Some("screen-codex_hooks_need_review-abc".to_string());
+        payload.prompt_kind = Some("approval".to_string());
+        payload.prompt_options = vec![TerminalActivityHookPromptOption {
+            id: "trust_all_and_continue".to_string(),
+            label: "Trust all and continue".to_string(),
+            description: None,
+            value: Some("2".to_string()),
+            danger: Some(true),
+        }];
+        assert_eq!(
+            cloud_mcp_agent_chat_status_from_hook(&payload, "paused"),
+            "awaiting_input"
+        );
+        assert!(cloud_mcp_agent_chat_status_sync_request_from_hook(
+            &payload, None, "", "paused", "pending",
+        )
+        .is_some());
+    }
+
+    #[tokio::test]
+    async fn terminal_state_live_update_preserves_prompt_options() {
+        let state = CloudMcpState::new();
+        let payload = json!({
+            "event_kind": "terminal_state_update",
+            "workspace_id": "workspace-a",
+            "workspace_name": "Workspace A",
+            "terminal_id": "pane-1",
+            "pane_id": "pane-1",
+            "terminal_instance_id": 7,
+            "agent_kind": "codex",
+            "status": "awaiting_input",
+            "activity_status": "awaiting_input",
+            "prompt_id": "screen-codex_hooks_need_review-abc",
+            "prompt_kind": "approval",
+            "prompt_default_option": "continue_without_trusting",
+            "prompt_options": [{
+                "id": "trust_all_and_continue",
+                "label": "Trust all and continue",
+                "value": "2",
+                "danger": true
+            }],
+            "allows_free_text": true,
+            "manual_approval_required": true,
+            "provider_blocked_for_user": true,
+            "terminal_is_prompting_user": true,
+            "prompting_user_text": "Hooks need review"
+        });
+
+        cloud_mcp_apply_terminal_state_to_device_live_snapshot(
+            &state,
+            &payload,
+            "terminal_state_update",
+        )
+        .await;
+
+        let snapshots = state.runtime_snapshots.lock().await;
+        let terminal = &snapshots
+            .workspace_terminals
+            .as_ref()
+            .expect("workspace terminals")["workspaces"][0]["terminals"][0];
+        assert_eq!(
+            terminal["prompt_id"],
+            json!("screen-codex_hooks_need_review-abc")
+        );
+        assert_eq!(terminal["prompt_kind"], json!("approval"));
+        assert_eq!(terminal["prompt_options"][0]["danger"], json!(true));
+        assert_eq!(terminal["allows_free_text"], json!(true));
+        assert_eq!(terminal["terminal_is_prompting_user"], json!(true));
+    }
+
+    #[test]
+    fn agent_chat_permission_config_record_enqueues_session_sync_delta() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let cache_root = test_cloud_root("diffforge-permission-config-cache");
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+
+        let result =
+            tauri::async_runtime::block_on(cloud_mcp_record_agent_chat_permission_config(
+                "claude".to_string(),
+                Some("provider-session-1".to_string()),
+                Some("agent-session-1".to_string()),
+                "workspace-1".to_string(),
+                Some("Workspace 1".to_string()),
+                "pane-1".to_string(),
+                Some(42),
+                Some(0),
+                Some("thread-1".to_string()),
+                "acceptEdits".to_string(),
+                None,
+                Some("command-1".to_string()),
+                Some("turn-1".to_string()),
+                Some("2026-07-09T12:00:00.000Z".to_string()),
+            ))
+            .unwrap();
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(
+            result["event_kind"],
+            json!(CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT)
+        );
+
+        let conn = cloud_mcp_open_outbox_conn().unwrap();
+        let payload_json: String = conn
+            .query_row(
+                &format!(
+                    "SELECT payload_json FROM {CLOUD_MCP_OUTBOX_TABLE} WHERE event_kind=?1"
+                ),
+                rusqlite::params![CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload: Value = serde_json::from_str(&payload_json).unwrap();
+        assert_eq!(payload["reason"], json!("remote_permission_config_change"));
+        assert_eq!(payload["source_kind"], json!("remote_permission_config"));
+        assert_eq!(payload["packet_key"], json!("permission_config"));
+        assert_eq!(payload["provider"], json!("claude"));
+        assert_eq!(payload["permission_mode"], json!("acceptEdits"));
+        assert_eq!(payload["permissionMode"], json!("acceptEdits"));
+        assert_eq!(
+            payload["permission_config"]["permission_mode"],
+            json!("acceptEdits")
+        );
+        assert_eq!(payload["records"][0]["record_kind"], json!("permission_config"));
+        assert_eq!(
+            payload["records"][0]["permissionMode"],
+            json!("acceptEdits")
+        );
+
+        let _ = fs::remove_dir_all(cache_root);
     }
 
     #[test]
@@ -58074,13 +59544,27 @@ mod cloud_mcp_tests {
 
     #[test]
     fn direct_target_accepts_next_route_broker_response() {
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let route_token = general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "scope": "cloud_ws",
+                "route_mode": "node_dns_gateway",
+                "allowed_paths": ["/v1/app/ws", "/v1/voice/ws"],
+                "exp": now_s + 120,
+            }))
+            .expect("encode claims"),
+        );
+        let route_token = format!("{route_token}.test-signature");
         let route = json!({
             "ok": true,
             "direct": true,
             "browserCompatible": true,
             "websocketUrl": "wss://node-a.nodes.diffforge.ai/_diffforge/instances/abc/v1/app/ws",
             "voiceWebsocketUrl": "wss://node-a.nodes.diffforge.ai/_diffforge/instances/abc/v1/voice/ws",
-            "routeToken": "route-token-123",
+            "routeToken": route_token,
             "transport": "cloudflare_node_gateway",
         });
 
@@ -58090,7 +59574,7 @@ mod cloud_mcp_tests {
             app_target.ws_url,
             "wss://node-a.nodes.diffforge.ai/_diffforge/instances/abc/v1/app/ws"
         );
-        assert_eq!(app_target.route_token.as_deref(), Some("route-token-123"));
+        assert_eq!(app_target.route_token.as_deref(), route["routeToken"].as_str());
         assert_eq!(app_target.transport, "cloudflare_node_gateway");
 
         let voice_target =
@@ -58099,7 +59583,7 @@ mod cloud_mcp_tests {
             voice_target.ws_url,
             "wss://node-a.nodes.diffforge.ai/_diffforge/instances/abc/v1/voice/ws"
         );
-        assert_eq!(voice_target.route_token.as_deref(), Some("route-token-123"));
+        assert_eq!(voice_target.route_token.as_deref(), route["routeToken"].as_str());
     }
 
     #[test]
@@ -65623,6 +67107,12 @@ pub(crate) fn cloud_mcp_forward_agent_start_task(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    #[cfg(test)]
+    if let Some(response) =
+        cloud_mcp_test_fake_agent_start_task(base_url_override, requested_task_id.as_deref())
+    {
+        return response;
+    }
     if cloud_mcp_task_cloud_sync_disabled() {
         let task_id = requested_task_id.as_deref().ok_or_else(|| {
             "Local coordination start_task must create a task_id before cloud task sync can be skipped."
@@ -65824,6 +67314,54 @@ pub(crate) fn cloud_mcp_forward_agent_start_task(
         "cloud_sync_mode": "disabled",
         "sync": queued,
     }))
+}
+
+#[cfg(test)]
+fn cloud_mcp_test_fake_agent_start_task(
+    base_url_override: Option<&str>,
+    requested_task_id: Option<&str>,
+) -> Option<Result<Value, String>> {
+    let base_url = base_url_override?.trim();
+    let rest = base_url.strip_prefix("diffforge-test://fake-cloud/start-task/")?;
+    let (default_task_id, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let task_id = requested_task_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default_task_id.trim());
+    if task_id.is_empty() {
+        return Some(Err(
+            "Local coordination start_task must create a task_id before cloud task sync can be skipped."
+                .to_string(),
+        ));
+    }
+    let omit_task_id = query
+        .split('&')
+        .filter_map(|part| part.split_once('='))
+        .any(|(name, value)| name == "omit_task_id" && value == "true");
+    let data = if omit_task_id {
+        json!({
+            "task": {},
+            "spec_activity": {"recorded": true, "node_ids": ["spec-test"]},
+        })
+    } else {
+        json!({
+            "task_id": task_id,
+            "task": {"id": task_id},
+            "spec_activity": {"recorded": true, "node_ids": ["spec-test"]},
+        })
+    };
+    Some(Ok(json!({
+        "ok": true,
+        "task_id": task_id,
+        "coordination_authority": "local",
+        "cloud_sync_mode": "disabled",
+        "sync": {
+            "queued": true,
+            "durable": true,
+            "transport": "in_process_test_fake",
+        },
+        "data": data,
+    })))
 }
 
 fn cloud_mcp_proxy_read_message<R: std::io::BufRead>(

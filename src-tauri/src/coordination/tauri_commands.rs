@@ -908,6 +908,22 @@ pub fn coordination_delete_workspace_mcp_secret(
 }
 
 #[tauri::command]
+pub fn coordination_reveal_workspace_mcp_secret(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    workspace_id: String,
+    key: String,
+) -> Result<Value, String> {
+    let kernel = kernel(repo_path, db_path)?;
+    let workspace_id = req_text(&workspace_id, "workspace_id")?;
+    result(
+        kernel
+            .reveal_workspace_mcp_secret(workspace_id, &key)
+            .map(api_ok_from_data),
+    )
+}
+
+#[tauri::command]
 pub fn coordination_upsert_workspace_mcp_ssh_target(
     repo_path: Option<String>,
     db_path: Option<String>,

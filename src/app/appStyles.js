@@ -51,6 +51,7 @@ import { TerminalFill as AgentTerminalGlyph } from "@styled-icons/bootstrap/Term
 import { LayoutSplit } from "@styled-icons/bootstrap/LayoutSplit";
 import { LayoutRow } from "@styled-icons/remix-line/LayoutRow";
 import { CloudQueue as RailCloudGlyph } from "@styled-icons/material-rounded/CloudQueue";
+import { Devices as RailDevicesGlyph } from "@styled-icons/material-rounded/Devices";
 import { Token as RailCubeGlyph } from "@styled-icons/material-rounded/Token";
 import { Public as RailGlobeGlyph } from "@styled-icons/material-rounded/Public";
 import { History as RailHistoryGlyph } from "@styled-icons/material-rounded/History";
@@ -4449,6 +4450,11 @@ export const LoopspaceRuntimeSurface = styled.section`
   overflow: hidden;
   color: #f6f7f9;
   background: #000;
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+    background: #f5f7fa;
+  }
 `;
 
 export const LoopspaceRuntimeToolbar = styled.div`
@@ -4469,6 +4475,13 @@ export const LoopspaceRuntimeToolbar = styled.div`
   @media (max-width: 640px) {
     grid-template-columns: 32px minmax(0, 1fr);
     align-content: center;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(217, 119, 6, 0.22);
+    background:
+      linear-gradient(180deg, rgba(217, 119, 6, 0.07), rgba(217, 119, 6, 0.015)),
+      #ffffff;
   }
 `;
 
@@ -4493,6 +4506,17 @@ export const LoopspaceRuntimeNameInput = styled.input`
 
   &:disabled {
     opacity: 0.58;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.14);
+    color: #0f172a;
+    background: rgba(15, 23, 42, 0.04);
+  }
+
+  html[data-forge-theme="light"] &:focus {
+    border-color: rgba(15, 23, 42, 0.32);
+    background: rgba(15, 23, 42, 0.06);
   }
 `;
 
@@ -4524,6 +4548,17 @@ export const LoopspaceRuntimeIconButton = styled.button`
     cursor: default;
     opacity: 0.42;
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.12);
+    color: #0f172a;
+    background: rgba(15, 23, 42, 0.04);
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    border-color: rgba(15, 23, 42, 0.26);
+    background: rgba(15, 23, 42, 0.07);
+  }
 `;
 
 export const LoopspaceRuntimeDangerButton = styled(LoopspaceRuntimeIconButton)`
@@ -4532,6 +4567,15 @@ export const LoopspaceRuntimeDangerButton = styled(LoopspaceRuntimeIconButton)`
   &:hover:not(:disabled) {
     border-color: rgba(255, 121, 121, 0.34);
     background: rgba(255, 78, 78, 0.12);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #dc2626;
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    border-color: rgba(220, 38, 38, 0.4);
+    background: rgba(220, 38, 38, 0.1);
   }
 `;
 
@@ -4544,6 +4588,10 @@ export const LoopspaceRuntimeStage = styled.div`
 
   &[data-panel-collapsed="true"] {
     grid-template-rows: minmax(0, 1fr) 0 28px;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: #f5f7fa;
   }
 `;
 
@@ -4585,6 +4633,14 @@ export const LoopspaceRuntimeTitle = styled.div`
     height: 11px;
     flex: 0 0 auto;
   }
+
+  html[data-forge-theme="light"] & strong {
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: #64748b;
+  }
 `;
 
 export const LoopspaceRuntimeTabs = styled.div`
@@ -4603,6 +4659,11 @@ export const LoopspaceRuntimeTabs = styled.div`
     grid-column: 1 / -1;
     justify-self: stretch;
     grid-auto-columns: minmax(0, 1fr);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.1);
+    background: rgba(15, 23, 42, 0.04);
   }
 `;
 
@@ -4641,6 +4702,24 @@ export const LoopspaceRuntimeTabButton = styled.button`
     color: #ffffff;
     outline: none;
     background: rgba(255, 255, 255, 0.08);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    color: #92400e;
+    background: rgba(217, 119, 6, 0.14);
+    box-shadow:
+      inset 0 1px 0 rgba(15, 23, 42, 0.03),
+      0 0 14px rgba(217, 119, 6, 0.1);
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-visible {
+    color: #0f172a;
+    background: rgba(15, 23, 42, 0.06);
   }
 `;
 
@@ -4703,6 +4782,23 @@ export const LoopspaceGraphCanvas = styled.div`
 
   &[data-panning="true"] {
     cursor: grabbing;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(217, 119, 6, 0.16);
+    background:
+      linear-gradient(rgba(15, 23, 42, 0.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(15, 23, 42, 0.035) 1px, transparent 1px),
+      linear-gradient(rgba(217, 119, 6, 0.09) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(217, 119, 6, 0.09) 1px, transparent 1px),
+      linear-gradient(rgba(217, 119, 6, 0.28), rgba(217, 119, 6, 0.28)),
+      linear-gradient(90deg, rgba(217, 119, 6, 0.28), rgba(217, 119, 6, 0.28)),
+      radial-gradient(circle at var(--loopspace-origin-x, 50%) var(--loopspace-origin-y, 50%), rgba(217, 119, 6, 0.1), transparent 170px),
+      #f5f7fa;
+  }
+
+  html[data-forge-theme="light"] &::after {
+    background: radial-gradient(ellipse at 50% 42%, transparent 58%, rgba(15, 23, 42, 0.06) 100%);
   }
 `;
 
@@ -4824,6 +4920,10 @@ export const LoopspaceRuntimeSignalDot = styled.div`
     animation: none;
     transition: none;
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(245, 247, 250, 0.95);
+  }
 `;
 
 const loopspaceActiveEdge = keyframes`
@@ -4878,6 +4978,42 @@ export const LoopspaceGraphEdgePath = styled.path`
     filter: drop-shadow(0 0 14px rgba(134, 239, 172, 0.38));
     animation: ${loopspaceActiveEdge} 1s linear infinite;
   }
+
+  html[data-forge-theme="light"] & {
+    stroke: rgba(180, 83, 9, 0.72);
+    filter: drop-shadow(0 0 6px rgba(180, 83, 9, 0.12));
+  }
+
+  html[data-forge-theme="light"] &[data-branch="exec"] {
+    stroke: rgba(29, 78, 216, 0.72);
+    filter: drop-shadow(0 0 6px rgba(29, 78, 216, 0.12));
+  }
+
+  html[data-forge-theme="light"] &[data-branch="success"] {
+    stroke: rgba(4, 120, 87, 0.74);
+    filter: drop-shadow(0 0 6px rgba(4, 120, 87, 0.12));
+  }
+
+  html[data-forge-theme="light"] &[data-branch="failure"] {
+    stroke: rgba(220, 38, 38, 0.72);
+    filter: drop-shadow(0 0 6px rgba(220, 38, 38, 0.12));
+  }
+
+  html[data-forge-theme="light"] &[data-branch="interrupt"] {
+    stroke: rgba(180, 130, 10, 0.68);
+    filter: drop-shadow(0 0 6px rgba(180, 130, 10, 0.1));
+  }
+
+  html[data-forge-theme="light"] &[data-branch="docs"],
+  html[data-forge-theme="light"] &[data-branch="assets"] {
+    stroke: rgba(15, 118, 110, 0.7);
+    filter: drop-shadow(0 0 6px rgba(15, 118, 110, 0.12));
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    stroke: rgba(4, 120, 87, 0.9);
+    filter: drop-shadow(0 0 10px rgba(4, 120, 87, 0.28));
+  }
 `;
 
 export const LoopspaceGraphConnectionPreview = styled(LoopspaceGraphEdgePath)`
@@ -4885,6 +5021,11 @@ export const LoopspaceGraphConnectionPreview = styled(LoopspaceGraphEdgePath)`
   stroke-dasharray: 7 6;
   filter: drop-shadow(0 0 10px rgba(96, 165, 250, 0.24));
   pointer-events: none;
+
+  html[data-forge-theme="light"] & {
+    stroke: rgba(29, 78, 216, 0.78);
+    filter: drop-shadow(0 0 8px rgba(29, 78, 216, 0.16));
+  }
 `;
 
 export const LoopspaceGraphEdgeLabel = styled.text`
@@ -4901,6 +5042,11 @@ export const LoopspaceGraphEdgeLabel = styled.text`
   cursor: pointer;
   user-select: none;
   -webkit-user-select: none;
+
+  html[data-forge-theme="light"] & {
+    fill: rgba(15, 23, 42, 0.82);
+    stroke: rgba(255, 255, 255, 0.85);
+  }
 `;
 
 export const LoopspaceGraphNode = styled.div`
@@ -4932,9 +5078,16 @@ export const LoopspaceGraphNode = styled.div`
   user-select: none;
   -webkit-user-select: none;
 
-  &[data-kind="cron"] { --loop-node-accent: 96, 165, 250; }
-  &[data-kind="webhook"] { --loop-node-accent: 45, 212, 191; }
-  &[data-kind="manual"] { --loop-node-accent: 251, 191, 36; }
+  &[data-kind="cron"],
+  &[data-kind="webhook"],
+  &[data-kind="manual"] {
+    --loop-node-accent: 255, 209, 102;
+    border-color: rgba(var(--loop-node-accent), 0.52);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.07),
+      0 18px 48px rgba(0, 0, 0, 0.5),
+      0 0 28px rgba(var(--loop-node-accent), 0.16);
+  }
   &[data-kind="send_message"] { --loop-node-accent: 125, 176, 255; }
   &[data-kind="dispatch_todos"] { --loop-node-accent: 56, 189, 248; }
   &[data-kind="notify_device"] { --loop-node-accent: 251, 146, 60; }
@@ -4975,7 +5128,7 @@ export const LoopspaceGraphNode = styled.div`
     min-height: var(--loopspace-node-height, 132px);
     padding-right: var(--loopspace-output-gutter);
   }
-  &[data-kind="dispatch_todos"] {
+  &[data-kind="dispatch_todos"]:not([data-region="true"]) {
     --loopspace-output-gutter: var(--loopspace-node-output-gutter, 104px);
     box-sizing: border-box;
     width: var(--loopspace-node-width, 420px);
@@ -5105,6 +5258,132 @@ export const LoopspaceGraphNode = styled.div`
       0 0 0 1px rgba(var(--loop-node-accent), 0.18),
       0 14px 38px rgba(0, 0, 0, 0.32);
   }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+    background:
+      linear-gradient(180deg, rgba(var(--loop-node-accent), 0.16), rgba(var(--loop-node-accent), 0.05) 46px, transparent 84px),
+      #ffffff;
+    border-color: rgba(var(--loop-node-accent), 0.45);
+    box-shadow:
+      inset 0 1px 0 rgba(15, 23, 42, 0.03),
+      0 14px 40px rgba(15, 23, 42, 0.14),
+      0 0 0 1px rgba(15, 23, 42, 0.04);
+  }
+
+  html[data-forge-theme="light"] &[data-settings-open="true"] {
+    border-color: rgba(var(--loop-node-accent), 0.68);
+    box-shadow:
+      0 0 0 2px rgba(var(--loop-node-accent), 0.16),
+      0 16px 44px rgba(15, 23, 42, 0.16);
+  }
+
+  html[data-forge-theme="light"] &[data-region="true"] {
+    background:
+      linear-gradient(180deg, rgba(var(--loop-node-accent), 0.1), rgba(var(--loop-node-accent), 0.03) 56px, transparent 120px),
+      rgba(255, 255, 255, 0.92);
+    box-shadow:
+      inset 0 1px 0 rgba(15, 23, 42, 0.03),
+      0 16px 44px rgba(15, 23, 42, 0.16);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(var(--loop-node-accent), 0.55);
+    box-shadow:
+      inset 0 1px 0 rgba(15, 23, 42, 0.04),
+      0 16px 44px rgba(15, 23, 42, 0.16),
+      0 0 20px rgba(var(--loop-node-accent), 0.14);
+  }
+
+  html[data-forge-theme="light"] &[data-runtime] {
+    border-color: rgba(4, 120, 87, 0.5);
+    box-shadow:
+      0 0 0 1px rgba(4, 120, 87, 0.12),
+      0 0 16px rgba(4, 120, 87, 0.1),
+      0 14px 40px rgba(15, 23, 42, 0.12);
+  }
+
+  html[data-forge-theme="light"] &[data-runtime="queued"],
+  html[data-forge-theme="light"] &[data-runtime="blocked"],
+  html[data-forge-theme="light"] &[data-runtime="awaiting_device"] {
+    border-color: rgba(161, 98, 7, 0.55);
+    box-shadow:
+      0 0 0 1px rgba(161, 98, 7, 0.14),
+      0 0 18px rgba(161, 98, 7, 0.1),
+      0 14px 40px rgba(15, 23, 42, 0.12);
+  }
+
+  html[data-forge-theme="light"] &[data-runtime="running"],
+  html[data-forge-theme="light"] &[data-runtime="active"] {
+    border-color: rgba(180, 83, 9, 0.85);
+    box-shadow:
+      0 0 0 1.5px rgba(180, 83, 9, 0.24),
+      0 0 22px rgba(180, 83, 9, 0.16),
+      0 14px 40px rgba(15, 23, 42, 0.12);
+  }
+
+  html[data-forge-theme="light"] &[data-runtime="failed"],
+  html[data-forge-theme="light"] &[data-runtime="error"],
+  html[data-forge-theme="light"] &[data-runtime="timed_out"] {
+    border-color: rgba(220, 38, 38, 0.7);
+    box-shadow:
+      0 0 0 1px rgba(220, 38, 38, 0.18),
+      0 0 22px rgba(220, 38, 38, 0.14),
+      0 14px 40px rgba(15, 23, 42, 0.12);
+  }
+
+  html[data-forge-theme="light"] &[data-runtime="interrupted"],
+  html[data-forge-theme="light"] &[data-runtime="cancelled"],
+  html[data-forge-theme="light"] &[data-runtime="paused"] {
+    border-color: rgba(147, 51, 234, 0.62);
+    box-shadow:
+      0 0 0 1px rgba(147, 51, 234, 0.14),
+      0 0 22px rgba(147, 51, 234, 0.12),
+      0 14px 40px rgba(15, 23, 42, 0.12);
+  }
+
+  html[data-forge-theme="light"] &[data-runtime-selected="true"] {
+    box-shadow:
+      0 0 0 2px rgba(180, 83, 9, 0.32),
+      0 0 24px rgba(180, 83, 9, 0.14),
+      0 16px 44px rgba(15, 23, 42, 0.14);
+  }
+
+  html[data-forge-theme="light"] &[data-runtime-selected="true"]:not([data-runtime]) {
+    border-color: rgba(180, 83, 9, 0.72);
+  }
+
+  html[data-forge-theme="light"] &[data-pending="true"] {
+    border-color: rgba(var(--loop-node-accent), 0.62);
+    box-shadow:
+      0 0 0 1px rgba(var(--loop-node-accent), 0.14),
+      0 12px 34px rgba(15, 23, 42, 0.1);
+  }
+
+  html[data-forge-theme="light"] &[data-document-drop-target="true"] {
+    border-color: rgba(4, 120, 87, 0.85);
+    box-shadow:
+      0 0 0 1px rgba(4, 120, 87, 0.2),
+      0 0 20px rgba(4, 120, 87, 0.16),
+      0 14px 40px rgba(15, 23, 42, 0.12);
+  }
+
+  html[data-forge-theme="light"] &[data-ghost="true"] {
+    border-color: rgba(var(--loop-node-accent), 0.78);
+    box-shadow:
+      0 0 0 1px rgba(var(--loop-node-accent), 0.2),
+      0 10px 30px rgba(15, 23, 42, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-kind="cron"],
+  html[data-forge-theme="light"] &[data-kind="webhook"],
+  html[data-forge-theme="light"] &[data-kind="manual"] {
+    border-color: rgba(var(--loop-node-accent), 0.68);
+    box-shadow:
+      inset 0 1px 0 rgba(15, 23, 42, 0.035),
+      0 16px 44px rgba(15, 23, 42, 0.16),
+      0 0 22px rgba(var(--loop-node-accent), 0.2);
+  }
 `;
 
 export const LoopspaceDispatchTodoCarousel = styled.div`
@@ -5136,6 +5415,20 @@ export const LoopspaceDispatchTodoRow = styled.div`
     background:
       linear-gradient(135deg, rgba(var(--loop-node-accent), 0.16), rgba(255, 255, 255, 0.04)),
       rgba(8, 13, 18, 0.88);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(var(--loop-node-accent), 0.3);
+    color: rgba(15, 23, 42, 0.72);
+    background: rgba(15, 23, 42, 0.04);
+  }
+
+  html[data-forge-theme="light"] &[data-current="true"] {
+    border-color: rgba(var(--loop-node-accent), 0.55);
+    color: #0f172a;
+    background:
+      linear-gradient(135deg, rgba(var(--loop-node-accent), 0.2), rgba(255, 255, 255, 0.5)),
+      #ffffff;
   }
 
   > span:last-child {
@@ -5203,6 +5496,10 @@ export const LoopspaceDispatchTodoNumber = styled.span`
   font-size: 9px;
   font-weight: 900;
   text-align: right;
+
+  html[data-forge-theme="light"] & {
+    color: color-mix(in srgb, rgb(var(--loop-node-accent)) 65%, #0f172a);
+  }
 `;
 
 export const LoopspaceDispatchTodoEmpty = styled.div`
@@ -5215,6 +5512,11 @@ export const LoopspaceDispatchTodoEmpty = styled.div`
   color: rgba(226, 232, 240, 0.52);
   font-size: 10px;
   font-weight: 760;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(var(--loop-node-accent), 0.38);
+    color: #64748b;
+  }
 `;
 
 export const LoopspaceGraphNodeOutputPorts = styled.div`
@@ -5273,6 +5575,22 @@ export const LoopspaceGraphNodePort = styled.button`
     box-shadow:
       0 0 0 4px rgba(var(--loop-node-accent), 0.2),
       0 0 20px rgba(var(--loop-node-accent), 0.34);
+  }
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+    box-shadow:
+      0 0 0 2px rgba(var(--loop-node-accent), 0.12),
+      0 0 10px rgba(var(--loop-node-accent), 0.16);
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"],
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-visible {
+    border-color: color-mix(in srgb, rgb(var(--loop-node-accent)) 70%, #0f172a);
+    box-shadow:
+      0 0 0 4px rgba(var(--loop-node-accent), 0.2),
+      0 0 16px rgba(var(--loop-node-accent), 0.3);
   }
 `;
 
@@ -5334,6 +5652,36 @@ export const LoopspaceGraphNodeOutputPort = styled.span`
     color: rgba(253, 224, 71, 0.9);
   }
 
+  html[data-forge-theme="light"] & {
+    color: rgba(15, 23, 42, 0.68);
+  }
+
+  html[data-forge-theme="light"] & > span {
+    background: rgba(255, 255, 255, 0.92);
+    text-shadow: none;
+    box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="exec"] {
+    color: #1d4ed8;
+  }
+
+  html[data-forge-theme="light"] &[data-tone="asset"] {
+    color: #0f766e;
+  }
+
+  html[data-forge-theme="light"] &[data-tone="success"] {
+    color: #047857;
+  }
+
+  html[data-forge-theme="light"] &[data-tone="failure"] {
+    color: #dc2626;
+  }
+
+  html[data-forge-theme="light"] &[data-tone="interrupt"] {
+    color: #a16207;
+  }
+
   ${LoopspaceGraphNodePort} {
     position: relative;
     top: auto;
@@ -5359,6 +5707,14 @@ export const LoopspaceGraphNodeIcon = styled.span`
   svg {
     width: 18px;
     height: 18px;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: color-mix(in srgb, rgb(var(--loop-node-accent)) 62%, #0f172a);
+    background: rgba(var(--loop-node-accent), 0.16);
+    box-shadow:
+      inset 0 1px 0 rgba(15, 23, 42, 0.03),
+      0 0 14px rgba(var(--loop-node-accent), 0.14);
   }
 `;
 
@@ -5391,6 +5747,10 @@ export const LoopspaceGraphNodeText = styled.div`
     align-self: stretch;
     height: 100%;
   }
+
+  html[data-forge-theme="light"] & > span {
+    color: #64748b;
+  }
 `;
 
 export const LoopspaceGraphNodeTitleRow = styled.div`
@@ -5410,6 +5770,10 @@ export const LoopspaceGraphNodeTitleRow = styled.div`
     line-height: 1.1;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  html[data-forge-theme="light"] & > strong {
+    color: #0f172a;
   }
 `;
 
@@ -5442,6 +5806,13 @@ export const LoopspaceGraphNodeSelectButton = styled.button`
   &:disabled {
     cursor: not-allowed;
     opacity: 0.55;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+    background:
+      linear-gradient(180deg, rgba(var(--loop-node-accent), 0.1), rgba(var(--loop-node-accent), 0.03)),
+      #ffffff;
   }
 `;
 
@@ -5486,6 +5857,14 @@ export const LoopspaceGraphNodeSelectDevice = styled.span`
   &[data-muted="true"] {
     color: rgba(248, 250, 252, 0.4);
   }
+
+  html[data-forge-theme="light"] & {
+    color: color-mix(in srgb, rgb(var(--loop-node-accent)) 65%, #0f172a);
+  }
+
+  html[data-forge-theme="light"] &[data-muted="true"] {
+    color: #94a3b8;
+  }
 `;
 
 export const LoopspaceGraphNodeDeviceBadge = styled.span`
@@ -5515,6 +5894,15 @@ export const LoopspaceGraphNodeDeviceBadge = styled.span`
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+    background: rgba(15, 23, 42, 0.05);
+  }
+
+  html[data-forge-theme="light"] & svg {
+    color: color-mix(in srgb, rgb(var(--loop-node-accent)) 65%, #0f172a);
   }
 `;
 
@@ -5633,6 +6021,47 @@ export const LoopspaceGraphNodeStateBadge = styled.div`
     background: #c084fc;
     box-shadow: 0 0 0 3px rgba(192, 132, 252, 0.16);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.14);
+    color: #334155;
+    background:
+      linear-gradient(135deg, rgba(15, 23, 42, 0.05), rgba(255, 255, 255, 0.6)),
+      #ffffff;
+    box-shadow:
+      inset 0 0 0 1px rgba(15, 23, 42, 0.02),
+      0 6px 16px rgba(15, 23, 42, 0.08);
+  }
+
+  html[data-forge-theme="light"] &::before {
+    background: rgba(100, 116, 139, 0.9);
+    box-shadow: 0 0 0 3px rgba(100, 116, 139, 0.14);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="queued"] {
+    border-color: rgba(161, 98, 7, 0.32);
+    color: #854d0e;
+  }
+
+  html[data-forge-theme="light"] &[data-tone="active"] {
+    border-color: rgba(29, 78, 216, 0.32);
+    color: #1d4ed8;
+  }
+
+  html[data-forge-theme="light"] &[data-tone="good"] {
+    border-color: rgba(4, 120, 87, 0.32);
+    color: #047857;
+  }
+
+  html[data-forge-theme="light"] &[data-tone="error"] {
+    border-color: rgba(220, 38, 38, 0.32);
+    color: #dc2626;
+  }
+
+  html[data-forge-theme="light"] &[data-tone="paused"] {
+    border-color: rgba(147, 51, 234, 0.32);
+    color: #7e22ce;
+  }
 `;
 
 export const LoopspaceGraphNodeResumeButton = styled.button`
@@ -5665,6 +6094,18 @@ export const LoopspaceGraphNodeResumeButton = styled.button`
   &:disabled {
     cursor: not-allowed;
     opacity: 0.52;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #ffffff;
+    background: rgba(126, 34, 206, 0.82);
+    border-color: rgba(126, 34, 206, 0.4);
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled),
+  html[data-forge-theme="light"] &:focus-visible {
+    border-color: rgba(126, 34, 206, 0.6);
+    box-shadow: 0 0 0 3px rgba(147, 51, 234, 0.18);
   }
 `;
 
@@ -5700,6 +6141,15 @@ export const LoopspaceGraphNodeTimer = styled.span`
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: color-mix(in srgb, rgb(var(--loop-node-accent)) 60%, #0f172a);
+    background: rgba(var(--loop-node-accent), 0.14);
+  }
+
+  html[data-forge-theme="light"] & svg {
+    color: color-mix(in srgb, rgb(var(--loop-node-accent)) 65%, #0f172a);
   }
 `;
 
@@ -5744,6 +6194,21 @@ export const LoopspaceGraphTriggerRunButton = styled.button`
   &[data-running="true"] {
     opacity: 0.86;
   }
+
+  html[data-forge-theme="light"] & {
+    color: color-mix(in srgb, rgb(var(--loop-node-accent)) 60%, #0f172a);
+    background:
+      linear-gradient(135deg, rgba(var(--loop-node-accent), 0.24), rgba(255, 255, 255, 0.5)),
+      #ffffff;
+    box-shadow: 0 6px 16px rgba(15, 23, 42, 0.12);
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled),
+  html[data-forge-theme="light"] &:focus-visible {
+    box-shadow:
+      0 0 0 3px rgba(var(--loop-node-accent), 0.18),
+      0 8px 20px rgba(15, 23, 42, 0.14);
+  }
 `;
 
 export const LoopspaceGraphNodeSelectChevron = styled.span`
@@ -5759,6 +6224,10 @@ export const LoopspaceGraphNodeSelectChevron = styled.span`
 
   ${LoopspaceGraphNodeSelectButton}[data-open="true"] & svg {
     transform: rotate(180deg);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
   }
 `;
 
@@ -5787,6 +6256,18 @@ export const LoopspaceGraphNodeSelectMenu = styled.div`
   &::-webkit-scrollbar-thumb {
     border-radius: 8px;
     background: rgba(251, 191, 36, 0.22);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(217, 119, 6, 0.24);
+    background: #ffffff;
+    box-shadow:
+      0 24px 60px rgba(15, 23, 42, 0.16),
+      0 0 0 1px rgba(217, 119, 6, 0.08);
+  }
+
+  html[data-forge-theme="light"] &::-webkit-scrollbar-thumb {
+    background: rgba(217, 119, 6, 0.24);
   }
 `;
 
@@ -5822,6 +6303,25 @@ export const LoopspaceGraphNodeSelectOption = styled.button`
   &[data-selected="true"] {
     border-color: rgba(251, 191, 36, 0.34);
     background: rgba(251, 191, 36, 0.16);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] & > svg {
+    color: #b45309;
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-visible {
+    border-color: rgba(217, 119, 6, 0.32);
+    background: rgba(217, 119, 6, 0.1);
+  }
+
+  html[data-forge-theme="light"] &[data-selected="true"] {
+    border-color: rgba(217, 119, 6, 0.4);
+    background: rgba(217, 119, 6, 0.14);
   }
 `;
 
@@ -5874,6 +6374,19 @@ export const LoopspaceGraphNodeSelectOptionDevice = styled.span`
     font-weight: 760;
     text-transform: lowercase;
   }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] & svg {
+    color: #b45309;
+  }
+
+  html[data-forge-theme="light"] & em {
+    background: rgba(15, 23, 42, 0.06);
+    color: #475569;
+  }
 `;
 
 export const LoopspaceGraphNodeSelectEmpty = styled.div`
@@ -5882,20 +6395,49 @@ export const LoopspaceGraphNodeSelectEmpty = styled.div`
   font-size: 11px;
   font-weight: 640;
   text-align: center;
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
 `;
 
 export const LoopspaceGraphDocumentPicker = styled.div`
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  align-self: stretch;
+  grid-template-rows: auto;
   grid-auto-rows: auto;
   gap: 7px;
   min-width: 0;
   min-height: 0;
   margin-top: 6px;
+  overflow: hidden;
   pointer-events: auto;
 
+  > * {
+    min-width: 0;
+    min-height: 0;
+  }
+
+  &[data-has-selected="true"],
+  &[data-has-results="true"] {
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  &[data-has-selected="true"][data-has-results="true"] {
+    grid-template-rows: auto minmax(0, 1fr) minmax(0, 1fr);
+  }
+
   &[data-mode="write"] {
+    grid-template-rows: auto auto auto auto;
+  }
+
+  &[data-mode="write"][data-has-selected="true"],
+  &[data-mode="write"][data-has-results="true"] {
     grid-template-rows: auto auto auto auto minmax(0, 1fr);
+  }
+
+  &[data-mode="write"][data-has-selected="true"][data-has-results="true"] {
+    grid-template-rows: auto auto auto auto minmax(0, 1fr) minmax(0, 1fr);
   }
 `;
 
@@ -5923,6 +6465,15 @@ export const LoopspaceGraphDocumentSearch = styled.input`
   &::placeholder {
     color: rgba(248, 250, 252, 0.36);
   }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &::placeholder {
+    color: #94a3b8;
+  }
 `;
 
 export const LoopspaceGraphDocumentTemplateInput = styled.textarea`
@@ -5945,6 +6496,12 @@ export const LoopspaceGraphDocumentTemplateInput = styled.textarea`
   user-select: text;
   -webkit-user-select: text;
 
+  ${LoopspaceGraphNode}[data-kind="document_write"] & {
+    height: 42px;
+    overflow-y: auto;
+    resize: none;
+  }
+
   &:focus {
     border-color: rgba(var(--loop-node-accent), 0.62);
     box-shadow: 0 0 0 2px rgba(var(--loop-node-accent), 0.12);
@@ -5952,6 +6509,15 @@ export const LoopspaceGraphDocumentTemplateInput = styled.textarea`
 
   &::placeholder {
     color: rgba(248, 250, 252, 0.34);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &::placeholder {
+    color: #94a3b8;
   }
 `;
 
@@ -6007,6 +6573,15 @@ export const LoopspaceGraphDocumentPickButton = styled.button`
     border-color: rgba(var(--loop-node-accent), 0.42);
     background: rgba(var(--loop-node-accent), 0.1);
   }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+    background: rgba(15, 23, 42, 0.03);
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: color-mix(in srgb, rgb(var(--loop-node-accent)) 65%, #0f172a);
+  }
 `;
 
 export const LoopspaceGraphDocumentCreateButton = styled.button`
@@ -6056,6 +6631,22 @@ export const LoopspaceGraphDocumentCreateButton = styled.button`
     border-color: rgba(134, 239, 172, 0.54);
     background: rgba(22, 101, 52, 0.24);
   }
+
+  html[data-forge-theme="light"] & {
+    color: #065f46;
+    background: rgba(16, 185, 129, 0.1);
+    border-color: rgba(16, 185, 129, 0.34);
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: #047857;
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-visible {
+    border-color: rgba(16, 185, 129, 0.55);
+    background: rgba(16, 185, 129, 0.16);
+  }
 `;
 
 export const LoopspaceGraphDocumentCreateInput = styled.input`
@@ -6075,6 +6666,14 @@ export const LoopspaceGraphDocumentCreateInput = styled.input`
 
   &::placeholder {
     color: rgba(220, 252, 231, 0.42);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #065f46;
+  }
+
+  html[data-forge-theme="light"] &::placeholder {
+    color: rgba(6, 95, 70, 0.4);
   }
 `;
 
@@ -6169,6 +6768,34 @@ export const LoopspaceGraphDocumentRefItem = styled.span`
       color: #fecaca;
     }
   }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+    background: rgba(var(--loop-node-accent), 0.12);
+  }
+
+  html[data-forge-theme="light"] &[data-generated="true"] {
+    color: #065f46;
+    background: rgba(16, 185, 129, 0.14);
+    box-shadow: inset 0 0 0 1px rgba(16, 185, 129, 0.12);
+  }
+
+  html[data-forge-theme="light"] &[data-generated="true"] em {
+    color: #047857;
+  }
+
+  html[data-forge-theme="light"] & em {
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] & button {
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] & button:hover,
+  html[data-forge-theme="light"] & button:focus-visible {
+    color: #dc2626;
+  }
 `;
 
 export const LoopspaceGraphNodeAction = styled.button`
@@ -6214,6 +6841,18 @@ export const LoopspaceGraphNodeAction = styled.button`
     transform: scale(1);
     pointer-events: auto;
     outline: none;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #dc2626;
+    background: #ffffff;
+    box-shadow: 0 6px 16px rgba(15, 23, 42, 0.16);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    color: #ffffff;
+    border-color: rgba(220, 38, 38, 0.6);
+    background: rgba(220, 38, 38, 0.92);
   }
 `;
 
@@ -6276,6 +6915,17 @@ export const LoopspaceGraphMessageSettingsButton = styled.button`
     cursor: not-allowed;
     opacity: 0.5;
   }
+
+  html[data-forge-theme="light"] & {
+    color: #475569;
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled),
+  html[data-forge-theme="light"] &[data-open="true"] {
+    color: color-mix(in srgb, rgb(var(--loop-node-accent)) 65%, #0f172a);
+    background: rgba(var(--loop-node-accent), 0.14);
+  }
 `;
 
 export const LoopspaceGraphMessageFlow = styled.div`
@@ -6309,6 +6959,11 @@ export const LoopspaceGraphMessageFlowEdgePath = styled.path`
   stroke-width: 2;
   stroke-linecap: round;
   filter: drop-shadow(0 0 8px rgba(var(--loop-node-accent), 0.2));
+
+  html[data-forge-theme="light"] & {
+    stroke: color-mix(in srgb, rgb(var(--loop-node-accent)) 68%, #0f172a);
+    filter: drop-shadow(0 0 5px rgba(15, 23, 42, 0.1));
+  }
 `;
 
 export const LoopspaceGraphMessageFlowNode = styled.div`
@@ -6395,6 +7050,26 @@ export const LoopspaceGraphMessageFlowNode = styled.div`
       transform: rotate(360deg);
     }
   }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+    background:
+      linear-gradient(135deg, rgba(var(--loop-message-child-accent), 0.14), rgba(255, 255, 255, 0.6)),
+      #ffffff;
+    box-shadow:
+      inset 0 0 0 1px rgba(15, 23, 42, 0.02),
+      0 12px 28px rgba(15, 23, 42, 0.12);
+  }
+
+  html[data-forge-theme="light"] &[data-status]::after {
+    box-shadow:
+      0 0 0 2px #ffffff,
+      0 0 10px rgba(var(--loop-message-child-accent), 0.22);
+  }
+
+  html[data-forge-theme="light"] &[data-status="skipped"]::after {
+    background: #94a3b8;
+  }
 `;
 
 export const LoopspaceGraphMessageFlowNodeText = styled.div`
@@ -6426,6 +7101,14 @@ export const LoopspaceGraphMessageFlowNodeText = styled.div`
     text-transform: uppercase;
     -webkit-box-orient: vertical;
     -webkit-line-clamp: 2;
+  }
+
+  html[data-forge-theme="light"] & strong {
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: #64748b;
   }
 `;
 
@@ -6473,6 +7156,16 @@ export const LoopspaceGraphMessageFlowNodePort = styled.span`
     box-shadow:
       0 0 0 4px rgba(var(--loop-message-child-accent), 0.18),
       0 0 18px rgba(var(--loop-message-child-accent), 0.32);
+  }
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"],
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-visible {
+    border-color: color-mix(in srgb, rgb(var(--loop-message-child-accent)) 70%, #0f172a);
   }
 `;
 
@@ -6550,6 +7243,10 @@ export const LoopspaceGraphMessageStepPreviewItem = styled.div`
     width: 2px;
     height: calc(100% + var(--loop-step-gap));
   }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+  }
 `;
 
 export const LoopspaceGraphMessageStepPreviewNumber = styled.span`
@@ -6571,6 +7268,13 @@ export const LoopspaceGraphMessageStepPreviewNumber = styled.span`
   box-shadow:
     0 0 0 3px rgba(var(--loop-node-accent), 0.08),
     0 0 10px rgba(var(--loop-node-accent), 0.24);
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+    background:
+      radial-gradient(circle at center, rgba(var(--loop-node-accent), 0.95) 0 4px, transparent 5px),
+      #ffffff;
+  }
 `;
 
 export const LoopspaceGraphMessageStepPreviewCopy = styled.div`
@@ -6611,6 +7315,21 @@ export const LoopspaceGraphMessageStepPreviewCopy = styled.div`
     line-height: 1.28;
     -webkit-box-orient: vertical;
     -webkit-line-clamp: 2;
+  }
+
+  html[data-forge-theme="light"] & {
+    background:
+      linear-gradient(135deg, rgba(var(--loop-node-accent), 0.14), rgba(255, 255, 255, 0.6)),
+      #ffffff;
+    box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.03);
+  }
+
+  html[data-forge-theme="light"] & strong {
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: #64748b;
   }
 `;
 
@@ -6654,6 +7373,15 @@ export const LoopspaceGraphMessagePrompt = styled.textarea`
   &::placeholder {
     color: rgba(248, 250, 252, 0.38);
   }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &::placeholder {
+    color: #94a3b8;
+  }
 `;
 
 export const LoopspaceGraphMessageSettingsPanel = styled.div`
@@ -6686,6 +7414,10 @@ export const LoopspaceGraphMessageSettingsPanel = styled.div`
     grid-auto-rows: minmax(0, auto);
     overflow: auto;
   }
+
+  html[data-forge-theme="light"] & {
+    background: #f8fafc;
+  }
 `;
 
 export const LoopspaceGraphMessageSettingsTabList = styled.div`
@@ -6698,6 +7430,10 @@ export const LoopspaceGraphMessageSettingsTabList = styled.div`
   border: 1px solid rgba(var(--loop-node-accent), 0.18);
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.24);
+
+  html[data-forge-theme="light"] & {
+    background: rgba(15, 23, 42, 0.04);
+  }
 `;
 
 export const LoopspaceGraphMessageSettingsTabButton = styled.button`
@@ -6724,6 +7460,16 @@ export const LoopspaceGraphMessageSettingsTabButton = styled.button`
     color: #ffffff;
     background: rgba(var(--loop-node-accent), 0.16);
     box-shadow: 0 0 0 2px rgba(var(--loop-node-accent), 0.08);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-visible,
+  html[data-forge-theme="light"] &[data-active="true"] {
+    color: color-mix(in srgb, rgb(var(--loop-node-accent)) 65%, #0f172a);
   }
 `;
 
@@ -6807,6 +7553,14 @@ export const LoopspaceGraphMessageSettingsSection = styled.div`
     font-size: 9px;
     font-weight: 720;
   }
+
+  html[data-forge-theme="light"] & > strong {
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] & > span {
+    color: #64748b;
+  }
 `;
 
 export const LoopspaceGraphMessageSettingsGrid = styled.div`
@@ -6841,6 +7595,10 @@ export const LoopspaceGraphMessageSettingsField = styled.label`
     font-weight: 820;
     letter-spacing: 0.08em;
     text-transform: uppercase;
+  }
+
+  html[data-forge-theme="light"] & > span {
+    color: #64748b;
   }
 `;
 
@@ -6948,6 +7706,11 @@ export const LoopspaceGraphMessageSubnodeButton = styled.button`
     cursor: not-allowed;
     opacity: 0.48;
   }
+
+  html[data-forge-theme="light"] & {
+    color: color-mix(in srgb, rgb(var(--loop-node-accent)) 60%, #0f172a);
+    background: rgba(var(--loop-node-accent), 0.14);
+  }
 `;
 
 export const LoopspaceGraphMessageSubnodeList = styled.div`
@@ -6986,6 +7749,10 @@ export const LoopspaceGraphMessageSubnodeItem = styled.div`
   border: 1px solid rgba(var(--loop-node-accent), 0.2);
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.035);
+
+  html[data-forge-theme="light"] & {
+    background: rgba(15, 23, 42, 0.03);
+  }
 
   &[data-mode="write"] {
     border-color: rgba(251, 191, 36, 0.28);
@@ -7080,6 +7847,32 @@ export const LoopspaceGraphMessageSubnodeItem = styled.div`
   ${LoopspaceGraphDocumentPicker} {
     grid-column: 1 / -1;
   }
+
+  html[data-forge-theme="light"] &[data-action="add"] {
+    color: #0f172a;
+    background:
+      linear-gradient(135deg, rgba(var(--loop-node-accent), 0.12), rgba(255, 255, 255, 0.5)),
+      #ffffff;
+  }
+
+  html[data-forge-theme="light"] &[data-action="add"]:hover,
+  html[data-forge-theme="light"] &[data-action="add"]:focus-visible {
+    color: #0f172a;
+    background:
+      linear-gradient(135deg, rgba(var(--loop-node-accent), 0.18), rgba(255, 255, 255, 0.7)),
+      #ffffff;
+  }
+
+  html[data-forge-theme="light"] & > button {
+    color: #94a3b8;
+    background: rgba(15, 23, 42, 0.04);
+  }
+
+  html[data-forge-theme="light"] & > button:hover,
+  html[data-forge-theme="light"] & > button:focus-visible {
+    color: #dc2626;
+    background: rgba(220, 38, 38, 0.1);
+  }
 `;
 
 export const LoopspaceGraphMessageSubnodeMain = styled.div`
@@ -7112,6 +7905,11 @@ export const LoopspaceGraphMessageStepNumber = styled.span`
   background: rgba(var(--loop-node-accent), 0.1);
   font-size: 9px;
   font-weight: 900;
+
+  html[data-forge-theme="light"] & {
+    color: color-mix(in srgb, rgb(var(--loop-node-accent)) 60%, #0f172a);
+    background: rgba(var(--loop-node-accent), 0.16);
+  }
 `;
 
 export const LoopspaceGraphMessageStepInput = styled.input`
@@ -7136,6 +7934,15 @@ export const LoopspaceGraphMessageStepInput = styled.input`
 
   &::placeholder {
     color: rgba(248, 250, 252, 0.34);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &::placeholder {
+    color: #94a3b8;
   }
 `;
 
@@ -7168,6 +7975,15 @@ export const LoopspaceGraphMessageStepDescription = styled.textarea`
   ${LoopspaceGraphMessageSubnodeList}[data-orientation="horizontal"] & {
     height: 100%;
     min-height: 86px;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &::placeholder {
+    color: #94a3b8;
   }
 `;
 
@@ -7217,6 +8033,29 @@ export const LoopspaceGraphMessageSaveButton = styled.button`
     color: #f8fafc;
     background: rgba(248, 250, 252, 0.08);
   }
+
+  html[data-forge-theme="light"] & {
+    color: color-mix(in srgb, rgb(var(--loop-node-accent)) 55%, #0f172a);
+    background: rgba(var(--loop-node-accent), 0.16);
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-visible {
+    background: rgba(var(--loop-node-accent), 0.24);
+  }
+
+  html[data-forge-theme="light"] &[data-variant="secondary"] {
+    border-color: rgba(15, 23, 42, 0.18);
+    color: #334155;
+    background: rgba(15, 23, 42, 0.04);
+  }
+
+  html[data-forge-theme="light"] &[data-variant="secondary"]:hover,
+  html[data-forge-theme="light"] &[data-variant="secondary"]:focus-visible {
+    border-color: rgba(15, 23, 42, 0.3);
+    color: #0f172a;
+    background: rgba(15, 23, 42, 0.07);
+  }
 `;
 
 export const LoopspaceGraphMessageCheckpointList = styled.div`
@@ -7226,6 +8065,10 @@ export const LoopspaceGraphMessageCheckpointList = styled.div`
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.025);
   overflow: hidden;
+
+  html[data-forge-theme="light"] & {
+    background: rgba(15, 23, 42, 0.02);
+  }
 `;
 
 export const LoopspaceGraphMessageCheckpoint = styled.span`
@@ -7250,6 +8093,11 @@ export const LoopspaceGraphMessageCheckpoint = styled.span`
   &:active {
     cursor: grabbing;
   }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+    background: #ffffff;
+  }
 `;
 
 export const LoopspaceGraphMessageDocumentContext = styled.div`
@@ -7269,6 +8117,11 @@ export const LoopspaceGraphMessageDocumentContext = styled.div`
 
   &:active {
     cursor: grabbing;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+    background: #ffffff;
   }
 `;
 
@@ -7316,6 +8169,16 @@ export const LoopspaceGraphMessageResize = styled.button`
     border-top: 2px solid currentColor;
     border-bottom: 2px solid currentColor;
   }
+
+  html[data-forge-theme="light"] & {
+    color: #475569;
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-visible {
+    color: #0f172a;
+  }
 `;
 
 export const LoopspaceGraphControls = styled.div`
@@ -7334,6 +8197,12 @@ export const LoopspaceGraphControls = styled.div`
   backdrop-filter: blur(14px) saturate(120%);
   cursor: default;
   user-select: none;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(217, 119, 6, 0.22);
+    background: rgba(255, 255, 255, 0.92);
+    box-shadow: 0 16px 36px rgba(15, 23, 42, 0.14);
+  }
 `;
 
 export const LoopspaceGraphControlButton = styled.button`
@@ -7367,6 +8236,19 @@ export const LoopspaceGraphControlButton = styled.button`
     opacity: 0.38;
     cursor: not-allowed;
   }
+
+  html[data-forge-theme="light"] & {
+    color: #92400e;
+    border-color: rgba(15, 23, 42, 0.1);
+    background: rgba(15, 23, 42, 0.03);
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-visible {
+    color: #92400e;
+    border-color: rgba(217, 119, 6, 0.4);
+    background: rgba(217, 119, 6, 0.14);
+  }
 `;
 
 export const LoopspaceGraphZoomReadout = styled.span`
@@ -7377,6 +8259,10 @@ export const LoopspaceGraphZoomReadout = styled.span`
   font-weight: 850;
   text-align: center;
   letter-spacing: 0;
+
+  html[data-forge-theme="light"] & {
+    color: #475569;
+  }
 `;
 
 export const LoopspaceGraphSaveBadge = styled.span`
@@ -7420,6 +8306,34 @@ export const LoopspaceGraphSaveBadge = styled.span`
     color: rgba(254, 202, 202, 0.92);
     background: rgba(127, 29, 29, 0.4);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.14);
+    color: #334155;
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] & span {
+    box-shadow: 0 0 0 3px rgba(15, 23, 42, 0.05);
+  }
+
+  html[data-forge-theme="light"] &[data-state="saving"] {
+    border-color: rgba(29, 78, 216, 0.28);
+    color: #1d4ed8;
+    background: rgba(37, 99, 235, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-state="queued"] {
+    border-color: rgba(161, 98, 7, 0.28);
+    color: #854d0e;
+    background: rgba(202, 138, 4, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-state="error"] {
+    border-color: rgba(220, 38, 38, 0.3);
+    color: #dc2626;
+    background: rgba(220, 38, 38, 0.08);
+  }
 `;
 
 export const LoopspaceGraphNavHud = styled.div`
@@ -7439,6 +8353,13 @@ export const LoopspaceGraphNavHud = styled.div`
   backdrop-filter: blur(14px) saturate(120%);
   cursor: default;
   user-select: none;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(217, 119, 6, 0.22);
+    color: #475569;
+    background: rgba(255, 255, 255, 0.92);
+    box-shadow: 0 16px 36px rgba(15, 23, 42, 0.14);
+  }
 `;
 
 export const LoopspaceGraphNavMap = styled.div`
@@ -7453,6 +8374,14 @@ export const LoopspaceGraphNavMap = styled.div`
     linear-gradient(90deg, rgba(255, 255, 255, 0.06) 1px, transparent 1px),
     rgba(255, 255, 255, 0.035);
   background-size: 12px 12px;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(217, 119, 6, 0.2);
+    background:
+      linear-gradient(rgba(15, 23, 42, 0.05) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(15, 23, 42, 0.05) 1px, transparent 1px),
+      #f8fafc;
+  }
 `;
 
 export const LoopspaceGraphNavViewport = styled.span`
@@ -7538,6 +8467,14 @@ export const LoopspaceGraphNavStats = styled.div`
     letter-spacing: 0;
     white-space: nowrap;
   }
+
+  html[data-forge-theme="light"] & strong {
+    color: #92400e;
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: #64748b;
+  }
 `;
 
 export const LoopspaceGraphPalette = styled.div`
@@ -7576,6 +8513,17 @@ export const LoopspaceGraphPalette = styled.div`
   &::-webkit-scrollbar-track {
     background: transparent;
   }
+
+  html[data-forge-theme="light"] & {
+    border-top-color: rgba(217, 119, 6, 0.2);
+    background: rgba(255, 255, 255, 0.94);
+    box-shadow: 0 -12px 28px rgba(15, 23, 42, 0.1);
+    scrollbar-color: rgba(217, 119, 6, 0.28) transparent;
+  }
+
+  html[data-forge-theme="light"] &::-webkit-scrollbar-thumb {
+    background: rgba(217, 119, 6, 0.28);
+  }
 `;
 
 export const LoopspaceGraphPaletteSearch = styled.input`
@@ -7600,6 +8548,16 @@ export const LoopspaceGraphPaletteSearch = styled.input`
 
   &::placeholder {
     color: rgba(248, 250, 252, 0.45);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(217, 119, 6, 0.24);
+    color: #0f172a;
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &::placeholder {
+    color: #94a3b8;
   }
 `;
 
@@ -7656,6 +8614,19 @@ export const LoopspaceGraphPaletteCard = styled.div`
       linear-gradient(135deg, rgba(var(--loop-palette-accent), 0.2), rgba(255, 255, 255, 0.05)),
       rgba(9, 12, 16, 0.94);
   }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+    background:
+      linear-gradient(135deg, rgba(var(--loop-palette-accent), 0.16), rgba(255, 255, 255, 0.6)),
+      #ffffff;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    background:
+      linear-gradient(135deg, rgba(var(--loop-palette-accent), 0.22), rgba(255, 255, 255, 0.7)),
+      #ffffff;
+  }
 `;
 
 export const LoopspaceGraphPaletteIcon = styled.span`
@@ -7671,6 +8642,11 @@ export const LoopspaceGraphPaletteIcon = styled.span`
   svg {
     width: 13px;
     height: 13px;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: color-mix(in srgb, rgb(var(--loop-palette-accent)) 62%, #0f172a);
+    background: rgba(var(--loop-palette-accent), 0.2);
   }
 `;
 
@@ -7701,6 +8677,10 @@ export const LoopspaceGraphPaletteText = styled.div`
     -webkit-box-orient: vertical;
     -webkit-line-clamp: 2;
   }
+
+  html[data-forge-theme="light"] & span {
+    color: #64748b;
+  }
 `;
 
 export const LoopspaceRuntimePanel = styled.div`
@@ -7727,6 +8707,21 @@ export const LoopspaceRuntimePanel = styled.div`
     background:
       linear-gradient(90deg, rgba(255, 209, 102, 0.075), rgba(255, 209, 102, 0.018)),
       rgba(5, 5, 5, 0.98);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-top-color: rgba(217, 119, 6, 0.18);
+    color: #0f172a;
+    background:
+      linear-gradient(180deg, rgba(217, 119, 6, 0.05), rgba(217, 119, 6, 0.01) 42px, transparent),
+      #f8fafc;
+    box-shadow: 0 -16px 40px rgba(15, 23, 42, 0.1);
+  }
+
+  html[data-forge-theme="light"] &[data-collapsed="true"] {
+    background:
+      linear-gradient(90deg, rgba(217, 119, 6, 0.09), rgba(217, 119, 6, 0.02)),
+      #ffffff;
   }
 `;
 
@@ -7765,6 +8760,16 @@ export const LoopspaceRuntimePanelResizeHandle = styled.div`
   &[data-dragging="true"]::after {
     opacity: 1;
     background: rgba(255, 209, 102, 0.55);
+  }
+
+  html[data-forge-theme="light"] &::after {
+    background: rgba(217, 119, 6, 0.3);
+  }
+
+  html[data-forge-theme="light"] &:hover::after,
+  html[data-forge-theme="light"] &:focus-visible::after,
+  html[data-forge-theme="light"] &[data-dragging="true"]::after {
+    background: rgba(217, 119, 6, 0.55);
   }
 `;
 
@@ -7830,6 +8835,39 @@ export const LoopspaceRuntimePanelHeader = styled.div`
     font-size: 10px;
     font-weight: 760;
   }
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(217, 119, 6, 0.2);
+    background: #ffffff;
+    box-shadow: 0 8px 16px rgba(15, 23, 42, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-collapsed="true"] {
+    border-top-color: rgba(217, 119, 6, 0.24);
+    color: #92400e;
+    background:
+      linear-gradient(90deg, rgba(217, 119, 6, 0.12), rgba(217, 119, 6, 0.03)),
+      #ffffff;
+    box-shadow:
+      inset 0 1px 0 rgba(15, 23, 42, 0.03),
+      0 -12px 30px rgba(15, 23, 42, 0.1);
+  }
+
+  html[data-forge-theme="light"] &[data-collapsed="true"]:hover,
+  html[data-forge-theme="light"] &[data-collapsed="true"]:focus-visible {
+    color: #78350f;
+    background:
+      linear-gradient(90deg, rgba(217, 119, 6, 0.18), rgba(217, 119, 6, 0.05)),
+      #ffffff;
+  }
+
+  html[data-forge-theme="light"] & [data-restore-label="true"] {
+    color: #92400e;
+  }
+
+  html[data-forge-theme="light"] & [data-restore-hint="true"] {
+    color: #64748b;
+  }
 `;
 
 export const LoopspaceRuntimePanelTabs = styled.div`
@@ -7880,6 +8918,23 @@ export const LoopspaceRuntimePanelTab = styled.button`
   &:focus-visible {
     color: #ffffff;
     outline: none;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    color: #b45309;
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"]::after {
+    background: #b45309;
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-visible {
+    color: #0f172a;
   }
 `;
 
@@ -7952,6 +9007,39 @@ export const LoopspaceRuntimePanelToggle = styled.button`
       0 0 0 2px rgba(255, 209, 102, 0.12),
       0 10px 24px rgba(0, 0, 0, 0.28);
   }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] &[data-collapsed="true"] {
+    border-color: rgba(217, 119, 6, 0.34);
+    color: #92400e;
+    background:
+      linear-gradient(135deg, rgba(217, 119, 6, 0.16), rgba(255, 255, 255, 0.6)),
+      #ffffff;
+    box-shadow:
+      0 0 0 1px rgba(217, 119, 6, 0.06),
+      0 8px 22px rgba(15, 23, 42, 0.1);
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-visible {
+    color: #0f172a;
+    background: rgba(217, 119, 6, 0.1);
+  }
+
+  html[data-forge-theme="light"] &[data-collapsed="true"]:hover,
+  html[data-forge-theme="light"] &[data-collapsed="true"]:focus-visible {
+    border-color: rgba(217, 119, 6, 0.5);
+    color: #78350f;
+    background:
+      linear-gradient(135deg, rgba(217, 119, 6, 0.22), rgba(255, 255, 255, 0.7)),
+      #ffffff;
+    box-shadow:
+      0 0 0 2px rgba(217, 119, 6, 0.1),
+      0 10px 24px rgba(15, 23, 42, 0.12);
+  }
 `;
 
 export const LoopspaceRuntimePanelAutoScroll = styled.button`
@@ -7994,6 +9082,27 @@ export const LoopspaceRuntimePanelAutoScroll = styled.button`
     color: rgba(255, 246, 223, 0.92);
     outline: none;
   }
+
+  html[data-forge-theme="light"] & {
+    color: #475569;
+  }
+
+  html[data-forge-theme="light"] &::after {
+    border-color: rgba(217, 119, 6, 0.24);
+    box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.06);
+  }
+
+  html[data-forge-theme="light"] &[data-enabled="false"]::after {
+    border-color: rgba(15, 23, 42, 0.14);
+    background:
+      radial-gradient(circle at 8px 50%, #ffffff 0 5px, transparent 5.5px),
+      rgba(15, 23, 42, 0.14);
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-visible {
+    color: #92400e;
+  }
 `;
 
 export const LoopspaceRuntimePanelBody = styled.div`
@@ -8028,6 +9137,14 @@ export const LoopspaceRuntimePanelBody = styled.div`
   &[data-tab="runtime"] {
     overflow: hidden;
   }
+
+  html[data-forge-theme="light"] & {
+    scrollbar-color: rgba(217, 119, 6, 0.32) transparent;
+  }
+
+  html[data-forge-theme="light"] &::-webkit-scrollbar-thumb {
+    background: rgba(217, 119, 6, 0.3);
+  }
 `;
 
 export const LoopspaceRuntimePanelEmpty = styled.div`
@@ -8056,6 +9173,16 @@ export const LoopspaceRuntimePanelEmpty = styled.div`
     font-weight: 680;
     line-height: 1.35;
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(217, 119, 6, 0.24);
+    color: #64748b;
+    background: rgba(217, 119, 6, 0.03);
+  }
+
+  html[data-forge-theme="light"] & strong {
+    color: #92400e;
+  }
 `;
 
 export const LoopspaceRuntimePanelGrid = styled.div`
@@ -8079,6 +9206,14 @@ export const LoopspaceRuntimePanelGrid = styled.div`
   &::-webkit-scrollbar-thumb {
     border-radius: 999px;
     background: rgba(255, 209, 102, 0.26);
+  }
+
+  html[data-forge-theme="light"] & {
+    scrollbar-color: rgba(217, 119, 6, 0.32) transparent;
+  }
+
+  html[data-forge-theme="light"] &::-webkit-scrollbar-thumb {
+    background: rgba(217, 119, 6, 0.3);
   }
 `;
 
@@ -8145,6 +9280,14 @@ export const LoopspaceRuntimePanelSettingsMain = styled.div`
     -webkit-box-orient: vertical;
     -webkit-line-clamp: 2;
   }
+
+  html[data-forge-theme="light"] & strong {
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: #64748b;
+  }
 `;
 
 export const LoopspaceRuntimePanelSettingsAction = styled.button`
@@ -8179,6 +9322,17 @@ export const LoopspaceRuntimePanelSettingsAction = styled.button`
     cursor: not-allowed;
     opacity: 0.48;
   }
+
+  html[data-forge-theme="light"] & {
+    color: #475569;
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-visible {
+    color: color-mix(in srgb, rgb(var(--loop-settings-accent, 217, 119, 6)) 60%, #0f172a);
+    background: rgba(var(--loop-settings-accent, 217, 119, 6), 0.14);
+  }
 `;
 
 export const LoopspaceRuntimePanelSettingsRow = styled.div`
@@ -8205,9 +9359,9 @@ export const LoopspaceRuntimePanelSettingsRow = styled.div`
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.018);
   transition: border-color 0.12s ease, background 0.12s ease, box-shadow 0.12s ease;
 
-  &[data-kind="manual"] { --loop-settings-accent: 251, 191, 36; }
-  &[data-kind="cron"] { --loop-settings-accent: 96, 165, 250; }
-  &[data-kind="webhook"] { --loop-settings-accent: 45, 212, 191; }
+  &[data-kind="manual"],
+  &[data-kind="cron"],
+  &[data-kind="webhook"] { --loop-settings-accent: 255, 209, 102; }
   &[data-kind="run_script"] { --loop-settings-accent: 251, 191, 36; }
   &[data-kind="document_read"],
   &[data-kind="document_write"] { --loop-settings-accent: 96, 165, 250; }
@@ -8251,6 +9405,30 @@ export const LoopspaceRuntimePanelSettingsRow = styled.div`
     box-shadow: 0 0 10px rgba(var(--loop-settings-accent), 0.32);
     content: "";
   }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+    background:
+      linear-gradient(135deg, rgba(var(--loop-settings-accent), 0.14), rgba(255, 255, 255, 0.6)),
+      #ffffff;
+    box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.03);
+  }
+
+  html[data-forge-theme="light"] & ${LoopspaceGraphPaletteIcon} {
+    color: color-mix(in srgb, rgb(var(--loop-settings-accent)) 60%, #0f172a);
+    background: rgba(var(--loop-settings-accent), 0.18);
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-visible,
+  html[data-forge-theme="light"] &[data-active="true"] {
+    background:
+      linear-gradient(135deg, rgba(var(--loop-settings-accent), 0.2), rgba(255, 255, 255, 0.7)),
+      #ffffff;
+    box-shadow:
+      inset 0 0 0 1px rgba(15, 23, 42, 0.03),
+      0 0 0 2px rgba(var(--loop-settings-accent), 0.12);
+  }
 `;
 
 export const LoopspaceRuntimePanelSettingsInspector = styled.div`
@@ -8266,6 +9444,12 @@ export const LoopspaceRuntimePanelSettingsInspector = styled.div`
 
   &[data-kind="run_script"] {
     --loop-settings-accent: 251, 191, 36;
+  }
+
+  &[data-kind="manual"],
+  &[data-kind="cron"],
+  &[data-kind="webhook"] {
+    --loop-settings-accent: 255, 209, 102;
   }
 
   &[data-kind="document_read"],
@@ -8351,6 +9535,16 @@ export const LoopspaceRuntimePanelEventRow = styled.div`
     background: rgba(96, 165, 250, 0.08);
   }
 
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(15, 23, 42, 0.06);
+    color: #0f172a;
+    background: transparent;
+  }
+
+  html[data-forge-theme="light"] &[data-selected="true"] {
+    background: rgba(37, 99, 235, 0.08);
+  }
+
   &[data-tone="good"] {
     border-left-color: rgba(74, 222, 128, 0.72);
   }
@@ -8401,6 +9595,14 @@ export const LoopspaceRuntimePanelEventRow = styled.div`
     font-style: normal;
     font-weight: 700;
   }
+
+  html[data-forge-theme="light"] & span {
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] & em {
+    color: #475569;
+  }
 `;
 
 export const LoopspaceRuntimeConsole = styled.div`
@@ -8414,6 +9616,13 @@ export const LoopspaceRuntimeConsole = styled.div`
     linear-gradient(180deg, rgba(0, 0, 0, 0.18), transparent 42px),
     #050608;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+    background:
+      linear-gradient(180deg, rgba(15, 23, 42, 0.02), transparent 42px),
+      #ffffff;
+  }
 `;
 
 export const LoopspaceRuntimeConsoleLoader = styled.button`
@@ -8444,6 +9653,22 @@ export const LoopspaceRuntimeConsoleLoader = styled.button`
   &[data-loading="true"] {
     color: rgba(255, 231, 161, 0.82);
     cursor: wait;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(217, 119, 6, 0.18);
+    color: #92400e;
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-visible {
+    color: #78350f;
+    background: rgba(217, 119, 6, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-loading="true"] {
+    color: #92400e;
   }
 `;
 
@@ -8883,6 +10108,111 @@ export const LoopspaceRuntimeConsoleIcon = styled.span`
       animation: none;
     }
   }
+
+  html[data-forge-theme="light"] & {
+    color: #334155;
+    background:
+      linear-gradient(135deg, rgba(148, 163, 184, 0.14), rgba(255, 255, 255, 0.6)),
+      #ffffff;
+    box-shadow:
+      0 0 0 3px #ffffff,
+      0 0 10px rgba(15, 23, 42, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-icon="running"] {
+    border-color: rgba(29, 78, 216, 0.55);
+    color: #1d4ed8;
+    box-shadow:
+      0 0 0 3px #ffffff,
+      0 0 12px rgba(29, 78, 216, 0.16);
+  }
+
+  html[data-forge-theme="light"] &[data-icon="queued"] {
+    border-color: rgba(161, 98, 7, 0.5);
+    color: #854d0e;
+    background:
+      linear-gradient(135deg, rgba(250, 204, 21, 0.16), rgba(255, 255, 255, 0.6)),
+      #fffbeb;
+    box-shadow:
+      0 0 0 3px #ffffff,
+      0 0 12px rgba(202, 138, 4, 0.14);
+  }
+
+  html[data-forge-theme="light"] &[data-icon="sent"] {
+    border-color: rgba(29, 78, 216, 0.5);
+    color: #1d4ed8;
+    background:
+      linear-gradient(135deg, rgba(96, 165, 250, 0.18), rgba(255, 255, 255, 0.6)),
+      #eff6ff;
+    box-shadow:
+      0 0 0 3px #ffffff,
+      0 0 12px rgba(37, 99, 235, 0.12);
+  }
+
+  html[data-forge-theme="light"] &[data-icon="trigger"] {
+    border-color: rgba(180, 83, 9, 0.5);
+    color: #92400e;
+    background:
+      linear-gradient(135deg, rgba(255, 209, 102, 0.2), rgba(255, 255, 255, 0.6)),
+      #fffbeb;
+    box-shadow:
+      0 0 0 3px #ffffff,
+      0 0 12px rgba(180, 83, 9, 0.12);
+  }
+
+  html[data-forge-theme="light"] &[data-icon="completed"] {
+    border-color: rgba(4, 120, 87, 0.45);
+    color: #047857;
+    background:
+      linear-gradient(135deg, rgba(74, 222, 128, 0.2), rgba(255, 255, 255, 0.6)),
+      #ecfdf5;
+  }
+
+  html[data-forge-theme="light"] &[data-icon="resuming"] {
+    border-color: rgba(15, 118, 110, 0.5);
+    color: #0f766e;
+    background:
+      linear-gradient(135deg, rgba(45, 212, 191, 0.2), rgba(255, 255, 255, 0.6)),
+      #f0fdfa;
+    box-shadow:
+      0 0 0 3px #ffffff,
+      0 0 12px rgba(15, 118, 110, 0.12);
+  }
+
+  html[data-forge-theme="light"] &[data-icon="resume-ready"] {
+    border-color: rgba(126, 34, 206, 0.55);
+    color: #7e22ce;
+    background:
+      linear-gradient(135deg, rgba(216, 180, 254, 0.24), rgba(255, 255, 255, 0.6)),
+      #faf5ff;
+    box-shadow:
+      0 0 0 3px #ffffff,
+      0 0 12px rgba(126, 34, 206, 0.12);
+  }
+
+  html[data-forge-theme="light"] &[data-icon="failed"] {
+    border-color: rgba(220, 38, 38, 0.5);
+    color: #dc2626;
+    background:
+      linear-gradient(135deg, rgba(248, 113, 113, 0.2), rgba(255, 255, 255, 0.6)),
+      #fef2f2;
+  }
+
+  html[data-forge-theme="light"] &[data-icon="cancelled"] {
+    border-color: rgba(194, 65, 12, 0.55);
+    color: #c2410c;
+    background:
+      linear-gradient(135deg, rgba(251, 146, 60, 0.22), rgba(255, 255, 255, 0.6)),
+      #fff7ed;
+  }
+
+  html[data-forge-theme="light"] &[data-icon="interrupted"] {
+    border-color: rgba(126, 34, 206, 0.55);
+    color: #7e22ce;
+    background:
+      linear-gradient(135deg, rgba(192, 132, 252, 0.2), rgba(255, 255, 255, 0.6)),
+      #faf5ff;
+  }
 `;
 
 export const LoopspaceRuntimeConsoleRow = styled.div`
@@ -8993,6 +10323,52 @@ export const LoopspaceRuntimeConsoleRow = styled.div`
   @media (prefers-reduced-motion: reduce) {
     animation: none;
   }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] &[data-clickable="true"]:hover,
+  html[data-forge-theme="light"] &[data-clickable="true"]:focus-visible,
+  html[data-forge-theme="light"] &[data-selected="true"] {
+    background: rgba(37, 99, 235, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="error"] {
+    background: rgba(220, 38, 38, 0.06);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="good"] strong {
+    color: #4d7c0f;
+  }
+
+  html[data-forge-theme="light"] &[data-tone="active"] strong {
+    color: #1d4ed8;
+  }
+
+  html[data-forge-theme="light"] &[data-tone="queued"] strong {
+    color: #854d0e;
+  }
+
+  html[data-forge-theme="light"] &[data-tone="error"] strong {
+    color: #dc2626;
+  }
+
+  html[data-forge-theme="light"] &[data-tone="paused"] strong {
+    color: #7e22ce;
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: #94a3b8;
+  }
+
+  html[data-forge-theme="light"] & strong {
+    color: #92400e;
+  }
+
+  html[data-forge-theme="light"] & em {
+    color: #334155;
+  }
 `;
 
 export const LoopspaceRuntimeConsoleDetail = styled.pre`
@@ -9010,6 +10386,11 @@ export const LoopspaceRuntimeConsoleDetail = styled.pre`
   line-height: 1.45;
   white-space: pre-wrap;
   word-break: break-word;
+
+  html[data-forge-theme="light"] & {
+    color: #334155;
+    background: rgba(15, 23, 42, 0.04);
+  }
 `;
 
 export const LoopspaceRuntimePanelResumeButton = styled.button`
@@ -9036,6 +10417,17 @@ export const LoopspaceRuntimePanelResumeButton = styled.button`
     background: rgba(255, 209, 102, 0.18);
     outline: none;
   }
+
+  html[data-forge-theme="light"] & {
+    color: #92400e;
+    background: rgba(217, 119, 6, 0.12);
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled),
+  html[data-forge-theme="light"] &:focus-visible {
+    border-color: rgba(217, 119, 6, 0.45);
+    background: rgba(217, 119, 6, 0.2);
+  }
 `;
 
 export const LoopspaceRuntimeTimeline = styled.div`
@@ -9052,6 +10444,13 @@ export const LoopspaceRuntimeTimeline = styled.div`
   @media (max-width: 820px) {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: minmax(120px, 1fr) auto;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+    background:
+      linear-gradient(180deg, rgba(15, 23, 42, 0.02), transparent 46px),
+      #ffffff;
   }
 `;
 
@@ -9087,6 +10486,15 @@ export const LoopspaceRuntimeTimelineList = styled.div`
   @media (max-width: 820px) {
     border-right: 0;
     border-bottom: 1px solid rgba(255, 209, 102, 0.08);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-right-color: rgba(217, 119, 6, 0.16);
+    scrollbar-color: rgba(217, 119, 6, 0.3) transparent;
+  }
+
+  html[data-forge-theme="light"] &::-webkit-scrollbar-thumb {
+    background: rgba(217, 119, 6, 0.3);
   }
 `;
 
@@ -9148,6 +10556,28 @@ export const LoopspaceRuntimeTimelineRow = styled.div`
   @media (prefers-reduced-motion: reduce) {
     animation: none;
   }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-visible,
+  html[data-forge-theme="light"] &[data-selected="true"] {
+    background: rgba(37, 99, 235, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="good"] {
+    background: linear-gradient(90deg, rgba(22, 163, 74, 0.09), transparent 72%);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="error"] {
+    background: linear-gradient(90deg, rgba(220, 38, 38, 0.09), transparent 72%);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="paused"] {
+    background: linear-gradient(90deg, rgba(147, 51, 234, 0.09), transparent 72%);
+  }
 `;
 
 export const LoopspaceRuntimeTimelineMain = styled.div`
@@ -9176,6 +10606,14 @@ export const LoopspaceRuntimeTimelineMain = styled.div`
     font-size: 10px;
     font-weight: 720;
   }
+
+  html[data-forge-theme="light"] & strong {
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: #64748b;
+  }
 `;
 
 export const LoopspaceRuntimeTimelineMeta = styled.div`
@@ -9198,6 +10636,10 @@ export const LoopspaceRuntimeTimelineMeta = styled.div`
     > span {
       display: none;
     }
+  }
+
+  html[data-forge-theme="light"] & > span {
+    color: #64748b;
   }
 `;
 
@@ -9249,6 +10691,42 @@ export const LoopspaceRuntimeStatusPill = styled.span`
     color: rgba(233, 213, 255, 0.98);
     background: rgba(88, 28, 135, 0.25);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.14);
+    color: #334155;
+    background: rgba(15, 23, 42, 0.05);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="active"] {
+    border-color: rgba(29, 78, 216, 0.3);
+    color: #1d4ed8;
+    background: rgba(37, 99, 235, 0.1);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="queued"] {
+    border-color: rgba(161, 98, 7, 0.3);
+    color: #854d0e;
+    background: rgba(202, 138, 4, 0.12);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="good"] {
+    border-color: rgba(4, 120, 87, 0.3);
+    color: #047857;
+    background: rgba(22, 163, 74, 0.1);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="error"] {
+    border-color: rgba(220, 38, 38, 0.32);
+    color: #dc2626;
+    background: rgba(220, 38, 38, 0.1);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="paused"] {
+    border-color: rgba(126, 34, 206, 0.34);
+    color: #7e22ce;
+    background: rgba(147, 51, 234, 0.1);
+  }
 `;
 
 export const LoopspaceRuntimeDetail = styled.aside`
@@ -9267,6 +10745,13 @@ export const LoopspaceRuntimeDetail = styled.aside`
   background:
     linear-gradient(135deg, rgba(255, 209, 102, 0.04), rgba(255, 255, 255, 0.012)),
     rgba(6, 8, 10, 0.84);
+
+  html[data-forge-theme="light"] & {
+    scrollbar-color: rgba(217, 119, 6, 0.3) transparent;
+    background:
+      linear-gradient(135deg, rgba(217, 119, 6, 0.05), rgba(255, 255, 255, 0.6)),
+      #ffffff;
+  }
 `;
 
 export const LoopspaceRuntimeDetailHeader = styled.div`
@@ -9307,6 +10792,14 @@ export const LoopspaceRuntimeDetailHeader = styled.div`
     -webkit-box-orient: vertical;
     -webkit-line-clamp: 2;
   }
+
+  html[data-forge-theme="light"] & strong {
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] & div > span {
+    color: #475569;
+  }
 `;
 
 export const LoopspaceRuntimeDetailGrid = styled.div`
@@ -9337,6 +10830,14 @@ export const LoopspaceRuntimeDetailGrid = styled.div`
     font-size: 10px;
     font-weight: 700;
   }
+
+  html[data-forge-theme="light"] & span {
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] & strong {
+    color: #0f172a;
+  }
 `;
 
 export const LoopspaceRuntimeDetailMessage = styled.pre`
@@ -9354,6 +10855,11 @@ export const LoopspaceRuntimeDetailMessage = styled.pre`
   line-height: 1.45;
   white-space: pre-wrap;
   word-break: break-word;
+
+  html[data-forge-theme="light"] & {
+    color: #334155;
+    background: rgba(15, 23, 42, 0.04);
+  }
 `;
 
 /* Full state-change history for the selected runtime node — every event of
@@ -9404,6 +10910,18 @@ export const LoopspaceRuntimeDetailHistory = styled.ol`
     white-space: normal;
     word-break: break-word;
   }
+
+  html[data-forge-theme="light"] & li {
+    background: rgba(15, 23, 42, 0.04);
+  }
+
+  html[data-forge-theme="light"] & li > span {
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] & li > em {
+    color: #334155;
+  }
 `;
 
 export const LoopspaceGraphEmpty = styled.div`
@@ -9419,6 +10937,12 @@ export const LoopspaceGraphEmpty = styled.div`
   text-align: center;
   font-size: 11px;
   font-weight: 760;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(217, 119, 6, 0.28);
+    color: #64748b;
+    background: rgba(217, 119, 6, 0.03);
+  }
 `;
 
 export const LoopspaceLogsList = styled.div`
@@ -9430,6 +10954,10 @@ export const LoopspaceLogsList = styled.div`
   overflow: auto;
   padding: 14px;
   background: #000;
+
+  html[data-forge-theme="light"] & {
+    background: #f5f7fa;
+  }
 `;
 
 export const LoopspaceLogRow = styled.div`
@@ -9443,6 +10971,12 @@ export const LoopspaceLogRow = styled.div`
   border-left-color: rgba(255, 209, 102, 0.34);
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.035);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.1);
+    border-left-color: rgba(217, 119, 6, 0.4);
+    background: #ffffff;
+  }
 `;
 
 export const LoopspaceLogIcon = styled.span`
@@ -9457,6 +10991,11 @@ export const LoopspaceLogIcon = styled.span`
   svg {
     width: 16px;
     height: 16px;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #92400e;
+    background: rgba(217, 119, 6, 0.16);
   }
 `;
 
@@ -9484,6 +11023,14 @@ export const LoopspaceLogMain = styled.div`
     font-size: 10px;
     font-weight: 720;
   }
+
+  html[data-forge-theme="light"] & strong {
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: #64748b;
+  }
 `;
 
 export const LoopspaceLogMeta = styled.span`
@@ -9504,6 +11051,16 @@ export const LoopspaceLogMeta = styled.span`
     color: #fecaca;
     background: rgba(248, 113, 113, 0.13);
   }
+
+  html[data-forge-theme="light"] & {
+    color: #047857;
+    background: rgba(22, 163, 74, 0.12);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="error"] {
+    color: #dc2626;
+    background: rgba(220, 38, 38, 0.1);
+  }
 `;
 
 export const LoopspaceRuntimeError = styled.div`
@@ -9520,6 +11077,11 @@ export const LoopspaceRuntimeError = styled.div`
   background: rgba(64, 0, 0, 0.82);
   font-size: 12px;
   font-weight: 760;
+
+  html[data-forge-theme="light"] & {
+    color: #b91c1c;
+    background: #fef2f2;
+  }
 `;
 
 export const ForgeWorkspace = styled.section`
@@ -22487,6 +24049,10 @@ export const RailAudioIcon = styled(Mic)`
 `;
 
 export const RailTokenomicsIcon = styled(RailCubeGlyph)`
+  ${railActionIconSize}
+`;
+
+export const RailDevicesIcon = styled(RailDevicesGlyph)`
   ${railActionIconSize}
 `;
 

@@ -983,6 +983,10 @@ function normalizeDeviceRecord(record, index = 0, options = {}) {
       record.os,
       inherited?.platformLabel,
     ),
+    pushCapable: normalizeLiveBoolean(readFirstKey(record, ["pushCapable", "push_capable"]))
+      ?? inherited?.pushCapable
+      ?? null,
+    pushPublicKey: firstText(record.pushPublicKey, record.push_public_key, inherited?.pushPublicKey),
     registered: Boolean(
       options.registered
         || inherited?.registered
@@ -1054,6 +1058,8 @@ function mergeDevice(previous, next) {
       : nextIsWebOverlay
       ? previous.platformLabel || ""
       : previous.platformLabel || next.platformLabel || "",
+    pushCapable: next.pushCapable ?? previous.pushCapable ?? null,
+    pushPublicKey: next.pushPublicKey || previous.pushPublicKey || "",
     registered: Boolean(previous.registered || next.registered),
     serverSeen: Boolean(previous.serverSeen || next.serverSeen),
     webConnected,
@@ -1422,6 +1428,8 @@ export function buildAccountLiveDeviceRows({
       nativeConnected: device.nativeConnected === true,
       platformIcon: device.platformIcon || "",
       platformLabel: device.platformLabel || "",
+      pushCapable: device.pushCapable ?? device.push_capable ?? null,
+      pushPublicKey: device.pushPublicKey || device.push_public_key || "",
       registered: Boolean(device.registered),
       serverSeen: Boolean(device.serverSeen),
       webConnected: device.webConnected === true,

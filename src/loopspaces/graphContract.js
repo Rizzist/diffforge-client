@@ -109,7 +109,7 @@ export const LOOPSPACE_GRAPH_NODE_CONTRACTS = {
     inputs: [INPUT_PORTS_BY_ID.in],
     outputs: [OUTPUT_PORTS_BY_ID.docs],
     role: "context",
-    visual: { height: 128, minHeight: 128, minWidth: 270, sized: true, width: 270 },
+    visual: { height: 248, minHeight: 248, minWidth: 270, sized: true, width: 270 },
   },
   asset_read: {
     inputs: [],
@@ -149,12 +149,13 @@ export const LOOPSPACE_GRAPH_NODE_CONTRACTS = {
     outputs: EXECUTION_OUTPUT_PORTS,
     role: "action",
     visual: {
-      height: 178,
-      minHeight: 178,
-      minWidth: 420,
-      outputGutter: 104,
+      height: 260,
+      minHeight: 220,
+      minWidth: 560,
+      outputGutter: 92,
+      region: true,
       sized: true,
-      width: 420,
+      width: 680,
     },
   },
   send_message: {
@@ -240,13 +241,14 @@ function graphContractNodeFromLookup(lookup, id) {
   return null;
 }
 
-function graphContractIsSendMessageSubstep(node, nodeLookup = null) {
+function graphContractIsInternalActionSubstep(node, nodeLookup = null) {
   if (normalizeLoopspaceGraphNodeKind(node) !== "step") return false;
   const parentId = graphContractNodeParentId(node);
   if (!parentId || parentId === String(node?.id || "").trim()) return false;
   const parentNode = graphContractNodeFromLookup(nodeLookup, parentId);
   if (!parentNode) return false;
-  return normalizeLoopspaceGraphNodeKind(parentNode) === "send_message";
+  const parentKind = normalizeLoopspaceGraphNodeKind(parentNode);
+  return parentKind === "send_message" || parentKind === "dispatch_todos";
 }
 
 export function normalizeLoopspaceGraphNodeKind(value) {
@@ -341,55 +343,57 @@ export function validateLoopspaceGraphEdgeCandidate(fromNode, toNode, options = 
       && (toKind === "run_script" || toKind === "send_message" || toKind === "dispatch_todos" || toKind === "notify_device")
       && fromPort === "success"
       && toPort === "in"
-      && graphContractIsSendMessageSubstep(fromNode, nodeLookup)
+      && graphContractIsInternalActionSubstep(fromNode, nodeLookup)
   );
   const isResourceStepContextEdge = (
     fromKind === "document_read"
       && toKind === "step"
       && fromPort === "docs"
       && toPort === "in"
-      && graphContractIsSendMessageSubstep(toNode, nodeLookup)
+      && graphContractIsInternalActionSubstep(toNode, nodeLookup)
   ) || (
     fromKind === "step"
       && toKind === "document_write"
       && fromPort === "docs"
       && toPort === "in"
-      && graphContractIsSendMessageSubstep(fromNode, nodeLookup)
+      && graphContractIsInternalActionSubstep(fromNode, nodeLookup)
   ) || (
     fromKind === "step"
       && toKind === "asset_write"
       && fromPort === "assets"
       && toPort === "in"
-      && graphContractIsSendMessageSubstep(fromNode, nodeLookup)
+      && graphContractIsInternalActionSubstep(fromNode, nodeLookup)
   ) || (
     fromKind === "document_write"
       && toKind === "step"
       && fromPort === "docs"
       && toPort === "in"
-      && graphContractIsSendMessageSubstep(toNode, nodeLookup)
+      && graphContractIsInternalActionSubstep(toNode, nodeLookup)
   ) || (
     fromKind === "asset_read"
       && toKind === "step"
       && fromPort === "assets"
       && toPort === "in"
-      && graphContractIsSendMessageSubstep(toNode, nodeLookup)
+      && graphContractIsInternalActionSubstep(toNode, nodeLookup)
   ) || (
     fromKind === "asset_write"
       && toKind === "step"
       && fromPort === "assets"
       && toPort === "in"
-      && graphContractIsSendMessageSubstep(toNode, nodeLookup)
+      && graphContractIsInternalActionSubstep(toNode, nodeLookup)
   );
   if ((fromContract.internal || toContract.internal) && !isResourceStepContextEdge && !isSendMessageSubstepSuccessEdge) {
-    return { error: "Internal send-message steps cannot be connected as graph nodes.", ok: false };
+    return { error: "Internal action steps cannot be connected as standalone graph nodes.", ok: false };
   }
   if (
-    toKind === "asset_write"
+    (toKind === "document_write" || toKind === "asset_write")
       && (fromKind === "run_script" || fromKind === "send_message" || fromKind === "dispatch_todos" || fromKind === "notify_device")
       && EXECUTION_OUTPUT_PORT_IDS.has(fromPort)
   ) {
+    const resourceLabel = toKind === "document_write" ? "Document" : "Asset";
+    const resourcePort = toKind === "document_write" ? "document" : "asset";
     return {
-      error: "Asset write nodes must be connected from a send-message step asset output, not an action execution branch.",
+      error: `${resourceLabel} write nodes must be connected from an internal action step ${resourcePort} output, not an action execution branch.`,
       ok: false,
     };
   }

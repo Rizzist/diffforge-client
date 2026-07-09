@@ -364,7 +364,8 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
     };
   }
   if (templateId === "send_message") {
-    const deviceLabel = safeText(template?.device_label);
+    const messageDeviceId = deviceId || safeText(template?.target_device_id);
+    const deviceLabel = safeText(template?.device_label || template?.target_device_label);
     const visualDefaults = loopspaceGraphVisualDefaultsForNode("send_message");
     return {
       id: `${templateId}-${suffix}`,
@@ -379,15 +380,17 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
       x: position ? Math.round(Number(position.x) || 0) : 0,
       y: position ? Math.round(Number(position.y) || 0) : 0,
       props: {
-        device_id: deviceId,
+        device_id: messageDeviceId,
         device_label: deviceLabel,
         display: "region",
         h: safeText(template?.h || template?.height, String(visualDefaults.height || 260)),
         model: safeText(template?.model),
-        prompt: "",
+        prompt: safeText(template?.prompt || template?.message || template?.body || template?.text || template?.instructions),
         reasoning_effort: safeText(template?.reasoning_effort || template?.effort),
         speed: safeText(template?.speed),
         target_agent_id: safeText(template?.target_agent_id || template?.agent_id, "codex"),
+        target_device_id: messageDeviceId,
+        target_device_label: deviceLabel,
         target_terminal_id: safeText(template?.target_terminal_id),
         target_terminal_name: safeText(template?.target_terminal_name),
         w: safeText(template?.w || template?.width, String(visualDefaults.width || 680)),
@@ -423,6 +426,7 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
     };
   }
   if (templateId === "dispatch_todos") {
+    const dispatchDeviceId = deviceId || safeText(template?.target_device_id);
     const deviceLabel = safeText(template?.device_label || template?.target_device_label);
     const visualDefaults = loopspaceGraphVisualDefaultsForNode("dispatch_todos");
     return {
@@ -438,8 +442,9 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
       x: position ? Math.round(Number(position.x) || 0) : 0,
       y: position ? Math.round(Number(position.y) || 0) : 0,
       props: {
-        device_id: deviceId || safeText(template?.target_device_id),
+        device_id: dispatchDeviceId,
         device_label: deviceLabel,
+        display: "region",
         dispatch_mode: safeText(template?.dispatch_mode || template?.send_mode || template?.mode, "queued"),
         enable_wait_ms: safeText(template?.enable_wait_ms || template?.enableWaitMs, "30000"),
         h: safeText(template?.h || template?.height, String(visualDefaults.height || 178)),
@@ -447,10 +452,11 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
         reasoning_effort: safeText(template?.reasoning_effort || template?.effort),
         speed: safeText(template?.speed),
         target_agent_id: safeText(template?.target_agent_id || template?.agent_id, "codex"),
-        target_device_id: deviceId || safeText(template?.target_device_id),
+        target_device_id: dispatchDeviceId,
         target_device_label: deviceLabel,
         target_terminal_id: safeText(template?.target_terminal_id),
         target_terminal_index: safeText(template?.target_terminal_index),
+        target_terminal_mode: safeText(template?.target_terminal_mode || template?.terminal_mode, "auto"),
         target_terminal_name: safeText(template?.target_terminal_name),
         target_thread_id: safeText(template?.target_thread_id),
         target_workspace_ids: safeText(template?.target_workspace_ids || template?.workspace_ids || template?.workspace_id),
@@ -722,6 +728,39 @@ function dfBlueprintResourcePropsFromPatchOperation(op = {}, node = null) {
     putFirst("title", ["title", "notification_title", "notificationTitle"]);
     putFirst("url", ["url", "link"]);
   }
+  if (nodeKind === "send_message") {
+    putFirst("device_id", ["device_id", "deviceId", "target_device_id", "targetDeviceId"]);
+    putFirst("device_label", ["device_label", "deviceLabel", "target_device_label", "targetDeviceLabel"]);
+    putFirst("model", ["model", "model_id", "modelId"]);
+    putFirst("prompt", ["prompt", "message", "body", "text", "instructions"]);
+    putFirst("reasoning_effort", ["reasoning_effort", "reasoningEffort", "effort", "thinking_power", "thinkingPower"]);
+    putFirst("speed", ["speed", "service_tier", "serviceTier"]);
+    putFirst("target_agent_id", ["target_agent_id", "targetAgentId", "agent_id", "agentId", "agent"]);
+    putFirst("target_device_id", ["target_device_id", "targetDeviceId", "device_id", "deviceId"]);
+    putFirst("target_device_label", ["target_device_label", "targetDeviceLabel", "device_label", "deviceLabel"]);
+    putFirst("target_terminal_id", ["target_terminal_id", "targetTerminalId", "terminal_id", "terminalId", "pane_id", "paneId"]);
+    putFirst("target_terminal_name", ["target_terminal_name", "targetTerminalName", "terminal_name", "terminalName"]);
+  }
+  if (nodeKind === "dispatch_todos") {
+    putFirst("device_id", ["device_id", "deviceId", "target_device_id", "targetDeviceId"]);
+    putFirst("device_label", ["device_label", "deviceLabel", "target_device_label", "targetDeviceLabel"]);
+    putFirst("dispatch_mode", ["dispatch_mode", "dispatchMode", "send_mode", "sendMode", "mode"]);
+    putFirst("enable_wait_ms", ["enable_wait_ms", "enableWaitMs"]);
+    putFirst("model", ["model", "model_id", "modelId"]);
+    putFirst("reasoning_effort", ["reasoning_effort", "reasoningEffort", "effort", "thinking_power", "thinkingPower"]);
+    putFirst("speed", ["speed", "service_tier", "serviceTier"]);
+    putFirst("target_agent_id", ["target_agent_id", "targetAgentId", "agent_id", "agentId", "agent"]);
+    putFirst("target_device_id", ["target_device_id", "targetDeviceId", "device_id", "deviceId"]);
+    putFirst("target_device_label", ["target_device_label", "targetDeviceLabel", "device_label", "deviceLabel"]);
+    putFirst("target_terminal_id", ["target_terminal_id", "targetTerminalId", "terminal_id", "terminalId", "pane_id", "paneId"]);
+    putFirst("target_terminal_index", ["target_terminal_index", "targetTerminalIndex", "terminal_index", "terminalIndex"]);
+    putFirst("target_terminal_mode", ["target_terminal_mode", "targetTerminalMode", "terminal_mode", "terminalMode"]);
+    putFirst("target_terminal_name", ["target_terminal_name", "targetTerminalName", "terminal_name", "terminalName"]);
+    putFirst("target_thread_id", ["target_thread_id", "targetThreadId", "thread_id", "threadId"]);
+    putFirst("target_workspace_ids", ["target_workspace_ids", "targetWorkspaceIds", "workspace_ids", "workspaceIds", "workspace_id", "workspaceId"]);
+    putFirst("todo_batch_id", ["todo_batch_id", "todoBatchId", "batch_id", "batchId"]);
+    putFirst("todo_lines", ["todo_lines", "todoLines", "todos", "items", "prompt", "text"]);
+  }
   return props;
 }
 
@@ -743,10 +782,14 @@ export function applyDfBlueprintPatchOperations(source, operations = [], options
         mode: op.mode || "",
         device_id: op.device_id,
         device_label: op.device_label,
+        model: op.model || op.model_id || op.modelId,
+        prompt: op.prompt || op.message || op.body || op.text || op.instructions,
         path_key: op.path_key,
+        reasoning_effort: op.reasoning_effort || op.reasoningEffort || op.effort || op.thinking_power || op.thinkingPower,
         script_id: op.script_id,
         script_name: op.script_name,
         shell: op.shell,
+        speed: op.speed || op.service_tier || op.serviceTier,
         dispatch_mode: op.dispatch_mode || op.dispatchMode || op.send_mode || op.sendMode,
         enable_wait_ms: op.enable_wait_ms || op.enableWaitMs,
         target_agent_id: op.target_agent_id || op.targetAgentId || op.agent_id || op.agentId,
@@ -754,6 +797,7 @@ export function applyDfBlueprintPatchOperations(source, operations = [], options
         target_device_label: op.target_device_label || op.targetDeviceLabel,
         target_terminal_id: op.target_terminal_id || op.targetTerminalId || op.terminal_id || op.terminalId || op.pane_id || op.paneId,
         target_terminal_index: op.target_terminal_index || op.targetTerminalIndex || op.terminal_index || op.terminalIndex,
+        target_terminal_mode: op.target_terminal_mode || op.targetTerminalMode || op.terminal_mode || op.terminalMode,
         target_terminal_name: op.target_terminal_name || op.targetTerminalName || op.terminal_name || op.terminalName,
         target_thread_id: op.target_thread_id || op.targetThreadId || op.thread_id || op.threadId,
         target_workspace_ids: op.target_workspace_ids || op.targetWorkspaceIds || op.workspace_ids || op.workspaceIds || op.workspace_id || op.workspaceId,

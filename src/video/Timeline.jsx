@@ -92,6 +92,10 @@ const TimelineRoot = styled.div`
   min-height: 0;
   height: 100%;
   background: #030507;
+
+  html[data-forge-theme="light"] & {
+    background: #f5f7fa;
+  }
 `;
 
 const TimelineToolbar = styled.div`
@@ -109,6 +113,10 @@ const TimelineToolbar = styled.div`
   &::-webkit-scrollbar {
     display: none;
   }
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(15, 23, 42, 0.1);
+  }
 `;
 
 const ToolbarTimecode = styled.span`
@@ -118,6 +126,10 @@ const ToolbarTimecode = styled.span`
   color: #fbbf24;
   margin-right: 4px;
   white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    color: #b45309;
+  }
 `;
 
 const ToolbarSpacer = styled.span`
@@ -131,6 +143,10 @@ const ToolbarDivider = styled.span`
   background: rgba(148, 163, 184, 0.16);
   flex: none;
   margin: 0 3px;
+
+  html[data-forge-theme="light"] & {
+    background: rgba(15, 23, 42, 0.12);
+  }
 `;
 
 const ZoomWrap = styled.label`
@@ -155,6 +171,12 @@ const AddTrackMenu = styled.div`
   border-radius: 7px;
   background: rgba(7, 12, 22, 0.98);
   box-shadow: 0 10px 26px rgba(0, 0, 0, 0.5);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.14);
+    background: #ffffff;
+    box-shadow: 0 10px 26px rgba(15, 23, 42, 0.14);
+  }
 `;
 
 const AddTrackOption = styled.button`
@@ -172,6 +194,14 @@ const AddTrackOption = styled.button`
   &:hover {
     background: rgba(16, 185, 129, 0.16);
     color: #d1fae5;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #475569;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    color: #047857;
   }
 `;
 
@@ -201,6 +231,11 @@ const RulerRow = styled.div`
   height: ${RULER_HEIGHT}px;
   background: rgba(3, 5, 7, 0.96);
   border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+
+  html[data-forge-theme="light"] & {
+    background: #f8fafc;
+    border-bottom-color: rgba(15, 23, 42, 0.1);
+  }
 `;
 
 const RulerRail = styled.div`
@@ -211,6 +246,11 @@ const RulerRail = styled.div`
   flex: none;
   background: rgba(3, 5, 7, 0.98);
   border-right: 1px solid rgba(148, 163, 184, 0.12);
+
+  html[data-forge-theme="light"] & {
+    background: #f8fafc;
+    border-right-color: rgba(15, 23, 42, 0.1);
+  }
 `;
 
 const RulerTrack = styled.div`
@@ -236,6 +276,14 @@ const RulerTick = styled.div`
     color: rgba(148, 163, 184, 0.8);
     white-space: nowrap;
   }
+
+  html[data-forge-theme="light"] & {
+    background: rgba(15, 23, 42, 0.14);
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: #64748b;
+  }
 `;
 
 const TrackRow = styled.div`
@@ -260,6 +308,11 @@ const TrackLabelRail = styled.div`
   border-radius: 0 4px 4px 0;
   border-left: 2px solid ${(props) => TRACK_TINTS[props.$kind] || "transparent"};
   cursor: grab;
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+    border-right-color: rgba(15, 23, 42, 0.1);
+  }
 `;
 
 const TrackLabelText = styled.span`
@@ -272,6 +325,10 @@ const TrackLabelText = styled.span`
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    color: #475569;
+  }
 `;
 
 const TrackMiniButton = styled.button`
@@ -298,6 +355,19 @@ const TrackMiniButton = styled.button`
   &[data-active="true"] {
     color: #fbbf24;
   }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    color: #0f172a;
+    background: rgba(15, 23, 42, 0.06);
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    color: #b45309;
+  }
 `;
 
 const TrackLane = styled.div`
@@ -310,6 +380,10 @@ const TrackLane = styled.div`
     outline: 1.5px dashed rgba(16, 185, 129, 0.6);
     outline-offset: -2px;
     background: rgba(16, 185, 129, 0.07);
+  }
+
+  html[data-forge-theme="light"] & {
+    background: ${(props) => (props.$kind === "audio" ? "rgba(15, 23, 42, 0.035)" : props.$kind === "text" ? "rgba(15, 23, 42, 0.03)" : "rgba(15, 23, 42, 0.045)")};
   }
 `;
 
@@ -370,6 +444,16 @@ const ClipBlock = styled.div`
       opacity: 1;
     }
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.16);
+    background: ${(props) =>
+      props.$kind === "audio"
+        ? "linear-gradient(180deg, rgba(16, 185, 129, 0.22), rgba(16, 185, 129, 0.1))"
+        : props.$kind === "text"
+          ? "linear-gradient(180deg, rgba(168, 85, 247, 0.22), rgba(168, 85, 247, 0.1))"
+          : "linear-gradient(180deg, rgba(37, 99, 235, 0.2), rgba(37, 99, 235, 0.1))"};
+  }
 `;
 
 const ClipLabel = styled.div`
@@ -391,6 +475,18 @@ const ClipLabel = styled.div`
   &[data-generation-failed="true"] {
     color: #fca5a5;
     font-weight: 800;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] &[data-generating="true"] {
+    color: #047857;
+  }
+
+  html[data-forge-theme="light"] &[data-generation-failed="true"] {
+    color: #dc2626;
   }
 `;
 
@@ -448,6 +544,14 @@ const TrimHandle = styled.div`
   &:hover {
     background: rgba(16, 185, 129, 0.3);
   }
+
+  html[data-forge-theme="light"] &[data-side="start"] {
+    border-left-color: rgba(15, 23, 42, 0.35);
+  }
+
+  html[data-forge-theme="light"] &[data-side="end"] {
+    border-right-color: rgba(15, 23, 42, 0.35);
+  }
 `;
 
 const GainEnvelope = styled.svg`
@@ -467,6 +571,10 @@ const SnapLine = styled.div`
   border-left: 1.5px dashed rgba(251, 191, 36, 0.85);
   z-index: 8;
   pointer-events: none;
+
+  html[data-forge-theme="light"] & {
+    border-left-color: rgba(180, 83, 9, 0.85);
+  }
 `;
 
 const MarqueeRect = styled.div`
@@ -475,6 +583,10 @@ const MarqueeRect = styled.div`
   border: 1px dashed rgba(96, 165, 250, 0.8);
   background: rgba(37, 99, 235, 0.12);
   pointer-events: none;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(37, 99, 235, 0.5);
+  }
 `;
 
 const KfDiamond = styled.span`
@@ -486,6 +598,10 @@ const KfDiamond = styled.span`
   background: #fbbf24;
   border-radius: 1px;
   pointer-events: none;
+
+  html[data-forge-theme="light"] & {
+    background: #b45309;
+  }
 `;
 
 const LinkBadge = styled.span`
@@ -500,6 +616,10 @@ const LinkBadge = styled.span`
     width: 9px;
     height: 9px;
   }
+
+  html[data-forge-theme="light"] & {
+    color: #334155;
+  }
 `;
 
 const RangeOverlay = styled.div`
@@ -511,6 +631,11 @@ const RangeOverlay = styled.div`
   border-left: 1px solid rgba(96, 165, 250, 0.55);
   border-right: 1px solid rgba(96, 165, 250, 0.55);
   pointer-events: none;
+
+  html[data-forge-theme="light"] & {
+    border-left-color: rgba(37, 99, 235, 0.45);
+    border-right-color: rgba(37, 99, 235, 0.45);
+  }
 `;
 
 const RangeChip = styled.span`
@@ -538,6 +663,12 @@ const RangeChip = styled.span`
     font-size: 10px;
     line-height: 1;
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(37, 99, 235, 0.45);
+    background: rgba(37, 99, 235, 0.12);
+    color: #1d4ed8;
+  }
 `;
 
 const Playhead = styled.div`
@@ -558,6 +689,14 @@ const Playhead = styled.div`
     border-right: 4.5px solid transparent;
     border-top: 5px solid #f87171;
   }
+
+  html[data-forge-theme="light"] & {
+    background: #dc2626;
+  }
+
+  html[data-forge-theme="light"] &::before {
+    border-top-color: #dc2626;
+  }
 `;
 
 const InspectorPopover = styled.div`
@@ -575,6 +714,12 @@ const InspectorPopover = styled.div`
   border-radius: 9px;
   background: rgba(7, 12, 22, 0.97);
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.14);
+    background: #ffffff;
+    box-shadow: 0 12px 32px rgba(15, 23, 42, 0.16);
+  }
 `;
 
 const InspectorHeader = styled.div`
@@ -591,6 +736,10 @@ const InspectorHeader = styled.div`
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #047857;
   }
 `;
 
@@ -617,6 +766,10 @@ const SliderLabel = styled.label`
   input[type="range"] {
     accent-color: #10b981;
     width: 100%;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
   }
 `;
 

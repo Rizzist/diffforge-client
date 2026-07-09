@@ -93,6 +93,10 @@ const PaneSurface = styled.div`
   flex-direction: column;
   overflow: hidden;
   background: #020304;
+
+  html[data-forge-theme="light"] & {
+    background: #f5f7fa;
+  }
 `;
 
 const PaneBody = styled.div`
@@ -136,6 +140,17 @@ const EmptyPane = styled.div`
   @container pcb-pane (max-width: 340px) {
     padding: 10px;
   }
+
+  html[data-forge-theme="light"] & {
+    color: #475569;
+    background:
+      radial-gradient(ellipse at 16% -12%, rgba(217, 119, 6, 0.05), transparent 52%),
+      radial-gradient(ellipse at 88% 114%, rgba(16, 185, 129, 0.06), transparent 55%),
+      linear-gradient(rgba(15, 23, 42, 0.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(15, 23, 42, 0.035) 1px, transparent 1px),
+      #f5f7fa;
+    background-size: auto, auto, 24px 24px, 24px 24px, auto;
+  }
 `;
 
 const EmptyCard = styled.div`
@@ -173,6 +188,17 @@ const EmptyCard = styled.div`
   @container pcb-pane (max-height: 260px) {
     gap: 6px;
     padding: 10px;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(16, 185, 129, 0.2);
+    background: #ffffff;
+    box-shadow: 0 18px 44px rgba(15, 23, 42, 0.14);
+    scrollbar-color: rgba(15, 23, 42, 0.22) transparent;
+  }
+
+  html[data-forge-theme="light"] &::-webkit-scrollbar-thumb {
+    background: rgba(15, 23, 42, 0.22);
   }
 `;
 
@@ -214,6 +240,12 @@ const EmptyBadge = styled.div`
       height: 14px;
     }
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(217, 119, 6, 0.4);
+    background: linear-gradient(160deg, rgba(217, 119, 6, 0.18), rgba(217, 119, 6, 0.05));
+    color: #b45309;
+  }
 `;
 
 const EmptyTitle = styled.div`
@@ -223,6 +255,10 @@ const EmptyTitle = styled.div`
 
   @container pcb-pane (max-height: 260px) {
     font-size: 12px;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
   }
 `;
 
@@ -235,6 +271,10 @@ const EmptyHint = styled.div`
   @container pcb-pane (max-height: 300px) {
     font-size: 10px;
     line-height: 1.25;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
   }
 `;
 
@@ -261,6 +301,16 @@ const PaneButton = styled.button`
   @container pcb-pane (max-height: 260px) {
     min-height: 28px;
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(217, 119, 6, 0.45);
+    color: #b45309;
+    background: rgba(217, 119, 6, 0.14);
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    background: rgba(217, 119, 6, 0.22);
+  }
 `;
 
 const DangerButton = styled(PaneButton)`
@@ -271,6 +321,16 @@ const DangerButton = styled(PaneButton)`
   &:hover:not(:disabled) {
     background: rgba(127, 29, 29, 0.42);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(220, 38, 38, 0.4);
+    color: #dc2626;
+    background: rgba(220, 38, 38, 0.1);
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    background: rgba(220, 38, 38, 0.16);
+  }
 `;
 
 const SecondaryButton = styled(PaneButton)`
@@ -280,6 +340,16 @@ const SecondaryButton = styled(PaneButton)`
 
   &:hover:not(:disabled) {
     background: rgba(30, 41, 59, 0.78);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.14);
+    color: #475569;
+    background: #f8fafc;
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    background: rgba(15, 23, 42, 0.08);
   }
 `;
 
@@ -299,6 +369,10 @@ const CreateOverlay = styled.div`
   @container pcb-pane (max-height: 420px) {
     align-items: start;
     padding: 10px;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: rgba(248, 250, 252, 0.82);
   }
 `;
 
@@ -329,6 +403,16 @@ const CreateInput = styled.input`
 
   @container pcb-pane (max-height: 260px) {
     min-height: 30px;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.14);
+    color: #0f172a;
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &::placeholder {
+    color: rgba(15, 23, 42, 0.4);
   }
 `;
 
@@ -373,6 +457,17 @@ const CreateCancelButton = styled.button`
   @container pcb-pane (max-height: 260px) {
     min-height: 28px;
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.12);
+    color: #475569;
+    background: #f8fafc;
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    border-color: rgba(15, 23, 42, 0.2);
+    color: #0f172a;
+  }
 `;
 
 const PaneError = styled.div`
@@ -380,6 +475,10 @@ const PaneError = styled.div`
   font-size: 11px;
   font-weight: 750;
   line-height: 1.35;
+
+  html[data-forge-theme="light"] & {
+    color: #dc2626;
+  }
 `;
 
 const CreatePickerWrap = styled.div`
@@ -419,6 +518,16 @@ const RecentRow = styled.button`
   @container pcb-pane (max-height: 260px) {
     min-height: 28px;
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.1);
+    background: #f8fafc;
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    border-color: rgba(217, 119, 6, 0.5);
+    background: rgba(217, 119, 6, 0.1);
+  }
 `;
 
 const RecentName = styled.span`
@@ -430,6 +539,10 @@ const RecentName = styled.span`
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+  }
 `;
 
 const RecentMeta = styled.span`
@@ -438,6 +551,10 @@ const RecentMeta = styled.span`
   font-weight: 650;
   color: rgba(232, 178, 102, 0.66);
   white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    color: #b45309;
+  }
 `;
 
 const CreateLabel = styled.div`
@@ -446,6 +563,10 @@ const CreateLabel = styled.div`
   font-weight: 850;
   letter-spacing: 0;
   text-transform: uppercase;
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
 `;
 
 export default function PcbWorkspacePane({

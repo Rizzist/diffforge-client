@@ -66,6 +66,27 @@ test("visible terminal presence follows activity status instead of running turn 
   assert.equal(terminalTurnStatusFromActivityStatus("idle"), "completed");
 });
 
+test("user-input-required aliases map to the paused needs-input bucket", () => {
+  for (const status of ["awaiting_input", "user_input_required", "uir"]) {
+    assert.equal(terminalReadinessFromPresenceStatus(status), "needs_input");
+    assert.equal(terminalExecutionPhaseFromState({
+      activityStatus: status,
+      readiness: "needs_input",
+    }), "needs_input");
+    assert.equal(terminalRailStateFromExecutionPhase(status), "paused");
+    assert.equal(terminalTurnStatusFromActivityStatus(status), "pending");
+  }
+  assert.equal(workspaceTerminalStatusFromActivityStatus("idle", {
+    terminalLifecycle: "open",
+    terminalIsPromptingUser: true,
+  }), "awaiting_input");
+  assert.equal(workspaceTerminalStatusFromActivityStatus("awaiting_input", {
+    terminalLifecycle: "open",
+    terminalIsParked: true,
+    terminalIsPromptingUser: true,
+  }), "paused");
+});
+
 test("visible terminal rail preserves exact activity status", () => {
   assert.equal(terminalRailStateFromActivityStatus("running"), "running");
   assert.equal(terminalActivityStatusIsBusy("running"), true);

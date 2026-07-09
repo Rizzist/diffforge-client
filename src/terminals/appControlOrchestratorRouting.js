@@ -174,6 +174,36 @@ export function getLoopspaceAutomationAutoSpawnMaxTotal(detail = {}) {
   return LOOPSPACE_AUTOMATION_APP_CONTROL_MAX_TERMINALS;
 }
 
+export function buildAppControlPromptWithAttachmentMarkers(text = "", stageResult = {}) {
+  const prompt = String(text || "").trim();
+  const markerBlock = String(stageResult?.markerBlock || stageResult?.marker_block || "").trim();
+  const warningBlock = String(stageResult?.warningBlock || stageResult?.warning_block || "").trim();
+  const attachmentBlock = [markerBlock, warningBlock].filter(Boolean).join("\n");
+  if (!attachmentBlock) {
+    return prompt;
+  }
+  /* LS/1 structured prompts carry the user message in a msg: section that
+     ends at the steps: line; attachment markers appended after the final
+     done line sit outside the protocol and the agent won't tie the image to
+     the message. Insert them at the end of the msg: section instead. */
+  if (prompt.startsWith("LS/1 ")) {
+    const lines = prompt.split("\n");
+    const msgIndex = lines.indexOf("msg:");
+    const stepsIndex = msgIndex === -1
+      ? -1
+      : lines.findIndex((line, index) => index > msgIndex && line === "steps:");
+    if (msgIndex !== -1 && stepsIndex !== -1) {
+      const insertAt = lines[stepsIndex - 1]?.trim() === "" ? stepsIndex - 1 : stepsIndex;
+      return [
+        ...lines.slice(0, insertAt),
+        ...attachmentBlock.split("\n"),
+        ...lines.slice(insertAt),
+      ].join("\n");
+    }
+  }
+  return [prompt, attachmentBlock].filter(Boolean).join("\n\n");
+}
+
 export function selectLoopspaceAutomationAppControlTerminal({
   indexes = [],
   rolesByIndex = {},

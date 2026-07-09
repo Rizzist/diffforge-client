@@ -1,4 +1,4 @@
-const NATIVE_NOTIFICATION_STORAGE_KEY = "diffforge.nativeNotifications.v1";
+export const NATIVE_NOTIFICATION_STORAGE_KEY = "diffforge.nativeNotifications.v1";
 
 function readSettings() {
   try {
@@ -10,6 +10,22 @@ function readSettings() {
   } catch {
     return { enabled: true };
   }
+}
+
+export function readNativeNotificationSettings() {
+  return readSettings();
+}
+
+export function writeNativeNotificationSettings(settings = {}) {
+  const nextSettings = { enabled: settings?.enabled !== false };
+  try {
+    if (typeof window !== "undefined" && window.localStorage) {
+      window.localStorage.setItem(NATIVE_NOTIFICATION_STORAGE_KEY, JSON.stringify(nextSettings));
+    }
+  } catch {
+    // Runtime notification checks still default safely if persistence fails.
+  }
+  return nextSettings;
 }
 
 function windowIsFocused() {

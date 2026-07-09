@@ -63,6 +63,11 @@ const BinRoot = styled.div`
     border-radius: 8px;
     animation: video-bin-drop-flash 0.9s ease-out;
   }
+
+  html[data-forge-theme="light"] &[data-drop-active="true"],
+  html[data-forge-theme="light"] &[data-snip-drop-active="true"] {
+    outline-color: rgba(5, 150, 105, 0.55);
+  }
 `;
 
 const BinToolbar = styled.div`
@@ -101,6 +106,20 @@ const FilterChip = styled.button`
     border-color: rgba(96, 165, 250, 0.5);
     background: rgba(37, 99, 235, 0.18);
     color: #dbeafe;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: rgba(71, 85, 105, 0.9);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    border-color: rgba(37, 99, 235, 0.45);
+    background: rgba(37, 99, 235, 0.12);
+    color: #1d4ed8;
   }
 `;
 
@@ -152,6 +171,23 @@ const FolderChip = styled(FilterChip)`
     background: rgba(16, 185, 129, 0.22);
     color: #a7f3d0;
   }
+
+  html[data-forge-theme="light"] & em {
+    color: #dc2626;
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    border-color: rgba(5, 150, 105, 0.5);
+    background: rgba(16, 185, 129, 0.14);
+    color: #047857;
+  }
+
+  html[data-forge-theme="light"] &[data-snip-drop-active="true"],
+  html[data-forge-theme="light"] &[data-drop-flash="true"] {
+    border-color: rgba(5, 150, 105, 0.85);
+    background: rgba(16, 185, 129, 0.22);
+    color: #047857;
+  }
 `;
 
 const FolderInput = styled.input`
@@ -166,6 +202,12 @@ const FolderInput = styled.input`
   outline: none;
   width: 96px;
   flex: none;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(37, 99, 235, 0.45);
+    background: #ffffff;
+    color: #0f172a;
+  }
 `;
 
 // Library search: filenames instantly, transcript text (cached segments)
@@ -190,6 +232,20 @@ const SearchInput = styled.input`
   &:focus {
     border-color: rgba(16, 185, 129, 0.5);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.12);
+    background: #ffffff;
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] &::placeholder {
+    color: rgba(100, 116, 139, 0.75);
+  }
+
+  html[data-forge-theme="light"] &:focus {
+    border-color: rgba(5, 150, 105, 0.5);
+  }
 `;
 
 const AiMenuHeading = styled.div`
@@ -199,6 +255,10 @@ const AiMenuHeading = styled.div`
   letter-spacing: 0.07em;
   text-transform: uppercase;
   color: rgba(148, 163, 184, 0.65);
+
+  html[data-forge-theme="light"] & {
+    color: rgba(71, 85, 105, 0.85);
+  }
 `;
 
 const BinGrid = styled.div`
@@ -239,6 +299,23 @@ const AssetTile = styled.div`
     border-color: rgba(96, 165, 250, 0.45);
     cursor: default;
   }
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+    border-color: rgba(15, 23, 42, 0.12);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(5, 150, 105, 0.45);
+  }
+
+  html[data-forge-theme="light"] &[data-selected="true"] {
+    border-color: rgba(5, 150, 105, 0.65);
+  }
+
+  html[data-forge-theme="light"] &[data-pending="true"] {
+    border-color: rgba(37, 99, 235, 0.45);
+  }
 `;
 
 // Spinning ring shown on a tile while its transcription job runs.
@@ -258,6 +335,12 @@ const TranscribeSpinner = styled.span`
     to {
       transform: rotate(360deg);
     }
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(29, 78, 216, 0.25);
+    border-top-color: #1d4ed8;
+    background: rgba(255, 255, 255, 0.75);
   }
 `;
 
@@ -280,6 +363,10 @@ const PendingSpin = styled.span`
       opacity: 1;
     }
   }
+
+  html[data-forge-theme="light"] & {
+    color: #1d4ed8;
+  }
 `;
 
 const AiMenu = styled.div`
@@ -295,6 +382,12 @@ const AiMenu = styled.div`
   min-width: 168px;
   max-height: min(60vh, 320px);
   overflow-y: auto;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.12);
+    background: #ffffff;
+    box-shadow: 0 12px 30px rgba(15, 23, 42, 0.16);
+  }
 `;
 
 const AiMenuItem = styled.button`
@@ -313,6 +406,15 @@ const AiMenuItem = styled.button`
     background: rgba(16, 185, 129, 0.16);
     color: #d1fae5;
   }
+
+  html[data-forge-theme="light"] & {
+    color: rgba(15, 23, 42, 0.85);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    background: rgba(16, 185, 129, 0.14);
+    color: #047857;
+  }
 `;
 
 const AssetThumb = styled.div`
@@ -329,6 +431,10 @@ const AssetThumb = styled.div`
     object-fit: cover;
     display: block;
     pointer-events: none;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: #eef1f6;
   }
 `;
 
@@ -348,6 +454,11 @@ const AssetDuration = styled.span`
   font-size: 8.5px;
   font-weight: 750;
   font-variant-numeric: tabular-nums;
+
+  html[data-forge-theme="light"] & {
+    background: rgba(15, 23, 42, 0.78);
+    color: #f1f5f9;
+  }
 `;
 
 const AssetKind = styled.span`
@@ -362,6 +473,11 @@ const AssetKind = styled.span`
   font-weight: 800;
   text-transform: uppercase;
   letter-spacing: 0.05em;
+
+  html[data-forge-theme="light"] & {
+    background: rgba(15, 23, 42, 0.78);
+    color: #6ee7b7;
+  }
 `;
 
 const AssetName = styled.div`
@@ -372,6 +488,10 @@ const AssetName = styled.div`
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+
+  html[data-forge-theme="light"] & {
+    color: rgba(15, 23, 42, 0.88);
+  }
 `;
 
 const HoverActions = styled.div`
@@ -406,6 +526,21 @@ const HoverButton = styled(VideoIconButton)`
   &[data-danger="true"]:hover:not(:disabled) {
     background: rgba(190, 40, 40, 0.55);
   }
+
+  html[data-forge-theme="light"] & {
+    background: rgba(255, 255, 255, 0.85);
+    color: #334155;
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    background: rgba(16, 185, 129, 0.22);
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] &[data-danger="true"]:hover:not(:disabled) {
+    background: rgba(220, 38, 38, 0.18);
+    color: #dc2626;
+  }
 `;
 
 const EmptyBin = styled.div`
@@ -424,6 +559,11 @@ const EmptyBin = styled.div`
   text-align: center;
   min-height: 100px;
   flex: 1 1 auto;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.16);
+    color: #64748b;
+  }
 `;
 
 const DragGhost = styled.div`
@@ -454,6 +594,13 @@ const DragGhost = styled.div`
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(5, 150, 105, 0.5);
+    background: #ffffff;
+    color: #047857;
+    box-shadow: 0 8px 22px rgba(15, 23, 42, 0.16);
   }
 `;
 

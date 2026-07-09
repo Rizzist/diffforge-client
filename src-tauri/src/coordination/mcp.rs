@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet},
+    collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet, VecDeque},
     env, fs,
     hash::{Hash, Hasher},
     io::{self, BufRead, BufReader, Read, Write},
@@ -52,6 +52,7 @@ const TERMINAL_SESSION_TOOL_NAMES: &[&str] = &[
     "submit_patch",
     "submit_patch_status",
 ];
+const DIRECT_UNMANAGED_LOOPSPACE_TOOL_NAMES: &[&str] = &["start_task", "checkpoint"];
 const WORKSPACE_GATEWAY_BUILTIN_TOOLS: &[&str] = &[
     "workspace_mcp__sync_manifest",
     "workspace_mcp__list_servers",
@@ -4843,15 +4844,21 @@ fn coordination_context_repo_session_mode(context: &McpContext) -> Option<&'stat
 }
 
 fn coordination_tools_for_context(context: &McpContext) -> Vec<&'static str> {
-    // Unsafe direct workspaces never expose the coordination lifecycle:
-    // agents physically cannot start tasks, take leases, or submit patches.
+    // Unsafe direct workspaces expose only the tiny lifecycle slice needed for
+    // Loopspace runtime hydration/progress. Normal Full-mode work is still not
+    // coordinated, patchable, leasable, pausable, or resumable.
     if coordination_context_repo_session_mode(context)
         == Some(super::kernel::AGENT_SESSION_MODE_DIRECT_UNMANAGED)
     {
+        let has_terminal_session = coordination_context_has_terminal_session(context);
         return TOOL_NAMES
             .iter()
             .copied()
-            .filter(|tool| !TERMINAL_SESSION_TOOL_NAMES.contains(tool))
+            .filter(|tool| {
+                !TERMINAL_SESSION_TOOL_NAMES.contains(tool)
+                    || (has_terminal_session
+                        && DIRECT_UNMANAGED_LOOPSPACE_TOOL_NAMES.contains(tool))
+            })
             .collect();
     }
     if coordination_context_has_terminal_session(context) {
@@ -4891,6 +4898,26 @@ pub fn dispatch_tool(context: &McpContext, tool: &str, mut input: Value) -> Valu
         );
     }
     apply_context_defaults(context, &mut input);
+    let direct_unmanaged_context = coordination_context_repo_session_mode(context)
+        == Some(super::kernel::AGENT_SESSION_MODE_DIRECT_UNMANAGED);
+    let loopspace_runtime_call = coordination_tool_input_has_loopspace_runtime(&input);
+    if direct_unmanaged_context && tool == "start_task" && !loopspace_runtime_call {
+        record_mcp_client_event(
+            context,
+            "mcp_agent_tool_failed",
+            json!({
+                "method": "tools/call",
+                "tool": tool,
+                "ok": false,
+                "error_code": "loopspace_runtime_required",
+            }),
+        );
+        return api_error(
+            "loopspace_runtime_required",
+            "Full-mode start_task is available only for Loopspace runs. Include loopspace_id, loop_runtime_run_id, and loop_runtime_node_id.",
+            json!({"allowed_tools": allowed_tools}),
+        );
+    }
     if matches!(
         tool,
         "acquire_lease" | "checkpoint" | "complete_task" | "submit_patch"
@@ -4917,9 +4944,32 @@ pub fn dispatch_tool(context: &McpContext, tool: &str, mut input: Value) -> Valu
             "tool": tool,
             "ok": ok,
             "error_code": result["error"]["code"].as_str(),
+            "loopspace_runtime": loopspace_runtime_call,
         }),
     );
     result
+}
+
+fn coordination_tool_input_has_loopspace_runtime(input: &Value) -> bool {
+    if loopspace_runtime_context_value(input).is_some() {
+        return true;
+    }
+    let loopspace_id =
+        loopspace_runtime_field_text(input, &["loopspace_id", "loopspaceId", "loopspaceID"]);
+    let loop_runtime_run_id = loopspace_runtime_field_text(
+        input,
+        &["loop_runtime_run_id", "loopRuntimeRunId", "run_id", "runId"],
+    );
+    let loop_runtime_node_id = loopspace_runtime_field_text(
+        input,
+        &[
+            "loop_runtime_node_id",
+            "loopRuntimeNodeId",
+            "node_id",
+            "nodeId",
+        ],
+    );
+    loopspace_id.is_some() && loop_runtime_run_id.is_some() && loop_runtime_node_id.is_some()
 }
 
 fn dispatch_tool_result(
@@ -5265,6 +5315,10 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         .filter(|value| !value.trim().is_empty());
     let local_task_hint = existing_local_task_id_for_start(kernel, task_id, session_id)?;
     let task_title = requested_title.map(str::to_string);
+    let loop_runtime_run_id = loopspace_runtime_field_text(
+        input,
+        &["loop_runtime_run_id", "loopRuntimeRunId", "run_id", "runId"],
+    );
 
     if let (Some(agent_id), Some(session_id)) = (agent_id, session_id) {
         if !session_is_active_for_agent(kernel, session_id, agent_id)? {
@@ -5301,7 +5355,7 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         agent_id,
         session_id,
         requested_local_task_id,
-        None,
+        loop_runtime_run_id.as_deref(),
         Some(&start_plan),
         requested_title,
         None,
@@ -5390,6 +5444,8 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         None
     };
 
+    let loopspace_run_context = start_task_loopspace_run_context_for_agent(input, &cloud);
+
     if let Some(object) = data.as_object_mut() {
         let brief = refreshed_brief
             .as_ref()
@@ -5397,9 +5453,16 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
             .cloned()
             .map(|brief| start_task_brief_for_agent(&brief))
             .unwrap_or_else(|| json!({}));
+        let mut cloud_view = cloud_start_task_for_agent(&cloud);
+        if let Some(context) = loopspace_run_context.as_ref() {
+            if let Some(cloud_object) = cloud_view.as_object_mut() {
+                cloud_object.insert("loopspace_run_context".to_string(), context.clone());
+            }
+            object.insert("loopspace_run_context".to_string(), context.clone());
+        }
         object.insert("brief".to_string(), brief);
         object.insert("start_plan".to_string(), json!(start_plan));
-        object.insert("cloud".to_string(), cloud_start_task_for_agent(&cloud));
+        object.insert("cloud".to_string(), cloud_view);
         object.insert("cloud_task_id".to_string(), json!(started_task_id));
         object.insert("coordination_authority".to_string(), json!("local"));
         object.insert(
@@ -5646,6 +5709,1630 @@ fn cloud_start_task_metadata_values(response: &Value) -> Vec<Value> {
         }
     }
     values
+}
+
+#[derive(Clone)]
+struct LoopspaceDfNode {
+    id: String,
+    label: String,
+    kind: String,
+    props: Map<String, Value>,
+}
+
+#[derive(Clone)]
+struct LoopspaceDfEdge {
+    id: String,
+    from: String,
+    from_port: String,
+    to: String,
+    to_port: String,
+    label: String,
+}
+
+struct LoopspaceDfAst {
+    nodes: Vec<LoopspaceDfNode>,
+    edges: Vec<LoopspaceDfEdge>,
+}
+
+fn loopspace_runtime_field_text(source: &Value, keys: &[&str]) -> Option<String> {
+    let mut queue = VecDeque::from([(source.clone(), 0usize)]);
+    let nested_keys = [
+        "payload",
+        "request",
+        "event",
+        "data",
+        "task",
+        "source_todo",
+        "sourceTodo",
+        "remoteCommand",
+        "remote_command",
+        "metadata",
+        "metadata_json",
+        "metadataJson",
+        "arguments",
+        "args",
+        "details",
+    ];
+    while let Some((value, depth)) = queue.pop_front() {
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        for key in keys {
+            if let Some(text) = object
+                .get(*key)
+                .and_then(loopspace_runtime_value_text)
+                .filter(|text| !text.trim().is_empty())
+            {
+                return Some(text.trim().to_string());
+            }
+        }
+        if depth >= 5 {
+            continue;
+        }
+        for key in nested_keys {
+            let Some(nested) = object.get(key) else {
+                continue;
+            };
+            if nested.is_object() {
+                queue.push_back((nested.clone(), depth + 1));
+            } else if let Some(raw) = nested.as_str() {
+                if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
+                    if parsed.is_object() {
+                        queue.push_back((parsed, depth + 1));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn loopspace_runtime_value_text(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+    if value.is_number() || value.is_boolean() {
+        return Some(value.to_string());
+    }
+    None
+}
+
+fn loopspace_runtime_context_value(source: &Value) -> Option<Value> {
+    let mut queue = VecDeque::from([(source.clone(), 0usize)]);
+    let nested_keys = [
+        "payload",
+        "request",
+        "event",
+        "data",
+        "task",
+        "source_todo",
+        "sourceTodo",
+        "remoteCommand",
+        "remote_command",
+        "metadata",
+        "metadata_json",
+        "metadataJson",
+        "arguments",
+        "args",
+        "details",
+    ];
+    while let Some((value, depth)) = queue.pop_front() {
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        for key in ["loopspace_run_context", "loopspaceRunContext"] {
+            if let Some(context) = object.get(key).filter(|value| value.is_object()) {
+                return Some(context.clone());
+            }
+        }
+        if depth >= 5 {
+            continue;
+        }
+        for key in nested_keys {
+            let Some(nested) = object.get(key) else {
+                continue;
+            };
+            if nested.is_object() {
+                queue.push_back((nested.clone(), depth + 1));
+            } else if let Some(raw) = nested.as_str() {
+                if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
+                    if parsed.is_object() {
+                        queue.push_back((parsed, depth + 1));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn loopspace_runtime_field_text_from_start(
+    input: &Value,
+    cloud: &Value,
+    keys: &[&str],
+) -> Option<String> {
+    loopspace_runtime_field_text(input, keys).or_else(|| loopspace_runtime_field_text(cloud, keys))
+}
+
+fn loopspace_df_unquote(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        serde_json::from_str::<String>(trimmed).unwrap_or_else(|_| {
+            trimmed[1..trimmed.len() - 1]
+                .replace("\\\"", "\"")
+                .replace("\\t", "\t")
+                .replace("\\n", "\n")
+                .replace("\\r", "\r")
+                .replace("\\\\", "\\")
+        })
+    } else if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+        trimmed[1..trimmed.len() - 1].to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn loopspace_df_split_top_level(input: &str, separator: char) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut bracket_depth = 0usize;
+    let mut paren_depth = 0usize;
+    for ch in input.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            current.push(ch);
+            escaped = true;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            current.push(ch);
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+            current.push(ch);
+            continue;
+        }
+        match ch {
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            _ => {}
+        }
+        if ch == separator && bracket_depth == 0 && paren_depth == 0 {
+            if !current.trim().is_empty() {
+                parts.push(current.trim().to_string());
+            }
+            current.clear();
+            continue;
+        }
+        current.push(ch);
+    }
+    if !current.trim().is_empty() {
+        parts.push(current.trim().to_string());
+    }
+    parts
+}
+
+fn loopspace_df_parse_props(raw: &str) -> Map<String, Value> {
+    let mut props = Map::new();
+    for part in loopspace_df_split_top_level(raw, ',') {
+        let colon_index = part.find(':');
+        let equals_index = part.find('=');
+        let index = match (colon_index, equals_index) {
+            (Some(colon), Some(equals)) => Some(colon.min(equals)),
+            (Some(colon), None) => Some(colon),
+            (None, Some(equals)) => Some(equals),
+            (None, None) => None,
+        };
+        let Some(index) = index.filter(|index| *index > 0) else {
+            continue;
+        };
+        let key = part[..index].trim();
+        if key.is_empty() {
+            continue;
+        }
+        let value = loopspace_df_unquote(part[index + 1..].trim());
+        props.insert(key.to_string(), json!(value));
+        props.insert(key.to_ascii_lowercase(), json!(value));
+    }
+    props
+}
+
+fn loopspace_df_prop(props: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        for candidate in [key.to_string(), key.to_ascii_lowercase()] {
+            if let Some(text) = props
+                .get(&candidate)
+                .and_then(loopspace_runtime_value_text)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+            {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+fn loopspace_df_sanitize_id(value: &str, fallback: &str) -> String {
+    let mut safe = String::new();
+    let mut last_dash = false;
+    for ch in value.trim().to_ascii_lowercase().chars() {
+        let next = if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            Some(ch)
+        } else {
+            Some('-')
+        };
+        if let Some(ch) = next {
+            if ch == '-' {
+                if !last_dash && !safe.is_empty() {
+                    safe.push(ch);
+                }
+                last_dash = true;
+            } else {
+                safe.push(ch);
+                last_dash = false;
+            }
+        }
+    }
+    let safe = safe.trim_matches('-').to_string();
+    if safe.is_empty() {
+        fallback.to_string()
+    } else {
+        safe
+    }
+}
+
+fn loopspace_df_parse_node(line: &str, line_index: usize) -> Option<LoopspaceDfNode> {
+    let trimmed = line.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let (line_kind, rest) = if lower.starts_with("node ") {
+        ("node", trimmed[5..].trim())
+    } else if lower.starts_with("trigger ") {
+        ("trigger", trimmed[8..].trim())
+    } else {
+        return None;
+    };
+    let open_index = rest.rfind('[')?;
+    let close_index = rest.rfind(']')?;
+    if close_index <= open_index {
+        return None;
+    }
+    let label = loopspace_df_unquote(rest[..open_index].trim());
+    let props = loopspace_df_parse_props(&rest[open_index + 1..close_index]);
+    let fallback_id = format!("{line_kind}-{line_index}");
+    let id = loopspace_df_prop(&props, &["id", "node_id"])
+        .unwrap_or_else(|| loopspace_df_sanitize_id(&label, &fallback_id));
+    let kind = if line_kind == "trigger" {
+        "trigger".to_string()
+    } else {
+        loopspace_df_prop(&props, &["kind", "node_kind", "type"])
+            .unwrap_or_else(|| "action".to_string())
+    };
+    Some(LoopspaceDfNode {
+        id,
+        label: if label.trim().is_empty() {
+            fallback_id
+        } else {
+            label.trim().to_string()
+        },
+        kind,
+        props,
+    })
+}
+
+fn loopspace_df_parse_endpoint(raw: &str) -> Option<(String, String)> {
+    let endpoint = raw.trim();
+    let index = endpoint.rfind('.')?;
+    let node_id = endpoint[..index].trim();
+    let port_id = endpoint[index + 1..].trim();
+    if node_id.is_empty() || port_id.is_empty() {
+        None
+    } else {
+        Some((node_id.to_string(), port_id.to_string()))
+    }
+}
+
+fn loopspace_df_parse_edge(line: &str, line_index: usize) -> Option<LoopspaceDfEdge> {
+    let trimmed = line.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.starts_with("edge ") {
+        return None;
+    }
+    let rest = trimmed[5..].trim();
+    let arrow_index = rest.find("->")?;
+    let left = rest[..arrow_index].trim();
+    let right_and_props = rest[arrow_index + 2..].trim();
+    let (right, raw_props) = if let (Some(open), Some(close)) =
+        (right_and_props.rfind('['), right_and_props.rfind(']'))
+    {
+        if close > open {
+            (
+                right_and_props[..open].trim(),
+                &right_and_props[open + 1..close],
+            )
+        } else {
+            (right_and_props, "")
+        }
+    } else {
+        (right_and_props, "")
+    };
+    let (from, from_port) = loopspace_df_parse_endpoint(left)?;
+    let (to, to_port) = loopspace_df_parse_endpoint(right)?;
+    let props = loopspace_df_parse_props(raw_props);
+    let id = loopspace_df_prop(&props, &["id", "edge_id"])
+        .unwrap_or_else(|| format!("edge-{from}-{from_port}-{to}-{to_port}-{line_index}"));
+    let label = loopspace_df_prop(&props, &["label", "name"]).unwrap_or_default();
+    Some(LoopspaceDfEdge {
+        id,
+        from,
+        from_port,
+        to,
+        to_port,
+        label,
+    })
+}
+
+fn loopspace_df_parse_source(source: &str) -> LoopspaceDfAst {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut seen_nodes = HashSet::new();
+    for (index, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("dfblueprint ")
+            || lower.starts_with("blueprint ")
+            || lower.starts_with("format ")
+            || lower.starts_with("direction ")
+        {
+            continue;
+        }
+        if let Some(node) = loopspace_df_parse_node(trimmed, index) {
+            if seen_nodes.insert(node.id.clone()) {
+                nodes.push(node);
+            }
+            continue;
+        }
+        if let Some(edge) = loopspace_df_parse_edge(trimmed, index) {
+            edges.push(edge);
+        }
+    }
+    LoopspaceDfAst { nodes, edges }
+}
+
+fn loopspace_df_node_parent_id(node: &LoopspaceDfNode) -> String {
+    loopspace_df_prop(&node.props, &["parent_id", "parentId", "parent"]).unwrap_or_default()
+}
+
+fn loopspace_df_node_is_step(node: &LoopspaceDfNode) -> bool {
+    matches!(
+        node.kind.trim().to_ascii_lowercase().as_str(),
+        "checkpoint" | "message_step" | "step" | "substep" | "todo"
+    )
+}
+
+fn loopspace_df_step_order(node: &LoopspaceDfNode, fallback: usize) -> usize {
+    loopspace_df_prop(&node.props, &["order", "index"])
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(fallback)
+}
+
+fn loopspace_df_step_title(node: &LoopspaceDfNode, fallback_index: usize) -> String {
+    loopspace_df_prop(&node.props, &["title", "name"])
+        .unwrap_or_else(|| {
+            if node.label.trim().is_empty() {
+                format!("Step {}", fallback_index + 1)
+            } else {
+                node.label.clone()
+            }
+        })
+        .trim()
+        .to_string()
+}
+
+fn loopspace_df_step_description(node: &LoopspaceDfNode) -> String {
+    loopspace_df_prop(&node.props, &["description", "desc", "details"]).unwrap_or_default()
+}
+
+fn loopspace_df_split_refs(value: Option<String>) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    value
+        .unwrap_or_default()
+        .split('|')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter_map(|value| {
+            if seen.insert(value.to_string()) {
+                Some(json!(value))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn loopspace_df_normalize_document_write_operation(value: Option<String>) -> String {
+    let normalized = value
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-'], "_");
+    match normalized.as_str() {
+        "replace" | "overwrite" | "set" => "replace",
+        "prepend" | "prepend_or_create" => "prepend",
+        "create" | "create_if_missing" | "create_only" => "create_if_missing",
+        "delete" | "del" | "remove" => "delete",
+        _ => "append",
+    }
+    .to_string()
+}
+
+fn loopspace_df_normalize_asset_write_operation(value: Option<String>) -> String {
+    let normalized = value
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-'], "_");
+    match normalized.as_str() {
+        "replace" | "overwrite" | "update" | "set" => "replace",
+        "create" | "create_if_missing" | "create_only" | "if_missing" => "create_if_missing",
+        "delete" | "del" | "remove" | "unlink" => "delete",
+        _ => "add_version",
+    }
+    .to_string()
+}
+
+fn loopspace_df_resource_entry(node: &LoopspaceDfNode, resource_kind: &str) -> Value {
+    let create_name =
+        loopspace_df_prop(&node.props, &["create_name", "createName", "name"]).unwrap_or_default();
+    let refs = if resource_kind == "asset" {
+        loopspace_df_split_refs(loopspace_df_prop(
+            &node.props,
+            &["asset_refs", "assets", "asset_id", "path_key"],
+        ))
+    } else {
+        loopspace_df_split_refs(loopspace_df_prop(
+            &node.props,
+            &["doc_refs", "documents", "path_key"],
+        ))
+    };
+    let operation = match node.kind.as_str() {
+        "document_write" => loopspace_df_normalize_document_write_operation(loopspace_df_prop(
+            &node.props,
+            &[
+                "operation",
+                "write_operation",
+                "writeOperation",
+                "document_operation",
+                "documentOperation",
+            ],
+        )),
+        "asset_write" => loopspace_df_normalize_asset_write_operation(loopspace_df_prop(
+            &node.props,
+            &[
+                "operation",
+                "write_operation",
+                "writeOperation",
+                "asset_operation",
+                "assetOperation",
+            ],
+        )),
+        _ => String::new(),
+    };
+    let content_template = if node.kind == "document_write" || node.kind == "asset_write" {
+        loopspace_df_prop(
+            &node.props,
+            &[
+                "content_template",
+                "contentTemplate",
+                "template",
+                "body_template",
+                "bodyTemplate",
+            ],
+        )
+        .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let target_mode =
+        loopspace_df_prop(&node.props, &["target_mode", "targetMode"]).unwrap_or_default();
+    let label = if !node.label.trim().is_empty() {
+        node.label.clone()
+    } else if !create_name.trim().is_empty() {
+        create_name.clone()
+    } else if resource_kind == "asset" {
+        "Asset".to_string()
+    } else {
+        "Document".to_string()
+    };
+    json!({
+        "contentTemplate": content_template,
+        "content_template": content_template,
+        "createName": create_name,
+        "create_name": create_name,
+        "id": node.id,
+        "kind": if node.kind.trim().is_empty() { resource_kind } else { node.kind.as_str() },
+        "label": label,
+        "node_id": node.id,
+        "operation": operation,
+        "refs": refs,
+        "targetMode": target_mode,
+        "target_mode": target_mode,
+    })
+}
+
+fn loopspace_df_push_unique_resource(context: &mut Map<String, Value>, key: &str, entry: Value) {
+    let id = entry["id"].as_str().unwrap_or_default().trim().to_string();
+    if id.is_empty() {
+        return;
+    }
+    let array = context
+        .entry(key.to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(values) = array.as_array_mut() else {
+        return;
+    };
+    if values
+        .iter()
+        .any(|value| value["id"].as_str() == Some(id.as_str()))
+    {
+        return;
+    }
+    values.push(entry);
+}
+
+fn loopspace_df_resource_context_for_step(
+    ast: &LoopspaceDfAst,
+    node_by_id: &HashMap<String, LoopspaceDfNode>,
+    step_id: &str,
+) -> Value {
+    let mut context = Map::from_iter([
+        ("readable_assets".to_string(), Value::Array(Vec::new())),
+        ("readable_documents".to_string(), Value::Array(Vec::new())),
+        ("writable_assets".to_string(), Value::Array(Vec::new())),
+        ("writable_documents".to_string(), Value::Array(Vec::new())),
+    ]);
+    let step_id = step_id.trim();
+    if step_id.is_empty() {
+        return Value::Object(context);
+    }
+    for edge in &ast.edges {
+        let from_port = edge.from_port.trim().to_ascii_lowercase();
+        let to_port = edge.to_port.trim().to_ascii_lowercase();
+        if edge.to == step_id && to_port == "in" {
+            if let Some(from_node) = node_by_id.get(&edge.from) {
+                match from_node.kind.as_str() {
+                    "document_read" | "document_write" if from_port == "docs" => {
+                        loopspace_df_push_unique_resource(
+                            &mut context,
+                            "readable_documents",
+                            loopspace_df_resource_entry(from_node, "document"),
+                        );
+                    }
+                    "asset_read" | "asset_write" if from_port == "assets" => {
+                        loopspace_df_push_unique_resource(
+                            &mut context,
+                            "readable_assets",
+                            loopspace_df_resource_entry(from_node, "asset"),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if edge.from == step_id && to_port == "in" {
+            if let Some(to_node) = node_by_id.get(&edge.to) {
+                match to_node.kind.as_str() {
+                    "document_write" if from_port == "docs" => {
+                        loopspace_df_push_unique_resource(
+                            &mut context,
+                            "writable_documents",
+                            loopspace_df_resource_entry(to_node, "document"),
+                        );
+                    }
+                    "asset_write" if from_port == "assets" => {
+                        loopspace_df_push_unique_resource(
+                            &mut context,
+                            "writable_assets",
+                            loopspace_df_resource_entry(to_node, "asset"),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Value::Object(context)
+}
+
+fn loopspace_df_resource_context_has_content(context: &Value) -> bool {
+    [
+        "readable_documents",
+        "writable_documents",
+        "readable_assets",
+        "writable_assets",
+    ]
+    .iter()
+    .any(|key| {
+        context[*key]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    })
+}
+
+fn loopspace_df_checkpoint_plan(ast: &LoopspaceDfAst, parent_id: &str) -> Vec<Value> {
+    let node_by_id = ast
+        .nodes
+        .iter()
+        .map(|node| (node.id.clone(), node.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut checkpoints = ast
+        .nodes
+        .iter()
+        .filter(|node| {
+            loopspace_df_node_parent_id(node) == parent_id && loopspace_df_node_is_step(node)
+        })
+        .enumerate()
+        .map(|(index, node)| {
+            let order = loopspace_df_step_order(node, index + 1);
+            let resource_context =
+                loopspace_df_resource_context_for_step(ast, &node_by_id, &node.id);
+            let mut checkpoint = Map::new();
+            checkpoint.insert("id".to_string(), json!(node.id));
+            checkpoint.insert("index".to_string(), json!(index + 1));
+            checkpoint.insert(
+                "label".to_string(),
+                json!(loopspace_df_step_title(node, index)),
+            );
+            checkpoint.insert("order".to_string(), json!(order));
+            if loopspace_df_resource_context_has_content(&resource_context) {
+                checkpoint.insert("resourceContext".to_string(), resource_context.clone());
+                checkpoint.insert("resource_context".to_string(), resource_context);
+            }
+            Value::Object(checkpoint)
+        })
+        .collect::<Vec<_>>();
+    checkpoints.sort_by(|left, right| {
+        let left_order = left["order"].as_u64().unwrap_or(u64::MAX);
+        let right_order = right["order"].as_u64().unwrap_or(u64::MAX);
+        left_order
+            .cmp(&right_order)
+            .then_with(|| {
+                left["label"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .cmp(right["label"].as_str().unwrap_or_default())
+            })
+            .then_with(|| {
+                left["id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .cmp(right["id"].as_str().unwrap_or_default())
+            })
+    });
+    for (index, checkpoint) in checkpoints.iter_mut().enumerate() {
+        if let Some(object) = checkpoint.as_object_mut() {
+            object.insert("index".to_string(), json!(index + 1));
+        }
+    }
+    checkpoints
+}
+
+fn loopspace_df_summary_prop(
+    props: &Map<String, Value>,
+    aliases: &[&str],
+    output_key: &str,
+    summary: &mut Map<String, Value>,
+) {
+    if let Some(value) = loopspace_df_prop(props, aliases) {
+        if !value.trim().is_empty() {
+            summary.insert(output_key.to_string(), json!(value));
+        }
+    }
+}
+
+fn loopspace_df_node_summary(node: &LoopspaceDfNode, index: usize) -> Value {
+    let parent_id = loopspace_df_node_parent_id(node);
+    let mut summary = Map::new();
+    summary.insert("id".to_string(), json!(node.id));
+    summary.insert("index".to_string(), json!(index));
+    summary.insert("kind".to_string(), json!(node.kind));
+    summary.insert("label".to_string(), json!(node.label));
+    if !parent_id.is_empty() {
+        summary.insert("parent_id".to_string(), json!(parent_id.clone()));
+        summary.insert("parentId".to_string(), json!(parent_id));
+    }
+    if loopspace_df_node_is_step(node) {
+        summary.insert(
+            "title".to_string(),
+            json!(loopspace_df_step_title(node, index)),
+        );
+        summary.insert(
+            "description".to_string(),
+            json!(loopspace_df_step_description(node)),
+        );
+        summary.insert(
+            "order".to_string(),
+            json!(loopspace_df_step_order(node, index + 1)),
+        );
+    }
+    if node.kind == "dispatch_todos" {
+        let fields: &[(&str, &[&str])] = &[
+            ("device_id", &["device_id", "deviceId"]),
+            ("device_label", &["device_label", "deviceLabel"]),
+            (
+                "dispatch_mode",
+                &[
+                    "dispatch_mode",
+                    "dispatchMode",
+                    "send_mode",
+                    "sendMode",
+                    "mode",
+                ],
+            ),
+            ("enable_wait_ms", &["enable_wait_ms", "enableWaitMs"]),
+            ("model", &["model", "model_id", "modelId"]),
+            ("reasoning_effort", &["reasoning_effort", "reasoningEffort"]),
+            ("speed", &["speed", "service_tier", "serviceTier"]),
+            (
+                "target_agent_id",
+                &["target_agent_id", "targetAgentId", "agent_id", "agentId"],
+            ),
+            (
+                "target_device_id",
+                &[
+                    "target_device_id",
+                    "targetDeviceId",
+                    "device_id",
+                    "deviceId",
+                ],
+            ),
+            (
+                "target_device_label",
+                &[
+                    "target_device_label",
+                    "targetDeviceLabel",
+                    "device_label",
+                    "deviceLabel",
+                ],
+            ),
+            (
+                "target_terminal_id",
+                &[
+                    "target_terminal_id",
+                    "targetTerminalId",
+                    "terminal_id",
+                    "terminalId",
+                    "pane_id",
+                    "paneId",
+                ],
+            ),
+            (
+                "target_terminal_index",
+                &[
+                    "target_terminal_index",
+                    "targetTerminalIndex",
+                    "terminal_index",
+                    "terminalIndex",
+                ],
+            ),
+            (
+                "target_terminal_mode",
+                &[
+                    "target_terminal_mode",
+                    "targetTerminalMode",
+                    "terminal_mode",
+                    "terminalMode",
+                ],
+            ),
+            (
+                "target_terminal_name",
+                &[
+                    "target_terminal_name",
+                    "targetTerminalName",
+                    "terminal_name",
+                    "terminalName",
+                ],
+            ),
+            (
+                "target_thread_id",
+                &[
+                    "target_thread_id",
+                    "targetThreadId",
+                    "thread_id",
+                    "threadId",
+                ],
+            ),
+            (
+                "target_workspace_ids",
+                &[
+                    "target_workspace_ids",
+                    "targetWorkspaceIds",
+                    "workspace_ids",
+                    "workspaceIds",
+                    "workspace_id",
+                    "workspaceId",
+                ],
+            ),
+            (
+                "todo_batch_id",
+                &["todo_batch_id", "todoBatchId", "batch_id", "batchId"],
+            ),
+            (
+                "todo_lines",
+                &[
+                    "todo_lines",
+                    "todoLines",
+                    "todos",
+                    "items",
+                    "prompt",
+                    "text",
+                ],
+            ),
+        ];
+        for (output_key, aliases) in fields {
+            loopspace_df_summary_prop(&node.props, aliases, output_key, &mut summary);
+        }
+    }
+    if node.kind == "send_message" {
+        let fields: &[(&str, &[&str])] = &[
+            ("device_id", &["device_id", "deviceId"]),
+            ("device_label", &["device_label", "deviceLabel"]),
+            ("model", &["model", "model_id", "modelId"]),
+            ("prompt", &["prompt", "message", "body", "instructions"]),
+            ("reasoning_effort", &["reasoning_effort", "reasoningEffort"]),
+            ("speed", &["speed", "service_tier", "serviceTier"]),
+            (
+                "target_agent_id",
+                &["target_agent_id", "targetAgentId", "agent_id", "agentId"],
+            ),
+            (
+                "target_device_id",
+                &[
+                    "target_device_id",
+                    "targetDeviceId",
+                    "device_id",
+                    "deviceId",
+                ],
+            ),
+            (
+                "target_device_label",
+                &[
+                    "target_device_label",
+                    "targetDeviceLabel",
+                    "device_label",
+                    "deviceLabel",
+                ],
+            ),
+            (
+                "target_terminal_id",
+                &[
+                    "target_terminal_id",
+                    "targetTerminalId",
+                    "terminal_id",
+                    "terminalId",
+                    "pane_id",
+                    "paneId",
+                ],
+            ),
+            (
+                "target_terminal_name",
+                &[
+                    "target_terminal_name",
+                    "targetTerminalName",
+                    "terminal_name",
+                    "terminalName",
+                ],
+            ),
+        ];
+        for (output_key, aliases) in fields {
+            loopspace_df_summary_prop(&node.props, aliases, output_key, &mut summary);
+        }
+    }
+    if node.kind == "document_read" || node.kind == "document_write" {
+        summary.insert(
+            "resource".to_string(),
+            loopspace_df_resource_entry(node, "document"),
+        );
+    }
+    if node.kind == "asset_read" || node.kind == "asset_write" {
+        summary.insert(
+            "resource".to_string(),
+            loopspace_df_resource_entry(node, "asset"),
+        );
+    }
+    Value::Object(summary)
+}
+
+fn loopspace_df_edge_summary(edge: &LoopspaceDfEdge) -> Value {
+    json!({
+        "branch": edge.label,
+        "from": edge.from,
+        "fromPort": edge.from_port,
+        "from_port": edge.from_port,
+        "id": edge.id,
+        "to": edge.to,
+        "toPort": edge.to_port,
+        "to_port": edge.to_port,
+    })
+}
+
+fn loopspace_df_first_open_checkpoint(checkpoint_plan: &[Value]) -> Option<Value> {
+    checkpoint_plan
+        .iter()
+        .find(|checkpoint| {
+            !matches!(
+                checkpoint["status"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "completed" | "skipped"
+            )
+        })
+        .cloned()
+}
+
+fn loopspace_df_subloop_context(
+    ast: &LoopspaceDfAst,
+    node_id: &str,
+    checkpoint_plan: &[Value],
+) -> Option<Value> {
+    let node_by_id = ast
+        .nodes
+        .iter()
+        .map(|node| (node.id.clone(), node.clone()))
+        .collect::<HashMap<_, _>>();
+    let parent_node = node_by_id.get(node_id)?;
+    let mut adjacency: HashMap<String, HashSet<String>> = HashMap::new();
+    for node in &ast.nodes {
+        adjacency.entry(node.id.clone()).or_default();
+        let parent_id = loopspace_df_node_parent_id(node);
+        if !parent_id.is_empty() {
+            adjacency
+                .entry(node.id.clone())
+                .or_default()
+                .insert(parent_id.clone());
+            adjacency
+                .entry(parent_id)
+                .or_default()
+                .insert(node.id.clone());
+        }
+    }
+    for edge in &ast.edges {
+        adjacency
+            .entry(edge.from.clone())
+            .or_default()
+            .insert(edge.to.clone());
+        adjacency
+            .entry(edge.to.clone())
+            .or_default()
+            .insert(edge.from.clone());
+    }
+    let mut selected = HashSet::new();
+    let mut queue = VecDeque::from([node_id.to_string()]);
+    while let Some(current) = queue.pop_front() {
+        if current.trim().is_empty() || !selected.insert(current.clone()) {
+            continue;
+        }
+        if let Some(next_values) = adjacency.get(&current) {
+            for next in next_values {
+                if !selected.contains(next) {
+                    queue.push_back(next.clone());
+                }
+            }
+        }
+    }
+    let selected_nodes = ast
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| selected.contains(&node.id))
+        .map(|(index, node)| loopspace_df_node_summary(node, index))
+        .collect::<Vec<_>>();
+    let selected_edges = ast
+        .edges
+        .iter()
+        .filter(|edge| selected.contains(&edge.from) && selected.contains(&edge.to))
+        .map(loopspace_df_edge_summary)
+        .collect::<Vec<_>>();
+    let current_checkpoint = loopspace_df_first_open_checkpoint(checkpoint_plan);
+    let parent_summary = loopspace_df_node_summary(parent_node, 0);
+    let current = current_checkpoint
+        .clone()
+        .unwrap_or_else(|| parent_summary.clone());
+    Some(json!({
+        "checkpointPlan": checkpoint_plan,
+        "checkpoint_plan": checkpoint_plan,
+        "current": current,
+        "currentCheckpoint": current_checkpoint,
+        "current_checkpoint": current_checkpoint,
+        "edges": selected_edges,
+        "nodeCount": selected_nodes.len(),
+        "node_count": selected_nodes.len(),
+        "nodes": selected_nodes,
+        "parentNode": parent_summary,
+        "parent_node": parent_summary,
+        "source": "connected_subloop",
+    }))
+}
+
+fn loopspace_df_context_error(
+    code: &str,
+    message: &str,
+    loopspace_id: Option<&str>,
+    loop_runtime_run_id: Option<&str>,
+    loop_runtime_node_id: Option<&str>,
+    loop_runtime_edge_id: Option<&str>,
+    trigger_id: Option<&str>,
+    trigger_run_id: Option<&str>,
+) -> Value {
+    json!({
+        "ok": false,
+        "error": {
+            "code": code,
+            "message": message,
+        },
+        "loopspaceId": loopspace_id.unwrap_or_default(),
+        "loopspace_id": loopspace_id.unwrap_or_default(),
+        "loopRuntimeRunId": loop_runtime_run_id.unwrap_or_default(),
+        "loop_runtime_run_id": loop_runtime_run_id.unwrap_or_default(),
+        "loopRuntimeNodeId": loop_runtime_node_id.unwrap_or_default(),
+        "loop_runtime_node_id": loop_runtime_node_id.unwrap_or_default(),
+        "loopRuntimeEdgeId": loop_runtime_edge_id.unwrap_or_default(),
+        "loop_runtime_edge_id": loop_runtime_edge_id.unwrap_or_default(),
+        "triggerId": trigger_id.unwrap_or_default(),
+        "trigger_id": trigger_id.unwrap_or_default(),
+        "triggerRunId": trigger_run_id.unwrap_or_default(),
+        "trigger_run_id": trigger_run_id.unwrap_or_default(),
+    })
+}
+
+fn loopspace_df_run_context_from_source(
+    source: &str,
+    loopspace_id: &str,
+    loop_runtime_run_id: &str,
+    loop_runtime_node_id: &str,
+    loop_runtime_edge_id: &str,
+    trigger_id: &str,
+    trigger_run_id: &str,
+) -> Value {
+    let ast = loopspace_df_parse_source(source);
+    let Some(parent_node) = ast
+        .nodes
+        .iter()
+        .find(|node| node.id == loop_runtime_node_id)
+    else {
+        return loopspace_df_context_error(
+            "loopspace_runtime_node_missing",
+            "The Loopspace runtime node was not found in the local graph mirror.",
+            Some(loopspace_id),
+            Some(loop_runtime_run_id),
+            Some(loop_runtime_node_id),
+            Some(loop_runtime_edge_id),
+            Some(trigger_id),
+            Some(trigger_run_id),
+        );
+    };
+    let checkpoint_plan = loopspace_df_checkpoint_plan(&ast, loop_runtime_node_id);
+    let Some(subloop) = loopspace_df_subloop_context(&ast, loop_runtime_node_id, &checkpoint_plan)
+    else {
+        return loopspace_df_context_error(
+            "loopspace_subloop_unavailable",
+            "Unable to isolate the connected subloop for this Loopspace run.",
+            Some(loopspace_id),
+            Some(loop_runtime_run_id),
+            Some(loop_runtime_node_id),
+            Some(loop_runtime_edge_id),
+            Some(trigger_id),
+            Some(trigger_run_id),
+        );
+    };
+    let current_checkpoint = subloop["currentCheckpoint"].clone();
+    let parent_summary = loopspace_df_node_summary(parent_node, 0);
+    let current_action = if checkpoint_plan.is_empty() {
+        parent_summary
+    } else {
+        current_checkpoint.clone()
+    };
+    json!({
+        "ok": true,
+        "checkpointPlan": checkpoint_plan,
+        "checkpoint_plan": checkpoint_plan,
+        "current": current_action,
+        "currentAction": current_action,
+        "currentCheckpoint": current_checkpoint,
+        "current_action": current_action,
+        "current_checkpoint": current_checkpoint,
+        "graphSourceKind": "local_mirror",
+        "graph_source_kind": "local_mirror",
+        "instructions": "This Loopspace run context was injected by coordination-kernel.start_task. It is the connected subloop for the current run, not the full graph. The current action is the main Dispatch Todo for direct runs or the first/current child checkpoint for stepped runs. Use the docs/assets resources exactly; for Write docs prepare a draft and save it before marking the checkpoint completed. Work the current checkpoint/action, then call record_loopspace_step_progress and use its nextCheckpoint response to continue.",
+        "loopRuntimeEdgeId": loop_runtime_edge_id,
+        "loopRuntimeNodeId": loop_runtime_node_id,
+        "loopRuntimeRunId": loop_runtime_run_id,
+        "loop_runtime_edge_id": loop_runtime_edge_id,
+        "loop_runtime_node_id": loop_runtime_node_id,
+        "loop_runtime_run_id": loop_runtime_run_id,
+        "loopspaceId": loopspace_id,
+        "loopspace_id": loopspace_id,
+        "subloop": subloop,
+        "triggerId": trigger_id,
+        "triggerRunId": trigger_run_id,
+        "trigger_id": trigger_id,
+        "trigger_run_id": trigger_run_id,
+    })
+}
+
+fn loopspace_df_compact_line_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn loopspace_df_value_text(value: &Value, keys: &[&str]) -> String {
+    for key in keys {
+        let Some(candidate) = value.get(*key) else {
+            continue;
+        };
+        let Some(text) = loopspace_runtime_value_text(candidate) else {
+            continue;
+        };
+        let text = loopspace_df_compact_line_text(&text);
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    String::new()
+}
+
+fn loopspace_df_context_run_values(context: &Value) -> Vec<String> {
+    [
+        loopspace_df_value_text(context, &["loopspace_id", "loopspaceId"]),
+        loopspace_df_value_text(
+            context,
+            &["loop_runtime_run_id", "loopRuntimeRunId", "run_id", "runId"],
+        ),
+        loopspace_df_value_text(
+            context,
+            &[
+                "loop_runtime_node_id",
+                "loopRuntimeNodeId",
+                "node_id",
+                "nodeId",
+            ],
+        ),
+        loopspace_df_value_text(
+            context,
+            &[
+                "loop_runtime_edge_id",
+                "loopRuntimeEdgeId",
+                "edge_id",
+                "edgeId",
+            ],
+        ),
+        loopspace_df_value_text(context, &["trigger_id", "triggerId"]),
+        loopspace_df_value_text(context, &["trigger_run_id", "triggerRunId"]),
+    ]
+    .into_iter()
+    .filter(|value| !value.is_empty())
+    .collect()
+}
+
+fn loopspace_df_compact_resource_name(resource: &Value) -> String {
+    if let Some(refs) = resource.get("refs") {
+        if let Some(values) = refs.as_array() {
+            for value in values {
+                if let Some(text) = loopspace_runtime_value_text(value) {
+                    let text = loopspace_df_compact_line_text(&text);
+                    if !text.is_empty() {
+                        return text;
+                    }
+                }
+            }
+        } else if let Some(text) = loopspace_runtime_value_text(refs) {
+            let text = loopspace_df_compact_line_text(&text);
+            if !text.is_empty() {
+                return text;
+            }
+        }
+    }
+    let text = loopspace_df_value_text(
+        resource,
+        &[
+            "path_key",
+            "pathKey",
+            "create_name",
+            "createName",
+            "label",
+            "title",
+            "name",
+            "id",
+        ],
+    );
+    if text.is_empty() {
+        "resource".to_string()
+    } else {
+        text
+    }
+}
+
+fn loopspace_df_compact_resource_lines(step_id: &str, checkpoint: &Value) -> Vec<String> {
+    let resource_context = checkpoint
+        .get("resource_context")
+        .or_else(|| checkpoint.get("resourceContext"))
+        .or_else(|| checkpoint.get("resources"))
+        .unwrap_or(&Value::Null);
+    let mut lines = Vec::new();
+    for (keys, tag) in [
+        (&["readable_documents", "readableDocuments"][..], "rd"),
+        (&["writable_documents", "writableDocuments"][..], "wd"),
+        (&["readable_assets", "readableAssets"][..], "ra"),
+        (&["writable_assets", "writableAssets"][..], "wa"),
+    ] {
+        let Some(resources) = keys
+            .iter()
+            .find_map(|key| resource_context.get(*key).and_then(Value::as_array))
+        else {
+            continue;
+        };
+        for resource in resources {
+            let name = loopspace_df_compact_resource_name(resource);
+            let operation = loopspace_df_value_text(resource, &["operation", "op"]);
+            let create_name = loopspace_df_value_text(resource, &["create_name", "createName"]);
+            let target_mode = loopspace_df_value_text(resource, &["target_mode", "targetMode"]);
+            let template = loopspace_df_value_text(
+                resource,
+                &["content_template", "contentTemplate", "template"],
+            );
+            let mut extras = Vec::new();
+            if !operation.is_empty() {
+                extras.push(format!("op={operation}"));
+            }
+            if !create_name.is_empty() && create_name != name {
+                extras.push(format!("create={create_name}"));
+            }
+            if !target_mode.is_empty() {
+                extras.push(format!("mode={target_mode}"));
+            }
+            if !template.is_empty() {
+                extras.push(format!("template={template}"));
+            }
+            let suffix = if extras.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", extras.join(" "))
+            };
+            lines.push(format!("{step_id} {tag} {name}{suffix}"));
+        }
+    }
+    lines
+}
+
+fn loopspace_df_node_kind_map(subloop: &Value) -> HashMap<String, String> {
+    let mut values = HashMap::new();
+    if let Some(nodes) = subloop.get("nodes").and_then(Value::as_array) {
+        for node in nodes {
+            let id = loopspace_df_value_text(node, &["id"]);
+            let kind = loopspace_df_value_text(node, &["kind", "type"]);
+            if !id.is_empty() {
+                values.insert(id, kind);
+            }
+        }
+    }
+    values
+}
+
+fn loopspace_df_kind_is_resource(kind: &str) -> bool {
+    matches!(
+        kind,
+        "document_read" | "document_write" | "asset_read" | "asset_write"
+    )
+}
+
+fn loopspace_df_compact_flow_lines(subloop: &Value) -> Vec<String> {
+    let node_kinds = loopspace_df_node_kind_map(subloop);
+    subloop
+        .get("edges")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|edge| {
+            let from = loopspace_df_value_text(edge, &["from"]);
+            let to = loopspace_df_value_text(edge, &["to"]);
+            if from.is_empty() || to.is_empty() {
+                return None;
+            }
+            if node_kinds
+                .get(&from)
+                .is_some_and(|kind| loopspace_df_kind_is_resource(kind))
+                || node_kinds
+                    .get(&to)
+                    .is_some_and(|kind| loopspace_df_kind_is_resource(kind))
+            {
+                return None;
+            }
+            let branch = loopspace_df_value_text(edge, &["branch", "label"]);
+            let suffix = if branch.is_empty() {
+                String::new()
+            } else {
+                format!(" {branch}")
+            };
+            Some(format!("{from} -> {to}{suffix}"))
+        })
+        .collect()
+}
+
+fn loopspace_df_compact_run_context_packet(context: &Value) -> String {
+    let mut lines = vec!["LS/1 run_context".to_string()];
+    let run_values = loopspace_df_context_run_values(context);
+    if !run_values.is_empty() {
+        lines.push(format!("r {}", run_values.join(" ")));
+    }
+    if context["ok"].as_bool() == Some(false) {
+        let code = loopspace_df_value_text(&context["error"], &["code"]);
+        let message = loopspace_df_value_text(&context["error"], &["message"]);
+        lines.push(format!("err {code} {message}").trim().to_string());
+        return lines.join("\n");
+    }
+
+    let subloop = context.get("subloop").unwrap_or(&Value::Null);
+    let parent = subloop
+        .get("parentNode")
+        .or_else(|| subloop.get("parent_node"))
+        .unwrap_or(&Value::Null);
+    if parent.is_object() {
+        let id = loopspace_df_value_text(parent, &["id"]);
+        let kind = loopspace_df_value_text(parent, &["kind", "type"]);
+        let label = loopspace_df_value_text(parent, &["label", "title", "name"]);
+        let mut line = format!("parent {id} {kind}").trim().to_string();
+        if !label.is_empty() && label != id {
+            line.push(' ');
+            line.push_str(&label);
+        }
+        if !line.trim().is_empty() {
+            lines.push(line);
+        }
+        let todo = loopspace_df_value_text(parent, &["todo_lines", "todoLines", "todo", "text"]);
+        if !todo.is_empty() {
+            lines.push(format!("todo: {todo}"));
+        }
+        let workspace = loopspace_df_value_text(
+            parent,
+            &[
+                "target_workspace_ids",
+                "targetWorkspaceIds",
+                "workspace_id",
+                "workspaceId",
+            ],
+        );
+        let terminal = loopspace_df_value_text(
+            parent,
+            &["target_terminal_mode", "targetTerminalMode", "terminal"],
+        );
+        let mut target = Vec::new();
+        if !workspace.is_empty() {
+            target.push(workspace);
+        }
+        if !terminal.is_empty() {
+            target.push(format!("terminal={terminal}"));
+        }
+        if !target.is_empty() {
+            lines.push(format!("target {}", target.join(" ")));
+        }
+    }
+
+    let current = context
+        .get("currentAction")
+        .or_else(|| context.get("current_action"))
+        .or_else(|| context.get("current"))
+        .unwrap_or(&Value::Null);
+    if current.is_object() {
+        let id = loopspace_df_value_text(
+            current,
+            &["id", "step_id", "stepId", "checkpoint_id", "checkpointId"],
+        );
+        let kind = loopspace_df_value_text(current, &["kind", "type"]);
+        let label = loopspace_df_value_text(current, &["label", "title", "name"]);
+        let kind = if kind.is_empty() && !id.is_empty() {
+            "checkpoint".to_string()
+        } else {
+            kind
+        };
+        let mut line = format!("current {id} {kind}").trim().to_string();
+        if !label.is_empty() && label != id {
+            line.push(' ');
+            line.push_str(&label);
+        }
+        if !line.trim().is_empty() {
+            lines.push(line);
+        }
+    }
+
+    let flow_lines = loopspace_df_compact_flow_lines(subloop);
+    if !flow_lines.is_empty() {
+        lines.push("subloop:".to_string());
+        lines.extend(flow_lines);
+    }
+
+    let checkpoints = context
+        .get("checkpointPlan")
+        .or_else(|| context.get("checkpoint_plan"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut resource_lines = Vec::new();
+    let mut has_writable_docs = false;
+    if !checkpoints.is_empty() {
+        lines.push("steps:".to_string());
+        for (index, checkpoint) in checkpoints.iter().enumerate() {
+            let mut step_id = loopspace_df_value_text(
+                checkpoint,
+                &["id", "step_id", "stepId", "checkpoint_id", "checkpointId"],
+            );
+            if step_id.is_empty() {
+                step_id = format!("step_{}", index + 1);
+            }
+            let mut label = loopspace_df_value_text(checkpoint, &["label", "title", "name"]);
+            if label.is_empty() {
+                label = format!("Step {}", index + 1);
+            }
+            lines.push(format!("{} {step_id} checkpoint {label}", index + 1));
+            if checkpoint
+                .get("resource_context")
+                .or_else(|| checkpoint.get("resourceContext"))
+                .and_then(|resources| {
+                    resources
+                        .get("writable_documents")
+                        .or_else(|| resources.get("writableDocuments"))
+                })
+                .and_then(Value::as_array)
+                .is_some_and(|values| !values.is_empty())
+            {
+                has_writable_docs = true;
+            }
+            resource_lines.extend(loopspace_df_compact_resource_lines(&step_id, checkpoint));
+        }
+    }
+    if !resource_lines.is_empty() {
+        lines.push("resources:".to_string());
+        lines.extend(resource_lines);
+    }
+    if has_writable_docs {
+        lines.push("docs wd=prepare_doc_draft->save_doc canonical=read_only".to_string());
+    }
+    lines.push("done checkpoint=record_loopspace_step_progress final=todo_status".to_string());
+    lines.join("\n")
+}
+
+fn loopspace_df_compact_run_context_value(context: &Value) -> Value {
+    if let Some(text) = context.as_str() {
+        return json!(text);
+    }
+    json!(loopspace_df_compact_run_context_packet(context))
+}
+
+fn start_task_loopspace_run_context_for_agent(input: &Value, cloud: &Value) -> Option<Value> {
+    if let Some(context) =
+        loopspace_runtime_context_value(input).or_else(|| loopspace_runtime_context_value(cloud))
+    {
+        return Some(loopspace_df_compact_run_context_value(&context));
+    }
+
+    let loop_runtime_run_id = loopspace_runtime_field_text_from_start(
+        input,
+        cloud,
+        &["loop_runtime_run_id", "loopRuntimeRunId", "run_id", "runId"],
+    )
+    .unwrap_or_default();
+    let loop_runtime_node_id = loopspace_runtime_field_text_from_start(
+        input,
+        cloud,
+        &[
+            "loop_runtime_node_id",
+            "loopRuntimeNodeId",
+            "node_id",
+            "nodeId",
+        ],
+    )
+    .unwrap_or_default();
+    if loop_runtime_run_id.trim().is_empty() && loop_runtime_node_id.trim().is_empty() {
+        return None;
+    }
+
+    let loopspace_id = loopspace_runtime_field_text_from_start(
+        input,
+        cloud,
+        &["loopspace_id", "loopspaceId", "loopspaceID"],
+    )
+    .unwrap_or_default();
+    let loop_runtime_edge_id = loopspace_runtime_field_text_from_start(
+        input,
+        cloud,
+        &[
+            "loop_runtime_edge_id",
+            "loopRuntimeEdgeId",
+            "edge_id",
+            "edgeId",
+        ],
+    )
+    .unwrap_or_default();
+    let trigger_id =
+        loopspace_runtime_field_text_from_start(input, cloud, &["trigger_id", "triggerId"])
+            .unwrap_or_default();
+    let trigger_run_id =
+        loopspace_runtime_field_text_from_start(input, cloud, &["trigger_run_id", "triggerRunId"])
+            .unwrap_or_default();
+
+    if loopspace_id.trim().is_empty() || loop_runtime_node_id.trim().is_empty() {
+        let context = loopspace_df_context_error(
+            "loopspace_runtime_context_required",
+            "Loopspace start_task context requires loopspace_id and loop_runtime_node_id.",
+            Some(&loopspace_id),
+            Some(&loop_runtime_run_id),
+            Some(&loop_runtime_node_id),
+            Some(&loop_runtime_edge_id),
+            Some(&trigger_id),
+            Some(&trigger_run_id),
+        );
+        return Some(loopspace_df_compact_run_context_value(&context));
+    }
+
+    let source = match crate::cloud_mcp_loopspace_graph_source_from_local_mirror(&loopspace_id) {
+        Ok(Some(source)) if !source.trim().is_empty() => source,
+        Ok(_) => {
+            let context = loopspace_df_context_error(
+                "loopspace_graph_unavailable",
+                "Unable to resolve the Loopspace graph from the local Cloud mirror.",
+                Some(&loopspace_id),
+                Some(&loop_runtime_run_id),
+                Some(&loop_runtime_node_id),
+                Some(&loop_runtime_edge_id),
+                Some(&trigger_id),
+                Some(&trigger_run_id),
+            );
+            return Some(loopspace_df_compact_run_context_value(&context));
+        }
+        Err(error) => {
+            let context = loopspace_df_context_error(
+                "loopspace_graph_unavailable",
+                &format!(
+                    "Unable to resolve the Loopspace graph from the local Cloud mirror: {error}"
+                ),
+                Some(&loopspace_id),
+                Some(&loop_runtime_run_id),
+                Some(&loop_runtime_node_id),
+                Some(&loop_runtime_edge_id),
+                Some(&trigger_id),
+                Some(&trigger_run_id),
+            );
+            return Some(loopspace_df_compact_run_context_value(&context));
+        }
+    };
+
+    let context = loopspace_df_run_context_from_source(
+        &source,
+        &loopspace_id,
+        &loop_runtime_run_id,
+        &loop_runtime_node_id,
+        &loop_runtime_edge_id,
+        &trigger_id,
+        &trigger_run_id,
+    );
+    Some(loopspace_df_compact_run_context_value(&context))
 }
 
 fn kernel_acquire_lease(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
@@ -6011,6 +7698,17 @@ fn kernel_checkpoint(kernel: &CoordinationKernel, input: &Value) -> Result<Value
             return Ok(api_error(
                 "start_task_required_before_checkpoint",
                 "Call start_task for this session and pass its returned task_id before checkpointing.",
+                json!({"task_id": task_id, "session_id": session_id}),
+            ));
+        }
+        if input["enforcement_mode"]
+            .as_str()
+            .is_some_and(|mode| mode == "direct_unmanaged")
+            && !mcp_loopspace_start_task_seen_for_task(kernel, task_id, session_id)?
+        {
+            return Ok(api_error(
+                "loopspace_start_task_required_before_checkpoint",
+                "Full-mode checkpoint is available only for Loopspace tasks that were started with loopspace runtime ids.",
                 json!({"task_id": task_id, "session_id": session_id}),
             ));
         }
@@ -6614,9 +8312,31 @@ fn mcp_start_task_seen_for_task(
     }))
 }
 
+fn mcp_loopspace_start_task_seen_for_task(
+    kernel: &CoordinationKernel,
+    task_id: &str,
+    session_id: &str,
+) -> Result<bool, String> {
+    let rows = kernel.query_json(
+        "SELECT payload_json
+         FROM events
+         WHERE task_id=?1
+           AND session_id=?2
+           AND event_type IN ('mcp_agent_tool_called', 'mcp_agent_tool_failed')
+         ORDER BY seq DESC
+         LIMIT 50",
+        &[&task_id, &session_id],
+    )?;
+    Ok(rows.into_iter().any(|event| {
+        event["payload_json"]["details"]["tool"].as_str() == Some("start_task")
+            && event["payload_json"]["details"]["ok"].as_bool() != Some(false)
+            && event["payload_json"]["details"]["loopspace_runtime"].as_bool() == Some(true)
+    }))
+}
+
 fn tool_description(name: &str) -> String {
     match name {
-        "start_task" => "Start the local coordination task only after read-only inspection, immediately before active work. Omit task_id on the first call; Rust creates the task immediately for leases, checkpoints, patches, or direct/activity completion. Cloud task/history sync is disabled; use todos for shared work state.".to_string(),
+        "start_task" => "Start the local coordination task only after read-only inspection, immediately before active work. Omit task_id on the first call; Rust creates the task immediately for leases, checkpoints, patches, or direct/activity completion. In Full/direct-unmanaged workspaces this tool is Loopspace-only: include loopspace_id plus loop_runtime_run_id/loop_runtime_node_id and wait for loopspace_run_context. For Loopspace Dispatch Todo runs, start_task injects loopspace_run_context as a compact LS/1 run_context packet with the connected subloop slice, current action/checkpoint, and exact docs/assets resources. Cloud task/history sync is disabled; use todos for shared work state and record_loopspace_step_progress for graph checkpoint progress.".to_string(),
         "list_todo_targets" => "List same-account device/workspace targets from the local Rust SQLite todo mirror. Rust sync keeps this mirror current; this tool does not refresh Cloud during the call.".to_string(),
         "get_todo_status" => "Return compact current status rows for todo batches, dispatch ids, todo ids, or target filters from the local Rust SQLite todo mirror only. Rust sync keeps this mirror current; this tool does not refresh Cloud during the call.".to_string(),
         "wait_for_todos" => "Wait inside the local Rust proxy over local SQLite todo status until selected todo dispatches satisfy until=terminal, accepted, or running, then return compact status. Do not manually sleep/poll from the coding agent.".to_string(),
@@ -6630,7 +8350,7 @@ fn tool_description(name: &str) -> String {
         "delete_local_asset" => "Delete this device's local asset file/copy and clear the active local path in the Rust SQLite mirror while preserving the Cloud copy for download later.".to_string(),
         "delete_cloud_asset" => "Delete the Cloud durable copy/reference for an asset, including backing blob storage when no active cloud references remain, while keeping any local file path recorded in the Rust SQLite mirror so it can be uploaded again.".to_string(),
         "acquire_lease" => "Acquire a lease for a task that was explicitly started in this session. You must pass the task_id returned by start_task; implicit session defaults are rejected.".to_string(),
-        "checkpoint" => "Send one short summary only while an active started task exists. You may also advance or revise the terminal todo plan with current/next/completed step fields, step title/detail fields, or step_updates. You must pass the task_id returned by start_task; read-only file inspection should not create checkpoints.".to_string(),
+        "checkpoint" => "Send one short summary only while an active started task exists. In Full/direct-unmanaged workspaces this is available only after a Loopspace start_task and is for local Loopspace step visibility, not ordinary Full-mode work. You may also advance or revise the terminal todo plan with current/next/completed step fields, step title/detail fields, or step_updates. You must pass the task_id returned by start_task; read-only file inspection should not create checkpoints.".to_string(),
         "complete_task" => "Mark a started direct, activity, or remote task complete without submitting a git worktree patch. You must pass the task_id returned by start_task.".to_string(),
         "submit_patch" => "Queue the current task patch for asynchronous validation and safe local integration. Returns submit_job_id quickly; poll submit_patch_status for progress.".to_string(),
         "submit_patch_status" => "Check an asynchronous submit_patch job by submit_job_id, or the latest submit job for a task.".to_string(),
@@ -6645,7 +8365,19 @@ fn tool_input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "task_id": {"type": "string", "description": "Optional existing task_id when continuing a previously started task. Omit this on the first call."},
-                "plan": {"type": "string", "description": "Required short explanation of the edit you are about to make. Do not call start_task for read-only inspection."}
+                "plan": {"type": "string", "description": "Required short explanation of the edit you are about to make. Do not call start_task for read-only inspection."},
+                "loopspace_id": {"type": "string", "description": "Optional Loopspace id for Dispatch Todo runtime context injection."},
+                "loopspaceId": {"type": "string", "description": "Optional camelCase Loopspace id."},
+                "loop_runtime_run_id": {"type": "string", "description": "Optional Loopspace runtime run id. When present with loopspace_id and loop_runtime_node_id, start_task returns compact LS/1 loopspace_run_context."},
+                "loopRuntimeRunId": {"type": "string", "description": "Optional camelCase Loopspace runtime run id."},
+                "loop_runtime_node_id": {"type": "string", "description": "Optional Loopspace runtime action node id for the connected subloop slice."},
+                "loopRuntimeNodeId": {"type": "string", "description": "Optional camelCase Loopspace runtime action node id."},
+                "loop_runtime_edge_id": {"type": "string", "description": "Optional Loopspace runtime edge id."},
+                "loopRuntimeEdgeId": {"type": "string", "description": "Optional camelCase Loopspace runtime edge id."},
+                "trigger_id": {"type": "string", "description": "Optional triggering Loopspace trigger id."},
+                "triggerId": {"type": "string", "description": "Optional camelCase triggering Loopspace trigger id."},
+                "trigger_run_id": {"type": "string", "description": "Optional triggering Loopspace run id."},
+                "triggerRunId": {"type": "string", "description": "Optional camelCase triggering Loopspace run id."}
             },
             "required": ["plan"],
             "additionalProperties": true
@@ -6903,6 +8635,94 @@ mod tests {
     }
 
     #[test]
+    fn loopspace_run_context_for_dispatch_steps_preserves_doc_resources() {
+        let source = r#"
+dfblueprint "Dispatch"
+node "Manual" [id: trig, kind: trigger]
+node "Dispatch Todo" [id: dispatch, kind: dispatch_todos, target_workspace_ids: "workspace-a", target_terminal_mode: auto, todo_lines: "Research the idea"]
+node "Blog Ideas Backlog" [id: doc_in, kind: document_read, doc_refs: "blog-ideas.md"]
+node "Step 1" [id: step_1, kind: step, parent_id: dispatch, title: Research, order: 1]
+node "Blog Draft" [id: doc_out, kind: document_write, create_name: "blog-draft.md", operation: append]
+edge trig.out -> dispatch.in
+edge doc_in.docs -> step_1.in
+edge step_1.docs -> doc_out.in
+"#;
+        let context = loopspace_df_run_context_from_source(
+            source,
+            "loop-1",
+            "run-1",
+            "dispatch",
+            "edge-trigger-dispatch",
+            "trigger-1",
+            "trigger-run-1",
+        );
+
+        assert_eq!(context["ok"].as_bool(), Some(true));
+        assert_eq!(context["loopspace_id"].as_str(), Some("loop-1"));
+        assert_eq!(context["loop_runtime_run_id"].as_str(), Some("run-1"));
+        assert_eq!(context["currentAction"]["id"].as_str(), Some("step_1"));
+        assert_eq!(context["currentCheckpoint"]["id"].as_str(), Some("step_1"));
+        assert_eq!(
+            context["subloop"]["parentNode"]["id"].as_str(),
+            Some("dispatch")
+        );
+        let first = &context["checkpointPlan"][0];
+        assert_eq!(first["label"].as_str(), Some("Research"));
+        assert_eq!(
+            first["resource_context"]["readable_documents"][0]["refs"][0].as_str(),
+            Some("blog-ideas.md")
+        );
+        assert_eq!(
+            first["resource_context"]["writable_documents"][0]["create_name"].as_str(),
+            Some("blog-draft.md")
+        );
+        assert_eq!(
+            first["resource_context"]["writable_documents"][0]["operation"].as_str(),
+            Some("append")
+        );
+
+        let packet = loopspace_df_compact_run_context_packet(&context);
+        assert!(packet.contains("LS/1 run_context"));
+        assert!(packet
+            .contains("r loop-1 run-1 dispatch edge-trigger-dispatch trigger-1 trigger-run-1"));
+        assert!(packet.contains("current step_1 checkpoint Research"));
+        assert!(packet.contains("1 step_1 checkpoint Research"));
+        assert!(packet.contains("step_1 rd blog-ideas.md"));
+        assert!(packet.contains("step_1 wd blog-draft.md op=append"));
+        assert!(packet.contains("docs wd=prepare_doc_draft->save_doc canonical=read_only"));
+        assert!(!packet.contains("checkpointPlan"));
+    }
+
+    #[test]
+    fn loopspace_run_context_for_direct_dispatch_uses_parent_action() {
+        let source = r#"
+dfblueprint "Dispatch"
+node "Manual" [id: trig, kind: trigger]
+node "Dispatch Todo" [id: dispatch, kind: dispatch_todos, target_workspace_ids: "workspace-a", target_terminal_mode: auto, todo_lines: "Do the thing"]
+edge trig.out -> dispatch.in
+"#;
+        let context =
+            loopspace_df_run_context_from_source(source, "loop-1", "run-1", "dispatch", "", "", "");
+
+        assert_eq!(context["ok"].as_bool(), Some(true));
+        assert_eq!(context["checkpointPlan"].as_array().unwrap().len(), 0);
+        assert_eq!(context["currentAction"]["id"].as_str(), Some("dispatch"));
+        assert_eq!(
+            context["currentAction"]["target_terminal_mode"].as_str(),
+            Some("auto")
+        );
+        assert_eq!(context["currentCheckpoint"], Value::Null);
+
+        let packet = loopspace_df_compact_run_context_packet(&context);
+        assert!(packet.contains("LS/1 run_context"));
+        assert!(packet.contains("parent dispatch dispatch_todos Dispatch Todo"));
+        assert!(packet.contains("todo: Do the thing"));
+        assert!(packet.contains("target workspace-a terminal=auto"));
+        assert!(packet.contains("current dispatch dispatch_todos Dispatch Todo"));
+        assert!(!packet.contains("steps:"));
+    }
+
+    #[test]
     fn workspace_gateway_video_look_content_emits_image_blocks() {
         let result = workspace_gateway_video_look_content(json!({
             "frames": [
@@ -6925,7 +8745,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_tools_are_hidden_for_direct_unmanaged_policy() {
+    fn lifecycle_tools_are_loopspace_scoped_for_direct_unmanaged_policy() {
         let repo = std::env::temp_dir().join(format!(
             "diffforge-mcp-direct-unmanaged-{}",
             std::time::SystemTime::now()
@@ -6947,10 +8767,17 @@ mod tests {
         };
         let tools = coordination_tools_for_context(&session_context);
         for tool in TERMINAL_SESSION_TOOL_NAMES {
-            assert!(
-                !tools.contains(tool),
-                "{tool} must be hidden in direct mode"
-            );
+            if DIRECT_UNMANAGED_LOOPSPACE_TOOL_NAMES.contains(tool) {
+                assert!(
+                    tools.contains(tool),
+                    "{tool} must remain visible for Loopspace runtime work in direct mode"
+                );
+            } else {
+                assert!(
+                    !tools.contains(tool),
+                    "{tool} must be hidden in direct mode"
+                );
+            }
         }
         for tool in [
             "list_assets",
@@ -6973,13 +8800,109 @@ mod tests {
             json!({"plan": "Patch code"}),
         );
         assert_eq!(denied["ok"].as_bool(), Some(false));
-        assert_eq!(denied["error"]["code"].as_str(), Some("unknown_tool"));
+        assert_eq!(
+            denied["error"]["code"].as_str(),
+            Some("loopspace_runtime_required")
+        );
+
+        let complete_denied = dispatch_tool(
+            &session_context,
+            "complete_task",
+            json!({"task_id": "task-1"}),
+        );
+        assert_eq!(complete_denied["ok"].as_bool(), Some(false));
+        assert_eq!(
+            complete_denied["error"]["code"].as_str(),
+            Some("unknown_tool")
+        );
 
         kernel
             .update_repo_policy(&json!({"agent_session_mode": "direct_coordination"}))
             .unwrap();
         let restored = coordination_tools_for_context(&session_context);
         assert!(restored.contains(&"start_task"));
+    }
+
+    #[test]
+    fn direct_unmanaged_loopspace_start_task_and_checkpoint_are_allowed() {
+        let repo = std::env::temp_dir().join(format!(
+            "diffforge-mcp-direct-unmanaged-loopspace-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&repo).unwrap();
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        kernel
+            .update_repo_policy(&json!({"agent_session_mode": "direct_unmanaged"}))
+            .unwrap();
+        let terminal = kernel
+            .prepare_terminal_context_for_slot(
+                "Codex",
+                "codex",
+                "1",
+                Some("pane-loopspace-direct"),
+                Some("workspace-loopspace-direct"),
+                Some("Loopspace Direct"),
+                None,
+                None,
+                None,
+                Some("epoch-loopspace-direct"),
+                Some("direct_unmanaged"),
+            )
+            .unwrap();
+        let session_context = McpContext {
+            repo_path: Some(repo.display().to_string()),
+            db_path: Some(kernel.paths.db_path.display().to_string()),
+            agent_id: Some(terminal.agent_id.clone()),
+            session_id: Some(terminal.session_id.clone()),
+            enforcement_mode: Some("direct_unmanaged".to_string()),
+            file_authority: Some("direct_unmanaged".to_string()),
+            completion_mode: Some("none".to_string()),
+            ..McpContext::default()
+        };
+
+        let started = dispatch_tool(
+            &session_context,
+            "start_task",
+            json!({
+                "plan": "Run the current Loopspace checkpoint.",
+                "loopspace_id": "loop-1",
+                "loop_runtime_run_id": "run-1",
+                "loop_runtime_node_id": "dispatch-1",
+                "cloud_mcp_base_url": "diffforge-test://fake-cloud/start-task/task-loopspace-direct",
+            }),
+        );
+        assert_eq!(started["ok"].as_bool(), Some(true));
+        let task_id = started["data"]["task_id"].as_str().unwrap();
+        assert!(started["data"]["loopspace_run_context"]
+            .as_str()
+            .is_some_and(|context| context.contains("err loopspace_graph_unavailable")));
+        assert!(
+            mcp_loopspace_start_task_seen_for_task(&kernel, task_id, &terminal.session_id).unwrap()
+        );
+
+        let checkpoint = dispatch_tool(
+            &session_context,
+            "checkpoint",
+            json!({
+                "task_id": task_id,
+                "summary": "Completed the Loopspace checkpoint locally.",
+            }),
+        );
+        assert_eq!(checkpoint["ok"].as_bool(), Some(true));
+
+        let complete_denied = dispatch_tool(
+            &session_context,
+            "complete_task",
+            json!({"task_id": task_id, "summary": "Full mode does not complete lifecycle tasks."}),
+        );
+        assert_eq!(complete_denied["ok"].as_bool(), Some(false));
+        assert_eq!(
+            complete_denied["error"]["code"].as_str(),
+            Some("unknown_tool")
+        );
     }
 
     #[test]

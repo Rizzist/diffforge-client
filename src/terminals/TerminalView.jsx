@@ -185,6 +185,7 @@ import {
 } from "./workspaceToolPanelBridge.js";
 import {
   appControlMessageHasExplicitTerminalTarget,
+  buildAppControlPromptWithAttachmentMarkers,
   getLoopspaceAutomationAutoSpawnMaxTotal,
   isLoopspaceAutomationAppControlMessage,
   loopspaceAutomationAutoSpawnEnabled,
@@ -3789,6 +3790,58 @@ function appControlCheckpointResourceEntryText(resource = {}) {
   return details.length ? `${label} (${details.join("; ")})` : label;
 }
 
+function appControlCompactLineText(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function appControlCompactRunLine(detail = {}) {
+  const values = [
+    appControlRemoteDetailString(detail, ["loopspace_id", "loopspaceId"]),
+    appControlRemoteDetailString(detail, ["loop_runtime_run_id", "loopRuntimeRunId", "run_id", "runId"]),
+    appControlRemoteDetailString(detail, ["loop_runtime_node_id", "loopRuntimeNodeId", "node_id", "nodeId"]),
+    appControlRemoteDetailString(detail, ["loop_runtime_edge_id", "loopRuntimeEdgeId", "edge_id", "edgeId"]),
+    appControlRemoteDetailString(detail, ["trigger_id", "triggerId"]),
+    appControlRemoteDetailString(detail, ["trigger_run_id", "triggerRunId"]),
+  ].map(appControlCompactLineText).filter(Boolean);
+  return values.length ? `r ${values.join(" ")}` : "";
+}
+
+function appControlCompactResourceName(resource = {}) {
+  const refs = appControlCheckpointResourceRefs(resource);
+  return appControlCompactLineText(
+    refs[0]
+      || appControlCheckpointText(resource, ["path_key", "pathKey", "createName", "create_name", "label", "title", "name", "id"]),
+  ) || "resource";
+}
+
+function appControlCompactResourceLine(tag, resource = {}) {
+  const name = appControlCompactResourceName(resource);
+  const extras = [];
+  const operation = appControlCompactLineText(appControlCheckpointText(resource, ["operation", "op"]));
+  const createName = appControlCompactLineText(appControlCheckpointText(resource, ["createName", "create_name"]));
+  const targetMode = appControlCompactLineText(appControlCheckpointText(resource, ["targetMode", "target_mode"]));
+  const template = appControlCompactLineText(appControlCheckpointText(resource, ["contentTemplate", "content_template", "template"]));
+  if (operation) extras.push(`op=${operation}`);
+  if (createName && createName !== name) extras.push(`create=${createName}`);
+  if (targetMode) extras.push(`mode=${targetMode}`);
+  if (template) extras.push(`template=${template}`);
+  return `${tag} ${name}${extras.length ? ` ${extras.join(" ")}` : ""}`;
+}
+
+function appControlCompactCheckpointResourceLines(checkpoint = {}) {
+  return [
+    ["rd", appControlCheckpointResourceList(checkpoint, ["readable_documents", "readableDocuments", "read_docs", "readDocs"])],
+    ["wd", appControlCheckpointResourceList(checkpoint, ["writable_documents", "writableDocuments", "write_docs", "writeDocs"])],
+    ["ra", appControlCheckpointResourceList(checkpoint, ["readable_assets", "readableAssets", "read_assets", "readAssets"])],
+    ["wa", appControlCheckpointResourceList(checkpoint, ["writable_assets", "writableAssets", "write_assets", "writeAssets"])],
+  ]
+    .flatMap(([tag, resources]) => resources.map((resource) => appControlCompactResourceLine(tag, resource)));
+}
+
+function appControlCheckpointHasWritableDocuments(checkpoint = {}) {
+  return appControlCheckpointResourceList(checkpoint, ["writable_documents", "writableDocuments", "write_docs", "writeDocs"]).length > 0;
+}
+
 function appControlCheckpointResourcePromptLines(checkpoint = {}) {
   return [
     ["Read docs", appControlCheckpointResourceList(checkpoint, ["readable_documents", "readableDocuments", "read_docs", "readDocs"])],
@@ -3806,34 +3859,58 @@ function appControlRemoteCheckpointPromptBlock(detail = {}, checkpointPlan = [])
   if (!checkpoints.length) {
     return "";
   }
-  const lines = [
-    "Diff Forge internal send-message steps:",
-    "- Treat these as ordered internal checkpoints for this message.",
-    "- As you make progress, call the diffforge-app-control MCP tool record_loopspace_step_progress with status \"running\" when you start a checkpoint and status \"completed\" when that checkpoint is done.",
-    "- For Write docs resources, use prepare_doc_draft first, edit the returned draft_path, then call save_doc with document_key/path_key/draft_path/draft_id/base_content_hash before marking that checkpoint completed. Do not edit canonical local_path directly.",
-  ];
-  const fieldPairs = [
-    ["loopspace_id", appControlRemoteDetailString(detail, ["loopspace_id", "loopspaceId"])],
-    ["loop_runtime_run_id", appControlRemoteDetailString(detail, ["loop_runtime_run_id", "loopRuntimeRunId", "run_id", "runId"])],
-    ["loop_runtime_node_id", appControlRemoteDetailString(detail, ["loop_runtime_node_id", "loopRuntimeNodeId", "node_id", "nodeId"])],
-    ["loop_runtime_edge_id", appControlRemoteDetailString(detail, ["loop_runtime_edge_id", "loopRuntimeEdgeId", "edge_id", "edgeId"])],
-    ["trigger_id", appControlRemoteDetailString(detail, ["trigger_id", "triggerId"])],
-    ["trigger_run_id", appControlRemoteDetailString(detail, ["trigger_run_id", "triggerRunId"])],
-  ].filter(([, value]) => value);
-  if (fieldPairs.length) {
-    lines.push(`- Include these fields on every checkpoint call: ${fieldPairs.map(([key, value]) => `${key}="${value}"`).join(", ")}.`);
+  const commandKind = normalizeRemoteCommandKind(
+    appControlRemoteDetailString(detail, ["commandKind", "command_kind", "kind", "type"]),
+  );
+  const isDispatchTodo = commandKind === "dispatch_todos"
+    || commandKind === "loopspace_dispatch_todos"
+    || commandKind === "loopspace_workspace_todo_dispatch";
+  const lines = [`LS/1 ${isDispatchTodo ? "dispatch_todo" : "send_message"}`];
+  const runLine = appControlCompactRunLine(detail);
+  if (runLine) {
+    lines.push(runLine);
   }
+  const message = appControlRemoteMessageText(detail).trim();
+  if (!isDispatchTodo && message) {
+    lines.push("msg:", message, "");
+  }
+  lines.push("steps:");
   checkpoints.forEach((checkpoint, index) => {
-    const label = appControlCheckpointText(checkpoint, ["label", "title", "name"])
+    const label = appControlCompactLineText(appControlCheckpointText(checkpoint, ["label", "title", "name"]))
       || `Step ${index + 1}`;
-    const stepId = appControlCheckpointText(checkpoint, ["id", "step_id", "stepId", "checkpoint_id", "checkpointId"]);
-    const description = appControlCheckpointText(checkpoint, ["description", "desc", "details"]);
-    const idSuffix = stepId ? ` [step_id: ${stepId}]` : "";
-    lines.push(`${index + 1}. ${label}${idSuffix}${description ? ` - ${description}` : ""}`);
-    appControlCheckpointResourcePromptLines(checkpoint)
-      .forEach((line) => lines.push(`   - ${line}`));
+    const stepId = appControlCompactLineText(appControlCheckpointText(checkpoint, ["id", "step_id", "stepId", "checkpoint_id", "checkpointId"]))
+      || `step_${index + 1}`;
+    lines.push(`${index + 1} ${stepId} checkpoint ${label}`);
+    appControlCompactCheckpointResourceLines(checkpoint)
+      .forEach((line) => lines.push(`  ${line}`));
   });
+  if (checkpoints.some(appControlCheckpointHasWritableDocuments)) {
+    lines.push("docs wd=prepare_doc_draft->save_doc canonical=read_only");
+  }
+  lines.push(`done checkpoint=record_loopspace_step_progress final=${isDispatchTodo ? "todo_status" : "terminal_run"}`);
   return lines.join("\n");
+}
+
+function appControlRemoteCommandIsDispatchTodo(detail = {}) {
+  const commandKind = normalizeRemoteCommandKind(
+    appControlRemoteDetailString(detail, ["commandKind", "command_kind", "kind", "type"]),
+  );
+  return commandKind === "dispatch_todos"
+    || commandKind === "loopspace_dispatch_todos"
+    || commandKind === "loopspace_workspace_todo_dispatch";
+}
+
+function appControlRemoteLoopspaceRunIdentityPromptBlock(detail = {}) {
+  const runId = appControlRemoteDetailString(detail, ["loop_runtime_run_id", "loopRuntimeRunId", "run_id", "runId"]);
+  if (!runId) {
+    return "";
+  }
+  return [
+    "LS/1 dispatch_todo",
+    appControlCompactRunLine(detail),
+    "start coordination-kernel.start_task -> loopspace_run_context",
+    "note identity_only",
+  ].join("\n");
 }
 
 function appControlRemoteMessageTextWithCheckpointPlan(detail = {}, checkpointPlan = []) {
@@ -3841,10 +3918,15 @@ function appControlRemoteMessageTextWithCheckpointPlan(detail = {}, checkpointPl
   const checkpointBlock = appControlRemoteCheckpointPromptBlock(detail, checkpointPlan);
   if (
     !checkpointBlock
+    || text.includes("LS/1 ")
+    || text.includes("Diff Forge internal Loopspace steps:")
     || text.includes("Diff Forge internal send-message steps:")
     || text.includes("record_loopspace_step_progress")
   ) {
     return text;
+  }
+  if (checkpointBlock.startsWith("LS/1 ")) {
+    return checkpointBlock;
   }
   return [text, checkpointBlock].filter(Boolean).join("\n\n");
 }
@@ -11398,7 +11480,33 @@ function getTodoQueueRemoteCommandObject(item) {
   if (item?.remote_command && typeof item.remote_command === "object") {
     return item.remote_command;
   }
-  return {};
+  const commandKind = String(item?.commandKind || item?.command_kind || "").trim();
+  const source = String(item?.source || item?.sourceKind || item?.source_kind || "").trim();
+  const loopRuntimeRunId = String(item?.loopRuntimeRunId || item?.loop_runtime_run_id || item?.runId || item?.run_id || "").trim();
+  const loopRuntimeNodeId = String(item?.loopRuntimeNodeId || item?.loop_runtime_node_id || item?.nodeId || item?.node_id || "").trim();
+  const loopRuntimeEdgeId = String(item?.loopRuntimeEdgeId || item?.loop_runtime_edge_id || item?.edgeId || item?.edge_id || "").trim();
+  const loopspaceId = String(item?.loopspaceId || item?.loopspace_id || "").trim();
+  const triggerId = String(item?.triggerId || item?.trigger_id || "").trim();
+  const triggerRunId = String(item?.triggerRunId || item?.trigger_run_id || "").trim();
+  const inferredDispatchKind = source === "loopspace-dispatch-todos" && (loopRuntimeRunId || loopRuntimeNodeId);
+  const effectiveCommandKind = commandKind || (inferredDispatchKind ? "loopspace_dispatch_todos" : "");
+  if (!effectiveCommandKind && !loopRuntimeRunId && !loopRuntimeNodeId && !loopspaceId) {
+    return {};
+  }
+  return {
+    ...(effectiveCommandKind ? { commandKind: effectiveCommandKind, command_kind: effectiveCommandKind } : {}),
+    ...(item?.commandId || item?.command_id || item?.id ? {
+      commandId: String(item.commandId || item.command_id || item.id || "").trim(),
+      command_id: String(item.command_id || item.commandId || item.id || "").trim(),
+    } : {}),
+    ...(loopspaceId ? { loopspaceId, loopspace_id: loopspaceId } : {}),
+    ...(loopRuntimeRunId ? { loopRuntimeRunId, loop_runtime_run_id: loopRuntimeRunId } : {}),
+    ...(loopRuntimeNodeId ? { loopRuntimeNodeId, loop_runtime_node_id: loopRuntimeNodeId } : {}),
+    ...(loopRuntimeEdgeId ? { loopRuntimeEdgeId, loop_runtime_edge_id: loopRuntimeEdgeId } : {}),
+    ...(triggerId ? { triggerId, trigger_id: triggerId } : {}),
+    ...(triggerRunId ? { triggerRunId, trigger_run_id: triggerRunId } : {}),
+    ...(source ? { source } : {}),
+  };
 }
 
 function isTerminalOrchestratorRemoteCommand(item) {
@@ -13235,12 +13343,31 @@ function getTodoQueueItemImage(item) {
 function getTodoQueueItemTerminalText(item) {
   const text = normalizeTodoQueueText(item?.text);
   const note = getTodoQueueItemNote(item);
+  const baseText = text && note?.text
+    ? `${text}\n\n${note.text}`
+    : text || note?.text || "";
+  const remoteCommand = getTodoQueueRemoteCommandObject(item);
+  const remoteCommandDetail = {
+    ...remoteCommand,
+    event: remoteCommand,
+    message: baseText,
+    text: baseText,
+  };
+  if (appControlRemoteCommandIsDispatchTodo(remoteCommandDetail)) {
+    const runIdentityBlock = appControlRemoteLoopspaceRunIdentityPromptBlock(remoteCommandDetail);
+    if (runIdentityBlock) {
+      return runIdentityBlock;
+    }
+  }
+  const checkpointPlan = appControlRemoteCheckpointPlan({
+    ...remoteCommandDetail,
+  });
 
-  if (text && note?.text) {
-    return `${text}\n\n${note.text}`;
+  if (checkpointPlan.length) {
+    return appControlRemoteMessageTextWithCheckpointPlan(remoteCommandDetail, checkpointPlan);
   }
 
-  return text || note?.text || "";
+  return baseText;
 }
 
 function getTodoQueueItemThreadMessageText(item, fallback = "") {
@@ -15530,8 +15657,9 @@ function createTodoQueueItem(text, options = {}) {
   const targetTerminalColor = hasTerminalTarget
     ? getTodoQueueTargetTerminalColor(options) || terminalColorForSlot(targetColorFallbackSlot)
     : "";
-  const remoteCommand = options.remoteCommand && typeof options.remoteCommand === "object"
-    ? { ...options.remoteCommand }
+  const remoteCommandCandidate = getTodoQueueRemoteCommandObject(options);
+  const remoteCommand = Object.keys(remoteCommandCandidate).length
+    ? { ...remoteCommandCandidate }
     : null;
   const queuedAt = getTodoQueueItemQueuedAt(options);
   const inputs = getTodoQueueItemInputs(options);
@@ -15647,11 +15775,10 @@ function normalizeTodoQueueItem(item) {
   const targetTerminalColor = hasTerminalTarget
     ? getTodoQueueTargetTerminalColor(item) || terminalColorForSlot(targetColorFallbackSlot)
     : "";
-  const remoteCommand = item.remoteCommand && typeof item.remoteCommand === "object"
-    ? { ...item.remoteCommand }
-    : item.remote_command && typeof item.remote_command === "object"
-      ? { ...item.remote_command }
-      : null;
+  const remoteCommandCandidate = getTodoQueueRemoteCommandObject(item);
+  const remoteCommand = Object.keys(remoteCommandCandidate).length
+    ? { ...remoteCommandCandidate }
+    : null;
   const queuedAt = getTodoQueueItemQueuedAt(item);
   const inputs = getTodoQueueItemInputs(item);
   const agentSessionMetadata = getTodoQueueAgentSessionMetadata(item);
@@ -18584,16 +18711,21 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     recordAppControlRemoteCommandStatus,
     recoverOrFailAppControlAgentSendMessage,
   ]);
-  const handleRemoteAppControlSendMessage = useCallback((event) => {
+  const handleRemoteAppControlSendMessage = useCallback(async (event) => {
     const detail = event?.detail || {};
     const checkpointPlan = appControlRemoteCheckpointPlan(detail);
-    const text = appControlRemoteMessageTextWithCheckpointPlan(detail, checkpointPlan);
+    const rawText = appControlRemoteMessageTextWithCheckpointPlan(detail, checkpointPlan);
+    const chatAttachments = getTodoQueueItemChatAttachments(detail);
     const remoteEvent = detail.event && typeof detail.event === "object"
       ? detail.event
       : {
         command_id: appControlRemoteDetailString(detail, ["commandId", "command_id"]) || "",
         command_kind: appControlRemoteDetailString(detail, ["commandKind", "command_kind"]) || "terminal_orchestrator_send_message",
-        message: text,
+        ...(chatAttachments.length ? {
+          attachments: chatAttachments,
+          chat_attachments: chatAttachments,
+        } : {}),
+        message: rawText,
       };
     const commandId = appControlRemoteDetailString(detail, ["commandId", "command_id"])
       || String(remoteEvent.command_id || remoteEvent.commandId || "").trim()
@@ -18601,12 +18733,37 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     const commandKind = appControlRemoteDetailString(detail, ["commandKind", "command_kind"])
       || String(remoteEvent.command_kind || remoteEvent.commandKind || "").trim()
       || "terminal_orchestrator_send_message";
-    if (!text) {
+    if (!rawText) {
       void recordAppControlRemoteCommandStatus(remoteEvent, "failed", "Remote command did not include a terminal orchestrator message.", {
         commandId,
         commandKind,
       });
       return;
+    }
+    let text = rawText;
+    if (chatAttachments.length) {
+      try {
+        const stageResult = await invoke("stage_chat_attachment_refs", {
+          request: {
+            ackCloud: true,
+            ack_cloud: true,
+            attachments: chatAttachments,
+            markerStartIndex: 0,
+            marker_start_index: 0,
+            workspaceId: APP_CONTROL_AGENT_WORKSPACE.id,
+            workspace_id: APP_CONTROL_AGENT_WORKSPACE.id,
+          },
+        });
+        text = buildAppControlPromptWithAttachmentMarkers(rawText, stageResult);
+      } catch (error) {
+        void recordAppControlRemoteCommandStatus(remoteEvent, "failed", getErrorMessage(error, "Unable to stage chat attachments for the terminal orchestrator."), {
+          attachmentCount: chatAttachments.length,
+          commandId,
+          commandKind,
+          workspaceId: APP_CONTROL_AGENT_WORKSPACE.id,
+        });
+        return;
+      }
     }
 
     const rawAgentId = appControlRemoteDetailString(detail, [
@@ -18681,6 +18838,11 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       agentId: role,
       commandId,
       commandKind,
+      ...(chatAttachments.length ? {
+        attachments: chatAttachments,
+        chatAttachments,
+        chat_attachments: chatAttachments,
+      } : {}),
       checkpointPlan,
       event: remoteEvent,
       loopRuntimeEdgeId: appControlRemoteDetailString(detail, ["loopRuntimeEdgeId", "loop_runtime_edge_id", "edgeId", "edge_id"]),
@@ -18717,6 +18879,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       createdAt,
       deliveryMode: "terminal-confirmed",
       id: promptId,
+      ...(chatAttachments.length ? { attachments: chatAttachments } : {}),
       message: text,
       model: appControlRemoteDetailString(detail, ["model", "modelId", "model_id", "requestedModel"]),
       promptEventId: promptId,
@@ -23286,6 +23449,7 @@ function TerminalView({
   terminalWorkspaceExplicitEmpty = false,
   terminalWorkspaceRootWasEmptyAtSelection = false,
   terminalWorkspaceWorkingDirectory,
+  terminalRuntimeRestartKey = "",
   terminalWorkspaceLogicalIndexes,
   terminalWorkspaceLogicalTerminalCount,
   agentLaunchDefaults = null,
@@ -24678,12 +24842,27 @@ function TerminalView({
           : receiptStatus === "released"
             ? "interrupted"
             : receiptStatus;
+      const loopRuntimeCommandKind = normalizeRemoteCommandKind(
+        fields.commandKind
+          || fields.command_kind
+          || item?.remoteCommand?.commandKind
+          || item?.remoteCommand?.command_kind
+          || item?.remote_command?.commandKind
+          || item?.remote_command?.command_kind
+          || item?.commandKind
+          || item?.command_kind
+          || "",
+      ) || (dispatchId
+        ? "loopspace_dispatch_todos"
+        : isTerminalOrchestratorRemoteCommand(item)
+          ? "terminal_orchestrator_send_message"
+          : "loopspace_dispatch_todos");
       void invoke("cloud_mcp_record_remote_command_status", {
         event: {
           command_id: commandId || loopRuntimeRunId,
           commandId: commandId || loopRuntimeRunId,
-          command_kind: "terminal_orchestrator_send_message",
-          commandKind: "terminal_orchestrator_send_message",
+          command_kind: loopRuntimeCommandKind,
+          commandKind: loopRuntimeCommandKind,
           loop_runtime_run_id: loopRuntimeRunId,
           loopRuntimeRunId: loopRuntimeRunId,
           loop_runtime_node_id: loopRuntimeNodeId,
@@ -24706,6 +24885,8 @@ function TerminalView({
         message: String(fields.reason || fields.message || receiptStatus || ""),
         status: remoteStatus,
         details: {
+          commandKind: loopRuntimeCommandKind,
+          command_kind: loopRuntimeCommandKind,
           itemId: nextReceipt.itemId,
           source: normalizeTodoQueueSource(item?.source),
           statusReason: String(fields.reason || fields.message || ""),
@@ -41272,12 +41453,16 @@ function TerminalView({
               {!paneMountReleased ? (
                 <div
                   data-pane-mount-pending="true"
-                  key={`${terminalWorkspace.id}-${terminalIndex}`}
+                  key={`${terminalWorkspace.id}-${terminalIndex}-${terminalRuntimeRestartKey || normalizeTerminalWorkspaceRootIdentity(terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "")}`}
                   style={{ background: "var(--terminal-pane-bg, #0a0d12)", height: "100%", width: "100%" }}
                 />
               ) : (
+              // The runtime restart key (root identity + agent session mode) is part
+              // of the pane key so re-pointing a workspace at a new folder — or
+              // toggling git-worktree/session mode — remounts the pane: the old PTY
+              // is torn down and a fresh terminal_open runs at the new cwd/isolation.
               <WorkspaceTerminal
-                key={`${terminalWorkspace.id}-${terminalIndex}`}
+                key={`${terminalWorkspace.id}-${terminalIndex}-${terminalRuntimeRestartKey || normalizeTerminalWorkspaceRootIdentity(terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "")}`}
                 agent={terminalAgent}
                 agentLaunchEpoch={workspaceAgentLaunchEpoch}
                 agentLaunchAlert={workspaceAgentLaunchAlert}

@@ -5566,6 +5566,129 @@ mod agent_chat_session_sync_tests {
     }
 
     #[test]
+    fn agent_chat_session_history_item_with_app_control_sentinel_syncs() {
+        let _guard = agent_chat_session_sync_test_lock();
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = env::temp_dir().join(format!("codex-app-control-sync-{suffix}"));
+        let workspace_root = root.join("app-control-cwd");
+        let codex_home = root.join("codex-home");
+        let diffforge_home = root.join("diffforge-home");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::create_dir_all(&diffforge_home).unwrap();
+        let _codex_home_guard = set_test_env_var("CODEX_HOME", &codex_home);
+        let _diffforge_home_guard = set_test_env_var("RUST_DIFFFORGE_HOME", &diffforge_home);
+
+        let workspace_root_text = workspace_root.to_string_lossy().to_string();
+        let workspace_id = "__diffforge_app_control__";
+        let provider_session_id = "codex-app-control-sentinel";
+        let rollout_path = sessions_dir.join(format!("rollout-{provider_session_id}.jsonl"));
+        let lines = [
+            json!({
+                "type": "session_meta",
+                "timestamp": "2026-07-02T00:00:00Z",
+                "payload": {
+                    "id": provider_session_id,
+                    "cwd": workspace_root_text.as_str()
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-07-02T00:00:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "inspect attached image"}]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(&rollout_path, format!("{lines}\n")).unwrap();
+
+        let mut history_item = test_history_item(
+            provider_session_id,
+            WorkspaceAgentSessionHistoryChatSync::default(),
+        );
+        history_item.id =
+            workspace_agent_session_history_record_id(workspace_id, "codex", provider_session_id);
+        history_item.workspace_id = workspace_id.to_string();
+        history_item.workspace_name = "Terminal Orchestrators".to_string();
+        history_item.workspace_root = workspace_root_text.clone();
+        history_item.thread_id = "app-control-thread-0".to_string();
+        history_item.pane_id = "forge-app-control-agent-terminal".to_string();
+        history_item.terminal_instance_id = Some(7);
+        history_item.terminal_index = Some(0);
+        history_item.slot_key = "app-control:0".to_string();
+        history_item.cwd = workspace_root_text.clone();
+        history_item.status = "observed".to_string();
+        history_item.source = "native-transcript-watch".to_string();
+
+        assert!(agent_chat_session_sync_history_item_needs_backfill(
+            &history_item
+        ));
+        assert!(agent_chat_session_sync_history_item_source_fingerprint(
+            &history_item,
+            "codex",
+            provider_session_id,
+        )
+        .is_some());
+
+        let record = agent_chat_session_sync_history_item_record(&history_item);
+        assert_eq!(record.workspace_id, workspace_id);
+        assert_eq!(record.cwd, workspace_root_text);
+
+        let context = AgentChatSessionSyncContext {
+            workspace_id: record.workspace_id.clone(),
+            workspace_name: record.workspace_name.clone(),
+            thread_id: record.thread_id.clone(),
+            pane_id: record.pane_id.clone(),
+            terminal_instance_id: record.terminal_instance_id,
+            terminal_index: record.terminal_index,
+            model_id: record.model_id.clone(),
+            model_source: record.model_source.clone(),
+            session_mode: record.session_mode.clone(),
+            file_authority: record.file_authority.clone(),
+            coordination_mode: record.coordination_mode.clone(),
+            status: record.status.clone(),
+            source: record.source.clone(),
+            shared_history_id: record.shared_history_id.clone(),
+            fork_from_provider_session_id: record.fork_from_provider_session_id.clone(),
+            ..AgentChatSessionSyncContext::default()
+        };
+        let payloads = agent_chat_session_sync_payloads(
+            &record.provider,
+            &record.provider_session_id,
+            &record.cwd,
+            context,
+            "workspace_agent_session_history_backfill",
+        )
+        .unwrap();
+
+        assert!(!payloads.is_empty());
+        let payload = &payloads[0];
+        assert_eq!(payload["workspace_id"], json!(workspace_id));
+        assert_eq!(payload["workspaceId"], json!(workspace_id));
+        assert_eq!(payload["provider"], json!("codex"));
+        assert_eq!(payload["session_id"], json!(provider_session_id));
+        assert_eq!(payload["provider_session_id"], json!(provider_session_id));
+        assert_eq!(payload["thread_id"], json!("app-control-thread-0"));
+        assert_eq!(
+            payload["pane_id"],
+            json!("forge-app-control-agent-terminal")
+        );
+        assert!(payload["record_count"].as_u64().unwrap_or_default() > 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn agent_chat_session_sync_prefers_event_user_message_over_response_item() {
         let source = codex_sync_source_from_lines(
             "codex-sync-user-dedupe",

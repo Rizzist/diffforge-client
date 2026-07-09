@@ -34,6 +34,19 @@ import { createTerminalOutputWorkerSession } from "./terminalOutputWorkerClient.
 import { SshClientPicker } from "../../ssh/SshClientPicker.jsx";
 import { guardXtermDuringPushToTalk } from "../xtermPushToTalkGuard.js";
 import {
+  REMOTE_PERMISSION_CONFIG_REQUEST_EVENT,
+  REMOTE_PERMISSION_CONFIG_RESULT_EVENT,
+  REMOTE_PERMISSION_CONFIG_SOURCE,
+  appendUniqueMode,
+  claudePermissionModeFromText,
+  claudePermissionTargetAvailableInCycle,
+  codexPermissionPickerOpen,
+  codexPermissionPostSelectionState,
+  findCodexPermissionPickerTarget,
+  normalizePermissionModeForProvider,
+  opencodeAgentModeFromText,
+} from "../permissionModeAutomation.js";
+import {
   GlobalStyle,
   AppFrame,
   WindowTitleBar,
@@ -12525,6 +12538,30 @@ function WorkspaceTerminal({
             Number(activeBuffer?.viewportY || 0),
           );
         };
+        const getTerminalBufferOutputMark = () => {
+          const activeBuffer = terminal?.buffer?.active;
+          if (!activeBuffer) {
+            return 0;
+          }
+          return Math.max(0, Number(activeBuffer.length || 0));
+        };
+        const getTerminalBufferTextSince = (startLine, maxRows = 80) => {
+          const activeBuffer = terminal?.buffer?.active;
+          if (!activeBuffer) {
+            return "";
+          }
+          const lineCount = Number(activeBuffer.length || 0);
+          if (!lineCount) {
+            return "";
+          }
+          const safeStartLine = Math.max(0, Number(startLine) || 0);
+          if (safeStartLine >= lineCount) {
+            return "";
+          }
+          const rowLimit = Math.max(1, Math.min(160, Number(maxRows) || 80));
+          const firstLine = Math.max(safeStartLine, lineCount - rowLimit);
+          return getTerminalBufferText(activeBuffer, Math.max(1, lineCount - firstLine), firstLine);
+        };
         const getTerminalControlUiPromptSnapshot = () => {
           const tailText = getTerminalBufferTailText(12);
           const viewportText = getTerminalViewportText(12);
@@ -12536,6 +12573,289 @@ function WorkspaceTerminal({
             viewportText,
           };
         };
+        const waitForRemotePermissionConfigSettle = (delayMs = 150) => (
+          new Promise((resolve) => {
+            window.setTimeout(resolve, Math.max(0, Number(delayMs) || 0));
+          })
+        );
+        const remotePermissionConfigSnapshot = () => {
+          const rows = Math.max(12, Math.min(80, Number(terminal?.rows || 24) || 24));
+          return {
+            tailText: getTerminalBufferTailText(rows),
+            viewportText: getTerminalViewportText(rows),
+          };
+        };
+        const remotePermissionConfigText = () => {
+          const snapshot = remotePermissionConfigSnapshot();
+          return [snapshot.viewportText, snapshot.tailText].filter(Boolean).join("\n");
+        };
+        const remotePermissionConfigViewportText = () => (
+          remotePermissionConfigSnapshot().viewportText || ""
+        );
+        const remotePermissionConfigFreshTextSince = (startLine, maxRows = 80) => (
+          getTerminalBufferTextSince(startLine, maxRows)
+        );
+        const writeRemotePermissionConfigInput = async (data) => {
+          await invoke("terminal_write", {
+            data,
+            instanceId: terminalInstanceIdRef.current || terminalInstanceId || undefined,
+            paneId,
+            promptEventSource: REMOTE_PERMISSION_CONFIG_SOURCE,
+            threadId: terminalThreadIdRef.current || startupThreadId || undefined,
+          });
+        };
+        const sendRemotePermissionConfigResult = (detail, result) => {
+          window.dispatchEvent(new CustomEvent(REMOTE_PERMISSION_CONFIG_RESULT_EVENT, {
+            detail: {
+              commandId: detail.commandId || "",
+              permissionMode: detail.permissionMode || "",
+              permissionRequestId: detail.permissionRequestId || "",
+              provider: detail.provider || terminalAgentKind,
+              targetPaneId: detail.targetPaneId || detail.paneId || paneId,
+              ...result,
+            },
+          }));
+        };
+        const remotePermissionConfigRequestMatchesPane = (detail = {}) => {
+          const requestedPaneId = String(detail.targetPaneId || detail.paneId || detail.terminalId || "").trim();
+          if (requestedPaneId && requestedPaneId !== paneId) {
+            return false;
+          }
+          const requestedWorkspaceId = String(detail.workspaceId || detail.workspace_id || "").trim();
+          if (requestedWorkspaceId && requestedWorkspaceId !== String(workspace?.id || "").trim()) {
+            return false;
+          }
+          const requestedThreadId = String(detail.targetThreadId || detail.threadId || "").trim();
+          if (requestedThreadId && requestedThreadId !== String(terminalThreadIdRef.current || startupThreadId || "").trim()) {
+            return false;
+          }
+          const requestedInstanceId = Number.parseInt(detail.instanceId || detail.terminalInstanceId || 0, 10);
+          if (
+            Number.isInteger(requestedInstanceId)
+            && requestedInstanceId > 0
+            && requestedInstanceId !== Number(terminalInstanceIdRef.current || terminalInstanceId || 0)
+          ) {
+            return false;
+          }
+          const requestedTerminalIndex = Number.parseInt(detail.targetTerminalIndex ?? detail.terminalIndex ?? "", 10);
+          return !Number.isInteger(requestedTerminalIndex) || requestedTerminalIndex === terminalIndex;
+        };
+        const waitForCodexPermissionPicker = async (permissionMode, outputMark) => {
+          const startedAt = Date.now();
+          let latestMatch = findCodexPermissionPickerTarget(
+            remotePermissionConfigFreshTextSince(outputMark, 80),
+            permissionMode,
+          );
+          while (!latestMatch.found && !latestMatch.ambiguous && Date.now() - startedAt < 2_000) {
+            await waitForRemotePermissionConfigSettle(120);
+            latestMatch = findCodexPermissionPickerTarget(
+              remotePermissionConfigFreshTextSince(outputMark, 80),
+              permissionMode,
+            );
+          }
+          return latestMatch;
+        };
+        const waitForCodexPermissionStatus = async (permissionMode) => {
+          const statusOutputMark = getTerminalBufferOutputMark();
+          await writeRemotePermissionConfigInput("\u0015/status\r");
+          const startedAt = Date.now();
+          let statusText = remotePermissionConfigFreshTextSince(statusOutputMark, 80);
+          let freshOutputObserved = Boolean(statusText.trim());
+          let latestState = codexPermissionPostSelectionState(statusText, permissionMode);
+          while (
+            (!freshOutputObserved || !latestState.matched)
+            && !latestState.errorRows.length
+            && Date.now() - startedAt < 2_000
+          ) {
+            await waitForRemotePermissionConfigSettle(160);
+            statusText = remotePermissionConfigFreshTextSince(statusOutputMark, 80);
+            freshOutputObserved = Boolean(statusText.trim());
+            latestState = codexPermissionPostSelectionState(statusText, permissionMode);
+          }
+          return {
+            ...latestState,
+            statusChanged: freshOutputObserved,
+          };
+        };
+        const applyCodexRemotePermissionConfig = async (permissionMode) => {
+          const targetMode = normalizePermissionModeForProvider("codex", permissionMode);
+          const pickerOutputMark = getTerminalBufferOutputMark();
+          await writeRemotePermissionConfigInput("\u0015/permissions\r");
+          const picker = await waitForCodexPermissionPicker(targetMode, pickerOutputMark);
+          if (!picker.found) {
+            await writeRemotePermissionConfigInput("\x1b");
+            throw new Error(
+              picker.rows.length
+                ? `Codex permission mode ${targetMode} was not visible. Saw: ${picker.rows.join(", ")}.`
+                : "Codex permission picker did not show available modes.",
+            );
+          }
+          if (picker.arrowDownCount > 0) {
+            await writeRemotePermissionConfigInput("\x1b[B".repeat(picker.arrowDownCount));
+            await waitForRemotePermissionConfigSettle(80);
+          }
+          await writeRemotePermissionConfigInput("\r");
+          await waitForRemotePermissionConfigSettle(260);
+          const postText = remotePermissionConfigViewportText();
+          if (codexPermissionPickerOpen(postText)) {
+            await writeRemotePermissionConfigInput("\x1b");
+            throw new Error(`Codex permission picker stayed open after selecting ${picker.label}.`);
+          }
+          const statusState = await waitForCodexPermissionStatus(targetMode);
+          if (statusState.errorRows.length) {
+            throw new Error(`Codex permission status reported an error after selecting ${picker.label}: ${statusState.errorRows.join(" ")}`);
+          }
+          if (!statusState.statusChanged) {
+            throw new Error(`Unable to confirm Codex permission mode ${targetMode}; /status output did not update.`);
+          }
+          if (!statusState.matched) {
+            throw new Error(
+              `Unable to confirm Codex permission mode ${targetMode}. Saw status: ${statusState.evidenceRows.join(" ") || "none"}.`,
+            );
+          }
+          return {
+            applied: true,
+            evidenceRows: statusState.evidenceRows,
+            labelsSeen: picker.rows,
+            message: `Permission mode changed to ${targetMode}.`,
+            permissionMode: targetMode,
+          };
+        };
+        const applyClaudeRemotePermissionConfig = async (permissionMode) => {
+          const targetMode = normalizePermissionModeForProvider("claude", permissionMode);
+          await writeRemotePermissionConfigInput("\u0015");
+          await waitForRemotePermissionConfigSettle(80);
+          let currentMode = claudePermissionModeFromText(remotePermissionConfigViewportText());
+          const originalMode = currentMode;
+          let seenModes = appendUniqueMode([], currentMode);
+          if (currentMode === targetMode) {
+            return {
+              applied: true,
+              message: `Permission mode already ${targetMode}.`,
+              permissionMode: targetMode,
+              seenModes,
+            };
+          }
+          const maxCycleSteps = 8;
+          const cycleClaudePermissionMode = async () => {
+            await writeRemotePermissionConfigInput("\x1b[Z");
+            await waitForRemotePermissionConfigSettle(180);
+            currentMode = claudePermissionModeFromText(remotePermissionConfigViewportText());
+            seenModes = appendUniqueMode(seenModes, currentMode);
+            return currentMode;
+          };
+          for (let index = 0; index < maxCycleSteps; index += 1) {
+            const nextMode = await cycleClaudePermissionMode();
+            if (currentMode === targetMode) {
+              return {
+                applied: true,
+                message: `Permission mode changed to ${targetMode}.`,
+                permissionMode: targetMode,
+                seenModes,
+              };
+            }
+            if (originalMode && nextMode === originalMode) {
+              break;
+            }
+          }
+          if (originalMode && currentMode !== originalMode) {
+            for (let index = 0; index < maxCycleSteps; index += 1) {
+              const restoredMode = await cycleClaudePermissionMode();
+              if (restoredMode === originalMode) {
+                break;
+              }
+            }
+          }
+          await writeRemotePermissionConfigInput("\x1b");
+          const restartMessage = `Claude permission mode ${targetMode} requires restart with --permission-mode ${targetMode}.`;
+          const seenMessage = `Seen modes: ${seenModes.join(", ") || "none"}. Current mode: ${currentMode || "unknown"}.`;
+          if (!claudePermissionTargetAvailableInCycle(targetMode, seenModes)) {
+            throw new Error(`${restartMessage} ${seenMessage}`);
+          }
+          throw new Error(`${restartMessage} ${seenMessage}`);
+        };
+        const applyOpenCodeRemotePermissionConfig = async (permissionMode) => {
+          const targetMode = normalizePermissionModeForProvider("opencode", permissionMode);
+          await writeRemotePermissionConfigInput("\u0015");
+          await waitForRemotePermissionConfigSettle(80);
+          let currentMode = opencodeAgentModeFromText(remotePermissionConfigViewportText());
+          let seenModes = appendUniqueMode([], currentMode);
+          if (currentMode === targetMode) {
+            return {
+              applied: true,
+              message: `Permission mode already ${targetMode}.`,
+              permissionMode: targetMode,
+              seenModes,
+            };
+          }
+          for (let index = 0; index < 8; index += 1) {
+            await writeRemotePermissionConfigInput("\t");
+            await waitForRemotePermissionConfigSettle(180);
+            currentMode = opencodeAgentModeFromText(remotePermissionConfigViewportText());
+            seenModes = appendUniqueMode(seenModes, currentMode);
+            if (currentMode === targetMode) {
+              return {
+                applied: true,
+                message: `Permission mode changed to ${targetMode}.`,
+                permissionMode: targetMode,
+                seenModes,
+              };
+            }
+          }
+          await writeRemotePermissionConfigInput("\x1b");
+          throw new Error(`OpenCode agent ${targetMode} was not reachable by Tab cycle. Seen agents: ${seenModes.join(", ") || "none"}.`);
+        };
+        const applyRemotePermissionConfig = async (detail = {}) => {
+          const provider = normalizePermissionModeForProvider("opencode", detail.provider || terminalAgentKind) === "opencode"
+            ? "opencode"
+            : getTerminalAgentKind(detail.provider || terminalAgentKind);
+          const permissionMode = normalizePermissionModeForProvider(provider, detail.permissionMode || detail.permission_mode);
+          if (!permissionMode) {
+            throw new Error("Remote permission configuration did not include a supported permission_mode.");
+          }
+          if (provider === "codex") {
+            return applyCodexRemotePermissionConfig(permissionMode);
+          }
+          if (provider === "claude") {
+            return applyClaudeRemotePermissionConfig(permissionMode);
+          }
+          if (provider === "opencode") {
+            return applyOpenCodeRemotePermissionConfig(permissionMode);
+          }
+          throw new Error("Remote permission configuration requires provider codex, claude, or opencode.");
+        };
+        const handleRemotePermissionConfigRequest = (event) => {
+          const detail = event?.detail && typeof event.detail === "object" ? event.detail : {};
+          if (!remotePermissionConfigRequestMatchesPane(detail)) {
+            return;
+          }
+          void (async () => {
+            try {
+              const result = await applyRemotePermissionConfig(detail);
+              sendRemotePermissionConfigResult(detail, {
+                ok: true,
+                status: "applied",
+                ...result,
+              });
+            } catch (error) {
+              sendRemotePermissionConfigResult(detail, {
+                error: getErrorMessage(error, "Unable to apply permission mode."),
+                ok: false,
+                status: "failed",
+              });
+            }
+          })();
+        };
+        window.addEventListener(
+          REMOTE_PERMISSION_CONFIG_REQUEST_EVENT,
+          handleRemotePermissionConfigRequest,
+        );
+        disposables.push(() => {
+          window.removeEventListener(
+            REMOTE_PERMISSION_CONFIG_REQUEST_EVENT,
+            handleRemotePermissionConfigRequest,
+          );
+        });
         const getTerminalDomInputSnapshot = () => {
           const textarea = container?.querySelector?.("textarea");
           const activeElement = typeof document !== "undefined" ? document.activeElement : null;

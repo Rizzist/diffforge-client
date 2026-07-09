@@ -3,6 +3,11 @@ import styled from "styled-components";
 // Shared chrome for the Video Editor pane family. Palette mirrors the PCB
 // pane (dark surface #020304, cards #07101d, emerald accent), sized for a
 // dense editing surface: thin rails, small quiet buttons, no chunky chrome.
+//
+// Light theme: every surface keeps its dark values as the base and layers a
+// `html[data-forge-theme="light"] &` override so the dark rendering stays
+// bit-identical. Light mirrors the app shell — white/#f8fafc surfaces,
+// rgba(15,23,42,·) borders, #0f172a/#1e293b text, emerald-700 accents.
 
 export const VideoPaneButton = styled.button`
   appearance: none;
@@ -25,6 +30,16 @@ export const VideoPaneButton = styled.button`
     opacity: 0.45;
     cursor: default;
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(5, 150, 105, 0.4);
+    background: rgba(16, 185, 129, 0.14);
+    color: #047857;
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    background: rgba(16, 185, 129, 0.22);
+  }
 `;
 
 export const VideoSecondaryButton = styled(VideoPaneButton)`
@@ -37,6 +52,18 @@ export const VideoSecondaryButton = styled(VideoPaneButton)`
     border-color: rgba(148, 163, 184, 0.34);
     color: rgba(241, 245, 249, 0.94);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.16);
+    background: transparent;
+    color: #334155;
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    background: rgba(15, 23, 42, 0.06);
+    border-color: rgba(15, 23, 42, 0.24);
+    color: #0f172a;
+  }
 `;
 
 export const VideoDangerButton = styled(VideoPaneButton)`
@@ -46,6 +73,16 @@ export const VideoDangerButton = styled(VideoPaneButton)`
 
   &:hover:not(:disabled) {
     background: rgba(127, 29, 29, 0.3);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(220, 38, 38, 0.4);
+    background: transparent;
+    color: #dc2626;
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    background: rgba(220, 38, 38, 0.1);
   }
 `;
 
@@ -83,6 +120,20 @@ export const VideoIconButton = styled.button`
     background: rgba(16, 185, 129, 0.16);
     color: #a7f3d0;
   }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    background: rgba(15, 23, 42, 0.08);
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    background: rgba(16, 185, 129, 0.16);
+    color: #047857;
+  }
 `;
 
 export const VideoInput = styled.input`
@@ -110,6 +161,16 @@ export const VideoInput = styled.input`
     padding: 2px;
     min-width: 32px;
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.16);
+    color: #0f172a;
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] &::placeholder {
+    color: rgba(71, 85, 105, 0.55);
+  }
 `;
 
 export const VideoTextArea = styled.textarea`
@@ -131,6 +192,12 @@ export const VideoTextArea = styled.textarea`
     border-color: rgba(16, 185, 129, 0.55);
     box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.12);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.16);
+    color: #0f172a;
+    background: #ffffff;
+  }
 `;
 
 export const VideoLabel = styled.label`
@@ -142,6 +209,10 @@ export const VideoLabel = styled.label`
   letter-spacing: 0.07em;
   text-transform: uppercase;
   color: rgba(148, 163, 184, 0.85);
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
 `;
 
 export const VideoHint = styled.div`
@@ -149,6 +220,10 @@ export const VideoHint = styled.div`
   font-weight: 550;
   color: #8fa0b8;
   line-height: 1.45;
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
 `;
 
 export const VideoErrorText = styled.div`
@@ -157,6 +232,10 @@ export const VideoErrorText = styled.div`
   color: #fca5a5;
   line-height: 1.4;
   overflow-wrap: anywhere;
+
+  html[data-forge-theme="light"] & {
+    color: #dc2626;
+  }
 `;
 
 export const VideoCard = styled.div`
@@ -167,6 +246,11 @@ export const VideoCard = styled.div`
   border-radius: 9px;
   background: rgba(9, 13, 20, 0.72);
   min-width: 0;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.1);
+    background: #f8fafc;
+  }
 `;
 
 // The pane's single thin nav rail — PCB ViewTabRail sibling: horizontal,
@@ -184,6 +268,10 @@ export const VideoRail = styled.div`
 
   &::-webkit-scrollbar {
     display: none;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(15, 23, 42, 0.1);
   }
 `;
 
@@ -219,6 +307,20 @@ export const VideoRailButton = styled.button`
     background: rgba(37, 99, 235, 0.2);
     color: #dbeafe;
   }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    color: #0f172a;
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    border-color: rgba(37, 99, 235, 0.45);
+    background: rgba(37, 99, 235, 0.12);
+    color: #1d4ed8;
+  }
 `;
 
 export const VideoRailDivider = styled.span`
@@ -227,6 +329,10 @@ export const VideoRailDivider = styled.span`
   background: rgba(148, 163, 184, 0.18);
   flex: none;
   margin: 0 3px;
+
+  html[data-forge-theme="light"] & {
+    background: rgba(15, 23, 42, 0.14);
+  }
 `;
 
 export const VideoRailTitle = styled.span`
@@ -238,6 +344,10 @@ export const VideoRailTitle = styled.span`
   text-overflow: ellipsis;
   max-width: 32cqw;
   flex: 0 1 auto;
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+  }
 `;
 
 export const VideoRailSpacer = styled.span`
@@ -251,6 +361,10 @@ export const VideoProgressTrack = styled.div`
   border-radius: 999px;
   background: rgba(148, 163, 184, 0.15);
   overflow: hidden;
+
+  html[data-forge-theme="light"] & {
+    background: rgba(15, 23, 42, 0.1);
+  }
 `;
 
 export const VideoProgressFill = styled.div`
@@ -313,6 +427,10 @@ export const VideoSheet = styled.div`
   flex-direction: column;
   background: rgba(3, 5, 8, 0.97);
   backdrop-filter: blur(6px);
+
+  html[data-forge-theme="light"] & {
+    background: rgba(248, 250, 252, 0.97);
+  }
 `;
 
 export const VideoSheetHeader = styled.div`
@@ -327,6 +445,11 @@ export const VideoSheetHeader = styled.div`
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: rgba(167, 243, 208, 0.9);
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(15, 23, 42, 0.1);
+    color: #047857;
+  }
 `;
 
 export const VideoSheetBody = styled.div`

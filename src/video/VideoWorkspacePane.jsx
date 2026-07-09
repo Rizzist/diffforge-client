@@ -123,6 +123,10 @@ const ClipMenuHint = styled.div`
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 260px;
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
 `;
 
 const CodePreviewViewport = styled.div`
@@ -130,6 +134,10 @@ const CodePreviewViewport = styled.div`
   min-height: 0;
   width: 100%;
   background: #05070c;
+
+  html[data-forge-theme="light"] & {
+    background: #f5f7fa;
+  }
 `;
 
 // Live Hyperframes Studio preview for a composition, embedded as a native
@@ -319,6 +327,24 @@ const SplitSeparatorH = styled(Separator)`
   &[data-resizing]::after {
     background: rgba(16, 185, 129, 0.9);
   }
+
+  html[data-forge-theme="light"] &::before {
+    background: rgba(15, 23, 42, 0.14);
+  }
+
+  html[data-forge-theme="light"] &::after {
+    background: rgba(15, 23, 42, 0.28);
+  }
+
+  html[data-forge-theme="light"] &:hover::before,
+  html[data-forge-theme="light"] &[data-resizing]::before {
+    background: rgba(5, 150, 105, 0.5);
+  }
+
+  html[data-forge-theme="light"] &:hover::after,
+  html[data-forge-theme="light"] &[data-resizing]::after {
+    background: rgba(5, 150, 105, 0.85);
+  }
 `;
 
 const SplitSeparatorV = styled(Separator)`
@@ -361,6 +387,24 @@ const SplitSeparatorV = styled(Separator)`
   &[data-resizing]::after {
     background: rgba(16, 185, 129, 0.9);
   }
+
+  html[data-forge-theme="light"] &::before {
+    background: rgba(15, 23, 42, 0.14);
+  }
+
+  html[data-forge-theme="light"] &::after {
+    background: rgba(15, 23, 42, 0.28);
+  }
+
+  html[data-forge-theme="light"] &:hover::before,
+  html[data-forge-theme="light"] &[data-resizing]::before {
+    background: rgba(5, 150, 105, 0.5);
+  }
+
+  html[data-forge-theme="light"] &:hover::after,
+  html[data-forge-theme="light"] &[data-resizing]::after {
+    background: rgba(5, 150, 105, 0.85);
+  }
 `;
 
 const EditorArea = styled.div`
@@ -378,6 +422,10 @@ const AgentUnseenDot = styled.span`
   border-radius: 999px;
   background: #34d399;
   flex: none;
+
+  html[data-forge-theme="light"] & {
+    background: #059669;
+  }
 `;
 
 // Tiny loader on the Agent rail button while prompts sent from this pane are
@@ -395,6 +443,11 @@ const AgentBusySpinner = styled.span`
     to {
       transform: rotate(360deg);
     }
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(37, 99, 235, 0.25);
+    border-top-color: #1d4ed8;
   }
 `;
 
@@ -441,6 +494,25 @@ const AgentEditToast = styled.div`
       border-color: rgba(16, 185, 129, 0.6);
     }
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(5, 150, 105, 0.4);
+    background: #ffffff;
+    box-shadow: 0 10px 26px rgba(15, 23, 42, 0.14);
+
+    span {
+      color: #047857;
+    }
+
+    button {
+      border-color: rgba(15, 23, 42, 0.16);
+      color: #0f172a;
+
+      &:hover {
+        border-color: rgba(5, 150, 105, 0.5);
+      }
+    }
+  }
 `;
 
 const PreviewCell = styled.div`
@@ -484,6 +556,12 @@ const InstallChip = styled.button`
   &:disabled {
     cursor: default;
     opacity: 0.85;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(217, 119, 6, 0.4);
+    background: rgba(217, 119, 6, 0.1);
+    color: #92400e;
   }
 `;
 
@@ -802,6 +880,10 @@ const ProjectRowMeta = styled.span`
   font-weight: 650;
   color: #7d8ca3;
   white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
 `;
 
 const CreateRow = styled.form`

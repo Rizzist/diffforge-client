@@ -78,6 +78,10 @@ const Toolbar = styled.div`
   padding: 8px 12px;
   border-bottom: 1px solid rgba(148, 163, 184, 0.14);
   flex: 0 0 auto;
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(15, 23, 42, 0.1);
+  }
 `;
 
 const ToolbarButton = styled.button`
@@ -99,6 +103,16 @@ const ToolbarButton = styled.button`
     opacity: 0.5;
     cursor: default;
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(16, 185, 129, 0.34);
+    background: rgba(16, 185, 129, 0.12);
+    color: #047857;
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    background: rgba(16, 185, 129, 0.2);
+  }
 `;
 
 const ToolbarSpacer = styled.div`
@@ -108,6 +122,10 @@ const ToolbarSpacer = styled.div`
 const ToolbarCount = styled.span`
   font-size: 11px;
   color: #94a3b8;
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
 `;
 
 const ToolbarError = styled.span`
@@ -117,6 +135,10 @@ const ToolbarError = styled.span`
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 40%;
+
+  html[data-forge-theme="light"] & {
+    color: #dc2626;
+  }
 `;
 
 const GridArea = styled.div`
@@ -139,6 +161,10 @@ const GridSeparator = styled(Separator)`
   &:hover {
     background: rgba(16, 185, 129, 0.16);
   }
+
+  html[data-forge-theme="light"] &:hover {
+    background: rgba(16, 185, 129, 0.18);
+  }
 `;
 
 const EmptyState = styled.div`
@@ -151,6 +177,10 @@ const EmptyState = styled.div`
   color: #94a3b8;
   font-size: 13px;
   text-align: center;
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
 `;
 
 const ChooserShell = styled.div`
@@ -167,18 +197,31 @@ const ChooserShell = styled.div`
   background: #07101d;
   border: 1px dashed rgba(148, 163, 184, 0.26);
   border-radius: 10px;
+
+  html[data-forge-theme="light"] & {
+    background: #f8fafc;
+    border-color: rgba(15, 23, 42, 0.16);
+  }
 `;
 
 const ChooserTitle = styled.div`
   font-size: 13px;
   font-weight: 600;
   color: #a7f3d0;
+
+  html[data-forge-theme="light"] & {
+    color: #047857;
+  }
 `;
 
 const ChooserHint = styled.div`
   font-size: 11px;
   color: #94a3b8;
   text-align: center;
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
 `;
 
 const ChooserClose = styled.button`
@@ -198,6 +241,15 @@ const ChooserClose = styled.button`
   &:hover {
     background: rgba(148, 163, 184, 0.16);
     color: #ffffff;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #475569;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    background: rgba(15, 23, 42, 0.06);
+    color: #0f172a;
   }
 `;
 
@@ -228,6 +280,12 @@ const ChooserInput = styled.input`
     border-color: rgba(16, 185, 129, 0.55);
     box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.14);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.14);
+    color: #0f172a;
+    background: #ffffff;
+  }
 `;
 
 const ChooserCreateActions = styled.div`
@@ -250,6 +308,17 @@ const ChooserCancelButton = styled.button`
   &:hover:not(:disabled) {
     border-color: rgba(148, 163, 184, 0.34);
     color: rgba(241, 245, 249, 0.94);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.12);
+    color: #475569;
+    background: #f8fafc;
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    border-color: rgba(15, 23, 42, 0.2);
+    color: #0f172a;
   }
 `;
 
