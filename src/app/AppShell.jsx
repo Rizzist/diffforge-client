@@ -44,6 +44,7 @@ import {
   validateWorkspaceProjectCommandPayload,
   validateWorkspaceProjectCommandWorkspace,
   videoProjectIdFromPath,
+  workspaceProjectActiveIdFromPath,
   workspaceProjectInventoriesEqual,
 } from "./workspaceProjectInventory.js";
 import { VIDEO_PROJECT_DELETED_EVENT } from "../video/videoPanelBridge.js";
@@ -543,6 +544,12 @@ import {
   LoopspaceDispatchTodoEmpty,
   LoopspaceDispatchTodoNumber,
   LoopspaceDispatchTodoRow,
+  LoopspaceDispatchTerminalDot,
+  LoopspaceDispatchTerminalIndex,
+  LoopspaceDispatchTerminalMeta,
+  LoopspaceDispatchTerminalName,
+  LoopspaceDispatchTerminalOption,
+  LoopspaceDispatchTerminalWorkspace,
   LoopspaceDispatchTodoStatusDot,
   LoopspaceGraphNodeTimer,
   LoopspaceGraphTriggerRunButton,
@@ -6507,6 +6514,69 @@ function loopspaceDispatchTodosLinesFromText(value = "") {
     .filter(Boolean);
 }
 
+// Build the rich terminal picker options (color · name · harness · index) for a
+// dispatch-todos node, scoped to the currently-targeted workspace ids. Falls back
+// to every known workspace's terminals when no target is set yet so the picker is
+// still useful before a workspace is chosen.
+function buildLoopspaceDispatchTerminalOptions(workspaceTerminalsWorkspaces = [], targetWorkspaceIds = []) {
+  const rows = Array.isArray(workspaceTerminalsWorkspaces) ? workspaceTerminalsWorkspaces : [];
+  const targetIds = new Set(
+    (Array.isArray(targetWorkspaceIds) ? targetWorkspaceIds : [])
+      .map((id) => String(id || "").trim())
+      .filter(Boolean),
+  );
+  const multiWorkspace = targetIds.size !== 1;
+  const seen = new Set();
+  const options = [];
+  rows.forEach((row) => {
+    const workspaceId = String(row?.workspaceId || row?.workspace_id || "").trim();
+    if (targetIds.size && !targetIds.has(workspaceId)) return;
+    const workspaceName = String(row?.workspaceName || row?.name || row?.workspace_name || workspaceId).trim();
+    const terminals = Array.isArray(row?.terminals) ? row.terminals : [];
+    terminals.forEach((terminal) => {
+      const terminalIndex = Number(terminal?.terminalIndex ?? terminal?.terminal_index);
+      if (!Number.isInteger(terminalIndex)) return;
+      const value = `${workspaceId}::${terminalIndex}`;
+      if (seen.has(value)) return;
+      seen.add(value);
+      const name = String(
+        terminal?.terminalNickname
+          || terminal?.terminalName
+          || terminal?.displayName
+          || terminal?.agentDisplayName
+          || "",
+      ).trim() || `Terminal ${terminalIndex + 1}`;
+      const harness = String(terminal?.agentLabel || terminal?.agent_label || terminal?.agentType || "").trim();
+      const providerSessionId = String(
+        terminal?.providerSessionId
+          || terminal?.provider_session_id
+          || terminal?.nativeSessionId
+          || terminal?.native_session_id
+          || terminal?.sessionId
+          || terminal?.session_id
+          || "",
+      ).trim();
+      options.push({
+        value,
+        workspaceId,
+        workspaceName,
+        terminalIndex,
+        name,
+        harness,
+        color: String(terminal?.color || "").trim(),
+        paneId: String(terminal?.paneId || terminal?.pane_id || "").trim(),
+        providerSessionId,
+        connected: terminal?.connected === false ? false : true,
+        multiWorkspace,
+      });
+    });
+  });
+  return options.sort((left, right) => (
+    left.workspaceName.localeCompare(right.workspaceName, undefined, { sensitivity: "base" })
+      || left.terminalIndex - right.terminalIndex
+  ));
+}
+
 const LOOPSPACE_NOTIFY_DEVICE_DELIVERY_OPTIONS = [
   { value: "auto", label: "Auto (native, then push)" },
   { value: "native", label: "Native only" },
@@ -8740,6 +8810,8 @@ function LoopspaceRuntimeView({
   loopspace,
   onActivateWorkspaceForTodoDispatch = null,
   visible = true,
+  workspaces = [],
+  workspaceTerminalsWorkspaces = [],
   workspaceTodos = null,
 }) {
   const [runtimePanelTab, setRuntimePanelTab] = useState("runtime");
@@ -12347,8 +12419,84 @@ function LoopspaceRuntimeView({
         dispatchDraft.model,
       );
       const dispatchPending = dispatchTodosPendingNodeId === node.id;
-      const dispatchWorkspaceCount = loopspaceDispatchTodosSplitList(dispatchDraft.target_workspace_ids).length;
+      const dispatchWorkspaceIds = loopspaceDispatchTodosSplitList(dispatchDraft.target_workspace_ids);
+      const dispatchWorkspaceCount = dispatchWorkspaceIds.length;
       const dispatchTodoCount = loopspaceDispatchTodosLinesFromText(dispatchDraft.todo_lines).length;
+      const dispatchWorkspaceCatalog = Array.isArray(workspaces) ? workspaces : [];
+      const dispatchWorkspaceKnownIds = new Set(
+        dispatchWorkspaceCatalog.map((workspace) => String(workspace?.id || "").trim()).filter(Boolean),
+      );
+      const dispatchWorkspaceOptions = [
+        ...dispatchWorkspaceCatalog
+          .map((workspace) => {
+            const id = String(workspace?.id || "").trim();
+            if (!id) return null;
+            return { value: id, label: String(workspace?.name || "").trim() || id };
+          })
+          .filter(Boolean),
+        // Keep ids that are still targeted but no longer in the catalog visible.
+        ...dispatchWorkspaceIds
+          .filter((id) => !dispatchWorkspaceKnownIds.has(id))
+          .map((id) => ({ value: id, label: id })),
+      ];
+      const dispatchTerminalOptions = buildLoopspaceDispatchTerminalOptions(
+        workspaceTerminalsWorkspaces,
+        dispatchWorkspaceIds,
+      );
+      const dispatchTerminalPaneId = String(dispatchDraft.target_terminal_id || "").trim();
+      const dispatchTerminalName = String(dispatchDraft.target_terminal_name || "").trim();
+      const dispatchTerminalIndexRaw = String(dispatchDraft.target_terminal_index || "").trim();
+      const dispatchTerminalMatch = dispatchTerminalOptions.find((option) => (
+        (dispatchTerminalPaneId && (option.paneId === dispatchTerminalPaneId || option.providerSessionId === dispatchTerminalPaneId))
+          || (dispatchTerminalIndexRaw !== ""
+            && String(option.terminalIndex) === dispatchTerminalIndexRaw
+            && (dispatchWorkspaceIds.length !== 1 || option.workspaceId === dispatchWorkspaceIds[0]))
+          || (dispatchTerminalName && option.name === dispatchTerminalName)
+      )) || null;
+      const dispatchTerminalHasSelection = Boolean(
+        dispatchTerminalPaneId || dispatchTerminalName || dispatchTerminalIndexRaw,
+      );
+      const dispatchTerminalCustomLabel = dispatchTerminalName
+        || dispatchTerminalPaneId
+        || (dispatchTerminalIndexRaw !== "" ? `Terminal ${Number(dispatchTerminalIndexRaw) + 1}` : "");
+      const dispatchTerminalMenuOptions = [
+        { value: "", name: "Any terminal", harness: "", color: "", terminalIndex: null, __any: true },
+        ...dispatchTerminalOptions,
+        ...(!dispatchTerminalMatch && dispatchTerminalHasSelection
+          ? [{
+            value: "__custom",
+            name: dispatchTerminalCustomLabel || "Custom terminal",
+            harness: "",
+            color: "",
+            terminalIndex: dispatchTerminalIndexRaw !== "" ? Number(dispatchTerminalIndexRaw) : null,
+            workspaceName: "",
+            __custom: true,
+          }]
+          : []),
+      ];
+      const dispatchTerminalValue = dispatchTerminalMatch
+        ? dispatchTerminalMatch.value
+        : (dispatchTerminalHasSelection ? "__custom" : "");
+      const renderDispatchTerminalOption = (option) => (
+        <LoopspaceDispatchTerminalOption data-muted={option.connected === false ? "true" : undefined}>
+          {option.__any || option.__custom ? null : (
+            <LoopspaceDispatchTerminalDot
+              $color={option.color || undefined}
+              data-disconnected={option.connected === false ? "true" : undefined}
+            />
+          )}
+          <LoopspaceDispatchTerminalName>{option.name}</LoopspaceDispatchTerminalName>
+          {option.harness ? (
+            <LoopspaceDispatchTerminalMeta>{option.harness}</LoopspaceDispatchTerminalMeta>
+          ) : null}
+          {option.multiWorkspace && option.workspaceName ? (
+            <LoopspaceDispatchTerminalWorkspace>{option.workspaceName}</LoopspaceDispatchTerminalWorkspace>
+          ) : null}
+          {Number.isInteger(option.terminalIndex) ? (
+            <LoopspaceDispatchTerminalIndex>#{option.terminalIndex + 1}</LoopspaceDispatchTerminalIndex>
+          ) : null}
+        </LoopspaceDispatchTerminalOption>
+      );
       return (
         <LoopspaceRuntimePanelSettingsInspector data-kind="dispatch_todos">
           {renderSettingsHeader("Dispatch todos")}
@@ -12382,54 +12530,6 @@ function LoopspaceRuntimeView({
                     />
                   </LoopspaceGraphMessageSettingsField>
                   <LoopspaceGraphMessageSettingsField>
-                    <span>Workspaces</span>
-                    <LoopspaceGraphDocumentSearch
-                      aria-label="Target workspace ids"
-                      disabled={busy || dispatchPending}
-                      onChange={(event) => updateDispatchTodosSettingsDraft(node.id, {
-                        target_workspace_ids: event.target.value,
-                      })}
-                      placeholder="workspace-id, another-workspace"
-                      value={dispatchDraft.target_workspace_ids}
-                    />
-                  </LoopspaceGraphMessageSettingsField>
-                  <LoopspaceGraphMessageSettingsField>
-                    <span>Terminal ID</span>
-                    <LoopspaceGraphDocumentSearch
-                      aria-label="Target terminal id"
-                      disabled={busy || dispatchPending}
-                      onChange={(event) => updateDispatchTodosSettingsDraft(node.id, {
-                        target_terminal_id: event.target.value,
-                      })}
-                      placeholder="Optional pane id"
-                      value={dispatchDraft.target_terminal_id}
-                    />
-                  </LoopspaceGraphMessageSettingsField>
-                  <LoopspaceGraphMessageSettingsField>
-                    <span>Terminal name</span>
-                    <LoopspaceGraphDocumentSearch
-                      aria-label="Target terminal name"
-                      disabled={busy || dispatchPending}
-                      onChange={(event) => updateDispatchTodosSettingsDraft(node.id, {
-                        target_terminal_name: event.target.value,
-                      })}
-                      placeholder="Optional name"
-                      value={dispatchDraft.target_terminal_name}
-                    />
-                  </LoopspaceGraphMessageSettingsField>
-                  <LoopspaceGraphMessageSettingsField>
-                    <span>Terminal index</span>
-                    <LoopspaceGraphDocumentSearch
-                      aria-label="Target terminal index"
-                      disabled={busy || dispatchPending}
-                      onChange={(event) => updateDispatchTodosSettingsDraft(node.id, {
-                        target_terminal_index: event.target.value,
-                      })}
-                      placeholder="Optional number"
-                      value={dispatchDraft.target_terminal_index}
-                    />
-                  </LoopspaceGraphMessageSettingsField>
-                  <LoopspaceGraphMessageSettingsField>
                     <span>Enable wait</span>
                     <LoopspaceGraphDocumentSearch
                       aria-label="Workspace enable wait milliseconds"
@@ -12439,6 +12539,56 @@ function LoopspaceRuntimeView({
                       })}
                       placeholder="30000"
                       value={dispatchDraft.enable_wait_ms}
+                    />
+                  </LoopspaceGraphMessageSettingsField>
+                  <LoopspaceGraphMessageSettingsField data-span="full">
+                    <span>Workspaces</span>
+                    <AppSelect
+                      aria-label="Target workspaces"
+                      isDisabled={busy || dispatchPending}
+                      isMulti
+                      isSearchable
+                      onChange={(values) => updateDispatchTodosSettingsDraft(node.id, {
+                        target_workspace_ids: (Array.isArray(values) ? values : []).join(", "),
+                      })}
+                      options={dispatchWorkspaceOptions}
+                      placeholder="Select workspaces…"
+                      value={dispatchWorkspaceIds}
+                    />
+                  </LoopspaceGraphMessageSettingsField>
+                  <LoopspaceGraphMessageSettingsField data-span="full">
+                    <span>Terminal</span>
+                    <AppSelect
+                      aria-label="Target terminal"
+                      formatOptionLabel={renderDispatchTerminalOption}
+                      isDisabled={busy || dispatchPending}
+                      isSearchable
+                      getOptionLabel={(option) => (
+                        option.__any || option.__custom
+                          ? option.name
+                          : `${option.name} ${option.harness || ""} #${option.terminalIndex + 1}`
+                      )}
+                      onChange={(value, option) => {
+                        if (!option || option.__any || value === "") {
+                          updateDispatchTodosSettingsDraft(node.id, {
+                            target_terminal_id: "",
+                            target_terminal_index: "",
+                            target_terminal_name: "",
+                          });
+                          return;
+                        }
+                        if (option.__custom) return;
+                        updateDispatchTodosSettingsDraft(node.id, {
+                          target_terminal_id: option.paneId || option.providerSessionId || "",
+                          target_terminal_index: Number.isInteger(option.terminalIndex)
+                            ? String(option.terminalIndex)
+                            : "",
+                          target_terminal_name: option.name || "",
+                        });
+                      }}
+                      options={dispatchTerminalMenuOptions}
+                      placeholder="Any terminal"
+                      value={dispatchTerminalValue}
                     />
                   </LoopspaceGraphMessageSettingsField>
                   <LoopspaceGraphMessageSettingsField>
@@ -22142,6 +22292,63 @@ function workspacePanelSnapshotCurrent(panel = {}, workspaceActive = false) {
     return ["active", "busy", "connected", "idle", "loading", "open", "opening", "ready", "running", "starting"].some((token) => status.includes(token));
   }
   return Boolean(workspaceActive);
+}
+
+function workspacePanelProjectPath(panel = {}, kind = "") {
+  const normalizedKind = normalizeWorkspacePaneKind(
+    panel?.kind || panel?.panelKind || panel?.panel_kind || panel?.surface_kind,
+  );
+  const requestedKind = normalizeWorkspacePaneKind(kind);
+  if (!normalizedKind || normalizedKind !== requestedKind) {
+    return "";
+  }
+  const context = panel?.context && typeof panel.context === "object" ? panel.context : {};
+  if (requestedKind === WORKSPACE_PANE_KIND_PCB) {
+    return workspacePanelSnapshotText(
+      context.boardPath
+        || context.board_path
+        || context.board?.path
+        || panel.boardPath
+        || panel.board_path
+        || "",
+    );
+  }
+  if (requestedKind === WORKSPACE_PANE_KIND_VIDEO) {
+    return workspacePanelSnapshotText(
+      context.projectPath
+        || context.project_path
+        || context.project?.path
+        || panel.projectPath
+        || panel.project_path
+        || "",
+    );
+  }
+  return "";
+}
+
+function workspaceActiveProjectIdFromPanelSnapshots(panels, kind, projects) {
+  const candidates = (Array.isArray(panels) ? panels : [])
+    .filter((panel) => workspacePanelProjectPath(panel, kind));
+  const activeCandidate = candidates.find((panel) => workspacePanelSnapshotBool(panel?.active));
+  const selected = activeCandidate || candidates[0] || null;
+  const activePath = workspacePanelProjectPath(selected, kind);
+  return workspaceProjectActiveIdFromPath(activePath, projects, kind);
+}
+
+function workspaceLivePanelSnapshotsFromBridge(bridge, workspace = {}) {
+  if (typeof bridge?.listWorkspacePanels !== "function") {
+    return [];
+  }
+  try {
+    const result = bridge.listWorkspacePanels({
+      includeContext: true,
+      workspaceId: workspace?.id || workspace?.workspaceId || workspace?.workspace_id || "",
+      workspaceName: workspace?.name || workspace?.workspaceName || workspace?.workspace_name || "",
+    });
+    return Array.isArray(result?.panels) ? result.panels : [];
+  } catch {
+    return [];
+  }
 }
 
 function buildWorkspacePanelSnapshot({
@@ -37010,6 +37217,24 @@ export default function App() {
         .map(sanitizeWorkspaceMcpServerForCloud)
         .filter(Boolean);
       const workspaceProjectInventory = workspaceProjectInventories[workspaceId] || null;
+      const workspaceToolBridge = workspaceToolRuntimeBridges[workspaceId] || null;
+      const livePanelSnapshots = workspaceLivePanelSnapshotsFromBridge(
+        workspaceToolBridge,
+        workspace,
+      );
+      const activeProjectPanelSnapshots = typeof workspaceToolBridge?.listWorkspacePanels === "function"
+        ? livePanelSnapshots
+        : panels;
+      const pcbActiveProjectId = workspaceActiveProjectIdFromPanelSnapshots(
+        activeProjectPanelSnapshots,
+        WORKSPACE_PANE_KIND_PCB,
+        workspaceProjectInventory?.pcb_projects,
+      );
+      const videoActiveProjectId = workspaceActiveProjectIdFromPanelSnapshots(
+        activeProjectPanelSnapshots,
+        WORKSPACE_PANE_KIND_VIDEO,
+        workspaceProjectInventory?.video_projects,
+      );
       targets.push({
         dashboardWorkspace: true,
         displaySurface: "dashboard_workspace",
@@ -37031,9 +37256,11 @@ export default function App() {
         pcb_projects: Array.isArray(workspaceProjectInventory?.pcb_projects)
           ? workspaceProjectInventory.pcb_projects
           : [],
+        pcb_active_project_id: pcbActiveProjectId,
         video_projects: Array.isArray(workspaceProjectInventory?.video_projects)
           ? workspaceProjectInventory.video_projects
           : [],
+        video_active_project_id: videoActiveProjectId,
         terminalClearReason: terminalListEmptyAuthoritative ? "all_terminals_closed" : "",
         terminalCount: terminals.length,
         terminals,
@@ -37071,7 +37298,9 @@ export default function App() {
     shouldShowWorkspaceSetup,
     workspaceProjectInventories,
     workspaceTerminalsWorkspaces,
+    workspaceTerminalsLiveSyncRevision,
     workspaceSettings,
+    workspaceToolRuntimeBridges,
     workspaceMcpRegistries,
     workspaceTerminalFallbackRole,
     workspaceTerminalLogicalIndexes,
@@ -38122,6 +38351,9 @@ export default function App() {
   const workspaceToolPaneVisible = workspaceToolPaneAvailable;
   const workspaceToolPaneMinimized = workspaceToolPaneMode === TODO_QUEUE_PANE_MODE_MINIMIZED;
   const workspaceToolPaneFullscreen = workspaceToolPaneMode === TODO_QUEUE_PANE_MODE_FULLSCREEN;
+  const workspaceToolPanelLayoutMode = workspaceToolPaneVisible
+    ? workspaceToolPaneMode
+    : TODO_QUEUE_PANE_MODE_MINIMIZED;
   const workspaceToolMinimizedSize = workspaceToolLayoutWidth > 0
     ? Math.min(4, Math.max(2.8, (WORKSPACE_TOOL_MINIMIZED_WIDTH_PX / workspaceToolLayoutWidth) * 100))
     : 3.2;
@@ -38149,7 +38381,11 @@ export default function App() {
   const workspaceMainPanelMinSize = workspaceToolPaneVisible
     ? workspaceToolPaneMinimized ? 72 : 30
     : 100;
-  const shouldRenderWorkspaceToolPanel = workspaceToolPaneAvailable;
+  // Mount is app-level and view-independent: keep TodoQueuePanel mounted across
+  // view switches (Tools/Settings/Assets/Audio/etc.) so the orchestrator /
+  // agent-chat session never resets. Visibility + sizing stay driven by
+  // workspaceToolPaneVisible (0% width + aria-hidden when not on the workspace view).
+  const shouldRenderWorkspaceToolPanel = !shouldShowWorkspaceSetup;
   const selectedWorkspaceToolRuntimeBridge = selectedWorkspaceToolWorkspaceId
     ? workspaceToolRuntimeBridges[selectedWorkspaceToolWorkspaceId] || null
     : null;
@@ -38297,6 +38533,15 @@ export default function App() {
         [safeWorkspaceId]: nextBridge,
       };
     });
+  }, []);
+  const handleWorkspaceProjectActiveChange = useCallback((event = {}) => {
+    const workspaceId = String(event?.workspaceId || event?.workspace_id || "").trim();
+    const kind = normalizeWorkspacePaneKind(event?.kind || event?.panelKind || event?.panel_kind || "");
+    if (!workspaceId || (kind !== WORKSPACE_PANE_KIND_PCB && kind !== WORKSPACE_PANE_KIND_VIDEO)) {
+      return;
+    }
+    workspaceTerminalsSyncKeyRef.current = "";
+    setWorkspaceTerminalsLiveSyncRevision((revision) => revision + 1);
   }, []);
   const openNetworkingOverlay = useCallback(() => {
     setNetworkingOverlayOpen(true);
@@ -53837,6 +54082,7 @@ export default function App() {
                             plan={billingPlanName}
                             onMinimizeWorkspaceToolPane={minimizeWorkspaceToolPane}
                             onToggleFullscreenWorkspaceToolPane={toggleFullscreenWorkspaceToolPane}
+                            onWorkspaceProjectActiveChange={handleWorkspaceProjectActiveChange}
                             onWorkspaceToolRuntimeBridgeChange={updateWorkspaceToolRuntimeBridge}
                             onWorkspaceThreadsViewStateChange={updateWorkspaceThreadsViewStateFromOverlay}
                             onThreadTerminalLifecycle={handleThreadTerminalLifecycle}
@@ -53898,6 +54144,8 @@ export default function App() {
                           onBack={unselectLoopspace}
                           onActivateWorkspaceForTodoDispatch={activateWorkspacesForLoopspaceTodoDispatch}
                           visible={visibleView === DEFAULT_WORKSPACE_VIEW && loopspacesModeActive}
+                          workspaces={workspaces}
+                          workspaceTerminalsWorkspaces={workspaceTerminalsWorkspaces}
                           workspaceTodos={cloudWorkspaceProgress.workspaceTodos}
                         />
                       ) : (
@@ -55642,7 +55890,7 @@ export default function App() {
                     )}
                       <ResizePanel
                         aria-hidden={workspaceToolPaneVisible ? undefined : "true"}
-                        data-pane-mode={workspaceToolPaneMode}
+                        data-pane-mode={workspaceToolPanelLayoutMode}
                         data-visible={workspaceToolPaneVisible ? "true" : "false"}
                         data-workspace-tool-panel="true"
                         defaultSize={`${workspaceToolPanelSize}%`}

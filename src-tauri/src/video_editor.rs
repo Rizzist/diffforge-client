@@ -54,6 +54,7 @@ const VIDEO_CLOUD_GENERATE_MAX_B64_BYTES: usize = 40 * 1024 * 1024;
 const VIDEO_CLOUD_GENERATE_ACK_TIMEOUT_SECS: u64 = 45;
 const VIDEO_DIRECT_UPSCALE_VIDEO_LIMIT_BYTES: u64 = 60 * 1024 * 1024;
 const VIDEO_DIRECT_UPSCALE_IMAGE_LIMIT_BYTES: u64 = 25 * 1024 * 1024;
+const VIDEO_DIRECT_GENERATION_AUDIO_LIMIT_BYTES: u64 = 15 * 1024 * 1024;
 const VIDEO_MCP_MIN_CLIP_DURATION_MS: u64 = 80;
 const VIDEO_MCP_REMOVE_WORDS_MERGE_GAP_MS: u64 = 80;
 const VIDEO_MCP_LOOK_MAX_FRAMES: usize = 6;
@@ -487,42 +488,19 @@ const VIDEO_GENERATION_PROVIDERS: &[VideoProviderDefinition] = &[
         default_base_url: "",
         models: &[
             "kling3_0",
-            "kling3_0_turbo",
             "kling2_6",
             "seedance_2_0",
-            "seedance_1_5_pro",
             "veo3_1",
-            "veo3_1_lite",
-            "veo3",
             "wan2_7",
-            "wan2_6",
             "minimax_hailuo",
-            "grok_video_1_5",
             "higgsfield_dop_lite",
-            "higgsfield_dop_turbo",
             "higgsfield_dop_standard",
             "kling_v2_5_turbo_pro_text_to_video",
             "kling_v2_5_turbo_pro_image_to_video",
             "kling_v2_1_pro_image_to_video",
             "seedance_v1_pro_image_to_video",
-            "nano_banana_pro",
-            "nano_banana_2",
-            "flux_2",
             "higgsfield_soul_standard",
             "reve_text_to_image",
-            "seedream_v4_text_to_image",
-            "seedream_v4_edit",
-            "flux_kontext",
-            "gpt_image_2",
-            "text2image_soul_v2",
-            "seedream_v4_5",
-            "seedream_v5_lite",
-            "grok_image",
-            "recraft_v4_1",
-            "text2speech_v2",
-            "sonilo_music",
-            "mirelo_sfx",
-            "higgsfield_speak",
             "seedvr2-video-upscaler",
             "esrgan-image-upscaler",
             "topaz-video-upscale",
@@ -549,11 +527,8 @@ const VIDEO_GENERATION_PROVIDERS: &[VideoProviderDefinition] = &[
         kind: "video",
         default_base_url: "https://platform.higgsfield.ai",
         models: &[
-            "dop-turbo",
-            "dop-standard",
-            "dop-lite",
-            "kling-video/v2.5-turbo/pro/text-to-video",
-            "kling-video/v2.5-turbo/pro/image-to-video",
+            "higgsfield-ai/dop/standard",
+            "higgsfield-ai/dop/preview",
             "kling-video/v2.1/pro/image-to-video",
             "bytedance/seedance/v1/pro/image-to-video",
         ],
@@ -604,7 +579,29 @@ const VIDEO_GENERATION_PROVIDERS: &[VideoProviderDefinition] = &[
         label: "fal.ai",
         kind: "mixed",
         default_base_url: "https://queue.fal.run",
-        models: &[],
+        models: &[
+            "fal-ai/veo3.1",
+            "fal-ai/veo3.1/image-to-video",
+            "fal-ai/veo3.1/first-last-frame-to-video",
+            "fal-ai/veo3.1/reference-to-video",
+            "bytedance/seedance-2.0/text-to-video",
+            "bytedance/seedance-2.0/image-to-video",
+            "bytedance/seedance-2.0/reference-to-video",
+            "fal-ai/kling-video/v3/pro/text-to-video",
+            "fal-ai/kling-video/v3/pro/image-to-video",
+            "fal-ai/kling-video/v3/standard/text-to-video",
+            "fal-ai/kling-video/v3/standard/image-to-video",
+            "fal-ai/kling-video/v2.6/pro/text-to-video",
+            "fal-ai/kling-video/v2.6/pro/image-to-video",
+            "fal-ai/kling-video/v2.5-turbo/pro/text-to-video",
+            "fal-ai/kling-video/v2.5-turbo/pro/image-to-video",
+            "fal-ai/wan/v2.7/text-to-video",
+            "fal-ai/wan/v2.7/image-to-video",
+            "fal-ai/minimax/hailuo-02/standard/text-to-video",
+            "fal-ai/minimax/hailuo-02/standard/image-to-video",
+            "fal-ai/seedvr/upscale/video",
+            "fal-ai/esrgan",
+        ],
         requires_secret_key: false,
     },
 ];
@@ -1080,16 +1077,7 @@ fn video_record_cloud_generation_relations(
         .first()
         .map(|path| video_manifest_asset_path(&context.root, &context.media_root, path))
         .transpose()?;
-    let audio_path = if context.model == "higgsfield_speak" {
-        context
-            .request
-            .audio_asset_paths
-            .first()
-            .map(|path| video_manifest_asset_path(&context.root, &context.media_root, path))
-            .transpose()?
-    } else {
-        None
-    };
+    let audio_path: Option<String> = None;
     if source_path.is_none() && audio_path.is_none() {
         return Ok(false);
     }
@@ -6133,41 +6121,20 @@ fn video_mcp_jobs_json(media_root: &std::path::Path) -> Vec<serde_json::Value> {
 fn video_mcp_generate_models(kind: Option<&str>) -> Vec<serde_json::Value> {
     // Keep in sync with src/video/generationCatalog.js.
     let rows = vec![
-        serde_json::json!({"id":"higgsfield_dop_turbo","kind":"video","name":"DoP Turbo","caps":{"requiresStartFrame":true,"maxReferenceImages":0},"estUsdPerSecond":0.08}),
         serde_json::json!({"id":"higgsfield_dop_standard","kind":"video","name":"DoP Standard","caps":{"requiresStartFrame":true,"maxReferenceImages":0},"estUsdPerSecond":0.10}),
-        serde_json::json!({"id":"higgsfield_dop_lite","kind":"video","name":"DoP Lite","caps":{"requiresStartFrame":true,"maxReferenceImages":0},"estUsdPerSecond":0.05}),
+        serde_json::json!({"id":"higgsfield_dop_lite","kind":"video","name":"DoP Preview","caps":{"requiresStartFrame":true,"maxReferenceImages":0},"estUsdPerSecond":0.05}),
         serde_json::json!({"id":"kling_v2_5_turbo_pro_text_to_video","kind":"video","name":"Kling 2.5 Turbo Pro","caps":{"durations":[5,10],"maxReferenceImages":0},"estUsdPerSecond":0.08}),
         serde_json::json!({"id":"kling_v2_5_turbo_pro_image_to_video","kind":"video","name":"Kling 2.5 Turbo Pro I2V","caps":{"durations":[5,10],"requiresStartFrame":true,"maxReferenceImages":0},"estUsdPerSecond":0.08}),
         serde_json::json!({"id":"kling_v2_1_pro_image_to_video","kind":"video","name":"Kling 2.1 Pro I2V","caps":{"durations":[5,10],"requiresStartFrame":true,"maxReferenceImages":0},"estUsdPerSecond":0.08}),
         serde_json::json!({"id":"seedance_v1_pro_image_to_video","kind":"video","name":"Seedance v1 Pro I2V","caps":{"durations":[5,10],"requiresStartFrame":true,"maxReferenceImages":0},"estUsdPerSecond":0.08}),
-        serde_json::json!({"id":"kling3_0","kind":"video","name":"Kling 3.0","caps":{"durations":[5,10],"resolutions":["720p","1080p"],"aspects":["16:9","9:16","1:1","4:3"],"maxReferenceImages":0},"estUsdPerSecond":0.09}),
-        serde_json::json!({"id":"kling3_0_turbo","kind":"video","name":"Kling 3.0 Turbo","caps":{"durations":[5,10],"resolutions":["720p","1080p"],"aspects":["16:9","9:16","1:1","4:3"],"maxReferenceImages":0},"estUsdPerSecond":0.05}),
-        serde_json::json!({"id":"kling2_6","kind":"video","name":"Kling 2.6","caps":{"durations":[5,10],"resolutions":["720p","1080p"],"aspects":["16:9","9:16","1:1","4:3"],"maxReferenceImages":0},"estUsdPerSecond":0.04}),
-        serde_json::json!({"id":"seedance_2_0","kind":"video","name":"Seedance 2.0","caps":{"durations":[4,5,8,10,12,15],"resolutions":["480p","720p","1080p"],"aspects":["16:9","9:16","1:1","4:3"],"maxReferenceImages":4,"supportsSound":true},"estUsdPerSecond":0.05}),
-        serde_json::json!({"id":"seedance_1_5_pro","kind":"video","name":"Seedance 1.5 Pro","caps":{"durations":[5,10],"resolutions":["480p","720p","1080p"],"aspects":["16:9","9:16","1:1","4:3"],"maxReferenceImages":0},"estUsdPerSecond":0.04}),
-        serde_json::json!({"id":"veo3_1","kind":"video","name":"Veo 3.1","caps":{"durations":[4,6,8],"resolutions":["720p","1080p"],"aspects":["16:9","9:16"],"maxReferenceImages":3,"sound":true},"estUsdPerSecond":0.40}),
-        serde_json::json!({"id":"veo3_1_lite","kind":"video","name":"Veo 3.1 Lite","caps":{"durations":[4,6,8],"resolutions":["720p","1080p"],"aspects":["16:9","9:16"],"maxReferenceImages":3,"sound":true},"estUsdPerSecond":0.15}),
-        serde_json::json!({"id":"wan2_7","kind":"video","name":"Wan 2.7","caps":{"durations":[5,10],"resolutions":["720p","1080p"],"aspects":["16:9","9:16","1:1","4:3"],"maxReferenceImages":0,"sound":true},"estUsdPerSecond":0.05}),
-        serde_json::json!({"id":"minimax_hailuo","kind":"video","name":"MiniMax Hailuo","caps":{"durations":[6,10],"resolutions":["720p","1080p"],"aspects":["16:9","9:16","1:1"],"maxReferenceImages":0},"estUsdPerSecond":0.045}),
-        serde_json::json!({"id":"grok_video_1_5","kind":"video","name":"Grok Video 1.5","caps":{"durations":[6],"resolutions":["720p"],"aspects":["16:9","9:16"],"maxReferenceImages":0,"sound":true},"estUsdPerSecond":0.05}),
-        serde_json::json!({"id":"higgsfield_speak","kind":"video","name":"Higgsfield Speak","caps":{"requiresStartFrame":true,"requiresInputAudio":true,"maxReferenceImages":0},"estUsdPerSecond":0.10}),
+        serde_json::json!({"id":"kling3_0","kind":"video","name":"Kling 3.0","caps":{"durations":[3,4,5,6,7,8,9,10,11,12,13,14,15],"aspects":["16:9","9:16","1:1"],"maxReferenceImages":0,"sound":true,"modes":["pro","standard"]},"estUsdPerSecond":0.112}),
+        serde_json::json!({"id":"kling2_6","kind":"video","name":"Kling 2.6","caps":{"durations":[5,10],"aspects":["16:9","9:16","1:1"],"maxReferenceImages":0,"sound":true},"estUsdPerSecond":0.14}),
+        serde_json::json!({"id":"seedance_2_0","kind":"video","name":"Seedance 2.0","caps":{"durations":[4,5,6,7,8,9,10,11,12,13,14,15],"resolutions":["480p","720p","1080p","4k"],"aspects":["21:9","16:9","4:3","1:1","3:4","9:16"],"maxReferenceImages":9,"sound":true},"estUsdPerSecond":0.30}),
+        serde_json::json!({"id":"veo3_1","kind":"video","name":"Veo 3.1","caps":{"durations":[4,6,8],"resolutions":["720p","1080p","4k"],"aspects":["16:9","9:16"],"maxReferenceImages":3,"sound":true},"estUsdPerSecond":0.40}),
+        serde_json::json!({"id":"wan2_7","kind":"video","name":"Wan 2.7","caps":{"durations":[2,3,4,5,6,7,8,9,10,11,12,13,14,15],"resolutions":["720p","1080p"],"aspects":["16:9","9:16","1:1","4:3","3:4"],"maxReferenceImages":0},"estUsdPerSecond":0.15}),
+        serde_json::json!({"id":"minimax_hailuo","kind":"video","name":"MiniMax Hailuo","caps":{"durations":[6,10],"maxReferenceImages":0},"estUsdPerSecond":0.045}),
         serde_json::json!({"id":"higgsfield_soul_standard","kind":"image","name":"Soul Standard","caps":{"resolutions":["2K","4K"],"aspects":["16:9","9:16","1:1","3:4","4:3","2:3","3:2"],"maxReferenceImages":0},"estUsdPerImage":0.05}),
-        serde_json::json!({"id":"seedream_v4_text_to_image","kind":"image","name":"Seedream 4","caps":{"resolutions":["1K","2K","4K"],"aspects":["16:9","9:16","1:1","3:4","4:3","2:3","3:2"],"maxReferenceImages":0},"estUsdPerImage":0.04}),
-        serde_json::json!({"id":"seedream_v4_edit","kind":"image","name":"Seedream 4 Edit","caps":{"resolutions":["1K","2K","4K"],"aspects":["16:9","9:16","1:1","3:4","4:3","2:3","3:2"],"maxReferenceImages":1},"estUsdPerImage":0.05}),
         serde_json::json!({"id":"reve_text_to_image","kind":"image","name":"Reve","caps":{"aspects":["16:9","9:16","1:1","3:4","4:3","2:3","3:2"],"maxReferenceImages":0},"estUsdPerImage":0.04}),
-        serde_json::json!({"id":"nano_banana_pro","kind":"image","name":"Nano Banana Pro","caps":{"resolutions":["1k","2k","4k"],"aspects":["16:9","9:16","1:1","3:4","4:3","2:3","3:2"],"maxReferenceImages":4},"estUsdPerImage":0.14}),
-        serde_json::json!({"id":"nano_banana_2","kind":"image","name":"Nano Banana 2","caps":{"resolutions":["1k","2k"],"aspects":["16:9","9:16","1:1","3:4","4:3","2:3","3:2"],"maxReferenceImages":4},"estUsdPerImage":0.04}),
-        serde_json::json!({"id":"flux_2","kind":"image","name":"FLUX.2","caps":{"resolutions":["1k","2k"],"aspects":["16:9","9:16","1:1","3:4","4:3","2:3","3:2"],"maxReferenceImages":4},"estUsdPerImage":0.05}),
-        serde_json::json!({"id":"flux_kontext","kind":"image","name":"FLUX Kontext","caps":{"aspects":["16:9","9:16","1:1","3:4","4:3","2:3","3:2"],"maxReferenceImages":1},"estUsdPerImage":0.06}),
-        serde_json::json!({"id":"gpt_image_2","kind":"image","name":"GPT Image 2","caps":{"qualities":["low","medium","high"],"aspects":["1:1","3:2","2:3"],"maxReferenceImages":4},"estUsdPerImage":0.08}),
-        serde_json::json!({"id":"text2image_soul_v2","kind":"image","name":"Soul V2","caps":{"qualities":["standard","hd"],"aspects":["1:1","3:4"],"maxReferenceImages":0},"estUsdPerImage":0.05}),
-        serde_json::json!({"id":"seedream_v4_5","kind":"image","name":"Seedream 4.5","caps":{"resolutions":["2k","4k"],"aspects":["16:9","9:16","1:1","3:4","4:3","2:3","3:2"],"maxReferenceImages":4},"estUsdPerImage":0.04}),
-        serde_json::json!({"id":"seedream_v5_lite","kind":"image","name":"Seedream V5 Lite","caps":{"resolutions":["1k","2k"],"aspects":["16:9","9:16","1:1","3:4","4:3","2:3","3:2"],"maxReferenceImages":4},"estUsdPerImage":0.02}),
-        serde_json::json!({"id":"grok_image","kind":"image","name":"Grok Image","caps":{"aspects":["16:9","9:16","1:1"],"maxReferenceImages":0},"estUsdPerImage":0.03}),
-        serde_json::json!({"id":"recraft_v4_1","kind":"image","name":"Recraft V4.1","caps":{"aspects":["16:9","9:16","1:1","3:4","4:3","2:3","3:2"],"maxReferenceImages":1},"estUsdPerImage":0.04}),
-        serde_json::json!({"id":"text2speech_v2","kind":"audio","name":"Text to Speech","caps":{"voices":["elevenlabs","minimax","seed_speech","vibe_voice","cozy_voice"]},"estUsdPerImage":0.03}),
-        serde_json::json!({"id":"sonilo_music","kind":"audio","name":"Sonilo Music","caps":{"durations":[10,20,30,60]},"estUsdPerSecond":0.01}),
-        serde_json::json!({"id":"mirelo_sfx","kind":"audio","name":"Mirelo SFX","caps":{"durations":[5,10,15]},"estUsdPerSecond":0.015}),
         serde_json::json!({"id":"hyperframes","kind":"code","name":"Hyperframes (HTML code render)","caps":{"twoPhase":true,"localRender":true},"estUsdPerSecond":0.0}),
     ];
     match kind {
@@ -11242,6 +11209,24 @@ fn video_provider_definition(provider_id: &str) -> Option<&'static VideoProvider
         .find(|provider| provider.id == provider_id)
 }
 
+fn video_validate_provider_model(
+    provider: &VideoProviderDefinition,
+    model: &str,
+) -> Result<(), String> {
+    let model = model.trim();
+    if model.is_empty() || provider.models.is_empty() {
+        return Ok(());
+    }
+    if provider.models.iter().any(|candidate| *candidate == model) {
+        return Ok(());
+    }
+    let valid = provider.models.join(", ");
+    Err(format!(
+        "Unsupported {} model mapping for provider {}: {}. Valid model ids: {}",
+        provider.label, provider.id, model, valid
+    ))
+}
+
 fn video_provider_base_url(
     provider: &VideoProviderDefinition,
     auth: &Option<VideoProviderAuth>,
@@ -11273,6 +11258,47 @@ fn video_http_body_excerpt(body: &str) -> String {
     body.chars().take(300).collect::<String>()
 }
 
+// Provider error bodies bury the human-readable message inside varying JSON
+// shapes (fal: detail[].msg, OpenAI-style: error.message, plain message/error
+// strings). Surface that message instead of a raw JSON dump that also echoes
+// the full request payload back at the user.
+fn video_http_error_detail(body: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return video_http_body_excerpt(body);
+    };
+    let mut messages: Vec<String> = Vec::new();
+    match value.get("detail") {
+        Some(serde_json::Value::String(text)) => messages.push(text.trim().to_string()),
+        Some(serde_json::Value::Array(items)) => {
+            for item in items {
+                if let Some(msg) = item.get("msg").and_then(serde_json::Value::as_str) {
+                    messages.push(msg.trim().to_string());
+                } else if let Some(text) = item.as_str() {
+                    messages.push(text.trim().to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+    if messages.is_empty() {
+        if let Some(text) = value
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| value.get("error").and_then(serde_json::Value::as_str))
+            .or_else(|| value.get("message").and_then(serde_json::Value::as_str))
+        {
+            messages.push(text.trim().to_string());
+        }
+    }
+    messages.retain(|message| !message.is_empty());
+    if messages.is_empty() {
+        return video_http_body_excerpt(body);
+    }
+    messages.dedup();
+    messages.join(" ")
+}
+
 async fn video_response_json(
     response: reqwest::Response,
     label: &str,
@@ -11286,7 +11312,7 @@ async fn video_response_json(
         return Err(format!(
             "{label} returned HTTP {}: {}",
             status,
-            video_http_body_excerpt(&body)
+            video_http_error_detail(&body)
         ));
     }
     serde_json::from_str::<serde_json::Value>(&body).map_err(|error| {
@@ -11631,7 +11657,8 @@ fn video_emit_generate_progress_event(
 }
 
 fn video_cloud_model_is_audio(model: &str) -> bool {
-    matches!(model, "text2speech_v2" | "sonilo_music" | "mirelo_sfx")
+    let _ = model;
+    false
 }
 
 fn video_generate_request_kind(
@@ -11641,8 +11668,6 @@ fn video_generate_request_kind(
 ) -> &'static str {
     if request.mode == "upscale-video" || request.mode == "upscale-image" {
         "upscale"
-    } else if provider.id == "cloud" && model == "higgsfield_speak" {
-        "video"
     } else if provider.id == "cloud" && video_cloud_model_is_audio(model) {
         "audio"
     } else if request.mode.contains("audio")
@@ -12418,32 +12443,7 @@ fn video_cloud_generate_payload(
     input.insert("mode".to_string(), serde_json::json!(request.mode.clone()));
 
     let mut total_b64 = 0usize;
-    if context.model == "higgsfield_speak" {
-        let start_path = request
-            .input_asset_paths
-            .first()
-            .ok_or_else(|| "Cloud Higgsfield Speak requires a face image asset.".to_string())?;
-        let audio_path = request
-            .audio_asset_paths
-            .first()
-            .ok_or_else(|| "Cloud Higgsfield Speak requires an input audio asset.".to_string())?;
-        let (b64, mime) = video_cloud_append_b64_asset(
-            &context.root,
-            &context.media_root,
-            start_path,
-            &mut total_b64,
-        )?;
-        input.insert("startFrameB64".to_string(), serde_json::json!(b64));
-        input.insert("startFrameMime".to_string(), serde_json::json!(mime));
-        let (b64, mime) = video_cloud_append_audio_b64_asset(
-            &context.root,
-            &context.media_root,
-            audio_path,
-            &mut total_b64,
-        )?;
-        input.insert("inputAudioB64".to_string(), serde_json::json!(b64));
-        input.insert("inputAudioMime".to_string(), serde_json::json!(mime));
-    } else if request.mode == "upscale-video" || request.mode == "upscale-image" {
+    if request.mode == "upscale-video" || request.mode == "upscale-image" {
         let source_path = request
             .input_asset_paths
             .first()
@@ -12498,7 +12498,7 @@ fn video_cloud_generate_payload(
             serde_json::Value::Array(reference_images),
         );
     }
-    if context.model != "higgsfield_speak" && !request.audio_asset_paths.is_empty() {
+    if !request.audio_asset_paths.is_empty() {
         let mut reference_audios = Vec::new();
         for input_path in &request.audio_asset_paths {
             let (b64, mime) = video_cloud_append_audio_b64_asset(
@@ -12685,16 +12685,14 @@ async fn video_generate_higgsfield(
     } else {
         endpoint_raw
     };
-    let (endpoint, dop_model) = match endpoint {
-        "dop-lite" | "higgsfield-ai/dop/lite" => ("v1/image2video/dop", Some("dop-lite")),
-        "dop-turbo" | "higgsfield-ai/dop/turbo" => ("v1/image2video/dop", Some("dop-turbo")),
-        "dop-standard" | "higgsfield-ai/dop/standard" => {
-            ("v1/image2video/dop", Some("dop-standard"))
-        }
-        value => (value, None),
+    let endpoint = match endpoint {
+        "dop-lite" | "higgsfield-ai/dop/lite" => "higgsfield-ai/dop/preview",
+        "dop-standard" => "higgsfield-ai/dop/standard",
+        value => value,
     };
+    let is_dop_endpoint = endpoint.starts_with("higgsfield-ai/dop/");
     let is_image_to_video_endpoint =
-        dop_model.is_some() || endpoint.contains("/image-to-video") || endpoint.contains("/dop/");
+        endpoint.contains("/image-to-video") || is_dop_endpoint;
     let mut body = serde_json::json!({
         "prompt": request.prompt,
     });
@@ -12702,26 +12700,21 @@ async fn video_generate_higgsfield(
         if let Some(duration) = params.duration_sec {
             body["duration"] = serde_json::json!((duration.round() as i64).clamp(5, 10));
         }
-        if let Some(seed) = params.seed {
+        if !is_dop_endpoint {
+            if let Some(seed) = params.seed {
             body["seed"] = serde_json::json!(seed.clamp(1, 1_000_000));
+            }
+            if let Some(provider_mode) = params
+                .extra
+                .get("providerMode")
+                .or_else(|| params.extra.get("provider_mode"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                body["mode"] = serde_json::json!(provider_mode);
+            }
         }
-        if let Some(provider_mode) = params
-            .extra
-            .get("providerMode")
-            .or_else(|| params.extra.get("provider_mode"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            body["mode"] = serde_json::json!(provider_mode);
-        }
-    }
-    if let Some(dop_model) = dop_model {
-        body["model"] = serde_json::json!(dop_model);
-        body.as_object_mut().map(|object| {
-            object.remove("duration");
-            object.remove("mode");
-        });
     }
     if is_image_to_video_endpoint {
         let input = request
@@ -12737,7 +12730,8 @@ async fn video_generate_higgsfield(
             input,
         )
         .await?;
-        let end_image_url = if let Some(end_input) = request.input_asset_paths.get(1) {
+        let end_image_url = if !is_dop_endpoint {
+            if let Some(end_input) = request.input_asset_paths.get(1) {
             Some(
                 video_higgsfield_upload_asset(
                     &client,
@@ -12751,30 +12745,18 @@ async fn video_generate_higgsfield(
             )
         } else {
             None
-        };
-        if dop_model.is_some() {
-            let mut input_images = vec![serde_json::json!({
-                "type": "image_url",
-                "image_url": start_image_url,
-            })];
-            if let Some(end_image_url) = end_image_url {
-                input_images.push(serde_json::json!({
-                    "type": "image_url",
-                    "image_url": end_image_url,
-                }));
             }
-            body["input_images"] = serde_json::Value::Array(input_images);
         } else {
-            body["image_url"] = serde_json::json!(start_image_url);
-            if let Some(end_image_url) = end_image_url {
-                body["end_image_url"] = serde_json::json!(end_image_url);
-            }
+            None
+        };
+        body["image_url"] = serde_json::json!(start_image_url);
+        if let Some(end_image_url) = end_image_url {
+            body["end_image_url"] = serde_json::json!(end_image_url);
         }
     } else {
         body.as_object_mut().map(|object| {
             object.remove("image_url");
             object.remove("end_image_url");
-            object.remove("input_images");
         });
     }
     let submit = client
@@ -13326,29 +13308,260 @@ fn video_fal_output_urls(result: &serde_json::Value) -> Vec<String> {
     urls
 }
 
-async fn video_generate_fal(
-    context: &VideoGenerateJobContext,
-    request: &VideoGenerateRequest,
-    provider: &VideoProviderDefinition,
-    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> Result<Vec<String>, String> {
-    let model = request.model.trim().trim_matches('/');
+fn video_fal_param_text(params: Option<&VideoGenerateParams>, field: &str) -> Option<String> {
+    let params = params?;
+    match field {
+        "aspect" | "aspect_ratio" => params.aspect.as_deref(),
+        "resolution" => params.resolution.as_deref(),
+        "negativePrompt" | "negative_prompt" => params
+            .extra
+            .get("negativePrompt")
+            .or_else(|| params.extra.get("negative_prompt"))
+            .and_then(serde_json::Value::as_str),
+        "providerMode" | "provider_mode" => params
+            .extra
+            .get("providerMode")
+            .or_else(|| params.extra.get("provider_mode"))
+            .and_then(serde_json::Value::as_str),
+        _ => params.extra.get(field).and_then(serde_json::Value::as_str),
+    }
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .map(str::to_string)
+}
+
+fn video_fal_param_bool(params: Option<&VideoGenerateParams>, keys: &[&str]) -> Option<bool> {
+    let params = params?;
+    keys.iter().find_map(|key| {
+        params.extra.get(*key).and_then(|value| {
+            value.as_bool().or_else(|| match value.as_str()?.trim() {
+                "true" | "1" | "yes" => Some(true),
+                "false" | "0" | "no" => Some(false),
+                _ => None,
+            })
+        })
+    })
+}
+
+fn video_fal_param_allowed(
+    params: Option<&VideoGenerateParams>,
+    field: &str,
+    allowed: &[&str],
+) -> Option<String> {
+    let value = video_fal_param_text(params, field)?;
+    allowed
+        .iter()
+        .any(|allowed_value| value.eq_ignore_ascii_case(allowed_value))
+        .then_some(value)
+}
+
+fn video_fal_duration_nearest(
+    params: Option<&VideoGenerateParams>,
+    allowed: &[u64],
+    default: u64,
+) -> u64 {
+    let requested = params
+        .and_then(|params| params.duration_sec)
+        .filter(|value| value.is_finite())
+        .map(|value| value.round().max(1.0) as u64)
+        .unwrap_or(default);
+    allowed
+        .iter()
+        .copied()
+        .min_by_key(|candidate| candidate.abs_diff(requested))
+        .unwrap_or(default)
+}
+
+fn video_fal_duration_clamped(
+    params: Option<&VideoGenerateParams>,
+    min: u64,
+    max: u64,
+    default: u64,
+) -> u64 {
+    params
+        .and_then(|params| params.duration_sec)
+        .filter(|value| value.is_finite())
+        .map(|value| value.round().clamp(min as f64, max as f64) as u64)
+        .unwrap_or(default)
+}
+
+fn video_fal_insert_seed(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+    params: Option<&VideoGenerateParams>,
+) {
+    if let Some(seed) = params.and_then(|params| params.seed) {
+        body.insert("seed".to_string(), serde_json::json!(seed));
+    }
+}
+
+fn video_fal_insert_negative_prompt(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+    params: Option<&VideoGenerateParams>,
+) {
+    if let Some(negative_prompt) = video_fal_param_text(params, "negativePrompt") {
+        body.insert(
+            "negative_prompt".to_string(),
+            serde_json::json!(negative_prompt),
+        );
+    }
+}
+
+fn video_fal_insert_common_video_fields(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+    params: Option<&VideoGenerateParams>,
+    aspect_allowed: &[&str],
+    resolution_allowed: &[&str],
+    audio_key: &str,
+) {
+    if let Some(aspect_ratio) = video_fal_param_allowed(params, "aspect", aspect_allowed) {
+        body.insert("aspect_ratio".to_string(), serde_json::json!(aspect_ratio));
+    }
+    if let Some(resolution) = video_fal_param_allowed(params, "resolution", resolution_allowed) {
+        body.insert("resolution".to_string(), serde_json::json!(resolution));
+    }
+    if !audio_key.is_empty() {
+        if let Some(generate_audio) = video_fal_param_bool(params, &["sound", "generateAudio"]) {
+            body.insert(audio_key.to_string(), serde_json::json!(generate_audio));
+        }
+    }
+    video_fal_insert_seed(body, params);
+    video_fal_insert_negative_prompt(body, params);
+}
+
+fn video_fal_insert_seedance20_fields(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+    params: Option<&VideoGenerateParams>,
+) {
+    body.insert(
+        "duration".to_string(),
+        serde_json::json!(video_fal_duration_clamped(params, 4, 15, 5).to_string()),
+    );
+    if let Some(aspect_ratio) = video_fal_param_allowed(
+        params,
+        "aspect",
+        &["auto", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"],
+    ) {
+        body.insert("aspect_ratio".to_string(), serde_json::json!(aspect_ratio));
+    }
+    if let Some(resolution) =
+        video_fal_param_allowed(params, "resolution", &["480p", "720p", "1080p", "4k"])
+    {
+        body.insert("resolution".to_string(), serde_json::json!(resolution));
+    }
+    if let Some(generate_audio) = video_fal_param_bool(params, &["sound", "generateAudio"]) {
+        body.insert("generate_audio".to_string(), serde_json::json!(generate_audio));
+    }
+}
+
+fn video_fal_concrete_model(request: &VideoGenerateRequest) -> Result<String, String> {
+    let mut model = request.model.trim().trim_matches('/').to_string();
     if model.is_empty() {
         return Err("fal provider requires a full model queue path.".to_string());
     }
-    let client = http_client(std::time::Duration::from_secs(120))?;
-    let base = video_provider_base_url(provider, &request.auth);
-    let api_key = video_auth_api_key(&request.auth)?;
-    let mut body = video_generate_params_body(request.params.as_ref());
-    if !request.prompt.trim().is_empty() {
-        body.insert("prompt".to_string(), serde_json::json!(request.prompt));
+    if model.starts_with("fal-ai/kling-video/v3/") {
+        let tier = match video_fal_param_text(request.params.as_ref(), "providerMode")
+            .as_deref()
+        {
+            Some("std") | Some("standard") => "standard",
+            _ => "pro",
+        };
+        model = model
+            .replace("/v3/pro/", &format!("/v3/{tier}/"))
+            .replace("/v3/standard/", &format!("/v3/{tier}/"));
     }
-    match request.mode.as_str() {
-        "upscale-video" => {
-            let input = request
-                .input_asset_paths
-                .first()
-                .ok_or_else(|| "fal upscale-video requires an input asset.".to_string())?;
+    if model == "fal-ai/veo3.1" {
+        if request.mode == "image-to-video" && request.input_asset_paths.len() >= 2 {
+            return Ok("fal-ai/veo3.1/first-last-frame-to-video".to_string());
+        }
+        if request.mode == "image-to-video" && !request.input_asset_paths.is_empty() {
+            return Ok("fal-ai/veo3.1/image-to-video".to_string());
+        }
+        if !request.input_asset_paths.is_empty() {
+            return Ok("fal-ai/veo3.1/reference-to-video".to_string());
+        }
+        return Ok(model);
+    }
+    if model == "bytedance/seedance-2.0/text-to-video" {
+        if request.mode == "image-to-video" && !request.input_asset_paths.is_empty() {
+            return Ok("bytedance/seedance-2.0/image-to-video".to_string());
+        }
+        if !request.input_asset_paths.is_empty() || !request.audio_asset_paths.is_empty() {
+            return Ok("bytedance/seedance-2.0/reference-to-video".to_string());
+        }
+        return Ok(model);
+    }
+    if request.mode == "image-to-video" {
+        for base in [
+            "fal-ai/kling-video/v3/pro",
+            "fal-ai/kling-video/v3/standard",
+            "fal-ai/kling-video/v2.6/pro",
+            "fal-ai/kling-video/v2.5-turbo/pro",
+            "fal-ai/wan/v2.7",
+            "fal-ai/minimax/hailuo-02/standard",
+        ] {
+            if model == format!("{base}/text-to-video") {
+                return Ok(format!("{base}/image-to-video"));
+            }
+        }
+    }
+    Ok(model)
+}
+
+fn video_fal_image_data_uri(
+    context: &VideoGenerateJobContext,
+    input_path: &str,
+) -> Result<String, String> {
+    Ok(video_asset_data_uri_with_limit(
+        &context.root,
+        &context.media_root,
+        input_path,
+        Some(VIDEO_DIRECT_UPSCALE_IMAGE_LIMIT_BYTES),
+        "Image too large for direct generation",
+        25,
+    )?
+    .0)
+}
+
+fn video_fal_input_image_url(
+    context: &VideoGenerateJobContext,
+    request: &VideoGenerateRequest,
+    index: usize,
+    label: &str,
+) -> Result<String, String> {
+    let input = request
+        .input_asset_paths
+        .get(index)
+        .ok_or_else(|| format!("fal {label} requires an input image."))?;
+    video_fal_image_data_uri(context, input)
+}
+
+fn video_fal_audio_data_uri(
+    context: &VideoGenerateJobContext,
+    input_path: &str,
+) -> Result<String, String> {
+    Ok(video_asset_data_uri_with_limit(
+        &context.root,
+        &context.media_root,
+        input_path,
+        Some(VIDEO_DIRECT_GENERATION_AUDIO_LIMIT_BYTES),
+        "Audio too large for direct generation",
+        15,
+    )?
+    .0)
+}
+
+fn video_fal_build_body(
+    context: &VideoGenerateJobContext,
+    request: &VideoGenerateRequest,
+    model: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    if model == "fal-ai/seedvr/upscale/video" || model == "fal-ai/esrgan" {
+        let mut body = video_generate_params_body(request.params.as_ref());
+        let input = request
+            .input_asset_paths
+            .first()
+            .ok_or_else(|| format!("fal {} requires an input asset.", request.mode))?;
+        if model == "fal-ai/seedvr/upscale/video" {
             body.insert(
                 "video_url".to_string(),
                 serde_json::json!(
@@ -13363,29 +13576,323 @@ async fn video_generate_fal(
                     .0
                 ),
             );
-        }
-        "upscale-image" | "image-to-image" | "image-edit" | "image-to-video" => {
-            let input = request
-                .input_asset_paths
-                .first()
-                .ok_or_else(|| format!("fal {} requires an input asset.", request.mode))?;
+        } else {
             body.insert(
                 "image_url".to_string(),
-                serde_json::json!(
-                    video_asset_data_uri_with_limit(
-                        &context.root,
-                        &context.media_root,
-                        input,
-                        Some(VIDEO_DIRECT_UPSCALE_IMAGE_LIMIT_BYTES),
-                        "Image too large for direct upscale",
-                        25,
-                    )?
-                    .0
-                ),
+                serde_json::json!(video_fal_image_data_uri(context, input)?),
             );
         }
-        _ => {}
+        return Ok(body);
     }
+
+    if request.prompt.trim().is_empty() {
+        return Err(format!("fal model {model} requires a prompt."));
+    }
+    let params = request.params.as_ref();
+    let mut body = serde_json::Map::new();
+    body.insert("prompt".to_string(), serde_json::json!(request.prompt.trim()));
+
+    match model {
+        "fal-ai/veo3.1" => {
+            body.insert(
+                "duration".to_string(),
+                serde_json::json!(format!(
+                    "{}s",
+                    video_fal_duration_nearest(params, &[4, 6, 8], 8)
+                )),
+            );
+            video_fal_insert_common_video_fields(
+                &mut body,
+                params,
+                &["auto", "16:9", "9:16"],
+                &["720p", "1080p", "4k"],
+                "generate_audio",
+            );
+        }
+        "fal-ai/veo3.1/image-to-video" => {
+            body.insert(
+                "image_url".to_string(),
+                serde_json::json!(video_fal_input_image_url(context, request, 0, "image-to-video")?),
+            );
+            body.insert(
+                "duration".to_string(),
+                serde_json::json!(format!(
+                    "{}s",
+                    video_fal_duration_nearest(params, &[4, 6, 8], 8)
+                )),
+            );
+            video_fal_insert_common_video_fields(
+                &mut body,
+                params,
+                &["auto", "16:9", "9:16"],
+                &["720p", "1080p", "4k"],
+                "generate_audio",
+            );
+        }
+        "fal-ai/veo3.1/first-last-frame-to-video" => {
+            body.insert(
+                "first_frame_url".to_string(),
+                serde_json::json!(video_fal_input_image_url(context, request, 0, "first frame")?),
+            );
+            body.insert(
+                "last_frame_url".to_string(),
+                serde_json::json!(video_fal_input_image_url(context, request, 1, "last frame")?),
+            );
+            body.insert(
+                "duration".to_string(),
+                serde_json::json!(format!(
+                    "{}s",
+                    video_fal_duration_nearest(params, &[4, 6, 8], 8)
+                )),
+            );
+            video_fal_insert_common_video_fields(
+                &mut body,
+                params,
+                &["auto", "16:9", "9:16"],
+                &["720p", "1080p", "4k"],
+                "generate_audio",
+            );
+        }
+        "fal-ai/veo3.1/reference-to-video" => {
+            let image_urls = request
+                .input_asset_paths
+                .iter()
+                .take(3)
+                .map(|input| video_fal_image_data_uri(context, input))
+                .collect::<Result<Vec<_>, _>>()?;
+            if image_urls.is_empty() {
+                return Err("fal Veo 3.1 reference-to-video requires reference images.".to_string());
+            }
+            body.insert("image_urls".to_string(), serde_json::json!(image_urls));
+            body.insert(
+                "duration".to_string(),
+                serde_json::json!(format!(
+                    "{}s",
+                    video_fal_duration_nearest(params, &[4, 6, 8], 8)
+                )),
+            );
+            video_fal_insert_common_video_fields(
+                &mut body,
+                params,
+                &["16:9", "9:16"],
+                &["720p", "1080p", "4k"],
+                "generate_audio",
+            );
+        }
+        "bytedance/seedance-2.0/text-to-video" => {
+            video_fal_insert_seedance20_fields(&mut body, params);
+        }
+        "bytedance/seedance-2.0/image-to-video" => {
+            body.insert(
+                "image_url".to_string(),
+                serde_json::json!(video_fal_input_image_url(context, request, 0, "image-to-video")?),
+            );
+            if request.input_asset_paths.len() > 1 {
+                body.insert(
+                    "end_image_url".to_string(),
+                    serde_json::json!(video_fal_input_image_url(context, request, 1, "end frame")?),
+                );
+            }
+            video_fal_insert_seedance20_fields(&mut body, params);
+        }
+        "bytedance/seedance-2.0/reference-to-video" => {
+            let image_urls = request
+                .input_asset_paths
+                .iter()
+                .take(9)
+                .map(|input| video_fal_image_data_uri(context, input))
+                .collect::<Result<Vec<_>, _>>()?;
+            let audio_urls = request
+                .audio_asset_paths
+                .iter()
+                .take(3)
+                .map(|input| video_fal_audio_data_uri(context, input))
+                .collect::<Result<Vec<_>, _>>()?;
+            if image_urls.is_empty() && audio_urls.is_empty() {
+                return Err(
+                    "fal Seedance 2.0 reference-to-video requires reference image or audio assets."
+                        .to_string(),
+                );
+            }
+            if !image_urls.is_empty() {
+                body.insert("image_urls".to_string(), serde_json::json!(image_urls));
+            }
+            if !audio_urls.is_empty() {
+                body.insert("audio_urls".to_string(), serde_json::json!(audio_urls));
+            }
+            video_fal_insert_seedance20_fields(&mut body, params);
+        }
+        "fal-ai/kling-video/v3/pro/text-to-video"
+        | "fal-ai/kling-video/v3/standard/text-to-video" => {
+            body.insert(
+                "duration".to_string(),
+                serde_json::json!(video_fal_duration_nearest(
+                    params,
+                    &[3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+                    5
+                )
+                .to_string()),
+            );
+            video_fal_insert_common_video_fields(
+                &mut body,
+                params,
+                &["16:9", "9:16", "1:1"],
+                &[],
+                "generate_audio",
+            );
+        }
+        "fal-ai/kling-video/v3/pro/image-to-video"
+        | "fal-ai/kling-video/v3/standard/image-to-video" => {
+            body.insert(
+                "start_image_url".to_string(),
+                serde_json::json!(video_fal_input_image_url(context, request, 0, "image-to-video")?),
+            );
+            if request.input_asset_paths.len() > 1 {
+                body.insert(
+                    "end_image_url".to_string(),
+                    serde_json::json!(video_fal_input_image_url(context, request, 1, "end frame")?),
+                );
+            }
+            body.insert(
+                "duration".to_string(),
+                serde_json::json!(video_fal_duration_nearest(
+                    params,
+                    &[3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+                    5
+                )
+                .to_string()),
+            );
+            video_fal_insert_common_video_fields(&mut body, params, &[], &[], "generate_audio");
+        }
+        "fal-ai/kling-video/v2.6/pro/text-to-video" => {
+            body.insert(
+                "duration".to_string(),
+                serde_json::json!(video_fal_duration_nearest(params, &[5, 10], 5).to_string()),
+            );
+            video_fal_insert_common_video_fields(
+                &mut body,
+                params,
+                &["16:9", "9:16", "1:1"],
+                &[],
+                "generate_audio",
+            );
+        }
+        "fal-ai/kling-video/v2.6/pro/image-to-video" => {
+            body.insert(
+                "start_image_url".to_string(),
+                serde_json::json!(video_fal_input_image_url(context, request, 0, "image-to-video")?),
+            );
+            if request.input_asset_paths.len() > 1 {
+                body.insert(
+                    "end_image_url".to_string(),
+                    serde_json::json!(video_fal_input_image_url(context, request, 1, "end frame")?),
+                );
+            }
+            body.insert(
+                "duration".to_string(),
+                serde_json::json!(video_fal_duration_nearest(params, &[5, 10], 5).to_string()),
+            );
+            video_fal_insert_common_video_fields(&mut body, params, &[], &[], "generate_audio");
+        }
+        "fal-ai/kling-video/v2.5-turbo/pro/text-to-video" => {
+            body.insert(
+                "duration".to_string(),
+                serde_json::json!(video_fal_duration_nearest(params, &[5, 10], 5).to_string()),
+            );
+            video_fal_insert_negative_prompt(&mut body, params);
+        }
+        "fal-ai/kling-video/v2.5-turbo/pro/image-to-video" => {
+            body.insert(
+                "image_url".to_string(),
+                serde_json::json!(video_fal_input_image_url(context, request, 0, "image-to-video")?),
+            );
+            if request.input_asset_paths.len() > 1 {
+                body.insert(
+                    "tail_image_url".to_string(),
+                    serde_json::json!(video_fal_input_image_url(context, request, 1, "end frame")?),
+                );
+            }
+            body.insert(
+                "duration".to_string(),
+                serde_json::json!(video_fal_duration_nearest(params, &[5, 10], 5).to_string()),
+            );
+            video_fal_insert_negative_prompt(&mut body, params);
+        }
+        "fal-ai/wan/v2.7/text-to-video" | "fal-ai/wan/v2.7/image-to-video" => {
+            if model.ends_with("/image-to-video") {
+                body.insert(
+                    "image_url".to_string(),
+                    serde_json::json!(video_fal_input_image_url(context, request, 0, "image-to-video")?),
+                );
+                if request.input_asset_paths.len() > 1 {
+                    body.insert(
+                        "end_image_url".to_string(),
+                        serde_json::json!(video_fal_input_image_url(context, request, 1, "end frame")?),
+                    );
+                }
+            }
+            body.insert(
+                "duration".to_string(),
+                serde_json::json!(video_fal_duration_clamped(params, 2, 15, 5)),
+            );
+            if let Some(audio_input) = request.audio_asset_paths.first() {
+                body.insert(
+                    "audio_url".to_string(),
+                    serde_json::json!(video_fal_audio_data_uri(context, audio_input)?),
+                );
+            }
+            video_fal_insert_common_video_fields(
+                &mut body,
+                params,
+                if model.ends_with("/image-to-video") {
+                    &[]
+                } else {
+                    &["16:9", "9:16", "1:1", "4:3", "3:4"]
+                },
+                &["720p", "1080p"],
+                "",
+            );
+        }
+        "fal-ai/minimax/hailuo-02/standard/text-to-video"
+        | "fal-ai/minimax/hailuo-02/standard/image-to-video" => {
+            if model.ends_with("/image-to-video") {
+                body.insert(
+                    "image_url".to_string(),
+                    serde_json::json!(video_fal_input_image_url(context, request, 0, "image-to-video")?),
+                );
+                if request.input_asset_paths.len() > 1 {
+                    body.insert(
+                        "end_image_url".to_string(),
+                        serde_json::json!(video_fal_input_image_url(context, request, 1, "end frame")?),
+                    );
+                }
+            }
+            body.insert(
+                "duration".to_string(),
+                serde_json::json!(video_fal_duration_nearest(params, &[6, 10], 6).to_string()),
+            );
+        }
+        _ => {
+            return Err(format!(
+                "Unsupported fal model mapping: {model}. Add an endpoint-specific request body before submitting."
+            ));
+        }
+    }
+
+    Ok(body)
+}
+
+async fn video_generate_fal(
+    context: &VideoGenerateJobContext,
+    request: &VideoGenerateRequest,
+    provider: &VideoProviderDefinition,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<Vec<String>, String> {
+    let model = video_fal_concrete_model(request)?;
+    let client = http_client(std::time::Duration::from_secs(120))?;
+    let base = video_provider_base_url(provider, &request.auth);
+    let api_key = video_auth_api_key(&request.auth)?;
+    let body = video_fal_build_body(context, request, &model)?;
     let submit = client
         .post(format!("{base}/{model}"))
         .header("Authorization", format!("Key {api_key}"))
@@ -13593,6 +14100,7 @@ async fn video_generate_start(
     } else {
         request.model.clone()
     };
+    video_validate_provider_model(provider, &model)?;
     let kind = video_generate_request_kind(provider, &model, &request);
     let recorded_request = video_recorded_generate_request(kind, &model, &request);
     let planned_paths =
@@ -16049,7 +16557,7 @@ mod video_mcp_tests {
     }
 
     #[test]
-    fn video_mcp_generate_higgsfield_speak_requires_start_frame_before_job_write() {
+    fn video_mcp_generate_removed_model_fails_before_job_write() {
         let (root, media_root) = temp_video_root();
         super::video_ensure_media_dirs(&media_root).expect("media dirs");
         let jobs_path = super::video_generation_jobs_path(&media_root);
@@ -16064,8 +16572,8 @@ mod video_mcp_tests {
                 "prompt": "talk"
             }),
         )
-        .expect_err("higgsfield_speak without start frame must fail");
-        assert!(error.contains("inputAssetPaths[0]"), "{error}");
+        .expect_err("removed model must fail");
+        assert!(error.contains("Unknown video generation model"), "{error}");
         assert!(!jobs_path.exists(), "preflight must not persist a job");
         let _ = std::fs::remove_dir_all(root);
     }

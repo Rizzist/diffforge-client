@@ -2037,7 +2037,6 @@ export default function VideoWorkspacePane({
     },
     [paneWidth],
   );
-  openSidePanelRef.current = openSidePanel;
 
   const openTranscript = useCallback(
     (asset) => {
@@ -2361,9 +2360,6 @@ export default function VideoWorkspacePane({
 
   // Clicking a failed ghost clip opens the Generate panel's history and
   // flash-highlights the job row (the terminals/audio jump-to pattern).
-  // openSidePanel is declared further down — ref-indirection per this file's
-  // declaration-order convention.
-  const openSidePanelRef = useRef(() => {});
   const [generateHistoryFocus, setGenerateHistoryFocus] = useState(null);
   const handleGhostClipClick = useCallback(
     (_clip, generation) => {
@@ -2371,9 +2367,9 @@ export default function VideoWorkspacePane({
         return;
       }
       setGenerateHistoryFocus({ jobId: generation.jobId, at: Date.now() });
-      openSidePanelRef.current("generate");
+      openSidePanel("generate");
     },
-    [],
+    [openSidePanel],
   );
 
   // Deleting a job from history takes its ghost clips + map entries with it.

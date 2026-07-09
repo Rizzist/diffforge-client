@@ -23314,6 +23314,7 @@ function TerminalView({
   onAppControlDocumentActions = null,
   onMinimizeWorkspaceToolPane = null,
   onToggleFullscreenWorkspaceToolPane = null,
+  onWorkspaceProjectActiveChange = null,
   onWorkspaceToolRuntimeBridgeChange = null,
   onOpenWorkspaceDocumentPanel = null,
   onCloseWorkspaceDocumentPanel = null,
@@ -29762,6 +29763,9 @@ function TerminalView({
     if (!safePaneId) {
       return;
     }
+    const existingBoard = pcbPaneBoardsRef.current[safePaneId] || null;
+    const nextBoard = board || null;
+    const activePathChanged = String(existingBoard?.path || "") !== String(nextBoard?.path || "");
     if (options?.breakoutSync) {
       pcbPaneBreakoutSyncRef.current = {
         ...pcbPaneBreakoutSyncRef.current,
@@ -29771,11 +29775,19 @@ function TerminalView({
         current[safePaneId] ? current : { ...current, [safePaneId]: true }
       ));
     }
+    if (activePathChanged) {
+      const next = { ...pcbPaneBoardsRef.current };
+      if (nextBoard) {
+        next[safePaneId] = nextBoard;
+      } else {
+        delete next[safePaneId];
+      }
+      pcbPaneBoardsRef.current = next;
+    }
     setPcbPaneBoards((current) => {
       // Bail on no-op updates: this setter runs from child notify effects, so
       // unconditionally returning a new object re-renders → re-notifies → loops.
       const existing = current[safePaneId] || null;
-      const nextBoard = board || null;
       if (
         existing === nextBoard
         || (existing && nextBoard
@@ -29793,13 +29805,24 @@ function TerminalView({
       pcbPaneBoardsRef.current = next;
       return next;
     });
-  }, []);
+    if (activePathChanged) {
+      onWorkspaceProjectActiveChange?.({
+        kind: "pcb",
+        paneId: safePaneId,
+        path: nextBoard?.path || "",
+        workspaceId: terminalWorkspace?.id || "",
+      });
+    }
+  }, [onWorkspaceProjectActiveChange, terminalWorkspace?.id]);
 
   const recordVideoPaneProject = useCallback((paneId, project, options = {}) => {
     const safePaneId = String(paneId || "").trim();
     if (!safePaneId) {
       return;
     }
+    const existingProject = videoPaneProjectsRef.current[safePaneId] || null;
+    const nextProject = project || null;
+    const activePathChanged = String(existingProject?.path || "") !== String(nextProject?.path || "");
     if (options?.breakoutSync) {
       videoPaneBreakoutSyncRef.current = {
         ...videoPaneBreakoutSyncRef.current,
@@ -29809,21 +29832,38 @@ function TerminalView({
         current[safePaneId] ? current : { ...current, [safePaneId]: true }
       ));
     }
+    if (activePathChanged) {
+      const next = { ...videoPaneProjectsRef.current };
+      if (nextProject) {
+        next[safePaneId] = nextProject;
+      } else {
+        delete next[safePaneId];
+      }
+      videoPaneProjectsRef.current = next;
+    }
     setVideoPaneProjects((current) => {
       // Bail on no-op updates (same notify-loop hazard as recordPcbPaneBoard).
-      if ((current[safePaneId] || null) === (project || null)) {
+      if ((current[safePaneId] || null) === nextProject) {
         return current;
       }
       const next = { ...current };
-      if (project) {
-        next[safePaneId] = project;
+      if (nextProject) {
+        next[safePaneId] = nextProject;
       } else {
         delete next[safePaneId];
       }
       videoPaneProjectsRef.current = next;
       return next;
     });
-  }, []);
+    if (activePathChanged) {
+      onWorkspaceProjectActiveChange?.({
+        kind: "video",
+        paneId: safePaneId,
+        path: nextProject?.path || "",
+        workspaceId: terminalWorkspace?.id || "",
+      });
+    }
+  }, [onWorkspaceProjectActiveChange, terminalWorkspace?.id]);
 
   const popOutWebPanelForIndex = useCallback(async (terminalIndex, paneId, url) => {
     const safePaneId = String(paneId || "").trim();

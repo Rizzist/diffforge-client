@@ -12,6 +12,7 @@ import {
   validateWorkspaceProjectCommandPayload,
   validateWorkspaceProjectCommandWorkspace,
   videoProjectIdFromPath,
+  workspaceProjectActiveIdFromPath,
   workspaceProjectCommandRequestedWorkspaceId,
   workspaceProjectInventoriesEqual,
 } from "./workspaceProjectInventory.js";
@@ -104,6 +105,30 @@ test("findWorkspaceProjectMatch prefers path, then id, then name", () => {
   assert.equal(findWorkspaceProjectMatch(projects, {}), null);
 });
 
+test("workspaceProjectActiveIdFromPath maps active paths to inventory ids", () => {
+  assert.equal(
+    workspaceProjectActiveIdFromPath(
+      "hardware/power-board/power-board.board.tsx",
+      [],
+      "pcb",
+    ),
+    "power-board",
+  );
+  assert.equal(
+    workspaceProjectActiveIdFromPath(
+      "media/projects/launch.video.pipe",
+      [{ id: "launch", name: "Launch", path: "media/projects/launch.video.pipe" }],
+      "video",
+    ),
+    "launch",
+  );
+  assert.equal(
+    workspaceProjectActiveIdFromPath("media/projects/legacy.video.json", [], "video"),
+    "legacy",
+  );
+  assert.equal(workspaceProjectActiveIdFromPath("", [], "pcb"), null);
+});
+
 test("validateWorkspaceProjectCommandPayload enforces create names", () => {
   assert.equal(validateWorkspaceProjectCommandPayload({ action: "create", name: "Board" }).ok, true);
   const missing = validateWorkspaceProjectCommandPayload({ action: "create", name: "  " });
@@ -157,18 +182,24 @@ test("validateWorkspaceProjectCommandWorkspace requires an explicit known worksp
 test("workspaceProjectInventoriesEqual compares rows structurally", () => {
   const left = {
     "ws-1": {
+      pcb_active_project_id: "a",
+      video_active_project_id: null,
       pcb_projects: [{ id: "a", name: "a", path: "hardware/a/a.board.tsx" }],
       video_projects: [],
     },
   };
   const same = {
     "ws-1": {
+      pcb_active_project_id: "a",
+      video_active_project_id: null,
       pcb_projects: [{ id: "a", name: "a", path: "hardware/a/a.board.tsx" }],
       video_projects: [],
     },
   };
   const different = {
     "ws-1": {
+      pcb_active_project_id: null,
+      video_active_project_id: null,
       pcb_projects: [{ id: "a", name: "a", path: "hardware/a/a.board.tsx", updated_at_ms: 5 }],
       video_projects: [],
     },

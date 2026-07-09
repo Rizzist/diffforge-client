@@ -28576,6 +28576,20 @@ fn cloud_mcp_workspace_project_rows(workspace: &Value, keys: &[&str]) -> Vec<Val
     rows
 }
 
+fn cloud_mcp_workspace_project_active_id(workspace: &Value, keys: &[&str]) -> Value {
+    cloud_mcp_payload_text(workspace, keys)
+        .map(|value| {
+            value
+                .trim()
+                .chars()
+                .take(CLOUD_MCP_WORKSPACE_PROJECT_TEXT_LIMIT)
+                .collect::<String>()
+        })
+        .filter(|value| !value.is_empty())
+        .map(Value::String)
+        .unwrap_or(Value::Null)
+}
+
 fn cloud_mcp_workspace_panel_is_last_known(panel: &Value) -> bool {
     cloud_mcp_payload_bool(panel, &["last_known_runtime"], false)
         || cloud_mcp_payload_bool(panel, &["lastKnownRuntime"], false)
@@ -33125,6 +33139,14 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
             cloud_mcp_workspace_project_rows(workspace, &["pcb_projects", "pcbProjects"]);
         let video_projects =
             cloud_mcp_workspace_project_rows(workspace, &["video_projects", "videoProjects"]);
+        let pcb_active_project_id = cloud_mcp_workspace_project_active_id(
+            workspace,
+            &["pcb_active_project_id", "pcbActiveProjectId"],
+        );
+        let video_active_project_id = cloud_mcp_workspace_project_active_id(
+            workspace,
+            &["video_active_project_id", "videoActiveProjectId"],
+        );
         let servers = cloud_mcp_normalize_workspace_mcp_servers_for_snapshot(workspace);
         let workspace_order = cloud_mcp_payload_u64(
             workspace,
@@ -33220,7 +33242,9 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
             "lastKnownPanelFallback": panel_list_last_known_fallback,
             "panels": panels,
             "pcb_projects": pcb_projects,
+            "pcb_active_project_id": pcb_active_project_id,
             "video_projects": video_projects,
+            "video_active_project_id": video_active_project_id,
             "servers": servers.clone(),
             "mcps": servers,
             "terminals": terminals,
@@ -55718,7 +55742,10 @@ mod cloud_mcp_tests {
         // Duplicate path is dropped; missing-path row is skipped.
         projects.insert(1, projects[0].clone());
         projects.insert(2, json!({ "name": "no path" }));
-        let workspace = json!({ "pcb_projects": projects });
+        let workspace = json!({
+            "pcb_projects": projects,
+            "pcb_active_project_id": format!("  {}  ", "x".repeat(CLOUD_MCP_WORKSPACE_PROJECT_TEXT_LIMIT + 12)),
+        });
 
         let rows = cloud_mcp_workspace_project_rows(&workspace, &["pcb_projects", "pcbProjects"]);
         assert!(rows.len() <= CLOUD_MCP_WORKSPACE_PROJECT_LIMIT);
@@ -55733,11 +55760,21 @@ mod cloud_mcp_tests {
             .filter_map(|row| row.get("path").and_then(Value::as_str))
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(unique_paths.len(), rows.len());
+
+        let active_id = cloud_mcp_workspace_project_active_id(
+            &workspace,
+            &["pcb_active_project_id", "pcbActiveProjectId"],
+        );
+        assert_eq!(
+            active_id.as_str().map(|value| value.chars().count()),
+            Some(CLOUD_MCP_WORKSPACE_PROJECT_TEXT_LIMIT),
+        );
     }
 
     #[test]
     fn workspace_project_rows_fall_back_to_camel_case_and_path_identity() {
         let workspace = json!({
+            "videoActiveProjectId": " launch ",
             "videoProjects": [{
                 "path": "media/projects/launch.video.pipe",
             }],
@@ -55749,6 +55786,20 @@ mod cloud_mcp_tests {
         assert_eq!(rows[0]["id"], json!("media/projects/launch.video.pipe"));
         assert_eq!(rows[0]["name"], json!("media/projects/launch.video.pipe"));
         assert!(rows[0].get("updated_at_ms").is_none());
+        assert_eq!(
+            cloud_mcp_workspace_project_active_id(
+                &workspace,
+                &["video_active_project_id", "videoActiveProjectId"],
+            ),
+            json!("launch"),
+        );
+        assert_eq!(
+            cloud_mcp_workspace_project_active_id(
+                &json!({}),
+                &["video_active_project_id", "videoActiveProjectId"],
+            ),
+            Value::Null,
+        );
     }
 
     #[test]

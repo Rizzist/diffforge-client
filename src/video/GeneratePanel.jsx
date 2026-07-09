@@ -688,12 +688,10 @@ const HistInfo = styled.div`
 const HistError = styled.div`
   font-size: 9px;
   font-weight: 600;
+  line-height: 1.45;
   color: #fca5a5;
   overflow-wrap: anywhere;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+  white-space: pre-wrap;
 `;
 
 const HistSide = styled.div`

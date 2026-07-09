@@ -6829,6 +6829,12 @@ export const LoopspaceGraphMessageSettingsField = styled.label`
   gap: 4px;
   min-width: 0;
 
+  /* Full-width fields (rich pickers: workspaces, terminal) span the whole
+     auto-fit grid so their menus/chips have room at any panel width. */
+  &[data-span="full"] {
+    grid-column: 1 / -1;
+  }
+
   > span {
     color: rgba(248, 250, 252, 0.5);
     font-size: 8.5px;
@@ -6836,6 +6842,78 @@ export const LoopspaceGraphMessageSettingsField = styled.label`
     letter-spacing: 0.08em;
     text-transform: uppercase;
   }
+`;
+
+// Rich terminal option row (color dot · name · harness type · index) used in
+// the dispatch-todos terminal picker, mirroring the terminal chips elsewhere.
+export const LoopspaceDispatchTerminalOption = styled.span`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  width: 100%;
+
+  &[data-muted="true"] {
+    opacity: 0.62;
+  }
+`;
+
+export const LoopspaceDispatchTerminalDot = styled.span`
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: ${(props) => props.$color || "rgba(148, 163, 184, 0.7)"};
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.42), 0 0 8px ${(props) => props.$color || "rgba(148, 163, 184, 0.4)"};
+
+  &[data-disconnected="true"] {
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.42);
+    opacity: 0.5;
+  }
+`;
+
+export const LoopspaceDispatchTerminalName = styled.span`
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--forge-text, #e5edf7);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+`;
+
+export const LoopspaceDispatchTerminalMeta = styled.span`
+  flex: 0 0 auto;
+  padding: 1px 7px;
+  border: 1px solid rgba(var(--forge-accent-rgb, 16, 185, 129), 0.3);
+  border-radius: 999px;
+  color: var(--forge-text-soft, #cbd5f5);
+  background: rgba(var(--forge-accent-rgb, 16, 185, 129), 0.12);
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  text-transform: capitalize;
+  white-space: nowrap;
+`;
+
+export const LoopspaceDispatchTerminalIndex = styled.span`
+  flex: 0 0 auto;
+  color: var(--forge-text-muted, #94a3b8);
+  font-size: 10.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+`;
+
+export const LoopspaceDispatchTerminalWorkspace = styled.span`
+  flex: 0 0 auto;
+  max-width: 38%;
+  overflow: hidden;
+  color: var(--forge-text-muted, #94a3b8);
+  font-size: 10px;
+  font-weight: 650;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 `;
 
 export const LoopspaceGraphMessageSubnodeToolbar = styled.div`

@@ -70,6 +70,25 @@ export const APP_SELECT_STYLES = {
     color: "var(--forge-text-muted, #94a3b8)",
     padding: 6,
   }),
+  multiValue: (base) => ({
+    ...base,
+    borderRadius: 6,
+    border: "1px solid rgba(var(--forge-accent-rgb, 16, 185, 129), 0.32)",
+    backgroundColor: "rgba(var(--forge-accent-rgb, 16, 185, 129), 0.16)",
+  }),
+  multiValueLabel: (base) => ({
+    ...base,
+    color: "var(--forge-text, #e5edf7)",
+    fontSize: 11.5,
+    fontWeight: 700,
+    padding: "2px 3px 2px 7px",
+  }),
+  multiValueRemove: (base) => ({
+    ...base,
+    color: "var(--forge-text-muted, #94a3b8)",
+    borderRadius: "0 6px 6px 0",
+    ":hover": { backgroundColor: "rgba(239, 68, 68, 0.3)", color: "#ffffff" },
+  }),
 };
 
 function normalizeOptions(options) {
@@ -86,24 +105,41 @@ export default function AppSelect({
   isDisabled = false,
   isSearchable = false,
   isClearable = false,
+  isMulti = false,
   ...rest
 }) {
   const normalizedOptions = useMemo(() => normalizeOptions(options), [options]);
-  const selectedOption = useMemo(
-    () => normalizedOptions.find((option) => option.value === value) ?? null,
-    [normalizedOptions, value],
-  );
+  const selectedOption = useMemo(() => {
+    if (isMulti) {
+      const values = (Array.isArray(value) ? value : []).map((entry) => String(entry));
+      // Preserve the caller's ordering, and keep unknown values from silently
+      // vanishing by echoing them back as their own label.
+      return values.map((entry) => (
+        normalizedOptions.find((option) => String(option.value) === entry)
+          ?? { value: entry, label: entry }
+      ));
+    }
+    return normalizedOptions.find((option) => option.value === value) ?? null;
+  }, [normalizedOptions, value, isMulti]);
 
   return (
     <Select
       classNamePrefix="app-select"
+      closeMenuOnSelect={!isMulti}
       isClearable={isClearable}
       isDisabled={isDisabled}
+      isMulti={isMulti}
       isSearchable={isSearchable}
       menuPlacement="auto"
       menuPortalTarget={portalTarget()}
       menuPosition="fixed"
-      onChange={(option) => onChange?.(option ? option.value : null, option)}
+      onChange={(option) => {
+        if (isMulti) {
+          onChange?.((Array.isArray(option) ? option : []).map((entry) => entry.value), option);
+          return;
+        }
+        onChange?.(option ? option.value : null, option);
+      }}
       options={normalizedOptions}
       placeholder={placeholder}
       styles={APP_SELECT_STYLES}

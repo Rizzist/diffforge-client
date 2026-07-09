@@ -138,6 +138,26 @@ export function findWorkspaceProjectMatch(projects, { projectId = "", path = "" 
   return null;
 }
 
+export function workspaceProjectActiveIdFromPath(path, projects = [], kind = "") {
+  const cleanPath = cleanWorkspaceProjectPath(path);
+  if (!cleanPath) {
+    return null;
+  }
+  const matchedId = cleanWorkspaceProjectText(
+    findWorkspaceProjectMatch(projects, { path: cleanPath })?.id,
+  );
+  if (matchedId) {
+    return matchedId;
+  }
+  const normalizedKind = cleanWorkspaceProjectText(kind).toLowerCase();
+  const derivedId = normalizedKind === "video"
+    ? videoProjectIdFromPath(cleanPath)
+    : normalizedKind === "pcb"
+      ? pcbProjectIdFromPath(cleanPath)
+      : cleanPath;
+  return cleanWorkspaceProjectText(derivedId) || null;
+}
+
 export function validateWorkspaceProjectCommandPayload({
   action = "",
   name = "",
@@ -234,6 +254,8 @@ export function workspaceProjectInventoriesEqual(left, right) {
       return false;
     }
     return workspaceProjectRowsEqual(leftEntry?.pcb_projects, rightEntry?.pcb_projects)
-      && workspaceProjectRowsEqual(leftEntry?.video_projects, rightEntry?.video_projects);
+      && workspaceProjectRowsEqual(leftEntry?.video_projects, rightEntry?.video_projects)
+      && (leftEntry?.pcb_active_project_id ?? null) === (rightEntry?.pcb_active_project_id ?? null)
+      && (leftEntry?.video_active_project_id ?? null) === (rightEntry?.video_active_project_id ?? null);
   });
 }
