@@ -19,3 +19,5 @@ logs/
 *.pem
 *.p12
 *.keychain-db
+# Local macOS code-signing material (certs, keys, Apple notarize creds) — never commit
+dist-signing-local/
