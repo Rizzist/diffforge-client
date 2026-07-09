@@ -28,6 +28,17 @@ on:
 permissions:
   contents: read
 
+# Flip APPLE_NOTARIZE to "true" once the Apple Developer account is active
+# (~48h after enrollment) AND the Developer ID secrets are set: a Developer ID
+# Application .p12 in MACOS_SIGNING_CERT_P12_BASE64/MACOS_SIGNING_CERT_PASSWORD,
+# plus APPLE_ID / APPLE_PASSWORD (app-specific) / APPLE_TEAM_ID. "true" signs
+# with the Developer ID identity and notarizes+staples via notarytool, so
+# downloads open with a plain double-click. "false" = self-signed mode: the app
+# is sealed (no "damaged" error, TCC grants survive updates) but not notarized,
+# so Gatekeeper still shows the unverified-developer gate.
+env:
+  APPLE_NOTARIZE: "false"
+
 concurrency:
   group: desktop-release-${{ github.ref }}
   cancel-in-progress: false
@@ -91,17 +102,21 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "$keychain_password" "$keychain" > /dev/null
           security list-keychains -d user -s "$keychain" login.keychain-db
-          # Prefer a real Developer ID Application identity (notarizable, and
-          # chains to Apple's already-trusted root so no manual trust needed).
-          identity="$(security find-identity -v -p codesigning "$keychain" \
-            | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
-          if [ -n "$identity" ]; then
-            echo "Using Developer ID identity: $identity"
+          if [ "${APPLE_NOTARIZE:-false}" = "true" ]; then
+            # Notarize mode: require a real Developer ID Application identity
+            # (chains to Apple's already-trusted root, so no manual trust).
+            identity="$(security find-identity -v -p codesigning "$keychain" \
+              | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
+            if [ -z "$identity" ]; then
+              echo "::error::APPLE_NOTARIZE=true but the signing p12 holds no Developer ID Application cert — set MACOS_SIGNING_CERT_P12_BASE64 to a Developer ID .p12 (or set APPLE_NOTARIZE=false)"
+              exit 1
+            fi
+            echo "Notarize mode — using Developer ID identity: $identity"
             echo "APPLE_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
           else
-            # Legacy self-signed cert: codesign only offers identities whose
-            # certs chain to trust, so trust it explicitly (runner-local only).
-            echo "::warning::No Developer ID Application cert in p12 — falling back to self-signed identity (NOT notarizable; Gatekeeper will show the unverified-developer gate)"
+            # Self-signed mode: codesign only offers identities whose certs
+            # chain to trust, so trust this one explicitly (runner-local only).
+            echo "Self-signed mode (APPLE_NOTARIZE != true) — app is sealed but NOT notarized; Gatekeeper shows the unverified-developer gate"
             /usr/bin/openssl pkcs12 -in "$p12" -clcerts -nokeys -out "$cert" \
               -passin "pass:$MACOS_SIGNING_CERT_PASSWORD"
             sudo security add-trusted-cert -d -r trustRoot -p codeSign \
@@ -118,9 +133,11 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Only supplied in notarize mode; empty otherwise so the Tauri
+          # bundler skips notarization even if the secrets happen to be set.
+          APPLE_ID: ${{ env.APPLE_NOTARIZE == 'true' && secrets.APPLE_ID || '' }}
+          APPLE_PASSWORD: ${{ env.APPLE_NOTARIZE == 'true' && secrets.APPLE_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ env.APPLE_NOTARIZE == 'true' && secrets.APPLE_TEAM_ID || '' }}
         run: npx tauri build --target ${{ matrix.target }} --bundles app,dmg --config src-tauri/tauri.updater.conf.json
       - uses: actions/upload-artifact@v4
         with:
