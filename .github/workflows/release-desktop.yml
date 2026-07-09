@@ -37,7 +37,7 @@ permissions:
 # is sealed (no "damaged" error, TCC grants survive updates) but not notarized,
 # so Gatekeeper still shows the unverified-developer gate.
 env:
-  APPLE_NOTARIZE: "false"
+  APPLE_NOTARIZE: "true"
 
 concurrency:
   group: desktop-release-${{ github.ref }}
