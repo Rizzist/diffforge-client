@@ -27453,13 +27453,13 @@ fn diffforge_agent_contract_markdown(variant: AgentContractVariant) -> String {
         return format!(
             "{DIFFFORGE_AGENT_CONTRACT_BEGIN}\n\
 # Diff Forge workspace note\n\n\
-Work normally from the visible project root. No local coordination MCP workflow applies unless Diff Forge launches the agent with coordination environment variables.\n\
+Work normally from the visible project root.\n\
 {DIFFFORGE_AGENT_CONTRACT_END}\n"
         );
     }
     let env_gate = if variant == AgentContractVariant::ManagedEnvGated {
-        "## Who this contract applies to\n\n\
-This contract applies only to coding agents launched by the Diff Forge AI desktop app. Those terminals run with `COORDINATION_SESSION_ID` and `COORDINATION_ENFORCEMENT_MODE` set in their environment and with the `coordination-kernel` MCP server mounted. If those environment variables are not present, ignore everything below, work normally from the project root, and do not attempt to call any `coordination-kernel` tools.\n\n"
+        "## Scope\n\n\
+Apply this contract only when `COORDINATION_SESSION_ID` and `COORDINATION_ENFORCEMENT_MODE` are both set and `coordination-kernel` is mounted. Otherwise ignore it entirely and work normally.\n\n"
     } else {
         ""
     };
@@ -27467,26 +27467,19 @@ This contract applies only to coding agents launched by the Diff Forge AI deskto
         "{DIFFFORGE_AGENT_CONTRACT_BEGIN}\n\
 # Diff Forge agent coordination contract\n\n\
 {env_gate}\
-This workspace is coordinated by Diff Forge. The user prompt is still the source of truth, and app-launched coding agents use one local MCP server for task context, leases, direct completion, and optional patch submission.\n\n\
-## Required flow for every user task\n\n\
-1. Read-only inspection is free: open, search, and inspect files normally without calling `coordination-kernel.start_task` or `coordination-kernel.checkpoint`.\n\
-2. Call `coordination-kernel.start_task` only when you are ready to edit, and again when a parked task resumes after first inspecting refreshed context. Include a short `plan` for the immediate edit; Rust creates or resumes the local task immediately for all leases, checkpoints, and patch submission. Task/context/history Cloud sync is disabled; todos are the shared cloud work state.\n\
-3. Filesystem edits are not lease-gated. Use normal shell and edit tools against any path the user asks you to change; `coordination-kernel.acquire_lease` is not required for file access.\n\
-4. Coordinated task calls are for shared activity state, not local filesystem permission. Keep summaries/checkpoints useful, but do not treat worktree roots or leases as write barriers.\n\
-5. Call `coordination-kernel.checkpoint` with that `task_id` only while a task is active and after meaningful edit progress; never checkpoint reconnaissance.\n\
-6. When finished, follow the active session `completion_mode`: call `coordination-kernel.complete_task` for direct/activity work, or `coordination-kernel.submit_patch` only when the session reports `worktree_required`/`submit_patch`. If `submit_patch` returns a `submit_job_id`, use `coordination-kernel.submit_patch_status` to watch validation, patch artifact creation, local integration, and cloud sync progress.\n\
-7. Keep summaries public and terse. Do not include hidden reasoning, raw terminal logs, secrets, credentials, or large source dumps.\n\n\
-## Cloud MCP is automatic\n\n\
-- Do not call `cloud-diffforge` tools directly from the coding agent.\n\
-- Task/context/history Cloud sync is disabled. Diff Forge's Rust app/kernel keeps task lifecycle, checkpoint summaries, and merge context local while todos remain the shared cloud work state.\n\
-- Use the local coordination kernel for leases, completion, patch submission when enabled, and merge safety.\n\
-- For Git-managed files, Diff Forge no longer gates local filesystem writes by worktree or lease. Use the path that matches the user's request and the current repo state.\n\
-- Autonomous intent-resolution tasks should treat current integration as source of truth, preserve every compatible task intent without asking the user, and finish through the reported completion mode.\n\
-- Do not call request_merge or apply_merge directly; submit_patch owns the automatic accept/apply path when isolated worktree submission is enabled.\n\
-\n\
-## Workspace MCP gateway\n\n\
-- Diff Forge also mounts `workspace-mcp-gateway` when workspace MCPs are installed. Call `workspace_mcp__sync_manifest` before using workspace MCP tools after config changes or when tool availability is unclear.\n\
-- Workspace MCP tools are namespaced as `<server_key>__<tool_name>` and can change when the user enables, disables, or configures MCPs in Diff Forge.\n\
+## Workflow\n\n\
+1. Inspect files freely. Do not start or checkpoint a task for read-only work.\n\
+2. Immediately before the first edit, call `coordination-kernel.start_task` with a short plan. Use its returned `task_id` for later lifecycle calls.\n\
+3. `coordination-kernel.acquire_lease` does not grant file access; it records claims and detects conflicts. When `completion_mode=submit_patch`, acquire write coverage for every changed file, individually or by glob; patch validation rejects uncovered changes.\n\
+4. After meaningful edit progress, call `coordination-kernel.checkpoint` with a short public summary. Never checkpoint reconnaissance.\n\
+5. Follow the reported mode. For `completion_mode=complete_task`, call `coordination-kernel.complete_task`. Only when `enforcement_mode=worktree_required` and `completion_mode=submit_patch`, call `coordination-kernel.submit_patch`, then poll `coordination-kernel.submit_patch_status` with the returned `submit_job_id`.\n\n\
+## Don't\n\n\
+- Do not call `cloud-diffforge` tools. Task, context, and history Cloud sync is disabled; todos are the shared Cloud work state.\n\
+- Do not call `request_merge` or `apply_merge`; patch acceptance and integration are kernel-owned.\n\
+- Keep plans, checkpoints, and summaries public and terse; omit secrets, hidden reasoning, raw logs, and source dumps.\n\n\
+## Workspace MCPs\n\n\
+- `workspace-mcp-gateway` fronts installed workspace MCPs; child tools are named `<server_key>__<tool_name>`.\n\
+- Call `workspace_mcp__sync_manifest` after configuration changes or whenever tool availability is unclear.\n\
 {DIFFFORGE_AGENT_CONTRACT_END}\n"
     )
 }
@@ -29838,15 +29831,20 @@ mod tests {
         assert!(!repo.join(".codex").join("config.toml").exists());
         assert!(!repo.join(".claude").join("settings.local.json").exists());
         let repo_agents = fs::read_to_string(repo.join("AGENTS.md")).unwrap();
-        assert!(repo_agents.contains("Work normally from the visible project root"));
-        assert!(!repo_agents.contains("COORDINATION_AGENT_BRANCH_ROOT"));
-        assert!(!repo_agents.contains("coordination-kernel.submit_patch"));
-        assert!(!repo_agents.contains("coordination contract"));
-        assert!(!repo_agents.contains("start_task"));
-        assert!(!repo_agents.contains("worktree"));
-        assert!(!repo_agents.contains("lease"));
+        assert!(repo_agents.contains(DIFFFORGE_AGENT_CONTRACT_BEGIN));
+        assert!(repo_agents.contains(DIFFFORGE_AGENT_CONTRACT_END));
+        assert!(repo_agents.contains("# Diff Forge workspace note"));
+        assert!(!repo_agents.contains("coordination-kernel"));
+        assert!(!repo_agents.contains("COORDINATION_"));
         let worktree_agents = fs::read_to_string(worktree.join("AGENTS.md")).unwrap();
+        assert!(worktree_agents.contains(DIFFFORGE_AGENT_CONTRACT_BEGIN));
+        assert!(worktree_agents.contains(DIFFFORGE_AGENT_CONTRACT_END));
+        assert!(worktree_agents.contains("# Diff Forge agent coordination contract"));
         assert!(worktree_agents.contains("coordination-kernel.start_task"));
+        assert!(worktree_agents.contains("coordination-kernel.acquire_lease"));
+        assert!(worktree_agents.contains("coordination-kernel.complete_task"));
+        assert!(worktree_agents.contains("coordination-kernel.submit_patch"));
+        assert!(!worktree_agents.contains("COORDINATION_SESSION_ID"));
         let worktree_codex =
             fs::read_to_string(worktree.join(".codex").join("config.toml")).unwrap();
         assert!(!worktree_codex.contains("[mcp_servers.cloud-diffforge]"));
@@ -32486,6 +32484,66 @@ command = "diffforge --diff-forge-activity-hook"
 
     #[test]
     fn visible_root_contract_exposes_coordination_only_in_direct_coordination_mode() {
+        let plain = diffforge_agent_contract_markdown(AgentContractVariant::Plain);
+        let managed = diffforge_agent_contract_markdown(AgentContractVariant::Managed);
+        let gated = diffforge_agent_contract_markdown(AgentContractVariant::ManagedEnvGated);
+        for contract in [&plain, &managed, &gated] {
+            assert!(contract.starts_with(DIFFFORGE_AGENT_CONTRACT_BEGIN));
+            assert!(contract.ends_with(&format!("{DIFFFORGE_AGENT_CONTRACT_END}\n")));
+            assert_eq!(contract.matches(DIFFFORGE_AGENT_CONTRACT_BEGIN).count(), 1);
+            assert_eq!(contract.matches(DIFFFORGE_AGENT_CONTRACT_END).count(), 1);
+        }
+        assert!(!plain.to_ascii_lowercase().contains("coordination"));
+        assert!(!plain.contains("COORDINATION_"));
+        for forbidden in [
+            "start_task",
+            "acquire_lease",
+            "checkpoint",
+            "complete_task",
+            "submit_patch",
+            "worktree",
+            "lease",
+        ] {
+            assert!(!plain.contains(forbidden));
+        }
+        assert!(managed.contains("# Diff Forge agent coordination contract"));
+        for tool in [
+            "start_task",
+            "acquire_lease",
+            "checkpoint",
+            "complete_task",
+            "submit_patch",
+            "submit_patch_status",
+        ] {
+            assert!(crate::coordination::mcp::TOOL_NAMES.contains(&tool));
+            assert!(managed.contains(&format!("coordination-kernel.{tool}")));
+            assert!(gated.contains(&format!("coordination-kernel.{tool}")));
+        }
+        assert!(managed.contains("does not grant file access"));
+        assert!(managed.contains("patch validation rejects uncovered changes"));
+        assert!(managed.contains("completion_mode=complete_task"));
+        assert!(managed.contains("enforcement_mode=worktree_required"));
+        assert!(managed.contains("completion_mode=submit_patch"));
+        assert!(managed.contains("Task, context, and history Cloud sync is disabled"));
+        assert!(managed.contains("<server_key>__<tool_name>"));
+        assert!(managed.contains("workspace_mcp__sync_manifest"));
+        assert!(!managed.contains("COORDINATION_SESSION_ID"));
+        assert!(!managed.contains("COORDINATION_ENFORCEMENT_MODE"));
+        assert!(!managed.contains("## Scope"));
+        let managed_word_count = managed
+            .lines()
+            .filter(|line| !line.starts_with("<!-- DIFFFORGE_AGENT_CONTRACT_"))
+            .flat_map(str::split_whitespace)
+            .count();
+        assert!(
+            (150..=220).contains(&managed_word_count),
+            "managed contract should stay terse; got {managed_word_count} words"
+        );
+        assert!(gated.contains("## Scope"));
+        assert!(gated.contains("COORDINATION_SESSION_ID"));
+        assert!(gated.contains("COORDINATION_ENFORCEMENT_MODE"));
+        assert!(gated.contains("Otherwise ignore it entirely"));
+
         let repo = init_git_repo("contract_per_mode");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
 
@@ -32495,11 +32553,11 @@ command = "diffforge --diff-forge-activity-hook"
             .update_repo_policy(&json!({"agent_session_mode": "worktree_coordination"}))
             .unwrap();
         let root_contract = fs::read_to_string(repo.join("CLAUDE.md")).unwrap();
-        assert!(root_contract.contains("Work normally from the visible project root"));
-        assert!(!root_contract.contains("start_task"));
-        assert!(!root_contract.contains("lease"));
-        assert!(!root_contract.contains("worktree"));
-        assert!(!root_contract.contains("coordination contract"));
+        assert!(root_contract.contains(DIFFFORGE_AGENT_CONTRACT_BEGIN));
+        assert!(root_contract.contains(DIFFFORGE_AGENT_CONTRACT_END));
+        assert!(root_contract.contains("# Diff Forge workspace note"));
+        assert!(!root_contract.contains("coordination-kernel"));
+        assert!(!root_contract.contains("COORDINATION_"));
 
         // Coordinated mode: managed agents edit the visible root, so the
         // contract lives there but only behind an explicit environment gate.
@@ -32507,8 +32565,12 @@ command = "diffforge --diff-forge-activity-hook"
             .update_repo_policy(&json!({"agent_session_mode": "direct_coordination"}))
             .unwrap();
         let root_contract = fs::read_to_string(repo.join("CLAUDE.md")).unwrap();
+        assert!(root_contract.contains(DIFFFORGE_AGENT_CONTRACT_BEGIN));
+        assert!(root_contract.contains(DIFFFORGE_AGENT_CONTRACT_END));
+        assert!(root_contract.contains("# Diff Forge agent coordination contract"));
         assert!(root_contract.contains("COORDINATION_SESSION_ID"));
-        assert!(root_contract.contains("you were not launched by Diff Forge"));
+        assert!(root_contract.contains("COORDINATION_ENFORCEMENT_MODE"));
+        assert!(root_contract.contains("Otherwise ignore it entirely"));
         assert!(root_contract.contains("coordination-kernel.start_task"));
 
         // Unsafe mode: agents behave like standalone tools; the visible root
@@ -32517,10 +32579,11 @@ command = "diffforge --diff-forge-activity-hook"
             .update_repo_policy(&json!({"agent_session_mode": "direct_unmanaged"}))
             .unwrap();
         let root_contract = fs::read_to_string(repo.join("CLAUDE.md")).unwrap();
-        assert!(root_contract.contains("Work normally from the visible project root"));
-        assert!(!root_contract.contains("start_task"));
-        assert!(!root_contract.contains("lease"));
-        assert!(!root_contract.contains("worktree"));
+        assert!(root_contract.contains(DIFFFORGE_AGENT_CONTRACT_BEGIN));
+        assert!(root_contract.contains(DIFFFORGE_AGENT_CONTRACT_END));
+        assert!(root_contract.contains("# Diff Forge workspace note"));
+        assert!(!root_contract.contains("coordination-kernel"));
+        assert!(!root_contract.contains("COORDINATION_"));
     }
 
     #[test]

@@ -39,6 +39,7 @@ const CLOUD_MCP_ACCOUNT_DEVICE_LIVE_STATE_EVENT: &str = "cloud-mcp-account-devic
 const CLOUD_MCP_AUDIO_PREFERENCES_CHANGED_EVENT: &str = "forge-audio-preferences-changed";
 const CLOUD_MCP_NOTIFICATION_PREFERENCES_CHANGED_EVENT: &str =
     "forge-notification-preferences-changed";
+const CLOUD_MCP_NOTIFICATION_PREFERENCES_MAX_CLOCK_SKEW_MS: u64 = 2 * 60_000;
 const CLOUD_MCP_ACCOUNT_USAGE_EVENT: &str = "cloud-mcp-account-usage";
 const CLOUD_MCP_ACCOUNT_TOOLS_UPDATED_EVENT: &str = "cloud-mcp-account-tools-updated";
 const CLOUD_MCP_NATIVE_SESSIONS_UPDATED_EVENT: &str = "cloud-mcp-native-sessions-updated";
@@ -20642,20 +20643,23 @@ fn cloud_mcp_remote_workspace_activation_error_allows_pending(error: &str) -> bo
     !(error.contains("unknown workspace") || error.contains("workspace root does not exist"))
 }
 
+fn cloud_mcp_agent_prompt_answer_details_failed(details: &Value) -> bool {
+    details
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status.eq_ignore_ascii_case("failed"))
+        || details.get("answered").and_then(Value::as_bool) == Some(false)
+}
+
 fn cloud_mcp_apply_remote_agent_prompt_lever(
     app: &AppHandle,
     state: &CloudMcpState,
     event: &Value,
 ) -> bool {
     let command_kind = cloud_mcp_remote_command_kind(event);
-    if !matches!(
-        command_kind.as_str(),
-        "agent_prompt_answer"
-            | "answer_agent_prompt"
-            | "agent_input_answer"
-            | "terminal_prompt_answer"
-            | "prompt_answer"
-    ) {
+    if !cloud_mcp_remote_command_is_agent_prompt_answer(&command_kind)
+        || todo_dispatch_webview_dispatcher_active()
+    {
         return false;
     }
     let app = app.clone();
@@ -20663,6 +20667,16 @@ fn cloud_mcp_apply_remote_agent_prompt_lever(
     let event = event.clone();
     tauri::async_runtime::spawn(async move {
         match crate::terminal_answer_agent_prompt_remote_command(app, event.clone()).await {
+            Ok(details) if cloud_mcp_agent_prompt_answer_details_failed(&details) => {
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state,
+                    &event,
+                    "failed",
+                    "Agent prompt answer was rejected or did not dismiss the prompt.",
+                    Some(&details),
+                )
+                .await;
+            }
             Ok(details) => {
                 let _ = cloud_mcp_send_remote_command_status_event(
                     &state,
@@ -20689,6 +20703,27 @@ fn cloud_mcp_apply_remote_agent_prompt_lever(
         }
     });
     true
+}
+
+#[cfg(test)]
+mod cloud_mcp_agent_prompt_answer_tests {
+    use super::*;
+
+    #[test]
+    fn failed_prompt_answer_details_are_not_remote_completion() {
+        assert!(cloud_mcp_agent_prompt_answer_details_failed(&json!({
+            "status": "failed",
+            "answered": true,
+        })));
+        assert!(cloud_mcp_agent_prompt_answer_details_failed(&json!({
+            "status": "applied",
+            "answered": false,
+        })));
+        assert!(!cloud_mcp_agent_prompt_answer_details_failed(&json!({
+            "status": "applied",
+            "answered": true,
+        })));
+    }
 }
 
 /// Architecture file changes are local drafts. The webview listens to the store
@@ -22470,12 +22505,24 @@ fn cloud_mcp_apply_remote_device_lever(
     true
 }
 
+fn cloud_mcp_remote_command_is_agent_prompt_answer(command_kind: &str) -> bool {
+    matches!(
+        command_kind,
+        "agent_prompt_answer"
+            | "answer_agent_prompt"
+            | "agent_input_answer"
+            | "terminal_prompt_answer"
+            | "prompt_answer"
+    )
+}
+
 fn cloud_mcp_remote_command_is_rust_owned(event: &Value) -> bool {
-    let command_kind =
-        cloud_mcp_payload_text(event, &["command_kind", "commandKind", "action", "command"])
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .replace(['.', ' ', '-'], "_");
+    let command_kind = cloud_mcp_remote_command_kind(event);
+    if cloud_mcp_remote_command_is_agent_prompt_answer(&command_kind)
+        && todo_dispatch_webview_dispatcher_active()
+    {
+        return false;
+    }
     matches!(
         command_kind.as_str(),
         "agent_uninstall"
@@ -23190,6 +23237,13 @@ fn cloud_mcp_notification_preferences_timestamp(value: &Value) -> u64 {
         .unwrap_or_default()
 }
 
+fn cloud_mcp_notification_preferences_timestamp_is_plausible(value: &Value, now_ms: u64) -> bool {
+    let timestamp = cloud_mcp_notification_preferences_timestamp(value);
+    timestamp > 0
+        && timestamp
+            <= now_ms.saturating_add(CLOUD_MCP_NOTIFICATION_PREFERENCES_MAX_CLOCK_SKEW_MS)
+}
+
 fn cloud_mcp_notification_preferences_source(value: &Value) -> &Value {
     value
         .get("preferences")
@@ -23404,8 +23458,22 @@ fn cloud_mcp_sanitize_notification_preferences(value: &Value) -> Option<Value> {
 
 fn cloud_mcp_notification_preferences_from_app(app: &AppHandle) -> Value {
     let current = app_local_state_read(app, CLOUD_MCP_NOTIFICATION_PREFERENCES_STATE_KEY);
-    cloud_mcp_sanitize_notification_preferences(&current)
-        .unwrap_or_else(cloud_mcp_default_notification_preferences)
+    let mut preferences = cloud_mcp_sanitize_notification_preferences(&current)
+        .unwrap_or_else(cloud_mcp_default_notification_preferences);
+    if cloud_mcp_notification_preferences_timestamp(&preferences) > 0
+        && !cloud_mcp_notification_preferences_timestamp_is_plausible(
+            &preferences,
+            cloud_mcp_now_ms(),
+        )
+    {
+        // Old clients could persist an arbitrarily future-stamped snapshot.
+        // Treat its timestamp as untrusted so a valid edit can recover instead
+        // of leaving the account pinned until that wall clock is reached.
+        if let Some(object) = preferences.as_object_mut() {
+            object.insert("updated_at_ms".to_string(), json!(0));
+        }
+    }
+    preferences
 }
 
 fn cloud_mcp_notification_preferences_write_app(
@@ -23415,12 +23483,28 @@ fn cloud_mcp_notification_preferences_write_app(
     app_local_state_write(app, CLOUD_MCP_NOTIFICATION_PREFERENCES_STATE_KEY, preferences)
 }
 
+static CLOUD_MCP_NOTIFICATION_PREFERENCES_WRITE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+
+fn cloud_mcp_notification_preferences_write_lock() -> &'static StdMutex<()> {
+    CLOUD_MCP_NOTIFICATION_PREFERENCES_WRITE_LOCK.get_or_init(|| StdMutex::new(()))
+}
+
 async fn cloud_mcp_notification_preferences_set_runtime_snapshot(
     state: &CloudMcpState,
     preferences: Value,
 ) {
     let mut snapshots = state.runtime_snapshots.lock().await;
-    snapshots.notification_preferences = Some(preferences);
+    let should_replace = snapshots
+        .notification_preferences
+        .as_ref()
+        .map(|current| {
+            current == &preferences
+                || cloud_mcp_notification_preferences_should_apply(current, &preferences)
+        })
+        .unwrap_or(true);
+    if should_replace {
+        snapshots.notification_preferences = Some(preferences);
+    }
 }
 
 fn cloud_mcp_notification_preferences_unit_payload(preferences: &Value, reason: &str) -> Value {
@@ -23468,32 +23552,35 @@ async fn cloud_mcp_publish_notification_preferences_unit(
 }
 
 fn cloud_mcp_notification_preferences_consider_candidate(
-    latest: &mut Option<(Value, bool)>,
+    latest: &mut Option<Value>,
     candidate: &Value,
-    is_account_root: bool,
+    now_ms: u64,
 ) {
     let Some(preferences) = cloud_mcp_sanitize_notification_preferences(candidate) else {
         return;
     };
-    let candidate_timestamp = cloud_mcp_notification_preferences_timestamp(&preferences);
+    let Some(candidate_rank) = cloud_mcp_notification_preferences_rank(&preferences, now_ms) else {
+        return;
+    };
     let should_replace = latest
         .as_ref()
-        .map(|(current, current_is_account_root)| {
-            let current_timestamp = cloud_mcp_notification_preferences_timestamp(current);
-            candidate_timestamp > current_timestamp
-                || (candidate_timestamp == current_timestamp
-                    && is_account_root
-                    && !*current_is_account_root)
+        .map(|current| {
+            cloud_mcp_notification_preferences_rank(current, now_ms)
+                .map(|current_rank| candidate_rank > current_rank)
+                .unwrap_or(true)
         })
         .unwrap_or(true);
     if should_replace {
-        *latest = Some((preferences, is_account_root));
+        *latest = Some(preferences);
     }
 }
 
-fn cloud_mcp_notification_preferences_from_account_live_state(value: &Value) -> Option<Value> {
+fn cloud_mcp_notification_preferences_from_account_live_state_at(
+    value: &Value,
+    now_ms: u64,
+) -> Option<Value> {
     let live = cloud_mcp_account_live_state_from_value(value).unwrap_or_else(|| value.clone());
-    let mut latest: Option<(Value, bool)> = None;
+    let mut latest: Option<Value> = None;
     for candidate in [
         live.get("notification_preferences"),
         live.get("notificationPreferences"),
@@ -23503,7 +23590,7 @@ fn cloud_mcp_notification_preferences_from_account_live_state(value: &Value) -> 
     .into_iter()
     .flatten()
     {
-        cloud_mcp_notification_preferences_consider_candidate(&mut latest, candidate, true);
+        cloud_mcp_notification_preferences_consider_candidate(&mut latest, candidate, now_ms);
     }
 
     let devices = live
@@ -23523,7 +23610,7 @@ fn cloud_mcp_notification_preferences_from_account_live_state(value: &Value) -> 
                     cloud_mcp_notification_preferences_consider_candidate(
                         &mut latest,
                         candidate,
-                        false,
+                        now_ms,
                     );
                 }
             }
@@ -23540,14 +23627,18 @@ fn cloud_mcp_notification_preferences_from_account_live_state(value: &Value) -> 
                     cloud_mcp_notification_preferences_consider_candidate(
                         &mut latest,
                         candidate,
-                        false,
+                        now_ms,
                     );
                 }
             }
         }
         _ => {}
     }
-    latest.map(|(preferences, _)| preferences)
+    latest
+}
+
+fn cloud_mcp_notification_preferences_from_account_live_state(value: &Value) -> Option<Value> {
+    cloud_mcp_notification_preferences_from_account_live_state_at(value, cloud_mcp_now_ms())
 }
 
 fn cloud_mcp_is_notification_preferences_sync_unit_event(event_kind: &str, event: &Value) -> bool {
@@ -23562,14 +23653,55 @@ fn cloud_mcp_is_notification_preferences_sync_unit_event(event_kind: &str, event
         .unwrap_or(false)
 }
 
-fn cloud_mcp_notification_preferences_should_apply(current: &Value, incoming: &Value) -> bool {
-    let incoming_updated_at_ms = cloud_mcp_notification_preferences_timestamp(incoming);
-    if incoming_updated_at_ms == 0 {
-        return false;
+fn cloud_mcp_notification_preferences_fingerprint(value: &Value) -> String {
+    let normalized = cloud_mcp_sanitize_notification_preferences(value)
+        .unwrap_or_else(cloud_mcp_default_notification_preferences);
+    cloud_mcp_outbox_payload_hash(&normalized)
+}
+
+fn cloud_mcp_notification_preferences_rank(value: &Value, now_ms: u64) -> Option<(u64, String)> {
+    if !cloud_mcp_notification_preferences_timestamp_is_plausible(value, now_ms) {
+        return None;
     }
-    let current_updated_at_ms = cloud_mcp_notification_preferences_timestamp(current);
-    current_updated_at_ms < incoming_updated_at_ms
-        || (current_updated_at_ms == incoming_updated_at_ms && current != incoming)
+    Some((
+        cloud_mcp_notification_preferences_timestamp(value),
+        cloud_mcp_notification_preferences_fingerprint(value),
+    ))
+}
+
+fn cloud_mcp_notification_preferences_should_apply_at(
+    current: &Value,
+    incoming: &Value,
+    now_ms: u64,
+) -> bool {
+    let Some(incoming_rank) = cloud_mcp_notification_preferences_rank(incoming, now_ms) else {
+        return false;
+    };
+    cloud_mcp_notification_preferences_rank(current, now_ms)
+        .map(|current_rank| incoming_rank > current_rank)
+        .unwrap_or(true)
+}
+
+fn cloud_mcp_notification_preferences_should_apply(current: &Value, incoming: &Value) -> bool {
+    cloud_mcp_notification_preferences_should_apply_at(current, incoming, cloud_mcp_now_ms())
+}
+
+fn cloud_mcp_notification_preferences_authoritative_local_timestamp(
+    current: &Value,
+    now_ms: u64,
+) -> u64 {
+    let max_timestamp = now_ms
+        .saturating_add(CLOUD_MCP_NOTIFICATION_PREFERENCES_MAX_CLOCK_SKEW_MS);
+    let current_timestamp = if cloud_mcp_notification_preferences_timestamp_is_plausible(
+        current, now_ms,
+    ) {
+        cloud_mcp_notification_preferences_timestamp(current)
+    } else {
+        0
+    };
+    now_ms
+        .max(current_timestamp.saturating_add(1))
+        .min(max_timestamp)
 }
 
 async fn cloud_mcp_apply_notification_preferences_from_account_live_state_inner<F>(
@@ -23597,17 +23729,21 @@ async fn cloud_mcp_apply_notification_preferences_from_account_live_state(
     state: &CloudMcpState,
     event: &Value,
 ) {
-    let current = cloud_mcp_notification_preferences_from_app(app);
-    let Some(preferences) = cloud_mcp_apply_notification_preferences_from_account_live_state_inner(
-        state,
-        event,
-        current,
-        |preferences| cloud_mcp_notification_preferences_write_app(app, preferences).is_ok(),
-    )
-    .await
-    else {
+    let Some(preferences) = cloud_mcp_notification_preferences_from_account_live_state(event) else {
         return;
     };
+    let applied = {
+        let Ok(_write_guard) = cloud_mcp_notification_preferences_write_lock().lock() else {
+            return;
+        };
+        let current = cloud_mcp_notification_preferences_from_app(app);
+        cloud_mcp_notification_preferences_should_apply(&current, &preferences)
+            && cloud_mcp_notification_preferences_write_app(app, &preferences).is_ok()
+    };
+    if !applied {
+        return;
+    }
+    cloud_mcp_notification_preferences_set_runtime_snapshot(state, preferences.clone()).await;
     let _ = app.emit(
         CLOUD_MCP_NOTIFICATION_PREFERENCES_CHANGED_EVENT,
         json!({
@@ -23646,12 +23782,24 @@ async fn cloud_mcp_set_notification_preferences(
     let now_ms = cloud_mcp_now_ms();
     let mut preferences = cloud_mcp_sanitize_notification_preferences(&preferences)
         .unwrap_or_else(cloud_mcp_default_notification_preferences);
-    if cloud_mcp_notification_preferences_timestamp(&preferences) == 0 {
+    {
+        let _write_guard = cloud_mcp_notification_preferences_write_lock()
+            .lock()
+            .map_err(|_| "Notification preference write state is unavailable.".to_string())?;
+        let current = cloud_mcp_notification_preferences_from_app(&app);
+        let authoritative_timestamp =
+            cloud_mcp_notification_preferences_authoritative_local_timestamp(&current, now_ms);
         if let Some(object) = preferences.as_object_mut() {
-            object.insert("updated_at_ms".to_string(), json!(now_ms));
+            // Client wall clocks are advisory only. The desktop serializes
+            // writes and assigns a bounded authoritative timestamp so a
+            // future-stamped client cannot pin every other device's edits.
+            object.insert(
+                "updated_at_ms".to_string(),
+                json!(authoritative_timestamp),
+            );
         }
+        cloud_mcp_notification_preferences_write_app(&app, &preferences)?;
     }
-    cloud_mcp_notification_preferences_write_app(&app, &preferences)?;
     cloud_mcp_notification_preferences_set_runtime_snapshot(state.inner(), preferences.clone())
         .await;
     let reason = reason
@@ -55908,27 +56056,155 @@ mod cloud_mcp_tests {
     }
 
     #[test]
-    fn notification_preferences_from_account_live_state_tie_prefers_root() {
-        let preferences = cloud_mcp_notification_preferences_from_account_live_state(&json!({
+    fn notification_preferences_equal_timestamp_tie_is_deterministic_without_churn() {
+        let root = json!({
+            "push": {"loop_run_blocked": true},
+            "updated_at_ms": 300,
+        });
+        let device = json!({
+            "push": {"loop_run_blocked": false},
+            "updated_at_ms": 300,
+        });
+        let root_first = cloud_mcp_notification_preferences_from_account_live_state(&json!({
             "account_live_state": {
-                "notification_preferences": {
-                    "push": {"loop_run_blocked": true},
-                    "updated_at_ms": 300,
-                },
+                "notification_preferences": root.clone(),
                 "devices": [
                     {
-                        "notification_preferences": {
-                            "push": {"loop_run_blocked": false},
-                            "updated_at_ms": 300,
-                        },
+                        "notification_preferences": device.clone(),
                     },
                 ],
             },
         }))
-        .expect("root tie preferences");
+        .expect("root-first tie preferences");
+        let device_first = cloud_mcp_notification_preferences_from_account_live_state(&json!({
+            "account_live_state": {
+                "notification_preferences": device,
+                "devices": [
+                    {
+                        "notification_preferences": root,
+                    },
+                ],
+            },
+        }))
+        .expect("device-first tie preferences");
 
-        assert_eq!(preferences["updated_at_ms"], json!(300));
-        assert_eq!(preferences["push"]["loop_run_blocked"], json!(true));
+        assert_eq!(root_first, device_first);
+        assert!(!cloud_mcp_notification_preferences_should_apply(
+            &root_first,
+            &device_first,
+        ));
+        assert!(!cloud_mcp_notification_preferences_should_apply(
+            &device_first,
+            &root_first,
+        ));
+    }
+
+    #[test]
+    fn notification_preferences_reject_implausible_future_clock_and_accept_valid_edit() {
+        let now_ms: u64 = 1_000_000;
+        let future_timestamp = now_ms
+            .saturating_add(CLOUD_MCP_NOTIFICATION_PREFERENCES_MAX_CLOCK_SKEW_MS)
+            .saturating_add(1);
+        let preferences = cloud_mcp_notification_preferences_from_account_live_state_at(
+            &json!({
+                "account_live_state": {
+                    "notification_preferences": {
+                        "push": {"loop_run_failed": false},
+                        "updated_at_ms": future_timestamp,
+                    },
+                    "devices": [{
+                        "notification_preferences": {
+                            "push": {"loop_run_failed": true},
+                            "updated_at_ms": now_ms - 1,
+                        },
+                    }],
+                },
+            }),
+            now_ms,
+        )
+        .expect("valid preferences");
+
+        assert_eq!(preferences["updated_at_ms"], json!(now_ms - 1));
+        assert_eq!(preferences["push"]["loop_run_failed"], json!(true));
+        assert!(!cloud_mcp_notification_preferences_should_apply_at(
+            &json!({"updated_at_ms": now_ms}),
+            &json!({"updated_at_ms": future_timestamp}),
+            now_ms,
+        ));
+        assert!(cloud_mcp_notification_preferences_should_apply_at(
+            &json!({"updated_at_ms": future_timestamp}),
+            &json!({"updated_at_ms": now_ms - 1}),
+            now_ms,
+        ));
+    }
+
+    #[test]
+    fn notification_preferences_equal_timestamp_has_one_way_tie_break() {
+        let now_ms = 10_000;
+        let left = cloud_mcp_sanitize_notification_preferences(&json!({
+            "push": {"account_events": false},
+            "updated_at_ms": 9_000,
+        }))
+        .expect("left preferences");
+        let right = cloud_mcp_sanitize_notification_preferences(&json!({
+            "push": {"account_events": true},
+            "updated_at_ms": 9_000,
+        }))
+        .expect("right preferences");
+
+        let left_accepts_right =
+            cloud_mcp_notification_preferences_should_apply_at(&left, &right, now_ms);
+        let right_accepts_left =
+            cloud_mcp_notification_preferences_should_apply_at(&right, &left, now_ms);
+        assert_ne!(left_accepts_right, right_accepts_left);
+    }
+
+    #[test]
+    fn notification_preferences_local_timestamp_stays_within_skew_boundary() {
+        let now_ms: u64 = 50_000;
+        let boundary = now_ms
+            .saturating_add(CLOUD_MCP_NOTIFICATION_PREFERENCES_MAX_CLOCK_SKEW_MS);
+        let current = json!({
+            "push": {"uir_prompts": true},
+            "updated_at_ms": boundary,
+        });
+
+        let timestamp =
+            cloud_mcp_notification_preferences_authoritative_local_timestamp(&current, now_ms);
+        assert_eq!(timestamp, boundary);
+        assert!(cloud_mcp_notification_preferences_timestamp_is_plausible(
+            &json!({"updated_at_ms": timestamp}),
+            now_ms,
+        ));
+    }
+
+    #[tokio::test]
+    async fn notification_preferences_runtime_snapshot_cannot_regress() {
+        let state = CloudMcpState::new();
+        cloud_mcp_notification_preferences_set_runtime_snapshot(
+            &state,
+            json!({
+                "push": {"loop_run_completed": false},
+                "updated_at_ms": 2_000,
+            }),
+        )
+        .await;
+        cloud_mcp_notification_preferences_set_runtime_snapshot(
+            &state,
+            json!({
+                "push": {"loop_run_completed": true},
+                "updated_at_ms": 1_000,
+            }),
+        )
+        .await;
+
+        let snapshots = state.runtime_snapshots.lock().await;
+        let stored = snapshots
+            .notification_preferences
+            .as_ref()
+            .expect("runtime notification preferences");
+        assert_eq!(stored["updated_at_ms"], json!(2_000));
+        assert_eq!(stored["push"]["loop_run_completed"], json!(false));
     }
 
     #[tokio::test]

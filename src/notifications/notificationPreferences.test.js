@@ -5,6 +5,9 @@ import {
   loopspaceOverrideSelectValue,
   loopspaceOverrideValueFromSelect,
   normalizeNotificationPreferences,
+  notificationPreferencesLoadRetryDelayMs,
+  notificationPreferencesSnapshotCanReplaceLocalEdit,
+  pruneNotificationPreferenceLoopspaceOverrides,
   setLoopspaceNotificationOverride,
   setNotificationPreferencePushValue,
 } from "./notificationPreferences.js";
@@ -88,4 +91,32 @@ test("notification prefs update loopspace overrides as tri-state values", () => 
   assert.equal(loopspaceOverrideSelectValue(null), "inherit");
   assert.equal(loopspaceOverrideValueFromSelect("on"), true);
   assert.equal(loopspaceOverrideValueFromSelect("inherit"), null);
+});
+
+test("notification prefs reject load and event snapshots not newer than an in-flight edit", () => {
+  assert.equal(notificationPreferencesSnapshotCanReplaceLocalEdit({ updated_at_ms: 99 }, 100), false);
+  assert.equal(notificationPreferencesSnapshotCanReplaceLocalEdit({ updated_at_ms: 100 }, 100), false);
+  assert.equal(notificationPreferencesSnapshotCanReplaceLocalEdit({ updated_at_ms: 101 }, 100), true);
+  assert.equal(notificationPreferencesSnapshotCanReplaceLocalEdit({ updated_at_ms: 0 }, 0), true);
+});
+
+test("notification prefs load retry uses bounded backoff", () => {
+  assert.deepEqual(
+    [0, 1, 2, 3, 4].map(notificationPreferencesLoadRetryDelayMs),
+    [500, 1_500, 5_000, null, null],
+  );
+});
+
+test("notification prefs prune overrides for deleted loopspaces", () => {
+  const preferences = pruneNotificationPreferenceLoopspaceOverrides({
+    updated_at_ms: 500,
+    loopspace_overrides: {
+      "loop-live": { started: true },
+      "loop-deleted": { completed: false },
+    },
+  }, [{ id: "loop-live" }, { loopspace_id: "loop-other" }]);
+
+  assert.equal(preferences.updated_at_ms, 500);
+  assert.deepEqual(Object.keys(preferences.loopspace_overrides), ["loop-live"]);
+  assert.equal(preferences.loopspace_overrides["loop-live"].started, true);
 });

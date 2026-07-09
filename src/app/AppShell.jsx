@@ -101,6 +101,10 @@ import {
   normalizePermissionModeForProvider,
 } from "../terminals/permissionModeAutomation.js";
 import {
+  enqueuePaneControlOperation,
+  paneControlOperationPending,
+} from "../terminals/paneControlQueue.js";
+import {
   getProviderTurnCompletionIntent,
   shouldReconcileProviderTurnCompletion,
 } from "../terminals/providerTurnIntent.js";
@@ -349,7 +353,11 @@ import {
   loopspaceOverrideSelectValue,
   loopspaceOverrideValueFromSelect,
   normalizeNotificationPreferences,
+  notificationPreferencesLoadRetryDelayMs,
+  notificationPreferencesSnapshotCanReplaceLocalEdit,
   notificationPreferencesStatusLabel,
+  notificationPreferencesUpdatedNow,
+  pruneNotificationPreferenceLoopspaceOverrides,
   setLoopspaceNotificationOverride,
   setNotificationPreferencePushValue,
 } from "../notifications/notificationPreferences.js";
@@ -24570,6 +24578,16 @@ export default function App() {
   const appScriptsShelfRef = useRef(null);
   const [cloudWorkspaceProgress, setCloudWorkspaceProgress] = useState(CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE);
   const [cloudDesktopDeviceProfile, setCloudDesktopDeviceProfile] = useState(null);
+  // App-scope account device rows for the Devices view. LoopspaceRuntimeView
+  // builds its own copy from its props; the Devices view lives in App() and
+  // must not reference that inner-scope binding (a ReferenceError there crashes
+  // the whole render tree).
+  const accountDeviceRowsForDevicesView = useMemo(() => buildAccountLiveDeviceRows({
+    deviceLiveState: cloudWorkspaceProgress.deviceLiveState,
+    knownDevices: cloudWorkspaceProgress.knownDevices,
+    localProfile: cloudDesktopDeviceProfile,
+    maxRows: "all",
+  }), [cloudWorkspaceProgress.deviceLiveState, cloudWorkspaceProgress.knownDevices, cloudDesktopDeviceProfile]);
   const [dismissedLowCreditWarningKey, setDismissedLowCreditWarningKey] = useState(
     readDismissedLowCreditWarningKey,
   );
@@ -24615,6 +24633,16 @@ export default function App() {
   const activatedWorkspaceIdRef = useRef("");
   const workspacePendingActivationIdRef = useRef("");
   const loopspacesRef = useRef(loopspaces);
+  const loopspacesHydratedRef = useRef(loopspacesHydrated);
+  loopspacesHydratedRef.current = loopspacesHydrated;
+  const notificationPreferencesRef = useRef(notificationPreferences);
+  notificationPreferencesRef.current = notificationPreferences;
+  const notificationPreferencesActiveScopeKeyRef = useRef("");
+  const notificationPreferencesStateScopeKeyRef = useRef("");
+  const notificationPreferencesLoadInFlightRef = useRef(null);
+  const notificationPreferencesInFlightEditRef = useRef(null);
+  const notificationPreferencesSaveQueueRef = useRef(Promise.resolve());
+  const notificationPreferencesSaveRevisionRef = useRef(0);
   const workspaceGraphStateRef = useRef(workspaceGraphState);
   const workspaceArchitectureScanInFlightRef = useRef(new Set());
   const workspaceArchitectureGraphListInFlightRef = useRef(new Set());
@@ -25111,8 +25139,8 @@ export default function App() {
   const workspaceCoordinationBootstrapKeysRef = useRef(new Set());
   const terminalStatusEventEmitterRef = useRef(null);
   const remoteCommandReceiptsRef = useRef(new Map());
-  const remoteModelConfigQueueRef = useRef(new Map());
-  const remotePermissionConfigQueueRef = useRef(new Map());
+  const remoteControlConfigWaitQueueRef = useRef(new Map());
+  const remotePaneControlQueueRef = useRef(new Map());
   const workspaceMcpSyncKeyRef = useRef("");
   const cloudMcpSessionContextSyncKeyRef = useRef("");
 
@@ -25431,6 +25459,7 @@ export default function App() {
       };
   }, [accountScopes, activeScope]);
   const activeAccountScopeKey = accountScopeKey(activeAccountScope);
+  notificationPreferencesActiveScopeKeyRef.current = activeAccountScopeKey;
   const activeWorkspaceScopePayload = useMemo(
     () => accountScopeInvokePayload(activeAccountScope),
     [activeAccountScope],
@@ -28448,11 +28477,7 @@ export default function App() {
     };
 
     setLoopspacesHydrated(false);
-    loadLoopspaces().finally(() => {
-      if (!cancelled) {
-        setLoopspacesHydrated(true);
-      }
-    });
+    void loadLoopspaces();
     return () => {
       cancelled = true;
     };
@@ -29178,60 +29203,182 @@ export default function App() {
     }
   }, [highlightSettingsPermission, loadSettingsPermissionState, setSettingsPermissionError]);
 
+  const normalizeInboundNotificationPreferences = useCallback(
+    (value) => normalizeNotificationPreferences(value),
+    [],
+  );
+
+  const acceptInboundNotificationPreferences = useCallback((value) => {
+    const preferences = normalizeInboundNotificationPreferences(value);
+    const incomingTimestamp = Number(preferences.updated_at_ms || 0);
+    const currentTimestamp = Number(notificationPreferencesRef.current?.updated_at_ms || 0);
+    const inFlightEditTimestamp = Number(
+      notificationPreferencesInFlightEditRef.current?.updatedAtMs || 0,
+    );
+    if (
+      !notificationPreferencesSnapshotCanReplaceLocalEdit(preferences, inFlightEditTimestamp)
+      || (!inFlightEditTimestamp && currentTimestamp > 0 && incomingTimestamp < currentTimestamp)
+    ) {
+      return null;
+    }
+    notificationPreferencesRef.current = preferences;
+    setNotificationPreferences(preferences);
+    return preferences;
+  }, [normalizeInboundNotificationPreferences]);
+
   const loadNotificationPreferences = useCallback(async ({ silent = false } = {}) => {
+    if (notificationPreferencesInFlightEditRef.current) {
+      return notificationPreferencesRef.current;
+    }
+    if (notificationPreferencesLoadInFlightRef.current) {
+      return notificationPreferencesLoadInFlightRef.current;
+    }
     if (!silent) {
       setNotificationPreferencesState("loading");
     }
-    try {
-      const result = await invoke("cloud_mcp_get_notification_preferences");
-      const preferences = normalizeNotificationPreferences(result?.preferences || result?.notification_preferences || result);
-      setNotificationPreferences(preferences);
-      setNotificationPreferencesState("ready");
-      setNotificationPreferencesError("");
-      return preferences;
-    } catch (error) {
-      setNotificationPreferencesState("error");
-      setNotificationPreferencesError(getErrorMessage(error, "Unable to load notification preferences."));
-      return null;
-    }
-  }, []);
+    const scopeKeyAtStart = notificationPreferencesActiveScopeKeyRef.current;
+    const saveRevisionAtStart = notificationPreferencesSaveRevisionRef.current;
+    const request = (async () => {
+      try {
+        const result = await invoke("cloud_mcp_get_notification_preferences");
+        if (
+          notificationPreferencesActiveScopeKeyRef.current !== scopeKeyAtStart
+          || notificationPreferencesSaveRevisionRef.current !== saveRevisionAtStart
+        ) {
+          return notificationPreferencesRef.current;
+        }
+        const incoming = result?.preferences || result?.notification_preferences || result;
+        const preferences = acceptInboundNotificationPreferences(incoming)
+          || notificationPreferencesRef.current;
+        if (!notificationPreferencesInFlightEditRef.current) {
+          setNotificationPreferencesState("ready");
+          setNotificationPreferencesError("");
+        }
+        return preferences;
+      } catch (error) {
+        if (
+          notificationPreferencesActiveScopeKeyRef.current !== scopeKeyAtStart
+          || notificationPreferencesSaveRevisionRef.current !== saveRevisionAtStart
+        ) {
+          return notificationPreferencesRef.current;
+        }
+        if (!notificationPreferencesInFlightEditRef.current) {
+          setNotificationPreferencesState("error");
+          setNotificationPreferencesError(getErrorMessage(error, "Unable to load notification preferences."));
+        }
+        return null;
+      } finally {
+        if (notificationPreferencesLoadInFlightRef.current === request) {
+          notificationPreferencesLoadInFlightRef.current = null;
+        }
+      }
+    })();
+    notificationPreferencesLoadInFlightRef.current = request;
+    return request;
+  }, [acceptInboundNotificationPreferences]);
 
   const saveNotificationPreferences = useCallback(async (nextPreferences, reason) => {
-    const preferences = normalizeNotificationPreferences(nextPreferences);
+    const scopeKey = notificationPreferencesActiveScopeKeyRef.current;
+    const previousPreferences = normalizeNotificationPreferences(notificationPreferencesRef.current);
+    const normalized = normalizeNotificationPreferences(nextPreferences);
+    const pruned = loopspacesHydratedRef.current
+      ? pruneNotificationPreferenceLoopspaceOverrides(normalized, loopspacesRef.current)
+      : normalized;
+    const currentTimestamp = Number(notificationPreferencesRef.current?.updated_at_ms || 0);
+    const requestedTimestamp = Number(pruned.updated_at_ms || 0);
+    const preferences = notificationPreferencesUpdatedNow(
+      pruned,
+      Math.max(Date.now(), requestedTimestamp, currentTimestamp + 1),
+    );
+    const revision = notificationPreferencesSaveRevisionRef.current + 1;
+    notificationPreferencesSaveRevisionRef.current = revision;
+    notificationPreferencesInFlightEditRef.current = {
+      revision,
+      updatedAtMs: preferences.updated_at_ms,
+    };
+    notificationPreferencesRef.current = preferences;
     setNotificationPreferences(preferences);
     setNotificationPreferencesState("saving");
     setNotificationPreferencesError("");
     try {
-      const result = await invoke("cloud_mcp_set_notification_preferences", {
-        preferences,
-        reason,
-      });
-      const synced = normalizeNotificationPreferences(result?.preferences || result?.notification_preferences || preferences);
-      setNotificationPreferences(synced);
-      setNotificationPreferencesState("ready");
-      setNotificationPreferencesError("");
-      return synced;
+      const request = notificationPreferencesSaveQueueRef.current
+        .catch(() => undefined)
+        .then(() => {
+          if (notificationPreferencesActiveScopeKeyRef.current !== scopeKey) {
+            throw new Error("Notification preference account scope changed before save.");
+          }
+          return invoke("cloud_mcp_set_notification_preferences", {
+            preferences,
+            reason,
+          });
+        });
+      notificationPreferencesSaveQueueRef.current = request.then(
+        () => undefined,
+        () => undefined,
+      );
+      const result = await request;
+      if (notificationPreferencesActiveScopeKeyRef.current !== scopeKey) {
+        return null;
+      }
+      const synced = normalizeInboundNotificationPreferences(
+        result?.preferences || result?.notification_preferences || preferences,
+      );
+      if (notificationPreferencesSaveRevisionRef.current === revision) {
+        notificationPreferencesInFlightEditRef.current = null;
+        // The Rust boundary owns the persisted clock. Its response is the
+        // authority even when the optimistic browser clock was further ahead.
+        notificationPreferencesRef.current = synced;
+        setNotificationPreferences(synced);
+        setNotificationPreferencesState("ready");
+        setNotificationPreferencesError("");
+      }
+      return notificationPreferencesRef.current;
     } catch (error) {
-      setNotificationPreferencesState("error");
-      setNotificationPreferencesError(getErrorMessage(error, "Unable to save notification preferences."));
+      if (
+        notificationPreferencesActiveScopeKeyRef.current === scopeKey
+        && notificationPreferencesSaveRevisionRef.current === revision
+      ) {
+        notificationPreferencesInFlightEditRef.current = null;
+        notificationPreferencesRef.current = previousPreferences;
+        setNotificationPreferences(previousPreferences);
+        setNotificationPreferencesState("error");
+        setNotificationPreferencesError(getErrorMessage(error, "Unable to save notification preferences."));
+      }
       return null;
     }
-  }, []);
+  }, [normalizeInboundNotificationPreferences]);
 
   const updateNotificationPushPreference = useCallback((key, enabled) => {
-    const nextPreferences = setNotificationPreferencePushValue(notificationPreferences, key, enabled);
+    const nextPreferences = setNotificationPreferencePushValue(notificationPreferencesRef.current, key, enabled);
     void saveNotificationPreferences(nextPreferences, `notification_push_${key}`);
-  }, [notificationPreferences, saveNotificationPreferences]);
+  }, [saveNotificationPreferences]);
 
   const updateLoopspaceNotificationPreference = useCallback((loopspaceId, status, value) => {
     const nextPreferences = setLoopspaceNotificationOverride(
-      notificationPreferences,
+      notificationPreferencesRef.current,
       loopspaceId,
       status,
       loopspaceOverrideValueFromSelect(value),
     );
     void saveNotificationPreferences(nextPreferences, `loopspace_notification_${status}`);
-  }, [notificationPreferences, saveNotificationPreferences]);
+  }, [saveNotificationPreferences]);
+
+  useEffect(() => {
+    const previousScopeKey = notificationPreferencesStateScopeKeyRef.current;
+    notificationPreferencesStateScopeKeyRef.current = activeAccountScopeKey;
+    if (!previousScopeKey || previousScopeKey === activeAccountScopeKey) {
+      return;
+    }
+    notificationPreferencesSaveRevisionRef.current += 1;
+    notificationPreferencesInFlightEditRef.current = null;
+    notificationPreferencesLoadInFlightRef.current = null;
+    loopspacesHydratedRef.current = false;
+    const defaults = normalizeNotificationPreferences(null);
+    notificationPreferencesRef.current = defaults;
+    setNotificationPreferences(defaults);
+    setNotificationPreferencesState("idle");
+    setNotificationPreferencesError("");
+  }, [activeAccountScopeKey]);
 
   const updateNativeNotificationsEnabled = useCallback((enabled) => {
     setNativeNotificationSettings(writeNativeNotificationSettings({
@@ -29281,32 +29428,73 @@ export default function App() {
   }, [loadSettingsPermissionState, settingsTab, visibleView]);
 
   useEffect(() => {
-    if (visibleView !== "settings" || settingsTab !== SETTINGS_TAB_NOTIFICATIONS) {
-      return;
+    const active = (
+      (visibleView === "settings" && settingsTab === SETTINGS_TAB_NOTIFICATIONS)
+      || Boolean(loopspaceSettingsPanelId)
+    );
+    if (!active) {
+      return undefined;
     }
 
-    void loadNotificationPreferences({ silent: notificationPreferencesState === "ready" });
-  }, [loadNotificationPreferences, notificationPreferencesState, settingsTab, visibleView]);
-
-  useEffect(() => {
-    if (!loopspaceSettingsPanelId) {
-      return;
-    }
-
-    void loadNotificationPreferences({ silent: notificationPreferencesState === "ready" });
-  }, [loadNotificationPreferences, loopspaceSettingsPanelId, notificationPreferencesState]);
+    let cancelled = false;
+    let retryTimer = 0;
+    const runLoad = async (failedAttempt = 0) => {
+      const loaded = await loadNotificationPreferences({
+        silent: failedAttempt > 0 || notificationPreferencesRef.current.updated_at_ms > 0,
+      });
+      if (cancelled || loaded || notificationPreferencesInFlightEditRef.current) {
+        return;
+      }
+      const retryDelayMs = notificationPreferencesLoadRetryDelayMs(failedAttempt);
+      if (retryDelayMs === null) {
+        return;
+      }
+      retryTimer = window.setTimeout(() => {
+        retryTimer = 0;
+        void runLoad(failedAttempt + 1);
+      }, retryDelayMs);
+    };
+    void runLoad();
+    return () => {
+      cancelled = true;
+      if (retryTimer) {
+        window.clearTimeout(retryTimer);
+      }
+    };
+  }, [activeAccountScopeKey, loadNotificationPreferences, loopspaceSettingsPanelId, settingsTab, visibleView]);
 
   useEffect(() => {
     const unsubscribe = listenShared(NOTIFICATION_PREFERENCES_CHANGED_EVENT, (event) => {
-      const preferences = normalizeNotificationPreferences(event?.payload?.preferences || event?.payload);
-      setNotificationPreferences(preferences);
-      setNotificationPreferencesState("ready");
-      setNotificationPreferencesError("");
+      const preferences = acceptInboundNotificationPreferences(event?.payload?.preferences || event?.payload);
+      if (preferences && !notificationPreferencesInFlightEditRef.current) {
+        setNotificationPreferencesState("ready");
+        setNotificationPreferencesError("");
+      }
     });
     return () => {
       unsubscribe();
     };
-  }, []);
+  }, [acceptInboundNotificationPreferences]);
+
+  useEffect(() => {
+    if (
+      !loopspacesHydrated
+      || notificationPreferencesStateScopeKeyRef.current !== activeAccountScopeKey
+    ) {
+      return;
+    }
+    const current = normalizeNotificationPreferences(notificationPreferencesRef.current);
+    const pruned = pruneNotificationPreferenceLoopspaceOverrides(current, loopspaces);
+    const currentOverrideIds = Object.keys(current.loopspace_overrides);
+    const prunedOverrideIds = Object.keys(pruned.loopspace_overrides);
+    if (
+      currentOverrideIds.length === prunedOverrideIds.length
+      && currentOverrideIds.every((loopspaceId) => Object.hasOwn(pruned.loopspace_overrides, loopspaceId))
+    ) {
+      return;
+    }
+    void saveNotificationPreferences(pruned, "notification_preferences_prune_deleted_loopspaces");
+  }, [activeAccountScopeKey, loopspaces, loopspacesHydrated, notificationPreferences, saveNotificationPreferences]);
 
   useEffect(() => {
     const highlightId = Number(settingsPermissionHighlight?.id || 0);
@@ -41632,6 +41820,51 @@ export default function App() {
         window.setTimeout(resolve, Math.max(0, Number(delayMs) || 0));
       })
     );
+    const runRemotePaneControlOperation = ({
+      operationKind,
+      paneId,
+    }, operation) => enqueuePaneControlOperation(
+      remotePaneControlQueueRef.current,
+      paneId,
+      async () => {
+        const operationId = `${operationKind || "control"}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        let guardStarted = false;
+        try {
+          await invoke("terminal_control_automation_begin", {
+            operationId,
+            operationKind,
+            paneId,
+            timeoutMs: 20_000,
+          });
+          guardStarted = true;
+          return await operation();
+        } finally {
+          if (guardStarted) {
+            await invoke("terminal_control_automation_end", {
+              operationId,
+              paneId,
+            }).catch(() => {});
+          }
+        }
+      },
+    );
+    const serializeRemoteAgentChatControlChange = async (request, operation) => {
+      const { terminal } = findRemoteControlTerminal(request.workspaceId, request.target);
+      const paneId = remoteControlTerminalText(
+        terminal,
+        ["paneId", "pane_id", "terminalId", "terminal_id"],
+      );
+      if (!terminal || !paneId) {
+        throw new Error("Target terminal was not found on this desktop.");
+      }
+      const normalizedKind = normalizeRemoteCommandName(request.commandKind);
+      const operationKind = normalizedKind.includes("permission")
+        ? "permission"
+        : normalizedKind.includes("effort")
+          ? "effort"
+          : "model";
+      return runRemotePaneControlOperation({ operationKind, paneId }, () => operation(request));
+    };
     const remoteAgentChatConfigSubmitSequences = (provider) => {
       const primary = getTerminalSubmitSequence(provider, false);
       const sequences = [];
@@ -41952,16 +42185,16 @@ export default function App() {
       });
     };
     const scheduleRemoteAgentChatConfigDrain = (commandId) => {
-      const queued = remoteModelConfigQueueRef.current.get(commandId);
+      const queued = remoteControlConfigWaitQueueRef.current.get(commandId);
       if (!queued || queued.timer) {
         return;
       }
       const timer = window.setTimeout(async () => {
-        const request = remoteModelConfigQueueRef.current.get(commandId);
+        const request = remoteControlConfigWaitQueueRef.current.get(commandId);
         if (!request) {
           return;
         }
-        remoteModelConfigQueueRef.current.set(commandId, {
+        remoteControlConfigWaitQueueRef.current.set(commandId, {
           ...request,
           timer: null,
         });
@@ -41969,7 +42202,7 @@ export default function App() {
         const assessment = assessRemoteControlTerminalIdle(terminal);
         if (!terminal || !assessment.idle) {
           if (Date.now() - Number(request.queuedAtMs || 0) > 10 * 60 * 1000) {
-            remoteModelConfigQueueRef.current.delete(commandId);
+            remoteControlConfigWaitQueueRef.current.delete(commandId);
             await recordRemoteCommandStatus(request.event, "error", "Timed out waiting for the terminal to become idle for model configuration.", {
               assessment,
               commandId,
@@ -41981,9 +42214,9 @@ export default function App() {
           scheduleRemoteAgentChatConfigDrain(commandId);
           return;
         }
-        remoteModelConfigQueueRef.current.delete(commandId);
+        remoteControlConfigWaitQueueRef.current.delete(commandId);
         try {
-          await applyRemoteAgentChatConfigChange(request);
+          await serializeRemoteAgentChatControlChange(request, applyRemoteAgentChatConfigChange);
         } catch (error) {
           await recordRemoteCommandStatus(request.event, "error", getErrorMessage(error, "Unable to apply model configuration."), {
             commandId,
@@ -41992,7 +42225,7 @@ export default function App() {
           });
         }
       }, 2_000);
-      remoteModelConfigQueueRef.current.set(commandId, {
+      remoteControlConfigWaitQueueRef.current.set(commandId, {
         ...queued,
         timer,
       });
@@ -42026,7 +42259,7 @@ export default function App() {
           terminal,
           workspaceId,
         });
-        const duplicateQueued = Array.from(remoteModelConfigQueueRef.current.values()).find((request) => (
+        const duplicateQueued = Array.from(remoteControlConfigWaitQueueRef.current.values()).find((request) => (
           request
             && request.commandId !== commandId
             && request.dedupeKey
@@ -42053,7 +42286,7 @@ export default function App() {
           target,
           workspaceId,
         };
-        remoteModelConfigQueueRef.current.set(commandId, queued);
+        remoteControlConfigWaitQueueRef.current.set(commandId, queued);
         scheduleRemoteAgentChatConfigDrain(commandId);
         await recordRemoteCommandStatus(event, "queued", "Terminal is busy; model configuration will apply when it is ready.", {
           assessment,
@@ -42065,14 +42298,14 @@ export default function App() {
         return;
       }
       try {
-        await applyRemoteAgentChatConfigChange({
+        await serializeRemoteAgentChatControlChange({
           agentId,
           commandId,
           commandKind,
           event,
           target,
           workspaceId,
-        });
+        }, applyRemoteAgentChatConfigChange);
       } catch (error) {
         await recordRemoteCommandStatus(event, "error", getErrorMessage(error, "Unable to apply model configuration."), {
           commandId,
@@ -42152,16 +42385,16 @@ export default function App() {
       });
     };
     const scheduleRemoteAgentChatPermissionDrain = (commandId) => {
-      const queued = remotePermissionConfigQueueRef.current.get(commandId);
+      const queued = remoteControlConfigWaitQueueRef.current.get(commandId);
       if (!queued || queued.timer) {
         return;
       }
       const timer = window.setTimeout(async () => {
-        const request = remotePermissionConfigQueueRef.current.get(commandId);
+        const request = remoteControlConfigWaitQueueRef.current.get(commandId);
         if (!request) {
           return;
         }
-        remotePermissionConfigQueueRef.current.set(commandId, {
+        remoteControlConfigWaitQueueRef.current.set(commandId, {
           ...request,
           timer: null,
         });
@@ -42169,7 +42402,7 @@ export default function App() {
         const assessment = assessRemoteControlTerminalIdle(terminal);
         if (!terminal || !assessment.idle) {
           if (Date.now() - Number(request.queuedAtMs || 0) > 10 * 60 * 1000) {
-            remotePermissionConfigQueueRef.current.delete(commandId);
+            remoteControlConfigWaitQueueRef.current.delete(commandId);
             await recordRemoteCommandStatus(request.event, "failed", "Timed out waiting for the terminal to become idle for permission configuration.", {
               assessment,
               commandId,
@@ -42181,9 +42414,9 @@ export default function App() {
           scheduleRemoteAgentChatPermissionDrain(commandId);
           return;
         }
-        remotePermissionConfigQueueRef.current.delete(commandId);
+        remoteControlConfigWaitQueueRef.current.delete(commandId);
         try {
-          await applyRemoteAgentChatPermissionChange(request);
+          await serializeRemoteAgentChatControlChange(request, applyRemoteAgentChatPermissionChange);
         } catch (error) {
           await recordRemoteCommandStatus(request.event, "failed", getErrorMessage(error, "Unable to apply permission configuration."), {
             commandId,
@@ -42192,7 +42425,7 @@ export default function App() {
           });
         }
       }, 2_000);
-      remotePermissionConfigQueueRef.current.set(commandId, {
+      remoteControlConfigWaitQueueRef.current.set(commandId, {
         ...queued,
         timer,
       });
@@ -42225,7 +42458,7 @@ export default function App() {
           terminal,
           workspaceId,
         });
-        const duplicateQueued = Array.from(remotePermissionConfigQueueRef.current.values()).find((request) => (
+        const duplicateQueued = Array.from(remoteControlConfigWaitQueueRef.current.values()).find((request) => (
           request
             && request.commandId !== commandId
             && request.dedupeKey
@@ -42252,7 +42485,7 @@ export default function App() {
           target,
           workspaceId,
         };
-        remotePermissionConfigQueueRef.current.set(commandId, queued);
+        remoteControlConfigWaitQueueRef.current.set(commandId, queued);
         scheduleRemoteAgentChatPermissionDrain(commandId);
         await recordRemoteCommandStatus(event, "queued", "Terminal is busy; permission configuration will apply when it is ready.", {
           assessment,
@@ -42264,14 +42497,14 @@ export default function App() {
         return;
       }
       try {
-        await applyRemoteAgentChatPermissionChange({
+        await serializeRemoteAgentChatControlChange({
           agentId,
           commandId,
           commandKind,
           event,
           target,
           workspaceId,
-        });
+        }, applyRemoteAgentChatPermissionChange);
       } catch (error) {
         await recordRemoteCommandStatus(event, "failed", getErrorMessage(error, "Unable to apply permission configuration."), {
           commandId,
@@ -42481,6 +42714,13 @@ export default function App() {
       workspaceId,
     }) => {
       const normalizedKind = normalizeRemoteCommandName(commandKind);
+      const promptAnswerAction = [
+        "agent_prompt_answer",
+        "answer_agent_prompt",
+        "agent_input_answer",
+        "terminal_prompt_answer",
+        "prompt_answer",
+      ].includes(normalizedKind);
       const targetWorkspace = findWorkspaceById(workspacesRef.current, workspaceId);
       const workspaceIsDeviceOrchestrator = isDeviceTerminalOrchestratorWorkspaceId(workspaceId);
       const deviceOrchestratorConfigOrInterruptAction = workspaceIsDeviceOrchestrator && [
@@ -42504,7 +42744,7 @@ export default function App() {
         "terminal_stop",
         "stop_terminal",
         "terminal_cancel",
-      ].includes(normalizedKind);
+      ].includes(normalizedKind) || promptAnswerAction;
       const target = { targetTerminalId, targetTerminalIndex, targetTerminalName, targetThreadId };
       await recordRemoteCommandStatus(event, "validating", "Desktop is validating the remote control command.");
       if ([
@@ -42891,6 +43131,56 @@ export default function App() {
             commandId,
             commandKind,
             workspaceId: explicitWorkspaceId,
+          });
+        }
+        return;
+      }
+      if (promptAnswerAction) {
+        const { terminal } = findRemoteControlTerminal(workspaceId, target);
+        const paneId = remoteControlTerminalText(
+          terminal,
+          ["paneId", "pane_id", "terminalId", "terminal_id"],
+        ) || String(targetTerminalId || "").trim();
+        if (!paneId) {
+          await recordRemoteCommandStatus(event, "failed", "Prompt answer requires a target terminal id.", {
+            commandId,
+            commandKind,
+            workspaceId,
+          });
+          return;
+        }
+        if (paneControlOperationPending(remotePaneControlQueueRef.current, paneId)) {
+          await recordRemoteCommandStatus(event, "failed", "Terminal control automation owns this pane; prompt answer injection was rejected.", {
+            commandId,
+            commandKind,
+            paneId,
+            workspaceId,
+          });
+          return;
+        }
+        try {
+          const details = await enqueuePaneControlOperation(
+            remotePaneControlQueueRef.current,
+            paneId,
+            () => invoke("terminal_answer_agent_prompt_remote_command", { event }),
+          );
+          const failed = String(details?.status || "").trim().toLowerCase() === "failed"
+            || details?.answered === false;
+          await recordRemoteCommandStatus(
+            event,
+            failed ? "failed" : "completed",
+            failed
+              ? "Agent prompt answer was rejected or did not dismiss the prompt."
+              : "Agent prompt answer sent to the terminal.",
+            details || { paneId },
+          );
+        } catch (error) {
+          await recordRemoteCommandStatus(event, "failed", "Agent prompt answer could not be sent to the terminal.", {
+            commandId,
+            commandKind,
+            error: getErrorMessage(error, "Prompt answer failed."),
+            paneId,
+            workspaceId,
           });
         }
         return;
@@ -57247,8 +57537,8 @@ export default function App() {
                       >
                         <DevicesView
                           active={devicesViewActive}
-                          deviceRows={loopspaceGraphAccountDeviceRows}
-                          localDeviceId={localDesktopProfile?.deviceId || localDesktopProfile?.device_id || ""}
+                          deviceRows={accountDeviceRowsForDevicesView}
+                          localDeviceId={cloudDesktopDeviceProfile?.deviceId || cloudDesktopDeviceProfile?.device_id || ""}
                         />
                       </ForgeWorkspace>
                     </WorkspaceRuntimeLayer>

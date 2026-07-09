@@ -54,7 +54,6 @@ jobs:
           # x86_64-apple-darwin is unsupported: shiguredo_libvpx's build
           # script rejects os=macos, arch=x86_64 (Intel Macs not supported).
     runs-on: macos-14
-    continue-on-error: true
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -219,7 +218,10 @@ jobs:
 
   release:
     needs: [build-macos, build-windows, build-linux]
-    if: ${{ !cancelled() }}
+    # Windows/Linux remain best-effort, but macOS is mandatory: when
+    # APPLE_NOTARIZE is enabled, a signing/notarization failure must prevent
+    # both the GitHub release and updater manifest from being published.
+    if: ${{ !cancelled() && needs.build-macos.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -270,6 +272,17 @@ jobs:
           if [ "$found" = "0" ]; then
             echo "::error::No build artifacts produced by any platform job"
             exit 1
+          fi
+          if [ "${APPLE_NOTARIZE:-false}" = "true" ]; then
+            for required in \
+              "diffforge-ai-${VERSION}-macos-aarch64.dmg" \
+              "diffforge-ai-${VERSION}-macos-aarch64.app.tar.gz" \
+              "diffforge-ai-${VERSION}-macos-aarch64.app.tar.gz.sig"; do
+              if [ ! -f "out/$required" ]; then
+                echo "::error::APPLE_NOTARIZE=true but required macOS release artifact is missing: $required"
+                exit 1
+              fi
+            done
           fi
           (cd out && sha256sum * > SHA256SUMS)
           ls -la out

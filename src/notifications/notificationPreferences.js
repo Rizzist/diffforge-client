@@ -211,6 +211,51 @@ export function notificationPreferencesUpdatedNow(preferences, nowMs = Date.now(
   };
 }
 
+export function notificationPreferencesSnapshotCanReplaceLocalEdit(
+  preferences,
+  inFlightUpdatedAtMs = 0,
+) {
+  const localEditTimestamp = Math.max(0, Math.round(Number(inFlightUpdatedAtMs) || 0));
+  if (localEditTimestamp === 0) {
+    return true;
+  }
+  return normalizeNotificationPreferences(preferences).updated_at_ms > localEditTimestamp;
+}
+
+const NOTIFICATION_PREFERENCES_LOAD_RETRY_DELAYS_MS = Object.freeze([500, 1_500, 5_000]);
+
+export function notificationPreferencesLoadRetryDelayMs(failedAttempt = 0) {
+  const attempt = Math.max(0, Math.floor(Number(failedAttempt) || 0));
+  return NOTIFICATION_PREFERENCES_LOAD_RETRY_DELAYS_MS[attempt] ?? null;
+}
+
+function loopspaceIdFromPreferenceInventoryEntry(entry) {
+  if (typeof entry === "string" || typeof entry === "number") {
+    return String(entry).trim();
+  }
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    return "";
+  }
+  return String(entry.id || entry.loopspaceId || entry.loopspace_id || "").trim();
+}
+
+export function pruneNotificationPreferenceLoopspaceOverrides(preferences, loopspaces = []) {
+  const normalized = normalizeNotificationPreferences(preferences);
+  const liveLoopspaceIds = new Set(
+    (Array.isArray(loopspaces) ? loopspaces : [])
+      .map(loopspaceIdFromPreferenceInventoryEntry)
+      .filter(Boolean),
+  );
+  const loopspaceOverrides = Object.fromEntries(
+    Object.entries(normalized.loopspace_overrides)
+      .filter(([loopspaceId]) => liveLoopspaceIds.has(loopspaceId)),
+  );
+  return {
+    ...normalized,
+    loopspace_overrides: loopspaceOverrides,
+  };
+}
+
 export function setNotificationPreferencePushValue(preferences, key, enabled, nowMs = Date.now()) {
   const normalized = normalizeNotificationPreferences(preferences);
   if (!Object.prototype.hasOwnProperty.call(NOTIFICATION_PREFERENCE_DEFAULT_PUSH, key)) {

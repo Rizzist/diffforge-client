@@ -33,6 +33,12 @@ import {
   providerLimitKey,
   providerLimitSampleKey,
 } from "./tokenomicsProviderLimitMerge.js";
+import {
+  prioritizedTokenomicsIdentityKeyClaims,
+  registerTokenomicsIdentityAlias,
+  tokenomicsAccountsFromDistinctKeys,
+  uniqueTokenomicsAliasesByOwner,
+} from "./tokenomicsAccountIdentity.js";
 
 const TOKENOMICS_SCAN_PROGRESS_EVENT = "diffforge://tokenomics-scan-progress";
 const TOKENOMICS_UPDATED_EVENT = "diffforge://tokenomics-updated";
@@ -880,7 +886,7 @@ function normalizeTokenomicsAliasLabel(value, providerId = "") {
 }
 
 function tokenomicsProfileLabelCandidates(profile = {}, providerId = "") {
-  const email = normalizeTokenomicsEmail(profile?.identity?.email || profile?.email);
+  const email = normalizeTokenomicsEmail(profile?.email || profile?.identity?.email);
   const local = tokenomicsEmailLocalPart(email);
   const raw = [
     profile?.alias,
@@ -929,15 +935,6 @@ function preferredTokenomicsAccountLabel(nextLabel, currentLabel, providerId = "
   const currentScore = tokenomicsAccountLabelScore(current, providerId);
   if (nextScore !== currentScore) return nextScore > currentScore ? next : current;
   return next.length < current.length ? next : current;
-}
-
-function preferProviderAccountOption(next, current) {
-  if (!current) return true;
-  if ((next.total || 0) !== (current.total || 0)) return (next.total || 0) > (current.total || 0);
-  const nextProfile = String(next.key || "").includes(":profile:");
-  const currentProfile = String(current.key || "").includes(":profile:");
-  if (nextProfile !== currentProfile) return !nextProfile;
-  return String(next.key || "").localeCompare(String(current.key || "")) < 0;
 }
 
 function normalizeProviderAccountKeys(value, fallbackKey = "all") {
@@ -1238,7 +1235,8 @@ function tokenomicsAddGroupLabel(index, group, label) {
   const normalized = normalizeProviderAccountLabel(label);
   const stripped = normalizeTokenomicsAliasLabel(label, group.providerId);
   [normalized, stripped].filter(Boolean).forEach((candidate) => {
-    index.byLabel.set(tokenomicsIndexKey(group.providerId, candidate), group);
+    const key = tokenomicsIndexKey(group.providerId, candidate);
+    registerTokenomicsIdentityAlias(index.byLabel, index.ambiguousLabels, key, group);
   });
 }
 
@@ -1270,6 +1268,7 @@ function buildTokenomicsAccountIdentityIndex(agentAccounts) {
     groups,
     byKey: new Map(),
     byLabel: new Map(),
+    ambiguousLabels: new Set(),
     byProfileId: new Map(),
     activeByProvider: new Map(),
     providerGroupCount: new Map(),
@@ -1277,6 +1276,12 @@ function buildTokenomicsAccountIdentityIndex(agentAccounts) {
   for (const providerId of PROVIDER_ACCOUNT_FILTER_PROVIDERS) {
     const entry = agentAccounts?.[providerId];
     const profiles = Array.isArray(entry?.profiles) ? entry.profiles : [];
+    const uniqueProfileLabels = uniqueTokenomicsAliasesByOwner(
+      profiles.map((profile) => ({
+        owner: normalizeTokenomicsEmail(profile?.email || profile?.identity?.email),
+        aliases: tokenomicsProfileLabelCandidates(profile, providerId),
+      })),
+    );
     // Provider-side display names are not unique across accounts — only use
     // one as a row-matching alias when a single profile claims it.
     const displayNameCounts = new Map();
@@ -1285,7 +1290,7 @@ function buildTokenomicsAccountIdentityIndex(agentAccounts) {
       if (name) displayNameCounts.set(name, (displayNameCounts.get(name) || 0) + 1);
     }
     for (const profile of profiles) {
-      const email = normalizeTokenomicsEmail(profile?.identity?.email || profile?.email);
+      const email = normalizeTokenomicsEmail(profile?.email || profile?.identity?.email);
       if (!email) continue;
       const group = tokenomicsEnsureAccountGroup(groups, providerId, email);
       const label = profile?.alias || (!profile?.isDefault ? profile?.label : "") || tokenomicsEmailLocalPart(email) || email;
@@ -1302,21 +1307,17 @@ function buildTokenomicsAccountIdentityIndex(agentAccounts) {
         index.byProfileId.set(tokenomicsIndexKey(providerId, profileId), group);
       }
       tokenomicsAddGroupKey(index, group, tokenomicsProviderProfileAccountKey(providerId, profile?.id));
-      // The oauth-derived key from the profile's own login state folds in
-      // rows recorded while this account was the Default login (historical
-      // "display name" chips) and everything the identity-first scanner
-      // records going forward. First registry owner wins: if a second group
-      // claims the same key (stale email after an account rename), leave the
-      // key with the first rather than flip-flopping rows between groups.
-      const oauthKey = String(profile?.identity?.tokenomicsAccountKey || "").trim();
-      if (oauthKey) {
-        const owner = index.byKey.get(tokenomicsIndexKey(providerId, oauthKey));
-        if (!owner || owner === group) {
-          tokenomicsAddGroupKey(index, group, oauthKey);
-        }
-      }
       tokenomicsProfileLabelCandidates(profile, providerId).forEach((candidate) => {
-        tokenomicsAddGroupLabel(index, group, candidate);
+        if (uniqueProfileLabels.has(candidate)) {
+          tokenomicsAddGroupLabel(index, group, candidate);
+        } else {
+          [
+            normalizeProviderAccountLabel(candidate),
+            normalizeTokenomicsAliasLabel(candidate, providerId),
+          ].filter(Boolean).forEach((ambiguous) => {
+            index.ambiguousLabels.add(tokenomicsIndexKey(providerId, ambiguous));
+          });
+        }
       });
       const displayName = normalizeProviderAccountLabel(profile?.identity?.displayName);
       if (displayName && displayNameCounts.get(displayName) === 1) {
@@ -1326,6 +1327,17 @@ function buildTokenomicsAccountIdentityIndex(agentAccounts) {
         index.activeByProvider.set(providerId, group);
       }
     }
+    // OAuth keys belong to the identity email observed beside the key, not
+    // blindly to the registry email. Process matching-email claims first so a
+    // stale pushed/legacy profile can never win ownership through registry
+    // order; mismatches still get a correctly labeled identity-email group.
+    prioritizedTokenomicsIdentityKeyClaims(profiles).forEach((claim) => {
+      const group = tokenomicsEnsureAccountGroup(groups, providerId, claim.ownerEmail);
+      const owner = index.byKey.get(tokenomicsIndexKey(providerId, claim.key));
+      if (!owner || owner === group) {
+        tokenomicsAddGroupKey(index, group, claim.key);
+      }
+    });
   }
   for (const group of groups.values()) {
     index.providerGroupCount.set(group.providerId, (index.providerGroupCount.get(group.providerId) || 0) + 1);
@@ -2600,15 +2612,10 @@ function providerAccountOptions(summary, selectedProvider, selectedDeviceId = "a
     }
     byKey.set(key, current);
   }
-  const byLabel = new Map();
-  for (const account of byKey.values()) {
-    const labelKey = normalizeProviderAccountLabel(account.label);
-    const current = byLabel.get(labelKey);
-    if (preferProviderAccountOption(account, current)) {
-      byLabel.set(labelKey, account);
-    }
-  }
-  const accounts = [...byLabel.values()].sort((a, b) => b.total - a.total || a.label.localeCompare(b.label));
+  // Identity canonicalization has already folded legitimate aliases onto the
+  // same key. Never collapse different keys solely because their display
+  // labels match: unrelated accounts commonly share names like "support".
+  const accounts = tokenomicsAccountsFromDistinctKeys(byKey);
   if (!accounts.length) return [];
   return [{ key: "all", label: "All" }, ...accounts];
 }

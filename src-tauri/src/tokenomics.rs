@@ -3656,10 +3656,15 @@ fn tokenomics_sources() -> Vec<TokenomicsSource> {
     // Additional Claude account profiles: each isolated CLAUDE_CONFIG_DIR
     // keeps its own transcript tree, so without these roots every non-default
     // account's usage would be invisible to tokenomics.
-    for (profile_id, profile_label, profile_dir) in agent_accounts_profiles_for_tokenomics("claude")
+    for (profile_id, profile_label, stored_email, profile_dir) in
+        agent_accounts_profiles_for_tokenomics("claude")
     {
-        let account =
-            tokenomics_claude_profile_provider_account(&profile_id, &profile_label, &profile_dir);
+        let account = tokenomics_claude_profile_provider_account(
+            &profile_id,
+            &profile_label,
+            stored_email.as_deref(),
+            &profile_dir,
+        );
         sources.push(TokenomicsSource {
             provider: "anthropic",
             agent_kind: "claude",
@@ -4432,9 +4437,21 @@ fn tokenomics_claude_profile_auth_value(profile_dir: &Path) -> Option<Value> {
 pub(crate) fn tokenomics_claude_profile_provider_account(
     profile_id: &str,
     profile_label: &str,
+    stored_email: Option<&str>,
     profile_dir: &Path,
 ) -> TokenomicsProviderAccount {
     let auth_value = tokenomics_claude_profile_auth_value(profile_dir);
+    let stored_email = stored_email
+        .map(agent_accounts_email_key)
+        .filter(|email| !email.is_empty());
+    let identity_email = auth_value
+        .as_ref()
+        .and_then(tokenomics_claude_oauth_account)
+        .and_then(|account| tokenomics_text_field(account, &["emailAddress", "email"]))
+        .map(|email| agent_accounts_email_key(&email));
+    let identity_matches_registry = stored_email
+        .as_ref()
+        .is_none_or(|stored| identity_email.as_ref() == Some(stored));
     // Require real oauth identifiers before trusting the identity path: a
     // credential-only dir (tokens without an oauthAccount) would fall through
     // to token-hash keys that churn on every refresh and that the retirement
@@ -4442,7 +4459,7 @@ pub(crate) fn tokenomics_claude_profile_provider_account(
     let identity_ready = auth_value
         .as_ref()
         .is_some_and(|auth| !tokenomics_claude_account_key_identifiers(auth).is_empty());
-    if !identity_ready {
+    if !identity_ready || !identity_matches_registry {
         return TokenomicsProviderAccount {
             key: format!("anthropic:claude:profile:{profile_id}"),
             label: format!("Claude · {profile_label}"),
@@ -6644,67 +6661,11 @@ fn tokenomics_compact_provider_account_fact_rows(
 fn tokenomics_reconcile_duplicate_provider_account_identities(
     conn: &rusqlite::Connection,
 ) -> Result<(), String> {
-    let candidates = tokenomics_provider_account_identity_candidates(conn)?;
-    let mut groups =
-        HashMap::<(String, String, String), Vec<TokenomicsProviderAccountIdentityCandidate>>::new();
-    for candidate in candidates {
-        groups
-            .entry((
-                candidate.provider.clone(),
-                candidate.agent_kind.clone(),
-                candidate.normalized_label.clone(),
-            ))
-            .or_default()
-            .push(candidate);
-    }
-
-    let mut changed = false;
-    for ((provider, agent_kind, _label), mut accounts) in groups {
-        accounts.sort_by(|left, right| {
-            right
-                .usage_total
-                .cmp(&left.usage_total)
-                .then_with(|| right.rollup_total.cmp(&left.rollup_total))
-                .then_with(|| right.cloud_total.cmp(&left.cloud_total))
-                .then_with(|| right.authoritative_rows().cmp(&left.authoritative_rows()))
-                .then_with(|| right.account_rows.cmp(&left.account_rows))
-                .then_with(|| right.updated_at_unix.cmp(&left.updated_at_unix))
-                .then_with(|| left.provider_account_key.cmp(&right.provider_account_key))
-        });
-        accounts.dedup_by(|left, right| left.provider_account_key == right.provider_account_key);
-        if accounts.len() < 2
-            || !accounts
-                .iter()
-                .any(|account| account.has_authoritative_data())
-        {
-            continue;
-        }
-        let canonical = accounts[0].clone();
-        if !canonical.has_authoritative_data() {
-            continue;
-        }
-        let canonical_account = TokenomicsProviderAccount {
-            key: canonical.provider_account_key.clone(),
-            label: canonical.provider_account_label.clone(),
-        };
-        for alias in accounts.iter().skip(1) {
-            if alias.provider_account_key == canonical_account.key {
-                continue;
-            }
-            tokenomics_migrate_provider_account_key(
-                conn,
-                &provider,
-                &agent_kind,
-                &alias.provider_account_key,
-                &canonical_account,
-            )?;
-            changed = true;
-        }
-    }
-
-    if changed {
-        tokenomics_compact_provider_account_fact_rows(conn)?;
-    }
+    // Display labels are not identities. Two unrelated accounts can both be
+    // named "support" (or share a person's display name), so label-only
+    // reconciliation must never rewrite provider_account_key on historical
+    // facts. Identity-specific legacy migrations happen in their dedicated
+    // provider paths; presentation aliases are folded only in the frontend.
     tokenomics_compact_provider_account_rows(conn)?;
     Ok(())
 }
@@ -16037,7 +15998,8 @@ fn tokenomics_provider_limits(
     // auth.json, so the usage endpoint reports per-account windows (including
     // consumption from other devices on that account). Profiles that haven't
     // completed login are skipped instead of rendering unknown rows.
-    for (profile_id, profile_label, profile_dir) in agent_accounts_profiles_for_tokenomics("codex")
+    for (profile_id, profile_label, _stored_email, profile_dir) in
+        agent_accounts_profiles_for_tokenomics("codex")
     {
         let auth_path = profile_dir.join("auth.json");
         let profile_auth = tokenomics_read_json_file(auth_path.clone());
@@ -16184,7 +16146,8 @@ fn tokenomics_provider_limits(
     // profile keeps file-based credentials (macOS Keychain installs don't —
     // those profiles still get per-account token stats from their transcript
     // scan roots, just not the live limit gauges).
-    for (profile_id, profile_label, profile_dir) in agent_accounts_profiles_for_tokenomics("claude")
+    for (profile_id, profile_label, stored_email, profile_dir) in
+        agent_accounts_profiles_for_tokenomics("claude")
     {
         let credentials = tokenomics_read_json_file(profile_dir.join(".credentials.json"));
         let Some(access_token) = credentials.as_ref().and_then(|credentials| {
@@ -16195,8 +16158,12 @@ fn tokenomics_provider_limits(
             continue;
         };
         let profile_plan = tokenomics_claude_plan_state_from_credentials(credentials.as_ref());
-        let profile_account =
-            tokenomics_claude_profile_provider_account(&profile_id, &profile_label, &profile_dir);
+        let profile_account = tokenomics_claude_profile_provider_account(
+            &profile_id,
+            &profile_label,
+            stored_email.as_deref(),
+            &profile_dir,
+        );
         let profile_refresh_keys =
             tokenomics_provider_account_refresh_keys(conn, "anthropic", "claude", &profile_account);
         let profile_should_fetch_live = refresh_scope.should_fetch_live_for_account_keys(
@@ -20849,7 +20816,7 @@ mod tokenomics_tests {
     }
 
     #[test]
-    fn tokenomics_reconcile_duplicate_provider_account_identities_migrates_badge_windows() {
+    fn tokenomics_reconcile_duplicate_provider_account_identities_preserves_badge_windows() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let canonical_key = "openai:codex:canonical-agency";
@@ -20926,18 +20893,18 @@ mod tokenomics_tests {
             )
             .unwrap();
 
-        assert_eq!(old_badges, 0);
-        assert_eq!(old_windows, 0);
+        assert_eq!(old_badges, 1);
+        assert_eq!(old_windows, 1);
         assert_eq!(distinct_badge_keys, 1);
-        assert_eq!(migrated_windows, 1);
+        assert_eq!(migrated_windows, 0);
     }
 
     #[test]
-    fn tokenomics_reconcile_duplicate_provider_account_identities_merges_usage_keys() {
+    fn tokenomics_reconcile_duplicate_provider_account_identities_preserves_claude_usage_keys() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
-        let canonical_key = "openai:codex:canonical-rizzist";
-        let old_key = "openai:codex:old-rizzist";
+        let canonical_key = "anthropic:claude:support-splutter";
+        let old_key = "anthropic:claude:support-diffforge";
         for (id, key, input_tokens, output_tokens) in [
             ("rizzist-event-canonical", canonical_key, 90, 10),
             ("rizzist-event-old", old_key, 9, 1),
@@ -20949,8 +20916,8 @@ mod tokenomics_tests {
                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
                    total_tokens, estimated_cost_microusd, created_at, observed_at
                  ) VALUES(
-                   ?1, 'openai', 'codex', 'gpt-5.4', ?2, ?2,
-                   'Rizzist', 'codex_token_count_jsonl', '/tmp/session.jsonl',
+                   ?1, 'anthropic', 'claude', 'sonnet', ?2, ?2,
+                   'support', 'claude_transcript_jsonl', '/tmp/session.jsonl',
                    '2026-06-16', '2026-06-16T11:00:00Z', ?3, ?4, 0, 0,
                    ?5, 0, '2026-06-16T11:00:00Z', '2026-06-16T11:00:00Z'
                  )",
@@ -20966,10 +20933,10 @@ mod tokenomics_tests {
             tokenomics_upsert_provider_account(
                 &conn,
                 "device-a",
-                "openai",
-                "codex",
+                "anthropic",
+                "claude",
                 key,
-                Some("Rizzist"),
+                Some("support"),
                 &TokenomicsBillingScope {
                     scope_type: "personal".to_string(),
                     team_id: None,
@@ -20993,7 +20960,7 @@ mod tokenomics_tests {
             .query_row(
                 "SELECT COUNT(DISTINCT provider_account_key)
                  FROM tokenomics_usage_events
-                 WHERE provider='openai' AND agent_kind='codex' AND provider_account_label='Rizzist'",
+                 WHERE provider='anthropic' AND agent_kind='claude' AND provider_account_label='support'",
                 [],
                 |row| row.get(0),
             )
@@ -21002,7 +20969,7 @@ mod tokenomics_tests {
             .query_row(
                 "SELECT COALESCE(SUM(total_tokens), 0)
                  FROM tokenomics_rollups
-                 WHERE provider='openai' AND agent_kind='codex'
+                 WHERE provider='anthropic' AND agent_kind='claude'
                    AND provider_account_key=?1 AND bucket_width='hour'",
                 rusqlite::params![canonical_key],
                 |row| row.get(0),
@@ -21016,10 +20983,10 @@ mod tokenomics_tests {
             )
             .unwrap();
 
-        assert_eq!(old_events, 0);
-        assert_eq!(distinct_event_keys, 1);
-        assert_eq!(rollup_total, 110);
-        assert_eq!(old_badges, 0);
+        assert_eq!(old_events, 1);
+        assert_eq!(distinct_event_keys, 2);
+        assert_eq!(rollup_total, 0);
+        assert_eq!(old_badges, 1);
     }
 
     #[test]
@@ -21092,6 +21059,7 @@ mod tokenomics_tests {
         let account = tokenomics_claude_profile_provider_account(
             "cap-profile-1234",
             "profileuser",
+            Some("profile@example.test"),
             &profile_dir,
         );
         // Same key as the default-home path for the same login: one account,
@@ -21119,6 +21087,43 @@ mod tokenomics_tests {
     }
 
     #[test]
+    fn claude_profile_provider_account_rejects_registry_email_mismatch() {
+        let profile_dir = std::env::temp_dir().join(format!(
+            "diffforge-tokenomics-claude-profile-mismatch-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join(".claude.json"),
+            serde_json::to_vec(&json!({
+                "oauthAccount": {
+                    "accountUuid": "admin-account-uuid",
+                    "displayName": "Admin",
+                    "emailAddress": "ADMIN@example.test"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let account = tokenomics_claude_profile_provider_account(
+            "cap-support-1234",
+            "support",
+            Some("support@example.test"),
+            &profile_dir,
+        );
+
+        assert_eq!(
+            account.key,
+            "anthropic:claude:profile:cap-support-1234"
+        );
+        assert_eq!(account.label, "Claude · support");
+
+        let _ = fs::remove_dir_all(&profile_dir);
+    }
+
+    #[test]
     fn claude_profile_provider_account_falls_back_to_profile_key_without_identity() {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -21133,6 +21138,7 @@ mod tokenomics_tests {
         let account = tokenomics_claude_profile_provider_account(
             "cap-empty-1234",
             "pending",
+            None,
             &profile_dir,
         );
         assert_eq!(account.key, "anthropic:claude:profile:cap-empty-1234");
@@ -21154,6 +21160,7 @@ mod tokenomics_tests {
         let credential_only = tokenomics_claude_profile_provider_account(
             "cap-empty-1234",
             "pending",
+            None,
             &profile_dir,
         );
         assert_eq!(credential_only.key, "anthropic:claude:profile:cap-empty-1234");

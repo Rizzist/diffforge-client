@@ -14,6 +14,9 @@ const TERMINAL_HOT_STALE_WATCHDOG_MS: u64 = 10 * 60_000;
 const TERMINAL_STARTUP_READY_SCAN_BYTES: usize = 16 * 1024;
 const TERMINAL_SCREEN_PROMPT_STABILITY_MS: u64 = 400;
 const TERMINAL_SCREEN_PROMPT_ANSWER_VERIFY_MS: u64 = 2_000;
+const TERMINAL_CONTROL_AUTOMATION_GUARD_TTL_MS: u64 = 60_000;
+const TERMINAL_CONTROL_PROMPT_ANSWER_GUARD_TTL_MS: u64 = 10_000;
+const TERMINAL_CONTROL_AUTOMATION_WAIT_POLL_MS: u64 = 25;
 // Agent-start commands must never hang the frontend launch pipeline: a
 // wedged lifecycle holder (slow terminal_open, close teardown) or a stuck
 // pane future previously left the invoke pending forever, so panes sat at
@@ -163,6 +166,21 @@ struct TerminalScreenPromptActive {
     missing_scans: u8,
 }
 
+enum TerminalScreenPromptEmission {
+    Resolved(TerminalScreenPromptActive, &'static str),
+    Started(TerminalScreenPromptActive),
+}
+
+fn terminal_screen_prompt_supersession_emissions(
+    superseded: TerminalScreenPromptActive,
+    replacement: TerminalScreenPromptActive,
+) -> Vec<TerminalScreenPromptEmission> {
+    vec![
+        TerminalScreenPromptEmission::Resolved(superseded, "superseded"),
+        TerminalScreenPromptEmission::Started(replacement),
+    ]
+}
+
 #[derive(Clone)]
 struct TerminalScreenPromptScanState {
     detector_id: String,
@@ -176,6 +194,174 @@ static TERMINAL_SCREEN_PROMPTS: OnceLock<StdMutex<HashMap<String, TerminalScreen
 static TERMINAL_SCREEN_PROMPT_SCANS: OnceLock<
     StdMutex<HashMap<String, TerminalScreenPromptScanState>>,
 > = OnceLock::new();
+
+#[derive(Clone, Debug)]
+struct TerminalControlOperation {
+    operation_id: String,
+    operation_kind: String,
+    automation_owned: bool,
+    expires_at_ms: u64,
+}
+
+static TERMINAL_CONTROL_OPERATIONS: OnceLock<
+    StdMutex<HashMap<String, TerminalControlOperation>>,
+> = OnceLock::new();
+
+fn terminal_control_operation_registry(
+) -> &'static StdMutex<HashMap<String, TerminalControlOperation>> {
+    TERMINAL_CONTROL_OPERATIONS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn terminal_control_operation_prune_expired(
+    operations: &mut HashMap<String, TerminalControlOperation>,
+    now_ms: u64,
+) {
+    operations.retain(|_, operation| operation.expires_at_ms > now_ms);
+}
+
+fn terminal_control_automation_owned(pane_id: &str) -> bool {
+    let now_ms = terminal_now_ms();
+    let Ok(mut operations) = terminal_control_operation_registry().lock() else {
+        return true;
+    };
+    terminal_control_operation_prune_expired(&mut operations, now_ms);
+    operations
+        .get(pane_id)
+        .is_some_and(|operation| operation.automation_owned)
+}
+
+fn terminal_control_operation_end_if_owner(pane_id: &str, operation_id: &str) -> bool {
+    let Ok(mut operations) = terminal_control_operation_registry().lock() else {
+        return false;
+    };
+    if operations
+        .get(pane_id)
+        .is_some_and(|operation| operation.operation_id == operation_id)
+    {
+        operations.remove(pane_id);
+        true
+    } else {
+        false
+    }
+}
+
+#[derive(Debug)]
+struct TerminalControlPromptAnswerGuard {
+    pane_id: String,
+    operation_id: String,
+}
+
+impl Drop for TerminalControlPromptAnswerGuard {
+    fn drop(&mut self) {
+        terminal_control_operation_end_if_owner(&self.pane_id, &self.operation_id);
+    }
+}
+
+fn terminal_control_prompt_answer_begin(
+    pane_id: &str,
+) -> Result<TerminalControlPromptAnswerGuard, String> {
+    let now_ms = terminal_now_ms();
+    let operation_id = format!("prompt-answer-{}", uuid::Uuid::new_v4());
+    let mut operations = terminal_control_operation_registry()
+        .lock()
+        .map_err(|_| "Terminal control operation state is unavailable.".to_string())?;
+    terminal_control_operation_prune_expired(&mut operations, now_ms);
+    if let Some(active) = operations.get(pane_id) {
+        return Err(if active.automation_owned {
+            format!(
+                "Terminal control automation ({}) owns this pane; prompt answer injection was rejected.",
+                active.operation_kind
+            )
+        } else {
+            "Another prompt answer is already being applied to this pane.".to_string()
+        });
+    }
+    operations.insert(
+        pane_id.to_string(),
+        TerminalControlOperation {
+            operation_id: operation_id.clone(),
+            operation_kind: "prompt_answer".to_string(),
+            automation_owned: false,
+            expires_at_ms: now_ms.saturating_add(TERMINAL_CONTROL_PROMPT_ANSWER_GUARD_TTL_MS),
+        },
+    );
+    Ok(TerminalControlPromptAnswerGuard {
+        pane_id: pane_id.to_string(),
+        operation_id,
+    })
+}
+
+#[tauri::command]
+async fn terminal_control_automation_begin(
+    pane_id: String,
+    operation_id: String,
+    operation_kind: String,
+    timeout_ms: Option<u64>,
+) -> Result<(), String> {
+    validate_terminal_pane_id(&pane_id)?;
+    let operation_id = operation_id.trim();
+    if operation_id.is_empty() || operation_id.len() > 200 {
+        return Err("Terminal control automation requires a valid operation id.".to_string());
+    }
+    let operation_kind = terminal_projection_text(&operation_kind, "");
+    if !matches!(operation_kind.as_str(), "model" | "effort" | "permission") {
+        return Err("Unsupported terminal control automation kind.".to_string());
+    }
+    let wait_ms = timeout_ms.unwrap_or(20_000).clamp(100, 20_000);
+    let started_at_ms = terminal_now_ms();
+    loop {
+        let now_ms = terminal_now_ms();
+        let acquired = {
+            let mut operations = terminal_control_operation_registry()
+                .lock()
+                .map_err(|_| "Terminal control operation state is unavailable.".to_string())?;
+            terminal_control_operation_prune_expired(&mut operations, now_ms);
+            match operations.get_mut(&pane_id) {
+                Some(active) if active.operation_id == operation_id => {
+                    active.expires_at_ms = now_ms
+                        .saturating_add(TERMINAL_CONTROL_AUTOMATION_GUARD_TTL_MS);
+                    true
+                }
+                Some(_) => false,
+                None => {
+                    operations.insert(
+                        pane_id.clone(),
+                        TerminalControlOperation {
+                            operation_id: operation_id.to_string(),
+                            operation_kind: operation_kind.clone(),
+                            automation_owned: true,
+                            expires_at_ms: now_ms
+                                .saturating_add(TERMINAL_CONTROL_AUTOMATION_GUARD_TTL_MS),
+                        },
+                    );
+                    true
+                }
+            }
+        };
+        if acquired {
+            return Ok(());
+        }
+        if now_ms.saturating_sub(started_at_ms) >= wait_ms {
+            return Err("Timed out waiting for this pane's control operation queue.".to_string());
+        }
+        sleep(Duration::from_millis(
+            TERMINAL_CONTROL_AUTOMATION_WAIT_POLL_MS,
+        ))
+        .await;
+    }
+}
+
+#[tauri::command]
+fn terminal_control_automation_end(
+    pane_id: String,
+    operation_id: String,
+) -> Result<bool, String> {
+    validate_terminal_pane_id(&pane_id)?;
+    Ok(terminal_control_operation_end_if_owner(
+        &pane_id,
+        operation_id.trim(),
+    ))
+}
 
 const CODEX_HOOKS_REVIEW_OPTIONS: &[TerminalScreenPromptStaticOption] = &[
     TerminalScreenPromptStaticOption {
@@ -1386,6 +1572,9 @@ async fn terminal_screen_prompt_emit_started(
     active: &TerminalScreenPromptActive,
     source: &str,
 ) {
+    if terminal_control_automation_owned(&active.pane_id) {
+        return;
+    }
     let mut event = json!({
         "hookEventName": "UserInputRequired",
         "provider": instance.metadata.agent_kind.clone(),
@@ -1573,6 +1762,9 @@ async fn terminal_screen_prompt_reemit_if_visible(
     instance_id: u64,
     reason: &'static str,
 ) -> bool {
+    if terminal_control_automation_owned(pane_id) {
+        return false;
+    }
     let key = terminal_screen_prompt_active_key(pane_id, instance_id);
     let Some(active) = terminal_screen_prompt_registry()
         .lock()
@@ -1607,6 +1799,10 @@ async fn terminal_screen_prompt_observe_candidate(
     key: &str,
     candidate: TerminalScreenPromptCandidate,
 ) {
+    if terminal_control_automation_owned(pane_id) {
+        terminal_screen_prompt_clear_scan(key);
+        return;
+    }
     let Some(instance) =
         terminal_activity_hook_current_instance(terminals, pane_id, instance_id).await
     else {
@@ -1622,7 +1818,7 @@ async fn terminal_screen_prompt_observe_candidate(
         &candidate.fingerprint_text,
     );
     let now_ms = terminal_now_ms();
-    let active_to_emit = {
+    let emissions = {
         let Ok(mut active) = terminal_screen_prompt_registry().lock() else {
             return;
         };
@@ -1635,11 +1831,12 @@ async fn terminal_screen_prompt_observe_candidate(
                     existing.last_emitted_ms = now_ms;
                 }
                 if should_reemit {
-                    Some(existing.clone())
+                    vec![TerminalScreenPromptEmission::Started(existing.clone())]
                 } else {
-                    None
+                    Vec::new()
                 }
             } else {
+                let superseded = existing.clone();
                 let replacement = terminal_screen_prompt_active_from_candidate(
                     pane_id,
                     instance_id,
@@ -1648,7 +1845,7 @@ async fn terminal_screen_prompt_observe_candidate(
                     now_ms,
                 );
                 active.insert(key.to_string(), replacement.clone());
-                Some(replacement)
+                terminal_screen_prompt_supersession_emissions(superseded, replacement)
             }
         } else {
             let active_prompt = terminal_screen_prompt_active_from_candidate(
@@ -1659,19 +1856,36 @@ async fn terminal_screen_prompt_observe_candidate(
                 now_ms,
             );
             active.insert(key.to_string(), active_prompt.clone());
-            Some(active_prompt)
+            vec![TerminalScreenPromptEmission::Started(active_prompt)]
         }
     };
-    if let Some(active) = active_to_emit {
-        terminal_screen_prompt_emit_started(
-            app,
-            terminals,
-            cloud_mcp_state,
-            &instance,
-            &active,
-            "screen_detector",
-        )
-        .await;
+    for emission in emissions {
+        match emission {
+            TerminalScreenPromptEmission::Resolved(active, reason) => {
+                terminal_screen_prompt_emit_resolved(
+                    app,
+                    terminals,
+                    cloud_mcp_state,
+                    pane_id,
+                    instance_id,
+                    &active,
+                    None,
+                    reason,
+                )
+                .await;
+            }
+            TerminalScreenPromptEmission::Started(active) => {
+                terminal_screen_prompt_emit_started(
+                    app,
+                    terminals,
+                    cloud_mcp_state,
+                    &instance,
+                    &active,
+                    "screen_detector",
+                )
+                .await;
+            }
+        }
     }
 }
 
@@ -1685,6 +1899,10 @@ async fn observe_terminal_screen_prompt(
 ) {
     let key = terminal_screen_prompt_active_key(&pane_id, instance_id);
     for _ in 0..4 {
+        if terminal_control_automation_owned(&pane_id) {
+            terminal_screen_prompt_clear_scan(&key);
+            return;
+        }
         let Some(instance) =
             terminal_activity_hook_current_instance(&terminals, &pane_id, instance_id).await
         else {
@@ -19261,7 +19479,8 @@ fn terminal_remote_command_u64(event: &Value, keys: &[&str]) -> Option<u64> {
         .or_else(|| event.get("request").and_then(|request| value_from(request)))
 }
 
-pub(crate) async fn terminal_answer_agent_prompt_remote_command(
+#[tauri::command]
+async fn terminal_answer_agent_prompt_remote_command(
     app: AppHandle,
     event: Value,
 ) -> Result<Value, String> {
@@ -19277,6 +19496,8 @@ pub(crate) async fn terminal_answer_agent_prompt_remote_command(
         ],
     )
     .ok_or_else(|| "Prompt answer requires a target terminal id.".to_string())?;
+    validate_terminal_pane_id(&pane_id)?;
+    let _control_operation_guard = terminal_control_prompt_answer_begin(&pane_id)?;
     let instance_id =
         terminal_remote_command_u64(&event, &["terminal_instance_id", "terminalInstanceId"]);
     let prompt_id = terminal_remote_command_string(&event, &["prompt_id", "promptId"])
@@ -21070,6 +21291,57 @@ async fn terminal_live_sessions(
 #[cfg(test)]
 mod terminal_tests {
     use super::*;
+
+    #[test]
+    fn pane_control_automation_guard_blocks_prompt_answers_and_expires() {
+        let pane_id = format!("pane-control-test-{}", uuid::Uuid::new_v4());
+        let operation_id = "permission-test".to_string();
+        terminal_control_operation_registry().lock().unwrap().insert(
+            pane_id.clone(),
+            TerminalControlOperation {
+                operation_id: operation_id.clone(),
+                operation_kind: "permission".to_string(),
+                automation_owned: true,
+                expires_at_ms: terminal_now_ms().saturating_add(10_000),
+            },
+        );
+
+        assert!(terminal_control_automation_owned(&pane_id));
+        assert!(terminal_control_prompt_answer_begin(&pane_id)
+            .unwrap_err()
+            .contains("owns this pane"));
+        assert!(!terminal_control_operation_end_if_owner(
+            &pane_id,
+            "wrong-owner"
+        ));
+        assert!(terminal_control_operation_end_if_owner(
+            &pane_id,
+            &operation_id
+        ));
+
+        let prompt_guard = terminal_control_prompt_answer_begin(&pane_id).unwrap();
+        assert!(!terminal_control_automation_owned(&pane_id));
+        drop(prompt_guard);
+        assert!(!terminal_control_operation_registry()
+            .lock()
+            .unwrap()
+            .contains_key(&pane_id));
+
+        terminal_control_operation_registry().lock().unwrap().insert(
+            pane_id.clone(),
+            TerminalControlOperation {
+                operation_id,
+                operation_kind: "model".to_string(),
+                automation_owned: true,
+                expires_at_ms: 0,
+            },
+        );
+        assert!(!terminal_control_automation_owned(&pane_id));
+        assert!(!terminal_control_operation_registry()
+            .lock()
+            .unwrap()
+            .contains_key(&pane_id));
+    }
 
     #[test]
     fn choose_terminal_command_path_prefers_existing_candidates() {
@@ -22997,6 +23269,52 @@ Done. Ready for the next command.
         assert_eq!(resolved_running.1, "thinking");
         assert_eq!(resolved_running.3, "running");
         assert!(!resolved_running.4);
+    }
+
+    #[test]
+    fn detected_prompt_supersession_resolves_old_prompt_before_starting_replacement() {
+        let first_candidate = terminal_screen_prompt_detect(
+            "codex",
+            "Hooks need review\n1. Review hooks\n2. Trust all and continue\n3. Continue without trusting\nPress enter to confirm\n",
+        )
+        .expect("first prompt");
+        let second_candidate = terminal_screen_prompt_detect(
+            "codex",
+            "Do you trust the contents of this folder?\n1. Trust folder\n2. Do not trust\nPress enter to confirm\n",
+        )
+        .expect("replacement prompt");
+        let first = terminal_screen_prompt_active_from_candidate(
+            "pane-supersession-order",
+            11,
+            "prompt-old".to_string(),
+            first_candidate,
+            1,
+        );
+        let replacement = terminal_screen_prompt_active_from_candidate(
+            "pane-supersession-order",
+            11,
+            "prompt-new".to_string(),
+            second_candidate,
+            2,
+        );
+
+        let emissions = terminal_screen_prompt_supersession_emissions(first, replacement);
+        assert_eq!(emissions.len(), 2);
+        match &emissions[0] {
+            TerminalScreenPromptEmission::Resolved(active, reason) => {
+                assert_eq!(active.prompt_id, "prompt-old");
+                assert_eq!(*reason, "superseded");
+            }
+            TerminalScreenPromptEmission::Started(_) => panic!("old prompt must resolve first"),
+        }
+        match &emissions[1] {
+            TerminalScreenPromptEmission::Started(active) => {
+                assert_eq!(active.prompt_id, "prompt-new");
+            }
+            TerminalScreenPromptEmission::Resolved(_, _) => {
+                panic!("replacement prompt must start second")
+            }
+        }
     }
 
     #[test]

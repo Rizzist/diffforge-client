@@ -5,9 +5,17 @@ export const REMOTE_PERMISSION_CONFIG_SOURCE = "remote-permission-config";
 
 export const CODEX_PERMISSION_MODE_LABELS = {
   "read-only": "Read Only",
-  auto: "Auto",
+  auto: "Auto-review",
   "full-access": "Full Access",
 };
+
+const CODEX_PERMISSION_PROFILE_LABELS = [
+  { key: "read-only", labels: ["read only", "read-only"] },
+  { key: "auto-review", labels: ["auto-review", "auto review"] },
+  { key: "auto", labels: ["auto"] },
+  { key: "default", labels: ["default"] },
+  { key: "full-access", labels: ["full access", "full-access"] },
+];
 
 export const CLAUDE_PERMISSION_MODE_STATUS = {
   default: ["manual mode on", "default mode on"],
@@ -94,55 +102,90 @@ export function extractVisibleTerminalRows(text = "") {
     .filter(Boolean);
 }
 
-export function findCodexPermissionPickerTarget(text = "", mode = "") {
-  const targetMode = normalizePermissionModeForProvider("codex", mode);
-  const targetLabel = codexPermissionLabelForMode(targetMode);
-  const rows = extractVisibleTerminalRows(text);
-  const labelCompacts = Object.values(CODEX_PERMISSION_MODE_LABELS).map((label) => compactPermissionText(label));
-  const pickerCandidates = rows
-    .map((row, rowIndex) => ({
-      label: row,
-      rowIndex,
-      text: compactPermissionText(row),
-    }))
-    .filter((row) => (
-      !terminalRowLooksLikeTranscript(row.label)
-      && labelCompacts.some((label) => row.text.includes(label))
-    ));
-  const pickerBlocks = [];
+const CODEX_PERMISSION_POINTER_REGEX = /^\s*(?:>|›|❯|▶|●|◉)\s*/u;
+
+function codexPermissionPickerRow(row = "", rowIndex = -1) {
+  if (terminalRowLooksLikeTranscript(row)) {
+    return null;
+  }
+  const selected = CODEX_PERMISSION_POINTER_REGEX.test(row);
+  const withoutPointer = normalizePermissionToken(row).replace(CODEX_PERMISSION_POINTER_REGEX, "");
+  const numberedMatch = withoutPointer.match(/^([1-9][0-9]?)\s*[.)]\s*(.+)$/u);
+  const labelText = compactPermissionText(numberedMatch?.[2] || withoutPointer);
+  const profile = CODEX_PERMISSION_PROFILE_LABELS.find(({ labels }) => (
+    labels.some((label) => labelText === label || labelText.startsWith(`${label} `))
+  ));
+  if (!profile) {
+    return null;
+  }
+  return {
+    key: profile.key,
+    label: row,
+    numbered: Boolean(numberedMatch),
+    rowIndex,
+    selected,
+    text: labelText,
+  };
+}
+
+function codexPermissionPickerBlocks(rows = []) {
+  const candidates = rows
+    .map((row, rowIndex) => codexPermissionPickerRow(row, rowIndex))
+    .filter(Boolean);
+  const blocks = [];
   let currentBlock = [];
-  for (const candidate of pickerCandidates) {
+  for (const candidate of candidates) {
     if (
       currentBlock.length
-      && candidate.rowIndex !== currentBlock[currentBlock.length - 1].rowIndex + 1
+      && (
+        candidate.rowIndex - currentBlock[currentBlock.length - 1].rowIndex > 4
+        || currentBlock.some((row) => row.key === candidate.key)
+        || (candidate.selected && currentBlock.some((row) => row.selected))
+      )
     ) {
-      pickerBlocks.push(currentBlock);
+      blocks.push(currentBlock);
       currentBlock = [];
     }
     currentBlock.push(candidate);
   }
   if (currentBlock.length) {
-    pickerBlocks.push(currentBlock);
+    blocks.push(currentBlock);
   }
 
-  const pointerRegex = /^\s*(?:>|›|❯|▶|●|◉)\s*/u;
-  const validBlocks = pickerBlocks
-    .map((block) => {
-      const selectedRows = block.filter((row) => pointerRegex.test(row.label));
-      const labelsPresent = labelCompacts.filter((label) => (
-        block.some((row) => row.text.includes(label))
-      ));
-      return {
-        block,
-        labelsPresent,
-        selectedRows,
-      };
-    })
-    .filter(({ block, labelsPresent, selectedRows }) => (
-      block.length >= labelCompacts.length
-      && labelsPresent.length === labelCompacts.length
-      && selectedRows.length === 1
-    ));
+  return blocks.filter((block) => {
+    const keys = block.map((row) => row.key);
+    const uniqueKeys = new Set(keys);
+    const selectedRows = block.filter((row) => row.selected);
+    const legacyShape = keys.length === 3
+      && ["read-only", "auto", "full-access"].every((key) => uniqueKeys.has(key));
+    const currentShape = keys.length === 3
+      && ["default", "auto-review", "full-access"].every((key) => uniqueKeys.has(key));
+    return (
+      selectedRows.length === 1
+      && uniqueKeys.size === keys.length
+      && (legacyShape || currentShape)
+    );
+  });
+}
+
+function codexPermissionTargetKeys(mode = "") {
+  const targetMode = normalizePermissionModeForProvider("codex", mode);
+  if (targetMode === "auto") {
+    // Prefer the current profile name, then the legacy name. "Default" is a
+    // safe compatibility fallback only when neither explicit auto label exists.
+    return ["auto-review", "auto", "default"];
+  }
+  return targetMode ? [targetMode] : [];
+}
+
+export function findCodexPermissionPickerTarget(text = "", mode = "") {
+  const targetMode = normalizePermissionModeForProvider("codex", mode);
+  const targetLabel = codexPermissionLabelForMode(targetMode);
+  const rows = extractVisibleTerminalRows(text);
+  const pickerCandidates = rows
+    .map((row, rowIndex) => codexPermissionPickerRow(row, rowIndex))
+    .filter(Boolean);
+  const validBlocks = codexPermissionPickerBlocks(rows);
   if (validBlocks.length !== 1) {
     return {
       ambiguous: validBlocks.length > 1,
@@ -156,9 +199,23 @@ export function findCodexPermissionPickerTarget(text = "", mode = "") {
     };
   }
 
-  const pickerRows = validBlocks[0].block;
-  const targetIndex = pickerRows.findIndex((row) => row.text.includes(compactPermissionText(targetLabel)));
-  const selectedIndex = pickerRows.findIndex((row) => pointerRegex.test(row.label));
+  const pickerRows = validBlocks[0];
+  const targetKeys = codexPermissionTargetKeys(targetMode);
+  let targetIndex = -1;
+  for (const targetKey of targetKeys) {
+    const matches = pickerRows
+      .map((row, index) => (row.key === targetKey ? index : -1))
+      .filter((index) => index >= 0);
+    if (matches.length > 1) {
+      targetIndex = -1;
+      break;
+    }
+    if (matches.length === 1) {
+      targetIndex = matches[0];
+      break;
+    }
+  }
+  const selectedIndex = pickerRows.findIndex((row) => row.selected);
   const arrowDownCount = targetIndex < 0
     ? -1
     : (targetIndex - selectedIndex + pickerRows.length) % pickerRows.length;
@@ -176,12 +233,7 @@ export function findCodexPermissionPickerTarget(text = "", mode = "") {
 
 export function codexPermissionPickerOpen(text = "") {
   const rows = extractVisibleTerminalRows(text);
-  const joined = compactPermissionText(rows.join(" "));
-  return (
-    joined.includes("read only")
-    && joined.includes("full access")
-    && (joined.includes("permission") || joined.includes("auto"))
-  );
+  return codexPermissionPickerBlocks(rows).length === 1;
 }
 
 export function extractTerminalStatusRows(text = "", rowLimit = 5) {
@@ -241,6 +293,7 @@ export function codexPermissionModeFromStatusText(text = "") {
   }
   if (
     compact.includes("auto")
+    || /\bpermissions?\s*[:=]?\s*default\b/.test(compact)
     || (compact.includes("on request") && (compact.includes("workspace write") || compact.includes("workspace-write")))
     || (compact.includes("on-request") && (compact.includes("workspace write") || compact.includes("workspace-write")))
   ) {
@@ -324,4 +377,82 @@ export function appendUniqueMode(seenModes = [], mode = "") {
     return seenModes;
   }
   return [...seenModes, safeMode];
+}
+
+export async function cyclePermissionModeWithBestEffortRestore({
+  cycleMode,
+  maxCycleSteps = 8,
+  originalMode = "",
+  targetMode = "",
+} = {}) {
+  const safeOriginalMode = String(originalMode || "").trim();
+  const safeTargetMode = String(targetMode || "").trim();
+  const cycle = typeof cycleMode === "function" ? cycleMode : null;
+  const stepLimit = Math.max(1, Math.floor(Number(maxCycleSteps) || 8));
+  let currentMode = safeOriginalMode;
+  let seenModes = appendUniqueMode([], currentMode);
+  let cycleError = null;
+
+  if (!cycle || !safeOriginalMode || !safeTargetMode) {
+    return {
+      applied: false,
+      currentMode,
+      cycleError: new Error("Permission cycling requires the original mode, target mode, and cycle callback."),
+      restoreError: null,
+      restored: currentMode === safeOriginalMode,
+      seenModes,
+    };
+  }
+
+  try {
+    for (let index = 0; index < stepLimit; index += 1) {
+      currentMode = String(await cycle() || "").trim();
+      seenModes = appendUniqueMode(seenModes, currentMode);
+      if (currentMode === safeTargetMode) {
+        return {
+          applied: true,
+          currentMode,
+          cycleError: null,
+          restoreError: null,
+          restored: false,
+          seenModes,
+        };
+      }
+      if (currentMode === safeOriginalMode) {
+        break;
+      }
+    }
+  } catch (error) {
+    cycleError = error;
+  }
+
+  // A rejected write may still have reached the PTY before the error was
+  // observed, so a cycle error makes the current mode unknown even when the
+  // last successfully parsed value was the original.
+  let restored = !cycleError && currentMode === safeOriginalMode;
+  let restoreError = null;
+  if (!restored) {
+    for (let index = 0; index < stepLimit; index += 1) {
+      try {
+        currentMode = String(await cycle() || "").trim();
+        seenModes = appendUniqueMode(seenModes, currentMode);
+        if (currentMode === safeOriginalMode) {
+          restored = true;
+          break;
+        }
+      } catch (error) {
+        restoreError = error;
+        break;
+      }
+    }
+  }
+
+  return {
+    applied: false,
+    currentMode,
+    cycleError,
+    restoreError,
+    restored,
+    seenModes,
+  };
 }

@@ -37,11 +37,11 @@ import {
   REMOTE_PERMISSION_CONFIG_REQUEST_EVENT,
   REMOTE_PERMISSION_CONFIG_RESULT_EVENT,
   REMOTE_PERMISSION_CONFIG_SOURCE,
-  appendUniqueMode,
   claudePermissionModeFromText,
   claudePermissionTargetAvailableInCycle,
   codexPermissionPickerOpen,
   codexPermissionPostSelectionState,
+  cyclePermissionModeWithBestEffortRestore,
   findCodexPermissionPickerTarget,
   normalizePermissionModeForProvider,
   opencodeAgentModeFromText,
@@ -12727,13 +12727,16 @@ function WorkspaceTerminal({
           await waitForRemotePermissionConfigSettle(80);
           let currentMode = claudePermissionModeFromText(remotePermissionConfigViewportText());
           const originalMode = currentMode;
-          let seenModes = appendUniqueMode([], currentMode);
+          if (!originalMode) {
+            await writeRemotePermissionConfigInput("\x1b");
+            throw new Error("Unable to determine Claude's original permission mode; no mode keys were sent. Seen modes: none.");
+          }
           if (currentMode === targetMode) {
             return {
               applied: true,
               message: `Permission mode already ${targetMode}.`,
               permissionMode: targetMode,
-              seenModes,
+              seenModes: [currentMode],
             };
           }
           const maxCycleSteps = 8;
@@ -12741,35 +12744,33 @@ function WorkspaceTerminal({
             await writeRemotePermissionConfigInput("\x1b[Z");
             await waitForRemotePermissionConfigSettle(180);
             currentMode = claudePermissionModeFromText(remotePermissionConfigViewportText());
-            seenModes = appendUniqueMode(seenModes, currentMode);
             return currentMode;
           };
-          for (let index = 0; index < maxCycleSteps; index += 1) {
-            const nextMode = await cycleClaudePermissionMode();
-            if (currentMode === targetMode) {
-              return {
-                applied: true,
-                message: `Permission mode changed to ${targetMode}.`,
-                permissionMode: targetMode,
-                seenModes,
-              };
-            }
-            if (originalMode && nextMode === originalMode) {
-              break;
-            }
+          const cycleResult = await cyclePermissionModeWithBestEffortRestore({
+            cycleMode: cycleClaudePermissionMode,
+            maxCycleSteps,
+            originalMode,
+            targetMode,
+          });
+          currentMode = cycleResult.currentMode;
+          if (cycleResult.applied) {
+            return {
+              applied: true,
+              message: `Permission mode changed to ${targetMode}.`,
+              permissionMode: targetMode,
+              seenModes: cycleResult.seenModes,
+            };
           }
-          if (originalMode && currentMode !== originalMode) {
-            for (let index = 0; index < maxCycleSteps; index += 1) {
-              const restoredMode = await cycleClaudePermissionMode();
-              if (restoredMode === originalMode) {
-                break;
-              }
-            }
-          }
-          await writeRemotePermissionConfigInput("\x1b");
+          await writeRemotePermissionConfigInput("\x1b").catch(() => {});
           const restartMessage = `Claude permission mode ${targetMode} requires restart with --permission-mode ${targetMode}.`;
-          const seenMessage = `Seen modes: ${seenModes.join(", ") || "none"}. Current mode: ${currentMode || "unknown"}.`;
-          if (!claudePermissionTargetAvailableInCycle(targetMode, seenModes)) {
+          const restoreError = cycleResult.restoreError
+            ? getErrorMessage(cycleResult.restoreError, "restore write failed")
+            : "";
+          const seenMessage = `Seen modes: ${cycleResult.seenModes.join(", ") || "none"}. Original mode: ${originalMode}. Current mode: ${currentMode || "unknown"}. Restore: ${cycleResult.restored ? "restored" : `failed${restoreError ? ` (${restoreError})` : ""}`}.`;
+          if (cycleResult.cycleError) {
+            throw new Error(`${getErrorMessage(cycleResult.cycleError, restartMessage)} ${seenMessage}`);
+          }
+          if (!claudePermissionTargetAvailableInCycle(targetMode, cycleResult.seenModes)) {
             throw new Error(`${restartMessage} ${seenMessage}`);
           }
           throw new Error(`${restartMessage} ${seenMessage}`);
@@ -12779,31 +12780,50 @@ function WorkspaceTerminal({
           await writeRemotePermissionConfigInput("\u0015");
           await waitForRemotePermissionConfigSettle(80);
           let currentMode = opencodeAgentModeFromText(remotePermissionConfigViewportText());
-          let seenModes = appendUniqueMode([], currentMode);
+          const originalMode = currentMode;
+          if (!originalMode) {
+            await writeRemotePermissionConfigInput("\x1b");
+            throw new Error("Unable to determine OpenCode's original agent mode; no mode keys were sent. Seen agents: none.");
+          }
           if (currentMode === targetMode) {
             return {
               applied: true,
               message: `Permission mode already ${targetMode}.`,
               permissionMode: targetMode,
-              seenModes,
+              seenModes: [currentMode],
             };
           }
-          for (let index = 0; index < 8; index += 1) {
+          const maxCycleSteps = 8;
+          const cycleOpenCodeAgentMode = async () => {
             await writeRemotePermissionConfigInput("\t");
             await waitForRemotePermissionConfigSettle(180);
             currentMode = opencodeAgentModeFromText(remotePermissionConfigViewportText());
-            seenModes = appendUniqueMode(seenModes, currentMode);
-            if (currentMode === targetMode) {
-              return {
-                applied: true,
-                message: `Permission mode changed to ${targetMode}.`,
-                permissionMode: targetMode,
-                seenModes,
-              };
-            }
+            return currentMode;
+          };
+          const cycleResult = await cyclePermissionModeWithBestEffortRestore({
+            cycleMode: cycleOpenCodeAgentMode,
+            maxCycleSteps,
+            originalMode,
+            targetMode,
+          });
+          currentMode = cycleResult.currentMode;
+          if (cycleResult.applied) {
+            return {
+              applied: true,
+              message: `Permission mode changed to ${targetMode}.`,
+              permissionMode: targetMode,
+              seenModes: cycleResult.seenModes,
+            };
           }
-          await writeRemotePermissionConfigInput("\x1b");
-          throw new Error(`OpenCode agent ${targetMode} was not reachable by Tab cycle. Seen agents: ${seenModes.join(", ") || "none"}.`);
+          await writeRemotePermissionConfigInput("\x1b").catch(() => {});
+          const restoreError = cycleResult.restoreError
+            ? getErrorMessage(cycleResult.restoreError, "restore write failed")
+            : "";
+          const seenMessage = `Seen agents: ${cycleResult.seenModes.join(", ") || "none"}. Original agent: ${originalMode}. Current agent: ${currentMode || "unknown"}. Restore: ${cycleResult.restored ? "restored" : `failed${restoreError ? ` (${restoreError})` : ""}`}.`;
+          if (cycleResult.cycleError) {
+            throw new Error(`${getErrorMessage(cycleResult.cycleError, `OpenCode agent ${targetMode} cycle failed.`)} ${seenMessage}`);
+          }
+          throw new Error(`OpenCode agent ${targetMode} was not reachable by Tab cycle. ${seenMessage}`);
         };
         const applyRemotePermissionConfig = async (detail = {}) => {
           const provider = normalizePermissionModeForProvider("opencode", detail.provider || terminalAgentKind) === "opencode"

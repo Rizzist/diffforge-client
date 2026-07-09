@@ -27,6 +27,7 @@ const AGENT_ACCOUNTS_AUTH_SCAN_MAX_CHARS: usize = 4096;
 const AGENT_ACCOUNT_PUSH_CHANGED_EVENT: &str = "agent-account-push-changed";
 const AGENT_ACCOUNT_PUSH_KEY_FILE: &str = "agent-account-push-key.json";
 const AGENT_ACCOUNT_PUSH_TRUSTED_KEYS_FILE: &str = "agent-account-push-trusted-keys.json";
+const AGENT_ACCOUNT_PUSH_APPLIED_FILE: &str = "agent-account-push-applied.json";
 pub(crate) const AGENT_ACCOUNT_PUSH_SEALED_ALGORITHM: &str = "x25519-sealedbox-v1";
 const AGENT_ACCOUNT_PUSH_KEY_BYTES: usize = 32;
 const AGENT_ACCOUNT_PUSH_MAX_FILE_BYTES: u64 = 1024 * 1024;
@@ -38,10 +39,62 @@ const AGENT_ACCOUNT_PUSH_APPLIED_MAX: usize = 256;
 static AGENT_ACCOUNTS_PANE_PROFILES: OnceLock<StdMutex<HashMap<String, Value>>> = OnceLock::new();
 static AGENT_ACCOUNT_PUSH_PENDING: OnceLock<StdMutex<HashMap<String, AgentAccountPushPending>>> =
     OnceLock::new();
-static AGENT_ACCOUNT_PUSH_APPLIED: OnceLock<StdMutex<HashMap<String, u64>>> = OnceLock::new();
 static AGENT_ACCOUNT_PUSH_KEY_FILE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-static AGENT_ACCOUNT_PUSH_KEY_FILE_CACHE: OnceLock<StdMutex<Option<(PathBuf, AgentAccountPushKeyFile)>>> =
-    OnceLock::new();
+static AGENT_ACCOUNT_PUSH_KEY_FILE_CACHE: OnceLock<
+    StdMutex<Option<(PathBuf, AgentAccountPushKeyFile)>>,
+> = OnceLock::new();
+static AGENT_ACCOUNT_PUSH_TRUSTED_KEYS_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static AGENT_ACCOUNT_PUSH_APPLIED_FILE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static AGENT_ACCOUNTS_CLAUDE_CREDENTIAL_OBSERVATIONS: OnceLock<
+    StdMutex<HashMap<PathBuf, AgentAccountsClaudeCredentialObservation>>,
+> = OnceLock::new();
+static AGENT_ACCOUNTS_CLAUDE_CAPTURE_CYCLE: AtomicU64 = AtomicU64::new(0);
+static AGENT_ACCOUNTS_REGISTRY_ACTIVITY_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static AGENT_ACCOUNTS_PROFILE_LOGIN_MARKERS: OnceLock<
+    StdMutex<HashMap<PathBuf, AgentAccountsProfileLoginMarker>>,
+> = OnceLock::new();
+
+const AGENT_ACCOUNTS_PROFILE_LOGIN_MARKER_TTL_SECS: u64 = 30 * 60;
+const AGENT_ACCOUNTS_PROFILE_LOGIN_CREDENTIAL_ONLY_CONFIRM_SECS: u64 = 30;
+
+#[derive(Clone, Eq, PartialEq)]
+struct AgentAccountsClaudeCredentialFingerprint {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    sha256: String,
+    expected_email: String,
+}
+
+#[derive(Clone)]
+struct AgentAccountsClaudeCredentialObservation {
+    fingerprint: AgentAccountsClaudeCredentialFingerprint,
+    capture_cycle: u64,
+    observed_at: std::time::Instant,
+}
+
+#[derive(Clone)]
+struct AgentAccountsProfileLoginMarker {
+    expires_at: std::time::Instant,
+    credentials_sha256: Option<String>,
+    state_sha256: Option<String>,
+    state_modified: Option<std::time::SystemTime>,
+    baseline_email: String,
+    matching_credentials_sha256: Option<String>,
+    matching_credentials_observed_at: Option<std::time::Instant>,
+}
+
+#[derive(Default)]
+struct AgentAccountsClaudeReconcileResult {
+    profile_files_changed: bool,
+    registry_changed: bool,
+    rebound_profile_dirs: Vec<PathBuf>,
+}
+
+impl AgentAccountsClaudeReconcileResult {
+    fn changed(&self) -> bool {
+        self.profile_files_changed || self.registry_changed
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct AgentAccountPushPublicKeyMetadata {
@@ -57,6 +110,15 @@ struct AgentAccountPushPending {
     wipe_local_after: bool,
     identity_email: String,
     delivered: bool,
+    created_at_ms: u64,
+    expires_at_ms: u64,
+    ack_nonce_b64: String,
+    target_push_public_key_b64: String,
+    source_credentials_sha256: String,
+}
+
+fn agent_account_push_pending_is_fresh(pending: &AgentAccountPushPending, now_ms: u64) -> bool {
+    pending.created_at_ms <= now_ms && now_ms < pending.expires_at_ms
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -68,13 +130,24 @@ struct AgentAccountPushKeyFile {
     created_at_ms: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+struct AgentAccountPushTrustedKey {
+    public_key_b64: String,
+    fingerprint_sha256: String,
+    confirmed_at_ms: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct AgentAccountPushBlob {
     version: u8,
     contract: String,
     push_id: String,
     target_device_id: String,
     sender_device_id: String,
+    sender_push_public_key_b64: String,
+    sender_key_fingerprint_sha256: String,
+    ack_nonce_b64: String,
+    sender_auth_tag_b64: String,
     issued_at_ms: u64,
     expires_at_ms: u64,
     agent_kind: String,
@@ -85,7 +158,7 @@ struct AgentAccountPushBlob {
     files: Vec<AgentAccountPushFile>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct AgentAccountPushFile {
     name: String,
     data_b64: String,
@@ -93,10 +166,6 @@ struct AgentAccountPushFile {
 
 fn agent_account_push_pending() -> &'static StdMutex<HashMap<String, AgentAccountPushPending>> {
     AGENT_ACCOUNT_PUSH_PENDING.get_or_init(|| StdMutex::new(HashMap::new()))
-}
-
-fn agent_account_push_applied() -> &'static StdMutex<HashMap<String, u64>> {
-    AGENT_ACCOUNT_PUSH_APPLIED.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
 fn agent_account_push_key_path() -> Result<PathBuf, String> {
@@ -115,34 +184,63 @@ fn agent_account_push_random_32() -> Result<[u8; AGENT_ACCOUNT_PUSH_KEY_BYTES], 
     Ok(bytes)
 }
 
-fn agent_account_push_write_private_json(path: &Path, value: &AgentAccountPushKeyFile) -> Result<(), String> {
+fn agent_accounts_write_private_file_atomic(
+    path: &Path,
+    bytes: &[u8],
+    description: &str,
+) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Unable to resolve {description} directory."))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Unable to create {description} directory: {error}"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("private-state");
+    let temp_path = parent.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
+    let write_result = (|| -> Result<(), String> {
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&temp_path)
+                .map_err(|error| format!("Unable to open temporary {description}: {error}"))?
+        };
+        #[cfg(not(unix))]
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .map_err(|error| format!("Unable to open temporary {description}: {error}"))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("Unable to write temporary {description}: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("Unable to sync temporary {description}: {error}"))?;
+        fs::rename(&temp_path, path)
+            .map_err(|error| format!("Unable to install {description}: {error}"))?;
+        #[cfg(unix)]
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("Unable to sync {description} directory: {error}"))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    write_result
+}
+
+fn agent_account_push_write_private_json(
+    path: &Path,
+    value: &AgentAccountPushKeyFile,
+) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|error| format!("Unable to encode agent account push key: {error}"))?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Unable to create agent account push key directory: {error}"))?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|error| format!("Unable to open agent account push key: {error}"))?;
-        file.write_all(&bytes)
-            .map_err(|error| format!("Unable to write agent account push key: {error}"))?;
-        let _ = fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600));
-        return Ok(());
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, bytes)
-            .map_err(|error| format!("Unable to write agent account push key: {error}"))?;
-        Ok(())
-    }
+    agent_accounts_write_private_file_atomic(path, &bytes, "agent account push key")
 }
 
 fn agent_account_push_read_or_create_key_file() -> Result<AgentAccountPushKeyFile, String> {
@@ -170,7 +268,9 @@ fn agent_account_push_read_or_create_key_file() -> Result<AgentAccountPushKeyFil
     Ok(file)
 }
 
-fn agent_account_push_read_or_create_key_file_uncached(path: &Path) -> Result<AgentAccountPushKeyFile, String> {
+fn agent_account_push_read_or_create_key_file_uncached(
+    path: &Path,
+) -> Result<AgentAccountPushKeyFile, String> {
     match fs::read_to_string(&path) {
         Ok(raw) => {
             let file = serde_json::from_str::<AgentAccountPushKeyFile>(&raw)
@@ -328,6 +428,19 @@ fn agent_account_push_status_text(event: &Value, keys: &[&str]) -> Option<String
             keys.iter()
                 .find_map(|key| cloud_mcp_payload_text(event, &["result", key]))
         })
+        .or_else(|| {
+            keys.iter()
+                .find_map(|key| cloud_mcp_payload_text(event, &["payload", "details", key]))
+        })
+        .or_else(|| {
+            keys.iter()
+                .find_map(|key| cloud_mcp_payload_text(event, &["payload", "result", key]))
+        })
+        .or_else(|| {
+            keys.iter().find_map(|key| {
+                cloud_mcp_payload_text(event, &["request", "payload", "details", key])
+            })
+        })
 }
 
 fn agent_account_push_status_push_id(event: &Value) -> Option<String> {
@@ -373,6 +486,42 @@ fn agent_account_push_status_matches_pending(
         == agent_account_push_normalized_device_id(&pending.target_device_id)
 }
 
+fn agent_account_push_status_has_valid_completion_proof(
+    event: &Value,
+    push_id: &str,
+    pending: &AgentAccountPushPending,
+) -> bool {
+    let Some(proof) = agent_account_push_status_text(
+        event,
+        &[
+            "recipient_proof_b64",
+            "recipientProofB64",
+            "ack_proof_b64",
+            "ackProofB64",
+        ],
+    ) else {
+        return false;
+    };
+    let local_device = cloud_mcp_desktop_device_profile();
+    let sender_device_id =
+        cloud_mcp_payload_text(&local_device, &["device_id", "deviceId"]).unwrap_or_default();
+    let Ok(payload) = agent_account_push_ack_payload(
+        push_id,
+        &pending.ack_nonce_b64,
+        &sender_device_id,
+        &pending.target_device_id,
+    ) else {
+        return false;
+    };
+    agent_account_push_verify_hmac_b64(
+        &pending.target_push_public_key_b64,
+        b"diffforge.agent_account_push.ack.v2\0",
+        &payload,
+        &proof,
+    )
+    .is_ok()
+}
+
 fn agent_account_push_handle_remote_status_inner(app: Option<&AppHandle>, event: &Value) -> bool {
     let event_kind =
         cloud_mcp_payload_text(event, &["event_kind", "eventKind", "kind"]).unwrap_or_default();
@@ -382,11 +531,10 @@ fn agent_account_push_handle_remote_status_inner(app: Option<&AppHandle>, event:
     ) {
         return false;
     }
-    let command_kind =
-        cloud_mcp_remote_command_field_text(event, &["command_kind", "commandKind"])
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .replace(['.', ' ', '-'], "_");
+    let command_kind = cloud_mcp_remote_command_field_text(event, &["command_kind", "commandKind"])
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .replace(['.', ' ', '-'], "_");
     if command_kind != "agent_account_push" {
         return false;
     }
@@ -398,10 +546,18 @@ fn agent_account_push_handle_remote_status_inner(app: Option<&AppHandle>, event:
         .to_ascii_lowercase();
     match status.as_str() {
         "received" | "accepted" | "queued" | "delivered" => {
+            let now_ms = todo_dispatch_now_ms();
             let pending = agent_account_push_pending()
                 .lock()
                 .ok()
                 .and_then(|mut pending| {
+                    if pending
+                        .get(&push_id)
+                        .is_some_and(|entry| !agent_account_push_pending_is_fresh(entry, now_ms))
+                    {
+                        pending.remove(&push_id);
+                        return None;
+                    }
                     let entry = pending.get_mut(&push_id)?;
                     if !agent_account_push_status_matches_pending(event, &push_id, entry) {
                         return None;
@@ -426,12 +582,24 @@ fn agent_account_push_handle_remote_status_inner(app: Option<&AppHandle>, event:
             true
         }
         "completed" => {
+            let now_ms = todo_dispatch_now_ms();
             let pending = agent_account_push_pending()
                 .lock()
                 .ok()
                 .and_then(|mut pending| {
+                    if pending
+                        .get(&push_id)
+                        .is_some_and(|entry| !agent_account_push_pending_is_fresh(entry, now_ms))
+                    {
+                        pending.remove(&push_id);
+                        return None;
+                    }
                     let entry = pending.get(&push_id)?;
                     if !agent_account_push_status_matches_pending(event, &push_id, entry) {
+                        return None;
+                    }
+                    if !agent_account_push_status_has_valid_completion_proof(event, &push_id, entry)
+                    {
                         return None;
                     }
                     pending.remove(&push_id)
@@ -469,6 +637,7 @@ fn agent_account_push_handle_remote_status_inner(app: Option<&AppHandle>, event:
                             &pending_for_wipe.agent_kind,
                             &pending_for_wipe.profile_id,
                             &pending_for_wipe.identity_email,
+                            Some(&pending_for_wipe.source_credentials_sha256),
                         ) {
                             Ok(_) => agent_account_push_emit(
                                 &app_handle,
@@ -498,6 +667,7 @@ fn agent_account_push_handle_remote_status_inner(app: Option<&AppHandle>, event:
                         &pending.agent_kind,
                         &pending.profile_id,
                         &pending.identity_email,
+                        Some(&pending.source_credentials_sha256),
                     ) {
                         Ok(_) => agent_account_push_emit_optional(
                             app,
@@ -532,7 +702,9 @@ fn agent_account_push_handle_remote_status_inner(app: Option<&AppHandle>, event:
             if let Some(pending) = pending {
                 let message = cloud_mcp_payload_text(event, &["message"])
                     .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| "Agent account push failed on the target device.".to_string());
+                    .unwrap_or_else(|| {
+                        "Agent account push failed on the target device.".to_string()
+                    });
                 agent_account_push_emit_optional(
                     app,
                     &push_id,
@@ -615,16 +787,30 @@ fn agent_accounts_registry_read() -> Value {
         .unwrap_or_else(|| json!({ "agents": {} }))
 }
 
-fn agent_accounts_registry_write(registry: &Value) {
-    let Some(path) = agent_accounts_file_path() else {
-        return;
+fn agent_accounts_registry_read_checked() -> Result<Value, String> {
+    let path = agent_accounts_file_path()
+        .ok_or_else(|| "Unable to resolve agent accounts registry path.".to_string())?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(json!({ "agents": {} }));
+        }
+        Err(error) => return Err(format!("Unable to read agent accounts registry: {error}")),
     };
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+    let registry = serde_json::from_str::<Value>(&raw)
+        .map_err(|_| "Agent accounts registry is not valid JSON.".to_string())?;
+    if !registry.is_object() {
+        return Err("Agent accounts registry root is not an object.".to_string());
     }
-    if let Ok(bytes) = serde_json::to_vec_pretty(registry) {
-        let _ = fs::write(path, bytes);
-    }
+    Ok(registry)
+}
+
+fn agent_accounts_registry_write(registry: &Value) -> Result<(), String> {
+    let path = agent_accounts_file_path()
+        .ok_or_else(|| "Unable to resolve agent accounts registry path.".to_string())?;
+    let bytes = serde_json::to_vec_pretty(registry)
+        .map_err(|error| format!("Unable to encode agent accounts registry: {error}"))?;
+    agent_accounts_write_private_file_atomic(&path, &bytes, "agent accounts registry")
 }
 
 fn agent_accounts_kind_entry(registry: &Value, kind: &str) -> (String, Vec<Value>) {
@@ -806,7 +992,29 @@ fn agent_accounts_profile_view(kind: &str, profile: &Value, active_id: &str) -> 
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let identity = agent_accounts_profile_identity(kind, Some(Path::new(&dir)));
+    let mut identity = agent_accounts_profile_identity(kind, Some(Path::new(&dir)));
+    let stored_email = profile
+        .get("email")
+        .and_then(Value::as_str)
+        .map(agent_accounts_email_key)
+        .unwrap_or_default();
+    if kind == "claude"
+        && profile.get("source").and_then(Value::as_str) == Some("captured")
+        && !stored_email.is_empty()
+    {
+        let live_email = identity
+            .get("email")
+            .and_then(Value::as_str)
+            .map(agent_accounts_email_key)
+            .unwrap_or_default();
+        if live_email != stored_email {
+            identity["email"] = json!("");
+            identity["displayName"] = json!("");
+            identity["tokenomicsAccountKey"] = json!("");
+            identity["authReady"] = json!(false);
+            identity["identityMismatch"] = json!(!live_email.is_empty());
+        }
+    }
     let auth_status = agent_accounts_auth_status(
         kind,
         &id,
@@ -817,6 +1025,7 @@ fn agent_accounts_profile_view(kind: &str, profile: &Value, active_id: &str) -> 
     json!({
         "id": id,
         "label": profile.get("label").and_then(Value::as_str).unwrap_or_default(),
+        "email": stored_email,
         "alias": profile.get("alias").and_then(Value::as_str).unwrap_or_default(),
         "showAlias": profile.get("showAlias").and_then(Value::as_bool).unwrap_or(true),
         "showEmail": profile.get("showEmail").and_then(Value::as_bool).unwrap_or(true),
@@ -935,9 +1144,9 @@ fn agent_accounts_effective_active_profile_id(
     default_email: &str,
 ) -> String {
     if active_id != AGENT_ACCOUNTS_DEFAULT_PROFILE_ID
-        && profiles.iter().any(|profile| {
-            agent_accounts_profile_id(profile).as_deref() == Some(active_id)
-        })
+        && profiles
+            .iter()
+            .any(|profile| agent_accounts_profile_id(profile).as_deref() == Some(active_id))
     {
         return active_id.to_string();
     }
@@ -998,8 +1207,12 @@ pub(crate) fn agent_accounts_duplicate_profile_ids(kind: &str) -> Vec<String> {
     let default_email = agent_accounts_default_email(kind);
     let effective_active_id =
         agent_accounts_effective_active_profile_id(kind, &active_id, &profiles, &default_email);
-    let canonical_ids =
-        agent_accounts_canonical_profile_ids_by_email(kind, &profiles, &effective_active_id, &default_email);
+    let canonical_ids = agent_accounts_canonical_profile_ids_by_email(
+        kind,
+        &profiles,
+        &effective_active_id,
+        &default_email,
+    );
     profiles
         .iter()
         .filter_map(|profile| {
@@ -1020,8 +1233,12 @@ pub(crate) fn agent_accounts_active_profile_id_for_tokenomics(kind: &str) -> Str
     let default_email = agent_accounts_default_email(kind);
     let effective_active_id =
         agent_accounts_effective_active_profile_id(kind, &active_id, &profiles, &default_email);
-    let canonical_ids =
-        agent_accounts_canonical_profile_ids_by_email(kind, &profiles, &effective_active_id, &default_email);
+    let canonical_ids = agent_accounts_canonical_profile_ids_by_email(
+        kind,
+        &profiles,
+        &effective_active_id,
+        &default_email,
+    );
     if canonical_ids.contains(&effective_active_id) {
         effective_active_id
     } else {
@@ -1039,10 +1256,19 @@ fn agent_accounts_kind_state(registry: &Value, kind: &str) -> Value {
         .unwrap_or_default();
     let effective_active_id =
         agent_accounts_effective_active_profile_id(kind, &active_id, &profiles, &default_email);
-    let canonical_ids =
-        agent_accounts_canonical_profile_ids_by_email(kind, &profiles, &effective_active_id, &default_email);
-    let default_alias =
-        agent_accounts_default_alias_for_state(registry, kind, &profiles, &active_id, &default_email);
+    let canonical_ids = agent_accounts_canonical_profile_ids_by_email(
+        kind,
+        &profiles,
+        &effective_active_id,
+        &default_email,
+    );
+    let default_alias = agent_accounts_default_alias_for_state(
+        registry,
+        kind,
+        &profiles,
+        &active_id,
+        &default_email,
+    );
     let default_issue = registry
         .get("agents")
         .and_then(|agents| agents.get(kind))
@@ -1075,7 +1301,11 @@ fn agent_accounts_kind_state(registry: &Value, kind: &str) -> Value {
         if !canonical_ids.contains(&id) {
             continue;
         }
-        views.push(agent_accounts_profile_view(kind, profile, &effective_active_id));
+        views.push(agent_accounts_profile_view(
+            kind,
+            profile,
+            &effective_active_id,
+        ));
     }
     json!({ "activeProfileId": effective_active_id, "profiles": views })
 }
@@ -1177,7 +1407,8 @@ fn agent_accounts_auth_file_path(
     profile: Option<&Value>,
 ) -> Option<PathBuf> {
     if profile_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
-        return agent_accounts_default_home(kind).map(|home| home.join(agent_accounts_auth_file_name(kind)));
+        return agent_accounts_default_home(kind)
+            .map(|home| home.join(agent_accounts_auth_file_name(kind)));
     }
     profile
         .and_then(agent_accounts_profile_dir)
@@ -1296,7 +1527,12 @@ fn agent_accounts_clear_resolved_auth_issues_for_kind(registry: &mut Value, kind
                 }
                 let issue = profile.get(AGENT_ACCOUNTS_AUTH_ISSUE_KEY).cloned();
                 if issue.is_some()
-                    && !agent_accounts_auth_issue_is_current(kind, &id, Some(profile), issue.as_ref())
+                    && !agent_accounts_auth_issue_is_current(
+                        kind,
+                        &id,
+                        Some(profile),
+                        issue.as_ref(),
+                    )
                 {
                     if let Some(object) = profile.as_object_mut() {
                         object.remove(AGENT_ACCOUNTS_AUTH_ISSUE_KEY);
@@ -1311,11 +1547,12 @@ fn agent_accounts_clear_resolved_auth_issues_for_kind(registry: &mut Value, kind
 
 fn agent_accounts_registry_read_resolved() -> Value {
     let mut registry = agent_accounts_registry_read();
-    let claude_changed = agent_accounts_clear_resolved_auth_issues_for_kind(&mut registry, "claude");
+    let claude_changed =
+        agent_accounts_clear_resolved_auth_issues_for_kind(&mut registry, "claude");
     let codex_changed = agent_accounts_clear_resolved_auth_issues_for_kind(&mut registry, "codex");
     let changed = claude_changed || codex_changed;
     if changed {
-        agent_accounts_registry_write(&registry);
+        let _ = agent_accounts_registry_write(&registry);
     }
     registry
 }
@@ -1417,14 +1654,20 @@ fn agent_accounts_launch_profile_label(kind: &'static str) -> (String, String) {
 /// Claude profiles contribute transcript scan roots (`<dir>/projects`), Codex
 /// profiles contribute per-account auth for the live usage endpoint — each
 /// attributed to its own account key.
-pub(crate) fn agent_accounts_profiles_for_tokenomics(kind: &str) -> Vec<(String, String, PathBuf)> {
+pub(crate) fn agent_accounts_profiles_for_tokenomics(
+    kind: &str,
+) -> Vec<(String, String, Option<String>, PathBuf)> {
     let registry = agent_accounts_registry_read();
     let (active_id, profiles) = agent_accounts_kind_entry(&registry, kind);
     let default_email = agent_accounts_default_email(kind);
     let effective_active_id =
         agent_accounts_effective_active_profile_id(kind, &active_id, &profiles, &default_email);
-    let canonical_ids =
-        agent_accounts_canonical_profile_ids_by_email(kind, &profiles, &effective_active_id, &default_email);
+    let canonical_ids = agent_accounts_canonical_profile_ids_by_email(
+        kind,
+        &profiles,
+        &effective_active_id,
+        &default_email,
+    );
     profiles
         .iter()
         .filter_map(|profile| {
@@ -1435,6 +1678,11 @@ pub(crate) fn agent_accounts_profiles_for_tokenomics(kind: &str) -> Vec<(String,
                 return None;
             }
             let label = agent_accounts_profile_display_label(profile);
+            let stored_email = profile
+                .get("email")
+                .and_then(Value::as_str)
+                .map(agent_accounts_email_key)
+                .filter(|email| !email.is_empty());
             let dir = profile
                 .get("dir")
                 .and_then(Value::as_str)
@@ -1442,7 +1690,7 @@ pub(crate) fn agent_accounts_profiles_for_tokenomics(kind: &str) -> Vec<(String,
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
                 .filter(|path| path.is_dir())?;
-            Some((id, label, dir))
+            Some((id, label, stored_email, dir))
         })
         .collect()
 }
@@ -1593,6 +1841,118 @@ fn agent_accounts_email_slug(email: &str) -> String {
     }
 }
 
+fn agent_accounts_label_key(label: &str) -> String {
+    label
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn agent_accounts_email_domain_label(email: &str) -> String {
+    email
+        .split_once('@')
+        .map(|(_, domain)| domain)
+        .unwrap_or_default()
+        .chars()
+        .filter_map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-') {
+                Some(character.to_ascii_lowercase())
+            } else {
+                None
+            }
+        })
+        .collect::<String>()
+        .trim_matches(['.', '-'])
+        .chars()
+        .take(48)
+        .collect()
+}
+
+fn agent_accounts_unique_capture_label(email: &str, used_labels: &HashSet<String>) -> String {
+    let base = agent_accounts_email_slug(email);
+    if !used_labels.contains(&agent_accounts_label_key(&base)) {
+        return base;
+    }
+    let domain = agent_accounts_email_domain_label(email);
+    let disambiguated = if domain.is_empty() {
+        format!("{base}-{}", cloud_mcp_short_hash(email))
+    } else {
+        format!("{base}-{domain}")
+    };
+    if !used_labels.contains(&agent_accounts_label_key(&disambiguated)) {
+        return disambiguated;
+    }
+    format!("{disambiguated}-{}", cloud_mcp_short_hash(email))
+}
+
+/// Captured labels are derived rather than user-authored. Keep the oldest
+/// captured profile's short local-part label and deterministically append the
+/// email domain to newer collisions. Aliases are never changed and continue
+/// to win at display time.
+fn agent_accounts_dedupe_captured_profile_labels(registry: &mut Value, kind: &str) -> bool {
+    let Some(profiles) = registry
+        .get_mut("agents")
+        .and_then(|agents| agents.get_mut(kind))
+        .and_then(|entry| entry.get_mut("profiles"))
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    let mut used_labels = profiles
+        .iter()
+        .filter(|profile| profile.get("source").and_then(Value::as_str) != Some("captured"))
+        .filter_map(|profile| profile.get("label").and_then(Value::as_str))
+        .map(agent_accounts_label_key)
+        .filter(|label| !label.is_empty())
+        .collect::<HashSet<_>>();
+    let mut captured_indices = profiles
+        .iter()
+        .enumerate()
+        .filter_map(|(index, profile)| {
+            (profile.get("source").and_then(Value::as_str) == Some("captured")).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    captured_indices.sort_by_key(|index| {
+        (
+            profiles[*index]
+                .get("createdAtMs")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            *index,
+        )
+    });
+
+    let mut changed = false;
+    for index in captured_indices {
+        let current_label = profiles[index]
+            .get("label")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
+        let current_key = agent_accounts_label_key(&current_label);
+        if !current_key.is_empty() && used_labels.insert(current_key) {
+            continue;
+        }
+        let email = profiles[index]
+            .get("email")
+            .and_then(Value::as_str)
+            .map(agent_accounts_email_key)
+            .unwrap_or_default();
+        if email.is_empty() {
+            continue;
+        }
+        let label = agent_accounts_unique_capture_label(&email, &used_labels);
+        used_labels.insert(agent_accounts_label_key(&label));
+        if label != current_label {
+            profiles[index]["label"] = json!(label);
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// The identity a profile is pinned to: the email stored at capture time, or
 /// a live probe of the profile dir for manually created legacy profiles.
 fn agent_accounts_profile_email(kind: &str, profile: &Value) -> String {
@@ -1619,7 +1979,7 @@ fn agent_accounts_profile_email(kind: &str, profile: &Value) -> String {
         .unwrap_or_default()
 }
 
-fn agent_accounts_copy_if_newer(source: &Path, destination: &Path) -> bool {
+fn agent_accounts_source_is_newer(source: &Path, destination: &Path) -> bool {
     if !source.is_file() {
         return false;
     }
@@ -1637,55 +1997,688 @@ fn agent_accounts_copy_if_newer(source: &Path, destination: &Path) -> bool {
         (Ok(_), Err(_)) => true,
         _ => false,
     };
-    newer && fs::copy(source, destination).is_ok()
+    newer
 }
 
-/// Copies the default home's credential/identity files into a snapshot
-/// profile dir. Callers only invoke this while the default home holds the
-/// SAME account the profile is pinned to, so refreshed tokens keep
-/// propagating into the snapshot without ever mixing identities.
-fn agent_accounts_snapshot_refresh(kind: &str, dir: &Path) {
+fn agent_accounts_copy_if_newer(source: &Path, destination: &Path) -> bool {
+    agent_accounts_source_is_newer(source, destination)
+        && fs::copy(source, destination).is_ok()
+}
+
+struct AgentAccountsFileSnapshot {
+    bytes: Vec<u8>,
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+fn agent_accounts_read_stable_file(path: &Path) -> Option<AgentAccountsFileSnapshot> {
+    let before = path.metadata().ok()?;
+    let bytes = fs::read(path).ok()?;
+    let after = path.metadata().ok()?;
+    let before_modified = before.modified().ok();
+    let after_modified = after.modified().ok();
+    if before.len() != after.len()
+        || before_modified != after_modified
+        || after.len() != bytes.len() as u64
+    {
+        return None;
+    }
+    Some(AgentAccountsFileSnapshot {
+        bytes,
+        modified: after_modified,
+        len: after.len(),
+    })
+}
+
+fn agent_accounts_claude_state_email(state: &Value) -> String {
+    state
+        .pointer("/oauthAccount/emailAddress")
+        .and_then(Value::as_str)
+        .map(agent_accounts_email_key)
+        .unwrap_or_default()
+}
+
+fn agent_accounts_claude_default_state_for_email(
+    expected_email: &str,
+) -> Option<AgentAccountsFileSnapshot> {
+    let expected_email = agent_accounts_email_key(expected_email);
+    if expected_email.is_empty() {
+        return None;
+    }
+    let path = env::var_os("HOME")
+        .map(PathBuf::from)?
+        .join(".claude.json");
+    let snapshot = agent_accounts_read_stable_file(&path)?;
+    let state = serde_json::from_slice::<Value>(&snapshot.bytes).ok()?;
+    (agent_accounts_claude_state_email(&state) == expected_email).then_some(snapshot)
+}
+
+fn agent_accounts_clear_claude_credential_observation(destination: &Path) {
+    if let Ok(mut observations) = AGENT_ACCOUNTS_CLAUDE_CREDENTIAL_OBSERVATIONS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+    {
+        observations.remove(destination);
+    }
+}
+
+fn agent_accounts_claude_credentials_consistent_for_copy(
+    credentials: &AgentAccountsFileSnapshot,
+    state: &AgentAccountsFileSnapshot,
+    destination: &Path,
+    expected_email: &str,
+    capture_cycle: u64,
+) -> bool {
+    let credentials_are_newer = match (credentials.modified, state.modified) {
+        (Some(credentials_modified), Some(state_modified)) => {
+            credentials_modified > state_modified
+        }
+        // If either timestamp is unavailable, require the same conservative
+        // confirmation as the credentials-first case.
+        _ => true,
+    };
+    if !credentials_are_newer {
+        agent_accounts_clear_claude_credential_observation(destination);
+        return true;
+    }
+
+    let fingerprint = AgentAccountsClaudeCredentialFingerprint {
+        modified: credentials.modified,
+        len: credentials.len,
+        sha256: format!("{:x}", Sha256::digest(&credentials.bytes)),
+        expected_email: expected_email.to_string(),
+    };
+    let Ok(mut observations) = AGENT_ACCOUNTS_CLAUDE_CREDENTIAL_OBSERVATIONS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+    else {
+        return false;
+    };
+    if let Some(observation) = observations.get(destination) {
+        if observation.fingerprint == fingerprint {
+            // Reconcile and normal refresh can both run inside one slow
+            // capture pass. Only a later capture cycle may confirm the same
+            // credentials; elapsed wall time alone is not a poll boundary.
+            if observation.capture_cycle != capture_cycle {
+                observations.remove(destination);
+                return true;
+            }
+            return false;
+        }
+    }
+    observations.insert(
+        destination.to_path_buf(),
+        AgentAccountsClaudeCredentialObservation {
+            fingerprint,
+            capture_cycle,
+            observed_at: std::time::Instant::now(),
+        },
+    );
+    false
+}
+
+fn agent_accounts_has_pending_claude_credentials() -> bool {
+    let default_email = agent_accounts_default_email("claude");
+    let Ok(mut observations) = AGENT_ACCOUNTS_CLAUDE_CREDENTIAL_OBSERVATIONS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+    else {
+        return false;
+    };
+    observations.retain(|destination, observation| {
+        observation.fingerprint.expected_email == default_email
+            && destination.parent().is_some_and(Path::exists)
+            && observation.observed_at.elapsed() < Duration::from_secs(10 * 60)
+    });
+    !observations.is_empty()
+}
+
+/// Copies default-home auth material only after the live identity matches the
+/// captured profile's stored email. Claude state is copied from the exact
+/// bytes that passed the check, so a later login change cannot substitute a
+/// different oauthAccount between the gate and the write.
+fn agent_accounts_next_claude_capture_cycle() -> u64 {
+    AGENT_ACCOUNTS_CLAUDE_CAPTURE_CYCLE
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1)
+}
+
+fn agent_accounts_snapshot_refresh(kind: &str, dir: &Path, expected_email: &str) -> bool {
+    agent_accounts_snapshot_refresh_in_cycle(
+        kind,
+        dir,
+        expected_email,
+        false,
+        agent_accounts_next_claude_capture_cycle(),
+    )
+}
+
+fn agent_accounts_snapshot_refresh_in_cycle(
+    kind: &str,
+    dir: &Path,
+    expected_email: &str,
+    force_credentials: bool,
+    capture_cycle: u64,
+) -> bool {
     let _span = BackendCpuSpan::new("agent_accounts.snapshot_refresh");
     let Some(default_home) = agent_accounts_default_home(kind) else {
-        return;
+        return false;
     };
+    let expected_email = agent_accounts_email_key(expected_email);
+    if expected_email.is_empty() {
+        return false;
+    }
     match kind {
         "claude" => {
-            let creds_copied = agent_accounts_copy_if_newer(
-                &default_home.join(".credentials.json"),
-                &dir.join(".credentials.json"),
-            );
-            // `.claude.json` (identity + CLI state) lives at `~/.claude.json`
-            // beside the default home and churns constantly with project
-            // state; only mirror it when missing or when credentials moved.
-            if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
-                let state_destination = dir.join(".claude.json");
-                if creds_copied || !state_destination.is_file() {
-                    let _ = fs::copy(home.join(".claude.json"), &state_destination);
+            let credentials_destination = dir.join(".credentials.json");
+            let Some(_) = agent_accounts_claude_default_state_for_email(&expected_email) else {
+                agent_accounts_clear_claude_credential_observation(&credentials_destination);
+                return false;
+            };
+            let credentials_source = default_home.join(".credentials.json");
+            let credentials_snapshot = (force_credentials
+                || agent_accounts_source_is_newer(
+                    &credentials_source,
+                    &credentials_destination,
+                ))
+            .then(|| agent_accounts_read_stable_file(&credentials_source))
+            .flatten();
+            if credentials_snapshot.is_none() {
+                agent_accounts_clear_claude_credential_observation(&credentials_destination);
+            }
+            // Re-probe after buffering credentials. Nothing is written unless
+            // the default state still names the registered account.
+            let Some(state_snapshot) =
+                agent_accounts_claude_default_state_for_email(&expected_email)
+            else {
+                agent_accounts_clear_claude_credential_observation(&credentials_destination);
+                return false;
+            };
+            let mut changed = false;
+            // Claude can write new credentials before it rewrites
+            // `~/.claude.json` during an account switch. If credentials are
+            // newer than the matching state, defer them until a later capture
+            // observes the same credential version with the same identity.
+            // The watcher schedules that confirmation after its normal 30s
+            // capture gap, so routine same-account token refreshes are delayed
+            // once rather than starved.
+            let creds_copied = credentials_snapshot.is_some_and(|credentials| {
+                if !agent_accounts_claude_credentials_consistent_for_copy(
+                    &credentials,
+                    &state_snapshot,
+                    &credentials_destination,
+                    &expected_email,
+                    capture_cycle,
+                ) {
+                    return false;
                 }
+                agent_accounts_write_private_file_atomic(
+                    &credentials_destination,
+                    &credentials.bytes,
+                    "captured Claude credentials",
+                )
+                .is_ok()
+            });
+            changed |= creds_copied;
+            // `.claude.json` (identity + CLI state) lives at `~/.claude.json`
+            // beside the default home. Repair a missing/neutralized/mismatched
+            // captured identity even when the stale credentials mtime did not
+            // move; otherwise copy only alongside an actual credentials move.
+            let state_destination = dir.join(".claude.json");
+            let destination_email = fs::read(&state_destination)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .map(|state| agent_accounts_claude_state_email(&state))
+                .unwrap_or_default();
+            if (creds_copied || destination_email != expected_email)
+                && agent_accounts_write_private_file_atomic(
+                    &state_destination,
+                    &state_snapshot.bytes,
+                    "captured Claude identity state",
+                )
+                .is_ok()
+            {
+                changed = true;
             }
             let settings_destination = dir.join("settings.json");
             if !settings_destination.exists() {
-                let _ = fs::copy(default_home.join("settings.json"), &settings_destination);
+                changed |= fs::copy(default_home.join("settings.json"), &settings_destination)
+                    .is_ok();
             }
+            changed
         }
         "opencode" => {
-            agent_accounts_copy_if_newer(&default_home.join("auth.json"), &dir.join("auth.json"));
+            if agent_accounts_default_email(kind) != expected_email {
+                return false;
+            }
+            let mut changed = agent_accounts_copy_if_newer(
+                &default_home.join("auth.json"),
+                &dir.join("auth.json"),
+            );
             for config_name in ["config.json", "opencode.json", "opencode.jsonc"] {
                 let destination = dir.join(config_name);
                 if !destination.exists() {
-                    let _ = fs::copy(default_home.join(config_name), &destination);
+                    changed |= fs::copy(default_home.join(config_name), &destination).is_ok();
                 }
             }
+            changed
         }
         _ => {
-            agent_accounts_copy_if_newer(&default_home.join("auth.json"), &dir.join("auth.json"));
+            if agent_accounts_default_email(kind) != expected_email {
+                return false;
+            }
+            let mut changed = agent_accounts_copy_if_newer(
+                &default_home.join("auth.json"),
+                &dir.join("auth.json"),
+            );
             let config_destination = dir.join("config.toml");
             if !config_destination.exists() {
-                let _ = fs::copy(default_home.join("config.toml"), &config_destination);
+                changed |= fs::copy(default_home.join("config.toml"), &config_destination).is_ok();
             }
+            changed
         }
     }
+}
+
+fn agent_accounts_neutralize_captured_claude_identity(profile_dir: &Path) -> bool {
+    // Captured credentials are disposable snapshots. Once the state identity
+    // is known to be foreign, retaining its bearer token would let the live
+    // limits poll attribute another account's windows to this profile.
+    let credentials_path = profile_dir.join(".credentials.json");
+    agent_accounts_clear_claude_credential_observation(&credentials_path);
+    let mut changed = match fs::remove_file(&credentials_path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => false,
+    };
+    let state_path = profile_dir.join(".claude.json");
+    let Ok(bytes) = fs::read(&state_path) else {
+        return changed;
+    };
+    let Ok(mut state) = serde_json::from_slice::<Value>(&bytes) else {
+        return changed;
+    };
+    let Some(object) = state.as_object_mut() else {
+        return changed;
+    };
+    let removed = object.remove("oauthAccount").is_some()
+        | object.remove("oauth_account").is_some();
+    if !removed {
+        return changed;
+    }
+    changed |= serde_json::to_vec_pretty(&state)
+        .ok()
+        .is_some_and(|bytes| {
+            agent_accounts_write_private_file_atomic(
+                &state_path,
+                &bytes,
+                "neutralized captured Claude identity state",
+            )
+            .is_ok()
+        });
+    changed
+}
+
+fn agent_accounts_profile_credentials_sha256(profile_dir: &Path) -> Option<String> {
+    fs::read(profile_dir.join(".credentials.json"))
+        .ok()
+        .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn agent_accounts_profile_state_sha256(profile_dir: &Path) -> Option<String> {
+    fs::read(profile_dir.join(".claude.json"))
+        .ok()
+        .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn agent_accounts_profile_state_modified(
+    profile_dir: &Path,
+) -> Option<std::time::SystemTime> {
+    profile_dir
+        .join(".claude.json")
+        .metadata()
+        .ok()?
+        .modified()
+        .ok()
+}
+
+fn agent_accounts_mark_profile_login(profile_dir: &Path) -> bool {
+    let baseline_email = agent_accounts_profile_identity("claude", Some(profile_dir))
+        .get("email")
+        .and_then(Value::as_str)
+        .map(agent_accounts_email_key)
+        .unwrap_or_default();
+    if let Ok(mut markers) = AGENT_ACCOUNTS_PROFILE_LOGIN_MARKERS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+    {
+        markers.insert(
+            profile_dir.to_path_buf(),
+            AgentAccountsProfileLoginMarker {
+                expires_at: std::time::Instant::now()
+                    + Duration::from_secs(AGENT_ACCOUNTS_PROFILE_LOGIN_MARKER_TTL_SECS),
+                credentials_sha256: agent_accounts_profile_credentials_sha256(profile_dir),
+                state_sha256: agent_accounts_profile_state_sha256(profile_dir),
+                state_modified: agent_accounts_profile_state_modified(profile_dir),
+                baseline_email,
+                matching_credentials_sha256: None,
+                matching_credentials_observed_at: None,
+            },
+        );
+        return true;
+    }
+    false
+}
+
+fn agent_accounts_profile_login_marker(
+    profile_dir: &Path,
+) -> Option<AgentAccountsProfileLoginMarker> {
+    let mut markers = AGENT_ACCOUNTS_PROFILE_LOGIN_MARKERS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .ok()?;
+    markers.retain(|_, marker| marker.expires_at > std::time::Instant::now());
+    markers.get(profile_dir).cloned()
+}
+
+fn agent_accounts_profile_login_marker_observed_change(
+    marker: &AgentAccountsProfileLoginMarker,
+    profile_dir: &Path,
+    live_email: &str,
+) -> bool {
+    live_email != marker.baseline_email
+        || agent_accounts_profile_credentials_sha256(profile_dir) != marker.credentials_sha256
+        || agent_accounts_profile_login_marker_observed_state_change(marker, profile_dir)
+}
+
+fn agent_accounts_profile_login_marker_observed_state_change(
+    marker: &AgentAccountsProfileLoginMarker,
+    profile_dir: &Path,
+) -> bool {
+    agent_accounts_profile_state_sha256(profile_dir) != marker.state_sha256
+        || agent_accounts_profile_state_modified(profile_dir) != marker.state_modified
+}
+
+fn agent_accounts_profile_login_marker_matching_completion(
+    profile_dir: &Path,
+    live_email: &str,
+) -> bool {
+    // The outer poll's identity read can become stale while Claude atomically
+    // replaces its state file. Derive the email and fingerprint from one
+    // stable read, and refuse to consume the marker unless that email still
+    // agrees with the poll. A transient/partial rewrite therefore retries on
+    // the next tick instead of turning a deliberate account switch into an
+    // unmarked mismatch that reconciliation would neutralize.
+    let Some(state) = agent_accounts_read_stable_file(&profile_dir.join(".claude.json")) else {
+        return false;
+    };
+    let Ok(state_json) = serde_json::from_slice::<Value>(&state.bytes) else {
+        return false;
+    };
+    let stable_email = agent_accounts_claude_state_email(&state_json);
+    let live_email = agent_accounts_email_key(live_email);
+    if stable_email != live_email {
+        return false;
+    }
+    let state_sha256 = Some(format!("{:x}", Sha256::digest(&state.bytes)));
+
+    let Ok(mut markers) = AGENT_ACCOUNTS_PROFILE_LOGIN_MARKERS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+    else {
+        return false;
+    };
+    markers.retain(|_, marker| marker.expires_at > std::time::Instant::now());
+    let Some(marker) = markers.get_mut(profile_dir) else {
+        return false;
+    };
+    if live_email != marker.baseline_email
+        || state_sha256 != marker.state_sha256
+        || state.modified != marker.state_modified
+    {
+        return true;
+    }
+    let credentials_sha256 = agent_accounts_profile_credentials_sha256(profile_dir);
+    if credentials_sha256 == marker.credentials_sha256 {
+        marker.matching_credentials_sha256 = None;
+        marker.matching_credentials_observed_at = None;
+        return false;
+    }
+    if marker.matching_credentials_sha256 != credentials_sha256 {
+        marker.matching_credentials_sha256 = credentials_sha256;
+        marker.matching_credentials_observed_at = Some(std::time::Instant::now());
+        return false;
+    }
+    marker
+        .matching_credentials_observed_at
+        .is_some_and(|observed_at| {
+            observed_at.elapsed()
+                >= Duration::from_secs(
+                    AGENT_ACCOUNTS_PROFILE_LOGIN_CREDENTIAL_ONLY_CONFIRM_SECS,
+                )
+        })
+}
+
+fn agent_accounts_clear_profile_login_marker(profile_dir: &Path) {
+    if let Ok(mut markers) = AGENT_ACCOUNTS_PROFILE_LOGIN_MARKERS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+    {
+        markers.remove(profile_dir);
+    }
+}
+
+fn agent_accounts_prepare_captured_claude_profile_login(
+    profile_id: &str,
+    profile_dir: &Path,
+) -> Result<bool, String> {
+    let _registry_guard = AGENT_ACCOUNTS_REGISTRY_ACTIVITY_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let registry = agent_accounts_registry_read_checked()?;
+    let (_, profiles) = agent_accounts_kind_entry(&registry, "claude");
+    let Some(profile) = profiles.iter().find(|profile| {
+        profile.get("id").and_then(Value::as_str) == Some(profile_id)
+            && profile.get("source").and_then(Value::as_str) == Some("captured")
+    }) else {
+        return Ok(false);
+    };
+    let registered_email = profile
+        .get("email")
+        .and_then(Value::as_str)
+        .map(agent_accounts_email_key)
+        .unwrap_or_default();
+    let live_email = agent_accounts_profile_identity("claude", Some(profile_dir))
+        .get("email")
+        .and_then(Value::as_str)
+        .map(agent_accounts_email_key)
+        .unwrap_or_default();
+    if registered_email.is_empty() {
+        return Err("Captured Claude profile has no registered email.".to_string());
+    }
+    if live_email != registered_email {
+        let _ = agent_accounts_neutralize_captured_claude_identity(profile_dir);
+    }
+    if !agent_accounts_mark_profile_login(profile_dir) {
+        return Err("Unable to authorize captured Claude profile login.".to_string());
+    }
+    Ok(true)
+}
+
+fn agent_accounts_rebind_captured_claude_profile(
+    registry: &mut Value,
+    profile_id: &str,
+    observed_email: &str,
+) -> bool {
+    let observed_email = agent_accounts_email_key(observed_email);
+    if observed_email.is_empty() {
+        return false;
+    }
+    let Some(profiles) = registry
+        .get_mut("agents")
+        .and_then(|agents| agents.get_mut("claude"))
+        .and_then(|entry| entry.get_mut("profiles"))
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    let Some(index) = profiles.iter().position(|profile| {
+        profile.get("id").and_then(Value::as_str) == Some(profile_id)
+            && profile.get("source").and_then(Value::as_str) == Some("captured")
+    }) else {
+        return false;
+    };
+    let current_email = profiles[index]
+        .get("email")
+        .and_then(Value::as_str)
+        .map(agent_accounts_email_key)
+        .unwrap_or_default();
+    if current_email == observed_email {
+        return false;
+    }
+    let used_labels = profiles
+        .iter()
+        .enumerate()
+        .filter(|(candidate_index, _)| *candidate_index != index)
+        .filter_map(|(_, profile)| profile.get("label").and_then(Value::as_str))
+        .map(agent_accounts_label_key)
+        .filter(|label| !label.is_empty())
+        .collect::<HashSet<_>>();
+    let label = agent_accounts_unique_capture_label(&observed_email, &used_labels);
+    profiles[index]["email"] = json!(observed_email);
+    profiles[index]["label"] = json!(label);
+    if let Some(profile) = profiles[index].as_object_mut() {
+        profile.remove(AGENT_ACCOUNTS_AUTH_ISSUE_KEY);
+    }
+    // If another profile already owns this email, the existing canonical-id
+    // selection suppresses one of the duplicates (favoring the active one),
+    // so re-login never creates two visible/tokenomics accounts.
+    let _ = agent_accounts_dedupe_captured_profile_labels(registry, "claude");
+    true
+}
+
+/// Captured dirs are registry-owned snapshots. A live oauthAccount that does
+/// not match the stored email is unusable identity material: repair it from a
+/// matching default login or remove both identity and bearer credentials so
+/// scanners and live-limit probes cannot attribute another account. The one
+/// exception is a fresh mismatch under a profile-login marker: that is an
+/// explicit user re-login and rebinds the registry entry instead. Manual and
+/// pushed profiles retain ownership of their own dir identity.
+fn agent_accounts_reconcile_captured_claude_identities(
+    registry: &mut Value,
+    default_email: &str,
+) -> AgentAccountsClaudeReconcileResult {
+    agent_accounts_reconcile_captured_claude_identities_in_cycle(
+        registry,
+        default_email,
+        agent_accounts_next_claude_capture_cycle(),
+    )
+}
+
+fn agent_accounts_reconcile_captured_claude_identities_in_cycle(
+    registry: &mut Value,
+    default_email: &str,
+    capture_cycle: u64,
+) -> AgentAccountsClaudeReconcileResult {
+    let (_, profiles) = agent_accounts_kind_entry(registry, "claude");
+    let default_email = agent_accounts_email_key(default_email);
+    let mut result = AgentAccountsClaudeReconcileResult::default();
+    for profile in profiles {
+        if profile.get("source").and_then(Value::as_str) != Some("captured") {
+            continue;
+        }
+        let registered_email = profile
+            .get("email")
+            .and_then(Value::as_str)
+            .map(agent_accounts_email_key)
+            .unwrap_or_default();
+        let Some(profile_dir) = agent_accounts_profile_dir(&profile) else {
+            continue;
+        };
+        let profile_id = profile
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if registered_email.is_empty() {
+            continue;
+        }
+        let live_email = agent_accounts_profile_identity("claude", Some(&profile_dir))
+            .get("email")
+            .and_then(Value::as_str)
+            .map(agent_accounts_email_key)
+            .unwrap_or_default();
+        if live_email == registered_email {
+            continue;
+        }
+
+        if let Some(marker) = agent_accounts_profile_login_marker(&profile_dir) {
+            if live_email.is_empty()
+                || profile_id.is_empty()
+                || !agent_accounts_profile_login_marker_observed_change(
+                    &marker,
+                    &profile_dir,
+                    &live_email,
+                )
+            {
+                // Empty/unchanged identity is an in-progress explicit login,
+                // including the neutralized pre-launch baseline. Do not let
+                // default-home repair or background mirroring consume it.
+                continue;
+            }
+            // A Keychain-only login can update identity without replacing the
+            // old file snapshot. Drop unchanged credentials before rebinding
+            // so the new email cannot inherit old live limits.
+            let credentials_path = profile_dir.join(".credentials.json");
+            if credentials_path.is_file()
+                && agent_accounts_profile_credentials_sha256(&profile_dir)
+                    == marker.credentials_sha256
+            {
+                result.profile_files_changed |= fs::remove_file(&credentials_path).is_ok();
+            }
+            if agent_accounts_rebind_captured_claude_profile(
+                registry,
+                profile_id,
+                &live_email,
+            ) {
+                result.registry_changed = true;
+                result.rebound_profile_dirs.push(profile_dir);
+            }
+            continue;
+        }
+
+        if default_email == registered_email {
+            // The destination is already suspect. Remove it first, then force
+            // a source read so a newer foreign snapshot cannot defeat repair
+            // through the normal copy-if-newer optimization.
+            let credentials_path = profile_dir.join(".credentials.json");
+            agent_accounts_clear_claude_credential_observation(&credentials_path);
+            result.profile_files_changed |= match fs::remove_file(&credentials_path) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => false,
+            };
+            result.profile_files_changed |= agent_accounts_snapshot_refresh_in_cycle(
+                "claude",
+                &profile_dir,
+                &registered_email,
+                true,
+                capture_cycle,
+            );
+            let repaired_email = agent_accounts_profile_identity("claude", Some(&profile_dir))
+                .get("email")
+                .and_then(Value::as_str)
+                .map(agent_accounts_email_key)
+                .unwrap_or_default();
+            if repaired_email == registered_email {
+                continue;
+            }
+        }
+        result.profile_files_changed |=
+            agent_accounts_neutralize_captured_claude_identity(&profile_dir);
+    }
+    result
 }
 
 fn agent_account_push_allowed_files(kind: &str) -> &'static [&'static str] {
@@ -1706,7 +2699,9 @@ fn agent_account_push_required_files(kind: &str) -> &'static [&'static str] {
 
 fn agent_account_push_default_file_path(kind: &str, name: &str) -> Option<PathBuf> {
     match (kind, name) {
-        ("claude", ".claude.json") => env::var_os("HOME").map(PathBuf::from).map(|home| home.join(name)),
+        ("claude", ".claude.json") => env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(name)),
         _ => agent_accounts_default_home(kind).map(|home| home.join(name)),
     }
 }
@@ -1740,13 +2735,23 @@ fn agent_accounts_write_private_file(path: &Path, bytes: &[u8]) -> Result<(), St
             .map_err(|error| format!("Unable to open {}: {error}", path.display()))?;
         file.write_all(bytes)
             .map_err(|error| format!("Unable to write {}: {error}", path.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("Unable to sync {}: {error}", path.display()))?;
         let _ = fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600));
         return Ok(());
     }
     #[cfg(not(unix))]
     {
-        fs::write(path, bytes)
-            .map_err(|error| format!("Unable to write {}: {error}", path.display()))
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .map_err(|error| format!("Unable to open {}: {error}", path.display()))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("Unable to write {}: {error}", path.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("Unable to sync {}: {error}", path.display()))
     }
 }
 
@@ -1762,8 +2767,12 @@ fn agent_account_push_read_file(path: &Path, required: bool) -> Result<Option<St
         }
         return Ok(None);
     }
-    let metadata = fs::metadata(path)
-        .map_err(|error| format!("Unable to inspect credential file {}: {error}", path.display()))?;
+    let metadata = fs::metadata(path).map_err(|error| {
+        format!(
+            "Unable to inspect credential file {}: {error}",
+            path.display()
+        )
+    })?;
     if metadata.len() > AGENT_ACCOUNT_PUSH_MAX_FILE_BYTES {
         return Err(format!(
             "Credential file is too large to push safely: {}",
@@ -1781,8 +2790,12 @@ fn agent_account_push_read_claude_state_subset_file(path: &Path) -> Result<Optio
     if !path.is_file() {
         return Err("Required credential file is missing: .claude.json".to_string());
     }
-    let metadata = fs::metadata(path)
-        .map_err(|error| format!("Unable to inspect credential file {}: {error}", path.display()))?;
+    let metadata = fs::metadata(path).map_err(|error| {
+        format!(
+            "Unable to inspect credential file {}: {error}",
+            path.display()
+        )
+    })?;
     if metadata.len() > AGENT_ACCOUNT_PUSH_MAX_FILE_BYTES {
         return Err("Credential file is too large to push safely: .claude.json".to_string());
     }
@@ -1809,16 +2822,25 @@ fn agent_account_push_claude_default_state_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "Unable to locate Claude global state for local wipe.".to_string())
 }
 
-fn agent_account_push_splice_claude_default_state(expected_email: &str) -> Result<Option<Vec<u8>>, String> {
+fn agent_account_push_splice_claude_default_state(
+    expected_email: &str,
+) -> Result<Option<Vec<u8>>, String> {
     let path = agent_account_push_claude_default_state_path()?;
-    if !path.exists() {
-        return Ok(None);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err("Claude global state is a symlink; wipe cancelled.".to_string());
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err("Claude global state is not a regular file; wipe cancelled.".to_string());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!("Unable to inspect Claude global state: {error}"));
+        }
     }
-    if !path.is_file() {
-        return Err("Claude global state is not a regular file; wipe cancelled.".to_string());
-    }
-    let original = fs::read(&path)
-        .map_err(|error| format!("Unable to read Claude global state: {error}"))?;
+    let original =
+        fs::read(&path).map_err(|error| format!("Unable to read Claude global state: {error}"))?;
     let mut state = serde_json::from_slice::<Value>(&original)
         .map_err(|_| "Claude global state is not valid JSON; wipe cancelled.".to_string())?;
     let state_email = state
@@ -1838,13 +2860,13 @@ fn agent_account_push_splice_claude_default_state(expected_email: &str) -> Resul
     object.remove("oauthAccount");
     let updated = serde_json::to_vec_pretty(&state)
         .map_err(|error| format!("Unable to encode Claude global state: {error}"))?;
-    agent_accounts_write_private_file(&path, &updated)?;
+    agent_accounts_write_private_file_atomic(&path, &updated, "Claude global state")?;
     Ok(Some(original))
 }
 
 fn agent_account_push_restore_claude_default_state(original: &[u8]) {
     if let Ok(path) = agent_account_push_claude_default_state_path() {
-        let _ = agent_accounts_write_private_file(&path, original);
+        let _ = agent_accounts_write_private_file_atomic(&path, original, "Claude global state");
     }
 }
 
@@ -1868,7 +2890,9 @@ fn agent_account_push_profile_bundle(
         let dir = agent_accounts_profile_dir(&profile)
             .ok_or_else(|| format!("{kind} account profile has no directory: {profile_id}"))?;
         if !dir.is_dir() {
-            return Err(format!("{kind} account profile directory is missing: {profile_id}"));
+            return Err(format!(
+                "{kind} account profile directory is missing: {profile_id}"
+            ));
         }
         (Some(profile), Some(dir))
     };
@@ -1881,7 +2905,9 @@ fn agent_account_push_profile_bundle(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if !auth_ready {
-        return Err(format!("{kind} account profile is not signed in with file credentials."));
+        return Err(format!(
+            "{kind} account profile is not signed in with file credentials."
+        ));
     }
     let email = identity
         .get("email")
@@ -1911,8 +2937,9 @@ fn agent_account_push_profile_bundle(
     }
     let mut files = Vec::new();
     for name in agent_account_push_allowed_files(kind) {
-        let path = agent_account_push_source_file_path(kind, profile_id, profile_dir.as_deref(), name)
-            .ok_or_else(|| format!("Unable to locate {kind} credential file: {name}"))?;
+        let path =
+            agent_account_push_source_file_path(kind, profile_id, profile_dir.as_deref(), name)
+                .ok_or_else(|| format!("Unable to locate {kind} credential file: {name}"))?;
         let required = required_files.iter().any(|required| required == name);
         let data_b64 = if kind == "claude" && *name == ".claude.json" {
             agent_account_push_read_claude_state_subset_file(&path)?
@@ -1928,14 +2955,17 @@ fn agent_account_push_profile_bundle(
     }
     for required in required_files {
         if !files.iter().any(|file| file.name == *required) {
-            return Err(format!("Required {kind} credential file is missing: {required}"));
+            return Err(format!(
+                "Required {kind} credential file is missing: {required}"
+            ));
         }
     }
     let label = profile
         .as_ref()
         .map(agent_accounts_profile_display_label)
         .unwrap_or_else(|| {
-            email.split('@')
+            email
+                .split('@')
                 .next()
                 .filter(|value| !value.is_empty())
                 .unwrap_or("Account")
@@ -1951,11 +2981,15 @@ fn agent_account_push_profile_bundle(
         .to_string();
     let issued_at_ms = todo_dispatch_now_ms();
     Ok(AgentAccountPushBlob {
-        version: 1,
+        version: 2,
         contract: AGENT_ACCOUNT_PUSH_CONTRACT.to_string(),
         push_id: push_id.trim().to_string(),
         target_device_id: target_device_id.trim().to_string(),
         sender_device_id: sender_device_id.trim().to_string(),
+        sender_push_public_key_b64: String::new(),
+        sender_key_fingerprint_sha256: String::new(),
+        ack_nonce_b64: String::new(),
+        sender_auth_tag_b64: String::new(),
         issued_at_ms,
         expires_at_ms: issued_at_ms.saturating_add(AGENT_ACCOUNT_PUSH_BLOB_TTL_MS),
         agent_kind: kind.to_string(),
@@ -1965,6 +2999,41 @@ fn agent_account_push_profile_bundle(
         alias,
         files,
     })
+}
+
+fn agent_account_push_blob_credentials_digest(
+    blob: &AgentAccountPushBlob,
+) -> Result<String, String> {
+    let credential_name = agent_accounts_auth_file_name(&blob.agent_kind);
+    let file = blob
+        .files
+        .iter()
+        .find(|file| file.name == credential_name)
+        .ok_or_else(|| "Pushed account is missing its primary credential file.".to_string())?;
+    let bytes = general_purpose::STANDARD
+        .decode(&file.data_b64)
+        .map_err(|_| "Pushed account credential file is not valid base64.".to_string())?;
+    let mut material = credential_name.as_bytes().to_vec();
+    material.push(0);
+    material.extend_from_slice(&bytes);
+    Ok(format!("{:x}", Sha256::digest(material)))
+}
+
+fn agent_account_push_current_credentials_digest(
+    kind: &str,
+    profile_id: &str,
+    profile_dir: Option<&Path>,
+) -> Result<String, String> {
+    let credential_name = agent_accounts_auth_file_name(kind);
+    let path = agent_account_push_source_file_path(kind, profile_id, profile_dir, credential_name)
+        .ok_or_else(|| "Unable to resolve current credential file for local wipe.".to_string())?;
+    let bytes = fs::read(&path).map_err(|error| {
+        format!("Unable to re-read current credentials before local wipe: {error}")
+    })?;
+    let mut material = credential_name.as_bytes().to_vec();
+    material.push(0);
+    material.extend_from_slice(&bytes);
+    Ok(format!("{:x}", Sha256::digest(material)))
 }
 
 fn agent_account_push_normalized_device_id(value: &str) -> String {
@@ -2041,9 +3110,9 @@ fn agent_account_push_find_device_candidate(
             }
             None
         }
-        Value::Array(items) => items
-            .iter()
-            .find_map(|item| agent_account_push_find_device_candidate(item, target_device_id, depth + 1)),
+        Value::Array(items) => items.iter().find_map(|item| {
+            agent_account_push_find_device_candidate(item, target_device_id, depth + 1)
+        }),
         _ => None,
     }
 }
@@ -2126,7 +3195,10 @@ fn agent_account_push_target_key(device: &Value) -> Result<(String, String), Str
     .iter()
     .any(|path| cloud_mcp_payload_bool(device, path, false));
     if push_public_key.is_empty() || !push_capable {
-        return Err("Target device is not push-capable; it has not published an agent account push key.".to_string());
+        return Err(
+            "Target device is not push-capable; it has not published an agent account push key."
+                .to_string(),
+        );
     }
     let algorithm = agent_account_push_first_text(
         device,
@@ -2141,7 +3213,9 @@ fn agent_account_push_target_key(device: &Value) -> Result<(String, String), Str
     )
     .unwrap_or_default();
     if algorithm != AGENT_ACCOUNT_PUSH_SEALED_ALGORITHM {
-        return Err("Target device uses an unsupported agent account push key algorithm.".to_string());
+        return Err(
+            "Target device uses an unsupported agent account push key algorithm.".to_string(),
+        );
     }
     Ok((push_public_key, algorithm))
 }
@@ -2155,7 +3229,37 @@ fn agent_account_push_trusted_keys_path() -> Result<PathBuf, String> {
     Ok(state_dir.join(AGENT_ACCOUNT_PUSH_TRUSTED_KEYS_FILE))
 }
 
-fn agent_account_push_read_trusted_keys() -> Result<HashMap<String, String>, String> {
+fn agent_account_push_decode_public_key(
+    value: &str,
+) -> Result<[u8; AGENT_ACCOUNT_PUSH_KEY_BYTES], String> {
+    let decoded = general_purpose::STANDARD
+        .decode(value.trim())
+        .map_err(|_| "Agent account push public key is not valid base64.".to_string())?;
+    decoded
+        .try_into()
+        .map_err(|_| "Agent account push public key has the wrong length.".to_string())
+}
+
+fn agent_account_push_key_fingerprint(public_key_b64: &str) -> Result<String, String> {
+    let public_key = agent_account_push_decode_public_key(public_key_b64)?;
+    Ok(format!("{:x}", Sha256::digest(public_key)))
+}
+
+fn agent_account_push_normalized_fingerprint(value: &str) -> String {
+    let value = value.trim();
+    let value = value
+        .strip_prefix("sha256:")
+        .or_else(|| value.strip_prefix("SHA256:"))
+        .unwrap_or(value);
+    value
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn agent_account_push_read_trusted_keys_unlocked(
+) -> Result<HashMap<String, AgentAccountPushTrustedKey>, String> {
     let path = agent_account_push_trusted_keys_path()?;
     let raw = match fs::read_to_string(&path) {
         Ok(raw) => raw,
@@ -2166,49 +3270,289 @@ fn agent_account_push_read_trusted_keys() -> Result<HashMap<String, String>, Str
         .map_err(|_| "Trusted device push key file is not valid JSON.".to_string())?;
     let mut keys = HashMap::new();
     if let Some(object) = value.as_object() {
-        for (device_id, key) in object {
+        for (device_id, stored) in object {
             let device_id = agent_account_push_normalized_device_id(device_id);
-            let key = key.as_str().unwrap_or_default().trim().to_string();
-            if !device_id.is_empty() && !key.is_empty() {
-                keys.insert(device_id, key);
+            if device_id.is_empty() {
+                continue;
             }
+            let key = if let Some(public_key_b64) = stored.as_str() {
+                // Legacy entries were silently TOFU-pinned. Preserve the key but
+                // deliberately mark it unconfirmed so it cannot authenticate a
+                // credential transfer until the user compares its fingerprint.
+                AgentAccountPushTrustedKey {
+                    public_key_b64: public_key_b64.trim().to_string(),
+                    fingerprint_sha256: agent_account_push_key_fingerprint(public_key_b64)?,
+                    confirmed_at_ms: 0,
+                }
+            } else {
+                serde_json::from_value::<AgentAccountPushTrustedKey>(stored.clone()).map_err(
+                    |_| "Trusted device push key file contains an invalid entry.".to_string(),
+                )?
+            };
+            let actual_fingerprint = agent_account_push_key_fingerprint(&key.public_key_b64)?;
+            if key.fingerprint_sha256 != actual_fingerprint {
+                return Err(
+                    "Trusted device push key fingerprint does not match its key.".to_string(),
+                );
+            }
+            keys.insert(device_id, key);
         }
     }
     Ok(keys)
 }
 
-fn agent_account_push_write_trusted_keys(keys: &HashMap<String, String>) -> Result<(), String> {
+fn agent_account_push_write_trusted_keys_unlocked(
+    keys: &HashMap<String, AgentAccountPushTrustedKey>,
+) -> Result<(), String> {
     let path = agent_account_push_trusted_keys_path()?;
     let mut object = serde_json::Map::new();
     for (device_id, key) in keys {
-        object.insert(device_id.clone(), json!(key));
+        object.insert(
+            device_id.clone(),
+            serde_json::to_value(key)
+                .map_err(|error| format!("Unable to encode trusted device push key: {error}"))?,
+        );
     }
     let bytes = serde_json::to_vec_pretty(&Value::Object(object))
         .map_err(|error| format!("Unable to encode trusted device push keys: {error}"))?;
-    agent_accounts_write_private_file(&path, &bytes)
+    agent_accounts_write_private_file_atomic(&path, &bytes, "trusted device push keys")
 }
 
+/// There is currently no cloud/device-attestation chain for push keys. The
+/// only safe bootstrap available in this file is an exact, full fingerprint
+/// supplied after the user compares it with the value displayed locally on
+/// the other device. The caller must not derive `user_confirmed_fingerprint`
+/// from the same cloud snapshot. A future cloud protocol should replace this
+/// manual trust bootstrap with device-key-signed push-key attestation.
 fn agent_account_push_verify_or_pin_target_key(
     target_device_id: &str,
     push_public_key: &str,
+    user_confirmed_fingerprint: Option<&str>,
 ) -> Result<(), String> {
     let target_device_id = agent_account_push_normalized_device_id(target_device_id);
-    let push_public_key = push_public_key.trim().to_string();
-    if target_device_id.is_empty() || push_public_key.is_empty() {
+    if target_device_id.is_empty() || push_public_key.trim().is_empty() {
         return Err("Target device push key is missing.".to_string());
     }
-    let mut keys = agent_account_push_read_trusted_keys()?;
-    if let Some(pinned) = keys.get(&target_device_id) {
-        if pinned != &push_public_key {
+    let key_bytes = agent_account_push_decode_public_key(push_public_key)?;
+    let push_public_key = general_purpose::STANDARD.encode(key_bytes);
+    let _ = agent_account_push_shared_secret(&push_public_key)?;
+    let fingerprint = agent_account_push_key_fingerprint(&push_public_key)?;
+    let _guard = AGENT_ACCOUNT_PUSH_TRUSTED_KEYS_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .map_err(|_| "Trusted device push key lock is unavailable.".to_string())?;
+    let mut keys = agent_account_push_read_trusted_keys_unlocked()?;
+    if let Some(pinned) = keys.get_mut(&target_device_id) {
+        if pinned.public_key_b64 != push_public_key && pinned.confirmed_at_ms != 0 {
             return Err(
                 "This device's security key changed; push cancelled. Re-verify the device."
                     .to_string(),
             );
         }
-        return Ok(());
+        if pinned.public_key_b64 == push_public_key && pinned.confirmed_at_ms != 0 {
+            return Ok(());
+        }
+        let confirmed = user_confirmed_fingerprint
+            .map(agent_account_push_normalized_fingerprint)
+            .filter(|value| value.len() == 64 && value == &fingerprint)
+            .is_some();
+        if !confirmed {
+            return Err(format!(
+                "Credential push requires an out-of-band fingerprint match. Compare the target device fingerprint outside the cloud channel, then confirm the full SHA-256 value: {fingerprint}"
+            ));
+        }
+        *pinned = AgentAccountPushTrustedKey {
+            public_key_b64: push_public_key,
+            fingerprint_sha256: fingerprint,
+            confirmed_at_ms: todo_dispatch_now_ms(),
+        };
+        return agent_account_push_write_trusted_keys_unlocked(&keys);
     }
-    keys.insert(target_device_id, push_public_key);
-    agent_account_push_write_trusted_keys(&keys)
+    let confirmed = user_confirmed_fingerprint
+        .map(agent_account_push_normalized_fingerprint)
+        .filter(|value| value.len() == 64 && value == &fingerprint)
+        .is_some();
+    if !confirmed {
+        // The displayed value is only a convenience. It is cloud-derived and
+        // must not itself be treated as attestation; the user must compare it
+        // with the fingerprint shown locally on the recipient device.
+        return Err(format!(
+            "Credential push requires an out-of-band fingerprint match. Compare the target device fingerprint outside the cloud channel, then confirm the full SHA-256 value: {fingerprint}"
+        ));
+    }
+    keys.insert(
+        target_device_id,
+        AgentAccountPushTrustedKey {
+            public_key_b64: push_public_key,
+            fingerprint_sha256: fingerprint,
+            confirmed_at_ms: todo_dispatch_now_ms(),
+        },
+    );
+    agent_account_push_write_trusted_keys_unlocked(&keys)
+}
+
+fn agent_account_push_require_confirmed_peer_key(
+    device_id: &str,
+    public_key_b64: &str,
+) -> Result<(), String> {
+    let device_id = agent_account_push_normalized_device_id(device_id);
+    let public_key =
+        general_purpose::STANDARD.encode(agent_account_push_decode_public_key(public_key_b64)?);
+    let _guard = AGENT_ACCOUNT_PUSH_TRUSTED_KEYS_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .map_err(|_| "Trusted device push key lock is unavailable.".to_string())?;
+    let keys = agent_account_push_read_trusted_keys_unlocked()?;
+    let trusted = keys.get(&device_id).ok_or_else(|| {
+        "Sender device key is not user-confirmed; pushed credentials were rejected.".to_string()
+    })?;
+    if trusted.confirmed_at_ms == 0 || trusted.public_key_b64 != public_key {
+        return Err(
+            "Sender device key is not user-confirmed or changed; pushed credentials were rejected."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn agent_account_push_shared_secret(peer_public_key_b64: &str) -> Result<[u8; 32], String> {
+    let peer_public_key = agent_account_push_decode_public_key(peer_public_key_b64)?;
+    let local_private_key = agent_account_push_local_private_key()?.to_bytes();
+    let shared = x25519_dalek::x25519(local_private_key, peer_public_key);
+    if shared.iter().all(|byte| *byte == 0) {
+        return Err("Agent account push peer key produced an invalid shared secret.".to_string());
+    }
+    Ok(shared)
+}
+
+fn agent_account_push_hmac_b64(
+    peer_public_key_b64: &str,
+    domain: &[u8],
+    payload: &[u8],
+) -> Result<String, String> {
+    use hmac::Mac as _;
+    let shared = agent_account_push_shared_secret(peer_public_key_b64)?;
+    let mut mac = hmac::Hmac::<Sha256>::new_from_slice(&shared)
+        .map_err(|_| "Unable to initialize agent account push authenticator.".to_string())?;
+    mac.update(domain);
+    mac.update(payload);
+    Ok(general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
+}
+
+fn agent_account_push_verify_hmac_b64(
+    peer_public_key_b64: &str,
+    domain: &[u8],
+    payload: &[u8],
+    tag_b64: &str,
+) -> Result<(), String> {
+    use hmac::Mac as _;
+    let tag = general_purpose::STANDARD
+        .decode(tag_b64.trim())
+        .map_err(|_| "Agent account push authenticator is not valid base64.".to_string())?;
+    let shared = agent_account_push_shared_secret(peer_public_key_b64)?;
+    let mut mac = hmac::Hmac::<Sha256>::new_from_slice(&shared)
+        .map_err(|_| "Unable to initialize agent account push authenticator.".to_string())?;
+    mac.update(domain);
+    mac.update(payload);
+    mac.verify_slice(&tag)
+        .map_err(|_| "Agent account push authentication failed.".to_string())
+}
+
+fn agent_account_push_sender_auth_payload(blob: &AgentAccountPushBlob) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&json!({
+        "version": blob.version,
+        "contract": blob.contract,
+        "push_id": blob.push_id,
+        "target_device_id": blob.target_device_id,
+        "sender_device_id": blob.sender_device_id,
+        "sender_push_public_key_b64": blob.sender_push_public_key_b64,
+        "sender_key_fingerprint_sha256": blob.sender_key_fingerprint_sha256,
+        "ack_nonce_b64": blob.ack_nonce_b64,
+        "issued_at_ms": blob.issued_at_ms,
+        "expires_at_ms": blob.expires_at_ms,
+        "agent_kind": blob.agent_kind,
+        "source_profile_id": blob.source_profile_id,
+        "identity_email": blob.identity_email,
+        "label": blob.label,
+        "alias": blob.alias,
+        "files": blob.files.iter().map(|file| json!({
+            "name": file.name,
+            "data_b64": file.data_b64,
+        })).collect::<Vec<_>>(),
+    }))
+    .map_err(|error| format!("Unable to encode agent account push authenticator input: {error}"))
+}
+
+fn agent_account_push_authenticate_outbound_blob(
+    blob: &mut AgentAccountPushBlob,
+    target_public_key_b64: &str,
+) -> Result<(), String> {
+    let local_key = agent_account_push_read_or_create_key_file()?;
+    blob.sender_push_public_key_b64 = local_key.public_key_b64;
+    blob.sender_key_fingerprint_sha256 =
+        agent_account_push_key_fingerprint(&blob.sender_push_public_key_b64)?;
+    blob.ack_nonce_b64 = general_purpose::STANDARD.encode(agent_account_push_random_32()?);
+    let payload = agent_account_push_sender_auth_payload(blob)?;
+    blob.sender_auth_tag_b64 = agent_account_push_hmac_b64(
+        target_public_key_b64,
+        b"diffforge.agent_account_push.sender.v2\0",
+        &payload,
+    )?;
+    Ok(())
+}
+
+fn agent_account_push_verify_sender_auth(blob: &AgentAccountPushBlob) -> Result<(), String> {
+    agent_account_push_require_confirmed_peer_key(
+        &blob.sender_device_id,
+        &blob.sender_push_public_key_b64,
+    )?;
+    let fingerprint = agent_account_push_key_fingerprint(&blob.sender_push_public_key_b64)?;
+    if blob.sender_key_fingerprint_sha256 != fingerprint {
+        return Err("Sender device key fingerprint does not match the signed key.".to_string());
+    }
+    let nonce = general_purpose::STANDARD
+        .decode(blob.ack_nonce_b64.trim())
+        .map_err(|_| "Agent account push ACK nonce is not valid base64.".to_string())?;
+    if nonce.len() != AGENT_ACCOUNT_PUSH_KEY_BYTES {
+        return Err("Agent account push ACK nonce has the wrong length.".to_string());
+    }
+    let payload = agent_account_push_sender_auth_payload(blob)?;
+    agent_account_push_verify_hmac_b64(
+        &blob.sender_push_public_key_b64,
+        b"diffforge.agent_account_push.sender.v2\0",
+        &payload,
+        &blob.sender_auth_tag_b64,
+    )
+}
+
+fn agent_account_push_ack_payload(
+    push_id: &str,
+    ack_nonce_b64: &str,
+    sender_device_id: &str,
+    target_device_id: &str,
+) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&json!({
+        "push_id": push_id,
+        "ack_nonce_b64": ack_nonce_b64,
+        "sender_device_id": agent_account_push_normalized_device_id(sender_device_id),
+        "target_device_id": agent_account_push_normalized_device_id(target_device_id),
+        "state": "durably_applied",
+    }))
+    .map_err(|error| format!("Unable to encode agent account push ACK proof input: {error}"))
+}
+
+fn agent_account_push_completion_proof(blob: &AgentAccountPushBlob) -> Result<String, String> {
+    let payload = agent_account_push_ack_payload(
+        &blob.push_id,
+        &blob.ack_nonce_b64,
+        &blob.sender_device_id,
+        &blob.target_device_id,
+    )?;
+    agent_account_push_hmac_b64(
+        &blob.sender_push_public_key_b64,
+        b"diffforge.agent_account_push.ack.v2\0",
+        &payload,
+    )
 }
 
 async fn agent_account_push_target_device(
@@ -2219,7 +3563,9 @@ async fn agent_account_push_target_device(
         let runtime = state.inner.lock().await;
         runtime.account_device_live_state_snapshot.clone()
     }
-    .ok_or_else(|| "Device live-state is not available yet; wait for cloud sync and try again.".to_string())?;
+    .ok_or_else(|| {
+        "Device live-state is not available yet; wait for cloud sync and try again.".to_string()
+    })?;
     let target = agent_account_push_find_device_candidate(&snapshot, target_device_id, 0)
         .ok_or_else(|| format!("Unknown target device: {target_device_id}"))?;
     if !agent_account_push_device_online(&target) {
@@ -2230,19 +3576,21 @@ async fn agent_account_push_target_device(
     Ok(target)
 }
 
-fn agent_account_push_profile_id(kind: &str, email: &str) -> String {
-    let email = agent_accounts_email_key(email);
+fn agent_account_push_profile_id(kind: &str, sender_device_id: &str, push_id: &str) -> String {
     format!(
-        "cap-{}-{}",
-        agent_accounts_email_slug(&email),
-        cloud_mcp_short_hash(&format!("{kind}:{email}"))
+        "push-{kind}-{}",
+        cloud_mcp_short_hash(&format!(
+            "{}:{}",
+            agent_account_push_normalized_device_id(sender_device_id),
+            push_id.trim()
+        ))
     )
 }
 
 fn agent_account_push_decode_blob(plaintext: &[u8]) -> Result<AgentAccountPushBlob, String> {
     let blob: AgentAccountPushBlob = serde_json::from_slice(plaintext)
         .map_err(|_| "Agent account push payload is not valid JSON.".to_string())?;
-    if blob.version != 1 || blob.contract != AGENT_ACCOUNT_PUSH_CONTRACT {
+    if blob.version != 2 || blob.contract != AGENT_ACCOUNT_PUSH_CONTRACT {
         return Err("Unsupported agent account push payload.".to_string());
     }
     if blob.push_id.trim().is_empty() {
@@ -2253,6 +3601,13 @@ fn agent_account_push_decode_blob(plaintext: &[u8]) -> Result<AgentAccountPushBl
     }
     if blob.sender_device_id.trim().is_empty() {
         return Err("Pushed agent account is missing sender device binding.".to_string());
+    }
+    if blob.sender_push_public_key_b64.trim().is_empty()
+        || blob.sender_key_fingerprint_sha256.trim().is_empty()
+        || blob.ack_nonce_b64.trim().is_empty()
+        || blob.sender_auth_tag_b64.trim().is_empty()
+    {
+        return Err("Pushed agent account is missing authenticated sender metadata.".to_string());
     }
     if blob.issued_at_ms == 0 || blob.expires_at_ms <= blob.issued_at_ms {
         return Err("Pushed agent account has an invalid expiry.".to_string());
@@ -2269,7 +3624,11 @@ fn agent_account_push_decode_blob(plaintext: &[u8]) -> Result<AgentAccountPushBl
     let required = agent_account_push_required_files(kind);
     let mut names = HashSet::new();
     for file in &blob.files {
-        if file.name.contains('/') || file.name.contains('\\') || file.name == "." || file.name == ".." {
+        if file.name.contains('/')
+            || file.name.contains('\\')
+            || file.name == "."
+            || file.name == ".."
+        {
             return Err("Pushed agent account contains an invalid file name.".to_string());
         }
         if !allowed.iter().any(|allowed| *allowed == file.name) {
@@ -2311,96 +3670,110 @@ fn agent_account_push_verify_received_blob(
     {
         return Err("Agent account push was sealed for a different device.".to_string());
     }
-    if now_ms > blob.expires_at_ms {
+    if blob.issued_at_ms > now_ms {
+        return Err("Agent account push payload was issued in the future.".to_string());
+    }
+    if now_ms >= blob.expires_at_ms {
         return Err("Agent account push payload expired.".to_string());
     }
+    if blob.expires_at_ms.saturating_sub(blob.issued_at_ms) > AGENT_ACCOUNT_PUSH_BLOB_TTL_MS {
+        return Err("Agent account push payload expiry exceeds the allowed lifetime.".to_string());
+    }
+    agent_account_push_verify_sender_auth(&blob)?;
     Ok(blob)
 }
 
 fn agent_account_push_prune_applied_locked(applied: &mut HashMap<String, u64>, now_ms: u64) {
-    applied.retain(|_, expires_at_ms| *expires_at_ms >= now_ms);
-    if applied.len() > AGENT_ACCOUNT_PUSH_APPLIED_MAX {
-        let remove_count = applied.len() - AGENT_ACCOUNT_PUSH_APPLIED_MAX;
-        let stale_keys = applied
-            .keys()
-            .take(remove_count)
-            .cloned()
-            .collect::<Vec<_>>();
-        for key in stale_keys {
-            applied.remove(&key);
+    applied.retain(|_, expires_at_ms| *expires_at_ms > now_ms);
+}
+
+fn agent_account_push_applied_path() -> Result<PathBuf, String> {
+    let state_dir = cloud_mcp_native_data_root()
+        .ok_or_else(|| "Unable to resolve Diff Forge device data directory.".to_string())?
+        .join(DEVICE_APP_STATE_DIR);
+    fs::create_dir_all(&state_dir).map_err(|error| {
+        format!("Unable to create agent account push replay directory: {error}")
+    })?;
+    Ok(state_dir.join(AGENT_ACCOUNT_PUSH_APPLIED_FILE))
+}
+
+fn agent_account_push_read_applied_unlocked() -> Result<HashMap<String, u64>, String> {
+    let path = agent_account_push_applied_path()?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => {
+            return Err(format!(
+                "Unable to read agent account push replay guard: {error}"
+            ))
         }
-    }
+    };
+    serde_json::from_str::<HashMap<String, u64>>(&raw)
+        .map_err(|_| "Agent account push replay guard is not valid JSON.".to_string())
+}
+
+fn agent_account_push_write_applied_unlocked(applied: &HashMap<String, u64>) -> Result<(), String> {
+    let path = agent_account_push_applied_path()?;
+    let bytes = serde_json::to_vec_pretty(applied)
+        .map_err(|error| format!("Unable to encode agent account push replay guard: {error}"))?;
+    agent_accounts_write_private_file_atomic(&path, &bytes, "agent account push replay guard")
 }
 
 fn agent_account_push_reject_if_applied(push_id: &str, now_ms: u64) -> Result<(), String> {
-    let mut applied = agent_account_push_applied()
+    let push_id = push_id.trim();
+    if push_id.is_empty() {
+        return Err("Agent account push replay id is missing.".to_string());
+    }
+    let _guard = AGENT_ACCOUNT_PUSH_APPLIED_FILE_LOCK
+        .get_or_init(|| StdMutex::new(()))
         .lock()
         .map_err(|_| "Agent account push replay guard is unavailable.".to_string())?;
+    let mut applied = agent_account_push_read_applied_unlocked()?;
     agent_account_push_prune_applied_locked(&mut applied, now_ms);
     if applied.contains_key(push_id) {
         return Err("Agent account push was already applied on this device.".to_string());
     }
-    Ok(())
+    if applied.len() >= AGENT_ACCOUNT_PUSH_APPLIED_MAX {
+        return Err(
+            "Agent account push replay guard is at capacity; wait for existing pushes to expire."
+                .to_string(),
+        );
+    }
+    // Claim durably before materialization. A failed apply remains blocked for
+    // the short payload lifetime, which is safer than a concurrent/restarted
+    // process applying the same credential bundle twice.
+    applied.insert(
+        push_id.to_string(),
+        now_ms.saturating_add(AGENT_ACCOUNT_PUSH_BLOB_TTL_MS),
+    );
+    agent_account_push_write_applied_unlocked(&applied)
 }
 
-fn agent_account_push_mark_applied(push_id: &str, expires_at_ms: u64, now_ms: u64) -> Result<(), String> {
-    let mut applied = agent_account_push_applied()
+fn agent_account_push_mark_applied(
+    push_id: &str,
+    expires_at_ms: u64,
+    now_ms: u64,
+) -> Result<(), String> {
+    let _guard = AGENT_ACCOUNT_PUSH_APPLIED_FILE_LOCK
+        .get_or_init(|| StdMutex::new(()))
         .lock()
         .map_err(|_| "Agent account push replay guard is unavailable.".to_string())?;
+    let mut applied = agent_account_push_read_applied_unlocked()?;
     agent_account_push_prune_applied_locked(&mut applied, now_ms);
     applied.insert(push_id.trim().to_string(), expires_at_ms.max(now_ms));
-    Ok(())
-}
-
-fn agent_accounts_replace_profile_dir_with_backup(
-    temp_dir: &Path,
-    final_dir: &Path,
-) -> Result<(), String> {
-    let final_name = final_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("profile");
-    let backup_dir = final_dir.with_file_name(format!(
-        ".push-backup-{}-{}",
-        final_name,
-        uuid::Uuid::new_v4()
-    ));
-    let had_existing = final_dir.exists();
-    if had_existing {
-        fs::rename(final_dir, &backup_dir)
-            .map_err(|error| format!("Unable to stage existing pushed profile backup: {error}"))?;
-    }
-    if let Err(error) = fs::rename(temp_dir, final_dir) {
-        if had_existing {
-            if let Err(restore_error) = fs::rename(&backup_dir, final_dir) {
-                return Err(format!(
-                    "Unable to install pushed account profile: {error}; restoring the previous profile also failed: {restore_error}"
-                ));
-            }
-        }
-        return Err(format!("Unable to install pushed account profile: {error}"));
-    }
-    if had_existing {
-        if let Err(error) = fs::remove_dir_all(&backup_dir) {
-            let _ = fs::remove_dir_all(final_dir);
-            if let Err(restore_error) = fs::rename(&backup_dir, final_dir) {
-                return Err(format!(
-                    "Unable to remove previous pushed profile backup: {error}; restoring the previous profile also failed: {restore_error}"
-                ));
-            }
-            return Err(format!(
-                "Unable to remove previous pushed profile backup: {error}"
-            ));
-        }
-    }
-    Ok(())
+    agent_account_push_write_applied_unlocked(&applied)
 }
 
 fn agent_accounts_materialize_pushed_account(blob: AgentAccountPushBlob) -> Result<Value, String> {
     let kind = agent_accounts_supported_kind(&blob.agent_kind)
         .ok_or_else(|| format!("Unsupported pushed agent kind: {}", blob.agent_kind))?;
+    agent_account_push_verify_sender_auth(&blob)?;
     let email = agent_accounts_email_key(&blob.identity_email);
-    let profile_id = agent_account_push_profile_id(kind, &email);
+    // Claimed email/identity fields in Claude state and Codex JWT payloads are
+    // not provider-verified offline. They are display/consistency metadata
+    // only. A recipient-local id names the trusted sender + one signed push,
+    // so crafted identity text cannot collide with or overwrite any profile.
+    let profile_id = agent_account_push_profile_id(kind, &blob.sender_device_id, &blob.push_id);
     let root = cloud_mcp_local_data_file_path(AGENT_ACCOUNTS_PROFILE_DIR)
         .ok_or_else(|| "Unable to resolve agent profile storage root.".to_string())?;
     let kind_root = root.join(kind);
@@ -2408,6 +3781,27 @@ fn agent_accounts_materialize_pushed_account(blob: AgentAccountPushBlob) -> Resu
         .map_err(|error| format!("Unable to create pushed account profile root: {error}"))?;
     let temp_dir = kind_root.join(format!(".push-{}-{}", profile_id, uuid::Uuid::new_v4()));
     let final_dir = kind_root.join(&profile_id);
+    if final_dir.exists() {
+        return Err(
+            "A local profile already exists for this push; refusing to overwrite it.".to_string(),
+        );
+    }
+    let mut registry = agent_accounts_registry_read_checked()?;
+    let original_registry = registry.clone();
+    agent_accounts_ensure_kind_entry(&mut registry, kind);
+    if registry["agents"][kind]["profiles"]
+        .as_array()
+        .is_some_and(|profiles| {
+            profiles
+                .iter()
+                .any(|entry| entry.get("id").and_then(Value::as_str) == Some(profile_id.as_str()))
+        })
+    {
+        return Err(
+            "A registry profile already exists for this push; refusing to overwrite it."
+                .to_string(),
+        );
+    }
     fs::create_dir_all(&temp_dir)
         .map_err(|error| format!("Unable to create pushed account profile directory: {error}"))?;
     let write_result = (|| -> Result<(), String> {
@@ -2415,7 +3809,12 @@ fn agent_accounts_materialize_pushed_account(blob: AgentAccountPushBlob) -> Resu
             let bytes = general_purpose::STANDARD
                 .decode(&file.data_b64)
                 .map_err(|_| "Pushed agent account file is not valid base64.".to_string())?;
-            agent_accounts_write_private_file(&temp_dir.join(&file.name), &bytes)?;
+            agent_accounts_write_private_file(&temp_dir.join(&file.name), &bytes).map_err(|_| {
+                format!(
+                    "Unable to durably write pushed {kind} credential file: {}",
+                    file.name
+                )
+            })?;
         }
         let materialized_identity = agent_accounts_profile_identity(kind, Some(&temp_dir));
         let materialized_email = materialized_identity
@@ -2424,7 +3823,9 @@ fn agent_accounts_materialize_pushed_account(blob: AgentAccountPushBlob) -> Resu
             .map(agent_accounts_email_key)
             .unwrap_or_default();
         if materialized_email != email {
-            return Err("Pushed account credentials did not match the sealed identity.".to_string());
+            return Err(
+                "Pushed account credentials did not match the sealed identity.".to_string(),
+            );
         }
         Ok(())
     })();
@@ -2432,10 +3833,17 @@ fn agent_accounts_materialize_pushed_account(blob: AgentAccountPushBlob) -> Resu
         let _ = fs::remove_dir_all(&temp_dir);
         return Err(error);
     }
-    agent_accounts_replace_profile_dir_with_backup(&temp_dir, &final_dir)?;
-
-    let mut registry = agent_accounts_registry_read();
-    agent_accounts_ensure_kind_entry(&mut registry, kind);
+    fs::rename(&temp_dir, &final_dir)
+        .map_err(|error| format!("Unable to install pushed account profile: {error}"))?;
+    #[cfg(unix)]
+    if let Err(error) = fs::File::open(&kind_root)
+        .and_then(|directory| directory.sync_all())
+    {
+        let _ = fs::remove_dir_all(&final_dir);
+        return Err(format!(
+            "Unable to sync pushed account profile directory: {error}"
+        ));
+    }
     let profile = json!({
         "id": profile_id,
         "label": if blob.label.trim().is_empty() {
@@ -2447,32 +3855,26 @@ fn agent_accounts_materialize_pushed_account(blob: AgentAccountPushBlob) -> Resu
         "email": email,
         "source": "pushed",
         "dir": final_dir.to_string_lossy().to_string(),
+        "pushSenderDeviceId": agent_account_push_normalized_device_id(&blob.sender_device_id),
+        "pushSourceProfileId": blob.source_profile_id,
         "createdAtMs": todo_dispatch_now_ms(),
     });
     if let Some(profiles) = registry["agents"][kind]["profiles"].as_array_mut() {
-        if let Some(existing) = profiles.iter_mut().find(|entry| {
-            entry
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                == profile_id
-        }) {
-            *existing = profile.clone();
-        } else {
-            profiles.push(profile.clone());
-        }
+        profiles.push(profile);
     }
     registry["agents"][kind]["activeProfileId"] = json!(profile_id.clone());
-    agent_accounts_registry_write(&registry);
+    if let Err(error) = agent_accounts_registry_write(&registry) {
+        let _ = fs::remove_dir_all(&final_dir);
+        let _ = agent_accounts_registry_write(&original_registry);
+        return Err(error);
+    }
+    let recipient_proof_b64 = agent_account_push_completion_proof(&blob)?;
     Ok(json!({
         "ok": true,
         "agent_kind": kind,
         "agentKind": kind,
-        "profile_id": profile_id,
-        "profileId": profile_id,
-        "identity_email": email,
-        "identityEmail": email,
-        "dir": final_dir.to_string_lossy().to_string(),
+        "recipient_proof_b64": recipient_proof_b64,
+        "recipientProofB64": recipient_proof_b64,
     }))
 }
 
@@ -2542,36 +3944,53 @@ fn agent_account_push_validate_managed_profile_dir(kind: &str, dir: &Path) -> Re
     let canonical_kind_root = fs::canonicalize(&kind_root)
         .map_err(|error| format!("Unable to verify agent profile kind root: {error}"))?;
     if !canonical_kind_root.starts_with(&canonical_root) {
-        return Err("Local account profile kind root is outside managed storage; wipe cancelled.".to_string());
+        return Err(
+            "Local account profile kind root is outside managed storage; wipe cancelled."
+                .to_string(),
+        );
     }
 
     match fs::symlink_metadata(dir) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {
-                return Err("Local account profile directory is a symlink; wipe cancelled.".to_string());
+                return Err(
+                    "Local account profile directory is a symlink; wipe cancelled.".to_string(),
+                );
             }
-            let canonical_dir = fs::canonicalize(dir)
-                .map_err(|error| format!("Unable to verify local account profile directory: {error}"))?;
+            let canonical_dir = fs::canonicalize(dir).map_err(|error| {
+                format!("Unable to verify local account profile directory: {error}")
+            })?;
             if !canonical_dir.starts_with(&canonical_kind_root) {
-                return Err("Local account profile directory is outside managed storage; wipe cancelled.".to_string());
+                return Err(
+                    "Local account profile directory is outside managed storage; wipe cancelled."
+                        .to_string(),
+                );
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let parent = dir
-                .parent()
-                .ok_or_else(|| "Local account profile directory is invalid; wipe cancelled.".to_string())?;
+            let parent = dir.parent().ok_or_else(|| {
+                "Local account profile directory is invalid; wipe cancelled.".to_string()
+            })?;
             let final_component = dir
                 .file_name()
                 .and_then(|name| name.to_str())
                 .filter(|name| !name.is_empty() && *name != "." && *name != "..")
-                .ok_or_else(|| "Local account profile directory is invalid; wipe cancelled.".to_string())?;
+                .ok_or_else(|| {
+                    "Local account profile directory is invalid; wipe cancelled.".to_string()
+                })?;
             if final_component.contains('/') || final_component.contains('\\') {
-                return Err("Local account profile directory is invalid; wipe cancelled.".to_string());
+                return Err(
+                    "Local account profile directory is invalid; wipe cancelled.".to_string(),
+                );
             }
-            let canonical_parent = fs::canonicalize(parent)
-                .map_err(|error| format!("Unable to verify local account profile parent: {error}"))?;
+            let canonical_parent = fs::canonicalize(parent).map_err(|error| {
+                format!("Unable to verify local account profile parent: {error}")
+            })?;
             if !canonical_parent.starts_with(&canonical_kind_root) {
-                return Err("Local account profile directory is outside managed storage; wipe cancelled.".to_string());
+                return Err(
+                    "Local account profile directory is outside managed storage; wipe cancelled."
+                        .to_string(),
+                );
             }
         }
         Err(error) => {
@@ -2588,6 +4007,7 @@ fn agent_accounts_wipe_pushed_profile_internal(
     kind: &str,
     profile_id: &str,
     expected_email: &str,
+    expected_credentials_sha256: Option<&str>,
 ) -> Result<Value, String> {
     let kind = agent_accounts_supported_kind(kind)
         .ok_or_else(|| format!("Unsupported agent kind for local wipe: {kind}"))?;
@@ -2595,7 +4015,8 @@ fn agent_accounts_wipe_pushed_profile_internal(
     if expected_email.is_empty() {
         return Err("Pushed account identity is missing; local wipe cancelled.".to_string());
     }
-    let mut registry = agent_accounts_registry_read();
+    let mut registry = agent_accounts_registry_read_checked()?;
+    let original_registry = registry.clone();
     let (active_id, profiles) = agent_accounts_kind_entry(&registry, kind);
     let mut removed_profile = None;
     let mut profile_dir = None;
@@ -2607,8 +4028,22 @@ fn agent_accounts_wipe_pushed_profile_internal(
             .find(|profile| agent_accounts_profile_id(profile).as_deref() == Some(profile_id))
             .cloned()
             .ok_or_else(|| format!("Unknown {kind} account profile: {profile_id}"))?;
-        let email = agent_accounts_profile_email(kind, &profile);
-        profile_dir = agent_accounts_profile_dir(&profile);
+        let dir = agent_accounts_profile_dir(&profile).ok_or_else(|| {
+            "Local account profile has no managed directory; wipe cancelled.".to_string()
+        })?;
+        agent_account_push_validate_managed_profile_dir(kind, &dir)?;
+        let email = agent_accounts_profile_identity(kind, Some(&dir))
+            .get("email")
+            .and_then(Value::as_str)
+            .map(agent_accounts_email_key)
+            .unwrap_or_default();
+        if email.is_empty() {
+            return Err(
+                "Unable to re-probe the current on-disk account identity; wipe cancelled."
+                    .to_string(),
+            );
+        }
+        profile_dir = Some(dir);
         removed_profile = Some(profile);
         email
     };
@@ -2618,6 +4053,19 @@ fn agent_accounts_wipe_pushed_profile_internal(
 
     if let Some(dir) = profile_dir.as_ref() {
         agent_account_push_validate_managed_profile_dir(kind, dir)?;
+    }
+    if let Some(expected_digest) = expected_credentials_sha256
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let current_digest = agent_account_push_current_credentials_digest(
+            kind,
+            profile_id,
+            profile_dir.as_deref(),
+        )?;
+        if current_digest != expected_digest {
+            return Err("Local credential bytes changed after push; wipe cancelled.".to_string());
+        }
     }
 
     let default_email = agent_accounts_default_email(kind);
@@ -2630,7 +4078,9 @@ fn agent_accounts_wipe_pushed_profile_internal(
     let mut targets = Vec::<AgentAccountWipeTarget>::new();
     if let Some(dir) = profile_dir.as_ref().filter(|dir| dir.exists()) {
         if !dir.is_dir() {
-            return Err("Local account profile path is not a directory; wipe cancelled.".to_string());
+            return Err(
+                "Local account profile path is not a directory; wipe cancelled.".to_string(),
+            );
         }
         targets.push(AgentAccountWipeTarget {
             path: dir.clone(),
@@ -2681,26 +4131,6 @@ fn agent_accounts_wipe_pushed_profile_internal(
         None
     };
 
-    let delete_result = (|| -> Result<(), String> {
-        for (target, moved) in targets.iter().zip(quarantines.iter()) {
-            if target.is_dir {
-                fs::remove_dir_all(&moved.quarantine)
-                    .map_err(|error| format!("Unable to remove pushed profile directory: {error}"))?;
-            } else {
-                fs::remove_file(&moved.quarantine)
-                    .map_err(|error| format!("Unable to remove default credential file: {error}"))?;
-            }
-        }
-        Ok(())
-    })();
-    if let Err(error) = delete_result {
-        agent_account_push_rollback_quarantines(&quarantines);
-        if let Some(original) = claude_default_state_backup.as_deref() {
-            agent_account_push_restore_claude_default_state(original);
-        }
-        return Err(error);
-    }
-
     agent_accounts_ensure_kind_entry(&mut registry, kind);
     if removed_profile.is_some() {
         if let Some(entries) = registry
@@ -2709,7 +4139,9 @@ fn agent_accounts_wipe_pushed_profile_internal(
             .and_then(|entry| entry.get_mut("profiles"))
             .and_then(Value::as_array_mut)
         {
-            entries.retain(|profile| agent_accounts_profile_id(profile).as_deref() != Some(profile_id));
+            entries.retain(|profile| {
+                agent_accounts_profile_id(profile).as_deref() != Some(profile_id)
+            });
         }
         if active_id == profile_id {
             let replacement = profiles
@@ -2723,7 +4155,36 @@ fn agent_accounts_wipe_pushed_profile_internal(
     if wipe_default_home {
         agent_accounts_add_suppressed_email(&mut registry, kind, &expected_email);
     }
-    agent_accounts_registry_write(&registry);
+    if let Err(error) = agent_accounts_registry_write(&registry) {
+        agent_account_push_rollback_quarantines(&quarantines);
+        if let Some(original) = claude_default_state_backup.as_deref() {
+            agent_account_push_restore_claude_default_state(original);
+        }
+        return Err(error);
+    }
+
+    let delete_result = (|| -> Result<(), String> {
+        for (target, moved) in targets.iter().zip(quarantines.iter()) {
+            if target.is_dir {
+                fs::remove_dir_all(&moved.quarantine).map_err(|error| {
+                    format!("Unable to remove pushed profile directory: {error}")
+                })?;
+            } else {
+                fs::remove_file(&moved.quarantine).map_err(|error| {
+                    format!("Unable to remove default credential file: {error}")
+                })?;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = delete_result {
+        agent_account_push_rollback_quarantines(&quarantines);
+        if let Some(original) = claude_default_state_backup.as_deref() {
+            agent_account_push_restore_claude_default_state(original);
+        }
+        let _ = agent_accounts_registry_write(&original_registry);
+        return Err(error);
+    }
     if let Some(app) = app {
         let _ = app.emit(AGENT_ACCOUNTS_CHANGED_EVENT, json!({ "kind": kind }));
     }
@@ -2765,8 +4226,34 @@ fn agent_accounts_ensure_kind_entry(registry: &mut Value, kind: &str) {
     }
 }
 
-/// One capture pass for one agent kind. Returns true when the registry
-/// changed (a new account was pinned or a stale suppression was cleared).
+fn agent_accounts_available_capture_profile_id(
+    kind: &str,
+    email: &str,
+    profiles: &[Value],
+    profile_root: &Path,
+) -> String {
+    let slug = agent_accounts_email_slug(email);
+    for collision_index in 0_u32.. {
+        let hash_material = if collision_index == 0 {
+            format!("{kind}:{email}")
+        } else {
+            format!("{kind}:{email}:collision:{collision_index}")
+        };
+        let candidate = format!("cap-{slug}-{}", cloud_mcp_short_hash(&hash_material));
+        let candidate_dir = profile_root.join(kind).join(&candidate);
+        let occupied = profiles.iter().any(|profile| {
+            agent_accounts_profile_id(profile).as_deref() == Some(candidate.as_str())
+                || agent_accounts_profile_dir(profile).as_deref() == Some(candidate_dir.as_path())
+        });
+        if !occupied {
+            return candidate;
+        }
+    }
+    unreachable!("capture profile collision search is unbounded")
+}
+
+/// One capture pass for one agent kind. Returns true when registry or captured
+/// snapshot state changed.
 fn agent_accounts_capture_kind(kind: &'static str) -> bool {
     let _span = BackendCpuSpan::new("agent_accounts.capture_kind");
     let identity = agent_accounts_profile_identity(kind, None);
@@ -2779,15 +4266,44 @@ fn agent_accounts_capture_kind(kind: &'static str) -> bool {
         .get("authReady")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if email.is_empty() || !auth_ready {
-        return false;
-    }
+    let _registry_guard = AGENT_ACCOUNTS_REGISTRY_ACTIVITY_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let capture_cycle = (kind == "claude")
+        .then(agent_accounts_next_claude_capture_cycle)
+        .unwrap_or(0);
     let mut registry = agent_accounts_registry_read();
+    let mut registry_changed = agent_accounts_dedupe_captured_profile_labels(&mut registry, kind);
+    let reconcile_result = if kind == "claude" {
+        agent_accounts_reconcile_captured_claude_identities_in_cycle(
+            &mut registry,
+            &email,
+            capture_cycle,
+        )
+    } else {
+        AgentAccountsClaudeReconcileResult::default()
+    };
+    registry_changed |= reconcile_result.registry_changed;
+    let snapshot_changed = reconcile_result.profile_files_changed;
+    let persist_registry = |registry: &Value, changed: bool| {
+        let persisted = changed && agent_accounts_registry_write(registry).is_ok();
+        if persisted && reconcile_result.registry_changed {
+            for dir in &reconcile_result.rebound_profile_dirs {
+                agent_accounts_clear_profile_login_marker(dir);
+            }
+        }
+        persisted
+    };
+    if email.is_empty() || !auth_ready {
+        let registry_persisted = persist_registry(&registry, registry_changed);
+        return snapshot_changed || registry_persisted;
+    }
     let suppressed = agent_accounts_suppressed_emails(&registry, kind);
     if suppressed.iter().any(|entry| entry == &email) {
-        return false;
+        let registry_persisted = persist_registry(&registry, registry_changed);
+        return snapshot_changed || registry_persisted;
     }
-    let mut registry_changed = false;
     if !suppressed.is_empty() {
         // Suppressions only block recapture of the identity that was deleted
         // while still signed in; once the default home moved on, clear them
@@ -2799,44 +4315,80 @@ fn agent_accounts_capture_kind(kind: &'static str) -> bool {
     let (_, profiles) = agent_accounts_kind_entry(&registry, kind);
     let existing = profiles
         .iter()
-        .find(|profile| agent_accounts_profile_email(kind, profile) == email)
-        .cloned();
-    if let Some(existing) = existing {
+        .any(|profile| agent_accounts_profile_email(kind, profile) == email);
+    if existing {
         // Same account still signed in: keep its snapshot's tokens fresh so
-        // switching back later doesn't land on an expired refresh token.
-        if existing.get("source").and_then(Value::as_str) == Some("captured") {
+        // switching back later doesn't land on an expired refresh token. Walk
+        // every matching captured profile: a manual/duplicate first in
+        // registry order must not starve a deferred repair destination.
+        let mut refresh_changed = false;
+        for existing in profiles.iter().filter(|profile| {
+            profile.get("source").and_then(Value::as_str) == Some("captured")
+                && agent_accounts_profile_email(kind, profile) == email
+        }) {
             if let Some(dir) = existing
                 .get("dir")
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             {
-                agent_accounts_snapshot_refresh(kind, Path::new(dir));
+                if kind == "claude"
+                    && agent_accounts_profile_login_marker(Path::new(dir)).is_some()
+                {
+                    continue;
+                }
+                let registered_email = existing
+                    .get("email")
+                    .and_then(Value::as_str)
+                    .map(agent_accounts_email_key)
+                    .filter(|email| !email.is_empty())
+                    .unwrap_or_else(|| email.clone());
+                refresh_changed |= agent_accounts_snapshot_refresh_in_cycle(
+                    kind,
+                    Path::new(dir),
+                    &registered_email,
+                    false,
+                    capture_cycle,
+                );
             }
         }
-        if registry_changed {
-            agent_accounts_registry_write(&registry);
-        }
-        return registry_changed;
+        let registry_persisted = persist_registry(&registry, registry_changed);
+        return snapshot_changed || refresh_changed || registry_persisted;
     }
-    // New identity in the default home: pin it. The id is deterministic per
-    // (kind, email) so a deleted-then-relogged account lands back in its dir.
-    let profile_id = format!(
-        "cap-{}-{}",
-        agent_accounts_email_slug(&email),
-        cloud_mcp_short_hash(&format!("{kind}:{email}"))
-    );
-    let Some(dir) = cloud_mcp_local_data_file_path(AGENT_ACCOUNTS_PROFILE_DIR)
-        .map(|root| root.join(kind).join(&profile_id))
-    else {
-        return registry_changed;
+    // New identity in the default home: pin it. Normally the id is
+    // deterministic per (kind, email). If a deliberate rebind still owns that
+    // historical id/dir, allocate a deterministic collision suffix instead of
+    // overwriting the rebound account.
+    let Some(profile_root) = cloud_mcp_local_data_file_path(AGENT_ACCOUNTS_PROFILE_DIR) else {
+        let registry_persisted = persist_registry(&registry, registry_changed);
+        return snapshot_changed || registry_persisted;
     };
+    let profile_id =
+        agent_accounts_available_capture_profile_id(kind, &email, &profiles, &profile_root);
+    let dir = profile_root.join(kind).join(&profile_id);
     if fs::create_dir_all(&dir).is_err() {
-        return registry_changed;
+        let registry_persisted = persist_registry(&registry, registry_changed);
+        return snapshot_changed || registry_persisted;
     }
-    agent_accounts_snapshot_refresh(kind, &dir);
+    if !agent_accounts_snapshot_refresh_in_cycle(
+        kind,
+        &dir,
+        &email,
+        false,
+        capture_cycle,
+    ) {
+        let _ = fs::remove_dir(&dir);
+        let registry_persisted = persist_registry(&registry, registry_changed);
+        return snapshot_changed || registry_persisted;
+    }
     agent_accounts_ensure_kind_entry(&mut registry, kind);
-    let label = email.split('@').next().unwrap_or("account").to_string();
+    let used_labels = profiles
+        .iter()
+        .filter_map(|profile| profile.get("label").and_then(Value::as_str))
+        .map(agent_accounts_label_key)
+        .filter(|label| !label.is_empty())
+        .collect::<HashSet<_>>();
+    let label = agent_accounts_unique_capture_label(&email, &used_labels);
     let profile = json!({
         "id": profile_id,
         "label": label,
@@ -2848,14 +4400,51 @@ fn agent_accounts_capture_kind(kind: &'static str) -> bool {
     if let Some(profiles) = registry["agents"][kind]["profiles"].as_array_mut() {
         profiles.push(profile);
     }
-    agent_accounts_registry_write(&registry);
-    true
+    let persisted = agent_accounts_registry_write(&registry).is_ok();
+    if persisted && reconcile_result.registry_changed {
+        for dir in &reconcile_result.rebound_profile_dirs {
+            agent_accounts_clear_profile_login_marker(dir);
+        }
+    }
+    persisted
+}
+
+fn agent_accounts_capture_startup_reconcile() -> bool {
+    let _registry_guard = AGENT_ACCOUNTS_REGISTRY_ACTIVITY_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut registry = agent_accounts_registry_read();
+    let mut registry_changed = false;
+    for kind in ["claude", "codex", "opencode"] {
+        registry_changed |= agent_accounts_dedupe_captured_profile_labels(&mut registry, kind);
+    }
+    let default_claude_email = agent_accounts_default_email("claude");
+    let reconcile_result = agent_accounts_reconcile_captured_claude_identities(
+        &mut registry,
+        &default_claude_email,
+    );
+    registry_changed |= reconcile_result.registry_changed;
+    let registry_persisted =
+        registry_changed && agent_accounts_registry_write(&registry).is_ok();
+    if registry_persisted && reconcile_result.registry_changed {
+        for dir in &reconcile_result.rebound_profile_dirs {
+            agent_accounts_clear_profile_login_marker(dir);
+        }
+    }
+    reconcile_result.profile_files_changed || registry_persisted
 }
 
 pub(crate) fn agent_accounts_capture_watch_start(app: AppHandle) {
     let _ = std::thread::Builder::new()
         .name("agent-accounts-capture".to_string())
         .spawn(move || {
+            if agent_accounts_capture_startup_reconcile() {
+                let _ = app.emit(
+                    AGENT_ACCOUNTS_CHANGED_EVENT,
+                    json!({ "kind": "claude", "reconciled": true }),
+                );
+            }
             let capture_all = |capture_app: &AppHandle| {
                 let _heavy_permit = backend_heavy_job_acquire("agent_accounts.capture_all");
                 let _span = BackendCpuSpan::new("agent_accounts.capture_all");
@@ -2896,11 +4485,28 @@ pub(crate) fn agent_accounts_capture_watch_start(app: AppHandle) {
             let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
             let mut watcher = notify::recommended_watcher(tx).ok();
             if let Some(watcher) = watcher.as_mut() {
+                let mut watched_paths = HashSet::new();
                 for kind in ["claude", "codex", "opencode"] {
                     if let Some(dir) = agent_accounts_default_home(kind) {
+                        if watched_paths.insert(dir.clone()) {
+                            let _ = notify::Watcher::watch(
+                                watcher,
+                                &dir,
+                                notify::RecursiveMode::NonRecursive,
+                            );
+                        }
+                    }
+                }
+                // Claude keeps identity state beside (not inside) ~/.claude.
+                // Watch the parent so creation and replacement of the sibling
+                // ~/.claude.json are both observable.
+                if let Some(claude_parent) = agent_accounts_default_home("claude")
+                    .and_then(|dir| dir.parent().map(Path::to_path_buf))
+                {
+                    if watched_paths.insert(claude_parent.clone()) {
                         let _ = notify::Watcher::watch(
                             watcher,
-                            &dir,
+                            &claude_parent,
                             notify::RecursiveMode::NonRecursive,
                         );
                     }
@@ -2922,44 +4528,63 @@ pub(crate) fn agent_accounts_capture_watch_start(app: AppHandle) {
                 })
             };
             const EVENT_CAPTURE_MIN_GAP_SECS: u64 = 30;
-            let mut last_event_capture = std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_secs(EVENT_CAPTURE_MIN_GAP_SECS))
+            const EVENT_DEBOUNCE_MS: u64 = 400;
+            const BACKSTOP_SECS: u64 = 300;
+            let mut last_capture = std::time::Instant::now()
+                .checked_sub(Duration::from_secs(EVENT_CAPTURE_MIN_GAP_SECS))
                 .unwrap_or_else(std::time::Instant::now);
+            let mut next_backstop = std::time::Instant::now() + Duration::from_secs(BACKSTOP_SECS);
+            let mut pending_event_capture: Option<std::time::Instant> = None;
             loop {
-                match rx.recv_timeout(std::time::Duration::from_secs(300)) {
+                let now = std::time::Instant::now();
+                if now >= next_backstop {
+                    // Advance from the prior deadline, never from "now", so
+                    // unrelated filesystem notifications cannot reset the
+                    // five-minute safety cadence.
+                    while next_backstop <= now {
+                        next_backstop += Duration::from_secs(BACKSTOP_SECS);
+                    }
+                    capture_all(&app);
+                    last_capture = std::time::Instant::now();
+                    pending_event_capture = agent_accounts_has_pending_claude_credentials()
+                        .then_some(last_capture + Duration::from_secs(EVENT_CAPTURE_MIN_GAP_SECS));
+                    continue;
+                }
+                if pending_event_capture.is_some_and(|deadline| now >= deadline) {
+                    capture_all(&app);
+                    last_capture = std::time::Instant::now();
+                    pending_event_capture = agent_accounts_has_pending_claude_credentials()
+                        .then_some(last_capture + Duration::from_secs(EVENT_CAPTURE_MIN_GAP_SECS));
+                    continue;
+                }
+
+                let deadline = pending_event_capture
+                    .map(|pending| pending.min(next_backstop))
+                    .unwrap_or(next_backstop);
+                let wait = deadline.saturating_duration_since(now);
+                match rx.recv_timeout(wait) {
                     Ok(event) => {
-                        // A login writes several files in a burst; drain the
-                        // burst (quiet for 400ms) and capture once.
-                        let mut relevant = event
+                        let relevant = event
                             .as_ref()
                             .map(&event_is_credential_related)
                             .unwrap_or(false);
-                        while let Ok(next_event) =
-                            rx.recv_timeout(std::time::Duration::from_millis(400))
-                        {
-                            relevant = relevant
-                                || next_event
-                                    .as_ref()
-                                    .map(&event_is_credential_related)
-                                    .unwrap_or(false);
-                        }
                         if !relevant {
                             continue;
                         }
-                        if last_event_capture.elapsed()
-                            < std::time::Duration::from_secs(EVENT_CAPTURE_MIN_GAP_SECS)
-                        {
-                            // The 300s backstop still covers anything skipped.
-                            continue;
-                        }
-                        last_event_capture = std::time::Instant::now();
-                        capture_all(&app);
+                        // Debounce credential bursts, but never drop a change
+                        // inside the post-capture gap: carry it to the first
+                        // allowed deadline instead.
+                        let event_deadline = std::time::Instant::now()
+                            + Duration::from_millis(EVENT_DEBOUNCE_MS);
+                        let gap_deadline = last_capture
+                            + Duration::from_secs(EVENT_CAPTURE_MIN_GAP_SECS);
+                        pending_event_capture = Some(event_deadline.max(gap_deadline));
                     }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => capture_all(&app),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        // Watcher unavailable: degrade to a slow safety poll.
-                        std::thread::sleep(std::time::Duration::from_secs(300));
-                        capture_all(&app);
+                        // Watcher unavailable: let the same monotonic deadline
+                        // loop degrade to a slow safety poll without spinning.
+                        std::thread::sleep(wait.min(Duration::from_secs(60)));
                     }
                 }
             }
@@ -2990,9 +4615,7 @@ fn agent_accounts_codex_auth_failure_reason(text: &str) -> Option<(&'static str,
             "Codex refresh was already consumed elsewhere. Sign in again for this saved account.",
         ));
     }
-    if lower.contains("refresh token was revoked")
-        || lower.contains("refresh_token_invalidated")
-    {
+    if lower.contains("refresh token was revoked") || lower.contains("refresh_token_invalidated") {
         return Some((
             "refresh_revoked",
             "Codex refresh was revoked for this saved account. Sign in again for this account.",
@@ -3020,7 +4643,9 @@ pub(crate) fn agent_accounts_observe_terminal_auth_output(
     }
     scan_tail.push_str(&String::from_utf8_lossy(chunk));
     if scan_tail.len() > AGENT_ACCOUNTS_AUTH_SCAN_MAX_CHARS {
-        let drain_to = scan_tail.len().saturating_sub(AGENT_ACCOUNTS_AUTH_SCAN_MAX_CHARS);
+        let drain_to = scan_tail
+            .len()
+            .saturating_sub(AGENT_ACCOUNTS_AUTH_SCAN_MAX_CHARS);
         if scan_tail.is_char_boundary(drain_to) {
             scan_tail.drain(..drain_to);
         } else {
@@ -3089,9 +4714,12 @@ fn agent_accounts_mark_pane_auth_issue(
             return false;
         }
     }
-    let auth_file_signature =
-        agent_accounts_auth_signature_for_profile(kind, &profile_id, profile_for_signature.as_ref())
-            .unwrap_or_default();
+    let auth_file_signature = agent_accounts_auth_signature_for_profile(
+        kind,
+        &profile_id,
+        profile_for_signature.as_ref(),
+    )
+    .unwrap_or_default();
     let issue = json!({
         "needsLogin": true,
         "reason": reason,
@@ -3132,7 +4760,9 @@ fn agent_accounts_mark_pane_auth_issue(
     }
 
     if changed {
-        agent_accounts_registry_write(&registry);
+        if agent_accounts_registry_write(&registry).is_err() {
+            return false;
+        }
         let _ = app.emit(
             AGENT_ACCOUNTS_CHANGED_EVENT,
             json!({
@@ -3198,12 +4828,126 @@ fn agent_accounts_launch_profile_login_terminal(
             vec!["auth", "login"],
             vec![("OPENCODE_DATA_DIR".to_string(), dir_text)],
         ),
-        _ => (
-            vec!["login"],
-            vec![("CODEX_HOME".to_string(), dir_text)],
-        ),
+        _ => (vec!["login"], vec![("CODEX_HOME".to_string(), dir_text)]),
     };
-    run_login_terminal_with_env(definition.label, &binary, &args, &env_vars)
+    let marker_set = if kind == "claude" {
+        agent_accounts_prepare_captured_claude_profile_login(profile_id, &dir)?
+    } else {
+        false
+    };
+    let launch = run_login_terminal_with_env(definition.label, &binary, &args, &env_vars);
+    if launch.is_err() && marker_set {
+        agent_accounts_clear_profile_login_marker(&dir);
+    }
+    launch
+}
+
+fn agent_accounts_watch_profile_login_completion(
+    app: AppHandle,
+    kind: &'static str,
+    profile_id: String,
+) {
+    if kind != "claude" || profile_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
+        return;
+    }
+    let Ok((profile_dir, false)) = agent_accounts_profile_login_target(kind, &profile_id) else {
+        return;
+    };
+    let _ = thread::Builder::new()
+        .name("agent-account-profile-login".to_string())
+        .spawn(move || loop {
+            if agent_accounts_profile_login_marker(&profile_dir).is_none() {
+                break;
+            }
+            let registry_guard = AGENT_ACCOUNTS_REGISTRY_ACTIVITY_LOCK
+                .get_or_init(|| StdMutex::new(()))
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let mut registry = match agent_accounts_registry_read_checked() {
+                Ok(registry) => registry,
+                Err(_) => {
+                    // A concurrent atomic replacement can be briefly
+                    // unreadable. Preserve the authorization marker and retry
+                    // instead of treating an empty fallback as profile removal.
+                    drop(registry_guard);
+                    thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+            };
+            let (_, profiles) = agent_accounts_kind_entry(&registry, "claude");
+            let registered_email = profiles.iter().find_map(|profile| {
+                (profile.get("id").and_then(Value::as_str) == Some(profile_id.as_str()))
+                    .then(|| {
+                        profile
+                            .get("email")
+                            .and_then(Value::as_str)
+                            .map(agent_accounts_email_key)
+                            .unwrap_or_default()
+                    })
+            });
+            let Some(registered_email) = registered_email else {
+                agent_accounts_clear_profile_login_marker(&profile_dir);
+                break;
+            };
+            let live_email = agent_accounts_profile_identity("claude", Some(&profile_dir))
+                .get("email")
+                .and_then(Value::as_str)
+                .map(agent_accounts_email_key)
+                .unwrap_or_default();
+            if !live_email.is_empty()
+                && live_email == registered_email
+                // Credentials can arrive before identity during a deliberate
+                // account switch. State writes complete immediately; a
+                // credentials-only refresh must remain stable for 30 seconds
+                // before it can consume the marker.
+                && agent_accounts_profile_login_marker_matching_completion(
+                    &profile_dir,
+                    &live_email,
+                )
+            {
+                agent_accounts_clear_profile_login_marker(&profile_dir);
+                let _ = app.emit(
+                    AGENT_ACCOUNTS_CHANGED_EVENT,
+                    json!({
+                        "kind": "claude",
+                        "profileId": profile_id,
+                        "loginCompleted": true,
+                        "rebound": false,
+                    }),
+                );
+                break;
+            }
+            if !live_email.is_empty() && live_email != registered_email {
+                let default_email = agent_accounts_default_email("claude");
+                let result = agent_accounts_reconcile_captured_claude_identities(
+                    &mut registry,
+                    &default_email,
+                );
+                let persisted = !result.registry_changed
+                    || agent_accounts_registry_write(&registry).is_ok();
+                if persisted && result.registry_changed {
+                    for dir in &result.rebound_profile_dirs {
+                        agent_accounts_clear_profile_login_marker(dir);
+                    }
+                }
+                if result.changed() {
+                    let _ = app.emit(
+                        AGENT_ACCOUNTS_CHANGED_EVENT,
+                        json!({
+                            "kind": "claude",
+                            "profileId": profile_id,
+                            "loginCompleted": persisted,
+                            "rebound": persisted && result.registry_changed,
+                        }),
+                    );
+                }
+                if persisted && result.registry_changed {
+                    break;
+                }
+            }
+            drop(registry_guard);
+            thread::sleep(Duration::from_secs(1));
+        });
 }
 
 fn agent_accounts_provider_for_kind(kind: &str) -> AgentProvider {
@@ -3245,6 +4989,7 @@ async fn agent_accounts_start_profile_login(
     }
     tauri::async_runtime::spawn_blocking(move || {
         agent_accounts_launch_profile_login_terminal(kind, &profile_id)?;
+        agent_accounts_watch_profile_login_completion(app.clone(), kind, profile_id.clone());
         let _ = app.emit(
             AGENT_ACCOUNTS_CHANGED_EVENT,
             json!({ "kind": kind, "profileId": profile_id, "loginStarted": true }),
@@ -3291,7 +5036,7 @@ async fn agent_accounts_update_display(
                 registry["agents"][kind]["defaultAlias"] =
                     json!(alias.trim().chars().take(40).collect::<String>());
             }
-            agent_accounts_registry_write(&registry);
+            agent_accounts_registry_write(&registry)?;
             let _ = app.emit(AGENT_ACCOUNTS_CHANGED_EVENT, json!({ "kind": kind }));
             return Ok(json!({ "ok": true }));
         }
@@ -3325,7 +5070,7 @@ async fn agent_accounts_update_display(
         if let Some(show_email) = show_email {
             profile["showEmail"] = json!(show_email);
         }
-        agent_accounts_registry_write(&registry);
+        agent_accounts_registry_write(&registry)?;
         let _ = app.emit(AGENT_ACCOUNTS_CHANGED_EVENT, json!({ "kind": kind }));
         Ok(json!({ "ok": true }))
     })
@@ -3367,7 +5112,7 @@ async fn agent_accounts_set_active(
             registry["agents"][kind] = json!({ "profiles": [] });
         }
         registry["agents"][kind]["activeProfileId"] = json!(active_profile_id);
-        agent_accounts_registry_write(&registry);
+        agent_accounts_registry_write(&registry)?;
         let _ = app.emit(
             AGENT_ACCOUNTS_CHANGED_EVENT,
             json!({ "kind": kind, "activeProfileId": active_profile_id }),
@@ -3378,6 +5123,20 @@ async fn agent_accounts_set_active(
     .map_err(|error| format!("Agent accounts set-active worker failed: {error}"))?
 }
 
+fn agent_account_push_validate_wipe_mode(wipe_local_after: bool) -> Result<(), String> {
+    if wipe_local_after {
+        // A boolean arriving over IPC is not evidence of a user gesture. Keep
+        // Push & Wipe fail-closed until the frontend is wired to a separate,
+        // one-time backend-issued confirmation token. Normal credential push
+        // still uses the authenticated apply proof below.
+        return Err(
+            "Push & Wipe is disabled until an explicit one-time local confirmation token is available. Push without wiping instead."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn agent_account_push_to_device(
     app: AppHandle,
@@ -3386,6 +5145,7 @@ async fn agent_account_push_to_device(
     profile_id: String,
     target_device_id: String,
     wipe_local_after: bool,
+    target_key_fingerprint: Option<String>,
 ) -> Result<Value, String> {
     let kind = agent_accounts_supported_kind(&agent_kind)
         .ok_or_else(|| format!("Unsupported agent kind for account push: {agent_kind}"))?;
@@ -3393,6 +5153,7 @@ async fn agent_account_push_to_device(
     if profile_id.is_empty() {
         return Err("A profile id is required.".to_string());
     }
+    agent_account_push_validate_wipe_mode(wipe_local_after)?;
     let target_device_id = target_device_id.trim().to_string();
     if target_device_id.is_empty() {
         return Err("A target device id is required.".to_string());
@@ -3400,18 +5161,27 @@ async fn agent_account_push_to_device(
     let local_device = cloud_mcp_desktop_device_profile();
     let local_device_id =
         cloud_mcp_payload_text(&local_device, &["device_id", "deviceId"]).unwrap_or_default();
+    if local_device_id.trim().is_empty() {
+        return Err(
+            "Current device identity is unavailable; credential push cancelled.".to_string(),
+        );
+    }
     if agent_account_push_normalized_device_id(&target_device_id)
         == agent_account_push_normalized_device_id(&local_device_id)
     {
-        return Err("Choose a different device; this account is already on the current device.".to_string());
+        return Err(
+            "Choose a different device; this account is already on the current device.".to_string(),
+        );
     }
 
     let target_device = agent_account_push_target_device(state.inner(), &target_device_id).await?;
     let (target_push_public_key, sealed_algorithm) = agent_account_push_target_key(&target_device)?;
     let push_id = uuid::Uuid::new_v4().to_string();
-    if let Err(error) =
-        agent_account_push_verify_or_pin_target_key(&target_device_id, &target_push_public_key)
-    {
+    if let Err(error) = agent_account_push_verify_or_pin_target_key(
+        &target_device_id,
+        &target_push_public_key,
+        target_key_fingerprint.as_deref(),
+    ) {
         agent_account_push_emit(
             &app,
             &push_id,
@@ -3439,22 +5209,41 @@ async fn agent_account_push_to_device(
     let sender_device_id_for_bundle = local_device_id.clone();
     let target_key_for_bundle = target_push_public_key.clone();
     let sealed = tauri::async_runtime::spawn_blocking(move || {
-        let blob = agent_account_push_profile_bundle(
+        let mut blob = agent_account_push_profile_bundle(
             kind,
             &profile_id_for_bundle,
             &push_id_for_bundle,
             &target_device_id_for_bundle,
             &sender_device_id_for_bundle,
         )?;
+        agent_account_push_authenticate_outbound_blob(&mut blob, &target_key_for_bundle)?;
         let identity_email = blob.identity_email.clone();
+        let source_credentials_sha256 = agent_account_push_blob_credentials_digest(&blob)?;
+        let ack_nonce_b64 = blob.ack_nonce_b64.clone();
+        let issued_at_ms = blob.issued_at_ms;
+        let expires_at_ms = blob.expires_at_ms;
         let plaintext = serde_json::to_vec(&blob)
             .map_err(|error| format!("Unable to encode agent account push payload: {error}"))?;
         let sealed_blob = agent_account_push_seal_blob(&target_key_for_bundle, &plaintext)?;
-        Ok::<_, String>((sealed_blob, identity_email))
+        Ok::<_, String>((
+            sealed_blob,
+            identity_email,
+            source_credentials_sha256,
+            ack_nonce_b64,
+            issued_at_ms,
+            expires_at_ms,
+        ))
     })
     .await
     .map_err(|error| format!("Agent account push sealing worker failed: {error}"))?;
-    let (sealed_blob, identity_email) = match sealed {
+    let (
+        sealed_blob,
+        identity_email,
+        source_credentials_sha256,
+        ack_nonce_b64,
+        issued_at_ms,
+        expires_at_ms,
+    ) = match sealed {
         Ok(value) => value,
         Err(error) => {
             agent_account_push_emit(
@@ -3492,6 +5281,11 @@ async fn agent_account_push_to_device(
                 wipe_local_after,
                 identity_email: identity_email.clone(),
                 delivered: false,
+                created_at_ms: issued_at_ms,
+                expires_at_ms,
+                ack_nonce_b64,
+                target_push_public_key_b64: target_push_public_key.clone(),
+                source_credentials_sha256,
             },
         );
     }
@@ -3525,8 +5319,6 @@ async fn agent_account_push_to_device(
         "agent_kind": kind,
         "agentKind": kind,
         "provider": kind,
-        "profile_id": profile_id.clone(),
-        "profileId": profile_id.clone(),
         "target_device_id": target_device_id.clone(),
         "targetDeviceId": target_device_id.clone(),
         "target_device_name": target_device_name.clone(),
@@ -3548,9 +5340,12 @@ async fn agent_account_push_to_device(
         "wipeLocalAfter": wipe_local_after,
         "ts_ms": todo_dispatch_now_ms(),
     });
-    if let Err(error) =
-        cloud_mcp_send_remote_command_over_app_ws_once(state.inner(), &request, "agent-account-push")
-            .await
+    if let Err(error) = cloud_mcp_send_remote_command_over_app_ws_once(
+        state.inner(),
+        &request,
+        "agent-account-push",
+    )
+    .await
     {
         if let Ok(mut pending) = agent_account_push_pending().lock() {
             pending.remove(&push_id);
@@ -3637,7 +5432,7 @@ async fn agent_accounts_remove(
             }
             registry["agents"][kind]["capturedSuppressed"] = json!(suppressed);
         }
-        agent_accounts_registry_write(&registry);
+        agent_accounts_registry_write(&registry)?;
         // Profiles are credential snapshots, so a delete is a real delete —
         // but only ever inside the managed agent-profiles root.
         if let (Some(dir), Some(root)) = (
@@ -3758,11 +5553,15 @@ mod agent_accounts_tests {
         expires_at_ms: u64,
     ) -> AgentAccountPushBlob {
         AgentAccountPushBlob {
-            version: 1,
+            version: 2,
             contract: AGENT_ACCOUNT_PUSH_CONTRACT.to_string(),
             push_id: push_id.to_string(),
             target_device_id: target_device_id.to_string(),
             sender_device_id: "device-source".to_string(),
+            sender_push_public_key_b64: String::new(),
+            sender_key_fingerprint_sha256: String::new(),
+            ack_nonce_b64: String::new(),
+            sender_auth_tag_b64: String::new(),
             issued_at_ms,
             expires_at_ms,
             agent_kind: "codex".to_string(),
@@ -3772,9 +5571,48 @@ mod agent_accounts_tests {
             alias: String::new(),
             files: vec![AgentAccountPushFile {
                 name: "auth.json".to_string(),
-                data_b64: general_purpose::STANDARD.encode(test_codex_auth_for_email("pushed@example.com")),
+                data_b64: general_purpose::STANDARD
+                    .encode(test_codex_auth_for_email("pushed@example.com")),
             }],
         }
+    }
+
+    fn test_authenticated_agent_account_push_blob(
+        sender_data: &Path,
+        recipient_data: &Path,
+        push_id: &str,
+    ) -> AgentAccountPushBlob {
+        let recipient_key = {
+            let _env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, recipient_data);
+            agent_account_push_public_key_metadata().unwrap()
+        };
+        let (sender_key, blob) = {
+            let _env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, sender_data);
+            let sender_key = agent_account_push_public_key_metadata().unwrap();
+            let now_ms = todo_dispatch_now_ms();
+            let mut blob = test_agent_account_push_blob(
+                push_id,
+                "device-recipient",
+                now_ms,
+                now_ms.saturating_add(AGENT_ACCOUNT_PUSH_BLOB_TTL_MS),
+            );
+            blob.sender_device_id = "device-sender".to_string();
+            agent_account_push_authenticate_outbound_blob(&mut blob, &recipient_key.public_key_b64)
+                .unwrap();
+            (sender_key, blob)
+        };
+        {
+            let _env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, recipient_data);
+            let sender_fingerprint =
+                agent_account_push_key_fingerprint(&sender_key.public_key_b64).unwrap();
+            agent_account_push_verify_or_pin_target_key(
+                "device-sender",
+                &sender_key.public_key_b64,
+                Some(&sender_fingerprint),
+            )
+            .unwrap();
+        }
+        blob
     }
 
     #[test]
@@ -3786,6 +5624,14 @@ mod agent_accounts_tests {
         assert_eq!(agent_accounts_supported_kind("opencode"), Some("opencode"));
         assert_eq!(agent_accounts_supported_kind("OpenCode"), Some("opencode"));
         assert_eq!(agent_accounts_supported_kind("generic"), None);
+    }
+
+    #[test]
+    fn agent_account_push_and_wipe_requires_backend_gesture_token() {
+        assert!(agent_account_push_validate_wipe_mode(false).is_ok());
+        assert!(agent_account_push_validate_wipe_mode(true)
+            .unwrap_err()
+            .contains("one-time local confirmation token"));
     }
 
     #[test]
@@ -3833,6 +5679,826 @@ mod agent_accounts_tests {
             "dev"
         );
         assert_eq!(agent_accounts_profile_display_label(&json!({})), "Account");
+    }
+
+    #[test]
+    fn captured_label_collisions_disambiguate_newer_profile_by_domain() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let data = env::temp_dir().join(format!(
+            "agent_accounts_label_dedupe_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&data).unwrap();
+        let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data);
+        let mut registry = json!({
+            "agents": {
+                "claude": {
+                    "activeProfileId": AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+                    "profiles": [
+                        {
+                            "id": "cap-support-splutter",
+                            "label": "support",
+                            "email": "support@splutter.ai",
+                            "source": "captured",
+                            "createdAtMs": 100,
+                            "dir": data.join("splutter").to_string_lossy().to_string()
+                        },
+                        {
+                            "id": "cap-support-diffforge",
+                            "label": "support",
+                            "alias": "Work Support",
+                            "email": "support@diffforge.ai",
+                            "source": "captured",
+                            "createdAtMs": 200,
+                            "dir": data.join("diffforge").to_string_lossy().to_string()
+                        }
+                    ]
+                }
+            }
+        });
+
+        assert!(agent_accounts_dedupe_captured_profile_labels(
+            &mut registry,
+            "claude"
+        ));
+        let profiles = registry["agents"]["claude"]["profiles"]
+            .as_array()
+            .unwrap();
+        assert_eq!(profiles[0]["label"].as_str(), Some("support"));
+        assert_eq!(
+            profiles[1]["label"].as_str(),
+            Some("support-diffforge.ai")
+        );
+        assert_eq!(profiles[1]["alias"].as_str(), Some("Work Support"));
+
+        agent_accounts_registry_write(&registry).unwrap();
+        assert_eq!(
+            agent_accounts_profile_label_for_email("claude", "support@splutter.ai").as_deref(),
+            Some("support")
+        );
+        assert_eq!(
+            agent_accounts_profile_label_for_email("claude", "support@diffforge.ai").as_deref(),
+            Some("Work Support")
+        );
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn claude_snapshot_refresh_rejects_mismatched_default_identity() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_claude_identity_gate_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let default_claude_home = home.join(".claude");
+        let profile_dir = root.join("captured-support");
+        fs::create_dir_all(&default_claude_home).unwrap();
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            home.join(".claude.json"),
+            test_claude_state_for_email("admin@example.test"),
+        )
+        .unwrap();
+        fs::write(
+            default_claude_home.join(".credentials.json"),
+            "admin-credentials",
+        )
+        .unwrap();
+        fs::write(default_claude_home.join("settings.json"), "admin-settings").unwrap();
+        fs::write(
+            profile_dir.join(".claude.json"),
+            test_claude_state_for_email("support@example.test"),
+        )
+        .unwrap();
+        fs::write(
+            profile_dir.join(".credentials.json"),
+            "support-credentials",
+        )
+        .unwrap();
+        let _home_env = ScopedAgentAccountsEnv::set("HOME", &home);
+
+        assert!(!agent_accounts_snapshot_refresh(
+            "claude",
+            &profile_dir,
+            "support@example.test"
+        ));
+        assert_eq!(
+            fs::read_to_string(profile_dir.join(".claude.json")).unwrap(),
+            test_claude_state_for_email("support@example.test")
+        );
+        assert_eq!(
+            fs::read_to_string(profile_dir.join(".credentials.json")).unwrap(),
+            "support-credentials"
+        );
+        assert!(!profile_dir.join("settings.json").exists());
+
+        fs::write(
+            home.join(".claude.json"),
+            test_claude_state_for_email("support@example.test"),
+        )
+        .unwrap();
+        fs::write(
+            profile_dir.join(".claude.json"),
+            test_claude_state_for_email("admin@example.test"),
+        )
+        .unwrap();
+        fs::remove_file(profile_dir.join(".credentials.json")).unwrap();
+        fs::write(
+            default_claude_home.join(".credentials.json"),
+            "fresh-support-credentials",
+        )
+        .unwrap();
+
+        // Credentials newer than matching state take two observations. The
+        // first pass can still repair identity/settings, but must not install
+        // the not-yet-confirmed bearer snapshot.
+        let first_capture_cycle = agent_accounts_next_claude_capture_cycle();
+        assert!(agent_accounts_snapshot_refresh_in_cycle(
+            "claude",
+            &profile_dir,
+            "support@example.test",
+            false,
+            first_capture_cycle,
+        ));
+        assert!(!profile_dir.join(".credentials.json").exists());
+        assert!(!agent_accounts_snapshot_refresh_in_cycle(
+            "claude",
+            &profile_dir,
+            "support@example.test",
+            false,
+            first_capture_cycle,
+        ));
+        assert!(!profile_dir.join(".credentials.json").exists());
+        assert!(agent_accounts_snapshot_refresh_in_cycle(
+            "claude",
+            &profile_dir,
+            "support@example.test",
+            false,
+            agent_accounts_next_claude_capture_cycle(),
+        ));
+        assert_eq!(
+            fs::read_to_string(profile_dir.join(".claude.json")).unwrap(),
+            test_claude_state_for_email("support@example.test")
+        );
+        assert_eq!(
+            fs::read_to_string(profile_dir.join(".credentials.json")).unwrap(),
+            "fresh-support-credentials"
+        );
+        assert_eq!(
+            fs::read_to_string(profile_dir.join("settings.json")).unwrap(),
+            "admin-settings"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_snapshot_refresh_defers_credentials_newer_than_matching_state() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_claude_credentials_first_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let default_claude_home = home.join(".claude");
+        let profile_dir = root.join("captured-b");
+        fs::create_dir_all(&default_claude_home).unwrap();
+        fs::create_dir_all(&profile_dir).unwrap();
+        let default_state_path = home.join(".claude.json");
+        let default_credentials_path = default_claude_home.join(".credentials.json");
+        fs::write(
+            &default_state_path,
+            test_claude_state_for_email("b@example.test"),
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(20));
+        fs::write(&default_credentials_path, "account-a-credentials").unwrap();
+        assert!(
+            default_credentials_path
+                .metadata()
+                .unwrap()
+                .modified()
+                .unwrap()
+                > default_state_path.metadata().unwrap().modified().unwrap()
+        );
+        fs::write(
+            profile_dir.join(".claude.json"),
+            test_claude_state_for_email("b@example.test"),
+        )
+        .unwrap();
+        fs::write(profile_dir.join(".credentials.json"), "account-b-credentials").unwrap();
+        fs::write(profile_dir.join("settings.json"), "settings").unwrap();
+        let _home_env = ScopedAgentAccountsEnv::set("HOME", &home);
+
+        assert!(!agent_accounts_snapshot_refresh(
+            "claude",
+            &profile_dir,
+            "b@example.test"
+        ));
+        assert_eq!(
+            fs::read_to_string(profile_dir.join(".credentials.json")).unwrap(),
+            "account-b-credentials"
+        );
+
+        // Once the state catches up to account A, B's pending observation is
+        // invalidated rather than copied on a later pass.
+        fs::write(
+            &default_state_path,
+            test_claude_state_for_email("a@example.test"),
+        )
+        .unwrap();
+        assert!(!agent_accounts_has_pending_claude_credentials());
+        assert!(!agent_accounts_snapshot_refresh(
+            "claude",
+            &profile_dir,
+            "b@example.test"
+        ));
+        assert_eq!(
+            fs::read_to_string(profile_dir.join(".credentials.json")).unwrap(),
+            "account-b-credentials"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn deferred_claude_repair_refreshes_captured_profile_after_manual_duplicate() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_claude_deferred_duplicate_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let data = root.join("data");
+        let default_claude_home = home.join(".claude");
+        let captured_dir = root.join("captured");
+        fs::create_dir_all(&default_claude_home).unwrap();
+        fs::create_dir_all(&captured_dir).unwrap();
+        fs::write(
+            home.join(".claude.json"),
+            test_claude_state_for_email("support@example.test"),
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(20));
+        fs::write(
+            default_claude_home.join(".credentials.json"),
+            "fresh-support-credentials",
+        )
+        .unwrap();
+        fs::write(
+            captured_dir.join(".claude.json"),
+            test_claude_state_for_email("foreign@example.test"),
+        )
+        .unwrap();
+        fs::write(
+            captured_dir.join(".credentials.json"),
+            "foreign-credentials",
+        )
+        .unwrap();
+        let _home_env = ScopedAgentAccountsEnv::set("HOME", &home);
+        let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data);
+        agent_accounts_registry_write(&json!({
+            "agents": {
+                "claude": {
+                    "profiles": [
+                        {
+                            "id": "manual-support",
+                            "label": "support-manual",
+                            "email": "support@example.test",
+                            "source": "manual",
+                            "dir": root.join("manual").to_string_lossy().to_string()
+                        },
+                        {
+                            "id": "cap-support",
+                            "label": "support",
+                            "email": "support@example.test",
+                            "source": "captured",
+                            "dir": captured_dir.to_string_lossy().to_string()
+                        }
+                    ]
+                }
+            }
+        }))
+        .unwrap();
+
+        assert!(agent_accounts_capture_kind("claude"));
+        assert_eq!(
+            agent_accounts_profile_identity("claude", Some(&captured_dir))["email"].as_str(),
+            Some("support@example.test")
+        );
+        assert!(!captured_dir.join(".credentials.json").exists());
+        assert!(agent_accounts_has_pending_claude_credentials());
+
+        assert!(agent_accounts_capture_kind("claude"));
+        assert_eq!(
+            fs::read_to_string(captured_dir.join(".credentials.json")).unwrap(),
+            "fresh-support-credentials"
+        );
+        assert!(!agent_accounts_has_pending_claude_credentials());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn captured_claude_identity_self_heals_without_touching_manual_profiles() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_claude_self_heal_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let default_claude_home = home.join(".claude");
+        let captured_dir = root.join("captured");
+        let manual_dir = root.join("manual");
+        fs::create_dir_all(&default_claude_home).unwrap();
+        fs::create_dir_all(&captured_dir).unwrap();
+        fs::create_dir_all(&manual_dir).unwrap();
+        fs::write(
+            home.join(".claude.json"),
+            test_claude_state_for_email("syed@example.test"),
+        )
+        .unwrap();
+        fs::write(
+            default_claude_home.join(".credentials.json"),
+            "default-credentials",
+        )
+        .unwrap();
+        fs::write(
+            captured_dir.join(".claude.json"),
+            test_claude_state_with_globals("admin@example.test"),
+        )
+        .unwrap();
+        fs::write(
+            captured_dir.join(".credentials.json"),
+            "foreign-admin-credentials",
+        )
+        .unwrap();
+        fs::write(
+            manual_dir.join(".claude.json"),
+            test_claude_state_for_email("admin@example.test"),
+        )
+        .unwrap();
+        let captured_profile = json!({
+            "id": "cap-support",
+            "label": "support",
+            "email": "support@example.test",
+            "source": "captured",
+            "dir": captured_dir.to_string_lossy().to_string()
+        });
+        let manual_profile = json!({
+            "id": "manual-support",
+            "label": "support-manual",
+            "email": "support@example.test",
+            "source": "manual",
+            "dir": manual_dir.to_string_lossy().to_string()
+        });
+        let mut registry = json!({
+            "agents": {
+                "claude": {
+                    "profiles": [captured_profile.clone(), manual_profile]
+                }
+            }
+        });
+        let _home_env = ScopedAgentAccountsEnv::set("HOME", &home);
+
+        let result = agent_accounts_reconcile_captured_claude_identities(
+            &mut registry,
+            "syed@example.test",
+        );
+        assert!(result.changed());
+        let captured_state = serde_json::from_slice::<Value>(
+            &fs::read(captured_dir.join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(captured_state.get("oauthAccount").is_none());
+        assert!(captured_state.get("projects").is_some());
+        assert!(!captured_dir.join(".credentials.json").exists());
+        assert_eq!(
+            agent_accounts_profile_identity("claude", Some(&manual_dir))["email"].as_str(),
+            Some("admin@example.test")
+        );
+        let view = agent_accounts_profile_view("claude", &captured_profile, "");
+        assert_eq!(view["email"].as_str(), Some("support@example.test"));
+        assert_eq!(view["identity"]["email"].as_str(), Some(""));
+        assert_eq!(view["identity"]["authReady"].as_bool(), Some(false));
+
+        fs::write(
+            default_claude_home.join(".credentials.json"),
+            "fresh-support-credentials",
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(20));
+        fs::write(
+            home.join(".claude.json"),
+            test_claude_state_for_email("support@example.test"),
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(20));
+        fs::write(
+            captured_dir.join(".credentials.json"),
+            "newer-foreign-credentials",
+        )
+        .unwrap();
+        let result = agent_accounts_reconcile_captured_claude_identities(
+            &mut registry,
+            "support@example.test",
+        );
+        assert!(result.changed());
+        assert_eq!(
+            agent_accounts_profile_identity("claude", Some(&captured_dir))["email"].as_str(),
+            Some("support@example.test")
+        );
+        assert_eq!(
+            fs::read_to_string(captured_dir.join(".credentials.json")).unwrap(),
+            "fresh-support-credentials"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn marked_claude_profile_login_rebinds_email_and_collision_safe_label() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_claude_profile_rebind_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let default_claude_home = home.join(".claude");
+        let captured_dir = root.join("captured");
+        fs::create_dir_all(&default_claude_home).unwrap();
+        fs::create_dir_all(&captured_dir).unwrap();
+        fs::write(
+            default_claude_home.join(".credentials.json"),
+            "default-support-credentials",
+        )
+        .unwrap();
+        fs::write(
+            home.join(".claude.json"),
+            test_claude_state_for_email("support@example.test"),
+        )
+        .unwrap();
+        fs::write(
+            captured_dir.join(".claude.json"),
+            test_claude_state_for_email("support@example.test"),
+        )
+        .unwrap();
+        fs::write(
+            captured_dir.join(".credentials.json"),
+            "old-support-credentials",
+        )
+        .unwrap();
+        let _home_env = ScopedAgentAccountsEnv::set("HOME", &home);
+        let mut registry = json!({
+            "agents": {
+                "claude": {
+                    "profiles": [
+                        {
+                            "id": "cap-support",
+                            "label": "support",
+                            "email": "support@example.test",
+                            "source": "captured",
+                            "dir": captured_dir.to_string_lossy().to_string()
+                        },
+                        {
+                            "id": "manual-admin-label",
+                            "label": "admin",
+                            "email": "operations@example.test",
+                            "source": "manual",
+                            "dir": root.join("manual").to_string_lossy().to_string()
+                        }
+                    ]
+                }
+            }
+        });
+
+        agent_accounts_mark_profile_login(&captured_dir);
+        let marker = agent_accounts_profile_login_marker(&captured_dir).unwrap();
+        assert!(!agent_accounts_profile_login_marker_observed_change(
+            &marker,
+            &captured_dir,
+            "support@example.test"
+        ));
+        fs::write(
+            captured_dir.join(".credentials.json"),
+            "new-admin-credentials",
+        )
+        .unwrap();
+        fs::write(
+            captured_dir.join(".claude.json"),
+            test_claude_state_for_email("admin@example.test"),
+        )
+        .unwrap();
+        assert!(agent_accounts_profile_login_marker_observed_change(
+            &marker,
+            &captured_dir,
+            "admin@example.test"
+        ));
+        let result = agent_accounts_reconcile_captured_claude_identities(
+            &mut registry,
+            "support@example.test",
+        );
+
+        assert!(result.registry_changed);
+        let rebound = &registry["agents"]["claude"]["profiles"][0];
+        assert_eq!(rebound["email"].as_str(), Some("admin@example.test"));
+        assert_eq!(rebound["label"].as_str(), Some("admin-example.test"));
+        assert_eq!(
+            fs::read_to_string(captured_dir.join(".credentials.json")).unwrap(),
+            "new-admin-credentials"
+        );
+        agent_accounts_clear_profile_login_marker(&captured_dir);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn profile_login_preparation_neutralizes_a_preexisting_mismatch() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_claude_profile_prepare_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let data = root.join("data");
+        let default_claude_home = home.join(".claude");
+        let captured_dir = root.join("captured");
+        fs::create_dir_all(&default_claude_home).unwrap();
+        fs::create_dir_all(&captured_dir).unwrap();
+        fs::write(
+            default_claude_home.join(".credentials.json"),
+            "default-support-credentials",
+        )
+        .unwrap();
+        fs::write(
+            home.join(".claude.json"),
+            test_claude_state_for_email("support@example.test"),
+        )
+        .unwrap();
+        let _home_env = ScopedAgentAccountsEnv::set("HOME", &home);
+        let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data);
+        fs::write(
+            captured_dir.join(".claude.json"),
+            test_claude_state_for_email("foreign@example.test"),
+        )
+        .unwrap();
+        fs::write(
+            captured_dir.join(".credentials.json"),
+            "foreign-credentials",
+        )
+        .unwrap();
+        agent_accounts_registry_write(&json!({
+            "agents": {
+                "claude": {
+                    "profiles": [{
+                        "id": "cap-support",
+                        "label": "support",
+                        "email": "support@example.test",
+                        "source": "captured",
+                        "dir": captured_dir.to_string_lossy().to_string()
+                    }]
+                }
+            }
+        }))
+        .unwrap();
+
+        assert!(agent_accounts_prepare_captured_claude_profile_login(
+            "cap-support",
+            &captured_dir
+        )
+        .unwrap());
+        assert_eq!(
+            agent_accounts_profile_identity("claude", Some(&captured_dir))["email"].as_str(),
+            Some("")
+        );
+        assert!(!captured_dir.join(".credentials.json").exists());
+        let marker = agent_accounts_profile_login_marker(&captured_dir).unwrap();
+        assert!(marker.baseline_email.is_empty());
+        assert!(!agent_accounts_capture_kind("claude"));
+        assert_eq!(
+            agent_accounts_profile_identity("claude", Some(&captured_dir))["email"].as_str(),
+            Some("")
+        );
+        assert!(!captured_dir.join(".credentials.json").exists());
+        assert!(agent_accounts_profile_login_marker(&captured_dir).is_some());
+        agent_accounts_clear_profile_login_marker(&captured_dir);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn matching_email_profile_login_detects_completion_material_change() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let profile_dir = env::temp_dir().join(format!(
+            "agent_accounts_claude_same_email_login_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join(".claude.json"),
+            test_claude_state_for_email("support@example.test"),
+        )
+        .unwrap();
+        fs::write(profile_dir.join(".credentials.json"), "old-credentials").unwrap();
+        assert!(agent_accounts_mark_profile_login(&profile_dir));
+        let marker = agent_accounts_profile_login_marker(&profile_dir).unwrap();
+        assert!(!agent_accounts_profile_login_marker_observed_change(
+            &marker,
+            &profile_dir,
+            "support@example.test"
+        ));
+
+        fs::write(
+            profile_dir.join(".credentials.json"),
+            "refreshed-credentials",
+        )
+        .unwrap();
+        assert!(agent_accounts_profile_login_marker_observed_change(
+            &marker,
+            &profile_dir,
+            "support@example.test"
+        ));
+        assert!(!agent_accounts_profile_login_marker_observed_state_change(
+            &marker,
+            &profile_dir
+        ));
+        thread::sleep(Duration::from_millis(20));
+        fs::write(
+            profile_dir.join(".claude.json"),
+            test_claude_state_for_email("support@example.test"),
+        )
+        .unwrap();
+        assert!(agent_accounts_profile_login_marker_observed_state_change(
+            &marker,
+            &profile_dir
+        ));
+        agent_accounts_clear_profile_login_marker(&profile_dir);
+        let _ = fs::remove_dir_all(&profile_dir);
+    }
+
+    #[test]
+    fn profile_login_completion_rejects_stale_email_for_new_state() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let profile_dir = env::temp_dir().join(format!(
+            "agent_accounts_claude_stale_login_poll_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join(".claude.json"),
+            test_claude_state_for_email("support@example.test"),
+        )
+        .unwrap();
+        assert!(agent_accounts_mark_profile_login(&profile_dir));
+
+        fs::write(
+            profile_dir.join(".claude.json"),
+            test_claude_state_for_email("admin@example.test"),
+        )
+        .unwrap();
+        assert!(!agent_accounts_profile_login_marker_matching_completion(
+            &profile_dir,
+            "support@example.test"
+        ));
+        assert!(agent_accounts_profile_login_marker(&profile_dir).is_some());
+        assert!(agent_accounts_profile_login_marker_matching_completion(
+            &profile_dir,
+            "admin@example.test"
+        ));
+
+        agent_accounts_clear_profile_login_marker(&profile_dir);
+        let _ = fs::remove_dir_all(&profile_dir);
+    }
+
+    #[test]
+    fn rebind_reserves_old_capture_id_and_dir_when_old_default_is_recaptured() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_claude_rebind_recapture_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let data = root.join("data");
+        let default_claude_home = home.join(".claude");
+        let profile_root = data.join(AGENT_ACCOUNTS_PROFILE_DIR);
+        let old_email = "support@example.test";
+        let rebound_id = agent_accounts_available_capture_profile_id(
+            "claude",
+            old_email,
+            &[],
+            &profile_root,
+        );
+        let rebound_dir = profile_root.join("claude").join(&rebound_id);
+        fs::create_dir_all(&default_claude_home).unwrap();
+        fs::create_dir_all(&rebound_dir).unwrap();
+        fs::write(
+            default_claude_home.join(".credentials.json"),
+            "default-support-credentials",
+        )
+        .unwrap();
+        fs::write(
+            home.join(".claude.json"),
+            test_claude_state_for_email(old_email),
+        )
+        .unwrap();
+        fs::write(
+            rebound_dir.join(".claude.json"),
+            test_claude_state_for_email(old_email),
+        )
+        .unwrap();
+        fs::write(
+            rebound_dir.join(".credentials.json"),
+            "old-support-credentials",
+        )
+        .unwrap();
+        let _home_env = ScopedAgentAccountsEnv::set("HOME", &home);
+        let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data);
+        let mut registry = json!({
+            "agents": {
+                "claude": {
+                    "activeProfileId": AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+                    "profiles": [{
+                        "id": rebound_id,
+                        "label": "support",
+                        "email": old_email,
+                        "source": "captured",
+                        "dir": rebound_dir.to_string_lossy().to_string()
+                    }]
+                }
+            }
+        });
+
+        agent_accounts_mark_profile_login(&rebound_dir);
+        fs::write(
+            rebound_dir.join(".credentials.json"),
+            "new-admin-credentials",
+        )
+        .unwrap();
+        fs::write(
+            rebound_dir.join(".claude.json"),
+            test_claude_state_for_email("admin@example.test"),
+        )
+        .unwrap();
+        let result = agent_accounts_reconcile_captured_claude_identities(
+            &mut registry,
+            old_email,
+        );
+        assert!(result.registry_changed);
+        agent_accounts_registry_write(&registry).unwrap();
+        agent_accounts_clear_profile_login_marker(&rebound_dir);
+
+        assert!(agent_accounts_capture_kind("claude"));
+        let captured_registry = agent_accounts_registry_read();
+        let (_, profiles) = agent_accounts_kind_entry(&captured_registry, "claude");
+        assert_eq!(profiles.len(), 2);
+        let rebound = profiles
+            .iter()
+            .find(|profile| profile.get("email").and_then(Value::as_str) == Some("admin@example.test"))
+            .unwrap();
+        let recaptured = profiles
+            .iter()
+            .find(|profile| profile.get("email").and_then(Value::as_str) == Some(old_email))
+            .unwrap();
+        assert_eq!(rebound.get("id").and_then(Value::as_str), Some(rebound_id.as_str()));
+        assert_ne!(recaptured.get("id").and_then(Value::as_str), Some(rebound_id.as_str()));
+        assert_ne!(
+            agent_accounts_profile_dir(recaptured).as_deref(),
+            Some(rebound_dir.as_path())
+        );
+        assert_eq!(
+            agent_accounts_profile_identity("claude", Some(&rebound_dir))["email"].as_str(),
+            Some("admin@example.test")
+        );
+        assert_eq!(
+            fs::read_to_string(rebound_dir.join(".credentials.json")).unwrap(),
+            "new-admin-credentials"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3934,7 +6600,8 @@ mod agent_accounts_tests {
                     ],
                 }
             }
-        }));
+        }))
+        .unwrap();
 
         let registry = agent_accounts_registry_read();
         let state = agent_accounts_kind_state(&registry, "codex");
@@ -3950,9 +6617,12 @@ mod agent_accounts_tests {
         assert!(agent_accounts_duplicate_profile_ids("codex").is_empty());
         let tokenomics_ids = agent_accounts_profiles_for_tokenomics("codex")
             .into_iter()
-            .map(|(id, _, _)| id)
+            .map(|(id, _, _, _)| id)
             .collect::<Vec<_>>();
-        assert_eq!(tokenomics_ids, vec!["cap-admin".to_string(), "cap-work".to_string()]);
+        assert_eq!(
+            tokenomics_ids,
+            vec!["cap-admin".to_string(), "cap-work".to_string()]
+        );
 
         assert!(!agent_accounts_capture_kind("codex"));
         let registry_after = agent_accounts_registry_read();
@@ -4026,7 +6696,8 @@ mod agent_accounts_tests {
                     ],
                 }
             }
-        }));
+        }))
+        .unwrap();
 
         let registry = agent_accounts_registry_read();
         let state = agent_accounts_kind_state(&registry, "codex");
@@ -4113,7 +6784,7 @@ mod agent_accounts_tests {
         fs::write(
             profile_dir.join("auth.json"),
             test_codex_auth_for_email("dev@example.com")
-                .replace("h.", "h.changed-",)
+                .replace("h.", "h.changed-")
                 .replace(".s", ".changed-s"),
         )
         .unwrap();
@@ -4343,7 +7014,11 @@ mod agent_accounts_tests {
         let data = root.join("data");
         let claude_home = home.join(".claude");
         fs::create_dir_all(&claude_home).unwrap();
-        fs::write(claude_home.join(".credentials.json"), r#"{"token":"secret"}"#).unwrap();
+        fs::write(
+            claude_home.join(".credentials.json"),
+            r#"{"token":"secret"}"#,
+        )
+        .unwrap();
         fs::write(
             home.join(".claude.json"),
             test_claude_state_with_globals("pushed@example.com"),
@@ -4361,7 +7036,10 @@ mod agent_accounts_tests {
         )
         .unwrap();
 
-        assert!(bundle.files.iter().any(|file| file.name == ".credentials.json"));
+        assert!(bundle
+            .files
+            .iter()
+            .any(|file| file.name == ".credentials.json"));
         let state_file = bundle
             .files
             .iter()
@@ -4372,7 +7050,9 @@ mod agent_accounts_tests {
             .unwrap();
         let state = serde_json::from_slice::<Value>(&state_bytes).unwrap();
         assert_eq!(
-            state.pointer("/oauthAccount/emailAddress").and_then(Value::as_str),
+            state
+                .pointer("/oauthAccount/emailAddress")
+                .and_then(Value::as_str),
             Some("pushed@example.com")
         );
         assert!(state.get("projects").is_none());
@@ -4429,7 +7109,11 @@ mod agent_accounts_tests {
         let data = root.join("data");
         let claude_home = home.join(".claude");
         fs::create_dir_all(&claude_home).unwrap();
-        fs::write(claude_home.join(".credentials.json"), r#"{"token":"secret"}"#).unwrap();
+        fs::write(
+            claude_home.join(".credentials.json"),
+            r#"{"token":"secret"}"#,
+        )
+        .unwrap();
         fs::write(
             home.join(".claude.json"),
             test_claude_state_with_globals("pushed@example.com"),
@@ -4444,22 +7128,23 @@ mod agent_accounts_tests {
                     "profiles": []
                 }
             }
-        }));
+        }))
+        .unwrap();
 
         let result = agent_accounts_wipe_pushed_profile_internal(
             None,
             "claude",
             AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
             "pushed@example.com",
+            None,
         )
         .unwrap();
 
         assert_eq!(result["defaultHomeWiped"].as_bool(), Some(true));
         assert!(!claude_home.join(".credentials.json").exists());
-        let state = serde_json::from_str::<Value>(
-            &fs::read_to_string(home.join(".claude.json")).unwrap(),
-        )
-        .unwrap();
+        let state =
+            serde_json::from_str::<Value>(&fs::read_to_string(home.join(".claude.json")).unwrap())
+                .unwrap();
         assert!(state.get("oauthAccount").is_none());
         assert!(state.get("projects").is_some());
         assert!(state.get("mcpServers").is_some());
@@ -4494,35 +7179,20 @@ mod agent_accounts_tests {
                     ]
                 }
             }
-        }));
+        }))
+        .unwrap();
 
-        let error =
-            agent_accounts_wipe_pushed_profile_internal(None, "codex", "cap-escape", "escape@example.com")
-                .unwrap_err();
+        let error = agent_accounts_wipe_pushed_profile_internal(
+            None,
+            "codex",
+            "cap-escape",
+            "escape@example.com",
+            None,
+        )
+        .unwrap_err();
 
         assert!(error.contains("outside managed storage"));
         assert!(escaped_dir.join("auth.json").is_file());
-    }
-
-    #[test]
-    fn materialize_replace_restores_existing_profile_when_temp_rename_fails() {
-        let root = env::temp_dir().join(format!(
-            "agent_accounts_replace_restore_{}",
-            uuid::Uuid::new_v4()
-        ));
-        let final_dir = root.join("profile");
-        let missing_temp = root.join("missing-temp");
-        fs::create_dir_all(&final_dir).unwrap();
-        fs::write(final_dir.join("sentinel.txt"), "original").unwrap();
-
-        let error = agent_accounts_replace_profile_dir_with_backup(&missing_temp, &final_dir)
-            .unwrap_err();
-
-        assert!(error.contains("Unable to install pushed account profile"));
-        assert_eq!(
-            fs::read_to_string(final_dir.join("sentinel.txt")).unwrap(),
-            "original"
-        );
     }
 
     #[test]
@@ -4555,7 +7225,8 @@ mod agent_accounts_tests {
                     ]
                 }
             }
-        }));
+        }))
+        .unwrap();
         agent_account_push_pending().lock().unwrap().clear();
         agent_account_push_pending().lock().unwrap().insert(
             "push-wrong-device".to_string(),
@@ -4566,6 +7237,12 @@ mod agent_accounts_tests {
                 wipe_local_after: true,
                 identity_email: "pushed@example.com".to_string(),
                 delivered: true,
+                created_at_ms: todo_dispatch_now_ms(),
+                expires_at_ms: todo_dispatch_now_ms()
+                    .saturating_add(AGENT_ACCOUNT_PUSH_BLOB_TTL_MS),
+                ack_nonce_b64: String::new(),
+                target_push_public_key_b64: String::new(),
+                source_credentials_sha256: String::new(),
             },
         );
 
@@ -4591,6 +7268,91 @@ mod agent_accounts_tests {
     }
 
     #[test]
+    fn agent_account_push_stale_completion_is_rejected_and_removed() {
+        use hmac::Mac as _;
+
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_stale_completion_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let data = root.join("data");
+        let default_codex_home = home.join(".codex");
+        test_write_codex_profile(&default_codex_home, "pushed@example.com");
+        let _home_env = ScopedAgentAccountsEnv::set("HOME", &home);
+        let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data);
+        agent_accounts_registry_write(&json!({ "agents": {} })).unwrap();
+        let local_key = agent_account_push_public_key_metadata().unwrap();
+        let local_public = agent_account_push_decode_public_key(&local_key.public_key_b64).unwrap();
+        let local_device = cloud_mcp_desktop_device_profile();
+        let local_device_id =
+            cloud_mcp_payload_text(&local_device, &["device_id", "deviceId"]).unwrap();
+        let target_secret = crypto_box::SecretKey::from(agent_account_push_random_32().unwrap());
+        let target_public_b64 =
+            general_purpose::STANDARD.encode(target_secret.public_key().as_bytes());
+        let nonce_b64 = general_purpose::STANDARD.encode(agent_account_push_random_32().unwrap());
+        agent_account_push_pending().lock().unwrap().clear();
+        agent_account_push_pending().lock().unwrap().insert(
+            "push-stale".to_string(),
+            AgentAccountPushPending {
+                agent_kind: "codex".to_string(),
+                profile_id: "default".to_string(),
+                target_device_id: "device-b".to_string(),
+                wipe_local_after: true,
+                identity_email: "pushed@example.com".to_string(),
+                delivered: true,
+                created_at_ms: 1,
+                expires_at_ms: 2,
+                ack_nonce_b64: nonce_b64.clone(),
+                target_push_public_key_b64: target_public_b64,
+                source_credentials_sha256: String::new(),
+            },
+        );
+
+        assert!(!agent_account_push_pending_is_fresh(
+            agent_account_push_pending()
+                .lock()
+                .unwrap()
+                .get("push-stale")
+                .unwrap(),
+            todo_dispatch_now_ms(),
+        ));
+        let payload = agent_account_push_ack_payload(
+            "push-stale",
+            &nonce_b64,
+            &local_device_id,
+            "device-b",
+        )
+        .unwrap();
+        let shared = x25519_dalek::x25519(target_secret.to_bytes(), local_public);
+        let mut mac = hmac::Hmac::<Sha256>::new_from_slice(&shared).unwrap();
+        mac.update(b"diffforge.agent_account_push.ack.v2\0");
+        mac.update(&payload);
+        let proof = general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+        assert!(agent_account_push_handle_remote_status_inner(
+            None,
+            &json!({
+                "event_kind": "remote_command_result",
+                "command_kind": "agent_account_push",
+                "command_id": "agent-account-push-push-stale",
+                "push_id": "push-stale",
+                "status": "completed",
+                "device_id": "device-b",
+                "details": { "recipient_proof_b64": proof }
+            })
+        ));
+        assert!(!agent_account_push_pending()
+            .lock()
+            .unwrap()
+            .contains_key("push-stale"));
+        assert!(default_codex_home.join("auth.json").is_file());
+    }
+
+    #[test]
     fn agent_account_push_target_key_pin_allows_same_key_and_rejects_changed_key() {
         let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
             .get_or_init(|| StdMutex::new(()))
@@ -4603,12 +7365,125 @@ mod agent_accounts_tests {
         let data = root.join("data");
         let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data);
 
-        agent_account_push_verify_or_pin_target_key("Device-A", "key-one").unwrap();
-        agent_account_push_verify_or_pin_target_key("device-a", "key-one").unwrap();
-        let error = agent_account_push_verify_or_pin_target_key("device-a", "key-two")
-            .unwrap_err();
+        let first = crypto_box::SecretKey::from(agent_account_push_random_32().unwrap());
+        let first_key = general_purpose::STANDARD.encode(first.public_key().as_bytes());
+        let first_fingerprint = agent_account_push_key_fingerprint(&first_key).unwrap();
+        let second = crypto_box::SecretKey::from(agent_account_push_random_32().unwrap());
+        let second_key = general_purpose::STANDARD.encode(second.public_key().as_bytes());
+        let second_fingerprint = agent_account_push_key_fingerprint(&second_key).unwrap();
+
+        assert!(agent_account_push_verify_or_pin_target_key(
+            "invalid-device",
+            "not-base64",
+            Some("00")
+        )
+        .is_err());
+        let low_order_key = general_purpose::STANDARD.encode([0_u8; 32]);
+        assert!(agent_account_push_verify_or_pin_target_key(
+            "low-order-device",
+            &low_order_key,
+            Some(&agent_account_push_key_fingerprint(&low_order_key).unwrap())
+        )
+        .is_err());
+        assert!(!agent_account_push_trusted_keys_path().unwrap().exists());
+        let unconfirmed =
+            agent_account_push_verify_or_pin_target_key("Device-A", &first_key, None).unwrap_err();
+        assert!(unconfirmed.contains("out-of-band fingerprint"));
+        agent_account_push_verify_or_pin_target_key(
+            "Device-A",
+            &first_key,
+            Some(&first_fingerprint),
+        )
+        .unwrap();
+        agent_account_push_verify_or_pin_target_key("device-a", &first_key, None).unwrap();
+        let error = agent_account_push_verify_or_pin_target_key(
+            "device-a",
+            &second_key,
+            Some(&second_fingerprint),
+        )
+        .unwrap_err();
 
         assert!(error.contains("security key changed"));
+    }
+
+    #[test]
+    fn agent_account_push_completed_requires_recipient_key_proof() {
+        use hmac::Mac as _;
+
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root =
+            env::temp_dir().join(format!("agent_accounts_ack_proof_{}", uuid::Uuid::new_v4()));
+        let data = root.join("data");
+        let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data);
+        let local_key = agent_account_push_public_key_metadata().unwrap();
+        let local_public = agent_account_push_decode_public_key(&local_key.public_key_b64).unwrap();
+        let local_device = cloud_mcp_desktop_device_profile();
+        let local_device_id =
+            cloud_mcp_payload_text(&local_device, &["device_id", "deviceId"]).unwrap();
+        let target_secret = crypto_box::SecretKey::from(agent_account_push_random_32().unwrap());
+        let target_public_b64 =
+            general_purpose::STANDARD.encode(target_secret.public_key().as_bytes());
+        let nonce_b64 = general_purpose::STANDARD.encode(agent_account_push_random_32().unwrap());
+        let now_ms = todo_dispatch_now_ms();
+        agent_account_push_pending().lock().unwrap().clear();
+        agent_account_push_pending().lock().unwrap().insert(
+            "push-proof".to_string(),
+            AgentAccountPushPending {
+                agent_kind: "codex".to_string(),
+                profile_id: "default".to_string(),
+                target_device_id: "device-b".to_string(),
+                wipe_local_after: false,
+                identity_email: "pushed@example.com".to_string(),
+                delivered: true,
+                created_at_ms: now_ms,
+                expires_at_ms: now_ms.saturating_add(AGENT_ACCOUNT_PUSH_BLOB_TTL_MS),
+                ack_nonce_b64: nonce_b64.clone(),
+                target_push_public_key_b64: target_public_b64,
+                source_credentials_sha256: String::new(),
+            },
+        );
+        let event = |proof: Option<&str>| {
+            let mut event = json!({
+                "event_kind": "remote_command_result",
+                "command_kind": "agent_account_push",
+                "command_id": "agent-account-push-push-proof",
+                "push_id": "push-proof",
+                "status": "completed",
+                "device_id": "device-b",
+            });
+            if let Some(proof) = proof {
+                event["details"] = json!({ "recipient_proof_b64": proof });
+            }
+            event
+        };
+        assert!(agent_account_push_handle_remote_status_inner(
+            None,
+            &event(None)
+        ));
+        assert!(agent_account_push_pending()
+            .lock()
+            .unwrap()
+            .contains_key("push-proof"));
+
+        let payload =
+            agent_account_push_ack_payload("push-proof", &nonce_b64, &local_device_id, "device-b")
+                .unwrap();
+        let shared = x25519_dalek::x25519(target_secret.to_bytes(), local_public);
+        let mut mac = hmac::Hmac::<Sha256>::new_from_slice(&shared).unwrap();
+        mac.update(b"diffforge.agent_account_push.ack.v2\0");
+        mac.update(&payload);
+        let proof = general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+        assert!(agent_account_push_handle_remote_status_inner(
+            None,
+            &event(Some(&proof))
+        ));
+        assert!(!agent_account_push_pending()
+            .lock()
+            .unwrap()
+            .contains_key("push-proof"));
     }
 
     #[test]
@@ -4617,33 +7492,166 @@ mod agent_accounts_tests {
             .get_or_init(|| StdMutex::new(()))
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        agent_account_push_applied().lock().unwrap().clear();
+        let root = env::temp_dir().join(format!("agent_accounts_replay_{}", uuid::Uuid::new_v4()));
+        let data = root.join("data");
+        let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data);
 
         let wrong_target = test_agent_account_push_blob("push-a", "device-a", 1_000, 2_000);
-        assert!(agent_account_push_verify_received_blob(
-            wrong_target,
-            "push-a",
-            "device-b",
-            1_500,
-        )
-        .is_err());
+        assert!(
+            agent_account_push_verify_received_blob(wrong_target, "push-a", "device-b", 1_500,)
+                .is_err()
+        );
 
         let expired = test_agent_account_push_blob("push-b", "device-a", 1_000, 2_000);
-        assert!(agent_account_push_verify_received_blob(
-            expired,
-            "push-b",
-            "device-a",
-            2_001,
-        )
-        .is_err());
+        assert!(
+            agent_account_push_verify_received_blob(expired, "push-b", "device-a", 2_001,).is_err()
+        );
 
-        let valid = test_agent_account_push_blob("push-replay", "device-a", 1_000, 2_000);
-        agent_account_push_verify_received_blob(valid, "push-replay", "device-a", 1_500)
-            .unwrap();
         agent_account_push_reject_if_applied("push-replay", 1_500).unwrap();
+        assert!(agent_account_push_applied_path().unwrap().is_file());
+        assert!(agent_account_push_reject_if_applied("push-replay", 1_500).is_err());
         agent_account_push_mark_applied("push-replay", 2_000, 1_500).unwrap();
         assert!(agent_account_push_reject_if_applied("push-replay", 1_600).is_err());
         assert!(agent_account_push_reject_if_applied("push-replay", 2_001).is_ok());
+    }
+
+    #[test]
+    fn agent_account_push_requires_trusted_authenticated_sender() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_sender_auth_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let sender_data = root.join("sender");
+        let recipient_data = root.join("recipient");
+        let blob = test_authenticated_agent_account_push_blob(
+            &sender_data,
+            &recipient_data,
+            "push-authenticated",
+        );
+        let now_ms = blob.issued_at_ms;
+        {
+            let _env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &recipient_data);
+            agent_account_push_verify_received_blob(
+                blob.clone(),
+                "push-authenticated",
+                "device-recipient",
+                now_ms,
+            )
+            .unwrap();
+
+            let mut tampered = blob.clone();
+            tampered.identity_email = "victim@example.com".to_string();
+            assert!(agent_account_push_verify_received_blob(
+                tampered,
+                "push-authenticated",
+                "device-recipient",
+                now_ms,
+            )
+            .is_err());
+        }
+
+        let unknown_recipient = root.join("unknown-recipient");
+        {
+            let _env =
+                ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &unknown_recipient);
+            let unknown_key = agent_account_push_public_key_metadata().unwrap();
+            let mut unknown_blob = blob.clone();
+            unknown_blob.target_device_id = "device-unknown".to_string();
+            {
+                let _sender_env =
+                    ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &sender_data);
+                agent_account_push_authenticate_outbound_blob(
+                    &mut unknown_blob,
+                    &unknown_key.public_key_b64,
+                )
+                .unwrap();
+            }
+            let error = match agent_account_push_verify_received_blob(
+                unknown_blob,
+                "push-authenticated",
+                "device-unknown",
+                now_ms,
+            ) {
+                Ok(_) => panic!("unknown sender should be rejected"),
+                Err(error) => error,
+            };
+            assert!(error.contains("not user-confirmed"));
+        }
+    }
+
+    #[test]
+    fn agent_account_push_materialize_is_private_and_never_overwrites() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_materialize_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let sender_data = root.join("sender");
+        let recipient_data = root.join("recipient");
+        let home = root.join("home");
+        let blob = test_authenticated_agent_account_push_blob(
+            &sender_data,
+            &recipient_data,
+            "push-materialize",
+        );
+        let profile_id =
+            agent_account_push_profile_id(&blob.agent_kind, &blob.sender_device_id, &blob.push_id);
+        let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &recipient_data);
+        let _home_env = ScopedAgentAccountsEnv::set("HOME", &home);
+        let details = agent_accounts_materialize_pushed_account(blob.clone()).unwrap();
+        assert!(details.get("recipient_proof_b64").is_some());
+        assert!(details.get("identity_email").is_none());
+        assert!(details.get("identityEmail").is_none());
+        assert!(details.get("dir").is_none());
+        let final_dir = recipient_data
+            .join(AGENT_ACCOUNTS_PROFILE_DIR)
+            .join("codex")
+            .join(&profile_id);
+        assert!(final_dir.join("auth.json").is_file());
+
+        let error = agent_accounts_materialize_pushed_account(blob).unwrap_err();
+        assert!(error.contains("refusing to overwrite"));
+        assert!(final_dir.join("auth.json").is_file());
+    }
+
+    #[test]
+    fn agent_account_push_registry_failure_never_reports_materialized() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_registry_failure_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let sender_data = root.join("sender");
+        let recipient_data = root.join("recipient");
+        let home = root.join("home");
+        let blob = test_authenticated_agent_account_push_blob(
+            &sender_data,
+            &recipient_data,
+            "push-registry-failure",
+        );
+        let profile_id =
+            agent_account_push_profile_id(&blob.agent_kind, &blob.sender_device_id, &blob.push_id);
+        let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &recipient_data);
+        let _home_env = ScopedAgentAccountsEnv::set("HOME", &home);
+        let registry_path = agent_accounts_file_path().unwrap();
+        fs::create_dir_all(&registry_path).unwrap();
+
+        assert!(agent_accounts_materialize_pushed_account(blob).is_err());
+        assert!(!recipient_data
+            .join(AGENT_ACCOUNTS_PROFILE_DIR)
+            .join("codex")
+            .join(profile_id)
+            .exists());
     }
 
     #[test]
@@ -4716,12 +7724,14 @@ mod agent_accounts_tests {
         let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data);
         let metadata = agent_account_push_public_key_metadata().unwrap();
         let path = agent_account_push_key_path().unwrap();
-        let replacement_secret = crypto_box::SecretKey::from(agent_account_push_random_32().unwrap());
+        let replacement_secret =
+            crypto_box::SecretKey::from(agent_account_push_random_32().unwrap());
         let replacement_file = AgentAccountPushKeyFile {
             version: 1,
             algorithm: AGENT_ACCOUNT_PUSH_SEALED_ALGORITHM.to_string(),
             private_key_b64: general_purpose::STANDARD.encode(replacement_secret.to_bytes()),
-            public_key_b64: general_purpose::STANDARD.encode(replacement_secret.public_key().as_bytes()),
+            public_key_b64: general_purpose::STANDARD
+                .encode(replacement_secret.public_key().as_bytes()),
             created_at_ms: todo_dispatch_now_ms(),
         };
         agent_account_push_write_private_json(&path, &replacement_file).unwrap();
@@ -4729,6 +7739,98 @@ mod agent_accounts_tests {
         let sealed = agent_account_push_seal_blob(&metadata.public_key_b64, b"same-run").unwrap();
 
         assert_eq!(agent_account_push_open_blob(&sealed).unwrap(), b"same-run");
+    }
+
+    #[test]
+    fn wipe_reprobes_non_default_identity_before_deleting() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_wipe_reprobe_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let data = root.join("data");
+        let pushed_dir = data
+            .join(AGENT_ACCOUNTS_PROFILE_DIR)
+            .join("codex")
+            .join("cap-stale");
+        test_write_codex_profile(&pushed_dir, "account-b@example.com");
+        let _home_env = ScopedAgentAccountsEnv::set("HOME", &home);
+        let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data);
+        agent_accounts_registry_write(&json!({
+            "agents": {
+                "codex": {
+                    "activeProfileId": "cap-stale",
+                    "profiles": [{
+                        "id": "cap-stale",
+                        "email": "account-a@example.com",
+                        "source": "pushed",
+                        "dir": pushed_dir.to_string_lossy().to_string()
+                    }]
+                }
+            }
+        }))
+        .unwrap();
+
+        let error = agent_accounts_wipe_pushed_profile_internal(
+            None,
+            "codex",
+            "cap-stale",
+            "account-a@example.com",
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("identity changed"));
+        assert!(pushed_dir.join("auth.json").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wipe_rejects_symlinked_claude_global_state_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_wipe_claude_symlink_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let data = root.join("data");
+        let claude_home = home.join(".claude");
+        let outside_state = root.join("outside-claude.json");
+        fs::create_dir_all(&claude_home).unwrap();
+        fs::write(claude_home.join(".credentials.json"), "secret-token").unwrap();
+        fs::write(
+            &outside_state,
+            test_claude_state_for_email("pushed@example.com"),
+        )
+        .unwrap();
+        fs::create_dir_all(&home).unwrap();
+        symlink(&outside_state, home.join(".claude.json")).unwrap();
+        let outside_before = fs::read(&outside_state).unwrap();
+        let _home_env = ScopedAgentAccountsEnv::set("HOME", &home);
+        let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data);
+        agent_accounts_registry_write(&json!({ "agents": {} })).unwrap();
+
+        let error = agent_accounts_wipe_pushed_profile_internal(
+            None,
+            "claude",
+            AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+            "pushed@example.com",
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("symlink"));
+        assert!(claude_home.join(".credentials.json").is_file());
+        assert_eq!(fs::read(outside_state).unwrap(), outside_before);
     }
 
     #[test]
@@ -4784,11 +7886,17 @@ mod agent_accounts_tests {
                     ]
                 }
             }
-        }));
+        }))
+        .unwrap();
 
-        let result =
-            agent_accounts_wipe_pushed_profile_internal(None, "codex", "cap-pushed", "pushed@example.com")
-                .unwrap();
+        let result = agent_accounts_wipe_pushed_profile_internal(
+            None,
+            "codex",
+            "cap-pushed",
+            "pushed@example.com",
+            None,
+        )
+        .unwrap();
 
         assert_eq!(result["profileRemoved"].as_bool(), Some(true));
         assert!(!pushed_dir.exists());
@@ -4831,11 +7939,17 @@ mod agent_accounts_tests {
                     ]
                 }
             }
-        }));
+        }))
+        .unwrap();
 
-        let result =
-            agent_accounts_wipe_pushed_profile_internal(None, "codex", "cap-pushed", "pushed@example.com")
-                .unwrap();
+        let result = agent_accounts_wipe_pushed_profile_internal(
+            None,
+            "codex",
+            "cap-pushed",
+            "pushed@example.com",
+            None,
+        )
+        .unwrap();
 
         assert_eq!(result["defaultHomeWiped"].as_bool(), Some(false));
         assert!(default_codex_home.join("auth.json").is_file());
@@ -4886,11 +8000,17 @@ mod agent_accounts_tests {
                     ]
                 }
             }
-        }));
+        }))
+        .unwrap();
 
-        let result =
-            agent_accounts_wipe_pushed_profile_internal(None, "codex", "cap-pushed", "pushed@example.com")
-                .unwrap();
+        let result = agent_accounts_wipe_pushed_profile_internal(
+            None,
+            "codex",
+            "cap-pushed",
+            "pushed@example.com",
+            None,
+        )
+        .unwrap();
 
         assert_eq!(result["defaultHomeWiped"].as_bool(), Some(true));
         assert!(!pushed_dir.exists());
@@ -4934,7 +8054,8 @@ mod agent_accounts_tests {
                     ]
                 }
             }
-        }));
+        }))
+        .unwrap();
         agent_account_push_pending().lock().unwrap().clear();
         agent_account_push_pending().lock().unwrap().insert(
             "push-failed".to_string(),
@@ -4945,6 +8066,12 @@ mod agent_accounts_tests {
                 wipe_local_after: true,
                 identity_email: "pushed@example.com".to_string(),
                 delivered: true,
+                created_at_ms: todo_dispatch_now_ms(),
+                expires_at_ms: todo_dispatch_now_ms()
+                    .saturating_add(AGENT_ACCOUNT_PUSH_BLOB_TTL_MS),
+                ack_nonce_b64: String::new(),
+                target_push_public_key_b64: String::new(),
+                source_credentials_sha256: String::new(),
             },
         );
 
