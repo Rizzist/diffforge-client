@@ -55,6 +55,33 @@ function appControlRoutingDetailBoolean(detail = {}, keys = [], fallback = true)
   return fallback;
 }
 
+export function remoteCommandIsMessageIntent(detail = {}) {
+  const actionKind = appControlRoutingDetailString(detail, ["action_kind", "actionKind"])
+    .toLowerCase()
+    .replace(/[. -]+/g, "_");
+  if (actionKind === "message") {
+    return true;
+  }
+  if (actionKind === "todo") {
+    return false;
+  }
+  const commandKind = appControlRoutingDetailString(detail, [
+    "command_kind",
+    "commandKind",
+    "action",
+    "command",
+  ])
+    .toLowerCase()
+    .replace(/[. -]+/g, "_");
+  return [
+    "terminal_orchestrator_send_message",
+    "terminal_send_message",
+    "orchestrator_send_message",
+    "loopspace_send_message",
+    "send_message",
+  ].includes(commandKind);
+}
+
 function clampLoopspaceAutomationMaxTotal(value) {
   const number = Number.parseInt(value, 10);
   if (!Number.isInteger(number)) {

@@ -4205,7 +4205,7 @@ const TokenomicsPanel = styled.div`
 
 const ProviderAccountRows = styled.div`
   display: grid;
-  gap: 5px;
+  gap: 4px;
   min-width: 0;
 `;
 
@@ -4227,35 +4227,55 @@ const AccountTabs = styled.div`
   }
 `;
 
+/* Pill design mirrors the web dashboard's provider account filter rows
+   (UsageAccountTab in next-diffforge dashboard.js): fully round pills, the
+   provider accent carried by the active pill's ring + text, neutral dark
+   pills otherwise, and a compact 32px icon-only exclude pill per row. */
 const AccountTab = styled.button`
   display: inline-flex;
   align-items: center;
-  justify-content: center;
+  justify-content: ${({ $iconOnly }) => ($iconOnly ? "center" : "flex-start")};
+  gap: 6px;
   flex: 0 0 auto;
-  width: ${({ $iconOnly }) => ($iconOnly ? "30px" : "auto")};
-  max-width: 210px;
-  min-height: 28px;
-  padding: ${({ $iconOnly }) => ($iconOnly ? "0" : "0 10px")};
-  border: 1px solid ${({ $active, $provider }) => ($active ? providerAccent($provider) : "rgba(230, 236, 245, 0.1)")};
-  border-radius: 8px;
+  width: ${({ $iconOnly }) => ($iconOnly ? "32px" : "auto")};
+  min-width: ${({ $iconOnly }) => ($iconOnly ? "32px" : "0")};
+  max-width: 200px;
+  min-height: 26px;
+  padding: ${({ $iconOnly }) => ($iconOnly ? "0" : "0 8px")};
+  border: 1px solid ${({ $active, $provider }) => ($active ? providerAccent($provider) : "rgba(148, 163, 184, 0.16)")};
+  border-radius: 999px;
   color: ${({ $active, $provider }) => ($active ? providerAccent($provider) : "#94a3b8")};
-  background: ${({ $active, $provider }) => ($active ? `color-mix(in srgb, ${providerAccent($provider)} 14%, #10151c)` : "#151b23")};
+  background: ${({ $active, $provider }) => ($active
+    ? `color-mix(in srgb, ${providerAccent($provider)} 14%, rgba(16, 21, 28, 0.74))`
+    : "rgba(16, 21, 28, 0.48)")};
   font: inherit;
   font-size: 11px;
-  font-weight: 750;
+  font-weight: 600;
   overflow: hidden;
+  text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
+  transition: color 130ms ease, border-color 130ms ease;
 
   svg {
-    width: 16px;
-    height: 16px;
+    width: 14px;
+    height: 14px;
     flex: none;
   }
 
+  &:hover {
+    border-color: ${({ $provider }) => providerAccent($provider)};
+    color: #ffffff;
+  }
+
   html[data-forge-theme="light"] & {
+    border-color: ${({ $active, $provider }) => ($active ? providerAccent($provider) : "rgba(71, 85, 105, 0.2)")};
     color: ${({ $active, $provider }) => ($active ? providerAccent($provider) : "#475569")};
     background: ${({ $active, $provider }) => ($active ? `color-mix(in srgb, ${providerAccent($provider)} 10%, #ffffff)` : "#f8fafc")};
+
+    &:hover {
+      color: #0f172a;
+    }
   }
 `;
 

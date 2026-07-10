@@ -189,6 +189,7 @@ import {
   getLoopspaceAutomationAutoSpawnMaxTotal,
   isLoopspaceAutomationAppControlMessage,
   loopspaceAutomationAutoSpawnEnabled,
+  remoteCommandIsMessageIntent,
   selectLoopspaceAutomationAppControlTerminal,
 } from "./appControlOrchestratorRouting.js";
 import {
@@ -17749,6 +17750,29 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   const appControlAgentTerminalIndexesRef = useRef(appControlAgentTerminalIndexes);
   const appControlAgentPendingPromptsRef = useRef(appControlAgentPendingPromptsByIndex);
   const appControlAgentRemoteCommandsByPromptIdRef = useRef(new Map());
+  const clientActionAcksRef = useRef(new Set());
+  const emitClientActionAck = useCallback(({
+    actionKind,
+    clientActionId,
+    entityId = "",
+    error = "",
+    result,
+  }) => {
+    const safeClientActionId = String(clientActionId || "").trim();
+    if (!safeClientActionId || clientActionAcksRef.current.has(safeClientActionId)) {
+      return;
+    }
+    clientActionAcksRef.current.add(safeClientActionId);
+    void invoke("cloud_mcp_record_client_action_ack", {
+      actionKind,
+      clientActionId: safeClientActionId,
+      entityId: String(entityId || "").trim() || null,
+      error: String(error || "").trim() || null,
+      result,
+    }).catch(() => {
+      clientActionAcksRef.current.delete(safeClientActionId);
+    });
+  }, []);
   const appControlAgentSettledCommandTombstonesByTerminalRef = useRef(new Map());
   const appControlAgentSendQueuesByIndexRef = useRef(new Map());
   const appControlAgentSendWatchdogsByPromptIdRef = useRef(new Map());
@@ -18563,6 +18587,15 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       clearAppControlAgentRetryTimer(promptId);
     }
     if (terminalAccepted) {
+      emitClientActionAck({
+        actionKind: "message",
+        clientActionId: appControlRemoteDetailString(
+          existingContext.event,
+          ["clientActionId", "client_action_id"],
+        ),
+        entityId: existingContext.commandId || promptId,
+        result: "applied",
+      });
       const acceptedThreadId = eventThreadId || existingContext.threadId || "";
       const acceptedAgentId = String(
         existingContext.agentId
@@ -18614,6 +18647,16 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       });
     }
 	    if (failed && !terminalAccepted) {
+	      emitClientActionAck({
+	        actionKind: "message",
+	        clientActionId: appControlRemoteDetailString(
+	          existingContext.event,
+	          ["clientActionId", "client_action_id"],
+	        ),
+	        entityId: existingContext.commandId || promptId,
+	        error: event.error || event.message || "Terminal message injection failed.",
+	        result: "failed",
+	      });
 	      recoverOrFailAppControlAgentSendMessage(promptId, "terminal_lifecycle_failure", event);
 	      return;
 	    }
@@ -18748,6 +18791,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     clearAppControlAgentRetryTimer,
     clearAppControlAgentSendWatchdog,
     drainAppControlAgentSendQueue,
+    emitClientActionAck,
     recordAppControlRemoteCommandStatus,
     recoverOrFailAppControlAgentSendMessage,
   ]);
@@ -32995,12 +33039,46 @@ function TerminalView({
   ]);
 
   const handleWorkspaceTerminalLifecycle = useCallback((event) => {
+    const eventType = String(event?.type || event?.eventType || event?.event_type || "")
+      .trim()
+      .toLowerCase();
+    if (["pending-prompt-sent", "pending-prompt-error"].includes(eventType)) {
+      const promptId = String(
+        event?.pendingPromptId
+          || event?.pending_prompt_id
+          || event?.promptEventId
+          || event?.prompt_event_id
+          || event?.promptId
+          || event?.prompt_id
+          || "",
+      ).trim();
+      const inFlight = Array.from(todoQueueTerminalInFlightPromptsRef.current.values())
+        .find((candidate) => String(
+          candidate?.promptId || candidate?.promptEventId || candidate?.prompt_event_id || "",
+        ).trim() === promptId);
+      const item = inFlight
+        ? todoQueueItemsRef.current.find((candidate) => candidate?.id === inFlight.itemId)
+        : null;
+      const remoteCommand = item?.remoteCommand || item?.remote_command || {};
+      if (remoteCommandIsMessageIntent(remoteCommand)) {
+        emitClientActionAck({
+          actionKind: "message",
+          clientActionId: remoteCommand.clientActionId || remoteCommand.client_action_id,
+          entityId: remoteCommand.commandId || remoteCommand.command_id || item?.id || promptId,
+          error: eventType === "pending-prompt-error"
+            ? (event?.error || event?.message || "Terminal message injection failed.")
+            : "",
+          result: eventType === "pending-prompt-error" ? "failed" : "applied",
+        });
+      }
+    }
     openPendingForkWindowBreakout(event);
     recordTodoQueueTerminalLifecycle(event);
     materializeTerminalDirectTodoFromLifecycle(event);
     settleTerminalDirectTodoFromReadiness(event);
     onThreadTerminalLifecycle?.(event);
   }, [
+    emitClientActionAck,
     materializeTerminalDirectTodoFromLifecycle,
     onThreadTerminalLifecycle,
     openPendingForkWindowBreakout,

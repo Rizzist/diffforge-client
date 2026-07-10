@@ -947,6 +947,88 @@ fn terminal_screen_prompt_take_for_instance(
     removed
 }
 
+fn terminal_activity_payload_is_non_prompting_lifecycle(
+    payload: &TerminalActivityHookPayload,
+) -> bool {
+    if payload.terminal_is_prompting_user {
+        return false;
+    }
+    [
+        payload.status.as_str(),
+        payload.activity_status.as_str(),
+        payload.command_phase.as_str(),
+        payload.execution_phase.as_str(),
+        payload.native_rail_state.as_str(),
+        payload.terminal_status.as_str(),
+        payload.terminal_work_state.as_str(),
+        payload.turn_status.as_str(),
+    ]
+    .into_iter()
+    .map(|value| terminal_projection_text(value, ""))
+    .any(|value| {
+        matches!(
+            value.as_str(),
+            "idle" | "running" | "completed" | "complete" | "done"
+        )
+    })
+}
+
+fn terminal_activity_payload_clear_prompt_state(payload: &mut TerminalActivityHookPayload) {
+    payload.prompt_id = Some(String::new());
+    payload.prompt_kind = None;
+    payload.prompt_default_option = None;
+    payload.prompt_ttl_ms = None;
+    payload.prompt_options.clear();
+    payload.allows_free_text = false;
+    payload.manual_prompt_source = None;
+    payload.manual_approval_required = false;
+    payload.provider_blocked_for_user = false;
+    payload.terminal_is_prompting_user = false;
+    payload.prompting_user_kind = None;
+    payload.prompting_user_source = None;
+    payload.prompting_user_confidence = None;
+    payload.prompting_user_text = None;
+}
+
+fn terminal_activity_hook_reconcile_prompt_state(payload: &mut TerminalActivityHookPayload) {
+    if payload.terminal_is_prompting_user {
+        if payload.prompt_id.is_none() {
+            payload.prompt_id = Some(String::new());
+        }
+        return;
+    }
+
+    if terminal_activity_payload_is_non_prompting_lifecycle(payload) {
+        let _ = terminal_screen_prompt_take_for_instance(&payload.pane_id, payload.instance_id);
+        terminal_activity_payload_clear_prompt_state(payload);
+        return;
+    }
+
+    let key = terminal_screen_prompt_active_key(&payload.pane_id, payload.instance_id);
+    let screen_prompt = terminal_screen_prompt_registry()
+        .lock()
+        .ok()
+        .and_then(|active| active.get(&key).cloned());
+    let Some(screen_prompt) = screen_prompt else {
+        terminal_activity_payload_clear_prompt_state(payload);
+        return;
+    };
+
+    payload.prompt_id = Some(screen_prompt.prompt_id.clone());
+    payload.prompt_kind = Some(screen_prompt.prompt_kind.clone());
+    payload.prompt_default_option = screen_prompt.default_option.clone();
+    payload.prompt_options = screen_prompt.options.clone();
+    payload.allows_free_text = screen_prompt.allows_free_text;
+    payload.manual_prompt_source = Some("screen_detector".to_string());
+    payload.manual_approval_required = screen_prompt.manual_approval_required;
+    payload.provider_blocked_for_user = true;
+    payload.terminal_is_prompting_user = true;
+    payload.prompting_user_kind = Some(screen_prompt.prompt_kind);
+    payload.prompting_user_source = Some("screen_detector".to_string());
+    payload.prompting_user_confidence = Some("stable_tail".to_string());
+    payload.prompting_user_text = Some(screen_prompt.prompt_text);
+}
+
 fn terminal_screen_prompt_provider_matches(provider: &str, allowed: &[&str]) -> bool {
     let provider = terminal_normalize_agent_kind(Some(provider)).unwrap_or_else(|| {
         provider
@@ -13444,7 +13526,7 @@ fn emit_terminal_prompt_submitted_activity_started(
         updated_at_ms: now_ms,
     };
     let projected_runtime = terminal_project_runtime(&metadata, &synthetic_runtime, false);
-    let payload = TerminalActivityHookPayload {
+    let mut payload = TerminalActivityHookPayload {
         pane_id: metadata.pane_id.clone(),
         instance_id: instance.id,
         workspace_id: metadata.workspace_id.clone(),
@@ -13528,6 +13610,7 @@ fn emit_terminal_prompt_submitted_activity_started(
         observed_at_ms: now_ms,
         completion_evidence: "backend_prompt_submit".to_string(),
     };
+    terminal_activity_hook_reconcile_prompt_state(&mut payload);
     terminal_runtime_apply_activity_payload(instance, &payload);
     todo_dispatch_observe_activity_hook(app, &payload);
     let cloud_payload = payload.clone();
@@ -16700,6 +16783,12 @@ fn terminal_pending_final_stops(
     TERMINAL_PENDING_FINAL_STOPS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
+fn terminal_pending_final_stop_next_generation() -> u64 {
+    TERMINAL_PENDING_FINAL_STOP_GENERATION
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1)
+}
+
 fn terminal_pending_final_stop_key(pane_id: &str, instance_id: u64) -> String {
     format!("{pane_id}:{instance_id}")
 }
@@ -16863,16 +16952,16 @@ fn terminal_activity_hook_update_pending_final_stop_for_activity(
     runtime: &TerminalRuntimeSnapshot,
     payload: &TerminalActivityHookPayload,
     source: &str,
-) {
+) -> Option<u64> {
     if terminal_activity_hook_is_idle_stop_payload(payload) {
-        return;
+        return None;
     }
     let key = terminal_pending_final_stop_key(pane_id, instance_id);
     let Ok(mut pending) = terminal_pending_final_stops().lock() else {
-        return;
+        return None;
     };
     let Some(candidate) = pending.get_mut(&key) else {
-        return;
+        return None;
     };
     if terminal_activity_hook_cancels_pending_final_stop(payload)
         || !terminal_pending_final_stop_activity_matches(candidate, runtime, payload)
@@ -16888,11 +16977,13 @@ fn terminal_activity_hook_update_pending_final_stop_for_activity(
                 "source": source,
             }),
         );
-        return;
+        return None;
     }
-    candidate.generation = TERMINAL_PENDING_FINAL_STOP_GENERATION
-        .fetch_add(1, Ordering::SeqCst)
-        .wrapping_add(1);
+    // Every candidate and replacement sleeper draws from the same allocator.
+    // A cancelled candidate can leave an old sleeper alive, so a key-local
+    // increment must never collide with a later globally allocated candidate.
+    let generation = terminal_pending_final_stop_next_generation();
+    candidate.generation = generation;
     log_terminal_status_event(
         "backend.terminal_activity_hook.pending_final_stop_extended",
         json!({
@@ -16903,83 +16994,38 @@ fn terminal_activity_hook_update_pending_final_stop_for_activity(
             "source": source,
         }),
     );
+    Some(generation)
 }
 
-fn terminal_activity_hook_buffer_final_stop_candidate(
+fn terminal_pending_final_stop_take_generation(
+    key: &str,
+    generation: u64,
+) -> Option<PendingTerminalFinalStopCandidate> {
+    let Ok(mut pending) = terminal_pending_final_stops().lock() else {
+        return None;
+    };
+    if pending.get(key)?.generation != generation {
+        return None;
+    }
+    pending.remove(key)
+}
+
+fn terminal_activity_hook_schedule_final_stop_quiesce(
     app: &AppHandle,
     terminals: &Arc<RwLock<HashMap<String, TerminalInstance>>>,
     cloud_mcp_state: &CloudMcpState,
     pane_id: &str,
     instance_id: u64,
-    current_runtime: &TerminalRuntimeSnapshot,
-    event: &Value,
-    payload: &TerminalActivityHookPayload,
-    source: &str,
+    generation: u64,
 ) {
-    let key = terminal_pending_final_stop_key(pane_id, instance_id);
-    let generation = TERMINAL_PENDING_FINAL_STOP_GENERATION
-        .fetch_add(1, Ordering::SeqCst)
-        .wrapping_add(1);
-    let session_id = {
-        let payload_session_id = terminal_activity_payload_session_id(payload);
-        if payload_session_id.is_empty() {
-            terminal_activity_runtime_session_id(current_runtime)
-        } else {
-            payload_session_id
-        }
-    };
-    let turn_id = {
-        let payload_turn_id = terminal_activity_payload_turn_id(payload);
-        if payload_turn_id.is_empty() {
-            terminal_activity_runtime_turn_id(current_runtime)
-        } else {
-            payload_turn_id
-        }
-    };
-    let mut buffered_event = event.clone();
-    if let Some(object) = buffered_event.as_object_mut() {
-        object.insert("terminalIdleQuiesceBuffered".to_string(), json!(true));
-        object.insert("codexIdleQuiesceBuffered".to_string(), json!(true));
-    }
-    if let Ok(mut pending) = terminal_pending_final_stops().lock() {
-        pending.insert(
-            key.clone(),
-            PendingTerminalFinalStopCandidate {
-                generation,
-                session_id,
-                turn_id,
-                event: buffered_event,
-            },
-        );
-    }
-    log_terminal_status_event(
-        "backend.terminal_activity_hook.idle_quiesce_buffered",
-        json!({
-            "buffer_ms": TERMINAL_ACTIVITY_IDLE_QUIESCE_MS,
-            "hook_event_name": payload.hook_event_name.clone(),
-            "instance_id": instance_id,
-            "pane_id": clean_terminal_diagnostic_log_text(pane_id),
-            "source": source,
-        }),
-    );
     let app = app.clone();
     let terminals = Arc::clone(terminals);
     let cloud_mcp_state = cloud_mcp_state.clone();
     let pane_id = pane_id.to_string();
+    let key = terminal_pending_final_stop_key(&pane_id, instance_id);
     tauri::async_runtime::spawn(async move {
         sleep(Duration::from_millis(TERMINAL_ACTIVITY_IDLE_QUIESCE_MS)).await;
-        let candidate = {
-            let Ok(mut pending) = terminal_pending_final_stops().lock() else {
-                return;
-            };
-            let Some(candidate) = pending.get(&key) else {
-                return;
-            };
-            if candidate.generation != generation {
-                return;
-            }
-            pending.remove(&key)
-        };
+        let candidate = terminal_pending_final_stop_take_generation(&key, generation);
         let Some(candidate) = candidate else {
             return;
         };
@@ -17050,16 +17096,82 @@ fn terminal_activity_hook_buffer_final_stop_candidate(
     });
 }
 
+fn terminal_activity_hook_buffer_final_stop_candidate(
+    app: &AppHandle,
+    terminals: &Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    cloud_mcp_state: &CloudMcpState,
+    pane_id: &str,
+    instance_id: u64,
+    current_runtime: &TerminalRuntimeSnapshot,
+    event: &Value,
+    payload: &TerminalActivityHookPayload,
+    source: &str,
+) {
+    let key = terminal_pending_final_stop_key(pane_id, instance_id);
+    let generation = terminal_pending_final_stop_next_generation();
+    let session_id = {
+        let payload_session_id = terminal_activity_payload_session_id(payload);
+        if payload_session_id.is_empty() {
+            terminal_activity_runtime_session_id(current_runtime)
+        } else {
+            payload_session_id
+        }
+    };
+    let turn_id = {
+        let payload_turn_id = terminal_activity_payload_turn_id(payload);
+        if payload_turn_id.is_empty() {
+            terminal_activity_runtime_turn_id(current_runtime)
+        } else {
+            payload_turn_id
+        }
+    };
+    let mut buffered_event = event.clone();
+    if let Some(object) = buffered_event.as_object_mut() {
+        object.insert("terminalIdleQuiesceBuffered".to_string(), json!(true));
+        object.insert("codexIdleQuiesceBuffered".to_string(), json!(true));
+    }
+    if let Ok(mut pending) = terminal_pending_final_stops().lock() {
+        pending.insert(
+            key.clone(),
+            PendingTerminalFinalStopCandidate {
+                generation,
+                session_id,
+                turn_id,
+                event: buffered_event,
+            },
+        );
+    }
+    log_terminal_status_event(
+        "backend.terminal_activity_hook.idle_quiesce_buffered",
+        json!({
+            "buffer_ms": TERMINAL_ACTIVITY_IDLE_QUIESCE_MS,
+            "hook_event_name": payload.hook_event_name.clone(),
+            "instance_id": instance_id,
+            "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+            "source": source,
+        }),
+    );
+    terminal_activity_hook_schedule_final_stop_quiesce(
+        app,
+        terminals,
+        cloud_mcp_state,
+        pane_id,
+        instance_id,
+        generation,
+    );
+}
+
 fn apply_terminal_activity_hook_payload(
     app: &AppHandle,
     terminals: &Arc<RwLock<HashMap<String, TerminalInstance>>>,
     cloud_mcp_state: &CloudMcpState,
     instance: &TerminalInstance,
     event: &Value,
-    payload: TerminalActivityHookPayload,
+    mut payload: TerminalActivityHookPayload,
     architecture_payload: Option<TerminalArchitectureActivityPayload>,
     source: &str,
 ) {
+    terminal_activity_hook_reconcile_prompt_state(&mut payload);
     let runtime_snapshot = terminal_runtime_apply_activity_payload(instance, &payload);
     log_terminal_status_event(
         "backend.terminal_activity_hook.lifecycle",
@@ -17378,13 +17490,22 @@ async fn process_terminal_activity_hook_event(
         );
         return;
     }
-    terminal_activity_hook_update_pending_final_stop_for_activity(
+    if let Some(generation) = terminal_activity_hook_update_pending_final_stop_for_activity(
         pane_id,
         instance_id,
         &current_runtime,
         &payload,
         source,
-    );
+    ) {
+        terminal_activity_hook_schedule_final_stop_quiesce(
+            app,
+            terminals,
+            cloud_mcp_state,
+            pane_id,
+            instance_id,
+            generation,
+        );
+    }
     apply_terminal_activity_hook_payload(
         app,
         terminals,
@@ -23991,6 +24112,108 @@ Press enter to confirm
     }
 
     #[test]
+    fn idle_lifecycle_retracts_registered_screen_prompt_and_emits_explicit_clear() {
+        let pane_id = "pane-screen-prompt-idle-retract";
+        let instance_id = 41;
+        let tail = "Hooks need review\n1. Trust all and continue\n2. Continue without trusting\nPress enter to confirm";
+        let candidate = terminal_screen_prompt_detect("codex", tail).expect("detected prompt");
+        let prompt_id = terminal_screen_prompt_hash_id(
+            &candidate.detector_id,
+            pane_id,
+            &candidate.fingerprint_text,
+        );
+        let active = terminal_screen_prompt_active_from_candidate(
+            pane_id,
+            instance_id,
+            prompt_id.clone(),
+            candidate,
+            1,
+        );
+        let key = terminal_screen_prompt_active_key(pane_id, instance_id);
+        terminal_screen_prompt_registry()
+            .lock()
+            .unwrap()
+            .insert(key.clone(), active);
+
+        let mut payload = terminal_activity_hook_test_payload(
+            "provider-turn-completed",
+            "idle",
+            "completed",
+            true,
+            Some("session-main"),
+        );
+        payload.pane_id = pane_id.to_string();
+        payload.instance_id = instance_id;
+        payload.prompt_id = Some(prompt_id);
+        payload.prompt_options.push(TerminalActivityHookPromptOption {
+            id: "stale".to_string(),
+            label: "Stale".to_string(),
+            description: None,
+            value: None,
+            danger: None,
+        });
+
+        terminal_activity_hook_reconcile_prompt_state(&mut payload);
+
+        assert!(!payload.terminal_is_prompting_user);
+        assert_eq!(payload.prompt_id.as_deref(), Some(""));
+        assert!(payload.prompt_options.is_empty());
+        assert!(!terminal_screen_prompt_registry()
+            .lock()
+            .unwrap()
+            .contains_key(&key));
+        terminal_screen_prompt_clear_scan(&key);
+    }
+
+    #[test]
+    fn screen_registry_prompt_is_unioned_into_hook_live_state() {
+        let pane_id = "pane-screen-prompt-union";
+        let instance_id = 42;
+        let tail = "Hooks need review\n1. Trust all and continue\n2. Continue without trusting\nPress enter to confirm";
+        let candidate = terminal_screen_prompt_detect("codex", tail).expect("detected prompt");
+        let prompt_id = terminal_screen_prompt_hash_id(
+            &candidate.detector_id,
+            pane_id,
+            &candidate.fingerprint_text,
+        );
+        let active = terminal_screen_prompt_active_from_candidate(
+            pane_id,
+            instance_id,
+            prompt_id.clone(),
+            candidate,
+            1,
+        );
+        let key = terminal_screen_prompt_active_key(pane_id, instance_id);
+        terminal_screen_prompt_registry()
+            .lock()
+            .unwrap()
+            .insert(key.clone(), active);
+
+        let mut payload = terminal_activity_hook_test_payload(
+            "provider-user-prompt-started",
+            "paused",
+            "awaiting_input",
+            false,
+            Some("session-main"),
+        );
+        payload.pane_id = pane_id.to_string();
+        payload.instance_id = instance_id;
+        payload.execution_phase = "needs_input".to_string();
+        payload.native_rail_state = "paused".to_string();
+        payload.terminal_status = "paused".to_string();
+        payload.terminal_work_state = "paused".to_string();
+        payload.turn_status = "pending".to_string();
+
+        terminal_activity_hook_reconcile_prompt_state(&mut payload);
+
+        assert!(payload.terminal_is_prompting_user);
+        assert_eq!(payload.prompt_id.as_deref(), Some(prompt_id.as_str()));
+        assert!(!payload.prompt_options.is_empty());
+        assert_eq!(payload.prompting_user_source.as_deref(), Some("screen_detector"));
+        terminal_screen_prompt_clear_scan(&key);
+    }
+
+    #[test]
     fn synthetic_prompt_runtime_is_guarded_from_stale_hot_watchdog() {
         let runtime = TerminalRuntimeSnapshot {
             status: "active".to_string(),
@@ -24394,6 +24617,99 @@ Press enter to confirm
             &runtime,
             &tool_payload,
         ));
+    }
+
+    #[test]
+    fn cancelled_bump_stale_sleeper_cannot_claim_rebuffered_final_stop() {
+        let pane_id = "pane-final-stop-reschedule";
+        let instance_id = 73;
+        let key = terminal_pending_final_stop_key(pane_id, instance_id);
+        let original_generation = terminal_pending_final_stop_next_generation();
+        let runtime = TerminalRuntimeSnapshot {
+            status: "active".to_string(),
+            activity_status: "thinking".to_string(),
+            command_phase: "running".to_string(),
+            input_ready: false,
+            input_ready_at: None,
+            prompt_ready_at: None,
+            completed_at: None,
+            provider_session_id: Some("session-main".to_string()),
+            native_session_id: Some("session-main".to_string()),
+            fork_from_provider_session_id: None,
+            provider_turn_id: Some("turn-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            source: "cli-hook:provider-turn-started".to_string(),
+            event_type: "provider-turn-started".to_string(),
+            hook_event_name: "UserPromptSubmit".to_string(),
+            updated_at_ms: 1,
+        };
+        terminal_pending_final_stops().lock().unwrap().insert(
+            key.clone(),
+            PendingTerminalFinalStopCandidate {
+                generation: original_generation,
+                session_id: "session-main".to_string(),
+                turn_id: "turn-1".to_string(),
+                event: json!({}),
+            },
+        );
+        let mut payload = terminal_activity_hook_test_payload(
+            "provider-tool-completed",
+            "thinking",
+            "tool_completed",
+            false,
+            Some("session-main"),
+        );
+        payload.hook_event_name = "PostToolUse".to_string();
+        payload.turn_id = Some("turn-1".to_string());
+        payload.provider_turn_id = Some("turn-1".to_string());
+
+        let generation = terminal_activity_hook_update_pending_final_stop_for_activity(
+            pane_id,
+            instance_id,
+            &runtime,
+            &payload,
+            "test",
+        )
+        .expect("replacement sleeper generation");
+
+        assert_ne!(generation, original_generation);
+        assert_eq!(
+            terminal_pending_final_stops()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .map(|candidate| candidate.generation),
+            Some(generation)
+        );
+
+        // Cancellation removes the candidate but cannot stop its already
+        // spawned replacement sleeper. Re-buffering the same pane must use a
+        // generation that the stale sleeper can never claim.
+        terminal_pending_final_stops().lock().unwrap().remove(&key);
+        let rebuffered_generation = terminal_pending_final_stop_next_generation();
+        terminal_pending_final_stops().lock().unwrap().insert(
+            key.clone(),
+            PendingTerminalFinalStopCandidate {
+                generation: rebuffered_generation,
+                session_id: "session-main".to_string(),
+                turn_id: "turn-2".to_string(),
+                event: json!({"hookEventName": "Stop"}),
+            },
+        );
+
+        assert_ne!(rebuffered_generation, generation);
+        assert!(terminal_pending_final_stop_take_generation(&key, generation).is_none());
+        assert_eq!(
+            terminal_pending_final_stops()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .map(|candidate| candidate.generation),
+            Some(rebuffered_generation)
+        );
+        assert!(
+            terminal_pending_final_stop_take_generation(&key, rebuffered_generation).is_some()
+        );
     }
 
     #[test]

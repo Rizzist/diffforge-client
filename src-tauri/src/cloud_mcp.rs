@@ -32,6 +32,9 @@ const CLOUD_MCP_APPWRITE_JWT_MIN_TTL_SECS: u64 = 60;
 const CLOUD_MCP_APPWRITE_JWT_MAX_TTL_SECS: u64 = 3600;
 const CLOUD_MCP_APPWRITE_JWT_REFRESH_MARGIN_MS: u64 = 60_000;
 const CLOUD_MCP_DEVICE_HEARTBEAT_INTERVAL_MS: u64 = 15_000;
+const CLOUD_MCP_DEVICE_LIVE_CATALOG_RETRY_INITIAL_MS: u64 = 100;
+const CLOUD_MCP_DEVICE_LIVE_CATALOG_RETRY_MAX_MS: u64 = 2_000;
+const CLOUD_MCP_DEVICE_LIVE_CATALOG_RETRY_MAX_ATTEMPTS: usize = 8;
 const CLOUD_MCP_MAX_BEARER_TOKEN_LENGTH: usize = 8192;
 const CLOUD_MCP_RUST_CLIENT_ID: &str = "rust-diffforge-agent";
 const CLOUD_MCP_DESKTOP_USER_AGENT: &str = "DiffForgeDesktop/0.1";
@@ -540,6 +543,8 @@ struct CloudMcpState {
     terminal_output_stream_subscriptions: Arc<StdMutex<HashSet<String>>>,
     terminal_output_tail_by_stream: Arc<StdMutex<HashMap<String, CloudMcpTerminalOutputTail>>>,
     device_live_snapshot_debounce: Arc<StdMutex<Option<String>>>,
+    device_live_catalog_retry_scheduled: Arc<AtomicBool>,
+    device_live_catalog_ready_notify: Arc<tokio::sync::Notify>,
     remote_command_listener_started: Arc<AtomicBool>,
     remote_command_receipts: Arc<Mutex<HashMap<String, u64>>>,
     remote_command_cancellations: Arc<Mutex<HashMap<String, u64>>>,
@@ -804,6 +809,8 @@ impl CloudMcpState {
             terminal_output_stream_subscriptions: Arc::new(StdMutex::new(HashSet::new())),
             terminal_output_tail_by_stream: Arc::new(StdMutex::new(HashMap::new())),
             device_live_snapshot_debounce: Arc::new(StdMutex::new(None)),
+            device_live_catalog_retry_scheduled: Arc::new(AtomicBool::new(false)),
+            device_live_catalog_ready_notify: Arc::new(tokio::sync::Notify::new()),
             remote_command_listener_started: Arc::new(AtomicBool::new(false)),
             remote_command_receipts: Arc::new(Mutex::new(HashMap::new())),
             remote_command_cancellations: Arc::new(Mutex::new(HashMap::new())),
@@ -5248,6 +5255,13 @@ fn cloud_mcp_outbox_claim_due_rows(limit: usize) -> Result<Vec<CloudMcpOutboxRow
     Ok(values)
 }
 
+fn cloud_mcp_outbox_event_is_expedited(event_kind: &str) -> bool {
+    matches!(
+        event_kind.trim(),
+        CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT | "todo.live_state"
+    )
+}
+
 fn cloud_mcp_outbox_claim_expedited_agent_chat_rows(
     limit: usize,
 ) -> Result<Vec<CloudMcpOutboxRow>, String> {
@@ -5261,14 +5275,19 @@ fn cloud_mcp_outbox_claim_expedited_agent_chat_rows(
                 SELECT outbox_id
                 FROM {CLOUD_MCP_OUTBOX_TABLE}
                 WHERE status='queued'
-                  AND event_kind=?2
+                  AND event_kind IN (?2, ?3)
                   AND attempt_count=0
                   AND next_attempt_at_ms<=?1
                 ORDER BY priority ASC, created_at_ms ASC, rowid ASC
-                LIMIT ?3
+                LIMIT ?4
              )"
         ),
-        rusqlite::params![now, CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT, limit as i64],
+        rusqlite::params![
+            now,
+            CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT,
+            "todo.live_state",
+            limit as i64
+        ],
     )
     .map_err(|error| format!("Unable to claim expedited agent chat sync rows: {error}"))?;
     let mut statement = conn
@@ -5277,7 +5296,7 @@ fn cloud_mcp_outbox_claim_expedited_agent_chat_rows(
              FROM {CLOUD_MCP_OUTBOX_TABLE}
              WHERE status='in_flight'
                AND updated_at_ms=?2
-               AND event_kind=?3
+               AND event_kind IN (?3, ?4)
                AND attempt_count=0
              ORDER BY priority ASC, created_at_ms ASC, rowid ASC
              LIMIT ?1"
@@ -5285,7 +5304,12 @@ fn cloud_mcp_outbox_claim_expedited_agent_chat_rows(
         .map_err(|error| format!("Unable to prepare expedited agent chat sync query: {error}"))?;
     let rows = statement
         .query_map(
-            rusqlite::params![limit as i64, now, CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT],
+            rusqlite::params![
+                limit as i64,
+                now,
+                CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT,
+                "todo.live_state"
+            ],
             cloud_mcp_outbox_row_from_statement_row,
         )
         .map_err(|error| format!("Unable to read expedited agent chat sync rows: {error}"))?;
@@ -8042,8 +8066,11 @@ async fn cloud_mcp_send_event_over_app_ws_once(
         .lock()
         .await
         .insert(request_id.clone(), response_tx);
-    let envelope = json!({
-        "kind": "event",
+    let direct_client_action_ack = event_kind
+        .trim()
+        .eq_ignore_ascii_case("client_action_ack");
+    let mut envelope = json!({
+        "kind": if direct_client_action_ack { "client_action_ack" } else { "event" },
         "id": request_id,
         "contract": "diffforge.app_ws.v1",
         "auth": auth,
@@ -8054,6 +8081,12 @@ async fn cloud_mcp_send_event_over_app_ws_once(
             .or_else(|| cloud_mcp_payload_text(&request, &["payload", "workspace_id"])),
         "request": request,
     });
+    // client_action_ack is a first-class app-ws request. Keep the standard
+    // request envelope for traceability, but also expose its payload where the
+    // cloud's dedicated request handler reads first-class request bodies.
+    if direct_client_action_ack {
+        envelope["payload"] = payload.clone();
+    }
     if tx.send(envelope).is_err() {
         state.global_ws_pending.lock().await.remove(&request_id);
         cloud_mcp_fail_sync_activity_key(&sync_activity_key);
@@ -8210,10 +8243,10 @@ async fn cloud_mcp_enqueue_background_sync(
         );
         return;
     }
-    let mut queued_agent_chat_row = false;
+    let mut queued_expedited_row = false;
     match cloud_mcp_outbox_enqueue_event(&event_kind, &payload, priority, &reason) {
         Ok(row) => {
-            queued_agent_chat_row = event_kind == CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT;
+            queued_expedited_row = cloud_mcp_outbox_event_is_expedited(&event_kind);
             if cloud_mcp_tokenomics_device_packet_kind(&event_kind) {
                 cloud_mcp_record_tokenomics_sync_log(
                     "outbox_queued",
@@ -8283,7 +8316,7 @@ async fn cloud_mcp_enqueue_background_sync(
         }
     }
     state.background_sync.notify.notify_one();
-    if queued_agent_chat_row {
+    if queued_expedited_row {
         cloud_mcp_spawn_expedited_agent_chat_drain(state);
     }
 }
@@ -18167,6 +18200,7 @@ async fn cloud_mcp_apply_account_sync_resume_remote_commands(
                 state, &event, &status, &message, details,
             )
             .await;
+            cloud_mcp_ack_remote_todo_intake(state, &event, outcome).await;
         }
         let delete_outcome = todo_dispatch_apply_remote_delete(&app, &event);
         if let Some(outcome) = delete_outcome.as_ref() {
@@ -18177,6 +18211,7 @@ async fn cloud_mcp_apply_account_sync_resume_remote_commands(
                 state, &event, &status, &message, details,
             )
             .await;
+            cloud_mcp_ack_remote_todo_delete(state, &event, outcome).await;
         }
         if crate::daemon_mode_active() && (intake_outcome.is_some() || delete_outcome.is_some()) {
             applied += 1;
@@ -20474,6 +20509,154 @@ async fn cloud_mcp_send_remote_command_status_event(
     Ok(json!({"ok": true, "sent": true, "status": status}))
 }
 
+fn cloud_mcp_client_action_ack_payload(
+    client_action_id: &str,
+    action_kind: &str,
+    result: &str,
+    entity_id: Option<&str>,
+    error: Option<&str>,
+) -> Value {
+    let mut payload = json!({
+        "client_action_id": client_action_id.trim(),
+        "action_kind": action_kind.trim(),
+        "result": result.trim(),
+    });
+    if let Some(object) = payload.as_object_mut() {
+        if let Some(entity_id) = entity_id.map(str::trim).filter(|value| !value.is_empty()) {
+            object.insert("entity_id".to_string(), json!(entity_id));
+        }
+        if let Some(error) = error.map(str::trim).filter(|value| !value.is_empty()) {
+            object.insert("error".to_string(), json!(error));
+        }
+    }
+    payload
+}
+
+pub(crate) async fn cloud_mcp_send_client_action_ack(
+    state: &CloudMcpState,
+    event: &Value,
+    action_kind: &str,
+    result: &str,
+    entity_id: Option<&str>,
+    error: Option<&str>,
+) -> Result<Value, String> {
+    let client_action_id = cloud_mcp_remote_command_field_text(
+        event,
+        &["client_action_id", "clientActionId"],
+    )
+    .unwrap_or_default();
+    if client_action_id.trim().is_empty() {
+        return Ok(json!({"ok": true, "skipped": true, "reason": "missing_client_action_id"}));
+    }
+    if !matches!(action_kind, "message" | "todo") {
+        return Err("client_action_ack action_kind must be message or todo.".to_string());
+    }
+    if !matches!(result, "applied" | "failed") {
+        return Err("client_action_ack result must be applied or failed.".to_string());
+    }
+    let payload = cloud_mcp_client_action_ack_payload(
+        &client_action_id,
+        action_kind,
+        result,
+        entity_id,
+        error,
+    );
+    cloud_mcp_send_event_over_app_ws_once(
+        state,
+        "client_action_ack",
+        &payload,
+        "client-action-ack",
+    )
+    .await
+}
+
+async fn cloud_mcp_ack_remote_todo_intake(
+    state: &CloudMcpState,
+    event: &Value,
+    outcome: &Value,
+) {
+    let status = cloud_mcp_payload_text(outcome, &["status"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let failed = matches!(status.as_str(), "failed" | "rejected" | "error");
+    let entity_id = cloud_mcp_payload_text(outcome, &["details", "todo_id"])
+        .or_else(|| cloud_mcp_payload_text(outcome, &["details", "todoId"]))
+        .or_else(|| cloud_mcp_remote_command_field_text(event, &["todo_id", "todoId"]))
+        .or_else(|| cloud_mcp_remote_command_field_text(event, &["command_id", "commandId"]));
+    let error = failed
+        .then(|| cloud_mcp_payload_text(outcome, &["message"]).unwrap_or_else(|| status.clone()));
+    let Some(action_kind) = cloud_mcp_remote_todo_intake_ack_action_kind(event, failed) else {
+        return;
+    };
+    let _ = cloud_mcp_send_client_action_ack(
+        state,
+        event,
+        action_kind,
+        if failed { "failed" } else { "applied" },
+        entity_id.as_deref(),
+        error.as_deref(),
+    )
+    .await;
+}
+
+async fn cloud_mcp_ack_remote_todo_delete(
+    state: &CloudMcpState,
+    event: &Value,
+    outcome: &Value,
+) {
+    let status = cloud_mcp_payload_text(outcome, &["status"])
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let failed = matches!(status.as_str(), "failed" | "rejected" | "error");
+    let entity_id = cloud_mcp_payload_text(outcome, &["details", "todo_id"])
+        .or_else(|| cloud_mcp_payload_text(outcome, &["details", "todoId"]))
+        .or_else(|| cloud_mcp_remote_command_field_text(event, &["todo_id", "todoId"]));
+    let error = failed
+        .then(|| cloud_mcp_payload_text(outcome, &["message"]).unwrap_or_else(|| status.clone()));
+    let _ = cloud_mcp_send_client_action_ack(
+        state,
+        event,
+        "todo",
+        if failed { "failed" } else { "applied" },
+        entity_id.as_deref(),
+        error.as_deref(),
+    )
+    .await;
+}
+
+fn cloud_mcp_remote_todo_intake_ack_action_kind(
+    event: &Value,
+    failed: bool,
+) -> Option<&'static str> {
+    if todo_dispatch_remote_command_is_message_intent(event) {
+        failed.then_some("message")
+    } else {
+        Some("todo")
+    }
+}
+
+#[tauri::command]
+async fn cloud_mcp_record_client_action_ack(
+    state: State<'_, CloudMcpState>,
+    client_action_id: String,
+    action_kind: String,
+    result: String,
+    entity_id: Option<String>,
+    error: Option<String>,
+) -> Result<Value, String> {
+    let event = json!({"client_action_id": client_action_id});
+    cloud_mcp_send_client_action_ack(
+        state.inner(),
+        &event,
+        action_kind.trim(),
+        result.trim(),
+        entity_id.as_deref(),
+        error.as_deref(),
+    )
+    .await
+}
+
 #[tauri::command]
 async fn cloud_mcp_start_remote_command_listener(
     app: AppHandle,
@@ -20787,6 +20970,7 @@ async fn cloud_mcp_start_remote_command_listener(
                     details,
                 )
                 .await;
+                cloud_mcp_ack_remote_todo_intake(&state_clone, &event, outcome).await;
             }
             let delete_outcome = todo_dispatch_apply_remote_delete(&app, &event);
             if let Some(outcome) = delete_outcome.as_ref() {
@@ -20801,6 +20985,7 @@ async fn cloud_mcp_start_remote_command_listener(
                     details,
                 )
                 .await;
+                cloud_mcp_ack_remote_todo_delete(&state_clone, &event, outcome).await;
             }
             if crate::daemon_mode_active() && (intake_outcome.is_some() || delete_outcome.is_some())
             {
@@ -27054,7 +27239,13 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
 }
 
 fn cloud_mcp_device_live_snapshot_force_replay(reason: &str) -> bool {
-    reason.trim().eq_ignore_ascii_case("websocket_ready_replay")
+    reason
+        .trim()
+        .split(':')
+        .any(|part| {
+            part.eq_ignore_ascii_case("websocket_ready_replay")
+                || part.eq_ignore_ascii_case("workspace_catalog_ready_deferred_republish")
+        })
 }
 
 fn cloud_mcp_device_live_force_replay_identity(mut payload: Value) -> Value {
@@ -27076,8 +27267,118 @@ fn cloud_mcp_device_live_force_replay_identity(mut payload: Value) -> Value {
     payload
 }
 
+fn cloud_mcp_schedule_device_live_catalog_ready_retry(state: &CloudMcpState, reason: &str) {
+    if state
+        .device_live_catalog_retry_scheduled
+        .swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+    let state = state.clone();
+    let reason = reason.to_string();
+    tauri::async_runtime::spawn(async move {
+        for attempt in 0..CLOUD_MCP_DEVICE_LIVE_CATALOG_RETRY_MAX_ATTEMPTS {
+            sleep(cloud_mcp_device_live_catalog_retry_delay(attempt)).await;
+            if crate::app_shutdown_requested() {
+                state
+                    .device_live_catalog_retry_scheduled
+                    .store(false, Ordering::SeqCst);
+                return;
+            }
+            let payload = cloud_mcp_device_live_payload_with_sync_identity(
+                cloud_mcp_device_live_state_snapshot_payload(
+                    &state,
+                    "workspace_catalog_ready_deferred_republish",
+                )
+                .await,
+            );
+            if !cloud_mcp_payload_bool(&payload, &["workspace_catalog_ready"], false) {
+                continue;
+            }
+            state
+                .device_live_catalog_retry_scheduled
+                .store(false, Ordering::SeqCst);
+            cloud_mcp_publish_device_live_state_ready_payload(
+                &state,
+                payload,
+                &format!("{reason}:workspace_catalog_ready_deferred_republish"),
+            )
+            .await;
+            return;
+        }
+        log_terminal_status_event(
+            "backend.cloud_mcp.device_live_state.ws.retry_exhausted",
+            json!({
+                "reason": reason,
+                "attempts": CLOUD_MCP_DEVICE_LIVE_CATALOG_RETRY_MAX_ATTEMPTS,
+                "max_wait_ms": (0..CLOUD_MCP_DEVICE_LIVE_CATALOG_RETRY_MAX_ATTEMPTS)
+                    .map(cloud_mcp_device_live_catalog_retry_delay)
+                    .map(|delay| delay.as_millis() as u64)
+                    .sum::<u64>(),
+                "status": "waiting_for_workspace_catalog_ready_event",
+            }),
+        );
+
+        // Stop polling after the bounded retry window. The durable catalog
+        // writer wakes this task once hydration completes, so a slow startup
+        // still republishes without rebuilding the snapshot forever.
+        tokio::select! {
+            _ = state.device_live_catalog_ready_notify.notified() => {}
+            _ = cloud_mcp_shutdown_goodbye_notify().notified() => {
+                state
+                    .device_live_catalog_retry_scheduled
+                    .store(false, Ordering::SeqCst);
+                return;
+            }
+        }
+        if crate::app_shutdown_requested() {
+            state
+                .device_live_catalog_retry_scheduled
+                .store(false, Ordering::SeqCst);
+            return;
+        }
+        let payload = cloud_mcp_device_live_payload_with_sync_identity(
+            cloud_mcp_device_live_state_snapshot_payload(
+                &state,
+                "workspace_catalog_ready_deferred_republish",
+            )
+            .await,
+        );
+        state
+            .device_live_catalog_retry_scheduled
+            .store(false, Ordering::SeqCst);
+        if cloud_mcp_payload_bool(&payload, &["workspace_catalog_ready"], false) {
+            cloud_mcp_publish_device_live_state_ready_payload(
+                &state,
+                payload,
+                &format!("{reason}:workspace_catalog_ready_deferred_republish"),
+            )
+            .await;
+        } else {
+            cloud_mcp_schedule_device_live_catalog_ready_retry(&state, &reason);
+        }
+    });
+}
+
+fn cloud_mcp_notify_workspace_catalog_ready(state: &CloudMcpState) {
+    if state
+        .device_live_catalog_retry_scheduled
+        .load(Ordering::SeqCst)
+    {
+        state.device_live_catalog_ready_notify.notify_one();
+    }
+}
+
+fn cloud_mcp_device_live_catalog_retry_delay(attempt: usize) -> Duration {
+    let shift = attempt.min(20) as u32;
+    let delay_ms = CLOUD_MCP_DEVICE_LIVE_CATALOG_RETRY_INITIAL_MS
+        .saturating_mul(1_u64 << shift)
+        .min(CLOUD_MCP_DEVICE_LIVE_CATALOG_RETRY_MAX_MS);
+    Duration::from_millis(delay_ms)
+}
+
 async fn cloud_mcp_publish_device_live_state_snapshot(state: &CloudMcpState, reason: &str) {
-    let mut payload = cloud_mcp_device_live_payload_with_sync_identity(
+    let payload = cloud_mcp_device_live_payload_with_sync_identity(
         cloud_mcp_device_live_state_snapshot_payload(state, reason).await,
     );
     if !cloud_mcp_payload_bool(&payload, &["workspace_catalog_ready"], false) {
@@ -27088,8 +27389,17 @@ async fn cloud_mcp_publish_device_live_state_snapshot(state: &CloudMcpState, rea
                 "status": "workspace_catalog_not_ready",
             }),
         );
+        cloud_mcp_schedule_device_live_catalog_ready_retry(state, reason);
         return;
     }
+    cloud_mcp_publish_device_live_state_ready_payload(state, payload, reason).await;
+}
+
+async fn cloud_mcp_publish_device_live_state_ready_payload(
+    state: &CloudMcpState,
+    mut payload: Value,
+    reason: &str,
+) {
     let force_replay = cloud_mcp_device_live_snapshot_force_replay(reason);
     if force_replay {
         payload = cloud_mcp_device_live_force_replay_identity(payload);
@@ -38301,6 +38611,17 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         turn_status,
     );
     let terminal_state_summary = format!("Terminal {}.", state_value);
+    let terminal_is_prompting_user = payload.terminal_is_prompting_user;
+    let prompt_id = if terminal_is_prompting_user {
+        payload.prompt_id.clone().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let prompt_options = if terminal_is_prompting_user {
+        payload.prompt_options.clone()
+    } else {
+        Vec::new()
+    };
     let mut delta = json!({
         "source": "rust-diffforge-activity-hook",
         "event_kind": if device_terminal_orchestrator { "device_terminal_orchestrator_update" } else { "terminal_state_update" },
@@ -38366,24 +38687,24 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         "status_seq": status_seq,
         "observed_at_ms": payload.observed_at_ms,
         "hook_timestamp_ms": payload.hook_timestamp_ms,
-        "prompt_id": payload.prompt_id.clone(),
-        "promptId": payload.prompt_id.clone(),
+        "prompt_id": prompt_id.clone(),
+        "promptId": prompt_id,
         "prompt_kind": payload.prompt_kind.clone(),
         "promptKind": payload.prompt_kind.clone(),
         "prompt_default_option": payload.prompt_default_option.clone(),
         "promptDefaultOption": payload.prompt_default_option.clone(),
         "prompt_ttl_ms": payload.prompt_ttl_ms,
         "promptTtlMs": payload.prompt_ttl_ms,
-        "prompt_options": payload.prompt_options.clone(),
-        "promptOptions": payload.prompt_options.clone(),
+        "prompt_options": prompt_options.clone(),
+        "promptOptions": prompt_options,
         "allows_free_text": payload.allows_free_text,
         "allowsFreeText": payload.allows_free_text,
         "manual_approval_required": payload.manual_approval_required,
         "manualApprovalRequired": payload.manual_approval_required,
         "provider_blocked_for_user": payload.provider_blocked_for_user,
         "providerBlockedForUser": payload.provider_blocked_for_user,
-        "terminal_is_prompting_user": payload.terminal_is_prompting_user,
-        "terminalIsPromptingUser": payload.terminal_is_prompting_user,
+        "terminal_is_prompting_user": terminal_is_prompting_user,
+        "terminalIsPromptingUser": terminal_is_prompting_user,
         "prompting_user_kind": payload.prompting_user_kind.clone(),
         "promptingUserKind": payload.prompting_user_kind.clone(),
         "prompting_user_source": payload.prompting_user_source.clone(),
@@ -57632,6 +57953,73 @@ mod cloud_mcp_tests {
         envelope
     }
 
+    #[tokio::test]
+    async fn client_action_ack_emits_exact_app_ws_contract() {
+        let (state, mut rx) = workspace_consistency_connected_state().await;
+        let send_state = state.clone();
+        let send = tokio::spawn(async move {
+            cloud_mcp_send_client_action_ack(
+                &send_state,
+                &json!({"client_action_id": "client-action-1"}),
+                "message",
+                "applied",
+                Some("message-1"),
+                None,
+            )
+            .await
+        });
+
+        let envelope = workspace_consistency_capture_and_ack(&state, &mut rx).await;
+        assert_eq!(envelope["kind"], json!("client_action_ack"));
+        assert_eq!(envelope["payload"], envelope["request"]["payload"]);
+        let payload = &envelope["request"]["payload"];
+        assert_eq!(
+            envelope["request"]["event_kind"],
+            json!("client_action_ack")
+        );
+        assert_eq!(payload["client_action_id"], json!("client-action-1"));
+        assert_eq!(payload["action_kind"], json!("message"));
+        assert_eq!(payload["result"], json!("applied"));
+        assert_eq!(payload["entity_id"], json!("message-1"));
+        assert!(payload.get("error").is_none());
+        assert!(send.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn remote_todo_delete_emits_failed_ack_with_same_client_action_id() {
+        let (state, mut rx) = workspace_consistency_connected_state().await;
+        let ack_state = state.clone();
+        let ack = tokio::spawn(async move {
+            cloud_mcp_ack_remote_todo_delete(
+                &ack_state,
+                &json!({
+                    "client_action_id": "client-action-delete-1",
+                    "todo_id": "todo-delete-1"
+                }),
+                &json!({
+                    "status": "rejected",
+                    "message": "Todo changed before delete.",
+                    "details": {"todo_id": "todo-delete-1"}
+                }),
+            )
+            .await;
+        });
+
+        let envelope = workspace_consistency_capture_and_ack(&state, &mut rx).await;
+        assert_eq!(envelope["kind"], json!("client_action_ack"));
+        assert_eq!(
+            envelope["payload"],
+            json!({
+                "client_action_id": "client-action-delete-1",
+                "action_kind": "todo",
+                "result": "failed",
+                "entity_id": "todo-delete-1",
+                "error": "Todo changed before delete."
+            })
+        );
+        ack.await.unwrap();
+    }
+
     fn chat_attachment_push_test_png(seed: u8) -> Vec<u8> {
         let mut bytes = b"\x89PNG\r\n\x1a\nchat-attachment-push-test".to_vec();
         bytes.push(seed);
@@ -58274,6 +58662,41 @@ mod cloud_mcp_tests {
         ));
     }
 
+    #[test]
+    fn device_live_catalog_retry_backoff_is_bounded_and_capped() {
+        let delays = (0..CLOUD_MCP_DEVICE_LIVE_CATALOG_RETRY_MAX_ATTEMPTS)
+            .map(cloud_mcp_device_live_catalog_retry_delay)
+            .collect::<Vec<_>>();
+
+        assert_eq!(delays.len(), CLOUD_MCP_DEVICE_LIVE_CATALOG_RETRY_MAX_ATTEMPTS);
+        assert_eq!(delays[0], Duration::from_millis(100));
+        assert_eq!(delays.last().copied(), Some(Duration::from_millis(2_000)));
+        assert!(delays.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(delays
+            .iter()
+            .all(|delay| *delay <= Duration::from_millis(2_000)));
+        assert_eq!(
+            delays.iter().map(Duration::as_millis).sum::<u128>(),
+            9_100
+        );
+        assert!(cloud_mcp_device_live_snapshot_force_replay(
+            "startup:workspace_catalog_ready_deferred_republish"
+        ));
+    }
+
+    #[tokio::test]
+    async fn workspace_catalog_ready_event_wakes_deferred_republish_waiter() {
+        let state = CloudMcpState::new();
+        state
+            .device_live_catalog_retry_scheduled
+            .store(true, Ordering::SeqCst);
+        let notified = state.device_live_catalog_ready_notify.notified();
+        cloud_mcp_notify_workspace_catalog_ready(&state);
+        timeout(Duration::from_millis(50), notified)
+            .await
+            .expect("catalog writer should wake the deferred republish waiter");
+    }
+
     #[tokio::test]
     async fn workspace_device_consistency_reconnect_publishes_complete_wire_catalog() {
         let _guard = CLOUD_MCP_TEST_ENV_LOCK
@@ -58361,9 +58784,24 @@ mod cloud_mcp_tests {
         let (unhydrated_state, mut unhydrated_rx) = workspace_consistency_connected_state().await;
         cloud_mcp_publish_device_live_state_snapshot(&unhydrated_state, "websocket_ready_replay")
             .await;
-        assert!(timeout(Duration::from_millis(100), unhydrated_rx.recv())
+        assert!(timeout(Duration::from_millis(50), unhydrated_rx.recv())
             .await
             .is_err());
+        workspace_consistency_write_catalog(&data_root, json!([]));
+        let deferred_envelope =
+            workspace_consistency_capture_and_ack(&unhydrated_state, &mut unhydrated_rx).await;
+        assert_eq!(
+            deferred_envelope["request"]["payload"]["workspace_catalog_ready"],
+            json!(true)
+        );
+        assert_eq!(
+            deferred_envelope["request"]["payload"]["workspaces"],
+            json!([])
+        );
+        assert_eq!(
+            deferred_envelope["request"]["payload"]["force_connection_replay"],
+            json!(true)
+        );
 
         let _ = fs::remove_dir_all(data_root);
         let _ = fs::remove_dir_all(cache_root);
@@ -65934,7 +66372,7 @@ mod cloud_mcp_tests {
     }
 
     #[test]
-    fn expedited_agent_chat_claim_selects_only_first_attempt_chat_rows() {
+    fn expedited_claim_selects_first_attempt_agent_chat_and_todo_rows() {
         let _guard = CLOUD_MCP_TEST_ENV_LOCK
             .get_or_init(|| StdMutex::new(()))
             .lock()
@@ -65949,6 +66387,8 @@ mod cloud_mcp_tests {
         for (outbox_id, event_kind, attempt_count) in [
             ("chat-first", CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT, 0),
             ("chat-retry", CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT, 1),
+            ("todo-first", "todo.live_state", 0),
+            ("todo-retry", "todo.live_state", 1),
             ("live-first", "device_live_state_snapshot", 0),
         ] {
             conn.execute(
@@ -65974,10 +66414,21 @@ mod cloud_mcp_tests {
 
         let rows = cloud_mcp_outbox_claim_expedited_agent_chat_rows(24).unwrap();
 
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].outbox_id, "chat-first");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.outbox_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["chat-first", "todo-first"]
+        );
         let conn = cloud_mcp_open_outbox_conn().unwrap();
-        let statuses = ["chat-first", "chat-retry", "live-first"]
+        let statuses = [
+            "chat-first",
+            "chat-retry",
+            "todo-first",
+            "todo-retry",
+            "live-first",
+        ]
             .into_iter()
             .map(|outbox_id| {
                 conn.query_row(
@@ -65988,7 +66439,10 @@ mod cloud_mcp_tests {
                 .unwrap()
             })
             .collect::<Vec<_>>();
-        assert_eq!(statuses, vec!["in_flight", "queued", "queued"]);
+        assert_eq!(
+            statuses,
+            vec!["in_flight", "queued", "in_flight", "queued", "queued"]
+        );
         drop(conn);
         let _ = fs::remove_dir_all(root);
     }

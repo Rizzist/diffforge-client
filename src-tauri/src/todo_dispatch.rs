@@ -255,6 +255,7 @@ fn todo_dispatch_normalize_status(value: &str) -> String {
         "running",
         "dispatching",
         "completed",
+        "done",
         "failed",
         "cancelled",
         "canceled",
@@ -277,6 +278,13 @@ fn todo_dispatch_normalize_status(value: &str) -> String {
         "parked" | "resume_ready" | "resume_requested" => "paused".to_string(),
         other => other.to_string(),
     }
+}
+
+fn todo_dispatch_remote_intake_status(event: &Value) -> String {
+    todo_dispatch_normalize_status(&todo_dispatch_text(
+        event,
+        &["todo_status", "todoStatus", "status", "mode"],
+    ))
 }
 
 fn todo_store_normalize_lifecycle_status(value: &str) -> String {
@@ -310,6 +318,13 @@ fn todo_store_normalize_lifecycle_status(value: &str) -> String {
     }
 }
 
+fn todo_dispatch_wire_status(value: &str) -> String {
+    match value.trim() {
+        "completed" => "done".to_string(),
+        status => status.to_string(),
+    }
+}
+
 fn todo_dispatch_status_is_active(status: &str) -> bool {
     let status = status.trim().to_ascii_lowercase().replace(['-', ' '], "_");
     matches!(
@@ -329,7 +344,7 @@ fn todo_dispatch_status_is_active(status: &str) -> bool {
 fn todo_dispatch_status_is_settled(status: &str) -> bool {
     matches!(
         status,
-        "completed" | "failed" | "interrupted" | "cancelled" | "timed_out"
+        "completed" | "done" | "failed" | "interrupted" | "cancelled" | "timed_out"
     )
 }
 
@@ -719,6 +734,36 @@ fn todo_dispatch_remote_command_is_orchestrator_send_message(command_kind: &str)
     )
 }
 
+fn todo_dispatch_remote_command_is_message_intent(event: &Value) -> bool {
+    match todo_dispatch_text(event, &["action_kind", "actionKind"])
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "message" => true,
+        "todo" => false,
+        _ => todo_dispatch_remote_command_is_orchestrator_send_message(&todo_dispatch_text(
+            event,
+            &["command_kind", "commandKind", "action", "command"],
+        )),
+    }
+}
+
+fn todo_dispatch_post_injection_message_ack_kind(
+    item: &Value,
+    injection_completed: bool,
+) -> Option<&'static str> {
+    (injection_completed
+        && todo_dispatch_remote_command_is_message_intent(item)
+        && !todo_dispatch_nested_text(
+            item,
+            &["client_action_id", "clientActionId"],
+            &["remoteCommand", "remote_command"],
+        )
+        .is_empty())
+    .then_some("message")
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum TodoDispatchRemoteIntakeScopeDecision {
     Continue,
@@ -783,6 +828,9 @@ fn todo_dispatch_remote_intake_already_current(
     requested_model: &str,
     requested_reasoning_effort: &str,
     requested_speed: &str,
+    client_action_id: &str,
+    action_kind: &str,
+    command_kind: &str,
 ) -> bool {
     if todo_store_item_status(item) != status {
         return false;
@@ -871,6 +919,18 @@ fn todo_dispatch_remote_intake_already_current(
         item,
         &["speed", "serviceTier", "service_tier"],
         requested_speed,
+    ) && todo_dispatch_remote_intake_field_matches(
+        item,
+        &["clientActionId", "client_action_id"],
+        client_action_id,
+    ) && todo_dispatch_remote_intake_field_matches(
+        item,
+        &["actionKind", "action_kind"],
+        action_kind,
+    ) && todo_dispatch_remote_intake_field_matches(
+        item,
+        &["commandKind", "command_kind"],
+        command_kind,
     )
 }
 
@@ -921,8 +981,14 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
     }
     let command_id = todo_dispatch_text(event, &["command_id", "commandId"]);
     let workspace_id = todo_dispatch_text(event, &["workspace_id", "workspaceId"]);
+    let message_intent = todo_dispatch_remote_command_is_message_intent(event);
+    let scope_command_kind = if message_intent {
+        "send_message"
+    } else {
+        command_kind.as_str()
+    };
     match todo_dispatch_remote_intake_scope_decision_for_webview(
-        &command_kind,
+        scope_command_kind,
         &command_id,
         &workspace_id,
         todo_dispatch_webview_dispatcher_active(),
@@ -959,15 +1025,10 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
     let chat_attachments = todo_dispatch_chat_attachment_refs(event);
     let chat_attachments_value = todo_dispatch_chat_attachment_refs_value(&chat_attachments);
     let workspace_name = todo_dispatch_text(event, &["workspace_name", "workspaceName"]);
-    let requested_status = todo_dispatch_normalize_status(&todo_dispatch_text(
-        event,
-        &["todo_status", "todoStatus", "status", "mode"],
-    ));
-    let intake_status = if requested_status == "queued" {
-        "queued"
-    } else {
-        "listed"
-    };
+    let intake_status = todo_dispatch_remote_intake_status(event);
+    let intake_status = intake_status.as_str();
+    let client_action_id = todo_dispatch_text(event, &["client_action_id", "clientActionId"]);
+    let action_kind = if message_intent { "message" } else { "todo" };
     let origin_device_id = todo_dispatch_text(
         event,
         &[
@@ -1009,6 +1070,12 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
         "commandId": command_id,
         "itemId": command_id,
         "originDeviceId": origin_device_id,
+        "clientActionId": client_action_id,
+        "client_action_id": client_action_id,
+        "actionKind": action_kind,
+        "action_kind": action_kind,
+        "commandKind": command_kind,
+        "command_kind": command_kind,
         "remoteIntake": true,
         "remote_intake": true,
         "source": remote_intake_source,
@@ -1166,6 +1233,9 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                             &requested_model,
                             &requested_reasoning_effort,
                             &requested_speed,
+                            &client_action_id,
+                            action_kind,
+                            &command_kind,
                         ) {
                             changed_item = Some(existing.clone());
                             changed_kind = "remote_todo_already_current";
@@ -1279,6 +1349,26 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                                         json!(origin_client_id.clone()),
                                     );
                                 }
+                                if !client_action_id.is_empty() {
+                                    object.insert(
+                                        "clientActionId".to_string(),
+                                        json!(client_action_id.clone()),
+                                    );
+                                    object.insert(
+                                        "client_action_id".to_string(),
+                                        json!(client_action_id.clone()),
+                                    );
+                                }
+                                object.insert("actionKind".to_string(), json!(action_kind));
+                                object.insert("action_kind".to_string(), json!(action_kind));
+                                object.insert(
+                                    "commandKind".to_string(),
+                                    json!(command_kind.clone()),
+                                );
+                                object.insert(
+                                    "command_kind".to_string(),
+                                    json!(command_kind.clone()),
+                                );
                                 if !origin_device_id.is_empty() {
                                     object.insert(
                                         "originDeviceId".to_string(),
@@ -1395,6 +1485,28 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                                         "originWorkspaceId".to_string(),
                                         json!(origin_workspace_id.clone()),
                                     );
+                                    if !client_action_id.is_empty() {
+                                        remote_object.insert(
+                                            "clientActionId".to_string(),
+                                            json!(client_action_id.clone()),
+                                        );
+                                        remote_object.insert(
+                                            "client_action_id".to_string(),
+                                            json!(client_action_id.clone()),
+                                        );
+                                    }
+                                    remote_object
+                                        .insert("actionKind".to_string(), json!(action_kind));
+                                    remote_object
+                                        .insert("action_kind".to_string(), json!(action_kind));
+                                    remote_object.insert(
+                                        "commandKind".to_string(),
+                                        json!(command_kind.clone()),
+                                    );
+                                    remote_object.insert(
+                                        "command_kind".to_string(),
+                                        json!(command_kind.clone()),
+                                    );
                                     if chat_attachments.is_empty() {
                                         remote_object.remove("attachments");
                                     } else {
@@ -1466,6 +1578,12 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                     "origin_device_id": origin_device_id,
                     "originWorkspaceId": origin_workspace_id,
                     "origin_workspace_id": origin_workspace_id,
+                    "clientActionId": client_action_id,
+                    "client_action_id": client_action_id,
+                    "actionKind": action_kind,
+                    "action_kind": action_kind,
+                    "commandKind": command_kind,
+                    "command_kind": command_kind,
                     "model": requested_model.clone(),
                     "model_id": requested_model.clone(),
                     "modelId": requested_model.clone(),
@@ -1487,6 +1605,12 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                         "originClientId": origin_client_id,
                         "originDeviceId": origin_device_id,
                         "originWorkspaceId": origin_workspace_id,
+                        "clientActionId": client_action_id,
+                        "client_action_id": client_action_id,
+                        "actionKind": action_kind,
+                        "action_kind": action_kind,
+                        "commandKind": command_kind,
+                        "command_kind": command_kind,
                         "model": requested_model.clone(),
                         "model_id": requested_model.clone(),
                         "modelId": requested_model,
@@ -3382,7 +3506,7 @@ fn todo_dispatch_todo_sync_commit_payload(
         return None;
     }
     let now_iso = chrono_like_now_iso();
-    let status = match todo_store_item_status(item).as_str() {
+    let status = match todo_dispatch_wire_status(&todo_store_item_status(item)).as_str() {
         "" => "listed".to_string(),
         value => value.to_string(),
     };
@@ -3411,6 +3535,23 @@ fn todo_dispatch_todo_sync_commit_payload(
         ],
     );
     let requested_speed = todo_dispatch_text(item, &["speed", "serviceTier", "service_tier"]);
+    let attachments = todo_dispatch_chat_attachment_refs(item);
+    let attachments_value = todo_dispatch_chat_attachment_refs_value(&attachments);
+    let client_action_id = todo_dispatch_nested_text(
+        item,
+        &["client_action_id", "clientActionId"],
+        &["remoteCommand", "remote_command"],
+    );
+    let action_kind = if todo_dispatch_remote_command_is_message_intent(item) {
+        "message"
+    } else {
+        "todo"
+    };
+    let command_kind = todo_dispatch_nested_text(
+        item,
+        &["command_kind", "commandKind"],
+        &["remoteCommand", "remote_command"],
+    );
     let origin_client_id = todo_dispatch_nested_text(
         item,
         &[
@@ -3532,6 +3673,22 @@ fn todo_dispatch_todo_sync_commit_payload(
         "providerSessionId": todo_dispatch_text(item, &["providerSessionId", "provider_session_id", "sessionId", "session_id"]),
     });
     if let Some(meta_object) = meta.as_object_mut() {
+        if !attachments.is_empty() {
+            meta_object.insert("attachments".to_string(), attachments_value);
+        }
+        if !client_action_id.is_empty() {
+            meta_object.insert(
+                "client_action_id".to_string(),
+                json!(client_action_id.clone()),
+            );
+            meta_object.insert("clientActionId".to_string(), json!(client_action_id));
+        }
+        meta_object.insert("action_kind".to_string(), json!(action_kind));
+        meta_object.insert("actionKind".to_string(), json!(action_kind));
+        if !command_kind.is_empty() {
+            meta_object.insert("command_kind".to_string(), json!(command_kind.clone()));
+            meta_object.insert("commandKind".to_string(), json!(command_kind));
+        }
         if !origin_client_id.is_empty() {
             meta_object.insert(
                 "origin_client_id".to_string(),
@@ -11291,18 +11448,64 @@ mod todo_dispatch_backend_tests {
 
     #[test]
     fn remote_intake_defaults_missing_status_to_queued() {
-        let requested_status = todo_dispatch_normalize_status("");
-        let intake_status = if requested_status == "queued" {
-            "queued"
-        } else {
-            "listed"
-        };
+        let intake_status = todo_dispatch_normalize_status("");
         assert_eq!(intake_status, "queued");
         assert!(todo_dispatch_backend_item_dispatchable(&json!({
             "id": "command-1",
             "status": intake_status,
             "text": "ship it",
         })));
+    }
+
+    #[test]
+    fn remote_intake_applies_explicit_queued_status_as_queued() {
+        let event = json!({
+            "todo_status": "queued",
+        });
+        let intake_status = todo_dispatch_remote_intake_status(&event);
+        let mut item = json!({"id": "todo-queued"});
+        todo_store_set_item_status(&mut item, &intake_status, "remote_todo_intake");
+
+        assert_eq!(intake_status, "queued");
+        assert_eq!(todo_store_item_status(&item), "queued");
+    }
+
+    #[test]
+    fn message_intent_ack_is_deferred_until_post_injection() {
+        let event = json!({
+            "commandKind": "todo_queue",
+            "action_kind": "message",
+            "client_action_id": "client-action-message-1",
+        });
+
+        assert!(todo_dispatch_remote_command_is_message_intent(&event));
+        assert_eq!(
+            cloud_mcp_remote_todo_intake_ack_action_kind(&event, false),
+            None
+        );
+        assert_eq!(
+            todo_dispatch_post_injection_message_ack_kind(&event, false),
+            None
+        );
+        assert_eq!(
+            todo_dispatch_post_injection_message_ack_kind(&event, true),
+            Some("message")
+        );
+        assert_eq!(
+            todo_dispatch_text(&event, &["client_action_id", "clientActionId"]),
+            "client-action-message-1"
+        );
+
+        let explicit_todo = json!({
+            "commandKind": "send_message",
+            "action_kind": "todo",
+            "client_action_id": "client-action-todo-1",
+        });
+        assert!(!todo_dispatch_remote_command_is_message_intent(&explicit_todo));
+        assert_eq!(
+            cloud_mcp_remote_todo_intake_ack_action_kind(&explicit_todo, false),
+            Some("todo")
+        );
     }
 
     #[test]
@@ -11640,6 +11843,13 @@ mod todo_dispatch_backend_tests {
             "kind": "todo",
             "text": "Run the queued todo",
             "targetTerminalId": "pane-1",
+            "attachments": [{
+                "attachment_id": "attachment-1",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "bytes": 128,
+                "mime": "image/png",
+                "name": "diagram.png",
+            }],
         });
         todo_store_set_item_status(&mut item, "running", "todo_queue_backend_submit");
         if let Some(object) = item.as_object_mut() {
@@ -11665,6 +11875,10 @@ mod todo_dispatch_backend_tests {
             payload["ops"][0][7]["reason"].as_str(),
             Some("todo_queue_backend_submit")
         );
+        assert_eq!(
+            payload["ops"][0][7]["attachments"][0]["sha256"].as_str(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
 
         let entries = cloud_mcp_todo_sync_entries_from_ops(&payload);
         assert_eq!(entries.len(), 1);
@@ -11673,6 +11887,34 @@ mod todo_dispatch_backend_tests {
             entries[0]["payload"]["todoStatus"].as_str(),
             Some("running")
         );
+    }
+
+    #[test]
+    fn done_status_round_trips_on_todo_wire_as_done() {
+        let mut item = json!({
+            "id": "todo-done-1",
+            "kind": "todo",
+            "text": "Completed todo",
+            "targetTerminalId": "pane-1",
+        });
+        todo_store_set_item_status(&mut item, "done", "remote_todo_intake");
+        assert_eq!(todo_store_item_status(&item), "completed");
+
+        let payload = todo_dispatch_todo_sync_commit_payload(
+            "workspace-a",
+            "Workspace A",
+            "/tmp/workspace-a",
+            &item,
+            "remote_todo_intake",
+            "rust-diffforge-todo-dispatch",
+        )
+        .expect("done payload");
+
+        assert_eq!(payload["ops"][0][5], json!("done"));
+        let entries = cloud_mcp_todo_sync_entries_from_ops(&payload);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["todoStatus"], json!("done"));
+        assert_eq!(entries[0]["payload"]["todoStatus"], json!("done"));
     }
 }
 
@@ -12955,6 +13197,23 @@ async fn todo_dispatch_backend_submit(
         "todo_queue_backend_submit",
         Some(&thread_id),
     );
+
+    if let Some(action_kind) = todo_dispatch_post_injection_message_ack_kind(item, true) {
+        let state = app.state::<CloudMcpState>().inner().clone();
+        let ack_event = item.clone();
+        let ack_entity_id = prompt_event_id.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = cloud_mcp_send_client_action_ack(
+                &state,
+                &ack_event,
+                action_kind,
+                "applied",
+                Some(&ack_entity_id),
+                None,
+            )
+            .await;
+        });
+    }
 
     todo_dispatch_terminal_runtime_mark_busy(&pane_id);
     let _ = todo_dispatch_record_receipt_internal(

@@ -37603,6 +37603,21 @@ export default function App() {
             || "",
         ).trim().toLowerCase();
         const visibleStopped = stoppedTerminalStatuses.has(visibleStatus);
+        const startingTerminalStatuses = new Set(["prewarmed", "starting"]);
+        const rustStarting = [
+          rustTerminal?.status,
+          rustTerminal?.terminalStatus,
+          rustTerminal?.terminal_status,
+          rustTerminal?.activityStatus,
+          rustTerminal?.activity_status,
+          rustTerminal?.terminalLifecycle,
+          rustTerminal?.terminal_lifecycle,
+        ].some((value) => startingTerminalStatuses.has(String(value || "").trim().toLowerCase()));
+        const preferVisibleLifecycle = Boolean(
+          visibleStatus
+            && !startingTerminalStatuses.has(visibleStatus)
+            && rustStarting,
+        );
         const merged = {
           ...visibleTerminal,
           ...rustTerminal,
@@ -37611,6 +37626,29 @@ export default function App() {
           visibleTerminal: true,
           visible_terminal: true,
         };
+        if (preferVisibleLifecycle) {
+          const visibleIdle = ["idle", "ready", "completed", "complete", "done"].includes(visibleStatus);
+          merged.status = visibleTerminal.status || visibleStatus;
+          merged.activityStatus = visibleTerminal.activityStatus || visibleTerminal.activity_status || visibleStatus;
+          merged.activity_status = visibleTerminal.activity_status || visibleTerminal.activityStatus || visibleStatus;
+          merged.commandPhase = visibleTerminal.commandPhase || visibleTerminal.command_phase || (visibleIdle ? "completed" : visibleStatus);
+          merged.command_phase = visibleTerminal.command_phase || visibleTerminal.commandPhase || (visibleIdle ? "completed" : visibleStatus);
+          merged.displayStatus = visibleTerminal.displayStatus || visibleTerminal.display_status || visibleStatus;
+          merged.display_status = visibleTerminal.display_status || visibleTerminal.displayStatus || visibleStatus;
+          merged.executionPhase = visibleTerminal.executionPhase || visibleTerminal.execution_phase || (visibleIdle ? "idle" : visibleStatus);
+          merged.execution_phase = visibleTerminal.execution_phase || visibleTerminal.executionPhase || (visibleIdle ? "idle" : visibleStatus);
+          merged.inputReady = visibleTerminal.inputReady ?? visibleTerminal.input_ready ?? visibleIdle;
+          merged.input_ready = visibleTerminal.input_ready ?? visibleTerminal.inputReady ?? visibleIdle;
+          merged.nativeRailState = visibleTerminal.nativeRailState || visibleTerminal.native_rail_state || visibleStatus;
+          merged.native_rail_state = visibleTerminal.native_rail_state || visibleTerminal.nativeRailState || visibleStatus;
+          merged.readiness = visibleTerminal.readiness || (visibleIdle ? "ready" : "busy");
+          merged.terminalLifecycle = visibleTerminal.terminalLifecycle || visibleTerminal.terminal_lifecycle || "open";
+          merged.terminal_lifecycle = visibleTerminal.terminal_lifecycle || visibleTerminal.terminalLifecycle || "open";
+          merged.terminalStatus = visibleTerminal.terminalStatus || visibleTerminal.terminal_status || visibleTerminal.status || visibleStatus;
+          merged.terminal_status = visibleTerminal.terminal_status || visibleTerminal.terminalStatus || visibleTerminal.status || visibleStatus;
+          merged.turnStatus = visibleTerminal.turnStatus || visibleTerminal.turn_status || (visibleIdle ? "completed" : visibleStatus);
+          merged.turn_status = visibleTerminal.turn_status || visibleTerminal.turnStatus || (visibleIdle ? "completed" : visibleStatus);
+        }
         if (visibleStopped) {
           merged.activityStatus = visibleTerminal.activityStatus || visibleTerminal.activity_status || visibleStatus;
           merged.activity_status = visibleTerminal.activity_status || visibleTerminal.activityStatus || visibleStatus;
@@ -45333,6 +45371,14 @@ export default function App() {
           const commandId = String(event.command_id || event.commandId || event.payload?.command_id || event.payload?.commandId || "").trim()
             || `remote-command-${Date.now()}-${Math.random().toString(16).slice(2)}`;
           const commandKind = remoteCommandKind(event);
+          const clientActionId = remoteCommandStringField(event, [
+            "client_action_id",
+            "clientActionId",
+          ]);
+          const actionKind = remoteCommandStringField(event, [
+            "action_kind",
+            "actionKind",
+          ]).toLowerCase();
           const sendMessageTask = remoteCommandIsSendMessageTask(commandKind);
           let text = remoteCommandText(event);
           const workspaceId = sendMessageTask ? "" : remoteCommandWorkspaceId(event);
@@ -45659,6 +45705,8 @@ export default function App() {
                   chat_attachments: chatAttachments,
                 } : {}),
                 body: text,
+                clientActionId,
+                client_action_id: clientActionId,
                 commandId,
                 commandKind,
                 checkpointPlan,
@@ -45784,10 +45832,22 @@ export default function App() {
                 createdAt: event.created_at || event.createdAt || new Date().toISOString(),
                 id: commandId,
                 kind: "todo",
+                ...(actionKind ? {
+                  actionKind,
+                  action_kind: actionKind,
+                } : {}),
                 remoteCommand: {
                   commandId,
                   commandKind,
                   command_kind: commandKind,
+                  ...(clientActionId ? {
+                    clientActionId,
+                    client_action_id: clientActionId,
+                  } : {}),
+                  ...(actionKind ? {
+                    actionKind,
+                    action_kind: actionKind,
+                  } : {}),
                   ...(checkpointPlan.length && !dispatchTodosAction ? {
                     checkpointPlan: loopspaceGraphCheckpointPlanFromDispatch(checkpointPlan),
                     checkpoint_plan: loopspaceGraphCheckpointPlanFromDispatch(checkpointPlan),
@@ -45839,6 +45899,10 @@ export default function App() {
                   ...(Number.isInteger(targetColorSlot) ? { targetColorSlot } : {}),
                 },
                 source: "next-remote-control",
+                ...(clientActionId ? {
+                  clientActionId,
+                  client_action_id: clientActionId,
+                } : {}),
                 targetAgentId: agentId || "",
                 targetAgentLabel: agentId ? getManagedAgentLabel(agentId) : "",
                 ...(chatAttachments.length ? { attachments: chatAttachments } : {}),

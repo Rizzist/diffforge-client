@@ -56,21 +56,6 @@ fn orchestrator_pool_sends() -> &'static StdMutex<HashMap<String, OrchestratorPa
     ORCHESTRATOR_POOL_SENDS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
-fn orchestrator_pool_command_is_send(command_kind: &str) -> bool {
-    let command_kind = command_kind
-        .trim()
-        .to_ascii_lowercase()
-        .replace(['.', ' ', '-'], "_");
-    matches!(
-        command_kind.as_str(),
-        "terminal_orchestrator_send_message"
-            | "terminal_send_message"
-            | "orchestrator_send_message"
-            | "loopspace_send_message"
-            | "send_message"
-    )
-}
-
 fn orchestrator_pool_event_text(event: &Value, keys: &[&str]) -> String {
     cloud_mcp_remote_command_field_text(event, keys)
         .or_else(|| cloud_mcp_payload_text(event, keys))
@@ -727,7 +712,16 @@ pub(crate) fn orchestrator_pool_observe_turn_settled(
             match orchestrator_pool_submit_prompt(&app, &queued.event, &queued.entry, queued.prompt)
                 .await
             {
-                Ok(_) => {
+                Ok(prompt_id) => {
+                    let _ = cloud_mcp_send_client_action_ack(
+                        &queued.state,
+                        &queued.event,
+                        "message",
+                        "applied",
+                        Some(&prompt_id),
+                        None,
+                    )
+                    .await;
                     if let Ok(mut guard) = orchestrator_pool_sends().lock() {
                         let pane_state = guard.entry(queued.entry.pane_id.clone()).or_default();
                         pane_state.in_flight = Some(OrchestratorInFlightSend {
@@ -738,6 +732,16 @@ pub(crate) fn orchestrator_pool_observe_turn_settled(
                     }
                 }
                 Err(error) => {
+                    let entity_id = cloud_mcp_remote_command_id(&queued.event);
+                    let _ = cloud_mcp_send_client_action_ack(
+                        &queued.state,
+                        &queued.event,
+                        "message",
+                        "failed",
+                        (!entity_id.is_empty()).then_some(entity_id.as_str()),
+                        Some(&error),
+                    )
+                    .await;
                     let details = json!({
                         "error": clean_terminal_telemetry_text(&error),
                         "reason": "orchestrator_pool_queued_delivery_failed",
@@ -764,7 +768,7 @@ pub(crate) fn orchestrator_pool_apply_remote_send_lever(
     if todo_dispatch_webview_dispatcher_active() {
         return false;
     }
-    if !orchestrator_pool_command_is_send(&cloud_mcp_remote_command_kind(event)) {
+    if !todo_dispatch_remote_command_is_message_intent(event) {
         return false;
     }
     let workspace_id = cloud_mcp_remote_command_field_text(event, &["workspace_id", "workspaceId"])
@@ -786,6 +790,29 @@ pub(crate) fn orchestrator_pool_apply_remote_send_lever(
         .await;
         match orchestrator_pool_deliver(&app, &state, &event).await {
             Ok(details) => {
+                if details
+                    .get("queuedBehindTurn")
+                    .and_then(Value::as_bool)
+                    != Some(true)
+                {
+                    let entity_id = details
+                        .get("promptId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| {
+                            let command_id = cloud_mcp_remote_command_id(&event);
+                            (!command_id.is_empty()).then_some(command_id)
+                        });
+                    let _ = cloud_mcp_send_client_action_ack(
+                        &state,
+                        &event,
+                        "message",
+                        "applied",
+                        entity_id.as_deref(),
+                        None,
+                    )
+                    .await;
+                }
                 // NOT terminal: the send completes when the agent's turn
                 // settles (orchestrator_pool_observe_turn_settled).
                 let _ = cloud_mcp_send_remote_command_status_event(
@@ -798,6 +825,16 @@ pub(crate) fn orchestrator_pool_apply_remote_send_lever(
                 .await;
             }
             Err(error) => {
+                let entity_id = cloud_mcp_remote_command_id(&event);
+                let _ = cloud_mcp_send_client_action_ack(
+                    &state,
+                    &event,
+                    "message",
+                    "failed",
+                    (!entity_id.is_empty()).then_some(entity_id.as_str()),
+                    Some(&error),
+                )
+                .await;
                 let details = json!({
                     "error": clean_terminal_telemetry_text(&error),
                     "reason": "orchestrator_pool_delivery_failed",

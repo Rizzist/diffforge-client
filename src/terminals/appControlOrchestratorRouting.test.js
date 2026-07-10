@@ -6,8 +6,26 @@ import {
   buildAppControlPromptWithAttachmentMarkers,
   getLoopspaceAutomationAutoSpawnMaxTotal,
   isLoopspaceAutomationAppControlMessage,
+  remoteCommandIsMessageIntent,
   selectLoopspaceAutomationAppControlTerminal,
 } from "./appControlOrchestratorRouting.js";
+
+test("message intent uses explicit action_kind before legacy command aliases", () => {
+  assert.equal(remoteCommandIsMessageIntent({
+    action_kind: "message",
+    commandKind: "todo_queue",
+  }), true);
+  assert.equal(remoteCommandIsMessageIntent({
+    action_kind: "todo",
+    commandKind: "send_message",
+  }), false);
+  assert.equal(remoteCommandIsMessageIntent({
+    commandKind: "terminal_send_message",
+  }), true);
+  assert.equal(remoteCommandIsMessageIntent({
+    commandKind: "todo_queue",
+  }), false);
+});
 
 test("loopspace automation detection reads runtime fields and event payload aliases", () => {
   assert.equal(isLoopspaceAutomationAppControlMessage({

@@ -7558,6 +7558,7 @@ async fn local_workspaces_store(
             .map_err(|error| format!("Unable to write local workspace catalog: {error}"))?;
         fs::rename(&temp_path, &path)
             .map_err(|error| format!("Unable to finalize local workspace catalog: {error}"))?;
+        cloud_mcp_notify_workspace_catalog_ready(&cloud_mcp_state);
         let _removed_revived_workspace_count = if revived_workspace_ids.len() == 1 {
             if let Some(workspace_id) = revived_workspace_ids.iter().next() {
                 match cloud_mcp_forget_deleted_workspace_id(workspace_id) {
@@ -10188,6 +10189,7 @@ fn run_app(daemon: bool) {
             cloud_mcp_report_cli_snapshot,
             cloud_mcp_start_remote_command_listener,
             cloud_mcp_record_remote_command_status,
+            cloud_mcp_record_client_action_ack,
             cloud_mcp_record_agent_chat_model_config,
             cloud_mcp_record_agent_chat_permission_config,
             cloud_mcp_get_audio_preferences,
