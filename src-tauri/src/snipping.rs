@@ -35,6 +35,9 @@ static SNIPPING_DESKTOP_ICONS_HIDDEN_BY_APP: AtomicBool = AtomicBool::new(false)
 static SNIPPING_AREA_BEGIN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static SNIPPING_AREA_BEGIN_STARTED_AT_MS: AtomicU64 = AtomicU64::new(0);
 static SNIPPING_AREA_BEGIN_GENERATION: AtomicU64 = AtomicU64::new(0);
+static SNIPPING_AREA_SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static SNIPPING_AREA_OVERLAY_CAPTURE_HIDE_DEPTH: AtomicU64 = AtomicU64::new(0);
 static SNIPPING_AREA_CURSOR_DEBUG_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static SNIPPING_AREA_CURSOR_DEBUG_LAST_MOUSE_LOG_MS: AtomicU64 = AtomicU64::new(0);
 const SNIPPING_CAPTURE_HIDE_OVERLAY_DELAY_MS: u64 = 80;
@@ -49,6 +52,9 @@ const SNIPPING_SCAP_TARGET_SIZE_TIMEOUT_MS: u64 = 1_200;
 const SNIPPING_AREA_BEGIN_CAPTURE_TIMEOUT_MS: u64 = 5_500;
 const SNIPPING_AREA_BEGIN_STALE_MS: u64 = SNIPPING_AREA_BEGIN_CAPTURE_TIMEOUT_MS + 3_000;
 const SNIPPING_STARTUP_PREWARM_ENABLED: bool = false;
+#[cfg(target_os = "macos")]
+const SNIPPING_WARM_CAPTURE_ENABLED: bool = true;
+#[cfg(not(target_os = "macos"))]
 const SNIPPING_WARM_CAPTURE_ENABLED: bool = false;
 const SNIPPING_RECORDING_TARGET_FPS: u32 = 60;
 const SNIPPING_RECORDING_FALLBACK_FPS: u32 = 30;
@@ -71,8 +77,28 @@ const SNIPPING_SCREEN_CAPTURE_KIT_QUEUE_DEPTH: isize = 8;
 const SNIPPING_WINDOWS_GRAPHICS_CAPTURE_FRAME_WAIT_MS: u64 = 25;
 #[cfg(windows)]
 const SNIPPING_WINDOWS_GRAPHICS_CAPTURE_FIRST_FRAME_TIMEOUT_MS: u64 = 750;
-const SNIPPING_WARM_CAPTURE_FRAME_MAX_AGE_MS: u64 = 750;
 const SNIPPING_WARM_CAPTURE_RESTART_MIN_MS: u64 = 2_000;
+/// Warm streams keep a live ScreenCaptureKit session per display (and its
+/// menu-bar capture indicator) alive; without a bound they would run from the
+/// first snip until snipping is disabled. Idle-stop them after this much time
+/// with no snip activity — the next capture restarts them.
+const SNIPPING_WARM_CAPTURE_IDLE_STOP_MS: u64 = 120_000;
+const SNIPPING_WARM_CAPTURE_IDLE_POLL_MS: u64 = 15_000;
+static SNIPPING_WARM_CAPTURE_LAST_USE_MS: AtomicU64 = AtomicU64::new(0);
+static SNIPPING_WARM_CAPTURE_IDLE_WATCHDOG_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+const SNIPPING_MACOS_SPACE_SETTLE_MS: u64 = 300;
+#[cfg(target_os = "macos")]
+const SNIPPING_MACOS_SPACE_SETTLE_MAX_WAIT_MS: u64 = SNIPPING_MACOS_SPACE_SETTLE_MS * 3;
+#[cfg(target_os = "macos")]
+const SNIPPING_MACOS_SPACE_CAPTURE_MAX_ATTEMPTS: usize = 2;
+#[cfg(target_os = "macos")]
+const SNIPPING_MACOS_SPACE_RECOVERY_POLL_MS: u64 = 80;
+#[cfg(target_os = "macos")]
+const SNIPPING_MACOS_SPACE_RECOVERY_CAPTURE_ATTEMPTS: usize = 2;
+#[cfg(target_os = "macos")]
+const SNIPPING_MACOS_SPACE_RECOVERY_TIMEOUT_MS: u64 =
+    SNIPPING_AREA_BEGIN_STALE_MS + SNIPPING_MACOS_SPACE_SETTLE_MS;
 /// Wall-clock ms before which warm-capture frames must not be trusted for a
 /// screen freeze. Stamped on macOS Space changes (frames from before a
 /// three-finger swipe show the PREVIOUS Space — freezing one snips the old
@@ -80,6 +106,12 @@ const SNIPPING_WARM_CAPTURE_RESTART_MIN_MS: u64 = 2_000;
 /// while snipping windows are visible in captures (those frames contain the
 /// overlay itself).
 static SNIPPING_WARM_FRAMES_INVALID_BEFORE_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static SNIPPING_MACOS_SPACE_CHANGED_AT_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static SNIPPING_MACOS_SPACE_CHANGE_GENERATION: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static SNIPPING_AREA_SNAPSHOT_SPACE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn snipping_warm_frames_invalid_before_ms() -> u64 {
     SNIPPING_WARM_FRAMES_INVALID_BEFORE_MS.load(Ordering::Acquire)
@@ -87,6 +119,86 @@ fn snipping_warm_frames_invalid_before_ms() -> u64 {
 
 fn snipping_invalidate_current_warm_frames() {
     SNIPPING_WARM_FRAMES_INVALID_BEFORE_MS.store(current_time_ms(), Ordering::Release);
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_mark_macos_space_changed_now() -> u64 {
+    let changed_at_ms = current_time_ms();
+    SNIPPING_WARM_FRAMES_INVALID_BEFORE_MS.store(changed_at_ms, Ordering::Release);
+    SNIPPING_MACOS_SPACE_CHANGED_AT_MS.store(changed_at_ms, Ordering::Release);
+    SNIPPING_MACOS_SPACE_CHANGE_GENERATION.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn snipping_space_settle_delay_ms(now_ms: u64, changed_at_ms: u64, settle_ms: u64) -> u64 {
+    if changed_at_ms == 0 {
+        return 0;
+    }
+    changed_at_ms
+        .saturating_add(settle_ms)
+        .saturating_sub(now_ms)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn snipping_space_capture_round_should_retry(
+    started_generation: u64,
+    current_generation: u64,
+    attempt: usize,
+    max_attempts: usize,
+) -> bool {
+    started_generation != current_generation && attempt.saturating_add(1) < max_attempts
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn snipping_space_recovery_ticket_is_current(
+    expected_space_generation: u64,
+    current_space_generation: u64,
+    expected_begin_generation: u64,
+    current_begin_generation: u64,
+) -> bool {
+    expected_space_generation == current_space_generation
+        && expected_begin_generation == current_begin_generation
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn snipping_area_recovery_ticket_is_current(
+    expected_space_generation: u64,
+    current_space_generation: u64,
+    expected_begin_generation: u64,
+    current_begin_generation: u64,
+    expected_session_generation: u64,
+    current_session_generation: u64,
+) -> bool {
+    snipping_space_recovery_ticket_is_current(
+        expected_space_generation,
+        current_space_generation,
+        expected_begin_generation,
+        current_begin_generation,
+    ) && expected_session_generation == current_session_generation
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_wait_for_macos_space_settle() -> u64 {
+    let started_at = Instant::now();
+    loop {
+        let generation = SNIPPING_MACOS_SPACE_CHANGE_GENERATION.load(Ordering::Acquire);
+        let changed_at_ms = SNIPPING_MACOS_SPACE_CHANGED_AT_MS.load(Ordering::Acquire);
+        let wait_ms = snipping_space_settle_delay_ms(
+            current_time_ms(),
+            changed_at_ms,
+            SNIPPING_MACOS_SPACE_SETTLE_MS,
+        );
+        if wait_ms == 0 {
+            return generation;
+        }
+
+        let remaining_ms = SNIPPING_MACOS_SPACE_SETTLE_MAX_WAIT_MS
+            .saturating_sub(started_at.elapsed().as_millis() as u64);
+        if remaining_ms == 0 {
+            return generation;
+        }
+        thread::sleep(Duration::from_millis(wait_ms.min(remaining_ms)));
+    }
 }
 
 /// Cached mirror of `SnippingSettings.visible_in_captures`, inverted, for
@@ -480,28 +592,74 @@ fn snipping_area_native_cursor_context_debug_value() -> Value {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Debug)]
+enum SnippingMainThreadSyncError {
+    Schedule {
+        context: &'static str,
+        detail: String,
+    },
+    TimedOut {
+        context: &'static str,
+        detail: String,
+    },
+    Work(String),
+}
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Display for SnippingMainThreadSyncError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Schedule { context, detail } => {
+                write!(formatter, "Unable to schedule {context} on the main thread: {detail}")
+            }
+            Self::TimedOut { context, detail } => {
+                write!(formatter, "Timed out waiting for {context} on the main thread: {detail}")
+            }
+            Self::Work(error) => formatter.write_str(error),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn snipping_run_on_main_thread_sync<T, F>(
     app: &AppHandle,
     context: &'static str,
     work: F,
-) -> Result<T, String>
+) -> Result<T, SnippingMainThreadSyncError>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, String> + Send + 'static,
 {
     if objc2_foundation::NSThread::isMainThread_class() {
-        return work();
+        return work().map_err(SnippingMainThreadSyncError::Work);
     }
 
     let (sender, receiver) = std::sync::mpsc::channel();
     app.run_on_main_thread(move || {
         let _ = sender.send(work());
     })
-    .map_err(|error| format!("Unable to schedule {context} on the main thread: {error}"))?;
+    .map_err(|error| SnippingMainThreadSyncError::Schedule {
+        context,
+        detail: error.to_string(),
+    })?;
 
-    receiver
+    let result = receiver
         .recv_timeout(Duration::from_millis(750))
-        .map_err(|error| format!("Timed out waiting for {context} on the main thread: {error}"))?
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => {
+                SnippingMainThreadSyncError::TimedOut {
+                    context,
+                    detail: error.to_string(),
+                }
+            }
+            std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                SnippingMainThreadSyncError::Schedule {
+                    context,
+                    detail: "main-thread work channel disconnected".to_string(),
+                }
+            }
+        })?;
+    result.map_err(SnippingMainThreadSyncError::Work)
 }
 
 #[cfg(target_os = "macos")]
@@ -3000,11 +3158,36 @@ fn snipping_scap_video_frame_dimensions(frame: &scap::frame::VideoFrame) -> (i32
     }
 }
 
-fn snipping_warm_capture_has_fresh_frames_for(
+fn snipping_scap_video_frame_display_time_ms(frame: &scap::frame::VideoFrame) -> Option<u64> {
+    let display_time = match frame {
+        scap::frame::VideoFrame::BGRA(frame) => frame.display_time,
+        scap::frame::VideoFrame::BGR0(frame) => frame.display_time,
+        scap::frame::VideoFrame::BGRx(frame) => frame.display_time,
+        scap::frame::VideoFrame::RGBx(frame) => frame.display_time,
+        scap::frame::VideoFrame::XBGR(frame) => frame.display_time,
+        scap::frame::VideoFrame::RGB(frame) => frame.display_time,
+        scap::frame::VideoFrame::YUVFrame(frame) => frame.display_time,
+    };
+    display_time
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+}
+
+fn snipping_warm_frame_is_usable(
+    captured_at_ms: u64,
+    min_captured_at_ms: u64,
+    width: i32,
+    height: i32,
+) -> bool {
+    width > 0 && height > 0 && captured_at_ms >= min_captured_at_ms
+}
+
+fn snipping_warm_capture_has_usable_frames_for(
     state: &SnippingWarmCaptureState,
     monitors: &[SnippingAreaMonitor],
+    min_captured_at_ms: u64,
 ) -> bool {
-    let now = current_time_ms();
     state
         .frames
         .lock()
@@ -3013,14 +3196,28 @@ fn snipping_warm_capture_has_fresh_frames_for(
                 && monitors.iter().all(|monitor| {
                     let key = snipping_warm_capture_key(monitor);
                     frames.get(&key).is_some_and(|frame| {
-                        frame.width > 0
-                            && frame.height > 0
-                            && now.saturating_sub(frame.captured_at_ms)
-                                <= SNIPPING_WARM_CAPTURE_FRAME_MAX_AGE_MS
+                        snipping_warm_frame_is_usable(
+                            frame.captured_at_ms,
+                            min_captured_at_ms,
+                            frame.width,
+                            frame.height,
+                        )
                     })
                 })
         })
         .unwrap_or(false)
+}
+
+fn snipping_warm_capture_mark_used() {
+    SNIPPING_WARM_CAPTURE_LAST_USE_MS.store(current_time_ms(), Ordering::Release);
+}
+
+fn snipping_warm_capture_idle_should_stop(
+    now_ms: u64,
+    last_use_ms: u64,
+    idle_stop_ms: u64,
+) -> bool {
+    now_ms.saturating_sub(last_use_ms) > idle_stop_ms
 }
 
 fn snipping_warm_capture_frame_for_monitor(
@@ -3031,20 +3228,21 @@ fn snipping_warm_capture_frame_for_monitor(
     if !SNIPPING_WARM_CAPTURE_ENABLED {
         return None;
     }
+    snipping_warm_capture_mark_used();
 
     let state = app.state::<SnippingState>().warm_capture.clone();
     let key = snipping_warm_capture_key(monitor);
-    let now = current_time_ms();
     let warm_frame = state
         .frames
         .lock()
         .ok()
         .and_then(|frames| frames.get(&key).cloned())?;
-    if warm_frame.width <= 0
-        || warm_frame.height <= 0
-        || warm_frame.captured_at_ms < min_captured_at_ms
-        || now.saturating_sub(warm_frame.captured_at_ms) > SNIPPING_WARM_CAPTURE_FRAME_MAX_AGE_MS
-    {
+    if !snipping_warm_frame_is_usable(
+        warm_frame.captured_at_ms,
+        min_captured_at_ms,
+        warm_frame.width,
+        warm_frame.height,
+    ) {
         snipping_start_warm_capture_if_ready(app);
         return None;
     }
@@ -3070,8 +3268,9 @@ fn snipping_store_warm_capture_frame(
         return;
     }
     let warm_frame = SnippingWarmFrame {
+        captured_at_ms: snipping_scap_video_frame_display_time_ms(&frame)
+            .unwrap_or_else(current_time_ms),
         frame: Arc::new(frame),
-        captured_at_ms: current_time_ms(),
         width,
         height,
     };
@@ -3118,6 +3317,14 @@ fn snipping_warm_capture_loop(
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         capturer.stop_capture();
     }));
+    // A static display legitimately keeps its last frame while get_next_frame
+    // remains blocked. If the loop actually terminates, however, that cached
+    // frame must not masquerade as a live static stream forever.
+    if state.generation.load(Ordering::Acquire) == generation {
+        if let Ok(mut frames) = state.frames.lock() {
+            frames.remove(&key);
+        }
+    }
 }
 
 fn snipping_start_warm_capture_if_ready(app: &AppHandle) {
@@ -3144,7 +3351,11 @@ fn snipping_start_warm_capture_if_ready(app: &AppHandle) {
     let Ok(monitors) = snipping_area_monitors(app) else {
         return;
     };
-    if snipping_warm_capture_has_fresh_frames_for(&state, &monitors) {
+    if snipping_warm_capture_has_usable_frames_for(
+        &state,
+        &monitors,
+        snipping_warm_frames_invalid_before_ms(),
+    ) {
         return;
     }
 
@@ -3162,6 +3373,34 @@ fn snipping_start_warm_capture_if_ready(app: &AppHandle) {
     }
     if state.starting.swap(true, Ordering::AcqRel) {
         return;
+    }
+
+    snipping_warm_capture_mark_used();
+    if !SNIPPING_WARM_CAPTURE_IDLE_WATCHDOG_ACTIVE.swap(true, Ordering::AcqRel) {
+        let app_for_watchdog = app.clone();
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_millis(SNIPPING_WARM_CAPTURE_IDLE_POLL_MS));
+                let state = app_for_watchdog
+                    .state::<SnippingState>()
+                    .warm_capture
+                    .clone();
+                // snipping_stop_warm_capture zeroes last_start_ms — streams were
+                // already stopped externally (disable, recording start).
+                if state.last_start_ms.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                if snipping_warm_capture_idle_should_stop(
+                    current_time_ms(),
+                    SNIPPING_WARM_CAPTURE_LAST_USE_MS.load(Ordering::Acquire),
+                    SNIPPING_WARM_CAPTURE_IDLE_STOP_MS,
+                ) {
+                    snipping_stop_warm_capture(&app_for_watchdog);
+                    break;
+                }
+            }
+            SNIPPING_WARM_CAPTURE_IDLE_WATCHDOG_ACTIVE.store(false, Ordering::Release);
+        });
     }
 
     let state_for_start = state.clone();
@@ -4039,11 +4278,46 @@ fn snipping_capture_area_image(
 /// Mid-session capture that must NOT end the snip. Re-freezes hide only the
 /// relevant overlay for the capture and then restore it, preserving the active
 /// area session, Escape grab, and overlay windows.
+#[cfg(target_os = "macos")]
+struct SnippingAreaOverlayCaptureHideGuard {
+    app: AppHandle,
+}
+
+#[cfg(target_os = "macos")]
+impl SnippingAreaOverlayCaptureHideGuard {
+    fn new(app: &AppHandle) -> Self {
+        SNIPPING_AREA_OVERLAY_CAPTURE_HIDE_DEPTH.fetch_add(1, Ordering::AcqRel);
+        Self { app: app.clone() }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for SnippingAreaOverlayCaptureHideGuard {
+    fn drop(&mut self) {
+        let previous_depth =
+            SNIPPING_AREA_OVERLAY_CAPTURE_HIDE_DEPTH.fetch_sub(1, Ordering::AcqRel);
+        // Overlapping Space recoveries can finish out of order. Whichever
+        // worker releases the final intentional hide revives the CURRENT
+        // session, even when that worker's own generation became stale.
+        if previous_depth == 1
+            && SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire)
+            && !SNIPPING_AREA_BEGIN_IN_FLIGHT.load(Ordering::Acquire)
+        {
+            snipping_reshow_active_area_overlays(&self.app, "capture_hide_released");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn snipping_capture_monitor_image_keeping_session(
     app: &AppHandle,
     overlay_label: &str,
     monitor: &SnippingAreaMonitor,
+    expected_space_generation: u64,
+    expected_begin_generation: u64,
+    expected_session_generation: u64,
 ) -> Result<image::RgbaImage, String> {
+    let capture_hide_guard = SnippingAreaOverlayCaptureHideGuard::new(app);
     let overlay = app.get_webview_window(overlay_label);
     if let Some(overlay) = overlay.as_ref() {
         snipping_hide_window_now(overlay, "capture_region_hide_overlay");
@@ -4057,10 +4331,22 @@ fn snipping_capture_monitor_image_keeping_session(
         overlay_hidden_at_ms,
     )
     .map_err(|error| format!("Unable to capture screen for snip re-freeze: {error}"));
-    if let Some(overlay) = overlay.as_ref() {
-        snipping_show_window_now(overlay, "capture_region_show_overlay");
-        #[cfg(target_os = "macos")]
-        snipping_order_overlay_front_regardless(overlay);
+    // The frame is complete; allow only the guarded restore below (or later
+    // reassertions) to make this panel visible again.
+    drop(capture_hide_guard);
+    let restore_overlay = snipping_area_recovery_ticket_is_current(
+        expected_space_generation,
+        SNIPPING_MACOS_SPACE_CHANGE_GENERATION.load(Ordering::Acquire),
+        expected_begin_generation,
+        SNIPPING_AREA_BEGIN_GENERATION.load(Ordering::Acquire),
+        expected_session_generation,
+        SNIPPING_AREA_SESSION_GENERATION.load(Ordering::Acquire),
+    ) && snipping_area_session_monitor(app, overlay_label).is_ok();
+    if restore_overlay {
+        let Some(overlay) = overlay.as_ref() else {
+            return captured;
+        };
+        let _ = snipping_show_area_overlay_window_for_session(app, overlay, overlay_label);
     }
     captured
 }
@@ -9003,10 +9289,16 @@ fn snipping_force_area_crosshair_for_visible_overlays(
 
         let location = objc2_app_kit::NSEvent::mouseLocation();
         let mouse_button_down = snipping_left_mouse_button_pressed();
+        let begin_in_flight = SNIPPING_AREA_BEGIN_IN_FLIGHT.load(Ordering::Acquire);
+        let overlay_hidden_for_capture =
+            SNIPPING_AREA_OVERLAY_CAPTURE_HIDE_DEPTH.load(Ordering::Acquire) > 0;
         let mut forced_cursor_window = false;
         let mut windows_debug = Vec::new();
         for (_, window) in snipping_overlay_windows(app) {
             let label = window.label().to_string();
+            if snipping_area_session_monitor(app, &label).is_err() {
+                continue;
+            }
             let Ok(ns_ptr) = window.ns_window() else {
                 continue;
             };
@@ -9014,11 +9306,28 @@ fn snipping_force_area_crosshair_for_visible_overlays(
                 continue;
             }
             let ns_window: &NSWindow = unsafe { &*ns_ptr.cast::<NSWindow>() };
+            let was_visible = ns_window.isVisible();
+            if !was_visible
+                && !mouse_button_down
+                && !begin_in_flight
+                && !overlay_hidden_for_capture
+            {
+                // WindowServer can order an all-Spaces panel out when the
+                // transition transaction commits. Reassertions must revive it,
+                // not skip it forever just because isVisible became false.
+                snipping_apply_overlay_fullscreen_window_style_to_ns_window(ns_window);
+                let _ = window.show();
+                ns_window.orderFrontRegardless();
+            }
             if !ns_window.isVisible() {
                 if should_log {
                     windows_debug.push(json!({
                         "label": label,
                         "visible": false,
+                        "reshow_attempted": !was_visible
+                            && !mouse_button_down
+                            && !begin_in_flight
+                            && !overlay_hidden_for_capture,
                     }));
                 }
                 continue;
@@ -9052,6 +9361,9 @@ fn snipping_force_area_crosshair_for_visible_overlays(
         if !forced_cursor_window {
             for (_, window) in snipping_overlay_windows(app) {
                 let label = window.label().to_string();
+                if snipping_area_session_monitor(app, &label).is_err() {
+                    continue;
+                }
                 let Ok(ns_ptr) = window.ns_window() else {
                     continue;
                 };
@@ -9106,7 +9418,14 @@ fn snipping_force_area_crosshair_for_visible_overlays(
 
 #[cfg(target_os = "macos")]
 fn snipping_claim_area_crosshair_on_main_thread(app: &AppHandle, reason: &'static str) {
+    let begin_generation_for_main = SNIPPING_AREA_BEGIN_GENERATION.load(Ordering::Acquire);
     if let Err(error) = snipping_run_on_main_thread_sync(app, "claim_area_crosshair", move || {
+        if !snipping_area_session_claims_crosshair()
+            || SNIPPING_AREA_BEGIN_GENERATION.load(Ordering::Acquire)
+                != begin_generation_for_main
+        {
+            return Ok(());
+        }
         snipping_set_area_crosshair_cursor_now();
         log_snipping_area_cursor_debug_event(
             "native.claim_crosshair_sync",
@@ -9121,7 +9440,7 @@ fn snipping_claim_area_crosshair_on_main_thread(app: &AppHandle, reason: &'stati
             "native.claim_crosshair_sync_failed",
             json!({
                 "reason": reason,
-                "error": error,
+                "error": error.to_string(),
             }),
         );
     }
@@ -9145,7 +9464,7 @@ fn snipping_force_area_crosshair_for_visible_overlays_on_main_thread(
             "native.force_visible_overlays_sync_failed",
             json!({
                 "reason": reason,
-                "error": error,
+                "error": error.to_string(),
             }),
         );
     }
@@ -9174,42 +9493,6 @@ fn snipping_restore_area_overlay_cursor_rects(window: &tauri::WebviewWindow) {
                 ns_window.invalidateCursorRectsForView(&content_view);
             }
             ns_window.resetCursorRects();
-        });
-    });
-}
-
-/// Orders the overlay to the front even while Diff Forge is NOT the active
-/// app. tao's show()/set_focus() rely on makeKeyAndOrderFront, which does
-/// nothing visible when another app's fullscreen Space is active; AppKit's
-/// orderFrontRegardless is the documented way to surface a window from an
-/// inactive application.
-#[cfg(target_os = "macos")]
-fn snipping_order_overlay_front_regardless(window: &tauri::WebviewWindow) {
-    let window_for_main = window.clone();
-    let _ = window.run_on_main_thread(move || {
-        snipping_catch_objc("order_overlay_front_regardless", || {
-            let Ok(ns_window) = window_for_main.ns_window() else {
-                return;
-            };
-            if ns_window.is_null() {
-                return;
-            }
-            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
-            if SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
-                if snipping_left_mouse_button_pressed() {
-                    snipping_force_area_crosshair_for_ns_window(ns_window);
-                    log_snipping_area_cursor_debug_event(
-                        "native.order_overlay_skipped_during_drag",
-                        json!({
-                            "overlay_label": window_for_main.label(),
-                            "context": snipping_macos_cursor_context_debug_value(),
-                        }),
-                    );
-                    return;
-                }
-                snipping_force_area_crosshair_for_ns_window(ns_window);
-            }
-            ns_window.orderFrontRegardless();
         });
     });
 }
@@ -9429,16 +9712,54 @@ fn snipping_show_window_now(window: &tauri::WebviewWindow, _context: &'static st
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnippingAreaOverlayShowOutcome {
+    Shown,
+    Pending,
+    Failed,
+}
+
+#[cfg(target_os = "macos")]
+impl SnippingAreaOverlayShowOutcome {
+    fn retains_session(self) -> bool {
+        !matches!(self, Self::Failed)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Shown => "shown",
+            Self::Pending => "pending",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn snipping_show_area_overlay_window_for_session(
     app: &AppHandle,
     window: &tauri::WebviewWindow,
     label: &str,
-) -> bool {
+) -> SnippingAreaOverlayShowOutcome {
+    let app_for_main = app.clone();
+    let begin_generation_for_main = SNIPPING_AREA_BEGIN_GENERATION.load(Ordering::Acquire);
+    let session_generation_for_main = SNIPPING_AREA_SESSION_GENERATION.load(Ordering::Acquire);
     let window_for_main = window.clone();
     let label_for_main = label.to_string();
     let label_for_error = label_for_main.clone();
     match snipping_run_on_main_thread_sync(app, "show_area_overlay_window", move || {
         snipping_catch_objc_result("show_area_overlay_window", || {
+            // A sync timeout leaves this closure queued. Do not let it revive a
+            // panel after cancellation (or after a failed begin cleared the
+            // session) when the main thread eventually drains the queue.
+            if SNIPPING_AREA_BEGIN_GENERATION.load(Ordering::Acquire)
+                != begin_generation_for_main
+                || SNIPPING_AREA_SESSION_GENERATION.load(Ordering::Acquire)
+                    != session_generation_for_main
+                || SNIPPING_AREA_OVERLAY_CAPTURE_HIDE_DEPTH.load(Ordering::Acquire) > 0
+                || snipping_area_session_monitor(&app_for_main, &label_for_main).is_err()
+            {
+                return Ok(());
+            }
             let Ok(ns_window) = window_for_main.ns_window() else {
                 return Err("Unable to access snipping overlay NSWindow.".to_string());
             };
@@ -9471,16 +9792,26 @@ fn snipping_show_area_overlay_window_for_session(
             Ok(())
         })
     }) {
-        Ok(()) => true,
+        Ok(()) => SnippingAreaOverlayShowOutcome::Shown,
+        Err(SnippingMainThreadSyncError::TimedOut { context, detail }) => {
+            log_snipping_area_cursor_debug_event(
+                "native.overlay_show_crosshair_pending",
+                json!({
+                    "overlay_label": label_for_error,
+                    "error": SnippingMainThreadSyncError::TimedOut { context, detail }.to_string(),
+                }),
+            );
+            SnippingAreaOverlayShowOutcome::Pending
+        }
         Err(error) => {
             log_snipping_area_cursor_debug_event(
                 "native.overlay_show_crosshair_failed",
                 json!({
                     "overlay_label": label_for_error,
-                    "error": error,
+                    "error": error.to_string(),
                 }),
             );
-            false
+            SnippingAreaOverlayShowOutcome::Failed
         }
     }
 }
@@ -9550,8 +9881,15 @@ fn snipping_make_overlay_key(window: &tauri::WebviewWindow) {
 fn snipping_make_overlay_key_sync(app: &AppHandle, window: &tauri::WebviewWindow) -> bool {
     let window_for_main = window.clone();
     let label_for_error = window.label().to_string();
+    let begin_generation_for_main = SNIPPING_AREA_BEGIN_GENERATION.load(Ordering::Acquire);
     match snipping_run_on_main_thread_sync(app, "make_overlay_key", move || {
         snipping_catch_objc_result("make_overlay_key", || {
+            if !SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire)
+                || SNIPPING_AREA_BEGIN_GENERATION.load(Ordering::Acquire)
+                    != begin_generation_for_main
+            {
+                return Ok(());
+            }
             let Ok(ns_window) = window_for_main.ns_window() else {
                 return Err("Unable to access snipping overlay NSWindow.".to_string());
             };
@@ -9608,7 +9946,7 @@ fn snipping_make_overlay_key_sync(app: &AppHandle, window: &tauri::WebviewWindow
                 "native.key_overlay_crosshair_failed",
                 json!({
                     "overlay_label": label_for_error,
-                    "error": error,
+                    "error": error.to_string(),
                 }),
             );
             false
@@ -9842,6 +10180,10 @@ fn snipping_replace_area_sessions(
         .active_area_sessions
         .lock()
         .map_err(|_| "Unable to lock snipping overlay state.".to_string())?;
+    // Invalidates Space-recovery workers before this map is cleared/replaced,
+    // so an in-flight capture cannot restore windows or desktop-icon state for
+    // a cancelled/older session.
+    SNIPPING_AREA_SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
     let previous = std::mem::replace(&mut *guard, sessions);
     let next_paths: HashSet<String> = guard
         .values()
@@ -9878,16 +10220,56 @@ fn snipping_area_session_active(app: &AppHandle) -> bool {
         .unwrap_or(false)
 }
 
-fn snipping_area_sessions_include_recording(app: &AppHandle) -> bool {
+#[cfg(target_os = "macos")]
+fn snipping_current_capture_state_keeps_desktop_icons_hidden(app: &AppHandle) -> bool {
+    if snipping_recording_active(app) {
+        return true;
+    }
+    if SNIPPING_AREA_BEGIN_IN_FLIGHT.load(Ordering::Acquire)
+        && snipping_should_hide_desktop_icons(app)
+    {
+        return true;
+    }
     app.state::<SnippingState>()
         .active_area_sessions
         .lock()
         .map(|guard| {
-            guard
-                .values()
-                .any(|session| session.mode == SnippingAreaMode::Recording)
+            guard.values().any(|session| {
+                session.mode == SnippingAreaMode::Recording || session.snapshot.is_none()
+            })
         })
         .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_reconcile_desktop_icons_after_space_recovery(
+    app: &AppHandle,
+    expected_space_generation: u64,
+) {
+    // Cancellation/new-session replacement can race the platform mutation.
+    // Re-evaluate a few times until the lifecycle generation is stable. A
+    // newer Space owns its own recovery worker, so leave cleanup to it.
+    for _ in 0..3 {
+        if SNIPPING_MACOS_SPACE_CHANGE_GENERATION.load(Ordering::Acquire)
+            != expected_space_generation
+        {
+            return;
+        }
+        let session_generation = SNIPPING_AREA_SESSION_GENERATION.load(Ordering::Acquire);
+        if snipping_current_capture_state_keeps_desktop_icons_hidden(app) {
+            snipping_hide_desktop_icons_for_capture(app);
+        } else {
+            snipping_restore_desktop_icons_after_capture(app);
+        }
+        if SNIPPING_MACOS_SPACE_CHANGE_GENERATION.load(Ordering::Acquire)
+            != expected_space_generation
+        {
+            return;
+        }
+        if SNIPPING_AREA_SESSION_GENERATION.load(Ordering::Acquire) == session_generation {
+            return;
+        }
+    }
 }
 
 struct SnippingAreaBeginGuard {
@@ -9978,20 +10360,31 @@ fn snipping_area_already_active_payload(reason: &str, shortcut: String) -> Value
 /// Idempotent recovery for overlays that never became visible (their original
 /// show timed out on a stalled main thread) or got stranded on another Space.
 fn snipping_reshow_active_area_overlays(app: &AppHandle, reason: &'static str) {
+    #[cfg(target_os = "macos")]
+    if SNIPPING_AREA_OVERLAY_CAPTURE_HIDE_DEPTH.load(Ordering::Acquire) > 0 {
+        // A mid-session re-freeze intentionally hid one panel. Re-pressing the
+        // hotkey must not expose it inside its own capture; the capture helper
+        // or final recovery pass restores it after the hide guard drops.
+        return;
+    }
     for (label, window) in snipping_overlay_windows(app) {
         if snipping_area_session_monitor(app, &label).is_err() {
             continue;
         }
         #[cfg(target_os = "macos")]
-        let shown = snipping_show_area_overlay_window_for_session(app, &window, &label);
+        let outcome = snipping_show_area_overlay_window_for_session(app, &window, &label).as_str();
         #[cfg(not(target_os = "macos"))]
-        let shown = snipping_show_window_now(&window, "reshow_active_area_overlay");
+        let outcome = if snipping_show_window_now(&window, "reshow_active_area_overlay") {
+            "shown"
+        } else {
+            "failed"
+        };
         log_snipping_area_cursor_debug_event(
             "native.reshow_active_overlay",
             json!({
                 "reason": reason,
                 "overlay_label": label,
-                "shown": shown,
+                "outcome": outcome,
             }),
         );
     }
@@ -10059,6 +10452,75 @@ fn snipping_area_session_snapshot_image(
         .get(label)
         .and_then(|session| session.snapshot.clone())
         .ok_or_else(|| "No frozen snip snapshot is available.".to_string())
+}
+
+struct SnippingAreaFreezeRound {
+    captured: Vec<(usize, SnippingAreaMonitor, Arc<image::RgbaImage>)>,
+    first_error: Option<String>,
+    received_count: usize,
+}
+
+fn snipping_capture_area_freeze_round(
+    app: &AppHandle,
+    monitors: &[SnippingAreaMonitor],
+    exclude_desktop_icons: bool,
+) -> SnippingAreaFreezeRound {
+    let capture_count = monitors.len();
+    let (capture_sender, capture_receiver) = std::sync::mpsc::channel();
+    for (index, monitor) in monitors.iter().cloned().enumerate() {
+        let app_for_capture = app.clone();
+        let capture_sender = capture_sender.clone();
+        thread::spawn(move || {
+            let result = snipping_capture_monitor_full_image(
+                &app_for_capture,
+                &monitor,
+                exclude_desktop_icons,
+            );
+            let _ = capture_sender.send((index, monitor, result));
+        });
+    }
+    drop(capture_sender);
+
+    let mut captured = Vec::new();
+    let mut first_error = None;
+    let capture_started_at = Instant::now();
+    let capture_deadline = Duration::from_millis(SNIPPING_AREA_BEGIN_CAPTURE_TIMEOUT_MS);
+    let mut received_count = 0usize;
+    while received_count < capture_count {
+        let elapsed = capture_started_at.elapsed();
+        if elapsed >= capture_deadline {
+            first_error.get_or_insert_with(|| {
+                format!(
+                    "Timed out preparing snip overlays after {}ms.",
+                    SNIPPING_AREA_BEGIN_CAPTURE_TIMEOUT_MS
+                )
+            });
+            break;
+        }
+
+        let wait_for = capture_deadline
+            .checked_sub(elapsed)
+            .unwrap_or_else(|| Duration::from_millis(0));
+        let Ok((index, monitor, result)) = capture_receiver.recv_timeout(wait_for) else {
+            first_error.get_or_insert_with(|| "Timed out preparing snip overlays.".to_string());
+            break;
+        };
+        received_count += 1;
+        match result {
+            Ok(image) => captured.push((index, monitor, Arc::new(image))),
+            Err(error) => {
+                // A display that cannot be captured (mirroring quirks, ...)
+                // is skipped; the snip continues on the displays that can.
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+
+    SnippingAreaFreezeRound {
+        captured,
+        first_error,
+        received_count,
+    }
 }
 
 fn snipping_begin_area_snip_for(
@@ -10148,6 +10610,23 @@ fn snipping_begin_area_for(
         return Ok(snipping_area_already_active_payload(reason, shortcut));
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        // NSWorkspace reports that the active Space changed, not that the
+        // WindowServer/SCK transition transaction is finished. This worker is
+        // off the main thread, so hold the begin ticket through a short quiet
+        // window before either capturing or ordering panels onto the new Space.
+        let space_generation = snipping_wait_for_macos_space_settle();
+        log_snipping_area_cursor_debug_event(
+            "native.begin_space_settled",
+            json!({
+                "reason": reason,
+                "space_generation": space_generation,
+                "begin_generation": begin_guard.generation,
+            }),
+        );
+    }
+
     // Boot the preview window for this capture while the user is still
     // drawing the selection, so the draggable preview shows up instantly
     // when the snip finishes.
@@ -10175,91 +10654,86 @@ fn snipping_begin_area_for(
         let exclude_desktop_icons = snipping_should_hide_desktop_icons(app);
         snipping_hide_desktop_icons_for_capture(app);
         let capture_count = monitors.len();
-        let (capture_sender, capture_receiver) = std::sync::mpsc::channel();
-        for (index, monitor) in monitors.into_iter().enumerate() {
-            let app_for_capture = app.clone();
-            let capture_sender = capture_sender.clone();
-            thread::spawn(move || {
-                let result = snipping_capture_monitor_full_image(
-                    &app_for_capture,
-                    &monitor,
-                    exclude_desktop_icons,
-                );
-                let _ = capture_sender.send((index, monitor, result));
-            });
-        }
-        drop(capture_sender);
+        #[cfg(target_os = "macos")]
+        let max_capture_attempts = SNIPPING_MACOS_SPACE_CAPTURE_MAX_ATTEMPTS;
+        #[cfg(not(target_os = "macos"))]
+        let max_capture_attempts = 1usize;
 
-        let mut captured: Vec<(usize, String, SnippingAreaMonitor, Arc<image::RgbaImage>)> =
-            Vec::new();
-        let capture_started_at = Instant::now();
-        let capture_deadline = Duration::from_millis(SNIPPING_AREA_BEGIN_CAPTURE_TIMEOUT_MS);
-        let mut received_count = 0usize;
-        while received_count < capture_count {
-            let elapsed = capture_started_at.elapsed();
-            if elapsed >= capture_deadline {
-                if first_error.is_none() {
-                    first_error = Some(format!(
-                        "Timed out preparing snip overlays after {}ms.",
-                        SNIPPING_AREA_BEGIN_CAPTURE_TIMEOUT_MS
-                    ));
-                }
+        for attempt in 0..max_capture_attempts {
+            #[cfg(target_os = "macos")]
+            let capture_space_generation = if attempt == 0 {
+                SNIPPING_MACOS_SPACE_CHANGE_GENERATION.load(Ordering::Acquire)
+            } else {
+                snipping_wait_for_macos_space_settle()
+            };
+
+            let mut round = snipping_capture_area_freeze_round(
+                app,
+                &monitors,
+                exclude_desktop_icons,
+            );
+            if round.received_count < capture_count {
                 log_snipping_area_cursor_debug_event(
                     "native.begin_capture_timeout",
                     json!({
                         "reason": reason,
                         "shortcut": &shortcut,
+                        "attempt": attempt,
                         "monitor_count": capture_count,
-                        "received_count": received_count,
+                        "received_count": round.received_count,
                         "timeout_ms": SNIPPING_AREA_BEGIN_CAPTURE_TIMEOUT_MS,
                         "cursor_position": snipping_app_cursor_position_debug_value(app),
                     }),
                 );
-                break;
             }
 
-            let wait_for = capture_deadline
-                .checked_sub(elapsed)
-                .unwrap_or_else(|| Duration::from_millis(0));
-            let Ok((index, mut monitor, result)) = capture_receiver.recv_timeout(wait_for) else {
-                if first_error.is_none() {
-                    first_error = Some("Timed out preparing snip overlays.".to_string());
-                }
-                break;
-            };
-            received_count += 1;
-            match result {
-                Ok(image) => {
-                    let image = Arc::new(image);
-                    monitor.snapshot_width = image.width();
-                    monitor.snapshot_height = image.height();
-                    monitor.snapshot_path = None;
-                    let label = snipping_overlay_label(index);
-                    sessions.insert(
-                        label.clone(),
-                        SnippingAreaSession {
-                            mode,
-                            monitor: monitor.clone(),
-                            snapshot: Some(Arc::clone(&image)),
-                        },
+            #[cfg(target_os = "macos")]
+            {
+                let current_space_generation =
+                    SNIPPING_MACOS_SPACE_CHANGE_GENERATION.load(Ordering::Acquire);
+                if snipping_space_capture_round_should_retry(
+                    capture_space_generation,
+                    current_space_generation,
+                    attempt,
+                    max_capture_attempts,
+                ) && begin_guard.is_current()
+                {
+                    log_snipping_area_cursor_debug_event(
+                        "native.begin_capture_invalidated_by_space",
+                        json!({
+                            "reason": reason,
+                            "shortcut": &shortcut,
+                            "attempt": attempt,
+                            "capture_space_generation": capture_space_generation,
+                            "current_space_generation": current_space_generation,
+                        }),
                     );
-                    captured.push((index, label, monitor, image));
-                }
-                Err(error) => {
-                    // A display that cannot be captured (mirroring quirks, ...)
-                    // is skipped; the snip continues on the displays that can.
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
+                    continue;
                 }
             }
+
+            #[cfg(target_os = "macos")]
+            SNIPPING_AREA_SNAPSHOT_SPACE_GENERATION
+                .store(capture_space_generation, Ordering::Release);
+            first_error = round.first_error.take();
+            round.captured.sort_by_key(|(index, _, _)| *index);
+            for (index, mut monitor, image) in round.captured {
+                monitor.snapshot_width = image.width();
+                monitor.snapshot_height = image.height();
+                monitor.snapshot_path = None;
+                let label = snipping_overlay_label(index);
+                sessions.insert(
+                    label.clone(),
+                    SnippingAreaSession {
+                        mode,
+                        monitor: monitor.clone(),
+                        snapshot: Some(Arc::clone(&image)),
+                    },
+                );
+                ordered.push((label, monitor, Some(image)));
+            }
+            break;
         }
-        captured.sort_by_key(|(index, _, _, _)| *index);
-        ordered.extend(
-            captured
-                .into_iter()
-                .map(|(_, label, monitor, image)| (label, monitor, Some(image))),
-        );
         snipping_restore_desktop_icons_after_capture(app);
     } else {
         snipping_hide_desktop_icons_for_capture(app);
@@ -10367,18 +10841,24 @@ fn snipping_begin_area_for(
         snipping_wait_for_area_overlay_ready(app, label);
         #[cfg(target_os = "macos")]
         {
-            // The show runs main-thread-sync with a 750ms timeout. A stalled
-            // main thread fails the first attempt while its closure is still
-            // queued; one retry lands right behind it and almost always
-            // succeeds, instead of silently leaving this display overlay-less.
-            let shown = snipping_show_area_overlay_window_for_session(app, &window, label)
-                || snipping_show_area_overlay_window_for_session(app, &window, label);
-            if !shown {
+            // A 750ms timeout means the main-thread closure is still queued,
+            // not that the show failed. Retain that session so the queued show
+            // and the generation-guarded reassertions can finish after the
+            // Space transaction releases the main thread. Retry only a real
+            // scheduling/AppKit failure.
+            let first = snipping_show_area_overlay_window_for_session(app, &window, label);
+            let outcome = if first == SnippingAreaOverlayShowOutcome::Failed {
+                snipping_show_area_overlay_window_for_session(app, &window, label)
+            } else {
+                first
+            };
+            if !outcome.retains_session() {
                 log_snipping_area_cursor_debug_event(
                     "native.overlay_show_failed",
                     json!({
                         "reason": reason,
                         "overlay_label": label,
+                        "outcome": outcome.as_str(),
                         "cursor_position": snipping_app_cursor_position_debug_value(app),
                     }),
                 );
@@ -10529,10 +11009,19 @@ fn snipping_store_area_snapshot_backdrop(
     let mut previous_path = None;
     if let Ok(mut guard) = state.active_area_sessions.lock() {
         if let Some(session) = guard.get_mut(overlay_label) {
-            previous_path = session.monitor.snapshot_path.replace(path_text.clone());
-            session.monitor.snapshot_width = image.width();
-            session.monitor.snapshot_height = image.height();
-            still_active = true;
+            // JPEG encoding is intentionally asynchronous. A Space recovery
+            // may have replaced this Arc while an older encode was running;
+            // only the snapshot still authoritative for the session may win.
+            let snapshot_is_current = session
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| Arc::ptr_eq(snapshot, &image));
+            if snapshot_is_current {
+                previous_path = session.monitor.snapshot_path.replace(path_text.clone());
+                session.monitor.snapshot_width = image.width();
+                session.monitor.snapshot_height = image.height();
+                still_active = true;
+            }
         }
     }
     if !still_active {
@@ -10554,51 +11043,143 @@ fn snipping_store_area_snapshot_backdrop(
     );
 }
 
-/// Re-freezes every active overlay session after a macOS Space switch:
-/// captures each display below its overlay (so the stale backdrop is not in
-/// the shot), swaps the in-memory frozen frames, and refreshes the backdrops.
-/// NSWorkspace's notification does not say which display changed Space, so
-/// all visible overlays re-freeze.
+/// Recovers an area session after a macOS Space switch. The notification can
+/// arrive while the initial capture is still in flight, before the session map
+/// exists, so label discovery happens inside this bounded worker after the
+/// matching begin generation has completed. The Space generation cancels a
+/// stale worker if the user swipes again.
 #[cfg(target_os = "macos")]
-fn snipping_refreeze_area_snapshot_for_space_change(app: &AppHandle) {
-    if !snipping_freeze_screen_enabled(app) {
-        return;
-    }
-    let labels = snipping_area_session_labels(app);
-    if labels.is_empty() {
-        return;
-    }
-    let keep_desktop_icons_hidden = snipping_area_sessions_include_recording(app);
+fn snipping_schedule_area_space_change_recovery(app: &AppHandle, space_generation: u64) {
+    let begin_generation = SNIPPING_AREA_BEGIN_GENERATION.load(Ordering::Acquire);
     let app = app.clone();
     thread::spawn(move || {
-        // Let the Space transition animation settle before re-capturing.
-        thread::sleep(Duration::from_millis(260));
-        snipping_hide_desktop_icons_for_capture(&app);
-        for label in labels {
-            let Some(window) = app.get_webview_window(&label) else {
-                continue;
-            };
-            if !window.is_visible().unwrap_or(false) {
+        let started_at = Instant::now();
+        let labels = loop {
+            let current_space_generation =
+                SNIPPING_MACOS_SPACE_CHANGE_GENERATION.load(Ordering::Acquire);
+            let current_begin_generation = SNIPPING_AREA_BEGIN_GENERATION.load(Ordering::Acquire);
+            if !snipping_space_recovery_ticket_is_current(
+                space_generation,
+                current_space_generation,
+                begin_generation,
+                current_begin_generation,
+            ) {
+                return;
+            }
+
+            let wait_ms = snipping_space_settle_delay_ms(
+                current_time_ms(),
+                SNIPPING_MACOS_SPACE_CHANGED_AT_MS.load(Ordering::Acquire),
+                SNIPPING_MACOS_SPACE_SETTLE_MS,
+            );
+            if wait_ms > 0 {
+                thread::sleep(Duration::from_millis(
+                    wait_ms.min(SNIPPING_MACOS_SPACE_RECOVERY_POLL_MS),
+                ));
                 continue;
             }
-            let Ok(area_monitor) = snipping_area_session_monitor(&app, &label) else {
-                continue;
-            };
-            let Ok(image) =
-                snipping_capture_monitor_image_keeping_session(&app, &label, &area_monitor)
-            else {
-                continue;
-            };
-            let image = Arc::new(image);
-            if !snipping_set_area_session_snapshot(&app, &label, Arc::clone(&image)) {
-                continue;
+
+            let labels = snipping_area_session_labels(&app);
+            if !labels.is_empty() && !SNIPPING_AREA_BEGIN_IN_FLIGHT.load(Ordering::Acquire) {
+                break labels;
             }
-            snipping_store_area_snapshot_backdrop(&app, &label, image);
+            if (!SNIPPING_AREA_BEGIN_IN_FLIGHT.load(Ordering::Acquire) && labels.is_empty())
+                || started_at.elapsed()
+                    >= Duration::from_millis(SNIPPING_MACOS_SPACE_RECOVERY_TIMEOUT_MS)
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(
+                SNIPPING_MACOS_SPACE_RECOVERY_POLL_MS,
+            ));
+        };
+
+        let session_generation = SNIPPING_AREA_SESSION_GENERATION.load(Ordering::Acquire);
+        let ticket_is_current = || {
+            snipping_area_recovery_ticket_is_current(
+                space_generation,
+                SNIPPING_MACOS_SPACE_CHANGE_GENERATION.load(Ordering::Acquire),
+                begin_generation,
+                SNIPPING_AREA_BEGIN_GENERATION.load(Ordering::Acquire),
+                session_generation,
+                SNIPPING_AREA_SESSION_GENERATION.load(Ordering::Acquire),
+            )
+        };
+        if !ticket_is_current() {
+            return;
         }
-        if keep_desktop_icons_hidden {
-            snipping_hide_desktop_icons_for_capture(&app);
-        } else {
-            snipping_restore_desktop_icons_after_capture(&app);
+
+        log_snipping_area_cursor_debug_event(
+            "native.space_recovery_session_ready",
+            json!({
+                "space_generation": space_generation,
+                "begin_generation": begin_generation,
+                "session_generation": session_generation,
+                "overlay_labels": &labels,
+            }),
+        );
+
+        let needs_refreeze = snipping_freeze_screen_enabled(&app)
+            && SNIPPING_AREA_SNAPSHOT_SPACE_GENERATION.load(Ordering::Acquire)
+                != space_generation;
+        if needs_refreeze {
+            let mut refreeze_succeeded = false;
+            let mut refrozen_labels = HashSet::new();
+            for attempt in 0..SNIPPING_MACOS_SPACE_RECOVERY_CAPTURE_ATTEMPTS {
+                if !ticket_is_current() {
+                    break;
+                }
+                snipping_hide_desktop_icons_for_capture(&app);
+                for label in &labels {
+                    if !ticket_is_current() {
+                        break;
+                    }
+                    let Ok(area_monitor) = snipping_area_session_monitor(&app, label) else {
+                        continue;
+                    };
+                    let Ok(image) = snipping_capture_monitor_image_keeping_session(
+                        &app,
+                        label,
+                        &area_monitor,
+                        space_generation,
+                        begin_generation,
+                        session_generation,
+                    ) else {
+                        continue;
+                    };
+                    if !ticket_is_current() {
+                        break;
+                    }
+                    let image = Arc::new(image);
+                    if !snipping_set_area_session_snapshot(&app, label, Arc::clone(&image)) {
+                        continue;
+                    }
+                    refrozen_labels.insert(label.clone());
+                    snipping_store_area_snapshot_backdrop(&app, label, image);
+                }
+                if ticket_is_current() && refrozen_labels.len() == labels.len() {
+                    refreeze_succeeded = true;
+                    break;
+                }
+                if attempt.saturating_add(1) < SNIPPING_MACOS_SPACE_RECOVERY_CAPTURE_ATTEMPTS {
+                    thread::sleep(Duration::from_millis(
+                        SNIPPING_MACOS_SPACE_RECOVERY_POLL_MS,
+                    ));
+                }
+            }
+
+            snipping_reconcile_desktop_icons_after_space_recovery(&app, space_generation);
+            if ticket_is_current() && refreeze_succeeded {
+                SNIPPING_AREA_SNAPSHOT_SPACE_GENERATION
+                    .store(space_generation, Ordering::Release);
+            }
+        }
+
+        // Capture helpers restore each panel, but a transition can still order
+        // it out. This unconditional active-session show is the recovery the
+        // visibility-gated cursor path previously lacked.
+        if ticket_is_current() && !SNIPPING_AREA_BEGIN_IN_FLIGHT.load(Ordering::Acquire) {
+            snipping_reshow_active_area_overlays(&app, "macos_space_recovery");
         }
     });
 }
@@ -10643,13 +11224,25 @@ fn register_snipping_space_change_observer(app: &AppHandle) {
             let block = block2::RcBlock::new(
                 move |_notification: std::ptr::NonNull<objc2_foundation::NSNotification>| {
                     snipping_catch_objc("space_change_observer_callback", || {
-                        snipping_invalidate_current_warm_frames();
+                        // Stamp and schedule first: the fullscreen/AX probe
+                        // below can itself hold the main thread during a Space
+                        // transaction, while the recovery worker must already
+                        // be waiting for the matching quiet generation.
+                        let space_generation = snipping_mark_macos_space_changed_now();
+                        let app = snipping_macos_event_tap_app();
+                        if let Some(app) = app.as_ref() {
+                            snipping_schedule_area_space_change_recovery(
+                                app,
+                                space_generation,
+                            );
+                        }
                         let use_full_monitor_bounds =
                             macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread();
-                        if let Some(app) = snipping_macos_event_tap_app() {
+                        if let Some(app) = app {
                             log_snipping_area_cursor_debug_event(
                                 "native.space_changed",
                                 json!({
+                                    "space_generation": space_generation,
                                     "use_full_monitor_bounds": use_full_monitor_bounds,
                                     "cursor_position": snipping_app_cursor_position_debug_value(&app),
                                     "context": snipping_macos_cursor_context_debug_value(),
@@ -10667,7 +11260,6 @@ fn register_snipping_space_change_observer(app: &AppHandle) {
                                 "macos_space_immediate",
                                 true,
                             );
-                            snipping_refreeze_area_snapshot_for_space_change(&app);
                             snipping_schedule_area_overlay_reassertions(&app, "macos_space");
                             snipping_reflow_preview_stack_for_space_change(&app);
                         }
@@ -16082,6 +16674,62 @@ mod snipping_recording_webm_tests {
             offset = element.next;
         }
         None
+    }
+
+    #[test]
+    fn warm_frame_accepts_static_content_without_blanket_age_limit() {
+        // A static ScreenCaptureKit stream may not emit another frame for a
+        // long time. Eligibility is tied only to explicit invalidation events,
+        // never to wall-clock age.
+        assert!(snipping_warm_frame_is_usable(1, 0, 1920, 1080));
+        assert!(snipping_warm_frame_is_usable(10_000, 9_000, 1920, 1080));
+        assert!(!snipping_warm_frame_is_usable(8_999, 9_000, 1920, 1080));
+        assert!(!snipping_warm_frame_is_usable(10_000, 9_000, 0, 1080));
+    }
+
+    #[test]
+    fn warm_capture_idle_stop_requires_full_idle_window() {
+        assert!(!snipping_warm_capture_idle_should_stop(1_000, 1_000, 500));
+        assert!(!snipping_warm_capture_idle_should_stop(1_500, 1_000, 500));
+        assert!(snipping_warm_capture_idle_should_stop(1_501, 1_000, 500));
+        // last-use in the future (clock skew) must not trigger a stop
+        assert!(!snipping_warm_capture_idle_should_stop(1_000, 2_000, 500));
+    }
+
+    #[test]
+    fn space_settle_delay_tracks_notification_quiet_window() {
+        assert_eq!(snipping_space_settle_delay_ms(1_000, 0, 300), 0);
+        assert_eq!(snipping_space_settle_delay_ms(1_100, 1_000, 300), 200);
+        assert_eq!(snipping_space_settle_delay_ms(1_300, 1_000, 300), 0);
+        assert_eq!(snipping_space_settle_delay_ms(1_500, 1_000, 300), 0);
+    }
+
+    #[test]
+    fn space_capture_retry_is_generation_guarded_and_bounded() {
+        assert!(!snipping_space_capture_round_should_retry(4, 4, 0, 2));
+        assert!(snipping_space_capture_round_should_retry(4, 5, 0, 2));
+        assert!(!snipping_space_capture_round_should_retry(4, 5, 1, 2));
+    }
+
+    #[test]
+    fn space_recovery_ticket_rejects_new_space_or_new_begin() {
+        assert!(snipping_space_recovery_ticket_is_current(7, 7, 11, 11));
+        assert!(!snipping_space_recovery_ticket_is_current(7, 8, 11, 11));
+        assert!(!snipping_space_recovery_ticket_is_current(7, 7, 11, 12));
+        assert!(snipping_area_recovery_ticket_is_current(
+            7, 7, 11, 11, 13, 13,
+        ));
+        assert!(!snipping_area_recovery_ticket_is_current(
+            7, 7, 11, 11, 13, 14,
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn overlay_timeout_pending_keeps_session_for_delayed_show() {
+        assert!(SnippingAreaOverlayShowOutcome::Shown.retains_session());
+        assert!(SnippingAreaOverlayShowOutcome::Pending.retains_session());
+        assert!(!SnippingAreaOverlayShowOutcome::Failed.retains_session());
     }
 
     #[test]

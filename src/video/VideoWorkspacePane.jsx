@@ -31,6 +31,7 @@ import {
 } from "./videoPanelBridge.js";
 import {
   AUTO_DESCRIBE_CREDITS_FLOOR,
+  DESCRIBE_CREDITS_ESTIMATE,
   GENERATION_SETTINGS_EVENT,
   readAutoDescribeEnabled,
   readGenerationRouting,
@@ -46,6 +47,7 @@ import {
   updateClip,
 } from "./videoEditorModel.js";
 import AssetPanel from "./AssetPanel.jsx";
+import { videoProviderAuth } from "./videoProviders.js";
 import {
   VideoCard,
   VideoErrorText,
@@ -1080,6 +1082,9 @@ export default function VideoWorkspacePane({
   projectPathRef.current = projectPath;
   const createInputRef = useRef(null);
   const historyRef = useRef({ past: [], future: [] });
+  // Pre-gesture project snapshot: set by the first transient change of a drag
+  // gesture, pushed into history by the commit (see handleProjectChange).
+  const gestureOriginRef = useRef(null);
 
   const storageKey = useMemo(() => slotStorageKey(workspaceId, paneId, repoPath), [paneId, repoPath, workspaceId]);
   const externalProjectProvided = externalProject !== undefined;
@@ -1231,12 +1236,23 @@ export default function VideoWorkspacePane({
         })
     )
       .then((remaining) => {
-        if (remaining == null || remaining < AUTO_DESCRIBE_CREDITS_FLOOR) {
+        if (
+          remaining == null
+          || remaining - DESCRIBE_CREDITS_ESTIMATE < AUTO_DESCRIBE_CREDITS_FLOOR
+        ) {
           autoDescribeRunningRef.current = false;
           return undefined;
         }
+        autoDescribeBillingRef.current = {
+          ...autoDescribeBillingRef.current,
+          credits: remaining - DESCRIBE_CREDITS_ESTIMATE,
+        };
         autoDescribeAttemptedRef.current.add(candidate.path);
-        return invoke("video_describe_start", { repoPath, path: candidate.path }).then(
+        return invoke("video_describe_start", {
+          repoPath,
+          path: candidate.path,
+          autoDescribe: true,
+        }).then(
           (result) => {
             autoDescribeJobIdRef.current = result?.jobId || "";
           },
@@ -1320,6 +1336,7 @@ export default function VideoWorkspacePane({
 
   const resetHistory = useCallback(() => {
     historyRef.current = { past: [], future: [] };
+    gestureOriginRef.current = null;
     setHistoryVersion((version) => version + 1);
   }, []);
 
@@ -1675,10 +1692,10 @@ export default function VideoWorkspacePane({
     pendingSaveRef.current = null;
     window.clearTimeout(saveTimerRef.current);
     if (!pending?.repoPath || !pending?.projectPath) {
-      return;
+      return Promise.resolve();
     }
     lastLocalWriteAtRef.current = Date.now();
-    invoke("video_project_write", {
+    return invoke("video_project_write", {
       repoPath: pending.repoPath,
       projectPath: pending.projectPath,
       project: pending.project,
@@ -1708,24 +1725,46 @@ export default function VideoWorkspacePane({
 
   useEffect(() => () => flushPendingSave(), [flushPendingSave]);
 
+  // Rust commands (draft render, video/interchange exports) read the SAVED
+  // project file — awaiting this before invoking them guarantees the file on
+  // disk matches the on-screen state even inside the autosave debounce window.
+  const flushProjectSave = useCallback(async () => {
+    await flushPendingSave();
+  }, [flushPendingSave]);
+
   // Project mutations. Committed (non-transient) edits record undo history.
+  //
+  // Transient updates (clip/lane-key/transform/text drags) flow through
+  // setProject too, so by commit time projectStateRef already holds the final
+  // transient state — pushing it would make the first Undo a no-op. Instead,
+  // the first transient change of a gesture snapshots the pre-gesture project
+  // and the commit pushes that snapshot into history.
   const projectStateRef = useRef(null);
   projectStateRef.current = project;
   const handleProjectChange = useCallback(
     (next, { transient = false, fromHistory = false } = {}) => {
-      if (!transient && !fromHistory && projectStateRef.current) {
-        const history = historyRef.current;
-        history.past.push(projectStateRef.current);
-        if (history.past.length > HISTORY_LIMIT) {
-          history.past.shift();
+      if (transient) {
+        if (!gestureOriginRef.current && projectStateRef.current) {
+          gestureOriginRef.current = projectStateRef.current;
         }
-        history.future = [];
-        setHistoryVersion((version) => version + 1);
+        setProject(next);
+        return;
       }
+      if (!fromHistory) {
+        const origin = gestureOriginRef.current || projectStateRef.current;
+        if (origin) {
+          const history = historyRef.current;
+          history.past.push(origin);
+          if (history.past.length > HISTORY_LIMIT) {
+            history.past.shift();
+          }
+          history.future = [];
+          setHistoryVersion((version) => version + 1);
+        }
+      }
+      gestureOriginRef.current = null;
       setProject(next);
-      if (!transient) {
-        scheduleSave(next);
-      }
+      scheduleSave(next);
     },
     [scheduleSave],
   );
@@ -1755,6 +1794,7 @@ export default function VideoWorkspacePane({
             history.future = [];
             setHistoryVersion((version) => version + 1);
           }
+          gestureOriginRef.current = null;
           setProject(next);
           setPaneError("");
           // History entry is in — an agent-edit toast may now safely offer Undo.
@@ -2241,14 +2281,17 @@ export default function VideoWorkspacePane({
     (asset, words) => {
       const current = projectStateRef.current;
       if (!current || !asset?.path || !words?.length) {
-        return;
+        return null;
       }
+      // Return the full model result — TranscriptPanel surfaces blocked
+      // reasons (locked tracks) and no-op outcomes from it.
       const result = rippleDeleteWords(current, asset.path, words);
       if (result.ranges.length) {
         handleProjectChange(result.project, { transient: false });
-      } else {
+      } else if (!result.blocked) {
         setPaneError("Those words aren't inside any timeline clip of this media.");
       }
+      return result;
     },
     [handleProjectChange],
   );
@@ -2382,6 +2425,42 @@ export default function VideoWorkspacePane({
       unlisten();
     };
   }, [handleProjectChange, refreshAssets]);
+
+  const generationRecoveryProjectRef = useRef("");
+  useEffect(() => {
+    if (!repoPath || !projectPath) {
+      return;
+    }
+    const recoveryKey = `${repoPath}|${projectPath}`;
+    if (generationRecoveryProjectRef.current === recoveryKey) {
+      return;
+    }
+    generationRecoveryProjectRef.current = recoveryKey;
+    invoke("video_jobs_list", { repoPath })
+      .then((result) => {
+        if (result?.recoveryWarning) {
+          setPaneError(String(result.recoveryWarning));
+        }
+        const pending = (Array.isArray(result?.jobs) ? result.jobs : []).filter(
+          (job) =>
+            job &&
+            !job.done &&
+            job.state !== "unknown-outcome" &&
+            job.providerId !== "hyperframes",
+        );
+        return Promise.allSettled(
+          pending.map((job) =>
+            invoke("video_generate_resume", {
+              repoPath,
+              jobId: job.jobId,
+              auth: job.providerId === "cloud" ? null : videoProviderAuth(job.providerId),
+            }),
+          ),
+        );
+      })
+      .then(() => refreshAssets())
+      .catch(() => {});
+  }, [projectPath, refreshAssets, repoPath]);
 
   const addPlannedClip = useCallback(
     (plannedPath, durationMs, { model = "" } = {}) => {
@@ -2870,10 +2949,30 @@ export default function VideoWorkspacePane({
     selectedPath: selectedAssetPath,
   };
 
+  // First selected media clip (preview transform/crop handles target it).
+  const selectedMediaClip = useMemo(() => {
+    const clipId = selectedClipIds[0];
+    if (!clipId || !project) {
+      return null;
+    }
+    for (const track of project.tracks || []) {
+      if (track.kind === "text") {
+        continue;
+      }
+      const clip = (track.clips || []).find((entry) => entry.id === clipId);
+      if (clip) {
+        return clip;
+      }
+    }
+    return null;
+  }, [project, selectedClipIds]);
+
   const previewCell = (
     <PreviewCell>
       <VideoEditor
         mediaRootAbs={mediaRootAbs}
+        onClipTransformChange={handleUpdateTextClip}
+        onFlushProjectSave={flushProjectSave}
         onSeek={commitSeek}
         onTogglePlay={setPlaybackPlaying}
         onUpdateTextClip={handleUpdateTextClip}
@@ -2881,7 +2980,10 @@ export default function VideoWorkspacePane({
         playheadMs={playheadUiMs}
         playing={playing}
         project={project}
+        projectRelPath={projectPath}
         repoPath={repoPath}
+        selectedClip={selectedMediaClip}
+        selectedRange={ranges[0] || null}
       />
     </PreviewCell>
   );
@@ -2937,6 +3039,7 @@ export default function VideoWorkspacePane({
       assetsByPath={assetsByPath}
       onAddToTimeline={addAssetToTimeline}
       onOpenAsset={openAssetPanel}
+      onReprobe={refreshAssets}
       onDeleted={() => {
         refreshAssets();
         setSidePanel("");
@@ -2949,6 +3052,7 @@ export default function VideoWorkspacePane({
     <ExportPanel
       ffmpegReady={ffmpegReady}
       ffmpegTextSupport={tools?.ffmpeg?.textSupport ?? null}
+      onFlushProjectSave={flushProjectSave}
       project={project}
       projectPath={projectPath}
       repoPath={repoPath}

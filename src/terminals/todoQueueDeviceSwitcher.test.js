@@ -5,7 +5,11 @@ import {
   TODO_QUEUE_DEVICE_KIND_MOBILE,
   buildAccountLiveDeviceRows,
   buildDevicesGraphModel,
+  buildTodoQueueHydratedSnapshotRows,
+  buildTodoQueueDisplayedSelectionArrays,
   buildTodoQueueDeviceWorkspaceOptions,
+  normalizeTodoQueueSwitcherId,
+  normalizeTodoQueueWorkspaceMatchId,
   todoQueueDeviceSelectionIsLocalEditable,
   workspaceTodoItemsForDeviceWorkspace,
 } from "./todoQueueDeviceSwitcher.js";
@@ -1133,4 +1137,146 @@ test("only local device current workspace selections are editable", () => {
     isLocal: true,
     workspaceId: "",
   }, ""), false);
+});
+
+test("Windows local workspace aliases stay editable and resolve mirrored todos", () => {
+  const windowsWorkspaceId = "C:\\Users\\Rizzi\\Code\\DiffForge";
+  const currentWorkspaceId = "c:/users/rizzi/code/diffforge/";
+  const reportedDeviceId = "C:\\Users\\Rizzi\\Devices\\Windows-Rig";
+  const localDeviceId = "c:/users/rizzi/devices/windows-rig";
+  const options = buildTodoQueueDeviceWorkspaceOptions({
+    currentWorkspaceId,
+    currentWorkspaceName: "DiffForge",
+    deviceLiveState: {
+      devices: [{
+        device_aliases: [reportedDeviceId, "web-windows-rig"],
+        device_id: reportedDeviceId,
+        form_factor: "Windows Desktop",
+        native_connected: true,
+        workspaces: [{
+          device_id: reportedDeviceId,
+          workspace_id: windowsWorkspaceId,
+          workspace_name: "DiffForge",
+        }],
+      }],
+    },
+    localProfile: {
+      device_id: localDeviceId,
+      form_factor: "desktop",
+      platform: "Windows",
+    },
+  });
+
+  assert.equal(
+    normalizeTodoQueueWorkspaceMatchId(windowsWorkspaceId, "Windows"),
+    "c:/users/rizzi/code/diffforge",
+  );
+  assert.equal(
+    normalizeTodoQueueSwitcherId(windowsWorkspaceId),
+    "c__users_rizzi_code_diffforge",
+  );
+  assert.equal(
+    normalizeTodoQueueSwitcherId(reportedDeviceId),
+    normalizeTodoQueueSwitcherId(localDeviceId),
+  );
+  assert.equal(normalizeTodoQueueSwitcherId(`device:${"x".repeat(120)}`).length, 96);
+  assert.notEqual(
+    normalizeTodoQueueWorkspaceMatchId("/srv/Foo\\Bar", "linux"),
+    normalizeTodoQueueWorkspaceMatchId("/srv/foo/bar", "linux"),
+  );
+  assert.equal(normalizeTodoQueueWorkspaceMatchId("C:\\Üser\\Repo", "windows"), "c:/üser/repo");
+  assert.equal(options.length, 1);
+  assert.equal(options[0].isLocal, true);
+  assert.equal(options[0].deviceKind, "desktop");
+  assert.equal(todoQueueDeviceSelectionIsLocalEditable(options[0], currentWorkspaceId), true);
+  assert.equal(todoQueueDeviceSelectionIsLocalEditable({
+    deviceKind: "unknown",
+    isLocal: true,
+    platform: "Windows",
+    workspaceId: windowsWorkspaceId,
+  }, currentWorkspaceId), true);
+
+  const todos = workspaceTodoItemsForDeviceWorkspace({
+    itemsByWorkspace: {
+      [currentWorkspaceId]: [{
+        mirror_row_kind: "dispatch",
+        todo_device_id: "web-origin",
+        todo_workspace_id: "web-origin-workspace",
+        target_device_id: reportedDeviceId,
+        target_workspace_id: windowsWorkspaceId,
+        todo_id: "23",
+        target: {
+          device_id: reportedDeviceId,
+          workspace_id: windowsWorkspaceId,
+        },
+        status: "pending",
+        text: "Mirror this todo",
+      }],
+    },
+  }, options[0]);
+  assert.equal(todos.length, 1);
+  assert.equal(todos[0].todo_id, "23");
+});
+
+test("displayed todo arrays render a production dispatch for its remote Windows recipient", () => {
+  const recipientWorkspace = "C:\\Code\\Recipient";
+  const displayed = buildTodoQueueDisplayedSelectionArrays({
+    editable: false,
+    items: [{ id: "local-only", text: "Must not render for remote selection" }],
+    selection: {
+      deviceAliases: ["Windows-Rig"],
+      deviceId: "windows-rig",
+      deviceKind: "desktop",
+      isLocal: false,
+      platform: "windows",
+      workspaceId: "c:/code/recipient/",
+    },
+    workspaceTodos: {
+      dispatchesByWorkspace: [{
+        workspaceId: recipientWorkspace,
+        items: [{
+          mirror_row_kind: "dispatch",
+          todo_device_id: "web-origin",
+          todo_workspace_id: "web-origin-workspace",
+          target_device_id: "Windows-Rig",
+          target_workspace_id: recipientWorkspace,
+          target: {
+            device_id: "Windows-Rig",
+            workspace_id: recipientWorkspace,
+          },
+          todo_id: "23",
+          dispatch_status: "running",
+          text: "Recipient-shaped mirror row",
+        }],
+      }],
+    },
+  });
+
+  assert.equal(displayed.items.length, 1);
+  assert.equal(displayed.items[0].id, "23");
+  assert.equal(displayed.items[0].todo_device_id, "web-origin");
+  assert.equal(displayed.items[0].target_device_id, "Windows-Rig");
+  assert.equal(displayed.items[0].readOnly, true);
+  assert.deepEqual(displayed.pendingItems, {});
+  assert.deepEqual(displayed.peerItems, []);
+});
+
+test("todo_store_snapshot hydration keeps a Windows workspace across slash and drive case", () => {
+  const hydratedRows = buildTodoQueueHydratedSnapshotRows({
+    deviceId: "Windows-Rig",
+    platform: "windows",
+    snapshot: {
+      items: [{
+        device_id: "windows-rig",
+        id: "todo-23",
+        text: "Hydrated on the Windows recipient",
+        workspace_id: "C:\\Code\\Recipient",
+      }],
+    },
+    workspaceId: "c:/code/recipient/",
+  });
+
+  assert.equal(hydratedRows.length, 1);
+  assert.equal(hydratedRows[0].id, "todo-23");
+  assert.equal(hydratedRows[0].workspace_id, "C:\\Code\\Recipient");
 });

@@ -56,9 +56,10 @@ const VIDEO_DIRECT_UPSCALE_VIDEO_LIMIT_BYTES: u64 = 60 * 1024 * 1024;
 const VIDEO_DIRECT_UPSCALE_IMAGE_LIMIT_BYTES: u64 = 25 * 1024 * 1024;
 const VIDEO_DIRECT_GENERATION_AUDIO_LIMIT_BYTES: u64 = 15 * 1024 * 1024;
 const VIDEO_MCP_MIN_CLIP_DURATION_MS: u64 = 80;
-const VIDEO_MCP_REMOVE_WORDS_MERGE_GAP_MS: u64 = 80;
+const VIDEO_MCP_REMOVE_WORDS_MERGE_GAP_MS: u64 = 120;
 const VIDEO_MCP_LOOK_MAX_FRAMES: usize = 6;
 const VIDEO_MCP_LOOK_JPEG_MAX_BASE64_BYTES: usize = 48 * 1024;
+const VIDEO_MCP_TEXT_OMITTED_WARNING: &str = "text layers omitted: ffmpeg without drawtext";
 const VIDEO_MCP_MOMENT_SOURCE_NOTE: &str = "video_media search moments: momentSourceMs uses the asset's own timebase. Inherited transcript moments include inheritedFrom; inherited timing is valid for derived assets that preserve audio timing.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -393,6 +394,11 @@ struct VideoRenderFrameResponse {
     data_url: String,
 }
 
+struct VideoRenderedFrame {
+    bytes: Vec<u8>,
+    text_layers_omitted: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct VideoProjectSummary {
@@ -422,6 +428,10 @@ struct VideoExportOptions {
     // Absolute directory picked by the user (native folder dialog); empty or
     // absent → the default media/exports/ inside the workspace.
     output_dir: Option<String>,
+    #[serde(default)]
+    hardware_encode: Option<bool>,
+    #[serde(default)]
+    draft: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -468,6 +478,7 @@ struct VideoGenerateRecordedRequest {
     params: Option<VideoGenerateParams>,
     input_asset_paths: Vec<String>,
     audio_asset_paths: Vec<String>,
+    lora_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -518,8 +529,6 @@ const VIDEO_GENERATION_PROVIDERS: &[VideoProviderDefinition] = &[
             "mirelo_sfx",
             "seedvr2-video-upscaler",
             "esrgan-image-upscaler",
-            "topaz-video-upscale",
-            "topaz-image-upscale",
             "real-esrgan-replicate",
         ],
         requires_secret_key: false,
@@ -664,6 +673,8 @@ struct VideoPersistentGenerateJob {
 #[serde(rename_all = "camelCase")]
 struct VideoJobsListResponse {
     jobs: Vec<VideoPersistentGenerateJob>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -699,10 +710,15 @@ struct VideoProbeSummary {
     width: Option<u32>,
     height: Option<u32>,
     has_audio: Option<bool>,
+    fps: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
 struct VideoExportMediaClip {
+    clip_id: String,
+    link_id: String,
+    track_id: String,
+    track_order: usize,
     input_index: usize,
     kind: String,
     abs_path: std::path::PathBuf,
@@ -722,6 +738,11 @@ struct VideoExportMediaClip {
     x_keyframes: Vec<VideoExportPropertyKeyframe>,
     y_keyframes: Vec<VideoExportPropertyKeyframe>,
     scale_keyframes: Vec<VideoExportPropertyKeyframe>,
+    fx: VideoTier1Fx,
+    crop: VideoTier1Crop,
+    lut_abs: Option<std::path::PathBuf>,
+    supports_colortemperature: bool,
+    transition_after: Option<VideoExportTransition>,
     has_audio: bool,
 }
 
@@ -744,8 +765,15 @@ struct VideoExportTextClip {
     outline_width: f64,
     shadow: bool,
     uppercase: bool,
+    align: String,
+    bold: bool,
+    font_family: String,
     x: f64,
     y: f64,
+    words: Vec<VideoTier1Word>,
+    anim: String,
+    anim_opts: VideoTier1AnimOpts,
+    word_time_offset_ms: u64,
 }
 
 fn video_job_registry_insert(
@@ -764,15 +792,36 @@ fn video_job_registry_insert_with_id(
     >,
     job_id: &str,
 ) -> Result<std::sync::Arc<std::sync::atomic::AtomicBool>, String> {
+    Ok(video_job_registry_insert_if_absent(registry, job_id)?.0)
+}
+
+fn video_job_registry_insert_if_absent(
+    registry: &'static std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, VideoJobHandle>>,
+    >,
+    job_key: &str,
+) -> Result<(std::sync::Arc<std::sync::atomic::AtomicBool>, bool), String> {
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = VideoJobHandle {
         cancel: cancel.clone(),
     };
     let jobs = registry.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    jobs.lock()
-        .map_err(|_| "Video job registry is poisoned.".to_string())?
-        .insert(job_id.to_string(), handle);
-    Ok(cancel)
+    let mut jobs = jobs
+        .lock()
+        .map_err(|_| "Video job registry is poisoned.".to_string())?;
+    match jobs.entry(job_key.to_string()) {
+        std::collections::hash_map::Entry::Occupied(existing) => {
+            Ok((existing.get().cancel.clone(), false))
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(handle);
+            Ok((cancel, true))
+        }
+    }
+}
+
+fn video_generation_job_registry_key(root: &std::path::Path, job_id: &str) -> String {
+    format!("{}\u{1f}{job_id}", root.to_string_lossy())
 }
 
 fn video_job_registry_cancel(
@@ -1459,6 +1508,7 @@ fn video_probe_from_cache(value: &serde_json::Value) -> VideoProbeSummary {
             .and_then(|value| value.as_u64())
             .and_then(|value| u32::try_from(value).ok()),
         has_audio: value.get("hasAudio").and_then(|value| value.as_bool()),
+        fps: value.get("fps").and_then(|value| value.as_f64()),
     }
 }
 
@@ -1468,6 +1518,7 @@ fn video_probe_to_cache(summary: &VideoProbeSummary) -> serde_json::Value {
         "width": summary.width,
         "height": summary.height,
         "hasAudio": summary.has_audio,
+        "fps": summary.fps,
     })
 }
 
@@ -1477,6 +1528,20 @@ fn video_parse_duration_ms(value: &serde_json::Value) -> Option<u64> {
         .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
         .filter(|duration| duration.is_finite() && *duration >= 0.0)
         .map(|duration| (duration * 1000.0).round().max(0.0) as u64)
+}
+
+fn video_parse_rational_f64(value: &serde_json::Value) -> Option<f64> {
+    let text = value.as_str()?.trim();
+    if let Some((numerator, denominator)) = text.split_once('/') {
+        let numerator = numerator.parse::<f64>().ok()?;
+        let denominator = denominator.parse::<f64>().ok()?;
+        return (denominator != 0.0)
+            .then_some(numerator / denominator)
+            .filter(|value| value.is_finite() && *value > 0.0);
+    }
+    text.parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value > 0.0)
 }
 
 fn video_probe_media(ffprobe_path: &str, abs_path: &std::path::Path) -> Option<VideoProbeSummary> {
@@ -1507,6 +1572,7 @@ fn video_probe_media(ffprobe_path: &str, abs_path: &std::path::Path) -> Option<V
         .and_then(video_parse_duration_ms);
     let mut width = None;
     let mut height = None;
+    let mut fps = None;
     let mut has_audio = false;
     if let Some(streams) = parsed.get("streams").and_then(|value| value.as_array()) {
         for stream in streams {
@@ -1523,6 +1589,14 @@ fn video_probe_media(ffprobe_path: &str, abs_path: &std::path::Path) -> Option<V
                     .get("height")
                     .and_then(|value| value.as_u64())
                     .and_then(|value| u32::try_from(value).ok());
+                fps = stream
+                    .get("avg_frame_rate")
+                    .and_then(video_parse_rational_f64)
+                    .or_else(|| {
+                        stream
+                            .get("r_frame_rate")
+                            .and_then(video_parse_rational_f64)
+                    });
             } else if codec_type == "audio" {
                 has_audio = true;
             }
@@ -1533,6 +1607,7 @@ fn video_probe_media(ffprobe_path: &str, abs_path: &std::path::Path) -> Option<V
         width,
         height,
         has_audio: Some(has_audio),
+        fps,
     })
 }
 
@@ -2160,13 +2235,27 @@ static VIDEO_FFMPEG_DRAWTEXT_CACHE: std::sync::OnceLock<
 
 // Homebrew's ffmpeg 8 formula dropped libfreetype, so a system build can be
 // missing the drawtext filter entirely — text/caption rendering must know up
-// front instead of failing mid-export with a raw ffmpeg error. Cached per
-// binary path for the app's lifetime.
+// front instead of failing mid-export with a raw ffmpeg error. Include the
+// file identity because a managed-tool install replaces the binary in-place.
+fn video_ffmpeg_drawtext_cache_key(ffmpeg_path: &str) -> String {
+    std::fs::metadata(ffmpeg_path)
+        .ok()
+        .map(|metadata| {
+            video_cache_key(
+                ffmpeg_path,
+                video_file_modified_ms(&metadata),
+                metadata.len(),
+            )
+        })
+        .unwrap_or_else(|| video_cache_key(ffmpeg_path, 0, 0))
+}
+
 fn video_ffmpeg_supports_drawtext(ffmpeg_path: &str) -> bool {
     let cache = VIDEO_FFMPEG_DRAWTEXT_CACHE
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let cache_key = video_ffmpeg_drawtext_cache_key(ffmpeg_path);
     if let Ok(guard) = cache.lock() {
-        if let Some(known) = guard.get(ffmpeg_path) {
+        if let Some(known) = guard.get(&cache_key) {
             return *known;
         }
     }
@@ -2183,9 +2272,16 @@ fn video_ffmpeg_supports_drawtext(ffmpeg_path: &str) -> bool {
     })
     .unwrap_or(false);
     if let Ok(mut guard) = cache.lock() {
-        guard.insert(ffmpeg_path.to_string(), supported);
+        guard.insert(cache_key, supported);
     }
     supported
+}
+
+fn video_should_warn_text_layers_omitted(
+    active_text_count: usize,
+    drawtext_supported: bool,
+) -> bool {
+    active_text_count > 0 && !drawtext_supported
 }
 
 fn video_version_for_tool(path: &str) -> Option<String> {
@@ -4419,7 +4515,7 @@ async fn video_frame_extract(
     .map_err(|error| format!("Video frame extract worker failed: {error}"))?
 }
 
-const VIDEO_PIPE_HEADER: &str = "#diffforge-video 1\n# syntax: project \"<name>\" <W>x<H> [fps=30] [bg=#000000]\n#   track <video|audio|text> \"<label>\" [muted] [locked]\n#   c <asset-path> at=<ms> dur=<ms> [in=<ms>] [speed=<f>] [gain=<f>] [kf=<ms>:<lvl>,...] [kfo=<ms>:<value>[:l|h|s],...] [kfx=...] [kfy=...] [kfs=...] [link=<id>] [x=] [y=] [scale=] [opacity=]\n#   t \"<text>\" at=<ms> dur=<ms> [cap=<id>] [size=48] [color=#ffffff] [bg=] [outline=#000000] [outlinew=0] [shadow] [upper] [x=0.5] [y=0.85] [align=center] [plain] [font=]\n";
+const VIDEO_PIPE_HEADER: &str = "#diffforge-video 1\n# syntax: project \"<name>\" <W>x<H> [fps=30] [bg=#000000]\n#   track <video|audio|text> \"<label>\" [muted] [locked] [transition=<afterClipId>:<kind>:<durationMs>]\n#   c <asset-path> at=<ms> dur=<ms> [in=<ms>] [speed=<f>] [gain=<f>] [kf=<ms>:<lvl>,...] [kfo=<ms>:<value>[:l|h|s|ei|eo|eio],...] [kfx=...] [kfy=...] [kfs=...] [link=<id>] [x=] [y=] [scale=] [opacity=] [fx=<json>] [crop=<l>:<t>:<r>:<b>]\n#   t \"<text>\" at=<ms> dur=<ms> [cap=<id>] [size=48] [color=#ffffff] [bg=] [outline=#000000] [outlinew=0] [shadow] [upper] [x=0.5] [y=0.85] [align=center] [plain] [font=] [words=<json>] [anim=<kind>] [animOpts=<json>]\n";
 
 #[derive(Debug, Clone)]
 struct VideoPipeTrackDraft {
@@ -4429,6 +4525,7 @@ struct VideoPipeTrackDraft {
     muted: bool,
     locked: bool,
     clips: Vec<serde_json::Value>,
+    transitions: Vec<serde_json::Value>,
 }
 
 fn video_pipe_line_error(line_number: usize, message: &str) -> String {
@@ -4557,9 +4654,12 @@ fn video_pipe_easing_from_code(value: &str, line_number: usize) -> Result<&'stat
         "" | "l" => Ok("linear"),
         "h" => Ok("hold"),
         "s" => Ok("smooth"),
+        "ei" => Ok("ease-in"),
+        "eo" => Ok("ease-out"),
+        "eio" => Ok("ease-in-out"),
         _ => Err(video_pipe_line_error(
             line_number,
-            "keyframe easing must be l, h, or s",
+            "keyframe easing must be l, h, s, ei, eo, or eio",
         )),
     }
 }
@@ -4568,6 +4668,9 @@ fn video_pipe_easing_code(value: &str) -> &'static str {
     match value {
         "hold" => "h",
         "smooth" => "s",
+        "ease-in" => "ei",
+        "ease-out" => "eo",
+        "ease-in-out" => "eio",
         _ => "l",
     }
 }
@@ -4625,6 +4728,7 @@ fn video_pipe_parse_project(raw: &str) -> Result<serde_json::Value, String> {
     let mut audio_count = 0u32;
     let mut text_count = 0u32;
     let mut clip_count = 0u64;
+    let mut transition_count = 0u64;
 
     for (line_index, line) in raw.lines().enumerate() {
         let line_number = line_index + 1;
@@ -4689,11 +4793,30 @@ fn video_pipe_parse_project(raw: &str) -> Result<serde_json::Value, String> {
                 }
                 let mut muted = false;
                 let mut locked = false;
+                let mut transitions = Vec::new();
                 for token in tokens.iter().skip(3) {
                     match token.as_str() {
                         "muted" => muted = true,
                         "locked" => locked = true,
-                        _ => {}
+                        _ => {
+                            if let Some(("transition", value)) = video_pipe_key_value(token) {
+                                if kind != "video" {
+                                    return Err(video_pipe_line_error(
+                                        line_number,
+                                        "transitions are only valid on video tracks",
+                                    ));
+                                }
+                                let (after_clip_id, transition_kind, duration_ms) =
+                                    video_tier1_parse_transition_token(value, line_number)?;
+                                transition_count += 1;
+                                transitions.push(serde_json::json!({
+                                    "id": format!("tr{transition_count}"),
+                                    "afterClipId": after_clip_id,
+                                    "kind": transition_kind,
+                                    "durationMs": duration_ms,
+                                }));
+                            }
+                        }
                     }
                 }
                 match kind {
@@ -4710,6 +4833,7 @@ fn video_pipe_parse_project(raw: &str) -> Result<serde_json::Value, String> {
                     muted,
                     locked,
                     clips: Vec::new(),
+                    transitions,
                 });
                 current_track_index = Some(tracks.len() - 1);
             }
@@ -4743,6 +4867,8 @@ fn video_pipe_parse_project(raw: &str) -> Result<serde_json::Value, String> {
                 let mut scale = 1.0f64;
                 let mut opacity = 1.0f64;
                 let mut link_id = String::new();
+                let mut fx = VideoTier1Fx::default();
+                let mut crop = VideoTier1Crop::default();
                 let mut kf = serde_json::Map::<String, serde_json::Value>::new();
                 for token in tokens.iter().skip(2) {
                     if let Some((key, value)) = video_pipe_key_value(token) {
@@ -4805,6 +4931,8 @@ fn video_pipe_parse_project(raw: &str) -> Result<serde_json::Value, String> {
                                 );
                             }
                             "link" => link_id = value.to_string(),
+                            "fx" => fx = video_tier1_parse_fx_token(value, line_number)?,
+                            "crop" => crop = video_tier1_parse_crop_token(value, line_number)?,
                             _ => {}
                         }
                     }
@@ -4844,6 +4972,8 @@ fn video_pipe_parse_project(raw: &str) -> Result<serde_json::Value, String> {
                         "scale": scale,
                         "opacity": opacity,
                     },
+                    "fx": fx,
+                    "crop": crop,
                 });
                 if !kf.is_empty() {
                     if let Some(object) = clip.as_object_mut() {
@@ -4886,6 +5016,9 @@ fn video_pipe_parse_project(raw: &str) -> Result<serde_json::Value, String> {
                 let mut bold = true;
                 let mut font_family = "sans-serif".to_string();
                 let mut caption_group = String::new();
+                let mut words = Vec::<VideoTier1Word>::new();
+                let mut anim = "none".to_string();
+                let mut anim_opts = VideoTier1AnimOpts::default();
                 for token in tokens.iter().skip(2) {
                     if token == "plain" {
                         bold = false;
@@ -4928,6 +5061,13 @@ fn video_pipe_parse_project(raw: &str) -> Result<serde_json::Value, String> {
                             }
                             "font" => font_family = value.to_string(),
                             "cap" => caption_group = value.to_string(),
+                            "words" => {
+                                words = video_tier1_parse_words_token(value, line_number)?
+                            }
+                            "anim" => anim = video_tier1_parse_anim(value, line_number)?,
+                            "animOpts" => {
+                                anim_opts = video_tier1_parse_anim_opts_token(value, line_number)?
+                            }
                             _ => {}
                         }
                     }
@@ -4945,12 +5085,15 @@ fn video_pipe_parse_project(raw: &str) -> Result<serde_json::Value, String> {
                     ));
                 };
                 clip_count += 1;
-                tracks[track_index].clips.push(serde_json::json!({
+                let mut parsed_clip = serde_json::json!({
                     "id": format!("c{clip_count}"),
                     "text": tokens[1],
                     "captionGroup": caption_group,
                     "timelineStartMs": timeline_start_ms,
                     "durationMs": duration_ms,
+                    "words": words,
+                    "anim": anim,
+                    "animOpts": anim_opts,
                     "style": {
                         "fontSize": font_size,
                         "color": color,
@@ -4965,7 +5108,13 @@ fn video_pipe_parse_project(raw: &str) -> Result<serde_json::Value, String> {
                         "bold": bold,
                         "fontFamily": font_family,
                     },
-                }));
+                });
+                if anim != "word-highlight" {
+                    if let Some(object) = parsed_clip.as_object_mut() {
+                        object.remove("animOpts");
+                    }
+                }
+                tracks[track_index].clips.push(parsed_clip);
             }
             _ => {
                 return Err(video_pipe_line_error(
@@ -4990,6 +5139,7 @@ fn video_pipe_parse_project(raw: &str) -> Result<serde_json::Value, String> {
                 "muted": track.muted,
                 "locked": track.locked,
                 "clips": track.clips,
+                "transitions": track.transitions,
             })
         })
         .collect::<Vec<_>>();
@@ -5155,6 +5305,7 @@ fn video_pipe_serialize_project(project: &serde_json::Value) -> Result<String, S
         .and_then(|value| value.as_array())
         .cloned()
         .unwrap_or_default();
+    let mut serialized_clip_count = 0u64;
     for track in tracks {
         let kind = video_json_string(&track, "kind", "");
         if !matches!(kind.as_str(), "video" | "audio" | "text") {
@@ -5162,6 +5313,20 @@ fn video_pipe_serialize_project(project: &serde_json::Value) -> Result<String, S
         }
         let default_label = kind.to_ascii_uppercase();
         let label = video_json_string(&track, "label", &default_label);
+        let mut clips = track
+            .get("clips")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        clips.sort_by_key(|clip| video_json_u64(clip, "timelineStartMs", 0));
+        let mut serialized_ids = std::collections::BTreeMap::<String, String>::new();
+        for clip in &clips {
+            serialized_clip_count += 1;
+            let old_id = video_json_string(clip, "id", "");
+            if !old_id.is_empty() {
+                serialized_ids.insert(old_id, format!("c{serialized_clip_count}"));
+            }
+        }
         let mut track_line = format!("track {kind} {}", video_pipe_quote_string(&label));
         if track
             .get("muted")
@@ -5177,15 +5342,27 @@ fn video_pipe_serialize_project(project: &serde_json::Value) -> Result<String, S
         {
             track_line.push_str(" locked");
         }
+        if let Some(transitions) = track.get("transitions").and_then(|value| value.as_array()) {
+            for transition in transitions {
+                let after_clip_id = video_json_string(transition, "afterClipId", "");
+                let after_clip_id = serialized_ids
+                    .get(&after_clip_id)
+                    .cloned()
+                    .unwrap_or(after_clip_id);
+                let transition_kind = video_json_string(transition, "kind", "crossfade");
+                let duration_ms = video_json_u64(transition, "durationMs", 0);
+                video_tier1_validate_transition(&transition_kind, duration_ms)?;
+                track_line.push_str(" transition=");
+                track_line.push_str(&format!(
+                    "{}:{}:{}",
+                    video_pipe_token_value(&after_clip_id),
+                    transition_kind,
+                    duration_ms
+                ));
+            }
+        }
         output.push_str(&track_line);
         output.push('\n');
-
-        let mut clips = track
-            .get("clips")
-            .and_then(|value| value.as_array())
-            .cloned()
-            .unwrap_or_default();
-        clips.sort_by_key(|clip| video_json_u64(clip, "timelineStartMs", 0));
         for clip in clips {
             let timeline_start_ms = video_json_u64(&clip, "timelineStartMs", 0);
             let duration_ms = video_json_u64(&clip, "durationMs", 0);
@@ -5260,6 +5437,16 @@ fn video_pipe_serialize_project(project: &serde_json::Value) -> Result<String, S
                     &video_json_string(style, "fontFamily", "sans-serif"),
                     "sans-serif",
                 );
+                video_tier1_push_words_token(&mut line, clip.get("words"))?;
+                video_pipe_push_string_key(
+                    &mut line,
+                    "anim",
+                    &video_json_string(&clip, "anim", "none"),
+                    "none",
+                );
+                if video_json_string(&clip, "anim", "none") == "word-highlight" {
+                    video_tier1_push_anim_opts_token(&mut line, clip.get("animOpts"))?;
+                }
                 output.push_str(&line);
                 output.push('\n');
                 continue;
@@ -5323,6 +5510,8 @@ fn video_pipe_serialize_project(project: &serde_json::Value) -> Result<String, S
                 video_json_f64(transform, "opacity", 1.0),
                 1.0,
             );
+            video_tier1_push_fx_token(&mut line, clip.get("fx"))?;
+            video_tier1_push_crop_token(&mut line, clip.get("crop"))?;
             output.push_str(&line);
             output.push('\n');
         }
@@ -5623,6 +5812,7 @@ struct VideoMcpTrack {
     muted: bool,
     locked: bool,
     clips: Vec<VideoMcpClip>,
+    transitions: Vec<VideoExportTransition>,
 }
 
 impl Default for VideoMcpTrack {
@@ -5634,6 +5824,7 @@ impl Default for VideoMcpTrack {
             muted: false,
             locked: false,
             clips: Vec::new(),
+            transitions: Vec::new(),
         }
     }
 }
@@ -5656,6 +5847,12 @@ struct VideoMcpClip {
     kf: std::collections::BTreeMap<String, Vec<VideoMcpPropKeyframe>>,
     style: serde_json::Value,
     caption_group: String,
+    fx: VideoTier1Fx,
+    crop: VideoTier1Crop,
+    words: Vec<VideoTier1Word>,
+    anim: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    anim_opts: Option<VideoTier1AnimOpts>,
     // Applied motion-preset name (metadata; the compiled transform/kf render).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     motion: String,
@@ -5677,6 +5874,11 @@ impl Default for VideoMcpClip {
             kf: std::collections::BTreeMap::new(),
             style: serde_json::Value::Null,
             caption_group: String::new(),
+            fx: VideoTier1Fx::default(),
+            crop: VideoTier1Crop::default(),
+            words: Vec::new(),
+            anim: "none".to_string(),
+            anim_opts: None,
             motion: String::new(),
         }
     }
@@ -5747,11 +5949,12 @@ impl Default for VideoMcpPropKeyframe {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct VideoMcpEditState {
     next_clip_seq: u64,
     next_link_seq: u64,
     changed_clip_ids: std::collections::BTreeSet<String>,
+    effective_ranges: Vec<(u64, u64)>,
     summaries: Vec<String>,
 }
 
@@ -6361,11 +6564,11 @@ async fn video_mcp_render_look_frame_b64(
     repo_path: String,
     project_path: String,
     at_ms: u64,
-) -> Result<(String, VideoMcpLookJpegAttempt, usize), String> {
+) -> Result<(String, VideoMcpLookJpegAttempt, usize, bool), String> {
     let at_i64 = at_ms.min(i64::MAX as u64) as i64;
     let mut last_len = 0usize;
     for attempt in VIDEO_MCP_LOOK_JPEG_ATTEMPTS {
-        let bytes = video_render_frame_jpeg_bytes(
+        let rendered = video_render_frame_jpeg_bytes(
             app.clone(),
             repo_path.clone(),
             project_path.clone(),
@@ -6374,11 +6577,12 @@ async fn video_mcp_render_look_frame_b64(
             attempt.quality,
         )
         .await?;
-        last_len = bytes.len().saturating_add(2) / 3 * 4;
-        if let Some((b64, len)) =
-            video_mcp_jpeg_base64_within_budget(&bytes, VIDEO_MCP_LOOK_JPEG_MAX_BASE64_BYTES)
-        {
-            return Ok((b64, attempt, len));
+        last_len = rendered.bytes.len().saturating_add(2) / 3 * 4;
+        if let Some((b64, len)) = video_mcp_jpeg_base64_within_budget(
+            &rendered.bytes,
+            VIDEO_MCP_LOOK_JPEG_MAX_BASE64_BYTES,
+        ) {
+            return Ok((b64, attempt, len, rendered.text_layers_omitted));
         }
     }
     Err(format!(
@@ -6410,24 +6614,30 @@ async fn video_mcp_look(
 
     let mut frames = Vec::new();
     let mut budget_notes = Vec::new();
+    let mut text_layers_omitted = false;
     for at_ms in &times_ms {
-        let (b64, attempt, len) = video_mcp_render_look_frame_b64(
+        let (b64, attempt, len, frame_text_layers_omitted) = video_mcp_render_look_frame_b64(
             app.clone(),
             repo_path.clone(),
             project_path.clone(),
             *at_ms,
         )
         .await?;
+        text_layers_omitted |= frame_text_layers_omitted;
         if attempt != VIDEO_MCP_LOOK_JPEG_ATTEMPTS[0] {
             budget_notes.push(format!(
                 "{}ms q{} {}px {}B",
                 *at_ms, attempt.quality, attempt.max_width, len
             ));
         }
-        frames.push(serde_json::json!({
+        let mut frame = serde_json::json!({
             "atMs": *at_ms,
             "b64Jpeg": b64,
-        }));
+        });
+        if frame_text_layers_omitted {
+            frame["warnings"] = serde_json::json!([VIDEO_MCP_TEXT_OMITTED_WARNING]);
+        }
+        frames.push(frame);
     }
     let rendered = times_ms
         .iter()
@@ -6447,9 +6657,19 @@ async fn video_mcp_look(
             budget_notes.join(", ")
         )
     };
+    let note = if text_layers_omitted {
+        format!("{note}; {VIDEO_MCP_TEXT_OMITTED_WARNING}")
+    } else {
+        note
+    };
     Ok(serde_json::json!({
         "frames": frames,
         "note": note,
+        "warnings": if text_layers_omitted {
+            serde_json::json!([VIDEO_MCP_TEXT_OMITTED_WARNING])
+        } else {
+            serde_json::json!([])
+        },
     }))
 }
 
@@ -7055,6 +7275,26 @@ async fn video_mcp_context(
                 "pipePath".to_string(),
                 serde_json::json!(project_abs.to_string_lossy().to_string()),
             );
+            output.insert(
+                "transitions".to_string(),
+                serde_json::Value::Array(
+                    project
+                        .tracks
+                        .iter()
+                        .flat_map(|track| {
+                            track.transitions.iter().map(move |transition| {
+                                serde_json::json!({
+                                    "trackId": track.id,
+                                    "id": transition.id,
+                                    "afterClipId": transition.after_clip_id,
+                                    "kind": transition.kind,
+                                    "durationMs": transition.duration_ms,
+                                })
+                            })
+                        })
+                        .collect(),
+                ),
+            );
         }
         if includes("selection") {
             output.insert(
@@ -7219,7 +7459,10 @@ fn video_mcp_normalize_prop_frames(
         .map(|frame| VideoMcpPropKeyframe {
             at_ms: frame.at_ms,
             value: video_mcp_clamp_prop_value(prop, frame.value),
-            easing: if matches!(frame.easing.as_str(), "linear" | "hold" | "smooth") {
+            easing: if matches!(
+                frame.easing.as_str(),
+                "linear" | "hold" | "smooth" | "ease-in" | "ease-out" | "ease-in-out"
+            ) {
                 frame.easing.clone()
             } else {
                 "linear".to_string()
@@ -7290,6 +7533,11 @@ fn video_mcp_kf_value_at_ms(frames: &[VideoMcpPropKeyframe], at_ms: u64, fallbac
             let mut ratio = (at_ms - from.at_ms) as f64 / span as f64;
             if from.easing == "smooth" {
                 ratio = video_mcp_smoothstep(ratio);
+            } else if matches!(
+                from.easing.as_str(),
+                "ease-in" | "ease-out" | "ease-in-out"
+            ) {
+                ratio = video_tier1_ease_ratio(&from.easing, ratio);
             }
             return from.value + (to.value - from.value) * ratio;
         }
@@ -7301,7 +7549,10 @@ fn video_mcp_spanning_easing(frames: &[VideoMcpPropKeyframe], offset: u64) -> St
     let mut easing = "linear".to_string();
     for frame in frames {
         if frame.at_ms <= offset {
-            easing = if matches!(frame.easing.as_str(), "linear" | "hold" | "smooth") {
+            easing = if matches!(
+                frame.easing.as_str(),
+                "linear" | "hold" | "smooth" | "ease-in" | "ease-out" | "ease-in-out"
+            ) {
                 frame.easing.clone()
             } else {
                 "linear".to_string()
@@ -7544,6 +7795,13 @@ fn video_mcp_split_clip_core(
         }
     }
     project.tracks[track_index].clips.push(right);
+    if project.tracks[track_index].kind == "video" {
+        for transition in &mut project.tracks[track_index].transitions {
+            if transition.after_clip_id == clip_id {
+                transition.after_clip_id = right_id.clone();
+            }
+        }
+    }
     video_mcp_sort_track(&mut project.tracks[track_index]);
     state.changed_clip_ids.insert(clip_id.to_string());
     state.changed_clip_ids.insert(right_id.clone());
@@ -8183,21 +8441,235 @@ fn video_mcp_remove_clips(
     Ok(())
 }
 
-fn video_mcp_ripple_delete_range(
-    project: &mut VideoMcpProject,
+#[derive(Debug, Clone)]
+struct VideoMcpRippleDeletePlan {
+    from: u64,
+    to: u64,
+    affected_track_ids: std::collections::BTreeSet<String>,
+    touched_link_ids: std::collections::BTreeSet<String>,
+    mutation: bool,
+}
+
+fn video_mcp_ripple_track_ids_with_links(
+    project: &VideoMcpProject,
+    track_ids: Option<&std::collections::BTreeSet<String>>,
+    from_ms: u64,
+) -> Result<
+    (
+        std::collections::BTreeSet<String>,
+        std::collections::BTreeSet<String>,
+    ),
+    String,
+> {
+    let mut affected = track_ids.cloned().unwrap_or_else(|| {
+        project
+            .tracks
+            .iter()
+            .filter(|track| !track.locked)
+            .map(|track| track.id.clone())
+            .collect()
+    });
+    for track in &project.tracks {
+        if affected.contains(&track.id) && track.locked {
+            return Err(format!(
+                "ripple edit is blocked because track {} is locked",
+                track.id
+            ));
+        }
+    }
+
+    let mut groups = std::collections::BTreeMap::<String, Vec<(usize, usize)>>::new();
+    for (track_index, track) in project.tracks.iter().enumerate() {
+        for (clip_index, clip) in track.clips.iter().enumerate() {
+            if !clip.link_id.is_empty() {
+                groups
+                    .entry(clip.link_id.clone())
+                    .or_default()
+                    .push((track_index, clip_index));
+            }
+        }
+    }
+
+    let mut touched_link_ids = std::collections::BTreeSet::new();
+    let mut expanded = true;
+    while expanded {
+        expanded = false;
+        for (link_id, members) in &groups {
+            if !members
+                .iter()
+                .any(|(track_index, _)| affected.contains(&project.tracks[*track_index].id))
+            {
+                continue;
+            }
+            if !members.iter().any(|(track_index, clip_index)| {
+                video_mcp_clip_end(&project.tracks[*track_index].clips[*clip_index]) > from_ms
+            }) {
+                continue;
+            }
+            touched_link_ids.insert(link_id.clone());
+            for (track_index, clip_index) in members {
+                let track = &project.tracks[*track_index];
+                if track.locked {
+                    return Err(format!(
+                        "linked ripple would modify {} while a partner track is locked",
+                        project.tracks[*track_index].clips[*clip_index].id
+                    ));
+                }
+                if affected.insert(track.id.clone()) {
+                    expanded = true;
+                }
+            }
+        }
+    }
+    Ok((affected, touched_link_ids))
+}
+
+fn video_mcp_plan_ripple_delete_range(
+    project: &VideoMcpProject,
     start_ms: u64,
     end_ms: u64,
-    state: &mut VideoMcpEditState,
-) -> Result<Vec<String>, String> {
-    let from = start_ms.min(end_ms);
-    let to = start_ms.max(end_ms);
-    let gap = to.saturating_sub(from);
-    if gap == 0 {
+    track_ids: Option<&std::collections::BTreeSet<String>>,
+) -> Result<VideoMcpRippleDeletePlan, String> {
+    let mut from = start_ms.min(end_ms);
+    let mut to = start_ms.max(end_ms);
+    if to == from {
         return Err("rippleDeleteRange requires a non-empty range".to_string());
     }
+
+    loop {
+        let (affected_track_ids, _) =
+            video_mcp_ripple_track_ids_with_links(project, track_ids, from)?;
+        let mut expanded_from = from;
+        let mut expanded_to = to;
+        for track in &project.tracks {
+            if track.locked || !affected_track_ids.contains(&track.id) {
+                continue;
+            }
+            for clip in &track.clips {
+                let start = clip.timeline_start_ms;
+                let end = video_mcp_clip_end(clip);
+                if end <= from || start >= to {
+                    continue;
+                }
+                if start < from {
+                    let head_duration = from - start;
+                    if head_duration < VIDEO_MCP_MIN_CLIP_DURATION_MS {
+                        expanded_from = expanded_from.min(start);
+                    }
+                }
+                if end > to {
+                    let tail_duration = end - to;
+                    if tail_duration < VIDEO_MCP_MIN_CLIP_DURATION_MS {
+                        expanded_to = expanded_to.max(end);
+                    }
+                }
+            }
+        }
+        if expanded_from == from && expanded_to == to {
+            break;
+        }
+        from = expanded_from;
+        to = expanded_to;
+    }
+
+    let (affected_track_ids, touched_link_ids) =
+        video_mcp_ripple_track_ids_with_links(project, track_ids, from)?;
+    let mutation = project.tracks.iter().any(|track| {
+        affected_track_ids.contains(&track.id)
+            && !track.locked
+            && track
+                .clips
+                .iter()
+                .any(|clip| video_mcp_clip_end(clip) > from)
+    });
+    Ok(VideoMcpRippleDeletePlan {
+        from,
+        to,
+        affected_track_ids,
+        touched_link_ids,
+        mutation,
+    })
+}
+
+fn video_mcp_add_cohort_member(
+    cohorts: &mut std::collections::BTreeMap<String, Vec<String>>,
+    link_id: &str,
+    clip_id: &str,
+) {
+    if !link_id.is_empty() && !clip_id.is_empty() {
+        cohorts
+            .entry(link_id.to_string())
+            .or_default()
+            .push(clip_id.to_string());
+    }
+}
+
+fn video_mcp_apply_link_cohorts(
+    project: &mut VideoMcpProject,
+    touched_link_ids: &std::collections::BTreeSet<String>,
+    left_cohorts: &std::collections::BTreeMap<String, Vec<String>>,
+    right_cohorts: &std::collections::BTreeMap<String, Vec<String>>,
+    changed: &mut std::collections::BTreeSet<String>,
+    state: &mut VideoMcpEditState,
+) {
+    for original_link_id in touched_link_ids {
+        let left_ids = left_cohorts
+            .get(original_link_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let right_ids = right_cohorts
+            .get(original_link_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let left_link_id = if left_ids.len() >= 2 {
+            original_link_id.clone()
+        } else {
+            String::new()
+        };
+        let right_link_id = if right_ids.len() >= 2 {
+            video_mcp_next_link_id(project, state)
+        } else {
+            String::new()
+        };
+        for (ids, link_id) in [(&left_ids, &left_link_id), (&right_ids, &right_link_id)] {
+            for clip_id in ids {
+                if let Some((track_index, clip_index)) =
+                    video_mcp_find_clip_indices(project, clip_id)
+                {
+                    if project.tracks[track_index].kind != "text"
+                        && project.tracks[track_index].clips[clip_index].link_id != *link_id
+                    {
+                        project.tracks[track_index].clips[clip_index].link_id = link_id.clone();
+                        changed.insert(clip_id.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn video_mcp_apply_ripple_delete_plan(
+    project: &mut VideoMcpProject,
+    plan: &VideoMcpRippleDeletePlan,
+    state: &mut VideoMcpEditState,
+) -> Vec<String> {
+    if !plan.mutation || plan.to <= plan.from || plan.affected_track_ids.is_empty() {
+        return Vec::new();
+    }
+    let gap = plan.to - plan.from;
     let mut changed = std::collections::BTreeSet::new();
+    let mut left_cohorts = std::collections::BTreeMap::<String, Vec<String>>::new();
+    let mut right_cohorts = std::collections::BTreeMap::<String, Vec<String>>::new();
     for track_index in 0..project.tracks.len() {
-        if project.tracks[track_index].locked {
+        if project.tracks[track_index].locked
+            || !plan
+                .affected_track_ids
+                .contains(&project.tracks[track_index].id)
+        {
             continue;
         }
         let track_kind = project.tracks[track_index].kind.clone();
@@ -8206,35 +8678,58 @@ fn video_mcp_ripple_delete_range(
         for clip in old_clips {
             let start = clip.timeline_start_ms;
             let end = video_mcp_clip_end(&clip);
-            if end <= from {
+            let original_link_id = clip.link_id.clone();
+            if end <= plan.from {
+                if plan.touched_link_ids.contains(&original_link_id) {
+                    video_mcp_add_cohort_member(
+                        &mut left_cohorts,
+                        &original_link_id,
+                        &clip.id,
+                    );
+                }
                 kept.push(clip);
                 continue;
             }
-            if start >= to {
+            if start >= plan.to {
                 let mut shifted = clip;
                 shifted.timeline_start_ms = shifted.timeline_start_ms.saturating_sub(gap);
                 changed.insert(shifted.id.clone());
+                if plan.touched_link_ids.contains(&original_link_id) {
+                    video_mcp_add_cohort_member(
+                        &mut right_cohorts,
+                        &original_link_id,
+                        &shifted.id,
+                    );
+                }
                 kept.push(shifted);
                 continue;
             }
+
             changed.insert(clip.id.clone());
-            if start < from {
+            if start < plan.from {
                 let mut head = clip.clone();
-                head.duration_ms = from - start;
+                head.duration_ms = plan.from - start;
                 if head.duration_ms >= VIDEO_MCP_MIN_CLIP_DURATION_MS {
                     if track_kind != "text" {
                         let head_duration = head.duration_ms;
                         video_mcp_partition_envelopes_at(&mut head, None, head_duration);
                     }
+                    if plan.touched_link_ids.contains(&original_link_id) {
+                        video_mcp_add_cohort_member(
+                            &mut left_cohorts,
+                            &original_link_id,
+                            &head.id,
+                        );
+                    }
                     kept.push(head);
                 }
             }
-            if end > to {
+            if end > plan.to {
                 let mut tail = clip.clone();
-                let cut = to - start;
+                let cut = plan.to - start;
                 tail.id = video_mcp_next_clip_id(project, state);
-                tail.timeline_start_ms = from;
-                tail.duration_ms = end - to;
+                tail.timeline_start_ms = plan.from;
+                tail.duration_ms = end - plan.to;
                 if track_kind != "text" {
                     tail.source_in_ms = clip
                         .source_in_ms
@@ -8243,6 +8738,13 @@ fn video_mcp_ripple_delete_range(
                     tail.link_id.clear();
                 }
                 if tail.duration_ms >= VIDEO_MCP_MIN_CLIP_DURATION_MS {
+                    if plan.touched_link_ids.contains(&original_link_id) {
+                        video_mcp_add_cohort_member(
+                            &mut right_cohorts,
+                            &original_link_id,
+                            &tail.id,
+                        );
+                    }
                     changed.insert(tail.id.clone());
                     kept.push(tail);
                 }
@@ -8251,11 +8753,45 @@ fn video_mcp_ripple_delete_range(
         project.tracks[track_index].clips = kept;
         video_mcp_sort_track(&mut project.tracks[track_index]);
     }
+    video_mcp_apply_link_cohorts(
+        project,
+        &plan.touched_link_ids,
+        &left_cohorts,
+        &right_cohorts,
+        &mut changed,
+        state,
+    );
     for id in &changed {
         state.changed_clip_ids.insert(id.clone());
     }
-    state.summaries.push(format!("ripple deleted {from}..{to}"));
-    Ok(changed.into_iter().collect())
+    changed.into_iter().collect()
+}
+
+fn video_mcp_ripple_delete_range_scoped(
+    project: &mut VideoMcpProject,
+    start_ms: u64,
+    end_ms: u64,
+    track_ids: Option<&std::collections::BTreeSet<String>>,
+    state: &mut VideoMcpEditState,
+) -> Result<Vec<String>, String> {
+    let plan = video_mcp_plan_ripple_delete_range(project, start_ms, end_ms, track_ids)?;
+    let changed = video_mcp_apply_ripple_delete_plan(project, &plan, state);
+    if plan.mutation {
+        state.effective_ranges.push((plan.from, plan.to));
+        state
+            .summaries
+            .push(format!("ripple deleted {}..{}", plan.from, plan.to));
+    }
+    Ok(changed)
+}
+
+fn video_mcp_ripple_delete_range(
+    project: &mut VideoMcpProject,
+    start_ms: u64,
+    end_ms: u64,
+    state: &mut VideoMcpEditState,
+) -> Result<Vec<String>, String> {
+    video_mcp_ripple_delete_range_scoped(project, start_ms, end_ms, None, state)
 }
 
 fn video_mcp_text_style(style: Option<&serde_json::Value>) -> serde_json::Value {
@@ -8394,6 +8930,7 @@ fn video_mcp_add_track(project: &mut VideoMcpProject, kind: &str, label: &str) -
         muted: false,
         locked: false,
         clips: Vec::new(),
+        transitions: Vec::new(),
     });
     project.tracks.len() - 1
 }
@@ -8526,6 +9063,22 @@ fn video_mcp_add_captions(
             ));
         let duration_ms = video_mcp_round_u64((end_src - start_src) as f64 / speed)
             .max(VIDEO_MCP_MIN_CLIP_DURATION_MS);
+        let words = segment
+            .words
+            .iter()
+            .filter_map(|word| {
+                let word_start = word.start_ms.max(start_src);
+                let word_end = word.end_ms.min(end_src);
+                if word_end <= word_start {
+                    return None;
+                }
+                Some(VideoTier1Word {
+                    text: word.text.clone(),
+                    start_ms: video_mcp_round_u64((word_start - start_src) as f64 / speed),
+                    end_ms: video_mcp_round_u64((word_end - start_src) as f64 / speed),
+                })
+            })
+            .collect::<Vec<_>>();
         project.tracks[captions_track].clips.push(VideoMcpClip {
             id: id.clone(),
             text,
@@ -8533,6 +9086,7 @@ fn video_mcp_add_captions(
             duration_ms,
             style: video_mcp_caption_style(),
             caption_group: caption_group.clone(),
+            words,
             ..VideoMcpClip::default()
         });
         state.changed_clip_ids.insert(id);
@@ -8542,6 +9096,44 @@ fn video_mcp_add_captions(
     state.changed_clip_ids.insert(clip_id.to_string());
     state.summaries.push(format!("added {count} caption(s)"));
     Ok(())
+}
+
+fn video_mcp_merge_timeline_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ranges.sort();
+    let mut merged = Vec::<(u64, u64)>::new();
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    merged
+}
+
+fn video_mcp_plan_effective_ranges(
+    project: &VideoMcpProject,
+    ranges: Vec<(u64, u64)>,
+    track_ids: Option<&std::collections::BTreeSet<String>>,
+) -> Result<Vec<(u64, u64)>, String> {
+    let mut effective_ranges = video_mcp_merge_timeline_ranges(ranges);
+    loop {
+        let mut planned_ranges = Vec::new();
+        for (start, end) in &effective_ranges {
+            let plan =
+                video_mcp_plan_ripple_delete_range(project, *start, *end, track_ids)?;
+            if plan.mutation {
+                planned_ranges.push((plan.from, plan.to));
+            }
+        }
+        let merged_ranges = video_mcp_merge_timeline_ranges(planned_ranges);
+        if merged_ranges == effective_ranges {
+            return Ok(merged_ranges);
+        }
+        effective_ranges = merged_ranges;
+    }
 }
 
 fn video_mcp_remove_word_spans(
@@ -8557,7 +9149,7 @@ fn video_mcp_remove_word_spans(
     let mut merged = Vec::<(u64, u64)>::new();
     for span in spans {
         if let Some(last) = merged.last_mut() {
-            if span.0.saturating_sub(last.1) < VIDEO_MCP_REMOVE_WORDS_MERGE_GAP_MS {
+            if span.0.saturating_sub(last.1) <= VIDEO_MCP_REMOVE_WORDS_MERGE_GAP_MS {
                 last.1 = last.1.max(span.1);
                 continue;
             }
@@ -8580,6 +9172,12 @@ fn video_mcp_remove_word_spans(
                 if to.saturating_sub(from) < 40 {
                     continue;
                 }
+                if track.locked {
+                    return Err(format!(
+                        "word deletion is blocked because track {} is locked",
+                        track.id
+                    ));
+                }
                 timeline_ranges.push((
                     clip.timeline_start_ms
                         .saturating_add(video_mcp_round_u64((from - source_from) as f64 / speed)),
@@ -8592,11 +9190,29 @@ fn video_mcp_remove_word_spans(
     if timeline_ranges.is_empty() {
         return Err("selected words are outside all clips using this asset".to_string());
     }
-    timeline_ranges.sort_by_key(|range| range.0);
-    for (start, end) in timeline_ranges.iter().rev().copied() {
-        video_mcp_ripple_delete_range(project, start, end, state)?;
+    let effective_ranges =
+        video_mcp_plan_effective_ranges(project, timeline_ranges, None)?;
+    if effective_ranges.is_empty() {
+        return Err("selected words are outside all clips using this asset".to_string());
     }
-    Ok(timeline_ranges)
+
+    // Apply only after every mapped range and linked-lock closure has passed
+    // preflight. Keeping both values local makes this helper transactional
+    // even when it is exercised directly by unit tests.
+    let mut next_project = project.clone();
+    let mut next_state = state.clone();
+    let effective_start = next_state.effective_ranges.len();
+    for (start, end) in effective_ranges.iter().rev().copied() {
+        let plan = video_mcp_plan_ripple_delete_range(&next_project, start, end, None)?;
+        video_mcp_apply_ripple_delete_plan(&mut next_project, &plan, &mut next_state);
+    }
+    next_state.effective_ranges.truncate(effective_start);
+    next_state
+        .effective_ranges
+        .extend(effective_ranges.iter().copied());
+    *project = next_project;
+    *state = next_state;
+    Ok(effective_ranges)
 }
 
 fn video_mcp_remove_words(
@@ -8687,7 +9303,17 @@ fn video_mcp_apply_kf_patch(clip: &mut VideoMcpClip, kf: &serde_json::Value) {
                 let easing = frame
                     .get("easing")
                     .and_then(|value| value.as_str())
-                    .filter(|value| matches!(*value, "linear" | "hold" | "smooth"))
+                    .filter(|value| {
+                        matches!(
+                            *value,
+                            "linear"
+                                | "hold"
+                                | "smooth"
+                                | "ease-in"
+                                | "ease-out"
+                                | "ease-in-out"
+                        )
+                    })
                     .unwrap_or("linear");
                 Some(VideoMcpPropKeyframe {
                     at_ms: frame.get("atMs").and_then(video_mcp_value_u64)?,
@@ -8900,6 +9526,76 @@ fn video_mcp_apply_motion_preset(
     clip.transform.scale = video_mcp_motion_round(scale_start);
 }
 
+fn video_mcp_merge_struct_patch<T>(
+    current: &T,
+    patch: &serde_json::Value,
+    label: &str,
+) -> Result<serde_json::Value, String>
+where
+    T: Serialize,
+{
+    if patch.is_null() {
+        return Ok(serde_json::Value::Null);
+    }
+    let patch = patch
+        .as_object()
+        .ok_or_else(|| format!("{label} patch must be an object or null"))?;
+    let mut merged = serde_json::to_value(current)
+        .map_err(|error| format!("unable to serialize current {label}: {error}"))?
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    for (key, value) in patch {
+        merged.insert(key.clone(), value.clone());
+    }
+    Ok(serde_json::Value::Object(merged))
+}
+
+fn video_mcp_normalize_words(
+    value: &serde_json::Value,
+    duration_ms: u64,
+) -> Vec<VideoTier1Word> {
+    let mut words = value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|word| {
+            let text = word.get("text")?.as_str()?.trim();
+            if text.is_empty() {
+                return None;
+            }
+            let start_ms = word
+                .get("startMs")
+                .or_else(|| word.get("start_ms"))
+                .and_then(video_mcp_value_f64)
+                .filter(|value| value.is_finite())
+                .unwrap_or(0.0)
+                .round()
+                .max(0.0) as u64;
+            let end_ms = word
+                .get("endMs")
+                .or_else(|| word.get("end_ms"))
+                .and_then(video_mcp_value_f64)
+                .filter(|value| value.is_finite())
+                .unwrap_or(0.0)
+                .round()
+                .max(0.0) as u64;
+            let end_ms = end_ms.min(duration_ms);
+            (start_ms < duration_ms && end_ms > start_ms).then(|| VideoTier1Word {
+                text: text.to_string(),
+                start_ms,
+                end_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+    words.sort_by(|left, right| {
+        left.start_ms
+            .cmp(&right.start_ms)
+            .then(left.end_ms.cmp(&right.end_ms))
+    });
+    words
+}
+
 fn video_mcp_set_props(
     project: &mut VideoMcpProject,
     root: &std::path::Path,
@@ -8924,6 +9620,46 @@ fn video_mcp_set_props(
         if let Some(style) = patch.get("style") {
             clip.style = video_mcp_merge_text_style(&clip.style, style);
         }
+        if let Some(words) = patch.get("words") {
+            clip.words = video_mcp_normalize_words(words, clip.duration_ms);
+        }
+        if let Some(anim) = patch.get("anim").and_then(|value| value.as_str()) {
+            clip.anim = video_tier1_parse_anim(anim, 0)
+                .map_err(|error| error.replace("Video pipe line 0: ", ""))?;
+            if clip.anim == "word-highlight" {
+                let current = clip.anim_opts.clone().unwrap_or_default();
+                clip.anim_opts = Some(
+                    patch
+                        .get("animOpts")
+                        .filter(|value| !value.is_null())
+                        .map(|value| {
+                            let merged = video_mcp_merge_struct_patch(
+                                &current,
+                                value,
+                                "caption animOpts",
+                            )?;
+                            serde_json::from_value::<VideoTier1AnimOpts>(merged)
+                                .map_err(|error| format!("invalid caption animOpts: {error}"))
+                        })
+                        .transpose()?
+                        .unwrap_or(current),
+                );
+            } else {
+                clip.anim_opts = None;
+            }
+        } else if clip.anim == "word-highlight" {
+            if let Some(anim_opts) = patch.get("animOpts").filter(|value| !value.is_null()) {
+                let current = clip.anim_opts.clone().unwrap_or_default();
+                let merged =
+                    video_mcp_merge_struct_patch(&current, anim_opts, "caption animOpts")?;
+                clip.anim_opts = Some(
+                    serde_json::from_value::<VideoTier1AnimOpts>(merged)
+                        .map_err(|error| format!("invalid caption animOpts: {error}"))?,
+                );
+            }
+        } else {
+            clip.anim_opts = None;
+        }
     } else {
         if let Some(speed) = patch.get("speed").and_then(video_mcp_value_f64) {
             clip.speed = video_mcp_clamp_speed(speed);
@@ -8936,6 +9672,14 @@ fn video_mcp_set_props(
         }
         if let Some(kf) = patch.get("kf") {
             video_mcp_apply_kf_patch(clip, kf);
+        }
+        if let Some(fx) = patch.get("fx") {
+            let merged = video_mcp_merge_struct_patch(&clip.fx, fx, "fx")?;
+            clip.fx = video_tier1_fx_from_value(Some(&merged))?;
+        }
+        if let Some(crop) = patch.get("crop") {
+            let merged = video_mcp_merge_struct_patch(&clip.crop, crop, "crop")?;
+            clip.crop = video_tier1_crop_from_value(Some(&merged))?;
         }
         // Motion after raw kf: when both are supplied, the preset wins the
         // x/y/scale envelope (it keeps opacity frames untouched either way).
@@ -8971,6 +9715,7 @@ fn video_mcp_apply_ops(
         next_clip_seq: video_mcp_project_clip_count(project).saturating_add(1),
         next_link_seq: 1,
         changed_clip_ids: std::collections::BTreeSet::new(),
+        effective_ranges: Vec::new(),
         summaries: Vec::new(),
     };
     for (index, op_value) in ops.iter().enumerate() {
@@ -9033,24 +9778,48 @@ fn video_mcp_apply_ops(
                         .unwrap_or(false)
                     {
                         let mut ranges = Vec::<(u64, u64)>::new();
-                        for clip_id in video_mcp_expand_with_links(project, &clip_ids) {
-                            if let Some((track_index, clip_index)) =
-                                video_mcp_find_clip_indices(project, &clip_id)
-                            {
-                                if !project.tracks[track_index].locked {
+                        let mut visited = std::collections::BTreeSet::new();
+                        for clip_id in &clip_ids {
+                            if visited.contains(clip_id) {
+                                continue;
+                            }
+                            let group_ids = video_mcp_linked_clip_ids(project, clip_id);
+                            let mut group_from = u64::MAX;
+                            let mut group_to = 0u64;
+                            let mut found = false;
+                            for group_id in group_ids {
+                                visited.insert(group_id.clone());
+                                if let Some((track_index, clip_index)) =
+                                    video_mcp_find_clip_indices(project, &group_id)
+                                {
+                                    if project.tracks[track_index].locked {
+                                        return Err(format!(
+                                            "ripple remove is blocked because track {} is locked",
+                                            project.tracks[track_index].id
+                                        ));
+                                    }
                                     let clip = &project.tracks[track_index].clips[clip_index];
-                                    ranges.push((clip.timeline_start_ms, video_mcp_clip_end(clip)));
+                                    group_from = group_from.min(clip.timeline_start_ms);
+                                    group_to = group_to.max(video_mcp_clip_end(clip));
+                                    found = true;
                                 }
                             }
+                            if found && group_to > group_from {
+                                ranges.push((group_from, group_to));
+                            }
                         }
-                        ranges.sort();
-                        ranges.dedup();
+                        let ranges = video_mcp_plan_effective_ranges(project, ranges, None)?;
                         if ranges.is_empty() {
                             Err("no removable clips found".to_string())
                         } else {
+                            let effective_start = state.effective_ranges.len();
                             for (start, end) in ranges.iter().rev().copied() {
-                                video_mcp_ripple_delete_range(project, start, end, &mut state)?;
+                                let plan =
+                                    video_mcp_plan_ripple_delete_range(project, start, end, None)?;
+                                video_mcp_apply_ripple_delete_plan(project, &plan, &mut state);
                             }
+                            state.effective_ranges.truncate(effective_start);
+                            state.effective_ranges.extend(ranges.iter().copied());
                             state
                                 .summaries
                                 .push(format!("ripple removed {} range(s)", ranges.len()));
@@ -9107,6 +9876,49 @@ fn video_mcp_apply_ops(
                         project, root, media_root, &manifest, asset_path, words, &mut state,
                     )
                 }
+                "addTransition" => {
+                    let track_id = video_mcp_op_str(op_value, "trackId")?;
+                    let after_clip_id = video_mcp_op_str(op_value, "afterClipId")?;
+                    let kind = video_mcp_op_str(op_value, "kind")?;
+                    let duration_ms = video_mcp_op_u64(op_value, "durationMs")?;
+                    video_tier1_mcp_add_transition(
+                        project,
+                        track_id,
+                        after_clip_id,
+                        kind,
+                        duration_ms,
+                        &mut state,
+                    )
+                }
+                "removeTransition" => {
+                    let transition_id = video_mcp_op_str(op_value, "transitionId")?;
+                    video_tier1_mcp_remove_transition(project, transition_id, &mut state)
+                }
+                "removeSilences" => {
+                    let asset_path = op_value
+                        .get("assetPath")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let noise_db = op_value
+                        .get("noiseDb")
+                        .and_then(video_mcp_value_f64)
+                        .unwrap_or(-35.0);
+                    let min_ms = op_value
+                        .get("minMs")
+                        .and_then(video_mcp_value_u64)
+                        .unwrap_or(400);
+                    video_tier1_mcp_remove_silences(
+                        project,
+                        root,
+                        media_root,
+                        ffprobe_path,
+                        asset_path,
+                        noise_db,
+                        min_ms,
+                        &mut state,
+                    )
+                }
                 "addText" => {
                     let text = op_value
                         .get("text")
@@ -9156,6 +9968,7 @@ fn video_mcp_apply_ops(
             };
             return Err(format!("op[{index}] {name}: {error}"));
         }
+        video_tier1_normalize_mcp_transitions(project);
     }
     Ok(state)
 }
@@ -9330,6 +10143,21 @@ async fn video_mcp_edit(
         output.insert(
             "changedClipIds".to_string(),
             serde_json::json!(changed_clip_ids),
+        );
+        output.insert(
+            "effectiveRanges".to_string(),
+            serde_json::Value::Array(
+                state
+                    .effective_ranges
+                    .iter()
+                    .map(|(start_ms, end_ms)| {
+                        serde_json::json!({
+                            "startMs": start_ms,
+                            "endMs": end_ms,
+                        })
+                    })
+                    .collect(),
+            ),
         );
         output.insert("summary".to_string(), serde_json::json!(summary));
         output.insert(
@@ -9641,7 +10469,17 @@ fn video_collect_property_keyframes(
                     let easing = item
                         .get("easing")
                         .and_then(|value| value.as_str())
-                        .filter(|value| matches!(*value, "linear" | "hold" | "smooth"))
+                        .filter(|value| {
+                            matches!(
+                                *value,
+                                "linear"
+                                    | "hold"
+                                    | "smooth"
+                                    | "ease-in"
+                                    | "ease-out"
+                                    | "ease-in-out"
+                            )
+                        })
                         .unwrap_or("linear")
                         .to_string();
                     VideoExportPropertyKeyframe {
@@ -9736,15 +10574,32 @@ fn video_collect_export_clips(
     media_root: &std::path::Path,
     project: &serde_json::Value,
     ffprobe_path: Option<&str>,
-) -> Result<(Vec<VideoExportMediaClip>, Vec<VideoExportTextClip>, u64), String> {
+    ffmpeg_path: Option<&str>,
+) -> Result<
+    (
+        Vec<VideoExportMediaClip>,
+        Vec<VideoExportTextClip>,
+        u64,
+        Vec<String>,
+    ),
+    String,
+> {
     let mut media_clips = Vec::new();
     let mut text_clips = Vec::new();
     let mut total_ms = 0u64;
+    let mut warnings = Vec::new();
     let tracks = project
         .get("tracks")
         .and_then(|value| value.as_array())
         .ok_or_else(|| "Video project tracks must be an array.".to_string())?;
-    for track in tracks {
+    let bottom_video_track_order = tracks.iter().position(|track| {
+        video_json_string(track, "kind", "") == "video"
+            && !track
+                .get("muted")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+    });
+    for (track_order, track) in tracks.iter().enumerate() {
         let track_kind = video_json_string(track, "kind", "");
         let muted = track
             .get("muted")
@@ -9757,6 +10612,7 @@ fn video_collect_export_clips(
             .unwrap_or_default();
         let mut clips_sorted = clips;
         clips_sorted.sort_by_key(|clip| video_json_u64(clip, "timelineStartMs", 0));
+        let track_media_start = media_clips.len();
         for clip in clips_sorted {
             let start = video_json_u64(&clip, "timelineStartMs", 0);
             let duration = video_json_u64(&clip, "durationMs", 0);
@@ -9766,6 +10622,43 @@ fn video_collect_export_clips(
             total_ms = total_ms.max(start.saturating_add(duration));
             if track_kind == "text" {
                 let style = clip.get("style").unwrap_or(&serde_json::Value::Null);
+                let words = clip
+                    .get("words")
+                    .filter(|value| !value.is_null())
+                    .map(|value| serde_json::from_value::<Vec<VideoTier1Word>>(value.clone()))
+                    .transpose()
+                    .map_err(|error| format!("Invalid caption words: {error}"))?
+                    .unwrap_or_default();
+                let anim = video_tier1_parse_anim(
+                    clip.get("anim")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("none"),
+                    0,
+                )
+                .map_err(|error| error.replace("Video pipe line 0: ", ""))?;
+                if words.len() > 120
+                    && matches!(anim.as_str(), "typewriter" | "word-reveal" | "word-highlight")
+                {
+                    warnings.push(format!(
+                        "Caption clip {} has more than 120 words; exported as static text.",
+                        video_json_string(&clip, "id", "unknown")
+                    ));
+                }
+                if anim == "pop" {
+                    warnings.push(format!(
+                        "Caption clip {} pop animation is approximated with a fade.",
+                        video_json_string(&clip, "id", "unknown")
+                    ));
+                }
+                if matches!(anim.as_str(), "word-reveal" | "word-highlight")
+                    && !words.is_empty()
+                    && words.len() <= 120
+                {
+                    warnings.push(format!(
+                        "Caption clip {} per-word placement uses a single-line drawtext approximation.",
+                        video_json_string(&clip, "id", "unknown")
+                    ));
+                }
                 text_clips.push(VideoExportTextClip {
                     text: video_json_string(&clip, "text", ""),
                     timeline_start_ms: start,
@@ -9787,8 +10680,30 @@ fn video_collect_export_clips(
                         .get("uppercase")
                         .and_then(|value| value.as_bool())
                         .unwrap_or(false),
+                    align: match video_json_string(style, "align", "center").as_str() {
+                        "left" => "left".to_string(),
+                        "right" => "right".to_string(),
+                        _ => "center".to_string(),
+                    },
+                    bold: style
+                        .get("bold")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(true),
+                    font_family: video_json_string(style, "fontFamily", "sans-serif"),
                     x: video_json_f64(style, "x", 0.5).clamp(0.0, 1.0),
                     y: video_json_f64(style, "y", 0.5).clamp(0.0, 1.0),
+                    words,
+                    anim,
+                    anim_opts: clip
+                        .get("animOpts")
+                        .filter(|value| !value.is_null())
+                        .map(|value| {
+                            serde_json::from_value::<VideoTier1AnimOpts>(value.clone())
+                        })
+                        .transpose()
+                        .map_err(|error| format!("Invalid caption animOpts: {error}"))?
+                        .unwrap_or_default(),
+                    word_time_offset_ms: 0,
                 });
                 continue;
             }
@@ -9819,10 +10734,36 @@ fn video_collect_export_clips(
                 gain_keyframes.sort_by_key(|(at_ms, _)| *at_ms);
             }
             let gain_level = video_json_f64(gain, "level", 1.0).max(0.0);
+            let fx = video_tier1_fx_from_value(clip.get("fx"))?;
+            if Some(track_order) == bottom_video_track_order && fx.chroma_key.is_some() {
+                warnings.push(format!(
+                    "Clip {} chroma key is ignored on the bottom video layer.",
+                    video_json_string(&clip, "id", "unknown")
+                ));
+            }
+            let crop = video_tier1_crop_from_value(clip.get("crop"))?;
+            let lut_abs = if fx.lut.trim().is_empty() {
+                None
+            } else {
+                match video_tier1_validate_lut(root, media_root, &fx.lut) {
+                    Ok(path) => Some(path),
+                    Err(warning) => {
+                        warnings.push(format!(
+                            "Clip {} LUT skipped: {warning}",
+                            video_json_string(&clip, "id", "unknown")
+                        ));
+                        None
+                    }
+                }
+            };
             let has_audio = !muted
                 && video_export_gain_has_signal(gain_level, &gain_keyframes)
                 && video_export_probe_has_audio(ffprobe_path, &abs, asset_kind);
             media_clips.push(VideoExportMediaClip {
+                clip_id: video_json_string(&clip, "id", ""),
+                link_id: video_json_string(&clip, "linkId", ""),
+                track_id: video_json_string(track, "id", ""),
+                track_order,
                 input_index: media_clips.len(),
                 kind: kind.to_string(),
                 abs_path: abs.clone(),
@@ -9842,11 +10783,77 @@ fn video_collect_export_clips(
                 x_keyframes,
                 y_keyframes,
                 scale_keyframes,
+                fx,
+                crop,
+                lut_abs,
+                supports_colortemperature: ffmpeg_path
+                    .map(video_tier1_ffmpeg_supports_colortemperature)
+                    .unwrap_or(false),
+                transition_after: None,
                 has_audio,
             });
         }
+        let track_media_end = media_clips.len();
+        if track_kind == "video" {
+            for transition_value in track
+                .get("transitions")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let transition = serde_json::from_value::<VideoExportTransition>(
+                    transition_value.clone(),
+                )
+                .map_err(|error| format!("Invalid video transition: {error}"))?;
+                let left_offset = media_clips[track_media_start..track_media_end]
+                    .iter()
+                    .position(|clip| clip.clip_id == transition.after_clip_id);
+                let Some(left_offset) = left_offset else {
+                    warnings.push(format!(
+                        "Transition {} skipped because its left clip was not found.",
+                        transition.id
+                    ));
+                    continue;
+                };
+                let left_index = track_media_start + left_offset;
+                let Some(right) = media_clips.get(left_index + 1) else {
+                    warnings.push(format!(
+                        "Transition {} skipped because there is no next clip.",
+                        transition.id
+                    ));
+                    continue;
+                };
+                let left = &media_clips[left_index];
+                let valid = left.track_id == right.track_id
+                    && matches!(left.kind.as_str(), "video" | "image")
+                    && matches!(right.kind.as_str(), "video" | "image")
+                    && left.timeline_start_ms.saturating_add(left.duration_ms)
+                        == right.timeline_start_ms
+                    && video_tier1_validate_transition(
+                        &transition.kind,
+                        transition.duration_ms,
+                    )
+                    .is_ok()
+                    && transition.duration_ms
+                        <= left.duration_ms.min(right.duration_ms) / 2;
+                if !valid {
+                    warnings.push(format!(
+                        "Transition {} skipped because clip adjacency or duration is invalid.",
+                        transition.id
+                    ));
+                    continue;
+                }
+                if left.fx.blend != right.fx.blend {
+                    warnings.push(format!(
+                        "Transition {} crosses clips with different blend modes; the transition uses the left clip's {} blend mode.",
+                        transition.id, left.fx.blend
+                    ));
+                }
+                media_clips[left_index].transition_after = Some(transition);
+            }
+        }
     }
-    Ok((media_clips, text_clips, total_ms))
+    Ok((media_clips, text_clips, total_ms, warnings))
 }
 
 fn video_ffmpeg_seconds(ms: u64) -> String {
@@ -9880,7 +10887,8 @@ fn video_escape_drawtext(value: &str) -> String {
             ';' => escaped.push_str("\\;"),
             '[' => escaped.push_str("\\["),
             ']' => escaped.push_str("\\]"),
-            '\n' | '\r' => escaped.push(' '),
+            '\n' => escaped.push('\n'),
+            '\r' => {}
             _ => escaped.push(ch),
         }
     }
@@ -9891,29 +10899,128 @@ fn video_escape_drawtext(value: &str) -> String {
 // system fontconfig, so drawtext without an explicit fontfile dies with
 // "Cannot load default config file". Point it at a font that ships with the
 // OS; when none of the known paths exist, fall back to fontconfig.
-fn video_drawtext_fontfile() -> Option<&'static str> {
+fn video_drawtext_fontfile(font_family: &str, bold: bool) -> Option<&'static str> {
     #[cfg(target_os = "macos")]
-    const CANDIDATES: &[&str] = &[
+    const SANS_REGULAR: &[&str] = &[
         "/System/Library/Fonts/Helvetica.ttc",
         "/System/Library/Fonts/Supplemental/Arial.ttf",
         "/System/Library/Fonts/SFNS.ttf",
     ];
+    #[cfg(target_os = "macos")]
+    const SANS_BOLD: &[&str] = &[
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/SFNS.ttf",
+    ];
+    #[cfg(target_os = "macos")]
+    const SERIF_REGULAR: &[&str] = &[
+        "/System/Library/Fonts/Times.ttc",
+        "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
+        "/System/Library/Fonts/Supplemental/Georgia.ttf",
+    ];
+    #[cfg(target_os = "macos")]
+    const SERIF_BOLD: &[&str] = &[
+        "/System/Library/Fonts/Supplemental/Times New Roman Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Georgia Bold.ttf",
+        "/System/Library/Fonts/Times.ttc",
+    ];
+    #[cfg(target_os = "macos")]
+    const MONO_REGULAR: &[&str] = &[
+        "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/Supplemental/Courier New.ttf",
+    ];
+    #[cfg(target_os = "macos")]
+    const MONO_BOLD: &[&str] = &[
+        "/System/Library/Fonts/Supplemental/Courier New Bold.ttf",
+        "/System/Library/Fonts/Menlo.ttc",
+    ];
+    #[cfg(target_os = "macos")]
+    const IMPACT: &[&str] = &[
+        "/System/Library/Fonts/Supplemental/Impact.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Black.ttf",
+    ];
     #[cfg(target_os = "windows")]
-    const CANDIDATES: &[&str] = &[
+    const SANS_REGULAR: &[&str] = &[
         "C:/Windows/Fonts/arial.ttf",
         "C:/Windows/Fonts/segoeui.ttf",
         "C:/Windows/Fonts/calibri.ttf",
     ];
+    #[cfg(target_os = "windows")]
+    const SANS_BOLD: &[&str] = &[
+        "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/segoeuib.ttf",
+        "C:/Windows/Fonts/calibrib.ttf",
+    ];
+    #[cfg(target_os = "windows")]
+    const SERIF_REGULAR: &[&str] = &["C:/Windows/Fonts/times.ttf", "C:/Windows/Fonts/georgia.ttf"];
+    #[cfg(target_os = "windows")]
+    const SERIF_BOLD: &[&str] = &["C:/Windows/Fonts/timesbd.ttf", "C:/Windows/Fonts/georgiab.ttf"];
+    #[cfg(target_os = "windows")]
+    const MONO_REGULAR: &[&str] = &["C:/Windows/Fonts/consola.ttf", "C:/Windows/Fonts/cour.ttf"];
+    #[cfg(target_os = "windows")]
+    const MONO_BOLD: &[&str] = &["C:/Windows/Fonts/consolab.ttf", "C:/Windows/Fonts/courbd.ttf"];
+    #[cfg(target_os = "windows")]
+    const IMPACT: &[&str] = &["C:/Windows/Fonts/impact.ttf", "C:/Windows/Fonts/ariblk.ttf"];
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    const CANDIDATES: &[&str] = &[
+    const SANS_REGULAR: &[&str] = &[
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
     ];
-    CANDIDATES
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    const SANS_BOLD: &[&str] = &[
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ];
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    const SERIF_REGULAR: &[&str] = &[
+        "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+    ];
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    const SERIF_BOLD: &[&str] = &[
+        "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
+    ];
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    const MONO_REGULAR: &[&str] = &[
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    ];
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    const MONO_BOLD: &[&str] = &[
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
+    ];
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    const IMPACT: &[&str] = &[
+        "/usr/share/fonts/truetype/msttcorefonts/Impact.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ];
+
+    let family = font_family.trim().to_ascii_lowercase();
+    let preferred = if family.contains("impact") || family.contains("arial black") {
+        IMPACT
+    } else if family == "serif" || family.contains("times") || family.contains("georgia") {
+        if bold { SERIF_BOLD } else { SERIF_REGULAR }
+    } else if family == "monospace" || family.contains("mono") || family.contains("courier") {
+        if bold { MONO_BOLD } else { MONO_REGULAR }
+    } else if bold {
+        SANS_BOLD
+    } else {
+        SANS_REGULAR
+    };
+    preferred
         .iter()
         .copied()
         .find(|path| std::path::Path::new(path).is_file())
+        .or_else(|| {
+            SANS_REGULAR
+                .iter()
+                .copied()
+                .find(|path| std::path::Path::new(path).is_file())
+        })
 }
 
 fn video_escape_filter_color(value: &str, fallback: &str) -> String {
@@ -9931,7 +11038,37 @@ fn video_parse_background_for_box(value: &str) -> Option<String> {
         return None;
     }
     if trimmed.starts_with('#') && trimmed.len() == 7 {
-        return Some(format!("{trimmed}@0.65"));
+        return Some(format!("{trimmed}@1.000"));
+    }
+    if trimmed.starts_with('#') && trimmed.len() == 9 {
+        let alpha = u8::from_str_radix(&trimmed[7..9], 16).ok()? as f64 / 255.0;
+        return Some(format!("{}@{alpha:.3}", &trimmed[..7]));
+    }
+    if trimmed.starts_with('#') && trimmed.len() == 4 {
+        let chars = trimmed.as_bytes();
+        return Some(format!(
+            "#{}{}{}{}{}{}@1.000",
+            chars[1] as char,
+            chars[1] as char,
+            chars[2] as char,
+            chars[2] as char,
+            chars[3] as char,
+            chars[3] as char,
+        ));
+    }
+    if trimmed.starts_with('#') && trimmed.len() == 5 {
+        let chars = trimmed.as_bytes();
+        let expanded = format!(
+            "#{}{}{}{}{}{}",
+            chars[1] as char,
+            chars[1] as char,
+            chars[2] as char,
+            chars[2] as char,
+            chars[3] as char,
+            chars[3] as char,
+        );
+        let alpha = u8::from_str_radix(&trimmed[4..5].repeat(2), 16).ok()? as f64 / 255.0;
+        return Some(format!("{expanded}@{alpha:.3}"));
     }
     if trimmed.to_ascii_lowercase().starts_with("rgba(") && trimmed.ends_with(')') {
         let inner = &trimmed[5..trimmed.len() - 1];
@@ -10038,6 +11175,20 @@ fn video_property_keyframe_expression(
                 "({}+({}-{})*({}*{}*(3-2*{})))",
                 start_value, end_value, start_value, ratio, ratio, ratio
             )
+        } else if matches!(
+            start.easing.as_str(),
+            "ease-in" | "ease-out" | "ease-in-out"
+        ) {
+            let ratio = format!(
+                "((t-{})/{})",
+                video_ffmpeg_number(start_s),
+                video_ffmpeg_number(span)
+            );
+            let eased = video_tier1_bezier_ffmpeg_expression(&start.easing, &ratio);
+            format!(
+                "({}+({}-{})*({}))",
+                start_value, end_value, start_value, eased
+            )
         } else {
             format!(
                 "({}+({}-{})*(t-{})/{})",
@@ -10060,7 +11211,7 @@ fn video_property_keyframe_expression(
     expr.replace(',', "\\,")
 }
 
-fn video_build_export_filter(
+fn video_build_export_filter_legacy(
     project: &serde_json::Value,
     media_clips: &[VideoExportMediaClip],
     text_clips: &[VideoExportTextClip],
@@ -10236,16 +11387,17 @@ fn video_build_export_filter(
         } else {
             clip.text.clone()
         };
-        let fontfile = video_drawtext_fontfile()
+        let fontfile = video_drawtext_fontfile(&clip.font_family, clip.bold)
             .map(|path| format!("fontfile={}:", video_escape_drawtext(path)))
             .unwrap_or_default();
         let mut draw = format!(
-            "[{}]drawtext=expansion=none:{}text={}:fontsize={}:fontcolor={}:x=(w-text_w)*{}:y=(h-text_h)*{}:enable='between(t,{},{})'",
+            "[{}]drawtext=expansion=none:{}text={}:fontsize={}:fontcolor={}:text_align={}:x=w*{}-text_w/2:y=h*{}-text_h/2:enable='between(t,{},{})'",
             previous,
             fontfile,
             video_escape_drawtext(&text),
             video_ffmpeg_number(clip.font_size),
             video_escape_filter_color(&clip.color, "#ffffff"),
+            clip.align,
             video_ffmpeg_number(clip.x),
             video_ffmpeg_number(clip.y),
             video_ffmpeg_seconds(clip.timeline_start_ms),
@@ -10407,6 +11559,9 @@ fn video_render_frame_window_clips(
         let mut window_clip = clip.clone();
         window_clip.timeline_start_ms = windowed_start_ms.saturating_sub(window_start_ms);
         window_clip.duration_ms = windowed_end_ms.saturating_sub(windowed_start_ms);
+        window_clip.word_time_offset_ms = window_clip
+            .word_time_offset_ms
+            .saturating_add(windowed_start_ms.saturating_sub(clip_start_ms));
         window_text_clips.push(window_clip);
     }
 
@@ -10462,6 +11617,39 @@ fn video_export_window_clips_for_range(
         window_media_clips.push(window_clip);
     }
 
+    // A range can shorten either side of a transition. Mirror model
+    // normalization after windowing so the shared export builder never receives
+    // a duration that is invalid for the clipped pair.
+    for left_index in 0..window_media_clips.len() {
+        let Some(transition) = window_media_clips[left_index].transition_after.clone() else {
+            continue;
+        };
+        let left_end = window_media_clips[left_index]
+            .timeline_start_ms
+            .saturating_add(window_media_clips[left_index].duration_ms);
+        let right = window_media_clips.iter().find(|candidate| {
+            candidate.track_id == window_media_clips[left_index].track_id
+                && candidate.clip_id != window_media_clips[left_index].clip_id
+                && candidate.timeline_start_ms == left_end
+        });
+        let Some(right) = right else {
+            window_media_clips[left_index].transition_after = None;
+            continue;
+        };
+        let max_duration = window_media_clips[left_index]
+            .duration_ms
+            .min(right.duration_ms)
+            / 2;
+        if max_duration < 100 {
+            window_media_clips[left_index].transition_after = None;
+        } else if transition.duration_ms > max_duration {
+            window_media_clips[left_index].transition_after = Some(VideoExportTransition {
+                duration_ms: max_duration,
+                ..transition
+            });
+        }
+    }
+
     let mut window_text_clips = Vec::new();
     for clip in text_clips {
         let clip_start_ms = clip.timeline_start_ms;
@@ -10477,6 +11665,9 @@ fn video_export_window_clips_for_range(
         let mut window_clip = clip.clone();
         window_clip.timeline_start_ms = windowed_start_ms.saturating_sub(start_ms);
         window_clip.duration_ms = windowed_end_ms.saturating_sub(windowed_start_ms);
+        window_clip.word_time_offset_ms = window_clip
+            .word_time_offset_ms
+            .saturating_add(windowed_start_ms.saturating_sub(clip_start_ms));
         window_text_clips.push(window_clip);
     }
 
@@ -10485,6 +11676,22 @@ fn video_export_window_clips_for_range(
         window_text_clips,
         end_ms.saturating_sub(start_ms),
     ))
+}
+
+fn video_export_plan_worker_clips(
+    media_clips: Vec<VideoExportMediaClip>,
+    text_clips: Vec<VideoExportTextClip>,
+    total_ms: u64,
+    export_range: Option<(u64, u64)>,
+) -> Result<(
+    Vec<VideoExportMediaClip>,
+    Vec<VideoExportTextClip>,
+    u64,
+), String> {
+    let Some((start_ms, end_ms)) = export_range else {
+        return Ok((media_clips, text_clips, total_ms));
+    };
+    video_export_window_clips_for_range(&media_clips, &text_clips, start_ms, end_ms)
 }
 
 // Custom export destination: must be an absolute path to an existing
@@ -10651,19 +11858,37 @@ fn video_run_export_blocking(
     } else {
         preset
     };
-    let (mut media_clips, mut text_clips, mut total_ms) =
-        video_collect_export_clips(&root, &media_root, &project, status.ffprobe.path.as_deref())?;
-    if let (Some(start_ms), Some(end_ms)) = (options.range_start_ms, options.range_end_ms) {
-        let windowed =
-            video_export_window_clips_for_range(&media_clips, &text_clips, start_ms, end_ms)?;
-        media_clips = windowed.0;
-        text_clips = windowed.1;
-        total_ms = windowed.2;
-    }
-    if total_ms == 0 {
+    let (media_clips, text_clips, source_total_ms, mut export_warnings) =
+        video_collect_export_clips(
+            &root,
+            &media_root,
+            &project,
+            status.ffprobe.path.as_deref(),
+            Some(&ffmpeg_path),
+        )?;
+    let export_range = match (options.range_start_ms, options.range_end_ms) {
+        (Some(start_ms), Some(end_ms)) if end_ms > start_ms => Some((start_ms, end_ms)),
+        (Some(_), Some(_)) => {
+            return Err("Export range endMs must be greater than startMs.".to_string())
+        }
+        _ => None,
+    };
+    if source_total_ms == 0 {
         return Err("Video project has no clips to export.".to_string());
     }
-    let output_abs = match video_export_custom_dir(&options)? {
+    let (media_clips, text_clips, total_ms) = video_export_plan_worker_clips(
+        media_clips,
+        text_clips,
+        source_total_ms,
+        export_range,
+    )?;
+    let output_abs = if options.draft {
+        let draft_dir = media_root
+            .join(VIDEO_CACHE_DIR)
+            .join("draft");
+        video_tier1_draft_paths(&draft_dir, &job_id).0
+    } else {
+        match video_export_custom_dir(&options)? {
         Some(custom_dir) => {
             // User-picked folders (Downloads, Desktop, …) hold files the app
             // doesn't own — never overwrite, always pick a free name.
@@ -10676,11 +11901,24 @@ fn video_run_export_blocking(
             video_destination_with_collision(&custom_dir, &file_name)
         }
         None => video_export_output_path(&media_root, &project, &options),
+        }
     };
     if let Some(parent) = output_abs.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Unable to create video exports directory: {error}"))?;
+        if options.draft {
+            video_tier1_prune_drafts(parent);
+        }
     }
+    let render_abs = if options.draft {
+        video_tier1_draft_paths(
+            output_abs.parent().unwrap_or_else(|| std::path::Path::new(".")),
+            &job_id,
+        )
+        .1
+    } else {
+        output_abs.clone()
+    };
     if !text_clips.is_empty() && !video_ffmpeg_supports_drawtext(&ffmpeg_path) {
         return Err(
             "This export includes text or caption clips, but the detected ffmpeg build cannot render text (no drawtext filter — Homebrew's ffmpeg 8 dropped it). Install the bundled video tools from the editor's Install chip, then export again."
@@ -10697,67 +11935,33 @@ fn video_run_export_blocking(
         fps,
         true,
     );
-    let mut args: Vec<String> = Vec::new();
-    for clip in &media_clips {
-        if clip.kind == "image" {
-            args.extend([
-                "-loop".to_string(),
-                "1".to_string(),
-                "-t".to_string(),
-                video_ffmpeg_seconds(clip.duration_ms),
-            ]);
-        }
-        args.push("-i".to_string());
-        args.push(clip.abs_path.to_string_lossy().to_string());
-    }
-    args.extend([
-        "-filter_complex".to_string(),
-        filter_complex,
-        "-map".to_string(),
-        format!("[{video_output}]"),
-        "-map".to_string(),
-        format!("[{audio_output}]"),
-    ]);
-    if format == "webm" {
-        args.extend([
-            "-c:v".to_string(),
-            "libvpx-vp9".to_string(),
-            "-crf".to_string(),
-            crf.to_string(),
-            "-b:v".to_string(),
-            "0".to_string(),
-            "-c:a".to_string(),
-            "libopus".to_string(),
-        ]);
+    let encoder_names = video_tier1_probe_encoder_names(&ffmpeg_path);
+    let probed_hardware = video_tier1_select_hardware_encoder(
+        video_tier1_platform_name(),
+        &encoder_names,
+    );
+    let hardware = if format == "mp4"
+        && options
+            .hardware_encode
+            .unwrap_or_else(|| probed_hardware.is_some())
+    {
+        probed_hardware
     } else {
-        args.extend([
-            "-c:v".to_string(),
-            "libx264".to_string(),
-            "-preset".to_string(),
-            preset,
-            "-crf".to_string(),
-            crf.to_string(),
-            "-pix_fmt".to_string(),
-            "yuv420p".to_string(),
-            "-c:a".to_string(),
-            "aac".to_string(),
-            "-b:a".to_string(),
-            "192k".to_string(),
-            "-movflags".to_string(),
-            "+faststart".to_string(),
-        ]);
-    }
-    args.extend([
-        "-r".to_string(),
-        video_ffmpeg_number(fps),
-        "-t".to_string(),
-        video_ffmpeg_seconds(total_ms),
-        "-progress".to_string(),
-        "pipe:1".to_string(),
-        "-nostats".to_string(),
-        "-y".to_string(),
-        output_abs.to_string_lossy().to_string(),
-    ]);
+        None
+    };
+    let args = video_tier1_export_ffmpeg_args(
+        &media_clips,
+        &filter_complex,
+        &video_output,
+        &audio_output,
+        &format,
+        crf,
+        &preset,
+        fps,
+        total_ms,
+        &render_abs,
+        hardware.as_ref(),
+    );
     video_emit_export_progress(
         &app,
         &repo_display,
@@ -10771,69 +11975,63 @@ fn video_run_export_blocking(
         None,
         None,
     );
-    let mut child = std::process::Command::new(&ffmpeg_path)
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("Unable to start ffmpeg export: {error}"))?;
-    let stderr_lines = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<
-        String,
-    >::new()));
-    if let Some(stderr) = child.stderr.take() {
-        let stderr_lines_for_thread = stderr_lines.clone();
-        std::thread::spawn(move || {
-            use std::io::BufRead as _;
-            let reader = std::io::BufReader::new(stderr);
-            for line in reader.lines().flatten() {
-                if let Ok(mut lines) = stderr_lines_for_thread.lock() {
-                    lines.push_back(line);
-                    while lines.len() > 40 {
-                        lines.pop_front();
-                    }
-                }
-            }
-        });
-    }
-    let mut cancelled = false;
-    let mut last_emit = std::time::Instant::now();
-    if let Some(stdout) = child.stdout.take() {
-        use std::io::BufRead as _;
-        let reader = std::io::BufReader::new(stdout);
-        for line in reader.lines().flatten() {
-            if cancel.load(std::sync::atomic::Ordering::Acquire) {
-                let _ = child.kill();
-                cancelled = true;
-                break;
-            }
-            if let Some(out_ms) = video_parse_ffmpeg_progress_ms(&line) {
-                if last_emit.elapsed()
-                    >= std::time::Duration::from_millis(VIDEO_EXPORT_PROGRESS_INTERVAL_MS)
-                {
-                    let percent = ((out_ms as f64 / total_ms as f64) * 100.0).clamp(0.0, 100.0);
-                    video_emit_export_progress(
-                        &app,
-                        &repo_display,
-                        &job_id,
-                        "rendering",
-                        Some(percent),
-                        Some(out_ms.min(total_ms)),
-                        Some(total_ms),
-                        "Rendering video.",
-                        false,
-                        None,
-                        None,
-                    );
-                    last_emit = std::time::Instant::now();
-                }
-            }
+    let first_attempt = video_tier1_run_export_attempt(
+        &app,
+        &ffmpeg_path,
+        &args,
+        &job_id,
+        &repo_display,
+        total_ms,
+        &cancel,
+    )?;
+    let attempt = match (first_attempt, hardware.as_ref()) {
+        (VideoTier1ExportAttempt::Failed(_), Some(encoder)) => {
+            let warning = format!(
+                "Hardware encoder {} failed; export retried with libx264.",
+                encoder.name
+            );
+            export_warnings.push(warning);
+            let _ = std::fs::remove_file(&render_abs);
+            video_emit_export_progress(
+                &app,
+                &repo_display,
+                &job_id,
+                "rendering",
+                Some(0.0),
+                Some(0),
+                Some(total_ms),
+                "Hardware encoding failed; retrying with software encoding.",
+                false,
+                None,
+                None,
+            );
+            let fallback_args = video_tier1_export_ffmpeg_args(
+                &media_clips,
+                &filter_complex,
+                &video_output,
+                &audio_output,
+                &format,
+                crf,
+                &preset,
+                fps,
+                total_ms,
+                &render_abs,
+                None,
+            );
+            video_tier1_run_export_attempt(
+                &app,
+                &ffmpeg_path,
+                &fallback_args,
+                &job_id,
+                &repo_display,
+                total_ms,
+                &cancel,
+            )?
         }
-    }
-    let status = child
-        .wait()
-        .map_err(|error| format!("Unable to wait for ffmpeg export: {error}"))?;
-    if cancelled || cancel.load(std::sync::atomic::Ordering::Acquire) {
-        let _ = std::fs::remove_file(&output_abs);
+        (attempt, _) => attempt,
+    };
+    if matches!(attempt, VideoTier1ExportAttempt::Cancelled) {
+        let _ = std::fs::remove_file(&render_abs);
         video_emit_export_progress(
             &app,
             &repo_display,
@@ -10849,40 +12047,36 @@ fn video_run_export_blocking(
         );
         return Ok(());
     }
-    if !status.success() {
-        let detail = stderr_lines
-            .lock()
-            .ok()
-            .map(|lines| lines.iter().cloned().collect::<Vec<_>>().join("\n"))
-            .unwrap_or_default();
-        return Err(if detail.is_empty() {
-            "ffmpeg export failed.".to_string()
-        } else {
-            format!("ffmpeg export failed: {detail}")
-        });
+    if let VideoTier1ExportAttempt::Failed(detail) = attempt {
+        let _ = std::fs::remove_file(&render_abs);
+        return Err(detail);
+    }
+    if options.draft {
+        std::fs::rename(&render_abs, &output_abs)
+            .map_err(|error| format!("Unable to finalize draft render atomically: {error}"))?;
     }
     let output_rel = video_relative_path(&root, &output_abs);
-    video_emit_export_progress(
+    video_tier1_record_completion_path(&output_abs);
+    video_tier1_emit_export_completion(
         &app,
         &repo_display,
         &job_id,
-        "done",
-        Some(100.0),
-        Some(total_ms),
-        Some(total_ms),
-        "Video export finished.",
-        true,
-        None,
-        Some(&output_rel),
+        &output_rel,
+        width,
+        height,
+        total_ms,
+        &export_warnings,
     );
-    let _ = app.emit(
-        VIDEO_STORE_CHANGED_EVENT,
-        serde_json::json!({
-            "repoPath": root.to_string_lossy().to_string(),
-            "paths": [output_rel],
-            "changedAtMs": video_now_millis(),
-        }),
-    );
+    if !options.draft {
+        let _ = app.emit(
+            VIDEO_STORE_CHANGED_EVENT,
+            serde_json::json!({
+                "repoPath": root.to_string_lossy().to_string(),
+                "paths": [output_rel],
+                "changedAtMs": video_now_millis(),
+            }),
+        );
+    }
     Ok(())
 }
 
@@ -11126,6 +12320,8 @@ async fn video_mcp_export(
                 // Agent exports always land in media/exports so their
                 // outputs stay inside the workspace the agent can see.
                 output_dir: None,
+                hardware_encode: None,
+                draft: is_draft,
             };
             let result = video_export_start(app, repo_path, project_path, options).await?;
             Ok(serde_json::json!({ "jobId": result.job_id }))
@@ -11141,7 +12337,7 @@ fn video_render_frame_jpeg_bytes_blocking(
     at_ms: i64,
     max_width: Option<u32>,
     jpeg_quality: u8,
-) -> Result<Vec<u8>, String> {
+) -> Result<VideoRenderedFrame, String> {
     let _span = BackendCpuSpan::new("video_render_frame");
     let (root, media_root) = video_workspace_media_root(repo_path)?;
     video_ensure_media_dirs(&media_root)?;
@@ -11156,13 +12352,24 @@ fn video_render_frame_jpeg_bytes_blocking(
     let height = (video_json_u64(settings, "height", 1080) as u32).clamp(16, 4320);
     let fps = video_json_f64(settings, "fps", 30.0).clamp(1.0, 240.0);
     let seek_ms = if at_ms < 0 { 0 } else { at_ms as u64 };
-    let (media_clips, text_clips, _total_ms) =
-        video_collect_export_clips(&root, &media_root, &project, status.ffprobe.path.as_deref())?;
+    let (media_clips, text_clips, _total_ms, _warnings) =
+        video_collect_export_clips(
+            &root,
+            &media_root,
+            &project,
+            status.ffprobe.path.as_deref(),
+            Some(&ffmpeg_path),
+        )?;
     let (media_clips, text_clips, input_seek_ms, render_seek_ms, render_total_ms) =
         video_render_frame_window_clips(&media_clips, &text_clips, seek_ms);
-    // Preview frames degrade gracefully on drawtext-less ffmpeg builds:
-    // render the frame without text overlays rather than failing video_look.
-    let text_clips = if text_clips.is_empty() || video_ffmpeg_supports_drawtext(&ffmpeg_path) {
+    // Preview frames degrade gracefully on drawtext-less ffmpeg builds, but
+    // the caller receives an explicit fidelity flag instead of an "exact"
+    // frame that silently omitted active text/captions.
+    let text_layers_omitted = video_should_warn_text_layers_omitted(
+        text_clips.len(),
+        video_ffmpeg_supports_drawtext(&ffmpeg_path),
+    );
+    let text_clips = if !text_layers_omitted {
         text_clips
     } else {
         Vec::new()
@@ -11194,11 +12401,17 @@ fn video_render_frame_jpeg_bytes_blocking(
             args.extend(["-ss".to_string(), video_ffmpeg_seconds(*input_seek)]);
         }
         if clip.kind == "image" {
+            let (head_ms, tail_ms) =
+                video_tier1_media_transition_handles(&media_clips, clip.input_index);
             args.extend([
                 "-loop".to_string(),
                 "1".to_string(),
                 "-t".to_string(),
-                video_ffmpeg_seconds(clip.duration_ms),
+                video_ffmpeg_seconds(
+                    clip.duration_ms
+                        .saturating_add(head_ms)
+                        .saturating_add(tail_ms),
+                ),
             ]);
         }
         args.push("-i".to_string());
@@ -11221,7 +12434,12 @@ fn video_render_frame_jpeg_bytes_blocking(
         "mjpeg".to_string(),
         "pipe:1".to_string(),
     ]);
-    video_run_ffmpeg_binary_stdout(&ffmpeg_path, &args, std::time::Duration::from_secs(30))
+    let bytes =
+        video_run_ffmpeg_binary_stdout(&ffmpeg_path, &args, std::time::Duration::from_secs(30))?;
+    Ok(VideoRenderedFrame {
+        bytes,
+        text_layers_omitted,
+    })
 }
 
 async fn video_render_frame_jpeg_bytes(
@@ -11231,7 +12449,7 @@ async fn video_render_frame_jpeg_bytes(
     at_ms: i64,
     max_width: Option<u32>,
     jpeg_quality: u8,
-) -> Result<Vec<u8>, String> {
+) -> Result<VideoRenderedFrame, String> {
     tauri::async_runtime::spawn_blocking(move || {
         video_render_frame_jpeg_bytes_blocking(
             &app,
@@ -11255,12 +12473,12 @@ async fn video_render_frame(
     max_width: Option<u32>,
 ) -> Result<VideoRenderFrameResponse, String> {
     use base64::Engine as _;
-    let bytes =
+    let rendered =
         video_render_frame_jpeg_bytes(app, repo_path, project_path, at_ms, max_width, 4).await?;
     Ok(VideoRenderFrameResponse {
         data_url: format!(
             "data:image/jpeg;base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(bytes)
+            base64::engine::general_purpose::STANDARD.encode(rendered.bytes)
         ),
     })
 }
@@ -11450,12 +12668,23 @@ struct VideoGenerateJobContext {
     last_registry_write_ms: std::sync::Arc<std::sync::Mutex<u64>>,
     expected_duration_ms: Option<u64>,
     source_path: Option<String>,
+    completion_warning: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 #[derive(Clone)]
 struct VideoCloudGenerateJobHandle {
     context: VideoGenerateJobContext,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    lifecycle: std::sync::Arc<std::sync::Mutex<VideoCloudGenerateLifecycle>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoCloudGenerateLifecycle {
+    Pending,
+    Settling,
+    TerminalDone,
+    TerminalFailed,
+    TerminalCancelled,
 }
 
 #[derive(Clone)]
@@ -11470,17 +12699,146 @@ fn video_generation_jobs_path(media_root: &std::path::Path) -> std::path::PathBu
         .join(VIDEO_GENERATION_JOBS_FILE)
 }
 
+fn video_generation_jobs_quarantine_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.with_file_name("jobs.quarantine.json")
+}
+
+#[derive(Debug)]
+struct VideoGenerationJobsRead {
+    jobs: Vec<VideoPersistentGenerateJob>,
+    quarantined_count: usize,
+}
+
+fn video_write_generation_jobs_quarantine(
+    path: &std::path::Path,
+    mut entries: Vec<serde_json::Value>,
+) -> Result<usize, String> {
+    let quarantine_path = video_generation_jobs_quarantine_path(path);
+    let mut preserved = std::fs::read_to_string(&quarantine_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(&raw).ok())
+        .unwrap_or_default();
+    let mut changed = false;
+    for entry in entries.drain(..) {
+        let row = entry.get("row").cloned();
+        let raw = entry.get("raw").cloned();
+        if preserved.iter().any(|existing| {
+            (row.is_some() && existing.get("row") == row.as_ref())
+                || (raw.is_some() && existing.get("raw") == raw.as_ref())
+        }) {
+            continue;
+        }
+        preserved.push(entry);
+        changed = true;
+    }
+    if !changed && quarantine_path.is_file() {
+        return Ok(preserved.len());
+    }
+    if let Some(parent) = quarantine_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!("Unable to create video generation quarantine directory: {error}")
+        })?;
+    }
+    let counter =
+        VIDEO_GENERATION_JOBS_WRITE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp_path = quarantine_path.with_file_name(format!(
+        "jobs.quarantine.{}.{}.tmp",
+        std::process::id(),
+        counter
+    ));
+    let raw = serde_json::to_vec_pretty(&preserved)
+        .map_err(|error| format!("Unable to serialize quarantined video jobs: {error}"))?;
+    std::fs::write(&temp_path, raw)
+        .map_err(|error| format!("Unable to write quarantined video jobs: {error}"))?;
+    std::fs::rename(&temp_path, &quarantine_path)
+        .map_err(|error| format!("Unable to finalize quarantined video jobs: {error}"))?;
+    Ok(preserved.len())
+}
+
+fn video_generation_jobs_quarantine_count(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(video_generation_jobs_quarantine_path(path))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(&raw).ok())
+        .map(|entries| entries.len())
+        .unwrap_or(0)
+}
+
+fn video_read_generation_jobs_with_recovery(
+    path: &std::path::Path,
+) -> Result<VideoGenerationJobsRead, String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(VideoGenerationJobsRead {
+                jobs: Vec::new(),
+                quarantined_count: video_generation_jobs_quarantine_count(path),
+            });
+        }
+        Err(error) => {
+            return Err(format!(
+                "Unable to read video generation job registry: {error}"
+            ));
+        }
+    };
+    let rows = match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(serde_json::Value::Array(rows)) => rows,
+        Ok(value) => {
+            let count = video_write_generation_jobs_quarantine(
+                path,
+                vec![serde_json::json!({
+                    "quarantined": true,
+                    "error": "Generation job registry root was not an array.",
+                    "row": value,
+                })],
+            )?;
+            return Ok(VideoGenerationJobsRead {
+                jobs: Vec::new(),
+                quarantined_count: count,
+            });
+        }
+        Err(error) => {
+            let count = video_write_generation_jobs_quarantine(
+                path,
+                vec![serde_json::json!({
+                    "quarantined": true,
+                    "error": format!("Generation job registry JSON was malformed: {error}"),
+                    "raw": raw,
+                })],
+            )?;
+            return Ok(VideoGenerationJobsRead {
+                jobs: Vec::new(),
+                quarantined_count: count,
+            });
+        }
+    };
+    let mut jobs = Vec::with_capacity(rows.len());
+    let mut malformed = Vec::new();
+    for (index, row) in rows.into_iter().enumerate() {
+        match serde_json::from_value::<VideoPersistentGenerateJob>(row.clone()) {
+            Ok(job) => jobs.push(job),
+            Err(error) => malformed.push(serde_json::json!({
+                "quarantined": true,
+                "index": index,
+                "error": error.to_string(),
+                "row": row,
+            })),
+        }
+    }
+    let quarantined_count = if malformed.is_empty() {
+        video_generation_jobs_quarantine_count(path)
+    } else {
+        video_write_generation_jobs_quarantine(path, malformed)?
+    };
+    Ok(VideoGenerationJobsRead {
+        jobs,
+        quarantined_count,
+    })
+}
+
 fn video_read_generation_jobs(
     path: &std::path::Path,
 ) -> Result<Vec<VideoPersistentGenerateJob>, String> {
-    match std::fs::read_to_string(path) {
-        Ok(raw) => serde_json::from_str::<Vec<VideoPersistentGenerateJob>>(&raw)
-            .map_err(|error| format!("Unable to parse video generation job registry: {error}")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(error) => Err(format!(
-            "Unable to read video generation job registry: {error}"
-        )),
-    }
+    Ok(video_read_generation_jobs_with_recovery(path)?.jobs)
 }
 
 fn video_generation_jobs_guard() -> Result<std::sync::MutexGuard<'static, ()>, String> {
@@ -11499,7 +12857,10 @@ fn video_write_generation_jobs(
         if let Some(index) = jobs.iter().position(|job| job.done) {
             jobs.remove(index);
         } else {
-            jobs.remove(0);
+            // Pending provider jobs are billing-sensitive recovery records.
+            // Raise the effective cap instead of discarding the only resume
+            // reference merely because history is full.
+            break;
         }
     }
     if let Some(parent) = path.parent() {
@@ -11571,6 +12932,11 @@ fn video_update_generation_job(
     let mut found = false;
     for job in &mut jobs {
         if job.job_id == context.job_id {
+            if job.done {
+                // Terminal rows are monotonic. A status/progress response
+                // that was already in flight cannot reopen or downgrade it.
+                return Ok(());
+            }
             job.state = state.to_string();
             job.percent = percent;
             if provider_ref.is_some() {
@@ -11632,6 +12998,71 @@ fn video_set_generation_provider_ref(
         source_path: context.source_path.clone(),
     });
     video_write_generation_jobs(&context.registry_path, &mut jobs)
+}
+
+fn video_settle_persisted_generation_job_failed(
+    registry_path: &std::path::Path,
+    job_id: &str,
+    reason: &str,
+) -> Result<VideoPersistentGenerateJob, String> {
+    let _guard = video_generation_jobs_guard()?;
+    let mut jobs = video_read_generation_jobs(registry_path)?;
+    let job = jobs
+        .iter_mut()
+        .find(|job| job.job_id == job_id)
+        .ok_or_else(|| format!("Video generation job not found: {job_id}"))?;
+    job.state = "error".to_string();
+    job.percent = Some(100.0);
+    job.done = true;
+    job.error = Some(reason.to_string());
+    let settled = job.clone();
+    video_write_generation_jobs(registry_path, &mut jobs)?;
+    Ok(settled)
+}
+
+fn video_settle_generation_resume_failure(
+    app: &tauri::AppHandle,
+    registry_path: &std::path::Path,
+    job: &VideoPersistentGenerateJob,
+    error: &str,
+) -> Result<(), String> {
+    let reason = format!("Unable to resume generation after restart: {error}");
+    let settled =
+        video_settle_persisted_generation_job_failed(registry_path, &job.job_id, &reason)?;
+    video_emit_generate_progress_event(
+        app,
+        &settled.job_id,
+        &settled.provider_id,
+        "error",
+        Some(100.0),
+        &reason,
+        true,
+        Some(&reason),
+        &[],
+        &settled.model,
+        &settled.planned_paths,
+    );
+    Ok(())
+}
+
+fn video_mark_generation_unknown_outcome(
+    registry_path: &std::path::Path,
+    job_id: &str,
+) -> Result<VideoPersistentGenerateJob, String> {
+    let _guard = video_generation_jobs_guard()?;
+    let mut jobs = video_read_generation_jobs(registry_path)?;
+    let job = jobs
+        .iter_mut()
+        .find(|job| job.job_id == job_id)
+        .ok_or_else(|| format!("Video generation job not found: {job_id}"))?;
+    let warning = "The provider may have accepted this paid request before the app stopped, but its provider reference was not recorded. Retrying may duplicate a running paid job.";
+    job.state = "unknown-outcome".to_string();
+    job.percent = None;
+    job.done = false;
+    job.error = Some(warning.to_string());
+    let marked = job.clone();
+    video_write_generation_jobs(registry_path, &mut jobs)?;
+    Ok(marked)
 }
 
 fn video_update_generation_job_planned_path(
@@ -11765,6 +13196,7 @@ fn video_recorded_generate_request(
         params: request.params.clone(),
         input_asset_paths: request.input_asset_paths.clone(),
         audio_asset_paths: request.audio_asset_paths.clone(),
+        lora_id: request.lora_id.clone(),
     }
 }
 
@@ -12167,64 +13599,282 @@ fn video_cloud_generate_jobs()
 
 fn video_cloud_register_generation_job(
     cloud_job_id: &str,
-    context: VideoGenerateJobContext,
-    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: VideoCloudGenerateJobHandle,
 ) -> Result<(), String> {
+    let key = video_generation_job_registry_key(&handle.context.root, cloud_job_id);
     video_cloud_generate_jobs()
         .lock()
         .map_err(|_| "Video cloud generation registry is poisoned.".to_string())?
-        .insert(
-            cloud_job_id.to_string(),
-            VideoCloudGenerateJobHandle { context, cancel },
-        );
+        .insert(key, handle);
     Ok(())
 }
 
-fn video_cloud_generation_handle(cloud_job_id: &str) -> Option<VideoCloudGenerateJobHandle> {
+fn video_cloud_generation_handle_new(
+    context: VideoGenerateJobContext,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> VideoCloudGenerateJobHandle {
+    VideoCloudGenerateJobHandle {
+        context,
+        cancel,
+        lifecycle: std::sync::Arc::new(std::sync::Mutex::new(
+            VideoCloudGenerateLifecycle::Pending,
+        )),
+    }
+}
+
+fn video_cloud_generation_handles(cloud_job_id: &str) -> Vec<VideoCloudGenerateJobHandle> {
+    let suffix = format!("\u{1f}{cloud_job_id}");
     video_cloud_generate_jobs()
         .lock()
         .ok()
-        .and_then(|jobs| jobs.get(cloud_job_id).cloned())
+        .map(|jobs| {
+            jobs.iter()
+                .filter(|(key, _)| key.ends_with(&suffix))
+                .map(|(_, handle)| handle.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-fn video_cloud_remove_generation_job(cloud_job_id: &str) -> Option<VideoCloudGenerateJobHandle> {
+fn video_cloud_remove_generation_jobs_for_local(root: &std::path::Path, job_id: &str) {
+    if let Ok(mut jobs) = video_cloud_generate_jobs().lock() {
+        jobs.retain(|_, handle| handle.context.root != root || handle.context.job_id != job_id);
+    }
+}
+
+fn video_cloud_generation_handle_for_local(
+    root: &std::path::Path,
+    job_id: &str,
+) -> Option<VideoCloudGenerateJobHandle> {
     video_cloud_generate_jobs()
         .lock()
         .ok()
-        .and_then(|mut jobs| jobs.remove(cloud_job_id))
+        .and_then(|jobs| {
+            jobs.values()
+                .find(|handle| handle.context.root == root && handle.context.job_id == job_id)
+                .cloned()
+        })
 }
 
-fn video_cloud_cancel_generation_job(job_id: &str) -> bool {
-    let found = video_cloud_generate_jobs()
+fn video_cloud_lifecycle(handle: &VideoCloudGenerateJobHandle) -> VideoCloudGenerateLifecycle {
+    handle
+        .lifecycle
         .lock()
-        .ok()
-        .and_then(|mut jobs| {
-            let cloud_job_id = jobs
-                .iter()
-                .find(|(_, handle)| handle.context.job_id == job_id)
-                .map(|(cloud_job_id, _)| cloud_job_id.clone())?;
-            jobs.remove(&cloud_job_id)
-                .map(|handle| (cloud_job_id, handle))
-        });
-    let Some((_cloud_job_id, handle)) = found else {
+        .map(|state| *state)
+        .unwrap_or(VideoCloudGenerateLifecycle::TerminalFailed)
+}
+
+fn video_cloud_with_pending_lifecycle<T>(
+    lifecycle: &std::sync::Mutex<VideoCloudGenerateLifecycle>,
+    action: impl FnOnce() -> T,
+) -> Option<T> {
+    let state = lifecycle.lock().ok()?;
+    if *state != VideoCloudGenerateLifecycle::Pending {
+        return None;
+    }
+    Some(action())
+}
+
+fn video_cloud_try_update_cancel_pending(
+    lifecycle: &std::sync::Mutex<VideoCloudGenerateLifecycle>,
+    cancel: &std::sync::atomic::AtomicBool,
+    requested: bool,
+) -> bool {
+    video_cloud_with_pending_lifecycle(lifecycle, || {
+        cancel.store(requested, std::sync::atomic::Ordering::Release);
+    })
+    .is_some()
+}
+
+fn video_cloud_lifecycle_try_begin_settling(
+    lifecycle: &std::sync::Mutex<VideoCloudGenerateLifecycle>,
+) -> bool {
+    let Ok(mut state) = lifecycle.lock() else {
         return false;
     };
-    handle
-        .cancel
-        .store(true, std::sync::atomic::Ordering::Release);
-    // Cloud generation v1 has no remote cancel contract. This only cancels
-    // local downloads and stops handling future pushes for this job.
-    video_emit_generate_progress(
-        &handle.context,
-        "cancelled",
-        Some(100.0),
-        "Generation cancelled.",
-        true,
-        None,
-        &[],
-    );
-    video_job_registry_remove(&VIDEO_GENERATE_JOBS, job_id);
+    if *state != VideoCloudGenerateLifecycle::Pending {
+        return false;
+    }
+    *state = VideoCloudGenerateLifecycle::Settling;
     true
+}
+
+fn video_cloud_try_begin_settling(handle: &VideoCloudGenerateJobHandle) -> bool {
+    video_cloud_lifecycle_try_begin_settling(&handle.lifecycle)
+}
+
+fn video_cloud_finish_settling(
+    handle: &VideoCloudGenerateJobHandle,
+    terminal: VideoCloudGenerateLifecycle,
+) {
+    video_cloud_lifecycle_finish_settling(&handle.lifecycle, terminal);
+}
+
+fn video_cloud_lifecycle_finish_settling(
+    lifecycle: &std::sync::Mutex<VideoCloudGenerateLifecycle>,
+    terminal: VideoCloudGenerateLifecycle,
+) {
+    if let Ok(mut state) = lifecycle.lock() {
+        if *state == VideoCloudGenerateLifecycle::Settling {
+            *state = terminal;
+        }
+    }
+}
+
+fn video_cloud_emit_pending_progress(
+    handle: &VideoCloudGenerateJobHandle,
+    state: &str,
+    percent: Option<f64>,
+    message: &str,
+) -> bool {
+    video_cloud_with_pending_lifecycle(&handle.lifecycle, || {
+        video_emit_generate_progress(
+            &handle.context,
+            state,
+            percent,
+            message,
+            false,
+            None,
+            &[],
+        );
+    })
+    .is_some()
+}
+
+async fn video_cloud_cancel_generation_job(
+    root: &std::path::Path,
+    job_id: &str,
+) -> Result<bool, String> {
+    let Some(handle) = video_cloud_generation_handle_for_local(root, job_id) else {
+        return Ok(false);
+    };
+    let mut provider_ref = {
+        let state = handle
+            .lifecycle
+            .lock()
+            .map_err(|_| "Video cloud generation lifecycle is poisoned.".to_string())?;
+        if *state != VideoCloudGenerateLifecycle::Pending {
+            return Err(
+                "Cloud delivery already won; the generated asset is being imported.".to_string(),
+            );
+        }
+        let mut provider_ref = video_read_generation_jobs(&handle.context.registry_path)?
+            .into_iter()
+            .find(|job| job.job_id == job_id)
+            .and_then(|job| job.provider_ref)
+            .ok_or_else(|| {
+                "Cloud generation cannot be cancelled without a provider reference.".to_string()
+            })?;
+        provider_ref["cancelRequested"] = serde_json::json!(true);
+        video_set_generation_provider_ref(&handle.context, provider_ref.clone())?;
+        provider_ref
+    };
+    let cloud_job_id = video_cloud_job_id_from_provider_ref(&provider_ref);
+    let original_request_id = video_cloud_request_id_from_provider_ref(&provider_ref);
+    let mut payload = serde_json::json!({
+        "requestId": format!("video-generate-cancel-{}-{}", video_now_millis(), uuid::Uuid::new_v4()),
+        "action": "cancel",
+    });
+    if let Some(cloud_job_id) = cloud_job_id {
+        payload["jobId"] = serde_json::json!(cloud_job_id);
+    }
+    if let Some(request_id) = original_request_id {
+        payload["originalRequestId"] = serde_json::json!(request_id);
+    }
+    let cloud_state = handle.context.app.state::<CloudMcpState>().inner().clone();
+    let response = match cloud_mcp_ws_request_once_with_timeout(
+        &cloud_state,
+        "media_generate_request",
+        &payload,
+        std::time::Duration::from_secs(VIDEO_CLOUD_GENERATE_ACK_TIMEOUT_SECS),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) if cloud_mcp_ws_request_error_is_transient(&error) => {
+            if !video_cloud_try_update_cancel_pending(
+                &handle.lifecycle,
+                &handle.cancel,
+                true,
+            ) {
+                handle
+                    .cancel
+                    .store(false, std::sync::atomic::Ordering::Release);
+                return Err(
+                    "Cloud delivery already won; the generated asset is being imported."
+                        .to_string(),
+                );
+            }
+            video_cloud_emit_pending_progress(
+                &handle,
+                "cancel-requested",
+                None,
+                "Cloud cancellation acknowledgement was interrupted; retrying until billing is reconciled.",
+            );
+            return Ok(true);
+        }
+        Err(error) => {
+            if video_cloud_lifecycle(&handle) != VideoCloudGenerateLifecycle::Pending {
+                return Err(
+                    "Cloud delivery already won; the generated asset is being imported."
+                        .to_string(),
+                );
+            }
+            provider_ref["cancelRequested"] = serde_json::json!(false);
+            let _ = video_set_generation_provider_ref(&handle.context, provider_ref);
+            return Err(error);
+        }
+    };
+    if video_cloud_lifecycle(&handle) != VideoCloudGenerateLifecycle::Pending {
+        handle
+            .cancel
+            .store(false, std::sync::atomic::Ordering::Release);
+        return Err(
+            "Cloud delivery already won; the generated asset is being imported.".to_string(),
+        );
+    }
+    let data = response
+        .get("data")
+        .cloned()
+        .unwrap_or_else(|| response.clone());
+    if data
+        .get("cancelAccepted")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+    {
+        if !video_cloud_try_update_cancel_pending(
+            &handle.lifecycle,
+            &handle.cancel,
+            false,
+        ) {
+            return Err(
+                "Cloud delivery already won; the generated asset is being imported.".to_string(),
+            );
+        }
+        provider_ref["cancelRequested"] = serde_json::json!(false);
+        let _ = video_set_generation_provider_ref(&handle.context, provider_ref);
+        let error = video_cloud_event_text(&data, &["cancelError", "message"])
+            .unwrap_or_else(|| "Cloud generation was already terminal.".to_string());
+        return Err(error);
+    }
+    {
+        if !video_cloud_try_update_cancel_pending(
+            &handle.lifecycle,
+            &handle.cancel,
+            true,
+        ) {
+            return Err(
+                "Cloud delivery already won; the generated asset is being imported.".to_string(),
+            );
+        }
+        video_cloud_emit_pending_progress(
+            &handle,
+            "cancel-requested",
+            None,
+            "Cancellation requested; waiting for cloud billing reconciliation.",
+        );
+    }
+    Ok(true)
 }
 
 fn video_cloud_event_text(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -12242,6 +13892,13 @@ fn video_cloud_job_id_from_provider_ref(provider_ref: &serde_json::Value) -> Opt
     video_cloud_event_text(
         provider_ref,
         &["cloudJobId", "cloud_job_id", "jobId", "job_id"],
+    )
+}
+
+fn video_cloud_request_id_from_provider_ref(provider_ref: &serde_json::Value) -> Option<String> {
+    video_cloud_event_text(
+        provider_ref,
+        &["requestId", "request_id", "clientRequestId", "client_request_id"],
     )
 }
 
@@ -12267,12 +13924,6 @@ fn video_cloud_generate_progress_event(event: &serde_json::Value) {
     let Some(cloud_job_id) = video_cloud_event_text(event, &["jobId", "job_id"]) else {
         return;
     };
-    let Some(handle) = video_cloud_generation_handle(&cloud_job_id) else {
-        return;
-    };
-    if handle.cancel.load(std::sync::atomic::Ordering::Acquire) {
-        return;
-    }
     let state = video_cloud_event_text(event, &["state"]).unwrap_or_else(|| "running".to_string());
     let percent = event.get("percent").and_then(serde_json::Value::as_f64);
     let message = video_cloud_event_text(event, &["message"]).unwrap_or_else(|| {
@@ -12285,7 +13936,17 @@ fn video_cloud_generate_progress_event(event: &serde_json::Value) {
         }
         .to_string()
     });
-    video_emit_generate_progress(&handle.context, &state, percent, &message, false, None, &[]);
+    for handle in video_cloud_generation_handles(&cloud_job_id) {
+        let Ok(lifecycle) = handle.lifecycle.lock() else {
+            continue;
+        };
+        if *lifecycle != VideoCloudGenerateLifecycle::Pending
+            || handle.cancel.load(std::sync::atomic::Ordering::Acquire)
+        {
+            continue;
+        }
+        video_emit_generate_progress(&handle.context, &state, percent, &message, false, None, &[]);
+    }
 }
 
 fn video_cloud_output_mime(output: &serde_json::Value) -> Option<String> {
@@ -12328,19 +13989,65 @@ fn video_cloud_generate_outputs(event: &serde_json::Value) -> Vec<VideoGenerated
 }
 
 async fn video_cloud_generate_result_worker(
-    cloud_job_id: String,
+    _cloud_job_id: String,
     handle: VideoCloudGenerateJobHandle,
     event: serde_json::Value,
 ) {
-    if handle.cancel.load(std::sync::atomic::Ordering::Acquire) {
-        video_cloud_remove_generation_job(&cloud_job_id);
-        video_job_registry_remove(&VIDEO_GENERATE_JOBS, &handle.context.job_id);
+    if !video_cloud_try_begin_settling(&handle) {
         return;
     }
+    let registry_key =
+        video_generation_job_registry_key(&handle.context.root, &handle.context.job_id);
     let ok = event
         .get("ok")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    let cancelled = video_cloud_event_text(&event, &["state"])
+        .map(|state| matches!(state.as_str(), "cancelled" | "canceled"))
+        .unwrap_or(false);
+    let result_warning = video_cloud_event_text(&event, &["warning"]);
+    if cancelled {
+        let error = event
+            .get("error")
+            .and_then(|error| {
+                error.as_str().map(str::to_string).or_else(|| {
+                    error
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+            })
+            .unwrap_or_else(|| {
+                "Generation cancelled. The cloud released the credit hold; no asset was delivered."
+                    .to_string()
+            });
+        video_emit_generate_progress(
+            &handle.context,
+            "cancelled",
+            Some(100.0),
+            &error,
+            true,
+            Some(&error),
+            &[],
+        );
+        video_cloud_finish_settling(
+            &handle,
+            VideoCloudGenerateLifecycle::TerminalCancelled,
+        );
+        video_cloud_remove_generation_jobs_for_local(
+            &handle.context.root,
+            &handle.context.job_id,
+        );
+        video_job_registry_remove(&VIDEO_GENERATE_JOBS, &registry_key);
+        return;
+    }
+    // A terminal non-cancel result is authoritative. This matters when a
+    // cancellation acknowledgement was interrupted: local intent must not
+    // turn an already-billed success or an unknown/expired error into a fake
+    // "hold released" result.
+    handle
+        .cancel
+        .store(false, std::sync::atomic::Ordering::Release);
     if !ok {
         let error = video_cloud_event_error(&event);
         video_emit_generate_progress(
@@ -12352,8 +14059,12 @@ async fn video_cloud_generate_result_worker(
             Some(&error),
             &[],
         );
-        video_cloud_remove_generation_job(&cloud_job_id);
-        video_job_registry_remove(&VIDEO_GENERATE_JOBS, &handle.context.job_id);
+        video_cloud_finish_settling(&handle, VideoCloudGenerateLifecycle::TerminalFailed);
+        video_cloud_remove_generation_jobs_for_local(
+            &handle.context.root,
+            &handle.context.job_id,
+        );
+        video_job_registry_remove(&VIDEO_GENERATE_JOBS, &registry_key);
         return;
     }
     let outputs = video_cloud_generate_outputs(&event);
@@ -12365,7 +14076,10 @@ async fn video_cloud_generate_result_worker(
         video_download_provider_outputs(&handle.context, &client, outputs, &handle.cancel).await
     }
     .await;
-    match result {
+    if video_cloud_lifecycle(&handle) != VideoCloudGenerateLifecycle::Settling {
+        return;
+    }
+    let terminal = match result {
         Ok(output_paths) => {
             let manifest_changed =
                 video_record_cloud_generation_relations(&handle.context, &output_paths)
@@ -12393,22 +14107,15 @@ async fn video_cloud_generate_result_worker(
                 &handle.context,
                 "done",
                 Some(100.0),
-                "Generation finished.",
+                &result_warning
+                    .as_deref()
+                    .map(|warning| format!("Generation finished with a warning: {warning}"))
+                    .unwrap_or_else(|| "Generation finished.".to_string()),
                 true,
                 None,
                 &output_paths,
             );
-        }
-        Err(_error) if handle.cancel.load(std::sync::atomic::Ordering::Acquire) => {
-            video_emit_generate_progress(
-                &handle.context,
-                "cancelled",
-                Some(100.0),
-                "Generation cancelled.",
-                true,
-                None,
-                &[],
-            );
+            VideoCloudGenerateLifecycle::TerminalDone
         }
         Err(error) => {
             video_emit_generate_progress(
@@ -12420,24 +14127,179 @@ async fn video_cloud_generate_result_worker(
                 Some(&error),
                 &[],
             );
+            VideoCloudGenerateLifecycle::TerminalFailed
         }
-    }
-    video_cloud_remove_generation_job(&cloud_job_id);
-    video_job_registry_remove(&VIDEO_GENERATE_JOBS, &handle.context.job_id);
+    };
+    video_cloud_finish_settling(&handle, terminal);
+    video_cloud_remove_generation_jobs_for_local(&handle.context.root, &handle.context.job_id);
+    video_job_registry_remove(&VIDEO_GENERATE_JOBS, &registry_key);
 }
 
 fn video_cloud_generate_result_event(event: serde_json::Value) {
     let Some(cloud_job_id) = video_cloud_event_text(&event, &["jobId", "job_id"]) else {
         return;
     };
-    let Some(handle) = video_cloud_generation_handle(&cloud_job_id) else {
-        return;
-    };
-    tauri::async_runtime::spawn(video_cloud_generate_result_worker(
-        cloud_job_id,
-        handle,
-        event,
-    ));
+    for handle in video_cloud_generation_handles(&cloud_job_id) {
+        tauri::async_runtime::spawn(video_cloud_generate_result_worker(
+            cloud_job_id.clone(),
+            handle,
+            event.clone(),
+        ));
+    }
+}
+
+async fn video_cloud_query_generation_job(
+    handle: &VideoCloudGenerateJobHandle,
+    provider_ref: &serde_json::Value,
+) -> Result<bool, String> {
+    if video_cloud_lifecycle(handle) != VideoCloudGenerateLifecycle::Pending {
+        return Ok(true);
+    }
+    let cloud_job_id = video_cloud_job_id_from_provider_ref(provider_ref);
+    let original_request_id = video_cloud_request_id_from_provider_ref(provider_ref);
+    if cloud_job_id.is_none() && original_request_id.is_none() {
+        return Err(
+            "Cloud generation providerRef has neither cloudJobId nor requestId.".to_string(),
+        );
+    }
+    let mut payload = serde_json::json!({
+        "requestId": format!("video-generate-status-{}-{}", video_now_millis(), uuid::Uuid::new_v4()),
+        "action": if handle.cancel.load(std::sync::atomic::Ordering::Acquire) {
+            "cancel"
+        } else {
+            "status"
+        },
+    });
+    if let Some(cloud_job_id) = cloud_job_id.as_deref() {
+        payload["jobId"] = serde_json::json!(cloud_job_id);
+    }
+    if let Some(request_id) = original_request_id.as_deref() {
+        payload["originalRequestId"] = serde_json::json!(request_id);
+    }
+    let cloud_state = handle.context.app.state::<CloudMcpState>().inner().clone();
+    let response = cloud_mcp_ws_request_once_with_timeout(
+        &cloud_state,
+        "media_generate_request",
+        &payload,
+        std::time::Duration::from_secs(VIDEO_CLOUD_GENERATE_ACK_TIMEOUT_SECS),
+    )
+    .await?;
+    // A websocket result may have won while this status request was in
+    // flight. Never let that stale response write progress over settlement.
+    if video_cloud_lifecycle(handle) != VideoCloudGenerateLifecycle::Pending {
+        return Ok(true);
+    }
+    let data = response
+        .get("data")
+        .cloned()
+        .unwrap_or_else(|| response.clone());
+    let actual_cloud_job_id = video_cloud_event_text(&data, &["jobId", "job_id"])
+        .or(cloud_job_id)
+        .unwrap_or_else(|| handle.context.job_id.clone());
+    let mut merged_provider_ref = provider_ref.clone();
+    if !actual_cloud_job_id.is_empty() {
+        merged_provider_ref["cloudJobId"] = serde_json::json!(actual_cloud_job_id.clone());
+    }
+    if let Some(request_id) = original_request_id {
+        merged_provider_ref["requestId"] = serde_json::json!(request_id);
+    }
+    {
+        let lifecycle = handle
+            .lifecycle
+            .lock()
+            .map_err(|_| "Video cloud generation lifecycle is poisoned.".to_string())?;
+        if *lifecycle != VideoCloudGenerateLifecycle::Pending {
+            return Ok(true);
+        }
+        let _ = video_set_generation_provider_ref(&handle.context, merged_provider_ref);
+        video_cloud_register_generation_job(&actual_cloud_job_id, handle.clone())?;
+    }
+    if data
+        .get("done")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        let mut event = data
+            .get("result")
+            .cloned()
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "ok": false,
+                    "error": video_cloud_event_text(&data, &["message"])
+                        .unwrap_or_else(|| "Cloud generation completed without a result snapshot.".to_string()),
+                    "outputs": [],
+                })
+            });
+        event["jobId"] = serde_json::json!(actual_cloud_job_id.clone());
+        if event.get("state").is_none() {
+            event["state"] = data
+                .get("state")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!("error"));
+        }
+        video_cloud_generate_result_worker(actual_cloud_job_id, handle.clone(), event).await;
+        return Ok(true);
+    }
+
+    let state = video_cloud_event_text(&data, &["state"]).unwrap_or_else(|| "running".to_string());
+    let percent = data.get("percent").and_then(serde_json::Value::as_f64);
+    let message = video_cloud_event_text(&data, &["message"])
+        .unwrap_or_else(|| "Waiting for Diff Forge Cloud.".to_string());
+    {
+        let lifecycle = handle
+            .lifecycle
+            .lock()
+            .map_err(|_| "Video cloud generation lifecycle is poisoned.".to_string())?;
+        if *lifecycle != VideoCloudGenerateLifecycle::Pending {
+            return Ok(true);
+        }
+        video_emit_generate_progress(
+            &handle.context,
+            &state,
+            percent,
+            &message,
+            false,
+            None,
+            &[],
+        );
+    }
+    Ok(false)
+}
+
+fn video_cloud_spawn_generation_requery(
+    handle: VideoCloudGenerateJobHandle,
+    provider_ref: serde_json::Value,
+) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if video_cloud_lifecycle(&handle) != VideoCloudGenerateLifecycle::Pending {
+                break;
+            }
+            match video_cloud_query_generation_job(&handle, &provider_ref).await {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(error) if cloud_mcp_ws_request_error_is_transient(&error) => {}
+                Err(error) => {
+                    let cloud_job_id = video_cloud_job_id_from_provider_ref(&provider_ref)
+                        .unwrap_or_else(|| handle.context.job_id.clone());
+                    video_cloud_generate_result_worker(
+                        cloud_job_id,
+                        handle.clone(),
+                        serde_json::json!({
+                            "jobId": video_cloud_job_id_from_provider_ref(&provider_ref),
+                            "state": "error",
+                            "ok": false,
+                            "error": format!("Unable to resume cloud generation: {error}"),
+                            "outputs": [],
+                        }),
+                    )
+                    .await;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
 }
 
 fn video_cloud_handle_generation_event(event: serde_json::Value) {
@@ -12682,40 +14544,74 @@ async fn video_generate_cloud(
         return Err("Video generation cancelled.".to_string());
     }
     let payload = video_cloud_generate_payload(context, request)?;
+    let request_id = video_cloud_event_text(&payload, &["requestId", "request_id"])
+        .ok_or_else(|| "Cloud media generation payload omitted requestId.".to_string())?;
+    let pending_provider_ref = serde_json::json!({
+        "requestId": request_id,
+    });
+    video_set_generation_provider_ref(context, pending_provider_ref.clone())?;
+    let handle = video_cloud_generation_handle_new(context.clone(), cancel.clone());
+    video_cloud_register_generation_job(
+        &format!("request:{request_id}"),
+        handle.clone(),
+    )?;
     let cloud_state = context.app.state::<CloudMcpState>().inner().clone();
-    let response = cloud_mcp_ws_request_once_with_timeout(
+    let response = match cloud_mcp_ws_request_once_with_timeout(
         &cloud_state,
         "media_generate_request",
         &payload,
         std::time::Duration::from_secs(VIDEO_CLOUD_GENERATE_ACK_TIMEOUT_SECS),
     )
-    .await?;
+    .await
+    {
+        Ok(response) => response,
+        Err(error) if cloud_mcp_ws_request_error_is_transient(&error) => {
+            video_cloud_emit_pending_progress(
+                &handle,
+                "queued",
+                Some(0.0),
+                "Cloud acknowledgement was interrupted; checking the persisted cloud job.",
+            );
+            video_cloud_spawn_generation_requery(handle, pending_provider_ref);
+            return Ok(());
+        }
+        Err(error) => {
+            video_cloud_remove_generation_jobs_for_local(&context.root, &context.job_id);
+            return Err(error);
+        }
+    };
+    if video_cloud_lifecycle(&handle) != VideoCloudGenerateLifecycle::Pending {
+        return Ok(());
+    }
     let data = response
         .get("data")
         .cloned()
         .unwrap_or_else(|| response.clone());
     if data.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        video_cloud_remove_generation_jobs_for_local(&context.root, &context.job_id);
         return Err(video_cloud_event_error(&data));
     }
-    let cloud_job_id = video_cloud_event_text(&data, &["jobId", "job_id"])
-        .ok_or_else(|| "Cloud media generation ack omitted jobId.".to_string())?;
-    video_set_generation_provider_ref(
-        context,
-        serde_json::json!({
-            "cloudJobId": cloud_job_id.clone(),
-            "requestId": data.get("requestId").or_else(|| data.get("request_id")).cloned().unwrap_or(serde_json::Value::Null),
-        }),
-    )?;
-    video_cloud_register_generation_job(&cloud_job_id, context.clone(), cancel.clone())?;
-    video_emit_generate_progress(
-        context,
+    let Some(cloud_job_id) = video_cloud_event_text(&data, &["jobId", "job_id"]) else {
+        video_cloud_remove_generation_jobs_for_local(&context.root, &context.job_id);
+        return Err("Cloud media generation ack omitted jobId.".to_string());
+    };
+    let provider_ref = serde_json::json!({
+        "cloudJobId": cloud_job_id.clone(),
+        "requestId": data
+            .get("requestId")
+            .or_else(|| data.get("request_id"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(request_id)),
+    });
+    video_set_generation_provider_ref(context, provider_ref.clone())?;
+    video_cloud_register_generation_job(&cloud_job_id, handle.clone())?;
+    video_cloud_emit_pending_progress(
+        &handle,
         "queued",
         Some(0.0),
         "Cloud generation queued.",
-        false,
-        None,
-        &[],
     );
+    video_cloud_spawn_generation_requery(handle, provider_ref);
     Ok(())
 }
 
@@ -13212,6 +15108,16 @@ async fn video_generate_openai_image(
             .text("prompt", request.prompt.clone())
             .text("size", video_openai_image_size(request.params.as_ref()))
             .text(
+                "n",
+                request
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.num_images)
+                    .unwrap_or(1)
+                    .clamp(1, 10)
+                    .to_string(),
+            )
+            .text(
                 "model",
                 if request.model.trim().is_empty() {
                     provider.models[0].to_string()
@@ -13250,7 +15156,7 @@ async fn video_generate_openai_image(
                 "model": if request.model.trim().is_empty() { provider.models[0] } else { request.model.as_str() },
                 "prompt": request.prompt,
                 "size": video_openai_image_size(request.params.as_ref()),
-                "n": request.params.as_ref().and_then(|params| params.num_images).unwrap_or(1).clamp(1, 16),
+                "n": request.params.as_ref().and_then(|params| params.num_images).unwrap_or(1).clamp(1, 10),
             }))
             .send()
             .await
@@ -13318,6 +15224,23 @@ fn video_collect_gemini_image_data(
     }
 }
 
+fn video_gemini_partial_success_warning(
+    requested: u32,
+    successful: usize,
+) -> Option<String> {
+    if successful == 0 || successful >= requested as usize {
+        return None;
+    }
+    Some(format!(
+        "Gemini delivered {successful} of {requested} requested provider outputs; the remaining interaction{} failed.",
+        if requested as usize - successful == 1 {
+            ""
+        } else {
+            "s"
+        }
+    ))
+}
+
 async fn video_generate_nano_banana(
     context: &VideoGenerateJobContext,
     request: &VideoGenerateRequest,
@@ -13361,31 +15284,76 @@ async fn video_generate_nano_banana(
     {
         response_format["image_size"] = serde_json::json!(resolution);
     }
-    let response = client
-        .post(format!("{base}/v1beta/interactions"))
-        .header("x-goog-api-key", api_key)
-        .json(&serde_json::json!({
-            "model": model,
-            "input": input,
-            "response_format": response_format,
-        }))
-        .send()
-        .await
-        .map_err(|error| format!("Unable to submit Gemini image generation: {error}"))?;
-    let json = video_response_json(response, "Gemini image").await?;
+    let body = serde_json::json!({
+        "model": model,
+        "input": input,
+        "response_format": response_format,
+    });
+    let requested = request
+        .params
+        .as_ref()
+        .and_then(|params| params.num_images)
+        .unwrap_or(1)
+        .clamp(1, 4);
     let mut image_data = Vec::new();
-    video_collect_gemini_image_data(&json, &mut image_data);
+    let mut last_interaction_error = None::<String>;
+    // Gemini's current Interactions API has no supported native-image
+    // candidate-count field. Issue one interaction per requested output.
+    for _ in 0..requested {
+        let response = match client
+            .post(format!("{base}/v1beta/interactions"))
+            .header("x-goog-api-key", api_key.clone())
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                last_interaction_error = Some(format!(
+                    "Unable to submit Gemini image generation: {error}"
+                ));
+                continue;
+            }
+        };
+        let json = match video_response_json(response, "Gemini image").await {
+            Ok(json) => json,
+            Err(error) => {
+                last_interaction_error = Some(error);
+                continue;
+            }
+        };
+        let mut interaction_images = Vec::new();
+        video_collect_gemini_image_data(&json, &mut interaction_images);
+        if let Some(image) = interaction_images.pop() {
+            image_data.push(image);
+        } else {
+            last_interaction_error = Some(
+                "Gemini image response did not include inline image data.".to_string(),
+            );
+        }
+    }
     image_data.sort_by(|left, right| left.0.cmp(&right.0));
     image_data.dedup_by(|left, right| left.0 == right.0);
     let mut outputs = Vec::new();
     for (data, _mime) in image_data {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(data)
-            .map_err(|error| format!("Unable to decode Gemini image: {error}"))?;
+        let bytes = match base64::engine::general_purpose::STANDARD.decode(data) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                last_interaction_error = Some(format!("Unable to decode Gemini image: {error}"));
+                continue;
+            }
+        };
         outputs.push(video_save_generated_bytes(context, outputs.len(), &bytes)?);
     }
     if outputs.is_empty() {
-        return Err("Gemini image response did not include inline image data.".to_string());
+        return Err(last_interaction_error.unwrap_or_else(|| {
+            "Gemini image response did not include inline image data.".to_string()
+        }));
+    }
+    if let Some(warning) = video_gemini_partial_success_warning(requested, outputs.len()) {
+        if let Ok(mut completion_warning) = context.completion_warning.lock() {
+            *completion_warning = Some(warning);
+        }
     }
     Ok(outputs)
 }
@@ -14538,13 +16506,19 @@ async fn video_generate_worker(
     }
     .await;
     let keep_cloud_job_active = context.provider_id == "cloud" && result.is_ok();
+    let completion_message = context
+        .completion_warning
+        .lock()
+        .ok()
+        .and_then(|warning| warning.clone())
+        .unwrap_or_else(|| "Generation finished.".to_string());
     match result {
         Ok(output_paths) if context.provider_id == "cloud" && output_paths.is_empty() => {}
         Ok(output_paths) => video_emit_generate_progress(
             &context,
             "done",
             Some(100.0),
-            "Generation finished.",
+            &completion_message,
             true,
             None,
             &output_paths,
@@ -14571,7 +16545,10 @@ async fn video_generate_worker(
         ),
     }
     if !keep_cloud_job_active {
-        video_job_registry_remove(&VIDEO_GENERATE_JOBS, &context.job_id);
+        video_job_registry_remove(
+            &VIDEO_GENERATE_JOBS,
+            &video_generation_job_registry_key(&context.root, &context.job_id),
+        );
     }
 }
 
@@ -14594,7 +16571,9 @@ async fn video_generate_start(
         .await
         .map_err(|error| format!("Hyperframes start worker failed: {error}"))?;
     }
-    let (job_id, cancel) = video_job_registry_insert(&VIDEO_GENERATE_JOBS)?;
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let job_key = video_generation_job_registry_key(&root, &job_id);
+    let (cancel, _) = video_job_registry_insert_if_absent(&VIDEO_GENERATE_JOBS, &job_key)?;
     let created_at_ms = video_now_millis();
     let raw_model = if request.model.trim().is_empty() {
         provider
@@ -14664,6 +16643,7 @@ async fn video_generate_start(
         last_registry_write_ms: std::sync::Arc::new(std::sync::Mutex::new(created_at_ms)),
         expected_duration_ms,
         source_path: None,
+        completion_warning: std::sync::Arc::new(std::sync::Mutex::new(None)),
     };
     tauri::async_runtime::spawn(video_generate_worker(context, request, cancel));
     Ok(VideoGenerateStartResult {
@@ -14865,7 +16845,16 @@ async fn video_generate_code_render(
     if let Some(error) = video_code_ready_error(&status) {
         return Err(error);
     }
-    let cancel = video_job_registry_insert_with_id(&VIDEO_GENERATE_JOBS, &job.job_id)?;
+    let job_key = video_generation_job_registry_key(&root, &job.job_id);
+    let (cancel, inserted) =
+        video_job_registry_insert_if_absent(&VIDEO_GENERATE_JOBS, &job_key)?;
+    if !inserted {
+        return Ok(VideoGenerateStartResult {
+            job_id: job.job_id,
+            planned_paths: job.planned_paths,
+            source_path: Some(source_path),
+        });
+    }
     let context = VideoGenerateJobContext {
         app,
         root,
@@ -14882,6 +16871,7 @@ async fn video_generate_code_render(
         last_registry_write_ms: std::sync::Arc::new(std::sync::Mutex::new(0)),
         expected_duration_ms,
         source_path: Some(source_path.clone()),
+        completion_warning: std::sync::Arc::new(std::sync::Mutex::new(None)),
     };
     let request = VideoGenerateRequest {
         provider_id: job.provider_id.clone(),
@@ -14891,7 +16881,7 @@ async fn video_generate_code_render(
         input_asset_paths: Vec::new(),
         audio_asset_paths: Vec::new(),
         params: job.request.params.clone(),
-        lora_id: None,
+        lora_id: job.request.lora_id.clone(),
         auth: None,
     };
     tauri::async_runtime::spawn(video_generate_worker(context, request, cancel));
@@ -15195,11 +17185,15 @@ async fn video_generate_resume_from_ref(
 }
 
 fn video_generate_resume_error_is_terminal(error: &str) -> bool {
-    error.contains("job failed:")
-        || error.contains("queue job failed:")
-        || error.contains("completed without")
-        || error.contains("succeeded without")
-        || error.contains("response did not include downloadable outputs")
+    let lower = error.to_ascii_lowercase();
+    lower.contains("job failed:")
+        || lower.contains("queue job failed:")
+        || lower.contains("completed without")
+        || lower.contains("succeeded without")
+        || lower.contains("rejected by moderation")
+        || lower.contains("response did not include downloadable outputs")
+        || lower.contains("http 404")
+        || lower.contains("http 410")
 }
 
 async fn video_generate_resume_preflight(
@@ -15297,7 +17291,39 @@ async fn video_generate_resume_worker(
     auth: Option<VideoProviderAuth>,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let result = video_generate_resume_from_ref(&context, &job, auth, &cancel).await;
+    let started = std::time::Instant::now();
+    let mut retryable_timeout = false;
+    let result = loop {
+        let result = video_generate_resume_from_ref(&context, &job, auth.clone(), &cancel).await;
+        match result {
+            Ok(output_paths) => break Ok(output_paths),
+            Err(error) if cancel.load(std::sync::atomic::Ordering::Acquire) => break Err(error),
+            Err(error) if video_generate_resume_error_is_terminal(&error) => break Err(error),
+            Err(error)
+                if started.elapsed()
+                    >= std::time::Duration::from_secs(VIDEO_GENERATION_TIMEOUT_SECS) =>
+            {
+                retryable_timeout = true;
+                break Err(format!(
+                    "Generation could not be resumed before the timeout. Last provider error: {error}"
+                ));
+            }
+            Err(error) => {
+                video_emit_generate_progress(
+                    &context,
+                    "running",
+                    None,
+                    &format!("Provider status check was interrupted; retrying. {error}"),
+                    false,
+                    None,
+                    &[],
+                );
+                if let Err(cancel_error) = video_poll_sleep(&cancel).await {
+                    break Err(cancel_error);
+                }
+            }
+        }
+    };
     match result {
         Ok(output_paths) => {
             let _ = context.app.emit(
@@ -15329,20 +17355,33 @@ async fn video_generate_resume_worker(
                 &[],
             );
         }
+        Err(error) if retryable_timeout => {
+            video_emit_generate_progress(
+                &context,
+                "resume-pending",
+                None,
+                &format!("Provider status remains temporarily unavailable; this job is still pending and can be resumed again. {error}"),
+                false,
+                None,
+                &[],
+            );
+        }
         Err(error) => {
-            let done = video_generate_resume_error_is_terminal(&error);
             video_emit_generate_progress(
                 &context,
                 "error",
                 Some(100.0),
                 &error,
-                done,
+                true,
                 Some(&error),
                 &[],
             );
         }
     }
-    video_job_registry_remove(&VIDEO_GENERATE_JOBS, &context.job_id);
+    video_job_registry_remove(
+        &VIDEO_GENERATE_JOBS,
+        &video_generation_job_registry_key(&context.root, &context.job_id),
+    );
 }
 
 #[tauri::command]
@@ -15350,8 +17389,17 @@ async fn video_jobs_list(repo_path: String) -> Result<VideoJobsListResponse, Str
     tauri::async_runtime::spawn_blocking(move || {
         let (_root, media_root) = video_workspace_media_root(repo_path.as_str())?;
         video_ensure_media_dirs(&media_root)?;
+        let registry_path = video_generation_jobs_path(&media_root);
+        let recovered = video_read_generation_jobs_with_recovery(&registry_path)?;
         Ok(VideoJobsListResponse {
-            jobs: video_read_generation_jobs(&video_generation_jobs_path(&media_root))?,
+            jobs: recovered.jobs,
+            recovery_warning: (recovered.quarantined_count > 0).then(|| {
+                format!(
+                    "Recovered the valid generation jobs and quarantined {} malformed row{} in media/.cache/jobs.quarantine.json.",
+                    recovered.quarantined_count,
+                    if recovered.quarantined_count == 1 { "" } else { "s" }
+                )
+            }),
         })
     })
     .await
@@ -15382,16 +17430,51 @@ async fn video_generate_resume(
         video_generate_code_render(app, repo_path, job.job_id).await?;
         return Ok(VideoGenerateResumeResponse { ok: true });
     }
+    let job_key = video_generation_job_registry_key(&root, &job.job_id);
+    let (cancel, inserted) =
+        video_job_registry_insert_if_absent(&VIDEO_GENERATE_JOBS, &job_key)?;
+    if !inserted {
+        return Ok(VideoGenerateResumeResponse { ok: true });
+    }
     if job.provider_ref.is_none() {
-        return Err("Video generation job does not have a providerRef to resume.".to_string());
+        let marked = video_mark_generation_unknown_outcome(&registry_path, &job.job_id)?;
+        let warning = marked.error.as_deref().unwrap_or(
+            "Provider submission outcome is unknown; retrying may duplicate a paid job.",
+        );
+        video_emit_generate_progress_event(
+            &app,
+            &marked.job_id,
+            &marked.provider_id,
+            "unknown-outcome",
+            None,
+            warning,
+            false,
+            Some(warning),
+            &[],
+            &marked.model,
+            &marked.planned_paths,
+        );
+        video_job_registry_remove(&VIDEO_GENERATE_JOBS, &job_key);
+        return Err(warning.to_string());
     }
     if job.provider_id == "cloud" {
-        let cloud_job_id = job
-            .provider_ref
-            .as_ref()
-            .and_then(video_cloud_job_id_from_provider_ref)
-            .ok_or_else(|| "Cloud generation providerRef is missing cloudJobId.".to_string())?;
-        let cancel = video_job_registry_insert_with_id(&VIDEO_GENERATE_JOBS, &job.job_id)?;
+        let provider_ref = job.provider_ref.clone().unwrap_or_default();
+        let cloud_job_id = video_cloud_job_id_from_provider_ref(&provider_ref);
+        if cloud_job_id.is_none()
+            && video_cloud_request_id_from_provider_ref(&provider_ref).is_none()
+        {
+            let error = "cloud provider reference is missing both cloudJobId and requestId";
+            video_settle_generation_resume_failure(&app, &registry_path, &job, error)?;
+            video_job_registry_remove(&VIDEO_GENERATE_JOBS, &job_key);
+            return Err(error.to_string());
+        }
+        if provider_ref
+            .get("cancelRequested")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
         let context = VideoGenerateJobContext {
             app,
             root,
@@ -15408,21 +17491,46 @@ async fn video_generate_resume(
             last_registry_write_ms: std::sync::Arc::new(std::sync::Mutex::new(0)),
             expected_duration_ms: job.expected_duration_ms,
             source_path: job.source_path.clone(),
+            completion_warning: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
-        video_cloud_register_generation_job(&cloud_job_id, context.clone(), cancel)?;
-        video_emit_generate_progress(
-            &context,
+        let handle = video_cloud_generation_handle_new(context.clone(), cancel);
+        if let Some(cloud_job_id) = cloud_job_id.as_deref() {
+            video_cloud_register_generation_job(cloud_job_id, handle.clone())?;
+        } else if let Some(request_id) = video_cloud_request_id_from_provider_ref(&provider_ref) {
+            video_cloud_register_generation_job(
+                &format!("request:{request_id}"),
+                handle.clone(),
+            )?;
+        }
+        video_cloud_emit_pending_progress(
+            &handle,
             "running",
             None,
             "Waiting for Diff Forge Cloud.",
+        );
+        video_cloud_spawn_generation_requery(handle, provider_ref);
+        return Ok(VideoGenerateResumeResponse { ok: true });
+    }
+    if let Err(error) = video_generate_resume_preflight(&job, &auth).await {
+        if video_generate_resume_error_is_terminal(&error) {
+            video_settle_generation_resume_failure(&app, &registry_path, &job, &error)?;
+            video_job_registry_remove(&VIDEO_GENERATE_JOBS, &job_key);
+            return Err(error);
+        }
+        video_emit_generate_progress_event(
+            &app,
+            &job.job_id,
+            &job.provider_id,
+            "resume-pending",
+            None,
+            &format!("Provider preflight was interrupted; the original job remains pending and will be retried. {error}"),
             false,
             None,
             &[],
+            &job.model,
+            &job.planned_paths,
         );
-        return Ok(VideoGenerateResumeResponse { ok: true });
     }
-    video_generate_resume_preflight(&job, &auth).await?;
-    let cancel = video_job_registry_insert_with_id(&VIDEO_GENERATE_JOBS, &job.job_id)?;
     let context = VideoGenerateJobContext {
         app,
         root,
@@ -15439,6 +17547,7 @@ async fn video_generate_resume(
         last_registry_write_ms: std::sync::Arc::new(std::sync::Mutex::new(0)),
         expected_duration_ms: job.expected_duration_ms,
         source_path: job.source_path.clone(),
+        completion_warning: std::sync::Arc::new(std::sync::Mutex::new(None)),
     };
     tauri::async_runtime::spawn(video_generate_resume_worker(context, job, auth, cancel));
     Ok(VideoGenerateResumeResponse { ok: true })
@@ -15485,21 +17594,78 @@ fn video_generate_cancel_ledger_job(app: &tauri::AppHandle, repo_path: Option<&s
 // jobs list and cancels either through this command. repo_path lets it also
 // cancel ledger-only jobs (hyperframes authoring) that have no live worker.
 #[tauri::command]
-fn video_generate_cancel(
+async fn video_generate_cancel(
     app: tauri::AppHandle,
     job_id: String,
     repo_path: Option<String>,
 ) -> Result<(), String> {
-    match video_job_registry_cancel(&VIDEO_GENERATE_JOBS, &job_id) {
+    let generation_root = repo_path
+        .as_deref()
+        .and_then(|repo_path| video_workspace_media_root(repo_path).ok())
+        .map(|(root, _)| root);
+    if let Some(root) = generation_root.as_deref() {
+        if video_cloud_generation_handle_for_local(root, &job_id).is_some()
+            && video_cloud_cancel_generation_job(root, &job_id).await?
+        {
+            return Ok(());
+        }
+    }
+    let generation_cancel = generation_root
+        .as_deref()
+        .map(|root| {
+            video_job_registry_cancel(
+                &VIDEO_GENERATE_JOBS,
+                &video_generation_job_registry_key(root, &job_id),
+            )
+        })
+        .unwrap_or_else(|| Err("Unknown job".to_string()));
+    match generation_cancel {
         Ok(()) => {
-            let _ = video_cloud_cancel_generation_job(&job_id);
+            if let Some(root) = generation_root.as_deref() {
+                let _ = video_cloud_cancel_generation_job(root, &job_id).await?;
+            }
             Ok(())
         }
         Err(error) if error == "Unknown job" => {
             match video_job_registry_cancel(&VIDEO_LORA_JOBS, &job_id) {
                 Ok(()) => Ok(()),
                 Err(lora_error) if lora_error == "Unknown job" => {
-                    video_generate_cancel_ledger_job(&app, repo_path.as_deref(), &job_id)
+                    let cloud_job = repo_path
+                        .as_deref()
+                        .and_then(|repo_path| video_workspace_media_root(repo_path).ok())
+                        .and_then(|(_root, media_root)| {
+                            video_read_generation_jobs(&video_generation_jobs_path(&media_root)).ok()
+                        })
+                        .and_then(|jobs| {
+                            jobs.into_iter().find(|job| {
+                                job.job_id == job_id && !job.done && job.provider_id == "cloud"
+                            })
+                        });
+                    if cloud_job.is_some() {
+                        let repo_path = repo_path
+                            .clone()
+                            .ok_or_else(|| {
+                                "Cloud generation cancel requires repoPath.".to_string()
+                            })?;
+                        video_generate_resume(
+                            app.clone(),
+                            repo_path,
+                            job_id.clone(),
+                            None,
+                        )
+                        .await?;
+                        let root = generation_root.as_deref().ok_or_else(|| {
+                            "Cloud generation cancel requires repoPath.".to_string()
+                        })?;
+                        if !video_cloud_cancel_generation_job(root, &job_id).await? {
+                            return Err(
+                                "Cloud generation cancel could not bind the cloud job.".to_string()
+                            );
+                        }
+                        Ok(())
+                    } else {
+                        video_generate_cancel_ledger_job(&app, repo_path.as_deref(), &job_id)
+                    }
                 }
                 Err(lora_error) => Err(lora_error),
             }
@@ -15683,7 +17849,7 @@ async fn video_mcp_generate(
         "cancel" => {
             let job_id = video_mcp_input_text(&input, &["jobId", "job_id"])
                 .ok_or_else(|| "video_generate cancel requires jobId.".to_string())?;
-            video_generate_cancel(app, job_id.clone(), Some(repo_path))?;
+            video_generate_cancel(app, job_id.clone(), Some(repo_path)).await?;
             Ok(serde_json::json!({ "ok": true, "jobId": job_id }))
         }
         _ => Err(format!("Unknown video_generate action: {action}")),
@@ -16178,7 +18344,7 @@ mod video_drawtext_tests {
         assert_eq!(video_escape_drawtext("[hi]; ok"), "\\[hi\\]\\; ok");
         assert_eq!(video_escape_drawtext("50% off"), "50% off");
         assert_eq!(video_escape_drawtext("back\\slash"), "back\\\\\\\\slash");
-        assert_eq!(video_escape_drawtext("line\nbreak"), "line break");
+        assert_eq!(video_escape_drawtext("line\nbreak"), "line\nbreak");
     }
 
     // The full caption from the field failure: an apostrophe used to
@@ -16188,6 +18354,413 @@ mod video_drawtext_tests {
     fn video_escape_drawtext_survives_apostrophe_comma_caption() {
         let escaped = video_escape_drawtext("You don't chat, you queue.");
         assert_eq!(escaped, "You don\\\\\\'t chat\\, you queue.");
+    }
+
+    #[test]
+    fn video_text_fidelity_warning_only_applies_to_active_text_without_drawtext() {
+        assert!(video_should_warn_text_layers_omitted(1, false));
+        assert!(!video_should_warn_text_layers_omitted(0, false));
+        assert!(!video_should_warn_text_layers_omitted(2, true));
+    }
+
+    #[test]
+    fn video_drawtext_filter_keeps_alignment_weight_and_rich_text_effects() {
+        let clip = VideoExportTextClip {
+            text: "Left\naligned".to_string(),
+            timeline_start_ms: 0,
+            duration_ms: 1_000,
+            font_size: 48.0,
+            color: "#ffffff".to_string(),
+            background: Some("#000000cc".to_string()),
+            outline_color: "#112233".to_string(),
+            outline_width: 3.0,
+            shadow: true,
+            uppercase: false,
+            align: "left".to_string(),
+            bold: true,
+            font_family: "sans-serif".to_string(),
+            x: 0.5,
+            y: 0.8,
+            words: Vec::new(),
+            anim: "none".to_string(),
+            anim_opts: VideoTier1AnimOpts::default(),
+            word_time_offset_ms: 0,
+        };
+        let (filter, _, _) = video_build_export_filter(
+            &serde_json::json!({ "settings": { "background": "#000000" } }),
+            &[],
+            &[clip],
+            1_000,
+            1920,
+            1080,
+            30.0,
+            false,
+        );
+        assert!(filter.contains("text_align=left"), "{filter}");
+        assert!(filter.contains("borderw=3"), "{filter}");
+        assert!(filter.contains("bordercolor=#112233"), "{filter}");
+        assert!(filter.contains("shadowcolor=black@0.6"), "{filter}");
+        assert!(filter.contains("boxcolor=#000000@0.800"), "{filter}");
+        assert!(filter.contains("Left\naligned"), "{filter}");
+        assert_eq!(
+            video_parse_background_for_box("#123").as_deref(),
+            Some("#112233@1.000")
+        );
+        if let Some(bold_font) = video_drawtext_fontfile("sans-serif", true) {
+            assert!(filter.contains(&video_escape_drawtext(bold_font)), "{filter}");
+        }
+    }
+
+    #[test]
+    fn video_drawtext_positions_are_centered_at_preview_coordinates() {
+        for (position, expected) in [
+            (0.0, "x=w*0-text_w/2:y=h*0-text_h/2"),
+            (0.5, "x=w*0.500000-text_w/2:y=h*0.500000-text_h/2"),
+            (1.0, "x=w*1-text_w/2:y=h*1-text_h/2"),
+        ] {
+            let clip = VideoExportTextClip {
+                text: "centered".to_string(),
+                timeline_start_ms: 0,
+                duration_ms: 1_000,
+                font_size: 48.0,
+                color: "#ffffff".to_string(),
+                background: Some("#000000cc".to_string()),
+                outline_color: "#000000".to_string(),
+                outline_width: 0.0,
+                shadow: false,
+                uppercase: false,
+                align: "center".to_string(),
+                bold: false,
+                font_family: "sans-serif".to_string(),
+                x: position,
+                y: position,
+                words: Vec::new(),
+                anim: "none".to_string(),
+                anim_opts: VideoTier1AnimOpts::default(),
+                word_time_offset_ms: 0,
+            };
+            let (filter, _, _) = video_build_export_filter(
+                &serde_json::json!({ "settings": { "background": "#000000" } }),
+                &[],
+                &[clip],
+                1_000,
+                1920,
+                1080,
+                30.0,
+                false,
+            );
+            assert!(filter.contains(expected), "{expected}: {filter}");
+            assert!(filter.contains("boxborderw=8"), "{filter}");
+        }
+    }
+
+    #[test]
+    fn video_drawtext_cache_key_changes_when_managed_binary_is_replaced() {
+        let root = std::env::temp_dir().join(format!(
+            "diffforge-video-drawtext-cache-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create cache test directory");
+        let binary = root.join("ffmpeg");
+        std::fs::write(&binary, b"old").expect("write first binary");
+        let first = video_ffmpeg_drawtext_cache_key(binary.to_str().expect("utf8 path"));
+        std::fs::write(&binary, b"replacement").expect("replace binary");
+        let second = video_ffmpeg_drawtext_cache_key(binary.to_str().expect("utf8 path"));
+        assert_ne!(first, second);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod video_generation_job_tests {
+    fn pending_job(job_id: &str, created_at_ms: u64) -> super::VideoPersistentGenerateJob {
+        super::VideoPersistentGenerateJob {
+            job_id: job_id.to_string(),
+            provider_id: "fal".to_string(),
+            model: "fal-ai/flux-2".to_string(),
+            mode: "text-to-image".to_string(),
+            request: super::VideoGenerateRecordedRequest {
+                kind: "image".to_string(),
+                model: "fal-ai/flux-2".to_string(),
+                mode: "text-to-image".to_string(),
+                prompt: "resume me".to_string(),
+                ..super::VideoGenerateRecordedRequest::default()
+            },
+            state: "queued".to_string(),
+            planned_paths: vec![format!("media/generated/{job_id}.png")],
+            provider_ref: Some(serde_json::json!({
+                "statusUrl": format!("https://queue.invalid/{job_id}/status"),
+                "responseUrl": format!("https://queue.invalid/{job_id}")
+            })),
+            created_at_ms,
+            ..super::VideoPersistentGenerateJob::default()
+        }
+    }
+
+    #[test]
+    fn expired_resume_settles_failed_without_losing_retry_request() {
+        let root = std::env::temp_dir().join(format!(
+            "diffforge-video-expired-job-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp job directory");
+        let registry_path = root.join("jobs.json");
+        let original = super::VideoPersistentGenerateJob {
+            job_id: "expired-job".to_string(),
+            provider_id: "fal".to_string(),
+            model: "fal-ai/flux-2".to_string(),
+            mode: "text-to-image".to_string(),
+            request: super::VideoGenerateRecordedRequest {
+                kind: "image".to_string(),
+                model: "fal-ai/flux-2".to_string(),
+                mode: "text-to-image".to_string(),
+                prompt: "retry me".to_string(),
+                ..super::VideoGenerateRecordedRequest::default()
+            },
+            state: "queued".to_string(),
+            planned_paths: vec!["media/generated/expired.png".to_string()],
+            provider_ref: Some(serde_json::json!({
+                "statusUrl": "https://queue.invalid/requests/expired/status",
+                "responseUrl": "https://queue.invalid/requests/expired"
+            })),
+            created_at_ms: 42,
+            ..super::VideoPersistentGenerateJob::default()
+        };
+        super::video_upsert_generation_job(&registry_path, original.clone())
+            .expect("write pending job");
+
+        let reason = "Unable to resume generation after restart: fal status returned HTTP 410: expired";
+        assert!(super::video_generate_resume_error_is_terminal(reason));
+        let settled = super::video_settle_persisted_generation_job_failed(
+            &registry_path,
+            &original.job_id,
+            reason,
+        )
+        .expect("settle expired job");
+
+        assert!(settled.done);
+        assert_eq!(settled.state, "error");
+        assert_eq!(settled.error.as_deref(), Some(reason));
+        assert_eq!(settled.planned_paths, original.planned_paths);
+        assert_eq!(settled.request.prompt, "retry me");
+        assert_eq!(settled.provider_ref, original.provider_ref);
+        let persisted = super::video_read_generation_jobs(&registry_path).expect("read jobs");
+        assert_eq!(persisted.len(), 1);
+        assert!(persisted[0].done);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offline_resume_preflight_keeps_original_job_pending() {
+        let root = std::env::temp_dir().join(format!(
+            "diffforge-video-offline-job-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp job directory");
+        let registry_path = root.join("jobs.json");
+        let original = pending_job("offline-job", 43);
+        super::video_upsert_generation_job(&registry_path, original.clone())
+            .expect("write pending job");
+
+        let error = "Unable to poll fal.ai queue: error sending request: network is offline";
+        assert!(!super::video_generate_resume_error_is_terminal(error));
+        let persisted = super::video_read_generation_jobs(&registry_path).expect("read jobs");
+        assert_eq!(persisted.len(), 1);
+        assert!(!persisted[0].done);
+        assert_eq!(persisted[0].state, "queued");
+        assert_eq!(persisted[0].provider_ref, original.provider_ref);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn http_404_resume_preflight_settles_failed() {
+        let root = std::env::temp_dir().join(format!(
+            "diffforge-video-404-job-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp job directory");
+        let registry_path = root.join("jobs.json");
+        let original = pending_job("missing-job", 44);
+        super::video_upsert_generation_job(&registry_path, original.clone())
+            .expect("write pending job");
+        let reason = "fal.ai status returned HTTP 404: job expired";
+        assert!(super::video_generate_resume_error_is_terminal(reason));
+        let settled = super::video_settle_persisted_generation_job_failed(
+            &registry_path,
+            &original.job_id,
+            reason,
+        )
+        .expect("settle missing job");
+        assert!(settled.done);
+        assert_eq!(settled.provider_ref, original.provider_ref);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_provider_ref_becomes_explicit_unknown_outcome() {
+        let root = std::env::temp_dir().join(format!(
+            "diffforge-video-unknown-outcome-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp job directory");
+        let registry_path = root.join("jobs.json");
+        let mut original = pending_job("unknown-job", 45);
+        original.state = "submitting".to_string();
+        original.provider_ref = None;
+        super::video_upsert_generation_job(&registry_path, original)
+            .expect("write submitting job");
+        let marked = super::video_mark_generation_unknown_outcome(
+            &registry_path,
+            "unknown-job",
+        )
+        .expect("mark unknown outcome");
+        assert!(!marked.done);
+        assert_eq!(marked.state, "unknown-outcome");
+        assert!(marked
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("duplicate"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_job_row_is_quarantined_without_hiding_valid_rows() {
+        let root = std::env::temp_dir().join(format!(
+            "diffforge-video-quarantine-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp job directory");
+        let registry_path = root.join("jobs.json");
+        let valid = serde_json::to_value(pending_job("valid-job", 1)).expect("encode valid job");
+        let malformed = serde_json::json!({ "jobId": "bad-job", "done": "not-a-boolean" });
+        std::fs::write(
+            &registry_path,
+            serde_json::to_vec_pretty(&serde_json::json!([valid, malformed]))
+                .expect("encode mixed jobs"),
+        )
+        .expect("write mixed jobs");
+
+        let recovered = super::video_read_generation_jobs_with_recovery(&registry_path)
+            .expect("recover valid rows");
+        assert_eq!(recovered.jobs.len(), 1);
+        assert_eq!(recovered.jobs[0].job_id, "valid-job");
+        assert_eq!(recovered.quarantined_count, 1);
+        assert!(super::video_generation_jobs_quarantine_path(&registry_path).is_file());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn generation_job_cap_never_evicts_pending_rows() {
+        let root = std::env::temp_dir().join(format!(
+            "diffforge-video-job-cap-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp job directory");
+        let registry_path = root.join("jobs.json");
+        let mut jobs = (0..61)
+            .map(|index| pending_job(&format!("pending-{index}"), index))
+            .collect::<Vec<_>>();
+        let mut terminal = pending_job("terminal-history", 62);
+        terminal.done = true;
+        terminal.state = "done".to_string();
+        jobs.push(terminal);
+        super::video_write_generation_jobs(&registry_path, &mut jobs).expect("write capped jobs");
+        let persisted = super::video_read_generation_jobs(&registry_path).expect("read capped jobs");
+        assert_eq!(persisted.len(), 61);
+        assert!(persisted.iter().all(|job| !job.done));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn generation_registry_is_atomic_and_workspace_scoped() {
+        static REGISTRY: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, super::VideoJobHandle>>,
+        > = std::sync::OnceLock::new();
+        let first_key = super::video_generation_job_registry_key(
+            std::path::Path::new("/workspace/one"),
+            "copied-job",
+        );
+        let second_key = super::video_generation_job_registry_key(
+            std::path::Path::new("/workspace/two"),
+            "copied-job",
+        );
+        let (first, first_inserted) =
+            super::video_job_registry_insert_if_absent(&REGISTRY, &first_key)
+                .expect("insert first waiter");
+        let (duplicate, duplicate_inserted) =
+            super::video_job_registry_insert_if_absent(&REGISTRY, &first_key)
+                .expect("get first waiter");
+        let (_, copied_inserted) =
+            super::video_job_registry_insert_if_absent(&REGISTRY, &second_key)
+                .expect("insert copied workspace waiter");
+        assert!(first_inserted);
+        assert!(!duplicate_inserted);
+        assert!(std::sync::Arc::ptr_eq(&first, &duplicate));
+        assert!(copied_inserted);
+    }
+
+    #[test]
+    fn cloud_result_then_stale_status_cannot_reopen_terminal_job() {
+        let lifecycle = std::sync::Mutex::new(super::VideoCloudGenerateLifecycle::Pending);
+        assert!(super::video_cloud_lifecycle_try_begin_settling(&lifecycle));
+        super::video_cloud_lifecycle_finish_settling(
+            &lifecycle,
+            super::VideoCloudGenerateLifecycle::TerminalDone,
+        );
+        assert!(!super::video_cloud_lifecycle_try_begin_settling(&lifecycle));
+        assert_eq!(
+            *lifecycle.lock().expect("lifecycle lock"),
+            super::VideoCloudGenerateLifecycle::TerminalDone
+        );
+        let stale_status_wrote = std::sync::atomic::AtomicBool::new(false);
+        assert!(super::video_cloud_with_pending_lifecycle(&lifecycle, || {
+            stale_status_wrote.store(true, std::sync::atomic::Ordering::Release);
+        })
+        .is_none());
+        assert!(!stale_status_wrote.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn cloud_result_then_cancel_is_rejected_before_download_token_changes() {
+        let lifecycle = std::sync::Mutex::new(super::VideoCloudGenerateLifecycle::Pending);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        assert!(super::video_cloud_lifecycle_try_begin_settling(&lifecycle));
+        assert!(!super::video_cloud_try_update_cancel_pending(
+            &lifecycle,
+            &cancel,
+            true,
+        ));
+        assert!(!cancel.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn recorded_request_round_trips_lora_and_legacy_defaults_null() {
+        let request = super::VideoGenerateRequest {
+            provider_id: "flux-lora".to_string(),
+            model: "flux-klein".to_string(),
+            mode: "text-to-image".to_string(),
+            prompt: "portrait".to_string(),
+            lora_id: Some("lora-123".to_string()),
+            ..super::VideoGenerateRequest::default()
+        };
+        let recorded = super::video_recorded_generate_request("image", "flux-klein", &request);
+        assert_eq!(recorded.lora_id.as_deref(), Some("lora-123"));
+        let legacy: super::VideoGenerateRecordedRequest = serde_json::from_value(
+            serde_json::json!({ "kind": "image", "model": "flux-klein" }),
+        )
+        .expect("decode legacy recorded request");
+        assert!(legacy.lora_id.is_none());
+    }
+
+    #[test]
+    fn gemini_partial_success_warns_but_zero_success_is_not_partial() {
+        assert_eq!(
+            super::video_gemini_partial_success_warning(3, 2).as_deref(),
+            Some("Gemini delivered 2 of 3 requested provider outputs; the remaining interaction failed.")
+        );
+        assert!(super::video_gemini_partial_success_warning(3, 0).is_none());
+        assert!(super::video_gemini_partial_success_warning(3, 3).is_none());
     }
 }
 
@@ -16271,11 +18844,28 @@ mod video_mcp_tests {
         .expect("project decodes")
     }
 
+    fn project_with_tracks(tracks: serde_json::Value) -> super::VideoMcpProject {
+        super::video_mcp_project_from_value(&serde_json::json!({
+            "version": 1,
+            "name": "parity",
+            "settings": {
+                "width": 1920,
+                "height": 1080,
+                "fps": 30,
+                "background": "#000000",
+            },
+            "tracks": tracks,
+            "updatedAtMs": 0,
+        }))
+        .expect("parity project decodes")
+    }
+
     fn edit_state(project: &super::VideoMcpProject) -> super::VideoMcpEditState {
         super::VideoMcpEditState {
             next_clip_seq: super::video_mcp_project_clip_count(project).saturating_add(1),
             next_link_seq: 1,
             changed_clip_ids: std::collections::BTreeSet::new(),
+            effective_ranges: Vec::new(),
             summaries: Vec::new(),
         }
     }
@@ -16624,6 +19214,261 @@ mod video_mcp_tests {
     }
 
     #[test]
+    fn video_mcp_ripple_delete_range_rejects_locked_link_partner_atomically() {
+        let mut project = project_with_clip(serde_json::json!({ "linkId": "link-1" }));
+        project.tracks[1].locked = true;
+        project.tracks[1].clips.push(super::VideoMcpClip {
+            id: "audio-1".to_string(),
+            asset_path: "media/assets/a.mp4".to_string(),
+            timeline_start_ms: 1000,
+            duration_ms: 4000,
+            source_in_ms: 500,
+            speed: 1.0,
+            link_id: "link-1".to_string(),
+            ..super::VideoMcpClip::default()
+        });
+        let before = super::video_mcp_project_to_value(&project).expect("project value");
+        let mut state = edit_state(&project);
+
+        let error = super::video_mcp_ripple_delete_range(&mut project, 2000, 3000, &mut state)
+            .expect_err("locked linked ripple must fail");
+
+        assert!(error.contains("partner track is locked"), "{error}");
+        assert_eq!(
+            super::video_mcp_project_to_value(&project).expect("project value"),
+            before
+        );
+        assert!(state.changed_clip_ids.is_empty());
+    }
+
+    #[test]
+    fn video_mcp_parity_link_group_remove_uses_union_interval() {
+        let mut project = project_with_tracks(serde_json::json!([
+            {
+                "id": "v1",
+                "kind": "video",
+                "clips": [
+                    { "id": "v", "assetPath": "a.mp4", "timelineStartMs": 1000, "durationMs": 4000, "linkId": "group" }
+                ]
+            },
+            {
+                "id": "a1",
+                "kind": "audio",
+                "clips": [
+                    { "id": "a-left", "assetPath": "a.mp3", "timelineStartMs": 1000, "durationMs": 1000, "linkId": "group" },
+                    { "id": "a-right", "assetPath": "a.mp3", "timelineStartMs": 3000, "durationMs": 1000, "linkId": "group" },
+                    { "id": "a-follow", "assetPath": "b.mp3", "timelineStartMs": 5500, "durationMs": 500 }
+                ]
+            }
+        ]));
+        let (root, media_root) = temp_video_root();
+        let ops = serde_json::json!([{
+            "op": "remove",
+            "clipIds": ["a-left"],
+            "ripple": true
+        }]);
+
+        let state = super::video_mcp_apply_ops(
+            &mut project,
+            &root,
+            &media_root,
+            ops.as_array().expect("ops"),
+            None,
+        )
+        .expect("ripple remove");
+
+        assert!(project.tracks[0].clips.is_empty());
+        let audio = &project.tracks[1].clips;
+        assert_eq!(audio.len(), 1);
+        assert_eq!(audio[0].id, "a-follow");
+        assert_eq!(audio[0].timeline_start_ms, 1500);
+        assert_eq!(audio[0].duration_ms, 500);
+        assert_eq!(state.effective_ranges, vec![(1000, 5000)]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn video_mcp_parity_sub_minimum_word_remnant_expands_effective_range() {
+        let mut project = project_with_tracks(serde_json::json!([{
+            "id": "v1",
+            "kind": "video",
+            "clips": [{
+                "id": "fast",
+                "assetPath": "media/assets/fast.mp4",
+                "timelineStartMs": 0,
+                "durationMs": 1000,
+                "sourceInMs": 0,
+                "speed": 2
+            }]
+        }]));
+        let mut state = edit_state(&project);
+
+        let ranges = super::video_mcp_remove_word_spans(
+            &mut project,
+            "media/assets/fast.mp4",
+            vec![(100, 300)],
+            &mut state,
+        )
+        .expect("remove fast word");
+
+        assert_eq!(ranges, vec![(0, 150)]);
+        assert_eq!(state.effective_ranges, vec![(0, 150)]);
+        let clips = &project.tracks[0].clips;
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0].timeline_start_ms, 0);
+        assert_eq!(clips[0].duration_ms, 850);
+        assert_eq!(clips[0].source_in_ms, 300);
+    }
+
+    #[test]
+    fn video_mcp_parity_locked_word_mapping_aborts_every_range() {
+        let mut project = project_with_tracks(serde_json::json!([
+            {
+                "id": "v1",
+                "kind": "video",
+                "clips": [{
+                    "id": "open-source",
+                    "assetPath": "media/assets/a.mp4",
+                    "timelineStartMs": 0,
+                    "durationMs": 1000,
+                    "sourceInMs": 0,
+                    "speed": 1
+                }]
+            },
+            {
+                "id": "v2",
+                "kind": "video",
+                "locked": true,
+                "clips": [{
+                    "id": "locked-source",
+                    "assetPath": "media/assets/a.mp4",
+                    "timelineStartMs": 2000,
+                    "durationMs": 1000,
+                    "sourceInMs": 1000,
+                    "speed": 1
+                }]
+            }
+        ]));
+        let before = super::video_mcp_project_to_value(&project).expect("before");
+        let mut state = edit_state(&project);
+
+        let error = super::video_mcp_remove_word_spans(
+            &mut project,
+            "media/assets/a.mp4",
+            vec![(100, 250), (1100, 1250)],
+            &mut state,
+        )
+        .expect_err("locked source mapping must abort");
+
+        assert!(error.contains("track v2 is locked"), "{error}");
+        assert_eq!(
+            super::video_mcp_project_to_value(&project).expect("after"),
+            before
+        );
+        assert!(state.changed_clip_ids.is_empty());
+        assert!(state.effective_ranges.is_empty());
+        assert_eq!(project.tracks[0].clips[0].duration_ms, 1000);
+    }
+
+    #[test]
+    fn video_mcp_parity_short_twin_closes_over_long_partner_track() {
+        let mut project = project_with_tracks(serde_json::json!([
+            {
+                "id": "v1",
+                "kind": "video",
+                "clips": [
+                    { "id": "short", "assetPath": "a.mp4", "timelineStartMs": 0, "durationMs": 1000, "linkId": "pair" },
+                    { "id": "video-follow", "assetPath": "b.mp4", "timelineStartMs": 5000, "durationMs": 500 }
+                ]
+            },
+            {
+                "id": "a1",
+                "kind": "audio",
+                "clips": [
+                    { "id": "long", "assetPath": "a.mp3", "timelineStartMs": 0, "durationMs": 4000, "linkId": "pair" },
+                    { "id": "audio-follow", "assetPath": "b.mp3", "timelineStartMs": 5000, "durationMs": 500 }
+                ]
+            }
+        ]));
+        let track_ids = ["v1".to_string()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut state = edit_state(&project);
+
+        super::video_mcp_ripple_delete_range_scoped(
+            &mut project,
+            2000,
+            3000,
+            Some(&track_ids),
+            &mut state,
+        )
+        .expect("scoped linked ripple");
+
+        let video = &project.tracks[0].clips;
+        assert_eq!(video[0].id, "short");
+        assert_eq!((video[0].timeline_start_ms, video[0].duration_ms), (0, 1000));
+        assert_eq!(video[1].id, "video-follow");
+        assert_eq!((video[1].timeline_start_ms, video[1].duration_ms), (4000, 500));
+        let audio = &project.tracks[1].clips;
+        assert_eq!((audio[0].timeline_start_ms, audio[0].duration_ms), (0, 2000));
+        assert_eq!((audio[1].timeline_start_ms, audio[1].duration_ms), (2000, 1000));
+        assert_eq!(audio[1].source_in_ms, 3000);
+        assert_eq!(audio[2].id, "audio-follow");
+        assert_eq!((audio[2].timeline_start_ms, audio[2].duration_ms), (4000, 500));
+    }
+
+    #[test]
+    fn video_mcp_parity_wholly_right_member_joins_complete_right_cohort() {
+        let mut project = project_with_tracks(serde_json::json!([
+            {
+                "id": "v1",
+                "kind": "video",
+                "clips": [{ "id": "v-long", "assetPath": "a.mp4", "timelineStartMs": 1000, "durationMs": 4000, "linkId": "triple" }]
+            },
+            {
+                "id": "a1",
+                "kind": "audio",
+                "clips": [{ "id": "a-long", "assetPath": "a.mp3", "timelineStartMs": 1000, "durationMs": 4000, "linkId": "triple" }]
+            },
+            {
+                "id": "v2",
+                "kind": "video",
+                "clips": [{ "id": "v-right", "assetPath": "overlay.mp4", "timelineStartMs": 4000, "durationMs": 1000, "linkId": "triple" }]
+            }
+        ]));
+        let track_ids = ["v1".to_string()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut state = edit_state(&project);
+
+        super::video_mcp_ripple_delete_range_scoped(
+            &mut project,
+            2000,
+            3000,
+            Some(&track_ids),
+            &mut state,
+        )
+        .expect("scoped triple ripple");
+
+        let v1 = &project.tracks[0].clips;
+        let a1 = &project.tracks[1].clips;
+        let v2 = &project.tracks[2].clips;
+        assert_eq!((v1[0].timeline_start_ms, v1[0].duration_ms), (1000, 1000));
+        assert_eq!((a1[0].timeline_start_ms, a1[0].duration_ms), (1000, 1000));
+        assert_eq!(v1[0].link_id, "triple");
+        assert_eq!(a1[0].link_id, "triple");
+        assert_eq!((v1[1].timeline_start_ms, v1[1].duration_ms), (2000, 2000));
+        assert_eq!((a1[1].timeline_start_ms, a1[1].duration_ms), (2000, 2000));
+        assert_eq!(v1[1].source_in_ms, 2000);
+        assert_eq!(a1[1].source_in_ms, 2000);
+        assert_eq!((v2[0].timeline_start_ms, v2[0].duration_ms), (3000, 1000));
+        assert!(!v1[1].link_id.is_empty());
+        assert_ne!(v1[1].link_id, "triple");
+        assert_eq!(v1[1].link_id, a1[1].link_id);
+        assert_eq!(v1[1].link_id, v2[0].link_id);
+    }
+
+    #[test]
     fn video_mcp_remove_words_two_adjacent_words_merge_into_one_ripple() {
         let mut project = project_with_clip(serde_json::json!({}));
         let mut state = edit_state(&project);
@@ -16641,6 +19486,187 @@ mod video_mcp_tests {
             .map(|clip| clip.duration_ms)
             .sum();
         assert_eq!(total, 3600);
+    }
+
+    #[test]
+    fn video_mcp_remove_words_merge_gap_is_120ms_inclusive() {
+        assert_eq!(super::VIDEO_MCP_REMOVE_WORDS_MERGE_GAP_MS, 120);
+        let cases = [
+            (79, vec![(1000, 1279)], 4721),
+            (80, vec![(1000, 1280)], 4720),
+            (100, vec![(1000, 1300)], 4700),
+            (120, vec![(1000, 1320)], 4680),
+            (121, vec![(1000, 1100), (1221, 1321)], 4800),
+        ];
+        for (gap_ms, expected_ranges, expected_duration_ms) in cases {
+            let mut project = project_with_tracks(serde_json::json!([{
+                "id": "v1",
+                "kind": "video",
+                "clips": [{
+                    "id": format!("source-{gap_ms}"),
+                    "assetPath": "media/assets/gaps.mp4",
+                    "timelineStartMs": 0,
+                    "durationMs": 5000,
+                    "sourceInMs": 0,
+                    "speed": 1
+                }]
+            }]));
+            let mut state = edit_state(&project);
+            let ranges = super::video_mcp_remove_word_spans(
+                &mut project,
+                "media/assets/gaps.mp4",
+                vec![(1000, 1100), (1100 + gap_ms, 1200 + gap_ms)],
+                &mut state,
+            )
+            .unwrap_or_else(|error| panic!("gap {gap_ms}: {error}"));
+            assert_eq!(ranges, expected_ranges, "gap {gap_ms}");
+            assert_eq!(state.effective_ranges, expected_ranges, "gap {gap_ms}");
+            assert_eq!(
+                project.tracks[0]
+                    .clips
+                    .iter()
+                    .map(|clip| clip.duration_ms)
+                    .sum::<u64>(),
+                expected_duration_ms,
+                "gap {gap_ms}"
+            );
+        }
+    }
+
+    #[test]
+    fn video_mcp_remove_words_outside_asset_leaves_project_untouched() {
+        let mut project = project_with_clip(serde_json::json!({}));
+        let before = super::video_mcp_project_to_value(&project).expect("project before");
+        let mut state = edit_state(&project);
+
+        let error = super::video_mcp_remove_word_spans(
+            &mut project,
+            "media/assets/not-on-timeline.mp4",
+            vec![(500, 700)],
+            &mut state,
+        )
+        .expect_err("missing asset mapping must fail");
+
+        assert!(error.contains("outside all clips"), "{error}");
+        assert_eq!(
+            super::video_mcp_project_to_value(&project).expect("project after"),
+            before
+        );
+        assert!(state.changed_clip_ids.is_empty());
+    }
+
+    #[test]
+    fn video_mcp_remove_words_linked_pair_ripples_once_and_relinks_tails() {
+        let mut project = project_with_clip(serde_json::json!({ "linkId": "link-1" }));
+        project.tracks[1].clips.push(super::VideoMcpClip {
+            id: "audio-1".to_string(),
+            asset_path: "media/assets/a.mp4".to_string(),
+            timeline_start_ms: 1000,
+            duration_ms: 4000,
+            source_in_ms: 500,
+            speed: 1.0,
+            link_id: "link-1".to_string(),
+            ..super::VideoMcpClip::default()
+        });
+        let before_end = project
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips.iter())
+            .map(super::video_mcp_clip_end)
+            .max()
+            .unwrap_or(0);
+        let mut state = edit_state(&project);
+
+        let ranges = super::video_mcp_remove_word_spans(
+            &mut project,
+            "media/assets/a.mp4",
+            vec![(1500, 1700)],
+            &mut state,
+        )
+        .expect("remove linked word span");
+
+        assert_eq!(ranges, vec![(2000, 2200)]);
+        let after_end = project
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips.iter())
+            .map(super::video_mcp_clip_end)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(before_end.saturating_sub(after_end), 200);
+        let video = clips(&project, "video");
+        let audio = clips(&project, "audio");
+        assert_eq!(video.iter().map(|clip| clip.duration_ms).sum::<u64>(), 3800);
+        assert_eq!(audio.iter().map(|clip| clip.duration_ms).sum::<u64>(), 3800);
+        assert_eq!(video.len(), 2);
+        assert_eq!(audio.len(), 2);
+        assert!(!video[1].link_id.is_empty());
+        assert_eq!(video[1].link_id, audio[1].link_id);
+        assert_ne!(video[1].link_id, "link-1");
+    }
+
+    #[test]
+    fn video_mcp_remove_words_unions_overlapping_timeline_mappings() {
+        let mut project = project_with_clip(serde_json::json!({
+            "timelineStartMs": 0,
+            "durationMs": 1000,
+            "sourceInMs": 0,
+            "linkId": "link-1"
+        }));
+        project.tracks[1].clips.push(super::VideoMcpClip {
+            id: "audio-1".to_string(),
+            asset_path: "media/assets/a.mp4".to_string(),
+            duration_ms: 1000,
+            speed: 1.0,
+            link_id: "link-1".to_string(),
+            ..super::VideoMcpClip::default()
+        });
+        let second_video = super::VideoMcpClip {
+            id: "video-2".to_string(),
+            asset_path: "media/assets/a.mp4".to_string(),
+            timeline_start_ms: 100,
+            duration_ms: 1000,
+            speed: 1.0,
+            link_id: "link-2".to_string(),
+            ..super::VideoMcpClip::default()
+        };
+        let second_audio = super::VideoMcpClip {
+            id: "audio-2".to_string(),
+            ..second_video.clone()
+        };
+        project.tracks.push(super::VideoMcpTrack {
+            id: "v2".to_string(),
+            kind: "video".to_string(),
+            label: "V2".to_string(),
+            clips: vec![second_video],
+            ..super::VideoMcpTrack::default()
+        });
+        project.tracks.push(super::VideoMcpTrack {
+            id: "a2".to_string(),
+            kind: "audio".to_string(),
+            label: "A2".to_string(),
+            clips: vec![second_audio],
+            ..super::VideoMcpTrack::default()
+        });
+        let mut state = edit_state(&project);
+
+        let ranges = super::video_mcp_remove_word_spans(
+            &mut project,
+            "media/assets/a.mp4",
+            vec![(500, 700)],
+            &mut state,
+        )
+        .expect("remove overlapping word mappings");
+
+        assert_eq!(ranges, vec![(500, 800)]);
+        let after_end = project
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips.iter())
+            .map(super::video_mcp_clip_end)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(after_end, 800);
     }
 
     #[test]
@@ -16757,8 +19783,8 @@ mod video_mcp_tests {
             .scale = 1.25;
 
         let project_value = super::video_mcp_project_to_value(&project).expect("project value");
-        let (media_clips, _text_clips, _total_ms) =
-            super::video_collect_export_clips(&root, &media_root, &project_value, None)
+        let (media_clips, _text_clips, _total_ms, _warnings) =
+            super::video_collect_export_clips(&root, &media_root, &project_value, None, None)
                 .expect("collect export clips");
         let visual_layers = media_clips
             .iter()
@@ -17415,6 +20441,10 @@ c media/assets/a.mp4 at=0
     #[test]
     fn video_pipe_export_animated_scale_uses_project_fit_basis() {
         let clip = super::VideoExportMediaClip {
+            clip_id: "c1".to_string(),
+            link_id: String::new(),
+            track_id: "v1".to_string(),
+            track_order: 0,
             input_index: 0,
             kind: "image".to_string(),
             abs_path: std::path::PathBuf::from("media/assets/still.png"),
@@ -17446,6 +20476,11 @@ c media/assets/a.mp4 at=0
                 value: 1.0,
                 easing: "linear".to_string(),
             }],
+            fx: super::VideoTier1Fx::default(),
+            crop: super::VideoTier1Crop::default(),
+            lut_abs: None,
+            supports_colortemperature: false,
+            transition_after: None,
             has_audio: false,
         };
         let (filter, _, _) = super::video_build_export_filter(
@@ -17471,6 +20506,10 @@ c media/assets/a.mp4 at=0
     #[test]
     fn video_pipe_render_frame_window_seeks_late_clip() {
         let clip = super::VideoExportMediaClip {
+            clip_id: "c1".to_string(),
+            link_id: String::new(),
+            track_id: "v1".to_string(),
+            track_order: 0,
             input_index: 0,
             kind: "video".to_string(),
             abs_path: std::path::PathBuf::from("media/assets/long.mp4"),
@@ -17490,6 +20529,11 @@ c media/assets/a.mp4 at=0
             x_keyframes: Vec::new(),
             y_keyframes: Vec::new(),
             scale_keyframes: Vec::new(),
+            fx: super::VideoTier1Fx::default(),
+            crop: super::VideoTier1Crop::default(),
+            lut_abs: None,
+            supports_colortemperature: false,
+            transition_after: None,
             has_audio: false,
         };
         let (clips, _texts, input_seek_ms, render_seek_ms, total_ms) =
@@ -17508,6 +20552,10 @@ c media/assets/a.mp4 at=0
     #[test]
     fn video_pipe_range_export_rebases_gain_with_boundary_keyframe() {
         let clip = super::VideoExportMediaClip {
+            clip_id: "c1".to_string(),
+            link_id: String::new(),
+            track_id: "v1".to_string(),
+            track_order: 0,
             input_index: 0,
             kind: "video".to_string(),
             abs_path: std::path::PathBuf::from("media/assets/gain.mp4"),
@@ -17527,6 +20575,11 @@ c media/assets/a.mp4 at=0
             x_keyframes: Vec::new(),
             y_keyframes: Vec::new(),
             scale_keyframes: Vec::new(),
+            fx: super::VideoTier1Fx::default(),
+            crop: super::VideoTier1Crop::default(),
+            lut_abs: None,
+            supports_colortemperature: false,
+            transition_after: None,
             has_audio: true,
         };
 

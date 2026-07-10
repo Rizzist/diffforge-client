@@ -24370,6 +24370,7 @@ export default function App() {
     activeScope,
     accountKey: authAccountKey,
     entitlements: authEntitlements,
+    billingStatus: persistedBillingStatus,
   } = useAuthSnapshot();
   const resolvedTokenomicsAccountKey = authAccountKey || user?.id || user?.email || "";
   const [apiState, setApiState] = useState("checking");
@@ -36512,6 +36513,32 @@ export default function App() {
     () => billingPlanNameFromStatus(billingStatus, user),
     [billingStatus, user],
   );
+  // Seed billing status from the persisted auth snapshot so the free-plan
+  // upsell can decide from local state alone. Free accounts run permanently
+  // offline (they never open the account websocket), so gating the upsell on
+  // the live /v1/billing/status fetch strands it whenever that request is slow
+  // or fails — the exact cohort we most want to reach. The plan is knowable
+  // offline from the auth session (only the credit *balance* needs the
+  // network), so we hydrate a last-known/synthesized snapshot and mark it
+  // ready. Paid accounts are left alone: they connect the websocket and get
+  // live credit data, and seeding a stale snapshot could mistime their
+  // low-credits startup decision.
+  useEffect(() => {
+    if (authState !== "authenticated" || userIsPaid) {
+      return;
+    }
+    if (billingStatus || billingStatusState === "ready") {
+      return;
+    }
+    const seededBillingStatus = persistedBillingStatus
+      && typeof persistedBillingStatus === "object"
+      && Object.keys(persistedBillingStatus).length
+      ? persistedBillingStatus
+      : { planName: "free", planStatus: "free" };
+    setBillingStatus(seededBillingStatus);
+    setBillingStatusState("ready");
+    setBillingStatusError("");
+  }, [authState, userIsPaid, billingStatus, billingStatusState, persistedBillingStatus]);
   const billingCredits = billingStatus?.credits || null;
   const billingRemainingCredits = Number(billingCredits?.termRemainingCredits || 0);
   const billingCreditPercent = creditUsagePercent(billingCredits);

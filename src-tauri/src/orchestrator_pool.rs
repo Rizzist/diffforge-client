@@ -585,7 +585,12 @@ async fn orchestrator_pool_deliver(
     state: &CloudMcpState,
     event: &Value,
 ) -> Result<Value, String> {
-    let prompt = orchestrator_pool_prompt_text(event);
+    let prompt = todo_dispatch_text_with_remote_attachments(
+        orchestrator_pool_prompt_text(event),
+        event,
+        CLOUD_MCP_APP_CONTROL_WORKSPACE_ID,
+    )
+    .await;
     if prompt.is_empty() {
         return Err("orchestrator send message is empty".to_string());
     }
@@ -764,7 +769,7 @@ pub(crate) fn orchestrator_pool_apply_remote_send_lever(
     }
     let workspace_id = cloud_mcp_remote_command_field_text(event, &["workspace_id", "workspaceId"])
         .unwrap_or_default();
-    if !workspace_id.trim().is_empty() {
+    if !workspace_id.trim().is_empty() && !cloud_mcp_is_app_control_workspace_id(&workspace_id) {
         return false;
     }
     let app = app.clone();

@@ -695,6 +695,7 @@ export default function AssetPanel({
   onDeleted,
   onOpenAsset,
   onOpenTranscript,
+  onReprobe,
   paneToken = "video-pane",
   repoPath = "",
 }) {
@@ -990,6 +991,11 @@ export default function AssetPanel({
         return;
       }
       setError("");
+      const durationMs = Number(asset.durationMs);
+      if (asset.kind === "video" && (!Number.isFinite(durationMs) || durationMs <= 0)) {
+        setError("source duration unknown — reprobe the asset");
+        return;
+      }
       setStartedUpscaleId(model.id);
       invoke("video_generate_start", {
         repoPath,
@@ -1000,7 +1006,17 @@ export default function AssetPanel({
           mode: asset.kind === "video" ? "upscale-video" : "upscale-image",
           prompt: "",
           inputAssetPaths: [asset.path],
-          params: { durationSec: null, aspect: null, resolution: null, quality: null, numImages: null, seed: null },
+          params: {
+            durationSec:
+              asset.kind === "video"
+                ? durationMs / 1000
+                : null,
+            aspect: null,
+            resolution: null,
+            quality: null,
+            numImages: null,
+            seed: null,
+          },
           loraId: null,
           auth: { apiKey: "", secretKey: "", baseUrl: "" },
         },
@@ -1034,7 +1050,12 @@ export default function AssetPanel({
   }
 
   const resClass = resolutionClass(asset.width, asset.height);
-  const durationSecEstimate = Math.max(1, Math.round((Number(asset.durationMs) || 0) / 1000));
+  const assetDurationMs = Number(asset.durationMs);
+  const videoDurationKnown = asset.kind !== "video"
+    || (Number.isFinite(assetDurationMs) && assetDurationMs > 0);
+  const durationSecEstimate = asset.kind === "video" && videoDurationKnown
+    ? assetDurationMs / 1000
+    : 1;
   const polishBusy = Boolean(polishJob && !polishJob.done);
   const annotation = annotationInfo?.annotation || null;
   const annotationAvailable = Boolean(annotationInfo?.available && annotation);
@@ -1415,15 +1436,29 @@ export default function AssetPanel({
             Runs through your cloud — the result lands in Versions next to the original
             {asset.kind === "video" && resClass ? ` (currently ${resClass})` : ""}.
           </VideoHint>
+          {asset.kind === "video" && !videoDurationKnown ? (
+            <InlineRow>
+              <VideoHint>Source duration unknown — reprobe the asset before upscaling.</VideoHint>
+              {onReprobe ? (
+                <VideoSecondaryButton onClick={onReprobe} type="button">
+                  Reprobe asset
+                </VideoSecondaryButton>
+              ) : null}
+            </InlineRow>
+          ) : null}
           {upscalers.map((model) => {
-            const credits = estimateModelCredits(model, { durationSec: durationSecEstimate });
+            const credits = videoDurationKnown
+              ? estimateModelCredits(model, { durationSec: durationSecEstimate })
+              : null;
             return (
               <UpscaleRow key={model.id}>
                 <UpscaleInfo>
                   <b>{model.displayName}</b>
                   <span>
                     {model.providerLabel}
-                    {credits != null ? ` · ≈ ${credits.toLocaleString()} credits` : ""}
+                    {credits != null
+                      ? ` · ≈ ${credits.toLocaleString()} credits · validated provider outputs`
+                      : ""}
                   </span>
                 </UpscaleInfo>
                 <SpeedBadge $speed={model.caps.speed}>{model.caps.speed}</SpeedBadge>

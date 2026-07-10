@@ -3,6 +3,14 @@ import test from "node:test";
 
 import {
   addCaptionsForClip,
+  addTransition,
+  clampTransitionDurationMs,
+  cubicBezierEase,
+  normalizeCrop,
+  normalizeFx,
+  normalizeWords,
+  removeTransition,
+  setTransitionDuration,
   addMediaClip,
   addTextClip,
   addTrack,
@@ -26,6 +34,7 @@ import {
   projectDurationMs,
   removeClip,
   removeClips,
+  RIPPLE_DELETE_WORDS_MERGE_GAP_MS,
   rippleDeleteClip,
   rippleDeleteRange,
   rippleDeleteWords,
@@ -36,6 +45,7 @@ import {
   snapMs,
   splitClip,
   splitLinkedAt,
+  trimClips,
   trimClipEnd,
   trimClipStart,
   unlinkClip,
@@ -310,6 +320,100 @@ test("ripple delete closes the gap on the same track", () => {
   assert.equal(clips[0].timelineStartMs, 3000); // 7000 - 4000
 });
 
+test("linked ripple delete removes the whole group and ripples each member track once", () => {
+  let project = projectWithClip(); // linked pair at 1000..5000
+  const audio = addMediaClip(
+    project,
+    { path: "media/assets/a.mp4", kind: "audio", durationMs: 4000 },
+    { timelineStartMs: 1000 },
+  );
+  project = linkClips(audio.project, ["clip-1", audio.clipId]);
+  const videoFollower = addMediaClip(
+    project,
+    { path: "media/assets/b.mp4", kind: "video", durationMs: 2000 },
+    { timelineStartMs: 7000 },
+  );
+  const audioFollower = addMediaClip(
+    videoFollower.project,
+    { path: "media/assets/b.mp3", kind: "audio", durationMs: 2000 },
+    { timelineStartMs: 7000 },
+  );
+
+  const next = rippleDeleteClip(audioFollower.project, "clip-1");
+  const video = next.tracks.find((track) => track.kind === "video").clips;
+  const audioClips = next.tracks.find((track) => track.kind === "audio").clips;
+  assert.deepEqual(video.map((clip) => clip.id), [videoFollower.clipId]);
+  assert.deepEqual(audioClips.map((clip) => clip.id), [audioFollower.clipId]);
+  assert.equal(video[0].timelineStartMs, 3000);
+  assert.equal(audioClips[0].timelineStartMs, 3000);
+  assert.equal(projectDurationMs(next), 5000);
+});
+
+test("asymmetric linked ripple delete is selection-independent and shifts title tracks globally", () => {
+  const project = normalizeProject({
+    tracks: [
+      {
+        id: "v1",
+        kind: "video",
+        clips: [
+          { id: "video-twin", assetPath: "a.mp4", timelineStartMs: 1000, durationMs: 4000, linkId: "pair" },
+          { id: "video-follower", assetPath: "b.mp4", timelineStartMs: 5500, durationMs: 1000 },
+        ],
+      },
+      {
+        id: "a1",
+        kind: "audio",
+        clips: [
+          { id: "audio-twin", assetPath: "a.mp3", timelineStartMs: 1000, durationMs: 2000, linkId: "pair" },
+          { id: "audio-follower", assetPath: "b.mp3", timelineStartMs: 5200, durationMs: 1000 },
+        ],
+      },
+      {
+        id: "t1",
+        kind: "text",
+        clips: [{ id: "title", text: "Title", timelineStartMs: 7000, durationMs: 1000 }],
+      },
+    ],
+  });
+
+  const fromVideo = rippleDeleteClip(project, "video-twin");
+  const fromAudio = rippleDeleteClip(project, "audio-twin");
+  assert.deepEqual(fromVideo, fromAudio);
+  assert.equal(fromVideo.tracks.find((track) => track.id === "t1").clips[0].timelineStartMs, 3000);
+  const audio = fromVideo.tracks.find((track) => track.id === "a1").clips;
+  assert.deepEqual(audio.map((clip) => clip.id), ["audio-follower"]);
+  assert.equal(audio[0].timelineStartMs, 1200);
+  for (let index = 1; index < audio.length; index += 1) {
+    assert.ok(audio[index - 1].timelineStartMs + audio[index - 1].durationMs <= audio[index].timelineStartMs);
+  }
+});
+
+test("linked ripple delete uses the union for multiple members on one track", () => {
+  const project = normalizeProject({
+    tracks: [
+      {
+        id: "v1",
+        kind: "video",
+        clips: [{ id: "v", assetPath: "a.mp4", timelineStartMs: 1000, durationMs: 4000, linkId: "group" }],
+      },
+      {
+        id: "a1",
+        kind: "audio",
+        clips: [
+          { id: "a-left", assetPath: "a.mp3", timelineStartMs: 1000, durationMs: 1000, linkId: "group" },
+          { id: "a-right", assetPath: "a.mp3", timelineStartMs: 3000, durationMs: 1000, linkId: "group" },
+          { id: "a-follow", assetPath: "b.mp3", timelineStartMs: 5500, durationMs: 500 },
+        ],
+      },
+    ],
+  });
+  const fromLeft = rippleDeleteClip(project, "a-left");
+  const fromRight = rippleDeleteClip(project, "a-right");
+  assert.deepEqual(fromLeft, fromRight);
+  assert.deepEqual(fromLeft.tracks.find((track) => track.id === "a1").clips.map((clip) => clip.id), ["a-follow"]);
+  assert.equal(fromLeft.tracks.find((track) => track.id === "a1").clips[0].timelineStartMs, 1500);
+});
+
 test("snap points include zero, clip edges, and extras; snapMs respects threshold", () => {
   const project = projectWithClip(); // edges at 1000 and 5000
   const points = collectSnapPoints(project, [], [2500]);
@@ -403,6 +507,246 @@ test("copy/paste round-trips clips with fresh ids and remapped links", () => {
   assert.notEqual(pastedVideo.linkId, videoClips[0].linkId);
 });
 
+test("linked paste uses one placement delta when only one member track collides", () => {
+  let project = projectWithClip(); // source pair at 1000..5000
+  const audio = addMediaClip(
+    project,
+    { path: "media/assets/a.mp4", kind: "audio", durationMs: 4000 },
+    { timelineStartMs: 1000 },
+  );
+  project = linkClips(audio.project, ["clip-1", audio.clipId]);
+  const payload = serializeClips(project, ["clip-1"]);
+  const blocker = addMediaClip(
+    project,
+    { path: "media/assets/blocker.mp4", kind: "video", durationMs: 1000 },
+    { timelineStartMs: 6000 },
+  );
+
+  const pasted = pasteClips(blocker.project, payload, 6000);
+  const pastedClips = pasted.clipIds.map((id) =>
+    pasted.project.tracks.flatMap((track) => track.clips).find((clip) => clip.id === id),
+  );
+  assert.equal(pastedClips.length, 2);
+  assert.equal(pastedClips[0].timelineStartMs, 7000);
+  assert.equal(pastedClips[1].timelineStartMs, 7000);
+  assert.equal(pastedClips[0].timelineStartMs - 1000, pastedClips[1].timelineStartMs - 1000);
+  assert.ok(pastedClips[0].linkId);
+  assert.equal(pastedClips[0].linkId, pastedClips[1].linkId);
+});
+
+test("linked group drag placement keeps one delta when only one member track collides", () => {
+  let project = projectWithClip(); // source pair at 1000..5000
+  const audio = addMediaClip(
+    project,
+    { path: "media/assets/a.mp4", kind: "audio", durationMs: 4000 },
+    { timelineStartMs: 1000 },
+  );
+  project = linkClips(audio.project, ["clip-1", audio.clipId]);
+  project = addMediaClip(
+    project,
+    { path: "media/assets/blocker.mp4", kind: "video", durationMs: 1000 },
+    { timelineStartMs: 6000 },
+  ).project;
+
+  const moved = moveClips(project, ["clip-1", audio.clipId], 5000);
+  const video = moved.tracks.find((track) => track.kind === "video").clips.find((clip) => clip.id === "clip-1");
+  const audioClip = moved.tracks.find((track) => track.kind === "audio").clips.find((clip) => clip.id === audio.clipId);
+  assert.equal(video.timelineStartMs, 7000);
+  assert.equal(audioClip.timelineStartMs, 7000);
+});
+
+test("linked group drag resolves every alternating collision and is atomic across locks", () => {
+  const target = (id, linkId) => ({
+    id,
+    assetPath: `media/assets/${id}.mp4`,
+    timelineStartMs: 0,
+    durationMs: 100,
+    linkId,
+  });
+  const blocker = (index) => ({
+    id: `blocker-${index}`,
+    assetPath: `media/assets/blocker-${index}.mp4`,
+    timelineStartMs: (index + 1) * 100,
+    durationMs: 100,
+  });
+  const project = normalizeProject({
+    tracks: [
+      {
+        id: "v1",
+        kind: "video",
+        clips: [target("video-target", "link-many"), ...Array.from({ length: 12 }, (_, index) => index % 2 === 0 ? blocker(index) : null).filter(Boolean)],
+      },
+      {
+        id: "a1",
+        kind: "audio",
+        clips: [target("audio-target", "link-many"), ...Array.from({ length: 12 }, (_, index) => index % 2 === 1 ? blocker(index) : null).filter(Boolean)],
+      },
+    ],
+  });
+
+  const moved = moveClips(project, ["video-target", "audio-target"], 100);
+  const movedVideo = moved.tracks[0].clips.find((clip) => clip.id === "video-target");
+  const movedAudio = moved.tracks[1].clips.find((clip) => clip.id === "audio-target");
+  assert.equal(movedVideo.timelineStartMs, 1300);
+  assert.equal(movedAudio.timelineStartMs, 1300);
+
+  const locked = normalizeProject({
+    ...project,
+    tracks: project.tracks.map((track) => ({ ...track, locked: track.kind === "audio" })),
+  });
+  assert.equal(moveClips(locked, ["video-target", "audio-target"], 500), locked);
+});
+
+test("paste resolves every alternating collision with one payload-wide delta", () => {
+  const blocker = (index) => ({
+    id: `blocker-${index}`,
+    assetPath: `media/assets/blocker-${index}.mp4`,
+    timelineStartMs: (index + 1) * 100,
+    durationMs: 100,
+  });
+  const project = normalizeProject({
+    tracks: [
+      {
+        id: "v1",
+        kind: "video",
+        clips: Array.from({ length: 12 }, (_, index) => index % 2 === 0 ? blocker(index) : null).filter(Boolean),
+      },
+      {
+        id: "a1",
+        kind: "audio",
+        clips: Array.from({ length: 12 }, (_, index) => index % 2 === 1 ? blocker(index) : null).filter(Boolean),
+      },
+    ],
+  });
+  const payload = {
+    kind: "diffforge-video-clips",
+    baseMs: 0,
+    entries: [
+      { trackKind: "video", clip: { id: "source-v", assetPath: "v.mp4", timelineStartMs: 0, durationMs: 100 } },
+      { trackKind: "audio", clip: { id: "source-a", assetPath: "a.mp3", timelineStartMs: 0, durationMs: 100 } },
+    ],
+  };
+
+  const pasted = pasteClips(project, payload, 100);
+  const clips = pasted.clipIds.map((id) =>
+    pasted.project.tracks.flatMap((track) => track.clips).find((clip) => clip.id === id),
+  );
+  assert.deepEqual(clips.map((clip) => clip.timelineStartMs), [1300, 1300]);
+});
+
+test("serialize and paste preserve stacked V1/V2 overlays on their source lanes", () => {
+  const project = normalizeProject({
+    tracks: [
+      {
+        id: "v1",
+        kind: "video",
+        clips: [{ id: "base", assetPath: "base.mp4", timelineStartMs: 0, durationMs: 1000 }],
+      },
+      {
+        id: "v2",
+        kind: "video",
+        clips: [{ id: "overlay", assetPath: "overlay.mp4", timelineStartMs: 200, durationMs: 500 }],
+      },
+      { id: "a1", kind: "audio", clips: [] },
+    ],
+  });
+  const payload = serializeClips(project, ["base", "overlay"]);
+  assert.equal(payload.version, 2);
+  assert.deepEqual(payload.entries.map((entry) => entry.laneIndex), [0, 1]);
+
+  const pasted = pasteClips(project, payload, 5000);
+  const pastedBase = pasted.project.tracks[0].clips.find((clip) => pasted.clipIds.includes(clip.id));
+  const pastedOverlay = pasted.project.tracks[1].clips.find((clip) => pasted.clipIds.includes(clip.id));
+  assert.equal(pastedBase.timelineStartMs, 5000);
+  assert.equal(pastedOverlay.timelineStartMs, 5200);
+});
+
+test("paste aborts atomically when the required destination lane is locked", () => {
+  const source = normalizeProject({
+    tracks: [
+      { id: "v1", kind: "video", clips: [] },
+      {
+        id: "v2",
+        kind: "video",
+        clips: [{ id: "overlay", assetPath: "overlay.mp4", timelineStartMs: 0, durationMs: 500 }],
+      },
+    ],
+  });
+  const payload = serializeClips(source, ["overlay"]);
+  const destination = normalizeProject({
+    tracks: [
+      { id: "dest-v1", kind: "video", clips: [] },
+      { id: "dest-v2", kind: "video", locked: true, clips: [] },
+    ],
+  });
+
+  const result = pasteClips(destination, payload, 1000);
+  assert.equal(result.project, destination);
+  assert.deepEqual(result.clipIds, []);
+  assert.equal(result.blocked.reason, "locked-track");
+  assert.equal(result.blocked.trackId, "dest-v2");
+});
+
+test("paste clears the link id from a single copied group member", () => {
+  const project = makeStarterProject("paste orphan");
+  const payload = {
+    kind: "diffforge-video-clips",
+    version: 2,
+    baseMs: 0,
+    entries: [{
+      trackKind: "video",
+      laneIndex: 0,
+      clip: {
+        id: "orphan-source",
+        assetPath: "orphan.mp4",
+        timelineStartMs: 0,
+        durationMs: 500,
+        linkId: "source-link",
+      },
+    }],
+  };
+
+  const result = pasteClips(project, payload, 1000);
+  const clip = result.project.tracks.find((track) => track.kind === "video").clips[0];
+  assert.equal(clip.linkId, "");
+});
+
+test("legacy paste applies one delta to all entries and keeps twins in sync", () => {
+  const project = normalizeProject({
+    tracks: [
+      {
+        id: "v1",
+        kind: "video",
+        clips: [{ id: "blocker", assetPath: "blocker.mp4", timelineStartMs: 1000, durationMs: 1000 }],
+      },
+      { id: "a1", kind: "audio", clips: [] },
+    ],
+  });
+  const payload = {
+    kind: "diffforge-video-clips",
+    baseMs: 0,
+    entries: [
+      {
+        trackKind: "video",
+        clip: { id: "legacy-v", assetPath: "v.mp4", timelineStartMs: 0, durationMs: 500, linkId: "legacy-link" },
+      },
+      {
+        trackKind: "audio",
+        clip: { id: "legacy-a", assetPath: "a.mp3", timelineStartMs: 200, durationMs: 500, linkId: "legacy-link" },
+      },
+    ],
+  };
+
+  const result = pasteClips(project, payload, 1000);
+  const clips = result.clipIds.map((id) =>
+    result.project.tracks.flatMap((track) => track.clips).find((clip) => clip.id === id),
+  );
+  assert.deepEqual(clips.map((clip) => clip.timelineStartMs), [2000, 2200]);
+  assert.equal(clips[0].timelineStartMs, 0 + 2000);
+  assert.equal(clips[1].timelineStartMs, 200 + 2000);
+  assert.equal(clips[0].linkId, clips[1].linkId);
+});
+
 test("rippleTrim start edge keeps the clip anchored and closes the gap", () => {
   let project = projectWithClip({ timelineStartMs: 0, durationMs: 1000, sourceInMs: 0 });
   const later = addMediaClip(project, { path: "media/assets/b.mp4", kind: "video", durationMs: 1000 }, { timelineStartMs: 1000 });
@@ -454,6 +798,31 @@ test("rippleTrim closes the gap behind a shortened clip", () => {
   assert.equal(clips[1].timelineStartMs, 4000); // slid left by 1000
 });
 
+test("linked non-ripple and ripple trims preflight every locked member atomically", () => {
+  const project = normalizeProject({
+    tracks: [
+      {
+        id: "v1",
+        kind: "video",
+        clips: [{ id: "video", assetPath: "a.mp4", timelineStartMs: 0, durationMs: 2000, linkId: "pair" }],
+      },
+      {
+        id: "a1",
+        kind: "audio",
+        locked: true,
+        clips: [{ id: "audio", assetPath: "a.mp3", timelineStartMs: 0, durationMs: 2000, linkId: "pair" }],
+      },
+    ],
+  });
+
+  assert.equal(trimClips(project, ["video", "audio"], "start", 250), project);
+  assert.equal(trimClips(project, ["video", "audio"], "end", -250), project);
+  assert.equal(rippleTrim(project, "video", "start", 250), project);
+  assert.equal(rippleTrim(project, "video", "end", -250), project);
+  assert.equal(project.tracks[0].clips[0].durationMs, 2000);
+  assert.equal(project.tracks[1].clips[0].durationMs, 2000);
+});
+
 test("rippleDeleteRange trims straddlers and closes the gap across tracks", () => {
   let project = projectWithClip(); // video 1000..5000
   const audio = addMediaClip(project, { path: "media/assets/a.mp3", kind: "audio", durationMs: 6000 }, { timelineStartMs: 0 });
@@ -472,6 +841,90 @@ test("rippleDeleteRange trims straddlers and closes the gap across tracks", () =
   assert.equal(projectDurationMs(next), 5000);
 });
 
+test("rippleDeleteRange relinks the right fragments of a linked pair", () => {
+  let project = projectWithClip(); // video 1000..5000
+  const audio = addMediaClip(
+    project,
+    { path: "media/assets/a.mp4", kind: "audio", durationMs: 4000 },
+    { timelineStartMs: 1000 },
+  );
+  project = linkClips(audio.project, ["clip-1", audio.clipId]);
+  const videoTrack = project.tracks.find((track) => track.kind === "video");
+  const originalLinkId = videoTrack.clips[0].linkId;
+
+  const next = rippleDeleteRange(project, 2000, 3000, [videoTrack.id]);
+  const video = next.tracks.find((track) => track.kind === "video").clips;
+  const audioClips = next.tracks.find((track) => track.kind === "audio").clips;
+  assert.equal(video.length, 2);
+  assert.equal(audioClips.length, 2);
+  assert.equal(video[0].linkId, originalLinkId);
+  assert.equal(audioClips[0].linkId, originalLinkId);
+  assert.ok(video[1].linkId);
+  assert.equal(video[1].linkId, audioClips[1].linkId);
+  assert.notEqual(video[1].linkId, originalLinkId);
+});
+
+test("range closure follows a long twin when the scoped short twin ends before the range", () => {
+  const project = normalizeProject({
+    tracks: [
+      {
+        id: "v1",
+        kind: "video",
+        clips: [
+          { id: "short", assetPath: "a.mp4", timelineStartMs: 0, durationMs: 1000, linkId: "pair" },
+          { id: "video-follow", assetPath: "b.mp4", timelineStartMs: 5000, durationMs: 500 },
+        ],
+      },
+      {
+        id: "a1",
+        kind: "audio",
+        clips: [
+          { id: "long", assetPath: "a.mp3", timelineStartMs: 0, durationMs: 4000, linkId: "pair" },
+          { id: "audio-follow", assetPath: "b.mp3", timelineStartMs: 5000, durationMs: 500 },
+        ],
+      },
+    ],
+  });
+
+  const next = rippleDeleteRange(project, 2000, 3000, ["v1"]);
+  assert.equal(next.tracks.find((track) => track.id === "v1").clips.find((clip) => clip.id === "video-follow").timelineStartMs, 4000);
+  assert.equal(next.tracks.find((track) => track.id === "a1").clips.find((clip) => clip.id === "audio-follow").timelineStartMs, 4000);
+  const audioTail = next.tracks.find((track) => track.id === "a1").clips.find((clip) => clip.timelineStartMs === 2000);
+  assert.equal(audioTail.durationMs, 1000);
+});
+
+test("rippleDeleteRange puts a wholly-right third member in the complete right cohort", () => {
+  const project = normalizeProject({
+    tracks: [
+      {
+        id: "v1",
+        kind: "video",
+        clips: [{ id: "v-long", assetPath: "a.mp4", timelineStartMs: 1000, durationMs: 4000, linkId: "triple" }],
+      },
+      {
+        id: "a1",
+        kind: "audio",
+        clips: [{ id: "a-long", assetPath: "a.mp3", timelineStartMs: 1000, durationMs: 4000, linkId: "triple" }],
+      },
+      {
+        id: "v2",
+        kind: "video",
+        clips: [{ id: "v-right", assetPath: "overlay.mp4", timelineStartMs: 4000, durationMs: 1000, linkId: "triple" }],
+      },
+    ],
+  });
+
+  const next = rippleDeleteRange(project, 2000, 3000, ["v1"]);
+  const all = next.tracks.flatMap((track) => track.clips);
+  const right = all.filter((clip) => clip.timelineStartMs >= 2000);
+  assert.equal(right.length, 3);
+  assert.ok(right[0].linkId);
+  assert.equal(new Set(right.map((clip) => clip.linkId)).size, 1);
+  assert.notEqual(right[0].linkId, "triple");
+  const left = all.filter((clip) => clip.timelineStartMs === 1000);
+  assert.deepEqual(left.map((clip) => clip.linkId), ["triple", "triple"]);
+});
+
 test("rippleInsertGap splits straddlers and shifts later clips right", () => {
   const project = projectWithClip(); // 1000..5000
   const next = rippleInsertGap(project, 2000, 1500);
@@ -479,6 +932,84 @@ test("rippleInsertGap splits straddlers and shifts later clips right", () => {
   assert.equal(clips.length, 2);
   assert.equal(clips[0].durationMs, 1000);
   assert.equal(clips[1].timelineStartMs, 3500);
+});
+
+test("rippleInsertGap relinks the right fragments of a linked pair", () => {
+  let project = projectWithClip(); // video 1000..5000
+  const audio = addMediaClip(
+    project,
+    { path: "media/assets/a.mp4", kind: "audio", durationMs: 4000 },
+    { timelineStartMs: 1000 },
+  );
+  project = linkClips(audio.project, ["clip-1", audio.clipId]);
+  const videoTrack = project.tracks.find((track) => track.kind === "video");
+  const originalLinkId = videoTrack.clips[0].linkId;
+
+  const next = rippleInsertGap(project, 3000, 1500, [videoTrack.id]);
+  const video = next.tracks.find((track) => track.kind === "video").clips;
+  const audioClips = next.tracks.find((track) => track.kind === "audio").clips;
+  assert.equal(video.length, 2);
+  assert.equal(audioClips.length, 2);
+  assert.equal(video[1].timelineStartMs, 4500);
+  assert.equal(audioClips[1].timelineStartMs, 4500);
+  assert.ok(video[1].linkId);
+  assert.equal(video[1].linkId, audioClips[1].linkId);
+  assert.notEqual(video[1].linkId, originalLinkId);
+});
+
+test("rippleInsertGap partitions every member so no link id spans the gap", () => {
+  const project = normalizeProject({
+    tracks: [
+      {
+        id: "v1",
+        kind: "video",
+        clips: [{ id: "tiny-right", assetPath: "v.mp4", timelineStartMs: 0, durationMs: 3050, linkId: "triple" }],
+      },
+      {
+        id: "a1",
+        kind: "audio",
+        clips: [{ id: "straddler", assetPath: "a.mp3", timelineStartMs: 0, durationMs: 5000, linkId: "triple" }],
+      },
+      {
+        id: "v2",
+        kind: "video",
+        clips: [{ id: "wholly-right", assetPath: "overlay.mp4", timelineStartMs: 4000, durationMs: 500, linkId: "triple" }],
+      },
+    ],
+  });
+
+  const next = rippleInsertGap(project, 3000, 1000, ["v1"]);
+  const all = next.tracks.flatMap((track) => track.clips);
+  const leftIds = new Set(all.filter((clip) => clip.timelineStartMs < 3000).map((clip) => clip.linkId).filter(Boolean));
+  const right = all.filter((clip) => clip.timelineStartMs >= 4000);
+  const rightIds = new Set(right.map((clip) => clip.linkId).filter(Boolean));
+  assert.equal(right.length, 2);
+  assert.equal(rightIds.size, 1);
+  assert.ok([...rightIds].every((linkId) => !leftIds.has(linkId)));
+  assert.ok(!rightIds.has("triple"));
+});
+
+test("range ripple no-ops preserve project identity", () => {
+  const project = projectWithClip();
+  assert.equal(rippleDeleteRange(project, 9000, 10000), project);
+  assert.equal(rippleDeleteRange(project, 2000, 3000, []), project);
+  assert.equal(rippleInsertGap(project, 9000, 1000), project);
+  assert.equal(rippleInsertGap(project, 2000, 1000, []), project);
+});
+
+test("range ripple rejects a linked group when one partner track is locked", () => {
+  let project = projectWithClip();
+  const audio = addMediaClip(
+    project,
+    { path: "media/assets/a.mp4", kind: "audio", durationMs: 4000 },
+    { timelineStartMs: 1000 },
+  );
+  project = linkClips(audio.project, ["clip-1", audio.clipId]);
+  const videoTrack = project.tracks.find((track) => track.kind === "video");
+  project.tracks.find((track) => track.kind === "audio").locked = true;
+
+  assert.equal(rippleDeleteRange(project, 2000, 3000, [videoTrack.id]), project);
+  assert.equal(rippleInsertGap(project, 3000, 1500, [videoTrack.id]), project);
 });
 
 test("addCaptionsForClip maps source segments through trim and speed", () => {
@@ -511,6 +1042,205 @@ test("rippleDeleteWords removes word spans through the clip mapping", () => {
   const clips = result.project.tracks.find((track) => track.kind === "video").clips;
   const total = clips.reduce((sum, clip) => sum + clip.durationMs, 0);
   assert.equal(total, 4000 - 400);
+});
+
+test("rippleDeleteWords dedupes linked-pair ranges and shortens the timeline once", () => {
+  const linked = addMediaClip(
+    makeStarterProject("linked words"),
+    { path: "media/assets/a.mp4", kind: "video", durationMs: 4000, hasAudio: true },
+    { timelineStartMs: 1000 },
+  );
+  const words = [
+    { startMs: 500, endMs: 700, text: "um" },
+    { startMs: 1500, endMs: 1700, text: "uh" },
+  ];
+
+  const result = rippleDeleteWords(linked.project, "media/assets/a.mp4", words);
+  assert.deepEqual(result.ranges, [
+    { startMs: 1500, endMs: 1700 },
+    { startMs: 2500, endMs: 2700 },
+  ]);
+  assert.equal(projectDurationMs(result.project), 4600);
+  for (const kind of ["video", "audio"]) {
+    const total = result.project.tracks
+      .find((track) => track.kind === kind)
+      .clips.reduce((sum, clip) => sum + clip.durationMs, 0);
+    assert.equal(total, 3600);
+  }
+});
+
+test("rippleDeleteWords unions overlapping timeline mappings before rippling", () => {
+  const clip = (id, timelineStartMs, linkId) => ({
+    id,
+    assetPath: "media/assets/a.mp4",
+    timelineStartMs,
+    durationMs: 1000,
+    sourceInMs: 0,
+    speed: 1,
+    linkId,
+  });
+  const project = normalizeProject({
+    tracks: [
+      { id: "v1", kind: "video", clips: [clip("v1-clip", 0, "link-1")] },
+      { id: "a1", kind: "audio", clips: [clip("a1-clip", 0, "link-1")] },
+      { id: "v2", kind: "video", clips: [clip("v2-clip", 100, "link-2")] },
+      { id: "a2", kind: "audio", clips: [clip("a2-clip", 100, "link-2")] },
+    ],
+  });
+
+  const result = rippleDeleteWords(project, "media/assets/a.mp4", [
+    { startMs: 500, endMs: 700, text: "um" },
+  ]);
+  assert.deepEqual(result.ranges, [{ startMs: 500, endMs: 800 }]);
+  assert.equal(projectDurationMs(result.project), 800);
+});
+
+test("rippleDeleteWords aborts atomically when a linked member track is locked", () => {
+  const project = normalizeProject({
+    tracks: [
+      {
+        id: "v1",
+        kind: "video",
+        clips: [{
+          id: "video-source",
+          assetPath: "media/assets/a.mp4",
+          timelineStartMs: 0,
+          durationMs: 2000,
+          sourceInMs: 0,
+          speed: 1,
+          linkId: "pair",
+        }],
+      },
+      {
+        id: "a1",
+        kind: "audio",
+        locked: true,
+        clips: [{
+          id: "locked-partner",
+          assetPath: "media/assets/different.mp3",
+          timelineStartMs: 0,
+          durationMs: 4000,
+          sourceInMs: 0,
+          speed: 1,
+          linkId: "pair",
+        }],
+      },
+    ],
+  });
+
+  const result = rippleDeleteWords(project, "media/assets/a.mp4", [
+    { startMs: 1500, endMs: 1700, text: "um" },
+  ]);
+  assert.equal(result.project, project);
+  assert.deepEqual(result.ranges, []);
+  assert.equal(result.blocked.reason, "locked-track");
+  assert.equal(result.blocked.trackId, "a1");
+});
+
+test("rippleDeleteWords aborts every range when one of several ranges is locked", () => {
+  const project = normalizeProject({
+    tracks: [
+      {
+        id: "v1",
+        kind: "video",
+        clips: [{
+          id: "open-source",
+          assetPath: "media/assets/a.mp4",
+          timelineStartMs: 0,
+          durationMs: 1000,
+          sourceInMs: 0,
+          speed: 1,
+        }],
+      },
+      {
+        id: "v2",
+        kind: "video",
+        locked: true,
+        clips: [{
+          id: "locked-source",
+          assetPath: "media/assets/a.mp4",
+          timelineStartMs: 2000,
+          durationMs: 1000,
+          sourceInMs: 1000,
+          speed: 1,
+        }],
+      },
+    ],
+  });
+
+  const result = rippleDeleteWords(project, "media/assets/a.mp4", [
+    { startMs: 100, endMs: 250, text: "first" },
+    { startMs: 1100, endMs: 1250, text: "blocked" },
+  ]);
+  assert.equal(result.project, project);
+  assert.deepEqual(result.ranges, []);
+  assert.equal(result.blocked.reason, "locked-track");
+  assert.equal(result.blocked.trackId, "v2");
+  assert.equal(project.tracks[0].clips[0].durationMs, 1000);
+});
+
+test("rippleDeleteWords reports an expanded effective range for a sub-80ms remnant", () => {
+  const project = normalizeProject({
+    tracks: [{
+      id: "v1",
+      kind: "video",
+      clips: [{
+        id: "fast",
+        assetPath: "media/assets/fast.mp4",
+        timelineStartMs: 0,
+        durationMs: 1000,
+        sourceInMs: 0,
+        speed: 2,
+      }],
+    }],
+  });
+
+  const result = rippleDeleteWords(project, "media/assets/fast.mp4", [
+    { startMs: 100, endMs: 300, text: "fast word" },
+  ]);
+  assert.deepEqual(result.ranges, [{ startMs: 0, endMs: 150 }]);
+  const clips = result.project.tracks[0].clips;
+  assert.equal(clips.length, 1);
+  assert.equal(clips[0].timelineStartMs, 0);
+  assert.equal(clips[0].durationMs, 850);
+  assert.equal(clips[0].sourceInMs, 300);
+});
+
+test("rippleDeleteWords merges transcript gaps through 120ms inclusive", () => {
+  assert.equal(RIPPLE_DELETE_WORDS_MERGE_GAP_MS, 120);
+  const cases = [
+    [79, [{ startMs: 1000, endMs: 1279 }], 4721],
+    [80, [{ startMs: 1000, endMs: 1280 }], 4720],
+    [100, [{ startMs: 1000, endMs: 1300 }], 4700],
+    [120, [{ startMs: 1000, endMs: 1320 }], 4680],
+    [121, [{ startMs: 1000, endMs: 1100 }, { startMs: 1221, endMs: 1321 }], 4800],
+  ];
+  for (const [gapMs, expectedRanges, expectedDurationMs] of cases) {
+    const project = normalizeProject({
+      tracks: [{
+        id: "v1",
+        kind: "video",
+        clips: [{
+          id: `source-${gapMs}`,
+          assetPath: "media/assets/gaps.mp4",
+          timelineStartMs: 0,
+          durationMs: 5000,
+          sourceInMs: 0,
+          speed: 1,
+        }],
+      }],
+    });
+    const result = rippleDeleteWords(project, "media/assets/gaps.mp4", [
+      { startMs: 1000, endMs: 1100, text: "first" },
+      { startMs: 1100 + gapMs, endMs: 1200 + gapMs, text: "second" },
+    ]);
+    assert.deepEqual(result.ranges, expectedRanges, `gap ${gapMs}`);
+    assert.equal(
+      result.project.tracks[0].clips.reduce((sum, clip) => sum + clip.durationMs, 0),
+      expectedDurationMs,
+      `gap ${gapMs}`,
+    );
+  }
 });
 
 test("formats timecodes", () => {
@@ -576,4 +1306,254 @@ test("motionPresetPatch strength scales amplitudes", () => {
   const subtleZoom = subtle.kf.scale[1].value - subtle.kf.scale[0].value;
   const boldZoom = bold.kf.scale[1].value - bold.kf.scale[0].value;
   assert.ok(boldZoom > subtleZoom * 2);
+});
+
+// --- Tier 1: bezier easing parity fixtures (contract docs/tier1-contract-2026-07-10.md §3)
+
+test("cubic bezier easings match the shared parity fixtures", () => {
+  const fixtures = {
+    "ease-in": [0.017026, 0.093465, 0.315357, 0.621861, 0.839428],
+    "ease-out": [0.160572, 0.378139, 0.684643, 0.906535, 0.982974],
+    "ease-in-out": [0.019722, 0.129162, 0.499999, 0.870838, 0.980278],
+  };
+  const ts = [0.1, 0.25, 0.5, 0.75, 0.9];
+  for (const [easing, expected] of Object.entries(fixtures)) {
+    ts.forEach((t, index) => {
+      assert.ok(
+        Math.abs(cubicBezierEase(easing, t) - expected[index]) < 1e-4,
+        `${easing} at t=${t}`,
+      );
+    });
+  }
+});
+
+test("keyframe interpolation honors bezier easing", () => {
+  const frames = [
+    { atMs: 0, value: 0, easing: "ease-in" },
+    { atMs: 1000, value: 100, easing: "linear" },
+  ];
+  const mid = kfValueAtMs(frames, 500, 0);
+  assert.ok(Math.abs(mid - 31.5357) < 0.1, `got ${mid}`);
+});
+
+test("normalizeProject keeps bezier easings on keyframes", () => {
+  const project = normalizeProject({
+    tracks: [{
+      kind: "video",
+      clips: [{
+        id: "c1", assetPath: "media/assets/a.mp4", timelineStartMs: 0, durationMs: 1000,
+        kf: { opacity: [{ atMs: 0, value: 0, easing: "ease-in-out" }, { atMs: 900, value: 1, easing: "bogus" }] },
+      }],
+    }],
+  });
+  const frames = project.tracks[0].clips[0].kf.opacity;
+  assert.equal(frames[0].easing, "ease-in-out");
+  assert.equal(frames[1].easing, "linear");
+});
+
+// --- Tier 1: fx + crop normalization
+
+test("normalizeFx returns null at defaults and clamps ranges", () => {
+  assert.equal(normalizeFx(null), null);
+  assert.equal(normalizeFx({ exposure: 0, contrast: 1 }), null);
+  const fx = normalizeFx({ exposure: 9, saturation: -2, blend: "screen", chromaKey: { color: "#00ff00" } });
+  assert.equal(fx.exposure, 2);
+  assert.equal(fx.saturation, 0);
+  assert.equal(fx.blend, "screen");
+  assert.equal(fx.chromaKey.similarity, 0.2);
+});
+
+test("normalizeClip carries fx and crop only when meaningful", () => {
+  const project = normalizeProject({
+    tracks: [{
+      kind: "video",
+      clips: [
+        { id: "plain", assetPath: "a.mp4", timelineStartMs: 0, durationMs: 1000, fx: { contrast: 1 }, crop: { l: 0 } },
+        { id: "graded", assetPath: "a.mp4", timelineStartMs: 1000, durationMs: 1000, fx: { blur: 4 }, crop: { l: 0.6, r: 0.1 } },
+      ],
+    }],
+  });
+  const [plain, graded] = project.tracks[0].clips;
+  assert.equal(plain.fx, undefined);
+  assert.equal(plain.crop, undefined);
+  assert.equal(graded.fx.blur, 4);
+  assert.equal(graded.crop.l, 0.45); // clamped
+  assert.equal(graded.crop.r, 0.1);
+});
+
+// --- Tier 1: transitions
+
+function transitionFixture() {
+  return normalizeProject({
+    tracks: [{
+      id: "v1", kind: "video",
+      clips: [
+        { id: "a", assetPath: "a.mp4", timelineStartMs: 0, durationMs: 4000 },
+        { id: "b", assetPath: "b.mp4", timelineStartMs: 4000, durationMs: 4000 },
+      ],
+    }],
+  });
+}
+
+test("addTransition validates adjacency and clamps duration", () => {
+  const project = transitionFixture();
+  const next = addTransition(project, "v1", "a", "wipe-left", 60000);
+  const transition = next.tracks[0].transitions[0];
+  assert.equal(transition.kind, "wipe-left");
+  assert.equal(transition.durationMs, 2000); // half the shorter neighbor
+  // Non-adjacent afterClipId (last clip) is rejected.
+  assert.equal(addTransition(project, "v1", "b", "crossfade", 500), project);
+});
+
+test("transition duration clamp needs adjacency", () => {
+  const project = transitionFixture();
+  assert.equal(clampTransitionDurationMs(project.tracks[0], "b", 500), 0);
+  assert.equal(clampTransitionDurationMs(project.tracks[0], "a", 500), 500);
+});
+
+test("edits that break adjacency prune the transition", () => {
+  let project = addTransition(transitionFixture(), "v1", "a", "crossfade", 800);
+  assert.equal(project.tracks[0].transitions.length, 1);
+  const moved = moveClip(project, "b", 6000);
+  assert.equal(moved.tracks[0].transitions, undefined);
+  // Removing the trailing clip also prunes.
+  const removed = removeClips(project, ["b"]);
+  assert.equal(removed.tracks[0].transitions, undefined);
+  // A no-op edit keeps it.
+  const kept = moveClip(project, "b", 4000);
+  assert.equal(kept.tracks[0].transitions?.length, 1);
+});
+
+test("removeTransition and setTransitionDuration work by id", () => {
+  const project = addTransition(transitionFixture(), "v1", "a", "dip-black", 600);
+  const id = project.tracks[0].transitions[0].id;
+  const longer = setTransitionDuration(project, id, 1400);
+  assert.equal(longer.tracks[0].transitions[0].durationMs, 1400);
+  const gone = removeTransition(project, id);
+  assert.equal(gone.tracks[0].transitions, undefined);
+  assert.equal(removeTransition(project, "missing"), project);
+});
+
+// --- Tier 1: words + text animation
+
+test("normalizeWords filters and sorts word timings", () => {
+  assert.equal(normalizeWords([], 1000), null);
+  const words = normalizeWords(
+    [
+      { text: "world", startMs: 400, endMs: 700 },
+      { text: "hello", startMs: 0, endMs: 300 },
+      { text: "", startMs: 100, endMs: 200 },
+      { text: "late", startMs: 2000, endMs: 2100 },
+    ],
+    1000,
+  );
+  assert.equal(words.length, 2);
+  assert.equal(words[0].text, "hello");
+});
+
+test("text clips normalize anim and words", () => {
+  const project = normalizeProject({
+    tracks: [{
+      kind: "text",
+      clips: [{
+        id: "t1", text: "hello world", timelineStartMs: 0, durationMs: 1000,
+        anim: "word-highlight",
+        words: [{ text: "hello", startMs: 0, endMs: 300 }, { text: "world", startMs: 300, endMs: 700 }],
+      }],
+    }],
+  });
+  const clip = project.tracks[0].clips[0];
+  assert.equal(clip.anim, "word-highlight");
+  assert.equal(clip.words.length, 2);
+  assert.equal(clip.animOpts.highlightColor, "#fbbf24");
+});
+
+// --- Iron-out regressions (adversarial round) --------------------------------
+
+test("transition clamp rejects neighbors shorter than the 100ms minimum", () => {
+  const project = normalizeProject({
+    tracks: [{
+      id: "v1", kind: "video",
+      clips: [
+        { id: "a", assetPath: "a.mp4", timelineStartMs: 0, durationMs: 150 },
+        { id: "b", assetPath: "b.mp4", timelineStartMs: 150, durationMs: 150 },
+      ],
+    }],
+  });
+  assert.equal(clampTransitionDurationMs(project.tracks[0], "a", 500), 0);
+  assert.equal(addTransition(project, "v1", "a", "crossfade", 500), project);
+});
+
+test("splitting the leading clip retargets its transition to the right fragment", () => {
+  let project = normalizeProject({
+    tracks: [{
+      id: "v1", kind: "video",
+      clips: [
+        { id: "a", assetPath: "a.mp4", timelineStartMs: 0, durationMs: 4000 },
+        { id: "b", assetPath: "b.mp4", timelineStartMs: 4000, durationMs: 4000 },
+      ],
+    }],
+  });
+  project = addTransition(project, "v1", "a", "crossfade", 800);
+  const next = splitClip(project, "a", 2000);
+  const track = next.tracks[0];
+  assert.equal(track.transitions?.length, 1);
+  const rightHalf = track.clips.find((clip) => clip.timelineStartMs === 2000);
+  assert.equal(track.transitions[0].afterClipId, rightHalf.id);
+});
+
+test("transitions are rejected on audio tracks", () => {
+  const project = normalizeProject({
+    tracks: [{
+      id: "a1", kind: "audio",
+      clips: [
+        { id: "x", assetPath: "x.mp3", timelineStartMs: 0, durationMs: 2000 },
+        { id: "y", assetPath: "y.mp3", timelineStartMs: 2000, durationMs: 2000 },
+      ],
+      transitions: [{ id: "t", afterClipId: "x", kind: "crossfade", durationMs: 400 }],
+    }],
+  });
+  assert.equal(project.tracks[0].transitions, undefined);
+  assert.equal(addTransition(project, "a1", "x", "crossfade", 400), project);
+});
+
+test("removeClip prunes transitions whose junction it destroyed", () => {
+  let project = normalizeProject({
+    tracks: [{
+      id: "v1", kind: "video",
+      clips: [
+        { id: "a", assetPath: "a.mp4", timelineStartMs: 0, durationMs: 2000 },
+        { id: "b", assetPath: "b.mp4", timelineStartMs: 2000, durationMs: 2000 },
+      ],
+    }],
+  });
+  project = addTransition(project, "v1", "a", "crossfade", 400);
+  const next = removeClip(project, "b");
+  assert.equal(next.tracks[0].transitions, undefined);
+});
+
+test("addCaptionsForClip maps segment words into clip-relative words", () => {
+  const project = normalizeProject({
+    tracks: [{
+      id: "v1", kind: "video",
+      clips: [{ id: "src", assetPath: "talk.mp4", timelineStartMs: 0, durationMs: 4000, sourceInMs: 1000, speed: 1 }],
+    }],
+  });
+  const { project: next, count } = addCaptionsForClip(project, "src", [
+    {
+      startMs: 1200,
+      endMs: 2200,
+      text: "hello brave world",
+      words: [
+        { text: "hello", startMs: 1200, endMs: 1500 },
+        { text: "brave", startMs: 1500, endMs: 1800 },
+        { text: "world", startMs: 1800, endMs: 2200 },
+      ],
+    },
+  ]);
+  assert.equal(count, 1);
+  const caption = next.tracks.find((track) => track.kind === "text").clips[0];
+  assert.equal(caption.words.length, 3);
+  assert.deepEqual(caption.words[0], { text: "hello", startMs: 0, endMs: 300 });
+  assert.deepEqual(caption.words[2], { text: "world", startMs: 600, endMs: 1000 });
 });

@@ -4,7 +4,7 @@
 // provider-routing id the cloud's model table understands.
 //
 // Cloud env keys: HIGGSFIELD_CREDENTIALS ("KEY_ID:KEY_SECRET"), FAL_API_KEY,
-// OPENAI_API_KEY, GEMINI_API_KEY, TOPAZ_API_KEY, REPLICATE_API_TOKEN.
+// OPENAI_API_KEY, GEMINI_API_KEY, REPLICATE_API_TOKEN.
 
 export const GENERATION_KINDS = [
   { id: "image", label: "Image" },
@@ -558,7 +558,7 @@ export const GENERATION_MODELS = [
     est: {},
   },
 
-  // --- Upscalers (three providers: fal.ai, Topaz Labs, Replicate) ---
+  // --- Upscalers (fal.ai and Replicate) ---
   {
     id: "seedvr2-video-upscaler",
     kind: "upscale",
@@ -569,15 +569,6 @@ export const GENERATION_MODELS = [
     est: { usdPerSecond: 0.02 },
   },
   {
-    id: "topaz-video-upscale",
-    kind: "upscale",
-    jobType: "topaz:video",
-    displayName: "Topaz Video AI",
-    providerLabel: "Topaz Labs",
-    caps: { supportedTypes: ["video"], speed: "Slow" },
-    est: { usdPerSecond: 0.05 },
-  },
-  {
     id: "esrgan-image-upscaler",
     kind: "upscale",
     jobType: "fal:fal-ai/esrgan",
@@ -585,15 +576,6 @@ export const GENERATION_MODELS = [
     providerLabel: "fal.ai",
     caps: { supportedTypes: ["image"], speed: "Fast" },
     est: { usdPerImage: 0.01 },
-  },
-  {
-    id: "topaz-image-upscale",
-    kind: "upscale",
-    jobType: "topaz:image",
-    displayName: "Topaz Image AI",
-    providerLabel: "Topaz Labs",
-    caps: { supportedTypes: ["image"], speed: "Medium" },
-    est: { usdPerImage: 0.04 },
   },
   {
     id: "real-esrgan-replicate",
@@ -689,9 +671,7 @@ const CLOUD_CREDIT_RATES = {
   mirelo_sfx: { perSecond: 4 },
   // Upscalers (video per source second, image per image)
   "seedvr2-video-upscaler": { perSecond: 3 },
-  "topaz-video-upscale": { perSecond: 4 },
   "esrgan-image-upscaler": { perImage: 8 },
-  "topaz-image-upscale": { perImage: 10 },
   "real-esrgan-replicate": { perImage: 8 },
 };
 

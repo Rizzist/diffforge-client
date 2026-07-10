@@ -9,6 +9,7 @@ import {
   VideoDangerButton,
   VideoErrorText,
   VideoHint,
+  VideoInput,
   VideoPaneButton,
   VideoProgressFill,
   VideoProgressTrack,
@@ -356,6 +357,62 @@ const EmptyState = styled.div`
   text-align: center;
 `;
 
+const CleanupTitle = styled.span`
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: rgba(148, 163, 184, 0.85);
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
+`;
+
+const CleanupField = styled.label`
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: rgba(148, 163, 184, 0.85);
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
+`;
+
+// Compact numeric field for the silence-detect knobs — inherits VideoInput's
+// palette (incl. its light-theme block), just sized down for the toolbar row.
+const CleanupNumberInput = styled(VideoInput)`
+  width: 54px;
+  min-height: 20px;
+  padding: 0 6px;
+  font-size: 10px;
+`;
+
+const CleanupConfirm = styled.div`
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 5px 8px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 6px;
+  background: rgba(6, 10, 17, 0.72);
+  font-size: 10.5px;
+  font-weight: 600;
+  color: rgba(226, 232, 240, 0.92);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.12);
+    background: #f8fafc;
+    color: #0f172a;
+  }
+`;
+
 function parseTimecode(text) {
   // Accept "m:ss", "m:ss.mmm", "h:mm:ss.mmm", or raw ms.
   const clean = String(text || "").trim();
@@ -374,6 +431,46 @@ function parseTimecode(text) {
 
 function segmentsEqual(a, b) {
   return JSON.stringify(a) === JSON.stringify(b);
+}
+
+// Filler-word cleanup: case-insensitive, punctuation-stripped singles plus
+// the "you know" bigram — the bigram only counts when the two words are
+// actually adjacent in speech (≤250ms gap), so "you… know what I did?" with
+// a real pause between them survives.
+const FILLER_SINGLES = new Set(["um", "uh", "uhh", "umm", "erm", "hmm", "mhm"]);
+const FILLER_BIGRAM_MAX_GAP_MS = 250;
+
+function normalizeFillerWord(text) {
+  return String(text || "").toLowerCase().replace(/[^a-z]/g, "");
+}
+
+function findFillerWords(segments) {
+  const flat = [];
+  for (const segment of Array.isArray(segments) ? segments : []) {
+    for (const word of segment.words || []) {
+      flat.push(word);
+    }
+  }
+  const picked = [];
+  for (let index = 0; index < flat.length; index += 1) {
+    const norm = normalizeFillerWord(flat[index].text);
+    if (FILLER_SINGLES.has(norm)) {
+      picked.push(flat[index]);
+      continue;
+    }
+    if (norm === "you") {
+      const next = flat[index + 1];
+      if (
+        next
+        && normalizeFillerWord(next.text) === "know"
+        && next.startMs - flat[index].endMs <= FILLER_BIGRAM_MAX_GAP_MS
+      ) {
+        picked.push(flat[index], next);
+        index += 1;
+      }
+    }
+  }
+  return picked;
 }
 
 // HappySRT-inspired transcript editor for one media asset: numbered segment
@@ -693,7 +790,23 @@ export default function TranscriptPanel({
     const words = struckWords
       .map(({ segIndex, wordIndex }) => transcript.segments[segIndex]?.words?.[wordIndex])
       .filter(Boolean);
-    onRemoveWordsFromCut?.(asset, words);
+    const result = onRemoveWordsFromCut?.(asset, words);
+    if (result?.blocked) {
+      setError(
+        result.blocked.message
+          || (result.blocked.reason === "locked-track"
+            ? "Word deletion is blocked by a locked linked track. Unlock it and try again."
+            : String(result.blocked.reason || "Word deletion was blocked.")),
+      );
+      return;
+    }
+    if (result && !result.ranges?.length) {
+      // No-op: nothing mapped into the timeline — keep the strikes so the
+      // user can adjust instead of silently clearing them.
+      setError("Those words aren't inside any timeline clip of this media.");
+      return;
+    }
+    setError("");
     setStruckWords([]);
   }, [asset, onRemoveWordsFromCut, struckWords, transcript]);
 
@@ -701,6 +814,107 @@ export default function TranscriptPanel({
     () => Boolean(transcript?.segments?.some((segment) => segment.words?.length)),
     [transcript],
   );
+
+  // --- Cleanup toolbar: filler + silence removal via the same ripple path
+  // the strike-words flow uses (onRemoveWordsFromCut → rippleDeleteWords).
+  const [noiseDb, setNoiseDb] = useState("-35");
+  const [minSilenceMs, setMinSilenceMs] = useState("400");
+  const [detectingSilences, setDetectingSilences] = useState(false);
+  const [silencePreview, setSilencePreview] = useState(null); // { ranges, totalMs }
+  const [cleanupNote, setCleanupNote] = useState("");
+
+  useEffect(() => {
+    setSilencePreview(null);
+    setCleanupNote("");
+  }, [asset?.path]);
+
+  const flashCleanupNote = useCallback((text) => {
+    setCleanupNote(text);
+    window.setTimeout(() => setCleanupNote(""), 2600);
+  }, []);
+
+  const fillerWords = useMemo(() => findFillerWords(transcript?.segments), [transcript]);
+
+  const removeFillers = useCallback(() => {
+    if (!fillerWords.length) {
+      return;
+    }
+    const result = onRemoveWordsFromCut?.(asset, fillerWords);
+    if (result?.blocked) {
+      setError(
+        result.blocked.message
+          || (result.blocked.reason === "locked-track"
+            ? "Filler removal is blocked by a locked linked track. Unlock it and try again."
+            : String(result.blocked.reason || "Filler removal was blocked.")),
+      );
+      return;
+    }
+    if (result && !result.ranges?.length) {
+      setError("Those filler words aren't inside any timeline clip of this media.");
+      return;
+    }
+    setError("");
+    const rangeCount = Array.isArray(result?.ranges) ? result.ranges.length : fillerWords.length;
+    flashCleanupNote(`✂ Removed ${rangeCount} range${rangeCount === 1 ? "" : "s"} of filler words from the cut`);
+  }, [asset, fillerWords, flashCleanupNote, onRemoveWordsFromCut]);
+
+  // Two-step silence flow: detect (Rust ffmpeg silencedetect, SOURCE time)
+  // → confirmation line → Apply ripples the ranges out of the cut.
+  const detectSilences = useCallback(() => {
+    if (!repoPath || !asset?.path || detectingSilences) {
+      return;
+    }
+    const noiseDbNum = Number.isFinite(Number(noiseDb)) && noiseDb !== "" ? Number(noiseDb) : -35;
+    const minMsNum = Math.max(0, Number(minSilenceMs)) || 400;
+    setDetectingSilences(true);
+    setSilencePreview(null);
+    invoke("video_detect_silences", { repoPath, assetPath: asset.path, noiseDb: noiseDbNum, minMs: minMsNum })
+      .then((result) => {
+        if (assetPathRef.current !== asset.path) {
+          return;
+        }
+        const ranges = (Array.isArray(result?.ranges) ? result.ranges : [])
+          .map((range) => ({
+            startMs: Math.round(Number(range.startMs) || 0),
+            endMs: Math.round(Number(range.endMs) || 0),
+          }))
+          .filter((range) => range.endMs - range.startMs >= minMsNum);
+        setError("");
+        if (!ranges.length) {
+          flashCleanupNote("No silences found at these settings.");
+          return;
+        }
+        const totalMs = ranges.reduce((sum, range) => sum + (range.endMs - range.startMs), 0);
+        setSilencePreview({ ranges, totalMs });
+      })
+      .catch((err) => setError(String(err)))
+      .finally(() => setDetectingSilences(false));
+  }, [asset?.path, detectingSilences, flashCleanupNote, minSilenceMs, noiseDb, repoPath]);
+
+  const applySilences = useCallback(() => {
+    const ranges = silencePreview?.ranges;
+    if (!ranges?.length) {
+      return;
+    }
+    setSilencePreview(null);
+    const result = onRemoveWordsFromCut?.(asset, ranges);
+    if (result?.blocked) {
+      setError(
+        result.blocked.message
+          || (result.blocked.reason === "locked-track"
+            ? "Silence removal is blocked by a locked linked track. Unlock it and try again."
+            : String(result.blocked.reason || "Silence removal was blocked.")),
+      );
+      return;
+    }
+    if (result && !result.ranges?.length) {
+      setError("Those silences aren't inside any timeline clip of this media.");
+      return;
+    }
+    setError("");
+    const rangeCount = Array.isArray(result?.ranges) ? result.ranges.length : ranges.length;
+    flashCleanupNote(`✂ Cut ${rangeCount} silence${rangeCount === 1 ? "" : "s"} from the timeline`);
+  }, [asset, flashCleanupNote, onRemoveWordsFromCut, silencePreview]);
 
   if (!asset) {
     return (
@@ -782,6 +996,63 @@ export default function TranscriptPanel({
             ) : null}
           </ActionRow>
         ) : null}
+        <ActionRow>
+          <CleanupTitle>Cleanup</CleanupTitle>
+          <VideoPaneButton
+            disabled={!fillerWords.length}
+            onClick={removeFillers}
+            title={
+              transcript
+                ? "Cut um/uh/erm/hmm (and adjacent “you know”) straight out of the timeline"
+                : "Transcribe first — filler detection scans the transcript words"
+            }
+            type="button"
+          >
+            Remove fillers ({fillerWords.length})
+          </VideoPaneButton>
+          <VideoSecondaryButton
+            disabled={detectingSilences || !repoPath}
+            onClick={detectSilences}
+            title="Detect silent stretches in the source audio, then cut them from the timeline"
+            type="button"
+          >
+            {detectingSilences ? "Detecting…" : "Remove silences"}
+          </VideoSecondaryButton>
+          <CleanupField title="Silence threshold (dB)">
+            dB
+            <CleanupNumberInput
+              onChange={(event) => setNoiseDb(event.target.value)}
+              step="1"
+              type="number"
+              value={noiseDb}
+            />
+          </CleanupField>
+          <CleanupField title="Minimum silence duration (ms)">
+            ms
+            <CleanupNumberInput
+              min="0"
+              onChange={(event) => setMinSilenceMs(event.target.value)}
+              step="50"
+              type="number"
+              value={minSilenceMs}
+            />
+          </CleanupField>
+        </ActionRow>
+        {silencePreview ? (
+          <CleanupConfirm>
+            <span>
+              {silencePreview.ranges.length} silence{silencePreview.ranges.length === 1 ? "" : "s"} (
+              {(silencePreview.totalMs / 1000).toFixed(1)}s total) will be cut
+            </span>
+            <VideoPaneButton onClick={applySilences} type="button">
+              Apply
+            </VideoPaneButton>
+            <VideoSecondaryButton onClick={() => setSilencePreview(null)} type="button">
+              Cancel
+            </VideoSecondaryButton>
+          </CleanupConfirm>
+        ) : null}
+        {cleanupNote ? <VideoHint>{cleanupNote}</VideoHint> : null}
         {transcribing && progress ? (
           <div style={{ display: "grid", gap: 3 }}>
             <VideoProgressTrack>

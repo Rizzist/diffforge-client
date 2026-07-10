@@ -16,6 +16,25 @@ Use `video_context` first. Clip ids are stable only until the next edit; re-fetc
 3. Use transcript word indexes/times to call `video_edit` with `op:"removeWords"`, `assetPath`, and `words`.
 4. Call `video_look` around the edit boundaries to verify timing.
 
+## Silence Removal
+
+- `removeSilences {assetPath?, noiseDb?, minMs?}` detects source-time silence with ffmpeg and transactionally ripple-deletes the mapped timeline ranges.
+- Omit `assetPath` to process every audio/video asset on the timeline. Defaults are `noiseDb:-35` and `minMs:400`.
+- Read `effectiveRanges` from the result, then re-fetch `video_context` and inspect the boundaries with `video_look`.
+
+## Transitions
+
+- Add: `addTransition {trackId, afterClipId, kind, durationMs}`. Both clips must be exactly adjacent on the same video track.
+- Remove: `removeTransition {transitionId}`.
+- Kinds: `crossfade`, `dip-black`, `dip-white`, `wipe-left`, `wipe-right`, `wipe-up`, `wipe-down`, `slide-left`, `slide-right`.
+- Re-fetch `video_context` after either operation because clip and transition ids are reparsed.
+
+## setProps Tier 1 Fields
+
+- Media clips accept `fx` and `crop:{l,t,r,b}` in addition to speed/gain/transform/motion/keyframes.
+- Text clips accept `words:[{text,startMs,endMs}]`, `anim`, and `animOpts:{highlightColor}`. Word times are relative to the text clip.
+- Keyframe easing accepts `linear`, `hold`, `smooth`, `ease-in`, `ease-out`, and `ease-in-out`.
+
 ## moments to addClip
 
 1. Call `video_media` with `action:"search"` and a query.
@@ -34,7 +53,7 @@ Use `video_context` first. Clip ids are stable only until the next edit; re-fetc
 ## Export
 
 - Full export: `video_export {action:"export", projectPath?, resolution?}`. Default resolution is `source`.
-- Draft export: `video_export {action:"draft", range:{startMs,endMs}}`. Drafts are forced to 480p and write to `media/exports/draft-<ts>.mp4`.
+- Draft export: `video_export {action:"draft", range:{startMs,endMs}}`. Drafts are forced to 480p and write to `media/.cache/draft/draft-<ts>.mp4` (the newest three are retained).
 - Export start returns `jobId`; poll with `video_export {action:"status", jobId}`.
 
 ## Id Stability

@@ -1,3 +1,5 @@
+use rusqlite::OptionalExtension;
+
 const CLOUD_MCP_DEFAULT_BASE_URL: &str = "https://balancer.diffforge.ai";
 const CLOUD_MCP_LOCAL_CLOUD_BASE_URL: &str = "http://127.0.0.1:8080";
 const CLOUD_MCP_BASE_URL_ENV: &str = "CLOUD_MCP_BASE_URL";
@@ -67,6 +69,13 @@ const CLOUD_MCP_WORKSPACE_TODO_TEXT_MAX_CHARS: usize = 2_000_000;
 const CLOUD_MCP_WORKSPACE_TODO_MAX_ITEMS: usize = 120;
 const CLOUD_MCP_APP_CONTROL_WORKSPACE_ID: &str = "__diffforge_app_control__";
 const CLOUD_MCP_APP_CONTROL_WORKSPACE_ID_NORMALIZED: &str = "diffforge_app_control";
+const CLOUD_MCP_CHAT_ATTACHMENT_PUSH_KIND: &str = "chat_attachment_push";
+const CLOUD_MCP_CHAT_ATTACHMENT_MAX_IMAGES: usize = 5;
+const CLOUD_MCP_CHAT_ATTACHMENT_MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+const CLOUD_MCP_CHAT_ATTACHMENT_MAX_TOTAL_BYTES: usize = 20 * 1024 * 1024;
+const CLOUD_MCP_CHAT_ATTACHMENT_MAX_INLINE_BASE64_CHARS: usize = 1024 * 1024;
+const CLOUD_MCP_CHAT_ATTACHMENT_MAX_CHUNK_BASE64_CHARS: usize = 512 * 1024;
+const CLOUD_MCP_CHAT_ATTACHMENT_MAX_CHUNKS_PER_IMAGE: usize = 32;
 const CLOUD_MCP_APP_CONTROL_PANE_ID: &str = "forge-app-control-agent-terminal";
 const CLOUD_MCP_TODO_BODY_CACHE_MAX_ITEMS: usize = 96;
 const CLOUD_MCP_TODO_BODY_CACHE_FILE: &str = "todo-body-cache.json";
@@ -176,6 +185,7 @@ const CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT: &str = "tokenomics_device_delta";
 const CLOUD_MCP_TOKENOMICS_DEVICE_SNAPSHOT_EVENT: &str = "tokenomics_device_snapshot";
 const CLOUD_MCP_TOKENOMICS_INGEST_ACK_EVENT: &str = "tokenomics_ingest_ack";
 const CLOUD_MCP_TOKENOMICS_DELIVERY_ACK_EVENT: &str = "tokenomics_delivery_ack";
+static CLOUD_MCP_DEVICE_LIVE_SYNC_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 const CLOUD_MCP_WORKSPACE_MCP_TOOL_NAME_LIMIT: usize = 32;
 const CLOUD_MCP_AUDIO_PREFERENCES_STATE_KEY: &str = "audio-preferences";
 const CLOUD_MCP_NOTIFICATION_PREFERENCES_STATE_KEY: &str = "notification-preferences";
@@ -486,6 +496,13 @@ enum CloudMcpDeviceLiveSyncDecision {
     Enqueue,
     CurrentAcked,
     CurrentPending,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloudMcpDeviceLiveSyncStateMatch {
+    Current,
+    Missing,
+    Superseded,
 }
 
 #[derive(Clone)]
@@ -1492,7 +1509,7 @@ fn cloud_mcp_deleted_workspace_ids() -> HashSet<String> {
 }
 
 fn cloud_mcp_remember_deleted_workspace_id(workspace_id: &str) -> Result<bool, String> {
-    let workspace_id = workspace_id.trim();
+    let workspace_id = cloud_mcp_workspace_id_match_key(workspace_id);
     if workspace_id.is_empty() {
         return Ok(false);
     }
@@ -1508,10 +1525,10 @@ fn cloud_mcp_remember_deleted_workspace_id(workspace_id: &str) -> Result<bool, S
     }
 
     let mut ids = cloud_mcp_deleted_workspace_ids();
-    let inserted = ids.insert(workspace_id.to_string());
+    let inserted = ids.insert(workspace_id);
     let mut sorted_ids = ids.into_iter().collect::<Vec<_>>();
     sorted_ids.sort();
-    let payload = json!({
+    let mut payload = json!({
         "version": 1,
         "workspace_ids": sorted_ids,
         "updated_at_ms": cloud_mcp_now_ms(),
@@ -1534,7 +1551,15 @@ fn cloud_mcp_forget_deleted_workspace_ids(
     }
     let mut ids = cloud_mcp_deleted_workspace_ids();
     let original_len = ids.len();
-    ids.retain(|workspace_id| !workspace_ids.contains(workspace_id));
+    ids.retain(|stored_workspace_id| {
+        !workspace_ids.iter().any(|candidate_workspace_id| {
+            cloud_mcp_workspace_id_matches_canonical_or_legacy(
+                candidate_workspace_id,
+                stored_workspace_id,
+                cloud_mcp_desktop_platform(),
+            )
+        })
+    });
     let removed = original_len.saturating_sub(ids.len());
     if removed == 0 {
         return Ok(0);
@@ -1569,11 +1594,20 @@ fn cloud_mcp_forget_deleted_workspace_ids(
 }
 
 fn cloud_mcp_forget_deleted_workspace_id(workspace_id: &str) -> Result<bool, String> {
-    let workspace_id = workspace_id.trim();
+    let workspace_id = cloud_mcp_workspace_id_match_key(workspace_id);
     if workspace_id.is_empty() {
         return Ok(false);
     }
-    let ids = HashSet::from([workspace_id.to_string()]);
+    let ids = cloud_mcp_deleted_workspace_ids()
+        .into_iter()
+        .filter(|stored_id| {
+            cloud_mcp_workspace_id_matches_canonical_or_legacy(
+                &workspace_id,
+                stored_id,
+                cloud_mcp_desktop_platform(),
+            )
+        })
+        .collect::<HashSet<_>>();
     cloud_mcp_forget_deleted_workspace_ids(&ids).map(|removed| removed > 0)
 }
 
@@ -7883,6 +7917,16 @@ fn cloud_mcp_queue_event_background(
     if cloud_mcp_task_event_kind_removed(event_kind) {
         return Ok(cloud_mcp_task_event_removed_outbox_response(event_kind));
     }
+    if let Err(reason) =
+        cloud_mcp_validate_authoritative_workspace_snapshot_payload(event_kind, payload)
+    {
+        return Ok(json!({
+            "ok": true,
+            "skipped": true,
+            "reason": reason,
+            "event_kind": event_kind,
+        }));
+    }
     let mut payload = payload.clone();
     if let Some(object) = payload.as_object_mut() {
         let event_id = format!(
@@ -7956,6 +8000,16 @@ async fn cloud_mcp_send_event_over_app_ws_once(
     payload: &Value,
     request_prefix: &str,
 ) -> Result<Value, String> {
+    if let Err(reason) =
+        cloud_mcp_validate_authoritative_workspace_snapshot_payload(event_kind, payload)
+    {
+        // Direct producers must not interpret a locally suppressed stale
+        // snapshot as a successful wire send. The callers recognize this
+        // tagged error and rebuild from the latest durable catalog.
+        return Err(format!(
+            "{CLOUD_MCP_AUTHORITATIVE_WORKSPACE_SNAPSHOT_REBUILD_PREFIX}{reason}"
+        ));
+    }
     cloud_mcp_start_global_ws(state).await;
     let tx = cloud_mcp_wait_for_ws_sender(state).await?;
     let auth = cloud_mcp_ws_auth_object(state).await?;
@@ -8110,7 +8164,9 @@ async fn cloud_mcp_send_remote_command_over_app_ws_once(
         Ok(Err(_)) => {
             state.global_ws_pending.lock().await.remove(&request_id);
             cloud_mcp_fail_sync_activity_key(&sync_activity_key);
-            return Err("Cloud MCP app websocket remote command response was cancelled.".to_string());
+            return Err(
+                "Cloud MCP app websocket remote command response was cancelled.".to_string(),
+            );
         }
         Err(_) => {
             state.global_ws_pending.lock().await.remove(&request_id);
@@ -13473,7 +13529,11 @@ async fn cloud_mcp_open_global_ws(
     // Direct-only policy: a failed direct connect returns to the reconnect
     // loop (which re-resolves a fresh route) instead of proxying through the
     // balancer.
-    let (stream, response) = match connect_async(request).await {
+    let websocket_config = WebSocketConfig::default()
+        .max_message_size(Some(64 * 1024 * 1024))
+        .max_frame_size(Some(32 * 1024 * 1024));
+    let (stream, response) =
+        match connect_async_with_config(request, Some(websocket_config), false).await {
         Ok(result) => result,
         Err(error) => {
             let message = format!(
@@ -13504,7 +13564,7 @@ async fn cloud_mcp_open_global_ws(
             .await;
             return Err(message);
         }
-    };
+        };
     cloud_mcp_record_signin_diagnostic(
         state,
         "websocket.open",
@@ -15978,9 +16038,11 @@ pub(crate) fn cloud_mcp_loopspace_graph_source_from_local_mirror(
     loopspace_id: &str,
 ) -> Result<Option<String>, String> {
     let snapshot = cloud_mcp_get_loopspaces_snapshot()?;
-    Ok(cloud_mcp_loopspace_graph_from_snapshot(&snapshot, loopspace_id)
-        .map(|graph| cloud_mcp_loopspace_graph_result_source(&graph))
-        .filter(|source| !source.trim().is_empty()))
+    Ok(
+        cloud_mcp_loopspace_graph_from_snapshot(&snapshot, loopspace_id)
+            .map(|graph| cloud_mcp_loopspace_graph_result_source(&graph))
+            .filter(|source| !source.trim().is_empty()),
+    )
 }
 
 #[tauri::command]
@@ -18242,6 +18304,237 @@ async fn cloud_mcp_emit_initial_account_tools_snapshot(
     let _ = state.global_ws_events.send(event);
 }
 
+fn cloud_mcp_chat_attachment_encoded_limit(decoded_bytes: usize) -> usize {
+    decoded_bytes.saturating_add(2) / 3 * 4
+}
+
+fn cloud_mcp_chat_attachment_add_total(
+    current_total: usize,
+    image_bytes: usize,
+) -> Result<usize, String> {
+    let total = current_total.saturating_add(image_bytes);
+    if total > CLOUD_MCP_CHAT_ATTACHMENT_MAX_TOTAL_BYTES {
+        return Err("chat attachment images must total 20 MiB or less".to_string());
+    }
+    Ok(total)
+}
+
+fn cloud_mcp_decode_chat_attachment_push(
+    message: &Value,
+) -> Result<(String, Vec<ChatAttachmentPushImage>), String> {
+    let request = message
+        .get("request")
+        .or_else(|| message.get("payload"))
+        .ok_or_else(|| "chat_attachment_push request is missing".to_string())?;
+    let workspace_id = cloud_mcp_payload_text(request, &["workspace_id", "workspaceId"])
+        .ok_or_else(|| {
+            "chat_attachment_push workspace_id is missing; use __diffforge_app_control__ for orchestrator targets"
+                .to_string()
+        })?;
+    let images = request
+        .get("images")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "chat_attachment_push images are missing".to_string())?;
+    if images.is_empty() {
+        return Err("chat_attachment_push requires at least one image".to_string());
+    }
+    if images.len() > CLOUD_MCP_CHAT_ATTACHMENT_MAX_IMAGES {
+        return Err(format!(
+            "chat_attachment_push accepts at most {CLOUD_MCP_CHAT_ATTACHMENT_MAX_IMAGES} images"
+        ));
+    }
+
+    let mut decoded_images = Vec::with_capacity(images.len());
+    let mut total_bytes = 0usize;
+    for (image_index, image) in images.iter().enumerate() {
+        let name = cloud_mcp_payload_text(image, &["name"])
+            .ok_or_else(|| format!("chat attachment image {} name is missing", image_index + 1))?;
+        let mime = cloud_mcp_payload_text(image, &["mime", "mime_type", "mimeType"])
+            .map(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase()
+            })
+            .unwrap_or_default();
+        if !matches!(
+            mime.as_str(),
+            "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+        ) {
+            return Err(format!(
+                "chat attachment image {} must be PNG, JPEG, WebP, or GIF",
+                image_index + 1
+            ));
+        }
+        let sha256 = cloud_mcp_payload_text(image, &["sha256"])
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!(
+                "chat attachment image {} SHA-256 is invalid",
+                image_index + 1
+            ));
+        }
+        let declared_bytes = image
+            .get("bytes")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                format!(
+                    "chat attachment image {} decoded byte length is missing",
+                    image_index + 1
+                )
+            })?;
+        if declared_bytes == 0 || declared_bytes > CLOUD_MCP_CHAT_ATTACHMENT_MAX_IMAGE_BYTES {
+            return Err(format!(
+                "chat attachment image {} must be non-empty and no larger than 10 MiB",
+                image_index + 1
+            ));
+        }
+        let inline = image.get("base64").and_then(Value::as_str);
+        let chunks = image.get("chunks").and_then(Value::as_array);
+        if inline.is_some() == chunks.is_some() {
+            return Err(format!(
+                "chat attachment image {} must contain exactly one of base64 or chunks",
+                image_index + 1
+            ));
+        }
+        let encoded = if let Some(inline) = inline {
+            if inline.is_empty()
+                || inline.len() > CLOUD_MCP_CHAT_ATTACHMENT_MAX_INLINE_BASE64_CHARS
+            {
+                return Err(format!(
+                    "chat attachment image {} inline base64 exceeds 1 MiB; use ordered chunks",
+                    image_index + 1
+                ));
+            }
+            inline.to_string()
+        } else {
+            let chunks = chunks.expect("chunks checked above");
+            if chunks.is_empty() {
+                return Err(format!(
+                    "chat attachment image {} chunks are empty",
+                    image_index + 1
+                ));
+            }
+            if chunks.len() > CLOUD_MCP_CHAT_ATTACHMENT_MAX_CHUNKS_PER_IMAGE {
+                return Err(format!(
+                    "chat attachment image {} exceeds the limit of {CLOUD_MCP_CHAT_ATTACHMENT_MAX_CHUNKS_PER_IMAGE} chunks",
+                    image_index + 1
+                ));
+            }
+            let mut encoded = String::new();
+            for (expected_index, chunk) in chunks.iter().enumerate() {
+                let index = chunk.get("index").and_then(Value::as_u64);
+                let total = chunk.get("total").and_then(Value::as_u64);
+                let data = chunk.get("data").and_then(Value::as_str);
+                if index != Some(expected_index as u64)
+                    || total != Some(chunks.len() as u64)
+                    || data.is_none()
+                {
+                    return Err(format!(
+                        "chat attachment image {} chunks must be ordered, zero-based, contiguous, and share total={}",
+                        image_index + 1,
+                        chunks.len()
+                    ));
+                }
+                let data = data.unwrap_or_default();
+                if data.is_empty()
+                    || data.len() > CLOUD_MCP_CHAT_ATTACHMENT_MAX_CHUNK_BASE64_CHARS
+                {
+                    return Err(format!(
+                        "chat attachment image {} chunk {} exceeds 512 KiB of base64 text",
+                        image_index + 1,
+                        expected_index
+                    ));
+                }
+                if encoded.len().saturating_add(data.len())
+                    > cloud_mcp_chat_attachment_encoded_limit(
+                        CLOUD_MCP_CHAT_ATTACHMENT_MAX_IMAGE_BYTES,
+                    )
+                    .saturating_add(4)
+                {
+                    return Err(format!(
+                        "chat attachment image {} exceeds 10 MiB decoded",
+                        image_index + 1
+                    ));
+                }
+                encoded.push_str(data);
+            }
+            encoded
+        };
+        if encoded.starts_with("data:") {
+            return Err(format!(
+                "chat attachment image {} must use raw base64 without a data URL prefix",
+                image_index + 1
+            ));
+        }
+        if encoded.trim().len() != encoded.len() {
+            return Err(format!(
+                "chat attachment image {} base64 must not contain surrounding whitespace",
+                image_index + 1
+            ));
+        }
+        let bytes = general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .map_err(|_| {
+                format!(
+                    "chat attachment image {} contains invalid base64",
+                    image_index + 1
+                )
+            })?;
+        if bytes.len() != declared_bytes {
+            return Err(format!(
+                "chat attachment image {} decoded to {} bytes but declared {}",
+                image_index + 1,
+                bytes.len(),
+                declared_bytes
+            ));
+        }
+        if chat_attachment_sha256_hex(&bytes) != sha256 {
+            return Err(format!(
+                "chat attachment image {} SHA-256 did not match its bytes",
+                image_index + 1
+            ));
+        }
+        if chat_attachment_signature_mime(&bytes) != Some(mime.as_str()) {
+            return Err(format!(
+                "chat attachment image {} MIME did not match its bytes",
+                image_index + 1
+            ));
+        }
+        total_bytes = cloud_mcp_chat_attachment_add_total(total_bytes, bytes.len())?;
+        decoded_images.push(ChatAttachmentPushImage {
+            name,
+            mime,
+            sha256,
+            bytes,
+        });
+    }
+    Ok((workspace_id, decoded_images))
+}
+
+async fn cloud_mcp_receive_chat_attachment_push(message: &Value) -> Result<Value, String> {
+    let (workspace_id, images) = cloud_mcp_decode_chat_attachment_push(message)?;
+    let image_count = images.len();
+    let total_bytes = images.iter().map(|image| image.bytes.len()).sum::<usize>();
+    let stage_workspace_id = workspace_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        stage_chat_attachment_push_images(&stage_workspace_id, images)
+    })
+    .await
+    .map_err(|error| format!("chat attachment staging worker failed: {error}"))??;
+    Ok(json!({
+        "workspace_id": workspace_id,
+        "image_count": image_count,
+        "total_bytes": total_bytes,
+        "staged": result.staged,
+        "marker_block": result.marker_block,
+    }))
+}
+
 async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
     let Ok(message) = serde_json::from_str::<Value>(text) else {
         return;
@@ -18501,7 +18794,9 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         let device_profile = cloud_mcp_desktop_device_profile();
         let (plan_name, device_limit) = cloud_mcp_account_plan(state).await;
         let connection_epoch = state.global_ws_epoch.load(Ordering::SeqCst);
-        let hello = json!({
+        let (hello_workspaces, workspace_catalog_ready) =
+            cloud_mcp_lifecycle_workspaces(state).await;
+        let mut hello = json!({
             "kind": "hello",
             "id": format!("hello-{}", cloud_mcp_now_ms()),
             "client_id": CLOUD_MCP_RUST_CLIENT_ID,
@@ -18524,8 +18819,12 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
                 "connection_id": connection_id.clone(),
                 "message_token": message_token.clone(),
             },
-            "workspaces": cloud_mcp_lifecycle_workspaces(state).await,
+            "workspace_catalog_ready": workspace_catalog_ready,
+            "workspace_snapshot_complete": workspace_catalog_ready,
         });
+        if workspace_catalog_ready {
+            hello["workspaces"] = Value::Array(hello_workspaces);
+        }
         if let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() {
             let _ = tx.send(hello);
         }
@@ -18576,6 +18875,37 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         cloud_mcp_spawn_account_sync_resume(state, "websocket_hello_ack");
         cloud_mcp_spawn_account_asset_inventory_sync(state, "websocket_hello_ack");
         cloud_mcp_spawn_local_scripts_inventory_sync(state, "websocket_hello_ack");
+        return;
+    }
+    if message.get("kind").and_then(Value::as_str) == Some(CLOUD_MCP_CHAT_ATTACHMENT_PUSH_KIND) {
+        let source_request_id = message
+            .get("source_request_id")
+            .or_else(|| message.get("sourceRequestId"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        match cloud_mcp_receive_chat_attachment_push(&message).await {
+            Ok(result) => {
+                log_cloud_sync_event(
+                    "chat_attachment_push.staged",
+                    json!({
+                        "source_request_id": source_request_id,
+                        "workspace_id": result.get("workspace_id").cloned().unwrap_or(Value::Null),
+                        "image_count": result.get("image_count").cloned().unwrap_or(Value::Null),
+                        "total_bytes": result.get("total_bytes").cloned().unwrap_or(Value::Null),
+                        "staged_count": result.get("staged").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
+                    }),
+                );
+            }
+            Err(error) => {
+                log_cloud_sync_event(
+                    "chat_attachment_push.stage_failed",
+                    json!({
+                        "source_request_id": source_request_id,
+                        "error": clean_terminal_telemetry_text(&error),
+                    }),
+                );
+            }
+        }
         return;
     }
     if let Some(id) = message.get("id").and_then(Value::as_str) {
@@ -19053,7 +19383,9 @@ async fn cloud_mcp_send_liveness_pong_event(
     let sent_ms = cloud_mcp_now_ms();
     let auth = cloud_mcp_ws_auth_object(state).await?;
     let device_profile = cloud_mcp_desktop_device_profile();
-    let payload = json!({
+    let (lifecycle_workspaces, workspace_catalog_ready) =
+        cloud_mcp_lifecycle_workspaces(state).await;
+    let mut payload = json!({
         "source": "rust-diffforge-liveness",
         "event_kind": "desktop_liveness_pong",
         "agent_id": "rust-diffforge",
@@ -19096,9 +19428,14 @@ async fn cloud_mcp_send_liveness_pong_event(
         "rust_elapsed_ms": sent_ms.saturating_sub(received_ms),
         "registered_workspace_count": snapshot.registered_workspaces.len(),
         "global_ws_connected": snapshot.global_ws_connected,
+        "workspace_catalog_ready": workspace_catalog_ready,
+        "workspace_snapshot_complete": workspace_catalog_ready,
         "status": "connected",
         "ts_ms": sent_ms,
     });
+    if workspace_catalog_ready {
+        payload["workspaces"] = Value::Array(lifecycle_workspaces);
+    }
     let request = cloud_mcp_event_envelope("desktop_liveness_pong", &payload);
     let envelope = json!({
         "kind": "event",
@@ -19287,7 +19624,9 @@ async fn cloud_mcp_send_lifecycle_event(
     let snapshot = cloud_mcp_status_snapshot(state).await;
     let auth = cloud_mcp_ws_auth_object(state).await?;
     let device_profile = cloud_mcp_desktop_device_profile();
-    let payload = json!({
+    let (lifecycle_workspaces, workspace_catalog_ready) =
+        cloud_mcp_lifecycle_workspaces(state).await;
+    let mut payload = json!({
         "source": "rust-diffforge-lifecycle",
         "event_kind": event_kind,
         "agent_id": "rust-diffforge",
@@ -19307,9 +19646,13 @@ async fn cloud_mcp_send_lifecycle_event(
         "connection_epoch": connection_epoch,
         "registered_workspace_count": snapshot.registered_workspace_count,
         "global_ws_connected": snapshot.global_ws_connected,
-        "workspaces": cloud_mcp_lifecycle_workspaces(state).await,
+        "workspace_catalog_ready": workspace_catalog_ready,
+        "workspace_snapshot_complete": workspace_catalog_ready,
         "ts_ms": now,
     });
+    if workspace_catalog_ready {
+        payload["workspaces"] = Value::Array(lifecycle_workspaces);
+    }
     let request = cloud_mcp_event_envelope(event_kind, &payload);
     let envelope = json!({
         "kind": "event",
@@ -19386,6 +19729,46 @@ fn cloud_mcp_remote_command_field_i64(event: &Value, keys: &[&str]) -> Option<i6
 }
 
 fn cloud_mcp_remote_command_matches_device(event: &Value) -> bool {
+    let device = cloud_mcp_desktop_device_profile();
+    let profile_matches = |candidate: &str| {
+        let candidate_key = cloud_mcp_device_id_match_key(candidate);
+        if candidate_key.is_empty() {
+            return false;
+        }
+        let scalar_match = [
+            "device_id",
+            "deviceId",
+            "web_device_id",
+            "webDeviceId",
+            "machine_id",
+            "machineId",
+        ]
+        .iter()
+        .filter_map(|key| device.get(*key).and_then(Value::as_str))
+        .any(|value| cloud_mcp_device_id_match_key(value) == candidate_key);
+        scalar_match
+            || ["device_aliases", "deviceAliases"]
+                .iter()
+                .filter_map(|key| device.get(*key).and_then(Value::as_array))
+                .flatten()
+                .filter_map(Value::as_str)
+                .any(|value| cloud_mcp_device_id_match_key(value) == candidate_key)
+    };
+
+    // This root-only field is stamped by the cloud immediately before delivery to
+    // the authenticated desktop socket. Do not read it from the user payload/request.
+    let routed_field_present = ["cloud_routed_native_device_id", "cloudRoutedNativeDeviceId"]
+        .iter()
+        .any(|key| event.get(*key).is_some());
+    if routed_field_present {
+        return ["cloud_routed_native_device_id", "cloudRoutedNativeDeviceId"]
+            .iter()
+            .filter_map(|key| event.get(*key).and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .any(profile_matches);
+    }
+
     let Some(target_device_id) =
         cloud_mcp_remote_command_field_text(event, &["target_device_id", "targetDeviceId"])
             .map(|value| value.trim().to_string())
@@ -19393,15 +19776,7 @@ fn cloud_mcp_remote_command_matches_device(event: &Value) -> bool {
     else {
         return false;
     };
-    let device = cloud_mcp_desktop_device_profile();
-    [
-        cloud_mcp_payload_text(&device, &["device_id"]),
-        cloud_mcp_payload_text(&device, &["deviceId"]),
-    ]
-    .into_iter()
-    .flatten()
-    .map(|value| value.trim().to_string())
-    .any(|value| value == target_device_id)
+    profile_matches(&target_device_id)
 }
 
 fn cloud_mcp_remote_command_receipt_key(event: &Value) -> Option<String> {
@@ -19418,16 +19793,21 @@ fn cloud_mcp_remote_command_receipt_key(event: &Value) -> Option<String> {
     let command_kind = cloud_mcp_remote_command_field_text(event, &["command_kind", "commandKind"])
         .unwrap_or_default();
     let workspace_id = cloud_mcp_remote_command_field_text(event, &["workspace_id", "workspaceId"])
+        .map(|value| {
+            cloud_mcp_canonical_workspace_id_from_value(&value, event, cloud_mcp_desktop_platform())
+        })
         .unwrap_or_default();
     let intent_id =
         cloud_mcp_remote_command_field_text(event, &["intent_id", "intentId"]).unwrap_or_default();
     Some(format!(
-        "{}::{}::{}::{}::{}",
-        client_id.trim(),
-        workspace_id.trim(),
-        command_kind.trim(),
-        command_id,
-        intent_id.trim()
+        "remote-command-receipt::{command_id}::{}",
+        cloud_mcp_outbox_payload_hash(&json!([
+            client_id.trim(),
+            workspace_id,
+            command_kind.trim(),
+            command_id.as_str(),
+            intent_id.trim(),
+        ]))
     ))
 }
 
@@ -20493,8 +20873,11 @@ fn cloud_mcp_apply_remote_workspace_lever(
         return false;
     }
     let command_kind = cloud_mcp_remote_command_kind(event);
-    let workspace_id = cloud_mcp_remote_command_field_text(event, &["workspace_id", "workspaceId"])
-        .unwrap_or_default();
+    let requested_workspace_id =
+        cloud_mcp_remote_command_field_text(event, &["workspace_id", "workspaceId"])
+            .unwrap_or_default();
+    let workspace_id = cloud_mcp_resolve_local_workspace_id(&requested_workspace_id)
+        .unwrap_or(requested_workspace_id);
     if workspace_id.is_empty() {
         return false;
     }
@@ -21173,7 +21556,11 @@ fn cloud_mcp_headless_terminal_panel_close_command(
     workspace_id: &str,
     terminal: &Value,
 ) -> Option<Value> {
-    let workspace_id = workspace_id.trim();
+    let workspace_id = cloud_mcp_canonical_workspace_id_from_value(
+        workspace_id,
+        original_event,
+        cloud_mcp_desktop_platform(),
+    );
     if workspace_id.is_empty() {
         return None;
     }
@@ -21277,6 +21664,7 @@ fn cloud_mcp_terminal_agent_identity(value: &str) -> String {
 }
 
 fn cloud_mcp_terminal_identity_values(workspace_id: &str, terminal: &Value) -> Vec<String> {
+    let workspace_id = cloud_mcp_workspace_id_match_key(workspace_id);
     let mut values = Vec::<String>::new();
     let mut push = |value: String| {
         let trimmed = value.trim();
@@ -21299,16 +21687,12 @@ fn cloud_mcp_terminal_identity_values(workspace_id: &str, terminal: &Value) -> V
         }
     }
 
-    if !workspace_id.trim().is_empty() {
+    if !workspace_id.is_empty() {
         if let Some(terminal_index) =
             cloud_mcp_payload_i64(terminal, &["terminal_index", "terminalIndex", "index"])
         {
             if terminal_index >= 0 {
-                let base_id = format!(
-                    "workspace-terminal-{}-{}",
-                    workspace_id.trim(),
-                    terminal_index
-                );
+                let base_id = format!("workspace-terminal-{}-{}", workspace_id, terminal_index);
                 push(base_id.clone());
                 if let Some(agent_id) = cloud_mcp_payload_text(
                     terminal,
@@ -21446,6 +21830,7 @@ fn cloud_mcp_apply_remote_terminal_interrupt_lever(
                     .filter(|workspace| {
                         workspace_id.is_empty()
                             || cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId"])
+                                .map(|value| cloud_mcp_workspace_id_match_key(&value))
                                 .as_deref()
                                 == Some(workspace_id.as_str())
                     })
@@ -21580,8 +21965,9 @@ fn cloud_mcp_apply_remote_terminal_lever(
         }
         _ => return false,
     };
-    let workspace_id =
-        cloud_mcp_payload_text(event, &["workspace_id", "workspaceId"]).unwrap_or_default();
+    let workspace_id = cloud_mcp_payload_text(event, &["workspace_id", "workspaceId"])
+        .map(|value| cloud_mcp_workspace_id_match_key(&value))
+        .unwrap_or_default();
     let target_terminal_id = cloud_mcp_payload_text(
         event,
         &[
@@ -21728,6 +22114,7 @@ fn cloud_mcp_apply_remote_terminal_lever(
                     .iter()
                     .filter(|workspace| {
                         cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId"])
+                            .map(|value| cloud_mcp_workspace_id_match_key(&value))
                             .as_deref()
                             == Some(workspace_id.as_str())
                     })
@@ -22358,15 +22745,20 @@ fn cloud_mcp_apply_remote_device_lever(
                 .await;
             }
             "agent_account_push" => {
-                let push_id =
-                    cloud_mcp_remote_command_field_text(&event, &["push_id", "pushId"])
-                        .or_else(|| {
-                            cloud_mcp_remote_command_field_text(&event, &["intent_id", "intentId"])
-                        })
-                        .unwrap_or_default();
+                let push_id = cloud_mcp_remote_command_field_text(&event, &["push_id", "pushId"])
+                    .or_else(|| {
+                        cloud_mcp_remote_command_field_text(&event, &["intent_id", "intentId"])
+                    })
+                    .unwrap_or_default();
                 let agent_kind = cloud_mcp_remote_command_field_text(
                     &event,
-                    &["agent_kind", "agentKind", "provider", "agent_provider", "agentProvider"],
+                    &[
+                        "agent_kind",
+                        "agentKind",
+                        "provider",
+                        "agent_provider",
+                        "agentProvider",
+                    ],
                 )
                 .unwrap_or_default();
                 let sealed_blob =
@@ -22385,10 +22777,15 @@ fn cloud_mcp_apply_remote_device_lever(
                         return Err("Agent account push is missing the sealed payload.".to_string());
                     }
                     if sealed_algorithm != AGENT_ACCOUNT_PUSH_SEALED_ALGORITHM {
-                        return Err("Agent account push uses an unsupported sealed payload algorithm.".to_string());
+                        return Err(
+                            "Agent account push uses an unsupported sealed payload algorithm."
+                                .to_string(),
+                        );
                     }
-                    let expected_kind = agent_accounts_supported_kind(&agent_kind)
-                        .ok_or_else(|| "Agent account push is missing a supported agent kind.".to_string())?;
+                    let expected_kind =
+                        agent_accounts_supported_kind(&agent_kind).ok_or_else(|| {
+                            "Agent account push is missing a supported agent kind.".to_string()
+                        })?;
                     let plaintext = agent_account_push_open_blob(&sealed_blob)?;
                     let blob = agent_account_push_decode_blob(&plaintext)?;
                     let now_ms = todo_dispatch_now_ms();
@@ -22404,7 +22801,8 @@ fn cloud_mcp_apply_remote_device_lever(
                     )?;
                     agent_account_push_reject_if_applied(&push_id, now_ms)?;
                     if blob.agent_kind != expected_kind {
-                        return Err("Agent account push kind does not match the sealed payload.".to_string());
+                        return Err("Agent account push kind does not match the sealed payload."
+                            .to_string());
                     }
                     let expires_at_ms = blob.expires_at_ms;
                     let mut details = agent_accounts_materialize_pushed_account(blob)?;
@@ -22412,8 +22810,14 @@ fn cloud_mcp_apply_remote_device_lever(
                     if let Some(object) = details.as_object_mut() {
                         object.insert("push_id".to_string(), json!(push_id.clone()));
                         object.insert("pushId".to_string(), json!(push_id.clone()));
-                        object.insert("sealed_algorithm".to_string(), json!(sealed_algorithm.clone()));
-                        object.insert("sealedAlgorithm".to_string(), json!(sealed_algorithm.clone()));
+                        object.insert(
+                            "sealed_algorithm".to_string(),
+                            json!(sealed_algorithm.clone()),
+                        );
+                        object.insert(
+                            "sealedAlgorithm".to_string(),
+                            json!(sealed_algorithm.clone()),
+                        );
                     }
                     Ok(details)
                 })();
@@ -22592,8 +22996,9 @@ async fn cloud_mcp_report_terminal_output_status(
     state: &CloudMcpState,
     event: &Value,
 ) {
-    let workspace_id =
-        cloud_mcp_payload_text(event, &["workspace_id", "workspaceId"]).unwrap_or_default();
+    let workspace_id = cloud_mcp_payload_text(event, &["workspace_id", "workspaceId"])
+        .map(|value| cloud_mcp_workspace_id_match_key(&value))
+        .unwrap_or_default();
     let target_terminal_id = cloud_mcp_payload_text(
         event,
         &[
@@ -22638,7 +23043,10 @@ async fn cloud_mcp_report_terminal_output_status(
             workspaces
                 .iter()
                 .filter(|workspace| {
-                    cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId"]).as_deref()
+                    cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId"])
+                        .as_deref()
+                        .map(cloud_mcp_workspace_id_match_key)
+                        .as_deref()
                         == Some(workspace_id.as_str())
                 })
                 .flat_map(|workspace| {
@@ -23240,8 +23648,7 @@ fn cloud_mcp_notification_preferences_timestamp(value: &Value) -> u64 {
 fn cloud_mcp_notification_preferences_timestamp_is_plausible(value: &Value, now_ms: u64) -> bool {
     let timestamp = cloud_mcp_notification_preferences_timestamp(value);
     timestamp > 0
-        && timestamp
-            <= now_ms.saturating_add(CLOUD_MCP_NOTIFICATION_PREFERENCES_MAX_CLOCK_SKEW_MS)
+        && timestamp <= now_ms.saturating_add(CLOUD_MCP_NOTIFICATION_PREFERENCES_MAX_CLOCK_SKEW_MS)
 }
 
 fn cloud_mcp_notification_preferences_source(value: &Value) -> &Value {
@@ -23252,11 +23659,7 @@ fn cloud_mcp_notification_preferences_source(value: &Value) -> &Value {
         .unwrap_or(value)
 }
 
-fn cloud_mcp_notification_preferences_bool(
-    source: &Value,
-    keys: &[&str],
-    fallback: bool,
-) -> bool {
+fn cloud_mcp_notification_preferences_bool(source: &Value, keys: &[&str], fallback: bool) -> bool {
     for key in keys {
         let Some(candidate) = source.get(*key) else {
             continue;
@@ -23394,13 +23797,21 @@ fn cloud_mcp_sanitize_notification_preferences(value: &Value) -> Option<Value> {
             ["loop_run_completed", "loopRunCompleted"],
             true,
         ),
-        ("loop_run_failed", ["loop_run_failed", "loopRunFailed"], true),
+        (
+            "loop_run_failed",
+            ["loop_run_failed", "loopRunFailed"],
+            true,
+        ),
         (
             "loop_run_blocked",
             ["loop_run_blocked", "loopRunBlocked"],
             true,
         ),
-        ("awaiting_device", ["awaiting_device", "awaitingDevice"], true),
+        (
+            "awaiting_device",
+            ["awaiting_device", "awaitingDevice"],
+            true,
+        ),
         ("account_events", ["account_events", "accountEvents"], true),
     ] {
         push.insert(
@@ -23480,7 +23891,11 @@ fn cloud_mcp_notification_preferences_write_app(
     app: &AppHandle,
     preferences: &Value,
 ) -> Result<(), String> {
-    app_local_state_write(app, CLOUD_MCP_NOTIFICATION_PREFERENCES_STATE_KEY, preferences)
+    app_local_state_write(
+        app,
+        CLOUD_MCP_NOTIFICATION_PREFERENCES_STATE_KEY,
+        preferences,
+    )
 }
 
 static CLOUD_MCP_NOTIFICATION_PREFERENCES_WRITE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
@@ -23649,7 +24064,11 @@ fn cloud_mcp_is_notification_preferences_sync_unit_event(event_kind: &str, event
         return true;
     }
     cloud_mcp_payload_text(event, &["sync_unit", "syncUnit"])
-        .map(|sync_unit| sync_unit.trim().eq_ignore_ascii_case("notification_preferences"))
+        .map(|sync_unit| {
+            sync_unit
+                .trim()
+                .eq_ignore_ascii_case("notification_preferences")
+        })
         .unwrap_or(false)
 }
 
@@ -23690,15 +24109,13 @@ fn cloud_mcp_notification_preferences_authoritative_local_timestamp(
     current: &Value,
     now_ms: u64,
 ) -> u64 {
-    let max_timestamp = now_ms
-        .saturating_add(CLOUD_MCP_NOTIFICATION_PREFERENCES_MAX_CLOCK_SKEW_MS);
-    let current_timestamp = if cloud_mcp_notification_preferences_timestamp_is_plausible(
-        current, now_ms,
-    ) {
-        cloud_mcp_notification_preferences_timestamp(current)
-    } else {
-        0
-    };
+    let max_timestamp = now_ms.saturating_add(CLOUD_MCP_NOTIFICATION_PREFERENCES_MAX_CLOCK_SKEW_MS);
+    let current_timestamp =
+        if cloud_mcp_notification_preferences_timestamp_is_plausible(current, now_ms) {
+            cloud_mcp_notification_preferences_timestamp(current)
+        } else {
+            0
+        };
     now_ms
         .max(current_timestamp.saturating_add(1))
         .min(max_timestamp)
@@ -23729,7 +24146,8 @@ async fn cloud_mcp_apply_notification_preferences_from_account_live_state(
     state: &CloudMcpState,
     event: &Value,
 ) {
-    let Some(preferences) = cloud_mcp_notification_preferences_from_account_live_state(event) else {
+    let Some(preferences) = cloud_mcp_notification_preferences_from_account_live_state(event)
+    else {
         return;
     };
     let applied = {
@@ -23793,10 +24211,7 @@ async fn cloud_mcp_set_notification_preferences(
             // Client wall clocks are advisory only. The desktop serializes
             // writes and assigns a bounded authoritative timestamp so a
             // future-stamped client cannot pin every other device's edits.
-            object.insert(
-                "updated_at_ms".to_string(),
-                json!(authoritative_timestamp),
-            );
+            object.insert("updated_at_ms".to_string(), json!(authoritative_timestamp));
         }
         cloud_mcp_notification_preferences_write_app(&app, &preferences)?;
     }
@@ -23889,7 +24304,7 @@ async fn cloud_mcp_record_agent_chat_model_config(
             "Agent chat model config record requires provider_session_id or agent_chat_session_id."
                 .to_string()
         })?;
-    let workspace_id = workspace_id.trim().to_string();
+    let workspace_id = cloud_mcp_workspace_id_match_key(&workspace_id);
     if workspace_id.is_empty() {
         return Err("Agent chat model config record requires workspace_id.".to_string());
     }
@@ -24014,7 +24429,7 @@ async fn cloud_mcp_record_agent_chat_model_config(
         "session_id": session_id.as_str(),
         "workspace_id": workspace_id.as_str(),
     }));
-    let payload = json!({
+    let mut payload = json!({
         "c": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_CONTRACT,
         "contract": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_CONTRACT,
         "m": "delta",
@@ -24150,7 +24565,7 @@ async fn cloud_mcp_record_agent_chat_permission_config(
             "Agent chat permission config record requires provider_session_id or agent_chat_session_id."
                 .to_string()
         })?;
-    let workspace_id = workspace_id.trim().to_string();
+    let workspace_id = cloud_mcp_workspace_id_match_key(&workspace_id);
     if workspace_id.is_empty() {
         return Err("Agent chat permission config record requires workspace_id.".to_string());
     }
@@ -24918,9 +25333,586 @@ fn cloud_mcp_desktop_device_id(device_name: &str, platform: &str) -> String {
     format!("{}-{}", platform, fingerprint)
 }
 
-async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
-    let mut seen = HashSet::<String>::new();
+fn cloud_mcp_device_id_match_key(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let cleaned = trimmed
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let cleaned = cleaned.trim_matches(['.', '_', '-']);
+    if cleaned.is_empty() {
+        "dev-client".to_string()
+    } else {
+        cleaned
+            .chars()
+            .take(96)
+            .collect::<String>()
+            .to_ascii_lowercase()
+    }
+}
+
+fn cloud_mcp_workspace_id_match_key(value: &str) -> String {
+    cloud_mcp_workspace_id_match_key_for_platform(value, cloud_mcp_desktop_platform())
+}
+
+fn cloud_mcp_platform_is_windows(platform: &str) -> bool {
+    let platform = platform.trim().to_ascii_lowercase();
+    matches!(platform.as_str(), "windows" | "win32" | "win64") || platform.starts_with("windows ")
+}
+
+fn cloud_mcp_workspace_id_match_key_for_platform(value: &str, platform: &str) -> String {
+    let raw = value.trim();
+    let windows_path = cloud_mcp_platform_is_windows(platform);
+    let mut normalized = if windows_path {
+        raw.replace('\\', "/")
+    } else {
+        raw.to_string()
+    };
+    if normalized.is_empty() {
+        return normalized;
+    }
+    if windows_path {
+        if let Some(stripped) = normalized.strip_prefix("//?/") {
+            normalized = stripped.to_string();
+        }
+        if normalized
+            .get(..4)
+            .map(|prefix| prefix.eq_ignore_ascii_case("UNC/"))
+            .unwrap_or(false)
+        {
+            normalized = format!("//{}", &normalized[4..]);
+        }
+        if normalized.starts_with('/')
+            && normalized
+                .as_bytes()
+                .get(1..3)
+                .map(|slice| slice.len() == 2 && slice[0].is_ascii_alphabetic() && slice[1] == b':')
+                .unwrap_or(false)
+        {
+            normalized.remove(0);
+        }
+        while normalized.contains("//") {
+            normalized = normalized.replace("//", "/");
+        }
+    }
+    let drive_root = normalized.len() == 3
+        && normalized.as_bytes()[0].is_ascii_alphabetic()
+        && normalized.as_bytes()[1] == b':'
+        && normalized.as_bytes()[2] == b'/';
+    if normalized.len() > 1 && !drive_root {
+        normalized = normalized.trim_end_matches('/').to_string();
+    }
+    if windows_path {
+        normalized.to_lowercase()
+    } else {
+        normalized
+    }
+}
+
+fn cloud_mcp_workspace_platform_hint(value: &Value, fallback: &str) -> String {
+    if let Some(platform) = cloud_mcp_payload_text(
+        value,
+        &[
+            "device_platform",
+            "devicePlatform",
+            "platform",
+            "os",
+            "system",
+        ],
+    ) {
+        return platform;
+    }
+    for key in ["device", "payload", "request", "state"] {
+        let Some(nested) = value.get(key) else {
+            continue;
+        };
+        if let Some(platform) = cloud_mcp_payload_text(
+            nested,
+            &[
+                "device_platform",
+                "devicePlatform",
+                "platform",
+                "os",
+                "system",
+            ],
+        ) {
+            return platform;
+        }
+    }
+    fallback.trim().to_string()
+}
+
+fn cloud_mcp_canonical_workspace_id_from_value(
+    workspace_id: &str,
+    value: &Value,
+    fallback_platform: &str,
+) -> String {
+    let platform = cloud_mcp_workspace_platform_hint(value, fallback_platform);
+    cloud_mcp_workspace_id_match_key_for_platform(workspace_id, &platform)
+}
+
+fn cloud_mcp_legacy_sanitized_workspace_id(value: &str) -> String {
+    let cleaned = value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let cleaned = cleaned.trim_matches(['.', '_', '-']);
+    if cleaned.is_empty() {
+        // Match the deployed cloud sanitizer exactly so legacy tombstones and
+        // outbox rows for non-ASCII/separator-only ids remain addressable.
+        "dev-client".to_string()
+    } else {
+        cleaned.chars().take(96).collect()
+    }
+}
+
+fn cloud_mcp_workspace_id_matches_canonical_or_legacy(
+    candidate_id: &str,
+    stored_id: &str,
+    platform: &str,
+) -> bool {
+    let candidate = cloud_mcp_workspace_id_match_key_for_platform(candidate_id, platform);
+    if candidate.is_empty() {
+        return false;
+    }
+    if cloud_mcp_workspace_id_match_key_for_platform(stored_id, platform) == candidate {
+        return true;
+    }
+    let legacy = cloud_mcp_legacy_sanitized_workspace_id(&candidate);
+    let canonical_stored = cloud_mcp_workspace_id_match_key_for_platform(stored_id, platform);
+    let stored_legacy = cloud_mcp_legacy_sanitized_workspace_id(&canonical_stored);
+    if cloud_mcp_platform_is_windows(platform) {
+        stored_id.eq_ignore_ascii_case(&legacy)
+            || candidate_id.eq_ignore_ascii_case(&stored_legacy)
+    } else {
+        stored_id == legacy || candidate_id == stored_legacy
+    }
+}
+
+fn cloud_mcp_canonicalize_workspace_fields(value: &mut Value, fallback_platform: &str) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                cloud_mcp_canonicalize_workspace_fields(item, fallback_platform);
+            }
+        }
+        Value::Object(object) => {
+            let object_value = Value::Object(object.clone());
+            let platform = cloud_mcp_workspace_platform_hint(&object_value, fallback_platform);
+            let source_platform = cloud_mcp_payload_text(
+                &object_value,
+                &[
+                    "source_platform",
+                    "sourcePlatform",
+                    "origin_platform",
+                    "originPlatform",
+                ],
+            )
+            .or_else(|| {
+                object_value
+                    .get("source_device")
+                    .or_else(|| object_value.get("sourceDevice"))
+                    .or_else(|| object_value.get("dispatch_source"))
+                    .or_else(|| object_value.get("dispatchSource"))
+                    .map(|source| cloud_mcp_workspace_platform_hint(source, &platform))
+            })
+            .unwrap_or_else(|| platform.clone());
+            let target_platform =
+                cloud_mcp_payload_text(&object_value, &["target_platform", "targetPlatform"])
+                    .or_else(|| {
+                        object_value
+                            .get("target_device")
+                            .or_else(|| object_value.get("targetDevice"))
+                            .or_else(|| object_value.get("dispatch_target"))
+                            .or_else(|| object_value.get("dispatchTarget"))
+                            .map(|target| cloud_mcp_workspace_platform_hint(target, &platform))
+                    })
+                    .unwrap_or_else(|| platform.clone());
+            for key in [
+                "workspace_id",
+                "workspaceId",
+                "observer_workspace_id",
+                "observerWorkspaceId",
+                "w",
+                "wid",
+            ] {
+                if let Some(Value::String(workspace_id)) = object.get_mut(key) {
+                    *workspace_id =
+                        cloud_mcp_workspace_id_match_key_for_platform(workspace_id, &platform);
+                }
+            }
+            for key in [
+                "source_workspace_id",
+                "sourceWorkspaceId",
+                "todo_workspace_id",
+                "todoWorkspaceId",
+                "origin_workspace_id",
+                "originWorkspaceId",
+                "requested_by_workspace_id",
+                "requestedByWorkspaceId",
+            ] {
+                if let Some(Value::String(workspace_id)) = object.get_mut(key) {
+                    *workspace_id = cloud_mcp_workspace_id_match_key_for_platform(
+                        workspace_id,
+                        &source_platform,
+                    );
+                }
+            }
+            for key in ["target_workspace_id", "targetWorkspaceId"] {
+                if let Some(Value::String(workspace_id)) = object.get_mut(key) {
+                    *workspace_id = cloud_mcp_workspace_id_match_key_for_platform(
+                        workspace_id,
+                        &target_platform,
+                    );
+                }
+            }
+            for key in ["workspace_ids", "workspaceIds"] {
+                if let Some(Value::Array(ids)) = object.get_mut(key) {
+                    for id in ids.iter_mut() {
+                        if let Value::String(workspace_id) = id {
+                            *workspace_id = cloud_mcp_workspace_id_match_key_for_platform(
+                                workspace_id,
+                                &platform,
+                            );
+                        }
+                    }
+                }
+            }
+            for (keys, key_platform) in [
+                (
+                    &[
+                        "source_workspace_ids",
+                        "sourceWorkspaceIds",
+                        "origin_workspace_ids",
+                        "originWorkspaceIds",
+                    ][..],
+                    source_platform.as_str(),
+                ),
+                (
+                    &["target_workspace_ids", "targetWorkspaceIds"][..],
+                    target_platform.as_str(),
+                ),
+            ] {
+                for key in keys {
+                    if let Some(Value::Array(ids)) = object.get_mut(*key) {
+                        for id in ids.iter_mut() {
+                            if let Value::String(workspace_id) = id {
+                                *workspace_id = cloud_mcp_workspace_id_match_key_for_platform(
+                                    workspace_id,
+                                    key_platform,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            for (key, nested) in object.iter_mut() {
+                if nested.is_object() || nested.is_array() {
+                    let nested_platform = match key.as_str() {
+                        "target" | "target_device" | "targetDevice" | "dispatch_target"
+                        | "dispatchTarget" => target_platform.as_str(),
+                        "source" | "source_device" | "sourceDevice" | "dispatch_source"
+                        | "dispatchSource" => source_platform.as_str(),
+                        _ => platform.as_str(),
+                    };
+                    cloud_mcp_canonicalize_workspace_fields(nested, nested_platform);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn cloud_mcp_resolve_local_workspace_id(requested_workspace_id: &str) -> Option<String> {
+    cloud_mcp_resolve_local_workspace_id_for_platform(
+        requested_workspace_id,
+        cloud_mcp_desktop_platform(),
+    )
+}
+
+fn cloud_mcp_resolve_local_workspace_id_for_platform(
+    requested_workspace_id: &str,
+    platform: &str,
+) -> Option<String> {
+    let requested_key =
+        cloud_mcp_workspace_id_match_key_for_platform(requested_workspace_id, platform);
+    if requested_key.is_empty() {
+        return None;
+    }
+    cloud_mcp_authoritative_local_workspace_catalog()
+        .ok()
+        .flatten()?
+        .into_iter()
+        .find_map(|workspace| {
+            let workspace_id =
+                cloud_mcp_payload_text(&workspace, &["workspace_id", "workspaceId", "id"])?;
+            (cloud_mcp_workspace_id_match_key_for_platform(&workspace_id, platform)
+                == requested_key)
+                .then_some(workspace_id)
+        })
+}
+
+/// Read the Rust-owned workspace catalog that backs `local_workspaces_load`.
+/// Merely having an in-memory runtime row is not proof that the catalog finished
+/// hydrating after startup, so a missing or malformed file deliberately returns
+/// `None` and blocks authoritative workspace publication.
+fn cloud_mcp_authoritative_local_workspace_catalog() -> Result<Option<Vec<Value>>, String> {
+    let path = if let Some(app) = CLOUD_MCP_SYNC_STATUS_APP.get() {
+        local_workspace_store_path(app, &cloud_mcp_process_account_scope_key())?
+    } else {
+        // Daemon/startup paths can run before the AppHandle is registered. Use
+        // the same device-data root and scope filename as local_workspaces_load
+        // so readiness never depends on a test-only or secondary cache.
+        let Some(root) = cloud_mcp_native_data_root() else {
+            return Ok(None);
+        };
+        root.join(DEVICE_WORKSPACE_CATALOG_DIR).join(format!(
+            "{}.json",
+            local_workspace_scope_file_key(&cloud_mcp_process_account_scope_key())
+        ))
+    };
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&path).map_err(|error| {
+        format!("Unable to read authoritative local workspace catalog: {error}")
+    })?;
+    let value = serde_json::from_str::<Value>(&text).map_err(|error| {
+        format!("Unable to parse authoritative local workspace catalog: {error}")
+    })?;
+    let items = value
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| {
+            "Authoritative local workspace catalog is missing its workspaces array.".to_string()
+        })?;
+    let deleted_workspace_ids = cloud_mcp_deleted_workspace_ids();
+    let platform = cloud_mcp_desktop_platform();
+    Ok(Some(
+        local_workspace_catalog_visible_items(items)
+            .into_iter()
+            .filter_map(|mut workspace| {
+                if cloud_mcp_workspace_snapshot_is_locally_archived(&workspace) {
+                    return None;
+                }
+                let workspace_id = local_workspace_catalog_entry_id(&workspace)?;
+                let canonical_id =
+                    cloud_mcp_workspace_id_match_key_for_platform(&workspace_id, platform);
+                if canonical_id.is_empty()
+                    || deleted_workspace_ids.iter().any(|deleted_id| {
+                        cloud_mcp_workspace_id_matches_canonical_or_legacy(
+                            &canonical_id,
+                            deleted_id,
+                            platform,
+                        )
+                    })
+                {
+                    return None;
+                }
+                if let Some(object) = workspace.as_object_mut() {
+                    object.insert("workspace_id".to_string(), json!(canonical_id.clone()));
+                    object.insert("workspaceId".to_string(), json!(canonical_id.clone()));
+                    object.insert("id".to_string(), json!(canonical_id));
+                }
+                Some(workspace)
+            })
+            .collect(),
+    ))
+}
+
+fn cloud_mcp_overlay_workspace_catalog_rows(
+    authoritative: Vec<Value>,
+    incoming: &[Value],
+) -> Vec<Value> {
+    let platform = cloud_mcp_desktop_platform();
+    let mut incoming_by_id = HashMap::<String, Value>::new();
+    for workspace in incoming {
+        let workspace_id =
+            cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])
+                .unwrap_or_default();
+        let key = cloud_mcp_workspace_id_match_key_for_platform(&workspace_id, platform);
+        if !key.is_empty() {
+            if let Some(existing) = incoming_by_id.get_mut(&key) {
+                cloud_mcp_live_state_merge_object(existing, workspace.clone());
+            } else {
+                incoming_by_id.insert(key, workspace.clone());
+            }
+        }
+    }
+    authoritative
+        .into_iter()
+        .filter_map(|mut workspace| {
+            let workspace_id =
+                cloud_mcp_payload_text(&workspace, &["workspace_id", "workspaceId", "id"])?;
+            let key = cloud_mcp_workspace_id_match_key_for_platform(&workspace_id, platform);
+            if let Some(incoming_workspace) = incoming_by_id.get(&key) {
+                cloud_mcp_live_state_merge_object(&mut workspace, incoming_workspace.clone());
+            }
+            Some(workspace)
+        })
+        .collect()
+}
+
+fn cloud_mcp_event_carries_authoritative_workspace_snapshot(event_kind: &str) -> bool {
+    matches!(
+        event_kind.trim().to_ascii_lowercase().as_str(),
+        "device_workspaces_snapshot" | "device_live_state_snapshot"
+    )
+}
+
+const CLOUD_MCP_AUTHORITATIVE_WORKSPACE_SNAPSHOT_REBUILD_PREFIX: &str =
+    "authoritative_workspace_snapshot_rebuild:";
+
+fn cloud_mcp_authoritative_workspace_snapshot_rebuild_reason(error: &str) -> Option<&str> {
+    error
+        .strip_prefix(CLOUD_MCP_AUTHORITATIVE_WORKSPACE_SNAPSHOT_REBUILD_PREFIX)
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+}
+
+fn cloud_mcp_workspace_membership_keys(workspaces: &[Value]) -> HashSet<String> {
+    workspaces
+        .iter()
+        .filter_map(|workspace| {
+            let workspace_id =
+                cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])?;
+            let key = cloud_mcp_workspace_id_match_key(&workspace_id);
+            (!key.is_empty()).then_some(key)
+        })
+        .collect()
+}
+
+/// Reject stale pre-upgrade outbox rows and any future partial producer before
+/// bytes reach the websocket. A valid empty catalog is distinguishable from an
+/// unhydrated one because the former has a parsed on-disk `workspaces: []`.
+fn cloud_mcp_validate_authoritative_workspace_snapshot_payload(
+    event_kind: &str,
+    payload: &Value,
+) -> Result<(), String> {
+    if !cloud_mcp_event_carries_authoritative_workspace_snapshot(event_kind) {
+        return Ok(());
+    }
+    let authoritative = cloud_mcp_authoritative_local_workspace_catalog()?
+        .ok_or_else(|| "workspace_catalog_not_ready".to_string())?;
+    let expected = cloud_mcp_workspace_membership_keys(&authoritative);
+    let actual = cloud_mcp_workspace_membership_keys(
+        payload
+            .get("workspaces")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+    );
+    let complete = cloud_mcp_payload_bool(payload, &["workspace_snapshot_complete"], false)
+        || cloud_mcp_payload_bool(payload, &["workspaceSnapshotComplete"], false)
+        || cloud_mcp_payload_bool(payload, &["workspace_catalog_complete"], false)
+        || cloud_mcp_payload_bool(payload, &["workspaceCatalogComplete"], false);
+    if !complete || actual != expected {
+        return Err("workspace_catalog_snapshot_superseded".to_string());
+    }
+    Ok(())
+}
+
+fn cloud_mcp_normalize_lifecycle_workspace(
+    mut workspace: Value,
+    default_status: &str,
+) -> Option<(String, Value)> {
+    let workspace_id = cloud_mcp_payload_text(&workspace, &["workspace_id", "workspaceId", "id"])?;
+    let workspace_key = cloud_mcp_workspace_id_match_key(&workspace_id);
+    if workspace_key.is_empty() {
+        return None;
+    }
+    let workspace_name =
+        cloud_mcp_payload_text(&workspace, &["workspace_name", "workspaceName", "name"])
+            .unwrap_or_else(|| workspace_id.clone());
+    let workspace_status = cloud_mcp_payload_text(
+        &workspace,
+        &["workspace_status", "workspaceStatus", "status"],
+    )
+    .unwrap_or_else(|| default_status.to_string());
+    let workspace_active = workspace
+        .get("workspace_active")
+        .or_else(|| workspace.get("workspaceActive"))
+        .or_else(|| workspace.get("active"))
+        .cloned()
+        .unwrap_or_else(|| json!(false));
+    let workspace_root = cloud_mcp_workspace_root_text(&workspace);
+    if let Some(object) = workspace.as_object_mut() {
+        object.insert("workspace_id".to_string(), json!(workspace_id));
+        object.insert("workspace_name".to_string(), json!(workspace_name));
+        object
+            .entry("workspace_role".to_string())
+            .or_insert_with(|| json!("desktop_workspace"));
+        object
+            .entry("display_surface".to_string())
+            .or_insert_with(|| json!("dashboard_workspace"));
+        object.insert("workspace_status".to_string(), json!(workspace_status));
+        object.insert("workspace_active".to_string(), workspace_active);
+        if let Some(workspace_root) = workspace_root {
+            object
+                .entry("workspace_root".to_string())
+                .or_insert_with(|| json!(workspace_root));
+        }
+    }
+    let source = workspace.clone();
+    cloud_mcp_copy_workspace_runtime_ordering(&mut workspace, &source);
+    Some((workspace_key, workspace))
+}
+
+async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> (Vec<Value>, bool) {
     let mut workspaces = Vec::<Value>::new();
+    let mut indexes_by_id = HashMap::<String, usize>::new();
+    let authoritative_catalog = match cloud_mcp_authoritative_local_workspace_catalog() {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            log_terminal_status_event(
+                "backend.cloud_mcp.workspace_catalog.not_ready",
+                json!({
+                    "reason": "catalog_read_failed",
+                    "error": clean_terminal_telemetry_text(&error),
+                }),
+            );
+            None
+        }
+    };
+    let catalog_ready = authoritative_catalog.is_some();
+    let authoritative_by_id = authoritative_catalog.as_ref().map(|items| {
+        items
+            .iter()
+            .filter_map(|workspace| {
+                let workspace_id =
+                    cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])?;
+                let key = cloud_mcp_workspace_id_match_key(&workspace_id);
+                (!key.is_empty()).then_some(key)
+            })
+            .collect::<HashSet<_>>()
+    });
+
+    for workspace in authoritative_catalog.iter().flatten().cloned() {
+        let Some((workspace_key, workspace)) =
+            cloud_mcp_normalize_lifecycle_workspace(workspace, "registered")
+        else {
+            continue;
+        };
+        indexes_by_id.insert(workspace_key, workspaces.len());
+        workspaces.push(workspace);
+    }
 
     {
         let snapshots = state.runtime_snapshots.lock().await;
@@ -24935,38 +25927,36 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
             let Some(items) = snapshot.get("workspaces").and_then(Value::as_array) else {
                 continue;
             };
-            for workspace in items.iter().take(64) {
-                let workspace_id =
-                    cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])
-                        .unwrap_or_default();
-                if workspace_id.is_empty() || !seen.insert(workspace_id.clone()) {
+            for workspace in items {
+                let Some((workspace_match_id, workspace_value)) =
+                    cloud_mcp_normalize_lifecycle_workspace(workspace.clone(), "registered")
+                else {
+                    continue;
+                };
+                if authoritative_by_id
+                    .as_ref()
+                    .is_some_and(|ids| !ids.contains(&workspace_match_id))
+                {
                     continue;
                 }
-                let mut workspace_value = json!({
-                    "workspace_id": workspace_id,
-                    "workspace_name": cloud_mcp_payload_text(workspace, &["workspace_name", "workspaceName", "name"]),
-                    "workspace_role": "desktop_workspace",
-                    "display_surface": "dashboard_workspace",
-                    "workspace_status": cloud_mcp_payload_text(workspace, &["workspace_status", "workspaceStatus", "status"]),
-                    "workspace_active": workspace.get("workspace_active")
-                        .or_else(|| workspace.get("workspaceActive"))
-                        .cloned()
-                        .unwrap_or_else(|| json!(false)),
-                });
-                if let Some(workspace_root) = cloud_mcp_workspace_root_text(workspace) {
-                    if let Some(object) = workspace_value.as_object_mut() {
-                        object.insert("workspace_root".to_string(), json!(workspace_root));
-                    }
+                if let Some(index) = indexes_by_id.get(&workspace_match_id).copied() {
+                    cloud_mcp_live_state_merge_object(&mut workspaces[index], workspace_value);
+                } else {
+                    indexes_by_id.insert(workspace_match_id, workspaces.len());
+                    workspaces.push(workspace_value);
                 }
-                cloud_mcp_copy_workspace_runtime_ordering(&mut workspace_value, workspace);
-                workspaces.push(workspace_value);
             }
         }
     }
 
     let runtime = state.inner.lock().await;
     for workspace in runtime.registered_workspaces.values() {
-        if !seen.insert(workspace.workspace_id.clone()) {
+        let workspace_match_id = cloud_mcp_workspace_id_match_key(&workspace.workspace_id);
+        if authoritative_by_id
+            .as_ref()
+            .is_some_and(|ids| !ids.contains(&workspace_match_id))
+            || indexes_by_id.contains_key(&workspace_match_id)
+        {
             continue;
         }
         let mut workspace_value = json!({
@@ -24982,10 +25972,11 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
                 object.insert("workspace_root".to_string(), json!(workspace.root.trim()));
             }
         }
+        indexes_by_id.insert(workspace_match_id, workspaces.len());
         workspaces.push(workspace_value);
     }
 
-    workspaces
+    (workspaces, catalog_ready)
 }
 
 fn cloud_mcp_live_state_merge_object(target: &mut Value, incoming: Value) {
@@ -25086,8 +26077,43 @@ fn cloud_mcp_live_state_values(value: Option<&Value>) -> Vec<Value> {
 }
 
 fn cloud_mcp_live_state_workspace_key(workspace: &Value, index: usize) -> String {
-    cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])
-        .unwrap_or_else(|| format!("workspace-{index}"))
+    let workspace_id = cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])
+        .unwrap_or_else(|| format!("workspace-{index}"));
+    let match_key = cloud_mcp_workspace_id_match_key(&workspace_id);
+    if match_key.is_empty() {
+        workspace_id
+    } else {
+        match_key
+    }
+}
+
+fn cloud_mcp_stamp_workspace_device_identity(
+    workspace: &mut Value,
+    device_id: &str,
+    device_aliases: &[String],
+    platform: &str,
+) {
+    let raw_workspace_id =
+        cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"]);
+    let canonical_workspace_id = raw_workspace_id
+        .as_deref()
+        .map(|workspace_id| cloud_mcp_workspace_id_match_key_for_platform(workspace_id, platform));
+    let Some(workspace) = workspace.as_object_mut() else {
+        return;
+    };
+    workspace.insert("device_id".to_string(), json!(device_id));
+    workspace.insert("deviceId".to_string(), json!(device_id));
+    workspace.insert("machine_id".to_string(), json!(device_id));
+    workspace.insert("machineId".to_string(), json!(device_id));
+    workspace.insert("device_aliases".to_string(), json!(device_aliases));
+    workspace.insert("deviceAliases".to_string(), json!(device_aliases));
+    workspace.insert("device_platform".to_string(), json!(platform));
+    workspace.insert("devicePlatform".to_string(), json!(platform));
+    if let Some(workspace_id) = canonical_workspace_id.filter(|value| !value.is_empty()) {
+        workspace.insert("workspace_id".to_string(), json!(workspace_id.clone()));
+        workspace.insert("workspaceId".to_string(), json!(workspace_id.clone()));
+        workspace.insert("id".to_string(), json!(workspace_id));
+    }
 }
 
 fn cloud_mcp_compact_insert_value(
@@ -25259,8 +26285,12 @@ fn cloud_mcp_compact_terminal_live_state(terminal: &Value, index: usize) -> Valu
 
 fn cloud_mcp_compact_workspace_live_state(workspace: &Value, index: usize) -> (String, Value) {
     let workspace_key = cloud_mcp_live_state_workspace_key(workspace, index);
+    let workspace_id = cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])
+        .unwrap_or_else(|| format!("workspace-{index}"));
     let mut item = serde_json::Map::new();
-    item.insert("id".to_string(), json!(workspace_key.clone()));
+    item.insert("id".to_string(), json!(workspace_id));
+    item.insert("workspace_id".to_string(), json!(workspace_id));
+    item.insert("workspaceId".to_string(), json!(workspace_id));
     for (key, aliases) in [
         ("name", &["workspace_name", "workspaceName", "name"][..]),
         (
@@ -25561,6 +26591,10 @@ fn cloud_mcp_device_live_payload_with_sync_identity(mut payload: Value) -> Value
 }
 
 fn cloud_mcp_device_live_mark_sync_pending(payload: &Value) -> Result<(), String> {
+    let _guard = CLOUD_MCP_DEVICE_LIVE_SYNC_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .map_err(|_| "Device live-state sync lock is poisoned.".to_string())?;
     let Some((scope_key, device_id, sync_unit, content_hash, payload_hash, idempotency_key)) =
         cloud_mcp_device_live_sync_identity_from_payload(payload)
     else {
@@ -25593,13 +26627,68 @@ fn cloud_mcp_device_live_mark_sync_pending(payload: &Value) -> Result<(), String
         ],
     )
     .map_err(|error| format!("Unable to mark device live-state sync pending: {error}"))?;
+    if sync_unit == "device_live_state_snapshot" {
+        if let Some(coalesce_key) =
+            cloud_mcp_outbox_snapshot_coalesce_key("device_live_state_snapshot", payload)
+        {
+            conn.execute(
+                &format!(
+                    "UPDATE {CLOUD_MCP_OUTBOX_TABLE}
+                     SET status='superseded', updated_at_ms=?1
+                     WHERE coalesce_key=?2
+                       AND idempotency_key<>?3
+                       AND status IN ('queued', 'retrying', 'in_flight')"
+                ),
+                rusqlite::params![now, coalesce_key, idempotency_key],
+            )
+            .map_err(|error| {
+                format!("Unable to supersede stale device live-state outbox rows: {error}")
+            })?;
+        }
+    }
     Ok(())
+}
+
+fn cloud_mcp_device_live_sync_state_matches_from_conn(
+    conn: &rusqlite::Connection,
+    payload: &Value,
+) -> Result<CloudMcpDeviceLiveSyncStateMatch, String> {
+    let Some((scope_key, device_id, sync_unit, content_hash, _payload_hash, idempotency_key)) =
+        cloud_mcp_device_live_sync_identity_from_payload(payload)
+    else {
+        return Ok(CloudMcpDeviceLiveSyncStateMatch::Missing);
+    };
+    let current = conn
+        .query_row(
+            &format!(
+                "SELECT content_hash, idempotency_key
+                 FROM {CLOUD_MCP_DEVICE_LIVE_SYNC_STATE_TABLE}
+                 WHERE scope_key=?1 AND device_id=?2 AND sync_unit=?3"
+            ),
+            rusqlite::params![scope_key, device_id, sync_unit],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("Unable to read current device live-state sync: {error}"))?;
+    Ok(match current {
+        Some((current_hash, current_idempotency_key))
+            if current_hash == content_hash && current_idempotency_key == idempotency_key =>
+        {
+            CloudMcpDeviceLiveSyncStateMatch::Current
+        }
+        Some(_) => CloudMcpDeviceLiveSyncStateMatch::Superseded,
+        None => CloudMcpDeviceLiveSyncStateMatch::Missing,
+    })
 }
 
 fn cloud_mcp_device_live_mark_sync_acked_from_payload(
     source_payload: Option<&Value>,
     response: &Value,
 ) -> Result<bool, String> {
+    let _guard = CLOUD_MCP_DEVICE_LIVE_SYNC_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .map_err(|_| "Device live-state sync lock is poisoned.".to_string())?;
     let identity_source = source_payload.unwrap_or(response);
     let Some((scope_key, device_id, sync_unit, content_hash, payload_hash, idempotency_key)) =
         cloud_mcp_device_live_sync_identity_from_payload(identity_source)
@@ -25634,6 +26723,12 @@ fn cloud_mcp_device_live_mark_sync_acked_from_payload(
     })
     .unwrap_or_default();
     let conn = cloud_mcp_open_outbox_conn()?;
+    if source_payload.is_some()
+        && cloud_mcp_device_live_sync_state_matches_from_conn(&conn, identity_source)?
+            != CloudMcpDeviceLiveSyncStateMatch::Current
+    {
+        return Ok(false);
+    }
     let now = cloud_mcp_now_ms() as i64;
     conn.execute(
         &format!(
@@ -25663,6 +26758,35 @@ fn cloud_mcp_device_live_mark_sync_acked_from_payload(
     )
     .map_err(|error| format!("Unable to mark device live-state sync acked: {error}"))?;
     Ok(true)
+}
+
+fn cloud_mcp_device_live_enqueue_fallback_if_current(
+    payload: &Value,
+    reason: &str,
+) -> Result<Option<CloudMcpOutboxRow>, String> {
+    let _guard = CLOUD_MCP_DEVICE_LIVE_SYNC_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .map_err(|_| "Device live-state sync lock is poisoned.".to_string())?;
+    let conn = cloud_mcp_open_outbox_conn()?;
+    match cloud_mcp_device_live_sync_state_matches_from_conn(&conn, payload)? {
+        CloudMcpDeviceLiveSyncStateMatch::Current => {}
+        CloudMcpDeviceLiveSyncStateMatch::Superseded => return Ok(None),
+        CloudMcpDeviceLiveSyncStateMatch::Missing => {
+            return Err(
+                "Current device live-state sync marker is missing; rebuild the snapshot."
+                    .to_string(),
+            )
+        }
+    }
+    drop(conn);
+    cloud_mcp_outbox_enqueue_event(
+        "device_live_state_snapshot",
+        payload,
+        CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
+        reason,
+    )
+    .map(Some)
 }
 
 fn cloud_mcp_device_live_sync_decision(
@@ -25767,6 +26891,8 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
     let device_profile = cloud_mcp_desktop_device_profile();
     let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
         .unwrap_or_else(|| "desktop".to_string());
+    let device_id = cloud_mcp_device_id_match_key(&device_id);
+    let device_aliases = vec![device_id.clone()];
     let (connection_id, session_started_at_ms) = {
         let runtime = state.inner.lock().await;
         (
@@ -25791,8 +26917,9 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
     let mut cli_states = Value::Null;
     let mut has_cli_state = false;
 
-    let lifecycle_workspaces = cloud_mcp_lifecycle_workspaces(state).await;
-    if !lifecycle_workspaces.is_empty() {
+    let (lifecycle_workspaces, workspace_catalog_ready) =
+        cloud_mcp_lifecycle_workspaces(state).await;
+    if workspace_catalog_ready {
         has_workspace_state = true;
     }
     for (index, workspace) in lifecycle_workspaces.iter().enumerate() {
@@ -25816,29 +26943,6 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
             has_notification_preferences = true;
             notification_preferences = snapshot.clone();
         }
-        for snapshot in [
-            snapshots.workspace_catalog.as_ref(),
-            snapshots.workspace_terminals.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if snapshot.get("workspaces").is_some() {
-                has_workspace_state = true;
-            }
-            for (index, workspace) in snapshot
-                .get("workspaces")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .enumerate()
-            {
-                let (workspace_key, workspace_value) =
-                    cloud_mcp_live_state_workspace_from_snapshot(workspace, index);
-                let existing = workspaces.entry(workspace_key).or_insert_with(|| json!({}));
-                cloud_mcp_live_state_merge_object(existing, workspace_value);
-            }
-        }
         if let Some(snapshot) = snapshots.cli_states.as_ref() {
             if let Some(clis) = snapshot
                 .get("cli_states")
@@ -25856,6 +26960,7 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
         "reason": reason,
         "device_id": device_id.clone(),
         "machine_id": device_id.clone(),
+        "device_aliases": device_aliases.clone(),
         "device_name": device_profile["device_name"].clone(),
         "machine_name": device_profile["machine_name"].clone(),
         "platform": device_profile["platform"].clone(),
@@ -25873,10 +26978,17 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
         "status": "connected",
         "connected": true,
         "native_connected": true,
-        "workspace_snapshot_authoritative": has_workspace_state,
-        "workspaceSnapshotAuthoritative": has_workspace_state,
+        "workspace_catalog_ready": workspace_catalog_ready,
+        "workspaceCatalogReady": workspace_catalog_ready,
+        "workspace_snapshot_complete": workspace_catalog_ready,
+        "workspaceSnapshotComplete": workspace_catalog_ready,
+        "workspace_snapshot_authoritative": workspace_catalog_ready,
+        "workspaceSnapshotAuthoritative": workspace_catalog_ready,
         "device": {
             "id": device_id.clone(),
+            "device_id": device_id.clone(),
+            "machine_id": device_id.clone(),
+            "device_aliases": device_aliases.clone(),
             "name": device_profile["device_name"].clone(),
             "host": device_profile["machine_name"].clone(),
             "os": device_profile["platform"].clone(),
@@ -25910,10 +27022,29 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
             );
         }
         if has_workspace_state {
-            object.insert(
-                "workspaces".to_string(),
-                Value::Array(workspaces.values().cloned().collect()),
-            );
+            let workspace_values = workspaces
+                .values()
+                .cloned()
+                .map(|mut workspace| {
+                    cloud_mcp_stamp_workspace_device_identity(
+                        &mut workspace,
+                        &device_id,
+                        &device_aliases,
+                        cloud_mcp_desktop_platform(),
+                    );
+                    workspace
+                })
+                .collect::<Vec<_>>();
+            let workspace_set_empty_authoritative = workspace_values.is_empty();
+            object.insert("workspaces".to_string(), Value::Array(workspace_values));
+            if workspace_set_empty_authoritative {
+                object.insert("workspace_set_empty_authoritative".to_string(), json!(true));
+                object.insert("workspaceSetEmptyAuthoritative".to_string(), json!(true));
+                object.insert(
+                    "workspace_clear_reason".to_string(),
+                    json!("workspace_catalog_cleared"),
+                );
+            }
         }
         if has_cli_state {
             object.insert("cli_states".to_string(), cli_states);
@@ -25922,11 +27053,52 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
     payload
 }
 
+fn cloud_mcp_device_live_snapshot_force_replay(reason: &str) -> bool {
+    reason.trim().eq_ignore_ascii_case("websocket_ready_replay")
+}
+
+fn cloud_mcp_device_live_force_replay_identity(mut payload: Value) -> Value {
+    let replay_token = cloud_mcp_payload_text(
+        &payload,
+        &["connection_id", "connectionId", "session_id", "sessionId"],
+    )
+    .unwrap_or_else(|| cloud_mcp_now_ms().to_string());
+    let base_idempotency_key =
+        cloud_mcp_payload_text(&payload, &["idempotency_key", "idempotencyKey"])
+            .unwrap_or_else(|| "device-live-state".to_string());
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "idempotency_key".to_string(),
+            json!(format!("{base_idempotency_key}:replay:{replay_token}")),
+        );
+        object.insert("force_connection_replay".to_string(), json!(true));
+    }
+    payload
+}
+
 async fn cloud_mcp_publish_device_live_state_snapshot(state: &CloudMcpState, reason: &str) {
-    let payload = cloud_mcp_device_live_payload_with_sync_identity(
+    let mut payload = cloud_mcp_device_live_payload_with_sync_identity(
         cloud_mcp_device_live_state_snapshot_payload(state, reason).await,
     );
-    match cloud_mcp_device_live_sync_decision(&payload) {
+    if !cloud_mcp_payload_bool(&payload, &["workspace_catalog_ready"], false) {
+        log_terminal_status_event(
+            "backend.cloud_mcp.device_live_state.ws.skip",
+            json!({
+                "reason": reason,
+                "status": "workspace_catalog_not_ready",
+            }),
+        );
+        return;
+    }
+    let force_replay = cloud_mcp_device_live_snapshot_force_replay(reason);
+    if force_replay {
+        payload = cloud_mcp_device_live_force_replay_identity(payload);
+    }
+    match if force_replay {
+        Ok(CloudMcpDeviceLiveSyncDecision::Enqueue)
+    } else {
+        cloud_mcp_device_live_sync_decision(&payload)
+    } {
         Ok(CloudMcpDeviceLiveSyncDecision::CurrentAcked) => {
             log_terminal_status_event(
                 "backend.cloud_mcp.device_live_state.ws.skip",
@@ -25958,7 +27130,19 @@ async fn cloud_mcp_publish_device_live_state_snapshot(state: &CloudMcpState, rea
             );
         }
     }
-    let _ = cloud_mcp_device_live_mark_sync_pending(&payload);
+    let pending_recorded = match cloud_mcp_device_live_mark_sync_pending(&payload) {
+        Ok(()) => true,
+        Err(error) => {
+            log_terminal_status_event(
+                "backend.cloud_mcp.device_live_state.mark_pending_failed",
+                json!({
+                    "reason": reason,
+                    "error": clean_terminal_telemetry_text(&error),
+                }),
+            );
+            false
+        }
+    };
     let state = state.clone();
     let reason = reason.to_string();
     tauri::async_runtime::spawn(async move {
@@ -25982,21 +27166,99 @@ async fn cloud_mcp_publish_device_live_state_snapshot(state: &CloudMcpState, rea
                 );
             }
             Err(error) => {
-                cloud_mcp_enqueue_background_sync(
-                    &state,
-                    "device_live_state_snapshot".to_string(),
-                    "device_live_state_snapshot",
-                    payload.clone(),
-                    CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
-                    reason.clone(),
-                )
-                .await;
+                if let Some(rebuild_reason) =
+                    cloud_mcp_authoritative_workspace_snapshot_rebuild_reason(&error)
+                {
+                    log_terminal_status_event(
+                        "backend.cloud_mcp.device_live_state.ws.rebuild",
+                        json!({
+                            "reason": reason,
+                            "status": rebuild_reason,
+                        }),
+                    );
+                    let current_payload = cloud_mcp_device_live_payload_with_sync_identity(
+                        cloud_mcp_device_live_state_snapshot_payload(
+                            &state,
+                            "workspace_catalog_changed_during_live_send",
+                        )
+                        .await,
+                    );
+                    if cloud_mcp_payload_bool(&current_payload, &["workspace_catalog_ready"], false)
+                    {
+                        cloud_mcp_enqueue_background_sync(
+                            &state,
+                            "device_live_state_snapshot".to_string(),
+                            "device_live_state_snapshot",
+                            current_payload,
+                            CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
+                            "workspace_catalog_changed_during_live_send",
+                        )
+                        .await;
+                    }
+                    return;
+                }
+                cloud_mcp_background_sync_ensure_started(&state);
+                let fallback = if pending_recorded {
+                    cloud_mcp_device_live_enqueue_fallback_if_current(&payload, reason.as_str())
+                } else {
+                    Err(
+                        "Device live-state pending marker was not recorded; rebuild the snapshot."
+                            .to_string(),
+                    )
+                };
+                let fallback_status = match fallback {
+                    Ok(Some(_)) => {
+                        state.background_sync.notify.notify_one();
+                        "durable_outbox"
+                    }
+                    Ok(None) => "stale_snapshot_dropped",
+                    Err(fallback_error) => {
+                        // If SQLite itself is unavailable, rebuild from current local state
+                        // before falling back to the in-memory queue. Never enqueue the
+                        // captured (possibly stale) snapshot after a newer activation.
+                        let mut current_payload = cloud_mcp_device_live_payload_with_sync_identity(
+                            cloud_mcp_device_live_state_snapshot_payload(
+                                &state,
+                                "direct_send_fallback_refresh",
+                            )
+                            .await,
+                        );
+                        if !cloud_mcp_payload_bool(
+                            &current_payload,
+                            &["workspace_catalog_ready"],
+                            false,
+                        ) {
+                            log_terminal_status_event(
+                                "backend.cloud_mcp.device_live_state.ws.skip",
+                                json!({
+                                    "reason": reason,
+                                    "status": "workspace_catalog_not_ready_during_fallback",
+                                }),
+                            );
+                            return;
+                        }
+                        if force_replay {
+                            current_payload =
+                                cloud_mcp_device_live_force_replay_identity(current_payload);
+                        }
+                        cloud_mcp_enqueue_background_sync(
+                            &state,
+                            "device_live_state_snapshot".to_string(),
+                            "device_live_state_snapshot",
+                            current_payload,
+                            CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
+                            format!("{reason}: {fallback_error}"),
+                        )
+                        .await;
+                        "current_snapshot_memory_fallback"
+                    }
+                };
                 log_terminal_status_event(
                     "backend.cloud_mcp.device_live_state.ws.queued",
                     json!({
                         "reason": reason,
                         "error": clean_terminal_telemetry_text(&error),
-                        "fallback": "durable_outbox",
+                        "fallback": fallback_status,
                     }),
                 );
             }
@@ -28278,7 +29540,7 @@ async fn cloud_mcp_post_json_endpoint(
         let _ = cloud_mcp_workspace_log(
             root,
             "cloud_mcp.ws.start",
-            workspace_id,
+            &workspace_id,
             workspace_name,
             fields,
         );
@@ -28493,6 +29755,17 @@ async fn cloud_mcp_send_outbox_row_now(
     }
     let payload = serde_json::from_str::<Value>(&row.payload_json)
         .map_err(|error| format!("Unable to decode Cloud sync outbox payload: {error}"))?;
+    if let Err(reason) =
+        cloud_mcp_validate_authoritative_workspace_snapshot_payload(&row.event_kind, &payload)
+    {
+        return Ok(json!({
+            "ok": true,
+            "skipped": true,
+            "reason": reason,
+            "event_kind": row.event_kind,
+            "outbox_id": row.outbox_id,
+        }));
+    }
     let response = cloud_mcp_send_event_now(state, &row.event_kind, &payload).await?;
     if row.event_kind == CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT
         && !cloud_mcp_agent_chat_sync_response_accepted(&response)
@@ -28509,6 +29782,16 @@ async fn cloud_mcp_send_event_now(
 ) -> Result<Value, String> {
     if cloud_mcp_task_event_kind_removed(event_kind) {
         return Ok(cloud_mcp_task_event_removed_outbox_response(event_kind));
+    }
+    if let Err(reason) =
+        cloud_mcp_validate_authoritative_workspace_snapshot_payload(event_kind, payload)
+    {
+        return Ok(json!({
+            "ok": true,
+            "skipped": true,
+            "reason": reason,
+            "event_kind": event_kind,
+        }));
     }
     if cloud_mcp_is_account_asset_request_kind(event_kind) {
         let response = cloud_mcp_ws_request(state, event_kind, payload).await?;
@@ -28680,7 +29963,7 @@ fn cloud_mcp_event_envelope(event_kind: &str, payload: &Value) -> Value {
         }
     }
     if let Some(workspaces) = payload.get("workspaces").and_then(Value::as_array) {
-        for workspace in workspaces.iter().take(64) {
+        for workspace in workspaces {
             if let Some(workspace_id) =
                 cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])
             {
@@ -28734,6 +30017,18 @@ fn cloud_mcp_terminal_output_message_kind(message: &Value) -> String {
         .to_ascii_lowercase()
 }
 
+fn cloud_mcp_terminal_output_key_component(value: &str) -> String {
+    value.trim().replace('%', "%25").replace(':', "%3A")
+}
+
+fn cloud_mcp_terminal_output_decode_key_component(value: &str) -> String {
+    value
+        .trim()
+        .replace("%3A", ":")
+        .replace("%3a", ":")
+        .replace("%25", "%")
+}
+
 fn cloud_mcp_terminal_output_message_stream_key(message: &Value) -> Option<String> {
     if let Some(stream_key) = cloud_mcp_payload_text(message, &["sk", "stream_key", "streamKey"])
         .map(|value| value.trim().to_string())
@@ -28743,6 +30038,11 @@ fn cloud_mcp_terminal_output_message_stream_key(message: &Value) -> Option<Strin
     }
     let device_id = cloud_mcp_payload_text(message, &["d", "device_id", "deviceId"])?;
     let workspace_id = cloud_mcp_payload_text(message, &["w", "workspace_id", "workspaceId"])?;
+    let workspace_id = cloud_mcp_canonical_workspace_id_from_value(
+        &workspace_id,
+        message,
+        cloud_mcp_desktop_platform(),
+    );
     let pane_id = cloud_mcp_payload_text(
         message,
         &[
@@ -28767,11 +30067,19 @@ fn cloud_mcp_terminal_output_message_stream_key(message: &Value) -> Option<Strin
     )
     .unwrap_or_default();
     if instance_id.trim().is_empty() {
-        Some(format!("{device_id}:{workspace_id}:{pane_id}"))
+        Some(format!(
+            "{}:{}:{}",
+            cloud_mcp_terminal_output_key_component(&device_id),
+            cloud_mcp_terminal_output_key_component(&workspace_id),
+            cloud_mcp_terminal_output_key_component(&pane_id),
+        ))
     } else {
         Some(format!(
-            "{device_id}:{workspace_id}:{pane_id}:{}",
-            instance_id.trim()
+            "{}:{}:{}:{}",
+            cloud_mcp_terminal_output_key_component(&device_id),
+            cloud_mcp_terminal_output_key_component(&workspace_id),
+            cloud_mcp_terminal_output_key_component(&pane_id),
+            cloud_mcp_terminal_output_key_component(&instance_id),
         ))
     }
 }
@@ -28860,10 +30168,10 @@ fn cloud_mcp_handle_terminal_output_subscription(
                 "truncated": truncated,
             });
             if parts.len() == 4 {
-                envelope["d"] = json!(parts[0]);
-                envelope["w"] = json!(parts[1]);
-                envelope["p"] = json!(parts[2]);
-                envelope["i"] = json!(parts[3]);
+                envelope["d"] = json!(cloud_mcp_terminal_output_decode_key_component(parts[0]));
+                envelope["w"] = json!(cloud_mcp_terminal_output_decode_key_component(parts[1]));
+                envelope["p"] = json!(cloud_mcp_terminal_output_decode_key_component(parts[2]));
+                envelope["i"] = json!(cloud_mcp_terminal_output_decode_key_component(parts[3]));
             }
             let _ = tx.send(envelope);
         });
@@ -28885,7 +30193,14 @@ fn cloud_mcp_terminal_output_stream_key(
     pane_id: &str,
     instance_id: u64,
 ) -> String {
-    format!("{device_id}:{workspace_id}:{pane_id}:{instance_id}")
+    let workspace_id = cloud_mcp_workspace_id_match_key(workspace_id);
+    format!(
+        "{}:{}:{}:{}",
+        cloud_mcp_terminal_output_key_component(device_id),
+        cloud_mcp_terminal_output_key_component(&workspace_id),
+        cloud_mcp_terminal_output_key_component(pane_id),
+        cloud_mcp_terminal_output_key_component(&instance_id.to_string()),
+    )
 }
 
 const CLOUD_MCP_TERMINAL_OUTPUT_REPLAY_TAIL_BYTES: usize = 64 * 1024;
@@ -30096,6 +31411,28 @@ async fn cloud_mcp_ws_send_workspace_registration(
     state: &CloudMcpState,
     workspace: &CloudMcpWorkspaceStatus,
 ) -> Result<Value, String> {
+    let (mut catalog_workspaces, workspace_catalog_ready) =
+        cloud_mcp_lifecycle_workspaces(state).await;
+    if !workspace_catalog_ready {
+        return Ok(json!({
+            "ok": true,
+            "skipped": true,
+            "reason": "workspace_catalog_not_ready",
+            "event_kind": "workspace_register",
+        }));
+    }
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
+        .unwrap_or_else(|| "desktop".to_string());
+    let device_aliases = vec![device_id.clone()];
+    for catalog_workspace in &mut catalog_workspaces {
+        cloud_mcp_stamp_workspace_device_identity(
+            catalog_workspace,
+            &device_id,
+            &device_aliases,
+            cloud_mcp_desktop_platform(),
+        );
+    }
     let mut payload = json!({
         "workspace_id": workspace.workspace_id,
         "workspace_name": workspace.workspace_name,
@@ -30103,6 +31440,12 @@ async fn cloud_mcp_ws_send_workspace_registration(
         "workspace_role": workspace.workspace_role,
         "display_surface": workspace.display_surface,
         "workspace_status": "registered",
+        "device_id": device_id,
+        "device_aliases": device_aliases,
+        "workspace_catalog_ready": true,
+        "workspace_snapshot_complete": true,
+        "workspace_snapshot_authoritative": true,
+        "workspaces": catalog_workspaces,
         "schema_version": 1,
     });
     if !workspace.root.trim().is_empty() {
@@ -30854,8 +32197,8 @@ async fn cloud_mcp_record_voice_plan_terminal_lifecycle(
         "terminal_instance_id": parked.instance_id,
         "threadId": metadata.thread_id.as_deref().unwrap_or_default(),
         "thread_id": metadata.thread_id.as_deref().unwrap_or_default(),
-        "workspace_id": metadata.workspace_id.as_str(),
-        "workspaceId": metadata.workspace_id.as_str(),
+            "workspace_id": req.workspace_id.as_deref().unwrap_or_default(),
+            "workspaceId": req.workspace_id.as_deref().unwrap_or_default(),
         "workspace_name": metadata.workspace_name.as_str(),
         "workspace_root": req.root_display.clone(),
     });
@@ -30887,7 +32230,7 @@ async fn cloud_mcp_record_voice_plan_terminal_lifecycle(
                     "result": value,
                     "source": "backend_terminal_parked_lifecycle",
                     "statusPayload": payload,
-                    "workspaceId": metadata.workspace_id.as_str(),
+                    "workspaceId": req.workspace_id.as_deref().unwrap_or_default(),
                 }),
             );
         }
@@ -32434,6 +33777,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
     let effective_todo_command_id = cloud_mcp_clean_optional_text(&prompt_metadata.todo_command_id);
     let effective_todo_action = cloud_mcp_clean_optional_text(&prompt_metadata.todo_action);
     let effective_todo_resume_requested = prompt_metadata.todo_resume_requested;
+    let prompt_workspace_id = cloud_mcp_workspace_id_match_key(&prompt_metadata.workspace_id);
     {
         let mut runtime = state.inner.lock().await;
         runtime.terminal_contexts.insert(
@@ -32449,7 +33793,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
                 prompt_event_submitted_at: prompt_metadata.prompt_event_submitted_at.clone(),
                 terminal_index: prompt_metadata.terminal_index,
                 thread_id: prompt_metadata.thread_id.clone(),
-                workspace_id: prompt_metadata.workspace_id.clone(),
+                workspace_id: prompt_workspace_id,
                 workspace_name: prompt_metadata.workspace_name.clone(),
                 session_mode: session_mode.as_str().to_string(),
                 todo_id: effective_todo_id.clone(),
@@ -33564,8 +34908,7 @@ fn cloud_mcp_normalize_device_terminal_orchestrator(
         object.insert("thread_id".to_string(), json!(thread_id.clone()));
         object.insert("threadId".to_string(), json!(thread_id));
     }
-    if let Some(provider_session_id) =
-        provider_session_id.filter(|value| !value.trim().is_empty())
+    if let Some(provider_session_id) = provider_session_id.filter(|value| !value.trim().is_empty())
     {
         object.insert(
             "provider_session_id".to_string(),
@@ -33741,14 +35084,79 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
     };
     let reason = clean_option(reason).unwrap_or_else(|| "device_workspaces_snapshot".to_string());
     let reason_for_ack = reason.clone();
-    let workspace_items = workspaces
+    let reported_workspace_items = workspaces
         .as_array()
         .ok_or_else(|| "Device workspace snapshot sync requires a workspaces array.".to_string())?;
+    let input_workspace_count = reported_workspace_items.len();
+    let authoritative_catalog = match cloud_mcp_authoritative_local_workspace_catalog() {
+        Ok(Some(catalog)) => catalog,
+        Ok(None) => {
+            return Ok(cloud_mcp_background_sync_ack(
+                "device_workspaces_snapshot",
+                "device_workspaces_snapshot",
+                &reason_for_ack,
+                json!({
+                    "queued": false,
+                    "sent": false,
+                    "skipped": true,
+                    "skip_reason": "workspace_catalog_not_ready",
+                    "input_workspace_count": input_workspace_count,
+                    "workspace_count": 0,
+                    "workspace_snapshot_authoritative": false,
+                    "workspace_snapshot_complete": false,
+                }),
+            ));
+        }
+        Err(error) => {
+            log_terminal_status_event(
+                "backend.cloud_mcp.workspace_catalog.not_ready",
+                json!({
+                    "reason": reason_for_ack,
+                    "error": clean_terminal_telemetry_text(&error),
+                }),
+            );
+            return Ok(cloud_mcp_background_sync_ack(
+                "device_workspaces_snapshot",
+                "device_workspaces_snapshot",
+                &reason_for_ack,
+                json!({
+                    "queued": false,
+                    "sent": false,
+                    "skipped": true,
+                    "skip_reason": "workspace_catalog_invalid",
+                    "input_workspace_count": input_workspace_count,
+                    "workspace_count": 0,
+                    "workspace_snapshot_authoritative": false,
+                    "workspace_snapshot_complete": false,
+                }),
+            ));
+        }
+    };
+    // The durable catalog owns membership. Runtime snapshots may only enrich rows
+    // that still exist in that catalog, and the just-reported live update wins
+    // over cached fields. This keeps W2/W3 live state intact when activation only
+    // reports W1 without allowing a deleted cached workspace to reappear.
+    let cached_catalog_rows = {
+        let snapshots = state.runtime_snapshots.lock().await;
+        [
+            snapshots.workspace_catalog.as_ref(),
+            snapshots.workspace_terminals.as_ref(),
+            snapshots.workspace_servers.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .flat_map(|snapshot| cloud_mcp_payload_items(snapshot, &["workspaces"], usize::MAX))
+        .collect::<Vec<_>>()
+    };
+    let complete_workspace_catalog = cloud_mcp_overlay_workspace_catalog_rows(
+        cloud_mcp_overlay_workspace_catalog_rows(authoritative_catalog, &cached_catalog_rows),
+        reported_workspace_items,
+    );
+    let workspace_items = complete_workspace_catalog.as_slice();
     let mut normalized_workspaces = Vec::new();
     let mut selected_workspace_id: Option<String> = None;
     let mut selected_workspace_name: Option<String> = None;
     let mut skipped_archived_count = 0usize;
-    let mut skipped_archived_workspace_ids = std::collections::BTreeSet::new();
     let mut normalized_terminal_orchestrators = Vec::new();
     let device_profile = cloud_mcp_desktop_device_profile();
 
@@ -33766,13 +35174,14 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
         .into_iter()
         .flatten()
         {
-            for workspace in cloud_mcp_payload_items(snapshot, &["workspaces"], 64) {
+            for workspace in cloud_mcp_payload_items(snapshot, &["workspaces"], usize::MAX) {
                 let Some(workspace_id) =
                     cloud_mcp_payload_text(&workspace, &["workspace_id", "workspaceId", "id"])
                         .filter(|value| !value.trim().is_empty())
                 else {
                     continue;
                 };
+                let workspace_id = cloud_mcp_workspace_id_match_key(&workspace_id);
                 if cached.contains_key(&workspace_id) {
                     continue;
                 }
@@ -33806,7 +35215,12 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
             .values()
             .filter_map(|workspace| {
                 let root = workspace.root.trim();
-                (!root.is_empty()).then(|| (workspace.workspace_id.clone(), root.to_string()))
+                (!root.is_empty()).then(|| {
+                    (
+                        cloud_mcp_workspace_id_match_key(&workspace.workspace_id),
+                        root.to_string(),
+                    )
+                })
             })
             .collect()
     };
@@ -33826,14 +35240,8 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
         }
     }
 
-    for (workspace_index, workspace) in workspace_items.iter().take(64).enumerate() {
+    for (workspace_index, workspace) in workspace_items.iter().enumerate() {
         if cloud_mcp_workspace_snapshot_is_locally_archived(workspace) {
-            if let Some(workspace_id) =
-                cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])
-                    .filter(|value| !value.trim().is_empty())
-            {
-                skipped_archived_workspace_ids.insert(workspace_id);
-            }
             skipped_archived_count += 1;
             continue;
         }
@@ -33844,6 +35252,7 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
         else {
             continue;
         };
+        let workspace_id = cloud_mcp_workspace_id_match_key(&workspace_id);
         let terminal_items = cloud_mcp_workspace_terminal_items(workspace);
         if cloud_mcp_is_app_control_workspace_id(&workspace_id) {
             for terminal in terminal_items {
@@ -34513,79 +35922,11 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
             }
         }
     }
-    let input_workspace_count = normalized_workspaces.len();
-    let mut workspace_snapshot_fallback_count = 0usize;
-    if !cached_last_known_workspaces.is_empty() {
-        let mut reported_workspace_ids = normalized_workspaces
-            .iter()
-            .filter_map(|workspace| {
-                cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])
-                    .filter(|value| !value.trim().is_empty())
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-        for (workspace_id, cached_workspace) in cached_last_known_workspaces.iter() {
-            if reported_workspace_ids.contains(workspace_id)
-                || skipped_archived_workspace_ids.contains(workspace_id)
-            {
-                continue;
-            }
-            let mut workspace = cached_workspace.clone();
-            if let Some(object) = workspace.as_object_mut() {
-                object.insert("workspace_snapshot_fallback".to_string(), json!(true));
-                object.insert("workspaceSnapshotFallback".to_string(), json!(true));
-                object.insert("last_known_workspace_fallback".to_string(), json!(true));
-                object.insert("lastKnownWorkspaceFallback".to_string(), json!(true));
-                object
-                    .entry("workspace_id".to_string())
-                    .or_insert_with(|| json!(workspace_id.clone()));
-                object
-                    .entry("id".to_string())
-                    .or_insert_with(|| json!(workspace_id.clone()));
-                object.insert(
-                    "reason".to_string(),
-                    json!("workspace_snapshot_transient_gap_backfill"),
-                );
-                object.insert("updated_at_ms".to_string(), json!(cloud_mcp_now_ms()));
-                object.insert("updatedAtMs".to_string(), json!(cloud_mcp_now_ms()));
-            }
-            agent_chat_session_sync_mark_workspace_history_dirty(workspace_id);
-            normalized_workspaces.push(workspace);
-            reported_workspace_ids.insert(workspace_id.clone());
-            workspace_snapshot_fallback_count += 1;
-        }
-    }
-    let reason_token = reason.trim().to_ascii_lowercase().replace('-', "_");
-    let workspace_set_clear_requested = matches!(
-        reason_token.as_str(),
-        "workspace_deleted"
-            | "workspace_delete"
-            | "all_workspaces_deleted"
-            | "all_workspaces_closed"
-            | "workspace_catalog_cleared"
-    );
-    if normalized_workspaces.is_empty() && !workspace_set_clear_requested {
-        let sync_key = "device_workspaces_snapshot".to_string();
-        return Ok(cloud_mcp_background_sync_ack(
-            "device_workspaces_snapshot",
-            &sync_key,
-            &reason_for_ack,
-            json!({
-                "queued": false,
-                "sent": false,
-                "skipped": true,
-                "skip_reason": "transient_empty_workspace_snapshot",
-                "stored": {
-                    "cached_workspace_count": cached_last_known_workspaces.len(),
-                    "input_workspace_count": input_workspace_count,
-                    "skipped_archived_workspace_count": skipped_archived_count,
-                    "workspace_count": 0,
-                    "workspace_snapshot_fallback_count": workspace_snapshot_fallback_count,
-                },
-                "stored_count": 0,
-                "workspace_count": 0,
-            }),
-        ));
-    }
+    // Missing workspaces are never synthesized from runtime snapshots. The durable
+    // local catalog above is the complete set; cached rows are consulted only for
+    // per-workspace terminal/panel details and can therefore never resurrect a
+    // workspace that the local catalog deleted.
+    let workspace_snapshot_fallback_count = 0usize;
     let terminal_count = normalized_workspaces
         .iter()
         .map(|workspace| {
@@ -34631,7 +35972,7 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
         .unwrap_or(Value::Null);
     let selected_workspace_id_value = selected_workspace_id.clone();
 
-    let payload = json!({
+    let mut payload = json!({
         "source": "rust-diffforge-device-workspaces",
         "contract": "diffforge.device_workspaces.v1",
         "event_kind": "device_workspaces_snapshot",
@@ -34650,8 +35991,14 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
         "agent_id": "rust-diffforge",
         "agent_label": "Diff Forge Desktop",
         "reason": reason,
+        "workspace_catalog_ready": true,
+        "workspaceCatalogReady": true,
         "snapshot_full": true,
         "snapshotFull": true,
+        "workspace_snapshot_complete": true,
+        "workspaceSnapshotComplete": true,
+        "workspace_catalog_complete": true,
+        "workspaceCatalogComplete": true,
         "workspace_snapshot_authoritative": true,
         "workspaceSnapshotAuthoritative": true,
         "workspace_snapshot_input_count": input_workspace_count,
@@ -34673,9 +36020,15 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
         "selectedWorkspaceId": selected_workspace_id,
         "selected_workspace": selected_workspace,
         "workspaces": normalized_workspaces,
-        "summary": "Desktop workspace and terminal state synced as the authoritative device workspace snapshot.",
+        "summary": "Desktop workspace and terminal state synced from the complete durable local workspace catalog.",
         "ts_ms": cloud_mcp_now_ms(),
     });
+    if workspace_count == 0 {
+        payload["workspace_set_empty_authoritative"] = json!(true);
+        payload["workspaceSetEmptyAuthoritative"] = json!(true);
+        payload["workspace_clear_reason"] = json!("complete_local_catalog_empty");
+        payload["workspaceClearReason"] = json!("complete_local_catalog_empty");
+    }
     let payload = cloud_mcp_device_live_payload_with_sync_identity(payload);
 
     {
@@ -34716,21 +36069,34 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
                 }
                 Err(error) => {
                     queued = true;
-                    cloud_mcp_enqueue_background_sync(
-                        state,
-                        "device_workspaces_snapshot".to_string(),
-                        "device_workspaces_snapshot",
-                        payload.clone(),
-                        CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
-                        reason_for_ack.clone(),
-                    )
-                    .await;
+                    let fallback = if let Some(rebuild_reason) =
+                        cloud_mcp_authoritative_workspace_snapshot_rebuild_reason(&error)
+                    {
+                        skipped_reason = json!(rebuild_reason);
+                        cloud_mcp_publish_device_live_state_snapshot_debounced(
+                            state,
+                            "workspace_catalog_changed_during_workspace_send",
+                        )
+                        .await;
+                        "catalog_rebuild"
+                    } else {
+                        cloud_mcp_enqueue_background_sync(
+                            state,
+                            "device_workspaces_snapshot".to_string(),
+                            "device_workspaces_snapshot",
+                            payload.clone(),
+                            CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
+                            reason_for_ack.clone(),
+                        )
+                        .await;
+                        "durable_outbox"
+                    };
                     log_terminal_status_event(
                         "backend.cloud_mcp.device_workspaces.ws.queued",
                         json!({
                             "reason": reason_for_ack,
                             "error": clean_terminal_telemetry_text(&error),
-                            "fallback": "durable_outbox",
+                            "fallback": fallback,
                         }),
                     );
                 }
@@ -36565,6 +37931,7 @@ fn cloud_mcp_agent_chat_status_sync_request_from_hook(
     } else {
         payload.workspace_id.clone()
     };
+    let workspace_id = cloud_mcp_workspace_id_match_key(&workspace_id);
     if workspace_id.trim().is_empty() {
         return None;
     }
@@ -37093,16 +38460,26 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
     }
 }
 
-fn cloud_mcp_workspace_payload_matches_delete(value: &Value, workspace_id: &str) -> bool {
+fn cloud_mcp_workspace_payload_matches_delete(
+    value: &Value,
+    workspace_id: &str,
+    platform: &str,
+) -> bool {
     cloud_mcp_payload_text(value, &["workspace_id", "workspaceId", "id"])
         .as_deref()
-        .map(|value| value == workspace_id)
-        .unwrap_or(false)
+        .is_some_and(|stored_id| {
+            cloud_mcp_workspace_id_matches_canonical_or_legacy(
+                workspace_id,
+                stored_id,
+                platform,
+            )
+        })
 }
 
 fn cloud_mcp_mark_workspace_inactive_in_snapshot(
     snapshot: &mut Option<Value>,
     workspace_id: &str,
+    platform: &str,
     reason: &str,
     observed_at_ms: u64,
 ) -> bool {
@@ -37118,7 +38495,7 @@ fn cloud_mcp_mark_workspace_inactive_in_snapshot(
 
     let mut changed = false;
     for workspace in workspaces {
-        if !cloud_mcp_workspace_payload_matches_delete(workspace, workspace_id) {
+        if !cloud_mcp_workspace_payload_matches_delete(workspace, workspace_id, platform) {
             continue;
         }
         changed = true;
@@ -37216,7 +38593,7 @@ pub(crate) async fn cloud_mcp_publish_workspace_deactivated_snapshot(
     workspace_id: &str,
     reason: &str,
 ) {
-    let workspace_id = workspace_id.trim();
+    let workspace_id = cloud_mcp_workspace_id_match_key(workspace_id);
     if workspace_id.is_empty() {
         return;
     }
@@ -37229,12 +38606,15 @@ pub(crate) async fn cloud_mcp_publish_workspace_deactivated_snapshot(
         }
     };
     let observed_at_ms = cloud_mcp_now_ms();
+    let platform = cloud_mcp_desktop_platform();
     let workspace_root = {
         let runtime = state.inner.lock().await;
         runtime
             .registered_workspaces
             .values()
-            .find(|workspace| workspace.workspace_id == workspace_id)
+            .find(|workspace| {
+                cloud_mcp_workspace_id_match_key(&workspace.workspace_id) == workspace_id
+            })
             .map(|workspace| workspace.root.trim().to_string())
             .filter(|root| !root.is_empty())
     };
@@ -37243,25 +38623,28 @@ pub(crate) async fn cloud_mcp_publish_workspace_deactivated_snapshot(
         let mut snapshots = state.runtime_snapshots.lock().await;
         changed |= cloud_mcp_mark_workspace_inactive_in_snapshot(
             &mut snapshots.workspace_catalog,
-            workspace_id,
+            &workspace_id,
+            platform,
             &reason,
             observed_at_ms,
         );
         changed |= cloud_mcp_mark_workspace_inactive_in_snapshot(
             &mut snapshots.workspace_terminals,
-            workspace_id,
+            &workspace_id,
+            platform,
             &reason,
             observed_at_ms,
         );
         changed |= cloud_mcp_mark_workspace_inactive_in_snapshot(
             &mut snapshots.workspace_servers,
-            workspace_id,
+            &workspace_id,
+            platform,
             &reason,
             observed_at_ms,
         );
         if !changed {
             snapshots.workspace_catalog = Some(cloud_mcp_deactivated_workspace_snapshot(
-                workspace_id,
+                &workspace_id,
                 workspace_root.as_deref(),
                 &reason,
                 observed_at_ms,
@@ -37274,6 +38657,7 @@ pub(crate) async fn cloud_mcp_publish_workspace_deactivated_snapshot(
 fn cloud_mcp_filter_deleted_workspace_snapshot(
     snapshot: &mut Option<Value>,
     workspace_id: &str,
+    platform: &str,
     count_kind: &str,
 ) -> usize {
     let (removed, should_clear) = {
@@ -37289,7 +38673,7 @@ fn cloud_mcp_filter_deleted_workspace_snapshot(
 
         let before = workspaces.len();
         workspaces.retain(|workspace| {
-            !cloud_mcp_workspace_payload_matches_delete(workspace, workspace_id)
+            !cloud_mcp_workspace_payload_matches_delete(workspace, workspace_id, platform)
         });
         let removed = before.saturating_sub(workspaces.len());
         if removed == 0 {
@@ -37408,6 +38792,13 @@ fn cloud_mcp_post_workspace_revived_events(state: CloudMcpState, workspaces: Vec
         for workspace in workspaces {
             let workspace_id =
                 cloud_mcp_payload_text(&workspace, &["id", "workspace_id", "workspaceId"])
+                    .map(|workspace_id| {
+                        cloud_mcp_canonical_workspace_id_from_value(
+                            &workspace_id,
+                            &workspace,
+                            cloud_mcp_desktop_platform(),
+                        )
+                    })
                     .unwrap_or_default();
             if workspace_id.trim().is_empty() {
                 continue;
@@ -37430,6 +38821,14 @@ async fn cloud_mcp_post_workspace_revived_event(
     workspace: &Value,
 ) -> Result<Value, String> {
     let workspace_id = cloud_mcp_payload_text(workspace, &["id", "workspace_id", "workspaceId"])
+        .map(|workspace_id| {
+            cloud_mcp_canonical_workspace_id_from_value(
+                &workspace_id,
+                workspace,
+                cloud_mcp_desktop_platform(),
+            )
+        })
+        .filter(|workspace_id| !workspace_id.is_empty())
         .ok_or_else(|| "Workspace revive requires a workspace id.".to_string())?;
     let workspace_name =
         cloud_mcp_payload_text(workspace, &["workspace_name", "workspaceName", "name"])
@@ -37498,15 +38897,34 @@ async fn cloud_mcp_delete_workspace(
     workspace_name: Option<String>,
     include_child_projects: Option<bool>,
 ) -> Result<Value, String> {
-    let workspace_id = workspace_id.trim().to_string();
+    cloud_mcp_delete_workspace_internal(
+        state.inner(),
+        repo_path,
+        workspace_id,
+        workspace_name,
+        include_child_projects,
+    )
+    .await
+}
+
+async fn cloud_mcp_delete_workspace_internal(
+    state: &CloudMcpState,
+    repo_path: String,
+    workspace_id: String,
+    workspace_name: Option<String>,
+    include_child_projects: Option<bool>,
+) -> Result<Value, String> {
+    let workspace_id = cloud_mcp_workspace_id_match_key(&workspace_id);
     if workspace_id.is_empty() {
         return Err("Workspace delete requires a workspace id.".to_string());
     }
     let deleted_ledger_inserted = cloud_mcp_remember_deleted_workspace_id(&workspace_id)?;
-    let purged_todo_mirror_rows = cloud_mcp_todo_mirror_purge_workspace(&workspace_id).unwrap_or(0);
+    let platform = cloud_mcp_desktop_platform();
+    let purged_todo_mirror_rows =
+        cloud_mcp_todo_mirror_purge_workspace(&workspace_id, platform).unwrap_or(0);
     todo_store_orphan_sweep_trigger("workspace_deleted");
     let purged_agent_chat_sync_rows =
-        cloud_mcp_agent_chat_purge_workspace_local_sync_state(&workspace_id).unwrap_or(0);
+        cloud_mcp_agent_chat_purge_workspace_local_sync_state(&workspace_id, platform).unwrap_or(0);
 
     let root = resolve_workspace_root_directory(Some(&repo_path))?;
     let root_display = workspace_path_display(&root);
@@ -37533,16 +38951,19 @@ async fn cloud_mcp_delete_workspace(
         let catalog_removed = cloud_mcp_filter_deleted_workspace_snapshot(
             &mut snapshots.workspace_catalog,
             &workspace_id,
+            platform,
             "catalog",
         );
         let terminal_removed = cloud_mcp_filter_deleted_workspace_snapshot(
             &mut snapshots.workspace_terminals,
             &workspace_id,
+            platform,
             "terminals",
         );
         let mcp_removed = cloud_mcp_filter_deleted_workspace_snapshot(
             &mut snapshots.workspace_servers,
             &workspace_id,
+            platform,
             "mcps",
         );
         cloud_mcp_restore_empty_workspace_snapshot_after_delete(
@@ -37570,12 +38991,20 @@ async fn cloud_mcp_delete_workspace(
     };
     {
         let mut runtime = state.inner.lock().await;
-        runtime
-            .registered_workspaces
-            .retain(|_, workspace| workspace.workspace_id != workspace_id);
-        runtime
-            .terminal_contexts
-            .retain(|_, terminal| terminal.workspace_id != workspace_id);
+        runtime.registered_workspaces.retain(|_, workspace| {
+            !cloud_mcp_workspace_id_matches_canonical_or_legacy(
+                &workspace_id,
+                &workspace.workspace_id,
+                platform,
+            )
+        });
+        runtime.terminal_contexts.retain(|_, terminal| {
+            !cloud_mcp_workspace_id_matches_canonical_or_legacy(
+                &workspace_id,
+                &terminal.workspace_id,
+                platform,
+            )
+        });
     }
 
     let device_profile = cloud_mcp_desktop_device_profile();
@@ -37608,8 +39037,7 @@ async fn cloud_mcp_delete_workspace(
     let _ = state
         .global_ws_events
         .send(cloud_mcp_event_envelope("workspace_deleted", &payload));
-    let response =
-        cloud_mcp_post_event_endpoint(state.inner(), "workspace_deleted", &payload).await?;
+    let response = cloud_mcp_post_event_endpoint(state, "workspace_deleted", &payload).await?;
     Ok(json!({
         "ok": true,
         "workspaceId": payload["workspace_id"].clone(),
@@ -37637,7 +39065,7 @@ async fn cloud_mcp_delete_agent_chat_session(
     pane_id: Option<String>,
     reason: Option<String>,
 ) -> Result<Value, String> {
-    let workspace_id = workspace_id.trim().to_string();
+    let workspace_id = cloud_mcp_workspace_id_match_key(&workspace_id);
     if workspace_id.is_empty() {
         return Err("Agent chat session delete requires a workspace id.".to_string());
     }
@@ -37662,6 +39090,7 @@ async fn cloud_mcp_delete_agent_chat_session(
 
     let local_sync_rows = cloud_mcp_agent_chat_purge_local_sync_state(
         &workspace_id,
+        cloud_mcp_desktop_platform(),
         &provider,
         &provider_session_id,
         &agent_chat_session_id,
@@ -37669,6 +39098,7 @@ async fn cloud_mcp_delete_agent_chat_session(
     .unwrap_or(0);
     let purged_mirror_rows = cloud_mcp_todo_mirror_purge_agent_chat_session(
         &workspace_id,
+        cloud_mcp_desktop_platform(),
         &provider_session_id,
         &agent_chat_session_id,
     )
@@ -46245,30 +47675,51 @@ async fn cloud_mcp_agent_download_asset_status(input: Value) -> Result<Value, St
     .map_err(|error| format!("Unable to run agent asset download status task: {error}"))?
 }
 
-fn cloud_mcp_todo_mirror_purge_workspace(workspace_id: &str) -> Result<usize, String> {
-    let workspace_id = workspace_id.trim();
+fn cloud_mcp_todo_mirror_purge_workspace(
+    workspace_id: &str,
+    platform: &str,
+) -> Result<usize, String> {
+    let workspace_id = cloud_mcp_workspace_id_match_key_for_platform(workspace_id, platform);
     if workspace_id.is_empty() {
         return Ok(0);
     }
+    let legacy_workspace_id = cloud_mcp_legacy_sanitized_workspace_id(&workspace_id);
+    let windows_workspace = i64::from(cloud_mcp_platform_is_windows(platform));
     let conn = cloud_mcp_open_todo_mirror_conn()?;
     let mut removed = conn
         .execute(
             "DELETE FROM workspace_todo_mirror_rows
-             WHERE workspace_id=?1 OR origin_workspace_id=?1 OR target_workspace_id=?1",
-            rusqlite::params![workspace_id],
+             WHERE workspace_id IN (?1, ?2)
+                OR origin_workspace_id IN (?1, ?2)
+                OR target_workspace_id IN (?1, ?2)
+                OR (?3=1 AND (
+                  workspace_id COLLATE NOCASE IN (?1, ?2)
+                  OR origin_workspace_id COLLATE NOCASE IN (?1, ?2)
+                  OR target_workspace_id COLLATE NOCASE IN (?1, ?2)
+                ))",
+            rusqlite::params![workspace_id, legacy_workspace_id, windows_workspace],
         )
         .map_err(|error| format!("Unable to purge todo mirror rows for workspace: {error}"))?;
     removed += conn
         .execute(
             "DELETE FROM workspace_todo_history_rows
-             WHERE workspace_id=?1 OR origin_workspace_id=?1 OR target_workspace_id=?1",
-            rusqlite::params![workspace_id],
+             WHERE workspace_id IN (?1, ?2)
+                OR origin_workspace_id IN (?1, ?2)
+                OR target_workspace_id IN (?1, ?2)
+                OR (?3=1 AND (
+                  workspace_id COLLATE NOCASE IN (?1, ?2)
+                  OR origin_workspace_id COLLATE NOCASE IN (?1, ?2)
+                  OR target_workspace_id COLLATE NOCASE IN (?1, ?2)
+                ))",
+            rusqlite::params![workspace_id, legacy_workspace_id, windows_workspace],
         )
         .map_err(|error| format!("Unable to purge todo history rows for workspace: {error}"))?;
     removed += conn
         .execute(
-            "DELETE FROM workspace_todo_mirror_snapshots WHERE workspace_id=?1",
-            rusqlite::params![workspace_id],
+            "DELETE FROM workspace_todo_mirror_snapshots
+             WHERE workspace_id IN (?1, ?2)
+                OR (?3=1 AND workspace_id COLLATE NOCASE IN (?1, ?2))",
+            rusqlite::params![workspace_id, legacy_workspace_id, windows_workspace],
         )
         .map_err(|error| format!("Unable to purge todo mirror snapshots for workspace: {error}"))?;
     Ok(removed)
@@ -46291,12 +47742,61 @@ fn cloud_mcp_json_contains_text(value: &Value, needle: &str) -> bool {
     }
 }
 
+fn cloud_mcp_json_contains_workspace_id(value: &Value, workspace_id: &str, platform: &str) -> bool {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .any(|item| cloud_mcp_json_contains_workspace_id(item, workspace_id, platform)),
+        Value::Object(object) => object.iter().any(|(key, item)| {
+            let workspace_field = matches!(
+                key.as_str(),
+                "workspace_id"
+                    | "workspaceId"
+                    | "workspace_ids"
+                    | "workspaceIds"
+                    | "source_workspace_id"
+                    | "sourceWorkspaceId"
+                    | "origin_workspace_id"
+                    | "originWorkspaceId"
+                    | "target_workspace_id"
+                    | "targetWorkspaceId"
+                    | "todo_workspace_id"
+                    | "todoWorkspaceId"
+                    | "requested_by_workspace_id"
+                    | "requestedByWorkspaceId"
+            );
+            if workspace_field {
+                return match item {
+                    Value::String(text) => cloud_mcp_workspace_id_matches_canonical_or_legacy(
+                        workspace_id,
+                        text,
+                        platform,
+                    ),
+                    Value::Array(items) => items.iter().any(|item| {
+                        item.as_str().is_some_and(|text| {
+                            cloud_mcp_workspace_id_matches_canonical_or_legacy(
+                                workspace_id,
+                                text,
+                                platform,
+                            )
+                        })
+                    }),
+                    _ => false,
+                };
+            }
+            cloud_mcp_json_contains_workspace_id(item, workspace_id, platform)
+        }),
+        _ => false,
+    }
+}
+
 fn cloud_mcp_supersede_workspace_outbox_rows(
     conn: &rusqlite::Connection,
     workspace_id: &str,
+    platform: &str,
     now: i64,
 ) -> Result<usize, String> {
-    let workspace_id = workspace_id.trim();
+    let workspace_id = cloud_mcp_workspace_id_match_key_for_platform(workspace_id, platform);
     if workspace_id.is_empty() {
         return Ok(0);
     }
@@ -46330,8 +47830,12 @@ fn cloud_mcp_supersede_workspace_outbox_rows(
     for (outbox_id, payload_json) in rows {
         let matches_workspace = serde_json::from_str::<Value>(&payload_json)
             .ok()
-            .map(|value| cloud_mcp_json_contains_text(&value, workspace_id))
-            .unwrap_or_else(|| payload_json.contains(workspace_id));
+            .map(|value| cloud_mcp_json_contains_workspace_id(&value, &workspace_id, platform))
+            .unwrap_or_else(|| {
+                payload_json.contains(&workspace_id)
+                    || payload_json
+                        .contains(&cloud_mcp_legacy_sanitized_workspace_id(&workspace_id))
+            });
         if !matches_workspace {
             continue;
         }
@@ -46357,12 +47861,13 @@ fn cloud_mcp_supersede_workspace_outbox_rows(
 fn cloud_mcp_supersede_agent_chat_session_todo_outbox_rows(
     conn: &rusqlite::Connection,
     workspace_id: &str,
+    platform: &str,
     _provider: &str,
     session_id: &str,
     agent_chat_session_id: &str,
     now: i64,
 ) -> Result<usize, String> {
-    let workspace_id = workspace_id.trim();
+    let workspace_id = cloud_mcp_workspace_id_match_key_for_platform(workspace_id, platform);
     let session_id = session_id.trim();
     let agent_chat_session_id = agent_chat_session_id.trim();
     if workspace_id.is_empty() || (session_id.is_empty() && agent_chat_session_id.is_empty()) {
@@ -46402,13 +47907,15 @@ fn cloud_mcp_supersede_agent_chat_session_todo_outbox_rows(
         let matches_session = serde_json::from_str::<Value>(&payload_json)
             .ok()
             .map(|value| {
-                cloud_mcp_json_contains_text(&value, workspace_id)
+                cloud_mcp_json_contains_workspace_id(&value, &workspace_id, platform)
                     && identities
                         .iter()
                         .any(|identity| cloud_mcp_json_contains_text(&value, identity))
             })
             .unwrap_or_else(|| {
-                payload_json.contains(workspace_id)
+                (payload_json.contains(&workspace_id)
+                    || payload_json
+                        .contains(&cloud_mcp_legacy_sanitized_workspace_id(&workspace_id)))
                     && identities
                         .iter()
                         .any(|identity| payload_json.contains(identity))
@@ -46437,10 +47944,11 @@ fn cloud_mcp_supersede_agent_chat_session_todo_outbox_rows(
 
 fn cloud_mcp_todo_mirror_purge_agent_chat_session(
     workspace_id: &str,
+    platform: &str,
     provider_session_id: &str,
     agent_chat_session_id: &str,
 ) -> Result<usize, String> {
-    let workspace_id = workspace_id.trim();
+    let workspace_id = cloud_mcp_workspace_id_match_key_for_platform(workspace_id, platform);
     if workspace_id.is_empty() {
         return Ok(0);
     }
@@ -46454,6 +47962,8 @@ fn cloud_mcp_todo_mirror_purge_agent_chat_session(
     }
 
     let conn = cloud_mcp_open_todo_mirror_conn()?;
+    let legacy_workspace_id = cloud_mcp_legacy_sanitized_workspace_id(&workspace_id);
+    let windows_workspace = i64::from(cloud_mcp_platform_is_windows(platform));
     let mut removed = 0usize;
     for table in [
         CLOUD_MCP_TODO_MIRROR_ROWS_TABLE,
@@ -46463,15 +47973,23 @@ fn cloud_mcp_todo_mirror_purge_agent_chat_session(
             .prepare(&format!(
                 "SELECT key, row_json
                  FROM {table}
-                 WHERE workspace_id=?1 OR origin_workspace_id=?1 OR target_workspace_id=?1"
+                 WHERE workspace_id IN (?1, ?2)
+                    OR origin_workspace_id IN (?1, ?2)
+                    OR target_workspace_id IN (?1, ?2)
+                    OR (?3=1 AND (
+                      workspace_id COLLATE NOCASE IN (?1, ?2)
+                      OR origin_workspace_id COLLATE NOCASE IN (?1, ?2)
+                      OR target_workspace_id COLLATE NOCASE IN (?1, ?2)
+                    ))"
             ))
             .map_err(|error| {
                 format!("Unable to read todo mirror rows for session purge: {error}")
             })?;
         let rows = statement
-            .query_map(rusqlite::params![workspace_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
+            .query_map(
+                rusqlite::params![workspace_id, legacy_workspace_id, windows_workspace],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
             .map_err(|error| format!("Unable to scan todo mirror rows for session purge: {error}"))?
             .filter_map(Result::ok)
             .collect::<Vec<_>>();
@@ -46508,11 +48026,12 @@ fn cloud_mcp_todo_mirror_purge_agent_chat_session(
 
 fn cloud_mcp_agent_chat_purge_local_sync_state(
     workspace_id: &str,
+    platform: &str,
     provider: &str,
     session_id: &str,
     agent_chat_session_id: &str,
 ) -> Result<usize, String> {
-    let workspace_id = workspace_id.trim();
+    let workspace_id = cloud_mcp_workspace_id_match_key_for_platform(workspace_id, platform);
     let provider = provider.trim();
     let session_id = session_id.trim();
     let agent_chat_session_id = agent_chat_session_id.trim();
@@ -46528,14 +48047,24 @@ fn cloud_mcp_agent_chat_purge_local_sync_state(
         .map_err(|error| format!("Unable to start agent chat purge transaction: {error}"))?;
     let result = (|| -> Result<usize, String> {
         let mut removed = 0usize;
+        let legacy_workspace_id = cloud_mcp_legacy_sanitized_workspace_id(&workspace_id);
+        let windows_workspace = i64::from(cloud_mcp_platform_is_windows(platform));
         if !session_id.is_empty() {
             removed += conn
                 .execute(
                     &format!(
                         "DELETE FROM {CLOUD_MCP_AGENT_CHAT_RECORD_SYNC_STATE_TABLE}
-                         WHERE workspace_id=?1 AND provider=?2 AND session_id=?3"
+                         WHERE (workspace_id IN (?1, ?4)
+                                OR (?5=1 AND workspace_id COLLATE NOCASE IN (?1, ?4)))
+                           AND provider=?2 AND session_id=?3"
                     ),
-                    rusqlite::params![workspace_id, provider, session_id],
+                    rusqlite::params![
+                        workspace_id,
+                        provider,
+                        session_id,
+                        legacy_workspace_id,
+                        windows_workspace
+                    ],
                 )
                 .map_err(|error| {
                     format!("Unable to clear agent chat record sync state: {error}")
@@ -46544,9 +48073,17 @@ fn cloud_mcp_agent_chat_purge_local_sync_state(
                 .execute(
                     &format!(
                         "DELETE FROM {CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_STATE_TABLE}
-                         WHERE workspace_id=?1 AND provider=?2 AND session_id=?3"
+                         WHERE (workspace_id IN (?1, ?4)
+                                OR (?5=1 AND workspace_id COLLATE NOCASE IN (?1, ?4)))
+                           AND provider=?2 AND session_id=?3"
                     ),
-                    rusqlite::params![workspace_id, provider, session_id],
+                    rusqlite::params![
+                        workspace_id,
+                        provider,
+                        session_id,
+                        legacy_workspace_id,
+                        windows_workspace
+                    ],
                 )
                 .map_err(|error| {
                     format!("Unable to clear agent chat session sync state: {error}")
@@ -46561,7 +48098,10 @@ fn cloud_mcp_agent_chat_purge_local_sync_state(
                          updated_at_ms=?1
                      WHERE event_kind=?2
                        AND status IN ('queued', 'retrying', 'in_flight', 'dead_letter')
-                       AND COALESCE(json_extract(payload_json, '$.workspace_id'), json_extract(payload_json, '$.workspaceId'), '')=?3
+                       AND (
+                         COALESCE(json_extract(payload_json, '$.workspace_id'), json_extract(payload_json, '$.workspaceId'), '') IN (?3, ?7)
+                         OR (?8=1 AND COALESCE(json_extract(payload_json, '$.workspace_id'), json_extract(payload_json, '$.workspaceId'), '') COLLATE NOCASE IN (?3, ?7))
+                       )
                        AND COALESCE(json_extract(payload_json, '$.provider'), json_extract(payload_json, '$.agent_kind'), json_extract(payload_json, '$.agentKind'), '')=?4
                        AND (
                          (?5<>'' AND COALESCE(json_extract(payload_json, '$.session_id'), json_extract(payload_json, '$.sessionId'), json_extract(payload_json, '$.provider_session_id'), json_extract(payload_json, '$.providerSessionId'), '')=?5)
@@ -46574,7 +48114,9 @@ fn cloud_mcp_agent_chat_purge_local_sync_state(
                     workspace_id,
                     provider,
                     session_id,
-                    agent_chat_session_id
+                    agent_chat_session_id,
+                    legacy_workspace_id,
+                    windows_workspace
                 ],
             )
             .map_err(|error| {
@@ -46582,7 +48124,8 @@ fn cloud_mcp_agent_chat_purge_local_sync_state(
             })?;
         removed += cloud_mcp_supersede_agent_chat_session_todo_outbox_rows(
             &conn,
-            workspace_id,
+            &workspace_id,
+            platform,
             provider,
             session_id,
             agent_chat_session_id,
@@ -46606,8 +48149,9 @@ fn cloud_mcp_agent_chat_purge_local_sync_state(
 
 fn cloud_mcp_agent_chat_purge_workspace_local_sync_state(
     workspace_id: &str,
+    platform: &str,
 ) -> Result<usize, String> {
-    let workspace_id = workspace_id.trim();
+    let workspace_id = cloud_mcp_workspace_id_match_key_for_platform(workspace_id, platform);
     if workspace_id.is_empty() {
         return Ok(0);
     }
@@ -46617,13 +48161,16 @@ fn cloud_mcp_agent_chat_purge_workspace_local_sync_state(
         format!("Unable to start workspace agent chat purge transaction: {error}")
     })?;
     let result = (|| -> Result<usize, String> {
+        let legacy_workspace_id = cloud_mcp_legacy_sanitized_workspace_id(&workspace_id);
+        let windows_workspace = i64::from(cloud_mcp_platform_is_windows(platform));
         let mut removed = conn
             .execute(
                 &format!(
                     "DELETE FROM {CLOUD_MCP_AGENT_CHAT_RECORD_SYNC_STATE_TABLE}
-                     WHERE workspace_id=?1"
+                     WHERE workspace_id IN (?1, ?2)
+                        OR (?3=1 AND workspace_id COLLATE NOCASE IN (?1, ?2))"
                 ),
-                rusqlite::params![workspace_id],
+                rusqlite::params![workspace_id, legacy_workspace_id, windows_workspace],
             )
             .map_err(|error| {
                 format!("Unable to clear workspace agent chat record sync state: {error}")
@@ -46632,9 +48179,10 @@ fn cloud_mcp_agent_chat_purge_workspace_local_sync_state(
             .execute(
                 &format!(
                     "DELETE FROM {CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_STATE_TABLE}
-                     WHERE workspace_id=?1"
+                     WHERE workspace_id IN (?1, ?2)
+                        OR (?3=1 AND workspace_id COLLATE NOCASE IN (?1, ?2))"
                 ),
-                rusqlite::params![workspace_id],
+                rusqlite::params![workspace_id, legacy_workspace_id, windows_workspace],
             )
             .map_err(|error| {
                 format!("Unable to clear workspace agent chat session sync state: {error}")
@@ -46648,14 +48196,23 @@ fn cloud_mcp_agent_chat_purge_workspace_local_sync_state(
                          updated_at_ms=?1
                      WHERE event_kind=?2
                        AND status IN ('queued', 'retrying', 'in_flight', 'dead_letter')
-                       AND COALESCE(json_extract(payload_json, '$.workspace_id'), json_extract(payload_json, '$.workspaceId'), '')=?3"
+                       AND (
+                         COALESCE(json_extract(payload_json, '$.workspace_id'), json_extract(payload_json, '$.workspaceId'), '') IN (?3, ?4)
+                         OR (?5=1 AND COALESCE(json_extract(payload_json, '$.workspace_id'), json_extract(payload_json, '$.workspaceId'), '') COLLATE NOCASE IN (?3, ?4))
+                       )"
                 ),
-                rusqlite::params![now, CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT, workspace_id],
+                rusqlite::params![
+                    now,
+                    CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT,
+                    workspace_id,
+                    legacy_workspace_id,
+                    windows_workspace
+                ],
             )
             .map_err(|error| {
                 format!("Unable to supersede pending workspace agent chat sync rows: {error}")
             })?;
-        removed += cloud_mcp_supersede_workspace_outbox_rows(&conn, workspace_id, now)?;
+        removed += cloud_mcp_supersede_workspace_outbox_rows(&conn, &workspace_id, platform, now)?;
         Ok(removed)
     })();
     match result {
@@ -46679,13 +48236,15 @@ async fn cloud_mcp_archive_workspace_todos(
     workspace_name: Option<String>,
     reason: Option<String>,
 ) -> Result<Value, String> {
-    let workspace_id = workspace_id.trim().to_string();
+    let workspace_id = cloud_mcp_workspace_id_match_key(&workspace_id);
     if workspace_id.is_empty() {
         return Err("Workspace todo archive requires a workspace id.".to_string());
     }
     // Local state is removed immediately; todo.live_state/todo.content own account
     // convergence for recreated workspaces.
-    let purged_mirror_rows = cloud_mcp_todo_mirror_purge_workspace(&workspace_id).unwrap_or(0);
+    let purged_mirror_rows =
+        cloud_mcp_todo_mirror_purge_workspace(&workspace_id, cloud_mcp_desktop_platform())
+            .unwrap_or(0);
     todo_store_orphan_sweep_trigger("workspace_todo_archive");
     let device_profile = cloud_mcp_desktop_device_profile();
     let payload = json!({
@@ -46754,7 +48313,7 @@ async fn cloud_mcp_request_workspace_todo_dispatch(
     reason: Option<String>,
     mode: Option<String>,
 ) -> Result<Value, String> {
-    let workspace_id = workspace_id.trim().to_string();
+    let workspace_id = cloud_mcp_workspace_id_match_key(&workspace_id);
     if workspace_id.is_empty() {
         return Err("Workspace todo dispatch requires workspace_id.".to_string());
     }
@@ -46827,6 +48386,7 @@ async fn cloud_mcp_request_workspace_todo_dispatch(
             "clientKind": cloud_mcp_payload_text(&target, &["target_client_kind", "targetClientKind", "target_client_type", "targetClientType", "client_kind", "clientKind", "client_type", "clientType"]).unwrap_or_else(|| "rust_desktop".to_string()),
             "deviceId": cloud_mcp_payload_text(&target, &["target_device_id", "targetDeviceId", "device_id", "deviceId"]).unwrap_or_default(),
             "deviceName": cloud_mcp_payload_text(&target, &["target_device_name", "targetDeviceName", "device_name", "deviceName"]).unwrap_or_default(),
+            "platform": cloud_mcp_payload_text(&target, &["target_platform", "targetPlatform", "platform", "os", "system"]).unwrap_or_default(),
             "surface": "native_rust_app",
             "workspaceId": cloud_mcp_payload_text(&target, &["target_workspace_id", "targetWorkspaceId", "workspace_id", "workspaceId"]).unwrap_or_default(),
             "workspaceName": cloud_mcp_payload_text(&target, &["target_workspace_name", "targetWorkspaceName", "workspace_name", "workspaceName"]).unwrap_or_default(),
@@ -46874,6 +48434,7 @@ async fn cloud_mcp_request_workspace_todo_dispatch(
             }
         }
     }
+    cloud_mcp_canonicalize_workspace_fields(&mut payload, cloud_mcp_desktop_platform());
     cloud_mcp_limit_workspace_todo_sync_payload(&mut payload);
     log_terminal_status_event(
         "backend.workspace_todos.dispatch_request",
@@ -46905,6 +48466,9 @@ async fn cloud_mcp_record_todo_dispatch_status(
     details: Option<Value>,
 ) -> Result<Value, String> {
     let device_profile = cloud_mcp_desktop_device_profile();
+    let workspace_id = workspace_id
+        .map(|workspace_id| cloud_mcp_workspace_id_match_key(&workspace_id))
+        .filter(|workspace_id| !workspace_id.is_empty());
     let mut payload = json!({
         "event_kind": "workspace_todo_dispatch_status",
         "source": "rust-diffforge-todo-dispatch",
@@ -47105,6 +48669,7 @@ async fn cloud_mcp_record_todo_dispatch_status(
             payload["details"] = details;
         }
     }
+    cloud_mcp_canonicalize_workspace_fields(&mut payload, cloud_mcp_desktop_platform());
     cloud_mcp_limit_workspace_todo_sync_payload(&mut payload);
     cloud_mcp_apply_local_workspace_todo_event(
         state.inner(),
@@ -51197,7 +52762,7 @@ fn cloud_mcp_normalize_account_todo_entry(
     )?
     .trim()
     .to_string();
-    let source_workspace_id = cloud_mcp_account_todo_text_from_sources(
+    let raw_source_workspace_id = cloud_mcp_account_todo_text_from_sources(
         event,
         entry,
         todo,
@@ -51209,9 +52774,14 @@ fn cloud_mcp_normalize_account_todo_entry(
             "workspace_id",
             "workspaceId",
         ],
-    )?
-    .trim()
-    .to_string();
+    )?;
+    let event_platform = cloud_mcp_workspace_platform_hint(event, "");
+    let entry_platform = cloud_mcp_workspace_platform_hint(entry, &event_platform);
+    let source_workspace_id = cloud_mcp_canonical_workspace_id_from_value(
+        &raw_source_workspace_id,
+        &source,
+        &entry_platform,
+    );
     if source_device_id.is_empty() || source_workspace_id.is_empty() {
         return None;
     }
@@ -51321,8 +52891,10 @@ fn cloud_mcp_normalize_account_todo_entry(
         normalized.insert("account_todo_cursor".to_string(), json!(cursor.clone()));
         normalized.insert("accountTodoCursor".to_string(), json!(cursor.clone()));
     }
+    let mut normalized = Value::Object(normalized);
+    cloud_mcp_canonicalize_workspace_fields(&mut normalized, &entry_platform);
     Some((
-        Value::Object(normalized),
+        normalized,
         source_device_id,
         source_workspace_id,
         todo_id,
@@ -51845,7 +53417,7 @@ fn cloud_mcp_workspace_todo_session_key_from_fields(
     terminal_instance_id: &str,
     thread_id: &str,
 ) -> Option<String> {
-    let workspace_id = workspace_id.trim();
+    let workspace_id = cloud_mcp_workspace_id_match_key(workspace_id);
     if workspace_id.is_empty() {
         return None;
     }
@@ -51950,7 +53522,7 @@ fn cloud_mcp_workspace_todo_session_key_from_value(
 }
 
 pub(crate) fn cloud_mcp_agent_session_context_for_voice(workspace_id: &str) -> Value {
-    let workspace_id = workspace_id.trim();
+    let workspace_id = cloud_mcp_workspace_id_match_key(workspace_id);
     json!({
         "kind": "agent_session_context",
         "source": "workspace_agent_session_history",
@@ -51971,6 +53543,7 @@ pub(crate) fn cloud_mcp_todo_mirror_correction_item(
     workspace_id: &str,
     todo_id: &str,
 ) -> Option<Value> {
+    let workspace_id = cloud_mcp_workspace_id_match_key(workspace_id);
     let todo_id = todo_id.trim();
     if todo_id.is_empty() {
         return None;
@@ -52012,7 +53585,7 @@ pub(crate) fn cloud_mcp_todo_mirror_lookup_todo_item(
     workspace_id: &str,
     todo_id: &str,
 ) -> Option<Value> {
-    let workspace_id = workspace_id.trim();
+    let workspace_id = cloud_mcp_workspace_id_match_key(workspace_id);
     let todo_id = todo_id.trim();
     if workspace_id.is_empty() || todo_id.is_empty() {
         return None;
@@ -52207,6 +53780,27 @@ fn cloud_mcp_todo_mirror_filter_matches(
     })
 }
 
+fn cloud_mcp_todo_mirror_device_filter_matches(
+    row: &Value,
+    filters: &HashSet<String>,
+    keys: &[&str],
+) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    let filter_keys = filters
+        .iter()
+        .map(|value| cloud_mcp_device_id_match_key(value))
+        .filter(|value| !value.is_empty())
+        .collect::<HashSet<_>>();
+    keys.iter().any(|key| {
+        row.get(*key)
+            .and_then(Value::as_str)
+            .map(cloud_mcp_device_id_match_key)
+            .is_some_and(|value| filter_keys.contains(&value))
+    })
+}
+
 fn cloud_mcp_todo_mirror_row_workspace_matches(row: &Value, workspace_id: Option<&str>) -> bool {
     let Some(workspace_id) = workspace_id
         .map(str::trim)
@@ -52249,9 +53843,19 @@ fn cloud_mcp_todo_mirror_row_matches_request(
     workspace_id: Option<&str>,
     input: &Value,
 ) -> bool {
+    let mut canonical_input = input.clone();
+    cloud_mcp_canonicalize_workspace_fields(&mut canonical_input, "");
+    let canonical_workspace_id = workspace_id
+        .map(|workspace_id| {
+            cloud_mcp_canonical_workspace_id_from_value(workspace_id, &canonical_input, "")
+        })
+        .filter(|workspace_id| !workspace_id.is_empty());
+    let input = &canonical_input;
     let include_all = cloud_mcp_payload_bool(input, &["include_all"], false)
         || cloud_mcp_payload_bool(input, &["includeAll"], false);
-    if !include_all && !cloud_mcp_todo_mirror_row_workspace_matches(row, workspace_id) {
+    if !include_all
+        && !cloud_mcp_todo_mirror_row_workspace_matches(row, canonical_workspace_id.as_deref())
+    {
         return false;
     }
     cloud_mcp_todo_mirror_filter_matches(
@@ -52286,7 +53890,7 @@ fn cloud_mcp_todo_mirror_row_matches_request(
         row,
         &cloud_mcp_todo_mirror_text_values(input, &["todo_id", "todoId", "todo_ids", "todoIds"]),
         &["todo_id", "todoId", "id"],
-    ) && cloud_mcp_todo_mirror_filter_matches(
+    ) && cloud_mcp_todo_mirror_device_filter_matches(
         row,
         &cloud_mcp_todo_mirror_text_values(
             input,
@@ -52310,7 +53914,7 @@ fn cloud_mcp_todo_mirror_row_matches_request(
             ],
         ),
         &["target_workspace_id", "targetWorkspaceId"],
-    ) && cloud_mcp_todo_mirror_filter_matches(
+    ) && cloud_mcp_todo_mirror_device_filter_matches(
         row,
         &cloud_mcp_todo_mirror_text_values(
             input,
@@ -52674,6 +54278,10 @@ fn cloud_mcp_todo_mirror_rows_from_response(value: &Value) -> Vec<Value> {
         cloud_mcp_todo_mirror_collect_workspace_dispatch_rows(&workspace_todos, &mut rows);
         cloud_mcp_todo_mirror_collect_workspace_todo_rows(&workspace_todos, &mut rows);
     }
+    let fallback_platform = cloud_mcp_workspace_platform_hint(value, "");
+    for row in &mut rows {
+        cloud_mcp_canonicalize_workspace_fields(row, &fallback_platform);
+    }
     cloud_mcp_todo_mirror_dedupe_rows(rows)
 }
 
@@ -52872,7 +54480,10 @@ fn cloud_mcp_todo_mirror_upsert_rows_into(
         todo_store_all_tombstone_ids()
     };
     for row in rows {
-        let row = cloud_mcp_todo_mirror_enrich_status_row(row.clone());
+        let mut row = cloud_mcp_todo_mirror_enrich_status_row(row.clone());
+        cloud_mcp_canonicalize_workspace_fields(&mut row, "");
+        let observer_workspace_id =
+            cloud_mcp_canonical_workspace_id_from_value(observer_workspace_id, &row, "");
         let row_kind = cloud_mcp_todo_mirror_row_kind(&row);
         let Some(status_row_key) = cloud_mcp_todo_mirror_status_row_key(&row) else {
             continue;
@@ -52891,7 +54502,7 @@ fn cloud_mcp_todo_mirror_upsert_rows_into(
             ],
         );
         let effective_workspace_id = if !observer_workspace_id.is_empty() {
-            observer_workspace_id.to_string()
+            observer_workspace_id
         } else if !target_workspace_id.is_empty() {
             target_workspace_id.clone()
         } else {
@@ -53534,7 +55145,16 @@ fn cloud_mcp_todo_mirror_push_in_clause(
         .join(", ");
     let column_clause = columns
         .iter()
-        .map(|column| format!("{column} IN ({placeholders})"))
+        .map(|column| {
+            if column.ends_with("device_id") {
+                // Device IDs are canonically case-folded by the Rust postfilter.
+                // Apply the same case-insensitive gate in SQLite so a stored
+                // `Windows-Rig` row reaches that postfilter for `windows-rig`.
+                format!("{column} COLLATE NOCASE IN ({placeholders})")
+            } else {
+                format!("{column} IN ({placeholders})")
+            }
+        })
         .collect::<Vec<_>>()
         .join(" OR ");
     clauses.push(format!("({column_clause})"));
@@ -54690,16 +56310,16 @@ fn cloud_mcp_todo_mirror_snapshot_metadata(
     repo_id: Option<&str>,
     workspace_id: Option<&str>,
 ) -> (Value, u64) {
+    let workspace_id = workspace_id
+        .map(|workspace_id| cloud_mcp_workspace_id_match_key_for_platform(workspace_id, ""))
+        .filter(|workspace_id| !workspace_id.is_empty());
     let mut clauses = Vec::<String>::new();
     let mut params = Vec::<String>::new();
     if let Some(repo_id) = repo_id.map(str::trim).filter(|value| !value.is_empty()) {
         clauses.push("repo_id=?".to_string());
         params.push(repo_id.to_string());
     }
-    if let Some(workspace_id) = workspace_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(workspace_id) = workspace_id.as_deref() {
         clauses.push("workspace_id=?".to_string());
         params.push(workspace_id.to_string());
     }
@@ -54746,6 +56366,9 @@ fn cloud_mcp_todo_mirror_snapshot_rows(
     workspace_id: Option<&str>,
     limit: usize,
 ) -> Vec<(Value, String)> {
+    let workspace_id = workspace_id
+        .map(|workspace_id| cloud_mcp_workspace_id_match_key_for_platform(workspace_id, ""))
+        .filter(|workspace_id| !workspace_id.is_empty());
     let mut clauses = vec!["row_kind=?".to_string()];
     let mut params = vec![row_kind.to_string()];
     clauses.push("workspace_id<>''".to_string());
@@ -54759,10 +56382,7 @@ fn cloud_mcp_todo_mirror_snapshot_rows(
         clauses.push("repo_id=?".to_string());
         params.push(repo_id.to_string());
     }
-    if let Some(workspace_id) = workspace_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(workspace_id) = workspace_id.as_deref() {
         clauses
             .push("(workspace_id=? OR origin_workspace_id=? OR target_workspace_id=?)".to_string());
         params.push(workspace_id.to_string());
@@ -54807,6 +56427,9 @@ fn cloud_mcp_todo_mirror_count_rows(
     repo_id: Option<&str>,
     workspace_id: Option<&str>,
 ) -> usize {
+    let workspace_id = workspace_id
+        .map(|workspace_id| cloud_mcp_workspace_id_match_key_for_platform(workspace_id, ""))
+        .filter(|workspace_id| !workspace_id.is_empty());
     let mut clauses = vec!["row_kind=?".to_string()];
     let mut params = vec![row_kind.to_string()];
     clauses.push("workspace_id<>''".to_string());
@@ -54820,10 +56443,7 @@ fn cloud_mcp_todo_mirror_count_rows(
         clauses.push("repo_id=?".to_string());
         params.push(repo_id.to_string());
     }
-    if let Some(workspace_id) = workspace_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(workspace_id) = workspace_id.as_deref() {
         clauses
             .push("(workspace_id=? OR origin_workspace_id=? OR target_workspace_id=?)".to_string());
         params.push(workspace_id.to_string());
@@ -55179,7 +56799,7 @@ fn cloud_mcp_todo_body_cache_key(value: &Value) -> Option<String> {
             "sourceDeviceId",
         ],
     )?;
-    let workspace_id = cloud_mcp_payload_text(
+    let raw_workspace_id = cloud_mcp_payload_text(
         value,
         &[
             "todo_workspace_id",
@@ -55190,6 +56810,7 @@ fn cloud_mcp_todo_body_cache_key(value: &Value) -> Option<String> {
             "sourceWorkspaceId",
         ],
     )?;
+    let workspace_id = cloud_mcp_canonical_workspace_id_from_value(&raw_workspace_id, value, "");
     let revision = cloud_mcp_payload_text(
         value,
         &[
@@ -55488,6 +57109,7 @@ fn cloud_mcp_prepare_workspace_todo_sync_request(payload: Value) -> Value {
         .or_insert_with(|| device_profile["device_id"].clone());
 
     let mut request_value = Value::Object(request);
+    cloud_mcp_canonicalize_workspace_fields(&mut request_value, cloud_mcp_desktop_platform());
     cloud_mcp_limit_workspace_todo_sync_payload(&mut request_value);
     request_value
 }
@@ -55810,7 +57432,9 @@ fn cloud_mcp_repo_request(
     CloudMcpRepoRequest {
         root_display,
         repo_id,
-        workspace_id,
+        workspace_id: workspace_id
+            .map(|workspace_id| cloud_mcp_workspace_id_match_key(&workspace_id))
+            .filter(|workspace_id| !workspace_id.is_empty()),
         workspace_name,
     }
 }
@@ -55944,6 +57568,1014 @@ mod cloud_mcp_tests {
     use super::*;
 
     static CLOUD_MCP_TEST_ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+
+    fn workspace_consistency_catalog_path(data_root: &Path) -> PathBuf {
+        data_root.join(DEVICE_WORKSPACE_CATALOG_DIR).join(format!(
+            "{}.json",
+            local_workspace_scope_file_key(&cloud_mcp_process_account_scope_key())
+        ))
+    }
+
+    fn workspace_consistency_write_catalog(data_root: &Path, workspaces: Value) {
+        let path = workspace_consistency_catalog_path(data_root);
+        fs::create_dir_all(path.parent().expect("workspace catalog parent")).unwrap();
+        fs::write(
+            path,
+            json!({
+                "version": 1,
+                "workspaces": workspaces,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    async fn workspace_consistency_connected_state(
+    ) -> (CloudMcpState, mpsc::UnboundedReceiver<Value>) {
+        let state = CloudMcpState::new();
+        state.global_ws_started.store(true, Ordering::SeqCst);
+        let (tx, rx) = mpsc::unbounded_channel();
+        *state.global_ws_tx.lock().await = Some(tx);
+        let mut runtime = state.inner.lock().await;
+        runtime.connected = true;
+        runtime.global_ws_connected = true;
+        runtime.global_ws_status = "connected".to_string();
+        runtime.global_ws_connection_id = Some("production-test-connection".to_string());
+        runtime.global_ws_message_token = Some("production-test-message-token".to_string());
+        drop(runtime);
+        (state, rx)
+    }
+
+    async fn workspace_consistency_capture_and_ack(
+        state: &CloudMcpState,
+        rx: &mut mpsc::UnboundedReceiver<Value>,
+    ) -> Value {
+        let envelope = timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("production app websocket event")
+            .expect("app websocket sender remains open");
+        let request_id = envelope["id"]
+            .as_str()
+            .expect("production app websocket request id")
+            .to_string();
+        state
+            .global_ws_pending
+            .lock()
+            .await
+            .remove(&request_id)
+            .expect("pending app websocket request")
+            .send(json!({
+                "ok": true,
+                "cloud_event_id": format!("acked-{request_id}"),
+            }))
+            .expect("app websocket response receiver");
+        envelope
+    }
+
+    fn chat_attachment_push_test_png(seed: u8) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\nchat-attachment-push-test".to_vec();
+        bytes.push(seed);
+        bytes
+    }
+
+    fn chat_attachment_push_test_message(
+        workspace_id: &str,
+        bytes: &[u8],
+        chunked: bool,
+    ) -> Value {
+        let encoded = general_purpose::STANDARD.encode(bytes);
+        let image = if chunked {
+            let first = 7;
+            let second = 19.min(encoded.len());
+            json!({
+                "name": "desktop-shot.png",
+                "mime": "image/png",
+                "sha256": chat_attachment_sha256_hex(bytes),
+                "bytes": bytes.len(),
+                "chunks": [
+                    {"index": 0, "total": 3, "data": &encoded[..first]},
+                    {"index": 1, "total": 3, "data": &encoded[first..second]},
+                    {"index": 2, "total": 3, "data": &encoded[second..]},
+                ],
+            })
+        } else {
+            json!({
+                "name": "desktop-shot.png",
+                "mime": "image/png",
+                "sha256": chat_attachment_sha256_hex(bytes),
+                "bytes": bytes.len(),
+                "base64": encoded,
+            })
+        };
+        json!({
+            "kind": "chat_attachment_push",
+            "contract": "diffforge.chat_attachment_push.v1",
+            "request": {
+                "target_device_id": "desktop-test",
+                "workspace_id": workspace_id,
+                "target_thread_id": "thread-test",
+                "images": [image],
+            },
+        })
+    }
+
+    fn cleanup_chat_attachment_push_test_sha(sha: &str) {
+        if let Ok(mut index) = chat_attachment_stage_index().lock() {
+            index.remove(sha);
+        }
+        let Ok(root) = chat_attachment_stage_root() else {
+            return;
+        };
+        let Ok(entries) = fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.starts_with(&format!("{sha}-")))
+            {
+                discard_staged_chat_attachment_file(&path);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_attachment_push_receive_reassembles_stages_and_reuses_marker_injection() {
+        let bytes = chat_attachment_push_test_png(1);
+        let sha = chat_attachment_sha256_hex(&bytes);
+        cleanup_chat_attachment_push_test_sha(&sha);
+        let message = chat_attachment_push_test_message("workspace-test", &bytes, true);
+
+        let received = cloud_mcp_receive_chat_attachment_push(&message)
+            .await
+            .expect("chunked websocket image stages");
+        assert_eq!(received["workspace_id"], json!("workspace-test"));
+        assert_eq!(received["image_count"], json!(1));
+        assert!(received["marker_block"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("[image-attached 1] desktop-shot.png -> "));
+
+        let attachment = ChatAttachmentRef {
+            attachment_id: format!("ws-{sha}"),
+            sha256: sha.clone(),
+            bytes: bytes.len() as u64,
+            mime: "image/png".to_string(),
+            name: "desktop-shot.png".to_string(),
+        };
+        let result = stage_chat_attachment_refs_for_dispatch(
+            ChatAttachmentStageRequest {
+                workspace_id: "workspace-test".to_string(),
+                attachments: vec![attachment.clone()],
+                ack_cloud: true,
+                marker_start_index: 0,
+            },
+        );
+        assert!(result.failed.is_empty());
+        assert!(!result.cloud_acked);
+        assert!(result.cloud_ack_error.is_empty());
+        assert!(result
+            .marker_block
+            .contains("[image-attached 1] desktop-shot.png -> "));
+        cleanup_chat_attachment_push_test_sha(&sha);
+
+        let missing = stage_chat_attachment_refs_for_dispatch(ChatAttachmentStageRequest {
+            workspace_id: "workspace-test".to_string(),
+            attachments: vec![attachment],
+            ack_cloud: true,
+            marker_start_index: 0,
+        });
+        assert_eq!(missing.failed.len(), 1);
+        assert!(missing.failed[0]
+            .reason
+            .contains("Websocket-staged attachment is unavailable"));
+        assert!(!missing.cloud_acked);
+        assert!(missing.cloud_ack_error.is_empty());
+    }
+
+    #[test]
+    fn chat_attachment_push_receive_rejects_sha256_mismatch_and_caps() {
+        let bytes = chat_attachment_push_test_png(2);
+        let mut mismatch = chat_attachment_push_test_message("workspace-test", &bytes, false);
+        mismatch["request"]["images"][0]["sha256"] = json!("0".repeat(64));
+        assert!(cloud_mcp_decode_chat_attachment_push(&mismatch)
+            .unwrap_err()
+            .contains("SHA-256 did not match"));
+
+        let image = mismatch["request"]["images"][0].clone();
+        let mut too_many = mismatch;
+        too_many["request"]["images"] = Value::Array(vec![image; 6]);
+        assert!(cloud_mcp_decode_chat_attachment_push(&too_many)
+            .unwrap_err()
+            .contains("at most 5 images"));
+        assert!(cloud_mcp_chat_attachment_add_total(
+            CLOUD_MCP_CHAT_ATTACHMENT_MAX_TOTAL_BYTES,
+            1,
+        )
+        .unwrap_err()
+        .contains("20 MiB"));
+
+        let mut too_many_chunks =
+            chat_attachment_push_test_message("workspace-test", &bytes, false);
+        too_many_chunks["request"]["images"][0]
+            .as_object_mut()
+            .expect("image object")
+            .remove("base64");
+        too_many_chunks["request"]["images"][0]["chunks"] = Value::Array(
+            (0..33)
+                .map(|index| json!({"index": index, "total": 33, "data": "A"}))
+                .collect(),
+        );
+        assert!(cloud_mcp_decode_chat_attachment_push(&too_many_chunks)
+            .unwrap_err()
+            .contains("limit of 32 chunks"));
+    }
+
+    #[tokio::test]
+    async fn chat_attachment_push_receive_accepts_app_control_sentinel() {
+        let bytes = chat_attachment_push_test_png(3);
+        let sha = chat_attachment_sha256_hex(&bytes);
+        cleanup_chat_attachment_push_test_sha(&sha);
+        let message = chat_attachment_push_test_message(
+            CLOUD_MCP_APP_CONTROL_WORKSPACE_ID,
+            &bytes,
+            false,
+        );
+
+        let received = cloud_mcp_receive_chat_attachment_push(&message)
+            .await
+            .expect("app control attachment stages");
+        assert_eq!(
+            received["workspace_id"],
+            json!(CLOUD_MCP_APP_CONTROL_WORKSPACE_ID)
+        );
+        assert!(received["marker_block"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("[image-attached 1]"));
+        cleanup_chat_attachment_push_test_sha(&sha);
+    }
+
+    #[test]
+    fn workspace_device_consistency_match_keys_respect_device_platform() {
+        assert_eq!(
+            cloud_mcp_device_id_match_key(" Windows-Rig "),
+            "windows-rig"
+        );
+        assert_eq!(
+            cloud_mcp_device_id_match_key(r"C:\Users\Rizzi\DiffForge"),
+            "c__users_rizzi_diffforge"
+        );
+        assert_eq!(
+            cloud_mcp_device_id_match_key(&format!("device:{}", "x".repeat(120))).len(),
+            96
+        );
+        assert_eq!(
+            cloud_mcp_workspace_id_match_key_for_platform(
+                r"C:\Users\Rizzi\Code\DiffForge\",
+                "windows",
+            ),
+            "c:/users/rizzi/code/diffforge"
+        );
+        assert_eq!(
+            cloud_mcp_workspace_id_match_key_for_platform(r"C:\Üser\Repo", "windows"),
+            "c:/üser/repo"
+        );
+        assert_eq!(
+            cloud_mcp_workspace_id_match_key_for_platform(
+                "c:/users/rizzi/code/diffforge",
+                "windows",
+            ),
+            "c:/users/rizzi/code/diffforge"
+        );
+        assert_ne!(
+            cloud_mcp_workspace_id_match_key("/srv/Repo"),
+            cloud_mcp_workspace_id_match_key("/srv/repo")
+        );
+        assert_ne!(
+            cloud_mcp_workspace_id_match_key_for_platform(r"/srv/Foo\Bar", "linux"),
+            cloud_mcp_workspace_id_match_key_for_platform("/srv/foo/bar", "linux")
+        );
+        assert!(cloud_mcp_device_live_snapshot_force_replay(
+            "websocket_ready_replay"
+        ));
+        assert!(!cloud_mcp_device_live_snapshot_force_replay(
+            "workspace_registration"
+        ));
+    }
+
+    #[test]
+    fn workspace_action_catalog_resolution_returns_raw_local_windows_id() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let data_root = test_cloud_root("diffforge-windows-workspace-action-resolution");
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        workspace_consistency_write_catalog(
+            &data_root,
+            json!([
+                {
+                    "id": r"C:\Repo",
+                    "name": "Recipient",
+                    "rootDirectory": r"C:\Repo"
+                },
+                {
+                    "id": r"C:\Other",
+                    "name": "Other",
+                    "rootDirectory": r"C:\Other"
+                }
+            ]),
+        );
+
+        // This is the resolver used by cloud_mcp_apply_remote_workspace_lever
+        // immediately before the exact-id local actuator. It must translate
+        // the cloud canonical id back to the raw Rust catalog id.
+        assert_eq!(
+            cloud_mcp_resolve_local_workspace_id_for_platform("c:/REPO/", "windows"),
+            Some(r"C:\Repo".to_string())
+        );
+        assert_eq!(
+            cloud_mcp_resolve_local_workspace_id_for_platform("c:/missing", "windows"),
+            None
+        );
+
+        let _ = fs::remove_dir_all(data_root);
+    }
+
+    #[test]
+    fn remote_command_receive_gate_accepts_canonical_and_cloud_routed_device_aliases() {
+        let local_device_id = cloud_mcp_desktop_device_profile()["device_id"]
+            .as_str()
+            .expect("local desktop device id")
+            .to_string();
+
+        assert!(cloud_mcp_remote_command_matches_device(&json!({
+            "target_device_id": local_device_id.to_uppercase(),
+        })));
+        assert!(cloud_mcp_remote_command_matches_device(&json!({
+            "target_device_id": "web-device-alias",
+            "requested_target_device_id": "web-device-alias",
+            "cloud_routed_native_device_id": local_device_id,
+        })));
+        assert!(!cloud_mcp_remote_command_matches_device(&json!({
+            "target_device_id": local_device_id,
+            "cloud_routed_native_device_id": "another-device",
+        })));
+        assert!(!cloud_mcp_remote_command_matches_device(&json!({
+            "target_device_id": "web-device-alias",
+        })));
+    }
+
+    #[tokio::test]
+    async fn workspace_device_consistency_activation_and_deletion_emit_complete_wire_catalog() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let data_root = test_cloud_root("diffforge-complete-workspace-catalog-data");
+        let cache_root = test_cloud_root("diffforge-complete-workspace-catalog-cache");
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        workspace_consistency_write_catalog(
+            &data_root,
+            json!([
+                {"id": "W1", "name": "One", "rootDirectory": "/repo/one"},
+                {"id": "W2", "name": "Two", "rootDirectory": "/repo/two"},
+                {"id": "W3", "name": "Three", "rootDirectory": "/repo/three"}
+            ]),
+        );
+        let (state, mut rx) = workspace_consistency_connected_state().await;
+        {
+            // Production restart shape: the durable catalog is ready while the
+            // activation callback reports only W1. A matching cached W2 may
+            // still contain richer live fields and must remain active.
+            let mut snapshots = state.runtime_snapshots.lock().await;
+            snapshots.workspace_catalog = Some(json!({
+                "workspaces": [{
+                    "workspace_id": "W2",
+                    "workspace_name": "Two",
+                    "workspace_active": true,
+                    "workspace_status": "active",
+                    "terminals": [{"terminal_id": "w2-terminal", "status": "running"}]
+                }]
+            }));
+        }
+
+        let activation_state = state.clone();
+        let activation = tokio::spawn(async move {
+            cloud_mcp_sync_device_workspaces_snapshot_internal(
+                &activation_state,
+                json!([{
+                    "workspace_id": "W1",
+                    "workspace_name": "One",
+                    "workspace_root": "/repo/one",
+                    "workspace_active": true,
+                    "workspace_status": "active",
+                    "terminals": [{"terminal_id": "w1-terminal", "status": "running"}]
+                }]),
+                None,
+                Some("workspace_activate_runtime".to_string()),
+            )
+            .await
+        });
+        let activation_envelope = workspace_consistency_capture_and_ack(&state, &mut rx).await;
+        let activation_ack = activation.await.unwrap().unwrap();
+        assert_eq!(activation_ack["sent"], json!(true));
+        let activation_payload = &activation_envelope["request"]["payload"];
+        let activation_rows = activation_payload["workspaces"]
+            .as_array()
+            .expect("activation wire workspaces");
+        let activation_ids = cloud_mcp_workspace_membership_keys(activation_rows);
+        assert_eq!(
+            activation_ids,
+            HashSet::from(["W1".to_string(), "W2".to_string(), "W3".to_string()])
+        );
+        assert_eq!(
+            activation_payload["workspace_snapshot_complete"],
+            json!(true)
+        );
+        assert_eq!(
+            activation_payload["workspace_snapshot_authoritative"],
+            json!(true)
+        );
+        assert_eq!(
+            activation_payload["workspace_snapshot_input_count"],
+            json!(1)
+        );
+        let w1 = activation_rows
+            .iter()
+            .find(|workspace| workspace["workspace_id"] == json!("W1"))
+            .expect("W1 on activation wire");
+        let w2 = activation_rows
+            .iter()
+            .find(|workspace| workspace["workspace_id"] == json!("W2"))
+            .expect("W2 on activation wire");
+        assert_eq!(w1["workspace_active"], json!(true));
+        assert_eq!(w1["terminals"][0]["terminal_id"], json!("w1-terminal"));
+        assert_eq!(w2["workspace_active"], json!(true));
+        assert_eq!(w2["terminals"][0]["terminal_id"], json!("w2-terminal"));
+
+        // The real catalog retains a tombstone while local_workspaces_load hides
+        // it. The next authoritative wire snapshot must therefore be W1+W3;
+        // cached W2 cannot be appended as fake completeness backfill.
+        workspace_consistency_write_catalog(
+            &data_root,
+            json!([
+                {"id": "W1", "name": "One", "rootDirectory": "/repo/one"},
+                {
+                    "id": "W2",
+                    "name": "Two",
+                    "rootDirectory": "/repo/two",
+                    "deleted": true,
+                    "deletedAtMs": cloud_mcp_now_ms()
+                },
+                {"id": "W3", "name": "Three", "rootDirectory": "/repo/three"}
+            ]),
+        );
+        let deletion_state = state.clone();
+        let deletion = tokio::spawn(async move {
+            cloud_mcp_sync_device_workspaces_snapshot_internal(
+                &deletion_state,
+                json!([
+                    {"workspace_id": "W1", "workspace_active": true},
+                    {"workspace_id": "W3", "workspace_active": false}
+                ]),
+                None,
+                Some("local_workspace_deleted".to_string()),
+            )
+            .await
+        });
+        let deletion_envelope = workspace_consistency_capture_and_ack(&state, &mut rx).await;
+        assert_eq!(deletion.await.unwrap().unwrap()["sent"], json!(true));
+        let deletion_rows = deletion_envelope["request"]["payload"]["workspaces"]
+            .as_array()
+            .expect("deletion wire workspaces");
+        assert_eq!(
+            cloud_mcp_workspace_membership_keys(deletion_rows),
+            HashSet::from(["W1".to_string(), "W3".to_string()])
+        );
+        assert!(!deletion_rows
+            .iter()
+            .any(|workspace| workspace["workspace_id"] == json!("W2")));
+
+        let _ = fs::remove_dir_all(data_root);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[tokio::test]
+    async fn workspace_device_consistency_unhydrated_catalog_blocks_authoritative_wire_and_replay()
+    {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let data_root = test_cloud_root("diffforge-unhydrated-workspace-catalog-data");
+        let cache_root = test_cloud_root("diffforge-unhydrated-workspace-catalog-cache");
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        let (state, mut rx) = workspace_consistency_connected_state().await;
+        let prior_snapshot = json!({
+            "workspaces": [
+                {"workspace_id": "W1"},
+                {"workspace_id": "W2"},
+                {"workspace_id": "W3"}
+            ]
+        });
+        state.runtime_snapshots.lock().await.workspace_catalog = Some(prior_snapshot.clone());
+
+        // Drive the production function called by workspace activation while
+        // the on-disk catalog is absent (fresh process, hydration not finished).
+        let ack = cloud_mcp_sync_device_workspaces_snapshot_internal(
+            &state,
+            json!([{"workspace_id": "W1", "workspace_active": true}]),
+            None,
+            Some("workspace_activate_runtime".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ack["skipped"], json!(true));
+        assert_eq!(ack["skip_reason"], json!("workspace_catalog_not_ready"));
+        assert_eq!(
+            state.runtime_snapshots.lock().await.workspace_catalog,
+            Some(prior_snapshot)
+        );
+        assert!(timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .is_err());
+
+        // A pre-upgrade partial outbox row must be retired locally rather than
+        // replayed once a complete catalog is available.
+        workspace_consistency_write_catalog(
+            &data_root,
+            json!([
+                {"id": "W1", "rootDirectory": "/repo/one"},
+                {"id": "W2", "rootDirectory": "/repo/two"},
+                {"id": "W3", "rootDirectory": "/repo/three"}
+            ]),
+        );
+        let stale_row = CloudMcpOutboxRow {
+            outbox_id: "legacy-partial-row".to_string(),
+            idempotency_key: "legacy-partial-key".to_string(),
+            event_kind: "device_workspaces_snapshot".to_string(),
+            payload_json: json!({
+                "workspace_snapshot_complete": true,
+                "workspaces": [{"workspace_id": "W1"}]
+            })
+            .to_string(),
+            attempt_count: 1,
+        };
+        let stale_result = cloud_mcp_send_outbox_row_now(&state, &stale_row)
+            .await
+            .unwrap();
+        assert_eq!(stale_result["skipped"], json!(true));
+        assert_eq!(
+            stale_result["reason"],
+            json!("workspace_catalog_snapshot_superseded")
+        );
+        assert!(timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .is_err());
+
+        // The direct fast lane used by activation and reconnect must surface
+        // suppression as a rebuild request, never Ok/sent=true.
+        let direct_error = cloud_mcp_send_event_over_app_ws_once(
+            &state,
+            "device_workspaces_snapshot",
+            &json!({
+                "workspace_snapshot_complete": true,
+                "workspaces": [{"workspace_id": "W1"}]
+            }),
+            "stale-production-snapshot",
+        )
+        .await
+        .expect_err("stale direct snapshot requests a current-catalog rebuild");
+        assert_eq!(
+            cloud_mcp_authoritative_workspace_snapshot_rebuild_reason(&direct_error),
+            Some("workspace_catalog_snapshot_superseded")
+        );
+        assert!(timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .is_err());
+
+        let _ = fs::remove_dir_all(data_root);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[tokio::test]
+    async fn workspace_delete_production_pipeline_removes_legacy_snapshots_and_blocks_replay() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let data_root = test_cloud_root("diffforge-legacy-delete-replay-data");
+        let cache_root = test_cloud_root("diffforge-legacy-delete-replay-cache");
+        let repo_root = data_root.join("repo-foo");
+        fs::create_dir_all(&repo_root).unwrap();
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        workspace_consistency_write_catalog(
+            &data_root,
+            json!([
+                {"id": "srv_foo", "name": "Legacy Foo", "rootDirectory": "/srv/foo"},
+                {"id": "/srv/other", "name": "Other", "rootDirectory": "/srv/other"}
+            ]),
+        );
+        let (state, mut rx) = workspace_consistency_connected_state().await;
+        {
+            let mut snapshots = state.runtime_snapshots.lock().await;
+            let legacy = json!({
+                "workspaces": [
+                    {"workspace_id": "srv_foo"},
+                    {"workspace_id": "/srv/other"}
+                ]
+            });
+            snapshots.workspace_catalog = Some(legacy.clone());
+            snapshots.workspace_terminals = Some(legacy.clone());
+            snapshots.workspace_servers = Some(legacy);
+        }
+        state.inner.lock().await.registered_workspaces.insert(
+            "legacy-srv-foo".to_string(),
+            CloudMcpWorkspaceStatus {
+                root: "/srv/foo".to_string(),
+                workspace_id: "srv_foo".to_string(),
+                workspace_name: "Legacy Foo".to_string(),
+                dashboard_workspace: true,
+                workspace_role: "desktop_workspace".to_string(),
+                display_surface: "dashboard_workspace".to_string(),
+                last_registered_ms: Some(1),
+                last_synced_ms: Some(1),
+                last_error: String::new(),
+                policy_graph_detected: false,
+                policy_graph_path: String::new(),
+            },
+        );
+
+        let delete_state = state.clone();
+        let delete_root = repo_root.to_string_lossy().to_string();
+        let deletion = tokio::spawn(async move {
+            cloud_mcp_delete_workspace_internal(
+                &delete_state,
+                delete_root,
+                "/srv/foo".to_string(),
+                Some("Foo".to_string()),
+                Some(false),
+            )
+            .await
+        });
+        let envelope = workspace_consistency_capture_and_ack(&state, &mut rx).await;
+        assert_eq!(envelope["kind"], json!("event"));
+        let response = deletion.await.unwrap().unwrap();
+        assert_eq!(response["removedCatalogSnapshots"], json!(1));
+        assert!(state
+            .inner
+            .lock()
+            .await
+            .registered_workspaces
+            .values()
+            .all(|workspace| workspace.workspace_id != "srv_foo"));
+        let snapshots = state.runtime_snapshots.lock().await;
+        for snapshot in [
+            &snapshots.workspace_catalog,
+            &snapshots.workspace_terminals,
+            &snapshots.workspace_servers,
+        ] {
+            assert!(snapshot
+                .as_ref()
+                .and_then(|value| value["workspaces"].as_array())
+                .is_some_and(|rows| rows.iter().all(|row| row["workspace_id"] != "srv_foo")));
+        }
+        drop(snapshots);
+
+        let replay = cloud_mcp_authoritative_local_workspace_catalog()
+            .expect("authoritative catalog reload")
+            .expect("catalog remains ready");
+        let replay_ids = cloud_mcp_workspace_membership_keys(&replay);
+        assert!(!replay_ids.contains("srv_foo"));
+        assert!(replay_ids.contains("/srv/other"));
+
+        let _ = fs::remove_dir_all(data_root);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
+    fn legacy_workspace_sanitizer_matches_deployed_empty_fallback() {
+        assert_eq!(cloud_mcp_legacy_sanitized_workspace_id("/日本"), "dev-client");
+        assert_eq!(cloud_mcp_legacy_sanitized_workspace_id("/"), "dev-client");
+        assert!(cloud_mcp_workspace_id_matches_canonical_or_legacy(
+            "/日本",
+            "dev-client",
+            "linux",
+        ));
+        assert!(cloud_mcp_workspace_id_matches_canonical_or_legacy(
+            "c:/repo", "C__Repo", "windows",
+        ));
+    }
+
+    #[tokio::test]
+    async fn workspace_device_consistency_reconnect_publishes_complete_wire_catalog() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let data_root = test_cloud_root("diffforge-reconnect-workspace-catalog-data");
+        let cache_root = test_cloud_root("diffforge-reconnect-workspace-catalog-cache");
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        workspace_consistency_write_catalog(
+            &data_root,
+            json!([
+                {"id": "W1", "name": "One", "rootDirectory": "/repo/one"},
+                {"id": "W2", "name": "Two", "rootDirectory": "/repo/two"},
+                {"id": "W3", "name": "Three", "rootDirectory": "/repo/three"}
+            ]),
+        );
+        let (state, mut rx) = workspace_consistency_connected_state().await;
+        state.runtime_snapshots.lock().await.workspace_catalog = Some(json!({
+            "workspaces": [{
+                "workspace_id": "W1",
+                "workspace_active": true,
+                "terminals": [{"terminal_id": "w1-reconnect-terminal", "status": "running"}]
+            }]
+        }));
+
+        // This is the actual reconnect publisher, not its payload helper.
+        cloud_mcp_publish_device_live_state_snapshot(&state, "websocket_ready_replay").await;
+        let envelope = workspace_consistency_capture_and_ack(&state, &mut rx).await;
+        let payload = &envelope["request"]["payload"];
+        let rows = payload["workspaces"]
+            .as_array()
+            .expect("reconnect wire workspaces");
+        assert_eq!(
+            cloud_mcp_workspace_membership_keys(rows),
+            HashSet::from(["W1".to_string(), "W2".to_string(), "W3".to_string()])
+        );
+        let w1 = rows
+            .iter()
+            .find(|workspace| workspace["workspace_id"] == json!("W1"))
+            .expect("W1 reconnect row");
+        assert_eq!(
+            w1["terminals"][0]["terminal_id"],
+            json!("w1-reconnect-terminal")
+        );
+        assert_eq!(payload["workspace_snapshot_complete"], json!(true));
+        assert_eq!(payload["workspace_snapshot_authoritative"], json!(true));
+
+        let _ = fs::remove_dir_all(data_root);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[tokio::test]
+    async fn workspace_device_consistency_reconnect_empty_catalog_clears_but_unhydrated_blocks() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let data_root = test_cloud_root("diffforge-empty-workspace-catalog-data");
+        let cache_root = test_cloud_root("diffforge-empty-workspace-catalog-cache");
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+
+        // A valid, loaded empty catalog means the device deleted its final
+        // workspace. Drive the real reconnect publisher and inspect its wire
+        // envelope rather than testing the payload builder in isolation.
+        workspace_consistency_write_catalog(&data_root, json!([]));
+        let (state, mut rx) = workspace_consistency_connected_state().await;
+        state.runtime_snapshots.lock().await.workspace_catalog = Some(json!({
+            "workspaces": [{"workspace_id": "stale-workspace"}]
+        }));
+        cloud_mcp_publish_device_live_state_snapshot(&state, "websocket_ready_replay").await;
+        let envelope = workspace_consistency_capture_and_ack(&state, &mut rx).await;
+        let payload = &envelope["request"]["payload"];
+        assert_eq!(payload["workspaces"], json!([]));
+        assert_eq!(payload["workspace_snapshot_complete"], json!(true));
+        assert_eq!(payload["workspace_snapshot_authoritative"], json!(true));
+        assert_eq!(payload["workspace_set_empty_authoritative"], json!(true));
+        assert_eq!(payload["workspaceSetEmptyAuthoritative"], json!(true));
+
+        // The same production reconnect path must distinguish a missing file:
+        // hydration is not complete, so no authoritative wire snapshot exists.
+        fs::remove_file(workspace_consistency_catalog_path(&data_root)).unwrap();
+        let (unhydrated_state, mut unhydrated_rx) = workspace_consistency_connected_state().await;
+        cloud_mcp_publish_device_live_state_snapshot(&unhydrated_state, "websocket_ready_replay")
+            .await;
+        assert!(timeout(Duration::from_millis(100), unhydrated_rx.recv())
+            .await
+            .is_err());
+
+        let _ = fs::remove_dir_all(data_root);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[tokio::test]
+    async fn workspace_device_consistency_large_catalog_is_not_silently_truncated() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let data_root = test_cloud_root("diffforge-large-workspace-catalog-data");
+        let cache_root = test_cloud_root("diffforge-large-workspace-catalog-cache");
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        let catalog = (0..300)
+            .map(|index| {
+                json!({
+                    "id": format!("W{index}"),
+                    "name": format!("Workspace {index}"),
+                    "rootDirectory": format!("/repo/{index}"),
+                })
+            })
+            .collect::<Vec<_>>();
+        workspace_consistency_write_catalog(&data_root, Value::Array(catalog));
+        let (state, mut rx) = workspace_consistency_connected_state().await;
+        state.runtime_snapshots.lock().await.workspace_catalog = Some(json!({
+            "workspaces": (0..300).map(|index| {
+                if index == 299 {
+                    json!({
+                        "workspace_id": "W299",
+                        "workspace_active": false,
+                        "terminals": [{"terminal_id": "high-index-terminal", "status": "running"}]
+                    })
+                } else {
+                    json!({"workspace_id": format!("W{index}")})
+                }
+            }).collect::<Vec<_>>()
+        }));
+
+        let sync_state = state.clone();
+        let sync = tokio::spawn(async move {
+            cloud_mcp_sync_device_workspaces_snapshot_internal(
+                &sync_state,
+                json!([{
+                    "workspace_id": "W299",
+                    "workspace_active": false,
+                    "terminals": []
+                }]),
+                None,
+                Some("workspace_activate_runtime".to_string()),
+            )
+            .await
+        });
+        let envelope = workspace_consistency_capture_and_ack(&state, &mut rx).await;
+        let ack = sync.await.unwrap().unwrap();
+        let rows = envelope["request"]["payload"]["workspaces"]
+            .as_array()
+            .expect("large production wire workspace set");
+        assert_eq!(rows.len(), 300);
+        assert_eq!(cloud_mcp_workspace_membership_keys(rows).len(), 300);
+        let high_index = rows
+            .iter()
+            .find(|workspace| workspace["workspace_id"] == json!("W299"))
+            .expect("high-index workspace reaches the wire");
+        assert_eq!(
+            high_index["terminals"][0]["terminal_id"],
+            json!("high-index-terminal")
+        );
+        assert_eq!(
+            envelope["request"]["workspace_ids"]
+                .as_array()
+                .map(Vec::len),
+            Some(300)
+        );
+        assert_eq!(ack["sent"], json!(true));
+        assert_eq!(ack["skipped"], json!(false));
+
+        let _ = fs::remove_dir_all(data_root);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[tokio::test]
+    async fn workspace_device_consistency_registration_update_carries_complete_catalog() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let data_root = test_cloud_root("diffforge-workspace-register-catalog-data");
+        let cache_root = test_cloud_root("diffforge-workspace-register-catalog-cache");
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        workspace_consistency_write_catalog(
+            &data_root,
+            json!([
+                {"id": "W1", "name": "One", "rootDirectory": "/repo/one"},
+                {"id": "W2", "name": "Two", "rootDirectory": "/repo/two"},
+                {"id": "W3", "name": "Three", "rootDirectory": "/repo/three"}
+            ]),
+        );
+        let (state, mut rx) = workspace_consistency_connected_state().await;
+        let registration_state = state.clone();
+        let registration = tokio::spawn(async move {
+            cloud_mcp_ws_send_workspace_registration(
+                &registration_state,
+                &CloudMcpWorkspaceStatus {
+                    root: "/repo/one".to_string(),
+                    workspace_id: "W1".to_string(),
+                    workspace_name: "One".to_string(),
+                    dashboard_workspace: true,
+                    workspace_role: "desktop_workspace".to_string(),
+                    display_surface: "dashboard_workspace".to_string(),
+                    last_registered_ms: Some(1),
+                    last_synced_ms: Some(1),
+                    last_error: String::new(),
+                    policy_graph_detected: false,
+                    policy_graph_path: String::new(),
+                },
+            )
+            .await
+        });
+        let envelope = workspace_consistency_capture_and_ack(&state, &mut rx).await;
+        registration.await.unwrap().unwrap();
+        assert_eq!(envelope["kind"], json!("workspace_register"));
+        let rows = envelope["request"]["workspaces"]
+            .as_array()
+            .expect("workspace registration complete catalog");
+        assert_eq!(
+            cloud_mcp_workspace_membership_keys(rows),
+            HashSet::from(["W1".to_string(), "W2".to_string(), "W3".to_string()])
+        );
+        assert_eq!(
+            envelope["request"]["workspace_snapshot_complete"],
+            json!(true)
+        );
+
+        let _ = fs::remove_dir_all(data_root);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
+    fn late_device_snapshot_cannot_ack_or_enqueue_over_newer_pending_state() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let cache_root = test_cloud_root("diffforge-device-live-ordering-cache");
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        let payload_a = cloud_mcp_device_live_payload_with_sync_identity(json!({
+            "scope_key": "race-test",
+            "device_id": "device-a",
+            "sync_unit": "device_live_state_snapshot",
+            "workspaces": [{"workspace_id": "one", "workspace_active": false}],
+        }));
+        let payload_b = cloud_mcp_device_live_payload_with_sync_identity(json!({
+            "scope_key": "race-test",
+            "device_id": "device-a",
+            "sync_unit": "device_live_state_snapshot",
+            "workspaces": [{"workspace_id": "one", "workspace_active": true}],
+        }));
+
+        assert!(
+            cloud_mcp_device_live_enqueue_fallback_if_current(&payload_a, "missing-a").is_err()
+        );
+        cloud_mcp_device_live_mark_sync_pending(&payload_a).unwrap();
+        let row_a = cloud_mcp_device_live_enqueue_fallback_if_current(&payload_a, "test-a")
+            .unwrap()
+            .expect("queued first snapshot");
+        cloud_mcp_device_live_mark_sync_pending(&payload_b).unwrap();
+
+        assert!(!cloud_mcp_device_live_mark_sync_acked_from_payload(
+            Some(&payload_a),
+            &json!({"ok": true}),
+        )
+        .unwrap());
+        assert!(
+            cloud_mcp_device_live_enqueue_fallback_if_current(&payload_a, "late-a")
+                .unwrap()
+                .is_none()
+        );
+        let row_b = cloud_mcp_device_live_enqueue_fallback_if_current(&payload_b, "test-b")
+            .unwrap()
+            .expect("queued current snapshot");
+
+        let conn = cloud_mcp_open_outbox_conn().unwrap();
+        assert_eq!(
+            cloud_mcp_device_live_sync_state_matches_from_conn(&conn, &payload_b).unwrap(),
+            CloudMcpDeviceLiveSyncStateMatch::Current
+        );
+        let active_a: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {CLOUD_MCP_OUTBOX_TABLE}
+                     WHERE idempotency_key=?1
+                       AND status IN ('queued', 'retrying', 'in_flight')"
+                ),
+                rusqlite::params![row_a.idempotency_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let status_b: String = conn
+            .query_row(
+                &format!("SELECT status FROM {CLOUD_MCP_OUTBOX_TABLE} WHERE idempotency_key=?1"),
+                rusqlite::params![row_b.idempotency_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_a, 0);
+        assert_eq!(status_b, "queued");
+        drop(conn);
+        let _ = fs::remove_dir_all(cache_root);
+    }
 
     #[test]
     fn notification_preferences_sanitize_preserves_unknowns_and_canonicalizes() {
@@ -56162,8 +58794,7 @@ mod cloud_mcp_tests {
     #[test]
     fn notification_preferences_local_timestamp_stays_within_skew_boundary() {
         let now_ms: u64 = 50_000;
-        let boundary = now_ms
-            .saturating_add(CLOUD_MCP_NOTIFICATION_PREFERENCES_MAX_CLOCK_SKEW_MS);
+        let boundary = now_ms.saturating_add(CLOUD_MCP_NOTIFICATION_PREFERENCES_MAX_CLOCK_SKEW_MS);
         let current = json!({
             "push": {"uir_prompts": true},
             "updated_at_ms": boundary,
@@ -56531,8 +59162,8 @@ mod cloud_mcp_tests {
             "pane_id": "pane-1",
             "terminal_instance_id": 7,
             "agent_kind": "codex",
-            "status": "awaiting_input",
-            "activity_status": "awaiting_input",
+            "status": "paused",
+            "activity_status": "paused",
             "prompt_id": "screen-codex_hooks_need_review-abc",
             "prompt_kind": "approval",
             "prompt_default_option": "continue_without_trusting",
@@ -56561,6 +59192,7 @@ mod cloud_mcp_tests {
             .workspace_terminals
             .as_ref()
             .expect("workspace terminals")["workspaces"][0]["terminals"][0];
+        assert_eq!(terminal["status"], json!("paused"));
         assert_eq!(
             terminal["prompt_id"],
             json!("screen-codex_hooks_need_review-abc")
@@ -56580,24 +59212,23 @@ mod cloud_mcp_tests {
         let cache_root = test_cloud_root("diffforge-permission-config-cache");
         let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
 
-        let result =
-            tauri::async_runtime::block_on(cloud_mcp_record_agent_chat_permission_config(
-                "claude".to_string(),
-                Some("provider-session-1".to_string()),
-                Some("agent-session-1".to_string()),
-                "workspace-1".to_string(),
-                Some("Workspace 1".to_string()),
-                "pane-1".to_string(),
-                Some(42),
-                Some(0),
-                Some("thread-1".to_string()),
-                "acceptEdits".to_string(),
-                None,
-                Some("command-1".to_string()),
-                Some("turn-1".to_string()),
-                Some("2026-07-09T12:00:00.000Z".to_string()),
-            ))
-            .unwrap();
+        let result = tauri::async_runtime::block_on(cloud_mcp_record_agent_chat_permission_config(
+            "claude".to_string(),
+            Some("provider-session-1".to_string()),
+            Some("agent-session-1".to_string()),
+            "workspace-1".to_string(),
+            Some("Workspace 1".to_string()),
+            "pane-1".to_string(),
+            Some(42),
+            Some(0),
+            Some("thread-1".to_string()),
+            "acceptEdits".to_string(),
+            None,
+            Some("command-1".to_string()),
+            Some("turn-1".to_string()),
+            Some("2026-07-09T12:00:00.000Z".to_string()),
+        ))
+        .unwrap();
         assert_eq!(result["ok"], json!(true));
         assert_eq!(
             result["event_kind"],
@@ -56607,9 +59238,7 @@ mod cloud_mcp_tests {
         let conn = cloud_mcp_open_outbox_conn().unwrap();
         let payload_json: String = conn
             .query_row(
-                &format!(
-                    "SELECT payload_json FROM {CLOUD_MCP_OUTBOX_TABLE} WHERE event_kind=?1"
-                ),
+                &format!("SELECT payload_json FROM {CLOUD_MCP_OUTBOX_TABLE} WHERE event_kind=?1"),
                 rusqlite::params![CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT],
                 |row| row.get(0),
             )
@@ -56625,7 +59254,10 @@ mod cloud_mcp_tests {
             payload["permission_config"]["permission_mode"],
             json!("acceptEdits")
         );
-        assert_eq!(payload["records"][0]["record_kind"], json!("permission_config"));
+        assert_eq!(
+            payload["records"][0]["record_kind"],
+            json!("permission_config")
+        );
         assert_eq!(
             payload["records"][0]["permissionMode"],
             json!("acceptEdits")
@@ -59850,7 +62482,10 @@ mod cloud_mcp_tests {
             app_target.ws_url,
             "wss://node-a.nodes.diffforge.ai/_diffforge/instances/abc/v1/app/ws"
         );
-        assert_eq!(app_target.route_token.as_deref(), route["routeToken"].as_str());
+        assert_eq!(
+            app_target.route_token.as_deref(),
+            route["routeToken"].as_str()
+        );
         assert_eq!(app_target.transport, "cloudflare_node_gateway");
 
         let voice_target =
@@ -59859,7 +62494,10 @@ mod cloud_mcp_tests {
             voice_target.ws_url,
             "wss://node-a.nodes.diffforge.ai/_diffforge/instances/abc/v1/voice/ws"
         );
-        assert_eq!(voice_target.route_token.as_deref(), route["routeToken"].as_str());
+        assert_eq!(
+            voice_target.route_token.as_deref(),
+            route["routeToken"].as_str()
+        );
     }
 
     #[test]
@@ -60918,6 +63556,103 @@ mod cloud_mcp_tests {
         assert_eq!(status["count"].as_u64(), Some(1));
         assert_eq!(status["aggregate"]["status"].as_str(), Some("running"));
         assert_eq!(status["terminal"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn workspace_device_consistency_todo_status_query_reaches_mixed_case_recipient() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
+        let response = json!({
+            "kind": "todo_status",
+            "items": [{
+                "dispatchId": "dispatch-23",
+                "commandId": "command-23",
+                "todoId": "23",
+                "todoDeviceId": "web-origin",
+                "todoWorkspaceId": "web-origin-workspace",
+                "targetDeviceId": "Windows-Rig",
+                "targetWorkspaceId": r"C:\Users\Rizzi\Code\Recipient",
+                "dispatchStatus": "running",
+                "updatedAt": "2026-07-10T00:00:00Z"
+            }]
+        });
+        assert!(cloud_mcp_update_todo_mirror_conn(
+            &conn,
+            "production-app-ws",
+            Some("https://cloud.example"),
+            Some("repo-23"),
+            Some("web-origin-workspace"),
+            &response,
+        )
+        .unwrap());
+
+        // Drive the production SQLite status query. Before the fix its SQL IN
+        // prefilter discarded this row before canonical recipient matching ran.
+        let status = cloud_mcp_todo_mirror_status_from_conn(
+            &conn,
+            Some("repo-23"),
+            Some(r"C:\Users\Rizzi\Code\Recipient"),
+            &json!({
+                "include_all": true,
+                "target_device_id": "windows-rig",
+                "target_workspace_id": r"C:\Users\Rizzi\Code\Recipient"
+            }),
+            None,
+        )
+        .expect("mixed-case recipient survives SQL and canonical postfilter");
+
+        assert_eq!(status["count"], json!(1));
+        assert_eq!(status["items"][0]["todoDeviceId"], json!("web-origin"));
+        assert_eq!(status["items"][0]["targetDeviceId"], json!("Windows-Rig"));
+    }
+
+    #[test]
+    fn todo_dispatch_canonicalization_uses_each_workspaces_owning_device_platform() {
+        // This is the production dispatch shape after the command handler has
+        // flattened `target` fields into the event.  The recipient is Windows,
+        // but it must never make the Linux source workspace case-fold or turn a
+        // literal POSIX backslash into a separator.
+        let mut payload = json!({
+            "device": {
+                "deviceId": "linux-source",
+                "platform": "linux"
+            },
+            "device_id": "linux-source",
+            "workspace_id": r"/srv/Foo\Bar",
+            "source_device_id": "linux-source",
+            "source_platform": "linux",
+            "source_workspace_id": r"/srv/Foo\Bar",
+            "dispatch_source": {
+                "deviceId": "linux-source",
+                "platform": "linux",
+                "workspaceId": r"/srv/Foo\Bar"
+            },
+            "target_device_id": "windows-rig",
+            "target_platform": "windows",
+            "target_workspace_id": r"C:\Repo",
+            "dispatch_target": {
+                "deviceId": "windows-rig",
+                "platform": "windows",
+                "workspaceId": r"C:\Repo"
+            },
+            "target": {
+                "targetDeviceId": "windows-rig",
+                "targetPlatform": "windows",
+                "targetWorkspaceId": r"C:\Repo"
+            }
+        });
+
+        cloud_mcp_canonicalize_workspace_fields(&mut payload, "linux");
+
+        assert_eq!(payload["workspace_id"], json!(r"/srv/Foo\Bar"));
+        assert_eq!(payload["source_workspace_id"], json!(r"/srv/Foo\Bar"));
+        assert_eq!(
+            payload["dispatch_source"]["workspaceId"],
+            json!(r"/srv/Foo\Bar")
+        );
+        assert_eq!(payload["target_workspace_id"], json!("c:/repo"));
+        assert_eq!(payload["dispatch_target"]["workspaceId"], json!("c:/repo"));
+        assert_eq!(payload["target"]["targetWorkspaceId"], json!("c:/repo"));
     }
 
     #[test]
@@ -62867,6 +65602,137 @@ mod cloud_mcp_tests {
         });
 
         assert!(cloud_mcp_agent_chat_sync_response_accepted(&compact));
+    }
+
+    #[test]
+    fn production_workspace_purges_dual_read_legacy_posix_and_windows_ids() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let root = test_cloud_root("workspace-legacy-delete-purge");
+        let data_root = root.join("data");
+        let cache_root = root.join("cache");
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+
+        let mirror = cloud_mcp_open_todo_mirror_conn().unwrap();
+        for (table, key) in [
+            (CLOUD_MCP_TODO_MIRROR_ROWS_TABLE, "mirror-windows"),
+            (CLOUD_MCP_TODO_HISTORY_ROWS_TABLE, "history-windows"),
+        ] {
+            mirror
+                .execute(
+                    &format!(
+                        "INSERT INTO {table}(key, row_kind, workspace_id, origin_workspace_id, target_workspace_id, row_json)
+                         VALUES(?1, 'todo', 'C__Repo', 'C__Repo', 'C__Repo', ?2)"
+                    ),
+                    rusqlite::params![key, r#"{"workspace_id":"C__Repo"}"#],
+                )
+                .unwrap();
+        }
+        mirror
+            .execute(
+                "INSERT INTO workspace_todo_mirror_snapshots(entry_key, workspace_id, metadata_json)
+                 VALUES('snapshot-windows', 'C__Repo', '{}')",
+                [],
+            )
+            .unwrap();
+        drop(mirror);
+
+        let purged = cloud_mcp_todo_mirror_purge_workspace("c:/repo", "windows").unwrap();
+        assert_eq!(purged, 3);
+        let mirror = cloud_mcp_open_todo_mirror_conn().unwrap();
+        for table in [
+            CLOUD_MCP_TODO_MIRROR_ROWS_TABLE,
+            CLOUD_MCP_TODO_HISTORY_ROWS_TABLE,
+            "workspace_todo_mirror_snapshots",
+        ] {
+            let count: i64 = mirror
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "legacy Windows row survived in {table}");
+        }
+        drop(mirror);
+
+        let outbox = cloud_mcp_open_outbox_conn().unwrap();
+        for (scope, workspace, suffix) in [
+            ("scope-posix", "srv_foo", "posix"),
+            ("scope-windows", "C__Repo", "windows"),
+        ] {
+            outbox
+                .execute(
+                    &format!(
+                        "INSERT INTO {CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_STATE_TABLE}(
+                           scope_key, device_id, workspace_id, provider, session_id, updated_at_ms
+                         ) VALUES(?1, 'device-a', ?2, 'codex', 'session-a', 1)"
+                    ),
+                    rusqlite::params![scope, workspace],
+                )
+                .unwrap();
+            outbox
+                .execute(
+                    &format!(
+                        "INSERT INTO {CLOUD_MCP_AGENT_CHAT_RECORD_SYNC_STATE_TABLE}(
+                           scope_key, device_id, workspace_id, provider, session_id, record_key, updated_at_ms
+                         ) VALUES(?1, 'device-a', ?2, 'codex', 'session-a', 'record-a', 1)"
+                    ),
+                    rusqlite::params![scope, workspace],
+                )
+                .unwrap();
+            outbox
+                .execute(
+                    &format!(
+                        "INSERT INTO {CLOUD_MCP_OUTBOX_TABLE}(
+                           outbox_id, idempotency_key, event_kind, payload_hash, payload_json,
+                           status, created_at_ms, updated_at_ms
+                         ) VALUES(?1, ?2, ?3, 'hash', ?4, 'queued', 1, 1)"
+                    ),
+                    rusqlite::params![
+                        format!("outbox-{suffix}"),
+                        format!("idem-{suffix}"),
+                        CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT,
+                        json!({"workspace_id": workspace, "session_id": "session-a"}).to_string()
+                    ],
+                )
+                .unwrap();
+        }
+        drop(outbox);
+
+        let posix_removed =
+            cloud_mcp_agent_chat_purge_workspace_local_sync_state("/srv/foo", "linux").unwrap();
+        let windows_removed =
+            cloud_mcp_agent_chat_purge_workspace_local_sync_state("c:/repo", "windows").unwrap();
+        assert!(posix_removed >= 3);
+        assert!(windows_removed >= 3);
+
+        let outbox = cloud_mcp_open_outbox_conn().unwrap();
+        for table in [
+            CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_STATE_TABLE,
+            CLOUD_MCP_AGENT_CHAT_RECORD_SYNC_STATE_TABLE,
+        ] {
+            let count: i64 = outbox
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "legacy sync row survived in {table}");
+        }
+        let active: i64 = outbox
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {CLOUD_MCP_OUTBOX_TABLE}
+                     WHERE status IN ('queued', 'retrying', 'in_flight', 'dead_letter')"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 0);
+        drop(outbox);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -66455,6 +69321,7 @@ fn cloud_mcp_proxy_push_todo_target(
     seen: &mut std::collections::HashSet<String>,
     targets: &mut Vec<Value>,
 ) {
+    cloud_mcp_canonicalize_workspace_fields(&mut item, "");
     let target_device_id = cloud_mcp_payload_text(
         &item,
         &[
@@ -66478,9 +69345,11 @@ fn cloud_mcp_proxy_push_todo_target(
     if target_device_id.trim().is_empty() || target_workspace_id.trim().is_empty() {
         return;
     }
-    if workspace_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+    let observer_workspace_id = workspace_id
+        .map(|workspace_id| cloud_mcp_canonical_workspace_id_from_value(workspace_id, &item, ""))
+        .filter(|value| !value.is_empty());
+    if observer_workspace_id
+        .as_deref()
         .is_some_and(|workspace_id| {
             cloud_mcp_payload_text(
                 &item,
@@ -66497,7 +69366,8 @@ fn cloud_mcp_proxy_push_todo_target(
     {
         return;
     }
-    let key = format!("{target_device_id}::{target_workspace_id}");
+    let key =
+        serde_json::to_string(&json!([target_device_id, target_workspace_id])).unwrap_or_default();
     if !seen.insert(key) {
         return;
     }
@@ -68379,9 +71249,10 @@ fn cloud_mcp_proxy_post_json_endpoint(
             );
         }
         if let Some(workspace_id) = workspace_id.as_deref() {
+            let workspace_id = cloud_mcp_workspace_id_match_key(workspace_id);
             request.headers_mut().insert(
                 "x-diffforge-workspace-id",
-                HeaderValue::from_str(workspace_id.trim())
+                HeaderValue::from_str(&workspace_id)
                     .map_err(|error| format!("Invalid Cloud MCP workspace id header: {error}"))?,
             );
         }

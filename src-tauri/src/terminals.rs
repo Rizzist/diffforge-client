@@ -203,9 +203,8 @@ struct TerminalControlOperation {
     expires_at_ms: u64,
 }
 
-static TERMINAL_CONTROL_OPERATIONS: OnceLock<
-    StdMutex<HashMap<String, TerminalControlOperation>>,
-> = OnceLock::new();
+static TERMINAL_CONTROL_OPERATIONS: OnceLock<StdMutex<HashMap<String, TerminalControlOperation>>> =
+    OnceLock::new();
 
 fn terminal_control_operation_registry(
 ) -> &'static StdMutex<HashMap<String, TerminalControlOperation>> {
@@ -318,8 +317,8 @@ async fn terminal_control_automation_begin(
             terminal_control_operation_prune_expired(&mut operations, now_ms);
             match operations.get_mut(&pane_id) {
                 Some(active) if active.operation_id == operation_id => {
-                    active.expires_at_ms = now_ms
-                        .saturating_add(TERMINAL_CONTROL_AUTOMATION_GUARD_TTL_MS);
+                    active.expires_at_ms =
+                        now_ms.saturating_add(TERMINAL_CONTROL_AUTOMATION_GUARD_TTL_MS);
                     true
                 }
                 Some(_) => false,
@@ -352,10 +351,7 @@ async fn terminal_control_automation_begin(
 }
 
 #[tauri::command]
-fn terminal_control_automation_end(
-    pane_id: String,
-    operation_id: String,
-) -> Result<bool, String> {
+fn terminal_control_automation_end(pane_id: String, operation_id: String) -> Result<bool, String> {
     validate_terminal_pane_id(&pane_id)?;
     Ok(terminal_control_operation_end_if_owner(
         &pane_id,
@@ -686,7 +682,11 @@ const TERMINAL_SCREEN_PROMPT_DETECTORS: &[TerminalScreenPromptDetectorSpec] = &[
         id: "codex_hooks_need_review",
         providers: &["codex"],
         required_any: &["hooks need review", "review hooks"],
-        confirm_any: &["trust all and continue", "continue without trusting", "/hooks"],
+        confirm_any: &[
+            "trust all and continue",
+            "continue without trusting",
+            "/hooks",
+        ],
         prompt_kind: "approval",
         manual_approval_required: true,
         allow_while_busy: false,
@@ -763,7 +763,10 @@ const TERMINAL_SCREEN_PROMPT_DETECTORS: &[TerminalScreenPromptDetectorSpec] = &[
     TerminalScreenPromptDetectorSpec {
         id: "codex_permission_profile_escalation",
         providers: &["codex"],
-        required_any: &["would you like to grant these permissions", "permission rule"],
+        required_any: &[
+            "would you like to grant these permissions",
+            "permission rule",
+        ],
         confirm_any: &["grant", "deny", "cancel"],
         prompt_kind: "permission",
         manual_approval_required: true,
@@ -771,7 +774,9 @@ const TERMINAL_SCREEN_PROMPT_DETECTORS: &[TerminalScreenPromptDetectorSpec] = &[
         allows_free_text: false,
         default_option: Some("deny"),
         danger_labels: &["grant"],
-        option_strategy: TerminalScreenPromptOptionStrategy::Static(CODEX_PERMISSION_PROFILE_OPTIONS),
+        option_strategy: TerminalScreenPromptOptionStrategy::Static(
+            CODEX_PERMISSION_PROFILE_OPTIONS,
+        ),
     },
     TerminalScreenPromptDetectorSpec {
         id: "claude_workspace_trust",
@@ -789,7 +794,12 @@ const TERMINAL_SCREEN_PROMPT_DETECTORS: &[TerminalScreenPromptDetectorSpec] = &[
     TerminalScreenPromptDetectorSpec {
         id: "claude_theme_onboarding",
         providers: &["claude"],
-        required_any: &["choose a theme", "select theme", "tips for getting started", "what's new"],
+        required_any: &[
+            "choose a theme",
+            "select theme",
+            "tips for getting started",
+            "what's new",
+        ],
         confirm_any: &["welcome", "theme", "continue"],
         prompt_kind: "selection",
         manual_approval_required: false,
@@ -816,7 +826,11 @@ const TERMINAL_SCREEN_PROMPT_DETECTORS: &[TerminalScreenPromptDetectorSpec] = &[
         id: "claude_plan_approval",
         providers: &["claude"],
         required_any: &["do you want to proceed", "claude has written up a plan"],
-        confirm_any: &["no, keep planning", "plan approved", "tell claude what to do differently"],
+        confirm_any: &[
+            "no, keep planning",
+            "plan approved",
+            "tell claude what to do differently",
+        ],
         prompt_kind: "approval",
         manual_approval_required: true,
         allow_while_busy: true,
@@ -828,7 +842,13 @@ const TERMINAL_SCREEN_PROMPT_DETECTORS: &[TerminalScreenPromptDetectorSpec] = &[
     TerminalScreenPromptDetectorSpec {
         id: "claude_login",
         providers: &["claude"],
-        required_any: &["authorization code", "paste", "/login", "auth login", "login"],
+        required_any: &[
+            "authorization code",
+            "paste",
+            "/login",
+            "auth login",
+            "login",
+        ],
         confirm_any: &["browser", "code", "authorization", "login"],
         prompt_kind: "input",
         manual_approval_required: false,
@@ -854,8 +874,21 @@ const TERMINAL_SCREEN_PROMPT_DETECTORS: &[TerminalScreenPromptDetectorSpec] = &[
     TerminalScreenPromptDetectorSpec {
         id: "opencode_login",
         providers: &["opencode"],
-        required_any: &["add credential", "select provider", "login method", "enter your api key", "waiting for authorization", "paste the authorization code here"],
-        confirm_any: &["credential", "provider", "api key", "authorization", "login"],
+        required_any: &[
+            "add credential",
+            "select provider",
+            "login method",
+            "enter your api key",
+            "waiting for authorization",
+            "paste the authorization code here",
+        ],
+        confirm_any: &[
+            "credential",
+            "provider",
+            "api key",
+            "authorization",
+            "login",
+        ],
         prompt_kind: "input",
         manual_approval_required: false,
         allow_while_busy: false,
@@ -1218,9 +1251,15 @@ fn terminal_screen_prompt_fingerprint_text(
     signature_line: &str,
     options: &[TerminalScreenPromptDetectedOption],
 ) -> String {
-    let mut lines = vec![terminal_activity_compact_text(signature_line).trim().to_string()];
+    let mut lines = vec![terminal_activity_compact_text(signature_line)
+        .trim()
+        .to_string()];
     for option in options {
-        lines.push(terminal_activity_compact_text(&option.option.label).trim().to_string());
+        lines.push(
+            terminal_activity_compact_text(&option.option.label)
+                .trim()
+                .to_string(),
+        );
     }
     lines
         .into_iter()
@@ -1277,13 +1316,13 @@ fn terminal_screen_prompt_candidate_from_spec(
                 terminal_screen_prompt_static_options(CODEX_HOOKS_REVIEW_OPTIONS)
             }
             "codex_login_first_run" => terminal_screen_prompt_static_options(CODEX_LOGIN_OPTIONS),
-            "codex_update_available" => {
-                terminal_screen_prompt_static_options(CODEX_UPDATE_OPTIONS)
-            }
+            "codex_update_available" => terminal_screen_prompt_static_options(CODEX_UPDATE_OPTIONS),
             "claude_workspace_trust" => {
                 terminal_screen_prompt_static_options(CLAUDE_WORKSPACE_TRUST_OPTIONS)
             }
-            "claude_theme_onboarding" => terminal_screen_prompt_static_options(CLAUDE_THEME_OPTIONS),
+            "claude_theme_onboarding" => {
+                terminal_screen_prompt_static_options(CLAUDE_THEME_OPTIONS)
+            }
             "claude_external_claude_md_imports" => {
                 terminal_screen_prompt_static_options(CLAUDE_EXTERNAL_IMPORT_OPTIONS)
             }
@@ -1518,11 +1557,53 @@ fn terminal_screen_prompt_clear_scan(key: &str) {
 }
 
 fn terminal_screen_prompt_runtime_has_hook_prompt(runtime: &TerminalRuntimeSnapshot) -> bool {
-    terminal_activity_watchdog_runtime_is_paused_or_manual(runtime)
-        && !runtime
-            .source
-            .to_ascii_lowercase()
-            .contains("screen_detector")
+    if runtime
+        .source
+        .to_ascii_lowercase()
+        .contains("screen_detector")
+    {
+        return false;
+    }
+
+    let event_type = terminal_projection_text(&runtime.event_type, "");
+    if matches!(
+        event_type.as_str(),
+        "provider_permission_requested" | "provider_user_prompt_started"
+    ) {
+        return true;
+    }
+
+    // The hook's prompt state outlives the event that opened it. Coordination
+    // park/heartbeat updates may roll `event_type` while the provider is still
+    // awaiting the same answer, so gate on the prompt-specific runtime state.
+    // Deliberately exclude generic `paused`/`parked` values: those can describe
+    // a coordination lease wait with no live provider prompt.
+    let status = terminal_projection_text(&runtime.status, "");
+    let activity_status = terminal_projection_text(&runtime.activity_status, "");
+    let command_phase = terminal_projection_text(&runtime.command_phase, "");
+    [
+        status.as_str(),
+        activity_status.as_str(),
+        command_phase.as_str(),
+    ]
+    .iter()
+    .any(|value| {
+        matches!(
+            *value,
+            "awaiting_input"
+                | "awaiting_permission"
+                | "awaiting_user"
+                | "manual_prompt"
+                | "needs_input"
+                | "permission"
+                | "permission_requested"
+                | "prompting_user"
+                | "requires_input"
+                | "requires_user_input"
+                | "uir"
+                | "user_input_required"
+        )
+    })
 }
 
 fn terminal_screen_prompt_runtime_allows_candidate(
@@ -1774,7 +1855,8 @@ async fn terminal_screen_prompt_reemit_if_visible(
         return false;
     };
     let (tail, _) = terminal_screen_prompt_headless_snapshot(&instance.headless_output);
-    let Some(candidate) = terminal_screen_prompt_detect(&instance.metadata.agent_kind, &tail) else {
+    let Some(candidate) = terminal_screen_prompt_detect(&instance.metadata.agent_kind, &tail)
+    else {
         return false;
     };
     let visible_prompt_id = terminal_screen_prompt_hash_id(
@@ -8039,119 +8121,291 @@ fn choose_terminal_command_path(command_candidates: &[String]) -> Option<String>
 // terminal input is to read it from a file: stage the full launch sequence in a
 // 0600 temp script and inject only a short `. <script>` line, which is immune to
 // both the canonical-length limit and the shell-startup timing race.
+//
+// If staging fails, only a genuinely short single command may fall back to PTY
+// line injection. A 2,000-unit ceiling leaves substantial headroom below the
+// Windows shell limits and the common 4 KiB Unix canonical-input limit. Measure
+// both UTF-8 bytes and UTF-16 units so non-ASCII text cannot bypass the bound.
+const AGENT_LAUNCH_INLINE_FALLBACK_MAX_ENCODED_UNITS: usize = 2_000;
+const AGENT_LAUNCH_STAGE_MAX_AGE: Duration = Duration::from_secs(10 * 60);
+const AGENT_LAUNCH_STAGE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+#[cfg(windows)]
+const AGENT_LAUNCH_STAGE_EXTENSION: &str = "txt";
 #[cfg(not(windows))]
-fn stage_agent_launch_input_as_source_command(input: &str) -> Option<String> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
+const AGENT_LAUNCH_STAGE_EXTENSION: &str = "sh";
 
-    if input.trim().is_empty() {
-        return None;
+#[derive(Debug)]
+struct StagedAgentLaunchInput {
+    source_command: String,
+    path: PathBuf,
+}
+
+fn agent_launch_input_allows_inline_fallback(input: &str) -> bool {
+    let command = input
+        .strip_suffix("\r\n")
+        .or_else(|| input.strip_suffix('\r'))
+        .or_else(|| input.strip_suffix('\n'))
+        .unwrap_or(input);
+    let encoded_units = input.len().max(input.encode_utf16().count());
+    encoded_units < AGENT_LAUNCH_INLINE_FALLBACK_MAX_ENCODED_UNITS
+        && !command.chars().any(|character| matches!(character, '\r' | '\n'))
+}
+
+fn agent_launch_stage_filename_matches(file_name: &str, extension: &str) -> bool {
+    let Some(stem) = file_name
+        .strip_prefix("difflaunch-")
+        .and_then(|name| name.strip_suffix(&format!(".{extension}")))
+    else {
+        return false;
+    };
+    let mut parts = stem.split('-');
+    (0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    }) && parts.next().is_none()
+}
+
+fn agent_launch_stage_file_should_prune(modified_at: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(modified_at)
+        .is_ok_and(|age| age >= AGENT_LAUNCH_STAGE_MAX_AGE)
+}
+
+fn prune_agent_launch_stage_files() {
+    let Ok(entries) = fs::read_dir(env::temp_dir()) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let matches_stage_file = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                agent_launch_stage_filename_matches(name, AGENT_LAUNCH_STAGE_EXTENSION)
+            });
+        let should_prune = matches_stage_file
+            && entry
+                .metadata()
+                .ok()
+                .filter(|metadata| metadata.is_file())
+                .and_then(|metadata| metadata.modified().ok())
+                .is_some_and(|modified_at| agent_launch_stage_file_should_prune(modified_at, now));
+        if should_prune {
+            let _ = fs::remove_file(path);
+        }
     }
+}
 
-    static LAUNCH_SCRIPT_COUNTER: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
-    let counter = LAUNCH_SCRIPT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+fn ensure_agent_launch_stage_cleanup_sweeper() {
+    static SWEEPER_STARTED: OnceLock<()> = OnceLock::new();
+    SWEEPER_STARTED.get_or_init(|| {
+        let _ = thread::Builder::new()
+            .name("agent-launch-stage-sweeper".to_string())
+            .spawn(|| loop {
+                prune_agent_launch_stage_files();
+                thread::sleep(AGENT_LAUNCH_STAGE_SWEEP_INTERVAL);
+            });
+    });
+}
+
+fn next_agent_launch_stage_path(directory: &Path, extension: &str) -> PathBuf {
+    static LAUNCH_SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = LAUNCH_SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!(
-        "difflaunch-{}-{}-{}.sh",
+    directory.join(format!(
+        "difflaunch-{}-{}-{}.{}",
         std::process::id(),
         nanos,
-        counter
-    ));
+        counter,
+        extension
+    ))
+}
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-        .ok()?;
+fn write_agent_launch_stage_file_with<W, F>(
+    path: &Path,
+    open_file: F,
+    chunks: &[&[u8]],
+) -> Result<(), String>
+where
+    W: Write,
+    F: FnOnce(&Path) -> std::io::Result<W>,
+{
+    let mut file = open_file(path).map_err(|error| {
+        format!(
+            "Unable to create agent launch staging file {}: {error}",
+            path.display()
+        )
+    })?;
+    let write_result = (|| -> std::io::Result<()> {
+        for chunk in chunks {
+            file.write_all(chunk)?;
+        }
+        file.flush()
+    })();
+    if let Err(error) = write_result {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(format!(
+            "Unable to write or flush agent launch staging file {}: {error}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
 
+#[cfg(not(windows))]
+fn stage_agent_launch_input_as_source_command_in_directory_with<W, F>(
+    input: &str,
+    directory: &Path,
+    open_file: F,
+) -> Result<Option<StagedAgentLaunchInput>, String>
+where
+    W: Write,
+    F: FnOnce(&Path) -> std::io::Result<W>,
+{
+    if input.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let path = next_agent_launch_stage_path(directory, "sh");
     let quoted_path = quote_shell_literal(&path.to_string_lossy());
     // Self-delete first: on Unix the shell keeps its already-open source fd valid
     // after the path is unlinked, so the script still runs to completion and the
     // file never lingers on disk (even if the agent runs for hours).
     let script = format!("command rm -f -- {quoted_path}\n{input}");
-    file.write_all(script.as_bytes()).ok()?;
-    file.flush().ok()?;
-    drop(file);
+    write_agent_launch_stage_file_with(&path, open_file, &[script.as_bytes()])?;
 
-    Some(format!(". {quoted_path}\n"))
+    Ok(Some(StagedAgentLaunchInput {
+        source_command: format!(". {quoted_path}\n"),
+        path,
+    }))
+}
+
+#[cfg(not(windows))]
+fn stage_agent_launch_input_as_source_command(
+    input: &str,
+) -> Result<Option<StagedAgentLaunchInput>, String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    if !input.trim().is_empty() {
+        ensure_agent_launch_stage_cleanup_sweeper();
+    }
+    stage_agent_launch_input_as_source_command_in_directory_with(
+        input,
+        &env::temp_dir(),
+        |path| {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+        },
+    )
 }
 
 // Windows console line input is hard-capped well below our launch payloads
 // (ConPTY cooked input; cmd/PowerShell reject with "The command line is too
 // long."), and the agent launch input routinely exceeds it with `-c`/MCP
 // overrides and env exports. Same cure as Unix: stage the full launch
-// sequence in a temp script and inject only a short dot-source line.
+// sequence in a temp file and inject only a short line that executes it.
+//
+// The staged file is deliberately NOT a dot-sourced `.ps1`: execution policy
+// set through Group Policy (MachinePolicy/UserPolicy scopes) overrides our
+// `-ExecutionPolicy Bypass`, so on managed machines a script FILE can never
+// run ("running scripts is disabled on this system" / "is not digitally
+// signed"), and AV/EDR heuristics flag self-deleting `.ps1` files in %TEMP%.
+// Execution policy only gates script files — `Invoke-Expression` on a string
+// read from a plain `.txt` is exempt, and it evaluates in the caller scope so
+// Set-Location and `$env:` assignments persist in the interactive shell
+// exactly like dot-sourcing did. The injected line deletes the file before
+// evaluating its content, preserving the no-linger-on-disk guarantee.
 #[cfg(windows)]
-fn stage_agent_launch_input_as_source_command(input: &str) -> Option<String> {
-    use std::io::Write as _;
-
+fn stage_agent_launch_input_as_source_command(
+    input: &str,
+) -> Result<Option<StagedAgentLaunchInput>, String> {
     if input.trim().is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    static LAUNCH_SCRIPT_COUNTER: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
-    let counter = LAUNCH_SCRIPT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!(
-        "difflaunch-{}-{}-{}.ps1",
-        std::process::id(),
-        nanos,
-        counter
-    ));
+    ensure_agent_launch_stage_cleanup_sweeper();
+    let path = next_agent_launch_stage_path(&env::temp_dir(), "txt");
 
-    // PowerShell reads and parses the whole file before executing a
-    // dot-sourced script, so the self-delete can run first: by execution
-    // time the handle is closed and the launch continues from memory even
-    // though the script is already gone from disk. Dot-sourcing runs in the
-    // caller scope, so Set-Location and $env: assignments persist in the
-    // interactive shell exactly like the previous inline injection.
-    let body = format!(
-        "Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue\r\n{}",
-        // PTY line injection terminates lines with bare `\r`; a script file
-        // needs real CRLF line endings.
-        input.replace('\r', "\r\n"),
-    );
+    // PTY line injection terminates lines with bare `\r`; the staged file
+    // needs real CRLF line endings.
+    let body = input.replace('\r', "\r\n");
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .ok()?;
+    // UTF-8 BOM: Windows PowerShell 5.1's Get-Content otherwise reads the
+    // file as ANSI and mangles non-ASCII working directories and env values.
+    write_agent_launch_stage_file_with(
+        &path,
+        |path| {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+        },
+        &[b"\xEF\xBB\xBF", body.as_bytes()],
+    )?;
 
-    // UTF-8 BOM: Windows PowerShell 5.1 otherwise reads .ps1 files as ANSI
-    // and mangles non-ASCII working directories and env values.
-    file.write_all(b"\xEF\xBB\xBF").ok()?;
-    file.write_all(body.as_bytes()).ok()?;
-    file.flush().ok()?;
-    drop(file);
-
-    Some(format!(
-        ". {}\r",
-        quote_powershell_literal(&path.to_string_lossy())
-    ))
+    Ok(Some(StagedAgentLaunchInput {
+        source_command: windows_staged_launch_source_line(&path.to_string_lossy()),
+        path,
+    }))
 }
 
-fn write_agent_start_input_to_writer(
+// Split out (and compiled everywhere) so the injected line's shape is unit
+// tested on every platform even though staging itself is Windows-only.
+#[cfg(any(windows, test))]
+fn windows_staged_launch_source_line(path: &str) -> String {
+    let quoted = format!("'{}'", path.replace('\'', "''"));
+    format!(
+        "$__diffforgeLaunch = Get-Content -Raw -LiteralPath {quoted}; Remove-Item -LiteralPath {quoted} -Force -ErrorAction SilentlyContinue; Invoke-Expression $__diffforgeLaunch; Remove-Variable -Name __diffforgeLaunch -ErrorAction SilentlyContinue\r"
+    )
+}
+
+fn write_agent_start_input_to_writer_with_stager<F>(
     writer: &mut dyn Write,
     input: &str,
     context: &str,
-) -> Result<(), String> {
-    let staged_source_command = stage_agent_launch_input_as_source_command(input);
-    let payload = staged_source_command.as_deref().unwrap_or(input);
-    let delivery = if staged_source_command.is_some() {
-        "source_script"
-    } else {
-        "inline"
+    stager: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&str) -> Result<Option<StagedAgentLaunchInput>, String>,
+{
+    let (staged, delivery, reason, staging_error) = match stager(input) {
+        Ok(Some(staged)) => (Some(staged), "source_script", "staged", None),
+        Ok(None) => (None, "inline", "input_empty", None),
+        Err(error) if agent_launch_input_allows_inline_fallback(input) => (
+            None,
+            "inline",
+            "staging_failed_safe_inline_fallback",
+            Some(error),
+        ),
+        Err(error) => {
+            log_terminal_crash_forensics_event(
+                "backend.agent_start_input.write.error",
+                json!({
+                    "bytes": input.len(),
+                    "context": clean_terminal_diagnostic_log_text(context),
+                    "delivery": "failed",
+                    "error": clean_terminal_diagnostic_log_text(&error),
+                    "input_kind": terminal_input_forensics_kind(input),
+                    "reason": "staging_failed_unsafe_inline_fallback",
+                    "stage": "staging",
+                }),
+            );
+            return Err(format!("Failed to stage agent launch input: {error}"));
+        }
     };
+    let payload = staged
+        .as_ref()
+        .map(|staged| staged.source_command.as_str())
+        .unwrap_or(input);
     log_terminal_crash_forensics_event(
         "backend.agent_start_input.write.begin",
         json!({
@@ -8160,27 +8414,43 @@ fn write_agent_start_input_to_writer(
             "delivery": delivery,
             "context": clean_terminal_diagnostic_log_text(context),
             "input_kind": terminal_input_forensics_kind(input),
+            "reason": reason,
+            "stagingError": staging_error
+                .as_deref()
+                .map(clean_terminal_diagnostic_log_text),
         }),
     );
     if let Err(error) = writer.write_all(payload.as_bytes()) {
+        if let Some(staged) = staged.as_ref() {
+            let _ = fs::remove_file(&staged.path);
+        }
         log_terminal_crash_forensics_event(
             "backend.agent_start_input.write.error",
             json!({
+                "attemptedDelivery": delivery,
                 "bytes": input.len(),
                 "context": clean_terminal_diagnostic_log_text(context),
+                "delivery": "failed",
                 "error": clean_terminal_diagnostic_log_text(&error.to_string()),
+                "reason": "pty_write_failed",
                 "stage": "write_all",
             }),
         );
         return Err(format!("Unable to write {context}: {error}"));
     }
     if let Err(error) = writer.flush() {
+        if let Some(staged) = staged.as_ref() {
+            let _ = fs::remove_file(&staged.path);
+        }
         log_terminal_crash_forensics_event(
             "backend.agent_start_input.write.error",
             json!({
+                "attemptedDelivery": delivery,
                 "bytes": input.len(),
                 "context": clean_terminal_diagnostic_log_text(context),
+                "delivery": "failed",
                 "error": clean_terminal_diagnostic_log_text(&error.to_string()),
+                "reason": "pty_flush_failed",
                 "stage": "flush",
             }),
         );
@@ -8191,10 +8461,25 @@ fn write_agent_start_input_to_writer(
         json!({
             "bytes": input.len(),
             "context": clean_terminal_diagnostic_log_text(context),
+            "delivery": delivery,
             "input_kind": terminal_input_forensics_kind(input),
+            "reason": reason,
         }),
     );
     Ok(())
+}
+
+fn write_agent_start_input_to_writer(
+    writer: &mut dyn Write,
+    input: &str,
+    context: &str,
+) -> Result<(), String> {
+    write_agent_start_input_to_writer_with_stager(
+        writer,
+        input,
+        context,
+        stage_agent_launch_input_as_source_command,
+    )
 }
 
 fn terminal_request_is_plain_shell(
@@ -8389,13 +8674,11 @@ async fn terminal_open(
     }
     ensure_app_not_shutting_down("terminal open")?;
 
-    let working_directory =
-        match resolve_workspace_root_directory(working_directory_request.as_deref()) {
-            Ok(working_directory) => working_directory,
-            Err(error) => {
-                return Err(error);
-            }
-        };
+    let working_directory = if app_control_mcp_requested {
+        resolve_app_control_terminal_working_directory(working_directory_request.as_deref())
+    } else {
+        resolve_workspace_root_directory(working_directory_request.as_deref())
+    }?;
     let working_directory_text = working_directory.to_string_lossy().to_string();
     let mut terminal_project_root = working_directory.clone();
     let mut process_working_directory = workspace_path_for_process(&working_directory);
@@ -8611,6 +8894,11 @@ async fn terminal_open(
         } else {
             None
         };
+        launch_args = prepare_terminal_agent_launch_args_for_platform(
+            launch_provider_id,
+            &command_path,
+            &launch_args,
+        )?;
         validate_terminal_agent_launch_args_for_platform(launch_provider_id, &launch_args)?;
         let mut coordination_env_vars = terminal_coordination
             .as_ref()
@@ -9421,6 +9709,11 @@ async fn terminal_start_agent(
             app_control_args,
         )?;
     }
+    launch_args = prepare_terminal_agent_launch_args_for_platform(
+        definition.id,
+        &command_path,
+        &launch_args,
+    )?;
     validate_terminal_agent_launch_args_for_platform(definition.id, &launch_args)?;
     let mut coordination_env_vars = instance
         .coordination
@@ -9806,6 +10099,24 @@ async fn start_terminal_agent_in_prepared_pty(
                 }
             }
         }
+        launch_args = match prepare_terminal_agent_launch_args_for_platform(
+            definition.id,
+            &command_path,
+            &launch_args,
+        ) {
+            Ok(args) => args,
+            Err(error) => {
+                return TerminalStartAgentPaneResult {
+                    pane_id,
+                    instance_id: Some(instance.id),
+                    model: None,
+                    model_source: None,
+                    started: false,
+                    skipped: false,
+                    message: error,
+                };
+            }
+        };
         if let Err(error) =
             validate_terminal_agent_launch_args_for_platform(definition.id, &launch_args)
         {
@@ -14587,8 +14898,7 @@ fn terminal_activity_hook_activity_kind(
             )
             .map(|value| terminal_projection_text(&value, ""))
             .unwrap_or_default();
-            if input_ready || matches!(activity_status.as_str(), "idle" | "input_ready" | "ready")
-            {
+            if input_ready || matches!(activity_status.as_str(), "idle" | "input_ready" | "ready") {
                 Some((
                     "provider-user-prompt-completed",
                     "idle",
@@ -15493,11 +15803,11 @@ fn terminal_activity_hook_payload(
             activity_status: activity_status.to_string(),
             command_phase: command_phase.to_string(),
             input_ready,
-                        input_ready_at: input_ready_at.clone(),
-                        prompt_ready_at: prompt_ready_at.clone(),
-                        completed_at: completed_at.clone(),
-                        provider_session_id: provider_session_id.clone(),
-                        native_session_id: provider_session_id.clone(),
+            input_ready_at: input_ready_at.clone(),
+            prompt_ready_at: prompt_ready_at.clone(),
+            completed_at: completed_at.clone(),
+            provider_session_id: provider_session_id.clone(),
+            native_session_id: provider_session_id.clone(),
             fork_from_provider_session_id: current_runtime.fork_from_provider_session_id.clone(),
             provider_turn_id: provider_turn_id.clone(),
             turn_id: provider_turn_id.clone(),
@@ -16043,36 +16353,40 @@ fn terminal_activity_watchdog_runtime_is_paused_or_manual(
     let status = terminal_projection_text(&runtime.status, "");
     let activity_status = terminal_projection_text(&runtime.activity_status, "");
     let command_phase = terminal_projection_text(&runtime.command_phase, "");
-    [status.as_str(), activity_status.as_str(), command_phase.as_str()]
-        .iter()
-        .any(|value| {
-            matches!(
-                *value,
-                "paused"
-                    | "awaiting_input"
-                    | "awaiting-input"
-                    | "awaiting_permission"
-                    | "awaiting-permission"
-                    | "awaiting_user"
-                    | "awaiting-user"
-                    | "manual_prompt"
-                    | "manual-prompt"
-                    | "needs_input"
-                    | "needs-input"
-                    | "permission"
-                    | "permission_requested"
-                    | "permission-requested"
-                    | "prompting_user"
-                    | "prompting-user"
-                    | "requires_input"
-                    | "requires-input"
-                    | "requires_user_input"
-                    | "requires-user-input"
-                    | "uir"
-                    | "user_input_required"
-                    | "user-input-required"
-            )
-        })
+    [
+        status.as_str(),
+        activity_status.as_str(),
+        command_phase.as_str(),
+    ]
+    .iter()
+    .any(|value| {
+        matches!(
+            *value,
+            "paused"
+                | "awaiting_input"
+                | "awaiting-input"
+                | "awaiting_permission"
+                | "awaiting-permission"
+                | "awaiting_user"
+                | "awaiting-user"
+                | "manual_prompt"
+                | "manual-prompt"
+                | "needs_input"
+                | "needs-input"
+                | "permission"
+                | "permission_requested"
+                | "permission-requested"
+                | "prompting_user"
+                | "prompting-user"
+                | "requires_input"
+                | "requires-input"
+                | "requires_user_input"
+                | "requires-user-input"
+                | "uir"
+                | "user_input_required"
+                | "user-input-required"
+        )
+    })
 }
 
 fn terminal_activity_watchdog_runtime_is_active_tool(runtime: &TerminalRuntimeSnapshot) -> bool {
@@ -18322,14 +18636,14 @@ fn terminal_permission_config_input_is_allowed(data: &str) -> bool {
     if data.contains("/permissions") {
         return matches!(
             data,
-            "/permissions"
-                | "/permissions\r"
-                | "\u{15}/permissions"
-                | "\u{15}/permissions\r"
+            "/permissions" | "/permissions\r" | "\u{15}/permissions" | "\u{15}/permissions\r"
         );
     }
     if data.contains("/status") {
-        return matches!(data, "/status" | "/status\r" | "\u{15}/status" | "\u{15}/status\r");
+        return matches!(
+            data,
+            "/status" | "/status\r" | "\u{15}/status" | "\u{15}/status\r"
+        );
     }
     if data == "\r" {
         return true;
@@ -18369,9 +18683,9 @@ fn terminal_codex_model_change_command_from_input(data: &str) -> Option<String> 
     let effort = parts.next();
     if slash != "/model"
         || model.len() > 160
-        || !model
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | ':' | '/' | '-'))
+        || !model.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | ':' | '/' | '-')
+        })
         || parts.next().is_some()
     {
         return None;
@@ -18471,7 +18785,10 @@ async fn terminal_write_inner(
     if terminal_write_source_is_permission_config(prompt_event_source.as_deref())
         && !terminal_permission_config_input_is_allowed(&data)
     {
-        return Err("Remote permission configuration input contained an invalid command sequence.".to_string());
+        return Err(
+            "Remote permission configuration input contained an invalid command sequence."
+                .to_string(),
+        );
     }
     if terminal_metadata_is_codex(&instance.metadata)
         && terminal_write_source_is_model_change(prompt_event_source.as_deref())
@@ -19320,9 +19637,12 @@ fn terminal_screen_prompt_answer_input(
     let Some(active) = terminal_screen_prompt_active_by_prompt_id(prompt_id) else {
         return Ok(None);
     };
-    let Some(plan) =
-        terminal_screen_prompt_answer_plan_for_option(&active, option_id, option_label, option_value)
-    else {
+    let Some(plan) = terminal_screen_prompt_answer_plan_for_option(
+        &active,
+        option_id,
+        option_label,
+        option_value,
+    ) else {
         return Err(format!(
             "Prompt answer option {option_id} is not valid for synthetic prompt {prompt_id}."
         ));
@@ -19337,7 +19657,9 @@ fn terminal_screen_prompt_answer_input(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| {
-                    format!("Prompt answer option {option_id} requires answer_text or option_value.")
+                    format!(
+                        "Prompt answer option {option_id} requires answer_text or option_value."
+                    )
                 })?;
             format!("{text}\r")
         }
@@ -19364,8 +19686,7 @@ fn terminal_screen_prompt_tail_matches_prompt_id(
     raw_tail: &str,
     prompt_id: &str,
 ) -> bool {
-    terminal_screen_prompt_visible_prompt_id(provider, pane_id, raw_tail)
-        .as_deref()
+    terminal_screen_prompt_visible_prompt_id(provider, pane_id, raw_tail).as_deref()
         == Some(prompt_id)
 }
 
@@ -19384,7 +19705,8 @@ async fn terminal_screen_prompt_same_prompt_visible(
     instance_id: Option<u64>,
     prompt_id: &str,
 ) -> (bool, String) {
-    let Ok(Some(instance)) = get_terminal_instance_if_current(state, pane_id, instance_id).await else {
+    let Ok(Some(instance)) = get_terminal_instance_if_current(state, pane_id, instance_id).await
+    else {
         return (false, String::new());
     };
     let (tail, _) = terminal_screen_prompt_headless_snapshot(&instance.headless_output);
@@ -19635,10 +19957,7 @@ async fn terminal_answer_agent_prompt_remote_command(
         }
         if same_prompt_visible {
             answer_status = "failed".to_string();
-            answer_message = format!(
-                "answer did not dismiss the prompt: {}",
-                latest_tail
-            );
+            answer_message = format!("answer did not dismiss the prompt: {}", latest_tail);
         } else if let Some(resolved) = terminal_screen_prompt_clear_by_prompt_id(&prompt_id) {
             terminal_screen_prompt_emit_resolved(
                 &cloud_app,
@@ -21296,15 +21615,18 @@ mod terminal_tests {
     fn pane_control_automation_guard_blocks_prompt_answers_and_expires() {
         let pane_id = format!("pane-control-test-{}", uuid::Uuid::new_v4());
         let operation_id = "permission-test".to_string();
-        terminal_control_operation_registry().lock().unwrap().insert(
-            pane_id.clone(),
-            TerminalControlOperation {
-                operation_id: operation_id.clone(),
-                operation_kind: "permission".to_string(),
-                automation_owned: true,
-                expires_at_ms: terminal_now_ms().saturating_add(10_000),
-            },
-        );
+        terminal_control_operation_registry()
+            .lock()
+            .unwrap()
+            .insert(
+                pane_id.clone(),
+                TerminalControlOperation {
+                    operation_id: operation_id.clone(),
+                    operation_kind: "permission".to_string(),
+                    automation_owned: true,
+                    expires_at_ms: terminal_now_ms().saturating_add(10_000),
+                },
+            );
 
         assert!(terminal_control_automation_owned(&pane_id));
         assert!(terminal_control_prompt_answer_begin(&pane_id)
@@ -21327,15 +21649,18 @@ mod terminal_tests {
             .unwrap()
             .contains_key(&pane_id));
 
-        terminal_control_operation_registry().lock().unwrap().insert(
-            pane_id.clone(),
-            TerminalControlOperation {
-                operation_id,
-                operation_kind: "model".to_string(),
-                automation_owned: true,
-                expires_at_ms: 0,
-            },
-        );
+        terminal_control_operation_registry()
+            .lock()
+            .unwrap()
+            .insert(
+                pane_id.clone(),
+                TerminalControlOperation {
+                    operation_id,
+                    operation_kind: "model".to_string(),
+                    automation_owned: true,
+                    expires_at_ms: 0,
+                },
+            );
         assert!(!terminal_control_automation_owned(&pane_id));
         assert!(!terminal_control_operation_registry()
             .lock()
@@ -21370,25 +21695,236 @@ mod terminal_tests {
         assert_eq!(choose_terminal_command_path(&candidates), None);
     }
 
+    #[test]
+    fn agent_launch_stage_sweep_matches_only_exact_owned_file_names() {
+        assert!(agent_launch_stage_filename_matches(
+            "difflaunch-123-456-7.sh",
+            "sh"
+        ));
+        assert!(agent_launch_stage_filename_matches(
+            "difflaunch-123-456-7.txt",
+            "txt"
+        ));
+        assert!(!agent_launch_stage_filename_matches(
+            "difflaunch-123-456-7.txt",
+            "sh"
+        ));
+        assert!(!agent_launch_stage_filename_matches(
+            "difflaunch-123-456.sh",
+            "sh"
+        ));
+        assert!(!agent_launch_stage_filename_matches(
+            "difflaunch-123-456-7-extra.sh",
+            "sh"
+        ));
+        assert!(!agent_launch_stage_filename_matches(
+            "difflaunch-123-not-a-number-7.sh",
+            "sh"
+        ));
+        assert!(!agent_launch_stage_filename_matches(
+            "other-difflaunch-123-456-7.sh",
+            "sh"
+        ));
+
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert!(agent_launch_stage_file_should_prune(
+            now - AGENT_LAUNCH_STAGE_MAX_AGE,
+            now
+        ));
+        assert!(!agent_launch_stage_file_should_prune(
+            now - AGENT_LAUNCH_STAGE_MAX_AGE + Duration::from_secs(1),
+            now
+        ));
+    }
+
+    #[test]
+    fn agent_launch_staging_failure_never_inlines_unsafe_input() {
+        for input in [
+            "x".repeat(AGENT_LAUNCH_INLINE_FALLBACK_MAX_ENCODED_UNITS),
+            "😀".repeat(AGENT_LAUNCH_INLINE_FALLBACK_MAX_ENCODED_UNITS / 4),
+            "first command\nsecond command".to_string(),
+        ] {
+            let mut delivered = Vec::new();
+            let result = write_agent_start_input_to_writer_with_stager(
+                &mut delivered,
+                &input,
+                "test launch",
+                |_| Err("injected staging failure".to_string()),
+            );
+            assert_eq!(delivered, Vec::<u8>::new());
+            assert_eq!(
+                result.unwrap_err(),
+                "Failed to stage agent launch input: injected staging failure"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_launch_staging_failure_allows_small_single_line_inline_fallback() {
+        let input = "claude --version\n";
+        let mut delivered = Vec::new();
+        write_agent_start_input_to_writer_with_stager(
+            &mut delivered,
+            input,
+            "test launch",
+            |_| Err("injected staging failure".to_string()),
+        )
+        .expect("short single-line input should use the bounded fallback");
+        assert_eq!(delivered, input.as_bytes());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn agent_launch_staging_write_failure_removes_partial_file_and_fails_closed() {
+        struct PartialThenFailWriter {
+            file: fs::File,
+        }
+
+        impl Write for PartialThenFailWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let prefix_len = bytes.len().min(8);
+                self.file.write_all(&bytes[..prefix_len])?;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected partial write failure",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.file.flush()
+            }
+        }
+
+        let directory = env::temp_dir().join(format!(
+            "diffforge-stage-failure-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let input = "first command\nsecond command";
+        let mut delivered = Vec::new();
+        let result = write_agent_start_input_to_writer_with_stager(
+            &mut delivered,
+            input,
+            "test launch",
+            |input| {
+                stage_agent_launch_input_as_source_command_in_directory_with(
+                    input,
+                    &directory,
+                    |path| {
+                        let file = fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(path)?;
+                        Ok(PartialThenFailWriter { file })
+                    },
+                )
+            },
+        );
+
+        assert!(result
+            .unwrap_err()
+            .starts_with("Failed to stage agent launch input:"));
+        assert!(delivered.is_empty());
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        let _ = fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn staged_agent_launch_file_is_removed_when_pty_write_or_flush_fails() {
+        #[derive(Clone, Copy)]
+        enum FailureStage {
+            Write,
+            Flush,
+        }
+
+        struct FailingPtyWriter {
+            stage: FailureStage,
+        }
+
+        impl Write for FailingPtyWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if matches!(self.stage, FailureStage::Write) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "injected PTY write failure",
+                    ));
+                }
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                if matches!(self.stage, FailureStage::Flush) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "injected PTY flush failure",
+                    ));
+                }
+                Ok(())
+            }
+        }
+
+        for stage in [FailureStage::Write, FailureStage::Flush] {
+            let path = env::temp_dir().join(format!(
+                "difflaunch-pty-failure-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            fs::write(&path, "staged launch").unwrap();
+            let staged_path = path.clone();
+            let mut writer = FailingPtyWriter { stage };
+            let result = write_agent_start_input_to_writer_with_stager(
+                &mut writer,
+                "agent launch\n",
+                "test launch",
+                move |_| {
+                    Ok(Some(StagedAgentLaunchInput {
+                        source_command: ". staged-launch\n".to_string(),
+                        path: staged_path,
+                    }))
+                },
+            );
+            assert!(result.is_err());
+            assert!(!path.exists(), "PTY failure left staged launch input behind");
+        }
+    }
+
     #[cfg(windows)]
     #[test]
-    fn staged_windows_agent_launch_input_dot_sources_a_script() {
-        let staged = stage_agent_launch_input_as_source_command("Set-Location -LiteralPath 'C:\\work'\r& 'claude'\r")
-            .expect("staging should succeed");
-        assert!(staged.starts_with(". '"));
-        assert!(staged.ends_with("\r"));
-        let path = staged
-            .trim_start_matches(". '")
-            .trim_end_matches("'\r")
-            .replace("''", "'");
-        // The staged script self-deletes on execution, so at staging time it
-        // must exist with a BOM and CRLF line endings.
-        let bytes = std::fs::read(&path).expect("staged script exists");
+    fn staged_windows_agent_launch_input_evaluates_a_plain_text_file() {
+        let staged = stage_agent_launch_input_as_source_command(
+            "Set-Location -LiteralPath 'C:\\work'\r& 'claude'\r",
+        )
+        .expect("staging should not fail")
+        .expect("staging should produce a source command");
+        assert!(staged
+            .source_command
+            .starts_with("$__diffforgeLaunch = Get-Content -Raw -LiteralPath '"));
+        assert!(staged.source_command.ends_with("\r"));
+        let path = staged.path;
+        // Not a .ps1: execution policy must never gate the staged payload.
+        assert_eq!(path.extension().and_then(|value| value.to_str()), Some("txt"));
+        let bytes = std::fs::read(&path).expect("staged file exists");
         assert!(bytes.starts_with(b"\xEF\xBB\xBF"));
-        let text = String::from_utf8(bytes[3..].to_vec()).expect("utf-8 script body");
-        assert!(text.starts_with("Remove-Item -LiteralPath $PSCommandPath"));
+        let text = String::from_utf8(bytes[3..].to_vec()).expect("utf-8 body");
+        assert!(text.starts_with("Set-Location -LiteralPath 'C:\\work'\r\n"));
         assert!(text.contains("& 'claude'\r\n"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn windows_staged_launch_line_deletes_file_before_evaluating_it() {
+        let line = windows_staged_launch_source_line("C:\\Temp\\it's here\\difflaunch-1.txt");
+        // Single injected line, CR-terminated for PTY delivery.
+        assert!(line.ends_with('\r'));
+        assert_eq!(line.matches('\r').count(), 1);
+        // Embedded quotes use PowerShell literal doubling.
+        assert!(line.contains("'C:\\Temp\\it''s here\\difflaunch-1.txt'"));
+        // No script-file execution: content is read then Invoke-Expression'd,
+        // and the file is removed before evaluation so it never lingers.
+        assert!(!line.contains(". '"));
+        let read_at = line.find("Get-Content -Raw").expect("reads content");
+        let delete_at = line.find("Remove-Item").expect("deletes file");
+        let eval_at = line.find("Invoke-Expression").expect("evaluates content");
+        assert!(read_at < delete_at && delete_at < eval_at);
     }
 
     #[test]
@@ -21466,8 +22002,8 @@ mod terminal_tests {
     #[test]
     fn codex_model_change_rewrite_uses_plain_submit_after_clear() {
         let input = format!("/model gpt-5.1-codex high{TERMINAL_ENTER_SEQUENCE}");
-        let command = terminal_codex_model_change_command_from_input(&input)
-            .expect("valid model command");
+        let command =
+            terminal_codex_model_change_command_from_input(&input).expect("valid model command");
         assert_eq!(command, "/model gpt-5.1-codex high");
         assert_eq!(
             terminal_codex_model_change_pty_input(&command, true),
@@ -21482,8 +22018,12 @@ mod terminal_tests {
             "/model gpt-5.1-codex high"
         ));
         assert!(terminal_write_source_is_model_change(Some("model-change")));
-        assert!(terminal_write_source_is_model_change(Some("remote-model-config")));
-        assert!(!terminal_write_source_is_model_change(Some("remote-permission-config")));
+        assert!(terminal_write_source_is_model_change(Some(
+            "remote-model-config"
+        )));
+        assert!(!terminal_write_source_is_model_change(Some(
+            "remote-permission-config"
+        )));
         assert!(terminal_codex_model_change_command_from_input("/model\r").is_none());
         assert!(terminal_codex_model_change_command_from_input("/model bad model\r").is_none());
         assert!(terminal_codex_model_change_command_from_input("/model gpt-5 max\r").is_none());
@@ -21491,12 +22031,24 @@ mod terminal_tests {
 
     #[test]
     fn permission_config_write_source_suppresses_without_model_rewrite() {
-        assert!(terminal_write_source_is_permission_config(Some("remote-permission-config")));
-        assert!(terminal_write_source_is_permission_config(Some("remote_permission_config")));
-        assert!(terminal_write_source_suppresses_prompt_tracking(Some("remote-permission-config")));
-        assert!(!terminal_write_source_is_model_change(Some("remote-permission-config")));
-        assert!(terminal_permission_config_input_is_allowed("\u{15}/permissions\r"));
-        assert!(terminal_permission_config_input_is_allowed("\u{15}/status\r"));
+        assert!(terminal_write_source_is_permission_config(Some(
+            "remote-permission-config"
+        )));
+        assert!(terminal_write_source_is_permission_config(Some(
+            "remote_permission_config"
+        )));
+        assert!(terminal_write_source_suppresses_prompt_tracking(Some(
+            "remote-permission-config"
+        )));
+        assert!(!terminal_write_source_is_model_change(Some(
+            "remote-permission-config"
+        )));
+        assert!(terminal_permission_config_input_is_allowed(
+            "\u{15}/permissions\r"
+        ));
+        assert!(terminal_permission_config_input_is_allowed(
+            "\u{15}/status\r"
+        ));
         assert!(terminal_permission_config_input_is_allowed("\x1b[B\x1b[B"));
         assert!(terminal_permission_config_input_is_allowed("\x1b[Z"));
         assert!(terminal_permission_config_input_is_allowed("\t"));
@@ -21504,20 +22056,27 @@ mod terminal_tests {
         assert!(terminal_permission_config_input_is_allowed("\x1b"));
         assert!(terminal_permission_config_input_is_allowed("\r"));
         assert!(!terminal_permission_config_input_is_allowed("rm -rf"));
-        assert!(!terminal_permission_config_input_is_allowed("\u{15}rm -rf\r"));
-        assert!(!terminal_permission_config_input_is_allowed("/permissions\n"));
-        assert!(!terminal_permission_config_input_is_allowed("/permissions\r\r"));
-        assert!(!terminal_permission_config_input_is_allowed("/permissions now\r"));
-        assert!(!terminal_permission_config_input_is_allowed("/status now\r"));
+        assert!(!terminal_permission_config_input_is_allowed(
+            "\u{15}rm -rf\r"
+        ));
+        assert!(!terminal_permission_config_input_is_allowed(
+            "/permissions\n"
+        ));
+        assert!(!terminal_permission_config_input_is_allowed(
+            "/permissions\r\r"
+        ));
+        assert!(!terminal_permission_config_input_is_allowed(
+            "/permissions now\r"
+        ));
+        assert!(!terminal_permission_config_input_is_allowed(
+            "/status now\r"
+        ));
     }
 
     #[test]
     fn prompt_answer_escape_is_not_treated_as_task_interrupt() {
         assert!(terminal_write_escape_should_interrupt(
-            "\x1b",
-            true,
-            None,
-            None
+            "\x1b", true, None, None
         ));
         assert!(!terminal_write_escape_should_interrupt(
             "\x1b",
@@ -23055,6 +23614,65 @@ Press enter to confirm
     }
 
     #[test]
+    fn screen_prompt_runtime_gate_allows_startup_and_coordination_pauses() {
+        let tail = "\
+Hooks need review
+
+1. Review hooks
+2. Trust all and continue
+3. Continue without trusting
+
+Press enter to confirm
+";
+        let candidate = terminal_screen_prompt_detect("codex", tail).expect("detected prompt");
+        let mut runtime = TerminalRuntimeSnapshot::opened_starting(None, "terminal-open");
+
+        assert!(terminal_screen_prompt_runtime_allows_candidate(
+            &runtime, &candidate
+        ));
+
+        runtime.status = "active".to_string();
+        runtime.activity_status = "paused".to_string();
+        runtime.command_phase = "parked".to_string();
+        runtime.source = "terminal-parked-lifecycle".to_string();
+        runtime.event_type = "task_parked_for_resource_queue".to_string();
+        runtime.hook_event_name = "task_parked_for_resource_queue".to_string();
+        assert!(terminal_screen_prompt_runtime_allows_candidate(
+            &runtime, &candidate
+        ));
+
+        runtime.command_phase = "awaiting_input".to_string();
+        runtime.source = "cli-hook:manual-prompt".to_string();
+        runtime.event_type = "provider-user-prompt-started".to_string();
+        runtime.hook_event_name = "UserInputRequired".to_string();
+        assert!(!terminal_screen_prompt_runtime_allows_candidate(
+            &runtime, &candidate
+        ));
+
+        runtime.source = "terminal-parked-lifecycle".to_string();
+        runtime.event_type = "task_parked_for_resource_queue".to_string();
+        runtime.hook_event_name = "coordination_heartbeat".to_string();
+        assert!(
+            terminal_screen_prompt_runtime_has_hook_prompt(&runtime),
+            "rolling event_type must not reopen the detector over a live hook prompt"
+        );
+        assert!(!terminal_screen_prompt_runtime_allows_candidate(
+            &runtime, &candidate
+        ));
+
+        runtime.command_phase = "awaiting_permission".to_string();
+        assert!(!terminal_screen_prompt_runtime_allows_candidate(
+            &runtime, &candidate
+        ));
+
+        runtime.activity_status = "paused".to_string();
+        runtime.command_phase = "parked".to_string();
+        assert!(terminal_screen_prompt_runtime_allows_candidate(
+            &runtime, &candidate
+        ));
+    }
+
+    #[test]
     fn screen_prompt_detector_rejects_quoted_menu_mid_transcript() {
         let quoted_tail = "\
 Assistant:
@@ -23099,14 +23717,20 @@ Press enter to confirm
 ";
         let tail_with_footer_a = format!("Earlier transcript line\n{menu}\nCtrl+C to cancel\n");
         let tail_with_footer_b = format!("Different repaint noise\n{menu}\nEsc to interrupt\n");
-        let first = terminal_screen_prompt_detect("codex", &tail_with_footer_a)
-            .expect("first prompt");
-        let second = terminal_screen_prompt_detect("codex", &tail_with_footer_b)
-            .expect("second prompt");
-        let first_id =
-            terminal_screen_prompt_hash_id(&first.detector_id, "pane-stable", &first.fingerprint_text);
-        let second_id =
-            terminal_screen_prompt_hash_id(&second.detector_id, "pane-stable", &second.fingerprint_text);
+        let first =
+            terminal_screen_prompt_detect("codex", &tail_with_footer_a).expect("first prompt");
+        let second =
+            terminal_screen_prompt_detect("codex", &tail_with_footer_b).expect("second prompt");
+        let first_id = terminal_screen_prompt_hash_id(
+            &first.detector_id,
+            "pane-stable",
+            &first.fingerprint_text,
+        );
+        let second_id = terminal_screen_prompt_hash_id(
+            &second.detector_id,
+            "pane-stable",
+            &second.fingerprint_text,
+        );
         assert_eq!(first_id, second_id);
 
         let changed_menu = "\
@@ -23202,12 +23826,9 @@ Hooks need review
 3. Continue without trusting
 Press enter to confirm
 ";
-        let prompt_id = terminal_screen_prompt_visible_prompt_id(
-            "codex",
-            "pane-preflight",
-            visible_tail,
-        )
-        .expect("visible prompt id");
+        let prompt_id =
+            terminal_screen_prompt_visible_prompt_id("codex", "pane-preflight", visible_tail)
+                .expect("visible prompt id");
         assert!(terminal_screen_prompt_tail_matches_prompt_id(
             "codex",
             "pane-preflight",
@@ -23264,7 +23885,8 @@ Done. Ready for the next command.
             "inputReady": false,
         });
         let resolved_running =
-            terminal_activity_hook_activity_kind("ScreenPromptResolved", &running).expect("running");
+            terminal_activity_hook_activity_kind("ScreenPromptResolved", &running)
+                .expect("running");
         assert_eq!(resolved_running.0, "provider-user-prompt-answered");
         assert_eq!(resolved_running.1, "thinking");
         assert_eq!(resolved_running.3, "running");
@@ -23388,7 +24010,9 @@ Press enter to confirm
             hook_event_name: "UserInputRequired".to_string(),
             updated_at_ms: 1,
         };
-        assert!(terminal_activity_watchdog_runtime_is_paused_or_manual(&runtime));
+        assert!(terminal_activity_watchdog_runtime_is_paused_or_manual(
+            &runtime
+        ));
         assert_eq!(
             terminal_activity_watchdog_stale_hot_action(&runtime, TERMINAL_HOT_STALE_WATCHDOG_MS),
             None
@@ -23430,7 +24054,10 @@ Press enter to confirm
                     projected.execution_phase, expected_execution,
                     "{provider} {activity}"
                 );
-                assert_eq!(projected.native_rail_state, expected_rail, "{provider} {activity}");
+                assert_eq!(
+                    projected.native_rail_state, expected_rail,
+                    "{provider} {activity}"
+                );
                 assert_ne!(projected.execution_phase, "idle", "{provider} {activity}");
             }
         }
@@ -23800,7 +24427,11 @@ Press enter to confirm
         duplicate.provider_turn_id = Some("turn-1".to_string());
 
         assert!(terminal_activity_hook_idle_stop_already_settled(
-            &duplicate, &runtime, false, "pane-main", 42,
+            &duplicate,
+            &runtime,
+            false,
+            "pane-main",
+            42,
         ));
     }
 

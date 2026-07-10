@@ -20,10 +20,20 @@ import { VolumeUp } from "@styled-icons/material-rounded/VolumeUp";
 import AppSelect from "../app/AppSelect.jsx";
 import { VIDEO_ASSET_POINTER_DRAG_EVENT } from "./videoDragEvents.js";
 import {
+  addTransition,
+  clampTransitionDurationMs,
+  removeTransition,
+  setTransitionDuration,
+  VIDEO_FX_BLENDS,
+  VIDEO_FX_CURVES,
+  VIDEO_KF_EASINGS,
+  VIDEO_TEXT_ANIMS,
+  VIDEO_TRANSITION_KINDS,
   addMediaClip,
   addTextClip,
   addTrack,
   clearClipKeyframes,
+  removeClipKeyframe,
   clipEndMs,
   clipIdsFromMs,
   clipPropAtMs,
@@ -52,8 +62,7 @@ import {
   snapMs,
   splitClip,
   splitLinkedAt,
-  trimClipEnd,
-  trimClipStart,
+  trimClips,
   unlinkClip,
   updateClip,
   updateTrack,
@@ -61,12 +70,18 @@ import {
 import { GENERATION_MODELS } from "./generationCatalog.js";
 import {
   VideoDangerButton,
+  VideoHint,
   VideoIconButton,
   VideoInput,
   VideoLabel,
   VideoSecondaryButton,
   VideoTextArea,
 } from "./videoStyles.js";
+
+// Props that currently carry keyframes on this clip (lane rows render these).
+function VIDEO_KF_PROPS_WITH_FRAMES(clip) {
+  return ["opacity", "scale", "x", "y"].filter((prop) => clip?.kf?.[prop]?.length);
+}
 
 const LABEL_RAIL_WIDTH = 76;
 const RULER_HEIGHT = 20;
@@ -529,7 +544,9 @@ const TrimHandle = styled.div`
   bottom: 0;
   width: 7px;
   cursor: ew-resize;
-  z-index: 2;
+  /* Above the junction TransitionHotspot (3) so the lower half of a clip edge
+     stays trimmable at exact junctions; the marker (5) is top-half only. */
+  z-index: 4;
 
   &[data-side="start"] {
     left: 0;
@@ -619,6 +636,131 @@ const LinkBadge = styled.span`
 
   html[data-forge-theme="light"] & {
     color: #334155;
+  }
+`;
+
+// Transition marker straddling the junction between two exactly-adjacent
+// clips; the width reflects the transition duration at the current zoom.
+const TransitionMarker = styled.button`
+  appearance: none;
+  position: absolute;
+  /* Top half of the lane only — the lower half of the clip edges underneath
+     stays free for the TrimHandles at exact junctions. */
+  top: 2px;
+  height: 45%;
+  transform: translateX(-50%);
+  min-width: 10px;
+  border: 1px solid rgba(96, 165, 250, 0.65);
+  border-radius: 4px;
+  background: rgba(37, 99, 235, 0.35);
+  color: #dbeafe;
+  cursor: pointer;
+  z-index: 5;
+  padding: 0;
+  font-size: 8px;
+  font-weight: 800;
+  line-height: 1;
+
+  &[data-selected="true"] {
+    border-color: #fbbf24;
+    box-shadow: 0 0 0 1px rgba(251, 191, 36, 0.5);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(37, 99, 235, 0.55);
+    background: rgba(37, 99, 235, 0.22);
+    color: #1d4ed8;
+  }
+`;
+
+// Invisible add-transition hotspot at a bare junction; visible on hover.
+const TransitionHotspot = styled.button`
+  appearance: none;
+  position: absolute;
+  /* Top half only (see TransitionMarker) — trim-at-junction stays possible. */
+  top: 2px;
+  height: 45%;
+  width: 14px;
+  transform: translateX(-50%);
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: transparent;
+  cursor: pointer;
+  z-index: 3;
+  padding: 0;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+
+  &:hover {
+    background: rgba(96, 165, 250, 0.25);
+    color: #dbeafe;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    background: rgba(37, 99, 235, 0.15);
+    color: #1d4ed8;
+  }
+`;
+
+// --- Keyframe lane editor (inspector) ----------------------------------------
+
+const LaneRow = styled.div`
+  display: grid;
+  grid-template-columns: 52px 1fr;
+  align-items: center;
+  gap: 6px;
+`;
+
+const LaneName = styled.span`
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: rgba(148, 163, 184, 0.85);
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
+`;
+
+const LaneTrack = styled.div`
+  position: relative;
+  height: 18px;
+  border-radius: 4px;
+  background: rgba(148, 163, 184, 0.12);
+
+  html[data-forge-theme="light"] & {
+    background: rgba(15, 23, 42, 0.08);
+  }
+`;
+
+const LaneKey = styled.button`
+  appearance: none;
+  position: absolute;
+  top: 50%;
+  width: 9px;
+  height: 9px;
+  padding: 0;
+  border: none;
+  transform: translate(-50%, -50%) rotate(45deg);
+  background: #fbbf24;
+  border-radius: 2px;
+  cursor: ew-resize;
+
+  &[data-selected="true"] {
+    background: #60a5fa;
+    box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.35);
+  }
+
+  html[data-forge-theme="light"] & {
+    background: #b45309;
+  }
+
+  html[data-forge-theme="light"] &[data-selected="true"] {
+    background: #1d4ed8;
+    box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.25);
   }
 `;
 
@@ -824,12 +966,17 @@ export default function Timeline({
 }) {
   const selectedClipId = selectedClipIds.length === 1 ? selectedClipIds[0] : "";
   const selectedSet = useMemo(() => new Set(selectedClipIds), [selectedClipIds]);
+  // Declared before selectClip: selecting a clip must clear the transition
+  // selection, otherwise the transition inspector branch shadows the clip
+  // inspector forever (the popover renders the transition first).
+  const [selectedTransitionId, setSelectedTransitionId] = useState("");
   const selectClip = useCallback(
     (clipId, { additive = false } = {}) => {
       if (!clipId) {
         onSelectClips?.([]);
         return;
       }
+      setSelectedTransitionId("");
       if (additive) {
         onSelectClips?.(
           selectedClipIds.includes(clipId)
@@ -1209,10 +1356,7 @@ export default function Timeline({
             next = rippleTrim(project, drag.clipId, "start", trimDelta);
           } else {
             // Linked partners trim in lockstep so A/V stays in sync.
-            next = project;
-            for (const id of drag.groupIds) {
-              next = trimClipStart(next, id, trimDelta);
-            }
+            next = trimClips(project, drag.groupIds, "start", trimDelta);
           }
         } else if (drag.mode === "trim-end") {
           const proposedEdge = drag.originEndMs + deltaMs;
@@ -1222,10 +1366,7 @@ export default function Timeline({
           if (rippleMode) {
             next = rippleTrim(project, drag.clipId, "end", trimDelta);
           } else {
-            next = project;
-            for (const id of drag.groupIds) {
-              next = trimClipEnd(next, id, trimDelta);
-            }
+            next = trimClips(project, drag.groupIds, "end", trimDelta);
           }
         }
         drag.latest = next;
@@ -1532,6 +1673,74 @@ export default function Timeline({
   );
 
   const selectedGain = selected && selected.track.kind !== "text" ? normalizeGain(selected.clip.gain) : null;
+
+  // --- Transitions + keyframe lane editor -----------------------------------
+  // (selectedTransitionId state lives above selectClip.)
+  const [selectedLaneKey, setSelectedLaneKey] = useState(null); // { prop, atMs }
+  const laneDragRef = useRef(null);
+  const laneWidthsRef = useRef({});
+
+  const selectedLaneFrame = useMemo(() => {
+    if (!selectedLaneKey || !selected || selected.track.kind === "text") {
+      return null;
+    }
+    return (
+      (selected.clip.kf?.[selectedLaneKey.prop] || []).find(
+        (frame) => frame.atMs === selectedLaneKey.atMs,
+      ) || null
+    );
+  }, [selected, selectedLaneKey]);
+
+  const selectedTransition = useMemo(() => {
+    for (const track of project?.tracks || []) {
+      for (const transition of track.transitions || []) {
+        if (transition.id === selectedTransitionId) {
+          return { track, transition };
+        }
+      }
+    }
+    return null;
+  }, [project, selectedTransitionId]);
+
+  // Drag a lane diamond horizontally: move the keyframe's atMs (transient
+  // while dragging, committed on pointerup) by remove + re-add.
+  const beginLaneKeyDrag = useCallback(
+    (event, prop, frame, laneWidthPx, clip) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const startX = event.clientX;
+      const msPerPx = clip.durationMs / Math.max(1, laneWidthPx);
+      laneDragRef.current = { latest: null };
+      const move = (moveEvent) => {
+        const atMs = Math.max(
+          0,
+          Math.min(clip.durationMs, Math.round(frame.atMs + (moveEvent.clientX - startX) * msPerPx)),
+        );
+        const withNew = setClipKeyframe(
+          removeClipKeyframe(project, clip.id, prop, frame.atMs),
+          clip.id,
+          prop,
+          atMs,
+          frame.value,
+          frame.easing,
+        );
+        laneDragRef.current.latest = withNew;
+        setSelectedLaneKey({ prop, atMs });
+        onChange?.(withNew, { transient: true });
+      };
+      const up = () => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        if (laneDragRef.current?.latest) {
+          onChange?.(laneDragRef.current.latest, { transient: false });
+        }
+        laneDragRef.current = null;
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+    },
+    [onChange, project],
+  );
 
   const [addTrackMenuPos, setAddTrackMenuPos] = useState({ left: 0, top: 0 });
   const toggleAddTrack = useCallback(() => {
@@ -1897,6 +2106,64 @@ export default function Timeline({
                     </ClipBlock>
                   );
                 })}
+                {/* Transition markers + add-hotspots at exact junctions. */}
+                {track.kind === "video"
+                  ? (track.clips || []).slice(0, -1).map((clip, clipIndex) => {
+                      const right = track.clips[clipIndex + 1];
+                      if (clipEndMs(clip) !== right.timelineStartMs) {
+                        return null;
+                      }
+                      const junctionX = right.timelineStartMs * pxPerMs;
+                      const existing = (track.transitions || []).find(
+                        (transition) => transition.afterClipId === clip.id,
+                      );
+                      if (existing) {
+                        return (
+                          <TransitionMarker
+                            data-selected={selectedTransitionId === existing.id ? "true" : "false"}
+                            key={`transition-${existing.id}`}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setSelectedTransitionId(existing.id);
+                              setInspectorOpen(true);
+                            }}
+                            style={{
+                              left: `${junctionX}px`,
+                              width: `${Math.max(10, existing.durationMs * pxPerMs)}px`,
+                            }}
+                            title={`${existing.kind} · ${existing.durationMs}ms — click to edit`}
+                            type="button"
+                          >
+                            ⧓
+                          </TransitionMarker>
+                        );
+                      }
+                      return (
+                        <TransitionHotspot
+                          key={`junction-${clip.id}`}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            const next = addTransition(project, track.id, clip.id, "crossfade", 500);
+                            if (next !== project) {
+                              onChange?.(next, { transient: false });
+                              const added = next.tracks
+                                .find((candidate) => candidate.id === track.id)
+                                ?.transitions?.find((transition) => transition.afterClipId === clip.id);
+                              if (added) {
+                                setSelectedTransitionId(added.id);
+                                setInspectorOpen(true);
+                              }
+                            }
+                          }}
+                          style={{ left: `${junctionX}px` }}
+                          title="Add transition"
+                          type="button"
+                        >
+                          +
+                        </TransitionHotspot>
+                      );
+                    })
+                  : null}
               </TrackLane>
             </TrackRow>
           ))}
@@ -1929,7 +2196,69 @@ export default function Timeline({
         />
         ,document.body,
       ) : null}
-      {selected && inspectorOpen ? (
+      {selectedTransition && inspectorOpen ? (
+        <InspectorPopover data-video-clip-inspector="true">
+          <InspectorHeader>
+            <span>Transition</span>
+            <VideoIconButton
+              onClick={() => {
+                setSelectedTransitionId("");
+                setInspectorOpen(false);
+              }}
+              title="Close"
+              type="button"
+            >
+              <Close aria-hidden="true" />
+            </VideoIconButton>
+          </InspectorHeader>
+          <VideoLabel>
+            Type
+            <AppSelect
+              onChange={(value) => {
+                const { track, transition } = selectedTransition;
+                let next = removeTransition(project, transition.id);
+                next = addTransition(next, track.id, transition.afterClipId, value, transition.durationMs);
+                if (next !== project) {
+                  onChange?.(next, { transient: false });
+                  const added = next.tracks
+                    .find((candidate) => candidate.id === track.id)
+                    ?.transitions?.find((entry) => entry.afterClipId === transition.afterClipId);
+                  if (added) {
+                    setSelectedTransitionId(added.id);
+                  }
+                }
+              }}
+              options={VIDEO_TRANSITION_KINDS.map((kind) => ({ value: kind, label: kind }))}
+              value={selectedTransition.transition.kind}
+            />
+          </VideoLabel>
+          <SliderLabel>
+            Duration · {selectedTransition.transition.durationMs}ms
+            <input
+              max={3000}
+              min={100}
+              onChange={(event) =>
+                onChange?.(
+                  setTransitionDuration(project, selectedTransition.transition.id, Number(event.target.value)),
+                  { transient: false },
+                )
+              }
+              step={50}
+              type="range"
+              value={selectedTransition.transition.durationMs}
+            />
+          </SliderLabel>
+          <VideoDangerButton
+            onClick={() => {
+              onChange?.(removeTransition(project, selectedTransition.transition.id), { transient: false });
+              setSelectedTransitionId("");
+            }}
+            type="button"
+          >
+            Remove transition
+          </VideoDangerButton>
+        </InspectorPopover>
+      ) : selected && inspectorOpen ? (
         <InspectorPopover data-video-clip-inspector="true">
           <InspectorHeader>
             <span>{clipDisplayName(selected.clip, selected.track)}</span>
@@ -1947,6 +2276,37 @@ export default function Timeline({
                   value={selected.clip.text || ""}
                 />
               </VideoLabel>
+              <InspectorRow>
+                <VideoLabel>
+                  Animation
+                  <AppSelect
+                    onChange={(value) => updateSelectedClip({ anim: value })}
+                    options={VIDEO_TEXT_ANIMS.map((anim) => ({
+                      value: anim,
+                      label: anim === "none" ? "None" : anim,
+                    }))}
+                    value={selected.clip.anim || "none"}
+                  />
+                </VideoLabel>
+                {selected.clip.anim === "word-highlight" ? (
+                  <VideoLabel>
+                    Highlight
+                    <VideoInput
+                      onChange={(event) =>
+                        updateSelectedClip({ animOpts: { highlightColor: event.target.value } })
+                      }
+                      type="color"
+                      value={selected.clip.animOpts?.highlightColor || "#fbbf24"}
+                    />
+                  </VideoLabel>
+                ) : null}
+                {["typewriter", "word-reveal", "word-highlight"].includes(selected.clip.anim) &&
+                !selected.clip.words?.length ? (
+                  <VideoHint style={{ alignSelf: "end" }}>
+                    Needs word timings — generate captions from a transcript to get them.
+                  </VideoHint>
+                ) : null}
+              </InspectorRow>
               <InspectorRow>
                 <VideoLabel>
                   Size
@@ -2202,66 +2562,311 @@ export default function Timeline({
                   Clear keyframes
                 </VideoDangerButton>
               ) : null}
-              <InspectorRow>
-                <SliderLabel>
-                  Opacity · {Math.round((selected.clip.transform?.opacity ?? 1) * 100)}%
-                  <input
-                    max={1}
-                    min={0}
-                    onChange={(event) => updateSelectedClip({ transform: { opacity: Number(event.target.value) } })}
-                    step={0.01}
-                    type="range"
-                    value={selected.clip.transform?.opacity ?? 1}
-                  />
-                </SliderLabel>
-                <SliderLabel>
-                  Scale · {Math.round((selected.clip.transform?.scale ?? 1) * 100)}%
-                  <input
-                    max={3}
-                    min={0.1}
-                    onChange={(event) => updateSelectedClip({ transform: { scale: Number(event.target.value) } })}
-                    step={0.01}
-                    type="range"
-                    value={selected.clip.transform?.scale ?? 1}
-                  />
-                </SliderLabel>
-              </InspectorRow>
-              <VideoLabel as="div">Keyframes at playhead</VideoLabel>
-              <InspectorRow>
-                {["opacity", "scale", "x", "y"].map((prop) => {
-                  const hasFrames = Boolean(selected.clip.kf?.[prop]?.length);
-                  return (
+              {/* Visual-only controls: audio clips keep gain/speed;
+                  transform, keyframe lanes, effects, and crop are video-track only. */}
+              {selected.track.kind === "video" ? (
+                <>
+                  <InspectorRow>
+                    <SliderLabel>
+                      Opacity · {Math.round((selected.clip.transform?.opacity ?? 1) * 100)}%
+                      <input
+                        max={1}
+                        min={0}
+                        onChange={(event) => updateSelectedClip({ transform: { opacity: Number(event.target.value) } })}
+                        step={0.01}
+                        type="range"
+                        value={selected.clip.transform?.opacity ?? 1}
+                      />
+                    </SliderLabel>
+                    <SliderLabel>
+                      Scale · {Math.round((selected.clip.transform?.scale ?? 1) * 100)}%
+                      <input
+                        max={3}
+                        min={0.1}
+                        onChange={(event) => updateSelectedClip({ transform: { scale: Number(event.target.value) } })}
+                        step={0.01}
+                        type="range"
+                        value={selected.clip.transform?.scale ?? 1}
+                      />
+                    </SliderLabel>
+                  </InspectorRow>
+                  <VideoLabel as="div">Keyframes at playhead</VideoLabel>
+                  <InspectorRow>
+                    {["opacity", "scale", "x", "y"].map((prop) => {
+                      const hasFrames = Boolean(selected.clip.kf?.[prop]?.length);
+                      return (
+                        <VideoSecondaryButton
+                          key={prop}
+                          onClick={(event) => {
+                            if (event.altKey && hasFrames) {
+                              onChange?.(clearClipKeyframes(project, selected.clip.id, prop), { transient: false });
+                              return;
+                            }
+                            const value =
+                              prop === "opacity"
+                                ? selected.clip.transform?.opacity ?? 1
+                                : prop === "scale"
+                                  ? selected.clip.transform?.scale ?? 1
+                                  : selected.clip.transform?.[prop] ?? 0;
+                            const clipRelMs = Math.min(
+                              Math.max(0, getPlayheadMs() - selected.clip.timelineStartMs),
+                              selected.clip.durationMs,
+                            );
+                            onChange?.(
+                              setClipKeyframe(project, selected.clip.id, prop, clipRelMs, clipPropAtMs(selected.clip, prop, clipRelMs) ?? value),
+                              { transient: false },
+                            );
+                          }}
+                          style={hasFrames ? { borderColor: "rgba(251,191,36,0.5)", color: "#fbbf24" } : undefined}
+                          title={`Add ${prop} keyframe at playhead${hasFrames ? " · ⌥-click clears all" : ""}`}
+                          type="button"
+                        >
+                          ◆ {prop}
+                        </VideoSecondaryButton>
+                      );
+                    })}
+                  </InspectorRow>
+                  {/* Keyframe lanes: one row per animated prop; drag diamonds in
+                      time, click to pick easing/value, ⌫ via the row button. */}
+                  {VIDEO_KF_PROPS_WITH_FRAMES(selected.clip).map((prop) => (
+                    <LaneRow key={`lane-${prop}`}>
+                      <LaneName>{prop}</LaneName>
+                      <LaneTrack
+                        ref={(node) => {
+                          if (node) {
+                            laneWidthsRef.current[prop] = node.clientWidth;
+                          }
+                        }}
+                      >
+                        {(selected.clip.kf?.[prop] || []).map((frame) => (
+                          <LaneKey
+                            data-selected={
+                              selectedLaneKey?.prop === prop && selectedLaneKey?.atMs === frame.atMs
+                                ? "true"
+                                : "false"
+                            }
+                            key={`${prop}-${frame.atMs}`}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setSelectedLaneKey({ prop, atMs: frame.atMs });
+                            }}
+                            onPointerDown={(event) =>
+                              beginLaneKeyDrag(
+                                event,
+                                prop,
+                                frame,
+                                laneWidthsRef.current[prop] || 200,
+                                selected.clip,
+                              )
+                            }
+                            style={{ left: `${(frame.atMs / Math.max(1, selected.clip.durationMs)) * 100}%` }}
+                            title={`${prop} @ ${frame.atMs}ms = ${frame.value} (${frame.easing})`}
+                            type="button"
+                          />
+                        ))}
+                      </LaneTrack>
+                    </LaneRow>
+                  ))}
+                  {selectedLaneFrame ? (
+                    <InspectorRow>
+                      <VideoLabel>
+                        Easing
+                        <AppSelect
+                          onChange={(value) => {
+                            onChange?.(
+                              setClipKeyframe(
+                                project,
+                                selected.clip.id,
+                                selectedLaneKey.prop,
+                                selectedLaneFrame.atMs,
+                                selectedLaneFrame.value,
+                                value,
+                              ),
+                              { transient: false },
+                            );
+                          }}
+                          options={VIDEO_KF_EASINGS.map((easing) => ({ value: easing, label: easing }))}
+                          value={selectedLaneFrame.easing}
+                        />
+                      </VideoLabel>
+                      <VideoLabel>
+                        Value
+                        <VideoInput
+                          onChange={(event) =>
+                            onChange?.(
+                              setClipKeyframe(
+                                project,
+                                selected.clip.id,
+                                selectedLaneKey.prop,
+                                selectedLaneFrame.atMs,
+                                Number(event.target.value),
+                                selectedLaneFrame.easing,
+                              ),
+                              { transient: false },
+                            )
+                          }
+                          step={0.01}
+                          type="number"
+                          value={selectedLaneFrame.value}
+                        />
+                      </VideoLabel>
+                      <VideoIconButton
+                        onClick={() => {
+                          onChange?.(
+                            removeClipKeyframe(project, selected.clip.id, selectedLaneKey.prop, selectedLaneFrame.atMs),
+                            { transient: false },
+                          );
+                          setSelectedLaneKey(null);
+                        }}
+                        style={{ alignSelf: "end" }}
+                        title="Delete keyframe"
+                        type="button"
+                      >
+                        <Close aria-hidden="true" />
+                      </VideoIconButton>
+                    </InspectorRow>
+                  ) : null}
+                  <VideoLabel as="div">Effects</VideoLabel>
+                  <InspectorRow>
+                    {[
+                      ["exposure", -2, 2, 0.05],
+                      ["contrast", 0.5, 2, 0.01],
+                      ["saturation", 0, 3, 0.01],
+                    ].map(([fxProp, min, max, step]) => (
+                      <SliderLabel key={fxProp}>
+                        {fxProp} · {(selected.clip.fx?.[fxProp] ?? (fxProp === "exposure" ? 0 : 1)).toFixed(2)}
+                        <input
+                          max={max}
+                          min={min}
+                          onChange={(event) => updateSelectedClip({ fx: { [fxProp]: Number(event.target.value) } })}
+                          step={step}
+                          type="range"
+                          value={selected.clip.fx?.[fxProp] ?? (fxProp === "exposure" ? 0 : 1)}
+                        />
+                      </SliderLabel>
+                    ))}
+                  </InspectorRow>
+                  <InspectorRow>
+                    {[
+                      ["temperature", -100, 100, 1, 0],
+                      ["blur", 0, 50, 0.5, 0],
+                      ["vignette", 0, 1, 0.02, 0],
+                      ["grain", 0, 1, 0.02, 0],
+                    ].map(([fxProp, min, max, step, fallback]) => (
+                      <SliderLabel key={fxProp}>
+                        {fxProp} · {Number(selected.clip.fx?.[fxProp] ?? fallback).toFixed(fxProp === "temperature" ? 0 : 2)}
+                        <input
+                          max={max}
+                          min={min}
+                          onChange={(event) => updateSelectedClip({ fx: { [fxProp]: Number(event.target.value) } })}
+                          step={step}
+                          type="range"
+                          value={selected.clip.fx?.[fxProp] ?? fallback}
+                        />
+                      </SliderLabel>
+                    ))}
+                  </InspectorRow>
+                  <InspectorRow>
+                    <VideoLabel>
+                      Curves
+                      <AppSelect
+                        onChange={(value) => updateSelectedClip({ fx: { curves: value } })}
+                        options={VIDEO_FX_CURVES.map((curve) => ({ value: curve, label: curve }))}
+                        value={selected.clip.fx?.curves || "none"}
+                      />
+                    </VideoLabel>
+                    <VideoLabel>
+                      Blend
+                      <AppSelect
+                        onChange={(value) => updateSelectedClip({ fx: { blend: value } })}
+                        options={VIDEO_FX_BLENDS.map((blend) => ({ value: blend, label: blend }))}
+                        value={selected.clip.fx?.blend || "normal"}
+                      />
+                    </VideoLabel>
+                    <VideoLabel>
+                      LUT (.cube in media/luts)
+                      <VideoInput
+                        onChange={(event) => updateSelectedClip({ fx: { lut: event.target.value } })}
+                        placeholder="media/luts/film.cube"
+                        value={selected.clip.fx?.lut || ""}
+                      />
+                    </VideoLabel>
+                  </InspectorRow>
+                  <InspectorRow>
                     <VideoSecondaryButton
-                      key={prop}
-                      onClick={(event) => {
-                        if (event.altKey && hasFrames) {
-                          onChange?.(clearClipKeyframes(project, selected.clip.id, prop), { transient: false });
-                          return;
-                        }
-                        const value =
-                          prop === "opacity"
-                            ? selected.clip.transform?.opacity ?? 1
-                            : prop === "scale"
-                              ? selected.clip.transform?.scale ?? 1
-                              : selected.clip.transform?.[prop] ?? 0;
-                        const clipRelMs = Math.min(
-                          Math.max(0, getPlayheadMs() - selected.clip.timelineStartMs),
-                          selected.clip.durationMs,
-                        );
-                        onChange?.(
-                          setClipKeyframe(project, selected.clip.id, prop, clipRelMs, clipPropAtMs(selected.clip, prop, clipRelMs) ?? value),
-                          { transient: false },
-                        );
-                      }}
-                      style={hasFrames ? { borderColor: "rgba(251,191,36,0.5)", color: "#fbbf24" } : undefined}
-                      title={`Add ${prop} keyframe at playhead${hasFrames ? " · ⌥-click clears all" : ""}`}
+                      data-active={selected.clip.fx?.chromaKey ? "true" : "false"}
+                      onClick={() =>
+                        updateSelectedClip({
+                          fx: {
+                            chromaKey: selected.clip.fx?.chromaKey
+                              ? null
+                              : { color: "#00ff00", similarity: 0.2, blend: 0.1 },
+                          },
+                        })
+                      }
+                      style={
+                        selected.clip.fx?.chromaKey
+                          ? { borderColor: "rgba(16,185,129,0.5)", color: "#a7f3d0" }
+                          : undefined
+                      }
                       type="button"
                     >
-                      ◆ {prop}
+                      Chroma key
                     </VideoSecondaryButton>
-                  );
-                })}
-              </InspectorRow>
+                    {selected.clip.fx?.chromaKey ? (
+                      <>
+                        <VideoLabel>
+                          Key color
+                          <VideoInput
+                            onChange={(event) =>
+                              updateSelectedClip({ fx: { chromaKey: { ...selected.clip.fx.chromaKey, color: event.target.value } } })
+                            }
+                            type="color"
+                            value={selected.clip.fx.chromaKey.color}
+                          />
+                        </VideoLabel>
+                        <SliderLabel>
+                          Similarity · {selected.clip.fx.chromaKey.similarity.toFixed(2)}
+                          <input
+                            max={1}
+                            min={0.01}
+                            onChange={(event) =>
+                              updateSelectedClip({
+                                fx: { chromaKey: { ...selected.clip.fx.chromaKey, similarity: Number(event.target.value) } },
+                              })
+                            }
+                            step={0.01}
+                            type="range"
+                            value={selected.clip.fx.chromaKey.similarity}
+                          />
+                        </SliderLabel>
+                      </>
+                    ) : null}
+                    {selected.clip.fx ? (
+                      <VideoDangerButton onClick={() => updateSelectedClip({ fx: null })} type="button">
+                        Reset FX
+                      </VideoDangerButton>
+                    ) : null}
+                  </InspectorRow>
+                  <VideoLabel as="div">Crop</VideoLabel>
+                  <InspectorRow>
+                    {["l", "t", "r", "b"].map((side) => (
+                      <SliderLabel key={`crop-${side}`}>
+                        {{ l: "Left", t: "Top", r: "Right", b: "Bottom" }[side]} ·{" "}
+                        {Math.round((selected.clip.crop?.[side] ?? 0) * 100)}%
+                        <input
+                          max={0.45}
+                          min={0}
+                          onChange={(event) => updateSelectedClip({ crop: { [side]: Number(event.target.value) } })}
+                          step={0.01}
+                          type="range"
+                          value={selected.clip.crop?.[side] ?? 0}
+                        />
+                      </SliderLabel>
+                    ))}
+                  </InspectorRow>
+                </>
+              ) : null}
             </>
           )}
         </InspectorPopover>

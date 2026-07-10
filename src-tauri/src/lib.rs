@@ -38,8 +38,10 @@ use tokio::{
     time::{sleep, timeout},
 };
 use tokio_tungstenite::{
-    accept_async, connect_async,
-    tungstenite::{client::IntoClientRequest, http::HeaderValue, Message},
+    accept_async, connect_async, connect_async_with_config,
+    tungstenite::{
+        client::IntoClientRequest, http::HeaderValue, protocol::WebSocketConfig, Message,
+    },
 };
 
 pub mod coordination;
@@ -102,7 +104,7 @@ const MAX_FORGE_PROMPT_LENGTH: usize = 12_000;
 // itself be a slash path (e.g. `fireworks-ai/accounts/fireworks/routers/...`).
 const MAX_FORGE_MODEL_LENGTH: usize = 128;
 const MAX_FORGE_IMAGES: usize = 5;
-const MAX_FORGE_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+const MAX_FORGE_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_FORGE_IMAGE_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 const MAX_HTML_DOCUMENT_OPEN_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TODO_TEXT_ATTACHMENT_BYTES: usize = 256 * 1024;
@@ -2721,6 +2723,7 @@ include!("workspace_threads_store.rs");
 include!("architectures.rs");
 include!("pcb.rs");
 include!("video_editor.rs");
+include!("video_tier1.rs");
 include!("video_code.rs");
 include!("video_polish.rs");
 include!("video_annotate.rs");
@@ -9981,6 +9984,11 @@ fn run_app(daemon: bool) {
             video_agent_state_set,
             video_export_start,
             video_export_cancel,
+            video_export_encoders,
+            video_detect_silences,
+            video_draft_render,
+            video_export_fcpxml,
+            video_export_premiere_xml,
             video_render_frame,
             video_transcribe_start,
             video_transcribe_cancel,

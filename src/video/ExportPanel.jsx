@@ -30,6 +30,18 @@ function readStoredExportDir() {
   }
 }
 
+// Hardware H.264 encoding (VideoToolbox / NVENC / QSV / VAAPI) for mp4
+// exports; default ON — the backend retries with libx264 automatically.
+const HW_ENCODE_STORAGE_KEY = "diffforge.video.hwEncode";
+
+function readStoredHwEncode() {
+  try {
+    return window.localStorage.getItem(HW_ENCODE_STORAGE_KEY) !== "0";
+  } catch {
+    return true;
+  }
+}
+
 const SIZE_PRESETS = [
   { id: "project", label: "Project" },
   { id: "1080p", label: "1080p", width: 1920, height: 1080 },
@@ -112,10 +124,66 @@ const InlineRow = styled.div`
   flex-wrap: wrap;
 `;
 
+const ToggleRow = styled.label`
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  font-weight: 700;
+  color: rgba(203, 213, 225, 0.88);
+  cursor: pointer;
+  user-select: none;
+
+  html[data-forge-theme="light"] & {
+    color: #334155;
+  }
+`;
+
+const ToggleInput = styled.input`
+  width: 12px;
+  height: 12px;
+  margin: 0;
+  flex: none;
+  accent-color: #10b981;
+  cursor: pointer;
+
+  &:disabled {
+    cursor: not-allowed;
+  }
+
+  html[data-forge-theme="light"] & {
+    accent-color: #047857;
+  }
+`;
+
+const WarningText = styled.div`
+  font-size: 10.5px;
+  font-weight: 650;
+  color: #fcd34d;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+
+  html[data-forge-theme="light"] & {
+    color: #b45309;
+  }
+`;
+
+// Interchange exporters can drop many features — keep long warning lists
+// contained and scrollable instead of stretching the panel.
+const WarningsList = styled.div`
+  display: grid;
+  gap: 3px;
+  max-height: 96px;
+  overflow-y: auto;
+`;
+
 // Render the timeline through ffmpeg into media/exports with live progress.
 export default function ExportPanel({
   ffmpegReady = false,
   ffmpegTextSupport = null,
+  // Flushes the pane's debounced project autosave. Exports read the saved
+  // file, so this must run before any export command.
+  onFlushProjectSave = null,
   project,
   projectPath = "",
   repoPath = "",
@@ -134,6 +202,44 @@ export default function ExportPanel({
   const ownJobIdRef = useRef("");
   const [agentJob, setAgentJob] = useState(null); // exports started by agents (MCP)
   const [outputDir, setOutputDir] = useState(readStoredExportDir);
+  const [hwEncode, setHwEncode] = useState(readStoredHwEncode);
+  const [interchangeBusy, setInterchangeBusy] = useState(""); // "fcpxml" | "premiere" | ""
+  const [interchangeResult, setInterchangeResult] = useState(null); // { path, warnings }
+  const [interchangeError, setInterchangeError] = useState("");
+  // Hardware-encoder probe: null = unknown (old backend without the command,
+  // or probe still in flight) — keep the historical optimistic behavior then.
+  const [hwProbe, setHwProbe] = useState(null); // { hardwareAvailable, encoder } | null
+
+  useEffect(() => {
+    let disposed = false;
+    invoke("video_export_encoders")
+      .then((result) => {
+        if (disposed || !result || typeof result !== "object") {
+          return;
+        }
+        const hardwareAvailable = result.hardwareAvailable ?? result.hardware_available;
+        if (typeof hardwareAvailable === "boolean") {
+          setHwProbe({ hardwareAvailable, encoder: String(result.encoder || "") });
+        }
+      })
+      .catch(() => {
+        // Command not landed yet — hardware availability stays unknown.
+      });
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  const hwUnavailable = hwProbe?.hardwareAvailable === false;
+
+  const applyHwEncode = useCallback((next) => {
+    setHwEncode(next);
+    try {
+      window.localStorage.setItem(HW_ENCODE_STORAGE_KEY, next ? "1" : "0");
+    } catch {
+      /* best-effort */
+    }
+  }, []);
 
   const applyOutputDir = useCallback((dir) => {
     setOutputDir(dir);
@@ -238,6 +344,9 @@ export default function ExportPanel({
       return;
     }
     try {
+      // The export renders the SAVED project file — flush the pane's
+      // debounced autosave so edits from the last second are included.
+      await onFlushProjectSave?.();
       const result = await invoke("video_export_start", {
         repoPath,
         projectPath,
@@ -250,6 +359,9 @@ export default function ExportPanel({
           crf: Number(crf) || 20,
           preset: speedPreset,
           outputDir: outputDir || null,
+          // mp4-only: the backend probes for a hw encoder and falls back to
+          // libx264 automatically; webm always stays libvpx-vp9.
+          hardwareEncode: format === "mp4" ? hwEncode && !hwUnavailable : null,
         },
       });
       ownJobIdRef.current = String(result?.jobId || "");
@@ -257,13 +369,63 @@ export default function ExportPanel({
     } catch (err) {
       setError(String(err));
     }
-  }, [crf, durationMs, fileName, format, fps, height, outputDir, projectPath, repoPath, speedPreset, width]);
+  }, [crf, durationMs, fileName, format, fps, height, hwEncode, hwUnavailable, onFlushProjectSave, outputDir, projectPath, repoPath, speedPreset, width]);
 
   const cancelExport = useCallback(() => {
     if (job?.jobId && !job.done) {
       invoke("video_export_cancel", { jobId: job.jobId }).catch(() => {});
     }
   }, [job]);
+
+  // Warnings surfaced by the export job (e.g. hardware-encoder fallback).
+  // Defensive: the backend may report either a warnings array or a bare
+  // hwFallback flag — normalize both into one list of strings.
+  const jobWarnings = useMemo(() => {
+    const list = Array.isArray(job?.warnings) ? job.warnings.filter(Boolean).map(String) : [];
+    if (job?.hwFallback && list.length === 0) {
+      list.push("Hardware encoder failed — fell back to software encoding.");
+    }
+    return list;
+  }, [job]);
+
+  const runInterchange = useCallback(
+    async (kind) => {
+      setInterchangeError("");
+      setInterchangeResult(null);
+      if (!projectPath) {
+        setInterchangeError("Open a project first.");
+        return;
+      }
+      const baseName = String(project?.name || "project").replace(/[\\/:]+/g, "-").trim() || "project";
+      const outName = kind === "fcpxml" ? `${baseName}-fcpxml.fcpxml` : `${baseName}-premiere.xml`;
+      // Same convention as video exports: the chosen custom folder when set,
+      // otherwise the workspace's media/exports/ (repo-relative).
+      const outDir = outputDir ? outputDir.replace(/[\\/]+$/, "") : "media/exports";
+      const command = kind === "fcpxml" ? "video_export_fcpxml" : "video_export_premiere_xml";
+      setInterchangeBusy(kind);
+      try {
+        // Interchange exporters read the saved project file too — flush the
+        // pane's debounced autosave first.
+        await onFlushProjectSave?.();
+        const result = await invoke(command, {
+          repoPath,
+          projectRelPath: projectPath,
+          outPath: `${outDir}/${outName}`,
+        });
+        setInterchangeResult({
+          path: String(result?.path || `${outDir}/${outName}`),
+          warnings: Array.isArray(result?.warnings) ? result.warnings.filter(Boolean).map(String) : [],
+        });
+      } catch (err) {
+        // Also covers the command not existing yet (backend not landed) —
+        // Tauri rejects with a plain string we can show as-is.
+        setInterchangeError(String(err));
+      } finally {
+        setInterchangeBusy("");
+      }
+    },
+    [onFlushProjectSave, outputDir, project?.name, projectPath, repoPath],
+  );
 
   const exporting = Boolean(job && !job.done);
 
@@ -362,6 +524,26 @@ export default function ExportPanel({
           />
         </VideoLabel>
       </FieldRow>
+      {format === "mp4" ? (
+        <>
+          <ToggleRow style={hwUnavailable ? { cursor: "not-allowed", opacity: 0.65 } : undefined}>
+            <ToggleInput
+              checked={hwEncode && !hwUnavailable}
+              disabled={hwUnavailable}
+              onChange={(event) => applyHwEncode(event.target.checked)}
+              type="checkbox"
+            />
+            Hardware encoding
+          </ToggleRow>
+          <VideoHint>
+            {hwUnavailable
+              ? "No hardware encoder detected — software x264 will be used"
+              : hwProbe?.hardwareAvailable && hwProbe.encoder
+                ? `Hardware encoder: ${hwProbe.encoder} — falls back to software automatically if it fails.`
+                : "Falls back to software automatically if the encoder fails."}
+          </VideoHint>
+        </>
+      ) : null}
       <VideoLabel>
         File name (optional)
         <VideoInput
@@ -440,6 +622,53 @@ export default function ExportPanel({
           </DoneRow>
         )
       ) : null}
+      {job && jobWarnings.length ? (
+        <WarningsList>
+          {jobWarnings.map((warning, index) => (
+            <WarningText key={index}>⚠ {warning}</WarningText>
+          ))}
+        </WarningsList>
+      ) : null}
+      <VideoLabel as="div">
+        Interchange
+        <InlineRow>
+          <VideoSecondaryButton
+            disabled={!projectPath || Boolean(interchangeBusy)}
+            onClick={() => runInterchange("fcpxml")}
+            type="button"
+          >
+            {interchangeBusy === "fcpxml" ? "Writing…" : "Final Cut Pro XML"}
+          </VideoSecondaryButton>
+          <VideoSecondaryButton
+            disabled={!projectPath || Boolean(interchangeBusy)}
+            onClick={() => runInterchange("premiere")}
+            type="button"
+          >
+            {interchangeBusy === "premiere" ? "Writing…" : "Premiere XML"}
+          </VideoSecondaryButton>
+        </InlineRow>
+        {interchangeError ? (
+          <VideoErrorText style={{ textTransform: "none", letterSpacing: "normal" }}>
+            {interchangeError}
+          </VideoErrorText>
+        ) : null}
+        {interchangeResult ? (
+          <>
+            <DoneRow style={{ textTransform: "none", letterSpacing: "normal" }}>
+              ✓ Written to <code>{interchangeResult.path}</code>
+            </DoneRow>
+            {interchangeResult.warnings.length ? (
+              <WarningsList>
+                {interchangeResult.warnings.map((warning, index) => (
+                  <WarningText key={index} style={{ textTransform: "none", letterSpacing: "normal" }}>
+                    ⚠ {warning}
+                  </WarningText>
+                ))}
+              </WarningsList>
+            ) : null}
+          </>
+        ) : null}
+      </VideoLabel>
     </PanelRoot>
   );
 }

@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Pause } from "@styled-icons/material-rounded/Pause";
 import { PhotoCamera } from "@styled-icons/material-rounded/PhotoCamera";
 import { PlayArrow } from "@styled-icons/material-rounded/PlayArrow";
@@ -13,7 +14,8 @@ import {
   preparePropEvaluator,
   projectDurationMs,
 } from "./videoEditorModel.js";
-import { VideoIconButton } from "./videoStyles.js";
+import { VIDEO_EXPORT_PROGRESS_EVENT } from "./videoPanelBridge.js";
+import { VideoErrorText, VideoHint, VideoIconButton, VideoPaneButton, VideoSecondaryButton } from "./videoStyles.js";
 import { getRenderabilitySnapshot, subscribeToRenderability } from "../app/renderability.js";
 
 const PRELOAD_AHEAD_MS = 3000;
@@ -120,6 +122,146 @@ const TransportScrub = styled.input`
   accent-color: #10b981;
 `;
 
+// --- Stage overlays (Tier 1 preview additions) -------------------------------
+// Everything below sits ON the black letterbox stage, which is deliberately
+// theme-independent (dark in both themes), so none of these carry
+// `html[data-forge-theme="light"]` blocks — matching the stage convention.
+
+// Vignette approximation (contract §1): sits above the media element inside
+// the transform wrapper so it moves/scales with the clip.
+const PreviewVignette = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+`;
+
+// Full-frame solid used by dip-black / dip-white transitions; opacity driven
+// per-frame from the current time (seek-safe, no CSS animations).
+const PreviewDipOverlay = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  opacity: 0;
+`;
+
+// "FX approximate" hint chip on the stage corner (once, not per clip).
+const StageFxBadge = styled.div`
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 4;
+  font-size: 10px;
+  font-weight: 700;
+  color: #e2e8f0;
+  background: rgba(15, 23, 42, 0.78);
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 999px;
+  padding: 3px 9px;
+  pointer-events: none;
+  white-space: nowrap;
+`;
+
+// Draft render result panel over the stage (§6).
+const DraftOverlay = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  background: rgba(2, 3, 4, 0.94);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+
+  video {
+    flex: 1 1 auto;
+    min-height: 0;
+    width: 100%;
+    object-fit: contain;
+    background: #000000;
+    border-radius: 6px;
+  }
+`;
+
+const DraftOverlayBar = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+`;
+
+const DraftLabelChip = styled.span`
+  font-size: 10px;
+  font-weight: 750;
+  color: #a7f3d0;
+  background: rgba(16, 185, 129, 0.16);
+  border: 1px solid rgba(16, 185, 129, 0.35);
+  border-radius: 999px;
+  padding: 3px 9px;
+  white-space: nowrap;
+`;
+
+const DraftCloseButton = styled.button`
+  margin-left: auto;
+  appearance: none;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  background: rgba(15, 23, 42, 0.72);
+  color: #e2e8f0;
+  font-size: 11px;
+  font-weight: 700;
+  border-radius: 6px;
+  padding: 3px 10px;
+  cursor: pointer;
+
+  &:hover {
+    background: rgba(30, 41, 59, 0.92);
+  }
+`;
+
+// Transform/crop handles for the selected media clip. Positioned in stage
+// pixels (the frame is already screen-sized), so handle chrome stays
+// constant-size regardless of previewScale/zoom.
+const TransformHandlesBox = styled.div`
+  position: absolute;
+  z-index: 3;
+  border: 1px solid rgba(96, 165, 250, 0.9);
+  box-shadow: 0 0 0 1px rgba(2, 6, 23, 0.55);
+  cursor: move;
+  touch-action: none;
+`;
+
+const TransformHandleDot = styled.div`
+  position: absolute;
+  width: 11px;
+  height: 11px;
+  border-radius: 3px;
+  background: #0f172a;
+  border: 1.5px solid #60a5fa;
+  transform: translate(-50%, -50%);
+  touch-action: none;
+`;
+
+const CropToggleChip = styled.button`
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  appearance: none;
+  font-size: 10px;
+  font-weight: 750;
+  color: #bfdbfe;
+  background: rgba(15, 23, 42, 0.85);
+  border: 1px solid rgba(96, 165, 250, 0.5);
+  border-radius: 999px;
+  padding: 2px 9px;
+  cursor: pointer;
+
+  &[data-active="true"] {
+    color: #0f172a;
+    background: #60a5fa;
+  }
+`;
+
 function isImageAsset(assetPath) {
   return /\.(png|jpe?g|webp|gif|bmp|tiff)$/i.test(assetPath || "");
 }
@@ -194,6 +336,183 @@ function volumeLevel(value) {
   return Math.min(1, Math.max(0, Number(value) || 0));
 }
 
+function clamp01(value) {
+  return Math.min(1, Math.max(0, value));
+}
+
+const TEXT_ENTRANCE_MS = 250;
+const WORD_REVEAL_RAMP_MS = 150;
+const DEFAULT_HIGHLIGHT_COLOR = "#fbbf24";
+
+// CSS approximation of clip.fx (contract §1). previewScale scales blur so it
+// tracks the rendered stage size (renderedStageWidth / project width).
+// Temperature is a documented, subtle approximation: warm → sepia tint,
+// cool → slight hue rotation. grain/curves/lut/chromaKey are NOT previewed.
+function fxFilterString(fx, previewScale) {
+  if (!fx) {
+    return "";
+  }
+  const parts = [];
+  if (fx.exposure) {
+    parts.push(`brightness(${(1 + fx.exposure * 0.35).toFixed(4)})`);
+  }
+  if (fx.contrast !== 1) {
+    parts.push(`contrast(${fx.contrast})`);
+  }
+  if (fx.saturation !== 1) {
+    parts.push(`saturate(${fx.saturation})`);
+  }
+  if (fx.blur > 0) {
+    parts.push(`blur(${(fx.blur * Math.max(0, previewScale)).toFixed(2)}px)`);
+  }
+  if (fx.temperature > 0) {
+    parts.push(`sepia(${(fx.temperature / 300).toFixed(4)})`);
+  } else if (fx.temperature < 0) {
+    parts.push(`hue-rotate(${(fx.temperature * 0.12).toFixed(2)}deg)`);
+  }
+  return parts.join(" ");
+}
+
+// CSS has no "addition" blend mode; plus-lighter is the closest match.
+function cssBlendMode(blend) {
+  if (!blend || blend === "normal") {
+    return "";
+  }
+  return blend === "addition" ? "plus-lighter" : blend;
+}
+
+function fxHasNonPreviewable(fx) {
+  return Boolean(fx && ((fx.curves && fx.curves !== "none") || fx.lut || fx.chromaKey || fx.grain > 0));
+}
+
+// Static crop preview (contract §3): inset percentages from crop fractions.
+function cropClipPath(crop) {
+  if (!crop) {
+    return "";
+  }
+  const pct = (value) => `${((value || 0) * 100).toFixed(3)}%`;
+  return `inset(${pct(crop.t)} ${pct(crop.r)} ${pct(crop.b)} ${pct(crop.l)})`;
+}
+
+// Honest single-layer transition approximation (contract §2). The preview
+// renders one visual clip at a time, so per-clip opacity multipliers are
+// composed on top of the clip's own keyframed opacity: the outgoing clip
+// ramps out during [boundary - d, boundary]; the incoming clip's ramp-in
+// resolves to 1 by the time it becomes the visible clip. Dips hand the
+// midpoint to the full-stage overlay below.
+function transitionOpacityMultiplier(track, clip, timelineMs) {
+  const transitions = track?.transitions;
+  if (!Array.isArray(transitions) || !transitions.length || !clip) {
+    return 1;
+  }
+  let mult = 1;
+  for (const transition of transitions) {
+    const durationMs = Number(transition?.durationMs) || 0;
+    if (durationMs <= 0) {
+      continue;
+    }
+    const afterClip = (track.clips || []).find((entry) => entry.id === transition.afterClipId);
+    if (!afterClip) {
+      continue;
+    }
+    const boundaryMs = clipEndMs(afterClip);
+    const windowStartMs = boundaryMs - durationMs;
+    if (timelineMs < windowStartMs || timelineMs > boundaryMs) {
+      continue;
+    }
+    const progress = clamp01((timelineMs - windowStartMs) / durationMs);
+    const isDip = transition.kind === "dip-black" || transition.kind === "dip-white";
+    if (clip.id === transition.afterClipId) {
+      // Outgoing clip: linear 1→0; dips finish the fade in the first half.
+      mult *= isDip ? clamp01(1 - progress * 2) : 1 - progress;
+    } else if (Math.abs(clip.timelineStartMs - boundaryMs) < 1) {
+      // Incoming clip: linear 0→1; dips ramp in over the second half.
+      mult *= isDip ? clamp01((progress - 0.5) * 2) : progress;
+    }
+  }
+  return mult;
+}
+
+// Full-stage dip overlay state at a time, across all tracks (first hit wins).
+function dipOverlayAt(project, timelineMs) {
+  for (const track of project?.tracks || []) {
+    if (track.muted) {
+      continue;
+    }
+    for (const transition of track.transitions || []) {
+      if (transition.kind !== "dip-black" && transition.kind !== "dip-white") {
+        continue;
+      }
+      const durationMs = Number(transition?.durationMs) || 0;
+      if (durationMs <= 0) {
+        continue;
+      }
+      const afterClip = (track.clips || []).find((entry) => entry.id === transition.afterClipId);
+      if (!afterClip) {
+        continue;
+      }
+      const boundaryMs = clipEndMs(afterClip);
+      const windowStartMs = boundaryMs - durationMs;
+      if (timelineMs < windowStartMs || timelineMs > boundaryMs) {
+        continue;
+      }
+      const progress = clamp01((timelineMs - windowStartMs) / durationMs);
+      const alpha = progress < 0.5 ? progress * 2 : (1 - progress) * 2;
+      return { color: transition.kind === "dip-white" ? "#ffffff" : "#000000", alpha: clamp01(alpha) };
+    }
+  }
+  return null;
+}
+
+// Text animations (contract §4): word anims need word timings; without them
+// they fall back to none. pop/fade animate the whole clip entrance.
+function effectiveTextAnim(clip) {
+  const anim = clip?.anim || "none";
+  if (anim === "pop" || anim === "fade") {
+    return anim;
+  }
+  if (
+    (anim === "typewriter" || anim === "word-reveal" || anim === "word-highlight")
+    && Array.isArray(clip?.words)
+    && clip.words.length
+  ) {
+    return anim;
+  }
+  return "none";
+}
+
+function isWordAnim(anim) {
+  return anim === "typewriter" || anim === "word-reveal" || anim === "word-highlight";
+}
+
+// Whole-clip entrance state, derived from the clip-relative time (seek-safe).
+function textEntranceState(anim, clipRelMs) {
+  if (anim === "pop") {
+    const progress = clamp01(clipRelMs / TEXT_ENTRANCE_MS);
+    return { opacity: progress, scale: 0.85 + 0.15 * progress };
+  }
+  if (anim === "fade") {
+    return { opacity: clamp01(clipRelMs / TEXT_ENTRANCE_MS), scale: 1 };
+  }
+  return { opacity: 1, scale: 1 };
+}
+
+// Per-word render state. Typewriter hides upcoming words (visibility keeps
+// the layout stable so revealed words don't reflow on every start).
+function wordSpanState(anim, word, clipRelMs, highlightColor) {
+  if (anim === "typewriter") {
+    return { visibility: word.startMs <= clipRelMs ? "visible" : "hidden", opacity: 1, color: "" };
+  }
+  if (anim === "word-reveal") {
+    return { visibility: "visible", opacity: clamp01((clipRelMs - word.startMs) / WORD_REVEAL_RAMP_MS), color: "" };
+  }
+  if (anim === "word-highlight") {
+    const activeWord = clipRelMs >= word.startMs && clipRelMs < word.endMs;
+    return { visibility: "visible", opacity: 1, color: activeWord ? highlightColor : "" };
+  }
+  return { visibility: "visible", opacity: 1, color: "" };
+}
+
 // Approximate realtime preview of the timeline: the topmost active video-track
 // clip renders visually (with CSS transform/opacity), audible clips play
 // through pooled media elements, and text clips render as DOM overlays. Export
@@ -204,7 +523,20 @@ export default function VideoEditor({
   playheadMs = 0,
   playing = false,
   project,
+  // Relative path of the open .pipe project inside the repo — required for
+  // Draft render (§6). Optional: the pane passes it when available.
+  projectRelPath = "",
   repoPath = "",
+  // Currently selected media clip (object) + change callback for the
+  // transform/crop handles overlay. Optional: overlay hides without them.
+  selectedClip = null,
+  // { startMs, endMs } timeline selection; Draft render falls back to the
+  // full timeline when absent.
+  selectedRange = null,
+  onClipTransformChange = null,
+  // Flushes the pane's debounced project autosave. Draft render reads the
+  // saved file, so this must run before video_draft_render.
+  onFlushProjectSave = null,
   onSeek,
   onTogglePlay,
   onUpdateTextClip,
@@ -233,6 +565,19 @@ export default function VideoEditor({
   const [draggingTextId, setDraggingTextId] = useState("");
   const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
   const [capturingFrame, setCapturingFrame] = useState(false);
+  const dipOverlayRef = useRef(null);
+  const handlesOverlayRef = useRef(null);
+  const frameSizeRef = useRef({ width: 0, height: 0 });
+  const selectedClipRef = useRef(null);
+  const draftJobIdRef = useRef("");
+  const [draftJob, setDraftJob] = useState(null);
+  const [draftResult, setDraftResult] = useState(null);
+  const [draftError, setDraftError] = useState("");
+  const [draftNotice, setDraftNotice] = useState("");
+  // Whether the retained draft result is currently shown over the live
+  // preview — the Live/Draft toggle flips this without discarding the result.
+  const [draftView, setDraftView] = useState(false);
+  const [cropMode, setCropMode] = useState(false);
   // Bumped every time the visual layer node (re)mounts. The media-sync effect
   // depends on it: without this, an attach refused because the layer didn't
   // exist yet (stage still measuring 0 on project open) or because the layer
@@ -254,9 +599,37 @@ export default function VideoEditor({
   projectRef.current = project;
   durationRef.current = durationMs;
   playingRef.current = playing;
+  selectedClipRef.current = selectedClip;
 
   const settings = project?.settings || { width: 1920, height: 1080, background: "#000000" };
   const aspect = settings.width / Math.max(1, settings.height);
+
+  // One stage badge (not per clip) when any timeline clip carries fx the CSS
+  // preview cannot approximate (curves/lut/chromaKey/grain).
+  const fxNeedsDraftBadge = useMemo(() => {
+    for (const track of project?.tracks || []) {
+      if (track.kind === "text") {
+        continue;
+      }
+      for (const clip of track.clips || []) {
+        if (fxHasNonPreviewable(clip.fx)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }, [project]);
+
+  const hasDipTransitions = useMemo(() => {
+    for (const track of project?.tracks || []) {
+      for (const transition of track.transitions || []) {
+        if (transition.kind === "dip-black" || transition.kind === "dip-white") {
+          return true;
+        }
+      }
+    }
+    return false;
+  }, [project]);
 
   // Meme-editor essential: grab a title on the preview and put it where it
   // belongs. Fractions are relative to the project frame.
@@ -322,8 +695,11 @@ export default function VideoEditor({
     return { width, height: width / aspect };
   }, [aspect, stageSize]);
 
+  // previewScale (== fontScale): renderedStageWidth / project width. Blur and
+  // any other pixel-sized fx approximations scale by it so they track zoom.
   const fontScale = frameSize.width > 0 ? frameSize.width / Math.max(1, settings.width) : 0;
   fontScaleRef.current = fontScale;
+  frameSizeRef.current = frameSize;
 
   const assetSrc = useCallback(
     (assetPath) => {
@@ -704,8 +1080,41 @@ export default function VideoEditor({
         const x = getPropEvaluator(visualNow.clip, "x")(clipRelMs);
         const y = getPropEvaluator(visualNow.clip, "y")(clipRelMs);
         const scale = getPropEvaluator(visualNow.clip, "scale")(clipRelMs);
-        visualLayerRef.current.style.opacity = String(opacity);
+        // Transitions multiply on top of the clip's own keyframed opacity.
+        const transitionMult = transitionOpacityMultiplier(visualNow.track, visualNow.clip, timelineMs);
+        visualLayerRef.current.style.opacity = String(opacity * transitionMult);
         visualLayerRef.current.style.transform = `translate(${x * 100}%, ${y * 100}%) scale(${scale})`;
+        // FX/crop on the pooled <video> element (attached imperatively, so it
+        // can't get these from JSX). Images get theirs from JSX props.
+        const mediaNode = visualLayerRef.current.querySelector("video");
+        if (mediaNode) {
+          const filterValue = fxFilterString(visualNow.clip.fx, fontScaleRef.current);
+          if (mediaNode.style.filter !== filterValue) {
+            mediaNode.style.filter = filterValue;
+          }
+          const clipPathValue = cropClipPath(visualNow.clip.crop);
+          if (mediaNode.style.clipPath !== clipPathValue) {
+            mediaNode.style.clipPath = clipPathValue;
+          }
+        }
+        // Keep the selection handles glued to the rendered bounds while the
+        // transform is keyframed / the playhead moves.
+        const selClip = selectedClipRef.current;
+        const handlesNode = handlesOverlayRef.current;
+        const frame = frameSizeRef.current;
+        if (handlesNode && selClip && visualNow.clip.id === selClip.id && frame.width > 0) {
+          const width = frame.width * scale;
+          const height = frame.height * scale;
+          handlesNode.style.left = `${frame.width * (0.5 + x) - width / 2}px`;
+          handlesNode.style.top = `${frame.height * (0.5 + y) - height / 2}px`;
+          handlesNode.style.width = `${width}px`;
+          handlesNode.style.height = `${height}px`;
+        }
+      }
+      if (dipOverlayRef.current) {
+        const dip = dipOverlayAt(projectRef.current, timelineMs);
+        dipOverlayRef.current.style.backgroundColor = dip ? dip.color : "transparent";
+        dipOverlayRef.current.style.opacity = dip ? dip.alpha.toFixed(4) : "0";
       }
       for (const { clip } of activeNow.text) {
         const node = textOverlayRefs.current.get(clip.id);
@@ -719,6 +1128,28 @@ export default function VideoEditor({
         node.style.fontSize = `${Math.max(6, (clip.style?.fontSize || 48) * currentFontScale)}px`;
         node.style.webkitTextStroke = outlineWidth > 0 ? `${outlineWidth}px ${clip.style?.outlineColor || "#000000"}` : "";
         node.style.paintOrder = outlineWidth > 0 ? "stroke fill" : "";
+        // Caption animations (contract §4): everything derives from the
+        // clip-relative time so seeking is deterministic.
+        const anim = effectiveTextAnim(clip);
+        const clipRelTextMs = Math.max(0, timelineMs - clip.timelineStartMs);
+        const entrance = textEntranceState(anim, clipRelTextMs);
+        node.style.opacity = String(entrance.opacity);
+        if (anim === "pop") {
+          node.style.transform = `translate(-50%, -50%) scale(${entrance.scale.toFixed(4)})`;
+        }
+        if (isWordAnim(anim) && Array.isArray(clip.words)) {
+          const highlightColor = clip.animOpts?.highlightColor || DEFAULT_HIGHLIGHT_COLOR;
+          for (const span of node.querySelectorAll("[data-word-index]")) {
+            const word = clip.words[Number(span.dataset.wordIndex)];
+            if (!word) {
+              continue;
+            }
+            const wordState = wordSpanState(anim, word, clipRelTextMs, highlightColor);
+            span.style.visibility = wordState.visibility;
+            span.style.opacity = String(wordState.opacity);
+            span.style.color = wordState.color;
+          }
+        }
       }
     },
     [getPropEvaluator],
@@ -746,6 +1177,23 @@ export default function VideoEditor({
     syncMediaForTime(currentMs, { now: performance.now(), playing, seekActive: !playing });
     applyPreviewStyles(currentMs);
   }, [applyPreviewStyles, playback, playing, playheadMs, syncMediaForTime, visual?.clip.id, visualIsImage, visualLayerNonce]);
+
+  // FX/crop on the pooled <video> element when editing while paused: the
+  // per-tick path above only runs on playback/seek, so an inspector fx edit
+  // must reach the attached element through this effect (declared after the
+  // sync effect so the element is already attached). Empty values clear stale
+  // styles left over from pool reuse.
+  const visualFx = visual?.clip.fx || null;
+  const visualCrop = visual?.clip.crop || null;
+  useEffect(() => {
+    const host = visualLayerRef.current;
+    const mediaNode = host?.querySelector("video");
+    if (!mediaNode) {
+      return;
+    }
+    mediaNode.style.filter = fxFilterString(visualFx, fontScaleRef.current);
+    mediaNode.style.clipPath = cropClipPath(visualCrop);
+  }, [fontScale, visualCrop, visualFx, visualIsImage, visualLayerNonce, visual?.clip.id]);
 
   // Playback clock: use the active media element as master. The rAF loop never
   // drift-seeks that primary element; seeks happen on explicit seek, play
@@ -912,6 +1360,228 @@ export default function VideoEditor({
     [onSeek, playback],
   );
 
+  // --- Draft render (contract §6) --------------------------------------------
+  const draftRunning = Boolean(draftJob && !draftJob.done);
+
+  const startDraftRender = useCallback(async () => {
+    if (!repoPath || !projectRelPath || draftRunning) {
+      return;
+    }
+    const hasRange =
+      selectedRange
+      && Number.isFinite(Number(selectedRange.startMs))
+      && Number.isFinite(Number(selectedRange.endMs))
+      && Number(selectedRange.endMs) > Number(selectedRange.startMs);
+    const startMs = hasRange ? Math.max(0, Math.round(Number(selectedRange.startMs))) : 0;
+    const endMs = hasRange ? Math.round(Number(selectedRange.endMs)) : Math.round(durationRef.current);
+    if (endMs <= startMs) {
+      setDraftError("The timeline is empty — add clips before draft rendering.");
+      return;
+    }
+    setDraftError("");
+    setDraftResult(null);
+    setDraftView(false);
+    setDraftNotice(endMs - startMs > 120000 ? "Draft range exceeds 120s — expect a slower render." : "");
+    try {
+      // The draft renders the SAVED .pipe file — flush the pane's debounced
+      // autosave so edits from the last second are included.
+      await onFlushProjectSave?.();
+      const result = await invoke("video_draft_render", { repoPath, projectRelPath, startMs, endMs, height: 480 });
+      const jobId = String(result?.jobId || "");
+      draftJobIdRef.current = jobId;
+      if (jobId) {
+        setDraftJob({ jobId, percent: 0, done: false });
+      } else {
+        setDraftNotice("");
+        setDraftError("Draft render did not return a job id.");
+      }
+    } catch (err) {
+      setDraftNotice("");
+      setDraftError(String(err));
+    }
+  }, [draftRunning, onFlushProjectSave, projectRelPath, repoPath, selectedRange]);
+
+  // Same cancel command/convention as ExportPanel — draft renders ride the
+  // shared export job registry.
+  const cancelDraftRender = useCallback(() => {
+    if (draftJob?.jobId && !draftJob.done) {
+      invoke("video_export_cancel", { jobId: draftJob.jobId }).catch(() => {});
+    }
+  }, [draftJob]);
+
+  // Switching projects invalidates the retained draft result and any live job.
+  useEffect(() => {
+    draftJobIdRef.current = "";
+    setDraftJob(null);
+    setDraftResult(null);
+    setDraftError("");
+    setDraftNotice("");
+    setDraftView(false);
+  }, [projectRelPath]);
+
+  // Progress/completion rides the existing export progress event stream, keyed
+  // by our own jobId (same convention as ExportPanel — never adopt other
+  // jobs). Mounted for the component lifetime, like ExportPanel's listener,
+  // so a fast job can't complete before registration.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    listen(VIDEO_EXPORT_PROGRESS_EVENT, (event) => {
+      const payload = event?.payload;
+      if (disposed || !payload?.jobId || String(payload.jobId) !== draftJobIdRef.current) {
+        return;
+      }
+      setDraftJob({
+        jobId: String(payload.jobId),
+        percent: Number(payload.percent) || 0,
+        done: Boolean(payload.done),
+      });
+      if (payload.done) {
+        setDraftNotice("");
+        const path = String(payload.path || payload.outputPath || "");
+        if (payload.error) {
+          setDraftError(String(payload.error));
+        } else if (path) {
+          setDraftResult({
+            path,
+            width: payload.width,
+            height: payload.height,
+            durationMs: payload.durationMs,
+          });
+          setDraftView(true);
+        } else {
+          setDraftError("Draft render finished without an output path.");
+        }
+      }
+    })
+      .then((next) => {
+        if (disposed) {
+          next();
+        } else {
+          unlisten = next;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, []);
+
+  const draftSrc = useMemo(() => {
+    if (!draftResult?.path) {
+      return "";
+    }
+    const path = String(draftResult.path);
+    const isAbsolute = path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(path);
+    if (isAbsolute) {
+      try {
+        return convertFileSrc(path);
+      } catch {
+        return "";
+      }
+    }
+    return assetSrc(path);
+  }, [assetSrc, draftResult]);
+
+  // Pause the live preview whenever the draft overlay opens so its <video>
+  // and the timeline's media pool never play audio simultaneously.
+  const draftOverlayVisible = Boolean(draftResult && draftSrc && draftView);
+  const onTogglePlayRef = useRef(onTogglePlay);
+  onTogglePlayRef.current = onTogglePlay;
+  useEffect(() => {
+    if (draftOverlayVisible) {
+      onTogglePlayRef.current?.(false);
+    }
+  }, [draftOverlayVisible]);
+
+  // --- Transform/crop handles for the selected media clip ---------------------
+  useEffect(() => {
+    setCropMode(false);
+  }, [selectedClip?.id]);
+
+  const beginHandleDrag = useCallback(
+    (event, mode) => {
+      // mode: "move" | "corner" | "crop-l" | "crop-t" | "crop-r" | "crop-b"
+      const clip = selectedClipRef.current;
+      if (event.button !== 0 || !onClipTransformChange || !clip) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      const frameRect = frameRef.current?.getBoundingClientRect();
+      if (!frameRect || frameRect.width <= 0 || frameRect.height <= 0) {
+        return;
+      }
+      const relMs = Math.max(0, (playback?.getMs?.() ?? playheadMsRef.current) - clip.timelineStartMs);
+      const baseX = getPropEvaluator(clip, "x")(relMs);
+      const baseY = getPropEvaluator(clip, "y")(relMs);
+      const baseScale = getPropEvaluator(clip, "scale")(relMs);
+      const baseCrop = { l: 0, t: 0, r: 0, b: 0, ...(clip.crop || {}) };
+      // transform.x/y are frame fractions (translate(x*100%, y*100%) of the
+      // full-frame layer), scale is about the frame center — same mapping as
+      // the layer render math above.
+      const centerX = frameRect.left + frameRect.width * (0.5 + baseX);
+      const centerY = frameRect.top + frameRect.height * (0.5 + baseY);
+      const startClientX = event.clientX;
+      const startClientY = event.clientY;
+      const startDist = Math.max(8, Math.hypot(startClientX - centerX, startClientY - centerY));
+      const renderedW = Math.max(1, frameRect.width * baseScale);
+      const renderedH = Math.max(1, frameRect.height * baseScale);
+      const round4 = (value) => Number(value.toFixed(4));
+      const clampCrop = (value) => Math.min(0.45, Math.max(0, value));
+      const emit = (clientX, clientY, transient) => {
+        if (mode === "move") {
+          onClipTransformChange(
+            clip.id,
+            {
+              transform: {
+                x: round4(baseX + (clientX - startClientX) / frameRect.width),
+                y: round4(baseY + (clientY - startClientY) / frameRect.height),
+              },
+            },
+            { transient },
+          );
+        } else if (mode === "corner") {
+          // Uniform scale anchored at center: distance ratio from the center.
+          const dist = Math.hypot(clientX - centerX, clientY - centerY);
+          const nextScale = Math.min(8, Math.max(0.05, baseScale * (dist / startDist)));
+          onClipTransformChange(clip.id, { transform: { scale: round4(nextScale) } }, { transient });
+        } else {
+          // Crop edges: pointer deltas in fractions of the rendered clip size.
+          const next = { ...baseCrop };
+          if (mode === "crop-l") {
+            next.l = clampCrop(baseCrop.l + (clientX - startClientX) / renderedW);
+          } else if (mode === "crop-r") {
+            next.r = clampCrop(baseCrop.r - (clientX - startClientX) / renderedW);
+          } else if (mode === "crop-t") {
+            next.t = clampCrop(baseCrop.t + (clientY - startClientY) / renderedH);
+          } else if (mode === "crop-b") {
+            next.b = clampCrop(baseCrop.b - (clientY - startClientY) / renderedH);
+          }
+          next.l = round4(next.l);
+          next.t = round4(next.t);
+          next.r = round4(next.r);
+          next.b = round4(next.b);
+          onClipTransformChange(clip.id, { crop: next }, { transient });
+        }
+      };
+      const moveTo = (moveEvent) => emit(moveEvent.clientX, moveEvent.clientY, true);
+      const finish = (endEvent) => {
+        window.removeEventListener("pointermove", moveTo);
+        window.removeEventListener("pointerup", finish);
+        window.removeEventListener("pointercancel", finish);
+        if (endEvent?.clientX != null) {
+          emit(endEvent.clientX, endEvent.clientY, false);
+        }
+      };
+      window.addEventListener("pointermove", moveTo);
+      window.addEventListener("pointerup", finish);
+      window.addEventListener("pointercancel", finish);
+    },
+    [getPropEvaluator, onClipTransformChange, playback],
+  );
+
   const visualLayerStyle = visual
     ? (() => {
         const clipRelMs = Math.max(0, playheadMs - visual.clip.timelineStartMs);
@@ -919,12 +1589,44 @@ export default function VideoEditor({
         const x = getPropEvaluator(visual.clip, "x")(clipRelMs);
         const y = getPropEvaluator(visual.clip, "y")(clipRelMs);
         const scale = getPropEvaluator(visual.clip, "scale")(clipRelMs);
+        // Same composition as applyPreviewStyles: transition multiplier on top
+        // of the clip's own opacity; fx.blend as mix-blend-mode.
+        const transitionMult = transitionOpacityMultiplier(visual.track, visual.clip, playheadMs);
+        const blendMode = cssBlendMode(visual.clip.fx?.blend);
         return {
-          opacity,
+          opacity: opacity * transitionMult,
           transform: `translate(${x * 100}%, ${y * 100}%) scale(${scale})`,
+          mixBlendMode: blendMode || undefined,
         };
       })()
     : undefined;
+
+  // Rendered bounds of the selected clip (stage px) for the handles overlay.
+  const showHandles = Boolean(
+    selectedClip
+    && onClipTransformChange
+    && visual
+    && visual.clip.id === selectedClip.id
+    && frameSize.width > 0,
+  );
+  const handlesRect = showHandles
+    ? (() => {
+        const clipRelMs = Math.max(0, playheadMs - visual.clip.timelineStartMs);
+        const x = getPropEvaluator(visual.clip, "x")(clipRelMs);
+        const y = getPropEvaluator(visual.clip, "y")(clipRelMs);
+        const scale = getPropEvaluator(visual.clip, "scale")(clipRelMs);
+        const width = frameSize.width * scale;
+        const height = frameSize.height * scale;
+        return {
+          left: frameSize.width * (0.5 + x) - width / 2,
+          top: frameSize.height * (0.5 + y) - height / 2,
+          width,
+          height,
+        };
+      })()
+    : null;
+
+  const dipNow = hasDipTransitions ? dipOverlayAt(project, playheadMs) : null;
 
   const scrubMax = Math.max(1000, durationMs);
   const currentStoreMs = playback?.getMs?.() ?? playheadMs;
@@ -945,7 +1647,22 @@ export default function VideoEditor({
                 style={visualLayerStyle}
               >
                 {visualIsImage ? (
-                  <img alt="" draggable={false} src={assetSrc(visual.clip.assetPath)} />
+                  <img
+                    alt=""
+                    draggable={false}
+                    src={assetSrc(visual.clip.assetPath)}
+                    style={{
+                      filter: fxFilterString(visual.clip.fx, fontScale) || undefined,
+                      clipPath: cropClipPath(visual.clip.crop) || undefined,
+                    }}
+                  />
+                ) : null}
+                {visual.clip.fx?.vignette > 0 ? (
+                  <PreviewVignette
+                    style={{
+                      background: `radial-gradient(transparent 55%, rgba(0, 0, 0, ${(visual.clip.fx.vignette * 0.8).toFixed(3)}))`,
+                    }}
+                  />
                 ) : null}
               </PreviewLayer>
             ) : (
@@ -955,8 +1672,21 @@ export default function VideoEditor({
                 </PreviewEmpty>
               </PreviewLayer>
             )}
+            {hasDipTransitions ? (
+              <PreviewDipOverlay
+                ref={dipOverlayRef}
+                style={{
+                  backgroundColor: dipNow ? dipNow.color : "transparent",
+                  opacity: dipNow ? dipNow.alpha : 0,
+                }}
+              />
+            ) : null}
             {active.text.map(({ clip }) => {
               const outlineWidth = (clip.style?.outlineWidth || 0) * fontScale;
+              const textAnim = effectiveTextAnim(clip);
+              const clipRelTextMs = Math.max(0, playheadMs - clip.timelineStartMs);
+              const entrance = textEntranceState(textAnim, clipRelTextMs);
+              const highlightColor = clip.animOpts?.highlightColor || DEFAULT_HIGHLIGHT_COLOR;
               return (
                 <PreviewTextOverlay
                   data-dragging={draggingTextId === clip.id ? "true" : "false"}
@@ -984,14 +1714,115 @@ export default function VideoEditor({
                     WebkitTextStroke: outlineWidth > 0 ? `${outlineWidth}px ${clip.style?.outlineColor || "#000000"}` : undefined,
                     paintOrder: outlineWidth > 0 ? "stroke fill" : undefined,
                     textShadow: clip.style?.shadow ? "2px 2px 6px rgba(0, 0, 0, 0.75)" : "none",
+                    opacity: entrance.opacity,
+                    transform: textAnim === "pop" ? `translate(-50%, -50%) scale(${entrance.scale.toFixed(4)})` : undefined,
                   }}
                   title="Drag to position"
                 >
-                  {clip.text}
+                  {isWordAnim(textAnim) ? (
+                    clip.words.map((word, index) => {
+                      const wordState = wordSpanState(textAnim, word, clipRelTextMs, highlightColor);
+                      return (
+                        <React.Fragment key={`${clip.id}-w${index}`}>
+                          {index ? " " : ""}
+                          <span
+                            data-word-index={index}
+                            style={{
+                              visibility: wordState.visibility,
+                              opacity: wordState.opacity,
+                              color: wordState.color || undefined,
+                            }}
+                          >
+                            {word.text}
+                          </span>
+                        </React.Fragment>
+                      );
+                    })
+                  ) : (
+                    clip.text
+                  )}
                 </PreviewTextOverlay>
               );
             })}
+            {handlesRect ? (
+              <TransformHandlesBox
+                onPointerDown={(event) => beginHandleDrag(event, "move")}
+                ref={handlesOverlayRef}
+                style={{
+                  left: `${handlesRect.left}px`,
+                  top: `${handlesRect.top}px`,
+                  width: `${handlesRect.width}px`,
+                  height: `${handlesRect.height}px`,
+                }}
+              >
+                <CropToggleChip
+                  data-active={cropMode ? "true" : "false"}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setCropMode((value) => !value);
+                  }}
+                  onPointerDown={(event) => event.stopPropagation()}
+                  title="Toggle crop-edge handles"
+                  type="button"
+                >
+                  Crop
+                </CropToggleChip>
+                {cropMode
+                  ? [
+                      { edge: "crop-l", style: { left: 0, top: "50%", cursor: "ew-resize" } },
+                      { edge: "crop-r", style: { left: "100%", top: "50%", cursor: "ew-resize" } },
+                      { edge: "crop-t", style: { left: "50%", top: 0, cursor: "ns-resize" } },
+                      { edge: "crop-b", style: { left: "50%", top: "100%", cursor: "ns-resize" } },
+                    ].map(({ edge, style }) => (
+                      <TransformHandleDot
+                        key={edge}
+                        onPointerDown={(event) => beginHandleDrag(event, edge)}
+                        style={style}
+                      />
+                    ))
+                  : [
+                      { corner: "nw", style: { left: 0, top: 0, cursor: "nwse-resize" } },
+                      { corner: "ne", style: { left: "100%", top: 0, cursor: "nesw-resize" } },
+                      { corner: "sw", style: { left: 0, top: "100%", cursor: "nesw-resize" } },
+                      { corner: "se", style: { left: "100%", top: "100%", cursor: "nwse-resize" } },
+                    ].map(({ corner, style }) => (
+                      <TransformHandleDot
+                        key={corner}
+                        onPointerDown={(event) => beginHandleDrag(event, "corner")}
+                        style={style}
+                      />
+                    ))}
+              </TransformHandlesBox>
+            ) : null}
           </PreviewFrame>
+        ) : null}
+        {fxNeedsDraftBadge ? <StageFxBadge>FX approximate — use Draft render</StageFxBadge> : null}
+        {draftOverlayVisible ? (
+          <DraftOverlay>
+            <DraftOverlayBar>
+              <DraftLabelChip>Exact draft render</DraftLabelChip>
+              <DraftCloseButton
+                onClick={() => setDraftView(false)}
+                style={{ marginLeft: "auto" }}
+                title="Back to the live preview (the draft stays available)"
+                type="button"
+              >
+                Live
+              </DraftCloseButton>
+              <DraftCloseButton
+                onClick={() => {
+                  setDraftResult(null);
+                  setDraftView(false);
+                }}
+                style={{ marginLeft: 0 }}
+                title="Discard this draft render"
+                type="button"
+              >
+                Close
+              </DraftCloseButton>
+            </DraftOverlayBar>
+            <video controls src={draftSrc} />
+          </DraftOverlay>
         ) : null}
       </PreviewStage>
       <TransportRow>
@@ -1014,6 +1845,28 @@ export default function VideoEditor({
         >
           <PhotoCamera aria-hidden="true" />
         </VideoIconButton>
+        <VideoPaneButton
+          disabled={!repoPath || !projectRelPath || durationMs <= 0 || draftRunning}
+          onClick={startDraftRender}
+          title="Render the selected range (or full timeline) through the exact export pipeline at 480p"
+          type="button"
+        >
+          {draftRunning ? `Draft ${Math.round(draftJob?.percent || 0)}%` : "Draft"}
+        </VideoPaneButton>
+        {draftRunning ? (
+          <VideoSecondaryButton onClick={cancelDraftRender} title="Cancel the draft render" type="button">
+            Cancel
+          </VideoSecondaryButton>
+        ) : null}
+        {draftResult && !draftView ? (
+          <VideoSecondaryButton
+            onClick={() => setDraftView(true)}
+            title="Show the last draft render over the live preview"
+            type="button"
+          >
+            View draft
+          </VideoSecondaryButton>
+        ) : null}
         <TransportScrub
           defaultValue={Math.min(currentStoreMs, scrubMax)}
           max={scrubMax}
@@ -1027,6 +1880,8 @@ export default function VideoEditor({
           {formatTimecode(currentStoreMs)} / {formatTimecode(durationMs)}
         </TransportTime>
       </TransportRow>
+      {draftError ? <VideoErrorText>{draftError}</VideoErrorText> : null}
+      {!draftError && draftNotice ? <VideoHint>{draftNotice}</VideoHint> : null}
     </PreviewRoot>
   );
 }

@@ -733,7 +733,7 @@ fn todo_dispatch_remote_intake_scope_decision_for_webview(
     workspace_id: &str,
     webview_dispatcher_active: bool,
 ) -> TodoDispatchRemoteIntakeScopeDecision {
-    if workspace_id.is_empty()
+    if (workspace_id.is_empty() || todo_dispatch_is_app_control_workspace_id(workspace_id))
         && todo_dispatch_remote_command_is_orchestrator_send_message(command_kind)
     {
         return if webview_dispatcher_active {
@@ -7936,37 +7936,39 @@ mod todo_store_tests {
     }
 
     #[test]
-    fn todo_dispatch_intake_routes_orchestrator_send_without_workspace_by_owner() {
-        let event = json!({
-            "command_kind": "terminal_orchestrator_send_message",
-            "commandId": "run-1",
-            "workspaceId": "",
-        });
-        let command_kind = todo_dispatch_text(
-            &event,
-            &["command_kind", "commandKind", "action", "command"],
-        );
-        let command_id = todo_dispatch_text(&event, &["command_id", "commandId"]);
-        let workspace_id = todo_dispatch_text(&event, &["workspace_id", "workspaceId"]);
+    fn chat_attachment_push_app_control_sentinel_routes_orchestrator_send_by_owner() {
+        for workspace_id in ["", TODO_DISPATCH_APP_CONTROL_WORKSPACE_ID] {
+            let event = json!({
+                "command_kind": "terminal_orchestrator_send_message",
+                "commandId": "run-1",
+                "workspaceId": workspace_id,
+            });
+            let command_kind = todo_dispatch_text(
+                &event,
+                &["command_kind", "commandKind", "action", "command"],
+            );
+            let command_id = todo_dispatch_text(&event, &["command_id", "commandId"]);
+            let workspace_id = todo_dispatch_text(&event, &["workspace_id", "workspaceId"]);
 
-        assert_eq!(
-            todo_dispatch_remote_intake_scope_decision_for_webview(
-                &command_kind,
-                &command_id,
-                &workspace_id,
-                true,
-            ),
-            TodoDispatchRemoteIntakeScopeDecision::IgnoreOrchestratorSend
-        );
-        assert_eq!(
-            todo_dispatch_remote_intake_scope_decision_for_webview(
-                &command_kind,
-                &command_id,
-                &workspace_id,
-                false,
-            ),
-            TodoDispatchRemoteIntakeScopeDecision::RustOrchestratorSend
-        );
+            assert_eq!(
+                todo_dispatch_remote_intake_scope_decision_for_webview(
+                    &command_kind,
+                    &command_id,
+                    &workspace_id,
+                    true,
+                ),
+                TodoDispatchRemoteIntakeScopeDecision::IgnoreOrchestratorSend
+            );
+            assert_eq!(
+                todo_dispatch_remote_intake_scope_decision_for_webview(
+                    &command_kind,
+                    &command_id,
+                    &workspace_id,
+                    false,
+                ),
+                TodoDispatchRemoteIntakeScopeDecision::RustOrchestratorSend
+            );
+        }
     }
 
     #[test]
@@ -10858,6 +10860,14 @@ async fn todo_dispatch_backend_item_text_with_remote_attachments(
     workspace_id: &str,
 ) -> String {
     let text = todo_dispatch_backend_item_text(item);
+    todo_dispatch_text_with_remote_attachments(text, item, workspace_id).await
+}
+
+async fn todo_dispatch_text_with_remote_attachments(
+    text: String,
+    item: &Value,
+    workspace_id: &str,
+) -> String {
     let attachments = todo_dispatch_chat_attachment_refs(item);
     if attachments.is_empty() {
         return text;

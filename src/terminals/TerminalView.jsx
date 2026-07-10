@@ -227,7 +227,11 @@ import {
   TODO_QUEUE_DEVICE_KIND_MOBILE,
   TODO_QUEUE_DEVICE_KIND_UNKNOWN,
   buildAccountLiveDeviceRows,
+  buildTodoQueueHydratedSnapshotRows,
+  buildTodoQueueDisplayedSelectionArrays,
   buildTodoQueueDeviceWorkspaceOptions,
+  normalizeTodoQueueSwitcherId,
+  normalizeTodoQueueWorkspaceMatchId,
   todoQueueDeviceSelectionIsLocalEditable,
 } from "./todoQueueDeviceSwitcher.js";
 import WorkspaceTerminal, {
@@ -15868,13 +15872,20 @@ function normalizeTodoQueueItems(items) {
     .slice(0, TODO_QUEUE_MAX_ITEMS);
 }
 
-function normalizeTodoQueueItemsForWorkspace(items, workspaceId = "", deviceId = "") {
+function normalizeTodoQueueItemsForWorkspace(
+  items,
+  workspaceId = "",
+  deviceId = "",
+  platform = "",
+) {
   const safeWorkspaceId = String(workspaceId || "").trim();
+  const workspaceMatchId = normalizeTodoQueueWorkspaceMatchId(safeWorkspaceId, platform);
   const safeDeviceId = normalizeWorkspaceTodoDeviceId(deviceId);
   return normalizeTodoQueueItems(items)
     .map((item) => {
       const itemWorkspaceId = String(item?.workspaceId || item?.workspace_id || "").trim();
-      if (safeWorkspaceId && itemWorkspaceId && itemWorkspaceId !== safeWorkspaceId) {
+      const itemWorkspaceMatchId = normalizeTodoQueueWorkspaceMatchId(itemWorkspaceId, platform);
+      if (workspaceMatchId && itemWorkspaceMatchId && itemWorkspaceMatchId !== workspaceMatchId) {
         return null;
       }
       const itemDeviceId = normalizeWorkspaceTodoDeviceId(item?.deviceId || item?.device_id);
@@ -16590,7 +16601,7 @@ function normalizeOrchestratorConnectedDevices(devices) {
 }
 
 function normalizeWorkspaceTodoDeviceId(value) {
-  return String(value || "").trim().toLowerCase();
+  return normalizeTodoQueueSwitcherId(value);
 }
 
 function workspaceTodoDeviceBool(value) {
@@ -16707,11 +16718,29 @@ function workspaceTodoPeerStatusLabel(status) {
   return "listed";
 }
 
-function workspaceTodoPeerActivityForWorkspace(workspaceTodos, workspaceId) {
+function workspaceTodoMirrorWorkspaceIds(entry = {}) {
+  return [
+    entry?.targetWorkspaceId,
+    entry?.target_workspace_id,
+    entry?.target?.workspaceId,
+    entry?.target?.workspace_id,
+    entry?.workspaceId,
+    entry?.workspace_id,
+    entry?.observerWorkspaceId,
+    entry?.observer_workspace_id,
+    entry?.todoWorkspaceId,
+    entry?.todo_workspace_id,
+    entry?.origin?.workspaceId,
+    entry?.origin?.workspace_id,
+  ].map((value) => String(value || "").trim()).filter(Boolean);
+}
+
+function workspaceTodoPeerActivityForWorkspace(workspaceTodos, workspaceId, platform = "") {
   if (!workspaceTodos || typeof workspaceTodos !== "object") {
     return null;
   }
   const safeWorkspaceId = String(workspaceId || "").trim();
+  const workspaceMatchId = normalizeTodoQueueWorkspaceMatchId(safeWorkspaceId, platform);
   const direct = workspaceTodos.peerActivity || workspaceTodos.peer_activity || null;
   const byWorkspace = workspaceTodos.peerActivityByWorkspace
     || workspaceTodos.peer_activity_by_workspace
@@ -16721,28 +16750,34 @@ function workspaceTodoPeerActivityForWorkspace(workspaceTodos, workspaceId) {
 
   if (Array.isArray(byWorkspace)) {
     return byWorkspace.find((entry) => (
-      String(
-        entry?.workspaceId
-          || entry?.workspace_id
-          || entry?.observerWorkspaceId
-          || entry?.observer_workspace_id
-          || "",
-      ).trim() === safeWorkspaceId
+      workspaceTodoMirrorWorkspaceIds(entry).some((candidate) => (
+        normalizeTodoQueueWorkspaceMatchId(candidate, platform) === workspaceMatchId
+      ))
     )) || direct;
   }
 
   if (byWorkspace && typeof byWorkspace === "object") {
-    return byWorkspace[safeWorkspaceId] || byWorkspace[String(safeWorkspaceId).toLowerCase()] || direct;
+    const matchedKey = Object.keys(byWorkspace).find(
+      (key) => normalizeTodoQueueWorkspaceMatchId(key, platform) === workspaceMatchId,
+    );
+    return (matchedKey ? byWorkspace[matchedKey] : null) || direct;
   }
 
   return direct;
 }
 
-function workspaceTodoCollectionForWorkspace(workspaceTodos, workspaceId, directKeys = [], byWorkspaceKeys = []) {
+function workspaceTodoCollectionForWorkspace(
+  workspaceTodos,
+  workspaceId,
+  directKeys = [],
+  byWorkspaceKeys = [],
+  platform = "",
+) {
   if (!workspaceTodos || typeof workspaceTodos !== "object") {
     return null;
   }
   const safeWorkspaceId = String(workspaceId || "").trim();
+  const workspaceMatchId = normalizeTodoQueueWorkspaceMatchId(safeWorkspaceId, platform);
   const direct = directKeys
     .map((key) => workspaceTodos[key])
     .find((value) => value);
@@ -16752,18 +16787,17 @@ function workspaceTodoCollectionForWorkspace(workspaceTodos, workspaceId, direct
 
   if (Array.isArray(byWorkspace)) {
     return byWorkspace.find((entry) => (
-      String(
-        entry?.workspaceId
-          || entry?.workspace_id
-          || entry?.observerWorkspaceId
-          || entry?.observer_workspace_id
-          || "",
-      ).trim() === safeWorkspaceId
+      workspaceTodoMirrorWorkspaceIds(entry).some((candidate) => (
+        normalizeTodoQueueWorkspaceMatchId(candidate, platform) === workspaceMatchId
+      ))
     )) || direct;
   }
 
   if (byWorkspace && typeof byWorkspace === "object") {
-    return byWorkspace[safeWorkspaceId] || byWorkspace[String(safeWorkspaceId).toLowerCase()] || direct;
+    const matchedKey = Object.keys(byWorkspace).find(
+      (key) => normalizeTodoQueueWorkspaceMatchId(key, platform) === workspaceMatchId,
+    );
+    return (matchedKey ? byWorkspace[matchedKey] : null) || direct;
   }
 
   return direct;
@@ -16894,8 +16928,13 @@ function findWorkspaceTodoForVoicePlanTask(workspaceTodos, workspaceId, planTask
   }) || null;
 }
 
-function normalizeWorkspaceTodoPeerActivityItems(workspaceTodos, workspaceId, deviceMap = new Map()) {
-  const activity = workspaceTodoPeerActivityForWorkspace(workspaceTodos, workspaceId);
+function normalizeWorkspaceTodoPeerActivityItems(
+  workspaceTodos,
+  workspaceId,
+  deviceMap = new Map(),
+  platform = "",
+) {
+  const activity = workspaceTodoPeerActivityForWorkspace(workspaceTodos, workspaceId, platform);
   const items = Array.isArray(activity?.items)
     ? activity.items
     : Array.isArray(activity)
@@ -17003,8 +17042,9 @@ function todoDeviceOptionRank(option, selectedOptionId = "", currentWorkspaceId 
     return 99;
   }
   const optionId = String(option.id || "");
-  const workspaceId = String(option.workspaceId || "").trim();
-  const currentId = String(currentWorkspaceId || "").trim();
+  const platform = option.platform || option.os || option.platformLabel || option.platform_label || "";
+  const workspaceId = normalizeTodoQueueWorkspaceMatchId(option.workspaceId, platform);
+  const currentId = normalizeTodoQueueWorkspaceMatchId(currentWorkspaceId, platform);
   if (optionId && optionId === selectedOptionId) return 0;
   if (option.isLocal && option.isCurrentWorkspace) return 1;
   if (option.isLocal && currentId && workspaceId === currentId) return 2;
@@ -19236,12 +19276,30 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     orchestratorPanelWorkspaceId,
   );
   const todoSelectionMobile = selectedTodoDevice?.deviceKind === TODO_QUEUE_DEVICE_KIND_MOBILE;
-  const displayedTodoQueueItems = useMemo(
-    () => (todoSelectionEditable ? normalizeTodoQueueItems(items) : []),
-    [items, todoSelectionEditable],
+  const displayedTodoSelection = useMemo(
+    () => buildTodoQueueDisplayedSelectionArrays({
+      editable: todoSelectionEditable,
+      items,
+      peerItems,
+      pendingItems,
+      selection: selectedTodoDevice,
+      workspaceTodos,
+    }),
+    [
+      items,
+      peerItems,
+      pendingItems,
+      selectedTodoDevice,
+      todoSelectionEditable,
+      workspaceTodos,
+    ],
   );
-  const displayedTodoQueuePendingItems = todoSelectionEditable ? pendingItems : {};
-  const workspaceTodoPeerItems = todoSelectionEditable && Array.isArray(peerItems) ? peerItems : [];
+  const displayedTodoQueueItems = useMemo(
+    () => normalizeTodoQueueItems(displayedTodoSelection.items),
+    [displayedTodoSelection.items],
+  );
+  const displayedTodoQueuePendingItems = displayedTodoSelection.pendingItems;
+  const workspaceTodoPeerItems = displayedTodoSelection.peerItems;
 
   const getOrchestratorVoiceControlRequest = useCallback(() => ({
     clientSessionId: orchestratorVoiceClientSessionIdRef.current,
@@ -24209,6 +24267,13 @@ function TerminalView({
   );
   const [cloudDesktopDeviceProfile, setCloudDesktopDeviceProfile] = useState(null);
   const [cloudDesktopDeviceId, setCloudDesktopDeviceId] = useState("");
+  const cloudDesktopDevicePlatform = String(
+    cloudDesktopDeviceProfile?.platform
+      || cloudDesktopDeviceProfile?.os
+      || cloudDesktopDeviceProfile?.operatingSystem
+      || cloudDesktopDeviceProfile?.operating_system
+      || "",
+  ).trim();
   todoQueueItemsRef.current = todoQueueItems;
   terminalBreakoutPhaseRef.current = terminalBreakoutPhase;
   terminalBreakoutDocumentWindowLayoutRef.current = terminalBreakoutDocumentWindowLayout;
@@ -24236,8 +24301,13 @@ function TerminalView({
     })
   ), [todoQueueItems, todoQueuePendingItems]);
   const workspaceTodoPeerItems = useMemo(
-    () => normalizeWorkspaceTodoPeerActivityItems(workspaceTodos, terminalWorkspace?.id, workspaceTodoDeviceMap),
-    [terminalWorkspace?.id, workspaceTodoDeviceMap, workspaceTodos],
+    () => normalizeWorkspaceTodoPeerActivityItems(
+      workspaceTodos,
+      terminalWorkspace?.id,
+      workspaceTodoDeviceMap,
+      cloudDesktopDevicePlatform,
+    ),
+    [cloudDesktopDevicePlatform, terminalWorkspace?.id, workspaceTodoDeviceMap, workspaceTodos],
   );
   const workspaceTodoDispatchTargets = useMemo(
     () => normalizeWorkspaceTodoDispatchTargets(workspaceTodos, terminalWorkspace?.id),
@@ -24394,7 +24464,12 @@ function TerminalView({
   const buildTodoQueueCloudSyncPayload = useCallback((items, options = {}) => {
     const pendingItems = options.pendingItems || todoQueuePendingItemsRef.current || {};
     const workspaceId = terminalWorkspace?.id || "";
-    const normalizedItems = normalizeTodoQueueItemsForWorkspace(items, workspaceId, cloudDesktopDeviceId);
+    const normalizedItems = normalizeTodoQueueItemsForWorkspace(
+      items,
+      workspaceId,
+      cloudDesktopDeviceId,
+      cloudDesktopDevicePlatform,
+    );
     const clearProviderSessionId = Boolean(
       options.clearProviderSessionId
         || options.reason === "provider_session_id_cleared",
@@ -24428,6 +24503,7 @@ function TerminalView({
     };
   }, [
     cloudDesktopDeviceId,
+    cloudDesktopDevicePlatform,
     getTodoQueueItemAgentSessionMetadataForSync,
     terminalWorkspace?.id,
   ]);
@@ -27153,6 +27229,7 @@ function TerminalView({
           currentItems.filter((item) => item.id !== itemId),
           terminalWorkspace?.id || "",
           cloudDesktopDeviceId,
+          cloudDesktopDevicePlatform,
         );
         logTerminalStatus("frontend.todo_queue.items_state", {
           nextItemCount: nextItems.length,
@@ -27274,6 +27351,7 @@ function TerminalView({
           )),
           terminalWorkspace?.id || "",
           cloudDesktopDeviceId,
+          cloudDesktopDevicePlatform,
         );
         syncTodoQueueItemsToCloud(nextItems, {
           force: true,
@@ -27328,6 +27406,7 @@ function TerminalView({
           )),
           terminalWorkspace?.id || "",
           cloudDesktopDeviceId,
+          cloudDesktopDevicePlatform,
         );
         syncTodoQueueItemsToCloud(nextItems, {
           force: true,
@@ -27413,6 +27492,7 @@ function TerminalView({
         )),
         terminalWorkspace?.id || "",
         cloudDesktopDeviceId,
+        cloudDesktopDevicePlatform,
       );
       syncTodoQueueItemsToCloud(nextItems, { reason: "todo_queue_requeued" });
       return nextItems;
@@ -27430,6 +27510,7 @@ function TerminalView({
   }, [
     recordTodoQueueRemoteCommandReceipt,
     cloudDesktopDeviceId,
+    cloudDesktopDevicePlatform,
     getTerminalPaneId,
     replaceTodoQueuePendingItems,
     syncTodoQueueItemsToCloud,
@@ -28169,9 +28250,15 @@ function TerminalView({
           .filter(Boolean);
         todoQueueTombstonedIdsRef.current = new Set(tombstonedIds);
         const persistedItems = normalizeTodoQueueItemsForWorkspace(
-          Array.isArray(snapshot?.items) ? snapshot.items : [],
+          buildTodoQueueHydratedSnapshotRows({
+            deviceId: cloudDesktopDeviceId,
+            platform: cloudDesktopDevicePlatform,
+            snapshot,
+            workspaceId,
+          }),
           workspaceId,
           cloudDesktopDeviceId,
+          cloudDesktopDevicePlatform,
         );
         const queuedPersistedItems = persistedItems.filter((item) => (
           getTodoQueueCanonicalLifecycleStatus(item) === "queued"
@@ -28201,6 +28288,7 @@ function TerminalView({
     };
   }, [
     cloudDesktopDeviceId,
+    cloudDesktopDevicePlatform,
     replaceTodoQueuePendingItems,
     terminalWorkspace?.id,
   ]);
@@ -31476,6 +31564,7 @@ function TerminalView({
         typeof updater === "function" ? updater(currentItems) : updater,
         terminalWorkspace?.id || "",
         cloudDesktopDeviceId,
+        cloudDesktopDevicePlatform,
       );
       const previousImageCount = currentItems.filter((item) => getTodoQueueItemImage(item)).length;
       const nextImageCount = nextItems.filter((item) => getTodoQueueItemImage(item)).length;
@@ -31505,7 +31594,12 @@ function TerminalView({
       }
       return nextItems;
     });
-  }, [cloudDesktopDeviceId, syncTodoQueueItemsToCloud, terminalWorkspace?.id]);
+  }, [
+    cloudDesktopDeviceId,
+    cloudDesktopDevicePlatform,
+    syncTodoQueueItemsToCloud,
+    terminalWorkspace?.id,
+  ]);
 
   useEffect(() => {
     if (!terminalWorkspace?.id || !cloudDesktopDeviceId) {
@@ -31533,9 +31627,15 @@ function TerminalView({
       .filter(Boolean);
     todoQueueTombstonedIdsRef.current = new Set(tombstonedIds);
     const persistedItems = normalizeTodoQueueItemsForWorkspace(
-      Array.isArray(snapshot?.items) ? snapshot.items : [],
+      buildTodoQueueHydratedSnapshotRows({
+        deviceId: cloudDesktopDeviceId,
+        platform: cloudDesktopDevicePlatform,
+        snapshot,
+        workspaceId: safeWorkspaceId,
+      }),
       safeWorkspaceId,
       cloudDesktopDeviceId,
+      cloudDesktopDevicePlatform,
     );
     const persistedPendingItems = buildTodoQueuePendingItemsFromPersistedQueue(
       persistedItems,
@@ -31563,6 +31663,7 @@ function TerminalView({
     return persistedItems;
   }, [
     cloudDesktopDeviceId,
+    cloudDesktopDevicePlatform,
     replaceTodoQueuePendingItems,
     terminalWorkspace?.id,
     updateTodoQueueItems,
@@ -36445,6 +36546,7 @@ function TerminalView({
         result?.items,
         terminalWorkspace?.id || "",
         cloudDesktopDeviceId,
+        cloudDesktopDevicePlatform,
       );
       if (!updatedItems.length) {
         return;
@@ -36455,6 +36557,7 @@ function TerminalView({
           [...currentItems.filter((item) => !updatedIds.has(item.id)), ...updatedItems],
           terminalWorkspace?.id || "",
           cloudDesktopDeviceId,
+          cloudDesktopDevicePlatform,
         );
       }, {
         force: true,
@@ -36467,6 +36570,7 @@ function TerminalView({
     });
   }, [
     cloudDesktopDeviceId,
+    cloudDesktopDevicePlatform,
     terminalWorkspace?.id,
     todoQueueItems,
     updateTodoQueueItems,

@@ -81,6 +81,9 @@ block2 = "0.6"
 windows-capture = "1.5.0"
 windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_SystemInformation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 
+[dev-dependencies]
+quick-xml = "0.39.3"
+
 [patch.crates-io]
 cidre = { path = "vendor/cidre" }
 portable-pty = { path = "vendor/portable-pty" }

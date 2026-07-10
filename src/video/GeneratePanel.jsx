@@ -1312,6 +1312,34 @@ export default function GeneratePanel({
     setHistoryOpen(false);
   }, [assets]);
 
+  const retryJob = useCallback(
+    (job) => {
+      if (!repoPath || !job?.request || !job?.providerId) {
+        return;
+      }
+      if (
+        job.state === "unknown-outcome" &&
+        !window.confirm(
+          "The provider may still be running the original paid job. Retrying can submit a duplicate paid request. Retry anyway?",
+        )
+      ) {
+        return;
+      }
+      setError("");
+      invoke("video_generate_start", {
+        repoPath,
+        request: {
+          ...job.request,
+          providerId: job.providerId,
+          auth: job.providerId === "cloud" ? null : videoProviderAuth(job.providerId),
+        },
+      })
+        .then(() => loadHistory())
+        .catch((err) => setError(String(err)));
+    },
+    [loadHistory, repoPath],
+  );
+
   // Keep params legal for the active model.
   useEffect(() => {
     if (!model) {
@@ -2090,8 +2118,8 @@ export default function GeneratePanel({
           ) : null}
           {!isCodeKind && !directRoute && estCredits != null ? (
             <>
-              <VideoHint title="Matches the cloud's reserve formula for this model — billed as Diff Forge credits. AI video generation is expensive; consider your own API keys for regular use.">
-                ≈ {estCredits.toLocaleString()} credits
+              <VideoHint title="Matches the cloud's reserve formula for this model. Credits are captured only for provider outputs the cloud validates. AI video generation is expensive; consider your own API keys for regular use.">
+                ≈ {estCredits.toLocaleString()} credits · validated provider outputs
               </VideoHint>
               {creditsRemaining != null ? (
                 <VideoHint
@@ -2298,6 +2326,8 @@ export default function GeneratePanel({
             displayJobs.map((job) => {
               const previewAsset = resolvePreviewAsset(job);
               const isCodeJob = job.providerId === "hyperframes" || job.request?.model === "hyperframes";
+              const recordedModelId = job.request?.model || job.model || "";
+              const modelRetired = !isCodeJob && Boolean(recordedModelId) && !getGenerationModel(recordedModelId);
               const isAuthoring = isCodeJob && !job.done && (job.state === "authoring" || !job.state);
               const status = job.error ? "error" : job.done ? "done" : isAuthoring ? "authoring" : "running";
               const promptText = job.request?.prompt || job.message || "";
@@ -2363,6 +2393,7 @@ export default function GeneratePanel({
                       </VideoProgressTrack>
                     ) : null}
                     {job.error ? <HistError>{job.error}</HistError> : null}
+                    {modelRetired ? <VideoHint>Model retired</VideoHint> : null}
                   </HistInfo>
                   <HistSide>
                     <HistStatus data-status={status}>
@@ -2416,6 +2447,20 @@ export default function GeneratePanel({
                         type="button"
                       >
                         ↺ Reuse
+                      </VideoSecondaryButton>
+                    ) : null}
+                    {status === "error" ? (
+                      <VideoSecondaryButton
+                        disabled={modelRetired}
+                        onClick={() => {
+                          if (!modelRetired) {
+                            retryJob(job);
+                          }
+                        }}
+                        title={modelRetired ? "Model retired — Retry is unavailable" : "Retry this recorded generation request"}
+                        type="button"
+                      >
+                        Retry
                       </VideoSecondaryButton>
                     ) : null}
                     {status === "error" ? (

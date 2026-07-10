@@ -924,6 +924,416 @@ fn terminal_agent_invocation(command_path: &str, args: &[String]) -> String {
     invocation
 }
 
+// cmd.exe rejects command lines at roughly 8191 UTF-16 code units. Keep
+// enough headroom for PowerShell/cmd quoting and the npm-generated Claude
+// launcher, which is commonly a .cmd shim on Windows.
+const WINDOWS_CLAUDE_LAUNCH_STAGE_THRESHOLD: usize = 7_000;
+// Native executables bypass cmd.exe and inherit CreateProcessW's roughly
+// 32,767 UTF-16-unit command-line ceiling. Preserve conservative headroom for
+// the PowerShell and portable-pty quoting layers.
+const WINDOWS_NATIVE_CLAUDE_LAUNCH_STAGE_THRESHOLD: usize = 30_000;
+const WINDOWS_CLAUDE_LAUNCH_STAGE_MAX_AGE: Duration = Duration::from_secs(10 * 60);
+const WINDOWS_CLAUDE_LAUNCH_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+fn windows_claude_launch_stage_directory() -> PathBuf {
+    env::temp_dir().join("diffforge-claude-launch")
+}
+
+fn windows_claude_launch_file_should_prune(modified_at: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(modified_at)
+        .is_ok_and(|age| age >= WINDOWS_CLAUDE_LAUNCH_STAGE_MAX_AGE)
+}
+
+fn prune_windows_claude_launch_stage_directory() {
+    let directory = windows_claude_launch_stage_directory();
+    let Ok(entries) = fs::read_dir(&directory) else {
+        return;
+    };
+    let now = SystemTime::now();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let should_prune = entry
+            .metadata()
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .and_then(|metadata| metadata.modified().ok())
+            .is_some_and(|modified_at| windows_claude_launch_file_should_prune(modified_at, now));
+        if should_prune {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    // Keep the shared empty directory: removing it can race another launch
+    // between its create_dir_all and create_new calls.
+}
+
+fn ensure_windows_claude_launch_cleanup_sweeper() {
+    static SWEEPER_STARTED: OnceLock<()> = OnceLock::new();
+    SWEEPER_STARTED.get_or_init(|| {
+        thread::spawn(|| loop {
+            thread::sleep(WINDOWS_CLAUDE_LAUNCH_SWEEP_INTERVAL);
+            prune_windows_claude_launch_stage_directory();
+        });
+    });
+}
+
+fn cleanup_windows_claude_launch_files(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = fs::remove_file(path);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowsClaudeLaunchFileCleanupPolicy {
+    Immediate,
+    AgeBasedSweep,
+}
+
+fn windows_claude_launch_file_cleanup_policy(
+    staging_failed: bool,
+) -> WindowsClaudeLaunchFileCleanupPolicy {
+    if staging_failed {
+        WindowsClaudeLaunchFileCleanupPolicy::Immediate
+    } else {
+        WindowsClaudeLaunchFileCleanupPolicy::AgeBasedSweep
+    }
+}
+
+fn windows_powershell_literal_command_line_len(value: &str) -> usize {
+    // PowerShell single-quoted literals wrap the value and escape each single
+    // quote by doubling it. portable-pty then quotes the complete -Command
+    // payload for CreateProcessW; count every embedded double quote and
+    // backslash as an extra code unit for a conservative upper bound on that
+    // second escaping layer.
+    2 + value.encode_utf16().count()
+        + value
+            .chars()
+            .filter(|ch| matches!(*ch, '\'' | '"' | '\\'))
+            .count()
+}
+
+fn windows_agent_launch_command_line_len(command_path: &str, args: &[String]) -> usize {
+    let powershell_prefix = "powershell.exe -NoLogo -NoExit -ExecutionPolicy Bypass -Command ";
+    let mut len = powershell_prefix.encode_utf16().count()
+        + 2 // quotes around the -Command payload
+        + 2 // `& `
+        + windows_powershell_literal_command_line_len(command_path)
+        + 1; // terminating NUL
+    for arg in args {
+        len += 1 + windows_powershell_literal_command_line_len(arg);
+    }
+    len
+}
+
+fn windows_agent_launch_command_line_bound(command_path: &str) -> usize {
+    let is_batch_shim = Path::new(command_path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+        });
+    if is_batch_shim {
+        WINDOWS_CLAUDE_LAUNCH_STAGE_THRESHOLD
+    } else {
+        WINDOWS_NATIVE_CLAUDE_LAUNCH_STAGE_THRESHOLD
+    }
+}
+
+fn windows_claude_launch_needs_file_staging(command_path: &str, args: &[String]) -> bool {
+    windows_agent_launch_command_line_len(command_path, args)
+        >= windows_agent_launch_command_line_bound(command_path)
+}
+
+fn windows_claude_inline_json(value: &str) -> bool {
+    let trimmed = value.trim();
+    matches!(trimmed.as_bytes().first(), Some(b'{') | Some(b'['))
+        && serde_json::from_str::<Value>(trimmed).is_ok()
+}
+
+fn write_windows_claude_launch_file(
+    kind: &str,
+    extension: &str,
+    contents: &str,
+) -> Result<PathBuf, String> {
+    let directory = windows_claude_launch_stage_directory();
+    fs::create_dir_all(&directory).map_err(|error| {
+        format!(
+            "Unable to prepare Claude launch staging directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    let path = directory.join(format!(
+        "{kind}-{}-{}.{}",
+        std::process::id(),
+        uuid::Uuid::new_v4(),
+        extension
+    ));
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // The production staging path is Windows-only, so this mode is a no-op
+        // there; staged files instead inherit the per-user ACLs on %TEMP%.
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).map_err(|error| {
+        format!(
+            "Unable to create Claude launch staging file {}: {error}",
+            path.display()
+        )
+    })?;
+    if let Err(error) = file.write_all(contents.as_bytes()) {
+        drop(file);
+        cleanup_windows_claude_launch_files(std::slice::from_ref(&path));
+        return Err(format!(
+            "Unable to write Claude launch staging file {}: {error}",
+            path.display()
+        ));
+    }
+    if let Err(error) = file.flush() {
+        drop(file);
+        cleanup_windows_claude_launch_files(std::slice::from_ref(&path));
+        return Err(format!(
+            "Unable to flush Claude launch staging file {}: {error}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn windows_claude_launch_file_spec(
+    option: &str,
+    value: &str,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    match option {
+        "--append-system-prompt" => {
+            Some(("--append-system-prompt-file", "append-system-prompt", "txt"))
+        }
+        "--system-prompt" => Some(("--system-prompt-file", "system-prompt", "txt")),
+        "--settings" if windows_claude_inline_json(value) => {
+            Some(("--settings", "settings", "json"))
+        }
+        "--mcp-config" if windows_claude_inline_json(value) => {
+            Some(("--mcp-config", "mcp-config", "json"))
+        }
+        _ => None,
+    }
+}
+
+fn windows_claude_inline_option(arg: &str) -> Option<(&'static str, &str)> {
+    for option in [
+        "--append-system-prompt",
+        "--system-prompt",
+        "--settings",
+        "--mcp-config",
+    ] {
+        if let Some(value) = arg.strip_prefix(&format!("{option}=")) {
+            return Some((option, value));
+        }
+    }
+    None
+}
+
+fn windows_claude_allowed_tools_inline_value(arg: &str) -> Option<&str> {
+    arg.strip_prefix("--allowedTools=")
+        .or_else(|| arg.strip_prefix("--allowed-tools="))
+}
+
+fn windows_claude_settings_value(value: Option<&str>) -> Result<Value, String> {
+    let Some(value) = value else {
+        return Ok(json!({}));
+    };
+    let body = if windows_claude_inline_json(value) {
+        value.to_string()
+    } else {
+        fs::read_to_string(value)
+            .map_err(|error| format!("Unable to read Claude settings {value}: {error}"))?
+    };
+    serde_json::from_str(&body)
+        .map_err(|error| format!("Unable to parse Claude settings for Windows staging: {error}"))
+}
+
+fn stage_windows_claude_allowed_tools_in_settings(
+    args: &[String],
+    staged_paths: &mut Vec<PathBuf>,
+) -> Result<Vec<String>, String> {
+    let mut retained = Vec::with_capacity(args.len());
+    let mut allowed_tools = Vec::new();
+    let mut settings_value = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--allowedTools" | "--allowed-tools" if index + 1 < args.len() => {
+                allowed_tools.push(args[index + 1].clone());
+                index += 2;
+            }
+            "--settings" if index + 1 < args.len() => {
+                settings_value = Some(args[index + 1].clone());
+                index += 2;
+            }
+            arg => {
+                if let Some(value) = windows_claude_allowed_tools_inline_value(arg) {
+                    allowed_tools.push(value.to_string());
+                } else if let Some(value) = arg.strip_prefix("--settings=") {
+                    settings_value = Some(value.to_string());
+                } else {
+                    retained.push(args[index].clone());
+                }
+                index += 1;
+            }
+        }
+    }
+
+    if allowed_tools.is_empty() {
+        return Ok(args.to_vec());
+    }
+
+    let mut settings = windows_claude_settings_value(settings_value.as_deref())?;
+    let settings_object = settings
+        .as_object_mut()
+        .ok_or_else(|| "Claude settings must be a JSON object for Windows staging.".to_string())?;
+    let permissions = settings_object
+        .entry("permissions".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| {
+            "Claude settings permissions must be a JSON object for Windows staging.".to_string()
+        })?;
+    let allow = permissions
+        .entry("allow".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| {
+            "Claude settings permissions.allow must be an array for Windows staging.".to_string()
+        })?;
+    let mut seen = allow
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    for tool in allowed_tools
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if seen.insert(tool.to_string()) {
+            allow.push(Value::String(tool.to_string()));
+        }
+    }
+
+    let serialized = serde_json::to_string(&settings)
+        .map_err(|error| format!("Unable to serialize staged Claude settings: {error}"))?;
+    let staged_path = write_windows_claude_launch_file("settings", "json", &serialized)?;
+    staged_paths.push(staged_path.clone());
+    if let Some(previous_path) = settings_value
+        .as_deref()
+        .map(Path::new)
+        .filter(|previous_path| previous_path.starts_with(windows_claude_launch_stage_directory()))
+    {
+        let _ = fs::remove_file(previous_path);
+    }
+    retained.push("--settings".to_string());
+    retained.push(staged_path.to_string_lossy().to_string());
+    Ok(retained)
+}
+
+fn stage_windows_claude_launch_args(
+    command_path: &str,
+    args: &[String],
+) -> Result<Vec<String>, String> {
+    let mut staged_paths = Vec::new();
+    let result = (|| {
+        let command_line_bound = windows_agent_launch_command_line_bound(command_path);
+        if windows_agent_launch_command_line_len(command_path, args) < command_line_bound {
+            return Ok(args.to_vec());
+        }
+
+        let mut staged_args = Vec::with_capacity(args.len());
+        let mut index = 0usize;
+        while index < args.len() {
+            let option = args[index].as_str();
+            if let Some(value) = args.get(index + 1) {
+                if let Some((file_option, kind, extension)) =
+                    windows_claude_launch_file_spec(option, value)
+                {
+                    let path = write_windows_claude_launch_file(kind, extension, value)?;
+                    staged_paths.push(path.clone());
+                    staged_args.push(file_option.to_string());
+                    staged_args.push(path.to_string_lossy().to_string());
+                    index += 2;
+                    continue;
+                }
+            }
+
+            if let Some((inline_option, value)) = windows_claude_inline_option(option) {
+                if let Some((file_option, kind, extension)) =
+                    windows_claude_launch_file_spec(inline_option, value)
+                {
+                    let path = write_windows_claude_launch_file(kind, extension, value)?;
+                    staged_paths.push(path.clone());
+                    staged_args.push(file_option.to_string());
+                    staged_args.push(path.to_string_lossy().to_string());
+                    index += 1;
+                    continue;
+                }
+            }
+
+            staged_args.push(args[index].clone());
+            index += 1;
+        }
+
+        let mut staged_len = windows_agent_launch_command_line_len(command_path, &staged_args);
+        if staged_len >= command_line_bound {
+            staged_args =
+                stage_windows_claude_allowed_tools_in_settings(&staged_args, &mut staged_paths)?;
+            staged_len = windows_agent_launch_command_line_len(command_path, &staged_args);
+        }
+        if staged_len >= command_line_bound {
+            return Err(format!(
+                "Claude Code launch remains too long for Windows after staging file-backed settings, allowed tools, MCP config, and system prompts ({staged_len} characters; limit {command_line_bound})."
+            ));
+        }
+
+        Ok(staged_args)
+    })();
+
+    match windows_claude_launch_file_cleanup_policy(result.is_err()) {
+        WindowsClaudeLaunchFileCleanupPolicy::Immediate => {
+            cleanup_windows_claude_launch_files(&staged_paths);
+        }
+        WindowsClaudeLaunchFileCleanupPolicy::AgeBasedSweep => {
+            if cfg!(windows) && !staged_paths.is_empty() {
+                // Successful staging transfers ownership exclusively to the
+                // conservative age-based sweep. Later writer/spawn completion
+                // must not delete files Claude may not have opened yet.
+                ensure_windows_claude_launch_cleanup_sweeper();
+            }
+        }
+    }
+    result
+}
+
+fn prepare_terminal_agent_launch_args_for_platform(
+    provider_id: &str,
+    command_path: &str,
+    args: &[String],
+) -> Result<Vec<String>, String> {
+    if cfg!(windows) && provider_id.to_ascii_lowercase().contains("claude") {
+        // Prune before every Claude launch, while preserving files recent
+        // enough that another concurrent launch may not have consumed them.
+        prune_windows_claude_launch_stage_directory();
+        if windows_claude_launch_needs_file_staging(command_path, args) {
+            return stage_windows_claude_launch_args(command_path, args);
+        }
+    }
+
+    Ok(args.to_vec())
+}
+
 #[cfg(windows)]
 fn terminal_agent_launch_command(
     command_path: &str,
@@ -4051,6 +4461,265 @@ mod terminal_cli_tests {
     use super::*;
 
     #[test]
+    fn windows_claude_staging_prunes_only_files_at_or_beyond_max_age() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let just_recent = now - WINDOWS_CLAUDE_LAUNCH_STAGE_MAX_AGE + Duration::from_secs(1);
+        let exactly_stale = now - WINDOWS_CLAUDE_LAUNCH_STAGE_MAX_AGE;
+
+        assert!(!windows_claude_launch_file_should_prune(just_recent, now));
+        assert!(windows_claude_launch_file_should_prune(exactly_stale, now));
+        assert!(!windows_claude_launch_file_should_prune(
+            now + Duration::from_secs(1),
+            now
+        ));
+    }
+
+    #[test]
+    fn windows_claude_staging_failure_cleans_files_from_attempt() {
+        let command_path = r"C:\Users\tester\AppData\Roaming\npm\claude.cmd";
+        let marker = format!("diffforge-stage-failure-{}", uuid::Uuid::new_v4());
+        let args = vec![
+            "--append-system-prompt".to_string(),
+            format!("{marker}{}", "p".repeat(8_000)),
+            "--model".to_string(),
+            "m".repeat(8_000),
+        ];
+
+        let result = stage_windows_claude_launch_args(command_path, &args);
+        assert!(result.is_err());
+
+        let leaked = fs::read_dir(windows_claude_launch_stage_directory())
+            .ok()
+            .is_some_and(|entries| {
+                entries.flatten().any(|entry| {
+                    fs::read_to_string(entry.path())
+                        .is_ok_and(|contents| contents.contains(&marker))
+                })
+            });
+        assert!(
+            !leaked,
+            "failed staging left its payload in the temp directory"
+        );
+    }
+
+    #[test]
+    fn windows_claude_launch_staging_policy_uses_resolved_shim_type() {
+        let batch_command_path = r"C:\Users\tester\AppData\Roaming\npm\claude.cmd";
+        let native_command_path = r"C:\Program Files\Claude\claude.exe";
+        assert_eq!(
+            windows_agent_launch_command_line_bound(batch_command_path),
+            WINDOWS_CLAUDE_LAUNCH_STAGE_THRESHOLD
+        );
+        assert_eq!(
+            windows_agent_launch_command_line_bound(r"C:\tools\CLAUDE.BAT"),
+            WINDOWS_CLAUDE_LAUNCH_STAGE_THRESHOLD
+        );
+        assert_eq!(
+            windows_agent_launch_command_line_bound(native_command_path),
+            WINDOWS_NATIVE_CLAUDE_LAUNCH_STAGE_THRESHOLD
+        );
+
+        let short_args = vec!["--model".to_string(), "sonnet".to_string()];
+        assert!(!windows_claude_launch_needs_file_staging(
+            batch_command_path,
+            &short_args
+        ));
+        assert_eq!(
+            stage_windows_claude_launch_args(batch_command_path, &short_args).unwrap(),
+            short_args
+        );
+
+        let fixed_len = windows_agent_launch_command_line_len(
+            batch_command_path,
+            &["--append-system-prompt".to_string(), String::new()],
+        );
+        let batch_threshold_args = vec![
+            "--append-system-prompt".to_string(),
+            "x".repeat(WINDOWS_CLAUDE_LAUNCH_STAGE_THRESHOLD.saturating_sub(fixed_len)),
+        ];
+        assert_eq!(
+            windows_agent_launch_command_line_len(batch_command_path, &batch_threshold_args),
+            WINDOWS_CLAUDE_LAUNCH_STAGE_THRESHOLD
+        );
+        assert!(windows_claude_launch_needs_file_staging(
+            batch_command_path,
+            &batch_threshold_args
+        ));
+        assert!(!windows_claude_launch_needs_file_staging(
+            native_command_path,
+            &batch_threshold_args
+        ));
+        assert_eq!(
+            stage_windows_claude_launch_args(native_command_path, &batch_threshold_args).unwrap(),
+            batch_threshold_args
+        );
+
+        let native_fixed_len = windows_agent_launch_command_line_len(
+            native_command_path,
+            &["--append-system-prompt".to_string(), String::new()],
+        );
+        let native_oversized_args = vec![
+            "--append-system-prompt".to_string(),
+            "n".repeat(
+                WINDOWS_NATIVE_CLAUDE_LAUNCH_STAGE_THRESHOLD
+                    .saturating_sub(native_fixed_len)
+                    .saturating_add(1),
+            ),
+        ];
+        assert!(windows_claude_launch_needs_file_staging(
+            native_command_path,
+            &native_oversized_args
+        ));
+        let staged_native =
+            stage_windows_claude_launch_args(native_command_path, &native_oversized_args).unwrap();
+        assert!(
+            windows_agent_launch_command_line_len(native_command_path, &staged_native)
+                < WINDOWS_NATIVE_CLAUDE_LAUNCH_STAGE_THRESHOLD
+        );
+        let staged_native_path = staged_native
+            .windows(2)
+            .find_map(|pair| {
+                (pair[0] == "--append-system-prompt-file").then_some(PathBuf::from(&pair[1]))
+            })
+            .expect("native launch should stage its system prompt");
+        cleanup_windows_claude_launch_files(std::slice::from_ref(&staged_native_path));
+
+        let native_unstageable_args = vec![
+            "--model".to_string(),
+            "m".repeat(WINDOWS_NATIVE_CLAUDE_LAUNCH_STAGE_THRESHOLD),
+        ];
+        let error = stage_windows_claude_launch_args(
+            native_command_path,
+            &native_unstageable_args,
+        )
+        .expect_err("non-file-backed native launch should remain over the native bound");
+        assert!(error.contains(&format!(
+            "limit {WINDOWS_NATIVE_CLAUDE_LAUNCH_STAGE_THRESHOLD}"
+        )));
+    }
+
+    #[test]
+    fn windows_claude_successfully_staged_files_use_only_age_based_cleanup() {
+        assert_eq!(
+            windows_claude_launch_file_cleanup_policy(false),
+            WindowsClaudeLaunchFileCleanupPolicy::AgeBasedSweep
+        );
+        assert_eq!(
+            windows_claude_launch_file_cleanup_policy(true),
+            WindowsClaudeLaunchFileCleanupPolicy::Immediate
+        );
+    }
+
+    #[test]
+    fn windows_claude_long_launch_uses_file_backed_payloads_below_cmd_limit() {
+        let command_path = r"C:\Users\tester\AppData\Roaming\npm\claude.cmd";
+        let settings = json!({
+            "hooks": {
+                "Stop": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "powershell.exe -NoProfile -File activity-hook.ps1",
+                        "timeout": 5
+                    }]
+                }]
+            },
+            "permissions": { "allow": ["Read", "Write(C:/work/**)"] },
+            "padding": "s".repeat(8_000)
+        })
+        .to_string();
+        let mcp_config = json!({
+            "mcpServers": {
+                "coordination-kernel": {
+                    "command": "diff-forge.exe",
+                    "args": ["--coordination-mcp", "--repo-path", r"C:\work"]
+                }
+            }
+        })
+        .to_string();
+        let mut allowed_tool_entries = APP_CONTROL_MCP_TOOL_NAMES
+            .iter()
+            .map(|tool| format!("mcp__{APP_CONTROL_MCP_SERVER_NAME}__{tool}"))
+            .collect::<Vec<_>>();
+        allowed_tool_entries.extend((0..160).map(|index| {
+            format!(
+                "mcp__diffforge-app-control__long_windows_tool_{index}_{}",
+                "x".repeat(32)
+            )
+        }));
+        let allowed_tools = allowed_tool_entries.join(",");
+        let args = vec![
+            "--settings".to_string(),
+            settings.clone(),
+            "--append-system-prompt".to_string(),
+            APP_CONTROL_ORCHESTRATOR_SYSTEM_PROMPT.to_string(),
+            "--mcp-config".to_string(),
+            mcp_config.clone(),
+            "--allowedTools".to_string(),
+            allowed_tools.clone(),
+        ];
+
+        assert!(windows_claude_launch_needs_file_staging(
+            command_path,
+            &args
+        ));
+        let staged = stage_windows_claude_launch_args(command_path, &args).unwrap();
+        assert!(
+            windows_agent_launch_command_line_len(command_path, &staged)
+                < WINDOWS_CLAUDE_LAUNCH_STAGE_THRESHOLD
+        );
+        assert!(!staged
+            .iter()
+            .any(|arg| arg == "--allowedTools" || arg == "--allowed-tools"));
+        assert!(!staged.iter().any(|arg| arg == "--append-system-prompt"));
+
+        let settings_path = staged
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--settings").then_some(PathBuf::from(&pair[1])))
+            .unwrap();
+        let prompt_path = staged
+            .windows(2)
+            .find_map(|pair| {
+                (pair[0] == "--append-system-prompt-file").then_some(PathBuf::from(&pair[1]))
+            })
+            .unwrap();
+        let mcp_path = staged
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--mcp-config").then_some(PathBuf::from(&pair[1])))
+            .unwrap();
+
+        let staged_settings: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            staged_settings["hooks"]["Stop"][0]["hooks"][0]["command"].as_str(),
+            Some("powershell.exe -NoProfile -File activity-hook.ps1")
+        );
+        assert_eq!(
+            staged_settings["padding"].as_str().map(str::len),
+            Some(8_000)
+        );
+        let staged_allow = staged_settings["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<HashSet<_>>();
+        assert!(allowed_tool_entries
+            .iter()
+            .all(|tool| staged_allow.contains(tool.as_str())));
+        assert!(staged_allow.contains("Read"));
+        assert!(staged_allow.contains("Write(C:/work/**)"));
+        assert_eq!(
+            fs::read_to_string(&prompt_path).unwrap(),
+            APP_CONTROL_ORCHESTRATOR_SYSTEM_PROMPT
+        );
+        assert_eq!(fs::read_to_string(&mcp_path).unwrap(), mcp_config);
+
+        let _ = fs::remove_file(settings_path);
+        let _ = fs::remove_file(prompt_path);
+        let _ = fs::remove_file(mcp_path);
+    }
+
+    #[test]
     fn opencode_image_support_prefers_vision_over_text_only_family() {
         // Vision variants of otherwise text-only families are image-capable.
         assert_eq!(
@@ -4471,7 +5140,7 @@ mod terminal_cli_tests {
         );
         assert_eq!(
             oversized_result.failed[0].reason,
-            "Images must be 5 MB or smaller."
+            "Images must be 10 MiB or smaller."
         );
 
         let total = (0..5)
@@ -4677,7 +5346,9 @@ mod terminal_cli_tests {
         assert!(prompt.contains("list_scripts"));
         assert!(prompt.contains("modify this selection"));
         assert!(prompt.contains("update_selected_document"));
-        assert!(prompt.contains("When a Loopspace should send a message to the terminal orchestrator"));
+        assert!(
+            prompt.contains("When a Loopspace should send a message to the terminal orchestrator")
+        );
         assert!(prompt.contains("send_message action region"));
         assert!(prompt.contains("dispatch_todos action region"));
         assert!(prompt.contains("loopspace_run_context"));
@@ -4743,7 +5414,9 @@ mod terminal_cli_tests {
         assert!(prompt.contains("save_doc"));
         assert!(prompt.contains("list_scripts"));
         assert!(prompt.contains("update_selected_document"));
-        assert!(prompt.contains("When a Loopspace should send a message to the terminal orchestrator"));
+        assert!(
+            prompt.contains("When a Loopspace should send a message to the terminal orchestrator")
+        );
         assert!(prompt.contains("send_message action region"));
         assert!(prompt.contains("dispatch_todos action region"));
         assert!(prompt.contains("loopspace_run_context"));
@@ -6506,6 +7179,10 @@ fn create_agent_terminal_pty(
         command.env(key, value);
     }
 
+    // `spawn_terminal_pty` can fail while acquiring the reader/writer after
+    // the child process has already started, so no post-spawn result is safe
+    // evidence that staged Claude files are unconsumed. The age-based sweeper
+    // owns every successfully staged file.
     spawn_terminal_pty(size, command, "agent terminal")
 }
 
@@ -7755,6 +8432,14 @@ struct ChatAttachmentDownload {
     content_type: String,
 }
 
+#[derive(Clone, Debug)]
+struct ChatAttachmentPushImage {
+    name: String,
+    mime: String,
+    sha256: String,
+    bytes: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatAttachmentStageFailure {
@@ -7801,6 +8486,13 @@ fn sanitized_chat_attachment_id(value: &str) -> String {
         .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
         .take(96)
         .collect()
+}
+
+fn chat_attachment_is_websocket_id(value: &str) -> bool {
+    value
+        .trim()
+        .strip_prefix("ws-")
+        .is_some_and(|sha| sha.len() == 64 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 fn normalized_chat_attachment_sha(value: &str) -> String {
@@ -8117,7 +8809,7 @@ fn validate_chat_attachment_ref(
         return Err("Images must be PNG, JPEG, WebP, or GIF.".to_string());
     }
     if attachment.bytes == 0 || attachment.bytes as usize > MAX_FORGE_IMAGE_BYTES {
-        return Err("Images must be 5 MB or smaller.".to_string());
+        return Err("Images must be 10 MiB or smaller.".to_string());
     }
     let file_name = chat_attachment_file_name(attachment, fallback_index);
     Ok((attachment_id, sha, file_name))
@@ -8133,7 +8825,7 @@ fn verify_chat_attachment_download(
         return Err("Downloaded attachment size did not match.".to_string());
     }
     if download.bytes.is_empty() || download.bytes.len() > MAX_FORGE_IMAGE_BYTES {
-        return Err("Images must be 5 MB or smaller.".to_string());
+        return Err("Images must be 10 MiB or smaller.".to_string());
     }
     let actual_sha = chat_attachment_sha256_hex(&download.bytes);
     if actual_sha != expected_sha {
@@ -8316,7 +9008,9 @@ where
 
         if let Some(staged) = find_staged_chat_attachment(attachment, index, use_verify_cache) {
             result.staged.push(attachment_id.clone());
-            ack_ids.push(attachment_id);
+            if !chat_attachment_is_websocket_id(&attachment_id) {
+                ack_ids.push(attachment_id);
+            }
             result
                 .attachments
                 .push(saved_todo_image_from_staged(&staged));
@@ -8362,7 +9056,9 @@ where
             index.insert(sha, staged.clone());
         }
         result.staged.push(attachment_id.clone());
-        ack_ids.push(attachment_id);
+        if !chat_attachment_is_websocket_id(&attachment_id) {
+            ack_ids.push(attachment_id);
+        }
         result
             .attachments
             .push(saved_todo_image_from_staged(&staged));
@@ -8391,6 +9087,62 @@ where
     result
 }
 
+fn stage_chat_attachment_push_images(
+    workspace_id: &str,
+    images: Vec<ChatAttachmentPushImage>,
+) -> Result<ChatAttachmentStageResult, String> {
+    let mut downloads = images
+        .iter()
+        .map(|image| {
+            (
+                normalized_chat_attachment_sha(&image.sha256),
+                ChatAttachmentDownload {
+                    bytes: image.bytes.clone(),
+                    content_type: normalized_chat_attachment_mime(&image.mime),
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let attachments = images
+        .into_iter()
+        .map(|image| {
+            let sha256 = normalized_chat_attachment_sha(&image.sha256);
+            ChatAttachmentRef {
+                attachment_id: format!("ws-{sha256}"),
+                sha256,
+                bytes: image.bytes.len() as u64,
+                mime: normalized_chat_attachment_mime(&image.mime),
+                name: image.name,
+            }
+        })
+        .collect::<Vec<_>>();
+    let result = stage_chat_attachment_refs_with_cache_mode(
+        ChatAttachmentStageRequest {
+            workspace_id: workspace_id.trim().to_string(),
+            attachments,
+            ack_cloud: false,
+            marker_start_index: 0,
+        },
+        &mut |attachment: &ChatAttachmentRef| {
+            downloads
+                .remove(&normalized_chat_attachment_sha(&attachment.sha256))
+                .ok_or_else(|| "Inline websocket attachment bytes are unavailable.".to_string())
+        },
+        false,
+        false,
+    );
+    if result.failed.is_empty() {
+        Ok(result)
+    } else {
+        Err(result
+            .failed
+            .iter()
+            .map(|failure| format!("{}: {}", failure.name, failure.reason))
+            .collect::<Vec<_>>()
+            .join("; "))
+    }
+}
+
 fn stage_chat_attachment_refs_for(
     request: ChatAttachmentStageRequest,
 ) -> ChatAttachmentStageResult {
@@ -8399,6 +9151,11 @@ fn stage_chat_attachment_refs_for(
         request,
         &mut |attachment: &ChatAttachmentRef| {
             let attachment_id = sanitized_chat_attachment_id(&attachment.attachment_id);
+            if chat_attachment_is_websocket_id(&attachment_id) {
+                return Err(
+                    "Websocket-staged attachment is unavailable on this device.".to_string(),
+                );
+            }
             cloud_mcp_download_chat_attachment_blocking(&attachment_id)
         },
         ack_cloud,
@@ -8414,6 +9171,11 @@ fn stage_chat_attachment_refs_for_dispatch(
         request,
         &mut |attachment: &ChatAttachmentRef| {
             let attachment_id = sanitized_chat_attachment_id(&attachment.attachment_id);
+            if chat_attachment_is_websocket_id(&attachment_id) {
+                return Err(
+                    "Websocket-staged attachment is unavailable on this device.".to_string(),
+                );
+            }
             cloud_mcp_download_chat_attachment_blocking(&attachment_id)
         },
         ack_cloud,

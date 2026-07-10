@@ -684,6 +684,7 @@ async fn video_describe_worker(
     repo_path: String,
     path: String,
     force: bool,
+    auto_describe: bool,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     dedupe_key: String,
 ) {
@@ -777,6 +778,7 @@ async fn video_describe_worker(
             "fileName": file_name,
             "width": width,
             "height": height,
+            "autoDescribe": auto_describe,
         });
         video_emit_describe_progress(
             &app,
@@ -836,6 +838,7 @@ async fn video_describe_start(
     repo_path: String,
     path: String,
     force: Option<bool>,
+    auto_describe: Option<bool>,
 ) -> Result<VideoJobStartResult, String> {
     let dedupe_key = format!("{}|{}", repo_path.trim(), path.trim());
     video_describe_claim_path(&dedupe_key)?;
@@ -853,6 +856,7 @@ async fn video_describe_start(
         repo_path,
         path,
         force.unwrap_or(false),
+        auto_describe.unwrap_or(false),
         cancel,
         dedupe_key,
     ));

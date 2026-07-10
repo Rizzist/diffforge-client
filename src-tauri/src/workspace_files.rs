@@ -1383,6 +1383,17 @@ fn is_windows_system_startup_directory(directory: &Path) -> bool {
 }
 
 fn resolve_workspace_root_directory(value: Option<&str>) -> Result<PathBuf, String> {
+    resolve_working_directory(value, true)
+}
+
+fn resolve_app_control_terminal_working_directory(value: Option<&str>) -> Result<PathBuf, String> {
+    resolve_working_directory(value, false)
+}
+
+fn resolve_working_directory(
+    value: Option<&str>,
+    enforce_workspace_root_policy: bool,
+) -> Result<PathBuf, String> {
     let Some(value) = value else {
         return default_working_directory();
     };
@@ -1422,8 +1433,10 @@ fn resolve_workspace_root_directory(value: Option<&str>) -> Result<PathBuf, Stri
         return Err("Workspace root directory must be an existing directory.".to_string());
     }
 
-    if let Some(reason) = workspace_root_rejection_reason(&canonical) {
-        return Err(reason.to_string());
+    if enforce_workspace_root_policy {
+        if let Some(reason) = workspace_root_rejection_reason(&canonical) {
+            return Err(reason.to_string());
+        }
     }
 
     Ok(canonical)
@@ -2876,6 +2889,22 @@ mod workspace_files_tests {
         assert!(error.contains("too broad"));
 
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn app_control_terminal_allows_user_home_while_workspace_terminal_rejects_it() {
+        let home = user_home_dir().expect("test user home should be available");
+        let home_text = home.to_string_lossy().to_string();
+
+        assert!(resolve_workspace_root_directory(Some(&home_text)).is_err());
+
+        let orchestrator_directory =
+            resolve_app_control_terminal_working_directory(Some(&home_text)).unwrap();
+        let expected_home = home.canonicalize().unwrap_or(home);
+        assert_eq!(
+            normalized_path_key(&orchestrator_directory),
+            normalized_path_key(&expected_home)
+        );
     }
 
     #[test]

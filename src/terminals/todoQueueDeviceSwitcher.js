@@ -210,11 +210,83 @@ function firstText(...values) {
 }
 
 export function normalizeTodoQueueSwitcherId(value) {
-  return String(value || "").trim().toLowerCase();
+  const trimmed = String(value || "").trim();
+  if (!trimmed) return "";
+  const cleaned = [...trimmed]
+    .map((character) => (/[A-Za-z0-9._-]/.test(character) ? character : "_"))
+    .join("")
+    .replace(/^[._-]+|[._-]+$/g, "")
+    .slice(0, 96)
+    .toLowerCase();
+  return cleaned || "dev-client";
 }
 
 function normalizeWorkspaceId(value) {
   return String(value || "").trim();
+}
+
+// Workspace ids are usually absolute paths. Keep the original spelling for commands and
+// display, but use one path-aware key whenever ids are compared. Windows can report the
+// same workspace with either slash style, a differently-cased drive letter/path, or the
+// extended-length path prefix depending on which runtime produced the row.
+function todoQueuePlatformIsWindows(platform) {
+  const normalized = String(platform || "").trim().toLowerCase();
+  return ["windows", "win32", "win64"].includes(normalized) || normalized.startsWith("windows ");
+}
+
+export function normalizeTodoQueueWorkspaceMatchId(value, platform = "") {
+  const raw = normalizeWorkspaceId(value);
+  const windowsPath = todoQueuePlatformIsWindows(platform);
+  let normalized = windowsPath ? raw.replace(/\\/g, "/") : raw;
+  if (!normalized) {
+    return "";
+  }
+  if (windowsPath) {
+    normalized = normalized
+      .replace(/^\/\/\?\//, "")
+      .replace(/^unc\//i, "//")
+      .replace(/^\/([a-z]:\/)/i, "$1")
+      .replace(/\/{2,}/g, "/");
+  }
+  if (normalized.length > 1 && !/^[a-z]:\/$/i.test(normalized)) {
+    normalized = normalized.replace(/\/+$/, "");
+  }
+  return windowsPath ? normalized.toLowerCase() : normalized;
+}
+
+// Production todo_store_snapshot hydration gate. It deliberately receives the
+// owning device platform; a Windows catalog can otherwise lose its own rows
+// when Rust and the webview spell the same path with different slash/case.
+export function buildTodoQueueHydratedSnapshotRows({
+  deviceId = "",
+  platform = "",
+  snapshot = null,
+  workspaceId = "",
+} = {}) {
+  const safeWorkspaceId = normalizeWorkspaceId(workspaceId);
+  const workspaceMatchId = normalizeTodoQueueWorkspaceMatchId(safeWorkspaceId, platform);
+  const safeDeviceId = normalizeTodoQueueSwitcherId(deviceId);
+  const items = Array.isArray(snapshot?.items) ? snapshot.items : [];
+  return items
+    .filter((item) => {
+      const itemWorkspaceId = normalizeWorkspaceId(item?.workspaceId || item?.workspace_id);
+      return !workspaceMatchId
+        || !itemWorkspaceId
+        || normalizeTodoQueueWorkspaceMatchId(itemWorkspaceId, platform) === workspaceMatchId;
+    })
+    .map((item) => ({
+      ...item,
+      ...(
+        safeDeviceId && !normalizeTodoQueueSwitcherId(item?.deviceId || item?.device_id)
+          ? { deviceId: safeDeviceId }
+          : {}
+      ),
+      ...(
+        safeWorkspaceId && !normalizeWorkspaceId(item?.workspaceId || item?.workspace_id)
+          ? { workspaceId: safeWorkspaceId }
+          : {}
+      ),
+    }));
 }
 
 function normalizeLiveBoolean(value) {
@@ -801,6 +873,59 @@ function workspaceIdForRecord(record, fallback = "") {
   return "";
 }
 
+function todoMirrorWorkspaceIdsForRecord(record, fallback = "") {
+  const values = [
+    record?.targetWorkspaceId,
+    record?.target_workspace_id,
+    record?.target?.workspaceId,
+    record?.target?.workspace_id,
+    record?.workspaceId,
+    record?.workspace_id,
+    record?.sourceWorkspaceId,
+    record?.source_workspace_id,
+    record?.todoWorkspaceId,
+    record?.todo_workspace_id,
+    record?.requestedByWorkspaceId,
+    record?.requested_by_workspace_id,
+    record?.originWorkspaceId,
+    record?.origin_workspace_id,
+    record?.origin?.workspaceId,
+    record?.origin?.workspace_id,
+  ]
+    .map(normalizeWorkspaceId)
+    .filter(Boolean);
+  if (!values.length && fallback) {
+    values.push(normalizeWorkspaceId(fallback));
+  }
+  return Array.from(new Set(values));
+}
+
+function todoMirrorDeviceIdsForRecord(record) {
+  const values = [
+    record?.targetDeviceId,
+    record?.target_device_id,
+    record?.target?.deviceId,
+    record?.target?.device_id,
+    record?.deviceId,
+    record?.device_id,
+    record?.machineId,
+    record?.machine_id,
+    record?.sourceDeviceId,
+    record?.source_device_id,
+    record?.todoDeviceId,
+    record?.todo_device_id,
+    record?.requestedByDeviceId,
+    record?.requested_by_device_id,
+    record?.originDeviceId,
+    record?.origin_device_id,
+    record?.origin?.deviceId,
+    record?.origin?.device_id,
+  ]
+    .map(normalizeTodoQueueSwitcherId)
+    .filter(Boolean);
+  return Array.from(new Set(values));
+}
+
 function workspaceNameForRecord(record, fallback = "") {
   return firstText(
     record?.sourceWorkspaceName,
@@ -1082,10 +1207,12 @@ function shouldPreferDeviceKey(candidateId, currentId, previous = null, next = n
 function addWorkspace(workspacesByDevice, entry) {
   const deviceId = normalizeTodoQueueSwitcherId(entry?.deviceId);
   const workspaceId = normalizeWorkspaceId(entry?.workspaceId);
-  if (!deviceId || !workspaceId) {
+  const workspacePlatform = firstText(entry?.platform, entry?.os, entry?.platformLabel, entry?.platform_label);
+  const workspaceMatchId = normalizeTodoQueueWorkspaceMatchId(workspaceId, workspacePlatform);
+  if (!deviceId || !workspaceId || !workspaceMatchId) {
     return;
   }
-  const key = `${deviceId}::${workspaceId}`;
+  const key = `${deviceId}::${workspaceMatchId}`;
   const previous = workspacesByDevice.get(key) || {};
   workspacesByDevice.set(key, {
     ...previous,
@@ -1494,6 +1621,7 @@ function collectLiveStateEntries(value, result, inheritedDevice = null, depth = 
       deviceAliases: currentDevice.deviceAliases,
       deviceKind: currentDevice.deviceKind,
       deviceName: currentDevice.deviceName,
+      platformLabel: currentDevice.platformLabel,
       workspaceId,
       workspaceName: workspaceNameForRecord(value, workspaceId),
       ...workspaceGraphDetailsForRecord(value),
@@ -1569,9 +1697,14 @@ function collectWorkspaceTodoOptionEntries(value, entries, inheritedWorkspaceId 
   });
 }
 
-function selectionIdFor({ deviceId, workspaceId = "", deviceKind = TODO_QUEUE_DEVICE_KIND_UNKNOWN }) {
+function selectionIdFor({
+  deviceId,
+  workspaceId = "",
+  deviceKind = TODO_QUEUE_DEVICE_KIND_UNKNOWN,
+  platform = "",
+}) {
   const safeDeviceId = normalizeTodoQueueSwitcherId(deviceId) || "device";
-  const safeWorkspaceId = normalizeWorkspaceId(workspaceId);
+  const safeWorkspaceId = normalizeTodoQueueWorkspaceMatchId(workspaceId, platform);
   return safeWorkspaceId
     ? `${safeDeviceId}::${safeWorkspaceId}`
     : `${safeDeviceId}::${deviceKind}`;
@@ -1618,15 +1751,21 @@ export function buildTodoQueueDeviceWorkspaceOptions({
     serverSeen: false,
     webConnected: null,
   };
+  const currentWorkspaceMatchId = normalizeTodoQueueWorkspaceMatchId(
+    safeCurrentWorkspaceId,
+    localDevice.platformLabel,
+  );
 
   const addCanonicalWorkspace = (entry) => {
     const canonicalDeviceId = canonicalDeviceIdFor(devicesById, entry);
     if (!canonicalDeviceId) {
       return;
     }
+    const canonicalDevice = devicesById.get(canonicalDeviceId) || {};
     addWorkspace(workspacesByDevice, {
       ...entry,
       deviceId: canonicalDeviceId,
+      platformLabel: firstText(entry?.platformLabel, entry?.platform, entry?.os, canonicalDevice.platformLabel),
     });
   };
 
@@ -1673,7 +1812,7 @@ export function buildTodoQueueDeviceWorkspaceOptions({
       serverSeen: Boolean(serverDevice.serverSeen || mergedLocalDevice.serverSeen),
     });
     if (safeCurrentWorkspaceId) {
-      const workspaceKey = `${localCanonicalDeviceId}::${safeCurrentWorkspaceId}`;
+      const workspaceKey = `${localCanonicalDeviceId}::${currentWorkspaceMatchId}`;
       const currentWorkspace = workspacesByDevice.get(workspaceKey);
       if (currentWorkspace) {
         workspacesByDevice.set(workspaceKey, {
@@ -1688,6 +1827,7 @@ export function buildTodoQueueDeviceWorkspaceOptions({
           deviceName: mergedLocalDevice.deviceName || localDevice.deviceName,
           isCurrentWorkspace: true,
           isLocal: true,
+          platformLabel: mergedLocalDevice.platformLabel || localDevice.platformLabel,
           workspaceId: safeCurrentWorkspaceId,
           workspaceName: safeCurrentWorkspaceName,
         });
@@ -1702,6 +1842,7 @@ export function buildTodoQueueDeviceWorkspaceOptions({
         deviceName: localDevice.deviceName,
         isCurrentWorkspace: true,
         isLocal: true,
+        platformLabel: localDevice.platformLabel,
         workspaceId: safeCurrentWorkspaceId,
         workspaceName: safeCurrentWorkspaceName,
       });
@@ -1736,6 +1877,7 @@ export function buildTodoQueueDeviceWorkspaceOptions({
       id: selectionIdFor({
         deviceId: device.deviceId,
         deviceKind: device.deviceKind,
+        platform: device.platformLabel,
         workspaceId,
       }),
       isCurrentWorkspace: Boolean(extra.isCurrentWorkspace),
@@ -1779,7 +1921,10 @@ export function buildTodoQueueDeviceWorkspaceOptions({
     if (device.isLocal && device.deviceKind !== TODO_QUEUE_DEVICE_KIND_MOBILE) {
       const preferredWorkspace = workspaces.find((workspace) => (
         workspace.isCurrentWorkspace
-        || normalizeWorkspaceId(workspace.workspaceId) === safeCurrentWorkspaceId
+        || normalizeTodoQueueWorkspaceMatchId(
+          workspace.workspaceId,
+          device.platformLabel,
+        ) === currentWorkspaceMatchId
       )) || workspaces[0] || null;
       workspaces = preferredWorkspace ? [preferredWorkspace] : [];
     }
@@ -1795,11 +1940,18 @@ export function buildTodoQueueDeviceWorkspaceOptions({
   return options;
 }
 
-function collectionForWorkspace(workspaceTodos, workspaceId, directKeys = [], byWorkspaceKeys = []) {
+function collectionForWorkspace(
+  workspaceTodos,
+  workspaceId,
+  directKeys = [],
+  byWorkspaceKeys = [],
+  platform = "",
+) {
   if (!workspaceTodos || typeof workspaceTodos !== "object") {
     return null;
   }
   const safeWorkspaceId = normalizeWorkspaceId(workspaceId);
+  const workspaceMatchId = normalizeTodoQueueWorkspaceMatchId(safeWorkspaceId, platform);
   const direct = directKeys
     .map((key) => workspaceTodos[key])
     .find((value) => value);
@@ -1808,11 +1960,20 @@ function collectionForWorkspace(workspaceTodos, workspaceId, directKeys = [], by
     .find((value) => value);
 
   if (Array.isArray(byWorkspace)) {
-    return byWorkspace.find((entry) => workspaceIdForRecord(entry) === safeWorkspaceId) || direct;
+    return byWorkspace.find((entry) => (
+      todoMirrorWorkspaceIdsForRecord(entry).some((candidate) => (
+        normalizeTodoQueueWorkspaceMatchId(candidate, platform) === workspaceMatchId
+      ))
+    )) || direct;
   }
 
   if (byWorkspace && typeof byWorkspace === "object") {
-    return byWorkspace[safeWorkspaceId] || byWorkspace[safeWorkspaceId.toLowerCase()] || direct;
+    const matchingKey = Object.keys(byWorkspace).find((key) => (
+      normalizeTodoQueueWorkspaceMatchId(key, platform) === workspaceMatchId
+    ));
+    return byWorkspace[safeWorkspaceId]
+      || (matchingKey ? byWorkspace[matchingKey] : null)
+      || direct;
   }
 
   return direct;
@@ -1820,7 +1981,14 @@ function collectionForWorkspace(workspaceTodos, workspaceId, directKeys = [], by
 
 export function workspaceTodoItemsForDeviceWorkspace(workspaceTodos, selection = {}) {
   const safeSelection = selection && typeof selection === "object" ? selection : {};
+  const platform = firstText(
+    safeSelection.platform,
+    safeSelection.os,
+    safeSelection.platformLabel,
+    safeSelection.platform_label,
+  );
   const workspaceId = normalizeWorkspaceId(safeSelection.workspaceId);
+  const workspaceMatchId = normalizeTodoQueueWorkspaceMatchId(workspaceId, platform);
   const deviceId = normalizeTodoQueueSwitcherId(safeSelection.deviceId);
   if (!workspaceId || !deviceId) {
     return [];
@@ -1829,8 +1997,18 @@ export function workspaceTodoItemsForDeviceWorkspace(workspaceTodos, selection =
   const todoCollection = collectionForWorkspace(
     workspaceTodos,
     workspaceId,
-    ["items", "todos"],
-    ["itemsByWorkspace", "items_by_workspace", "todosByWorkspace", "todos_by_workspace"],
+    ["items", "todos", "dispatches", "todoDispatches", "todo_dispatches"],
+    [
+      "itemsByWorkspace",
+      "items_by_workspace",
+      "todosByWorkspace",
+      "todos_by_workspace",
+      "dispatchesByWorkspace",
+      "dispatches_by_workspace",
+      "todoDispatchesByWorkspace",
+      "todo_dispatches_by_workspace",
+    ],
+    platform,
   );
   const items = Array.isArray(todoCollection?.items)
     ? todoCollection.items
@@ -1841,21 +2019,14 @@ export function workspaceTodoItemsForDeviceWorkspace(workspaceTodos, selection =
     if (!item || typeof item !== "object") {
       return false;
     }
-    const itemWorkspaceId = workspaceIdForRecord(item, workspaceId);
-    if (itemWorkspaceId && itemWorkspaceId !== workspaceId) {
+    const itemWorkspaceIds = todoMirrorWorkspaceIdsForRecord(item, workspaceId);
+    if (!itemWorkspaceIds.some((candidate) => (
+      normalizeTodoQueueWorkspaceMatchId(candidate, platform) === workspaceMatchId
+    ))) {
       return false;
     }
-    const itemDeviceId = normalizeTodoQueueSwitcherId(readFirstKey(item, [
-      "sourceDeviceId",
-      "source_device_id",
-      "deviceId",
-      "device_id",
-      "machineId",
-      "machine_id",
-      "todoDeviceId",
-      "todo_device_id",
-    ]));
-    if (!selectionDeviceAliases.has(itemDeviceId)) {
+    const itemDeviceIds = todoMirrorDeviceIdsForRecord(item);
+    if (!itemDeviceIds.some((candidate) => selectionDeviceAliases.has(candidate))) {
       return false;
     }
     const status = String(item.todoStatus || item.todo_status || item.status || item.state || "")
@@ -1865,8 +2036,78 @@ export function workspaceTodoItemsForDeviceWorkspace(workspaceTodos, selection =
   });
 }
 
+function todoQueueMirroredDisplayItem(item, selection = {}) {
+  const target = item?.target && typeof item.target === "object" ? item.target : {};
+  const id = firstText(
+    item?.id,
+    item?.todoId,
+    item?.todo_id,
+    item?.dispatchId,
+    item?.dispatch_id,
+    item?.commandId,
+    item?.command_id,
+  );
+  const text = firstText(
+    item?.text,
+    item?.todoText,
+    item?.todo_text,
+    item?.title,
+    item?.description,
+  );
+  return {
+    ...item,
+    ...(id ? { id } : {}),
+    ...(text ? { text } : {}),
+    deviceId: firstText(
+      item?.targetDeviceId,
+      item?.target_device_id,
+      target?.deviceId,
+      target?.device_id,
+      selection?.deviceId,
+    ),
+    workspaceId: firstText(
+      item?.targetWorkspaceId,
+      item?.target_workspace_id,
+      target?.workspaceId,
+      target?.workspace_id,
+      selection?.workspaceId,
+    ),
+    readOnly: true,
+    mirrored: true,
+  };
+}
+
+// This model is the production source for the arrays rendered by TodoQueuePanel.
+// Keeping the recipient filter here makes the regression test exercise the same
+// branch as the visible "No mirrored todos" state, not the devices graph helper.
+export function buildTodoQueueDisplayedSelectionArrays({
+  editable = false,
+  items = [],
+  peerItems = [],
+  pendingItems = {},
+  selection = null,
+  workspaceTodos = null,
+} = {}) {
+  if (editable) {
+    return {
+      items: Array.isArray(items) ? items : [],
+      peerItems: Array.isArray(peerItems) ? peerItems : [],
+      pendingItems: pendingItems && typeof pendingItems === "object" ? pendingItems : {},
+    };
+  }
+  const mirroredItems = workspaceTodoItemsForDeviceWorkspace(workspaceTodos, selection)
+    .map((item) => todoQueueMirroredDisplayItem(item, selection));
+  return {
+    items: mirroredItems,
+    peerItems: [],
+    pendingItems: {},
+  };
+}
+
 function workspaceTodoItemsForGraph(workspaceTodos, device, workspace) {
+  const platform = firstText(device?.platformLabel, device?.platform, device?.os);
   const workspaceId = normalizeWorkspaceId(workspace?.id || workspace?.workspaceId);
+  const workspaceMatchId = normalizeTodoQueueWorkspaceMatchId(workspaceId, platform);
   if (!workspaceId) {
     return [];
   }
@@ -1875,6 +2116,7 @@ function workspaceTodoItemsForGraph(workspaceTodos, device, workspace) {
   const deviceScopedItems = workspaceTodoItemsForDeviceWorkspace(workspaceTodos, {
     deviceAliases: Array.from(deviceAliases),
     deviceId,
+    platform,
     workspaceId,
   });
   if (deviceScopedItems.length) {
@@ -1886,6 +2128,7 @@ function workspaceTodoItemsForGraph(workspaceTodos, device, workspace) {
     workspaceId,
     ["items", "todos"],
     ["itemsByWorkspace", "items_by_workspace", "todosByWorkspace", "todos_by_workspace"],
+    platform,
   );
   const items = Array.isArray(todoCollection?.items)
     ? todoCollection.items
@@ -1896,21 +2139,14 @@ function workspaceTodoItemsForGraph(workspaceTodos, device, workspace) {
     if (!item || typeof item !== "object") {
       return false;
     }
-    const itemWorkspaceId = workspaceIdForRecord(item, workspaceId);
-    if (itemWorkspaceId && itemWorkspaceId !== workspaceId) {
+    const itemWorkspaceIds = todoMirrorWorkspaceIdsForRecord(item, workspaceId);
+    if (!itemWorkspaceIds.some((candidate) => (
+      normalizeTodoQueueWorkspaceMatchId(candidate, platform) === workspaceMatchId
+    ))) {
       return false;
     }
-    const itemDeviceId = normalizeTodoQueueSwitcherId(readFirstKey(item, [
-      "sourceDeviceId",
-      "source_device_id",
-      "deviceId",
-      "device_id",
-      "machineId",
-      "machine_id",
-      "todoDeviceId",
-      "todo_device_id",
-    ]));
-    if (itemDeviceId && !deviceAliases.has(itemDeviceId)) {
+    const itemDeviceIds = todoMirrorDeviceIdsForRecord(item);
+    if (itemDeviceIds.length && !itemDeviceIds.some((candidate) => deviceAliases.has(candidate))) {
       return false;
     }
     const status = normalizedGraphStatus(item.todoStatus || item.todo_status || item.status || item.state);
@@ -2052,11 +2288,47 @@ export function buildDevicesGraphModel({
 }
 
 export function todoQueueDeviceSelectionIsLocalEditable(selection, currentWorkspaceId = "") {
-  const selectionWorkspaceId = normalizeWorkspaceId(selection?.workspaceId);
-  const safeCurrentWorkspaceId = normalizeWorkspaceId(currentWorkspaceId);
-  return Boolean(
+  const platform = firstText(
+    selection?.platform,
+    selection?.os,
+    selection?.platformLabel,
+    selection?.platform_label,
+    selection?.rawDevice?.platform,
+    selection?.rawDevice?.os,
+  );
+  const selectionWorkspaceId = normalizeTodoQueueWorkspaceMatchId(
+    selection?.workspaceId ?? selection?.workspace_id,
+    platform,
+  );
+  const safeCurrentWorkspaceId = normalizeTodoQueueWorkspaceMatchId(currentWorkspaceId, platform);
+  const deviceKind = [
+    selection?.deviceKind,
+    selection?.device_kind,
+    selection?.formFactor,
+    selection?.form_factor,
+    selection?.platform,
+    selection?.os,
+    selection?.platformLabel,
+    selection?.platform_label,
+    selection?.rawDevice?.deviceKind,
+    selection?.rawDevice?.formFactor,
+    selection?.rawDevice?.platform,
+    selection?.rawDevice?.os,
+  ]
+    .map((value) => normalizeDeviceKind(value, TODO_QUEUE_DEVICE_KIND_UNKNOWN))
+    .find((value) => value !== TODO_QUEUE_DEVICE_KIND_UNKNOWN)
+    || TODO_QUEUE_DEVICE_KIND_UNKNOWN;
+  const isLocal = normalizeLiveBoolean(
     selection?.isLocal
-      && selection.deviceKind === TODO_QUEUE_DEVICE_KIND_DESKTOP
+      ?? selection?.is_local
+      ?? selection?.local
+      ?? selection?.rawDevice?.isLocal
+      ?? selection?.rawDevice?.is_local
+      ?? selection?.rawDevice?.local,
+  ) === true;
+  return Boolean(
+    isLocal
+      && deviceKind === TODO_QUEUE_DEVICE_KIND_DESKTOP
       && selectionWorkspaceId
       && safeCurrentWorkspaceId
       && selectionWorkspaceId === safeCurrentWorkspaceId,

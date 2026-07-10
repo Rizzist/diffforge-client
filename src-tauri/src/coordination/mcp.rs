@@ -1964,13 +1964,13 @@ fn workspace_gateway_builtin_tool_description(tool: &str) -> &'static str {
             "Read Video Editor timeline, selection, transcripts, and jobs. Call this first; clip ids are stable only within one context/edit exchange, so re-fetch after edits."
         }
         "video_edit" => {
-            "Apply atomic Video Editor edits after video_context. ops support split, trim, move, remove, rippleDeleteRange, removeWords, addClip, addText, addCaptions, setProps; use video_media search moments as addClip sourceInMs/durationMs, use removeWords with transcript word indexes, and call video_transcribe first if transcript data is missing. Still images (import them into media/ first) become video-track clips — give them motion via addClip/setProps motion presets (kenburns-in/out, pan-left/right/up/down, drift) which compile aspect-aware x/y/scale keyframes."
+            "Apply atomic Video Editor edits after video_context. ops support split, trim, move, remove, rippleDeleteRange, removeWords, removeSilences, addClip, addText, addCaptions, addTransition, removeTransition, and setProps. removeSilences returns effectiveRanges. setProps supports fx/crop on media and words/anim/animOpts on text. Re-fetch context after every edit."
         }
         "video_transcribe" => {
             "Read or start transcripts for video assets. Use before removeWords/addCaptions when video_context reports missing transcripts."
         }
         "video_look" => {
-            "Render exact composited Video Editor timeline frame(s) as JPEG image content blocks. Use after video_context when visual inspection is needed."
+            "Render composited Video Editor timeline frame(s) as JPEG image content blocks. Use after video_context when visual inspection is needed; structuredContent.warnings reports any fidelity omissions."
         }
         "video_media" => {
             "List, search, import, annotate, and organize Video Editor media. Search returns filename matches plus transcript moments and image annotation matches. Image assets carry annotations (blurb/description/tags/ocrText) — list/search rows include the blurb; use action annotation to read the full record and action annotate to write one yourself after viewing the image (free, no cloud call). Consult annotations plus width/height when picking stills for timeline slot-in, motion presets, or hyperframes compositions."
@@ -2110,7 +2110,7 @@ fn workspace_gateway_builtin_tool_input_schema(tool: &str) -> Value {
                 "ops": {
                     "type": "array",
                     "items": {"type": "object", "additionalProperties": true},
-                    "description": "Required edit ops with op discriminator: split, trim, move, remove, rippleDeleteRange, removeWords, addClip, addText, addCaptions, setProps. For addClip, pass assetPath, atMs, optional sourceInMs/durationMs, optional trackHint, and optional motion. motion applies a motion preset to a video-track clip (great for still images): \"kenburns-in\" | \"kenburns-out\" | \"pan-left\" | \"pan-right\" | \"pan-up\" | \"pan-down\" | \"drift\" | \"none\", or { preset, strength: \"subtle\"|\"normal\"|\"bold\" }; it compiles aspect-aware x/y/scale keyframes (cover-fit zoom, edge-safe pan) onto the clip. setProps patch supports speed, gain, transform {x,y,scale,opacity}, motion (same values), and raw kf keyframes { x|y|scale|opacity: [{ atMs, value, easing: \"linear\"|\"hold\"|\"smooth\" }] } — atMs is clip-relative; x/y are frame fractions."
+                    "description": "Required edit ops: split, trim, move, remove, rippleDeleteRange, removeWords, removeSilences {assetPath?,noiseDb?,minMs?}, addClip, addText, addCaptions, addTransition {trackId,afterClipId,kind,durationMs}, removeTransition {transitionId}, setProps. setProps patch supports speed, gain, transform, motion, fx, crop, text words/anim/animOpts, and kf {x|y|scale|opacity:[{atMs,value,easing}]}; easing is linear|hold|smooth|ease-in|ease-out|ease-in-out. Word/keyframe times are clip-relative. removeSilences is transactional and returns effectiveRanges."
                 },
                 "includePipe": {"type": "boolean"}
             },
@@ -4519,7 +4519,14 @@ fn workspace_gateway_video_look_content(value: Value) -> Value {
         "type": "text",
         "text": note,
     }));
-    workspace_gateway_content_blocks(content, false)
+    let warnings = value
+        .get("warnings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut result = workspace_gateway_content_blocks(content, false);
+    result["structuredContent"] = json!({ "warnings": warnings });
+    result
 }
 
 fn workspace_gateway_error_content(error: impl Into<String>) -> Value {
@@ -8729,7 +8736,8 @@ edge trig.out -> dispatch.in
                 {"atMs": 1000, "b64Jpeg": "abc123"},
                 {"atMs": 2000, "b64Jpeg": "def456"}
             ],
-            "note": "rendered 1000ms, 2000ms"
+            "note": "rendered 1000ms, 2000ms; text layers omitted: ffmpeg without drawtext",
+            "warnings": ["text layers omitted: ffmpeg without drawtext"]
         }));
         assert_eq!(result["isError"].as_bool(), Some(false));
         let content = result["content"].as_array().expect("content array");
@@ -8741,7 +8749,14 @@ edge trig.out -> dispatch.in
         assert_eq!(content[1]["data"], "def456");
         assert_eq!(content[1]["mimeType"], "image/jpeg");
         assert_eq!(content[2]["type"], "text");
-        assert_eq!(content[2]["text"], "rendered 1000ms, 2000ms");
+        assert_eq!(
+            content[2]["text"],
+            "rendered 1000ms, 2000ms; text layers omitted: ffmpeg without drawtext"
+        );
+        assert_eq!(
+            result["structuredContent"]["warnings"][0],
+            "text layers omitted: ffmpeg without drawtext"
+        );
     }
 
     #[test]

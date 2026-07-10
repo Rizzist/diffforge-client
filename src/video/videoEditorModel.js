@@ -13,6 +13,7 @@
 export const VIDEO_PROJECT_VERSION = 1;
 export const VIDEO_TRACK_KINDS = ["video", "audio", "text"];
 export const MIN_CLIP_DURATION_MS = 80;
+export const RIPPLE_DELETE_WORDS_MERGE_GAP_MS = 120;
 
 let clipIdSeq = 0;
 
@@ -61,7 +62,41 @@ export function normalizeTransform(transform) {
 // Property keyframes (opacity / x / y / scale). atMs is clip-relative;
 // easing describes the segment FROM this keyframe to the next.
 export const VIDEO_KF_PROPS = ["opacity", "x", "y", "scale"];
-export const VIDEO_KF_EASINGS = ["linear", "hold", "smooth"];
+export const VIDEO_KF_EASINGS = ["linear", "hold", "smooth", "ease-in", "ease-out", "ease-in-out"];
+
+// Cubic-bezier easing (CSS-style control points, P0=(0,0), P3=(1,1)).
+// Evaluation MUST stay in exact parity with the Rust mirror (see
+// docs/tier1-contract-2026-07-10.md §3): solve x(u)=t with 20 bisection
+// iterations, return y(u). Fixture values are asserted on both sides.
+const VIDEO_KF_BEZIERS = {
+  "ease-in": [0.42, 0, 1, 1],
+  "ease-out": [0, 0, 0.58, 1],
+  "ease-in-out": [0.42, 0, 0.58, 1],
+};
+
+export function cubicBezierEase(easing, t) {
+  const points = VIDEO_KF_BEZIERS[easing];
+  if (!points || t <= 0) {
+    return Math.max(0, Math.min(1, t));
+  }
+  if (t >= 1) {
+    return 1;
+  }
+  const [p1x, p1y, p2x, p2y] = points;
+  const sample = (coord1, coord2, u) =>
+    3 * (1 - u) * (1 - u) * u * coord1 + 3 * (1 - u) * u * u * coord2 + u * u * u;
+  let lo = 0;
+  let hi = 1;
+  for (let index = 0; index < 20; index += 1) {
+    const mid = (lo + hi) / 2;
+    if (sample(p1x, p2x, mid) < t) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return sample(p1y, p2y, (lo + hi) / 2);
+}
 
 function normalizeKfList(list, prop) {
   const clamp = (value) => {
@@ -258,6 +293,8 @@ export function kfValueAtMs(frames, atMs, fallback) {
       let ratio = (atMs - from.atMs) / span;
       if (from.easing === "smooth") {
         ratio = smoothstep(ratio);
+      } else if (VIDEO_KF_BEZIERS[from.easing]) {
+        ratio = cubicBezierEase(from.easing, ratio);
       }
       return from.value + (to.value - from.value) * ratio;
     }
@@ -306,6 +343,86 @@ export function normalizeTextStyle(style) {
   };
 }
 
+// --- Effects & color (contract §1) -------------------------------------------
+// Defaults are never serialized: normalizeFx returns null when everything is
+// at its default so clips without effects stay byte-identical in .pipe.
+
+export const VIDEO_FX_CURVES = ["none", "vintage", "darker", "lighter", "increase_contrast", "strong_contrast"];
+export const VIDEO_FX_BLENDS = ["normal", "multiply", "screen", "overlay", "lighten", "darken", "addition"];
+
+export const VIDEO_FX_DEFAULTS = Object.freeze({
+  exposure: 0,
+  contrast: 1,
+  saturation: 1,
+  temperature: 0,
+  curves: "none",
+  lut: "",
+  chromaKey: null,
+  blur: 0,
+  vignette: 0,
+  grain: 0,
+  blend: "normal",
+});
+
+export function normalizeFx(fx) {
+  if (!fx || typeof fx !== "object") {
+    return null;
+  }
+  const chroma = fx.chromaKey && typeof fx.chromaKey === "object"
+    ? {
+        color: cleanText(fx.chromaKey.color) || "#00ff00",
+        similarity: Math.min(1, Math.max(0.01, cleanNumber(fx.chromaKey.similarity, 0.2))),
+        blend: Math.min(1, Math.max(0, cleanNumber(fx.chromaKey.blend, 0.1))),
+      }
+    : null;
+  const result = {
+    exposure: Math.min(2, Math.max(-2, cleanNumber(fx.exposure, 0))),
+    contrast: Math.min(2, Math.max(0.5, cleanNumber(fx.contrast, 1))),
+    saturation: Math.min(3, Math.max(0, cleanNumber(fx.saturation, 1))),
+    temperature: Math.min(100, Math.max(-100, cleanNumber(fx.temperature, 0))),
+    curves: VIDEO_FX_CURVES.includes(fx.curves) ? fx.curves : "none",
+    lut: cleanText(fx.lut),
+    chromaKey: chroma,
+    blur: Math.min(50, Math.max(0, cleanNumber(fx.blur, 0))),
+    vignette: Math.min(1, Math.max(0, cleanNumber(fx.vignette, 0))),
+    grain: Math.min(1, Math.max(0, cleanNumber(fx.grain, 0))),
+    blend: VIDEO_FX_BLENDS.includes(fx.blend) ? fx.blend : "normal",
+  };
+  const isDefault = Object.keys(VIDEO_FX_DEFAULTS).every((key) => {
+    if (key === "chromaKey") {
+      return result.chromaKey === null;
+    }
+    return result[key] === VIDEO_FX_DEFAULTS[key];
+  });
+  return isDefault ? null : result;
+}
+
+// Static crop fractions of the source (contract §3); null when un-cropped.
+export function normalizeCrop(crop) {
+  if (!crop || typeof crop !== "object") {
+    return null;
+  }
+  const side = (value) => Math.min(0.45, Math.max(0, cleanNumber(value, 0)));
+  const result = { l: side(crop.l), t: side(crop.t), r: side(crop.r), b: side(crop.b) };
+  return result.l || result.t || result.r || result.b ? result : null;
+}
+
+// --- Word-timed captions + text animations (contract §4) ---------------------
+
+export const VIDEO_TEXT_ANIMS = ["none", "typewriter", "word-reveal", "word-highlight", "pop", "fade"];
+
+export function normalizeWords(words, durationMs) {
+  const list = (Array.isArray(words) ? words : [])
+    .map((word) => ({
+      text: cleanText(word?.text),
+      startMs: Math.max(0, Math.round(cleanNumber(word?.startMs))),
+      endMs: Math.max(0, Math.round(cleanNumber(word?.endMs))),
+    }))
+    .filter((word) => word.text && word.endMs > word.startMs && word.startMs < durationMs)
+    .sort((a, b) => a.startMs - b.startMs);
+  return list.length ? list : null;
+}
+
 // Classic meme text: heavy white face, thick black outline, uppercase.
 export const MEME_TEXT_STYLE = {
   color: "#ffffff",
@@ -328,14 +445,25 @@ export function normalizeClip(clip, trackKind) {
     durationMs: Math.max(MIN_CLIP_DURATION_MS, Math.round(cleanNumber(clip.durationMs, 1000))),
   };
   if (trackKind === "text") {
-    return {
+    const textClip = {
       ...base,
       text: cleanText(clip.text) || "Text",
       style: normalizeTextStyle(clip.style),
       captionGroup: cleanText(clip.captionGroup),
+      anim: VIDEO_TEXT_ANIMS.includes(clip.anim) ? clip.anim : "none",
     };
+    const words = normalizeWords(clip.words, textClip.durationMs);
+    if (words) {
+      textClip.words = words;
+    }
+    if (textClip.anim === "word-highlight") {
+      textClip.animOpts = {
+        highlightColor: cleanText(clip.animOpts?.highlightColor) || "#fbbf24",
+      };
+    }
+    return textClip;
   }
-  return {
+  const mediaClip = {
     ...base,
     assetPath: cleanText(clip.assetPath),
     sourceInMs: Math.max(0, Math.round(cleanNumber(clip.sourceInMs))),
@@ -348,6 +476,156 @@ export function normalizeClip(clip, trackKind) {
     // above are what actually render; this lets UI/agents see what was used).
     motion: MOTION_PRESET_IDS.includes(cleanText(clip.motion)) ? cleanText(clip.motion) : "",
   };
+  const fx = normalizeFx(clip.fx);
+  if (fx) {
+    mediaClip.fx = fx;
+  }
+  const crop = normalizeCrop(clip.crop);
+  if (crop) {
+    mediaClip.crop = crop;
+  }
+  return mediaClip;
+}
+
+// --- Transitions (contract §2) ------------------------------------------------
+
+export const VIDEO_TRANSITION_KINDS = [
+  "crossfade",
+  "dip-black",
+  "dip-white",
+  "wipe-left",
+  "wipe-right",
+  "wipe-up",
+  "wipe-down",
+  "slide-left",
+  "slide-right",
+];
+
+// A transition is valid only while its leading clip's end touches the next
+// clip's start exactly (both on this track). Duration is clamped to half the
+// shorter neighbor.
+function transitionNeighbors(track, afterClipId) {
+  const clips = track?.clips || [];
+  const index = clips.findIndex((clip) => clip.id === afterClipId);
+  if (index < 0 || index + 1 >= clips.length) {
+    return null;
+  }
+  const left = clips[index];
+  const right = clips[index + 1];
+  if (clipEndMs(left) !== right.timelineStartMs) {
+    return null;
+  }
+  return { left, right };
+}
+
+export function clampTransitionDurationMs(track, afterClipId, durationMs) {
+  const neighbors = transitionNeighbors(track, afterClipId);
+  if (!neighbors) {
+    return 0;
+  }
+  const cap = Math.floor(Math.min(neighbors.left.durationMs, neighbors.right.durationMs) / 2);
+  if (cap < 100) {
+    return 0; // neighbors too short for the 100ms minimum — reject, never inflate
+  }
+  return Math.max(100, Math.min(3000, Math.min(cap, Math.round(cleanNumber(durationMs, 500)))));
+}
+
+export function normalizeTransitions(transitions, track) {
+  const seen = new Set();
+  const list = (Array.isArray(transitions) ? transitions : [])
+    .map((transition) => {
+      if (!transition || typeof transition !== "object") {
+        return null;
+      }
+      const afterClipId = cleanText(transition.afterClipId);
+      if (!afterClipId || seen.has(afterClipId) || !transitionNeighbors(track, afterClipId)) {
+        return null;
+      }
+      const durationMs = clampTransitionDurationMs(track, afterClipId, transition.durationMs);
+      if (!durationMs) {
+        return null;
+      }
+      seen.add(afterClipId);
+      return {
+        id: cleanText(transition.id) || makeVideoId("transition"),
+        afterClipId,
+        kind: VIDEO_TRANSITION_KINDS.includes(transition.kind) ? transition.kind : "crossfade",
+        durationMs,
+      };
+    })
+    .filter(Boolean);
+  return list;
+}
+
+// Drop transitions whose adjacency an edit just broke. Called by every
+// geometry-mutating op; cheap (no clone — mutates the passed project).
+export function pruneTransitions(project) {
+  for (const track of project?.tracks || []) {
+    if (Array.isArray(track.transitions) && track.transitions.length) {
+      track.transitions = normalizeTransitions(track.transitions, track);
+      if (!track.transitions.length) {
+        delete track.transitions;
+      }
+    }
+  }
+  return project;
+}
+
+export function addTransition(project, trackId, afterClipId, kind, durationMs) {
+  const next = cloneProject(project);
+  const track = (next.tracks || []).find((candidate) => candidate.id === trackId);
+  if (!track || track.locked || track.kind !== "video") {
+    return project;
+  }
+  const clamped = clampTransitionDurationMs(track, afterClipId, durationMs);
+  if (!clamped) {
+    return project;
+  }
+  const existing = (track.transitions || []).filter((transition) => transition.afterClipId !== afterClipId);
+  existing.push({
+    id: makeVideoId("transition"),
+    afterClipId,
+    kind: VIDEO_TRANSITION_KINDS.includes(kind) ? kind : "crossfade",
+    durationMs: clamped,
+  });
+  track.transitions = normalizeTransitions(existing, track);
+  return next;
+}
+
+export function removeTransition(project, transitionId) {
+  const next = cloneProject(project);
+  let found = false;
+  for (const track of next.tracks || []) {
+    const before = (track.transitions || []).length;
+    if (!before) {
+      continue;
+    }
+    track.transitions = track.transitions.filter((transition) => transition.id !== transitionId);
+    if (track.transitions.length !== before) {
+      found = true;
+    }
+    if (!track.transitions.length) {
+      delete track.transitions;
+    }
+  }
+  return found ? next : project;
+}
+
+export function setTransitionDuration(project, transitionId, durationMs) {
+  const next = cloneProject(project);
+  for (const track of next.tracks || []) {
+    for (const transition of track.transitions || []) {
+      if (transition.id === transitionId) {
+        const clamped = clampTransitionDurationMs(track, transition.afterClipId, durationMs);
+        if (!clamped) {
+          return project;
+        }
+        transition.durationMs = clamped;
+        return next;
+      }
+    }
+  }
+  return project;
 }
 
 export function normalizeTrack(track, index = 0) {
@@ -359,7 +637,7 @@ export function normalizeTrack(track, index = 0) {
     .map((clip) => normalizeClip(clip, kind))
     .filter(Boolean)
     .sort((a, b) => a.timelineStartMs - b.timelineStartMs);
-  return {
+  const normalized = {
     id: cleanText(track.id) || makeVideoId("track"),
     kind,
     label: cleanText(track.label) || `${kind.charAt(0).toUpperCase()}${index + 1}`,
@@ -367,6 +645,13 @@ export function normalizeTrack(track, index = 0) {
     locked: track.locked === true,
     clips,
   };
+  if (kind === "video") {
+    const transitions = normalizeTransitions(track.transitions, normalized);
+    if (transitions.length) {
+      normalized.transitions = transitions;
+    }
+  }
+  return normalized;
 }
 
 export function makeStarterProject(name = "untitled") {
@@ -502,7 +787,7 @@ function updateClipIn(project, clipId, updater) {
   }
   updater(found.clip, found.track);
   found.track.clips.sort((a, b) => a.timelineStartMs - b.timelineStartMs);
-  return next;
+  return pruneTransitions(next);
 }
 
 // First position ≥ startMs on a track where a clip of durationMs fits without
@@ -535,7 +820,7 @@ export function moveClip(project, clipId, timelineStartMs) {
 // earliest one lands at 0 (relative spacing always survives). Collisions with
 // clips outside the group push the whole group forward until nothing overlaps.
 export function moveClips(project, clipIds, deltaMs) {
-  const ids = Array.isArray(clipIds) ? clipIds.filter(Boolean) : [];
+  const ids = [...new Set(Array.isArray(clipIds) ? clipIds.filter(Boolean) : [])];
   if (!ids.length) {
     return project;
   }
@@ -544,16 +829,14 @@ export function moveClips(project, clipIds, deltaMs) {
   const targets = [];
   for (const clipId of ids) {
     const found = findClip(next, clipId);
-    if (found && !found.track.locked) {
-      targets.push(found);
+    if (!found || found.track.locked) {
+      return project;
     }
-  }
-  if (!targets.length) {
-    return project;
+    targets.push(found);
   }
   const minStart = Math.min(...targets.map((entry) => entry.clip.timelineStartMs));
-  let applied = Math.max(Math.round(deltaMs), -minStart);
-  for (let iteration = 0; iteration < 10; iteration += 1) {
+  let applied = Math.max(Math.round(cleanNumber(deltaMs)), -minStart);
+  for (;;) {
     let push = 0;
     for (const { clip, track } of targets) {
       const proposed = clip.timelineStartMs + applied;
@@ -575,7 +858,7 @@ export function moveClips(project, clipIds, deltaMs) {
     clip.timelineStartMs += applied;
     track.clips.sort((a, b) => a.timelineStartMs - b.timelineStartMs);
   }
-  return next;
+  return pruneTransitions(next);
 }
 
 export function removeClips(project, clipIds) {
@@ -589,28 +872,25 @@ export function removeClips(project, clipIds) {
       track.clips = track.clips.filter((clip) => !ids.has(clip.id));
     }
   }
-  return next;
+  return pruneTransitions(next);
 }
 
-// Ripple delete: remove the clip and slide every later clip on the SAME
-// track left by its duration, closing the gap.
+// Ripple delete uses the linked group's union interval and the same global
+// timeline semantics as a range ripple. Selecting any member is therefore
+// equivalent, even when members start/end at different times or share a lane.
 export function rippleDeleteClip(project, clipId) {
-  const next = cloneProject(project);
-  const found = findClip(next, clipId);
-  if (!found || found.track.locked) {
+  const selected = findClip(project, clipId);
+  if (!selected) {
     return project;
   }
-  const { clip, track } = found;
-  const start = clip.timelineStartMs;
-  const gap = clip.durationMs;
-  track.clips = track.clips.filter((entry) => entry.id !== clipId);
-  for (const entry of track.clips) {
-    if (entry.timelineStartMs >= start) {
-      entry.timelineStartMs = Math.max(0, entry.timelineStartMs - gap);
-    }
+  const ids = expandWithLinks(project, [clipId]);
+  const members = ids.map((id) => findClip(project, id)).filter(Boolean);
+  if (!members.length || members.some((member) => member.track.locked)) {
+    return project;
   }
-  track.clips.sort((a, b) => a.timelineStartMs - b.timelineStartMs);
-  return next;
+  const from = Math.min(...members.map((member) => member.clip.timelineStartMs));
+  const to = Math.max(...members.map((member) => clipEndMs(member.clip)));
+  return rippleDeleteRange(project, from, to, null);
 }
 
 // Candidate snap targets: timeline zero, every other clip's edges, and any
@@ -672,7 +952,7 @@ export function moveClipToTrack(project, clipId, targetTrackId, timelineStartMs)
   );
   target.clips.push(found.clip);
   target.clips.sort((a, b) => a.timelineStartMs - b.timelineStartMs);
-  return next;
+  return pruneTransitions(next);
 }
 
 // Trim the left edge: shifts timeline start and source-in together so the
@@ -697,6 +977,25 @@ export function trimClipEnd(project, clipId, deltaMs) {
   return updateClipIn(project, clipId, (clip) => {
     clip.durationMs = Math.max(MIN_CLIP_DURATION_MS, clip.durationMs + Math.round(deltaMs));
   });
+}
+
+// Trim a linked/selected cohort transactionally. A sequential trim would
+// otherwise mutate earlier members before discovering that a later partner
+// lives on a locked track.
+export function trimClips(project, clipIds, edge, deltaMs) {
+  const ids = [...new Set(Array.isArray(clipIds) ? clipIds : [])];
+  if (!ids.length || !["start", "end"].includes(edge)) {
+    return project;
+  }
+  const members = ids.map((id) => findClip(project, id));
+  if (members.some((member) => !member || member.track.locked)) {
+    return project;
+  }
+  let next = project;
+  for (const id of ids) {
+    next = edge === "start" ? trimClipStart(next, id, deltaMs) : trimClipEnd(next, id, deltaMs);
+  }
+  return next;
 }
 
 // Easing of the keyframe segment that spans an offset (drives boundary
@@ -807,7 +1106,14 @@ function splitClipCore(project, clipId, atTimelineMs) {
   }
   track.clips.push(right);
   track.clips.sort((a, b) => a.timelineStartMs - b.timelineStartMs);
-  return { project: next, rightId: right.id };
+  // A transition anchored on the split clip belongs to the ORIGINAL junction,
+  // which the new right fragment now owns — retarget before pruning.
+  for (const transition of track.transitions || []) {
+    if (transition.afterClipId === clip.id) {
+      transition.afterClipId = right.id;
+    }
+  }
+  return { project: pruneTransitions(next), rightId: right.id };
 }
 
 export function splitClip(project, clipId, atTimelineMs) {
@@ -864,6 +1170,114 @@ export function linkClips(project, clipIds) {
     }
   }
   return touched >= 2 ? next : project;
+}
+
+function freshLinkId(suffix = "") {
+  linkIdSeq += 1;
+  return `link-${Date.now().toString(36)}${suffix}-${linkIdSeq}`;
+}
+
+function linkGroups(project) {
+  const groups = new Map();
+  for (const track of project?.tracks || []) {
+    for (const clip of track.clips || []) {
+      if (!clip.linkId) {
+        continue;
+      }
+      if (!groups.has(clip.linkId)) {
+        groups.set(clip.linkId, []);
+      }
+      groups.get(clip.linkId).push({ track, clip });
+    }
+  }
+  return groups;
+}
+
+function lockedTrackBlock(track, operation = "Ripple edit") {
+  return {
+    reason: "locked-track",
+    trackId: track?.id || "",
+    message: `${operation} blocked because ${track?.label || track?.id || "a required track"} is locked.`,
+  };
+}
+
+// A scoped ripple follows whole link groups. A group is affected when it has
+// a member on a seed/closed-over track AND any member lies in the edit's
+// affected time cohort. That second, group-wide test is what catches a short
+// twin whose longer partner reaches the range.
+function rippleTrackIdsWithLinks(project, trackIds, affectsClip) {
+  const tracks = project?.tracks || [];
+  const affected = new Set(trackIds == null
+    ? tracks.filter((track) => !track.locked).map((track) => track.id)
+    : (Array.isArray(trackIds) ? trackIds : [...trackIds]));
+  for (const track of project?.tracks || []) {
+    if (affected.has(track.id) && track.locked) {
+      return { affected: new Set(), touchedLinkIds: new Set(), blocked: lockedTrackBlock(track) };
+    }
+  }
+  const groups = linkGroups(project);
+  const touchedLinkIds = new Set();
+  let expanded = true;
+  while (expanded) {
+    expanded = false;
+    for (const [linkId, members] of groups) {
+      if (!members.some((member) => affected.has(member.track.id))) {
+        continue;
+      }
+      if (!members.some((member) => affectsClip(member.clip))) {
+        continue;
+      }
+      touchedLinkIds.add(linkId);
+      for (const member of members) {
+        if (member.track.locked) {
+          return {
+            affected: new Set(),
+            touchedLinkIds: new Set(),
+            blocked: lockedTrackBlock(member.track),
+          };
+        }
+        if (!affected.has(member.track.id)) {
+          affected.add(member.track.id);
+          expanded = true;
+        }
+      }
+    }
+  }
+  return { affected, touchedLinkIds, blocked: null };
+}
+
+function addCohortMember(cohorts, linkId, clipId) {
+  if (!linkId || !clipId) {
+    return;
+  }
+  if (!cohorts.has(linkId)) {
+    cohorts.set(linkId, []);
+  }
+  cohorts.get(linkId).push(clipId);
+}
+
+// Reassign every touched group as two complete cohorts. The left side keeps
+// the old id, the right side receives exactly one fresh id, and singleton
+// cohorts are explicitly unlinked.
+function applyLinkCohorts(project, touchedLinkIds, leftCohorts, rightCohorts) {
+  for (const linkId of touchedLinkIds) {
+    const leftIds = [...new Set(leftCohorts.get(linkId) || [])];
+    const rightIds = [...new Set(rightCohorts.get(linkId) || [])];
+    const rightLinkId = rightIds.length >= 2 ? freshLinkId("-r") : "";
+    const leftLinkId = leftIds.length >= 2 ? linkId : "";
+    for (const clipId of leftIds) {
+      const found = findClip(project, clipId);
+      if (found && found.track.kind !== "text") {
+        found.clip.linkId = leftLinkId;
+      }
+    }
+    for (const clipId of rightIds) {
+      const found = findClip(project, clipId);
+      if (found && found.track.kind !== "text") {
+        found.clip.linkId = rightLinkId;
+      }
+    }
+  }
 }
 
 export function unlinkClip(project, clipId) {
@@ -950,55 +1364,166 @@ export function serializeClips(project, clipIds) {
   for (const clipId of expandWithLinks(project, clipIds)) {
     const found = findClip(project, clipId);
     if (found) {
-      entries.push({ trackKind: found.track.kind, clip: JSON.parse(JSON.stringify(found.clip)) });
+      const laneIndex = (project?.tracks || [])
+        .filter((track) => track.kind === found.track.kind)
+        .findIndex((track) => track.id === found.track.id);
+      entries.push({
+        trackKind: found.track.kind,
+        laneIndex: Math.max(0, laneIndex),
+        clip: JSON.parse(JSON.stringify(found.clip)),
+      });
       baseMs = Math.min(baseMs, found.clip.timelineStartMs);
     }
   }
   if (!entries.length) {
     return null;
   }
-  return { kind: "diffforge-video-clips", baseMs, entries };
+  return { kind: "diffforge-video-clips", version: 2, baseMs, entries };
 }
 
 export function pasteClips(project, payload, atMs) {
   if (payload?.kind !== "diffforge-video-clips" || !Array.isArray(payload.entries) || !payload.entries.length) {
     return { project, clipIds: [] };
   }
+  const requestedDelta = Math.round(cleanNumber(atMs)) - Math.round(cleanNumber(payload.baseMs));
+  const prepared = [];
+  for (const [index, entry] of payload.entries.entries()) {
+    const kind = VIDEO_TRACK_KINDS.includes(entry.trackKind) ? entry.trackKind : "video";
+    // Version-1/legacy payloads had no lane identity; they map to lane zero.
+    const laneIndex = Math.max(0, Math.round(cleanNumber(entry.laneIndex, 0)));
+    const sourceLinkId = typeof entry.clip?.linkId === "string" ? entry.clip.linkId : "";
+    prepared.push({
+      entry,
+      index,
+      kind,
+      laneIndex,
+      sourceLinkId,
+      timelineStartMs: Math.max(0, Math.round(Number(entry.clip?.timelineStartMs) || 0)),
+      durationMs: Math.max(
+        MIN_CLIP_DURATION_MS,
+        Math.round(Number(entry.clip?.durationMs) || MIN_CLIP_DURATION_MS),
+      ),
+    });
+  }
+
+  // Resolve every required lane before cloning. A locked lane is not skipped:
+  // lane identity is positional, so substituting another lane would corrupt
+  // stacked geometry.
+  const existingLanes = new Map();
+  for (const kind of VIDEO_TRACK_KINDS) {
+    existingLanes.set(kind, (project?.tracks || []).filter((track) => track.kind === kind));
+  }
+  for (const item of prepared) {
+    const lane = existingLanes.get(item.kind)?.[item.laneIndex];
+    if (lane?.locked) {
+      return {
+        project,
+        clipIds: [],
+        blocked: lockedTrackBlock(lane, "Paste"),
+      };
+    }
+  }
+
   let next = cloneProject(project);
-  const offset = Math.round(atMs) - (Number(payload.baseMs) || 0);
+  for (const kind of VIDEO_TRACK_KINDS) {
+    const requiredMax = prepared
+      .filter((item) => item.kind === kind)
+      .reduce((maximum, item) => Math.max(maximum, item.laneIndex), -1);
+    let lanes = next.tracks.filter((track) => track.kind === kind);
+    while (lanes.length <= requiredMax) {
+      const prefix = kind === "video" ? "V" : kind === "audio" ? "A" : "T";
+      const track = {
+        id: makeVideoId("track"),
+        kind,
+        label: `${prefix}${lanes.length + 1}`,
+        muted: false,
+        locked: false,
+        clips: [],
+      };
+      next.tracks.push(track);
+      lanes = next.tracks.filter((candidate) => candidate.kind === kind);
+    }
+  }
+  const destinationLanes = new Map();
+  for (const kind of VIDEO_TRACK_KINDS) {
+    destinationLanes.set(kind, next.tracks.filter((track) => track.kind === kind));
+  }
+  for (const item of prepared) {
+    item.track = destinationLanes.get(item.kind)[item.laneIndex];
+  }
+
+  // Relative overlap on one destination lane cannot be repaired by any
+  // shared delta, so reject it before adding a single clip.
+  for (const track of next.tracks) {
+    const laneItems = prepared
+      .filter((item) => item.track.id === track.id)
+      .sort((a, b) => a.timelineStartMs - b.timelineStartMs || a.index - b.index);
+    for (let index = 1; index < laneItems.length; index += 1) {
+      if (laneItems[index].timelineStartMs < laneItems[index - 1].timelineStartMs + laneItems[index - 1].durationMs) {
+        return {
+          project,
+          clipIds: [],
+          blocked: {
+            reason: "payload-overlap",
+            trackId: track.id,
+            message: `Paste blocked because clips overlap within ${track.label || "a destination lane"}.`,
+          },
+        };
+      }
+    }
+  }
+
+  const minStart = Math.min(...prepared.map((item) => item.timelineStartMs));
+  let applied = Math.max(requestedDelta, -minStart);
+  // Every entry shares this one delta. Rechecking all lanes after every push
+  // finds the earliest placement at or after the request that fits the entire
+  // payload against existing occupancy.
+  for (;;) {
+    let required = applied;
+    for (const item of prepared) {
+      const free = firstFreePositionOnTrack(
+        item.track,
+        item.timelineStartMs + applied,
+        item.durationMs,
+      );
+      required = Math.max(required, free - item.timelineStartMs);
+    }
+    if (required === applied) {
+      break;
+    }
+    applied = required;
+  }
+
+  const linkCounts = new Map();
+  for (const item of prepared) {
+    if (item.kind !== "text" && item.sourceLinkId) {
+      linkCounts.set(item.sourceLinkId, (linkCounts.get(item.sourceLinkId) || 0) + 1);
+    }
+  }
   const linkMap = new Map();
   const newIds = [];
-  for (const entry of payload.entries) {
-    const kind = VIDEO_TRACK_KINDS.includes(entry.trackKind) ? entry.trackKind : "video";
-    let track = next.tracks.find((candidate) => candidate.kind === kind && !candidate.locked);
-    if (!track) {
-      next = addTrack(next, kind);
-      track = next.tracks[next.tracks.length - 1];
-    }
-    const clip = normalizeClip(
-      {
-        ...entry.clip,
-        id: makeVideoId("clip"),
-        timelineStartMs: firstFreePositionOnTrack(
-          track,
-          Math.max(0, (entry.clip.timelineStartMs || 0) + offset),
-          Math.max(MIN_CLIP_DURATION_MS, Math.round(entry.clip.durationMs || MIN_CLIP_DURATION_MS)),
-        ),
-      },
-      kind,
-    );
-    if (clip.linkId) {
-      if (!linkMap.has(clip.linkId)) {
-        linkIdSeq += 1;
-        linkMap.set(clip.linkId, `link-${Date.now().toString(36)}-p${linkIdSeq}`);
+  for (const item of prepared) {
+    const id = makeVideoId("clip");
+    let linkId = "";
+    if (item.sourceLinkId && (linkCounts.get(item.sourceLinkId) || 0) >= 2) {
+      if (!linkMap.has(item.sourceLinkId)) {
+        linkMap.set(item.sourceLinkId, freshLinkId("-p"));
       }
-      clip.linkId = linkMap.get(clip.linkId);
+      linkId = linkMap.get(item.sourceLinkId);
     }
-    track.clips.push(clip);
-    track.clips.sort((a, b) => a.timelineStartMs - b.timelineStartMs);
-    newIds.push(clip.id);
+    const clip = normalizeClip({
+      ...item.entry.clip,
+      id,
+      timelineStartMs: item.timelineStartMs + applied,
+      linkId,
+    }, item.kind);
+    item.track.clips.push(clip);
+    newIds.push(id);
   }
-  return { project: next, clipIds: newIds };
+  for (const track of next.tracks) {
+    track.clips.sort((a, b) => a.timelineStartMs - b.timelineStartMs);
+  }
+  return { project: pruneTransitions(next), clipIds: newIds };
 }
 
 // --- Select forward / ripple family -----------------------------------------
@@ -1030,6 +1555,10 @@ export function rippleTrim(project, clipId, edge, deltaMs) {
   const beforeDuration = before.clip.durationMs;
   const beforeEnd = clipEndMs(before.clip);
   const affectedIds = expandWithLinks(project, [clipId]);
+  const affectedMembers = affectedIds.map((id) => findClip(project, id));
+  if (affectedMembers.some((member) => !member || member.track.locked)) {
+    return project;
+  }
   const originalStarts = new Map();
   for (const id of affectedIds) {
     const found = findClip(project, id);
@@ -1037,10 +1566,7 @@ export function rippleTrim(project, clipId, edge, deltaMs) {
       originalStarts.set(id, found.clip.timelineStartMs);
     }
   }
-  let next = project;
-  for (const id of affectedIds) {
-    next = edge === "start" ? trimClipStart(next, id, deltaMs) : trimClipEnd(next, id, deltaMs);
-  }
+  const next = trimClips(project, affectedIds, edge, deltaMs);
   const after = findClip(next, clipId);
   if (!after || next === project) {
     return project;
@@ -1076,36 +1602,96 @@ export function rippleTrim(project, clipId, edge, deltaMs) {
       track.clips.sort((a, b) => a.timelineStartMs - b.timelineStartMs);
     }
   }
-  return cloned;
+  return pruneTransitions(cloned);
 }
 
 // Ripple delete a time range across all (or given) unlocked tracks: clips
 // fully inside vanish, straddling clips get trimmed/split, and everything
 // after slides left to close the gap.
-export function rippleDeleteRange(project, startMs, endMs, trackIds = null) {
-  const from = Math.max(0, Math.round(startMs));
-  const to = Math.max(from, Math.round(endMs));
-  const gap = to - from;
-  if (!gap) {
+function planRippleDeleteRange(project, startMs, endMs, trackIds = null) {
+  let from = Math.max(0, Math.round(cleanNumber(startMs)));
+  let to = Math.max(from, Math.round(cleanNumber(endMs)));
+  if (to === from) {
+    return { from, to, affected: new Set(), touchedLinkIds: new Set(), mutation: false, blocked: null };
+  }
+  let closure;
+  for (;;) {
+    closure = rippleTrackIdsWithLinks(project, trackIds, (clip) => clipEndMs(clip) > from);
+    if (closure.blocked) {
+      return { from, to, affected: new Set(), touchedLinkIds: new Set(), mutation: false, blocked: closure.blocked };
+    }
+    let expandedFrom = from;
+    let expandedTo = to;
+    for (const track of project?.tracks || []) {
+      if (!closure.affected.has(track.id) || track.locked) {
+        continue;
+      }
+      for (const clip of track.clips || []) {
+        const start = clip.timelineStartMs;
+        const end = clipEndMs(clip);
+        if (end <= from || start >= to) {
+          continue;
+        }
+        const headDuration = from - start;
+        const tailDuration = end - to;
+        if (headDuration > 0 && headDuration < MIN_CLIP_DURATION_MS) {
+          expandedFrom = Math.min(expandedFrom, start);
+        }
+        if (tailDuration > 0 && tailDuration < MIN_CLIP_DURATION_MS) {
+          expandedTo = Math.max(expandedTo, end);
+        }
+      }
+    }
+    if (expandedFrom === from && expandedTo === to) {
+      break;
+    }
+    from = expandedFrom;
+    to = expandedTo;
+  }
+  // Boundary expansion can change which group is temporally affected.
+  closure = rippleTrackIdsWithLinks(project, trackIds, (clip) => clipEndMs(clip) > from);
+  if (closure.blocked) {
+    return { from, to, affected: new Set(), touchedLinkIds: new Set(), mutation: false, blocked: closure.blocked };
+  }
+  const mutation = closure.affected.size > 0 && (project?.tracks || []).some(
+    (track) => closure.affected.has(track.id)
+      && !track.locked
+      && (track.clips || []).some((clip) => clipEndMs(clip) > from),
+  );
+  return { from, to, ...closure, mutation };
+}
+
+function applyRippleDeletePlan(project, plan) {
+  if (plan.blocked || !plan.mutation || !plan.affected.size || plan.to <= plan.from) {
     return project;
   }
-  const affected = trackIds ? new Set(trackIds) : null;
+  const { from, to, affected, touchedLinkIds } = plan;
+  const gap = to - from;
   const next = cloneProject(project);
+  const leftCohorts = new Map();
+  const rightCohorts = new Map();
   for (const track of next.tracks) {
-    if (track.locked || (affected && !affected.has(track.id))) {
+    if (track.locked || !affected.has(track.id)) {
       continue;
     }
     const kept = [];
     for (const clip of track.clips) {
       const start = clip.timelineStartMs;
       const end = clipEndMs(clip);
+      const originalLinkId = clip.linkId || "";
       if (end <= from) {
         kept.push(clip);
+        if (touchedLinkIds.has(originalLinkId)) {
+          addCohortMember(leftCohorts, originalLinkId, clip.id);
+        }
         continue;
       }
       if (start >= to) {
         clip.timelineStartMs = Math.max(0, start - gap);
         kept.push(clip);
+        if (touchedLinkIds.has(originalLinkId)) {
+          addCohortMember(rightCohorts, originalLinkId, clip.id);
+        }
         continue;
       }
       // Overlapping: keep the head before the range and/or the tail after it,
@@ -1118,7 +1704,11 @@ export function rippleDeleteRange(project, startMs, endMs, trackIds = null) {
           if (track.kind !== "text") {
             partitionEnvelopesAt(head, null, head.durationMs);
           }
-          kept.push(normalizeClip(head, track.kind));
+          const normalizedHead = normalizeClip(head, track.kind);
+          kept.push(normalizedHead);
+          if (touchedLinkIds.has(originalLinkId)) {
+            addCohortMember(leftCohorts, originalLinkId, normalizedHead.id);
+          }
         }
       }
       if (end > to) {
@@ -1133,47 +1723,126 @@ export function rippleDeleteRange(project, startMs, endMs, trackIds = null) {
           tail.linkId = "";
         }
         if (tail.durationMs >= MIN_CLIP_DURATION_MS) {
-          kept.push(normalizeClip(tail, track.kind));
+          const normalizedTail = normalizeClip(tail, track.kind);
+          kept.push(normalizedTail);
+          if (touchedLinkIds.has(originalLinkId)) {
+            addCohortMember(rightCohorts, originalLinkId, normalizedTail.id);
+          }
         }
       }
     }
     track.clips = kept.sort((a, b) => a.timelineStartMs - b.timelineStartMs);
   }
-  return next;
+  applyLinkCohorts(next, touchedLinkIds, leftCohorts, rightCohorts);
+  return pruneTransitions(next);
+}
+
+export function rippleDeleteRange(project, startMs, endMs, trackIds = null) {
+  const plan = planRippleDeleteRange(project, startMs, endMs, trackIds);
+  return applyRippleDeletePlan(project, plan);
 }
 
 // Insert a gap (ripple insert): everything at/after atMs slides right;
 // straddling clips are split first so the gap opens cleanly.
 export function rippleInsertGap(project, atMs, gapMs, trackIds = null) {
-  const at = Math.max(0, Math.round(atMs));
-  const gap = Math.max(0, Math.round(gapMs));
+  const at = Math.max(0, Math.round(cleanNumber(atMs)));
+  const gap = Math.max(0, Math.round(cleanNumber(gapMs)));
   if (!gap) {
     return project;
   }
-  const affected = trackIds ? new Set(trackIds) : null;
-  let next = cloneProject(project);
-  for (const track of next.tracks) {
-    if (track.locked || (affected && !affected.has(track.id))) {
-      continue;
-    }
-    for (const clip of [...track.clips]) {
-      if (clip.timelineStartMs < at && clipEndMs(clip) > at) {
-        next = splitClip(next, clip.id, at);
-      }
-    }
+  const closure = rippleTrackIdsWithLinks(project, trackIds, (clip) => clipEndMs(clip) > at);
+  if (closure.blocked || !closure.affected.size) {
+    return project;
   }
+  const hasMutation = (project?.tracks || []).some(
+    (track) => closure.affected.has(track.id)
+      && !track.locked
+      && (track.clips || []).some((clip) => {
+        if (clip.timelineStartMs >= at) {
+          return true;
+        }
+        if (clipEndMs(clip) <= at) {
+          return false;
+        }
+        // A sub-minimum right remnant is deliberately kept with the left
+        // fragment; by itself that is a no-op.
+        return clipEndMs(clip) - at >= MIN_CLIP_DURATION_MS;
+      }),
+  );
+  if (!hasMutation) {
+    return project;
+  }
+  const next = cloneProject(project);
+  const leftCohorts = new Map();
+  const rightCohorts = new Map();
   for (const track of next.tracks) {
-    if (track.locked || (affected && !affected.has(track.id))) {
+    if (track.locked || !closure.affected.has(track.id)) {
       continue;
     }
+    const kept = [];
     for (const clip of track.clips) {
-      if (clip.timelineStartMs >= at) {
+      const start = clip.timelineStartMs;
+      const end = clipEndMs(clip);
+      const originalLinkId = clip.linkId || "";
+      const touched = closure.touchedLinkIds.has(originalLinkId);
+      if (end <= at) {
+        kept.push(clip);
+        if (touched) {
+          addCohortMember(leftCohorts, originalLinkId, clip.id);
+        }
+        continue;
+      }
+      if (start >= at) {
         clip.timelineStartMs += gap;
+        kept.push(clip);
+        if (touched) {
+          addCohortMember(rightCohorts, originalLinkId, clip.id);
+        }
+        continue;
+      }
+
+      const leftDuration = at - start;
+      const rightDuration = end - at;
+      if (leftDuration < MIN_CLIP_DURATION_MS) {
+        // Keep the tiny left remnant merged with its adjacent right fragment.
+        clip.timelineStartMs += gap;
+        kept.push(clip);
+        if (touched) {
+          addCohortMember(rightCohorts, originalLinkId, clip.id);
+        }
+        continue;
+      }
+      if (rightDuration < MIN_CLIP_DURATION_MS) {
+        // Keep the tiny right remnant merged with its adjacent left fragment.
+        kept.push(clip);
+        if (touched) {
+          addCohortMember(leftCohorts, originalLinkId, clip.id);
+        }
+        continue;
+      }
+
+      const right = JSON.parse(JSON.stringify(clip));
+      right.id = makeVideoId("clip");
+      right.timelineStartMs = at + gap;
+      right.durationMs = rightDuration;
+      clip.durationMs = leftDuration;
+      if (track.kind !== "text") {
+        right.sourceInMs = (clip.sourceInMs || 0) + Math.round(leftDuration * (clip.speed || 1));
+        right.linkId = "";
+        partitionEnvelopesAt(clip, right, leftDuration);
+      }
+      const normalizedLeft = normalizeClip(clip, track.kind);
+      const normalizedRight = normalizeClip(right, track.kind);
+      kept.push(normalizedLeft, normalizedRight);
+      if (touched) {
+        addCohortMember(leftCohorts, originalLinkId, normalizedLeft.id);
+        addCohortMember(rightCohorts, originalLinkId, normalizedRight.id);
       }
     }
-    track.clips.sort((a, b) => a.timelineStartMs - b.timelineStartMs);
+    track.clips = kept.sort((a, b) => a.timelineStartMs - b.timelineStartMs);
   }
-  return next;
+  applyLinkCohorts(next, closure.touchedLinkIds, leftCohorts, rightCohorts);
+  return pruneTransitions(next);
 }
 
 // --- Captions from transcripts ----------------------------------------------
@@ -1234,6 +1903,16 @@ export function addCaptionsForClip(project, clipId, segments, { style = {} } = {
     }
     const timelineStart = clip.timelineStartMs + Math.round((startSrc - sourceFrom) / speed);
     const durationMs = Math.max(MIN_CLIP_DURATION_MS, Math.round((endSrc - startSrc) / speed));
+    // Word timings ride along (clip-relative, trim/speed-mapped) so the
+    // typewriter/word-reveal/word-highlight animations have data to drive.
+    const words = (Array.isArray(segment.words) ? segment.words : [])
+      .filter((word) => Number.isFinite(Number(word?.startMs)) && Number.isFinite(Number(word?.endMs)))
+      .map((word) => ({
+        text: String(word.text || "").trim(),
+        startMs: Math.round((Math.max(Number(word.startMs), startSrc) - startSrc) / speed),
+        endMs: Math.round((Math.min(Number(word.endMs), endSrc) - startSrc) / speed),
+      }))
+      .filter((word) => word.text && word.endMs > word.startMs);
     track.clips.push(
       normalizeClip(
         {
@@ -1243,6 +1922,7 @@ export function addCaptionsForClip(project, clipId, segments, { style = {} } = {
           durationMs,
           style: { ...CAPTION_TEXT_STYLE, ...style },
           captionGroup,
+          words: words.length ? words : undefined,
         },
         "text",
       ),
@@ -1256,7 +1936,12 @@ export function addCaptionsForClip(project, clipId, segments, { style = {} } = {
 // Remove transcript words from the cut: turns the words' source spans into
 // timeline ranges via every clip using that asset, merges adjacent ranges,
 // and ripple-deletes them. The AI-native "delete the umms" primitive.
-export function rippleDeleteWords(project, assetPath, words, { mergeGapMs = 120 } = {}) {
+export function rippleDeleteWords(
+  project,
+  assetPath,
+  words,
+  { mergeGapMs = RIPPLE_DELETE_WORDS_MERGE_GAP_MS } = {},
+) {
   const spans = (Array.isArray(words) ? words : [])
     .filter((word) => Number.isFinite(Number(word?.startMs)) && Number.isFinite(Number(word?.endMs)))
     .map((word) => ({ startMs: Math.round(word.startMs), endMs: Math.round(word.endMs) }))
@@ -1292,17 +1977,80 @@ export function rippleDeleteWords(project, assetPath, words, { mergeGapMs = 120 
         timelineRanges.push({
           startMs: clip.timelineStartMs + Math.round((from - sourceFrom) / speed),
           endMs: clip.timelineStartMs + Math.round((to - sourceFrom) / speed),
+          trackId: track.id,
+          trackLocked: track.locked === true,
         });
       }
     }
   }
-  timelineRanges.sort((a, b) => a.startMs - b.startMs);
+  // A source mapping on a locked-only track would not be discovered by the
+  // default unlocked-track ripple seed, so retain mapping provenance and veto
+  // it explicitly before any back-to-front mutation begins.
+  const lockedMapping = timelineRanges.find((range) => range.trackLocked);
+  if (lockedMapping) {
+    const track = (project?.tracks || []).find((entry) => entry.id === lockedMapping.trackId);
+    return {
+      project,
+      ranges: [],
+      blocked: lockedTrackBlock(track, "Word deletion"),
+    };
+  }
+  timelineRanges.sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs);
+  let effectiveRanges = [];
+  for (const range of timelineRanges) {
+    const last = effectiveRanges[effectiveRanges.length - 1];
+    if (last && range.startMs <= last.endMs) {
+      last.endMs = Math.max(last.endMs, range.endMs);
+    } else {
+      effectiveRanges.push({ startMs: range.startMs, endMs: range.endMs });
+    }
+  }
+  if (!effectiveRanges.length) {
+    return { project, ranges: [] };
+  }
+
+  // Plan every range against the untouched project. Minimum-duration
+  // expansion can make ranges overlap, so merge and re-plan until stable.
+  for (;;) {
+    const plannedRanges = [];
+    for (const range of effectiveRanges) {
+      const plan = planRippleDeleteRange(project, range.startMs, range.endMs, null);
+      if (plan.blocked) {
+        return { project, ranges: [], blocked: plan.blocked };
+      }
+      if (plan.mutation) {
+        plannedRanges.push({ startMs: plan.from, endMs: plan.to });
+      }
+    }
+    plannedRanges.sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs);
+    const mergedRanges = [];
+    for (const range of plannedRanges) {
+      const last = mergedRanges[mergedRanges.length - 1];
+      if (last && range.startMs <= last.endMs) {
+        last.endMs = Math.max(last.endMs, range.endMs);
+      } else {
+        mergedRanges.push({ ...range });
+      }
+    }
+    if (JSON.stringify(mergedRanges) === JSON.stringify(effectiveRanges)) {
+      effectiveRanges = mergedRanges;
+      break;
+    }
+    effectiveRanges = mergedRanges;
+  }
+
   // Delete back-to-front so earlier ranges stay valid.
   let next = project;
-  for (let index = timelineRanges.length - 1; index >= 0; index -= 1) {
-    next = rippleDeleteRange(next, timelineRanges[index].startMs, timelineRanges[index].endMs);
+  for (let index = effectiveRanges.length - 1; index >= 0; index -= 1) {
+    const range = effectiveRanges[index];
+    const plan = planRippleDeleteRange(next, range.startMs, range.endMs, null);
+    if (plan.blocked) {
+      // Defensive transactional fallback: discard the local immutable chain.
+      return { project, ranges: [], blocked: plan.blocked };
+    }
+    next = applyRippleDeletePlan(next, plan);
   }
-  return { project: next, ranges: timelineRanges };
+  return { project: next, ranges: effectiveRanges };
 }
 
 export function removeClip(project, clipId) {
@@ -1312,7 +2060,7 @@ export function removeClip(project, clipId) {
     return project;
   }
   found.track.clips = found.track.clips.filter((clip) => clip.id !== clipId);
-  return next;
+  return pruneTransitions(next);
 }
 
 export function addTrack(project, kind) {
@@ -1383,7 +2131,49 @@ export function updateClip(project, clipId, patch) {
       if (patch?.style && typeof patch.style === "object") {
         clip.style = normalizeTextStyle({ ...clip.style, ...patch.style });
       }
+      if (typeof patch?.anim === "string") {
+        clip.anim = VIDEO_TEXT_ANIMS.includes(patch.anim) ? patch.anim : "none";
+        if (clip.anim === "word-highlight") {
+          clip.animOpts = {
+            highlightColor:
+              cleanText(patch.animOpts?.highlightColor || clip.animOpts?.highlightColor) || "#fbbf24",
+          };
+        } else {
+          delete clip.animOpts;
+        }
+      } else if (patch?.animOpts && typeof patch.animOpts === "object" && clip.anim === "word-highlight") {
+        clip.animOpts = {
+          highlightColor:
+            cleanText(patch.animOpts.highlightColor) || clip.animOpts?.highlightColor || "#fbbf24",
+        };
+      }
+      if (patch?.words !== undefined) {
+        const words = normalizeWords(patch.words, clip.durationMs);
+        if (words) {
+          clip.words = words;
+        } else {
+          delete clip.words;
+        }
+      }
     } else {
+      // fx/crop merge over current values; null (or a patch resolving to all
+      // defaults) clears the field so untouched clips stay lean.
+      if (patch?.fx !== undefined) {
+        const fx = patch.fx === null ? null : normalizeFx({ ...VIDEO_FX_DEFAULTS, ...clip.fx, ...patch.fx });
+        if (fx) {
+          clip.fx = fx;
+        } else {
+          delete clip.fx;
+        }
+      }
+      if (patch?.crop !== undefined) {
+        const crop = patch.crop === null ? null : normalizeCrop({ ...clip.crop, ...patch.crop });
+        if (crop) {
+          clip.crop = crop;
+        } else {
+          delete clip.crop;
+        }
+      }
       if (patch?.gain && typeof patch.gain === "object") {
         clip.gain = normalizeGain({ ...clip.gain, ...patch.gain });
       }
