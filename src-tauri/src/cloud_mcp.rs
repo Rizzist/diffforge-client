@@ -26315,8 +26315,41 @@ fn cloud_mcp_compact_insert_value(
     }
 }
 
+fn cloud_mcp_remove_unauthored_terminal_prompt_fields(source: &Value, target: &mut Value) {
+    let Some(target) = target.as_object_mut() else {
+        return;
+    };
+    for aliases in [
+        &["prompt_id", "promptId"][..],
+        &["prompt_kind", "promptKind"][..],
+        &["prompt_options", "promptOptions"][..],
+        &["allows_free_text", "allowsFreeText"][..],
+        &["prompt_default_option", "promptDefaultOption"][..],
+        &["prompt_ttl_ms", "promptTtlMs"][..],
+        &[
+            "manual_approval_required",
+            "manualApprovalRequired",
+        ][..],
+        &[
+            "provider_blocked_for_user",
+            "providerBlockedForUser",
+        ][..],
+        &[
+            "terminal_is_prompting_user",
+            "terminalIsPromptingUser",
+        ][..],
+        &["prompting_user_text", "promptingUserText"][..],
+    ] {
+        if aliases.iter().all(|key| source.get(*key).is_none()) {
+            for key in aliases {
+                target.remove(*key);
+            }
+        }
+    }
+}
+
 fn cloud_mcp_compact_terminal_live_state(terminal: &Value, index: usize) -> Value {
-    let mut item = serde_json::Map::new();
+    let mut item = terminal.as_object().cloned().unwrap_or_default();
     cloud_mcp_compact_insert_value(
         &mut item,
         "id",
@@ -27101,6 +27134,8 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
     let mut has_workspace_state = false;
     let mut cli_states = Value::Null;
     let mut has_cli_state = false;
+    let mut terminal_orchestrators = Vec::new();
+    let mut has_terminal_orchestrator_state = false;
 
     let (lifecycle_workspaces, workspace_catalog_ready) =
         cloud_mcp_lifecycle_workspaces(state).await;
@@ -27137,6 +27172,24 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
                 cli_states = clis.clone();
                 has_cli_state = true;
             }
+        }
+        if let Some(orchestrator_source) = snapshots
+            .workspace_terminals
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .get("terminal_orchestrators")
+                    .or_else(|| snapshot.get("terminalOrchestrators"))
+            })
+        {
+            has_terminal_orchestrator_state = true;
+            terminal_orchestrators = cloud_mcp_live_state_values(Some(orchestrator_source))
+                .into_iter()
+                .enumerate()
+                .map(|(index, terminal)| {
+                    cloud_mcp_compact_terminal_live_state(&terminal, index)
+                })
+                .collect();
         }
     }
 
@@ -27233,6 +27286,24 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
         }
         if has_cli_state {
             object.insert("cli_states".to_string(), cli_states);
+        }
+        if has_terminal_orchestrator_state {
+            object.insert(
+                "terminal_orchestrator_count".to_string(),
+                json!(terminal_orchestrators.len()),
+            );
+            object.insert(
+                "terminalOrchestratorCount".to_string(),
+                json!(terminal_orchestrators.len()),
+            );
+            object.insert(
+                "terminal_orchestrators".to_string(),
+                Value::Array(terminal_orchestrators.clone()),
+            );
+            object.insert(
+                "terminalOrchestrators".to_string(),
+                Value::Array(terminal_orchestrators),
+            );
         }
     }
     payload
@@ -35793,7 +35864,7 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
                         "paneId",
                     ],
                 );
-                Some(json!({
+                let mut normalized = json!({
                     "presence_agent_id": cloud_mcp_payload_text(
                         terminal,
                         &["presence_agent_id", "presenceAgentId", "id"],
@@ -35909,7 +35980,16 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
                         .or_else(|| terminal.get("waitingOn"))
                         .cloned()
                         .unwrap_or(Value::Null),
-                }))
+                });
+                cloud_mcp_remove_unauthored_terminal_prompt_fields(terminal, &mut normalized);
+                if let (Some(normalized), Some(authored)) =
+                    (normalized.as_object_mut(), terminal.as_object())
+                {
+                    for (key, value) in authored {
+                        normalized.insert(key.clone(), value.clone());
+                    }
+                }
+                Some(normalized)
             })
             .collect::<Vec<_>>();
         let mut terminals = terminals;
@@ -59641,6 +59721,46 @@ mod cloud_mcp_tests {
         assert_eq!(terminal["terminal_is_prompting_user"], json!(true));
     }
 
+    #[tokio::test]
+    async fn terminal_orchestrator_is_included_losslessly_in_full_device_snapshot() {
+        let state = CloudMcpState::new();
+        let payload = json!({
+            "event_kind": "device_terminal_orchestrator_update",
+            "workspace_id": CLOUD_MCP_APP_CONTROL_WORKSPACE_ID,
+            "workspace_name": "App Control",
+            "terminal_id": CLOUD_MCP_APP_CONTROL_PANE_ID,
+            "pane_id": CLOUD_MCP_APP_CONTROL_PANE_ID,
+            "terminal_instance_id": 9,
+            "terminal_scope": "device",
+            "terminal_kind": "terminal_orchestrator",
+            "status": "awaiting_input",
+            "prompt_id": "app-prompt-1",
+            "prompt_kind": "approval",
+            "prompt_options": [{"id": "continue", "label": "Continue"}],
+            "terminal_is_prompting_user": true,
+            "future_terminal_field": {"verbatim": [1, 2, 3]}
+        });
+
+        cloud_mcp_apply_terminal_state_to_device_live_snapshot(
+            &state,
+            &payload,
+            "device_terminal_orchestrator_update",
+        )
+        .await;
+        let snapshot =
+            cloud_mcp_device_live_state_snapshot_payload(&state, "terminal_orchestrator_test")
+                .await;
+        let terminal = &snapshot["terminal_orchestrators"][0];
+        assert_eq!(snapshot["terminal_orchestrator_count"], json!(1));
+        assert_eq!(terminal["prompt_id"], json!("app-prompt-1"));
+        assert_eq!(terminal["prompt_options"][0]["id"], json!("continue"));
+        assert_eq!(terminal["terminal_is_prompting_user"], json!(true));
+        assert_eq!(
+            terminal["future_terminal_field"],
+            json!({"verbatim": [1, 2, 3]})
+        );
+    }
+
     #[test]
     fn agent_chat_permission_config_record_enqueues_session_sync_delta() {
         let _guard = CLOUD_MCP_TEST_ENV_LOCK
@@ -60842,6 +60962,51 @@ mod cloud_mcp_tests {
             explicit_clear["terminals"].as_array().map(Vec::len),
             Some(0),
         );
+    }
+
+    #[test]
+    fn terminal_wire_compaction_preserves_prompt_body_and_explicit_idle_clear() {
+        let prompt = cloud_mcp_compact_terminal_live_state(
+            &json!({
+                "pane_id": "pane-1",
+                "status": "awaiting_input",
+                "prompt_id": "prompt-1",
+                "prompt_kind": "approval",
+                "prompt_options": [{"id": "continue", "label": "Continue"}],
+                "allows_free_text": true,
+                "manual_approval_required": true,
+                "provider_blocked_for_user": true,
+                "terminal_is_prompting_user": true,
+                "prompting_user_text": "Continue?",
+                "future_terminal_field": {"verbatim": [1, 2, 3]}
+            }),
+            0,
+        );
+        assert_eq!(prompt["prompt_id"], json!("prompt-1"));
+        assert_eq!(prompt["prompt_options"][0]["id"], json!("continue"));
+        assert_eq!(prompt["terminal_is_prompting_user"], json!(true));
+        assert_eq!(
+            prompt["future_terminal_field"],
+            json!({"verbatim": [1, 2, 3]})
+        );
+
+        let idle = cloud_mcp_compact_terminal_live_state(
+            &json!({
+                "pane_id": "pane-1",
+                "status": "idle",
+                "prompt_id": "",
+                "prompt_options": [],
+                "allows_free_text": false,
+                "manual_approval_required": false,
+                "provider_blocked_for_user": false,
+                "terminal_is_prompting_user": false,
+                "prompting_user_text": ""
+            }),
+            0,
+        );
+        assert_eq!(idle["prompt_id"], json!(""));
+        assert_eq!(idle["prompt_options"], json!([]));
+        assert_eq!(idle["terminal_is_prompting_user"], json!(false));
     }
 
     #[test]
