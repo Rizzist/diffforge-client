@@ -1,21 +1,31 @@
 // Aura Mode 3D scene — vanilla three.js engine (no react-three-fiber).
-// UI-only: renders the mock orchestration graph (workspaces → terminals with
-// live-state colors, todo particles in flight, docs + MCP orbital rings)
-// around a central aura core. The React shell (AuraMode.jsx) owns the DOM HUD.
+// UI-only: renders the mock fleet (auraMockData.js) as a device-centric
+// constellation. Each device is a node inside a transparent sphere; its
+// workspaces branch outward from the device, terminals branch off each
+// workspace (deterministic fan layout — no overlap), and the local device
+// carries a labeled script ring. Node colors follow state; each workspace
+// branch keeps a unique hue. The React shell (AuraMode.jsx) owns the HUD.
 
 import * as THREE from "three";
 
-import { AURA_STATE_COLORS, AURA_STATE_LABELS } from "./auraMockData.js";
+import {
+  AURA_BRANCH_HUES,
+  AURA_DEVICE_KIND_COLORS,
+  AURA_DEVICE_KIND_LABELS,
+  AURA_STATE_COLORS,
+  AURA_STATE_LABELS,
+  auraWorkspaceState,
+} from "./auraMockData.js";
 
 const COLORS = {
   coreCyan: 0x4fd8ff,
   coreEmber: 0xff9a3c,
   containment: 0x274a66,
-  edge: 0x4fd8ff,
   star: 0x9fb4d8,
   doc: 0xffd27d,
   mcp: 0xb48cff,
   queued: 0xffd27d,
+  spoke: 0x3a5a7d,
 };
 
 const TWO_PI = Math.PI * 2;
@@ -98,17 +108,17 @@ export class AuraSceneEngine {
     // Camera orbit state (hand-rolled so we skip the OrbitControls addon).
     this.orbit = {
       theta: 0.6,
-      phi: 1.18,
-      radius: 10.4,
+      phi: 1.16,
+      radius: 13.4,
       targetTheta: 0.6,
-      targetPhi: 1.18,
-      targetRadius: 10.4,
+      targetPhi: 1.16,
+      targetRadius: 13.4,
     };
 
     this.scene = new THREE.Scene();
-    this.scene.fog = new THREE.FogExp2(0x02040a, 0.012);
+    this.scene.fog = new THREE.FogExp2(0x02040a, 0.007);
 
-    this.camera = new THREE.PerspectiveCamera(48, 1, 0.1, 240);
+    this.camera = new THREE.PerspectiveCamera(48, 1, 0.1, 260);
 
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
@@ -128,28 +138,29 @@ export class AuraSceneEngine {
     this.buildLights();
     this.buildStarfield();
     this.buildCore();
-    this.buildWorkspaceGraph();
+    this.buildDeviceTrees();
+    this.buildEdges();
     this.buildOuterRing({
       items: this.data.docs,
-      radius: 5.05,
-      tilt: new THREE.Euler(0.42, 0, 0.08),
+      radius: 7.6,
+      tilt: new THREE.Euler(0.4, 0, 0.08),
       color: COLORS.doc,
       kind: "doc",
       kindLabel: "Doc",
-      makeNodeGeometry: () => new THREE.OctahedronGeometry(0.13),
+      makeNodeGeometry: () => new THREE.OctahedronGeometry(0.14),
       key: "docsRing",
-      speed: 0.055,
+      speed: 0.05,
     });
     this.buildOuterRing({
       items: this.data.mcps,
-      radius: 5.75,
-      tilt: new THREE.Euler(-0.5, 0, -0.22),
+      radius: 8.4,
+      tilt: new THREE.Euler(-0.48, 0, -0.2),
       color: COLORS.mcp,
       kind: "mcp",
       kindLabel: "MCP",
-      makeNodeGeometry: () => new THREE.BoxGeometry(0.15, 0.15, 0.15),
+      makeNodeGeometry: () => new THREE.BoxGeometry(0.16, 0.16, 0.16),
       key: "mcpRing",
-      speed: -0.042,
+      speed: -0.038,
     });
     this.buildTodoParticles();
 
@@ -172,12 +183,12 @@ export class AuraSceneEngine {
   }
 
   buildLights() {
-    this.scene.add(new THREE.AmbientLight(0x8fa8d0, 0.55));
-    const coreLight = new THREE.PointLight(COLORS.coreCyan, 60, 40, 1.8);
-    coreLight.position.set(0, 0.4, 0);
+    this.scene.add(new THREE.AmbientLight(0x8fa8d0, 0.6));
+    const coreLight = new THREE.PointLight(COLORS.coreCyan, 70, 60, 1.7);
+    coreLight.position.set(0, 0.6, 0);
     this.scene.add(coreLight);
-    const rim = new THREE.DirectionalLight(0xffb277, 0.8);
-    rim.position.set(6, 8, -4);
+    const rim = new THREE.DirectionalLight(0xffb277, 0.7);
+    rim.position.set(7, 9, -5);
     this.scene.add(rim);
   }
 
@@ -185,7 +196,7 @@ export class AuraSceneEngine {
     const count = 1400;
     const positions = new Float32Array(count * 3);
     for (let i = 0; i < count; i += 1) {
-      const r = 42 + Math.random() * 60;
+      const r = 50 + Math.random() * 70;
       const theta = Math.random() * TWO_PI;
       const phi = Math.acos(2 * Math.random() - 1);
       positions[i * 3] = r * Math.sin(phi) * Math.cos(theta);
@@ -198,7 +209,7 @@ export class AuraSceneEngine {
       geometry,
       new THREE.PointsMaterial({
         color: COLORS.star,
-        size: 0.55,
+        size: 0.6,
         sizeAttenuation: true,
         transparent: true,
         opacity: 0.5,
@@ -208,12 +219,14 @@ export class AuraSceneEngine {
     this.scene.add(this.starfield);
   }
 
+  /* The orchestrator heart: compact ring pair + halo at the origin. Devices
+     arrange around it and connect back with faint spokes. */
   buildCore() {
     this.coreGroup = new THREE.Group();
     this.root.add(this.coreGroup);
 
     const ringA = new THREE.Mesh(
-      new THREE.TorusGeometry(3.55, 0.016, 12, 260),
+      new THREE.TorusGeometry(1.55, 0.013, 12, 220),
       new THREE.MeshBasicMaterial({
         color: COLORS.coreCyan,
         transparent: true,
@@ -222,12 +235,12 @@ export class AuraSceneEngine {
         depthWrite: false,
       }),
     );
-    ringA.rotation.x = Math.PI / 2 - 0.06;
+    ringA.rotation.x = Math.PI / 2 - 0.05;
     this.coreGroup.add(ringA);
     this.ringA = ringA;
 
     const ringB = new THREE.Mesh(
-      new THREE.TorusGeometry(3.82, 0.011, 12, 260),
+      new THREE.TorusGeometry(1.78, 0.009, 12, 220),
       new THREE.MeshBasicMaterial({
         color: COLORS.coreEmber,
         transparent: true,
@@ -236,194 +249,415 @@ export class AuraSceneEngine {
         depthWrite: false,
       }),
     );
-    ringB.rotation.x = Math.PI / 2 + 0.2;
+    ringB.rotation.x = Math.PI / 2 + 0.22;
     ringB.rotation.y = 0.14;
     this.coreGroup.add(ringB);
     this.ringB = ringB;
 
-    // Dashed outer accent ring: a circle of points, counter-rotating.
-    const dashCount = 170;
-    const dashPositions = new Float32Array(dashCount * 3);
-    for (let i = 0; i < dashCount; i += 1) {
-      const angle = (i / dashCount) * TWO_PI;
-      dashPositions[i * 3] = Math.cos(angle) * 4.12;
-      dashPositions[i * 3 + 1] = 0;
-      dashPositions[i * 3 + 2] = Math.sin(angle) * 4.12;
-    }
-    const dashGeometry = new THREE.BufferGeometry();
-    dashGeometry.setAttribute("position", new THREE.BufferAttribute(dashPositions, 3));
-    this.ringDots = new THREE.Points(
-      dashGeometry,
-      new THREE.PointsMaterial({
-        color: 0xbfe8ff,
-        size: 0.045,
-        transparent: true,
-        opacity: 0.55,
-        depthWrite: false,
-        blending: THREE.AdditiveBlending,
+    const core = new THREE.Mesh(
+      new THREE.IcosahedronGeometry(0.42, 1),
+      new THREE.MeshStandardMaterial({
+        color: 0x0b1220,
+        emissive: new THREE.Color(COLORS.coreCyan),
+        emissiveIntensity: 0.9,
+        metalness: 0.3,
+        roughness: 0.35,
       }),
     );
-    this.ringDots.rotation.x = -0.08;
-    this.coreGroup.add(this.ringDots);
-
-    this.containment = new THREE.Mesh(
-      new THREE.IcosahedronGeometry(3.34, 2),
-      new THREE.MeshBasicMaterial({
-        color: COLORS.containment,
-        wireframe: true,
-        transparent: true,
-        opacity: 0.1,
-        depthWrite: false,
-      }),
-    );
-    this.coreGroup.add(this.containment);
+    core.userData = {
+      kind: "core",
+      label: "Orchestrator",
+      detail: "Fleet heart",
+      baseScale: 1,
+    };
+    this.coreGroup.add(core);
+    this.coreMesh = core;
+    this.hoverables.push(core);
 
     const halo = new THREE.Sprite(
       new THREE.SpriteMaterial({
         map: this.glowSoft,
         transparent: true,
-        opacity: 0.42,
+        opacity: 0.4,
         blending: THREE.AdditiveBlending,
         depthWrite: false,
       }),
     );
-    halo.scale.set(7.4, 7.4, 1);
+    halo.scale.set(3.6, 3.6, 1);
     this.coreGroup.add(halo);
     this.halo = halo;
   }
 
-  buildWorkspaceGraph() {
-    this.graphGroup = new THREE.Group();
-    this.coreGroup.add(this.graphGroup);
-
+  /* Deterministic fan layout: device i sits on a ring around the core; its
+     workspaces fan outward (away from the core) around the device, and each
+     workspace's terminals fan further out around the workspace. Branch
+     angles are index-derived so siblings never overlap. */
+  buildDeviceTrees() {
+    this.deviceNodes = [];
     this.workspaceNodes = [];
     this.terminalNodes = [];
+    this.scriptNodes = [];
 
-    const workspaces = this.data.workspaces;
-    workspaces.forEach((workspace, index) => {
-      const angle = (index / workspaces.length) * TWO_PI + 0.7;
-      const radius = 1.9;
-      const baseY = ((index % 2 === 0 ? 1 : -1) * (0.34 + 0.14 * (index % 3)));
+    const devices = this.data.devices || [];
+    const deviceRadius = 4.7;
+    let branchHueCursor = 0;
+
+    devices.forEach((device, deviceIndex) => {
+      const isLocal = device.kind === "local";
+      const angle = (deviceIndex / Math.max(devices.length, 1)) * TWO_PI + 0.85;
+      const position = new THREE.Vector3(
+        Math.cos(angle) * deviceRadius,
+        (deviceIndex % 2 === 0 ? 1 : -1) * 0.5,
+        Math.sin(angle) * deviceRadius,
+      );
+      const outward = position.clone().setY(0).normalize();
+      const side = new THREE.Vector3(-outward.z, 0, outward.x);
 
       const group = new THREE.Group();
-      this.graphGroup.add(group);
+      group.position.copy(position);
+      this.root.add(group);
 
-      const color = new THREE.Color(workspace.accent);
-      const mesh = new THREE.Mesh(
-        new THREE.IcosahedronGeometry(0.28, 1),
-        new THREE.MeshStandardMaterial({
-          color: 0x0b1220,
-          emissive: color,
-          emissiveIntensity: 0.7,
-          metalness: 0.2,
-          roughness: 0.35,
-        }),
-      );
-      mesh.userData = {
-        kind: "workspace",
-        label: workspace.name,
-        detail: `${workspace.terminals.length} terminals · ${workspace.todos.queued} queued · ${workspace.todos.running} running`,
-        baseScale: 1,
-      };
-      group.add(mesh);
-      this.hoverables.push(mesh);
+      const kindColor = new THREE.Color(AURA_DEVICE_KIND_COLORS[device.kind] || "#4fd8ff");
+      const sphereRadius = isLocal ? 1.28 : 1.02;
 
-      const wire = new THREE.Mesh(
-        new THREE.IcosahedronGeometry(0.4, 1),
+      // Transparent containment sphere: soft inner shell + wireframe skin.
+      const shell = new THREE.Mesh(
+        new THREE.SphereGeometry(sphereRadius, 32, 24),
         new THREE.MeshBasicMaterial({
-          color,
-          wireframe: true,
+          color: kindColor,
           transparent: true,
-          opacity: 0.24,
+          opacity: 0.05,
+          side: THREE.BackSide,
           depthWrite: false,
         }),
       );
-      group.add(wire);
+      group.add(shell);
+      const skin = new THREE.Mesh(
+        new THREE.IcosahedronGeometry(sphereRadius, 2),
+        new THREE.MeshBasicMaterial({
+          color: kindColor,
+          wireframe: true,
+          transparent: true,
+          opacity: device.status === "standby" ? 0.06 : 0.11,
+          depthWrite: false,
+        }),
+      );
+      group.add(skin);
+
+      // Device node inside the sphere.
+      const nodeMesh = new THREE.Mesh(
+        new THREE.IcosahedronGeometry(isLocal ? 0.24 : 0.19, 1),
+        new THREE.MeshStandardMaterial({
+          color: 0x0b1220,
+          emissive: kindColor,
+          emissiveIntensity: device.status === "standby" ? 0.35 : 0.95,
+          metalness: 0.25,
+          roughness: 0.35,
+        }),
+      );
+      const workspaceCount = (device.workspaces || []).length;
+      const terminalCount = (device.workspaces || []).reduce(
+        (sum, ws) => sum + (ws.terminals || []).length,
+        0,
+      );
+      nodeMesh.userData = {
+        kind: "device",
+        label: device.name,
+        detail: `${AURA_DEVICE_KIND_LABELS[device.kind] || device.kind} · ${AURA_STATE_LABELS[device.status] || device.status} · ${workspaceCount} ws · ${terminalCount} term`,
+        baseScale: 1,
+      };
+      group.add(nodeMesh);
+      this.hoverables.push(nodeMesh);
 
       const glow = new THREE.Sprite(
         new THREE.SpriteMaterial({
           map: this.glowSoft,
-          color,
+          color: kindColor,
           transparent: true,
-          opacity: 0.4,
+          opacity: device.status === "standby" ? 0.16 : 0.34,
           blending: THREE.AdditiveBlending,
           depthWrite: false,
         }),
       );
-      glow.scale.set(1.5, 1.5, 1);
+      glow.scale.set(1.7, 1.7, 1);
       group.add(glow);
 
-      const label = makeLabelSprite(workspace.name, { fontSize: 44, height: 0.3 });
-      label.position.set(0, 0.62, 0);
+      const label = makeLabelSprite(device.name, { fontSize: 46, height: 0.32 });
+      label.position.set(0, sphereRadius + 0.42, 0);
       group.add(label);
+      const kindTag = makeLabelSprite(
+        (AURA_DEVICE_KIND_LABELS[device.kind] || device.kind).toUpperCase(),
+        { fontSize: 30, height: 0.16, color: "rgba(160, 186, 224, 0.72)" },
+      );
+      kindTag.position.set(0, sphereRadius + 0.2, 0);
+      group.add(kindTag);
 
-      const node = {
-        workspace,
+      const deviceNode = {
+        device,
         group,
-        mesh,
-        wire,
-        angle,
-        radius,
-        baseY,
-        bobPhase: index * 1.7,
-        terminals: [],
+        mesh: nodeMesh,
+        skin,
+        basePosition: position.clone(),
+        bobPhase: deviceIndex * 2.1,
+        isLocal,
+        sphereRadius,
+        workspaces: [],
       };
-      this.workspaceNodes.push(node);
+      this.deviceNodes.push(deviceNode);
 
-      workspace.terminals.forEach((terminal, termIndex) => {
-        const stateColor = new THREE.Color(AURA_STATE_COLORS[terminal.state] || AURA_STATE_COLORS.idle);
-        const termMesh = new THREE.Mesh(
-          new THREE.SphereGeometry(0.082, 18, 18),
+      // Workspaces: fan outward from the device sphere.
+      const workspaces = device.workspaces || [];
+      const wsSpread = Math.min(1.9, 0.85 * Math.max(workspaces.length - 1, 1));
+      workspaces.forEach((workspace, wsIndex) => {
+        const hue = AURA_BRANCH_HUES[branchHueCursor % AURA_BRANCH_HUES.length];
+        branchHueCursor += 1;
+        const branchColor = new THREE.Color(hue);
+        const state = auraWorkspaceState(workspace);
+        const stateColor = new THREE.Color(AURA_STATE_COLORS[state] || AURA_STATE_COLORS.idle);
+
+        const t = workspaces.length > 1 ? wsIndex / (workspaces.length - 1) - 0.5 : 0;
+        const wsDir = outward.clone()
+          .addScaledVector(side, t * wsSpread)
+          .normalize();
+        const wsOffset = wsDir.multiplyScalar(sphereRadius + 1.05);
+        wsOffset.y += (wsIndex % 2 === 0 ? 0.34 : -0.3);
+        const wsAnchor = position.clone().add(wsOffset);
+
+        const wsGroup = new THREE.Group();
+        wsGroup.position.copy(wsAnchor);
+        this.root.add(wsGroup);
+
+        // Unique branch hue on the wireframe shell; state color at the core.
+        const wsWire = new THREE.Mesh(
+          new THREE.IcosahedronGeometry(0.2, 1),
+          new THREE.MeshBasicMaterial({
+            color: branchColor,
+            wireframe: true,
+            transparent: true,
+            opacity: 0.5,
+            depthWrite: false,
+          }),
+        );
+        wsGroup.add(wsWire);
+        const wsCore = new THREE.Mesh(
+          new THREE.SphereGeometry(0.115, 18, 18),
           new THREE.MeshStandardMaterial({
             color: 0x060a12,
             emissive: stateColor,
-            emissiveIntensity: terminal.state === "running" ? 1.5 : 0.8,
-            metalness: 0.1,
+            emissiveIntensity: state === "running" ? 1.4 : state === "attention" ? 1.6 : 0.7,
+            metalness: 0.15,
             roughness: 0.4,
           }),
         );
-        termMesh.userData = {
-          kind: "terminal",
-          label: `${workspace.name} / ${terminal.name}`,
-          detail: AURA_STATE_LABELS[terminal.state] || terminal.state,
+        wsCore.userData = {
+          kind: "workspace",
+          label: workspace.name,
+          detail: `${AURA_STATE_LABELS[state]} · ${(workspace.terminals || []).length} terminals · ${workspace.todos?.running || 0} running · ${workspace.todos?.queued || 0} queued`,
           baseScale: 1,
         };
-        this.graphGroup.add(termMesh);
-        this.hoverables.push(termMesh);
+        wsGroup.add(wsCore);
+        this.hoverables.push(wsCore);
 
-        const orbit = {
-          mesh: termMesh,
-          parent: node,
-          state: terminal.state,
-          radius: 0.66 + termIndex * 0.13,
-          speed: (0.34 + (termIndex % 3) * 0.11) * (termIndex % 2 === 0 ? 1 : -1),
-          phase: termIndex * 2.4 + index,
-          tilt: new THREE.Quaternion().setFromEuler(
-            new THREE.Euler((termIndex * 0.9 + index) % 1.2 - 0.6, 0, ((termIndex + index) * 0.7) % 1.4 - 0.7),
-          ),
-          blinkPhase: termIndex * 1.3,
+        const wsLabel = makeLabelSprite(workspace.name, { fontSize: 38, height: 0.23 });
+        wsLabel.position.set(0, 0.42, 0);
+        wsGroup.add(wsLabel);
+
+        const workspaceNode = {
+          workspace,
+          state,
+          group: wsGroup,
+          core: wsCore,
+          wire: wsWire,
+          anchor: wsAnchor.clone(),
+          branchColor,
+          parent: deviceNode,
+          bobPhase: wsIndex * 1.7 + deviceIndex,
+          terminals: [],
         };
-        node.terminals.push(orbit);
-        this.terminalNodes.push(orbit);
+        deviceNode.workspaces.push(workspaceNode);
+        this.workspaceNodes.push(workspaceNode);
+
+        // Terminals: smaller fan continuing outward from the workspace.
+        const terminals = workspace.terminals || [];
+        const termSpread = Math.min(1.5, 0.7 * Math.max(terminals.length - 1, 1));
+        terminals.forEach((terminal, termIndex) => {
+          const tt = terminals.length > 1 ? termIndex / (terminals.length - 1) - 0.5 : 0;
+          const termDir = wsAnchor.clone().sub(position).setY(0).normalize()
+            .addScaledVector(side, tt * termSpread)
+            .normalize();
+          const termAnchor = wsAnchor.clone()
+            .addScaledVector(termDir, 0.85)
+            .add(new THREE.Vector3(0, (termIndex % 2 === 0 ? 0.22 : -0.2), 0));
+
+          const termColor = new THREE.Color(
+            AURA_STATE_COLORS[terminal.state] || AURA_STATE_COLORS.idle,
+          );
+          const termMesh = new THREE.Mesh(
+            new THREE.SphereGeometry(0.07, 16, 16),
+            new THREE.MeshStandardMaterial({
+              color: 0x060a12,
+              emissive: termColor,
+              emissiveIntensity: terminal.state === "running" ? 1.5 : 0.8,
+              metalness: 0.1,
+              roughness: 0.4,
+            }),
+          );
+          termMesh.position.copy(termAnchor);
+          termMesh.userData = {
+            kind: "terminal",
+            label: `${workspace.name} / ${terminal.name}`,
+            detail: AURA_STATE_LABELS[terminal.state] || terminal.state,
+            baseScale: 1,
+          };
+          this.root.add(termMesh);
+          this.hoverables.push(termMesh);
+
+          const termLabel = makeLabelSprite(terminal.name, {
+            fontSize: 28,
+            height: 0.14,
+            color: "rgba(196, 214, 242, 0.7)",
+          });
+          termLabel.position.copy(termAnchor).add(new THREE.Vector3(0, 0.19, 0));
+          this.root.add(termLabel);
+
+          const terminalNode = {
+            terminal,
+            state: terminal.state,
+            mesh: termMesh,
+            label: termLabel,
+            anchor: termAnchor.clone(),
+            parent: workspaceNode,
+            wobblePhase: termIndex * 2.3 + wsIndex + deviceIndex,
+            blinkPhase: termIndex * 1.3,
+          };
+          workspaceNode.terminals.push(terminalNode);
+          this.terminalNodes.push(terminalNode);
+        });
+      });
+
+      // Local device: labeled scripts orbit the containment sphere.
+      const scripts = device.scripts || [];
+      if (scripts.length) {
+        const scriptRing = new THREE.Mesh(
+          new THREE.TorusGeometry(sphereRadius + 0.55, 0.004, 8, 160),
+          new THREE.MeshBasicMaterial({
+            color: kindColor,
+            transparent: true,
+            opacity: 0.14,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false,
+          }),
+        );
+        scriptRing.rotation.x = Math.PI / 2 - 0.35;
+        group.add(scriptRing);
+
+        scripts.forEach((script, scriptIndex) => {
+          const scriptColor = new THREE.Color(
+            AURA_STATE_COLORS[script.state] || AURA_STATE_COLORS.idle,
+          );
+          const holder = new THREE.Group();
+          group.add(holder);
+          const mesh = new THREE.Mesh(
+            new THREE.OctahedronGeometry(0.085),
+            new THREE.MeshStandardMaterial({
+              color: 0x0a0f1a,
+              emissive: scriptColor,
+              emissiveIntensity: script.state === "running" ? 1.5 : 0.85,
+              metalness: 0.2,
+              roughness: 0.4,
+            }),
+          );
+          mesh.userData = {
+            kind: "script",
+            label: `${device.name} · ${script.name}`,
+            detail: `Script · ${AURA_STATE_LABELS[script.state] || script.state}`,
+            baseScale: 1,
+          };
+          holder.add(mesh);
+          this.hoverables.push(mesh);
+
+          const scriptLabel = makeLabelSprite(script.name, {
+            fontSize: 28,
+            height: 0.13,
+            color: "rgba(214, 228, 250, 0.78)",
+          });
+          scriptLabel.position.set(0, 0.18, 0);
+          holder.add(scriptLabel);
+
+          this.scriptNodes.push({
+            script,
+            holder,
+            mesh,
+            parent: deviceNode,
+            orbitRadius: sphereRadius + 0.55,
+            orbitTilt: -0.35,
+            phase: (scriptIndex / scripts.length) * TWO_PI,
+            speed: 0.22,
+            blinkPhase: scriptIndex * 1.9,
+          });
+        });
+      }
+    });
+  }
+
+  /* One shared vertex-colored line buffer: core→device spokes (faint), then
+     device→workspace and workspace→terminal branches in each branch hue. */
+  buildEdges() {
+    this.edgeSegments = [];
+    const spokeColor = new THREE.Color(COLORS.spoke);
+
+    this.deviceNodes.forEach((deviceNode) => {
+      this.edgeSegments.push({
+        from: () => this.coreMesh.getWorldPosition(this.scratchA),
+        to: () => deviceNode.group.getWorldPosition(this.scratchB),
+        color: spokeColor,
+      });
+      deviceNode.workspaces.forEach((wsNode) => {
+        this.edgeSegments.push({
+          from: () => deviceNode.group.getWorldPosition(this.scratchA),
+          to: () => wsNode.group.getWorldPosition(this.scratchB),
+          color: wsNode.branchColor,
+        });
+        wsNode.terminals.forEach((termNode) => {
+          this.edgeSegments.push({
+            from: () => wsNode.group.getWorldPosition(this.scratchA),
+            to: () => termNode.mesh.getWorldPosition(this.scratchB),
+            color: wsNode.branchColor,
+          });
+        });
       });
     });
 
-    // One shared line buffer: core→workspace spokes + workspace→terminal edges.
-    const segmentCount = this.workspaceNodes.length + this.terminalNodes.length;
-    this.edgePositions = new Float32Array(segmentCount * 2 * 3);
+    this.scratchA = new THREE.Vector3();
+    this.scratchB = new THREE.Vector3();
+
+    const vertexCount = this.edgeSegments.length * 2;
+    this.edgePositions = new Float32Array(vertexCount * 3);
+    const edgeColors = new Float32Array(vertexCount * 3);
+    this.edgeSegments.forEach((segment, index) => {
+      const color = segment.color;
+      for (let v = 0; v < 2; v += 1) {
+        const offset = (index * 2 + v) * 3;
+        edgeColors[offset] = color.r;
+        edgeColors[offset + 1] = color.g;
+        edgeColors[offset + 2] = color.b;
+      }
+    });
+
     const edgeGeometry = new THREE.BufferGeometry();
     edgeGeometry.setAttribute("position", new THREE.BufferAttribute(this.edgePositions, 3));
+    edgeGeometry.setAttribute("color", new THREE.BufferAttribute(edgeColors, 3));
     this.edgeLines = new THREE.LineSegments(
       edgeGeometry,
       new THREE.LineBasicMaterial({
-        color: COLORS.edge,
+        vertexColors: true,
         transparent: true,
-        opacity: 0.16,
+        opacity: 0.34,
         blending: THREE.AdditiveBlending,
         depthWrite: false,
       }),
     );
-    this.graphGroup.add(this.edgeLines);
+    this.root.add(this.edgeLines);
   }
 
   buildOuterRing({ items, radius, tilt, color, kind, kindLabel, makeNodeGeometry, key, speed }) {
@@ -436,7 +670,7 @@ export class AuraSceneEngine {
       new THREE.MeshBasicMaterial({
         color,
         transparent: true,
-        opacity: 0.14,
+        opacity: 0.12,
         blending: THREE.AdditiveBlending,
         depthWrite: false,
       }),
@@ -486,15 +720,17 @@ export class AuraSceneEngine {
     this[key] = { group: ringGroup, spinner, nodes, speed };
   }
 
+  /* Activity-monitor particles: running todos travel workspace→terminal;
+     queued todos idle in a tight orbit around their workspace. */
   buildTodoParticles() {
     this.todoTravelers = [];
     this.todoQueued = [];
 
-    this.workspaceNodes.forEach((node, wsIndex) => {
-      const { todos } = node.workspace;
+    this.workspaceNodes.forEach((wsNode, wsIndex) => {
+      const todos = wsNode.workspace.todos || {};
 
-      for (let i = 0; i < Math.min(todos.running, 3); i += 1) {
-        if (!node.terminals.length) break;
+      for (let i = 0; i < Math.min(todos.running || 0, 3); i += 1) {
+        if (!wsNode.terminals.length) break;
         const sprite = new THREE.Sprite(
           new THREE.SpriteMaterial({
             map: this.glowSoft,
@@ -505,18 +741,18 @@ export class AuraSceneEngine {
             depthWrite: false,
           }),
         );
-        sprite.scale.set(0.16, 0.16, 1);
-        this.graphGroup.add(sprite);
+        sprite.scale.set(0.15, 0.15, 1);
+        this.root.add(sprite);
         this.todoTravelers.push({
           sprite,
-          node,
-          target: node.terminals[(i + wsIndex) % node.terminals.length],
+          node: wsNode,
+          target: wsNode.terminals[(i + wsIndex) % wsNode.terminals.length],
           t: (i * 0.37 + wsIndex * 0.21) % 1,
           speed: 0.24 + (i % 3) * 0.07,
         });
       }
 
-      for (let i = 0; i < Math.min(todos.queued, 4); i += 1) {
+      for (let i = 0; i < Math.min(todos.queued || 0, 4); i += 1) {
         const sprite = new THREE.Sprite(
           new THREE.SpriteMaterial({
             map: this.glowEmber,
@@ -527,35 +763,17 @@ export class AuraSceneEngine {
             depthWrite: false,
           }),
         );
-        sprite.scale.set(0.1, 0.1, 1);
-        this.graphGroup.add(sprite);
+        sprite.scale.set(0.09, 0.09, 1);
+        this.root.add(sprite);
         this.todoQueued.push({
           sprite,
-          node,
-          radius: 0.42 + i * 0.045,
+          node: wsNode,
+          radius: 0.34 + i * 0.05,
           speed: 0.5 + i * 0.12,
           phase: i * 1.9 + wsIndex,
         });
       }
     });
-  }
-
-  workspacePosition(node, target) {
-    const bob = Math.sin(this.elapsed * 0.5 + node.bobPhase) * 0.09;
-    target.set(
-      Math.cos(node.angle) * node.radius,
-      node.baseY + bob,
-      Math.sin(node.angle) * node.radius,
-    );
-    return target;
-  }
-
-  terminalPosition(orbit, target) {
-    const angle = orbit.phase + this.elapsed * orbit.speed;
-    target.set(Math.cos(angle) * orbit.radius, 0, Math.sin(angle) * orbit.radius);
-    target.applyQuaternion(orbit.tilt);
-    target.add(orbit.parent.group.position);
-    return target;
   }
 
   handlePointerMove(event) {
@@ -593,9 +811,9 @@ export class AuraSceneEngine {
 
   handleWheel(event) {
     this.orbit.targetRadius = THREE.MathUtils.clamp(
-      this.orbit.targetRadius + event.deltaY * 0.008,
-      6.6,
-      15.5,
+      this.orbit.targetRadius + event.deltaY * 0.009,
+      8.2,
+      19.5,
     );
   }
 
@@ -621,14 +839,14 @@ export class AuraSceneEngine {
   updateCamera(dt) {
     const orbit = this.orbit;
     if (!this.dragging && !this.reducedMotion) {
-      orbit.targetTheta += dt * 0.045;
+      orbit.targetTheta += dt * 0.04;
     }
     const ease = 1 - Math.pow(0.001, dt);
     orbit.theta += (orbit.targetTheta - orbit.theta) * ease;
     orbit.phi += (orbit.targetPhi - orbit.phi) * ease;
     orbit.radius += (orbit.targetRadius - orbit.radius) * ease;
 
-    const introRadius = orbit.radius + (1 - easeOutCubic(this.introT)) * 3.4;
+    const introRadius = orbit.radius + (1 - easeOutCubic(this.introT)) * 4;
     this.camera.position.set(
       introRadius * Math.sin(orbit.phi) * Math.cos(orbit.theta),
       introRadius * Math.cos(orbit.phi),
@@ -650,55 +868,84 @@ export class AuraSceneEngine {
     this.root.scale.setScalar(introScale);
 
     // Core motion
-    this.ringA.rotation.z += motion * 0.11;
-    this.ringB.rotation.z -= motion * 0.07;
-    this.ringDots.rotation.y -= motion * 0.16;
-    this.containment.rotation.y += motion * 0.02;
+    this.ringA.rotation.z += motion * 0.12;
+    this.ringB.rotation.z -= motion * 0.08;
+    this.coreMesh.rotation.y += motion * 0.25;
     this.starfield.rotation.y += motion * 0.004;
-    const pulse = 1 + Math.sin(this.elapsed * 1.4) * 0.035;
-    this.halo.scale.set(7.4 * pulse, 7.4 * pulse, 1);
+    const pulse = 1 + Math.sin(this.elapsed * 1.4) * 0.04;
+    this.halo.scale.set(3.6 * pulse, 3.6 * pulse, 1);
 
-    // Workspaces + terminals
-    const scratch = new THREE.Vector3();
-    this.workspaceNodes.forEach((node) => {
-      this.workspacePosition(node, scratch);
-      node.group.position.copy(scratch);
-      node.wire.rotation.y += motion * 0.4;
-      node.mesh.rotation.y += motion * 0.2;
+    // Devices breathe gently; standby skins stay dim.
+    this.deviceNodes.forEach((deviceNode) => {
+      const bob = Math.sin(this.elapsed * 0.4 + deviceNode.bobPhase) * 0.06;
+      deviceNode.group.position.set(
+        deviceNode.basePosition.x,
+        deviceNode.basePosition.y + bob,
+        deviceNode.basePosition.z,
+      );
+      deviceNode.skin.rotation.y += motion * 0.05;
+      deviceNode.mesh.rotation.y += motion * 0.3;
     });
 
-    this.terminalNodes.forEach((orbit) => {
-      this.terminalPosition(orbit, scratch);
-      orbit.mesh.position.copy(scratch);
-      const material = orbit.mesh.material;
-      if (orbit.state === "running") {
-        material.emissiveIntensity = 1.3 + Math.sin(this.elapsed * 3.2 + orbit.blinkPhase) * 0.5;
-      } else if (orbit.state === "attention") {
-        material.emissiveIntensity = Math.sin(this.elapsed * 6 + orbit.blinkPhase) > 0 ? 1.7 : 0.35;
+    // Workspaces ride their anchors with a soft bob; state pulses.
+    this.workspaceNodes.forEach((wsNode) => {
+      const bob = Math.sin(this.elapsed * 0.55 + wsNode.bobPhase) * 0.05;
+      wsNode.group.position.set(
+        wsNode.anchor.x,
+        wsNode.anchor.y + bob,
+        wsNode.anchor.z,
+      );
+      wsNode.wire.rotation.y += motion * 0.35;
+      const material = wsNode.core.material;
+      if (wsNode.state === "running") {
+        material.emissiveIntensity = 1.2 + Math.sin(this.elapsed * 3 + wsNode.bobPhase) * 0.4;
+      } else if (wsNode.state === "attention") {
+        material.emissiveIntensity = Math.sin(this.elapsed * 6 + wsNode.bobPhase) > 0 ? 1.8 : 0.4;
       }
     });
 
-    // Edge buffer: spokes then orbit edges
-    let offset = 0;
-    this.workspaceNodes.forEach((node) => {
-      this.edgePositions[offset] = 0;
-      this.edgePositions[offset + 1] = 0;
-      this.edgePositions[offset + 2] = 0;
-      this.edgePositions[offset + 3] = node.group.position.x;
-      this.edgePositions[offset + 4] = node.group.position.y;
-      this.edgePositions[offset + 5] = node.group.position.z;
-      offset += 6;
+    // Terminals wobble around their fan anchors; blink by state.
+    const wobble = new THREE.Vector3();
+    this.terminalNodes.forEach((termNode) => {
+      const angle = this.elapsed * 0.8 + termNode.wobblePhase;
+      wobble.set(Math.cos(angle) * 0.05, Math.sin(angle * 1.3) * 0.05, Math.sin(angle) * 0.05);
+      termNode.mesh.position.copy(termNode.anchor).add(wobble);
+      termNode.label.position.copy(termNode.mesh.position).add(new THREE.Vector3(0, 0.19, 0));
+      const material = termNode.mesh.material;
+      if (termNode.state === "running") {
+        material.emissiveIntensity = 1.3 + Math.sin(this.elapsed * 3.2 + termNode.blinkPhase) * 0.5;
+      } else if (termNode.state === "attention") {
+        material.emissiveIntensity = Math.sin(this.elapsed * 6 + termNode.blinkPhase) > 0 ? 1.7 : 0.35;
+      }
     });
-    this.terminalNodes.forEach((orbit) => {
-      const from = orbit.parent.group.position;
-      const to = orbit.mesh.position;
+
+    // Scripts orbit the local device sphere; running scripts pulse.
+    this.scriptNodes.forEach((scriptNode) => {
+      const angle = scriptNode.phase + this.elapsed * scriptNode.speed;
+      const x = Math.cos(angle) * scriptNode.orbitRadius;
+      const z = Math.sin(angle) * scriptNode.orbitRadius;
+      const y = Math.sin(angle) * Math.sin(scriptNode.orbitTilt) * scriptNode.orbitRadius * 0.4;
+      scriptNode.holder.position.set(x, y, z);
+      scriptNode.mesh.rotation.y += motion * 0.8;
+      const material = scriptNode.mesh.material;
+      if (scriptNode.script.state === "running") {
+        material.emissiveIntensity = 1.3 + Math.sin(this.elapsed * 3.4 + scriptNode.blinkPhase) * 0.5;
+      } else if (scriptNode.script.state === "failed") {
+        material.emissiveIntensity = Math.sin(this.elapsed * 5 + scriptNode.blinkPhase) > 0 ? 1.6 : 0.5;
+      }
+    });
+
+    // Edge buffer follows every moving anchor.
+    this.edgeSegments.forEach((segment, index) => {
+      const from = segment.from();
+      const offset = index * 6;
       this.edgePositions[offset] = from.x;
       this.edgePositions[offset + 1] = from.y;
       this.edgePositions[offset + 2] = from.z;
+      const to = segment.to();
       this.edgePositions[offset + 3] = to.x;
       this.edgePositions[offset + 4] = to.y;
       this.edgePositions[offset + 5] = to.z;
-      offset += 6;
     });
     this.edgeLines.geometry.attributes.position.needsUpdate = true;
 
@@ -709,7 +956,6 @@ export class AuraSceneEngine {
       ring.nodes.forEach((node) => {
         node.mesh.rotation.x += motion * 0.5;
         node.mesh.rotation.y += motion * 0.7;
-        // Billboard-ish: labels are sprites so they self-face; nothing to do.
       });
     });
 
@@ -725,8 +971,7 @@ export class AuraSceneEngine {
       const from = traveler.node.group.position;
       const to = traveler.target.mesh.position;
       curveScratch.lerpVectors(from, to, traveler.t);
-      // Arc the path outward a little for a comet feel.
-      const arc = Math.sin(traveler.t * Math.PI) * 0.22;
+      const arc = Math.sin(traveler.t * Math.PI) * 0.18;
       curveScratch.y += arc;
       traveler.sprite.position.copy(curveScratch);
       const fade = Math.sin(traveler.t * Math.PI);
@@ -737,7 +982,7 @@ export class AuraSceneEngine {
       const angle = dot.phase + this.elapsed * dot.speed;
       dot.sprite.position.set(
         dot.node.group.position.x + Math.cos(angle) * dot.radius,
-        dot.node.group.position.y + Math.sin(angle * 0.7) * 0.08,
+        dot.node.group.position.y + Math.sin(angle * 0.7) * 0.07,
         dot.node.group.position.z + Math.sin(angle) * dot.radius,
       );
     });

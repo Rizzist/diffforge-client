@@ -620,7 +620,51 @@ const AUDIO_WIDGET_ERROR_OVERLAY_SIZE = { width: 432, height: 64 };
 const AUDIO_WIDGET_ERROR_OVERLAY_GAP = 6;
 // Extra window height for the small error card shown above the bubble; the
 // window shifts up by the same amount so the pill stays put on screen.
+// Fallback only — the expand effect measures the actual message so long
+// errors are never cut off (capped to match the CSS clamp safety net).
 const AUDIO_WIDGET_ERROR_POPOVER_HEIGHT = 62;
+// Keep in sync with AudioWidgetErrorPopover (font 11px/1.35, padding 8x12,
+// 1px border, 2px side margins, max-height 137px).
+const AUDIO_WIDGET_ERROR_POPOVER_MAX_TEXT_HEIGHT = 137;
+// Breathing room above the popover plus the 3px gap under it (popover sits
+// at bottom: 67px = focus height 64 + 3): constant 62 == 54 + 8 historically.
+const AUDIO_WIDGET_ERROR_POPOVER_CHROME = 8;
+// Keep in sync with AudioWidgetErrorOverlayCard (font 10px/1.35, padding
+// 8x12, 1px border, width min(100%, 426px), max-height 126px) and the
+// overlay shell's 3px padding.
+const AUDIO_WIDGET_ERROR_OVERLAY_MAX_CARD_HEIGHT = 126;
+const AUDIO_WIDGET_ERROR_OVERLAY_CHROME = 6;
+
+/* Measures how tall an error card renders for `message` at `width`, using a
+   hidden probe that mirrors the card typography. Returns null off-DOM. */
+function measureAudioWidgetErrorTextHeight({ fontSize, maxHeight, message, width }) {
+  if (typeof document === "undefined" || !document.body) {
+    return null;
+  }
+  const probe = document.createElement("div");
+  probe.style.position = "fixed";
+  probe.style.left = "-9999px";
+  probe.style.top = "0";
+  probe.style.visibility = "hidden";
+  probe.style.pointerEvents = "none";
+  probe.style.boxSizing = "border-box";
+  probe.style.width = `${width}px`;
+  probe.style.padding = "8px 12px";
+  probe.style.border = "1px solid transparent";
+  probe.style.fontSize = `${fontSize}px`;
+  probe.style.fontWeight = "650";
+  probe.style.lineHeight = "1.35";
+  probe.style.wordBreak = "break-word";
+  probe.style.overflowWrap = "anywhere";
+  probe.textContent = String(message || "");
+  document.body.appendChild(probe);
+  const height = probe.offsetHeight;
+  probe.remove();
+  if (!Number.isFinite(height) || height <= 0) {
+    return null;
+  }
+  return Math.min(Math.ceil(height), maxHeight);
+}
 const AUDIO_WIDGET_ERROR_AUTO_DISMISS_MS = 6500;
 // Compact bar: 8 bars fill the ~38px of meter room left between the cancel
 // and stop controls at the 124px bar width.
@@ -8365,11 +8409,25 @@ export function AudioWidgetWindow() {
       theme: audioWidgetTheme,
       visible: true,
     });
+    // Size the overlay window to the measured message so long errors are
+    // fully visible instead of clipping at the fixed default height.
+    const measuredCardHeight = measureAudioWidgetErrorTextHeight({
+      fontSize: 10,
+      maxHeight: AUDIO_WIDGET_ERROR_OVERLAY_MAX_CARD_HEIGHT,
+      message: errorFrameText,
+      width: AUDIO_WIDGET_ERROR_OVERLAY_SIZE.width - AUDIO_WIDGET_ERROR_OVERLAY_CHROME,
+    });
+    const overlayHeight = measuredCardHeight
+      ? Math.max(
+        AUDIO_WIDGET_ERROR_OVERLAY_SIZE.height,
+        measuredCardHeight + AUDIO_WIDGET_ERROR_OVERLAY_CHROME,
+      )
+      : AUDIO_WIDGET_ERROR_OVERLAY_SIZE.height;
     invoke("audio_widget_show_error_overlay", {
       request: {
         animate: true,
         gap: AUDIO_WIDGET_ERROR_OVERLAY_GAP,
-        height: AUDIO_WIDGET_ERROR_OVERLAY_SIZE.height,
+        height: overlayHeight,
         width: AUDIO_WIDGET_ERROR_OVERLAY_SIZE.width,
       },
     }).catch(() => {});
@@ -8747,6 +8805,20 @@ export function AudioWidgetWindow() {
     if (!errorFrameActive || widgetDragging) {
       return undefined;
     }
+    // The popover renders the full message, so the window has to grow by the
+    // measured height (fixed 62px used to cut long errors off mid-line).
+    const measuredPopoverHeight = measureAudioWidgetErrorTextHeight({
+      fontSize: 11,
+      maxHeight: AUDIO_WIDGET_ERROR_POPOVER_MAX_TEXT_HEIGHT,
+      message: errorFrameText,
+      width: AUDIO_WIDGET_FOCUS_SIZE.width - 4,
+    });
+    const popoverHeight = measuredPopoverHeight
+      ? Math.max(
+        AUDIO_WIDGET_ERROR_POPOVER_HEIGHT,
+        measuredPopoverHeight + AUDIO_WIDGET_ERROR_POPOVER_CHROME,
+      )
+      : AUDIO_WIDGET_ERROR_POPOVER_HEIGHT;
     let savedPosition = null;
     runWidgetWindowAction(async (windowHandle) => {
       if (widgetDraggingRef.current) {
@@ -8758,16 +8830,17 @@ export function AudioWidgetWindow() {
         return;
       }
       logAudioWidgetBubblePosition("audio.widget.bubble.error_frame.expand", {
+        popoverHeight,
         savedPosition: audioWidgetBubblePositionPoint(savedPosition),
         scale: Number(scale || 1) || 1,
       });
       await windowHandle.setSize(new LogicalSize(
         AUDIO_WIDGET_FOCUS_SIZE.width,
-        AUDIO_WIDGET_FOCUS_SIZE.height + AUDIO_WIDGET_ERROR_POPOVER_HEIGHT,
+        AUDIO_WIDGET_FOCUS_SIZE.height + popoverHeight,
       ));
       await windowHandle.setPosition(new PhysicalPosition(
         savedPosition.x,
-        savedPosition.y - Math.round(AUDIO_WIDGET_ERROR_POPOVER_HEIGHT * (scale || 1)),
+        savedPosition.y - Math.round(popoverHeight * (scale || 1)),
       ));
       await logAudioWidgetBubbleWindowSnapshot(windowHandle, "audio.widget.bubble.error_frame.expanded", {
         savedPosition: audioWidgetBubblePositionPoint(savedPosition),
@@ -8790,7 +8863,7 @@ export function AudioWidgetWindow() {
         }
       });
     };
-  }, [errorFrameActive, runWidgetWindowAction, widgetDragging]);
+  }, [errorFrameActive, errorFrameText, runWidgetWindowAction, widgetDragging]);
 
   // Floating live transcript (bubble style): while dictating, the window
   // grows upward by the pill headroom — error-popover mechanics — so the

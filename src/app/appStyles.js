@@ -17161,8 +17161,11 @@ export const AudioWidgetErrorPopover = styled.div`
   z-index: 30;
   display: -webkit-box;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  max-height: 54px;
+  /* The widget window grows to fit the measured message (see the
+     error-frame expand effect); the clamp + max-height only guard against
+     pathological messages, and must stay in sync with that measurement cap. */
+  -webkit-line-clamp: 8;
+  max-height: 137px;
   overflow: hidden;
   margin: 0 2px;
   padding: 8px 12px;
@@ -17294,9 +17297,12 @@ export const AudioWidgetErrorOverlayCard = styled.div`
   display: -webkit-box;
   box-sizing: border-box;
   width: min(100%, 426px);
-  max-height: 58px;
+  /* The overlay window is sized to the measured message; clamp + max-height
+     only guard against pathological messages and must stay in sync with the
+     measurement cap in AudioWorkspaceView. */
+  max-height: 126px;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
+  -webkit-line-clamp: 8;
   overflow: hidden;
   padding: 8px 12px;
   border: 1px solid rgba(239, 107, 107, 0.46);

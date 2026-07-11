@@ -7,7 +7,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled, { css, keyframes } from "styled-components";
 
 import { AuraSceneEngine } from "./AuraSceneEngine.js";
-import { AURA_MOCK_STATE, AURA_STATE_COLORS } from "./auraMockData.js";
+import {
+  AURA_DEVICE_KIND_LABELS,
+  AURA_MOCK_STATE,
+  AURA_STATE_COLORS,
+  auraWorkspaceState,
+} from "./auraMockData.js";
 
 const EXIT_ANIMATION_MS = 260;
 
@@ -270,7 +275,10 @@ const AuraWordmarkStatus = styled.div`
 const AuraPanel = styled.section`
   ${auraHudLayer};
   top: 50%;
-  width: 216px;
+  width: 226px;
+  max-height: min(64vh, 540px);
+  overflow-y: auto;
+  scrollbar-width: thin;
   padding: 15px 17px;
   transform: translateY(-50%);
   animation-name: ${hudInStill};
@@ -316,6 +324,15 @@ const AuraPanelRow = styled.div`
   padding: 4px 0;
 `;
 
+const dotPulse = keyframes`
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+`;
+
 const AuraPanelDot = styled.span`
   align-self: center;
   width: 7px;
@@ -323,6 +340,25 @@ const AuraPanelDot = styled.span`
   border-radius: 999px;
   background: ${(props) => props.$color || "#77839a"};
   box-shadow: 0 0 9px ${(props) => props.$color || "#77839a"}66;
+
+  &[data-pulse="true"] {
+    animation: ${dotPulse} 2.1s ease-in-out infinite;
+    ${reducedMotion};
+  }
+`;
+
+const AuraPanelTag = styled.span`
+  display: inline-block;
+  margin-left: 7px;
+  padding: 1px 6px;
+  border: 1px solid rgba(79, 216, 255, 0.34);
+  border-radius: 999px;
+  color: rgba(79, 216, 255, 0.85);
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  vertical-align: 2px;
 `;
 
 const AuraPanelName = styled.div`
@@ -457,6 +493,42 @@ const AuraVoiceCaption = styled.div`
   }
 `;
 
+const tickerIn = keyframes`
+  from {
+    opacity: 0;
+    transform: translate3d(0, 6px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+`;
+
+const AuraActivityTicker = styled.div`
+  ${auraHudLayer};
+  bottom: 46px;
+  left: 56px;
+  max-width: 340px;
+  overflow: hidden;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.1em;
+  color: rgba(126, 214, 255, 0.78);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  animation-name: ${hudInStill};
+  animation-delay: 600ms;
+
+  > span {
+    display: inline-block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    animation: ${tickerIn} 420ms ease both;
+    ${reducedMotion};
+  }
+`;
+
 const AuraFooterLine = styled.div`
   ${auraHudLayer};
   bottom: 24px;
@@ -511,12 +583,48 @@ export function AuraMode({
   const data = AURA_MOCK_STATE;
 
   const totals = useMemo(() => {
-    const terminals = data.workspaces.reduce((sum, ws) => sum + ws.terminals.length, 0);
-    const inFlight = data.workspaces.reduce(
-      (sum, ws) => sum + ws.todos.queued + ws.todos.running,
-      0,
+    let workspaces = 0;
+    let terminals = 0;
+    let inFlight = 0;
+    for (const device of data.devices) {
+      workspaces += device.workspaces.length;
+      for (const workspace of device.workspaces) {
+        terminals += workspace.terminals.length;
+        inFlight += (workspace.todos?.queued || 0) + (workspace.todos?.running || 0);
+      }
+    }
+    return { devices: data.devices.length, workspaces, terminals, inFlight };
+  }, [data]);
+
+  const localDevice = useMemo(
+    () => data.devices.find((device) => device.kind === "local") || null,
+    [data],
+  );
+
+  const localActivity = useMemo(() => {
+    if (!localDevice) return { running: [], waiting: [] };
+    const running = [];
+    const waiting = [];
+    for (const workspace of localDevice.workspaces) {
+      for (const todo of workspace.todos?.active || []) {
+        running.push({ todo, workspace: workspace.name });
+      }
+      for (const todo of workspace.todos?.waiting || []) {
+        waiting.push({ todo, workspace: workspace.name });
+      }
+    }
+    return { running, waiting };
+  }, [localDevice]);
+
+  const [feedIndex, setFeedIndex] = useState(0);
+  useEffect(() => {
+    const feed = data.activityFeed || [];
+    if (feed.length < 2) return undefined;
+    const timer = window.setInterval(
+      () => setFeedIndex((index) => (index + 1) % feed.length),
+      3600,
     );
-    return { workspaces: data.workspaces.length, terminals, inFlight };
+    return () => window.clearInterval(timer);
   }, [data]);
 
   const beginExit = useCallback(() => {
@@ -594,31 +702,86 @@ export function AuraMode({
         <AuraWordmarkStatus>Orchestrator · Online</AuraWordmarkStatus>
       </AuraWordmark>
 
-      <AuraPanel aria-label="Workspaces" data-side="left">
-        <AuraPanelHeading>Workspaces</AuraPanelHeading>
-        {data.workspaces.map((workspace) => {
-          const running = workspace.terminals.filter((t) => t.state === "running").length;
-          const attention = workspace.terminals.filter((t) => t.state === "attention").length;
-          const meta = [
-            running ? `${running} running` : null,
-            attention ? `${attention} attention` : null,
-            workspace.todos.queued ? `${workspace.todos.queued} queued` : null,
-          ]
-            .filter(Boolean)
-            .join(" · ") || "idle";
+      <AuraPanel aria-label="Devices and workspaces" data-side="left">
+        <AuraPanelHeading>Devices</AuraPanelHeading>
+        {data.devices.map((device) => {
+          const terminals = device.workspaces.reduce(
+            (sum, ws) => sum + ws.terminals.length,
+            0,
+          );
+          const running = device.workspaces.reduce(
+            (sum, ws) => sum + (ws.todos?.running || 0),
+            0,
+          );
           return (
-            <AuraPanelRow key={workspace.id}>
+            <AuraPanelRow key={device.id}>
               <AuraPanelDot
-                $color={attention ? AURA_STATE_COLORS.attention : workspace.accent}
+                $color={AURA_STATE_COLORS[device.status] || AURA_STATE_COLORS.idle}
+                data-pulse={device.status === "online" ? "true" : undefined}
               />
-              <AuraPanelName>{workspace.name}</AuraPanelName>
-              <AuraPanelMeta>{meta}</AuraPanelMeta>
+              <AuraPanelName>
+                {device.name}
+                {device.kind === "local" && <AuraPanelTag>{AURA_DEVICE_KIND_LABELS.local}</AuraPanelTag>}
+              </AuraPanelName>
+              <AuraPanelMeta>
+                {device.workspaces.length} ws · {terminals} term
+                {running ? ` · ${running} running` : ""}
+              </AuraPanelMeta>
             </AuraPanelRow>
           );
         })}
+        <AuraPanelDivider />
+        <AuraPanelHeading>Workspaces</AuraPanelHeading>
+        {data.devices.flatMap((device) => device.workspaces).map((workspace) => {
+          const state = auraWorkspaceState(workspace);
+          return (
+            <AuraPanelRow key={workspace.id}>
+              <AuraPanelDot
+                $color={AURA_STATE_COLORS[state]}
+                data-pulse={state === "running" || state === "attention" ? "true" : undefined}
+              />
+              <AuraPanelName>{workspace.name}</AuraPanelName>
+            </AuraPanelRow>
+          );
+        })}
+        <AuraPanelDivider />
+        <AuraPanelHeading>Local activity</AuraPanelHeading>
+        {localActivity.running.map((entry) => (
+          <AuraPanelRow key={`run:${entry.workspace}:${entry.todo}`}>
+            <AuraPanelDot $color={AURA_STATE_COLORS.running} data-pulse="true" />
+            <AuraPanelName>{entry.todo}</AuraPanelName>
+            <AuraPanelMeta>{entry.workspace}</AuraPanelMeta>
+          </AuraPanelRow>
+        ))}
+        {localActivity.waiting.slice(0, 3).map((entry) => (
+          <AuraPanelRow key={`wait:${entry.workspace}:${entry.todo}`}>
+            <AuraPanelDot $color={AURA_STATE_COLORS.attention} />
+            <AuraPanelName>{entry.todo}</AuraPanelName>
+            <AuraPanelMeta>queued · {entry.workspace}</AuraPanelMeta>
+          </AuraPanelRow>
+        ))}
+        {!localActivity.running.length && !localActivity.waiting.length && (
+          <AuraPanelMeta>No todos in flight</AuraPanelMeta>
+        )}
       </AuraPanel>
 
-      <AuraPanel aria-label="Docs and MCP servers" data-side="right">
+      <AuraPanel aria-label="Scripts, docs and MCP servers" data-side="right">
+        {localDevice && localDevice.scripts.length > 0 && (
+          <>
+            <AuraPanelHeading>Scripts · {localDevice.name}</AuraPanelHeading>
+            {localDevice.scripts.map((script) => (
+              <AuraPanelRow key={script.id}>
+                <AuraPanelDot
+                  $color={AURA_STATE_COLORS[script.state] || AURA_STATE_COLORS.idle}
+                  data-pulse={script.state === "running" ? "true" : undefined}
+                />
+                <AuraPanelName>{script.name}</AuraPanelName>
+                <AuraPanelMeta>{script.state}</AuraPanelMeta>
+              </AuraPanelRow>
+            ))}
+            <AuraPanelDivider />
+          </>
+        )}
         <AuraPanelHeading>Docs</AuraPanelHeading>
         {data.docs.map((doc) => (
           <AuraPanelRow key={doc.id}>
@@ -635,6 +798,10 @@ export function AuraMode({
           </AuraPanelRow>
         ))}
       </AuraPanel>
+
+      <AuraActivityTicker aria-live="polite">
+        <span key={feedIndex}>▸ {(data.activityFeed || [])[feedIndex] || ""}</span>
+      </AuraActivityTicker>
 
       <AuraVoiceCluster>
         <AuraVoiceButtonShell data-engaged={voiceEngaged ? "true" : "false"}>
@@ -657,8 +824,8 @@ export function AuraMode({
       </AuraVoiceCluster>
 
       <AuraFooterLine data-side="left">
-        {totals.workspaces} workspaces · {totals.terminals} terminals · {totals.inFlight} todos in
-        flight
+        {totals.devices} devices · {totals.workspaces} workspaces · {totals.terminals} terminals ·{" "}
+        {totals.inFlight} todos in flight
       </AuraFooterLine>
       <AuraFooterLine data-side="right">{hoverReadout}</AuraFooterLine>
     </AuraBackdrop>
