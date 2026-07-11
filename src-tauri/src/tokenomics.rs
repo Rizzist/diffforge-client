@@ -13731,12 +13731,10 @@ fn tokenomics_apply_provider_limit_sample_pacing_from_rows(limit: &mut Value, sa
         "pace_last_sample_at".to_string(),
         latest["sample_at"].clone(),
     );
-    object.insert("pace_last_sample_at".to_string(), latest["sample_at"].clone());
     object.insert(
         "pace_last_sample_used_percent".to_string(),
         json!(latest_used),
     );
-    object.insert("pace_last_sample_used_percent".to_string(), json!(latest_used));
     if let Some(projected) = projected_used_percent {
         let delta = pace_delta_percent.unwrap_or(projected - 100);
         object.insert("pace_trajectory_status".to_string(), json!(status.clone()));
@@ -14130,11 +14128,6 @@ fn tokenomics_cloud_summary_payload(event: &Value) -> Value {
         .or_else(|| {
             event
                 .get("payload")
-                .and_then(|payload| payload.get("tokenomics_delta"))
-        })
-        .or_else(|| {
-            event
-                .get("payload")
                 .and_then(|payload| payload.get("snapshot"))
         })
         .or_else(|| {
@@ -14144,11 +14137,6 @@ fn tokenomics_cloud_summary_payload(event: &Value) -> Value {
                 .filter(|value| value.is_object())
         })
         .or_else(|| event.get("data").and_then(|data| data.get("summary")))
-        .or_else(|| {
-            event
-                .get("data")
-                .and_then(|data| data.get("tokenomics_delta"))
-        })
         .or_else(|| {
             event
                 .get("data")
@@ -15876,9 +15864,6 @@ fn tokenomics_tag_provider_limit_devices(limits: &mut [Value], device_id: &str) 
     }
     for limit in limits {
         if let Some(object) = limit.as_object_mut() {
-            object
-                .entry("device_id".to_string())
-                .or_insert_with(|| json!(device_id));
             object
                 .entry("device_id".to_string())
                 .or_insert_with(|| json!(device_id));

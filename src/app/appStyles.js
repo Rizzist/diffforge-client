@@ -11141,11 +11141,6 @@ export const TerminalWorkspaceSurface = styled.section`
     background: ${TERMINAL_THEME_BACKGROUND_LIGHT};
   }
 
-  &[data-terminal-breakout="true"] {
-    border-radius: 0;
-    overflow: hidden;
-  }
-
   &[data-terminal-fullscreen="true"] {
     --terminal-focus-outline-inset: 1px;
 
@@ -11480,10 +11475,6 @@ export const TerminalFrame = styled.section`
     background: ${TERMINAL_THEME_BACKGROUND_LIGHT};
   }
 
-  &[data-terminal-breakout="true"] {
-    border-radius: 0;
-  }
-
   &[data-state="error"] {
     border-color: rgba(255, 107, 107, 0.36);
   }
@@ -11811,12 +11802,6 @@ export const XtermSurface = styled.div`
     pointer-events: none;
   }
 
-  &[data-terminal-breakout="true"] {
-    --terminal-xterm-painted-bottom: 100% !important;
-
-    contain: layout paint;
-  }
-
   html[data-forge-theme="light"] & {
     background: ${TERMINAL_THEME_BACKGROUND_LIGHT};
     --terminal-native-scrollbar-thumb: rgba(0, 102, 204, 0.22);
@@ -11842,10 +11827,6 @@ export const XtermSurface = styled.div`
     background: ${TERMINAL_THEME_BACKGROUND_LIGHT};
   }
 
-  &[data-terminal-breakout="true"]::after {
-    display: none;
-  }
-
   .xterm {
     position: relative;
     z-index: 1;
@@ -11857,15 +11838,6 @@ export const XtermSurface = styled.div`
 
   html[data-forge-theme="light"] & .xterm {
     background: ${TERMINAL_THEME_BACKGROUND_LIGHT} !important;
-  }
-
-  &[data-terminal-breakout="true"] .xterm,
-  &[data-terminal-breakout="true"] .xterm-viewport,
-  &[data-terminal-breakout="true"] .xterm-scroll-area,
-  &[data-terminal-breakout="true"] .xterm-scrollable-element,
-  &[data-terminal-breakout="true"] .xterm-screen {
-    height: 100% !important;
-    min-height: 100% !important;
   }
 
   .xterm-viewport,
@@ -18823,6 +18795,11 @@ export const McpWorkspaceSurface = styled.section`
   html[data-forge-theme="light"] & {
     background: var(--forge-bg);
   }
+
+  /* Third row appears when the scope-card strip renders (Tools tab). */
+  &[data-scope-cards="true"] {
+    grid-template-rows: auto auto minmax(0, 1fr);
+  }
 `;
 
 export const McpHeaderPanel = styled.section`
@@ -19586,6 +19563,7 @@ export const McpInput = styled.input`
   border-radius: 8px;
   color: var(--forge-text);
   background: var(--mcp-control-bg, rgba(13, 17, 23, 0.92));
+  color-scheme: var(--forge-color-scheme, dark);
   font-family:
     "Cascadia Mono",
     "SFMono-Regular",
@@ -20025,6 +20003,28 @@ export const McpEditorActions = styled.div`
     align-items: center;
     justify-content: center;
     gap: 7px;
+    padding: 0 14px;
+    border: 1px solid var(--mcp-border, var(--forge-border));
+    border-radius: 8px;
+    color: var(--forge-text-soft);
+    background: var(--mcp-icon-bg, rgba(21, 27, 35, 0.72));
+    font-size: 11px;
+    font-weight: 800;
+    white-space: nowrap;
+
+    html[data-forge-theme="light"] & {
+      background: var(--forge-surface);
+    }
+  }
+
+  button:hover:not(:disabled) {
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.34);
+    color: var(--forge-text);
+  }
+
+  button:disabled {
+    cursor: default;
+    opacity: 0.5;
   }
 
   @media (max-width: 680px) {

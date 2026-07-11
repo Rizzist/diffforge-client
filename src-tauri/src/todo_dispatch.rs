@@ -3552,10 +3552,6 @@ fn todo_dispatch_todo_sync_commit_payload(
             );
         }
         if !origin_workspace_id.is_empty() {
-            meta_object.insert(
-                "origin_workspace_id".to_string(),
-                json!(origin_workspace_id.clone()),
-            );
             meta_object.insert("origin_workspace_id".to_string(), json!(origin_workspace_id));
         }
     }
@@ -4324,32 +4320,16 @@ fn todo_store_build_created_item(
             "todo_batch_id",
             &["todo_batch_id", "batch_id"][..],
         ),
-        (
-            "todo_batch_id",
-            &["todo_batch_id", "batch_id"][..],
-        ),
         ("command_id", &["command_id"][..]),
         (
             "dispatch_id",
             &["dispatch_id", "todo_dispatch_id"][..],
         ),
         (
-            "dispatch_id",
-            &["dispatch_id", "todo_dispatch_id"][..],
-        ),
-        (
-            "last_dispatch_id",
-            &["last_dispatch_id", "dispatch_id"][..],
-        ),
-        (
             "last_dispatch_id",
             &["last_dispatch_id", "dispatch_id"][..],
         ),
         ("loopspace_id", &["loopspace_id"][..]),
-        (
-            "loop_runtime_node_id",
-            &["loop_runtime_node_id", "node_id"][..],
-        ),
         (
             "loop_runtime_node_id",
             &["loop_runtime_node_id", "node_id"][..],
@@ -4363,14 +4343,6 @@ fn todo_store_build_created_item(
             &["loop_runtime_run_id", "run_id"][..],
         ),
         (
-            "loop_runtime_run_id",
-            &["loop_runtime_run_id", "run_id"][..],
-        ),
-        (
-            "loop_runtime_edge_id",
-            &["loop_runtime_edge_id", "edge_id"][..],
-        ),
-        (
             "loop_runtime_edge_id",
             &["loop_runtime_edge_id", "edge_id"][..],
         ),
@@ -4380,20 +4352,8 @@ fn todo_store_build_created_item(
             &["trigger_run_id"][..],
         ),
         (
-            "trigger_run_id",
-            &["trigger_run_id"][..],
-        ),
-        (
             "command_kind",
             &["command_kind", "kind", "type", "action"][..],
-        ),
-        (
-            "command_kind",
-            &["command_kind", "kind", "type", "action"][..],
-        ),
-        (
-            "target_terminal_mode",
-            &["target_terminal_mode", "terminal_mode"][..],
         ),
         (
             "target_terminal_mode",
@@ -4402,10 +4362,6 @@ fn todo_store_build_created_item(
         (
             "todo_number",
             &["todo_number", "todo_sequence"][..],
-        ),
-        (
-            "todo_sequence",
-            &["todo_sequence", "todo_number"][..],
         ),
         (
             "todo_sequence",
@@ -4833,10 +4789,6 @@ async fn todo_store_dispatch_loopspace_batch(
                 &["loop_runtime_node_id", "node_id"][..],
             ),
             (
-                "loop_runtime_node_id",
-                &["loop_runtime_node_id", "node_id"][..],
-            ),
-            (
                 "node_id",
                 &["node_id", "loop_runtime_node_id"][..],
             ),
@@ -4845,28 +4797,12 @@ async fn todo_store_dispatch_loopspace_batch(
                 &["loop_runtime_run_id", "run_id"][..],
             ),
             (
-                "loop_runtime_run_id",
-                &["loop_runtime_run_id", "run_id"][..],
-            ),
-            (
-                "loop_runtime_edge_id",
-                &["loop_runtime_edge_id", "edge_id"][..],
-            ),
-            (
                 "loop_runtime_edge_id",
                 &["loop_runtime_edge_id", "edge_id"][..],
             ),
             (
                 "trigger_id",
                 &["trigger_id"][..],
-            ),
-            (
-                "trigger_id",
-                &["trigger_id"][..],
-            ),
-            (
-                "trigger_run_id",
-                &["trigger_run_id"][..],
             ),
             (
                 "trigger_run_id",
@@ -4974,12 +4910,7 @@ async fn todo_store_dispatch_loopspace_batch(
                 draft_object.insert("command_id".to_string(), json!(todo_id.clone()));
                 draft_object.insert("dispatch_id".to_string(), json!(dispatch_id.clone()));
                 draft_object.insert("last_dispatch_id".to_string(), json!(dispatch_id.clone()));
-                draft_object.insert("last_dispatch_id".to_string(), json!(dispatch_id));
                 draft_object.insert("target_workspace_id".to_string(), json!(workspace_id.clone()));
-                draft_object.insert(
-                    "target_workspace_id".to_string(),
-                    json!(workspace_id.clone()),
-                );
                 draft_object.insert("workspace_id".to_string(), json!(workspace_id.clone()));
                 draft_object.insert("todo_number".to_string(), json!(sequence));
                 draft_object.insert("todo_sequence".to_string(), json!(sequence));
@@ -8317,7 +8248,6 @@ mod todo_store_tests {
         .expect("dispatch todo should create");
 
         assert_eq!(item["loop_runtime_run_id"], "run-1");
-        assert_eq!(item["loop_runtime_run_id"], "run-1");
         assert_eq!(item["loop_runtime_node_id"], "dispatch-1");
         assert_eq!(item["loop_runtime_edge_id"], "edge-1");
         assert_eq!(item["trigger_id"], "trigger-1");
@@ -8327,7 +8257,6 @@ mod todo_store_tests {
             item["remote_command"]["command_kind"],
             "loopspace_dispatch_todos"
         );
-        assert_eq!(item["remote_command"]["loop_runtime_run_id"], "run-1");
         assert_eq!(item["remote_command"]["loop_runtime_run_id"], "run-1");
         assert_eq!(item["remote_command"]["loop_runtime_node_id"], "dispatch-1");
         assert!(item["remote_command"].get("checkpoint_plan").is_none());
@@ -11237,7 +11166,6 @@ fn todo_dispatch_prepare_immediate_backend_item(
         if target_kind.eq_ignore_ascii_case("swarm") && !target_swarm_id.is_empty() {
             object.insert("target_kind".to_string(), json!("swarm"));
             object.insert("target_swarm_id".to_string(), json!(target_swarm_id.clone()));
-            object.insert("target_swarm_id".to_string(), json!(target_swarm_id));
         }
         if let Some(index) = terminal_index {
             object.insert("target_terminal_index".to_string(), json!(index));
@@ -12069,8 +11997,6 @@ async fn todo_dispatch_backend_submit_swarm(
                             object.insert("command_id".to_string(), json!(command_id.clone()));
                             object.insert("dispatch_id".to_string(), json!(dispatch_id.clone()));
                             object.insert("last_dispatch_id".to_string(), json!(dispatch_id.clone()));
-                            object
-                                .insert("last_dispatch_id".to_string(), json!(dispatch_id.clone()));
                             object.insert("todo_id".to_string(), json!(todo_id.clone()));
                             object.insert("target_kind".to_string(), json!("swarm"));
                             object.insert("target_swarm_id".to_string(), json!(swarm_id.clone()));
@@ -12405,8 +12331,6 @@ async fn todo_dispatch_backend_submit(
                             object.insert("command_id".to_string(), json!(command_id.clone()));
                             object.insert("dispatch_id".to_string(), json!(dispatch_id.clone()));
                             object.insert("last_dispatch_id".to_string(), json!(dispatch_id.clone()));
-                            object
-                                .insert("last_dispatch_id".to_string(), json!(dispatch_id.clone()));
                             object.insert("todo_id".to_string(), json!(todo_id.clone()));
                             object.insert("target_terminal_id".to_string(), json!(pane_id.clone()));
                             object.insert("pane_id".to_string(), json!(pane_id.clone()));

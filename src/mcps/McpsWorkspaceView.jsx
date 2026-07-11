@@ -839,6 +839,43 @@ function parseMarketplaceCommand(provider, command) {
   };
 }
 
+const MCP_GLOBAL_SCOPE_VALUE = "global-defaults";
+
+function McpScopeGlobeIcon(props) {
+  return (
+    <svg
+      fill="none"
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeWidth="1.7"
+      viewBox="0 0 24 24"
+      xmlns="http://www.w3.org/2000/svg"
+      {...props}
+    >
+      <circle cx="12" cy="12" r="9" />
+      <path d="M3 12h18" />
+      <path d="M12 3c2.6 2.4 3.9 5.4 3.9 9S14.6 18.6 12 21c-2.6-2.4-3.9-5.4-3.9-9S9.4 5.4 12 3Z" />
+    </svg>
+  );
+}
+
+function McpScopeWorkspaceIcon(props) {
+  return (
+    <svg
+      fill="none"
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth="1.7"
+      viewBox="0 0 24 24"
+      xmlns="http://www.w3.org/2000/svg"
+      {...props}
+    >
+      <path d="M3.5 7.5a2 2 0 0 1 2-2h4l2 2.4h7a2 2 0 0 1 2 2v8.1a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2Z" />
+    </svg>
+  );
+}
+
 export default function McpsWorkspaceView({
   default_working_directory: defaultWorkingDirectory,
   onScopeChange = null,
@@ -2098,7 +2135,7 @@ export default function McpsWorkspaceView({
             Add secret
           </SecretButton>
         </SecretsToolbar>
-        {scopeValue === "global-defaults" && (
+        {scopeValue === MCP_GLOBAL_SCOPE_VALUE && (
           <McpEmptyAccess>
             Global secrets vault: these values (with the rest of the global
             MCP defaults) are copied into each new workspace the first time
@@ -2519,7 +2556,7 @@ export default function McpsWorkspaceView({
               busy={actionState !== "idle"}
               onDelete={deleteSshTarget}
               onUpsert={upsertSshTarget}
-              scope={scopeValue === "global-defaults" ? "global" : "workspace"}
+              scope={scopeValue === MCP_GLOBAL_SCOPE_VALUE ? "global" : "workspace"}
               targets={asArray(selectedServer.ssh_targets)}
             />
           </>
@@ -2681,16 +2718,40 @@ export default function McpsWorkspaceView({
   const listViewOptions = [
     {
       value: "installed",
-      label: `${scopeValue === "global-defaults" ? "Global MCPs" : "Workspace MCPs"} · ${servers.length}`,
+      label: `${scopeValue === MCP_GLOBAL_SCOPE_VALUE ? "Global MCPs" : "Workspace MCPs"} · ${servers.length}`,
     },
     { value: "catalog", label: `Browse catalog · ${MCP_CATALOG.length}` },
   ];
+  const scopeSelectable = scopeOptions.length > 0 && typeof onScopeChange === "function";
+  const isGlobalScope = scopeValue === MCP_GLOBAL_SCOPE_VALUE;
+  const activeScopeLabel = optionForValue(scopeOptions, scopeValue)?.label
+    || (isGlobalScope ? "Global defaults" : workspaceName);
+  const scopeCardsVisible = scopeSelectable && screen === "list";
+  const scopeBadge = (
+    <McpScopeBadge
+      title={isGlobalScope
+        ? "Changes here go to the global defaults every workspace inherits"
+        : `Changes here only apply to the ${activeScopeLabel} workspace`}
+    >
+      {isGlobalScope
+        ? <McpScopeGlobeIcon aria-hidden="true" />
+        : <McpScopeWorkspaceIcon aria-hidden="true" />}
+      <span>{activeScopeLabel}</span>
+    </McpScopeBadge>
+  );
 
   return (
-    <McpWorkspaceSurface aria-label="Workspace MCPs" data-screen={screen}>
-      {/* One compact bar holds every selection: scope, list view, search,
-          and the secondary actions — no second selector row. Detail keeps a
-          compact escape hatch so a stale selection can never trap the user. */}
+    <McpWorkspaceSurface
+      aria-label="Workspace MCPs"
+      data-scope-cards={scopeCardsVisible ? "true" : undefined}
+      data-screen={screen}
+    >
+      {/* One compact bar holds every selection: list view, search, and the
+          secondary actions. Scope is picked via the card strip below on the
+          list screen; every other screen pins a scope badge here so it's
+          always clear whether an edit lands in the global defaults or a
+          single workspace. Detail keeps a compact escape hatch so a stale
+          selection can never trap the user. */}
       <McpHubTopBar>
         {screen === "detail" ? (
           <>
@@ -2700,19 +2761,9 @@ export default function McpsWorkspaceView({
             <McpHubDetailCrumb title={selectedServer?.name || "MCP settings"}>
               {selectedServer?.name || "MCP settings"}
             </McpHubDetailCrumb>
+            {scopeSelectable && scopeBadge}
           </>
-        ) : scopeOptions.length > 0 && typeof onScopeChange === "function" && (
-          <Select
-            aria-label="MCP scope"
-            isSearchable={scopeOptions.length > 6}
-            menuPosition="fixed"
-            menuPortalTarget={selectPortalTarget()}
-            onChange={(option) => onScopeChange(option?.value || "")}
-            options={scopeOptions}
-            styles={MCP_BAR_SELECT_STYLES}
-            value={optionForValue(scopeOptions, scopeValue)}
-          />
-        )}
+        ) : scopeSelectable && screen !== "list" && scopeBadge}
         {screen === "list" && (
           <Select
             aria-label="MCP list view"
@@ -2765,6 +2816,47 @@ export default function McpsWorkspaceView({
         )}
       </McpHubTopBar>
 
+      {scopeCardsVisible && (
+        <McpScopeStrip aria-label="MCP scope">
+          {scopeOptions.map((option) => {
+            const optionValue = option?.value || "";
+            const active = optionValue === scopeValue;
+            const optionIsGlobal = optionValue === MCP_GLOBAL_SCOPE_VALUE;
+            return (
+              <McpScopeCard
+                aria-pressed={active ? "true" : "false"}
+                data-active={active ? "true" : undefined}
+                disabled={isBusy && !active}
+                key={optionValue}
+                onClick={() => {
+                  if (!active) onScopeChange(optionValue);
+                }}
+                title={optionIsGlobal
+                  ? "Defaults every workspace inherits"
+                  : `MCPs for the ${option.label} workspace only`}
+                type="button"
+              >
+                <McpScopeCardIcon>
+                  {optionIsGlobal
+                    ? <McpScopeGlobeIcon aria-hidden="true" />
+                    : <McpScopeWorkspaceIcon aria-hidden="true" />}
+                </McpScopeCardIcon>
+                <McpScopeCardCopy>
+                  <strong>{option.label}</strong>
+                  <span>
+                    {active
+                      ? "Editing this scope"
+                      : optionIsGlobal
+                        ? "All workspaces"
+                        : "This workspace only"}
+                  </span>
+                </McpScopeCardCopy>
+              </McpScopeCard>
+            );
+          })}
+        </McpScopeStrip>
+      )}
+
       <McpHubScroll ref={scrollRef}>
         {error && screen !== "detail" && <McpEmptyAccess role="alert">{error}</McpEmptyAccess>}
         {status === "missing_workspace" ? (
@@ -2791,6 +2883,130 @@ const McpHubTopBar = styled.div`
   gap: 8px;
   min-width: 0;
   flex-wrap: nowrap;
+`;
+
+/* Scope picker: one card per install target (global defaults + each
+   workspace) so it's obvious which registry the list below edits. */
+const McpScopeStrip = styled.div`
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  width: min(880px, 100%);
+  justify-self: center;
+  min-width: 0;
+  overflow-x: auto;
+  padding: 2px;
+  scrollbar-width: thin;
+`;
+
+const McpScopeCard = styled.button`
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 168px;
+  max-width: 232px;
+  padding: 9px 12px;
+  border: 1px solid var(--mcp-border, var(--forge-border, rgba(230, 236, 245, 0.1)));
+  border-radius: 10px;
+  color: var(--forge-text, #f4f7fa);
+  background: var(--mcp-panel-bg, rgba(17, 22, 29, 0.78));
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 130ms ease, background 130ms ease, box-shadow 130ms ease;
+
+  &:hover:not(:disabled):not([data-active="true"]) {
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.32);
+    background: var(--mcp-hover-bg, rgba(230, 236, 245, 0.035));
+  }
+
+  &[data-active="true"] {
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.55);
+    background: var(--mcp-active-bg, rgba(var(--forge-accent-rgb), 0.12));
+    box-shadow: 0 0 0 1px rgba(var(--forge-accent-rgb), 0.22);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.55;
+  }
+`;
+
+const McpScopeCardIcon = styled.span`
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 8px;
+  color: var(--forge-text-soft, #b6c0cc);
+  background: var(--mcp-icon-bg, rgba(21, 27, 35, 0.72));
+
+  svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  [data-active="true"] > & {
+    color: var(--forge-accent-soft, #7db0ff);
+    background: rgba(var(--forge-accent-rgb), 0.16);
+  }
+`;
+
+const McpScopeCardCopy = styled.span`
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+
+  strong {
+    overflow: hidden;
+    font-size: 12px;
+    font-weight: 750;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    overflow: hidden;
+    color: var(--forge-text-muted, #7a8493);
+    font-size: 10px;
+    font-weight: 700;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  [data-active="true"] > & span {
+    color: var(--forge-accent-soft, #7db0ff);
+  }
+`;
+
+/* Pinned scope reminder on the editor/detail screens. */
+const McpScopeBadge = styled.span`
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  max-width: 210px;
+  min-height: 26px;
+  padding: 0 10px;
+  border: 1px solid rgba(var(--forge-accent-soft-rgb), 0.3);
+  border-radius: 999px;
+  color: var(--forge-accent-soft, #7db0ff);
+  background: rgba(var(--forge-accent-rgb), 0.1);
+  font-size: 10px;
+  font-weight: 800;
+  white-space: nowrap;
+
+  > span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  svg {
+    width: 12px;
+    height: 12px;
+    flex: 0 0 auto;
+  }
 `;
 
 const McpHubScroll = styled.div`

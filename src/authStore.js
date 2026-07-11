@@ -65,6 +65,7 @@ function normalizeSnapshot(nextSnapshot = {}) {
 }
 
 let snapshot = normalizeSnapshot();
+let authorityVersion = 0;
 let nativeStarted = false;
 let nativeStartPromise = null;
 let nativeUnlisten = null;
@@ -114,12 +115,21 @@ function readPersistedAuthenticatedSnapshot() {
   }
 }
 
+function authAuthoritySignature(value) {
+  const object = value && typeof value === "object" ? value : {};
+  return `${String(object.status || "")}:${String(object.accountKey || "")}`;
+}
+
 function emitAuthChange(partial) {
-  snapshot = normalizeSnapshot({
+  const nextSnapshot = normalizeSnapshot({
     ...snapshot,
     ...partial,
     version: Number(snapshot.version || 0) + 1,
   });
+  if (authAuthoritySignature(nextSnapshot) !== authAuthoritySignature(snapshot)) {
+    authorityVersion += 1;
+  }
+  snapshot = nextSnapshot;
   persistAuthenticatedSnapshot(snapshot);
   listeners.forEach((listener) => listener());
 }
@@ -158,6 +168,9 @@ function applyNativeSnapshot(nextSnapshot) {
     snapshot.updatedAtMs = Number(normalized.updatedAtMs || 0);
     return snapshot;
   }
+  if (authAuthoritySignature(normalized) !== authAuthoritySignature(snapshot)) {
+    authorityVersion += 1;
+  }
   snapshot = normalized;
   persistAuthenticatedSnapshot(snapshot);
   listeners.forEach((listener) => listener());
@@ -170,6 +183,10 @@ function snapshotValuesEqual(left, right) {
   } catch {
     return left === right;
   }
+}
+
+function normalizedAccountKey(value) {
+  return String(value || "").trim();
 }
 
 async function refreshNativeSnapshot() {
@@ -255,6 +272,9 @@ export function useAuthSnapshot() {
 
 export const authStore = {
   getSnapshot,
+  getAuthorityVersion() {
+    return authorityVersion;
+  },
   refresh: refreshNativeSnapshot,
   async startLogin() {
     const result = await invoke("desktop_auth_start_login");
@@ -270,11 +290,18 @@ export const authStore = {
   async signOut() {
     return applyNativeCommand("desktop_auth_sign_out");
   },
-  async applyBillingStatus(billingStatus) {
+  async applyBillingStatus(billingStatus, { expectedAccountKey = "" } = {}) {
+    const expected = normalizedAccountKey(expectedAccountKey);
+    if (expected && normalizedAccountKey(snapshot.accountKey) !== expected) {
+      return snapshot;
+    }
     if (snapshotValuesEqual(snapshot.billingStatus, billingStatus)) {
       return snapshot;
     }
-    return applyNativeCommand("desktop_auth_apply_billing_status", { billing_status: billingStatus });
+    return applyNativeCommand("desktop_auth_apply_billing_status", {
+      billing_status: billingStatus,
+      expected_account_key: expected || null,
+    });
   },
   getActiveScope() {
     return snapshot.activeScope || personalScope();

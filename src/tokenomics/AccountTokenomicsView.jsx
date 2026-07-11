@@ -5,18 +5,18 @@ import styled, { keyframes } from "styled-components";
 import { Refresh } from "@styled-icons/material-rounded/Refresh";
 import { FilterListOff } from "@styled-icons/material-rounded/FilterListOff";
 import {
+  billingStatusPlanName,
   dailyUsageTitle,
   dailyUsageValue,
-  creditSnapshotHasMeaningfulData,
   formatCredits,
   formatCost,
   formatCostTitle,
   formatPaceMultiplier,
   formatTokenTitle,
   formatTokens,
-  normalizeCreditWallet,
   numeric,
   paceMultiplierFromDelta,
+  resolveAccountDisplayedCreditWalletState,
   rowActivityTokens,
   rowCache,
   rowCost,
@@ -1013,11 +1013,17 @@ function storageUsageHasMeaningfulData(storageUsage) {
     raw.known === true
       || usage
       || tokenomicsObjectHasAny(raw, [
+        "totalBytes",
         "total_bytes",
+        "totalUsedBytes",
         "total_used_bytes",
+        "sqliteBytes",
         "sqlite_bytes",
+        "sqliteUsedBytes",
         "sqlite_used_bytes",
+        "assetsBytes",
         "assets_bytes",
+        "assetsUsedBytes",
         "assets_used_bytes",
       ])
   );
@@ -1052,7 +1058,10 @@ function storageLimitsForPlan(planName) {
 
 function storageUsageModel(billingStatus = {}, liveStorageUsage = null) {
   const planName = String(
-    billingStatus?.plan_name || billingStatus?.credits?.plan_name || liveStorageUsage?.plan_name || "free",
+    billingStatusPlanName(billingStatus)
+      || liveStorageUsage?.planName
+      || liveStorageUsage?.plan_name
+      || "free",
   ).trim().toLowerCase();
   const raw = liveStorageUsage
     || billingStatus?.storage?.usage
@@ -1066,27 +1075,27 @@ function storageUsageModel(billingStatus = {}, liveStorageUsage = null) {
     || billingStatus?.user?.entitlements?.storage
     || {};
   const limits = {
-    total_bytes: storageByteValue(explicitLimits.total_bytes, fallback.total_bytes),
-    sqlite_bytes: storageByteValue(explicitLimits.sqlite_bytes, fallback.sqlite_bytes),
-    assets_bytes: storageByteValue(explicitLimits.assets_bytes, fallback.assets_bytes),
+    total_bytes: storageByteValue(explicitLimits.totalBytes, explicitLimits.total_bytes, fallback.total_bytes),
+    sqlite_bytes: storageByteValue(explicitLimits.sqliteBytes, explicitLimits.sqlite_bytes, fallback.sqlite_bytes),
+    assets_bytes: storageByteValue(explicitLimits.assetsBytes, explicitLimits.assets_bytes, fallback.assets_bytes),
   };
   const rows = [
     {
       key: "total",
       label: "Total",
-      used: storageByteValue(usage.total_bytes, raw.total_used_bytes),
+      used: storageByteValue(usage.totalBytes, usage.total_bytes, raw.totalUsedBytes, raw.total_used_bytes),
       limit: limits.total_bytes,
     },
     {
       key: "sqlite",
       label: "SQLite",
-      used: storageByteValue(usage.sqlite_bytes, raw.sqlite_used_bytes),
+      used: storageByteValue(usage.sqliteBytes, usage.sqlite_bytes, raw.sqliteUsedBytes, raw.sqlite_used_bytes),
       limit: limits.sqlite_bytes,
     },
     {
       key: "assets",
       label: "Assets",
-      used: storageByteValue(usage.assets_bytes, raw.assets_used_bytes),
+      used: storageByteValue(usage.assetsBytes, usage.assets_bytes, raw.assetsUsedBytes, raw.assets_used_bytes),
       limit: limits.assets_bytes,
     },
   ].map((row) => ({
@@ -3693,9 +3702,29 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
     () => modelBreakdown(modelRows, selectedProvider, selectedAccountFilter, selectedDeviceId, selectedScopeKey),
     [modelRows, selectedAccountFilter, selectedDeviceId, selectedProvider, selectedScopeKey],
   );
-  const credits = creditSnapshotHasMeaningfulData(billingStatus?.credits)
-    ? normalizeCreditWallet(billingStatus.credits) || {}
-    : {};
+  // Credits precedence: the auth/billing snapshot seeds the widget immediately
+  // (pre-websocket); later live/hot snapshots only update the display when
+  // they are themselves meaningful/known. The last good wallet is kept in a
+  // ref so a transient empty/unknown snapshot can never flicker the widget
+  // back to 0 — while a genuine known:true zeroed balance still shows 0.
+  const displayedCreditsRef = useRef({
+    accountKey: "",
+    awaitingBillingStatus: false,
+    billingStatus: null,
+    credits: null,
+  });
+  const displayedCreditsState = useMemo(
+    () => resolveAccountDisplayedCreditWalletState(
+      displayedCreditsRef.current,
+      accountKey,
+      billingStatus,
+    ),
+    [accountKey, billingStatus],
+  );
+  useLayoutEffect(() => {
+    displayedCreditsRef.current = displayedCreditsState;
+  }, [displayedCreditsState]);
+  const credits = displayedCreditsState.credits;
   // OpenCode is intentionally excluded from live limit gauges — OpenCode Go has
   // no usage API, and users track spend via their own plugins. OpenCode usage is
   // surfaced through the token-usage charts/account cards below, not estimates.
@@ -3936,15 +3965,15 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
           <CreditsGrid>
             <CreditMetric>
               <span>Used</span>
-              <strong>{formatCredits(credits.term_used_credits)}</strong>
+              <strong>{credits ? formatCredits(credits.term_used_credits) : "—"}</strong>
             </CreditMetric>
             <CreditMetric>
               <span>Remaining</span>
-              <strong>{formatCredits(credits.term_remaining_credits)}</strong>
+              <strong>{credits ? formatCredits(credits.term_remaining_credits) : "—"}</strong>
             </CreditMetric>
             <CreditMetric>
               <span>Reserved</span>
-              <strong>{formatCredits(credits.term_reserved_credits)}</strong>
+              <strong>{credits ? formatCredits(credits.term_reserved_credits) : "—"}</strong>
             </CreditMetric>
           </CreditsGrid>
         </CreditsCard>

@@ -2272,7 +2272,6 @@ function WorkspaceTerminal({
   permission_mode: permissionMode = "",
   startupReady = true,
   showDockedDragHandle = false,
-  terminalBreakoutActive = false,
   terminalSplitLimit = MAX_WORKSPACE_TERMINAL_COUNT,
   terminalSplitMode = "both",
   terminalSelectionMode = "pointerdown",
@@ -2494,7 +2493,7 @@ function WorkspaceTerminal({
     1,
     Number.parseInt(draggablePaneCount, 10) || terminalCount || 1,
   );
-  const canDragTerminalPane = terminalBreakoutActive || normalizedDraggablePaneCount > 1;
+  const canDragTerminalPane = normalizedDraggablePaneCount > 1;
   const terminalRoleId = String(terminalRole || agent?.id || "").toLowerCase();
   const isGenericTerminal = terminalRoleId === "generic" || agent?.id === "generic";
   const paneAgentId = isGenericTerminal ? "generic" : agent?.id;
@@ -5419,15 +5418,12 @@ function WorkspaceTerminal({
     workspace?.id,
   ]);
 
-  const requestTerminalDragFromEvent = useCallback((event, options = {}) => {
-    const breakoutSurfaceDrag = options?.breakoutSurfaceDrag === true;
-
+  const requestTerminalDragFromEvent = useCallback((event) => {
     if (
       terminalClosed
       || terminalClosing
       || isFullscreen
       || event.button !== 0
-      || (breakoutSurfaceDrag && !terminalBreakoutActive)
       || !canDragTerminalPane
     ) {
       return false;
@@ -5439,10 +5435,7 @@ function WorkspaceTerminal({
     event.preventDefault();
     event.stopPropagation();
 
-    activateTerminalPane(
-      breakoutSurfaceDrag ? "terminal_breakout_drag" : "terminal_drag",
-      { focusKeyboard: false },
-    );
+    activateTerminalPane("terminal_drag", { focusKeyboard: false });
 
     onBeginTerminalDrag?.({
       clientX: event.clientX,
@@ -5462,31 +5455,10 @@ function WorkspaceTerminal({
     isFullscreen,
     onBeginTerminalDrag,
     paneId,
-    terminalBreakoutActive,
     terminalClosed,
     terminalClosing,
     terminalIndex,
     workspace?.id,
-  ]);
-
-  const beginBreakoutSurfaceDragGesture = useCallback((event) => {
-    if (
-      !terminalBreakoutActive
-      || terminalClosed
-      || terminalClosing
-      || isFullscreen
-      || event.button !== 0
-    ) {
-      return false;
-    }
-
-    return requestTerminalDragFromEvent(event, { breakoutSurfaceDrag: true });
-  }, [
-    isFullscreen,
-    requestTerminalDragFromEvent,
-    terminalBreakoutActive,
-    terminalClosed,
-    terminalClosing,
   ]);
 
   const handleTerminalSurfaceFocusCapture = useCallback((event) => {
@@ -5506,14 +5478,6 @@ function WorkspaceTerminal({
       return;
     }
 
-    if (
-      terminalBreakoutActive
-      && beginBreakoutSurfaceDragGesture(event)
-    ) {
-      terminalPointerSelectionPendingRef.current = false;
-      return;
-    }
-
     if (!terminalSelectsOnPointerDown) {
       terminalPointerSelectionPendingRef.current = true;
       return;
@@ -5522,8 +5486,6 @@ function WorkspaceTerminal({
     activateTerminalPane("terminal_pointer", { focusKeyboard: false });
   }, [
     activateTerminalPane,
-    beginBreakoutSurfaceDragGesture,
-    terminalBreakoutActive,
     terminalSelectsOnPointerDown,
   ]);
 
@@ -17214,7 +17176,6 @@ function WorkspaceTerminal({
     <XtermSurface
       data-active={deferredXtermActive ? "true" : "false"}
       data-pty-reveal-ready={terminalPtyRevealReady ? "true" : "false"}
-      data-terminal-breakout={terminalBreakoutActive ? "true" : undefined}
       data-scrollbar-platform={TERMINAL_SCROLLBAR_PLATFORM}
       data-parked={parkedPrompt ? "true" : "false"}
       aria-hidden={terminalPtyRevealReady ? undefined : "true"}
@@ -17291,7 +17252,6 @@ function WorkspaceTerminal({
       data-pane-id={paneId}
       data-terminal-fullscreen={isFullscreen ? "true" : undefined}
       data-terminal-fullscreen-state={isFullscreen ? fullscreenState : undefined}
-      data-terminal-breakout={terminalBreakoutActive ? "true" : undefined}
       data-terminal-index={terminalIndex}
       data-threads-view={threadOverlayOpen ? "true" : undefined}
       data-ui-view={terminalUiViewActive ? "true" : undefined}
@@ -17537,7 +17497,6 @@ function WorkspaceTerminal({
 
       <TerminalFrame
         aria-busy={terminalClosing ? "true" : "false"}
-        data-terminal-breakout={terminalBreakoutActive ? "true" : undefined}
         data-state={terminalState}
         data-drop-active={todoDropOverlayTarget ? "true" : "false"}
         onDragEnter={handleTerminalTodoDragEnter}

@@ -8717,10 +8717,22 @@ const ScriptColorField = styled.label`
     width: 20px;
     height: 20px;
     padding: 0;
-    border: 0;
+    border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.16));
     border-radius: 5px;
     background: transparent;
     cursor: pointer;
+    appearance: none;
+    -webkit-appearance: none;
+  }
+
+  input::-webkit-color-swatch-wrapper {
+    padding: 0;
+  }
+
+  input::-webkit-color-swatch {
+    border: 0;
+    border-radius: 4px;
+    box-shadow: inset 0 0 0 1px rgba(4, 7, 12, 0.35);
   }
 `;
 
@@ -8734,8 +8746,20 @@ const ScriptCreateFields = styled.div`
 const ScriptColorCreateField = styled(DocsField)`
   input[type="color"] {
     width: 100%;
-    padding: 3px;
+    padding: 4px;
     cursor: pointer;
+    appearance: none;
+    -webkit-appearance: none;
+  }
+
+  input[type="color"]::-webkit-color-swatch-wrapper {
+    padding: 0;
+  }
+
+  input[type="color"]::-webkit-color-swatch {
+    border: 0;
+    border-radius: 4px;
+    box-shadow: inset 0 0 0 1px rgba(4, 7, 12, 0.3);
   }
 `;
 

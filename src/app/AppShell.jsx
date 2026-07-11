@@ -30,7 +30,7 @@ import { Send } from "@styled-icons/material-rounded/Send";
 import { Terminal } from "@styled-icons/material-rounded/Terminal";
 import { Webhook } from "@styled-icons/material-rounded/Webhook";
 import { ZoomOutMap } from "@styled-icons/material-rounded/ZoomOutMap";
-import { Fragment, memo, Profiler, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, lazy, memo, Profiler, startTransition, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { onRuntimeProfilerRender } from "../diagnostics/commitProfiler.js";
 import { authStore, DEFAULT_AUTH_MESSAGE, useAuthSnapshot } from "../authStore";
@@ -82,6 +82,10 @@ import {
   terminalPromptSubmittedPayloadIsAuthoritative,
 } from "../terminals/terminalPromptSubmission.js";
 import {
+  billingStatusCredits,
+  billingStatusPlanName,
+  billingStatusPlanStatus,
+  billingStatusUpdatedAt,
   creditRemainingWithReserved,
   creditSnapshotHasMeaningfulData,
   normalizeCreditWallet,
@@ -154,6 +158,7 @@ import {
   normalizeSnippingDispatchTargetThread,
 } from "../snipping/snippingAnnotationTargets.js";
 import { TERMINAL_IS_WINDOWS_HOST } from "../terminals/terminalScrollStabilityStrategies.jsx";
+import PaneErrorBoundary from "./PaneErrorBoundary.js";
 import TerminalView, {
   TODO_QUEUE_PANE_MODE_FULLSCREEN,
   TODO_QUEUE_PANE_MODE_MINIMIZED,
@@ -1075,6 +1080,8 @@ import SnippingQuickAccess, {
 } from "../snipping/SnippingQuickAccess.jsx";
 import AccountTokenomicsView, { warmAccountTokenomics } from "../tokenomics/AccountTokenomicsView.jsx";
 import DevicesView from "../devices/DevicesView.jsx";
+
+const AuraMode = lazy(() => import("../aura/AuraMode.jsx"));
 
 const BRAND_NAME = "Diff Forge AI";
 const LAUNCH_MINIMUM_MS = 1400;
@@ -2391,7 +2398,7 @@ function creditResetLabel(resetAt) {
 }
 
 function creditUsagePercent(credits) {
-  const total = Number(credits?.term_total_credits || 0);
+  const total = Number(credits?.termTotalCredits ?? credits?.term_total_credits ?? 0);
   const remaining = creditRemainingWithReserved(credits);
 
   if (!Number.isFinite(total) || total <= 0) {
@@ -2408,6 +2415,92 @@ function liveCreditText(value, fallback = "") {
 
 function liveCreditObject(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
+function billingAccountKey(value) {
+  return String(value || "").trim();
+}
+
+function billingAccountIdentityToken(value) {
+  return billingAccountKey(value);
+}
+
+function cloudAccountIdentityToken(value) {
+  const cleaned = billingAccountKey(value)
+    .split("")
+    .map((character) => (
+      /[A-Za-z0-9._-]/.test(character) ? character : "_"
+    ))
+    .join("")
+    .replace(/^[._-]+|[._-]+$/g, "")
+    .slice(0, 96);
+  return cleaned || "";
+}
+
+function billingAccountAliasTokens(accountKey, user) {
+  const appwriteUserId = billingAccountIdentityToken(
+    user?.appwriteUserId || user?.appwrite_user_id,
+  );
+  const values = [
+    accountKey,
+    user?.id,
+    user?.$id,
+    user?.email,
+    appwriteUserId,
+  ];
+  if (appwriteUserId) {
+    values.push(
+      `user:${appwriteUserId}`,
+      cloudAccountIdentityToken(`user:${appwriteUserId}`),
+    );
+  }
+  return new Set(values.map(billingAccountIdentityToken).filter(Boolean));
+}
+
+function accountUsageIdentityTokens(payload, snapshot) {
+  const object = liveCreditObject(payload) || {};
+  const roots = [
+    object,
+    liveCreditObject(object.envelope),
+    liveCreditObject(object.snapshot),
+    liveCreditObject(object.payload),
+    liveCreditObject(object.data),
+    liveCreditObject(object.payload?.snapshot),
+    liveCreditObject(object.data?.snapshot),
+    liveCreditObject(snapshot),
+  ].filter(Boolean);
+  const tokens = new Set();
+  for (const root of roots) {
+    for (const key of [
+      "accountKey",
+      "account_key",
+      "accountId",
+      "account_id",
+      "desktopAccountKey",
+      "desktop_account_key",
+      "scopeKey",
+      "scope_key",
+    ]) {
+      const token = billingAccountIdentityToken(root?.[key]);
+      if (token) {
+        tokens.add(token);
+      }
+    }
+  }
+  return tokens;
+}
+
+function accountUsageMatchesCurrentAccount(payload, snapshot, currentAliases) {
+  const eventAccounts = accountUsageIdentityTokens(payload, snapshot);
+  if (!eventAccounts.size) {
+    // Untagged events cannot be attributed safely after an account switch.
+    // The account-bound billing poll remains the compatibility fallback.
+    return false;
+  }
+  if (!currentAliases?.size) {
+    return false;
+  }
+  return [...eventAccounts].some((token) => currentAliases.has(token));
 }
 
 function liveCreditHasMeaningfulSnapshot(credits) {
@@ -2440,10 +2533,9 @@ function billingStatusHasMeaningfulData(status) {
   const object = liveCreditObject(status);
   if (!object) return false;
   return Boolean(
-    liveCreditText(object.plan_name)
-      || liveCreditText(object.plan_status)
-      || liveCreditHasMeaningfulSnapshot(object.credits)
-      || liveCreditHasMeaningfulSnapshot(object.user?.credits)
+    billingStatusPlanName(object)
+      || billingStatusPlanStatus(object)
+      || liveCreditHasMeaningfulSnapshot(billingStatusCredits(object))
   );
 }
 
@@ -2451,12 +2543,11 @@ function mergeBillingStatusSnapshot(previous, incoming, options = {}) {
   if (!billingStatusHasMeaningfulData(incoming)) {
     return previous || null;
   }
-  const previousCredits = previous?.credits;
-  const incomingCredits = liveCreditHasMeaningfulSnapshot(incoming?.credits)
-    ? incoming.credits
-    : liveCreditHasMeaningfulSnapshot(incoming?.user?.credits)
-      ? incoming.user.credits
-      : null;
+  const previousCredits = billingStatusCredits(previous);
+  const candidateIncomingCredits = billingStatusCredits(incoming);
+  const incomingCredits = liveCreditHasMeaningfulSnapshot(candidateIncomingCredits)
+    ? candidateIncomingCredits
+    : null;
   const next = {
     ...(previous || {}),
     ...(incoming || {}),
@@ -2474,6 +2565,24 @@ function mergeBillingStatusSnapshot(previous, incoming, options = {}) {
       credits: next.credits || next.user.credits,
     };
   }
+  // Object spread can leave a stale camel alias beside a fresher snake alias
+  // (or vice versa). Resolve from the incoming snapshot first, then stamp both
+  // spellings so later camel-first readers cannot select the stale value.
+  const planName = billingStatusPlanName(incoming) || billingStatusPlanName(previous);
+  const planStatus = billingStatusPlanStatus(incoming) || billingStatusPlanStatus(previous);
+  const updatedAt = billingStatusUpdatedAt(incoming) || billingStatusUpdatedAt(previous);
+  if (planName) {
+    next.planName = planName;
+    next.plan_name = planName;
+  }
+  if (planStatus) {
+    next.planStatus = planStatus;
+    next.plan_status = planStatus;
+  }
+  if (updatedAt) {
+    next.updatedAt = updatedAt;
+    next.updated_at = updatedAt;
+  }
   return next;
 }
 
@@ -2483,8 +2592,8 @@ function lowCreditWarningKey(credits) {
   }
 
   return [
-    credits.term_id || credits.reset_at || "current",
-    credits.low_credit_state || "unknown",
+    credits.termId || credits.term_id || credits.resetAt || credits.reset_at || "current",
+    credits.lowCreditState || credits.low_credit_state || "unknown",
     String(creditRemainingWithReserved(credits)),
   ].join(":");
 }
@@ -2494,7 +2603,7 @@ function shouldShowLowCreditWarning(credits, dismissedKey) {
     return false;
   }
 
-  const state = String(credits.low_credit_state || "").toLowerCase();
+  const state = String(credits.lowCreditState || credits.low_credit_state || "").toLowerCase();
   const remaining = creditRemainingWithReserved(credits);
   const isLow = ["low", "critical", "exhausted", "missing_term"].includes(state)
     || (Number.isFinite(remaining) && remaining <= LOW_CREDIT_WARNING_THRESHOLD);
@@ -2532,6 +2641,26 @@ async function recordCloudConnectionDiagnostic() {
 }
 
 async function refreshCloudMcpSessionContext(options = {}) {
+  const expectedAccountKey = billingAccountKey(options.expectedAccountKey);
+  const expectedAuthAuthorityVersion = Number(options.expectedAuthAuthorityVersion);
+  const assertExpectedAccount = () => {
+    if (
+      expectedAccountKey
+      && billingAccountKey(authStore.getSnapshot()?.accountKey) !== expectedAccountKey
+    ) {
+      const error = new Error("Cloud context refresh belongs to a previous account.");
+      error.code = "STALE_AUTH_ACCOUNT";
+      throw error;
+    }
+    if (
+      Number.isFinite(expectedAuthAuthorityVersion)
+      && authStore.getAuthorityVersion() !== expectedAuthAuthorityVersion
+    ) {
+      const error = new Error("Cloud context refresh belongs to a previous auth session.");
+      error.code = "STALE_AUTH_ACCOUNT";
+      throw error;
+    }
+  };
   const emitProgress = (progress) => {
     if (typeof options.onProgress !== "function") {
       return;
@@ -2546,6 +2675,7 @@ async function refreshCloudMcpSessionContext(options = {}) {
 
   try {
     const flowId = options.flowId || "desktop-cloud-connect";
+    assertExpectedAccount();
     emitProgress({
       detail: "Refreshing your signed-in cloud context in the native runtime.",
       stage: "desktop_session",
@@ -2562,6 +2692,7 @@ async function refreshCloudMcpSessionContext(options = {}) {
         requireConnected: Boolean(options.requireConnected),
       },
     });
+    assertExpectedAccount();
     await recordCloudSigninDiagnostic({
       flowId,
       step: "cloud_mcp.context.refresh",
@@ -2571,13 +2702,21 @@ async function refreshCloudMcpSessionContext(options = {}) {
         requireConnected: Boolean(options.requireConnected),
       },
     });
+    assertExpectedAccount();
     if (options.accountScope) {
+      assertExpectedAccount();
       await authStore.setActiveScope(options.accountScope);
+      assertExpectedAccount();
     }
-    if (options.billing_status) {
-      await authStore.applyBillingStatus(options.billing_status);
+    if (options.billing_status && expectedAccountKey) {
+      assertExpectedAccount();
+      await authStore.applyBillingStatus(options.billing_status, {
+        expectedAccountKey,
+      });
+      assertExpectedAccount();
     }
     const status = await invoke("cloud_mcp_get_status");
+    assertExpectedAccount();
     await recordCloudConnectionDiagnostic({
       channel: "rust-client-auth",
       flowId,
@@ -2586,6 +2725,7 @@ async function refreshCloudMcpSessionContext(options = {}) {
       message: "Cloud MCP runtime context refresh completed.",
       details: status,
     });
+    assertExpectedAccount();
     await recordCloudSigninDiagnostic({
       flowId,
       step: "cloud_mcp.context.refresh",
@@ -2593,6 +2733,7 @@ async function refreshCloudMcpSessionContext(options = {}) {
       message: "Cloud MCP runtime context refresh completed",
       details: status,
     });
+    assertExpectedAccount();
 
     emitProgress({
       detail: "The native runtime is using your signed-in cloud context.",
@@ -2610,6 +2751,7 @@ async function refreshCloudMcpSessionContext(options = {}) {
     let lastConnectError = null;
 
     for (let attempt = 1; attempt <= connectAttempts; attempt += 1) {
+      assertExpectedAccount();
       emitProgress({
         attempt,
         detail: attempt === 1
@@ -2630,14 +2772,18 @@ async function refreshCloudMcpSessionContext(options = {}) {
           timeout_ms: CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MS,
         },
       });
+      assertExpectedAccount();
 
       const stopStatusPolling = startCloudWorkspaceStatusPolling(emitProgress);
       try {
         const connectedStatus = await withTimeout(
-          invoke("cloud_mcp_connect"),
+          invoke("cloud_mcp_connect", {
+            expected_account_key: expectedAccountKey || null,
+          }),
           CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MS,
           CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MESSAGE,
         );
+        assertExpectedAccount();
         stopStatusPolling();
         await recordCloudConnectionDiagnostic({
           channel: "rust-client-auth",
@@ -2647,6 +2793,7 @@ async function refreshCloudMcpSessionContext(options = {}) {
           message: "Rust client Cloud MCP websocket connect command returned.",
           details: connectedStatus,
         });
+        assertExpectedAccount();
         await recordCloudSigninDiagnostic({
           flowId,
           step: "cloud_mcp.connect.invoke",
@@ -2654,6 +2801,7 @@ async function refreshCloudMcpSessionContext(options = {}) {
           message: "Cloud MCP websocket connect command returned",
           details: connectedStatus,
         });
+        assertExpectedAccount();
 
         if (!connectedStatus?.connected || !connectedStatus?.global_ws_connected) {
           throw new Error("Cloud workspace websocket is not connected yet.");
@@ -2670,6 +2818,9 @@ async function refreshCloudMcpSessionContext(options = {}) {
         return connectedStatus;
       } catch (connectError) {
         stopStatusPolling();
+        if (connectError?.code === "STALE_AUTH_ACCOUNT") {
+          throw connectError;
+        }
         lastConnectError = connectError;
 
         if (attempt < connectAttempts) {
@@ -2683,6 +2834,7 @@ async function refreshCloudMcpSessionContext(options = {}) {
 
           if (retryDelayMs > 0) {
             await waitMs(retryDelayMs);
+            assertExpectedAccount();
           }
           continue;
         }
@@ -2693,6 +2845,9 @@ async function refreshCloudMcpSessionContext(options = {}) {
 
     throw lastConnectError || new Error("Cloud workspace websocket is not connected yet.");
   } catch (error) {
+    if (error?.code === "STALE_AUTH_ACCOUNT") {
+      return null;
+    }
     if (options.requireConnected) {
       emitProgress({
         detail: getErrorMessage(error, "The cloud workspace did not finish connecting."),
@@ -5001,7 +5156,19 @@ function cloudAccountUsageSnapshotFromEventPayload(payload) {
   const snapshot = direct && typeof direct === "object" ? direct : {};
   const nestedData = snapshot.data && typeof snapshot.data === "object" ? snapshot.data : {};
   const nestedPayload = snapshot.payload && typeof snapshot.payload === "object" ? snapshot.payload : {};
-  const billingStatus = snapshot.billing_status || snapshot.account_status || nestedData.billing_status || nestedData.account_status || nestedPayload.billing_status || nestedPayload.account_status || {};
+  const billingStatus = snapshot.billingStatus
+    || snapshot.billing_status
+    || snapshot.accountStatus
+    || snapshot.account_status
+    || nestedData.billingStatus
+    || nestedData.billing_status
+    || nestedData.accountStatus
+    || nestedData.account_status
+    || nestedPayload.billingStatus
+    || nestedPayload.billing_status
+    || nestedPayload.accountStatus
+    || nestedPayload.account_status
+    || {};
   const credits = snapshot.credits
     || snapshot.wallet
     || billingStatus.credits
@@ -5011,7 +5178,13 @@ function cloudAccountUsageSnapshotFromEventPayload(payload) {
     || nestedPayload.credits
     || nestedPayload.wallet
     || null;
-  const storageUsage = snapshot.storage_usage || nestedData.storage_usage || nestedPayload.storage_usage || null;
+  const storageUsage = snapshot.storageUsage
+    || snapshot.storage_usage
+    || nestedData.storageUsage
+    || nestedData.storage_usage
+    || nestedPayload.storageUsage
+    || nestedPayload.storage_usage
+    || null;
   return {
     snapshot,
     credits: credits && typeof credits === "object" ? credits : null,
@@ -5029,7 +5202,7 @@ function billingStatusFromAccountUsagePayload(payload, previousBillingStatus = n
   if (!preferIncomingCredits && sourceCredits?.known === false && sourceCredits?.live !== true) {
     return null;
   }
-  const normalizedCredits = normalizeLiveCreditWallet(sourceCredits, previousBillingStatus?.credits, {
+  const normalizedCredits = normalizeLiveCreditWallet(sourceCredits, billingStatusCredits(previousBillingStatus), {
     preferIncomingTotals: preferIncomingCredits,
   });
   if (!normalizedCredits) {
@@ -5037,8 +5210,15 @@ function billingStatusFromAccountUsagePayload(payload, previousBillingStatus = n
   }
   return mergeBillingStatusSnapshot(previousBillingStatus, {
     credits: normalizedCredits,
-    plan_name: normalizedCredits.plan_name || snapshot?.plan_name || previousBillingStatus?.plan_name,
-    plan_status: snapshot?.plan_status || previousBillingStatus?.plan_status || "paid",
+    plan_name: normalizedCredits.planName
+      || normalizedCredits.plan_name
+      || snapshot?.planName
+      || snapshot?.plan_name
+      || billingStatusPlanName(previousBillingStatus),
+    plan_status: snapshot?.planStatus
+      || snapshot?.plan_status
+      || billingStatusPlanStatus(previousBillingStatus)
+      || "paid",
   }, {
     preferIncomingCredits,
   });
@@ -15896,7 +16076,7 @@ function WorkspaceCreatePanel({
 }
 
 function isPaidUser(sessionUser) {
-  return sessionUser?.plan_status === "paid";
+  return (sessionUser?.planStatus || sessionUser?.plan_status) === "paid";
 }
 
 function accountScopeOptionsFromUser() {
@@ -15922,9 +16102,9 @@ function accountScopeKey() {
 }
 
 function billingPlanNameFromStatus(billingStatus, sessionUser) {
-  const paid = isPaidUser(sessionUser) || billingStatus?.plan_status === "paid";
+  const paid = isPaidUser(sessionUser) || billingStatusPlanStatus(billingStatus) === "paid";
   const rawPlan = String(
-    billingStatus?.plan_name || billingStatus?.credits?.plan_name || sessionUser?.plan_name || "",
+    billingStatusPlanName(billingStatus) || sessionUser?.planName || sessionUser?.plan_name || "",
   ).trim().toLowerCase();
 
   if (!paid && rawPlan !== "free") {
@@ -15937,15 +16117,15 @@ function billingPlanNameFromStatus(billingStatus, sessionUser) {
 }
 
 function billingPlanLabelFromStatus(billingStatus, sessionUser) {
-  const paid = isPaidUser(sessionUser) || billingStatus?.plan_status === "paid";
+  const paid = isPaidUser(sessionUser) || billingStatusPlanStatus(billingStatus) === "paid";
 
   if (!paid) {
     return "Free";
   }
 
   const rawPlan = String(
-    billingStatus?.plan_name
-    || billingStatus?.credits?.plan_name
+    billingStatusPlanName(billingStatus)
+    || sessionUser?.planName
     || sessionUser?.plan_name
     || "",
   ).trim().toLowerCase();
@@ -23316,12 +23496,15 @@ export default function App() {
     message: authMessage,
     error: authError,
     user,
-    active_scope: activeScope,
-    account_key: authAccountKey,
+    activeScope,
+    accountKey: authAccountKey,
     entitlements: authEntitlements,
-    billing_status: persistedBillingStatus,
+    // NOTE: the auth store snapshot uses camelCase keys — destructuring
+    // `billing_status` here silently yielded undefined and starved the
+    // credits widget of its auth-time baseline.
+    billingStatus: persistedBillingStatus,
   } = useAuthSnapshot();
-  const resolvedTokenomicsAccountKey = authAccountKey || user?.id || user?.email || "";
+  const resolvedTokenomicsAccountKey = authAccountKey || user?.id || user?.$id || user?.email || "";
   const [apiState, setApiState] = useState("checking");
   const [apiMessage, setApiMessage] = useState("Checking connection");
   const [activeView, setActiveView] = useState(DEFAULT_WORKSPACE_VIEW);
@@ -23512,6 +23695,45 @@ export default function App() {
   // and flickered the app between login and dashboard.
   const billingStatusRef = useRef(null);
   billingStatusRef.current = billingStatus;
+  const billingRequestSequenceRef = useRef(0);
+  const currentBillingAccountKeyRef = useRef(billingAccountKey(resolvedTokenomicsAccountKey));
+  const currentBillingAccountAliasesRef = useRef(
+    billingAccountAliasTokens(resolvedTokenomicsAccountKey, user),
+  );
+  useLayoutEffect(() => {
+    currentBillingAccountKeyRef.current = billingAccountKey(resolvedTokenomicsAccountKey);
+    currentBillingAccountAliasesRef.current = billingAccountAliasTokens(
+      resolvedTokenomicsAccountKey,
+      user,
+    );
+  }, [resolvedTokenomicsAccountKey, user]);
+  const billingAuthorityAuthStateRef = useRef(authState);
+  useLayoutEffect(() => {
+    if (billingAuthorityAuthStateRef.current === authState) {
+      return;
+    }
+    billingAuthorityAuthStateRef.current = authState;
+    billingRequestSequenceRef.current += 1;
+  }, [authState]);
+  const billingStatusAccountKeyRef = useRef(String(resolvedTokenomicsAccountKey || "").trim());
+  useLayoutEffect(() => {
+    const nextAccountKey = String(resolvedTokenomicsAccountKey || "").trim();
+    const previousAccountKey = billingStatusAccountKeyRef.current;
+    if (nextAccountKey === previousAccountKey) {
+      return;
+    }
+    billingStatusAccountKeyRef.current = nextAccountKey;
+    billingRequestSequenceRef.current += 1;
+    if (!previousAccountKey) {
+      return;
+    }
+    // Billing state belongs to one authenticated account. Never display or
+    // merge the previous account's wallet while the new snapshot hydrates.
+    billingStatusRef.current = null;
+    setBillingStatus(null);
+    setBillingStatusState("idle");
+    setBillingStatusError("");
+  }, [resolvedTokenomicsAccountKey]);
   // Same contract for authState: refreshBillingStatus feeds (via
   // requestCloudCreditsRefresh → handleTopupDeepLink) into the auth startup
   // effect's deps, so keying it on authState re-armed that effect on every
@@ -24170,10 +24392,10 @@ export default function App() {
     activeAgent,
   );
   const accountScopes = useMemo(() => accountScopeOptionsFromUser(), []);
-  const accountIsPaid = Boolean(authEntitlements?.is_paid)
-    || Boolean(authEntitlements?.can_use_cloud_sync)
+  const accountIsPaid = Boolean(authEntitlements?.isPaid ?? authEntitlements?.is_paid)
+    || Boolean(authEntitlements?.canUseCloudSync ?? authEntitlements?.can_use_cloud_sync)
     || isPaidUser(user)
-    || billingStatus?.plan_status === "paid";
+    || billingStatusPlanStatus(billingStatus) === "paid";
   const getTerminalInputHotDelayMs = useCallback((extraMs = TERMINAL_INPUT_HOT_BACKGROUND_GRACE_MS) => {
     const globalHotUntil = typeof window === "undefined"
       ? 0
@@ -24423,7 +24645,7 @@ export default function App() {
     } catch {
       billingKey = String(Boolean(billingStatus));
     }
-    const sessionContextKey = `${activeAccountScopeKey}:${billingKey}`;
+    const sessionContextKey = `${resolvedTokenomicsAccountKey}:${activeAccountScopeKey}:${billingKey}`;
     if (cloudMcpSessionContextSyncKeyRef.current === sessionContextKey) {
       return;
     }
@@ -24433,13 +24655,15 @@ export default function App() {
     void refreshCloudMcpSessionContext({
       accountScope: activeAccountScope,
       billing_status: billingStatus,
+      expectedAccountKey: resolvedTokenomicsAccountKey,
+      expectedAuthAuthorityVersion: authStore.getAuthorityVersion(),
       flowId: `scope-${activeAccountScopeKey}`,
     }).catch(() => {
       if (cloudMcpSessionContextSyncKeyRef.current === sessionContextKey) {
         cloudMcpSessionContextSyncKeyRef.current = "";
       }
     });
-  }, [activeAccountScope, activeAccountScopeKey, authState, billingStatus]);
+  }, [activeAccountScope, activeAccountScopeKey, authState, billingStatus, resolvedTokenomicsAccountKey]);
   useEffect(() => {
     if (authState !== "authenticated") {
       cloudMcpStartupWarmupKeyRef.current = "";
@@ -24451,7 +24675,7 @@ export default function App() {
       return undefined;
     }
 
-    const warmupKey = `${activeAccountScopeKey}:${authState}:${billingStatus?.updated_at || billingStatus?.credits?.updated_at || ""}`;
+    const warmupKey = `${resolvedTokenomicsAccountKey}:${activeAccountScopeKey}:${authState}:${billingStatusUpdatedAt(billingStatus)}`;
     if (cloudMcpStartupWarmupKeyRef.current === warmupKey) {
       return undefined;
     }
@@ -24468,6 +24692,8 @@ export default function App() {
         connectAttempts: CLOUD_WORKSPACE_CONNECT_ATTEMPTS,
         connectRetryDelayMs: CLOUD_WORKSPACE_CONNECT_RETRY_DELAY_MS,
         billing_status: billingStatus,
+        expectedAccountKey: resolvedTokenomicsAccountKey,
+        expectedAuthAuthorityVersion: authStore.getAuthorityVersion(),
         flowId: `startup-cloud-mcp-${activeAccountScopeKey}`,
         requireConnected: true,
       }).catch((error) => {
@@ -24494,6 +24720,7 @@ export default function App() {
     accountIsPaid,
     authState,
     billingStatus,
+    resolvedTokenomicsAccountKey,
   ]);
   const activeWorkspaceHydrationRoot = activatedWorkspaceId
     ? getWorkspaceRootDirectory(workspaceSettings, activatedWorkspaceId) || defaultWorkingDirectory
@@ -27543,6 +27770,9 @@ export default function App() {
 
   const enterAuthenticatedWorkspace = useCallback((sessionUser, options = {}) => {
     const cloudEnabled = isPaidUser(sessionUser);
+    const expectedAccountKey = billingAccountKey(
+      sessionUser?.id || sessionUser?.$id || sessionUser?.email,
+    );
 
     if (cloudEnabled) {
       updateCloudWorkspaceProgress({
@@ -27560,8 +27790,16 @@ export default function App() {
       });
     }
     if (cloudEnabled && options.syncCloud !== false) {
+      const billingStatusForAccount = (
+        expectedAccountKey
+          && billingStatusAccountKeyRef.current === expectedAccountKey
+          ? billingStatusRef.current
+          : null
+      );
       void refreshCloudMcpSessionContext({
-        billing_status: billingStatusRef.current,
+        billing_status: billingStatusForAccount,
+        expectedAccountKey,
+        expectedAuthAuthorityVersion: authStore.getAuthorityVersion(),
         onProgress: updateCloudWorkspaceProgress,
       });
     }
@@ -30562,9 +30800,17 @@ export default function App() {
   }, []);
 
   const refreshBillingStatus = useCallback(async ({ quiet = false } = {}) => {
+    const requestSequence = billingRequestSequenceRef.current + 1;
+    billingRequestSequenceRef.current = requestSequence;
+    const expectedAccountKey = currentBillingAccountKeyRef.current;
+    const requestIsCurrent = () => (
+      requestSequence === billingRequestSequenceRef.current
+      && expectedAccountKey === currentBillingAccountKeyRef.current
+      && authStateRef.current === "authenticated"
+    );
     // authState via ref keeps this callback's identity stable — it sits in the
     // auth startup effect's dependency chain (see authStateRef above).
-    if (authStateRef.current !== "authenticated") {
+    if (authStateRef.current !== "authenticated" || !expectedAccountKey) {
       setBillingStatus(null);
       setBillingStatusState("idle");
       setBillingStatusError("");
@@ -30579,35 +30825,84 @@ export default function App() {
 
     try {
       const cloudRuntimeStatus = await invoke("cloud_mcp_get_status").catch(() => null);
+      if (!requestIsCurrent()) {
+        return null;
+      }
+      const cachedUsage = cloudAccountUsageSnapshotFromEventPayload(cloudRuntimeStatus);
+      const cachedUsageMatchesAccount = accountUsageMatchesCurrentAccount(
+        cloudRuntimeStatus,
+        cachedUsage.snapshot,
+        currentBillingAccountAliasesRef.current,
+      );
       const websocketConnected = Boolean(
         cloudRuntimeStatus?.global_ws_connected ?? cloudRuntimeStatus?.connected,
       );
-      if (websocketConnected) {
+      if (websocketConnected && cachedUsageMatchesAccount) {
         const liveBillingStatus = billingStatusFromAccountUsagePayload(
           cloudRuntimeStatus,
           billingStatusRef.current,
         );
         if (liveBillingStatus) {
-          await authStore.applyBillingStatus(liveBillingStatus).catch(() => {});
-          setBillingStatus(liveBillingStatus);
+          if (!requestIsCurrent()) {
+            return null;
+          }
+          const appliedSnapshot = await authStore.applyBillingStatus(liveBillingStatus, {
+            expectedAccountKey,
+          });
+          if (
+            !requestIsCurrent()
+            || billingAccountKey(appliedSnapshot?.accountKey) !== expectedAccountKey
+            || !billingStatusHasMeaningfulData(appliedSnapshot?.billingStatus)
+          ) {
+            return null;
+          }
+          const appliedBillingStatus = appliedSnapshot.billingStatus;
+          billingStatusRef.current = appliedBillingStatus;
+          setBillingStatus(appliedBillingStatus);
           setBillingStatusState("ready");
           setBillingStatusError("");
-          return liveBillingStatus;
+          return appliedBillingStatus;
         }
       }
       const nextBillingStatus = await invoke("cloud_mcp_get_billing_status");
+      if (!requestIsCurrent()) {
+        return null;
+      }
       const mergedBillingStatus = mergeBillingStatusSnapshot(
         billingStatusRef.current,
         nextBillingStatus,
       );
       if (mergedBillingStatus) {
-        await authStore.applyBillingStatus(mergedBillingStatus).catch(() => {});
-        setBillingStatus(mergedBillingStatus);
+        if (!requestIsCurrent()) {
+          return null;
+        }
+        const appliedSnapshot = await authStore.applyBillingStatus(mergedBillingStatus, {
+          expectedAccountKey,
+        });
+        if (
+          !requestIsCurrent()
+          || billingAccountKey(appliedSnapshot?.accountKey) !== expectedAccountKey
+          || !billingStatusHasMeaningfulData(appliedSnapshot?.billingStatus)
+        ) {
+          return null;
+        }
+        const appliedBillingStatus = appliedSnapshot.billingStatus;
+        billingStatusRef.current = appliedBillingStatus;
+        setBillingStatus(appliedBillingStatus);
+        setBillingStatusState("ready");
+        setBillingStatusError("");
+        return appliedBillingStatus;
+      }
+      if (!requestIsCurrent()) {
+        return null;
       }
       setBillingStatusState("ready");
       setBillingStatusError("");
-      return mergedBillingStatus;
+      return null;
     } catch (error) {
+      if (!requestIsCurrent()) {
+        return null;
+      }
       const message = getErrorMessage(error, "Unable to load credit status.");
       setBillingStatusState((current) => (
         billingStatusRef.current ? "ready" : current === "ready" ? "ready" : "error"
@@ -30673,7 +30968,10 @@ export default function App() {
         // fall through to the regular status pipeline
       }
       const refreshed = await refreshBillingStatus({ quiet: true }).catch(() => null);
-      const remaining = Number(refreshed?.credits?.term_remaining_credits);
+      const refreshedCredits = billingStatusCredits(refreshed);
+      const remaining = Number(
+        refreshedCredits?.termRemainingCredits ?? refreshedCredits?.term_remaining_credits,
+      );
       const baseline = Number(lowCreditsBaselineRemainingRef.current);
       if (
         Number.isFinite(remaining)
@@ -34903,7 +35201,7 @@ export default function App() {
       window.removeEventListener("focus", refreshOnForeground);
       unsubscribeSyncStatus();
     };
-  }, [authState, refreshBillingStatus]);
+  }, [authState, refreshBillingStatus, resolvedTokenomicsAccountKey]);
 
   useEffect(() => {
     let isMounted = true;
@@ -35411,18 +35709,34 @@ export default function App() {
     () => billingPlanNameFromStatus(billingStatus, user),
     [billingStatus, user],
   );
-  // Seed billing status from the persisted auth snapshot so the free-plan
-  // upsell can decide from local state alone. Free accounts run permanently
-  // offline (they never open the account websocket), so gating the upsell on
-  // the live /v1/billing/status fetch strands it whenever that request is slow
-  // or fails — the exact cohort we most want to reach. The plan is knowable
-  // offline from the auth session (only the credit *balance* needs the
-  // network), so we hydrate a last-known/synthesized snapshot and mark it
-  // ready. Paid accounts are left alone: they connect the websocket and get
-  // live credit data, and seeding a stale snapshot could mistime their
-  // low-credits startup decision.
+  // Seed billing status from the persisted auth snapshot so credits render
+  // from local state alone, before any network round-trip.
+  //
+  // Free accounts run permanently offline (they never open the account
+  // websocket), so gating the upsell on the live /v1/billing/status fetch
+  // strands it whenever that request is slow or fails — the exact cohort we
+  // most want to reach. The plan is knowable offline from the auth session,
+  // so we hydrate a last-known/synthesized snapshot and mark it ready.
+  //
+  // Paid accounts get the same auth-time baseline for the credits widget —
+  // the persisted billing snapshot carries the credit balance from sign-in —
+  // but billingStatusState is intentionally left alone: the low-credits
+  // startup overlay decides from the first *ready* snapshot, and a stale
+  // persisted balance must not mistime that decision. Live websocket / fetch
+  // snapshots merge on top and only replace totals they actually carry.
   useEffect(() => {
-    if (authState !== "authenticated" || userIsPaid) {
+    if (authState !== "authenticated") {
+      return;
+    }
+    if (userIsPaid) {
+      if (
+        !billingStatus
+        && persistedBillingStatus
+        && typeof persistedBillingStatus === "object"
+        && billingStatusHasMeaningfulData(persistedBillingStatus)
+      ) {
+        setBillingStatus(mergeBillingStatusSnapshot(null, persistedBillingStatus));
+      }
       return;
     }
     if (billingStatus || billingStatusState === "ready") {
@@ -35431,24 +35745,28 @@ export default function App() {
     const seededBillingStatus = persistedBillingStatus
       && typeof persistedBillingStatus === "object"
       && Object.keys(persistedBillingStatus).length
-      ? persistedBillingStatus
+      ? mergeBillingStatusSnapshot(null, persistedBillingStatus)
       : { plan_name: "free", plan_status: "free" };
     setBillingStatus(seededBillingStatus);
     setBillingStatusState("ready");
     setBillingStatusError("");
   }, [authState, userIsPaid, billingStatus, billingStatusState, persistedBillingStatus]);
-  const billingCredits = billingStatus?.credits || null;
-  const billingRemainingCredits = Number(billingCredits?.term_remaining_credits || 0);
+  const billingCredits = billingStatusCredits(billingStatus);
+  const billingRemainingCredits = Number(
+    billingCredits?.termRemainingCredits ?? billingCredits?.term_remaining_credits ?? 0,
+  );
   const billingCreditPercent = creditUsagePercent(billingCredits);
-  const billingResetLabel = creditResetLabel(billingCredits?.reset_at);
-  const billingLowCreditState = String(billingCredits?.low_credit_state || "pending");
+  const billingResetLabel = creditResetLabel(billingCredits?.resetAt || billingCredits?.reset_at);
+  const billingLowCreditState = String(
+    billingCredits?.lowCreditState || billingCredits?.low_credit_state || "pending",
+  );
   const lowCreditWarningSyncReady = lowCreditWarningCloudSynced(cloudSyncStatus, cloudLiveSyncEpoch);
   const lowCreditToastVisible = userIsPaid
     && lowCreditWarningSyncReady
     && billingStatusState === "ready"
     && shouldShowLowCreditWarning(billingCredits, dismissedLowCreditWarningKey);
   const dismissLowCreditWarning = useCallback(() => {
-    const nextDismissedKey = lowCreditWarningKey(billingStatus?.credits);
+    const nextDismissedKey = lowCreditWarningKey(billingStatusCredits(billingStatus));
 
     if (!nextDismissedKey) {
       return;
@@ -38262,12 +38580,10 @@ export default function App() {
         onBeginTodoDrag: bridge.onBeginTodoDrag,
         onOpenDocumentPanel: bridge.onOpenDocumentPanel,
         onSelectWorkspaceTool: bridge.onSelectWorkspaceTool,
-        onToggleTerminalBreakout: bridge.onToggleTerminalBreakout,
         onToggleWindowBreakout: bridge.onToggleWindowBreakout,
         onVoiceAgentToolCall: bridge.onVoiceAgentToolCall,
         onVoicePlanServerResult: bridge.onVoicePlanServerResult,
         runWorkspacePanelAction: bridge.runWorkspacePanelAction,
-        terminalBreakoutActive: Boolean(bridge.terminalBreakoutActive),
         windowBreakoutActive: Boolean(bridge.windowBreakoutActive),
         workspace_id: safeWorkspaceId,
       };
@@ -38282,12 +38598,10 @@ export default function App() {
         && previousBridge.onBeginTodoDrag === nextBridge.onBeginTodoDrag
         && previousBridge.onOpenDocumentPanel === nextBridge.onOpenDocumentPanel
         && previousBridge.onSelectWorkspaceTool === nextBridge.onSelectWorkspaceTool
-        && previousBridge.onToggleTerminalBreakout === nextBridge.onToggleTerminalBreakout
         && previousBridge.onToggleWindowBreakout === nextBridge.onToggleWindowBreakout
         && previousBridge.onVoiceAgentToolCall === nextBridge.onVoiceAgentToolCall
         && previousBridge.onVoicePlanServerResult === nextBridge.onVoicePlanServerResult
         && previousBridge.runWorkspacePanelAction === nextBridge.runWorkspacePanelAction
-        && previousBridge.terminalBreakoutActive === nextBridge.terminalBreakoutActive
         && previousBridge.windowBreakoutActive === nextBridge.windowBreakoutActive
       ) {
         return currentBridges;
@@ -38388,6 +38702,13 @@ export default function App() {
         ? TODO_QUEUE_PANE_MODE_NORMAL
         : TODO_QUEUE_PANE_MODE_FULLSCREEN
     ));
+  }, []);
+  const [auraModeOpen, setAuraModeOpen] = useState(false);
+  const openAuraMode = useCallback(() => {
+    setAuraModeOpen(true);
+  }, []);
+  const closeAuraMode = useCallback(() => {
+    setAuraModeOpen(false);
   }, []);
   const accountToolTodoDeviceId = cloudDesktopDeviceProfile?.device_id || cloudDesktopDeviceProfile?.machine_id || "";
   const refreshAccountToolItemsFromRust = useCallback(async (workspaceId = selectedWorkspaceToolWorkspaceId) => {
@@ -39664,6 +39985,22 @@ export default function App() {
         return;
       }
       const { snapshot, credits, storage_usage: storageUsage } = cloudAccountUsageSnapshotFromEventPayload(event?.payload);
+      const expectedAccountKey = currentBillingAccountKeyRef.current;
+      if (!accountUsageMatchesCurrentAccount(
+        event?.payload,
+        snapshot,
+        currentBillingAccountAliasesRef.current,
+      )) {
+        return;
+      }
+      const eventAccountIsCurrent = () => (
+        expectedAccountKey === currentBillingAccountKeyRef.current
+        && Boolean(expectedAccountKey)
+        && authStateRef.current === "authenticated"
+      );
+      if (!eventAccountIsCurrent()) {
+        return;
+      }
       if (storageUsage) {
         setCloudWorkspaceProgress((current) => ({
           ...current,
@@ -39678,11 +40015,34 @@ export default function App() {
           currentBillingStatus,
         );
         if (mergedBillingStatus) {
-          billingStatusRef.current = mergedBillingStatus;
-          void authStore.applyBillingStatus(mergedBillingStatus).catch(() => {});
-          setBillingStatus(mergedBillingStatus);
-          setBillingStatusState("ready");
-          setBillingStatusError("");
+          // Only a meaningful credit snapshot supersedes an in-flight poll.
+          // Storage-only and unknown wallet events must not strand loading.
+          const eventSequence = billingRequestSequenceRef.current + 1;
+          billingRequestSequenceRef.current = eventSequence;
+          const eventIsCurrent = () => (
+            eventSequence === billingRequestSequenceRef.current
+            && eventAccountIsCurrent()
+          );
+          if (!eventIsCurrent()) {
+            return;
+          }
+          void authStore.applyBillingStatus(mergedBillingStatus, {
+            expectedAccountKey,
+          }).then((appliedSnapshot) => {
+            if (
+              cancelled
+              || !eventIsCurrent()
+              || billingAccountKey(appliedSnapshot?.accountKey) !== expectedAccountKey
+              || !billingStatusHasMeaningfulData(appliedSnapshot?.billingStatus)
+            ) {
+              return;
+            }
+            const appliedBillingStatus = appliedSnapshot.billingStatus;
+            billingStatusRef.current = appliedBillingStatus;
+            setBillingStatus(appliedBillingStatus);
+            setBillingStatusState("ready");
+            setBillingStatusError("");
+          }).catch(() => {});
         }
       }
     });
@@ -52879,7 +53239,7 @@ export default function App() {
   ]);
 
   const isConnectivityBlocked = false;
-  const isPaidPlanUser = accountIsPaid || billingStatus?.plan_status === "paid";
+  const isPaidPlanUser = accountIsPaid || billingStatusPlanStatus(billingStatus) === "paid";
   const toolsWorkspaceArchitectures = useMemo(() => ({
     catalog: architectureHub.catalog,
     catalogError: architectureHub.error,
@@ -53224,7 +53584,9 @@ export default function App() {
     if (lowCreditsUpsellState !== "idle" || billingStatusState !== "ready") {
       return;
     }
-    const lowCreditsTermTotal = Number(billingCredits?.term_total_credits || 0);
+    const lowCreditsTermTotal = Number(
+      billingCredits?.termTotalCredits ?? billingCredits?.term_total_credits ?? 0,
+    );
     const isLowOnCredits = userIsPaid
       && lowCreditsTermTotal > 0
       && billingCreditPercent < LOW_CREDITS_UPSELL_THRESHOLD_PERCENT;
@@ -53330,6 +53692,14 @@ export default function App() {
   return (
     <>
       <GlobalStyle />
+      {/* App-level error boundary. It sits INSIDE App's render so a throw
+          anywhere in the visual tree is absorbed here while App itself (which
+          owns the CLOUD_MCP_REMOTE_COMMAND listener, the workspace activation
+          status emitter, and cloud live-state sync effects) stays mounted and
+          its effects keep running. Do NOT move this above <App/> — a boundary
+          outside App would unmount those listeners on error, which is exactly
+          the failure mode this guards against. */}
+      <PaneErrorBoundary label="Diff Forge interface" variant="shell">
       <AppFrame data-platform={windowControlPlatform} data-window-expanded={isWindowFrameExpanded}>
         <WindowTitleBar
           data-platform={windowControlPlatform}
@@ -53875,6 +54245,14 @@ export default function App() {
                           {/* Profiler: names slow runtime commits behind switch-lag
                               freezes (react-dom/profiling in debug bundles). */}
                           <Profiler id={`runtime:${runtimeWorkspace.id}`} onRender={onRuntimeProfilerRender}>
+                          {/* Error isolation: a render throw inside the terminal
+                              grid must never unwind past this point — AppShell
+                              above owns the cloud remote-command listener and
+                              the activation status emitter. */}
+                          <PaneErrorBoundary
+                            label={`Terminal panels — ${runtimeWorkspace?.name || runtimeWorkspace.id}`}
+                            resetKey={`${runtimeWorkspace.id}:${runtimeDescriptor.terminalRuntimeRestartKey || ""}`}
+                          >
                           <TerminalView
                             account_key={resolvedTokenomicsAccountKey}
                             architectureTerminalActivity={workspaceArchitectureTerminalActivity[runtimeWorkspace.id]?.latest || null}
@@ -53994,6 +54372,7 @@ export default function App() {
                             workspaces={workspaces}
                             useDefaultNewWorkspaceRoot={useDefaultNewWorkspaceRoot}
                           />
+                          </PaneErrorBoundary>
                           </Profiler>
                         </WorkspaceRuntimeLayer>
                       );
@@ -55651,13 +56030,15 @@ export default function App() {
                       viewMotion={viewMotion}
                     />
                   ) : selectedWorkspace ? (
-                    <FilesWorkspaceView
-                      default_working_directory={defaultWorkingDirectory}
-                      onOpenWorkspaceSettings={openSelectedWorkspaceSettings}
-                      root_directory={selectedWorkspaceFileRoot}
-                      workspace={selectedWorkspace}
-                      workspaceError={workspaceError}
-                    />
+                    <PaneErrorBoundary label="Files view" resetKey={selectedWorkspace.id}>
+                      <FilesWorkspaceView
+                        default_working_directory={defaultWorkingDirectory}
+                        onOpenWorkspaceSettings={openSelectedWorkspaceSettings}
+                        root_directory={selectedWorkspaceFileRoot}
+                        workspace={selectedWorkspace}
+                        workspaceError={workspaceError}
+                      />
+                    </PaneErrorBoundary>
                   ) : (
                     <WorkspaceIdleState detail="Select a workspace to browse files." viewMotion={viewMotion} />
                   )}
@@ -55675,17 +56056,19 @@ export default function App() {
                       viewMotion={viewMotion}
                     />
                   ) : selectedWorkspace ? (
-                    <WebWorkspaceView
-                      is_active={activeView === "web" && visibleView === "web" && viewMotion !== "exiting"}
-                      onFocusWebTabPopout={focusWorkspaceWebTabPopout}
-                      onPopOutWebTab={openWorkspaceWebTabPopout}
-                      onReturnWebTabPopout={returnWorkspaceWebTabPopout}
-                      onWebTabNativeLabel={rememberWorkspaceWebTabNativeLabel}
-                      onWebTabNavigate={rememberWorkspaceWebTabUrl}
-                      webTabSession={selectedWorkspaceWebTabSession}
-                      webviewObscured={workspaceNativeWebviewObscured}
-                      workspace={selectedWorkspace}
-                    />
+                    <PaneErrorBoundary label="Web view" resetKey={selectedWorkspace.id}>
+                      <WebWorkspaceView
+                        is_active={activeView === "web" && visibleView === "web" && viewMotion !== "exiting"}
+                        onFocusWebTabPopout={focusWorkspaceWebTabPopout}
+                        onPopOutWebTab={openWorkspaceWebTabPopout}
+                        onReturnWebTabPopout={returnWorkspaceWebTabPopout}
+                        onWebTabNativeLabel={rememberWorkspaceWebTabNativeLabel}
+                        onWebTabNavigate={rememberWorkspaceWebTabUrl}
+                        webTabSession={selectedWorkspaceWebTabSession}
+                        webviewObscured={workspaceNativeWebviewObscured}
+                        workspace={selectedWorkspace}
+                      />
+                    </PaneErrorBoundary>
                   ) : (
                     <WorkspaceIdleState detail="Select a workspace to open the web view." viewMotion={viewMotion} />
                   )}
@@ -55693,6 +56076,7 @@ export default function App() {
               ) : visibleView === "architecture" ? (
                 <ForgeWorkspace aria-label="Workspace Architecture" data-motion={viewMotion}>
                   {selectedWorkspace ? (
+                    <PaneErrorBoundary label="Architecture view" resetKey={selectedWorkspace.id}>
                     <ArchitectureWorkspaceView
                       default_working_directory={defaultWorkingDirectory}
                       root_directory={selectedWorkspaceFileRoot}
@@ -55715,6 +56099,7 @@ export default function App() {
                       workspaceTerminalOptions={selectedWorkspaceTerminalOptions}
                       workspace_todos={cloudWorkspaceProgress.workspace_todos}
                     />
+                    </PaneErrorBoundary>
                   ) : (
                     <WorkspaceIdleState detail="Select a workspace to view task history." viewMotion={viewMotion} />
                   )}
@@ -56029,6 +56414,10 @@ export default function App() {
                                   id={`runtime-tools:${workspaceToolPanelData.workspace_id || "tools"}`}
                                   onRender={onRuntimeProfilerRender}
                                 >
+                                <PaneErrorBoundary
+                                  label="Tools panel"
+                                  resetKey={workspaceToolPanelData.workspace_id || "tools"}
+                                >
                                 <TodoQueuePanel
                                   account_key={resolvedTokenomicsAccountKey}
                                   activeDragItemId={workspaceToolPanelData.activeDragItemId || ""}
@@ -56077,6 +56466,7 @@ export default function App() {
                                       ? workspaceToolPanelActuators.onMinimizePane
                                       : minimizeWorkspaceToolPane
                                   }
+                                  onOpenAuraMode={openAuraMode}
                                   onRefreshGitRepositories={workspaceToolPanelActuators.onRefreshGitRepositories}
                                   onRefreshGitSnapshot={workspaceToolPanelActuators.onRefreshGitSnapshot}
                                   onRecheckAgents={workspaceToolPanelActuators.onRecheckAgents}
@@ -56092,7 +56482,6 @@ export default function App() {
                                   onRequeueVoicePlanTask={workspaceToolPanelActuators.onRequeueVoicePlanTask}
                                   onRequeueVoicePlanUnfinished={workspaceToolPanelActuators.onRequeueVoicePlanUnfinished}
                                   onSubmitDraft={workspaceToolPanelActuators.onSubmitDraft}
-                                  onToggleTerminalBreakout={workspaceToolPanelActuators.onToggleTerminalBreakout}
                                   onToggleWindowBreakout={workspaceToolPanelActuators.onToggleWindowBreakout}
                                   onToggleFullscreenPane={
                                     workspaceToolPanelHasRuntime
@@ -56122,9 +56511,6 @@ export default function App() {
                                   root_directory={workspaceToolPanelData.root_directory || defaultWorkingDirectory}
                                   selectedTerminalPlanTarget={workspaceToolPanelData.selectedTerminalPlanTarget || null}
                                   storage_usage={cloudWorkspaceProgress.storage_usage}
-                                  terminalBreakoutActive={Boolean(
-                                    workspaceToolPanelHasRuntime && workspaceToolPanelData.terminalBreakoutActive,
-                                  )}
                                   windowBreakoutActive={Boolean(
                                     workspaceToolPanelHasRuntime && workspaceToolPanelData.windowBreakoutActive,
                                   )}
@@ -56143,6 +56529,7 @@ export default function App() {
                                   }
                                   workspaces={workspaces}
                                 />
+                                </PaneErrorBoundary>
                                 </Profiler>
                               </div>
                             </>
@@ -56393,9 +56780,22 @@ export default function App() {
             percentRemaining={billingCreditPercent}
             remaining_credits={billingRemainingCredits}
             reset_label={billingResetLabel}
-            total_credits={Number(billingCredits?.term_total_credits || 0)}
+            total_credits={Number(
+              billingCredits?.termTotalCredits ?? billingCredits?.term_total_credits ?? 0
+            )}
             windowPlatform={windowControlPlatform}
           />
+        )}
+
+        {auraModeOpen && (
+          <Suspense fallback={null}>
+            <AuraMode
+              isWindowFrameExpanded={isWindowFrameExpanded}
+              onExit={closeAuraMode}
+              onTitleBarMouseDown={handleTitleBarMouseDown}
+              windowPlatform={windowControlPlatform}
+            />
+          </Suspense>
         )}
 
         {plusUpsellState === "shown" && (
@@ -56577,6 +56977,7 @@ export default function App() {
           </WorkspaceCloseOverlay>
         )}
       </AppFrame>
+      </PaneErrorBoundary>
     </>
   );
 }

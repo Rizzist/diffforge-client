@@ -7,6 +7,8 @@ export function numeric(...values) {
 }
 
 function finiteNumber(value) {
+  if (value == null || typeof value === "boolean") return null;
+  if (typeof value === "string" && !value.trim()) return null;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
 }
@@ -39,6 +41,57 @@ function objectHasAny(value, keys = []) {
   const object = plainObject(value);
   if (!object) return false;
   return keys.some((key) => object[key] != null && object[key] !== "");
+}
+
+function aliasedValue(value, canonicalKey, legacyKey) {
+  const object = plainObject(value);
+  if (!object) return undefined;
+  const canonical = object[canonicalKey];
+  if (canonical != null && canonical !== "") return canonical;
+  return object[legacyKey];
+}
+
+function creditPlanName(credits) {
+  const object = plainObject(credits) || {};
+  const term = plainObject(object.term) || {};
+  return textValue(
+    aliasedValue(object, "planName", "plan_name")
+      || aliasedValue(term, "planName", "plan_name"),
+  );
+}
+
+export function billingStatusCredits(status) {
+  const object = plainObject(status);
+  const candidates = [
+    plainObject(object?.credits),
+    plainObject(object?.wallet),
+    plainObject(object?.user?.credits),
+  ].filter(Boolean);
+  return candidates.find(creditSnapshotHasFiniteTotals)
+    || candidates.find(creditSnapshotHasMeaningfulData)
+    || candidates[0]
+    || null;
+}
+
+export function billingStatusPlanName(status) {
+  const object = plainObject(status) || {};
+  return textValue(
+    aliasedValue(object, "planName", "plan_name")
+      || creditPlanName(billingStatusCredits(object)),
+  );
+}
+
+export function billingStatusPlanStatus(status) {
+  return textValue(aliasedValue(status, "planStatus", "plan_status"));
+}
+
+export function billingStatusUpdatedAt(status) {
+  const object = plainObject(status) || {};
+  const credits = billingStatusCredits(object) || {};
+  return textValue(
+    aliasedValue(object, "updatedAt", "updated_at")
+      || aliasedValue(credits, "updatedAt", "updated_at"),
+  );
 }
 
 export function formatInteger(value) {
@@ -169,36 +222,88 @@ export function creditSnapshotHasMeaningfulData(credits) {
   const object = plainObject(credits);
   if (!object) return false;
   const term = plainObject(object.term);
-  const total = plainObject(object.total) || plainObject(object.total_credits);
+  const total = plainObject(object.total)
+    || plainObject(object.totalCredits)
+    || plainObject(object.total_credits);
   return Boolean(
     object.known === true
       || object.live === true
-      || textValue(object.plan_name)
-      || textValue(term?.plan_name || term?.id)
+      || creditPlanName(object)
+      || textValue(term?.id)
       || objectHasAny(object, [
+        "termTotalCredits",
         "term_total_credits",
+        "totalCredits",
         "total_credits",
+        "termRemainingCredits",
         "term_remaining_credits",
+        "remainingCredits",
         "remaining_credits",
+        "termReservedCredits",
         "term_reserved_credits",
+        "reservedCredits",
         "reserved_credits",
+        "termUsedCredits",
         "term_used_credits",
+        "usedCredits",
         "used_credits",
+        "localMeteredUsedCredits",
         "local_metered_used_credits",
       ])
       || objectHasAny(total, [
+        "totalCredits",
         "total_credits",
+        "remainingCredits",
         "remaining_credits",
+        "reservedCredits",
         "reserved_credits",
+        "usedCredits",
         "used_credits",
       ])
       || objectHasAny(term, [
+        "totalCredits",
         "total_credits",
+        "remainingCredits",
         "remaining_credits",
+        "reservedCredits",
         "reserved_credits",
+        "usedCredits",
         "used_credits",
       ])
   );
+}
+
+// True when the snapshot carries at least one finite credit amount (a genuine
+// zero counts). Snapshots that are "meaningful" only through plan metadata or
+// known/live flags have no totals to trust, so they must never be allowed to
+// replace a baseline's numbers.
+export function creditSnapshotHasFiniteTotals(credits) {
+  const object = plainObject(credits);
+  if (!object) return false;
+  const total = plainObject(object.total)
+    || plainObject(object.totalCredits)
+    || plainObject(object.total_credits)
+    || {};
+  const term = plainObject(object.term) || {};
+  return [
+    aliasedValue(total, "totalCredits", "total_credits"),
+    aliasedValue(total, "usedCredits", "used_credits"),
+    aliasedValue(total, "remainingCredits", "remaining_credits"),
+    aliasedValue(total, "reservedCredits", "reserved_credits"),
+    aliasedValue(term, "totalCredits", "total_credits"),
+    aliasedValue(term, "usedCredits", "used_credits"),
+    aliasedValue(term, "remainingCredits", "remaining_credits"),
+    aliasedValue(term, "reservedCredits", "reserved_credits"),
+    aliasedValue(object, "termTotalCredits", "term_total_credits"),
+    aliasedValue(object, "totalCredits", "total_credits"),
+    aliasedValue(object, "termUsedCredits", "term_used_credits"),
+    aliasedValue(object, "usedCredits", "used_credits"),
+    aliasedValue(object, "termRemainingCredits", "term_remaining_credits"),
+    aliasedValue(object, "remainingCredits", "remaining_credits"),
+    aliasedValue(object, "termReservedCredits", "term_reserved_credits"),
+    aliasedValue(object, "reservedCredits", "reserved_credits"),
+    aliasedValue(object, "localMeteredUsedCredits", "local_metered_used_credits"),
+  ].some((value) => finiteNumber(value) != null);
 }
 
 export function normalizeCreditWallet(wallet, previous = null, options = {}) {
@@ -207,19 +312,45 @@ export function normalizeCreditWallet(wallet, previous = null, options = {}) {
   if (!creditSnapshotHasMeaningfulData(credits)) {
     return creditSnapshotHasMeaningfulData(previousCredits) ? previousCredits : null;
   }
-  const preferIncoming = Boolean(options?.preferIncoming || options?.preferIncomingTotals);
+  // Flags, plan labels, and term IDs do not establish a balance. Returning the
+  // last complete wallet (or null) prevents a metadata-only snapshot from
+  // manufacturing 0/0/0 totals or attaching a new term ID to stale totals.
+  if (!creditSnapshotHasFiniteTotals(credits)) {
+    return creditSnapshotHasMeaningfulData(previousCredits) ? previousCredits : null;
+  }
+  // Authoritative snapshots prefer each total they actually carry. Missing
+  // same-term fields still come from the previous wallet, so a partial or
+  // metadata-only update cannot manufacture zeroes.
+  const preferIncoming = Boolean(options?.preferIncoming || options?.preferIncomingTotals)
+    && creditSnapshotHasFiniteTotals(credits);
 
-  const total = plainObject(credits.total) || plainObject(credits.total_credits) || {};
+  const total = plainObject(credits.total)
+    || plainObject(credits.totalCredits)
+    || plainObject(credits.total_credits)
+    || {};
   const term = plainObject(credits.term) || {};
-  const termId = textValue(term.id || credits.term_id, "");
-  const rawTermEnd = textValue(term.term_end || credits.reset_at, "");
-  const previousTermId = textValue(previousCredits.term_id, "");
-  const previousTermEnd = textValue(previousCredits.term_end || previousCredits.reset_at, "");
+  const termId = textValue(aliasedValue(credits, "termId", "term_id") || term.id, "");
+  const rawTermEnd = textValue(
+    aliasedValue(credits, "termEnd", "term_end")
+      || aliasedValue(credits, "resetAt", "reset_at")
+      || aliasedValue(term, "termEnd", "term_end"),
+    "",
+  );
+  const previousTermId = textValue(aliasedValue(previousCredits, "termId", "term_id"), "");
+  const previousTermEnd = textValue(
+    aliasedValue(previousCredits, "termEnd", "term_end")
+      || aliasedValue(previousCredits, "resetAt", "reset_at"),
+    "",
+  );
   const incomingPlanToken = textValue(
-    credits.plan_name || credits.plan_status || credits.status,
+    aliasedValue(credits, "planName", "plan_name")
+      || aliasedValue(credits, "planStatus", "plan_status")
+      || credits.status,
   ).toLowerCase();
   const previousPlanToken = textValue(
-    previousCredits.plan_name || previousCredits.plan_status || previousCredits.status,
+    aliasedValue(previousCredits, "planName", "plan_name")
+      || aliasedValue(previousCredits, "planStatus", "plan_status")
+      || previousCredits.status,
   ).toLowerCase();
   const explicitFreeReset = incomingPlanToken === "free" && previousPlanToken && previousPlanToken !== "free";
   const sameTerm = !explicitFreeReset && (termId && previousTermId
@@ -227,41 +358,160 @@ export function normalizeCreditWallet(wallet, previous = null, options = {}) {
     : rawTermEnd && previousTermEnd
       ? rawTermEnd === previousTermEnd
       : true);
-  const sameTermPreviousCredits = sameTerm && !preferIncoming ? previousCredits : {};
-  const used = maxFiniteNumber(
-    total.used_credits,
-    credits.term_used_credits,
-    credits.used_credits,
-    term.used_credits,
-    credits.local_metered_used_credits,
-    sameTermPreviousCredits.term_used_credits,
-  ) ?? 0;
+  // Keep missing fields from the same-term baseline even for an authoritative
+  // partial snapshot. Incoming values win when authoritative, while the
+  // defensive max remains appropriate for non-authoritative/local snapshots.
+  const sameTermPreviousCredits = (sameTerm || !creditSnapshotHasFiniteTotals(credits))
+    ? previousCredits
+    : {};
+  const incomingUsedValues = [
+    aliasedValue(credits, "termUsedCredits", "term_used_credits"),
+    aliasedValue(credits, "usedCredits", "used_credits"),
+    aliasedValue(total, "usedCredits", "used_credits"),
+    aliasedValue(term, "usedCredits", "used_credits"),
+    aliasedValue(credits, "localMeteredUsedCredits", "local_metered_used_credits"),
+  ];
+  const previousUsed = aliasedValue(sameTermPreviousCredits, "termUsedCredits", "term_used_credits");
+  const used = (preferIncoming
+    ? firstFiniteNumber(...incomingUsedValues, previousUsed)
+    : maxFiniteNumber(...incomingUsedValues, previousUsed)) ?? 0;
   const reserved = firstFiniteNumber(
-    total.reserved_credits,
-    credits.term_reserved_credits,
-    credits.reserved_credits,
-    term.reserved_credits,
-    sameTermPreviousCredits.term_reserved_credits,
+    aliasedValue(credits, "termReservedCredits", "term_reserved_credits"),
+    aliasedValue(credits, "reservedCredits", "reserved_credits"),
+    aliasedValue(total, "reservedCredits", "reserved_credits"),
+    aliasedValue(term, "reservedCredits", "reserved_credits"),
+    aliasedValue(sameTermPreviousCredits, "termReservedCredits", "term_reserved_credits"),
   ) ?? 0;
-  const totalCredits = maxFiniteNumber(
-    total.total_credits,
-    credits.term_total_credits,
-    credits.total_credits,
-    term.total_credits,
-    sameTermPreviousCredits.term_total_credits,
-  ) ?? 0;
+  const incomingTotalValues = [
+    aliasedValue(credits, "termTotalCredits", "term_total_credits"),
+    aliasedValue(credits, "totalCredits", "total_credits"),
+    aliasedValue(total, "totalCredits", "total_credits"),
+    aliasedValue(term, "totalCredits", "total_credits"),
+  ];
+  const previousTotal = aliasedValue(sameTermPreviousCredits, "termTotalCredits", "term_total_credits");
+  const totalCredits = (preferIncoming
+    ? firstFiniteNumber(...incomingTotalValues, previousTotal)
+    : maxFiniteNumber(...incomingTotalValues, previousTotal)) ?? 0;
+  const incomingRemaining = firstFiniteNumber(
+    aliasedValue(credits, "termRemainingCredits", "term_remaining_credits"),
+    aliasedValue(credits, "remainingCredits", "remaining_credits"),
+    aliasedValue(total, "remainingCredits", "remaining_credits"),
+    aliasedValue(term, "remainingCredits", "remaining_credits"),
+  );
   const directRemaining = firstFiniteNumber(
-    total.remaining_credits,
-    credits.term_remaining_credits,
-    credits.remaining_credits,
-    term.remaining_credits,
-    sameTermPreviousCredits.term_remaining_credits,
+    incomingRemaining,
+    aliasedValue(sameTermPreviousCredits, "termRemainingCredits", "term_remaining_credits"),
   );
   const computedRemaining = totalCredits > 0 ? Math.max(0, totalCredits - used - reserved) : null;
-  const remaining = directRemaining != null && directRemaining > 0
-    ? directRemaining
-    : computedRemaining ?? directRemaining ?? 0;
-  const termEnd = rawTermEnd || (sameTerm ? previousCredits.reset_at || previousCredits.term_end || "" : "");
+  const remaining = preferIncoming && incomingRemaining != null
+    ? Math.max(0, incomingRemaining)
+    : directRemaining != null && directRemaining > 0
+      ? directRemaining
+      : computedRemaining ?? directRemaining ?? 0;
+  const termEnd = rawTermEnd || (sameTerm
+    ? aliasedValue(previousCredits, "resetAt", "reset_at")
+      || aliasedValue(previousCredits, "termEnd", "term_end")
+      || ""
+    : "");
+  const planName = creditPlanName(credits) || creditPlanName(previousCredits);
+  const planStatus = textValue(
+    aliasedValue(credits, "planStatus", "plan_status"),
+    textValue(aliasedValue(previousCredits, "planStatus", "plan_status")),
+  );
+  const lowCreditState = textValue(
+    aliasedValue(credits, "lowCreditState", "low_credit_state"),
+    textValue(aliasedValue(previousCredits, "lowCreditState", "low_credit_state")),
+  );
+  const localMeteredUsedCredits = firstFiniteNumber(
+    aliasedValue(credits, "localMeteredUsedCredits", "local_metered_used_credits"),
+    aliasedValue(previousCredits, "localMeteredUsedCredits", "local_metered_used_credits"),
+  ) ?? 0;
+  const providerCostMicrousd = firstFiniteNumber(
+    aliasedValue(total, "providerCostMicrousd", "provider_cost_microusd"),
+    aliasedValue(credits, "providerCostMicrousd", "provider_cost_microusd"),
+    aliasedValue(previousCredits, "providerCostMicrousd", "provider_cost_microusd"),
+  ) ?? 0;
+  const inputTokens = firstFiniteNumber(
+    aliasedValue(total, "inputTokens", "input_tokens"),
+    aliasedValue(credits, "inputTokens", "input_tokens"),
+    aliasedValue(previousCredits, "inputTokens", "input_tokens"),
+  ) ?? 0;
+  const cachedInputTokens = firstFiniteNumber(
+    aliasedValue(total, "cachedInputTokens", "cached_input_tokens"),
+    aliasedValue(credits, "cachedInputTokens", "cached_input_tokens"),
+    aliasedValue(previousCredits, "cachedInputTokens", "cached_input_tokens"),
+  ) ?? 0;
+  const outputTokens = firstFiniteNumber(
+    aliasedValue(total, "outputTokens", "output_tokens"),
+    aliasedValue(credits, "outputTokens", "output_tokens"),
+    aliasedValue(previousCredits, "outputTokens", "output_tokens"),
+  ) ?? 0;
+  const audioSeconds = firstFiniteNumber(
+    aliasedValue(total, "audioSeconds", "audio_seconds"),
+    aliasedValue(credits, "audioSeconds", "audio_seconds"),
+    aliasedValue(previousCredits, "audioSeconds", "audio_seconds"),
+  ) ?? 0;
+  const ttsCharacters = firstFiniteNumber(
+    aliasedValue(total, "ttsCharacters", "tts_characters"),
+    aliasedValue(credits, "ttsCharacters", "tts_characters"),
+    aliasedValue(previousCredits, "ttsCharacters", "tts_characters"),
+  ) ?? 0;
+  const webSearchCalls = firstFiniteNumber(
+    aliasedValue(total, "webSearchCalls", "web_search_calls"),
+    aliasedValue(credits, "webSearchCalls", "web_search_calls"),
+    aliasedValue(previousCredits, "webSearchCalls", "web_search_calls"),
+  ) ?? 0;
+  const eventCount = firstFiniteNumber(
+    aliasedValue(total, "eventCount", "event_count"),
+    aliasedValue(credits, "eventCount", "event_count"),
+    aliasedValue(previousCredits, "eventCount", "event_count"),
+  ) ?? 0;
+  const updatedAt = textValue(
+    aliasedValue(credits, "updatedAt", "updated_at"),
+    textValue(aliasedValue(previousCredits, "updatedAt", "updated_at"), new Date().toISOString()),
+  );
+  const normalizedTotal = {
+    ...(plainObject(previousCredits.total) || {}),
+    ...total,
+    totalCredits,
+    total_credits: totalCredits,
+    usedCredits: used,
+    used_credits: used,
+    remainingCredits: remaining,
+    remaining_credits: remaining,
+    reservedCredits: reserved,
+    reserved_credits: reserved,
+    providerCostMicrousd,
+    provider_cost_microusd: providerCostMicrousd,
+    inputTokens,
+    input_tokens: inputTokens,
+    cachedInputTokens,
+    cached_input_tokens: cachedInputTokens,
+    outputTokens,
+    output_tokens: outputTokens,
+    audioSeconds,
+    audio_seconds: audioSeconds,
+    ttsCharacters,
+    tts_characters: ttsCharacters,
+    webSearchCalls,
+    web_search_calls: webSearchCalls,
+    eventCount,
+    event_count: eventCount,
+  };
+  const normalizedTerm = {
+    ...(plainObject(previousCredits.term) || {}),
+    ...term,
+    ...(termId ? { id: termId } : {}),
+    ...(termEnd ? { termEnd, term_end: termEnd } : {}),
+    totalCredits,
+    total_credits: totalCredits,
+    usedCredits: used,
+    used_credits: used,
+    remainingCredits: remaining,
+    remaining_credits: remaining,
+    reservedCredits: reserved,
+    reserved_credits: reserved,
+  };
 
   return {
     ...previousCredits,
@@ -269,28 +519,143 @@ export function normalizeCreditWallet(wallet, previous = null, options = {}) {
     known: credits.known ?? previousCredits.known ?? true,
     live: credits.live ?? previousCredits.live ?? true,
     source: textValue(credits.source, previousCredits.source || "diff_forge_hot_credit_wallet"),
-    wallet_version: firstFiniteNumber(credits.wallet_version, previousCredits.wallet_version) ?? 0,
-    pending_event_count: firstFiniteNumber(credits.pending_event_count, previousCredits.pending_event_count) ?? 0,
-    plan_name: textValue(credits.plan_name || term.plan_name, previousCredits.plan_name || ""),
+    walletVersion: firstFiniteNumber(
+      aliasedValue(credits, "walletVersion", "wallet_version"),
+      aliasedValue(previousCredits, "walletVersion", "wallet_version"),
+    ) ?? 0,
+    wallet_version: firstFiniteNumber(
+      aliasedValue(credits, "walletVersion", "wallet_version"),
+      aliasedValue(previousCredits, "walletVersion", "wallet_version"),
+    ) ?? 0,
+    pendingEventCount: firstFiniteNumber(
+      aliasedValue(credits, "pendingEventCount", "pending_event_count"),
+      aliasedValue(previousCredits, "pendingEventCount", "pending_event_count"),
+    ) ?? 0,
+    pending_event_count: firstFiniteNumber(
+      aliasedValue(credits, "pendingEventCount", "pending_event_count"),
+      aliasedValue(previousCredits, "pendingEventCount", "pending_event_count"),
+    ) ?? 0,
+    planName,
+    plan_name: planName,
+    planStatus,
+    plan_status: planStatus,
+    lowCreditState,
+    low_credit_state: lowCreditState,
+    total: normalizedTotal,
+    term: normalizedTerm,
+    resetAt: termEnd || null,
     reset_at: termEnd || null,
+    termEnd: termEnd || null,
     term_end: termEnd || null,
-    term_id: termId || previousCredits.term_id || "",
+    termId: termId || aliasedValue(previousCredits, "termId", "term_id") || "",
+    term_id: termId || aliasedValue(previousCredits, "termId", "term_id") || "",
+    termRemainingCredits: remaining,
     term_remaining_credits: remaining,
+    termReservedCredits: reserved,
     term_reserved_credits: reserved,
+    termTotalCredits: totalCredits,
     term_total_credits: totalCredits,
+    termUsedCredits: used,
     term_used_credits: used,
-    provider_cost_microusd: firstFiniteNumber(total.provider_cost_microusd, credits.provider_cost_microusd, previousCredits.provider_cost_microusd) ?? 0,
-    input_tokens: firstFiniteNumber(total.input_tokens, credits.input_tokens, previousCredits.input_tokens) ?? 0,
-    cached_input_tokens: firstFiniteNumber(total.cached_input_tokens, credits.cached_input_tokens, previousCredits.cached_input_tokens) ?? 0,
-    output_tokens: firstFiniteNumber(total.output_tokens, credits.output_tokens, previousCredits.output_tokens) ?? 0,
-    audio_seconds: firstFiniteNumber(total.audio_seconds, credits.audio_seconds, previousCredits.audio_seconds) ?? 0,
-    tts_characters: firstFiniteNumber(total.tts_characters, credits.tts_characters, previousCredits.tts_characters) ?? 0,
-    web_search_calls: firstFiniteNumber(total.web_search_calls, credits.web_search_calls, previousCredits.web_search_calls) ?? 0,
-    event_count: firstFiniteNumber(total.event_count, credits.event_count, previousCredits.event_count) ?? 0,
-    updated_at: textValue(credits.updated_at, new Date().toISOString()),
+    totalCredits,
+    total_credits: totalCredits,
+    usedCredits: used,
+    used_credits: used,
+    remainingCredits: remaining,
+    remaining_credits: remaining,
+    reservedCredits: reserved,
+    reserved_credits: reserved,
+    localMeteredUsedCredits,
+    local_metered_used_credits: localMeteredUsedCredits,
+    providerCostMicrousd,
+    provider_cost_microusd: providerCostMicrousd,
+    inputTokens,
+    input_tokens: inputTokens,
+    cachedInputTokens,
+    cached_input_tokens: cachedInputTokens,
+    outputTokens,
+    output_tokens: outputTokens,
+    audioSeconds,
+    audio_seconds: audioSeconds,
+    ttsCharacters,
+    tts_characters: ttsCharacters,
+    webSearchCalls,
+    web_search_calls: webSearchCalls,
+    eventCount,
+    event_count: eventCount,
+    updatedAt,
+    updated_at: updatedAt,
   };
 }
 
 export function creditRemainingWithReserved(credits) {
-  return numeric(credits?.term_remaining_credits) + numeric(credits?.term_reserved_credits);
+  return numeric(aliasedValue(credits, "termRemainingCredits", "term_remaining_credits"))
+    + numeric(aliasedValue(credits, "termReservedCredits", "term_reserved_credits"));
+}
+
+// Credits-widget precedence: the auth/billing snapshot is the authoritative
+// baseline (it populates the widget immediately, before the live websocket is
+// active); live/hot snapshots only update the display when they carry
+// meaningful, known data. Returns the next displayed wallet, or null when
+// nothing meaningful has ever arrived (the caller renders a loading state,
+// never a hard 0).
+//
+// - `previous` is the last displayed wallet (the baseline to preserve).
+// - `incoming` is whatever the billing/live pipeline currently exposes.
+// - A non-meaningful or known:false incoming snapshot NEVER clobbers the
+//   baseline (mirrors the web-side fix).
+// - A known:true/live:true snapshot with finite totals replaces the totals —
+//   so a genuine zeroed balance still displays 0.
+export function resolveDisplayedCreditWallet(previous, incoming) {
+  const baseline = creditSnapshotHasMeaningfulData(previous) ? previous : null;
+  const credits = plainObject(incoming?.credits)
+    || plainObject(incoming?.wallet)
+    || plainObject(incoming);
+  if (!creditSnapshotHasMeaningfulData(credits)) {
+    return baseline;
+  }
+  const unknown = credits.known === false && credits.live !== true;
+  if (unknown) {
+    return baseline;
+  }
+  if (!creditSnapshotHasFiniteTotals(credits)) {
+    return baseline;
+  }
+  const authoritative = credits.known === true || credits.live === true;
+  return normalizeCreditWallet(credits, baseline, { preferIncomingTotals: authoritative }) || baseline;
+}
+
+export function resolveAccountDisplayedCreditWalletState(
+  previousState,
+  accountKey,
+  billingStatus,
+) {
+  const previous = plainObject(previousState) || {};
+  const nextAccountKey = String(accountKey || "").trim();
+  const accountChanged = String(previous.accountKey || "") !== nextAccountKey;
+  let awaitingBillingStatus = Boolean(previous.awaitingBillingStatus);
+  let previousCredits = previous.credits || null;
+
+  if (accountChanged) {
+    previousCredits = null;
+    awaitingBillingStatus = billingStatus === previous.billingStatus;
+  }
+  if (awaitingBillingStatus && billingStatus === previous.billingStatus) {
+    return {
+      accountKey: nextAccountKey,
+      awaitingBillingStatus: true,
+      billingStatus,
+      credits: null,
+    };
+  }
+
+  return {
+    accountKey: nextAccountKey,
+    awaitingBillingStatus: false,
+    billingStatus,
+    credits: resolveDisplayedCreditWallet(
+      previousCredits,
+      billingStatusCredits(billingStatus),
+    ),
+  };
 }

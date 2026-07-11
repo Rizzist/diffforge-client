@@ -28,7 +28,6 @@ const WORKSPACE_TOOL_PANEL_ACTUATOR_KEYS = Object.freeze([
   "onResumeTodoSession",
   "onSubmitDraft",
   "onToggleFullscreenPane",
-  "onToggleTerminalBreakout",
   "onToggleWindowBreakout",
   "onUpdateItem",
   "onVoiceAgentToolCall",
