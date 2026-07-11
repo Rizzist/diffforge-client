@@ -62,6 +62,7 @@ import {
   normalizeAgentLaunchDefaults,
   resolveAgentLaunchDefaultForModel,
 } from "../agents/agentLaunchDefaults.js";
+import { buildAgentChatChangeEffortCommand } from "../agents/agentRemoteConfig.js";
 import { collapseFunctionalRepoPathToCoreRepoPath } from "../terminals/coreRepoNameDisplay";
 import {
   TERMINAL_AGENT_COLOR_HEX_BY_SLOT,
@@ -40616,12 +40617,15 @@ export default function App() {
       terminal_index: remoteControlTerminalNumber(terminal, ["terminal_index"]) ?? fallback.target_terminal_index ?? null,
       thread_id: remoteControlTerminalText(terminal, ["thread_id"]) || fallback.target_thread_id || "",
     });
-    const remoteControlTerminalCapabilityText = (terminal, keys) => {
-      const capabilities = terminal?.capabilities && typeof terminal.capabilities === "object"
+    const remoteControlTerminalCapabilities = (terminal) => (
+      terminal?.capabilities && typeof terminal.capabilities === "object"
         ? terminal.capabilities
         : terminal?.sessionCapabilities && typeof terminal.sessionCapabilities === "object"
           ? terminal.sessionCapabilities
-          : {};
+          : {}
+    );
+    const remoteControlTerminalCapabilityText = (terminal, keys) => {
+      const capabilities = remoteControlTerminalCapabilities(terminal);
       for (const key of keys) {
         const text = String(capabilities?.[key] || "").trim();
         if (text) return text;
@@ -40629,11 +40633,7 @@ export default function App() {
       return "";
     };
     const remoteControlTerminalCapabilityValues = (terminal, keys) => {
-      const capabilities = terminal?.capabilities && typeof terminal.capabilities === "object"
-        ? terminal.capabilities
-        : terminal?.sessionCapabilities && typeof terminal.sessionCapabilities === "object"
-          ? terminal.sessionCapabilities
-          : {};
+      const capabilities = remoteControlTerminalCapabilities(terminal);
       const values = [];
       keys.forEach((key) => {
         const raw = capabilities?.[key] ?? terminal?.[key];
@@ -40642,6 +40642,24 @@ export default function App() {
           const text = String(item?.id || item?.model_id || item || "").trim();
           if (text && !values.includes(text)) {
             values.push(text);
+          }
+        });
+      });
+      return values;
+    };
+    const remoteControlTerminalCapabilityObjects = (terminal, keys) => {
+      const capabilities = remoteControlTerminalCapabilities(terminal);
+      const values = [];
+      keys.forEach((key) => {
+        const raw = capabilities?.[key] ?? terminal?.[key];
+        const items = Array.isArray(raw)
+          ? raw
+          : Array.isArray(raw?.models)
+            ? raw.models
+            : [raw];
+        items.forEach((item) => {
+          if (item && typeof item === "object") {
+            values.push(item);
           }
         });
       });
@@ -40761,6 +40779,27 @@ export default function App() {
         || remoteControlTerminalText(terminal, ["current_model", "model_id", "model"])
         || remoteControlTerminalCapabilityText(terminal, ["current_model"])
     );
+    const remoteAgentChatConfigEffortValues = (provider, currentModel, terminal) => {
+      const catalogModels = remoteControlTerminalCapabilityObjects(terminal, [
+        "models",
+        "available_models",
+        "model_catalog",
+      ]);
+      const values = getAgentLaunchEffortOptions(
+        provider,
+        currentModel,
+        catalogModels.length ? { models: catalogModels } : null,
+      ).map((option) => String(option?.value || "").trim().toLowerCase());
+      remoteControlTerminalCapabilityValues(terminal, [
+        "available_reasoning_efforts",
+        "reasoning_efforts",
+        "reasoning_effort_options",
+      ]).forEach((effort) => {
+        const value = String(effort || "").trim().toLowerCase();
+        if (value) values.push(value);
+      });
+      return [...new Set(values)];
+    };
     const buildRemoteAgentChatConfigCommand = ({ command_kind: rawCommandKind, event, provider, terminal }) => {
       const commandKind = normalizeRemoteCommandName(rawCommandKind);
       const requestedModel = remoteCommandStringField(event, ["model_id", "model"]);
@@ -40811,32 +40850,13 @@ export default function App() {
         };
       }
       if (commandKind === "agent_chat_change_effort") {
-        const validEfforts = provider === "claude"
-          ? new Set(["low", "medium", "high", "xhigh", "max"])
-          : new Set(["low", "medium", "high", "xhigh"]);
-        if (!validEfforts.has(requestedEffort)) {
-          return { error: `Remote effort change included an invalid ${provider} reasoning_effort.` };
-        }
-        if (provider === "claude") {
-          return {
-            command: `/effort ${requestedEffort}`,
-            model_id: remoteAgentChatConfigCurrentModel(event, terminal),
-            recordModelId: "",
-            recordReasoningEffort: requestedEffort,
-            reasoning_effort: requestedEffort,
-          };
-        }
         const currentModel = remoteAgentChatConfigCurrentModel(event, terminal);
-        if (!currentModel || currentModel.length > 160 || !modelPattern.test(currentModel)) {
-          return { error: "Codex effort changes require the current model_id." };
-        }
-        return {
-          command: `/model ${currentModel} ${requestedEffort}`,
-          model_id: currentModel,
-          recordModelId: "",
-          recordReasoningEffort: requestedEffort,
-          reasoning_effort: requestedEffort,
-        };
+        return buildAgentChatChangeEffortCommand({
+          currentModel,
+          effortValues: remoteAgentChatConfigEffortValues(provider, currentModel, terminal),
+          provider,
+          requestedEffort,
+        });
       }
       return { error: "Unsupported model configuration command." };
     };
@@ -55200,10 +55220,11 @@ export default function App() {
                             ? "warning"
                             : "neutral";
                         const launchDefault = getAgentLaunchDefault(agent.id, agentLaunchDefaults);
-                        const launchModelOptions = getAgentLaunchModelOptions(agent.id);
-                        const launchModelOption = getAgentLaunchModelOption(agent.id, launchDefault.model);
-                        const launchEffortOptions = getAgentLaunchEffortOptions(agent.id, launchDefault.model);
-                        const launchSpeedOptions = getAgentLaunchSpeedOptions(agent.id, launchDefault.model);
+                        const launchModelCatalog = agent?.model_catalog || null;
+                        const launchModelOptions = getAgentLaunchModelOptions(agent.id, launchModelCatalog);
+                        const launchModelOption = getAgentLaunchModelOption(agent.id, launchDefault.model, launchModelCatalog);
+                        const launchEffortOptions = getAgentLaunchEffortOptions(agent.id, launchDefault.model, launchModelCatalog);
+                        const launchSpeedOptions = getAgentLaunchSpeedOptions(agent.id, launchDefault.model, launchModelCatalog);
                         const launchModelDraftActive = Object.prototype.hasOwnProperty.call(agentLaunchModelDrafts, agent.id);
                         const launchModelIsKnown = Boolean(launchModelOption) && !launchModelDraftActive;
                         const launchModelDraft = launchModelDraftActive

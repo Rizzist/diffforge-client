@@ -5185,12 +5185,15 @@ struct TerminalSessionCapabilities {
     current_effort: Option<String>,
     current_speed: Option<String>,
     permission_mode: Option<String>,
+    available_models: Vec<AgentModelCatalogEntry>,
     available_reasoning_efforts: Vec<String>,
     available_permission_modes: Vec<String>,
     can_prompt_answer: bool,
     can_interrupt: bool,
     can_raw_input: bool,
     can_close: bool,
+    can_list_models: bool,
+    can_select_model: bool,
     can_change_model_now: bool,
     can_change_effort_now: bool,
     can_change_permission_mode_now: bool,
@@ -5206,17 +5209,24 @@ fn terminal_session_capabilities(
     let provider = terminal_normalize_agent_kind(Some(agent_kind))
         .unwrap_or_else(|| agent_kind.trim().to_ascii_lowercase())
         .replace('-', "_");
-    let available_reasoning_efforts = match provider.as_str() {
-        "codex" => ["low", "medium", "high", "xhigh"]
+    let available_models = cloud_mcp_agent_model_catalog_models_for_capabilities(&provider);
+    let current_model = launch_metadata.model.clone();
+    let catalog_efforts = current_model
+        .as_deref()
+        .and_then(|model| cloud_mcp_agent_model_catalog_entry_for_model(&provider, model))
+        .map(|entry| entry.reasoning_efforts)
+        .filter(|efforts| !efforts.is_empty());
+    let available_reasoning_efforts = catalog_efforts.unwrap_or_else(|| match provider.as_str() {
+        "codex" => AGENT_MODEL_CATALOG_CODEX_REASONING_EFFORTS
             .into_iter()
             .map(str::to_string)
             .collect(),
-        "claude" => ["low", "medium", "high", "xhigh", "max"]
+        "claude" => AGENT_MODEL_CATALOG_CLAUDE_REASONING_EFFORTS
             .into_iter()
             .map(str::to_string)
             .collect(),
         _ => Vec::new(),
-    };
+    });
     let available_permission_modes = match provider.as_str() {
         "codex" | "claude" | "opencode" => [
             TERMINAL_PERMISSION_MODE_PLAN,
@@ -5229,21 +5239,26 @@ fn terminal_session_capabilities(
         .collect(),
         _ => Vec::new(),
     };
+    let can_list_models = matches!(provider.as_str(), "codex" | "claude" | "opencode");
+    let can_select_model = can_list_models;
     let can_change_model_now = matches!(provider.as_str(), "codex" | "claude");
     let can_change_effort_now = matches!(provider.as_str(), "codex" | "claude");
     TerminalSessionCapabilities {
         provider,
-        current_model: launch_metadata.model.clone(),
+        current_model,
         current_model_source: launch_metadata.model_source.clone(),
         current_effort: launch_metadata.reasoning_effort.clone(),
         current_speed: launch_metadata.speed.clone(),
         permission_mode: launch_metadata.permission_mode.clone(),
+        available_models,
         available_reasoning_efforts,
         available_permission_modes,
         can_prompt_answer: true,
         can_interrupt: true,
         can_raw_input: false,
         can_close: true,
+        can_list_models,
+        can_select_model,
         can_change_model_now,
         can_change_effort_now,
         can_change_permission_mode_now: false,
@@ -18645,7 +18660,24 @@ fn terminal_permission_config_input_is_allowed(data: &str) -> bool {
     true
 }
 
-fn terminal_codex_model_change_command_from_input(data: &str) -> Option<String> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalCodexModelChangeRequest {
+    command: String,
+    model: String,
+    effort: Option<String>,
+    catalog_match: bool,
+    effort_catalog_match: Option<bool>,
+}
+
+fn terminal_codex_model_change_effort_fallback_match(effort: &str) -> bool {
+    AGENT_MODEL_CATALOG_CODEX_REASONING_EFFORTS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(effort))
+}
+
+fn terminal_codex_model_change_request_from_input(
+    data: &str,
+) -> Option<TerminalCodexModelChangeRequest> {
     let command = data
         .replace(TERMINAL_ENTER_SEQUENCE_MOD1, "")
         .replace(TERMINAL_ENTER_SEQUENCE, "")
@@ -18668,12 +18700,37 @@ fn terminal_codex_model_change_command_from_input(data: &str) -> Option<String> 
     {
         return None;
     }
-    if let Some(effort) = effort {
-        if !matches!(effort, "low" | "medium" | "high" | "xhigh") {
+    let model = model.to_string();
+    let effort = effort.map(str::to_string);
+    if let Some(effort) = effort.as_deref() {
+        if effort.len() > 40
+            || !effort
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        {
             return None;
         }
     }
-    Some(command)
+    let catalog_entry = cloud_mcp_agent_model_catalog_entry_for_model("codex", &model);
+    let catalog_match = catalog_entry.is_some();
+    let effort_catalog_match = effort.as_deref().map(|effort| {
+        catalog_entry
+            .as_ref()
+            .map(|entry| {
+                entry
+                    .reasoning_efforts
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(effort))
+            })
+            .unwrap_or_else(|| terminal_codex_model_change_effort_fallback_match(effort))
+    });
+    Some(TerminalCodexModelChangeRequest {
+        command,
+        model,
+        effort,
+        catalog_match,
+        effort_catalog_match,
+    })
 }
 
 fn terminal_codex_model_change_input_requests_submit(data: &str) -> bool {
@@ -18771,18 +18828,40 @@ async fn terminal_write_inner(
     if terminal_metadata_is_codex(&instance.metadata)
         && terminal_write_source_is_model_change(prompt_event_source.as_deref())
     {
-        if let Some(command) = terminal_codex_model_change_command_from_input(&data) {
+        if let Some(model_change) = terminal_codex_model_change_request_from_input(&data) {
             let runtime = terminal_runtime_snapshot(&instance);
             let submit = terminal_codex_model_change_input_requests_submit(&data);
+            if !model_change.catalog_match
+                || model_change.effort_catalog_match == Some(false)
+            {
+                log_terminal_status_event(
+                    "backend.agent_chat_model_change.catalog_warning",
+                    json!({
+                        "agent_id": clean_terminal_diagnostic_log_text(&instance.metadata.agent_id),
+                        "catalog_match": model_change.catalog_match,
+                        "effort": model_change.effort.as_deref().unwrap_or_default(),
+                        "effort_catalog_match": model_change.effort_catalog_match,
+                        "instance_id": instance.id,
+                        "level": "warning",
+                        "model": clean_terminal_diagnostic_log_text(&model_change.model),
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                        "provider": clean_terminal_diagnostic_log_text(&instance.metadata.agent_kind),
+                    }),
+                );
+            }
             log_terminal_status_event(
                 "backend.agent_chat_model_change.inject",
                 json!({
                     "agent_id": clean_terminal_diagnostic_log_text(&instance.metadata.agent_id),
-                    "command_len": command.len(),
+                    "catalog_match": model_change.catalog_match,
+                    "command_len": model_change.command.len(),
+                    "effort": model_change.effort.as_deref().unwrap_or_default(),
+                    "effort_catalog_match": model_change.effort_catalog_match,
                     "had_enhanced_enter": data.contains(TERMINAL_ENTER_SEQUENCE) || data.contains(TERMINAL_ENTER_SEQUENCE_MOD1),
                     "had_plain_enter": data.contains('\r') || data.contains('\n'),
                     "instance_id": instance.id,
                     "launch_mode": terminal_activity_watchdog_launch_mode(&runtime),
+                    "model": clean_terminal_diagnostic_log_text(&model_change.model),
                     "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
                     "provider": clean_terminal_diagnostic_log_text(&instance.metadata.agent_kind),
                     "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
@@ -18790,7 +18869,7 @@ async fn terminal_write_inner(
                     "sequence": if submit { "ctrl_u_slash_model_plain_cr" } else { "ctrl_u_slash_model_defer_submit" },
                 }),
             );
-            data = terminal_codex_model_change_pty_input(&command, submit);
+            data = terminal_codex_model_change_pty_input(&model_change.command, submit);
             prompt_event_id = None;
             prompt_event_text = None;
         }
@@ -21974,8 +22053,9 @@ mod terminal_tests {
     #[test]
     fn codex_model_change_rewrite_uses_plain_submit_after_clear() {
         let input = format!("/model gpt-5.1-codex high{TERMINAL_ENTER_SEQUENCE}");
-        let command =
-            terminal_codex_model_change_command_from_input(&input).expect("valid model command");
+        let command = terminal_codex_model_change_request_from_input(&input)
+            .expect("valid model command")
+            .command;
         assert_eq!(command, "/model gpt-5.1-codex high");
         assert_eq!(
             terminal_codex_model_change_pty_input(&command, true),
@@ -21996,9 +22076,65 @@ mod terminal_tests {
         assert!(!terminal_write_source_is_model_change(Some(
             "remote-permission-config"
         )));
-        assert!(terminal_codex_model_change_command_from_input("/model\r").is_none());
-        assert!(terminal_codex_model_change_command_from_input("/model bad model\r").is_none());
-        assert!(terminal_codex_model_change_command_from_input("/model gpt-5 max\r").is_none());
+        assert!(terminal_codex_model_change_request_from_input("/model\r").is_none());
+        assert!(terminal_codex_model_change_request_from_input("/model bad model\r").is_none());
+        assert_eq!(
+            terminal_codex_model_change_request_from_input("/model gpt-5 max\r")
+                .map(|request| request.command)
+                .as_deref(),
+            Some("/model gpt-5 max")
+        );
+        assert!(terminal_codex_model_change_request_from_input("/model gpt-5 bad!").is_none());
+    }
+
+    #[test]
+    fn codex_model_change_soft_gate_injects_unknown_model() {
+        let request = terminal_codex_model_change_request_from_input(
+            "/model gpt-softgate-unknown-zz ultra\r",
+        )
+        .expect("safe unknown model should still inject");
+
+        assert_eq!(request.command, "/model gpt-softgate-unknown-zz ultra");
+        assert_eq!(request.model, "gpt-softgate-unknown-zz");
+        assert_eq!(request.effort.as_deref(), Some("ultra"));
+        assert!(!request.catalog_match);
+        assert_eq!(request.effort_catalog_match, Some(false));
+    }
+
+    #[test]
+    fn terminal_session_capabilities_populates_available_models() {
+        let launch_metadata = TerminalLaunchRuntimeMetadata {
+            model: Some("gpt-5.5".to_string()),
+            reasoning_effort: Some("medium".to_string()),
+            ..TerminalLaunchRuntimeMetadata::default()
+        };
+        let capabilities = terminal_session_capabilities("codex", &launch_metadata);
+
+        assert!(capabilities
+            .available_models
+            .iter()
+            .any(|model| model.id == "gpt-5.5"));
+        assert!(capabilities
+            .available_reasoning_efforts
+            .iter()
+            .any(|effort| effort == "medium"));
+    }
+
+    #[test]
+    fn opencode_session_capabilities_allow_model_listing_without_live_change() {
+        let launch_metadata = TerminalLaunchRuntimeMetadata {
+            model: Some("anthropic/claude-sonnet-4-5".to_string()),
+            ..TerminalLaunchRuntimeMetadata::default()
+        };
+        let capabilities = terminal_session_capabilities("opencode", &launch_metadata);
+
+        assert!(capabilities.can_list_models);
+        assert!(capabilities.can_select_model);
+        assert!(!capabilities.can_change_model_now);
+        assert!(capabilities
+            .available_models
+            .iter()
+            .any(|model| model.id == "anthropic/claude-sonnet-4-5"));
     }
 
     #[test]

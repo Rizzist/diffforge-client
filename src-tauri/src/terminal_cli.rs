@@ -523,17 +523,400 @@ fn clear_agent_command_candidate_cache(provider: AgentProvider) {
     }
 }
 
+const AGENT_MODEL_CATALOG_CLAUDE_REASONING_EFFORTS: [&str; 6] =
+    ["default", "low", "medium", "high", "xhigh", "max"];
+const AGENT_MODEL_CATALOG_CODEX_REASONING_EFFORTS: [&str; 4] =
+    ["low", "medium", "high", "xhigh"];
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct AgentModelCatalogEntry {
+    id: String,
+    display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    agent_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    supports_images: bool,
+    supports_effort: bool,
+    reasoning_efforts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speed_modes: Option<Vec<String>>,
+    is_default: bool,
+    hidden: bool,
+    deprecated: bool,
+    source: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct AgentModelCatalog {
+    agent_kind: String,
+    harness_version: String,
+    source: String,
+    complete: bool,
+    models: Vec<AgentModelCatalogEntry>,
+    content_hash: String,
+}
+
+fn clean_agent_model_catalog_text(value: &str, max_chars: usize) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(max_chars)
+        .collect::<String>()
+}
+
+fn agent_model_catalog_content_hash(
+    agent_kind: &str,
+    harness_version: &str,
+    source: &str,
+    complete: bool,
+    models: &[AgentModelCatalogEntry],
+) -> String {
+    let seed = json!({
+        "agent_kind": agent_kind,
+        "harness_version": harness_version,
+        "source": source,
+        "complete": complete,
+        "models": models,
+    });
+    format!("{:x}", Sha256::digest(seed.to_string().as_bytes()))
+}
+
+fn agent_model_catalog(
+    agent_kind: &str,
+    harness_version: &str,
+    source: &str,
+    complete: bool,
+    models: Vec<AgentModelCatalogEntry>,
+) -> AgentModelCatalog {
+    let content_hash =
+        agent_model_catalog_content_hash(agent_kind, harness_version, source, complete, &models);
+    AgentModelCatalog {
+        agent_kind: agent_kind.to_string(),
+        harness_version: harness_version.to_string(),
+        source: source.to_string(),
+        complete,
+        models,
+        content_hash,
+    }
+}
+
+fn agent_model_catalog_provider_from_id(model_id: &str) -> Option<String> {
+    let provider = model_id.split('/').next()?.trim();
+    if provider.is_empty() || provider == model_id {
+        None
+    } else {
+        Some(provider.to_string())
+    }
+}
+
+fn agent_model_catalog_display_from_id(model_id: &str) -> String {
+    let leaf = model_id
+        .rsplit('/')
+        .next()
+        .unwrap_or(model_id)
+        .replace(['_', '-'], " ");
+    let display = leaf
+        .split_whitespace()
+        .map(|part| {
+            if part.chars().all(|ch| ch.is_ascii_digit() || ch == '.') {
+                part.to_string()
+            } else if part.len() <= 4 && part.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+                part.to_ascii_uppercase()
+            } else {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                    None => String::new(),
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if display.trim().is_empty() {
+        model_id.to_string()
+    } else {
+        display
+    }
+}
+
+fn agent_model_catalog_entry(
+    agent_kind: &str,
+    id: &str,
+    display_name: &str,
+    description: Option<&str>,
+    source: &str,
+    is_default: bool,
+    supports_images: bool,
+    supports_effort: bool,
+    reasoning_efforts: Vec<String>,
+    default_reasoning_effort: Option<&str>,
+    speed_modes: Option<Vec<&str>>,
+    provider: Option<&str>,
+    hidden: bool,
+    deprecated: bool,
+) -> AgentModelCatalogEntry {
+    AgentModelCatalogEntry {
+        id: clean_agent_model_catalog_text(id, 180),
+        display_name: clean_agent_model_catalog_text(display_name, 120),
+        description: description
+            .map(|value| clean_agent_model_catalog_text(value, 240))
+            .filter(|value| !value.is_empty()),
+        agent_kind: agent_kind.to_string(),
+        provider: provider
+            .map(|value| clean_agent_model_catalog_text(value, 80))
+            .filter(|value| !value.is_empty()),
+        supports_images,
+        supports_effort,
+        reasoning_efforts,
+        default_reasoning_effort: default_reasoning_effort
+            .map(|value| clean_agent_model_catalog_text(value, 40))
+            .filter(|value| !value.is_empty()),
+        speed_modes: speed_modes.map(|modes| {
+            modes
+                .into_iter()
+                .map(|mode| clean_agent_model_catalog_text(mode, 40))
+                .filter(|mode| !mode.is_empty())
+                .collect::<Vec<_>>()
+        }),
+        is_default,
+        hidden,
+        deprecated,
+        source: source.to_string(),
+    }
+}
+
+fn agent_model_baseline_catalog_entries(agent_kind: &str) -> Vec<AgentModelCatalogEntry> {
+    match agent_kind {
+        "codex" => {
+            let efforts = AGENT_MODEL_CATALOG_CODEX_REASONING_EFFORTS
+                .iter()
+                .map(|effort| effort.to_string())
+                .collect::<Vec<_>>();
+            vec![
+                agent_model_catalog_entry(
+                    "codex",
+                    "gpt-5.5",
+                    "GPT-5.5",
+                    Some("Latest Codex model"),
+                    "device_baseline",
+                    true,
+                    true,
+                    true,
+                    efforts.clone(),
+                    Some("medium"),
+                    Some(vec!["standard", "fast"]),
+                    None,
+                    false,
+                    false,
+                ),
+                agent_model_catalog_entry(
+                    "codex",
+                    "gpt-5.4",
+                    "GPT-5.4",
+                    Some("Balanced coding model"),
+                    "device_baseline",
+                    false,
+                    true,
+                    true,
+                    efforts.clone(),
+                    Some("medium"),
+                    Some(vec!["standard", "fast"]),
+                    None,
+                    false,
+                    false,
+                ),
+                agent_model_catalog_entry(
+                    "codex",
+                    "gpt-5.4-mini",
+                    "GPT-5.4 mini",
+                    Some("Faster lower-cost coding model"),
+                    "device_baseline",
+                    false,
+                    true,
+                    true,
+                    efforts.clone(),
+                    Some("medium"),
+                    None,
+                    None,
+                    false,
+                    false,
+                ),
+                agent_model_catalog_entry(
+                    "codex",
+                    "gpt-5.3-codex-spark",
+                    "Codex Spark",
+                    Some("Research preview quick coding model"),
+                    "device_baseline",
+                    false,
+                    true,
+                    true,
+                    efforts,
+                    Some("high"),
+                    Some(vec!["fast"]),
+                    None,
+                    false,
+                    false,
+                ),
+            ]
+        }
+        "claude" => {
+            let efforts = AGENT_MODEL_CATALOG_CLAUDE_REASONING_EFFORTS
+                .iter()
+                .map(|effort| effort.to_string())
+                .collect::<Vec<_>>();
+            vec![
+                agent_model_catalog_entry(
+                    "claude",
+                    "sonnet",
+                    "Sonnet",
+                    Some("Balanced Claude Code default"),
+                    "device_baseline",
+                    true,
+                    true,
+                    true,
+                    efforts.clone(),
+                    Some("default"),
+                    None,
+                    None,
+                    false,
+                    false,
+                ),
+                agent_model_catalog_entry(
+                    "claude",
+                    "opus",
+                    "Opus",
+                    Some("Higher capability Claude model"),
+                    "device_baseline",
+                    false,
+                    true,
+                    true,
+                    efforts.clone(),
+                    Some("default"),
+                    Some(vec!["standard", "fast"]),
+                    None,
+                    false,
+                    false,
+                ),
+                agent_model_catalog_entry(
+                    "claude",
+                    "haiku",
+                    "Haiku",
+                    Some("Lower-latency Claude model"),
+                    "device_baseline",
+                    false,
+                    true,
+                    true,
+                    efforts.clone(),
+                    Some("default"),
+                    None,
+                    None,
+                    false,
+                    false,
+                ),
+                agent_model_catalog_entry(
+                    "claude",
+                    "fable",
+                    "Fable",
+                    Some("Latest Claude alias when available"),
+                    "device_baseline",
+                    false,
+                    true,
+                    true,
+                    efforts,
+                    Some("default"),
+                    None,
+                    None,
+                    false,
+                    false,
+                ),
+            ]
+        }
+        "opencode" => vec![
+            opencode_model_catalog_entry("openai/gpt-5.5", "device_baseline", false),
+            opencode_model_catalog_entry("openai/gpt-5.4-mini", "device_baseline", false),
+            opencode_model_catalog_entry(
+                "anthropic/claude-sonnet-4-5",
+                "device_baseline",
+                true,
+            ),
+            opencode_model_catalog_entry("google/gemini-2.5-pro", "device_baseline", false),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn agent_model_catalog_normalize_defaults(models: &mut [AgentModelCatalogEntry]) {
+    let mut found_default = false;
+    for model in models.iter_mut() {
+        if model.is_default && !found_default {
+            found_default = true;
+        } else {
+            model.is_default = false;
+        }
+    }
+    if found_default {
+        return;
+    }
+    let default_index = models
+        .iter()
+        .position(|model| !model.hidden && !model.deprecated)
+        .or_else(|| (!models.is_empty()).then_some(0));
+    if let Some(index) = default_index {
+        if let Some(model) = models.get_mut(index) {
+            model.is_default = true;
+        }
+    }
+}
+
+fn agent_model_catalog_merge_live_with_baseline(
+    agent_kind: &str,
+    live_models: Vec<AgentModelCatalogEntry>,
+) -> Vec<AgentModelCatalogEntry> {
+    let mut merged = Vec::new();
+    let mut seen = HashSet::new();
+    for mut model in live_models
+        .into_iter()
+        .chain(agent_model_baseline_catalog_entries(agent_kind))
+    {
+        let id = model.id.trim().to_string();
+        if id.is_empty() {
+            continue;
+        }
+        let key = id.to_ascii_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+        model.id = id;
+        model.agent_kind = agent_kind.to_string();
+        merged.push(model);
+    }
+    agent_model_catalog_normalize_defaults(&mut merged);
+    merged
+}
+
+fn agent_model_catalog_fallback(agent_kind: &str, harness_version: &str) -> AgentModelCatalog {
+    let models = agent_model_catalog_merge_live_with_baseline(agent_kind, Vec::new());
+    agent_model_catalog(agent_kind, harness_version, "device_baseline", false, models)
+}
+
 const OPENCODE_MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 const OPENCODE_MODELS_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 static OPENCODE_MODEL_LIST_CACHE: OnceLock<StdMutex<Option<OpencodeModelCacheEntry>>> =
     OnceLock::new();
+static OPENCODE_HARNESS_VERSION: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
 
 #[derive(Clone, Serialize)]
 struct OpencodeModelList {
     models: Vec<String>,
     source: String,
     fetched_at_ms: u64,
+    harness_version: Option<String>,
     error: Option<String>,
 }
 
@@ -542,6 +925,7 @@ struct OpencodeModelCacheEntry {
     models: Vec<String>,
     fetched_at_ms: u64,
     fetched_instant: Instant,
+    harness_version: Option<String>,
 }
 
 enum OpencodeModelsCommandError {
@@ -571,6 +955,40 @@ fn opencode_model_list_cache() -> &'static StdMutex<Option<OpencodeModelCacheEnt
     OPENCODE_MODEL_LIST_CACHE.get_or_init(|| StdMutex::new(None))
 }
 
+fn opencode_harness_version_cache() -> &'static StdMutex<Option<String>> {
+    OPENCODE_HARNESS_VERSION.get_or_init(|| StdMutex::new(None))
+}
+
+fn opencode_current_harness_version() -> Option<String> {
+    opencode_harness_version_cache()
+        .lock()
+        .ok()
+        .and_then(|version| version.clone())
+}
+
+fn clear_opencode_model_list_cache() {
+    if let Ok(mut cache) = opencode_model_list_cache().lock() {
+        *cache = None;
+    }
+}
+
+fn opencode_note_harness_version(version: &str) -> bool {
+    let version = version.trim();
+    if version.is_empty() {
+        return false;
+    }
+    let Ok(mut current) = opencode_harness_version_cache().lock() else {
+        return false;
+    };
+    if current.as_deref() == Some(version) {
+        return false;
+    }
+    *current = Some(version.to_string());
+    drop(current);
+    clear_opencode_model_list_cache();
+    true
+}
+
 fn opencode_model_list_response(
     entry: &OpencodeModelCacheEntry,
     source: &str,
@@ -580,6 +998,7 @@ fn opencode_model_list_response(
         models: entry.models.clone(),
         source: source.to_string(),
         fetched_at_ms: entry.fetched_at_ms,
+        harness_version: entry.harness_version.clone(),
         error,
     }
 }
@@ -594,6 +1013,11 @@ fn opencode_model_list_cached_response_for(
     }
 
     let entry = entry?;
+    if let Some(current_harness_version) = opencode_current_harness_version() {
+        if entry.harness_version.as_deref() != Some(current_harness_version.as_str()) {
+            return None;
+        }
+    }
     if now.saturating_duration_since(entry.fetched_instant) < OPENCODE_MODELS_CACHE_TTL {
         Some(opencode_model_list_response(entry, "cache", None))
     } else {
@@ -623,6 +1047,7 @@ fn opencode_model_list_failure_response(error: String) -> OpencodeModelList {
             models: Vec::new(),
             source: "error".to_string(),
             fetched_at_ms: 0,
+            harness_version: opencode_current_harness_version(),
             error: Some(error),
         }
     }
@@ -805,10 +1230,61 @@ fn fetch_opencode_models_from_cli() -> Result<OpencodeModelCacheEntry, String> {
             models: parse_opencode_models_stdout(&capture.stdout),
             fetched_at_ms: current_time_ms(),
             fetched_instant: Instant::now(),
+            harness_version: opencode_current_harness_version(),
         });
     }
 
     Err(last_error)
+}
+
+fn opencode_model_catalog_entry(
+    model_id: &str,
+    source: &str,
+    is_default: bool,
+) -> AgentModelCatalogEntry {
+    let supports_images = opencode_model_supports_images(model_id).unwrap_or(false);
+    agent_model_catalog_entry(
+        "opencode",
+        model_id,
+        &agent_model_catalog_display_from_id(model_id),
+        None,
+        source,
+        is_default,
+        supports_images,
+        false,
+        Vec::new(),
+        None,
+        None,
+        agent_model_catalog_provider_from_id(model_id).as_deref(),
+        false,
+        false,
+    )
+}
+
+fn opencode_model_catalog_entries_from_ids(
+    model_ids: &[String],
+    source: &str,
+) -> Vec<AgentModelCatalogEntry> {
+    let source = if source == "cache" || source == "stale-cache" {
+        "harness_cache"
+    } else {
+        "harness_api"
+    };
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+    for model_id in model_ids.iter().take(512) {
+        let model_id = model_id.trim();
+        if model_id.is_empty() || !seen.insert(model_id.to_ascii_lowercase()) {
+            continue;
+        }
+        models.push(opencode_model_catalog_entry(
+            model_id,
+            source,
+            model_id == "anthropic/claude-sonnet-4-5",
+        ));
+    }
+    agent_model_catalog_normalize_defaults(&mut models);
+    models
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -4753,6 +5229,7 @@ mod terminal_cli_tests {
             fetched_instant: now
                 .checked_sub(Duration::from_secs(30))
                 .expect("fresh instant"),
+            harness_version: None,
         };
 
         let cached = opencode_model_list_cached_response_for(Some(&entry), now, false)
@@ -4770,6 +5247,7 @@ mod terminal_cli_tests {
             fetched_instant: now
                 .checked_sub(OPENCODE_MODELS_CACHE_TTL + Duration::from_secs(1))
                 .expect("expired instant"),
+            harness_version: None,
         };
 
         assert!(

@@ -17807,6 +17807,171 @@ async fn cloud_mcp_receive_chat_attachment_push(message: &Value) -> Result<Value
     }))
 }
 
+fn cloud_mcp_is_list_agent_models_request(
+    message: &Value,
+    direct_kind: &str,
+    direct_request_kind: &str,
+) -> bool {
+    let matches_list_agent_models = |value: &str| {
+        value
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['.', ' ', '-'], "_")
+            == "list_agent_models"
+    };
+    let is_request = [
+        Some(direct_kind.to_string()),
+        Some(direct_request_kind.to_string()),
+        cloud_mcp_nested_payload_text(message, &["payload", "kind"]),
+        cloud_mcp_nested_payload_text(message, &["request", "kind"]),
+        cloud_mcp_nested_payload_text(message, &["event", "kind"]),
+        cloud_mcp_nested_payload_text(message, &["event", "event_kind"]),
+        cloud_mcp_nested_payload_text(message, &["event", "payload", "kind"]),
+        cloud_mcp_nested_payload_text(message, &["event", "request", "kind"]),
+        cloud_mcp_remote_command_field_text(message, &["command_kind"]),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| matches_list_agent_models(&value));
+    if !is_request {
+        return false;
+    }
+    let target_device_id = cloud_mcp_remote_command_field_text(message, &["target_device_id"])
+        .unwrap_or_default();
+    target_device_id.trim().is_empty() || cloud_mcp_remote_command_matches_device(message)
+}
+
+fn cloud_mcp_nested_payload_text(payload: &Value, path: &[&str]) -> Option<String> {
+    let mut current = payload;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current
+        .as_str()
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn cloud_mcp_list_agent_models_request_id(message: &Value) -> String {
+    cloud_mcp_remote_command_field_text(message, &["request_id"])
+        .or_else(|| cloud_mcp_payload_text(message, &["id"]))
+        .unwrap_or_else(|| format!("agent-models-{}", uuid::Uuid::new_v4()))
+}
+
+fn cloud_mcp_agent_models_result_payload(
+    request: &Value,
+    agent_kind: &str,
+    models: Vec<AgentModelCatalogEntry>,
+    complete: bool,
+    harness_version: Option<String>,
+    error: Option<String>,
+) -> Value {
+    let request_id = cloud_mcp_list_agent_models_request_id(request);
+    let mut payload = json!({
+        "kind": "agent_models_result",
+        "event_kind": "agent_models_result",
+        "request_id": request_id,
+        "source_request_id": cloud_mcp_payload_text(request, &["id"]).unwrap_or_default(),
+        "agent_kind": agent_kind,
+        "models": models,
+        "complete": complete,
+        "harness_version": harness_version.unwrap_or_default(),
+        "workspace_id": cloud_mcp_remote_command_field_text(request, &["workspace_id"]).unwrap_or_default(),
+        "target_device_id": cloud_mcp_remote_command_field_text(request, &["target_device_id"]).unwrap_or_default(),
+        "target_terminal_id": cloud_mcp_remote_command_field_text(request, &["target_terminal_id", "terminal_id"]).unwrap_or_default(),
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    if let Some(error) = error
+        .map(|value| clean_terminal_telemetry_text(&value))
+        .filter(|value| !value.trim().is_empty())
+    {
+        payload["error"] = json!(error);
+    }
+    payload
+}
+
+async fn cloud_mcp_send_agent_models_result(
+    state: &CloudMcpState,
+    source_request: &Value,
+    payload: Value,
+) -> Result<(), String> {
+    let auth = cloud_mcp_ws_auth_object(state).await?;
+    let envelope = cloud_mcp_agent_models_result_envelope(source_request, &payload, auth);
+    let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() else {
+        return Err("Cloud MCP app websocket is not connected.".to_string());
+    };
+    tx.send(envelope)
+        .map_err(|_| "Cloud MCP app websocket sender is closed.".to_string())
+}
+
+fn cloud_mcp_agent_models_result_envelope(
+    source_request: &Value,
+    payload: &Value,
+    auth: Value,
+) -> Value {
+    let request = cloud_mcp_event_envelope("agent_models_result", payload);
+    json!({
+        "kind": "agent_models_result",
+        "event_kind": "agent_models_result",
+        "id": format!("agent-models-result-{}-{}", cloud_mcp_now_ms(), uuid::Uuid::new_v4()),
+        "contract": "diffforge.app_ws.v1",
+        "auth": auth,
+        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+        "request_id": payload.get("request_id").cloned().unwrap_or(Value::Null),
+        "source_request_id": cloud_mcp_payload_text(source_request, &["id"]).unwrap_or_default(),
+        "repo_id": cloud_mcp_payload_text(source_request, &["repo_id"])
+            .or_else(|| cloud_mcp_payload_text(source_request, &["payload", "repo_id"]))
+            .or_else(|| cloud_mcp_payload_text(&request, &["repo_id"]))
+            .or_else(|| cloud_mcp_payload_text(&request, &["payload", "repo_id"])),
+        "workspace_id": cloud_mcp_payload_text(source_request, &["workspace_id"])
+            .or_else(|| cloud_mcp_payload_text(source_request, &["payload", "workspace_id"]))
+            .or_else(|| cloud_mcp_payload_text(&request, &["workspace_id"]))
+            .or_else(|| cloud_mcp_payload_text(&request, &["payload", "workspace_id"])),
+        "payload": payload,
+        "request": request,
+    })
+}
+
+async fn cloud_mcp_handle_list_agent_models_request(state: CloudMcpState, request: Value) {
+    let agent_kind = cloud_mcp_remote_command_field_text(&request, &["agent_kind"])
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    let payload = if agent_kind != "opencode" {
+        cloud_mcp_agent_models_result_payload(
+            &request,
+            if agent_kind.is_empty() {
+                "unknown"
+            } else {
+                agent_kind.as_str()
+            },
+            Vec::new(),
+            false,
+            None,
+            Some("list_agent_models currently supports agent_kind opencode.".to_string()),
+        )
+    } else {
+        let list = opencode_list_models(Some(false)).await;
+        let models = opencode_model_catalog_entries_from_ids(&list.models, &list.source);
+        let complete = list.error.is_none();
+        cloud_mcp_agent_models_result_payload(
+            &request,
+            "opencode",
+            models,
+            complete,
+            list.harness_version.clone().or_else(opencode_current_harness_version),
+            list.error.clone(),
+        )
+    };
+    if let Err(error) = cloud_mcp_send_agent_models_result(&state, &request, payload).await {
+        log_terminal_status_event(
+            "backend.cloud_mcp.agent_models_result.send_failed",
+            json!({ "error": clean_terminal_telemetry_text(&error) }),
+        );
+    }
+}
+
 async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
     let Ok(message) = serde_json::from_str::<Value>(text) else {
         return;
@@ -18181,6 +18346,13 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
     }
     let direct_request_kind =
         cloud_mcp_payload_text(&message, &["request_kind"]).unwrap_or_default();
+    if cloud_mcp_is_list_agent_models_request(&message, &direct_kind, &direct_request_kind) {
+        let state = state.clone();
+        tauri::async_runtime::spawn(async move {
+            cloud_mcp_handle_list_agent_models_request(state, message).await;
+        });
+        return;
+    }
     if cloud_mcp_value_is_account_usage(&message) {
         cloud_mcp_cache_account_usage_snapshot(state, &message).await;
         let _ = state.global_ws_events.send(message);
@@ -18950,6 +19122,18 @@ fn cloud_mcp_remote_command_field_text(event: &Value, keys: &[&str]) -> Option<S
         .or_else(|| {
             keys.iter()
                 .find_map(|key| cloud_mcp_payload_text(event, &["request", key]))
+        })
+        .or_else(|| {
+            keys.iter()
+                .find_map(|key| cloud_mcp_payload_text(event, &["event", key]))
+        })
+        .or_else(|| {
+            keys.iter()
+                .find_map(|key| cloud_mcp_payload_text(event, &["event", "payload", key]))
+        })
+        .or_else(|| {
+            keys.iter()
+                .find_map(|key| cloud_mcp_payload_text(event, &["event", "request", key]))
         })
 }
 
@@ -20361,6 +20545,785 @@ const CLOUD_MCP_AGENT_INVENTORY_WATCH_DEBOUNCE_MS: u64 = 10_000;
 static CLOUD_MCP_AGENT_INVENTORY_SIGNATURE: OnceLock<StdMutex<String>> = OnceLock::new();
 static CLOUD_MCP_AGENT_INVENTORY_WATCHER: OnceLock<StdMutex<Option<notify::RecommendedWatcher>>> =
     OnceLock::new();
+static CLOUD_MCP_AGENT_MODEL_CATALOGS: OnceLock<StdMutex<HashMap<String, AgentModelCatalog>>> =
+    OnceLock::new();
+
+fn cloud_mcp_agent_model_catalog_cache() -> &'static StdMutex<HashMap<String, AgentModelCatalog>> {
+    CLOUD_MCP_AGENT_MODEL_CATALOGS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn cloud_mcp_store_agent_model_catalog(catalog: AgentModelCatalog) {
+    if let Ok(mut cache) = cloud_mcp_agent_model_catalog_cache().lock() {
+        cache.insert(catalog.agent_kind.clone(), catalog);
+    }
+}
+
+fn cloud_mcp_latest_agent_model_catalog(agent_kind: &str) -> Option<AgentModelCatalog> {
+    cloud_mcp_agent_model_catalog_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(agent_kind).cloned())
+}
+
+fn cloud_mcp_latest_agent_model_catalog_value(agent_kind: &str) -> Option<Value> {
+    cloud_mcp_latest_agent_model_catalog(agent_kind)
+        .and_then(|catalog| serde_json::to_value(catalog).ok())
+}
+
+fn cloud_mcp_agent_model_catalog_contains_model(agent_kind: &str, model_id: &str) -> bool {
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return false;
+    }
+    cloud_mcp_latest_agent_model_catalog(agent_kind)
+        .map(|catalog| {
+            catalog
+                .models
+                .iter()
+                .any(|model| model.id.eq_ignore_ascii_case(model_id))
+        })
+        .unwrap_or_else(|| {
+            agent_model_baseline_catalog_entries(agent_kind)
+                .iter()
+                .any(|model| model.id.eq_ignore_ascii_case(model_id))
+        })
+}
+
+fn cloud_mcp_agent_model_catalog_entry_for_model(
+    agent_kind: &str,
+    model_id: &str,
+) -> Option<AgentModelCatalogEntry> {
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return None;
+    }
+    cloud_mcp_latest_agent_model_catalog(agent_kind)
+        .and_then(|catalog| {
+            catalog
+                .models
+                .into_iter()
+                .find(|model| model.id.eq_ignore_ascii_case(model_id))
+        })
+        .or_else(|| {
+            agent_model_baseline_catalog_entries(agent_kind)
+                .into_iter()
+                .find(|model| model.id.eq_ignore_ascii_case(model_id))
+        })
+}
+
+fn cloud_mcp_agent_model_catalog_models_for_capabilities(
+    agent_kind: &str,
+) -> Vec<AgentModelCatalogEntry> {
+    cloud_mcp_latest_agent_model_catalog(agent_kind)
+        .map(|catalog| catalog.models)
+        .filter(|models| !models.is_empty())
+        .unwrap_or_else(|| agent_model_baseline_catalog_entries(agent_kind))
+}
+
+fn cloud_mcp_agent_status_payload_has_model_catalogs(agent_statuses: &Value) -> bool {
+    agent_statuses
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .any(|item| item.get("model_catalog").is_some())
+        })
+        .unwrap_or(false)
+}
+
+fn cloud_mcp_enrich_agent_status_payload_with_cached_catalogs(agent_statuses: &mut Value) {
+    let Some(items) = agent_statuses.as_array_mut() else {
+        return;
+    };
+    for item in items {
+        let Some(raw_id) = cloud_mcp_payload_text(item, &["id", "agent_id"]) else {
+            continue;
+        };
+        let Some(agent_kind) = cloud_mcp_canonical_coding_agent_id(&raw_id) else {
+            continue;
+        };
+        if !matches!(agent_kind.as_str(), "codex" | "claude") {
+            continue;
+        }
+        let Some(catalog) = cloud_mcp_latest_agent_model_catalog_value(&agent_kind) else {
+            continue;
+        };
+        if let Some(object) = item.as_object_mut() {
+            object.insert("model_catalog".to_string(), catalog);
+        }
+    }
+}
+
+fn cloud_mcp_json_array_strings(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|item| clean_agent_model_catalog_text(item, 80))
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn cloud_mcp_codex_model_list_array(response: &Value) -> Option<&Vec<Value>> {
+    response
+        .get("result")
+        .and_then(|result| result.get("data"))
+        .and_then(Value::as_array)
+        .or_else(|| {
+            response
+                .get("result")
+                .and_then(|result| result.get("models"))
+                .and_then(Value::as_array)
+        })
+        .or_else(|| response.get("data").and_then(Value::as_array))
+        .or_else(|| response.get("models").and_then(Value::as_array))
+        .or_else(|| response.as_array())
+}
+
+fn cloud_mcp_codex_catalog_entries_from_model_list_response(
+    response: &Value,
+) -> Vec<AgentModelCatalogEntry> {
+    let Some(models) = cloud_mcp_codex_model_list_array(response) else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+    for model in models.iter().take(512) {
+        let id = cloud_mcp_payload_text(model, &["id"])
+            .or_else(|| cloud_mcp_payload_text(model, &["model"]))
+            .unwrap_or_default();
+        let id = clean_agent_model_catalog_text(&id, 180);
+        if id.is_empty() || !seen.insert(id.to_ascii_lowercase()) {
+            continue;
+        }
+        let display_name = cloud_mcp_payload_text(model, &["displayName"])
+            .or_else(|| cloud_mcp_payload_text(model, &["display_name"]))
+            .unwrap_or_else(|| agent_model_catalog_display_from_id(&id));
+        let description = cloud_mcp_payload_text(model, &["description"]);
+        let reasoning_efforts =
+            cloud_mcp_json_array_strings(model.get("supportedReasoningEfforts").or_else(|| {
+                model.get("supported_reasoning_efforts")
+            }));
+        let default_reasoning_effort =
+            cloud_mcp_payload_text(model, &["defaultReasoningEffort"])
+                .or_else(|| cloud_mcp_payload_text(model, &["default_reasoning_effort"]));
+        let input_modalities = cloud_mcp_json_array_strings(
+            model.get("inputModalities")
+                .or_else(|| model.get("input_modalities")),
+        );
+        let supports_images = input_modalities
+            .iter()
+            .any(|modality| modality.eq_ignore_ascii_case("image"));
+        let speed_modes = cloud_mcp_json_array_strings(
+            model.get("serviceTiers")
+                .or_else(|| model.get("service_tiers")),
+        );
+        entries.push(agent_model_catalog_entry(
+            "codex",
+            &id,
+            &display_name,
+            description.as_deref(),
+            "harness_api",
+            cloud_mcp_payload_bool(model, &["isDefault"], false)
+                || cloud_mcp_payload_bool(model, &["is_default"], false),
+            supports_images,
+            !reasoning_efforts.is_empty() || default_reasoning_effort.is_some(),
+            reasoning_efforts,
+            default_reasoning_effort.as_deref(),
+            if speed_modes.is_empty() {
+                None
+            } else {
+                Some(speed_modes.iter().map(String::as_str).collect())
+            },
+            None,
+            cloud_mcp_payload_bool(model, &["hidden"], false),
+            cloud_mcp_payload_bool(model, &["deprecated"], false),
+        ));
+    }
+    entries
+}
+
+fn cloud_mcp_jsonrpc_response_matches_id(value: &Value, id: i64) -> bool {
+    value
+        .get("id")
+        .and_then(Value::as_i64)
+        .is_some_and(|candidate| candidate == id)
+        || value
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|candidate| candidate.parse::<i64>().ok())
+            .is_some_and(|candidate| candidate == id)
+}
+
+fn cloud_mcp_try_parse_codex_jsonrpc_response(buffer: &str, id: i64) -> Option<Value> {
+    for line in buffer.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(line) {
+            if cloud_mcp_jsonrpc_response_matches_id(&value, id) {
+                return Some(value);
+            }
+        }
+    }
+    let trimmed = buffer.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<Value>(trimmed)
+        .ok()
+        .filter(|value| cloud_mcp_jsonrpc_response_matches_id(value, id))
+}
+
+fn cloud_mcp_spawn_codex_app_server_stdout_reader<R: Read + Send + 'static>(
+    mut pipe: R,
+    sender: std::sync::mpsc::Sender<String>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match pipe.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    let chunk = String::from_utf8_lossy(&buffer[..read]).to_string();
+                    if sender.send(chunk).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+fn cloud_mcp_run_codex_app_server_candidate(candidate: &str) -> Result<Value, String> {
+    let mut command = Command::new(candidate);
+    command.env("PATH", desktop_command_path());
+    command.arg("app-server");
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Unable to start {candidate} app-server: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| format!("{candidate} app-server stdin was unavailable."))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{candidate} app-server stdout was unavailable."))?;
+    let stderr_reader = child
+        .stderr
+        .take()
+        .map(|stderr| spawn_opencode_models_pipe_reader("stderr", stderr));
+    let (stdout_sender, stdout_receiver) = std::sync::mpsc::channel();
+    let stdout_reader = cloud_mcp_spawn_codex_app_server_stdout_reader(stdout, stdout_sender);
+    let request_id = 1_i64;
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "model/list",
+        "params": {},
+    });
+    stdin
+        .write_all(format!("{request}\n").as_bytes())
+        .map_err(|error| format!("Unable to write Codex model/list request: {error}"))?;
+    let _ = stdin.flush();
+    drop(stdin);
+
+    let started_at = Instant::now();
+    let mut stdout_buffer = String::new();
+    loop {
+        if app_shutdown_requested() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            if let Some(stderr_reader) = stderr_reader {
+                let _ = stderr_reader.join();
+            }
+            return Err(app_shutdown_blocked_message(candidate));
+        }
+        match stdout_receiver.recv_timeout(Duration::from_millis(80)) {
+            Ok(chunk) => {
+                stdout_buffer.push_str(&chunk);
+                if let Some(response) =
+                    cloud_mcp_try_parse_codex_jsonrpc_response(&stdout_buffer, request_id)
+                {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    if let Some(stderr_reader) = stderr_reader {
+                        let _ = stderr_reader.join();
+                    }
+                    return Ok(response);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break;
+            }
+        }
+        if started_at.elapsed() >= Duration::from_secs(10) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let stderr = stderr_reader
+                .and_then(|reader| reader.join().ok())
+                .and_then(Result::ok)
+                .unwrap_or_default();
+            return Err(if stderr.trim().is_empty() {
+                format!("{candidate} app-server model/list timed out.")
+            } else {
+                format!(
+                    "{candidate} app-server model/list timed out: {}",
+                    first_output_line(&stderr)
+                )
+            });
+        }
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = stdout_reader.join();
+    let stderr = stderr_reader
+        .and_then(|reader| reader.join().ok())
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    Err(if stderr.trim().is_empty() {
+        format!("{candidate} app-server ended without a model/list response.")
+    } else {
+        format!(
+            "{candidate} app-server ended without a model/list response: {}",
+            first_output_line(&stderr)
+        )
+    })
+}
+
+fn cloud_mcp_fetch_codex_model_list_response() -> Result<Value, String> {
+    let definition = agent_definition(AgentProvider::Codex);
+    let mut last_error = format!(
+        "{} is not installed or not available on PATH.",
+        definition.label
+    );
+    for candidate in agent_command_candidates(definition) {
+        match cloud_mcp_run_codex_app_server_candidate(&candidate) {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                last_error = error;
+            }
+        }
+    }
+    Err(last_error)
+}
+
+fn cloud_mcp_read_claude_state_file() -> Result<Option<Value>, String> {
+    let state_path = if let Some(config_dir) = env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from) {
+        Some(config_dir.join(".claude.json"))
+    } else {
+        cloud_mcp_home_dir().map(|home| home.join(".claude.json"))
+    };
+    let Some(state_path) = state_path else {
+        return Ok(None);
+    };
+    if !state_path.is_file() {
+        return Ok(None);
+    }
+    let body = fs::read_to_string(&state_path)
+        .map_err(|error| format!("Unable to read {}: {error}", state_path.display()))?;
+    let value = serde_json::from_str::<Value>(&body)
+        .map_err(|error| format!("Unable to parse {}: {error}", state_path.display()))?;
+    Ok(Some(value))
+}
+
+fn cloud_mcp_claude_cache_entry_from_option(
+    option: &Value,
+    object_key: Option<&str>,
+) -> Option<AgentModelCatalogEntry> {
+    let id = cloud_mcp_payload_text(option, &["value", "id", "model", "model_id"])
+        .or_else(|| object_key.map(str::to_string))
+        .map(|value| clean_agent_model_catalog_text(&value, 180))
+        .filter(|value| !value.is_empty())?;
+    let label = cloud_mcp_payload_text(option, &["label", "display_name", "displayName", "name"])
+        .unwrap_or_else(|| agent_model_catalog_display_from_id(&id));
+    let description = cloud_mcp_payload_text(option, &["description", "detail"]);
+    Some(agent_model_catalog_entry(
+        "claude",
+        &id,
+        &label,
+        description.as_deref(),
+        "harness_cache",
+        false,
+        true,
+        true,
+        AGENT_MODEL_CATALOG_CLAUDE_REASONING_EFFORTS
+            .iter()
+            .map(|effort| effort.to_string())
+            .collect(),
+        Some("default"),
+        None,
+        None,
+        false,
+        cloud_mcp_payload_bool(option, &["deprecated"], false),
+    ))
+}
+
+fn cloud_mcp_claude_cache_entries_from_value(value: &Value) -> Vec<AgentModelCatalogEntry> {
+    let Some(cache) = value.get("additionalModelOptionsCache") else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    match cache {
+        Value::Array(items) => {
+            for item in items {
+                if let Some(entry) = cloud_mcp_claude_cache_entry_from_option(item, None) {
+                    entries.push(entry);
+                }
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                match item {
+                    Value::Array(items) => {
+                        for nested in items {
+                            if let Some(entry) =
+                                cloud_mcp_claude_cache_entry_from_option(nested, None)
+                            {
+                                entries.push(entry);
+                            }
+                        }
+                    }
+                    Value::Object(_) => {
+                        if let Some(entry) =
+                            cloud_mcp_claude_cache_entry_from_option(item, Some(key))
+                        {
+                            entries.push(entry);
+                        }
+                    }
+                    Value::String(label) => {
+                        let entry = agent_model_catalog_entry(
+                            "claude",
+                            key,
+                            label,
+                            None,
+                            "harness_cache",
+                            false,
+                            true,
+                            true,
+                            AGENT_MODEL_CATALOG_CLAUDE_REASONING_EFFORTS
+                                .iter()
+                                .map(|effort| effort.to_string())
+                                .collect(),
+                            Some("default"),
+                            None,
+                            None,
+                            false,
+                            false,
+                        );
+                        entries.push(entry);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    entries
+}
+
+async fn cloud_mcp_discover_codex_model_catalog(
+    harness_version: &str,
+    installed: bool,
+) -> AgentModelCatalog {
+    if !installed {
+        return agent_model_catalog_fallback("codex", harness_version);
+    }
+    let harness_version = harness_version.to_string();
+    let result = tauri::async_runtime::spawn_blocking(cloud_mcp_fetch_codex_model_list_response)
+        .await
+        .unwrap_or_else(|error| Err(format!("Codex model/list worker failed: {error}")));
+    match result {
+        Ok(response) => {
+            let live_models =
+                cloud_mcp_codex_catalog_entries_from_model_list_response(&response);
+            if live_models.is_empty() {
+                agent_model_catalog_fallback("codex", &harness_version)
+            } else {
+                let models = agent_model_catalog_merge_live_with_baseline("codex", live_models);
+                agent_model_catalog("codex", &harness_version, "harness_api", true, models)
+            }
+        }
+        Err(error) => {
+            log_terminal_status_event(
+                "backend.cloud_mcp.agent_model_catalog.codex_probe_failed",
+                json!({ "error": clean_terminal_telemetry_text(&error) }),
+            );
+            agent_model_catalog_fallback("codex", &harness_version)
+        }
+    }
+}
+
+async fn cloud_mcp_discover_claude_model_catalog(harness_version: &str) -> AgentModelCatalog {
+    let harness_version = harness_version.to_string();
+    let result = tauri::async_runtime::spawn_blocking(cloud_mcp_read_claude_state_file)
+        .await
+        .unwrap_or_else(|error| Err(format!("Claude cache worker failed: {error}")));
+    match result {
+        Ok(Some(value)) => {
+            let live_models = cloud_mcp_claude_cache_entries_from_value(&value);
+            let source = if live_models.is_empty() {
+                "device_baseline"
+            } else {
+                "harness_cache"
+            };
+            let models = agent_model_catalog_merge_live_with_baseline("claude", live_models);
+            agent_model_catalog("claude", &harness_version, source, true, models)
+        }
+        Ok(None) => {
+            let models = agent_model_catalog_merge_live_with_baseline("claude", Vec::new());
+            agent_model_catalog("claude", &harness_version, "device_baseline", true, models)
+        }
+        Err(error) => {
+            log_terminal_status_event(
+                "backend.cloud_mcp.agent_model_catalog.claude_cache_failed",
+                json!({ "error": clean_terminal_telemetry_text(&error) }),
+            );
+            agent_model_catalog_fallback("claude", &harness_version)
+        }
+    }
+}
+
+async fn cloud_mcp_refresh_agent_model_catalogs_from_status_payload(
+    agent_statuses: &Value,
+    reason: &str,
+) {
+    let Some(items) = agent_statuses.as_array() else {
+        return;
+    };
+    for item in items {
+        let Some(raw_id) = cloud_mcp_payload_text(item, &["id", "agent_id"]) else {
+            continue;
+        };
+        let Some(agent_kind) = cloud_mcp_canonical_coding_agent_id(&raw_id) else {
+            continue;
+        };
+        let harness_version = cloud_mcp_payload_text(item, &["version"])
+            .unwrap_or_else(|| "unknown".to_string());
+        let installed = cloud_mcp_payload_bool(item, &["installed"], false);
+        match agent_kind.as_str() {
+            "codex" => {
+                let catalog =
+                    cloud_mcp_discover_codex_model_catalog(&harness_version, installed).await;
+                cloud_mcp_store_agent_model_catalog(catalog);
+            }
+            "claude" => {
+                let catalog = cloud_mcp_discover_claude_model_catalog(&harness_version).await;
+                cloud_mcp_store_agent_model_catalog(catalog);
+            }
+            "opencode" => {
+                if opencode_note_harness_version(&harness_version) {
+                    log_terminal_status_event(
+                        "backend.cloud_mcp.agent_model_catalog.opencode_version_invalidated",
+                        json!({
+                            "harness_version": harness_version,
+                            "reason": reason,
+                        }),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod cloud_mcp_agent_model_catalog_tests {
+    use super::*;
+
+    #[test]
+    fn codex_catalog_maps_model_list_with_novel_effort() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "data": [{
+                    "id": "gpt-5.6-sol",
+                    "displayName": "GPT-5.6 Sol",
+                    "description": "Novel Codex model",
+                    "hidden": false,
+                    "isDefault": true,
+                    "defaultReasoningEffort": "ultra",
+                    "supportedReasoningEfforts": ["low", "medium", "ultra"],
+                    "inputModalities": ["text", "image"],
+                    "serviceTiers": ["standard", "fast"]
+                }]
+            }
+        });
+
+        let entries = cloud_mcp_codex_catalog_entries_from_model_list_response(&response);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "gpt-5.6-sol");
+        assert_eq!(entries[0].display_name, "GPT-5.6 Sol");
+        assert!(entries[0].supports_images);
+        assert!(entries[0].supports_effort);
+        assert_eq!(
+            entries[0].reasoning_efforts,
+            vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "ultra".to_string()
+            ]
+        );
+        assert_eq!(
+            entries[0].default_reasoning_effort.as_deref(),
+            Some("ultra")
+        );
+    }
+
+    #[test]
+    fn opencode_agent_models_result_maps_provider_scoped_catalog() {
+        let request = json!({
+            "id": "models-request-1",
+            "kind": "list_agent_models",
+            "target_device_id": "desktop-primary",
+            "target_terminal_id": "term-1",
+            "agent_kind": "opencode",
+            "workspace_id": "workspace-1"
+        });
+        let models = opencode_model_catalog_entries_from_ids(
+            &[
+                "openai/gpt-5.5".to_string(),
+                "anthropic/claude-sonnet-4-5".to_string(),
+            ],
+            "cli",
+        );
+        let payload = cloud_mcp_agent_models_result_payload(
+            &request,
+            "opencode",
+            models,
+            true,
+            Some("opencode 1.2.3".to_string()),
+            None,
+        );
+
+        assert_eq!(payload["kind"], json!("agent_models_result"));
+        assert_eq!(payload["request_id"], json!("models-request-1"));
+        assert_eq!(payload["agent_kind"], json!("opencode"));
+        assert_eq!(payload["complete"], json!(true));
+        assert_eq!(payload["harness_version"], json!("opencode 1.2.3"));
+        assert_eq!(payload["models"][0]["id"], json!("openai/gpt-5.5"));
+        assert_eq!(payload["models"][0]["provider"], json!("openai"));
+        assert_eq!(payload["models"][0]["source"], json!("harness_api"));
+    }
+
+    #[test]
+    fn list_agent_models_detector_accepts_cloud_event_wrapped_event_kind() {
+        let message = json!({
+            "kind": "cloud_event",
+            "event": {
+                "kind": "list_agent_models",
+                "request_id": "models-request-2",
+                "target_terminal_id": "term-2",
+                "agent_kind": "opencode",
+                "workspace_id": "workspace-2"
+            }
+        });
+
+        assert!(cloud_mcp_is_list_agent_models_request(
+            &message,
+            "cloud_event",
+            ""
+        ));
+        assert_eq!(
+            cloud_mcp_list_agent_models_request_id(&message),
+            "models-request-2"
+        );
+        assert_eq!(
+            cloud_mcp_remote_command_field_text(&message, &["agent_kind"]).as_deref(),
+            Some("opencode")
+        );
+        assert_eq!(
+            cloud_mcp_remote_command_field_text(&message, &["target_terminal_id"]).as_deref(),
+            Some("term-2")
+        );
+    }
+
+    #[test]
+    fn list_agent_models_detector_accepts_cloud_event_wrapped_command_kind() {
+        let message = json!({
+            "kind": "cloud_event",
+            "event": {
+                "command_kind": "list_agent_models",
+                "request_id": "models-request-3",
+                "agent_kind": "opencode"
+            }
+        });
+
+        assert!(cloud_mcp_is_list_agent_models_request(
+            &message,
+            "cloud_event",
+            ""
+        ));
+    }
+
+    #[test]
+    fn agent_models_result_envelope_uses_first_class_app_ws_kind() {
+        let request = json!({
+            "kind": "cloud_event",
+            "event": {
+                "kind": "list_agent_models",
+                "request_id": "models-request-4",
+                "agent_kind": "opencode",
+                "workspace_id": "workspace-4"
+            }
+        });
+        let payload = cloud_mcp_agent_models_result_payload(
+            &request,
+            "opencode",
+            Vec::new(),
+            true,
+            Some("opencode 1.2.3".to_string()),
+            None,
+        );
+        let envelope =
+            cloud_mcp_agent_models_result_envelope(&request, &payload, json!({"token": "test"}));
+
+        assert_eq!(envelope["kind"], json!("agent_models_result"));
+        assert_eq!(envelope["event_kind"], json!("agent_models_result"));
+        assert_eq!(envelope["request_id"], json!("models-request-4"));
+        assert_eq!(envelope["payload"]["kind"], json!("agent_models_result"));
+        assert_eq!(
+            envelope["payload"]["request_id"],
+            json!("models-request-4")
+        );
+        assert_eq!(
+            envelope["request"]["event_kind"],
+            json!("agent_models_result")
+        );
+        assert_eq!(
+            envelope["request"]["payload"]["kind"],
+            json!("agent_models_result")
+        );
+    }
+}
 
 fn cloud_mcp_agent_inventory_watcher_slot() -> &'static StdMutex<Option<notify::RecommendedWatcher>>
 {
@@ -20575,7 +21538,9 @@ pub(crate) async fn cloud_mcp_agent_inventory_probe_and_sync(
     let Ok(statuses) = agent_statuses().await else {
         return;
     };
-    let payload = serde_json::to_value(&statuses).unwrap_or_else(|_| json!([]));
+    let mut payload = serde_json::to_value(&statuses).unwrap_or_else(|_| json!([]));
+    cloud_mcp_refresh_agent_model_catalogs_from_status_payload(&payload, reason).await;
+    cloud_mcp_enrich_agent_status_payload_with_cached_catalogs(&mut payload);
     let signature = format!("{:x}", Sha256::digest(payload.to_string().as_bytes()));
     {
         let lock = CLOUD_MCP_AGENT_INVENTORY_SIGNATURE.get_or_init(|| StdMutex::new(String::new()));
@@ -23371,6 +24336,9 @@ async fn cloud_mcp_record_agent_chat_model_config(
             "Agent chat model config record requires model_id or reasoning_effort.".to_string(),
         );
     }
+    let catalog_match = model_id
+        .as_deref()
+        .map(|model| cloud_mcp_agent_model_catalog_contains_model(&provider, model));
 
     let now = timestamp
         .as_deref()
@@ -23424,12 +24392,14 @@ async fn cloud_mcp_record_agent_chat_model_config(
         "messages": [],
         "model_id": model_id.clone(),
         "reasoning_effort": reasoning_effort.clone(),
+        "catalog_match": catalog_match,
         "origin": origin.as_str(),
         "command_id": command_id.as_str(),
         "turn_id": turn_id.clone(),
         "raw": {
             "model_id": model_id.clone(),
             "reasoning_effort": reasoning_effort.clone(),
+            "catalog_match": catalog_match,
             "origin": origin.as_str(),
             "command_id": command_id.as_str(),
             "turn_id": turn_id.clone(),
@@ -23438,6 +24408,7 @@ async fn cloud_mcp_record_agent_chat_model_config(
     let model_config = json!({
         "model_id": model_id.clone(),
         "reasoning_effort": reasoning_effort.clone(),
+        "catalog_match": catalog_match,
     });
     let payload_hash_seed = json!({
         "record": record.clone(),
@@ -23523,6 +24494,7 @@ async fn cloud_mcp_record_agent_chat_model_config(
         "outbox_id": queued.outbox_id,
         "event_kind": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT,
         "payload_hash": payload_hash,
+        "catalog_match": catalog_match,
     }))
 }
 
@@ -25771,6 +26743,8 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
     let mut has_workspace_state = false;
     let mut cli_states = Value::Null;
     let mut has_cli_state = false;
+    let mut coding_agents = Vec::new();
+    let mut has_agent_installations = false;
     let mut terminal_orchestrators = Vec::new();
     let mut has_terminal_orchestrator_state = false;
 
@@ -25807,6 +26781,15 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
             {
                 cli_states = clis.clone();
                 has_cli_state = true;
+            }
+        }
+        if let Some(snapshot) = snapshots.agent_installations.as_ref() {
+            if let Some(agents) = snapshot
+                .get("coding_agents")
+                .and_then(Value::as_array)
+            {
+                coding_agents = agents.clone();
+                has_agent_installations = true;
             }
         }
         if let Some(orchestrator_source) = snapshots
@@ -25922,6 +26905,10 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
         }
         if has_cli_state {
             object.insert("cli_states".to_string(), cli_states);
+        }
+        if has_agent_installations {
+            object.insert("agent_count".to_string(), json!(coding_agents.len()));
+            object.insert("coding_agents".to_string(), Value::Array(coding_agents));
         }
         if has_terminal_orchestrator_state {
             object.insert(
@@ -33217,7 +34204,7 @@ pub(crate) async fn cloud_mcp_sync_agent_installations_internal(
     _repo_path: String,
     workspace_id: Option<String>,
     workspace_name: Option<String>,
-    agent_statuses: Value,
+    mut agent_statuses: Value,
     reason: Option<String>,
 ) -> Result<Value, String> {
     let clean_option = |value: Option<String>| {
@@ -33228,6 +34215,10 @@ pub(crate) async fn cloud_mcp_sync_agent_installations_internal(
     let workspace_id = clean_option(workspace_id);
     let workspace_name = clean_option(workspace_name);
     let reason = clean_option(reason).unwrap_or_else(|| "agent_status_refresh".to_string());
+    if !cloud_mcp_agent_status_payload_has_model_catalogs(&agent_statuses) {
+        cloud_mcp_refresh_agent_model_catalogs_from_status_payload(&agent_statuses, &reason).await;
+    }
+    cloud_mcp_enrich_agent_status_payload_with_cached_catalogs(&mut agent_statuses);
     let snapshot_id = format!(
         "agent-installations-{}-{}",
         cloud_mcp_now_ms(),
@@ -33403,7 +34394,7 @@ fn cloud_mcp_sanitize_coding_agent_status(agent: &Value) -> Option<Value> {
                 "missing".to_string()
             }
         });
-    Some(json!({
+    let mut sanitized = json!({
         "id": id.clone(),
         "label": if label.is_empty() { cloud_mcp_coding_agent_label(&id) } else { label.as_str() },
         "installed": installed,
@@ -33420,7 +34411,17 @@ fn cloud_mcp_sanitize_coding_agent_status(agent: &Value) -> Option<Value> {
         "installing": installing,
         "updating": updating,
         "operation": operation,
-        "package_status": package_status}))
+        "package_status": package_status});
+    if matches!(id.as_str(), "codex" | "claude") {
+        if let Some(catalog) = agent
+            .get("model_catalog")
+            .cloned()
+            .or_else(|| cloud_mcp_latest_agent_model_catalog_value(&id))
+        {
+            sanitized["model_catalog"] = catalog;
+        }
+    }
+    Some(sanitized)
 }
 
 fn cloud_mcp_canonical_coding_agent_id(value: &str) -> Option<String> {

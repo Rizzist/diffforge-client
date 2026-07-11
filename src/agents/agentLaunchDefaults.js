@@ -52,6 +52,17 @@ const AGENT_LAUNCH_SPEED_OPTIONS = Object.freeze({
   fast: Object.freeze({ label: "Fast", value: "fast" }),
 });
 
+function agentLaunchEffortLabel(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  if (text.toLowerCase() === "xhigh") return "XHigh";
+  return text
+    .split(/[-_\s]+/g)
+    .filter(Boolean)
+    .map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`)
+    .join(" ");
+}
+
 export function normalizeAgentLaunchAgentId(value) {
   const normalized = String(value || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
   if (normalized === "codex" || normalized === "openai-codex") {
@@ -80,22 +91,102 @@ export function cleanAgentLaunchModelId(value, fallback = "") {
   return isValidAgentLaunchModelId(model) ? model : String(fallback || "").trim();
 }
 
-export function getAgentLaunchModelOptions(agentId) {
-  return AGENT_LAUNCH_MODEL_OPTIONS[normalizeAgentLaunchAgentId(agentId)] || [];
+export function getAgentLaunchModelOptions(agentId, modelCatalog = null) {
+  return getMergedAgentLaunchModelOptions(agentId, modelCatalog);
 }
 
-export function getAgentLaunchModelOption(agentId, model) {
+function normalizeAgentLaunchCatalogModelOption(agentId, entry) {
+  if (!entry || typeof entry !== "object") return null;
+  const normalizedAgentId = normalizeAgentLaunchAgentId(agentId);
+  const entryAgentId = normalizeAgentLaunchAgentId(entry.agent_kind || entry.agentKind || normalizedAgentId);
+  if (!normalizedAgentId || entryAgentId !== normalizedAgentId) return null;
+  if (entry.hidden || entry.deprecated) return null;
+  const value = cleanAgentLaunchModelId(entry.id ?? entry.model_id ?? entry.value ?? "");
+  if (!value) return null;
+  const label = String(entry.display_name || entry.displayName || entry.label || value).trim() || value;
+  const detail = String(entry.description || entry.detail || "").trim();
+  const speedModes = Array.isArray(entry.speed_modes)
+    ? entry.speed_modes.map((mode) => String(mode || "").trim()).filter(Boolean)
+    : Array.isArray(entry.speedModes)
+      ? entry.speedModes.map((mode) => String(mode || "").trim()).filter(Boolean)
+      : null;
+  return {
+    ...(detail ? { detail } : {}),
+    ...(speedModes?.length ? { speed_modes: speedModes } : {}),
+    label,
+    source: entry.source || "harness_api",
+    value,
+  };
+}
+
+export function getMergedAgentLaunchModelOptions(agentId, modelCatalog = null) {
+  const normalizedAgentId = normalizeAgentLaunchAgentId(agentId);
+  const baseline = AGENT_LAUNCH_MODEL_OPTIONS[normalizedAgentId] || [];
+  const catalogModels = Array.isArray(modelCatalog?.models) ? modelCatalog.models : [];
+  const seen = new Set();
+  const merged = [];
+  catalogModels
+    .map((entry) => normalizeAgentLaunchCatalogModelOption(normalizedAgentId, entry))
+    .filter(Boolean)
+    .forEach((option) => {
+      if (seen.has(option.value)) return;
+      seen.add(option.value);
+      merged.push(option);
+    });
+  baseline.forEach((option) => {
+    if (!option?.value || seen.has(option.value)) return;
+    seen.add(option.value);
+    merged.push(option);
+  });
+  return merged;
+}
+
+export function getAgentLaunchModelOption(agentId, model, modelCatalog = null) {
   const safeModel = String(model || "").trim();
   if (!safeModel) {
     return null;
   }
-  return getAgentLaunchModelOptions(agentId).find((option) => option.value === safeModel) || null;
+  return getMergedAgentLaunchModelOptions(agentId, modelCatalog).find((option) => option.value === safeModel) || null;
 }
 
-export function agentLaunchModelSupportsFast(agentId, model) {
+export function getAgentLaunchCatalogModelEntry(agentId, model, modelCatalog = null) {
+  const normalizedAgentId = normalizeAgentLaunchAgentId(agentId);
+  const safeModel = String(model || "").trim();
+  if (!normalizedAgentId || !safeModel) return null;
+  const catalogModels = Array.isArray(modelCatalog?.models) ? modelCatalog.models : [];
+  return catalogModels.find((entry) => {
+    if (!entry || typeof entry !== "object" || entry.hidden || entry.deprecated) return false;
+    const entryAgentId = normalizeAgentLaunchAgentId(entry.agent_kind || entry.agentKind || normalizedAgentId);
+    const entryModel = String(entry.id ?? entry.model_id ?? entry.value ?? "").trim();
+    return entryAgentId === normalizedAgentId && entryModel === safeModel;
+  }) || null;
+}
+
+export function getAgentLaunchCatalogReasoningEfforts(agentId, model, modelCatalog = null) {
+  const entry = getAgentLaunchCatalogModelEntry(agentId, model, modelCatalog);
+  const rawEfforts = Array.isArray(entry?.reasoning_efforts)
+    ? entry.reasoning_efforts
+    : Array.isArray(entry?.reasoningEfforts)
+      ? entry.reasoningEfforts
+      : Array.isArray(entry?.reasoning_options)
+        ? entry.reasoning_options
+        : Array.isArray(entry?.reasoningOptions)
+          ? entry.reasoningOptions
+          : [];
+  const seen = new Set();
+  return rawEfforts
+    .map((effort) => String(effort || "").trim().toLowerCase())
+    .filter((effort) => {
+      if (!effort || seen.has(effort)) return false;
+      seen.add(effort);
+      return true;
+    });
+}
+
+export function agentLaunchModelSupportsFast(agentId, model, modelCatalog = null) {
   const normalizedAgentId = normalizeAgentLaunchAgentId(agentId);
   const normalizedModel = String(model || "").trim().toLowerCase();
-  const option = getAgentLaunchModelOption(normalizedAgentId, model);
+  const option = getAgentLaunchModelOption(normalizedAgentId, model, modelCatalog);
 
   if (Array.isArray(option?.speed_modes) && option.speed_modes.includes("fast")) {
     return true;
@@ -109,22 +200,29 @@ export function agentLaunchModelSupportsFast(agentId, model) {
   return false;
 }
 
-export function getAgentLaunchEffortOptions(agentId, _model = "") {
+export function getAgentLaunchEffortOptions(agentId, model = "", modelCatalog = null) {
+  const catalogEfforts = getAgentLaunchCatalogReasoningEfforts(agentId, model, modelCatalog);
+  if (catalogEfforts.length) {
+    return catalogEfforts.map((effort) => ({
+      label: agentLaunchEffortLabel(effort),
+      value: effort,
+    }));
+  }
   return AGENT_LAUNCH_EFFORT_OPTIONS[normalizeAgentLaunchAgentId(agentId)] || [];
 }
 
-export function getAgentLaunchSpeedOptions(agentId, model = "") {
+export function getAgentLaunchSpeedOptions(agentId, model = "", modelCatalog = null) {
   const options = [AGENT_LAUNCH_SPEED_OPTIONS.standard];
-  if (agentLaunchModelSupportsFast(agentId, model)) {
+  if (agentLaunchModelSupportsFast(agentId, model, modelCatalog)) {
     options.push(AGENT_LAUNCH_SPEED_OPTIONS.fast);
   }
   return options;
 }
 
-export function normalizeAgentLaunchEffort(agentId, model, effort) {
+export function normalizeAgentLaunchEffort(agentId, model, effort, modelCatalog = null) {
   const normalizedAgentId = normalizeAgentLaunchAgentId(agentId);
   const safeEffort = String(effort || "").trim().toLowerCase();
-  const options = getAgentLaunchEffortOptions(normalizedAgentId, model).map((option) => option.value);
+  const options = getAgentLaunchEffortOptions(normalizedAgentId, model, modelCatalog).map((option) => option.value);
 
   if (safeEffort && options.includes(safeEffort)) {
     return safeEffort;
@@ -133,9 +231,9 @@ export function normalizeAgentLaunchEffort(agentId, model, effort) {
   return BUILTIN_AGENT_LAUNCH_DEFAULTS[normalizedAgentId]?.effort || "default";
 }
 
-export function normalizeAgentLaunchSpeed(agentId, model, speed) {
+export function normalizeAgentLaunchSpeed(agentId, model, speed, modelCatalog = null) {
   const safeSpeed = String(speed || "").trim().toLowerCase();
-  if (safeSpeed === "fast" && agentLaunchModelSupportsFast(agentId, model)) {
+  if (safeSpeed === "fast" && agentLaunchModelSupportsFast(agentId, model, modelCatalog)) {
     return "fast";
   }
   return "standard";
