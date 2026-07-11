@@ -56,26 +56,17 @@ function documentHasHtmlSignal(value = {}) {
     .replace(/^\./u, "")
     .toLowerCase();
   if (extension === "html" || extension === "htm") return true;
-  const mimeType = text(value?.mimeType || value?.mime_type).toLowerCase();
+  const mimeType = text(value?.mime_type).toLowerCase();
   if (mimeType.startsWith("text/html") || mimeType === "application/xhtml+xml") return true;
   const path = normalizedDocumentPath(
-    value?.filePath
-      || value?.file_path
-      || value?.pathKey
-      || value?.path_key
-      || value?.fileName
-      || value?.file_name
-      || value?.localPath
-      || value?.local_path
-      || value?.draftPath
-      || value?.draft_path,
+    value?.file_path || value?.path_key || value?.file_name || value?.local_path || value?.draft_path,
   ).toLowerCase();
   return path.endsWith(".html") || path.endsWith(".htm");
 }
 
 function documentKindFromParts(value = {}, collection = "documents") {
   const documentKind = normalizedDocumentKind(
-    value?.documentKind || value?.document_kind || value?.source || value?.kind || value?.type,
+    value?.document_kind || value?.source || value?.kind || value?.type,
     collection,
   );
   if (documentKind === "document" && documentHasHtmlSignal(value)) return "html";
@@ -91,10 +82,10 @@ export function normalizedDocumentId(value) {
 }
 
 function documentRowType(row) {
-  const entryKind = text(row?.entry_kind || row?.entryKind).toLowerCase();
+  const entryKind = text(row?.entry_kind).toLowerCase();
   if (entryKind === "folder" || entryKind === "document") return entryKind;
   const kind = text(row?.kind).toLowerCase();
-  const rowType = text(row?.row_type || row?.rowType || row?.type).toLowerCase();
+  const rowType = text(row?.row_type || row?.type).toLowerCase();
   return rowType === "folder" || kind === "account_document_folder" ? "folder" : "document";
 }
 
@@ -138,12 +129,7 @@ function documentFilePathFromParts(row, extension = "md") {
 export function accountDocumentStorageKey(document) {
   const rowType = documentRowType(document);
   const pathKey = normalizedDocumentPath(
-    document?.pathKey
-      || document?.path_key
-      || document?.filePath
-      || document?.file_path
-      || document?.documentKey
-      || document?.storageKey,
+    document?.path_key || document?.file_path || document?.document_key || document?.storage_key,
   );
   if (pathKey) return rowType === "folder" ? `folder:${pathKey}` : pathKey;
   const id = normalizedDocumentId(document?.doc_id || document?.document_id || document?.id);
@@ -152,15 +138,7 @@ export function accountDocumentStorageKey(document) {
 
 function accountDocumentVisiblePath(document) {
   return normalizedDocumentPath(
-    document?.pathKey
-      || document?.path_key
-      || document?.filePath
-      || document?.file_path
-      || document?.folderPath
-      || document?.folder_path
-      || document?.id
-      || document?.doc_id
-      || document?.document_id,
+    document?.path_key || document?.file_path || document?.folder_path || document?.id || document?.doc_id || document?.document_id,
   );
 }
 
@@ -236,43 +214,43 @@ export function skillFromUnit(unit) {
     || unit?.has_content_payload === true
     || (!hasContentFlag && hasContentPayload);
 	  return {
-	    assetId: text(unit?.asset_id),
-	    blobId: text(unit?.blob_id),
-	    baseContentHash: text(unit?.base_content_hash),
-	    canonicalLocalPath: text(unit?.canonical_local_path),
+	    asset_id: text(unit?.asset_id),
+	    blob_id: text(unit?.blob_id),
+	    base_content_hash: text(unit?.base_content_hash),
+	    canonical_local_path: text(unit?.canonical_local_path),
 	    content: rowType === "folder" ? "" : String(unit?.content_md ?? unit?.content ?? unit?.body ?? ""),
-	    contentHash: text(unit?.content_hash || unit?.hash || unit?.sha256),
+	    content_hash: text(unit?.content_hash || unit?.hash || unit?.sha256),
 	    collection,
-	    documentKind,
+	    document_kind: documentKind,
 	    draft: unit?.draft === true || unit?.is_draft === true || text(unit?.sync_status) === "draft",
-	    draftId: text(unit?.draft_id),
-	    draftPath: text(unit?.draft_path),
+	    draft_id: text(unit?.draft_id),
+	    draft_path: text(unit?.draft_path),
 	    extension,
-    fileName,
-    filePath,
-    folderId: text(unit?.folder_id, rowType === "folder" ? id : parentPathKey),
-    folderPath: rowType === "folder" ? pathKey : folderPath || parentPathKey,
-    hasContent: rowType === "folder" ? false : hasContent,
-    hasContentPayload: rowType === "folder" ? false : hasContentPayload,
+    file_name: fileName,
+    file_path: filePath,
+    folder_id: text(unit?.folder_id, rowType === "folder" ? id : parentPathKey),
+    folder_path: rowType === "folder" ? pathKey : folderPath || parentPathKey,
+    has_content: rowType === "folder" ? false : hasContent,
+    has_content_payload: rowType === "folder" ? false : hasContentPayload,
 	    icon: text(unit?.icon),
 	    id,
 	    isDraft: unit?.draft === true || unit?.is_draft === true || text(unit?.sync_status) === "draft",
-	    localPath: text(unit?.local_path),
-    mimeType: text(unit?.mime_type),
-    localSavedAt: text(unit?.local_saved_at),
-    parentPathKey,
-    pathKey,
-    pendingPush: unit?.pending_push === true,
-    rowType,
+	    local_path: text(unit?.local_path),
+    mime_type: text(unit?.mime_type),
+    local_saved_at: text(unit?.local_saved_at),
+    parent_path_key: parentPathKey,
+    path_key: pathKey,
+    pending_push: unit?.pending_push === true,
+    row_type: rowType,
     sha256: text(unit?.sha256),
-    sizeBytes: Number.isFinite(Number(unit?.size_bytes))
+    size_bytes: Number.isFinite(Number(unit?.size_bytes))
       ? Number(unit?.size_bytes)
       : 0,
 	    source: text(unit?.source, documentKind),
-	    syncStatus: text(unit?.sync_status),
+	    sync_status: text(unit?.sync_status),
     title: text(unit?.title || unit?.name || unit?.label, rowType === "folder" ? fileName : id),
     tone: text(unit?.tone),
-    updatedAt: text(unit?.updated_at),
+    updated_at: text(unit?.updated_at),
   };
 }
 
@@ -312,16 +290,16 @@ export function mergeSkillUnits(currentSkills, units) {
       }
     } else {
       const existing = byId.get(key) || {};
-      const hasContentPayload = skill.hasContentPayload === true;
-      const incomingHash = text(skill.contentHash || skill.sha256);
-      const existingHash = text(existing.contentHash || existing.sha256);
-      const incomingStatus = text(skill.syncStatus);
-      const incomingPending = skill.pendingPush === true
+      const hasContentPayload = skill.has_content_payload === true;
+      const incomingHash = text(skill.content_hash || skill.sha256);
+      const existingHash = text(existing.content_hash || existing.sha256);
+      const incomingStatus = text(skill.sync_status);
+      const incomingPending = skill.pending_push === true
         || ["local_pending", "sync_failed", "upload_failed"].includes(incomingStatus);
       const incomingSynced = incomingStatus === "synced";
-      const pendingPush = incomingPending || (existing.pendingPush === true && !incomingSynced);
+      const pendingPush = incomingPending || (existing.pending_push === true && !incomingSynced);
       const preserveExistingPayload = !hasContentPayload
-        && existing.hasContentPayload === true
+        && existing.has_content_payload === true
         && (!incomingHash || !existingHash || incomingHash === existingHash);
       const contentStale = !hasContentPayload
         && !preserveExistingPayload
@@ -333,17 +311,17 @@ export function mergeSkillUnits(currentSkills, units) {
         ...existing,
         ...skill,
         content: hasContentPayload ? skill.content : existing.content || "",
-        contentStale: hasContentPayload || preserveExistingPayload
+        content_stale: hasContentPayload || preserveExistingPayload
           ? false
-          : Boolean(existing.contentStale || contentStale),
-        hasContent: hasContentPayload || preserveExistingPayload
+          : Boolean(existing.content_stale || contentStale),
+        has_content: hasContentPayload || preserveExistingPayload
           ? true
-          : skill.hasContent,
-        hasContentPayload: hasContentPayload || preserveExistingPayload,
-        localSavedAt: pendingPush ? text(skill.localSavedAt, existing.localSavedAt) : text(skill.localSavedAt),
-        pendingPush,
-        syncStatus: pendingPush && !incomingStatus
-          ? text(existing.syncStatus, "local_pending")
+          : skill.has_content,
+        has_content_payload: hasContentPayload || preserveExistingPayload,
+        local_saved_at: pendingPush ? text(skill.local_saved_at, existing.local_saved_at) : text(skill.local_saved_at),
+        pending_push: pendingPush,
+        sync_status: pendingPush && !incomingStatus
+          ? text(existing.sync_status, "local_pending")
           : incomingStatus,
       });
     }
@@ -355,32 +333,32 @@ export function skillsToSkillUnits(skills) {
   return (Array.isArray(skills) ? skills : [])
     .filter((skill) => documentRowType(skill) !== "folder")
     .map((skill) => ({
-      asset_id: text(skill?.assetId),
-      blob_id: text(skill?.blobId),
+      asset_id: text(skill?.asset_id),
+      blob_id: text(skill?.blob_id),
       collection: normalizedDocumentCollection(),
       content: String(skill?.content || "").trim(),
       content_md: String(skill?.content || "").trim(),
-      doc_id: normalizedDocumentId(skill?.id || skill?.pathKey || skill?.filePath),
-      document_id: normalizedDocumentId(skill?.id || skill?.pathKey || skill?.filePath),
+      doc_id: normalizedDocumentId(skill?.id || skill?.path_key || skill?.file_path),
+      document_id: normalizedDocumentId(skill?.id || skill?.path_key || skill?.file_path),
       document_kind: documentKindFromParts(skill, skill?.collection || skill?.source),
       entry_kind: "document",
-      file_name: text(skill?.fileName || skill?.file_name),
-      file_path: normalizedDocumentPath(skill?.filePath || skill?.file_path || skill?.pathKey || skill?.path_key),
-      folder_id: normalizedDocumentPath(skill?.folderId || skill?.folder_id || skill?.folderPath || skill?.folder_path),
-      folder_path: normalizedDocumentPath(skill?.folderPath || skill?.folder_path),
+      file_name: text(skill?.file_name),
+      file_path: normalizedDocumentPath(skill?.file_path || skill?.path_key),
+      folder_id: normalizedDocumentPath(skill?.folder_id || skill?.folder_path),
+      folder_path: normalizedDocumentPath(skill?.folder_path),
       icon: text(skill?.icon),
-      id: normalizedDocumentId(skill?.id || skill?.pathKey || skill?.filePath),
-      local_path: text(skill?.localPath),
-      mime_type: text(skill?.mimeType),
-      parent_folder_id: normalizedDocumentPath(skill?.folderId || skill?.folder_id || skill?.folderPath || skill?.folder_path),
-      parent_path_key: normalizedDocumentPath(skill?.parentPathKey || skill?.parent_path_key),
-      path_key: normalizedDocumentPath(skill?.pathKey || skill?.path_key || skill?.filePath || skill?.file_path),
+      id: normalizedDocumentId(skill?.id || skill?.path_key || skill?.file_path),
+      local_path: text(skill?.local_path),
+      mime_type: text(skill?.mime_type),
+      parent_folder_id: normalizedDocumentPath(skill?.folder_id || skill?.folder_path),
+      parent_path_key: normalizedDocumentPath(skill?.parent_path_key),
+      path_key: normalizedDocumentPath(skill?.path_key || skill?.file_path),
       sha256: text(skill?.sha256),
-      size_bytes: Number.isFinite(Number(skill?.sizeBytes)) ? Number(skill.sizeBytes) : 0,
+      size_bytes: Number.isFinite(Number(skill?.size_bytes)) ? Number(skill.size_bytes) : 0,
       source: text(skill?.source, "custom"),
       title: text(skill?.title, "Untitled skill"),
       tone: text(skill?.tone),
-      updated_at: text(skill?.updatedAt),
+      updated_at: text(skill?.updated_at),
     }))
     .filter((skill) => skill.id && skill.title);
 }
@@ -416,23 +394,22 @@ export function accountDocumentUnitFromRow(row, removed = false) {
     ...row,
     collection,
     content: rowType === "folder" ? "" : hasContentPayload ? String(row.content_md ?? row.content ?? row.body ?? "") : "",
-    contentMd: String(row.content_md ?? row.content ?? row.body ?? ""),
+    content_md: String(row.content_md ?? row.content ?? row.body ?? ""),
     current: removed ? false : row.current,
     deleted: removed || row.deleted === true || row.tombstoned === true,
-    documentId: id,
-    documentKind,
+    document_id: id,
+    document_kind: documentKind,
     extension,
-    fileName,
-    filePath,
-    folderId: text(row.folder_id, rowType === "folder" ? id : parentPathKey),
-    folderPath: rowType === "folder" ? pathKey : normalizedDocumentPath(row.folder_path || parentPathKey),
+    file_name: fileName,
+    file_path: filePath,
+    folder_id: text(row.folder_id, rowType === "folder" ? id : parentPathKey),
+    folder_path: rowType === "folder" ? pathKey : normalizedDocumentPath(row.folder_path || parentPathKey),
+    has_content: rowType === "folder" ? false : hasContent,
     has_content_payload: rowType === "folder" ? false : hasContentPayload,
-    hasContent: rowType === "folder" ? false : hasContent,
-    hasContentPayload: rowType === "folder" ? false : hasContentPayload,
     id,
-    parentPathKey,
-    pathKey,
-    rowType,
+    parent_path_key: parentPathKey,
+    path_key: pathKey,
+    row_type: rowType,
     source: text(row.source, documentKind),
     title: text(row.title || row.name || row.label, rowType === "folder" ? fileName : id),
   };
@@ -595,8 +572,7 @@ export function accountDocumentUnitsFromPayload(payload) {
     pushOps(candidate.removed);
   });
   const byKey = new Map();
-  const unitHasContentPayload = (unit) => unit?.hasContentPayload === true
-    || unit?.has_content_payload === true;
+  const unitHasContentPayload = (unit) => unit?.has_content_payload === true;
   const mergeDocumentUnit = (existing, incoming) => {
     if (!existing) return incoming;
     if (incoming?.deleted === true || incoming?.current === false || incoming?.tombstoned === true) {
@@ -616,10 +592,8 @@ export function accountDocumentUnitsFromPayload(payload) {
       body: existing.body,
       content: existing.content,
       content_md: existing.content_md,
-      contentMd: existing.contentMd,
+      has_content: true,
       has_content_payload: true,
-      hasContent: true,
-      hasContentPayload: true,
     };
   };
   units.forEach((unit) => {
@@ -631,25 +605,15 @@ export function accountDocumentUnitsFromPayload(payload) {
 
 export function accountDocumentRequestFromSkill(skill, { allow_conflict = false, local_only = false } = {}) {
   const collection = normalizedDocumentCollection();
-  const rowKind = text(skill?.entryKind || skill?.entry_kind || skill?.rowType || skill?.row_type || skill?.type || skill?.kind).toLowerCase();
+  const rowKind = text(skill?.entry_kind || skill?.row_type || skill?.type || skill?.kind).toLowerCase();
   if (rowKind === "folder" || rowKind === "account_document_folder") {
     const folderPath = normalizedDocumentPath(
-      skill?.pathKey
-        || skill?.path_key
-        || skill?.folderPath
-        || skill?.folder_path
-        || skill?.folderId
-        || skill?.folder_id
-        || skill?.id,
+      skill?.path_key || skill?.folder_path || skill?.folder_id || skill?.id,
     );
     const parts = folderPath.split("/").filter(Boolean);
-    const fileName = text(skill?.fileName || skill?.file_name || skill?.title || skill?.name, parts[parts.length - 1] || "folder");
+    const fileName = text(skill?.file_name || skill?.title || skill?.name, parts[parts.length - 1] || "folder");
     const parentPathKey = normalizedDocumentPath(
-      skill?.parentPathKey
-        || skill?.parent_path_key
-        || skill?.parentFolderId
-        || skill?.parent_folder_id
-        || parts.slice(0, -1).join("/"),
+      skill?.parent_path_key || skill?.parent_folder_id || parts.slice(0, -1).join("/"),
     );
     return {
       document: {
@@ -677,26 +641,26 @@ export function accountDocumentRequestFromSkill(skill, { allow_conflict = false,
   const documentKind = documentKindFromParts(skill, collection);
   const extension = text(skill?.extension, documentExtensionForKind(documentKind, collection));
   const filePath = documentFilePathFromParts(skill, extension);
-  const pathKey = normalizedDocumentPath(skill?.pathKey || skill?.path_key || filePath);
-  const parentPathKey = normalizedDocumentPath(skill?.parentPathKey || skill?.parent_path_key || pathKey.split("/").slice(0, -1).join("/"));
+  const pathKey = normalizedDocumentPath(skill?.path_key || filePath);
+  const parentPathKey = normalizedDocumentPath(skill?.parent_path_key || pathKey.split("/").slice(0, -1).join("/"));
   const fileName = documentFileNameFromParts({ ...skill, file_path: pathKey }, extension);
   const id = normalizedDocumentId(skill?.id || skill?.doc_id || skill?.document_id || pathKey) || skillSlug(skill?.title || "document");
   const mimeType = documentKind === "html" || documentKind === "architecture"
     ? documentMimeTypeForKind(documentKind, collection)
-    : text(skill?.mimeType || skill?.mime_type, documentMimeTypeForKind(documentKind, collection));
+    : text(skill?.mime_type, documentMimeTypeForKind(documentKind, collection));
   const document = {
-    allow_empty_overwrite: skill?.allowEmptyOverwrite === true || skill?.allow_empty_overwrite === true,
-    asset_id: text(skill?.assetId),
-    base_content_hash: text(skill?.baseContentHash || skill?.base_content_hash),
-    canonical_local_path: text(skill?.canonicalLocalPath || skill?.canonical_local_path),
+    allow_empty_overwrite: skill?.allow_empty_overwrite === true,
+    asset_id: text(skill?.asset_id),
+    base_content_hash: text(skill?.base_content_hash),
+    canonical_local_path: text(skill?.canonical_local_path),
     collection,
     content: String(skill?.content || ""),
     content_md: String(skill?.content || ""),
     doc_id: id,
     document_id: id,
     document_kind: documentKind,
-    draft_id: text(skill?.draftId || skill?.draft_id),
-    draft_path: text(skill?.draftPath || skill?.draft_path),
+    draft_id: text(skill?.draft_id),
+    draft_path: text(skill?.draft_path),
     entry_kind: "document",
     extension,
     file_name: fileName,
@@ -705,7 +669,7 @@ export function accountDocumentRequestFromSkill(skill, { allow_conflict = false,
     folder_path: parentPathKey,
     has_content_payload: true,
     id,
-    local_path: text(skill?.localPath),
+    local_path: text(skill?.local_path),
     mime_type: mimeType,
     name: text(skill?.title, id),
     parent_folder_id: parentPathKey,
@@ -731,14 +695,14 @@ export function accountDocumentHydrateRequestFromSkill(skill) {
   const documentKind = documentKindFromParts(skill, collection);
   const extension = text(skill?.extension, documentExtensionForKind(documentKind, collection));
   const filePath = documentFilePathFromParts(skill, extension);
-  const pathKey = normalizedDocumentPath(skill?.pathKey || skill?.path_key || filePath);
-  const parentPathKey = normalizedDocumentPath(skill?.parentPathKey || skill?.parent_path_key || pathKey.split("/").slice(0, -1).join("/"));
+  const pathKey = normalizedDocumentPath(skill?.path_key || filePath);
+  const parentPathKey = normalizedDocumentPath(skill?.parent_path_key || pathKey.split("/").slice(0, -1).join("/"));
   const fileName = documentFileNameFromParts({ ...skill, file_path: pathKey }, extension);
   const id = normalizedDocumentId(skill?.id || skill?.doc_id || skill?.document_id || pathKey) || skillSlug(skill?.title || "document");
-  const contentHash = text(skill?.contentHash || skill?.content_hash || skill?.sha256);
+  const contentHash = text(skill?.content_hash || skill?.sha256);
   const document = {
-    asset_id: text(skill?.assetId || skill?.asset_id),
-    blob_id: text(skill?.blobId || skill?.blob_id),
+    asset_id: text(skill?.asset_id),
+    blob_id: text(skill?.blob_id),
     collection,
     content_hash: contentHash,
     doc_id: id,
@@ -751,10 +715,10 @@ export function accountDocumentHydrateRequestFromSkill(skill) {
     folder_id: parentPathKey,
     folder_path: parentPathKey,
     id,
-    local_path: text(skill?.localPath || skill?.local_path),
+    local_path: text(skill?.local_path),
     mime_type: documentKind === "html" || documentKind === "architecture"
       ? documentMimeTypeForKind(documentKind, collection)
-      : text(skill?.mimeType || skill?.mime_type),
+      : text(skill?.mime_type),
     name: text(skill?.title || skill?.name, id),
     parent_folder_id: parentPathKey,
     parent_path_key: parentPathKey,
@@ -765,7 +729,7 @@ export function accountDocumentHydrateRequestFromSkill(skill) {
     title: text(skill?.title || skill?.name, id),
     type: "document",
   };
-  const sizeBytes = Number(skill?.sizeBytes ?? skill?.size_bytes);
+  const sizeBytes = Number(skill?.size_bytes);
   if (Number.isFinite(sizeBytes) && sizeBytes > 0) {
     document.size_bytes = sizeBytes;
   }

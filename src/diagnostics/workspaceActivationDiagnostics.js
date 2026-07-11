@@ -177,7 +177,7 @@ export function logWorkspaceActivationDiagnosticEvent(phase, fields = {}, option
     window.__DF_LAST_ACTIVATION_MARK = {
       phase: String(phase || ""),
       t: performance.now(),
-      workspaceId: String(fields?.workspaceId || ""),
+      workspace_id: String(fields?.workspace_id || ""),
     };
   } catch {
     // never let diagnostics interfere

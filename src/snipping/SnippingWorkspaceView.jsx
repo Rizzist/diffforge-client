@@ -107,7 +107,6 @@ function clearOverlaySnapshotPath(monitor) {
   if (!monitor || typeof monitor !== "object") return monitor || null;
   return {
     ...monitor,
-    snapshotPath: "",
     snapshot_path: "",
   };
 }
@@ -289,11 +288,11 @@ function defaultRecordingShortcut() {
 function fallbackPermissions() {
   return {
     platform: isMacPlatform() ? "macos" : "other",
-    shortcutAccessibilityRequired: isMacPlatform(),
-    shortcutAccessibilityGranted: !isMacPlatform(),
-    screenCaptureRequired: isMacPlatform(),
-    screenCaptureGranted: !isMacPlatform(),
-    screenCaptureSettingsUrl: isMacPlatform()
+    shortcut_accessibility_required: isMacPlatform(),
+    shortcut_accessibility_granted: !isMacPlatform(),
+    screen_capture_required: isMacPlatform(),
+    screen_capture_granted: !isMacPlatform(),
+    screen_capture_settings_url: isMacPlatform()
       ? "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
       : "",
     message: "",
@@ -307,30 +306,30 @@ function fallbackSnippingStatus() {
 
   return {
     enabled: true,
-    hideDesktopIcons: true,
-    freezeScreen: false,
-    uploadPublic: true,
-    visibleInCaptures: false,
-    fullScreenshot: {
+    hide_desktop_icons: true,
+    freeze_screen: false,
+    upload_public: true,
+    visible_in_captures: false,
+    full_screenshot: {
       shortcut: full,
-      defaultShortcut: full,
+      default_shortcut: full,
       registered: false,
       error: "",
     },
-    areaSnip: {
+    area_snip: {
       shortcut: area,
-      defaultShortcut: area,
+      default_shortcut: area,
       registered: false,
       error: "",
     },
-    areaRecording: {
+    area_recording: {
       shortcut: recording,
-      defaultShortcut: recording,
+      default_shortcut: recording,
       registered: false,
       error: "",
     },
     permissions: fallbackPermissions(),
-    untrackedRoot: "",
+    untracked_root: "",
   };
 }
 
@@ -430,7 +429,7 @@ function assetItems(library) {
 }
 
 function assetLocalPath(asset) {
-  return text(asset?.localPath || asset?.local_path || asset?.path);
+  return text(asset?.local_path || asset?.path);
 }
 
 function assetName(asset) {
@@ -448,7 +447,7 @@ function assetPreviewUrl(asset) {
 }
 
 function assetModifiedMs(asset) {
-  const value = Number(asset?.modifiedMs || asset?.modified_ms || asset?.createdMs || asset?.created_ms || 0);
+  const value = Number(asset?.modified_ms || asset?.created_ms || 0);
   return Number.isFinite(value) ? value : 0;
 }
 
@@ -509,24 +508,24 @@ export default function SnippingWorkspaceView({
   const permissionPanelRef = useRef(null);
 
   const snippingEnabled = Boolean(status?.enabled);
-  const hideDesktopIcons = status?.hideDesktopIcons !== false;
-  const freezeScreen = status?.freezeScreen === true;
-  const uploadPublic = status?.uploadPublic !== false;
-  const visibleInCaptures = status?.visibleInCaptures === true;
+  const hideDesktopIcons = status?.hide_desktop_icons !== false;
+  const freezeScreen = status?.freeze_screen === true;
+  const uploadPublic = status?.upload_public !== false;
+  const visibleInCaptures = status?.visible_in_captures === true;
   const permissions = status?.permissions || fallbackPermissions();
-  const fullShortcut = status?.fullScreenshot?.shortcut || defaultFullShortcut();
-  const areaShortcut = status?.areaSnip?.shortcut || defaultAreaShortcut();
-  const recordingShortcut = status?.areaRecording?.shortcut || defaultRecordingShortcut();
-  const fullError = status?.fullScreenshot?.error || "";
-  const areaError = status?.areaSnip?.error || "";
-  const recordingError = status?.areaRecording?.error || "";
+  const fullShortcut = status?.full_screenshot?.shortcut || defaultFullShortcut();
+  const areaShortcut = status?.area_snip?.shortcut || defaultAreaShortcut();
+  const recordingShortcut = status?.area_recording?.shortcut || defaultRecordingShortcut();
+  const fullError = status?.full_screenshot?.error || "";
+  const areaError = status?.area_snip?.error || "";
+  const recordingError = status?.area_recording?.error || "";
   const shortcutConflictError = shortcutConflictMessage([
     { label: "Full screenshot", shortcut: fullShortcut },
     { label: "Area snip", shortcut: areaShortcut },
     { label: "Area recording", shortcut: recordingShortcut },
   ]);
   const permissionMissing = Boolean(
-    permissions.screenCaptureRequired && !permissions.screenCaptureGranted,
+    permissions.screen_capture_required && !permissions.screen_capture_granted,
   );
   const shortcutReady = snippingEnabled
     && !permissionMissing
@@ -534,9 +533,9 @@ export default function SnippingWorkspaceView({
     && !areaError
     && !recordingError
     && !shortcutConflictError
-    && Boolean(status?.fullScreenshot?.registered)
-    && Boolean(status?.areaSnip?.registered)
-    && Boolean(status?.areaRecording?.registered);
+    && Boolean(status?.full_screenshot?.registered)
+    && Boolean(status?.area_snip?.registered)
+    && Boolean(status?.area_recording?.registered);
   const savingShortcut = actionState === "saving";
   const togglingSnipping = actionState === "toggling";
   const togglingDesktopIcons = actionState === "toggling-desktop-icons";
@@ -906,7 +905,7 @@ export default function SnippingWorkspaceView({
               </SecondaryButton>
             </SnippingButtonGrid>
             <SettingsHint>
-              Saves to {status?.untrackedRoot ? `${status.untrackedRoot}/snips` : "the untracked snips folder"}.
+              Saves to {status?.untracked_root ? `${status.untracked_root}/snips` : "the untracked snips folder"}.
             </SettingsHint>
             <AudioRecorderOptionRow>
               <SettingsHint>
@@ -970,8 +969,8 @@ export default function SnippingWorkspaceView({
                 {togglingVisibleInCaptures ? "Switching" : visibleInCaptures ? "Visible" : "Hidden"}
               </McpSwitchButton>
             </AudioRecorderOptionRow>
-            {lastCapture?.localPath && (
-              <AudioInputMeta>Last snip: {lastCapture.localPath}</AudioInputMeta>
+            {lastCapture?.local_path && (
+              <AudioInputMeta>Last snip: {lastCapture.local_path}</AudioInputMeta>
             )}
           </AudioDevicePanel>
 
@@ -994,11 +993,11 @@ export default function SnippingWorkspaceView({
             <SnippingPermissionGrid>
               <SnippingInfoTile>
                 <span>Screen capture</span>
-                <strong>{permissions.screenCaptureGranted ? "Granted" : "Required"}</strong>
+                <strong>{permissions.screen_capture_granted ? "Granted" : "Required"}</strong>
               </SnippingInfoTile>
               <SnippingInfoTile>
                 <span>Shortcuts</span>
-                <strong>{!snippingEnabled ? "Disabled" : status?.fullScreenshot?.registered && status?.areaSnip?.registered && status?.areaRecording?.registered ? "Registered" : "Unavailable"}</strong>
+                <strong>{!snippingEnabled ? "Disabled" : status?.full_screenshot?.registered && status?.area_snip?.registered && status?.area_recording?.registered ? "Registered" : "Unavailable"}</strong>
               </SnippingInfoTile>
             </SnippingPermissionGrid>
             {permissionMissing && (
@@ -1070,7 +1069,7 @@ export default function SnippingWorkspaceView({
 
           <AudioRecorderOptionRow>
             <SettingsHint>
-              Defaults: {formatShortcutLabel(status?.fullScreenshot?.defaultShortcut || defaultFullShortcut())} / {formatShortcutLabel(status?.areaSnip?.defaultShortcut || defaultAreaShortcut())} / {formatShortcutLabel(status?.areaRecording?.defaultShortcut || defaultRecordingShortcut())}
+              Defaults: {formatShortcutLabel(status?.full_screenshot?.default_shortcut || defaultFullShortcut())} / {formatShortcutLabel(status?.area_snip?.default_shortcut || defaultAreaShortcut())} / {formatShortcutLabel(status?.area_recording?.default_shortcut || defaultRecordingShortcut())}
             </SettingsHint>
             <SecondaryButton disabled={savingShortcut} onClick={resetShortcuts} type="button">
               <ButtonRefreshIcon aria-hidden="true" />
@@ -1127,7 +1126,7 @@ export function SnippingOverlayWindow() {
       if (!element) return null;
       const style = window.getComputedStyle(element);
       return {
-        backgroundColor: style.backgroundColor,
+        background_color: style.backgroundColor,
         display: style.display,
         opacity: style.opacity,
         pointerEvents: style.pointerEvents,
@@ -1146,19 +1145,19 @@ export function SnippingOverlayWindow() {
       type: event.type,
       pointerType: event.pointerType,
       pointerId: event.pointerId,
-      isPrimary: event.isPrimary,
+      is_primary: event.is_primary,
       button: event.button,
       buttons: event.buttons,
       clientX: event.clientX,
       clientY: event.clientY,
-      screenX: event.screenX,
-      screenY: event.screenY,
+      screen_x: event.screenX,
+      screen_y: event.screenY,
       movementX: event.movementX,
       movementY: event.movementY,
       pressure: event.pressure,
     } : null;
     return {
-      windowLabel,
+      window_label: windowLabel,
       activePointerId: activePointerIdRef.current,
       dragging: Boolean(dragRef.current),
       capturing: capturingRef.current,
@@ -1208,7 +1207,7 @@ export function SnippingOverlayWindow() {
   }, [cursorDebugSnapshot, logCursorDebug]);
 
   const snapshotUrl = useMemo(() => {
-    const snapshotPath = text(overlayMonitor?.snapshotPath || overlayMonitor?.snapshot_path);
+    const snapshotPath = text(overlayMonitor?.snapshot_path);
     if (!snapshotPath) return "";
     try {
       return convertFileSrc(snapshotPath);
@@ -1348,10 +1347,10 @@ export function SnippingOverlayWindow() {
 
     listen(SNIPPING_AREA_OVERLAY_STARTED_EVENT, (event) => {
       if (cancelled) return;
-      const targetLabel = text(event.payload?.overlayLabel || event.payload?.overlay_label);
+      const targetLabel = text(event.payload?.overlay_label);
       if (targetLabel && windowLabel && targetLabel !== windowLabel) return;
       logCursorDebug("overlay_started_event", cursorDebugSnapshot(null, {
-        targetLabel,
+        target_label: targetLabel,
         monitor: event.payload?.monitor || event.payload || null,
         mode: event.payload?.mode,
       }));
@@ -1371,16 +1370,16 @@ export function SnippingOverlayWindow() {
     // without resetting an in-progress selection.
     listen(SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT, (event) => {
       if (cancelled) return;
-      const targetLabel = text(event.payload?.overlayLabel || event.payload?.overlay_label);
+      const targetLabel = text(event.payload?.overlay_label);
       if (targetLabel && windowLabel && targetLabel !== windowLabel) return;
-      const snapshotPath = text(event.payload?.snapshotPath || event.payload?.snapshot_path);
+      const snapshotPath = text(event.payload?.snapshot_path);
       if (!snapshotPath) return;
       logCursorDebug("overlay_snapshot_event", cursorDebugSnapshot(null, {
-        targetLabel,
-        snapshotPath,
+        target_label: targetLabel,
+        snapshot_path: snapshotPath,
       }));
       setOverlayMonitor((current) => (
-        current ? { ...current, snapshotPath, snapshot_path: snapshotPath } : current
+        current ? { ...current, snapshot_path: snapshotPath } : current
       ));
     }).then((unlisten) => {
       if (cancelled) {
@@ -1636,9 +1635,9 @@ export function SnippingOverlayWindow() {
           y: top,
           width,
           height,
-          scaleFactor: window.devicePixelRatio || 1,
-          viewportWidth: requestViewport.width,
-          viewportHeight: requestViewport.height,
+          scale_factor: window.devicePixelRatio || 1,
+          viewport_width: requestViewport.width,
+          viewport_height: requestViewport.height,
         },
       });
       setCapturingState(false);
@@ -1684,9 +1683,9 @@ export function SnippingOverlayWindow() {
           y: activeSelection.top,
           width: activeSelection.width,
           height: activeSelection.height,
-          scaleFactor: window.devicePixelRatio || 1,
-          viewportWidth: requestViewport.width,
-          viewportHeight: requestViewport.height,
+          scale_factor: window.devicePixelRatio || 1,
+          viewport_width: requestViewport.width,
+          viewport_height: requestViewport.height,
         },
       });
       setRecordingSelection(null);
@@ -1782,7 +1781,7 @@ export function SnippingRecordingControlsWindow() {
   const [nowMs, setNowMs] = useState(Date.now());
   const [stopping, setStopping] = useState(false);
   const active = Boolean(status?.active);
-  const elapsed = formatRecordingElapsed(status?.startedAtMs || status?.started_at_ms, nowMs);
+  const elapsed = formatRecordingElapsed(status?.started_at_ms, nowMs);
 
   const loadStatus = useCallback(async () => {
     try {

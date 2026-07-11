@@ -162,12 +162,12 @@ function parseNodeLine(line, lineIndex) {
     id,
     label: label || id,
     kind,
-    nodeKind: kind === "trigger" ? "" : kind,
+    node_kind: kind === "trigger" ? "" : kind,
     role: safeText(props.role, kind === "trigger" ? "trigger" : "action"),
     icon: safeText(props.icon),
     mode: safeText(props.mode || props.splitter_mode),
-    triggerId,
-    triggerType: safeText(props.trigger_type),
+    trigger_id: triggerId,
+    trigger_type: safeText(props.trigger_type),
     hasPosition: x !== null || y !== null,
     x: x ?? 0,
     y: y ?? 0,
@@ -180,7 +180,7 @@ function parseEdgeEndpoint(raw) {
   const match = endpoint.match(/^([a-zA-Z0-9_-]+)\.([a-zA-Z0-9_-]+)$/);
   if (!match) return null;
   return {
-    nodeId: match[1],
+    node_id: match[1],
     portId: match[2],
   };
 }
@@ -193,13 +193,13 @@ function parseEdgeLine(line, lineIndex) {
   const to = parseEdgeEndpoint(match[2]);
   if (!from || !to) return null;
   const props = parseDfBlueprintProps(match[3] || "");
-  const id = safeText(props.id || props.edge_id, `edge-${from.nodeId}-${from.portId}-${to.nodeId}-${to.portId}-${lineIndex}`);
+  const id = safeText(props.id || props.edge_id, `edge-${from.node_id}-${from.portId}-${to.node_id}-${to.portId}-${lineIndex}`);
   return {
     id,
-    from: from.nodeId,
-    fromPort: from.portId,
-    to: to.nodeId,
-    toPort: to.portId,
+    from: from.node_id,
+    from_port: from.portId,
+    to: to.node_id,
+    to_port: to.portId,
     label: safeText(props.label || props.name),
     role: safeText(props.role, "flow"),
     props,
@@ -265,14 +265,14 @@ export function serializeDfBlueprint(ast = emptyDfBlueprintAst()) {
     "",
   ];
   for (const node of next.nodes) {
-    const isTrigger = Boolean(node.triggerId) || node.kind === "trigger" || node.role === "trigger";
+    const isTrigger = Boolean(node.trigger_id) || node.kind === "trigger" || node.role === "trigger";
     const props = {
       id: node.id,
       ...(isTrigger ? {
-        trigger_id: node.triggerId,
-        trigger_type: node.triggerType || node.type || "manual",
+        trigger_id: node.trigger_id,
+        trigger_type: node.trigger_type || node.type || "manual",
       } : {
-        kind: node.nodeKind || node.kind || "action",
+        kind: node.node_kind || node.kind || "action",
         role: node.role || "action",
       }),
       ...(node.icon ? { icon: node.icon } : {}),
@@ -281,8 +281,8 @@ export function serializeDfBlueprint(ast = emptyDfBlueprintAst()) {
       ...(node.hasPosition || Number.isFinite(node.y) ? { y: Math.round(Number(node.y) || 0) } : {}),
       ...(node.props && typeof node.props === "object" ? Object.fromEntries(
         Object.entries(node.props).filter(([key]) => ![
-          "id", "nodeId", "nodeid", "node_id", "kind", "nodeKind", "nodekind", "node_kind", "role", "icon", "mode", "x", "y",
-          "triggerId", "triggerid", "trigger_id", "trigger", "triggerType", "triggertype", "trigger_type", "type",
+          "id", "node_id", "nodeid", "kind", "node_kind", "nodekind", "role", "icon", "mode", "x", "y",
+          "trigger_id", "triggerid", "trigger", "trigger_type", "triggertype", "type",
         ].includes(key)),
       ) : {}),
     };
@@ -292,8 +292,8 @@ export function serializeDfBlueprint(ast = emptyDfBlueprintAst()) {
   }
   if (next.nodes.length && next.edges.length) lines.push("");
   for (const edge of next.edges) {
-    const fromPort = safeText(edge.fromPort);
-    const toPort = safeText(edge.toPort);
+    const fromPort = safeText(edge.from_port);
+    const toPort = safeText(edge.to_port);
     if (!fromPort || !toPort) continue;
     const props = {
       id: edge.id,
@@ -301,7 +301,7 @@ export function serializeDfBlueprint(ast = emptyDfBlueprintAst()) {
       ...(edge.label ? { label: edge.label } : {}),
       ...(edge.props && typeof edge.props === "object" ? Object.fromEntries(
         Object.entries(edge.props).filter(([key]) => ![
-          "id", "edgeId", "edgeid", "edge_id", "role", "label", "name", "fromPort", "fromport", "from_port", "toPort", "toport", "to_port",
+          "id", "edge_id", "edgeid", "role", "label", "name", "from_port", "fromport", "to_port", "toport",
         ].includes(key)),
       ) : {}),
     };
@@ -344,10 +344,10 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
       icon: safeText(template?.icon, "terminal"),
       label: safeText(template?.label, scriptName),
       mode: "",
-      nodeKind: "run_script",
+      node_kind: "run_script",
       kind: "run_script",
       role: safeText(template?.role, "action"),
-      triggerId: "",
+      trigger_id: "",
       hasPosition: Boolean(position),
       x: position ? Math.round(Number(position.x) || 0) : 0,
       y: position ? Math.round(Number(position.y) || 0) : 0,
@@ -372,10 +372,10 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
       icon: safeText(template?.icon, "message"),
       label: safeText(template?.label, "Send message"),
       mode: "",
-      nodeKind: "send_message",
+      node_kind: "send_message",
       kind: "send_message",
       role: safeText(template?.role, "action"),
-      triggerId: "",
+      trigger_id: "",
       hasPosition: Boolean(position),
       x: position ? Math.round(Number(position.x) || 0) : 0,
       y: position ? Math.round(Number(position.y) || 0) : 0,
@@ -406,10 +406,10 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
       icon: safeText(template?.icon, "bell"),
       label: safeText(template?.label, "Notify device"),
       mode: "",
-      nodeKind: "notify_device",
+      node_kind: "notify_device",
       kind: "notify_device",
       role: safeText(template?.role, "action"),
-      triggerId: "",
+      trigger_id: "",
       hasPosition: Boolean(position),
       x: position ? Math.round(Number(position.x) || 0) : 0,
       y: position ? Math.round(Number(position.y) || 0) : 0,
@@ -434,10 +434,10 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
       icon: safeText(template?.icon, "todos"),
       label: safeText(template?.label, "Dispatch todos"),
       mode: safeText(template?.mode || template?.dispatch_mode || template?.send_mode, "queued"),
-      nodeKind: "dispatch_todos",
+      node_kind: "dispatch_todos",
       kind: "dispatch_todos",
       role: safeText(template?.role, "action"),
-      triggerId: "",
+      trigger_id: "",
       hasPosition: Boolean(position),
       x: position ? Math.round(Number(position.x) || 0) : 0,
       y: position ? Math.round(Number(position.y) || 0) : 0,
@@ -446,7 +446,7 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
         device_label: deviceLabel,
         display: "region",
         dispatch_mode: safeText(template?.dispatch_mode || template?.send_mode || template?.mode, "queued"),
-        enable_wait_ms: safeText(template?.enable_wait_ms || template?.enableWaitMs, "30000"),
+        enable_wait_ms: safeText(template?.enable_wait_ms, "30000"),
         h: safeText(template?.h || template?.height, String(visualDefaults.height || 178)),
         model: safeText(template?.model),
         reasoning_effort: safeText(template?.reasoning_effort || template?.effort),
@@ -475,10 +475,10 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
       icon: safeText(template?.icon, "document"),
       label,
       mode,
-      nodeKind: templateId,
+      node_kind: templateId,
       kind: templateId,
       role: safeText(template?.role, "context"),
-      triggerId: "",
+      trigger_id: "",
       hasPosition: Boolean(position),
       x: position ? Math.round(Number(position.x) || 0) : 0,
       y: position ? Math.round(Number(position.y) || 0) : 0,
@@ -489,15 +489,12 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
         mode,
         operation: mode === "write"
           ? safeText(
-            template?.operation
-              || template?.write_operation
-              || template?.document_operation
-              || template?.documentOperation,
+            template?.operation || template?.write_operation || template?.document_operation,
             "append",
           )
           : "",
         content_template: mode === "write"
-          ? safeText(template?.content_template || template?.contentTemplate || template?.template)
+          ? safeText(template?.content_template || template?.template)
           : "",
         target_mode: safeText(template?.target_mode, mode === "write" ? "create_or_update" : "select"),
       },
@@ -512,10 +509,10 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
       icon: safeText(template?.icon, "asset"),
       label,
       mode,
-      nodeKind: templateId,
+      node_kind: templateId,
       kind: templateId,
       role: safeText(template?.role, "context"),
-      triggerId: "",
+      trigger_id: "",
       hasPosition: Boolean(position),
       x: position ? Math.round(Number(position.x) || 0) : 0,
       y: position ? Math.round(Number(position.y) || 0) : 0,
@@ -526,15 +523,12 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
         mode,
         operation: mode === "write"
           ? safeText(
-            template?.operation
-              || template?.write_operation
-              || template?.asset_operation
-              || template?.assetOperation,
+            template?.operation || template?.write_operation || template?.asset_operation,
             "add_version",
           )
           : "",
         content_template: mode === "write"
-          ? safeText(template?.content_template || template?.contentTemplate || template?.template)
+          ? safeText(template?.content_template || template?.template)
           : "",
         target_mode: safeText(template?.target_mode, mode === "write" ? "capture_generated" : "select"),
       },
@@ -547,17 +541,17 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
       icon: safeText(template?.icon, "node"),
       label,
       mode: "",
-      nodeKind: "step",
+      node_kind: "step",
       kind: "step",
       role: safeText(template?.role, "checkpoint"),
-      triggerId: "",
+      trigger_id: "",
       hasPosition: Boolean(position),
       x: position ? Math.round(Number(position.x) || 0) : 0,
       y: position ? Math.round(Number(position.y) || 0) : 0,
       props: {
         description: safeText(template?.description || template?.desc || template?.details),
         order: safeText(template?.order || template?.index),
-        parent_id: safeText(template?.parent_id || template?.parentId || template?.parent),
+        parent_id: safeText(template?.parent_id || template?.parent),
         status: safeText(template?.status, "pending"),
       },
     };
@@ -567,10 +561,10 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
     icon: safeText(template?.icon, "node"),
     label: safeText(template?.label, "Graph node"),
     mode: "",
-    nodeKind: templateId,
+    node_kind: templateId,
     kind: templateId,
     role: safeText(template?.role, "action"),
-    triggerId: "",
+    trigger_id: "",
     hasPosition: Boolean(position),
     x: position ? Math.round(Number(position.x) || 0) : 0,
     y: position ? Math.round(Number(position.y) || 0) : 0,
@@ -586,10 +580,10 @@ export function createDfBlueprintTriggerNode(trigger, position = null) {
     icon: type === "cron" ? "clock" : type === "webhook" ? "webhook" : "play",
     label: safeText(trigger?.name || triggerId, "Trigger"),
     kind: "trigger",
-    nodeKind: "",
+    node_kind: "",
     role: "trigger",
-    triggerId,
-    triggerType: type,
+    trigger_id: triggerId,
+    trigger_type: type,
     hasPosition: Boolean(position),
     x: position ? Math.round(Number(position.x) || 0) : 0,
     y: position ? Math.round(Number(position.y) || 0) : 0,
@@ -615,8 +609,8 @@ export function removeDfBlueprintNode(source, nodeId) {
 export function removeDfBlueprintTrigger(source, triggerId) {
   const id = safeText(triggerId);
   const ast = parseDfBlueprintSource(source);
-  const nodeIds = new Set(ast.nodes.filter((node) => node.triggerId === id).map((node) => node.id));
-  ast.nodes = ast.nodes.filter((node) => node.triggerId !== id);
+  const nodeIds = new Set(ast.nodes.filter((node) => node.trigger_id === id).map((node) => node.id));
+  ast.nodes = ast.nodes.filter((node) => node.trigger_id !== id);
   ast.edges = ast.edges.filter((edge) => !nodeIds.has(edge.from) && !nodeIds.has(edge.to));
   return serializeDfBlueprint(ast);
 }
@@ -634,8 +628,8 @@ export function connectDfBlueprintNodes(source, fromNode, toNode, options = {}) 
   const to = safeText(toNode?.id || toNode);
   if (!from || !to || from === to) return source || "";
   const ast = parseDfBlueprintSource(source);
-  const fromPort = safeText(options.fromPort || options.from_port, "out");
-  const toPort = safeText(options.toPort || options.to_port, "in");
+  const fromPort = safeText(options.from_port, "out");
+  const toPort = safeText(options.to_port, "in");
   const nodeById = new Map(ast.nodes.map((node) => [node.id, node]));
   const fromGraphNode = nodeById.get(from)
     || (fromNode && typeof fromNode === "object" ? fromNode : null);
@@ -643,10 +637,10 @@ export function connectDfBlueprintNodes(source, fromNode, toNode, options = {}) 
     || (toNode && typeof toNode === "object" ? toNode : null);
   const validation = validateLoopspaceGraphEdgeCandidate(fromGraphNode, toGraphNode, {
     from,
-    fromPort,
+    from_port: fromPort,
     nodeById,
     to,
-    toPort,
+    to_port: toPort,
   });
   if (!validation.ok) {
     return serializeDfBlueprint(ast);
@@ -656,17 +650,17 @@ export function connectDfBlueprintNodes(source, fromNode, toNode, options = {}) 
   if (ast.edges.some((edge) => (
     edge.from === from
     && edge.to === to
-    && edge.fromPort === fromPort
-    && edge.toPort === toPort
+    && edge.from_port === fromPort
+    && edge.to_port === toPort
   ))) {
     return serializeDfBlueprint(ast);
   }
   ast.edges.push({
     id: `edge-${from}-${fromPort}-${to}-${toPort}-${Date.now().toString(36)}`,
     from,
-    fromPort,
+    from_port: fromPort,
     to,
-    toPort,
+    to_port: toPort,
     label,
     role: "flow",
     props: branch ? { branch } : {},
@@ -698,7 +692,7 @@ export function updateDfBlueprintNodeProps(source, nodeId, patch = {}) {
 }
 
 function dfBlueprintResourcePropsFromPatchOperation(op = {}, node = null) {
-  const nodeKind = sanitizeDfBlueprintId(node?.nodeKind || node?.kind || "", "").replace(/-/g, "_");
+  const nodeKind = sanitizeDfBlueprintId(node?.node_kind || node?.kind || "", "").replace(/-/g, "_");
   const props = {};
   const putFirst = (targetKey, aliases = []) => {
     for (const alias of aliases) {
@@ -708,58 +702,58 @@ function dfBlueprintResourcePropsFromPatchOperation(op = {}, node = null) {
       }
     }
   };
-  putFirst("create_name", ["create_name", "createName"]);
+  putFirst("create_name", ["create_name"]);
   putFirst("h", ["h", "height"]);
   putFirst("mode", ["mode"]);
-  putFirst("operation", ["operation", "write_operation", "writeOperation", "document_operation", "documentOperation", "asset_operation", "assetOperation"]);
-  putFirst("content_template", ["content_template", "contentTemplate", "template", "body_template", "bodyTemplate"]);
-  putFirst("target_mode", ["target_mode", "targetMode"]);
+  putFirst("operation", ["operation", "write_operation", "document_operation", "asset_operation"]);
+  putFirst("content_template", ["content_template", "template", "body_template"]);
+  putFirst("target_mode", ["target_mode"]);
   if (nodeKind === "document_read" || nodeKind === "document_write") {
-    putFirst("doc_refs", ["doc_refs", "docRefs", "documents", "path_key", "pathKey"]);
+    putFirst("doc_refs", ["doc_refs", "documents", "path_key"]);
   }
   if (nodeKind === "asset_read" || nodeKind === "asset_write") {
-    putFirst("asset_refs", ["asset_refs", "assetRefs", "assets", "asset_id", "assetId", "path_key", "pathKey"]);
+    putFirst("asset_refs", ["asset_refs", "assets", "asset_id", "path_key"]);
   }
   if (nodeKind === "notify_device") {
-    putFirst("body", ["body", "message", "notification_body", "notificationBody"]);
-    putFirst("delivery", ["delivery", "delivery_mode", "deliveryMode", "channel"]);
-    putFirst("device_id", ["device_id", "deviceId", "target_device_id", "targetDeviceId"]);
-    putFirst("device_label", ["device_label", "deviceLabel", "target_device_label", "targetDeviceLabel"]);
-    putFirst("title", ["title", "notification_title", "notificationTitle"]);
+    putFirst("body", ["body", "message", "notification_body"]);
+    putFirst("delivery", ["delivery", "delivery_mode", "channel"]);
+    putFirst("device_id", ["device_id", "target_device_id"]);
+    putFirst("device_label", ["device_label", "target_device_label"]);
+    putFirst("title", ["title", "notification_title"]);
     putFirst("url", ["url", "link"]);
   }
   if (nodeKind === "send_message") {
-    putFirst("device_id", ["device_id", "deviceId", "target_device_id", "targetDeviceId"]);
-    putFirst("device_label", ["device_label", "deviceLabel", "target_device_label", "targetDeviceLabel"]);
-    putFirst("model", ["model", "model_id", "modelId"]);
+    putFirst("device_id", ["device_id", "target_device_id"]);
+    putFirst("device_label", ["device_label", "target_device_label"]);
+    putFirst("model", ["model", "model_id"]);
     putFirst("prompt", ["prompt", "message", "body", "text", "instructions"]);
-    putFirst("reasoning_effort", ["reasoning_effort", "reasoningEffort", "effort", "thinking_power", "thinkingPower"]);
-    putFirst("speed", ["speed", "service_tier", "serviceTier"]);
-    putFirst("target_agent_id", ["target_agent_id", "targetAgentId", "agent_id", "agentId", "agent"]);
-    putFirst("target_device_id", ["target_device_id", "targetDeviceId", "device_id", "deviceId"]);
-    putFirst("target_device_label", ["target_device_label", "targetDeviceLabel", "device_label", "deviceLabel"]);
-    putFirst("target_terminal_id", ["target_terminal_id", "targetTerminalId", "terminal_id", "terminalId", "pane_id", "paneId"]);
-    putFirst("target_terminal_name", ["target_terminal_name", "targetTerminalName", "terminal_name", "terminalName"]);
+    putFirst("reasoning_effort", ["reasoning_effort", "effort", "thinking_power"]);
+    putFirst("speed", ["speed", "service_tier"]);
+    putFirst("target_agent_id", ["target_agent_id", "agent_id", "agent"]);
+    putFirst("target_device_id", ["target_device_id", "device_id"]);
+    putFirst("target_device_label", ["target_device_label", "device_label"]);
+    putFirst("target_terminal_id", ["target_terminal_id", "terminal_id", "pane_id"]);
+    putFirst("target_terminal_name", ["target_terminal_name", "terminal_name"]);
   }
   if (nodeKind === "dispatch_todos") {
-    putFirst("device_id", ["device_id", "deviceId", "target_device_id", "targetDeviceId"]);
-    putFirst("device_label", ["device_label", "deviceLabel", "target_device_label", "targetDeviceLabel"]);
-    putFirst("dispatch_mode", ["dispatch_mode", "dispatchMode", "send_mode", "sendMode", "mode"]);
-    putFirst("enable_wait_ms", ["enable_wait_ms", "enableWaitMs"]);
-    putFirst("model", ["model", "model_id", "modelId"]);
-    putFirst("reasoning_effort", ["reasoning_effort", "reasoningEffort", "effort", "thinking_power", "thinkingPower"]);
-    putFirst("speed", ["speed", "service_tier", "serviceTier"]);
-    putFirst("target_agent_id", ["target_agent_id", "targetAgentId", "agent_id", "agentId", "agent"]);
-    putFirst("target_device_id", ["target_device_id", "targetDeviceId", "device_id", "deviceId"]);
-    putFirst("target_device_label", ["target_device_label", "targetDeviceLabel", "device_label", "deviceLabel"]);
-    putFirst("target_terminal_id", ["target_terminal_id", "targetTerminalId", "terminal_id", "terminalId", "pane_id", "paneId"]);
-    putFirst("target_terminal_index", ["target_terminal_index", "targetTerminalIndex", "terminal_index", "terminalIndex"]);
-    putFirst("target_terminal_mode", ["target_terminal_mode", "targetTerminalMode", "terminal_mode", "terminalMode"]);
-    putFirst("target_terminal_name", ["target_terminal_name", "targetTerminalName", "terminal_name", "terminalName"]);
-    putFirst("target_thread_id", ["target_thread_id", "targetThreadId", "thread_id", "threadId"]);
-    putFirst("target_workspace_ids", ["target_workspace_ids", "targetWorkspaceIds", "workspace_ids", "workspaceIds", "workspace_id", "workspaceId"]);
-    putFirst("todo_batch_id", ["todo_batch_id", "todoBatchId", "batch_id", "batchId"]);
-    putFirst("todo_lines", ["todo_lines", "todoLines", "todos", "items", "prompt", "text"]);
+    putFirst("device_id", ["device_id", "target_device_id"]);
+    putFirst("device_label", ["device_label", "target_device_label"]);
+    putFirst("dispatch_mode", ["dispatch_mode", "send_mode", "mode"]);
+    putFirst("enable_wait_ms", ["enable_wait_ms"]);
+    putFirst("model", ["model", "model_id"]);
+    putFirst("reasoning_effort", ["reasoning_effort", "effort", "thinking_power"]);
+    putFirst("speed", ["speed", "service_tier"]);
+    putFirst("target_agent_id", ["target_agent_id", "agent_id", "agent"]);
+    putFirst("target_device_id", ["target_device_id", "device_id"]);
+    putFirst("target_device_label", ["target_device_label", "device_label"]);
+    putFirst("target_terminal_id", ["target_terminal_id", "terminal_id", "pane_id"]);
+    putFirst("target_terminal_index", ["target_terminal_index", "terminal_index"]);
+    putFirst("target_terminal_mode", ["target_terminal_mode", "terminal_mode"]);
+    putFirst("target_terminal_name", ["target_terminal_name", "terminal_name"]);
+    putFirst("target_thread_id", ["target_thread_id", "thread_id"]);
+    putFirst("target_workspace_ids", ["target_workspace_ids", "workspace_ids", "workspace_id"]);
+    putFirst("todo_batch_id", ["todo_batch_id", "batch_id"]);
+    putFirst("todo_lines", ["todo_lines", "todos", "items", "prompt", "text"]);
   }
   return props;
 }
@@ -782,42 +776,42 @@ export function applyDfBlueprintPatchOperations(source, operations = [], options
         mode: op.mode || "",
         device_id: op.device_id,
         device_label: op.device_label,
-        model: op.model || op.model_id || op.modelId,
+        model: op.model || op.model_id,
         prompt: op.prompt || op.message || op.body || op.text || op.instructions,
         path_key: op.path_key,
-        reasoning_effort: op.reasoning_effort || op.reasoningEffort || op.effort || op.thinking_power || op.thinkingPower,
+        reasoning_effort: op.reasoning_effort || op.effort || op.thinking_power,
         script_id: op.script_id,
         script_name: op.script_name,
         shell: op.shell,
-        speed: op.speed || op.service_tier || op.serviceTier,
-        dispatch_mode: op.dispatch_mode || op.dispatchMode || op.send_mode || op.sendMode,
-        enable_wait_ms: op.enable_wait_ms || op.enableWaitMs,
-        target_agent_id: op.target_agent_id || op.targetAgentId || op.agent_id || op.agentId,
-        target_device_id: op.target_device_id || op.targetDeviceId,
-        target_device_label: op.target_device_label || op.targetDeviceLabel,
-        target_terminal_id: op.target_terminal_id || op.targetTerminalId || op.terminal_id || op.terminalId || op.pane_id || op.paneId,
-        target_terminal_index: op.target_terminal_index || op.targetTerminalIndex || op.terminal_index || op.terminalIndex,
-        target_terminal_mode: op.target_terminal_mode || op.targetTerminalMode || op.terminal_mode || op.terminalMode,
-        target_terminal_name: op.target_terminal_name || op.targetTerminalName || op.terminal_name || op.terminalName,
-        target_thread_id: op.target_thread_id || op.targetThreadId || op.thread_id || op.threadId,
-        target_workspace_ids: op.target_workspace_ids || op.targetWorkspaceIds || op.workspace_ids || op.workspaceIds || op.workspace_id || op.workspaceId,
-        todo_batch_id: op.todo_batch_id || op.todoBatchId || op.batch_id || op.batchId,
-        todo_lines: op.todo_lines || op.todoLines || op.todos || op.items || op.prompt || op.text,
+        speed: op.speed || op.service_tier,
+        dispatch_mode: op.dispatch_mode || op.send_mode,
+        enable_wait_ms: op.enable_wait_ms,
+        target_agent_id: op.target_agent_id || op.agent_id,
+        target_device_id: op.target_device_id,
+        target_device_label: op.target_device_label,
+        target_terminal_id: op.target_terminal_id || op.terminal_id || op.pane_id,
+        target_terminal_index: op.target_terminal_index || op.terminal_index,
+        target_terminal_mode: op.target_terminal_mode || op.terminal_mode,
+        target_terminal_name: op.target_terminal_name || op.terminal_name,
+        target_thread_id: op.target_thread_id || op.thread_id,
+        target_workspace_ids: op.target_workspace_ids || op.workspace_ids || op.workspace_id,
+        todo_batch_id: op.todo_batch_id || op.batch_id,
+        todo_lines: op.todo_lines || op.todos || op.items || op.prompt || op.text,
         description: op.description || op.desc || op.details,
         asset_refs: op.asset_refs || op.assets,
-        create_name: op.create_name || op.createName,
+        create_name: op.create_name,
         doc_refs: op.doc_refs || op.documents,
         h: op.h || op.height,
-        operation: op.operation || op.write_operation || op.writeOperation || op.document_operation || op.documentOperation || op.asset_operation || op.assetOperation,
-        content_template: op.content_template || op.contentTemplate || op.template || op.body_template || op.bodyTemplate,
+        operation: op.operation || op.write_operation || op.document_operation || op.asset_operation,
+        content_template: op.content_template || op.template || op.body_template,
         order: op.order || op.index,
-        parent_id: op.parent_id || op.parentId || op.parent,
+        parent_id: op.parent_id || op.parent,
         status: op.status,
-        target_mode: op.target_mode || op.targetMode,
-        title: op.title || op.notification_title || op.notificationTitle,
-        body: op.body || op.message || op.notification_body || op.notificationBody,
+        target_mode: op.target_mode,
+        title: op.title || op.notification_title,
+        body: op.body || op.message || op.notification_body,
         url: op.url || op.link,
-        delivery: op.delivery || op.delivery_mode || op.deliveryMode || op.channel,
+        delivery: op.delivery || op.delivery_mode || op.channel,
       }, op.position || { x: op.x, y: op.y });
       if (op.id) node.id = sanitizeDfBlueprintId(op.id, node.id);
       const existingIndex = ast.nodes.findIndex((item) => item.id === node.id);
@@ -839,7 +833,7 @@ export function applyDfBlueprintPatchOperations(source, operations = [], options
         name: op.label || op.name,
         trigger_type: op.trigger_type || op.type,
       }, op.position || { x: op.x, y: op.y });
-      if (node.triggerId && !ast.nodes.some((item) => item.id === node.id)) ast.nodes.push(node);
+      if (node.trigger_id && !ast.nodes.some((item) => item.id === node.id)) ast.nodes.push(node);
     } else if (action === "removenode" || action === "remove_node") {
       const id = safeText(op.node_id || op.id);
       ast.nodes = ast.nodes.filter((node) => node.id !== id);
@@ -855,8 +849,8 @@ export function applyDfBlueprintPatchOperations(source, operations = [], options
     } else if (action === "connect") {
       const from = safeText(op.from || op.from_id);
       const to = safeText(op.to || op.to_id);
-      const fromPort = safeText(op.from_port || op.fromPort, "out");
-      const toPort = safeText(op.to_port || op.toPort, "in");
+      const fromPort = safeText(op.from_port, "out");
+      const toPort = safeText(op.to_port, "in");
       const branch = safeText(op.branch || fromPort);
       const nodeById = new Map(ast.nodes.map((node) => [node.id, node]));
       const validation = validateLoopspaceGraphEdgeCandidate(
@@ -864,10 +858,10 @@ export function applyDfBlueprintPatchOperations(source, operations = [], options
         nodeById.get(to),
         {
           from,
-          fromPort,
+          from_port: fromPort,
           nodeById,
           to,
-          toPort,
+          to_port: toPort,
         },
       );
       if (!validation.ok) {
@@ -878,15 +872,15 @@ export function applyDfBlueprintPatchOperations(source, operations = [], options
       if (from && to && from !== to && fromPort && toPort && !ast.edges.some((edge) => (
         edge.from === from
         && edge.to === to
-        && edge.fromPort === fromPort
-        && edge.toPort === toPort
+        && edge.from_port === fromPort
+        && edge.to_port === toPort
       ))) {
         ast.edges.push({
           id: safeText(op.edge_id || op.id, `edge-${from}-${fromPort}-${to}-${toPort}-${Date.now().toString(36)}`),
           from,
-          fromPort,
+          from_port: fromPort,
           to,
-          toPort,
+          to_port: toPort,
           label: safeText(op.label, branch ? branch.toUpperCase() : "NEXT"),
           role: safeText(op.role, "flow"),
           props: branch ? { branch } : {},
@@ -896,15 +890,15 @@ export function applyDfBlueprintPatchOperations(source, operations = [], options
       const edgeId = safeText(op.edge_id || op.id);
       const from = safeText(op.from || op.from_id);
       const to = safeText(op.to || op.to_id);
-      const fromPort = safeText(op.from_port || op.fromPort);
-      const toPort = safeText(op.to_port || op.toPort);
+      const fromPort = safeText(op.from_port);
+      const toPort = safeText(op.to_port);
       const branch = safeText(op.branch);
       ast.edges = ast.edges.filter((edge) => {
         if (edgeId) return edge.id !== edgeId;
         if (edge.from !== from || edge.to !== to) return true;
-        if (fromPort && edge.fromPort !== fromPort) return true;
-        if (toPort && edge.toPort !== toPort) return true;
-        if (branch && safeText(edge.props?.branch || edge.branch || edge.fromPort) !== branch) return true;
+        if (fromPort && edge.from_port !== fromPort) return true;
+        if (toPort && edge.to_port !== toPort) return true;
+        if (branch && safeText(edge.props?.branch || edge.branch || edge.from_port) !== branch) return true;
         return false;
       });
     } else if (action === "updatenodeprops" || action === "update_node_props" || action === "updateprops") {

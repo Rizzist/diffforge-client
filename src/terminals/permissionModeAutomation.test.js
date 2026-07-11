@@ -202,7 +202,7 @@ test("failed Claude and OpenCode cycles restore the original mode", async () => 
     const calls = [];
     const result = await cyclePermissionModeWithBestEffortRestore({
       originalMode: fixture.originalMode,
-      targetMode: "unreachable",
+      target_mode: "unreachable",
       maxCycleSteps: 8,
       cycleMode: async () => {
         const mode = fixture.sequence[calls.length % fixture.sequence.length];
@@ -223,7 +223,7 @@ test("permission cycle restores after a mid-cycle write failure", async () => {
   const sequence = ["plan", new Error("write failed"), "default"];
   const result = await cyclePermissionModeWithBestEffortRestore({
     originalMode: "default",
-    targetMode: "bypassPermissions",
+    target_mode: "bypassPermissions",
     cycleMode: async () => {
       const next = sequence.shift();
       if (next instanceof Error) throw next;
@@ -242,7 +242,7 @@ test("permission cycle probes restoration when the first write rejects", async (
   const sequence = [new Error("write acknowledgement lost"), "acceptEdits", "plan", "default"];
   const result = await cyclePermissionModeWithBestEffortRestore({
     originalMode: "default",
-    targetMode: "bypassPermissions",
+    target_mode: "bypassPermissions",
     cycleMode: async () => {
       const next = sequence.shift();
       if (next instanceof Error) throw next;

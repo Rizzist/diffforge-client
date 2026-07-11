@@ -40,7 +40,7 @@ impl SwarmRuntimeState {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default)]
 struct MemberSpec {
     member_id: Option<String>,
     provider: String,
@@ -49,7 +49,7 @@ struct MemberSpec {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default)]
 struct SwarmConfig {
     swarm_id: String,
     workspace_id: String,
@@ -62,7 +62,7 @@ struct SwarmConfig {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default)]
 struct MemberStats {
     takes_delivered: u64,
     champion_runs: u64,
@@ -87,7 +87,7 @@ struct SwarmMemberRuntime {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default)]
 struct RunSummary {
     run_id: String,
     status: String,
@@ -129,14 +129,12 @@ struct SwarmContextPackCache {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct ContextPackSummary {
     at: u64,
     chars: usize,
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct MemberState {
     member_id: String,
     provider: String,
@@ -151,7 +149,6 @@ struct MemberState {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct SwarmState {
     swarm_id: String,
     workspace_id: String,
@@ -166,7 +163,6 @@ struct SwarmState {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct SwarmRunEvent {
     seq: u64,
     run_id: String,
@@ -180,14 +176,103 @@ struct SwarmRunEvent {
     data: Option<Value>,
 }
 
+fn swarm_persisted_key(key: String, to_runtime: bool) -> String {
+    let mapped = if to_runtime {
+        match key.as_str() {
+            "activeRunId" => "active_run_id",
+            "championMemberId" => "champion_member_id",
+            "championRuns" => "champion_runs",
+            "contextPack" => "context_pack",
+            "exitCode" => "exit_code",
+            "fuseChars" => "fuse_chars",
+            "inputReady" => "input_ready",
+            "lastActivityAt" => "last_activity_at",
+            "memberId" => "member_id",
+            "paneId" => "pane_id",
+            "repoPath" => "repo_path",
+            "resultSummary" => "result_summary",
+            "runId" => "run_id",
+            "scoutMemberId" => "scout_member_id",
+            "scoutRuns" => "scout_runs",
+            "settledAt" => "settled_at",
+            "startedAt" => "started_at",
+            "swarmId" => "swarm_id",
+            "takesDelivered" => "takes_delivered",
+            "timedOut" => "timed_out",
+            "updatedAt" => "updated_at",
+            "verifyCommand" => "verify_command",
+            "winnerMemberId" => "winner_member_id",
+            "workspaceId" => "workspace_id",
+            _ => return key,
+        }
+    } else {
+        match key.as_str() {
+            "active_run_id" => "activeRunId",
+            "champion_member_id" => "championMemberId",
+            "champion_runs" => "championRuns",
+            "context_pack" => "contextPack",
+            "exit_code" => "exitCode",
+            "fuse_chars" => "fuseChars",
+            "input_ready" => "inputReady",
+            "last_activity_at" => "lastActivityAt",
+            "member_id" => "memberId",
+            "pane_id" => "paneId",
+            "repo_path" => "repoPath",
+            "result_summary" => "resultSummary",
+            "run_id" => "runId",
+            "scout_member_id" => "scoutMemberId",
+            "scout_runs" => "scoutRuns",
+            "settled_at" => "settledAt",
+            "started_at" => "startedAt",
+            "swarm_id" => "swarmId",
+            "takes_delivered" => "takesDelivered",
+            "timed_out" => "timedOut",
+            "updated_at" => "updatedAt",
+            "verify_command" => "verifyCommand",
+            "winner_member_id" => "winnerMemberId",
+            "workspace_id" => "workspaceId",
+            _ => return key,
+        }
+    };
+    mapped.to_string()
+}
+
+fn swarm_map_persisted_keys(value: Value, to_runtime: bool) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| swarm_map_persisted_keys(item, to_runtime))
+                .collect(),
+        ),
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .map(|(key, item)| {
+                    (
+                        swarm_persisted_key(key, to_runtime),
+                        swarm_map_persisted_keys(item, to_runtime),
+                    )
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn swarm_run_event_from_persisted_line(line: &str) -> Option<SwarmRunEvent> {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .map(|value| swarm_map_persisted_keys(value, true))
+        .and_then(|value| serde_json::from_value::<SwarmRunEvent>(value).ok())
+}
+
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct SwarmSubmitTaskResult {
     run_id: String,
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct SwarmRunEventsResult {
     events: Vec<SwarmRunEvent>,
     latest_seq: u64,
@@ -647,7 +732,9 @@ fn swarm_load_config(workspace_id: &str, swarm_id: &str) -> SwarmConfig {
     };
     let mut config = fs::read_to_string(path)
         .ok()
-        .and_then(|text| serde_json::from_str::<SwarmConfig>(&text).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .map(|value| swarm_map_persisted_keys(value, true))
+        .and_then(|value| serde_json::from_value::<SwarmConfig>(value).ok())
         .unwrap_or_else(|| SwarmConfig {
             swarm_id: swarm_id.to_string(),
             workspace_id: workspace_id.to_string(),
@@ -668,7 +755,10 @@ fn swarm_save_config(config: &SwarmConfig) -> Result<(), String> {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Unable to create swarm config directory: {error}"))?;
     }
-    let bytes = serde_json::to_vec_pretty(config)
+    let persisted = serde_json::to_value(config)
+        .map(|value| swarm_map_persisted_keys(value, false))
+        .map_err(|error| format!("Unable to serialize swarm config: {error}"))?;
+    let bytes = serde_json::to_vec_pretty(&persisted)
         .map_err(|error| format!("Unable to serialize swarm config: {error}"))?;
     fs::write(path, bytes).map_err(|error| format!("Unable to write swarm config: {error}"))
 }
@@ -807,7 +897,7 @@ fn swarm_load_run_events(workspace_id: &str, swarm_id: &str, run_id: &str) -> Ve
         return Vec::new();
     };
     text.lines()
-        .filter_map(|line| serde_json::from_str::<SwarmRunEvent>(line).ok())
+        .filter_map(swarm_run_event_from_persisted_line)
         .collect()
 }
 
@@ -879,7 +969,7 @@ fn swarm_apply_event_stats(
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
             })
-            .and_then(|data| data.get("winnerMemberId"))
+            .and_then(|data| data.get("winner_member_id"))
             .and_then(Value::as_str)
         {
             let member_stats = stats.entry(winner.to_string()).or_default();
@@ -929,7 +1019,7 @@ fn swarm_load_run_summaries_and_stats(
         let mut run_mode = "plan".to_string();
         for event in text
             .lines()
-            .filter_map(|line| serde_json::from_str::<SwarmRunEvent>(line).ok())
+            .filter_map(swarm_run_event_from_persisted_line)
         {
             if event.kind == "run_started" {
                 run_mode = event
@@ -1036,8 +1126,8 @@ fn swarm_emit_state(app: &AppHandle, workspace_id: &str, swarm_id: &str) {
     let _ = app.emit(
         SWARM_STATE_EVENT,
         json!({
-            "workspaceId": workspace_id,
-            "swarmId": swarm_id,
+            "workspace_id": workspace_id,
+            "swarm_id": swarm_id,
         }),
     );
 }
@@ -1051,9 +1141,9 @@ fn swarm_emit_run_event(
     let _ = app.emit(
         SWARM_RUN_EVENT,
         json!({
-            "workspaceId": workspace_id,
-            "swarmId": swarm_id,
-            "runId": event.run_id,
+            "workspace_id": workspace_id,
+            "swarm_id": swarm_id,
+            "run_id": event.run_id,
             "event": event,
         }),
     );
@@ -1080,7 +1170,7 @@ async fn swarm_append_run_event(
         .ok()
         .map(|body| {
             body.lines()
-                .filter_map(|line| serde_json::from_str::<SwarmRunEvent>(line).ok())
+                .filter_map(swarm_run_event_from_persisted_line)
                 .map(|event| event.seq)
                 .max()
                 .unwrap_or(0)
@@ -1095,7 +1185,10 @@ async fn swarm_append_run_event(
         text,
         data,
     };
-    let line = serde_json::to_string(&event)
+    let persisted = serde_json::to_value(&event)
+        .map(|value| swarm_map_persisted_keys(value, false))
+        .map_err(|error| format!("Unable to serialize swarm run event: {error}"))?;
+    let line = serde_json::to_string(&persisted)
         .map_err(|error| format!("Unable to serialize swarm run event: {error}"))?;
     let mut file = fs::OpenOptions::new()
         .create(true)
@@ -1764,7 +1857,7 @@ async fn swarm_member_take_task(
                 &workspace_id,
                 &swarm_id,
                 &member.member_id,
-                "takesDelivered",
+                "takes_delivered",
             )
             .await;
             SwarmTakeResult {
@@ -2044,7 +2137,7 @@ async fn swarm_context_pack_phase(
         Some(json!({ "chars": chars, "incremental": incremental })),
     )
     .await;
-    swarm_increment_member_stat(state, workspace_id, swarm_id, &scout.member_id, "scoutRuns").await;
+    swarm_increment_member_stat(state, workspace_id, swarm_id, &scout.member_id, "scout_runs").await;
     swarm_emit_state(app, workspace_id, swarm_id);
     Some(pack_text)
 }
@@ -2062,13 +2155,13 @@ async fn swarm_increment_member_stat(
         return;
     };
     match stat {
-        "takesDelivered" => {
+        "takes_delivered" => {
             member.stats.takes_delivered = member.stats.takes_delivered.saturating_add(1)
         }
-        "championRuns" => member.stats.champion_runs = member.stats.champion_runs.saturating_add(1),
+        "champion_runs" => member.stats.champion_runs = member.stats.champion_runs.saturating_add(1),
         "reaps" => member.stats.reaps = member.stats.reaps.saturating_add(1),
         "errors" => member.stats.errors = member.stats.errors.saturating_add(1),
-        "scoutRuns" => member.stats.scout_runs = member.stats.scout_runs.saturating_add(1),
+        "scout_runs" => member.stats.scout_runs = member.stats.scout_runs.saturating_add(1),
         _ => {}
     }
 }
@@ -2423,8 +2516,8 @@ async fn swarm_run_verification_once(
         Some(output_tail),
         Some(json!({
             "ok": outcome.ok,
-            "exitCode": outcome.exit_code,
-            "timedOut": outcome.timed_out,
+            "exit_code": outcome.exit_code,
+            "timed_out": outcome.timed_out,
         })),
     )
     .await;
@@ -2774,7 +2867,7 @@ async fn swarm_run_conductor(
             .await;
             if let Some(winner) = converged_take.as_ref() {
                 gate_data.insert(
-                    "winnerMemberId".to_string(),
+                    "winner_member_id".to_string(),
                     json!(winner.member_id.clone()),
                 );
             }
@@ -2804,7 +2897,7 @@ async fn swarm_run_conductor(
     } else {
         trimmed_fuse_chars
     };
-    gate_data.insert("fuseChars".to_string(), json!(fuse_chars));
+    gate_data.insert("fuse_chars".to_string(), json!(fuse_chars));
 
     let _ = swarm_append_run_event(
         &app,
@@ -2850,7 +2943,7 @@ async fn swarm_run_conductor(
                 &workspace_id,
                 &swarm_id,
                 &winner.member_id,
-                "championRuns",
+                "champion_runs",
             )
             .await;
             let result = format!(
@@ -2904,7 +2997,7 @@ async fn swarm_run_conductor(
         &workspace_id,
         &swarm_id,
         &champion.member_id,
-        "championRuns",
+        "champion_runs",
     )
     .await;
 
@@ -3196,7 +3289,7 @@ fn swarm_spawn_readiness_monitor(
     });
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn swarm_get_state(
     state: State<'_, SwarmRuntimeState>,
     terminal_state: State<'_, TerminalState>,
@@ -3211,7 +3304,7 @@ async fn swarm_get_state(
     Ok(swarm_state_from_data(&data))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn swarm_configure(
     app: AppHandle,
     state: State<'_, SwarmRuntimeState>,
@@ -3298,7 +3391,7 @@ async fn swarm_configure(
     Ok(swarm_state_from_data(&data))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn swarm_member_restart(
     app: AppHandle,
     state: State<'_, SwarmRuntimeState>,
@@ -3381,7 +3474,7 @@ async fn swarm_activate_internal(
     Ok(swarm_state_from_data(&data))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn swarm_activate(
     app: AppHandle,
     state: State<'_, SwarmRuntimeState>,
@@ -3498,7 +3591,7 @@ pub(crate) async fn swarm_submit_task_internal(
     Ok(run_id)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn swarm_submit_task(
     app: AppHandle,
     state: State<'_, SwarmRuntimeState>,
@@ -3521,7 +3614,7 @@ async fn swarm_submit_task(
     Ok(SwarmSubmitTaskResult { run_id })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn swarm_cancel_run(
     app: AppHandle,
     state: State<'_, SwarmRuntimeState>,
@@ -3565,7 +3658,7 @@ async fn swarm_cancel_run(
     Ok(swarm_state_from_data(&data))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn swarm_run_events(
     workspace_id: String,
     swarm_id: String,
@@ -3584,7 +3677,7 @@ async fn swarm_run_events(
     })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn swarm_dispose(
     app: AppHandle,
     state: State<'_, SwarmRuntimeState>,
@@ -3760,9 +3853,9 @@ mod swarm_runtime_tests {
     fn swarm_config_defaults_missing_verify_command() {
         let config = serde_json::from_str::<SwarmConfig>(
             r#"{
-                "swarmId": "swarm-abc",
-                "workspaceId": "workspace",
-                "repoPath": "/repo",
+                "swarm_id": "swarm-abc",
+                "workspace_id": "workspace",
+                "repo_path": "/repo",
                 "members": []
             }"#,
         )

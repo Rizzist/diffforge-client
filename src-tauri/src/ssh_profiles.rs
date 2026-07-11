@@ -25,7 +25,6 @@ static SSH_PASSWORD_AUTOFILL_ACTIVE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SSH_PASSWORD_AUTOFILL_NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct SshProfilesRegistry {
     profiles: Vec<SshProfileRecord>,
 }
@@ -47,7 +46,6 @@ struct SshProfileRecord {
 }
 
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct SshProfileSummary {
     id: String,
     name: String,
@@ -63,13 +61,11 @@ struct SshProfileSummary {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct SshProfilesListResult {
     profiles: Vec<SshProfileSummary>,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct SshProfileSaveRequest {
     id: Option<String>,
     name: String,
@@ -95,7 +91,6 @@ struct SshProfileValidatedRequest {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalSshConnectResult {
     started: bool,
     message: String,
@@ -289,7 +284,7 @@ fn ssh_profile_sort_key(profile: &SshProfileSummary) -> (String, String) {
     (profile.name.to_ascii_lowercase(), profile.id.clone())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn ssh_profiles_list() -> Result<SshProfilesListResult, String> {
     let _guard = ssh_profiles_store_lock()
         .lock()
@@ -304,7 +299,7 @@ fn ssh_profiles_list() -> Result<SshProfilesListResult, String> {
     Ok(SshProfilesListResult { profiles })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn ssh_profile_save(request: SshProfileSaveRequest) -> Result<SshProfileSummary, String> {
     let request = ssh_profile_validate_request(request)?;
     let _guard = ssh_profiles_store_lock()
@@ -358,7 +353,7 @@ fn ssh_profile_save(request: SshProfileSaveRequest) -> Result<SshProfileSummary,
     Ok(ssh_profile_summary(&saved))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn ssh_profile_delete(profile_id: String) -> Result<bool, String> {
     let profile_id = profile_id.trim().to_string();
     if profile_id.is_empty() {
@@ -704,7 +699,7 @@ async fn ssh_terminal_ready_instance(
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_ssh_connect(
     app: AppHandle,
     state: State<'_, TerminalState>,

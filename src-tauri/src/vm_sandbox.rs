@@ -29,7 +29,6 @@ impl Default for VmSandboxState {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 pub struct VmSandboxRuntimeStatus {
     installed: bool,
     runtime_installed: bool,
@@ -51,7 +50,6 @@ pub struct VmSandboxRuntimeStatus {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 pub struct VmSandboxRuntimeProgress {
     state: String,
     downloaded_bytes: u64,
@@ -584,12 +582,12 @@ async fn vm_sandbox_download_runtime_archive(
     Ok(archive_path)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn vm_sandbox_runtime_status(app: AppHandle) -> Result<VmSandboxRuntimeStatus, String> {
     vm_sandbox_runtime_status_for(&app)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn vm_sandbox_install_runtime(
     app: AppHandle,
     vm_sandbox_state: State<'_, VmSandboxState>,

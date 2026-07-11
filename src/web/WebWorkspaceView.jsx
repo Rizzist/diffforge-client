@@ -21,7 +21,7 @@ export function workspaceWebTabPaneId(workspaceId) {
 }
 
 export default function WebWorkspaceView({
-  isActive = true,
+  is_active: isActive = true,
   onFocusWebTabPopout = null,
   onPopOutWebTab = null,
   onReturnWebTabPopout = null,
@@ -47,7 +47,7 @@ export default function WebWorkspaceView({
   const popoutLabel = String(webTabSession?.popoutLabel || webTabSession?.label || "").trim();
   const poppedOut = Boolean(webTabSession?.poppedOut || popoutLabel);
   const resumeNonce = Number(webTabSession?.resumeNonce || 0);
-  const adoptWebviewLabel = String(webTabSession?.webviewLabel || "").trim();
+  const adoptWebviewLabel = String(webTabSession?.webview_label || "").trim();
   const adoptNonce = Number(webTabSession?.adoptNonce || 0);
 
   const handleNativeLabelChange = useCallback((_paneId, label) => {
@@ -70,7 +70,7 @@ export default function WebWorkspaceView({
     }
     lastUrlRef.current = safeUrl;
     setCurrentUrl(safeUrl);
-    onWebTabNavigate?.({ paneId, url: safeUrl, workspaceId });
+    onWebTabNavigate?.({ pane_id: paneId, url: safeUrl, workspace_id: workspaceId });
   }, [onWebTabNavigate, paneId, workspaceId]);
 
   useEffect(() => {
@@ -95,14 +95,14 @@ export default function WebWorkspaceView({
     const targetUrl = normalizeWebInput(url || lastUrlRef.current) || DEFAULT_WEB_URL;
     rememberUrl(targetUrl);
     if (poppedOut) {
-      onFocusWebTabPopout?.({ label: popoutLabel, paneId, url: targetUrl, workspaceId });
+      onFocusWebTabPopout?.({ label: popoutLabel, pane_id: paneId, url: targetUrl, workspace_id: workspaceId });
       return;
     }
-    onPopOutWebTab?.({ paneId, url: targetUrl, workspaceId });
+    onPopOutWebTab?.({ pane_id: paneId, url: targetUrl, workspace_id: workspaceId });
   }, [onFocusWebTabPopout, onPopOutWebTab, paneId, popoutLabel, poppedOut, rememberUrl, workspaceId]);
 
   const focusWebTabPopout = useCallback(() => {
-    onFocusWebTabPopout?.({ label: popoutLabel, paneId, url: currentUrl, workspaceId });
+    onFocusWebTabPopout?.({ label: popoutLabel, pane_id: paneId, url: currentUrl, workspace_id: workspaceId });
   }, [currentUrl, onFocusWebTabPopout, paneId, popoutLabel, workspaceId]);
 
   const returnWebTabPopout = useCallback((_terminalIndex, _paneId, url) => {
@@ -111,25 +111,25 @@ export default function WebWorkspaceView({
       || lastUrlRef.current
       || DEFAULT_WEB_URL;
     rememberUrl(returnUrl);
-    onReturnWebTabPopout?.({ label: popoutLabel, paneId, url: returnUrl, workspaceId });
+    onReturnWebTabPopout?.({ label: popoutLabel, pane_id: paneId, url: returnUrl, workspace_id: workspaceId });
   }, [onReturnWebTabPopout, paneId, popoutLabel, rememberUrl, workspaceId]);
 
   const requestAgentPromptTargets = useCallback(() => {
     const requestId = createPanelAgentPromptRequestId("web-tab-targets");
     agentPromptTargetsRequestIdRef.current = requestId;
     emit(PANEL_AGENT_PROMPT_TARGETS_REQUEST_EVENT, {
-      panelKind: "web",
-      paneId,
-      requestId,
-      workspaceId,
+      panel_kind: "web",
+      pane_id: paneId,
+      request_id: requestId,
+      workspace_id: workspaceId,
     }).catch(() => {});
   }, [paneId, workspaceId]);
 
   const requestAgentPromptActivity = useCallback(() => {
     emit(PANEL_AGENT_PROMPT_ACTIVITY_REQUEST_EVENT, {
-      panelKind: "web",
-      paneId,
-      workspaceId,
+      panel_kind: "web",
+      pane_id: paneId,
+      workspace_id: workspaceId,
     }).catch(() => {});
   }, [paneId, workspaceId]);
 
@@ -154,11 +154,11 @@ export default function WebWorkspaceView({
         return;
       }
       const payload = event?.payload || {};
-      const payloadPaneId = String(payload.paneId || payload.pane_id || payload.panelPaneId || payload.panel_pane_id || "").trim();
+      const payloadPaneId = String(payload.pane_id || payload.panel_pane_id || "").trim();
       if (!payloadPaneId || payloadPaneId !== paneId) {
         return;
       }
-      const payloadWorkspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
+      const payloadWorkspaceId = String(payload.workspace_id || "").trim();
       if (payloadWorkspaceId && workspaceId && payloadWorkspaceId !== workspaceId) {
         return;
       }
@@ -188,18 +188,18 @@ export default function WebWorkspaceView({
         return;
       }
       const payload = event?.payload || {};
-      const requestId = String(payload.requestId || payload.request_id || "").trim();
+      const requestId = String(payload.request_id || "").trim();
       if (requestId && requestId !== agentPromptTargetsRequestIdRef.current) {
         return;
       }
-      const payloadWorkspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
+      const payloadWorkspaceId = String(payload.workspace_id || "").trim();
       if (payloadWorkspaceId && workspaceId && payloadWorkspaceId !== workspaceId) {
         return;
       }
       setAgentPromptTargets(normalizePanelAgentPromptTargets(payload.targets));
       setDefaultAgentPromptTargetIds(
-        (Array.isArray(payload.defaultSelectedTargetIds)
-          ? payload.defaultSelectedTargetIds
+        (Array.isArray(payload.default_selected_target_ids)
+          ? payload.default_selected_target_ids
           : Array.isArray(payload.default_selected_target_ids)
             ? payload.default_selected_target_ids
             : []
@@ -221,7 +221,7 @@ export default function WebWorkspaceView({
     };
   }, [workspaceId]);
 
-  const submitAgentPrompt = useCallback(async ({ contextRefs, targetIds, targetTerminalIndexes, text }) => {
+  const submitAgentPrompt = useCallback(async ({ context_refs: contextRefs, target_ids: targetIds, target_terminal_indexes: targetTerminalIndexes, text }) => {
     const requestId = createPanelAgentPromptRequestId("web-tab-submit");
     let unlisten = () => {};
     return new Promise((resolve, reject) => {
@@ -239,7 +239,7 @@ export default function WebWorkspaceView({
       }, 15000);
       listen(PANEL_AGENT_PROMPT_RESULT_EVENT, (event) => {
         const payload = event?.payload || {};
-        if (String(payload.requestId || payload.request_id || "").trim() !== requestId) {
+        if (String(payload.request_id || "").trim() !== requestId) {
           return;
         }
         window.clearTimeout(timeoutId);
@@ -257,14 +257,14 @@ export default function WebWorkspaceView({
           }
           unlisten = nextUnlisten;
           emit(PANEL_AGENT_PROMPT_SUBMIT_EVENT, {
-            contextRefs,
-            panelKind: "web",
-            paneId,
-            requestId,
-            targetIds,
-            targetTerminalIndexes,
+            context_refs: contextRefs,
+            panel_kind: "web",
+            pane_id: paneId,
+            request_id: requestId,
+            target_ids: targetIds,
+            target_terminal_indexes: targetTerminalIndexes,
             text,
-            workspaceId,
+            workspace_id: workspaceId,
           }).catch((error) => {
             window.clearTimeout(timeoutId);
             cleanup();
@@ -290,13 +290,13 @@ export default function WebWorkspaceView({
   return (
     <WebPane
       key={`web-tab-${paneId}-${resumeNonce}`}
-      adoptLabel={adoptWebviewLabel}
+      adopt_label={adoptWebviewLabel}
       adoptNonce={adoptNonce}
       breakoutReturnUrl={currentUrl}
       defaultPanelAgentPromptTargetIds={defaultAgentPromptTargetIds}
       initialUrl={currentUrl}
       inlineToolbarInNav
-      isActive={isActive}
+      is_active={isActive}
       layoutKey={layoutKey}
       onNativeLabelChange={handleNativeLabelChange}
       onAgentPromptOpenChange={handleAgentPromptOpenChange}
@@ -305,7 +305,7 @@ export default function WebWorkspaceView({
       onPopOut={popOutWebTab}
       onReturnFromBreakout={returnWebTabPopout}
       onSubmitPanelAgentPrompt={submitAgentPrompt}
-      paneId={paneId}
+      pane_id={paneId}
       panelAgentPromptActivityItems={agentPromptActivityItems}
       panelAgentPromptTargets={agentPromptTargets}
       poppedOut={poppedOut}
@@ -315,7 +315,7 @@ export default function WebWorkspaceView({
       showFullscreenControl={false}
       showSplitControls={false}
       webviewObscured={webviewObscured}
-      workspaceId={workspaceId}
+      workspace_id={workspaceId}
     />
   );
 }

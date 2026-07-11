@@ -84,12 +84,12 @@ fn emit_tools_window_closed(app: &AppHandle, window_id: &str, mode: &str, key: &
         json!({
             "key": key,
             "mode": mode,
-            "windowId": window_id,
+            "window_id": window_id,
         }),
     );
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn tools_window_open(
     app: AppHandle,
     key: String,
@@ -178,7 +178,7 @@ fn tools_window_open(
     Ok(ToolsWindowOpenResult { label })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn tools_window_focus(app: AppHandle, label: String) -> Result<bool, String> {
     validate_tools_window_label(&label)?;
     let Some(window) = app.get_webview_window(&label) else {
@@ -189,7 +189,7 @@ fn tools_window_focus(app: AppHandle, label: String) -> Result<bool, String> {
     Ok(true)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn tools_window_close(app: AppHandle, label: String) -> Result<(), String> {
     validate_tools_window_label(&label)?;
     if let Some(window) = app.get_webview_window(&label) {

@@ -70,7 +70,6 @@ struct DockerContainerSnapshotCache {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct DeveloperProcessSnapshot {
     platform: &'static str,
     sampled_at_ms: u64,
@@ -84,7 +83,6 @@ struct DeveloperProcessSnapshot {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct DeveloperEnergySnapshot {
     sampled_at_ms: u64,
     total_score: f64,
@@ -108,7 +106,6 @@ impl DeveloperEnergySnapshot {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct DeveloperEnergyGroup {
     id: String,
     label: String,
@@ -174,7 +171,6 @@ struct DeveloperEnergyCloudSignals {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct TerminalActivitySnapshot {
     platform: &'static str,
     sampled_at_ms: u64,
@@ -197,7 +193,6 @@ struct TerminalActivitySnapshot {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct TerminalActivitySubagent {
     id: String,
     provider: String,
@@ -217,7 +212,6 @@ struct TerminalActivitySubagent {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct DeveloperProcessInfo {
     pid: u32,
     parent_pid: Option<u32>,
@@ -258,7 +252,6 @@ struct DeveloperProcessInfo {
 }
 
 #[derive(Serialize, Clone, PartialEq, Eq, Hash)]
-#[serde(rename_all = "camelCase")]
 struct DeveloperProcessPort {
     protocol: String,
     address: String,
@@ -266,7 +259,6 @@ struct DeveloperProcessPort {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct DeveloperProcessGroup {
     id: String,
     label: String,
@@ -284,7 +276,6 @@ struct DeveloperProcessGroup {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct DeveloperProcessKillResult {
     requested_pid: u32,
     include_tree: bool,
@@ -295,7 +286,6 @@ struct DeveloperProcessKillResult {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct DockerDeveloperActionResult {
     action: String,
     target_count: usize,
@@ -307,7 +297,6 @@ struct DockerDeveloperActionResult {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct DockerDeveloperCommandResult {
     program: String,
     args: Vec<String>,
@@ -406,7 +395,7 @@ struct DeveloperTerminalProcessRoot {
     agent_kind: String,
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn list_developer_processes(
     state: State<'_, DeveloperProcessMonitorState>,
     cloud_state: State<'_, CloudMcpState>,
@@ -431,7 +420,7 @@ async fn list_developer_processes(
     .await
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn developer_energy_snapshot(
     state: State<'_, DeveloperProcessMonitorState>,
     cloud_state: State<'_, CloudMcpState>,
@@ -950,7 +939,7 @@ async fn developer_energy_cloud_signals(
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_activity_snapshot(
     state: State<'_, DeveloperProcessMonitorState>,
     terminal_state: State<'_, TerminalState>,
@@ -1340,23 +1329,11 @@ fn terminal_activity_event_key(value: &str) -> String {
 fn terminal_activity_subagent_event_is_pending(event: &Value) -> bool {
     let status = terminal_activity_event_key(&terminal_activity_event_string(
         event,
-        &[
-            "permissionStatus",
-            "permission_status",
-            "approvalStatus",
-            "approval_status",
-            "status",
-        ],
+        &["permission_status", "approval_status", "status"],
     ));
     let decision = terminal_activity_event_key(&terminal_activity_event_string(
         event,
-        &[
-            "permissionDecision",
-            "permission_decision",
-            "approvalDecision",
-            "approval_decision",
-            "decision",
-        ],
+        &["permission_decision", "approval_decision", "decision"],
     ));
     let resolved = matches!(
         decision.as_str(),
@@ -1414,18 +1391,7 @@ fn terminal_activity_subagent_event_is_pending(event: &Value) -> bool {
             | "waitingforuser"
     ) || terminal_activity_event_bool(
         event,
-        &[
-            "manualApprovalRequired",
-            "manual_approval_required",
-            "providerBlockedForUser",
-            "provider_blocked_for_user",
-            "requiresUserInput",
-            "requires_user_input",
-            "terminalIsPromptingUser",
-            "terminal_is_prompting_user",
-            "promptingUser",
-            "prompting_user",
-        ],
+        &["manual_approval_required", "provider_blocked_for_user", "requires_user_input", "terminal_is_prompting_user", "prompting_user"],
     )
 }
 
@@ -1436,7 +1402,7 @@ fn terminal_activity_subagent_event_status(event_key: &str, event: &Value) -> St
 
     let status = terminal_activity_event_key(&terminal_activity_event_string(
         event,
-        &["status", "activityStatus", "activity_status", "commandPhase", "command_phase"],
+        &["status", "activity_status", "command_phase"],
     ));
     if matches!(
         status.as_str(),
@@ -1470,9 +1436,9 @@ fn terminal_activity_subagents_from_events(
         let Ok(event) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        let event_name = event["eventName"]
+        let event_name = event["event_name"]
             .as_str()
-            .or_else(|| event["hookEventName"].as_str())
+            .or_else(|| event["hook_event_name"].as_str())
             .unwrap_or_default();
         let event_key = event_name.to_ascii_lowercase();
         let provider = event["provider"]
@@ -1480,18 +1446,18 @@ fn terminal_activity_subagents_from_events(
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(fallback_provider)
             .to_string();
-        let timestamp_ms = event["timestampMs"]
+        let timestamp_ms = event["timestamp_ms"]
             .as_u64()
             .unwrap_or_else(current_time_ms);
-        let agent_id = event["agentId"].as_str().unwrap_or_default().trim();
-        let tool_use_id = event["toolUseId"].as_str().unwrap_or_default().trim();
-        let agent_type = event["agentType"]
+        let agent_id = event["agent_id"].as_str().unwrap_or_default().trim();
+        let tool_use_id = event["tool_use_id"].as_str().unwrap_or_default().trim();
+        let agent_type = event["agent_type"]
             .as_str()
-            .or_else(|| event["subagentType"].as_str())
+            .or_else(|| event["subagent_type"].as_str())
             .unwrap_or_default()
             .trim();
         let description = event["description"].as_str().unwrap_or_default().trim();
-        let is_agent_tool = event["toolName"]
+        let is_agent_tool = event["tool_name"]
             .as_str()
             .is_some_and(|tool| tool.eq_ignore_ascii_case("Agent") || tool.eq_ignore_ascii_case("Task"));
         let is_subagent_event = event_key == "subagentstart" || event_key == "subagentstop";
@@ -1523,8 +1489,8 @@ fn terminal_activity_subagents_from_events(
                 started_at_ms: Some(timestamp_ms),
                 finished_at_ms: None,
                 updated_at_ms: timestamp_ms,
-                transcript_path: event["transcriptPath"].as_str().unwrap_or_default().to_string(),
-                agent_transcript_path: event["agentTranscriptPath"]
+                transcript_path: event["transcript_path"].as_str().unwrap_or_default().to_string(),
+                agent_transcript_path: event["agent_transcript_path"]
                     .as_str()
                     .unwrap_or_default()
                     .to_string(),
@@ -1557,10 +1523,10 @@ fn terminal_activity_subagents_from_events(
             entry.status = event_status;
             entry.started_at_ms = entry.started_at_ms.or(Some(timestamp_ms));
         }
-        if let Some(value) = event["transcriptPath"].as_str().filter(|value| !value.trim().is_empty()) {
+        if let Some(value) = event["transcript_path"].as_str().filter(|value| !value.trim().is_empty()) {
             entry.transcript_path = value.to_string();
         }
-        if let Some(value) = event["agentTranscriptPath"]
+        if let Some(value) = event["agent_transcript_path"]
             .as_str()
             .filter(|value| !value.trim().is_empty())
         {
@@ -1568,17 +1534,11 @@ fn terminal_activity_subagents_from_events(
         }
         let last_message = terminal_activity_event_string(
             &event,
-            &[
-                "promptingUserText",
-                "prompting_user_text",
-                "lastMessage",
-                "last_message",
-                "message",
-            ],
+            &["prompting_user_text", "last_message", "message"],
         );
         if !last_message.is_empty() {
             entry.last_message = last_message;
-        } else if let Some(value) = event["lastMessage"].as_str().filter(|value| !value.trim().is_empty()) {
+        } else if let Some(value) = event["last_message"].as_str().filter(|value| !value.trim().is_empty()) {
             entry.last_message = value.to_string();
         }
         if is_subagent_event {
@@ -1868,7 +1828,7 @@ fn developer_process_pids_from_ss_line(line: &str) -> Vec<u32> {
     pids
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn kill_developer_process(
     state: State<'_, DeveloperProcessMonitorState>,
     pid: u32,
@@ -1967,7 +1927,7 @@ fn kill_developer_process(
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn docker_developer_action(
     state: State<'_, DeveloperProcessMonitorState>,
     action: String,
@@ -2055,11 +2015,11 @@ fn docker_container_from_ps_line(line: &Value) -> Option<Value> {
         "health": health,
         "ports": line["Ports"].as_str().unwrap_or_default(),
         "command": line["Command"].as_str().unwrap_or_default().trim_matches('"'),
-        "createdAt": line["CreatedAt"].as_str().unwrap_or_default(),
-        "runningFor": line["RunningFor"].as_str().unwrap_or_default(),
+        "created_at": line["CreatedAt"].as_str().unwrap_or_default(),
+        "running_for": line["RunningFor"].as_str().unwrap_or_default(),
         "networks": line["Networks"].as_str().unwrap_or_default(),
-        "composeProject": docker_ps_labels_value(labels, "com.docker.compose.project"),
-        "composeService": docker_ps_labels_value(labels, "com.docker.compose.service"),
+        "compose_project": docker_ps_labels_value(labels, "com.docker.compose.project"),
+        "compose_service": docker_ps_labels_value(labels, "com.docker.compose.service"),
     }))
 }
 
@@ -2094,7 +2054,7 @@ fn docker_cli_is_missing(result: &DockerDeveloperCommandResult) -> bool {
 /// workspace-linked ones) with identity, state, ports, and optional live
 /// stats. Runs entirely through the Rust CLI bridge so the panel keeps
 /// working in background/headless mode.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn docker_containers_snapshot(
     state: State<'_, DeveloperProcessMonitorState>,
     include_stats: Option<bool>,
@@ -2184,7 +2144,7 @@ fn docker_containers_snapshot_blocking(include_stats: bool) -> Result<Value, Str
         if docker_cli_is_missing(&ps) {
             return Ok(json!({
                 "available": false,
-                "daemonRunning": false,
+                "daemon_running": false,
                 "state": "cli_missing",
                 "message": "The docker CLI is not installed.",
                 "containers": [],
@@ -2199,7 +2159,7 @@ fn docker_containers_snapshot_blocking(include_stats: bool) -> Result<Value, Str
         {
             return Ok(json!({
                 "available": true,
-                "daemonRunning": false,
+                "daemon_running": false,
                 "state": "daemon_unreachable",
                 "message": ps.stderr.lines().next().unwrap_or("The Docker daemon is not running."),
                 "containers": [],
@@ -2258,13 +2218,13 @@ fn docker_containers_snapshot_blocking(include_stats: bool) -> Result<Value, Str
             for container in containers.iter_mut() {
                 let id = container["id"].as_str().unwrap_or_default().to_string();
                 if let Some(entry) = stats_by_id.get(&id) {
-                    container["cpuPercent"] = json!(docker_stats_percent(
+                    container["cpu_percent"] = json!(docker_stats_percent(
                         entry["CPUPerc"].as_str().unwrap_or_default()
                     ));
-                    container["memPercent"] = json!(docker_stats_percent(
+                    container["mem_percent"] = json!(docker_stats_percent(
                         entry["MemPerc"].as_str().unwrap_or_default()
                     ));
-                    container["memUsage"] = json!(entry["MemUsage"].as_str().unwrap_or_default());
+                    container["mem_usage"] = json!(entry["MemUsage"].as_str().unwrap_or_default());
                     container["pids"] = entry["PIDs"]
                         .as_str()
                         .and_then(|value| value.trim().parse::<u64>().ok())
@@ -2288,17 +2248,17 @@ fn docker_containers_snapshot_blocking(include_stats: bool) -> Result<Value, Str
 
     Ok(json!({
         "available": true,
-        "daemonRunning": true,
+        "daemon_running": true,
         "state": "ok",
         "containers": containers,
-        "statsSampled": stats_sampled,
-        "fetchedAtMs": current_time_ms(),
+        "stats_sampled": stats_sampled,
+        "fetched_at_ms": current_time_ms(),
     }))
 }
 
 /// Per-container control (start/stop/restart/pause/unpause/remove) with a
 /// feedback payload the Processes tab renders inline.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn docker_container_action(
     state: State<'_, DeveloperProcessMonitorState>,
     container_ref: String,
@@ -2354,17 +2314,17 @@ fn docker_container_action_blocking(container_ref: &str, action: &str) -> Result
     Ok(json!({
         "ok": result.success,
         "action": action,
-        "containerRef": container_ref,
-        "exitCode": result.exit_code,
+        "container_ref": container_ref,
+        "exit_code": result.exit_code,
         "stdout": result.stdout,
         "stderr": result.stderr,
-        "durationMs": result.duration_ms,
+        "duration_ms": result.duration_ms,
         "message": message,
     }))
 }
 
 /// Tail of a container's logs for the Processes tab detail view.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn docker_container_logs(container_ref: String, tail: Option<u32>) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         docker_container_logs_blocking(&container_ref, tail)
@@ -2415,11 +2375,11 @@ fn docker_container_logs_blocking(container_ref: &str, tail: Option<u32>) -> Res
 
     Ok(json!({
         "ok": true,
-        "containerRef": container_ref,
+        "container_ref": container_ref,
         "tail": tail,
         "output": output,
         "truncated": truncated,
-        "durationMs": result.duration_ms,
+        "duration_ms": result.duration_ms,
     }))
 }
 
@@ -5039,8 +4999,8 @@ mod developer_process_docker_tests {
         assert_eq!(container["name"], "web-1");
         assert_eq!(container["state"], "running");
         assert_eq!(container["health"], "healthy");
-        assert_eq!(container["composeProject"], "shop");
-        assert_eq!(container["composeService"], "web");
+        assert_eq!(container["compose_project"], "shop");
+        assert_eq!(container["compose_service"], "web");
         assert_eq!(container["ports"], "0.0.0.0:8080->80/tcp");
     }
 
@@ -5167,23 +5127,23 @@ mod developer_process_docker_tests {
         ));
         let body = [
             json!({
-                "timestampMs": 1000,
-                "eventName": "PreToolUse",
+                "timestamp_ms": 1000,
+                "event_name": "PreToolUse",
                 "provider": "claude",
-                "toolName": "Task",
-                "toolUseId": "tool-1",
-                "agentType": "Halley",
+                "tool_name": "Task",
+                "tool_use_id": "tool-1",
+                "agent_type": "Halley",
                 "description": "Check the database",
             })
             .to_string(),
             json!({
-                "timestampMs": 1100,
-                "eventName": "PermissionPrompt",
+                "timestamp_ms": 1100,
+                "event_name": "PermissionPrompt",
                 "provider": "claude",
-                "toolUseId": "tool-1",
-                "agentType": "Halley",
-                "requiresUserInput": true,
-                "promptingUserText": "Approve database inspection",
+                "tool_use_id": "tool-1",
+                "agent_type": "Halley",
+                "requires_user_input": true,
+                "prompting_user_text": "Approve database inspection",
             })
             .to_string(),
         ]

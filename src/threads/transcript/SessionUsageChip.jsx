@@ -20,7 +20,7 @@ export const SessionUsageChip = memo(function SessionUsageChip({ stats = null, m
     <UsageChip title={tooltip || undefined}>
       <b>{formatTokensCompact(totalTokens)}</b>
       tokens
-      {Number.isFinite(totals?.costUsd) ? <b>${totals.costUsd.toFixed(2)}</b> : null}
+      {Number.isFinite(totals?.cost_usd) ? <b>${totals.cost_usd.toFixed(2)}</b> : null}
     </UsageChip>
   );
 });

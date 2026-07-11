@@ -137,7 +137,7 @@ fn app_update_store_last_error(error: Option<String>) {
 
 fn app_update_settings_to_value() -> Value {
     json!({
-        "autoRestartWhenIdle": APP_UPDATE_AUTO_WHEN_IDLE.load(Ordering::Acquire),
+        "auto_restart_when_idle": APP_UPDATE_AUTO_WHEN_IDLE.load(Ordering::Acquire),
     })
 }
 
@@ -176,7 +176,7 @@ fn app_update_effective_auto_restart_when_idle_for_current_process(persisted_aut
 pub(crate) fn app_update_settings_initialize(app: &AppHandle) {
     let raw = app_local_state_read(app, APP_UPDATE_SETTINGS_STATE_KEY);
     let persisted_auto = raw
-        .get("autoRestartWhenIdle")
+        .get("auto_restart_when_idle")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let auto = app_update_effective_auto_restart_when_idle_for_current_process(persisted_auto);
@@ -194,7 +194,7 @@ fn app_update_settings_save(
     app_local_state_write(
         app,
         APP_UPDATE_SETTINGS_STATE_KEY,
-        &json!({ "autoRestartWhenIdle": auto_restart_when_idle }),
+        &json!({ "auto_restart_when_idle": auto_restart_when_idle }),
     )?;
     Ok(value)
 }
@@ -282,9 +282,9 @@ fn app_update_status_snapshot() -> Value {
         "installing": APP_UPDATE_INSTALLING.load(Ordering::Acquire),
         "ready": staged.is_some(),
         "staged": staged,
-        "autoRestartWhenIdle": APP_UPDATE_AUTO_WHEN_IDLE.load(Ordering::Acquire),
+        "auto_restart_when_idle": APP_UPDATE_AUTO_WHEN_IDLE.load(Ordering::Acquire),
         "error": app_update_last_error(),
-        "currentVersion": env!("CARGO_PKG_VERSION"),
+        "current_version": env!("CARGO_PKG_VERSION"),
     })
 }
 
@@ -690,17 +690,17 @@ async fn app_update_auto_restart_watch(app: &AppHandle) {
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn app_update_status() -> Value {
     app_update_status_snapshot()
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn app_update_settings_state() -> Value {
     app_update_settings_to_value()
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn app_update_settings_update(
     app: AppHandle,
     auto_restart_when_idle: bool,
@@ -712,13 +712,13 @@ async fn app_update_settings_update(
     .map_err(|error| format!("App update settings worker failed: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn app_update_check_now(app: AppHandle) -> Result<Value, String> {
     app_updater_run_check(&app).await?;
     Ok(app_update_status_snapshot())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn app_update_install_and_restart(app: AppHandle) -> Result<(), String> {
     if APP_UPDATE_INSTALLING.swap(true, Ordering::AcqRel) {
         return Err("An update install is already in progress.".to_string());
@@ -740,7 +740,7 @@ async fn app_update_install_and_restart(app: AppHandle) -> Result<(), String> {
     result
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn app_update_download(app: AppHandle) -> Result<Value, String> {
     if APP_UPDATE_INSTALLING.swap(true, Ordering::AcqRel) {
         return Err("An update download is already in progress.".to_string());
@@ -762,7 +762,7 @@ async fn app_update_download(app: AppHandle) -> Result<Value, String> {
     result
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn app_update_restart(app: AppHandle) -> Result<(), String> {
     if APP_UPDATE_INSTALLING.swap(true, Ordering::AcqRel) {
         return Err("An update operation is already in progress.".to_string());

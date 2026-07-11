@@ -33,8 +33,8 @@ const EDIT_PATCH = [
 
 test("parseUnifiedPatch parses multiple hunks with line numbers", () => {
   const parsed = parseUnifiedPatch(EDIT_PATCH);
-  assert.equal(parsed.oldPath, "src/lib.rs");
-  assert.equal(parsed.newPath, "src/lib.rs");
+  assert.equal(parsed.old_path, "src/lib.rs");
+  assert.equal(parsed.new_path, "src/lib.rs");
   assert.equal(parsed.binary, false);
   assert.equal(parsed.hunks.length, 2);
 
@@ -106,8 +106,8 @@ test("parseUnifiedPatch reads rename headers", () => {
     " export default a;",
   ].join("\n");
   const parsed = parseUnifiedPatch(patch);
-  assert.equal(parsed.oldPath, "old/name.js");
-  assert.equal(parsed.newPath, "new/name.js");
+  assert.equal(parsed.old_path, "old/name.js");
+  assert.equal(parsed.new_path, "new/name.js");
   assert.equal(parsed.hunks.length, 1);
 });
 
@@ -119,8 +119,8 @@ test("parseUnifiedPatch reads rename-only patches without ---/+++ lines", () => 
     "rename to b.txt",
   ].join("\n");
   const parsed = parseUnifiedPatch(patch);
-  assert.equal(parsed.oldPath, "a.txt");
-  assert.equal(parsed.newPath, "b.txt");
+  assert.equal(parsed.old_path, "a.txt");
+  assert.equal(parsed.new_path, "b.txt");
   assert.equal(parsed.hunks.length, 0);
 });
 
@@ -132,8 +132,8 @@ test("parseUnifiedPatch handles create and delete patches", () => {
     "+import os",
     "+print(os.name)",
   ].join("\n"));
-  assert.equal(create.oldPath, "");
-  assert.equal(create.newPath, "fresh.py");
+  assert.equal(create.old_path, "");
+  assert.equal(create.new_path, "fresh.py");
   assert.deepEqual(
     create.hunks[0].lines.map((line) => [line.type, line.oldLine, line.newLine]),
     [["add", null, 1], ["add", null, 2]],
@@ -146,7 +146,7 @@ test("parseUnifiedPatch handles create and delete patches", () => {
     "-import os",
     "-print(os.name)",
   ].join("\n"));
-  assert.equal(remove.newPath, "");
+  assert.equal(remove.new_path, "");
   assert.deepEqual(
     remove.hunks[0].lines.map((line) => [line.type, line.oldLine, line.newLine]),
     [["del", 1, null], ["del", 2, null]],
@@ -225,7 +225,6 @@ test("parseUnifiedPatch drops the phantom empty line on CRLF patches too", () =>
     " a",
     "",
     " b",
-    "",
   ].join("\n"));
   assert.deepEqual(
     interior.hunks[0].lines.map((line) => [line.type, line.text]),
@@ -271,8 +270,8 @@ test("parseUnifiedPatch strips quoted paths", () => {
     "-x",
     "+y",
   ].join("\n"));
-  assert.equal(parsed.oldPath, "sp ace.txt");
-  assert.equal(parsed.newPath, "sp ace.txt");
+  assert.equal(parsed.old_path, "sp ace.txt");
+  assert.equal(parsed.new_path, "sp ace.txt");
 });
 
 /* ------------------------------------------------------------------ */
@@ -317,7 +316,7 @@ test("languageFromPath maps extensions to shiki languages", () => {
 /* normalizeTurnDiffFile (§1 file entries)                              */
 /* ------------------------------------------------------------------ */
 
-test("normalizeTurnDiffFile reads snake_case and camelCase aliases", () => {
+test("normalizeTurnDiffFile reads snake_case keys and tolerates sparse entries", () => {
   const snake = normalizeTurnDiffFile({
     path: "src/a.rs",
     old_path: "src/b.rs",
@@ -328,21 +327,21 @@ test("normalizeTurnDiffFile reads snake_case and camelCase aliases", () => {
     patch_truncated: true,
   });
   assert.equal(snake.path, "src/a.rs");
-  assert.equal(snake.oldPath, "src/b.rs");
+  assert.equal(snake.old_path, "src/b.rs");
   assert.equal(snake.kind, "rename");
   assert.equal(snake.additions, 3);
   assert.equal(snake.deletions, 1);
-  assert.equal(snake.patchTruncated, true);
+  assert.equal(snake.patch_truncated, true);
   assert.equal(snake.binary, false);
 
   const camel = normalizeTurnDiffFile({
     path: "src/a.rs",
-    oldPath: "src/b.rs",
+    old_path: "src/b.rs",
     kind: "rename",
-    patchTruncated: true,
+    patch_truncated: true,
   });
-  assert.equal(camel.oldPath, "src/b.rs");
-  assert.equal(camel.patchTruncated, true);
+  assert.equal(camel.old_path, "src/b.rs");
+  assert.equal(camel.patch_truncated, true);
   assert.equal(camel.patch, null);
 });
 

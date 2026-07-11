@@ -117,10 +117,10 @@ function flushSession(session) {
       session.queue.shift();
       batch.push(next.data);
       batchBytes += next.data.byteLength;
-      inputBytes += next.inputBytes;
-      visibleChars += next.visibleChars;
-      sourceChunks += next.sourceChunks;
-      inspectionText = `${inspectionText}${next.inspectionText || ""}`.slice(-INSPECTION_TEXT_LIMIT);
+      inputBytes += next.input_bytes;
+      visibleChars += next.visible_chars;
+      sourceChunks += next.source_chunks;
+      inspectionText = `${inspectionText}${next.inspection_text || ""}`.slice(-INSPECTION_TEXT_LIMIT);
       continue;
     }
 
@@ -129,13 +129,13 @@ function flushSession(session) {
     const splitRatio = remainingBudget / Math.max(1, next.data.byteLength);
     batch.push(head);
     batchBytes += head.byteLength;
-    inputBytes += Math.round(next.inputBytes * splitRatio);
+    inputBytes += Math.round(next.input_bytes * splitRatio);
     visibleChars += visibleByteEstimate(head, 1);
     sourceChunks += 1;
     next.data = tail;
-    next.inputBytes = Math.max(0, next.inputBytes - Math.round(next.inputBytes * splitRatio));
-    next.visibleChars = visibleByteEstimate(tail, 1);
-    next.inspectionText = "";
+    next.input_bytes = Math.max(0, next.input_bytes - Math.round(next.input_bytes * splitRatio));
+    next.visible_chars = visibleByteEstimate(tail, 1);
+    next.inspection_text = "";
   }
 
   session.queuedBytes = Math.max(0, session.queuedBytes - batchBytes);
@@ -156,13 +156,13 @@ function flushSession(session) {
     data: output.buffer,
     displayBytes: output.byteLength,
     id: session.id,
-    inputBytes,
-    inspectionText,
-    sourceChunks,
+    input_bytes: inputBytes,
+    inspection_text: inspectionText,
+    source_chunks: sourceChunks,
     type: "output",
-    visibleChars,
+    visible_chars: visibleChars,
     workerQueueBytes: session.queuedBytes,
-    workerScheduledDelayMs: session.scheduledAt
+    worker_scheduled_delay_ms: session.scheduledAt
       ? performance.now() - session.scheduledAt
       : 0,
   }, [output.buffer]);
@@ -192,10 +192,10 @@ function enqueueChunk(id, rawData, options = {}) {
   const visibleChars = visibleByteEstimate(masked, 1);
   session.queue.push({
     data: masked,
-    inputBytes: rawBytes,
-    inspectionText,
-    sourceChunks: 1,
-    visibleChars,
+    input_bytes: rawBytes,
+    inspection_text: inspectionText,
+    source_chunks: 1,
+    visible_chars: visibleChars,
   });
   session.queuedBytes += masked.byteLength;
 
@@ -262,7 +262,7 @@ function closeSessionTransport(session) {
 function connectTransport(message = {}) {
   const id = String(message.id || "");
   const endpoint = message.endpoint || {};
-  if (!id || !endpoint.url || !endpoint.token || !message.paneId || !message.instanceId) {
+  if (!id || !endpoint.url || !endpoint.token || !message.pane_id || !message.instance_id) {
     postMessage({
       error: "Terminal output transport connection request is incomplete.",
       id,
@@ -306,8 +306,8 @@ function connectTransport(message = {}) {
     try {
       socket.send(JSON.stringify({
         id,
-        instanceId: message.instanceId,
-        paneId: message.paneId,
+        instance_id: message.instance_id,
+        pane_id: message.pane_id,
         token: endpoint.token,
         type: "subscribe",
       }));

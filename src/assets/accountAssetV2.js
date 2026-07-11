@@ -72,11 +72,9 @@ function assetDocBacked(row = {}) {
     text(
       object.src,
       object.source_kind,
-      object.sourceKind,
       object.source,
       metadata.src,
       metadata.source_kind,
-      metadata.sourceKind,
       metadata.source,
     ),
   );
@@ -84,28 +82,22 @@ function assetDocBacked(row = {}) {
     text(
       object.dom,
       object.doc_domain,
-      object.docDomain,
       metadata.dom,
       metadata.doc_domain,
-      metadata.docDomain,
     ),
   );
   const folder = normalizedToken(
     text(
       object.fold,
       object.asset_folder,
-      object.assetFolder,
       object.folder,
       object.group,
       object.asset_group,
-      object.assetGroup,
       metadata.fold,
       metadata.asset_folder,
-      metadata.assetFolder,
       metadata.folder,
       metadata.group,
       metadata.asset_group,
-      metadata.assetGroup,
     ),
   );
   return DOC_BACKED_ASSET_SOURCE_TOKENS.has(sourceKind)
@@ -121,7 +113,7 @@ function compactUpdatedAt(value) {
 }
 
 function eventKind(value = {}) {
-  return normalizedToken(value.t || value.event_kind || value.eventKind || value.kind || value.ev);
+  return normalizedToken(value.t || value.event_kind || value.kind || value.ev);
 }
 
 function compactAssetV2Payload(candidate = {}) {
@@ -157,15 +149,12 @@ function collectAssetV2Payloads(value, depth = 0, seen = new Set()) {
   const rows = compactAssetV2Payload(object) ? [object] : [];
   [
     "asset_state",
-    "assetState",
     "initial_account_asset_state",
-    "initialAccountAssetState",
     "data",
     "payload",
     "result",
     "stored",
     "account_assets",
-    "accountAssets",
   ].forEach((key) => {
     rows.push(...collectAssetV2Payloads(object[key], depth + 1, seen));
   });
@@ -191,34 +180,29 @@ export function accountAssetFanoutFromValue(value = {}) {
     const cols = jsonObject(payload.cols) || {};
     const event = eventKind(payload);
     eventKindValue ||= event;
-    serverCursor ||= text(payload.cur, payload.cursor, payload.server_cursor, payload.serverCursor, payload.sync_cursor, payload.syncCursor);
+    serverCursor ||= text(payload.cur, payload.cursor, payload.server_cursor, payload.sync_cursor);
     snapshotFull = snapshotFull
-      || booleanValue(payload.sf ?? payload.snapshot_full ?? payload.snapshotFull, false)
+      || booleanValue(payload.sf ?? payload.snapshot_full, false)
       || event === "asset-snapshot";
     aggregate ||= jsonObject(payload.ag) || jsonObject(payload.aggregate);
-    jsonArray(payload.clouds || payload.asset_clouds || payload.assetClouds).forEach((cloud) => {
+    jsonArray(payload.clouds || payload.asset_clouds).forEach((cloud) => {
       if (jsonObject(cloud)) registryClouds.push(cloud);
     });
 
     compactRows(payload, "c").forEach((row) => {
       const object = compactRowObject(row, cols.c || ["bid", "cid", "st", "ut"]);
-      const blobId = text(object?.bid, object?.blob_id, object?.blobId);
-      const cloudId = text(object?.cid, object?.cloud_id, object?.cloudId);
+      const blobId = text(object?.bid, object?.blob_id);
+      const cloudId = text(object?.cid, object?.cloud_id);
       if (!blobId || !cloudId) return;
-      const status = text(object.st, object.status, object.cloud_status, object.cloudStatus);
+      const status = text(object.st, object.status, object.cloud_status);
       const cloud = {
         blob_id: blobId,
-        blobId,
         cloud_id: cloudId,
-        cloudId: cloudId,
         id: cloudId,
         status,
         cloud_status: status,
-        cloudStatus: status,
         cloud_available: CLOUD_AVAILABLE_STATUS_TOKENS.has(normalizedToken(status)),
-        cloudAvailable: CLOUD_AVAILABLE_STATUS_TOKENS.has(normalizedToken(status)),
-        updated_at: compactUpdatedAt(object.ut ?? object.updated_at ?? object.updatedAt),
-        updatedAt: compactUpdatedAt(object.ut ?? object.updated_at ?? object.updatedAt),
+        updated_at: compactUpdatedAt(object.ut ?? object.updated_at),
       };
       if (!cloudsByBlob.has(blobId)) cloudsByBlob.set(blobId, []);
       cloudsByBlob.get(blobId).push(cloud);
@@ -226,22 +210,17 @@ export function accountAssetFanoutFromValue(value = {}) {
 
     compactRows(payload, "p").forEach((row) => {
       const object = compactRowObject(row, cols.p || ["aid", "dev", "st", "ut"]);
-      const assetId = text(object?.aid, object?.asset_id, object?.assetId);
-      const deviceId = text(object?.dev, object?.device_id, object?.deviceId);
+      const assetId = text(object?.aid, object?.asset_id);
+      const deviceId = text(object?.dev, object?.device_id);
       if (!assetId || !deviceId) return;
-      const status = text(object.st, object.status, object.local_status, object.localStatus);
+      const status = text(object.st, object.status, object.local_status);
       const device = {
         asset_id: assetId,
-        assetId: assetId,
         device_id: deviceId,
-        deviceId: deviceId,
         id: deviceId,
         local_status: status,
-        localStatus: status,
         local_available: LOCAL_AVAILABLE_STATUS_TOKENS.has(normalizedToken(status)),
-        localAvailable: LOCAL_AVAILABLE_STATUS_TOKENS.has(normalizedToken(status)),
-        updated_at: compactUpdatedAt(object.ut ?? object.updated_at ?? object.updatedAt),
-        updatedAt: compactUpdatedAt(object.ut ?? object.updated_at ?? object.updatedAt),
+        updated_at: compactUpdatedAt(object.ut ?? object.updated_at),
       };
       if (!devicesByAsset.has(assetId)) devicesByAsset.set(assetId, []);
       devicesByAsset.get(assetId).push(device);
@@ -249,12 +228,12 @@ export function accountAssetFanoutFromValue(value = {}) {
 
     compactRows(payload, "a").forEach((row) => {
       const object = compactRowObject(row, cols.a || ["aid", "bid", "n", "k", "mt", "sz", "sha", "st", "ut", "src", "fold", "dom", "pub", "purl"]);
-      const assetId = text(object?.aid, object?.asset_id, object?.assetId, object?.id);
+      const assetId = text(object?.aid, object?.asset_id, object?.id);
       if (!assetId) return;
-      const blobId = text(object.bid, object.blob_id, object.blobId);
-      const sourceKind = text(object.src, object.source_kind, object.sourceKind, object.source);
-      const folder = text(object.fold, object.asset_folder, object.assetFolder, object.folder, object.group, object.asset_group, object.assetGroup);
-      const docDomain = text(object.dom, object.doc_domain, object.docDomain);
+      const blobId = text(object.bid, object.blob_id);
+      const sourceKind = text(object.src, object.source_kind, object.source);
+      const folder = text(object.fold, object.asset_folder, object.folder, object.group, object.asset_group);
+      const docDomain = text(object.dom, object.doc_domain);
       if (assetDocBacked({ source_kind: sourceKind, folder, doc_domain: docDomain })) {
         return;
       }
@@ -267,114 +246,83 @@ export function accountAssetFanoutFromValue(value = {}) {
       const publicFields = publicState === null ? {} : {
         public: publicState,
         is_public: publicState,
-        isPublic: publicState,
-        public_url: publicState ? text(object.purl, object.public_url, object.publicUrl) : "",
-        publicUrl: publicState ? text(object.purl, object.public_url, object.publicUrl) : "",
+        public_url: publicState ? text(object.purl, object.public_url) : "",
       };
       itemsById.set(assetId, {
         ...publicFields,
         asset_id: assetId,
-        assetId: assetId,
         id: assetId,
         blob_id: blobId,
-        blobId,
         name: text(object.n, object.name),
         kind: text(object.k, object.kind),
-        mime_type: text(object.mt, object.mime_type, object.mimeType),
-        mimeType: text(object.mt, object.mime_type, object.mimeType),
-        size_bytes: numberValue(object.sz, object.size_bytes, object.sizeBytes),
-        sizeBytes: numberValue(object.sz, object.size_bytes, object.sizeBytes),
+        mime_type: text(object.mt, object.mime_type),
+        size_bytes: numberValue(object.sz, object.size_bytes),
         sha256: text(object.sha, object.sha256),
-        cloud_status: text(object.st, object.status, object.cloud_status, object.cloudStatus),
-        cloudStatus: text(object.st, object.status, object.cloud_status, object.cloudStatus),
+        cloud_status: text(object.st, object.status, object.cloud_status),
         source_kind: sourceKind,
-        sourceKind,
         folder,
         group: folder,
         asset_folder: folder,
-        assetFolder: folder,
         asset_group: folder,
-        assetGroup: folder,
         doc_domain: docDomain,
-        docDomain,
         metadata: {
           source_kind: sourceKind,
-          sourceKind,
           folder,
           group: folder,
           asset_folder: folder,
-          assetFolder: folder,
           doc_domain: docDomain,
-          docDomain,
         },
-        updated_at: compactUpdatedAt(object.ut ?? object.updated_at ?? object.updatedAt),
-        updatedAt: compactUpdatedAt(object.ut ?? object.updated_at ?? object.updatedAt),
+        updated_at: compactUpdatedAt(object.ut ?? object.updated_at),
       });
     });
 
     compactRows(payload, "r").forEach((row) => {
       const object = compactRowObject(row, cols.r || ["aid", "ut"]);
-      const assetId = text(object?.aid, object?.asset_id, object?.assetId, object?.id);
+      const assetId = text(object?.aid, object?.asset_id, object?.id);
       if (!assetId) return;
       removedAssets.push({
         asset_id: assetId,
-        assetId: assetId,
         id: assetId,
         deleted: true,
         status: "deleted",
-        updated_at: compactUpdatedAt(object.ut ?? object.updated_at ?? object.updatedAt),
-        updatedAt: compactUpdatedAt(object.ut ?? object.updated_at ?? object.updatedAt),
+        updated_at: compactUpdatedAt(object.ut ?? object.updated_at),
       });
     });
 
     compactRows(payload, "x").forEach((row) => {
       const object = compactRowObject(row, cols.x || ["tid", "aid", "dir", "dev", "cid", "st", "dn", "tot", "err", "ut"]);
-      const transferId = text(object?.tid, object?.transfer_id, object?.transferId, object?.id);
+      const transferId = text(object?.tid, object?.transfer_id, object?.id);
       if (!transferId) return;
       transfers.push({
         transfer_id: transferId,
-        transferId: transferId,
         id: transferId,
-        asset_id: text(object.aid, object.asset_id, object.assetId),
-        assetId: text(object.aid, object.asset_id, object.assetId),
+        asset_id: text(object.aid, object.asset_id),
         direction: text(object.dir, object.direction),
-        device_id: text(object.dev, object.device_id, object.deviceId),
-        deviceId: text(object.dev, object.device_id, object.deviceId),
-        cloud_id: text(object.cid, object.cloud_id, object.cloudId),
-        cloudId: text(object.cid, object.cloud_id, object.cloudId),
+        device_id: text(object.dev, object.device_id),
+        cloud_id: text(object.cid, object.cloud_id),
         status: text(object.st, object.status),
-        bytes_done: numberValue(object.dn, object.bytes_done, object.bytesDone, object.done),
-        bytesDone: numberValue(object.dn, object.bytes_done, object.bytesDone, object.done),
-        bytes_total: numberValue(object.tot, object.bytes_total, object.bytesTotal, object.total),
-        bytesTotal: numberValue(object.tot, object.bytes_total, object.bytesTotal, object.total),
+        bytes_done: numberValue(object.dn, object.bytes_done, object.done),
+        bytes_total: numberValue(object.tot, object.bytes_total, object.total),
         error: text(object.err, object.error),
-        updated_at: compactUpdatedAt(object.ut ?? object.updated_at ?? object.updatedAt),
-        updatedAt: compactUpdatedAt(object.ut ?? object.updated_at ?? object.updatedAt),
+        updated_at: compactUpdatedAt(object.ut ?? object.updated_at),
       });
     });
 
     if (event === "asset-tx" || event === "asset-terminal") {
-      const transferId = text(payload.tid, payload.transfer_id, payload.transferId);
+      const transferId = text(payload.tid, payload.transfer_id);
       if (transferId) {
         transfers.push({
           transfer_id: transferId,
-          transferId: transferId,
           id: transferId,
-          asset_id: text(payload.aid, payload.asset_id, payload.assetId),
-          assetId: text(payload.aid, payload.asset_id, payload.assetId),
+          asset_id: text(payload.aid, payload.asset_id),
           direction: text(payload.dir, payload.direction),
-          device_id: text(payload.dev, payload.device_id, payload.deviceId),
-          deviceId: text(payload.dev, payload.device_id, payload.deviceId),
-          cloud_id: text(payload.cid, payload.cloud_id, payload.cloudId),
-          cloudId: text(payload.cid, payload.cloud_id, payload.cloudId),
+          device_id: text(payload.dev, payload.device_id),
+          cloud_id: text(payload.cid, payload.cloud_id),
           status: text(payload.st, payload.status),
-          bytes_done: numberValue(payload.dn, payload.bytes_done, payload.bytesDone),
-          bytesDone: numberValue(payload.dn, payload.bytes_done, payload.bytesDone),
-          bytes_total: numberValue(payload.tot, payload.bytes_total, payload.bytesTotal),
-          bytesTotal: numberValue(payload.tot, payload.bytes_total, payload.bytesTotal),
+          bytes_done: numberValue(payload.dn, payload.bytes_done),
+          bytes_total: numberValue(payload.tot, payload.bytes_total),
           error: text(payload.err, payload.error),
-          updated_at: compactUpdatedAt(payload.ut ?? payload.updated_at ?? payload.updatedAt),
-          updatedAt: compactUpdatedAt(payload.ut ?? payload.updated_at ?? payload.updatedAt),
+          updated_at: compactUpdatedAt(payload.ut ?? payload.updated_at),
         });
       }
     }
@@ -387,28 +335,23 @@ export function accountAssetFanoutFromValue(value = {}) {
       ...item,
       clouds,
       cloud_statuses: clouds,
-      cloudStatuses: clouds,
-      cloud_available: clouds.some((cloud) => cloud.cloud_available || cloud.cloudAvailable),
-      cloudAvailable: clouds.some((cloud) => cloud.cloud_available || cloud.cloudAvailable),
+      cloud_available: clouds.some((cloud) => cloud.cloud_available),
       devices,
       device_count: devices.length,
-      deviceCount: devices.length,
-      synced_device_count: devices.filter((device) => device.local_available || device.localAvailable).length,
-      syncedDeviceCount: devices.filter((device) => device.local_available || device.localAvailable).length,
+      synced_device_count: devices.filter((device) => device.local_available).length,
     };
   });
 
   return {
     aggregate: aggregate || {},
     clouds: registryClouds,
-    eventKind: eventKindValue || "asset-delta",
+    event_kind: eventKindValue || "asset-delta",
     items,
     assets: items,
     known: true,
-    removedAssets,
     removed_assets: removedAssets,
-    serverCursor,
-    snapshotFull,
+    server_cursor: serverCursor,
+    snapshot_full: snapshotFull,
     transfers,
   };
 }

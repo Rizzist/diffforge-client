@@ -28,7 +28,7 @@ import {
 // Per-terminal SSH launcher. Rendered only on plain shell terminals. Opening
 // the menu lazily loads the saved clients; picking one types the ssh command
 // into this pane's PTY (and arms the password autofill on the backend).
-export function SshClientPicker({ paneId, disabled = false }) {
+export function SshClientPicker({ pane_id: paneId, disabled = false }) {
   const [open, setOpen] = useState(false);
   const [align, setAlign] = useState("right");
   const [creating, setCreating] = useState(false);
@@ -167,7 +167,7 @@ export function SshClientPicker({ paneId, disabled = false }) {
                   type="button"
                 >
                   <SshPickerOptionIcon aria-hidden="true">
-                    {profile.authMethod === SSH_AUTH_KEY ? <ButtonKeyIcon /> : <ButtonHubIcon />}
+                    {profile.auth_method === SSH_AUTH_KEY ? <ButtonKeyIcon /> : <ButtonHubIcon />}
                   </SshPickerOptionIcon>
                   <SshPickerOptionMain>
                     <strong>{profile.name}</strong>

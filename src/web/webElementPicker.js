@@ -154,7 +154,9 @@ function buildWebElementPickerScript(action) {
       STYLE_KEYS.forEach((key) => {
         const value = computed[key];
         if (value && value !== "normal" && value !== "none" && value !== "0px") {
-          styles[key] = String(value);
+          // Payload keys are snake_case; STYLE_KEYS stay camel for the
+          // getComputedStyle lookup above.
+          styles[key.replace(/[A-Z]/g, (ch) => "_" + ch.toLowerCase())] = String(value);
         }
       });
       return styles;
@@ -533,7 +535,7 @@ function normalizeContext(raw, meta = {}) {
   }
   const id = String(selection.id || "").trim();
   const selector = String(selection.selector || "").trim();
-  const element = String(selection.element || selection.tagName || "").trim();
+  const element = String(selection.element || selection.tag_name || "").trim();
   if (!id && !selector && !element) {
     return null;
   }
@@ -542,13 +544,13 @@ function normalizeContext(raw, meta = {}) {
     element,
     id: id || `webctx_${Date.now().toString(36)}`,
     kind: "web-element",
-    panelKind: String(meta.panelKind || "web").trim() || "web",
-    paneId: String(meta.paneId || "").trim(),
+    panel_kind: String(meta.panel_kind || "web").trim() || "web",
+    pane_id: String(meta.pane_id || "").trim(),
     selector,
     text: safeText(selection.text, 420),
     title: safeText(selection.title, 160),
     url: String(selection.url || meta.currentUrl || "").trim(),
-    workspaceId: String(meta.workspaceId || "").trim(),
+    workspace_id: String(meta.workspace_id || "").trim(),
   };
 }
 
@@ -579,7 +581,7 @@ export function webElementContextLabel(context) {
   if (!context) {
     return "";
   }
-  const element = String(context.element || context.tagName || "").trim();
+  const element = String(context.element || context.tag_name || "").trim();
   const host = (() => {
     try {
       return new URL(context.url || "").host;
@@ -594,9 +596,9 @@ export function useWebElementPicker({
   currentUrl = "",
   enabled = true,
   evaluate,
-  panelKind = "web",
-  paneId = "",
-  workspaceId = "",
+  panel_kind: panelKind = "web",
+  pane_id: paneId = "",
+  workspace_id: workspaceId = "",
 } = {}) {
   const [armed, setArmed] = useState(false);
   const [selectedContexts, setSelectedContexts] = useState([]);
@@ -613,9 +615,9 @@ export function useWebElementPicker({
 
   const meta = useMemo(() => ({
     currentUrl,
-    panelKind,
-    paneId,
-    workspaceId,
+    panel_kind: panelKind,
+    pane_id: paneId,
+    workspace_id: workspaceId,
   }), [currentUrl, panelKind, paneId, workspaceId]);
 
   const runPickerAction = useCallback(async (action, options = {}) => {
@@ -631,21 +633,21 @@ export function useWebElementPicker({
     setArmed(false);
     setError("");
     if (typeof evaluate === "function") {
-      await evaluate(buildWebElementPickerScript("clear"), { expectResult: false }).catch(() => {});
+      await evaluate(buildWebElementPickerScript("clear"), { expect_result: false }).catch(() => {});
     }
   }, [evaluate]);
 
   const stopPicker = useCallback(async () => {
     setArmed(false);
     if (typeof evaluate === "function") {
-      await evaluate(buildWebElementPickerScript("disable"), { expectResult: false }).catch(() => {});
+      await evaluate(buildWebElementPickerScript("disable"), { expect_result: false }).catch(() => {});
     }
   }, [evaluate]);
 
   const armPicker = useCallback(async () => {
     setError("");
     try {
-      await runPickerAction("enable", { expectResult: false });
+      await runPickerAction("enable", { expect_result: false });
       if (mountedRef.current) {
         setArmed(true);
       }
@@ -672,7 +674,7 @@ export function useWebElementPicker({
       setArmed(false);
       setError("");
       if (typeof evaluate === "function") {
-        void evaluate(buildWebElementPickerScript("clear"), { expectResult: false }).catch(() => {});
+        void evaluate(buildWebElementPickerScript("clear"), { expect_result: false }).catch(() => {});
       }
     }
   }, [enabled, evaluate]);
@@ -683,7 +685,7 @@ export function useWebElementPicker({
     setArmed(false);
     setError("");
     if (typeof evaluate === "function") {
-      void evaluate(buildWebElementPickerScript("clear"), { expectResult: false }).catch(() => {});
+      void evaluate(buildWebElementPickerScript("clear"), { expect_result: false }).catch(() => {});
     }
   }, [currentUrl, evaluate]);
 
@@ -698,7 +700,7 @@ export function useWebElementPicker({
         return;
       }
       try {
-        const result = await evaluate(buildWebElementPickerScript("selection"), { expectResult: true });
+        const result = await evaluate(buildWebElementPickerScript("selection"), { expect_result: true });
         if (disposed) {
           return;
         }
@@ -735,7 +737,7 @@ export function useWebElementPicker({
     armed,
     armPicker,
     clearSelection,
-    contextRefs,
+    context_refs: contextRefs,
     error,
     selectedContext: selectedContexts[0] || null,
     selectedContexts,

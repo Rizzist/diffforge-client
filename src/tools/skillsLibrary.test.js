@@ -38,11 +38,11 @@ test("skills normalize from unit metadata", () => {
 
   assert.equal(skills.length, 1);
   assert.equal(skills[0].id, "review");
-  assert.equal(skills[0].assetId, "asset-review");
+  assert.equal(skills[0].asset_id, "asset-review");
   assert.equal(skills[0].content, "Check the diff and tests.");
-  assert.equal(skills[0].pendingPush, true);
-  assert.equal(skills[0].localSavedAt, "2026-06-20T12:00:00.000Z");
-  assert.equal(skills[0].syncStatus, "local_pending");
+  assert.equal(skills[0].pending_push, true);
+  assert.equal(skills[0].local_saved_at, "2026-06-20T12:00:00.000Z");
+  assert.equal(skills[0].sync_status, "local_pending");
 });
 
 test("legacy instruction document metadata normalizes as document", () => {
@@ -57,7 +57,7 @@ test("legacy instruction document metadata normalizes as document", () => {
     title: "Legacy Instruction",
   }]);
 
-  assert.equal(unit.documentKind, "document");
+  assert.equal(unit.document_kind, "document");
   assert.equal(unit.source, "document");
 });
 
@@ -76,11 +76,11 @@ test("html document metadata preserves html extension and mime type", () => {
     title: "Preview",
   }]);
 
-  assert.equal(unit.documentKind, "html");
+  assert.equal(unit.document_kind, "html");
   assert.equal(unit.source, "html");
   assert.equal(unit.extension, "html");
-  assert.equal(unit.fileName, "preview.html");
-  assert.equal(unit.mimeType, "text/html");
+  assert.equal(unit.file_name, "preview.html");
+  assert.equal(unit.mime_type, "text/html");
 
   const request = accountDocumentRequestFromSkill(unit);
   assert.equal(request.document.document_kind, "html");
@@ -89,10 +89,10 @@ test("html document metadata preserves html extension and mime type", () => {
 
   const extensionOnlyRequest = accountDocumentRequestFromSkill({
     content: "<!doctype html><title>Extension Only</title>",
-    documentKind: "document",
+    document_kind: "document",
     extension: "html",
     id: "extension-only",
-    mimeType: "text/markdown",
+    mime_type: "text/markdown",
     title: "Extension Only",
   });
   assert.equal(extensionOnlyRequest.document.document_kind, "html");
@@ -114,13 +114,13 @@ test("document save requests mark inline content as intentional", () => {
 test("document save requests can explicitly allow local draft conflicts", () => {
   const defaultRequest = accountDocumentRequestFromSkill({
     content: "Draft",
-    draftPath: "/tmp/Draft.md",
+    draft_path: "/tmp/Draft.md",
     id: "draft",
     title: "Draft",
   }, { local_only: true });
   const conflictRequest = accountDocumentRequestFromSkill({
     content: "Draft",
-    draftPath: "/tmp/Draft.md",
+    draft_path: "/tmp/Draft.md",
     id: "draft",
     title: "Draft",
   }, { allow_conflict: true, local_only: true });
@@ -163,18 +163,18 @@ test("document payload parsing preserves empty local content when projection fol
   assert.equal(skills.length, 1);
   assert.equal(skills[0].id, "blank");
   assert.equal(skills[0].content, "");
-  assert.equal(skills[0].hasContent, true);
-  assert.equal(skills[0].hasContentPayload, true);
-  assert.equal(skills[0].contentHash, "empty-hash");
+  assert.equal(skills[0].has_content, true);
+  assert.equal(skills[0].has_content_payload, true);
+  assert.equal(skills[0].content_hash, "empty-hash");
 });
 
 test("document hydrate requests never include editor content", () => {
   const request = accountDocumentHydrateRequestFromSkill({
-    assetId: "asset-blank",
+    asset_id: "asset-blank",
     content: "",
-    contentHash: "abc",
+    content_hash: "abc",
     id: "blank",
-    localPath: "/tmp/blank.md",
+    local_path: "/tmp/blank.md",
     title: "Blank",
   });
 
@@ -256,10 +256,10 @@ test("metadata-only document updates preserve cached content until hydration lan
   }]);
 
   assert.equal(metadataOnly[0].content, "Previous content stays visible.");
-  assert.equal(metadataOnly[0].contentHash, "new-hash");
-  assert.equal(metadataOnly[0].contentStale, true);
-  assert.equal(metadataOnly[0].hasContent, true);
-  assert.equal(metadataOnly[0].hasContentPayload, false);
+  assert.equal(metadataOnly[0].content_hash, "new-hash");
+  assert.equal(metadataOnly[0].content_stale, true);
+  assert.equal(metadataOnly[0].has_content, true);
+  assert.equal(metadataOnly[0].has_content_payload, false);
 
   const hydrated = mergeSkillUnits(metadataOnly, [{
     content_hash: "new-hash",
@@ -269,8 +269,8 @@ test("metadata-only document updates preserve cached content until hydration lan
   }]);
 
   assert.equal(hydrated[0].content, "Fresh hydrated content.");
-  assert.equal(hydrated[0].contentStale, false);
-  assert.equal(hydrated[0].hasContentPayload, true);
+  assert.equal(hydrated[0].content_stale, false);
+  assert.equal(hydrated[0].has_content_payload, true);
 });
 
 test("metadata-only same-hash document updates keep local content materialized", () => {
@@ -291,10 +291,10 @@ test("metadata-only same-hash document updates keep local content materialized",
   }]);
 
   assert.equal(merged[0].content, "");
-  assert.equal(merged[0].contentHash, "same-hash");
-  assert.equal(merged[0].contentStale, false);
-  assert.equal(merged[0].hasContent, true);
-  assert.equal(merged[0].hasContentPayload, true);
+  assert.equal(merged[0].content_hash, "same-hash");
+  assert.equal(merged[0].content_stale, false);
+  assert.equal(merged[0].has_content, true);
+  assert.equal(merged[0].has_content_payload, true);
 });
 
 test("workspace tools store tracks multiple account document drafts", () => {
@@ -302,16 +302,16 @@ test("workspace tools store tracks multiple account document drafts", () => {
   try {
     setWorkspaceToolsDocumentDraft({
       content: "Feature draft",
-      documentKey: "Features.md",
-      draftPath: "/tmp/drafts/draft-features/Features.md",
-      pathKey: "Features.md",
+      document_key: "Features.md",
+      draft_path: "/tmp/drafts/draft-features/Features.md",
+      path_key: "Features.md",
       title: "Features",
     });
     setWorkspaceToolsDocumentDraft({
       content: "Blog draft",
-      documentKey: "Blogs.md",
-      draftPath: "/tmp/drafts/draft-blogs/Blogs.md",
-      pathKey: "Blogs.md",
+      document_key: "Blogs.md",
+      draft_path: "/tmp/drafts/draft-blogs/Blogs.md",
+      path_key: "Blogs.md",
       title: "Blogs",
     });
 
@@ -365,10 +365,10 @@ test("draft titles normalize file-name fallbacks without markdown extensions", (
   try {
     setWorkspaceToolsDocumentDraft({
       content: "Title should not flicker.",
-      documentKey: "draft:Docs/Rustfeatures.md",
-      filePath: "Docs/Rustfeatures.md",
+      document_key: "draft:Docs/Rustfeatures.md",
+      file_path: "Docs/Rustfeatures.md",
       id: "Docs/Rustfeatures.md",
-      pathKey: "Docs/Rustfeatures.md",
+      path_key: "Docs/Rustfeatures.md",
     });
 
     const draft = getWorkspaceToolsDocumentDraft();
@@ -383,10 +383,10 @@ test("draft discard events clear drafts stored under a different identity key", 
   try {
     setWorkspaceToolsDocumentDraft({
       content: "Published content.",
-      documentKey: "draft:Rustfeatures.md",
-      draftId: "draft-rust",
-      draftPath: "/tmp/drafts/draft-rust/Rustfeatures.md",
-      pathKey: "Rustfeatures.md",
+      document_key: "draft:Rustfeatures.md",
+      draft_id: "draft-rust",
+      draft_path: "/tmp/drafts/draft-rust/Rustfeatures.md",
+      path_key: "Rustfeatures.md",
       title: "Rustfeatures",
     });
 
@@ -427,9 +427,9 @@ test("metadata-only document updates preserve pending local saves", () => {
   }]);
 
   assert.equal(metadataOnly[0].content, "Unsynced local body.");
-  assert.equal(metadataOnly[0].pendingPush, true);
-  assert.equal(metadataOnly[0].syncStatus, "local_pending");
-  assert.equal(metadataOnly[0].localSavedAt, "2026-06-20T12:00:00.000Z");
+  assert.equal(metadataOnly[0].pending_push, true);
+  assert.equal(metadataOnly[0].sync_status, "local_pending");
+  assert.equal(metadataOnly[0].local_saved_at, "2026-06-20T12:00:00.000Z");
 
   const synced = mergeSkillUnits(metadataOnly, [{
     content_hash: "new-hash",
@@ -441,17 +441,17 @@ test("metadata-only document updates preserve pending local saves", () => {
   }]);
 
   assert.equal(synced[0].content, "Cloud accepted body.");
-  assert.equal(synced[0].pendingPush, false);
-  assert.equal(synced[0].syncStatus, "synced");
+  assert.equal(synced[0].pending_push, false);
+  assert.equal(synced[0].sync_status, "synced");
 });
 
 test("metadata-only document draft updates preserve matching draft content", () => {
   const current = mergeWorkspaceToolsDocumentDraft(null, {
     content: "Unsaved editor body.",
-    documentKey: "draft:Docs/Review.md",
-    draftId: "draft-review",
-    draftPath: "/tmp/drafts/draft-review/Review.md",
-    pathKey: "Docs/Review.md",
+    document_key: "draft:Docs/Review.md",
+    draft_id: "draft-review",
+    draft_path: "/tmp/drafts/draft-review/Review.md",
+    path_key: "Docs/Review.md",
     title: "Review",
   });
 
@@ -486,10 +486,10 @@ test("document draft events do not overwrite active drafts but track nonmatching
   try {
     setWorkspaceToolsDocumentDraft({
       content: "Keep this active draft.",
-      documentKey: "draft:Docs/Active.md",
-      draftId: "draft-active",
-      draftPath: "/tmp/drafts/draft-active/Active.md",
-      pathKey: "Docs/Active.md",
+      document_key: "draft:Docs/Active.md",
+      draft_id: "draft-active",
+      draft_path: "/tmp/drafts/draft-active/Active.md",
+      path_key: "Docs/Active.md",
       title: "Active",
     });
 
@@ -572,10 +572,10 @@ test("local save payload projection does not erase materialized document content
 
   assert.equal(skills.length, 1);
   assert.equal(skills[0].content, "");
-  assert.equal(skills[0].hasContentPayload, true);
-  assert.equal(skills[0].pendingPush, true);
-  assert.equal(skills[0].syncStatus, "local_pending");
-  assert.equal(skills[0].localPath, "/tmp/local-draft.md");
+  assert.equal(skills[0].has_content_payload, true);
+  assert.equal(skills[0].pending_push, true);
+  assert.equal(skills[0].sync_status, "local_pending");
+  assert.equal(skills[0].local_path, "/tmp/local-draft.md");
 });
 
 test("hydrated metadata without inline bytes is not treated as materialized content", () => {
@@ -591,8 +591,8 @@ test("hydrated metadata without inline bytes is not treated as materialized cont
   const skills = skillsFromUnits(units);
 
   assert.equal(skills[0].content, "");
-  assert.equal(skills[0].hasContent, true);
-  assert.equal(skills[0].hasContentPayload, false);
+  assert.equal(skills[0].has_content, true);
+  assert.equal(skills[0].has_content_payload, false);
 });
 
 test("skills serialize to unit sync payloads", () => {
@@ -601,7 +601,7 @@ test("skills serialize to unit sync payloads", () => {
     id: "conventional-commits",
     source: "catalog",
     title: "Conventional Commits",
-    updatedAt: "2026-06-10T00:00:00.000Z",
+    updated_at: "2026-06-10T00:00:00.000Z",
   }]);
 
   assert.equal(units.length, 1);

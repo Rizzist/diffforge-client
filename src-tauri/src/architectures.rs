@@ -171,7 +171,6 @@ const ARCHITECTURE_ICON_REFERENCE: &str = r##"{
 "##;
 
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct ArchitectureRepositoryEntry {
     id: String,
     name: String,
@@ -183,14 +182,12 @@ struct ArchitectureRepositoryEntry {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct ArchitectureRepositoryList {
     root_directory: String,
     repositories: Vec<ArchitectureRepositoryEntry>,
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct ArchitectureScannedResult {
     root_directory: String,
     workspace_kind: String,
@@ -201,7 +198,6 @@ struct ArchitectureScannedResult {
 }
 
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct ArchitectureGraphSummary {
     id: String,
     title: String,
@@ -218,7 +214,6 @@ struct ArchitectureGraphSummary {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct ArchitectureGraphList {
     repo_path: String,
     architecture_root: String,
@@ -227,7 +222,6 @@ struct ArchitectureGraphList {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct ArchitectureGraphSaveResult {
     repo_path: String,
     architecture_root: String,
@@ -237,7 +231,6 @@ struct ArchitectureGraphSaveResult {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ArchitectureGraphRevisionSummary {
     revision_id: String,
     graph_id: String,
@@ -254,7 +247,6 @@ struct ArchitectureGraphRevisionSummary {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ArchitectureGraphRevisionManifest {
     kind: String,
     version: u32,
@@ -264,8 +256,71 @@ struct ArchitectureGraphRevisionManifest {
     revisions: Vec<ArchitectureGraphRevisionSummary>,
 }
 
+fn architecture_persisted_key(key: String, to_runtime: bool) -> String {
+    let mapped = if to_runtime {
+        match key.as_str() {
+            "contentHash" => "content_hash",
+            "contentRevision" => "content_revision",
+            "createdAt" => "created_at",
+            "edgeCount" => "edge_count",
+            "filePath" => "file_path",
+            "graphId" => "graph_id",
+            "groupIntents" => "group_intents",
+            "groupPath" => "group_path",
+            "liveFilePath" => "live_file_path",
+            "nodeCount" => "node_count",
+            "restoredFrom" => "restored_from",
+            "revisionId" => "revision_id",
+            "sourceFormat" => "source_format",
+            "updatedAt" => "updated_at",
+            _ => return key,
+        }
+    } else {
+        match key.as_str() {
+            "content_hash" => "contentHash",
+            "content_revision" => "contentRevision",
+            "created_at" => "createdAt",
+            "edge_count" => "edgeCount",
+            "file_path" => "filePath",
+            "graph_id" => "graphId",
+            "group_intents" => "groupIntents",
+            "group_path" => "groupPath",
+            "live_file_path" => "liveFilePath",
+            "node_count" => "nodeCount",
+            "restored_from" => "restoredFrom",
+            "revision_id" => "revisionId",
+            "source_format" => "sourceFormat",
+            "updated_at" => "updatedAt",
+            _ => return key,
+        }
+    };
+    mapped.to_string()
+}
+
+fn architecture_map_persisted_keys(value: Value, to_runtime: bool) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| architecture_map_persisted_keys(item, to_runtime))
+                .collect(),
+        ),
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .map(|(key, item)| {
+                    (
+                        architecture_persisted_key(key, to_runtime),
+                        architecture_map_persisted_keys(item, to_runtime),
+                    )
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct ArchitectureGraphRevisionList {
     repo_path: String,
     architecture_root: String,
@@ -276,7 +331,6 @@ struct ArchitectureGraphRevisionList {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct ArchitectureGraphRevisionReadResult {
     repo_path: String,
     architecture_root: String,
@@ -287,7 +341,6 @@ struct ArchitectureGraphRevisionReadResult {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct ArchitectureGraphRevisionRestoreResult {
     repo_path: String,
     architecture_root: String,
@@ -495,7 +548,9 @@ fn architecture_read_revision_manifest(
     }
     let source = fs::read_to_string(&path)
         .map_err(|error| format!("Unable to read architecture revision manifest: {error}"))?;
-    let mut manifest = serde_json::from_str::<ArchitectureGraphRevisionManifest>(&source)
+    let mut manifest = serde_json::from_str::<Value>(&source)
+        .map(|value| architecture_map_persisted_keys(value, true))
+        .and_then(serde_json::from_value::<ArchitectureGraphRevisionManifest>)
         .map_err(|error| format!("Unable to parse architecture revision manifest: {error}"))?;
     manifest.graph_id = architecture_slug(&manifest.graph_id);
     if manifest.graph_id.is_empty() {
@@ -511,7 +566,10 @@ fn architecture_write_revision_manifest(
 ) -> Result<(), String> {
     let dir = architecture_revision_graph_dir(repo, graph_id, true)?;
     let path = dir.join(ARCHITECTURE_REVISION_MANIFEST_FILENAME);
-    let bytes = serde_json::to_vec_pretty(manifest)
+    let persisted = serde_json::to_value(manifest)
+        .map(|value| architecture_map_persisted_keys(value, false))
+        .map_err(|error| format!("Unable to serialize architecture revision manifest: {error}"))?;
+    let bytes = serde_json::to_vec_pretty(&persisted)
         .map_err(|error| format!("Unable to serialize architecture revision manifest: {error}"))?;
     let temp_path = path.with_extension("json.tmp");
     fs::write(&temp_path, bytes)
@@ -731,8 +789,7 @@ fn architecture_graph_value_group_intents(graph: &Value) -> Vec<String> {
 
 fn architecture_graph_group_path(graph: &Value) -> Vec<String> {
     graph
-        .get("groupPath")
-        .or_else(|| graph.get("group_path"))
+        .get("group_path")
         .and_then(Value::as_array)
         .map(|items| {
             items
@@ -818,14 +875,12 @@ fn architecture_graph_summary_from_value(
         .map(Vec::len)
         .unwrap_or(0);
     let created_at = object
-        .get("createdAt")
-        .or_else(|| object.get("created_at"))
+        .get("created_at")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
     let updated_at = object
-        .get("updatedAt")
-        .or_else(|| object.get("updated_at"))
+        .get("updated_at")
         .and_then(Value::as_str)
         .map(ToString::to_string)
         .unwrap_or_else(|| architecture_modified_millis(file_path));
@@ -860,15 +915,16 @@ fn architecture_read_json_graph_file(path: &Path) -> Result<Value, String> {
     let bytes = fs::read(path)
         .map_err(|error| format!("Unable to read architecture graph file: {error}"))?;
     let mut graph = serde_json::from_slice::<Value>(&bytes)
+        .map(|value| architecture_map_persisted_keys(value, true))
         .map_err(|error| format!("Unable to parse architecture graph JSON: {error}"))?;
     if let Some(object) = graph.as_object_mut() {
         let source = String::from_utf8_lossy(&bytes);
         let hash = architecture_content_hash(&source);
         object
-            .entry("contentHash".to_string())
+            .entry("content_hash".to_string())
             .or_insert_with(|| Value::String(hash.clone()));
         object
-            .entry("contentRevision".to_string())
+            .entry("content_revision".to_string())
             .or_insert_with(|| Value::String(hash));
     }
     Ok(graph)
@@ -895,18 +951,18 @@ fn architecture_read_arch_graph(path: &Path, graph_id: &str) -> Result<Value, St
         "id": graph_id,
         "title": title,
         "kind": "architecture",
-        "groupPath": group_path,
-        "groupIntents": group_intents,
+        "group_path": group_path,
+        "group_intents": group_intents,
         "source": source,
-        "sourceFormat": "eraserDsl",
-        "contentHash": architecture_content_hash(&source),
-        "contentRevision": architecture_content_hash(&source),
+        "source_format": "eraserDsl",
+        "content_hash": architecture_content_hash(&source),
+        "content_revision": architecture_content_hash(&source),
         "version": 2,
-        "createdAt": updated_at,
-        "updatedAt": updated_at,
-        "filePath": workspace_path_display(path),
-        "nodeCount": node_count,
-        "edgeCount": edge_count,
+        "created_at": updated_at,
+        "updated_at": updated_at,
+        "file_path": workspace_path_display(path),
+        "node_count": node_count,
+        "edge_count": edge_count,
     }))
 }
 
@@ -1184,13 +1240,13 @@ fn architecture_write_index(
     let root = architecture_agents_root(repo);
     fs::create_dir_all(&root)
         .map_err(|error| format!("Unable to create architecture index directory: {error}"))?;
-    let index = json!({
+    let index = architecture_map_persisted_keys(json!({
         "kind": "architecture_index",
         "version": 2,
-        "updatedAt": architecture_now_millis(),
-        "sourceFormat": "eraserDsl",
+        "updated_at": architecture_now_millis(),
+        "source_format": "eraserDsl",
         "graphs": graphs,
-    });
+    }), false);
     let bytes = serde_json::to_vec_pretty(&index)
         .map_err(|error| format!("Unable to serialize architecture index: {error}"))?;
     fs::write(root.join("index.json"), bytes)
@@ -1372,8 +1428,8 @@ fn architecture_scanned_result_from_topology(
         "status": topology.cache_status,
         "hit": topology.cache_hit,
         "fresh": true,
-        "scannedAtMs": topology.scanned_ms,
-        "ttlMs": TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS,
+        "scanned_at_ms": topology.scanned_ms,
+        "ttl_ms": TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS,
         "source": "backend_workspace_topology_cache",
         "reason": "Shared workspace topology cache used by terminals, Architectures, and Scanned Result.",
     });
@@ -1492,15 +1548,15 @@ fn architecture_graph_save_blocking_with_reason(
             .ok_or_else(|| "Architecture graph must be a JSON object.".to_string())?;
         object.insert("id".to_string(), Value::String(graph_id.clone()));
         object.insert(
-            "sourceFormat".to_string(),
+            "source_format".to_string(),
             Value::String("eraserDsl".to_string()),
         );
-        object.insert("updatedAt".to_string(), Value::String(now.clone()));
+        object.insert("updated_at".to_string(), Value::String(now.clone()));
         object
-            .entry("createdAt".to_string())
+            .entry("created_at".to_string())
             .or_insert_with(|| Value::String(now.clone()));
         object.insert(
-            "filePath".to_string(),
+            "file_path".to_string(),
             Value::String(workspace_path_display(&graph_path)),
         );
 
@@ -1529,11 +1585,12 @@ fn architecture_graph_save_blocking_with_reason(
         .entry("version".to_string())
         .or_insert_with(|| Value::Number(1.into()));
     object
-        .entry("createdAt".to_string())
+        .entry("created_at".to_string())
         .or_insert_with(|| Value::String(now.clone()));
-    object.insert("updatedAt".to_string(), Value::String(now));
+    object.insert("updated_at".to_string(), Value::String(now));
 
-    let bytes = serde_json::to_vec_pretty(&graph)
+    let persisted_graph = architecture_map_persisted_keys(graph.clone(), false);
+    let bytes = serde_json::to_vec_pretty(&persisted_graph)
         .map_err(|error| format!("Unable to serialize architecture graph: {error}"))?;
     if bytes.len() as u64 > ARCHITECTURE_GRAPH_MAX_BYTES {
         return Err("Architecture graph is too large.".to_string());
@@ -1817,7 +1874,7 @@ fn architecture_graph_delete_blocking(
     )
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn architecture_repositories(
     root_directory: Option<String>,
     state: State<'_, TerminalState>,
@@ -1830,7 +1887,7 @@ async fn architecture_repositories(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn architecture_scanned_result(
     root_directory: Option<String>,
     state: State<'_, TerminalState>,
@@ -1840,14 +1897,14 @@ async fn architecture_scanned_result(
     Ok(architecture_scanned_result_from_topology(&root, topology))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn architecture_graphs_list(repo_path: String) -> Result<ArchitectureGraphList, String> {
     tauri::async_runtime::spawn_blocking(move || architecture_graphs_list_blocking(repo_path))
         .await
         .map_err(|error| format!("Architecture graph list worker failed: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn architecture_graph_read(repo_path: String, graph_id: String) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         architecture_graph_read_blocking(repo_path, graph_id)
@@ -1856,7 +1913,7 @@ async fn architecture_graph_read(repo_path: String, graph_id: String) -> Result<
     .map_err(|error| format!("Architecture graph read worker failed: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn architecture_graph_save(
     repo_path: String,
     graph: Value,
@@ -1866,7 +1923,7 @@ async fn architecture_graph_save(
         .map_err(|error| format!("Architecture graph save worker failed: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn architecture_graph_revisions_list(
     repo_path: String,
     graph_id: Option<String>,
@@ -1878,7 +1935,7 @@ async fn architecture_graph_revisions_list(
     .map_err(|error| format!("Architecture revision list worker failed: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn architecture_graph_revision_read(
     repo_path: String,
     graph_id: String,
@@ -1891,7 +1948,7 @@ async fn architecture_graph_revision_read(
     .map_err(|error| format!("Architecture revision read worker failed: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn architecture_graph_revision_restore(
     repo_path: String,
     graph_id: String,
@@ -1904,7 +1961,7 @@ async fn architecture_graph_revision_restore(
     .map_err(|error| format!("Architecture revision restore worker failed: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn architecture_graph_delete(
     repo_path: String,
     graph_id: String,
@@ -2021,9 +2078,8 @@ pub(crate) fn architecture_store_watcher_start(app: AppHandle) {
                 ARCHITECTURE_STORE_CHANGED_EVENT,
                 json!({
                     "slugs": slugs,
-                    "graphIds": graph_ids.clone(),
                     "graph_ids": graph_ids,
-                    "changedAtMs": architecture_now_millis(),
+                    "changed_at_ms": architecture_now_millis(),
                 }),
             );
         }
@@ -2349,24 +2405,21 @@ pub(crate) fn architecture_named_root_value(name: String) -> Result<Value, Strin
     let architecture_root = architecture_agents_root(&root);
     Ok(json!({
         "kind": "architecture_named_folder",
-        "scopeKind": "global",
+        "scope_kind": "global",
         "name": "Global",
-        "folderPath": folder_path.clone(),
         "folder_path": folder_path.clone(),
-        "initialFolderPath": folder_path.clone(),
         "initial_folder_path": folder_path,
-        "repoId": ARCHITECTURE_GLOBAL_REPO_ID,
-        "identityKey": ARCHITECTURE_GLOBAL_REPO_ID,
-        "rootDirectory": workspace_path_display(&root),
+        "repo_id": ARCHITECTURE_GLOBAL_REPO_ID,
+        "identity_key": ARCHITECTURE_GLOBAL_REPO_ID,
         "root_directory": workspace_path_display(&root),
         "path": workspace_path_display(&root),
-        "architectureRoot": workspace_path_display(&architecture_root),
-        "graphsRoot": workspace_path_display(&architecture_root.join("graphs")),
-        "graphCount": architecture_graph_count(&root),
+        "architecture_root": workspace_path_display(&architecture_root),
+        "graphs_root": workspace_path_display(&architecture_root.join("graphs")),
+        "graph_count": architecture_graph_count(&root),
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn architecture_named_root(name: String) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || architecture_named_root_value(name))
         .await
@@ -2380,26 +2433,23 @@ pub(crate) fn architecture_global_root_value() -> Result<Value, String> {
     Ok(json!({
         "kind": "architecture_global_root",
         "scope": "global",
-        "rootDirectory": workspace_path_display(&root),
         "root_directory": workspace_path_display(&root),
-        "architectureRoot": workspace_path_display(&architecture_root),
-        "graphsRoot": workspace_path_display(&architecture_root.join("graphs")),
-        "repoId": ARCHITECTURE_GLOBAL_REPO_ID,
+        "architecture_root": workspace_path_display(&architecture_root),
+        "graphs_root": workspace_path_display(&architecture_root.join("graphs")),
         "repo_id": ARCHITECTURE_GLOBAL_REPO_ID,
-        "workspaceId": ARCHITECTURE_GLOBAL_WORKSPACE_ID,
         "workspace_id": ARCHITECTURE_GLOBAL_WORKSPACE_ID,
-        "graphCount": architecture_graph_count(&root),
+        "graph_count": architecture_graph_count(&root),
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn architecture_global_root() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(architecture_global_root_value)
         .await
         .map_err(|error| format!("Architecture global root worker failed: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn architecture_graph_copy(
     source_repo_path: String,
     target_repo_path: String,

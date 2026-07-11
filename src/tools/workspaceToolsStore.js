@@ -31,7 +31,7 @@ const ACCOUNT_DOCUMENT_DRAFT_CHANGE_EVENTS = [
 const workspaceToolsStore = {
   architecturesByRepo: new Map(), // repoPath -> [{ graphId, repoLabel, repoPath, title }]
   archAttemptedRepos: new Set(),
-  activeDocumentDraftKey: "",
+  active_document_draft_key: "",
   documentDrafts: new Map(),
   documentDraftLoaded: false,
   knownRepos: new Map(), // repoPath -> label; event refreshes re-fetch all of these
@@ -68,17 +68,7 @@ function workspaceToolsDocumentDraftTitle(draft) {
   const explicit = text(draft?.title || draft?.name || draft?.label);
   if (explicit) return explicit.replace(/\.(?:md|markdown|arch)$/iu, "").trim() || explicit;
   return documentDisplayLeaf(
-    draft?.fileName
-      || draft?.file_name
-      || draft?.pathKey
-      || draft?.path_key
-      || draft?.filePath
-      || draft?.file_path
-      || draft?.documentKey
-      || draft?.document_key
-      || draft?.doc_id
-      || draft?.document_id
-      || draft?.id,
+    draft?.file_name || draft?.path_key || draft?.file_path || draft?.document_key || draft?.doc_id || draft?.document_id || draft?.id,
   );
 }
 
@@ -91,32 +81,84 @@ function clonePlainObject(value) {
   }
 }
 
+const DOCUMENT_DRAFT_PERSISTED_TO_RUNTIME_KEYS = Object.freeze({
+  activeDocumentDraftKey: "active_document_draft_key",
+  assetId: "asset_id",
+  baseContentHash: "base_content_hash",
+  canonicalLocalPath: "canonical_local_path",
+  contentHash: "content_hash",
+  contentMd: "content_md",
+  documentId: "document_id",
+  documentKey: "document_key",
+  draftId: "draft_id",
+  draftPath: "draft_path",
+  fileName: "file_name",
+  filePath: "file_path",
+  graphId: "graph_id",
+  hasContentPayload: "has_content_payload",
+  localSavedAt: "local_saved_at",
+  pathKey: "path_key",
+  pendingPush: "pending_push",
+  projectName: "project_name",
+  repoPath: "repo_path",
+  rowType: "row_type",
+  scopeKey: "scope_key",
+  syncStatus: "sync_status",
+  updatedAt: "updated_at",
+  updatedAtMs: "updated_at_ms",
+});
+
+const DOCUMENT_DRAFT_RUNTIME_TO_PERSISTED_KEYS = Object.freeze(
+  Object.fromEntries(
+    Object.entries(DOCUMENT_DRAFT_PERSISTED_TO_RUNTIME_KEYS)
+      .map(([persisted, runtime]) => [runtime, persisted]),
+  ),
+);
+
+function mapDocumentDraftPersistedKeys(value, keyMap) {
+  if (Array.isArray(value)) {
+    return value.map((item) => mapDocumentDraftPersistedKeys(item, keyMap));
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [
+      keyMap[key] || key,
+      mapDocumentDraftPersistedKeys(item, keyMap),
+    ]),
+  );
+}
+
 function readWorkspaceToolsDocumentDraftsFromStorage() {
-  if (typeof window === "undefined") return { activeDocumentDraftKey: "", drafts: [] };
+  if (typeof window === "undefined") return { active_document_draft_key: "", drafts: [] };
   try {
     const raw = window.localStorage?.getItem(ACCOUNT_DOCUMENT_DRAFT_STORAGE_KEY);
-    if (!raw) return { activeDocumentDraftKey: "", drafts: [] };
-    const parsed = JSON.parse(raw);
-    if (!parsed) return { activeDocumentDraftKey: "", drafts: [] };
+    if (!raw) return { active_document_draft_key: "", drafts: [] };
+    const parsed = mapDocumentDraftPersistedKeys(
+      JSON.parse(raw),
+      DOCUMENT_DRAFT_PERSISTED_TO_RUNTIME_KEYS,
+    );
+    if (!parsed) return { active_document_draft_key: "", drafts: [] };
     if (Array.isArray(parsed)) {
       return {
-        activeDocumentDraftKey: "",
+        active_document_draft_key: "",
         drafts: parsed.filter((draft) => draft && typeof draft === "object" && !Array.isArray(draft)),
       };
     }
-    if (typeof parsed !== "object") return { activeDocumentDraftKey: "", drafts: [] };
+    if (typeof parsed !== "object") return { active_document_draft_key: "", drafts: [] };
     if (Array.isArray(parsed.drafts)) {
       return {
-        activeDocumentDraftKey: text(parsed.activeDocumentDraftKey || parsed.active_document_draft_key),
+        active_document_draft_key: text(parsed.active_document_draft_key),
         drafts: parsed.drafts.filter((draft) => draft && typeof draft === "object" && !Array.isArray(draft)),
       };
     }
     return {
-      activeDocumentDraftKey: "",
+      active_document_draft_key: "",
       drafts: [parsed],
     };
   } catch {
-    return { activeDocumentDraftKey: "", drafts: [] };
+    return { active_document_draft_key: "", drafts: [] };
   }
 }
 
@@ -128,10 +170,11 @@ function writeWorkspaceToolsDocumentDraftsToStorage() {
       window.localStorage?.removeItem(ACCOUNT_DOCUMENT_DRAFT_STORAGE_KEY);
       return;
     }
-    window.localStorage?.setItem(ACCOUNT_DOCUMENT_DRAFT_STORAGE_KEY, JSON.stringify({
-      activeDocumentDraftKey: workspaceToolsStore.activeDocumentDraftKey,
+    const persisted = mapDocumentDraftPersistedKeys({
+      active_document_draft_key: workspaceToolsStore.active_document_draft_key,
       drafts,
-    }));
+    }, DOCUMENT_DRAFT_RUNTIME_TO_PERSISTED_KEYS);
+    window.localStorage?.setItem(ACCOUNT_DOCUMENT_DRAFT_STORAGE_KEY, JSON.stringify(persisted));
   } catch {
     // Draft persistence is best-effort; the in-memory copy still survives tab switches.
   }
@@ -139,10 +182,10 @@ function writeWorkspaceToolsDocumentDraftsToStorage() {
 
 function workspaceToolsDocumentDraftMapKey(draft) {
   const identity = workspaceToolsDocumentDraftIdentity(draft);
-  return identity.draftPath
-    || (identity.draftId ? `draft-id:${identity.draftId}` : "")
-    || identity.documentKey
-    || text(draft?.documentKey || draft?.document_key || accountDocumentStorageKey(draft) || draft?.id);
+  return identity.draft_path
+    || (identity.draft_id ? `draft-id:${identity.draft_id}` : "")
+    || identity.document_key
+    || text(draft?.document_key || accountDocumentStorageKey(draft) || draft?.id);
 }
 
 function ensureWorkspaceToolsDocumentDraftLoaded() {
@@ -156,31 +199,31 @@ function ensureWorkspaceToolsDocumentDraftLoaded() {
     if (!normalized || !key) return;
     workspaceToolsStore.documentDrafts.set(key, normalized);
   });
-  const storedActiveKey = Array.isArray(stored) ? "" : text(stored?.activeDocumentDraftKey || stored?.active_document_draft_key);
+  const storedActiveKey = Array.isArray(stored) ? "" : text(stored?.active_document_draft_key);
   if (storedActiveKey && workspaceToolsStore.documentDrafts.has(storedActiveKey)) {
-    workspaceToolsStore.activeDocumentDraftKey = storedActiveKey;
+    workspaceToolsStore.active_document_draft_key = storedActiveKey;
   }
-  if (!workspaceToolsStore.activeDocumentDraftKey && workspaceToolsStore.documentDrafts.size) {
-    workspaceToolsStore.activeDocumentDraftKey = Array.from(workspaceToolsStore.documentDrafts.keys()).at(-1) || "";
+  if (!workspaceToolsStore.active_document_draft_key && workspaceToolsStore.documentDrafts.size) {
+    workspaceToolsStore.active_document_draft_key = Array.from(workspaceToolsStore.documentDrafts.keys()).at(-1) || "";
   }
 }
 
 function normalizeWorkspaceToolsDocumentDraft(draft) {
   if (!draft || typeof draft !== "object" || Array.isArray(draft)) return null;
   const title = workspaceToolsDocumentDraftTitle(draft);
-  const content = String(draft.content ?? draft.content_md ?? draft.contentMd ?? draft.body ?? "");
-  const documentKey = text(draft.documentKey || draft.document_key || accountDocumentStorageKey(draft) || draft.id);
+  const content = String(draft.content ?? draft.content_md ?? draft.body ?? "");
+  const documentKey = text(draft.document_key || accountDocumentStorageKey(draft) || draft.id);
   if (!documentKey && !title && !content) return null;
   return {
     ...clonePlainObject(draft),
     content,
-    documentKey,
+    document_key: documentKey,
     draft: true,
     isDraft: true,
-    rowType: "document",
-    syncStatus: "draft",
+    row_type: "document",
+    sync_status: "draft",
     title: title || "Untitled document",
-    updatedAtMs: Date.now(),
+    updated_at_ms: Date.now(),
   };
 }
 
@@ -190,15 +233,10 @@ function objectHasValue(object, key) {
 
 export function workspaceToolsDocumentDraftHasContentPayload(draft) {
   if (!draft || typeof draft !== "object" || Array.isArray(draft)) return false;
-  if (draft.hasContentPayload === false || draft.has_content_payload === false) {
+  if (draft.has_content_payload === false) {
     return false;
   }
-  return objectHasValue(draft, "content_md")
-    || objectHasValue(draft, "contentMd")
-    || objectHasValue(draft, "body")
-    || objectHasValue(draft, "content")
-    || draft.hasContentPayload === true
-    || draft.has_content_payload === true;
+  return objectHasValue(draft, "content_md") || objectHasValue(draft, "body") || objectHasValue(draft, "content") || draft.has_content_payload === true;
 }
 
 function normalizedDraftDocumentIdentityKey(value) {
@@ -209,12 +247,9 @@ function normalizedDraftDocumentIdentityKey(value) {
 function workspaceToolsDocumentDraftDocumentKeys(draft) {
   if (!draft || typeof draft !== "object" || Array.isArray(draft)) return [];
   const keys = [
-    draft.documentKey,
     draft.document_key,
     accountDocumentStorageKey(draft),
-    draft.pathKey,
     draft.path_key,
-    draft.filePath,
     draft.file_path,
     draft.doc_id,
     draft.document_id,
@@ -225,14 +260,14 @@ function workspaceToolsDocumentDraftDocumentKeys(draft) {
 
 function workspaceToolsDocumentDraftIdentity(draft) {
   if (!draft || typeof draft !== "object" || Array.isArray(draft)) {
-    return { documentKey: "", documentKeys: [], draftId: "", draftPath: "" };
+    return { document_key: "", documentKeys: [], draft_id: "", draft_path: "" };
   }
   const documentKeys = workspaceToolsDocumentDraftDocumentKeys(draft);
   return {
-    documentKey: documentKeys[0] || "",
+    document_key: documentKeys[0] || "",
     documentKeys,
-    draftId: text(draft.draftId || draft.draft_id),
-    draftPath: text(draft.draftPath || draft.draft_path),
+    draft_id: text(draft.draft_id),
+    draft_path: text(draft.draft_path),
   };
 }
 
@@ -255,19 +290,14 @@ function workspaceToolsDocumentDraftClearCandidates(input) {
     }
     if (typeof value === "object") {
       [
-        value.documentKey,
         value.document_key,
         accountDocumentStorageKey(value),
-        value.pathKey,
         value.path_key,
-        value.filePath,
         value.file_path,
         value.doc_id,
         value.document_id,
         value.id,
-        value.draftPath,
         value.draft_path,
-        value.draftId,
         value.draft_id,
       ].forEach(add);
       return;
@@ -282,8 +312,8 @@ export function workspaceToolsDocumentDraftIdentityMatches(currentDraft, incomin
   const current = workspaceToolsDocumentDraftIdentity(currentDraft);
   const incoming = workspaceToolsDocumentDraftIdentity(incomingDraft);
   return Boolean(
-    (current.draftPath && incoming.draftPath && current.draftPath === incoming.draftPath)
-      || (current.draftId && incoming.draftId && current.draftId === incoming.draftId)
+    (current.draft_path && incoming.draft_path && current.draft_path === incoming.draft_path)
+      || (current.draft_id && incoming.draft_id && current.draft_id === incoming.draft_id)
       || current.documentKeys.some((key) => incoming.documentKeys.includes(key)),
   );
 }
@@ -300,11 +330,11 @@ export function mergeWorkspaceToolsDocumentDraft(currentDraft, incomingDraft) {
   const merged = {
     ...current,
     ...incoming,
-    documentKey: incoming.documentKey || current.documentKey,
+    document_key: incoming.document_key || current.document_key,
     draft: true,
     isDraft: true,
-    rowType: "document",
-    syncStatus: "draft",
+    row_type: "document",
+    sync_status: "draft",
   };
 
   if (!incomingHasContentPayload) {
@@ -334,10 +364,10 @@ export function workspaceToolsRepoDescriptors(coordinationTargets, rootDirectory
     const cleaned = text(repoPath);
     if (!cleaned || seen.has(cleaned)) return;
     seen.add(cleaned);
-    descriptors.push({ repoPath: cleaned, label: text(label, cleaned.split(/[\\/]/u).pop()) });
+    descriptors.push({ repo_path: cleaned, label: text(label, cleaned.split(/[\\/]/u).pop()) });
   };
   (Array.isArray(coordinationTargets) ? coordinationTargets : []).forEach((target) => {
-    addRepo(target?.repoPath, target?.projectName || target?.repoLabel);
+    addRepo(target?.repo_path, target?.project_name || target?.repoLabel);
   });
   addRepo(rootDirectory, text(rootDirectory).split(/[\\/]/u).pop());
   return descriptors;
@@ -355,7 +385,7 @@ function notifyWorkspaceToolsListeners() {
 }
 
 function architectureItemsSignature(items) {
-  return items.map((item) => `${item.repoPath}:${item.graphId}:${item.title}`).join("|");
+  return items.map((item) => `${item.repo_path}:${item.graph_id}:${item.title}`).join("|");
 }
 
 async function loadArchitecturesForRepo(repoPath, label) {
@@ -363,15 +393,15 @@ async function loadArchitecturesForRepo(repoPath, label) {
   if (existing) return existing;
   const load = (async () => {
     try {
-      const list = await invoke("architecture_graphs_list", { repoPath });
+      const list = await invoke("architecture_graphs_list", { repo_path: repoPath });
       const items = (Array.isArray(list?.graphs) ? list.graphs : [])
         .map((graph) => ({
-          graphId: text(graph?.graphId || graph?.graph_id || graph?.id),
+          graph_id: text(graph?.graph_id || graph?.id),
           repoLabel: label,
-          repoPath,
-          title: text(graph?.title || graph?.name || graph?.graphId || graph?.graph_id, "architecture"),
+          repo_path: repoPath,
+          title: text(graph?.title || graph?.name || graph?.graph_id, "architecture"),
         }))
-        .filter((item) => item.graphId);
+        .filter((item) => item.graph_id);
       const previous = workspaceToolsStore.architecturesByRepo.get(repoPath) || [];
       const changed = architectureItemsSignature(previous) !== architectureItemsSignature(items);
       workspaceToolsStore.architecturesByRepo.set(repoPath, items);
@@ -396,15 +426,15 @@ async function loadArchitecturesForRepo(repoPath, label) {
 function skillsSignature(skills) {
   return JSON.stringify((Array.isArray(skills) ? skills : []).map((skill) => [
     skill.id,
-    skill.pathKey,
-    skill.rowType,
+    skill.path_key,
+    skill.row_type,
     skill.title,
     skill.content,
-    skill.assetId,
-    skill.contentHash,
-    skill.pendingPush,
-    skill.localSavedAt,
-    skill.updatedAt,
+    skill.asset_id,
+    skill.content_hash,
+    skill.pending_push,
+    skill.local_saved_at,
+    skill.updated_at,
   ]));
 }
 
@@ -458,9 +488,7 @@ function accountToolsSkillPayloadIsFull(payload) {
       && typeof candidate === "object"
       && !Array.isArray(candidate)
       && (
-        candidate.authoritative === true
-        || candidate.snapshot_full === true
-        || candidate.snapshotFull === true
+        candidate.authoritative === true || candidate.snapshot_full === true
       )
   ));
 }
@@ -480,32 +508,22 @@ function draftEventCandidateWithMetadata(candidate, document) {
   const merged = { ...clonePlainObject(document) };
   [
     "base_content_hash",
-    "baseContentHash",
     "canonical_local_path",
-    "canonicalLocalPath",
     "collection",
     "content_hash",
-    "contentHash",
     "document_id",
-    "documentId",
     "document_key",
-    "documentKey",
     "draft_id",
-    "draftId",
     "draft_path",
-    "draftPath",
     "file_path",
-    "filePath",
     "path_key",
-    "pathKey",
     "scope_key",
-    "scopeKey",
   ].forEach((key) => {
     if (!objectHasValue(merged, key) && objectHasValue(candidate, key)) {
       merged[key] = candidate[key];
     }
   });
-  ["body", "content", "content_md", "contentMd"].forEach((key) => {
+  ["body", "content", "content_md"].forEach((key) => {
     if (!objectHasValue(merged, key) && objectHasValue(candidate, key)) {
       merged[key] = candidate[key];
     }
@@ -520,7 +538,6 @@ function accountDocumentDraftsFromEventPayload(payload) {
     [
       candidate.document,
       candidate.draft,
-      candidate.draftDocument,
       candidate.draft_document,
     ].forEach((document) => {
       const draft = draftEventCandidateWithMetadata(candidate, document);
@@ -538,7 +555,7 @@ function accountDocumentDraftsFromEventPayload(payload) {
       if (draft) drafts.push(draft);
     });
     const identity = workspaceToolsDocumentDraftIdentity(candidate);
-    if (identity.draftPath || identity.draftId || identity.documentKey) {
+    if (identity.draft_path || identity.draft_id || identity.document_key) {
       drafts.push(candidate);
     }
   });
@@ -572,8 +589,8 @@ export function applyWorkspaceToolsDocumentDraftEventPayload(payload) {
           workspaceToolsStore.documentDrafts.delete(currentKey);
         }
       }
-      if (!workspaceToolsStore.documentDrafts.has(workspaceToolsStore.activeDocumentDraftKey)) {
-        workspaceToolsStore.activeDocumentDraftKey = Array.from(workspaceToolsStore.documentDrafts.keys()).at(-1) || "";
+      if (!workspaceToolsStore.documentDrafts.has(workspaceToolsStore.active_document_draft_key)) {
+        workspaceToolsStore.active_document_draft_key = Array.from(workspaceToolsStore.documentDrafts.keys()).at(-1) || "";
       }
       return;
     }
@@ -584,8 +601,8 @@ export function applyWorkspaceToolsDocumentDraftEventPayload(payload) {
         workspaceToolsStore.documentDrafts.delete(key);
       }
       workspaceToolsStore.documentDrafts.set(nextKey, merged);
-      if (!workspaceToolsStore.activeDocumentDraftKey) {
-        workspaceToolsStore.activeDocumentDraftKey = nextKey;
+      if (!workspaceToolsStore.active_document_draft_key) {
+        workspaceToolsStore.active_document_draft_key = nextKey;
       }
     }
   });
@@ -716,7 +733,7 @@ export function ensureWorkspaceToolsFresh(repoDescriptors) {
   wireAccountDocumentDraftChangeEvents();
   const descriptors = Array.isArray(repoDescriptors) ? repoDescriptors : [];
   const activeRepos = new Set();
-  descriptors.forEach(({ repoPath, label }) => {
+  descriptors.forEach(({ repo_path: repoPath, label }) => {
     const cleaned = text(repoPath);
     if (!cleaned) return;
     activeRepos.add(cleaned);
@@ -752,7 +769,7 @@ export function noteAccountSkillUnits(skills) {
 
 export function getWorkspaceToolsDocumentDraft() {
   ensureWorkspaceToolsDocumentDraftLoaded();
-  const key = workspaceToolsStore.activeDocumentDraftKey;
+  const key = workspaceToolsStore.active_document_draft_key;
   const draft = key ? workspaceToolsStore.documentDrafts.get(key) : null;
   if (draft) return clonePlainObject(draft);
   const fallback = Array.from(workspaceToolsStore.documentDrafts.values()).at(-1) || null;
@@ -779,9 +796,9 @@ export function setWorkspaceToolsDocumentDraft(draft, options = {}) {
     }
     workspaceToolsStore.documentDrafts.set(nextKey, nextDraft);
     if (options.activate !== false) {
-      workspaceToolsStore.activeDocumentDraftKey = nextKey;
-    } else if (!workspaceToolsStore.activeDocumentDraftKey) {
-      workspaceToolsStore.activeDocumentDraftKey = nextKey;
+      workspaceToolsStore.active_document_draft_key = nextKey;
+    } else if (!workspaceToolsStore.active_document_draft_key) {
+      workspaceToolsStore.active_document_draft_key = nextKey;
     }
   }
   writeWorkspaceToolsDocumentDraftsToStorage();
@@ -797,28 +814,18 @@ export function clearWorkspaceToolsDocumentDraft(documentKey = "") {
   const previousKey = JSON.stringify(Array.from(workspaceToolsStore.documentDrafts.entries()));
   if (!requestedKeys.length) {
     workspaceToolsStore.documentDrafts.clear();
-    workspaceToolsStore.activeDocumentDraftKey = "";
+    workspaceToolsStore.active_document_draft_key = "";
   } else {
     for (const [key, current] of workspaceToolsStore.documentDrafts.entries()) {
       const matched = requestedKeys.some((requestedKey) => (
-        key === requestedKey
-          || workspaceToolsDocumentDraftIdentityMatches(current, { documentKey: requestedKey })
-          || workspaceToolsDocumentDraftIdentityMatches(current, { document_key: requestedKey })
-          || workspaceToolsDocumentDraftIdentityMatches(current, { pathKey: requestedKey })
-          || workspaceToolsDocumentDraftIdentityMatches(current, { path_key: requestedKey })
-          || workspaceToolsDocumentDraftIdentityMatches(current, { filePath: requestedKey })
-          || workspaceToolsDocumentDraftIdentityMatches(current, { file_path: requestedKey })
-          || workspaceToolsDocumentDraftIdentityMatches(current, { draftPath: requestedKey })
-          || workspaceToolsDocumentDraftIdentityMatches(current, { draft_path: requestedKey })
-          || workspaceToolsDocumentDraftIdentityMatches(current, { draftId: requestedKey })
-          || workspaceToolsDocumentDraftIdentityMatches(current, { draft_id: requestedKey })
+        key === requestedKey || workspaceToolsDocumentDraftIdentityMatches(current, { document_key: requestedKey }) || workspaceToolsDocumentDraftIdentityMatches(current, { path_key: requestedKey }) || workspaceToolsDocumentDraftIdentityMatches(current, { file_path: requestedKey }) || workspaceToolsDocumentDraftIdentityMatches(current, { draft_path: requestedKey }) || workspaceToolsDocumentDraftIdentityMatches(current, { draft_id: requestedKey })
       ));
       if (matched) {
         workspaceToolsStore.documentDrafts.delete(key);
       }
     }
-    if (!workspaceToolsStore.documentDrafts.has(workspaceToolsStore.activeDocumentDraftKey)) {
-      workspaceToolsStore.activeDocumentDraftKey = Array.from(workspaceToolsStore.documentDrafts.keys()).at(-1) || "";
+    if (!workspaceToolsStore.documentDrafts.has(workspaceToolsStore.active_document_draft_key)) {
+      workspaceToolsStore.active_document_draft_key = Array.from(workspaceToolsStore.documentDrafts.keys()).at(-1) || "";
     }
   }
   writeWorkspaceToolsDocumentDraftsToStorage();
@@ -842,7 +849,7 @@ export function getWorkspaceToolsVersion() {
 
 export function getWorkspaceToolsArchitectures(repoDescriptors) {
   const items = [];
-  (Array.isArray(repoDescriptors) ? repoDescriptors : []).forEach(({ repoPath }) => {
+  (Array.isArray(repoDescriptors) ? repoDescriptors : []).forEach(({ repo_path: repoPath }) => {
     const cached = workspaceToolsStore.architecturesByRepo.get(text(repoPath));
     if (cached?.length) items.push(...cached);
   });

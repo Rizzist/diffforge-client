@@ -165,7 +165,7 @@ test("resolvePcbPickedElementContext enriches a picked resistor from circuit-jso
       '  <resistor name="R2" footprint="0402" resistance="1k" />',
       ");",
     ].join("\n"),
-    boardPath: "hardware/demo/demo.board.tsx",
+    board_path: "hardware/demo/demo.board.tsx",
     boardTitle: "Demo Board",
   });
 

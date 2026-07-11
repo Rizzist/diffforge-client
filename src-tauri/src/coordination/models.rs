@@ -7,7 +7,6 @@ fn bool_is_false(value: &bool) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ApiEnvelope {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19,7 +18,6 @@ pub struct ApiEnvelope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ApiErrorEnvelope {
     pub code: String,
     pub message: String,
@@ -27,7 +25,6 @@ pub struct ApiErrorEnvelope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TerminalCoordinationContext {
     pub agent_id: String,
     pub agent_kind: String,

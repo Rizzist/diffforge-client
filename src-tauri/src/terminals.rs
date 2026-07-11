@@ -290,7 +290,7 @@ fn terminal_control_prompt_answer_begin(
     })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_control_automation_begin(
     pane_id: String,
     operation_id: String,
@@ -350,7 +350,7 @@ async fn terminal_control_automation_begin(
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn terminal_control_automation_end(pane_id: String, operation_id: String) -> Result<bool, String> {
     validate_terminal_pane_id(&pane_id)?;
     Ok(terminal_control_operation_end_if_owner(
@@ -1739,28 +1739,28 @@ async fn terminal_screen_prompt_emit_started(
         return;
     }
     let mut event = json!({
-        "hookEventName": "UserInputRequired",
+        "hook_event_name": "UserInputRequired",
         "provider": instance.metadata.agent_kind.clone(),
         "source": source,
         "origin": "screen_detector",
-        "screenDetectorId": active.detector_id.as_str(),
+        "screen_detector_id": active.detector_id.as_str(),
         "status": "awaiting_input",
-        "activityStatus": "awaiting_input",
-        "commandPhase": "awaiting_input",
-        "promptId": active.prompt_id.as_str(),
-        "promptKind": active.prompt_kind.as_str(),
-        "promptDefaultOption": active.default_option.as_deref(),
-        "promptOptions": terminal_screen_prompt_event_options(&active.options),
-        "manualApprovalRequired": active.manual_approval_required,
-        "providerBlockedForUser": true,
-        "terminalIsPromptingUser": true,
-        "promptingUserKind": active.prompt_kind.as_str(),
-        "promptingUserSource": "screen_detector",
-        "promptingUserConfidence": "stable_tail",
-        "promptingUserText": active.prompt_text.as_str(),
-        "allowsFreeText": active.allows_free_text,
+        "activity_status": "awaiting_input",
+        "command_phase": "awaiting_input",
+        "prompt_id": active.prompt_id.as_str(),
+        "prompt_kind": active.prompt_kind.as_str(),
+        "prompt_default_option": active.default_option.as_deref(),
+        "prompt_options": terminal_screen_prompt_event_options(&active.options),
+        "manual_approval_required": active.manual_approval_required,
+        "provider_blocked_for_user": true,
+        "terminal_is_prompting_user": true,
+        "prompting_user_kind": active.prompt_kind.as_str(),
+        "prompting_user_source": "screen_detector",
+        "prompting_user_confidence": "stable_tail",
+        "prompting_user_text": active.prompt_text.as_str(),
+        "allows_free_text": active.allows_free_text,
         "timestamp": crate::coordination::kernel::now_rfc3339(),
-        "timestampMs": terminal_now_ms(),
+        "timestamp_ms": terminal_now_ms(),
     });
     if let Some(object) = event.as_object_mut() {
         let runtime = terminal_runtime_snapshot(instance);
@@ -1771,9 +1771,9 @@ async fn terminal_screen_prompt_emit_started(
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            object.insert("sessionId".to_string(), json!(provider_session_id));
-            object.insert("providerSessionId".to_string(), json!(provider_session_id));
-            object.insert("nativeSessionId".to_string(), json!(provider_session_id));
+            object.insert("session_id".to_string(), json!(provider_session_id));
+            object.insert("provider_session_id".to_string(), json!(provider_session_id));
+            object.insert("native_session_id".to_string(), json!(provider_session_id));
         }
         if let Some(turn_id) = runtime
             .turn_id
@@ -1782,7 +1782,7 @@ async fn terminal_screen_prompt_emit_started(
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            object.insert("turnId".to_string(), json!(turn_id));
+            object.insert("turn_id".to_string(), json!(turn_id));
         }
     }
     process_terminal_activity_hook_event(
@@ -1822,27 +1822,27 @@ async fn terminal_screen_prompt_emit_resolved(
         ("thinking", "running")
     };
     let mut event = json!({
-        "hookEventName": "ScreenPromptResolved",
+        "hook_event_name": "ScreenPromptResolved",
         "provider": instance.metadata.agent_kind.clone(),
         "source": "screen_detector:prompt_resolved",
         "origin": "screen_detector",
-        "screenDetectorId": active.detector_id.as_str(),
+        "screen_detector_id": active.detector_id.as_str(),
         "status": "active",
-        "activityStatus": activity_status,
-        "commandPhase": command_phase,
-        "inputReady": input_ready,
-        "providerBlockedForUser": false,
-        "manualApprovalRequired": false,
-        "terminalIsPromptingUser": false,
-        "promptId": active.prompt_id.as_str(),
-        "promptKind": active.prompt_kind.as_str(),
-        "promptOptions": [],
-        "allowsFreeText": false,
-        "optionId": option_id.unwrap_or_default(),
-        "promptAnswerOption": option_id.unwrap_or_default(),
-        "screenPromptResolvedReason": reason,
+        "activity_status": activity_status,
+        "command_phase": command_phase,
+        "input_ready": input_ready,
+        "provider_blocked_for_user": false,
+        "manual_approval_required": false,
+        "terminal_is_prompting_user": false,
+        "prompt_id": active.prompt_id.as_str(),
+        "prompt_kind": active.prompt_kind.as_str(),
+        "prompt_options": [],
+        "allows_free_text": false,
+        "option_id": option_id.unwrap_or_default(),
+        "prompt_answer_option": option_id.unwrap_or_default(),
+        "screen_prompt_resolved_reason": reason,
         "timestamp": crate::coordination::kernel::now_rfc3339(),
-        "timestampMs": terminal_now_ms(),
+        "timestamp_ms": terminal_now_ms(),
     });
     if let Some(object) = event.as_object_mut() {
         if let Some(provider_session_id) = runtime
@@ -1852,9 +1852,9 @@ async fn terminal_screen_prompt_emit_resolved(
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            object.insert("sessionId".to_string(), json!(provider_session_id));
-            object.insert("providerSessionId".to_string(), json!(provider_session_id));
-            object.insert("nativeSessionId".to_string(), json!(provider_session_id));
+            object.insert("session_id".to_string(), json!(provider_session_id));
+            object.insert("provider_session_id".to_string(), json!(provider_session_id));
+            object.insert("native_session_id".to_string(), json!(provider_session_id));
         }
         if let Some(turn_id) = runtime
             .turn_id
@@ -1863,7 +1863,7 @@ async fn terminal_screen_prompt_emit_resolved(
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            object.insert("turnId".to_string(), json!(turn_id));
+            object.insert("turn_id".to_string(), json!(turn_id));
         }
     }
     process_terminal_activity_hook_event(
@@ -2128,13 +2128,13 @@ fn terminal_windows_build_number() -> Option<u32> {
     None
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_windows_pty_info() -> Result<Value, String> {
     Ok(json!({
         "backend": if cfg!(windows) { "conpty" } else { "native" },
-        "buildNumber": terminal_windows_build_number(),
+        "build_number": terminal_windows_build_number(),
         "term": TERMINAL_EMULATION_TERM,
-        "termProgram": TERMINAL_EMULATION_PROGRAM,
+        "term_program": TERMINAL_EMULATION_PROGRAM,
     }))
 }
 
@@ -2540,12 +2540,7 @@ fn terminal_uuid_session_id_from_text(value: &str) -> Option<String> {
 fn terminal_provider_session_id_from_transcript_path(event: &Value) -> Option<String> {
     terminal_activity_hook_string(
         event,
-        &[
-            "transcriptPath",
-            "transcript_path",
-            "agentTranscriptPath",
-            "agent_transcript_path",
-        ],
+        &["transcript_path", "agent_transcript_path"],
     )
     .and_then(|path| terminal_uuid_session_id_from_text(&path))
 }
@@ -2554,13 +2549,9 @@ fn terminal_activity_hook_provider_session_id(event: &Value) -> Option<String> {
     terminal_activity_hook_string(
         event,
         &[
-            "sessionId",
             "session_id",
-            "providerSessionId",
             "provider_session_id",
-            "nativeSessionId",
             "native_session_id",
-            "conversationId",
             "conversation_id",
         ],
     )
@@ -3291,23 +3282,23 @@ fn terminal_emit_provider_session_binding(
         object.insert("type".to_string(), json!("provider-session"));
         object.insert("recorded".to_string(), json!(recorded));
         object.insert(
-            "sessionId".to_string(),
+            "session_id".to_string(),
             json!(binding.provider_session_id.clone()),
         );
         object.insert(
-            "providerSessionId".to_string(),
+            "provider_session_id".to_string(),
             json!(binding.provider_session_id.clone()),
         );
         object.insert(
-            "nativeSessionId".to_string(),
+            "native_session_id".to_string(),
             json!(binding.native_session_id.clone()),
         );
         object.insert(
-            "nativeSessionKind".to_string(),
+            "native_session_kind".to_string(),
             json!(binding.native_session_kind.clone()),
         );
         object.insert(
-            "nativeSessionSource".to_string(),
+            "native_session_source".to_string(),
             json!(binding.native_session_source.clone()),
         );
     }
@@ -3528,10 +3519,10 @@ fn terminal_emit_workspace_agent_session_history_changed(
         object.insert("type".to_string(), json!("workspace-agent-session-history"));
         object.insert("recorded".to_string(), json!(recorded));
         object.insert(
-            "workspaceId".to_string(),
+            "workspace_id".to_string(),
             json!(record.workspace_id.clone()),
         );
-        object.insert("sessionHistoryId".to_string(), json!(record.id.clone()));
+        object.insert("session_history_id".to_string(), json!(record.id.clone()));
     }
     let _ = app.emit(WORKSPACE_AGENT_SESSION_HISTORY_CHANGED_EVENT, payload);
 }
@@ -5161,14 +5152,12 @@ fn emit_terminal_close_all_progress(
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct TerminalLiveActiveTaskSummary {
     task_id: String,
     title: String,
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct TerminalLiveCoordinationSummary {
     repo_path: String,
     agent_id: String,
@@ -5178,7 +5167,6 @@ struct TerminalLiveCoordinationSummary {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct TerminalLiveParkedPromptSummary {
     pane_id: String,
     instance_id: u64,
@@ -5190,7 +5178,6 @@ struct TerminalLiveParkedPromptSummary {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct TerminalSessionCapabilities {
     provider: String,
     current_model: Option<String>,
@@ -5267,7 +5254,6 @@ fn terminal_session_capabilities(
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct TerminalLiveSessionSummary {
     pane_id: String,
     instance_id: u64,
@@ -5317,7 +5303,6 @@ struct TerminalLiveSessionSummary {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct TerminalLiveSessionsResult {
     generated_at_ms: u64,
     sessions: Vec<TerminalLiveSessionSummary>,
@@ -5676,7 +5661,7 @@ fn workspace_git_operation_state(root: &Path) -> Value {
     json!({
         "clean": clean,
         "merge": merge,
-        "cherryPick": cherry_pick,
+        "cherry_pick": cherry_pick,
         "rebase": rebase,
         "state": if merge {
             "merge"
@@ -5783,7 +5768,7 @@ fn workspace_git_status_files(root: &Path) -> Vec<Value> {
         let worktree_status = bytes.get(1).copied().unwrap_or(b' ') as char;
         files.push(json!({
             "path": path,
-            "oldPath": old_path,
+            "old_path": old_path,
             "code": code,
             "kind": kind,
             "label": workspace_git_status_label(kind),
@@ -5871,15 +5856,15 @@ fn workspace_git_history(root: &Path) -> Vec<Value> {
                     Some(json!({
                         "status": status,
                         "path": normalize_git_status_path(path),
-                        "oldPath": old_path.map(normalize_git_status_path),
+                        "old_path": old_path.map(normalize_git_status_path),
                     }))
                 })
                 .collect::<Vec<_>>();
             Some(json!({
                 "sha": fields[0],
-                "shortSha": fields[1],
-                "authorName": fields[2],
-                "authorEmail": fields[3],
+                "short_sha": fields[1],
+                "author_name": fields[2],
+                "author_email": fields[3],
                 "date": fields[4],
                 "parents": fields[5].split_whitespace().collect::<Vec<_>>(),
                 "refs": fields[6]
@@ -5940,18 +5925,18 @@ fn workspace_git_snapshot_for(root: &Path) -> Value {
     let files = workspace_git_status_files(root);
     let counts = workspace_git_status_counts(&files);
     json!({
-        "generatedAtMs": terminal_now_ms(),
+        "generated_at_ms": terminal_now_ms(),
         "repo": {
             "path": workspace_path_display(root),
             "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
             "branch": workspace_git_current_branch(root),
-            "headSha": workspace_git_head_sha(root),
+            "head_sha": workspace_git_head_sha(root),
             "upstream": upstream,
             "ahead": ahead,
             "behind": behind,
             "remotes": workspace_git_remotes(root),
         },
-        "operationState": workspace_git_operation_state(root),
+        "operation_state": workspace_git_operation_state(root),
         "status": {
             "dirty": !files.is_empty(),
             "counts": counts,
@@ -6050,18 +6035,18 @@ fn workspace_git_pull_candidate_summary(
     json!({
         "path": workspace_path_display(root),
         "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
-        "relativePath": child_relative_path(workspace_root, root).unwrap_or_default(),
+        "relative_path": child_relative_path(workspace_root, root).unwrap_or_default(),
         "branch": branch,
-        "headSha": workspace_git_head_sha(root),
+        "head_sha": workspace_git_head_sha(root),
         "upstream": upstream,
         "ahead": ahead,
         "behind": behind,
         "dirty": dirty,
-        "operationState": operation_state,
-        "statusCounts": counts,
-        "fetchOk": fetch_ok,
-        "fetchError": fetch_error,
-        "fetchSkipped": fetch_skipped,
+        "operation_state": operation_state,
+        "status_counts": counts,
+        "fetch_ok": fetch_ok,
+        "fetch_error": fetch_error,
+        "fetch_skipped": fetch_skipped,
         "pullable": pullable,
         "selected": pullable,
         "reason": reason,
@@ -6077,8 +6062,8 @@ fn workspace_git_pull_repository_once(root: &Path) -> Value {
             "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
             "ok": false,
             "pulled": false,
-            "beforeHeadSha": before_head_sha,
-            "afterHeadSha": before_head_sha,
+            "before_head_sha": before_head_sha,
+            "after_head_sha": before_head_sha,
             "error": format!(
                 "Cannot pull while repository is in {} state.",
                 operation_state["state"].as_str().unwrap_or("an active operation")
@@ -6094,8 +6079,8 @@ fn workspace_git_pull_repository_once(root: &Path) -> Value {
             "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
             "ok": false,
             "pulled": false,
-            "beforeHeadSha": before_head_sha,
-            "afterHeadSha": before_head_sha,
+            "before_head_sha": before_head_sha,
+            "after_head_sha": before_head_sha,
             "error": "Cannot pull with local working tree changes.",
             "snapshot": workspace_git_snapshot_for(root),
         });
@@ -6108,8 +6093,8 @@ fn workspace_git_pull_repository_once(root: &Path) -> Value {
             "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
             "ok": false,
             "pulled": false,
-            "beforeHeadSha": before_head_sha,
-            "afterHeadSha": before_head_sha,
+            "before_head_sha": before_head_sha,
+            "after_head_sha": before_head_sha,
             "error": "No upstream branch configured.",
             "snapshot": workspace_git_snapshot_for(root),
         });
@@ -6121,8 +6106,8 @@ fn workspace_git_pull_repository_once(root: &Path) -> Value {
             "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
             "ok": false,
             "pulled": false,
-            "beforeHeadSha": before_head_sha,
-            "afterHeadSha": before_head_sha,
+            "before_head_sha": before_head_sha,
+            "after_head_sha": before_head_sha,
             "error": error,
             "snapshot": workspace_git_snapshot_for(root),
         });
@@ -6135,8 +6120,8 @@ fn workspace_git_pull_repository_once(root: &Path) -> Value {
             "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
             "ok": false,
             "pulled": false,
-            "beforeHeadSha": before_head_sha,
-            "afterHeadSha": before_head_sha,
+            "before_head_sha": before_head_sha,
+            "after_head_sha": before_head_sha,
             "ahead": ahead,
             "behind": behind,
             "error": if behind > 0 {
@@ -6154,9 +6139,9 @@ fn workspace_git_pull_repository_once(root: &Path) -> Value {
             "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
             "ok": true,
             "pulled": false,
-            "alreadyUpToDate": true,
-            "beforeHeadSha": before_head_sha,
-            "afterHeadSha": before_head_sha,
+            "already_up_to_date": true,
+            "before_head_sha": before_head_sha,
+            "after_head_sha": before_head_sha,
             "ahead": ahead,
             "behind": behind,
             "output": "Already up to date.",
@@ -6176,8 +6161,8 @@ fn workspace_git_pull_repository_once(root: &Path) -> Value {
                 "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
                 "ok": false,
                 "pulled": false,
-                "beforeHeadSha": before_head_sha,
-                "afterHeadSha": before_head_sha,
+                "before_head_sha": before_head_sha,
+                "after_head_sha": before_head_sha,
                 "ahead": ahead,
                 "behind": behind,
                 "error": error,
@@ -6192,8 +6177,8 @@ fn workspace_git_pull_repository_once(root: &Path) -> Value {
             "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
             "ok": false,
             "pulled": false,
-            "beforeHeadSha": before_head_sha,
-            "afterHeadSha": workspace_git_head_sha(root),
+            "before_head_sha": before_head_sha,
+            "after_head_sha": workspace_git_head_sha(root),
             "ahead": ahead,
             "behind": behind,
             "error": if output.trim().is_empty() { "git pull --ff-only failed.".to_string() } else { output.clone() },
@@ -6208,9 +6193,9 @@ fn workspace_git_pull_repository_once(root: &Path) -> Value {
         "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
         "ok": true,
         "pulled": after_head_sha != before_head_sha,
-        "alreadyUpToDate": after_head_sha == before_head_sha,
-        "beforeHeadSha": before_head_sha,
-        "afterHeadSha": after_head_sha,
+        "already_up_to_date": after_head_sha == before_head_sha,
+        "before_head_sha": before_head_sha,
+        "after_head_sha": after_head_sha,
         "ahead": ahead,
         "behind": behind,
         "output": output,
@@ -6286,7 +6271,7 @@ fn workspace_git_generated_commit_message(root: &Path) -> Value {
     })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn workspace_git_pull_candidates(
     state: State<'_, TerminalState>,
     repo_path: String,
@@ -6312,8 +6297,8 @@ async fn workspace_git_pull_candidates(
         "key": topology.cache_key,
         "status": topology.cache_status,
         "hit": topology.cache_hit,
-        "scannedAtMs": topology.scanned_ms,
-        "ageMs": terminal_now_ms().saturating_sub(topology.scanned_ms),
+        "scanned_at_ms": topology.scanned_ms,
+        "age_ms": terminal_now_ms().saturating_sub(topology.scanned_ms),
     });
     let repos = workspace_git_discovered_repositories(&workspace_root, &topology.mounts);
     let workspace_root_for_worker = workspace_root.clone();
@@ -6344,19 +6329,19 @@ async fn workspace_git_pull_candidates(
         .count();
     let repository_count = repositories.len();
     Ok(json!({
-        "generatedAtMs": terminal_now_ms(),
-        "workspaceId": workspace_id.unwrap_or_default(),
-        "workspaceName": workspace_name.unwrap_or_default(),
+        "generated_at_ms": terminal_now_ms(),
+        "workspace_id": workspace_id.unwrap_or_default(),
+        "workspace_name": workspace_name.unwrap_or_default(),
         "root": workspace_path_display(&workspace_root),
         "repositories": repositories,
-        "repositoryCount": repository_count,
-        "pullableCount": pullable_count,
-        "blockedCount": blocked_count,
+        "repository_count": repository_count,
+        "pullable_count": pullable_count,
+        "blocked_count": blocked_count,
         "cache": cache,
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn workspace_git_pull_repositories(repo_paths: Vec<String>) -> Result<Value, String> {
     ensure_app_not_shutting_down("workspace Git pull")?;
     if repo_paths.is_empty() {
@@ -6398,11 +6383,11 @@ async fn workspace_git_pull_repositories(repo_paths: Vec<String>) -> Result<Valu
             .count();
         let result_count = results.len();
         Ok(json!({
-            "generatedAtMs": terminal_now_ms(),
+            "generated_at_ms": terminal_now_ms(),
             "ok": ok_count == result_count,
-            "okCount": ok_count,
-            "pulledCount": pulled_count,
-            "failedCount": result_count.saturating_sub(ok_count),
+            "ok_count": ok_count,
+            "pulled_count": pulled_count,
+            "failed_count": result_count.saturating_sub(ok_count),
             "results": results,
         }))
     })
@@ -6410,7 +6395,7 @@ async fn workspace_git_pull_repositories(repo_paths: Vec<String>) -> Result<Valu
     .map_err(|error| format!("Unable to join Git pull worker: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn workspace_git_snapshot(repo_path: String) -> Result<Value, String> {
     ensure_app_not_shutting_down("workspace Git snapshot")?;
     let root = workspace_git_repo_root(&repo_path)?;
@@ -6419,7 +6404,7 @@ async fn workspace_git_snapshot(repo_path: String) -> Result<Value, String> {
         .map_err(|error| format!("Unable to join Git snapshot worker: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn workspace_git_file_diff(
     repo_path: String,
     file_path: String,
@@ -6450,8 +6435,8 @@ async fn workspace_git_file_diff(
         ensure_git_success(&capture, "git diff")?;
         let (diff, truncated) = truncate_workspace_diff(capture.stdout);
         Ok(json!({
-            "repoPath": workspace_path_display(&root),
-            "filePath": relative_path,
+            "repo_path": workspace_path_display(&root),
+            "file_path": relative_path,
             "staged": staged.unwrap_or(false),
             "diff": diff,
             "truncated": truncated,
@@ -6461,7 +6446,7 @@ async fn workspace_git_file_diff(
     .map_err(|error| format!("Unable to join Git diff worker: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn workspace_git_generate_commit_message(repo_path: String) -> Result<Value, String> {
     ensure_app_not_shutting_down("workspace Git commit message")?;
     let root = workspace_git_repo_root(&repo_path)?;
@@ -6470,7 +6455,7 @@ async fn workspace_git_generate_commit_message(repo_path: String) -> Result<Valu
         .map_err(|error| format!("Unable to join Git message worker: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn workspace_git_commit_and_push(
     repo_path: String,
     message: String,
@@ -6567,11 +6552,11 @@ async fn workspace_git_commit_and_push(
             }
         }
         Ok(json!({
-            "repoPath": workspace_path_display(&root),
-            "commitSha": commit_sha,
+            "repo_path": workspace_path_display(&root),
+            "commit_sha": commit_sha,
             "committed": true,
             "pushed": pushed,
-            "pushError": push_error,
+            "push_error": push_error,
             "snapshot": workspace_git_snapshot_for(&root),
         }))
     })
@@ -6871,21 +6856,21 @@ async fn prepare_terminal_coordination_launch(
                         .as_ref()
                         .map(|slot_key| format!("agent/{slot_key}"));
                     json!({
-                        "agentId": context.agent_id.clone(),
-                        "branchName": branch_name.clone(),
+                        "agent_id": context.agent_id.clone(),
+                        "branch_name": branch_name.clone(),
                         "id": context.worktree_id.clone(),
                         "path": context.write_root.clone(),
-                        "sessionId": context.session_id.clone(),
-                        "slotKey": context.slot_key.clone(),
+                        "session_id": context.session_id.clone(),
+                        "slot_key": context.slot_key.clone(),
                     })
                 } else {
                     json!({
-                        "agentId": context.agent_id.clone(),
-                        "branchName": Value::Null,
+                        "agent_id": context.agent_id.clone(),
+                        "branch_name": Value::Null,
                         "id": Value::Null,
                         "path": context.write_root.clone(),
-                        "sessionId": context.session_id.clone(),
-                        "slotKey": context.slot_key.clone(),
+                        "session_id": context.session_id.clone(),
+                        "slot_key": context.slot_key.clone(),
                     })
                 };
                 let process_working_directory = terminal_process_working_directory_for_context(
@@ -7045,7 +7030,7 @@ fn spawn_terminal_reader(
             "backend-output-prompt-ready"
         };
         let mut event = json!({
-            "hookEventName": "Stop",
+            "hook_event_name": "Stop",
             "provider": instance.metadata.agent_kind.clone(),
             "source": recovery_source,
             "timestamp": crate::coordination::kernel::now_rfc3339(),
@@ -7058,9 +7043,9 @@ fn spawn_terminal_reader(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             {
-                object.insert("sessionId".to_string(), json!(provider_session_id));
-                object.insert("providerSessionId".to_string(), json!(provider_session_id));
-                object.insert("nativeSessionId".to_string(), json!(provider_session_id));
+                object.insert("session_id".to_string(), json!(provider_session_id));
+                object.insert("provider_session_id".to_string(), json!(provider_session_id));
+                object.insert("native_session_id".to_string(), json!(provider_session_id));
             }
             if let Some(turn_id) = runtime
                 .turn_id
@@ -7069,7 +7054,7 @@ fn spawn_terminal_reader(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             {
-                object.insert("turnId".to_string(), json!(turn_id));
+                object.insert("turn_id".to_string(), json!(turn_id));
             }
         }
 
@@ -8492,12 +8477,12 @@ where
         "backend.agent_start_input.write.begin",
         json!({
             "bytes": input.len(),
-            "payloadBytes": payload.len(),
+            "payload_bytes": payload.len(),
             "delivery": delivery,
             "context": clean_terminal_diagnostic_log_text(context),
             "input_kind": terminal_input_forensics_kind(input),
             "reason": reason,
-            "stagingError": staging_error
+            "staging_error": staging_error
                 .as_deref()
                 .map(clean_terminal_diagnostic_log_text),
         }),
@@ -8509,7 +8494,7 @@ where
         log_terminal_crash_forensics_event(
             "backend.agent_start_input.write.error",
             json!({
-                "attemptedDelivery": delivery,
+                "attempted_delivery": delivery,
                 "bytes": input.len(),
                 "context": clean_terminal_diagnostic_log_text(context),
                 "delivery": "failed",
@@ -8527,7 +8512,7 @@ where
         log_terminal_crash_forensics_event(
             "backend.agent_start_input.write.error",
             json!({
-                "attemptedDelivery": delivery,
+                "attempted_delivery": delivery,
                 "bytes": input.len(),
                 "context": clean_terminal_diagnostic_log_text(context),
                 "delivery": "failed",
@@ -8613,7 +8598,7 @@ fn terminal_slot_key_from_request(
     crate::coordination::CoordinationKernel::normalize_slot_key_static("1")
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_open(
     app: AppHandle,
     state: State<'_, TerminalState>,
@@ -9309,7 +9294,7 @@ async fn terminal_open(
             .or_else(|| {
                 launch_worktree
                     .as_ref()
-                    .and_then(|worktree| worktree["agentId"].as_str())
+                    .and_then(|worktree| worktree["agent_id"].as_str())
                     .map(str::to_string)
             }),
         session_id: coordination_context
@@ -9326,7 +9311,7 @@ async fn terminal_open(
             }),
         agent_branch: launch_worktree
             .as_ref()
-            .and_then(|worktree| worktree["branchName"].as_str())
+            .and_then(|worktree| worktree["branch_name"].as_str())
             .map(str::to_string),
         slot_key: coordination_context
             .as_ref()
@@ -9334,7 +9319,7 @@ async fn terminal_open(
             .or_else(|| {
                 launch_worktree
                     .as_ref()
-                    .and_then(|worktree| worktree["slotKey"].as_str())
+                    .and_then(|worktree| worktree["slot_key"].as_str())
                     .map(str::to_string)
             }),
         thread_id,
@@ -9372,7 +9357,7 @@ async fn terminal_open(
     })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_record_provider_session(
     app: AppHandle,
     state: State<'_, TerminalState>,
@@ -9481,8 +9466,8 @@ fn terminal_crash_recovery_targets(
                     if !storage.db_path.exists() {
                         errors.push(json!({
                             "source": "initialized_kernel_registry",
-                            "dbPath": db_label,
-                            "repoPath": workspace_path_display(&storage.repo_path),
+                            "db_path": db_label,
+                            "repo_path": workspace_path_display(&storage.repo_path),
                             "error": "Coordination database no longer exists.",
                         }));
                         continue;
@@ -9565,53 +9550,53 @@ fn terminal_recover_crashed_sessions_report(roots: Option<Vec<String>>) -> Resul
         .and_then(|kernel| kernel.recover_crashed_terminal_sessions())
         {
             Ok(mut report) => {
-                scanned_sessions += report["scannedSessions"].as_u64().unwrap_or(0);
+                scanned_sessions += report["scanned_sessions"].as_u64().unwrap_or(0);
                 idle_sessions_interrupted +=
-                    report["idleSessionsInterrupted"].as_u64().unwrap_or(0);
+                    report["idle_sessions_interrupted"].as_u64().unwrap_or(0);
                 finished_sessions_interrupted +=
-                    report["finishedSessionsInterrupted"].as_u64().unwrap_or(0);
+                    report["finished_sessions_interrupted"].as_u64().unwrap_or(0);
 
-                if let Some(tasks) = report["interruptedTasks"].as_array_mut() {
+                if let Some(tasks) = report["interrupted_tasks"].as_array_mut() {
                     for task in tasks.iter_mut() {
                         if let Some(object) = task.as_object_mut() {
-                            object.insert("repoPath".to_string(), json!(repo_key.clone()));
+                            object.insert("repo_path".to_string(), json!(repo_key.clone()));
                             if let Some(db_key) = &db_key {
-                                object.insert("dbPath".to_string(), json!(db_key));
+                                object.insert("db_path".to_string(), json!(db_key));
                             }
                             object
-                                .insert("recoverySource".to_string(), json!(target.source.clone()));
+                                .insert("recovery_source".to_string(), json!(target.source.clone()));
                         }
                         interrupted_tasks.push(task.clone());
                     }
                 }
 
-                if let Some(terminals) = report["crashedTerminals"].as_array_mut() {
+                if let Some(terminals) = report["crashed_terminals"].as_array_mut() {
                     for terminal in terminals.iter_mut() {
                         if let Some(object) = terminal.as_object_mut() {
-                            object.insert("repoPath".to_string(), json!(repo_key.clone()));
+                            object.insert("repo_path".to_string(), json!(repo_key.clone()));
                             if let Some(db_key) = &db_key {
-                                object.insert("dbPath".to_string(), json!(db_key));
+                                object.insert("db_path".to_string(), json!(db_key));
                             }
                             object
-                                .insert("recoverySource".to_string(), json!(target.source.clone()));
+                                .insert("recovery_source".to_string(), json!(target.source.clone()));
                         }
                         crashed_terminals.push(terminal.clone());
                     }
                 }
 
                 if let Some(object) = report.as_object_mut() {
-                    object.insert("repoPath".to_string(), json!(repo_key));
+                    object.insert("repo_path".to_string(), json!(repo_key));
                     if let Some(db_key) = db_key {
-                        object.insert("dbPath".to_string(), json!(db_key));
+                        object.insert("db_path".to_string(), json!(db_key));
                     }
-                    object.insert("recoverySource".to_string(), json!(target.source.clone()));
+                    object.insert("recovery_source".to_string(), json!(target.source.clone()));
                 }
                 workspace_reports.push(report);
             }
             Err(error) => {
                 errors.push(json!({
                     "root": repo_key,
-                    "dbPath": db_key,
+                    "db_path": db_key,
                     "source": target.source,
                     "error": clean_terminal_telemetry_text(&error),
                 }));
@@ -9620,12 +9605,12 @@ fn terminal_recover_crashed_sessions_report(roots: Option<Vec<String>>) -> Resul
     }
 
     Ok(json!({
-        "interruptedTasks": interrupted_tasks,
-        "crashedTerminals": crashed_terminals,
-        "idleSessionsInterrupted": idle_sessions_interrupted,
-        "finishedSessionsInterrupted": finished_sessions_interrupted,
-        "scannedSessions": scanned_sessions,
-        "workspaceReports": workspace_reports,
+        "interrupted_tasks": interrupted_tasks,
+        "crashed_terminals": crashed_terminals,
+        "idle_sessions_interrupted": idle_sessions_interrupted,
+        "finished_sessions_interrupted": finished_sessions_interrupted,
+        "scanned_sessions": scanned_sessions,
+        "workspace_reports": workspace_reports,
         "errors": errors,
     }))
 }
@@ -9638,14 +9623,14 @@ fn terminal_recover_crashed_sessions_on_startup() {
                 "terminal.crash_recovery.startup_scan",
                 json!({
                     "ok": true,
-                    "scanned_sessions": report["scannedSessions"].as_u64().unwrap_or(0),
-                    "crashed_terminal_count": report["crashedTerminals"].as_array().map(Vec::len).unwrap_or(0),
-                    "interrupted_task_count": report["interruptedTasks"].as_array().map(Vec::len).unwrap_or(0),
-                    "idle_sessions_interrupted": report["idleSessionsInterrupted"].as_u64().unwrap_or(0),
-                    "finished_sessions_interrupted": report["finishedSessionsInterrupted"].as_u64().unwrap_or(0),
-                    "workspace_report_count": report["workspaceReports"].as_array().map(Vec::len).unwrap_or(0),
+                    "scanned_sessions": report["scanned_sessions"].as_u64().unwrap_or(0),
+                    "crashed_terminal_count": report["crashed_terminals"].as_array().map(Vec::len).unwrap_or(0),
+                    "interrupted_task_count": report["interrupted_tasks"].as_array().map(Vec::len).unwrap_or(0),
+                    "idle_sessions_interrupted": report["idle_sessions_interrupted"].as_u64().unwrap_or(0),
+                    "finished_sessions_interrupted": report["finished_sessions_interrupted"].as_u64().unwrap_or(0),
+                    "workspace_report_count": report["workspace_reports"].as_array().map(Vec::len).unwrap_or(0),
                     "error_count": report["errors"].as_array().map(Vec::len).unwrap_or(0),
-                    "crashed_terminals": report["crashedTerminals"].clone(),
+                    "crashed_terminals": report["crashed_terminals"].clone(),
                 }),
             ),
             Err(error) => log_terminal_crash_forensics_event(
@@ -9659,7 +9644,7 @@ fn terminal_recover_crashed_sessions_on_startup() {
     });
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_recover_crashed_sessions(roots: Option<Vec<String>>) -> Result<Value, String> {
     terminal_recover_crashed_sessions_report(roots)
 }
@@ -9684,7 +9669,7 @@ async fn resolve_app_control_mcp_launch(
     )))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_start_agent(
     app: AppHandle,
     state: State<'_, TerminalState>,
@@ -10429,7 +10414,7 @@ async fn start_terminal_agent_in_prepared_pty(
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_start_agent_many(
     app: AppHandle,
     state: State<'_, TerminalState>,
@@ -10521,7 +10506,7 @@ async fn terminal_start_agent_many(
     })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn set_terminal_audio_input_target(
     state: State<'_, TerminalState>,
     pane_id: String,
@@ -10531,7 +10516,7 @@ fn set_terminal_audio_input_target(
     set_terminal_audio_input_target_for(&state, pane_id, instance_id, active)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn set_terminal_audio_route_gate(
     state: State<'_, TerminalState>,
     allow_terminal: bool,
@@ -10539,7 +10524,7 @@ fn set_terminal_audio_route_gate(
     set_terminal_audio_route_gate_for(&state, allow_terminal)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_write_to_audio_input_target(
     app: AppHandle,
     state: State<'_, TerminalState>,
@@ -11884,13 +11869,13 @@ pub(crate) fn observe_terminal_coordination_event(
             return;
         };
         let refs_payload = json!({
-            "taskId": refs.task_id,
-            "agentId": refs.agent_id,
-            "agentSlotId": refs.agent_slot_id,
-            "sessionId": refs.session_id,
-            "resourceId": refs.resource_id,
-            "artifactId": refs.artifact_id,
-            "contextRunId": refs.context_run_id,
+            "task_id": refs.task_id,
+            "agent_id": refs.agent_id,
+            "agent_slot_id": refs.agent_slot_id,
+            "session_id": refs.session_id,
+            "resource_id": refs.resource_id,
+            "artifact_id": refs.artifact_id,
+            "context_run_id": refs.context_run_id,
         });
         let task_id = refs.task_id.clone();
         let agent_id = refs.agent_id.clone();
@@ -11924,7 +11909,6 @@ pub(crate) fn observe_terminal_coordination_event(
                 .and_then(|snapshot| {
                     snapshot
                         .get("selected_plan")
-                        .or_else(|| snapshot.get("selectedPlan"))
                 })
                 .cloned()
                 .filter(|value| !value.is_null());
@@ -11937,18 +11921,18 @@ pub(crate) fn observe_terminal_coordination_event(
                 TERMINAL_TODO_PLAN_UPDATED_EVENT,
                 json!({
                     "source": "coordination",
-                    "repoPath": repo_path.display().to_string(),
-                    "dbPath": db_path.display().to_string(),
-                    "eventType": event_type,
-                    "taskId": task_id,
-                    "planId": plan_ref,
-                    "agentId": agent_id,
-                    "sessionId": session_id,
+                    "repo_path": repo_path.display().to_string(),
+                    "db_path": db_path.display().to_string(),
+                    "event_type": event_type,
+                    "task_id": task_id,
+                    "plan_id": plan_ref,
+                    "agent_id": agent_id,
+                    "session_id": session_id,
                     "refs": refs_payload,
                     "plan": selected_plan.clone(),
-                    "selectedPlan": selected_plan,
+                    "selected_plan": selected_plan,
                     "history": plan_history,
-                    "planSnapshot": plan_snapshot,
+                    "plan_snapshot": plan_snapshot,
                     "payload": payload,
                 }),
             );
@@ -12029,13 +12013,13 @@ pub(crate) fn observe_workspace_notification_coordination_event(
     };
 
     let refs_payload = json!({
-        "taskId": refs.task_id,
-        "agentId": refs.agent_id,
-        "agentSlotId": refs.agent_slot_id,
-        "sessionId": refs.session_id,
-        "resourceId": refs.resource_id,
-        "artifactId": refs.artifact_id,
-        "contextRunId": refs.context_run_id,
+        "task_id": refs.task_id,
+        "agent_id": refs.agent_id,
+        "agent_slot_id": refs.agent_slot_id,
+        "session_id": refs.session_id,
+        "resource_id": refs.resource_id,
+        "artifact_id": refs.artifact_id,
+        "context_run_id": refs.context_run_id,
     });
 
     let notification_kind = match event_type.as_str() {
@@ -12077,13 +12061,13 @@ pub(crate) fn observe_workspace_notification_coordination_event(
         WORKSPACE_NOTIFICATION_EVENT,
         json!({
             "source": "coordination",
-            "eventId": event_id,
-            "sourceEventId": event_id,
+            "event_id": event_id,
+            "source_event_id": event_id,
             "seq": event_seq,
-            "createdAt": created_at,
-            "repoPath": repo_path.display().to_string(),
-            "dbPath": db_path.display().to_string(),
-            "eventType": event_type,
+            "created_at": created_at,
+            "repo_path": repo_path.display().to_string(),
+            "db_path": db_path.display().to_string(),
+            "event_type": event_type,
             "kind": notification_kind,
             "severity": severity,
             "actionability": actionability,
@@ -14181,12 +14165,7 @@ fn terminal_activity_hook_background_field_is_active(event: &Value, keys: &[&str
 fn terminal_activity_hook_claude_stop_has_background_work(event: &Value) -> bool {
     terminal_activity_hook_background_field_is_active(
         event,
-        &[
-            "backgroundTasks",
-            "background_tasks",
-            "sessionCrons",
-            "session_crons",
-        ],
+        &["background_tasks", "session_crons"],
     )
 }
 
@@ -14202,14 +14181,7 @@ fn terminal_activity_hook_background_stop_forces_busy(
 }
 
 fn terminal_activity_hook_explicit_input_not_ready(event: &Value) -> bool {
-    [
-        "inputReady",
-        "input_ready",
-        "isInputReady",
-        "is_input_ready",
-        "readyForInput",
-        "ready_for_input",
-    ]
+    ["input_ready", "is_input_ready", "ready_for_input"]
     .iter()
     .filter_map(|key| event.get(*key))
     .any(|value| match value {
@@ -14230,14 +14202,10 @@ fn terminal_activity_hook_resolution_is_failure(event: &Value) -> bool {
     terminal_activity_hook_status_key(
         event,
         &[
-            "permissionDecision",
             "permission_decision",
             "decision",
-            "approvalDecision",
             "approval_decision",
-            "permissionStatus",
             "permission_status",
-            "approvalStatus",
             "approval_status",
             "status",
             "result",
@@ -14428,7 +14396,6 @@ fn terminal_activity_hook_prompt_options_from_event(
     prompt_kind: &str,
 ) -> Vec<TerminalActivityHookPromptOption> {
     let mut options = [
-        "promptOptions",
         "prompt_options",
         "options",
         "choices",
@@ -14513,13 +14480,7 @@ fn terminal_activity_hook_manual_prompt(
     );
     let resolved_decision = terminal_activity_hook_status_key(
         event,
-        &[
-            "permissionDecision",
-            "permission_decision",
-            "decision",
-            "approvalDecision",
-            "approval_decision",
-        ],
+        &["permission_decision", "decision", "approval_decision"],
     )
     .is_some_and(|status| {
         matches!(
@@ -14543,13 +14504,7 @@ fn terminal_activity_hook_manual_prompt(
     });
     let resolved_status = terminal_activity_hook_status_key(
         event,
-        &[
-            "permissionStatus",
-            "permission_status",
-            "approvalStatus",
-            "approval_status",
-            "status",
-        ],
+        &["permission_status", "approval_status", "status"],
     )
     .is_some_and(|status| {
         matches!(
@@ -14578,13 +14533,7 @@ fn terminal_activity_hook_manual_prompt(
 
     let pending_status = terminal_activity_hook_status_key(
         event,
-        &[
-            "permissionStatus",
-            "permission_status",
-            "approvalStatus",
-            "approval_status",
-            "status",
-        ],
+        &["permission_status", "approval_status", "status"],
     )
     .is_some_and(|status| {
         matches!(
@@ -14611,15 +14560,10 @@ fn terminal_activity_hook_manual_prompt(
         || terminal_activity_hook_bool(
             event,
             &[
-                "manualApprovalRequired",
                 "manual_approval_required",
-                "providerBlockedForUser",
                 "provider_blocked_for_user",
-                "requiresUserInput",
                 "requires_user_input",
-                "terminalIsPromptingUser",
                 "terminal_is_prompting_user",
-                "promptingUser",
                 "prompting_user",
             ],
         );
@@ -14627,24 +14571,20 @@ fn terminal_activity_hook_manual_prompt(
         return None;
     }
 
-    let approval_id = terminal_activity_hook_string(event, &["approvalId", "approval_id"]);
+    let approval_id = terminal_activity_hook_string(event, &["approval_id"]);
     let permission_prompt_id =
-        terminal_activity_hook_string(event, &["permissionPromptId", "permission_prompt_id"]);
+        terminal_activity_hook_string(event, &["permission_prompt_id"]);
     let permission_request_id = terminal_activity_hook_string(
         event,
         &[
-            "permissionRequestId",
             "permission_request_id",
-            "promptId",
             "prompt_id",
-            "questionId",
             "question_id",
-            "selectionId",
             "selection_id",
             "id",
         ],
     );
-    let tool_use_id = terminal_activity_hook_string(event, &["toolUseId", "tool_use_id"]);
+    let tool_use_id = terminal_activity_hook_string(event, &["tool_use_id"]);
     let has_action_token = approval_id.is_some()
         || permission_prompt_id.is_some()
         || permission_request_id.is_some()
@@ -14655,12 +14595,7 @@ fn terminal_activity_hook_manual_prompt(
 
     let kind = terminal_activity_hook_string(
         event,
-        &[
-            "promptingUserKind",
-            "prompting_user_kind",
-            "promptingKind",
-            "prompting_kind",
-        ],
+        &["prompting_user_kind", "prompting_kind"],
     )
     .map(|value| terminal_activity_hook_name_key(&value))
     .filter(|value| {
@@ -14672,7 +14607,7 @@ fn terminal_activity_hook_manual_prompt(
     .unwrap_or_else(|| {
         if terminal_activity_hook_bool(
             event,
-            &["manualApprovalRequired", "manual_approval_required"],
+            &["manual_approval_required"],
         ) || hook_key.contains("approval")
         {
             "approval".to_string()
@@ -14691,28 +14626,22 @@ fn terminal_activity_hook_manual_prompt(
     let text = terminal_activity_hook_string(
         event,
         &[
-            "promptingUserText",
             "prompting_user_text",
-            "promptingText",
             "prompting_text",
             "question",
             "title",
             "description",
             "message",
             "prompt",
-            "lastMessage",
             "last_message",
         ],
     );
     let default_option = terminal_activity_hook_string(
         event,
         &[
-            "promptDefaultOption",
             "prompt_default_option",
-            "defaultOption",
             "default_option",
             "default",
-            "defaultDecision",
             "default_decision",
         ],
     )
@@ -14725,14 +14654,7 @@ fn terminal_activity_hook_manual_prompt(
             None
         }
     });
-    let ttl_ms = [
-        "promptTtlMs",
-        "prompt_ttl_ms",
-        "ttlMs",
-        "ttl_ms",
-        "timeoutMs",
-        "timeout_ms",
-    ]
+    let ttl_ms = ["prompt_ttl_ms", "ttl_ms", "timeout_ms"]
     .iter()
     .find_map(|key| {
         event.get(*key).and_then(|value| {
@@ -14755,14 +14677,7 @@ fn terminal_activity_hook_manual_prompt(
     }
     let allows_free_text = terminal_activity_hook_bool(
         event,
-        &[
-            "allowsFreeText",
-            "allows_free_text",
-            "freeText",
-            "free_text",
-            "supportsFreeText",
-            "supports_free_text",
-        ],
+        &["allows_free_text", "free_text", "supports_free_text"],
     ) || options.iter().any(|option| {
         let id = terminal_activity_hook_prompt_option_id(&option.id);
         let value = option
@@ -14840,7 +14755,7 @@ fn terminal_activity_hook_is_prompt_submit(hook_event_name: &str) -> bool {
 
 fn terminal_activity_hook_tool_activity_status(event: &Value) -> &'static str {
     let tool_name =
-        terminal_activity_hook_string(event, &["toolName", "tool_name"]).unwrap_or_default();
+        terminal_activity_hook_string(event, &["tool_name"]).unwrap_or_default();
     let tool_key = terminal_activity_hook_name_key(&tool_name);
     if tool_key.contains("mcp") {
         return "mcp";
@@ -14974,10 +14889,10 @@ fn terminal_activity_hook_activity_kind(
             "cli_hook_permission_resolved",
         )),
         "screenpromptresolved" => {
-            let input_ready = terminal_activity_hook_bool(event, &["inputReady", "input_ready"]);
+            let input_ready = terminal_activity_hook_bool(event, &["input_ready"]);
             let activity_status = terminal_activity_hook_string(
                 event,
-                &["activityStatus", "activity_status", "status"],
+                &["activity_status", "status"],
             )
             .map(|value| terminal_projection_text(&value, ""))
             .unwrap_or_default();
@@ -15328,11 +15243,8 @@ fn terminal_architecture_graph_path_from_text(value: &str) -> String {
 
 fn terminal_architecture_graph_path_from_event(event: &Value) -> String {
     [
-        "graphFilePath",
         "graph_file_path",
-        "architectureGraphFilePath",
         "architecture_graph_file_path",
-        "filePath",
         "file_path",
         "path",
         "command",
@@ -15383,14 +15295,12 @@ fn terminal_architecture_activity_payload(
     let hook_event_name = terminal_activity_hook_string(
         event,
         &[
-            "hookEventName",
             "hook_event_name",
-            "eventName",
             "event_name",
         ],
     )?;
     let tool_name =
-        terminal_activity_hook_string(event, &["toolName", "tool_name"]).unwrap_or_default();
+        terminal_activity_hook_string(event, &["tool_name"]).unwrap_or_default();
     let tool_key = terminal_activity_hook_name_key(&tool_name);
     let graph_file_path = terminal_architecture_graph_path_from_event(event);
     let is_architecture_tool = tool_key.contains("architecturecontext")
@@ -15426,9 +15336,7 @@ fn terminal_architecture_activity_payload(
     let graph_id = terminal_activity_hook_string(
         event,
         &[
-            "graphId",
             "graph_id",
-            "architectureGraphId",
             "architecture_graph_id",
         ],
     )
@@ -15436,9 +15344,7 @@ fn terminal_architecture_activity_payload(
     let graph_title = terminal_activity_hook_string(
         event,
         &[
-            "graphTitle",
             "graph_title",
-            "architectureGraphTitle",
             "architecture_graph_title",
         ],
     )
@@ -15474,9 +15380,7 @@ fn terminal_activity_hook_payload(
     let hook_event_name = terminal_activity_hook_string(
         event,
         &[
-            "hookEventName",
             "hook_event_name",
-            "eventName",
             "event_name",
         ],
     )?;
@@ -15484,7 +15388,7 @@ fn terminal_activity_hook_payload(
     let metadata = instance.metadata.clone();
     let mut background_work_active = false;
     let screen_detector_prompt = manual_prompt.is_some()
-        && terminal_activity_hook_string(event, &["origin", "promptOrigin", "prompt_origin"])
+        && terminal_activity_hook_string(event, &["origin", "prompt_origin"])
             .as_deref()
             .is_some_and(|value| value.eq_ignore_ascii_case("screen_detector"));
     let (event_type, activity_status, status, command_phase, input_ready, completion_evidence) =
@@ -15554,8 +15458,7 @@ fn terminal_activity_hook_payload(
         };
     let now_ms = terminal_now_ms();
     let event_time_ms = event
-        .get("timestampMs")
-        .or_else(|| event.get("timestamp_ms"))
+        .get("timestamp_ms")
         .and_then(Value::as_u64)
         .unwrap_or(now_ms);
     let event_time = crate::coordination::kernel::now_rfc3339();
@@ -15563,7 +15466,7 @@ fn terminal_activity_hook_payload(
         .unwrap_or_else(|| metadata.agent_kind.clone());
     let agent_type = terminal_activity_hook_string(
         event,
-        &["agentType", "agent_type", "subagentType", "subagent_type"],
+        &["agent_type", "subagent_type"],
     );
     let agent_display_name = terminal_activity_hook_agent_display_name(
         agent_type.as_deref(),
@@ -15573,7 +15476,7 @@ fn terminal_activity_hook_payload(
     let hook_key = terminal_activity_hook_name_key(&hook_event_name);
     let provider_session_id = terminal_activity_hook_provider_session_id(event);
     let provider_turn_id =
-        terminal_activity_hook_string(event, &["turnId", "turn_id"]).or_else(|| {
+        terminal_activity_hook_string(event, &["turn_id"]).or_else(|| {
             terminal_activity_hook_is_prompt_submit_key(&hook_key)
                 .then(|| format!("hook-turn-{}-{event_time_ms}", metadata.pane_id))
         });
@@ -15583,15 +15486,10 @@ fn terminal_activity_hook_payload(
     );
     let user_message_keys: &[&str] = if final_message_hook {
         &[
-            "lastMessage",
             "last_message",
-            "lastAssistantMessage",
             "last_assistant_message",
-            "assistantMessageSnapshot",
             "assistant_message_snapshot",
-            "assistantMessage",
             "assistant_message",
-            "outputText",
             "output_text",
             "content",
             "response",
@@ -15601,11 +15499,8 @@ fn terminal_activity_hook_payload(
         ]
     } else {
         &[
-            "assistantMessage",
             "assistant_message",
-            "assistantDelta",
             "assistant_delta",
-            "outputText",
             "output_text",
             "content",
             "delta",
@@ -15614,12 +15509,10 @@ fn terminal_activity_hook_payload(
             "thinking",
             "reasoning",
             "prompt",
-            "userPrompt",
             "user_prompt",
             "text",
             "message",
             "description",
-            "lastMessage",
             "last_message",
         ]
     };
@@ -15659,7 +15552,7 @@ fn terminal_activity_hook_payload(
     let prompt_ready_at = input_ready.then(|| event_time.clone());
     let completed_at = input_ready.then(|| event_time.clone());
     let permission_mode =
-        terminal_activity_hook_string(event, &["permissionMode", "permission_mode"]);
+        terminal_activity_hook_string(event, &["permission_mode"]);
     let prompt_is_open = matches!(
         event_type,
         "provider-permission-requested" | "provider-user-prompt-started"
@@ -15670,21 +15563,18 @@ fn terminal_activity_hook_payload(
         .is_some_and(|prompt| prompt.kind == "approval")
         || terminal_activity_hook_bool(
             event,
-            &["manualApprovalRequired", "manual_approval_required"],
+            &["manual_approval_required"],
         );
     let provider_blocked_for_user = manual_prompt.is_some()
         || terminal_activity_hook_bool(
             event,
-            &["providerBlockedForUser", "provider_blocked_for_user"],
+            &["provider_blocked_for_user"],
         );
     let explicit_prompt_kind = terminal_activity_hook_string(
         event,
         &[
-            "promptKind",
             "prompt_kind",
-            "promptingUserKind",
             "prompting_user_kind",
-            "promptingKind",
             "prompting_kind",
         ],
     )
@@ -15720,9 +15610,7 @@ fn terminal_activity_hook_payload(
             terminal_activity_hook_string(
                 event,
                 &[
-                    "promptingUserText",
                     "prompting_user_text",
-                    "promptingText",
                     "prompting_text",
                     "question",
                     "title",
@@ -15732,19 +15620,15 @@ fn terminal_activity_hook_payload(
                 ],
             )
         });
-    let event_approval_id = terminal_activity_hook_string(event, &["approvalId", "approval_id"]);
+    let event_approval_id = terminal_activity_hook_string(event, &["approval_id"]);
     let event_permission_prompt_id =
-        terminal_activity_hook_string(event, &["permissionPromptId", "permission_prompt_id"]);
+        terminal_activity_hook_string(event, &["permission_prompt_id"]);
     let event_permission_request_id = terminal_activity_hook_string(
         event,
         &[
-            "permissionRequestId",
             "permission_request_id",
-            "promptId",
             "prompt_id",
-            "questionId",
             "question_id",
-            "selectionId",
             "selection_id",
             "id",
         ],
@@ -15769,21 +15653,18 @@ fn terminal_activity_hook_payload(
                 .clone()
                 .or_else(|| prompt.permission_prompt_id.clone())
                 .or_else(|| prompt.permission_request_id.clone())
-                .or_else(|| terminal_activity_hook_string(event, &["toolUseId", "tool_use_id"]))
+                .or_else(|| terminal_activity_hook_string(event, &["tool_use_id"]))
         })
         .or_else(|| event_approval_id.clone())
         .or_else(|| event_permission_prompt_id.clone())
         .or_else(|| event_permission_request_id.clone())
-        .or_else(|| terminal_activity_hook_string(event, &["toolUseId", "tool_use_id"]));
+        .or_else(|| terminal_activity_hook_string(event, &["tool_use_id"]));
     let explicit_default_option = terminal_activity_hook_string(
         event,
         &[
-            "promptDefaultOption",
             "prompt_default_option",
-            "defaultOption",
             "default_option",
             "default",
-            "defaultDecision",
             "default_decision",
         ],
     )
@@ -15798,11 +15679,8 @@ fn terminal_activity_hook_payload(
                 .then(|| "reject".to_string())
         });
     let event_prompt_ttl_ms = [
-        "promptTtlMs",
         "prompt_ttl_ms",
-        "ttlMs",
         "ttl_ms",
-        "timeoutMs",
         "timeout_ms",
     ]
     .iter()
@@ -15836,11 +15714,8 @@ fn terminal_activity_hook_payload(
         || terminal_activity_hook_bool(
             event,
             &[
-                "allowsFreeText",
                 "allows_free_text",
-                "freeText",
                 "free_text",
-                "supportsFreeText",
                 "supports_free_text",
             ],
         )
@@ -15861,15 +15736,11 @@ fn terminal_activity_hook_payload(
         terminal_activity_hook_string(
             event,
             &[
-                "optionId",
                 "option_id",
-                "selectedOptionId",
                 "selected_option_id",
-                "selectedOption",
                 "selected_option",
                 "answer",
                 "choice",
-                "permissionDecision",
                 "permission_decision",
                 "decision",
                 "response",
@@ -15960,7 +15831,7 @@ fn terminal_activity_hook_payload(
         turn_id: provider_turn_id,
         transcript_path: terminal_activity_hook_string(
             event,
-            &["transcriptPath", "transcript_path"],
+            &["transcript_path"],
         ),
         cwd: terminal_activity_hook_string(event, &["cwd"]),
         user_message: user_message.clone(),
@@ -15968,19 +15839,17 @@ fn terminal_activity_hook_payload(
         live_text_delta: None,
         live_text_snapshot: None,
         live_text_kind,
-        tool_name: terminal_activity_hook_string(event, &["toolName", "tool_name"]),
-        tool_use_id: terminal_activity_hook_string(event, &["toolUseId", "tool_use_id"]),
-        tool_server: terminal_activity_hook_string(event, &["toolServer", "tool_server", "server"]),
+        tool_name: terminal_activity_hook_string(event, &["tool_name"]),
+        tool_use_id: terminal_activity_hook_string(event, &["tool_use_id"]),
+        tool_server: terminal_activity_hook_string(event, &["tool_server", "server"]),
         tool_input: terminal_activity_hook_value(
             event,
-            &["toolInput", "tool_input", "input", "arguments", "args"],
+            &["tool_input", "input", "arguments", "args"],
         ),
         tool_output: terminal_activity_hook_value(
             event,
             &[
-                "toolOutput",
                 "tool_output",
-                "toolResponse",
                 "tool_response",
                 "output",
                 "result",
@@ -15990,25 +15859,23 @@ fn terminal_activity_hook_payload(
         ),
         tool_error: terminal_activity_hook_value(
             event,
-            &["toolError", "tool_error", "error", "stderr"],
+            &["tool_error", "error", "stderr"],
         ),
         raw_tool_payload: terminal_activity_hook_value(
             event,
             &[
-                "rawToolPayload",
                 "raw_tool_payload",
-                "rawPayload",
                 "raw_payload",
                 "raw",
             ],
         ),
         command: terminal_activity_hook_string(event, &["command"]),
-        file_path: terminal_activity_hook_string(event, &["filePath", "file_path", "path"]),
+        file_path: terminal_activity_hook_string(event, &["file_path", "path"]),
         duration_ms: terminal_activity_hook_u64(
             event,
-            &["durationMs", "duration_ms", "elapsedMs", "elapsed_ms"],
+            &["duration_ms", "elapsed_ms"],
         ),
-        exit_code: terminal_activity_hook_i64(event, &["exitCode", "exit_code", "code"]),
+        exit_code: terminal_activity_hook_i64(event, &["exit_code", "code"]),
         approval_id,
         permission_prompt_id,
         permission_request_id,
@@ -16280,7 +16147,7 @@ fn terminal_native_plan_capture_observe(
     let hook_key = terminal_activity_hook_name_key(&payload.hook_event_name);
     let plan_update = if hook_key == "posttooluse" {
         event
-            .get("planUpdate")
+            .get("plan_update")
             .filter(|value| value.is_object())
             .cloned()
     } else {
@@ -16572,12 +16439,12 @@ fn terminal_activity_watchdog_event(
     reason: &str,
 ) -> Value {
     let mut event = json!({
-        "hookEventName": hook_event_name,
+        "hook_event_name": hook_event_name,
         "provider": instance.metadata.agent_kind.clone(),
         "source": source,
         "timestamp": crate::coordination::kernel::now_rfc3339(),
-        "backendWatchdog": true,
-        "watchdogReason": reason,
+        "backend_watchdog": true,
+        "watchdog_reason": reason,
     });
     if let Some(object) = event.as_object_mut() {
         if let Some(provider_session_id) = runtime
@@ -16587,9 +16454,9 @@ fn terminal_activity_watchdog_event(
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            object.insert("sessionId".to_string(), json!(provider_session_id));
-            object.insert("providerSessionId".to_string(), json!(provider_session_id));
-            object.insert("nativeSessionId".to_string(), json!(provider_session_id));
+            object.insert("session_id".to_string(), json!(provider_session_id));
+            object.insert("provider_session_id".to_string(), json!(provider_session_id));
+            object.insert("native_session_id".to_string(), json!(provider_session_id));
         }
         if let Some(turn_id) = runtime
             .turn_id
@@ -16598,7 +16465,7 @@ fn terminal_activity_watchdog_event(
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            object.insert("turnId".to_string(), json!(turn_id));
+            object.insert("turn_id".to_string(), json!(turn_id));
         }
     }
     event
@@ -16636,9 +16503,7 @@ fn terminal_activity_hook_startup_idle_candidate(event: &Value) -> bool {
     terminal_activity_hook_bool(
         event,
         &[
-            "startupIdleCandidate",
             "startup_idle_candidate",
-            "sessionIdleWithoutPrompt",
             "session_idle_without_prompt",
         ],
     )
@@ -16648,9 +16513,7 @@ fn terminal_activity_hook_startup_idle_buffered(event: &Value) -> bool {
     terminal_activity_hook_bool(
         event,
         &[
-            "startupIdleBuffered",
             "startup_idle_buffered",
-            "startingIdleBuffered",
             "starting_idle_buffered",
         ],
     )
@@ -16660,11 +16523,8 @@ fn terminal_activity_hook_codex_idle_quiesce_buffered(event: &Value) -> bool {
     terminal_activity_hook_bool(
         event,
         &[
-            "terminalIdleQuiesceBuffered",
             "terminal_idle_quiesce_buffered",
-            "activityIdleQuiesceBuffered",
             "activity_idle_quiesce_buffered",
-            "codexIdleQuiesceBuffered",
             "codex_idle_quiesce_buffered",
         ],
     )
@@ -17127,8 +16987,8 @@ fn terminal_activity_hook_buffer_final_stop_candidate(
     };
     let mut buffered_event = event.clone();
     if let Some(object) = buffered_event.as_object_mut() {
-        object.insert("terminalIdleQuiesceBuffered".to_string(), json!(true));
-        object.insert("codexIdleQuiesceBuffered".to_string(), json!(true));
+        object.insert("terminal_idle_quiesce_buffered".to_string(), json!(true));
+        object.insert("codex_idle_quiesce_buffered".to_string(), json!(true));
     }
     if let Ok(mut pending) = terminal_pending_final_stops().lock() {
         pending.insert(
@@ -17290,9 +17150,7 @@ async fn process_terminal_activity_hook_event(
         let hook_event_name = terminal_activity_hook_string(
             event,
             &[
-                "hookEventName",
                 "hook_event_name",
-                "eventName",
                 "event_name",
             ],
         )
@@ -17415,7 +17273,7 @@ async fn process_terminal_activity_hook_event(
         let pane_id = pane_id.to_string();
         let mut buffered_event = event.clone();
         if let Some(object) = buffered_event.as_object_mut() {
-            object.insert("startupIdleBuffered".to_string(), json!(true));
+            object.insert("startup_idle_buffered".to_string(), json!(true));
         }
         log_terminal_status_event(
             "backend.terminal_activity_hook.startup_idle_buffered",
@@ -17758,16 +17616,16 @@ fn spawn_terminal_activity_hook_watcher(
                                 log_terminal_status_event(
                                     "backend.terminal_activity_hook.debug",
                                     json!({
-                                        "activity_path": event.get("activityPath").and_then(Value::as_str).unwrap_or_default(),
+                                        "activity_path": event.get("activity_path").and_then(Value::as_str).unwrap_or_default(),
                                         "debug_phase": event.get("phase").and_then(Value::as_str).unwrap_or_default(),
                                         "details": event.get("details").cloned().unwrap_or(Value::Null),
-                                        "hook_instance_id": event.get("instanceId").and_then(Value::as_u64).unwrap_or_default(),
-                                        "hook_pane_id": clean_terminal_diagnostic_log_text(event.get("paneId").and_then(Value::as_str).unwrap_or_default()),
+                                        "hook_instance_id": event.get("instance_id").and_then(Value::as_u64).unwrap_or_default(),
+                                        "hook_pane_id": clean_terminal_diagnostic_log_text(event.get("pane_id").and_then(Value::as_str).unwrap_or_default()),
                                         "hook_provider": event.get("provider").and_then(Value::as_str).unwrap_or_default(),
                                         "instance_id": instance_id,
                                         "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                                        "terminal_index": event.get("terminalIndex").and_then(Value::as_str).unwrap_or_default(),
-                                        "workspace_id": event.get("workspaceId").and_then(Value::as_str).unwrap_or_default(),
+                                        "terminal_index": event.get("terminal_index").and_then(Value::as_str).unwrap_or_default(),
+                                        "workspace_id": event.get("workspace_id").and_then(Value::as_str).unwrap_or_default(),
                                     }),
                                 );
                             }
@@ -18028,7 +17886,7 @@ fn enqueue_terminal_input_queue_item(
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_input_transport_endpoint(
     app: AppHandle,
     state: State<'_, TerminalState>,
@@ -18068,7 +17926,7 @@ async fn terminal_input_transport_endpoint(
     Ok(endpoint)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_output_transport_endpoint(
     app: AppHandle,
     state: State<'_, TerminalState>,
@@ -18391,8 +18249,8 @@ async fn handle_terminal_output_transport_connection(
     let ready_message = json!({
         "type": "ready",
         "id": subscribe.id.as_deref().unwrap_or_default(),
-        "paneId": subscribe.pane_id,
-        "instanceId": subscribe.instance_id,
+        "pane_id": subscribe.pane_id,
+        "instance_id": subscribe.instance_id,
     });
     if socket
         .send(Message::Text(ready_message.to_string().into()))
@@ -18489,13 +18347,12 @@ async fn handle_terminal_activity_transport_message(
         return Err("Terminal activity transport message had an unsupported type.".to_string());
     }
 
-    let pane_id = terminal_activity_hook_string(&envelope.event, &["paneId", "pane_id"])
+    let pane_id = terminal_activity_hook_string(&envelope.event, &["pane_id"])
         .ok_or_else(|| "Terminal activity event is missing pane id.".to_string())?;
     validate_terminal_pane_id(&pane_id)?;
     let instance_id = envelope
         .event
-        .get("instanceId")
-        .or_else(|| envelope.event.get("instance_id"))
+        .get("instance_id")
         .and_then(Value::as_u64)
         .filter(|value| *value > 0)
         .ok_or_else(|| "Terminal activity event is missing instance id.".to_string())?;
@@ -19648,7 +19505,7 @@ async fn terminal_write_inner(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_write(
     app: AppHandle,
     state: State<'_, TerminalState>,
@@ -19922,7 +19779,7 @@ fn terminal_remote_command_u64(event: &Value, keys: &[&str]) -> Option<u64> {
         .or_else(|| event.get("request").and_then(|request| value_from(request)))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_answer_agent_prompt_remote_command(
     app: AppHandle,
     event: Value,
@@ -19931,35 +19788,30 @@ async fn terminal_answer_agent_prompt_remote_command(
         &event,
         &[
             "target_terminal_id",
-            "targetTerminalId",
             "terminal_id",
-            "terminalId",
             "pane_id",
-            "paneId",
         ],
     )
     .ok_or_else(|| "Prompt answer requires a target terminal id.".to_string())?;
     validate_terminal_pane_id(&pane_id)?;
     let _control_operation_guard = terminal_control_prompt_answer_begin(&pane_id)?;
     let instance_id =
-        terminal_remote_command_u64(&event, &["terminal_instance_id", "terminalInstanceId"]);
-    let prompt_id = terminal_remote_command_string(&event, &["prompt_id", "promptId"])
+        terminal_remote_command_u64(&event, &["terminal_instance_id"]);
+    let prompt_id = terminal_remote_command_string(&event, &["prompt_id"])
         .ok_or_else(|| "Prompt answer requires a prompt id.".to_string())?;
-    let option_id = terminal_remote_command_string(&event, &["option_id", "optionId", "choice"])
+    let option_id = terminal_remote_command_string(&event, &["option_id", "choice"])
         .ok_or_else(|| "Prompt answer requires an option id.".to_string())?;
-    let option_label = terminal_remote_command_string(&event, &["option_label", "optionLabel"])
+    let option_label = terminal_remote_command_string(&event, &["option_label"])
         .unwrap_or_else(|| option_id.clone());
     let option_value =
-        terminal_remote_command_string(&event, &["option_value", "optionValue", "value"]);
+        terminal_remote_command_string(&event, &["option_value", "value"]);
     let answer_text = terminal_remote_command_string(
         &event,
         &[
             "answer_text",
-            "answerText",
             "message",
             "text",
             "free_text",
-            "freeText",
         ],
     );
     let state_app = app.clone();
@@ -20126,7 +19978,7 @@ async fn terminal_answer_agent_prompt_remote_command(
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_request_fork(
     app: AppHandle,
     state: State<'_, TerminalState>,
@@ -20160,7 +20012,6 @@ async fn terminal_request_fork(
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalCaptureDirectPromptTodoRequest {
     workspace_id: String,
     workspace_name: Option<String>,
@@ -20173,7 +20024,7 @@ struct TerminalCaptureDirectPromptTodoRequest {
     item_id: Option<String>,
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_capture_direct_prompt_todo(
     app: AppHandle,
     request: TerminalCaptureDirectPromptTodoRequest,
@@ -20211,7 +20062,7 @@ async fn terminal_capture_direct_prompt_todo(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_write_realtime(
     app: AppHandle,
     pane_id: String,
@@ -20277,7 +20128,7 @@ fn terminal_provider_turn_should_reconcile_coordination(
     reconcile_coordination.unwrap_or(false)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_provider_turn_completed(
     app: AppHandle,
     state: State<'_, TerminalState>,
@@ -20371,7 +20222,7 @@ async fn terminal_provider_turn_completed(
     Ok(result)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_refresh_theme(
     state: State<'_, TerminalState>,
     pane_id: String,
@@ -20402,7 +20253,7 @@ async fn terminal_refresh_theme(
     Ok(!signal_opencode_theme_refresh(root_pid)?.is_empty())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_delete_selection(
     state: State<'_, TerminalState>,
     pane_id: String,
@@ -20531,15 +20382,13 @@ async fn terminal_delete_selection(
 
     Ok(json!({
         "deleted": true,
-        "remainingLine": gate.current_line,
-        "remainingChars": gate.current_line.chars().count(),
+        "remaining_line": gate.current_line,
         "remaining_chars": gate.current_line.chars().count(),
-        "removedChars": selected_text.chars().count(),
         "removed_chars": selected_text.chars().count(),
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_cancel_parked_task(
     app: AppHandle,
     state: State<'_, TerminalState>,
@@ -20746,7 +20595,6 @@ async fn interrupt_terminal_parked_prompts(
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalInterruptAgentResult {
     interrupted_active_task: bool,
     interrupted_parked_prompt_count: usize,
@@ -20754,7 +20602,7 @@ struct TerminalInterruptAgentResult {
     wrote_escape: bool,
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_interrupt_agent(
     app: AppHandle,
     state: State<'_, TerminalState>,
@@ -20981,7 +20829,7 @@ async fn resolve_terminal_for_resize(
     Ok(Some((resolved_pane_id, instance)))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn resize_terminal(
     app: AppHandle,
     state: State<'_, TerminalState>,
@@ -21012,7 +20860,7 @@ async fn resize_terminal(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_resize(
     app: AppHandle,
     state: State<'_, TerminalState>,
@@ -21041,7 +20889,7 @@ async fn terminal_resize(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_close(
     app: AppHandle,
     state: State<'_, TerminalState>,
@@ -21071,7 +20919,7 @@ async fn terminal_close(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_close_all(
     app: AppHandle,
     state: State<'_, TerminalState>,
@@ -21106,7 +20954,7 @@ async fn terminal_close_all(
     Ok(TerminalCloseAllResult { closed })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_headless_output_snapshot(
     state: State<'_, TerminalState>,
     pane_id: String,
@@ -21155,7 +21003,7 @@ fn emit_terminal_window_closed(app: &AppHandle, pane_id: &str) {
     let _ = app.emit(
         TERMINAL_WINDOW_CLOSED_EVENT,
         json!({
-            "paneId": pane_id,
+            "pane_id": pane_id,
         }),
     );
 }
@@ -21163,7 +21011,7 @@ fn emit_terminal_window_closed(app: &AppHandle, pane_id: &str) {
 /// Window Breakout: hosts one running terminal pane in its own native window.
 /// The PTY stays untouched; the window attaches as an extra output-transport
 /// subscriber, so opening and closing windows never restarts agents.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 #[allow(clippy::too_many_arguments)]
 async fn terminal_window_open(
     app: AppHandle,
@@ -21199,11 +21047,11 @@ async fn terminal_window_open(
         percent_encode_query_component(&title_text),
     );
     for (key, value) in [
-        ("agentKind", agent_kind),
-        ("agentLabel", agent_label),
-        ("colorSlot", color_slot),
+        ("agent_kind", agent_kind),
+        ("agent_label", agent_label),
+        ("color_slot", color_slot),
         ("theme", theme),
-        ("workspaceId", workspace_id),
+        ("workspace_id", workspace_id),
     ] {
         let Some(value) = value else {
             continue;
@@ -21257,7 +21105,7 @@ async fn terminal_window_open(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_window_close(app: AppHandle, pane_id: String) -> Result<(), String> {
     validate_terminal_pane_id(&pane_id)?;
     let label = terminal_window_label(&pane_id);
@@ -21270,7 +21118,7 @@ async fn terminal_window_close(app: AppHandle, pane_id: String) -> Result<(), St
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_window_focus(app: AppHandle, pane_id: String) -> Result<bool, String> {
     validate_terminal_pane_id(&pane_id)?;
     let label = terminal_window_label(&pane_id);
@@ -21324,9 +21172,7 @@ fn terminal_drag_session_slot() -> &'static StdMutex<Option<TerminalDragSession>
 
 #[derive(Deserialize)]
 struct TerminalDragTargetInput {
-    #[serde(rename = "paneId")]
     pane_id: String,
-    #[serde(rename = "terminalIndex")]
     terminal_index: i64,
 }
 
@@ -21461,7 +21307,7 @@ fn terminal_drag_spawn_watcher(app: AppHandle, generation: u64) {
                 let _ = app.emit_to(
                     "main",
                     TERMINAL_DRAG_RELEASE_EVENT,
-                    json!({ "terminalIndex": final_index }),
+                    json!({ "terminal_index": final_index }),
                 );
                 if let Ok(mut guard) = terminal_drag_session_slot().lock() {
                     if guard.as_ref().map(|session| session.generation) == Some(generation) {
@@ -21493,8 +21339,8 @@ fn terminal_drag_spawn_watcher(app: AppHandle, generation: u64) {
                     "main",
                     TERMINAL_DRAG_MOVE_EVENT,
                     json!({
-                        "terminalIndex": matched_index,
-                        "overBreakout": matched_index.is_some(),
+                        "terminal_index": matched_index,
+                        "over_breakout": matched_index.is_some(),
                     }),
                 );
                 last_index = matched_index;
@@ -21507,7 +21353,7 @@ fn terminal_drag_spawn_watcher(app: AppHandle, generation: u64) {
 /// Starts the cross-window drag watcher for the supplied breakout terminal
 /// windows. A no-op (and an immediate highlight clear) when no terminals are
 /// popped out — the in-grid case needs no watcher.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_drag_session_begin(
     app: AppHandle,
     targets: Vec<TerminalDragTargetInput>,
@@ -21541,13 +21387,13 @@ async fn terminal_drag_session_begin(
 }
 
 /// Ends the active drag watcher and clears any breakout-window highlight.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_drag_session_end(app: AppHandle) -> Result<(), String> {
     terminal_drag_clear(&app);
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_pane_runtime_info(
     state: State<'_, TerminalState>,
     pane_id: String,
@@ -21556,13 +21402,13 @@ async fn terminal_pane_runtime_info(
     let instance = get_terminal_instance(&state, &pane_id).await?;
     let size = *instance.size.lock().await;
     Ok(json!({
-        "instanceId": instance.id,
+        "instance_id": instance.id,
         "cols": size.cols,
         "rows": size.rows,
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_headless_output_delta(
     state: State<'_, TerminalState>,
     pane_id: String,
@@ -21588,7 +21434,7 @@ async fn terminal_headless_output_delta(
     Ok(output.delta_since(&pane_id, instance.id, since_total_bytes.unwrap_or(0)))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn terminal_live_sessions(
     state: State<'_, TerminalState>,
 ) -> Result<TerminalLiveSessionsResult, String> {
@@ -22262,7 +22108,7 @@ mod terminal_tests {
     fn transcript_path_session_fallback_extracts_uuid() {
         let session_id = "550e8400-e29b-41d4-a716-446655440000";
         let event = json!({
-            "transcriptPath": format!("/tmp/codex/rollout-{session_id}.jsonl"),
+            "transcript_path": format!("/tmp/codex/rollout-{session_id}.jsonl"),
         });
 
         assert_eq!(
@@ -22506,9 +22352,9 @@ mod terminal_tests {
                 Some("worktree_required"),
             )
             .unwrap();
-        let agent_id = session["agentId"].as_str().unwrap().to_string();
+        let agent_id = session["agent_id"].as_str().unwrap().to_string();
         let session_id = session["id"].as_str().unwrap().to_string();
-        let worktree_path = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let worktree_path = PathBuf::from(session["write_root"].as_str().unwrap());
         let task = kernel
             .create_task("Task", None, 0, 1, None, None, None, None)
             .unwrap();
@@ -23989,9 +23835,9 @@ Done. Ready for the next command.
     #[test]
     fn screen_prompt_resolved_hook_derives_idle_without_forcing_busy() {
         let idle = json!({
-            "hookEventName": "ScreenPromptResolved",
-            "activityStatus": "idle",
-            "inputReady": true,
+            "hook_event_name": "ScreenPromptResolved",
+            "activity_status": "idle",
+            "input_ready": true,
         });
         let resolved_idle =
             terminal_activity_hook_activity_kind("ScreenPromptResolved", &idle).expect("idle");
@@ -24001,9 +23847,9 @@ Done. Ready for the next command.
         assert!(resolved_idle.4);
 
         let running = json!({
-            "hookEventName": "ScreenPromptResolved",
-            "activityStatus": "thinking",
-            "inputReady": false,
+            "hook_event_name": "ScreenPromptResolved",
+            "activity_status": "thinking",
+            "input_ready": false,
         });
         let resolved_running =
             terminal_activity_hook_activity_kind("ScreenPromptResolved", &running)
@@ -24378,9 +24224,9 @@ Press enter to confirm
     #[test]
     fn stray_startup_idle_is_ignored_during_busy_turns() {
         let startup_idle = json!({
-            "hookEventName": "Stop",
-            "startupIdleCandidate": true,
-            "sessionIdleWithoutPrompt": true,
+            "hook_event_name": "Stop",
+            "startup_idle_candidate": true,
+            "session_idle_without_prompt": true,
         });
         assert!(terminal_activity_hook_should_ignore_startup_idle_candidate(
             &startup_idle,
@@ -24404,7 +24250,7 @@ Press enter to confirm
 
         assert!(terminal_activity_hook_should_quiesce_idle(
             &opencode_metadata,
-            &json!({ "hookEventName": "Stop" }),
+            &json!({ "hook_event_name": "Stop" }),
             &idle_payload,
             false,
             true,
@@ -24412,8 +24258,8 @@ Press enter to confirm
         assert!(!terminal_activity_hook_should_quiesce_idle(
             &opencode_metadata,
             &json!({
-                "hookEventName": "Stop",
-                "terminalIdleQuiesceBuffered": true,
+                "hook_event_name": "Stop",
+                "terminal_idle_quiesce_buffered": true,
             }),
             &idle_payload,
             false,
@@ -24422,8 +24268,8 @@ Press enter to confirm
         assert!(!terminal_activity_hook_should_quiesce_idle(
             &opencode_metadata,
             &json!({
-                "hookEventName": "Stop",
-                "startupIdleCandidate": true,
+                "hook_event_name": "Stop",
+                "startup_idle_candidate": true,
             }),
             &idle_payload,
             false,
@@ -24533,8 +24379,8 @@ Press enter to confirm
         claude_metadata.agent_id = "claude".to_string();
         claude_metadata.agent_kind = "claude".to_string();
         let background_stop = json!({
-            "hookEventName": "Stop",
-            "backgroundTasks": [{ "status": "running" }],
+            "hook_event_name": "Stop",
+            "background_tasks": [{ "status": "running" }],
         });
         assert!(terminal_activity_hook_claude_stop_has_background_work(
             &background_stop
@@ -24556,9 +24402,9 @@ Press enter to confirm
         );
 
         let blocked_background_stop = json!({
-            "hookEventName": "Stop",
-            "backgroundTasks": [{ "status": "running" }],
-            "inputReady": false,
+            "hook_event_name": "Stop",
+            "background_tasks": [{ "status": "running" }],
+            "input_ready": false,
         });
         assert!(terminal_activity_hook_background_stop_forces_busy(
             &claude_metadata,
@@ -24693,7 +24539,7 @@ Press enter to confirm
                 generation: rebuffered_generation,
                 session_id: "session-main".to_string(),
                 turn_id: "turn-2".to_string(),
-                event: json!({"hookEventName": "Stop"}),
+                event: json!({"hook_event_name": "Stop"}),
             },
         );
 
@@ -24772,9 +24618,9 @@ Press enter to confirm
         let prompt = terminal_activity_hook_manual_prompt(
             "PermissionAsked",
             &json!({
-                "hookEventName": "PermissionAsked",
-                "manualApprovalRequired": true,
-                "permissionRequestId": "permission-1",
+                "hook_event_name": "PermissionAsked",
+                "manual_approval_required": true,
+                "permission_request_id": "permission-1",
             }),
         )
         .expect("manual permission prompt");
@@ -24818,12 +24664,12 @@ Press enter to confirm
     fn claude_stop_background_metadata_blocks_ready_completion() {
         assert!(!terminal_activity_hook_claude_stop_has_background_work(
             &json!({
-                "stopHookActive": true,
+                "stop_hook_active": true,
             })
         ));
         assert!(terminal_activity_hook_claude_stop_has_background_work(
             &json!({
-                "backgroundTasks": [{ "id": "task-1", "status": "running" }],
+                "background_tasks": [{ "id": "task-1", "status": "running" }],
             })
         ));
         assert!(terminal_activity_hook_claude_stop_has_background_work(
@@ -24833,15 +24679,15 @@ Press enter to confirm
         ));
         assert!(!terminal_activity_hook_claude_stop_has_background_work(
             &json!({
-                "backgroundTasks": [{ "id": "task-1", "status": "completed" }],
+                "background_tasks": [{ "id": "task-1", "status": "completed" }],
                 "session_crons": [{ "id": "cron-1", "state": "done" }],
             })
         ));
         assert!(!terminal_activity_hook_claude_stop_has_background_work(
             &json!({
-                "stopHookActive": false,
-                "backgroundTasks": [],
-                "sessionCrons": [],
+                "stop_hook_active": false,
+                "background_tasks": [],
+                "session_crons": [],
             })
         ));
     }
@@ -24880,7 +24726,7 @@ Press enter to confirm
             &json!({
                 "delta": {"text": "streamed token"},
             }),
-            &["assistantMessage", "delta"],
+            &["assistant_message", "delta"],
         );
         assert_eq!(message.as_deref(), Some("streamed token"));
     }
@@ -24952,7 +24798,7 @@ Press enter to confirm
     fn activity_hook_provider_session_id_accepts_provider_aliases() {
         assert_eq!(
             terminal_activity_hook_provider_session_id(&json!({
-                "providerSessionId": "codex-session-123",
+                "provider_session_id": "codex-session-123",
             }))
             .as_deref(),
             Some("codex-session-123")
@@ -24966,7 +24812,7 @@ Press enter to confirm
         );
         assert_eq!(
             terminal_activity_hook_provider_session_id(&json!({
-                "threadId": "workspace-thread-not-provider-session",
+                "thread_id": "workspace-thread-not-provider-session",
             })),
             None
         );
@@ -25225,7 +25071,7 @@ Press enter to confirm
             ))
         );
         assert_eq!(
-            terminal_activity_hook_activity_kind("PreToolUse", &json!({ "toolName": "Bash" })),
+            terminal_activity_hook_activity_kind("PreToolUse", &json!({ "tool_name": "Bash" })),
             Some((
                 "provider-tool-started",
                 "shell",
@@ -25238,7 +25084,7 @@ Press enter to confirm
         assert_eq!(
             terminal_activity_hook_activity_kind(
                 "PreToolUse",
-                &json!({ "toolName": "apply_patch" })
+                &json!({ "tool_name": "apply_patch" })
             ),
             Some((
                 "provider-tool-started",
@@ -25252,7 +25098,7 @@ Press enter to confirm
         assert_eq!(
             terminal_activity_hook_activity_kind(
                 "PreToolUse",
-                &json!({ "toolName": "mcp__github__get_issue" })
+                &json!({ "tool_name": "mcp__github__get_issue" })
             ),
             Some((
                 "provider-tool-started",
@@ -25316,10 +25162,10 @@ Press enter to confirm
         let prompt = terminal_activity_hook_manual_prompt(
             "PreToolUse",
             &json!({
-                "hookEventName": "PreToolUse",
-                "manualApprovalRequired": true,
-                "toolUseId": "tool-1",
-                "promptingUserKind": "approval",
+                "hook_event_name": "PreToolUse",
+                "manual_approval_required": true,
+                "tool_use_id": "tool-1",
+                "prompting_user_kind": "approval",
                 "description": "Approve this edit?"
             }),
         )
@@ -25330,18 +25176,18 @@ Press enter to confirm
         assert!(terminal_activity_hook_manual_prompt(
             "PreToolUse",
             &json!({
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",
-                "toolUseId": "tool-auto",
-                "promptingUserKind": "approval"
+                "hook_event_name": "PreToolUse",
+                "permission_decision": "allow",
+                "tool_use_id": "tool-auto",
+                "prompting_user_kind": "approval"
             }),
         )
         .is_none());
         assert!(terminal_activity_hook_manual_prompt(
             "PreToolUse",
             &json!({
-                "hookEventName": "PreToolUse",
-                "toolUseId": "tool-observed"
+                "hook_event_name": "PreToolUse",
+                "tool_use_id": "tool-observed"
             }),
         )
         .is_none());
@@ -26526,10 +26372,10 @@ Press enter to confirm
             )
             .unwrap();
         assert_eq!(
-            session["enforcementMode"].as_str(),
+            session["enforcement_mode"].as_str(),
             Some("bounded_direct_edit")
         );
-        let agent_id = session["agentId"].as_str().unwrap().to_string();
+        let agent_id = session["agent_id"].as_str().unwrap().to_string();
         let session_id = session["id"].as_str().unwrap().to_string();
         let task = kernel
             .create_task("Late Git guarded edit", None, 0, 1, None, None, None, None)

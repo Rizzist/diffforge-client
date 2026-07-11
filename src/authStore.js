@@ -274,7 +274,7 @@ export const authStore = {
     if (snapshotValuesEqual(snapshot.billingStatus, billingStatus)) {
       return snapshot;
     }
-    return applyNativeCommand("desktop_auth_apply_billing_status", { billingStatus });
+    return applyNativeCommand("desktop_auth_apply_billing_status", { billing_status: billingStatus });
   },
   getActiveScope() {
     return snapshot.activeScope || personalScope();

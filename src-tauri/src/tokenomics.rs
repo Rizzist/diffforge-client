@@ -167,7 +167,7 @@ struct TokenomicsPeriodicCandidateDiscoveryCacheEntry {
 
 use std::io::Seek as _;
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn tokenomics_scan_usage(
     app: AppHandle,
     state: State<'_, CloudMcpState>,
@@ -192,7 +192,7 @@ async fn tokenomics_scan_usage(
     Ok(summary)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn tokenomics_scan_usage_silent(
     app: AppHandle,
     state: State<'_, CloudMcpState>,
@@ -217,7 +217,7 @@ async fn tokenomics_scan_usage_silent(
     Ok(summary)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn tokenomics_scan_realtime_usage(
     app: AppHandle,
     state: State<'_, CloudMcpState>,
@@ -253,7 +253,7 @@ async fn tokenomics_scan_realtime_usage(
     Ok(summary)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn tokenomics_resync_last_30_days(
     app: AppHandle,
     state: State<'_, CloudMcpState>,
@@ -278,7 +278,7 @@ async fn tokenomics_resync_last_30_days(
     Ok(summary)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn tokenomics_get_summary(app: AppHandle) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _span = BackendCpuSpan::new("tokenomics.command.get_summary");
@@ -288,7 +288,7 @@ async fn tokenomics_get_summary(app: AppHandle) -> Result<Value, String> {
     .map_err(|error| format!("Unable to join Tokenomics summary: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn tokenomics_get_live_limits(
     app: AppHandle,
     state: State<'_, CloudMcpState>,
@@ -313,7 +313,7 @@ async fn tokenomics_get_live_limits(
     Ok(summary)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn tokenomics_get_sync_payload(app: AppHandle) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _span = BackendCpuSpan::new("tokenomics.command.get_sync_payload");
@@ -323,7 +323,7 @@ async fn tokenomics_get_sync_payload(app: AppHandle) -> Result<Value, String> {
     .map_err(|error| format!("Unable to join Tokenomics sync payload: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn tokenomics_get_sync_delta(
     app: AppHandle,
     since_updated_at: Option<String>,
@@ -339,7 +339,7 @@ async fn tokenomics_get_sync_delta(
     .map_err(|error| format!("Unable to join Tokenomics sync delta: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn tokenomics_record_usage(
     app: AppHandle,
     state: State<'_, CloudMcpState>,
@@ -1235,20 +1235,13 @@ fn tokenomics_live_limits_snapshot_from_conn_with_options(
         "source": "rust_live_provider_limits",
         "updated_at": tokenomics_now_iso_like(),
         "recorded_samples": recorded_samples,
-        "recordedSamples": recorded_samples,
         "recorded_windows": recorded_windows,
-        "recordedWindows": recorded_windows,
         "limit_sample_count": limit_samples.len(),
-        "limitSampleCount": limit_samples.len(),
         "latest_window_count": latest_windows.len(),
-        "latestWindowCount": latest_windows.len(),
-        "limit_samples": limit_samples.clone(),
-        "limitSamples": limit_samples,
-        "latest_windows": latest_windows.clone(),
-        "latestWindows": latest_windows,
+        "limit_samples": limit_samples,
+        "latest_windows": latest_windows,
         "limits": limits,
-        "scan_index": scan_index.clone(),
-        "scanIndex": scan_index,
+        "scan_index": scan_index,
     }))
 }
 
@@ -1749,8 +1742,7 @@ fn tokenomics_scan_usage_for_mode(
                     "day_inserted_events": day_inserted_events,
                     "candidate_count": files.len(),
                     "day_candidate_count": day_candidate_count,
-                    "summary_delta": summary_delta.clone(),
-                    "summaryDelta": summary_delta,
+                    "summary_delta": summary_delta,
                     "mode": scan_mode.label(),
                 });
                 tokenomics_emit_scan_progress(app, emit_progress, progress);
@@ -1820,8 +1812,7 @@ fn tokenomics_scan_usage_for_mode(
             "current_device_name": tokenomics_local_device_name(),
             "inserted_events": inserted_events,
             "scan": scan,
-            "scan_index": scan_index.clone(),
-            "scanIndex": scan_index,
+            "scan_index": scan_index,
         }));
     }
     let mut summary = tokenomics_summary_from_conn(&conn, true, Some(inserted_events))?;
@@ -1869,10 +1860,8 @@ fn tokenomics_summary_inserted_events(summary: &Value) -> usize {
         .get("scan")
         .and_then(|scan| {
             scan.get("inserted_events")
-                .or_else(|| scan.get("insertedEvents"))
         })
         .or_else(|| summary.get("inserted_events"))
-        .or_else(|| summary.get("insertedEvents"))
         .and_then(Value::as_u64)
         .map(|value| value as usize)
         .unwrap_or_default()
@@ -1881,12 +1870,10 @@ fn tokenomics_summary_inserted_events(summary: &Value) -> usize {
 fn tokenomics_summary_recorded_limit_rows(summary: &Value) -> usize {
     let recorded_samples = summary
         .get("recorded_samples")
-        .or_else(|| summary.get("recordedSamples"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let recorded_windows = summary
         .get("recorded_windows")
-        .or_else(|| summary.get("recordedWindows"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
     recorded_samples.saturating_add(recorded_windows) as usize
@@ -2495,9 +2482,7 @@ fn tokenomics_cached_live_limits_for(
                     if let Some(object) = summary.as_object_mut() {
                         object.insert("cached".to_string(), json!(true));
                         object.insert("recorded_samples".to_string(), json!(0));
-                        object.insert("recordedSamples".to_string(), json!(0));
                         object.insert("recorded_windows".to_string(), json!(0));
-                        object.insert("recordedWindows".to_string(), json!(0));
                     }
                     return Ok(summary);
                 }
@@ -3701,9 +3686,7 @@ fn tokenomics_retired_provider_account_keys() -> Vec<String> {
 fn tokenomics_value_account_key(value: &Value) -> String {
     value
         .get("provider_account_key")
-        .or_else(|| value.get("providerAccountKey"))
         .or_else(|| value.get("subscription_key"))
-        .or_else(|| value.get("subscriptionKey"))
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or_default()
@@ -3985,11 +3968,8 @@ fn tokenomics_tag_limit_agent_profile(
             continue;
         };
         object.insert("agent_profile_id".to_string(), json!(profile_id));
-        object.insert("agentProfileId".to_string(), json!(profile_id));
         object.insert("active_agent_profile".to_string(), json!(active));
-        object.insert("activeAgentProfile".to_string(), json!(active));
         object.insert("active_provider_account".to_string(), json!(active));
-        object.insert("activeProviderAccount".to_string(), json!(active));
     }
 }
 
@@ -4002,17 +3982,13 @@ fn tokenomics_tag_dormant_cached_provider_limits(limits: &mut [Value]) {
             "provider_limit_refresh_mode".to_string(),
             json!("cached_dormant"),
         );
-        object.insert(
-            "providerLimitRefreshMode".to_string(),
-            json!("cached_dormant"),
-        );
     }
 }
 
 fn tokenomics_provider_limit_is_dormant_cached(limit: &Value) -> bool {
     tokenomics_value_string(
         limit,
-        &["provider_limit_refresh_mode", "providerLimitRefreshMode"],
+        &["provider_limit_refresh_mode"],
     )
     .is_some_and(|value| value == "cached_dormant")
 }
@@ -4023,7 +3999,6 @@ fn tokenomics_strip_provider_limit_refresh_mode(limits: &mut [Value]) {
             continue;
         };
         object.remove("provider_limit_refresh_mode");
-        object.remove("providerLimitRefreshMode");
     }
 }
 
@@ -4032,7 +4007,6 @@ fn tokenomics_active_provider_account_key_map(limits: &[Value]) -> HashMap<Strin
     for limit in limits {
         let active = limit
             .get("active_provider_account")
-            .or_else(|| limit.get("activeProviderAccount"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if !active {
@@ -4040,15 +4014,13 @@ fn tokenomics_active_provider_account_key_map(limits: &[Value]) -> HashMap<Strin
         }
         let provider =
             tokenomics_value_string(limit, &["provider"]).unwrap_or_else(|| "unknown".to_string());
-        let agent_kind = tokenomics_value_string(limit, &["agent_kind", "agentKind"])
+        let agent_kind = tokenomics_value_string(limit, &["agent_kind"])
             .unwrap_or_else(|| provider.clone());
         let account_key = tokenomics_value_string(
             limit,
             &[
                 "provider_account_key",
-                "providerAccountKey",
                 "subscription_key",
-                "subscriptionKey",
             ],
         )
         .unwrap_or_default();
@@ -4070,15 +4042,13 @@ fn tokenomics_retag_active_provider_accounts(
     for limit in limits {
         let provider =
             tokenomics_value_string(limit, &["provider"]).unwrap_or_else(|| "unknown".to_string());
-        let agent_kind = tokenomics_value_string(limit, &["agent_kind", "agentKind"])
+        let agent_kind = tokenomics_value_string(limit, &["agent_kind"])
             .unwrap_or_else(|| provider.clone());
         let account_key = tokenomics_value_string(
             limit,
             &[
                 "provider_account_key",
-                "providerAccountKey",
                 "subscription_key",
-                "subscriptionKey",
             ],
         )
         .unwrap_or_default();
@@ -4090,7 +4060,6 @@ fn tokenomics_retag_active_provider_accounts(
             continue;
         };
         object.insert("active_provider_account".to_string(), json!(active));
-        object.insert("activeProviderAccount".to_string(), json!(active));
     }
 }
 
@@ -4597,22 +4566,16 @@ fn tokenomics_billing_scope_from_value(
         value,
         &[
             "billing_scope_type",
-            "billingScopeType",
             "account_scope_type",
-            "accountScopeType",
             "scope_type",
-            "scopeType",
         ],
     );
     let team_id = tokenomics_value_string(
         value,
         &[
             "billing_team_id",
-            "billingTeamId",
             "account_team_id",
-            "accountTeamId",
             "team_id",
-            "teamId",
         ],
     );
     if scope_type.is_none() && team_id.is_none() {
@@ -4622,11 +4585,8 @@ fn tokenomics_billing_scope_from_value(
         value,
         &[
             "billing_scope_source",
-            "billingScopeSource",
             "account_scope_source",
-            "accountScopeSource",
             "scope_source",
-            "scopeSource",
         ],
     )
     .unwrap_or_else(|| "usage_payload".to_string());
@@ -4704,11 +4664,8 @@ fn tokenomics_local_device_name() -> String {
         &profile,
         &[
             "display_name",
-            "displayName",
             "device_name",
-            "deviceName",
             "machine_name",
-            "machineName",
             "hostname",
         ],
     )
@@ -4802,7 +4759,7 @@ fn tokenomics_remote_cloud_device_id_from_value(
     local_device_ids: &HashSet<String>,
 ) -> Option<String> {
     let device_id =
-        tokenomics_text_field(value, &["device_id", "deviceId", "machine_id", "machineId"])
+        tokenomics_text_field(value, &["device_id", "machine_id"])
             .or_else(|| inherited_device_id.map(str::to_string))?;
     let device_id = device_id.trim().to_string();
     if tokenomics_is_remote_cloud_device_id(&device_id, local_device_ids) {
@@ -4839,10 +4796,10 @@ fn tokenomics_store_local_device_aliases(
 
 fn tokenomics_device_identity_ids(identity: &Value) -> Vec<String> {
     [
-        tokenomics_text_field(identity, &["device_id", "deviceId"]),
-        tokenomics_text_field(identity, &["machine_id", "machineId"]),
-        tokenomics_text_field(identity, &["native_device_id", "nativeDeviceId"]),
-        tokenomics_text_field(identity, &["target_device_id", "targetDeviceId"]),
+        tokenomics_text_field(identity, &["device_id"]),
+        tokenomics_text_field(identity, &["machine_id"]),
+        tokenomics_text_field(identity, &["native_device_id"]),
+        tokenomics_text_field(identity, &["target_device_id"]),
         tokenomics_text_field(identity, &["id"]),
     ]
     .into_iter()
@@ -4858,12 +4815,9 @@ fn tokenomics_device_identity_label(identity: &Value) -> Option<String> {
         identity,
         &[
             "display_name",
-            "displayName",
             "label",
             "device_name",
-            "deviceName",
             "machine_name",
-            "machineName",
             "hostname",
             "name",
         ],
@@ -4924,7 +4878,6 @@ fn tokenomics_store_cloud_device_identities(
 ) -> Result<usize, String> {
     let incoming = summary
         .get("device_identities")
-        .or_else(|| summary.get("deviceIdentities"))
         .or_else(|| summary.get("devices"))
         .and_then(Value::as_array)
         .cloned()
@@ -4946,7 +4899,7 @@ fn tokenomics_store_cloud_device_identities(
         let label = tokenomics_device_identity_label(&identity);
         let updated_at = tokenomics_text_field(
             &identity,
-            &["updated_at", "updatedAt", "last_seen_at", "lastSeenAt"],
+            &["updated_at", "last_seen_at"],
         )
         .unwrap_or_else(tokenomics_now_iso_like);
         let mut object = identity.as_object().cloned().unwrap_or_default();
@@ -4962,7 +4915,7 @@ fn tokenomics_store_cloud_device_identities(
         for id in ids {
             let replace = by_id
                 .get(&id)
-                .and_then(|existing| tokenomics_text_field(existing, &["updated_at", "updatedAt"]))
+                .and_then(|existing| tokenomics_text_field(existing, &["updated_at"]))
                 .map(|existing_updated_at| updated_at.as_str() >= existing_updated_at.as_str())
                 .unwrap_or(true);
             if replace {
@@ -6839,15 +6792,13 @@ fn tokenomics_rewrite_cloud_provider_limits_for_account_key(
     for limit in &mut limits {
         let row_provider =
             tokenomics_value_string(limit, &["provider"]).unwrap_or_else(|| "unknown".to_string());
-        let row_agent = tokenomics_value_string(limit, &["agent_kind", "agentKind"])
+        let row_agent = tokenomics_value_string(limit, &["agent_kind"])
             .unwrap_or_else(|| row_provider.clone());
         let row_account_key = tokenomics_value_string(
             limit,
             &[
                 "provider_account_key",
-                "providerAccountKey",
                 "subscription_key",
-                "subscriptionKey",
             ],
         )
         .unwrap_or_default();
@@ -6860,34 +6811,21 @@ fn tokenomics_rewrite_cloud_provider_limits_for_account_key(
                 json!(provider_account.key.as_str()),
             );
             object.insert(
-                "providerAccountKey".to_string(),
-                json!(provider_account.key.as_str()),
-            );
-            object.insert(
                 "subscription_key".to_string(),
-                json!(provider_account.key.as_str()),
-            );
-            object.insert(
-                "subscriptionKey".to_string(),
                 json!(provider_account.key.as_str()),
             );
             object.insert(
                 "provider_account_label".to_string(),
                 json!(provider_account.label.as_str()),
             );
-            object.insert(
-                "providerAccountLabel".to_string(),
-                json!(provider_account.label.as_str()),
-            );
             let has_relay_device = tokenomics_value_string(
                 &Value::Object(object.clone()),
-                &["device_id", "deviceId", "machine_id", "machineId"],
+                &["device_id", "machine_id"],
             )
             .is_some_and(|device_id| !tokenomics_cloud_relay_placeholder_device_id(&device_id));
             if !has_relay_device {
                 if let Some(device_id) = inferred_device_id.as_deref() {
                     object.insert("device_id".to_string(), json!(device_id));
-                    object.insert("deviceId".to_string(), json!(device_id));
                 }
             }
             changed = true;
@@ -9397,8 +9335,7 @@ fn tokenomics_scan_codex_state_db(
             "day_inserted_events": day_inserted_events,
             "candidate_count": candidates.len(),
             "day_candidate_count": day_candidate_count,
-            "summary_delta": summary_delta.clone(),
-            "summaryDelta": summary_delta,
+            "summary_delta": summary_delta,
             "mode": scan_mode.label(),
         });
         tokenomics_emit_scan_progress(app, emit_progress, progress);
@@ -11617,7 +11554,6 @@ fn tokenomics_record_usage_value(
         .to_ascii_lowercase();
     let agent_kind = usage
         .get("agent_kind")
-        .or_else(|| usage.get("agentKind"))
         .and_then(Value::as_str)
         .unwrap_or(provider.as_str())
         .trim()
@@ -11625,16 +11561,13 @@ fn tokenomics_record_usage_value(
     let fallback_account = tokenomics_provider_account(&provider, &agent_kind);
     let explicit_account_key = usage
         .get("provider_account_key")
-        .or_else(|| usage.get("providerAccountKey"))
         .or_else(|| usage.get("subscription_key"))
-        .or_else(|| usage.get("subscriptionKey"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string);
     let explicit_account_label = usage
         .get("provider_account_label")
-        .or_else(|| usage.get("providerAccountLabel"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -11667,17 +11600,14 @@ fn tokenomics_record_usage_value(
             .map(|value| value.to_string()),
         usage
             .get("created_at")
-            .or_else(|| usage.get("createdAt"))
             .and_then(Value::as_str)
             .map(|value| value.to_string()),
         tokenomics_value_string(
             usage,
             &[
-                "requestId",
                 "request_id",
                 "requestID",
                 "message_id",
-                "messageId",
             ],
         ),
         tokenomics_local_device_id(),
@@ -11687,7 +11617,6 @@ fn tokenomics_record_usage_value(
     event.source_kind = source_kind.to_string();
     event.subscription_key = usage
         .get("subscription_key")
-        .or_else(|| usage.get("subscriptionKey"))
         .and_then(Value::as_str)
         .map(|value| value.to_string())
         .or_else(|| event.provider_account_key.clone())
@@ -11696,12 +11625,10 @@ fn tokenomics_record_usage_value(
     event.provider_account_label = Some(provider_account.label);
     event.workspace_id = usage
         .get("workspace_id")
-        .or_else(|| usage.get("workspaceId"))
         .and_then(Value::as_str)
         .map(|value| value.to_string());
     event.repo_path = usage
         .get("repo_path")
-        .or_else(|| usage.get("repoPath"))
         .and_then(Value::as_str)
         .map(|value| value.to_string());
     event.id = tokenomics_hash(&usage.to_string());
@@ -11835,35 +11762,27 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
     "total": total,
     "hourly_count": hourly.len(),
     "daily_by_device_provider_count": daily_by_device_provider.len(),
-    "dailyByDeviceProviderCount": daily_by_device_provider.len(),
     "provider_account_count": provider_accounts.len(),
-    "providerAccountCount": provider_accounts.len(),
     "latest_window_count": latest_windows.len(),
-    "latestWindowCount": latest_windows.len(),
     "limit_sample_count": limit_samples.len(),
-    "limitSampleCount": limit_samples.len(),
     "hourly": hourly,
     // UI summary payload diet: the big arrays used to ship in BOTH snake and
     // camel case, doubling a multi-MB response that the webview parses on the
     // main thread mid-workspace-open (measured 5.5MB → native parse + GC was
-    // a top open-lag component). Frontend readers fall back across casings;
-    // camelCase is canonical here. Cloud sync-delta builders keep their dual
-    // casing — the server contract parses those.
-    "dailyByDeviceProvider": daily_by_device_provider,
-    "providerAccounts": provider_accounts,
-    "latestWindows": latest_windows,
-    "limitSamples": limit_samples,
+    // a top open-lag component). snake_case is the only casing emitted now.
+    "daily_by_device_provider": daily_by_device_provider,
+    "provider_accounts": provider_accounts,
+    "latest_windows": latest_windows,
+    "limit_samples": limit_samples,
     "sources": [
         {"provider": "anthropic", "agent_kind": "claude", "label": "Claude Code"},
         {"provider": "openai", "agent_kind": "codex", "label": "Codex"},
         {"provider": "opencode", "agent_kind": "opencode", "label": "OpenCode"}
     ],
     "limits": limits,
-    "scanIndex": scan_index,
-    "retired_account_keys": retired_account_keys.clone(),
-    "retiredAccountKeys": retired_account_keys,
-    "device_identities": device_identities.clone(),
-    "deviceIdentities": device_identities,
+    "scan_index": scan_index,
+    "retired_account_keys": retired_account_keys,
+    "device_identities": device_identities,
     }))
 }
 
@@ -11965,45 +11884,26 @@ fn tokenomics_scan_index_status(conn: &rusqlite::Connection) -> Result<Value, St
         "historical_scan": {
             "status": status,
             "initial_backfill_done": complete_scan_state_count > 0,
-            "initialBackfillDone": complete_scan_state_count > 0,
             "scan_state_count": scan_state_count,
-            "scanStateCount": scan_state_count,
             "complete_scan_state_count": complete_scan_state_count,
-            "completeScanStateCount": complete_scan_state_count,
             "source_offset_count": source_offset_count,
-            "sourceOffsetCount": source_offset_count,
             "source_import_count": source_import_count,
-            "sourceImportCount": source_import_count,
             "raw_available_count": raw_available_count,
-            "rawAvailableCount": raw_available_count,
             "raw_deleted_count": raw_deleted_count,
-            "rawDeletedCount": raw_deleted_count,
             "safe_to_delete_count": safe_to_delete_count,
-            "safeToDeleteCount": safe_to_delete_count,
             "complete_scan_day_count": complete_scan_day_count,
-            "completeScanDayCount": complete_scan_day_count,
-            "covered_since_unix": covered_since_value.clone(),
-            "coveredSinceUnix": covered_since_value,
-            "last_event_timestamp": last_event_value.clone(),
-            "lastEventTimestamp": last_event_value,
+            "covered_since_unix": covered_since_value,
+            "last_event_timestamp": last_event_value,
             "last_indexed_at": last_indexed_at,
-            "lastIndexedAt": last_indexed_at,
         },
         "live_tail": {
             "status": "approximate",
             "approximate": true,
             "lookback_seconds": TOKENOMICS_REALTIME_LOOKBACK_SECS,
-            "lookbackSeconds": TOKENOMICS_REALTIME_LOOKBACK_SECS,
             "max_codex_candidates": TOKENOMICS_REALTIME_MAX_CODEX_CANDIDATES,
-            "maxCodexCandidates": TOKENOMICS_REALTIME_MAX_CODEX_CANDIDATES,
             "max_files_per_provider": TOKENOMICS_REALTIME_MAX_FILES_PER_PROVIDER,
-            "maxFilesPerProvider": TOKENOMICS_REALTIME_MAX_FILES_PER_PROVIDER,
         },
         "scanner_versions": {
-            "codex": TOKENOMICS_CODEX_SCANNER_VERSION,
-            "generic": TOKENOMICS_GENERIC_SCANNER_VERSION,
-        },
-        "scannerVersions": {
             "codex": TOKENOMICS_CODEX_SCANNER_VERSION,
             "generic": TOKENOMICS_GENERIC_SCANNER_VERSION,
         },
@@ -12338,9 +12238,7 @@ fn tokenomics_provider_account_identity_summary_from_conn(
         "schema_version": "tokenomics_v2",
         "updated_at": tokenomics_now_iso_like(),
         "provider_account_count": provider_account_count,
-        "providerAccountCount": provider_account_count,
-        "provider_accounts": provider_accounts.clone(),
-        "providerAccounts": provider_accounts,
+        "provider_accounts": provider_accounts,
         "hourly": [],
         "limits": [],
     }))
@@ -12386,7 +12284,7 @@ fn tokenomics_upsert_latest_window(
 ) -> Result<bool, String> {
     let provider =
         tokenomics_value_string(value, &["provider"]).unwrap_or_else(|| "unknown".to_string());
-    let agent_kind = tokenomics_value_string(value, &["agent_kind", "agentKind"])
+    let agent_kind = tokenomics_value_string(value, &["agent_kind"])
         .unwrap_or_else(|| provider.clone());
     if provider == "unknown" || agent_kind == "unknown" {
         return Ok(false);
@@ -12396,9 +12294,7 @@ fn tokenomics_upsert_latest_window(
         value,
         &[
             "provider_account_key",
-            "providerAccountKey",
             "subscription_key",
-            "subscriptionKey",
         ],
     )
     .unwrap_or_else(|| fallback_account.key.clone());
@@ -12406,12 +12302,12 @@ fn tokenomics_upsert_latest_window(
         return Ok(false);
     }
     let provider_account_label =
-        tokenomics_value_string(value, &["provider_account_label", "providerAccountLabel"])
+        tokenomics_value_string(value, &["provider_account_label"])
             .unwrap_or_else(|| fallback_account.label.clone());
     let billing_scope = tokenomics_billing_scope_from_value(value, fallback_scope);
     let provider_window_kind = tokenomics_value_string(
         value,
-        &["window_kind", "windowKind", "limit_kind", "limitKind"],
+        &["window_kind", "limit_kind"],
     )
     .unwrap_or_else(|| "5_hour".to_string());
     let window_kind = tokenomics_sync_window_kind(&provider_window_kind);
@@ -12423,15 +12319,12 @@ fn tokenomics_upsert_latest_window(
         value,
         &[
             "sample_at",
-            "sampleAt",
             "updated_at",
-            "updatedAt",
             "last_known_at",
-            "lastKnownAt",
         ],
     )
     .unwrap_or_else(|| tokenomics_unix_iso_like(now_unix));
-    let sample_at_unix = tokenomics_value_i64(value, &["sample_at_unix", "sampleAtUnix"])
+    let sample_at_unix = tokenomics_value_i64(value, &["sample_at_unix"])
         .map(tokenomics_normalize_unix_timestamp)
         .or_else(|| tokenomics_timestamp_unix(&sample_at))
         .unwrap_or(now_unix);
@@ -12440,23 +12333,23 @@ fn tokenomics_upsert_latest_window(
         .unwrap_or((None, None));
     let reset_at = tokenomics_provider_limit_sample_reset_at(value, sample_at_unix);
     let reset_after_seconds =
-        tokenomics_value_i64(value, &["reset_after_seconds", "resetAfterSeconds"]);
+        tokenomics_value_i64(value, &["reset_after_seconds"]);
     let limit_window_seconds = tokenomics_limit_effective_window_seconds(
         &provider_window_kind,
-        tokenomics_value_i64(value, &["limit_window_seconds", "limitWindowSeconds"]),
+        tokenomics_value_i64(value, &["limit_window_seconds"]),
     );
     let pace_status =
-        tokenomics_value_string(value, &["pace_status", "paceStatus"]).unwrap_or_default();
+        tokenomics_value_string(value, &["pace_status"]).unwrap_or_default();
     let pace_delta_percent =
-        tokenomics_value_i64(value, &["pace_delta_percent", "paceDeltaPercent"]);
+        tokenomics_value_i64(value, &["pace_delta_percent"]);
     let source = source_override
         .map(ToOwned::to_owned)
-        .or_else(|| tokenomics_value_string(value, &["source", "limit_source", "limitSource"]))
+        .or_else(|| tokenomics_value_string(value, &["source", "limit_source"]))
         .unwrap_or_else(|| "local".to_string());
     let confidence =
         tokenomics_value_string(value, &["confidence"]).unwrap_or_else(|| "unknown".to_string());
     let device_id =
-        tokenomics_value_string(value, &["device_id", "deviceId", "machine_id", "machineId"])
+        tokenomics_value_string(value, &["device_id", "machine_id"])
             .unwrap_or_else(|| fallback_device_id.to_string());
     tokenomics_upsert_provider_account(
         conn,
@@ -12740,10 +12633,8 @@ fn tokenomics_scan_day_summary_delta(
     });
     Ok(json!({
         "schema_version": "tokenomics_v2",
-        "schemaVersion": "tokenomics_v2",
         "updated_at": tokenomics_now_iso_like(),
-        "daily_by_device_provider": daily_rows.clone(),
-        "dailyByDeviceProvider": daily_rows,
+        "daily_by_device_provider": daily_rows,
     }))
 }
 
@@ -12862,10 +12753,6 @@ fn tokenomics_account_daily_display_rollups(
         if let Some(object) = row.as_object_mut() {
             object.insert(
                 "bucket_start_unix".to_string(),
-                json!(bucket_start_unix as i64),
-            );
-            object.insert(
-                "bucketStartUnix".to_string(),
                 json!(bucket_start_unix as i64),
             );
         }
@@ -13019,10 +12906,6 @@ fn tokenomics_account_hourly_display_rollups_for_range(
                 "bucket_start_unix".to_string(),
                 json!(bucket_start_unix as i64),
             );
-            object.insert(
-                "bucketStartUnix".to_string(),
-                json!(bucket_start_unix as i64),
-            );
         }
         rollups.push(row);
     }
@@ -13064,9 +12947,7 @@ fn tokenomics_limit_percent_pair(value: &Value) -> Option<(i64, i64)> {
         value,
         &[
             "used_percent",
-            "usedPercent",
             "limit_used_percent",
-            "limitUsedPercent",
             "used",
         ],
     )
@@ -13075,9 +12956,7 @@ fn tokenomics_limit_percent_pair(value: &Value) -> Option<(i64, i64)> {
         value,
         &[
             "remaining_percent",
-            "remainingPercent",
             "limit_remaining_percent",
-            "limitRemainingPercent",
             "remaining",
         ],
     )
@@ -13095,18 +12974,15 @@ fn tokenomics_provider_limit_sample_reset_at(value: &Value, sample_at_unix: u64)
         value,
         &[
             "reset_at",
-            "resetAt",
             "limit_resets_at",
-            "limitResetsAt",
             "pace_reset_at",
-            "paceResetAt",
         ],
     )
     .filter(|text| !text.trim().is_empty())
     {
         return Some(reset_at);
     }
-    tokenomics_value_i64(value, &["reset_after_seconds", "resetAfterSeconds"])
+    tokenomics_value_i64(value, &["reset_after_seconds"])
         .filter(|seconds| *seconds >= 0)
         .map(|seconds| tokenomics_unix_iso_like(sample_at_unix.saturating_add(seconds as u64)))
 }
@@ -13123,7 +12999,7 @@ fn tokenomics_upsert_provider_limit_sample(
     };
     let provider =
         tokenomics_value_string(value, &["provider"]).unwrap_or_else(|| "unknown".to_string());
-    let agent_kind = tokenomics_value_string(value, &["agent_kind", "agentKind"])
+    let agent_kind = tokenomics_value_string(value, &["agent_kind"])
         .unwrap_or_else(|| provider.clone());
     if provider == "unknown" || agent_kind == "unknown" {
         return Ok(false);
@@ -13133,9 +13009,7 @@ fn tokenomics_upsert_provider_limit_sample(
         value,
         &[
             "provider_account_key",
-            "providerAccountKey",
             "subscription_key",
-            "subscriptionKey",
         ],
     )
     .unwrap_or_else(|| fallback_account.key.clone());
@@ -13143,12 +13017,12 @@ fn tokenomics_upsert_provider_limit_sample(
         return Ok(false);
     }
     let provider_account_label =
-        tokenomics_value_string(value, &["provider_account_label", "providerAccountLabel"])
+        tokenomics_value_string(value, &["provider_account_label"])
             .unwrap_or_else(|| fallback_account.label.clone());
     let billing_scope = tokenomics_billing_scope_from_value(value, fallback_scope);
     let window_kind = tokenomics_value_string(
         value,
-        &["window_kind", "windowKind", "limit_kind", "limitKind"],
+        &["window_kind", "limit_kind"],
     )
     .unwrap_or_else(|| "5_hour".to_string());
     let now_unix = tokenomics_unix_now();
@@ -13156,15 +13030,12 @@ fn tokenomics_upsert_provider_limit_sample(
         value,
         &[
             "sample_at",
-            "sampleAt",
             "updated_at",
-            "updatedAt",
             "last_known_at",
-            "lastKnownAt",
         ],
     )
     .unwrap_or_else(|| tokenomics_unix_iso_like(now_unix));
-    let sample_at_unix = tokenomics_value_i64(value, &["sample_at_unix", "sampleAtUnix"])
+    let sample_at_unix = tokenomics_value_i64(value, &["sample_at_unix"])
         .map(tokenomics_normalize_unix_timestamp)
         .or_else(|| tokenomics_timestamp_unix(&sample_at))
         .unwrap_or(now_unix);
@@ -13172,9 +13043,7 @@ fn tokenomics_upsert_provider_limit_sample(
         value,
         &[
             "sample_bucket_unix",
-            "sampleBucketUnix",
             "bucket_unix",
-            "bucketUnix",
         ],
     )
     .map(tokenomics_normalize_unix_timestamp)
@@ -13183,9 +13052,7 @@ fn tokenomics_upsert_provider_limit_sample(
         value,
         &[
             "sample_bucket_start",
-            "sampleBucketStart",
             "bucket_start",
-            "bucketStart",
         ],
     )
     .unwrap_or_else(|| tokenomics_unix_iso_like(sample_bucket_unix));
@@ -13193,23 +13060,23 @@ fn tokenomics_upsert_provider_limit_sample(
     let updated_at = tokenomics_unix_iso_like(updated_at_unix);
     let reset_at = tokenomics_provider_limit_sample_reset_at(value, sample_at_unix);
     let reset_after_seconds =
-        tokenomics_value_i64(value, &["reset_after_seconds", "resetAfterSeconds"]);
+        tokenomics_value_i64(value, &["reset_after_seconds"]);
     let limit_window_seconds = tokenomics_limit_effective_window_seconds(
         &window_kind,
-        tokenomics_value_i64(value, &["limit_window_seconds", "limitWindowSeconds"]),
+        tokenomics_value_i64(value, &["limit_window_seconds"]),
     );
     let pace_status =
-        tokenomics_value_string(value, &["pace_status", "paceStatus"]).unwrap_or_default();
+        tokenomics_value_string(value, &["pace_status"]).unwrap_or_default();
     let pace_delta_percent =
-        tokenomics_value_i64(value, &["pace_delta_percent", "paceDeltaPercent"]);
+        tokenomics_value_i64(value, &["pace_delta_percent"]);
     let source = source_override
         .map(ToOwned::to_owned)
-        .or_else(|| tokenomics_value_string(value, &["source", "limit_source", "limitSource"]))
+        .or_else(|| tokenomics_value_string(value, &["source", "limit_source"]))
         .unwrap_or_else(|| "local".to_string());
     let confidence =
         tokenomics_value_string(value, &["confidence"]).unwrap_or_else(|| "unknown".to_string());
     let device_id =
-        tokenomics_value_string(value, &["device_id", "deviceId", "machine_id", "machineId"])
+        tokenomics_value_string(value, &["device_id", "machine_id"])
             .unwrap_or_else(|| fallback_device_id.to_string());
     let id = tokenomics_provider_limit_sample_id(
         &device_id,
@@ -13521,16 +13388,14 @@ fn tokenomics_recent_provider_limit_samples_for_limit(
     let billing_scope = tokenomics_billing_scope_from_value(limit, &fallback_scope);
     let provider =
         tokenomics_value_string(limit, &["provider"]).unwrap_or_else(|| "unknown".to_string());
-    let agent_kind = tokenomics_value_string(limit, &["agent_kind", "agentKind"])
+    let agent_kind = tokenomics_value_string(limit, &["agent_kind"])
         .unwrap_or_else(|| provider.clone());
     let fallback_account = tokenomics_provider_account(&provider, &agent_kind);
     let provider_account_key = tokenomics_value_string(
         limit,
         &[
             "provider_account_key",
-            "providerAccountKey",
             "subscription_key",
-            "subscriptionKey",
         ],
     )
     .unwrap_or_else(|| fallback_account.key);
@@ -13539,11 +13404,11 @@ fn tokenomics_recent_provider_limit_samples_for_limit(
     }
     let window_kind = tokenomics_value_string(
         limit,
-        &["window_kind", "windowKind", "limit_kind", "limitKind"],
+        &["window_kind", "limit_kind"],
     )
     .unwrap_or_else(|| "5_hour".to_string());
     let device_id =
-        tokenomics_value_string(limit, &["device_id", "deviceId", "machine_id", "machineId"])
+        tokenomics_value_string(limit, &["device_id", "machine_id"])
             .unwrap_or_default();
     let now_unix = tokenomics_unix_now();
     let retention = if window_kind == "weekly" {
@@ -13663,36 +13528,36 @@ fn tokenomics_apply_provider_limit_sample_pacing_from_rows(limit: &mut Value, sa
     let Some((latest_used, latest_remaining)) = tokenomics_limit_percent_pair(latest) else {
         return;
     };
-    let latest_sample_at_unix = tokenomics_value_i64(latest, &["sample_at_unix", "sampleAtUnix"])
+    let latest_sample_at_unix = tokenomics_value_i64(latest, &["sample_at_unix"])
         .map(tokenomics_normalize_unix_timestamp)
         .or_else(|| {
-            tokenomics_value_string(latest, &["sample_at", "sampleAt"])
+            tokenomics_value_string(latest, &["sample_at"])
                 .and_then(|value| tokenomics_timestamp_unix(&value))
         })
         .unwrap_or_else(tokenomics_unix_now);
     let window_kind = tokenomics_value_string(
         limit,
-        &["window_kind", "windowKind", "limit_kind", "limitKind"],
+        &["window_kind", "limit_kind"],
     )
     .unwrap_or_else(|| "5_hour".to_string());
     let window_seconds = tokenomics_limit_effective_window_seconds(
         &window_kind,
-        tokenomics_value_i64(latest, &["limit_window_seconds", "limitWindowSeconds"]).or_else(
-            || tokenomics_value_i64(limit, &["limit_window_seconds", "limitWindowSeconds"]),
+        tokenomics_value_i64(latest, &["limit_window_seconds"]).or_else(
+            || tokenomics_value_i64(limit, &["limit_window_seconds"]),
         ),
     )
     .max(1) as u64;
-    let reset_at_text = tokenomics_value_string(latest, &["reset_at", "resetAt"])
+    let reset_at_text = tokenomics_value_string(latest, &["reset_at"])
         .or_else(|| tokenomics_provider_limit_sample_reset_at(latest, latest_sample_at_unix))
         .or_else(|| {
-            tokenomics_value_string(limit, &["reset_at", "resetAt"])
+            tokenomics_value_string(limit, &["reset_at"])
                 .or_else(|| tokenomics_provider_limit_sample_reset_at(limit, latest_sample_at_unix))
         });
     let reset_at_unix = reset_at_text
         .as_deref()
         .and_then(tokenomics_timestamp_unix)
         .or_else(|| {
-            tokenomics_value_i64(latest, &["reset_after_seconds", "resetAfterSeconds"])
+            tokenomics_value_i64(latest, &["reset_after_seconds"])
                 .filter(|seconds| *seconds >= 0)
                 .map(|seconds| latest_sample_at_unix.saturating_add(seconds as u64))
         });
@@ -13703,7 +13568,7 @@ fn tokenomics_apply_provider_limit_sample_pacing_from_rows(limit: &mut Value, sa
                 .min(window_seconds)
         })
         .or_else(|| {
-            tokenomics_value_i64(latest, &["reset_after_seconds", "resetAfterSeconds"])
+            tokenomics_value_i64(latest, &["reset_after_seconds"])
                 .filter(|seconds| *seconds >= 0)
                 .map(|seconds| (seconds as u64).min(window_seconds))
         });
@@ -13717,7 +13582,7 @@ fn tokenomics_apply_provider_limit_sample_pacing_from_rows(limit: &mut Value, sa
     }
     let live_updated_at_unix = tokenomics_value_string(
         limit,
-        &["updated_at", "updatedAt", "last_known_at", "lastKnownAt"],
+        &["updated_at", "last_known_at"],
     )
     .and_then(|value| tokenomics_timestamp_unix(&value))
     .unwrap_or(latest_sample_at_unix);
@@ -13733,7 +13598,7 @@ fn tokenomics_apply_provider_limit_sample_pacing_from_rows(limit: &mut Value, sa
     if let Some(remaining_seconds) = remaining_seconds_at_sample {
         let reset_at_matches = |sample: &Value| {
             if let Some(latest_reset) = reset_at_text.as_deref().filter(|text| !text.is_empty()) {
-                tokenomics_value_string(sample, &["reset_at", "resetAt"])
+                tokenomics_value_string(sample, &["reset_at"])
                     .map(|value| value == latest_reset)
                     .unwrap_or(false)
             } else {
@@ -13745,10 +13610,10 @@ fn tokenomics_apply_provider_limit_sample_pacing_from_rows(limit: &mut Value, sa
             .filter(|sample| reset_at_matches(sample))
             .filter_map(|sample| {
                 let (used, _) = tokenomics_limit_percent_pair(sample)?;
-                let sample_at = tokenomics_value_i64(sample, &["sample_at_unix", "sampleAtUnix"])
+                let sample_at = tokenomics_value_i64(sample, &["sample_at_unix"])
                     .map(tokenomics_normalize_unix_timestamp)
                     .or_else(|| {
-                        tokenomics_value_string(sample, &["sample_at", "sampleAt"])
+                        tokenomics_value_string(sample, &["sample_at"])
                             .and_then(|value| tokenomics_timestamp_unix(&value))
                     })?;
                 if sample_at >= latest_sample_at_unix {
@@ -13779,7 +13644,7 @@ fn tokenomics_apply_provider_limit_sample_pacing_from_rows(limit: &mut Value, sa
                 .iter()
                 .filter(|sample| reset_at_matches(sample))
                 .filter(|sample| {
-                    tokenomics_value_i64(sample, &["sample_at_unix", "sampleAtUnix"])
+                    tokenomics_value_i64(sample, &["sample_at_unix"])
                         .map(tokenomics_normalize_unix_timestamp)
                         .map(|sample_at| {
                             sample_at >= earliest_at && sample_at <= latest_sample_at_unix
@@ -13812,13 +13677,9 @@ fn tokenomics_apply_provider_limit_sample_pacing_from_rows(limit: &mut Value, sa
         object.insert("allowance".to_string(), json!(100));
         object.insert("remaining".to_string(), json!(latest_remaining));
         object.insert("used_percent".to_string(), json!(latest_used));
-        object.insert("usedPercent".to_string(), json!(latest_used));
         object.insert("limit_used_percent".to_string(), json!(latest_used));
-        object.insert("limitUsedPercent".to_string(), json!(latest_used));
         object.insert("remaining_percent".to_string(), json!(latest_remaining));
-        object.insert("remainingPercent".to_string(), json!(latest_remaining));
         object.insert("last_known_at".to_string(), latest["sample_at"].clone());
-        object.insert("lastKnownAt".to_string(), latest["sample_at"].clone());
         object.insert("confidence".to_string(), json!("sampled_stale"));
         object.insert(
             "limit_source_kind".to_string(),
@@ -13834,15 +13695,10 @@ fn tokenomics_apply_provider_limit_sample_pacing_from_rows(limit: &mut Value, sa
         }
         if let Some(reset_at) = reset_at_text.as_deref() {
             object.insert("reset_at".to_string(), json!(reset_at));
-            object.insert("resetAt".to_string(), json!(reset_at));
         }
         if let Some(remaining_seconds) = remaining_seconds_at_sample {
             object.insert(
                 "reset_after_seconds".to_string(),
-                json!(remaining_seconds as i64),
-            );
-            object.insert(
-                "resetAfterSeconds".to_string(),
                 json!(remaining_seconds as i64),
             );
         }
@@ -13850,14 +13706,9 @@ fn tokenomics_apply_provider_limit_sample_pacing_from_rows(limit: &mut Value, sa
             "limit_window_seconds".to_string(),
             json!(window_seconds.min(i64::MAX as u64) as i64),
         );
-        object.insert(
-            "limitWindowSeconds".to_string(),
-            json!(window_seconds.min(i64::MAX as u64) as i64),
-        );
     }
 
     object.insert("pace_strategy".to_string(), json!("live_10s_with_samples"));
-    object.insert("paceStrategy".to_string(), json!("live_10s_with_samples"));
     object.insert(
         "pace_confidence".to_string(),
         json!(if live_age_seconds <= 30 {
@@ -13869,18 +13720,7 @@ fn tokenomics_apply_provider_limit_sample_pacing_from_rows(limit: &mut Value, sa
         }),
     );
     object.insert(
-        "paceConfidence".to_string(),
-        object
-            .get("pace_confidence")
-            .cloned()
-            .unwrap_or_else(|| json!("unknown")),
-    );
-    object.insert(
         "pace_sample_count".to_string(),
-        json!(trajectory_sample_count),
-    );
-    object.insert(
-        "paceSampleCount".to_string(),
         json!(trajectory_sample_count),
     );
     object.insert(
@@ -13888,31 +13728,21 @@ fn tokenomics_apply_provider_limit_sample_pacing_from_rows(limit: &mut Value, sa
         json!(sample_window_seconds),
     );
     object.insert(
-        "paceSampleWindowSeconds".to_string(),
-        json!(sample_window_seconds),
-    );
-    object.insert(
         "pace_last_sample_at".to_string(),
         latest["sample_at"].clone(),
     );
-    object.insert("paceLastSampleAt".to_string(), latest["sample_at"].clone());
+    object.insert("pace_last_sample_at".to_string(), latest["sample_at"].clone());
     object.insert(
         "pace_last_sample_used_percent".to_string(),
         json!(latest_used),
     );
-    object.insert("paceLastSampleUsedPercent".to_string(), json!(latest_used));
+    object.insert("pace_last_sample_used_percent".to_string(), json!(latest_used));
     if let Some(projected) = projected_used_percent {
         let delta = pace_delta_percent.unwrap_or(projected - 100);
         object.insert("pace_trajectory_status".to_string(), json!(status.clone()));
-        object.insert("paceTrajectoryStatus".to_string(), json!(status.clone()));
         object.insert("pace_trajectory_delta_percent".to_string(), json!(delta));
-        object.insert("paceTrajectoryDeltaPercent".to_string(), json!(delta));
         object.insert(
             "pace_trajectory_projected_used_percent".to_string(),
-            json!(projected),
-        );
-        object.insert(
-            "paceTrajectoryProjectedUsedPercent".to_string(),
             json!(projected),
         );
         object.insert(
@@ -13920,25 +13750,17 @@ fn tokenomics_apply_provider_limit_sample_pacing_from_rows(limit: &mut Value, sa
             json!(projected_exhaustion_seconds),
         );
         object.insert(
-            "paceTrajectoryProjectedExhaustionSeconds".to_string(),
-            json!(projected_exhaustion_seconds),
-        );
-        object.insert(
             "pace_trajectory_projected_exhaustion_at".to_string(),
-            json!(projected_exhaustion_at),
-        );
-        object.insert(
-            "paceTrajectoryProjectedExhaustionAt".to_string(),
             json!(projected_exhaustion_at),
         );
         let current_projected = tokenomics_value_i64(
             &Value::Object(object.clone()),
-            &["pace_projected_used_percent", "paceProjectedUsedPercent"],
+            &["pace_projected_used_percent"],
         )
         .unwrap_or(-1);
         let current_status = tokenomics_value_string(
             &Value::Object(object.clone()),
-            &["pace_status", "paceStatus"],
+            &["pace_status"],
         )
         .unwrap_or_else(|| "unknown".to_string());
         if live_age_seconds > 30
@@ -13947,27 +13769,15 @@ fn tokenomics_apply_provider_limit_sample_pacing_from_rows(limit: &mut Value, sa
             || current_status == "unknown"
         {
             object.insert("pace_strategy".to_string(), json!("sample_trajectory"));
-            object.insert("paceStrategy".to_string(), json!("sample_trajectory"));
             object.insert("pace_status".to_string(), json!(status.clone()));
-            object.insert("paceStatus".to_string(), json!(status.clone()));
             object.insert("pace_delta_percent".to_string(), json!(delta));
-            object.insert("paceDeltaPercent".to_string(), json!(delta));
             object.insert("pace_projected_used_percent".to_string(), json!(projected));
-            object.insert("paceProjectedUsedPercent".to_string(), json!(projected));
             object.insert(
                 "pace_projected_exhaustion_seconds".to_string(),
                 json!(projected_exhaustion_seconds),
             );
             object.insert(
-                "paceProjectedExhaustionSeconds".to_string(),
-                json!(projected_exhaustion_seconds),
-            );
-            object.insert(
                 "pace_projected_exhaustion_at".to_string(),
-                json!(projected_exhaustion_at),
-            );
-            object.insert(
-                "paceProjectedExhaustionAt".to_string(),
                 json!(projected_exhaustion_at),
             );
         }
@@ -14051,22 +13861,15 @@ fn tokenomics_sync_delta_from_conn_with_limit_sampling(
       "current_device_id": tokenomics_local_device_id(),
       "current_device_name": tokenomics_local_device_name(),
       "sync_cursor": sync_cursor,
-      "device_aliases": aliases.clone(),
-      "deviceAliases": aliases,
+      "device_aliases": aliases,
       "hourly_count": hourly_count,
         "provider_account_count": provider_account_count,
-        "providerAccountCount": provider_account_count,
         "latest_window_count": latest_window_count,
-        "latestWindowCount": latest_window_count,
         "limit_sample_count": limit_sample_count,
-        "limitSampleCount": limit_sample_count,
         "hourly": hourly,
-        "provider_accounts": provider_accounts.clone(),
-        "providerAccounts": provider_accounts,
-        "latest_windows": latest_windows.clone(),
-        "latestWindows": latest_windows,
-        "limit_samples": limit_samples.clone(),
-        "limitSamples": limit_samples,
+        "provider_accounts": provider_accounts,
+        "latest_windows": latest_windows,
+        "limit_samples": limit_samples,
         "limits": limits,
 	    }))
 }
@@ -14118,12 +13921,9 @@ fn tokenomics_sync_delta_for_day_from_conn(
         "sync_cursor": sync_cursor,
         "hourly_count": hourly_count,
         "limit_sample_count": limit_sample_count,
-        "limitSampleCount": limit_sample_count,
         "hourly": hourly,
         "latest_windows": [],
-        "latestWindows": [],
-        "limit_samples": limit_samples.clone(),
-        "limitSamples": limit_samples,
+        "limit_samples": limit_samples,
         "limits": [],
     }))
 }
@@ -14210,7 +14010,6 @@ fn tokenomics_store_cloud_provider_limits(
     let incoming = summary
         .get("limits")
         .or_else(|| summary.get("provider_limits"))
-        .or_else(|| summary.get("providerLimits"))
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
@@ -14247,7 +14046,6 @@ fn tokenomics_store_cloud_provider_limits(
                 .entry("limit_source_kind".to_string())
                 .or_insert_with(|| json!("cloud_last_known"));
             object.insert("device_id".to_string(), json!(device_id.as_str()));
-            object.insert("deviceId".to_string(), json!(device_id.as_str()));
         }
         hydrated.push(limit);
     }
@@ -14271,9 +14069,7 @@ fn tokenomics_store_cloud_provider_limit_samples(
 ) -> Result<usize, String> {
     let incoming = summary
         .get("limit_samples")
-        .or_else(|| summary.get("limitSamples"))
         .or_else(|| summary.get("provider_limit_samples"))
-        .or_else(|| summary.get("providerLimitSamples"))
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
@@ -14295,7 +14091,6 @@ fn tokenomics_store_cloud_provider_limit_samples(
         let mut sample = sample.clone();
         if let Some(object) = sample.as_object_mut() {
             object.insert("device_id".to_string(), json!(device_id.as_str()));
-            object.insert("deviceId".to_string(), json!(device_id.as_str()));
         }
         if tokenomics_upsert_provider_limit_sample(
             conn,
@@ -14320,7 +14115,6 @@ fn tokenomics_cloud_summary_payload(event: &Value) -> Value {
     let summary = event
         .get("summary")
         .or_else(|| event.get("tokenomics_delta"))
-        .or_else(|| event.get("tokenomicsDelta"))
         .or_else(|| event.get("snapshot"))
         .or_else(|| event.get("delta").filter(|value| value.is_object()))
         .or_else(|| {
@@ -14336,7 +14130,7 @@ fn tokenomics_cloud_summary_payload(event: &Value) -> Value {
         .or_else(|| {
             event
                 .get("payload")
-                .and_then(|payload| payload.get("tokenomicsDelta"))
+                .and_then(|payload| payload.get("tokenomics_delta"))
         })
         .or_else(|| {
             event
@@ -14358,7 +14152,7 @@ fn tokenomics_cloud_summary_payload(event: &Value) -> Value {
         .or_else(|| {
             event
                 .get("data")
-                .and_then(|data| data.get("tokenomicsDelta"))
+                .and_then(|data| data.get("tokenomics_delta"))
         })
         .or_else(|| event.get("data").and_then(|data| data.get("snapshot")))
         .or_else(|| {
@@ -14389,17 +14183,14 @@ fn tokenomics_cloud_relay_summary_like(value: &Value) -> bool {
     value.get("hourly").is_some()
         || value.get("devices").is_some()
         || value.get("hourly_groups").is_some()
-        || value.get("hourlyGroups").is_some()
         || value.get("windows").is_some()
         || value.get("limits").is_some()
         || value.get("provider_accounts").is_some()
-        || value.get("providerAccounts").is_some()
 }
 
 fn tokenomics_normalize_cloud_relay_summary(summary: &Value) -> Value {
     let has_hourly_groups = summary
         .get("hourly_groups")
-        .or_else(|| summary.get("hourlyGroups"))
         .is_some();
     let has_windows = summary.get("windows").is_some();
     if !has_hourly_groups && !has_windows {
@@ -14427,7 +14218,7 @@ fn tokenomics_normalize_cloud_relay_summary(summary: &Value) -> Value {
     }
     let inherited_device_id = tokenomics_text_field(
         summary,
-        &["device_id", "deviceId", "machine_id", "machineId"],
+        &["device_id", "machine_id"],
     );
     let account_labels = tokenomics_cloud_relay_provider_account_labels(summary);
 
@@ -14438,16 +14229,14 @@ fn tokenomics_normalize_cloud_relay_summary(summary: &Value) -> Value {
         .unwrap_or_default();
     let mut hourly_group_replacements = summary
         .get("hourly_group_replacements")
-        .or_else(|| summary.get("hourlyGroupReplacements"))
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
     for group in tokenomics_v2_collection_values(
         summary
-            .get("hourly_groups")
-            .or_else(|| summary.get("hourlyGroups")),
+            .get("hourly_groups"),
     ) {
-        let Some(bucket_ms) = tokenomics_value_i64(group, &["bucket_start_ms", "bucketStartMs"])
+        let Some(bucket_ms) = tokenomics_value_i64(group, &["bucket_start_ms"])
         else {
             continue;
         };
@@ -14457,14 +14246,11 @@ fn tokenomics_normalize_cloud_relay_summary(summary: &Value) -> Value {
         if let Some(device_id) = inherited_device_id.as_deref() {
             hourly_group_replacements.push(json!({
                 "device_id": device_id,
-                "deviceId": device_id,
                 "bucket_start": bucket_start,
-                "bucketStart": bucket_start,
                 "bucket_start_ms": bucket_ms,
-                "bucketStartMs": bucket_ms,
                 "updated_at": tokenomics_v2_ms_value_to_iso(
                     group,
-                    &["observed_at_ms", "observedAtMs", "group_generation", "groupGeneration"],
+                    &["observed_at_ms", "group_generation"],
                 ).unwrap_or_else(tokenomics_now_iso_like),
             }));
         }
@@ -14472,9 +14258,7 @@ fn tokenomics_normalize_cloud_relay_summary(summary: &Value) -> Value {
             group,
             &[
                 "observed_at_ms",
-                "observedAtMs",
                 "group_generation",
-                "groupGeneration",
             ],
         )
         .unwrap_or_else(tokenomics_now_iso_like);
@@ -14500,15 +14284,12 @@ fn tokenomics_normalize_cloud_relay_summary(summary: &Value) -> Value {
     let mut limits = summary
         .get("limits")
         .or_else(|| summary.get("provider_limits"))
-        .or_else(|| summary.get("providerLimits"))
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
     let mut limit_samples = summary
         .get("limit_samples")
-        .or_else(|| summary.get("limitSamples"))
         .or_else(|| summary.get("provider_limit_samples"))
-        .or_else(|| summary.get("providerLimitSamples"))
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
@@ -14529,12 +14310,12 @@ fn tokenomics_normalize_cloud_relay_summary(summary: &Value) -> Value {
         json!(hourly_group_replacements.clone()),
     );
     normalized.insert(
-        "hourlyGroupReplacements".to_string(),
+        "hourly_group_replacements".to_string(),
         json!(hourly_group_replacements),
     );
     normalized.insert("limits".to_string(), json!(limits));
     normalized.insert("limit_samples".to_string(), json!(limit_samples.clone()));
-    normalized.insert("limitSamples".to_string(), json!(limit_samples));
+    normalized.insert("limit_samples".to_string(), json!(limit_samples));
     Value::Object(normalized)
 }
 
@@ -14542,7 +14323,6 @@ fn tokenomics_cloud_relay_provider_account_labels(summary: &Value) -> HashMap<St
     let mut labels = HashMap::new();
     let Some(accounts) = summary
         .get("provider_accounts")
-        .or_else(|| summary.get("providerAccounts"))
     else {
         return labels;
     };
@@ -14553,10 +14333,8 @@ fn tokenomics_cloud_relay_provider_account_labels(summary: &Value) -> HashMap<St
                     account,
                     &[
                         "provider_account_label",
-                        "providerAccountLabel",
                         "label",
                         "display_name",
-                        "displayName",
                     ],
                 ) {
                     labels.insert(key.clone(), label);
@@ -14569,9 +14347,7 @@ fn tokenomics_cloud_relay_provider_account_labels(summary: &Value) -> HashMap<St
                     account,
                     &[
                         "provider_account_key",
-                        "providerAccountKey",
                         "subscription_key",
-                        "subscriptionKey",
                         "key",
                     ],
                 ) else {
@@ -14581,10 +14357,8 @@ fn tokenomics_cloud_relay_provider_account_labels(summary: &Value) -> HashMap<St
                     account,
                     &[
                         "provider_account_label",
-                        "providerAccountLabel",
                         "label",
                         "display_name",
-                        "displayName",
                     ],
                 ) {
                     labels.insert(key, label);
@@ -14607,10 +14381,8 @@ fn tokenomics_cloud_relay_account_label(
         row,
         &[
             "provider_account_label",
-            "providerAccountLabel",
             "label",
             "display_name",
-            "displayName",
         ],
     )
     .or_else(|| account_labels.get(account_key).cloned())
@@ -14625,21 +14397,18 @@ fn tokenomics_cloud_relay_hourly_group_row(
     account_labels: &HashMap<String, String>,
 ) -> Option<Value> {
     let device_id =
-        tokenomics_text_field(row, &["device_id", "deviceId", "machine_id", "machineId"])
+        tokenomics_text_field(row, &["device_id", "machine_id"])
             .or_else(|| inherited_device_id.map(str::to_string));
     let provider =
         tokenomics_value_string(row, &["provider"]).unwrap_or_else(|| "unknown".to_string());
-    let agent_kind = tokenomics_value_string(row, &["agent_kind", "agentKind"])
+    let agent_kind = tokenomics_value_string(row, &["agent_kind"])
         .unwrap_or_else(|| provider.clone());
     let account_key = tokenomics_value_string(
         row,
         &[
             "provider_account_key",
-            "providerAccountKey",
             "subscription_key",
-            "subscriptionKey",
             "account_key",
-            "accountKey",
         ],
     )
     .unwrap_or_else(|| tokenomics_provider_account(&provider, &agent_kind).key);
@@ -14650,19 +14419,17 @@ fn tokenomics_cloud_relay_hourly_group_row(
         &agent_kind,
         account_labels,
     );
-    let input_tokens = tokenomics_value_i64(row, &["input", "input_tokens", "inputTokens"])
+    let input_tokens = tokenomics_value_i64(row, &["input", "input_tokens"])
         .unwrap_or(0)
         .max(0);
-    let output_tokens = tokenomics_value_i64(row, &["output", "output_tokens", "outputTokens"])
+    let output_tokens = tokenomics_value_i64(row, &["output", "output_tokens"])
         .unwrap_or(0)
         .max(0);
     let cache_read_tokens = tokenomics_value_i64(
         row,
         &[
             "cache_read",
-            "cacheRead",
             "cache_read_tokens",
-            "cacheReadTokens",
         ],
     )
     .unwrap_or(0)
@@ -14671,14 +14438,12 @@ fn tokenomics_cloud_relay_hourly_group_row(
         row,
         &[
             "cache_write",
-            "cacheWrite",
             "cache_write_tokens",
-            "cacheWriteTokens",
         ],
     )
     .unwrap_or(0)
     .max(0);
-    let reported_total = tokenomics_value_i64(row, &["total", "total_tokens", "totalTokens"])
+    let reported_total = tokenomics_value_i64(row, &["total", "total_tokens"])
         .unwrap_or(0)
         .max(0);
     let total_tokens = if reported_total > 0 {
@@ -14693,11 +14458,8 @@ fn tokenomics_cloud_relay_hourly_group_row(
         row,
         &[
             "estimated_cost_microusd",
-            "estimatedCostMicrousd",
             "provider_cost_microusd",
-            "providerCostMicrousd",
             "cost_microusd",
-            "costMicrousd",
             "cost",
         ],
     )
@@ -14705,41 +14467,25 @@ fn tokenomics_cloud_relay_hourly_group_row(
     .max(0);
     let model = tokenomics_value_string(row, &["model"]).unwrap_or_else(|| agent_kind.clone());
     Some(json!({
-        "device_id": device_id.clone(),
-        "deviceId": device_id,
+        "device_id": device_id,
         "provider": provider,
-        "agent_kind": agent_kind.clone(),
-        "agentKind": agent_kind,
+        "agent_kind": agent_kind,
         "model": model,
         "provider_account_key": account_key.clone(),
-        "providerAccountKey": account_key.clone(),
-        "subscription_key": account_key.clone(),
-        "subscriptionKey": account_key,
-        "provider_account_label": label.clone(),
-        "providerAccountLabel": label,
+        "subscription_key": account_key,
+        "provider_account_label": label,
         "bucket_width": "hour",
-        "bucketWidth": "hour",
         "bucket_start": bucket_start,
-        "bucketStart": bucket_start,
         "input_tokens": input_tokens,
-        "inputTokens": input_tokens,
         "output_tokens": output_tokens,
-        "outputTokens": output_tokens,
         "cache_read_tokens": cache_read_tokens,
-        "cacheReadTokens": cache_read_tokens,
         "cache_write_tokens": cache_write_tokens,
-        "cacheWriteTokens": cache_write_tokens,
         "total_tokens": total_tokens,
-        "totalTokens": total_tokens,
         "estimated_cost_microusd": estimated_cost_microusd,
-        "estimatedCostMicrousd": estimated_cost_microusd,
         "provider_cost_microusd": estimated_cost_microusd,
-        "providerCostMicrousd": estimated_cost_microusd,
         "cost": estimated_cost_microusd,
-        "event_count": tokenomics_value_i64(row, &["events", "event_count", "eventCount"]).unwrap_or(0).max(0),
-        "eventCount": tokenomics_value_i64(row, &["events", "event_count", "eventCount"]).unwrap_or(0).max(0),
+        "event_count": tokenomics_value_i64(row, &["events", "event_count"]).unwrap_or(0).max(0),
         "updated_at": updated_at,
-        "updatedAt": updated_at,
     }))
 }
 
@@ -14750,22 +14496,19 @@ fn tokenomics_cloud_relay_window_row(
 ) -> Option<Value> {
     let device_id = tokenomics_text_field(
         window,
-        &["device_id", "deviceId", "machine_id", "machineId"],
+        &["device_id", "machine_id"],
     )
     .or_else(|| inherited_device_id.map(str::to_string));
     let provider =
         tokenomics_value_string(window, &["provider"]).unwrap_or_else(|| "unknown".to_string());
-    let agent_kind = tokenomics_value_string(window, &["agent_kind", "agentKind"])
+    let agent_kind = tokenomics_value_string(window, &["agent_kind"])
         .unwrap_or_else(|| provider.clone());
     let account_key = tokenomics_value_string(
         window,
         &[
             "provider_account_key",
-            "providerAccountKey",
             "subscription_key",
-            "subscriptionKey",
             "account_key",
-            "accountKey",
         ],
     )
     .unwrap_or_else(|| tokenomics_provider_account(&provider, &agent_kind).key);
@@ -14780,9 +14523,7 @@ fn tokenomics_cloud_relay_window_row(
         window,
         &[
             "window_kind",
-            "windowKind",
             "limit_kind",
-            "limitKind",
             "window",
         ],
     )
@@ -14799,7 +14540,6 @@ fn tokenomics_cloud_relay_window_row(
     if let Some(object) = row.as_object_mut() {
         if let Some(device_id) = device_id {
             object.insert("device_id".to_string(), json!(device_id.as_str()));
-            object.insert("deviceId".to_string(), json!(device_id.as_str()));
         }
     }
     Some(row)
@@ -14824,9 +14564,7 @@ fn tokenomics_cloud_account_scope_key(
         summary,
         &[
             "scope_key",
-            "scopeKey",
             "billing_scope_key",
-            "billingScopeKey",
         ],
     )
     .or_else(|| {
@@ -14834,9 +14572,7 @@ fn tokenomics_cloud_account_scope_key(
             event,
             &[
                 "scope_key",
-                "scopeKey",
                 "billing_scope_key",
-                "billingScopeKey",
             ],
         )
     })
@@ -14850,9 +14586,7 @@ fn tokenomics_cloud_summary_sync_cursor(event: &Value, summary: &Value) -> Optio
         summary,
         &[
             "server_cursor",
-            "serverCursor",
             "sync_cursor",
-            "syncCursor",
             "cursor",
         ],
     )
@@ -14861,9 +14595,7 @@ fn tokenomics_cloud_summary_sync_cursor(event: &Value, summary: &Value) -> Optio
             event,
             &[
                 "server_cursor",
-                "serverCursor",
                 "sync_cursor",
-                "syncCursor",
                 "cursor",
             ],
         )
@@ -14889,7 +14621,7 @@ fn tokenomics_store_cloud_account_sync_cursor(
 
 fn tokenomics_account_device_live_state_payload(event: &Value) -> Option<&Value> {
     let event_kind =
-        tokenomics_text_field(event, &["event_kind", "eventKind", "kind"]).unwrap_or_default();
+        tokenomics_text_field(event, &["event_kind", "kind"]).unwrap_or_default();
     let payload = event.get("payload");
     let data = event.get("data");
     let candidates = [
@@ -14898,10 +14630,8 @@ fn tokenomics_account_device_live_state_payload(event: &Value) -> Option<&Value>
         payload.and_then(|value| value.get("summary")),
         data,
         event.get("account_live_state"),
-        event.get("accountLiveState"),
         payload.and_then(|value| value.get("data")),
         payload.and_then(|value| value.get("account_live_state")),
-        payload.and_then(|value| value.get("accountLiveState")),
         Some(event),
     ];
     for candidate in candidates.into_iter().flatten() {
@@ -14918,7 +14648,6 @@ fn tokenomics_account_device_live_state_payload(event: &Value) -> Option<&Value>
             .get("summary")
             .or(data)
             .or_else(|| event.get("account_live_state"))
-            .or_else(|| event.get("accountLiveState"))
             .or(Some(event))
     } else {
         None
@@ -14965,18 +14694,12 @@ fn tokenomics_flatten_account_devices_usage(account_state: &Value) -> Option<Val
             tokenomics_extend_device_rows(&mut limits, summary.get("limits"), &device_id);
             if let Some(value) = summary
                 .get("limit_samples")
-                .or_else(|| summary.get("limitSamples"))
             {
                 tokenomics_extend_device_rows(&mut limit_samples, Some(value), &device_id);
             }
             tokenomics_extend_device_rows(
                 &mut device_identities,
                 summary.get("device_identities"),
-                &device_id,
-            );
-            tokenomics_extend_device_rows(
-                &mut device_identities,
-                summary.get("deviceIdentities"),
                 &device_id,
             );
         }
@@ -14990,28 +14713,19 @@ fn tokenomics_flatten_account_devices_usage(account_state: &Value) -> Option<Val
         "updated_at": tokenomics_now_iso_like(),
         "remote_device_count": device_count,
         "hourly": hourly,
-        "hourly_group_replacements": hourly_group_replacements.clone(),
-        "hourlyGroupReplacements": hourly_group_replacements,
+        "hourly_group_replacements": hourly_group_replacements,
         "limits": limits,
-        "limit_samples": limit_samples.clone(),
-        "limitSamples": limit_samples,
-        "device_identities": device_identities.clone(),
-        "deviceIdentities": device_identities,
+        "limit_samples": limit_samples,
+        "device_identities": device_identities,
     });
     if let Some(object) = result.as_object_mut() {
         for key in [
             "server_cursor",
-            "serverCursor",
             "sync_cursor",
-            "syncCursor",
             "scope_key",
-            "scopeKey",
             "billing_scope_type",
-            "billingScopeType",
             "team_id",
-            "teamId",
             "is_delta",
-            "isDelta",
         ] {
             if let Some(value) = account_state.get(key) {
                 object.insert(key.to_string(), value.clone());
@@ -15047,11 +14761,8 @@ fn tokenomics_account_device_is_removed(
 ) -> bool {
     let removed_fields = [
         "removed_at",
-        "removedAt",
         "deleted_at",
-        "deletedAt",
         "tombstoned_at",
-        "tombstonedAt",
     ];
     if removed_fields.iter().any(|key| {
         tokenomics
@@ -15098,7 +14809,6 @@ fn tokenomics_extend_v2_device_usage(
     let has_hourly_groups = added;
     let Some(accounts) = summary
         .get("provider_accounts")
-        .or_else(|| summary.get("providerAccounts"))
     else {
         return added;
     };
@@ -15123,11 +14833,8 @@ fn tokenomics_extend_v2_device_usage(
                     account,
                     &[
                         "provider_account_key",
-                        "providerAccountKey",
                         "subscription_key",
-                        "subscriptionKey",
                         "account_key",
-                        "accountKey",
                     ],
                 )
                 .unwrap_or_else(|| "unknown".to_string());
@@ -15158,10 +14865,9 @@ fn tokenomics_extend_v2_device_hourly_groups(
     let mut added = false;
     for group in tokenomics_v2_collection_values(
         summary
-            .get("hourly_groups")
-            .or_else(|| summary.get("hourlyGroups")),
+            .get("hourly_groups"),
     ) {
-        let Some(bucket_ms) = tokenomics_value_i64(group, &["bucket_start_ms", "bucketStartMs"])
+        let Some(bucket_ms) = tokenomics_value_i64(group, &["bucket_start_ms"])
         else {
             continue;
         };
@@ -15172,19 +14878,14 @@ fn tokenomics_extend_v2_device_hourly_groups(
             group,
             &[
                 "observed_at_ms",
-                "observedAtMs",
                 "group_generation",
-                "groupGeneration",
             ],
         )
         .unwrap_or_else(tokenomics_now_iso_like);
         hourly_group_replacements.push(json!({
             "device_id": device_id,
-            "deviceId": device_id,
             "bucket_start": bucket_start,
-            "bucketStart": bucket_start,
             "bucket_start_ms": bucket_ms,
-            "bucketStartMs": bucket_ms,
             "updated_at": updated_at,
         }));
         let rows = group
@@ -15225,17 +14926,15 @@ fn tokenomics_extend_v2_provider_account_usage(
     let provider = tokenomics_v2_account_text(account, root_account, &["provider"])
         .unwrap_or(fallback_provider);
     let agent_kind =
-        tokenomics_v2_account_text(account, root_account, &["agent_kind", "agentKind"])
+        tokenomics_v2_account_text(account, root_account, &["agent_kind"])
             .unwrap_or_else(|| fallback_agent.unwrap_or_else(|| provider.clone()));
     let provider_account_label = tokenomics_v2_account_text(
         account,
         root_account,
         &[
             "provider_account_label",
-            "providerAccountLabel",
             "label",
             "display_name",
-            "displayName",
         ],
     )
     .unwrap_or_else(|| tokenomics_provider_account(&provider, &agent_kind).label);
@@ -15243,7 +14942,7 @@ fn tokenomics_extend_v2_provider_account_usage(
         tokenomics_v2_account_text(
             account,
             root_account,
-            &["provider_account_key", "providerAccountKey"],
+            &["provider_account_key"],
         )
         .unwrap_or_else(|| tokenomics_provider_account(&provider, &agent_kind).key)
     } else {
@@ -15290,7 +14989,7 @@ fn tokenomics_extend_v2_provider_account_usage(
                 for window in items {
                     let window_kind = tokenomics_text_field(
                         window,
-                        &["window_kind", "windowKind", "limit_kind", "limitKind"],
+                        &["window_kind", "limit_kind"],
                     )
                     .unwrap_or_else(|| "5_hour".to_string());
                     if let Some(row) = tokenomics_v2_window_row(
@@ -15319,8 +15018,7 @@ fn tokenomics_v2_root_provider_account<'a>(
     account_key: &str,
 ) -> Option<&'a Value> {
     let root = account_state
-        .get("provider_accounts")
-        .or_else(|| account_state.get("providerAccounts"))?;
+        .get("provider_accounts")?;
     match root {
         Value::Object(map) => map.get(account_key),
         Value::Array(items) => items.iter().find(|item| {
@@ -15328,11 +15026,8 @@ fn tokenomics_v2_root_provider_account<'a>(
                 item,
                 &[
                     "provider_account_key",
-                    "providerAccountKey",
                     "subscription_key",
-                    "subscriptionKey",
                     "account_key",
-                    "accountKey",
                 ],
             )
             .as_deref()
@@ -15378,25 +15073,23 @@ fn tokenomics_v2_hourly_row(
     provider_account_label: &str,
 ) -> Option<Value> {
     let bucket_ms =
-        tokenomics_value_i64(row, &["bucket_start_ms", "bucketStartMs"]).or_else(|| {
-            tokenomics_value_string(row, &["bucket_start", "bucketStart"])
+        tokenomics_value_i64(row, &["bucket_start_ms"]).or_else(|| {
+            tokenomics_value_string(row, &["bucket_start"])
                 .and_then(|value| tokenomics_timestamp_unix(&value))
                 .map(|seconds| seconds.saturating_mul(1000) as i64)
         })?;
     let bucket_start = tokenomics_hour_bucket_from_ms(bucket_ms)?;
-    let input_tokens = tokenomics_value_i64(row, &["input", "input_tokens", "inputTokens"])
+    let input_tokens = tokenomics_value_i64(row, &["input", "input_tokens"])
         .unwrap_or(0)
         .max(0);
-    let output_tokens = tokenomics_value_i64(row, &["output", "output_tokens", "outputTokens"])
+    let output_tokens = tokenomics_value_i64(row, &["output", "output_tokens"])
         .unwrap_or(0)
         .max(0);
     let cache_read_tokens = tokenomics_value_i64(
         row,
         &[
             "cache_read",
-            "cacheRead",
             "cache_read_tokens",
-            "cacheReadTokens",
         ],
     )
     .unwrap_or(0)
@@ -15405,14 +15098,12 @@ fn tokenomics_v2_hourly_row(
         row,
         &[
             "cache_write",
-            "cacheWrite",
             "cache_write_tokens",
-            "cacheWriteTokens",
         ],
     )
     .unwrap_or(0)
     .max(0);
-    let total_tokens = tokenomics_value_i64(row, &["total", "total_tokens", "totalTokens"])
+    let total_tokens = tokenomics_value_i64(row, &["total", "total_tokens"])
         .unwrap_or_else(|| {
             input_tokens
                 .saturating_add(output_tokens)
@@ -15424,11 +15115,8 @@ fn tokenomics_v2_hourly_row(
         row,
         &[
             "estimated_cost_microusd",
-            "estimatedCostMicrousd",
             "provider_cost_microusd",
-            "providerCostMicrousd",
             "cost_microusd",
-            "costMicrousd",
             "cost",
         ],
     )
@@ -15436,46 +15124,30 @@ fn tokenomics_v2_hourly_row(
     .max(0);
     let updated_at = tokenomics_v2_ms_value_to_iso(
         row,
-        &["server_seq", "serverSeq", "observed_at_ms", "observedAtMs"],
+        &["server_seq", "observed_at_ms"],
     )
     .unwrap_or_else(tokenomics_now_iso_like);
     Some(json!({
         "device_id": device_id,
-        "deviceId": device_id,
         "provider": provider,
         "agent_kind": agent_kind,
-        "agentKind": agent_kind,
         "model": tokenomics_value_string(row, &["model"]).unwrap_or_else(|| agent_kind.to_string()),
         "provider_account_key": provider_account_key,
-        "providerAccountKey": provider_account_key,
         "subscription_key": provider_account_key,
-        "subscriptionKey": provider_account_key,
         "provider_account_label": provider_account_label,
-        "providerAccountLabel": provider_account_label,
         "bucket_width": "hour",
-        "bucketWidth": "hour",
         "bucket_start": bucket_start,
-        "bucketStart": bucket_start,
         "input_tokens": input_tokens,
-        "inputTokens": input_tokens,
         "output_tokens": output_tokens,
-        "outputTokens": output_tokens,
         "cache_read_tokens": cache_read_tokens,
-        "cacheReadTokens": cache_read_tokens,
         "cache_write_tokens": cache_write_tokens,
-        "cacheWriteTokens": cache_write_tokens,
         "total_tokens": total_tokens,
-        "totalTokens": total_tokens,
         "estimated_cost_microusd": estimated_cost_microusd,
-        "estimatedCostMicrousd": estimated_cost_microusd,
         "provider_cost_microusd": estimated_cost_microusd,
-        "providerCostMicrousd": estimated_cost_microusd,
         "cost": estimated_cost_microusd,
-        "event_count": tokenomics_value_i64(row, &["events", "event_count", "eventCount"]).unwrap_or(0).max(0),
-        "eventCount": tokenomics_value_i64(row, &["events", "event_count", "eventCount"]).unwrap_or(0).max(0),
-        "attribution_kind": tokenomics_value_string(row, &["attribution", "attribution_kind", "attributionKind"]).unwrap_or_else(|| "token_based".to_string()),
+        "event_count": tokenomics_value_i64(row, &["events", "event_count"]).unwrap_or(0).max(0),
+        "attribution_kind": tokenomics_value_string(row, &["attribution", "attribution_kind"]).unwrap_or_else(|| "token_based".to_string()),
         "updated_at": updated_at,
-        "updatedAt": updated_at,
     }))
 }
 
@@ -15488,11 +15160,11 @@ fn tokenomics_v2_window_row(
     provider_account_key: &str,
     provider_account_label: &str,
 ) -> Option<Value> {
-    let used_percent = tokenomics_value_i64(window, &["used_percent", "usedPercent", "used"])
+    let used_percent = tokenomics_value_i64(window, &["used_percent", "used"])
         .map(|value| value.clamp(0, 100));
     let remaining_percent = tokenomics_value_i64(
         window,
-        &["remaining_percent", "remainingPercent", "remaining"],
+        &["remaining_percent", "remaining"],
     )
     .map(|value| value.clamp(0, 100));
     if used_percent.is_none() && remaining_percent.is_none() {
@@ -15501,19 +15173,19 @@ fn tokenomics_v2_window_row(
     let window_kind = tokenomics_v2_display_window_kind(
         tokenomics_value_string(
             window,
-            &["window_kind", "windowKind", "limit_kind", "limitKind"],
+            &["window_kind", "limit_kind"],
         )
         .as_deref()
         .unwrap_or(raw_window_kind),
     );
     let observed_ms = tokenomics_value_i64(
         window,
-        &["observed_at_ms", "observedAtMs", "server_seq", "serverSeq"],
+        &["observed_at_ms", "server_seq"],
     )
     .unwrap_or_else(|| (tokenomics_unix_now().saturating_mul(1000)) as i64);
     let sample_at_unix = tokenomics_normalize_unix_timestamp(observed_ms);
     let sample_at = tokenomics_iso_from_unix(sample_at_unix);
-    let reset_at_ms = tokenomics_value_i64(window, &["reset_at_ms", "resetAtMs"]);
+    let reset_at_ms = tokenomics_value_i64(window, &["reset_at_ms"]);
     let reset_at = reset_at_ms
         .map(tokenomics_normalize_unix_timestamp)
         .filter(|seconds| *seconds > 0)
@@ -15523,40 +15195,24 @@ fn tokenomics_v2_window_row(
     let limit_window_seconds = tokenomics_limit_effective_window_seconds(&window_kind, None);
     Some(json!({
         "device_id": device_id,
-        "deviceId": device_id,
-        "source_device_id": tokenomics_value_string(window, &["source_device_id", "sourceDeviceId"]).unwrap_or_else(|| device_id.to_string()),
-        "sourceDeviceId": tokenomics_value_string(window, &["source_device_id", "sourceDeviceId"]).unwrap_or_else(|| device_id.to_string()),
+        "source_device_id": tokenomics_value_string(window, &["source_device_id"]).unwrap_or_else(|| device_id.to_string()),
         "provider": provider,
         "agent_kind": agent_kind,
-        "agentKind": agent_kind,
         "provider_account_key": provider_account_key,
-        "providerAccountKey": provider_account_key,
         "subscription_key": provider_account_key,
-        "subscriptionKey": provider_account_key,
         "provider_account_label": provider_account_label,
-        "providerAccountLabel": provider_account_label,
         "window_kind": window_kind,
-        "windowKind": window_kind,
         "limit_kind": window_kind,
-        "limitKind": window_kind,
         "used_percent": used_percent,
-        "usedPercent": used_percent,
         "remaining_percent": remaining_percent,
-        "remainingPercent": remaining_percent,
         "sample_at": sample_at,
-        "sampleAt": sample_at,
         "sample_at_unix": sample_at_unix as i64,
-        "sampleAtUnix": sample_at_unix as i64,
         "updated_at": sample_at,
-        "updatedAt": sample_at,
         "reset_at": reset_at,
-        "resetAt": reset_at,
         "reset_after_seconds": reset_after_seconds,
-        "resetAfterSeconds": reset_after_seconds,
         "limit_window_seconds": limit_window_seconds,
-        "limitWindowSeconds": limit_window_seconds,
-        "source": tokenomics_value_string(window, &["source", "limit_source", "limitSource"]).unwrap_or_else(|| "cloud_v2".to_string()),
-        "limit_source": tokenomics_value_string(window, &["source", "limit_source", "limitSource"]).unwrap_or_else(|| "cloud_v2".to_string()),
+        "source": tokenomics_value_string(window, &["source", "limit_source"]).unwrap_or_else(|| "cloud_v2".to_string()),
+        "limit_source": tokenomics_value_string(window, &["source", "limit_source"]).unwrap_or_else(|| "cloud_v2".to_string()),
         "confidence": tokenomics_value_string(window, &["confidence"]).unwrap_or_else(|| "cloud".to_string()),
     }))
 }
@@ -15619,12 +15275,12 @@ fn tokenomics_account_device_usage_entries(account_state: &Value) -> Vec<(String
 }
 
 fn tokenomics_device_id_from_tokenomics_payload(value: &Value) -> Option<String> {
-    tokenomics_text_field(value, &["device_id", "deviceId", "machine_id", "machineId"])
+    tokenomics_text_field(value, &["device_id", "machine_id"])
         .or_else(|| {
             value.get("device").and_then(|device| {
                 tokenomics_text_field(
                     device,
-                    &["device_id", "deviceId", "machine_id", "machineId"],
+                    &["device_id", "machine_id"],
                 )
             })
         })
@@ -15634,9 +15290,7 @@ fn tokenomics_device_id_from_tokenomics_payload(value: &Value) -> Option<String>
                     summary,
                     &[
                         "current_device_id",
-                        "currentDeviceId",
                         "device_id",
-                        "deviceId",
                     ],
                 )
             })
@@ -15672,14 +15326,10 @@ fn tokenomics_account_device_identity(
         .unwrap_or(tokenomics);
     for key in [
         "current_device_name",
-        "currentDeviceName",
         "device_name",
-        "deviceName",
         "machine_name",
-        "machineName",
         "platform",
         "form_factor",
-        "formFactor",
     ] {
         if let Some(value) = summary.get(key) {
             object
@@ -15772,9 +15422,6 @@ fn tokenomics_hydrate_device_row(row: &Value, device_id: &str) -> Option<Value> 
     object
         .entry("device_id".to_string())
         .or_insert_with(|| json!(device_id));
-    object
-        .entry("deviceId".to_string())
-        .or_insert_with(|| json!(device_id));
     Some(Value::Object(object))
 }
 
@@ -15820,7 +15467,7 @@ fn tokenomics_remove_cloud_provider_limits_for_devices(
     let filtered = previous
         .into_iter()
         .filter(|row| {
-            tokenomics_value_string(row, &["device_id", "deviceId", "machine_id", "machineId"])
+            tokenomics_value_string(row, &["device_id", "machine_id"])
                 .map(|device_id| !device_ids.contains(device_id.trim()))
                 .unwrap_or(false)
         })
@@ -16238,7 +15885,7 @@ fn tokenomics_tag_provider_limit_devices(limits: &mut [Value], device_id: &str) 
                 .entry("device_id".to_string())
                 .or_insert_with(|| json!(device_id));
             object
-                .entry("deviceId".to_string())
+                .entry("device_id".to_string())
                 .or_insert_with(|| json!(device_id));
         }
     }
@@ -16318,19 +15965,17 @@ fn tokenomics_should_replace_provider_limit(existing: &Value, incoming: &Value) 
 
 fn tokenomics_provider_limit_key(limit: &Value) -> String {
     let device_id =
-        tokenomics_value_string(limit, &["device_id", "deviceId", "machine_id", "machineId"])
+        tokenomics_value_string(limit, &["device_id", "machine_id"])
             .unwrap_or_else(|| "unknown-device".to_string());
     let provider =
         tokenomics_value_string(limit, &["provider"]).unwrap_or_else(|| "unknown".to_string());
-    let agent_kind = tokenomics_value_string(limit, &["agent_kind", "agentKind"])
+    let agent_kind = tokenomics_value_string(limit, &["agent_kind"])
         .unwrap_or_else(|| provider.clone());
     let account_key = tokenomics_value_string(
         limit,
         &[
             "provider_account_key",
-            "providerAccountKey",
             "subscription_key",
-            "subscriptionKey",
         ],
     )
     .unwrap_or_else(|| format!("{provider}:{agent_kind}:unknown"));
@@ -16338,20 +15983,18 @@ fn tokenomics_provider_limit_key(limit: &Value) -> String {
         limit,
         &[
             "billing_scope_type",
-            "billingScopeType",
             "scope_type",
-            "scopeType",
         ],
     )
     .unwrap_or_else(|| "unknown".to_string());
     let team_id = tokenomics_value_string(
         limit,
-        &["billing_team_id", "billingTeamId", "team_id", "teamId"],
+        &["billing_team_id", "team_id"],
     )
     .unwrap_or_default();
     let window_kind = tokenomics_value_string(
         limit,
-        &["window_kind", "windowKind", "limit_kind", "limitKind"],
+        &["window_kind", "limit_kind"],
     )
     .unwrap_or_else(|| "provider_limit".to_string());
     format!(
@@ -16360,13 +16003,13 @@ fn tokenomics_provider_limit_key(limit: &Value) -> String {
 }
 
 fn tokenomics_provider_limit_is_unknown(limit: &Value) -> bool {
-    let source = tokenomics_value_string(limit, &["limit_source", "limitSource"])
+    let source = tokenomics_value_string(limit, &["limit_source"])
         .unwrap_or_default()
         .to_ascii_lowercase();
     let confidence = tokenomics_value_string(limit, &["confidence"])
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let status = tokenomics_value_string(limit, &["status_label", "statusLabel"])
+    let status = tokenomics_value_string(limit, &["status_label"])
         .unwrap_or_default()
         .to_ascii_lowercase();
     let has_percent = tokenomics_provider_limit_has_percent(limit);
@@ -16383,11 +16026,8 @@ fn tokenomics_provider_limit_has_percent(limit: &Value) -> bool {
         limit,
         &[
             "remaining_percent",
-            "remainingPercent",
             "used_percent",
-            "usedPercent",
             "limit_used_percent",
-            "limitUsedPercent",
         ],
     )
     .is_some()
@@ -16398,15 +16038,10 @@ fn tokenomics_provider_limit_updated_at_unix(limit: &Value) -> u64 {
         limit,
         &[
             "limit_observed_at",
-            "limitObservedAt",
             "sample_observed_at",
-            "sampleObservedAt",
             "sample_at",
-            "sampleAt",
             "updated_at",
-            "updatedAt",
             "last_known_at",
-            "lastKnownAt",
         ],
     )
     .and_then(|value| tokenomics_timestamp_unix(&value))
@@ -16547,7 +16182,7 @@ fn tokenomics_cached_codex_usage(
     };
     let cached = serde_json::from_str::<Value>(&text)
         .map_err(|error| format!("Unable to parse Codex usage cache: {error}"))?;
-    let fetched_at = tokenomics_value_i64(&cached, &["fetched_at_unix", "fetchedAtUnix"])
+    let fetched_at = tokenomics_value_i64(&cached, &["fetched_at_unix"])
         .unwrap_or(0)
         .max(0) as u64;
     if fetched_at == 0 || now_unix.saturating_sub(fetched_at) >= max_age_secs {
@@ -16661,9 +16296,8 @@ fn tokenomics_mark_usage_updated_at(usage: &mut Value, updated_at: String) {
         return;
     };
     object.insert("updated_at".to_string(), json!(updated_at.clone()));
-    object.insert("updatedAt".to_string(), json!(updated_at.clone()));
     object.insert("last_known_at".to_string(), json!(updated_at.clone()));
-    object.insert("lastKnownAt".to_string(), json!(updated_at));
+    object.insert("last_known_at".to_string(), json!(updated_at));
 }
 
 #[derive(Default)]
@@ -16819,7 +16453,7 @@ fn tokenomics_cached_claude_usage(
     };
     let cached = serde_json::from_str::<Value>(&text)
         .map_err(|error| format!("Unable to parse Claude usage cache: {error}"))?;
-    let fetched_at = tokenomics_value_i64(&cached, &["fetched_at_unix", "fetchedAtUnix"])
+    let fetched_at = tokenomics_value_i64(&cached, &["fetched_at_unix"])
         .unwrap_or(0)
         .max(0) as u64;
     if fetched_at == 0 || now_unix.saturating_sub(fetched_at) >= max_age_secs {
@@ -17200,46 +16834,28 @@ fn tokenomics_limit_pace_snapshot(
 
     json!({
         "pace_delta_percent": pace_delta_percent,
-        "paceDeltaPercent": pace_delta_percent,
         "pace_status": pace_status,
-        "paceStatus": pace_status,
         "pace_exhausts_before_reset": exhausts_before_reset,
-        "paceExhaustsBeforeReset": exhausts_before_reset,
         "pace_expected_used_percent": expected_used_percent,
-        "paceExpectedUsedPercent": expected_used_percent,
         "pace_window_elapsed_percent": expected_used_percent,
-        "paceWindowElapsedPercent": expected_used_percent,
         "pace_projected_used_percent": projected_used_percent,
-        "paceProjectedUsedPercent": projected_used_percent,
         "pace_projected_exhaustion_seconds": projected_exhaustion_seconds,
-        "paceProjectedExhaustionSeconds": projected_exhaustion_seconds,
         "pace_projected_exhaustion_at": projected_exhaustion_at,
-        "paceProjectedExhaustionAt": projected_exhaustion_at,
         "pace_reset_at": reset_at,
-        "paceResetAt": reset_at,
     })
 }
 
 fn tokenomics_unknown_pace_snapshot() -> Value {
     json!({
         "pace_delta_percent": Value::Null,
-        "paceDeltaPercent": Value::Null,
         "pace_status": "unknown",
-        "paceStatus": "unknown",
         "pace_exhausts_before_reset": false,
-        "paceExhaustsBeforeReset": false,
         "pace_expected_used_percent": Value::Null,
-        "paceExpectedUsedPercent": Value::Null,
         "pace_window_elapsed_percent": Value::Null,
-        "paceWindowElapsedPercent": Value::Null,
         "pace_projected_used_percent": Value::Null,
-        "paceProjectedUsedPercent": Value::Null,
         "pace_projected_exhaustion_seconds": Value::Null,
-        "paceProjectedExhaustionSeconds": Value::Null,
         "pace_projected_exhaustion_at": Value::Null,
-        "paceProjectedExhaustionAt": Value::Null,
         "pace_reset_at": Value::Null,
-        "paceResetAt": Value::Null,
     })
 }
 
@@ -17331,13 +16947,9 @@ fn tokenomics_codex_window_snapshot(
             "used_percent": used_percent,
             "remaining_percent": remaining_percent,
             "display_percent": display_percent,
-            "displayPercent": display_percent,
             "limit_display_percent": display_percent,
-            "limitDisplayPercent": display_percent,
             "display_percent_kind": display_percent_kind,
-            "displayPercentKind": display_percent_kind,
             "limit_display_percent_kind": display_percent_kind,
-            "limitDisplayPercentKind": display_percent_kind,
             "status_label": tokenomics_codex_status_label(remaining_percent, limit_reached, allowed),
             "reset_label": tokenomics_reset_label(reset_at, reset_after_seconds),
             "reset_after_seconds": reset_after_seconds,
@@ -17637,20 +17249,15 @@ fn tokenomics_claude_window_snapshot(
             "used_percent": used_percent,
             "remaining_percent": remaining_percent,
             "display_percent": display_percent,
-            "displayPercent": display_percent,
             "limit_display_percent": display_percent,
-            "limitDisplayPercent": display_percent,
             "display_percent_kind": display_percent_kind,
-            "displayPercentKind": display_percent_kind,
             "limit_display_percent_kind": display_percent_kind,
-            "limitDisplayPercentKind": display_percent_kind,
             "provider_reported_percent": provider_reported_percent,
             "provider_reported_direction": provider_reported_direction,
             "status_label": tokenomics_claude_status_label(remaining_percent),
             "reset_label": reset_label,
             "reset_after_seconds": reset_after_seconds,
             "reset_at": reset_at.clone(),
-            "resetAt": reset_at.clone(),
             "limit_resets_at": reset_at,
             "limit_window_seconds": limit_window_seconds,
             "updated_at": updated_at,
@@ -17725,13 +17332,9 @@ fn tokenomics_unknown_limit_snapshot(
             "used_percent": Value::Null,
             "remaining_percent": Value::Null,
             "display_percent": Value::Null,
-            "displayPercent": Value::Null,
             "limit_display_percent": Value::Null,
-            "limitDisplayPercent": Value::Null,
             "display_percent_kind": tokenomics_limit_display_percent_kind(provider, agent_kind, window_kind),
-            "displayPercentKind": tokenomics_limit_display_percent_kind(provider, agent_kind, window_kind),
             "limit_display_percent_kind": tokenomics_limit_display_percent_kind(provider, agent_kind, window_kind),
-            "limitDisplayPercentKind": tokenomics_limit_display_percent_kind(provider, agent_kind, window_kind),
             "status_label": status_label,
             "reset_label": reset_label,
             "rate_points": [],
@@ -19009,7 +18612,7 @@ mod tokenomics_tests {
 
         let summary = tokenomics_summary_from_conn(&conn, false, None).unwrap();
         let hourly = summary["hourly"].as_array().unwrap();
-        let provider_accounts = summary["providerAccounts"].as_array().unwrap();
+        let provider_accounts = summary["provider_accounts"].as_array().unwrap();
 
         assert_eq!(summary["schema_version"], json!("tokenomics_v2"));
         assert_eq!(summary["total"]["total_tokens"], json!(42));
@@ -19180,7 +18783,7 @@ mod tokenomics_tests {
         assert_eq!(summary["total"]["total_tokens"], json!(12));
         assert_eq!(summary["hourly"][0]["total_tokens"], json!(12));
         assert_eq!(
-            summary["dailyByDeviceProvider"][0]["total_tokens"],
+            summary["daily_by_device_provider"][0]["total_tokens"],
             json!(12)
         );
         assert_eq!(
@@ -19376,7 +18979,7 @@ mod tokenomics_tests {
 
         let summary = tokenomics_summary_from_conn(&conn, false, None).unwrap();
         assert_eq!(summary["schema_version"], json!("tokenomics_v2"));
-        let daily = summary["dailyByDeviceProvider"].as_array().unwrap();
+        let daily = summary["daily_by_device_provider"].as_array().unwrap();
         assert_eq!(daily.len(), TOKENOMICS_INITIAL_BACKFILL_DAYS as usize);
         assert!(summary.get("daily").is_none());
         assert!(summary.get("monthly").is_none());

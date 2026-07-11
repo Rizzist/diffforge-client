@@ -1,7 +1,6 @@
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SqlClassification {
     pub classification: String,
     pub risk_level: i64,

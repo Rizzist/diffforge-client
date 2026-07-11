@@ -320,7 +320,7 @@ export async function invokeWebviewOpen({ label, url, rect, parentWindowLabel })
     label,
     url,
     width: rect.width,
-    windowLabel: parentWindowLabel || undefined,
+    window_label: parentWindowLabel || undefined,
     x: rect.x,
     y: rect.y,
   });
@@ -333,7 +333,7 @@ export async function invokeWebviewAdopt({ label, rect, parentWindowLabel }) {
     height: rect.height,
     label,
     width: rect.width,
-    windowLabel: parentWindowLabel || undefined,
+    window_label: parentWindowLabel || undefined,
     x: rect.x,
     y: rect.y,
   });
@@ -360,13 +360,13 @@ export async function invokeWebviewClose(label) {
   await invoke("workspace_webview_close", { label: safeLabel }).catch(() => {});
 }
 
-export async function invokeWebviewEval({ label, script, expectResult = true }) {
+export async function invokeWebviewEval({ label, script, expect_result: expectResult = true }) {
   const safeLabel = String(label || "").trim();
   if (!safeLabel) {
     throw new Error("Workspace web view is unavailable.");
   }
   return invoke("workspace_webview_eval", {
-    expectResult,
+    expect_result: expectResult,
     label: safeLabel,
     script,
   });
@@ -392,7 +392,7 @@ export function useNativeWebview({
   suspended = false,
   // When set (with a nonce bump), the hook adopts this existing webview into its
   // own window instead of creating a fresh one — preserving the live page.
-  adoptLabel = "",
+  adopt_label: adoptLabel = "",
   adoptNonce = 0,
   // The url the adopted webview is believed to be showing; lets later url-prop
   // syncs to that value skip a needless reload right after adoption.
@@ -584,7 +584,7 @@ export function useNativeWebview({
       return Promise.reject(new Error("Workspace web view is unavailable."));
     }
     return invokeWebviewEval({
-      expectResult: options.expectResult !== false,
+      expect_result: options.expect_result !== false,
       label,
       script,
     });

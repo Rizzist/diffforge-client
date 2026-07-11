@@ -19,9 +19,9 @@ test("device switcher puts the server-seen local desktop first and dedupes its e
     connectedDevices: [
       {
         connected: true,
-        deviceId: "desktop-local",
-        displayName: "Server Echo",
-        formFactor: "desktop",
+        device_id: "desktop-local",
+        display_name: "Server Echo",
+        form_factor: "desktop",
       },
     ],
     currentWorkspaceId: "ws-local",
@@ -52,21 +52,21 @@ test("device switcher puts the server-seen local desktop first and dedupes its e
     },
   });
 
-  assert.equal(options[0].deviceId, "desktop-local");
-  assert.equal(options[0].deviceName, "Server Echo");
-  assert.equal(options[0].isLocal, true);
+  assert.equal(options[0].device_id, "desktop-local");
+  assert.equal(options[0].device_name, "Server Echo");
+  assert.equal(options[0].is_local, true);
   assert.equal(options[0].liveState, "live");
-  assert.equal(options[0].nativeConnected, true);
-  assert.equal(options[0].webConnected, true);
+  assert.equal(options[0].native_connected, true);
+  assert.equal(options[0].web_connected, true);
   assert.equal(options[0].serverSeen, true);
   assert.equal(
-    options.filter((option) => option.deviceId === "desktop-local" && option.workspaceId === "ws-local").length,
+    options.filter((option) => option.device_id === "desktop-local" && option.workspace_id === "ws-local").length,
     1,
   );
   assert.ok(options.some((option) => (
-    option.deviceId === "desktop-remote"
-      && option.workspaceId === "ws-remote"
-      && option.workspaceName === "Remote repo"
+    option.device_id === "desktop-remote"
+      && option.workspace_id === "ws-remote"
+      && option.workspace_name === "Remote repo"
   )));
 });
 
@@ -97,13 +97,13 @@ test("device switcher aliases local profile to the canonical server device", () 
   });
 
   assert.equal(options.length, 1);
-  assert.equal(options[0].deviceId, "server-device");
-  assert.equal(options[0].deviceName, "Syed MacBook Air");
-  assert.equal(options[0].isLocal, true);
+  assert.equal(options[0].device_id, "server-device");
+  assert.equal(options[0].device_name, "Syed MacBook Air");
+  assert.equal(options[0].is_local, true);
   assert.equal(options[0].isCurrentWorkspace, true);
-  assert.equal(options[0].nativeConnected, true);
-  assert.equal(options[0].webConnected, true);
-  assert.deepEqual(options[0].deviceAliases.sort(), ["desktop-local", "server-device", "web-local"].sort());
+  assert.equal(options[0].native_connected, true);
+  assert.equal(options[0].web_connected, true);
+  assert.deepEqual(options[0].device_aliases.sort(), ["desktop-local", "server-device", "web-local"].sort());
 });
 
 test("device switcher collapses local desktop workspace echoes to the current workspace", () => {
@@ -133,14 +133,14 @@ test("device switcher collapses local desktop workspace echoes to the current wo
   });
 
   assert.equal(options.length, 1);
-  assert.equal(options[0].deviceId, "macos-local");
-  assert.equal(options[0].deviceName, "Syed MacBook Air");
-  assert.equal(options[0].isLocal, true);
-  assert.equal(options[0].workspaceId, "ws-current");
-  assert.equal(options[0].workspaceName, "Coding core");
-  assert.equal(options[0].nativeConnected, true);
-  assert.equal(options[0].webConnected, true);
-  assert.equal(options[0].platformLabel, "macos");
+  assert.equal(options[0].device_id, "macos-local");
+  assert.equal(options[0].device_name, "Syed MacBook Air");
+  assert.equal(options[0].is_local, true);
+  assert.equal(options[0].workspace_id, "ws-current");
+  assert.equal(options[0].workspace_name, "Coding core");
+  assert.equal(options[0].native_connected, true);
+  assert.equal(options[0].web_connected, true);
+  assert.equal(options[0].platform_label, "macos");
 });
 
 test("device switcher keeps web-sourced roster native badge tied to native_connected", () => {
@@ -169,13 +169,13 @@ test("device switcher keeps web-sourced roster native badge tied to native_conne
   });
 
   assert.equal(options.length, 1);
-  assert.equal(options[0].deviceId, "desktop-local");
-  assert.equal(options[0].deviceName, "Syed's MacBook Air");
-  assert.equal(options[0].isLocal, true);
+  assert.equal(options[0].device_id, "desktop-local");
+  assert.equal(options[0].device_name, "Syed's MacBook Air");
+  assert.equal(options[0].is_local, true);
   assert.equal(options[0].liveState, "live");
-  assert.equal(options[0].nativeConnected, false);
-  assert.equal(options[0].webConnected, true);
-  assert.equal(options[0].workspaceId, "ws-local");
+  assert.equal(options[0].native_connected, false);
+  assert.equal(options[0].web_connected, true);
+  assert.equal(options[0].workspace_id, "ws-local");
 });
 
 test("device switcher treats generic connected browser rows as web live", () => {
@@ -206,10 +206,10 @@ test("device switcher treats generic connected browser rows as web live", () => 
   });
 
   assert.equal(options.length, 1);
-  assert.equal(options[0].deviceId, "desktop-local");
+  assert.equal(options[0].device_id, "desktop-local");
   assert.equal(options[0].liveState, "live");
-  assert.equal(options[0].nativeConnected, false);
-  assert.equal(options[0].webConnected, true);
+  assert.equal(options[0].native_connected, false);
+  assert.equal(options[0].web_connected, true);
 });
 
 test("device switcher reads account live-state device maps and connection-summary surfaces", () => {
@@ -217,7 +217,7 @@ test("device switcher reads account live-state device maps and connection-summar
     currentWorkspaceId: "ws-local",
     currentWorkspaceName: "Coding core",
     deviceLiveState: {
-      accountDeviceLiveStateSnapshot: {
+      account_device_live_state_snapshot: {
         client_connection: {
           active_desktop_devices: [
             {
@@ -253,11 +253,11 @@ test("device switcher reads account live-state device maps and connection-summar
   });
 
   assert.equal(options.length, 1);
-  assert.equal(options[0].deviceId, "desktop-local");
+  assert.equal(options[0].device_id, "desktop-local");
   assert.equal(options[0].liveState, "live");
-  assert.equal(options[0].nativeConnected, true);
-  assert.equal(options[0].webConnected, true);
-  assert.equal(options[0].workspaceId, "ws-local");
+  assert.equal(options[0].native_connected, true);
+  assert.equal(options[0].web_connected, true);
+  assert.equal(options[0].workspace_id, "ws-local");
 });
 
 test("device switcher folds targeted web connection summaries into the canonical native device", () => {
@@ -297,12 +297,12 @@ test("device switcher folds targeted web connection summaries into the canonical
   });
 
   assert.equal(options.length, 1);
-  assert.equal(options[0].deviceId, "desktop-local");
-  assert.equal(options[0].deviceName, "Syed's MacBook Air");
-  assert.equal(options[0].isLocal, true);
-  assert.equal(options[0].nativeConnected, true);
-  assert.equal(options[0].webConnected, true);
-  assert.deepEqual(options[0].deviceAliases.sort(), ["desktop-local", "web-macos-chrome"].sort());
+  assert.equal(options[0].device_id, "desktop-local");
+  assert.equal(options[0].device_name, "Syed's MacBook Air");
+  assert.equal(options[0].is_local, true);
+  assert.equal(options[0].native_connected, true);
+  assert.equal(options[0].web_connected, true);
+  assert.deepEqual(options[0].device_aliases.sort(), ["desktop-local", "web-macos-chrome"].sort());
 });
 
 test("device switcher suppresses generic web-only echoes when the native device already has web presence", () => {
@@ -349,10 +349,10 @@ test("device switcher suppresses generic web-only echoes when the native device 
   });
 
   assert.equal(options.length, 1);
-  assert.equal(options[0].deviceId, "desktop-local");
-  assert.equal(options[0].nativeConnected, true);
-  assert.equal(options[0].webConnected, true);
-  assert.deepEqual(options[0].deviceAliases.sort(), ["desktop-local", "web-dashboard-1", "web-dashboard-2"].sort());
+  assert.equal(options[0].device_id, "desktop-local");
+  assert.equal(options[0].native_connected, true);
+  assert.equal(options[0].web_connected, true);
+  assert.deepEqual(options[0].device_aliases.sort(), ["desktop-local", "web-dashboard-1", "web-dashboard-2"].sort());
 });
 
 test("device switcher keeps registered inventory identity while overlaying web sessions", () => {
@@ -404,18 +404,18 @@ test("device switcher keeps registered inventory identity while overlaying web s
   });
 
   assert.equal(options.length, 2);
-  assert.equal(options[0].deviceId, "desktop-local");
-  assert.equal(options[0].deviceName, "Syed's MacBook Air");
-  assert.equal(options[0].platformLabel, "macos");
-  assert.equal(options[0].formFactorLabel, "pc");
-  assert.equal(options[0].nativeConnected, true);
-  assert.equal(options[0].webConnected, true);
-  assert.equal(options[1].deviceId, "android-phone");
-  assert.equal(options[1].deviceName, "Samsung Galaxy S23 Ultra");
-  assert.equal(options[1].platformLabel, "android");
-  assert.equal(options[1].formFactorLabel, "mobile");
-  assert.equal(options[1].nativeConnected, false);
-  assert.equal(options[1].webConnected, false);
+  assert.equal(options[0].device_id, "desktop-local");
+  assert.equal(options[0].device_name, "Syed's MacBook Air");
+  assert.equal(options[0].platform_label, "macos");
+  assert.equal(options[0].form_factor_label, "pc");
+  assert.equal(options[0].native_connected, true);
+  assert.equal(options[0].web_connected, true);
+  assert.equal(options[1].device_id, "android-phone");
+  assert.equal(options[1].device_name, "Samsung Galaxy S23 Ultra");
+  assert.equal(options[1].platform_label, "android");
+  assert.equal(options[1].form_factor_label, "mobile");
+  assert.equal(options[1].native_connected, false);
+  assert.equal(options[1].web_connected, false);
   assert.equal(options[1].liveState, "offline");
 });
 
@@ -464,17 +464,17 @@ test("device switcher drops generic web-only workspace rows when registered inve
   });
 
   assert.equal(options.length, 2);
-  assert.ok(options.every((option) => option.deviceName !== "This device"));
-  assert.ok(options.every((option) => option.deviceId !== "web-current-browser"));
+  assert.ok(options.every((option) => option.device_name !== "This device"));
+  assert.ok(options.every((option) => option.device_id !== "web-current-browser"));
   assert.ok(options.some((option) => (
-    option.deviceId === "desktop-local"
-      && option.workspaceId === "ws-web"
-      && option.workspaceName === "Browser workspace echo"
-      && option.webConnected === true
+    option.device_id === "desktop-local"
+      && option.workspace_id === "ws-web"
+      && option.workspace_name === "Browser workspace echo"
+      && option.web_connected === true
   )));
   assert.ok(options.some((option) => (
-    option.deviceId === "android-phone"
-      && option.deviceName === "Samsung Galaxy S23 Ultra"
+    option.device_id === "android-phone"
+      && option.device_name === "Samsung Galaxy S23 Ultra"
       && option.liveState === "offline"
   )));
 });
@@ -531,14 +531,14 @@ test("device switcher uses next registered device payload as the stable inventor
   });
 
   assert.equal(options.length, 2);
-  assert.deepEqual(options.map((option) => option.deviceName), [
+  assert.deepEqual(options.map((option) => option.device_name), [
     "Syed's MacBook Air",
     "Samsung Galaxy S23 Ultra",
   ]);
-  assert.ok(options.every((option) => option.deviceId !== "web-current-browser"));
-  assert.ok(options.every((option) => option.deviceName !== "This device"));
-  assert.equal(options.find((option) => option.deviceId === "desktop-local")?.webConnected, false);
-  assert.equal(options.find((option) => option.deviceId === "android-phone")?.liveState, "offline");
+  assert.ok(options.every((option) => option.device_id !== "web-current-browser"));
+  assert.ok(options.every((option) => option.device_name !== "This device"));
+  assert.equal(options.find((option) => option.device_id === "desktop-local")?.web_connected, false);
+  assert.equal(options.find((option) => option.device_id === "android-phone")?.liveState, "offline");
 });
 
 test("device switcher keeps app-shell registered inventory over live generic rows", () => {
@@ -590,15 +590,15 @@ test("device switcher keeps app-shell registered inventory over live generic row
     },
   });
 
-  assert.deepEqual(options.map((option) => option.deviceName), [
+  assert.deepEqual(options.map((option) => option.device_name), [
     "Syed's MacBook Air",
     "Samsung Galaxy S23 Ultra",
   ]);
-  assert.ok(options.every((option) => option.deviceName !== "This device"));
-  assert.ok(options.every((option) => option.deviceId !== "web-current-browser"));
-  assert.equal(options.find((option) => option.deviceId === "desktop-local")?.nativeConnected, true);
-  assert.equal(options.find((option) => option.deviceId === "desktop-local")?.webConnected, false);
-  assert.equal(options.find((option) => option.deviceId === "android-phone")?.liveState, "offline");
+  assert.ok(options.every((option) => option.device_name !== "This device"));
+  assert.ok(options.every((option) => option.device_id !== "web-current-browser"));
+  assert.equal(options.find((option) => option.device_id === "desktop-local")?.native_connected, true);
+  assert.equal(options.find((option) => option.device_id === "desktop-local")?.web_connected, false);
+  assert.equal(options.find((option) => option.device_id === "android-phone")?.liveState, "offline");
 });
 
 test("device switcher lets account live-state surface flags override stale connected devices", () => {
@@ -638,11 +638,11 @@ test("device switcher lets account live-state surface flags override stale conne
   });
 
   assert.equal(options.length, 1);
-  assert.equal(options[0].deviceId, "desktop-local");
+  assert.equal(options[0].device_id, "desktop-local");
   assert.equal(options[0].liveState, "live");
-  assert.equal(options[0].nativeConnected, false);
-  assert.equal(options[0].webConnected, true);
-  assert.equal(options[0].workspaceId, "ws-local");
+  assert.equal(options[0].native_connected, false);
+  assert.equal(options[0].web_connected, true);
+  assert.equal(options[0].workspace_id, "ws-local");
 });
 
 test("device switcher lights native from account connection summary overlay", () => {
@@ -690,10 +690,10 @@ test("device switcher lights native from account connection summary overlay", ()
   });
 
   assert.equal(options.length, 1);
-  assert.equal(options[0].deviceName, "Syed's MacBook Air");
+  assert.equal(options[0].device_name, "Syed's MacBook Air");
   assert.equal(options[0].liveState, "live");
-  assert.equal(options[0].nativeConnected, true);
-  assert.equal(options[0].webConnected, true);
+  assert.equal(options[0].native_connected, true);
+  assert.equal(options[0].web_connected, true);
   assert.deepEqual(options[0].surfaces.map(({ id, active }) => [id, active]), [
     ["native", true],
     ["web", true],
@@ -767,21 +767,21 @@ test("device switcher keeps registered roster while partial live updates light d
     },
   });
 
-  assert.deepEqual(options.map((option) => option.deviceName), [
+  assert.deepEqual(options.map((option) => option.device_name), [
     "Syed's MacBook Air",
     "Samsung Galaxy S23 Ultra",
   ]);
-  const mac = options.find((option) => option.deviceId === "desktop-local");
-  const phone = options.find((option) => option.deviceId === "android-phone");
-  assert.equal(mac?.nativeConnected, true);
-  assert.equal(mac?.webConnected, true);
+  const mac = options.find((option) => option.device_id === "desktop-local");
+  const phone = options.find((option) => option.device_id === "android-phone");
+  assert.equal(mac?.native_connected, true);
+  assert.equal(mac?.web_connected, true);
   assert.equal(mac?.liveState, "live");
   assert.deepEqual(mac?.surfaces.map(({ id, active }) => [id, active]), [
     ["native", true],
     ["web", true],
   ]);
-  assert.equal(phone?.nativeConnected, false);
-  assert.equal(phone?.webConnected, false);
+  assert.equal(phone?.native_connected, false);
+  assert.equal(phone?.web_connected, false);
   assert.equal(phone?.liveState, "offline");
 });
 
@@ -856,18 +856,18 @@ test("account devices rows mirror dashboard registry with live overlays", () => 
     },
   });
 
-  assert.deepEqual(rows.map((row) => row.deviceName), [
+  assert.deepEqual(rows.map((row) => row.device_name), [
     "Syed's MacBook Air",
     "Samsung Galaxy S23 Ultra",
   ]);
   assert.equal(rows.length, 2);
-  const mac = rows.find((row) => row.deviceId === "desktop-local");
-  const phone = rows.find((row) => row.deviceId === "android-phone");
-  assert.equal(mac?.nativeConnected, true);
-  assert.equal(mac?.webConnected, true);
-  assert.equal(mac?.isLocal, true);
-  assert.equal(phone?.nativeConnected, false);
-  assert.equal(phone?.webConnected, false);
+  const mac = rows.find((row) => row.device_id === "desktop-local");
+  const phone = rows.find((row) => row.device_id === "android-phone");
+  assert.equal(mac?.native_connected, true);
+  assert.equal(mac?.web_connected, true);
+  assert.equal(mac?.is_local, true);
+  assert.equal(phone?.native_connected, false);
+  assert.equal(phone?.web_connected, false);
   assert.equal(phone?.liveState, "offline");
 });
 
@@ -888,11 +888,11 @@ test("device switcher treats false server surface flags as offline despite gener
   });
 
   assert.equal(options.length, 1);
-  assert.equal(options[0].deviceId, "desktop-offline");
+  assert.equal(options[0].device_id, "desktop-offline");
   assert.equal(options[0].connected, false);
   assert.equal(options[0].liveState, "offline");
-  assert.equal(options[0].nativeConnected, false);
-  assert.equal(options[0].webConnected, false);
+  assert.equal(options[0].native_connected, false);
+  assert.equal(options[0].web_connected, false);
 });
 
 test("device switcher does not invent local device rows when server roster is present", () => {
@@ -915,8 +915,8 @@ test("device switcher does not invent local device rows when server roster is pr
   });
 
   assert.equal(options.length, 1);
-  assert.equal(options[0].deviceId, "server-remote");
-  assert.equal(options[0].isLocal, false);
+  assert.equal(options[0].device_id, "server-remote");
+  assert.equal(options[0].is_local, false);
 });
 
 test("mobile devices are selectable as devices without workspace todo views", () => {
@@ -935,82 +935,82 @@ test("mobile devices are selectable as devices without workspace todo views", ()
     },
     localProfile: { device_id: "desktop-local", device_name: "Local Rig" },
   });
-  const mobile = options.find((option) => option.deviceId === "phone-1");
+  const mobile = options.find((option) => option.device_id === "phone-1");
 
-  assert.equal(mobile.deviceKind, TODO_QUEUE_DEVICE_KIND_MOBILE);
-  assert.equal(mobile.workspaceId, "");
+  assert.equal(mobile.device_kind, TODO_QUEUE_DEVICE_KIND_MOBILE);
+  assert.equal(mobile.workspace_id, "");
   assert.equal(mobile.liveState, "live");
 });
 
 test("workspaceTodos filtering keeps only the selected source device and workspace", () => {
   const items = workspaceTodoItemsForDeviceWorkspace({
-    itemsByWorkspace: {
+    items_by_workspace: {
       "ws-remote": [
         {
-          deviceId: "desktop-remote",
+          device_id: "desktop-remote",
           status: "listed",
           text: "Remote todo",
-          todoId: "todo-remote",
-          workspaceId: "ws-remote",
+          todo_id: "todo-remote",
+          workspace_id: "ws-remote",
         },
         {
-          deviceId: "desktop-local",
+          device_id: "desktop-local",
           status: "listed",
           text: "Local todo",
-          todoId: "todo-local",
-          workspaceId: "ws-remote",
+          todo_id: "todo-local",
+          workspace_id: "ws-remote",
         },
         {
-          deviceId: "desktop-remote",
+          device_id: "desktop-remote",
           status: "deleted",
           text: "Deleted todo",
-          todoId: "todo-deleted",
-          workspaceId: "ws-remote",
+          todo_id: "todo-deleted",
+          workspace_id: "ws-remote",
         },
       ],
     },
   }, {
-    deviceId: "desktop-remote",
-    workspaceId: "ws-remote",
+    device_id: "desktop-remote",
+    workspace_id: "ws-remote",
   });
 
   assert.equal(items.length, 1);
-  assert.equal(items[0].todoId, "todo-remote");
+  assert.equal(items[0].todo_id, "todo-remote");
 });
 
 test("workspaceTodos filtering accepts selected device aliases", () => {
   const items = workspaceTodoItemsForDeviceWorkspace({
-    itemsByWorkspace: {
+    items_by_workspace: {
       "ws-local": [
         {
-          deviceId: "desktop-local",
+          device_id: "desktop-local",
           status: "listed",
           text: "Local alias todo",
-          todoId: "todo-local",
-          workspaceId: "ws-local",
+          todo_id: "todo-local",
+          workspace_id: "ws-local",
         },
       ],
     },
   }, {
-    deviceAliases: ["server-device", "desktop-local"],
-    deviceId: "server-device",
-    workspaceId: "ws-local",
+    device_aliases: ["server-device", "desktop-local"],
+    device_id: "server-device",
+    workspace_id: "ws-local",
   });
 
   assert.equal(items.length, 1);
-  assert.equal(items[0].todoId, "todo-local");
+  assert.equal(items[0].todo_id, "todo-local");
 });
 
 test("workspaceTodos filtering ignores null device selections", () => {
   const items = workspaceTodoItemsForDeviceWorkspace({
-    itemsByWorkspace: {
+    items_by_workspace: {
       "ws-local": [
         {
-          deviceId: "desktop-local",
+          device_id: "desktop-local",
           status: "listed",
           text: "Local todo",
-          todoId: "todo-local",
-          workspaceId: "ws-local",
+          todo_id: "todo-local",
+          workspace_id: "ws-local",
         },
       ],
     },
@@ -1072,22 +1072,22 @@ test("devices graph model preserves device, workspace, terminal, tool, and todo 
       form_factor: "desktop",
       platform: "macos",
     },
-    workspaceTodos: {
-      itemsByWorkspace: {
+    workspace_todos: {
+      items_by_workspace: {
         "ws-app": [
           {
-            deviceId: "desktop-local",
+            device_id: "desktop-local",
             status: "listed",
             text: "Build graph",
-            todoId: "todo-1",
-            workspaceId: "ws-app",
+            todo_id: "todo-1",
+            workspace_id: "ws-app",
           },
           {
-            deviceId: "desktop-local",
+            device_id: "desktop-local",
             status: "deleted",
             text: "Discarded",
-            todoId: "todo-2",
-            workspaceId: "ws-app",
+            todo_id: "todo-2",
+            workspace_id: "ws-app",
           },
         ],
       },
@@ -1095,47 +1095,47 @@ test("devices graph model preserves device, workspace, terminal, tool, and todo 
   });
 
   assert.equal(graph.account.name, "Acme Corp");
-  assert.equal(graph.totals.deviceCount, 2);
-  assert.equal(graph.totals.workspaceCount, 2);
-  assert.equal(graph.totals.terminalCount, 2);
-  assert.equal(graph.totals.toolCount, 2);
-  assert.equal(graph.totals.todoCount, 1);
-  const localDevice = graph.devices.find((device) => device.deviceId === "desktop-local");
-  assert.equal(localDevice.isLocal, true);
+  assert.equal(graph.totals.device_count, 2);
+  assert.equal(graph.totals.workspace_count, 2);
+  assert.equal(graph.totals.terminal_count, 2);
+  assert.equal(graph.totals.tool_count, 2);
+  assert.equal(graph.totals.todo_count, 1);
+  const localDevice = graph.devices.find((device) => device.device_id === "desktop-local");
+  assert.equal(localDevice.is_local, true);
   assert.equal(localDevice.liveState, "live");
-  assert.equal(localDevice.nativeConnected, true);
-  assert.equal(localDevice.webConnected, true);
-  assert.equal(localDevice.workspaceCount, 1);
+  assert.equal(localDevice.native_connected, true);
+  assert.equal(localDevice.web_connected, true);
+  assert.equal(localDevice.workspace_count, 1);
   assert.equal(localDevice.workspaces[0].status, "active");
-  assert.equal(localDevice.workspaces[0].terminalCount, 2);
+  assert.equal(localDevice.workspaces[0].terminal_count, 2);
   assert.equal(localDevice.workspaces[0].terminalStatusCounts.busy, 1);
-  assert.equal(localDevice.workspaces[0].toolCount, 2);
-  assert.equal(localDevice.workspaces[0].todoCount, 1);
-  const remoteDevice = graph.devices.find((device) => device.deviceId === "studio-pc");
+  assert.equal(localDevice.workspaces[0].tool_count, 2);
+  assert.equal(localDevice.workspaces[0].todo_count, 1);
+  const remoteDevice = graph.devices.find((device) => device.device_id === "studio-pc");
   assert.equal(remoteDevice.liveState, "offline");
   assert.equal(remoteDevice.workspaces[0].status, "idle");
 });
 
 test("only local device current workspace selections are editable", () => {
   assert.equal(todoQueueDeviceSelectionIsLocalEditable({
-    deviceKind: "desktop",
-    isLocal: true,
-    workspaceId: "ws-local",
+    device_kind: "desktop",
+    is_local: true,
+    workspace_id: "ws-local",
   }, "ws-local"), true);
   assert.equal(todoQueueDeviceSelectionIsLocalEditable({
-    deviceKind: "desktop",
-    isLocal: true,
-    workspaceId: "ws-other",
+    device_kind: "desktop",
+    is_local: true,
+    workspace_id: "ws-other",
   }, "ws-local"), false);
   assert.equal(todoQueueDeviceSelectionIsLocalEditable({
-    deviceKind: "desktop",
-    isLocal: false,
-    workspaceId: "ws-local",
+    device_kind: "desktop",
+    is_local: false,
+    workspace_id: "ws-local",
   }, "ws-local"), false);
   assert.equal(todoQueueDeviceSelectionIsLocalEditable({
-    deviceKind: "desktop",
-    isLocal: true,
-    workspaceId: "",
+    device_kind: "desktop",
+    is_local: true,
+    workspace_id: "",
   }, ""), false);
 });
 
@@ -1186,18 +1186,18 @@ test("Windows local workspace aliases stay editable and resolve mirrored todos",
   );
   assert.equal(normalizeTodoQueueWorkspaceMatchId("C:\\Üser\\Repo", "windows"), "c:/üser/repo");
   assert.equal(options.length, 1);
-  assert.equal(options[0].isLocal, true);
-  assert.equal(options[0].deviceKind, "desktop");
+  assert.equal(options[0].is_local, true);
+  assert.equal(options[0].device_kind, "desktop");
   assert.equal(todoQueueDeviceSelectionIsLocalEditable(options[0], currentWorkspaceId), true);
   assert.equal(todoQueueDeviceSelectionIsLocalEditable({
-    deviceKind: "unknown",
-    isLocal: true,
+    device_kind: "unknown",
+    is_local: true,
     platform: "Windows",
-    workspaceId: windowsWorkspaceId,
+    workspace_id: windowsWorkspaceId,
   }, currentWorkspaceId), true);
 
   const todos = workspaceTodoItemsForDeviceWorkspace({
-    itemsByWorkspace: {
+    items_by_workspace: {
       [currentWorkspaceId]: [{
         mirror_row_kind: "dispatch",
         todo_device_id: "web-origin",
@@ -1224,16 +1224,16 @@ test("displayed todo arrays render a production dispatch for its remote Windows 
     editable: false,
     items: [{ id: "local-only", text: "Must not render for remote selection" }],
     selection: {
-      deviceAliases: ["Windows-Rig"],
-      deviceId: "windows-rig",
-      deviceKind: "desktop",
-      isLocal: false,
+      device_aliases: ["Windows-Rig"],
+      device_id: "windows-rig",
+      device_kind: "desktop",
+      is_local: false,
       platform: "windows",
-      workspaceId: "c:/code/recipient/",
+      workspace_id: "c:/code/recipient/",
     },
-    workspaceTodos: {
-      dispatchesByWorkspace: [{
-        workspaceId: recipientWorkspace,
+    workspace_todos: {
+      dispatches_by_workspace: [{
+        workspace_id: recipientWorkspace,
         items: [{
           mirror_row_kind: "dispatch",
           todo_device_id: "web-origin",
@@ -1263,7 +1263,7 @@ test("displayed todo arrays render a production dispatch for its remote Windows 
 
 test("todo_store_snapshot hydration keeps a Windows workspace across slash and drive case", () => {
   const hydratedRows = buildTodoQueueHydratedSnapshotRows({
-    deviceId: "Windows-Rig",
+    device_id: "Windows-Rig",
     platform: "windows",
     snapshot: {
       items: [{
@@ -1273,7 +1273,7 @@ test("todo_store_snapshot hydration keeps a Windows workspace across slash and d
         workspace_id: "C:\\Code\\Recipient",
       }],
     },
-    workspaceId: "c:/code/recipient/",
+    workspace_id: "c:/code/recipient/",
   });
 
   assert.equal(hydratedRows.length, 1);

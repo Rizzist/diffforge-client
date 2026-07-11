@@ -56,8 +56,8 @@ function normalizeVmSandboxPercent(value) {
 }
 
 function getVmSandboxInstallText(status) {
-  const min = Number(status?.approximateDownloadMbMin || 80);
-  const max = Number(status?.approximateDownloadMbMax || 180);
+  const min = Number(status?.approximate_download_mb_min || 80);
+  const max = Number(status?.approximate_download_mb_max || 180);
   return `Install runtime (${min}-${max} MB)`;
 }
 
@@ -675,17 +675,17 @@ const VmSandboxError = styled.div`
 export default function VmSandboxPane({
   dragActive = false,
   fullscreenActive = false,
-  isActive = false,
+  is_active: isActive = false,
   isFullscreen = false,
   onClose = null,
   onDragHandlePointerDown = null,
   onMinimize = null,
   onSplit = null,
   onToggleFullscreen = null,
-  paneId = "",
+  pane_id: paneId = "",
   paneLimitReached = false,
-  terminalIndex,
-  workspaceId = "",
+  terminal_index: terminalIndex,
+  workspace_id: workspaceId = "",
 }) {
   const [runtimeStatus, setRuntimeStatus] = useState(null);
   const [progress, setProgress] = useState(null);
@@ -693,24 +693,24 @@ export default function VmSandboxPane({
   const [installing, setInstalling] = useState(false);
   const [error, setError] = useState("");
 
-  const runtimeReady = Boolean(runtimeStatus?.runtimeInstalled || runtimeStatus?.installed);
-  const installable = Boolean(runtimeStatus?.runtimeInstallable);
+  const runtimeReady = Boolean(runtimeStatus?.runtime_installed || runtimeStatus?.installed);
+  const installable = Boolean(runtimeStatus?.runtime_installable);
   const progressPercent = normalizeVmSandboxPercent(progress?.percent);
   const statusTone = error ? "error" : runtimeReady ? "ready" : "warning";
   const splitTitle = paneLimitReached ? "Panel limit reached" : "Split VM Sandbox panel";
   const runtimeSubtitle = runtimeReady
-    ? `${runtimeStatus?.runtimeName || "QEMU"} ready`
+    ? `${runtimeStatus?.runtime_name || "QEMU"} ready`
     : installing
       ? "Installing runtime"
       : "Runtime required";
 
   const statusLabel = useMemo(() => {
     if (error) return "Action needed";
-    if (runtimeReady) return runtimeStatus?.externalRuntime ? "External runtime" : "Runtime ready";
+    if (runtimeReady) return runtimeStatus?.external_runtime ? "External runtime" : "Runtime ready";
     if (installing) return "Installing";
     if (statusState === "loading") return "Checking runtime";
     return "Runtime missing";
-  }, [error, installing, runtimeReady, runtimeStatus?.externalRuntime, statusState]);
+  }, [error, installing, runtimeReady, runtimeStatus?.external_runtime, statusState]);
 
   const loadRuntimeStatus = useCallback(async () => {
     setStatusState("loading");
@@ -767,8 +767,8 @@ export default function VmSandboxPane({
     setError("");
     setProgress({
       state: "starting",
-      downloadedBytes: 0,
-      totalBytes: null,
+      downloaded_bytes: 0,
+      total_bytes: null,
       percent: null,
       message: "Starting VM Sandbox runtime install.",
     });
@@ -776,8 +776,8 @@ export default function VmSandboxPane({
       const nextStatus = await invoke("vm_sandbox_install_runtime");
       setRuntimeStatus(nextStatus);
       setInstalling(false);
-      if (!nextStatus?.runtimeInstalled && !nextStatus?.installed) {
-        setError(nextStatus?.runtimeInstallHint || "VM Sandbox runtime is not available yet.");
+      if (!nextStatus?.runtime_installed && !nextStatus?.installed) {
+        setError(nextStatus?.runtime_install_hint || "VM Sandbox runtime is not available yet.");
       }
     } catch (installError) {
       setInstalling(false);
@@ -786,10 +786,10 @@ export default function VmSandboxPane({
   }, [installable, installing]);
 
   const progressMessage = progress?.message
-    || runtimeStatus?.runtimeInstallHint
+    || runtimeStatus?.runtime_install_hint
     || "VM Sandbox runtime is checked locally.";
-  const progressBytes = progress?.downloadedBytes
-    ? `${formatVmSandboxBytes(progress.downloadedBytes)}${progress.totalBytes ? ` / ${formatVmSandboxBytes(progress.totalBytes)}` : ""}`
+  const progressBytes = progress?.downloaded_bytes
+    ? `${formatVmSandboxBytes(progress.downloaded_bytes)}${progress.total_bytes ? ` / ${formatVmSandboxBytes(progress.total_bytes)}` : ""}`
     : "";
 
   return (
@@ -831,7 +831,7 @@ export default function VmSandboxPane({
           <TerminalRestartButton
             aria-label="Split VM Sandbox panel horizontally"
             disabled={paneLimitReached}
-            onClick={() => onSplit?.({ direction: "vertical", paneId, terminalIndex, workspaceId })}
+            onClick={() => onSplit?.({ direction: "vertical", pane_id: paneId, terminal_index: terminalIndex, workspace_id: workspaceId })}
             title={splitTitle}
             type="button"
           >
@@ -840,7 +840,7 @@ export default function VmSandboxPane({
           <TerminalRestartButton
             aria-label="Split VM Sandbox panel vertically"
             disabled={paneLimitReached}
-            onClick={() => onSplit?.({ direction: "horizontal", paneId, terminalIndex, workspaceId })}
+            onClick={() => onSplit?.({ direction: "horizontal", pane_id: paneId, terminal_index: terminalIndex, workspace_id: workspaceId })}
             title={splitTitle}
             type="button"
           >
@@ -887,8 +887,8 @@ export default function VmSandboxPane({
             </VmSandboxHeadline>
             <VmSandboxCopy>
               {runtimeReady
-                ? `${runtimeStatus?.runtimeName || "QEMU"} is available on this device.`
-                : runtimeStatus?.runtimeInstallHint || "Install the local VM runtime before creating images."}
+                ? `${runtimeStatus?.runtime_name || "QEMU"} is available on this device.`
+                : runtimeStatus?.runtime_install_hint || "Install the local VM runtime before creating images."}
             </VmSandboxCopy>
 
             <VmSandboxActionRow>
@@ -942,15 +942,15 @@ export default function VmSandboxPane({
 
             <VmSandboxDetails>
               <dt>Runtime</dt>
-              <dd title={runtimeStatus?.runtimeName || "QEMU"}>{runtimeStatus?.runtimeName || "QEMU"}</dd>
+              <dd title={runtimeStatus?.runtime_name || "QEMU"}>{runtimeStatus?.runtime_name || "QEMU"}</dd>
               <dt>Path</dt>
-              <dd title={runtimeStatus?.runtimePath || ""}>{runtimeStatus?.runtimePath || "Not installed"}</dd>
+              <dd title={runtimeStatus?.runtime_path || ""}>{runtimeStatus?.runtime_path || "Not installed"}</dd>
               <dt>Host</dt>
-              <dd>{[runtimeStatus?.hostOs, runtimeStatus?.hostArch].filter(Boolean).join(" / ") || "Checking"}</dd>
+              <dd>{[runtimeStatus?.host_os, runtimeStatus?.host_arch].filter(Boolean).join(" / ") || "Checking"}</dd>
               <dt>Accel</dt>
               <dd>{runtimeStatus?.accelerator || "Checking"}</dd>
               <dt>Source</dt>
-              <dd>{runtimeStatus?.externalRuntime ? "PATH/system" : runtimeStatus?.managedRuntimeInstalled ? "Managed" : "First use"}</dd>
+              <dd>{runtimeStatus?.external_runtime ? "PATH/system" : runtimeStatus?.managed_runtime_installed ? "Managed" : "First use"}</dd>
             </VmSandboxDetails>
 
             <VmSandboxPreview>

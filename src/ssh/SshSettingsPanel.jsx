@@ -38,11 +38,11 @@ import {
 } from "./sshStyles.js";
 
 function authTagLabel(profile) {
-  if (profile.authMethod === SSH_AUTH_KEY) {
-    return profile.certificatePath ? "Key + cert" : "Key";
+  if (profile.auth_method === SSH_AUTH_KEY) {
+    return profile.certificate_path ? "Key + cert" : "Key";
   }
-  if (profile.authMethod === SSH_AUTH_PASSWORD) {
-    return profile.hasSecret ? "Password" : "Password (unset)";
+  if (profile.auth_method === SSH_AUTH_PASSWORD) {
+    return profile.has_secret ? "Password" : "Password (unset)";
   }
   return "Agent";
 }
@@ -153,11 +153,11 @@ export function SshSettingsPanel() {
             ) : (
               <SshClientRow key={profile.id}>
                 <SshClientIcon aria-hidden="true">
-                  {profile.authMethod === SSH_AUTH_KEY ? <ButtonKeyIcon /> : <ButtonHubIcon />}
+                  {profile.auth_method === SSH_AUTH_KEY ? <ButtonKeyIcon /> : <ButtonHubIcon />}
                 </SshClientIcon>
                 <SshClientMain>
                   <SshClientName>{profile.name}</SshClientName>
-                  <SshClientMeta title={`${describeSshProfile(profile)} · ${sshAuthMethodLabel(profile.authMethod)}`}>
+                  <SshClientMeta title={`${describeSshProfile(profile)} · ${sshAuthMethodLabel(profile.auth_method)}`}>
                     {describeSshProfile(profile)}
                   </SshClientMeta>
                 </SshClientMain>

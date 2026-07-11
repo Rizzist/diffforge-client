@@ -346,19 +346,19 @@ pub(crate) fn app_exit_background_internal(app: &AppHandle) {
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn app_enter_background(app: AppHandle) -> Result<(), String> {
     app_enter_background_internal(&app);
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn app_exit_background(app: AppHandle) -> Result<(), String> {
     app_exit_background_internal(&app);
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn app_background_mode_state() -> Result<Value, String> {
     Ok(json!({ "background": app_is_in_background_mode() }))
 }
@@ -367,7 +367,7 @@ fn app_background_mode_state() -> Result<Value, String> {
 /// lives right now. In background mode (or with the main window hidden) that
 /// is the tray popover's Activity tab; otherwise the main window comes
 /// forward on its Audio view.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn background_monitor_open_activity(app: AppHandle) -> Result<(), String> {
     if crate::daemon_mode_active() {
         return Ok(());
@@ -397,7 +397,7 @@ async fn background_monitor_open_activity(app: AppHandle) -> Result<(), String> 
 /// The monitor popover's Snippets button: the strip is its own full-width
 /// surface, never embedded inside the dropdown — dismiss the popover and
 /// surface the bar in its place.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn background_monitor_open_snip_strip(app: AppHandle) -> Result<(), String> {
     if crate::daemon_mode_active() {
         return Ok(());

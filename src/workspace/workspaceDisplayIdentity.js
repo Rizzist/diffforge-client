@@ -159,7 +159,7 @@ export function createWorkspaceDisplayIdentity(rootPath, fallback = "Project") {
     coreRoot,
     displayRoot,
     fallback,
-    repoName,
+    repo_name: repoName,
   };
 }
 
@@ -246,8 +246,8 @@ function privateNamespacePathParts(value, identity) {
       displayRoot = beforeLeaf ? `/${beforeLeaf}` : displayRoot;
     }
   }
-  if (!displayRoot && identity?.repoName) {
-    displayRoot = `/${identity.repoName}`;
+  if (!displayRoot && identity?.repo_name) {
+    displayRoot = `/${identity.repo_name}`;
   }
 
   const worktreeIndex = parts[1]?.toLowerCase() === FUNCTIONAL_REPO_WORKTREES_SEGMENT ? 1 : -1;
@@ -306,7 +306,7 @@ export function isWorkspacePathLike(value) {
 
 export function getWorkspacePathDisplayLabel(value, options = {}) {
   const identity = options.identity || createWorkspaceDisplayIdentity(
-    options.rootPath || value,
+    options.root_path || value,
     options.fallback || "Project",
   );
   const includeChildPath = options.includeChildPath !== false;

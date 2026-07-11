@@ -80,10 +80,10 @@ function normalizeActivityOverlayContext(value) {
   return {
     // Unknown (missing) means "assume available" so older payloads keep the
     // sync UI; only an explicit false from the main window hides it.
-    cloudSyncAvailable: object.cloudSyncAvailable !== false && object.cloud_sync_available !== false,
-    repoPath: text(object.repoPath || object.repo_path),
-    workspaceId: text(object.workspaceId || object.workspace_id),
-    workspaceName: text(object.workspaceName || object.workspace_name),
+    cloud_sync_available: object.cloudSyncAvailable !== false,
+    repo_path: text(object.repoPath),
+    workspace_id: text(object.workspaceId),
+    workspace_name: text(object.workspaceName),
   };
 }
 
@@ -99,7 +99,7 @@ function readActivityOverlayContext() {
 }
 
 function activityOverlayContextKey(context = {}) {
-  return `${text(context.repoPath)}\n${text(context.workspaceId)}`;
+  return `${text(context.repo_path)}\n${text(context.workspace_id)}`;
 }
 
 function numberValue(value, fallback = 0) {
@@ -113,9 +113,9 @@ function normalizeDictationHistoryEntry(entry, index = 0) {
   if (!entryText) {
     return null;
   }
-  const createdAt = timestampMs(object?.createdAt || object?.created_at);
+  const createdAt = timestampMs(object?.created_at);
   return {
-    createdAt,
+    created_at: createdAt,
     id: text(object?.id, `dictation-${createdAt || index}`),
     status: text(object?.status, "inserted"),
     text: entryText,
@@ -129,14 +129,14 @@ function mergeDictationHistoryEntries(...entryLists) {
     .map(normalizeDictationHistoryEntry)
     .filter(Boolean)
     .filter((entry) => {
-      const key = entry.id || `${entry.createdAt}:${entry.text}`;
+      const key = entry.id || `${entry.created_at}:${entry.text}`;
       if (seen.has(key)) {
         return false;
       }
       seen.add(key);
       return true;
     })
-    .sort((left, right) => right.createdAt - left.createdAt)
+    .sort((left, right) => right.created_at - left.created_at)
     .slice(0, DICTATION_CARD_LIMIT);
 }
 
@@ -337,12 +337,9 @@ function statusProgress(status, fallback = 42) {
 
 function todoIdentity(item, fallback) {
   return firstText(
-    item?.todoId,
     item?.todo_id,
     item?.id,
-    item?.bodyHash,
     item?.body_hash,
-    item?.todoBodyHash,
     item?.todo_body_hash,
     fallback,
   );
@@ -352,17 +349,13 @@ function todoTitle(item, fallback = "todo") {
   return shortText(
     displayText(
       firstText(
-        item?.llmTitle,
         item?.llm_title,
         item?.title,
         item?.summary,
         item?.body,
-        item?.todoText,
         item?.todo_text,
         item?.text,
-        item?.todoBodyPreview,
         item?.todo_body_preview,
-        item?.textPreview,
         item?.text_preview,
       ),
       fallback,
@@ -375,15 +368,10 @@ function todoWorkspaceLabel(item) {
   return shortText(
     displayText(
       firstText(
-        item?.workspaceName,
         item?.workspace_name,
-        item?.targetWorkspaceName,
         item?.target_workspace_name,
-        item?.observerWorkspaceName,
         item?.observer_workspace_name,
-        item?.gitRepoDisplayName,
         item?.git_repo_display_name,
-        item?.repoName,
         item?.repo_name,
       ),
     ),
@@ -393,33 +381,19 @@ function todoWorkspaceLabel(item) {
 
 function todoUpdatedAt(item) {
   return recentTimestamp(
-    item?.todoCompletedAt,
     item?.todo_completed_at,
-    item?.completedAt,
     item?.completed_at,
-    item?.todoCancelledAt,
     item?.todo_cancelled_at,
-    item?.cancelledAt,
     item?.cancelled_at,
-    item?.todoFailedAt,
     item?.todo_failed_at,
-    item?.failedAt,
     item?.failed_at,
-    item?.todoInterruptedAt,
     item?.todo_interrupted_at,
-    item?.interruptedAt,
     item?.interrupted_at,
-    item?.todoTimedOutAt,
     item?.todo_timed_out_at,
-    item?.timedOutAt,
     item?.timed_out_at,
-    item?.updatedAt,
     item?.updated_at,
-    item?.queuedAt,
     item?.queued_at,
-    item?.createdAt,
     item?.created_at,
-    item?.startedAt,
     item?.started_at,
   );
 }
@@ -439,7 +413,7 @@ function uniqueCards(cards, limit = CARD_LIMIT) {
       if (leftRank !== rightRank) {
         return rightRank - leftRank;
       }
-      return numberValue(right.updatedAt, 0) - numberValue(left.updatedAt, 0);
+      return numberValue(right.updated_at, 0) - numberValue(left.updated_at, 0);
     })
     .slice(0, limit);
 }
@@ -456,9 +430,9 @@ function todoCardFromItem(item, index, status, options = {}) {
     meta: workspace,
     progress: status === "queued" ? 20 : 0,
     status,
-    title: todoTitle(object, options.fallbackTitle || "Todo"),
+    title: todoTitle(object, options.fallback_title || "Todo"),
     tone: status === "queued" ? "warn" : "good",
-    updatedAt: todoUpdatedAt(object),
+    updated_at: todoUpdatedAt(object),
   };
 }
 
@@ -470,10 +444,7 @@ function normalizeOverviewTodoCards(overview) {
   jsonArray(overview?.workspaces).forEach((workspace) => {
     const workspaceObject = jsonObject(workspace) || {};
     const workspaceName = text(
-      workspaceObject.workspaceName
-        || workspaceObject.workspace_name
-        || workspaceObject.workspaceId
-        || workspaceObject.workspace_id,
+      workspaceObject.workspace_name || workspaceObject.workspace_id,
     );
     const finishedItems = [];
     jsonArray(workspaceObject.items).forEach((item, index) => {
@@ -488,11 +459,11 @@ function normalizeOverviewTodoCards(overview) {
       }
       const status = bucket === "running" ? "active" : bucket;
       const card = todoCardFromItem(
-        { ...object, workspaceName },
+        { ...object, workspace_name: workspaceName },
         index,
         status,
         {
-          fallbackTitle: bucket === "running"
+          fallback_title: bucket === "running"
             ? "Running todo"
             : bucket === "queued"
               ? "Queued todo"
@@ -511,18 +482,18 @@ function normalizeOverviewTodoCards(overview) {
     // newest first and capped per workspace so the retained history ledger
     // doesn't flood the widget.
     finishedItems
-      .map((entry) => ({ ...entry, updatedAt: todoUpdatedAt(entry.object) }))
-      .filter((entry) => entry.updatedAt
-        && Date.now() - entry.updatedAt <= OVERVIEW_FINISHED_WINDOW_MS)
-      .sort((left, right) => right.updatedAt - left.updatedAt)
+      .map((entry) => ({ ...entry, updated_at: todoUpdatedAt(entry.object) }))
+      .filter((entry) => entry.updated_at
+        && Date.now() - entry.updated_at <= OVERVIEW_FINISHED_WINDOW_MS)
+      .sort((left, right) => right.updated_at - left.updated_at)
       .slice(0, OVERVIEW_FINISHED_CARD_LIMIT)
       .forEach(({ index, object }) => {
         const status = statusKey(object.status, "") === "failed" ? "failed" : "done";
         const card = todoCardFromItem(
-          { ...object, workspaceName },
+          { ...object, workspace_name: workspaceName },
           index,
           status,
-          { fallbackTitle: "Finished todo", lane: "todo" },
+          { fallback_title: "Finished todo", lane: "todo" },
         );
         card.eyebrow = text(object.status, status);
         card.progress = 100;
@@ -545,7 +516,7 @@ function assetItemsById(value) {
   const byId = new Map();
   jsonArray(fanout ? fanout.items : data.items).forEach((asset) => {
     const object = jsonObject(asset);
-    const id = firstText(object?.assetId, object?.asset_id, object?.id);
+    const id = firstText(object?.asset_id, object?.id);
     if (object && id) {
       byId.set(id, object);
     }
@@ -555,29 +526,23 @@ function assetItemsById(value) {
 
 function assetLocalPath(asset) {
   return text(
-    asset?.localPath
-      || asset?.local_path
-      || asset?.path
-      || asset?.localPathHint
-      || asset?.local_path_hint
-      || asset?.lastLocalPath
-      || asset?.last_local_path,
+    asset?.local_path || asset?.path || asset?.local_path_hint || asset?.last_local_path,
   );
 }
 
 function assetLocalAvailable(asset) {
-  const explicit = asset?.localAvailable ?? asset?.local_available;
+  const explicit = asset?.local_available;
   if (typeof explicit === "boolean") return explicit && Boolean(assetLocalPath(asset));
-  const localStatus = text(asset?.localStatus || asset?.local_status).toLowerCase().replace(/[_\s]+/gu, "-");
+  const localStatus = text(asset?.local_status).toLowerCase().replace(/[_\s]+/gu, "-");
   if (["deleted", "local-deleted", "missing", "unavailable"].includes(localStatus)) return false;
   return Boolean(assetLocalPath(asset));
 }
 
 function assetCloudAvailable(asset) {
-  const explicit = asset?.cloudAvailable ?? asset?.cloud_available;
+  const explicit = asset?.cloud_available;
   if (typeof explicit === "boolean") return explicit;
   const cloudStatus = text(
-    asset?.cloudStatus || asset?.cloud_status || asset?.status || asset?.assetStatus || asset?.asset_status,
+    asset?.cloud_status || asset?.status || asset?.asset_status,
   ).toLowerCase().replace(/[_\s]+/gu, "-");
   if (["cloud-deleted-local-kept", "deleted", "local-only", "missing", "not-found", "unavailable"].includes(cloudStatus)) {
     return false;
@@ -585,7 +550,7 @@ function assetCloudAvailable(asset) {
   if (["available", "cloud-available", "cloud-only", "complete", "completed", "ready", "synced", "uploaded"].includes(cloudStatus)) {
     return true;
   }
-  return Boolean(asset?.blobId || asset?.blob_id || asset?.objectKey || asset?.object_key);
+  return Boolean(asset?.blob_id || asset?.object_key);
 }
 
 function assetSynced(asset) {
@@ -594,51 +559,35 @@ function assetSynced(asset) {
 
 function assetUpdatedAt(asset) {
   return recentTimestamp(
-    asset?.updatedAt,
     asset?.updated_at,
-    asset?.cloudUpdatedAt,
     asset?.cloud_updated_at,
-    asset?.localUpdatedAt,
     asset?.local_updated_at,
-    asset?.createdAt,
     asset?.created_at,
   );
 }
 
 function transferPercent(transfer) {
   const total = numberValue(
-    transfer?.bytesTotal
-      ?? transfer?.bytes_total
-      ?? transfer?.totalBytes
-      ?? transfer?.total_bytes
-      ?? transfer?.contentLength
-      ?? transfer?.content_length,
+    transfer?.bytes_total ?? transfer?.total_bytes ?? transfer?.content_length,
     0,
   );
   const done = numberValue(
-    transfer?.bytesDone
-      ?? transfer?.bytes_done
-      ?? transfer?.uploadedBytes
-      ?? transfer?.uploaded_bytes
-      ?? transfer?.downloadedBytes
-      ?? transfer?.downloaded_bytes
-      ?? transfer?.transferredBytes
-      ?? transfer?.transferred_bytes,
+    transfer?.bytes_done ?? transfer?.uploaded_bytes ?? transfer?.downloaded_bytes ?? transfer?.transferred_bytes,
     0,
   );
-  const explicit = transfer?.percent ?? transfer?.progressPercent ?? transfer?.progress_percent;
+  const explicit = transfer?.percent ?? transfer?.progress_percent;
   if (Number.isFinite(Number(explicit))) {
     return clampPercent(explicit);
   }
   if (!total) {
-    return statusProgress(transfer?.status || transfer?.transferStatus || transfer?.transfer_status, 46);
+    return statusProgress(transfer?.status || transfer?.transfer_status, 46);
   }
   return clampPercent((done / total) * 100);
 }
 
 function transferSizeMeta(transfer) {
-  const total = numberValue(transfer?.bytesTotal ?? transfer?.bytes_total ?? transfer?.totalBytes ?? transfer?.total_bytes, 0);
-  const done = numberValue(transfer?.bytesDone ?? transfer?.bytes_done ?? transfer?.uploadedBytes ?? transfer?.uploaded_bytes ?? transfer?.downloadedBytes ?? transfer?.downloaded_bytes, 0);
+  const total = numberValue(transfer?.bytes_total ?? transfer?.total_bytes, 0);
+  const done = numberValue(transfer?.bytes_done ?? transfer?.uploaded_bytes ?? transfer?.downloaded_bytes, 0);
   if (done && total) {
     return `${formatBytes(done)} / ${formatBytes(total)}`;
   }
@@ -652,7 +601,7 @@ function transferSizeMeta(transfer) {
 }
 
 function transferDirection(transfer) {
-  const direction = text(transfer?.direction || transfer?.transferDirection || transfer?.transfer_direction, "sync")
+  const direction = text(transfer?.direction || transfer?.transfer_direction, "sync")
     .toLowerCase()
     .replace(/[_\s]+/gu, "-");
   if (direction.includes("upload")) {
@@ -666,11 +615,8 @@ function transferDirection(transfer) {
 
 function transferUpdatedAt(transfer) {
   return recentTimestamp(
-    transfer?.updatedAt,
     transfer?.updated_at,
-    transfer?.completedAt,
     transfer?.completed_at,
-    transfer?.createdAt,
     transfer?.created_at,
   );
 }
@@ -731,39 +677,27 @@ function syncActivityDomainLabel(domain) {
 
 function syncActivityItems(status) {
   const data = dataValue(status);
-  const activity = jsonObject(data.syncActivity || data.sync_activity) || {};
+  const activity = jsonObject(data.sync_activity) || {};
   return jsonArray(activity.activities);
 }
 
 function syncActivityLane(item) {
-  return text(item?.syncLane || item?.sync_lane || item?.lane, "sync").toLowerCase();
+  return text(item?.sync_lane || item?.lane, "sync").toLowerCase();
 }
 
 function syncActivityProgress(item) {
   const metadata = jsonObject(item?.metadata) || {};
   const done = numberValue(
-    item?.progressDone
-      ?? item?.progress_done
-      ?? metadata.progressDone
-      ?? metadata.progress_done,
+    item?.progress_done ?? metadata.progress_done,
     0,
   );
   const total = numberValue(
-    item?.progressTotal
-      ?? item?.progress_total
-      ?? metadata.progressTotal
-      ?? metadata.progress_total,
+    item?.progress_total ?? metadata.progress_total,
     0,
   );
-  const explicit = item?.progressPercent
-    ?? item?.progress_percent
-    ?? metadata.progressPercent
-    ?? metadata.progress_percent;
+  const explicit = item?.progress_percent ?? metadata.progress_percent;
   const basis = text(
-    item?.progressBasis
-      || item?.progress_basis
-      || metadata.progressBasis
-      || metadata.progress_basis,
+    item?.progress_basis || metadata.progress_basis,
     "phase",
   ).toLowerCase();
   const percent = total > 0 && basis !== "phase"
@@ -815,31 +749,18 @@ function syncActivityDirection(item) {
 function syncActivityUnitCount(item = {}) {
   const metadata = jsonObject(item?.metadata) || {};
   return Math.max(0, Math.floor(numberValue(
-    item.syncUnitCount
-      ?? item.sync_unit_count
-      ?? item.unitCount
-      ?? item.unit_count
-      ?? item.durableUnitCount
-      ?? item.durable_unit_count
-      ?? item.durableCount
-      ?? item.durable_count
-      ?? metadata.syncUnitCount
-      ?? metadata.sync_unit_count
-      ?? metadata.unitCount
-      ?? metadata.unit_count
-      ?? metadata.durableUnitCount
-      ?? metadata.durable_unit_count,
+    item.sync_unit_count ?? item.unit_count ?? item.durable_unit_count ?? item.durable_count ?? metadata.sync_unit_count ?? metadata.unit_count ?? metadata.durable_unit_count,
     0,
   )));
 }
 
 function syncActivityUnitSummary(status) {
   const summary = {
-    controlCount: 0,
-    downCount: 0,
+    control_count: 0,
+    down_count: 0,
     hasUnitCounts: false,
-    pendingCount: 0,
-    upCount: 0,
+    pending_count: 0,
+    up_count: 0,
   };
   syncActivityItems(status).forEach((item) => {
     if (!item || typeof item !== "object" || syncActivityLane(item) !== "sync") {
@@ -852,20 +773,20 @@ function syncActivityUnitSummary(status) {
     summary.hasUnitCounts = true;
     const direction = syncActivityDirection(item);
     if (direction === "down") {
-      summary.downCount += count;
+      summary.down_count += count;
     } else if (direction === "both") {
-      summary.upCount += count;
-      summary.downCount += count;
+      summary.up_count += count;
+      summary.down_count += count;
     } else if (direction === "up") {
-      summary.upCount += count;
+      summary.up_count += count;
     } else {
-      summary.controlCount += count;
+      summary.control_count += count;
     }
     const state = statusKey(item.state || item.status, "");
-    const complete = Boolean(item.syncComplete ?? item.sync_complete)
+    const complete = Boolean(item.sync_complete)
       || ["complete", "completed", "synced", "acked", "sent", "received"].includes(state);
     if (!complete) {
-      summary.pendingCount += count;
+      summary.pending_count += count;
     }
   });
   return summary;
@@ -891,49 +812,33 @@ function normalizeActivitySyncBadge(status) {
   }
   const rawConnection = text(data.connection).toLowerCase();
   const rawStatus = text(data.status).toLowerCase();
-  const globalStatus = text(data.globalWsStatus || data.global_ws_status).toLowerCase();
+  const globalStatus = text(data.global_ws_status).toLowerCase();
   const connectionStatus = globalStatus || rawStatus;
   const connected = rawConnection === "connected"
-    || (syncBadgeBoolean(data.connected) && syncBadgeBoolean(data.globalWsConnected ?? data.global_ws_connected));
+    || (syncBadgeBoolean(data.connected) && syncBadgeBoolean(data.global_ws_connected));
   const unitSummary = syncActivityUnitSummary(data);
   const pendingCount = syncBadgeCount(
     unitSummary.hasUnitCounts
-      ? unitSummary.pendingCount
-      : data.pendingCount
-        ?? data.pending_count
-        ?? data.outboxPendingCount
-        ?? data.outbox_pending_count,
+      ? unitSummary.pending_count
+      : data.pending_count ?? data.outbox_pending_count,
   );
   const upCount = syncBadgeCount(
     unitSummary.hasUnitCounts
-      ? unitSummary.upCount
-      : data.upCount
-        ?? data.up_count
-        ?? data.syncUpCount
-        ?? data.sync_up_count
-        ?? pendingCount,
+      ? unitSummary.up_count
+      : data.up_count ?? data.sync_up_count ?? pendingCount,
   );
   const downCount = syncBadgeCount(
     unitSummary.hasUnitCounts
-      ? unitSummary.downCount
-      : data.downCount
-        ?? data.down_count
-        ?? data.syncDownCount
-        ?? data.sync_down_count,
+      ? unitSummary.down_count
+      : data.down_count ?? data.sync_down_count,
   );
   const controlCount = syncBadgeCount(
     unitSummary.hasUnitCounts
-      ? unitSummary.controlCount
-      : data.controlCount
-        ?? data.control_count
-        ?? data.syncControlCount
-        ?? data.sync_control_count,
+      ? unitSummary.control_count
+      : data.control_count ?? data.sync_control_count,
   );
   const sizeClass = text(
-    data.sizeClass
-      || data.size_class
-      || data.syncSizeClass
-      || data.sync_size_class,
+    data.size_class || data.sync_size_class,
     "live",
   ).toLowerCase() === "large"
     ? "large"
@@ -1004,20 +909,18 @@ function normalizeActivitySyncBadge(status) {
         : "Syncing cloud activity.",
   }[state] || label;
   return {
-    downCount,
+    down_count: downCount,
     indicator: ["connecting", "provisioning", "retrying", "syncing"].includes(state) ? "spinner" : "dot",
     label,
     state,
     title,
-    upCount,
+    up_count: upCount,
   };
 }
 
 function syncActivityUpdatedAt(item) {
   return recentTimestamp(
-    item?.updatedAtMs,
     item?.updated_at_ms,
-    item?.updatedAt,
     item?.updated_at,
   );
 }
@@ -1049,14 +952,14 @@ function normalizeLiveSyncCards(status) {
         status: state,
         title: `${syncActivityDomainLabel(domain)} sync`,
         tone: state === "done" ? "good" : state === "failed" ? "danger" : direction === "down" ? "hot" : "warn",
-        updatedAt: syncActivityUpdatedAt(object),
+        updated_at: syncActivityUpdatedAt(object),
       };
     })
     .filter(Boolean);
 }
 
 function isOpenTransferStatus(transfer) {
-  const status = statusKey(transfer?.status || transfer?.transferStatus || transfer?.transfer_status, "active");
+  const status = statusKey(transfer?.status || transfer?.transfer_status, "active");
   return (
     status === "active"
     || status === "queued"
@@ -1083,7 +986,7 @@ function isTerminalTransferStatus(status) {
 }
 
 function transferDisplayStatus(transfer, asset) {
-  const status = statusKey(transfer?.status || transfer?.transferStatus || transfer?.transfer_status, "active");
+  const status = statusKey(transfer?.status || transfer?.transfer_status, "active");
   if (assetSynced(asset) && (status === "active" || status === "queued")) {
     return "done";
   }
@@ -1109,12 +1012,9 @@ function transferTitle(transfer, asset) {
   return shortText(firstText(
     displayText(asset?.name),
     displayText(asset?.filename),
-    displayText(asset?.fileName),
     displayText(asset?.file_name),
-    displayText(transfer?.assetName),
     displayText(transfer?.asset_name),
     displayText(transfer?.filename),
-    displayText(transfer?.fileName),
     displayText(transfer?.file_name),
     "Asset transfer",
   ), 58);
@@ -1124,7 +1024,7 @@ function normalizeTransferCards(library) {
   const assets = assetItemsById(library);
   const cards = assetLibraryTransfers(library).map((transfer, index) => {
     const object = jsonObject(transfer) || {};
-    const assetId = firstText(object.assetId, object.asset_id);
+    const assetId = firstText(object.asset_id);
     const hasAsset = assetId ? assets.has(assetId) : false;
     const asset = assets.get(assetId) || {};
     if (!isVisibleTransfer(object, asset)) {
@@ -1139,7 +1039,7 @@ function normalizeTransferCards(library) {
       return null;
     }
     return {
-      id: `transfer-${firstText(object.transferId, object.transfer_id, object.id, index)}`,
+      id: `transfer-${firstText(object.transfer_id, object.id, index)}`,
       eyebrow: direction,
       lane: "transfers",
       meta: firstText(size, `${progress}%`),
@@ -1147,7 +1047,7 @@ function normalizeTransferCards(library) {
       status,
       title,
       tone: status === "done" ? "good" : direction === "upload" ? "warn" : direction === "download" ? "hot" : statusTone(status),
-      updatedAt: transferActivityAt(object, asset),
+      updated_at: transferActivityAt(object, asset),
     };
   }).filter(Boolean);
   // Open transfers all show; terminal ones (the history ledger) keep only
@@ -1155,7 +1055,7 @@ function normalizeTransferCards(library) {
   const openCards = cards.filter((card) => !isTerminalTransferStatus(card.status));
   const terminalCards = cards
     .filter((card) => isTerminalTransferStatus(card.status))
-    .sort((left, right) => numberValue(right.updatedAt, 0) - numberValue(left.updatedAt, 0))
+    .sort((left, right) => numberValue(right.updated_at, 0) - numberValue(left.updated_at, 0))
     .slice(0, TRANSFER_HISTORY_CARD_LIMIT);
   return uniqueCards([...openCards, ...terminalCards]);
 }
@@ -1198,7 +1098,7 @@ function activityCardTier(card, now = Date.now()) {
     return 0;
   }
   if (["done", "failed", "stopped"].includes(status)) {
-    const finishedAt = numberValue(card?.updatedAt, 0);
+    const finishedAt = numberValue(card?.updated_at, 0);
     return finishedAt && now - finishedAt <= ACTIVE_FINISH_PIN_MS ? 0 : 2;
   }
   if (status === "queued") {
@@ -1229,11 +1129,11 @@ function useActivityOverlayContext() {
 
 function useActivityOverlayData(context) {
   const [state, setState] = useState(() => ({
-    cloudStatus: null,
+    cloud_status: null,
     errors: [],
     library: null,
-    todoOverview: null,
-    updatedAt: 0,
+    todo_overview: null,
+    updated_at: 0,
   }));
   const contextRef = useRef(context);
   const contextKeyRef = useRef(activityOverlayContextKey(context));
@@ -1260,8 +1160,8 @@ function useActivityOverlayData(context) {
           const overview = await invoke("todo_dispatch_overview");
           setState((current) => ({
             ...current,
-            todoOverview: overview,
-            updatedAt: Date.now(),
+            todo_overview: overview,
+            updated_at: Date.now(),
           }));
         } catch {
           break;
@@ -1277,13 +1177,13 @@ function useActivityOverlayData(context) {
     contextKeyRef.current = activityOverlayContextKey(context);
     setState((current) => ({
       ...current,
-      updatedAt: Date.now(),
+      updated_at: Date.now(),
     }));
-  }, [context.repoPath, context.workspaceId]);
+  }, [context.repo_path, context.workspace_id]);
 
-  const refresh = useCallback(async ({ localOnly = true } = {}) => {
+  const refresh = useCallback(async ({ local_only: localOnly = true } = {}) => {
     if (refreshInFlightRef.current) {
-      refreshPendingOptionsRef.current = { localOnly: localOnly && refreshPendingOptionsRef.current?.localOnly !== false };
+      refreshPendingOptionsRef.current = { local_only: localOnly && refreshPendingOptionsRef.current?.local_only !== false };
       return;
     }
     refreshInFlightRef.current = true;
@@ -1294,7 +1194,7 @@ function useActivityOverlayData(context) {
         invoke("cloud_mcp_get_status"),
         invoke("cloud_mcp_list_account_assets", {
           limit: 120,
-          localOnly,
+          local_only: localOnly,
         }),
         // The Rust queue stores are the headless todo truth: running, queued,
         // and listed todos render from here with no cloud round trip.
@@ -1311,16 +1211,16 @@ function useActivityOverlayData(context) {
         if (libraryResult.status === "rejected") {
           errors.push("assets");
         }
-        const cloudStatus = cloudStatusResult.status === "fulfilled" ? cloudStatusResult.value : current.cloudStatus;
+        const cloudStatus = cloudStatusResult.status === "fulfilled" ? cloudStatusResult.value : current.cloud_status;
         return {
           ...current,
-          cloudStatus,
+          cloud_status: cloudStatus,
           errors,
           library: libraryResult.status === "fulfilled" ? libraryResult.value : current.library,
-          todoOverview: todoOverviewResult.status === "fulfilled"
+          todo_overview: todoOverviewResult.status === "fulfilled"
             ? todoOverviewResult.value
-            : current.todoOverview,
-          updatedAt: Date.now(),
+            : current.todo_overview,
+          updated_at: Date.now(),
         };
       });
     } finally {
@@ -1373,8 +1273,8 @@ function useActivityOverlayData(context) {
     // deletes, sweeps) drive the authoritative todo cards; the fast path
     // updates them instantly, the debounced full refresh converges the rest.
     void addListener("todo-store-changed", { onEvent: refreshTodoOverview });
-    void addListener(CLOUD_MCP_ACCOUNT_ASSETS_UPDATED_EVENT, { refreshOptions: { localOnly: true } });
-    void addListener(CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT, { refreshOptions: { localOnly: false } });
+    void addListener(CLOUD_MCP_ACCOUNT_ASSETS_UPDATED_EVENT, { refreshOptions: { local_only: true } });
+    void addListener(CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT, { refreshOptions: { local_only: false } });
     void addListener(CLOUD_MCP_SYNC_STATUS_EVENT, {
       onEvent: (event) => {
         const payload = jsonObject(event?.payload);
@@ -1382,26 +1282,25 @@ function useActivityOverlayData(context) {
           return;
         }
         setState((current) => {
-          const previous = jsonObject(current.cloudStatus) || {};
+          const previous = jsonObject(current.cloud_status) || {};
           return {
             ...current,
-            cloudStatus: {
+            cloud_status: {
               ...previous,
               ...payload,
-              syncActivity: payload.syncActivity ?? payload.sync_activity ?? previous.syncActivity,
-              sync_activity: payload.sync_activity ?? payload.syncActivity ?? previous.sync_activity,
+              sync_activity: payload.sync_activity ?? previous.sync_activity,
             },
-            updatedAt: Date.now(),
+            updated_at: Date.now(),
           };
         });
       },
-      refreshOptions: { localOnly: true },
+      refreshOptions: { local_only: true },
     });
     // The pre-created window keeps this panel mounted while hidden; the
     // moment Rust shows it, converge immediately instead of riding the poll.
     void addListener("forge-activity-overlay-visibility-changed", {
       onEvent: refreshTodoOverview,
-      refreshOptions: { localOnly: false },
+      refreshOptions: { local_only: false },
     });
 
     // Safety-net poll: overlay windows are separate webviews that can open
@@ -1437,8 +1336,8 @@ function useActivityOverlayData(context) {
   }, [refresh, refreshTodoOverview, scheduleRefresh]);
 
   useEffect(() => {
-    void refresh({ localOnly: false });
-  }, [context.repoPath, context.workspaceId, refresh]);
+    void refresh({ local_only: false });
+  }, [context.repo_path, context.workspace_id, refresh]);
 
   return state;
 }
@@ -1544,8 +1443,8 @@ export function ActivityOverlayPanel({ embedded = false }) {
   const data = useActivityOverlayData(context);
   const todoCards = useMemo(() => {
     // The Activity widget's todo rows come from the Rust queue overview only.
-    return normalizeOverviewTodoCards(data.todoOverview);
-  }, [data.todoOverview]);
+    return normalizeOverviewTodoCards(data.todo_overview);
+  }, [data.todo_overview]);
   const terminalTodoStates = useMemo(
     () => new Map(),
     [],
@@ -1556,14 +1455,14 @@ export function ActivityOverlayPanel({ embedded = false }) {
   );
   // Free plans cannot cloud-sync: the outbox only accumulates, so a "Syncing"
   // badge and progress rows would spin forever. Hide all sync UI instead.
-  const cloudSyncAvailable = context.cloudSyncAvailable !== false;
+  const cloudSyncAvailable = context.cloud_sync_available !== false;
   const syncCards = useMemo(
-    () => (cloudSyncAvailable ? normalizeLiveSyncCards(data.cloudStatus) : []),
-    [cloudSyncAvailable, data.cloudStatus],
+    () => (cloudSyncAvailable ? normalizeLiveSyncCards(data.cloud_status) : []),
+    [cloudSyncAvailable, data.cloud_status],
   );
   const syncBadge = useMemo(
-    () => (cloudSyncAvailable ? normalizeActivitySyncBadge(data.cloudStatus) : null),
-    [cloudSyncAvailable, data.cloudStatus],
+    () => (cloudSyncAvailable ? normalizeActivitySyncBadge(data.cloud_status) : null),
+    [cloudSyncAvailable, data.cloud_status],
   );
   const progressCards = useMemo(
     () => [...syncCards, ...transferCards],
@@ -1600,7 +1499,7 @@ export function ActivityOverlayPanel({ embedded = false }) {
       }
       const phase = text(payload.phase) === "transcribing" ? "transcribing" : "listening";
       setDictationStream({
-        atMs: numberValue(payload.atMs, Date.now()),
+        at_ms: numberValue(payload.at_ms, Date.now()),
         phase,
         text: text(payload.text),
       });
@@ -1749,7 +1648,7 @@ export function ActivityOverlayPanel({ embedded = false }) {
     const items = [...todoCards, ...progressCards].map((card) => ({
       card,
       key: card.id,
-      sortTime: numberValue(card.updatedAt, 0),
+      sortTime: numberValue(card.updated_at, 0),
       tier: activityCardTier(card, now),
       type: "card",
     }));
@@ -1757,7 +1656,7 @@ export function ActivityOverlayPanel({ embedded = false }) {
       items.push({
         entry,
         key: `dictation-${entry.id}`,
-        sortTime: numberValue(entry.createdAt, 0),
+        sortTime: numberValue(entry.created_at, 0),
         tier: 2,
         type: "dictation",
       });
@@ -1865,8 +1764,8 @@ export function ActivityOverlayPanel({ embedded = false }) {
       data-tauri-drag-region={embedded ? undefined : true}
       key={`dictation-${entry.id}`}
     >
-      <DictationTime title={entry.createdAt ? new Date(entry.createdAt).toLocaleString() : undefined}>
-        {dictationClockLabel(entry.createdAt)}
+      <DictationTime title={entry.created_at ? new Date(entry.created_at).toLocaleString() : undefined}>
+        {dictationClockLabel(entry.created_at)}
       </DictationTime>
       <DictationText
         data-cancelled={entry.status === "cancelled" ? "true" : undefined}
@@ -1929,18 +1828,18 @@ export function ActivityOverlayPanel({ embedded = false }) {
           >
             <ActivitySyncIndicator aria-hidden="true" data-variant={syncBadge.indicator} />
             <span>{syncBadge.label}</span>
-            {syncBadge.upCount > 0 || syncBadge.downCount > 0 ? (
+            {syncBadge.up_count > 0 || syncBadge.down_count > 0 ? (
               <ActivitySyncDirectionCounts aria-hidden="true">
-                {syncBadge.upCount > 0 ? (
+                {syncBadge.up_count > 0 ? (
                   <ActivitySyncDirectionCount data-direction="up">
                     <span>↑</span>
-                    <b>{syncBadge.upCount}</b>
+                    <b>{syncBadge.up_count}</b>
                   </ActivitySyncDirectionCount>
                 ) : null}
-                {syncBadge.downCount > 0 ? (
+                {syncBadge.down_count > 0 ? (
                   <ActivitySyncDirectionCount data-direction="down">
                     <span>↓</span>
-                    <b>{syncBadge.downCount}</b>
+                    <b>{syncBadge.down_count}</b>
                   </ActivitySyncDirectionCount>
                 ) : null}
               </ActivitySyncDirectionCounts>
@@ -2004,7 +1903,7 @@ export function ActivityOverlayPanel({ embedded = false }) {
       </OverlayBody>
 
       <OverlayFooter data-tauri-drag-region={embedded ? undefined : true}>
-        <span>{data.errors.length ? "snapshot pending" : `updated ${timeAgo(data.updatedAt)}`}</span>
+        <span>{data.errors.length ? "snapshot pending" : `updated ${timeAgo(data.updated_at)}`}</span>
         <FooterSpacer />
         <span>{stats.queued ? `${stats.queued} queued` : "live"}</span>
       </OverlayFooter>

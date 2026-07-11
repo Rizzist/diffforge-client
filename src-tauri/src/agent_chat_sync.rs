@@ -166,7 +166,6 @@ fn agent_chat_session_sync_touch_turn_summary_cache_session(
 fn agent_chat_session_sync_message_has_file_change(message: &Value) -> bool {
     message
         .get("file_change")
-        .or_else(|| message.get("fileChange"))
         .is_some_and(Value::is_object)
 }
 
@@ -385,12 +384,9 @@ fn agent_chat_session_sync_mark_payload_workspace_history_dirty(payload: &Value)
         payload,
         &[
             "workspace_id",
-            "workspaceId",
             "w",
             "repo_id",
-            "repoId",
             "target_workspace_id",
-            "targetWorkspaceId",
         ],
     )
     .unwrap_or_default();
@@ -551,7 +547,7 @@ fn agent_chat_session_sync_error_text_marker(value: &str) -> bool {
 }
 
 fn agent_chat_session_sync_message_error_evidence(message: &Value) -> bool {
-    if cloud_mcp_payload_bool(message, &["is_error", "isError"], false) {
+    if cloud_mcp_payload_bool(message, &["is_error"], false) {
         return true;
     }
     if message
@@ -561,7 +557,7 @@ fn agent_chat_session_sync_message_error_evidence(message: &Value) -> bool {
     {
         return true;
     }
-    if ["error", "tool_error", "toolError", "stderr"]
+    if ["error", "tool_error", "stderr"]
         .iter()
         .any(|key| {
             message
@@ -579,34 +575,6 @@ fn agent_chat_session_sync_message_error_evidence(message: &Value) -> bool {
         .is_some_and(|title| agent_chat_session_sync_error_text_marker(&title))
 }
 
-fn agent_chat_session_sync_insert_aliases(object: &mut serde_json::Map<String, Value>) {
-    for (camel, snake) in [
-        ("createdAt", "created_at"),
-        ("callId", "call_id"),
-        ("legacyKind", "legacy_kind"),
-        ("toolOutput", "tool_output"),
-        ("toolError", "tool_error"),
-        ("fileChange", "file_change"),
-        ("subagentId", "subagent_id"),
-    ] {
-        if let Some(value) = object.get(camel).cloned() {
-            object.entry(snake.to_string()).or_insert(value);
-        } else if let Some(value) = object.get(snake).cloned() {
-            object.entry(camel.to_string()).or_insert(value);
-        }
-    }
-}
-
-fn agent_chat_session_sync_insert_subagent_aliases(object: &mut serde_json::Map<String, Value>) {
-    if let Some(subagent) = object.get_mut("subagent").and_then(Value::as_object_mut) {
-        if let Some(value) = subagent.get("subagentId").cloned() {
-            subagent.entry("subagent_id".to_string()).or_insert(value);
-        } else if let Some(value) = subagent.get("subagent_id").cloned() {
-            subagent.entry("subagentId".to_string()).or_insert(value);
-        }
-    }
-}
-
 fn agent_chat_session_sync_normalize_artifact_aliases(value: &mut Value) {
     let Some(artifacts) = value.get_mut("artifacts").and_then(Value::as_array_mut) else {
         return;
@@ -616,16 +584,11 @@ fn agent_chat_session_sync_normalize_artifact_aliases(value: &mut Value) {
             continue;
         };
         let mime = object
-            .get("mimeType")
-            .or_else(|| object.get("mime_type"))
+            .get("mime_type")
             .or_else(|| object.get("mime"))
             .cloned();
         if let Some(mime) = mime {
-            object.entry("mimeType".to_string()).or_insert(mime.clone());
-            object
-                .entry("mime_type".to_string())
-                .or_insert(mime.clone());
-            object.entry("mime".to_string()).or_insert(mime);
+            object.entry("mime_type".to_string()).or_insert(mime);
         }
     }
 }
@@ -638,7 +601,7 @@ fn agent_chat_session_sync_tool_status(message: &Value) -> String {
 }
 
 fn agent_chat_session_sync_subagent_is_genuine(message: &Value) -> bool {
-    let legacy_kind = cloud_mcp_payload_text(message, &["legacyKind", "legacy_kind"])
+    let legacy_kind = cloud_mcp_payload_text(message, &["legacy_kind"])
         .unwrap_or_default()
         .to_ascii_lowercase();
     let kind = agent_chat_session_sync_message_kind(message);
@@ -653,18 +616,12 @@ fn agent_chat_session_sync_subagent_is_genuine(message: &Value) -> bool {
 
 fn agent_chat_session_sync_subagent_has_explicit_sidechain(subagent: &Value) -> bool {
     subagent
-        .get("isSidechain")
-        .or_else(|| subagent.get("is_sidechain"))
+        .get("is_sidechain")
         .and_then(Value::as_bool)
         .unwrap_or(false)
         || cloud_mcp_payload_text(
             subagent,
-            &[
-                "sidechainId",
-                "sidechain_id",
-                "sidechainUuid",
-                "sidechain_uuid",
-            ],
+            &["sidechain_id", "sidechain_uuid"],
         )
         .is_some_and(|value| !value.trim().is_empty())
 }
@@ -673,11 +630,7 @@ fn agent_chat_session_sync_canonical_kind(message: &Value, legacy_kind: &str) ->
     if matches!(legacy_kind, "turn_summary" | "turn_diff") {
         return legacy_kind.to_string();
     }
-    if message
-        .get("file_change")
-        .or_else(|| message.get("fileChange"))
-        .is_some()
-    {
+    if message.get("file_change").is_some() {
         return "file_change".to_string();
     }
     if message.get("subagent").is_some() && agent_chat_session_sync_subagent_is_genuine(message) {
@@ -722,7 +675,6 @@ fn agent_chat_session_sync_ensure_tool_value(
     let mut tool = serde_json::Map::new();
     if let Some(call_id) = object
         .get("call_id")
-        .or_else(|| object.get("callId"))
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
     {
@@ -764,11 +716,8 @@ fn agent_chat_session_sync_ensure_tool_value(
 fn agent_chat_session_sync_normalize_message_value(mut value: Value) -> Value {
     let legacy_kind = agent_chat_session_sync_message_kind(&value);
     if let Some(object) = value.as_object_mut() {
-        agent_chat_session_sync_insert_aliases(object);
-        agent_chat_session_sync_insert_subagent_aliases(object);
         if !object
             .get("subagent_id")
-            .or_else(|| object.get("subagentId"))
             .is_some_and(agent_chat_session_sync_value_has_content)
         {
             if let Some(subagent) = object.get("subagent") {
@@ -776,31 +725,23 @@ fn agent_chat_session_sync_normalize_message_value(mut value: Value) -> Value {
                     || agent_chat_session_sync_subagent_has_explicit_sidechain(subagent);
                 let subagent_id = first_value_string(&[
                     subagent.get("subagent_id"),
-                    subagent.get("subagentId"),
-                    subagent.get("sidechainUuid"),
                     subagent.get("sidechain_uuid"),
-                    subagent.get("sidechainId"),
                     subagent.get("sidechain_id"),
                     subagent.get("agent_id"),
-                    subagent.get("agentId"),
                     subagent.get("uuid"),
                     subagent.get("id"),
-                    subagent.get("sessionId"),
                     subagent.get("session_id"),
                 ]);
                 let subagent_id = if subagent_id.trim().is_empty() && allow_parent_id {
                     first_value_string(&[
-                        subagent.get("parentUuid"),
                         subagent.get("parent_uuid"),
-                        subagent.get("parentId"),
                         subagent.get("parent_id"),
                     ])
                 } else {
                     subagent_id
                 };
                 if !subagent_id.trim().is_empty() && allow_parent_id {
-                    object.insert("subagent_id".to_string(), json!(subagent_id.clone()));
-                    object.insert("subagentId".to_string(), json!(subagent_id));
+                    object.insert("subagent_id".to_string(), json!(subagent_id));
                 }
             }
         }
@@ -825,14 +766,8 @@ fn agent_chat_session_sync_normalize_message_value(mut value: Value) -> Value {
                 .to_string();
             if let Some(output) = output.filter(agent_chat_session_sync_value_has_content) {
                 if status == "failed" {
-                    object
-                        .entry("toolError".to_string())
-                        .or_insert(output.clone());
                     object.entry("tool_error".to_string()).or_insert(output);
                 } else {
-                    object
-                        .entry("toolOutput".to_string())
-                        .or_insert(output.clone());
                     object.entry("tool_output".to_string()).or_insert(output);
                 }
             }
@@ -846,12 +781,10 @@ fn agent_chat_session_sync_normalize_message_value(mut value: Value) -> Value {
             object.insert("status".to_string(), json!("error"));
             if kind == "tool_output"
                 && !object
-                    .get("toolError")
-                    .or_else(|| object.get("tool_error"))
+                    .get("tool_error")
                     .is_some_and(agent_chat_session_sync_value_has_content)
                 && !text.trim().is_empty()
             {
-                object.insert("toolError".to_string(), json!(text.clone()));
                 object.insert("tool_error".to_string(), json!(text));
             }
         }
@@ -860,9 +793,6 @@ fn agent_chat_session_sync_normalize_message_value(mut value: Value) -> Value {
     let canonical_kind = agent_chat_session_sync_canonical_kind(&value, &legacy_kind);
     if let Some(object) = value.as_object_mut() {
         if canonical_kind != legacy_kind {
-            object
-                .entry("legacyKind".to_string())
-                .or_insert_with(|| json!(legacy_kind.clone()));
             object
                 .entry("legacy_kind".to_string())
                 .or_insert_with(|| json!(legacy_kind.clone()));
@@ -906,7 +836,7 @@ fn agent_chat_session_sync_messages_value(
 }
 
 fn agent_chat_session_sync_message_id(message: &Value, index: usize) -> String {
-    cloud_mcp_payload_text(message, &["id", "message_id", "messageId"])
+    cloud_mcp_payload_text(message, &["id", "message_id"])
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| format!("message-{index}"))
 }
@@ -950,7 +880,7 @@ fn agent_chat_session_sync_strip_turn_diff_message_patches(message: &Value) -> V
 }
 
 fn agent_chat_session_sync_message_turn_id(message: &Value) -> String {
-    cloud_mcp_payload_text(message, &["turnId", "turn_id"])
+    cloud_mcp_payload_text(message, &["turn_id"])
         .unwrap_or_default()
         .trim()
         .to_string()
@@ -1040,10 +970,9 @@ fn agent_chat_session_sync_flush_activity_group(items: &mut Vec<Value>, group: &
     items.push(json!({
         "id": format!("activity-group-{first_id}-{last_id}"),
         "type": "activity-group",
-        "itemType": "activityGroup",
+        "item_type": "activityGroup",
         "title": title,
         "status": status,
-        "turnId": turn_id.as_str(),
         "turn_id": turn_id.as_str(),
         "messages": messages,
     }));
@@ -1072,8 +1001,7 @@ fn agent_chat_session_sync_flush_assistant_block(
     items.push(json!({
         "id": id,
         "type": "assistant-block",
-        "itemType": "assistantBlock",
-        "turnId": turn_id.as_str(),
+        "item_type": "assistantBlock",
         "turn_id": turn_id.as_str(),
         "items": child_items,
     }));
@@ -1082,7 +1010,7 @@ fn agent_chat_session_sync_flush_assistant_block(
 }
 
 fn agent_chat_session_sync_thread_detail_legacy_kind(message: &Value) -> String {
-    if let Some(kind) = cloud_mcp_payload_text(message, &["legacyKind", "legacy_kind"])
+    if let Some(kind) = cloud_mcp_payload_text(message, &["legacy_kind"])
         .filter(|value| !value.trim().is_empty())
     {
         if agent_chat_session_sync_normalize_kind_token(&kind) == "turn_summary" {
@@ -1112,7 +1040,6 @@ fn agent_chat_session_sync_thread_detail_message(message: &Value) -> Value {
     let canonical_kind = agent_chat_session_sync_message_kind(&message);
     let legacy_kind = agent_chat_session_sync_thread_detail_legacy_kind(&message);
     if let Some(object) = message.as_object_mut() {
-        object.insert("canonicalKind".to_string(), json!(canonical_kind.clone()));
         object.insert("canonical_kind".to_string(), json!(canonical_kind));
         object.insert("kind".to_string(), json!(legacy_kind));
     }
@@ -1122,7 +1049,6 @@ fn agent_chat_session_sync_thread_detail_message(message: &Value) -> Value {
 fn agent_chat_session_sync_file_change_value(message: &Value) -> Option<&Value> {
     message
         .get("file_change")
-        .or_else(|| message.get("fileChange"))
         .filter(|value| value.is_object())
 }
 
@@ -1193,13 +1119,10 @@ fn agent_chat_session_sync_thread_detail_diff_summaries(
         let summary = cloud_mcp_payload_text(file_change, &["summary"]).unwrap_or_default();
         summaries.push(json!({
             "id": format!("diff-summary-{message_id}"),
-            "messageId": message_id.as_str(),
             "message_id": message_id.as_str(),
-            "turnId": turn_id.as_str(),
             "turn_id": turn_id.as_str(),
             "summary": summary,
             "files": files,
-            "fileCount": files.len(),
             "file_count": files.len(),
             "additions": additions,
             "deletions": deletions,
@@ -1209,10 +1132,10 @@ fn agent_chat_session_sync_thread_detail_diff_summaries(
 }
 
 fn agent_chat_session_sync_turn_summary_window_ms(message: &Value) -> Option<(i64, i64)> {
-    let started_at_ms = cloud_mcp_payload_text(message, &["started_at", "startedAt"])
+    let started_at_ms = cloud_mcp_payload_text(message, &["started_at"])
         .as_deref()
         .and_then(agent_chat_session_sync_timestamp_ms)?;
-    let completed_at_ms = cloud_mcp_payload_text(message, &["completed_at", "completedAt"])
+    let completed_at_ms = cloud_mcp_payload_text(message, &["completed_at"])
         .as_deref()
         .and_then(agent_chat_session_sync_timestamp_ms)?;
     Some((started_at_ms, completed_at_ms))
@@ -1240,12 +1163,11 @@ fn agent_chat_session_sync_usage_value(message: &Value) -> Option<&Value> {
     message
         .get("usage")
         .or_else(|| message.get("token_usage"))
-        .or_else(|| message.get("tokenUsage"))
         .filter(|value| value.is_object())
 }
 
 fn agent_chat_session_sync_message_created_at(message: &Value) -> String {
-    cloud_mcp_payload_text(message, &["created_at", "createdAt", "timestamp"]).unwrap_or_default()
+    cloud_mcp_payload_text(message, &["created_at", "timestamp"]).unwrap_or_default()
 }
 
 fn agent_chat_session_sync_message_created_at_ms(message: &Value) -> Option<i64> {
@@ -1357,37 +1279,19 @@ fn agent_chat_session_sync_add_f64(target: &mut Option<f64>, value: f64) {
 
 impl AgentChatSessionSyncUsageTotals {
     fn add_usage(&mut self, usage: &Value) {
-        if let Some(value) = agent_chat_session_sync_usage_i64(
-            usage
-                .get("input_tokens")
-                .or_else(|| usage.get("inputTokens")),
-        ) {
+        if let Some(value) = agent_chat_session_sync_usage_i64(usage.get("input_tokens")) {
             agent_chat_session_sync_add_i64(&mut self.input_tokens, value);
         }
-        if let Some(value) = agent_chat_session_sync_usage_i64(
-            usage
-                .get("output_tokens")
-                .or_else(|| usage.get("outputTokens")),
-        ) {
+        if let Some(value) = agent_chat_session_sync_usage_i64(usage.get("output_tokens")) {
             agent_chat_session_sync_add_i64(&mut self.output_tokens, value);
         }
-        if let Some(value) = agent_chat_session_sync_usage_i64(
-            usage
-                .get("cache_read_tokens")
-                .or_else(|| usage.get("cacheReadTokens")),
-        ) {
+        if let Some(value) = agent_chat_session_sync_usage_i64(usage.get("cache_read_tokens")) {
             agent_chat_session_sync_add_i64(&mut self.cache_read_tokens, value);
         }
-        if let Some(value) = agent_chat_session_sync_usage_i64(
-            usage
-                .get("cache_write_tokens")
-                .or_else(|| usage.get("cacheWriteTokens")),
-        ) {
+        if let Some(value) = agent_chat_session_sync_usage_i64(usage.get("cache_write_tokens")) {
             agent_chat_session_sync_add_i64(&mut self.cache_write_tokens, value);
         }
-        if let Some(value) = agent_chat_session_sync_usage_f64(
-            usage.get("cost_usd").or_else(|| usage.get("costUsd")),
-        ) {
+        if let Some(value) = agent_chat_session_sync_usage_f64(usage.get("cost_usd")) {
             agent_chat_session_sync_add_f64(&mut self.cost_usd, value);
         }
     }
@@ -1463,10 +1367,9 @@ fn agent_chat_session_sync_usage_is_cumulative(usage: &Value) -> bool {
     usage
         .get("cumulative")
         .or_else(|| usage.get("is_cumulative"))
-        .or_else(|| usage.get("isCumulative"))
         .and_then(Value::as_bool)
         .unwrap_or(false)
-        || cloud_mcp_payload_text(usage, &["usage_kind", "usageKind"])
+        || cloud_mcp_payload_text(usage, &["usage_kind"])
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("cumulative"))
 }
 
@@ -1696,9 +1599,8 @@ fn agent_chat_session_sync_thread_detail_with_options(
             assistant_block_items.push(json!({
                 "id": message_id.as_str(),
                 "type": "message",
-                "itemType": "message",
+                "item_type": "message",
                 "role": role.as_str(),
-                "turnId": turn_id.as_str(),
                 "turn_id": turn_id.as_str(),
                 "message": message,
             }));
@@ -1718,9 +1620,8 @@ fn agent_chat_session_sync_thread_detail_with_options(
         items.push(json!({
             "id": message_id.as_str(),
             "type": "message",
-            "itemType": "message",
+            "item_type": "message",
             "role": role.as_str(),
-            "turnId": turn_id.as_str(),
             "turn_id": turn_id.as_str(),
             "message": message,
         }));
@@ -1735,45 +1636,28 @@ fn agent_chat_session_sync_thread_detail_with_options(
 
     json!({
         "contract": "diffforge.thread_detail_view.v1",
-        "schemaVersion": 1,
         "schema_version": 1,
         "provider": source.provider.as_str(),
-        "sessionId": source.session_id.as_str(),
         "session_id": source.session_id.as_str(),
-        "providerSessionId": source.session_id.as_str(),
         "provider_session_id": source.session_id.as_str(),
         "title": source.title.as_str(),
         "cwd": source.cwd.as_str(),
-        "workspaceId": context.workspace_id.as_str(),
         "workspace_id": context.workspace_id.as_str(),
-        "workspaceName": context.workspace_name.as_str(),
         "workspace_name": context.workspace_name.as_str(),
-        "threadId": context.thread_id.as_str(),
         "thread_id": context.thread_id.as_str(),
-        "paneId": context.pane_id.as_str(),
         "pane_id": context.pane_id.as_str(),
-        "modelId": model_id,
         "model_id": model_id,
-        "modelConfig": model_config,
         "model_config": model_config,
-        "latestTimestamp": source.latest_timestamp.as_str(),
         "latest_timestamp": source.latest_timestamp.as_str(),
         "messages": thread_detail_messages.clone(),
         "items": items,
-        "diffSummaries": diff_summaries.clone(),
         "diff_summaries": diff_summaries,
         "stats": {
-            "messageCount": thread_detail_messages.len(),
             "message_count": thread_detail_messages.len(),
-            "userCount": user_count,
             "user_count": user_count,
-            "assistantCount": assistant_count,
             "assistant_count": assistant_count,
-            "activityCount": activity_count,
             "activity_count": activity_count,
-            "artifactCount": artifact_count,
             "artifact_count": artifact_count,
-            "fileCount": file_count,
             "file_count": file_count,
             "additions": additions,
             "deletions": deletions,
@@ -1836,15 +1720,10 @@ fn agent_chat_session_sync_model_config_from_direct_fields(
         }
     };
     json!({
-        "modelId": model_id,
         "model_id": model_id,
-        "modelSource": model_source,
         "model_source": model_source,
-        "reasoningEffort": reasoning_effort,
         "reasoning_effort": reasoning_effort,
-        "serviceTier": service_tier,
         "service_tier": service_tier,
-        "speedMode": speed_mode,
         "speed_mode": speed_mode,
     })
 }
@@ -1923,15 +1802,10 @@ fn agent_chat_session_sync_codex_model_config_from_raw(value: &Value) -> Value {
     };
 
     json!({
-        "modelId": model_id,
         "model_id": model_id,
-        "modelSource": model_source,
         "model_source": model_source,
-        "reasoningEffort": reasoning_effort,
         "reasoning_effort": reasoning_effort,
-        "serviceTier": service_tier,
         "service_tier": service_tier,
-        "speedMode": speed_mode,
         "speed_mode": speed_mode,
     })
 }
@@ -1993,24 +1867,23 @@ fn agent_chat_session_sync_merge_authoritative_model_id(model_config: &mut Value
     agent_chat_session_sync_merge_model_config(
         model_config,
         json!({
-            "modelId": model_id,
             "model_id": model_id,
         }),
     );
 }
 
 fn agent_chat_session_sync_latest_model_id(model_config: &Value, fallback: &str) -> String {
-    cloud_mcp_payload_text(model_config, &["model_id", "modelId"])
+    cloud_mcp_payload_text(model_config, &["model_id"])
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| fallback.trim().to_string())
 }
 
 fn agent_chat_session_sync_model_config_fingerprint(model_config: &Value) -> String {
     let model_id =
-        cloud_mcp_payload_text(model_config, &["model_id", "modelId"]).unwrap_or_default();
+        cloud_mcp_payload_text(model_config, &["model_id"]).unwrap_or_default();
     let reasoning_effort = cloud_mcp_payload_text(
         model_config,
-        &["reasoning_effort", "reasoningEffort", "effort"],
+        &["reasoning_effort", "effort"],
     )
     .unwrap_or_default();
     if model_id.trim().is_empty() && reasoning_effort.trim().is_empty() {
@@ -2032,10 +1905,10 @@ fn agent_chat_session_sync_model_config_record(
     timestamp: &str,
     model_config: &Value,
 ) -> Option<Value> {
-    let model_id = cloud_mcp_payload_text(model_config, &["model_id", "modelId"]);
+    let model_id = cloud_mcp_payload_text(model_config, &["model_id"]);
     let reasoning_effort = cloud_mcp_payload_text(
         model_config,
-        &["reasoning_effort", "reasoningEffort", "effort"],
+        &["reasoning_effort", "effort"],
     )
     .map(|value| value.to_ascii_lowercase());
     if model_id.as_deref().unwrap_or_default().trim().is_empty()
@@ -2061,9 +1934,7 @@ fn agent_chat_session_sync_model_config_record(
     };
     let raw = json!({
         "model_id": model_id.clone(),
-        "modelId": model_id.clone(),
         "reasoning_effort": reasoning_effort.clone(),
-        "reasoningEffort": reasoning_effort.clone(),
         "origin": "local",
     });
     let mut record = agent_chat_session_sync_record(
@@ -2073,22 +1944,15 @@ fn agent_chat_session_sync_model_config_record(
         record_key,
         "model_config",
         json!({
-            "lineIndex": line_index,
             "line_index": line_index,
-            "startOffset": start_offset,
             "start_offset": start_offset,
         }),
         timestamp,
         raw,
         Vec::new(),
     )?;
-    record["model_id"] = model_id.clone().map(Value::from).unwrap_or(Value::Null);
-    record["modelId"] = model_id.map(Value::from).unwrap_or(Value::Null);
-    record["reasoning_effort"] = reasoning_effort
-        .clone()
-        .map(Value::from)
-        .unwrap_or(Value::Null);
-    record["reasoningEffort"] = reasoning_effort.map(Value::from).unwrap_or(Value::Null);
+    record["model_id"] = model_id.map(Value::from).unwrap_or(Value::Null);
+    record["reasoning_effort"] = reasoning_effort.map(Value::from).unwrap_or(Value::Null);
     record["origin"] = json!("local");
     Some(record)
 }
@@ -2115,25 +1979,17 @@ fn agent_chat_session_sync_turn_summary_message(
     message.insert("role".to_string(), json!("system"));
     message.insert("kind".to_string(), json!("turn_summary"));
     message.insert("turn_id".to_string(), json!(turn_id));
-    message.insert("turnId".to_string(), json!(turn_id));
     message.insert("started_at".to_string(), json!(summary.started_at.clone()));
-    message.insert("startedAt".to_string(), json!(summary.started_at.clone()));
     message.insert(
         "completed_at".to_string(),
         json!(summary.completed_at.clone()),
     );
-    message.insert(
-        "completedAt".to_string(),
-        json!(summary.completed_at.clone()),
-    );
     if let Some(duration_ms) = summary.duration_ms {
         message.insert("duration_ms".to_string(), json!(duration_ms));
-        message.insert("durationMs".to_string(), json!(duration_ms));
     }
     message.insert("usage".to_string(), usage);
     if let Some(file_change) = summary.file_change.clone().filter(Value::is_object) {
-        message.insert("file_change".to_string(), file_change.clone());
-        message.insert("fileChange".to_string(), file_change);
+        message.insert("file_change".to_string(), file_change);
     }
     agent_chat_session_sync_normalize_message_value(Value::Object(message))
 }
@@ -2157,13 +2013,11 @@ fn agent_chat_session_sync_turn_summary_record(
     let mut raw = summary.raw.clone();
     let computed_usage = message.get("usage").cloned().unwrap_or_else(|| json!({}));
     if let Some(object) = raw.as_object_mut() {
-        object.insert("computed_usage".to_string(), computed_usage.clone());
-        object.insert("computedUsage".to_string(), computed_usage);
+        object.insert("computed_usage".to_string(), computed_usage);
     } else {
         raw = json!({
             "value": raw,
-            "computed_usage": computed_usage.clone(),
-            "computedUsage": computed_usage,
+            "computed_usage": computed_usage,
         });
     }
     agent_chat_session_sync_record(
@@ -2174,9 +2028,7 @@ fn agent_chat_session_sync_turn_summary_record(
         "turn_summary",
         json!({
             "synthetic": true,
-            "sourceKind": "terminal_activity_hook_turn_summary",
             "source_kind": "terminal_activity_hook_turn_summary",
-            "turnKey": turn_key,
             "turn_key": turn_key,
         }),
         timestamp,
@@ -2188,8 +2040,8 @@ fn agent_chat_session_sync_turn_summary_record(
 fn agent_chat_session_sync_turn_diff_started_at(diff: &AgentChatTurnDiffContext) -> String {
     diff.raw
         .get("hook")
-        .and_then(|hook| cloud_mcp_payload_text(hook, &["started_at", "startedAt"]))
-        .or_else(|| cloud_mcp_payload_text(&diff.raw, &["started_at", "startedAt"]))
+        .and_then(|hook| cloud_mcp_payload_text(hook, &["started_at"]))
+        .or_else(|| cloud_mcp_payload_text(&diff.raw, &["started_at"]))
         .unwrap_or_default()
 }
 
@@ -2216,17 +2068,14 @@ fn agent_chat_session_sync_turn_diff_message(
     message.insert("turn_id".to_string(), json!(turn_id));
     let started_at = agent_chat_session_sync_turn_diff_started_at(diff);
     if !started_at.trim().is_empty() {
-        message.insert("started_at".to_string(), json!(started_at.clone()));
-        message.insert("startedAt".to_string(), json!(started_at));
+        message.insert("started_at".to_string(), json!(started_at));
     }
     message.insert("completed_at".to_string(), json!(diff.completed_at.clone()));
-    message.insert("completedAt".to_string(), json!(diff.completed_at.clone()));
     message.insert("files".to_string(), json!(diff.files.clone()));
     message.insert("total_additions".to_string(), json!(diff.total_additions));
     message.insert("total_deletions".to_string(), json!(diff.total_deletions));
     if diff.files_omitted > 0 {
         message.insert("files_omitted".to_string(), json!(diff.files_omitted));
-        message.insert("filesOmitted".to_string(), json!(diff.files_omitted));
     }
     if diff.truncated {
         message.insert("truncated".to_string(), json!(true));
@@ -2534,18 +2383,12 @@ fn agent_chat_session_sync_record(
         return None;
     }
     Some(json!({
-        "recordKey": record_key,
         "record_key": record_key,
-        "recordHash": record_hash,
         "record_hash": record_hash,
-            "recordKind": record_kind,
-            "record_kind": record_kind,
-        "parserSchemaVersion": AGENT_CHAT_SESSION_SYNC_PARSER_SCHEMA_VERSION,
+        "record_kind": record_kind,
         "parser_schema_version": AGENT_CHAT_SESSION_SYNC_PARSER_SCHEMA_VERSION,
-            "sourceCursor": source_cursor,
         "source_cursor": source_cursor,
         "timestamp": timestamp,
-        "createdAt": timestamp,
         "created_at": timestamp,
         "raw": raw,
         "messages": normalized_messages,
@@ -2693,9 +2536,7 @@ fn agent_chat_session_sync_claude_messages_for_line(
     }
     if role == "assistant"
         && claude_stop_reason_completes_turn(&value_string(
-            message
-                .get("stop_reason")
-                .or_else(|| value.get("stop_reason")),
+            message.get("stop_reason"),
         ))
     {
         messages.push(transcript_task_complete_message(
@@ -2965,11 +2806,8 @@ fn agent_chat_session_sync_jsonl_source(
             record_key,
             &record_kind,
             json!({
-                "lineIndex": line_index,
                 "line_index": line_index,
-                "startOffset": start_offset,
                 "start_offset": start_offset,
-                "endOffset": offset,
                 "end_offset": offset,
             }),
             timestamp.clone(),
@@ -3145,7 +2983,6 @@ fn agent_chat_session_sync_opencode_model_config(model: &str) -> Value {
             agent_chat_session_sync_merge_model_config(
                 &mut config,
                 json!({
-                    "modelId": model_id.clone(),
                     "model_id": model_id,
                 }),
             );
@@ -3157,7 +2994,6 @@ fn agent_chat_session_sync_opencode_model_config(model: &str) -> Value {
             agent_chat_session_sync_merge_model_config(
                 &mut config,
                 json!({
-                    "modelId": model_text,
                     "model_id": model_text,
                 }),
             );
@@ -3170,7 +3006,6 @@ fn agent_chat_session_sync_opencode_model_config(model: &str) -> Value {
             agent_chat_session_sync_merge_model_config(
                 &mut config,
                 json!({
-                    "modelSource": model_source.clone(),
                     "model_source": model_source,
                 }),
             );
@@ -3179,7 +3014,6 @@ fn agent_chat_session_sync_opencode_model_config(model: &str) -> Value {
         agent_chat_session_sync_merge_model_config(
             &mut config,
             json!({
-                "modelId": model,
                 "model_id": model,
             }),
         );
@@ -3246,7 +3080,8 @@ fn agent_chat_session_sync_opencode_source(
                     "title": session_title.clone(),
                     "directory": session_cwd.clone(),
                     "time_updated": session_updated_at_ms,
-                    "model": cloud_mcp_payload_text(&model_config, &["model_id", "modelId"]).unwrap_or_default(),
+                    "model": cloud_mcp_payload_text(&model_config, &["model_id"])
+                        .unwrap_or_default(),
                 })
             },
         );
@@ -3260,7 +3095,6 @@ fn agent_chat_session_sync_opencode_source(
         json!({
             "table": "session",
             "id": session_id,
-            "timeCreated": session_updated_at_ms,
             "time_created": session_updated_at_ms,
         }),
         latest_timestamp.clone(),
@@ -3364,7 +3198,6 @@ fn agent_chat_session_sync_opencode_source(
             json!({
                 "table": "message",
                 "id": row.0,
-                "timeCreated": row.1,
                 "time_created": row.1,
             }),
             timestamp,
@@ -3407,9 +3240,7 @@ fn agent_chat_session_sync_opencode_source(
             json!({
                 "table": "part",
                 "id": row.0,
-                "messageId": row.1,
                 "message_id": row.1,
-                "timeCreated": row.2,
                 "time_created": row.2,
             }),
             timestamp,
@@ -3542,8 +3373,8 @@ fn agent_chat_session_sync_record_refs(records: &[Value]) -> Vec<Value> {
         .iter()
         .map(|record| {
             json!({
-                "key": cloud_mcp_payload_text(record, &["record_key", "recordKey"]).unwrap_or_default(),
-                "hash": cloud_mcp_payload_text(record, &["record_hash", "recordHash"]).unwrap_or_default(),
+                "key": cloud_mcp_payload_text(record, &["record_key"]).unwrap_or_default(),
+                "hash": cloud_mcp_payload_text(record, &["record_hash"]).unwrap_or_default(),
             })
         })
         .collect()
@@ -3579,11 +3410,10 @@ fn agent_chat_session_sync_record_chunks(records: Vec<Value>) -> Vec<Vec<Value>>
 
 fn agent_chat_session_sync_record_is_synthetic_turn_summary(record: &Value) -> bool {
     let record_kind = agent_chat_session_sync_normalize_kind_token(
-        &cloud_mcp_payload_text(record, &["record_kind", "recordKind"]).unwrap_or_default(),
+        &cloud_mcp_payload_text(record, &["record_kind"]).unwrap_or_default(),
     );
     let synthetic = record
         .get("source_cursor")
-        .or_else(|| record.get("sourceCursor"))
         .and_then(|cursor| cursor.get("synthetic"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
@@ -3595,11 +3425,10 @@ fn agent_chat_session_sync_record_is_synthetic_turn_artifact(record: &Value) -> 
         return true;
     }
     let record_kind = agent_chat_session_sync_normalize_kind_token(
-        &cloud_mcp_payload_text(record, &["record_kind", "recordKind"]).unwrap_or_default(),
+        &cloud_mcp_payload_text(record, &["record_kind"]).unwrap_or_default(),
     );
     let synthetic = record
         .get("source_cursor")
-        .or_else(|| record.get("sourceCursor"))
         .and_then(|cursor| cursor.get("synthetic"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
@@ -3781,7 +3610,7 @@ fn agent_chat_session_sync_mark_build_failed(
         return;
     }
     let device_profile = cloud_mcp_desktop_device_profile();
-    let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
+    let device_id = cloud_mcp_payload_text(&device_profile, &["device_id"])
         .unwrap_or_else(|| "desktop-primary".to_string());
     let scope_key = cloud_mcp_process_account_scope_key();
     let now = cloud_mcp_now_ms() as i64;
@@ -3815,7 +3644,7 @@ fn agent_chat_session_sync_mark_build_failed(
     cloud_mcp_emit_agent_chat_session_sync_status_changed(
         &json!({
             "scope_key": cloud_mcp_process_account_scope_key(),
-            "device_id": cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"]).unwrap_or_default(),
+            "device_id": cloud_mcp_payload_text(&device_profile, &["device_id"]).unwrap_or_default(),
             "workspace_id": workspace_id,
             "provider": provider,
             "session_id": provider_session_id,
@@ -3835,7 +3664,7 @@ fn agent_chat_session_sync_payloads(
         return Ok(Vec::new());
     };
     let device_profile = cloud_mcp_desktop_device_profile();
-    let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
+    let device_id = cloud_mcp_payload_text(&device_profile, &["device_id"])
         .unwrap_or_else(|| "desktop-primary".to_string());
     let scope_key = cloud_mcp_process_account_scope_key();
     let workspace_id = context.workspace_id.trim().to_string();
@@ -3882,9 +3711,7 @@ fn agent_chat_session_sync_payloads(
         agent_chat_session_sync_merge_model_config(
             &mut model_config,
             json!({
-                "diffForgeModelId": context.model_id.clone(),
                 "diff_forge_model_id": context.model_id.clone(),
-                "modelId": model_id.clone(),
                 "model_id": model_id,
             }),
         );
@@ -3893,7 +3720,6 @@ fn agent_chat_session_sync_payloads(
         agent_chat_session_sync_merge_model_config(
             &mut model_config,
             json!({
-                "diffForgeModelSource": context.model_source.clone(),
                 "diff_forge_model_source": context.model_source.clone(),
             }),
         );
@@ -4018,97 +3844,58 @@ fn agent_chat_session_sync_payloads(
             "m": mode.clone(),
             "mode": mode,
             "v": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_SCHEMA_VERSION,
-            "schemaVersion": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_SCHEMA_VERSION,
             "schema_version": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_SCHEMA_VERSION,
             "pid": idempotency_key.clone(),
-            "idempotency_key": idempotency_key.clone(),
-            "idempotencyKey": idempotency_key,
+            "idempotency_key": idempotency_key,
             "ph": payload_hash.clone(),
-            "payload_hash": payload_hash.clone(),
-            "payloadHash": payload_hash,
-            "content_hash": content_hash.clone(),
-            "contentHash": content_hash,
+            "payload_hash": payload_hash,
+            "content_hash": content_hash,
             "metadata_hash": metadata_hash.clone(),
-            "metadataHash": metadata_hash.clone(),
             "scope_key": scope_key.clone(),
-            "scopeKey": scope_key.clone(),
             "device": device_profile.clone(),
             "device_id": device_id.clone(),
-            "deviceId": device_id.clone(),
             "source": "rust-diffforge",
             "reason": reason,
             "provider": source.provider.clone(),
             "agent_kind": source.provider.clone(),
-            "agentKind": source.provider.clone(),
             "session_id": source.session_id.clone(),
-            "sessionId": source.session_id.clone(),
             "provider_session_id": source.session_id.clone(),
-            "providerSessionId": source.session_id.clone(),
             "source_kind": source.source_kind.clone(),
-            "sourceKind": source.source_kind.clone(),
             "source_path": source.source_path.clone(),
-            "sourcePath": source.source_path.clone(),
             "cwd": source.cwd.clone(),
             "title": source.title.clone(),
             "latest_timestamp": source.latest_timestamp.clone(),
-            "latestTimestamp": source.latest_timestamp.clone(),
             "record_count": record_count,
-            "recordCount": record_count,
             "changed_record_count": changed_record_count,
-            "changedRecordCount": changed_record_count,
             "total_record_count": source.total_record_count,
-            "totalRecordCount": source.total_record_count,
-            "packet_key": packet_key.clone(),
-            "packetKey": packet_key,
+            "packet_key": packet_key,
             "packet_index": packet_index,
-            "packetIndex": packet_index,
             "packet_ordinal": packet_index + 1,
-            "packetOrdinal": packet_index + 1,
             "packet_count": total_packet_count,
-            "packetCount": total_packet_count,
             "packet_record_offset": packet_record_offset,
-            "packetRecordOffset": packet_record_offset,
             "records_remaining": records_remaining,
-            "recordsRemaining": records_remaining,
             "has_more_records": records_remaining > 0,
-            "hasMoreRecords": records_remaining > 0,
             "workspace_id": workspace_id.clone(),
-            "workspaceId": workspace_id.clone(),
             "workspace_name": context.workspace_name.clone(),
-            "workspaceName": context.workspace_name.clone(),
             "thread_id": context.thread_id.clone(),
-            "threadId": context.thread_id.clone(),
             "pane_id": context.pane_id.clone(),
-            "paneId": context.pane_id.clone(),
             "terminal_instance_id": context.terminal_instance_id,
-            "terminalInstanceId": context.terminal_instance_id,
             "terminal_index": context.terminal_index,
-            "terminalIndex": context.terminal_index,
             "session_mode": context.session_mode.clone(),
-            "sessionMode": context.session_mode.clone(),
             "file_authority": context.file_authority.clone(),
-            "fileAuthority": context.file_authority.clone(),
             "coordination_mode": context.coordination_mode.clone(),
-            "coordinationMode": context.coordination_mode.clone(),
             "status": context.status.clone(),
             "context_source": context.source.clone(),
-            "contextSource": context.source.clone(),
             "shared_history_id": context.shared_history_id.clone(),
-            "sharedHistoryId": context.shared_history_id.clone(),
             "fork_from_provider_session_id": context.fork_from_provider_session_id.clone(),
-            "forkFromProviderSessionId": context.fork_from_provider_session_id.clone(),
             "model_id": model_id.clone(),
-            "modelId": model_id.clone(),
             "model_config": model_config.clone(),
-            "modelConfig": model_config.clone(),
             "thread_detail": thread_detail.clone(),
-            "threadDetail": thread_detail.clone(),
             "records": packet_records,
         });
         if context.metadata_only {
             if let Some(object) = payload.as_object_mut() {
                 object.insert("metadata_only".to_string(), json!(true));
-                object.insert("metadataOnly".to_string(), json!(true));
             }
         }
         payloads.push(payload);
@@ -4200,11 +3987,11 @@ fn agent_chat_session_sync_spawn_with_state(
             agent_chat_session_sync_mark_workspace_history_dirty(&context.workspace_id);
             let key = format!(
                 "agent-chat-session:{}:{}:{}:{}",
-                cloud_mcp_payload_text(&payload, &["workspace_id", "workspaceId"])
+                cloud_mcp_payload_text(&payload, &["workspace_id"])
                     .unwrap_or_default(),
                 cloud_mcp_payload_text(&payload, &["provider"]).unwrap_or_default(),
-                cloud_mcp_payload_text(&payload, &["session_id", "sessionId"]).unwrap_or_default(),
-                cloud_mcp_payload_text(&payload, &["packet_key", "packetKey"])
+                cloud_mcp_payload_text(&payload, &["session_id"]).unwrap_or_default(),
+                cloud_mcp_payload_text(&payload, &["packet_key"])
                     .unwrap_or_else(|| "session".to_string())
             );
             cloud_mcp_enqueue_background_sync(
@@ -4762,73 +4549,64 @@ fn agent_chat_session_sync_spawn_from_payload_repair(
     payload: &Value,
     reason: &'static str,
 ) -> bool {
-    let provider = cloud_mcp_payload_text(payload, &["provider", "agent_kind", "agentKind"])
+    let provider = cloud_mcp_payload_text(payload, &["provider", "agent_kind"])
         .unwrap_or_default();
     let provider_session_id = cloud_mcp_payload_text(
         payload,
-        &[
-            "provider_session_id",
-            "providerSessionId",
-            "session_id",
-            "sessionId",
-        ],
+        &["provider_session_id", "session_id"],
     )
     .unwrap_or_default();
     let workspace_id =
-        cloud_mcp_payload_text(payload, &["workspace_id", "workspaceId"]).unwrap_or_default();
+        cloud_mcp_payload_text(payload, &["workspace_id"]).unwrap_or_default();
     if provider.trim().is_empty()
         || provider_session_id.trim().is_empty()
         || workspace_id.trim().is_empty()
     {
         return false;
     }
-    let cwd = cloud_mcp_payload_text(payload, &["cwd", "workspace_root", "workspaceRoot"])
+    let cwd = cloud_mcp_payload_text(payload, &["cwd", "workspace_root"])
         .unwrap_or_default();
     agent_chat_session_sync_mark_workspace_history_dirty(&workspace_id);
     let context = AgentChatSessionSyncContext {
         workspace_id,
-        workspace_name: cloud_mcp_payload_text(payload, &["workspace_name", "workspaceName"])
+        workspace_name: cloud_mcp_payload_text(payload, &["workspace_name"])
             .unwrap_or_default(),
-        thread_id: cloud_mcp_payload_text(payload, &["thread_id", "threadId"]).unwrap_or_default(),
-        pane_id: cloud_mcp_payload_text(payload, &["pane_id", "paneId"]).unwrap_or_default(),
+        thread_id: cloud_mcp_payload_text(payload, &["thread_id"]).unwrap_or_default(),
+        pane_id: cloud_mcp_payload_text(payload, &["pane_id"]).unwrap_or_default(),
         terminal_instance_id: payload
             .get("terminal_instance_id")
-            .or_else(|| payload.get("terminalInstanceId"))
             .and_then(Value::as_u64),
         terminal_index: payload
             .get("terminal_index")
-            .or_else(|| payload.get("terminalIndex"))
             .and_then(|value| {
                 value
                     .as_i64()
                     .or_else(|| value.as_u64().map(|number| number as i64))
             }),
-        model_id: cloud_mcp_payload_text(payload, &["model_id", "modelId", "model"])
+        model_id: cloud_mcp_payload_text(payload, &["model_id", "model"])
             .unwrap_or_default(),
         model_source: String::new(),
-        session_mode: cloud_mcp_payload_text(payload, &["session_mode", "sessionMode"])
+        session_mode: cloud_mcp_payload_text(payload, &["session_mode"])
             .unwrap_or_default(),
-        file_authority: cloud_mcp_payload_text(payload, &["file_authority", "fileAuthority"])
+        file_authority: cloud_mcp_payload_text(payload, &["file_authority"])
             .unwrap_or_default(),
         coordination_mode: cloud_mcp_payload_text(
             payload,
-            &["coordination_mode", "coordinationMode"],
+            &["coordination_mode"],
         )
         .unwrap_or_default(),
         status: "waiting".to_string(),
         source: "agent_chat_ack_repair".to_string(),
         shared_history_id: cloud_mcp_payload_text(
             payload,
-            &["shared_history_id", "sharedHistoryId"],
+            &["shared_history_id"],
         )
         .unwrap_or_default(),
         fork_from_provider_session_id: cloud_mcp_payload_text(
             payload,
             &[
                 "fork_from_provider_session_id",
-                "forkFromProviderSessionId",
                 "fork_from_session_id",
-                "forkFromSessionId",
             ],
         )
         .unwrap_or_default(),
@@ -5061,8 +4839,8 @@ mod agent_chat_session_sync_tests {
                 "source_cursor": { "synthetic": true }
             }),
             json!({
-                "recordKind": "turn_diff",
-                "sourceCursor": { "synthetic": true }
+                "record_kind": "turn_diff",
+                "source_cursor": { "synthetic": true }
             }),
         ];
         assert!(agent_chat_session_sync_record_is_synthetic_turn_artifact(
@@ -5131,7 +4909,7 @@ mod agent_chat_session_sync_tests {
         assert_eq!(message["kind"], json!("tool_call"));
         assert_eq!(message["legacy_kind"], json!("tool_output"));
         assert_eq!(message["status"], json!("error"));
-        assert_eq!(message["toolError"], json!("permission denied"));
+        assert_eq!(message["tool_error"], json!("permission denied"));
         assert_eq!(message["tool"]["status"], json!("failed"));
         assert_eq!(message["tool"]["output"], json!("permission denied"));
         assert_eq!(agent_chat_session_sync_message_status(&message), "error");
@@ -5179,14 +4957,12 @@ mod agent_chat_session_sync_tests {
             created_at: "2026-07-02T00:00:00Z".to_string(),
             source: "codex".to_string(),
             subagent_id: "worker-a".to_string(),
-            subagent: Some(json!({ "subagentId": "worker-a", "title": "Worker" })),
+            subagent: Some(json!({ "subagent_id": "worker-a", "title": "Worker" })),
             artifacts: Vec::new(),
             ..Default::default()
         });
 
-        assert_eq!(message["subagentId"], json!("worker-a"));
         assert_eq!(message["subagent_id"], json!("worker-a"));
-        assert_eq!(message["subagent"]["subagentId"], json!("worker-a"));
         assert_eq!(message["subagent"]["subagent_id"], json!("worker-a"));
     }
 
@@ -5249,7 +5025,7 @@ mod agent_chat_session_sync_tests {
             "session-a",
             "codex:session-a:jsonl:v2:0:0:abc".to_string(),
             "response_item",
-            json!({ "lineIndex": 0 }),
+            json!({ "line_index": 0 }),
             "2026-07-02T00:00:00Z".to_string(),
             json!({ "type": "response_item" }),
             vec![json!({
@@ -5408,7 +5184,6 @@ mod agent_chat_session_sync_tests {
         );
 
         assert_eq!(source.model_id, "gpt-5.5");
-        assert_eq!(source.model_config["modelId"], json!("gpt-5.5"));
         assert_eq!(source.model_config["model_id"], json!("gpt-5.5"));
         assert!(!source.model_config.to_string().contains("seedance_2_0"));
     }
@@ -5448,7 +5223,6 @@ mod agent_chat_session_sync_tests {
         );
 
         assert_eq!(source.model_id, "claude-sonnet-4-5");
-        assert_eq!(source.model_config["modelId"], json!("claude-sonnet-4-5"));
         assert_eq!(source.model_config["model_id"], json!("claude-sonnet-4-5"));
         assert!(!source.model_config.to_string().contains("seedance_2_0"));
     }
@@ -5674,7 +5448,6 @@ mod agent_chat_session_sync_tests {
         assert!(!payloads.is_empty());
         let payload = &payloads[0];
         assert_eq!(payload["workspace_id"], json!(workspace_id));
-        assert_eq!(payload["workspaceId"], json!(workspace_id));
         assert_eq!(payload["provider"], json!("codex"));
         assert_eq!(payload["session_id"], json!(provider_session_id));
         assert_eq!(payload["provider_session_id"], json!(provider_session_id));
@@ -5769,7 +5542,7 @@ mod agent_chat_session_sync_tests {
             "session-a",
             record_key.clone(),
             "response_item",
-            json!({ "lineIndex": 0 }),
+            json!({ "line_index": 0 }),
             "2026-07-02T00:00:00Z".to_string(),
             raw.clone(),
             Vec::new(),
@@ -5787,8 +5560,8 @@ mod agent_chat_session_sync_tests {
         assert_eq!(AGENT_CHAT_SESSION_SYNC_PARSER_SCHEMA_VERSION, 3);
         assert_eq!(AGENT_CHAT_SESSION_SYNC_RECORD_KEY_VERSION, 2);
         assert_eq!(AGENT_CHAT_SESSION_SYNC_RECORD_HASH_SCHEMA_VERSION, 3);
-        assert_eq!(record["parserSchemaVersion"], json!(3));
-        assert_eq!(record["recordHash"], json!(expected_hash));
+        assert_eq!(record["parser_schema_version"], json!(3));
+        assert_eq!(record["record_hash"], json!(expected_hash));
     }
 
     #[test]
@@ -5861,22 +5634,19 @@ mod agent_chat_session_sync_tests {
             json!("turn-summary:codex:session-a:turn-a")
         );
         assert_eq!(
-            record["recordKey"],
+            record["record_key"],
             json!("turn-summary:codex:session-a:turn-a")
         );
-        assert_eq!(record["recordKind"], json!("turn_summary"));
+        assert_eq!(record["record_kind"], json!("turn_summary"));
         assert_eq!(record["source_cursor"]["synthetic"], json!(true));
         assert_eq!(record["source_cursor"]["turn_key"], json!("turn-a"));
-        assert_eq!(record["sourceCursor"]["turnKey"], json!("turn-a"));
         assert_eq!(record["messages"].as_array().unwrap().len(), 1);
         let message = &record["messages"][0];
         assert_eq!(message["id"], json!("turn-summary:codex:session-a:turn-a"));
         assert_eq!(message["role"], json!("system"));
         assert_eq!(message["kind"], json!("turn_summary"));
         assert_eq!(message["turn_id"], json!("turn-a"));
-        assert_eq!(message["turnId"], json!("turn-a"));
         assert_eq!(message["duration_ms"], json!(3000));
-        assert_eq!(message["durationMs"], json!(3000));
         assert_eq!(message["usage"]["input_tokens"], json!(15));
         assert_eq!(message["usage"]["output_tokens"], json!(5));
         assert_eq!(message["usage"]["cache_read_tokens"], json!(2));
@@ -5886,7 +5656,7 @@ mod agent_chat_session_sync_tests {
             json!("src/lib.rs")
         );
         assert_eq!(
-            message["fileChange"]["files"][0]["path"],
+            message["file_change"]["files"][0]["path"],
             json!("src/lib.rs")
         );
         assert_eq!(
@@ -5924,7 +5694,6 @@ mod agent_chat_session_sync_tests {
         )
         .expect("recaptured record");
         assert_eq!(recaptured_record["record_key"], record["record_key"]);
-        assert_eq!(recaptured_record["recordKey"], record["recordKey"]);
         assert_eq!(
             recaptured_record["messages"][0]["id"],
             record["messages"][0]["id"]
@@ -5983,7 +5752,7 @@ mod agent_chat_session_sync_tests {
             record["record_key"],
             json!("turn-diff:codex:session-a:turn-a")
         );
-        assert_eq!(record["recordKind"], json!("turn_diff"));
+        assert_eq!(record["record_kind"], json!("turn_diff"));
         assert_eq!(record["source_cursor"]["synthetic"], json!(true));
         assert_eq!(record["source_cursor"]["turn_key"], json!("turn-a"));
         assert_eq!(record["messages"].as_array().unwrap().len(), 1);
@@ -6389,10 +6158,10 @@ mod agent_chat_session_sync_tests {
                 "turn_id": "turn-a",
                 "created_at": "2026-07-02T00:00:02.000Z",
                 "usage": {
-                    "inputTokens": "6",
-                    "outputTokens": 3,
-                    "cacheWriteTokens": 2,
-                    "costUsd": "0.04"
+                    "input_tokens": "6",
+                    "output_tokens": 3,
+                    "cache_write_tokens": 2,
+                    "cost_usd": "0.04"
                 }
             }),
             json!({
@@ -6561,7 +6330,6 @@ mod agent_chat_session_sync_tests {
             r#"{"id":"glm-5.2","providerID":"opencode-go"}"#,
         );
 
-        assert_eq!(config["modelId"], json!("opencode-go/glm-5.2"));
         assert_eq!(config["model_id"], json!("opencode-go/glm-5.2"));
     }
 
@@ -6588,7 +6356,7 @@ mod agent_chat_session_sync_tests {
                     "id": "assistant-1",
                     "role": "assistant",
                     "text": "hi",
-                    "turnId": "turn-1",
+                    "turn_id": "turn-1",
                 }),
                 json!({
                     "id": "tool-1",
@@ -6596,7 +6364,7 @@ mod agent_chat_session_sync_tests {
                     "kind": "tool_call",
                     "title": "Read file",
                     "text": "src/main.rs",
-                    "turnId": "turn-1",
+                    "turn_id": "turn-1",
                 }),
             ],
             total_record_count: 0,
@@ -6614,7 +6382,7 @@ mod agent_chat_session_sync_tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["type"], "message");
         assert_eq!(items[1]["type"], "assistant-block");
-        assert_eq!(items[1]["turnId"], "turn-1");
+        assert_eq!(items[1]["turn_id"], "turn-1");
         assert_eq!(items[1]["items"][0]["type"], "message");
         assert_eq!(items[1]["items"][1]["type"], "activity-group");
         assert_eq!(items[1]["items"][1]["messages"][0]["id"], "tool-1");
@@ -6663,9 +6431,9 @@ mod agent_chat_session_sync_tests {
             detail["messages"][0]["canonical_kind"],
             json!("file_change")
         );
-        assert_eq!(detail["diffSummaries"][0]["fileCount"], json!(1));
+        assert_eq!(detail["diff_summaries"][0]["file_count"], json!(1));
         assert_eq!(
-            detail["diffSummaries"][0]["files"][0]["path"],
+            detail["diff_summaries"][0]["files"][0]["path"],
             json!("src/lib.rs")
         );
         assert_eq!(detail["stats"]["additions"], json!(2));
@@ -6726,12 +6494,12 @@ mod agent_chat_session_sync_tests {
         let items = detail["items"].as_array().expect("items");
 
         assert_eq!(detail["messages"].as_array().unwrap().len(), 2);
-        assert_eq!(detail["diffSummaries"].as_array().unwrap().len(), 1);
+        assert_eq!(detail["diff_summaries"].as_array().unwrap().len(), 1);
         assert_eq!(
-            detail["diffSummaries"][0]["messageId"],
+            detail["diff_summaries"][0]["message_id"],
             json!("summary-edit")
         );
-        assert_eq!(detail["stats"]["fileCount"], json!(1));
+        assert_eq!(detail["stats"]["file_count"], json!(1));
         assert_eq!(detail["stats"]["additions"], json!(2));
         assert_eq!(detail["stats"]["deletions"], json!(1));
         assert!(!items
@@ -6802,12 +6570,12 @@ mod agent_chat_session_sync_tests {
             .expect("turn diff message");
         assert_eq!(turn_diff["kind"], json!("turn_diff"));
         assert_eq!(turn_diff["canonical_kind"], json!("turn_diff"));
-        assert_eq!(detail["diffSummaries"].as_array().unwrap().len(), 1);
+        assert_eq!(detail["diff_summaries"].as_array().unwrap().len(), 1);
         assert_eq!(
-            detail["diffSummaries"][0]["messageId"],
+            detail["diff_summaries"][0]["message_id"],
             json!("summary-edit")
         );
-        assert_eq!(detail["stats"]["fileCount"], json!(1));
+        assert_eq!(detail["stats"]["file_count"], json!(1));
         assert_eq!(detail["stats"]["additions"], json!(2));
         assert_eq!(detail["stats"]["deletions"], json!(1));
         assert!(detail["stats"]["usage"]["input_tokens"].is_null());

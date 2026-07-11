@@ -3,15 +3,15 @@ export const AGENT_LAUNCH_DEFAULTS_STORAGE_VERSION = 1;
 export const AGENT_LAUNCH_MODEL_OPTIONS = Object.freeze({
   claude: Object.freeze([
     { detail: "Balanced Claude Code default", label: "Sonnet", value: "sonnet" },
-    { detail: "Higher capability Claude model", label: "Opus", speedModes: ["standard", "fast"], value: "opus" },
+    { detail: "Higher capability Claude model", label: "Opus", speed_modes: ["standard", "fast"], value: "opus" },
     { detail: "Lower-latency Claude model", label: "Haiku", value: "haiku" },
     { detail: "Latest Claude alias when available", label: "Fable", value: "fable" },
   ]),
   codex: Object.freeze([
-    { detail: "Latest Codex model", label: "GPT-5.5", speedModes: ["standard", "fast"], thinkingPower: "medium", value: "gpt-5.5" },
-    { detail: "Balanced coding model", label: "GPT-5.4", speedModes: ["standard", "fast"], thinkingPower: "medium", value: "gpt-5.4" },
-    { detail: "Faster lower-cost coding model", label: "GPT-5.4 mini", thinkingPower: "medium", value: "gpt-5.4-mini" },
-    { detail: "Research preview quick coding model", label: "Codex Spark", speed: "fast", thinkingPower: "high", value: "gpt-5.3-codex-spark" },
+    { detail: "Latest Codex model", label: "GPT-5.5", speed_modes: ["standard", "fast"], thinking_power: "medium", value: "gpt-5.5" },
+    { detail: "Balanced coding model", label: "GPT-5.4", speed_modes: ["standard", "fast"], thinking_power: "medium", value: "gpt-5.4" },
+    { detail: "Faster lower-cost coding model", label: "GPT-5.4 mini", thinking_power: "medium", value: "gpt-5.4-mini" },
+    { detail: "Research preview quick coding model", label: "Codex Spark", speed: "fast", thinking_power: "high", value: "gpt-5.3-codex-spark" },
   ]),
   opencode: Object.freeze([
     { detail: "OpenAI model through OpenCode", label: "GPT-5.5", value: "openai/gpt-5.5" },
@@ -97,7 +97,7 @@ export function agentLaunchModelSupportsFast(agentId, model) {
   const normalizedModel = String(model || "").trim().toLowerCase();
   const option = getAgentLaunchModelOption(normalizedAgentId, model);
 
-  if (Array.isArray(option?.speedModes) && option.speedModes.includes("fast")) {
+  if (Array.isArray(option?.speed_modes) && option.speed_modes.includes("fast")) {
     return true;
   }
   if (normalizedAgentId === "codex") {
@@ -144,14 +144,14 @@ export function normalizeAgentLaunchSpeed(agentId, model, speed) {
 export function normalizeAgentLaunchDefault(agentId, value = {}) {
   const normalizedAgentId = normalizeAgentLaunchAgentId(agentId);
   const builtin = BUILTIN_AGENT_LAUNCH_DEFAULTS[normalizedAgentId] || {};
-  const rawModel = value?.model ?? value?.modelId ?? value?.defaultModel ?? "";
+  const rawModel = value?.model ?? value?.model_id ?? value?.defaultModel ?? "";
   const model = cleanAgentLaunchModelId(rawModel, builtin.model || "");
 
   return {
     effort: normalizeAgentLaunchEffort(
       normalizedAgentId,
       model,
-      value?.effort ?? value?.reasoningEffort ?? value?.thinkingPower ?? builtin.effort,
+      value?.effort ?? value?.reasoning_effort ?? value?.thinking_power ?? builtin.effort,
     ),
     model,
     speed: normalizeAgentLaunchSpeed(normalizedAgentId, model, value?.speed ?? builtin.speed),

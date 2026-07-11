@@ -83,7 +83,7 @@ export function logWindowsTerminalDiagnosticEvent(phase, fields = {}, options = 
   }
 
   const cleanPhase = cleanDiagnosticText(phase);
-  const elapsedMs = Number(fields.elapsedMs);
+  const elapsedMs = Number(fields.elapsed_ms);
   if (
     Number.isFinite(options.minElapsedMs)
     && (!Number.isFinite(elapsedMs) || elapsedMs < options.minElapsedMs)

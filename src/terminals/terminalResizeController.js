@@ -334,7 +334,7 @@ export function createTerminalResizeController({
   debounceMs = DEFAULT_DEBOUNCE_MS,
   defaultCols = DEFAULT_COLS,
   defaultRows = DEFAULT_ROWS,
-  instanceId,
+  instance_id: instanceId,
   isPriority,
   isVisible,
   maxCols = DEFAULT_MAX_COLS,
@@ -348,7 +348,7 @@ export function createTerminalResizeController({
   onSchedule,
   onSkip,
   onStart,
-  paneId,
+  pane_id: paneId,
   term,
 } = {}) {
   if (!container || !term || typeof ResizeObserver !== "function") {
@@ -421,7 +421,7 @@ export function createTerminalResizeController({
 
   const getNativeResizeSizeSignature = (request) => (
     request
-      ? `${request.paneId || ""}:${request.instanceId || ""}:${request.cols || 0}x${request.rows || 0}`
+      ? `${request.pane_id || ""}:${request.instance_id || ""}:${request.cols || 0}x${request.rows || 0}`
       : ""
   );
 
@@ -463,14 +463,14 @@ export function createTerminalResizeController({
       &&
       lastNativeAppliedSize?.cols === request.cols
       && lastNativeAppliedSize?.rows === request.rows
-      && lastNativeAppliedSize?.paneId === request.paneId
-      && lastNativeAppliedSize?.instanceId === request.instanceId
+      && lastNativeAppliedSize?.pane_id === request.pane_id
+      && lastNativeAppliedSize?.instance_id === request.instance_id
     ) {
       logNativeResizeCoalescing("skip_duplicate_commit", {
         burstElapsedMs,
         burstId,
         cols: request.cols,
-        paneId: request.paneId || "",
+        pane_id: request.pane_id || "",
         reason,
         rows: request.rows,
       });
@@ -486,7 +486,7 @@ export function createTerminalResizeController({
         invokeStartedAt,
         {
           cols: request.cols,
-          paneId: request.paneId || "",
+          pane_id: request.pane_id || "",
           reason,
           rows: request.rows,
         },
@@ -497,7 +497,7 @@ export function createTerminalResizeController({
         burstId,
         cols: request.cols,
         force,
-        paneId: request.paneId || "",
+        pane_id: request.pane_id || "",
         previousCols: burstStartSize?.cols ?? null,
         previousRows: burstStartSize?.rows ?? null,
         reason,
@@ -505,8 +505,8 @@ export function createTerminalResizeController({
       });
       lastNativeAppliedSize = {
         cols: request.cols,
-        instanceId: request.instanceId,
-        paneId: request.paneId,
+        instance_id: request.instance_id,
+        pane_id: request.pane_id,
         rows: request.rows,
       };
     } catch (error) {
@@ -552,8 +552,8 @@ export function createTerminalResizeController({
       logNativeResizeCoalescing("start", {
         burstId: nativeResizeBurstId,
         cols: request.cols,
-        delayMs: normalizedDelayMs,
-        paneId: request.paneId || "",
+        delay_ms: normalizedDelayMs,
+        pane_id: request.pane_id || "",
         previousCols: nativeResizeBurstStartSize?.cols ?? null,
         previousRows: nativeResizeBurstStartSize?.rows ?? null,
         reason,
@@ -564,8 +564,8 @@ export function createTerminalResizeController({
         burstElapsedMs: nowMs() - nativeResizeBurstStartedAt,
         burstId: nativeResizeBurstId,
         cols: request.cols,
-        delayMs: normalizedDelayMs,
-        paneId: request.paneId || "",
+        delay_ms: normalizedDelayMs,
+        pane_id: request.pane_id || "",
         previousPending: previousPendingSignature,
         reason,
         rows: request.rows,
@@ -597,9 +597,9 @@ export function createTerminalResizeController({
     callSafely(onSchedule, {
       canResize: getCanResize(),
       cols: term.cols,
-      delayMs: normalizedDelayMs,
+      delay_ms: normalizedDelayMs,
       hasDebounceTimer: queuedForResizeFrame,
-      inFlight: nativeInFlight,
+      in_flight: nativeInFlight,
       lastAppliedCols: lastAppliedSize?.cols ?? null,
       lastAppliedRows: lastAppliedSize?.rows ?? null,
       pendingAfterFlight: nativePendingAfterFlight || Boolean(pendingNativeRequest),
@@ -735,7 +735,7 @@ export function createTerminalResizeController({
     ) {
       callSafely(onSkip, {
         ...measurement,
-        inFlight: nativeInFlight,
+        in_flight: nativeInFlight,
         pendingAfterFlight: nativePendingAfterFlight || Boolean(pendingNativeRequest),
         reason,
         skipped: "duplicate_size",
@@ -751,11 +751,11 @@ export function createTerminalResizeController({
     const resolvedInstanceId = getInstanceId();
 
     if (resolvedPaneId) {
-      request.paneId = resolvedPaneId;
+      request.pane_id = resolvedPaneId;
     }
 
     if (resolvedInstanceId) {
-      request.instanceId = resolvedInstanceId;
+      request.instance_id = resolvedInstanceId;
     }
 
     const notifyStart = () => {
@@ -781,7 +781,7 @@ export function createTerminalResizeController({
 
       const atlasFields = {
         cols,
-        paneId: request.paneId || "",
+        pane_id: request.pane_id || "",
         reason,
         rows,
       };
@@ -801,9 +801,9 @@ export function createTerminalResizeController({
           clearedTextureAtlas,
           deferredTextureAtlasClear,
           cols,
-          elapsedMs,
+          elapsed_ms: elapsedMs,
           measureMs,
-          paneId: request.paneId || "",
+          pane_id: request.pane_id || "",
           reason,
           rows,
           termResizeMs,
@@ -816,7 +816,7 @@ export function createTerminalResizeController({
         ...measurement,
         clearedTextureAtlas,
         deferredTextureAtlasClear,
-        elapsedMs: nowMs() - measuredAt,
+        elapsed_ms: nowMs() - measuredAt,
         reason,
       });
       scheduleNativeResize(
@@ -830,7 +830,7 @@ export function createTerminalResizeController({
       callSafely(onError, {
         ...measurement,
         error,
-        elapsedMs: nowMs() - measuredAt,
+        elapsed_ms: nowMs() - measuredAt,
         reason,
       });
       return false;

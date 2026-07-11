@@ -69,16 +69,14 @@ fn orchestrator_pool_key(event: &Value) -> String {
         event,
         &[
             "loop_runtime_run_id",
-            "loopRuntimeRunId",
             "run_id",
-            "runId",
         ],
     );
     if !run_id.is_empty() {
         return format!("run:{run_id}");
     }
     let loopspace_id =
-        orchestrator_pool_event_text(event, &["loopspace_id", "loopspaceId", "loopspace"]);
+        orchestrator_pool_event_text(event, &["loopspace_id", "loopspace"]);
     if !loopspace_id.is_empty() {
         return format!("loopspace:{loopspace_id}");
     }
@@ -95,9 +93,7 @@ fn orchestrator_pool_agent_id(event: &Value) -> String {
         event,
         &[
             "agent_id",
-            "agentId",
             "target_agent_id",
-            "targetAgentId",
             "provider",
         ],
     );
@@ -142,13 +138,9 @@ fn orchestrator_pool_working_directory(event: &Value) -> String {
         event,
         &[
             "workspace_root",
-            "workspaceRoot",
             "repo_path",
-            "repoPath",
             "working_directory",
-            "workingDirectory",
             "root_directory",
-            "rootDirectory",
             "cwd",
         ],
     );
@@ -184,9 +176,7 @@ fn orchestrator_pool_prompt_id(event: &Value) -> String {
         event,
         &[
             "prompt_event_id",
-            "promptEventId",
             "prompt_id",
-            "promptId",
             "id",
         ],
     );
@@ -206,9 +196,7 @@ fn orchestrator_pool_requested_index(event: &Value) -> Option<u16> {
         event,
         &[
             "target_terminal_index",
-            "targetTerminalIndex",
             "terminal_index",
-            "terminalIndex",
         ],
     )
     .or_else(|| {
@@ -216,9 +204,7 @@ fn orchestrator_pool_requested_index(event: &Value) -> Option<u16> {
             event,
             &[
                 "target_terminal_index",
-                "targetTerminalIndex",
                 "terminal_index",
-                "terminalIndex",
             ],
         )
     })
@@ -351,18 +337,16 @@ async fn orchestrator_pool_spawn_entry(
         provider: (!plain_shell).then(|| agent_id.clone()),
         provider_session_id: None,
         fork_from_provider_session_id: None,
-        model: cloud_mcp_remote_command_field_text(event, &["model", "model_id", "modelId"]),
+        model: cloud_mcp_remote_command_field_text(event, &["model", "model_id"]),
         reasoning_effort: cloud_mcp_remote_command_field_text(
             event,
             &[
                 "reasoning_effort",
-                "reasoningEffort",
                 "effort",
                 "thinking_power",
-                "thinkingPower",
             ],
         ),
-        speed: cloud_mcp_remote_command_field_text(event, &["speed", "service_tier", "serviceTier"]),
+        speed: cloud_mcp_remote_command_field_text(event, &["speed", "service_tier"]),
         permission_mode: orchestrator_pool_permission_mode(&agent_id),
         plain_shell: Some(plain_shell),
         fresh_session: Some(false),
@@ -551,15 +535,15 @@ fn orchestrator_pool_result_details(
     queued: bool,
 ) -> Value {
     json!({
-        "agentId": entry.agent_id,
-        "instanceId": entry.instance_id,
-        "paneId": entry.pane_id,
-        "poolKey": pool_key,
-        "promptId": prompt_id,
-        "queuedBehindTurn": queued,
-        "targetThreadId": entry.thread_id,
-        "targetTerminalIndex": entry.terminal_index,
-        "workspaceId": CLOUD_MCP_APP_CONTROL_WORKSPACE_ID,
+        "agent_id": entry.agent_id,
+        "instance_id": entry.instance_id,
+        "pane_id": entry.pane_id,
+        "pool_key": pool_key,
+        "prompt_id": prompt_id,
+        "queued_behind_turn": queued,
+        "target_thread_id": entry.thread_id,
+        "target_terminal_index": entry.terminal_index,
+        "workspace_id": CLOUD_MCP_APP_CONTROL_WORKSPACE_ID,
     })
 }
 
@@ -771,7 +755,7 @@ pub(crate) fn orchestrator_pool_apply_remote_send_lever(
     if !todo_dispatch_remote_command_is_message_intent(event) {
         return false;
     }
-    let workspace_id = cloud_mcp_remote_command_field_text(event, &["workspace_id", "workspaceId"])
+    let workspace_id = cloud_mcp_remote_command_field_text(event, &["workspace_id"])
         .unwrap_or_default();
     if !workspace_id.trim().is_empty() && !cloud_mcp_is_app_control_workspace_id(&workspace_id) {
         return false;
@@ -791,12 +775,12 @@ pub(crate) fn orchestrator_pool_apply_remote_send_lever(
         match orchestrator_pool_deliver(&app, &state, &event).await {
             Ok(details) => {
                 if details
-                    .get("queuedBehindTurn")
+                    .get("queued_behind_turn")
                     .and_then(Value::as_bool)
                     != Some(true)
                 {
                     let entity_id = details
-                        .get("promptId")
+                        .get("prompt_id")
                         .and_then(Value::as_str)
                         .map(str::to_string)
                         .or_else(|| {

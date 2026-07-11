@@ -16,33 +16,26 @@ function cleanVoiceControlText(value, maxLength = 180) {
 
 function normalizeVoiceControlRequest(request = {}) {
   const ownerId = cleanVoiceControlText(
-    request?.ownerId
-      || request?.owner_id
-      || request?.owner
-      || "",
+    request?.owner_id || request?.owner || "",
     120,
   );
   const clientSessionId = cleanVoiceControlText(
-    request?.clientSessionId
-      || request?.client_session_id
-      || "",
+    request?.client_session_id || "",
     180,
   );
   const voiceSessionId = cleanVoiceControlText(
-    request?.voiceSessionId
-      || request?.voice_session_id
-      || "",
+    request?.voice_session_id || "",
     180,
   );
   return {
-    clientSessionId,
-    ownerId,
-    voiceSessionId,
+    client_session_id: clientSessionId,
+    owner_id: ownerId,
+    voice_session_id: voiceSessionId,
   };
 }
 
 export function cloudVoiceAgentEventKind(event) {
-  return String(event?.kind || event?.event_kind || event?.eventKind || event?.type || "").trim();
+  return String(event?.kind || event?.event_kind || event?.type || "").trim();
 }
 
 function cleanVoiceOrchestratorDiagnosticText(value) {
@@ -69,9 +62,9 @@ export function logVoiceOrchestratorDiagnosticEvent(phase, fields = {}) {
 
 export function startCloudVoiceAgentStream(request = {}) {
   logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.start_stream.invoke", {
-    repoId: request?.repoId || request?.repo_id || "",
-    submissionMode: request?.submissionMode || request?.submission_mode || "",
-    workspaceId: request?.workspaceId || request?.workspace_id || "",
+    repo_id: request?.repo_id || "",
+    submission_mode: request?.submission_mode || "",
+    workspace_id: request?.workspace_id || "",
   });
   /* The audio-settings language rides every session start so the cloud can
      speak its "let me think about that" acknowledgement in the user's
@@ -87,9 +80,9 @@ export function startCloudVoiceAgentStream(request = {}) {
     .then((result) => {
       logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.start_stream.ok", {
         active: Boolean(result?.active),
-        repoId: result?.repoId || result?.repo_id || "",
-        sampleRate: result?.sampleRate || result?.sample_rate || null,
-        workspaceId: result?.workspaceId || result?.workspace_id || "",
+        repo_id: result?.repo_id || "",
+        sample_rate: result?.sample_rate || null,
+        workspace_id: result?.workspace_id || "",
       });
       return result;
     })
@@ -196,7 +189,7 @@ export function setCloudVoiceAgentInputEnabled(enabled) {
     .then((result) => {
       logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.input_enabled.ok", {
         enabled: Boolean(result?.enabled),
-        micAttached: Boolean(result?.micAttached || result?.mic_attached),
+        mic_attached: Boolean(result?.mic_attached),
       });
       return result;
     })
@@ -210,10 +203,10 @@ export function setCloudVoiceAgentInputEnabled(enabled) {
 
 export function sendCloudVoiceAgentTextMessage(request = {}) {
   logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.text_message.invoke", {
-    repoId: request?.repoId || request?.repo_id || "",
+    repo_id: request?.repo_id || "",
     textLength: String(request?.text || "").length,
-    turnIndex: request?.turnIndex || request?.turn_index || 0,
-    workspaceId: request?.workspaceId || request?.workspace_id || "",
+    turn_index: request?.turn_index || 0,
+    workspace_id: request?.workspace_id || "",
   });
   return invoke("send_cloud_voice_agent_text_message", { request })
     .then((result) => {
@@ -234,9 +227,9 @@ export function subscribeCloudVoiceAgentEvents(handler) {
     logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.event.received", {
       hasError: Boolean(payload?.error),
       kind: cleanVoiceOrchestratorDiagnosticText(cloudVoiceAgentEventKind(payload)),
-      repoId: payload?.repo_id || payload?.repoId || "",
-      voiceSessionId: payload?.voice_session_id || payload?.voiceSessionId || "",
-      workspaceId: payload?.workspace_id || payload?.workspaceId || "",
+      repo_id: payload?.repo_id || "",
+      voice_session_id: payload?.voice_session_id || "",
+      workspace_id: payload?.workspace_id || "",
     });
     handler(payload);
   }).then((unlisten) => {
@@ -347,7 +340,7 @@ export function createCloudVoiceAgentTtsPlayer({ onError } = {}) {
     }
 
     const audio = event?.audio || {};
-    const sampleRate = normalizeTtsSampleRate(audio.sample_rate ?? audio.sampleRate);
+    const sampleRate = normalizeTtsSampleRate(audio.sample_rate);
     let bytes = base64ToUint8Array(audio.base64);
     if (!bytes.length) {
       return;
@@ -395,8 +388,8 @@ export function createCloudVoiceAgentTtsPlayer({ onError } = {}) {
         if (kind === "voice_agent_tts_start") {
           logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.tts.start", {
             phase: cleanVoiceOrchestratorDiagnosticText(event?.phase || ""),
-            sampleRate: event?.audio?.sample_rate || event?.audio?.sampleRate || null,
-            utteranceId: cleanVoiceOrchestratorDiagnosticText(event?.utterance_id || event?.utteranceId || ""),
+            sample_rate: event?.audio?.sample_rate || null,
+            utterance_id: cleanVoiceOrchestratorDiagnosticText(event?.utterance_id || ""),
           });
           return;
         }
@@ -405,16 +398,13 @@ export function createCloudVoiceAgentTtsPlayer({ onError } = {}) {
           // voice-processing unit (echo-cancelled native output) must not be
           // scheduled a second time here.
           const nativePlayback = Boolean(
-            event?.audio?.native_playback
-              ?? event?.audio?.nativePlayback
-              ?? event?.native_playback
-              ?? event?.nativePlayback,
+            event?.audio?.native_playback ?? event?.native_playback,
           );
           logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.tts.audio", {
             base64Chars: String(event?.audio?.base64 || "").length,
-            nativePlayback,
+            native_playback: nativePlayback,
             phase: cleanVoiceOrchestratorDiagnosticText(event?.phase || ""),
-            utteranceId: cleanVoiceOrchestratorDiagnosticText(event?.utterance_id || event?.utteranceId || ""),
+            utterance_id: cleanVoiceOrchestratorDiagnosticText(event?.utterance_id || ""),
           });
           if (!nativePlayback) {
             await playLinear16Chunk(event);
@@ -424,7 +414,7 @@ export function createCloudVoiceAgentTtsPlayer({ onError } = {}) {
         if (kind === "voice_agent_tts_end") {
           logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.tts.end", {
             phase: cleanVoiceOrchestratorDiagnosticText(event?.phase || ""),
-            utteranceId: cleanVoiceOrchestratorDiagnosticText(event?.utterance_id || event?.utteranceId || ""),
+            utterance_id: cleanVoiceOrchestratorDiagnosticText(event?.utterance_id || ""),
           });
           closeWhenIdle(450);
           return;

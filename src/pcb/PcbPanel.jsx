@@ -1207,10 +1207,10 @@ const PanelMessage = styled.div`
 export default function PcbPanel({
   board,
   embedded = false,
-  repoPath,
-  workspaceId = "",
+  repo_path: repoPath,
+  workspace_id: workspaceId = "",
   defaultTab = "pcb",
-  isActive = false,
+  is_active: isActive = false,
   onActivate,
   onClose,
   onElementPickerChange = null,
@@ -1257,12 +1257,12 @@ export default function PcbPanel({
     code: source || "",
     defaultActiveTab: activeTab,
     defaultTab: activeTab,
-    errorMessage: null,
+    error_message: null,
     errorStack: null,
     fsMap: fsMap || {},
     isRunningCode: false,
     isWebEmbedded: true,
-    projectName: board?.name || boardPath || "PCB",
+    project_name: board?.name || boardPath || "PCB",
     renderLog: null,
     showCodeTab: false,
     showFileMenu: false,
@@ -1417,7 +1417,7 @@ export default function PcbPanel({
     }
     return normalizePcbElementContexts(pickerHeldSelections
       .map((pick) => resolvePcbPickedElementContext(pick, {
-        boardPath,
+        board_path: boardPath,
         boardTitle: board?.name || "",
         circuitJson,
         source,
@@ -1445,7 +1445,7 @@ export default function PcbPanel({
     if (!repoPath || !boardPath) {
       return;
     }
-    invoke("pcb_document_read", { repoPath, boardPath, workspaceId })
+    invoke("pcb_document_read", { repo_path: repoPath, board_path: boardPath, workspace_id: workspaceId })
       .then((doc) => {
         if (readSeqRef.current !== readSeq) {
           return;
@@ -1570,7 +1570,7 @@ export default function PcbPanel({
           return result;
         };
         worker.on("board:renderPhaseStarted", (event) => {
-          const entry = { ...event, createdAt: Date.now() };
+          const entry = { ...event, created_at: Date.now() };
           updateRenderLog((previous) => {
             const eventsProcessed = (previous.eventsProcessed || 0) + 1;
             return {
@@ -1696,8 +1696,8 @@ export default function PcbPanel({
     let cancelled = false;
     listen(PCB_STORE_CHANGED_EVENT, (event) => {
       const paths = event?.payload?.paths;
-      const eventRepo = normalizeRepoIdentity(event?.payload?.repoPath);
-      const eventWorkspace = String(event?.payload?.workspaceId || event?.payload?.workspace_id || "").trim();
+      const eventRepo = normalizeRepoIdentity(event?.payload?.repo_path);
+      const eventWorkspace = String(event?.payload?.workspace_id || "").trim();
       if (eventRepo && eventRepo !== normalizedRepoPath) {
         return;
       }

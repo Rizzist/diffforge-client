@@ -58,17 +58,17 @@ function logFocusEvent(phase, fields = {}) {
     return;
   }
   const sincePointerDownMs = lastPointerDown
-    ? Math.max(0, nowMs() - lastPointerDown.atMs)
+    ? Math.max(0, nowMs() - lastPointerDown.at_ms)
     : -1;
   invoke("terminal_status_log", {
     phase: `frontend.window_focus.${phase}`,
     fields: {
       source: "frontend",
-      documentHasFocus: typeof document !== "undefined" ? document.hasFocus() : null,
-      documentVisibility: typeof document !== "undefined" ? document.visibilityState : "",
-      lastPointerDownTarget: lastPointerDown?.target || "",
-      pointerTrail: pointerTrail.map((entry) => entry.target),
-      sincePointerDownMs,
+      document_has_focus: typeof document !== "undefined" ? document.hasFocus() : null,
+      document_visibility: typeof document !== "undefined" ? document.visibilityState : "",
+      last_pointer_down_target: lastPointerDown?.target || "",
+      pointer_trail: pointerTrail.map((entry) => entry.target),
+      since_pointer_down_ms: sincePointerDownMs,
       ...fields,
     },
   }).catch(() => {});
@@ -87,7 +87,7 @@ function maybeReassertRailFocus() {
   if (!lastPointerDown || !lastPointerDown.target.includes(" rail=workspace:")) {
     return;
   }
-  if (nowMs() - lastPointerDown.atMs > RAIL_REFOCUS_WINDOW_MS) {
+  if (nowMs() - lastPointerDown.at_ms > RAIL_REFOCUS_WINDOW_MS) {
     return;
   }
   if (railRefocusForPointerDown === lastPointerDown) {
@@ -117,7 +117,7 @@ export function installWindowFocusDiagnostics() {
   window.__forgeWindowFocusDiagnosticsInstalled = true;
 
   window.addEventListener("pointerdown", (event) => {
-    const entry = { atMs: nowMs(), target: describeElement(event.target) };
+    const entry = { at_ms: nowMs(), target: describeElement(event.target) };
     lastPointerDown = entry;
     pointerTrail.push(entry);
     if (pointerTrail.length > POINTER_TRAIL_SIZE) {

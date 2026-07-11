@@ -1,12 +1,12 @@
 export function terminalPromptSubmittedPayloadIsAuthoritative(payload = {}) {
-  const promptSource = String(payload?.promptSource || "").trim();
-  const promptMatch = payload?.promptMatch !== false;
+  const promptSource = String(payload?.prompt_source || "").trim();
+  const promptMatch = payload?.prompt_match !== false;
   if (!promptMatch) {
     return false;
   }
 
   if (promptSource === "observed_input_gate") {
-    return String(payload?.observedPrompt || "").trim().length > 0;
+    return String(payload?.observed_prompt || "").trim().length > 0;
   }
 
   if (
@@ -14,7 +14,7 @@ export function terminalPromptSubmittedPayloadIsAuthoritative(payload = {}) {
     || promptSource === "cli_hook_user_prompt_submit"
   ) {
     return String(
-      payload?.prompt || payload?.observedPrompt || payload?.expectedPrompt || "",
+      payload?.prompt || payload?.observed_prompt || payload?.expected_prompt || "",
     ).trim().length > 0;
   }
 

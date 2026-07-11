@@ -65,19 +65,17 @@ const TOP_LEVEL_ALIASES = new Set([
   "version",
   "push",
   "loopspace_overrides",
-  "loopspaceOverrides",
   "updated_at_ms",
-  "updatedAtMs",
 ]);
 
 const PUSH_ALIASES = Object.freeze({
-  uir_prompts: ["uir_prompts", "uirPrompts"],
-  loop_run_started: ["loop_run_started", "loopRunStarted"],
-  loop_run_completed: ["loop_run_completed", "loopRunCompleted"],
-  loop_run_failed: ["loop_run_failed", "loopRunFailed"],
-  loop_run_blocked: ["loop_run_blocked", "loopRunBlocked"],
-  awaiting_device: ["awaiting_device", "awaitingDevice"],
-  account_events: ["account_events", "accountEvents"],
+  uir_prompts: ["uir_prompts"],
+  loop_run_started: ["loop_run_started"],
+  loop_run_completed: ["loop_run_completed"],
+  loop_run_failed: ["loop_run_failed"],
+  loop_run_blocked: ["loop_run_blocked"],
+  awaiting_device: ["awaiting_device"],
+  account_events: ["account_events"],
 });
 
 const PUSH_ALIAS_KEYS = new Set(Object.values(PUSH_ALIASES).flat());
@@ -90,10 +88,7 @@ function objectValue(value) {
 function preferenceSource(value) {
   const source = objectValue(value);
   return objectValue(
-    source.preferences
-      || source.notification_preferences
-      || source.notificationPreferences
-      || source,
+    source.preferences || source.notification_preferences || source,
   );
 }
 
@@ -123,7 +118,7 @@ function readBoolean(source, aliases, fallback) {
 }
 
 function readTimestamp(source) {
-  for (const key of ["updated_at_ms", "updatedAtMs"]) {
+  for (const key of ["updated_at_ms"]) {
     const timestamp = Number(source[key]);
     if (Number.isFinite(timestamp) && timestamp > 0) {
       return Math.round(timestamp);
@@ -177,7 +172,7 @@ export function normalizeNotificationPreferences(value) {
     push[key] = readBoolean(sourcePush, aliases, NOTIFICATION_PREFERENCE_DEFAULT_PUSH[key]);
   });
 
-  const sourceOverrides = objectValue(source.loopspace_overrides || source.loopspaceOverrides);
+  const sourceOverrides = objectValue(source.loopspace_overrides);
   const loopspaceOverrides = {};
   Object.entries(sourceOverrides).forEach(([loopspaceId, rawOverride]) => {
     const safeLoopspaceId = String(loopspaceId || "").trim();
@@ -236,7 +231,7 @@ function loopspaceIdFromPreferenceInventoryEntry(entry) {
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
     return "";
   }
-  return String(entry.id || entry.loopspaceId || entry.loopspace_id || "").trim();
+  return String(entry.id || entry.loopspace_id || "").trim();
 }
 
 export function pruneNotificationPreferenceLoopspaceOverrides(preferences, loopspaces = []) {

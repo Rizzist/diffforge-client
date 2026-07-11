@@ -1712,11 +1712,9 @@ fn workspace_gateway_forward_video_tool(
     })?;
     let mut forwarded_input = input;
     if let Some(object) = forwarded_input.as_object_mut() {
-        object.remove("repoPath");
-        object.remove("repo_path");
-        object.insert("repoPath".to_string(), json!(repo_path));
+        object.insert("repo_path".to_string(), json!(repo_path));
     } else {
-        forwarded_input = json!({ "repoPath": repo_path });
+        forwarded_input = json!({ "repo_path": repo_path });
     }
     let response = crate::app_control_mcp_forward_bridge_request(
         &endpoint,
@@ -1973,13 +1971,13 @@ fn workspace_gateway_builtin_tool_description(tool: &str) -> &'static str {
             "Render composited Video Editor timeline frame(s) as JPEG image content blocks. Use after video_context when visual inspection is needed; structuredContent.warnings reports any fidelity omissions."
         }
         "video_media" => {
-            "List, search, import, annotate, and organize Video Editor media. Search returns filename matches plus transcript moments and image annotation matches. Image assets carry annotations (blurb/description/tags/ocrText) — list/search rows include the blurb; use action annotation to read the full record and action annotate to write one yourself after viewing the image (free, no cloud call). Consult annotations plus width/height when picking stills for timeline slot-in, motion presets, or hyperframes compositions."
+            "List, search, import, annotate, and organize Video Editor media. Search returns filename matches plus transcript moments and image annotation matches. Image assets carry annotations (blurb/description/tags/ocr_text) — list/search rows include the blurb; use action annotation to read the full record and action annotate to write one yourself after viewing the image (free, no cloud call). Consult annotations plus width/height when picking stills for timeline slot-in, motion presets, or hyperframes compositions."
         }
         "video_generate" => {
-            "List models, start, poll, or cancel media generation. Every start returns jobId+plannedPaths — when the output is destined for the timeline, IMMEDIATELY video_edit addClip plannedPaths[0] so the user sees a generating placeholder clip (it is sized from params.durationSec and swaps to the real media when the job lands; a failed job removes it). Cloud models cover video/image/audio; model \"hyperframes\" (kind code) renders an HTML composition locally: start scaffolds media/code/<slug>/index.html and also returns sourcePath, author the HTML per its AGENTS.md, then action render with that jobId; re-render by starting a new job with sourcePath."
+            "List models, start, poll, or cancel media generation. Every start returns job_id+planned_paths — when the output is destined for the timeline, IMMEDIATELY video_edit addClip planned_paths[0] so the user sees a generating placeholder clip (it is sized from params.duration_sec and swaps to the real media when the job lands; a failed job removes it). Cloud models cover video/image/audio; model \"hyperframes\" (kind code) renders an HTML composition locally: start scaffolds media/code/<slug>/index.html and also returns source_path, author the HTML per its AGENTS.md, then action render with that job_id; re-render by starting a new job with source_path."
         }
         "video_export" => {
-            "Start full or draft Video Editor exports and poll progress. start returns jobId; poll status."
+            "Start full or draft Video Editor exports and poll progress. start returns job_id; poll status."
         }
         _ => "Workspace MCP gateway tool.",
     }
@@ -2106,13 +2104,13 @@ fn workspace_gateway_builtin_tool_input_schema(tool: &str) -> Value {
         "video_edit" => json!({
             "type": "object",
             "properties": {
-                "projectPath": {"type": "string"},
+                "project_path": {"type": "string"},
                 "ops": {
                     "type": "array",
                     "items": {"type": "object", "additionalProperties": true},
-                    "description": "Required edit ops: split, trim, move, remove, rippleDeleteRange, removeWords, removeSilences {assetPath?,noiseDb?,minMs?}, addClip, addText, addCaptions, addTransition {trackId,afterClipId,kind,durationMs}, removeTransition {transitionId}, setProps. setProps patch supports speed, gain, transform, motion, fx, crop, text words/anim/animOpts, and kf {x|y|scale|opacity:[{atMs,value,easing}]}; easing is linear|hold|smooth|ease-in|ease-out|ease-in-out. Word/keyframe times are clip-relative. removeSilences is transactional and returns effectiveRanges."
+                    "description": "Required edit ops: split, trim, move, remove, rippleDeleteRange, removeWords, removeSilences {asset_path?,noise_db?,min_ms?}, addClip, addText, addCaptions, addTransition {track_id,after_clip_id,kind,duration_ms}, removeTransition {transition_id}, setProps. setProps patch supports speed, gain, transform, motion, fx, crop, text words/anim/anim_opts, and kf {x|y|scale|opacity:[{at_ms,value,easing}]}; easing is linear|hold|smooth|ease-in|ease-out|ease-in-out. Word/keyframe times are clip-relative. removeSilences is transactional and returns effective_ranges."
                 },
-                "includePipe": {"type": "boolean"}
+                "include_pipe": {"type": "boolean"}
             },
             "required": ["ops"],
             "additionalProperties": true
@@ -2120,10 +2118,10 @@ fn workspace_gateway_builtin_tool_input_schema(tool: &str) -> Value {
         "video_look" => json!({
             "type": "object",
             "properties": {
-                "repoPath": {"type": "string"},
-                "projectPath": {"type": "string"},
-                "atMs": {"type": "integer", "minimum": 0},
-                "timesMs": {
+                "repo_path": {"type": "string"},
+                "project_path": {"type": "string"},
+                "at_ms": {"type": "integer", "minimum": 0},
+                "times_ms": {
                     "type": "array",
                     "items": {"type": "integer", "minimum": 0},
                     "description": "Timeline timestamps to render. More than 6 are clamped to the first 6."
@@ -2131,29 +2129,29 @@ fn workspace_gateway_builtin_tool_input_schema(tool: &str) -> Value {
                 "range": {
                     "type": "object",
                     "properties": {
-                        "startMs": {"type": "integer", "minimum": 0},
-                        "endMs": {"type": "integer", "minimum": 0},
+                        "start_ms": {"type": "integer", "minimum": 0},
+                        "end_ms": {"type": "integer", "minimum": 0},
                         "frames": {"type": "integer", "minimum": 2, "maximum": 6}
                     },
-                    "required": ["startMs", "endMs"],
+                    "required": ["start_ms", "end_ms"],
                     "additionalProperties": true
                 }
             },
-            "description": "Pass exactly one of atMs, timesMs, or range. range spreads frames evenly and video_look clamps output to 6 JPEG frames.",
+            "description": "Pass exactly one of at_ms, times_ms, or range. range spreads frames evenly and video_look clamps output to 6 JPEG frames.",
             "additionalProperties": true
         }),
         "video_media" => json!({
             "type": "object",
             "properties": {
-                "repoPath": {"type": "string"},
+                "repo_path": {"type": "string"},
                 "action": {
                     "type": "string",
                     "enum": ["list", "search", "import", "folders", "createFolder", "setFolder", "annotation", "annotate"]
                 },
                 "kind": {"type": "string", "enum": ["video", "audio", "image"]},
-                "folderId": {"type": "string"},
-                "query": {"type": "string", "description": "Required for search. Matches filenames, cached transcript segment text, and image annotation text (blurb/description/tags/ocrText)."},
-                "sourcePaths": {
+                "folder_id": {"type": "string"},
+                "query": {"type": "string", "description": "Required for search. Matches filenames, cached transcript segment text, and image annotation text (blurb/description/tags/ocr_text)."},
+                "source_paths": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Required absolute file paths for import."
@@ -2167,8 +2165,8 @@ fn workspace_gateway_builtin_tool_input_schema(tool: &str) -> Value {
                         "blurb": {"type": "string", "description": "One sentence, what the image shows (<=280 chars)."},
                         "description": {"type": "string", "description": "2-4 sentences: subjects, setting, composition, mood."},
                         "tags": {"type": "array", "items": {"type": "string"}},
-                        "dominantColors": {"type": "array", "items": {"type": "string"}},
-                        "ocrText": {"type": "string", "description": "Legible text visible in the image."}
+                        "dominant_colors": {"type": "array", "items": {"type": "string"}},
+                        "ocr_text": {"type": "string", "description": "Legible text visible in the image."}
                     },
                     "additionalProperties": true
                 }
@@ -2179,48 +2177,48 @@ fn workspace_gateway_builtin_tool_input_schema(tool: &str) -> Value {
         "video_generate" => json!({
             "type": "object",
             "properties": {
-                "repoPath": {"type": "string"},
+                "repo_path": {"type": "string"},
                 "action": {"type": "string", "enum": ["models", "start", "render", "status", "cancel"]},
                 "kind": {"type": "string", "enum": ["video", "image", "audio", "code"]},
                 "model": {"type": "string", "description": "Cloud jobType id from models, or \"hyperframes\" for local HTML code render."},
                 "prompt": {"type": "string"},
                 "mode": {"type": "string"},
-                "inputAssetPaths": {"type": "array", "items": {"type": "string"}},
-                "audioAssetPaths": {"type": "array", "items": {"type": "string"}},
+                "input_asset_paths": {"type": "array", "items": {"type": "string"}},
+                "audio_asset_paths": {"type": "array", "items": {"type": "string"}},
                 "params": {"type": "object", "additionalProperties": true},
-                "jobId": {"type": "string", "description": "Required for render/cancel; optional filter for status."},
+                "job_id": {"type": "string", "description": "Required for render/cancel; optional filter for status."},
                 "title": {"type": "string", "description": "hyperframes start: composition title (names the media/code/<slug>/ folder)."},
-                "expectedDurationMs": {"type": "integer", "minimum": 200, "description": "hyperframes start: declared duration for the timeline placeholder before the render lands (default 10000). The composition's data-duration wins once authored."},
+                "expected_duration_ms": {"type": "integer", "minimum": 200, "description": "hyperframes start: declared duration for the timeline placeholder before the render lands (default 10000). The composition's data-duration wins once authored."},
                 "fps": {"type": "integer", "minimum": 1, "maximum": 120, "description": "hyperframes: render fps (default 30)."},
                 "width": {"type": "integer", "description": "hyperframes start: composition width px (default 1920)."},
                 "height": {"type": "integer", "description": "hyperframes start: composition height px (default 1080)."},
                 "quality": {"type": "string", "enum": ["draft", "standard", "high"], "description": "hyperframes render quality (default standard)."},
-                "sourcePath": {"type": "string", "description": "hyperframes start: existing media/code/ composition entry HTML to re-render as a new output instead of scaffolding."}
+                "source_path": {"type": "string", "description": "hyperframes start: existing media/code/ composition entry HTML to re-render as a new output instead of scaffolding."}
             },
             "required": ["action"],
-            "description": "models first. Cloud (video/image/audio): start returns jobId+plannedPaths; addClip plannedPaths[0] right away for a timeline placeholder, then poll status. Local code render (model \"hyperframes\"): start declares the job and scaffolds sourcePath; author the HTML; then action render with jobId; poll status until done.",
+            "description": "models first. Cloud (video/image/audio): start returns job_id+planned_paths; addClip planned_paths[0] right away for a timeline placeholder, then poll status. Local code render (model \"hyperframes\"): start declares the job and scaffolds source_path; author the HTML; then action render with job_id; poll status until done.",
             "additionalProperties": true
         }),
         "video_export" => json!({
             "type": "object",
             "properties": {
-                "repoPath": {"type": "string"},
-                "projectPath": {"type": "string"},
+                "repo_path": {"type": "string"},
+                "project_path": {"type": "string"},
                 "action": {"type": "string", "enum": ["export", "draft", "status"]},
                 "range": {
                     "type": "object",
                     "properties": {
-                        "startMs": {"type": "integer", "minimum": 0},
-                        "endMs": {"type": "integer", "minimum": 0}
+                        "start_ms": {"type": "integer", "minimum": 0},
+                        "end_ms": {"type": "integer", "minimum": 0}
                     },
-                    "required": ["startMs", "endMs"],
+                    "required": ["start_ms", "end_ms"],
                     "additionalProperties": true
                 },
                 "resolution": {"type": "string", "enum": ["480p", "720p", "1080p", "source"]},
-                "jobId": {"type": "string"}
+                "job_id": {"type": "string"}
             },
             "required": ["action"],
-            "description": "export starts a full render; draft requires range and forces 480p. start returns jobId; poll status.",
+            "description": "export starts a full render; draft requires range and forces 480p. start returns job_id; poll status.",
             "additionalProperties": true
         }),
         "video_transcribe" => json!({
@@ -2229,8 +2227,8 @@ fn workspace_gateway_builtin_tool_input_schema(tool: &str) -> Value {
                 "paths": {"type": "array", "items": {"type": "string"}},
                 "scope": {"type": "string", "description": "Use selection to transcribe media clips under the current selected ranges."},
                 "wait": {"type": "boolean", "description": "Defaults true."},
-                "fromMs": {"type": "integer", "minimum": 0},
-                "toMs": {"type": "integer", "minimum": 0}
+                "from_ms": {"type": "integer", "minimum": 0},
+                "to_ms": {"type": "integer", "minimum": 0}
             },
             "additionalProperties": true
         }),
@@ -4495,7 +4493,7 @@ fn workspace_gateway_video_look_content(value: Value) -> Value {
     if let Some(frames) = value.get("frames").and_then(Value::as_array) {
         for frame in frames {
             let Some(data) = frame
-                .get("b64Jpeg")
+                .get("b64_jpeg")
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|data| !data.is_empty())
@@ -4961,21 +4959,11 @@ fn coordination_tool_input_has_loopspace_runtime(input: &Value) -> bool {
     if loopspace_runtime_context_value(input).is_some() {
         return true;
     }
-    let loopspace_id =
-        loopspace_runtime_field_text(input, &["loopspace_id", "loopspaceId", "loopspaceID"]);
-    let loop_runtime_run_id = loopspace_runtime_field_text(
-        input,
-        &["loop_runtime_run_id", "loopRuntimeRunId", "run_id", "runId"],
-    );
-    let loop_runtime_node_id = loopspace_runtime_field_text(
-        input,
-        &[
-            "loop_runtime_node_id",
-            "loopRuntimeNodeId",
-            "node_id",
-            "nodeId",
-        ],
-    );
+    let loopspace_id = loopspace_runtime_field_text(input, &["loopspace_id"]);
+    let loop_runtime_run_id =
+        loopspace_runtime_field_text(input, &["loop_runtime_run_id", "run_id"]);
+    let loop_runtime_node_id =
+        loopspace_runtime_field_text(input, &["loop_runtime_node_id", "node_id"]);
     loopspace_id.is_some() && loop_runtime_run_id.is_some() && loop_runtime_node_id.is_some()
 }
 
@@ -5075,7 +5063,6 @@ fn kernel_pcb_drc(kernel: &CoordinationKernel, input: &Value) -> Result<Value, S
     let repo_path = coordination_tool_repo_path(kernel, input);
     let board_path = input["board_path"]
         .as_str()
-        .or_else(|| input["boardPath"].as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
@@ -5322,10 +5309,8 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         .filter(|value| !value.trim().is_empty());
     let local_task_hint = existing_local_task_id_for_start(kernel, task_id, session_id)?;
     let task_title = requested_title.map(str::to_string);
-    let loop_runtime_run_id = loopspace_runtime_field_text(
-        input,
-        &["loop_runtime_run_id", "loopRuntimeRunId", "run_id", "runId"],
-    );
+    let loop_runtime_run_id =
+        loopspace_runtime_field_text(input, &["loop_runtime_run_id", "run_id"]);
 
     if let (Some(agent_id), Some(session_id)) = (agent_id, session_id) {
         if !session_is_active_for_agent(kernel, session_id, agent_id)? {
@@ -5560,81 +5545,50 @@ fn value_has_content(value: &Value) -> bool {
 }
 
 fn cloud_start_task_source_refs(response: &Value) -> Value {
-    let todo_id = cloud_start_task_source_ref_text(
-        response,
-        &["todo_id", "todoId", "source_todo_id", "sourceTodoId"],
-    );
+    let todo_id =
+        cloud_start_task_source_ref_text(response, &["todo_id", "source_todo_id"]);
     let todo_dispatch_id = cloud_start_task_source_ref_text(
         response,
-        &[
-            "todo_dispatch_id",
-            "todoDispatchId",
-            "source_todo_dispatch_id",
-            "sourceTodoDispatchId",
-        ],
+        &["todo_dispatch_id", "source_todo_dispatch_id"],
     );
     let prompt_event_id = cloud_start_task_source_ref_text(
         response,
-        &[
-            "prompt_event_id",
-            "promptEventId",
-            "source_prompt_event_id",
-            "sourcePromptEventId",
-        ],
+        &["prompt_event_id", "source_prompt_event_id"],
     );
-    let command_id = cloud_start_task_source_ref_text(
-        response,
-        &[
-            "command_id",
-            "commandId",
-            "source_command_id",
-            "sourceCommandId",
-        ],
-    );
+    let command_id =
+        cloud_start_task_source_ref_text(response, &["command_id", "source_command_id"]);
     let mut source = Map::new();
     if let Some(todo_id) = todo_id.as_deref() {
         source.insert("todo_id".to_string(), json!(todo_id));
-        source.insert("todoId".to_string(), json!(todo_id));
     }
     if let Some(todo_dispatch_id) = todo_dispatch_id.as_deref() {
         source.insert("todo_dispatch_id".to_string(), json!(todo_dispatch_id));
-        source.insert("todoDispatchId".to_string(), json!(todo_dispatch_id));
     }
     if let Some(prompt_event_id) = prompt_event_id.as_deref() {
         source.insert("prompt_event_id".to_string(), json!(prompt_event_id));
-        source.insert("promptEventId".to_string(), json!(prompt_event_id));
     }
     if let Some(command_id) = command_id.as_deref() {
         source.insert("command_id".to_string(), json!(command_id));
-        source.insert("commandId".to_string(), json!(command_id));
     }
     let mut refs = Map::new();
     if let Some(todo_id) = todo_id.as_deref() {
         refs.insert("source_todo_id".to_string(), json!(todo_id));
-        refs.insert("sourceTodoId".to_string(), json!(todo_id));
         refs.insert("todo_id".to_string(), json!(todo_id));
-        refs.insert("todoId".to_string(), json!(todo_id));
     }
     if let Some(todo_dispatch_id) = todo_dispatch_id.as_deref() {
         refs.insert(
             "source_todo_dispatch_id".to_string(),
             json!(todo_dispatch_id),
         );
-        refs.insert("sourceTodoDispatchId".to_string(), json!(todo_dispatch_id));
         refs.insert("todo_dispatch_id".to_string(), json!(todo_dispatch_id));
-        refs.insert("todoDispatchId".to_string(), json!(todo_dispatch_id));
     }
     if let Some(prompt_event_id) = prompt_event_id.as_deref() {
         refs.insert("source_prompt_event_id".to_string(), json!(prompt_event_id));
-        refs.insert("sourcePromptEventId".to_string(), json!(prompt_event_id));
         refs.insert("prompt_event_id".to_string(), json!(prompt_event_id));
-        refs.insert("promptEventId".to_string(), json!(prompt_event_id));
     }
     if let Some(command_id) = command_id.as_deref() {
         refs.insert("source_command_id".to_string(), json!(command_id));
-        refs.insert("sourceCommandId".to_string(), json!(command_id));
         refs.insert("command_id".to_string(), json!(command_id));
-        refs.insert("commandId".to_string(), json!(command_id));
     }
     if !source.is_empty() {
         refs.insert("source_todo".to_string(), Value::Object(source));
@@ -5700,7 +5654,7 @@ fn cloud_start_task_metadata_values(response: &Value) -> Vec<Value> {
     ];
     let mut values = Vec::new();
     for container in containers {
-        for key in ["metadata", "metadata_json", "metadataJson"] {
+        for key in ["metadata", "metadata_json"] {
             let Some(value) = container.get(key) else {
                 continue;
             };
@@ -5750,12 +5704,9 @@ fn loopspace_runtime_field_text(source: &Value, keys: &[&str]) -> Option<String>
         "data",
         "task",
         "source_todo",
-        "sourceTodo",
-        "remoteCommand",
         "remote_command",
         "metadata",
         "metadata_json",
-        "metadataJson",
         "arguments",
         "args",
         "details",
@@ -5813,12 +5764,9 @@ fn loopspace_runtime_context_value(source: &Value) -> Option<Value> {
         "data",
         "task",
         "source_todo",
-        "sourceTodo",
-        "remoteCommand",
         "remote_command",
         "metadata",
         "metadata_json",
-        "metadataJson",
         "arguments",
         "args",
         "details",
@@ -5827,7 +5775,7 @@ fn loopspace_runtime_context_value(source: &Value) -> Option<Value> {
         let Some(object) = value.as_object() else {
             continue;
         };
-        for key in ["loopspace_run_context", "loopspaceRunContext"] {
+        for key in ["loopspace_run_context"] {
             if let Some(context) = object.get(key).filter(|value| value.is_object()) {
                 return Some(context.clone());
             }
@@ -6122,7 +6070,7 @@ fn loopspace_df_parse_source(source: &str) -> LoopspaceDfAst {
 }
 
 fn loopspace_df_node_parent_id(node: &LoopspaceDfNode) -> String {
-    loopspace_df_prop(&node.props, &["parent_id", "parentId", "parent"]).unwrap_or_default()
+    loopspace_df_prop(&node.props, &["parent_id", "parent"]).unwrap_or_default()
 }
 
 fn loopspace_df_node_is_step(node: &LoopspaceDfNode) -> bool {
@@ -6206,7 +6154,7 @@ fn loopspace_df_normalize_asset_write_operation(value: Option<String>) -> String
 
 fn loopspace_df_resource_entry(node: &LoopspaceDfNode, resource_kind: &str) -> Value {
     let create_name =
-        loopspace_df_prop(&node.props, &["create_name", "createName", "name"]).unwrap_or_default();
+        loopspace_df_prop(&node.props, &["create_name", "name"]).unwrap_or_default();
     let refs = if resource_kind == "asset" {
         loopspace_df_split_refs(loopspace_df_prop(
             &node.props,
@@ -6221,43 +6169,24 @@ fn loopspace_df_resource_entry(node: &LoopspaceDfNode, resource_kind: &str) -> V
     let operation = match node.kind.as_str() {
         "document_write" => loopspace_df_normalize_document_write_operation(loopspace_df_prop(
             &node.props,
-            &[
-                "operation",
-                "write_operation",
-                "writeOperation",
-                "document_operation",
-                "documentOperation",
-            ],
+            &["operation", "write_operation", "document_operation"],
         )),
         "asset_write" => loopspace_df_normalize_asset_write_operation(loopspace_df_prop(
             &node.props,
-            &[
-                "operation",
-                "write_operation",
-                "writeOperation",
-                "asset_operation",
-                "assetOperation",
-            ],
+            &["operation", "write_operation", "asset_operation"],
         )),
         _ => String::new(),
     };
     let content_template = if node.kind == "document_write" || node.kind == "asset_write" {
         loopspace_df_prop(
             &node.props,
-            &[
-                "content_template",
-                "contentTemplate",
-                "template",
-                "body_template",
-                "bodyTemplate",
-            ],
+            &["content_template", "template", "body_template"],
         )
         .unwrap_or_default()
     } else {
         String::new()
     };
-    let target_mode =
-        loopspace_df_prop(&node.props, &["target_mode", "targetMode"]).unwrap_or_default();
+    let target_mode = loopspace_df_prop(&node.props, &["target_mode"]).unwrap_or_default();
     let label = if !node.label.trim().is_empty() {
         node.label.clone()
     } else if !create_name.trim().is_empty() {
@@ -6268,9 +6197,7 @@ fn loopspace_df_resource_entry(node: &LoopspaceDfNode, resource_kind: &str) -> V
         "Document".to_string()
     };
     json!({
-        "contentTemplate": content_template,
         "content_template": content_template,
-        "createName": create_name,
         "create_name": create_name,
         "id": node.id,
         "kind": if node.kind.trim().is_empty() { resource_kind } else { node.kind.as_str() },
@@ -6278,7 +6205,6 @@ fn loopspace_df_resource_entry(node: &LoopspaceDfNode, resource_kind: &str) -> V
         "node_id": node.id,
         "operation": operation,
         "refs": refs,
-        "targetMode": target_mode,
         "target_mode": target_mode,
     })
 }
@@ -6408,7 +6334,6 @@ fn loopspace_df_checkpoint_plan(ast: &LoopspaceDfAst, parent_id: &str) -> Vec<Va
             );
             checkpoint.insert("order".to_string(), json!(order));
             if loopspace_df_resource_context_has_content(&resource_context) {
-                checkpoint.insert("resourceContext".to_string(), resource_context.clone());
                 checkpoint.insert("resource_context".to_string(), resource_context);
             }
             Value::Object(checkpoint)
@@ -6461,8 +6386,7 @@ fn loopspace_df_node_summary(node: &LoopspaceDfNode, index: usize) -> Value {
     summary.insert("kind".to_string(), json!(node.kind));
     summary.insert("label".to_string(), json!(node.label));
     if !parent_id.is_empty() {
-        summary.insert("parent_id".to_string(), json!(parent_id.clone()));
-        summary.insert("parentId".to_string(), json!(parent_id));
+        summary.insert("parent_id".to_string(), json!(parent_id));
     }
     if loopspace_df_node_is_step(node) {
         summary.insert(
@@ -6480,116 +6404,44 @@ fn loopspace_df_node_summary(node: &LoopspaceDfNode, index: usize) -> Value {
     }
     if node.kind == "dispatch_todos" {
         let fields: &[(&str, &[&str])] = &[
-            ("device_id", &["device_id", "deviceId"]),
-            ("device_label", &["device_label", "deviceLabel"]),
-            (
-                "dispatch_mode",
-                &[
-                    "dispatch_mode",
-                    "dispatchMode",
-                    "send_mode",
-                    "sendMode",
-                    "mode",
-                ],
-            ),
-            ("enable_wait_ms", &["enable_wait_ms", "enableWaitMs"]),
-            ("model", &["model", "model_id", "modelId"]),
-            ("reasoning_effort", &["reasoning_effort", "reasoningEffort"]),
-            ("speed", &["speed", "service_tier", "serviceTier"]),
-            (
-                "target_agent_id",
-                &["target_agent_id", "targetAgentId", "agent_id", "agentId"],
-            ),
-            (
-                "target_device_id",
-                &[
-                    "target_device_id",
-                    "targetDeviceId",
-                    "device_id",
-                    "deviceId",
-                ],
-            ),
+            ("device_id", &["device_id"]),
+            ("device_label", &["device_label"]),
+            ("dispatch_mode", &["dispatch_mode", "send_mode", "mode"]),
+            ("enable_wait_ms", &["enable_wait_ms"]),
+            ("model", &["model", "model_id"]),
+            ("reasoning_effort", &["reasoning_effort"]),
+            ("speed", &["speed", "service_tier"]),
+            ("target_agent_id", &["target_agent_id", "agent_id"]),
+            ("target_device_id", &["target_device_id", "device_id"]),
             (
                 "target_device_label",
-                &[
-                    "target_device_label",
-                    "targetDeviceLabel",
-                    "device_label",
-                    "deviceLabel",
-                ],
+                &["target_device_label", "device_label"],
             ),
             (
                 "target_terminal_id",
-                &[
-                    "target_terminal_id",
-                    "targetTerminalId",
-                    "terminal_id",
-                    "terminalId",
-                    "pane_id",
-                    "paneId",
-                ],
+                &["target_terminal_id", "terminal_id", "pane_id"],
             ),
             (
                 "target_terminal_index",
-                &[
-                    "target_terminal_index",
-                    "targetTerminalIndex",
-                    "terminal_index",
-                    "terminalIndex",
-                ],
+                &["target_terminal_index", "terminal_index"],
             ),
             (
                 "target_terminal_mode",
-                &[
-                    "target_terminal_mode",
-                    "targetTerminalMode",
-                    "terminal_mode",
-                    "terminalMode",
-                ],
+                &["target_terminal_mode", "terminal_mode"],
             ),
             (
                 "target_terminal_name",
-                &[
-                    "target_terminal_name",
-                    "targetTerminalName",
-                    "terminal_name",
-                    "terminalName",
-                ],
+                &["target_terminal_name", "terminal_name"],
             ),
-            (
-                "target_thread_id",
-                &[
-                    "target_thread_id",
-                    "targetThreadId",
-                    "thread_id",
-                    "threadId",
-                ],
-            ),
+            ("target_thread_id", &["target_thread_id", "thread_id"]),
             (
                 "target_workspace_ids",
-                &[
-                    "target_workspace_ids",
-                    "targetWorkspaceIds",
-                    "workspace_ids",
-                    "workspaceIds",
-                    "workspace_id",
-                    "workspaceId",
-                ],
+                &["target_workspace_ids", "workspace_ids", "workspace_id"],
             ),
-            (
-                "todo_batch_id",
-                &["todo_batch_id", "todoBatchId", "batch_id", "batchId"],
-            ),
+            ("todo_batch_id", &["todo_batch_id", "batch_id"]),
             (
                 "todo_lines",
-                &[
-                    "todo_lines",
-                    "todoLines",
-                    "todos",
-                    "items",
-                    "prompt",
-                    "text",
-                ],
+                &["todo_lines", "todos", "items", "prompt", "text"],
             ),
         ];
         for (output_key, aliases) in fields {
@@ -6598,53 +6450,25 @@ fn loopspace_df_node_summary(node: &LoopspaceDfNode, index: usize) -> Value {
     }
     if node.kind == "send_message" {
         let fields: &[(&str, &[&str])] = &[
-            ("device_id", &["device_id", "deviceId"]),
-            ("device_label", &["device_label", "deviceLabel"]),
-            ("model", &["model", "model_id", "modelId"]),
+            ("device_id", &["device_id"]),
+            ("device_label", &["device_label"]),
+            ("model", &["model", "model_id"]),
             ("prompt", &["prompt", "message", "body", "instructions"]),
-            ("reasoning_effort", &["reasoning_effort", "reasoningEffort"]),
-            ("speed", &["speed", "service_tier", "serviceTier"]),
-            (
-                "target_agent_id",
-                &["target_agent_id", "targetAgentId", "agent_id", "agentId"],
-            ),
-            (
-                "target_device_id",
-                &[
-                    "target_device_id",
-                    "targetDeviceId",
-                    "device_id",
-                    "deviceId",
-                ],
-            ),
+            ("reasoning_effort", &["reasoning_effort"]),
+            ("speed", &["speed", "service_tier"]),
+            ("target_agent_id", &["target_agent_id", "agent_id"]),
+            ("target_device_id", &["target_device_id", "device_id"]),
             (
                 "target_device_label",
-                &[
-                    "target_device_label",
-                    "targetDeviceLabel",
-                    "device_label",
-                    "deviceLabel",
-                ],
+                &["target_device_label", "device_label"],
             ),
             (
                 "target_terminal_id",
-                &[
-                    "target_terminal_id",
-                    "targetTerminalId",
-                    "terminal_id",
-                    "terminalId",
-                    "pane_id",
-                    "paneId",
-                ],
+                &["target_terminal_id", "terminal_id", "pane_id"],
             ),
             (
                 "target_terminal_name",
-                &[
-                    "target_terminal_name",
-                    "targetTerminalName",
-                    "terminal_name",
-                    "terminalName",
-                ],
+                &["target_terminal_name", "terminal_name"],
             ),
         ];
         for (output_key, aliases) in fields {
@@ -6670,11 +6494,9 @@ fn loopspace_df_edge_summary(edge: &LoopspaceDfEdge) -> Value {
     json!({
         "branch": edge.label,
         "from": edge.from,
-        "fromPort": edge.from_port,
         "from_port": edge.from_port,
         "id": edge.id,
         "to": edge.to,
-        "toPort": edge.to_port,
         "to_port": edge.to_port,
     })
 }
@@ -6765,16 +6587,12 @@ fn loopspace_df_subloop_context(
         .clone()
         .unwrap_or_else(|| parent_summary.clone());
     Some(json!({
-        "checkpointPlan": checkpoint_plan,
         "checkpoint_plan": checkpoint_plan,
         "current": current,
-        "currentCheckpoint": current_checkpoint,
         "current_checkpoint": current_checkpoint,
         "edges": selected_edges,
-        "nodeCount": selected_nodes.len(),
         "node_count": selected_nodes.len(),
         "nodes": selected_nodes,
-        "parentNode": parent_summary,
         "parent_node": parent_summary,
         "source": "connected_subloop",
     }))
@@ -6796,17 +6614,11 @@ fn loopspace_df_context_error(
             "code": code,
             "message": message,
         },
-        "loopspaceId": loopspace_id.unwrap_or_default(),
         "loopspace_id": loopspace_id.unwrap_or_default(),
-        "loopRuntimeRunId": loop_runtime_run_id.unwrap_or_default(),
         "loop_runtime_run_id": loop_runtime_run_id.unwrap_or_default(),
-        "loopRuntimeNodeId": loop_runtime_node_id.unwrap_or_default(),
         "loop_runtime_node_id": loop_runtime_node_id.unwrap_or_default(),
-        "loopRuntimeEdgeId": loop_runtime_edge_id.unwrap_or_default(),
         "loop_runtime_edge_id": loop_runtime_edge_id.unwrap_or_default(),
-        "triggerId": trigger_id.unwrap_or_default(),
         "trigger_id": trigger_id.unwrap_or_default(),
-        "triggerRunId": trigger_run_id.unwrap_or_default(),
         "trigger_run_id": trigger_run_id.unwrap_or_default(),
     })
 }
@@ -6851,7 +6663,7 @@ fn loopspace_df_run_context_from_source(
             Some(trigger_run_id),
         );
     };
-    let current_checkpoint = subloop["currentCheckpoint"].clone();
+    let current_checkpoint = subloop["current_checkpoint"].clone();
     let parent_summary = loopspace_df_node_summary(parent_node, 0);
     let current_action = if checkpoint_plan.is_empty() {
         parent_summary
@@ -6860,27 +6672,17 @@ fn loopspace_df_run_context_from_source(
     };
     json!({
         "ok": true,
-        "checkpointPlan": checkpoint_plan,
         "checkpoint_plan": checkpoint_plan,
         "current": current_action,
-        "currentAction": current_action,
-        "currentCheckpoint": current_checkpoint,
         "current_action": current_action,
         "current_checkpoint": current_checkpoint,
-        "graphSourceKind": "local_mirror",
         "graph_source_kind": "local_mirror",
-        "instructions": "This Loopspace run context was injected by coordination-kernel.start_task. It is the connected subloop for the current run, not the full graph. The current action is the main Dispatch Todo for direct runs or the first/current child checkpoint for stepped runs. Use the docs/assets resources exactly; for Write docs prepare a draft and save it before marking the checkpoint completed. Work the current checkpoint/action, then call record_loopspace_step_progress and use its nextCheckpoint response to continue.",
-        "loopRuntimeEdgeId": loop_runtime_edge_id,
-        "loopRuntimeNodeId": loop_runtime_node_id,
-        "loopRuntimeRunId": loop_runtime_run_id,
+        "instructions": "This Loopspace run context was injected by coordination-kernel.start_task. It is the connected subloop for the current run, not the full graph. The current action is the main Dispatch Todo for direct runs or the first/current child checkpoint for stepped runs. Use the docs/assets resources exactly; for Write docs prepare a draft and save it before marking the checkpoint completed. Work the current checkpoint/action, then call record_loopspace_step_progress and use its next_checkpoint response to continue.",
         "loop_runtime_edge_id": loop_runtime_edge_id,
         "loop_runtime_node_id": loop_runtime_node_id,
         "loop_runtime_run_id": loop_runtime_run_id,
-        "loopspaceId": loopspace_id,
         "loopspace_id": loopspace_id,
         "subloop": subloop,
-        "triggerId": trigger_id,
-        "triggerRunId": trigger_run_id,
         "trigger_id": trigger_id,
         "trigger_run_id": trigger_run_id,
     })
@@ -6908,31 +6710,12 @@ fn loopspace_df_value_text(value: &Value, keys: &[&str]) -> String {
 
 fn loopspace_df_context_run_values(context: &Value) -> Vec<String> {
     [
-        loopspace_df_value_text(context, &["loopspace_id", "loopspaceId"]),
-        loopspace_df_value_text(
-            context,
-            &["loop_runtime_run_id", "loopRuntimeRunId", "run_id", "runId"],
-        ),
-        loopspace_df_value_text(
-            context,
-            &[
-                "loop_runtime_node_id",
-                "loopRuntimeNodeId",
-                "node_id",
-                "nodeId",
-            ],
-        ),
-        loopspace_df_value_text(
-            context,
-            &[
-                "loop_runtime_edge_id",
-                "loopRuntimeEdgeId",
-                "edge_id",
-                "edgeId",
-            ],
-        ),
-        loopspace_df_value_text(context, &["trigger_id", "triggerId"]),
-        loopspace_df_value_text(context, &["trigger_run_id", "triggerRunId"]),
+        loopspace_df_value_text(context, &["loopspace_id"]),
+        loopspace_df_value_text(context, &["loop_runtime_run_id", "run_id"]),
+        loopspace_df_value_text(context, &["loop_runtime_node_id", "node_id"]),
+        loopspace_df_value_text(context, &["loop_runtime_edge_id", "edge_id"]),
+        loopspace_df_value_text(context, &["trigger_id"]),
+        loopspace_df_value_text(context, &["trigger_run_id"]),
     ]
     .into_iter()
     .filter(|value| !value.is_empty())
@@ -6959,16 +6742,7 @@ fn loopspace_df_compact_resource_name(resource: &Value) -> String {
     }
     let text = loopspace_df_value_text(
         resource,
-        &[
-            "path_key",
-            "pathKey",
-            "create_name",
-            "createName",
-            "label",
-            "title",
-            "name",
-            "id",
-        ],
+        &["path_key", "create_name", "label", "title", "name", "id"],
     );
     if text.is_empty() {
         "resource".to_string()
@@ -6980,15 +6754,14 @@ fn loopspace_df_compact_resource_name(resource: &Value) -> String {
 fn loopspace_df_compact_resource_lines(step_id: &str, checkpoint: &Value) -> Vec<String> {
     let resource_context = checkpoint
         .get("resource_context")
-        .or_else(|| checkpoint.get("resourceContext"))
         .or_else(|| checkpoint.get("resources"))
         .unwrap_or(&Value::Null);
     let mut lines = Vec::new();
     for (keys, tag) in [
-        (&["readable_documents", "readableDocuments"][..], "rd"),
-        (&["writable_documents", "writableDocuments"][..], "wd"),
-        (&["readable_assets", "readableAssets"][..], "ra"),
-        (&["writable_assets", "writableAssets"][..], "wa"),
+        (&["readable_documents"][..], "rd"),
+        (&["writable_documents"][..], "wd"),
+        (&["readable_assets"][..], "ra"),
+        (&["writable_assets"][..], "wa"),
     ] {
         let Some(resources) = keys
             .iter()
@@ -6999,12 +6772,10 @@ fn loopspace_df_compact_resource_lines(step_id: &str, checkpoint: &Value) -> Vec
         for resource in resources {
             let name = loopspace_df_compact_resource_name(resource);
             let operation = loopspace_df_value_text(resource, &["operation", "op"]);
-            let create_name = loopspace_df_value_text(resource, &["create_name", "createName"]);
-            let target_mode = loopspace_df_value_text(resource, &["target_mode", "targetMode"]);
-            let template = loopspace_df_value_text(
-                resource,
-                &["content_template", "contentTemplate", "template"],
-            );
+            let create_name = loopspace_df_value_text(resource, &["create_name"]);
+            let target_mode = loopspace_df_value_text(resource, &["target_mode"]);
+            let template =
+                loopspace_df_value_text(resource, &["content_template", "template"]);
             let mut extras = Vec::new();
             if !operation.is_empty() {
                 extras.push(format!("op={operation}"));
@@ -7097,10 +6868,7 @@ fn loopspace_df_compact_run_context_packet(context: &Value) -> String {
     }
 
     let subloop = context.get("subloop").unwrap_or(&Value::Null);
-    let parent = subloop
-        .get("parentNode")
-        .or_else(|| subloop.get("parent_node"))
-        .unwrap_or(&Value::Null);
+    let parent = subloop.get("parent_node").unwrap_or(&Value::Null);
     if parent.is_object() {
         let id = loopspace_df_value_text(parent, &["id"]);
         let kind = loopspace_df_value_text(parent, &["kind", "type"]);
@@ -7113,23 +6881,13 @@ fn loopspace_df_compact_run_context_packet(context: &Value) -> String {
         if !line.trim().is_empty() {
             lines.push(line);
         }
-        let todo = loopspace_df_value_text(parent, &["todo_lines", "todoLines", "todo", "text"]);
+        let todo = loopspace_df_value_text(parent, &["todo_lines", "todo", "text"]);
         if !todo.is_empty() {
             lines.push(format!("todo: {todo}"));
         }
-        let workspace = loopspace_df_value_text(
-            parent,
-            &[
-                "target_workspace_ids",
-                "targetWorkspaceIds",
-                "workspace_id",
-                "workspaceId",
-            ],
-        );
-        let terminal = loopspace_df_value_text(
-            parent,
-            &["target_terminal_mode", "targetTerminalMode", "terminal"],
-        );
+        let workspace =
+            loopspace_df_value_text(parent, &["target_workspace_ids", "workspace_id"]);
+        let terminal = loopspace_df_value_text(parent, &["target_terminal_mode", "terminal"]);
         let mut target = Vec::new();
         if !workspace.is_empty() {
             target.push(workspace);
@@ -7143,15 +6901,12 @@ fn loopspace_df_compact_run_context_packet(context: &Value) -> String {
     }
 
     let current = context
-        .get("currentAction")
-        .or_else(|| context.get("current_action"))
+        .get("current_action")
         .or_else(|| context.get("current"))
         .unwrap_or(&Value::Null);
     if current.is_object() {
-        let id = loopspace_df_value_text(
-            current,
-            &["id", "step_id", "stepId", "checkpoint_id", "checkpointId"],
-        );
+        let id =
+            loopspace_df_value_text(current, &["id", "step_id", "checkpoint_id"]);
         let kind = loopspace_df_value_text(current, &["kind", "type"]);
         let label = loopspace_df_value_text(current, &["label", "title", "name"]);
         let kind = if kind.is_empty() && !id.is_empty() {
@@ -7176,8 +6931,7 @@ fn loopspace_df_compact_run_context_packet(context: &Value) -> String {
     }
 
     let checkpoints = context
-        .get("checkpointPlan")
-        .or_else(|| context.get("checkpoint_plan"))
+        .get("checkpoint_plan")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
@@ -7186,10 +6940,8 @@ fn loopspace_df_compact_run_context_packet(context: &Value) -> String {
     if !checkpoints.is_empty() {
         lines.push("steps:".to_string());
         for (index, checkpoint) in checkpoints.iter().enumerate() {
-            let mut step_id = loopspace_df_value_text(
-                checkpoint,
-                &["id", "step_id", "stepId", "checkpoint_id", "checkpointId"],
-            );
+            let mut step_id =
+                loopspace_df_value_text(checkpoint, &["id", "step_id", "checkpoint_id"]);
             if step_id.is_empty() {
                 step_id = format!("step_{}", index + 1);
             }
@@ -7200,12 +6952,7 @@ fn loopspace_df_compact_run_context_packet(context: &Value) -> String {
             lines.push(format!("{} {step_id} checkpoint {label}", index + 1));
             if checkpoint
                 .get("resource_context")
-                .or_else(|| checkpoint.get("resourceContext"))
-                .and_then(|resources| {
-                    resources
-                        .get("writable_documents")
-                        .or_else(|| resources.get("writableDocuments"))
-                })
+                .and_then(|resources| resources.get("writable_documents"))
                 .and_then(Value::as_array)
                 .is_some_and(|values| !values.is_empty())
             {
@@ -7242,46 +6989,32 @@ fn start_task_loopspace_run_context_for_agent(input: &Value, cloud: &Value) -> O
     let loop_runtime_run_id = loopspace_runtime_field_text_from_start(
         input,
         cloud,
-        &["loop_runtime_run_id", "loopRuntimeRunId", "run_id", "runId"],
+        &["loop_runtime_run_id", "run_id"],
     )
     .unwrap_or_default();
     let loop_runtime_node_id = loopspace_runtime_field_text_from_start(
         input,
         cloud,
-        &[
-            "loop_runtime_node_id",
-            "loopRuntimeNodeId",
-            "node_id",
-            "nodeId",
-        ],
+        &["loop_runtime_node_id", "node_id"],
     )
     .unwrap_or_default();
     if loop_runtime_run_id.trim().is_empty() && loop_runtime_node_id.trim().is_empty() {
         return None;
     }
 
-    let loopspace_id = loopspace_runtime_field_text_from_start(
-        input,
-        cloud,
-        &["loopspace_id", "loopspaceId", "loopspaceID"],
-    )
-    .unwrap_or_default();
+    let loopspace_id =
+        loopspace_runtime_field_text_from_start(input, cloud, &["loopspace_id"])
+            .unwrap_or_default();
     let loop_runtime_edge_id = loopspace_runtime_field_text_from_start(
         input,
         cloud,
-        &[
-            "loop_runtime_edge_id",
-            "loopRuntimeEdgeId",
-            "edge_id",
-            "edgeId",
-        ],
+        &["loop_runtime_edge_id", "edge_id"],
     )
     .unwrap_or_default();
-    let trigger_id =
-        loopspace_runtime_field_text_from_start(input, cloud, &["trigger_id", "triggerId"])
-            .unwrap_or_default();
+    let trigger_id = loopspace_runtime_field_text_from_start(input, cloud, &["trigger_id"])
+        .unwrap_or_default();
     let trigger_run_id =
-        loopspace_runtime_field_text_from_start(input, cloud, &["trigger_run_id", "triggerRunId"])
+        loopspace_runtime_field_text_from_start(input, cloud, &["trigger_run_id"])
             .unwrap_or_default();
 
     if loopspace_id.trim().is_empty() || loop_runtime_node_id.trim().is_empty() {
@@ -7591,7 +7324,6 @@ fn optional_start_task_text(input: &Value) -> Option<String> {
         "intent",
         "objective",
         "what_i_will_do",
-        "whatIWillDo",
     ]
     .iter()
     .find_map(|key| input.get(*key).and_then(Value::as_str))
@@ -8374,17 +8106,11 @@ fn tool_input_schema(name: &str) -> Value {
                 "task_id": {"type": "string", "description": "Optional existing task_id when continuing a previously started task. Omit this on the first call."},
                 "plan": {"type": "string", "description": "Required short explanation of the edit you are about to make. Do not call start_task for read-only inspection."},
                 "loopspace_id": {"type": "string", "description": "Optional Loopspace id for Dispatch Todo runtime context injection."},
-                "loopspaceId": {"type": "string", "description": "Optional camelCase Loopspace id."},
                 "loop_runtime_run_id": {"type": "string", "description": "Optional Loopspace runtime run id. When present with loopspace_id and loop_runtime_node_id, start_task returns compact LS/1 loopspace_run_context."},
-                "loopRuntimeRunId": {"type": "string", "description": "Optional camelCase Loopspace runtime run id."},
                 "loop_runtime_node_id": {"type": "string", "description": "Optional Loopspace runtime action node id for the connected subloop slice."},
-                "loopRuntimeNodeId": {"type": "string", "description": "Optional camelCase Loopspace runtime action node id."},
                 "loop_runtime_edge_id": {"type": "string", "description": "Optional Loopspace runtime edge id."},
-                "loopRuntimeEdgeId": {"type": "string", "description": "Optional camelCase Loopspace runtime edge id."},
                 "trigger_id": {"type": "string", "description": "Optional triggering Loopspace trigger id."},
-                "triggerId": {"type": "string", "description": "Optional camelCase triggering Loopspace trigger id."},
-                "trigger_run_id": {"type": "string", "description": "Optional triggering Loopspace run id."},
-                "triggerRunId": {"type": "string", "description": "Optional camelCase triggering Loopspace run id."}
+                "trigger_run_id": {"type": "string", "description": "Optional triggering Loopspace run id."}
             },
             "required": ["plan"],
             "additionalProperties": true
@@ -8667,13 +8393,13 @@ edge step_1.docs -> doc_out.in
         assert_eq!(context["ok"].as_bool(), Some(true));
         assert_eq!(context["loopspace_id"].as_str(), Some("loop-1"));
         assert_eq!(context["loop_runtime_run_id"].as_str(), Some("run-1"));
-        assert_eq!(context["currentAction"]["id"].as_str(), Some("step_1"));
-        assert_eq!(context["currentCheckpoint"]["id"].as_str(), Some("step_1"));
+        assert_eq!(context["current_action"]["id"].as_str(), Some("step_1"));
+        assert_eq!(context["current_checkpoint"]["id"].as_str(), Some("step_1"));
         assert_eq!(
-            context["subloop"]["parentNode"]["id"].as_str(),
+            context["subloop"]["parent_node"]["id"].as_str(),
             Some("dispatch")
         );
-        let first = &context["checkpointPlan"][0];
+        let first = &context["checkpoint_plan"][0];
         assert_eq!(first["label"].as_str(), Some("Research"));
         assert_eq!(
             first["resource_context"]["readable_documents"][0]["refs"][0].as_str(),
@@ -8697,7 +8423,7 @@ edge step_1.docs -> doc_out.in
         assert!(packet.contains("step_1 rd blog-ideas.md"));
         assert!(packet.contains("step_1 wd blog-draft.md op=append"));
         assert!(packet.contains("docs wd=prepare_doc_draft->save_doc canonical=read_only"));
-        assert!(!packet.contains("checkpointPlan"));
+        assert!(!packet.contains("checkpoint_plan"));
     }
 
     #[test]
@@ -8712,13 +8438,13 @@ edge trig.out -> dispatch.in
             loopspace_df_run_context_from_source(source, "loop-1", "run-1", "dispatch", "", "", "");
 
         assert_eq!(context["ok"].as_bool(), Some(true));
-        assert_eq!(context["checkpointPlan"].as_array().unwrap().len(), 0);
-        assert_eq!(context["currentAction"]["id"].as_str(), Some("dispatch"));
+        assert_eq!(context["checkpoint_plan"].as_array().unwrap().len(), 0);
+        assert_eq!(context["current_action"]["id"].as_str(), Some("dispatch"));
         assert_eq!(
-            context["currentAction"]["target_terminal_mode"].as_str(),
+            context["current_action"]["target_terminal_mode"].as_str(),
             Some("auto")
         );
-        assert_eq!(context["currentCheckpoint"], Value::Null);
+        assert_eq!(context["current_checkpoint"], Value::Null);
 
         let packet = loopspace_df_compact_run_context_packet(&context);
         assert!(packet.contains("LS/1 run_context"));
@@ -8733,8 +8459,8 @@ edge trig.out -> dispatch.in
     fn workspace_gateway_video_look_content_emits_image_blocks() {
         let result = workspace_gateway_video_look_content(json!({
             "frames": [
-                {"atMs": 1000, "b64Jpeg": "abc123"},
-                {"atMs": 2000, "b64Jpeg": "def456"}
+                {"at_ms": 1000, "b64_jpeg": "abc123"},
+                {"at_ms": 2000, "b64_jpeg": "def456"}
             ],
             "note": "rendered 1000ms, 2000ms; text layers omitted: ffmpeg without drawtext",
             "warnings": ["text layers omitted: ffmpeg without drawtext"]

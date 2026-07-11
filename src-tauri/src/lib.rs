@@ -620,14 +620,12 @@ struct TerminalInputQueueItem {
 }
 
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalInputTransportEndpoint {
     url: String,
     token: String,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalInputTransportEnvelope {
     token: String,
     message_id: Option<String>,
@@ -635,7 +633,6 @@ struct TerminalInputTransportEnvelope {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalInputTransportAck {
     r#type: &'static str,
     message_id: String,
@@ -644,14 +641,12 @@ struct TerminalInputTransportAck {
 }
 
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalOutputTransportEndpoint {
     url: String,
     token: String,
 }
 
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalActivityTransportEndpoint {
     host: String,
     port: u16,
@@ -659,7 +654,6 @@ struct TerminalActivityTransportEndpoint {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalActivityTransportEnvelope {
     r#type: String,
     token: String,
@@ -667,7 +661,6 @@ struct TerminalActivityTransportEnvelope {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalActivityTransportAck {
     r#type: &'static str,
     ok: bool,
@@ -675,7 +668,6 @@ struct TerminalActivityTransportAck {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalOutputTransportSubscribe {
     r#type: String,
     token: String,
@@ -958,7 +950,6 @@ impl Default for TerminalAudioRouteGate {
 }
 
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalAudioInputRefocusPayload {
     pane_id: String,
     instance_id: Option<u64>,
@@ -1166,7 +1157,6 @@ struct TerminalHeadlessOutputBuffer {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalHeadlessOutputSnapshot {
     bytes_base64: String,
     epoch: u64,
@@ -1177,7 +1167,6 @@ struct TerminalHeadlessOutputSnapshot {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalHeadlessOutputDelta {
     bytes_base64: String,
     epoch: u64,
@@ -1423,7 +1412,6 @@ struct TerminalParkedPrompt {
 }
 
 #[derive(Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 struct TerminalParkedWaitingOn {
     agent_id: Option<String>,
     agent_label: Option<String>,
@@ -1434,7 +1422,6 @@ struct TerminalParkedWaitingOn {
 }
 
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalParkedPromptPayload {
     pane_id: String,
     instance_id: u64,
@@ -1651,7 +1638,6 @@ impl Drop for PtyPool {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct BackendStatus {
     ok: bool,
     endpoint: String,
@@ -1659,7 +1645,6 @@ struct BackendStatus {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct ExchangeDesktopSessionRequest<'a> {
     code: &'a str,
     state: &'a str,
@@ -1691,7 +1676,6 @@ struct CommandCapture {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct AgentStatus {
     id: &'static str,
     label: &'static str,
@@ -1727,7 +1711,6 @@ struct AgentRuntimeStatus {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct AgentInstallResult {
     provider: &'static str,
     label: &'static str,
@@ -1740,7 +1723,6 @@ struct AgentInstallResult {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct AgentLoginStart {
     provider: &'static str,
     command: &'static str,
@@ -1748,7 +1730,6 @@ struct AgentLoginStart {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct AgentLogoutResult {
     provider: &'static str,
     label: &'static str,
@@ -1757,7 +1738,6 @@ struct AgentLogoutResult {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct ForgeRunResult {
     provider: &'static str,
     label: &'static str,
@@ -1768,7 +1748,6 @@ struct ForgeRunResult {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct AgentThreadTurnResult {
     agent_id: String,
     label: String,
@@ -1781,7 +1760,6 @@ struct AgentThreadTurnResult {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ForgePromptRequest {
     provider: String,
     prompt: String,
@@ -1791,7 +1769,6 @@ struct ForgePromptRequest {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct AgentThreadTurnRequest {
     agent_id: String,
     provider_session_id: Option<String>,
@@ -1801,7 +1778,6 @@ struct AgentThreadTurnRequest {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ForgePromptImage {
     name: String,
     mime_type: String,
@@ -1809,7 +1785,6 @@ struct ForgePromptImage {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct AgentImageInputStatus {
     supported: bool,
     support: &'static str,
@@ -1819,14 +1794,12 @@ struct AgentImageInputStatus {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct TodoTextAttachmentRequest {
     title: Option<String>,
     text: String,
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct SavedTodoImageAttachment {
     name: String,
     mime_type: String,
@@ -1834,7 +1807,6 @@ struct SavedTodoImageAttachment {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct SavedTodoTextAttachment {
     line_count: usize,
     path: String,
@@ -1842,7 +1814,6 @@ struct SavedTodoTextAttachment {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct ForgeWorkingDirectory {
     working_directory: String,
     root_identity: String,
@@ -1855,7 +1826,6 @@ struct ForgeWorkingDirectory {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct WorkspaceDirectoryEntry {
     name: String,
     relative_path: String,
@@ -1871,7 +1841,6 @@ struct WorkspaceDirectoryEntry {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct WorkspaceDirectoryListing {
     root: String,
     relative_path: String,
@@ -1884,7 +1853,6 @@ struct WorkspaceDirectoryListing {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct WorkspaceRootBrowse {
     working_directory: String,
     root_identity: String,
@@ -1898,7 +1866,6 @@ struct WorkspaceRootBrowse {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct WorkspaceFileText {
     root: String,
     relative_path: String,
@@ -1913,7 +1880,6 @@ struct WorkspaceFileText {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct WorkspaceFileImage {
     root: String,
     relative_path: String,
@@ -1929,7 +1895,6 @@ struct WorkspaceFileImage {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct WorkspaceFileDiff {
     root: String,
     relative_path: String,
@@ -1941,7 +1906,6 @@ struct WorkspaceFileDiff {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct WorkspaceFileOperationResult {
     root: String,
     relative_path: String,
@@ -1950,7 +1914,6 @@ struct WorkspaceFileOperationResult {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalOpenRequest {
     pane_id: String,
     instance_id: Option<u64>,
@@ -1986,7 +1949,6 @@ struct TerminalOpenRequest {
 }
 
 #[derive(Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct TerminalStartAgentRequest {
     pane_id: String,
     instance_id: Option<u64>,
@@ -2000,7 +1962,6 @@ struct TerminalStartAgentRequest {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalStartAgentPaneResult {
     pane_id: String,
     instance_id: Option<u64>,
@@ -2012,7 +1973,6 @@ struct TerminalStartAgentPaneResult {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalStartAgentManyResult {
     started: usize,
     skipped: usize,
@@ -2020,7 +1980,6 @@ struct TerminalStartAgentManyResult {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalOpenResult {
     pane_id: String,
     instance_id: u64,
@@ -2054,7 +2013,6 @@ struct TerminalOpenResult {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalProviderSessionRecordRequest {
     pane_id: String,
     instance_id: Option<u64>,
@@ -2063,7 +2021,6 @@ struct TerminalProviderSessionRecordRequest {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalProviderSessionRecordResult {
     pane_id: String,
     instance_id: u64,
@@ -2073,7 +2030,6 @@ struct TerminalProviderSessionRecordResult {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct TerminalExitPayload {
     pane_id: String,
     instance_id: u64,
@@ -2082,7 +2038,6 @@ struct TerminalExitPayload {
 }
 
 #[derive(Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct TerminalInputEventPayload {
     pane_id: String,
     instance_id: Option<u64>,
@@ -2102,7 +2057,6 @@ struct TerminalInputEventPayload {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct TerminalForkRequestedPayload {
     pane_id: String,
     instance_id: u64,
@@ -2115,7 +2069,6 @@ struct TerminalForkRequestedPayload {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct TerminalInputErrorPayload {
     pane_id: String,
     instance_id: Option<u64>,
@@ -2123,7 +2076,6 @@ struct TerminalInputErrorPayload {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct TerminalPromptSubmittedPayload {
     pane_id: String,
     instance_id: u64,
@@ -2153,7 +2105,6 @@ struct TerminalPromptSubmittedPayload {
 }
 
 #[derive(Debug, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct TerminalActivityHookPromptOption {
     id: String,
     label: String,
@@ -2166,7 +2117,6 @@ struct TerminalActivityHookPromptOption {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct TerminalActivityHookPayload {
     pane_id: String,
     instance_id: u64,
@@ -2253,7 +2203,6 @@ struct TerminalActivityHookPayload {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct TerminalArchitectureActivityPayload {
     pane_id: String,
     instance_id: u64,
@@ -2277,7 +2226,6 @@ struct TerminalArchitectureActivityPayload {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct TerminalOutputStatePayload {
     pane_id: String,
     instance_id: u64,
@@ -2288,13 +2236,11 @@ struct TerminalOutputStatePayload {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalCloseAllResult {
     closed: usize,
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct TerminalCloseAllProgressPayload {
     closed: usize,
     total: usize,
@@ -2304,7 +2250,6 @@ struct TerminalCloseAllProgressPayload {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct AppShutdownProgressPayload {
     phase: String,
     label: String,
@@ -2316,7 +2261,6 @@ struct AppShutdownProgressPayload {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct AudioInputDeviceSummary {
     device_id: String,
     label: String,
@@ -2324,7 +2268,6 @@ struct AudioInputDeviceSummary {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct AudioInputPermissionStatus {
     platform: &'static str,
     microphone_required: bool,
@@ -2338,14 +2281,12 @@ struct AudioInputPermissionStatus {
 }
 
 #[derive(Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct AudioInputMonitorRequest {
     device_id: Option<String>,
     owner: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct AudioInputMonitorStatus {
     monitoring: bool,
     device_id: String,
@@ -2357,7 +2298,6 @@ struct AudioInputMonitorStatus {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct AudioInputStats {
     device_id: String,
     engine: &'static str,
@@ -2370,14 +2310,12 @@ struct AudioInputStats {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct AudioInputCaptureResult {
     audio_base64: String,
     audio_ms: u64,
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct AudioShortcutRegistrationStatus {
     shortcut: String,
     default_shortcut: String,
@@ -2386,7 +2324,6 @@ struct AudioShortcutRegistrationStatus {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct AudioShortcutPermissionStatus {
     platform: &'static str,
     accessibility_required: bool,
@@ -2399,7 +2336,6 @@ struct AudioShortcutPermissionStatus {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct AudioShortcutSettingsStatus {
     push_to_talk: AudioShortcutRegistrationStatus,
     cancel: AudioShortcutRegistrationStatus,
@@ -2407,14 +2343,12 @@ struct AudioShortcutSettingsStatus {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct AudioShortcutBindings {
     push_to_talk: String,
     cancel: String,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct AudioShortcutUpdateRequest {
     action: String,
     shortcut: String,
@@ -2439,7 +2373,6 @@ struct AudioShortcutRegistration {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct WhisperModelStatus {
     installed: bool,
     model_installed: bool,
@@ -2468,7 +2401,6 @@ struct WhisperModelStatus {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct WhisperModelOptionStatus {
     model_id: &'static str,
     model_name: &'static str,
@@ -2486,13 +2418,11 @@ struct WhisperModelOptionStatus {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct WhisperModelRequest {
     model_id: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct WhisperModelDownloadProgress {
     state: String,
     model_id: Option<String>,
@@ -2503,7 +2433,6 @@ struct WhisperModelDownloadProgress {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct WhisperWarmStatus {
     prepared: bool,
     cached: bool,
@@ -2513,7 +2442,6 @@ struct WhisperWarmStatus {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct WhisperTranscriptionRequest {
     audio_base64: String,
     audio_ms: Option<u64>,
@@ -2522,7 +2450,6 @@ struct WhisperTranscriptionRequest {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct WhisperTranscriptionResult {
     text: String,
     segments: usize,
@@ -2536,7 +2463,6 @@ struct LocalWhisperPartialSession {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct LocalWhisperPartialStartRequest {
     session_id: String,
     history_id: Option<String>,
@@ -2546,26 +2472,22 @@ struct LocalWhisperPartialStartRequest {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct LocalWhisperPartialStopRequest {
     session_id: String,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct LocalWhisperPartialCancelRequest {
     session_id: Option<String>,
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct LocalWhisperPartialStartStatus {
     active: bool,
     session_id: String,
 }
 
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct LocalWhisperPartialChunkResult {
     index: u64,
     start_ms: u64,
@@ -2577,7 +2499,6 @@ struct LocalWhisperPartialChunkResult {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct LocalWhisperPartialTranscriptionResult {
     text: String,
     segments: usize,
@@ -2589,14 +2510,12 @@ struct LocalWhisperPartialTranscriptionResult {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct DeepgramRealtimeStartRequest {
     api_key: String,
     language: Option<String>,
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct DeepgramRealtimeStartStatus {
     active: bool,
     language: String,
@@ -2605,7 +2524,6 @@ struct DeepgramRealtimeStartStatus {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct CloudVoiceAgentStartRequest {
     client_session_id: Option<String>,
     owner_id: Option<String>,
@@ -2623,7 +2541,6 @@ struct CloudVoiceAgentStartRequest {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct CloudVoiceAgentControlRequest {
     client_session_id: Option<String>,
     owner_id: Option<String>,
@@ -2631,7 +2548,6 @@ struct CloudVoiceAgentControlRequest {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct CloudVoiceAgentTextMessageRequest {
     text: String,
     turn_index: Option<u64>,
@@ -2642,7 +2558,6 @@ struct CloudVoiceAgentTextMessageRequest {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct CloudVoiceAgentStartStatus {
     active: bool,
     client_session_id: String,
@@ -2654,14 +2569,12 @@ struct CloudVoiceAgentStartStatus {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct OrchestratorVoiceHistoryReadRequest {
     root_directory: Option<String>,
     workspace_id: String,
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct OrchestratorVoiceHistoryReadResult {
     items: Value,
     path: String,
@@ -2669,7 +2582,6 @@ struct OrchestratorVoiceHistoryReadResult {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct OrchestratorVoiceHistoryWriteRequest {
     root_directory: Option<String>,
     workspace_id: String,
@@ -2677,7 +2589,6 @@ struct OrchestratorVoiceHistoryWriteRequest {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct OrchestratorVoiceHistoryWriteResult {
     saved: usize,
     path: String,
@@ -2685,7 +2596,6 @@ struct OrchestratorVoiceHistoryWriteResult {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct DeepgramRealtimeTranscriptEvent {
     text: String,
     is_final: bool,
@@ -2695,7 +2605,6 @@ struct DeepgramRealtimeTranscriptEvent {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct AudioWidgetVisibility {
     visible: bool,
     installed: bool,
@@ -2703,7 +2612,6 @@ struct AudioWidgetVisibility {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct ActivityOverlayVisibility {
     visible: bool,
     shortcut: String,
@@ -3254,7 +3162,7 @@ fn log_windows_terminal_diagnostic_event(app: &AppHandle, phase: &str, fields: V
     }));
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn terminal_set_diagnostic_logging(
     state: State<'_, TerminalDiagnosticState>,
     enabled: bool,
@@ -3279,7 +3187,7 @@ fn terminal_set_diagnostic_logging(
     resolved_enabled
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn terminal_diagnostic_log(
     state: State<'_, TerminalDiagnosticState>,
     phase: String,
@@ -3301,7 +3209,7 @@ fn terminal_diagnostic_log(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn thread_bridge_diagnostic_log(phase: String, fields: Value) -> Result<(), String> {
     write_thread_bridge_diagnostic_log_entry(json!({
         "ts_ms": current_time_ms(),
@@ -3315,7 +3223,7 @@ fn thread_bridge_diagnostic_log(phase: String, fields: Value) -> Result<(), Stri
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn bigview_sync_diagnostic_log(phase: String, fields: Value) -> Result<(), String> {
     write_bigview_sync_diagnostic_log_entry(json!({
         "ts_ms": current_time_ms(),
@@ -3335,7 +3243,7 @@ struct WorkspaceActivationDiagnosticEvent {
     fields: Value,
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn workspace_activation_diagnostic_log(phase: String, fields: Value) -> Result<(), String> {
     write_workspace_activation_diagnostic_log_entry(json!({
         "ts_ms": current_time_ms(),
@@ -3349,7 +3257,7 @@ fn workspace_activation_diagnostic_log(phase: String, fields: Value) -> Result<(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn workspace_activation_diagnostic_log_many(
     events: Vec<WorkspaceActivationDiagnosticEvent>,
 ) -> Result<(), String> {
@@ -3375,12 +3283,12 @@ fn workspace_activation_diagnostic_log_many(
 
 /// Lets the frontend skip building/sending activation diagnostic batches when
 /// the sink is off. Enabled by the build const or DIFFFORGE_WORKSPACE_ACTIVATION_LOG=1.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn workspace_activation_diagnostic_logging_status() -> bool {
     workspace_activation_logging_enabled()
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn voice_orchestrator_diagnostic_log(phase: String, fields: Value) -> Result<(), String> {
     write_voice_orchestrator_diagnostic_log_entry(json!({
         "ts_ms": current_time_ms(),
@@ -3408,7 +3316,7 @@ fn log_voice_orchestrator_diagnostic_event(phase: &str, fields: Value) {
 /// Webview → Rust attention mirror: what the user is looking at plus the
 /// native-notification preference, so Rust-side notification paths can gate
 /// on watched workspaces and honor the setting (they previously could not).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn attention_state_update(
     focused: bool,
     selected_workspace_id: Option<String>,
@@ -3424,7 +3332,7 @@ fn attention_state_update(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn terminal_status_log(phase: String, fields: Value) -> Result<(), String> {
     if !terminal_status_logging_enabled() {
         forward_terminal_status_to_energy_if_needed(&phase, "frontend", fields);
@@ -3443,7 +3351,7 @@ fn terminal_status_log(phase: String, fields: Value) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn windows_terminal_set_diagnostic_logging(
     state: State<'_, WindowsTerminalDiagnosticState>,
     enabled: bool,
@@ -3468,7 +3376,7 @@ fn windows_terminal_set_diagnostic_logging(
     resolved_enabled
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn windows_terminal_diagnostic_log(
     state: State<'_, WindowsTerminalDiagnosticState>,
     phase: String,
@@ -3945,7 +3853,7 @@ fn workspace_activation_role_for_index(
         settings,
         slot_index,
         position,
-        &["terminalRoles", "terminal_roles"],
+        &["terminalRoles"],
     )
     .and_then(|value| match value {
         Value::String(text) => Some(text.as_str()),
@@ -3965,18 +3873,12 @@ fn workspace_activation_permission_for_index(
         settings,
         slot_index,
         position,
-        &[
-            "agentPermissions",
-            "agent_permissions",
-            "permissionModes",
-            "permission_modes",
-        ],
+        &["agentPermissions", "permissionModes"],
     )
     .and_then(|value| match value {
         Value::String(text) => Some(text.as_str()),
         Value::Object(object) => object
             .get("permissionMode")
-            .or_else(|| object.get("permission_mode"))
             .or_else(|| object.get("mode"))
             .and_then(Value::as_str),
         _ => None,
@@ -3989,14 +3891,7 @@ fn workspace_activation_pane_kind(value: Option<&Value>) -> Option<String> {
         Value::String(text) => Some(text.trim().to_ascii_lowercase()),
         Value::Object(_) => workspace_activation_text(
             value,
-            &[
-                "kind",
-                "paneKind",
-                "pane_kind",
-                "type",
-                "surfaceKind",
-                "surface_kind",
-            ],
+            &["kind", "paneKind", "type", "surfaceKind"],
         )
         .map(|value| value.to_ascii_lowercase()),
         _ => None,
@@ -4015,7 +3910,7 @@ fn workspace_activation_pane_kind(value: Option<&Value>) -> Option<String> {
 
 fn workspace_activation_pane_records(settings: &Value) -> HashMap<usize, Value> {
     let mut records = HashMap::new();
-    for key in ["panes", "workspacePanes", "workspace_panes"] {
+    for key in ["panes", "workspacePanes"] {
         let Some(value) = settings.get(key) else {
             continue;
         };
@@ -4023,15 +3918,7 @@ fn workspace_activation_pane_records(settings: &Value) -> HashMap<usize, Value> 
             for (fallback_index, item) in array.iter().enumerate() {
                 let index = workspace_activation_i64(
                     item,
-                    &[
-                        "logicalIndex",
-                        "logical_index",
-                        "terminalIndex",
-                        "terminal_index",
-                        "slotIndex",
-                        "slot_index",
-                        "index",
-                    ],
+                    &["logicalIndex", "terminalIndex", "slotIndex", "index"],
                 )
                 .and_then(|value| (value >= 0).then_some(value as usize))
                 .unwrap_or(fallback_index);
@@ -4050,7 +3937,7 @@ fn workspace_activation_pane_records(settings: &Value) -> HashMap<usize, Value> 
 
 fn workspace_activation_panel_indexes(settings: &Value) -> HashMap<usize, String> {
     let mut indexes = HashMap::new();
-    for key in ["paneKinds", "pane_kinds", "panelKinds", "panel_kinds"] {
+    for key in ["paneKinds", "panelKinds"] {
         let Some(value) = settings.get(key) else {
             continue;
         };
@@ -4084,25 +3971,23 @@ fn workspace_activation_terminal_count(settings: Option<&Value>) -> usize {
         return WORKSPACE_ACTIVATE_DEFAULT_TERMINAL_COUNT;
     };
     if let Some(count) =
-        workspace_activation_usize(settings, &["terminalCount", "terminal_count", "terminals"])
+        workspace_activation_usize(settings, &["terminalCount", "terminals"])
     {
         return count.min(WORKSPACE_ACTIVATE_MAX_TERMINAL_COUNT);
     }
     if let Some(array) = settings
         .get("terminalRoles")
-        .or_else(|| settings.get("terminal_roles"))
         .and_then(Value::as_array)
     {
         return array.len().min(WORKSPACE_ACTIVATE_MAX_TERMINAL_COUNT);
     }
     if let Some(array) = settings
         .get("logicalTerminalIndexes")
-        .or_else(|| settings.get("logical_terminal_indexes"))
         .and_then(Value::as_array)
     {
         return array.len().min(WORKSPACE_ACTIVATE_MAX_TERMINAL_COUNT);
     }
-    if workspace_activation_text(settings, &["rootDirectory", "root_directory"]).is_some() {
+    if workspace_activation_text(settings, &["rootDirectory"]).is_some() {
         return 0;
     }
     WORKSPACE_ACTIVATE_DEFAULT_TERMINAL_COUNT
@@ -4123,7 +4008,6 @@ fn workspace_activation_terminal_indexes(
     let mut indexes = Vec::new();
     if let Some(array) = settings
         .get("logicalTerminalIndexes")
-        .or_else(|| settings.get("logical_terminal_indexes"))
         .and_then(Value::as_array)
     {
         for item in array {
@@ -4132,15 +4016,7 @@ fn workspace_activation_terminal_indexes(
                 Value::String(text) => text.trim().parse::<i64>().ok(),
                 Value::Object(_) => workspace_activation_i64(
                     item,
-                    &[
-                        "logicalIndex",
-                        "logical_index",
-                        "terminalIndex",
-                        "terminal_index",
-                        "slotIndex",
-                        "slot_index",
-                        "index",
-                    ],
+                    &["logicalIndex", "terminalIndex", "slotIndex", "index"],
                 ),
                 _ => None,
             };
@@ -4181,8 +4057,7 @@ fn workspace_activation_thread_for_index<'a>(
 ) -> Option<&'a Value> {
     let terminal_index_key = terminal_index.to_string();
     if let Some(thread_id) = threads_state
-        .get("terminalThreadIds")
-        .or_else(|| threads_state.get("terminal_thread_ids"))
+        .get("terminal_thread_ids")
         .and_then(|value| value.get(&terminal_index_key))
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
@@ -4202,12 +4077,7 @@ fn workspace_activation_thread_for_index<'a>(
             threads.values().find(|thread| {
                 workspace_activation_i64(
                     thread,
-                    &[
-                        "terminalIndex",
-                        "terminal_index",
-                        "logicalIndex",
-                        "logical_index",
-                    ],
+                    &["terminal_index", "logical_index"],
                 )
                 .is_some_and(|value| value == terminal_index as i64)
             })
@@ -4228,8 +4098,7 @@ fn workspace_activation_terminal_record_for_index<'a>(
 fn workspace_activation_provider_binding<'a>(thread: &'a Value, role: &str) -> Option<&'a Value> {
     let role = workspace_activation_clean_role(Some(role));
     thread
-        .get("providerBindings")
-        .or_else(|| thread.get("provider_bindings"))
+        .get("provider_bindings")
         .and_then(Value::as_object)
         .and_then(|bindings| {
             bindings
@@ -4259,29 +4128,14 @@ fn workspace_activation_descriptor_from_sources(
         .and_then(|value| {
             workspace_activation_text(
                 value,
-                &[
-                    "paneId",
-                    "pane_id",
-                    "panelId",
-                    "panel_id",
-                    "terminalId",
-                    "terminal_id",
-                    "id",
-                ],
+                &["pane_id", "panel_id", "terminal_id", "id"],
             )
         })
         .or_else(|| {
             binding.and_then(|value| {
                 workspace_activation_text(
                     value,
-                    &[
-                        "paneId",
-                        "pane_id",
-                        "terminalId",
-                        "terminal_id",
-                        "targetTerminalId",
-                        "target_terminal_id",
-                    ],
+                    &["pane_id", "terminal_id", "target_terminal_id"],
                 )
             })
         })
@@ -4290,16 +4144,16 @@ fn workspace_activation_descriptor_from_sources(
                 workspace_activation_nested_text(
                     value,
                     &[
-                        &["terminalBinding", "paneId"],
-                        &["terminalBinding", "pane_id"],
-                        &["terminal_binding", "paneId"],
+                        &["terminal_binding", "pane_id"],
+                        &["terminal_binding", "pane_id"],
+                        &["terminal_binding", "pane_id"],
                         &["terminal_binding", "pane_id"],
                     ],
                 )
                 .or_else(|| {
                     workspace_activation_text(
                         value,
-                        &["paneId", "pane_id", "terminalId", "terminal_id"],
+                        &["pane_id", "terminal_id"],
                     )
                 })
             })
@@ -4308,14 +4162,7 @@ fn workspace_activation_descriptor_from_sources(
             terminal_record.and_then(|value| {
                 workspace_activation_text(
                     value,
-                    &[
-                        "paneId",
-                        "pane_id",
-                        "terminalId",
-                        "terminal_id",
-                        "targetTerminalId",
-                        "target_terminal_id",
-                    ],
+                    &["pane_id", "terminal_id", "target_terminal_id"],
                 )
             })
         })
@@ -4324,27 +4171,27 @@ fn workspace_activation_descriptor_from_sources(
         });
     let slot_key = pane_record
         .as_ref()
-        .and_then(|value| workspace_activation_text(value, &["slotKey", "slot_key"]))
+        .and_then(|value| workspace_activation_text(value, &["slot_key"]))
         .or_else(|| {
-            binding.and_then(|value| workspace_activation_text(value, &["slotKey", "slot_key"]))
+            binding.and_then(|value| workspace_activation_text(value, &["slot_key"]))
         })
         .or_else(|| {
             terminal_record
-                .and_then(|value| workspace_activation_text(value, &["slotKey", "slot_key"]))
+                .and_then(|value| workspace_activation_text(value, &["slot_key"]))
         })
         .unwrap_or_else(|| (terminal_index + 1).to_string());
     let thread_id = thread
-        .and_then(|value| workspace_activation_text(value, &["id", "threadId", "thread_id"]))
+        .and_then(|value| workspace_activation_text(value, &["id", "thread_id"]))
         .or_else(|| {
             terminal_record
-                .and_then(|value| workspace_activation_text(value, &["threadId", "thread_id"]))
+                .and_then(|value| workspace_activation_text(value, &["thread_id"]))
         });
     let provider = if plain_shell {
         None
     } else {
         binding
             .and_then(|value| {
-                workspace_activation_text(value, &["provider", "agentId", "agent_id"])
+                workspace_activation_text(value, &["provider", "agent_id"])
             })
             .map(|value| workspace_activation_clean_role(Some(&value)))
             .or_else(|| Some(role.clone()))
@@ -4353,28 +4200,14 @@ fn workspace_activation_descriptor_from_sources(
         .and_then(|value| {
             workspace_activation_text(
                 value,
-                &[
-                    "providerSessionId",
-                    "provider_session_id",
-                    "nativeSessionId",
-                    "native_session_id",
-                    "sessionId",
-                    "session_id",
-                ],
+                &["provider_session_id", "native_session_id", "session_id"],
             )
         })
         .or_else(|| {
             thread.and_then(|value| {
                 workspace_activation_text(
                     value,
-                    &[
-                        "providerSessionId",
-                        "provider_session_id",
-                        "nativeSessionId",
-                        "native_session_id",
-                        "transcriptSessionId",
-                        "transcript_session_id",
-                    ],
+                    &["provider_session_id", "native_session_id", "transcript_session_id"],
                 )
             })
         })
@@ -4382,14 +4215,7 @@ fn workspace_activation_descriptor_from_sources(
             terminal_record.and_then(|value| {
                 workspace_activation_text(
                     value,
-                    &[
-                        "providerSessionId",
-                        "provider_session_id",
-                        "nativeSessionId",
-                        "native_session_id",
-                        "sessionId",
-                        "session_id",
-                    ],
+                    &["provider_session_id", "native_session_id", "session_id"],
                 )
             })
         })
@@ -4398,23 +4224,17 @@ fn workspace_activation_descriptor_from_sources(
         .and_then(|value| {
             workspace_activation_text(
                 value,
-                &["forkFromProviderSessionId", "fork_from_provider_session_id"],
+                &["fork_from_provider_session_id"],
             )
         })
         .filter(|_| !plain_shell);
     let model = binding
-        .and_then(|value| workspace_activation_text(value, &["modelId", "model_id", "model"]))
+        .and_then(|value| workspace_activation_text(value, &["model_id", "model"]))
         .or_else(|| {
             terminal_record.and_then(|value| {
                 workspace_activation_text(
                     value,
-                    &[
-                        "model",
-                        "modelId",
-                        "model_id",
-                        "currentModel",
-                        "current_model",
-                    ],
+                    &["model", "model_id", "current_model"],
                 )
             })
         });
@@ -4422,35 +4242,24 @@ fn workspace_activation_descriptor_from_sources(
         .and_then(|value| {
             workspace_activation_text(
                 value,
-                &[
-                    "reasoningEffort",
-                    "reasoning_effort",
-                    "effort",
-                    "thinkingPower",
-                    "thinking_power",
-                ],
+                &["reasoning_effort", "effort", "thinking_power"],
             )
         })
         .or_else(|| {
             terminal_record.and_then(|value| {
                 workspace_activation_text(
                     value,
-                    &[
-                        "reasoningEffort",
-                        "reasoning_effort",
-                        "currentEffort",
-                        "current_effort",
-                    ],
+                    &["reasoning_effort", "current_effort"],
                 )
             })
         });
     let speed = binding
         .and_then(|value| {
-            workspace_activation_text(value, &["speed", "serviceTier", "service_tier"])
+            workspace_activation_text(value, &["speed", "service_tier"])
         })
         .or_else(|| {
             terminal_record.and_then(|value| {
-                workspace_activation_text(value, &["speed", "serviceTier", "service_tier"])
+                workspace_activation_text(value, &["speed", "service_tier"])
             })
         });
     let permission_mode =
@@ -4459,26 +4268,14 @@ fn workspace_activation_descriptor_from_sources(
         .and_then(|value| {
             workspace_activation_text(
                 value,
-                &[
-                    "workingDirectory",
-                    "working_directory",
-                    "cwd",
-                    "repoPath",
-                    "repo_path",
-                ],
+                &["working_directory", "cwd", "repo_path"],
             )
         })
         .or_else(|| {
             terminal_record.and_then(|value| {
                 workspace_activation_text(
                     value,
-                    &[
-                        "workingDirectory",
-                        "working_directory",
-                        "cwd",
-                        "repoPath",
-                        "repo_path",
-                    ],
+                    &["working_directory", "cwd", "repo_path"],
                 )
             })
         })
@@ -4487,7 +4284,7 @@ fn workspace_activation_descriptor_from_sources(
                 workspace_activation_nested_text(
                     value,
                     &[
-                        &["coordination", "worktreePath"],
+                        &["coordination", "worktree_path"],
                         &["coordination", "worktree_path"],
                         &["worktree", "path"],
                         &["worktree", "root"],
@@ -4496,13 +4293,7 @@ fn workspace_activation_descriptor_from_sources(
                 .or_else(|| {
                     workspace_activation_text(
                         value,
-                        &[
-                            "workingDirectory",
-                            "working_directory",
-                            "cwd",
-                            "repoPath",
-                            "repo_path",
-                        ],
+                        &["working_directory", "cwd", "repo_path"],
                     )
                 })
             })
@@ -4512,18 +4303,12 @@ fn workspace_activation_descriptor_from_sources(
         .and_then(|value| {
             workspace_activation_text(
                 value,
-                &[
-                    "terminalName",
-                    "terminal_name",
-                    "displayName",
-                    "display_name",
-                    "name",
-                ],
+                &["terminal_name", "display_name", "name"],
             )
         })
         .or_else(|| {
             thread.and_then(|value| {
-                workspace_activation_text(value, &["title", "sessionName", "session_name"])
+                workspace_activation_text(value, &["title", "session_name"])
             })
         })
         .or_else(|| Some(workspace_activation_agent_label(&role)));
@@ -4531,15 +4316,7 @@ fn workspace_activation_descriptor_from_sources(
         .and_then(|value| {
             workspace_activation_text(
                 value,
-                &[
-                    "terminalNickname",
-                    "terminal_nickname",
-                    "nickname",
-                    "terminalName",
-                    "terminal_name",
-                    "displayName",
-                    "display_name",
-                ],
+                &["terminal_nickname", "nickname", "terminal_name", "display_name"],
             )
         })
         .or_else(|| terminal_name.clone());
@@ -4623,7 +4400,7 @@ fn workspace_activation_find_workspace_catalog_entry(
                 let mut item = item;
                 if let Some(root) = local_workspace_catalog_root_text(&item, workspace_settings) {
                     if let Some(object) = item.as_object_mut() {
-                        object.insert("rootDirectory".to_string(), json!(root));
+                        object.insert("root_directory".to_string(), json!(root));
                     }
                 }
                 return Ok(Some(item));
@@ -4650,28 +4427,14 @@ fn workspace_activation_resolve_workspace(
         .and_then(|entry| {
             workspace_activation_catalog_entry_text(
                 entry,
-                &[
-                    "rootDirectory",
-                    "root_directory",
-                    "root",
-                    "path",
-                    "repoPath",
-                    "repo_path",
-                ],
+                &["root_directory", "root", "path", "repo_path"],
             )
         })
         .or_else(|| {
             settings.and_then(|settings| {
                 workspace_activation_text(
                     settings,
-                    &[
-                        "rootDirectory",
-                        "root_directory",
-                        "root",
-                        "path",
-                        "repoPath",
-                        "repo_path",
-                    ],
+                    &["rootDirectory", "root", "path", "repoPath"],
                 )
             })
         })
@@ -4688,14 +4451,14 @@ fn workspace_activation_resolve_workspace(
         .and_then(|entry| {
             workspace_activation_catalog_entry_text(
                 entry,
-                &["name", "workspaceName", "workspace_name", "label", "title"],
+                &["name", "workspace_name", "label", "title"],
             )
         })
         .or_else(|| {
             settings.and_then(|settings| {
                 workspace_activation_text(
                     settings,
-                    &["name", "workspaceName", "workspace_name", "label", "title"],
+                    &["name", "workspace_name", "label", "title"],
                 )
             })
         })
@@ -4704,7 +4467,7 @@ fn workspace_activation_resolve_workspace(
         .and_then(|settings| {
             workspace_activation_bool(
                 settings,
-                &["rootWasEmptyAtSelection", "root_was_empty_at_selection"],
+                &["rootWasEmptyAtSelection"],
             )
         })
         .unwrap_or(false);
@@ -4723,25 +4486,17 @@ fn workspace_activation_remote_intent_clear_if_matching(
     let remote_intents = app_local_state_read(app, "remote-intents");
     let pending = workspace_activation_text(
         &remote_intents,
-        &[
-            "pendingActivationWorkspaceId",
-            "pending_activation_workspace_id",
-        ],
+        &["pendingActivationWorkspaceId"],
     );
     if pending.as_deref() != Some(workspace_id) {
         return Ok(());
     }
     let patch = json!({
         "pendingActivationWorkspaceId": null,
-        "pending_activation_workspace_id": null,
         "pendingActivationReason": null,
-        "pending_activation_reason": null,
         "pendingActivationAtMs": null,
-        "pending_activation_at_ms": null,
         "pendingActivationSelectWorkspace": null,
-        "pending_activation_select_workspace": null,
         "pendingActivationWorkspaceTab": null,
-        "pending_activation_workspace_tab": null,
     });
     app_local_state_merge(app, "remote-intents", &patch)?;
     Ok(())
@@ -4816,14 +4571,14 @@ fn workspace_activation_ready_json(
     ready: bool,
 ) -> Value {
     json!({
-        "agentId": descriptor.role,
-        "inputReady": ready,
-        "instanceId": result.instance_id,
-        "paneId": result.pane_id,
-        "providerSessionId": result.provider_session_id,
-        "slotKey": descriptor.slot_key,
-        "terminalIndex": descriptor.terminal_index,
-        "threadId": result.thread_id,
+        "agent_id": descriptor.role,
+        "input_ready": ready,
+        "instance_id": result.instance_id,
+        "pane_id": result.pane_id,
+        "provider_session_id": result.provider_session_id,
+        "slot_key": descriptor.slot_key,
+        "terminal_index": descriptor.terminal_index,
+        "thread_id": result.thread_id,
     })
 }
 
@@ -4945,57 +4700,40 @@ async fn workspace_activation_workspace_snapshot(
             todo_dispatch_core_terminal_ready_for_submit(&runtime, &projected, is_parked)
                 == Some(true);
         terminals.push(json!({
-            "activityStatus": runtime.activity_status.clone(),
             "activity_status": runtime.activity_status.clone(),
-            "agentId": metadata.agent_id.clone(),
-            "agentKind": metadata.agent_kind.clone(),
+            "agent_id": metadata.agent_id.clone(),
+            "agent_kind": metadata.agent_kind.clone(),
             "commandable": true,
             "connected": true,
-            "currentEffort": launch_metadata.reasoning_effort.clone(),
-            "currentModel": launch_metadata.model.clone(),
-            "displayName": projected.display_name.clone(),
+            "current_effort": launch_metadata.reasoning_effort.clone(),
+            "current_model": launch_metadata.model.clone(),
+            "display_name": projected.display_name.clone(),
             "display_status": projected.native_rail_label.clone(),
-            "displayStatus": projected.native_rail_label.clone(),
-            "inputReady": input_ready,
             "input_ready": input_ready,
-            "inputReadyAt": runtime.input_ready_at.clone(),
             "input_ready_at": runtime.input_ready_at.clone(),
-            "instanceId": instance.id,
+            "instance_id": instance.id,
             "model": launch_metadata.model.clone(),
-            "nativeConnected": true,
             "native_connected": true,
             "native_rail_label": projected.native_rail_label.clone(),
-            "nativeRailLabel": projected.native_rail_label.clone(),
             "native_rail_state": projected.native_rail_state.clone(),
-            "nativeRailState": projected.native_rail_state.clone(),
-            "paneId": pane_id.clone(),
             "pane_id": pane_id.clone(),
-            "providerSessionId": runtime.provider_session_id.clone(),
             "provider_session_id": runtime.provider_session_id.clone(),
             "readiness": projected.readiness.clone(),
-            "sessionState": projected.session_state.clone(),
             "session_state": projected.session_state.clone(),
             "status": projected.terminal_status.clone(),
-            "terminalId": pane_id.clone(),
             "terminal_id": pane_id.clone(),
-            "terminalIndex": metadata.terminal_index,
             "terminal_index": metadata.terminal_index,
-            "terminalInstanceId": instance.id,
             "terminal_instance_id": instance.id,
-            "terminalName": projected.terminal_name.clone(),
             "terminal_name": projected.terminal_name.clone(),
-            "terminalNickname": projected.terminal_nickname.clone(),
             "terminal_nickname": projected.terminal_nickname.clone(),
-            "terminalStatus": projected.terminal_status.clone(),
             "terminal_status": projected.terminal_status.clone(),
-            "terminalWorkState": projected.terminal_work_state.clone(),
-            "threadId": metadata.thread_id.clone(),
+            "terminal_work_state": projected.terminal_work_state.clone(),
             "thread_id": metadata.thread_id.clone(),
         }));
     }
     terminals.sort_by_key(|terminal| {
         terminal
-            .get("terminalIndex")
+            .get("terminal_index")
             .and_then(Value::as_u64)
             .unwrap_or(u64::MAX)
     });
@@ -5006,8 +4744,7 @@ async fn workspace_activation_workspace_snapshot(
         "name": workspace.name,
         "reason": reason,
         "repo_path": workspace.root,
-        "repoPath": workspace.root,
-        "rootDirectory": workspace.root,
+        "root_directory": workspace.root,
         "selected": true,
         "status": "active",
         "terminals": terminals,
@@ -5015,11 +4752,7 @@ async fn workspace_activation_workspace_snapshot(
         "workspace_id": workspace.id,
         "workspace_name": workspace.name,
         "workspace_root": workspace.root,
-        "workspace_status": "active",
-        "workspaceId": workspace.id,
-        "workspaceName": workspace.name,
-        "workspaceRoot": workspace.root,
-    })
+        "workspace_status": "active"})
 }
 
 async fn workspace_activation_pane_is_live(app: &AppHandle, pane_id: &str) -> bool {
@@ -5054,9 +4787,9 @@ async fn workspace_activation_spawn_terminals(
             workspace_activation_log(
                 "backend.workspace_activation.orchestrator.aborted",
                 json!({
-                    "paneId": descriptor.pane_id.clone(),
+                    "pane_id": descriptor.pane_id.clone(),
                     "reason": "webview_dispatcher_became_active",
-                    "workspaceId": workspace.id,
+                    "workspace_id": workspace.id,
                 }),
             );
             results.push(WorkspaceActivationSpawnResult {
@@ -5093,9 +4826,9 @@ async fn workspace_activation_spawn_terminals(
                     "backend.workspace_activation.orchestrator.error",
                     json!({
                         "error": clean_terminal_diagnostic_log_text(&error),
-                        "paneId": descriptor.pane_id.clone(),
-                        "terminalIndex": descriptor.terminal_index,
-                        "workspaceId": workspace.id,
+                        "pane_id": descriptor.pane_id.clone(),
+                        "terminal_index": descriptor.terminal_index,
+                        "workspace_id": workspace.id,
                     }),
                 );
                 results.push(WorkspaceActivationSpawnResult {
@@ -5150,7 +4883,7 @@ async fn workspace_activation_bootstrap_coordination_and_mcp(root: &str) -> Valu
     }
     json!({
         "bootstrap": bootstrap_value,
-        "bootstrapError": bootstrap_error,
+        "bootstrap_error": bootstrap_error,
         "daemon": daemon_value,
         "error": daemon_error,
         "ok": bootstrap_error.is_none() && daemon_error.is_none(),
@@ -5222,7 +4955,7 @@ pub(crate) async fn workspace_activate_runtime_internal(
         "backend.workspace_activation.orchestrator.start",
         json!({
             "reason": reason,
-            "workspaceId": workspace_id,
+            "workspace_id": workspace_id,
         }),
     );
     if let Err(error) = workspace_activate_runtime_webview_guard() {
@@ -5231,7 +4964,7 @@ pub(crate) async fn workspace_activate_runtime_internal(
             json!({
                 "error": error,
                 "reason": reason,
-                "workspaceId": workspace_id,
+                "workspace_id": workspace_id,
             }),
         );
         return Err(error);
@@ -5242,7 +4975,7 @@ pub(crate) async fn workspace_activate_runtime_internal(
             json!({
                 "error": error,
                 "reason": reason,
-                "workspaceId": workspace_id,
+                "workspace_id": workspace_id,
             }),
         );
         return Err(error);
@@ -5279,7 +5012,7 @@ pub(crate) async fn workspace_activate_runtime_internal(
             .unwrap_or_else(|error| {
                 json!({
                     "error": error,
-                    "hydratedCount": 0,
+                    "hydrated_count": 0,
                     "items": [],
                 })
             })
@@ -5309,8 +5042,8 @@ pub(crate) async fn workspace_activate_runtime_internal(
                 spawn.error.as_ref().map(|error| {
                     json!({
                         "error": error,
-                        "paneId": spawn.descriptor.pane_id,
-                        "terminalIndex": spawn.descriptor.terminal_index,
+                        "pane_id": spawn.descriptor.pane_id,
+                        "terminal_index": spawn.descriptor.terminal_index,
                     })
                 })
             })
@@ -5324,7 +5057,7 @@ pub(crate) async fn workspace_activate_runtime_internal(
             .iter()
             .filter(|entry| {
                 entry
-                    .get("inputReady")
+                    .get("input_ready")
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
             })
@@ -5342,18 +5075,18 @@ pub(crate) async fn workspace_activate_runtime_internal(
             ));
         }
         Ok(json!({
-            "workspaceId": workspace.id,
+            "workspace_id": workspace.id,
             "root": workspace.root,
-            "terminalsSpawned": terminals_spawned,
-            "terminalsAdopted": terminals_adopted,
-            "terminalsReady": terminals_ready,
-            "terminalReadiness": readiness,
-            "terminalSpawnErrors": spawn_errors,
-            "mcpDaemon": mcp_daemon,
-            "todosHydrated": todos_hydrated,
-            "cloudSnapshot": cloud_snapshot,
+            "terminals_spawned": terminals_spawned,
+            "terminals_adopted": terminals_adopted,
+            "terminals_ready": terminals_ready,
+            "terminal_readiness": readiness,
+            "terminal_spawn_errors": spawn_errors,
+            "mcp_daemon": mcp_daemon,
+            "todos_hydrated": todos_hydrated,
+            "cloud_snapshot": cloud_snapshot,
             "reason": reason,
-            "durationMs": terminal_diagnostic_elapsed_ms(started_at),
+            "duration_ms": terminal_diagnostic_elapsed_ms(started_at),
         }))
     }
     .await;
@@ -5364,11 +5097,11 @@ pub(crate) async fn workspace_activate_runtime_internal(
             workspace_activation_log(
                 "backend.workspace_activation.orchestrator.done",
                 json!({
-                    "durationMs": terminal_diagnostic_elapsed_ms(started_at),
+                    "duration_ms": terminal_diagnostic_elapsed_ms(started_at),
                     "reason": reason,
-                    "terminalsReady": result.get("terminalsReady").cloned().unwrap_or(Value::Null),
-                    "terminalsSpawned": result.get("terminalsSpawned").cloned().unwrap_or(Value::Null),
-                    "workspaceId": workspace_id,
+                    "terminals_ready": result.get("terminals_ready").cloned().unwrap_or(Value::Null),
+                    "terminals_spawned": result.get("terminals_spawned").cloned().unwrap_or(Value::Null),
+                    "workspace_id": workspace_id,
                 }),
             );
             Ok(result)
@@ -5377,10 +5110,10 @@ pub(crate) async fn workspace_activate_runtime_internal(
             workspace_activation_log(
                 "backend.workspace_activation.orchestrator.error",
                 json!({
-                    "durationMs": terminal_diagnostic_elapsed_ms(started_at),
+                    "duration_ms": terminal_diagnostic_elapsed_ms(started_at),
                     "error": clean_terminal_diagnostic_log_text(&error),
                     "reason": reason,
-                    "workspaceId": workspace_id,
+                    "workspace_id": workspace_id,
                 }),
             );
             Err(error)
@@ -5388,7 +5121,7 @@ pub(crate) async fn workspace_activate_runtime_internal(
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn workspace_activate_runtime(
     app: AppHandle,
     workspace_id: String,
@@ -5417,57 +5150,57 @@ mod workspace_activation_tests {
             root_was_empty_at_selection: false,
         };
         let settings = json!({
-            "terminalCount": 3,
-            "logicalTerminalIndexes": [0, 1, 2],
-            "paneKinds": {
+            "terminal_count": 3,
+            "logical_terminal_indexes": [0, 1, 2],
+            "pane_kinds": {
                 "1": "web"
             },
-            "terminalRoles": ["codex", "generic", "claude"],
-            "agentPermissions": {
+            "terminal_roles": ["codex", "generic", "claude"],
+            "agent_permissions": {
                 "0": "bypass_permissions",
                 "2": "ask_each_time"
             },
             "panes": {
                 "2": {
                     "kind": "terminal",
-                    "paneId": "explicit-pane-2",
-                    "slotKey": "slot-three"
+                    "pane_id": "explicit-pane-2",
+                    "slot_key": "slot-three"
                 }
             }
         });
         let threads = json!({
-            "terminalThreadIds": {
+            "terminal_thread_ids": {
                 "0": "thread-zero",
                 "2": "thread-two"
             },
             "threads": {
                 "thread-zero": {
                     "id": "thread-zero",
-                    "providerBindings": {
+                    "provider_bindings": {
                         "codex": {
                             "provider": "codex",
-                            "modelId": "gpt-5",
-                            "nativeSessionId": "session-zero",
-                            "workingDirectory": "/repo/sub"
+                            "model_id": "gpt-5",
+                            "native_session_id": "session-zero",
+                            "working_directory": "/repo/sub"
                         }
                     }
                 },
                 "thread-two": {
                     "id": "thread-two",
-                    "providerBindings": {
+                    "provider_bindings": {
                         "claude": {
                             "provider": "claude",
-                            "modelId": "sonnet",
-                            "reasoningEffort": "high",
-                            "providerSessionId": "session-two"
+                            "model_id": "sonnet",
+                            "reasoning_effort": "high",
+                            "provider_session_id": "session-two"
                         }
                     }
                 }
             },
             "terminals": {
                 "2": {
-                    "terminalName": "Review",
-                    "terminalNickname": "Reviewer"
+                    "terminal_name": "Review",
+                    "terminal_nickname": "Reviewer"
                 }
             }
         });
@@ -5645,7 +5378,7 @@ async fn run_backend_app_shutdown(app_for_shutdown: AppHandle, window_label: Str
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn deactivate_workspace_runtime(
     app: AppHandle,
     repo_path: Option<String>,
@@ -5825,15 +5558,15 @@ async fn deactivate_workspace_runtime(
     let result = json!({
         "ok": errors.is_empty(),
         "reason": reason,
-        "repoPath": repo_path.as_deref().unwrap_or(""),
-        "workspaceId": workspace_id.as_deref().unwrap_or(""),
+        "repo_path": repo_path.as_deref().unwrap_or(""),
+        "workspace_id": workspace_id.as_deref().unwrap_or(""),
         "watchers": watchers,
         "terminals": {
             "closed": closed_terminals,
         },
         "mcp": mcp,
         "errors": errors,
-        "durationMs": terminal_diagnostic_elapsed_ms(started_at),
+        "duration_ms": terminal_diagnostic_elapsed_ms(started_at),
     });
 
     log_terminal_diagnostic_event(
@@ -6049,14 +5782,14 @@ fn delete_workspace_local_metadata_for(
                 coordination::db::forget_initialized_kernel_storage_for_repo(&root)?;
             return Ok(json!({
                 "ok": true,
-                "repoPath": root.display().to_string(),
-                "agentsRoot": agents_root.display().to_string(),
-                "privateStateRoot": private_state_root.display().to_string(),
+                "repo_path": root.display().to_string(),
+                "agents_root": agents_root.display().to_string(),
+                "private_state_root": private_state_root.display().to_string(),
                 "removed": [],
-                "removedCount": (if private_state_root_removed { 1 } else { 0 }) + remembered_kernel_entries_removed,
-                "agentsRootRemoved": false,
-                "privateStateRootRemoved": private_state_root_removed,
-                "rememberedKernelEntriesRemoved": remembered_kernel_entries_removed,
+                "removed_count": (if private_state_root_removed { 1 } else { 0 }) + remembered_kernel_entries_removed,
+                "agents_root_removed": false,
+                "private_state_root_removed": private_state_root_removed,
+                "remembered_kernel_entries_removed": remembered_kernel_entries_removed,
                 "skipped": true,
             }));
         }
@@ -6122,20 +5855,20 @@ fn delete_workspace_local_metadata_for(
 
     Ok(json!({
         "ok": true,
-        "repoPath": root.display().to_string(),
-        "agentsRoot": agents_root.display().to_string(),
-        "privateStateRoot": private_state_root.display().to_string(),
+        "repo_path": root.display().to_string(),
+        "agents_root": agents_root.display().to_string(),
+        "private_state_root": private_state_root.display().to_string(),
         "removed": removed,
-        "removedCount": removed_count + remembered_kernel_entries_removed,
-        "dirtyWorktrees": dirty_worktrees,
-        "agentsRootRemoved": agents_root_removed,
-        "privateStateRootRemoved": private_state_root_removed,
-        "rememberedKernelEntriesRemoved": remembered_kernel_entries_removed,
+        "removed_count": removed_count + remembered_kernel_entries_removed,
+        "dirty_worktrees": dirty_worktrees,
+        "agents_root_removed": agents_root_removed,
+        "private_state_root_removed": private_state_root_removed,
+        "remembered_kernel_entries_removed": remembered_kernel_entries_removed,
         "skipped": false,
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn delete_workspace_local_metadata(
     repo_path: String,
     discard_dirty_worktrees: Option<bool>,
@@ -6624,11 +6357,8 @@ fn device_data_workspace_catalog_scope_files(candidate_dirs: &[PathBuf]) -> Vec<
 
 fn workspace_catalog_entry_updated_key(entry: &Value) -> (u8, u128, String) {
     for key in [
-        "updatedAtMs",
         "updated_at_ms",
-        "modifiedAtMs",
         "modified_at_ms",
-        "createdAtMs",
         "created_at_ms",
     ] {
         if let Some(value) = entry.get(key) {
@@ -6647,11 +6377,8 @@ fn workspace_catalog_entry_updated_key(entry: &Value) -> (u8, u128, String) {
     }
 
     for key in [
-        "updatedAt",
         "updated_at",
-        "modifiedAt",
         "modified_at",
-        "createdAt",
         "created_at",
     ] {
         if let Some(value) = entry
@@ -6672,7 +6399,7 @@ fn workspace_catalog_entry_updated_key(entry: &Value) -> (u8, u128, String) {
 
 fn mark_workspace_catalog_entry_deleted(entry: &mut Value) {
     if let Value::Object(object) = entry {
-        object.insert("pendingDelete".to_string(), json!(true));
+        object.insert("pending_delete".to_string(), json!(true));
         object.insert("deleted".to_string(), json!(true));
     }
 }
@@ -6689,7 +6416,7 @@ fn resolve_workspace_catalog_root_collisions(items: &mut [Value], workspace_sett
             continue;
         };
         let workspace_id =
-            local_workspace_catalog_text(&items[index], &["id", "workspace_id", "workspaceId"])
+            local_workspace_catalog_text(&items[index], &["id", "workspace_id"])
                 .unwrap_or_default();
         if workspace_id.is_empty() {
             continue;
@@ -6698,7 +6425,7 @@ fn resolve_workspace_catalog_root_collisions(items: &mut [Value], workspace_sett
         if let Some(existing_index) = root_owners.get(&root_identity).copied() {
             let existing_id = local_workspace_catalog_text(
                 &items[existing_index],
-                &["id", "workspace_id", "workspaceId"],
+                &["id", "workspace_id"],
             )
             .unwrap_or_default();
             if existing_id == workspace_id {
@@ -6737,7 +6464,7 @@ fn merge_workspace_catalog_files(
         for item in workspaces {
             let item = item.clone();
             let workspace_id =
-                local_workspace_catalog_text(&item, &["id", "workspace_id", "workspaceId"]);
+                local_workspace_catalog_text(&item, &["id", "workspace_id"]);
             let Some(workspace_id) = workspace_id else {
                 items.push(item);
                 continue;
@@ -6914,7 +6641,7 @@ mod device_data_migration_tests {
             .unwrap()
             .iter()
             .find(|workspace| {
-                local_workspace_catalog_text(workspace, &["id", "workspace_id", "workspaceId"])
+                local_workspace_catalog_text(workspace, &["id", "workspace_id"])
                     .as_deref()
                     == Some(id)
             })
@@ -6949,30 +6676,30 @@ mod device_data_migration_tests {
                     {
                         "id": "prod-only",
                         "name": "Prod",
-                        "rootIdentity": "prod-root",
-                        "rootDirectory": "/tmp/prod-root",
-                        "updatedAtMs": 100
+                        "root_identity": "prod-root",
+                        "root_directory": "/tmp/prod-root",
+                        "updated_at_ms": 100
                     },
                     {
                         "id": "deleted-preserved",
                         "name": "Deleted",
-                        "rootIdentity": "deleted-root",
-                        "pendingDelete": true,
-                        "updatedAtMs": 110
+                        "root_identity": "deleted-root",
+                        "pending_delete": true,
+                        "updated_at_ms": 110
                     },
                     {
                         "id": "older-root-owner",
                         "name": "Older root owner",
-                        "rootIdentity": "shared-root",
-                        "rootDirectory": "/tmp/shared-old",
-                        "updatedAtMs": 120
+                        "root_identity": "shared-root",
+                        "root_directory": "/tmp/shared-old",
+                        "updated_at_ms": 120
                     },
                     {
                         "id": "same-id",
                         "name": "Older same id",
-                        "rootIdentity": "same-id-old-root",
-                        "rootDirectory": "/tmp/same-id-old",
-                        "updatedAtMs": 130
+                        "root_identity": "same-id-old-root",
+                        "root_directory": "/tmp/same-id-old",
+                        "updated_at_ms": 130
                     }
                 ]
             }),
@@ -6985,23 +6712,23 @@ mod device_data_migration_tests {
                     {
                         "id": "dev-only",
                         "name": "Dev",
-                        "rootIdentity": "dev-root",
-                        "rootDirectory": "/tmp/dev-root",
-                        "updatedAtMs": 200
+                        "root_identity": "dev-root",
+                        "root_directory": "/tmp/dev-root",
+                        "updated_at_ms": 200
                     },
                     {
                         "id": "newer-root-owner",
                         "name": "Newer root owner",
-                        "rootIdentity": "shared-root",
-                        "rootDirectory": "/tmp/shared-new",
-                        "updatedAtMs": 300
+                        "root_identity": "shared-root",
+                        "root_directory": "/tmp/shared-new",
+                        "updated_at_ms": 300
                     },
                     {
                         "id": "same-id",
                         "name": "Newer same id",
-                        "rootIdentity": "same-id-new-root",
-                        "rootDirectory": "/tmp/same-id-new",
-                        "updatedAtMs": 400
+                        "root_identity": "same-id-new-root",
+                        "root_directory": "/tmp/same-id-new",
+                        "updated_at_ms": 400
                     }
                 ]
             }),
@@ -7056,16 +6783,16 @@ mod device_data_migration_tests {
         write_json(
             &legacy_roots[0].join(&rel),
             &json!({
-                "prod-workspace": { "rootDirectory": "/tmp/prod" },
-                "shared-workspace": { "rootDirectory": "/tmp/prod-shared" }
+                "prod-workspace": { "root_directory": "/tmp/prod" },
+                "shared-workspace": { "root_directory": "/tmp/prod-shared" }
             }),
         );
         thread::sleep(Duration::from_millis(20));
         write_json(
             &legacy_roots[1].join(&rel),
             &json!({
-                "dev-workspace": { "rootDirectory": "/tmp/dev" },
-                "shared-workspace": { "rootDirectory": "/tmp/dev-shared" }
+                "dev-workspace": { "root_directory": "/tmp/dev" },
+                "shared-workspace": { "root_directory": "/tmp/dev-shared" }
             }),
         );
 
@@ -7079,12 +6806,12 @@ mod device_data_migration_tests {
 
         let merged = read_json(&device_root.join(&rel));
         assert_eq!(
-            merged["prod-workspace"]["rootDirectory"],
+            merged["prod-workspace"]["root_directory"],
             json!("/tmp/prod")
         );
-        assert_eq!(merged["dev-workspace"]["rootDirectory"], json!("/tmp/dev"));
+        assert_eq!(merged["dev-workspace"]["root_directory"], json!("/tmp/dev"));
         assert_eq!(
-            merged["shared-workspace"]["rootDirectory"],
+            merged["shared-workspace"]["root_directory"],
             json!("/tmp/dev-shared")
         );
     }
@@ -7176,21 +6903,21 @@ mod device_data_migration_tests {
                 json!({
                     "id": "ws-kept",
                     "name": "Kept",
-                    "rootIdentity": "root-kept",
-                    "rootDirectory": "/tmp/kept"
+                    "root_identity": "root-kept",
+                    "root_directory": "/tmp/kept"
                 }),
                 json!({
                     "id": "ws-removed",
                     "name": "Removed",
-                    "rootIdentity": "root-removed",
-                    "rootDirectory": "/tmp/removed"
+                    "root_identity": "root-removed",
+                    "root_directory": "/tmp/removed"
                 }),
             ],
             vec![json!({
                 "id": "ws-kept",
                 "name": "Kept",
-                "rootIdentity": "root-kept",
-                "rootDirectory": "/tmp/kept"
+                "root_identity": "root-kept",
+                "root_directory": "/tmp/kept"
             })],
             &json!({}),
             now_ms,
@@ -7204,7 +6931,7 @@ mod device_data_migration_tests {
         let removed = workspace_item_by_id(&stored, "ws-removed");
         assert!(local_workspace_catalog_entry_is_deleted(removed));
         assert_eq!(removed["deleted"], json!(true));
-        assert_eq!(removed["deletedAtMs"], json!(now_ms));
+        assert_eq!(removed["deleted_at_ms"], json!(now_ms));
     }
 
     #[test]
@@ -7213,18 +6940,18 @@ mod device_data_migration_tests {
             vec![json!({
                 "id": "ws-revive",
                 "name": "Deleted before",
-                "rootIdentity": "root-revive",
-                "rootDirectory": "/tmp/revive",
+                "root_identity": "root-revive",
+                "root_directory": "/tmp/revive",
                 "deleted": true,
-                "deletedAtMs": 100
+                "deleted_at_ms": 100
             })],
             vec![json!({
                 "id": "ws-revive",
                 "name": "Revived",
-                "rootIdentity": "root-revive",
-                "rootDirectory": "/tmp/revive",
+                "root_identity": "root-revive",
+                "root_directory": "/tmp/revive",
                 "deleted": true,
-                "deletedAtMs": 100,
+                "deleted_at_ms": 100,
                 "status": "deleted",
                 "current": false
             })],
@@ -7238,7 +6965,7 @@ mod device_data_migration_tests {
         assert!(!local_workspace_catalog_entry_is_deleted(revived));
         assert_eq!(revived["name"], json!("Revived"));
         assert!(revived.get("deleted").is_none());
-        assert!(revived.get("deletedAtMs").is_none());
+        assert!(revived.get("deleted_at_ms").is_none());
         assert_eq!(revived["current"], json!(true));
     }
 
@@ -7260,13 +6987,13 @@ mod device_data_migration_tests {
                 "workspaces": [
                     {
                         "id": "ws-deleted",
-                        "rootDirectory": deleted_root.display().to_string(),
+                        "root_directory": deleted_root.display().to_string(),
                         "deleted": true,
-                        "deletedAtMs": local_workspace_catalog_now_ms()
+                        "deleted_at_ms": local_workspace_catalog_now_ms()
                     },
                     {
                         "id": "ws-live",
-                        "rootDirectory": live_root.display().to_string()
+                        "root_directory": live_root.display().to_string()
                     }
                 ]
             }),
@@ -7278,9 +7005,9 @@ mod device_data_migration_tests {
                 "workspaces": [
                     {
                         "id": "ws-other-scope",
-                        "rootDirectory": other_scope_root.display().to_string(),
+                        "root_directory": other_scope_root.display().to_string(),
                         "deleted": true,
-                        "deletedAtMs": local_workspace_catalog_now_ms()
+                        "deleted_at_ms": local_workspace_catalog_now_ms()
                     }
                 ]
             }),
@@ -7338,18 +7065,18 @@ mod device_data_migration_tests {
             &json!({
                 "version": 1,
                 "workspaces": [
-                    { "id": "ws-live", "rootIdentity": "root-live" },
+                    { "id": "ws-live", "root_identity": "root-live" },
                     {
                         "id": "ws-tombstone",
-                        "rootIdentity": "root-tombstone",
+                        "root_identity": "root-tombstone",
                         "deleted": true,
-                        "deletedAtMs": now_ms - 1_000
+                        "deleted_at_ms": now_ms - 1_000
                     },
                     {
                         "id": "ws-expired",
-                        "rootIdentity": "root-expired",
+                        "root_identity": "root-expired",
                         "deleted": true,
-                        "deletedAtMs": now_ms - LOCAL_WORKSPACE_TOMBSTONE_RETENTION_MS - 1
+                        "deleted_at_ms": now_ms - LOCAL_WORKSPACE_TOMBSTONE_RETENTION_MS - 1
                     }
                 ]
             }),
@@ -7358,10 +7085,10 @@ mod device_data_migration_tests {
             local_workspace_catalog_retained_workspace_ids_from_dir(&store_dir, now_ms).unwrap();
         let (pruned, removed) = local_workspace_catalog_pruned_workspace_settings(
             &json!({
-                "ws-live": { "rootDirectory": "/tmp/live" },
-                "ws-tombstone": { "rootDirectory": "/tmp/tombstone" },
-                "ws-expired": { "rootDirectory": "/tmp/expired" },
-                "ws-unknown": { "rootDirectory": "/tmp/unknown" }
+                "ws-live": { "root_directory": "/tmp/live" },
+                "ws-tombstone": { "root_directory": "/tmp/tombstone" },
+                "ws-expired": { "root_directory": "/tmp/expired" },
+                "ws-unknown": { "root_directory": "/tmp/unknown" }
             }),
             &retained,
         )
@@ -7381,15 +7108,15 @@ mod device_data_migration_tests {
             vec![
                 json!({
                     "id": "ws-expired",
-                    "rootIdentity": "root-expired",
+                    "root_identity": "root-expired",
                     "deleted": true,
-                    "deletedAtMs": now_ms - LOCAL_WORKSPACE_TOMBSTONE_RETENTION_MS - 1
+                    "deleted_at_ms": now_ms - LOCAL_WORKSPACE_TOMBSTONE_RETENTION_MS - 1
                 }),
                 json!({
                     "id": "ws-fresh",
-                    "rootIdentity": "root-fresh",
+                    "root_identity": "root-fresh",
                     "deleted": true,
-                    "deletedAtMs": now_ms - 1_000
+                    "deleted_at_ms": now_ms - 1_000
                 }),
             ],
             vec![],
@@ -7409,12 +7136,12 @@ mod device_data_migration_tests {
     #[test]
     fn local_workspace_load_visible_items_filters_tombstones() {
         let visible = local_workspace_catalog_visible_items(vec![
-            json!({ "id": "ws-live", "rootIdentity": "root-live" }),
+            json!({ "id": "ws-live", "root_identity": "root-live" }),
             json!({
                 "id": "ws-deleted",
-                "rootIdentity": "root-deleted",
+                "root_identity": "root-deleted",
                 "deleted": true,
-                "deletedAtMs": 100
+                "deleted_at_ms": 100
             }),
         ]);
 
@@ -7489,7 +7216,7 @@ fn local_workspace_catalog_visible_items(items: Vec<Value>) -> Vec<Value> {
 
 /// Workspaces are local-first: the UI commits to this store instantly and the
 /// cloud workspace catalog reconciles in the background.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn local_workspaces_load(app: AppHandle, scope_key: String) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let path = local_workspace_store_path(&app, &scope_key)?;
@@ -7505,7 +7232,7 @@ async fn local_workspaces_load(app: AppHandle, scope_key: String) -> Result<Valu
     .map_err(|error| format!("Unable to load local workspace catalog: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn local_workspaces_store(
     app: AppHandle,
     scope_key: String,
@@ -7568,7 +7295,7 @@ async fn local_workspaces_store(
                         log_terminal_status_event(
                             "backend.local_workspaces.revive_ledger_cleanup_failed",
                             json!({
-                                "workspaceId": workspace_id,
+                                "workspace_id": workspace_id,
                                 "error": error,
                             }),
                         );
@@ -7588,7 +7315,7 @@ async fn local_workspaces_store(
                     log_terminal_status_event(
                         "backend.local_workspaces.revive_ledger_cleanup_failed",
                         json!({
-                            "workspaceIds": workspace_ids,
+                            "workspace_ids": workspace_ids,
                             "error": error,
                         }),
                     );
@@ -7606,14 +7333,14 @@ async fn local_workspaces_store(
         Ok(json!({
             "ok": true,
             "count": live_count,
-            "prunedWorkspaceSettings": pruned_workspace_settings,
+            "pruned_workspace_settings": pruned_workspace_settings,
         }))
     })
     .await
     .map_err(|error| format!("Unable to store local workspace catalog: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn local_workspace_reusable_id_for_root(
     app: AppHandle,
     scope_key: String,
@@ -7693,7 +7420,7 @@ fn open_path_with_default_browser(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("Unable to open HTML document in the default browser: {error}"))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn open_html_document_in_browser(
     app: AppHandle,
     title: Option<String>,
@@ -7736,24 +7463,17 @@ fn local_workspace_catalog_text(value: &Value, keys: &[&str]) -> Option<String> 
 }
 
 fn local_workspace_catalog_root_text(entry: &Value, workspace_settings: &Value) -> Option<String> {
-    let workspace_id = local_workspace_catalog_text(entry, &["id", "workspace_id", "workspaceId"]);
+    let workspace_id = local_workspace_catalog_text(entry, &["id", "workspace_id"]);
     let settings = workspace_id
         .as_deref()
         .and_then(|id| workspace_settings.get(id));
     local_workspace_catalog_text(
         entry,
-        &[
-            "rootDirectory",
-            "root_directory",
-            "workspaceRoot",
-            "workspace_root",
-            "repoPath",
-            "repo_path",
-        ],
+        &["root_directory", "workspace_root", "repo_path"],
     )
     .or_else(|| {
         settings.and_then(|settings| {
-            local_workspace_catalog_text(settings, &["rootDirectory", "root_directory"])
+            local_workspace_catalog_text(settings, &["rootDirectory"])
         })
     })
 }
@@ -7764,12 +7484,7 @@ fn local_workspace_catalog_root_identity(
 ) -> Option<(String, Option<String>)> {
     let explicit_identity = local_workspace_catalog_text(
         entry,
-        &[
-            "rootIdentity",
-            "root_identity",
-            "workspaceRootIdentity",
-            "workspace_root_identity",
-        ],
+        &["root_identity", "workspace_root_identity"],
     )
     .map(|value| normalized_literal_path_key(&value))
     .filter(|value| !value.is_empty());
@@ -7797,11 +7512,11 @@ fn local_workspace_catalog_now_ms() -> u64 {
 }
 
 fn local_workspace_catalog_entry_id(entry: &Value) -> Option<String> {
-    local_workspace_catalog_text(entry, &["id", "workspace_id", "workspaceId"])
+    local_workspace_catalog_text(entry, &["id", "workspace_id"])
 }
 
 fn local_workspace_catalog_entry_deleted_at_ms(entry: &Value) -> Option<u64> {
-    for key in ["deletedAtMs", "deleted_at_ms", "deletedAt", "deleted_at"] {
+    for key in ["deleted_at_ms", "deleted_at"] {
         if let Some(value) = entry.get(key) {
             if let Some(number) = value.as_u64() {
                 return Some(number);
@@ -7831,15 +7546,15 @@ fn local_workspace_catalog_tombstone_is_expired(entry: &Value, now_ms: u64) -> b
 fn local_workspace_catalog_mark_tombstoned(entry: &mut Value, now_ms: u64) {
     if let Value::Object(object) = entry {
         object.insert("deleted".to_string(), json!(true));
-        object.insert("deletedAtMs".to_string(), json!(now_ms));
+        object.insert("deleted_at_ms".to_string(), json!(now_ms));
     }
 }
 
 fn local_workspace_catalog_ensure_tombstone_shape(entry: &mut Value, now_ms: u64) {
     if let Value::Object(object) = entry {
         object.insert("deleted".to_string(), json!(true));
-        if !object.contains_key("deletedAtMs") && !object.contains_key("deleted_at_ms") {
-            object.insert("deletedAtMs".to_string(), json!(now_ms));
+        if !object.contains_key("deleted_at_ms") && !object.contains_key("deleted_at_ms") {
+            object.insert("deleted_at_ms".to_string(), json!(now_ms));
         }
     }
 }
@@ -7849,14 +7564,11 @@ fn local_workspace_catalog_clear_tombstone(entry: &mut Value) {
         return;
     };
     for key in [
-        "pendingDelete",
         "pending_delete",
         "deleted",
         "removed",
         "tombstoned",
-        "deletedAtMs",
         "deleted_at_ms",
-        "deletedAt",
         "deleted_at",
     ] {
         object.remove(key);
@@ -7954,7 +7666,7 @@ fn local_workspace_catalog_normalize_items(
 
     for item in items {
         let workspace_id =
-            local_workspace_catalog_text(&item, &["id", "workspace_id", "workspaceId"])
+            local_workspace_catalog_text(&item, &["id", "workspace_id"])
                 .unwrap_or_default();
         let root_details = local_workspace_catalog_root_identity(&item, workspace_settings);
 
@@ -7974,10 +7686,10 @@ fn local_workspace_catalog_normalize_items(
 
         match (item, root_details) {
             (Value::Object(mut object), Some((root_identity, root_directory))) => {
-                object.insert("rootIdentity".to_string(), json!(root_identity));
-                if !object.contains_key("rootDirectory") {
+                object.insert("root_identity".to_string(), json!(root_identity));
+                if !object.contains_key("root_directory") {
                     if let Some(root_directory) = root_directory {
-                        object.insert("rootDirectory".to_string(), json!(root_directory));
+                        object.insert("root_directory".to_string(), json!(root_directory));
                     }
                 }
                 normalized_items.push(Value::Object(object));
@@ -8047,7 +7759,7 @@ fn local_workspace_reusable_id_for_root_in_dir(
     root_path: &str,
     workspace_settings: &Value,
 ) -> Result<Option<String>, String> {
-    let probe = json!({ "rootDirectory": root_path });
+    let probe = json!({ "root_directory": root_path });
     let Some((root_identity, _)) =
         local_workspace_catalog_root_identity(&probe, workspace_settings)
     else {
@@ -8130,7 +7842,7 @@ fn local_workspace_catalog_all_workspace_ids(app: &AppHandle) -> Result<HashSet<
                     continue;
                 }
                 if let Some(id) =
-                    local_workspace_catalog_text(item, &["id", "workspace_id", "workspaceId"])
+                    local_workspace_catalog_text(item, &["id", "workspace_id"])
                 {
                     ids.insert(id);
                 }
@@ -8214,8 +7926,7 @@ fn local_workspace_catalog_prune_orphan_workspace_settings(
 
 fn local_workspace_catalog_entry_is_deleted(entry: &Value) -> bool {
     if entry
-        .get("pendingDelete")
-        .or_else(|| entry.get("pending_delete"))
+        .get("pending_delete")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
@@ -8238,7 +7949,7 @@ fn local_workspace_catalog_entry_is_deleted(entry: &Value) -> bool {
     {
         return true;
     }
-    if local_workspace_catalog_text(entry, &["deletedAt", "deleted_at"]).is_some() {
+    if local_workspace_catalog_text(entry, &["deleted_at"]).is_some() {
         return true;
     }
     local_workspace_catalog_text(entry, &["status", "workspace_status"])
@@ -8368,7 +8079,7 @@ fn app_local_state_is_desktop_auth_key(key: &str) -> bool {
     app_local_state_canonical_key(key).eq_ignore_ascii_case(DESKTOP_AUTH_STATE_KEY)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn app_local_state_load(app: AppHandle, key: String) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         // Auth state goes through the cached snapshot: the raw path re-read
@@ -8386,7 +8097,7 @@ async fn app_local_state_load(app: AppHandle, key: String) -> Result<Value, Stri
     .map_err(|error| format!("App state load worker failed: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn app_local_state_store(app: AppHandle, key: String, value: Value) -> Result<Value, String> {
     if app_local_state_is_desktop_auth_key(&key) {
         return Err("Desktop auth state is owned by the native auth core.".to_string());
@@ -8399,7 +8110,7 @@ async fn app_local_state_store(app: AppHandle, key: String, value: Value) -> Res
     .map_err(|error| format!("App state store worker failed: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn app_local_state_merge_command(
     app: AppHandle,
     key: String,
@@ -8520,6 +8231,13 @@ fn tray_click_settings_from_value(value: &Value) -> (TrayClickSettings, bool) {
 
 fn tray_click_settings_to_value(settings: &TrayClickSettings) -> Value {
     json!({
+        "foreground_action": settings.foreground_action.wire_value(),
+        "background_action": settings.background_action.wire_value(),
+    })
+}
+
+fn tray_click_settings_to_persisted_value(settings: &TrayClickSettings) -> Value {
+    json!({
         "foregroundAction": settings.foreground_action.wire_value(),
         "backgroundAction": settings.background_action.wire_value(),
     })
@@ -8546,7 +8264,7 @@ fn tray_click_settings_read_or_seed(app: &AppHandle) -> Result<(TrayClickSetting
         app_local_state_write(
             app,
             TRAY_CLICK_SETTINGS_STATE_KEY,
-            &tray_click_settings_to_value(&settings),
+            &tray_click_settings_to_persisted_value(&settings),
         )?;
     }
     tray_click_settings_apply_cache(&settings);
@@ -8557,7 +8275,7 @@ fn tray_click_settings_save(app: &AppHandle, settings: TrayClickSettings) -> Res
     app_local_state_write(
         app,
         TRAY_CLICK_SETTINGS_STATE_KEY,
-        &tray_click_settings_to_value(&settings),
+        &tray_click_settings_to_persisted_value(&settings),
     )?;
     tray_click_settings_apply_cache(&settings);
     Ok(tray_click_settings_to_value(&settings))
@@ -8574,15 +8292,14 @@ fn tray_click_settings_initialize(app: &AppHandle) {
     log_terminal_status_event(
         "backend.tray_click_settings.ready",
         json!({
-            "foregroundAction": settings.foreground_action.wire_value(),
-            "backgroundAction": settings.background_action.wire_value(),
+            "foreground_action": settings.foreground_action.wire_value(),
+            "background_action": settings.background_action.wire_value(),
             "defaulted": defaulted,
         }),
     );
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct StartupSettings {
     enabled: bool,
     launch_mode: String,
@@ -8653,9 +8370,9 @@ fn startup_settings_state_value(
 ) -> Value {
     json!({
         "enabled": settings.enabled,
-        "launchMode": settings.launch_mode,
-        "foregroundOnSecondLaunch": settings.foreground_on_second_launch,
-        "autostartEnabled": autostart_enabled,
+        "launch_mode": settings.launch_mode,
+        "foreground_on_second_launch": settings.foreground_on_second_launch,
+        "autostart_enabled": autostart_enabled,
         "defaulted": defaulted,
     })
 }
@@ -8737,9 +8454,9 @@ fn startup_settings_initialize(app: &AppHandle) {
         "backend.startup_settings.ready",
         json!({
             "enabled": settings.enabled,
-            "launchMode": settings.launch_mode,
+            "launch_mode": settings.launch_mode,
             "defaulted": defaulted,
-            "autostartEnabled": startup_autostart_is_enabled(app).ok(),
+            "autostart_enabled": startup_autostart_is_enabled(app).ok(),
         }),
     );
 }
@@ -8749,7 +8466,7 @@ fn startup_args_request_background(args: &[String]) -> bool {
         .any(|arg| arg.trim().eq_ignore_ascii_case(STARTUP_BACKGROUND_ARG))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn app_startup_settings_state(app: AppHandle) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let (settings, defaulted) = startup_settings_read_or_seed(&app)?;
@@ -8763,7 +8480,7 @@ async fn app_startup_settings_state(app: AppHandle) -> Result<Value, String> {
     .map_err(|error| format!("Startup settings worker failed: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn app_startup_settings_update(
     app: AppHandle,
     enabled: bool,
@@ -8780,7 +8497,7 @@ async fn app_startup_settings_update(
     .map_err(|error| format!("Startup settings worker failed: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn tray_click_settings_state(app: AppHandle) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let (settings, _) = tray_click_settings_read_or_seed(&app)?;
@@ -8790,7 +8507,7 @@ async fn tray_click_settings_state(app: AppHandle) -> Result<Value, String> {
     .map_err(|error| format!("Tray click settings worker failed: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn tray_click_settings_update(
     app: AppHandle,
     foreground_action: Option<String>,
@@ -8847,7 +8564,7 @@ mod tray_click_settings_tests {
             background_action: TrayClickAction::OpenApp,
         };
 
-        let value = tray_click_settings_to_value(&settings);
+        let value = tray_click_settings_to_persisted_value(&settings);
         assert_eq!(
             value,
             json!({
@@ -8862,7 +8579,7 @@ mod tray_click_settings_tests {
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn close_app_after_terminal_shutdown(
     app: AppHandle,
     window: tauri::WebviewWindow,
@@ -8872,7 +8589,7 @@ async fn close_app_after_terminal_shutdown(
     start_backend_app_shutdown_with_watchdog(app, window_label, force_exit_result)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn app_force_exit_now(app: AppHandle, reason: Option<String>) -> Result<(), String> {
     let reason = normalize_app_force_exit_reason(reason, "app_force_exit_now");
     log_terminal_crash_forensics_event(
@@ -9032,8 +8749,8 @@ fn start_main_window_cursor_watcher(app: &AppHandle) {
                     json!({
                         "hovered": true,
                         "focused": focused,
-                        "clientX": client_x,
-                        "clientY": client_y,
+                        "client_x": client_x,
+                        "client_y": client_y,
                     })
                 } else {
                     json!({
@@ -9129,7 +8846,7 @@ fn main_window_recently_minimized() -> bool {
             < MAIN_WINDOW_MINIMIZE_RESTORE_SUPPRESS_MS
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn note_main_window_minimize_requested() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     mark_main_window_minimize_requested();
@@ -9175,8 +8892,8 @@ mod workspace_delete_local_metadata_tests {
             delete_workspace_local_metadata_for(root.display().to_string(), false).unwrap();
 
         assert_eq!(result["ok"], json!(true));
-        assert_eq!(result["agentsRootRemoved"], json!(true));
-        assert_eq!(result["privateStateRootRemoved"], json!(true));
+        assert_eq!(result["agents_root_removed"], json!(true));
+        assert_eq!(result["private_state_root_removed"], json!(true));
         assert!(!agents.exists());
         assert!(!private_state_root.exists());
         assert_eq!(fs::read_to_string(root.join("source.txt")).unwrap(), "keep");
@@ -9198,7 +8915,7 @@ mod workspace_delete_local_metadata_tests {
 
         assert_eq!(result["ok"], json!(true));
         assert_eq!(result["skipped"], json!(true));
-        assert_eq!(result["privateStateRootRemoved"], json!(true));
+        assert_eq!(result["private_state_root_removed"], json!(true));
         assert!(!private_state_root.exists());
         assert_eq!(fs::read_to_string(root.join("source.txt")).unwrap(), "keep");
         let _ = fs::remove_dir_all(root);

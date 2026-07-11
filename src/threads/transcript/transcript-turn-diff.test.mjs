@@ -50,7 +50,7 @@ function turnItems() {
     {
       id: "u-1",
       type: "message",
-      turnId: "turn-1",
+      turn_id: "turn-1",
       message: {
         id: "u-1",
         role: "user",
@@ -62,7 +62,7 @@ function turnItems() {
     {
       id: "t-1",
       type: "message",
-      turnId: "turn-1",
+      turn_id: "turn-1",
       message: {
         id: "t-1",
         role: "activity",
@@ -75,7 +75,7 @@ function turnItems() {
     {
       id: "a-1",
       type: "message",
-      turnId: "turn-1",
+      turn_id: "turn-1",
       message: {
         id: "a-1",
         role: "assistant",
@@ -87,7 +87,7 @@ function turnItems() {
     {
       id: "u-2",
       type: "message",
-      turnId: "turn-2",
+      turn_id: "turn-2",
       message: {
         id: "u-2",
         role: "user",
@@ -99,7 +99,7 @@ function turnItems() {
     {
       id: "a-2",
       type: "message",
-      turnId: "turn-2",
+      turn_id: "turn-2",
       message: {
         id: "a-2",
         role: "assistant",
@@ -118,31 +118,31 @@ function turnItems() {
 test("isTurnDiffMessage detects turn_diff kind variants", () => {
   assert.equal(isTurnDiffMessage(turnDiffMessage()), true);
   assert.equal(isTurnDiffMessage({ kind: "turn-diff" }), true);
-  assert.equal(isTurnDiffMessage({ messageKind: "turn_diff" }), true);
+  assert.equal(isTurnDiffMessage({ message_kind: "turn_diff" }), true);
   assert.equal(isTurnDiffMessage({ kind: "turn_summary" }), false);
   assert.equal(isTurnDiffMessage({}), false);
 });
 
 test("normalizeTurnDiff reads the §1 contract with camelCase aliases", () => {
   const diff = normalizeTurnDiff(turnDiffMessage());
-  assert.equal(diff.turnId, "turn-1");
+  assert.equal(diff.turn_id, "turn-1");
   assert.equal(diff.files.length, 2);
-  assert.equal(diff.totalAdditions, 2);
-  assert.equal(diff.totalDeletions, 1);
+  assert.equal(diff.total_additions, 2);
+  assert.equal(diff.total_deletions, 1);
   assert.equal(diff.truncated, false);
   assert.equal(diff.files[0].patch.includes("@@ -1,2 +1,3 @@"), true);
   assert.equal(diff.files[1].binary, true);
 
   const camel = normalizeTurnDiff({
     kind: "turn_diff",
-    turnId: "turn-9",
+    turn_id: "turn-9",
     files: [{ path: "a.js", additions: 1, deletions: 0 }],
-    totalAdditions: 1,
-    totalDeletions: 0,
+    total_additions: 1,
+    total_deletions: 0,
     truncated: true,
   });
-  assert.equal(camel.turnId, "turn-9");
-  assert.equal(camel.totalAdditions, 1);
+  assert.equal(camel.turn_id, "turn-9");
+  assert.equal(camel.total_additions, 1);
   assert.equal(camel.truncated, true);
 });
 
@@ -156,10 +156,10 @@ test("normalizeTurnDiff falls back to summed totals and message timestamp window
       { path: "b.js", additions: 1, deletions: 0 },
     ],
   });
-  assert.equal(diff.totalAdditions, 5);
-  assert.equal(diff.totalDeletions, 2);
-  assert.equal(diff.startedAtMs, Date.parse("2026-07-07T12:01:00.000Z"));
-  assert.equal(diff.completedAtMs, Date.parse("2026-07-07T12:01:00.000Z"));
+  assert.equal(diff.total_additions, 5);
+  assert.equal(diff.total_deletions, 2);
+  assert.equal(diff.started_at_ms, Date.parse("2026-07-07T12:01:00.000Z"));
+  assert.equal(diff.completed_at_ms, Date.parse("2026-07-07T12:01:00.000Z"));
 });
 
 test("normalizeTurnDiff carries the source record refs and files_omitted", () => {
@@ -169,27 +169,27 @@ test("normalizeTurnDiff carries the source record refs and files_omitted", () =>
     truncated: true,
     files_omitted: 3,
   }));
-  assert.equal(diff.recordId, "rec-77");
-  assert.equal(diff.recordSeq, 4210);
-  assert.equal(diff.filesOmitted, 3);
+  assert.equal(diff.record_id, "rec-77");
+  assert.equal(diff.record_seq, 4210);
+  assert.equal(diff.files_omitted, 3);
   assert.equal(diff.truncated, true);
 
   const camel = normalizeTurnDiff(turnDiffMessage({
-    recordId: "rec-78",
-    recordSeq: 4211,
-    filesOmitted: 1,
+    record_id: "rec-78",
+    record_seq: 4211,
+    files_omitted: 1,
   }));
-  assert.equal(camel.recordId, "rec-78");
-  assert.equal(camel.recordSeq, 4211);
-  assert.equal(camel.filesOmitted, 1);
+  assert.equal(camel.record_id, "rec-78");
+  assert.equal(camel.record_seq, 4211);
+  assert.equal(camel.files_omitted, 1);
 
   const recordSeqAlias = normalizeTurnDiff(turnDiffMessage({ record_seq: 9 }));
-  assert.equal(recordSeqAlias.recordSeq, 9);
+  assert.equal(recordSeqAlias.record_seq, 9);
 
   const bare = normalizeTurnDiff(turnDiffMessage());
-  assert.equal(bare.recordId, "");
-  assert.equal(bare.recordSeq, null);
-  assert.equal(bare.filesOmitted, 0);
+  assert.equal(bare.record_id, "");
+  assert.equal(bare.record_seq, null);
+  assert.equal(bare.files_omitted, 0);
 });
 
 test("turnDiffSyntheticMessage bears refs + truncated flag, null when empty", () => {
@@ -203,9 +203,7 @@ test("turnDiffSyntheticMessage bears refs + truncated flag, null when empty", ()
   })));
   assert.deepEqual(message, {
     record_id: "rec-77",
-    recordId: "rec-77",
     record_seq: 4210,
-    recordSeq: 4210,
     truncated: true,
   });
 
@@ -215,7 +213,7 @@ test("turnDiffSyntheticMessage bears refs + truncated flag, null when empty", ()
 
   // Refs without truncation stay carried for identity.
   const untruncated = turnDiffSyntheticMessage(normalizeTurnDiff(turnDiffMessage({ record_id: "rec-9" })));
-  assert.deepEqual(untruncated, { record_id: "rec-9", recordId: "rec-9", truncated: false });
+  assert.deepEqual(untruncated, { record_id: "rec-9", truncated: false });
 });
 
 test("normalizeTurnDiff rejects non-turn-diff and empty messages", () => {
@@ -299,11 +297,11 @@ test("extractTurnDiffs same-turn replacement is order-independent", () => {
 test("turn_diff messages never surface as transcript rows", () => {
   const items = [
     ...turnItems(),
-    { id: "td-item", type: "message", turnId: "turn-1", message: turnDiffMessage() },
+    { id: "td-item", type: "message", turn_id: "turn-1", message: turnDiffMessage() },
     {
       id: "ag-1",
       type: "activityGroup",
-      turnId: "turn-1",
+      turn_id: "turn-1",
       messages: [turnDiffMessage({ id: "td-nested" })],
     },
   ];
@@ -317,7 +315,7 @@ test("internal context user messages never surface as transcript rows", () => {
     {
       id: "noise-aborted",
       type: "message",
-      turnId: "turn-1",
+      turn_id: "turn-1",
       message: {
         id: "noise-aborted",
         role: "user",
@@ -327,7 +325,7 @@ test("internal context user messages never surface as transcript rows", () => {
     {
       id: "ag-noise",
       type: "activityGroup",
-      turnId: "turn-1",
+      turn_id: "turn-1",
       messages: [
         {
           id: "noise-interrupted",
@@ -357,7 +355,7 @@ test("attachTurnRecordsToGroups matches turn ids first", () => {
   const byGroupKey = attachTurnRecordsToGroups(groups, diffs);
   assert.equal(byGroupKey.size, 1);
   const [groupKey, diff] = [...byGroupKey.entries()][0];
-  assert.equal(groups.find((group) => group.key === groupKey).turnId, "turn-1");
+  assert.equal(groups.find((group) => group.key === groupKey).turn_id, "turn-1");
   assert.equal(diff.files.length, 2);
 });
 
@@ -366,7 +364,7 @@ test("attachTurnRecordsToGroups falls back to the timestamp window", () => {
   // first turn's row window (±2s tolerance).
   const items = turnItems().map((item) => ({
     ...item,
-    turnId: undefined,
+    turn_id: undefined,
     message: { ...item.message, turn_id: undefined },
   }));
   const groups = groupRowsIntoTurns(flattenTranscriptItems(items));
@@ -427,16 +425,16 @@ test("synthetic turn_diff card row is fetchable and reports omitted files", () =
   const fileChange = rows.find((row) => row.kind === "file-change");
   assert.ok(fileChange, "expected the synthetic file-change row");
   assert.equal(fileChange.synthetic, true);
-  // Rendering model: the card reads turnDiff.filesOmitted for the
+  // Rendering model: the card reads turnDiff.files_omitted for the
   // "N more files not shown" note and the message record refs + truncated
   // flag for the standard fetchable TruncatedChip.
-  assert.equal(fileChange.turnDiff.filesOmitted, 2);
+  assert.equal(fileChange.turnDiff.files_omitted, 2);
   assert.equal(fileChange.turnDiff.truncated, true);
   assert.ok(fileChange.message, "expected a minimal message on the synthetic row");
   assert.equal(fileChange.message.record_id, "rec-77");
-  assert.equal(fileChange.message.recordId, "rec-77");
+  assert.equal(fileChange.message.record_id, "rec-77");
   assert.equal(fileChange.message.record_seq, 4210);
-  assert.equal(fileChange.message.recordSeq, 4210);
+  assert.equal(fileChange.message.record_seq, 4210);
   assert.equal(fileChange.message.truncated, true);
 });
 
@@ -451,7 +449,7 @@ test("synthetic turn_diff card keeps message null without refs or truncation", (
   const fileChange = rows.find((row) => row.kind === "file-change");
   assert.ok(fileChange, "expected the synthetic file-change row");
   assert.equal(fileChange.message, null);
-  assert.equal(fileChange.turnDiff.filesOmitted, 0);
+  assert.equal(fileChange.turnDiff.files_omitted, 0);
 });
 
 test("buildTranscriptRows attaches turn_diff to an existing file-change row", () => {
@@ -460,7 +458,7 @@ test("buildTranscriptRows attaches turn_diff to an existing file-change row", ()
     {
       id: "fc-1",
       type: "message",
-      turnId: "turn-1",
+      turn_id: "turn-1",
       message: {
         id: "fc-1",
         role: "activity",
@@ -490,12 +488,12 @@ test("turns without turn_diff keep the counts-only card", () => {
   const turnSummaries = new Map([[
     "turn-1",
     {
-      turnId: "turn-1",
-      startedAtMs: Date.parse("2026-07-07T12:00:00.000Z"),
-      completedAtMs: Date.parse("2026-07-07T12:01:00.000Z"),
-      durationMs: 60000,
+      turn_id: "turn-1",
+      started_at_ms: Date.parse("2026-07-07T12:00:00.000Z"),
+      completed_at_ms: Date.parse("2026-07-07T12:01:00.000Z"),
+      duration_ms: 60000,
       usage: null,
-      fileChange: {
+      file_change: {
         files: [{ path: "src/lib.rs", kind: "edit", additions: 2, deletions: 1 }],
         summary: "",
       },

@@ -114,13 +114,9 @@ function architectureErrorText(value, fallback = "") {
   if (direct) return direct.trim();
   const item = value.item && typeof value.item === "object" ? value.item : null;
   const itemLabel = text(
-    item?.architecture_id
-      || item?.architectureId
-      || item?.graph_id
-      || item?.graphId
-      || item?.id,
+    item?.architecture_id || item?.graph_id || item?.id,
   );
-  const itemHash = text(item?.content_hash || item?.contentHash);
+  const itemHash = text(item?.content_hash);
   if (itemLabel || itemHash) {
     return [
       itemLabel ? `graph ${itemLabel}` : "",
@@ -244,7 +240,7 @@ function writeSessionHistoryCache(cacheKey, items) {
   sessionHistoryCache.delete(cacheKey);
   sessionHistoryCache.set(cacheKey, {
     items: jsonArray(items),
-    updatedAtMs: Date.now(),
+    updated_at_ms: Date.now(),
   });
   while (sessionHistoryCache.size > SESSION_HISTORY_CACHE_LIMIT) {
     const oldestKey = sessionHistoryCache.keys().next().value;
@@ -283,9 +279,7 @@ function architectureGraphIdsFromCloudEvent(event) {
       object.operations,
       object.o,
       object.graphs,
-      object.remoteGraphs,
       object.remote_graphs,
-      object.hydratedGraphs,
       object.hydrated_graphs,
       object.items,
     ].forEach((list) => jsonArray(list).forEach(visitGraphLike));
@@ -312,7 +306,7 @@ function architectureRepoPathKey(value) {
 }
 
 function architectureRepoPathFromEntry(entry) {
-  return text(entry?.path || entry?.projectRoot || entry?.project_root || entry?.repoPath || entry?.repo_path);
+  return text(entry?.path || entry?.project_root || entry?.repo_path);
 }
 
 function architectureGraphListCacheEntry(graphLists, repoPath) {
@@ -320,29 +314,19 @@ function architectureGraphListCacheEntry(graphLists, repoPath) {
   const repoKey = architectureRepoPathKey(repoPath);
   return graphLists[repoKey]
     || graphLists[repoPath]
-    || Object.values(graphLists).find((entry) => architectureRepoPathKey(entry?.repoPath || entry?.repo_path) === repoKey)
+    || Object.values(graphLists).find((entry) => architectureRepoPathKey(entry?.repo_path) === repoKey)
     || null;
 }
 
 function architectureGraphContentHash(graph) {
   return text(
-    graph?.contentHash
-      || graph?.content_hash
-      || graph?.contentRevision
-      || graph?.content_revision
-      || graph?.syncContentHash
-      || graph?.sync_content_hash
-      || graph?.hash,
+    graph?.content_hash || graph?.content_revision || graph?.sync_content_hash || graph?.hash,
   );
 }
 
 function architectureGraphLocalUnsaved(graph) {
   return Boolean(
-    graph?.localUnsaved
-      || graph?.local_unsaved
-      || graph?.dirty
-      || graph?.syncState === "local_unsaved"
-      || graph?.sync_state === "local_unsaved",
+    graph?.local_unsaved || graph?.dirty || graph?.sync_state === "local_unsaved",
   );
 }
 
@@ -354,76 +338,52 @@ function architectureGraphListSameContent(left, right) {
     const other = rightList[index];
     return text(graph?.id) === text(other?.id)
       && text(graph?.title) === text(other?.title)
-      && text(graph?.updatedAt || graph?.updated_at) === text(other?.updatedAt || other?.updated_at)
+      && text(graph?.updated_at) === text(other?.updated_at)
       && architectureGraphContentHash(graph) === architectureGraphContentHash(other)
-      && text(graph?.architectureId || graph?.architecture_id) === text(other?.architectureId || other?.architecture_id)
-      && text(graph?.filePath || graph?.file_path) === text(other?.filePath || other?.file_path)
-      && Boolean(graph?.cloudOnly || graph?.cloud_only) === Boolean(other?.cloudOnly || other?.cloud_only)
-      && Boolean(graph?.cloudNeedsHydration || graph?.cloud_needs_hydration) === Boolean(other?.cloudNeedsHydration || other?.cloud_needs_hydration)
+      && text(graph?.architecture_id) === text(other?.architecture_id)
+      && text(graph?.file_path) === text(other?.file_path)
+      && Boolean(graph?.cloud_only) === Boolean(other?.cloud_only)
+      && Boolean(graph?.cloud_needs_hydration) === Boolean(other?.cloud_needs_hydration)
       && architectureGraphLocalUnsaved(graph) === architectureGraphLocalUnsaved(other)
-      && Boolean(graph?.localAvailable ?? graph?.local_available ?? true) === Boolean(other?.localAvailable ?? other?.local_available ?? true)
+      && Boolean(graph?.local_available ?? true) === Boolean(other?.local_available ?? true)
       && Boolean(graph?.hydrated ?? true) === Boolean(other?.hydrated ?? true)
-      && Number(graph?.nodeCount || 0) === Number(other?.nodeCount || 0)
-      && text(graph?.syncState || graph?.sync_state) === text(other?.syncState || other?.sync_state);
+      && Number(graph?.node_count || 0) === Number(other?.node_count || 0)
+      && text(graph?.sync_state) === text(other?.sync_state);
   });
 }
 
 function architectureGraphCloudId(graph) {
   return text(
-    graph?.cloudArchitectureId
-      || graph?.cloud_architecture_id
-      || graph?.cloudGraphId
-      || graph?.cloud_graph_id
-      || graph?.architectureId
-      || graph?.architecture_id
-      || graph?.graphId
-      || graph?.graph_id
-      || graph?.docId
-      || graph?.doc_id
-      || graph?.id,
+    graph?.cloud_architecture_id || graph?.cloud_graph_id || graph?.architecture_id || graph?.graph_id || graph?.doc_id || graph?.id,
   );
 }
 
 function architectureGraphCloudRef(graph) {
-  const cloudGraph = graph?.cloudGraph || graph?.cloud_graph || graph;
+  const cloudGraph = graph?.cloud_graph || graph;
   const graphId = architectureGraphCloudId(cloudGraph) || architectureGraphCloudId(graph);
   if (!graphId) return null;
   const contentHash = architectureGraphContentHash(cloudGraph) || architectureGraphContentHash(graph);
-  const assetId = text(cloudGraph?.assetId || cloudGraph?.asset_id || graph?.assetId || graph?.asset_id);
+  const assetId = text(cloudGraph?.asset_id || graph?.asset_id);
   return {
     id: graphId,
-    architectureId: graphId,
     architecture_id: graphId,
-    graphId,
     graph_id: graphId,
-    docId: graphId,
     doc_id: graphId,
-    contentHash,
     content_hash: contentHash,
-    contentRevision: contentHash,
     content_revision: contentHash,
     ...(assetId ? {
-      assetId,
       asset_id: assetId,
     } : {}),
-    blobId: text(cloudGraph?.blobId || cloudGraph?.blob_id || graph?.blobId || graph?.blob_id),
-    blob_id: text(cloudGraph?.blob_id || cloudGraph?.blobId || graph?.blob_id || graph?.blobId),
+    blob_id: text(cloudGraph?.blob_id || graph?.blob_id),
     sha256: text(cloudGraph?.sha256 || graph?.sha256),
-    sourceFormat: text(cloudGraph?.sourceFormat || cloudGraph?.source_format || graph?.sourceFormat || graph?.source_format, "eraserDsl"),
-    source_format: text(cloudGraph?.source_format || cloudGraph?.sourceFormat || graph?.source_format || graph?.sourceFormat, "eraserDsl"),
+    source_format: text(cloudGraph?.source_format || graph?.source_format, "eraserDsl"),
   };
 }
 
 function architectureGraphNeedsCloudHydration(graph) {
   if (architectureGraphLocalUnsaved(graph)) return false;
   return Boolean(
-    graph?.cloudOnly
-      || graph?.cloud_only
-      || graph?.cloudNeedsHydration
-      || graph?.cloud_needs_hydration
-      || graph?.localAvailable === false
-      || graph?.local_available === false
-      || (graph?.cloudAvailable && graph?.hydrated === false),
+    graph?.cloud_only || graph?.cloud_needs_hydration || graph?.local_available === false || graph?.cloud_available && graph?.hydrated === false,
   );
 }
 
@@ -433,15 +393,7 @@ function architectureGraphNotFoundError(value) {
 
 function architectureGraphId(graph) {
   return text(
-    graph?.localGraphId
-      || graph?.local_graph_id
-      || graph?.architectureId
-      || graph?.architecture_id
-      || graph?.graphId
-      || graph?.graph_id
-      || graph?.docId
-      || graph?.doc_id
-      || graph?.id,
+    graph?.local_graph_id || graph?.architecture_id || graph?.graph_id || graph?.doc_id || graph?.id,
   );
 }
 
@@ -453,11 +405,11 @@ function architectureHydratedGraph(result, graphId = "") {
 }
 
 function architectureRevisionGraphId(revision) {
-  return text(revision?.graphId || revision?.graph_id);
+  return text(revision?.graph_id);
 }
 
 function architectureRevisionId(revision) {
-  return text(revision?.revisionId || revision?.revision_id);
+  return text(revision?.revision_id);
 }
 
 function architectureRevisionReasonLabel(reason) {
@@ -468,7 +420,7 @@ function architectureRevisionReasonLabel(reason) {
 }
 
 function architectureRevisionTimestamp(revision) {
-  return revision?.timestamp || revision?.updatedAt || revision?.updated_at || revision?.createdAt || revision?.created_at;
+  return revision?.timestamp || revision?.updated_at || revision?.created_at;
 }
 
 const ARCHITECTURE_SELECTED_GRAPH_REFRESH_MS = 450;
@@ -594,10 +546,7 @@ function architectureWorkspaceTodoCollection(workspaceTodos, workspaceId, direct
   if (Array.isArray(byWorkspace)) {
     return byWorkspace.find((entry) => (
       text(
-        entry?.workspaceId
-          || entry?.workspace_id
-          || entry?.observerWorkspaceId
-          || entry?.observer_workspace_id,
+        entry?.workspace_id || entry?.observer_workspace_id,
       ) === safeWorkspaceId
     )) || direct;
   }
@@ -628,27 +577,21 @@ function architectureWorkspaceTodoRawItems(workspaceTodos, workspaceId, localIte
     architectureWorkspaceTodoCollection(
       workspaceTodos,
       workspaceId,
-      ["history", "todoHistory", "todo_history", "dispatches", "todoDispatches", "todo_dispatches", "items", "todos"],
+      ["history", "todo_history", "dispatches", "todo_dispatches", "items", "todos"],
       [
-        "historyByWorkspace",
         "history_by_workspace",
-        "todoHistoryByWorkspace",
         "todo_history_by_workspace",
-        "dispatchesByWorkspace",
         "dispatches_by_workspace",
-        "todoDispatchesByWorkspace",
         "todo_dispatches_by_workspace",
-        "itemsByWorkspace",
         "items_by_workspace",
-        "todosByWorkspace",
         "todos_by_workspace",
       ],
     ),
     architectureWorkspaceTodoCollection(
       workspaceTodos,
       workspaceId,
-      ["peerActivity", "peer_activity"],
-      ["peerActivityByWorkspace", "peer_activity_by_workspace"],
+      ["peer_activity"],
+      ["peer_activity_by_workspace"],
     ),
   ];
 
@@ -661,20 +604,10 @@ function architectureWorkspaceTodoRawItems(workspaceTodos, workspaceId, localIte
   return [...safeLocalItems, ...collections.flatMap(architectureTodoArrayFromCollection)].filter((item, index) => {
     if (!item || typeof item !== "object") return false;
     const id = text(
-      item.todoDispatchId
-        || item.todo_dispatch_id
-        || item.dispatchId
-        || item.dispatch_id
-        || item.commandId
-        || item.command_id
-        || item.todoId
-        || item.todo_id
-        || item.id
-        || item.clientTodoId
-        || item.client_todo_id,
+      item.todo_dispatch_id || item.dispatch_id || item.command_id || item.todo_id || item.id || item.client_todo_id,
       `todo-${index}`,
     );
-    const sourceDeviceId = text(item.deviceId || item.device_id || item.sourceDeviceId || item.source_device_id);
+    const sourceDeviceId = text(item.device_id || item.source_device_id);
     const key = `${sourceDeviceId}::${id}`;
     if (seen.has(key)) return false;
     seen.add(key);
@@ -726,17 +659,7 @@ function architectureTodoStatusLabel(status) {
 function architectureTodoText(item) {
   const note = jsonObject(item?.note) || {};
   return text(
-    item?.text
-      || item?.body
-      || item?.todoText
-      || item?.todo_text
-      || item?.todoBodyPreview
-      || item?.todo_body_preview
-      || item?.prompt
-      || item?.todo
-      || item?.task
-      || note.text
-      || note.body,
+    item?.text || item?.body || item?.todo_text || item?.todo_body_preview || item?.prompt || item?.todo || item?.task || note.text || note.body,
   );
 }
 
@@ -754,12 +677,7 @@ function architectureTodoTitle(item, fallback = "Todo") {
   // The cloud-generated LLM title is the human label for the todo; the body
   // preview is the fallback so a row is never reduced to a raw id.
   return text(
-    item?.llmTitle
-      || item?.llm_title
-      || bodyTitle
-      || item?.title
-      || item?.name
-      || note.title,
+    item?.llm_title || bodyTitle || item?.title || item?.name || note.title,
     fallback,
   );
 }
@@ -777,8 +695,8 @@ function architectureTodoNestedObject(item, keys) {
 }
 
 function architectureTodoEndpointLabel(endpoint, fallback = "unknown") {
-  const device = text(endpoint.deviceName || endpoint.deviceId);
-  const workspace = text(endpoint.workspaceName || endpoint.workspaceId);
+  const device = text(endpoint.device_name || endpoint.device_id);
+  const workspace = text(endpoint.workspace_name || endpoint.workspace_id);
   if (device && workspace) return `${device} / ${workspace}`;
   return device || workspace || fallback;
 }
@@ -794,24 +712,16 @@ function buildTodoDeviceDirectory(...deviceLists) {
   deviceLists.flat().forEach((device) => {
     if (!device || typeof device !== "object") return;
     const deviceId = todoDeviceKey(
-      device.deviceId || device.device_id || device.machineId || device.machine_id || device.id,
+      device.device_id || device.machine_id || device.id,
     );
     if (!deviceId) return;
     const displayName = text(
-      device.displayName
-        || device.display_name
-        || device.label
-        || device.deviceName
-        || device.device_name
-        || device.machineName
-        || device.machine_name
-        || device.hostname
-        || device.name,
+      device.display_name || device.label || device.device_name || device.machine_name || device.hostname || device.name,
     );
     const previous = byId.get(deviceId) || {};
     byId.set(deviceId, {
-      displayName: displayName || previous.displayName || "",
-      icon: todoDeviceKey(device.platformIcon || device.platform_icon || device.icon) || previous.icon || "",
+      display_name: displayName || previous.display_name || "",
+      icon: todoDeviceKey(device.platform_icon || device.icon) || previous.icon || "",
       platform: todoDeviceKey(device.platform || device.os) || previous.platform || "",
     });
   });
@@ -839,7 +749,7 @@ const TODO_DEVICE_PLATFORM_LABELS = {
 // Device ids carry a platform prefix (e.g. "macos-24c1b00d-..."), so the
 // platform stays resolvable even when the presence directory has no entry.
 function todoDevicePlatformToken(endpoint, directoryEntry) {
-  const hints = [directoryEntry?.icon, directoryEntry?.platform, endpoint?.deviceId, endpoint?.deviceName]
+  const hints = [directoryEntry?.icon, directoryEntry?.platform, endpoint?.device_id, endpoint?.device_name]
     .map(todoDeviceKey)
     .join(" ");
   if (/iphone|ipad|android|mobile|phone|tablet/u.test(hints)) return "mobile";
@@ -855,10 +765,10 @@ function todoDeviceLooksLikeId(value) {
 }
 
 function todoDeviceDisplayName(endpoint, directory) {
-  const deviceId = todoDeviceKey(endpoint?.deviceId);
+  const deviceId = todoDeviceKey(endpoint?.device_id);
   const entry = deviceId ? directory?.get?.(deviceId) : null;
-  if (entry?.displayName) return entry.displayName;
-  const rawName = text(endpoint?.deviceName);
+  if (entry?.display_name) return entry.display_name;
+  const rawName = text(endpoint?.device_name);
   if (rawName && todoDeviceKey(rawName) !== deviceId && !todoDeviceLooksLikeId(rawName)) return rawName;
   if (!deviceId && !rawName) return "Unknown device";
   const platformLabel = TODO_DEVICE_PLATFORM_LABELS[todoDevicePlatformToken(endpoint, entry)];
@@ -870,100 +780,45 @@ function todoDeviceDisplayName(endpoint, directory) {
 
 function architectureTodoSourceEndpoint(item) {
   const dispatchSource = architectureTodoNestedObject(item, [
-    "dispatchSource",
     "dispatch_source",
-    "sourceContext",
     "source_context",
-    "sourceEndpoint",
     "source_endpoint",
     "origin",
   ]);
   const device = jsonObject(item?.device) || {};
   const deviceId = text(
-    dispatchSource.deviceId
-      || dispatchSource.device_id
-      || item?.todoDeviceId
-      || item?.todo_device_id
-      || item?.requestedByDeviceId
-      || item?.requested_by_device_id
-      || item?.sourceDeviceId
-      || item?.source_device_id
-      || item?.deviceId
-      || item?.device_id
-      || device.deviceId
-      || device.device_id,
+    dispatchSource.device_id || item?.todo_device_id || item?.requested_by_device_id || item?.source_device_id || item?.device_id || device.device_id,
   );
   const deviceName = text(
-    dispatchSource.deviceName
-      || dispatchSource.device_name
-      || item?.todoDeviceName
-      || item?.todo_device_name
-      || item?.requestedByDeviceName
-      || item?.requested_by_device_name
-      || item?.sourceDeviceName
-      || item?.source_device_name
-      || item?.deviceName
-      || item?.device_name
-      || item?.machineName
-      || item?.machine_name
-      || device.deviceName
-      || device.device_name
-      || device.machineName
-      || device.machine_name,
+    dispatchSource.device_name || item?.todo_device_name || item?.requested_by_device_name || item?.source_device_name || item?.device_name || item?.machine_name || device.device_name || device.machine_name,
   );
   const workspaceId = text(
-    dispatchSource.workspaceId
-      || dispatchSource.workspace_id
-      || item?.todoWorkspaceId
-      || item?.todo_workspace_id
-      || item?.requestedByWorkspaceId
-      || item?.requested_by_workspace_id
-      || item?.sourceWorkspaceId
-      || item?.source_workspace_id
-      || item?.workspaceId
-      || item?.workspace_id,
+    dispatchSource.workspace_id || item?.todo_workspace_id || item?.requested_by_workspace_id || item?.source_workspace_id || item?.workspace_id,
   );
   const workspaceName = text(
-    dispatchSource.workspaceName
-      || dispatchSource.workspace_name
-      || item?.todoWorkspaceName
-      || item?.todo_workspace_name
-      || item?.requestedByWorkspaceName
-      || item?.requested_by_workspace_name
-      || item?.sourceWorkspaceName
-      || item?.source_workspace_name
-      || item?.workspaceName
-      || item?.workspace_name,
+    dispatchSource.workspace_name || item?.todo_workspace_name || item?.requested_by_workspace_name || item?.source_workspace_name || item?.workspace_name,
   );
   return {
-    clientId: text(dispatchSource.clientId || dispatchSource.client_id || item?.sourceClientId || item?.source_client_id),
-    clientKind: text(dispatchSource.clientKind || dispatchSource.client_kind || item?.sourceClientKind || item?.source_client_kind),
-    deviceId,
-    deviceName,
-    label: architectureTodoEndpointLabel({ deviceId, deviceName, workspaceId, workspaceName }, "source device"),
-    workspaceId,
-    workspaceName,
+    client_id: text(dispatchSource.client_id || item?.source_client_id),
+    client_kind: text(dispatchSource.client_kind || item?.source_client_kind),
+    device_id: deviceId,
+    device_name: deviceName,
+    label: architectureTodoEndpointLabel({ device_id: deviceId, device_name: deviceName, workspace_id: workspaceId, workspace_name: workspaceName }, "source device"),
+    workspace_id: workspaceId,
+    workspace_name: workspaceName,
   };
 }
 
 function architectureTodoTargetLabel(item) {
   const targetWorkspace = text(
-    item?.targetWorkspaceName
-      || item?.target_workspace_name
-      || item?.workspaceName
-      || item?.workspace_name,
+    item?.target_workspace_name || item?.workspace_name,
   );
   const targetDevice = text(
-    item?.targetDeviceName
-      || item?.target_device_name
-      || item?.deviceName
-      || item?.device_name
-      || item?.machineName
-      || item?.machine_name,
+    item?.target_device_name || item?.device_name || item?.machine_name,
   );
-  const targetAgent = text(item?.targetAgentLabel || item?.target_agent_label || item?.targetAgentId || item?.target_agent_id);
-  const targetTerminalIndex = item?.targetTerminalIndex ?? item?.target_terminal_index;
-  const targetTerminal = text(item?.targetTerminalId || item?.target_terminal_id || item?.terminalId || item?.terminal_id);
+  const targetAgent = text(item?.target_agent_label || item?.target_agent_id);
+  const targetTerminalIndex = item?.target_terminal_index;
+  const targetTerminal = text(item?.target_terminal_id || item?.terminal_id);
   if (targetAgent) return targetAgent;
   if (Number.isInteger(Number(targetTerminalIndex))) return `Terminal ${Number(targetTerminalIndex) + 1}`;
   if (targetTerminal) return targetTerminal;
@@ -973,146 +828,93 @@ function architectureTodoTargetLabel(item) {
 
 function architectureTodoTargetEndpoint(item) {
   const dispatchTarget = architectureTodoNestedObject(item, [
-    "dispatchTarget",
     "dispatch_target",
-    "targetContext",
     "target_context",
-    "targetEndpoint",
     "target_endpoint",
     "target",
   ]);
   const deviceId = text(
-    dispatchTarget.deviceId
-      || dispatchTarget.device_id
-      || item?.targetDeviceId
-      || item?.target_device_id
-      || item?.deviceId
-      || item?.device_id,
+    dispatchTarget.device_id || item?.target_device_id || item?.device_id,
   );
   const deviceName = text(
-    dispatchTarget.deviceName
-      || dispatchTarget.device_name
-      || item?.targetDeviceName
-      || item?.target_device_name
-      || item?.machineName
-      || item?.machine_name
-      || item?.deviceName
-      || item?.device_name,
+    dispatchTarget.device_name || item?.target_device_name || item?.machine_name || item?.device_name,
   );
   const workspaceId = text(
-    dispatchTarget.workspaceId
-      || dispatchTarget.workspace_id
-      || item?.targetWorkspaceId
-      || item?.target_workspace_id
-      || item?.workspaceId
-      || item?.workspace_id,
+    dispatchTarget.workspace_id || item?.target_workspace_id || item?.workspace_id,
   );
   const workspaceName = text(
-    dispatchTarget.workspaceName
-      || dispatchTarget.workspace_name
-      || item?.targetWorkspaceName
-      || item?.target_workspace_name
-      || item?.workspaceName
-      || item?.workspace_name,
+    dispatchTarget.workspace_name || item?.target_workspace_name || item?.workspace_name,
   );
   return {
-    agentId: text(dispatchTarget.agentId || dispatchTarget.agent_id || item?.targetAgentId || item?.target_agent_id),
-    clientId: text(dispatchTarget.clientId || dispatchTarget.client_id || item?.targetClientId || item?.target_client_id),
-    clientKind: text(dispatchTarget.clientKind || dispatchTarget.client_kind || item?.targetClientKind || item?.target_client_kind),
-    deviceId,
-    deviceName,
-    label: architectureTodoEndpointLabel({ deviceId, deviceName, workspaceId, workspaceName }, architectureTodoTargetLabel(item)),
-    terminalId: text(dispatchTarget.terminalId || dispatchTarget.terminal_id || item?.targetTerminalId || item?.target_terminal_id),
-    terminalIndex: item?.targetTerminalIndex ?? item?.target_terminal_index ?? dispatchTarget.terminalIndex ?? dispatchTarget.terminal_index,
-    threadId: text(dispatchTarget.threadId || dispatchTarget.thread_id || item?.targetThreadId || item?.target_thread_id),
-    workspaceId,
-    workspaceName,
+    agent_id: text(dispatchTarget.agent_id || item?.target_agent_id),
+    client_id: text(dispatchTarget.client_id || item?.target_client_id),
+    client_kind: text(dispatchTarget.client_kind || item?.target_client_kind),
+    device_id: deviceId,
+    device_name: deviceName,
+    label: architectureTodoEndpointLabel({ device_id: deviceId, device_name: deviceName, workspace_id: workspaceId, workspace_name: workspaceName }, architectureTodoTargetLabel(item)),
+    terminal_id: text(dispatchTarget.terminal_id || item?.target_terminal_id),
+    terminal_index: item?.target_terminal_index ?? dispatchTarget.terminal_index,
+    thread_id: text(dispatchTarget.thread_id || item?.target_thread_id),
+    workspace_id: workspaceId,
+    workspace_name: workspaceName,
   };
 }
 
 function architectureTodoCreatedMs(item) {
-  return parseTimeMs(item?.createdAt || item?.created_at || item?.queuedAt || item?.queued_at);
+  return parseTimeMs(item?.created_at || item?.queued_at);
 }
 
 function architectureTodoFinishedMs(item, status) {
-  if (status === "completed") return parseTimeMs(item?.completedAt || item?.completed_at || item?.todoCompletedAt || item?.todo_completed_at);
-  if (status === "cancelled") return parseTimeMs(item?.cancelledAt || item?.cancelled_at || item?.canceledAt || item?.canceled_at || item?.todoCancelledAt || item?.todo_cancelled_at);
-  if (status === "paused") return parseTimeMs(item?.pausedAt || item?.paused_at || item?.parkedAt || item?.parked_at || item?.todoPausedAt || item?.todo_paused_at);
-  if (status === "interrupted") return parseTimeMs(item?.interruptedAt || item?.interrupted_at || item?.todoInterruptedAt || item?.todo_interrupted_at);
-  if (status === "timed-out") return parseTimeMs(item?.timedOutAt || item?.timed_out_at || item?.timeoutAt || item?.timeout_at || item?.todoTimedOutAt || item?.todo_timed_out_at);
-  if (status === "failed") return parseTimeMs(item?.failedAt || item?.failed_at || item?.todoFailedAt || item?.todo_failed_at);
-  if (status === "deleted") return parseTimeMs(item?.deletedAt || item?.deleted_at || item?.todoDeletedAt || item?.todo_deleted_at);
+  if (status === "completed") return parseTimeMs(item?.completed_at || item?.todo_completed_at);
+  if (status === "cancelled") return parseTimeMs(item?.cancelled_at || item?.canceled_at || item?.todo_cancelled_at);
+  if (status === "paused") return parseTimeMs(item?.paused_at || item?.parked_at || item?.todo_paused_at);
+  if (status === "interrupted") return parseTimeMs(item?.interrupted_at || item?.todo_interrupted_at);
+  if (status === "timed-out") return parseTimeMs(item?.timed_out_at || item?.timeout_at || item?.todo_timed_out_at);
+  if (status === "failed") return parseTimeMs(item?.failed_at || item?.todo_failed_at);
+  if (status === "deleted") return parseTimeMs(item?.deleted_at || item?.todo_deleted_at);
   return 0;
 }
 
 function architectureTodoRefs(item, fallbackId = "") {
-  const todoId = text(item?.todoId || item?.todo_id || item?.id || item?.clientTodoId || item?.client_todo_id);
-  const todoIds = jsonArray(item?.todoIds || item?.todo_ids)
+  const todoId = text(item?.todo_id || item?.id || item?.client_todo_id);
+  const todoIds = jsonArray(item?.todo_ids)
     .map((value) => text(value))
     .filter(Boolean);
   const dispatchId = text(
-    item?.dispatchId
-      || item?.dispatch_id
-      || item?.todoDispatchId
-      || item?.todo_dispatch_id,
+    item?.dispatch_id || item?.todo_dispatch_id,
   );
-  const commandId = text(item?.commandId || item?.command_id);
-  const promptEventId = text(item?.promptEventId || item?.prompt_event_id);
+  const commandId = text(item?.command_id);
+  const promptEventId = text(item?.prompt_event_id);
   const batchId = text(
-    item?.todoBatchId
-      || item?.todo_batch_id
-      || item?.batchId
-      || item?.batch_id
-      || item?.planId
-      || item?.plan_id,
+    item?.todo_batch_id || item?.batch_id || item?.plan_id,
   );
   const historyId = text(dispatchId || commandId || promptEventId || todoId || batchId, fallbackId);
   return {
-    batchId,
-    commandId,
-    dispatchId,
-    historyId,
-    promptEventId,
-    todoId,
-    todoIds: [todoId, ...todoIds].filter(Boolean),
+    batch_id: batchId,
+    command_id: commandId,
+    dispatch_id: dispatchId,
+    history_id: historyId,
+    prompt_event_id: promptEventId,
+    todo_id: todoId,
+    todo_ids: [todoId, ...todoIds].filter(Boolean),
   };
 }
 
 function architectureTaskSourceRefs(task) {
   const metadata = jsonObject(task?.metadata_json || task?.metadata) || {};
-  const source = jsonObject(task?.source_todo || task?.sourceTodo || metadata.source_todo || metadata.sourceTodo) || {};
+  const source = jsonObject(task?.source_todo || metadata.source_todo) || {};
   return {
-    commandId: text(
-      task?.source_command_id
-        || task?.sourceCommandId
-        || task?.command_id
-        || task?.commandId
-        || source.command_id
-        || source.commandId,
+    command_id: text(
+      task?.source_command_id || task?.command_id || source.command_id,
     ),
-    dispatchId: text(
-      task?.source_todo_dispatch_id
-        || task?.sourceTodoDispatchId
-        || task?.todo_dispatch_id
-        || task?.todoDispatchId
-        || source.todo_dispatch_id
-        || source.todoDispatchId,
+    dispatch_id: text(
+      task?.source_todo_dispatch_id || task?.todo_dispatch_id || source.todo_dispatch_id,
     ),
-    promptEventId: text(
-      task?.source_prompt_event_id
-        || task?.sourcePromptEventId
-        || task?.prompt_event_id
-        || task?.promptEventId
-        || source.prompt_event_id
-        || source.promptEventId,
+    prompt_event_id: text(
+      task?.source_prompt_event_id || task?.prompt_event_id || source.prompt_event_id,
     ),
-    todoId: text(
-      task?.source_todo_id
-        || task?.sourceTodoId
-        || task?.todo_id
-        || task?.todoId
-        || source.todo_id
-        || source.todoId,
+    todo_id: text(
+      task?.source_todo_id || task?.todo_id || source.todo_id,
     ),
   };
 }
@@ -1120,10 +922,10 @@ function architectureTaskSourceRefs(task) {
 function architectureTaskMatchesTodo(task, todoRefs) {
   const taskRefs = architectureTaskSourceRefs(task);
   return Boolean(
-    (todoRefs.todoId && taskRefs.todoId === todoRefs.todoId)
-      || (todoRefs.dispatchId && taskRefs.dispatchId === todoRefs.dispatchId)
-      || (todoRefs.commandId && taskRefs.commandId === todoRefs.commandId)
-      || (todoRefs.promptEventId && taskRefs.promptEventId === todoRefs.promptEventId),
+    (todoRefs.todo_id && taskRefs.todo_id === todoRefs.todo_id)
+      || (todoRefs.dispatch_id && taskRefs.dispatch_id === todoRefs.dispatch_id)
+      || (todoRefs.command_id && taskRefs.command_id === todoRefs.command_id)
+      || (todoRefs.prompt_event_id && taskRefs.prompt_event_id === todoRefs.prompt_event_id),
   );
 }
 
@@ -1136,11 +938,9 @@ function architectureTasksForTodo(todoRefs, tasks) {
 function architecturePlanSteps(plan) {
   return jsonArray(plan?.steps).length
     ? jsonArray(plan.steps)
-    : jsonArray(plan?.planSteps).length
-      ? jsonArray(plan.planSteps)
-      : jsonArray(plan?.plan_steps).length
-        ? jsonArray(plan.plan_steps)
-        : jsonArray(plan?.items);
+    : jsonArray(plan?.plan_steps).length
+      ? jsonArray(plan.plan_steps)
+      : jsonArray(plan?.items);
 }
 
 function architecturePlanTitle(plan, fallback = "Plan") {
@@ -1153,60 +953,38 @@ function architecturePlanDescription(plan) {
 
 function architectureTodoSyntheticPlan(item) {
   const explicitPlanId = text(
-    item?.planId
-      || item?.plan_id,
+    item?.plan_id,
   );
   const batchPlanId = text(
-    item?.todoBatchId
-      || item?.todo_batch_id
-      || item?.batchId
-      || item?.batch_id,
+    item?.todo_batch_id || item?.batch_id,
   );
-  const source = text(item?.source || item?.sourceKind || item?.source_kind).toLowerCase();
+  const source = text(item?.source || item?.source_kind).toLowerCase();
   const hasPlanShape = Boolean(
-    explicitPlanId
-      || text(item?.planTitle || item?.plan_title)
-      || item?.planStepIndex !== undefined
-      || item?.plan_step_index !== undefined
-      || item?.planStepCount !== undefined
-      || item?.plan_step_count !== undefined
-      || source.includes("create_plan")
-      || source.includes("create-plan"),
+    explicitPlanId || text(item?.plan_title) || item?.plan_step_index !== undefined || item?.plan_step_count !== undefined || source.includes("create_plan") || source.includes("create-plan"),
   );
   const planId = explicitPlanId || (hasPlanShape ? batchPlanId : "");
   if (!planId) return null;
   const refs = architectureTodoRefs(item);
-  const title = text(item?.planTitle || item?.plan_title || item?.title || item?.name, "Todo plan");
-  const stepIndex = Number(item?.planStepIndex ?? item?.plan_step_index ?? item?.stepIndex ?? item?.step_index);
+  const title = text(item?.plan_title || item?.title || item?.name, "Todo plan");
+  const stepIndex = Number(item?.plan_step_index ?? item?.step_index);
   const stepTitle = text(
-    item?.title
-      || item?.bodyPreview
-      || item?.body_preview
-      || item?.todoBodyPreview
-      || item?.todo_body_preview
-      || item?.text
-      || item?.body,
+    item?.title || item?.body_preview || item?.todo_body_preview || item?.text || item?.body,
     title,
   );
   return {
     id: planId,
     plan_id: planId,
-    planId,
-    status: text(item?.planStatus || item?.plan_status || item?.todoStatus || item?.todo_status || item?.status, "listed"),
+    status: text(item?.plan_status || item?.todo_status || item?.status, "listed"),
     title,
-    todo_batch_id: refs.batchId || planId,
-    todoBatchId: refs.batchId || planId,
-    todo_id: refs.todoId,
-    todoId: refs.todoId,
-    todo_ids: refs.todoIds,
-    todoIds: refs.todoIds,
+    todo_batch_id: refs.batch_id || planId,
+    todo_id: refs.todo_id,
+    todo_ids: refs.todo_ids,
     steps: Number.isInteger(stepIndex)
       ? [{
         detail: item?.detail || item?.details || item?.description,
-        id: refs.todoId || `${planId}-step-${stepIndex}`,
-        status: text(item?.todoStatus || item?.todo_status || item?.status, "listed"),
+        id: refs.todo_id || `${planId}-step-${stepIndex}`,
+        status: text(item?.todo_status || item?.status, "listed"),
         step_index: stepIndex,
-        stepIndex,
         title: stepTitle,
       }]
       : [],
@@ -1221,15 +999,7 @@ function architectureTodoPlanEntries(item, relatedTasks = []) {
     if (!normalized) return;
     const title = architecturePlanTitle(normalized, task ? taskDisplayTitle(task) : "Todo plan");
     const key = text(
-      normalized.plan_id
-        || normalized.planId
-        || normalized.id
-        || normalized.todo_batch_id
-        || normalized.todoBatchId
-        || normalized.batch_id
-        || normalized.batchId
-        || keyHint
-        || `${sourceLabel}-${entries.length}`,
+      normalized.plan_id || normalized.id || normalized.todo_batch_id || normalized.batch_id || keyHint || `${sourceLabel}-${entries.length}`,
     );
     const dedupeKey = key ? `plan:${key}` : `${sourceLabel}:${keyHint}:${title}`;
     if (seen.has(dedupeKey)) return;
@@ -1237,29 +1007,24 @@ function architectureTodoPlanEntries(item, relatedTasks = []) {
     entries.push({
       key: dedupeKey,
       plan: normalized,
-      sourceLabel,
+      source_label: sourceLabel,
       task,
       title,
     });
   };
 
   [
-    item?.compactPlan,
     item?.compact_plan,
     item?.terminal_todo_plan,
-    item?.terminalTodoPlan,
-    item?.terminalPlan,
     item?.terminal_plan,
-    item?.todoPlan,
     item?.todo_plan,
     item?.plan,
-    item?.planTask,
     item?.plan_task,
     architectureTodoSyntheticPlan(item),
   ].forEach((plan, index) => addPlan(plan, "Todo", `todo-inline-${index}`));
   jsonArray(item?.plans).forEach((plan, index) => addPlan(plan, "Todo", `todo-plan-${index}`));
-  jsonArray(item?.planTasks || item?.plan_tasks).forEach((plan, index) => addPlan(plan, "Todo", `todo-plan-task-${index}`));
-  jsonArray(item?.terminalPlans || item?.terminal_plans).forEach((plan, index) => (
+  jsonArray(item?.plan_tasks).forEach((plan, index) => addPlan(plan, "Todo", `todo-plan-task-${index}`));
+  jsonArray(item?.terminal_plans).forEach((plan, index) => (
     addPlan(plan, "Todo", `todo-terminal-plan-${index}`)
   ));
   relatedTasks.forEach((task, index) => {
@@ -1274,15 +1039,11 @@ function architectureTodoHistoryItemsFromWorkspaceTodos(workspaceTodos, workspac
   return architectureWorkspaceTodoRawItems(workspaceTodos, workspaceId, localItems)
     .map((item, index) => {
       const status = architectureNormalizeTodoStatus(
-        item.todoStatus
-          || item.todo_status
-          || item.status
-          || item.cloudStatus
-          || item.cloud_status,
+        item.todo_status || item.status || item.cloud_status,
       );
       const createdMs = architectureTodoCreatedMs(item);
       const finishedMs = architectureTodoFinishedMs(item, status);
-      const updatedMs = parseTimeMs(item.updatedAt || item.updated_at || item.todoStatusUpdatedAt || item.todo_status_updated_at)
+      const updatedMs = parseTimeMs(item.updated_at || item.todo_status_updated_at)
         || finishedMs
         || createdMs;
       const body = architectureTodoText(item);
@@ -1293,38 +1054,38 @@ function architectureTodoHistoryItemsFromWorkspaceTodos(workspaceTodos, workspac
       const sourceDevice = architectureTodoSourceEndpoint(item);
       const targetDevice = architectureTodoTargetEndpoint(item);
       return {
-        batchId: refs.batchId,
+        batch_id: refs.batch_id,
         body,
-        commandId: refs.commandId,
-        createdMs,
-        dispatchId: refs.dispatchId,
+        command_id: refs.command_id,
+        created_ms: createdMs,
+        dispatch_id: refs.dispatch_id,
         duration: formatTimelineDuration(createdMs, finishedMs || updatedMs, status === "running"),
-        endMs: finishedMs,
-        id: refs.historyId,
+        end_ms: finishedMs,
+        id: refs.history_id,
         planCount: relatedPlans.length,
-        promptEventId: refs.promptEventId,
+        prompt_event_id: refs.prompt_event_id,
         raw: item,
-        rawStatus: text(item.todoStatus || item.todo_status || item.status || item.cloudStatus || item.cloud_status, status),
+        rawStatus: text(item.todo_status || item.status || item.cloud_status, status),
         relatedPlans,
         relatedTasks,
         source: architectureTodoSourceLabel(item),
-        sourceDevice,
-        startMs: createdMs,
+        source_device: sourceDevice,
+        start_ms: createdMs,
         status,
         statusKind: architectureTodoStatusKind(status),
-        statusLabel: architectureTodoStatusLabel(status),
+        status_label: architectureTodoStatusLabel(status),
         target: targetDevice.label || architectureTodoTargetLabel(item),
-        targetDevice,
-        taskCount: relatedTasks.length,
+        target_device: targetDevice,
+        task_count: relatedTasks.length,
         title: architectureTodoTitle(item, `Todo ${index + 1}`),
         titleFromBody: Boolean(bodyTitle),
-        todoId: refs.todoId,
-        todoIds: refs.todoIds,
+        todo_id: refs.todo_id,
+        todo_ids: refs.todo_ids,
         updatedMs,
       };
     })
     .sort((left, right) => (
-      (right.updatedMs || right.createdMs || 0) - (left.updatedMs || left.createdMs || 0)
+      (right.updatedMs || right.created_ms || 0) - (left.updatedMs || left.created_ms || 0)
         || left.title.localeCompare(right.title)
     ))
     .slice(0, 200);
@@ -1337,28 +1098,19 @@ function taskStatus(task) {
 
 function taskTerminalPlan(task) {
   const metadata = jsonObject(task?.metadata_json || task?.metadata);
-  return jsonObject(task?.terminal_todo_plan)
-    || jsonObject(task?.terminalTodoPlan)
-    || jsonObject(metadata?.terminal_todo_plan)
-    || jsonObject(metadata?.terminalTodoPlan);
+  return jsonObject(task?.terminal_todo_plan) || jsonObject(metadata?.terminal_todo_plan);
 }
 
 function taskPlanTaskId(task, fallback = "") {
   return text(
-    task?.task_id
-      || task?.taskId
-      || task?.id,
+    task?.task_id || task?.id,
     fallback,
   );
 }
 
 function terminalPlanIdentity(plan, fallback = "") {
   return text(
-    plan?.plan_id
-      || plan?.planId
-      || plan?.id
-      || plan?.todo_id
-      || plan?.todoId,
+    plan?.plan_id || plan?.id || plan?.todo_id,
     fallback,
   );
 }
@@ -1381,7 +1133,6 @@ function completedTerminalTodoPlan(plan) {
   return {
     ...plan,
     current_step_index: steps.length ? steps.length - 1 : plan.current_step_index,
-    currentStepIndex: steps.length ? steps.length - 1 : plan.currentStepIndex,
     status: "completed",
     steps,
   };
@@ -2053,7 +1804,7 @@ function architectureRunTargetId(label, action, index = 0) {
 
 function architectureNormalizeRunTarget(target, index = 0) {
   if (!target || typeof target !== "object") return null;
-  const props = architectureCleanDslProps(target.semanticProps || target.props || target);
+  const props = architectureCleanDslProps(target.semantic_props || target.props || target);
   const action = architectureSemanticSlug(
     target.action || props.action || props.kind || props.type || target.kind || target.type,
     "run",
@@ -2067,28 +1818,28 @@ function architectureNormalizeRunTarget(target, index = 0) {
     ARCHITECTURE_RUN_DEFAULT_ENVS,
   );
   const modes = architectureRunList(
-    target.modes || target.allowedModes || target.allowed_modes || props.modes || props.allowedModes || props.allowed_modes || props.mode,
+    target.modes || target.allowed_modes || props.modes || props.allowed_modes || props.mode,
     ARCHITECTURE_RUN_DEFAULT_MODES,
   );
   const defaultEnv = architectureSemanticSlug(
-    target.defaultEnv || target.default_env || props.defaultEnv || props.default_env,
+    target.default_env || props.default_env,
     envs.includes("staging") ? "staging" : envs[0] || "local",
   );
   const defaultMode = architectureSemanticSlug(
-    target.defaultMode || target.default_mode || props.defaultMode || props.default_mode,
+    target.default_mode || props.default_mode,
     modes.includes("plan") ? "plan" : modes[0] || "plan",
   );
   return {
     action,
-    defaultEnv: envs.includes(defaultEnv) ? defaultEnv : envs[0] || "local",
-    defaultMode: modes.includes(defaultMode) ? defaultMode : modes[0] || "plan",
+    default_env: envs.includes(defaultEnv) ? defaultEnv : envs[0] || "local",
+    default_mode: modes.includes(defaultMode) ? defaultMode : modes[0] || "plan",
     envs: envs.length ? envs : ARCHITECTURE_RUN_DEFAULT_ENVS,
     id: text(target.id || props.id, architectureRunTargetId(label, action, index)),
     label,
     modes: modes.length ? modes : ARCHITECTURE_RUN_DEFAULT_MODES,
-    requiresApproval: text(target.requiresApproval || target.requires_approval || props.requiresApproval || props.requires_approval || props.approval),
+    requires_approval: text(target.requires_approval || props.requires_approval || props.approval),
     scope: text(target.scope || props.scope),
-    semanticProps: props,
+    semantic_props: props,
   };
 }
 
@@ -2099,27 +1850,27 @@ function architectureRunTargetFromDslLine(line, index = 0) {
   return architectureNormalizeRunTarget({
     ...props,
     label: name,
-    semanticProps: props,
+    semantic_props: props,
   }, index);
 }
 
 function architectureRunTargetDslLine(target, index = 0) {
   const runTarget = architectureNormalizeRunTarget(target, index);
   if (!runTarget) return "";
-  const props = architecturePropsWithOrderedOverrides(runTarget.semanticProps, {
+  const props = architecturePropsWithOrderedOverrides(runTarget.semantic_props, {
     action: runTarget.action,
     envs: runTarget.envs.join(","),
     modes: runTarget.modes.join(","),
-    defaultEnv: runTarget.defaultEnv,
-    defaultMode: runTarget.defaultMode,
+    default_env: runTarget.default_env,
+    default_mode: runTarget.default_mode,
     ...(runTarget.scope ? { scope: runTarget.scope } : {}),
-    ...(runTarget.requiresApproval ? { approval: runTarget.requiresApproval } : {}),
+    ...(runTarget.requires_approval ? { approval: runTarget.requires_approval } : {}),
   });
   return `run ${architectureDslString(runTarget.label)}${architectureDslPropsText(props)}`;
 }
 
 function architectureRunTargetsFromGraph(graph) {
-  const direct = jsonArray(graph?.runTargets || graph?.run_targets)
+  const direct = jsonArray(graph?.run_targets)
     .map(architectureNormalizeRunTarget)
     .filter(Boolean);
   if (direct.length) return direct;
@@ -2138,11 +1889,11 @@ function architectureRunTargetsFromGraph(graph) {
 function architectureRunTargetSelection(target, selections = {}) {
   const runTarget = architectureNormalizeRunTarget(target) || {};
   const selected = jsonObject(selections[runTarget.id]) || {};
-  const env = architectureSemanticSlug(selected.env, runTarget.defaultEnv || runTarget.envs?.[0] || "local");
-  const mode = architectureSemanticSlug(selected.mode, runTarget.defaultMode || "plan");
+  const env = architectureSemanticSlug(selected.env, runTarget.default_env || runTarget.envs?.[0] || "local");
+  const mode = architectureSemanticSlug(selected.mode, runTarget.default_mode || "plan");
   return {
-    env: jsonArray(runTarget.envs).includes(env) ? env : runTarget.defaultEnv || runTarget.envs?.[0] || "local",
-    mode: jsonArray(runTarget.modes).includes(mode) ? mode : runTarget.defaultMode || "plan",
+    env: jsonArray(runTarget.envs).includes(env) ? env : runTarget.default_env || runTarget.envs?.[0] || "local",
+    mode: jsonArray(runTarget.modes).includes(mode) ? mode : runTarget.default_mode || "plan",
   };
 }
 
@@ -2159,8 +1910,8 @@ function architectureRunPrompt(target, env, mode) {
   return [
     `Run architecture target "${text(runTarget.label, "Run")}".`,
     `Action: ${text(runTarget.action, "run")}.`,
-    `Environment: ${text(env, runTarget.defaultEnv || "local")}.`,
-    `Mode: ${text(mode, runTarget.defaultMode || "plan")}.`,
+    `Environment: ${text(env, runTarget.default_env || "local")}.`,
+    `Mode: ${text(mode, runTarget.default_mode || "plan")}.`,
     runTarget.scope ? `Scope: ${runTarget.scope}.` : "",
   ].filter(Boolean).join(" ");
 }
@@ -2510,7 +2261,7 @@ function architectureResolveIconDescriptor(icon, kind = "service", labelHint = "
       rawLabelHint,
     ].join("|"),
     label: architectureIconInitials(rawLabelHint || displayName),
-    sourceLabel: displayName,
+    source_label: displayName,
     styledCandidates: state.styledCandidates,
     styledKey: state.styledKey,
   };
@@ -2522,7 +2273,7 @@ function architectureIconFallbackState(descriptor) {
     Icon,
     label: descriptor.label,
     source: Icon ? "styled" : "label",
-    title: descriptor.sourceLabel,
+    title: descriptor.source_label,
   };
 }
 
@@ -2635,7 +2386,7 @@ function architectureFileNameFromPath(value) {
 }
 
 function architectureGraphFileName(graph) {
-  const pathName = architectureFileNameFromPath(graph?.filePath || graph?.file_path);
+  const pathName = architectureFileNameFromPath(graph?.file_path);
   if (pathName) return pathName;
   const graphId = text(graph?.id, architectureSlug(graph?.title || "architecture"));
   if (/\.(arch|json)$/iu.test(graphId)) return graphId;
@@ -2654,7 +2405,7 @@ function createArchitectureTreeNode(name = "", path = []) {
 function architectureGraphTreeRows(graphs, startDepth = 0) {
   const root = createArchitectureTreeNode();
   jsonArray(graphs).forEach((graph) => {
-    const parts = architectureFolderPathParts(graph.groupPath);
+    const parts = architectureFolderPathParts(graph.group_path);
     let node = root;
     parts.forEach((part) => {
       const key = part.toLowerCase();
@@ -2990,7 +2741,7 @@ function architectureLayoutGraph(graph) {
   const byId = new Map(nodes.map((node) => [node.id, node]));
   const childrenByParent = new Map();
   nodes.forEach((node) => {
-    const parentId = text(node.parentId || "");
+    const parentId = text(node.parent_id || "");
     if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, []);
     childrenByParent.get(parentId).push(node);
   });
@@ -3506,18 +3257,18 @@ function architectureParseDslGraph(graph) {
     id: text(graph?.id, architectureSlug(graph?.title || "architecture")),
     title: text(graph?.title, "Architecture graph"),
     kind: "architecture",
-    groupPath: architectureFolderPathParts(graph?.groupPath),
+    group_path: architectureFolderPathParts(graph?.group_path),
     layout: { direction: "LR", engine: "dsl" },
     source,
-    sourceFormat: "eraserDsl",
+    source_format: "eraserDsl",
     version: 2,
-    createdAt: text(graph?.createdAt),
-    updatedAt: text(graph?.updatedAt),
-    filePath: text(graph?.filePath),
+    created_at: text(graph?.created_at),
+    updated_at: text(graph?.updated_at),
+    file_path: text(graph?.file_path),
     nodes: [],
     edges: [],
-    apiCorridors: [],
-    runTargets: [],
+    api_corridors: [],
+    run_targets: [],
   };
   const nameToId = new Map();
   const nodeById = new Map();
@@ -3562,7 +3313,7 @@ function architectureParseDslGraph(graph) {
       type: isGroup ? "group" : "node",
       icon,
       color: text(props.color, isGroup ? ARCHITECTURE_GROUP_INTENT_COLORS[intent] : ""),
-      semanticProps,
+      semantic_props: semanticProps,
       ...(isGroup ? {
         intent,
         owner: text(props.owner),
@@ -3575,7 +3326,7 @@ function architectureParseDslGraph(graph) {
         status: text(props.status),
       }),
       ...(!isGroup ? { display } : {}),
-      ...(parentId ? { parentId } : {}),
+      ...(parentId ? { parent_id: parentId } : {}),
     };
     parsed.nodes.push(node);
     nodeById.set(id, node);
@@ -3598,8 +3349,8 @@ function architectureParseDslGraph(graph) {
     );
     corridor.steps.push({
       id: uniqueId(`${corridor.id}-step`, "corridor-step"),
-      sourceName,
-      targetName,
+      source_name: sourceName,
+      target_name: targetName,
       label: cleanLabel,
       kind: architectureEdgeKindFromRole(role, "calls"),
       role,
@@ -3611,7 +3362,7 @@ function architectureParseDslGraph(graph) {
       path: text(edgeProps.path || edgeProps.route),
       status: text(edgeProps.status),
       step: text(edgeProps.step),
-      semanticProps: edgeProps,
+      semantic_props: edgeProps,
     });
   };
 
@@ -3627,7 +3378,7 @@ function architectureParseDslGraph(graph) {
       return;
     }
     if (line.startsWith("folder ") || line.startsWith("groupPath ") || line.startsWith("path ")) {
-      parsed.groupPath = architectureUnquoteDsl(line.replace(/^(folder|groupPath|path)\s+/u, ""))
+      parsed.group_path = architectureUnquoteDsl(line.replace(/^(folder|groupPath|path)\s+/u, ""))
         .split(/[/>]/u)
         .map((part) => part.trim())
         .filter(Boolean);
@@ -3641,8 +3392,8 @@ function architectureParseDslGraph(graph) {
       return;
     }
     if (/^run\s+/u.test(line)) {
-      const target = architectureRunTargetFromDslLine(line, parsed.runTargets.length);
-      if (target) parsed.runTargets.push(target);
+      const target = architectureRunTargetFromDslLine(line, parsed.run_targets.length);
+      if (target) parsed.run_targets.push(target);
       return;
     }
     if (/^(colorMode|styleMode|typeface|legend)\b/u.test(line)) return;
@@ -3662,16 +3413,16 @@ function architectureParseDslGraph(graph) {
           display: text(props.display || props.mode, "overlay"),
           fromName: text(props.from || props.source || props.client),
           intent: ARCHITECTURE_API_CORRIDOR_INTENT,
-          lastVerified: text(props.lastVerified || props.last_verified || props.verified),
+          last_verified: text(props.last_verified || props.verified),
           orient: text(props.orient || props.orientation, "shortest-path"),
           route: text(props.route || props.via),
-          semanticProps,
+          semantic_props: semanticProps,
           source: text(props.sourceRef || props.source || props.ref),
           status: text(props.status, "current"),
           steps: [],
           toName: text(props.to || props.target || props.server),
         };
-        parsed.apiCorridors.push(corridor);
+        parsed.api_corridors.push(corridor);
         stack.push({ corridor, id, name, type: "apiCorridor" });
         return;
       }
@@ -3722,7 +3473,7 @@ function architectureParseDslGraph(graph) {
               condition: text(edgeProps.condition || edgeProps.guard),
               criticality: text(edgeProps.criticality),
               event: text(edgeProps.event),
-              semanticProps: edgeProps,
+              semantic_props: edgeProps,
             });
             if (connector.value === "<>") {
               parsed.edges.push({
@@ -3735,7 +3486,7 @@ function architectureParseDslGraph(graph) {
                 condition: text(edgeProps.condition || edgeProps.guard),
                 criticality: text(edgeProps.criticality),
                 event: text(edgeProps.event),
-                semanticProps: edgeProps,
+                semantic_props: edgeProps,
               });
             }
           });
@@ -3749,13 +3500,13 @@ function architectureParseDslGraph(graph) {
     registerNode(name, props, false);
   });
 
-  parsed.apiCorridors = parsed.apiCorridors
+  parsed.api_corridors = parsed.api_corridors
     .map((corridor, index) => {
       const fromId = resolveReference(corridor.fromName)
-        || resolveReference(corridor.steps[0]?.sourceName)
+        || resolveReference(corridor.steps[0]?.source_name)
         || "";
       const toId = resolveReference(corridor.toName)
-        || resolveReference(corridor.steps.at(-1)?.targetName)
+        || resolveReference(corridor.steps.at(-1)?.target_name)
         || "";
       const routeNames = architectureTokenizeDslConnection(corridor.route)
         .filter((token) => token.type === "name")
@@ -3763,8 +3514,8 @@ function architectureParseDslGraph(graph) {
         .filter(Boolean);
       const steps = corridor.steps.map((step, stepIndex) => ({
         ...step,
-        source: resolveReference(step.sourceName),
-        target: resolveReference(step.targetName),
+        source: resolveReference(step.source_name),
+        target: resolveReference(step.target_name),
         step: text(step.step, String(stepIndex + 1)),
       }));
       return {
@@ -3783,7 +3534,7 @@ function architectureParseDslGraph(graph) {
   return architectureLayoutGraph(parsed);
 }
 
-function architectureEmptyGraphSource({ groupPath = "", title = "" } = {}) {
+function architectureEmptyGraphSource({ group_path: groupPath = "", title = "" } = {}) {
   const cleanTitle = text(title, "Architecture graph");
   const groupParts = text(groupPath)
     .split(/[/>]/u)
@@ -3798,19 +3549,19 @@ function architectureEmptyGraphSource({ groupPath = "", title = "" } = {}) {
   return `${lines.join("\n")}\n`;
 }
 
-function architectureEmptyGraph({ groupPath = "", title = "" } = {}) {
+function architectureEmptyGraph({ group_path: groupPath = "", title = "" } = {}) {
   const cleanTitle = text(title, "Architecture graph");
   const id = `${architectureSlug(cleanTitle)}-${String(Date.now()).slice(-5)}`;
-  const source = architectureEmptyGraphSource({ groupPath, title: cleanTitle });
+  const source = architectureEmptyGraphSource({ group_path: groupPath, title: cleanTitle });
   return architectureParseDslGraph({
     id,
     title: cleanTitle,
-    groupPath: text(groupPath)
+    group_path: text(groupPath)
       .split(/[/>]/u)
       .map((part) => part.trim())
       .filter(Boolean),
     source,
-    sourceFormat: "eraserDsl",
+    source_format: "eraserDsl",
   });
 }
 
@@ -3830,18 +3581,18 @@ function architectureTargetHandlePosition(direction) {
 
 function architectureFlowNodeFromGraphNode(node, index = 0, direction = "LR") {
   const isSourceGroup = text(node?.kind || node?.type) === "group" || text(node?.type) === "group";
-  const intent = isSourceGroup ? architectureGroupIntent(node?.intent || node?.view || node?.groupIntent) : "";
-  const role = !isSourceGroup ? architectureNodeRole(node?.role || node?.semanticRole || node?.kind || node?.type) : "";
+  const intent = isSourceGroup ? architectureGroupIntent(node?.intent || node?.view || node?.group_intent) : "";
+  const role = !isSourceGroup ? architectureNodeRole(node?.role || node?.semantic_role || node?.kind || node?.type) : "";
   const rawKind = text(
     node?.kind && node?.kind !== "node" ? node.kind : "",
     isSourceGroup ? "group" : architectureNodeKindFromRole(role, "service"),
   );
   const isGroup = rawKind === "group" || text(node?.type) === "group";
   const id = text(node?.id, architectureEntityId(isGroup ? "group" : "node"));
-  const parentId = text(node?.parentId || node?.parent_id);
+  const parentId = text(node?.parent_id);
   const position = jsonObject(node?.position) || {};
   const title = text(node?.title || node?.label, isGroup ? "Group" : "Node");
-  const semanticProps = architectureCleanDslProps(node?.semanticProps || node?.semantic_props || node?.props);
+  const semanticProps = architectureCleanDslProps(node?.semantic_props || node?.props);
   const display = architectureNodeDisplayMode({ ...node, kind: rawKind, role, title }, isGroup);
   const compact = display === "compact";
   const icon = text(
@@ -3862,7 +3613,7 @@ function architectureFlowNodeFromGraphNode(node, index = 0, direction = "LR") {
   return {
     id,
     type: isGroup ? "architectureGroup" : "architectureNode",
-    parentId: parentId || undefined,
+    parent_id: parentId || undefined,
     extent: parentId ? "parent" : undefined,
     position: {
       x: numberValue(position.x, 80 + (index % 3) * 220),
@@ -3882,8 +3633,8 @@ function architectureFlowNodeFromGraphNode(node, index = 0, direction = "LR") {
       owner: text(node?.owner),
       role,
       scope: text(node?.scope),
-      semanticProps,
-      source: text(node?.source || node?.sourceRef || node?.reference),
+      semantic_props: semanticProps,
+      source: text(node?.source || node?.source_ref || node?.reference),
       status: text(node?.status),
       subtitle: compact ? "" : text(
         node?.subtitle || node?.description,
@@ -3917,7 +3668,7 @@ function architectureFlowEdgeFromGraphEdge(edge) {
       kind: text(edge?.kind, architectureEdgeKindFromRole(edge?.role, "calls")),
       label: text(edge?.label || edge?.title),
       role: architectureEdgeRole(edge?.role || edge?.kind, "calls"),
-      semanticProps: architectureCleanDslProps(edge?.semanticProps || edge?.semantic_props || edge?.props),
+      semantic_props: architectureCleanDslProps(edge?.semantic_props || edge?.props),
     },
   };
 }
@@ -4052,8 +3803,8 @@ function architectureApiCorridorFlowNodeFromCorridor(corridor, index, flowNodes,
     ...step,
     id: text(step?.id, `${corridor.id}-step-${stepIndex + 1}`),
     label: architectureApiCorridorStepLabel(step),
-    sourceTitle: architectureFlowNodeTitle(nodeById.get(step?.source)) || text(step?.sourceName, "source"),
-    targetTitle: architectureFlowNodeTitle(nodeById.get(step?.target)) || text(step?.targetName, "target"),
+    sourceTitle: architectureFlowNodeTitle(nodeById.get(step?.source)) || text(step?.source_name, "source"),
+    targetTitle: architectureFlowNodeTitle(nodeById.get(step?.target)) || text(step?.target_name, "target"),
     tone: architectureApiCorridorRoleTone(step?.role || step?.kind),
   }));
 
@@ -4077,11 +3828,11 @@ function architectureApiCorridorFlowNodeFromCorridor(corridor, index, flowNodes,
       direction,
       from: fromId,
       fromTitle: architectureFlowNodeTitle(fromNode),
-      lastVerified: text(corridor.lastVerified),
+      last_verified: text(corridor.last_verified),
       orientation: horizontal ? "horizontal" : "vertical",
       orient: text(corridor.orient || corridor.orientation, "shortest-path"),
       routeParticipants,
-      semanticProps: architectureCleanDslProps(corridor.semanticProps),
+      semantic_props: architectureCleanDslProps(corridor.semantic_props),
       source: text(corridor.source),
       status: text(corridor.status, "current"),
       steps,
@@ -4102,7 +3853,7 @@ function architectureGraphToFlow(graph) {
   const edges = jsonArray(compiledGraph?.edges)
     .map(architectureFlowEdgeFromGraphEdge)
     .filter(Boolean);
-  const corridorNodes = jsonArray(compiledGraph?.apiCorridors || compiledGraph?.api_corridors)
+  const corridorNodes = jsonArray(compiledGraph?.api_corridors)
     .map((corridor, index) => architectureApiCorridorFlowNodeFromCorridor(corridor, index, nodes, edges, direction))
     .filter(Boolean);
   return { edges, nodes: [...nodes, ...corridorNodes] };
@@ -4122,9 +3873,9 @@ function architectureApiCorridorFlowNodeToGraph(node) {
     fromName: text(data.fromTitle),
     id: text(node?.id),
     intent: ARCHITECTURE_API_CORRIDOR_INTENT,
-    lastVerified: text(data.lastVerified),
+    last_verified: text(data.last_verified),
     orient: text(data.orient, "shortest-path"),
-    semanticProps: architectureCleanDslProps(data.semanticProps),
+    semantic_props: architectureCleanDslProps(data.semantic_props),
     source: text(data.source),
     status: text(data.status, "current"),
     steps: jsonArray(data.steps).map((step, index) => ({
@@ -4140,7 +3891,7 @@ function architectureApiCorridorFlowNodeToGraph(node) {
 
 function architectureApiCorridorDslLines(node, dslNameById) {
   const corridor = architectureApiCorridorFlowNodeToGraph(node);
-  const props = architecturePropsWithOrderedOverrides(corridor.semanticProps, {
+  const props = architecturePropsWithOrderedOverrides(corridor.semantic_props, {
     intent: ARCHITECTURE_API_CORRIDOR_INTENT,
     display: "overlay",
     from: dslNameById.get(corridor.from) || corridor.fromName,
@@ -4149,16 +3900,16 @@ function architectureApiCorridorDslLines(node, dslNameById) {
     orient: corridor.orient || "shortest-path",
     ...(corridor.status ? { status: corridor.status } : {}),
     ...(corridor.source ? { source: corridor.source } : {}),
-    ...(corridor.lastVerified ? { lastVerified: corridor.lastVerified } : {}),
+    ...(corridor.last_verified ? { last_verified: corridor.last_verified } : {}),
   });
   const lines = [
     `${architectureDslName(corridor.title)}${architectureDslPropsText(props)} {`,
   ];
   corridor.steps.forEach((step, index) => {
     const role = architectureEdgeRole(step?.role || step?.kind, "request");
-    const source = architectureApiCorridorDslNodeName(step?.source, step?.sourceName || step?.sourceTitle, dslNameById);
-    const target = architectureApiCorridorDslNodeName(step?.target, step?.targetName || step?.targetTitle, dslNameById);
-    const stepProps = architecturePropsWithOrderedOverrides(step?.semanticProps, {
+    const source = architectureApiCorridorDslNodeName(step?.source, step?.source_name || step?.sourceTitle, dslNameById);
+    const target = architectureApiCorridorDslNodeName(step?.target, step?.target_name || step?.targetTitle, dslNameById);
+    const stepProps = architecturePropsWithOrderedOverrides(step?.semantic_props, {
       step: text(step?.step, String(index + 1)),
       role,
       ...(step?.method ? { method: step.method } : {}),
@@ -4180,7 +3931,7 @@ function architectureApiCorridorDslLines(node, dslNameById) {
 function architectureFlowGraphToDsl(graph, nodes, edges) {
   const currentGraph = jsonObject(graph) || {};
   const graphTitle = text(currentGraph.title, "Architecture graph");
-  const groupPath = architectureFolderPathParts(currentGraph.groupPath);
+  const groupPath = architectureFolderPathParts(currentGraph.group_path);
   const runTargets = architectureRunTargetsFromGraph(currentGraph);
   const corridorNodes = nodes.filter((node) => node.type === "architectureCorridor");
   const groupNodes = nodes.filter((node) => node.type === "architectureGroup");
@@ -4189,7 +3940,7 @@ function architectureFlowGraphToDsl(graph, nodes, edges) {
   const nodeById = new Map(allNodes.map((node) => [node.id, node]));
   const childrenByParent = new Map();
   allNodes.forEach((node) => {
-    const parentId = text(node.parentId);
+    const parentId = text(node.parent_id);
     if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, []);
     childrenByParent.get(parentId).push(node);
   });
@@ -4203,7 +3954,7 @@ function architectureFlowGraphToDsl(graph, nodes, edges) {
   allNodes.forEach((node) => {
     const title = text(node.data?.title || node.id, node.id);
     const duplicateTitle = (titleCounts.get(title.toLowerCase()) || 0) > 1;
-    const parentTitle = text(nodeById.get(node.parentId)?.data?.title);
+    const parentTitle = text(nodeById.get(node.parent_id)?.data?.title);
     const idSuffix = text(node.id).split("-").filter(Boolean).at(-1);
     const dslName = duplicateTitle
       ? [parentTitle, title, idSuffix].filter(Boolean).join(" / ")
@@ -4215,7 +3966,7 @@ function architectureFlowGraphToDsl(graph, nodes, edges) {
     const display = architectureNodeDisplayMode(node.data || {}, false);
     const compact = display === "compact";
     const role = architectureNodeRole(node.data?.role || node.data?.kind);
-    const props = architecturePropsWithOrderedOverrides(node.data?.semanticProps, {
+    const props = architecturePropsWithOrderedOverrides(node.data?.semantic_props, {
       icon: node.data?.icon || ARCHITECTURE_NODE_ROLE_ICONS[role] || node.data?.kind,
       ...(dslLabelById.has(node.id) ? { label: dslLabelById.get(node.id) } : {}),
       role,
@@ -4239,7 +3990,7 @@ function architectureFlowGraphToDsl(graph, nodes, edges) {
   lines.push("");
   const emitGroup = (group, depth = 0) => {
     const intent = architectureGroupIntent(group.data?.intent);
-    lines.push(`${"  ".repeat(depth)}${architectureDslName(dslNameById.get(group.id) || group.data?.title || group.id)}${architectureDslPropsText(architecturePropsWithOrderedOverrides(group.data?.semanticProps, {
+    lines.push(`${"  ".repeat(depth)}${architectureDslName(dslNameById.get(group.id) || group.data?.title || group.id)}${architectureDslPropsText(architecturePropsWithOrderedOverrides(group.data?.semantic_props, {
       icon: group.data?.icon || ARCHITECTURE_GROUP_INTENT_ICONS[intent] || "box",
       color: group.data?.color || ARCHITECTURE_GROUP_INTENT_COLORS[intent],
       intent,
@@ -4268,7 +4019,7 @@ function architectureFlowGraphToDsl(graph, nodes, edges) {
     const target = architectureDslName(dslNameById.get(edge.target) || edge.target);
     const label = text(edge.data?.label);
     const role = architectureEdgeRole(edge.data?.role || edge.data?.kind);
-    const props = architecturePropsWithOrderedOverrides(edge.data?.semanticProps, {
+    const props = architecturePropsWithOrderedOverrides(edge.data?.semantic_props, {
       role,
       ...(edge.data?.condition ? { condition: edge.data.condition } : {}),
       ...(edge.data?.event ? { event: edge.data.event } : {}),
@@ -4291,9 +4042,9 @@ function architectureGraphFromFlow(graph, nodes, edges) {
   return {
     ...currentGraph,
     source,
-    sourceFormat: "eraserDsl",
-    runTargets: architectureRunTargetsFromGraph(currentGraph),
-    apiCorridors: nodes
+    source_format: "eraserDsl",
+    run_targets: architectureRunTargetsFromGraph(currentGraph),
+    api_corridors: nodes
       .filter((node) => node.type === "architectureCorridor")
       .map(architectureApiCorridorFlowNodeToGraph),
     nodes: nodes.filter((node) => node.type !== "architectureCorridor").map((node) => {
@@ -4310,7 +4061,7 @@ function architectureGraphFromFlow(graph, nodes, edges) {
         color: text(node.data?.color),
         kind: isGroup ? "group" : text(node.data?.kind, "service"),
         type: isGroup ? "group" : "node",
-        semanticProps: architectureCleanDslProps(node.data?.semanticProps),
+        semantic_props: architectureCleanDslProps(node.data?.semantic_props),
         ...(isGroup ? {
           intent,
           owner: text(node.data?.owner),
@@ -4327,7 +4078,7 @@ function architectureGraphFromFlow(graph, nodes, edges) {
           x: Math.round(numberValue(node.position?.x, 0)),
           y: Math.round(numberValue(node.position?.y, 0)),
         },
-        ...(node.parentId ? { parentId: node.parentId } : {}),
+        ...(node.parent_id ? { parent_id: node.parent_id } : {}),
         ...(isGroup || compact ? {
           height: Math.round(numberValue(
             node.style?.height,
@@ -4353,7 +4104,7 @@ function architectureGraphFromFlow(graph, nodes, edges) {
       label: text(edge.data?.label),
       kind: text(edge.data?.kind, "calls"),
       role: architectureEdgeRole(edge.data?.role || edge.data?.kind),
-      semanticProps: architectureCleanDslProps(edge.data?.semanticProps),
+      semantic_props: architectureCleanDslProps(edge.data?.semantic_props),
     })),
     layout: {
       ...(jsonObject(graph?.layout) || {}),
@@ -4365,7 +4116,7 @@ function architectureGraphFromFlow(graph, nodes, edges) {
 function architectureGroupDescendantIds(groupId, nodes) {
   const childrenByParent = new Map();
   jsonArray(nodes).forEach((node) => {
-    const parentId = text(node.parentId);
+    const parentId = text(node.parent_id);
     if (!parentId) return;
     if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, []);
     childrenByParent.get(parentId).push(node);
@@ -4473,12 +4224,12 @@ function architectureNormalizedIdentityText(value) {
 function architectureGraphIdentity(graph) {
   const graphId = text(graph?.id);
   const graphTitle = text(graph?.title, "Architecture graph");
-  const graphFilePath = text(graph?.filePath || graph?.file_path);
+  const graphFilePath = text(graph?.file_path);
   return {
-    graphFilePath,
-    graphId,
-    graphKey: architectureNormalizedIdentityText(graphFilePath || graphId || graphTitle),
-    graphTitle,
+    graph_file_path: graphFilePath,
+    graph_id: graphId,
+    graph_key: architectureNormalizedIdentityText(graphFilePath || graphId || graphTitle),
+    graph_title: graphTitle,
   };
 }
 
@@ -4521,39 +4272,81 @@ function architectureAgentColor(value, fallback = "") {
 function architectureNormalizeAgentEditMarker(marker) {
   if (!marker || typeof marker !== "object") return null;
   const identity = architectureGraphIdentity({
-    filePath: marker.graphFilePath || marker.graph_file_path,
-    id: marker.graphId || marker.graph_id,
-    title: marker.graphTitle || marker.graph_title,
+    file_path: marker.graph_file_path,
+    id: marker.graph_id,
+    title: marker.graph_title,
   });
-  const commandId = text(marker.commandId || marker.command_id || marker.id);
-  const createdAt = text(marker.createdAt || marker.created_at, new Date().toISOString());
+  const commandId = text(marker.command_id || marker.id);
+  const createdAt = text(marker.created_at, new Date().toISOString());
   const status = text(marker.status || marker.state, "queued") === "editing" ? "editing" : "queued";
-  if (!commandId || !identity.graphKey) return null;
-  const agentId = text(marker.agentId || marker.agent_id || marker.codingAgent || marker.coding_agent);
-  const agentLabel = architectureAgentLabel(marker.agentLabel || marker.agent_label || agentId);
+  if (!commandId || !identity.graph_key) return null;
+  const agentId = text(marker.agent_id || marker.coding_agent);
+  const agentLabel = architectureAgentLabel(marker.agent_label || agentId);
   return {
-    agentColor: text(marker.agentColor || marker.agent_color, architectureAgentColor(agentId || agentLabel, commandId)),
-    agentId,
-    agentLabel,
-    commandId,
-    createdAt,
-    graphFilePath: identity.graphFilePath,
-    graphId: identity.graphId,
-    graphKey: identity.graphKey,
-    graphTitle: identity.graphTitle,
+    agent_color: text(marker.agent_color, architectureAgentColor(agentId || agentLabel, commandId)),
+    agent_id: agentId,
+    agent_label: agentLabel,
+    command_id: commandId,
+    created_at: createdAt,
+    graph_file_path: identity.graph_file_path,
+    graph_id: identity.graph_id,
+    graph_key: identity.graph_key,
+    graph_title: identity.graph_title,
     id: commandId,
-    repoPath: text(marker.repoPath || marker.repo_path),
+    repo_path: text(marker.repo_path),
     status,
-    taskId: text(marker.taskId || marker.task_id),
-    updatedAt: text(marker.updatedAt || marker.updated_at, createdAt),
-    workspaceId: text(marker.workspaceId || marker.workspace_id),
+    task_id: text(marker.task_id),
+    updated_at: text(marker.updated_at, createdAt),
+    workspace_id: text(marker.workspace_id),
   };
+}
+
+const ARCHITECTURE_EDIT_MARKER_PERSISTED_TO_RUNTIME_KEYS = Object.freeze({
+  agentColor: "agent_color",
+  agentId: "agent_id",
+  agentLabel: "agent_label",
+  codingAgent: "coding_agent",
+  commandId: "command_id",
+  createdAt: "created_at",
+  graphFilePath: "graph_file_path",
+  graphId: "graph_id",
+  graphKey: "graph_key",
+  graphTitle: "graph_title",
+  repoPath: "repo_path",
+  taskId: "task_id",
+  updatedAt: "updated_at",
+  workspaceId: "workspace_id",
+});
+
+const ARCHITECTURE_EDIT_MARKER_RUNTIME_TO_PERSISTED_KEYS = Object.freeze(
+  Object.fromEntries(
+    Object.entries(ARCHITECTURE_EDIT_MARKER_PERSISTED_TO_RUNTIME_KEYS)
+      .map(([persisted, runtime]) => [runtime, persisted]),
+  ),
+);
+
+function mapArchitectureEditMarkerKeys(value, keyMap) {
+  if (Array.isArray(value)) {
+    return value.map((item) => mapArchitectureEditMarkerKeys(item, keyMap));
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [
+      keyMap[key] || key,
+      mapArchitectureEditMarkerKeys(item, keyMap),
+    ]),
+  );
 }
 
 function architectureReadStoredAgentEditMarkers(storageKey) {
   if (!storageKey || typeof window === "undefined" || !window.localStorage) return [];
   try {
-    const parsed = JSON.parse(window.localStorage.getItem(storageKey) || "[]");
+    const parsed = mapArchitectureEditMarkerKeys(
+      JSON.parse(window.localStorage.getItem(storageKey) || "[]"),
+      ARCHITECTURE_EDIT_MARKER_PERSISTED_TO_RUNTIME_KEYS,
+    );
     return jsonArray(parsed).map(architectureNormalizeAgentEditMarker).filter(Boolean);
   } catch {
     return [];
@@ -4565,7 +4358,10 @@ function architectureWriteStoredAgentEditMarkers(storageKey, markers) {
   try {
     window.localStorage.setItem(
       storageKey,
-      JSON.stringify(jsonArray(markers).slice(-ARCHITECTURE_AGENT_EDIT_MARKER_MAX_ITEMS)),
+      JSON.stringify(mapArchitectureEditMarkerKeys(
+        jsonArray(markers).slice(-ARCHITECTURE_AGENT_EDIT_MARKER_MAX_ITEMS),
+        ARCHITECTURE_EDIT_MARKER_RUNTIME_TO_PERSISTED_KEYS,
+      )),
     );
   } catch {
     // Visual edit markers are best effort; the queued task still exists independently.
@@ -4580,10 +4376,10 @@ function architectureTodoCommandId() {
 }
 
 function architectureAgentTaskText({
-  commandId,
+  command_id: commandId,
   graph,
   prompt,
-  repoPath,
+  repo_path: repoPath,
   runEnvironment = "",
   runMode = "",
   runTarget = null,
@@ -4594,8 +4390,8 @@ function architectureAgentTaskText({
     "",
     `Run target: ${normalizedRunTarget.label}`,
     `Run action: ${normalizedRunTarget.action}`,
-    `Run environment: ${text(runEnvironment, normalizedRunTarget.defaultEnv)}`,
-    `Run mode: ${text(runMode, normalizedRunTarget.defaultMode)}`,
+    `Run environment: ${text(runEnvironment, normalizedRunTarget.default_env)}`,
+    `Run mode: ${text(runMode, normalizedRunTarget.default_mode)}`,
     normalizedRunTarget.scope ? `Run scope: ${normalizedRunTarget.scope}` : "",
     "Run target instructions: the `run` line describes operational intent and guardrails, not shell commands. Read the selected architecture graph and repo evidence before acting. In plan mode, stay read-only and explain the intended operation. For apply, rollback, production, destructive, credential, migration, or externally mutating work, use normal Diff Forge coordination and approval gates before changing or running anything.",
   ] : [];
@@ -4603,10 +4399,9 @@ function architectureAgentTaskText({
     `Architecture graph request: ${prompt}`,
     "",
     commandId ? `Command id: ${commandId}` : "",
-    `Current graph: ${identity.graphTitle}`,
-    identity.graphFilePath ? `Graph file: ${identity.graphFilePath}` : identity.graphId ? `Graph id: ${identity.graphId}` : "",
+    `Current graph: ${identity.graph_title}`,
+    identity.graph_file_path ? `Graph file: ${identity.graph_file_path}` : identity.graph_id ? `Graph id: ${identity.graph_id}` : "",
     repoPath ? `Repo: ${repoPath}` : "",
-    "",
     "Update the selected .arch graph file for this graph. Keep each edit syntactically valid so the Architecture tab can hot-reload the graph as nodes, groups, and edges are added.",
     "Treat .arch as a general system graph: one graph may contain connected or disconnected groups for architecture, api-pathway, api-corridor, data-flow, control-graph, state-machine, dependency-graph, deployment, runtime, or subsystem slices.",
     "Use api-corridor overlay containers only for important ordered API procedures such as auth, checkout, webhooks, task dispatch, uploads, token refresh, or async job lifecycles. API corridors explain runtime order across existing nodes; they are not replacement topology and not line-by-line source narration.",
@@ -4621,13 +4416,13 @@ function architectureAgentTaskText({
 function architectureQueueAgentTodo({
   graph,
   prompt,
-  repoPath,
+  repo_path: repoPath,
   runEnvironment = "",
   runMode = "",
   runTarget = null,
   targetFields = {},
-  workspaceId,
-  workspaceName,
+  workspace_id: workspaceId,
+  workspace_name: workspaceName,
 }) {
   const safeWorkspaceId = text(workspaceId);
   const safeTargetFields = jsonObject(targetFields) || {};
@@ -4635,55 +4430,55 @@ function architectureQueueAgentTodo({
   const now = new Date().toISOString();
   const identity = architectureGraphIdentity(graph);
   const architectureGraph = {
-    filePath: identity.graphFilePath,
-    graphKey: identity.graphKey,
-    id: identity.graphId,
-    repoPath: text(repoPath),
-    title: identity.graphTitle,
+    file_path: identity.graph_file_path,
+    graph_key: identity.graph_key,
+    id: identity.graph_id,
+    repo_path: text(repoPath),
+    title: identity.graph_title,
   };
   const architectureRun = architectureNormalizeRunTarget(runTarget);
   const selectedRun = architectureRun ? {
-    environment: text(runEnvironment, architectureRun.defaultEnv),
-    mode: text(runMode, architectureRun.defaultMode),
+    environment: text(runEnvironment, architectureRun.default_env),
+    mode: text(runMode, architectureRun.default_mode),
     target: architectureRun,
   } : null;
   const item = {
-    architectureGraph,
-    ...(selectedRun ? { architectureRun: selectedRun } : {}),
-    createdAt: now,
+    architecture_graph: architectureGraph,
+    ...(selectedRun ? { architecture_run: selectedRun } : {}),
+    created_at: now,
     id: commandId,
     kind: "todo",
     ...safeTargetFields,
-    remoteCommand: {
-      ...(selectedRun ? { architectureRun: selectedRun } : {}),
-      architectureGraph,
-      commandId,
-      graphFilePath: identity.graphFilePath,
-      graphId: identity.graphId,
-      graphTitle: identity.graphTitle,
+    remote_command: {
+      ...(selectedRun ? { architecture_run: selectedRun } : {}),
+      architecture_graph: architectureGraph,
+      command_id: commandId,
+      graph_file_path: identity.graph_file_path,
+      graph_id: identity.graph_id,
+      graph_title: identity.graph_title,
       source: "architecture-tab",
       ...safeTargetFields,
     },
     source: ARCHITECTURE_TODO_QUEUE_SOURCE,
     text: architectureAgentTaskText({
-      commandId,
+      command_id: commandId,
       graph,
       prompt,
-      repoPath,
+      repo_path: repoPath,
       runEnvironment,
       runMode,
       runTarget: architectureRun,
     }),
-    workspaceId: safeWorkspaceId,
+    workspace_id: safeWorkspaceId,
   };
   if (typeof window !== "undefined" && typeof window.dispatchEvent === "function") {
     window.dispatchEvent(new CustomEvent(ARCHITECTURE_REMOTE_TODO_QUEUE_EVENT, {
       detail: {
-        commandId,
+        command_id: commandId,
         item,
         source: "architecture-tab",
-        workspaceId: safeWorkspaceId,
-        workspaceName: text(workspaceName),
+        workspace_id: safeWorkspaceId,
+        workspace_name: text(workspaceName),
       },
     }));
   }
@@ -4804,16 +4599,7 @@ function taskDisplayTitle(task) {
   const metadata = jsonObject(task?.metadata_json || task?.metadata);
   const terminalPlan = taskTerminalPlan(task);
   return text(
-    terminalPlan?.title
-      || terminalPlan?.name
-      || task?.plan_title
-      || task?.planTitle
-      || metadata?.plan_title
-      || metadata?.planTitle
-      || task?.title
-      || task?.name
-      || metadata?.title
-      || metadata?.name,
+    terminalPlan?.title || terminalPlan?.name || task?.plan_title || metadata?.plan_title || task?.title || task?.name || metadata?.title || metadata?.name,
     "Untitled plan",
   );
 }
@@ -4822,23 +4608,7 @@ function taskBody(task) {
   const terminalPlan = taskTerminalPlan(task);
   const metadata = jsonObject(task?.metadata_json || task?.metadata);
   return text(
-    task?.body
-      || task?.prompt
-      || task?.input
-      || task?.user_input
-      || task?.userInput
-      || task?.description
-      || task?.details
-      || task?.summary
-      || task?.request
-      || metadata?.body
-      || metadata?.prompt
-      || metadata?.input
-      || metadata?.user_input
-      || metadata?.userInput
-      || terminalPlan?.description
-      || terminalPlan?.detail
-      || task?.start_task_plan,
+    task?.body || task?.prompt || task?.input || task?.user_input || task?.description || task?.details || task?.summary || task?.request || metadata?.body || metadata?.prompt || metadata?.input || metadata?.user_input || terminalPlan?.description || terminalPlan?.detail || task?.start_task_plan,
   );
 }
 
@@ -4849,50 +4619,37 @@ function taskAgentLabel(task) {
 function architectureTaskAgentId(task) {
   const terminalPlan = taskTerminalPlan(task);
   return text(
-    taskAgentLabel(task)
-      || terminalPlan?.agent_kind
-      || terminalPlan?.agentKind
-      || terminalPlan?.agent_id
-      || terminalPlan?.agentId,
+    taskAgentLabel(task) || terminalPlan?.agent_kind || terminalPlan?.agent_id,
   );
 }
 
 function architectureAgentEditMarkerFromQueueItem(item) {
-  const remoteCommand = jsonObject(item?.remoteCommand || item?.remote_command) || {};
+  const remoteCommand = jsonObject(item?.remote_command) || {};
   const graphMetadata = jsonObject(
-    item?.architectureGraph
-      || item?.architecture_graph
-      || remoteCommand?.architectureGraph
-      || remoteCommand?.architecture_graph,
+    item?.architecture_graph || remoteCommand?.architecture_graph,
   ) || {};
   const identity = architectureGraphIdentity({
-    filePath: graphMetadata.filePath
-      || graphMetadata.file_path
-      || remoteCommand.graphFilePath
-      || remoteCommand.graph_file_path,
-    id: graphMetadata.id || graphMetadata.graphId || graphMetadata.graph_id || remoteCommand.graphId || remoteCommand.graph_id,
-    title: graphMetadata.title || graphMetadata.graphTitle || graphMetadata.graph_title || remoteCommand.graphTitle || remoteCommand.graph_title,
+    file_path: graphMetadata.file_path || remoteCommand.graph_file_path,
+    id: graphMetadata.id || graphMetadata.graph_id || remoteCommand.graph_id,
+    title: graphMetadata.title || graphMetadata.graph_title || remoteCommand.graph_title,
   });
-  const commandId = text(remoteCommand.commandId || remoteCommand.command_id || item?.id);
-  if (!commandId || !identity.graphKey) return null;
+  const commandId = text(remoteCommand.command_id || item?.id);
+  if (!commandId || !identity.graph_key) return null;
   const agentId = text(
-    item?.targetAgentId
-      || item?.target_agent_id
-      || remoteCommand.targetAgentId
-      || remoteCommand.target_agent_id,
+    item?.target_agent_id || remoteCommand.target_agent_id,
   );
   return architectureNormalizeAgentEditMarker({
-    agentId,
-    agentLabel: item?.targetAgentLabel || item?.target_agent_label || architectureAgentLabel(agentId),
-    commandId,
-    createdAt: item?.createdAt || item?.created_at,
-    graphFilePath: identity.graphFilePath,
-    graphId: identity.graphId,
-    graphTitle: identity.graphTitle,
-    repoPath: graphMetadata.repoPath || graphMetadata.repo_path,
+    agent_id: agentId,
+    agent_label: item?.target_agent_label || architectureAgentLabel(agentId),
+    command_id: commandId,
+    created_at: item?.created_at,
+    graph_file_path: identity.graph_file_path,
+    graph_id: identity.graph_id,
+    graph_title: identity.graph_title,
+    repo_path: graphMetadata.repo_path,
     status: "queued",
-    updatedAt: item?.updatedAt || item?.updated_at || item?.createdAt || item?.created_at,
-    workspaceId: item?.workspaceId || item?.workspace_id,
+    updated_at: item?.updated_at || item?.created_at,
+    workspace_id: item?.workspace_id,
   });
 }
 
@@ -4903,22 +4660,22 @@ function architectureAgentEditMarkersEqual(left, right) {
 function architectureGraphMatchesAgentEditMarker(graph, marker) {
   const identity = architectureGraphIdentity(graph);
   const normalizedMarker = architectureNormalizeAgentEditMarker(marker);
-  if (!identity.graphKey || !normalizedMarker) return false;
-  if (identity.graphKey === normalizedMarker.graphKey) return true;
-  if (identity.graphId && normalizedMarker.graphId && identity.graphId === normalizedMarker.graphId) return true;
+  if (!identity.graph_key || !normalizedMarker) return false;
+  if (identity.graph_key === normalizedMarker.graph_key) return true;
+  if (identity.graph_id && normalizedMarker.graph_id && identity.graph_id === normalizedMarker.graph_id) return true;
   if (
-    identity.graphFilePath
-    && normalizedMarker.graphFilePath
-    && architectureNormalizedIdentityText(identity.graphFilePath)
-      === architectureNormalizedIdentityText(normalizedMarker.graphFilePath)
+    identity.graph_file_path
+    && normalizedMarker.graph_file_path
+    && architectureNormalizedIdentityText(identity.graph_file_path)
+      === architectureNormalizedIdentityText(normalizedMarker.graph_file_path)
   ) {
     return true;
   }
   return Boolean(
-    identity.graphTitle
-      && normalizedMarker.graphTitle
-      && architectureNormalizedIdentityText(identity.graphTitle)
-        === architectureNormalizedIdentityText(normalizedMarker.graphTitle),
+    identity.graph_title
+      && normalizedMarker.graph_title
+      && architectureNormalizedIdentityText(identity.graph_title)
+        === architectureNormalizedIdentityText(normalizedMarker.graph_title),
   );
 }
 
@@ -4926,13 +4683,13 @@ function architectureAgentEditMarkersGraphMatch(left, right) {
   const normalizedLeft = architectureNormalizeAgentEditMarker(left);
   const normalizedRight = architectureNormalizeAgentEditMarker(right);
   if (!normalizedLeft || !normalizedRight) return false;
-  if (normalizedLeft.graphKey && normalizedRight.graphKey && normalizedLeft.graphKey === normalizedRight.graphKey) return true;
-  if (normalizedLeft.graphId && normalizedRight.graphId && normalizedLeft.graphId === normalizedRight.graphId) return true;
+  if (normalizedLeft.graph_key && normalizedRight.graph_key && normalizedLeft.graph_key === normalizedRight.graph_key) return true;
+  if (normalizedLeft.graph_id && normalizedRight.graph_id && normalizedLeft.graph_id === normalizedRight.graph_id) return true;
   if (
-    normalizedLeft.graphFilePath
-    && normalizedRight.graphFilePath
-    && architectureNormalizedIdentityText(normalizedLeft.graphFilePath)
-      === architectureNormalizedIdentityText(normalizedRight.graphFilePath)
+    normalizedLeft.graph_file_path
+    && normalizedRight.graph_file_path
+    && architectureNormalizedIdentityText(normalizedLeft.graph_file_path)
+      === architectureNormalizedIdentityText(normalizedRight.graph_file_path)
   ) {
     return true;
   }
@@ -4949,7 +4706,6 @@ function architectureTaskSearchText(task) {
     taskStatus(task),
     architectureTaskAgentId(task),
     task?.id,
-    task?.taskId,
     task?.task_id,
     task?.remote_command_id,
     task?.remoteCommandId,
@@ -4971,13 +4727,13 @@ function architectureTaskMatchesAgentEditMarker(task, marker) {
   if (!task || !normalizedMarker) return false;
   const haystack = architectureTaskSearchText(task);
   const normalizedHaystack = architectureNormalizedIdentityText(haystack);
-  const commandId = text(normalizedMarker.commandId).toLowerCase();
+  const commandId = text(normalizedMarker.command_id).toLowerCase();
   if (commandId && haystack.includes(commandId)) return true;
-  const graphFilePath = architectureNormalizedIdentityText(normalizedMarker.graphFilePath);
+  const graphFilePath = architectureNormalizedIdentityText(normalizedMarker.graph_file_path);
   if (graphFilePath && normalizedHaystack.includes(graphFilePath)) return true;
-  const graphId = text(normalizedMarker.graphId).toLowerCase();
+  const graphId = text(normalizedMarker.graph_id).toLowerCase();
   if (graphId && haystack.includes(graphId)) return true;
-  const graphTitle = text(normalizedMarker.graphTitle).toLowerCase();
+  const graphTitle = text(normalizedMarker.graph_title).toLowerCase();
   return Boolean(
     graphTitle.length >= 8
       && haystack.includes(graphTitle)
@@ -4986,7 +4742,7 @@ function architectureTaskMatchesAgentEditMarker(task, marker) {
 }
 
 function architectureFindAgentEditTask(marker, tasks) {
-  const commandId = text(marker?.commandId).toLowerCase();
+  const commandId = text(marker?.command_id).toLowerCase();
   return jsonArray(tasks)
     .map((task, index) => {
       if (!architectureTaskMatchesAgentEditMarker(task, marker)) return null;
@@ -5007,15 +4763,15 @@ function architectureFindAgentEditTask(marker, tasks) {
 }
 
 function architectureGraphUpdatedAfterAgentEditMarker(graph, marker) {
-  const graphUpdatedMs = parseTimeMs(graph?.updatedAt || graph?.updated_at);
-  const markerCreatedMs = parseTimeMs(marker?.createdAt || marker?.created_at);
+  const graphUpdatedMs = parseTimeMs(graph?.updated_at);
+  const markerCreatedMs = parseTimeMs(marker?.created_at);
   return Boolean(graphUpdatedMs && markerCreatedMs && graphUpdatedMs > markerCreatedMs + 500);
 }
 
 function architectureDeriveAgentEditMarker(marker, tasks, graphs) {
   const normalizedMarker = architectureNormalizeAgentEditMarker(marker);
   if (!normalizedMarker) return null;
-  const createdMs = parseTimeMs(normalizedMarker.createdAt);
+  const createdMs = parseTimeMs(normalizedMarker.created_at);
   if (createdMs && Date.now() - createdMs > ARCHITECTURE_AGENT_EDIT_MARKER_MAX_AGE_MS) {
     return null;
   }
@@ -5023,16 +4779,16 @@ function architectureDeriveAgentEditMarker(marker, tasks, graphs) {
   if (task) {
     const statusKind = taskStatusKind(task);
     if (ARCHITECTURE_AGENT_EDIT_DONE_STATUSES.has(statusKind)) return null;
-    const agentId = architectureTaskAgentId(task) || normalizedMarker.agentId;
-    const agentLabel = architectureAgentLabel(agentId || normalizedMarker.agentLabel);
+    const agentId = architectureTaskAgentId(task) || normalizedMarker.agent_id;
+    const agentLabel = architectureAgentLabel(agentId || normalizedMarker.agent_label);
     return {
       ...normalizedMarker,
-      agentColor: architectureAgentColor(agentId || agentLabel, normalizedMarker.commandId),
-      agentId,
-      agentLabel,
+      agent_color: architectureAgentColor(agentId || agentLabel, normalizedMarker.command_id),
+      agent_id: agentId,
+      agent_label: agentLabel,
       status: statusKind === "queued" ? "queued" : "editing",
-      taskId: taskPlanTaskId(task, normalizedMarker.taskId),
-      updatedAt: taskUpdatedMs(task) ? new Date(taskUpdatedMs(task)).toISOString() : normalizedMarker.updatedAt,
+      task_id: taskPlanTaskId(task, normalizedMarker.task_id),
+      updated_at: taskUpdatedMs(task) ? new Date(taskUpdatedMs(task)).toISOString() : normalizedMarker.updated_at,
     };
   }
   const graph = jsonArray(graphs).find((candidate) => architectureGraphMatchesAgentEditMarker(candidate, normalizedMarker));
@@ -5040,7 +4796,7 @@ function architectureDeriveAgentEditMarker(marker, tasks, graphs) {
     return {
       ...normalizedMarker,
       status: "editing",
-      updatedAt: text(graph.updatedAt || graph.updated_at, normalizedMarker.updatedAt),
+      updated_at: text(graph.updated_at, normalizedMarker.updated_at),
     };
   }
   return normalizedMarker;
@@ -5051,7 +4807,7 @@ function architectureVisibleAgentEditMarkers(markers, tasks, graphs) {
   jsonArray(markers).forEach((marker) => {
     const nextMarker = architectureDeriveAgentEditMarker(marker, tasks, graphs);
     if (!nextMarker) return;
-    const existingIndex = nextMarkers.findIndex((candidate) => candidate.commandId === nextMarker.commandId);
+    const existingIndex = nextMarkers.findIndex((candidate) => candidate.command_id === nextMarker.command_id);
     if (existingIndex >= 0) {
       nextMarkers[existingIndex] = nextMarker;
       return;
@@ -5059,7 +4815,7 @@ function architectureVisibleAgentEditMarkers(markers, tasks, graphs) {
     nextMarkers.push(nextMarker);
   });
   return nextMarkers
-    .sort((left, right) => parseTimeMs(left.createdAt) - parseTimeMs(right.createdAt))
+    .sort((left, right) => parseTimeMs(left.created_at) - parseTimeMs(right.created_at))
     .slice(-ARCHITECTURE_AGENT_EDIT_MARKER_MAX_ITEMS);
 }
 
@@ -5067,7 +4823,7 @@ function architectureAgentEditMarkerForGraph(graph, markers) {
   return jsonArray(markers)
     .filter((marker) => architectureGraphMatchesAgentEditMarker(graph, marker))
     .sort((left, right) => (
-      parseTimeMs(right.updatedAt || right.createdAt) - parseTimeMs(left.updatedAt || left.createdAt)
+      parseTimeMs(right.updated_at || right.created_at) - parseTimeMs(left.updated_at || left.created_at)
     ))[0] || null;
 }
 
@@ -5075,19 +4831,19 @@ function architectureAgentEditMarkerBlurb(marker) {
   const normalizedMarker = architectureNormalizeAgentEditMarker(marker);
   if (!normalizedMarker) return "";
   const action = normalizedMarker.status === "editing" ? "editing" : "queued edit";
-  return `${normalizedMarker.agentLabel} ${action}`;
+  return `${normalizedMarker.agent_label} ${action}`;
 }
 
 function architectureAgentEditMarkerTitle(marker) {
   const normalizedMarker = architectureNormalizeAgentEditMarker(marker);
   if (!normalizedMarker) return "";
-  return `${architectureAgentEditMarkerBlurb(normalizedMarker)} for ${normalizedMarker.graphTitle}`;
+  return `${architectureAgentEditMarkerBlurb(normalizedMarker)} for ${normalizedMarker.graph_title}`;
 }
 
 function taskRelativeStamp(item) {
   if (!item) return "";
   if (item.active) return "live now";
-  const referenceMs = item.endMs || item.updatedMs || item.startMs;
+  const referenceMs = item.end_ms || item.updatedMs || item.start_ms;
   return formatRelativeTimeMs(referenceMs) || "unknown";
 }
 
@@ -5104,21 +4860,21 @@ function taskInputBlocks(task) {
 
   addUniqueInputBlock(blocks, "Input", task?.input);
   addUniqueInputBlock(blocks, "Input", task?.user_input);
-  addUniqueInputBlock(blocks, "Input", task?.userInput);
+  addUniqueInputBlock(blocks, "Input", task?.user_input);
   addUniqueInputBlock(blocks, "Input", task?.prompt);
   addUniqueInputBlock(blocks, "Input", task?.body);
   addUniqueInputBlock(blocks, "Input", task?.request);
   addUniqueInputBlock(blocks, "Input", task?.description);
   addUniqueInputBlock(blocks, "Input", metadata?.input);
   addUniqueInputBlock(blocks, "Input", metadata?.user_input);
-  addUniqueInputBlock(blocks, "Input", metadata?.userInput);
+  addUniqueInputBlock(blocks, "Input", metadata?.user_input);
   addUniqueInputBlock(blocks, "Input", metadata?.prompt);
   addUniqueInputBlock(blocks, "Input", metadata?.body);
   addUniqueInputBlock(blocks, "Input", metadata?.request);
   addUniqueInputBlock(blocks, "Input", terminalPlan?.description);
 
   addUniqueInputBlock(blocks, "Park resume", task?.parked_prompt);
-  addUniqueInputBlock(blocks, "Park resume", task?.parkedPrompt);
+  addUniqueInputBlock(blocks, "Park resume", task?.parked_prompt);
   addUniqueInputBlock(blocks, "Park resume", task?.parked_resume_input);
   addUniqueInputBlock(blocks, "Park resume", task?.parkedResumeInput);
   addUniqueInputBlock(blocks, "Park resume", task?.resume_prompt);
@@ -5126,7 +4882,7 @@ function taskInputBlocks(task) {
   addUniqueInputBlock(blocks, "Park resume", task?.resume_input);
   addUniqueInputBlock(blocks, "Park resume", task?.resumeInput);
   addUniqueInputBlock(blocks, "Park resume", metadata?.parked_prompt);
-  addUniqueInputBlock(blocks, "Park resume", metadata?.parkedPrompt);
+  addUniqueInputBlock(blocks, "Park resume", metadata?.parked_prompt);
   addUniqueInputBlock(blocks, "Park resume", metadata?.parked_resume_input);
   addUniqueInputBlock(blocks, "Park resume", metadata?.parkedResumeInput);
   addUniqueInputBlock(blocks, "Park resume", metadata?.resume_prompt);
@@ -5148,12 +4904,12 @@ function todoInputBlocks(todo, relatedTasks = []) {
   addUniqueInputBlock(blocks, "Todo", item.text);
   addUniqueInputBlock(blocks, "Todo", item.body);
   addUniqueInputBlock(blocks, "Todo", item.todo_text);
-  addUniqueInputBlock(blocks, "Todo", item.todoText);
+  addUniqueInputBlock(blocks, "Todo", item.todo_text);
   addUniqueInputBlock(blocks, "Todo", item.todo);
   addUniqueInputBlock(blocks, "Todo", item.task);
   addUniqueInputBlock(blocks, "Input", item.input);
   addUniqueInputBlock(blocks, "Input", item.user_input);
-  addUniqueInputBlock(blocks, "Input", item.userInput);
+  addUniqueInputBlock(blocks, "Input", item.user_input);
   addUniqueInputBlock(blocks, "Prompt", item.prompt);
   addUniqueInputBlock(blocks, "Command", item.command);
   addUniqueInputBlock(blocks, "Command", item.command_text);
@@ -5165,7 +4921,7 @@ function todoInputBlocks(todo, relatedTasks = []) {
   addUniqueInputBlock(blocks, "Note", note.body);
   addUniqueInputBlock(blocks, "Input", metadata.input);
   addUniqueInputBlock(blocks, "Input", metadata.user_input);
-  addUniqueInputBlock(blocks, "Input", metadata.userInput);
+  addUniqueInputBlock(blocks, "Input", metadata.user_input);
   addUniqueInputBlock(blocks, "Prompt", metadata.prompt);
   addUniqueInputBlock(blocks, "Command", metadata.command);
   addUniqueInputBlock(blocks, "Detail", metadata.detail);
@@ -5214,13 +4970,7 @@ function planStepTitle(step, index) {
 
 function planStepDetail(step) {
   return text(
-    step?.detail
-      || step?.details
-      || step?.description
-      || step?.done_when
-      || step?.doneWhen
-      || step?.summary
-      || step?.result,
+    step?.detail || step?.details || step?.description || step?.done_when || step?.summary || step?.result,
   );
 }
 
@@ -5239,16 +4989,16 @@ function scannedResultPathJoin(rootDirectory, relativePath) {
 }
 
 function scannedResultEntryPath(entry) {
-  return text(entry?.projectRoot || entry?.project_root || entry?.path || entry?.repoPath || entry?.repo_path);
+  return text(entry?.project_root || entry?.path || entry?.repo_path);
 }
 
 function scannedResultEntryName(entry, fallback = "Project") {
   const entryPath = scannedResultEntryPath(entry);
-  return text(entry?.projectName || entry?.project_name || entry?.name, pathName(entryPath, fallback));
+  return text(entry?.project_name || entry?.name, pathName(entryPath, fallback));
 }
 
 function scannedResultRelativePath(entry, rootDirectory) {
-  const explicit = text(entry?.workspaceRelativePath || entry?.workspace_relative_path || entry?.relativePath || entry?.relative_path);
+  const explicit = text(entry?.workspace_relative_path || entry?.relative_path);
   if (explicit === ".") return "";
   if (explicit) return explicit.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
 
@@ -5263,17 +5013,17 @@ function scannedResultRelativePath(entry, rootDirectory) {
 }
 
 function scannedResultEntryHasGit(entry) {
-  return entry?.hasGit === true || entry?.has_git === true;
+  return entry?.has_git === true;
 }
 
 function scannedResultEntryMountKind(entry) {
-  return text(entry?.mountKind || entry?.mount_kind);
+  return text(entry?.mount_kind);
 }
 
 function scannedResultGraphKind(entry) {
   if (
     scannedResultEntryMountKind(entry) === "container"
-    || text(entry?.projectKind || entry?.project_kind) === "container"
+    || text(entry?.project_kind) === "container"
   ) {
     return "container";
   }
@@ -5298,11 +5048,11 @@ function buildScannedResultGraph(scan) {
       edges: [],
       nodes: [],
       stats: {
-        graphCount: 0,
+        graph_count: 0,
         gitCount: 0,
         repoCount: 0,
         rootLabel: "No scan data",
-        sourceLabel: "Waiting",
+        source_label: "Waiting",
       },
     };
   }
@@ -5310,10 +5060,10 @@ function buildScannedResultGraph(scan) {
   const nodeMap = new Map();
   const edgeMap = new Map();
   const rootId = "root";
-  const rootDirectory = text(object.rootDirectory || object.root_directory || object.repoPath || object.repo_path);
+  const rootDirectory = text(object.root_directory || object.repo_path);
   const rootName = pathName(rootDirectory, "workspace");
-  const cacheSource = text(object.cache?.source || object.cacheSource || object.cache_source);
-  const cacheStatus = text(object.cache?.status || object.cacheStatus || object.cache_status);
+  const cacheSource = text(object.cache?.source || object.cache_source);
+  const cacheStatus = text(object.cache?.status || object.cache_status);
   const sourceLabel = cacheSource === "backend_workspace_topology_cache"
     ? `backend cache${cacheStatus ? `: ${cacheStatus.replaceAll("_", " ")}` : ""}`
     : "architecture scan";
@@ -5337,27 +5087,27 @@ function buildScannedResultGraph(scan) {
     label: rootName,
     meta: rootDirectory,
     path: rootDirectory,
-    relativePath: "",
+    relative_path: "",
     badge: "architecture root",
     depth: 0,
   });
 
   const repositories = jsonArray(object.repositories);
   const repoByPath = new Map(repositories.map((repo) => [scannedResultEntryPath(repo), repo]));
-  const workspaceMounts = jsonArray(object.workspaceMounts || object.workspace_mounts);
+  const workspaceMounts = jsonArray(object.workspace_mounts);
   const mounts = workspaceMounts.length ? workspaceMounts : jsonArray(object.mounts);
   const hasExplicitWorkspaceMounts = workspaceMounts.length > 0;
   const scanEntries = mounts.length
     ? mounts.map((mount) => ({
       ...mount,
-      graphCount: numberValue(repoByPath.get(scannedResultEntryPath(mount))?.graphCount, 0),
+      graph_count: numberValue(repoByPath.get(scannedResultEntryPath(mount))?.graph_count, 0),
     }))
     : repositories;
   const entryNodeIdsByMountId = new Map();
   scanEntries.forEach((entry, index) => {
     const relativePath = scannedResultRelativePath(entry, rootDirectory);
     if (!relativePath) return;
-    const entryId = text(entry?.mountId || entry?.mount_id || entry?.id, scannedResultEntryPath(entry) || `scan-entry-${index}`);
+    const entryId = text(entry?.mount_id || entry?.id, scannedResultEntryPath(entry) || `scan-entry-${index}`);
     entryNodeIdsByMountId.set(entryId, `${scannedResultGraphKind(entry)}:${entryId}`);
   });
   let gitCount = 0;
@@ -5367,10 +5117,10 @@ function buildScannedResultGraph(scan) {
     const entryPath = scannedResultEntryPath(entry);
     const relativePath = scannedResultRelativePath(entry, rootDirectory);
     const parts = relativePath.split("/").filter(Boolean);
-    const entryId = text(entry?.mountId || entry?.mount_id || entry?.id, entryPath || `scan-entry-${index}`);
+    const entryId = text(entry?.mount_id || entry?.id, entryPath || `scan-entry-${index}`);
     const entryName = scannedResultEntryName(entry, "Project");
     const entryKind = scannedResultGraphKind(entry);
-    const graphCount = numberValue(entry?.graphCount ?? entry?.graph_count, 0);
+    const graphCount = numberValue(entry?.graph_count, 0);
     if (entryKind === "git") gitCount += 1;
     totalGraphCount += graphCount;
 
@@ -5381,7 +5131,7 @@ function buildScannedResultGraph(scan) {
         label: entryName || rootName,
         meta: entryPath || rootDirectory,
         path: entryPath || rootDirectory,
-        relativePath: "",
+        relative_path: "",
         badge: scannedResultGraphBadge(entry),
         depth: 0,
       });
@@ -5390,7 +5140,7 @@ function buildScannedResultGraph(scan) {
 
     const repoNodeId = `${entryKind}:${entryId}`;
     if (hasExplicitWorkspaceMounts) {
-      const parentMountId = text(entry?.parentMountId || entry?.parent_mount_id);
+      const parentMountId = text(entry?.parent_mount_id);
       const parentNodeId = parentMountId ? entryNodeIdsByMountId.get(parentMountId) : rootId;
       addNode({
         id: repoNodeId,
@@ -5398,7 +5148,7 @@ function buildScannedResultGraph(scan) {
         label: entryName,
         meta: relativePath,
         path: entryPath,
-        relativePath,
+        relative_path: relativePath,
         badge: scannedResultGraphBadge(entry),
         depth: parts.length,
         entry,
@@ -5417,7 +5167,7 @@ function buildScannedResultGraph(scan) {
         label: part,
         meta: folderPath,
         path: scannedResultPathJoin(rootDirectory, folderPath),
-        relativePath: folderPath,
+        relative_path: folderPath,
         badge: "folder",
         depth: partIndex + 1,
       });
@@ -5433,7 +5183,7 @@ function buildScannedResultGraph(scan) {
       label: entryName,
       meta: relativePath,
       path: entryPath,
-      relativePath,
+      relative_path: relativePath,
       badge: scannedResultGraphBadge(entry),
       depth: parts.length,
       entry,
@@ -5455,11 +5205,11 @@ function buildScannedResultGraph(scan) {
     nodes,
     stats: {
       folderCount,
-      graphCount: totalGraphCount,
+      graph_count: totalGraphCount,
       gitCount,
       repoCount: scanEntries.length,
       rootLabel: rootDirectory || rootName,
-      sourceLabel,
+      source_label: sourceLabel,
     },
   };
 }
@@ -5529,8 +5279,8 @@ function layoutScannedResultGraph(graph) {
 }
 
 function ArchitectureWorkspaceView({
-  defaultWorkingDirectory,
-  rootDirectory,
+  default_working_directory: defaultWorkingDirectory,
+  root_directory: rootDirectory,
   architectureError = "",
   architectureRepositoryScanError = "",
   architectureRepositoryScanSnapshot = null,
@@ -5587,7 +5337,7 @@ function ArchitectureWorkspaceView({
     let cancelled = false;
     const unlisteners = [];
     const refreshLocalTodos = () => {
-      invoke("todo_store_history", { workspaceId })
+      invoke("todo_store_history", { workspace_id: workspaceId })
         .then((result) => {
           if (cancelled) return;
           setLocalTodoItems(jsonArray(result?.items));
@@ -5595,7 +5345,7 @@ function ArchitectureWorkspaceView({
         .catch(() => {
           // Never render an empty history because one command failed: the raw
           // queue ledger still has this device's todos.
-          invoke("todo_dispatch_queue_get", { workspaceId })
+          invoke("todo_dispatch_queue_get", { workspace_id: workspaceId })
             .then((result) => {
               if (cancelled) return;
               setLocalTodoItems(jsonArray(result?.items));
@@ -5608,7 +5358,7 @@ function ArchitectureWorkspaceView({
     // the only todo refresh signal. Rust emits this event for every mutation.
     listen("todo-store-changed", (event) => {
       if (cancelled) return;
-      const eventWorkspaceId = String(event?.payload?.workspaceId || "").trim();
+      const eventWorkspaceId = String(event?.payload?.workspace_id || "").trim();
       if (!eventWorkspaceId || eventWorkspaceId === workspaceId) {
         refreshLocalTodos();
       }
@@ -5679,8 +5429,8 @@ function ArchitectureWorkspaceView({
         request: {
           fast,
           limit: 500,
-          rootDirectory: sessionHistoryStoreRoot || null,
-          workspaceId,
+          root_directory: sessionHistoryStoreRoot || null,
+          workspace_id: workspaceId,
         },
       })
         .then((result) => {
@@ -5718,7 +5468,7 @@ function ArchitectureWorkspaceView({
     refreshSessionHistory({ fast: true });
     listen("workspace-agent-session-history-changed", (event) => {
       if (cancelled) return;
-      const eventWorkspaceId = String(event?.payload?.workspaceId || "").trim();
+      const eventWorkspaceId = String(event?.payload?.workspace_id || "").trim();
       if (!eventWorkspaceId || eventWorkspaceId === workspaceId) {
         scheduleSessionHistoryRefresh(0, { fast: true });
       }
@@ -5731,7 +5481,7 @@ function ArchitectureWorkspaceView({
     }).catch(() => {});
     listen("agent-chat-session-sync-status-changed", (event) => {
       if (cancelled) return;
-      const eventWorkspaceId = String(event?.payload?.workspaceId || "").trim();
+      const eventWorkspaceId = String(event?.payload?.workspace_id || "").trim();
       if (!eventWorkspaceId || eventWorkspaceId === workspaceId) {
         scheduleSessionHistoryRefresh(SESSION_HISTORY_SYNC_REFRESH_DELAY_MS, { fast: false });
       }
@@ -5771,13 +5521,13 @@ function ArchitectureWorkspaceView({
 
 	    setFinishPlanState({ error: "", planRef });
 	    invoke("coordination_terminal_todo_plan_finish", {
-	      repoPath,
+	      repo_path: repoPath,
 	      input: {
-	        agent_id: terminalPlan?.agent_id || terminalPlan?.agentId || task?.agent_id || task?.agentId || taskAgentLabel(task),
+	        agent_id: terminalPlan?.agent_id || task?.agent_id || taskAgentLabel(task),
 	        direct_repo_target: true,
-	        plan_id: text(terminalPlan?.plan_id || terminalPlan?.planId || terminalPlan?.id) || planRef,
-	        session_id: terminalPlan?.session_id || terminalPlan?.sessionId || task?.session_id || task?.sessionId,
-	        todo_id: text(terminalPlan?.todo_id || terminalPlan?.todoId),
+	        plan_id: text(terminalPlan?.plan_id || terminalPlan?.id) || planRef,
+	        session_id: terminalPlan?.session_id || task?.session_id,
+	        todo_id: text(terminalPlan?.todo_id),
 	        workspace_id: activeWorkspaceId,
 	      },
 	    })
@@ -5846,7 +5596,7 @@ function ArchitectureWorkspaceView({
           onFinishPlan={finishTerminalTodoPlan}
           repoLabel={repoLabel}
           terminalOptions={workspaceTerminalOptions}
-          workspaceId={activeWorkspaceId}
+          workspace_id={activeWorkspaceId}
         />
       ) : (
         <SessionHistoryPanel
@@ -5857,7 +5607,7 @@ function ArchitectureWorkspaceView({
           repoLabel={repoLabel}
           state={sessionHistoryState}
           terminalOptions={workspaceTerminalOptions}
-          workspaceId={activeWorkspaceId}
+          workspace_id={activeWorkspaceId}
         />
       )}
       {visibleArchitectureError && (
@@ -5899,13 +5649,13 @@ export function ArchitectureHubView({
       });
     }
     jsonArray(catalog.workspaces).forEach((workspaceGroup) => {
-      const workspaceId = text(workspaceGroup?.workspaceId);
+      const workspaceId = text(workspaceGroup?.workspace_id);
       const repositories = jsonArray(workspaceGroup?.repositories);
       if (!workspaceId) return;
       groups.push({
         id: `workspace-${workspaceId}`,
         kind: "workspace",
-        label: text(workspaceGroup?.workspaceName) || workspaceId,
+        label: text(workspaceGroup?.workspace_name) || workspaceId,
         repositories,
       });
     });
@@ -5955,7 +5705,7 @@ export function ArchitectureHubView({
         onGraphListRefresh={onGraphListRefresh}
         onSelectionChange={onSelectionChange}
         repoLabel="account"
-        repoPath=""
+        repo_path=""
         repositoryGroups={repositoryGroups}
         repositoryScan={repositoryScan}
         repositoryScanError={catalogError}
@@ -5984,7 +5734,7 @@ function ArchitecturesPanel({
   queueWorkspaceId = "",
   queueWorkspaceName = "",
   repoLabel,
-  repoPath,
+  repo_path: repoPath,
   repositoryScan = null,
   repositoryScanError = "",
   repositoryScanState = "idle",
@@ -6012,7 +5762,7 @@ function ArchitecturesPanel({
   const [selectedGraphDirty, setSelectedGraphDirty] = useState(false);
   const [selectedGraphExternalDirty, setSelectedGraphExternalDirty] = useState(false);
   const [externalDirtyGraphIds, setExternalDirtyGraphIds] = useState(() => new Set());
-  const [revisionBrowser, setRevisionBrowser] = useState({ graphId: "", open: false });
+  const [revisionBrowser, setRevisionBrowser] = useState({ graph_id: "", open: false });
   const [, setDragGraph] = useState(null);
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [draftFolderName, setDraftFolderName] = useState("");
@@ -6073,8 +5823,8 @@ function ArchitecturesPanel({
       const context = resolveRepoSyncContext(targetRepo);
       if (context && typeof context === "object") {
         return {
-          workspaceId: text(context.workspaceId),
-          workspaceName: text(context.workspaceName),
+          workspace_id: text(context.workspace_id),
+          workspace_name: text(context.workspace_name),
           queueWorkspaceId: text(context.queueWorkspaceId),
           queueWorkspaceName: text(context.queueWorkspaceName),
           scopeRepoId: text(context.scopeRepoId),
@@ -6083,8 +5833,8 @@ function ArchitecturesPanel({
       }
     }
     return {
-      workspaceId: text(queueWorkspaceId),
-      workspaceName: text(queueWorkspaceName),
+      workspace_id: text(queueWorkspaceId),
+      workspace_name: text(queueWorkspaceName),
       queueWorkspaceId: text(queueWorkspaceId),
       queueWorkspaceName: text(queueWorkspaceName),
       scopeRepoId: "",
@@ -6095,8 +5845,8 @@ function ArchitecturesPanel({
     () => repoSyncContext(selectedRepoPath),
     [repoSyncContext, selectedRepoPath],
   );
-  const syncWorkspaceId = selectedRepoSyncContext.workspaceId;
-  const syncWorkspaceName = selectedRepoSyncContext.workspaceName;
+  const syncWorkspaceId = selectedRepoSyncContext.workspace_id;
+  const syncWorkspaceName = selectedRepoSyncContext.workspace_name;
   const syncScopeRepoId = selectedRepoSyncContext.scopeRepoId;
   const syncScopeGitRepoIdentityId = selectedRepoSyncContext.scopeGitRepoIdentityId;
   const dispatchWorkspaceId = selectedRepoSyncContext.queueWorkspaceId;
@@ -6164,13 +5914,13 @@ function ArchitecturesPanel({
       const repoKey = architectureRepoPathKey(selectedRepoPath);
       if (!currentRepositories.some((repository) => (
         architectureRepoPathKey(architectureRepoPathFromEntry(repository)) === repoKey
-          && Number(repository?.graphCount || 0) !== nextGraphs.length
+          && Number(repository?.graph_count || 0) !== nextGraphs.length
       ))) {
         return currentRepositories;
       }
       return currentRepositories.map((repository) => (
         architectureRepoPathKey(architectureRepoPathFromEntry(repository)) === repoKey
-          ? { ...repository, graphCount: nextGraphs.length }
+          ? { ...repository, graph_count: nextGraphs.length }
           : repository
       ));
     });
@@ -6209,7 +5959,7 @@ function ArchitecturesPanel({
     setError("");
     const listPromise = typeof onGraphListRefresh === "function"
       ? onGraphListRefresh(repo, options)
-      : invoke("architecture_graphs_list", { repoPath: repo }).then((result) => jsonArray(result?.graphs));
+      : invoke("architecture_graphs_list", { repo_path: repo }).then((result) => jsonArray(result?.graphs));
     return listPromise
       .then((result) => {
         const nextGraphs = jsonArray(result?.graphs || result);
@@ -6218,13 +5968,13 @@ function ArchitecturesPanel({
           const repoKey = architectureRepoPathKey(repo);
           if (!currentRepositories.some((repository) => (
             architectureRepoPathKey(architectureRepoPathFromEntry(repository)) === repoKey
-              && Number(repository?.graphCount || 0) !== nextGraphs.length
+              && Number(repository?.graph_count || 0) !== nextGraphs.length
           ))) {
             return currentRepositories;
           }
           return currentRepositories.map((repository) => (
             architectureRepoPathKey(architectureRepoPathFromEntry(repository)) === repoKey
-              ? { ...repository, graphCount: nextGraphs.length }
+              ? { ...repository, graph_count: nextGraphs.length }
               : repository
           ));
         });
@@ -6263,7 +6013,7 @@ function ArchitecturesPanel({
   // (load → error entry → "changed" entry → load → ...). Error entries do
   // not auto-retry at all — the error renders with manual refresh.
   const selectedGraphListCacheSignature = selectedGraphListCacheEntry
-    ? `${text(selectedGraphListCacheEntry.state)}:${Number(selectedGraphListCacheEntry.updatedAt || 0)}`
+    ? `${text(selectedGraphListCacheEntry.state)}:${Number(selectedGraphListCacheEntry.updated_at || 0)}`
     : "";
   const selectedGraphListCacheRef = useRef(null);
   selectedGraphListCacheRef.current = selectedGraphListCacheEntry;
@@ -6287,12 +6037,9 @@ function ArchitecturesPanel({
       const payload = jsonObject(event?.payload) || {};
       const nestedPayload = jsonObject(payload.payload) || {};
       const eventWorkspaceId = text(
-        payload.workspaceId
-          || payload.workspace_id
-          || nestedPayload.workspaceId
-          || nestedPayload.workspace_id,
+        payload.workspace_id || nestedPayload.workspace_id,
       );
-      const workspaceIds = jsonArray(payload.workspace_ids || payload.workspaceIds || nestedPayload.workspace_ids || nestedPayload.workspaceIds)
+      const workspaceIds = jsonArray(payload.workspace_ids || nestedPayload.workspace_ids)
         .map((item) => text(item))
         .filter(Boolean);
       if (
@@ -6306,7 +6053,7 @@ function ArchitecturesPanel({
       void loadGraphList(selectedRepoPath, {
         refresh: true,
         silent: true,
-        workspaceName: syncWorkspaceName,
+        workspace_name: syncWorkspaceName,
       });
     }).then((unlisten) => {
       if (cancelled) {
@@ -6356,8 +6103,8 @@ function ArchitecturesPanel({
       : null;
 
     const readLocalGraph = () => invoke("architecture_graph_read", {
-      graphId: selectedGraphId,
-      repoPath: selectedRepoPath,
+      graph_id: selectedGraphId,
+      repo_path: selectedRepoPath,
     });
     const hydrateGraph = (ref) => {
       suppressExternalGraphWrites([
@@ -6428,7 +6175,7 @@ function ArchitecturesPanel({
           const sameGraph = current && text(current?.id) === text(graph?.id);
           const sameContent = sameGraph
             && text(current?.source) === text(graph?.source)
-            && text(current?.updatedAt) === text(graph?.updatedAt);
+            && text(current?.updated_at) === text(graph?.updated_at);
           if (
             alreadyLoadedSelectedGraph
             && sameGraph
@@ -6499,16 +6246,16 @@ function ArchitecturesPanel({
     let unlisten = null;
     const rereadSelectedGraph = ({ allowDirtyRefresh = false } = {}) => {
       invoke("architecture_graph_read", {
-        graphId: selectedGraphId,
-        repoPath: selectedRepoPath,
+        graph_id: selectedGraphId,
+        repo_path: selectedRepoPath,
       })
         .then((graph) => {
           if (cancelled) return;
           setSelectedGraph((current) => {
             const currentSource = text(current?.source);
             const nextSource = text(graph?.source);
-            const currentUpdatedAt = text(current?.updatedAt);
-            const nextUpdatedAt = text(graph?.updatedAt);
+            const currentUpdatedAt = text(current?.updated_at);
+            const nextUpdatedAt = text(graph?.updated_at);
             if (selectedGraphDirtyRef.current && !allowDirtyRefresh) {
               return current;
             }
@@ -6531,7 +6278,7 @@ function ArchitecturesPanel({
     listen("architecture-store-changed", (event) => {
       if (!cancelled) {
         const payload = event?.payload || {};
-        const changedGraphIds = jsonArray(payload.graphIds || payload.graph_ids)
+        const changedGraphIds = jsonArray(payload.graph_ids)
           .map((item) => text(item))
           .filter(Boolean);
         if (!changedGraphIds.length || changedGraphIds.includes(selectedGraphId)) {
@@ -6563,7 +6310,7 @@ function ArchitecturesPanel({
   useEffect(() => {
     if (!selectedRepoPath || typeof onSelectionChange !== "function") return;
     if (selectedGraphId && graphs.length && !graphs.some((graph) => graph.id === selectedGraphId)) return;
-    onSelectionChange({ graphId: selectedGraphId, repoPath: selectedRepoPath });
+    onSelectionChange({ graph_id: selectedGraphId, repo_path: selectedRepoPath });
   }, [
     graphs,
     onSelectionChange,
@@ -6591,7 +6338,7 @@ function ArchitecturesPanel({
     || (graphState === "loading" && Boolean(selectedGraphListCacheEntry))
   );
   const folderSuggestions = useMemo(() => (
-    [...new Set(graphs.map((graph) => architectureFolderPathText(graph.groupPath)).filter(Boolean))]
+    [...new Set(graphs.map((graph) => architectureFolderPathText(graph.group_path)).filter(Boolean))]
       .sort((left, right) => left.localeCompare(right))
   ), [graphs]);
   const revisionBrowserOpen = revisionBrowser.open && Boolean(selectedRepoPath);
@@ -6618,7 +6365,7 @@ function ArchitecturesPanel({
       const currentVisibleMarkers = architectureVisibleAgentEditMarkers(currentMarkers, tasks, graphs);
       const nextMarkers = currentVisibleMarkers
         .filter((candidate) => (
-          candidate.commandId !== marker.commandId
+          candidate.command_id !== marker.command_id
             && !architectureAgentEditMarkersGraphMatch(candidate, marker)
         ))
         .concat([marker])
@@ -6630,7 +6377,7 @@ function ArchitecturesPanel({
 
   const openRevisionBrowser = useCallback((graphId = "") => {
     setRevisionBrowser({
-      graphId: text(graphId),
+      graph_id: text(graphId),
       open: true,
     });
     setCreatingGraph(false);
@@ -6648,13 +6395,9 @@ function ArchitecturesPanel({
     setError("");
     Promise.resolve(onCreateNamedFolder(name))
       .then((entry) => {
-        const entryPath = text(entry?.rootDirectory || entry?.root_directory || entry?.path);
+        const entryPath = text(entry?.root_directory || entry?.path);
         const initialFolderPath = text(
-          entry?.initialFolderPath
-            || entry?.initial_folder_path
-            || entry?.folderPath
-            || entry?.folder_path
-            || name,
+          entry?.initial_folder_path || entry?.folder_path || name,
         );
         setCreatingFolder(false);
         setDraftFolderName("");
@@ -6700,18 +6443,18 @@ function ArchitecturesPanel({
     if (!selectedRepoPath) return;
     const groupPath = draftLocationMode === "folder" ? draftFolderPath : "";
     const graph = architectureEmptyGraph({
-      groupPath,
+      group_path: groupPath,
       title: draftTitle,
     });
     setSaveState("saving");
     setError("");
     invoke("architecture_graph_save", {
       graph,
-      repoPath: selectedRepoPath,
+      repo_path: selectedRepoPath,
     })
       .then((result) => {
         const nextGraph = result?.graph || graph;
-        const savedGraphId = architectureGraphId(nextGraph) || result?.graphId || result?.graph_id || graph.id;
+        const savedGraphId = architectureGraphId(nextGraph) || result?.graph_id || graph.id;
         suppressExternalGraphWrites([savedGraphId]);
         setSelectedGraph(nextGraph);
         setSelectedGraphId(savedGraphId || graph.id);
@@ -6734,11 +6477,11 @@ function ArchitecturesPanel({
     setError("");
     return invoke("architecture_graph_save", {
       graph,
-      repoPath: selectedRepoPath,
+      repo_path: selectedRepoPath,
     })
       .then((result) => {
         const nextGraph = result?.graph || graph;
-        const savedGraphId = architectureGraphId(nextGraph) || result?.graphId || result?.graph_id;
+        const savedGraphId = architectureGraphId(nextGraph) || result?.graph_id;
         suppressExternalGraphWrites([savedGraphId]);
         setSelectedGraph(nextGraph);
         setSelectedGraphId(savedGraphId || nextGraph.id);
@@ -6774,8 +6517,8 @@ function ArchitecturesPanel({
     setSaveState("saving");
     setError("");
     return invoke("architecture_graph_delete", {
-      graphId,
-      repoPath: selectedRepoPath,
+      graph_id: graphId,
+      repo_path: selectedRepoPath,
     })
       .then((result) => {
         setSelectedGraphDirty(false);
@@ -6788,7 +6531,7 @@ function ArchitecturesPanel({
           return nextIds;
         });
         setRevisionBrowser((current) => (
-          text(current.graphId) === graphId ? { graphId: "", open: false } : { ...current, open: false }
+          text(current.graph_id) === graphId ? { graph_id: "", open: false } : { ...current, open: false }
         ));
         setCreatingGraph(false);
         setSelectedGraphId("");
@@ -6807,7 +6550,7 @@ function ArchitecturesPanel({
 
   const handleRevisionRestored = useCallback((result) => {
     const nextGraph = result?.graph || null;
-    const nextGraphId = text(result?.graphId || result?.graph_id || nextGraph?.id);
+    const nextGraphId = text(result?.graph_id || nextGraph?.id);
     suppressExternalGraphWrites([nextGraphId]);
     if (nextGraph) setSelectedGraph(nextGraph);
     if (nextGraphId) setSelectedGraphId(nextGraphId);
@@ -6883,9 +6626,9 @@ function ArchitecturesPanel({
               onDragEnd={draggable ? () => setDragGraph(null) : undefined}
               onDragStart={draggable ? (event) => {
                 const payload = {
-                  filePath: row.graph.filePath || `.agents/architectures/graphs/${row.graph.id}.arch`,
-                  graphId: row.graph.id,
-                  sourceRepoPath: selectedRepoPath,
+                  file_path: row.graph.file_path || `.agents/architectures/graphs/${row.graph.id}.arch`,
+                  graph_id: row.graph.id,
+                  source_repo_path: selectedRepoPath,
                   title: row.graph.title || graphFileName,
                 };
                 setDragGraph(payload);
@@ -6899,7 +6642,7 @@ function ArchitecturesPanel({
               title={[
                 graphFileName,
                 row.graph.title && row.graph.title !== graphFileName ? row.graph.title : "",
-                row.graph.filePath,
+                row.graph.file_path,
                 rowMarkerTitle,
                 rowDirty ? "Unsaved local changes" : "",
               ].filter(Boolean).join("\n")}
@@ -6918,7 +6661,7 @@ function ArchitecturesPanel({
                 aria-hidden={!rowMarker && !rowDirty}
                 data-agent-edit={rowMarker ? rowMarker.status : undefined}
                 data-local-unsaved={rowDirty ? "true" : undefined}
-                style={rowMarker ? { "--agent-edit-color": rowMarker.agentColor } : undefined}
+                style={rowMarker ? { "--agent-edit-color": rowMarker.agent_color } : undefined}
                 title={rowMarkerTitle || (rowDirty ? "Unsaved local changes" : undefined)}
               >
                 {rowMarker || rowDirty ? <i /> : null}
@@ -7039,8 +6782,8 @@ function ArchitecturesPanel({
               </FileIconButton>
             </FileExplorerActions>
           </FileExplorerHeader>
-          <FileRootPath title={selectedRepo?.architectureRoot || selectedRepoPath || "No architecture root"}>
-            {selectedRepo?.architectureRoot || selectedRepoPath || "No architecture root"}
+          <FileRootPath title={selectedRepo?.architecture_root || selectedRepoPath || "No architecture root"}>
+            {selectedRepo?.architecture_root || selectedRepoPath || "No architecture root"}
           </FileRootPath>
           <ArchitectureNavControls>
             {repositories.length > 1 && (
@@ -7178,10 +6921,10 @@ function ArchitecturesPanel({
           {revisionBrowserOpen ? (
             <ArchitectureRevisionDrawer
               activeGraphDirty={selectedGraphDirty}
-              graphId={revisionBrowser.graphId}
+              graph_id={revisionBrowser.graph_id}
               onClose={closeRevisionBrowser}
               onRestored={handleRevisionRestored}
-              repoPath={selectedRepoPath}
+              repo_path={selectedRepoPath}
               selectedGraphId={selectedGraphId}
             />
           ) : selectedListedGraphPending ? (
@@ -7389,7 +7132,7 @@ function ArchitectureGraphEditorView({
       if (edge.id) edgeIds.add(edge.id);
     });
     [...nodeIds].forEach((id) => {
-      const parentId = nodes.find((node) => node.id === id)?.parentId;
+      const parentId = nodes.find((node) => node.id === id)?.parent_id;
       if (parentId) nodeIds.add(parentId);
     });
     return { edgeIds, nodeIds };
@@ -7470,31 +7213,31 @@ function ArchitectureGraphEditorView({
     [workspaceDispatchTargets],
   );
   const agentTargetWorkspace = useMemo(
-    () => dispatchTargets.find((target) => target.workspaceId === agentTargetWorkspaceId) || null,
+    () => dispatchTargets.find((target) => target.workspace_id === agentTargetWorkspaceId) || null,
     [agentTargetWorkspaceId, dispatchTargets],
   );
   const agentWorkspaceOptions = useMemo(() => dispatchTargets.map((target) => ({
-    label: text(target.workspaceName, target.workspaceId),
-    value: target.workspaceId,
+    label: text(target.workspace_name, target.workspace_id),
+    value: target.workspace_id,
   })), [dispatchTargets]);
   const agentTerminalOptions = useMemo(() => [
     { color: "", label: "Any terminal", value: "" },
     ...(agentTargetWorkspace?.threads || []).map((thread, index) => ({
       ...thread,
       color: sanitizeTerminalColor(
-        thread.targetTerminalColor || thread.color,
-        Number.isInteger(thread.targetColorSlot)
-          ? thread.targetColorSlot
-          : Number.isInteger(thread.terminalIndex)
-            ? thread.terminalIndex
+        thread.target_terminal_color || thread.color,
+        Number.isInteger(thread.target_color_slot)
+          ? thread.target_color_slot
+          : Number.isInteger(thread.terminal_index)
+            ? thread.terminal_index
             : index,
       ),
-      label: text(thread.label || thread.targetTerminalName, thread.threadId),
-      value: thread.threadId,
+      label: text(thread.label || thread.target_terminal_name, thread.thread_id),
+      value: thread.thread_id,
     })),
   ], [agentTargetWorkspace]);
-  const activeQueueWorkspaceId = text(agentTargetWorkspace?.workspaceId || queueWorkspaceId);
-  const activeQueueWorkspaceName = text(agentTargetWorkspace?.workspaceName || queueWorkspaceName);
+  const activeQueueWorkspaceId = text(agentTargetWorkspace?.workspace_id || queueWorkspaceId);
+  const activeQueueWorkspaceName = text(agentTargetWorkspace?.workspace_name || queueWorkspaceName);
 
   useEffect(() => {
     const nextFlow = architectureGraphToFlow(graph);
@@ -7512,11 +7255,11 @@ function ArchitectureGraphEditorView({
 
   useEffect(() => {
     setAgentTargetWorkspaceId((current) => {
-      if (current && dispatchTargets.some((target) => target.workspaceId === current)) return current;
-      if (queueWorkspaceId && dispatchTargets.some((target) => target.workspaceId === queueWorkspaceId)) {
+      if (current && dispatchTargets.some((target) => target.workspace_id === current)) return current;
+      if (queueWorkspaceId && dispatchTargets.some((target) => target.workspace_id === queueWorkspaceId)) {
         return queueWorkspaceId;
       }
-      return text(dispatchTargets[0]?.workspaceId);
+      return text(dispatchTargets[0]?.workspace_id);
     });
   }, [dispatchTargets, queueWorkspaceId]);
 
@@ -7524,7 +7267,7 @@ function ArchitectureGraphEditorView({
     setAgentTargetThreadId((current) => {
       if (!current) return current;
       const threads = agentTargetWorkspace?.threads || [];
-      return threads.some((thread) => thread.threadId === current) ? current : "";
+      return threads.some((thread) => thread.thread_id === current) ? current : "";
     });
   }, [agentTargetWorkspace]);
 
@@ -7569,16 +7312,16 @@ function ArchitectureGraphEditorView({
       return;
     }
     const targetFields = buildSnippingAnnotationTargetFields({
-      targetThreadId: agentTargetThreadId,
+      target_thread_id: agentTargetThreadId,
       targetWorkspace: agentTargetWorkspace,
     });
     const queuedItem = architectureQueueAgentTodo({
       graph: draftGraph,
       prompt,
-      repoPath: selectedRepo?.path || "",
+      repo_path: selectedRepo?.path || "",
       targetFields,
-      workspaceId: activeQueueWorkspaceId,
-      workspaceName: activeQueueWorkspaceName,
+      workspace_id: activeQueueWorkspaceId,
+      workspace_name: activeQueueWorkspaceName,
     });
     setAgentCommandDraft("");
     setAgentCommandNotice(queuedItem ? "Queued for coding agents" : "Queued locally");
@@ -7622,19 +7365,19 @@ function ArchitectureGraphEditorView({
     const selection = architectureRunTargetSelection(runTarget, runSelections);
     const prompt = architectureRunPrompt(runTarget, selection.env, selection.mode);
     const targetFields = buildSnippingAnnotationTargetFields({
-      targetThreadId: agentTargetThreadId,
+      target_thread_id: agentTargetThreadId,
       targetWorkspace: agentTargetWorkspace,
     });
     const queuedItem = architectureQueueAgentTodo({
       graph: draftGraph,
       prompt,
-      repoPath: selectedRepo?.path || "",
+      repo_path: selectedRepo?.path || "",
       runEnvironment: selection.env,
       runMode: selection.mode,
       runTarget,
       targetFields,
-      workspaceId: activeQueueWorkspaceId,
-      workspaceName: activeQueueWorkspaceName,
+      workspace_id: activeQueueWorkspaceId,
+      workspace_name: activeQueueWorkspaceName,
     });
     setAgentCommandNotice(queuedItem ? `Queued ${runTarget.label}` : "Queued locally");
     if (queuedItem) onAgentEditQueued(queuedItem);
@@ -7749,7 +7492,7 @@ function ArchitectureGraphEditorView({
             <ArchitectureAgentEditStatus
               aria-live="polite"
               role="status"
-              style={{ "--agent-edit-color": agentEditMarker.agentColor }}
+              style={{ "--agent-edit-color": agentEditMarker.agent_color }}
               title={agentEditTitle}
             >
               <i aria-hidden="true" />
@@ -7907,10 +7650,10 @@ function ArchitectureGraphEditorView({
 
 function ArchitectureRevisionDrawer({
   activeGraphDirty = false,
-  graphId = "",
+  graph_id: graphId = "",
   onClose = () => {},
   onRestored = () => {},
-  repoPath = "",
+  repo_path: repoPath = "",
   selectedGraphId = "",
 }) {
   const scopedGraphId = text(graphId);
@@ -7936,8 +7679,8 @@ function ArchitectureRevisionDrawer({
     setError("");
     setNotice("");
     invoke("architecture_graph_revisions_list", {
-      graphId: scopedGraphId || null,
-      repoPath,
+      graph_id: scopedGraphId || null,
+      repo_path: repoPath,
     })
       .then((result) => {
         if (cancelled) return;
@@ -7986,9 +7729,9 @@ function ArchitectureRevisionDrawer({
     setPreviewState("loading");
     setError("");
     invoke("architecture_graph_revision_read", {
-      graphId: revisionGraphId,
-      repoPath,
-      revisionId,
+      graph_id: revisionGraphId,
+      repo_path: repoPath,
+      revision_id: revisionId,
     })
       .then((result) => {
         if (cancelled) return;
@@ -8015,9 +7758,9 @@ function ArchitectureRevisionDrawer({
     setError("");
     setNotice("");
     invoke("architecture_graph_revision_restore", {
-      graphId: revisionGraphId,
-      repoPath,
-      revisionId,
+      graph_id: revisionGraphId,
+      repo_path: repoPath,
+      revision_id: revisionId,
     })
       .then((result) => {
         setRestoreState("idle");
@@ -8063,7 +7806,7 @@ function ArchitectureRevisionDrawer({
                   data-selected={revisionId === architectureRevisionId(selectedRevision) ? "true" : "false"}
                   key={`${revisionGraphId}-${revisionId}`}
                   onClick={() => setSelectedRevisionId(revisionId)}
-                  title={item?.filePath || item?.file_path || revisionId}
+                  title={item?.file_path || revisionId}
                   type="button"
                 >
                   <strong>{text(item?.title, revisionGraphId || "Architecture")}</strong>
@@ -8081,7 +7824,7 @@ function ArchitectureRevisionDrawer({
                 <strong>{text(selectedRevision.title, architectureRevisionGraphId(selectedRevision))}</strong>
                 <span>{architectureRevisionReasonLabel(selectedRevision.reason)}</span>
                 <span>{formatTime(architectureRevisionTimestamp(selectedRevision)) || "unknown time"}</span>
-                <span>{selectedRevision.nodeCount || 0} nodes · {selectedRevision.edgeCount || 0} edges</span>
+                <span>{selectedRevision.node_count || 0} nodes · {selectedRevision.edge_count || 0} edges</span>
               </ArchitectureRevisionMeta>
             )}
             <ArchitectureRevisionSource data-state={previewState}>
@@ -8259,7 +8002,7 @@ function architectureOrderFlowNodes(nodes) {
   const orderById = new Map(nodeList.map((node, index) => [node.id, index]));
   const childrenByParent = new Map();
   nodeList.forEach((node) => {
-    const parentId = text(node?.parentId);
+    const parentId = text(node?.parent_id);
     const safeParentId = parentId && byId.has(parentId) ? parentId : "";
     if (!childrenByParent.has(safeParentId)) childrenByParent.set(safeParentId, []);
     childrenByParent.get(safeParentId).push(node);
@@ -8310,7 +8053,7 @@ function architectureAbsoluteNodePosition(node, nodeById, cache) {
   const nodeId = text(node?.id);
   if (!nodeId) return { x: 0, y: 0 };
   if (cache.has(nodeId)) return cache.get(nodeId);
-  const parentId = text(node?.parentId);
+  const parentId = text(node?.parent_id);
   const parentPosition = parentId && nodeById.has(parentId)
     ? architectureAbsoluteNodePosition(nodeById.get(parentId), nodeById, cache)
     : { x: 0, y: 0 };
@@ -8542,15 +8285,15 @@ function architectureEdgesWithRoutingData(edges, nodes, options = {}) {
   const allRouteSegments = routedEdges.flatMap((edge, index) => (
     architectureRouteSegments(jsonArray(edge.data?.routePoints)).map((segment) => ({
       ...segment,
-      edgeId: architectureEdgeRenderKey(edge, index),
+      edge_id: architectureEdgeRenderKey(edge, index),
     }))
   ));
   const labelRects = [];
   return routedEdges.map((edge, index) => {
     const edgeKey = architectureEdgeRenderKey(edge, index);
     const label = text(edge.data?.label);
-    const ownRouteSegments = allRouteSegments.filter((segment) => segment.edgeId === edgeKey);
-    const otherRouteSegments = allRouteSegments.filter((segment) => segment.edgeId !== edgeKey);
+    const ownRouteSegments = allRouteSegments.filter((segment) => segment.edge_id === edgeKey);
+    const otherRouteSegments = allRouteSegments.filter((segment) => segment.edge_id !== edgeKey);
     const labelPlacement = label
       ? architectureEdgeLabelPlacement(jsonArray(edge.data?.routePoints), {
         avoidanceRects: [...obstacleRects, ...labelRects],
@@ -9669,9 +9412,9 @@ function TodoHistoryTargetSelect({ item, onSelect, terminalOptions = [], value }
   const options = useMemo(() => [
     { color: "", label: "Any terminal", value: "" },
     ...terminalOptions.map((terminal) => ({
-      color: sanitizeTerminalColor(terminal.color, terminal.terminalIndex),
+      color: sanitizeTerminalColor(terminal.color, terminal.terminal_index),
       label: terminal.label,
-      value: String(terminal.terminalIndex),
+      value: String(terminal.terminal_index),
     })),
   ], [terminalOptions]);
   const selected = options.find((option) => option.value === String(value ?? "")) || options[0];
@@ -9695,7 +9438,7 @@ function TodoHistoryTargetSelect({ item, onSelect, terminalOptions = [], value }
 }
 
 function sessionHistoryAgentKey(item) {
-  const raw = text(item?.agentId || item?.agent_id || item?.provider || item?.agentKind || item?.agent_kind).toLowerCase();
+  const raw = text(item?.agent_id || item?.provider || item?.agent_kind).toLowerCase();
   if (raw.includes("claude")) return "claude";
   if (raw.includes("opencode") || raw.includes("open-code")) return "opencode";
   if (raw.includes("codex") || raw.includes("openai") || raw.includes("open-ai")) return "codex";
@@ -9711,12 +9454,12 @@ function sessionHistoryAgentLabel(item) {
     case "codex":
       return "OpenAI Codex";
     default:
-      return text(item?.provider || item?.agentId || item?.agent_id, "Coding agent");
+      return text(item?.provider || item?.agent_id, "Coding agent");
   }
 }
 
 function sessionHistoryModelLabel(item) {
-  return text(item?.modelId || item?.model_id, "Unknown model");
+  return text(item?.model_id, "Unknown model");
 }
 
 function sessionHistoryStatusKind(item) {
@@ -9740,21 +9483,7 @@ function sessionHistoryStatusLabel(item) {
 
 function sessionHistoryTitle(item) {
   return text(
-    item?.firstUserMessage
-      || item?.first_user_message
-      || item?.initialUserMessage
-      || item?.initial_user_message
-      || item?.promptPreview
-      || item?.prompt_preview
-      || item?.title
-      || item?.sessionTitle
-      || item?.session_title
-      || item?.providerSessionId
-      || item?.provider_session_id
-      || item?.nativeSessionId
-      || item?.native_session_id
-      || item?.threadId
-      || item?.thread_id,
+    item?.first_user_message || item?.initial_user_message || item?.prompt_preview || item?.title || item?.session_title || item?.provider_session_id || item?.native_session_id || item?.thread_id,
     sessionHistoryAgentLabel(item),
   );
 }
@@ -9762,44 +9491,29 @@ function sessionHistoryTitle(item) {
 function sessionHistorySearchFields(item) {
   return [
     sessionHistoryTitle(item),
-    item?.firstUserMessage,
     item?.first_user_message,
     sessionHistoryAgentLabel(item),
     sessionHistoryAgentKey(item),
     sessionHistoryModelLabel(item),
-    item?.modelSource,
     item?.model_source,
-    item?.sessionMode,
     item?.session_mode,
-    item?.fileAuthority,
     item?.file_authority,
-    item?.coordinationMode,
     item?.coordination_mode,
     sessionHistoryStatusLabel(item),
     item?.status,
     item?.title,
-    item?.sessionTitle,
     item?.session_title,
     item?.provider,
-    item?.agentId,
     item?.agent_id,
-    item?.providerSessionId,
     item?.provider_session_id,
-    item?.nativeSessionId,
     item?.native_session_id,
-    item?.forkFromProviderSessionId,
     item?.fork_from_provider_session_id,
-    item?.sharedHistoryId,
     item?.shared_history_id,
-    item?.chatSync?.status,
-    item?.chatSync?.label,
     item?.chat_sync?.status,
     item?.chat_sync?.label,
-    item?.threadId,
     item?.thread_id,
     item?.source,
     item?.cwd,
-    item?.workspaceName,
     item?.workspace_name,
   ]
     .map((value) => text(value).toLowerCase())
@@ -9821,11 +9535,11 @@ function sessionHistoryRowKey(item, index = 0) {
   return text(
     item?.id
       || [
-        item?.workspaceId || item?.workspace_id,
+        item?.workspace_id,
         sessionHistoryAgentKey(item),
-        item?.providerSessionId || item?.provider_session_id || item?.nativeSessionId || item?.native_session_id,
-        item?.createdAtMs || item?.created_at_ms,
-        item?.latestAtMs || item?.latest_at_ms,
+        item?.provider_session_id || item?.native_session_id,
+        item?.created_at_ms,
+        item?.latest_at_ms,
       ].map((part) => text(part)).filter(Boolean).join(":"),
     `session-${index}`,
   );
@@ -9833,17 +9547,13 @@ function sessionHistoryRowKey(item, index = 0) {
 
 function sessionHistoryPrimarySessionValues(value) {
   const values = [
-    value?.providerSessionId,
     value?.provider_session_id,
-    value?.nativeSessionId,
     value?.native_session_id,
     value?.currentProviderSessionId,
     value?.current_provider_session_id,
     value?.currentNativeSessionId,
     value?.current_native_session_id,
-    value?.transcriptSessionId,
     value?.transcript_session_id,
-    value?.sessionId,
     value?.session_id,
   ];
   const flattened = [];
@@ -9863,20 +9573,15 @@ function sessionHistoryPrimarySessionValues(value) {
 
 function sessionHistoryForkParentSessionId(item) {
   return text(
-    item?.forkFromProviderSessionId
-      || item?.fork_from_provider_session_id
-      || item?.forkedFromProviderSessionId
-      || item?.forked_from_provider_session_id
-      || item?.parentProviderSessionId
-      || item?.parent_provider_session_id,
+    item?.fork_from_provider_session_id || item?.forked_from_provider_session_id || item?.parent_provider_session_id,
   );
 }
 
 function sessionHistoryAgentMatches(item, terminal) {
   const itemAgent = sessionHistoryAgentKey(item);
   const terminalAgent = sessionHistoryAgentKey({
-    agentId: terminal?.agentId || terminal?.agent_id || terminal?.agentKind || terminal?.agent_kind,
-    provider: terminal?.provider || terminal?.agentId || terminal?.agent_id || terminal?.agentKind || terminal?.agent_kind,
+    agent_id: terminal?.agent_id || terminal?.agent_kind,
+    provider: terminal?.provider || terminal?.agent_id || terminal?.agent_kind,
   });
   return !itemAgent || !terminalAgent || itemAgent === terminalAgent;
 }
@@ -9887,15 +9592,11 @@ function sessionHistoryProviderSessionId(item) {
 
 function sessionHistoryTerminalConnected(terminal) {
   if (!terminal) return false;
-  if (terminal.connected === false || terminal.nativeConnected === false || terminal.native_connected === false) {
+  if (terminal.connected === false || terminal.native_connected === false) {
     return false;
   }
   const status = text(
-    terminal.status
-      || terminal.terminalStatus
-      || terminal.terminal_status
-      || terminal.terminalLifecycle
-      || terminal.terminal_lifecycle,
+    terminal.status || terminal.terminal_status || terminal.terminal_lifecycle,
   ).toLowerCase();
   return !["closed", "closing", "disconnected", "exited", "offline", "terminated"].includes(status);
 }
@@ -9917,8 +9618,8 @@ function sessionHistoryFindExactTerminal(item, terminalOptions = []) {
 }
 
 function sessionHistoryChatSyncStatus(item) {
-  const sync = item?.chatSync || item?.chat_sync || {};
-  const rawStatus = text(sync.status || sync.state || sync.syncStatus || sync.sync_status, "waiting").toLowerCase();
+  const sync = item?.chat_sync || {};
+  const rawStatus = text(sync.status || sync.state || sync.sync_status, "waiting").toLowerCase();
   const status = ["live", "waiting", "syncing", "synced", "failed"].includes(rawStatus)
     ? rawStatus
     : rawStatus === "retrying" || rawStatus === "active"
@@ -9933,19 +9634,19 @@ function sessionHistoryChatSyncStatus(item) {
     syncing: "Syncing",
     waiting: "Not synced",
   };
-  const pending = Number(sync.pendingPacketCount ?? sync.pending_packet_count ?? 0) || 0;
-  const syncing = Number(sync.syncingPacketCount ?? sync.syncing_packet_count ?? 0) || 0;
-  const retrying = Number(sync.retryingPacketCount ?? sync.retrying_packet_count ?? 0) || 0;
-  const failed = Number(sync.failedPacketCount ?? sync.failed_packet_count ?? 0) || 0;
-  const acked = Number(sync.recordAckedCount ?? sync.record_acked_count ?? 0) || 0;
-  const total = Number(sync.recordTotalCount ?? sync.record_total_count ?? 0) || 0;
+  const pending = Number(sync.pending_packet_count ?? 0) || 0;
+  const syncing = Number(sync.syncing_packet_count ?? 0) || 0;
+  const retrying = Number(sync.retrying_packet_count ?? 0) || 0;
+  const failed = Number(sync.failed_packet_count ?? 0) || 0;
+  const acked = Number(sync.record_acked_count ?? 0) || 0;
+  const total = Number(sync.record_total_count ?? 0) || 0;
   const parts = [];
   if (pending) parts.push(`${pending} waiting`);
   if (syncing) parts.push(`${syncing} sending`);
   if (retrying) parts.push(`${retrying} retrying`);
   if (failed) parts.push(`${failed} failed`);
   if (acked || total) parts.push(`${acked}/${total || acked} records`);
-  const lastError = text(sync.lastError || sync.last_error);
+  const lastError = text(sync.last_error);
   if (lastError) parts.push(lastError);
   const rawLabel = text(sync.label);
   const normalizedRawLabel = rawLabel.toLowerCase();
@@ -10001,7 +9702,7 @@ function SessionHistoryPanel({
   repoLabel = "",
   state = "idle",
   terminalOptions = [],
-  workspaceId = "",
+  workspace_id: workspaceId = "",
 }) {
   const [searchQuery, setSearchQuery] = useState("");
   const [scrollTop, setScrollTop] = useState(0);
@@ -10114,8 +9815,8 @@ function SessionHistoryPanel({
           <SessionHistoryVirtualSpacer style={{ height: totalListHeight }}>
           {virtualItems.map((item, virtualIndex) => {
             const index = startIndex + virtualIndex;
-            const createdMs = parseTimeMs(item?.createdAtMs ?? item?.created_at_ms);
-            const latestMs = parseTimeMs(item?.latestAtMs ?? item?.latest_at_ms);
+            const createdMs = parseTimeMs(item?.created_at_ms);
+            const latestMs = parseTimeMs(item?.latest_at_ms);
             const id = sessionHistoryRowKey(item, index);
             const terminalMatch = sessionHistoryFindExactTerminal(item, terminalOptions);
             const syncBadge = sessionHistoryChatSyncStatus(item);
@@ -10162,7 +9863,7 @@ function SessionHistoryPanel({
                               onClick={() => onGoToTerminal?.({
                                 item,
                                 terminal: terminalMatch,
-                                workspaceId,
+                                workspace_id: workspaceId,
                               })}
                               title={`Go to active terminal ${terminalMatch.label || "terminal"} and highlight it`}
                               type="button"
@@ -10177,8 +9878,8 @@ function SessionHistoryPanel({
                               disabled={!providerSessionId}
                               onClick={() => onOpenTerminal?.({
                                 item,
-                                providerSessionId,
-                                workspaceId,
+                                provider_session_id: providerSessionId,
+                                workspace_id: workspaceId,
                               })}
                               title={providerSessionId ? "Open this session in a terminal" : "No provider session id recorded"}
                               type="button"
@@ -10228,7 +9929,7 @@ function TodosHistoryPanel({
   onFinishPlan = null,
   repoLabel,
   terminalOptions = [],
-  workspaceId = "",
+  workspace_id: workspaceId = "",
 }) {
   const [selectedTodoId, setSelectedTodoId] = useState("");
   const [actionNotice, setActionNotice] = useState(null);
@@ -10239,7 +9940,7 @@ function TodosHistoryPanel({
   useEffect(() => {
     const handleResult = (event) => {
       const detail = event?.detail || {};
-      if (!detail.requestId || detail.requestId !== actionRequestRef.current) return;
+      if (!detail.request_id || detail.request_id !== actionRequestRef.current) return;
       actionRequestRef.current = "";
       if (detail.ok) {
         setActionNotice(null);
@@ -10276,16 +9977,16 @@ function TodosHistoryPanel({
     window.dispatchEvent(new CustomEvent(TODO_HISTORY_CONTROL_EVENT, {
       detail: {
         action,
-        commandId: item.commandId,
-        dispatchId: item.dispatchId,
+        command_id: item.command_id,
+        dispatch_id: item.dispatch_id,
         item: item.raw || null,
-        itemId: text(item.raw?.id),
-        promptEventId: item.promptEventId,
-        requestId,
+        item_id: text(item.raw?.id),
+        prompt_event_id: item.prompt_event_id,
+        request_id: requestId,
         storeApplied: storeOwnsAction,
-        todoId: item.todoId,
-        todoIds: item.todoIds,
-        workspaceId,
+        todo_id: item.todo_id,
+        todo_ids: item.todo_ids,
+        workspace_id: workspaceId,
         ...extra,
       },
     }));
@@ -10294,32 +9995,32 @@ function TodosHistoryPanel({
     }
     const respond = (ok, reason = "") => {
       window.dispatchEvent(new CustomEvent(TODO_HISTORY_CONTROL_RESULT_EVENT, {
-        detail: { action, ok, reason, requestId, workspaceId },
+        detail: { action, ok, reason, request_id: requestId, workspace_id: workspaceId },
       }));
     };
     const todoIds = [
       ...new Set(
-        [text(item.raw?.id), item.todoId, ...(Array.isArray(item.todoIds) ? item.todoIds : [])]
+        [text(item.raw?.id), item.todo_id, ...(Array.isArray(item.todo_ids) ? item.todo_ids : [])]
           .map((value) => String(value || "").trim())
           .filter(Boolean),
       ),
     ];
     const todoRefs = {
-      todoId: String(item.todoId || text(item.raw?.id) || "").trim() || null,
-      commandId: String(item.commandId || "").trim() || null,
-      dispatchId: String(item.dispatchId || "").trim() || null,
+      todo_id: String(item.todo_id || text(item.raw?.id) || "").trim() || null,
+      command_id: String(item.command_id || "").trim() || null,
+      dispatch_id: String(item.dispatch_id || "").trim() || null,
     };
     const todoItemPayload = item.raw || null;
-    const queueTargetIndex = Number(extra.targetTerminalIndex);
+    const queueTargetIndex = Number(extra.target_terminal_index);
     const request = action === "cancel"
       ? invoke("todo_store_cancel", {
-        workspaceId,
+        workspace_id: workspaceId,
         ...todoRefs,
         reason: "todo_history_cancel",
       })
       : action === "unqueue"
         ? invoke("todo_store_set_status", {
-          workspaceId,
+          workspace_id: workspaceId,
           ...todoRefs,
           item: todoItemPayload,
           status: "listed",
@@ -10327,17 +10028,17 @@ function TodosHistoryPanel({
         })
         : action === "queue" || action === "retarget"
           ? invoke("todo_store_set_status", {
-            workspaceId,
+            workspace_id: workspaceId,
             ...todoRefs,
             item: todoItemPayload,
             status: "queued",
             reason: action === "queue" ? "todo_history_queue" : "todo_history_retarget",
-            targetTerminalIndex: Number.isInteger(queueTargetIndex) ? queueTargetIndex : null,
-            clearTarget: extra.generic === true,
+            target_terminal_index: Number.isInteger(queueTargetIndex) ? queueTargetIndex : null,
+            clear_target: extra.generic === true,
           })
           : invoke("todo_store_delete", {
-            workspaceId,
-            todoIds,
+            workspace_id: workspaceId,
+            todo_ids: todoIds,
             reason: "todo_history_delete",
           });
     request
@@ -10347,7 +10048,7 @@ function TodosHistoryPanel({
 
   const queuedTargetValue = useCallback((item) => {
     const raw = item.raw || {};
-    const index = Number(raw.targetTerminalIndex ?? raw.target_terminal_index);
+    const index = Number(raw.target_terminal_index);
     return Number.isInteger(index) ? String(index) : "";
   }, []);
 
@@ -10355,7 +10056,7 @@ function TodosHistoryPanel({
     const targetTerminalIndex = value === "" ? null : Number(value);
     dispatchTodoAction(item, "retarget", {
       generic: value === "",
-      targetTerminalIndex: Number.isInteger(targetTerminalIndex) ? targetTerminalIndex : null,
+      target_terminal_index: Number.isInteger(targetTerminalIndex) ? targetTerminalIndex : null,
     });
   }, [dispatchTodoAction]);
 
@@ -10423,7 +10124,7 @@ function TodosHistoryPanel({
                   const selected = selectedItem?.id === item.id;
                   const relativeStamp = item.statusKind === "active"
                     ? "live now"
-                    : formatRelativeTimeMs(item.updatedMs || item.endMs || item.createdMs) || "unknown";
+                    : formatRelativeTimeMs(item.updatedMs || item.end_ms || item.created_ms) || "unknown";
                   const preview = text(item.body, item.title);
                   return (
                     <TodoHistoryRowShell data-selected={selected ? "true" : "false"} key={item.id}>
@@ -10436,14 +10137,14 @@ function TodosHistoryPanel({
                       >
                         <TodoHistoryRowTop>
                           <StatusPill data-status={item.statusKind} title={`Actual status: ${item.rawStatus}`}>
-                            {item.statusLabel}
+                            {item.status_label}
                           </StatusPill>
                           <time>{relativeStamp}</time>
                         </TodoHistoryRowTop>
                         <TodoHistoryRowPreview>{preview}</TodoHistoryRowPreview>
                         <TodoHistoryRowMeta>
                           <span>{item.target || item.source || "unassigned"}</span>
-                          {item.taskCount > 0 && <em>{item.taskCount} task{item.taskCount === 1 ? "" : "s"}</em>}
+                          {item.task_count > 0 && <em>{item.task_count} task{item.task_count === 1 ? "" : "s"}</em>}
                           {item.planCount > 0 && <em>{item.planCount} plan{item.planCount === 1 ? "" : "s"}</em>}
                         </TodoHistoryRowMeta>
                       </TodoHistoryRow>
@@ -10519,7 +10220,7 @@ function TodosHistoryPanel({
                               const targetTerminalIndex = draftValue === "" ? null : Number(draftValue);
                               dispatchTodoAction(item, "queue", {
                                 generic: draftValue === "",
-                                targetTerminalIndex: Number.isInteger(targetTerminalIndex) ? targetTerminalIndex : null,
+                                target_terminal_index: Number.isInteger(targetTerminalIndex) ? targetTerminalIndex : null,
                               });
                             }}
                             title="Queue this todo"
@@ -10581,7 +10282,7 @@ function TaskPlanPreviewCard({
   label = "Terminal todo plan",
   plan,
   statusKind = "",
-  statusLabel = "",
+  status_label: statusLabel = "",
   title = "",
 }) {
   if (!plan) return null;
@@ -10699,23 +10400,23 @@ function TodoDetailPanel({
     );
   }
 
-  const updatedRelative = formatRelativeTimeMs(item.updatedMs || item.createdMs) || "unknown";
+  const updatedRelative = formatRelativeTimeMs(item.updatedMs || item.created_ms) || "unknown";
   const duration = item.duration || formatTimelineDuration(
-    item.startMs || item.createdMs,
-    item.endMs,
+    item.start_ms || item.created_ms,
+    item.end_ms,
     item.statusKind === "active",
   ) || "unknown";
-  const sourceDevice = item.sourceDevice || {};
-  const targetDevice = item.targetDevice || {};
+  const sourceDevice = item.source_device || {};
+  const targetDevice = item.target_device || {};
   const sourceName = todoDeviceDisplayName(sourceDevice, deviceDirectory);
   const targetName = todoDeviceDisplayName(targetDevice, deviceDirectory);
-  const sourceWorkspace = sourceDevice.workspaceName || sourceDevice.workspaceId || "unknown workspace";
-  const targetWorkspace = targetDevice.workspaceName || targetDevice.workspaceId || "unknown workspace";
+  const sourceWorkspace = sourceDevice.workspace_name || sourceDevice.workspace_id || "unknown workspace";
+  const targetWorkspace = targetDevice.workspace_name || targetDevice.workspace_id || "unknown workspace";
   const SourceDeviceIcon = TODO_DEVICE_PLATFORM_ICONS[
-    todoDevicePlatformToken(sourceDevice, deviceDirectory?.get?.(todoDeviceKey(sourceDevice.deviceId)))
+    todoDevicePlatformToken(sourceDevice, deviceDirectory?.get?.(todoDeviceKey(sourceDevice.device_id)))
   ];
   const TargetDeviceIcon = TODO_DEVICE_PLATFORM_ICONS[
-    todoDevicePlatformToken(targetDevice, deviceDirectory?.get?.(todoDeviceKey(targetDevice.deviceId)))
+    todoDevicePlatformToken(targetDevice, deviceDirectory?.get?.(todoDeviceKey(targetDevice.device_id)))
   ];
   // Same device + workspace on both ends collapses to one chip — half the
   // detail panel's todos are self-dispatched and the duplication reads noisy.
@@ -10732,7 +10433,7 @@ function TodoDetailPanel({
         <TaskDetailsHeaderActions>
           <TaskDetailsUpdated>Updated {updatedRelative}</TaskDetailsUpdated>
           <StatusPill data-status={item.statusKind} title={`Actual status: ${item.rawStatus}`}>
-            {item.statusLabel}
+            {item.status_label}
           </StatusPill>
         </TaskDetailsHeaderActions>
       </TaskDetailsHeader>
@@ -10743,7 +10444,7 @@ function TodoDetailPanel({
         </TaskMetaChip>
         <TaskMetaChip>
           <span>Tasks</span>
-          <strong>{item.taskCount}</strong>
+          <strong>{item.task_count}</strong>
         </TaskMetaChip>
         <TaskMetaChip>
           <span>Plans</span>
@@ -10751,14 +10452,14 @@ function TodoDetailPanel({
         </TaskMetaChip>
       </TaskMetaStrip>
       <TodoDeviceGrid data-single={sameEndpoint ? "true" : undefined}>
-        <TodoDeviceCard title={text(sourceDevice.deviceId) || undefined}>
+        <TodoDeviceCard title={text(sourceDevice.device_id) || undefined}>
           <span>{sameEndpoint ? "Device" : "Source"}</span>
           <TodoDeviceIcon aria-hidden="true"><SourceDeviceIcon /></TodoDeviceIcon>
           <strong>{sourceName}</strong>
           <em>{sourceWorkspace}</em>
         </TodoDeviceCard>
         {!sameEndpoint && (
-          <TodoDeviceCard title={text(targetDevice.deviceId) || undefined}>
+          <TodoDeviceCard title={text(targetDevice.device_id) || undefined}>
             <span>Target</span>
             <TodoDeviceIcon aria-hidden="true"><TargetDeviceIcon /></TodoDeviceIcon>
             <strong>{targetName}</strong>
@@ -10827,10 +10528,10 @@ function TodoDetailPanel({
                 </FinishPlanButton>
               ) : null}
               key={entry.key}
-              label={entry.sourceLabel === "Task" ? "Task plan" : "Todo plan"}
+              label={entry.source_label === "Task" ? "Task plan" : "Todo plan"}
               plan={plan}
               statusKind={statusKind}
-              statusLabel={statusLabel}
+              status_label={statusLabel}
               title={entry.title}
             />
           );
@@ -10848,8 +10549,8 @@ function ScannedResultPanel({ error = "", scan = null, state = "idle" }) {
   const hasGraph = graph.nodes.length > 0;
   const isLoading = state === "loading";
   const repositoriesByPath = new Map(jsonArray(scan?.repositories).map((repo) => [scannedResultEntryPath(repo), repo]));
-  const discoveredScanEntries = jsonArray(scan?.workspaceMounts || scan?.workspace_mounts).length
-    ? jsonArray(scan?.workspaceMounts || scan?.workspace_mounts)
+  const discoveredScanEntries = jsonArray(scan?.workspace_mounts).length
+    ? jsonArray(scan?.workspace_mounts)
     : jsonArray(scan?.mounts).length
       ? jsonArray(scan.mounts)
       : jsonArray(scan?.repositories);
@@ -10857,7 +10558,7 @@ function ScannedResultPanel({ error = "", scan = null, state = "idle" }) {
     const matchingRepository = repositoriesByPath.get(scannedResultEntryPath(entry));
     return {
       ...entry,
-      graphCount: numberValue(entry?.graphCount ?? entry?.graph_count ?? matchingRepository?.graphCount ?? matchingRepository?.graph_count, 0),
+      graph_count: numberValue(entry?.graph_count ?? matchingRepository?.graph_count, 0),
     };
   });
 
@@ -10871,7 +10572,7 @@ function ScannedResultPanel({ error = "", scan = null, state = "idle" }) {
       </ScannedResultHeader>
       {error && <ArchitectureError>{error}</ArchitectureError>}
       <ScannedResultStats>
-        <span>{graph.stats.sourceLabel}</span>
+        <span>{graph.stats.source_label}</span>
         <span>{graph.stats.repoCount} scan entr{graph.stats.repoCount === 1 ? "y" : "ies"}</span>
         <span>{graph.stats.gitCount} git</span>
         <span>{graph.stats.folderCount} folder{graph.stats.folderCount === 1 ? "" : "s"}</span>
@@ -10884,14 +10585,14 @@ function ScannedResultPanel({ error = "", scan = null, state = "idle" }) {
       {scanEntries.length > 0 && (
         <ScannedResultList aria-label="Scanned entries">
           {scanEntries.map((entry, index) => {
-            const graphCount = numberValue(entry?.graphCount ?? entry?.graph_count, 0);
+            const graphCount = numberValue(entry?.graph_count, 0);
             return (
               <ScannedResultListRow
                 data-kind={scannedResultGraphKind(entry)}
-                key={text(entry.mountId || entry.mount_id || entry.id || scannedResultEntryPath(entry), `scan-entry-${index}`)}
+                key={text(entry.mount_id || entry.id || scannedResultEntryPath(entry), `scan-entry-${index}`)}
               >
                 <strong>{scannedResultEntryName(entry, "Project")}</strong>
-                <span>{text(scannedResultRelativePath(entry, scan?.rootDirectory || scan?.root_directory), ".")}</span>
+                <span>{text(scannedResultRelativePath(entry, scan?.root_directory), ".")}</span>
                 <em>{scannedResultEntryKindLabel(entry)}</em>
                 <em>{graphCount} graph{graphCount === 1 ? "" : "s"}</em>
               </ScannedResultListRow>
@@ -10951,7 +10652,7 @@ function ScannedResultGraph({ graph }) {
               <rect className="scan-node-box" height={nodeHeight} rx="8" width={nodeWidth} />
               <circle className="scan-node-dot" cx="18" cy="21" r="5" />
               <text className="scan-node-label" x="32" y="24">{shortLabel(node.label, 24)}</text>
-              <text className="scan-node-meta" x="14" y="46">{shortLabel(node.meta || node.relativePath || node.path, 30)}</text>
+              <text className="scan-node-meta" x="14" y="46">{shortLabel(node.meta || node.relative_path || node.path, 30)}</text>
               <text className="scan-node-badge" x={nodeWidth - 14} y="46" textAnchor="end">{shortLabel(node.badge, 13)}</text>
             </g>
           ))}

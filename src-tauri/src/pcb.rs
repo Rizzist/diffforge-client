@@ -227,7 +227,6 @@ fn pcb_manifest_board_workspace(manifest: &serde_json::Value, board_path: &str) 
         .and_then(|entry| {
             entry
                 .get("workspaceId")
-                .or_else(|| entry.get("workspace_id"))
                 .and_then(|value| value.as_str())
         })
         .map(|value| value.trim().to_string())
@@ -328,7 +327,7 @@ fn pcb_collect_boards(hardware: &std::path::Path, root: &std::path::Path, out: &
                     "id": pcb_board_id(&path),
                     "name": pcb_board_id(&path),
                     "path": pcb_relative_path(root, &path),
-                    "updatedAtMs": pcb_file_modified_ms(&path),
+                    "updated_at_ms": pcb_file_modified_ms(&path),
                 }));
             }
         } else if path.is_dir() {
@@ -341,7 +340,7 @@ fn pcb_collect_boards(hardware: &std::path::Path, root: &std::path::Path, out: &
                             "id": pcb_board_id(&child_path),
                             "name": pcb_board_id(&child_path),
                             "path": pcb_relative_path(root, &child_path),
-                            "updatedAtMs": pcb_file_modified_ms(&child_path),
+                            "updated_at_ms": pcb_file_modified_ms(&child_path),
                         }));
                     }
                 }
@@ -411,8 +410,8 @@ fn pcb_documents_list_blocking(
             .cmp(b.get("path").and_then(|v| v.as_str()).unwrap_or_default())
     });
     Ok(serde_json::json!({
-        "repoPath": root.to_string_lossy(),
-        "workspaceId": workspace_text,
+        "repo_path": root.to_string_lossy(),
+        "workspace_id": workspace_text,
         "boards": boards,
     }))
 }
@@ -457,9 +456,9 @@ fn pcb_document_read_blocking(
         "claimed": claimed,
         "path": rel_path,
         "name": board_name,
-        "repoPath": root.to_string_lossy(),
+        "repo_path": root.to_string_lossy(),
         "source": source,
-        "workspaceId": workspace_text,
+        "workspace_id": workspace_text,
     }))
 }
 
@@ -525,9 +524,9 @@ fn pcb_document_create_blocking(
     Ok(serde_json::json!({
         "path": rel_path,
         "name": slug,
-        "repoPath": root.to_string_lossy(),
+        "repo_path": root.to_string_lossy(),
         "source": source,
-        "workspaceId": workspace_text,
+        "workspace_id": workspace_text,
     }))
 }
 
@@ -566,12 +565,12 @@ fn pcb_document_delete_blocking(
     Ok(serde_json::json!({
         "deleted": true,
         "path": rel_path,
-        "repoPath": root.to_string_lossy(),
-        "workspaceId": workspace_text,
+        "repo_path": root.to_string_lossy(),
+        "workspace_id": workspace_text,
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn pcb_documents_list(
     app: tauri::AppHandle,
     repo_path: String,
@@ -585,7 +584,7 @@ async fn pcb_documents_list(
         .map_err(|error| format!("PCB document list worker failed: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn pcb_document_read(
     app: tauri::AppHandle,
     repo_path: String,
@@ -601,16 +600,16 @@ async fn pcb_document_read(
         .map_err(|error| format!("PCB document read worker failed: {error}"))??;
     if result.get("claimed").and_then(|value| value.as_bool()).unwrap_or(false) {
         let _ = app.emit(PCB_STORE_CHANGED_EVENT, serde_json::json!({
-            "repoPath": result.get("repoPath").and_then(|value| value.as_str()).unwrap_or_default(),
-            "workspaceId": result.get("workspaceId").and_then(|value| value.as_str()).unwrap_or_default(),
+            "repo_path": result.get("repo_path").and_then(|value| value.as_str()).unwrap_or_default(),
+            "workspace_id": result.get("workspace_id").and_then(|value| value.as_str()).unwrap_or_default(),
             "paths": [result.get("path").and_then(|value| value.as_str()).unwrap_or_default()],
-            "changedAtMs": architecture_now_millis(),
+            "changed_at_ms": architecture_now_millis(),
         }));
     }
     Ok(result)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn pcb_document_create(
     app: tauri::AppHandle,
     repo_path: String,
@@ -625,15 +624,15 @@ async fn pcb_document_create(
         .await
         .map_err(|error| format!("PCB document create worker failed: {error}"))??;
     let _ = app.emit(PCB_STORE_CHANGED_EVENT, serde_json::json!({
-        "repoPath": result.get("repoPath").and_then(|value| value.as_str()).unwrap_or_default(),
-        "workspaceId": result.get("workspaceId").and_then(|value| value.as_str()).unwrap_or_default(),
+        "repo_path": result.get("repo_path").and_then(|value| value.as_str()).unwrap_or_default(),
+        "workspace_id": result.get("workspace_id").and_then(|value| value.as_str()).unwrap_or_default(),
         "paths": [result.get("path").and_then(|value| value.as_str()).unwrap_or_default()],
-        "changedAtMs": architecture_now_millis(),
+        "changed_at_ms": architecture_now_millis(),
     }));
     Ok(result)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn pcb_document_delete(
     app: tauri::AppHandle,
     repo_path: String,
@@ -648,16 +647,16 @@ async fn pcb_document_delete(
         .await
         .map_err(|error| format!("PCB document delete worker failed: {error}"))??;
     let _ = app.emit(PCB_STORE_CHANGED_EVENT, serde_json::json!({
-        "repoPath": result.get("repoPath").and_then(|value| value.as_str()).unwrap_or_default(),
-        "workspaceId": result.get("workspaceId").and_then(|value| value.as_str()).unwrap_or_default(),
+        "repo_path": result.get("repo_path").and_then(|value| value.as_str()).unwrap_or_default(),
+        "workspace_id": result.get("workspace_id").and_then(|value| value.as_str()).unwrap_or_default(),
         "paths": [result.get("path").and_then(|value| value.as_str()).unwrap_or_default()],
-        "deletedPaths": [result.get("path").and_then(|value| value.as_str()).unwrap_or_default()],
-        "changedAtMs": architecture_now_millis(),
+        "deleted_paths": [result.get("path").and_then(|value| value.as_str()).unwrap_or_default()],
+        "changed_at_ms": architecture_now_millis(),
     }));
     Ok(result)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn pcb_vendor_fetch(request: PcbVendorFetchRequest) -> Result<PcbVendorFetchResponse, String> {
     let url = pcb_vendor_fetch_url(request.url.as_str())?;
     let method_text = request
@@ -725,7 +724,7 @@ async fn pcb_vendor_fetch(request: PcbVendorFetchRequest) -> Result<PcbVendorFet
 // Ensure a debounced filesystem watcher is running for this workspace's
 // hardware/ directory, emitting `pcb-store-changed` on any board edit. Mirrors
 // architecture_store_watcher_start but scoped per workspace and started on demand.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn pcb_watch_start(app: tauri::AppHandle, repo_path: String) -> Result<(), String> {
     let (root, hardware) = pcb_hardware_root(repo_path.as_str())?;
     std::fs::create_dir_all(&hardware)
@@ -785,9 +784,9 @@ fn pcb_watch_start(app: tauri::AppHandle, repo_path: String) -> Result<(), Strin
             let _ = app.emit(
                 PCB_STORE_CHANGED_EVENT,
                 serde_json::json!({
-                    "repoPath": repo_display,
+                    "repo_path": repo_display,
                     "paths": paths,
-                    "changedAtMs": architecture_now_millis(),
+                    "changed_at_ms": architecture_now_millis(),
                 }),
             );
         }
@@ -864,14 +863,14 @@ fn emit_pcb_panel_closed(app: &tauri::AppHandle, workspace_id: &str, pane_id: &s
     let _ = app.emit(
         PCB_PANEL_CLOSED_EVENT,
         serde_json::json!({
-            "paneId": pane_id,
-            "windowId": window_id,
-            "workspaceId": workspace_id,
+            "pane_id": pane_id,
+            "window_id": window_id,
+            "workspace_id": workspace_id,
         }),
     );
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn pcb_panel_open(
     app: tauri::AppHandle,
     repo_path: String,
@@ -958,7 +957,7 @@ async fn pcb_panel_open(
     Ok(PcbPanelOpenResult { label })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn pcb_panel_focus(app: tauri::AppHandle, workspace_id: String, pane_id: String) -> Result<bool, String> {
     let label = pcb_panel_label(&workspace_id, &pane_id);
     let Some(window) = app.get_webview_window(&label) else {
@@ -969,7 +968,7 @@ async fn pcb_panel_focus(app: tauri::AppHandle, workspace_id: String, pane_id: S
     Ok(true)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn pcb_panel_close(app: tauri::AppHandle, workspace_id: String, pane_id: String) -> Result<(), String> {
     let workspace_text = workspace_id.trim().to_string();
     let pane_text = pane_id.trim().to_string();
@@ -982,7 +981,7 @@ async fn pcb_panel_close(app: tauri::AppHandle, workspace_id: String, pane_id: S
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn pcb_window_open(
     app: tauri::AppHandle,
     repo_path: String,
@@ -1062,10 +1061,10 @@ async fn pcb_window_open(
             let _ = app_for_events.emit(
                 PCB_WINDOW_CLOSED_EVENT,
                 serde_json::json!({
-                    "boardPath": board_for_events,
-                    "repoPath": repo_for_events,
-                    "windowId": label_for_events,
-                    "workspaceId": workspace_for_events,
+                    "board_path": board_for_events,
+                    "repo_path": repo_for_events,
+                    "window_id": label_for_events,
+                    "workspace_id": workspace_for_events,
                 }),
             );
         }
@@ -1074,7 +1073,7 @@ async fn pcb_window_open(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn pcb_window_close(
     app: tauri::AppHandle,
     board_path: String,

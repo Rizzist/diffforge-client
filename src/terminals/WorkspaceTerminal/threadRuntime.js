@@ -180,7 +180,7 @@ export function getTerminalPanelRows(terminalIndexes) {
     if (rowIndexes.length) {
       rows.push({
         rowIndex: rows.length,
-        terminalIndexes: rowIndexes,
+        terminal_indexes: rowIndexes,
       });
     }
     indexCursor += rowSize;
@@ -331,10 +331,10 @@ export function getTerminalComposerSnapshot(state, options = {}) {
     confidence: snapshot.confidence,
     cursorEnd: snapshot.cursorEnd,
     cursorStart: snapshot.cursorStart,
-    promptEventId: String(options.promptEventId || "").trim(),
+    prompt_event_id: String(options.prompt_event_id || "").trim(),
     revision: snapshot.revision,
     source: String(options.source || snapshot.source || ""),
-    submittedAt: options.submittedAt || "",
+    submitted_at: options.submitted_at || "",
     text: snapshot.text,
   };
 }
@@ -789,7 +789,7 @@ export function getWorkspaceThreadComposerDraftRecord(syncKey) {
       source: "",
       syncKey: "",
       transactionId: "",
-      updatedAt: "",
+      updated_at: "",
       value: "",
     };
   }
@@ -800,7 +800,7 @@ export function getWorkspaceThreadComposerDraftRecord(syncKey) {
     source: String(metadata.source || ""),
     syncKey: key,
     transactionId: String(metadata.transactionId || ""),
-    updatedAt: String(metadata.updatedAt || ""),
+    updated_at: String(metadata.updated_at || ""),
     value: workspaceThreadComposerDraftStore.get(key) || "",
   };
 }
@@ -808,12 +808,12 @@ export function getWorkspaceThreadComposerDraftRecord(syncKey) {
 function getComposerAttachmentLogSummary(attachments) {
   return (Array.isArray(attachments) ? attachments : [])
     .map((attachment) => ({
-      dataUrlLength: String(attachment?.dataUrl || "").length,
+      dataUrlLength: String(attachment?.data_url || "").length,
       id: String(attachment?.id || ""),
       kind: String(attachment?.kind || ""),
-      mimeType: String(attachment?.mimeType || ""),
+      mime_type: String(attachment?.mime_type || ""),
       name: String(attachment?.name || ""),
-      relativePath: String(attachment?.relativePath || ""),
+      relative_path: String(attachment?.relative_path || ""),
       savedPathPresent: Boolean(attachment?.savedPath),
       size: Number(attachment?.size || 0),
       source: String(attachment?.source || ""),
@@ -835,12 +835,12 @@ function normalizeWorkspaceThreadComposerAttachment(attachment, index = 0) {
     return null;
   }
 
-  const dataUrl = String(attachment.dataUrl || attachment.src || attachment.imageDataUrl || "").trim();
+  const dataUrl = String(attachment.data_url || attachment.src || attachment.image_data_url || "").trim();
   const savedPath = String(attachment.savedPath || attachment.path || "").trim();
-  const mimeType = String(attachment.mimeType || attachment.type || "").trim()
+  const mimeType = String(attachment.mime_type || attachment.type || "").trim()
     || dataUrl.match(/^data:([^;]+);/i)?.[1]
     || "";
-  const relativePath = String(attachment.relativePath || "").trim().replace(/\\/g, "/");
+  const relativePath = String(attachment.relative_path || "").trim().replace(/\\/g, "/");
   const kind = String(attachment.kind || (mimeType.startsWith("image/") ? "image" : "file")).trim() || "file";
   const name = String(attachment.name || relativePath.split("/").filter(Boolean).pop() || `attachment-${index + 1}`).trim()
     || `attachment-${index + 1}`;
@@ -850,12 +850,12 @@ function normalizeWorkspaceThreadComposerAttachment(attachment, index = 0) {
   }
 
   return {
-    dataUrl,
+    data_url: dataUrl,
     id: String(attachment.id || createComposerAttachmentId()),
     kind,
-    mimeType,
+    mime_type: mimeType,
     name,
-    relativePath,
+    relative_path: relativePath,
     savedPath,
     size: Number(attachment.size || 0),
     source: String(attachment.source || "unknown"),
@@ -944,7 +944,7 @@ export function setWorkspaceThreadComposerDraft(syncKey, value, options = {}) {
   const currentValue = workspaceThreadComposerDraftStore.get(key) || "";
   const currentMetadata = workspaceThreadComposerDraftMetadataStore.get(key) || {};
   const changed = currentValue !== nextValue;
-  const transactionId = String(options.transactionId || options.dispatchId || "").trim();
+  const transactionId = String(options.transactionId || options.dispatch_id || "").trim();
   const source = String(options.source || currentMetadata.source || "").trim();
   const shouldUpdateMetadata = changed
     || Boolean(transactionId)
@@ -964,7 +964,7 @@ export function setWorkspaceThreadComposerDraft(syncKey, value, options = {}) {
     revision,
     source,
     transactionId,
-    updatedAt: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
   });
   notifyWorkspaceThreadComposerDraftSubscribers();
 
@@ -1098,12 +1098,12 @@ export function createThreadProjectionToken(prefix = "projection") {
 }
 
 export function buildProviderTurnStartProjectionEvents({
-  agentId,
+  agent_id: agentId,
   includeUserMessage = false,
   source = "provider-api",
-  startedAt,
+  started_at: startedAt,
   text,
-  turnId,
+  turn_id: turnId,
   userMessageId,
 }) {
   const safeText = String(text || "").trim();
@@ -1113,28 +1113,28 @@ export function buildProviderTurnStartProjectionEvents({
 
   const events = [
     {
-      agentId,
-      createdAt: safeStartedAt,
+      agent_id: agentId,
+      created_at: safeStartedAt,
       id: `projection-provider-turn-started-${safeTurnId}`,
-      messageId: safeUserMessageId,
+      message_id: safeUserMessageId,
       source,
       status: "running",
-      turnId: safeTurnId,
+      turn_id: safeTurnId,
       type: "thread.turn.started",
     },
   ];
 
   if (includeUserMessage) {
     events.push({
-      agentId,
-      createdAt: safeStartedAt,
+      agent_id: agentId,
+      created_at: safeStartedAt,
       id: `projection-provider-user-${safeUserMessageId}`,
-      messageId: safeUserMessageId,
+      message_id: safeUserMessageId,
       role: "user",
       source,
       status: "submitted",
       text: safeText,
-      turnId: safeTurnId,
+      turn_id: safeTurnId,
       type: "thread.message.user",
     });
   }
@@ -1143,15 +1143,15 @@ export function buildProviderTurnStartProjectionEvents({
 }
 
 export function buildProviderTurnProjectionEvents({
-  agentId,
-  assistantMessageId,
-  completedAt,
+  agent_id: agentId,
+  assistant_message_id: assistantMessageId,
+  completed_at: completedAt,
   includeConversationMessages = false,
   output,
   source = "provider-api",
-  startedAt,
+  started_at: startedAt,
   text,
-  turnId,
+  turn_id: turnId,
   userMessageId,
 }) {
   const safeText = String(text || "").trim();
@@ -1164,12 +1164,12 @@ export function buildProviderTurnProjectionEvents({
 
   const events = [
     ...buildProviderTurnStartProjectionEvents({
-      agentId,
+      agent_id: agentId,
       includeUserMessage: includeConversationMessages,
       source,
-      startedAt: safeStartedAt,
+      started_at: safeStartedAt,
       text: safeText,
-      turnId: safeTurnId,
+      turn_id: safeTurnId,
       userMessageId: safeUserMessageId,
     }),
   ];
@@ -1177,26 +1177,26 @@ export function buildProviderTurnProjectionEvents({
   if (includeConversationMessages) {
     events.push(
       {
-        agentId,
-        createdAt: safeCompletedAt,
+        agent_id: agentId,
+        created_at: safeCompletedAt,
         delta: safeOutput,
         id: `projection-provider-assistant-delta-${safeAssistantMessageId}`,
-        messageId: safeAssistantMessageId,
+        message_id: safeAssistantMessageId,
         source,
         status: "streaming",
         text: safeOutput,
-        turnId: safeTurnId,
+        turn_id: safeTurnId,
         type: "thread.message.assistant.delta",
       },
       {
-        agentId,
-        createdAt: safeCompletedAt,
+        agent_id: agentId,
+        created_at: safeCompletedAt,
         id: `projection-provider-assistant-complete-${safeAssistantMessageId}`,
-        messageId: safeAssistantMessageId,
+        message_id: safeAssistantMessageId,
         source,
         status: "complete",
         text: safeOutput,
-        turnId: safeTurnId,
+        turn_id: safeTurnId,
         type: "thread.message.assistant.complete",
       },
     );
@@ -1204,15 +1204,15 @@ export function buildProviderTurnProjectionEvents({
 
   events.push(
     {
-      agentId,
-      createdAt: safeCompletedAt,
-      assistantMessageId: safeAssistantMessageId,
-      completedAt: safeCompletedAt,
+      agent_id: agentId,
+      created_at: safeCompletedAt,
+      assistant_message_id: safeAssistantMessageId,
+      completed_at: safeCompletedAt,
       id: `projection-provider-turn-completed-${safeTurnId}`,
-      messageId: safeUserMessageId,
+      message_id: safeUserMessageId,
       source,
       status: "completed",
-      turnId: safeTurnId,
+      turn_id: safeTurnId,
       type: "thread.turn.completed",
     },
   );
@@ -1221,11 +1221,11 @@ export function buildProviderTurnProjectionEvents({
 }
 
 export function buildProviderTurnErrorProjectionEvents({
-  agentId,
-  completedAt,
+  agent_id: agentId,
+  completed_at: completedAt,
   error,
   source = "provider-api",
-  turnId,
+  turn_id: turnId,
   userMessageId,
 }) {
   const safeCompletedAt = completedAt || new Date().toISOString();
@@ -1235,15 +1235,15 @@ export function buildProviderTurnErrorProjectionEvents({
 
   return [
     {
-      agentId,
-      completedAt: safeCompletedAt,
-      createdAt: safeCompletedAt,
+      agent_id: agentId,
+      completed_at: safeCompletedAt,
+      created_at: safeCompletedAt,
       id: `projection-provider-turn-error-${safeTurnId}`,
-      messageId: safeUserMessageId,
+      message_id: safeUserMessageId,
       source,
       status: "error",
       text: safeError,
-      turnId: safeTurnId,
+      turn_id: safeTurnId,
       type: "thread.turn.error",
     },
   ];
@@ -1281,15 +1281,15 @@ function delayThreadBridgeMs(delayMs) {
 
 export function createTerminalPromptSubmittedWaiter({
   allowObservedInputGateForHookManaged = false,
-  agentId = "",
-  expectedPrompt = "",
-  instanceId,
-  paneId,
-  promptId,
+  agent_id: agentId = "",
+  expected_prompt: expectedPrompt = "",
+  instance_id: instanceId,
+  pane_id: paneId,
+  prompt_id: promptId,
   requirePromptMatch = false,
-  threadId,
-  timeoutMs = 6000,
-  workspaceId = "",
+  thread_id: threadId,
+  timeout_ms: timeoutMs = 6000,
+  workspace_id: workspaceId = "",
 }) {
   const safePromptId = String(promptId || "").trim();
   const safePaneId = String(paneId || "").trim();
@@ -1320,14 +1320,14 @@ export function createTerminalPromptSubmittedWaiter({
       settled = true;
       cleanup();
       logThreadBridgeDiagnostic("frontend.bridge.submit.confirm_timeout", {
-        agentId,
+        agent_id: agentId,
         expectedPromptLength: safeExpectedPrompt.length,
-        instanceId: instanceId || "",
-        paneId: safePaneId,
-        promptId: safePromptId,
-        threadId: safeThreadId,
-        timeoutMs,
-        workspaceId,
+        instance_id: instanceId || "",
+        pane_id: safePaneId,
+        prompt_id: safePromptId,
+        thread_id: safeThreadId,
+        timeout_ms: timeoutMs,
+        workspace_id: workspaceId,
       });
       reject(new Error("Timed out waiting for the prompt to be observed in the terminal."));
     }, Math.max(1000, timeoutMs));
@@ -1335,10 +1335,10 @@ export function createTerminalPromptSubmittedWaiter({
 
   const handlePromptAccepted = (event) => {
     const detail = event?.detail || {};
-    const eventPromptId = String(detail.promptEventId || "").trim();
-    const eventThreadId = String(detail.threadId || "").trim();
-    const eventWorkspaceId = String(detail.workspaceId || "").trim();
-    const eventAgentId = getTerminalAgentKind(detail.agentId || "");
+    const eventPromptId = String(detail.prompt_event_id || "").trim();
+    const eventThreadId = String(detail.thread_id || "").trim();
+    const eventWorkspaceId = String(detail.workspace_id || "").trim();
+    const eventAgentId = getTerminalAgentKind(detail.agent_id || "");
     const promptMatches = !safePromptId || eventPromptId === safePromptId;
     const threadMatches = !safeThreadId || eventThreadId === safeThreadId;
     const workspaceMatches = !workspaceId || eventWorkspaceId === workspaceId;
@@ -1351,40 +1351,40 @@ export function createTerminalPromptSubmittedWaiter({
     settled = true;
     cleanup();
     logThreadBridgeDiagnostic("frontend.bridge.submit.confirmed_by_hook", {
-      agentId: eventAgentId,
+      agent_id: eventAgentId,
       expectedPromptLength: safeExpectedPrompt.length,
-      matchedBy: detail.matchedBy || "",
-      promptId: eventPromptId,
-      sessionIdPresent: Boolean(detail.sessionId),
-      threadId: eventThreadId,
-      workspaceId: eventWorkspaceId,
+      matched_by: detail.matched_by || "",
+      prompt_id: eventPromptId,
+      sessionIdPresent: Boolean(detail.session_id),
+      thread_id: eventThreadId,
+      workspace_id: eventWorkspaceId,
     });
     resolvePromptSubmitted?.({
-      agentId: eventAgentId,
-      expectedPrompt: safeExpectedPrompt,
-      observedPrompt: detail.promptText || safeExpectedPrompt,
-      prompt: detail.promptText || safeExpectedPrompt,
-      promptEventId: eventPromptId,
-      promptMatch: true,
-      promptSource: "activity_hook_user_prompt_submit",
-      threadId: eventThreadId,
-      workspaceId: eventWorkspaceId,
+      agent_id: eventAgentId,
+      expected_prompt: safeExpectedPrompt,
+      observed_prompt: detail.prompt_text || safeExpectedPrompt,
+      prompt: detail.prompt_text || safeExpectedPrompt,
+      prompt_event_id: eventPromptId,
+      prompt_match: true,
+      prompt_source: "activity_hook_user_prompt_submit",
+      thread_id: eventThreadId,
+      workspace_id: eventWorkspaceId,
     });
   };
 
   const handlePromptSubmitted = (event) => {
     const payload = event?.payload || {};
-    const eventPromptId = String(payload.promptEventId || "").trim();
-    const eventPaneId = String(payload.paneId || "").trim();
-    const eventThreadId = String(payload.threadId || "").trim();
-    const eventInstanceId = Number(payload.instanceId);
+    const eventPromptId = String(payload.prompt_event_id || "").trim();
+    const eventPaneId = String(payload.pane_id || "").trim();
+    const eventThreadId = String(payload.thread_id || "").trim();
+    const eventInstanceId = Number(payload.instance_id);
     const promptMatches = !safePromptId || eventPromptId === safePromptId;
     const paneMatches = !safePaneId || eventPaneId === safePaneId;
     const threadMatches = !safeThreadId || eventThreadId === safeThreadId;
     const instanceMatches = !Number.isFinite(Number(instanceId))
       || eventInstanceId === Number(instanceId);
-    const submittedPromptMatchesExpected = payload.promptMatch !== false;
-    const promptSource = String(payload.promptSource || "").trim();
+    const submittedPromptMatchesExpected = payload.prompt_match !== false;
+    const promptSource = String(payload.prompt_source || "").trim();
     const submittedPromptIsAuthoritative = terminalPromptSubmittedPayloadIsAuthoritative(payload);
     const submittedByActivityHook = promptSource === "activity_hook_user_prompt_submit"
       || promptSource === "cli_hook_user_prompt_submit";
@@ -1404,31 +1404,31 @@ export function createTerminalPromptSubmittedWaiter({
       && !terminalSubmitEventCanConfirmHookManagedSubmit
     ) {
       logThreadBridgeDiagnostic("frontend.bridge.submit.hook_managed_source_ignored", {
-        agentId,
+        agent_id: agentId,
         allowObservedInputGateForHookManaged,
-        instanceId: eventInstanceId,
-        paneId: eventPaneId,
-        promptId: eventPromptId,
-        promptSource,
+        instance_id: eventInstanceId,
+        pane_id: eventPaneId,
+        prompt_id: eventPromptId,
+        prompt_source: promptSource,
         reason: "user_prompt_submit_hook_owns_acceptance",
-        threadId: eventThreadId,
-        workspaceId: payload.workspaceId || workspaceId || "",
+        thread_id: eventThreadId,
+        workspace_id: payload.workspace_id || workspaceId || "",
       });
       return;
     }
     if (!submittedPromptIsAuthoritative || (requirePromptMatch && !submittedPromptMatchesExpected)) {
-      const observedPrompt = String(payload.observedPrompt || "").trim();
+      const observedPrompt = String(payload.observed_prompt || "").trim();
       logThreadBridgeDiagnostic("frontend.bridge.submit.mismatch_blocked", {
-        agentId,
+        agent_id: agentId,
         expectedPromptLength: safeExpectedPrompt.length,
-        instanceId: eventInstanceId,
+        instance_id: eventInstanceId,
         observedPromptLength: observedPrompt.length,
-        paneId: eventPaneId,
-        promptId: eventPromptId,
-        promptSource,
+        pane_id: eventPaneId,
+        prompt_id: eventPromptId,
+        prompt_source: promptSource,
         reason: submittedPromptIsAuthoritative ? "prompt_mismatch" : "prompt_not_authoritative",
-        threadId: eventThreadId,
-        workspaceId: payload.workspaceId || workspaceId || "",
+        thread_id: eventThreadId,
+        workspace_id: payload.workspace_id || workspaceId || "",
       });
       settled = true;
       cleanup();
@@ -1440,9 +1440,9 @@ export function createTerminalPromptSubmittedWaiter({
       error.terminalPromptSubmitMismatch = true;
       error.terminalPromptSubmitUnobserved = !observedPrompt || !submittedPromptIsAuthoritative;
       error.terminalPromptSubmitNotAuthoritative = !submittedPromptIsAuthoritative;
-      error.promptSource = promptSource;
-      error.promptId = eventPromptId;
-      error.workspaceId = payload.workspaceId || workspaceId || "";
+      error.prompt_source = promptSource;
+      error.prompt_id = eventPromptId;
+      error.workspace_id = payload.workspace_id || workspaceId || "";
       rejectPromptSubmitted?.(error);
       return;
     }
@@ -1450,20 +1450,20 @@ export function createTerminalPromptSubmittedWaiter({
     settled = true;
     cleanup();
     logThreadBridgeDiagnostic("frontend.bridge.submit.confirmed", {
-      agentId,
-      instanceId: eventInstanceId,
+      agent_id: agentId,
+      instance_id: eventInstanceId,
       observedPromptLength: String(payload.prompt || "").trim().length,
-      paneId: eventPaneId,
+      pane_id: eventPaneId,
       promptConfirmedByObservedInputGate: Boolean(
         terminalSubmitEventCanConfirmHookManagedSubmit
           && promptSource === "observed_input_gate",
       ),
       promptConfirmedByTerminalSubmitEvent: terminalSubmitEventCanConfirmHookManagedSubmit,
-      promptMatch: payload.promptMatch !== false,
-      promptId: eventPromptId,
-      promptSource: payload.promptSource || "",
-      threadId: eventThreadId,
-      workspaceId: payload.workspaceId || workspaceId || "",
+      prompt_match: payload.prompt_match !== false,
+      prompt_id: eventPromptId,
+      prompt_source: payload.prompt_source || "",
+      thread_id: eventThreadId,
+      workspace_id: payload.workspace_id || workspaceId || "",
     });
     resolvePromptSubmitted?.(payload);
   };
@@ -1494,12 +1494,12 @@ export function createTerminalPromptSubmittedWaiter({
 }
 
 export function createWorkspaceThreadPromptAcceptedWaiter({
-  agentId = "",
-  expectedPrompt = "",
-  promptId,
-  threadId,
-  timeoutMs,
-  workspaceId = "",
+  agent_id: agentId = "",
+  expected_prompt: expectedPrompt = "",
+  prompt_id: promptId,
+  thread_id: threadId,
+  timeout_ms: timeoutMs,
+  workspace_id: workspaceId = "",
 }) {
   const safeAgentId = getTerminalAgentKind(agentId);
   const safePromptId = String(promptId || "").trim();
@@ -1520,10 +1520,10 @@ export function createWorkspaceThreadPromptAcceptedWaiter({
 
   const handlePromptAccepted = (event) => {
     const detail = event?.detail || {};
-    const eventPromptId = String(detail.promptEventId || "").trim();
-    const eventThreadId = String(detail.threadId || "").trim();
-    const eventWorkspaceId = String(detail.workspaceId || "").trim();
-    const eventAgentId = getTerminalAgentKind(detail.agentId || "");
+    const eventPromptId = String(detail.prompt_event_id || "").trim();
+    const eventThreadId = String(detail.thread_id || "").trim();
+    const eventWorkspaceId = String(detail.workspace_id || "").trim();
+    const eventAgentId = getTerminalAgentKind(detail.agent_id || "");
     const promptMatches = !safePromptId || eventPromptId === safePromptId;
     const threadMatches = !safeThreadId || eventThreadId === safeThreadId;
     const workspaceMatches = !safeWorkspaceId || eventWorkspaceId === safeWorkspaceId;
@@ -1536,13 +1536,13 @@ export function createWorkspaceThreadPromptAcceptedWaiter({
     settled = true;
     cleanup();
     logThreadBridgeDiagnostic("frontend.bridge.accept.confirmed", {
-      agentId: eventAgentId,
+      agent_id: eventAgentId,
       expectedPromptLength: safeExpectedPrompt.length,
-      matchedBy: detail.matchedBy || "",
-      promptId: eventPromptId,
-      sessionIdPresent: Boolean(detail.sessionId),
-      threadId: eventThreadId,
-      workspaceId: eventWorkspaceId,
+      matched_by: detail.matched_by || "",
+      prompt_id: eventPromptId,
+      sessionIdPresent: Boolean(detail.session_id),
+      thread_id: eventThreadId,
+      workspace_id: eventWorkspaceId,
     });
     resolveAccepted?.(detail);
   };
@@ -1552,13 +1552,13 @@ export function createWorkspaceThreadPromptAcceptedWaiter({
     rejectAccepted = reject;
     window.addEventListener(WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT, handlePromptAccepted);
     logThreadBridgeDiagnostic("frontend.bridge.accept.wait_start", {
-      agentId: safeAgentId,
+      agent_id: safeAgentId,
       expectedPromptLength: safeExpectedPrompt.length,
-      promptId: safePromptId,
-      threadId: safeThreadId,
-      timeoutMs: acceptanceTimeoutMs,
+      prompt_id: safePromptId,
+      thread_id: safeThreadId,
+      timeout_ms: acceptanceTimeoutMs,
       timeoutPolicy: safeAgentId === "codex" ? "codex-late-transcript" : "default",
-      workspaceId: safeWorkspaceId,
+      workspace_id: safeWorkspaceId,
     });
     timeoutId = window.setTimeout(() => {
       if (settled) {
@@ -1567,12 +1567,12 @@ export function createWorkspaceThreadPromptAcceptedWaiter({
       settled = true;
       cleanup();
       logThreadBridgeDiagnostic("frontend.bridge.accept.confirm_timeout", {
-        agentId: safeAgentId,
+        agent_id: safeAgentId,
         expectedPromptLength: safeExpectedPrompt.length,
-        promptId: safePromptId,
-        threadId: safeThreadId,
-        timeoutMs: acceptanceTimeoutMs,
-        workspaceId: safeWorkspaceId,
+        prompt_id: safePromptId,
+        thread_id: safeThreadId,
+        timeout_ms: acceptanceTimeoutMs,
+        workspace_id: safeWorkspaceId,
       });
       reject(new Error("Timed out waiting for the prompt to appear in the agent session."));
     }, acceptanceTimeoutMs);
@@ -1607,18 +1607,18 @@ export function requestTerminalSubmitDiagnosticSnapshot(fields = {}) {
 
 export async function waitForWorkspaceThreadPromptAcceptedWithEnterRetries({
   acceptedWaiter,
-  agentId = "",
+  agent_id: agentId = "",
   allowEnterRetry = false,
   binding,
-  expectedPrompt = "",
+  expected_prompt: expectedPrompt = "",
   getDraftValue,
   isGenericTerminal = false,
   logPrefix = "frontend.thread_submit",
-  promptId,
+  prompt_id: promptId,
   retryDelaysMs = TERMINAL_PROMPT_ACCEPT_RETRY_DELAYS_MS,
   submitSequence,
-  threadId,
-  workspaceId = "",
+  thread_id: threadId,
+  workspace_id: workspaceId = "",
 }) {
   const safePrompt = String(expectedPrompt || "").trim();
   const safeSubmitSequence = String(submitSequence || "");
@@ -1648,17 +1648,17 @@ export async function waitForWorkspaceThreadPromptAcceptedWithEnterRetries({
 
     if (!allowEnterRetry) {
       logThreadBridgeDiagnostic(`${logPrefix}.enter_retry_blocked`, {
-        agentId: safeAgentId,
-        bindingInstanceId: binding?.instanceId || "",
-        bindingPaneId: binding?.paneId || "",
+        agent_id: safeAgentId,
+        bindingInstanceId: binding?.instance_id || "",
+        bindingPaneId: binding?.pane_id || "",
         expectedPromptLength: safePrompt.length,
-        promptId: safePromptId,
+        prompt_id: safePromptId,
         reason: "enter_retry_disabled_after_submit",
         retryDelayMs,
         retryIndex: retryIndex + 1,
         sendPolicy: "terminal-confirmed-and-session-accepted",
-        threadId: safeThreadId,
-        workspaceId,
+        thread_id: safeThreadId,
+        workspace_id: workspaceId,
       });
       continue;
     }
@@ -1667,138 +1667,138 @@ export async function waitForWorkspaceThreadPromptAcceptedWithEnterRetries({
       typeof getDraftValue === "function" ? getDraftValue() : "",
     ).trim();
     logThreadBridgeDiagnostic(`${logPrefix}.enter_retry_state`, {
-      agentId: safeAgentId,
-      bindingInstanceId: binding?.instanceId || "",
-      bindingPaneId: binding?.paneId || "",
+      agent_id: safeAgentId,
+      bindingInstanceId: binding?.instance_id || "",
+      bindingPaneId: binding?.pane_id || "",
       currentDraft: getBigViewTextDiagnosticFields(currentDraft),
       draftMatchesExpected: currentDraft === safePrompt,
-      expectedPrompt: getBigViewTextDiagnosticFields(safePrompt),
-      promptId: safePromptId,
+      expected_prompt: getBigViewTextDiagnosticFields(safePrompt),
+      prompt_id: safePromptId,
       retryDelayMs,
       retryIndex: retryIndex + 1,
       sendPolicy: "terminal-confirmed-and-session-accepted",
-      threadId: safeThreadId,
-      workspaceId,
+      thread_id: safeThreadId,
+      workspace_id: workspaceId,
     });
     if (currentDraft !== safePrompt) {
       logThreadBridgeDiagnostic(`${logPrefix}.enter_retry_blocked`, {
-        agentId: safeAgentId,
-        bindingInstanceId: binding?.instanceId || "",
-        bindingPaneId: binding?.paneId || "",
+        agent_id: safeAgentId,
+        bindingInstanceId: binding?.instance_id || "",
+        bindingPaneId: binding?.pane_id || "",
         currentDraftLength: currentDraft.length,
         expectedPromptLength: safePrompt.length,
-        promptId: safePromptId,
+        prompt_id: safePromptId,
         reason: "composer_not_synced_to_prompt",
         retryDelayMs,
         retryIndex: retryIndex + 1,
         sendPolicy: "terminal-confirmed-and-session-accepted",
-        threadId: safeThreadId,
-        workspaceId,
+        thread_id: safeThreadId,
+        workspace_id: workspaceId,
       });
       continue;
     }
 
-    if (!safeSubmitSequence || isGenericTerminal || !binding?.paneId || !binding?.instanceId) {
+    if (!safeSubmitSequence || isGenericTerminal || !binding?.pane_id || !binding?.instance_id) {
       logThreadBridgeDiagnostic(`${logPrefix}.enter_retry_blocked`, {
-        agentId: safeAgentId,
-        bindingInstanceId: binding?.instanceId || "",
-        bindingPaneId: binding?.paneId || "",
+        agent_id: safeAgentId,
+        bindingInstanceId: binding?.instance_id || "",
+        bindingPaneId: binding?.pane_id || "",
         expectedPromptLength: safePrompt.length,
         hasSubmitSequence: Boolean(safeSubmitSequence),
         isGenericTerminal,
-        promptId: safePromptId,
+        prompt_id: safePromptId,
         reason: "missing_live_tui_submit_target",
         retryDelayMs,
         retryIndex: retryIndex + 1,
         sendPolicy: "terminal-confirmed-and-session-accepted",
-        threadId: safeThreadId,
-        workspaceId,
+        thread_id: safeThreadId,
+        workspace_id: workspaceId,
       });
       continue;
     }
 
     logThreadBridgeDiagnostic(`${logPrefix}.enter_retry`, {
-      agentId: safeAgentId,
-      bindingInstanceId: binding.instanceId,
-      bindingPaneId: binding.paneId,
+      agent_id: safeAgentId,
+      bindingInstanceId: binding.instance_id,
+      bindingPaneId: binding.pane_id,
       expectedPromptLength: safePrompt.length,
-      promptId: safePromptId,
+      prompt_id: safePromptId,
       retryDelayMs,
       retryIndex: retryIndex + 1,
       sendPolicy: "terminal-confirmed-and-session-accepted",
       submitSequence: getSubmitSequenceDiagnosticFields(safeSubmitSequence),
-      threadId: safeThreadId,
-      workspaceId,
+      thread_id: safeThreadId,
+      workspace_id: workspaceId,
     });
     requestTerminalSubmitDiagnosticSnapshot({
-      agentId: safeAgentId,
+      agent_id: safeAgentId,
       attempt: retryIndex + 1,
-      bindingInstanceId: binding.instanceId,
-      bindingPaneId: binding.paneId,
-      expectedPrompt: safePrompt,
+      bindingInstanceId: binding.instance_id,
+      bindingPaneId: binding.pane_id,
+      expected_prompt: safePrompt,
       expectedPromptLength: safePrompt.length,
-      paneId: binding.paneId,
-      promptId: safePromptId,
+      pane_id: binding.pane_id,
+      prompt_id: safePromptId,
       reason: `${logPrefix}.enter_retry_before_write`,
       submitSequenceLength: safeSubmitSequence.length,
-      threadId: safeThreadId,
-      workspaceId,
+      thread_id: safeThreadId,
+      workspace_id: workspaceId,
     });
     const retryWriteStartedAt = Date.now();
     const retrySubmittedAt = new Date().toISOString();
     await invoke("terminal_write", {
       data: safeSubmitSequence,
-      instanceId: binding.instanceId,
-      paneId: binding.paneId,
-      promptEventId: safePromptId,
-      promptEventSource: "enter-retry",
-      promptEventSubmittedAt: retrySubmittedAt,
-      promptEventText: safePrompt,
-      threadId: safeThreadId,
+      instance_id: binding.instance_id,
+      pane_id: binding.pane_id,
+      prompt_event_id: safePromptId,
+      prompt_event_source: "enter-retry",
+      prompt_event_submitted_at: retrySubmittedAt,
+      prompt_event_text: safePrompt,
+      thread_id: safeThreadId,
     });
     logThreadBridgeDiagnostic(`${logPrefix}.enter_retry_write_done`, {
-      agentId: safeAgentId,
-      bindingInstanceId: binding.instanceId,
-      bindingPaneId: binding.paneId,
-      elapsedMs: Date.now() - retryWriteStartedAt,
+      agent_id: safeAgentId,
+      bindingInstanceId: binding.instance_id,
+      bindingPaneId: binding.pane_id,
+      elapsed_ms: Date.now() - retryWriteStartedAt,
       expectedPromptLength: safePrompt.length,
-      promptId: safePromptId,
+      prompt_id: safePromptId,
       retryDelayMs,
       retryIndex: retryIndex + 1,
       sendPolicy: "terminal-confirmed-and-session-accepted",
       submitSequence: getSubmitSequenceDiagnosticFields(safeSubmitSequence),
-      threadId: safeThreadId,
-      workspaceId,
+      thread_id: safeThreadId,
+      workspace_id: workspaceId,
     });
     requestTerminalSubmitDiagnosticSnapshot({
-      agentId: safeAgentId,
+      agent_id: safeAgentId,
       attempt: retryIndex + 1,
-      bindingInstanceId: binding.instanceId,
-      bindingPaneId: binding.paneId,
-      delayMs: 160,
-      expectedPrompt: safePrompt,
+      bindingInstanceId: binding.instance_id,
+      bindingPaneId: binding.pane_id,
+      delay_ms: 160,
+      expected_prompt: safePrompt,
       expectedPromptLength: safePrompt.length,
-      paneId: binding.paneId,
-      promptId: safePromptId,
+      pane_id: binding.pane_id,
+      prompt_id: safePromptId,
       reason: `${logPrefix}.enter_retry_after_write`,
       submitSequenceLength: safeSubmitSequence.length,
-      threadId: safeThreadId,
-      workspaceId,
+      thread_id: safeThreadId,
+      workspace_id: workspaceId,
     });
     requestTerminalSubmitDiagnosticSnapshot({
-      agentId: safeAgentId,
+      agent_id: safeAgentId,
       attempt: retryIndex + 1,
-      bindingInstanceId: binding.instanceId,
-      bindingPaneId: binding.paneId,
-      delayMs: 500,
-      expectedPrompt: safePrompt,
+      bindingInstanceId: binding.instance_id,
+      bindingPaneId: binding.pane_id,
+      delay_ms: 500,
+      expected_prompt: safePrompt,
       expectedPromptLength: safePrompt.length,
-      paneId: binding.paneId,
-      promptId: safePromptId,
+      pane_id: binding.pane_id,
+      prompt_id: safePromptId,
       reason: `${logPrefix}.enter_retry_after_write_500ms`,
       submitSequenceLength: safeSubmitSequence.length,
-      threadId: safeThreadId,
-      workspaceId,
+      thread_id: safeThreadId,
+      workspace_id: workspaceId,
     });
   }
 
@@ -1897,20 +1897,20 @@ export function getDraggedWorkspaceFile(dataTransfer) {
   try {
     const parsed = JSON.parse(customPayload);
     const path = String(parsed?.path || parsed?.savedPath || "").trim();
-    const relativePath = String(parsed?.relativePath || "").trim().replace(/\\/g, "/");
+    const relativePath = String(parsed?.relative_path || "").trim().replace(/\\/g, "/");
     if (!path && !relativePath) {
       return null;
     }
 
     return {
       kind: "file",
-      mimeType: String(parsed?.mimeType || parsed?.type || "").trim(),
+      mime_type: String(parsed?.mime_type || parsed?.type || "").trim(),
       name: String(parsed?.name || relativePath.split("/").filter(Boolean).pop() || path.split(/[\\/]/).filter(Boolean).pop() || "file").trim(),
       path,
-      relativePath,
+      relative_path: relativePath,
       size: Number(parsed?.size || 0),
-      workspaceId: String(parsed?.workspaceId || "").trim(),
-      workspaceRoot: String(parsed?.workspaceRoot || "").trim(),
+      workspace_id: String(parsed?.workspace_id || "").trim(),
+      workspace_root: String(parsed?.workspace_root || "").trim(),
     };
   } catch (_error) {
     return null;
@@ -1948,20 +1948,20 @@ function inferWorkspaceFileMimeType(path) {
 
 export function workspaceFileToComposerAttachment(file, source = "workspace_file_drag") {
   const path = String(file?.path || file?.savedPath || "").trim();
-  const relativePath = String(file?.relativePath || "").trim().replace(/\\/g, "/");
+  const relativePath = String(file?.relative_path || "").trim().replace(/\\/g, "/");
   if (!path && !relativePath) {
     return null;
   }
 
   const name = String(file?.name || relativePath.split("/").filter(Boolean).pop() || path.split(/[\\/]/).filter(Boolean).pop() || "file").trim();
-  const mimeType = String(file?.mimeType || file?.type || "").trim()
+  const mimeType = String(file?.mime_type || file?.type || "").trim()
     || inferWorkspaceFileMimeType(relativePath || path);
   return {
     id: createComposerAttachmentId(),
     kind: mimeType.startsWith("image/") ? "image" : "file",
-    mimeType,
+    mime_type: mimeType,
     name: name || "file",
-    relativePath,
+    relative_path: relativePath,
     savedPath: path,
     size: Number(file?.size || 0),
     source,
@@ -1996,54 +1996,54 @@ export function buildTerminalSubmittedInput(text, agentKind, isGenericTerminal =
 
 export function getWorkspaceThreadTerminalTarget({
   fallbackWorkspace,
-  terminalAgentKind,
+  terminal_agent_kind: terminalAgentKind,
   targetThread,
   targetWorkspace,
   workspaceThreads,
 }) {
-  const targetWorkspaceId = targetThread?.workspaceId || targetWorkspace?.id || fallbackWorkspace?.id || "";
+  const targetWorkspaceId = targetThread?.workspace_id || targetWorkspace?.id || fallbackWorkspace?.id || "";
   const workspaceThreadEntry = workspaceThreads?.[targetWorkspaceId];
   const latestThread = workspaceThreadEntry?.threads?.[targetThread?.id] || targetThread;
-  const agentId = getTerminalAgentKind(latestThread?.currentAgent || targetThread?.currentAgent || terminalAgentKind);
+  const agentId = getTerminalAgentKind(latestThread?.current_agent || targetThread?.current_agent || terminalAgentKind);
   const providerBinding = getWorkspaceThreadProviderBinding(latestThread, agentId);
   const targetTerminalIndex = Number.parseInt(
-    latestThread?.terminalIndex
-      ?? latestThread?.terminalBinding?.terminalIndex
-      ?? providerBinding?.terminalBinding?.terminalIndex
-      ?? targetThread?.terminalIndex
-      ?? targetThread?.terminalBinding?.terminalIndex,
+    latestThread?.terminal_index
+      ?? latestThread?.terminal_binding?.terminal_index
+      ?? providerBinding?.terminal_binding?.terminal_index
+      ?? targetThread?.terminal_index
+      ?? targetThread?.terminal_binding?.terminal_index,
     10,
   );
   const liveTerminal = Number.isInteger(targetTerminalIndex)
     ? workspaceThreadEntry?.terminals?.[String(targetTerminalIndex)]
     : null;
-  const liveTerminalBinding = liveTerminal?.paneId
-    && liveTerminal?.instanceId
-    && liveTerminal.threadId === latestThread?.id
+  const liveTerminalBinding = liveTerminal?.pane_id
+    && liveTerminal?.instance_id
+    && liveTerminal.thread_id === latestThread?.id
     && ["active", "starting"].includes(String(liveTerminal.status || "").toLowerCase())
     ? {
-      instanceId: liveTerminal.instanceId,
-      paneId: liveTerminal.paneId,
-      terminalIndex: liveTerminal.terminalIndex,
+      instance_id: liveTerminal.instance_id,
+      pane_id: liveTerminal.pane_id,
+      terminal_index: liveTerminal.terminal_index,
     }
     : null;
 
   return {
-    agentId,
+    agent_id: agentId,
     binding: liveTerminalBinding,
     latestThread,
     providerBinding,
-    targetTerminalIndex,
-    targetWorkspaceId,
+    target_terminal_index: targetTerminalIndex,
+    target_workspace_id: targetWorkspaceId,
     workspaceThreadEntry,
   };
 }
 
 export function getThreadComposerSyncKey(thread, binding) {
   return [
-    thread?.workspaceId || "",
+    thread?.workspace_id || "",
     thread?.id || "",
-    binding?.paneId || "",
+    binding?.pane_id || "",
   ].join(":");
 }
 
@@ -2115,27 +2115,27 @@ export function getPlainDomRect(rect) {
 }
 
 export function closeWorkspaceTerminalPane({
-  agentId,
+  agent_id: agentId,
   nextTerminalCount,
   previousTerminalCount,
   reason,
-  terminalIndex,
-  waitForCleanup = false,
-  workspaceId,
+  terminal_index: terminalIndex,
+  wait_for_cleanup: waitForCleanup = false,
+  workspace_id: workspaceId,
 }) {
   const paneId = getWorkspaceTerminalPaneId(workspaceId, terminalIndex, agentId);
 
 
   return invoke("terminal_close", {
-    paneId,
-    waitForCleanup: waitForCleanup || undefined,
+    pane_id: paneId,
+    wait_for_cleanup: waitForCleanup || undefined,
   })
     .then(() => {
-      return { closed: true, paneId };
+      return { closed: true, pane_id: paneId };
     })
     .catch((error) => {
       const message = getErrorMessage(error, "Unable to close removed terminal.");
-      return { closed: false, error: message, paneId };
+      return { closed: false, error: message, pane_id: paneId };
     });
 }
 

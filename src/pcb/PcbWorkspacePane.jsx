@@ -575,13 +575,13 @@ export default function PcbWorkspacePane({
   createRequestName = "",
   deleteRequestNonce = 0,
   externalBoard = undefined,
-  isActive = true,
+  is_active: isActive = true,
   onBoardChange = null,
   onElementPickerChange = null,
-  paneId = "",
+  pane_id: paneId = "",
   refreshRequestNonce = 0,
-  repoPath = "",
-  workspaceId = "",
+  repo_path: repoPath = "",
+  workspace_id: workspaceId = "",
 }) {
   const [availableBoards, setAvailableBoards] = useState([]);
   const [boardListReady, setBoardListReady] = useState(false);
@@ -618,7 +618,7 @@ export default function PcbWorkspacePane({
     const requestSeq = boardListSeqRef.current + 1;
     boardListSeqRef.current = requestSeq;
     setBoardListReady(false);
-    return invoke("pcb_documents_list", { repoPath, workspaceId })
+    return invoke("pcb_documents_list", { repo_path: repoPath, workspace_id: workspaceId })
       .then((result) => {
         if (boardListSeqRef.current !== requestSeq) {
           return [];
@@ -643,7 +643,7 @@ export default function PcbWorkspacePane({
     if (!repoPath) {
       return;
     }
-    invoke("pcb_watch_start", { repoPath }).catch(() => {});
+    invoke("pcb_watch_start", { repo_path: repoPath }).catch(() => {});
     refreshBoardList().catch(() => {});
   }, [repoPath, refreshBoardList]);
 
@@ -677,8 +677,8 @@ export default function PcbWorkspacePane({
       if (disposed) {
         return;
       }
-      const eventRepo = normalizeRepoIdentity(event?.payload?.repoPath);
-      const eventWorkspace = String(event?.payload?.workspaceId || event?.payload?.workspace_id || "").trim();
+      const eventRepo = normalizeRepoIdentity(event?.payload?.repo_path);
+      const eventWorkspace = String(event?.payload?.workspace_id || "").trim();
       if (eventRepo && eventRepo !== repoIdentity) {
         return;
       }
@@ -752,9 +752,9 @@ export default function PcbWorkspacePane({
     setDeleting(true);
     setError("");
     invoke("pcb_document_delete", {
-      boardPath: target.path,
-      repoPath,
-      workspaceId,
+      board_path: target.path,
+      repo_path: repoPath,
+      workspace_id: workspaceId,
     })
       .then(() => {
         setAvailableBoards((current) => current.filter((board) => board.path !== target.path));
@@ -787,7 +787,7 @@ export default function PcbWorkspacePane({
   // pcb_documents_list; older backends report 0 and keep the list order).
   const recentBoards = useMemo(
     () => [...availableBoards]
-      .sort((left, right) => (Number(right?.updatedAtMs) || 0) - (Number(left?.updatedAtMs) || 0))
+      .sort((left, right) => (Number(right?.updated_at_ms) || 0) - (Number(left?.updated_at_ms) || 0))
       .slice(0, 3),
     [availableBoards],
   );
@@ -881,7 +881,7 @@ export default function PcbWorkspacePane({
     }
     setBusy(true);
     setError("");
-    invoke("pcb_document_create", { repoPath, name: cleanName, workspaceId })
+    invoke("pcb_document_create", { repo_path: repoPath, name: cleanName, workspace_id: workspaceId })
       .then((doc) => {
         if (doc?.path) {
           setBoardListReady(false);
@@ -939,7 +939,7 @@ export default function PcbWorkspacePane({
     controlCommandSeenRef.current = nonce;
     const action = String(controlCommand?.action || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
     if (action === "create" || action === "new" || action === "new-board") {
-      const requestedName = String(controlCommand?.name || controlCommand?.boardName || controlCommand?.board_name || "").trim();
+      const requestedName = String(controlCommand?.name || controlCommand?.board_name || "").trim();
       if (requestedName) {
         createBoardWithName(requestedName);
       } else {
@@ -949,12 +949,7 @@ export default function PcbWorkspacePane({
     }
     if (["select", "switch", "switch-board", "open-board", "open-existing"].includes(action)) {
       const requestedPath = String(
-        controlCommand?.boardPath
-          || controlCommand?.board_path
-          || controlCommand?.path
-          || controlCommand?.filePath
-          || controlCommand?.file_path
-          || "",
+        controlCommand?.board_path || controlCommand?.path || controlCommand?.file_path || "",
       ).trim();
       if (requestedPath) {
         selectBoardPath(requestedPath, { closeChooser: true, refreshFirst: true });
@@ -962,10 +957,7 @@ export default function PcbWorkspacePane({
         return;
       }
       const requestedName = String(
-        controlCommand?.boardName
-          || controlCommand?.board_name
-          || controlCommand?.name
-          || "",
+        controlCommand?.board_name || controlCommand?.name || "",
       ).trim();
       if (requestedName) {
         if (!selectBoardByName(requestedName)) {
@@ -1015,12 +1007,12 @@ export default function PcbWorkspacePane({
           <PcbPanel
             board={selectedBoard}
             embedded
-            isActive={isActive}
+            is_active={isActive}
             key={`${workspaceId}:${repoIdentity}:${selectedBoard.path}`}
             onElementPickerChange={onElementPickerChange}
-            repoPath={repoPath}
+            repo_path={repoPath}
             showHeader={false}
-            workspaceId={workspaceId}
+            workspace_id={workspaceId}
           />
         ) : (
           <EmptyPane>
@@ -1050,8 +1042,8 @@ export default function PcbWorkspacePane({
                         type="button"
                       >
                         <RecentName>{board.name || board.path}</RecentName>
-                        {formatRelativeTime(board.updatedAtMs) ? (
-                          <RecentMeta>{formatRelativeTime(board.updatedAtMs)}</RecentMeta>
+                        {formatRelativeTime(board.updated_at_ms) ? (
+                          <RecentMeta>{formatRelativeTime(board.updated_at_ms)}</RecentMeta>
                         ) : null}
                       </RecentRow>
                     ))}
@@ -1098,8 +1090,8 @@ export default function PcbWorkspacePane({
                         type="button"
                       >
                         <RecentName>{board.name || board.path}</RecentName>
-                        {formatRelativeTime(board.updatedAtMs) ? (
-                          <RecentMeta>{formatRelativeTime(board.updatedAtMs)}</RecentMeta>
+                        {formatRelativeTime(board.updated_at_ms) ? (
+                          <RecentMeta>{formatRelativeTime(board.updated_at_ms)}</RecentMeta>
                         ) : null}
                       </RecentRow>
                     ))}

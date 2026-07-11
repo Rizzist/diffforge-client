@@ -13,7 +13,7 @@ test("a mismatched pushed-profile identity key belongs to the identity email", (
     source: "pushed",
     identity: {
       email: "ADMIN@example.test",
-      tokenomicsAccountKey: "anthropic:claude:admin-account",
+      tokenomics_account_key: "anthropic:claude:admin-account",
     },
   }]);
 
@@ -31,14 +31,14 @@ test("a matching-email identity owner beats an earlier registry claimant", () =>
       email: "support@example.test",
       identity: {
         email: "stale@example.test",
-        tokenomicsAccountKey: "anthropic:claude:admin-account",
+        tokenomics_account_key: "anthropic:claude:admin-account",
       },
     },
     {
       email: "admin@example.test",
       identity: {
         email: "admin@example.test",
-        tokenomicsAccountKey: "anthropic:claude:admin-account",
+        tokenomics_account_key: "anthropic:claude:admin-account",
       },
     },
   ]);

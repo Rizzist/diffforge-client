@@ -287,7 +287,7 @@ export function getTerminalOutputByteStats(data) {
     bytes: Number(data?.byteLength || text.length || 0),
     controlBytes,
     escapeBytes,
-    visibleChars: getTerminalOutputVisibleCharCount(text, 0),
+    visible_chars: getTerminalOutputVisibleCharCount(text, 0),
   };
 }
 
@@ -305,7 +305,7 @@ export function getTerminalInputDebugFields(data) {
     bytes: text.length,
     controlBytes: getTerminalOutputByteStats(text).controlBytes,
     preview: sanitizeTerminalDiagnosticText(text, 80),
-    visibleChars: getTerminalOutputVisibleCharCount(text, 0),
+    visible_chars: getTerminalOutputVisibleCharCount(text, 0),
   };
 }
 
@@ -375,7 +375,7 @@ export function createCodexResizeGateState() {
     scrollbackCleanupStartViewportY: 0,
     scrollbackCleanupStartedAtBottom: false,
     scrollbackCleanupUntil: 0,
-    startedAt: 0,
+    started_at: 0,
     startedAtBottom: false,
     startState: null,
     targetSize: null,
@@ -529,14 +529,14 @@ export function extractNativeSessionIdFromOutput(agentId, text) {
 }
 
 export const terminalKeyboardTargetMatches = (paneId, instanceId) => (
-  activeTerminalKeyboardTarget?.paneId === paneId
-  && Number(activeTerminalKeyboardTarget?.instanceId || 0) === Number(instanceId || 0)
+  activeTerminalKeyboardTarget?.pane_id === paneId
+  && Number(activeTerminalKeyboardTarget?.instance_id || 0) === Number(instanceId || 0)
 );
 
 export const setActiveTerminalKeyboardTarget = (paneId, instanceId) => {
   activeTerminalKeyboardTarget = {
-    instanceId: Number(instanceId || 0),
-    paneId,
+    instance_id: Number(instanceId || 0),
+    pane_id: paneId,
   };
 };
 
@@ -576,7 +576,7 @@ export const terminalGlobalRenderScheduler = (() => {
 
   const entryBytes = (entry) => Math.max(0, Number(entry.getPendingBytes?.() || 0));
 
-  const isEntryActive = (entry) => Boolean(entry.isActive?.());
+  const isEntryActive = (entry) => Boolean(entry.is_active?.());
 
   const isEntryVisible = (entry) => (
     isEntryActive(entry)
@@ -860,7 +860,7 @@ export const terminalGlobalRenderScheduler = (() => {
         bytes,
         candidates: candidates.length,
         deferred,
-        elapsedMs,
+        elapsed_ms: elapsedMs,
         frameId,
         flushed,
         registered: entries.size,
@@ -903,7 +903,7 @@ export const terminalGlobalRenderScheduler = (() => {
       const now = terminalRenderNow();
       const durationMs = Math.max(
         TERMINAL_GLOBAL_RENDER_INTERACTIVE_GRACE_MS,
-        Number(options.durationMs || 0),
+        Number(options.duration_ms || 0),
       );
       interactiveEntryId = entryId;
       interactiveUntil = Math.max(interactiveUntil, now + durationMs);

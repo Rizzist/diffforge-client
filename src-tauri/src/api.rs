@@ -237,7 +237,7 @@ fn read_blocking_api_body(
     Ok((status, response_body))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn backend_ping() -> Result<BackendStatus, String> {
     let endpoint = api_endpoint("hello");
     let client = http_client(Duration::from_secs(DEFAULT_API_TIMEOUT_SECS))?;
@@ -1813,12 +1813,12 @@ fn desktop_auth_callback_base() -> String {
     )
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn desktop_auth_snapshot_command(app: AppHandle) -> Result<Value, String> {
     Ok(desktop_auth_public_snapshot(&desktop_auth_snapshot(&app)))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn desktop_auth_start_login(app: AppHandle) -> Result<Value, String> {
     let state = desktop_auth_new_state();
     let snapshot = desktop_auth_persist_snapshot(
@@ -1832,7 +1832,7 @@ async fn desktop_auth_start_login(app: AppHandle) -> Result<Value, String> {
         }),
     )?;
     Ok(json!({
-        "loginUrl": desktop_auth_login_url(&state),
+        "login_url": desktop_auth_login_url(&state),
         "snapshot": desktop_auth_public_snapshot(&snapshot),
     }))
 }
@@ -1841,7 +1841,7 @@ async fn desktop_auth_start_login(app: AppHandle) -> Result<Value, String> {
 /// backend validates the desktop session token and returns a Stripe Checkout
 /// URL the shell opens in the system browser, so the user lands on Stripe
 /// already identified — no interim sign-in page.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn desktop_billing_start_topup_checkout(
     app: AppHandle,
     packs: Option<u32>,
@@ -1871,7 +1871,7 @@ async fn desktop_billing_start_topup_checkout(
     read_api_response(response, "Unable to start credit top-up checkout.").await
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn desktop_auth_validate_session(
     app: AppHandle,
     cloud_mcp_state: State<'_, CloudMcpState>,
@@ -1946,7 +1946,7 @@ async fn desktop_auth_validate_session(
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn desktop_auth_handle_deep_link(
     app: AppHandle,
     cloud_mcp_state: State<'_, CloudMcpState>,
@@ -2050,7 +2050,7 @@ async fn desktop_auth_handle_deep_link(
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn desktop_auth_set_active_scope(
     app: AppHandle,
     cloud_mcp_state: State<'_, CloudMcpState>,
@@ -2068,7 +2068,7 @@ async fn desktop_auth_set_active_scope(
     Ok(desktop_auth_public_snapshot(&snapshot))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn desktop_auth_apply_billing_status(
     app: AppHandle,
     cloud_mcp_state: State<'_, CloudMcpState>,
@@ -2100,7 +2100,7 @@ async fn desktop_auth_apply_billing_status(
     Ok(desktop_auth_public_snapshot(&snapshot))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn desktop_auth_sign_out(
     app: AppHandle,
     cloud_mcp_state: State<'_, CloudMcpState>,
@@ -3011,24 +3011,20 @@ fn desktop_auth_cli_login(args: &[String]) -> i32 {
     };
     let device_code = authorization
         .get("deviceCode")
-        .or_else(|| authorization.get("device_code"))
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
     let user_code = authorization
         .get("userCode")
-        .or_else(|| authorization.get("user_code"))
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
     let verification_uri = authorization
         .get("verificationUri")
-        .or_else(|| authorization.get("verification_uri"))
         .and_then(Value::as_str)
         .unwrap_or("https://diffforge.ai/device");
     let verification_uri_complete = authorization
         .get("verificationUriComplete")
-        .or_else(|| authorization.get("verification_uri_complete"))
         .and_then(Value::as_str)
         .unwrap_or(verification_uri);
     let mut interval = authorization
@@ -3038,7 +3034,6 @@ fn desktop_auth_cli_login(args: &[String]) -> i32 {
         .clamp(2, 30);
     let expires_in = authorization
         .get("expiresIn")
-        .or_else(|| authorization.get("expires_in"))
         .and_then(Value::as_u64)
         .unwrap_or(600);
 
@@ -3742,7 +3737,7 @@ async fn agent_statuses() -> Result<Vec<AgentStatus>, String> {
     .map_err(|error| format!("Unable to check terminal CLIs: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn start_agent_login(provider: String) -> Result<AgentLoginStart, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let provider = parse_agent_provider(&provider)?;
@@ -3760,7 +3755,7 @@ async fn start_agent_login(provider: String) -> Result<AgentLoginStart, String> 
     .map_err(|error| format!("Unable to start terminal CLI login: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn start_agent_account_login(provider: String) -> Result<AgentLoginStart, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let provider = parse_agent_provider(&provider)?;
@@ -3778,7 +3773,7 @@ async fn start_agent_account_login(provider: String) -> Result<AgentLoginStart, 
     .map_err(|error| format!("Unable to start terminal CLI login: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn disconnect_agent(provider: String) -> Result<AgentLogoutResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let provider = parse_agent_provider(&provider)?;
@@ -3789,7 +3784,7 @@ async fn disconnect_agent(provider: String) -> Result<AgentLogoutResult, String>
     .map_err(|error| format!("Unable to disconnect terminal CLI: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn install_agent(provider: String) -> Result<AgentInstallResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let provider = parse_agent_provider(&provider)?;
@@ -3805,7 +3800,7 @@ async fn install_agent(provider: String) -> Result<AgentInstallResult, String> {
     .map_err(|error| format!("Unable to install terminal CLI: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn update_agent(provider: String) -> Result<AgentInstallResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let provider = parse_agent_provider(&provider)?;
@@ -3821,7 +3816,7 @@ async fn update_agent(provider: String) -> Result<AgentInstallResult, String> {
     .map_err(|error| format!("Unable to update terminal CLI: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn uninstall_agent(provider: String) -> Result<AgentInstallResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let provider = parse_agent_provider(&provider)?;
@@ -3898,7 +3893,7 @@ fn tools_binary_on_path(binary: &str) -> Option<String> {
     None
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn tools_check_cli_binaries(binaries: Vec<String>) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let mut results = serde_json::Map::new();
@@ -3920,7 +3915,7 @@ async fn tools_check_cli_binaries(binaries: Vec<String>) -> Result<Value, String
 
 const TOOLS_CLI_ACTION_TIMEOUT_SECS: u64 = 15 * 60;
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn tools_run_cli_action(
     manager: String,
     package: String,
@@ -4011,7 +4006,7 @@ async fn tools_run_cli_action(
     .map_err(|error| format!("CLI action worker failed: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn forge_working_directory() -> Result<ForgeWorkingDirectory, String> {
     tauri::async_runtime::spawn_blocking(|| {
         let working_directory = default_working_directory()?;
@@ -4022,7 +4017,7 @@ async fn forge_working_directory() -> Result<ForgeWorkingDirectory, String> {
     .map_err(|error| format!("Unable to read Forge working directory: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn validate_workspace_root_directory(path: String) -> Result<ForgeWorkingDirectory, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let working_directory = match resolve_workspace_root_directory(Some(&path)) {
@@ -4106,7 +4101,7 @@ fn resolve_workspace_browse_target(
 /// is reported separately so the UI can disable Create instead of blocking
 /// navigation. The optional command path is intentionally cd-only; shell muscle
 /// memory such as ls/dir should never be interpreted as a folder path.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn browse_workspace_root_directory(
     base_path: Option<String>,
     command: Option<String>,
@@ -4175,7 +4170,7 @@ async fn browse_workspace_root_directory(
     .map_err(|error| format!("Unable to browse workspace directory: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn list_workspace_directory(
     root: String,
     relative_path: String,
@@ -4185,7 +4180,7 @@ async fn list_workspace_directory(
         .map_err(|error| format!("Unable to list workspace directory: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn read_workspace_file(
     root: String,
     relative_path: String,
@@ -4195,7 +4190,7 @@ async fn read_workspace_file(
         .map_err(|error| format!("Unable to read workspace file: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn read_workspace_file_image(
     root: String,
     relative_path: String,
@@ -4205,7 +4200,7 @@ async fn read_workspace_file_image(
         .map_err(|error| format!("Unable to read workspace image: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn read_workspace_file_diff(
     root: String,
     relative_path: String,
@@ -4215,7 +4210,7 @@ async fn read_workspace_file_diff(
         .map_err(|error| format!("Unable to read workspace file diff: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn rename_workspace_entry(
     root: String,
     relative_path: String,
@@ -4228,7 +4223,7 @@ async fn rename_workspace_entry(
     .map_err(|error| format!("Unable to rename workspace item: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn delete_workspace_entry(
     root: String,
     relative_path: String,
@@ -4240,7 +4235,7 @@ async fn delete_workspace_entry(
     .map_err(|error| format!("Unable to delete workspace item: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn move_workspace_entry(
     root: String,
     relative_path: String,
@@ -4253,14 +4248,14 @@ async fn move_workspace_entry(
     .map_err(|error| format!("Unable to move workspace item: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn run_forge_prompt(request: ForgePromptRequest) -> Result<ForgeRunResult, String> {
     tauri::async_runtime::spawn_blocking(move || run_forge_prompt_for(request))
         .await
         .map_err(|error| format!("Unable to run Forge Console prompt: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn agent_thread_turn_start(
     request: AgentThreadTurnRequest,
 ) -> Result<AgentThreadTurnResult, String> {

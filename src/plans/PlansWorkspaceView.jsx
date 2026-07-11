@@ -16,15 +16,15 @@ const planSnapshotCache = new Map();
 const planSnapshotRequests = new Map();
 
 const EMPTY_TARGET = Object.freeze({
-  agentId: "",
-  dbPath: "",
-  mountId: "",
-  paneId: "",
-  repoPath: "",
-  sessionId: "",
-  taskId: "",
-  terminalIndex: null,
-  workspaceId: "",
+  agent_id: "",
+  db_path: "",
+  mount_id: "",
+  pane_id: "",
+  repo_path: "",
+  session_id: "",
+  task_id: "",
+  terminal_index: null,
+  workspace_id: "",
 });
 
 function dataOf(response) {
@@ -41,13 +41,13 @@ function pathIdentity(value) {
 }
 
 function planSnapshotCacheKey({
-  agentId = "",
-  dbPath = "",
-  paneId = "",
-  repoPath = "",
-  sessionId = "",
-  taskId = "",
-  workspaceId = "",
+  agent_id: agentId = "",
+  db_path: dbPath = "",
+  pane_id: paneId = "",
+  repo_path: repoPath = "",
+  session_id: sessionId = "",
+  task_id: taskId = "",
+  workspace_id: workspaceId = "",
 }) {
   const scope = [
     cleanText(workspaceId),
@@ -77,7 +77,7 @@ function cachePlanSnapshot(keys, snapshot) {
   }
   const entry = {
     snapshot,
-    updatedAt: Date.now(),
+    updated_at: Date.now(),
   };
   if (keys?.exact) {
     planSnapshotCache.delete(keys.exact);
@@ -109,10 +109,10 @@ function cachedPlanSnapshot(keys) {
 
 function cachedPlanSnapshotIsFresh(keys) {
   const entry = cachedPlanSnapshotEntry(keys);
-  if (!entry?.snapshot || !Number.isFinite(Number(entry.updatedAt))) {
+  if (!entry?.snapshot || !Number.isFinite(Number(entry.updated_at))) {
     return false;
   }
-  return Date.now() - Number(entry.updatedAt) <= PLAN_SNAPSHOT_CACHE_FRESH_MS;
+  return Date.now() - Number(entry.updated_at) <= PLAN_SNAPSHOT_CACHE_FRESH_MS;
 }
 
 function planSnapshotRequestKey(keys) {
@@ -121,24 +121,24 @@ function planSnapshotRequestKey(keys) {
 
 function normalizeRepoTarget(value) {
   const target = value && typeof value === "object" && !Array.isArray(value) ? value : null;
-  const repoPath = cleanText(target?.repoPath || target?.repo_path);
+  const repoPath = cleanText(target?.repo_path);
   if (!repoPath) {
     return null;
   }
   return {
-    repoPath,
-    dbPath: cleanText(target?.dbPath || target?.db_path),
-    mountId: cleanText(target?.mountId || target?.mount_id),
-    projectName: cleanText(target?.projectName || target?.project_name),
-    projectKind: cleanText(target?.projectKind || target?.project_kind),
-    workspaceRelativePath: cleanText(target?.workspaceRelativePath || target?.workspace_relative_path),
+    repo_path: repoPath,
+    db_path: cleanText(target?.db_path),
+    mount_id: cleanText(target?.mount_id),
+    project_name: cleanText(target?.project_name),
+    project_kind: cleanText(target?.project_kind),
+    workspace_relative_path: cleanText(target?.workspace_relative_path),
   };
 }
 
 function repoTargetLabel(target) {
-  return cleanText(target?.workspaceRelativePath)
-    || cleanText(target?.projectName)
-    || cleanText(target?.repoPath).split(/[\\/]/).filter(Boolean).pop()
+  return cleanText(target?.workspace_relative_path)
+    || cleanText(target?.project_name)
+    || cleanText(target?.repo_path).split(/[\\/]/).filter(Boolean).pop()
     || "Repository";
 }
 
@@ -148,7 +148,7 @@ function dedupeRepoTargets(targets) {
     .map(normalizeRepoTarget)
     .filter(Boolean)
     .filter((target) => {
-      const key = pathIdentity(target.repoPath);
+      const key = pathIdentity(target.repo_path);
       if (!key || seen.has(key)) {
         return false;
       }
@@ -228,13 +228,13 @@ function receiptIsSettled(status) {
 }
 
 function receiptDurationParts(item, nowMs) {
-  if (!item?.receivedAtMs) return null;
+  if (!item?.received_at_ms) return null;
   if (receiptIsSettled(item.status)) {
-    const label = durationLabel(item.receivedAtMs, item.updatedAtMs);
+    const label = durationLabel(item.received_at_ms, item.updated_at_ms);
     return label ? { label, prefix: "took" } : null;
   }
   if (receiptStatusKind(item.status) === "active") {
-    const label = durationLabel(item.receivedAtMs, nowMs);
+    const label = durationLabel(item.received_at_ms, nowMs);
     return label ? { label, prefix: "running" } : null;
   }
   return null;
@@ -253,11 +253,8 @@ function sessionRefValues(value) {
   const object = value && typeof value === "object" && !Array.isArray(value) ? value : {};
   const refs = new Set();
   [
-    object.providerSessionId,
     object.provider_session_id,
-    object.nativeSessionId,
     object.native_session_id,
-    object.sessionId,
     object.session_id,
   ].forEach((candidate) => {
     const cleaned = cleanText(candidate);
@@ -282,18 +279,18 @@ function filterPlanSnapshotForSession(snapshot, sessionId) {
   if (!snapshot || typeof snapshot !== "object" || !targetSessionId) {
     return null;
   }
-  const historyScope = cleanText(snapshot.history_scope || snapshot.historyScope).toLowerCase();
+  const historyScope = cleanText(snapshot.history_scope).toLowerCase();
   if (historyScope === "session_lineage" || historyScope === "terminal_lineage" || historyScope === "target") {
     return {
       ...snapshot,
       history: Array.isArray(snapshot.history) ? snapshot.history : [],
-      selected_plan: snapshot.selected_plan || snapshot.selectedPlan || null,
+      selected_plan: snapshot.selected_plan || null,
     };
   }
   const history = (Array.isArray(snapshot.history) ? snapshot.history : [])
     .filter((plan) => planMatchesSession(plan, targetSessionId));
-  const selectedPlan = planMatchesSession(snapshot.selected_plan || snapshot.selectedPlan, targetSessionId)
-    ? snapshot.selected_plan || snapshot.selectedPlan
+  const selectedPlan = planMatchesSession(snapshot.selected_plan, targetSessionId)
+    ? snapshot.selected_plan
     : history[0] || null;
   return {
     ...snapshot,
@@ -317,32 +314,32 @@ function terminalPaneIdentity(paneId) {
 
 function normalizeTerminalReceipts(receipts, paneId, options = {}) {
   const pane = terminalPaneIdentity(paneId);
-  const sessionId = cleanText(options.sessionId);
+  const sessionId = cleanText(options.session_id);
   if (!pane || !receipts || typeof receipts !== "object" || Array.isArray(receipts)) {
     return [];
   }
   return Object.entries(receipts)
     .map(([key, receipt]) => {
       if (!receipt || typeof receipt !== "object") return null;
-      if (terminalPaneIdentity(receipt.paneId || receipt.pane_id) !== pane) return null;
-      const receivedAtMs = Number(receipt.receivedAtMs) || 0;
-      const updatedAtMs = Number(receipt.updatedAtMs) || receivedAtMs;
+      if (terminalPaneIdentity(receipt.pane_id) !== pane) return null;
+      const receivedAtMs = Number(receipt.received_at_ms) || 0;
+      const updatedAtMs = Number(receipt.updated_at_ms) || receivedAtMs;
       if (!receivedAtMs && !updatedAtMs) return null;
-      const commandId = cleanText(receipt.commandId) || cleanText(key);
-      const itemId = cleanText(receipt.itemId);
+      const commandId = cleanText(receipt.command_id) || cleanText(key);
+      const itemId = cleanText(receipt.item_id);
       const receiptSessions = sessionRefValues(receipt);
       return {
-        commandId,
-        itemId,
-        receivedAtMs: receivedAtMs || updatedAtMs,
-        sessionId: Array.from(receiptSessions)[0] || sessionId,
+        command_id: commandId,
+        item_id: itemId,
+        received_at_ms: receivedAtMs || updatedAtMs,
+        session_id: Array.from(receiptSessions)[0] || sessionId,
         status: cleanText(receipt.status).toLowerCase() || "queued",
         text: cleanText(receipt.text),
-        updatedAtMs,
+        updated_at_ms: updatedAtMs,
       };
     })
     .filter(Boolean)
-    .sort((left, right) => right.receivedAtMs - left.receivedAtMs);
+    .sort((left, right) => right.received_at_ms - left.received_at_ms);
 }
 
 function stepStatusLabel(status) {
@@ -441,8 +438,8 @@ function planStepUserEditable(step, plan) {
 }
 
 function planIdentity(plan) {
-  return cleanText(plan?.plan_id || plan?.planId || plan?.id)
-    || cleanText(plan?.todo_id || plan?.todoId);
+  return cleanText(plan?.plan_id || plan?.id)
+    || cleanText(plan?.todo_id);
 }
 
 function planStepSaveKey(planRef, stepIndex) {
@@ -481,8 +478,8 @@ function withPlanStepTitle(plan, planRef, stepIndex, title, fields = {}) {
       ...step,
       title: safeTitle,
       ...(fields.source ? { source: fields.source } : {}),
-      ...(fields.pendingSync ? { pending_sync: true, pendingSync: true } : {}),
-      ...(fields.syncError ? { sync_error: fields.syncError, syncError: fields.syncError } : {}),
+      ...(fields.pending_sync ? { pending_sync: true } : {}),
+      ...(fields.sync_error ? { sync_error: fields.sync_error } : {}),
     };
   });
 
@@ -493,8 +490,7 @@ function withPlanStepTitle(plan, planRef, stepIndex, title, fields = {}) {
   return {
     ...plan,
     steps: nextSteps,
-    updated_at: fields.updatedAt || plan.updated_at,
-    updatedAt: fields.updatedAt || plan.updatedAt,
+    updated_at: fields.updated_at || plan.updated_at,
   };
 }
 
@@ -505,7 +501,7 @@ function withSnapshotPlanStepTitle(snapshot, planRef, stepIndex, title, fields =
   const updatePlan = (plan) => withPlanStepTitle(plan, planRef, stepIndex, title, fields);
   return {
     ...snapshot,
-    selected_plan: updatePlan(snapshot.selected_plan || snapshot.selectedPlan || null),
+    selected_plan: updatePlan(snapshot.selected_plan || null),
     history: Array.isArray(snapshot.history) ? snapshot.history.map(updatePlan) : [],
   };
 }
@@ -519,13 +515,13 @@ function applyPendingPlanStepSaves(snapshot, pendingSaves = {}) {
 	      nextSnapshot = withSnapshotPlanStepTitle(
 	        nextSnapshot,
 	        pendingSave.planRef,
-	        pendingSave.stepIndex,
+	        pendingSave.step_index,
       pendingSave.title,
       {
-        pendingSync: pendingSave.status !== "error",
+        pending_sync: pendingSave.status !== "error",
         source: "user",
-        syncError: pendingSave.status === "error" ? pendingSave.error || "Sync failed" : "",
-        updatedAt: pendingSave.updatedAt,
+        sync_error: pendingSave.status === "error" ? pendingSave.error || "Sync failed" : "",
+        updated_at: pendingSave.updated_at,
       },
     );
   });
@@ -546,27 +542,22 @@ function planEventText(payload, keys) {
 
 function planEventSnapshot(payload) {
   const snapshot = dataOf(
-    payload?.planSnapshot
-      || payload?.plan_snapshot
-      || payload?.snapshot
-      || payload?.data?.planSnapshot
-      || payload?.data?.plan_snapshot
-      || null,
+    payload?.plan_snapshot || payload?.snapshot || payload?.data?.plan_snapshot || null,
   );
-  if (snapshot?.selected_plan || snapshot?.selectedPlan || Array.isArray(snapshot?.history)) {
+  if (snapshot?.selected_plan || Array.isArray(snapshot?.history)) {
     return {
       ...snapshot,
-      selected_plan: snapshot.selected_plan || snapshot.selectedPlan || null,
+      selected_plan: snapshot.selected_plan || null,
       history: Array.isArray(snapshot.history) ? snapshot.history : [],
     };
   }
 
-  const plan = payload?.plan || payload?.selectedPlan || payload?.selected_plan || null;
+  const plan = payload?.plan || payload?.selected_plan || null;
   if (plan && typeof plan === "object") {
     return {
       history: [plan],
       selected_plan: plan,
-      title_max_chars: plan.title_max_chars || plan.titleMaxChars,
+      title_max_chars: plan.title_max_chars,
     };
   }
   return null;
@@ -576,7 +567,7 @@ function mergePlanEventSnapshot(current, eventSnapshot) {
   if (!eventSnapshot || typeof eventSnapshot !== "object") {
     return current || null;
   }
-  const eventPlan = eventSnapshot.selected_plan || eventSnapshot.selectedPlan || null;
+  const eventPlan = eventSnapshot.selected_plan || null;
   const currentHistory = Array.isArray(current?.history) ? current.history : [];
   const eventHistory = Array.isArray(eventSnapshot.history) ? eventSnapshot.history : [];
   const mergedHistory = [...currentHistory];
@@ -669,7 +660,7 @@ export default function PlansWorkspaceView({
   onResumePlan,
   onResumeTodoSession,
   repoTargets = [],
-  rootDirectory = "",
+  root_directory: rootDirectory = "",
   selectedTerminal = EMPTY_TARGET,
   workspace,
 }) {
@@ -688,7 +679,7 @@ export default function PlansWorkspaceView({
   const snapshotRequestKeyRef = useRef("");
   const planEventStateRef = useRef({
     loadSnapshot: null,
-    rootPath: "",
+    root_path: "",
     snapshotAgentId: "",
     snapshotSessionId: "",
     snapshotTaskId: "",
@@ -700,39 +691,39 @@ export default function PlansWorkspaceView({
       return targets;
     }
     return dedupeRepoTargets([{
-      repoPath: target.repoPath || rootDirectory,
-      dbPath: target.dbPath || "",
-      mountId: target.mountId || "",
+      repo_path: target.repo_path || rootDirectory,
+      db_path: target.db_path || "",
+      mount_id: target.mount_id || "",
     }]);
-  }, [repoTargets, rootDirectory, target.dbPath, target.mountId, target.repoPath]);
-  const preferredRepoPath = target.repoPath || rootDirectory;
+  }, [repoTargets, rootDirectory, target.db_path, target.mount_id, target.repo_path]);
+  const preferredRepoPath = target.repo_path || rootDirectory;
   // The Plans tab is terminal-scoped: it always shows the selected terminal's
   // repo — no repository picker.
   const activeRepoPath = useMemo(() => {
     const preferredKey = pathIdentity(preferredRepoPath);
     const preferredTarget = preferredKey
-      ? normalizedRepoTargets.find((repoTarget) => pathIdentity(repoTarget.repoPath) === preferredKey)
+      ? normalizedRepoTargets.find((repoTarget) => pathIdentity(repoTarget.repo_path) === preferredKey)
       : null;
-    return preferredTarget?.repoPath
+    return preferredTarget?.repo_path
       || cleanText(preferredRepoPath)
-      || normalizedRepoTargets[0]?.repoPath
+      || normalizedRepoTargets[0]?.repo_path
       || "";
   }, [normalizedRepoTargets, preferredRepoPath]);
   const activeRepoTarget = useMemo(() => {
     const activeKey = pathIdentity(activeRepoPath);
     return activeKey
-      ? normalizedRepoTargets.find((repoTarget) => pathIdentity(repoTarget.repoPath) === activeKey) || null
+      ? normalizedRepoTargets.find((repoTarget) => pathIdentity(repoTarget.repo_path) === activeKey) || null
       : null;
   }, [activeRepoPath, normalizedRepoTargets]);
-  const activeDbPath = activeRepoTarget?.dbPath || "";
-  const targetMatchesActiveRepo = !target.repoPath
+  const activeDbPath = activeRepoTarget?.db_path || "";
+  const targetMatchesActiveRepo = !target.repo_path
     || !activeRepoPath
-    || pathIdentity(target.repoPath) === pathIdentity(activeRepoPath);
-  const snapshotAgentId = targetMatchesActiveRepo ? target.agentId || "" : "";
-  const snapshotPaneId = targetMatchesActiveRepo ? target.paneId || "" : "";
-  const snapshotSessionId = targetMatchesActiveRepo ? target.sessionId || "" : "";
-  const snapshotTaskId = targetMatchesActiveRepo ? target.taskId || "" : "";
-  const workspaceId = target.workspaceId || workspace?.id || "";
+    || pathIdentity(target.repo_path) === pathIdentity(activeRepoPath);
+  const snapshotAgentId = targetMatchesActiveRepo ? target.agent_id || "" : "";
+  const snapshotPaneId = targetMatchesActiveRepo ? target.pane_id || "" : "";
+  const snapshotSessionId = targetMatchesActiveRepo ? target.session_id || "" : "";
+  const snapshotTaskId = targetMatchesActiveRepo ? target.task_id || "" : "";
+  const workspaceId = target.workspace_id || workspace?.id || "";
   const hasSnapshotScope = Boolean(activeRepoPath && (snapshotTaskId || snapshotSessionId || snapshotPaneId || snapshotAgentId));
   const snapshotCacheKeys = useMemo(() => {
     if (!hasSnapshotScope) {
@@ -740,13 +731,13 @@ export default function PlansWorkspaceView({
     }
 
     const baseKey = {
-      agentId: snapshotAgentId,
-      dbPath: activeDbPath,
-      paneId: snapshotPaneId,
-      repoPath: activeRepoPath,
-      sessionId: snapshotSessionId,
-      taskId: snapshotTaskId,
-      workspaceId,
+      agent_id: snapshotAgentId,
+      db_path: activeDbPath,
+      pane_id: snapshotPaneId,
+      repo_path: activeRepoPath,
+      session_id: snapshotSessionId,
+      task_id: snapshotTaskId,
+      workspace_id: workspaceId,
     };
     return {
       exact: planSnapshotCacheKey(baseKey),
@@ -770,9 +761,7 @@ export default function PlansWorkspaceView({
     if (snapshotSessionId) {
       const sessionSnapshot = filterPlanSnapshotForSession(snapshot, snapshotSessionId);
       if (
-        sessionSnapshot?.selected_plan
-        || sessionSnapshot?.selectedPlan
-        || (Array.isArray(sessionSnapshot?.history) && sessionSnapshot.history.length > 0)
+        sessionSnapshot?.selected_plan || Array.isArray(sessionSnapshot?.history) && sessionSnapshot.history.length > 0
       ) {
         return sessionSnapshot;
       }
@@ -780,7 +769,7 @@ export default function PlansWorkspaceView({
     return {
       ...snapshot,
       history: Array.isArray(snapshot.history) ? snapshot.history : [],
-      selected_plan: snapshot.selected_plan || snapshot.selectedPlan || null,
+      selected_plan: snapshot.selected_plan || null,
     };
   }, [hasSnapshotScope, snapshot, snapshotSessionId]);
   const selectedPlan = scopedSnapshot?.selected_plan || null;
@@ -796,7 +785,7 @@ export default function PlansWorkspaceView({
   const plansByTodoRef = useMemo(() => {
     const map = new Map();
     const register = (plan) => {
-      const todoRef = cleanText(plan?.todo_id || plan?.todoId);
+      const todoRef = cleanText(plan?.todo_id);
       if (todoRef && !map.has(todoRef)) {
         map.set(todoRef, plan);
       }
@@ -807,15 +796,15 @@ export default function PlansWorkspaceView({
   }, [planCandidates, selectedPlan]);
   const planForTodo = useCallback((item) => {
     if (!item) return null;
-    return (item.itemId && plansByTodoRef.get(item.itemId))
-      || (item.commandId && plansByTodoRef.get(item.commandId))
+    return (item.item_id && plansByTodoRef.get(item.item_id))
+      || (item.command_id && plansByTodoRef.get(item.command_id))
       || null;
   }, [plansByTodoRef]);
 
   const openedTodo = useMemo(() => {
     if (!terminalTodoItems.length) return null;
     if (selectedTodoKey) {
-      const match = terminalTodoItems.find((item) => item.commandId === selectedTodoKey);
+      const match = terminalTodoItems.find((item) => item.command_id === selectedTodoKey);
       if (match) return match;
     }
     return terminalTodoItems[0];
@@ -916,7 +905,7 @@ export default function PlansWorkspaceView({
   // dispatched to this pane, with sent time and settle time.
   useEffect(() => {
     const receiptsWorkspaceId = cleanText(workspaceId);
-    const paneId = cleanText(target.paneId);
+    const paneId = cleanText(target.pane_id);
     setSelectedTodoKey("");
     if (!receiptsWorkspaceId || !paneId) {
       setTerminalTodoItems([]);
@@ -927,18 +916,18 @@ export default function PlansWorkspaceView({
     const applyReceipts = (receipts) => {
       if (cancelled) return;
       setTerminalTodoItems(normalizeTerminalReceipts(receipts, paneId, {
-        sessionId: snapshotSessionId,
+        session_id: snapshotSessionId,
       }));
     };
     const refresh = () => {
-      invoke("todo_dispatch_receipts_get", { workspaceId: receiptsWorkspaceId })
+      invoke("todo_dispatch_receipts_get", { workspace_id: receiptsWorkspaceId })
         .then((result) => applyReceipts(result?.receipts))
         .catch(() => {});
     };
     refresh();
     listen(TODO_DISPATCH_RECEIPTS_UPDATED_EVENT, (event) => {
       if (cancelled) return;
-      const eventWorkspaceId = cleanText(event?.payload?.workspaceId || event?.payload?.workspace_id);
+      const eventWorkspaceId = cleanText(event?.payload?.workspace_id);
       if (eventWorkspaceId && eventWorkspaceId !== receiptsWorkspaceId) return;
       const receipts = event?.payload?.receipts;
       if (receipts && typeof receipts === "object") {
@@ -959,7 +948,7 @@ export default function PlansWorkspaceView({
       window.clearInterval(intervalId);
       if (typeof unlisten === "function") unlisten();
     };
-  }, [snapshotSessionId, target.paneId, workspaceId]);
+  }, [snapshotSessionId, target.pane_id, workspaceId]);
 
   // Relative "sent x ago" labels and live running durations stay current.
   useEffect(() => {
@@ -978,18 +967,18 @@ export default function PlansWorkspaceView({
     }
     try {
       const command = {
-        repoPath: activeRepoPath,
+        repo_path: activeRepoPath,
         input: {
-          agentId: snapshotAgentId,
-          directRepoTarget: Boolean(activeRepoPath),
-          paneId: snapshotPaneId,
-          sessionId: snapshotSessionId,
-          taskId: snapshotTaskId,
-          workspaceId,
+          agent_id: snapshotAgentId,
+          direct_repo_target: Boolean(activeRepoPath),
+          pane_id: snapshotPaneId,
+          session_id: snapshotSessionId,
+          task_id: snapshotTaskId,
+          workspace_id: workspaceId,
         },
       };
       if (activeDbPath) {
-        command.dbPath = activeDbPath;
+        command.db_path = activeDbPath;
       }
       const requestKey = planSnapshotRequestKey(snapshotCacheKeys);
       let request = requestKey ? planSnapshotRequests.get(requestKey) : null;
@@ -1048,7 +1037,7 @@ export default function PlansWorkspaceView({
   useEffect(() => {
     planEventStateRef.current = {
       loadSnapshot,
-      rootPath: pathIdentity(activeRepoPath),
+      root_path: pathIdentity(activeRepoPath),
       snapshotAgentId,
       snapshotCacheKeys,
       snapshotPaneId,
@@ -1081,20 +1070,18 @@ export default function PlansWorkspaceView({
       }
 
       const payload = event?.payload || {};
-      const eventRepoPath = cleanText(payload.repoPath || payload.repo_path);
-      const currentRootPath = state.rootPath || rootPath;
+      const eventRepoPath = cleanText(payload.repo_path);
+      const currentRootPath = state.root_path || rootPath;
       if (eventRepoPath && currentRootPath && pathIdentity(eventRepoPath) !== currentRootPath) {
         return;
       }
 
-      const eventTaskId = planEventText(payload, ["taskId", "task_id"]);
+      const eventTaskId = planEventText(payload, ["task_id"]);
       const eventSessionId = planEventText(payload, [
-        "providerSessionId",
         "provider_session_id",
-        "sessionId",
         "session_id",
       ]);
-      const eventAgentId = planEventText(payload, ["agentId", "agent_id"]);
+      const eventAgentId = planEventText(payload, ["agent_id"]);
       const targetTaskId = cleanText(state.snapshotTaskId);
       const targetSessionId = cleanText(state.snapshotSessionId);
       const targetAgentId = cleanText(state.snapshotAgentId);
@@ -1193,20 +1180,20 @@ export default function PlansWorkspaceView({
 	    stepSaveSequenceRef.current = sequence;
 	    const pendingRecord = {
 	      planRef,
-	      stepIndex,
+	      step_index: stepIndex,
 	      title,
       sequence,
       status: "syncing",
-      updatedAt: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
     };
     setPendingStepSaveRecord(saveKey, pendingRecord);
     setError("");
 
 	    setSnapshot((current) => {
 	      const nextSnapshot = withSnapshotPlanStepTitle(current, planRef, stepIndex, title, {
-	        pendingSync: true,
+	        pending_sync: true,
 	        source: "user",
-        updatedAt: pendingRecord.updatedAt,
+        updated_at: pendingRecord.updated_at,
       });
       cachePlanSnapshot(snapshotCacheKeys, nextSnapshot);
       return nextSnapshot;
@@ -1214,16 +1201,16 @@ export default function PlansWorkspaceView({
     cancelEditing();
 
     void invoke("coordination_terminal_todo_plan_edit_step_title", {
-      repoPath: activeRepoPath,
-      ...(activeDbPath ? { dbPath: activeDbPath } : {}),
+      repo_path: activeRepoPath,
+      ...(activeDbPath ? { db_path: activeDbPath } : {}),
       input: {
-	        agentId: snapshotAgentId || displayedPlan?.agent_id || "",
-		        sessionId: snapshotSessionId || displayedPlan?.provider_session_id || displayedPlan?.session_id || "",
-	        planId: cleanText(displayedPlan?.plan_id || displayedPlan?.planId || displayedPlan?.id) || planRef,
-	        todoId: cleanText(displayedPlan?.todo_id || displayedPlan?.todoId),
-	        stepIndex,
+	        agent_id: snapshotAgentId || displayedPlan?.agent_id || "",
+		        session_id: snapshotSessionId || displayedPlan?.provider_session_id || displayedPlan?.session_id || "",
+	        plan_id: cleanText(displayedPlan?.plan_id || displayedPlan?.id) || planRef,
+	        todo_id: cleanText(displayedPlan?.todo_id),
+	        step_index: stepIndex,
         title,
-        workspaceId,
+        workspace_id: workspaceId,
       },
     }).then((response) => {
       if (response?.ok === false) {
@@ -1281,21 +1268,21 @@ export default function PlansWorkspaceView({
   }, [saveEditing]);
 
   const headerMeta = useMemo(() => {
-	    if (!target.paneId && !target.sessionId && !target.taskId && !activeRepoTarget) {
+	    if (!target.pane_id && !target.session_id && !target.task_id && !activeRepoTarget) {
 	      return "";
 	    }
     const parts = [];
-    if (Number.isInteger(Number(target.terminalIndex))) {
-      parts.push(`Terminal ${Number(target.terminalIndex) + 1}`);
+    if (Number.isInteger(Number(target.terminal_index))) {
+      parts.push(`Terminal ${Number(target.terminal_index) + 1}`);
     }
-    if (target.agentId) {
-      parts.push(target.agentId);
+    if (target.agent_id) {
+      parts.push(target.agent_id);
     }
     if (activeRepoTarget) {
       parts.push(repoTargetLabel(activeRepoTarget));
     }
     return parts.join(" / ");
-  }, [activeRepoTarget, target.agentId, target.paneId, target.sessionId, target.taskId, target.terminalIndex]);
+  }, [activeRepoTarget, target.agent_id, target.pane_id, target.session_id, target.task_id, target.terminal_index]);
 
   return (
     <PlansSurface aria-label="Terminal todo plans">
@@ -1337,7 +1324,7 @@ export default function PlansWorkspaceView({
             </TodoCardHeader>
             <TodoCardText>{openedTodo.text || "(no todo text)"}</TodoCardText>
             <TodoCardMeta>
-              <span>Sent {relativeTimeLabel(openedTodo.receivedAtMs, nowMs)}</span>
+              <span>Sent {relativeTimeLabel(openedTodo.received_at_ms, nowMs)}</span>
               {(() => {
                 const duration = receiptDurationParts(openedTodo, nowMs);
                 return duration ? <span>{duration.prefix} {duration.label}</span> : null;
@@ -1474,9 +1461,9 @@ export default function PlansWorkspaceView({
                 return (
                   <HistoryRow
                     data-selected={openedTodo === item ? "true" : "false"}
-                    key={item.commandId}
-                    onClick={() => setSelectedTodoKey(item.commandId)}
-                    onKeyDown={(event) => handleHistoryRowKeyDown(event, item.commandId)}
+                    key={item.command_id}
+                    onClick={() => setSelectedTodoKey(item.command_id)}
+                    onKeyDown={(event) => handleHistoryRowKeyDown(event, item.command_id)}
                     role="button"
                     tabIndex={0}
                   >
@@ -1498,7 +1485,7 @@ export default function PlansWorkspaceView({
                     </HistoryRowTop>
                     <HistoryRowMeta>
                       <HistoryBadge data-kind={kind}>{receiptStatusLabel(item.status)}</HistoryBadge>
-                      <span>{relativeTimeLabel(item.receivedAtMs, nowMs)}</span>
+                      <span>{relativeTimeLabel(item.received_at_ms, nowMs)}</span>
                       {duration && <span>{duration.prefix} {duration.label}</span>}
                     </HistoryRowMeta>
                   </HistoryRow>

@@ -98,22 +98,22 @@ test("graph contract exposes document and asset resource ports", () => {
 test("graph contract rejects illegal branch ports", () => {
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(runScriptNode, sendMessageNode, {
-      fromPort: "docs",
-      toPort: "in",
+      from_port: "docs",
+      to_port: "in",
     }).ok,
     false,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(documentReadNode, sendMessageNode, {
-      fromPort: "success",
-      toPort: "in",
+      from_port: "success",
+      to_port: "in",
     }).ok,
     false,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(sendMessageNode, documentReadNode, {
-      fromPort: "success",
-      toPort: "in",
+      from_port: "success",
+      to_port: "in",
     }).ok,
     false,
   );
@@ -122,42 +122,42 @@ test("graph contract rejects illegal branch ports", () => {
 test("graph contract accepts legal flow and document ports", () => {
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(triggerNode, sendMessageNode, {
-      fromPort: "out",
-      toPort: "in",
+      from_port: "out",
+      to_port: "in",
     }).ok,
     true,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(runScriptNode, sendMessageNode, {
-      fromPort: "success",
-      toPort: "in",
+      from_port: "success",
+      to_port: "in",
     }).ok,
     true,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(sendMessageNode, dispatchTodosNode, {
-      fromPort: "success",
-      toPort: "in",
+      from_port: "success",
+      to_port: "in",
     }).ok,
     true,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(documentReadNode, sendMessageNode, {
-      fromPort: "docs",
-      toPort: "in",
+      from_port: "docs",
+      to_port: "in",
     }).ok,
     true,
   );
   const directDocumentWrite = validateLoopspaceGraphEdgeCandidate(sendMessageNode, documentWriteNode, {
-    fromPort: "failure",
-    toPort: "in",
+    from_port: "failure",
+    to_port: "in",
   });
   assert.equal(directDocumentWrite.ok, false);
   assert.match(directDocumentWrite.error, /Document write nodes/);
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(triggerNode, assetWriteNode, {
-      fromPort: "out",
-      toPort: "in",
+      from_port: "out",
+      to_port: "in",
     }).ok,
     true,
   );
@@ -174,9 +174,9 @@ test("graph contract accepts completed send-message step edges to action nodes",
   ]);
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(stepNode, runScriptNode, {
-      fromPort: "success",
+      from_port: "success",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     true,
   );
@@ -185,33 +185,33 @@ test("graph contract accepts completed send-message step edges to action nodes",
       ...sendMessageNode,
       id: "send-message-follow-up",
     }, {
-      fromPort: "success",
+      from_port: "success",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     true,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(stepNode, dispatchTodosNode, {
-      fromPort: "success",
+      from_port: "success",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     true,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(orphanStepNode, runScriptNode, {
-      fromPort: "success",
+      from_port: "success",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     false,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(wrongParentStepNode, runScriptNode, {
-      fromPort: "success",
+      from_port: "success",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     false,
   );
@@ -230,80 +230,80 @@ test("graph contract accepts document context edges for internal action steps on
   ]);
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(documentReadNode, stepNode, {
-      fromPort: "docs",
+      from_port: "docs",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     true,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(stepNode, documentWriteNode, {
-      fromPort: "docs",
+      from_port: "docs",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     true,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(documentReadNode, dispatchStepNode, {
-      fromPort: "docs",
+      from_port: "docs",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     true,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(dispatchStepNode, documentWriteNode, {
-      fromPort: "docs",
+      from_port: "docs",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     true,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(documentReadNode, orphanStepNode, {
-      fromPort: "docs",
+      from_port: "docs",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     false,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(wrongParentStepNode, documentWriteNode, {
-      fromPort: "docs",
+      from_port: "docs",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     false,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(runScriptNode, stepNode, {
-      fromPort: "success",
+      from_port: "success",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     false,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(documentWriteNode, missingParentStepNode, {
-      fromPort: "docs",
+      from_port: "docs",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     false,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(stepNode, sendMessageNode, {
-      fromPort: "docs",
-      toPort: "in",
+      from_port: "docs",
+      to_port: "in",
     }).ok,
     false,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(stepNode, documentWriteNode, {
-      fromPort: "success",
+      from_port: "success",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     false,
   );
@@ -322,105 +322,105 @@ test("graph contract accepts asset context edges for internal action steps only"
   ]);
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(assetReadNode, stepNode, {
-      fromPort: "assets",
+      from_port: "assets",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     true,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(stepNode, assetWriteNode, {
-      fromPort: "assets",
+      from_port: "assets",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     true,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(assetWriteNode, stepNode, {
-      fromPort: "assets",
+      from_port: "assets",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     true,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(assetReadNode, dispatchStepNode, {
-      fromPort: "assets",
+      from_port: "assets",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     true,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(dispatchStepNode, assetWriteNode, {
-      fromPort: "assets",
+      from_port: "assets",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     true,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(stepNode, assetWriteNode, {
-      fromPort: "docs",
+      from_port: "docs",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     false,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(assetReadNode, orphanStepNode, {
-      fromPort: "assets",
+      from_port: "assets",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     false,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(wrongParentStepNode, assetWriteNode, {
-      fromPort: "assets",
+      from_port: "assets",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     false,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(assetWriteNode, missingParentStepNode, {
-      fromPort: "assets",
+      from_port: "assets",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     false,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(sendMessageNode, assetWriteNode, {
-      fromPort: "exec",
+      from_port: "exec",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     false,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(sendMessageNode, assetWriteNode, {
-      fromPort: "success",
+      from_port: "success",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     false,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(runScriptNode, assetWriteNode, {
-      fromPort: "exec",
+      from_port: "exec",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     false,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(dispatchTodosNode, assetWriteNode, {
-      fromPort: "success",
+      from_port: "success",
       nodeById,
-      toPort: "in",
+      to_port: "in",
     }).ok,
     false,
   );
@@ -429,16 +429,16 @@ test("graph contract accepts asset context edges for internal action steps only"
 test("graph contract keeps legacy action out edges readable but not newly valid", () => {
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(runScriptNode, sendMessageNode, {
-      fromPort: "out",
-      toPort: "in",
+      from_port: "out",
+      to_port: "in",
     }).ok,
     false,
   );
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(runScriptNode, sendMessageNode, {
       allowLegacy: true,
-      fromPort: "out",
-      toPort: "in",
+      from_port: "out",
+      to_port: "in",
     }).ok,
     true,
   );
@@ -450,12 +450,12 @@ test("graph update validation only preserves exact existing legacy action out ed
     edges: [{
       id: "edge-legacy",
       from: runScriptNode.id,
-      fromPort: "out",
+      from_port: "out",
       label: "OUT",
       props: { branch: "out" },
       role: "flow",
       to: sendMessageNode.id,
-      toPort: "in",
+      to_port: "in",
     }],
   };
 
@@ -505,16 +505,16 @@ test("graph ast validation accepts document context edges to internal steps", ()
       {
         id: "edge-read-step",
         from: documentReadNode.id,
-        fromPort: "docs",
+        from_port: "docs",
         to: stepNode.id,
-        toPort: "in",
+        to_port: "in",
       },
       {
         id: "edge-step-write",
         from: stepNode.id,
-        fromPort: "docs",
+        from_port: "docs",
         to: documentWriteNode.id,
-        toPort: "in",
+        to_port: "in",
       },
     ],
   });
@@ -529,16 +529,16 @@ test("graph ast validation accepts document context edges to dispatch todo steps
       {
         id: "edge-read-dispatch-step",
         from: documentReadNode.id,
-        fromPort: "docs",
+        from_port: "docs",
         to: dispatchStepNode.id,
-        toPort: "in",
+        to_port: "in",
       },
       {
         id: "edge-dispatch-step-write",
         from: dispatchStepNode.id,
-        fromPort: "docs",
+        from_port: "docs",
         to: documentWriteNode.id,
-        toPort: "in",
+        to_port: "in",
       },
     ],
   });
@@ -643,23 +643,23 @@ test("graph ast validation accepts asset context edges to internal steps", () =>
       {
         id: "edge-asset-read-step",
         from: assetReadNode.id,
-        fromPort: "assets",
+        from_port: "assets",
         to: stepNode.id,
-        toPort: "in",
+        to_port: "in",
       },
       {
         id: "edge-step-asset-write",
         from: stepNode.id,
-        fromPort: "assets",
+        from_port: "assets",
         to: assetWriteNode.id,
-        toPort: "in",
+        to_port: "in",
       },
       {
         id: "edge-asset-write-next-step",
         from: assetWriteNode.id,
-        fromPort: "assets",
+        from_port: "assets",
         to: stepNode.id,
-        toPort: "in",
+        to_port: "in",
       },
     ],
   });
@@ -674,16 +674,16 @@ test("graph ast validation accepts asset context edges to dispatch todo steps", 
       {
         id: "edge-asset-read-dispatch-step",
         from: assetReadNode.id,
-        fromPort: "assets",
+        from_port: "assets",
         to: dispatchStepNode.id,
-        toPort: "in",
+        to_port: "in",
       },
       {
         id: "edge-dispatch-step-asset-write",
         from: dispatchStepNode.id,
-        fromPort: "assets",
+        from_port: "assets",
         to: assetWriteNode.id,
-        toPort: "in",
+        to_port: "in",
       },
     ],
   });
@@ -698,16 +698,16 @@ test("graph ast validation rejects document context edges to orphan or non-actio
       {
         id: "edge-read-orphan-step",
         from: documentReadNode.id,
-        fromPort: "docs",
+        from_port: "docs",
         to: orphanStepNode.id,
-        toPort: "in",
+        to_port: "in",
       },
       {
         id: "edge-orphan-step-write",
         from: orphanStepNode.id,
-        fromPort: "docs",
+        from_port: "docs",
         to: documentWriteNode.id,
-        toPort: "in",
+        to_port: "in",
       },
     ],
   });
@@ -720,16 +720,16 @@ test("graph ast validation rejects document context edges to orphan or non-actio
       {
         id: "edge-read-wrong-step",
         from: documentReadNode.id,
-        fromPort: "docs",
+        from_port: "docs",
         to: wrongParentStepNode.id,
-        toPort: "in",
+        to_port: "in",
       },
       {
         id: "edge-wrong-step-write",
         from: wrongParentStepNode.id,
-        fromPort: "docs",
+        from_port: "docs",
         to: documentWriteNode.id,
-        toPort: "in",
+        to_port: "in",
       },
     ],
   });
@@ -742,16 +742,16 @@ test("graph ast validation rejects document context edges to orphan or non-actio
       {
         id: "edge-read-missing-parent-step",
         from: documentReadNode.id,
-        fromPort: "docs",
+        from_port: "docs",
         to: missingParentStepNode.id,
-        toPort: "in",
+        to_port: "in",
       },
       {
         id: "edge-missing-parent-step-write",
         from: missingParentStepNode.id,
-        fromPort: "docs",
+        from_port: "docs",
         to: documentWriteNode.id,
-        toPort: "in",
+        to_port: "in",
       },
     ],
   });
@@ -765,9 +765,9 @@ test("graph ast validation reports illegal ports with edge context", () => {
     edges: [{
       id: "edge-bad",
       from: runScriptNode.id,
-      fromPort: "docs",
+      from_port: "docs",
       to: sendMessageNode.id,
-      toPort: "in",
+      to_port: "in",
     }],
   });
 
@@ -794,7 +794,7 @@ test("graph patches do not create deprecated device nodes", () => {
   ]);
   const ast = parseDfBlueprintSource(patched);
 
-  assert.equal(ast.nodes.some((node) => node.kind === "device" || node.nodeKind === "device"), false);
+  assert.equal(ast.nodes.some((node) => node.kind === "device" || node.node_kind === "device"), false);
   assert.equal(ast.nodes.some((node) => node.id === "send-message-added" && node.kind === "send_message"), true);
 });
 
@@ -977,7 +977,7 @@ test("graph patches update resource node metadata from top-level fields", () => 
       asset_refs: "asset-existing",
       create_name: "hero.png",
       height: 208,
-      targetMode: "capture_generated",
+      target_mode: "capture_generated",
     },
   ]);
   const ast = parseDfBlueprintSource(patched);
@@ -1011,7 +1011,7 @@ test("graph patches preserve deterministic document write operation metadata", (
       op: "update_node_props",
       id: "webhook-log",
       document_operation: "replace",
-      contentTemplate: "Latest: {{body_json}}",
+      content_template: "Latest: {{body_json}}",
     },
   ]);
   const ast = parseDfBlueprintSource(updated);
@@ -1038,8 +1038,8 @@ test("graph patches preserve deterministic asset write operation metadata", () =
     {
       op: "update_node_props",
       id: "webhook-asset",
-      assetOperation: "replace",
-      contentTemplate: "Latest: {{body_json}}",
+      asset_operation: "replace",
+      content_template: "Latest: {{body_json}}",
     },
   ]);
   const ast = parseDfBlueprintSource(updated);
@@ -1067,9 +1067,9 @@ test("graph contract accepts completed send-message step edges to notify device 
     edges: [{
       id: "edge-step-notify",
       from: stepNode.id,
-      fromPort: "success",
+      from_port: "success",
       to: notifyDeviceNode.id,
-      toPort: "in",
+      to_port: "in",
     }],
   });
 
@@ -1080,15 +1080,15 @@ test("graph contract rejects notify device execution branches into resource writ
   const notifyDeviceNode = { id: "notify-device-1", kind: "notify_device", label: "Notify device" };
   for (const fromPort of ["exec", "success", "failure", "interrupt"]) {
     const assetValidation = validateLoopspaceGraphEdgeCandidate(notifyDeviceNode, assetWriteNode, {
-      fromPort,
-      toPort: "in",
+      from_port: fromPort,
+      to_port: "in",
     });
     assert.equal(assetValidation.ok, false);
     assert.match(assetValidation.error, /Asset write nodes/);
 
     const documentValidation = validateLoopspaceGraphEdgeCandidate(notifyDeviceNode, documentWriteNode, {
-      fromPort,
-      toPort: "in",
+      from_port: fromPort,
+      to_port: "in",
     });
     assert.equal(documentValidation.ok, false);
     assert.match(documentValidation.error, /Document write nodes/);
@@ -1098,8 +1098,8 @@ test("graph contract rejects notify device execution branches into resource writ
 test("graph contract rejects legacy out edges from notify device nodes", () => {
   const notifyDeviceNode = { id: "notify-device-1", kind: "notify_device", label: "Notify device" };
   const validation = validateLoopspaceGraphEdgeCandidate(notifyDeviceNode, runScriptNode, {
-    fromPort: "out",
-    toPort: "in",
+    from_port: "out",
+    to_port: "in",
     allowLegacy: true,
   });
 

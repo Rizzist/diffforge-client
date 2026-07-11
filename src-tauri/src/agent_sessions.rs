@@ -16,7 +16,6 @@ const CODEX_GENERATED_IMAGE_DIR_SCAN_LIMIT: usize = 16;
 use notify::Watcher as NotifyWatcher;
 
 #[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct CodexThreadTranscriptRequest {
     agent_id: Option<String>,
     provider_session_id: Option<String>,
@@ -26,7 +25,6 @@ struct CodexThreadTranscriptRequest {
 }
 
 #[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct AgentThreadTranscriptWatchRequest {
     agent_id: Option<String>,
     allow_timestamp_fallback: Option<bool>,
@@ -63,7 +61,6 @@ struct AgentThreadTranscriptNativeWatchRequest {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct CodexThreadSessionDiscoverRequest {
     allow_timestamp_fallback: Option<bool>,
     agent_id: Option<String>,
@@ -77,10 +74,9 @@ struct CodexThreadSessionDiscoverRequest {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default)]
 struct CodexThreadTranscriptArtifact {
     kind: String,
-    #[serde(alias = "mime")]
     mime_type: String,
     path: String,
     url: String,
@@ -95,37 +91,35 @@ struct CodexThreadTranscriptArtifact {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default)]
 struct CodexThreadTranscriptMessage {
     id: String,
     role: String,
     kind: String,
-    #[serde(alias = "legacy_kind", skip_serializing_if = "String::is_empty")]
+    #[serde(skip_serializing_if = "String::is_empty")]
     legacy_kind: String,
     text: String,
     title: String,
-    #[serde(alias = "call_id")]
     call_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     status: String,
-    #[serde(alias = "created_at")]
     created_at: String,
     source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool: Option<Value>,
-    #[serde(alias = "tool_output", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     tool_output: Option<Value>,
-    #[serde(alias = "tool_error", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     tool_error: Option<Value>,
-    #[serde(alias = "file_change", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     file_change: Option<Value>,
-    #[serde(alias = "duration_ms", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     duration_ms: Option<u64>,
-    #[serde(alias = "exit_code", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     exit_code: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     subagent: Option<Value>,
-    #[serde(alias = "subagent_id", skip_serializing_if = "String::is_empty")]
+    #[serde(skip_serializing_if = "String::is_empty")]
     subagent_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     usage: Option<Value>,
@@ -158,7 +152,6 @@ pub(crate) struct CodexObservedSession {
 }
 
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct CodexThreadTranscriptResult {
     session_id: String,
     session_title: String,
@@ -1377,12 +1370,12 @@ fn promote_generated_image_artifacts(
                 continue;
             };
             let asset_path =
-                cloud_mcp_payload_text(&promoted, &["local_path", "localPath", "path"])
+                cloud_mcp_payload_text(&promoted, &["local_path", "path"])
                     .unwrap_or_default();
             if asset_path.is_empty() {
                 continue;
             }
-            let asset_id = cloud_mcp_payload_text(&promoted, &["asset_id", "assetId", "id"])
+            let asset_id = cloud_mcp_payload_text(&promoted, &["asset_id", "id"])
                 .unwrap_or_default();
             let original_path = artifact.path.clone();
             artifact.asset_id = asset_id;
@@ -1429,11 +1422,8 @@ fn promoted_generated_asset_event(
         }
         assets.push(json!({
             "asset_id": artifact.asset_id,
-            "assetId": artifact.asset_id,
             "local_path": artifact.asset_path,
-            "localPath": artifact.asset_path,
             "original_path": artifact.original_path,
-            "originalPath": artifact.original_path,
             "path": artifact.asset_path,
         }));
     }
@@ -1443,7 +1433,6 @@ fn promoted_generated_asset_event(
 
     Some(json!({
         "event_kind": "account_assets_updated",
-        "eventKind": "account_assets_updated",
         "kind": "account_assets_updated",
         "reason": reason,
         "source": "codex_imagegen_autocopy",
@@ -2138,8 +2127,7 @@ fn transcript_set_subagent_id(object: &mut serde_json::Map<String, Value>, subag
     if subagent_id.trim().is_empty() {
         return;
     }
-    object.insert("subagent_id".to_string(), json!(subagent_id.clone()));
-    object.insert("subagentId".to_string(), json!(subagent_id));
+    object.insert("subagent_id".to_string(), json!(subagent_id));
 }
 
 impl TranscriptClaudeSidechainTracker {
@@ -4186,7 +4174,7 @@ mod agent_sessions_tests {
                 "role": "user",
                 "kind": "message",
                 "text": "please inspect the board",
-                "createdAt": "2026-01-01T00:00:00Z",
+                "created_at": "2026-01-01T00:00:00Z",
                 "source": "claude",
             }
         ]))
@@ -4195,24 +4183,24 @@ mod agent_sessions_tests {
             "ok": true,
             "session": {
                 "id": "agent-chat-session-1",
-                "providerSessionId": "provider-session-1",
+                "provider_session_id": "provider-session-1",
                 "title": "Board inspection",
                 "cwd": "/tmp/project",
-                "latestTimestamp": "2026-01-01T00:00:05Z",
+                "latest_timestamp": "2026-01-01T00:00:05Z",
             },
             "records": [
                 {
-                    "recordIndex": 0,
+                    "record_index": 0,
                     "messages_json": first_messages,
                 },
                 {
-                    "recordIndex": 1,
+                    "record_index": 1,
                     "messages": [{
                         "id": "m2",
                         "role": "assistant",
                         "kind": "message",
                         "text": "I found the synced transcript.",
-                        "createdAt": "2026-01-01T00:00:05Z",
+                        "created_at": "2026-01-01T00:00:05Z",
                         "source": "claude",
                     }],
                 },
@@ -4976,9 +4964,7 @@ mod agent_sessions_tests {
         let value = agent_thread_transcript_direct_result_value(&result);
         let message = &value["messages"][0];
         assert_eq!(message["kind"], json!("tool_call"));
-        assert_eq!(message["canonicalKind"], json!("subagent"));
         assert_eq!(message["canonical_kind"], json!("subagent"));
-        assert_eq!(message["subagentId"], json!("worker-a"));
         assert_eq!(message["subagent_id"], json!("worker-a"));
         assert_eq!(message["subagent"]["title"], json!("Review worker"));
         assert_eq!(message["subagent"]["subagent_id"], json!("worker-a"));
@@ -5910,9 +5896,7 @@ fn parse_claude_session(
 
             if role == "assistant"
                 && claude_stop_reason_completes_turn(&value_string(
-                    message
-                        .get("stop_reason")
-                        .or_else(|| value.get("stop_reason")),
+                    message.get("stop_reason"),
                 ))
             {
                 push_codex_message_with_tool_metadata(
@@ -6791,7 +6775,7 @@ fn agent_thread_cloud_string_array(value: Option<&Value>) -> Vec<Value> {
 }
 
 fn agent_thread_cloud_record_messages(record: &Value) -> Vec<Value> {
-    for key in ["messages", "messagesJson", "messages_json"] {
+    for key in ["messages", "messages_json"] {
         let messages = agent_thread_cloud_string_array(record.get(key));
         if !messages.is_empty() {
             return messages;
@@ -6892,35 +6876,26 @@ fn agent_thread_cloud_message_from_value(
 
     let role = agent_thread_cloud_message_role(value, &kind);
     Some(CodexThreadTranscriptMessage {
-        id: cloud_mcp_payload_text(value, &["id", "messageId", "message_id"])
+        id: cloud_mcp_payload_text(value, &["id", "message_id"])
             .unwrap_or(fallback_id),
         role,
         kind,
         text,
         title,
-        call_id: cloud_mcp_payload_text(value, &["callId", "call_id"]).unwrap_or_default(),
+        call_id: cloud_mcp_payload_text(value, &["call_id"]).unwrap_or_default(),
         created_at: cloud_mcp_payload_text(
             value,
-            &["createdAt", "created_at", "timestamp", "time"],
+            &["created_at", "timestamp", "time"],
         )
         .unwrap_or_else(|| fallback_timestamp.to_string()),
         source: cloud_mcp_payload_text(value, &["source"]).unwrap_or_else(|| agent_id.to_string()),
         tool: value.get("tool").cloned(),
-        tool_output: value
-            .get("tool_output")
-            .or_else(|| value.get("toolOutput"))
-            .cloned(),
-        tool_error: value
-            .get("tool_error")
-            .or_else(|| value.get("toolError"))
-            .cloned(),
-        file_change: value
-            .get("file_change")
-            .or_else(|| value.get("fileChange"))
-            .cloned(),
-        duration_ms: first_value_i64(&[value.get("durationMs"), value.get("duration_ms")])
+        tool_output: value.get("tool_output").cloned(),
+        tool_error: value.get("tool_error").cloned(),
+        file_change: value.get("file_change").cloned(),
+        duration_ms: first_value_i64(&[value.get("duration_ms")])
             .and_then(|value| (value >= 0).then_some(value as u64)),
-        exit_code: first_value_i64(&[value.get("exitCode"), value.get("exit_code")]),
+        exit_code: first_value_i64(&[value.get("exit_code")]),
         subagent: value.get("subagent").cloned(),
         usage: value.get("usage").cloned(),
         truncated: cloud_mcp_payload_bool(value, &["truncated"], false),
@@ -6943,29 +6918,17 @@ fn agent_thread_transcript_from_cloud_session_response(
         .ok_or_else(|| "Cloud session response did not include a session.".to_string())?;
     let cloud_session_id = cloud_mcp_payload_text(
         session,
-        &["id", "agentChatSessionId", "agent_chat_session_id"],
+        &["id", "agent_chat_session_id"],
     )
     .unwrap_or_default();
     let session_id = cloud_mcp_payload_text(
         session,
-        &[
-            "sessionId",
-            "session_id",
-            "providerSessionId",
-            "provider_session_id",
-        ],
+        &["session_id", "provider_session_id"],
     )
     .unwrap_or_else(|| provider_session_id.to_string());
     let mut latest_timestamp = cloud_mcp_payload_text(
         session,
-        &[
-            "latestTimestamp",
-            "latest_timestamp",
-            "updatedAt",
-            "updated_at",
-            "createdAt",
-            "created_at",
-        ],
+        &["latest_timestamp", "updated_at", "created_at"],
     )
     .unwrap_or_default();
     let records = root
@@ -6977,14 +6940,7 @@ fn agent_thread_transcript_from_cloud_session_response(
     for (record_index, record) in records.iter().enumerate() {
         let record_timestamp = cloud_mcp_payload_text(
             record,
-            &[
-                "recordTimestamp",
-                "record_timestamp",
-                "latestTimestamp",
-                "latest_timestamp",
-                "createdAt",
-                "created_at",
-            ],
+            &["record_timestamp", "latest_timestamp", "created_at"],
         )
         .unwrap_or_else(|| latest_timestamp.clone());
         for (message_index, message) in agent_thread_cloud_record_messages(record)
@@ -7014,14 +6970,14 @@ fn agent_thread_transcript_from_cloud_session_response(
 
     Ok(CodexThreadTranscriptResult {
         session_id,
-        session_title: cloud_mcp_payload_text(session, &["title", "sessionTitle", "session_title"])
+        session_title: cloud_mcp_payload_text(session, &["title", "session_title"])
             .unwrap_or_default(),
         rollout_path: if cloud_session_id.trim().is_empty() {
             format!("cloud://agent-chat-session/{provider_session_id}")
         } else {
             format!("cloud://agent-chat-session/{cloud_session_id}")
         },
-        cwd: cloud_mcp_payload_text(session, &["cwd", "workingDirectory", "working_directory"])
+        cwd: cloud_mcp_payload_text(session, &["cwd", "working_directory"])
             .unwrap_or_else(|| fallback_cwd.to_string()),
         matched_by: "sessionId".to_string(),
         latest_timestamp,
@@ -7039,12 +6995,7 @@ fn agent_thread_cloud_session_matches_provider_session(
     }
     cloud_mcp_payload_text(
         session,
-        &[
-            "sessionId",
-            "session_id",
-            "providerSessionId",
-            "provider_session_id",
-        ],
+        &["session_id", "provider_session_id"],
     )
     .map(|value| value.trim() == expected)
     .unwrap_or(false)
@@ -7089,7 +7040,7 @@ fn read_agent_thread_cloud_transcript(
         .ok_or_else(|| "Cloud did not return a synced session for this provider id.".to_string())?;
     let cloud_session_id = cloud_mcp_payload_text(
         session,
-        &["id", "agentChatSessionId", "agent_chat_session_id"],
+        &["id", "agent_chat_session_id"],
     )
     .ok_or_else(|| "Cloud session list row did not include a session id.".to_string())?;
 
@@ -7271,26 +7222,11 @@ fn agent_thread_transcript_signature(result: &CodexThreadTranscriptResult) -> St
 
 fn agent_thread_transcript_direct_message_value(message: &CodexThreadTranscriptMessage) -> Value {
     let mut value = serde_json::to_value(message).unwrap_or_else(|_| json!({}));
-    if let Some(object) = value.as_object_mut() {
-        if let Some(subagent_id) = object.get("subagentId").cloned() {
-            object
-                .entry("subagent_id".to_string())
-                .or_insert(subagent_id);
-        }
-        if let Some(subagent) = object.get_mut("subagent").and_then(Value::as_object_mut) {
-            if let Some(subagent_id) = subagent.get("subagentId").cloned() {
-                subagent
-                    .entry("subagent_id".to_string())
-                    .or_insert(subagent_id);
-            }
-        }
-    }
-    let legacy_kind = cloud_mcp_payload_text(&value, &["legacyKind", "legacy_kind"])
+    let legacy_kind = cloud_mcp_payload_text(&value, &["legacy_kind"])
         .filter(|value| !value.trim().is_empty());
     if let Some(legacy_kind) = legacy_kind {
         let canonical_kind = cloud_mcp_payload_text(&value, &["kind"]).unwrap_or_default();
         if let Some(object) = value.as_object_mut() {
-            object.insert("canonicalKind".to_string(), json!(canonical_kind.clone()));
             object.insert("canonical_kind".to_string(), json!(canonical_kind));
             object.insert("kind".to_string(), json!(legacy_kind));
         }
@@ -7569,26 +7505,26 @@ async fn emit_agent_thread_transcript_watch_update(
     let _ = app.emit(
         AGENT_THREAD_TRANSCRIPT_UPDATED_EVENT,
         json!({
-            "agentId": context.agent_id,
-            "allowTimestampFallback": context.allow_timestamp_fallback,
+            "agent_id": context.agent_id,
+            "allow_timestamp_fallback": context.allow_timestamp_fallback,
             "cwd": context.cwd,
-            "expectedMessageCreatedAt": context.expected_message_created_at,
-            "expectedUserMessage": context.expected_user_message,
-            "instanceId": context.instance_id,
-            "paneId": context.pane_id,
-            "pollUntilTurnComplete": context.poll_until_turn_complete,
-            "promptEventId": context.prompt_event_id,
-            "promptEventSubmittedAt": context.prompt_event_submitted_at,
-            "providerSessionId": context.provider_session_id,
+            "expected_message_created_at": context.expected_message_created_at,
+            "expected_user_message": context.expected_user_message,
+            "instance_id": context.instance_id,
+            "pane_id": context.pane_id,
+            "poll_until_turn_complete": context.poll_until_turn_complete,
+            "prompt_event_id": context.prompt_event_id,
+            "prompt_event_submitted_at": context.prompt_event_submitted_at,
+            "provider_session_id": context.provider_session_id,
             "reason": reason,
-            "requestSource": context.source,
+            "request_source": context.source,
             "result": agent_thread_transcript_direct_result_value(&result),
             "source": "agent-transcript-watch",
-            "submittedAt": context.submitted_at,
-            "terminalIndex": context.terminal_index,
-            "terminalPromptAccepted": context.terminal_prompt_accepted,
-            "threadId": context.thread_id,
-            "workspaceId": context.workspace_id,
+            "submitted_at": context.submitted_at,
+            "terminal_index": context.terminal_index,
+            "terminal_prompt_accepted": context.terminal_prompt_accepted,
+            "thread_id": context.thread_id,
+            "workspace_id": context.workspace_id,
         }),
     );
     if !agent_thread_transcript_result_is_cloud_backed(&result) {
@@ -7821,7 +7757,7 @@ fn unregister_agent_thread_transcript_native_watch(pane_id: &str, instance_id: O
     });
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn agent_thread_session_discover(
     app: AppHandle,
     request: CodexThreadSessionDiscoverRequest,
@@ -7880,7 +7816,7 @@ async fn agent_thread_session_discover(
     Ok(result)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn agent_thread_transcript(
     app: AppHandle,
     request: CodexThreadTranscriptRequest,
@@ -7923,7 +7859,7 @@ async fn agent_thread_transcript(
     Ok(result)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn agent_thread_transcript_watch(
     app: AppHandle,
     request: AgentThreadTranscriptWatchRequest,

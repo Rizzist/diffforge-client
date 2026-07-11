@@ -27,32 +27,32 @@ test("hook-managed terminal agent ids are normalized in one helper", () => {
 
 test("stale thread prop thinking cannot revive a terminal after newer lifecycle input-ready", () => {
   assert.equal(shouldSuppressThreadPropThinking({
-    latestTurn: {
+    latest_turn: {
       state: "running",
-      startedAt: "2026-05-31T10:00:00.000Z",
+      started_at: "2026-05-31T10:00:00.000Z",
     },
     lastReadyAtMs: Date.parse("2026-05-31T10:00:04.000Z"),
     nextStatus: "thinking",
     previousStatus: "idle",
     source: "thread_prop_status_sync",
-    threadId: "thread-1",
+    thread_id: "thread-1",
   }), true);
 });
 
 test("fresh submitted prompts are allowed to move a terminal into thinking", () => {
   assert.equal(shouldSuppressThreadPropThinking({
-    latestTurn: {
+    latest_turn: {
       state: "running",
-      startedAt: "2026-05-31T10:00:05.000Z",
+      started_at: "2026-05-31T10:00:05.000Z",
     },
     lastReadyAtMs: Date.parse("2026-05-31T10:00:04.000Z"),
     nextStatus: "thinking",
     previousStatus: "idle",
     source: "thread_prop_status_sync",
     submittedPrompt: {
-      threadId: "thread-1",
+      thread_id: "thread-1",
     },
-    threadId: "thread-1",
+    thread_id: "thread-1",
   }), false);
 });
 
@@ -60,7 +60,7 @@ test("visible terminal presence follows activity status instead of running turn 
   assert.equal(terminalRailStateFromActivityStatus("idle"), "idle");
   assert.equal(workspaceTerminalStatusFromActivityStatus("idle", {
     fallbackStatus: "thinking",
-    terminalLifecycle: "open",
+    terminal_lifecycle: "open",
   }), "idle");
   assert.equal(terminalReadinessFromPresenceStatus("idle"), "ready");
   assert.equal(terminalTurnStatusFromActivityStatus("idle"), "completed");
@@ -70,20 +70,20 @@ test("user-input-required aliases map to the paused needs-input bucket", () => {
   for (const status of ["awaiting_input", "user_input_required", "uir"]) {
     assert.equal(terminalReadinessFromPresenceStatus(status), "needs_input");
     assert.equal(terminalExecutionPhaseFromState({
-      activityStatus: status,
+      activity_status: status,
       readiness: "needs_input",
     }), "needs_input");
     assert.equal(terminalRailStateFromExecutionPhase(status), "paused");
     assert.equal(terminalTurnStatusFromActivityStatus(status), "pending");
   }
   assert.equal(workspaceTerminalStatusFromActivityStatus("idle", {
-    terminalLifecycle: "open",
-    terminalIsPromptingUser: true,
+    terminal_lifecycle: "open",
+    terminal_is_prompting_user: true,
   }), "awaiting_input");
   assert.equal(workspaceTerminalStatusFromActivityStatus("awaiting_input", {
-    terminalLifecycle: "open",
-    terminalIsParked: true,
-    terminalIsPromptingUser: true,
+    terminal_lifecycle: "open",
+    terminal_is_parked: true,
+    terminal_is_prompting_user: true,
   }), "paused");
 });
 
@@ -92,7 +92,7 @@ test("visible terminal rail preserves exact activity status", () => {
   assert.equal(terminalActivityStatusIsBusy("running"), true);
   assert.equal(terminalActivityStatusIsSendable("running"), false);
   assert.equal(workspaceTerminalStatusFromActivityStatus("thinking", {
-    terminalLifecycle: "open",
+    terminal_lifecycle: "open",
   }), "thinking");
   assert.equal(terminalReadinessFromPresenceStatus("thinking"), "busy");
   assert.equal(terminalTurnStatusFromActivityStatus("thinking"), "running");
@@ -115,7 +115,7 @@ test("queue sendability is driven by idle activity status only", () => {
 
 test("closed lifecycle wins over idle activity for terminal presence", () => {
   assert.equal(workspaceTerminalStatusFromActivityStatus("idle", {
-    terminalLifecycle: "closed",
+    terminal_lifecycle: "closed",
   }), "closed");
   assert.equal(terminalReadinessFromPresenceStatus("closed"), "closed");
   assert.equal(terminalTurnStatusFromActivityStatus("closed"), "interrupted");
@@ -124,10 +124,10 @@ test("closed lifecycle wins over idle activity for terminal presence", () => {
 test("canonical execution phase maps queue and run events to thinking rail", () => {
   const commandPhase = terminalCommandPhaseFromLifecycleEvent("remote-command-queued");
   const executionPhase = terminalExecutionPhaseFromState({
-    commandPhase,
-    eventType: "remote-command-queued",
+    command_phase: commandPhase,
+    event_type: "remote-command-queued",
     readiness: "busy",
-    turnStatus: "queued",
+    turn_status: "queued",
   });
 
   assert.equal(commandPhase, "queued");
@@ -138,11 +138,11 @@ test("canonical execution phase maps queue and run events to thinking rail", () 
 test("canonical execution phase clears stale thinking after interruption", () => {
   const commandPhase = terminalCommandPhaseFromLifecycleEvent("provider-turn-interrupted");
   const executionPhase = terminalExecutionPhaseFromState({
-    activityStatus: "thinking",
-    commandPhase,
-    eventType: "provider-turn-interrupted",
+    activity_status: "thinking",
+    command_phase: commandPhase,
+    event_type: "provider-turn-interrupted",
     readiness: "ready",
-    turnStatus: "interrupted",
+    turn_status: "interrupted",
   });
 
   assert.equal(commandPhase, "interrupted");

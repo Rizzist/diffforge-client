@@ -34,19 +34,19 @@ function itemsWithWork(messages = []) {
     {
       id: "u-1",
       type: "message",
-      turnId: "turn-1",
+      turn_id: "turn-1",
       message: { id: "u-1", role: "user", content: "go", turn_id: "turn-1" },
     },
     ...messages.map((message) => ({
       id: message.id,
       type: "message",
-      turnId: "turn-1",
+      turn_id: "turn-1",
       message,
     })),
     {
       id: "a-1",
       type: "message",
-      turnId: "turn-1",
+      turn_id: "turn-1",
       message: { id: "a-1", role: "assistant", content: "done", turn_id: "turn-1" },
     },
   ];
@@ -74,19 +74,19 @@ test("messageSubagent extracts parent and session references", () => {
     },
   });
   assert.equal(subagent.id, "sa-2");
-  assert.equal(subagent.parentId, "sa-1");
-  assert.deepEqual(subagent.sessionRef, {
-    agentChatSessionId: "acs-9",
-    providerSessionId: "ps-9",
+  assert.equal(subagent.parent_id, "sa-1");
+  assert.deepEqual(subagent.session_ref, {
+    agent_chat_session_id: "acs-9",
+    provider_session_id: "ps-9",
   });
   const camel = messageSubagent({
-    subagent: { id: "sa-3", parentId: "sa-2", providerSessionId: "ps-1" },
+    subagent: { id: "sa-3", parent_id: "sa-2", provider_session_id: "ps-1" },
   });
-  assert.equal(camel.parentId, "sa-2");
-  assert.deepEqual(camel.sessionRef, { agentChatSessionId: "", providerSessionId: "ps-1" });
+  assert.equal(camel.parent_id, "sa-2");
+  assert.deepEqual(camel.session_ref, { agent_chat_session_id: "", provider_session_id: "ps-1" });
   const bare = messageSubagent({ subagent: { id: "sa-4" } });
-  assert.equal(bare.parentId, "");
-  assert.equal(bare.sessionRef, null);
+  assert.equal(bare.parent_id, "");
+  assert.equal(bare.session_ref, null);
 });
 
 /* ------------------------------------------------------------------ */
@@ -102,7 +102,7 @@ test("consecutive same-id rows wrap into a single flat group", () => {
   ]);
   assert.deepEqual(rows.map((row) => row.kind), ["subagent-group", "tool", "subagent-group"]);
   const [first, , second] = rows;
-  assert.equal(first.subagentId, "sa-1");
+  assert.equal(first.subagent_id, "sa-1");
   assert.equal(first.depth, 1);
   assert.equal(first.childRows.length, 2);
   assert.equal(first.status, "completed");
@@ -131,7 +131,7 @@ test("parent_id chains nest child groups inside the parent", () => {
   assert.equal(rows.length, 1);
   const parent = rows[0];
   assert.equal(parent.kind, "subagent-group");
-  assert.equal(parent.subagentId, "sa-1");
+  assert.equal(parent.subagent_id, "sa-1");
   assert.equal(parent.depth, 1);
   // Parent children: first tool row, nested child group, closing tool row.
   assert.deepEqual(
@@ -139,7 +139,7 @@ test("parent_id chains nest child groups inside the parent", () => {
     ["tool", "subagent-group", "tool"],
   );
   const child = parent.childRows[1];
-  assert.equal(child.subagentId, "sa-2");
+  assert.equal(child.subagent_id, "sa-2");
   assert.equal(child.depth, 2);
   assert.equal(child.title, "Child");
   assert.equal(child.childRows.length, 2);
@@ -196,7 +196,7 @@ test("a parent_id that references a closed run starts a new root group", () => {
   ]);
   assert.deepEqual(rows.map((row) => row.kind), ["subagent-group", "tool", "subagent-group"]);
   const orphan = rows[2];
-  assert.equal(orphan.subagentId, "sa-2");
+  assert.equal(orphan.subagent_id, "sa-2");
   assert.equal(orphan.depth, 1);
 });
 
@@ -214,33 +214,33 @@ test("cross-session subagents expose sessionRef; same-session refs stay hidden",
         provider_session_id: "ps-other",
       },
     }),
-  ], { sessionId });
+  ], { session_id: sessionId });
 
   const different = stamped("acs-current");
-  assert.deepEqual(different[0].sessionRef, {
-    agentChatSessionId: "acs-other",
-    providerSessionId: "ps-other",
+  assert.deepEqual(different[0].session_ref, {
+    agent_chat_session_id: "acs-other",
+    provider_session_id: "ps-other",
   });
 
   const matchingAgentChat = stamped("acs-other");
-  assert.equal(matchingAgentChat[0].sessionRef, null);
+  assert.equal(matchingAgentChat[0].session_ref, null);
 
   const matchingProvider = stamped("ps-other");
-  assert.equal(matchingProvider[0].sessionRef, null);
+  assert.equal(matchingProvider[0].session_ref, null);
 
   // Unknown current session: best effort, the ref still surfaces.
   const unknown = stamped("");
-  assert.deepEqual(unknown[0].sessionRef, {
-    agentChatSessionId: "acs-other",
-    providerSessionId: "ps-other",
+  assert.deepEqual(unknown[0].session_ref, {
+    agent_chat_session_id: "acs-other",
+    provider_session_id: "ps-other",
   });
 });
 
 test("subagents without session references never get a sessionRef", () => {
   const rows = workRowsFor([
     toolMessage({ subagent: { id: "sa-1", title: "Local" } }),
-  ], { sessionId: "acs-current" });
-  assert.equal(rows[0].sessionRef, null);
+  ], { session_id: "acs-current" });
+  assert.equal(rows[0].session_ref, null);
 });
 
 /* ------------------------------------------------------------------ */
@@ -265,12 +265,12 @@ test("subagentGroupStats counts descendants recursively and derives duration", (
   const stats = subagentGroupStats(rows[0]);
   assert.equal(stats.messages, 3);
   assert.equal(stats.toolCalls, 3);
-  assert.equal(stats.durationMs, 45000);
+  assert.equal(stats.duration_ms, 45000);
 
   const childStats = subagentGroupStats(rows[0].childRows[1]);
   assert.equal(childStats.messages, 1);
   assert.equal(childStats.toolCalls, 1);
-  assert.equal(childStats.durationMs, null);
+  assert.equal(childStats.duration_ms, null);
 });
 
 test("countToolCalls recurses through nested subagent groups", () => {

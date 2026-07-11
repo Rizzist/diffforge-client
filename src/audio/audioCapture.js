@@ -80,11 +80,11 @@ const DEFAULT_AUDIO_POLISHING_SYSTEM_PROMPT_UPDATED_AT_MS = 1;
 const MAX_AUDIO_TRANSCRIPTION_HISTORY_ITEMS = 40;
 const MAX_AUDIO_SNIPPET_CHANGE_TEXT_CHARS = 32000;
 const EMPTY_CAPTURE_STATS = {
-  bufferMs: 0,
-  frequencyBands: [],
+  buffer_ms: 0,
+  frequency_bands: [],
   peak: 0,
   rms: 0,
-  timeDomainSamples: [],
+  time_domain_samples: [],
 };
 let audioInputOwnerSequence = 0;
 
@@ -255,22 +255,22 @@ export const AUDIO_LOCAL_WHISPER_REALTIME_MODE_OPTIONS = Object.freeze([
     id: AUDIO_LOCAL_WHISPER_REALTIME_MODE_REALTIME,
     label: "Real time",
     detail: "Shows segments as fast as the engine allows (~3s), at some accuracy cost.",
-    minChunkMs: 3000,
-    maxChunkMs: 10000,
+    min_chunk_ms: 3000,
+    max_chunk_ms: 10000,
   }),
   Object.freeze({
     id: AUDIO_LOCAL_WHISPER_REALTIME_MODE_BALANCED,
     label: "Close to real time",
     detail: "Steadier segments with better context (~10s).",
-    minChunkMs: 10000,
-    maxChunkMs: 35000,
+    min_chunk_ms: 10000,
+    max_chunk_ms: 35000,
   }),
   Object.freeze({
     id: AUDIO_LOCAL_WHISPER_REALTIME_MODE_OFF,
     label: "Off",
     detail: "No live transcript; everything is transcribed once when you stop.",
-    minChunkMs: 0,
-    maxChunkMs: 0,
+    min_chunk_ms: 0,
+    max_chunk_ms: 0,
   }),
 ]);
 
@@ -361,9 +361,9 @@ export function readLocalWhisperPartialTuning() {
   return {
     enabled: true,
     mode,
-    minChunkMs: option.minChunkMs,
-    maxChunkMs: option.maxChunkMs,
-    silenceMs: readLocalWhisperSilenceHoldMs(),
+    min_chunk_ms: option.min_chunk_ms,
+    max_chunk_ms: option.max_chunk_ms,
+    silence_ms: readLocalWhisperSilenceHoldMs(),
   };
 }
 
@@ -535,22 +535,22 @@ function normalizeTranscriptionTimingBreakdown(value) {
   }
 
   const timings = value.timings && typeof value.timings === "object" ? value.timings : {};
-  const sttMs = readObjectTimingMs(value, ["sttMs", "stt_ms", "finishToRawMs", "finish_to_raw_ms"])
-    || readObjectTimingMs(timings, ["sttMs", "stt_ms", "finishToRawMs", "finish_to_raw_ms"]);
-  const cleanupMs = readObjectTimingMs(value, ["cleanupMs", "cleanup_ms"])
-    || readObjectTimingMs(timings, ["cleanupMs", "cleanup_ms"]);
-  const llmMs = readObjectTimingMs(value, ["llmMs", "llm_ms"])
-    || readObjectTimingMs(timings, ["llmMs", "llm_ms"])
+  const sttMs = readObjectTimingMs(value, ["stt_ms", "finish_to_raw_ms"])
+    || readObjectTimingMs(timings, ["stt_ms", "finish_to_raw_ms"]);
+  const cleanupMs = readObjectTimingMs(value, ["cleanup_ms"])
+    || readObjectTimingMs(timings, ["cleanup_ms"]);
+  const llmMs = readObjectTimingMs(value, ["llm_ms"])
+    || readObjectTimingMs(timings, ["llm_ms"])
     || cleanupMs;
-  const totalMs = readObjectTimingMs(value, ["totalMs", "total_ms"])
-    || readObjectTimingMs(timings, ["totalMs", "total_ms"])
+  const totalMs = readObjectTimingMs(value, ["total_ms"])
+    || readObjectTimingMs(timings, ["total_ms"])
     || (sttMs || llmMs ? sttMs + llmMs : 0);
 
   const result = {};
-  if (sttMs > 0) result.sttMs = sttMs;
-  if (llmMs > 0) result.llmMs = llmMs;
-  if (totalMs > 0) result.totalMs = totalMs;
-  if (cleanupMs > 0) result.cleanupMs = cleanupMs;
+  if (sttMs > 0) result.stt_ms = sttMs;
+  if (llmMs > 0) result.llm_ms = llmMs;
+  if (totalMs > 0) result.total_ms = totalMs;
+  if (cleanupMs > 0) result.cleanup_ms = cleanupMs;
   return Object.keys(result).length ? result : null;
 }
 
@@ -560,18 +560,18 @@ function normalizeTranscriptionPolishMetadata(variant) {
   }
 
   const polish = variant.polish && typeof variant.polish === "object" ? variant.polish : {};
-  const provider = readObjectText(polish, ["provider", "cleanupProvider", "cleanup_provider"])
-    || readObjectText(variant, ["polishProvider", "cleanupProvider", "cleanup_provider", "provider"]);
-  const model = readObjectText(polish, ["model", "cleanupModel", "cleanup_model"])
-    || readObjectText(variant, ["polishModel", "cleanupModel", "cleanup_model", "model"]);
-  const engine = readObjectText(polish, ["engine", "cleanupEngine", "cleanup_engine"])
-    || readObjectText(variant, ["polishEngine", "cleanupEngine", "cleanup_engine", "engine"]);
-  const label = readObjectText(polish, ["label", "modelLabel"])
-    || readObjectText(variant, ["polishLabel", "modelLabel"]);
+  const provider = readObjectText(polish, ["provider", "cleanup_provider"])
+    || readObjectText(variant, ["cleanup_provider", "provider"]);
+  const model = readObjectText(polish, ["model", "cleanup_model"])
+    || readObjectText(variant, ["cleanup_model", "model"]);
+  const engine = readObjectText(polish, ["engine", "cleanup_engine"])
+    || readObjectText(variant, ["cleanup_engine", "engine"]);
+  const label = readObjectText(polish, ["label", "model_label"])
+    || readObjectText(variant, ["polish_label", "model_label"]);
   const timings = normalizeTranscriptionTimingBreakdown(polish)
     || normalizeTranscriptionTimingBreakdown(variant);
-  const polishedAt = readObjectText(polish, ["polishedAt", "updatedAt"])
-    || readObjectText(variant, ["polishedAt"]);
+  const polished_at = readObjectText(polish, ["polished_at", "updated_at"])
+    || readObjectText(variant, ["polished_at"]);
 
   const result = {};
   if (provider) result.provider = provider.slice(0, 48);
@@ -579,7 +579,7 @@ function normalizeTranscriptionPolishMetadata(variant) {
   if (engine) result.engine = engine.slice(0, 96);
   if (label) result.label = label.slice(0, 64);
   if (timings) result.timings = timings;
-  if (polishedAt) result.polishedAt = polishedAt.slice(0, 64);
+  if (polished_at) result.polished_at = polished_at.slice(0, 64);
   return Object.keys(result).length ? result : null;
 }
 
@@ -615,9 +615,9 @@ function normalizeTranscriptionVariants(value, text) {
     value.variants.forEach((variant) => addVariant(variant, variant?.id, variant?.label));
   }
 
-  const rawText = normalizeTranscriptionText(value?.rawText || value?.raw_text);
-  const cleanedText = normalizeTranscriptionText(value?.cleanedText || value?.cleaned_text)
-    || (value?.llmCleaned || value?.llm_cleaned ? text : "");
+  const rawText = normalizeTranscriptionText(value?.raw_text);
+  const cleanedText = normalizeTranscriptionText(value?.cleaned_text)
+    || (value?.llm_cleaned ? text : "");
 
   if (rawText) {
     addVariant(
@@ -694,7 +694,7 @@ export function clearAudioInputSetupReady() {
 }
 
 export function audioInputPermissionNeedsAttention(status) {
-  return Boolean(status?.microphoneRequired && !status?.microphoneGranted);
+  return Boolean(status?.microphone_required && !status?.microphone_granted);
 }
 
 export function readAutoOpenAudioRecorder() {
@@ -861,9 +861,9 @@ export function writeAudioLlmCleanupEngine(engine) {
 export function readAudioLlmCleanupRequestOptions() {
   const option = audioLlmCleanupEngineOption(readAudioLlmCleanupEngine());
   return {
-    cleanupEngine: option.id,
-    cleanupProvider: option.provider,
-    cleanupModel: option.model,
+    cleanup_engine: option.id,
+    cleanup_provider: option.provider,
+    cleanup_model: option.model,
   };
 }
 
@@ -933,8 +933,8 @@ export function readAudioPolishingPreferences() {
   const polishingSystemPrompt = readAudioPolishingSystemPrompt();
   const updatedAtMs = readAudioPolishingSystemPromptUpdatedAtMs();
   return {
-    polishingSystemPrompt,
-    updatedAtMs: updatedAtMs || (
+    polishing_system_prompt: polishingSystemPrompt,
+    updated_at_ms: updatedAtMs || (
       !hasAudioPolishingSystemPromptStorageState()
       && polishingSystemPrompt === normalizeAudioPolishingSystemPrompt(DEFAULT_AUDIO_POLISHING_SYSTEM_PROMPT)
         ? DEFAULT_AUDIO_POLISHING_SYSTEM_PROMPT_UPDATED_AT_MS
@@ -946,10 +946,8 @@ export function readAudioPolishingPreferences() {
 function syncAudioPolishingPreferences(preferences, reason = "polishing_prompt_changed") {
   invoke("cloud_mcp_set_audio_preferences", {
     preferences: {
-      polishingSystemPrompt: normalizeAudioPolishingSystemPrompt(preferences?.polishingSystemPrompt),
-      polishing_system_prompt: normalizeAudioPolishingSystemPrompt(preferences?.polishingSystemPrompt),
-      updatedAtMs: audioPolishingUpdatedAtMs(preferences?.updatedAtMs),
-      updated_at_ms: audioPolishingUpdatedAtMs(preferences?.updatedAtMs),
+      polishing_system_prompt: normalizeAudioPolishingSystemPrompt(preferences?.polishing_system_prompt),
+      updated_at_ms: audioPolishingUpdatedAtMs(preferences?.updated_at_ms),
     },
     reason,
   }).catch(() => {});
@@ -957,14 +955,14 @@ function syncAudioPolishingPreferences(preferences, reason = "polishing_prompt_c
 
 export function writeAudioPolishingSystemPrompt(prompt, options = {}) {
   const normalizedPrompt = normalizeAudioPolishingSystemPrompt(prompt);
-  const updatedAtMs = audioPolishingUpdatedAtMs(options.updatedAtMs);
+  const updatedAtMs = audioPolishingUpdatedAtMs(options.updated_at_ms);
   if (canUseStorage()) {
     writeAudioPolishingSystemPromptToStorage(normalizedPrompt, updatedAtMs);
   }
   if (options.sync !== false) {
     syncAudioPolishingPreferences({
-      polishingSystemPrompt: normalizedPrompt,
-      updatedAtMs,
+      polishing_system_prompt: normalizedPrompt,
+      updated_at_ms: updatedAtMs,
     }, options.reason);
   }
 }
@@ -1008,7 +1006,7 @@ function audioPreferencesText(value, keys) {
 
 function audioPreferencesTimestamp(value) {
   const source = audioPreferencesObject(value);
-  for (const key of ["updatedAtMs", "updated_at_ms", "promptUpdatedAtMs", "prompt_updated_at_ms"]) {
+  for (const key of ["updated_at_ms", "prompt_updated_at_ms"]) {
     const timestamp = Number(source[key]);
     if (Number.isFinite(timestamp) && timestamp > 0) {
       return Math.round(timestamp);
@@ -1019,38 +1017,35 @@ function audioPreferencesTimestamp(value) {
 
 export function normalizeAudioPolishingPreferences(value) {
   return {
-    polishingSystemPrompt: normalizeAudioPolishingSystemPrompt(audioPreferencesText(value, [
-      "polishingSystemPrompt",
+    polishing_system_prompt: normalizeAudioPolishingSystemPrompt(audioPreferencesText(value, [
       "polishing_system_prompt",
-      "polishingPrompt",
       "polishing_prompt",
-      "systemPrompt",
       "system_prompt",
       "prompt",
     ])),
-    updatedAtMs: audioPreferencesTimestamp(value),
+    updated_at_ms: audioPreferencesTimestamp(value),
   };
 }
 
 export function applySyncedAudioPolishingPreferences(value) {
   const preferences = normalizeAudioPolishingPreferences(value);
-  if (!preferences.updatedAtMs) {
+  if (!preferences.updated_at_ms) {
     return null;
   }
   const current = readAudioPolishingPreferences();
-  if (current.updatedAtMs > preferences.updatedAtMs) {
+  if (current.updated_at_ms > preferences.updated_at_ms) {
     return null;
   }
   if (
-    current.updatedAtMs === preferences.updatedAtMs
-    && current.polishingSystemPrompt === preferences.polishingSystemPrompt
+    current.updated_at_ms === preferences.updated_at_ms
+    && current.polishing_system_prompt === preferences.polishing_system_prompt
   ) {
     return preferences;
   }
-  writeAudioPolishingSystemPrompt(preferences.polishingSystemPrompt, {
+  writeAudioPolishingSystemPrompt(preferences.polishing_system_prompt, {
     reason: "polishing_prompt_remote",
     sync: false,
-    updatedAtMs: preferences.updatedAtMs,
+    updated_at_ms: preferences.updated_at_ms,
   });
   return preferences;
 }
@@ -1090,6 +1085,64 @@ export function writeDeepgramLanguage(language) {
   }
 }
 
+const AUDIO_TRANSCRIPTION_PERSISTED_TO_RUNTIME_KEYS = Object.freeze({
+  audioMs: "audio_ms",
+  cleanupEngine: "cleanup_engine",
+  cleanupModel: "cleanup_model",
+  cleanupMs: "cleanup_ms",
+  cleanupProvider: "cleanup_provider",
+  createdAt: "created_at",
+  createdAtMs: "created_at_ms",
+  defaultVariantId: "default_variant_id",
+  durationMs: "duration_ms",
+  finishToRawMs: "finish_to_raw_ms",
+  latencyMs: "latency_ms",
+  llmCleaned: "llm_cleaned",
+  llmCleanupEngine: "llm_cleanup_engine",
+  llmCleanupModel: "llm_cleanup_model",
+  llmCleanupProvider: "llm_cleanup_provider",
+  llmMs: "llm_ms",
+  modelLabel: "model_label",
+  polishLabel: "polish_label",
+  polishedAt: "polished_at",
+  snippetChanges: "snippet_changes",
+  sourceText: "source_text",
+  sttMs: "stt_ms",
+  totalMs: "total_ms",
+  updatedAt: "updated_at",
+  wordCount: "word_count",
+});
+
+const AUDIO_TRANSCRIPTION_RUNTIME_TO_PERSISTED_KEYS = Object.freeze(
+  Object.fromEntries(
+    Object.entries(AUDIO_TRANSCRIPTION_PERSISTED_TO_RUNTIME_KEYS)
+      .map(([persisted, runtime]) => [runtime, persisted]),
+  ),
+);
+
+function mapAudioTranscriptionKeys(value, keyMap) {
+  if (Array.isArray(value)) {
+    return value.map((item) => mapAudioTranscriptionKeys(item, keyMap));
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [
+      keyMap[key] || key,
+      mapAudioTranscriptionKeys(item, keyMap),
+    ]),
+  );
+}
+
+export function audioTranscriptionFromPersisted(value) {
+  return mapAudioTranscriptionKeys(value, AUDIO_TRANSCRIPTION_PERSISTED_TO_RUNTIME_KEYS);
+}
+
+export function audioTranscriptionToPersisted(value) {
+  return mapAudioTranscriptionKeys(value, AUDIO_TRANSCRIPTION_RUNTIME_TO_PERSISTED_KEYS);
+}
+
 function normalizeTranscriptionResult(value) {
   if (!value || typeof value !== "object") {
     return null;
@@ -1113,72 +1166,66 @@ function normalizeTranscriptionResult(value) {
       : provider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
         ? "forge-nova3-dictation"
         : "whisper-local";
-  const audioMs = Number(value.audioMs || value.durationMs || 0);
+  const audioMs = Number(value.audio_ms || value.duration_ms || 0);
   // Turnaround time: releasing the record button (request submitted) to the
   // transcript landing.
-  const latencyMs = Number(value.latencyMs || 0);
+  const latency_ms = Number(value.latency_ms || 0);
   const rawLanguage = typeof value.language === "string" ? value.language.trim() : "";
-  const wordCount = text.split(/\s+/).filter(Boolean).length;
+  const word_count = text.split(/\s+/).filter(Boolean).length;
 
-  const sourceText = typeof value.sourceText === "string" && value.sourceText.trim() !== text
-    ? value.sourceText.trim()
+  const sourceText = typeof value.source_text === "string" && value.source_text.trim() !== text
+    ? value.source_text.trim()
     : "";
-  const snippetChanges = normalizeAudioSnippetChanges(
-    value.snippetChanges || value.changes?.snippets,
+  const snippet_changes = normalizeAudioSnippetChanges(
+    value.snippet_changes || value.changes?.snippets,
   );
   const variants = normalizeTranscriptionVariants(value, text);
   const timings = normalizeTranscriptionTimingBreakdown(value);
   const cleanupProvider = readObjectText(value, [
-    "cleanupProvider",
     "cleanup_provider",
-    "llmCleanupProvider",
     "llm_cleanup_provider",
   ]);
   const cleanupModel = readObjectText(value, [
-    "cleanupModel",
     "cleanup_model",
-    "llmCleanupModel",
     "llm_cleanup_model",
   ]);
   const cleanupEngine = readObjectText(value, [
-    "cleanupEngine",
     "cleanup_engine",
-    "llmCleanupEngine",
     "llm_cleanup_engine",
   ]);
-  const defaultVariantId = normalizeTranscriptionVariantId(value.defaultVariantId)
+  const default_variant_id = normalizeTranscriptionVariantId(value.default_variant_id)
     || (variants.some((variant) => variant.id === AUDIO_TRANSCRIPTION_VARIANT_CLEANED)
       ? AUDIO_TRANSCRIPTION_VARIANT_CLEANED
       : variants[0]?.id || "");
 
   return {
-    createdAt: typeof value.createdAt === "string" ? value.createdAt : new Date().toISOString(),
+    created_at: typeof value.created_at === "string" ? value.created_at : new Date().toISOString(),
     id: typeof value.id === "string" ? value.id : String(Date.now()),
-    audioMs: Number.isFinite(audioMs) && audioMs > 0 ? Math.round(audioMs) : 0,
+    audio_ms: Number.isFinite(audioMs) && audioMs > 0 ? Math.round(audioMs) : 0,
     language: rawLanguage ? normalizeDeepgramLanguage(rawLanguage) : "",
-    latencyMs: Number.isFinite(latencyMs) && latencyMs > 0 ? Math.round(latencyMs) : 0,
-    llmCleaned: Boolean(value.llmCleaned || value.llm_cleaned),
-    ...(cleanupProvider ? { cleanupProvider } : {}),
-    ...(cleanupModel ? { cleanupModel } : {}),
-    ...(cleanupEngine ? { cleanupEngine } : {}),
+    latency_ms: Number.isFinite(latency_ms) && latency_ms > 0 ? Math.round(latency_ms) : 0,
+    llm_cleaned: Boolean(value.llm_cleaned),
+    ...(cleanupProvider ? { cleanup_provider: cleanupProvider } : {}),
+    ...(cleanupModel ? { cleanup_model: cleanupModel } : {}),
+    ...(cleanupEngine ? { cleanup_engine: cleanupEngine } : {}),
     ...(timings ? { timings } : {}),
     provider,
     source,
-    sourceText,
-    snippetChanges,
+    source_text: sourceText,
+    snippet_changes,
     status: value.status === AUDIO_TRANSCRIPTION_STATUS_CANCELLED
       ? AUDIO_TRANSCRIPTION_STATUS_CANCELLED
       : AUDIO_TRANSCRIPTION_STATUS_INSERTED,
     text,
-    defaultVariantId,
+    default_variant_id,
     variants,
-    wordCount,
+    word_count,
   };
 }
 
 function compareTranscriptionResultCreatedAt(left, right) {
-  const leftTime = new Date(left?.createdAt || 0).getTime();
-  const rightTime = new Date(right?.createdAt || 0).getTime();
+  const leftTime = new Date(left?.created_at || 0).getTime();
+  const rightTime = new Date(right?.created_at || 0).getTime();
 
   return (Number.isFinite(rightTime) ? rightTime : 0) - (Number.isFinite(leftTime) ? leftTime : 0);
 }
@@ -1191,7 +1238,7 @@ function normalizeTranscriptionHistory(value) {
     .map(normalizeTranscriptionResult)
     .filter(Boolean)
     .filter((result) => {
-      const key = result.id || `${result.createdAt}:${result.text}`;
+      const key = result.id || `${result.created_at}:${result.text}`;
       if (seen.has(key)) {
         return false;
       }
@@ -1210,7 +1257,9 @@ function readStoredAudioTranscriptionHistory() {
 
   try {
     return normalizeTranscriptionHistory(
-      JSON.parse(window.localStorage.getItem(AUDIO_TRANSCRIPTION_HISTORY_STORAGE_KEY) || "[]"),
+      audioTranscriptionFromPersisted(
+        JSON.parse(window.localStorage.getItem(AUDIO_TRANSCRIPTION_HISTORY_STORAGE_KEY) || "[]"),
+      ),
     );
   } catch {
     return [];
@@ -1224,7 +1273,9 @@ export function readLastAudioTranscriptionResult() {
 
   try {
     return normalizeTranscriptionResult(
-      JSON.parse(window.localStorage.getItem(AUDIO_TRANSCRIPTION_RESULT_STORAGE_KEY) || "null"),
+      audioTranscriptionFromPersisted(
+        JSON.parse(window.localStorage.getItem(AUDIO_TRANSCRIPTION_RESULT_STORAGE_KEY) || "null"),
+      ),
     );
   } catch {
     return null;
@@ -1255,13 +1306,19 @@ export async function publishAudioTranscriptionResult(value) {
   if (canUseStorage()) {
     const existingHistory = readStoredAudioTranscriptionHistory();
     const legacyLastResult = existingHistory.length ? null : readLastAudioTranscriptionResult();
-    window.localStorage.setItem(AUDIO_TRANSCRIPTION_RESULT_STORAGE_KEY, JSON.stringify(result));
+    window.localStorage.setItem(
+      AUDIO_TRANSCRIPTION_RESULT_STORAGE_KEY,
+      JSON.stringify(audioTranscriptionToPersisted(result)),
+    );
     const nextHistory = normalizeTranscriptionHistory([
       result,
       ...(legacyLastResult ? [legacyLastResult] : []),
       ...existingHistory,
     ]);
-    window.localStorage.setItem(AUDIO_TRANSCRIPTION_HISTORY_STORAGE_KEY, JSON.stringify(nextHistory));
+    window.localStorage.setItem(
+      AUDIO_TRANSCRIPTION_HISTORY_STORAGE_KEY,
+      JSON.stringify(audioTranscriptionToPersisted(nextHistory)),
+    );
   }
 
   // Mirror to the durable, paginated backend store. The History tab reads from
@@ -1269,12 +1326,14 @@ export async function publishAudioTranscriptionResult(value) {
   // above stays as the dictation widget's small recent cache. Best effort so a
   // backend hiccup never blocks the transcript landing.
   try {
-    const createdAtMs = typeof result.createdAt === "number"
-      ? result.createdAt
-      : Number.isFinite(Date.parse(result.createdAt))
-        ? Date.parse(result.createdAt)
+    const createdAtMs = typeof result.created_at === "number"
+      ? result.created_at
+      : Number.isFinite(Date.parse(result.created_at))
+        ? Date.parse(result.created_at)
         : Date.now();
-    invoke("audio_history_append", { entry: { ...result, createdAtMs } }).catch(() => {});
+    invoke("audio_history_append", {
+      entry: audioTranscriptionToPersisted({ ...result, created_at_ms: createdAtMs }),
+    }).catch(() => {});
   } catch {
     // Ignore: localStorage cache already updated; backend retries on next result.
   }
@@ -1344,7 +1403,7 @@ export async function cancelLocalWhisperPartialTranscription(request = null) {
 }
 
 export async function startLowPowerAudioBuffer({
-  deviceId = "default",
+  device_id: deviceId = "default",
   owner = "audio",
   onStats,
 } = {}) {
@@ -1363,7 +1422,7 @@ export async function startLowPowerAudioBuffer({
 
   const status = await invoke("start_audio_input_monitor", {
     request: {
-      deviceId,
+      device_id: deviceId,
       owner: monitorOwner,
     },
   });
@@ -1371,23 +1430,23 @@ export async function startLowPowerAudioBuffer({
   markAudioInputSetupReady();
 
   return {
-    sampleRate: status?.sampleRate || 16000,
+    sample_rate: status?.sample_rate || 16000,
     async beginCapture() {
       await invoke("begin_audio_input_capture");
     },
     async finishCapture({ decode = true } = {}) {
       const result = await invoke("finish_audio_input_capture");
-      const audioBase64 = result?.audioBase64 || "";
+      const audioBase64 = result?.audio_base64 || "";
 
       return {
-        audioMs: Number(result?.audioMs || 0),
-        audioBase64,
+        audio_ms: Number(result?.audio_ms || 0),
+        audio_base64: audioBase64,
         ...(decode ? { wavBuffer: base64ToArrayBuffer(audioBase64) } : {}),
       };
     },
     getCaptureStats() {
       return {
-        bufferMs: latestStats.bufferMs || 0,
+        buffer_ms: latestStats.buffer_ms || 0,
         peak: latestStats.peak || 0,
         rms: latestStats.rms || 0,
       };

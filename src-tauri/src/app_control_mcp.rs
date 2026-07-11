@@ -10,7 +10,6 @@ const VIDEO_MCP_NO_WORKSPACE_MESSAGE: &str =
     "No video workspace here — open a Video Editor pane (media/ folder) first.";
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct AppControlMcpEndpoint {
     host: String,
     port: u16,
@@ -36,14 +35,13 @@ impl AppControlMcpState {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct AppControlMcpBridgeRequest {
     token: String,
     tool: String,
     input: Value,
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn app_control_mcp_reply(
     state: State<'_, AppControlMcpState>,
     request_id: String,
@@ -248,7 +246,6 @@ async fn handle_app_control_mcp_bridge_connection(
         let include_content = request
             .input
             .get("include_content")
-            .or_else(|| request.input.get("includeContent"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let response =
@@ -341,7 +338,7 @@ async fn handle_app_control_mcp_bridge_connection(
     let emit_result = app.emit(
         APP_CONTROL_MCP_REQUEST_EVENT,
         json!({
-            "requestId": request_id,
+            "request_id": request_id,
             "tool": request.tool,
             "input": request.input,
         }),
@@ -409,7 +406,7 @@ async fn app_control_mcp_ui_tool_request(
     let emit_result = app.emit(
         APP_CONTROL_MCP_REQUEST_EVENT,
         json!({
-            "requestId": request_id,
+            "request_id": request_id,
             "tool": tool,
             "input": input,
         }),
@@ -449,7 +446,7 @@ fn app_control_mcp_input_text(input: &Value, keys: &[&str]) -> Option<String> {
 fn app_control_mcp_state_workspace_root(state: &Value, key: &str) -> Option<String> {
     state
         .get(key)
-        .and_then(|workspace| workspace.get("rootDirectory"))
+        .and_then(|workspace| workspace.get("root_directory"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -458,8 +455,8 @@ fn app_control_mcp_state_workspace_root(state: &Value, key: &str) -> Option<Stri
 
 fn app_control_mcp_repo_path_from_state_response(response: &Value) -> Option<String> {
     let state = response.get("data").unwrap_or(response);
-    app_control_mcp_state_workspace_root(state, "selectedWorkspace")
-        .or_else(|| app_control_mcp_state_workspace_root(state, "activatedWorkspace"))
+    app_control_mcp_state_workspace_root(state, "selected_workspace")
+        .or_else(|| app_control_mcp_state_workspace_root(state, "activated_workspace"))
         .or_else(|| {
             state
                 .get("workspaces")
@@ -472,7 +469,7 @@ fn app_control_mcp_repo_path_from_state_response(response: &Value) -> Option<Str
                 })
                 .find_map(|workspace| {
                     workspace
-                        .get("rootDirectory")
+                        .get("root_directory")
                         .and_then(Value::as_str)
                         .map(str::trim)
                         .filter(|value| !value.is_empty())
@@ -487,14 +484,14 @@ async fn app_control_mcp_resolve_video_repo_path(
     counter: Arc<AtomicU64>,
     input: &Value,
 ) -> Result<String, String> {
-    if let Some(repo_path) = app_control_mcp_input_text(input, &["repoPath", "repo_path"]) {
+    if let Some(repo_path) = app_control_mcp_input_text(input, &["repo_path"]) {
         return Ok(repo_path);
     }
 
     let state =
         app_control_mcp_ui_tool_request(app, pending, counter, "get_state", json!({})).await?;
     app_control_mcp_repo_path_from_state_response(&state).ok_or_else(|| {
-        "No workspace repo path is active. Pass repoPath or select a workspace.".to_string()
+        "No workspace repo path is active. Pass repo_path or select a workspace.".to_string()
     })
 }
 
@@ -514,8 +511,8 @@ fn app_control_mcp_present(input: &Value, keys: &[&str]) -> bool {
 }
 
 fn app_control_mcp_video_look_times(input: &Value) -> Result<Vec<u64>, String> {
-    let has_at = app_control_mcp_present(input, &["atMs", "at_ms"]);
-    let has_times = app_control_mcp_present(input, &["timesMs", "times_ms"]);
+    let has_at = app_control_mcp_present(input, &["at_ms"]);
+    let has_times = app_control_mcp_present(input, &["times_ms"]);
     let has_range = app_control_mcp_present(input, &["range"]);
     if [has_at, has_times, has_range]
         .into_iter()
@@ -523,31 +520,29 @@ fn app_control_mcp_video_look_times(input: &Value) -> Result<Vec<u64>, String> {
         .count()
         != 1
     {
-        return Err("Pass exactly one of atMs, timesMs, or range.".to_string());
+        return Err("Pass exactly one of at_ms, times_ms, or range.".to_string());
     }
     if has_at {
         let at_ms = input
-            .get("atMs")
-            .or_else(|| input.get("at_ms"))
+            .get("at_ms")
             .and_then(video_mcp_value_u64)
-            .ok_or_else(|| "atMs must be a non-negative number.".to_string())?;
+            .ok_or_else(|| "at_ms must be a non-negative number.".to_string())?;
         return Ok(vec![at_ms]);
     }
     if has_times {
         let values = input
-            .get("timesMs")
-            .or_else(|| input.get("times_ms"))
+            .get("times_ms")
             .and_then(Value::as_array)
-            .ok_or_else(|| "timesMs must be an array.".to_string())?;
+            .ok_or_else(|| "times_ms must be an array.".to_string())?;
         let mut times = Vec::new();
         for value in values {
             times.push(
                 video_mcp_value_u64(value)
-                    .ok_or_else(|| "timesMs entries must be non-negative numbers.".to_string())?,
+                    .ok_or_else(|| "times_ms entries must be non-negative numbers.".to_string())?,
             );
         }
         if times.is_empty() {
-            return Err("timesMs must include at least one timestamp.".to_string());
+            return Err("times_ms must include at least one timestamp.".to_string());
         }
         return Ok(times);
     }
@@ -556,15 +551,13 @@ fn app_control_mcp_video_look_times(input: &Value) -> Result<Vec<u64>, String> {
         .and_then(Value::as_object)
         .ok_or_else(|| "range must be an object.".to_string())?;
     let start_ms = range
-        .get("startMs")
-        .or_else(|| range.get("start_ms"))
+        .get("start_ms")
         .and_then(video_mcp_value_u64)
-        .ok_or_else(|| "range.startMs is required.".to_string())?;
+        .ok_or_else(|| "range.start_ms is required.".to_string())?;
     let end_ms = range
-        .get("endMs")
-        .or_else(|| range.get("end_ms"))
+        .get("end_ms")
         .and_then(video_mcp_value_u64)
-        .ok_or_else(|| "range.endMs is required.".to_string())?;
+        .ok_or_else(|| "range.end_ms is required.".to_string())?;
     let frames = range
         .get("frames")
         .and_then(video_mcp_value_u64)
@@ -599,11 +592,11 @@ fn app_control_mcp_video_activity_detail(tool: &str, input: &Value) -> Value {
                         .collect()
                 })
                 .unwrap_or_default();
-            json!({ "ops": kinds.len(), "opKinds": kinds })
+            json!({ "ops": kinds.len(), "op_kinds": kinds })
         }
         "video_look" => json!({
-            "atMs": input.get("atMs").cloned().unwrap_or(Value::Null),
-            "timesMs": input.get("timesMs").cloned().unwrap_or(Value::Null),
+            "at_ms": input.get("at_ms").cloned().unwrap_or(Value::Null),
+            "times_ms": input.get("times_ms").cloned().unwrap_or(Value::Null),
             "range": input.get("range").cloned().unwrap_or(Value::Null),
         }),
         "video_media" => json!({
@@ -630,14 +623,14 @@ fn app_control_mcp_video_activity_result(tool: &str, result: &Value) -> Value {
     match (tool, data) {
         ("video_edit", Some(data)) => json!({
             "summary": data.get("summary").cloned().unwrap_or(Value::Null),
-            "changedClipIds": data.get("changedClipIds").cloned().unwrap_or(Value::Null),
+            "changed_clip_ids": data.get("changed_clip_ids").cloned().unwrap_or(Value::Null),
         }),
         ("video_generate", Some(data)) => json!({
-            "jobId": data.get("jobId").cloned().unwrap_or(Value::Null),
+            "job_id": data.get("job_id").cloned().unwrap_or(Value::Null),
         }),
         ("video_export", Some(data)) => json!({
-            "jobId": data.get("jobId").cloned().unwrap_or(Value::Null),
-            "outputPath": data.get("outputPath").cloned().unwrap_or(Value::Null),
+            "job_id": data.get("job_id").cloned().unwrap_or(Value::Null),
+            "output_path": data.get("output_path").cloned().unwrap_or(Value::Null),
         }),
         ("video_transcribe", Some(data)) => json!({
             "results": data
@@ -648,7 +641,7 @@ fn app_control_mcp_video_activity_result(tool: &str, result: &Value) -> Value {
                         .iter()
                         .map(|item| {
                             json!({
-                                "assetPath": item.get("assetPath").cloned().unwrap_or(Value::Null),
+                                "asset_path": item.get("asset_path").cloned().unwrap_or(Value::Null),
                                 "status": item.get("status").cloned().unwrap_or(Value::Null),
                             })
                         })
@@ -698,7 +691,7 @@ async fn handle_app_control_mcp_video_tool(
         json!({
             "id": activity_id,
             "tool": tool,
-            "repoPath": repo_path,
+            "repo_path": repo_path,
             "phase": "start",
             "detail": start_detail,
         }),
@@ -717,7 +710,7 @@ async fn handle_app_control_mcp_video_tool(
         json!({
             "id": activity_id,
             "tool": tool,
-            "repoPath": repo_path,
+            "repo_path": repo_path,
             "phase": if ok { "done" } else { "error" },
             "error": error_message,
             "result": app_control_mcp_video_activity_result(tool, &result),
@@ -759,11 +752,10 @@ async fn handle_app_control_mcp_video_tool_inner(
             }
         }
         "video_edit" => {
-            let project_path = app_control_mcp_input_text(&input, &["projectPath", "project_path"]);
+            let project_path = app_control_mcp_input_text(&input, &["project_path"]);
             let ops = input.get("ops").cloned().unwrap_or_else(|| json!([]));
             let include_pipe = input
-                .get("includePipe")
-                .or_else(|| input.get("include_pipe"))
+                .get("include_pipe")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             match video_mcp_edit(app, repo_path, project_path, ops, include_pipe).await {
@@ -772,7 +764,7 @@ async fn handle_app_control_mcp_video_tool_inner(
             }
         }
         "video_look" => {
-            let project_path = app_control_mcp_input_text(&input, &["projectPath", "project_path"]);
+            let project_path = app_control_mcp_input_text(&input, &["project_path"]);
             let times_ms = match app_control_mcp_video_look_times(&input) {
                 Ok(times_ms) => times_ms,
                 Err(error) => return app_control_mcp_json_error("video_look_bad_input", error),
@@ -814,14 +806,8 @@ async fn handle_app_control_mcp_video_tool_inner(
                 .map(str::trim)
                 .is_some_and(|scope| scope.eq_ignore_ascii_case("selection"));
             let wait = input.get("wait").and_then(Value::as_bool).unwrap_or(true);
-            let from_ms = input
-                .get("fromMs")
-                .or_else(|| input.get("from_ms"))
-                .and_then(Value::as_u64);
-            let to_ms = input
-                .get("toMs")
-                .or_else(|| input.get("to_ms"))
-                .and_then(Value::as_u64);
+            let from_ms = input.get("from_ms").and_then(Value::as_u64);
+            let to_ms = input.get("to_ms").and_then(Value::as_u64);
             match video_mcp_transcribe(app, repo_path, paths, scope_selection, wait, from_ms, to_ms)
                 .await
             {
@@ -1026,16 +1012,16 @@ fn app_control_mcp_tools() -> Vec<Value> {
     vec![
         json!({
             "name": "get_state",
-            "description": "Return the current Diff Forge app view, selected workspace, active workspace, compact accountDocs and localScripts inventories, available navigation targets, and a compact visible-context summary. Call this before app-control actions when the target tab, workspace, document, script, or selection is unclear.",
+            "description": "Return the current Diff Forge app view, selected workspace, active workspace, compact account_docs and local_scripts inventories, available navigation targets, and a compact visible-context summary. Call this before app-control actions when the target tab, workspace, document, script, or selection is unclear.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         }),
         json!({
             "name": "get_visible_context",
-            "description": "Return the currently visible Diff Forge context, including selected Tools document or local script metadata, highlighted range, and compact state inventories when available. Use this first for prompts like explain this selected skill, create a draft here, modify/delete this selection, run the selected local script, or what is selected. For background inventory questions that should not disturb the user's view, use list_docs/list_scripts instead. Use localPath only for direct file edits when appropriate. For unsaved Tools document drafts, use update_selected_document; for unsaved local scripts, use update_selected_script.",
+            "description": "Return the currently visible Diff Forge context, including selected Tools document or local script metadata, highlighted range, and compact state inventories when available. Use this first for prompts like explain this selected skill, create a draft here, modify/delete this selection, run the selected local script, or what is selected. For background inventory questions that should not disturb the user's view, use list_docs/list_scripts instead. Use local_path only for direct file edits when appropriate. For unsaved Tools document drafts, use update_selected_document; for unsaved local scripts, use update_selected_script.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "includeContent": {"type": "boolean", "description": "When true, include any small in-memory draft preview the UI can safely expose."}
+                    "include_content": {"type": "boolean", "description": "When true, include any small in-memory draft preview the UI can safely expose."}
                 },
                 "additionalProperties": true
             }
@@ -1046,7 +1032,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "includeContent": {"type": "boolean", "description": "When true, include any small in-memory draft preview the UI can safely expose."}
+                    "include_content": {"type": "boolean", "description": "When true, include any small in-memory draft preview the UI can safely expose."}
                 },
                 "additionalProperties": true
             }
@@ -1058,30 +1044,27 @@ fn app_control_mcp_tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "refresh": {"type": "boolean", "description": "When true, force a Cloud/cache refresh before returning cached inventory."},
-                    "includeContent": {"type": "boolean", "description": "When true, include only already cached inline document content. This does not hydrate every document."},
-                    "includeDrafts": {"type": "boolean", "description": "When true or omitted, include the current unsaved document draft as a draft item when present."}
+                    "include_content": {"type": "boolean", "description": "When true, include only already cached inline document content. This does not hydrate every document."},
+                    "include_drafts": {"type": "boolean", "description": "When true or omitted, include the current unsaved document draft as a draft item when present."}
                 },
                 "additionalProperties": true
             }
         }),
         json!({
             "name": "get_doc",
-            "description": "Return one account Tools document by document_key, doc_id/document_id, path_key, file_path, title, or name without changing the visible tab, active view, selected document, or highlighted range. Use includeContent=true to hydrate and return content for that one document. Do not directly edit local_path; call prepare_doc_draft for file-backed edits.",
+            "description": "Return one account Tools document by document_key, doc_id/document_id, path_key, file_path, title, or name without changing the visible tab, active view, selected document, or highlighted range. Use include_content=true to hydrate and return content for that one document. Do not directly edit local_path; call prepare_doc_draft for file-backed edits.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "document_key": {"type": "string"},
-                    "documentKey": {"type": "string"},
                     "doc_id": {"type": "string"},
                     "document_id": {"type": "string"},
                     "id": {"type": "string"},
                     "path_key": {"type": "string"},
-                    "pathKey": {"type": "string"},
                     "file_path": {"type": "string"},
-                    "filePath": {"type": "string"},
                     "title": {"type": "string"},
                     "name": {"type": "string"},
-                    "includeContent": {"type": "boolean", "description": "When true or omitted, include document content, hydrating this single document if needed."},
+                    "include_content": {"type": "boolean", "description": "When true or omitted, include document content, hydrating this single document if needed."},
                     "refresh": {"type": "boolean", "description": "When true, force a Cloud/cache refresh before resolving the document."}
                 },
                 "additionalProperties": true
@@ -1094,14 +1077,11 @@ fn app_control_mcp_tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "document_key": {"type": "string"},
-                    "documentKey": {"type": "string"},
                     "doc_id": {"type": "string"},
                     "document_id": {"type": "string"},
                     "id": {"type": "string"},
                     "path_key": {"type": "string"},
-                    "pathKey": {"type": "string"},
                     "file_path": {"type": "string"},
-                    "filePath": {"type": "string"},
                     "title": {"type": "string"},
                     "name": {"type": "string"},
                     "content": {"type": "string"},
@@ -1118,31 +1098,22 @@ fn app_control_mcp_tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "document_key": {"type": "string"},
-                    "documentKey": {"type": "string"},
                     "doc_id": {"type": "string"},
                     "document_id": {"type": "string"},
                     "id": {"type": "string"},
                     "path_key": {"type": "string"},
-                    "pathKey": {"type": "string"},
                     "file_path": {"type": "string"},
-                    "filePath": {"type": "string"},
                     "local_path": {"type": "string"},
-                    "localPath": {"type": "string"},
                     "draft_path": {"type": "string"},
-                    "draftPath": {"type": "string"},
                     "draft_id": {"type": "string"},
-                    "draftId": {"type": "string"},
                     "base_content_hash": {"type": "string", "description": "Required when promoting a draft over an existing canonical document; use the value returned by prepare_doc_draft."},
-                    "baseContentHash": {"type": "string"},
                     "base_hash": {"type": "string"},
-                    "baseHash": {"type": "string"},
                     "title": {"type": "string"},
                     "name": {"type": "string"},
                     "content": {"type": "string"},
                     "content_md": {"type": "string"},
                     "mode": {"type": "string", "description": "publish, push, sync, save, or local. save aliases publish; use local only for local-only saves."},
                     "allow_empty_overwrite": {"type": "boolean"},
-                    "allowEmptyOverwrite": {"type": "boolean"},
                     "allow_conflict": {"type": "boolean", "description": "Force-promote a draft even if the canonical document changed after prepare_doc_draft."}
                 },
                 "additionalProperties": true
@@ -1163,7 +1134,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "includeContent": {"type": "boolean"}
+                    "include_content": {"type": "boolean"}
                 },
                 "additionalProperties": true
             }
@@ -1174,7 +1145,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "includeContent": {"type": "boolean"}
+                    "include_content": {"type": "boolean"}
                 },
                 "additionalProperties": true
             }
@@ -1185,7 +1156,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "includeContent": {"type": "boolean", "description": "When true, include script file contents."}
+                    "include_content": {"type": "boolean", "description": "When true, include script file contents."}
                 },
                 "additionalProperties": true
             }
@@ -1196,7 +1167,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "includeContent": {"type": "boolean", "description": "When true, include script file contents."}
+                    "include_content": {"type": "boolean", "description": "When true, include script file contents."}
                 },
                 "additionalProperties": true
             }
@@ -1210,13 +1181,10 @@ fn app_control_mcp_tools() -> Vec<Value> {
                     "script_id": {"type": "string"},
                     "id": {"type": "string"},
                     "script_name": {"type": "string"},
-                    "scriptName": {"type": "string"},
                     "name": {"type": "string"},
                     "title": {"type": "string"},
                     "path_key": {"type": "string"},
-                    "pathKey": {"type": "string"},
                     "file_path": {"type": "string"},
-                    "filePath": {"type": "string"},
                     "path": {"type": "string"}
                 },
                 "additionalProperties": true
@@ -1409,9 +1377,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "asset_id": {"type": "string", "description": "Required Cloud asset id to download."},
-                    "assetId": {"type": "string", "description": "Alias for asset_id."},
-                    "target_directory": {"type": "string", "description": "Optional download directory. Defaults to the device-level Diff Forge asset library."},
-                    "targetDirectory": {"type": "string", "description": "Alias for target_directory."}
+                    "target_directory": {"type": "string", "description": "Optional download directory. Defaults to the device-level Diff Forge asset library."}
                 },
                 "required": ["asset_id"],
                 "additionalProperties": true
@@ -1442,8 +1408,8 @@ fn app_control_mcp_tools() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspaceId": {"type": "string"},
-                    "workspaceName": {"type": "string"},
+                    "workspace_id": {"type": "string"},
+                    "workspace_name": {"type": "string"},
                     "active": {"type": "boolean", "description": "true activates/selects; false deactivates."}
                 },
                 "additionalProperties": true
@@ -1532,28 +1498,19 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "record_loopspace_step_progress",
-            "description": "Record progress for the current Loopspace send-message or dispatch-todo checkpoint. Use this for Diff Forge internal action steps: call with status='running' when starting a step and status='completed' when that step is done. If a checkpoint generated assets, include asset_id or asset_ids after upload_asset succeeds. For Dispatch Todo, todo queue status remains the final source of completed/failed/interrupted state; checkpoint progress only updates the internal step display. Include loop runtime ids, wait for the response, and follow nextCheckpoint before moving to the next checkpoint.",
+            "description": "Record progress for the current Loopspace send-message or dispatch-todo checkpoint. Use this for Diff Forge internal action steps: call with status='running' when starting a step and status='completed' when that step is done. If a checkpoint generated assets, include asset_id or asset_ids after upload_asset succeeds. For Dispatch Todo, todo queue status remains the final source of completed/failed/interrupted state; checkpoint progress only updates the internal step display. Include loop runtime ids, wait for the response, and follow next_checkpoint before moving to the next checkpoint.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "loopspace_id": {"type": "string"},
-                    "loopspaceId": {"type": "string"},
                     "loop_runtime_run_id": {"type": "string"},
-                    "loopRuntimeRunId": {"type": "string"},
                     "loop_runtime_node_id": {"type": "string"},
-                    "loopRuntimeNodeId": {"type": "string"},
                     "loop_runtime_edge_id": {"type": "string"},
-                    "loopRuntimeEdgeId": {"type": "string"},
                     "trigger_id": {"type": "string"},
-                    "triggerId": {"type": "string"},
                     "trigger_run_id": {"type": "string"},
-                    "triggerRunId": {"type": "string"},
                     "step_index": {"type": "integer", "minimum": 1},
-                    "stepIndex": {"type": "integer", "minimum": 1},
                     "step_id": {"type": "string"},
-                    "stepId": {"type": "string"},
                     "step_title": {"type": "string"},
-                    "stepTitle": {"type": "string"},
                     "status": {"type": "string", "description": "running, completed, failed, or skipped."},
                     "asset_id": {"type": "string", "description": "Generated/uploaded asset id for this checkpoint."},
                     "asset_ids": {"type": "array", "items": {"type": "string"}, "description": "Generated/uploaded asset ids for this checkpoint."},
@@ -1611,7 +1568,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "patch_loopspace_graph",
-            "description": "Patch a Loopspace .dfblueprint graph without rewriting the whole source. Call get_loopspace_graph and list_loopspace_triggers first. Trigger graph nodes must reference inventory: use attach_trigger with trigger_id, or create_loopspace_trigger first with explicit trigger_type. Do not invent standalone cron/manual/webhook nodes. For add_node, use supported node kinds: document_read, document_write, asset_read, asset_write, run_script, send_message, dispatch_todos, notify_device, or step. Device nodes are legacy saved-graph compatibility only; target devices are selected on send_message, dispatch_todos, run_script, and notify_device nodes. When the graph should send a message to the terminal orchestrator or a coding agent, create a send_message node as the outer action/target region; do not model that as queue_todo, dispatch_todos, or a free-floating terminal edge. When the graph should dispatch queued todos to workspace terminals, create a dispatch_todos node as the outer action/target region; it may be direct with target_workspace_ids and todo_lines or have child step nodes with parent_id/parentId set to the dispatch_todos node id. Edges are explicit node_id.port -> node_id.port connections. Trigger nodes expose out; run_script/send_message/dispatch_todos/notify_device expose exec, success, failure, interrupt; document_read/document_write expose docs; asset_read/asset_write expose assets; step nodes expose success, docs, and assets; executable/resource targets generally accept in. Specify from_port/fromPort and to_port/toPort on connect operations, especially from action nodes. For internal steps on send_message or dispatch_todos, connect trigger.out -> action.in; document_read.docs or asset_read.assets -> step.in for readable context; step.docs -> document_write.in for generated documents; step.assets -> asset_write.in for generated assets; and step.success -> run_script.in, send_message.in, dispatch_todos.in, or notify_device.in when a completed substep should start another action. Do not connect send_message.exec, send_message.success, dispatch_todos.exec, dispatch_todos.success, run_script.exec, run_script.success, or other action execution branches directly into document_write or asset_write; for generated documents/assets, prefer the child step docs/assets ports. Use doc_refs for document selections, asset_refs for asset selections, h for resource node height, and target_mode for selection/create behavior. Write nodes may include create_name for a new/generated resource name. Send-message nodes use prompt plus optional device_id/target_device_id, device_label/target_device_label, target_agent_id, target_terminal_id, model, reasoning_effort, and speed. Dispatch todo nodes use target_workspace_ids, todo_lines, target_terminal_mode auto|pinned, optional target_terminal_id/index/name, and optional target_agent_id/model/reasoning_effort/speed. Notify device nodes send a native/push notification when reached and use optional device_id (empty targets all account devices), title, body, url, and delivery auto|native|push; title/body support {{loop_name}}, {{node_title}}, {{from_node}}, {{branch}}, {{device_name}}, {{run_id}}, and {{date}} template variables. add_node and update_node_props accept resource metadata as top-level fields or nested under props.",
+            "description": "Patch a Loopspace .dfblueprint graph without rewriting the whole source. Call get_loopspace_graph and list_loopspace_triggers first. Trigger graph nodes must reference inventory: use attach_trigger with trigger_id, or create_loopspace_trigger first with explicit trigger_type. Do not invent standalone cron/manual/webhook nodes. For add_node, use supported node kinds: document_read, document_write, asset_read, asset_write, run_script, send_message, dispatch_todos, notify_device, or step. Device nodes are legacy saved-graph compatibility only; target devices are selected on send_message, dispatch_todos, run_script, and notify_device nodes. When the graph should send a message to the terminal orchestrator or a coding agent, create a send_message node as the outer action/target region; do not model that as queue_todo, dispatch_todos, or a free-floating terminal edge. When the graph should dispatch queued todos to workspace terminals, create a dispatch_todos node as the outer action/target region; it may be direct with target_workspace_ids and todo_lines or have child step nodes with parent_id set to the dispatch_todos node id. Edges are explicit node_id.port -> node_id.port connections. Trigger nodes expose out; run_script/send_message/dispatch_todos/notify_device expose exec, success, failure, interrupt; document_read/document_write expose docs; asset_read/asset_write expose assets; step nodes expose success, docs, and assets; executable/resource targets generally accept in. Specify from_port and to_port on connect operations, especially from action nodes. For internal steps on send_message or dispatch_todos, connect trigger.out -> action.in; document_read.docs or asset_read.assets -> step.in for readable context; step.docs -> document_write.in for generated documents; step.assets -> asset_write.in for generated assets; and step.success -> run_script.in, send_message.in, dispatch_todos.in, or notify_device.in when a completed substep should start another action. Do not connect send_message.exec, send_message.success, dispatch_todos.exec, dispatch_todos.success, run_script.exec, run_script.success, or other action execution branches directly into document_write or asset_write; for generated documents/assets, prefer the child step docs/assets ports. Use doc_refs for document selections, asset_refs for asset selections, h for resource node height, and target_mode for selection/create behavior. Write nodes may include create_name for a new/generated resource name. Send-message nodes use prompt plus optional device_id/target_device_id, device_label/target_device_label, target_agent_id, target_terminal_id, model, reasoning_effort, and speed. Dispatch todo nodes use target_workspace_ids, todo_lines, target_terminal_mode auto|pinned, optional target_terminal_id/index/name, and optional target_agent_id/model/reasoning_effort/speed. Notify device nodes send a native/push notification when reached and use optional device_id (empty targets all account devices), title, body, url, and delivery auto|native|push; title/body support {{loop_name}}, {{node_title}}, {{from_node}}, {{branch}}, {{device_name}}, {{run_id}}, and {{date}} template variables. add_node and update_node_props accept resource metadata as top-level fields or nested under props.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1640,8 +1597,8 @@ fn app_control_mcp_tools() -> Vec<Value> {
                 "properties": {
                     "tab": {"type": "string"},
                     "view": {"type": "string"},
-                    "workspaceId": {"type": "string"},
-                    "workspaceName": {"type": "string"}
+                    "workspace_id": {"type": "string"},
+                    "workspace_name": {"type": "string"}
                 },
                 "additionalProperties": true
             }
@@ -1652,11 +1609,11 @@ fn app_control_mcp_tools() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspaceId": {"type": "string"},
-                    "workspaceName": {"type": "string"},
+                    "workspace_id": {"type": "string"},
+                    "workspace_name": {"type": "string"},
                     "kind": {"type": "string", "description": "Optional panel kind filter: docs, web, pcb, terminal, or all."},
-                    "includeContext": {"type": "boolean", "description": "When true, include compact kind-specific context such as current URL, selected board path, or selected document metadata."},
-                    "includeState": {"type": "boolean", "description": "When true, include broader app-control state."}
+                    "include_context": {"type": "boolean", "description": "When true, include compact kind-specific context such as current URL, selected board path, or selected document metadata."},
+                    "include_state": {"type": "boolean", "description": "When true, include broader app-control state."}
                 },
                 "additionalProperties": true
             }
@@ -1667,14 +1624,14 @@ fn app_control_mcp_tools() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspaceId": {"type": "string"},
-                    "workspaceName": {"type": "string"},
-                    "paneId": {"type": "string"},
-                    "panelId": {"type": "string"},
-                    "terminalIndex": {"type": "integer", "minimum": 0},
+                    "workspace_id": {"type": "string"},
+                    "workspace_name": {"type": "string"},
+                    "pane_id": {"type": "string"},
+                    "panel_id": {"type": "string"},
+                    "terminal_index": {"type": "integer", "minimum": 0},
                     "kind": {"type": "string", "description": "docs, web, pcb, or terminal."},
-                    "includeContent": {"type": "boolean", "description": "When true, include already-live editor content when available. Large or native webview content is not captured."},
-                    "includeState": {"type": "boolean"}
+                    "include_content": {"type": "boolean", "description": "When true, include already-live editor content when available. Large or native webview content is not captured."},
+                    "include_state": {"type": "boolean"}
                 },
                 "additionalProperties": true
             }
@@ -1685,33 +1642,33 @@ fn app_control_mcp_tools() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspaceId": {"type": "string"},
-                    "workspaceName": {"type": "string"},
-                    "paneId": {"type": "string"},
-                    "panelId": {"type": "string"},
-                    "terminalIndex": {"type": "integer", "minimum": 0},
+                    "workspace_id": {"type": "string"},
+                    "workspace_name": {"type": "string"},
+                    "pane_id": {"type": "string"},
+                    "panel_id": {"type": "string"},
+                    "terminal_index": {"type": "integer", "minimum": 0},
                     "kind": {"type": "string", "description": "docs, web, pcb, or terminal."},
-                    "includeState": {"type": "boolean"}
+                    "include_state": {"type": "boolean"}
                 },
                 "additionalProperties": true
             }
         }),
         json!({
             "name": "open_panel",
-            "description": "Open a workspace panel in the selected workspace by default. Kinds: docs, web, pcb. Web may accept url/search; PCB may accept create/name or boardPath/boardName to switch to an existing board.",
+            "description": "Open a workspace panel in the selected workspace by default. Kinds: docs, web, pcb. Web may accept url/search; PCB may accept create/name or board_path/board_name to switch to an existing board.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspaceId": {"type": "string"},
-                    "workspaceName": {"type": "string"},
+                    "workspace_id": {"type": "string"},
+                    "workspace_name": {"type": "string"},
                     "kind": {"type": "string", "description": "docs, web, or pcb."},
                     "url": {"type": "string", "description": "Initial web URL or search text for web panels."},
                     "search": {"type": "string", "description": "Search text for web panels."},
                     "name": {"type": "string", "description": "Optional board name for PCB create flows."},
-                    "boardPath": {"type": "string", "description": "Repo-relative PCB board path to open or switch to, for example hardware/blinky/blinky.board.tsx."},
-                    "boardName": {"type": "string", "description": "Existing PCB board name to open or switch to."},
+                    "board_path": {"type": "string", "description": "Repo-relative PCB board path to open or switch to, for example hardware/blinky/blinky.board.tsx."},
+                    "board_name": {"type": "string", "description": "Existing PCB board name to open or switch to."},
                     "focus": {"type": "boolean", "description": "When true or omitted, show/focus the panel after opening."},
-                    "includeState": {"type": "boolean"}
+                    "include_state": {"type": "boolean"}
                 },
                 "additionalProperties": true
             }
@@ -1722,13 +1679,13 @@ fn app_control_mcp_tools() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspaceId": {"type": "string"},
-                    "workspaceName": {"type": "string"},
-                    "paneId": {"type": "string"},
-                    "panelId": {"type": "string"},
-                    "terminalIndex": {"type": "integer", "minimum": 0},
+                    "workspace_id": {"type": "string"},
+                    "workspace_name": {"type": "string"},
+                    "pane_id": {"type": "string"},
+                    "panel_id": {"type": "string"},
+                    "terminal_index": {"type": "integer", "minimum": 0},
                     "kind": {"type": "string", "description": "docs, web, pcb, or terminal."},
-                    "includeState": {"type": "boolean"}
+                    "include_state": {"type": "boolean"}
                 },
                 "additionalProperties": true
             }
@@ -1739,21 +1696,21 @@ fn app_control_mcp_tools() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspaceId": {"type": "string"},
-                    "workspaceName": {"type": "string"},
-                    "paneId": {"type": "string"},
-                    "panelId": {"type": "string"},
-                    "terminalIndex": {"type": "integer", "minimum": 0},
+                    "workspace_id": {"type": "string"},
+                    "workspace_name": {"type": "string"},
+                    "pane_id": {"type": "string"},
+                    "panel_id": {"type": "string"},
+                    "terminal_index": {"type": "integer", "minimum": 0},
                     "kind": {"type": "string", "description": "docs, web, pcb, or terminal."},
                     "action": {"type": "string", "description": "navigate, search, reload, back, forward, screenshot, create, select, open-board, refresh, focus, open, return, close, or context."},
                     "url": {"type": "string"},
                     "search": {"type": "string"},
                     "query": {"type": "string"},
                     "name": {"type": "string"},
-                    "boardPath": {"type": "string", "description": "Repo-relative PCB board path for select/open-board/switch actions."},
-                    "boardName": {"type": "string", "description": "PCB board name for select/open-board/switch actions."},
+                    "board_path": {"type": "string", "description": "Repo-relative PCB board path for select/open-board/switch actions."},
+                    "board_name": {"type": "string", "description": "PCB board name for select/open-board/switch actions."},
                     "args": {"type": "object", "additionalProperties": true},
-                    "includeState": {"type": "boolean"}
+                    "include_state": {"type": "boolean"}
                 },
                 "required": ["action"],
                 "additionalProperties": true
@@ -1765,10 +1722,10 @@ fn app_control_mcp_tools() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspaceId": {"type": "string"},
-                    "workspaceName": {"type": "string"},
+                    "workspace_id": {"type": "string"},
+                    "workspace_name": {"type": "string"},
                     "verbose": {"type": "boolean", "description": "When true, include root directories, status arrays, idle reasons, and extra terminal details."},
-                    "includeState": {"type": "boolean", "description": "When true, include the broader app-control state. Defaults false to keep live routing token-light."}
+                    "include_state": {"type": "boolean", "description": "When true, include the broader app-control state. Defaults false to keep live routing token-light."}
                 },
                 "additionalProperties": true
             }
@@ -1779,10 +1736,10 @@ fn app_control_mcp_tools() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspaceId": {"type": "string"},
-                    "workspaceName": {"type": "string"},
+                    "workspace_id": {"type": "string"},
+                    "workspace_name": {"type": "string"},
                     "verbose": {"type": "boolean"},
-                    "includeState": {"type": "boolean"}
+                    "include_state": {"type": "boolean"}
                 },
                 "additionalProperties": true
             }
@@ -1793,22 +1750,22 @@ fn app_control_mcp_tools() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspaceId": {"type": "string"},
-                    "workspaceName": {"type": "string"},
+                    "workspace_id": {"type": "string"},
+                    "workspace_name": {"type": "string"},
                     "verbose": {"type": "boolean"},
-                    "includeState": {"type": "boolean"}
+                    "include_state": {"type": "boolean"}
                 },
                 "additionalProperties": true
             }
         }),
         json!({
             "name": "queue_todo",
-            "description": "Queue an immediate todo/prompt into a workspace terminal queue from the terminal orchestrator. Pass workspaceId or workspaceName plus text/prompt/message/body/title/task. Omit terminal selectors for the next available terminal, or pass terminalIndex, paneId, targetTerminalId, targetThreadId, or targetTerminalName for a specific coding-agent terminal. Optional agent/targetAgentId constrains to claude, codex, or opencode; shell terminals are not queueable. By default this activates the workspace so its queue can receive the item; set openWorkspace=false to avoid switching views. For Loopspace graph design, use send_message for future terminal-orchestrator messages and dispatch_todos for future queued workspace todo dispatches instead of queue_todo/send_todo.",
+            "description": "Queue an immediate todo/prompt into a workspace terminal queue from the terminal orchestrator. Pass workspace_id or workspace_name plus text/prompt/message/body/title/task. Omit terminal selectors for the next available terminal, or pass terminal_index, pane_id, target_terminal_id, target_thread_id, or target_terminal_name for a specific coding-agent terminal. Optional agent/target_agent_id constrains to claude, codex, or opencode; shell terminals are not queueable. By default this activates the workspace so its queue can receive the item; set open_workspace=false to avoid switching views. For Loopspace graph design, use send_message for future terminal-orchestrator messages and dispatch_todos for future queued workspace todo dispatches instead of queue_todo/send_todo.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspaceId": {"type": "string"},
-                    "workspaceName": {"type": "string"},
+                    "workspace_id": {"type": "string"},
+                    "workspace_name": {"type": "string"},
                     "text": {"type": "string"},
                     "prompt": {"type": "string"},
                     "message": {"type": "string"},
@@ -1816,23 +1773,23 @@ fn app_control_mcp_tools() -> Vec<Value> {
                     "title": {"type": "string"},
                     "task": {"type": "string"},
                     "agent": {"type": "string"},
-                    "targetAgentId": {"type": "string"},
-                    "terminalIndex": {"type": "integer", "minimum": 0},
-                    "terminalNumber": {"type": "integer", "minimum": 1},
-                    "paneId": {"type": "string"},
-                    "targetTerminalId": {"type": "string"},
-                    "targetTerminalName": {"type": "string"},
-                    "targetThreadId": {"type": "string"},
+                    "target_agent_id": {"type": "string"},
+                    "terminal_index": {"type": "integer", "minimum": 0},
+                    "terminal_number": {"type": "integer", "minimum": 1},
+                    "pane_id": {"type": "string"},
+                    "target_terminal_id": {"type": "string"},
+                    "target_terminal_name": {"type": "string"},
+                    "target_thread_id": {"type": "string"},
                     "model": {"type": "string"},
-                    "reasoningEffort": {"type": "string"},
+                    "reasoning_effort": {"type": "string"},
                     "speed": {"type": "string"},
-                    "openWorkspace": {"type": "boolean"},
-                    "openTerminals": {"type": "boolean"},
-                    "ensureTerminal": {"type": "boolean"},
-                    "terminalCount": {"type": "integer", "minimum": 1},
-                    "commandId": {"type": "string"},
+                    "open_workspace": {"type": "boolean"},
+                    "open_terminals": {"type": "boolean"},
+                    "ensure_terminal": {"type": "boolean"},
+                    "terminal_count": {"type": "integer", "minimum": 1},
+                    "command_id": {"type": "string"},
                     "verbose": {"type": "boolean", "description": "When true, echo the full queued item and detailed terminal target snapshot. Defaults false."},
-                    "includeState": {"type": "boolean", "description": "When true, include broader app-control state. Defaults false."}
+                    "include_state": {"type": "boolean", "description": "When true, include broader app-control state. Defaults false."}
                 },
                 "additionalProperties": true
             }
@@ -1858,10 +1815,10 @@ fn app_control_mcp_tools() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspaceId": {"type": "string"},
-                    "workspaceName": {"type": "string"},
+                    "workspace_id": {"type": "string"},
+                    "workspace_name": {"type": "string"},
                     "agent": {"type": "string", "description": "claude, codex, opencode, shell, terminal, or generic."},
-                    "agentType": {"type": "string"},
+                    "agent_type": {"type": "string"},
                     "count": {"type": "integer", "minimum": 1},
                     "mode": {"type": "string", "description": "spawn opens count new terminals; ensure ensures count terminals of that agent exist."},
                     "focus": {"type": "boolean", "description": "When true, show the workspace terminals tab and focus the newest opened terminal."}
@@ -1875,18 +1832,18 @@ fn app_control_mcp_tools() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspaceId": {"type": "string"},
-                    "workspaceName": {"type": "string"},
-                    "terminalIndex": {"type": "integer", "minimum": 0},
-                    "terminalIndexes": {"type": "array", "items": {"type": "integer", "minimum": 0}},
-                    "paneId": {"type": "string"},
-                    "paneIds": {"type": "array", "items": {"type": "string"}},
+                    "workspace_id": {"type": "string"},
+                    "workspace_name": {"type": "string"},
+                    "terminal_index": {"type": "integer", "minimum": 0},
+                    "terminal_indexes": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+                    "pane_id": {"type": "string"},
+                    "pane_ids": {"type": "array", "items": {"type": "string"}},
                     "agent": {"type": "string"},
-                    "agentType": {"type": "string"},
+                    "agent_type": {"type": "string"},
                     "count": {"type": "integer", "minimum": 1},
                     "all": {"type": "boolean"},
                     "force": {"type": "boolean", "description": "Close busy terminals too. Without force, busy terminals are skipped."},
-                    "onlyIdle": {"type": "boolean", "description": "Close only terminals that appear idle."}
+                    "only_idle": {"type": "boolean", "description": "Close only terminals that appear idle."}
                 },
                 "additionalProperties": true
             }
@@ -1897,12 +1854,12 @@ fn app_control_mcp_tools() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspaceId": {"type": "string"},
-                    "workspaceName": {"type": "string"},
-                    "terminalIndex": {"type": "integer", "minimum": 0},
-                    "paneId": {"type": "string"},
+                    "workspace_id": {"type": "string"},
+                    "workspace_name": {"type": "string"},
+                    "terminal_index": {"type": "integer", "minimum": 0},
+                    "pane_id": {"type": "string"},
                     "agent": {"type": "string"},
-                    "agentType": {"type": "string"}
+                    "agent_type": {"type": "string"}
                 },
                 "additionalProperties": true
             }

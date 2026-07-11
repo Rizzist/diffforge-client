@@ -31,7 +31,7 @@ export default function PanelAgentPromptActivity({
   const completedVisibleItemKey = useMemo(() => (
     visibleItems
       .filter((item) => item.status === "completed")
-      .map((item) => String(item.itemId || item.id || "").trim())
+      .map((item) => String(item.item_id || item.id || "").trim())
       .filter(Boolean)
       .join("\n")
   ), [visibleItems]);
@@ -75,7 +75,7 @@ export default function PanelAgentPromptActivity({
         return (
           <ActivityRow
             data-status={status}
-            key={item.itemId}
+            key={item.item_id}
             style={{ "--panel-agent-activity-color": item.color || "#8bb8ff" }}
             title={title}
           >
@@ -85,7 +85,7 @@ export default function PanelAgentPromptActivity({
             {status === "completed" && typeof onDismissCompletedItem === "function" ? (
               <ActivityDismissButton
                 aria-label="Dismiss completed prompt"
-                onClick={() => onDismissCompletedItem(item.itemId)}
+                onClick={() => onDismissCompletedItem(item.item_id)}
                 title="Dismiss completed prompt"
                 type="button"
               >

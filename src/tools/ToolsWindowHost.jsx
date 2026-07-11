@@ -73,10 +73,10 @@ function normalizedWindowTheme(value, fallback = "dark") {
 }
 
 function metaIsHtmlDocument(meta) {
-  const kind = text(meta?.documentKind || meta?.document_kind || meta?.source || meta?.kind).toLowerCase();
+  const kind = text(meta?.document_kind || meta?.source || meta?.kind).toLowerCase();
   const extension = text(meta?.extension || meta?.ext).trim().replace(/^\./u, "").toLowerCase();
-  const mimeType = text(meta?.mimeType || meta?.mime_type).toLowerCase();
-  const path = text(meta?.pathKey || meta?.path_key || meta?.documentKey || meta?.document_key).toLowerCase();
+  const mimeType = text(meta?.mime_type).toLowerCase();
+  const path = text(meta?.path_key || meta?.document_key).toLowerCase();
   return kind === "html"
     || extension === "html"
     || extension === "htm"
@@ -87,7 +87,7 @@ function metaIsHtmlDocument(meta) {
 
 function parseToolsWindowParams() {
   if (typeof window === "undefined") {
-    return { key: "", mode: "docs", theme: "dark", title: "Tools", windowId: "" };
+    return { key: "", mode: "docs", theme: "dark", title: "Tools", window_id: "" };
   }
   const hash = window.location.hash || "";
   const queryIndex = hash.indexOf("?");
@@ -97,7 +97,7 @@ function parseToolsWindowParams() {
     mode: normalizedMode(params.get("mode")),
     theme: normalizedWindowTheme(params.get("theme")),
     title: params.get("title") || "Tools",
-    windowId: params.get("windowId") || getCurrentWebviewWindow().label || "",
+    window_id: params.get("window_id") || getCurrentWebviewWindow().label || "",
   };
 }
 
@@ -266,7 +266,7 @@ function pageStyle(scale, script = false) {
 
 function metaMatches(meta, params) {
   if (!meta) return false;
-  if (text(meta.windowId) && text(params.windowId) && text(meta.windowId) !== text(params.windowId)) {
+  if (text(meta.window_id) && text(params.window_id) && text(meta.window_id) !== text(params.window_id)) {
     return false;
   }
   if (normalizedMode(meta.mode) !== params.mode) return false;
@@ -332,7 +332,7 @@ export default function ToolsWindowHost() {
   const agentWorkspaceIdRef = useRef("");
   const agentPromptTargetsRequestIdRef = useRef("");
   agentWorkspaceIdRef.current = agentWorkspaceId;
-  const agentPaneId = `tools-window-${params.windowId || params.key || "popout"}`;
+  const agentPaneId = `tools-window-${params.window_id || params.key || "popout"}`;
 
   useEffect(() => {
     document.documentElement.dataset.toolsWindow = "true";
@@ -358,9 +358,9 @@ export default function ToolsWindowHost() {
     emit(TOOLS_WINDOW_META_REQUEST_EVENT, {
       key: params.key,
       mode: params.mode,
-      windowId: params.windowId,
+      window_id: params.window_id,
     }).catch(() => {});
-  }, [params.key, params.mode, params.windowId]);
+  }, [params.key, params.mode, params.window_id]);
 
   const sendAgentCompanion = useCallback((action) => {
     emit(TOOLS_WINDOW_AGENT_COMPANION_EVENT, {
@@ -368,9 +368,9 @@ export default function ToolsWindowHost() {
       key: params.key,
       mode: params.mode,
       title: localTitle,
-      windowId: params.windowId,
+      window_id: params.window_id,
     }).catch(() => {});
-  }, [localTitle, params.key, params.mode, params.windowId]);
+  }, [localTitle, params.key, params.mode, params.window_id]);
 
   const refreshWindowFrameState = useCallback(async () => {
     try {
@@ -430,9 +430,9 @@ export default function ToolsWindowHost() {
       action: TOOLS_WINDOW_AGENT_COMPANION_CLOSE,
       key: params.key,
       mode: params.mode,
-      windowId: params.windowId,
+      window_id: params.window_id,
     }).catch(() => {});
-  }, [params.key, params.mode, params.windowId]);
+  }, [params.key, params.mode, params.window_id]);
 
   useEffect(() => {
     let disposed = false;
@@ -483,7 +483,7 @@ export default function ToolsWindowHost() {
       emit(TOOLS_WINDOW_CLOSED_EVENT, {
         key: params.key,
         mode: params.mode,
-        windowId: params.windowId,
+        window_id: params.window_id,
       }).catch(() => {});
     };
     window.addEventListener("beforeunload", notifyClosed);
@@ -491,18 +491,18 @@ export default function ToolsWindowHost() {
       window.removeEventListener("beforeunload", notifyClosed);
       notifyClosed();
     };
-  }, [params.key, params.mode, params.windowId]);
+  }, [params.key, params.mode, params.window_id]);
 
   // The owner stamps its workspace id into the meta stream; adopt it so the
   // orchestrator bridge talks to exactly one TerminalView instance.
   useEffect(() => {
-    const metaWorkspaceId = text(meta?.workspaceId || meta?.workspace_id);
+    const metaWorkspaceId = text(meta?.workspace_id);
     if (metaWorkspaceId) {
       setAgentWorkspaceId(metaWorkspaceId);
     }
   }, [meta]);
 
-  const docIdentity = text(meta?.pathKey || meta?.documentKey || meta?.scriptKey || params.key);
+  const docIdentity = text(meta?.path_key || meta?.document_key || meta?.scriptKey || params.key);
   useEffect(() => {
     setDocSelection(null);
   }, [docIdentity]);
@@ -511,22 +511,22 @@ export default function ToolsWindowHost() {
     const requestId = createPanelAgentPromptRequestId("tools-window-targets");
     agentPromptTargetsRequestIdRef.current = requestId;
     emit(PANEL_AGENT_PROMPT_TARGETS_REQUEST_EVENT, {
-      panelKind: "docs",
-      paneId: agentPaneId,
-      requestId,
-      windowId: params.windowId,
-      workspaceId: agentWorkspaceIdRef.current,
+      panel_kind: "docs",
+      pane_id: agentPaneId,
+      request_id: requestId,
+      window_id: params.window_id,
+      workspace_id: agentWorkspaceIdRef.current,
     }).catch(() => {});
-  }, [agentPaneId, params.windowId]);
+  }, [agentPaneId, params.window_id]);
 
   const requestAgentPromptActivity = useCallback(() => {
     emit(PANEL_AGENT_PROMPT_ACTIVITY_REQUEST_EVENT, {
-      panelKind: "docs",
-      paneId: agentPaneId,
-      windowId: params.windowId,
-      workspaceId: agentWorkspaceIdRef.current,
+      panel_kind: "docs",
+      pane_id: agentPaneId,
+      window_id: params.window_id,
+      workspace_id: agentWorkspaceIdRef.current,
     }).catch(() => {});
-  }, [agentPaneId, params.windowId]);
+  }, [agentPaneId, params.window_id]);
 
   useEffect(() => {
     requestAgentPromptTargets();
@@ -543,15 +543,15 @@ export default function ToolsWindowHost() {
         return;
       }
       const payload = event?.payload || {};
-      const requestId = String(payload.requestId || payload.request_id || "").trim();
+      const requestId = String(payload.request_id || "").trim();
       if (requestId && requestId !== agentPromptTargetsRequestIdRef.current) {
         return;
       }
-      const windowId = String(payload.windowId || payload.window_id || "").trim();
-      if (windowId && windowId !== params.windowId) {
+      const windowId = String(payload.window_id || "").trim();
+      if (windowId && windowId !== params.window_id) {
         return;
       }
-      const payloadWorkspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
+      const payloadWorkspaceId = String(payload.workspace_id || "").trim();
       if (agentWorkspaceIdRef.current && payloadWorkspaceId && payloadWorkspaceId !== agentWorkspaceIdRef.current) {
         return;
       }
@@ -560,8 +560,8 @@ export default function ToolsWindowHost() {
       }
       setAgentPromptTargets(normalizePanelAgentPromptTargets(payload.targets));
       setDefaultAgentPromptTargetIds(
-        (Array.isArray(payload.defaultSelectedTargetIds)
-          ? payload.defaultSelectedTargetIds
+        (Array.isArray(payload.default_selected_target_ids)
+          ? payload.default_selected_target_ids
           : Array.isArray(payload.default_selected_target_ids)
             ? payload.default_selected_target_ids
             : []
@@ -580,7 +580,7 @@ export default function ToolsWindowHost() {
       disposed = true;
       unlisten();
     };
-  }, [params.windowId]);
+  }, [params.window_id]);
 
   useEffect(() => {
     let disposed = false;
@@ -590,11 +590,11 @@ export default function ToolsWindowHost() {
         return;
       }
       const payload = event?.payload || {};
-      const paneId = String(payload.paneId || payload.pane_id || payload.panelPaneId || payload.panel_pane_id || "").trim();
+      const paneId = String(payload.pane_id || payload.panel_pane_id || "").trim();
       if (!paneId || paneId !== agentPaneId) {
         return;
       }
-      const workspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
+      const workspaceId = String(payload.workspace_id || "").trim();
       if (workspaceId && agentWorkspaceIdRef.current && workspaceId !== agentWorkspaceIdRef.current) {
         return;
       }
@@ -614,11 +614,11 @@ export default function ToolsWindowHost() {
     };
   }, [agentPaneId]);
 
-  const submitAgentPrompt = useCallback(async ({ targetIds, targetTerminalIndexes, text: promptText }) => {
+  const submitAgentPrompt = useCallback(async ({ target_ids: targetIds, target_terminal_indexes: targetTerminalIndexes, text: promptText }) => {
     const requestId = createPanelAgentPromptRequestId("tools-window-submit");
     const script = params.mode === "scripts";
     const docTitle = text(localTitle, script ? "Script" : "Document");
-    const docPath = text(meta?.subtitle || meta?.pathKey || meta?.documentKey || meta?.scriptKey);
+    const docPath = text(meta?.subtitle || meta?.path_key || meta?.document_key || meta?.scriptKey);
     const docLabel = `${script ? "Script" : "Document"} "${docTitle}"${docPath ? ` (${docPath})` : ""}`;
     const selectionText = String(docSelection?.text || "").trim();
     const excerpt = selectionText.length > 1600
@@ -643,11 +643,11 @@ export default function ToolsWindowHost() {
       }, 15000);
       listen(PANEL_AGENT_PROMPT_RESULT_EVENT, (event) => {
         const payload = event?.payload || {};
-        if (String(payload.requestId || payload.request_id || "").trim() !== requestId) {
+        if (String(payload.request_id || "").trim() !== requestId) {
           return;
         }
-        const windowId = String(payload.windowId || payload.window_id || "").trim();
-        if (windowId && windowId !== params.windowId) {
+        const windowId = String(payload.window_id || "").trim();
+        if (windowId && windowId !== params.window_id) {
           return;
         }
         window.clearTimeout(timeoutId);
@@ -664,14 +664,14 @@ export default function ToolsWindowHost() {
           } else {
             unlisten = nextUnlisten;
             emit(PANEL_AGENT_PROMPT_SUBMIT_EVENT, {
-              panelKind: "docs",
-              paneId: agentPaneId,
-              requestId,
-              targetIds,
-              targetTerminalIndexes,
+              panel_kind: "docs",
+              pane_id: agentPaneId,
+              request_id: requestId,
+              target_ids: targetIds,
+              target_terminal_indexes: targetTerminalIndexes,
               text: finalText,
-              windowId: params.windowId,
-              workspaceId: agentWorkspaceIdRef.current,
+              window_id: params.window_id,
+              workspace_id: agentWorkspaceIdRef.current,
             }).catch((error) => {
               window.clearTimeout(timeoutId);
               cleanup();
@@ -685,7 +685,7 @@ export default function ToolsWindowHost() {
           reject(error);
         });
     });
-  }, [agentPaneId, docSelection, localTitle, meta, params.mode, params.windowId]);
+  }, [agentPaneId, docSelection, localTitle, meta, params.mode, params.window_id]);
 
   const handlePageSelectionChange = useCallback((page, element) => {
     if (!element) {
@@ -738,10 +738,10 @@ export default function ToolsWindowHost() {
       control,
       key: params.key,
       mode: params.mode,
-      windowId: params.windowId,
+      window_id: params.window_id,
       ...extra,
     }).catch(() => {});
-  }, [params.key, params.mode, params.windowId]);
+  }, [params.key, params.mode, params.window_id]);
 
   const updateOwner = useCallback((patch) => {
     lastLocalEditAtRef.current = Date.now();
@@ -824,7 +824,7 @@ export default function ToolsWindowHost() {
   const busy = Boolean(meta?.busy);
   const readOnly = Boolean(meta?.readOnly);
   const title = text(localTitle, isScript ? "Script" : "Document");
-  const subtitle = text(meta?.subtitle || meta?.pathKey || meta?.documentKey || meta?.scriptKey);
+  const subtitle = text(meta?.subtitle || meta?.path_key || meta?.document_key || meta?.scriptKey);
   const zoomLabel = `${Math.round(pageScale * 100)}%`;
 
   return (
@@ -1037,12 +1037,12 @@ export default function ToolsWindowHost() {
             </ToolsWindowAgentDockBody>
             <ToolsWindowAgentComposerSlot>
               <PanelAgentPromptComposer
-                defaultSelectedTargetIds={defaultAgentPromptTargetIds}
+                default_selected_target_ids={defaultAgentPromptTargetIds}
                 onSubmit={submitAgentPrompt}
-                panelKind="docs"
-                panelPaneId={agentPaneId}
+                panel_kind="docs"
+                panel_pane_id={agentPaneId}
                 targets={agentPromptTargets}
-                windowId={params.windowId}
+                window_id={params.window_id}
               />
             </ToolsWindowAgentComposerSlot>
           </ToolsWindowAgentDock>

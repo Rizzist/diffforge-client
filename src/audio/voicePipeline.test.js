@@ -38,7 +38,7 @@ test("parseDictionaryTerms splits pasted text and dedupes case-insensitively", (
 test("legacy phrase entries migrate into one imported list", () => {
   const rules = normalizeVoiceTextRules({
     dictionary: [
-      { phrase: "Tauri", soundsLike: ["towery"] },
+      { phrase: "Tauri", sounds_like: ["towery"] },
       { phrase: "Deepgram" },
       { phrase: "Skipped", enabled: false },
     ],
@@ -100,8 +100,8 @@ test("transforms run in order and support literal replacements", () => {
 test("regex transforms apply and invalid regex rules are skipped", () => {
   const result = applyVoiceTextPipeline("bug 123 and bug 456", {
     transforms: [
-      { match: "bug (\\d+)", replacement: "BUG-$1", isRegex: true },
-      { match: "([", replacement: "x", isRegex: true },
+      { match: "bug (\\d+)", replacement: "BUG-$1", is_regex: true },
+      { match: "([", replacement: "x", is_regex: true },
     ],
   });
 
@@ -171,6 +171,6 @@ test("pipeline reports source text and handles empty rules", () => {
   const result = applyVoiceTextPipeline("hello there", null);
 
   assert.equal(result.text, "hello there");
-  assert.equal(result.sourceText, "hello there");
+  assert.equal(result.source_text, "hello there");
   assert.equal(result.changed, false);
 });

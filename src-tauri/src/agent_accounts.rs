@@ -21,8 +21,8 @@ const AGENT_ACCOUNTS_CHANGED_EVENT: &str = "agent-accounts-changed";
 const AGENT_ACCOUNTS_FILE: &str = "agent-accounts.json";
 const AGENT_ACCOUNTS_PROFILE_DIR: &str = "agent-profiles";
 const AGENT_ACCOUNTS_DEFAULT_PROFILE_ID: &str = "default";
-const AGENT_ACCOUNTS_AUTH_ISSUE_KEY: &str = "authIssue";
-const AGENT_ACCOUNTS_DEFAULT_AUTH_ISSUE_KEY: &str = "defaultAuthIssue";
+const AGENT_ACCOUNTS_AUTH_ISSUE_KEY: &str = "auth_issue";
+const AGENT_ACCOUNTS_DEFAULT_AUTH_ISSUE_KEY: &str = "default_auth_issue";
 const AGENT_ACCOUNTS_AUTH_SCAN_MAX_CHARS: usize = 4096;
 const AGENT_ACCOUNT_PUSH_CHANGED_EVENT: &str = "agent-account-push-changed";
 const AGENT_ACCOUNT_PUSH_KEY_FILE: &str = "agent-account-push-key.json";
@@ -376,13 +376,9 @@ fn agent_account_push_emit(
     message: Option<&str>,
 ) {
     let mut payload = json!({
-        "pushId": push_id,
         "push_id": push_id,
-        "targetDeviceId": target_device_id,
         "target_device_id": target_device_id,
-        "agentKind": agent_kind,
         "agent_kind": agent_kind,
-        "profileId": profile_id,
         "profile_id": profile_id,
         "state": state,
     });
@@ -444,9 +440,9 @@ fn agent_account_push_status_text(event: &Value, keys: &[&str]) -> Option<String
 }
 
 fn agent_account_push_status_push_id(event: &Value) -> Option<String> {
-    agent_account_push_status_text(event, &["push_id", "pushId", "intent_id", "intentId"])
+    agent_account_push_status_text(event, &["push_id", "intent_id"])
         .or_else(|| {
-            cloud_mcp_remote_command_field_text(event, &["command_id", "commandId"]).and_then(
+            cloud_mcp_remote_command_field_text(event, &["command_id"]).and_then(
                 |command_id| {
                     command_id
                         .strip_prefix("agent-account-push-")
@@ -459,11 +455,9 @@ fn agent_account_push_status_push_id(event: &Value) -> Option<String> {
 }
 
 fn agent_account_push_status_reporting_device_id(event: &Value) -> Option<String> {
-    agent_account_push_status_text(event, &["device_id", "deviceId", "machine_id", "machineId"])
+    agent_account_push_status_text(event, &["device_id", "machine_id"])
         .or_else(|| cloud_mcp_payload_text(event, &["device", "device_id"]))
-        .or_else(|| cloud_mcp_payload_text(event, &["device", "deviceId"]))
         .or_else(|| cloud_mcp_payload_text(event, &["payload", "device", "device_id"]))
-        .or_else(|| cloud_mcp_payload_text(event, &["payload", "device", "deviceId"]))
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
@@ -474,7 +468,7 @@ fn agent_account_push_status_matches_pending(
     pending: &AgentAccountPushPending,
 ) -> bool {
     let expected_command_id = format!("agent-account-push-{push_id}");
-    let command_id = cloud_mcp_remote_command_field_text(event, &["command_id", "commandId"])
+    let command_id = cloud_mcp_remote_command_field_text(event, &["command_id"])
         .unwrap_or_default();
     if command_id != expected_command_id {
         return false;
@@ -495,16 +489,14 @@ fn agent_account_push_status_has_valid_completion_proof(
         event,
         &[
             "recipient_proof_b64",
-            "recipientProofB64",
             "ack_proof_b64",
-            "ackProofB64",
         ],
     ) else {
         return false;
     };
     let local_device = cloud_mcp_desktop_device_profile();
     let sender_device_id =
-        cloud_mcp_payload_text(&local_device, &["device_id", "deviceId"]).unwrap_or_default();
+        cloud_mcp_payload_text(&local_device, &["device_id"]).unwrap_or_default();
     let Ok(payload) = agent_account_push_ack_payload(
         push_id,
         &pending.ack_nonce_b64,
@@ -524,14 +516,14 @@ fn agent_account_push_status_has_valid_completion_proof(
 
 fn agent_account_push_handle_remote_status_inner(app: Option<&AppHandle>, event: &Value) -> bool {
     let event_kind =
-        cloud_mcp_payload_text(event, &["event_kind", "eventKind", "kind"]).unwrap_or_default();
+        cloud_mcp_payload_text(event, &["event_kind", "kind"]).unwrap_or_default();
     if !matches!(
         event_kind.as_str(),
         "remote_command_ack" | "remote_command_result"
     ) {
         return false;
     }
-    let command_kind = cloud_mcp_remote_command_field_text(event, &["command_kind", "commandKind"])
+    let command_kind = cloud_mcp_remote_command_field_text(event, &["command_kind"])
         .unwrap_or_default()
         .to_ascii_lowercase()
         .replace(['.', ' ', '-'], "_");
@@ -729,6 +721,70 @@ fn agent_accounts_file_path() -> Option<PathBuf> {
     cloud_mcp_local_data_file_path(AGENT_ACCOUNTS_FILE)
 }
 
+fn agent_accounts_registry_key(key: String, to_runtime: bool) -> String {
+    let mapped = if to_runtime {
+        match key.as_str() {
+            "activeProfileId" => "active_profile_id",
+            "authFileSignature" => "auth_file_signature",
+            "authIssue" => "auth_issue",
+            "capturedSuppressed" => "captured_suppressed",
+            "createdAtMs" => "created_at_ms",
+            "defaultAlias" => "default_alias",
+            "defaultAuthIssue" => "default_auth_issue",
+            "detectedAtMs" => "detected_at_ms",
+            "identityEmail" => "identity_email",
+            "needsLogin" => "needs_login",
+            "pushSenderDeviceId" => "push_sender_device_id",
+            "pushSourceProfileId" => "push_source_profile_id",
+            "showAlias" => "show_alias",
+            "showEmail" => "show_email",
+            _ => return key,
+        }
+    } else {
+        match key.as_str() {
+            "active_profile_id" => "activeProfileId",
+            "auth_file_signature" => "authFileSignature",
+            "auth_issue" => "authIssue",
+            "captured_suppressed" => "capturedSuppressed",
+            "created_at_ms" => "createdAtMs",
+            "default_alias" => "defaultAlias",
+            "default_auth_issue" => "defaultAuthIssue",
+            "detected_at_ms" => "detectedAtMs",
+            "identity_email" => "identityEmail",
+            "needs_login" => "needsLogin",
+            "push_sender_device_id" => "pushSenderDeviceId",
+            "push_source_profile_id" => "pushSourceProfileId",
+            "show_alias" => "showAlias",
+            "show_email" => "showEmail",
+            _ => return key,
+        }
+    };
+    mapped.to_string()
+}
+
+fn agent_accounts_registry_map_keys(value: Value, to_runtime: bool) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| agent_accounts_registry_map_keys(item, to_runtime))
+                .collect(),
+        ),
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .map(|(key, item)| {
+                    (
+                        agent_accounts_registry_key(key, to_runtime),
+                        agent_accounts_registry_map_keys(item, to_runtime),
+                    )
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 fn agent_accounts_supported_kind(kind: &str) -> Option<&'static str> {
     let normalized = kind.trim().to_ascii_lowercase();
     if normalized.contains("claude") {
@@ -783,6 +839,7 @@ fn agent_accounts_registry_read() -> Value {
     agent_accounts_file_path()
         .and_then(|path| fs::read_to_string(path).ok())
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .map(|value| agent_accounts_registry_map_keys(value, true))
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({ "agents": {} }))
 }
@@ -798,6 +855,7 @@ fn agent_accounts_registry_read_checked() -> Result<Value, String> {
         Err(error) => return Err(format!("Unable to read agent accounts registry: {error}")),
     };
     let registry = serde_json::from_str::<Value>(&raw)
+        .map(|value| agent_accounts_registry_map_keys(value, true))
         .map_err(|_| "Agent accounts registry is not valid JSON.".to_string())?;
     if !registry.is_object() {
         return Err("Agent accounts registry root is not an object.".to_string());
@@ -808,7 +866,8 @@ fn agent_accounts_registry_read_checked() -> Result<Value, String> {
 fn agent_accounts_registry_write(registry: &Value) -> Result<(), String> {
     let path = agent_accounts_file_path()
         .ok_or_else(|| "Unable to resolve agent accounts registry path.".to_string())?;
-    let bytes = serde_json::to_vec_pretty(registry)
+    let persisted = agent_accounts_registry_map_keys(registry.clone(), false);
+    let bytes = serde_json::to_vec_pretty(&persisted)
         .map_err(|error| format!("Unable to encode agent accounts registry: {error}"))?;
     agent_accounts_write_private_file_atomic(&path, &bytes, "agent accounts registry")
 }
@@ -816,7 +875,7 @@ fn agent_accounts_registry_write(registry: &Value) -> Result<(), String> {
 fn agent_accounts_kind_entry(registry: &Value, kind: &str) -> (String, Vec<Value>) {
     let entry = registry.get("agents").and_then(|agents| agents.get(kind));
     let active = entry
-        .and_then(|entry| entry.get("activeProfileId"))
+        .and_then(|entry| entry.get("active_profile_id"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -855,7 +914,7 @@ fn agent_accounts_profile_identity(kind: &str, dir: Option<&Path>) -> Value {
                 Some(dir) => dir.join(".claude.json"),
                 None => match env::var_os("HOME").map(PathBuf::from) {
                     Some(home) => home.join(".claude.json"),
-                    None => return json!({ "email": "", "authReady": false }),
+                    None => return json!({ "email": "", "auth_ready": false }),
                 },
             };
             let state = fs::read_to_string(&state_path)
@@ -890,9 +949,9 @@ fn agent_accounts_profile_identity(kind: &str, dir: Option<&Path>) -> Value {
             let auth_ready = !email.is_empty() || credentials_present;
             json!({
                 "email": email,
-                "authReady": auth_ready,
-                "displayName": display_name,
-                "tokenomicsAccountKey": tokenomics_account_key,
+                "auth_ready": auth_ready,
+                "display_name": display_name,
+                "tokenomics_account_key": tokenomics_account_key,
             })
         }
         "opencode" => {
@@ -900,7 +959,7 @@ fn agent_accounts_profile_identity(kind: &str, dir: Option<&Path>) -> Value {
                 Some(dir) => dir.join("auth.json"),
                 None => match agent_accounts_default_home("opencode") {
                     Some(home) => home.join("auth.json"),
-                    None => return json!({ "email": "", "authReady": false }),
+                    None => return json!({ "email": "", "auth_ready": false }),
                 },
             };
             let auth = fs::read_to_string(&auth_path)
@@ -916,14 +975,14 @@ fn agent_accounts_profile_identity(kind: &str, dir: Option<&Path>) -> Value {
                 .as_ref()
                 .and_then(Value::as_object)
                 .is_some_and(|providers| !providers.is_empty());
-            json!({ "email": identity, "authReady": auth_ready })
+            json!({ "email": identity, "auth_ready": auth_ready })
         }
         _ => {
             let auth_path = match dir {
                 Some(dir) => dir.join("auth.json"),
                 None => match agent_accounts_default_home("codex") {
                     Some(home) => home.join("auth.json"),
-                    None => return json!({ "email": "", "authReady": false }),
+                    None => return json!({ "email": "", "auth_ready": false }),
                 },
             };
             let auth = fs::read_to_string(&auth_path)
@@ -933,7 +992,7 @@ fn agent_accounts_profile_identity(kind: &str, dir: Option<&Path>) -> Value {
                 .as_ref()
                 .map(agent_accounts_codex_email_from_auth)
                 .unwrap_or_default();
-            json!({ "email": email, "authReady": auth.is_some() })
+            json!({ "email": email, "auth_ready": auth.is_some() })
         }
     }
 }
@@ -1009,10 +1068,10 @@ fn agent_accounts_profile_view(kind: &str, profile: &Value, active_id: &str) -> 
             .unwrap_or_default();
         if live_email != stored_email {
             identity["email"] = json!("");
-            identity["displayName"] = json!("");
-            identity["tokenomicsAccountKey"] = json!("");
-            identity["authReady"] = json!(false);
-            identity["identityMismatch"] = json!(!live_email.is_empty());
+            identity["display_name"] = json!("");
+            identity["tokenomics_account_key"] = json!("");
+            identity["auth_ready"] = json!(false);
+            identity["identity_mismatch"] = json!(!live_email.is_empty());
         }
     }
     let auth_status = agent_accounts_auth_status(
@@ -1027,16 +1086,16 @@ fn agent_accounts_profile_view(kind: &str, profile: &Value, active_id: &str) -> 
         "label": profile.get("label").and_then(Value::as_str).unwrap_or_default(),
         "email": stored_email,
         "alias": profile.get("alias").and_then(Value::as_str).unwrap_or_default(),
-        "showAlias": profile.get("showAlias").and_then(Value::as_bool).unwrap_or(true),
-        "showEmail": profile.get("showEmail").and_then(Value::as_bool).unwrap_or(true),
+        "show_alias": profile.get("show_alias").and_then(Value::as_bool).unwrap_or(true),
+        "show_email": profile.get("show_email").and_then(Value::as_bool).unwrap_or(true),
         "source": profile.get("source").and_then(Value::as_str).unwrap_or("manual"),
         "dir": dir,
-        "createdAtMs": profile.get("createdAtMs").and_then(Value::as_u64).unwrap_or(0),
+        "created_at_ms": profile.get("created_at_ms").and_then(Value::as_u64).unwrap_or(0),
         "identity": identity,
-        "authStatus": auth_status,
-        "isDefault": false,
-        "isActive": id == active_id,
-        "loginCommand": agent_accounts_login_command(kind, &dir),
+        "auth_status": auth_status,
+        "is_default": false,
+        "is_active": id == active_id,
+        "login_command": agent_accounts_login_command(kind, &dir),
     })
 }
 
@@ -1164,7 +1223,7 @@ fn agent_accounts_default_alias_for_state(
     let explicit = registry
         .get("agents")
         .and_then(|agents| agents.get(kind))
-        .and_then(|entry| entry.get("defaultAlias"))
+        .and_then(|entry| entry.get("default_alias"))
         .and_then(Value::as_str);
     if let Some(explicit) = explicit {
         return explicit.trim().to_string();
@@ -1287,12 +1346,12 @@ fn agent_accounts_kind_state(registry: &Value, kind: &str) -> Value {
         "dir": agent_accounts_default_home(kind)
             .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_default(),
-        "createdAtMs": 0,
+        "created_at_ms": 0,
         "identity": default_identity,
-        "authStatus": default_auth_status,
-        "isDefault": true,
-        "isActive": effective_active_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
-        "loginCommand": "",
+        "auth_status": default_auth_status,
+        "is_default": true,
+        "is_active": effective_active_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+        "login_command": "",
     })];
     for profile in &profiles {
         let Some(id) = agent_accounts_profile_id(profile) else {
@@ -1307,7 +1366,7 @@ fn agent_accounts_kind_state(registry: &Value, kind: &str) -> Value {
             &effective_active_id,
         ));
     }
-    json!({ "activeProfileId": effective_active_id, "profiles": views })
+    json!({ "active_profile_id": effective_active_id, "profiles": views })
 }
 
 fn agent_accounts_kind_auth_statuses(registry: &Value, kind: &str) -> Value {
@@ -1342,7 +1401,7 @@ fn agent_accounts_kind_auth_statuses(registry: &Value, kind: &str) -> Value {
         let identity = dir
             .as_deref()
             .map(|dir| agent_accounts_profile_identity(kind, Some(dir)))
-            .unwrap_or_else(|| json!({ "email": "", "authReady": false }));
+            .unwrap_or_else(|| json!({ "email": "", "auth_ready": false }));
         statuses.insert(
             id.clone(),
             agent_accounts_auth_status(
@@ -1434,14 +1493,14 @@ fn agent_accounts_auth_issue_is_current(
         return false;
     };
     if !issue
-        .get("needsLogin")
+        .get("needs_login")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
         return false;
     }
     let marked_signature = issue
-        .get("authFileSignature")
+        .get("auth_file_signature")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
@@ -1463,7 +1522,7 @@ fn agent_accounts_auth_status(
     issue: Option<&Value>,
 ) -> Value {
     let file_ready = identity
-        .get("authReady")
+        .get("auth_ready")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let issue_current = agent_accounts_auth_issue_is_current(kind, profile_id, profile, issue);
@@ -1489,12 +1548,12 @@ fn agent_accounts_auth_status(
         ""
     };
     json!({
-        "authReady": file_ready && !issue_current,
-        "fileReady": file_ready,
-        "needsLogin": needs_login,
+        "auth_ready": file_ready && !issue_current,
+        "file_ready": file_ready,
+        "needs_login": needs_login,
         "reason": reason,
         "message": message,
-        "detectedAtMs": issue.and_then(|issue| issue.get("detectedAtMs")).and_then(Value::as_u64).unwrap_or(0),
+        "detected_at_ms": issue.and_then(|issue| issue.get("detected_at_ms")).and_then(Value::as_u64).unwrap_or(0),
     })
 }
 
@@ -1583,7 +1642,7 @@ fn agent_accounts_default_profile_for_launch(kind: &'static str) -> Option<Value
         .map(agent_accounts_email_key)
         .unwrap_or_default();
     let auth_ready = identity
-        .get("authReady")
+        .get("auth_ready")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if email.is_empty() || !auth_ready {
@@ -1739,9 +1798,9 @@ pub(crate) fn agent_accounts_apply_spawn_env(
                 pane_id.to_string(),
                 json!({
                     "kind": kind,
-                    "profileId": active_id,
-                    "profileLabel": active_label,
-                    "stampedAtMs": todo_dispatch_now_ms(),
+                    "profile_id": active_id,
+                    "profile_label": active_label,
+                    "stamped_at_ms": todo_dispatch_now_ms(),
                 }),
             );
         }
@@ -1916,7 +1975,7 @@ fn agent_accounts_dedupe_captured_profile_labels(registry: &mut Value, kind: &st
     captured_indices.sort_by_key(|index| {
         (
             profiles[*index]
-                .get("createdAtMs")
+                .get("created_at_ms")
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
             *index,
@@ -2901,7 +2960,7 @@ fn agent_account_push_profile_bundle(
         None => agent_accounts_profile_identity(kind, None),
     };
     let auth_ready = identity
-        .get("authReady")
+        .get("auth_ready")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if !auth_ready {
@@ -3055,19 +3114,13 @@ fn agent_account_push_device_matches_id(device: &Value, target_device_id: &str) 
     }
     let ids = [
         &["device_id"][..],
-        &["deviceId"][..],
         &["machine_id"][..],
-        &["machineId"][..],
         &["id"][..],
         &["native_device_id"][..],
-        &["nativeDeviceId"][..],
         &["target_native_device_id"][..],
-        &["targetNativeDeviceId"][..],
         &["device", "device_id"][..],
-        &["device", "deviceId"][..],
         &["device", "id"][..],
         &["surfaces", "native", "device_id"][..],
-        &["surfaces", "native", "deviceId"][..],
     ];
     ids.iter().any(|path| {
         cloud_mcp_payload_text(device, path)
@@ -3120,7 +3173,6 @@ fn agent_account_push_find_device_candidate(
 fn agent_account_push_device_online(device: &Value) -> bool {
     let native_connected = [
         &["native_connected"][..],
-        &["nativeConnected"][..],
         &["native", "connected"][..],
         &["surfaces", "native", "connected"][..],
     ]
@@ -3133,11 +3185,8 @@ fn agent_account_push_device_online(device: &Value) -> bool {
         device,
         &[
             &["client_type"][..],
-            &["clientType"][..],
             &["client_kind"][..],
-            &["clientKind"][..],
             &["connection_source"][..],
-            &["connectionSource"][..],
         ],
     )
     .map(|value| {
@@ -3151,7 +3200,6 @@ fn agent_account_push_device_online(device: &Value) -> bool {
             &["status"][..],
             &["state"][..],
             &["connection_status"][..],
-            &["connectionStatus"][..],
         ],
     )
     .map(|value| {
@@ -3176,21 +3224,15 @@ fn agent_account_push_target_key(device: &Value) -> Result<(String, String), Str
         device,
         &[
             &["push_public_key"][..],
-            &["pushPublicKey"][..],
             &["device", "push_public_key"][..],
-            &["device", "pushPublicKey"][..],
             &["surfaces", "native", "push_public_key"][..],
-            &["surfaces", "native", "pushPublicKey"][..],
         ],
     )
     .unwrap_or_default();
     let push_capable = [
         &["push_capable"][..],
-        &["pushCapable"][..],
         &["device", "push_capable"][..],
-        &["device", "pushCapable"][..],
         &["surfaces", "native", "push_capable"][..],
-        &["surfaces", "native", "pushCapable"][..],
     ]
     .iter()
     .any(|path| cloud_mcp_payload_bool(device, path, false));
@@ -3204,11 +3246,8 @@ fn agent_account_push_target_key(device: &Value) -> Result<(String, String), Str
         device,
         &[
             &["push_key_algorithm"][..],
-            &["pushKeyAlgorithm"][..],
             &["device", "push_key_algorithm"][..],
-            &["device", "pushKeyAlgorithm"][..],
             &["surfaces", "native", "push_key_algorithm"][..],
-            &["surfaces", "native", "pushKeyAlgorithm"][..],
         ],
     )
     .unwrap_or_default();
@@ -3855,14 +3894,14 @@ fn agent_accounts_materialize_pushed_account(blob: AgentAccountPushBlob) -> Resu
         "email": email,
         "source": "pushed",
         "dir": final_dir.to_string_lossy().to_string(),
-        "pushSenderDeviceId": agent_account_push_normalized_device_id(&blob.sender_device_id),
-        "pushSourceProfileId": blob.source_profile_id,
-        "createdAtMs": todo_dispatch_now_ms(),
+        "push_sender_device_id": agent_account_push_normalized_device_id(&blob.sender_device_id),
+        "push_source_profile_id": blob.source_profile_id,
+        "created_at_ms": todo_dispatch_now_ms(),
     });
     if let Some(profiles) = registry["agents"][kind]["profiles"].as_array_mut() {
         profiles.push(profile);
     }
-    registry["agents"][kind]["activeProfileId"] = json!(profile_id.clone());
+    registry["agents"][kind]["active_profile_id"] = json!(profile_id.clone());
     if let Err(error) = agent_accounts_registry_write(&registry) {
         let _ = fs::remove_dir_all(&final_dir);
         let _ = agent_accounts_registry_write(&original_registry);
@@ -3872,9 +3911,7 @@ fn agent_accounts_materialize_pushed_account(blob: AgentAccountPushBlob) -> Resu
     Ok(json!({
         "ok": true,
         "agent_kind": kind,
-        "agentKind": kind,
         "recipient_proof_b64": recipient_proof_b64,
-        "recipientProofB64": recipient_proof_b64,
     }))
 }
 
@@ -3888,7 +3925,7 @@ fn agent_accounts_add_suppressed_email(registry: &mut Value, kind: &str, email: 
     if !suppressed.iter().any(|entry| entry == &email) {
         suppressed.push(email);
     }
-    registry["agents"][kind]["capturedSuppressed"] = json!(suppressed);
+    registry["agents"][kind]["captured_suppressed"] = json!(suppressed);
 }
 
 fn agent_account_push_default_wipe_paths(kind: &str) -> Vec<PathBuf> {
@@ -4149,7 +4186,7 @@ fn agent_accounts_wipe_pushed_profile_internal(
                 .filter_map(agent_accounts_profile_id)
                 .find(|id| id != profile_id)
                 .unwrap_or_else(|| AGENT_ACCOUNTS_DEFAULT_PROFILE_ID.to_string());
-            registry["agents"][kind]["activeProfileId"] = json!(replacement);
+            registry["agents"][kind]["active_profile_id"] = json!(replacement);
         }
     }
     if wipe_default_home {
@@ -4191,9 +4228,7 @@ fn agent_accounts_wipe_pushed_profile_internal(
     Ok(json!({
         "ok": true,
         "profile_removed": removed_profile.is_some(),
-        "profileRemoved": removed_profile.is_some(),
         "default_home_wiped": wipe_default_home,
-        "defaultHomeWiped": wipe_default_home,
     }))
 }
 
@@ -4201,7 +4236,7 @@ fn agent_accounts_suppressed_emails(registry: &Value, kind: &str) -> Vec<String>
     registry
         .get("agents")
         .and_then(|agents| agents.get(kind))
-        .and_then(|entry| entry.get("capturedSuppressed"))
+        .and_then(|entry| entry.get("captured_suppressed"))
         .and_then(Value::as_array)
         .map(|values| {
             values
@@ -4220,7 +4255,7 @@ fn agent_accounts_ensure_kind_entry(registry: &mut Value, kind: &str) {
     }
     if !registry["agents"].get(kind).is_some_and(Value::is_object) {
         registry["agents"][kind] = json!({
-            "activeProfileId": AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+            "active_profile_id": AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
             "profiles": [],
         });
     }
@@ -4263,7 +4298,7 @@ fn agent_accounts_capture_kind(kind: &'static str) -> bool {
         .map(agent_accounts_email_key)
         .unwrap_or_default();
     let auth_ready = identity
-        .get("authReady")
+        .get("auth_ready")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let _registry_guard = AGENT_ACCOUNTS_REGISTRY_ACTIVITY_LOCK
@@ -4309,7 +4344,7 @@ fn agent_accounts_capture_kind(kind: &'static str) -> bool {
         // while still signed in; once the default home moved on, clear them
         // so a deliberate later login re-pins the account.
         agent_accounts_ensure_kind_entry(&mut registry, kind);
-        registry["agents"][kind]["capturedSuppressed"] = json!([]);
+        registry["agents"][kind]["captured_suppressed"] = json!([]);
         registry_changed = true;
     }
     let (_, profiles) = agent_accounts_kind_entry(&registry, kind);
@@ -4395,7 +4430,7 @@ fn agent_accounts_capture_kind(kind: &'static str) -> bool {
         "email": email,
         "source": "captured",
         "dir": dir.to_string_lossy().to_string(),
-        "createdAtMs": todo_dispatch_now_ms(),
+        "created_at_ms": todo_dispatch_now_ms(),
     });
     if let Some(profiles) = registry["agents"][kind]["profiles"].as_array_mut() {
         profiles.push(profile);
@@ -4684,7 +4719,7 @@ fn agent_accounts_mark_pane_auth_issue(
         return false;
     }
     let profile_id = stamp
-        .get("profileId")
+        .get("profile_id")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -4721,11 +4756,11 @@ fn agent_accounts_mark_pane_auth_issue(
     )
     .unwrap_or_default();
     let issue = json!({
-        "needsLogin": true,
+        "needs_login": true,
         "reason": reason,
         "message": message,
-        "detectedAtMs": todo_dispatch_now_ms(),
-        "authFileSignature": auth_file_signature,
+        "detected_at_ms": todo_dispatch_now_ms(),
+        "auth_file_signature": auth_file_signature,
     });
 
     let mut changed = false;
@@ -4767,8 +4802,8 @@ fn agent_accounts_mark_pane_auth_issue(
             AGENT_ACCOUNTS_CHANGED_EVENT,
             json!({
                 "kind": kind,
-                "profileId": profile_id,
-                "authIssue": true,
+                "profile_id": profile_id,
+                "auth_issue": true,
                 "reason": reason,
             }),
         );
@@ -4910,8 +4945,8 @@ fn agent_accounts_watch_profile_login_completion(
                     AGENT_ACCOUNTS_CHANGED_EVENT,
                     json!({
                         "kind": "claude",
-                        "profileId": profile_id,
-                        "loginCompleted": true,
+                        "profile_id": profile_id,
+                        "login_completed": true,
                         "rebound": false,
                     }),
                 );
@@ -4935,8 +4970,8 @@ fn agent_accounts_watch_profile_login_completion(
                         AGENT_ACCOUNTS_CHANGED_EVENT,
                         json!({
                             "kind": "claude",
-                            "profileId": profile_id,
-                            "loginCompleted": persisted,
+                            "profile_id": profile_id,
+                            "login_completed": persisted,
                             "rebound": persisted && result.registry_changed,
                         }),
                     );
@@ -4958,7 +4993,7 @@ fn agent_accounts_provider_for_kind(kind: &str) -> AgentProvider {
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn agent_accounts_state() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _span = BackendCpuSpan::new("agent_accounts.command.state");
@@ -4975,7 +5010,7 @@ async fn agent_accounts_state() -> Result<Value, String> {
     .map_err(|error| format!("Agent accounts state worker failed: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn agent_accounts_start_profile_login(
     app: AppHandle,
     agent_kind: String,
@@ -4992,9 +5027,9 @@ async fn agent_accounts_start_profile_login(
         agent_accounts_watch_profile_login_completion(app.clone(), kind, profile_id.clone());
         let _ = app.emit(
             AGENT_ACCOUNTS_CHANGED_EVENT,
-            json!({ "kind": kind, "profileId": profile_id, "loginStarted": true }),
+            json!({ "kind": kind, "profile_id": profile_id, "login_started": true }),
         );
-        Ok(json!({ "ok": true, "kind": kind, "profileId": profile_id }))
+        Ok(json!({ "ok": true, "kind": kind, "profile_id": profile_id }))
     })
     .await
     .map_err(|error| format!("Agent account login worker failed: {error}"))?
@@ -5006,7 +5041,7 @@ async fn agent_accounts_start_profile_login(
 /// the default view is synthesized, not a registry profile. Only connected
 /// profiles (a signed-in identity is present) can be customized — the alias
 /// names an account, not an empty dir.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn agent_accounts_update_display(
     app: AppHandle,
     agent_kind: String,
@@ -5033,7 +5068,7 @@ async fn agent_accounts_update_display(
             }
             agent_accounts_ensure_kind_entry(&mut registry, kind);
             if let Some(alias) = alias {
-                registry["agents"][kind]["defaultAlias"] =
+                registry["agents"][kind]["default_alias"] =
                     json!(alias.trim().chars().take(40).collect::<String>());
             }
             agent_accounts_registry_write(&registry)?;
@@ -5065,10 +5100,10 @@ async fn agent_accounts_update_display(
             profile["alias"] = json!(alias.trim().chars().take(40).collect::<String>());
         }
         if let Some(show_alias) = show_alias {
-            profile["showAlias"] = json!(show_alias);
+            profile["show_alias"] = json!(show_alias);
         }
         if let Some(show_email) = show_email {
-            profile["showEmail"] = json!(show_email);
+            profile["show_email"] = json!(show_email);
         }
         agent_accounts_registry_write(&registry)?;
         let _ = app.emit(AGENT_ACCOUNTS_CHANGED_EVENT, json!({ "kind": kind }));
@@ -5078,7 +5113,7 @@ async fn agent_accounts_update_display(
     .map_err(|error| format!("Agent accounts update-display worker failed: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn agent_accounts_set_active(
     app: AppHandle,
     agent_kind: String,
@@ -5111,13 +5146,13 @@ async fn agent_accounts_set_active(
         if !registry["agents"].get(kind).is_some_and(Value::is_object) {
             registry["agents"][kind] = json!({ "profiles": [] });
         }
-        registry["agents"][kind]["activeProfileId"] = json!(active_profile_id);
+        registry["agents"][kind]["active_profile_id"] = json!(active_profile_id);
         agent_accounts_registry_write(&registry)?;
         let _ = app.emit(
             AGENT_ACCOUNTS_CHANGED_EVENT,
-            json!({ "kind": kind, "activeProfileId": active_profile_id }),
+            json!({ "kind": kind, "active_profile_id": active_profile_id }),
         );
-        Ok(json!({ "ok": true, "kind": kind, "activeProfileId": active_profile_id }))
+        Ok(json!({ "ok": true, "kind": kind, "active_profile_id": active_profile_id }))
     })
     .await
     .map_err(|error| format!("Agent accounts set-active worker failed: {error}"))?
@@ -5137,7 +5172,7 @@ fn agent_account_push_validate_wipe_mode(wipe_local_after: bool) -> Result<(), S
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn agent_account_push_to_device(
     app: AppHandle,
     state: State<'_, CloudMcpState>,
@@ -5160,7 +5195,7 @@ async fn agent_account_push_to_device(
     }
     let local_device = cloud_mcp_desktop_device_profile();
     let local_device_id =
-        cloud_mcp_payload_text(&local_device, &["device_id", "deviceId"]).unwrap_or_default();
+        cloud_mcp_payload_text(&local_device, &["device_id"]).unwrap_or_default();
     if local_device_id.trim().is_empty() {
         return Err(
             "Current device identity is unavailable; credential push cancelled.".to_string(),
@@ -5296,9 +5331,7 @@ async fn agent_account_push_to_device(
         &target_device,
         &[
             &["device_name"][..],
-            &["deviceName"][..],
             &["machine_name"][..],
-            &["machineName"][..],
             &["name"][..],
         ],
     )
@@ -5306,38 +5339,23 @@ async fn agent_account_push_to_device(
     let request = json!({
         "kind": "remote_command_requested",
         "event_kind": "remote_command_requested",
-        "eventKind": "remote_command_requested",
         "source": "rust-diffforge-agent-account-push",
-        "command_id": command_id.clone(),
-        "commandId": command_id,
+        "command_id": command_id,
         "command_kind": "agent_account_push",
-        "commandKind": "agent_account_push",
         "intent_id": push_id.clone(),
-        "intentId": push_id.clone(),
         "push_id": push_id.clone(),
-        "pushId": push_id.clone(),
         "agent_kind": kind,
-        "agentKind": kind,
         "provider": kind,
         "target_device_id": target_device_id.clone(),
-        "targetDeviceId": target_device_id.clone(),
-        "target_device_name": target_device_name.clone(),
-        "targetDeviceName": target_device_name,
-        "sealed_blob": sealed_blob.clone(),
-        "sealedBlob": sealed_blob,
-        "sealed_algorithm": sealed_algorithm.clone(),
-        "sealedAlgorithm": sealed_algorithm,
+        "target_device_name": target_device_name,
+        "sealed_blob": sealed_blob,
+        "sealed_algorithm": sealed_algorithm,
         "sender_device": sender_device.clone(),
-        "senderDevice": sender_device.clone(),
         "device": sender_device.clone(),
         "device_id": sender_device["device_id"].clone(),
-        "deviceId": sender_device["device_id"].clone(),
         "device_name": sender_device["device_name"].clone(),
-        "deviceName": sender_device["device_name"].clone(),
         "machine_name": sender_device["machine_name"].clone(),
-        "machineName": sender_device["machine_name"].clone(),
         "wipe_local_after": wipe_local_after,
-        "wipeLocalAfter": wipe_local_after,
         "ts_ms": todo_dispatch_now_ms(),
     });
     if let Err(error) = cloud_mcp_send_remote_command_over_app_ws_once(
@@ -5364,12 +5382,11 @@ async fn agent_account_push_to_device(
 
     Ok(json!({
         "ok": true,
-        "pushId": push_id,
         "push_id": push_id,
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn agent_accounts_remove(
     app: AppHandle,
     agent_kind: String,
@@ -5430,7 +5447,7 @@ async fn agent_accounts_remove(
             if !suppressed.iter().any(|entry| entry == &removed_email) {
                 suppressed.push(removed_email);
             }
-            registry["agents"][kind]["capturedSuppressed"] = json!(suppressed);
+            registry["agents"][kind]["captured_suppressed"] = json!(suppressed);
         }
         agent_accounts_registry_write(&registry)?;
         // Profiles are credential snapshots, so a delete is a real delete —
@@ -5459,7 +5476,7 @@ async fn agent_accounts_remove(
 /// stale-terminal chips ("account switched — restart to use X"). Default
 /// accounts resolve to captured snapshots when possible, so a later default
 /// login change can still mark older panes stale.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn agent_accounts_pane_profiles() -> Result<Value, String> {
     let registry = agent_accounts_registry_read_resolved();
     let panes = AGENT_ACCOUNTS_PANE_PROFILES
@@ -5482,9 +5499,9 @@ async fn agent_accounts_pane_profiles() -> Result<Value, String> {
     Ok(json!({
         "panes": panes,
         "active": {
-            "claude": { "profileId": claude_active, "profileLabel": claude_label },
-            "codex": { "profileId": codex_active, "profileLabel": codex_label },
-            "opencode": { "profileId": opencode_active, "profileLabel": opencode_label },
+            "claude": { "profile_id": claude_active, "profile_label": claude_label },
+            "codex": { "profile_id": codex_active, "profile_label": codex_label },
+            "opencode": { "profile_id": opencode_active, "profile_label": opencode_label },
         },
         "auth": auth,
     }))
@@ -5696,14 +5713,14 @@ mod agent_accounts_tests {
         let mut registry = json!({
             "agents": {
                 "claude": {
-                    "activeProfileId": AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+                    "active_profile_id": AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
                     "profiles": [
                         {
                             "id": "cap-support-splutter",
                             "label": "support",
                             "email": "support@splutter.ai",
                             "source": "captured",
-                            "createdAtMs": 100,
+                            "created_at_ms": 100,
                             "dir": data.join("splutter").to_string_lossy().to_string()
                         },
                         {
@@ -5712,7 +5729,7 @@ mod agent_accounts_tests {
                             "alias": "Work Support",
                             "email": "support@diffforge.ai",
                             "source": "captured",
-                            "createdAtMs": 200,
+                            "created_at_ms": 200,
                             "dir": data.join("diffforge").to_string_lossy().to_string()
                         }
                     ]
@@ -6093,7 +6110,7 @@ mod agent_accounts_tests {
         let view = agent_accounts_profile_view("claude", &captured_profile, "");
         assert_eq!(view["email"].as_str(), Some("support@example.test"));
         assert_eq!(view["identity"]["email"].as_str(), Some(""));
-        assert_eq!(view["identity"]["authReady"].as_bool(), Some(false));
+        assert_eq!(view["identity"]["auth_ready"].as_bool(), Some(false));
 
         fs::write(
             default_claude_home.join(".credentials.json"),
@@ -6441,7 +6458,7 @@ mod agent_accounts_tests {
         let mut registry = json!({
             "agents": {
                 "claude": {
-                    "activeProfileId": AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+                    "active_profile_id": AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
                     "profiles": [{
                         "id": rebound_id,
                         "label": "support",
@@ -6580,7 +6597,7 @@ mod agent_accounts_tests {
         agent_accounts_registry_write(&json!({
             "agents": {
                 "codex": {
-                    "activeProfileId": "cap-admin",
+                    "active_profile_id": "cap-admin",
                     "profiles": [
                         {
                             "id": "cap-admin",
@@ -6611,8 +6628,8 @@ mod agent_accounts_tests {
             .filter_map(|profile| profile["id"].as_str())
             .collect::<Vec<_>>();
         assert_eq!(visible_ids, vec!["default", "cap-admin", "cap-work"]);
-        assert_eq!(profiles[0]["isActive"].as_bool(), Some(false));
-        assert_eq!(profiles[1]["isActive"].as_bool(), Some(true));
+        assert_eq!(profiles[0]["is_active"].as_bool(), Some(false));
+        assert_eq!(profiles[1]["is_active"].as_bool(), Some(true));
         assert_eq!(profiles[0]["alias"].as_str(), Some("Admin"));
         assert!(agent_accounts_duplicate_profile_ids("codex").is_empty());
         let tokenomics_ids = agent_accounts_profiles_for_tokenomics("codex")
@@ -6627,7 +6644,7 @@ mod agent_accounts_tests {
         assert!(!agent_accounts_capture_kind("codex"));
         let registry_after = agent_accounts_registry_read();
         assert_eq!(
-            registry_after["agents"]["codex"]["activeProfileId"].as_str(),
+            registry_after["agents"]["codex"]["active_profile_id"].as_str(),
             Some("cap-admin")
         );
     }
@@ -6676,7 +6693,7 @@ mod agent_accounts_tests {
         agent_accounts_registry_write(&json!({
             "agents": {
                 "codex": {
-                    "activeProfileId": AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+                    "active_profile_id": AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
                     "profiles": [
                         {
                             "id": "cap-device",
@@ -6701,11 +6718,11 @@ mod agent_accounts_tests {
 
         let registry = agent_accounts_registry_read();
         let state = agent_accounts_kind_state(&registry, "codex");
-        assert_eq!(state["activeProfileId"].as_str(), Some("cap-device"));
+        assert_eq!(state["active_profile_id"].as_str(), Some("cap-device"));
         let profiles = state["profiles"].as_array().unwrap();
         let active_ids = profiles
             .iter()
-            .filter(|profile| profile["isActive"].as_bool() == Some(true))
+            .filter(|profile| profile["is_active"].as_bool() == Some(true))
             .filter_map(|profile| profile["id"].as_str())
             .collect::<Vec<_>>();
         assert_eq!(active_ids, vec!["cap-device"]);
@@ -6718,7 +6735,7 @@ mod agent_accounts_tests {
     #[test]
     fn suppressed_emails_read_normalized() {
         let registry = json!({
-            "agents": { "codex": { "capturedSuppressed": [" A@B.com ", "", 7] } }
+            "agents": { "codex": { "captured_suppressed": [" A@B.com ", "", 7] } }
         });
         assert_eq!(
             agent_accounts_suppressed_emails(&registry, "codex"),
@@ -6765,11 +6782,11 @@ mod agent_accounts_tests {
         let signature =
             agent_accounts_auth_signature_for_profile("codex", "cap-dev", Some(&profile)).unwrap();
         profile[AGENT_ACCOUNTS_AUTH_ISSUE_KEY] = json!({
-            "needsLogin": true,
+            "needs_login": true,
             "reason": "refresh_expired",
             "message": "Sign in again.",
-            "detectedAtMs": 1,
-            "authFileSignature": signature,
+            "detected_at_ms": 1,
+            "auth_file_signature": signature,
         });
         let identity = agent_accounts_profile_identity("codex", Some(&profile_dir));
         let status = agent_accounts_auth_status(
@@ -6779,7 +6796,7 @@ mod agent_accounts_tests {
             &identity,
             profile.get(AGENT_ACCOUNTS_AUTH_ISSUE_KEY),
         );
-        assert_eq!(status["needsLogin"].as_bool(), Some(true));
+        assert_eq!(status["needs_login"].as_bool(), Some(true));
 
         fs::write(
             profile_dir.join("auth.json"),
@@ -6791,7 +6808,7 @@ mod agent_accounts_tests {
         let mut registry = json!({
             "agents": {
                 "codex": {
-                    "activeProfileId": "cap-dev",
+                    "active_profile_id": "cap-dev",
                     "profiles": [profile],
                 }
             }
@@ -6820,10 +6837,10 @@ mod agent_accounts_tests {
             "dir": profile_dir.to_string_lossy().to_string(),
         });
         profile[AGENT_ACCOUNTS_AUTH_ISSUE_KEY] = json!({
-            "needsLogin": true,
+            "needs_login": true,
             "reason": "refresh_failed",
             "message": "Sign in again.",
-            "detectedAtMs": 1,
+            "detected_at_ms": 1,
         });
         let identity = agent_accounts_profile_identity("codex", Some(&profile_dir));
         let status = agent_accounts_auth_status(
@@ -6833,7 +6850,7 @@ mod agent_accounts_tests {
             &identity,
             profile.get(AGENT_ACCOUNTS_AUTH_ISSUE_KEY),
         );
-        assert_eq!(status["needsLogin"].as_bool(), Some(true));
+        assert_eq!(status["needs_login"].as_bool(), Some(true));
 
         fs::write(
             profile_dir.join("auth.json"),
@@ -6843,7 +6860,7 @@ mod agent_accounts_tests {
         let mut registry = json!({
             "agents": {
                 "codex": {
-                    "activeProfileId": "cap-dev",
+                    "active_profile_id": "cap-dev",
                     "profiles": [profile],
                 }
             }
@@ -6940,7 +6957,7 @@ mod agent_accounts_tests {
             .lock()
             .unwrap();
         assert_eq!(
-            panes["pane-test-claude"]["profileId"].as_str(),
+            panes["pane-test-claude"]["profile_id"].as_str(),
             expected_profile_id
         );
     }
@@ -7124,7 +7141,7 @@ mod agent_accounts_tests {
         agent_accounts_registry_write(&json!({
             "agents": {
                 "claude": {
-                    "activeProfileId": AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+                    "active_profile_id": AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
                     "profiles": []
                 }
             }
@@ -7140,7 +7157,7 @@ mod agent_accounts_tests {
         )
         .unwrap();
 
-        assert_eq!(result["defaultHomeWiped"].as_bool(), Some(true));
+        assert_eq!(result["default_home_wiped"].as_bool(), Some(true));
         assert!(!claude_home.join(".credentials.json").exists());
         let state =
             serde_json::from_str::<Value>(&fs::read_to_string(home.join(".claude.json")).unwrap())
@@ -7173,7 +7190,7 @@ mod agent_accounts_tests {
         agent_accounts_registry_write(&json!({
             "agents": {
                 "codex": {
-                    "activeProfileId": "cap-escape",
+                    "active_profile_id": "cap-escape",
                     "profiles": [
                         { "id": "cap-escape", "email": "escape@example.com", "source": "pushed", "dir": escaping_registry_dir.to_string_lossy().to_string() }
                     ]
@@ -7219,7 +7236,7 @@ mod agent_accounts_tests {
         agent_accounts_registry_write(&json!({
             "agents": {
                 "codex": {
-                    "activeProfileId": "cap-pushed",
+                    "active_profile_id": "cap-pushed",
                     "profiles": [
                         { "id": "cap-pushed", "email": "pushed@example.com", "source": "pushed", "dir": pushed_dir.to_string_lossy().to_string() }
                     ]
@@ -7290,7 +7307,7 @@ mod agent_accounts_tests {
         let local_public = agent_account_push_decode_public_key(&local_key.public_key_b64).unwrap();
         let local_device = cloud_mcp_desktop_device_profile();
         let local_device_id =
-            cloud_mcp_payload_text(&local_device, &["device_id", "deviceId"]).unwrap();
+            cloud_mcp_payload_text(&local_device, &["device_id"]).unwrap();
         let target_secret = crypto_box::SecretKey::from(agent_account_push_random_32().unwrap());
         let target_public_b64 =
             general_purpose::STANDARD.encode(target_secret.public_key().as_bytes());
@@ -7422,7 +7439,7 @@ mod agent_accounts_tests {
         let local_public = agent_account_push_decode_public_key(&local_key.public_key_b64).unwrap();
         let local_device = cloud_mcp_desktop_device_profile();
         let local_device_id =
-            cloud_mcp_payload_text(&local_device, &["device_id", "deviceId"]).unwrap();
+            cloud_mcp_payload_text(&local_device, &["device_id"]).unwrap();
         let target_secret = crypto_box::SecretKey::from(agent_account_push_random_32().unwrap());
         let target_public_b64 =
             general_purpose::STANDARD.encode(target_secret.public_key().as_bytes());
@@ -7608,7 +7625,6 @@ mod agent_accounts_tests {
         let details = agent_accounts_materialize_pushed_account(blob.clone()).unwrap();
         assert!(details.get("recipient_proof_b64").is_some());
         assert!(details.get("identity_email").is_none());
-        assert!(details.get("identityEmail").is_none());
         assert!(details.get("dir").is_none());
         let final_dir = recipient_data
             .join(AGENT_ACCOUNTS_PROFILE_DIR)
@@ -7763,7 +7779,7 @@ mod agent_accounts_tests {
         agent_accounts_registry_write(&json!({
             "agents": {
                 "codex": {
-                    "activeProfileId": "cap-stale",
+                    "active_profile_id": "cap-stale",
                     "profiles": [{
                         "id": "cap-stale",
                         "email": "account-a@example.com",
@@ -7873,14 +7889,14 @@ mod agent_accounts_tests {
         agent_accounts_registry_write(&json!({
             "agents": {
                 "codex": {
-                    "activeProfileId": "cap-pushed",
+                    "active_profile_id": "cap-pushed",
                     "profiles": [
                         { "id": "cap-pushed", "email": "pushed@example.com", "source": "pushed", "dir": pushed_dir.to_string_lossy().to_string() },
                         { "id": "cap-other", "email": "other@example.com", "source": "captured", "dir": other_codex_dir.to_string_lossy().to_string() }
                     ]
                 },
                 "claude": {
-                    "activeProfileId": "cap-claude",
+                    "active_profile_id": "cap-claude",
                     "profiles": [
                         { "id": "cap-claude", "email": "claude@example.com", "source": "captured", "dir": other_kind_dir.to_string_lossy().to_string() }
                     ]
@@ -7898,13 +7914,13 @@ mod agent_accounts_tests {
         )
         .unwrap();
 
-        assert_eq!(result["profileRemoved"].as_bool(), Some(true));
+        assert_eq!(result["profile_removed"].as_bool(), Some(true));
         assert!(!pushed_dir.exists());
         assert!(other_codex_dir.join("auth.json").is_file());
         assert!(other_kind_dir.join(".credentials.json").is_file());
         let registry = agent_accounts_registry_read();
         assert_eq!(
-            registry["agents"]["codex"]["activeProfileId"].as_str(),
+            registry["agents"]["codex"]["active_profile_id"].as_str(),
             Some("cap-other")
         );
     }
@@ -7933,7 +7949,7 @@ mod agent_accounts_tests {
         agent_accounts_registry_write(&json!({
             "agents": {
                 "codex": {
-                    "activeProfileId": "cap-pushed",
+                    "active_profile_id": "cap-pushed",
                     "profiles": [
                         { "id": "cap-pushed", "email": "pushed@example.com", "source": "pushed", "dir": pushed_dir.to_string_lossy().to_string() }
                     ]
@@ -7951,7 +7967,7 @@ mod agent_accounts_tests {
         )
         .unwrap();
 
-        assert_eq!(result["defaultHomeWiped"].as_bool(), Some(false));
+        assert_eq!(result["default_home_wiped"].as_bool(), Some(false));
         assert!(default_codex_home.join("auth.json").is_file());
         assert_eq!(
             agent_accounts_codex_email_from_auth(
@@ -7993,7 +8009,7 @@ mod agent_accounts_tests {
         agent_accounts_registry_write(&json!({
             "agents": {
                 "codex": {
-                    "activeProfileId": "cap-pushed",
+                    "active_profile_id": "cap-pushed",
                     "profiles": [
                         { "id": "cap-pushed", "email": "pushed@example.com", "source": "pushed", "dir": pushed_dir.to_string_lossy().to_string() },
                         { "id": "cap-other", "email": "other@example.com", "source": "captured", "dir": other_dir.to_string_lossy().to_string() }
@@ -8012,7 +8028,7 @@ mod agent_accounts_tests {
         )
         .unwrap();
 
-        assert_eq!(result["defaultHomeWiped"].as_bool(), Some(true));
+        assert_eq!(result["default_home_wiped"].as_bool(), Some(true));
         assert!(!pushed_dir.exists());
         assert!(!default_codex_home.join("auth.json").exists());
         assert!(default_codex_home.join("config.toml").is_file());
@@ -8048,7 +8064,7 @@ mod agent_accounts_tests {
         agent_accounts_registry_write(&json!({
             "agents": {
                 "codex": {
-                    "activeProfileId": "cap-pushed",
+                    "active_profile_id": "cap-pushed",
                     "profiles": [
                         { "id": "cap-pushed", "email": "pushed@example.com", "source": "pushed", "dir": pushed_dir.to_string_lossy().to_string() }
                     ]

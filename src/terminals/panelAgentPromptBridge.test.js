@@ -25,11 +25,11 @@ test("formatPanelAgentPromptContextNote keeps single web context output unchange
     scroll: { x: 0, y: 30.24 },
     styles: {
       display: "flex",
-      fontSize: "14px",
-      fontWeight: "700",
+      font_size: "14px",
+      font_weight: "700",
       color: "rgb(1, 2, 3)",
-      backgroundColor: "rgb(4, 5, 6)",
-      borderRadius: "6px",
+      background_color: "rgb(4, 5, 6)",
+      border_radius: "6px",
       padding: "8px 10px",
     },
     parent: {
@@ -134,11 +134,11 @@ test("formatPanelAgentPromptContextNote keeps each mixed context visible under c
       scroll: { x: 0, y: 30 },
       styles: {
         display: longText,
-        fontSize: longText,
-        fontWeight: longText,
+        font_size: longText,
+        font_weight: longText,
         color: longText,
-        backgroundColor: longText,
-        borderRadius: longText,
+        background_color: longText,
+        border_radius: longText,
         padding: longText,
       },
       parent: {

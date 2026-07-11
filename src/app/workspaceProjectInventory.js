@@ -56,18 +56,18 @@ export function normalizeWorkspaceProjectEntry(entry) {
     return null;
   }
   const path = cleanWorkspaceProjectPath(
-    entry.path ?? entry.project_path ?? entry.projectPath ?? entry.board_path ?? entry.boardPath,
+    entry.path ?? entry.project_path ?? entry.board_path,
   );
   if (!path) {
     return null;
   }
   const id = cleanWorkspaceProjectText(
-    entry.id ?? entry.project_id ?? entry.projectId ?? entry.board_id ?? entry.boardId,
+    entry.id ?? entry.project_id ?? entry.board_id,
   ) || path;
   const name = cleanWorkspaceProjectText(
-    entry.name ?? entry.project_name ?? entry.projectName ?? entry.title,
+    entry.name ?? entry.project_name ?? entry.title,
   ) || id;
-  const updatedAtMs = Number(entry.updated_at_ms ?? entry.updatedAtMs);
+  const updatedAtMs = Number(entry.updated_at_ms);
   const row = { id, name, path };
   if (Number.isFinite(updatedAtMs) && updatedAtMs > 0) {
     row.updated_at_ms = Math.floor(updatedAtMs);
@@ -115,7 +115,7 @@ export function buildVideoProjectInventory(projects) {
 // Command targets accept project_id | path; path wins, then stable id, then
 // display name (ids and names are equal for both surfaces today, but a
 // renamed video project keeps its slug id).
-export function findWorkspaceProjectMatch(projects, { projectId = "", path = "" } = {}) {
+export function findWorkspaceProjectMatch(projects, { project_id: projectId = "", path = "" } = {}) {
   const items = Array.isArray(projects) ? projects : [];
   const cleanPath = cleanWorkspaceProjectPath(path);
   if (cleanPath) {
@@ -161,7 +161,7 @@ export function workspaceProjectActiveIdFromPath(path, projects = [], kind = "")
 export function validateWorkspaceProjectCommandPayload({
   action = "",
   name = "",
-  projectId = "",
+  project_id: projectId = "",
   path = "",
 } = {}) {
   if (action === "create") {
@@ -196,32 +196,27 @@ export function workspaceProjectCommandRequestedWorkspaceId(event = {}) {
   const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
   const request = event?.request && typeof event.request === "object" ? event.request : {};
   return cleanWorkspaceProjectText(
-    event?.workspace_id
-      || event?.workspaceId
-      || payload.workspace_id
-      || payload.workspaceId
-      || request.workspace_id
-      || request.workspaceId,
+    event?.workspace_id || payload.workspace_id || request.workspace_id,
   );
 }
 
 export function validateWorkspaceProjectCommandWorkspace(event = {}, workspaceResolver = null) {
   const workspaceId = workspaceProjectCommandRequestedWorkspaceId(event);
   if (!workspaceId) {
-    return { ok: false, reason: "workspace_not_found", workspace: null, workspaceId: "" };
+    return { ok: false, reason: "workspace_not_found", workspace: null, workspace_id: "" };
   }
   let workspace = null;
   if (typeof workspaceResolver === "function") {
     workspace = workspaceResolver(workspaceId) || null;
   } else if (Array.isArray(workspaceResolver)) {
     workspace = workspaceResolver.find((candidate) => (
-      cleanWorkspaceProjectText(candidate?.id ?? candidate?.workspace_id ?? candidate?.workspaceId) === workspaceId
+      cleanWorkspaceProjectText(candidate?.id ?? candidate?.workspace_id) === workspaceId
     )) || null;
   }
   if (!workspace) {
-    return { ok: false, reason: "workspace_not_found", workspace: null, workspaceId };
+    return { ok: false, reason: "workspace_not_found", workspace: null, workspace_id: workspaceId };
   }
-  return { ok: true, reason: "", workspace, workspaceId };
+  return { ok: true, reason: "", workspace, workspace_id: workspaceId };
 }
 
 function workspaceProjectRowsEqual(left, right) {

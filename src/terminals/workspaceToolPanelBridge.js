@@ -40,7 +40,7 @@ const workspaceToolPanelStore = {
   activeWorkspaceId: "",
   actuators: {},
   data: EMPTY_DATA,
-  ownerId: "",
+  owner_id: "",
   snapshot: null,
   subscribers: new Set(),
 };
@@ -94,7 +94,7 @@ function setWorkspaceToolPanelSnapshot(nextSnapshot) {
 export function publishWorkspaceToolPanelState(ownerId, data = EMPTY_DATA, actuators = {}) {
   const safeOwnerId = String(ownerId || "").trim();
   const safeData = data && typeof data === "object" && !Array.isArray(data) ? data : EMPTY_DATA;
-  const activeWorkspaceId = String(safeData.workspaceId || safeData.workspace?.id || "").trim();
+  const activeWorkspaceId = String(safeData.workspace_id || safeData.workspace?.id || "").trim();
   if (!safeOwnerId || !activeWorkspaceId) {
     return;
   }
@@ -105,7 +105,7 @@ export function publishWorkspaceToolPanelState(ownerId, data = EMPTY_DATA, actua
     && workspaceToolPanelStore.activeWorkspaceId === activeWorkspaceId
     && workspaceToolPanelStore.data === nextData;
 
-  workspaceToolPanelStore.ownerId = safeOwnerId;
+  workspaceToolPanelStore.owner_id = safeOwnerId;
   workspaceToolPanelStore.activeWorkspaceId = activeWorkspaceId;
   workspaceToolPanelStore.data = nextData;
   workspaceToolPanelStore.actuators = actuators && typeof actuators === "object" ? actuators : {};
@@ -124,10 +124,10 @@ export function publishWorkspaceToolPanelState(ownerId, data = EMPTY_DATA, actua
 
 export function clearWorkspaceToolPanelState(ownerId) {
   const safeOwnerId = String(ownerId || "").trim();
-  if (!safeOwnerId || workspaceToolPanelStore.ownerId !== safeOwnerId) {
+  if (!safeOwnerId || workspaceToolPanelStore.owner_id !== safeOwnerId) {
     return;
   }
-  workspaceToolPanelStore.ownerId = "";
+  workspaceToolPanelStore.owner_id = "";
   workspaceToolPanelStore.activeWorkspaceId = "";
   workspaceToolPanelStore.data = EMPTY_DATA;
   workspaceToolPanelStore.actuators = {};

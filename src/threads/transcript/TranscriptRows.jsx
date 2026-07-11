@@ -228,18 +228,18 @@ export function Collapse({ open, children }) {
 /* ------------------------------------------------------------------ */
 
 function messageRecordRef(message = {}) {
-  const recordId = transcriptText(message.recordId || message.record_id);
-  const seqSource = message.recordSeq ?? message.record_seq;
+  const recordId = transcriptText(message.record_id);
+  const seqSource = message.record_seq;
   const recordSeq = seqSource == null ? null : Number(seqSource);
   return {
-    recordId,
-    recordSeq: Number.isFinite(recordSeq) && recordSeq > 0 ? recordSeq : null,
+    record_id: recordId,
+    record_seq: Number.isFinite(recordSeq) && recordSeq > 0 ? recordSeq : null,
   };
 }
 
 export function TruncatedChip({ message = {}, onFetchTruncated }) {
   const [fetching, setFetching] = useState(false);
-  const { recordId, recordSeq } = messageRecordRef(message);
+  const { record_id: recordId, record_seq: recordSeq } = messageRecordRef(message);
   const interactive = typeof onFetchTruncated === "function" && Boolean(recordId || recordSeq);
   if (!interactive) {
     return <StatusPill data-status="truncated">truncated</StatusPill>;
@@ -281,7 +281,7 @@ export function ArtifactListView({ artifacts = [] }) {
   return (
     <ArtifactList>
       {safeArtifacts.map((artifact, index) => {
-        const key = artifact.assetId || artifact.asset_id || artifact.url || artifact.path || index;
+        const key = artifact.asset_id || artifact.url || artifact.path || index;
         const imageUrl = artifactImageUrl(artifact);
         if (imageUrl) {
           return (
@@ -300,7 +300,7 @@ export function ArtifactListView({ artifacts = [] }) {
         return (
           <ArtifactChip key={key}>
             <strong>{artifact.title || artifact.kind || "Artifact"}</strong>
-            <span>{artifact.path || artifact.assetPath || artifact.asset_path || artifact.url || ""}</span>
+            <span>{artifact.path || artifact.asset_path || artifact.url || ""}</span>
           </ArtifactChip>
         );
       })}
@@ -320,7 +320,7 @@ export function UserMessageRow({ message = {}, onFetchTruncated, onUserMessageAc
   const content = messageContentText(message);
   const truncated = messageTruncated(message);
   const status = transcriptToken(message.status);
-  const timestamp = message.timestamp || message.created_at || message.createdAt;
+  const timestamp = message.timestamp || message.created_at;
   const relative = formatRelative(timestamp);
   const actionable = typeof onUserMessageAction === "function"
     && USER_MESSAGE_ACTIONABLE_STATUSES.has(status)
@@ -420,7 +420,7 @@ export function TerminalOutputRow({ message = {} }) {
         </ToolPaneHeader>
         <ToolPaneScroll>
           <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
-            <AnsiText maxChars={60000} text={content} />
+            <AnsiText max_chars={60000} text={content} />
           </pre>
         </ToolPaneScroll>
       </ToolPane>
@@ -477,7 +477,7 @@ function ToolPaneSection({ label, value }) {
       <ToolPaneScroll>
         {isPlainText ? (
           <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
-            <AnsiText maxChars={60000} text={text} />
+            <AnsiText max_chars={60000} text={text} />
           </pre>
         ) : (
           <pre>{text}</pre>
@@ -587,11 +587,11 @@ function fileChangeRowFiles(row = {}) {
   if (row.turnDiff?.files?.length) {
     return {
       files: transcriptArray(row.turnDiff.files),
-      additions: Math.max(0, Number(row.turnDiff.totalAdditions) || 0),
-      deletions: Math.max(0, Number(row.turnDiff.totalDeletions) || 0),
+      additions: Math.max(0, Number(row.turnDiff.total_additions) || 0),
+      deletions: Math.max(0, Number(row.turnDiff.total_deletions) || 0),
       summary: transcriptText(row.summary || row.message?.title),
       recordTruncated: Boolean(row.turnDiff.truncated),
-      filesOmitted: Math.max(0, Number(row.turnDiff.filesOmitted) || 0),
+      files_omitted: Math.max(0, Number(row.turnDiff.files_omitted) || 0),
     };
   }
   if (row.synthetic) {
@@ -601,7 +601,7 @@ function fileChangeRowFiles(row = {}) {
       deletions: row.deletions || 0,
       summary: row.summary || "",
       recordTruncated: false,
-      filesOmitted: 0,
+      files_omitted: 0,
     };
   }
   const fileChange = row.message ? messageFileChange(row.message) : null;
@@ -618,7 +618,7 @@ function fileChangeRowFiles(row = {}) {
     deletions,
     summary: transcriptText(fileChange?.summary || row.message?.title),
     recordTruncated: false,
-    filesOmitted: 0,
+    files_omitted: 0,
   };
 }
 
@@ -689,12 +689,12 @@ function DiffHunkView({ hunk, language = "" }) {
 export function DiffFileHunks({ file = {} }) {
   const parsed = useMemo(() => parseUnifiedPatch(file.patch || ""), [file.patch]);
   const language = useMemo(
-    () => codeLanguageToken(languageFromPath(file.path || file.oldPath || "")),
-    [file.oldPath, file.path],
+    () => codeLanguageToken(languageFromPath(file.path || file.old_path || "")),
+    [file.old_path, file.path],
   );
   return (
     <>
-      {file.patchTruncated ? <DiffNote>{PATCH_TRUNCATED_NOTE}</DiffNote> : null}
+      {file.patch_truncated ? <DiffNote>{PATCH_TRUNCATED_NOTE}</DiffNote> : null}
       <DiffHunksWrap>
         <ToolPaneHeader as="div">
           <span>{language || "patch"}</span>
@@ -714,8 +714,8 @@ export function DiffFileHunks({ file = {} }) {
 }
 
 function fileDisplayPath(file = {}) {
-  if (file.kind === "rename" && file.oldPath && file.oldPath !== file.path) {
-    return `${file.oldPath} → ${file.path}`;
+  if (file.kind === "rename" && file.old_path && file.old_path !== file.path) {
+    return `${file.old_path} → ${file.path}`;
   }
   return file.path || "";
 }
@@ -763,7 +763,7 @@ export function FileChangeCardRow({
   const [localOpenKeys, setLocalOpenKeys] = useState(() => new Set());
   const isMobile = useIsMobileViewport();
   const {
-    files, additions, deletions, summary, recordTruncated, filesOmitted,
+    files, additions, deletions, summary, recordTruncated, files_omitted: filesOmitted,
   } = fileChangeRowFiles(row);
   // A truncated turn_diff card whose message carries the durable record refs
   // gets the standard fetchable TruncatedChip. When the diff rides an
@@ -776,7 +776,7 @@ export function FileChangeCardRow({
   const truncatedFetchable = Boolean(
     cardMessage
       && messageTruncated(cardMessage)
-      && (cardRecordRef.recordId || cardRecordRef.recordSeq),
+      && (cardRecordRef.record_id || cardRecordRef.record_seq),
   );
   if (!files.length) return null;
 
@@ -850,7 +850,7 @@ export function FileChangeCardRow({
             <DiffFileHunks file={file} />
           </BottomSheet>
         ) : null}
-        {file.patchTruncated && !expandable ? <DiffNote>{PATCH_TRUNCATED_NOTE}</DiffNote> : null}
+        {file.patch_truncated && !expandable ? <DiffNote>{PATCH_TRUNCATED_NOTE}</DiffNote> : null}
       </div>
     );
   };
@@ -996,8 +996,8 @@ export function SubagentGroupRow({
       setLocalToggled((value) => !value);
     }
   };
-  const durationLabel = formatDurationMs(stats.durationMs);
-  const sessionRef = row.sessionRef || null;
+  const durationLabel = formatDurationMs(stats.duration_ms);
+  const sessionRef = row.session_ref || null;
   const openSession = sessionRef && typeof onOpenSession === "function"
     ? (event) => {
       event.stopPropagation();
@@ -1028,7 +1028,7 @@ export function SubagentGroupRow({
             disabled={!openSession}
             onClick={openSession || undefined}
             title={openSession
-              ? (sessionRef.agentChatSessionId || sessionRef.providerSessionId)
+              ? (sessionRef.agent_chat_session_id || sessionRef.provider_session_id)
               : "session outside this view"}
             type="button"
           >
@@ -1108,8 +1108,8 @@ export function FoldHeaderRowView({ row = {}, onToggle }) {
       ) : null}
       {summary?.hasError ? <FoldErrorDot aria-hidden="true" /> : null}
       <FoldSummaryText>{label}</FoldSummaryText>
-      {Number.isFinite(summary?.usage?.costUsd) ? (
-        <em>${summary.usage.costUsd.toFixed(2)}</em>
+      {Number.isFinite(summary?.usage?.cost_usd) ? (
+        <em>${summary.usage.cost_usd.toFixed(2)}</em>
       ) : null}
     </FoldHeaderRow>
   );
@@ -1119,7 +1119,7 @@ export function FoldHeaderRowView({ row = {}, onToggle }) {
 /* Working row                                                         */
 /* ------------------------------------------------------------------ */
 
-export function WorkingRow({ label = "Working", startedAtMs = 0 }) {
+export function WorkingRow({ label = "Working", started_at_ms: startedAtMs = 0 }) {
   const timerRef = useRef(null);
   useEffect(() => {
     if (!startedAtMs) return undefined;
@@ -1190,7 +1190,7 @@ export const TranscriptRowBody = memo(function TranscriptRowBody({ row = {}, liv
     case "divider": {
       const item = row.item || {};
       return (
-        <DividerRow data-divider={transcriptToken(item.dividerKind || item.divider_kind) || "divider"}>
+        <DividerRow data-divider={transcriptToken(item.divider_kind) || "divider"}>
           <span title={item.timestamp ? formatAbsolute(item.timestamp) : undefined}>
             {item.label || "Timeline"}
           </span>

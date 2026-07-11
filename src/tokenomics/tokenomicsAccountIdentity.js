@@ -35,7 +35,7 @@ export function prioritizedTokenomicsIdentityKeyClaims(profiles = []) {
   const normalizeEmail = (value) => String(value || "").trim().toLowerCase();
   return profiles
     .map((profile, registryOrder) => {
-      const key = String(profile?.identity?.tokenomicsAccountKey || "").trim();
+      const key = String(profile?.identity?.tokenomics_account_key || "").trim();
       const identityEmail = normalizeEmail(profile?.identity?.email);
       if (!key || !identityEmail) return null;
       const profileEmail = normalizeEmail(profile?.email || profile?.identity?.email);

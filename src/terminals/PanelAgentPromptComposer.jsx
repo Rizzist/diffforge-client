@@ -59,12 +59,7 @@ function panelAgentColorAlpha(hex, alpha, fallback = "rgba(96, 165, 250, 0.18)")
 
 function compactTargetName(option) {
   return String(
-    option?.short
-      || option?.terminalNickname
-      || option?.terminal_nickname
-      || option?.label
-      || option?.name
-      || "",
+    option?.short || option?.terminal_nickname || option?.label || option?.name || "",
   ).trim();
 }
 
@@ -91,7 +86,7 @@ function contextRefLabel(context) {
     // PCB element contexts carry a prebuilt pill label (designator/net).
     return context.label.trim();
   }
-  const element = String(context.element || context.tagName || context.tag_name || "element").trim();
+  const element = String(context.element || context.tag_name || "element").trim();
   const host = (() => {
     try {
       return new URL(context.url || "").host;
@@ -262,16 +257,16 @@ const TARGET_SELECT_STYLES = {
 
 export default function PanelAgentPromptComposer({
   autoFocus = false,
-  contextRefs = [],
-  defaultSelectedTargetIds = [],
+  context_refs: contextRefs = [],
+  default_selected_target_ids: defaultSelectedTargetIds = [],
   onClose = null,
   onClearContext = null,
   onSubmit = null,
   onTargetMenuOpenChange = null,
-  panelKind = "panel",
-  panelPaneId = "",
+  panel_kind: panelKind = "panel",
+  panel_pane_id: panelPaneId = "",
   targets = [],
-  windowId = "",
+  window_id: windowId = "",
 }) {
   const [selectedTargetIds, setSelectedTargetIds] = useState(() => (
     normalizeSelectedTargetIds(targets, defaultSelectedTargetIds)
@@ -305,7 +300,7 @@ export default function PanelAgentPromptComposer({
   );
   const targetOptions = useMemo(() => (
     (Array.isArray(targets) ? targets : []).map((target) => {
-      const fallbackLabel = target.label || `Agent ${target.terminalIndex + 1}`;
+      const fallbackLabel = target.label || `Agent ${target.terminal_index + 1}`;
       const shortLabel = compactTargetName(target);
       return {
         ...target,
@@ -375,15 +370,15 @@ export default function PanelAgentPromptComposer({
     setError("");
     try {
       await onSubmit?.({
-        contextRefs,
-        panelKind,
-        panelPaneId,
-        targetIds,
-        targetTerminalIndexes: targetIds
-          .map((targetId) => targets.find((target) => target.id === targetId)?.terminalIndex)
+        context_refs: contextRefs,
+        panel_kind: panelKind,
+        panel_pane_id: panelPaneId,
+        target_ids: targetIds,
+        target_terminal_indexes: targetIds
+          .map((targetId) => targets.find((target) => target.id === targetId)?.terminal_index)
           .filter((terminalIndex) => Number.isInteger(terminalIndex)),
         text,
-        windowId,
+        window_id: windowId,
       });
       await onClearContext?.();
       setPrompt("");

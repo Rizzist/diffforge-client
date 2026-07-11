@@ -146,7 +146,7 @@ const AnsiPre = styled.pre`
   overflow-wrap: anywhere;
 `;
 
-export function AnsiText({ text = "", maxChars = 0 }) {
+export function AnsiText({ text = "", max_chars: maxChars = 0 }) {
   const segments = useMemo(() => {
     const raw = maxChars > 0 && text.length > maxChars ? text.slice(-maxChars) : text;
     return parseAnsiSegments(raw);

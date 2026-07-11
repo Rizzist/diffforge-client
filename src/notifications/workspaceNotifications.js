@@ -148,7 +148,7 @@ function workspaceNotificationSeenOnArrival(workspaceId, options = {}) {
         || options.terminalSurfaceVisible,
     );
   }
-  return cleanText(options.selectedWorkspaceId) === cleanText(workspaceId);
+  return cleanText(options.selected_workspace_id) === cleanText(workspaceId);
 }
 
 function normalizeNotificationStatus(value, fallback = "unread") {
@@ -176,16 +176,7 @@ function normalizePromptingUserSource(value) {
 function promptingPermissionToken(value = {}) {
   const source = value && typeof value === "object" ? value : {};
   return cleanText(
-    source.approvalId
-      || source.approval_id
-      || source.permissionPromptId
-      || source.permission_prompt_id
-      || source.permissionRequestId
-      || source.permission_request_id
-      || source.sourceEventId
-      || source.source_event_id
-      || source.toolUseId
-      || source.tool_use_id,
+    source.approval_id || source.permission_prompt_id || source.permission_request_id || source.source_event_id || source.tool_use_id,
   );
 }
 
@@ -199,7 +190,7 @@ function promptingSourceLooksExplicitPermission(source) {
 }
 
 function lifecycleEventType(event = {}) {
-  return cleanText(event?.type || event?.eventType || event?.event_type)
+  return cleanText(event?.type || event?.event_type)
     .toLowerCase()
     .replace(/[_\s]+/g, "-");
 }
@@ -215,11 +206,8 @@ function hookManualPromptSourceLooksOwned(source) {
 
 function lifecycleEventHasHookManualPromptSource(event = {}) {
   return [
-    event?.manualPromptSource,
     event?.manual_prompt_source,
-    event?.promptingUserSource,
     event?.prompting_user_source,
-    event?.promptingSource,
     event?.prompting_source,
     event?.source,
   ].some(hookManualPromptSourceLooksOwned);
@@ -227,14 +215,10 @@ function lifecycleEventHasHookManualPromptSource(event = {}) {
 
 function lifecycleEventHasResolvedManualPromptDecision(event = {}) {
   return [
-    event?.permissionDecision,
     event?.permission_decision,
     event?.decision,
-    event?.approvalDecision,
     event?.approval_decision,
-    event?.permissionStatus,
     event?.permission_status,
-    event?.approvalStatus,
     event?.approval_status,
   ].some((value) => RESOLVED_MANUAL_PROMPT_DECISIONS.has(normalizePromptingUserSource(value)));
 }
@@ -250,49 +234,25 @@ function lifecycleEventIsHookManualPrompt(event = {}) {
   }
 
   const hookManualPromptType = HOOK_MANUAL_PROMPT_TYPES.has(type);
-  const active = hookManualPromptType
-    || event?.manualApprovalRequired === true
-    || event?.manual_approval_required === true
-    || event?.providerBlockedForUser === true
-    || event?.provider_blocked_for_user === true
-    || event?.terminalIsPromptingUser === true
-    || event?.terminal_is_prompting_user === true
-    || event?.promptingUser === true
-    || event?.prompting_user === true
-    || event?.requiresUserInput === true
-    || event?.requires_user_input === true;
+  const active = hookManualPromptType || event?.manual_approval_required === true || event?.provider_blocked_for_user === true || event?.terminal_is_prompting_user === true || event?.prompting_user === true || event?.requires_user_input === true;
   if (!active) {
     return false;
   }
 
   const kind = normalizePromptingUserKind(
-    event?.promptingUserKind
-      || event?.prompting_user_kind
-      || event?.promptingKind
-      || event?.prompting_kind,
+    event?.prompting_user_kind || event?.prompting_kind,
   );
   return Boolean(
-    hookManualPromptType
-      || MANUAL_ACCEPTANCE_PROMPT_KINDS.has(kind)
-      || event?.manualApprovalRequired === true
-      || event?.manual_approval_required === true
-      || event?.requiresUserInput === true
-      || event?.requires_user_input === true
-      || event?.providerBlockedForUser === true
-      || event?.provider_blocked_for_user === true
+    hookManualPromptType || MANUAL_ACCEPTANCE_PROMPT_KINDS.has(kind) || event?.manual_approval_required === true || event?.requires_user_input === true || event?.provider_blocked_for_user === true
   );
 }
 
 function notificationLooksExplicitPermissionPrompt(notification = {}) {
   const sourceNotification = notification && typeof notification === "object" ? notification : {};
   const kind = normalizePromptingUserKind(
-    sourceNotification.promptingUserKind || sourceNotification.prompting_user_kind,
+    sourceNotification.prompting_user_kind,
   );
-  const source = sourceNotification.promptingUserSource
-    || sourceNotification.prompting_user_source
-    || sourceNotification.manualPromptSource
-    || sourceNotification.manual_prompt_source
-    || sourceNotification.source;
+  const source = sourceNotification.prompting_user_source || sourceNotification.manual_prompt_source || sourceNotification.source;
   return Boolean(
     hookManualPromptSourceLooksOwned(source)
       && MANUAL_ACCEPTANCE_PROMPT_KINDS.has(kind)
@@ -310,36 +270,36 @@ function normalizeNotification(notification, workspaceId) {
 
   const kind = normalizeNotificationKind(notification.kind);
   const status = normalizeNotificationStatus(notification.status);
-  const createdAt = cleanText(notification.createdAt || notification.created_at, nowIso());
-  const updatedAt = cleanText(notification.updatedAt || notification.updated_at, createdAt);
+  const createdAt = cleanText(notification.created_at, nowIso());
+  const updatedAt = cleanText(notification.updated_at, createdAt);
 
   return {
     actionability: cleanText(notification.actionability, "open_thread"),
-    agentId: cleanText(notification.agentId || notification.agent_id),
-    approvalId: cleanText(notification.approvalId || notification.approval_id),
+    agent_id: cleanText(notification.agent_id),
+    approval_id: cleanText(notification.approval_id),
     body: cleanText(notification.body),
-    createdAt,
-    dbChangeRequestId: cleanText(notification.dbChangeRequestId || notification.db_change_request_id),
-    dedupeKey: cleanText(notification.dedupeKey || notification.dedupe_key, id),
+    created_at: createdAt,
+    db_change_request_id: cleanText(notification.db_change_request_id),
+    dedupe_key: cleanText(notification.dedupe_key, id),
     id,
     kind,
-    paneId: cleanText(notification.paneId || notification.pane_id),
-    pendingAction: Boolean(notification.pendingAction || notification.pending_action),
-    promptingUserConfidence: cleanText(notification.promptingUserConfidence || notification.prompting_user_confidence),
-    promptingUserKind: normalizePromptingUserKind(notification.promptingUserKind || notification.prompting_user_kind),
-    promptingUserSource: cleanText(notification.promptingUserSource || notification.prompting_user_source),
-    seenAt: cleanText(notification.seenAt || notification.seen_at),
-    sessionId: cleanText(notification.sessionId || notification.session_id),
+    pane_id: cleanText(notification.pane_id),
+    pending_action: Boolean(notification.pending_action),
+    prompting_user_confidence: cleanText(notification.prompting_user_confidence),
+    prompting_user_kind: normalizePromptingUserKind(notification.prompting_user_kind),
+    prompting_user_source: cleanText(notification.prompting_user_source),
+    seen_at: cleanText(notification.seen_at),
+    session_id: cleanText(notification.session_id),
     severity: cleanText(notification.severity, "info"),
-    sourceEventId: cleanText(notification.sourceEventId || notification.source_event_id),
-    sourceSeq: notification.sourceSeq ?? notification.seq ?? null,
+    source_event_id: cleanText(notification.source_event_id),
+    source_seq: notification.source_seq ?? notification.seq ?? null,
     status,
-    taskId: cleanText(notification.taskId || notification.task_id),
-    terminalIndex: notification.terminalIndex ?? notification.terminal_index ?? null,
-    threadId: cleanText(notification.threadId || notification.thread_id),
+    task_id: cleanText(notification.task_id),
+    terminal_index: notification.terminal_index ?? null,
+    thread_id: cleanText(notification.thread_id),
     title: cleanText(notification.title, notificationTitleForKind(kind)),
-    updatedAt,
-    workspaceId: cleanText(notification.workspaceId || notification.workspace_id, workspaceId),
+    updated_at: updatedAt,
+    workspace_id: cleanText(notification.workspace_id, workspaceId),
   };
 }
 
@@ -350,17 +310,17 @@ function normalizeActiveTurn(value) {
   const id = cleanText(value.id);
   if (!id) return null;
   return {
-    agentId: cleanText(value.agentId),
+    agent_id: cleanText(value.agent_id),
     id,
-    lastActiveAt: cleanText(value.lastActiveAt, nowIso()),
-    nativeSessionId: cleanText(value.nativeSessionId),
-    paneId: cleanText(value.paneId),
-    promptId: cleanText(value.promptId),
-    providerSessionId: cleanText(value.providerSessionId),
-    terminalIndex: value.terminalIndex ?? null,
-    threadId: cleanText(value.threadId),
-    turnId: cleanText(value.turnId),
-    workspaceId: cleanText(value.workspaceId),
+    last_active_at: cleanText(value.last_active_at, nowIso()),
+    native_session_id: cleanText(value.native_session_id),
+    pane_id: cleanText(value.pane_id),
+    prompt_id: cleanText(value.prompt_id),
+    provider_session_id: cleanText(value.provider_session_id),
+    terminal_index: value.terminal_index ?? null,
+    thread_id: cleanText(value.thread_id),
+    turn_id: cleanText(value.turn_id),
+    workspace_id: cleanText(value.workspace_id),
   };
 }
 
@@ -370,7 +330,7 @@ function normalizeWorkspaceBucket(bucket, workspaceId) {
     Object.entries(source.notifications || {})
       .map(([, notification]) => normalizeNotification(notification, workspaceId))
       .filter(Boolean)
-      .sort((left, right) => parseTimestampMs(right.createdAt) - parseTimestampMs(left.createdAt))
+      .sort((left, right) => parseTimestampMs(right.created_at) - parseTimestampMs(left.created_at))
       .slice(0, MAX_NOTIFICATIONS_PER_WORKSPACE)
       .map((notification) => [notification.id, notification]),
   );
@@ -388,7 +348,7 @@ function normalizeWorkspaceBucket(bucket, workspaceId) {
       approval: safeCount(source.lastCueAt?.approval),
       notification: safeCount(source.lastCueAt?.notification),
     },
-    lastSeenAt: cleanText(source.lastSeenAt),
+    last_seen_at: cleanText(source.last_seen_at),
     notifications,
   };
 }
@@ -413,13 +373,66 @@ export function normalizeWorkspaceNotificationState(value) {
   };
 }
 
+const WORKSPACE_NOTIFICATION_PERSISTED_TO_RUNTIME_KEYS = Object.freeze({
+  agentId: "agent_id",
+  approvalId: "approval_id",
+  createdAt: "created_at",
+  dbChangeRequestId: "db_change_request_id",
+  dedupeKey: "dedupe_key",
+  lastActiveAt: "last_active_at",
+  lastSeenAt: "last_seen_at",
+  nativeSessionId: "native_session_id",
+  paneId: "pane_id",
+  pendingAction: "pending_action",
+  promptingUserConfidence: "prompting_user_confidence",
+  promptingUserKind: "prompting_user_kind",
+  promptingUserSource: "prompting_user_source",
+  promptId: "prompt_id",
+  providerSessionId: "provider_session_id",
+  seenAt: "seen_at",
+  sessionId: "session_id",
+  sourceEventId: "source_event_id",
+  sourceSeq: "source_seq",
+  taskId: "task_id",
+  terminalIndex: "terminal_index",
+  threadId: "thread_id",
+  turnId: "turn_id",
+  updatedAt: "updated_at",
+  workspaceId: "workspace_id",
+});
+
+const WORKSPACE_NOTIFICATION_RUNTIME_TO_PERSISTED_KEYS = Object.freeze(
+  Object.fromEntries(
+    Object.entries(WORKSPACE_NOTIFICATION_PERSISTED_TO_RUNTIME_KEYS)
+      .map(([persisted, runtime]) => [runtime, persisted]),
+  ),
+);
+
+function mapWorkspaceNotificationPersistedKeys(value, keyMap) {
+  if (Array.isArray(value)) {
+    return value.map((item) => mapWorkspaceNotificationPersistedKeys(item, keyMap));
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [
+      keyMap[key] || key,
+      mapWorkspaceNotificationPersistedKeys(item, keyMap),
+    ]),
+  );
+}
+
 export function readWorkspaceNotifications() {
   try {
     if (typeof window === "undefined" || !window.localStorage) {
       return normalizeWorkspaceNotificationState(null);
     }
     return normalizeWorkspaceNotificationState(
-      JSON.parse(window.localStorage.getItem(WORKSPACE_NOTIFICATION_STORAGE_KEY) || "{}"),
+      mapWorkspaceNotificationPersistedKeys(
+        JSON.parse(window.localStorage.getItem(WORKSPACE_NOTIFICATION_STORAGE_KEY) || "{}"),
+        WORKSPACE_NOTIFICATION_PERSISTED_TO_RUNTIME_KEYS,
+      ),
     );
   } catch {
     return normalizeWorkspaceNotificationState(null);
@@ -435,15 +448,15 @@ export function persistWorkspaceNotifications(state) {
         workspaceId,
         {
           lastCueAt: bucket.lastCueAt,
-          lastSeenAt: bucket.lastSeenAt,
+          last_seen_at: bucket.last_seen_at,
           notifications: bucket.notifications,
         },
       ]),
     );
-    const serialized = JSON.stringify({
+    const serialized = JSON.stringify(mapWorkspaceNotificationPersistedKeys({
       version: WORKSPACE_NOTIFICATION_VERSION,
       workspaces,
-    });
+    }, WORKSPACE_NOTIFICATION_RUNTIME_TO_PERSISTED_KEYS));
     if (serialized === lastPersistedWorkspaceNotificationsPayload) {
       return;
     }
@@ -492,20 +505,17 @@ export function normalizeWorkspaceNotificationPath(value) {
 }
 
 export function resolveWorkspaceIdForNotificationEvent(event, workspaceRoots = []) {
-  const explicitWorkspaceId = cleanText(event?.workspaceId || event?.workspace_id);
+  const explicitWorkspaceId = cleanText(event?.workspace_id);
   if (explicitWorkspaceId) return explicitWorkspaceId;
 
   const eventPath = normalizeWorkspaceNotificationPath(
-    event?.repoPath
-      || event?.repo_path
-      || event?.payload?.repoPath
-      || event?.payload?.repo_path,
+    event?.repo_path || event?.payload?.repo_path,
   );
   if (!eventPath) return "";
 
   return workspaceRoots.find((entry) => (
-    normalizeWorkspaceNotificationPath(entry?.rootDirectory) === eventPath
-  ))?.workspaceId || "";
+    normalizeWorkspaceNotificationPath(entry?.root_directory) === eventPath
+  ))?.workspace_id || "";
 }
 
 function getWorkspaceBucket(state, workspaceId) {
@@ -545,7 +555,7 @@ function appendCue(state, bucket, workspaceId, kind, options = {}, source = {}) 
     return { bucket, state };
   }
 
-  const sourceTerminalIndex = Number(source.terminalIndex);
+  const sourceTerminalIndex = Number(source.terminal_index);
   return {
     bucket: {
       ...bucket,
@@ -559,14 +569,14 @@ function appendCue(state, bucket, workspaceId, kind, options = {}, source = {}) 
       cues: [
         ...(Array.isArray(state.cues) ? state.cues : []),
         {
-          createdAt: new Date(nowMs).toISOString(),
+          created_at: new Date(nowMs).toISOString(),
           id: `${kind}:${workspaceId}:${nowMs}:${Math.random().toString(16).slice(2)}`,
           kind,
           // Causer attribution: which terminal produced this cue, so cue
           // consumers can reason about the source, not just the workspace.
-          paneId: cleanText(source.paneId),
-          terminalIndex: Number.isInteger(sourceTerminalIndex) ? sourceTerminalIndex : null,
-          workspaceId,
+          pane_id: cleanText(source.pane_id),
+          terminal_index: Number.isInteger(sourceTerminalIndex) ? sourceTerminalIndex : null,
+          workspace_id: workspaceId,
         },
       ].slice(-MAX_CUES),
     },
@@ -593,7 +603,7 @@ function shouldCueNotification(notification, existing, options = {}) {
 }
 
 function notificationRequiresManualAcceptance(notification) {
-  if (!notification?.pendingAction) {
+  if (!notification?.pending_action) {
     return false;
   }
   const kind = normalizeNotificationKind(notification.kind);
@@ -608,7 +618,7 @@ function notificationRequiresManualAcceptance(notification) {
     return false;
   }
   const promptingKind = normalizePromptingUserKind(
-    notification.promptingUserKind || notification.prompting_user_kind,
+    notification.prompting_user_kind,
   );
   return MANUAL_ACCEPTANCE_PROMPT_KINDS.has(promptingKind)
     && notificationLooksExplicitPermissionPrompt(notification);
@@ -619,20 +629,20 @@ function appendNotificationCue(state, bucket, workspaceId, notification, existin
     return { bucket, state };
   }
   return appendCue(state, bucket, workspaceId, notification.kind || "workspace.notification", options, {
-    paneId: notification.paneId,
-    terminalIndex: notification.terminalIndex,
+    pane_id: notification.pane_id,
+    terminal_index: notification.terminal_index,
   });
 }
 
 function eventRefs(event) {
   const refs = event?.refs && typeof event.refs === "object" ? event.refs : {};
   return {
-    agentId: cleanText(refs.agentId || refs.agent_id || event?.agentId || event?.agent_id),
-    artifactId: cleanText(refs.artifactId || refs.artifact_id),
-    contextRunId: cleanText(refs.contextRunId || refs.context_run_id),
-    resourceId: cleanText(refs.resourceId || refs.resource_id),
-    sessionId: cleanText(refs.sessionId || refs.session_id || event?.sessionId || event?.session_id),
-    taskId: cleanText(refs.taskId || refs.task_id || event?.taskId || event?.task_id),
+    agent_id: cleanText(refs.agent_id || event?.agent_id),
+    artifact_id: cleanText(refs.artifact_id),
+    context_run_id: cleanText(refs.context_run_id),
+    resource_id: cleanText(refs.resource_id),
+    session_id: cleanText(refs.session_id || event?.session_id),
+    task_id: cleanText(refs.task_id || event?.task_id),
   };
 }
 
@@ -643,7 +653,7 @@ function eventPayload(event) {
 }
 
 function eventType(event) {
-  return cleanText(event?.eventType || event?.event_type).toLowerCase();
+  return cleanText(event?.event_type).toLowerCase();
 }
 
 function eventKind(event) {
@@ -676,16 +686,13 @@ function eventKind(event) {
 
 function approvalIdFromEvent(event) {
   const payload = eventPayload(event);
-  return cleanText(payload.approval_id || payload.approvalId || event?.approvalId || event?.approval_id);
+  return cleanText(payload.approval_id || event?.approval_id);
 }
 
 function dbChangeRequestIdFromEvent(event) {
   const payload = eventPayload(event);
   return cleanText(
-    payload.db_change_request_id
-      || payload.dbChangeRequestId
-      || event?.dbChangeRequestId
-      || event?.db_change_request_id,
+    payload.db_change_request_id || event?.db_change_request_id,
   );
 }
 
@@ -694,7 +701,7 @@ function notificationIdForCoordinationEvent(kind, event) {
   const approvalId = approvalIdFromEvent(event);
   const dbChangeRequestId = dbChangeRequestIdFromEvent(event);
   const type = eventType(event);
-  const sourceEventId = cleanText(event?.sourceEventId || event?.source_event_id || event?.eventId || event?.id);
+  const sourceEventId = cleanText(event?.source_event_id || event?.event_id || event?.id);
   if (type.startsWith("db_change_") && dbChangeRequestId) {
     return `db-change:${dbChangeRequestId}`;
   }
@@ -703,12 +710,12 @@ function notificationIdForCoordinationEvent(kind, event) {
     if (dbChangeRequestId) return `db-change:${dbChangeRequestId}`;
   }
   if (kind === "task.parked" || kind === "task.resume_ready" || kind === "task.resume.ready") {
-    if (refs.taskId) return `task-wait:${refs.taskId}`;
+    if (refs.task_id) return `task-wait:${refs.task_id}`;
   }
-  if (kind === "tool.failed" && refs.taskId) {
-    return `tool-failed:${refs.taskId}:${sourceEventId || Date.now()}`;
+  if (kind === "tool.failed" && refs.task_id) {
+    return `tool-failed:${refs.task_id}:${sourceEventId || Date.now()}`;
   }
-  return `${kind}:${sourceEventId || refs.taskId || Date.now()}`;
+  return `${kind}:${sourceEventId || refs.task_id || Date.now()}`;
 }
 
 function pendingActionForKind(kind) {
@@ -719,8 +726,8 @@ function buildCoordinationNotification(event, workspaceId, existing, options = {
   const refs = eventRefs(event);
   const payload = eventPayload(event);
   const kind = eventKind(event);
-  const sourceEventId = cleanText(event?.sourceEventId || event?.source_event_id || event?.eventId || event?.id);
-  const createdAt = cleanText(event?.createdAt || event?.created_at, nowIso());
+  const sourceEventId = cleanText(event?.source_event_id || event?.event_id || event?.id);
+  const createdAt = cleanText(event?.created_at, nowIso());
   const seenOnArrival = workspaceNotificationSeenOnArrival(workspaceId, options);
   const passiveStatus = seenOnArrival ? "read" : "unread";
   const pendingAction = pendingActionForKind(kind);
@@ -732,36 +739,36 @@ function buildCoordinationNotification(event, workspaceId, existing, options = {
 
   return {
     actionability: cleanText(event?.actionability, pendingAction ? "approve_deny" : "open_thread"),
-    agentId: refs.agentId,
-    approvalId: approvalIdFromEvent(event) || existing?.approvalId || "",
+    agent_id: refs.agent_id,
+    approval_id: approvalIdFromEvent(event) || existing?.approval_id || "",
     body: cleanText(
       payload.reason
         || payload.risk_summary
         || payload.status
         || existing?.body,
     ),
-    createdAt: existing?.createdAt || createdAt,
-    dbChangeRequestId: dbChangeRequestIdFromEvent(event) || existing?.dbChangeRequestId || "",
-    dedupeKey: notificationIdForCoordinationEvent(kind, event),
+    created_at: existing?.created_at || createdAt,
+    db_change_request_id: dbChangeRequestIdFromEvent(event) || existing?.db_change_request_id || "",
+    dedupe_key: notificationIdForCoordinationEvent(kind, event),
     id: notificationIdForCoordinationEvent(kind, event),
     kind: kind === "approval.resolved" ? existing?.kind || "approval.required" : kind,
-    pendingAction: kind === "approval.resolved" ? false : pendingAction,
-    seenAt: kind === "approval.resolved" ? cleanText(event?.createdAt || event?.created_at, nowIso()) : existing?.seenAt || "",
-    sessionId: refs.sessionId,
+    pending_action: kind === "approval.resolved" ? false : pendingAction,
+    seen_at: kind === "approval.resolved" ? cleanText(event?.created_at, nowIso()) : existing?.seen_at || "",
+    session_id: refs.session_id,
     severity: cleanText(event?.severity, pendingAction ? "action_required" : "info"),
-    sourceEventId,
-    sourceSeq: event?.sourceSeq ?? event?.seq ?? existing?.sourceSeq ?? null,
+    source_event_id: sourceEventId,
+    source_seq: event?.source_seq ?? event?.seq ?? existing?.source_seq ?? null,
     status,
-    taskId: refs.taskId,
-    terminalIndex: event?.terminalIndex ?? event?.terminal_index ?? existing?.terminalIndex ?? null,
+    task_id: refs.task_id,
+    terminal_index: event?.terminal_index ?? existing?.terminal_index ?? null,
     title: notificationTitleForKind(kind),
-    updatedAt: cleanText(event?.createdAt || event?.created_at, nowIso()),
-    workspaceId,
+    updated_at: cleanText(event?.created_at, nowIso()),
+    workspace_id: workspaceId,
   };
 }
 
 export function reduceWorkspaceNotificationEvent(state, rawEvent, options = {}) {
-  const workspaceId = cleanText(rawEvent?.workspaceId || rawEvent?.workspace_id || options.workspaceId);
+  const workspaceId = cleanText(rawEvent?.workspace_id || options.workspace_id);
   if (!workspaceId) {
     return normalizeWorkspaceNotificationState(state);
   }
@@ -792,7 +799,7 @@ function trimWorkspaceNotifications(state, workspaceId) {
 
   const notifications = Object.fromEntries(
     Object.values(bucket.notifications)
-      .sort((left, right) => parseTimestampMs(right.createdAt) - parseTimestampMs(left.createdAt))
+      .sort((left, right) => parseTimestampMs(right.created_at) - parseTimestampMs(left.created_at))
       .slice(0, MAX_NOTIFICATIONS_PER_WORKSPACE)
       .map((notification) => [notification.id, notification]),
   );
@@ -804,18 +811,12 @@ function trimWorkspaceNotifications(state, workspaceId) {
 }
 
 function lifecycleActiveKey(event, workspaceId) {
-  const threadId = cleanText(event?.threadId || event?.thread_id);
-  const terminalIndex = event?.terminalIndex ?? event?.terminal_index ?? "";
-  const paneId = cleanText(event?.paneId || event?.pane_id);
-  const agentId = cleanText(event?.agentId || event?.currentAgent || event?.agent_id, "agent");
+  const threadId = cleanText(event?.thread_id);
+  const terminalIndex = event?.terminal_index ?? "";
+  const paneId = cleanText(event?.pane_id);
+  const agentId = cleanText(event?.agent_id || event?.current_agent, "agent");
   const turnId = cleanText(
-    event?.turnId
-      || event?.turn_id
-      || event?.promptEventId
-      || event?.pendingPromptId
-      || event?.promptId
-      || event?.nativeSessionId
-      || event?.providerSessionId,
+    event?.turn_id || event?.prompt_event_id || event?.pending_prompt_id || event?.prompt_id || event?.native_session_id || event?.provider_session_id,
   );
   const targetId = threadId || paneId || (terminalIndex !== "" ? `terminal-${terminalIndex}` : "");
   if (!targetId) return "";
@@ -826,51 +827,48 @@ function activeTurnFromLifecycle(event, workspaceId) {
   const id = lifecycleActiveKey(event, workspaceId);
   if (!id) return null;
   return {
-    agentId: cleanText(event?.agentId || event?.currentAgent || event?.agent_id),
+    agent_id: cleanText(event?.agent_id || event?.current_agent),
     id,
-    lastActiveAt: cleanText(event?.updatedAt || event?.createdAt, nowIso()),
-    nativeSessionId: cleanText(event?.nativeSessionId),
-    paneId: cleanText(event?.paneId),
-    promptId: cleanText(event?.promptEventId || event?.pendingPromptId || event?.promptId),
-    providerSessionId: cleanText(event?.providerSessionId),
-    terminalIndex: event?.terminalIndex ?? event?.terminal_index ?? null,
-    threadId: cleanText(event?.threadId || event?.thread_id),
-    turnId: cleanText(event?.turnId || event?.turn_id),
-    workspaceId,
+    last_active_at: cleanText(event?.updated_at || event?.created_at, nowIso()),
+    native_session_id: cleanText(event?.native_session_id),
+    pane_id: cleanText(event?.pane_id),
+    prompt_id: cleanText(event?.prompt_event_id || event?.pending_prompt_id || event?.prompt_id),
+    provider_session_id: cleanText(event?.provider_session_id),
+    terminal_index: event?.terminal_index ?? null,
+    thread_id: cleanText(event?.thread_id),
+    turn_id: cleanText(event?.turn_id),
+    workspace_id: workspaceId,
   };
 }
 
 function activeTurnMatchesLifecycle(turn, event) {
-  const threadId = cleanText(event?.threadId || event?.thread_id);
-  const paneId = cleanText(event?.paneId || event?.pane_id);
-  const terminalIndex = event?.terminalIndex ?? event?.terminal_index ?? null;
-  const agentId = cleanText(event?.agentId || event?.currentAgent || event?.agent_id);
+  const threadId = cleanText(event?.thread_id);
+  const paneId = cleanText(event?.pane_id);
+  const terminalIndex = event?.terminal_index ?? null;
+  const agentId = cleanText(event?.agent_id || event?.current_agent);
 
-  if (agentId && turn.agentId && agentId !== turn.agentId) {
+  if (agentId && turn.agent_id && agentId !== turn.agent_id) {
     return false;
   }
-  if (threadId && turn.threadId) {
-    return threadId === turn.threadId;
+  if (threadId && turn.thread_id) {
+    return threadId === turn.thread_id;
   }
-  if (paneId && turn.paneId) {
-    return paneId === turn.paneId;
+  if (paneId && turn.pane_id) {
+    return paneId === turn.pane_id;
   }
-  if (terminalIndex != null && turn.terminalIndex != null) {
-    return String(terminalIndex) === String(turn.terminalIndex);
+  if (terminalIndex != null && turn.terminal_index != null) {
+    return String(terminalIndex) === String(turn.terminal_index);
   }
   return Boolean(threadId || paneId || terminalIndex != null);
 }
 
 function lifecycleTerminalWorkState(event) {
-  return cleanText(event?.terminalWorkState || event?.terminal_work_state).toLowerCase();
+  return cleanText(event?.terminal_work_state).toLowerCase();
 }
 
 function lifecycleTerminalIsComplete(event) {
   const state = lifecycleTerminalWorkState(event);
-  return event?.terminalIsComplete === true
-    || event?.terminal_is_complete === true
-    || state === "complete"
-    || state === "completed";
+  return event?.terminal_is_complete === true || state === "complete" || state === "completed";
 }
 
 function lifecycleTerminalIsPromptingUser(event) {
@@ -891,25 +889,16 @@ function lifecycleResolvesPromptingNotification(event) {
     "provider-turn-interrupted",
     "provider-turn-started",
     "thread-starting",
-  ].includes(type)
-    || event?.terminalIsPromptingUser === false
-    || event?.terminal_is_prompting_user === false
-    || event?.promptingUser === false
-    || event?.requiresUserInput === false
-    || ["complete", "completed", "error", "parked", "running"].includes(state);
+  ].includes(type) || event?.terminal_is_prompting_user === false || event?.prompting_user === false || event?.requires_user_input === false || ["complete", "completed", "error", "parked", "running"].includes(state);
 }
 
 function promptingNotificationId(event, workspaceId) {
-  const threadId = cleanText(event?.threadId || event?.thread_id);
-  const paneId = cleanText(event?.paneId || event?.pane_id);
-  const terminalIndex = event?.terminalIndex ?? event?.terminal_index ?? "";
-  const agentId = cleanText(event?.agentId || event?.currentAgent || event?.agent_id, "agent");
+  const threadId = cleanText(event?.thread_id);
+  const paneId = cleanText(event?.pane_id);
+  const terminalIndex = event?.terminal_index ?? "";
+  const agentId = cleanText(event?.agent_id || event?.current_agent, "agent");
   const turnId = cleanText(
-    event?.turnId
-      || event?.turn_id
-      || event?.promptEventId
-      || event?.pendingPromptId
-      || event?.promptId,
+    event?.turn_id || event?.prompt_event_id || event?.pending_prompt_id || event?.prompt_id,
   );
   const targetId = threadId || paneId || (terminalIndex !== "" ? `terminal-${terminalIndex}` : "workspace");
   return `user-input:${workspaceId}:${targetId}:${agentId}:${turnId || "active"}`;
@@ -917,11 +906,11 @@ function promptingNotificationId(event, workspaceId) {
 
 function promptingNotificationBody(event) {
   return cleanText(
-    event?.promptingUserText
-      || event?.promptingText
-      || event?.terminalPrompt
-      || event?.terminalText
-      || event?.outputText
+    event?.prompting_user_text
+      || event?.prompting_text
+      || event?.terminal_prompt
+      || event?.terminal_text
+      || event?.output_text
       || event?.text,
   ).slice(0, 280);
 }
@@ -930,32 +919,23 @@ function buildPromptingNotification(event, workspaceId, existing, options = {}) 
   const createdAt = nowIso();
   const seenOnArrival = workspaceNotificationSeenOnArrival(workspaceId, options);
   const id = promptingNotificationId(event, workspaceId);
-  const sourceText = event?.promptingUserSource
-    || event?.prompting_user_source
-    || event?.promptingSource
-    || event?.prompting_source
-    || event?.source
-    || event?.type;
-  const sourceEventId = promptingPermissionToken(event)
-    || event?.sourceEventId
-    || event?.source_event_id
-    || existing?.sourceEventId
-    || existing?.source_event_id;
+  const sourceText = event?.prompting_user_source || event?.prompting_source || event?.source || event?.type;
+  const sourceEventId = promptingPermissionToken(event) || event?.source_event_id || existing?.source_event_id;
   return {
     actionability: "open_thread",
-    agentId: cleanText(event?.agentId || event?.currentAgent || event?.agent_id),
-    approvalId: cleanText(event?.approvalId || event?.approval_id || existing?.approvalId || existing?.approval_id),
+    agent_id: cleanText(event?.agent_id || event?.current_agent),
+    approval_id: cleanText(event?.approval_id || existing?.approval_id),
     body: promptingNotificationBody(event) || existing?.body || "",
-    createdAt: existing?.createdAt || createdAt,
-    dbChangeRequestId: "",
-    dedupeKey: id,
+    created_at: existing?.created_at || createdAt,
+    db_change_request_id: "",
+    dedupe_key: id,
     id,
     kind: "user.input.required",
-    paneId: cleanText(event?.paneId || event?.pane_id),
-    pendingAction: true,
-    promptingUserConfidence: cleanText(event?.promptingUserConfidence || event?.prompting_user_confidence),
-    promptingUserKind: normalizePromptingUserKind(event?.promptingUserKind || event?.prompting_user_kind),
-    promptingUserSource: cleanText(
+    pane_id: cleanText(event?.pane_id),
+    pending_action: true,
+    prompting_user_confidence: cleanText(event?.prompting_user_confidence),
+    prompting_user_kind: normalizePromptingUserKind(event?.prompting_user_kind),
+    prompting_user_source: cleanText(
       promptingSourceLooksExplicitPermission(sourceText)
         ? sourceText
         : sourceEventId
@@ -963,18 +943,18 @@ function buildPromptingNotification(event, workspaceId, existing, options = {}) 
           : sourceText,
       "permission",
     ),
-    seenAt: seenOnArrival ? createdAt : existing?.seenAt || "",
-    sessionId: cleanText(event?.nativeSessionId || event?.providerSessionId),
+    seen_at: seenOnArrival ? createdAt : existing?.seen_at || "",
+    session_id: cleanText(event?.native_session_id || event?.provider_session_id),
     severity: "action_required",
-    sourceEventId: cleanText(sourceEventId),
-    sourceSeq: event?.sourceSeq ?? event?.seq ?? existing?.sourceSeq ?? null,
+    source_event_id: cleanText(sourceEventId),
+    source_seq: event?.source_seq ?? event?.seq ?? existing?.source_seq ?? null,
     status: (existing?.status === "read" || seenOnArrival) ? "read" : "unread",
-    taskId: "",
-    terminalIndex: event?.terminalIndex ?? event?.terminal_index ?? existing?.terminalIndex ?? null,
-    threadId: cleanText(event?.threadId || event?.thread_id),
+    task_id: "",
+    terminal_index: event?.terminal_index ?? existing?.terminal_index ?? null,
+    thread_id: cleanText(event?.thread_id),
     title: notificationTitleForKind("user.input.required"),
-    updatedAt: createdAt,
-    workspaceId,
+    updated_at: createdAt,
+    workspace_id: workspaceId,
   };
 }
 
@@ -995,10 +975,10 @@ function resolvePromptingNotificationsForLifecycle(bucket, event) {
         changed = true;
         return [id, {
           ...notification,
-          pendingAction: false,
-          seenAt: notification.seenAt || updatedAt,
+          pending_action: false,
+          seen_at: notification.seen_at || updatedAt,
           status: "resolved",
-          updatedAt,
+          updated_at: updatedAt,
         }];
       }
       return [id, notification];
@@ -1012,14 +992,14 @@ function resolvePromptingNotificationsForLifecycle(bucket, event) {
 /// then thread, then terminal index. Used to collapse the terminal.ready /
 /// todo.completed pair a single completion produces.
 function notificationTargetsSameTerminal(left, right) {
-  const leftPane = cleanText(left?.paneId);
-  const rightPane = cleanText(right?.paneId);
+  const leftPane = cleanText(left?.pane_id);
+  const rightPane = cleanText(right?.pane_id);
   if (leftPane && rightPane) return leftPane === rightPane;
-  const leftThread = cleanText(left?.threadId);
-  const rightThread = cleanText(right?.threadId);
+  const leftThread = cleanText(left?.thread_id);
+  const rightThread = cleanText(right?.thread_id);
   if (leftThread && rightThread) return leftThread === rightThread;
-  if (left?.terminalIndex != null && right?.terminalIndex != null) {
-    return String(left.terminalIndex) === String(right.terminalIndex);
+  if (left?.terminal_index != null && right?.terminal_index != null) {
+    return String(left.terminal_index) === String(right.terminal_index);
   }
   return false;
 }
@@ -1030,14 +1010,14 @@ function bucketHasFreshTodoCompletionForTarget(bucket, candidate) {
     notification.kind === "todo.completed"
     && notification.status !== "dismissed"
     && notificationTargetsSameTerminal(notification, candidate)
-    && nowMs - parseTimestampMs(notification.updatedAt || notification.createdAt)
+    && nowMs - parseTimestampMs(notification.updated_at || notification.created_at)
       < TERMINAL_READY_TODO_SUPPRESSION_WINDOW_MS
   ));
 }
 
 function workspacePendingActionCount(bucket) {
   return Object.values(bucket.notifications || {}).filter((notification) => (
-    notification.pendingAction
+    notification.pending_action
     && !["dismissed", "resolved"].includes(notification.status)
   )).length;
 }
@@ -1055,26 +1035,26 @@ function addAllDoneNotification(state, bucket, workspaceId, options = {}) {
   const id = `all-done:${workspaceId}:${Date.now()}`;
   const notification = {
     actionability: "open_thread",
-    agentId: "",
-    approvalId: "",
+    agent_id: "",
+    approval_id: "",
     body: "",
-    createdAt,
-    dbChangeRequestId: "",
-    dedupeKey: id,
+    created_at: createdAt,
+    db_change_request_id: "",
+    dedupe_key: id,
     id,
     kind: "all.done",
-    pendingAction: false,
-    seenAt: seenOnArrival ? createdAt : "",
-    sessionId: "",
+    pending_action: false,
+    seen_at: seenOnArrival ? createdAt : "",
+    session_id: "",
     severity: "success",
-    sourceEventId: "",
-    sourceSeq: null,
+    source_event_id: "",
+    source_seq: null,
     status: seenOnArrival ? "read" : "unread",
-    taskId: "",
-    terminalIndex: null,
+    task_id: "",
+    terminal_index: null,
     title: notificationTitleForKind("all.done"),
-    updatedAt: createdAt,
-    workspaceId,
+    updated_at: createdAt,
+    workspace_id: workspaceId,
   };
   let nextBucket = {
     ...bucket,
@@ -1094,16 +1074,11 @@ function terminalReadyNotificationId(event, workspaceId) {
   if (activeKey) {
     return `terminal-ready:${activeKey}`;
   }
-  const paneId = cleanText(event?.paneId || event?.pane_id);
-  const terminalIndex = event?.terminalIndex ?? event?.terminal_index ?? "";
+  const paneId = cleanText(event?.pane_id);
+  const terminalIndex = event?.terminal_index ?? "";
   const targetId = paneId || (terminalIndex !== "" ? `terminal-${terminalIndex}` : "workspace");
   const sourceEventId = cleanText(
-    event?.sourceEventId
-      || event?.source_event_id
-      || event?.promptEventId
-      || event?.pendingPromptId
-      || event?.promptId
-      || event?.id,
+    event?.source_event_id || event?.prompt_event_id || event?.pending_prompt_id || event?.prompt_id || event?.id,
   );
   return `terminal-ready:${workspaceId}:${targetId}:${sourceEventId || Date.now()}`;
 }
@@ -1114,28 +1089,28 @@ function buildTerminalReadyNotification(event, workspaceId, existing, options = 
   const id = terminalReadyNotificationId(event, workspaceId);
   return {
     actionability: "open_thread",
-    agentId: cleanText(event?.agentId || event?.currentAgent || event?.agent_id),
-    approvalId: "",
+    agent_id: cleanText(event?.agent_id || event?.current_agent),
+    approval_id: "",
     body: "",
-    createdAt: existing?.createdAt || createdAt,
-    dbChangeRequestId: "",
-    dedupeKey: id,
+    created_at: existing?.created_at || createdAt,
+    db_change_request_id: "",
+    dedupe_key: id,
     id,
     kind: TERMINAL_READY_NOTIFICATION_KIND,
-    paneId: cleanText(event?.paneId || event?.pane_id),
-    pendingAction: false,
-    seenAt: seenOnArrival ? createdAt : existing?.seenAt || "",
-    sessionId: cleanText(event?.nativeSessionId || event?.providerSessionId),
+    pane_id: cleanText(event?.pane_id),
+    pending_action: false,
+    seen_at: seenOnArrival ? createdAt : existing?.seen_at || "",
+    session_id: cleanText(event?.native_session_id || event?.provider_session_id),
     severity: "success",
-    sourceEventId: cleanText(event?.sourceEventId || event?.source_event_id),
-    sourceSeq: event?.sourceSeq ?? event?.seq ?? existing?.sourceSeq ?? null,
+    source_event_id: cleanText(event?.source_event_id),
+    source_seq: event?.source_seq ?? event?.seq ?? existing?.source_seq ?? null,
     status: existing?.status === "read" || seenOnArrival ? "read" : "unread",
-    taskId: "",
-    terminalIndex: event?.terminalIndex ?? event?.terminal_index ?? existing?.terminalIndex ?? null,
-    threadId: cleanText(event?.threadId || event?.thread_id),
+    task_id: "",
+    terminal_index: event?.terminal_index ?? existing?.terminal_index ?? null,
+    thread_id: cleanText(event?.thread_id),
     title: notificationTitleForKind(TERMINAL_READY_NOTIFICATION_KIND),
-    updatedAt: createdAt,
-    workspaceId,
+    updated_at: createdAt,
+    workspace_id: workspaceId,
   };
 }
 
@@ -1169,7 +1144,7 @@ function addTerminalReadyNotification(state, bucket, workspaceId, lifecycleEvent
 }
 
 export function reduceThreadLifecycleNotificationEvent(state, lifecycleEvent, options = {}) {
-  const workspaceId = cleanText(lifecycleEvent?.workspaceId || lifecycleEvent?.workspace_id || options.workspaceId);
+  const workspaceId = cleanText(lifecycleEvent?.workspace_id || options.workspace_id);
   if (!workspaceId) {
     return normalizeWorkspaceNotificationState(state);
   }
@@ -1216,7 +1191,7 @@ export function reduceThreadLifecycleNotificationEvent(state, lifecycleEvent, op
       },
     };
   } else if (type === "agent-output") {
-    const activityStatus = cleanText(lifecycleEvent?.activityStatus || lifecycleEvent?.status).toLowerCase();
+    const activityStatus = cleanText(lifecycleEvent?.activity_status || lifecycleEvent?.status).toLowerCase();
     if (activityStatus && activityStatus !== "thinking" && activityStatus !== "running") {
       nextBucket = {
         ...nextBucket,
@@ -1299,32 +1274,32 @@ export function reduceThreadLifecycleNotificationEvent(state, lifecycleEvent, op
 
   if (type === "provider-turn-error" || type === "pending-prompt-error") {
     const createdAt = nowIso();
-    const id = `agent-failed:${workspaceId}:${cleanText(lifecycleEvent.threadId || lifecycleEvent.paneId, Date.now())}`;
+    const id = `agent-failed:${workspaceId}:${cleanText(lifecycleEvent.thread_id || lifecycleEvent.pane_id, Date.now())}`;
     const seenOnArrival = workspaceNotificationSeenOnArrival(workspaceId, options);
     const failedBucket = nextState.workspaces[workspaceId] || nextBucket;
     const existing = failedBucket.notifications?.[id] || null;
     const notification = {
       actionability: "open_thread",
-      agentId: cleanText(lifecycleEvent.agentId || lifecycleEvent.currentAgent),
-      approvalId: "",
+      agent_id: cleanText(lifecycleEvent.agent_id || lifecycleEvent.current_agent),
+      approval_id: "",
       body: cleanText(lifecycleEvent.error),
-      createdAt,
-      dbChangeRequestId: "",
-      dedupeKey: id,
+      created_at: createdAt,
+      db_change_request_id: "",
+      dedupe_key: id,
       id,
       kind: "agent.failed",
-      pendingAction: false,
-      seenAt: seenOnArrival ? createdAt : "",
-      sessionId: cleanText(lifecycleEvent.nativeSessionId || lifecycleEvent.providerSessionId),
+      pending_action: false,
+      seen_at: seenOnArrival ? createdAt : "",
+      session_id: cleanText(lifecycleEvent.native_session_id || lifecycleEvent.provider_session_id),
       severity: "warning",
-      sourceEventId: "",
-      sourceSeq: null,
+      source_event_id: "",
+      source_seq: null,
       status: seenOnArrival ? "read" : "unread",
-      taskId: "",
-      terminalIndex: lifecycleEvent.terminalIndex ?? null,
+      task_id: "",
+      terminal_index: lifecycleEvent.terminal_index ?? null,
       title: notificationTitleForKind("agent.failed"),
-      updatedAt: createdAt,
-      workspaceId,
+      updated_at: createdAt,
+      workspace_id: workspaceId,
     };
     nextState = trimWorkspaceNotifications(setWorkspaceBucket(nextState, workspaceId, {
       ...failedBucket,
@@ -1352,8 +1327,8 @@ export function reduceThreadLifecycleNotificationEvent(state, lifecycleEvent, op
 }
 
 export function reduceTerminalParkedNotificationEvent(state, parkedEvent, options = {}) {
-  const workspaceId = cleanText(parkedEvent?.workspaceId || options.workspaceId);
-  const taskId = cleanText(parkedEvent?.taskId || parkedEvent?.task_id);
+  const workspaceId = cleanText(parkedEvent?.workspace_id || options.workspace_id);
+  const taskId = cleanText(parkedEvent?.task_id);
   if (!workspaceId || !taskId) {
     return normalizeWorkspaceNotificationState(state);
   }
@@ -1366,26 +1341,26 @@ export function reduceTerminalParkedNotificationEvent(state, parkedEvent, option
   const seenOnArrival = workspaceNotificationSeenOnArrival(workspaceId, options);
   const notification = {
     actionability: resolved ? "open_thread" : "resume_task",
-    agentId: "",
-    approvalId: "",
-    body: cleanText(parkedEvent?.reason || parkedEvent?.waitingOn || parkedEvent?.waiting_on),
-    createdAt: existing?.createdAt || createdAt,
-    dbChangeRequestId: "",
-    dedupeKey: id,
+    agent_id: "",
+    approval_id: "",
+    body: cleanText(parkedEvent?.reason || parkedEvent?.waiting_on),
+    created_at: existing?.created_at || createdAt,
+    db_change_request_id: "",
+    dedupe_key: id,
     id,
     kind: "task.parked",
-    pendingAction: false,
-    seenAt: resolved ? createdAt : existing?.seenAt || "",
-    sessionId: "",
+    pending_action: false,
+    seen_at: resolved ? createdAt : existing?.seen_at || "",
+    session_id: "",
     severity: "warning",
-    sourceEventId: "",
-    sourceSeq: null,
+    source_event_id: "",
+    source_seq: null,
     status: resolved ? "resolved" : (existing?.status === "read" || seenOnArrival ? "read" : "unread"),
-    taskId,
-    terminalIndex: null,
+    task_id: taskId,
+    terminal_index: null,
     title: cleanText(parkedEvent?.title, notificationTitleForKind("task.parked")),
-    updatedAt: createdAt,
-    workspaceId,
+    updated_at: createdAt,
+    workspace_id: workspaceId,
   };
   const nextBucket = {
     ...bucket,
@@ -1408,7 +1383,7 @@ export function reduceTerminalParkedNotificationEvent(state, parkedEvent, option
 
 export function reduceTodoCompletedNotificationEvent(state, completionEvent, options = {}) {
   const workspaceId = cleanText(
-    completionEvent?.workspaceId || completionEvent?.workspace_id || options.workspaceId,
+    completionEvent?.workspace_id || options.workspace_id,
   );
   if (!workspaceId) {
     return normalizeWorkspaceNotificationState(state);
@@ -1418,47 +1393,47 @@ export function reduceTodoCompletedNotificationEvent(state, completionEvent, opt
   // A completed turn with no todo identity is a lighter "turn.completed"
   // signal, never the todo celebration: direct CLI prompts used to ring the
   // todo-completed SFX/badge on every turn.
-  const isBareTurnCompletion = !cleanText(completionEvent?.itemId)
-    && cleanText(completionEvent?.completionKind || completionEvent?.completion_kind) === "turn";
+  const isBareTurnCompletion = !cleanText(completionEvent?.item_id)
+    && cleanText(completionEvent?.completion_kind) === "turn";
   const notificationKind = isBareTurnCompletion ? "turn.completed" : "todo.completed";
   // Pane-level attention: the dispatcher stamps whether the finishing pane
   // was actually visible. A completion in a hidden pane of the current
   // workspace must still badge (seen-on-arrival used to swallow it).
-  const paneVisibleHint = completionEvent?.paneVisible ?? completionEvent?.pane_visible;
+  const paneVisibleHint = completionEvent?.pane_visible;
   const seenOnArrival = workspaceNotificationSeenOnArrival(workspaceId, options)
     && paneVisibleHint !== false;
-  const rawTerminalIndex = Number(completionEvent?.terminalIndex ?? completionEvent?.terminal_index);
+  const rawTerminalIndex = Number(completionEvent?.terminal_index);
   // Stable per-completion id: the todo item id, else the turn id (so a hook
   // delivered twice updates one notification instead of minting a second),
   // else the arrival time.
-  const completionKey = cleanText(completionEvent?.itemId)
-    || cleanText(completionEvent?.turnId || completionEvent?.turn_id)
+  const completionKey = cleanText(completionEvent?.item_id)
+    || cleanText(completionEvent?.turn_id)
     || String(Date.now());
   const id = `${isBareTurnCompletion ? "turn-completed" : "todo-completed"}:${workspaceId}:${completionKey}`;
   const notification = {
     actionability: "open_thread",
-    agentId: cleanText(completionEvent?.agentId || completionEvent?.agent_id),
-    approvalId: "",
-    body: cleanText(completionEvent?.todoTitle || completionEvent?.todoText).slice(0, 200),
-    createdAt,
-    dbChangeRequestId: "",
-    dedupeKey: id,
+    agent_id: cleanText(completionEvent?.agent_id),
+    approval_id: "",
+    body: cleanText(completionEvent?.todo_title || completionEvent?.todo_text).slice(0, 200),
+    created_at: createdAt,
+    db_change_request_id: "",
+    dedupe_key: id,
     id,
     kind: notificationKind,
-    paneId: cleanText(completionEvent?.paneId || completionEvent?.pane_id),
-    pendingAction: false,
-    seenAt: seenOnArrival ? createdAt : "",
-    sessionId: "",
+    pane_id: cleanText(completionEvent?.pane_id),
+    pending_action: false,
+    seen_at: seenOnArrival ? createdAt : "",
+    session_id: "",
     severity: "success",
-    sourceEventId: "",
-    sourceSeq: null,
+    source_event_id: "",
+    source_seq: null,
     status: seenOnArrival ? "read" : "unread",
-    taskId: "",
-    terminalIndex: Number.isInteger(rawTerminalIndex) ? rawTerminalIndex : null,
-    threadId: cleanText(completionEvent?.threadId || completionEvent?.thread_id),
+    task_id: "",
+    terminal_index: Number.isInteger(rawTerminalIndex) ? rawTerminalIndex : null,
+    thread_id: cleanText(completionEvent?.thread_id),
     title: notificationTitleForKind(notificationKind),
-    updatedAt: createdAt,
-    workspaceId,
+    updated_at: createdAt,
+    workspace_id: workspaceId,
   };
   // The lifecycle reducer may have already (or may yet — see the suppression
   // in addTerminalReadyNotification) logged a generic terminal.ready for this
@@ -1472,9 +1447,9 @@ export function reduceTodoCompletedNotificationEvent(state, completionEvent, opt
       ) {
         return [existingId, {
           ...existingNotification,
-          seenAt: existingNotification.seenAt || createdAt,
+          seen_at: existingNotification.seen_at || createdAt,
           status: "resolved",
-          updatedAt: createdAt,
+          updated_at: createdAt,
         }];
       }
       return [existingId, existingNotification];
@@ -1502,15 +1477,15 @@ export function reduceTodoCompletedNotificationEvent(state, completionEvent, opt
       nextState,
       nextBucket,
       workspaceId,
-      completionEvent?.queueDrained
+      completionEvent?.queue_drained
         ? "todo.queue.drained"
         : isBareTurnCompletion
           ? "turn.completed"
           : "todo.completed",
       options,
       {
-        paneId: completionEvent?.paneId || completionEvent?.pane_id,
-        terminalIndex: completionEvent?.terminalIndex ?? completionEvent?.terminal_index,
+        pane_id: completionEvent?.pane_id,
+        terminal_index: completionEvent?.terminal_index,
       },
     );
   nextBucket = cueResult.bucket;
@@ -1542,28 +1517,28 @@ export function reconcileWorkspaceNotificationSnapshot(state, workspaceId, snaps
     }
     notifications[id] = {
       actionability: "approve_deny",
-      agentId: cleanText(approval?.requested_by_agent_id || approval?.requestedByAgentId),
-      approvalId,
-      body: cleanText(approval?.reason || approval?.risk_summary || approval?.riskSummary),
-      createdAt: cleanText(approval?.created_at || approval?.createdAt, existing?.createdAt || nowIso()),
-      dbChangeRequestId: existing?.dbChangeRequestId || "",
-      dedupeKey: id,
+      agent_id: cleanText(approval?.requested_by_agent_id),
+      approval_id: approvalId,
+      body: cleanText(approval?.reason || approval?.risk_summary),
+      created_at: cleanText(approval?.created_at, existing?.created_at || nowIso()),
+      db_change_request_id: existing?.db_change_request_id || "",
+      dedupe_key: id,
       id,
       kind: "approval.required",
-      pendingAction: isPending,
-      seenAt: isResolved ? cleanText(approval?.resolved_at || approval?.resolvedAt, existing?.seenAt || nowIso()) : existing?.seenAt || "",
-      sessionId: existing?.sessionId || "",
+      pending_action: isPending,
+      seen_at: isResolved ? cleanText(approval?.resolved_at, existing?.seen_at || nowIso()) : existing?.seen_at || "",
+      session_id: existing?.session_id || "",
       severity: isPending ? "action_required" : "info",
-      sourceEventId: existing?.sourceEventId || "",
-      sourceSeq: existing?.sourceSeq ?? null,
+      source_event_id: existing?.source_event_id || "",
+      source_seq: existing?.source_seq ?? null,
       status: isPending
         ? (existing?.status === "read" || seenOnArrival ? "read" : "unread")
         : "resolved",
-      taskId: cleanText(approval?.task_id || approval?.taskId),
-      terminalIndex: null,
+      task_id: cleanText(approval?.task_id),
+      terminal_index: null,
       title: notificationTitleForKind(isPending ? "approval.required" : "approval.resolved"),
-      updatedAt: cleanText(approval?.resolved_at || approval?.resolvedAt || approval?.created_at || approval?.createdAt, nowIso()),
-      workspaceId: safeWorkspaceId,
+      updated_at: cleanText(approval?.resolved_at || approval?.created_at, nowIso()),
+      workspace_id: safeWorkspaceId,
     };
   });
 
@@ -1571,16 +1546,16 @@ export function reconcileWorkspaceNotificationSnapshot(state, workspaceId, snaps
     Object.entries(notifications).map(([id, notification]) => {
       if (
         notification.kind === "approval.required"
-        && notification.approvalId
-        && !pendingApprovalIds.has(notification.approvalId)
-        && approvals.some((approval) => cleanText(approval?.id) === notification.approvalId)
+        && notification.approval_id
+        && !pendingApprovalIds.has(notification.approval_id)
+        && approvals.some((approval) => cleanText(approval?.id) === notification.approval_id)
       ) {
         return [id, {
           ...notification,
-          pendingAction: false,
-          seenAt: notification.seenAt || nowIso(),
+          pending_action: false,
+          seen_at: notification.seen_at || nowIso(),
           status: "resolved",
-          updatedAt: nowIso(),
+          updated_at: nowIso(),
         }];
       }
       return [id, notification];
@@ -1624,9 +1599,9 @@ export function markWorkspaceNotificationsSeen(state, workspaceId) {
       markedSeen = true;
       return [id, {
         ...notification,
-        seenAt,
+        seen_at: seenAt,
         status: "read",
-        updatedAt: seenAt,
+        updated_at: seenAt,
       }];
     }),
   );
@@ -1637,7 +1612,7 @@ export function markWorkspaceNotificationsSeen(state, workspaceId) {
 
   return setWorkspaceBucket(currentState, safeWorkspaceId, {
     ...bucket,
-    lastSeenAt: seenAt,
+    last_seen_at: seenAt,
     notifications,
   });
 }
@@ -1655,10 +1630,10 @@ export function collectWorkspaceNotificationAttentionPanes(state, workspaceId) {
   // kept per pane carries the latest title.
   Object.values(bucket.notifications || {}).forEach((notification) => {
     if (notification.status !== "unread") return;
-    const paneId = cleanText(notification.paneId);
-    const terminalIndex = notification.terminalIndex == null
+    const paneId = cleanText(notification.pane_id);
+    const terminalIndex = notification.terminal_index == null
       ? null
-      : (Number.isInteger(Number(notification.terminalIndex)) ? Number(notification.terminalIndex) : null);
+      : (Number.isInteger(Number(notification.terminal_index)) ? Number(notification.terminal_index) : null);
     if (!paneId && terminalIndex === null) return;
     const key = paneId || `terminal-index:${terminalIndex}`;
     const existing = panes.get(key);
@@ -1669,8 +1644,8 @@ export function collectWorkspaceNotificationAttentionPanes(state, workspaceId) {
     panes.set(key, {
       count: 1,
       kind: notification.kind,
-      paneId,
-      terminalIndex,
+      pane_id: paneId,
+      terminal_index: terminalIndex,
       title: notification.title,
     });
   });
@@ -1679,10 +1654,10 @@ export function collectWorkspaceNotificationAttentionPanes(state, workspaceId) {
 
 function threadIsActive(thread) {
   if (!thread || typeof thread !== "object") return false;
-  if (thread.latestTurn?.state === "running") return true;
-  if (thread.activityStatus === "thinking" || thread.activityStatus === "running") return true;
-  return Object.values(thread.providerBindings || {}).some((binding) => (
-    binding?.activityStatus === "thinking" || binding?.activityStatus === "running"
+  if (thread.latest_turn?.state === "running") return true;
+  if (thread.activity_status === "thinking" || thread.activity_status === "running") return true;
+  return Object.values(thread.provider_bindings || {}).some((binding) => (
+    binding?.activity_status === "thinking" || binding?.activity_status === "running"
   ));
 }
 
@@ -1695,15 +1670,15 @@ export function getWorkspaceNotificationSummary(state, workspaceId, workspaceThr
   const bucket = normalized.workspaces[workspaceId] || normalizeWorkspaceBucket(null, workspaceId);
   const notifications = Object.values(bucket.notifications || {});
   const pendingActionCount = notifications.filter((notification) => (
-    notification.pendingAction
+    notification.pending_action
     && !["dismissed", "resolved"].includes(notification.status)
   )).length;
   const unacknowledgedPendingActionCount = notifications.filter((notification) => (
-    notification.pendingAction
+    notification.pending_action
     && notification.status === "unread"
   )).length;
   const unreadCount = notifications.filter((notification) => (
-    !notification.pendingAction
+    !notification.pending_action
     && notification.status === "unread"
   )).length;
   const parkedCount = workspaceParkedCount(bucket);

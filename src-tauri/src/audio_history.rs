@@ -197,7 +197,7 @@ fn audio_history_record_from_value(entry: &Value) -> Result<AudioHistoryRecord, 
         return Err("Audio history entry must be an object.".to_string());
     }
 
-    let created_at_ms = audio_history_value_i64(entry, &["createdAtMs", "created_at_ms", "createdAt"])
+    let created_at_ms = audio_history_value_i64(entry, &["createdAtMs", "createdAt"])
         .filter(|value| *value > 0)
         .unwrap_or_else(|| {
             SystemTime::now()
@@ -218,13 +218,13 @@ fn audio_history_record_from_value(entry: &Value) -> Result<AudioHistoryRecord, 
             format!("audio-{created_at_ms}-{counter}")
         });
 
-    let audio_ms = audio_history_value_i64(entry, &["audioMs", "audio_ms", "durationMs", "duration_ms"])
+    let audio_ms = audio_history_value_i64(entry, &["audioMs", "durationMs"])
         .unwrap_or(0)
         .max(0);
-    let latency_ms = audio_history_value_i64(entry, &["latencyMs", "latency_ms"])
+    let latency_ms = audio_history_value_i64(entry, &["latencyMs"])
         .unwrap_or(0)
         .max(0);
-    let word_count = audio_history_value_i64(entry, &["wordCount", "word_count"])
+    let word_count = audio_history_value_i64(entry, &["wordCount"])
         .unwrap_or_else(|| audio_history_word_count_from_text(entry))
         .max(0);
 
@@ -384,7 +384,7 @@ fn audio_history_page_blocking(
 
     Ok(json!({
         "items": items,
-        "hasMore": has_more,
+        "has_more": has_more,
         "limit": limit,
         "offset": offset.unwrap_or(0).max(0),
     }))
@@ -442,11 +442,11 @@ fn audio_history_summary_blocking(connection: &rusqlite::Connection) -> Result<V
     }
 
     Ok(json!({
-        "totalDictations": total,
-        "audioMs": audio_ms,
-        "averageWpm": average_wpm,
-        "totalWords": total_words,
-        "wordsByDay": Value::Object(words_by_day),
+        "total_dictations": total,
+        "audio_ms": audio_ms,
+        "average_wpm": average_wpm,
+        "total_words": total_words,
+        "words_by_day": Value::Object(words_by_day),
     }))
 }
 
@@ -465,7 +465,7 @@ fn audio_history_arm_reaper_if_needed(arm: bool) {
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn audio_history_append(app: AppHandle, entry: Value) -> Result<Value, String> {
     let path = audio_history_db_path(&app)?;
     let (stored, arm) = tokio::task::spawn_blocking(move || {
@@ -480,7 +480,7 @@ async fn audio_history_append(app: AppHandle, entry: Value) -> Result<Value, Str
     Ok(stored)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn audio_history_import(app: AppHandle, entries: Vec<Value>) -> Result<Value, String> {
     let path = audio_history_db_path(&app)?;
     let (imported, arm) = tokio::task::spawn_blocking(move || {
@@ -497,7 +497,7 @@ async fn audio_history_import(app: AppHandle, entries: Vec<Value>) -> Result<Val
     Ok(json!({ "imported": imported }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn audio_history_page(
     app: AppHandle,
     offset: Option<i64>,
@@ -518,7 +518,7 @@ async fn audio_history_page(
     Ok(page)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn audio_history_summary(app: AppHandle) -> Result<Value, String> {
     let path = audio_history_db_path(&app)?;
     let (summary, arm) = tokio::task::spawn_blocking(move || {
@@ -530,7 +530,7 @@ async fn audio_history_summary(app: AppHandle) -> Result<Value, String> {
     Ok(summary)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn audio_history_clear(app: AppHandle) -> Result<(), String> {
     let path = audio_history_db_path(&app)?;
     let (_, arm) = tokio::task::spawn_blocking(move || {

@@ -221,7 +221,6 @@ enum WorkspaceAgentsGitignoreUpdate {
 }
 
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct WorkspaceGitBootstrap {
     repo_path: String,
     branch: String,
@@ -232,7 +231,6 @@ struct WorkspaceGitBootstrap {
 }
 
 #[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct WorkspaceProjectMount {
     mount_id: String,
     workspace_relative_path: String,
@@ -1568,7 +1566,7 @@ pub(crate) fn ensure_workspace_git_ready_for_late_coordination(root: &Path) -> R
     ensure_workspace_git_ready_for_coordination(root).map(|_| ())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn workspace_initialize_git(repo_path: String) -> Result<WorkspaceGitBootstrap, String> {
     let root = resolve_workspace_root_directory(Some(repo_path.as_str()))?;
     tauri::async_runtime::spawn_blocking(move || ensure_workspace_git_ready_for_coordination(&root))

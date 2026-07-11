@@ -43,9 +43,9 @@ export function buildSshSaveRequest(form = {}) {
   const name = String(form.name || "").trim();
   const host = String(form.host || "").trim();
   const username = String(form.username || "").trim();
-  const authMethod = isSshAuthMethod(form.authMethod) ? form.authMethod : SSH_AUTH_AGENT;
-  const keyPath = String(form.keyPath || "").trim();
-  const certificatePath = String(form.certificatePath || "").trim();
+  const authMethod = isSshAuthMethod(form.auth_method) ? form.auth_method : SSH_AUTH_AGENT;
+  const keyPath = String(form.key_path || "").trim();
+  const certificatePath = String(form.certificate_path || "").trim();
   const portRaw = String(form.port ?? "").trim();
 
   if (!name) {
@@ -77,9 +77,9 @@ export function buildSshSaveRequest(form = {}) {
     host,
     port,
     username: username || null,
-    authMethod,
-    keyPath: authMethod === SSH_AUTH_KEY ? keyPath : null,
-    certificatePath: authMethod === SSH_AUTH_KEY && certificatePath ? certificatePath : null,
+    auth_method: authMethod,
+    key_path: authMethod === SSH_AUTH_KEY ? keyPath : null,
+    certificate_path: authMethod === SSH_AUTH_KEY && certificatePath ? certificatePath : null,
     // secret handling: undefined field => omit so the backend keeps the
     // existing secret. A caller that wants to set/clear passes secret
     // explicitly (string, or "" to clear).
@@ -104,13 +104,13 @@ export async function saveSshProfile(request) {
 }
 
 export async function deleteSshProfile(profileId) {
-  return invoke("ssh_profile_delete", { profileId: String(profileId || "") });
+  return invoke("ssh_profile_delete", { profile_id: String(profileId || "") });
 }
 
 export async function connectTerminalSsh(paneId, profileId) {
   return invoke("terminal_ssh_connect", {
-    paneId: String(paneId || ""),
-    profileId: String(profileId || ""),
+    pane_id: String(paneId || ""),
+    profile_id: String(profileId || ""),
   });
 }
 

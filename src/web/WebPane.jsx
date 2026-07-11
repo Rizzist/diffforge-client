@@ -47,11 +47,11 @@ function PopOutGlyph(props) {
 }
 
 export default function WebPane({
-  terminalIndex,
-  paneId,
-  workspaceId,
+  terminal_index: terminalIndex,
+  pane_id: paneId,
+  workspace_id: workspaceId,
   initialUrl = DEFAULT_WEB_URL,
-  isActive = true,
+  is_active: isActive = true,
   isFocused = false,
   isFullscreen = false,
   fullscreenActive = false,
@@ -60,7 +60,7 @@ export default function WebPane({
   poppedOut = false,
   breakoutReturnUrl = "",
   webviewObscured = false,
-  adoptLabel = "",
+  adopt_label: adoptLabel = "",
   adoptNonce = 0,
   onNativeLabelChange = null,
   onDragHandlePointerDown,
@@ -76,7 +76,7 @@ export default function WebPane({
   onDismissPanelAgentPromptActivityItem = null,
   controlCommand = null,
   defaultPanelAgentPromptTargetIds = [],
-  panelKind = "web",
+  panel_kind: panelKind = "web",
   panelAgentPromptActivityItems = [],
   onSubmitPanelAgentPrompt = null,
   panelAgentPromptTargets = [],
@@ -217,7 +217,7 @@ export default function WebPane({
     // re-open, or close it from the grid side. On return the pane adopts the
     // window's living webview back via adoptLabel/adoptNonce (no reload).
     suspended: poppedOut,
-    adoptLabel,
+    adopt_label: adoptLabel,
     adoptNonce,
     adoptCurrentUrl: effectiveBreakoutReturnUrl,
     onLabelChange: handleNativeLabelChange,
@@ -233,9 +233,9 @@ export default function WebPane({
     currentUrl,
     enabled: agentPromptOpen && agentPromptControlVisible && visible && !poppedOut,
     evaluate,
-    panelKind,
-    paneId,
-    workspaceId,
+    panel_kind: panelKind,
+    pane_id: paneId,
+    workspace_id: workspaceId,
   });
   const dismissPanelAgentPromptActivityItem = useCallback((itemId) => {
     const safeItemId = String(itemId || "").trim();
@@ -246,16 +246,16 @@ export default function WebPane({
   const webAgentPromptOverlay = useWebAgentPromptOverlay({
     autoDismissCompleted: Boolean(isFocused),
     activityItems: panelAgentPromptActivityItems,
-    contextRefs: webElementPicker.contextRefs,
-    defaultSelectedTargetIds: defaultPanelAgentPromptTargetIds,
+    context_refs: webElementPicker.context_refs,
+    default_selected_target_ids: defaultPanelAgentPromptTargetIds,
     enabled: nativeAgentPromptOverlayActive,
     evaluate,
     onClearContext: webElementPicker.clearSelection,
     onClose: () => setAgentPromptOpen(false),
     onDismissCompletedItem: dismissPanelAgentPromptActivityItem,
     onSubmit: onSubmitPanelAgentPrompt,
-    panelKind,
-    panelPaneId: paneId,
+    panel_kind: panelKind,
+    panel_pane_id: paneId,
     targets: panelAgentPromptTargets,
   });
 
@@ -360,8 +360,8 @@ export default function WebPane({
           {agentPromptOpen ? (
             <WebPaneIconButton
               aria-label="Select web element"
-              aria-pressed={webElementPicker.armed || webElementPicker.contextRefs.length ? "true" : "false"}
-              data-active={webElementPicker.armed || webElementPicker.contextRefs.length ? "true" : undefined}
+              aria-pressed={webElementPicker.armed || webElementPicker.context_refs.length ? "true" : "false"}
+              data-active={webElementPicker.armed || webElementPicker.context_refs.length ? "true" : undefined}
               disabled={!visible || poppedOut}
               onClick={webElementPicker.togglePicker}
               title="Select web element"
@@ -376,7 +376,7 @@ export default function WebPane({
         <>
           <WebPaneIconButton
             aria-label="Split right"
-            onClick={() => onSplit?.({ direction: "vertical", terminalIndex, paneId })}
+            onClick={() => onSplit?.({ direction: "vertical", terminal_index: terminalIndex, pane_id: paneId })}
             title="Split right"
             type="button"
           >
@@ -384,7 +384,7 @@ export default function WebPane({
           </WebPaneIconButton>
           <WebPaneIconButton
             aria-label="Split down"
-            onClick={() => onSplit?.({ direction: "horizontal", terminalIndex, paneId })}
+            onClick={() => onSplit?.({ direction: "horizontal", terminal_index: terminalIndex, pane_id: paneId })}
             title="Split down"
             type="button"
           >
@@ -544,14 +544,14 @@ export default function WebPane({
         {agentPromptOpen && agentPromptControlVisible && !webAgentPromptOverlay.active ? (
           <PanelAgentPromptComposer
             autoFocus
-            contextRefs={webElementPicker.contextRefs}
-            defaultSelectedTargetIds={defaultPanelAgentPromptTargetIds}
+            context_refs={webElementPicker.context_refs}
+            default_selected_target_ids={defaultPanelAgentPromptTargetIds}
             onClearContext={webElementPicker.clearSelection}
             onClose={() => setAgentPromptOpen(false)}
             onSubmit={onSubmitPanelAgentPrompt}
             onTargetMenuOpenChange={setAgentPromptTargetMenuOpen}
-            panelKind={panelKind}
-            panelPaneId={paneId}
+            panel_kind={panelKind}
+            panel_pane_id={paneId}
             targets={panelAgentPromptTargets}
           />
         ) : null}

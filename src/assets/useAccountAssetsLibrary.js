@@ -77,11 +77,11 @@ function assetLibraryPayload(value, depth = 0) {
 }
 
 function assetLocalPath(asset) {
-  return text(asset?.localPath || asset?.local_path || asset?.path);
+  return text(asset?.local_path || asset?.path);
 }
 
 function assetRowShaped(asset) {
-  return Boolean(jsonObject(asset) && text(asset?.assetId || asset?.asset_id || asset?.id));
+  return Boolean(jsonObject(asset) && text(asset?.asset_id || asset?.id));
 }
 
 function normalizedStatus(value) {
@@ -133,65 +133,58 @@ const DOC_BACKED_ASSET_FOLDER_TOKENS = new Set([
 
 function assetIdText(asset) {
   if (typeof asset === "string") return text(asset);
-  return text(asset?.assetId || asset?.asset_id || asset?.id);
+  return text(asset?.asset_id || asset?.id);
 }
 
 function assetDeviceRows(asset) {
   return [
     ...jsonArray(asset?.devices),
-    ...jsonArray(asset?.assetDevices),
     ...jsonArray(asset?.asset_devices),
-    ...jsonArray(asset?.localCopies),
     ...jsonArray(asset?.local_copies),
     ...jsonArray(asset?.locations),
   ].filter((device) => device && typeof device === "object");
 }
 
 function assetDeviceLocalAvailable(device) {
-  const explicit = device?.localAvailable ?? device?.local_available ?? device?.available;
+  const explicit = device?.local_available ?? device?.available;
   if (typeof explicit === "boolean") return explicit;
-  const status = normalizedStatus(device?.localStatus || device?.local_status || device?.status || device?.availability);
+  const status = normalizedStatus(device?.local_status || device?.status || device?.availability);
   return ["available", "local-available", "present", "ready", "synced"].includes(status);
 }
 
 function assetCloudCopyAvailable(asset) {
   const cloudStates = [
     ...jsonArray(asset?.clouds),
-    ...jsonArray(asset?.cloudStatuses),
     ...jsonArray(asset?.cloud_statuses),
   ];
   let sawUnavailableCloudState = false;
   for (const cloudState of cloudStates) {
-    const explicit = cloudState?.cloudAvailable ?? cloudState?.cloud_available;
+    const explicit = cloudState?.cloud_available;
     if (explicit === true) return true;
     if (explicit === false) {
       sawUnavailableCloudState = true;
       continue;
     }
-    const status = normalizedStatus(cloudState?.cloudStatus || cloudState?.cloud_status || cloudState?.status);
+    const status = normalizedStatus(cloudState?.cloud_status || cloudState?.status);
     if (CLOUD_AVAILABLE_STATUSES.has(status)) return true;
     if (CLOUD_UNAVAILABLE_STATUSES.has(status)) sawUnavailableCloudState = true;
   }
   if (sawUnavailableCloudState) return false;
-  const explicit = asset?.cloudAvailable ?? asset?.cloud_available;
+  const explicit = asset?.cloud_available;
   if (typeof explicit === "boolean") return explicit;
   const status = normalizedStatus(
-    asset?.cloudStatus || asset?.cloud_status || asset?.status || asset?.assetStatus || asset?.asset_status,
+    asset?.cloud_status || asset?.status || asset?.asset_status,
   );
   if (CLOUD_UNAVAILABLE_STATUSES.has(status)) return false;
   if (CLOUD_AVAILABLE_STATUSES.has(status)) return true;
-  return Boolean(asset?.blobId || asset?.blob_id || asset?.objectKey || asset?.object_key);
+  return Boolean(asset?.blob_id || asset?.object_key);
 }
 
 function assetRemoteCopyAvailable(asset) {
   return assetDeviceRows(asset).some((device) => {
     if (!assetDeviceLocalAvailable(device)) return false;
     return !(
-      device?.current
-      || device?.isCurrent
-      || device?.is_current
-      || device?.currentDevice
-      || device?.current_device
+      device?.current || device?.is_current || device?.current_device
     );
   });
 }
@@ -199,17 +192,17 @@ function assetRemoteCopyAvailable(asset) {
 function removedAssetClearsOnlyLocal(removed) {
   const row = jsonObject(removed);
   if (!row) return false;
-  if (row.cloudRemoved === true || row.cloud_removed === true) return false;
+  if (row.cloud_removed === true) return false;
   const cloudStatus = normalizedStatus(
-    row.cloudStatus || row.cloud_status || row.assetStatus || row.asset_status || row.status,
+    row.cloud_status || row.asset_status || row.status,
   );
   if (CLOUD_UNAVAILABLE_STATUSES.has(cloudStatus) && !LOCAL_UNAVAILABLE_STATUSES.has(cloudStatus)) {
     return false;
   }
-  const localStatus = normalizedStatus(row.local_status || row.localStatus);
+  const localStatus = normalizedStatus(row.local_status);
   if (LOCAL_UNAVAILABLE_STATUSES.has(localStatus)) return true;
-  if (row.local_available === false || row.localAvailable === false) return true;
-  const reason = normalizedStatus(row.delete_reason || row.deleteReason || row.reason);
+  if (row.local_available === false) return true;
+  const reason = normalizedStatus(row.delete_reason || row.reason);
   return reason.includes("local") && !reason.includes("cloud");
 }
 
@@ -217,24 +210,17 @@ function assetLocalDeletedPatch(removed, assetId) {
   const patch = { ...(jsonObject(removed) || {}) };
   delete patch.deleted;
   delete patch.status;
-  delete patch.assetStatus;
   delete patch.asset_status;
   delete patch.deleted_at;
-  delete patch.deletedAt;
   return {
     ...patch,
     asset_id: assetId,
-    assetId,
     id: assetId,
     local_available: false,
-    localAvailable: false,
     local_path: "",
-    localPath: "",
     path: "",
     local_status: "local_deleted",
-    localStatus: "local_deleted",
     can_upload: false,
-    canUpload: false,
   };
 }
 
@@ -249,24 +235,23 @@ export function assetIdentityKeys(asset) {
     add("asset", assetId);
     return keys;
   }
-  add("blob", asset?.blobId || asset?.blob_id);
-  add("object", asset?.objectKey || asset?.object_key);
-  const sha = text(asset?.sha256 || asset?.hash || asset?.contentHash || asset?.content_hash);
-  const size = text(asset?.sizeBytes || asset?.size_bytes);
+  add("blob", asset?.blob_id);
+  add("object", asset?.object_key);
+  const sha = text(asset?.sha256 || asset?.hash || asset?.content_hash);
+  const size = text(asset?.size_bytes);
   if (sha && size) keys.push(`sha:${sha.toLowerCase()}:${size}`);
-  add("local", asset?.localPath || asset?.local_path || asset?.path || asset?.localPathHint || asset?.local_path_hint);
+  add("local", asset?.local_path || asset?.path || asset?.local_path_hint);
   return keys;
 }
 
 function assetIncomingClearsLocal(incoming) {
   const incomingObject = jsonObject(incoming) || {};
-  const localStatus = normalizedStatus(incomingObject.local_status || incomingObject.localStatus);
+  const localStatus = normalizedStatus(incomingObject.local_status);
   if (LOCAL_UNAVAILABLE_STATUSES.has(localStatus)) return true;
   if (
     incomingObject.local_available === false
-    || incomingObject.localAvailable === false
   ) {
-    const hasPathKey = ["local_path", "localPath", "path"].some((key) => (
+    const hasPathKey = ["local_path", "path"].some((key) => (
       Object.prototype.hasOwnProperty.call(incomingObject, key)
     ));
     return hasPathKey ? !assetLocalPath(incomingObject) : Boolean(localStatus);
@@ -284,16 +269,16 @@ function mergeAssetRows(existing, incoming) {
     const incomingText = typeof value === "string" ? value.trim() : "";
     const currentText = typeof current === "string" ? current.trim() : "";
     if ((value === null || value === undefined || incomingText === "") && currentText) {
-      if (clearsLocal && ["local_path", "localPath", "path"].includes(key)) {
+      if (clearsLocal && ["local_path", "path"].includes(key)) {
         merged[key] = "";
       }
       return;
     }
-    if (["local_path", "localPath", "path"].includes(key) && !incomingText && !clearsLocal) {
+    if (["local_path", "path"].includes(key) && !incomingText && !clearsLocal) {
       return;
     }
     if (
-      ["local_status", "localStatus", "cloud_status", "cloudStatus"].includes(key)
+      ["local_status", "cloud_status"].includes(key)
       && ["", "unknown"].includes(normalizedStatus(incomingText))
       && currentText
     ) {
@@ -303,14 +288,10 @@ function mergeAssetRows(existing, incoming) {
   });
   if (clearsLocal) {
     merged.local_path = "";
-    merged.localPath = "";
     merged.path = "";
     merged.local_available = false;
-    merged.localAvailable = false;
-    merged.local_status = text(incoming.local_status, incoming.localStatus, "local_deleted");
-    merged.localStatus = merged.local_status;
+    merged.local_status = text(incoming.local_status, "local_deleted");
     merged.can_upload = false;
-    merged.canUpload = false;
   }
   return merged;
 }
@@ -337,31 +318,23 @@ function dedupeAssetRows(items) {
 function assetHiddenFromGenericLibrary(asset) {
   const metadata = jsonObject(asset?.metadata) || {};
   const sourceToken = text(
-    asset?.sourceKind,
     asset?.source_kind,
     asset?.source,
-    metadata.sourceKind,
     metadata.source_kind,
     metadata.source,
   ).toLowerCase().replace(/[._\s]+/gu, "-");
   const domainToken = text(
-    asset?.docDomain,
     asset?.doc_domain,
-    metadata.docDomain,
     metadata.doc_domain,
   ).toLowerCase().replace(/[._\s]+/gu, "-");
   const folderToken = text(
-    asset?.assetFolder,
     asset?.asset_folder,
     asset?.folder,
     asset?.group,
-    asset?.assetGroup,
     asset?.asset_group,
-    metadata.assetFolder,
     metadata.asset_folder,
     metadata.folder,
     metadata.group,
-    metadata.assetGroup,
     metadata.asset_group,
   ).toLowerCase().replace(/[._\s]+/gu, "-");
   return DOC_BACKED_ASSET_SOURCE_TOKENS.has(sourceToken)
@@ -380,7 +353,7 @@ function hiddenAssetIdsFromItems(items) {
 }
 
 function transferAssetIdText(transfer) {
-  return text(transfer?.assetId || transfer?.asset_id);
+  return text(transfer?.asset_id);
 }
 
 const TERMINAL_TRANSFER_STATUSES = new Set([
@@ -392,7 +365,7 @@ const TERMINAL_TRANSFER_STATUSES = new Set([
 ]);
 
 function transferStatus(transfer) {
-  return text(transfer?.status || transfer?.transferStatus || transfer?.transfer_status).toLowerCase();
+  return text(transfer?.status || transfer?.transfer_status).toLowerCase();
 }
 
 function transferTerminal(transfer) {
@@ -404,36 +377,32 @@ function transferCompleted(transfer) {
 }
 
 function transferUpdatedText(transfer) {
-  return text(transfer?.updatedAt || transfer?.updated_at || transfer?.createdAt || transfer?.created_at);
+  return text(transfer?.updated_at || transfer?.created_at);
 }
 
 function transferBytesDone(transfer) {
-  const value = Number(transfer?.bytesDone ?? transfer?.bytes_done ?? 0);
+  const value = Number(transfer?.bytes_done ?? 0);
   return Number.isFinite(value) ? value : 0;
 }
 
-function transferFieldValue(row, camelKey, snakeKey = camelKey) {
-  if (Object.prototype.hasOwnProperty.call(row || {}, camelKey)) return row[camelKey];
-  if (Object.prototype.hasOwnProperty.call(row || {}, snakeKey)) return row[snakeKey];
+function transferFieldValue(row, key) {
+  if (Object.prototype.hasOwnProperty.call(row || {}, key)) return row[key];
   return undefined;
 }
 
 function applyTransferWinnerFields(merged, winner) {
   const status = transferFieldValue(winner, "status");
   if (status !== undefined) merged.status = status;
-  const bytesDone = transferFieldValue(winner, "bytesDone", "bytes_done");
+  const bytesDone = transferFieldValue(winner, "bytes_done");
   if (bytesDone !== undefined) {
-    merged.bytesDone = bytesDone;
     merged.bytes_done = bytesDone;
   }
-  const bytesTotal = transferFieldValue(winner, "bytesTotal", "bytes_total");
+  const bytesTotal = transferFieldValue(winner, "bytes_total");
   if (bytesTotal !== undefined) {
-    merged.bytesTotal = bytesTotal;
     merged.bytes_total = bytesTotal;
   }
-  const updatedAt = transferFieldValue(winner, "updatedAt", "updated_at");
+  const updatedAt = transferFieldValue(winner, "updated_at");
   if (updatedAt !== undefined) {
-    merged.updatedAt = updatedAt;
     merged.updated_at = updatedAt;
   }
   merged.error = transferFieldValue(winner, "error") ?? "";
@@ -472,16 +441,16 @@ function dedupeTransferRows(transfers) {
   const rows = [];
   jsonArray(transfers).forEach((transfer) => {
     if (!transfer || typeof transfer !== "object") return;
-    const transferId = text(transfer.transferId || transfer.transfer_id || transfer.id);
-    const cloudId = text(transfer.cloudId || transfer.cloud_id || transfer.assetCloudId || transfer.asset_cloud_id || "diffforge-ai-cloud");
+    const transferId = text(transfer.transfer_id || transfer.id);
+    const cloudId = text(transfer.cloud_id || transfer.asset_cloud_id || "diffforge-ai-cloud");
     const key = transferId
       ? `transfer:${cloudId.toLowerCase()}:${transferId.toLowerCase()}`
       : [
-        text(transfer.assetId || transfer.asset_id).toLowerCase(),
+        text(transfer.asset_id).toLowerCase(),
         cloudId.toLowerCase(),
         text(transfer.direction).toLowerCase(),
         text(transfer.status).toLowerCase(),
-        text(transfer.updatedAt || transfer.updated_at || transfer.createdAt || transfer.created_at),
+        text(transfer.updated_at || transfer.created_at),
       ].join(":");
     if (!key || !key.replaceAll(":", "")) return;
     const existingIndex = byKey.get(key);
@@ -518,8 +487,8 @@ function normalizeAssetsLibrary(library) {
     ? jsonArray(fanout.clouds)
     : jsonArray(payload.clouds).length
       ? jsonArray(payload.clouds)
-      : jsonArray(payload.assetClouds).length
-        ? jsonArray(payload.assetClouds)
+      : jsonArray(payload.asset_clouds).length
+        ? jsonArray(payload.asset_clouds)
         : jsonArray(payload.asset_clouds);
   return {
     ...payload,
@@ -527,7 +496,6 @@ function normalizeAssetsLibrary(library) {
     items,
     assets: items,
     clouds,
-    assetClouds: clouds,
     asset_clouds: clouds,
     transfers,
     count: items.length,
@@ -539,12 +507,7 @@ function mergeAssetsLibrarySnapshot(library, snapshot) {
   if (!normalizedSnapshot) return library;
   const snapshotPayload = assetLibraryPayload(snapshot);
   const snapshotIsFull = Boolean(
-    normalizedSnapshot?.snapshotFull
-      || normalizedSnapshot?.snapshot_full
-      || snapshotPayload?.snapshotFull
-      || snapshotPayload?.snapshot_full
-      || snapshotPayload?.source === "local_asset_library"
-      || snapshotPayload?.kind === "account_assets",
+    normalizedSnapshot?.snapshot_full || snapshotPayload?.snapshot_full || snapshotPayload?.source === "local_asset_library" || snapshotPayload?.kind === "account_assets",
   );
   if (!library || !normalizeAssetsLibrary(library)?.items?.length || snapshotIsFull) {
     return normalizedSnapshot;
@@ -569,7 +532,6 @@ function mergeAssetsLibrarySnapshot(library, snapshot) {
     items: nextItems,
     assets: nextItems,
     clouds,
-    assetClouds: clouds,
     asset_clouds: clouds,
     transfers: nextTransfers,
   });
@@ -582,9 +544,8 @@ function mergeAssetsLibraryEvent(library, eventPayload) {
   const items = normalizedEvent?.items || fanout?.items || [];
   const transfers = normalizedEvent?.transfers || fanout?.transfers || [];
   const removedAssets = [
-    ...jsonArray(fanout?.removedAssets || fanout?.removed_assets),
+    ...jsonArray(fanout?.removed_assets),
     ...jsonArray(payload?.removed_assets),
-    ...jsonArray(payload?.removedAssets),
   ];
   if (!items.length && !transfers.length && !removedAssets.length) return library;
   const current = normalizeAssetsLibrary(library || {});
@@ -618,7 +579,7 @@ function mergeAssetsLibraryEvent(library, eventPayload) {
   const hiddenIds = hiddenAssetIdsFromItems(allItems);
   const nextItems = allItems
     .filter((item) => !assetHiddenFromGenericLibrary(item))
-    .filter((item) => !removedIds.has(text(item.assetId || item.asset_id || item.id)));
+    .filter((item) => !removedIds.has(text(item.asset_id || item.id)));
   const nextTransfers = dedupeTransferRows([
     ...jsonArray(current?.transfers),
     ...transfers,
@@ -634,10 +595,10 @@ function mergeAssetsLibraryEvent(library, eventPayload) {
   });
 }
 
-function assetLibraryRequestOptions({ localOnly = false } = {}) {
+function assetLibraryRequestOptions({ local_only: localOnly = false } = {}) {
   return {
     limit: DEFAULT_ASSET_LIBRARY_LIMIT,
-    localOnly,
+    local_only: localOnly,
   };
 }
 
@@ -648,7 +609,7 @@ function loadCachedAssetsLibrary() {
 
   assetsLibraryStore.loadCachedPromise = invoke(
     "cloud_mcp_list_account_assets",
-    assetLibraryRequestOptions({ localOnly: true }),
+    assetLibraryRequestOptions({ local_only: true }),
   )
     .then((library) => {
       if (library) {

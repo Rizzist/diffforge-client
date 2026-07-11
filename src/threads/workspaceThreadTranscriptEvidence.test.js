@@ -6,12 +6,12 @@ import { transcriptHasTurnCompletionForPrompt } from "./workspaceThreadTranscrip
 test("completion evidence requires the exact submitted prompt by default", () => {
   const submittedAt = "2026-05-31T06:42:20.800Z";
   const messages = [{
-    createdAt: "2026-05-31T06:42:18.000Z",
+    created_at: "2026-05-31T06:42:18.000Z",
     id: "previous-user",
     role: "user",
     text: "are you ready?",
   }, {
-    createdAt: "2026-05-31T06:42:19.000Z",
+    created_at: "2026-05-31T06:42:19.000Z",
     id: "task-complete",
     kind: "task_complete",
     role: "assistant",
@@ -20,9 +20,9 @@ test("completion evidence requires the exact submitted prompt by default", () =>
 
   assert.equal(
     transcriptHasTurnCompletionForPrompt(messages, {
-      expectedUserMessage: "interesting",
-      matchedBy: "sessionId",
-      submittedAt,
+      expected_user_message: "interesting",
+      matched_by: "session_id",
+      submitted_at: submittedAt,
     }),
     false,
   );
@@ -31,12 +31,12 @@ test("completion evidence requires the exact submitted prompt by default", () =>
 test("completion evidence accepts an exact matching submitted prompt", () => {
   const submittedAt = "2026-05-31T06:42:20.800Z";
   const messages = [{
-    createdAt: submittedAt,
+    created_at: submittedAt,
     id: "current-user",
     role: "user",
     text: "interesting",
   }, {
-    createdAt: "2026-05-31T06:42:21.100Z",
+    created_at: "2026-05-31T06:42:21.100Z",
     id: "task-complete",
     kind: "task_complete",
     role: "assistant",
@@ -45,9 +45,9 @@ test("completion evidence accepts an exact matching submitted prompt", () => {
 
   assert.equal(
     transcriptHasTurnCompletionForPrompt(messages, {
-      expectedUserMessage: "interesting",
-      matchedBy: "sessionId",
-      submittedAt,
+      expected_user_message: "interesting",
+      matched_by: "session_id",
+      submitted_at: submittedAt,
     }),
     true,
   );
@@ -56,12 +56,12 @@ test("completion evidence accepts an exact matching submitted prompt", () => {
 test("completion evidence keeps explicit timestamp recovery behavior", () => {
   const submittedAt = "2026-05-31T06:42:20.800Z";
   const messages = [{
-    createdAt: "2026-05-31T06:42:20.900Z",
+    created_at: "2026-05-31T06:42:20.900Z",
     id: "current-user",
     role: "user",
     text: "slightly normalized prompt",
   }, {
-    createdAt: "2026-05-31T06:42:21.100Z",
+    created_at: "2026-05-31T06:42:21.100Z",
     id: "task-complete",
     kind: "task_complete",
     role: "assistant",
@@ -70,10 +70,10 @@ test("completion evidence keeps explicit timestamp recovery behavior", () => {
 
   assert.equal(
     transcriptHasTurnCompletionForPrompt(messages, {
-      allowTimestampFallback: true,
-      expectedUserMessage: "interesting",
-      matchedBy: "cwd+timestamp-recovery",
-      submittedAt,
+      allow_timestamp_fallback: true,
+      expected_user_message: "interesting",
+      matched_by: "cwd+timestamp-recovery",
+      submitted_at: submittedAt,
     }),
     true,
   );
@@ -82,17 +82,17 @@ test("completion evidence keeps explicit timestamp recovery behavior", () => {
 test("completion evidence stops at the next user turn", () => {
   const submittedAt = "2026-05-31T06:42:20.800Z";
   const messages = [{
-    createdAt: submittedAt,
+    created_at: submittedAt,
     id: "current-user",
     role: "user",
     text: "interesting",
   }, {
-    createdAt: "2026-05-31T06:42:21.000Z",
+    created_at: "2026-05-31T06:42:21.000Z",
     id: "later-user",
     role: "user",
     text: "new task",
   }, {
-    createdAt: "2026-05-31T06:42:22.100Z",
+    created_at: "2026-05-31T06:42:22.100Z",
     id: "task-complete",
     kind: "task_complete",
     role: "assistant",
@@ -101,9 +101,9 @@ test("completion evidence stops at the next user turn", () => {
 
   assert.equal(
     transcriptHasTurnCompletionForPrompt(messages, {
-      expectedUserMessage: "interesting",
-      matchedBy: "sessionId",
-      submittedAt,
+      expected_user_message: "interesting",
+      matched_by: "session_id",
+      submitted_at: submittedAt,
     }),
     false,
   );
@@ -112,18 +112,18 @@ test("completion evidence stops at the next user turn", () => {
 test("completion evidence ignores duplicate prompts before submitted timestamp", () => {
   const submittedAt = "2026-05-31T06:42:20.800Z";
   const messages = [{
-    createdAt: "2026-05-31T06:40:00.000Z",
+    created_at: "2026-05-31T06:40:00.000Z",
     id: "old-user",
     role: "user",
     text: "Make proposal",
   }, {
-    createdAt: "2026-05-31T06:40:04.000Z",
+    created_at: "2026-05-31T06:40:04.000Z",
     id: "old-complete",
     kind: "task_complete",
     role: "assistant",
     text: "Old answer.",
   }, {
-    createdAt: submittedAt,
+    created_at: submittedAt,
     id: "current-user",
     role: "user",
     text: "Make proposal",
@@ -131,9 +131,9 @@ test("completion evidence ignores duplicate prompts before submitted timestamp",
 
   assert.equal(
     transcriptHasTurnCompletionForPrompt(messages, {
-      expectedUserMessage: "Make proposal",
-      matchedBy: "sessionId",
-      submittedAt,
+      expected_user_message: "Make proposal",
+      matched_by: "session_id",
+      submitted_at: submittedAt,
     }),
     false,
   );

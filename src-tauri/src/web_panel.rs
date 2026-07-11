@@ -78,8 +78,8 @@ fn emit_web_panel_closed(app: &AppHandle, window_id: &str, pane_id: &str) {
     let _ = app.emit(
         WEB_PANEL_CLOSED_EVENT,
         json!({
-            "paneId": pane_id,
-            "windowId": window_id,
+            "pane_id": pane_id,
+            "window_id": window_id,
         }),
     );
 }
@@ -111,15 +111,15 @@ fn preserve_web_panel_child_webviews(app: &AppHandle, window_id: &str, pane_id: 
         let _ = app.emit(
             WEB_PANEL_WEBVIEW_PRESERVED_EVENT,
             json!({
-                "paneId": pane_id,
-                "webviewLabels": preserved,
-                "windowId": window_id,
+                "pane_id": pane_id,
+                "webview_labels": preserved,
+                "window_id": window_id,
             }),
         );
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn web_panel_open(
     app: AppHandle,
     pane_id: String,
@@ -222,7 +222,7 @@ fn web_panel_open(
     Ok(WebPanelOpenResult { label })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn web_panel_focus(app: AppHandle, label: String) -> Result<bool, String> {
     validate_web_panel_label(&label)?;
     // get_window, NOT get_webview_window: a web panel hosting a child page
@@ -236,7 +236,7 @@ fn web_panel_focus(app: AppHandle, label: String) -> Result<bool, String> {
     Ok(true)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn web_panel_close(app: AppHandle, label: String) -> Result<(), String> {
     validate_web_panel_label(&label)?;
     // get_window, NOT get_webview_window: a web panel hosting a child page

@@ -28,8 +28,8 @@ function stripDiffPathPrefix(raw = "") {
 // input degrades to whatever hunks parsed cleanly.
 export function parseUnifiedPatch(patch = "") {
   const result = {
-    oldPath: "",
-    newPath: "",
+    old_path: "",
+    new_path: "",
     binary: false,
     hunks: [],
   };
@@ -69,13 +69,13 @@ export function parseUnifiedPatch(patch = "") {
     if (!hunk) {
       // File header / extended header territory.
       if (line.startsWith("--- ")) {
-        result.oldPath = stripDiffPathPrefix(line.slice(4)) || result.oldPath;
+        result.old_path = stripDiffPathPrefix(line.slice(4)) || result.old_path;
       } else if (line.startsWith("+++ ")) {
-        result.newPath = stripDiffPathPrefix(line.slice(4)) || result.newPath;
+        result.new_path = stripDiffPathPrefix(line.slice(4)) || result.new_path;
       } else if (line.startsWith("rename from ")) {
-        result.oldPath = result.oldPath || transcriptText(line.slice("rename from ".length));
+        result.old_path = result.old_path || transcriptText(line.slice("rename from ".length));
       } else if (line.startsWith("rename to ")) {
-        result.newPath = result.newPath || transcriptText(line.slice("rename to ".length));
+        result.new_path = result.new_path || transcriptText(line.slice("rename to ".length));
       } else if (/^Binary files .* differ$/.test(line) || line.startsWith("GIT binary patch")) {
         result.binary = true;
       }
@@ -104,9 +104,9 @@ export function parseUnifiedPatch(patch = "") {
       // headers were concatenated). Close and fall back to header parsing.
       closeHunk();
       if (line.startsWith("--- ")) {
-        result.oldPath = stripDiffPathPrefix(line.slice(4)) || result.oldPath;
+        result.old_path = stripDiffPathPrefix(line.slice(4)) || result.old_path;
       } else if (line.startsWith("+++ ")) {
-        result.newPath = stripDiffPathPrefix(line.slice(4)) || result.newPath;
+        result.new_path = stripDiffPathPrefix(line.slice(4)) || result.new_path;
       } else if (/^Binary files .* differ$/.test(line)) {
         result.binary = true;
       }

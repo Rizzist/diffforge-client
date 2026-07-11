@@ -29,9 +29,9 @@ function initialFormState(profile) {
     host: profile?.host || "",
     port: profile?.port != null ? String(profile.port) : "",
     username: profile?.username || "",
-    authMethod: isSshAuthMethod(profile?.authMethod) ? profile.authMethod : SSH_AUTH_METHODS[0].id,
-    keyPath: profile?.keyPath || "",
-    certificatePath: profile?.certificatePath || "",
+    auth_method: isSshAuthMethod(profile?.auth_method) ? profile.auth_method : SSH_AUTH_METHODS[0].id,
+    key_path: profile?.key_path || "",
+    certificate_path: profile?.certificate_path || "",
     secret: "",
   };
 }
@@ -57,7 +57,7 @@ export function SshClientForm({
     setForm((current) => ({ ...current, [field]: value }));
   }, []);
 
-  const hasStoredSecret = Boolean(profile?.hasSecret);
+  const hasStoredSecret = Boolean(profile?.has_secret);
 
   const browseForFile = useCallback(async (field) => {
     try {
@@ -84,15 +84,15 @@ export function SshClientForm({
       host: form.host,
       port: form.port,
       username: form.username,
-      authMethod: form.authMethod,
-      keyPath: form.keyPath,
-      certificatePath: form.certificatePath,
+      auth_method: form.auth_method,
+      key_path: form.key_path,
+      certificate_path: form.certificate_path,
     };
     // Only send the secret when the user actually touched the password field.
     // On create with the password method, always send (even empty -> no secret).
-    if (form.authMethod === SSH_AUTH_PASSWORD && (secretDirty || !isEditing)) {
+    if (form.auth_method === SSH_AUTH_PASSWORD && (secretDirty || !isEditing)) {
       payload.secret = form.secret;
-    } else if (form.authMethod !== SSH_AUTH_PASSWORD && isEditing && hasStoredSecret) {
+    } else if (form.auth_method !== SSH_AUTH_PASSWORD && isEditing && hasStoredSecret) {
       // Switching an existing password profile to a keyless/key method clears
       // the stored secret so it does not linger on disk.
       payload.secret = "";
@@ -105,8 +105,8 @@ export function SshClientForm({
   }, [busy, form, hasStoredSecret, isEditing, onSave, secretDirty]);
 
   const authMethods = useMemo(() => SSH_AUTH_METHODS, []);
-  const showKeyFields = form.authMethod === SSH_AUTH_KEY;
-  const showPasswordField = form.authMethod === SSH_AUTH_PASSWORD;
+  const showKeyFields = form.auth_method === SSH_AUTH_KEY;
+  const showPasswordField = form.auth_method === SSH_AUTH_PASSWORD;
 
   return (
     <form onSubmit={handleSubmit}>
@@ -168,11 +168,11 @@ export function SshClientForm({
           <SshAuthSegment role="radiogroup">
             {authMethods.map((method) => (
               <SshAuthOption
-                aria-checked={form.authMethod === method.id}
-                data-selected={form.authMethod === method.id ? "true" : undefined}
+                aria-checked={form.auth_method === method.id}
+                data-selected={form.auth_method === method.id ? "true" : undefined}
                 disabled={busy}
                 key={method.id}
-                onClick={() => setField("authMethod", method.id)}
+                onClick={() => setField("auth_method", method.id)}
                 role="radio"
                 type="button"
               >
@@ -192,12 +192,12 @@ export function SshClientForm({
                   autoCapitalize="none"
                   autoCorrect="off"
                   disabled={busy}
-                  onChange={(event) => setField("keyPath", event.target.value)}
+                  onChange={(event) => setField("key_path", event.target.value)}
                   placeholder="~/.ssh/id_ed25519"
                   spellCheck={false}
-                  value={form.keyPath}
+                  value={form.key_path}
                 />
-                <SshInlineButton disabled={busy} onClick={() => browseForFile("keyPath")} type="button">
+                <SshInlineButton disabled={busy} onClick={() => browseForFile("key_path")} type="button">
                   Browse
                 </SshInlineButton>
               </SshInputWithButton>
@@ -212,12 +212,12 @@ export function SshClientForm({
                   autoCapitalize="none"
                   autoCorrect="off"
                   disabled={busy}
-                  onChange={(event) => setField("certificatePath", event.target.value)}
+                  onChange={(event) => setField("certificate_path", event.target.value)}
                   placeholder="~/.ssh/id_ed25519-cert.pub"
                   spellCheck={false}
-                  value={form.certificatePath}
+                  value={form.certificate_path}
                 />
-                <SshInlineButton disabled={busy} onClick={() => browseForFile("certificatePath")} type="button">
+                <SshInlineButton disabled={busy} onClick={() => browseForFile("certificate_path")} type="button">
                   Browse
                 </SshInlineButton>
               </SshInputWithButton>

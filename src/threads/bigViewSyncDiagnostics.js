@@ -95,7 +95,7 @@ export function getBigViewTextDiagnosticFields(value, options = {}) {
     hasCodexPastedContentMarker: /\[Pasted Content \d+ chars\]/i.test(text),
     hasCarriageReturn: carriageReturnCount > 0,
     hasNewline: newlineCount > 0,
-    lineCount: text ? text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").length : 0,
+    line_count: text ? text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").length : 0,
     newlineCount,
     preview: sanitized.slice(0, previewLength),
     tailPreview: sanitized.length > previewLength ? sanitized.slice(-previewLength) : "",

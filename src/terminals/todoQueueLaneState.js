@@ -39,9 +39,7 @@ function promptSourceIsTerminalDirect(value) {
 }
 
 function inFlightPromptIsTerminalDirect(inFlightPrompt) {
-  return promptSourceIsTerminalDirect(inFlightPrompt?.source)
-    || promptSourceIsTerminalDirect(inFlightPrompt?.lifecycleSource)
-    || promptSourceIsTerminalDirect(inFlightPrompt?.lifecycle_source);
+  return promptSourceIsTerminalDirect(inFlightPrompt?.source) || promptSourceIsTerminalDirect(inFlightPrompt?.lifecycle_source);
 }
 
 function getProviderTurnReleaseReason(turnState) {
@@ -77,11 +75,7 @@ function messageText(message) {
 
 function messageCreatedAtMs(message) {
   return parseTimestampMs(
-    message?.createdAt
-      || message?.created_at
-      || message?.timestamp
-      || message?.time
-      || "",
+    message?.created_at || message?.timestamp || message?.time || "",
   );
 }
 
@@ -128,9 +122,9 @@ export function getTodoQueueLatestUserMessage(thread) {
 
 export function getTodoQueuePromptCompletionEvidence({
   messages = [],
-  promptText = "",
+  prompt_text: promptText = "",
   readyGraceMs = 1000,
-  submittedAtMs = 0,
+  submitted_at_ms: submittedAtMs = 0,
 } = {}) {
   const normalizedPromptText = normalizeTodoQueuePromptComparisonText(promptText);
   if (!normalizedPromptText) {
@@ -199,30 +193,30 @@ export function evaluateTodoQueueInFlightPrompt({
   hookManaged = false,
   inFlightPrompt = null,
   liveTerminal = null,
-  nowMs = Date.now(),
+  now_ms: nowMs = Date.now(),
   providerBinding = null,
   readyGraceMs = 1000,
   recordedAgentInputReady = false,
   terminalGroundTruth = null,
-  terminalStatus = "",
+  terminal_status: terminalStatus = "",
   targetThread = null,
-  timeoutMs = 10 * 60 * 1000,
+  timeout_ms: timeoutMs = 10 * 60 * 1000,
 } = {}) {
-  const promptId = cleanText(inFlightPrompt?.promptId);
-  const promptText = cleanText(inFlightPrompt?.promptText);
+  const promptId = cleanText(inFlightPrompt?.prompt_id);
+  const promptText = cleanText(inFlightPrompt?.prompt_text);
   const submittedAtMs = Number(
-    inFlightPrompt?.submittedAtMs
-      || parseTimestampMs(inFlightPrompt?.submittedAt)
+    inFlightPrompt?.submitted_at_ms
+      || parseTimestampMs(inFlightPrompt?.submitted_at)
       || 0,
   );
-  const latestTurn = targetThread?.latestTurn || null;
+  const latestTurn = targetThread?.latest_turn || null;
   const rawLatestTurnState = normalizeTurnState(latestTurn?.state);
   const effectiveTurnState = normalizeTurnState(effectiveLatestTurnState);
   const latestTurnState = closedTurnStates.has(effectiveTurnState)
     ? effectiveTurnState
     : rawLatestTurnState || effectiveTurnState;
-  const latestTurnId = cleanText(latestTurn?.turnId || latestTurn?.id);
-  const latestMessageId = cleanText(latestTurn?.messageId);
+  const latestTurnId = cleanText(latestTurn?.turn_id || latestTurn?.id);
+  const latestMessageId = cleanText(latestTurn?.message_id);
   const latestTurnClosed = closedTurnStates.has(latestTurnState);
   const latestUserMessage = getTodoQueueLatestUserMessage(targetThread);
   const promptComparisonText = normalizeTodoQueuePromptComparisonText(promptText);
@@ -234,9 +228,9 @@ export function evaluateTodoQueueInFlightPrompt({
   );
   const latestUserCreatedAtMs = messageCreatedAtMs(latestUserMessage);
   const latestTurnStartedAtMs = parseTimestampMs(
-    latestTurn?.startedAt
-      || latestTurn?.requestedAt
-      || latestTurn?.updatedAt
+    latestTurn?.started_at
+      || latestTurn?.requested_at
+      || latestTurn?.updated_at
       || "",
   );
   const latestTurnAfterSubmit = Boolean(
@@ -252,9 +246,9 @@ export function evaluateTodoQueueInFlightPrompt({
       ),
   );
   const terminalInputReadyAtMs = parseTimestampMs(
-    liveTerminal?.inputReadyAt || "",
+    liveTerminal?.input_ready_at || "",
   );
-  const terminalInputReady = Boolean(liveTerminal?.inputReady);
+  const terminalInputReady = Boolean(liveTerminal?.input_ready);
   const normalizedTerminalStatus = normalizeTurnState(
     terminalStatus
       || liveTerminal?.status
@@ -262,7 +256,7 @@ export function evaluateTodoQueueInFlightPrompt({
   );
   const terminalClosed = Boolean(
     ["closed", "exited", "terminated"].includes(normalizedTerminalStatus)
-      || normalizeTurnState(liveTerminal?.terminalLifecycle || liveTerminal?.terminal_lifecycle) === "closed"
+      || normalizeTurnState(liveTerminal?.terminal_lifecycle) === "closed"
   );
   const terminalUnavailable = Boolean(
     submittedAtMs
@@ -275,13 +269,7 @@ export function evaluateTodoQueueInFlightPrompt({
       && terminalInputReadyAtMs >= submittedAtMs - readyGraceMs,
   );
   const terminalReadinessPromptId = cleanText(
-    liveTerminal?.promptEventId
-      || liveTerminal?.prompt_event_id
-      || liveTerminal?.pendingPromptId
-      || liveTerminal?.pending_prompt_id
-      || terminalGroundTruth?.promptEventId
-      || terminalGroundTruth?.pendingPromptId
-      || "",
+    liveTerminal?.prompt_event_id || liveTerminal?.pending_prompt_id || terminalGroundTruth?.prompt_event_id || terminalGroundTruth?.pending_prompt_id || "",
   );
   const terminalReadinessPromptMatches = Boolean(
     promptId
@@ -297,11 +285,7 @@ export function evaluateTodoQueueInFlightPrompt({
       )
   );
   const normalizedActivityStatus = normalizeTurnState(
-    effectiveActivityStatus
-      || terminalGroundTruth?.effectiveActivityStatus
-      || liveTerminal?.activityStatus
-      || liveTerminal?.activity_status
-      || "",
+    effectiveActivityStatus || terminalGroundTruth?.effectiveActivityStatus || liveTerminal?.activity_status || "",
   );
   const terminalPaused = Boolean(terminalActivityStatusIsPaused(normalizedActivityStatus));
   const terminalReadyForNextPrompt = Boolean(
@@ -323,9 +307,9 @@ export function evaluateTodoQueueInFlightPrompt({
       || inFlightPrompt?.acceptedAt,
   );
   const providerSessionId = cleanText(
-    targetThread?.transcriptSessionId
-      || providerBinding?.nativeSessionId
-      || inFlightPrompt?.sessionId
+    targetThread?.transcript_session_id
+      || providerBinding?.native_session_id
+      || inFlightPrompt?.session_id
       || "",
   );
   const sessionAcceptedByThread = Boolean(
@@ -343,9 +327,9 @@ export function evaluateTodoQueueInFlightPrompt({
   );
   const completionEvidence = getTodoQueuePromptCompletionEvidence({
     messages: targetThread?.messages,
-    promptText,
+    prompt_text: promptText,
     readyGraceMs,
-    submittedAtMs,
+    submitted_at_ms: submittedAtMs,
   });
   const transcriptCompletionAfterPrompt = false;
   const exactPromptTranscriptFinished = false;
@@ -370,8 +354,8 @@ export function evaluateTodoQueueInFlightPrompt({
       && terminalReadinessMatchesPrompt
   );
   const terminalConfirmedFinished = completedMatchingTurn || terminalDirectReadyFinished;
-  const promptInstanceId = Number.parseInt(inFlightPrompt?.terminalInstanceId, 10);
-  const liveInstanceId = Number.parseInt(liveTerminal?.instanceId, 10);
+  const promptInstanceId = Number.parseInt(inFlightPrompt?.terminal_instance_id, 10);
+  const liveInstanceId = Number.parseInt(liveTerminal?.instance_id, 10);
   const terminalInstanceChanged = Boolean(
     Number.isInteger(promptInstanceId)
       && promptInstanceId > 0
@@ -379,16 +363,16 @@ export function evaluateTodoQueueInFlightPrompt({
       && liveInstanceId > 0
       && promptInstanceId !== liveInstanceId
   );
-  const promptThreadId = cleanText(inFlightPrompt?.threadId);
-  const liveThreadId = cleanText(liveTerminal?.threadId || targetThread?.id);
+  const promptThreadId = cleanText(inFlightPrompt?.thread_id);
+  const liveThreadId = cleanText(liveTerminal?.thread_id || targetThread?.id);
   const threadChanged = Boolean(
     promptThreadId
       && liveThreadId
       && promptThreadId !== liveThreadId
   );
   const expired = Boolean(
-    Number(inFlightPrompt?.startedAtMs || 0) > 0
-      && nowMs - Number(inFlightPrompt.startedAtMs || 0) > timeoutMs
+    Number(inFlightPrompt?.started_at_ms || 0) > 0
+      && nowMs - Number(inFlightPrompt.started_at_ms || 0) > timeoutMs
   );
   const releaseReason = terminalConfirmedFinished
     ? getProviderTurnReleaseReason(latestTurnState)
@@ -427,19 +411,19 @@ export function evaluateTodoQueueInFlightPrompt({
     latestTurnState,
     latestUserPromptMatches,
     hookManaged: Boolean(hookManaged),
-    promptAccepted,
+    prompt_accepted: promptAccepted,
     promptAcceptedByCompletedThread,
     promptComparisonText,
-    promptId,
+    prompt_id: promptId,
     promptThreadId,
     promptTurnMatches,
     promptUserMessageSeen: completionEvidence.promptUserMessageSeen,
     recordedAgentInputReady: Boolean(recordedAgentInputReady),
     releaseReason,
     sessionAcceptedByThread,
-    submittedAtMs,
+    submitted_at_ms: submittedAtMs,
     terminalConfirmedFinished,
-    terminalClosed,
+    terminal_closed: terminalClosed,
     terminalDirectReadyFinished,
     terminalInputReady,
     terminalInputReadyAtMs,

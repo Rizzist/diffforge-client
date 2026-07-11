@@ -7,6 +7,10 @@
 // this module owns the durable, paginated path used by the History tab.
 
 import { invoke } from "@tauri-apps/api/core";
+import {
+  audioTranscriptionFromPersisted,
+  audioTranscriptionToPersisted,
+} from "./audioCapture";
 
 export const AUDIO_HISTORY_APPENDED_EVENT = "audio-history-appended";
 export const AUDIO_HISTORY_CHANGED_EVENT = "audio-history-changed";
@@ -20,16 +24,16 @@ export function audioHistoryEntryWithCreatedAtMs(entry) {
     return entry;
   }
 
-  const existing = Number(entry.createdAtMs);
+  const existing = Number(entry.created_at_ms);
   if (Number.isFinite(existing) && existing > 0) {
     return entry;
   }
 
   let createdAtMs = 0;
-  if (typeof entry.createdAt === "number" && Number.isFinite(entry.createdAt)) {
-    createdAtMs = entry.createdAt;
-  } else if (typeof entry.createdAt === "string") {
-    const parsed = Date.parse(entry.createdAt);
+  if (typeof entry.created_at === "number" && Number.isFinite(entry.created_at)) {
+    createdAtMs = entry.created_at;
+  } else if (typeof entry.created_at === "string") {
+    const parsed = Date.parse(entry.created_at);
     if (Number.isFinite(parsed)) {
       createdAtMs = parsed;
     }
@@ -38,18 +42,20 @@ export function audioHistoryEntryWithCreatedAtMs(entry) {
     createdAtMs = Date.now();
   }
 
-  return { ...entry, createdAtMs };
+  return { ...entry, created_at_ms: createdAtMs };
 }
 
 export async function audioHistoryAppend(entry) {
-  return invoke("audio_history_append", {
-    entry: audioHistoryEntryWithCreatedAtMs(entry),
+  const stored = await invoke("audio_history_append", {
+    entry: audioTranscriptionToPersisted(audioHistoryEntryWithCreatedAtMs(entry)),
   });
+  return audioTranscriptionFromPersisted(stored);
 }
 
 export async function audioHistoryImportEntries(entries) {
   const normalized = (Array.isArray(entries) ? entries : [])
     .map(audioHistoryEntryWithCreatedAtMs)
+    .map(audioTranscriptionToPersisted)
     .filter(Boolean);
   if (!normalized.length) {
     return { imported: 0 };
@@ -60,15 +66,19 @@ export async function audioHistoryImportEntries(entries) {
 export async function audioHistoryFetchPage({
   offset = null,
   limit = 60,
-  beforeCreatedAtMs = null,
-  beforeId = null,
+  before_created_at_ms: beforeCreatedAtMs = null,
+  before_id: beforeId = null,
 } = {}) {
-  return invoke("audio_history_page", {
+  const result = await invoke("audio_history_page", {
     offset,
     limit,
-    beforeCreatedAtMs,
-    beforeId,
+    before_created_at_ms: beforeCreatedAtMs,
+    before_id: beforeId,
   });
+  return {
+    ...(result || {}),
+    items: audioTranscriptionFromPersisted(Array.isArray(result?.items) ? result.items : []),
+  };
 }
 
 export async function audioHistoryFetchSummary() {

@@ -2,11 +2,11 @@ export function shouldReconcileProviderTurnCompletion(event = {}) {
   return Boolean(
     event
       && event.type === "provider-turn-completed"
-      && event.paneId
-      && event.reconcileCoordination === true,
+      && event.pane_id
+      && event.reconcile_coordination === true,
   );
 }
 
 export function getProviderTurnCompletionIntent(event = {}) {
-  return String(event?.providerTurnIntent || "casual_message").trim() || "casual_message";
+  return String(event?.provider_turn_intent || "casual_message").trim() || "casual_message";
 }

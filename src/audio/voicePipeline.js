@@ -12,7 +12,6 @@ export const DEFAULT_VOICE_DICTIONARY_TERMS = Object.freeze([
   "Diff Forge AI",
   "Diff Forge Cloud",
   "Diff Forge",
-  "DiffForge",
   "Rust client",
   "token",
   "tokens",
@@ -381,7 +380,7 @@ export function normalizeVoiceTextRules(value) {
         id: cleanRuleId(entry?.id, "transform", index),
         match,
         replacement: capRuleText(entry?.replacement, MAX_VOICE_EXPANSION_CHARS),
-        isRegex: entry?.isRegex === true,
+        is_regex: entry?.is_regex === true,
         enabled: ruleEnabled(entry?.enabled),
       };
     })
@@ -495,7 +494,7 @@ function applyTransformRules(text, entries) {
       continue;
     }
 
-    if (entry.isRegex) {
+    if (entry.is_regex) {
       try {
         const pattern = new RegExp(entry.match, "gi");
         const before = nextText;
@@ -532,7 +531,7 @@ export function applyVoiceTextPipeline(text, rules) {
 
   return {
     text: transformPass.text,
-    sourceText,
+    source_text: sourceText,
     changed: transformPass.text !== sourceText,
     counts: {
       dictionary: dictionaryPass.replacements,

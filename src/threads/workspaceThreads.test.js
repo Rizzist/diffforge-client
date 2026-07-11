@@ -33,89 +33,89 @@ function createPersistDirtyTestState() {
   const workspaceId = "workspace-dirty-persist";
   return {
     [workspaceId]: {
-      activeThreadId: "thread-a",
-      archivedThreadOrder: ["thread-archived"],
-      archivedThreads: {
+      active_thread_id: "thread-a",
+      archived_thread_order: ["thread-archived"],
+      archived_threads: {
         "thread-archived": {
           archivedAt: "2026-07-01T00:00:00.000Z",
-          currentAgent: "codex",
+          current_agent: "codex",
           id: "thread-archived",
           materialized: true,
-          messageCount: 1,
+          message_count: 1,
           messages: [{
-            createdAt: "2026-07-01T00:00:00.000Z",
+            created_at: "2026-07-01T00:00:00.000Z",
             id: "archived-message",
             role: "user",
             text: "archived prompt",
           }],
-          providerBindings: {
+          provider_bindings: {
             codex: {
-              nativeSessionId: "session-archived",
+              native_session_id: "session-archived",
             },
           },
-          workspaceId,
+          workspace_id: workspaceId,
         },
       },
-      terminalThreadIds: {},
+      terminal_thread_ids: {},
       terminals: {},
-      threadOrder: ["thread-a", "thread-b"],
+      thread_order: ["thread-a", "thread-b"],
       threads: {
         "thread-a": {
-          currentAgent: "codex",
+          current_agent: "codex",
           id: "thread-a",
           materialized: true,
-          messageCount: 1,
+          message_count: 1,
           messages: [{
-            createdAt: "2026-07-01T00:00:00.000Z",
+            created_at: "2026-07-01T00:00:00.000Z",
             id: "message-a",
             role: "user",
             text: "first prompt",
           }],
-          providerBindings: {
+          provider_bindings: {
             codex: {
-              nativeSessionId: "session-a",
+              native_session_id: "session-a",
             },
           },
           status: "idle",
-          workspaceId,
+          workspace_id: workspaceId,
         },
         "thread-b": {
-          currentAgent: "codex",
+          current_agent: "codex",
           id: "thread-b",
           materialized: true,
-          messageCount: 1,
+          message_count: 1,
           messages: [{
-            createdAt: "2026-07-01T00:01:00.000Z",
+            created_at: "2026-07-01T00:01:00.000Z",
             id: "message-b",
             role: "user",
             text: "second prompt",
           }],
-          providerBindings: {
+          provider_bindings: {
             codex: {
-              nativeSessionId: "session-b",
+              native_session_id: "session-b",
             },
           },
           status: "idle",
-          workspaceId,
+          workspace_id: workspaceId,
         },
       },
-      threadsView: {
+      threads_view: {
         selectedThreadId: "thread-a",
-        selectedWorkspaceId: workspaceId,
+        selected_workspace_id: workspaceId,
       },
     },
   };
 }
 
 function legacyHydratedWorkspaceThreadsMerge(currentThreads, loadedThreads, targets, ensureTargets = []) {
-  const targetIds = new Set(targets.map((target) => target.workspaceId));
+  const targetIds = new Set(targets.map((target) => target.workspace_id));
   const normalizedCurrent = normalizeWorkspaceThreads(currentThreads);
   let mergedThreads = Object.fromEntries(
     Object.entries(normalizedCurrent).filter(([workspaceId]) => targetIds.has(workspaceId)),
   );
   targets.forEach((target) => {
-    if (loadedThreads[target.workspaceId]) {
-      mergedThreads[target.workspaceId] = loadedThreads[target.workspaceId];
+    if (loadedThreads[target.workspace_id]) {
+      mergedThreads[target.workspace_id] = loadedThreads[target.workspace_id];
     }
   });
   ensureTargets.forEach((ensureTarget) => {
@@ -127,12 +127,10 @@ function legacyHydratedWorkspaceThreadsMerge(currentThreads, loadedThreads, targ
 function deletePersistedMessageProjectionHashes(threads) {
   const clone = JSON.parse(JSON.stringify(threads));
   Object.values(clone).forEach((entry) => {
-    [entry?.threads, entry?.archivedThreads].forEach((rows) => {
+    [entry?.threads, entry?.archived_threads].forEach((rows) => {
       Object.values(rows || {}).forEach((thread) => {
         (Array.isArray(thread.messages) ? thread.messages : []).forEach((message) => {
-          delete message.projectionHash;
           delete message.projection_hash;
-          delete message.stableProjectionHash;
           delete message.stable_projection_hash;
         });
       });
@@ -143,22 +141,22 @@ function deletePersistedMessageProjectionHashes(threads) {
 
 test("hydrated workspace thread merge matches legacy output without normalizing non-target state", () => {
   const targets = [
-    { workspaceId: "workspace-loaded" },
-    { workspaceId: "workspace-current" },
+    { workspace_id: "workspace-loaded" },
+    { workspace_id: "workspace-current" },
   ];
   const ensureTargets = [{
     fallbackAgent: "codex",
     rolesByIndex: { 0: "codex" },
-    terminalIndexes: [0],
-    workspaceId: "workspace-current",
+    terminal_indexes: [0],
+    workspace_id: "workspace-current",
   }];
   const currentThreads = {
     "workspace-loaded": {
-      activeThreadId: "thread-old",
-      threadOrder: ["thread-old"],
+      active_thread_id: "thread-old",
+      thread_order: ["thread-old"],
       threads: {
         "thread-old": {
-          currentAgent: "codex",
+          current_agent: "codex",
           id: "thread-old",
           materialized: true,
           messages: [{
@@ -166,66 +164,66 @@ test("hydrated workspace thread merge matches legacy output without normalizing 
             role: "user",
             text: "this current entry is replaced by SQLite",
           }],
-          workspaceId: "workspace-loaded",
+          workspace_id: "workspace-loaded",
         },
       },
     },
     "workspace-current": {
-      activeThreadId: "thread-current",
-      terminalOrder: ["0"],
-      terminalThreadIds: { 0: "thread-current" },
+      active_thread_id: "thread-current",
+      terminal_order: ["0"],
+      terminal_thread_ids: { 0: "thread-current" },
       terminals: {
         0: {
-          agentId: "codex",
-          displayName: "Ada",
-          lastActiveAt: "2026-07-01T00:00:00.000Z",
+          agent_id: "codex",
+          display_name: "Ada",
+          last_active_at: "2026-07-01T00:00:00.000Z",
           status: "idle",
-          terminalName: "Ada",
-          terminalNickname: "Ada",
-          terminalIndex: 0,
-          threadId: "thread-current",
-          updatedAt: "2026-07-01T00:00:00.000Z",
+          terminal_name: "Ada",
+          terminal_nickname: "Ada",
+          terminal_index: 0,
+          thread_id: "thread-current",
+          updated_at: "2026-07-01T00:00:00.000Z",
         },
       },
-      threadOrder: ["thread-current"],
+      thread_order: ["thread-current"],
       threads: {
         "thread-current": {
-          createdAt: "2026-07-01T00:00:00.000Z",
-          currentAgent: "codex",
-          displayName: "Ada",
+          created_at: "2026-07-01T00:00:00.000Z",
+          current_agent: "codex",
+          display_name: "Ada",
           id: "thread-current",
-          lastActiveAt: "2026-07-01T00:00:00.000Z",
+          last_active_at: "2026-07-01T00:00:00.000Z",
           materialized: true,
           messages: [{
-            createdAt: "2026-07-01T00:00:00.000Z",
+            created_at: "2026-07-01T00:00:00.000Z",
             id: "message-current",
             role: "user",
             text: "retained current fallback",
           }],
-          providerBindings: {
+          provider_bindings: {
             codex: {
-              lastActiveAt: "2026-07-01T00:00:00.000Z",
+              last_active_at: "2026-07-01T00:00:00.000Z",
               status: "idle",
-              terminalName: "Ada",
-              terminalNickname: "Ada",
-              updatedAt: "2026-07-01T00:00:00.000Z",
+              terminal_name: "Ada",
+              terminal_nickname: "Ada",
+              updated_at: "2026-07-01T00:00:00.000Z",
             },
           },
           status: "idle",
-          terminalName: "Ada",
-          terminalNickname: "Ada",
-          terminalIndex: 0,
-          updatedAt: "2026-07-01T00:00:00.000Z",
-          workspaceId: "workspace-current",
+          terminal_name: "Ada",
+          terminal_nickname: "Ada",
+          terminal_index: 0,
+          updated_at: "2026-07-01T00:00:00.000Z",
+          workspace_id: "workspace-current",
         },
       },
     },
     "workspace-dropped": {
-      activeThreadId: "thread-dropped",
-      threadOrder: ["thread-dropped"],
+      active_thread_id: "thread-dropped",
+      thread_order: ["thread-dropped"],
       threads: {
         "thread-dropped": {
-          currentAgent: "codex",
+          current_agent: "codex",
           id: "thread-dropped",
           materialized: true,
           messages: [{
@@ -233,28 +231,28 @@ test("hydrated workspace thread merge matches legacy output without normalizing 
             role: "user",
             text: "non-target state must not survive hydration merge",
           }],
-          workspaceId: "workspace-dropped",
+          workspace_id: "workspace-dropped",
         },
       },
     },
   };
   const loadedThreads = normalizeWorkspaceThreads({
     "workspace-loaded": {
-      activeThreadId: "thread-loaded",
-      threadOrder: ["thread-loaded"],
+      active_thread_id: "thread-loaded",
+      thread_order: ["thread-loaded"],
       threads: {
         "thread-loaded": {
-          currentAgent: "codex",
+          current_agent: "codex",
           id: "thread-loaded",
           materialized: true,
           messages: [{
-            createdAt: "2026-07-01T00:01:00.000Z",
+            created_at: "2026-07-01T00:01:00.000Z",
             id: "message-loaded",
             role: "user",
             text: "loaded from SQLite",
           }],
           status: "idle",
-          workspaceId: "workspace-loaded",
+          workspace_id: "workspace-loaded",
         },
       },
     },
@@ -272,8 +270,8 @@ test("hydrated workspace thread merge matches legacy output without normalizing 
   });
 
   assert.deepEqual(optimized, legacy);
-  assert.equal(optimized["workspace-loaded"].activeThreadId, "thread-loaded");
-  assert.equal(optimized["workspace-current"].activeThreadId, "thread-current");
+  assert.equal(optimized["workspace-loaded"].active_thread_id, "thread-loaded");
+  assert.equal(optimized["workspace-current"].active_thread_id, "thread-current");
   assert.equal(optimized["workspace-dropped"], undefined);
 });
 
@@ -282,29 +280,29 @@ test("persisted workspace thread messages carry projection hashes without changi
   const threadId = "thread-projection-hash";
   const state = {
     [workspaceId]: {
-      activeThreadId: threadId,
-      threadOrder: [threadId],
+      active_thread_id: threadId,
+      thread_order: [threadId],
       threads: {
         [threadId]: {
-          currentAgent: "codex",
+          current_agent: "codex",
           id: threadId,
           materialized: true,
           messages: [{
-            createdAt: "2026-07-01T00:00:00.000Z",
+            created_at: "2026-07-01T00:00:00.000Z",
             id: "message-user-hash",
             role: "user",
             text: "summarize the repository",
           }, {
-            createdAt: "2026-07-01T00:00:01.000Z",
+            created_at: "2026-07-01T00:00:01.000Z",
             id: "message-activity-hash",
             kind: "tool_call",
             role: "activity",
             text: "rg workspace_threads_read",
-            toolInput: { pattern: "workspace_threads_read" },
-            toolName: "rg",
+            tool_input: { pattern: "workspace_threads_read" },
+            tool_name: "rg",
           }],
           status: "idle",
-          workspaceId,
+          workspace_id: workspaceId,
         },
       },
     },
@@ -313,7 +311,7 @@ test("persisted workspace thread messages carry projection hashes without changi
   const persisted = persistWorkspaceThreads(state);
   const persistedMessages = persisted[workspaceId].threads[threadId].messages;
   persistedMessages.forEach((message) => {
-    assert.match(message.projectionHash, /^[a-z0-9]+$/);
+    assert.match(message.projection_hash, /^[a-z0-9]+$/);
   });
 
   const legacyPersisted = deletePersistedMessageProjectionHashes(persisted);
@@ -324,7 +322,7 @@ test("persisted workspace thread messages carry projection hashes without changi
 
   const repersistedLegacy = persistWorkspaceThreads(normalizeWorkspaceThreads(legacyPersisted));
   repersistedLegacy[workspaceId].threads[threadId].messages.forEach((message) => {
-    assert.match(message.projectionHash, /^[a-z0-9]+$/);
+    assert.match(message.projection_hash, /^[a-z0-9]+$/);
   });
 });
 
@@ -333,59 +331,59 @@ test("stored projection hashes preserve message-bootstrap projection output", ()
   const threadId = "thread-projection-hash-bootstrap";
   const persisted = persistWorkspaceThreads({
     [workspaceId]: {
-      activeThreadId: threadId,
-      threadOrder: [threadId],
+      active_thread_id: threadId,
+      thread_order: [threadId],
       threads: {
         [threadId]: {
-          createdAt: "2026-07-01T00:00:00.000Z",
-          currentAgent: "codex",
+          created_at: "2026-07-01T00:00:00.000Z",
+          current_agent: "codex",
           id: threadId,
-          lastActiveAt: "2026-07-01T00:00:00.000Z",
+          last_active_at: "2026-07-01T00:00:00.000Z",
           materialized: true,
           messages: [{
-            createdAt: "2026-07-01T00:00:00.000Z",
+            created_at: "2026-07-01T00:00:00.000Z",
             id: "message-user-bootstrap",
             role: "user",
             text: "run the frontend tests",
-            turnId: "turn-bootstrap",
+            turn_id: "turn-bootstrap",
           }, {
-            createdAt: "2026-07-01T00:00:01.000Z",
+            created_at: "2026-07-01T00:00:01.000Z",
             id: "message-assistant-bootstrap",
             role: "assistant",
             status: "complete",
             text: "Tests passed.",
-            turnId: "turn-bootstrap",
+            turn_id: "turn-bootstrap",
           }],
-          providerBindings: {
+          provider_bindings: {
             codex: {
-              lastActiveAt: "2026-07-01T00:00:00.000Z",
-              lastMessageAt: "2026-07-01T00:00:01.000Z",
-              messageCount: 2,
+              last_active_at: "2026-07-01T00:00:00.000Z",
+              last_message_at: "2026-07-01T00:00:01.000Z",
+              message_count: 2,
               status: "idle",
-              updatedAt: "2026-07-01T00:00:01.000Z",
+              updated_at: "2026-07-01T00:00:01.000Z",
             },
           },
           status: "idle",
-          updatedAt: "2026-07-01T00:00:01.000Z",
-          workspaceId,
+          updated_at: "2026-07-01T00:00:01.000Z",
+          workspace_id: workspaceId,
         },
       },
     },
   });
   const legacyPersisted = deletePersistedMessageProjectionHashes(persisted);
   const event = {
-    agentId: "codex",
-    createdAt: "2026-07-01T00:00:02.000Z",
-    messageId: "turn-bootstrap",
-    projectionEvents: [{
-      createdAt: "2026-07-01T00:00:02.000Z",
-      messageId: "turn-bootstrap",
+    agent_id: "codex",
+    created_at: "2026-07-01T00:00:02.000Z",
+    message_id: "turn-bootstrap",
+    projection_events: [{
+      created_at: "2026-07-01T00:00:02.000Z",
+      message_id: "turn-bootstrap",
       status: "completed",
-      turnId: "turn-bootstrap",
+      turn_id: "turn-bootstrap",
       type: "thread.turn.completed",
     }],
-    threadId,
-    workspaceId,
+    thread_id: threadId,
+    workspace_id: workspaceId,
   };
 
   const withStoredHashes = appendWorkspaceThreadProjectionEvents(
@@ -398,7 +396,7 @@ test("stored projection hashes preserve message-bootstrap projection output", ()
   )[workspaceId].threads[threadId];
 
   assert.deepEqual(withStoredHashes.messages, withoutStoredHashes.messages);
-  assert.deepEqual(withStoredHashes.projectionEvents, withoutStoredHashes.projectionEvents);
+  assert.deepEqual(withStoredHashes.projection_events, withoutStoredHashes.projection_events);
 });
 
 test("workspace thread dirty tracking ignores semantic no-op mutations", () => {
@@ -406,20 +404,20 @@ test("workspace thread dirty tracking ignores semantic no-op mutations", () => {
   const state = createPersistDirtyTestState();
   const previous = persistWorkspaceThreads(state);
   const next = updateWorkspaceThreadProviderModel(state, {
-    agentId: "codex",
-    modelId: "",
-    threadId: "thread-a",
-    workspaceId: "workspace-dirty-persist",
+    agent_id: "codex",
+    model_id: "",
+    thread_id: "thread-a",
+    workspace_id: "workspace-dirty-persist",
   });
 
   assert.equal(next, state);
-  const dirtySnapshot = getWorkspaceThreadsPersistDirtySnapshot([{ workspaceId: "workspace-dirty-persist" }]);
+  const dirtySnapshot = getWorkspaceThreadsPersistDirtySnapshot([{ workspace_id: "workspace-dirty-persist" }]);
   assert.deepEqual(dirtySnapshot.workspaces, {});
 
   const { request } = buildWorkspaceThreadsPersistDelta(
     next,
     previous,
-    [{ workspaceId: "workspace-dirty-persist" }],
+    [{ workspace_id: "workspace-dirty-persist" }],
     { dirtySnapshot },
   );
   assert.deepEqual(request.workspaces, []);
@@ -430,45 +428,45 @@ test("workspace thread dirty tracking persists only marked thread rows", () => {
   const state = createPersistDirtyTestState();
   const previous = persistWorkspaceThreads(state);
   const next = updateWorkspaceThreadProviderModel(state, {
-    agentId: "codex",
-    modelId: "gpt-5",
-    threadId: "thread-a",
-    workspaceId: "workspace-dirty-persist",
+    agent_id: "codex",
+    model_id: "gpt-5",
+    thread_id: "thread-a",
+    workspace_id: "workspace-dirty-persist",
   });
 
-  const dirtySnapshot = getWorkspaceThreadsPersistDirtySnapshot([{ workspaceId: "workspace-dirty-persist" }]);
+  const dirtySnapshot = getWorkspaceThreadsPersistDirtySnapshot([{ workspace_id: "workspace-dirty-persist" }]);
   const { request } = buildWorkspaceThreadsPersistDelta(
     next,
     previous,
-    [{ workspaceId: "workspace-dirty-persist" }],
+    [{ workspace_id: "workspace-dirty-persist" }],
     { dirtySnapshot },
   );
 
   assert.equal(request.workspaces.length, 1);
   assert.deepEqual(
-    request.workspaces[0].threads.map((row) => row.threadId),
+    request.workspaces[0].threads.map((row) => row.thread_id),
     ["thread-a"],
   );
-  assert.equal(request.workspaces[0].archivedThreads, undefined);
+  assert.equal(request.workspaces[0].archived_threads, undefined);
 });
 
 test("workspace thread dirty tracking retains marks until successful clear", () => {
   resetWorkspaceThreadsPersistDirty();
   const state = createPersistDirtyTestState();
   updateWorkspaceThreadProviderModel(state, {
-    agentId: "codex",
-    modelId: "gpt-5",
-    threadId: "thread-a",
-    workspaceId: "workspace-dirty-persist",
+    agent_id: "codex",
+    model_id: "gpt-5",
+    thread_id: "thread-a",
+    workspace_id: "workspace-dirty-persist",
   });
 
-  const dirtySnapshot = getWorkspaceThreadsPersistDirtySnapshot([{ workspaceId: "workspace-dirty-persist" }]);
+  const dirtySnapshot = getWorkspaceThreadsPersistDirtySnapshot([{ workspace_id: "workspace-dirty-persist" }]);
   assert.equal(
     dirtySnapshot.workspaces["workspace-dirty-persist"].threadVersions["thread-a"] > 0,
     true,
   );
 
-  const retainedSnapshot = getWorkspaceThreadsPersistDirtySnapshot([{ workspaceId: "workspace-dirty-persist" }]);
+  const retainedSnapshot = getWorkspaceThreadsPersistDirtySnapshot([{ workspace_id: "workspace-dirty-persist" }]);
   assert.equal(
     retainedSnapshot.workspaces["workspace-dirty-persist"].threadVersions["thread-a"],
     dirtySnapshot.workspaces["workspace-dirty-persist"].threadVersions["thread-a"],
@@ -479,22 +477,22 @@ test("workspace thread dirty tracking preserves marks added during in-flight per
   resetWorkspaceThreadsPersistDirty();
   const state = createPersistDirtyTestState();
   const first = updateWorkspaceThreadProviderModel(state, {
-    agentId: "codex",
-    modelId: "gpt-5",
-    threadId: "thread-a",
-    workspaceId: "workspace-dirty-persist",
+    agent_id: "codex",
+    model_id: "gpt-5",
+    thread_id: "thread-a",
+    workspace_id: "workspace-dirty-persist",
   });
-  const inFlightSnapshot = getWorkspaceThreadsPersistDirtySnapshot([{ workspaceId: "workspace-dirty-persist" }]);
+  const inFlightSnapshot = getWorkspaceThreadsPersistDirtySnapshot([{ workspace_id: "workspace-dirty-persist" }]);
 
   updateWorkspaceThreadProviderModel(first, {
-    agentId: "codex",
-    modelId: "gpt-5.1",
-    threadId: "thread-b",
-    workspaceId: "workspace-dirty-persist",
+    agent_id: "codex",
+    model_id: "gpt-5.1",
+    thread_id: "thread-b",
+    workspace_id: "workspace-dirty-persist",
   });
   clearWorkspaceThreadsPersistDirtySnapshot(inFlightSnapshot);
 
-  const remainingSnapshot = getWorkspaceThreadsPersistDirtySnapshot([{ workspaceId: "workspace-dirty-persist" }]);
+  const remainingSnapshot = getWorkspaceThreadsPersistDirtySnapshot([{ workspace_id: "workspace-dirty-persist" }]);
   assert.equal(
     remainingSnapshot.workspaces["workspace-dirty-persist"].threadVersions["thread-a"],
     undefined,
@@ -511,17 +509,17 @@ test("workspace thread dirty tracking still detects removed active and archived 
   const previous = persistWorkspaceThreads(state);
   const withoutActive = deleteWorkspaceThread(state, "workspace-dirty-persist", "thread-a");
   const withoutBoth = deleteWorkspaceThread(withoutActive, "workspace-dirty-persist", "thread-archived");
-  const dirtySnapshot = getWorkspaceThreadsPersistDirtySnapshot([{ workspaceId: "workspace-dirty-persist" }]);
+  const dirtySnapshot = getWorkspaceThreadsPersistDirtySnapshot([{ workspace_id: "workspace-dirty-persist" }]);
   const { request } = buildWorkspaceThreadsPersistDelta(
     withoutBoth,
     previous,
-    [{ workspaceId: "workspace-dirty-persist" }],
+    [{ workspace_id: "workspace-dirty-persist" }],
     { dirtySnapshot },
   );
 
   assert.equal(request.workspaces.length, 1);
-  assert.deepEqual(request.workspaces[0].removedThreadIds, ["thread-a"]);
-  assert.deepEqual(request.workspaces[0].removedArchivedThreadIds, ["thread-archived"]);
+  assert.deepEqual(request.workspaces[0].removed_thread_ids, ["thread-a"]);
+  assert.deepEqual(request.workspaces[0].removed_archived_thread_ids, ["thread-archived"]);
 });
 
 test("deleteWorkspaceThread hard-removes active and archived thread state", () => {
@@ -529,45 +527,45 @@ test("deleteWorkspaceThread hard-removes active and archived thread state", () =
   const threadId = "thread-delete";
   const state = {
     [workspaceId]: {
-      activeThreadId: threadId,
-      archivedThreadOrder: [threadId],
-      archivedThreads: {
+      active_thread_id: threadId,
+      archived_thread_order: [threadId],
+      archived_threads: {
         [threadId]: {
           id: threadId,
           archivedAt: "2026-06-30T00:00:00.000Z",
-          currentAgent: "codex",
-          providerBindings: {
+          current_agent: "codex",
+          provider_bindings: {
             codex: {
-              nativeSessionId: "session-delete",
+              native_session_id: "session-delete",
             },
           },
         },
       },
-      terminalThreadIds: {
+      terminal_thread_ids: {
         0: threadId,
       },
       terminals: {
         0: {
-          terminalIndex: 0,
-          threadId,
+          terminal_index: 0,
+          thread_id: threadId,
         },
       },
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: {
           id: threadId,
-          currentAgent: "codex",
-          providerBindings: {
+          current_agent: "codex",
+          provider_bindings: {
             codex: {
-              nativeSessionId: "session-delete",
+              native_session_id: "session-delete",
             },
           },
-          terminalIndex: 0,
+          terminal_index: 0,
         },
       },
-      threadsView: {
+      threads_view: {
         selectedThreadId: threadId,
-        selectedWorkspaceId: workspaceId,
+        selected_workspace_id: workspaceId,
       },
     },
   };
@@ -575,13 +573,13 @@ test("deleteWorkspaceThread hard-removes active and archived thread state", () =
   const next = deleteWorkspaceThread(state, workspaceId, threadId);
   const entry = next[workspaceId];
   assert.deepEqual(Object.keys(entry.threads), []);
-  assert.deepEqual(Object.keys(entry.archivedThreads), []);
-  assert.deepEqual(entry.threadOrder, []);
-  assert.deepEqual(entry.archivedThreadOrder, []);
-  assert.deepEqual(entry.terminalThreadIds, {});
-  assert.equal(entry.terminals[0].threadId, "");
-  assert.equal(entry.activeThreadId, "");
-  assert.equal(entry.threadsView.selectedThreadId, "");
+  assert.deepEqual(Object.keys(entry.archived_threads), []);
+  assert.deepEqual(entry.thread_order, []);
+  assert.deepEqual(entry.archived_thread_order, []);
+  assert.deepEqual(entry.terminal_thread_ids, {});
+  assert.equal(entry.terminals[0].thread_id, "");
+  assert.equal(entry.active_thread_id, "");
+  assert.equal(entry.threads_view.selectedThreadId, "");
 });
 
 test("provider session binding attaches to the live terminal thread without a thread id", () => {
@@ -591,97 +589,97 @@ test("provider session binding attaches to the live terminal thread without a th
   const state = {
     [workspaceId]: {
       id: workspaceId,
-      terminalThreadIds: {
+      terminal_thread_ids: {
         1: threadId,
       },
       terminals: {
         1: {
-          activityStatus: "thinking",
-          agentId: "codex",
-          inputReady: false,
-          instanceId: 42,
-          paneId: "pane-session-binding",
+          activity_status: "thinking",
+          agent_id: "codex",
+          input_ready: false,
+          instance_id: 42,
+          pane_id: "pane-session-binding",
           status: "active",
-          terminalIndex: 1,
-          threadId,
+          terminal_index: 1,
+          thread_id: threadId,
         },
       },
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: {
-          activityStatus: "thinking",
-          currentAgent: "codex",
+          activity_status: "thinking",
+          current_agent: "codex",
           id: threadId,
-          latestTurn: {
-            messageId: "prompt-session-binding",
-            promptEpoch: 3,
-            startedAt: "2026-06-18T12:00:00.000Z",
+          latest_turn: {
+            message_id: "prompt-session-binding",
+            prompt_epoch: 3,
+            started_at: "2026-06-18T12:00:00.000Z",
             state: "running",
-            turnId: "turn-session-binding",
+            turn_id: "turn-session-binding",
           },
-          messageCount: 1,
+          message_count: 1,
           messages: [{
-            createdAt: "2026-06-18T12:00:00.000Z",
+            created_at: "2026-06-18T12:00:00.000Z",
             id: "prompt-session-binding",
             role: "user",
             text: "bind this session",
-            turnId: "turn-session-binding",
+            turn_id: "turn-session-binding",
           }],
-          projectionEvents: [{
-            agentId: "codex",
-            createdAt: "2026-06-18T12:00:00.000Z",
+          projection_events: [{
+            agent_id: "codex",
+            created_at: "2026-06-18T12:00:00.000Z",
             id: "turn-session-binding-started",
-            messageId: "prompt-session-binding",
-            promptEpoch: 3,
+            message_id: "prompt-session-binding",
+            prompt_epoch: 3,
             status: "running",
-            turnId: "turn-session-binding",
+            turn_id: "turn-session-binding",
             type: "thread.turn.started",
           }, {
-            agentId: "codex",
-            createdAt: "2026-06-18T12:00:00.000Z",
+            agent_id: "codex",
+            created_at: "2026-06-18T12:00:00.000Z",
             id: "prompt-session-binding",
-            messageId: "prompt-session-binding",
+            message_id: "prompt-session-binding",
             role: "user",
             status: "submitted",
             text: "bind this session",
-            turnId: "turn-session-binding",
+            turn_id: "turn-session-binding",
             type: "thread.message.user",
           }],
-          providerBindings: {},
+          provider_bindings: {},
           status: "active",
-          terminalBinding: {
-            instanceId: 42,
-            paneId: "pane-session-binding",
-            terminalIndex: 1,
+          terminal_binding: {
+            instance_id: 42,
+            pane_id: "pane-session-binding",
+            terminal_index: 1,
           },
-          terminalIndex: 1,
-          workspaceId,
+          terminal_index: 1,
+          workspace_id: workspaceId,
         },
       },
     },
   };
 
   const nextState = applyWorkspaceThreadProviderSessionBinding(state, {
-    agentId: "codex",
-    instanceId: 42,
-    nativeSessionId: sessionId,
-    paneId: "pane-session-binding",
-    providerSessionId: sessionId,
+    agent_id: "codex",
+    instance_id: 42,
+    native_session_id: sessionId,
+    pane_id: "pane-session-binding",
+    provider_session_id: sessionId,
     source: "rust-session-binding",
-    terminalIndex: 1,
+    terminal_index: 1,
     type: "provider-session",
-    workspaceId,
+    workspace_id: workspaceId,
   });
 
   const nextEntry = nextState[workspaceId];
   const nextThread = nextEntry.threads[threadId];
-  assert.equal(nextThread.transcriptSessionId, sessionId);
-  assert.equal(nextThread.activityStatus, "thinking");
-  assert.equal(nextThread.providerBindings.codex.nativeSessionId, sessionId);
-  assert.equal(nextThread.providerBindings.codex.nativeSessionSource, "rust-session-binding");
-  assert.equal(nextThread.providerBindings.codex.terminalBinding.paneId, "pane-session-binding");
-  assert.equal(nextEntry.terminals[1].nativeSessionId, sessionId);
-  assert.equal(nextEntry.terminals[1].activityStatus, "thinking");
+  assert.equal(nextThread.transcript_session_id, sessionId);
+  assert.equal(nextThread.activity_status, "thinking");
+  assert.equal(nextThread.provider_bindings.codex.native_session_id, sessionId);
+  assert.equal(nextThread.provider_bindings.codex.native_session_source, "rust-session-binding");
+  assert.equal(nextThread.provider_bindings.codex.terminal_binding.pane_id, "pane-session-binding");
+  assert.equal(nextEntry.terminals[1].native_session_id, sessionId);
+  assert.equal(nextEntry.terminals[1].activity_status, "thinking");
 });
 
 test("fresh terminal open without provider session clears stale live terminal session ids", () => {
@@ -691,58 +689,58 @@ test("fresh terminal open without provider session clears stale live terminal se
   const state = {
     [workspaceId]: {
       id: workspaceId,
-      terminalThreadIds: {
+      terminal_thread_ids: {
         0: threadId,
       },
       terminals: {
         0: {
-          activityStatus: "idle",
-          agentId: "opencode",
-          inputReady: true,
-          instanceId: 1,
-          nativeSessionId: oldSessionId,
-          paneId: "pane-terminal-restart",
-          providerSessionId: oldSessionId,
-          sessionId: oldSessionId,
+          activity_status: "idle",
+          agent_id: "opencode",
+          input_ready: true,
+          instance_id: 1,
+          native_session_id: oldSessionId,
+          pane_id: "pane-terminal-restart",
+          provider_session_id: oldSessionId,
+          session_id: oldSessionId,
           status: "active",
-          terminalIndex: 0,
-          threadId,
+          terminal_index: 0,
+          thread_id: threadId,
         },
       },
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: {
-          currentAgent: "opencode",
+          current_agent: "opencode",
           id: threadId,
-          providerBindings: {},
+          provider_bindings: {},
           status: "active",
-          terminalBinding: {
-            instanceId: 1,
-            paneId: "pane-terminal-restart",
-            terminalIndex: 0,
+          terminal_binding: {
+            instance_id: 1,
+            pane_id: "pane-terminal-restart",
+            terminal_index: 0,
           },
-          terminalIndex: 0,
-          workspaceId,
+          terminal_index: 0,
+          workspace_id: workspaceId,
         },
       },
     },
   };
 
   const nextState = updateWorkspaceActiveTerminal(state, {
-    agentId: "opencode",
-    instanceId: 2,
-    paneId: "pane-terminal-restart",
+    agent_id: "opencode",
+    instance_id: 2,
+    pane_id: "pane-terminal-restart",
     status: "active",
-    terminalIndex: 0,
+    terminal_index: 0,
     type: "opened",
-    workspaceId,
+    workspace_id: workspaceId,
   });
 
   const terminal = nextState[workspaceId].terminals[0];
-  assert.equal(terminal.instanceId, 2);
-  assert.equal(terminal.providerSessionId, "");
-  assert.equal(terminal.nativeSessionId, "");
-  assert.equal(terminal.sessionId, "");
+  assert.equal(terminal.instance_id, 2);
+  assert.equal(terminal.provider_session_id, "");
+  assert.equal(terminal.native_session_id, "");
+  assert.equal(terminal.session_id, "");
 });
 
 test("session transcript completion settles the exact active running turn", () => {
@@ -757,115 +755,115 @@ test("session transcript completion settles the exact active running turn", () =
   const state = {
     [workspaceId]: {
       id: workspaceId,
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: {
           id: threadId,
-          activityStatus: "thinking",
-          currentAgent: "codex",
-          latestTurn: {
-            messageId: promptId,
-            promptEpoch: 7,
-            startedAt: submittedAt,
+          activity_status: "thinking",
+          current_agent: "codex",
+          latest_turn: {
+            message_id: promptId,
+            prompt_epoch: 7,
+            started_at: submittedAt,
             state: "running",
-            turnId,
+            turn_id: turnId,
           },
           messages: [{
-            createdAt: submittedAt,
+            created_at: submittedAt,
             id: promptId,
             role: "user",
             text: "Explain this codebase",
-            turnId,
+            turn_id: turnId,
           }],
-          projectionEvents: [{
-            agentId: "codex",
-            createdAt: submittedAt,
+          projection_events: [{
+            agent_id: "codex",
+            created_at: submittedAt,
             id: "turn-start",
-            messageId: promptId,
-            promptEpoch: 7,
+            message_id: promptId,
+            prompt_epoch: 7,
             status: "running",
-            turnId,
+            turn_id: turnId,
             type: "thread.turn.started",
           }, {
-            agentId: "codex",
-            createdAt: submittedAt,
+            agent_id: "codex",
+            created_at: submittedAt,
             id: "user-message",
-            messageId: promptId,
+            message_id: promptId,
             role: "user",
             status: "submitted",
             text: "Explain this codebase",
-            turnId,
+            turn_id: turnId,
             type: "thread.message.user",
           }],
-          providerBindings: {
+          provider_bindings: {
             codex: {
-              activityStatus: "thinking",
-              inputReady: false,
-              nativeSessionId: sessionId,
-              nativeSessionKind: "session",
+              activity_status: "thinking",
+              input_ready: false,
+              native_session_id: sessionId,
+              native_session_kind: "session",
               status: "active",
             },
           },
           status: "active",
-          terminalBinding: {
-            instanceId: 1,
-            paneId: "pane-test",
-            terminalIndex: 0,
+          terminal_binding: {
+            instance_id: 1,
+            pane_id: "pane-test",
+            terminal_index: 0,
           },
-          terminalIndex: 0,
-          transcriptSessionId: sessionId,
-          workspaceId,
+          terminal_index: 0,
+          transcript_session_id: sessionId,
+          workspace_id: workspaceId,
         },
       },
     },
   };
 
   const nextState = hydrateWorkspaceThreadSessionTranscript(state, {
-    agentId: "codex",
-    allowTranscriptTurnCompletion: true,
-    completedAt,
-    expectedMessageCreatedAt: submittedAt,
-    expectedUserMessage: "Explain this codebase",
-    latestTimestamp: completedAt,
-    matchedBy: "sessionId",
+    agent_id: "codex",
+    allow_transcript_turn_completion: true,
+    completed_at: completedAt,
+    expected_message_created_at: submittedAt,
+    expected_user_message: "Explain this codebase",
+    latest_timestamp: completedAt,
+    matched_by: "session_id",
     messages: [{
-      createdAt: submittedAt,
+      created_at: submittedAt,
       id: promptId,
       role: "user",
       text: "Explain this codebase",
     }, {
-      createdAt: completedAt,
+      created_at: completedAt,
       id: "assistant-final",
       kind: "message",
       role: "assistant",
       text: "The project is basically an empty workspace.",
     }, {
-      createdAt: completedAt,
+      created_at: completedAt,
       id: "task-complete",
       kind: "task_complete",
       role: "assistant",
       text: "The project is basically an empty workspace.",
     }],
-    promptAccepted: true,
-    promptEpoch: 7,
-    promptEventId: promptId,
-    providerSessionId: sessionId,
-    sessionId,
+    prompt_accepted: true,
+    prompt_epoch: 7,
+    prompt_event_id: promptId,
+    provider_session_id: sessionId,
+    session_id: sessionId,
     source: "codex-session",
-    submittedAt,
-    transcriptExplicitCompletionCanSettleTurn: true,
-    turnCompleteSeen: true,
-    workspaceId,
-    threadId,
+    submitted_at: submittedAt,
+    transcript_explicit_completion_can_settle_turn: true,
+    turn_complete_seen: true,
+    workspace_id: workspaceId,
+    thread_id: threadId,
   });
 
   const nextThread = nextState[workspaceId].threads[threadId];
-  assert.equal(nextThread.latestTurn.state, "completed");
-  assert.equal(nextThread.activityStatus, "idle");
-  assert.equal(nextThread.providerBindings.codex.inputReady, false);
+  assert.equal(nextThread.latest_turn.state, "completed");
+  assert.equal(nextThread.activity_status, "idle");
+  assert.equal(nextThread.provider_bindings.codex.input_ready, false);
   assert.equal(
-    nextThread.projectionEvents.some((event) => (
-      event.type === "thread.turn.completed" && event.turnId === turnId
+    nextThread.projection_events.some((event) => (
+      event.type === "thread.turn.completed" && event.turn_id === turnId
     )),
     true,
   );
@@ -884,117 +882,117 @@ test("session transcript completion cannot settle a running turn without termina
   const state = {
     [workspaceId]: {
       id: workspaceId,
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: {
           id: threadId,
-          activityStatus: "thinking",
-          currentAgent: "codex",
-          latestTurn: {
-            messageId: promptId,
-            promptEpoch: 7,
-            startedAt: submittedAt,
+          activity_status: "thinking",
+          current_agent: "codex",
+          latest_turn: {
+            message_id: promptId,
+            prompt_epoch: 7,
+            started_at: submittedAt,
             state: "running",
-            turnId,
+            turn_id: turnId,
           },
           messages: [{
-            createdAt: submittedAt,
+            created_at: submittedAt,
             id: promptId,
             role: "user",
             text: "Explain this codebase",
-            turnId,
+            turn_id: turnId,
           }],
-          projectionEvents: [{
-            agentId: "codex",
-            createdAt: submittedAt,
+          projection_events: [{
+            agent_id: "codex",
+            created_at: submittedAt,
             id: "turn-start",
-            messageId: promptId,
-            promptEpoch: 7,
+            message_id: promptId,
+            prompt_epoch: 7,
             status: "running",
-            turnId,
+            turn_id: turnId,
             type: "thread.turn.started",
           }, {
-            agentId: "codex",
-            createdAt: submittedAt,
+            agent_id: "codex",
+            created_at: submittedAt,
             id: "user-message",
-            messageId: promptId,
+            message_id: promptId,
             role: "user",
             status: "submitted",
             text: "Explain this codebase",
-            turnId,
+            turn_id: turnId,
             type: "thread.message.user",
           }],
-          providerBindings: {
+          provider_bindings: {
             codex: {
-              activityStatus: "thinking",
-              inputReady: false,
-              nativeSessionId: sessionId,
-              nativeSessionKind: "session",
+              activity_status: "thinking",
+              input_ready: false,
+              native_session_id: sessionId,
+              native_session_kind: "session",
               status: "active",
             },
           },
           status: "active",
-          terminalBinding: {
-            instanceId: 1,
-            paneId: "pane-test",
-            terminalIndex: 0,
+          terminal_binding: {
+            instance_id: 1,
+            pane_id: "pane-test",
+            terminal_index: 0,
           },
-          terminalIndex: 0,
-          transcriptSessionId: sessionId,
-          workspaceId,
+          terminal_index: 0,
+          transcript_session_id: sessionId,
+          workspace_id: workspaceId,
         },
       },
     },
   };
 
   const nextState = hydrateWorkspaceThreadSessionTranscript(state, {
-    agentId: "codex",
-    allowTranscriptTurnCompletion: false,
-    completedAt,
-    expectedMessageCreatedAt: submittedAt,
-    expectedUserMessage: "Explain this codebase",
-    latestTimestamp: completedAt,
-    matchedBy: "sessionId",
+    agent_id: "codex",
+    allow_transcript_turn_completion: false,
+    completed_at: completedAt,
+    expected_message_created_at: submittedAt,
+    expected_user_message: "Explain this codebase",
+    latest_timestamp: completedAt,
+    matched_by: "session_id",
     messages: [{
-      createdAt: submittedAt,
+      created_at: submittedAt,
       id: promptId,
       role: "user",
       text: "Explain this codebase",
     }, {
-      createdAt: completedAt,
+      created_at: completedAt,
       id: "assistant-final",
       kind: "message",
       role: "assistant",
       text: "The project is basically an empty workspace.",
     }, {
-      createdAt: completedAt,
+      created_at: completedAt,
       id: "task-complete",
       kind: "task_complete",
       role: "assistant",
       text: "The project is basically an empty workspace.",
     }],
-    promptAccepted: true,
-    promptEpoch: 7,
-    promptEventId: promptId,
-    providerSessionId: sessionId,
-    sessionId,
+    prompt_accepted: true,
+    prompt_epoch: 7,
+    prompt_event_id: promptId,
+    provider_session_id: sessionId,
+    session_id: sessionId,
     source: "codex-session",
-    submittedAt,
-    transcriptCompletionCanSettleTurn: false,
-    transcriptExplicitCompletionCanSettleTurn: false,
-    turnCompleteSeen: true,
-    workspaceId,
-    threadId,
+    submitted_at: submittedAt,
+    transcript_completion_can_settle_turn: false,
+    transcript_explicit_completion_can_settle_turn: false,
+    turn_complete_seen: true,
+    workspace_id: workspaceId,
+    thread_id: threadId,
   });
 
   const nextThread = nextState[workspaceId].threads[threadId];
-  assert.equal(nextThread.latestTurn.state, "running");
-  assert.equal(nextThread.latestTurn.promptEpoch, 7);
-  assert.equal(nextThread.activityStatus, "idle");
-  assert.equal(nextThread.providerBindings.codex.inputReady, false);
+  assert.equal(nextThread.latest_turn.state, "running");
+  assert.equal(nextThread.latest_turn.prompt_epoch, 7);
+  assert.equal(nextThread.activity_status, "idle");
+  assert.equal(nextThread.provider_bindings.codex.input_ready, false);
   assert.equal(
-    nextThread.projectionEvents.some((event) => (
-      event.type === "thread.turn.completed" && event.turnId === turnId
+    nextThread.projection_events.some((event) => (
+      event.type === "thread.turn.completed" && event.turn_id === turnId
     )),
     false,
   );
@@ -1016,114 +1014,114 @@ test("transcript hydration preserves a live running turn over stale completed pr
   const state = {
     [workspaceId]: {
       id: workspaceId,
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: {
           id: threadId,
-          activityStatus: "thinking",
-          currentAgent: "codex",
-          latestTurn: {
-            messageId: promptId,
-            promptEpoch: 9,
-            startedAt: submittedAt,
+          activity_status: "thinking",
+          current_agent: "codex",
+          latest_turn: {
+            message_id: promptId,
+            prompt_epoch: 9,
+            started_at: submittedAt,
             state: "running",
-            turnId,
+            turn_id: turnId,
           },
           messages: [{
-            createdAt: submittedAt,
+            created_at: submittedAt,
             id: promptId,
             role: "user",
             text: "Explain this codebase",
-            turnId,
+            turn_id: turnId,
           }],
-          projectionEvents: [{
-            agentId: "codex",
-            createdAt: submittedAt,
+          projection_events: [{
+            agent_id: "codex",
+            created_at: submittedAt,
             id: "turn-start",
-            messageId: promptId,
-            promptEpoch: 9,
+            message_id: promptId,
+            prompt_epoch: 9,
             status: "running",
-            turnId,
+            turn_id: turnId,
             type: "thread.turn.started",
           }, {
-            agentId: "codex",
-            createdAt: submittedAt,
+            agent_id: "codex",
+            created_at: submittedAt,
             id: "user-message",
-            messageId: promptId,
+            message_id: promptId,
             role: "user",
             status: "submitted",
             text: "Explain this codebase",
-            turnId,
+            turn_id: turnId,
             type: "thread.message.user",
           }, {
-            agentId: "codex",
-            completedAt,
-            createdAt: completedAt,
+            agent_id: "codex",
+            completed_at: completedAt,
+            created_at: completedAt,
             id: "stale-turn-completed",
-            messageId: promptId,
+            message_id: promptId,
             status: "completed",
-            turnId,
+            turn_id: turnId,
             type: "thread.turn.completed",
           }],
-          providerBindings: {
+          provider_bindings: {
             codex: {
-              activityStatus: "thinking",
-              inputReady: false,
-              nativeSessionId: sessionId,
-              nativeSessionKind: "session",
+              activity_status: "thinking",
+              input_ready: false,
+              native_session_id: sessionId,
+              native_session_kind: "session",
               status: "active",
             },
           },
           status: "active",
-          terminalBinding: {
-            instanceId: 1,
-            paneId: "pane-test",
-            terminalIndex: 0,
+          terminal_binding: {
+            instance_id: 1,
+            pane_id: "pane-test",
+            terminal_index: 0,
           },
-          terminalIndex: 0,
-          transcriptSessionId: sessionId,
-          workspaceId,
+          terminal_index: 0,
+          transcript_session_id: sessionId,
+          workspace_id: workspaceId,
         },
       },
     },
   };
 
   const nextState = hydrateWorkspaceThreadSessionTranscript(state, {
-    agentId: "codex",
-    allowTranscriptTurnCompletion: false,
-    expectedMessageCreatedAt: submittedAt,
-    expectedUserMessage: "Explain this codebase",
-    latestTimestamp: completedAt,
-    matchedBy: "sessionId",
+    agent_id: "codex",
+    allow_transcript_turn_completion: false,
+    expected_message_created_at: submittedAt,
+    expected_user_message: "Explain this codebase",
+    latest_timestamp: completedAt,
+    matched_by: "session_id",
     messages: [{
-      createdAt: submittedAt,
+      created_at: submittedAt,
       id: promptId,
       role: "user",
       text: "Explain this codebase",
     }, {
-      createdAt: completedAt,
+      created_at: completedAt,
       id: "assistant-final",
       kind: "message",
       role: "assistant",
       text: "The project is basically an empty workspace.",
     }],
-    promptAccepted: true,
-    promptEpoch: 9,
-    promptEventId: promptId,
-    providerSessionId: sessionId,
-    sessionId,
+    prompt_accepted: true,
+    prompt_epoch: 9,
+    prompt_event_id: promptId,
+    provider_session_id: sessionId,
+    session_id: sessionId,
     source: "codex-session",
-    submittedAt,
-    transcriptCompletionCanSettleTurn: false,
-    workspaceId,
-    threadId,
+    submitted_at: submittedAt,
+    transcript_completion_can_settle_turn: false,
+    workspace_id: workspaceId,
+    thread_id: threadId,
   });
 
   const nextThread = nextState[workspaceId].threads[threadId];
-  assert.equal(nextThread.latestTurn.state, "running");
-  assert.equal(nextThread.latestTurn.promptEpoch, 9);
-  assert.equal(nextThread.activityStatus, "idle");
-  assert.equal(nextThread.providerBindings.codex.activityStatus, "idle");
+  assert.equal(nextThread.latest_turn.state, "running");
+  assert.equal(nextThread.latest_turn.prompt_epoch, 9);
+  assert.equal(nextThread.activity_status, "idle");
+  assert.equal(nextThread.provider_bindings.codex.activity_status, "idle");
 });
 
 test("normalization clears orphan running turn with stale message count only", () => {
@@ -1133,42 +1131,42 @@ test("normalization clears orphan running turn with stale message count only", (
   const normalized = normalizeWorkspaceThreads({
     [workspaceId]: {
       id: workspaceId,
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: {
           id: threadId,
-          activityStatus: "idle",
-          currentAgent: "codex",
-          latestTurn: {
-            messageId: "terminal-prompt-stale",
-            startedAt: "2026-06-01T17:00:14.984Z",
+          activity_status: "idle",
+          current_agent: "codex",
+          latest_turn: {
+            message_id: "terminal-prompt-stale",
+            started_at: "2026-06-01T17:00:14.984Z",
             state: "running",
-            turnId: "turn-terminal-prompt-stale",
+            turn_id: "turn-terminal-prompt-stale",
           },
-          messageCount: 1,
+          message_count: 1,
           messages: [],
-          projectionEvents: [],
-          providerBindings: {
+          projection_events: [],
+          provider_bindings: {
             codex: {
-              activityStatus: "idle",
-              inputReady: false,
-              nativeSessionId: "",
+              activity_status: "idle",
+              input_ready: false,
+              native_session_id: "",
               status: "active",
             },
           },
           status: "idle",
-          terminalIndex: 1,
-          transcriptSessionId: "",
-          workspaceId,
+          terminal_index: 1,
+          transcript_session_id: "",
+          workspace_id: workspaceId,
         },
       },
     },
   });
 
   const thread = normalized[workspaceId].threads[threadId];
-  assert.equal(thread.latestTurn, null);
-  assert.equal(thread.activityStatus, "idle");
-  assert.equal(thread.providerBindings.codex.activityStatus, "idle");
+  assert.equal(thread.latest_turn, null);
+  assert.equal(thread.activity_status, "idle");
+  assert.equal(thread.provider_bindings.codex.activity_status, "idle");
 });
 
 test("opening a restored terminal clears stale thinking without closing historical running turn", () => {
@@ -1181,69 +1179,69 @@ test("opening a restored terminal clears stale thinking without closing historic
   const state = {
     [workspaceId]: {
       id: workspaceId,
-      terminalThreadIds: {
+      terminal_thread_ids: {
         0: threadId,
       },
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: {
           id: threadId,
-          activityStatus: "thinking",
-          currentAgent: "codex",
-          latestTurn: {
-            messageId: "prompt-open",
-            startedAt,
+          activity_status: "thinking",
+          current_agent: "codex",
+          latest_turn: {
+            message_id: "prompt-open",
+            started_at: startedAt,
             state: "running",
-            turnId,
+            turn_id: turnId,
           },
           materialized: true,
-          messageCount: 1,
+          message_count: 1,
           messages: [{
-            createdAt: startedAt,
+            created_at: startedAt,
             id: "prompt-open",
             role: "user",
             text: "stale prompt",
-            turnId,
+            turn_id: turnId,
           }],
-          projectionEvents: [{
-            agentId: "codex",
-            createdAt: startedAt,
+          projection_events: [{
+            agent_id: "codex",
+            created_at: startedAt,
             id: "turn-start",
-            messageId: "prompt-open",
+            message_id: "prompt-open",
             status: "running",
-            turnId,
+            turn_id: turnId,
             type: "thread.turn.started",
           }],
-          providerBindings: {
+          provider_bindings: {
             codex: {
-              activityStatus: "thinking",
-              inputReady: false,
+              activity_status: "thinking",
+              input_ready: false,
               status: "active",
             },
           },
           status: "active",
-          terminalIndex: 0,
-          workspaceId,
+          terminal_index: 0,
+          workspace_id: workspaceId,
         },
       },
     },
   };
 
   const opened = bindWorkspaceThreadTerminal(state, {
-    agentId: "codex",
-    instanceId: 1,
-    paneId,
+    agent_id: "codex",
+    instance_id: 1,
+    pane_id: paneId,
     status: "active",
-    terminalIndex: 0,
-    threadId,
+    terminal_index: 0,
+    thread_id: threadId,
     type: "opened",
-    workspaceId,
+    workspace_id: workspaceId,
   });
 
   const thread = opened[workspaceId].threads[threadId];
-  assert.equal(thread.latestTurn.state, "running");
-  assert.equal(thread.activityStatus, "idle");
-  assert.equal(thread.providerBindings.codex.activityStatus, "idle");
+  assert.equal(thread.latest_turn.state, "running");
+  assert.equal(thread.activity_status, "idle");
+  assert.equal(thread.provider_bindings.codex.activity_status, "idle");
   assert.equal(opened[workspaceId].terminals[0].status, "active");
 });
 
@@ -1255,54 +1253,54 @@ test("session transcript acceptance preserves a locally pending submitted prompt
   const sessionId = "session-test";
 
   const materialized = materializeWorkspaceThreadForTerminal({}, {
-    agentId: "codex",
-    instanceId: 1,
-    messageCreatedAt: submittedAt,
-    messageId: promptId,
-    paneId: "pane-test",
-    pendingPromptDeliveryMode: "session-acceptance",
-    pendingPromptId: promptId,
-    pendingPromptText: "Explain this codebase",
-    promptEventId: promptId,
-    promptEventSubmittedAt: submittedAt,
-    sessionAcceptancePending: true,
-    terminalIndex: 0,
-    threadId,
+    agent_id: "codex",
+    instance_id: 1,
+    message_created_at: submittedAt,
+    message_id: promptId,
+    pane_id: "pane-test",
+    pending_prompt_delivery_mode: "session-acceptance",
+    pending_prompt_id: promptId,
+    pending_prompt_text: "Explain this codebase",
+    prompt_event_id: promptId,
+    prompt_event_submitted_at: submittedAt,
+    session_acceptance_pending: true,
+    terminal_index: 0,
+    thread_id: threadId,
     type: "message-submitted",
-    userMessage: "Explain this codebase",
-    workspaceId,
+    user_message: "Explain this codebase",
+    workspace_id: workspaceId,
   });
 
   const pendingThread = materialized[workspaceId].threads[threadId];
-  assert.equal(pendingThread.pendingPrompt.id, promptId);
-  assert.equal(pendingThread.latestTurn.state, "running");
-  assert.equal(pendingThread.activityStatus, "thinking");
+  assert.equal(pendingThread.pending_prompt.id, promptId);
+  assert.equal(pendingThread.latest_turn.state, "running");
+  assert.equal(pendingThread.activity_status, "thinking");
 
   const accepted = hydrateWorkspaceThreadSessionTranscript(materialized, {
-    agentId: "codex",
-    expectedMessageCreatedAt: submittedAt,
-    expectedUserMessage: "Explain this codebase",
-    matchedBy: "sessionId",
+    agent_id: "codex",
+    expected_message_created_at: submittedAt,
+    expected_user_message: "Explain this codebase",
+    matched_by: "session_id",
     messages: [{
-      createdAt: submittedAt,
+      created_at: submittedAt,
       id: promptId,
       role: "user",
       text: "Explain this codebase",
     }],
-    promptAccepted: true,
-    promptEventId: promptId,
-    providerSessionId: sessionId,
-    sessionId,
+    prompt_accepted: true,
+    prompt_event_id: promptId,
+    provider_session_id: sessionId,
+    session_id: sessionId,
     source: "codex-session",
-    submittedAt,
-    threadId,
-    workspaceId,
+    submitted_at: submittedAt,
+    thread_id: threadId,
+    workspace_id: workspaceId,
   });
 
   const acceptedThread = accepted[workspaceId].threads[threadId];
-  assert.equal(acceptedThread.pendingPrompt.id, promptId);
-  assert.equal(acceptedThread.latestTurn.state, "running");
-  assert.equal(acceptedThread.activityStatus, "idle");
+  assert.equal(acceptedThread.pending_prompt.id, promptId);
+  assert.equal(acceptedThread.latest_turn.state, "running");
+  assert.equal(acceptedThread.activity_status, "idle");
 });
 
 test("accepted provider session attaches to a previously submitted prompt for resume", () => {
@@ -1313,61 +1311,61 @@ test("accepted provider session attaches to a previously submitted prompt for re
   const sessionId = "session-accepted";
 
   const submitted = materializeWorkspaceThreadForTerminal({}, {
-    agentId: "claude",
-    instanceId: 1,
-    messageCreatedAt: submittedAt,
-    messageId: promptId,
-    paneId: "pane-test",
-    pendingPromptDeliveryMode: "session-acceptance",
-    pendingPromptId: promptId,
-    pendingPromptText: "Fix the bug",
-    promptEventId: promptId,
-    promptEventSubmittedAt: submittedAt,
-    sessionAcceptancePending: true,
-    terminalIndex: 0,
-    threadId,
+    agent_id: "claude",
+    instance_id: 1,
+    message_created_at: submittedAt,
+    message_id: promptId,
+    pane_id: "pane-test",
+    pending_prompt_delivery_mode: "session-acceptance",
+    pending_prompt_id: promptId,
+    pending_prompt_text: "Fix the bug",
+    prompt_event_id: promptId,
+    prompt_event_submitted_at: submittedAt,
+    session_acceptance_pending: true,
+    terminal_index: 0,
+    thread_id: threadId,
     type: "message-submitted",
-    userMessage: "Fix the bug",
-    workspaceId,
+    user_message: "Fix the bug",
+    workspace_id: workspaceId,
   });
 
   const submittedThread = submitted[workspaceId].threads[threadId];
-  assert.equal(submittedThread.providerBindings.claude.nativeSessionId, "");
-  assert.equal(submittedThread.latestTurn.state, "running");
-  assert.equal(submittedThread.pendingPrompt.id, promptId);
+  assert.equal(submittedThread.provider_bindings.claude.native_session_id, "");
+  assert.equal(submittedThread.latest_turn.state, "running");
+  assert.equal(submittedThread.pending_prompt.id, promptId);
 
   const accepted = updateWorkspaceThreadProviderSession(submitted, {
-    agentId: "claude",
-    instanceId: 1,
-    nativeSessionId: sessionId,
-    nativeSessionKind: "session",
-    nativeSessionSource: "todo-drop:session-accepted",
-    paneId: "pane-test",
-    promptEventId: promptId,
-    providerSessionId: sessionId,
-    terminalIndex: 0,
-    threadId,
+    agent_id: "claude",
+    instance_id: 1,
+    native_session_id: sessionId,
+    native_session_kind: "session",
+    native_session_source: "todo-drop:session-accepted",
+    pane_id: "pane-test",
+    prompt_event_id: promptId,
+    provider_session_id: sessionId,
+    terminal_index: 0,
+    thread_id: threadId,
     type: "provider-session",
-    workspaceId,
+    workspace_id: workspaceId,
   });
 
   const acceptedThread = accepted[workspaceId].threads[threadId];
-  assert.equal(acceptedThread.providerBindings.claude.nativeSessionId, sessionId);
-  assert.equal(acceptedThread.transcriptSessionId, sessionId);
-  assert.equal(acceptedThread.latestTurn.state, "running");
-  assert.equal(acceptedThread.pendingPrompt.id, promptId);
-  assert.equal(acceptedThread.activityStatus, "thinking");
-  assert.equal(accepted[workspaceId].terminals["0"].providerSessionId, sessionId);
-  assert.equal(accepted[workspaceId].terminals["0"].nativeSessionId, sessionId);
-  assert.equal(accepted[workspaceId].terminals["0"].sessionId, sessionId);
-  assert.equal(accepted[workspaceId].terminals["0"].threadId, threadId);
+  assert.equal(acceptedThread.provider_bindings.claude.native_session_id, sessionId);
+  assert.equal(acceptedThread.transcript_session_id, sessionId);
+  assert.equal(acceptedThread.latest_turn.state, "running");
+  assert.equal(acceptedThread.pending_prompt.id, promptId);
+  assert.equal(acceptedThread.activity_status, "thinking");
+  assert.equal(accepted[workspaceId].terminals["0"].provider_session_id, sessionId);
+  assert.equal(accepted[workspaceId].terminals["0"].native_session_id, sessionId);
+  assert.equal(accepted[workspaceId].terminals["0"].session_id, sessionId);
+  assert.equal(accepted[workspaceId].terminals["0"].thread_id, threadId);
 
   const persisted = persistWorkspaceThreads(accepted);
   assert.equal(
-    persisted[workspaceId].threads[threadId].providerBindings.claude.nativeSessionId,
+    persisted[workspaceId].threads[threadId].provider_bindings.claude.native_session_id,
     sessionId,
   );
-  assert.equal(persisted[workspaceId].threads[threadId].transcriptSessionId, sessionId);
+  assert.equal(persisted[workspaceId].threads[threadId].transcript_session_id, sessionId);
 });
 
 test("provider session change updates the active terminal ground truth", () => {
@@ -1377,45 +1375,45 @@ test("provider session change updates the active terminal ground truth", () => {
   const newSessionId = "session-new";
 
   const opened = materializeWorkspaceThreadForTerminal({}, {
-    agentId: "codex",
-    instanceId: 4,
-    nativeSessionId: oldSessionId,
-    nativeSessionKind: "session",
-    nativeSessionSource: "terminal-open",
-    paneId: "pane-switch",
-    providerSessionId: oldSessionId,
-    terminalIndex: 1,
-    threadId,
+    agent_id: "codex",
+    instance_id: 4,
+    native_session_id: oldSessionId,
+    native_session_kind: "session",
+    native_session_source: "terminal-open",
+    pane_id: "pane-switch",
+    provider_session_id: oldSessionId,
+    terminal_index: 1,
+    thread_id: threadId,
     type: "opened",
-    workspaceId,
+    workspace_id: workspaceId,
   });
 
   const switched = updateWorkspaceThreadProviderSession(opened, {
-    agentId: "codex",
-    instanceId: 4,
-    nativeSessionId: newSessionId,
-    nativeSessionKind: "session",
-    nativeSessionSource: "terminal-output",
-    paneId: "pane-switch",
-    providerSessionId: newSessionId,
-    terminalIndex: 1,
-    threadId,
+    agent_id: "codex",
+    instance_id: 4,
+    native_session_id: newSessionId,
+    native_session_kind: "session",
+    native_session_source: "terminal-output",
+    pane_id: "pane-switch",
+    provider_session_id: newSessionId,
+    terminal_index: 1,
+    thread_id: threadId,
     type: "provider-session",
-    workspaceId,
+    workspace_id: workspaceId,
   });
 
   const entry = switched[workspaceId];
   const thread = entry.threads[threadId];
   const terminal = entry.terminals["1"];
 
-  assert.equal(thread.providerBindings.codex.nativeSessionId, newSessionId);
-  assert.equal(thread.transcriptSessionId, newSessionId);
-  assert.equal(thread.providerBindings.codex.terminalBinding.terminalIndex, 1);
-  assert.equal(thread.terminalBinding.terminalIndex, 1);
-  assert.equal(terminal.providerSessionId, newSessionId);
-  assert.equal(terminal.nativeSessionId, newSessionId);
-  assert.equal(terminal.sessionId, newSessionId);
-  assert.equal(terminal.threadId, threadId);
+  assert.equal(thread.provider_bindings.codex.native_session_id, newSessionId);
+  assert.equal(thread.transcript_session_id, newSessionId);
+  assert.equal(thread.provider_bindings.codex.terminal_binding.terminal_index, 1);
+  assert.equal(thread.terminal_binding.terminal_index, 1);
+  assert.equal(terminal.provider_session_id, newSessionId);
+  assert.equal(terminal.native_session_id, newSessionId);
+  assert.equal(terminal.session_id, newSessionId);
+  assert.equal(terminal.thread_id, threadId);
 });
 
 test("session transcript acceptance preserves pending prompts when transcript ids include the thread prefix", () => {
@@ -1427,46 +1425,46 @@ test("session transcript acceptance preserves pending prompts when transcript id
   const sessionId = "session-test";
 
   const materialized = materializeWorkspaceThreadForTerminal({}, {
-    agentId: "codex",
-    instanceId: 1,
-    messageCreatedAt: submittedAt,
-    messageId: promptId,
-    paneId: "pane-test",
-    pendingPromptDeliveryMode: "session-acceptance",
-    pendingPromptId: promptId,
-    pendingPromptText: "Queued command",
-    promptEventId: promptId,
-    promptEventSubmittedAt: submittedAt,
-    sessionAcceptancePending: true,
-    terminalIndex: 0,
-    threadId,
+    agent_id: "codex",
+    instance_id: 1,
+    message_created_at: submittedAt,
+    message_id: promptId,
+    pane_id: "pane-test",
+    pending_prompt_delivery_mode: "session-acceptance",
+    pending_prompt_id: promptId,
+    pending_prompt_text: "Queued command",
+    prompt_event_id: promptId,
+    prompt_event_submitted_at: submittedAt,
+    session_acceptance_pending: true,
+    terminal_index: 0,
+    thread_id: threadId,
     type: "message-submitted",
-    userMessage: "Queued command",
-    workspaceId,
+    user_message: "Queued command",
+    workspace_id: workspaceId,
   });
 
   const accepted = hydrateWorkspaceThreadSessionTranscript(materialized, {
-    agentId: "codex",
-    expectedMessageCreatedAt: submittedAt,
-    expectedUserMessage: "Queued command",
-    matchedBy: "sessionId",
+    agent_id: "codex",
+    expected_message_created_at: submittedAt,
+    expected_user_message: "Queued command",
+    matched_by: "session_id",
     messages: [{
-      createdAt: submittedAt,
+      created_at: submittedAt,
       id: prefixedPromptId,
       role: "user",
       text: "Queued command",
     }],
-    promptAccepted: true,
-    promptEventId: prefixedPromptId,
-    providerSessionId: sessionId,
-    sessionId,
+    prompt_accepted: true,
+    prompt_event_id: prefixedPromptId,
+    provider_session_id: sessionId,
+    session_id: sessionId,
     source: "codex-session",
-    submittedAt,
-    threadId,
-    workspaceId,
+    submitted_at: submittedAt,
+    thread_id: threadId,
+    workspace_id: workspaceId,
   });
 
-  assert.equal(accepted[workspaceId].threads[threadId].pendingPrompt.id, promptId);
+  assert.equal(accepted[workspaceId].threads[threadId].pending_prompt.id, promptId);
 });
 
 test("prompt clear accepts canonical pending ids without keeping a stale prompt", () => {
@@ -1475,25 +1473,25 @@ test("prompt clear accepts canonical pending ids without keeping a stale prompt"
   const promptId = "todo-drop-prompt-mpwi1po9-7c820d2f1dfda";
   const prefixedPromptId = `${threadId}-${promptId}`;
   const state = materializeWorkspaceThreadForTerminal({}, {
-    agentId: "codex",
-    messageId: promptId,
-    pendingPromptId: promptId,
-    pendingPromptText: "Queued command",
-    sessionAcceptancePending: true,
-    terminalIndex: 0,
-    threadId,
+    agent_id: "codex",
+    message_id: promptId,
+    pending_prompt_id: promptId,
+    pending_prompt_text: "Queued command",
+    session_acceptance_pending: true,
+    terminal_index: 0,
+    thread_id: threadId,
     type: "message-submitted",
-    userMessage: "Queued command",
-    workspaceId,
+    user_message: "Queued command",
+    workspace_id: workspaceId,
   });
 
   const cleared = clearWorkspaceThreadPendingPrompt(state, {
-    promptEventId: prefixedPromptId,
-    threadId,
-    workspaceId,
+    prompt_event_id: prefixedPromptId,
+    thread_id: threadId,
+    workspace_id: workspaceId,
   });
 
-  assert.equal(cleared[workspaceId].threads[threadId].pendingPrompt, null);
+  assert.equal(cleared[workspaceId].threads[threadId].pending_prompt, null);
 });
 
 test("accepted materialization does not reinstall a pending prompt", () => {
@@ -1503,27 +1501,27 @@ test("accepted materialization does not reinstall a pending prompt", () => {
   const submittedAt = "2026-06-02T14:02:12.000Z";
 
   const materialized = materializeWorkspaceThreadForTerminal({}, {
-    agentId: "codex",
-    instanceId: 1,
-    messageCreatedAt: submittedAt,
-    messageId: promptId,
-    paneId: "pane-test",
-    pendingPromptDeliveryMode: "session-acceptance",
-    pendingPromptId: promptId,
-    pendingPromptText: "Already sent",
-    promptEventId: promptId,
-    promptEventSubmittedAt: submittedAt,
-    sessionAcceptancePending: false,
-    terminalIndex: 0,
-    threadId,
+    agent_id: "codex",
+    instance_id: 1,
+    message_created_at: submittedAt,
+    message_id: promptId,
+    pane_id: "pane-test",
+    pending_prompt_delivery_mode: "session-acceptance",
+    pending_prompt_id: promptId,
+    pending_prompt_text: "Already sent",
+    prompt_event_id: promptId,
+    prompt_event_submitted_at: submittedAt,
+    session_acceptance_pending: false,
+    terminal_index: 0,
+    thread_id: threadId,
     type: "message-submitted",
-    userMessage: "Already sent",
-    workspaceId,
+    user_message: "Already sent",
+    workspace_id: workspaceId,
   });
 
   const thread = materialized[workspaceId].threads[threadId];
-  assert.equal(thread.pendingPrompt, null);
-  assert.equal(thread.latestTurn.state, "running");
+  assert.equal(thread.pending_prompt, null);
+  assert.equal(thread.latest_turn.state, "running");
 });
 
 test("message submission persists the actual submitted user prompt", () => {
@@ -1533,32 +1531,32 @@ test("message submission persists the actual submitted user prompt", () => {
   const submittedAt = "2026-06-01T17:26:05.508Z";
 
   const materialized = materializeWorkspaceThreadForTerminal({}, {
-    agentId: "codex",
-    expectedUserMessage: "Full terminal prompt sent to Codex",
-    instanceId: 1,
-    messageCreatedAt: submittedAt,
-    messageId: promptId,
-    paneId: "pane-test",
-    pendingPromptDeliveryMode: "session-acceptance",
-    pendingPromptId: promptId,
-    pendingPromptText: "Short queue label",
-    promptEventId: promptId,
-    promptEventSubmittedAt: submittedAt,
-    sessionAcceptancePending: true,
-    terminalIndex: 0,
-    threadId,
+    agent_id: "codex",
+    expected_user_message: "Full terminal prompt sent to Codex",
+    instance_id: 1,
+    message_created_at: submittedAt,
+    message_id: promptId,
+    pane_id: "pane-test",
+    pending_prompt_delivery_mode: "session-acceptance",
+    pending_prompt_id: promptId,
+    pending_prompt_text: "Short queue label",
+    prompt_event_id: promptId,
+    prompt_event_submitted_at: submittedAt,
+    session_acceptance_pending: true,
+    terminal_index: 0,
+    thread_id: threadId,
     type: "message-submitted",
-    userMessage: "Short queue label",
-    workspaceId,
+    user_message: "Short queue label",
+    workspace_id: workspaceId,
   });
 
   const thread = materialized[workspaceId].threads[threadId];
   assert.equal(thread.messages.length, 1);
   assert.equal(thread.messages[0].role, "user");
   assert.equal(thread.messages[0].text, "Full terminal prompt sent to Codex");
-  assert.equal(thread.latestTurn.state, "running");
+  assert.equal(thread.latest_turn.state, "running");
   assert.equal(
-    thread.projectionEvents.filter((event) => event.type === "thread.message.user").length,
+    thread.projection_events.filter((event) => event.type === "thread.message.user").length,
     1,
   );
 });
@@ -1571,59 +1569,59 @@ test("prompt-ready does not mark input ready for pending session acceptance", ()
   const promptReadyAt = "2026-05-31T04:15:11.000Z";
 
   const materialized = materializeWorkspaceThreadForTerminal({}, {
-    agentId: "codex",
-    instanceId: 1,
-    messageCreatedAt: submittedAt,
-    messageId: promptId,
-    paneId: "pane-test",
-    pendingPromptDeliveryMode: "session-acceptance",
-    pendingPromptId: promptId,
-    pendingPromptText: "Explain this codebase",
-    promptEventId: promptId,
-    promptEventSubmittedAt: submittedAt,
-    sessionAcceptancePending: true,
-    terminalIndex: 0,
-    threadId,
+    agent_id: "codex",
+    instance_id: 1,
+    message_created_at: submittedAt,
+    message_id: promptId,
+    pane_id: "pane-test",
+    pending_prompt_delivery_mode: "session-acceptance",
+    pending_prompt_id: promptId,
+    pending_prompt_text: "Explain this codebase",
+    prompt_event_id: promptId,
+    prompt_event_submitted_at: submittedAt,
+    session_acceptance_pending: true,
+    terminal_index: 0,
+    thread_id: threadId,
     type: "message-submitted",
-    userMessage: "Explain this codebase",
-    workspaceId,
+    user_message: "Explain this codebase",
+    workspace_id: workspaceId,
   });
 
   const nextState = markWorkspaceThreadAgentActivity(materialized, {
-    activityStatus: "idle",
-    agentId: "codex",
-    inputReady: true,
-    inputReadyAt: promptReadyAt,
-    instanceId: 1,
-    paneId: "pane-test",
-    promptEventId: promptId,
-    promptReadyAt,
+    activity_status: "idle",
+    agent_id: "codex",
+    input_ready: true,
+    input_ready_at: promptReadyAt,
+    instance_id: 1,
+    pane_id: "pane-test",
+    prompt_event_id: promptId,
+    prompt_ready_at: promptReadyAt,
     status: "active",
-    terminalIndex: 0,
-    threadId,
+    terminal_index: 0,
+    thread_id: threadId,
     type: "terminal-prompt-ready",
-    workspaceId,
+    workspace_id: workspaceId,
   });
 
   const nextThread = nextState[workspaceId].threads[threadId];
-  assert.equal(nextThread.activityStatus, "idle");
-  assert.equal(nextThread.latestTurn.state, "running");
-  assert.equal(nextThread.pendingPrompt.id, promptId);
-  assert.equal(nextThread.providerBindings.codex.activityStatus, "idle");
-  assert.equal(nextThread.providerBindings.codex.inputReady, false);
-  assert.equal(nextThread.providerBindings.codex.inputReadyAt, "");
+  assert.equal(nextThread.activity_status, "idle");
+  assert.equal(nextThread.latest_turn.state, "running");
+  assert.equal(nextThread.pending_prompt.id, promptId);
+  assert.equal(nextThread.provider_bindings.codex.activity_status, "idle");
+  assert.equal(nextThread.provider_bindings.codex.input_ready, false);
+  assert.equal(nextThread.provider_bindings.codex.input_ready_at, "");
 
   const terminal = nextState[workspaceId].terminals["0"];
-  assert.equal(terminal.inputReady, false);
-  assert.equal(terminal.inputReadyAt, "");
+  assert.equal(terminal.input_ready, false);
+  assert.equal(terminal.input_ready_at, "");
   assert.equal(terminal.status, "active");
 
   const normalizedState = normalizeWorkspaceThreads(nextState);
   const normalizedThread = normalizedState[workspaceId].threads[threadId];
-  assert.equal(normalizedThread.activityStatus, "idle");
-  assert.equal(normalizedThread.latestTurn.state, "running");
-  assert.equal(normalizedThread.pendingPrompt.id, promptId);
-  assert.equal(normalizedThread.providerBindings.codex.inputReady, false);
+  assert.equal(normalizedThread.activity_status, "idle");
+  assert.equal(normalizedThread.latest_turn.state, "running");
+  assert.equal(normalizedThread.pending_prompt.id, promptId);
+  assert.equal(normalizedThread.provider_bindings.codex.input_ready, false);
 });
 
 test("prompt-ready does not mark stale prompting fields as input ready", () => {
@@ -1634,140 +1632,140 @@ test("prompt-ready does not mark stale prompting fields as input ready", () => {
 
   const state = {
     [workspaceId]: {
-      activeThreadId: threadId,
+      active_thread_id: threadId,
       id: workspaceId,
-      terminalOrder: ["0"],
+      terminal_order: ["0"],
       terminals: {
         0: {
-          agentId: "codex",
-          inputReady: false,
-          instanceId: 1,
-          paneId,
-          promptingUserKind: "permission",
-          promptingUserSource: "terminal-output",
-          promptingUserText: "Allow command to run?",
+          agent_id: "codex",
+          input_ready: false,
+          instance_id: 1,
+          pane_id: paneId,
+          prompting_user_kind: "permission",
+          prompting_user_source: "terminal-output",
+          prompting_user_text: "Allow command to run?",
           status: "active",
-          terminalIndex: 0,
-          terminalIsPromptingUser: true,
-          threadId,
+          terminal_index: 0,
+          terminal_is_prompting_user: true,
+          thread_id: threadId,
         },
       },
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: {
-          activityStatus: "idle",
-          currentAgent: "codex",
+          activity_status: "idle",
+          current_agent: "codex",
           id: threadId,
-          latestTurn: {
+          latest_turn: {
             state: "completed",
           },
           materialized: true,
-          messageCount: 0,
+          message_count: 0,
           messages: [],
-          projectionEvents: [],
-          providerBindings: {
+          projection_events: [],
+          provider_bindings: {
             codex: {
-              activityStatus: "idle",
-              inputReady: false,
-              promptingUserKind: "permission",
-              promptingUserSource: "terminal-output",
-              promptingUserText: "Allow command to run?",
+              activity_status: "idle",
+              input_ready: false,
+              prompting_user_kind: "permission",
+              prompting_user_source: "terminal-output",
+              prompting_user_text: "Allow command to run?",
               status: "active",
-              terminalBinding: {
-                instanceId: 1,
-                paneId,
-                terminalIndex: 0,
+              terminal_binding: {
+                instance_id: 1,
+                pane_id: paneId,
+                terminal_index: 0,
               },
-              terminalIsPromptingUser: true,
+              terminal_is_prompting_user: true,
             },
           },
           status: "active",
-          terminalBinding: {
-            instanceId: 1,
-            paneId,
-            terminalIndex: 0,
+          terminal_binding: {
+            instance_id: 1,
+            pane_id: paneId,
+            terminal_index: 0,
           },
-          terminalIndex: 0,
-          workspaceId,
+          terminal_index: 0,
+          workspace_id: workspaceId,
         },
       },
     },
   };
 
   const next = markWorkspaceThreadAgentActivity(state, {
-    activityStatus: "idle",
-    agentId: "codex",
-    inputReady: true,
-    inputReadyAt: promptReadyAt,
-    instanceId: 1,
-    paneId,
+    activity_status: "idle",
+    agent_id: "codex",
+    input_ready: true,
+    input_ready_at: promptReadyAt,
+    instance_id: 1,
+    pane_id: paneId,
     status: "active",
-    terminalIndex: 0,
-    threadId,
+    terminal_index: 0,
+    thread_id: threadId,
     type: "terminal-prompt-ready",
-    workspaceId,
+    workspace_id: workspaceId,
   });
 
   const thread = next[workspaceId].threads[threadId];
-  assert.equal(thread.providerBindings.codex.inputReady, false);
-  assert.equal(thread.providerBindings.codex.terminalIsPromptingUser, false);
-  assert.equal(thread.providerBindings.codex.promptingUserKind, "");
-  assert.equal(thread.providerBindings.codex.promptingUserSource, "");
-  assert.equal(next[workspaceId].terminals[0].inputReady, false);
-  assert.equal(next[workspaceId].terminals[0].terminalIsPromptingUser, false);
-  assert.equal(next[workspaceId].terminals[0].promptingUserKind, "");
-  assert.equal(next[workspaceId].terminals[0].promptingUserSource, "");
+  assert.equal(thread.provider_bindings.codex.input_ready, false);
+  assert.equal(thread.provider_bindings.codex.terminal_is_prompting_user, false);
+  assert.equal(thread.provider_bindings.codex.prompting_user_kind, "");
+  assert.equal(thread.provider_bindings.codex.prompting_user_source, "");
+  assert.equal(next[workspaceId].terminals[0].input_ready, false);
+  assert.equal(next[workspaceId].terminals[0].terminal_is_prompting_user, false);
+  assert.equal(next[workspaceId].terminals[0].prompting_user_kind, "");
+  assert.equal(next[workspaceId].terminals[0].prompting_user_source, "");
 });
 
 test("normalization only preserves explicit permission prompting fields", () => {
   const workspaceId = "workspace-test";
   const threadId = "thread-test";
   const baseTerminal = {
-    agentId: "codex",
-    instanceId: 1,
-    paneId: "pane-test",
+    agent_id: "codex",
+    instance_id: 1,
+    pane_id: "pane-test",
     status: "active",
-    terminalIndex: 0,
-    threadId,
+    terminal_index: 0,
+    thread_id: threadId,
   };
   const state = {
     [workspaceId]: {
-      activeThreadId: threadId,
+      active_thread_id: threadId,
       id: workspaceId,
-      terminalOrder: ["0", "1"],
+      terminal_order: ["0", "1"],
       terminals: {
         0: {
           ...baseTerminal,
-          promptingUserKind: "permission",
-          promptingUserSource: "provider-permission",
-          terminalIsPromptingUser: true,
-          toolUseId: "tool-1",
+          prompting_user_kind: "permission",
+          prompting_user_source: "provider-permission",
+          terminal_is_prompting_user: true,
+          tool_use_id: "tool-1",
         },
         1: {
           ...baseTerminal,
-          paneId: "pane-stale",
-          promptingUserKind: "permission",
-          promptingUserSource: "terminal-output",
-          terminalIndex: 1,
-          terminalIsPromptingUser: true,
+          pane_id: "pane-stale",
+          prompting_user_kind: "permission",
+          prompting_user_source: "terminal-output",
+          terminal_index: 1,
+          terminal_is_prompting_user: true,
         },
       },
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: {
-          currentAgent: "codex",
+          current_agent: "codex",
           id: threadId,
           materialized: true,
-          providerBindings: {
+          provider_bindings: {
             codex: {
-              promptingUserKind: "permission",
-              promptingUserSource: "terminal-output",
+              prompting_user_kind: "permission",
+              prompting_user_source: "terminal-output",
               status: "active",
-              terminalIsPromptingUser: true,
+              terminal_is_prompting_user: true,
             },
           },
-          terminalIndex: 0,
-          workspaceId,
+          terminal_index: 0,
+          workspace_id: workspaceId,
         },
       },
     },
@@ -1775,11 +1773,11 @@ test("normalization only preserves explicit permission prompting fields", () => 
 
   const normalized = normalizeWorkspaceThreads(state);
 
-  assert.equal(normalized[workspaceId].terminals[0].terminalIsPromptingUser, true);
-  assert.equal(normalized[workspaceId].terminals[0].promptingUserSource, "provider-permission");
-  assert.equal(normalized[workspaceId].terminals[1].terminalIsPromptingUser, false);
-  assert.equal(normalized[workspaceId].terminals[1].promptingUserSource, "");
-  assert.equal(normalized[workspaceId].threads[threadId].providerBindings.codex.terminalIsPromptingUser, false);
+  assert.equal(normalized[workspaceId].terminals[0].terminal_is_prompting_user, true);
+  assert.equal(normalized[workspaceId].terminals[0].prompting_user_source, "provider-permission");
+  assert.equal(normalized[workspaceId].terminals[1].terminal_is_prompting_user, false);
+  assert.equal(normalized[workspaceId].terminals[1].prompting_user_source, "");
+  assert.equal(normalized[workspaceId].threads[threadId].provider_bindings.codex.terminal_is_prompting_user, false);
 });
 
 test("detached session transcript completion settles matching idle running turn", () => {
@@ -1795,123 +1793,123 @@ test("detached session transcript completion settles matching idle running turn"
   const state = {
     [workspaceId]: {
       id: workspaceId,
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: {
           id: threadId,
-          activityStatus: "idle",
-          currentAgent: "codex",
-          latestTurn: {
-            messageId: promptId,
-            startedAt: submittedAt,
+          activity_status: "idle",
+          current_agent: "codex",
+          latest_turn: {
+            message_id: promptId,
+            started_at: submittedAt,
             state: "running",
-            turnId,
+            turn_id: turnId,
           },
           messages: [{
-            createdAt: submittedAt,
+            created_at: submittedAt,
             id: promptId,
             role: "user",
             text: "is this a git repo?",
-            turnId,
+            turn_id: turnId,
           }, {
-            createdAt: completedAt,
+            created_at: completedAt,
             id: "assistant-final",
             role: "assistant",
             status: "complete",
             text: assistantText,
-            turnId,
+            turn_id: turnId,
           }],
-          projectionEvents: [{
-            agentId: "codex",
-            createdAt: submittedAt,
+          projection_events: [{
+            agent_id: "codex",
+            created_at: submittedAt,
             id: "turn-start",
-            messageId: promptId,
+            message_id: promptId,
             source: "codex-session",
             status: "running",
-            turnId,
+            turn_id: turnId,
             type: "thread.turn.started",
           }, {
-            agentId: "codex",
-            createdAt: submittedAt,
+            agent_id: "codex",
+            created_at: submittedAt,
             id: "user-message",
-            messageId: promptId,
+            message_id: promptId,
             role: "user",
             source: "codex-session",
             status: "submitted",
             text: "is this a git repo?",
-            turnId,
+            turn_id: turnId,
             type: "thread.message.user",
           }, {
-            agentId: "codex",
-            createdAt: completedAt,
+            agent_id: "codex",
+            created_at: completedAt,
             id: "assistant-complete",
-            messageId: "assistant-final",
+            message_id: "assistant-final",
             source: "codex-session",
             text: assistantText,
-            turnId,
+            turn_id: turnId,
             type: "thread.message.assistant.complete",
           }],
-          providerBindings: {
+          provider_bindings: {
             codex: {
-              activityStatus: "idle",
-              inputReady: false,
-              nativeSessionId: sessionId,
-              nativeSessionKind: "session",
+              activity_status: "idle",
+              input_ready: false,
+              native_session_id: sessionId,
+              native_session_kind: "session",
               status: "exited",
-              terminalBinding: null,
+              terminal_binding: null,
             },
           },
           status: "exited",
-          terminalBinding: null,
-          terminalIndex: 0,
-          transcriptSessionId: sessionId,
-          workspaceId,
+          terminal_binding: null,
+          terminal_index: 0,
+          transcript_session_id: sessionId,
+          workspace_id: workspaceId,
         },
       },
     },
   };
 
   const hydrated = hydrateWorkspaceThreadSessionTranscript(state, {
-    agentId: "codex",
-    allowTranscriptTurnCompletion: true,
-    expectedMessageCreatedAt: submittedAt,
-    expectedUserMessage: "is this a git repo?",
-    matchedBy: "sessionId",
+    agent_id: "codex",
+    allow_transcript_turn_completion: true,
+    expected_message_created_at: submittedAt,
+    expected_user_message: "is this a git repo?",
+    matched_by: "session_id",
     messages: [{
-      createdAt: submittedAt,
+      created_at: submittedAt,
       id: promptId,
       role: "user",
       text: "is this a git repo?",
     }, {
-      createdAt: completedAt,
+      created_at: completedAt,
       id: "assistant-final",
       kind: "message",
       role: "assistant",
       text: assistantText,
     }, {
-      createdAt: completedAt,
+      created_at: completedAt,
       id: "task-complete",
       kind: "task_complete",
       role: "assistant",
       text: assistantText,
     }],
-    promptAccepted: true,
-    promptEventId: promptId,
-    providerSessionId: sessionId,
-    sessionId,
+    prompt_accepted: true,
+    prompt_event_id: promptId,
+    provider_session_id: sessionId,
+    session_id: sessionId,
     source: "codex-session",
-    submittedAt,
-    transcriptExplicitCompletionCanSettleTurn: true,
-    threadId,
-    workspaceId,
+    submitted_at: submittedAt,
+    transcript_explicit_completion_can_settle_turn: true,
+    thread_id: threadId,
+    workspace_id: workspaceId,
   });
 
   const hydratedThread = hydrated[workspaceId].threads[threadId];
   assert.equal(hydratedThread.status, "exited");
-  assert.equal(hydratedThread.latestTurn.state, "completed");
-  assert.equal(hydratedThread.activityStatus, "idle");
-  assert.equal(hydratedThread.providerBindings.codex.activityStatus, "idle");
-  assert.equal(hydratedThread.providerBindings.codex.inputReady, false);
+  assert.equal(hydratedThread.latest_turn.state, "completed");
+  assert.equal(hydratedThread.activity_status, "idle");
+  assert.equal(hydratedThread.provider_bindings.codex.activity_status, "idle");
+  assert.equal(hydratedThread.provider_bindings.codex.input_ready, false);
 });
 
 test("timestamp recovered transcript settles queued running turn after prompt acceptance", () => {
@@ -1927,97 +1925,97 @@ test("timestamp recovered transcript settles queued running turn after prompt ac
   const state = {
     [workspaceId]: {
       id: workspaceId,
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: {
           id: threadId,
-          activityStatus: "idle",
+          activity_status: "idle",
           coordination: {
-            worktreePath: "/repo/.agents/worktrees/2",
+            worktree_path: "/repo/.agents/worktrees/2",
           },
-          currentAgent: "codex",
-          latestTurn: {
-            messageId: promptId,
-            startedAt: submittedAt,
+          current_agent: "codex",
+          latest_turn: {
+            message_id: promptId,
+            started_at: submittedAt,
             state: "running",
-            turnId,
+            turn_id: turnId,
           },
           materialized: true,
-          messageCount: 1,
+          message_count: 1,
           messages: [],
-          pendingPrompt: null,
-          projectionEvents: [{
-            agentId: "codex",
-            createdAt: submittedAt,
+          pending_prompt: null,
+          projection_events: [{
+            agent_id: "codex",
+            created_at: submittedAt,
             id: "turn-start",
-            messageId: promptId,
+            message_id: promptId,
             source: "tui-todo-auto-queue",
             status: "running",
-            turnId,
+            turn_id: turnId,
             type: "thread.turn.started",
           }],
-          providerBindings: {
+          provider_bindings: {
             codex: {
-              activityStatus: "idle",
-              inputReady: false,
-              nativeSessionId: "",
+              activity_status: "idle",
+              input_ready: false,
+              native_session_id: "",
               status: "exited",
-              terminalBinding: null,
+              terminal_binding: null,
             },
           },
           status: "exited",
-          terminalBinding: null,
-          terminalIndex: 1,
-          transcriptSessionId: "",
-          workspaceId,
+          terminal_binding: null,
+          terminal_index: 1,
+          transcript_session_id: "",
+          workspace_id: workspaceId,
         },
       },
     },
   };
 
   const hydrated = hydrateWorkspaceThreadSessionTranscript(state, {
-    agentId: "codex",
-    allowTranscriptTurnCompletion: true,
-    expectedMessageCreatedAt: submittedAt,
-    expectedUserMessage: "",
-    latestTimestamp: completedAt,
-    matchedBy: "cwd+timestamp-recovery",
+    agent_id: "codex",
+    allow_transcript_turn_completion: true,
+    expected_message_created_at: submittedAt,
+    expected_user_message: "",
+    latest_timestamp: completedAt,
+    matched_by: "cwd+timestamp-recovery",
     messages: [{
-      createdAt: acceptedAt,
+      created_at: acceptedAt,
       id: "codex-user",
       role: "user",
       text: "i need your help",
     }, {
-      createdAt: completedAt,
+      created_at: completedAt,
       id: "assistant-final",
       kind: "message",
       role: "assistant",
       text: "What do you need help with?",
     }, {
-      createdAt: completedAt,
+      created_at: completedAt,
       id: "task-complete",
       kind: "task_complete",
       role: "assistant",
       text: "What do you need help with?",
     }],
-    promptAccepted: true,
-    promptEventId: promptId,
-    providerSessionId: sessionId,
-    sessionId,
+    prompt_accepted: true,
+    prompt_event_id: promptId,
+    provider_session_id: sessionId,
+    session_id: sessionId,
     source: "codex-session",
-    submittedAt,
-    transcriptExplicitCompletionCanSettleTurn: true,
-    threadId,
-    workspaceId,
+    submitted_at: submittedAt,
+    transcript_explicit_completion_can_settle_turn: true,
+    thread_id: threadId,
+    workspace_id: workspaceId,
   });
 
   const thread = hydrated[workspaceId].threads[threadId];
-  assert.equal(thread.latestTurn.state, "completed");
-  assert.equal(thread.latestTurn.turnId, turnId);
-  assert.equal(thread.activityStatus, "idle");
+  assert.equal(thread.latest_turn.state, "completed");
+  assert.equal(thread.latest_turn.turn_id, turnId);
+  assert.equal(thread.activity_status, "idle");
   assert.equal(thread.messages[0].text, "i need your help");
-  assert.equal(thread.transcriptSessionId, sessionId);
-  assert.equal(thread.providerBindings.codex.inputReady, false);
+  assert.equal(thread.transcript_session_id, sessionId);
+  assert.equal(thread.provider_bindings.codex.input_ready, false);
 });
 
 test("session transcript completion does not settle running turn for a later prompt", () => {
@@ -2033,98 +2031,98 @@ test("session transcript completion does not settle running turn for a later pro
   const state = {
     [workspaceId]: {
       id: workspaceId,
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: {
           id: threadId,
-          activityStatus: "thinking",
-          currentAgent: "codex",
-          latestTurn: {
-            messageId: promptId,
-            startedAt: submittedAt,
+          activity_status: "thinking",
+          current_agent: "codex",
+          latest_turn: {
+            message_id: promptId,
+            started_at: submittedAt,
             state: "running",
-            turnId,
+            turn_id: turnId,
           },
           messages: [{
-            createdAt: submittedAt,
+            created_at: submittedAt,
             id: promptId,
             role: "user",
             text: "interesting",
-            turnId,
+            turn_id: turnId,
           }],
-          projectionEvents: [{
-            agentId: "codex",
-            createdAt: submittedAt,
+          projection_events: [{
+            agent_id: "codex",
+            created_at: submittedAt,
             id: "turn-start",
-            messageId: promptId,
+            message_id: promptId,
             status: "running",
-            turnId,
+            turn_id: turnId,
             type: "thread.turn.started",
           }, {
-            agentId: "codex",
-            createdAt: submittedAt,
+            agent_id: "codex",
+            created_at: submittedAt,
             id: "user-message",
-            messageId: promptId,
+            message_id: promptId,
             role: "user",
             source: "codex-session",
             status: "submitted",
             text: "interesting",
-            turnId,
+            turn_id: turnId,
             type: "thread.message.user",
           }],
-          providerBindings: {
+          provider_bindings: {
             codex: {
-              activityStatus: "thinking",
-              inputReady: false,
-              nativeSessionId: sessionId,
-              nativeSessionKind: "session",
+              activity_status: "thinking",
+              input_ready: false,
+              native_session_id: sessionId,
+              native_session_kind: "session",
               status: "active",
             },
           },
           status: "active",
-          terminalIndex: 0,
-          transcriptSessionId: sessionId,
-          workspaceId,
+          terminal_index: 0,
+          transcript_session_id: sessionId,
+          workspace_id: workspaceId,
         },
       },
     },
   };
 
   const hydrated = hydrateWorkspaceThreadSessionTranscript(state, {
-    agentId: "codex",
-    expectedMessageCreatedAt: submittedAt,
-    expectedUserMessage: "interesting",
-    matchedBy: "sessionId",
+    agent_id: "codex",
+    expected_message_created_at: submittedAt,
+    expected_user_message: "interesting",
+    matched_by: "session_id",
     messages: [{
-      createdAt: submittedAt,
+      created_at: submittedAt,
       id: promptId,
       role: "user",
       text: "interesting",
     }, {
-      createdAt: laterSubmittedAt,
+      created_at: laterSubmittedAt,
       id: "later-user",
       role: "user",
       text: "new task",
     }, {
-      createdAt: completedAt,
+      created_at: completedAt,
       id: "task-complete",
       kind: "task_complete",
       role: "assistant",
       text: "Done.",
     }],
-    promptAccepted: true,
-    promptEventId: promptId,
-    providerSessionId: sessionId,
-    sessionId,
+    prompt_accepted: true,
+    prompt_event_id: promptId,
+    provider_session_id: sessionId,
+    session_id: sessionId,
     source: "codex-session",
-    submittedAt,
-    threadId,
-    workspaceId,
+    submitted_at: submittedAt,
+    thread_id: threadId,
+    workspace_id: workspaceId,
   });
 
   const hydratedThread = hydrated[workspaceId].threads[threadId];
-  assert.equal(hydratedThread.latestTurn.state, "running");
-  assert.equal(hydratedThread.activityStatus, "idle");
+  assert.equal(hydratedThread.latest_turn.state, "running");
+  assert.equal(hydratedThread.activity_status, "idle");
 });
 
 test("terminal hook activity preserves agent display identity", () => {
@@ -2134,70 +2132,70 @@ test("terminal hook activity preserves agent display identity", () => {
   const state = {
     [workspaceId]: {
       id: workspaceId,
-      terminalOrder: ["0"],
+      terminal_order: ["0"],
       terminals: {
         0: {
-          agentId: "codex",
-          instanceId: 1,
-          paneId,
+          agent_id: "codex",
+          instance_id: 1,
+          pane_id: paneId,
           status: "active",
-          terminalIndex: 0,
-          threadId,
+          terminal_index: 0,
+          thread_id: threadId,
         },
       },
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: {
           id: threadId,
-          activityStatus: "idle",
-          currentAgent: "codex",
+          activity_status: "idle",
+          current_agent: "codex",
           messages: [],
-          providerBindings: {
+          provider_bindings: {
             codex: {
-              activityStatus: "idle",
-              inputReady: true,
+              activity_status: "idle",
+              input_ready: true,
               status: "active",
-              terminalBinding: {
-                instanceId: 1,
-                paneId,
-                terminalIndex: 0,
+              terminal_binding: {
+                instance_id: 1,
+                pane_id: paneId,
+                terminal_index: 0,
               },
             },
           },
           status: "active",
-          terminalBinding: {
-            instanceId: 1,
-            paneId,
-            terminalIndex: 0,
+          terminal_binding: {
+            instance_id: 1,
+            pane_id: paneId,
+            terminal_index: 0,
           },
-          terminalIndex: 0,
-          workspaceId,
+          terminal_index: 0,
+          workspace_id: workspaceId,
         },
       },
     },
   };
 
   const next = markWorkspaceThreadAgentActivity(state, {
-    activityStatus: "thinking",
-    agentDisplayName: "code-reviewer",
-    agentId: "codex",
-    agentType: "reviewer",
-    instanceId: 1,
-    paneId,
+    activity_status: "thinking",
+    agent_display_name: "code-reviewer",
+    agent_id: "codex",
+    agent_type: "reviewer",
+    instance_id: 1,
+    pane_id: paneId,
     provider: "codex",
-    terminalIndex: 0,
-    threadId,
+    terminal_index: 0,
+    thread_id: threadId,
     type: "provider-turn-started",
-    workspaceId,
+    workspace_id: workspaceId,
   });
 
-  const binding = next[workspaceId].threads[threadId].providerBindings.codex;
+  const binding = next[workspaceId].threads[threadId].provider_bindings.codex;
   const terminal = next[workspaceId].terminals[0];
-  assert.equal(binding.agentDisplayName, "code-reviewer");
-  assert.equal(binding.agentType, "reviewer");
+  assert.equal(binding.agent_display_name, "code-reviewer");
+  assert.equal(binding.agent_type, "reviewer");
   assert.equal(binding.provider, "codex");
-  assert.equal(terminal.agentDisplayName, "code-reviewer");
-  assert.equal(terminal.agentType, "reviewer");
+  assert.equal(terminal.agent_display_name, "code-reviewer");
+  assert.equal(terminal.agent_type, "reviewer");
   assert.equal(terminal.provider, "codex");
 });
 
@@ -2205,35 +2203,35 @@ test("workspace terminals get unique stable short nicknames", () => {
   const workspaceId = "workspace-terminal-names";
   const next = [0, 1, 2].reduce((state, terminalIndex) => (
     materializeWorkspaceThreadForTerminal(state, {
-      agentId: "codex",
-      instanceId: terminalIndex + 1,
-      paneId: `pane-${terminalIndex}`,
-      terminalIndex,
-      threadId: `thread-${terminalIndex}`,
+      agent_id: "codex",
+      instance_id: terminalIndex + 1,
+      pane_id: `pane-${terminalIndex}`,
+      terminal_index: terminalIndex,
+      thread_id: `thread-${terminalIndex}`,
       type: "message-submitted",
-      userMessage: `hello ${terminalIndex}`,
-      workspaceId,
+      user_message: `hello ${terminalIndex}`,
+      workspace_id: workspaceId,
     })
   ), {});
 
   const entry = next[workspaceId];
-  const nicknames = entry.threadOrder.map((threadId) => {
+  const nicknames = entry.thread_order.map((threadId) => {
     const thread = entry.threads[threadId];
-    const terminal = entry.terminals[String(thread.terminalIndex)];
-    const binding = thread.providerBindings.codex;
+    const terminal = entry.terminals[String(thread.terminal_index)];
+    const binding = thread.provider_bindings.codex;
     const nickname = getWorkspaceThreadTerminalNickname(thread, binding, terminal);
     assert.match(nickname, /^[A-Z][a-z]{1,3}$/);
-    assert.equal(thread.terminalNickname, nickname);
-    assert.equal(thread.terminalName, nickname);
-    assert.equal(binding.terminalNickname, nickname);
-    assert.equal(terminal.terminalNickname, nickname);
+    assert.equal(thread.terminal_nickname, nickname);
+    assert.equal(thread.terminal_name, nickname);
+    assert.equal(binding.terminal_nickname, nickname);
+    assert.equal(terminal.terminal_nickname, nickname);
     return nickname;
   });
   assert.equal(new Set(nicknames).size, nicknames.length);
 
   const persisted = persistWorkspaceThreads(next);
-  const persistedNicknames = entry.threadOrder.map((threadId) => (
-    persisted[workspaceId].threads[threadId].terminalNickname
+  const persistedNicknames = entry.thread_order.map((threadId) => (
+    persisted[workspaceId].threads[threadId].terminal_nickname
   ));
   assert.deepEqual(persistedNicknames, nicknames);
   assert.equal(Object.keys(persisted[workspaceId].terminals).length, 0);
@@ -2243,44 +2241,44 @@ test("workspace terminal nickname reconciliation keeps one duplicate per workspa
   const workspaceId = "workspace-terminal-name-dupes";
   const normalized = normalizeWorkspaceThreads({
     [workspaceId]: {
-      terminalThreadIds: {
+      terminal_thread_ids: {
         0: "thread-a",
         1: "thread-b",
       },
-      threadOrder: ["thread-a", "thread-b"],
+      thread_order: ["thread-a", "thread-b"],
       threads: {
         "thread-a": {
-          currentAgent: "codex",
+          current_agent: "codex",
           id: "thread-a",
           materialized: true,
-          providerBindings: {
+          provider_bindings: {
             codex: {
-              terminalNickname: "Bob",
+              terminal_nickname: "Bob",
             },
           },
-          terminalIndex: 0,
-          terminalNickname: "Bob",
-          workspaceId,
+          terminal_index: 0,
+          terminal_nickname: "Bob",
+          workspace_id: workspaceId,
         },
         "thread-b": {
-          currentAgent: "codex",
+          current_agent: "codex",
           id: "thread-b",
           materialized: true,
-          providerBindings: {
+          provider_bindings: {
             codex: {
-              terminalNickname: "Bob",
+              terminal_nickname: "Bob",
             },
           },
-          terminalIndex: 1,
-          terminalNickname: "Bob",
-          workspaceId,
+          terminal_index: 1,
+          terminal_nickname: "Bob",
+          workspace_id: workspaceId,
         },
       },
     },
   });
   const entry = normalized[workspaceId];
-  const first = entry.threads["thread-a"].terminalNickname;
-  const second = entry.threads["thread-b"].terminalNickname;
+  const first = entry.threads["thread-a"].terminal_nickname;
+  const second = entry.threads["thread-b"].terminal_nickname;
 
   assert.equal(first, "Bob");
   assert.match(second, /^[A-Z][a-z]{1,3}$/);
@@ -2290,36 +2288,36 @@ test("workspace terminal nickname reconciliation keeps one duplicate per workspa
 test("existing terminal nickname wins over hook agent display name", () => {
   const workspaceId = "workspace-terminal-name-hook";
   const state = materializeWorkspaceThreadForTerminal({}, {
-    agentDisplayName: "reviewer",
-    agentId: "codex",
-    agentType: "reviewer",
-    instanceId: 1,
-    paneId: "pane-hook",
+    agent_display_name: "reviewer",
+    agent_id: "codex",
+    agent_type: "reviewer",
+    instance_id: 1,
+    pane_id: "pane-hook",
     status: "active",
-    terminalIndex: 0,
-    terminalNickname: "Ali",
-    threadId: "thread-hook",
+    terminal_index: 0,
+    terminal_nickname: "Ali",
+    thread_id: "thread-hook",
     type: "message-submitted",
-    userMessage: "start",
-    workspaceId,
+    user_message: "start",
+    workspace_id: workspaceId,
   });
   const next = markWorkspaceThreadAgentActivity(state, {
-    activityStatus: "thinking",
-    agentDisplayName: "code-reviewer",
-    agentId: "codex",
-    agentType: "reviewer",
-    instanceId: 1,
-    paneId: "pane-hook",
-    terminalIndex: 0,
-    threadId: "thread-hook",
+    activity_status: "thinking",
+    agent_display_name: "code-reviewer",
+    agent_id: "codex",
+    agent_type: "reviewer",
+    instance_id: 1,
+    pane_id: "pane-hook",
+    terminal_index: 0,
+    thread_id: "thread-hook",
     type: "provider-turn-started",
-    workspaceId,
+    workspace_id: workspaceId,
   });
   const thread = next[workspaceId].threads["thread-hook"];
   const terminal = next[workspaceId].terminals[0];
-  const binding = thread.providerBindings.codex;
+  const binding = thread.provider_bindings.codex;
 
-  assert.equal(binding.agentDisplayName, "code-reviewer");
+  assert.equal(binding.agent_display_name, "code-reviewer");
   assert.equal(getWorkspaceThreadTerminalNickname(thread, binding, terminal), "Ali");
 });
 
@@ -2327,58 +2325,58 @@ test("workspace terminal nickname survives close and reopen", () => {
   const workspaceId = "workspace-terminal-name-reopen";
   const threadId = "thread-reopen";
   const state = materializeWorkspaceThreadForTerminal({}, {
-    agentId: "codex",
-    instanceId: 1,
-    paneId: "pane-reopen-1",
+    agent_id: "codex",
+    instance_id: 1,
+    pane_id: "pane-reopen-1",
     status: "active",
-    terminalIndex: 0,
-    threadId,
+    terminal_index: 0,
+    thread_id: threadId,
     type: "message-submitted",
-    userMessage: "start",
-    workspaceId,
+    user_message: "start",
+    workspace_id: workspaceId,
   });
   const firstThread = state[workspaceId].threads[threadId];
   const firstTerminal = state[workspaceId].terminals[0];
   const firstNickname = getWorkspaceThreadTerminalNickname(
     firstThread,
-    firstThread.providerBindings.codex,
+    firstThread.provider_bindings.codex,
     firstTerminal,
   );
 
   assert.ok(firstNickname);
 
   const closed = markWorkspaceThreadTerminalDetached(state, {
-    agentId: "codex",
-    instanceId: 1,
-    paneId: "pane-reopen-1",
+    agent_id: "codex",
+    instance_id: 1,
+    pane_id: "pane-reopen-1",
     status: "closed",
-    terminalIndex: 0,
-    threadId,
-    workspaceId,
+    terminal_index: 0,
+    thread_id: threadId,
+    workspace_id: workspaceId,
   });
   assert.equal(closed[workspaceId].terminals[0], undefined);
 
   const restored = normalizeWorkspaceThreads(persistWorkspaceThreads(closed));
-  assert.equal(restored[workspaceId].terminalThreadIds[0], threadId);
-  assert.equal(restored[workspaceId].threads[threadId].terminalNickname, firstNickname);
+  assert.equal(restored[workspaceId].terminal_thread_ids[0], threadId);
+  assert.equal(restored[workspaceId].threads[threadId].terminal_nickname, firstNickname);
 
   const reopened = updateWorkspaceActiveTerminal(restored, {
-    agentId: "codex",
-    instanceId: 2,
-    paneId: "pane-reopen-2",
+    agent_id: "codex",
+    instance_id: 2,
+    pane_id: "pane-reopen-2",
     status: "active",
-    terminalIndex: 0,
+    terminal_index: 0,
     type: "opened",
-    workspaceId,
+    workspace_id: workspaceId,
   });
   const reopenedThread = reopened[workspaceId].threads[threadId];
   const reopenedTerminal = reopened[workspaceId].terminals[0];
 
-  assert.equal(reopenedTerminal.threadId, threadId);
+  assert.equal(reopenedTerminal.thread_id, threadId);
   assert.equal(
     getWorkspaceThreadTerminalNickname(
       reopenedThread,
-      reopenedThread.providerBindings.codex,
+      reopenedThread.provider_bindings.codex,
       reopenedTerminal,
     ),
     firstNickname,
@@ -2390,47 +2388,47 @@ test("closed session-backed thread restores by terminal index after persistence"
   const threadId = "thread-session-reopen";
   const sessionId = "codex-session-reopen";
   const active = materializeWorkspaceThreadForTerminal({}, {
-    agentId: "codex",
-    instanceId: 1,
-    nativeSessionId: sessionId,
-    paneId: "pane-session-reopen-1",
-    providerSessionId: sessionId,
+    agent_id: "codex",
+    instance_id: 1,
+    native_session_id: sessionId,
+    pane_id: "pane-session-reopen-1",
+    provider_session_id: sessionId,
     status: "active",
-    terminalIndex: 0,
-    threadId,
+    terminal_index: 0,
+    thread_id: threadId,
     type: "message-submitted",
-    userMessage: "resume me later",
-    workspaceId,
+    user_message: "resume me later",
+    workspace_id: workspaceId,
   });
   const bound = updateWorkspaceThreadProviderSession(active, {
-    agentId: "codex",
-    instanceId: 1,
-    nativeSessionId: sessionId,
-    paneId: "pane-session-reopen-1",
-    providerSessionId: sessionId,
-    terminalIndex: 0,
-    threadId,
-    workspaceId,
+    agent_id: "codex",
+    instance_id: 1,
+    native_session_id: sessionId,
+    pane_id: "pane-session-reopen-1",
+    provider_session_id: sessionId,
+    terminal_index: 0,
+    thread_id: threadId,
+    workspace_id: workspaceId,
   });
   const closed = markWorkspaceThreadTerminalDetached(bound, {
-    agentId: "codex",
-    instanceId: 1,
-    paneId: "pane-session-reopen-1",
+    agent_id: "codex",
+    instance_id: 1,
+    pane_id: "pane-session-reopen-1",
     status: "closed",
-    terminalIndex: 0,
-    threadId,
-    workspaceId,
+    terminal_index: 0,
+    thread_id: threadId,
+    workspace_id: workspaceId,
   });
 
   const restored = normalizeWorkspaceThreads(persistWorkspaceThreads(closed));
   const restoredThread = getWorkspaceThreadForTerminalIndex(restored, workspaceId, "0");
 
   assert.equal(restored[workspaceId].terminals[0], undefined);
-  assert.equal(restored[workspaceId].terminalThreadIds[0], threadId);
+  assert.equal(restored[workspaceId].terminal_thread_ids[0], threadId);
   assert.equal(restoredThread?.id, threadId);
-  assert.equal(restoredThread?.terminalBinding, null);
-  assert.equal(restoredThread?.transcriptSessionId, sessionId);
-  assert.equal(restoredThread?.providerBindings.codex.nativeSessionId, sessionId);
+  assert.equal(restoredThread?.terminal_binding, null);
+  assert.equal(restoredThread?.transcript_session_id, sessionId);
+  assert.equal(restoredThread?.provider_bindings.codex.native_session_id, sessionId);
 });
 
 test("live terminal thread selection prefers the current provider session over a cached terminal thread", () => {
@@ -2439,67 +2437,67 @@ test("live terminal thread selection prefers the current provider session over a
   const currentThreadId = "thread-current-terminal-session";
   const state = normalizeWorkspaceThreads({
     [workspaceId]: {
-      activeThreadId: staleThreadId,
-      terminalThreadIds: {
+      active_thread_id: staleThreadId,
+      terminal_thread_ids: {
         0: staleThreadId,
       },
       terminals: {
         0: {
-          agentId: "codex",
-          instanceId: 11,
-          paneId: "pane-live-selection",
-          providerSessionId: "old-session",
+          agent_id: "codex",
+          instance_id: 11,
+          pane_id: "pane-live-selection",
+          provider_session_id: "old-session",
           status: "active",
-          terminalIndex: 0,
-          threadId: staleThreadId,
+          terminal_index: 0,
+          thread_id: staleThreadId,
         },
       },
-      threadOrder: [staleThreadId, currentThreadId],
+      thread_order: [staleThreadId, currentThreadId],
       threads: {
         [staleThreadId]: {
-          currentAgent: "codex",
+          current_agent: "codex",
           id: staleThreadId,
           materialized: true,
-          providerBindings: {
+          provider_bindings: {
             codex: {
-              nativeSessionId: "old-session",
+              native_session_id: "old-session",
             },
           },
           status: "active",
-          terminalIndex: 0,
-          transcriptSessionId: "old-session",
-          workspaceId,
+          terminal_index: 0,
+          transcript_session_id: "old-session",
+          workspace_id: workspaceId,
         },
         [currentThreadId]: {
-          currentAgent: "codex",
+          current_agent: "codex",
           id: currentThreadId,
           materialized: true,
-          providerBindings: {
+          provider_bindings: {
             codex: {
-              nativeSessionId: "current-session",
-              terminalBinding: {
-                instanceId: 12,
-                paneId: "pane-live-selection",
-                terminalIndex: 0,
+              native_session_id: "current-session",
+              terminal_binding: {
+                instance_id: 12,
+                pane_id: "pane-live-selection",
+                terminal_index: 0,
               },
             },
           },
           status: "active",
-          terminalIndex: 0,
-          transcriptSessionId: "current-session",
-          workspaceId,
+          terminal_index: 0,
+          transcript_session_id: "current-session",
+          workspace_id: workspaceId,
         },
       },
     },
   });
 
   const selectedThreadId = getWorkspaceThreadSelectionForLiveTerminal(state[workspaceId], {
-    agentId: "codex",
-    instanceId: 12,
-    paneId: "pane-live-selection",
-    providerSessionId: "current-session",
-    terminalIndex: 0,
-    threadId: staleThreadId,
+    agent_id: "codex",
+    instance_id: 12,
+    pane_id: "pane-live-selection",
+    provider_session_id: "current-session",
+    terminal_index: 0,
+    thread_id: staleThreadId,
   });
 
   assert.equal(selectedThreadId, currentThreadId);
@@ -2511,69 +2509,69 @@ test("live terminal thread selection uses a sessionless thread for no-session co
   const sessionlessThreadId = "thread-yellow-sessionless";
   const state = normalizeWorkspaceThreads({
     [workspaceId]: {
-      activeThreadId: staleThreadId,
-      terminalThreadIds: {
+      active_thread_id: staleThreadId,
+      terminal_thread_ids: {
         0: staleThreadId,
       },
       terminals: {
         0: {
-          agentId: "codex",
-          instanceId: 21,
-          paneId: "pane-yellow-selection",
-          providerSessionId: "old-session",
+          agent_id: "codex",
+          instance_id: 21,
+          pane_id: "pane-yellow-selection",
+          provider_session_id: "old-session",
           status: "active",
-          terminalIndex: 0,
-          threadId: staleThreadId,
+          terminal_index: 0,
+          thread_id: staleThreadId,
         },
       },
-      threadOrder: [staleThreadId, sessionlessThreadId],
+      thread_order: [staleThreadId, sessionlessThreadId],
       threads: {
         [staleThreadId]: {
-          currentAgent: "codex",
+          current_agent: "codex",
           id: staleThreadId,
           materialized: true,
-          providerBindings: {
+          provider_bindings: {
             codex: {
-              nativeSessionId: "old-session",
+              native_session_id: "old-session",
             },
           },
           status: "active",
-          terminalIndex: 0,
-          transcriptSessionId: "old-session",
-          workspaceId,
+          terminal_index: 0,
+          transcript_session_id: "old-session",
+          workspace_id: workspaceId,
         },
         [sessionlessThreadId]: {
-          currentAgent: "codex",
+          current_agent: "codex",
           id: sessionlessThreadId,
           materialized: true,
-          providerBindings: {
+          provider_bindings: {
             codex: {
-              terminalBinding: {
-                instanceId: 22,
-                paneId: "pane-yellow-selection",
-                terminalIndex: 0,
+              terminal_binding: {
+                instance_id: 22,
+                pane_id: "pane-yellow-selection",
+                terminal_index: 0,
               },
             },
           },
           status: "active",
-          terminalBinding: {
-            instanceId: 22,
-            paneId: "pane-yellow-selection",
-            terminalIndex: 0,
+          terminal_binding: {
+            instance_id: 22,
+            pane_id: "pane-yellow-selection",
+            terminal_index: 0,
           },
-          terminalIndex: 0,
-          workspaceId,
+          terminal_index: 0,
+          workspace_id: workspaceId,
         },
       },
     },
   });
 
   const selectedThreadId = getWorkspaceThreadSelectionForLiveTerminal(state[workspaceId], {
-    agentId: "codex",
-    instanceId: 22,
-    paneId: "pane-yellow-selection",
-    terminalIndex: 0,
-    threadId: staleThreadId,
+    agent_id: "codex",
+    instance_id: 22,
+    pane_id: "pane-yellow-selection",
+    terminal_index: 0,
+    thread_id: staleThreadId,
   });
 
   assert.equal(selectedThreadId, sessionlessThreadId);
@@ -2593,105 +2591,105 @@ test("provider turn interruption settles running thread and keeps terminal input
       id: workspaceId,
       terminals: {
         0: {
-          agentId: "codex",
-          inputReady: false,
-          instanceId: 1,
-          paneId,
+          agent_id: "codex",
+          input_ready: false,
+          instance_id: 1,
+          pane_id: paneId,
           status: "active",
-          terminalIndex: 0,
-          threadId,
+          terminal_index: 0,
+          thread_id: threadId,
         },
       },
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: {
           id: threadId,
-          activityStatus: "thinking",
-          currentAgent: "codex",
-          latestTurn: {
-            messageId: promptId,
-            startedAt,
+          activity_status: "thinking",
+          current_agent: "codex",
+          latest_turn: {
+            message_id: promptId,
+            started_at: startedAt,
             state: "running",
-            turnId,
+            turn_id: turnId,
           },
           messages: [{
-            createdAt: startedAt,
+            created_at: startedAt,
             id: promptId,
             role: "user",
             text: "cancel me",
-            turnId,
+            turn_id: turnId,
           }],
           materialized: true,
-          pendingPrompt: {
+          pending_prompt: {
             id: promptId,
           },
-          projectionEvents: [{
-            agentId: "codex",
-            createdAt: startedAt,
+          projection_events: [{
+            agent_id: "codex",
+            created_at: startedAt,
             id: "turn-start",
-            messageId: promptId,
+            message_id: promptId,
             status: "running",
-            turnId,
+            turn_id: turnId,
             type: "thread.turn.started",
           }],
-          providerBindings: {
+          provider_bindings: {
             codex: {
-              activityStatus: "thinking",
-              inputReady: false,
+              activity_status: "thinking",
+              input_ready: false,
               status: "active",
-              terminalBinding: {
-                instanceId: 1,
-                paneId,
-                terminalIndex: 0,
+              terminal_binding: {
+                instance_id: 1,
+                pane_id: paneId,
+                terminal_index: 0,
               },
             },
           },
           status: "active",
-          terminalBinding: {
-            instanceId: 1,
-            paneId,
-            terminalIndex: 0,
+          terminal_binding: {
+            instance_id: 1,
+            pane_id: paneId,
+            terminal_index: 0,
           },
-          terminalIndex: 0,
-          workspaceId,
+          terminal_index: 0,
+          workspace_id: workspaceId,
         },
       },
     },
   };
 
   const next = appendWorkspaceThreadProjectionEvents(state, {
-    activityStatus: "idle",
-    agentId: "codex",
-    clearPendingPrompt: true,
-    inputReady: true,
-    inputReadyAt: interruptedAt,
-    inputReadyConfidence: "escape_key_task_interrupted",
-    instanceId: 1,
-    paneId,
-    projectionEvents: [{
-      agentId: "codex",
-      completedAt: interruptedAt,
-      createdAt: interruptedAt,
+    activity_status: "idle",
+    agent_id: "codex",
+    clear_pending_prompt: true,
+    input_ready: true,
+    input_ready_at: interruptedAt,
+    input_ready_confidence: "escape_key_task_interrupted",
+    instance_id: 1,
+    pane_id: paneId,
+    projection_events: [{
+      agent_id: "codex",
+      completed_at: interruptedAt,
+      created_at: interruptedAt,
       id: "turn-interrupted",
-      messageId: promptId,
+      message_id: promptId,
       status: "interrupted",
-      turnId,
+      turn_id: turnId,
       type: "thread.turn.interrupted",
     }],
     status: "active",
-    terminalIndex: 0,
-    threadId,
+    terminal_index: 0,
+    thread_id: threadId,
     type: "provider-turn-interrupted",
-    workspaceId,
+    workspace_id: workspaceId,
   });
 
   const thread = next[workspaceId].threads[threadId];
-  assert.equal(thread.latestTurn.state, "interrupted");
-  assert.equal(thread.activityStatus, "idle");
-  assert.equal(thread.pendingPrompt, null);
-  assert.equal(thread.providerBindings.codex.inputReady, true);
-  assert.equal(thread.providerBindings.codex.activityStatus, "idle");
-  assert.equal(next[workspaceId].terminals[0].inputReady, true);
+  assert.equal(thread.latest_turn.state, "interrupted");
+  assert.equal(thread.activity_status, "idle");
+  assert.equal(thread.pending_prompt, null);
+  assert.equal(thread.provider_bindings.codex.input_ready, true);
+  assert.equal(thread.provider_bindings.codex.activity_status, "idle");
+  assert.equal(next[workspaceId].terminals[0].input_ready, true);
 });
 
 test("live hook snapshots replace streamed assistant text and survive transcript hydration", () => {
@@ -2710,89 +2708,87 @@ test("live hook snapshots replace streamed assistant text and survive transcript
   ].join("\n");
   const scrambledTranscriptText = "Connections::Layout&twoboards-10on|I'vesummaryhere's,tableaofreviewed|-----";
   const baseThread = {
-    activityStatus: "thinking",
-    currentAgent: "opencode",
+    activity_status: "thinking",
+    current_agent: "opencode",
     id: threadId,
-    latestTurn: {
-      agentId: "opencode",
-      messageId: promptId,
-      requestedAt: submittedAt,
-      startedAt: submittedAt,
+    latest_turn: {
+      agent_id: "opencode",
+      message_id: promptId,
+      requested_at: submittedAt,
+      started_at: submittedAt,
       state: "running",
-      turnId,
+      turn_id: turnId,
     },
     materialized: true,
     messages: [{
-      agentId: "opencode",
-      createdAt: submittedAt,
+      agent_id: "opencode",
+      created_at: submittedAt,
       id: promptId,
       role: "user",
       source: "cli-hook:provider-turn-started",
       status: "submitted",
       text: promptText,
-      turnId,
+      turn_id: turnId,
     }],
-    projectionEvents: [{
-      agentId: "opencode",
-      createdAt: submittedAt,
+    projection_events: [{
+      agent_id: "opencode",
+      created_at: submittedAt,
       id: "turn-start",
-      messageId: promptId,
-      promptEpoch: 1,
+      message_id: promptId,
       prompt_epoch: 1,
       source: "cli-hook:provider-turn-started",
       status: "running",
-      turnId,
+      turn_id: turnId,
       type: "thread.turn.started",
     }, {
-      agentId: "opencode",
-      createdAt: submittedAt,
+      agent_id: "opencode",
+      created_at: submittedAt,
       id: "user-message",
-      messageId: promptId,
-      promptEpoch: 1,
+      message_id: promptId,
       prompt_epoch: 1,
       role: "user",
       source: "cli-hook:provider-turn-started",
       status: "submitted",
       text: promptText,
-      turnId,
+      turn_id: turnId,
       type: "thread.message.user",
     }],
-    providerBindings: {
+    provider_bindings: {
       opencode: {
-        activityStatus: "thinking",
-        inputReady: false,
-        nativeSessionId: "opencode-session-live",
-        nativeSessionKind: "session",
+        activity_status: "thinking",
+        input_ready: false,
+        native_session_id: "opencode-session-live",
+        native_session_kind: "session",
         status: "active",
-        terminalBinding: {
-          terminalIndex: 0,
+        terminal_binding: {
+          terminal_index: 0,
         },
       },
     },
     status: "active",
-    terminalBinding: {
-      terminalIndex: 0,
+    terminal_binding: {
+      terminal_index: 0,
     },
-    terminalIndex: 0,
-    transcriptSessionId: "opencode-session-live",
-    workspaceId,
+    terminal_index: 0,
+    transcript_session_id: "opencode-session-live",
+    workspace_id: workspaceId,
   };
   const state = {
     [workspaceId]: {
-      activeThreadId: threadId,
+      active_thread_id: threadId,
       id: workspaceId,
-      terminalThreadIds: {
+      terminal_thread_ids: {
         0: threadId,
       },
       terminals: {
         0: {
-          activityStatus: "thinking",
-          inputReady: false,
-          terminalIndex: 0,
-          threadId,
+          activity_status: "thinking",
+          input_ready: false,
+          terminal_index: 0,
+          thread_id: threadId,
         },
       },
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: baseThread,
       },
@@ -2800,18 +2796,18 @@ test("live hook snapshots replace streamed assistant text and survive transcript
   };
 
   const deltaProjectionEvents = createWorkspaceThreadLiveTextProjectionEvents(baseThread, {
-    agentId: "opencode",
-    liveTextDelta: "Based on the two boards",
-    liveTextKind: "assistant",
+    agent_id: "opencode",
+    live_text_delta: "Based on the two boards",
+    live_text_kind: "assistant",
     source: "cli-hook:assistant-message-delta",
     type: "provider-output",
   });
   const streamed = appendWorkspaceThreadProjectionEvents(state, {
-    agentId: "opencode",
-    projectionEvents: deltaProjectionEvents,
-    threadId,
+    agent_id: "opencode",
+    projection_events: deltaProjectionEvents,
+    thread_id: threadId,
     type: "provider-output",
-    workspaceId,
+    workspace_id: workspaceId,
   });
   assert.equal(
     streamed[workspaceId].threads[threadId].messages.at(-1).text,
@@ -2821,53 +2817,53 @@ test("live hook snapshots replace streamed assistant text and survive transcript
   const finalProjectionEvents = createWorkspaceThreadLiveTextProjectionEvents(
     streamed[workspaceId].threads[threadId],
     {
-      agentId: "opencode",
-      completedAt,
-      liveTextKind: "assistant",
-      liveTextSnapshot: finalTable,
+      agent_id: "opencode",
+      completed_at: completedAt,
+      live_text_kind: "assistant",
+      live_text_snapshot: finalTable,
       source: "cli-hook:provider-turn-completed",
       type: "provider-turn-completed",
     },
   );
   const completed = appendWorkspaceThreadProjectionEvents(streamed, {
-    agentId: "opencode",
-    completedAt,
-    inputReady: true,
-    projectionEvents: finalProjectionEvents,
-    threadId,
+    agent_id: "opencode",
+    completed_at: completedAt,
+    input_ready: true,
+    projection_events: finalProjectionEvents,
+    thread_id: threadId,
     type: "provider-turn-completed",
-    workspaceId,
+    workspace_id: workspaceId,
   });
   const completedThread = completed[workspaceId].threads[threadId];
-  assert.equal(completedThread.latestTurn.state, "completed");
+  assert.equal(completedThread.latest_turn.state, "completed");
   assert.equal(completedThread.messages.at(-1).text, finalTable);
   assert.equal(completedThread.messages.at(-1).status, "complete");
 
   const hydrated = hydrateWorkspaceThreadSessionTranscript(completed, {
-    agentId: "opencode",
-    assistantResponseCompletesTurn: true,
-    expectedMessageCreatedAt: submittedAt,
-    expectedUserMessage: promptText,
+    agent_id: "opencode",
+    assistant_response_completes_turn: true,
+    expected_message_created_at: submittedAt,
+    expected_user_message: promptText,
     messages: [{
-      createdAt: submittedAt,
+      created_at: submittedAt,
       id: promptId,
       role: "user",
       text: promptText,
     }, {
-      createdAt: completedAt,
+      created_at: completedAt,
       id: "assistant-scrambled",
       role: "assistant",
       text: scrambledTranscriptText,
     }],
-    preferLiveHookAssistantMessages: true,
-    promptAccepted: true,
-    promptEventId: promptId,
-    providerSessionId: "opencode-session-live",
-    sessionId: "opencode-session-live",
+    prefer_live_hook_assistant_messages: true,
+    prompt_accepted: true,
+    prompt_event_id: promptId,
+    provider_session_id: "opencode-session-live",
+    session_id: "opencode-session-live",
     source: "opencode-session-watch",
-    submittedAt,
-    threadId,
-    workspaceId,
+    submitted_at: submittedAt,
+    thread_id: threadId,
+    workspace_id: workspaceId,
   });
   const assistantMessages = hydrated[workspaceId].threads[threadId].messages
     .filter((message) => message.role === "assistant");
@@ -2891,73 +2887,72 @@ test("transcript hydration replaces corrupted live stream for the same turn", ()
     "| --- | --- | --- | --- | --- | --- |",
     "| Resistor | R1 | 1kΩ | 0402 | (-3, 0) | pin2 -> D1 anode |",
     "| LED | D1 | - | 0402 | (3, 0) | anode <- R1 pin2 |",
-    "",
     "Board size: 12mm x 10mm",
   ].join("\n");
   const corruptedLiveText = "'s atablethe blinkof they boardHereitems in2 |: |Component| Name| |(Xpin040";
   const baseThread = {
-    activityStatus: "thinking",
-    currentAgent: "opencode",
+    activity_status: "thinking",
+    current_agent: "opencode",
     id: threadId,
-    latestTurn: {
-      agentId: "opencode",
-      messageId: promptId,
-      requestedAt: submittedAt,
-      startedAt: submittedAt,
+    latest_turn: {
+      agent_id: "opencode",
+      message_id: promptId,
+      requested_at: submittedAt,
+      started_at: submittedAt,
       state: "running",
-      turnId,
+      turn_id: turnId,
     },
     materialized: true,
     messages: [{
-      agentId: "opencode",
-      createdAt: submittedAt,
+      agent_id: "opencode",
+      created_at: submittedAt,
       id: promptId,
       role: "user",
       source: "cli-hook:provider-turn-started",
       status: "submitted",
       text: promptText,
-      turnId,
+      turn_id: turnId,
     }],
-    projectionEvents: [{
-      agentId: "opencode",
-      createdAt: submittedAt,
+    projection_events: [{
+      agent_id: "opencode",
+      created_at: submittedAt,
       id: "turn-start-replace",
-      messageId: promptId,
+      message_id: promptId,
       source: "cli-hook:provider-turn-started",
       status: "running",
-      turnId,
+      turn_id: turnId,
       type: "thread.turn.started",
     }, {
-      agentId: "opencode",
-      createdAt: submittedAt,
+      agent_id: "opencode",
+      created_at: submittedAt,
       id: "user-message-replace",
-      messageId: promptId,
+      message_id: promptId,
       role: "user",
       source: "cli-hook:provider-turn-started",
       status: "submitted",
       text: promptText,
-      turnId,
+      turn_id: turnId,
       type: "thread.message.user",
     }],
-    providerBindings: {
+    provider_bindings: {
       opencode: {
-        activityStatus: "thinking",
-        inputReady: false,
-        nativeSessionId: "opencode-session-live-replace",
+        activity_status: "thinking",
+        input_ready: false,
+        native_session_id: "opencode-session-live-replace",
         status: "active",
       },
     },
     status: "active",
-    terminalIndex: 0,
-    transcriptSessionId: "opencode-session-live-replace",
-    workspaceId,
+    terminal_index: 0,
+    transcript_session_id: "opencode-session-live-replace",
+    workspace_id: workspaceId,
   };
   const state = {
     [workspaceId]: {
-      activeThreadId: threadId,
+      active_thread_id: threadId,
       id: workspaceId,
       terminals: {},
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: baseThread,
       },
@@ -2965,18 +2960,18 @@ test("transcript hydration replaces corrupted live stream for the same turn", ()
   };
 
   const liveProjectionEvents = createWorkspaceThreadLiveTextProjectionEvents(baseThread, {
-    agentId: "opencode",
-    liveTextDelta: corruptedLiveText,
-    liveTextKind: "assistant",
+    agent_id: "opencode",
+    live_text_delta: corruptedLiveText,
+    live_text_kind: "assistant",
     source: "cli-hook:assistant-message-delta",
     type: "provider-message-displayed",
   });
   const streamed = appendWorkspaceThreadProjectionEvents(state, {
-    agentId: "opencode",
-    projectionEvents: liveProjectionEvents,
-    threadId,
+    agent_id: "opencode",
+    projection_events: liveProjectionEvents,
+    thread_id: threadId,
     type: "provider-message-displayed",
-    workspaceId,
+    workspace_id: workspaceId,
   });
   assert.equal(
     streamed[workspaceId].threads[threadId].messages
@@ -2985,29 +2980,29 @@ test("transcript hydration replaces corrupted live stream for the same turn", ()
   );
 
   const hydrated = hydrateWorkspaceThreadSessionTranscript(streamed, {
-    agentId: "opencode",
-    assistantResponseCompletesTurn: true,
-    expectedMessageCreatedAt: submittedAt,
-    expectedUserMessage: promptText,
+    agent_id: "opencode",
+    assistant_response_completes_turn: true,
+    expected_message_created_at: submittedAt,
+    expected_user_message: promptText,
     messages: [{
-      createdAt: submittedAt,
+      created_at: submittedAt,
       id: promptId,
       role: "user",
       text: promptText,
     }, {
-      createdAt: completedAt,
+      created_at: completedAt,
       id: "assistant-final-table",
       role: "assistant",
       text: finalTable,
     }],
-    promptAccepted: true,
-    promptEventId: promptId,
-    providerSessionId: "opencode-session-live-replace",
-    sessionId: "opencode-session-live-replace",
+    prompt_accepted: true,
+    prompt_event_id: promptId,
+    provider_session_id: "opencode-session-live-replace",
+    session_id: "opencode-session-live-replace",
     source: "opencode-session-watch",
-    submittedAt,
-    threadId,
-    workspaceId,
+    submitted_at: submittedAt,
+    thread_id: threadId,
+    workspace_id: workspaceId,
   });
   const assistantMessages = hydrated[workspaceId].threads[threadId].messages
     .filter((message) => message.role === "assistant");
@@ -3023,48 +3018,48 @@ test("live assistant projection preserves whitespace-only deltas", () => {
   const turnId = `turn-${promptId}`;
   const submittedAt = "2026-07-02T18:20:00.000Z";
   const baseThread = {
-    activityStatus: "thinking",
-    currentAgent: "opencode",
+    activity_status: "thinking",
+    current_agent: "opencode",
     id: threadId,
-    latestTurn: {
-      agentId: "opencode",
-      messageId: promptId,
-      requestedAt: submittedAt,
-      startedAt: submittedAt,
+    latest_turn: {
+      agent_id: "opencode",
+      message_id: promptId,
+      requested_at: submittedAt,
+      started_at: submittedAt,
       state: "running",
-      turnId,
+      turn_id: turnId,
     },
     materialized: true,
     messages: [{
-      agentId: "opencode",
-      createdAt: submittedAt,
+      agent_id: "opencode",
+      created_at: submittedAt,
       id: promptId,
       role: "user",
       source: "cli-hook:provider-turn-started",
       status: "submitted",
       text: "make a short table",
-      turnId,
+      turn_id: turnId,
     }],
-    projectionEvents: [{
-      agentId: "opencode",
-      createdAt: submittedAt,
+    projection_events: [{
+      agent_id: "opencode",
+      created_at: submittedAt,
       id: "turn-start-space-delta",
-      messageId: promptId,
+      message_id: promptId,
       source: "cli-hook:provider-turn-started",
       status: "running",
-      turnId,
+      turn_id: turnId,
       type: "thread.turn.started",
     }],
     status: "active",
-    transcriptSessionId: "opencode-session-space-delta",
-    workspaceId,
+    transcript_session_id: "opencode-session-space-delta",
+    workspace_id: workspaceId,
   };
   let state = {
     [workspaceId]: {
-      activeThreadId: threadId,
+      active_thread_id: threadId,
       id: workspaceId,
       terminals: {},
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: baseThread,
       },
@@ -3075,19 +3070,19 @@ test("live assistant projection preserves whitespace-only deltas", () => {
     const projectionEvents = createWorkspaceThreadLiveTextProjectionEvents(
       state[workspaceId].threads[threadId],
       {
-        agentId: "opencode",
-        liveTextDelta: chunk,
-        liveTextKind: "assistant",
+        agent_id: "opencode",
+        live_text_delta: chunk,
+        live_text_kind: "assistant",
         source: "cli-hook:assistant-message-delta",
         type: "provider-message-displayed",
       },
     );
     state = appendWorkspaceThreadProjectionEvents(state, {
-      agentId: "opencode",
-      projectionEvents,
-      threadId,
+      agent_id: "opencode",
+      projection_events: projectionEvents,
+      thread_id: threadId,
       type: "provider-message-displayed",
-      workspaceId,
+      workspace_id: workspaceId,
     });
   }
 
@@ -3102,13 +3097,13 @@ test("live assistant projection preserves repeated identical chunks from one sna
   const promptId = "prompt-live-repeated-space";
   const turnId = `turn-${promptId}`;
   const baseThread = {
-    currentAgent: "opencode",
+    current_agent: "opencode",
     id: threadId,
-    latestTurn: {
-      agentId: "opencode",
-      messageId: promptId,
+    latest_turn: {
+      agent_id: "opencode",
+      message_id: promptId,
       state: "running",
-      turnId,
+      turn_id: turnId,
     },
     materialized: true,
     messages: [{
@@ -3116,44 +3111,44 @@ test("live assistant projection preserves repeated identical chunks from one sna
       role: "user",
       status: "submitted",
       text: "space twice",
-      turnId,
+      turn_id: turnId,
     }],
-    projectionEvents: [{
+    projection_events: [{
       id: "turn-start-repeated-space",
-      messageId: promptId,
+      message_id: promptId,
       status: "running",
-      turnId,
+      turn_id: turnId,
       type: "thread.turn.started",
     }],
     status: "active",
-    transcriptSessionId: "opencode-session-repeated-space",
-    workspaceId,
+    transcript_session_id: "opencode-session-repeated-space",
+    workspace_id: workspaceId,
   };
   const projectionEvents = ["a", " ", " "].flatMap((chunk) => (
     createWorkspaceThreadLiveTextProjectionEvents(baseThread, {
-      agentId: "opencode",
-      liveTextDelta: chunk,
-      liveTextKind: "assistant",
+      agent_id: "opencode",
+      live_text_delta: chunk,
+      live_text_kind: "assistant",
       source: "cli-hook:assistant-message-delta",
       type: "provider-message-displayed",
     })
   ));
   const state = appendWorkspaceThreadProjectionEvents({
     [workspaceId]: {
-      activeThreadId: threadId,
+      active_thread_id: threadId,
       id: workspaceId,
       terminals: {},
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: baseThread,
       },
     },
   }, {
-    agentId: "opencode",
-    projectionEvents,
-    threadId,
+    agent_id: "opencode",
+    projection_events: projectionEvents,
+    thread_id: threadId,
     type: "provider-message-displayed",
-    workspaceId,
+    workspace_id: workspaceId,
   });
 
   const assistant = state[workspaceId].threads[threadId].messages
@@ -3168,48 +3163,48 @@ test("live assistant snapshots preserve edge whitespace", () => {
   const turnId = `turn-${promptId}`;
   const snapshot = "\n  indented snapshot  \n";
   const baseThread = {
-    currentAgent: "opencode",
+    current_agent: "opencode",
     id: threadId,
-    latestTurn: {
-      agentId: "opencode",
-      messageId: promptId,
+    latest_turn: {
+      agent_id: "opencode",
+      message_id: promptId,
       state: "running",
-      turnId,
+      turn_id: turnId,
     },
     materialized: true,
-    messages: [{ id: promptId, role: "user", status: "submitted", text: "snapshot", turnId }],
-    projectionEvents: [{
+    messages: [{ id: promptId, role: "user", status: "submitted", text: "snapshot", turn_id: turnId }],
+    projection_events: [{
       id: "turn-start-snapshot-space",
-      messageId: promptId,
+      message_id: promptId,
       status: "running",
-      turnId,
+      turn_id: turnId,
       type: "thread.turn.started",
     }],
     status: "active",
-    transcriptSessionId: "opencode-session-snapshot-space",
-    workspaceId,
+    transcript_session_id: "opencode-session-snapshot-space",
+    workspace_id: workspaceId,
   };
   const projectionEvents = createWorkspaceThreadLiveTextProjectionEvents(baseThread, {
-    agentId: "opencode",
-    liveTextKind: "assistant",
-    liveTextSnapshot: snapshot,
+    agent_id: "opencode",
+    live_text_kind: "assistant",
+    live_text_snapshot: snapshot,
     source: "cli-hook:assistant-message-delta",
     type: "provider-message-displayed",
   });
   const state = appendWorkspaceThreadProjectionEvents({
     [workspaceId]: {
-      activeThreadId: threadId,
+      active_thread_id: threadId,
       id: workspaceId,
       terminals: {},
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: { [threadId]: baseThread },
     },
   }, {
-    agentId: "opencode",
-    projectionEvents,
-    threadId,
+    agent_id: "opencode",
+    projection_events: projectionEvents,
+    thread_id: threadId,
     type: "provider-message-displayed",
-    workspaceId,
+    workspace_id: workspaceId,
   });
   const assistant = state[workspaceId].threads[threadId].messages
     .find((message) => message.role === "assistant");
@@ -3222,60 +3217,60 @@ test("assistant transcript replaces live text exactly without user transcript ec
   const promptId = "prompt-assistant-only-replace";
   const turnId = `turn-${promptId}`;
   const baseThread = {
-    currentAgent: "opencode",
+    current_agent: "opencode",
     id: threadId,
-    latestTurn: {
-      agentId: "opencode",
-      messageId: promptId,
+    latest_turn: {
+      agent_id: "opencode",
+      message_id: promptId,
       state: "running",
-      turnId,
+      turn_id: turnId,
     },
     materialized: true,
-    messages: [{ id: promptId, role: "user", status: "submitted", text: "finish this", turnId }],
-    projectionEvents: [{
+    messages: [{ id: promptId, role: "user", status: "submitted", text: "finish this", turn_id: turnId }],
+    projection_events: [{
       id: "turn-start-assistant-only",
-      messageId: promptId,
+      message_id: promptId,
       status: "running",
-      turnId,
+      turn_id: turnId,
       type: "thread.turn.started",
     }, {
       delta: "bad stream",
       id: "live-assistant-bad-stream",
-      messageId: `assistant-${promptId}`,
+      message_id: `assistant-${promptId}`,
       source: "cli-hook:assistant-message-delta",
-      turnId,
+      turn_id: turnId,
       type: "thread.message.assistant.delta",
     }],
     status: "active",
-    transcriptSessionId: "opencode-session-assistant-only",
-    workspaceId,
+    transcript_session_id: "opencode-session-assistant-only",
+    workspace_id: workspaceId,
   };
   const state = {
     [workspaceId]: {
-      activeThreadId: threadId,
+      active_thread_id: threadId,
       id: workspaceId,
       terminals: {},
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: { [threadId]: baseThread },
     },
   };
   const finalText = "Here  are\n  exact spaces  ";
   const hydrated = hydrateWorkspaceThreadSessionTranscript(state, {
-    agentId: "opencode",
-    assistantResponseCompletesTurn: true,
+    agent_id: "opencode",
+    assistant_response_completes_turn: true,
     messages: [{
-      createdAt: "2026-07-02T18:30:00.000Z",
+      created_at: "2026-07-02T18:30:00.000Z",
       id: "assistant-only-final",
       role: "assistant",
       text: finalText,
     }],
-    promptAccepted: true,
-    promptEventId: promptId,
-    providerSessionId: "opencode-session-assistant-only",
-    sessionId: "opencode-session-assistant-only",
+    prompt_accepted: true,
+    prompt_event_id: promptId,
+    provider_session_id: "opencode-session-assistant-only",
+    session_id: "opencode-session-assistant-only",
     source: "opencode-session-watch",
-    threadId,
-    workspaceId,
+    thread_id: threadId,
+    workspace_id: workspaceId,
   });
   const assistantMessages = hydrated[workspaceId].threads[threadId].messages
     .filter((message) => message.role === "assistant");
@@ -3289,10 +3284,10 @@ test("assistant live formatting survives persistence", () => {
   const assistantText = "a  b\n    code";
   const state = {
     [workspaceId]: {
-      activeThreadId: threadId,
+      active_thread_id: threadId,
       id: workspaceId,
       terminals: {},
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: {
           id: threadId,
@@ -3304,15 +3299,15 @@ test("assistant live formatting survives persistence", () => {
             status: "streaming",
             text: assistantText,
           }],
-          projectionEvents: [{
+          projection_events: [{
             delta: assistantText,
             id: "projection-assistant-persist-space",
-            messageId: "assistant-persist-space",
+            message_id: "assistant-persist-space",
             source: "cli-hook:assistant-message-delta",
             type: "thread.message.assistant.delta",
           }],
           status: "active",
-          workspaceId,
+          workspace_id: workspaceId,
         },
       },
     },
@@ -3323,7 +3318,7 @@ test("assistant live formatting survives persistence", () => {
     assistantText,
   );
   assert.equal(
-    restored[workspaceId].threads[threadId].projectionEvents[0].delta,
+    restored[workspaceId].threads[threadId].projection_events[0].delta,
     assistantText,
   );
 });
@@ -3335,59 +3330,59 @@ test("live provider tool hooks render as structured activity messages", () => {
   const turnId = `turn-${promptId}`;
   const startedAt = "2026-07-02T17:00:00.000Z";
   const baseThread = {
-    activityStatus: "thinking",
-    currentAgent: "opencode",
+    activity_status: "thinking",
+    current_agent: "opencode",
     id: threadId,
-    latestTurn: {
-      agentId: "opencode",
-      messageId: promptId,
-      startedAt,
+    latest_turn: {
+      agent_id: "opencode",
+      message_id: promptId,
+      started_at: startedAt,
       state: "running",
-      turnId,
+      turn_id: turnId,
     },
     materialized: true,
     messages: [{
-      agentId: "opencode",
-      createdAt: startedAt,
+      agent_id: "opencode",
+      created_at: startedAt,
       id: promptId,
       role: "user",
       status: "submitted",
       text: "run drc",
-      turnId,
+      turn_id: turnId,
     }],
-    projectionEvents: [{
-      agentId: "opencode",
-      createdAt: startedAt,
+    projection_events: [{
+      agent_id: "opencode",
+      created_at: startedAt,
       id: "turn-start",
-      messageId: promptId,
+      message_id: promptId,
       source: "cli-hook:provider-turn-started",
       status: "running",
-      turnId,
+      turn_id: turnId,
       type: "thread.turn.started",
     }],
-    providerBindings: {
+    provider_bindings: {
       opencode: {
-        activityStatus: "thinking",
-        inputReady: false,
+        activity_status: "thinking",
+        input_ready: false,
         status: "active",
       },
     },
     status: "active",
-    terminalIndex: 0,
-    workspaceId,
+    terminal_index: 0,
+    workspace_id: workspaceId,
   };
   const state = {
     [workspaceId]: {
-      activeThreadId: threadId,
+      active_thread_id: threadId,
       id: workspaceId,
       terminals: {
         0: {
-          activityStatus: "thinking",
-          terminalIndex: 0,
-          threadId,
+          activity_status: "thinking",
+          terminal_index: 0,
+          thread_id: threadId,
         },
       },
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: baseThread,
       },
@@ -3395,31 +3390,31 @@ test("live provider tool hooks render as structured activity messages", () => {
   };
 
   const startedProjectionEvents = createWorkspaceThreadToolProjectionEvents(baseThread, {
-    agentId: "opencode",
-    messageId: "shared-tool-message",
+    agent_id: "opencode",
+    message_id: "shared-tool-message",
     source: "cli-hook:provider-tool-started",
-    toolInput: {
+    tool_input: {
       board_path: "hardware/switch-led-buzzer/switch-led-buzzer.board.tsx",
     },
-    toolName: "coordination-kernel.pcb_drc",
-    toolUseId: "call-drc-1",
+    tool_name: "coordination-kernel.pcb_drc",
+    tool_use_id: "call-drc-1",
     type: "provider-tool-started",
   });
   const withToolStart = appendWorkspaceThreadProjectionEvents(state, {
-    activityStatus: "tool_running",
-    agentId: "opencode",
-    clearPendingPrompt: false,
-    projectionEvents: startedProjectionEvents,
-    threadId,
+    activity_status: "tool_running",
+    agent_id: "opencode",
+    clear_pending_prompt: false,
+    projection_events: startedProjectionEvents,
+    thread_id: threadId,
     type: "provider-tool-started",
-    workspaceId,
+    workspace_id: workspaceId,
   });
 
   const startMessage = withToolStart[workspaceId].threads[threadId].messages
     .find((message) => message.kind === "tool_call");
   assert.equal(startMessage.title, "Called coordination-kernel.pcb_drc");
-  assert.equal(startMessage.toolName, "coordination-kernel.pcb_drc");
-  assert.deepEqual(startMessage.toolInput, {
+  assert.equal(startMessage.tool_name, "coordination-kernel.pcb_drc");
+  assert.deepEqual(startMessage.tool_input, {
     board_path: "hardware/switch-led-buzzer/switch-led-buzzer.board.tsx",
   });
   assert.equal(startMessage.status, "running");
@@ -3427,28 +3422,28 @@ test("live provider tool hooks render as structured activity messages", () => {
   const outputProjectionEvents = createWorkspaceThreadToolProjectionEvents(
     withToolStart[workspaceId].threads[threadId],
     {
-      agentId: "opencode",
-      messageId: "shared-tool-message",
+      agent_id: "opencode",
+      message_id: "shared-tool-message",
       source: "cli-hook:provider-tool-completed",
-      toolName: "coordination-kernel.pcb_drc",
-      toolOutput: {
+      tool_name: "coordination-kernel.pcb_drc",
+      tool_output: {
         componentCount: 6,
         errorCount: 0,
         traceCount: 8,
         warningCount: 0,
       },
-      toolUseId: "call-drc-1",
+      tool_use_id: "call-drc-1",
       type: "provider-tool-completed",
     },
   );
   const withToolOutput = appendWorkspaceThreadProjectionEvents(withToolStart, {
-    activityStatus: "thinking",
-    agentId: "opencode",
-    clearPendingPrompt: false,
-    projectionEvents: outputProjectionEvents,
-    threadId,
+    activity_status: "thinking",
+    agent_id: "opencode",
+    clear_pending_prompt: false,
+    projection_events: outputProjectionEvents,
+    thread_id: threadId,
     type: "provider-tool-completed",
-    workspaceId,
+    workspace_id: workspaceId,
   });
   const outputMessage = withToolOutput[workspaceId].threads[threadId].messages
     .find((message) => message.kind === "tool_output");
@@ -3459,7 +3454,7 @@ test("live provider tool hooks render as structured activity messages", () => {
     ["tool_call", "tool_output"],
   );
   assert.equal(outputMessage.title, "coordination-kernel.pcb_drc finished");
-  assert.deepEqual(outputMessage.toolOutput, {
+  assert.deepEqual(outputMessage.tool_output, {
     componentCount: 6,
     errorCount: 0,
     traceCount: 8,
@@ -3470,23 +3465,23 @@ test("live provider tool hooks render as structured activity messages", () => {
 
 test("failed live provider tool hooks carry structured errors", () => {
   const thread = {
-    currentAgent: "opencode",
+    current_agent: "opencode",
     id: "thread-tool-failed",
-    latestTurn: {
-      messageId: "prompt-tool-failed",
-      turnId: "turn-tool-failed",
+    latest_turn: {
+      message_id: "prompt-tool-failed",
+      turn_id: "turn-tool-failed",
     },
-    workspaceId: "workspace-tool-failed",
+    workspace_id: "workspace-tool-failed",
   };
   const projectionEvents = createWorkspaceThreadToolProjectionEvents(thread, {
-    agentId: "opencode",
+    agent_id: "opencode",
     source: "cli-hook:provider-tool-failed",
-    toolError: {
+    tool_error: {
       error: "DRC failed",
       warningCount: 2,
     },
-    toolName: "coordination-kernel.pcb_drc",
-    toolUseId: "call-drc-failed",
+    tool_name: "coordination-kernel.pcb_drc",
+    tool_use_id: "call-drc-failed",
     type: "provider-tool-failed",
   });
 
@@ -3494,7 +3489,7 @@ test("failed live provider tool hooks carry structured errors", () => {
   assert.equal(projectionEvents[0].kind, "tool_output");
   assert.equal(projectionEvents[0].status, "error");
   assert.equal(projectionEvents[0].title, "coordination-kernel.pcb_drc failed");
-  assert.deepEqual(projectionEvents[0].toolError, {
+  assert.deepEqual(projectionEvents[0].tool_error, {
     error: "DRC failed",
     warningCount: 2,
   });
@@ -3506,44 +3501,44 @@ test("title-only tool projection events remain visible", () => {
   const threadId = "thread-title-only-tool";
   const state = {
     [workspaceId]: {
-      activeThreadId: threadId,
+      active_thread_id: threadId,
       id: workspaceId,
       terminals: {},
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: {
-          currentAgent: "codex",
+          current_agent: "codex",
           id: threadId,
           messages: [],
-          projectionEvents: [],
-          providerBindings: {
+          projection_events: [],
+          provider_bindings: {
             codex: {
-              activityStatus: "thinking",
+              activity_status: "thinking",
               status: "active",
             },
           },
           status: "active",
-          workspaceId,
+          workspace_id: workspaceId,
         },
       },
     },
   };
   const next = appendWorkspaceThreadProjectionEvents(state, {
-    agentId: "codex",
-    projectionEvents: [{
-      agentId: "codex",
-      createdAt: "2026-07-02T17:04:00.000Z",
+    agent_id: "codex",
+    projection_events: [{
+      agent_id: "codex",
+      created_at: "2026-07-02T17:04:00.000Z",
       id: "title-only-start-task",
       kind: "tool_call",
-      messageId: "tool-start-task-call",
+      message_id: "tool-start-task-call",
       source: "cli-hook:provider-tool-started",
       status: "running",
       title: "Called start_task",
       type: "thread.tool_call",
     }],
-    threadId,
+    thread_id: threadId,
     type: "provider-tool-started",
-    workspaceId,
+    workspace_id: workspaceId,
   });
 
   const message = next[workspaceId].threads[threadId].messages.at(-1);
@@ -3563,7 +3558,7 @@ test("session transcript preserves generated image artifacts through hydration",
   const sessionId = "session-image-test";
   const artifact = {
     kind: "image",
-    mimeType: "image/svg+xml",
+    mime_type: "image/svg+xml",
     path: "/tmp/diffforge/chocolate.svg",
     prompt: "dark chocolate squares on a slate plate",
     title: "Chocolate preview",
@@ -3573,108 +3568,108 @@ test("session transcript preserves generated image artifacts through hydration",
   const state = {
     [workspaceId]: {
       id: workspaceId,
-      threadOrder: [threadId],
+      thread_order: [threadId],
       threads: {
         [threadId]: {
           id: threadId,
-          activityStatus: "thinking",
-          currentAgent: "codex",
-          latestTurn: {
-            messageId: promptId,
-            promptEpoch: 2,
-            startedAt: submittedAt,
+          activity_status: "thinking",
+          current_agent: "codex",
+          latest_turn: {
+            message_id: promptId,
+            prompt_epoch: 2,
+            started_at: submittedAt,
             state: "running",
-            turnId,
+            turn_id: turnId,
           },
           messages: [{
-            createdAt: submittedAt,
+            created_at: submittedAt,
             id: promptId,
             role: "user",
             text: "make an image of chocolate",
-            turnId,
+            turn_id: turnId,
           }],
-          projectionEvents: [{
-            agentId: "codex",
-            createdAt: submittedAt,
+          projection_events: [{
+            agent_id: "codex",
+            created_at: submittedAt,
             id: "turn-start",
-            messageId: promptId,
-            promptEpoch: 2,
+            message_id: promptId,
+            prompt_epoch: 2,
             status: "running",
-            turnId,
+            turn_id: turnId,
             type: "thread.turn.started",
           }, {
-            agentId: "codex",
-            createdAt: submittedAt,
+            agent_id: "codex",
+            created_at: submittedAt,
             id: "user-message",
-            messageId: promptId,
+            message_id: promptId,
             role: "user",
             status: "submitted",
             text: "make an image of chocolate",
-            turnId,
+            turn_id: turnId,
             type: "thread.message.user",
           }],
-          providerBindings: {
+          provider_bindings: {
             codex: {
-              activityStatus: "thinking",
-              inputReady: false,
-              nativeSessionId: sessionId,
-              nativeSessionKind: "session",
+              activity_status: "thinking",
+              input_ready: false,
+              native_session_id: sessionId,
+              native_session_kind: "session",
               status: "active",
             },
           },
           status: "active",
-          terminalBinding: {
-            instanceId: 1,
-            paneId: "pane-image-test",
-            terminalIndex: 0,
+          terminal_binding: {
+            instance_id: 1,
+            pane_id: "pane-image-test",
+            terminal_index: 0,
           },
-          terminalIndex: 0,
-          transcriptSessionId: sessionId,
-          workspaceId,
+          terminal_index: 0,
+          transcript_session_id: sessionId,
+          workspace_id: workspaceId,
         },
       },
     },
   };
 
   const nextState = hydrateWorkspaceThreadSessionTranscript(state, {
-    agentId: "codex",
-    allowTranscriptTurnCompletion: true,
-    completedAt,
-    expectedMessageCreatedAt: submittedAt,
-    expectedUserMessage: "make an image of chocolate",
-    latestTimestamp: completedAt,
-    matchedBy: "sessionId",
+    agent_id: "codex",
+    allow_transcript_turn_completion: true,
+    completed_at: completedAt,
+    expected_message_created_at: submittedAt,
+    expected_user_message: "make an image of chocolate",
+    latest_timestamp: completedAt,
+    matched_by: "session_id",
     messages: [{
-      createdAt: submittedAt,
+      created_at: submittedAt,
       id: promptId,
       role: "user",
       text: "make an image of chocolate",
     }, {
       artifacts: [artifact],
-      createdAt: completedAt,
+      created_at: completedAt,
       id: "generated-image",
       kind: "image_generation",
       role: "activity",
       text: "",
       title: "Generated image",
     }, {
-      createdAt: completedAt,
+      created_at: completedAt,
       id: "task-complete",
       kind: "task_complete",
       role: "assistant",
       text: "Generated a fresh chocolate image preview.",
     }],
-    promptAccepted: true,
-    promptEpoch: 2,
-    promptEventId: promptId,
-    providerSessionId: sessionId,
-    sessionId,
+    prompt_accepted: true,
+    prompt_epoch: 2,
+    prompt_event_id: promptId,
+    provider_session_id: sessionId,
+    session_id: sessionId,
     source: "codex-session",
-    submittedAt,
-    transcriptExplicitCompletionCanSettleTurn: true,
-    turnCompleteSeen: true,
-    workspaceId,
-    threadId,
+    submitted_at: submittedAt,
+    transcript_explicit_completion_can_settle_turn: true,
+    turn_complete_seen: true,
+    workspace_id: workspaceId,
+    thread_id: threadId,
   });
 
   const nextThread = nextState[workspaceId].threads[threadId];
@@ -3682,10 +3677,10 @@ test("session transcript preserves generated image artifacts through hydration",
   assert.equal(imageMessage?.role, "activity");
   assert.equal(imageMessage?.kind, "image_generation");
   assert.equal(imageMessage?.artifacts?.length, 1);
-  assert.equal(imageMessage.artifacts[0].mimeType, "image/svg+xml");
+  assert.equal(imageMessage.artifacts[0].mime_type, "image/svg+xml");
   assert.equal(imageMessage.artifacts[0].url, "file:///tmp/diffforge/chocolate.svg");
 
-  const imageProjectionEvent = nextThread.projectionEvents.find((event) => event.messageId === "generated-image");
+  const imageProjectionEvent = nextThread.projection_events.find((event) => event.message_id === "generated-image");
   assert.equal(imageProjectionEvent?.type, "thread.activity");
   assert.equal(imageProjectionEvent?.artifacts?.length, 1);
   assert.equal(imageProjectionEvent.artifacts[0].path, "/tmp/diffforge/chocolate.svg");

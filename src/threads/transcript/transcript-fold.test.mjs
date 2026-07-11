@@ -16,13 +16,13 @@ function midAnswerItems() {
     {
       id: "u-1",
       type: "message",
-      turnId: "turn-1",
+      turn_id: "turn-1",
       message: { id: "u-1", role: "user", content: "Do the thing", turn_id: "turn-1", timestamp: "2026-07-07T12:00:00.000Z" },
     },
     {
       id: "ag-1",
       type: "activityGroup",
-      turnId: "turn-1",
+      turn_id: "turn-1",
       messages: [
         { id: "t-1", role: "activity", kind: "tool-call", turn_id: "turn-1", timestamp: "2026-07-07T12:00:05.000Z", tool: { name: "exec_command", input: { cmd: "ls" } } },
       ],
@@ -30,13 +30,13 @@ function midAnswerItems() {
     {
       id: "a-1",
       type: "message",
-      turnId: "turn-1",
+      turn_id: "turn-1",
       message: { id: "a-1", role: "assistant", content: "Here is the answer.", turn_id: "turn-1", timestamp: "2026-07-07T12:00:20.000Z" },
     },
     {
       id: "ag-2",
       type: "activityGroup",
-      turnId: "turn-1",
+      turn_id: "turn-1",
       messages: [
         { id: "t-2", role: "activity", kind: "tool-call", turn_id: "turn-1", timestamp: "2026-07-07T12:00:25.000Z", tool: { name: "notify", input: { name: "done" } } },
       ],
@@ -44,13 +44,13 @@ function midAnswerItems() {
     {
       id: "u-2",
       type: "message",
-      turnId: "turn-2",
+      turn_id: "turn-2",
       message: { id: "u-2", role: "user", content: "Next", turn_id: "turn-2", timestamp: "2026-07-07T12:05:00.000Z" },
     },
     {
       id: "ag-3",
       type: "activityGroup",
-      turnId: "turn-2",
+      turn_id: "turn-2",
       messages: [
         { id: "t-3", role: "activity", kind: "tool-call", turn_id: "turn-2", timestamp: "2026-07-07T12:05:05.000Z", status: "running", tool: { name: "write_file", input: { path: "a.rs" }, status: "running" } },
       ],
@@ -64,13 +64,13 @@ function textlessItems() {
     {
       id: "u-1",
       type: "message",
-      turnId: "turn-1",
+      turn_id: "turn-1",
       message: { id: "u-1", role: "user", content: "Run checks", turn_id: "turn-1", timestamp: "2026-07-07T12:00:00.000Z" },
     },
     {
       id: "ag-1",
       type: "activityGroup",
-      turnId: "turn-1",
+      turn_id: "turn-1",
       messages: [
         { id: "t-1", role: "activity", kind: "tool-call", turn_id: "turn-1", timestamp: "2026-07-07T12:00:05.000Z", tool: { name: "exec_command", input: { cmd: "npm test" } } },
         { id: "t-2", role: "activity", kind: "tool-call", turn_id: "turn-1", timestamp: "2026-07-07T12:00:30.000Z", tool: { name: "exec_command", input: { cmd: "npm run lint" } } },
@@ -79,13 +79,13 @@ function textlessItems() {
     {
       id: "u-2",
       type: "message",
-      turnId: "turn-2",
+      turn_id: "turn-2",
       message: { id: "u-2", role: "user", content: "Next", turn_id: "turn-2", timestamp: "2026-07-07T12:05:00.000Z" },
     },
     {
       id: "ag-2",
       type: "activityGroup",
-      turnId: "turn-2",
+      turn_id: "turn-2",
       messages: [
         { id: "t-3", role: "activity", kind: "tool-call", turn_id: "turn-2", timestamp: "2026-07-07T12:05:05.000Z", status: "running", tool: { name: "write_file", input: { path: "a.rs" }, status: "running" } },
       ],
@@ -99,13 +99,13 @@ function tailAnswerItems() {
     {
       id: "u-1",
       type: "message",
-      turnId: "turn-1",
+      turn_id: "turn-1",
       message: { id: "u-1", role: "user", content: "Explain", turn_id: "turn-1", timestamp: "2026-07-07T12:00:00.000Z" },
     },
     {
       id: "ag-1",
       type: "activityGroup",
-      turnId: "turn-1",
+      turn_id: "turn-1",
       messages: [
         { id: "t-1", role: "activity", kind: "tool-call", turn_id: "turn-1", timestamp: "2026-07-07T12:00:05.000Z", tool: { name: "read_file", input: { path: "a.rs" } } },
       ],
@@ -113,19 +113,19 @@ function tailAnswerItems() {
     {
       id: "a-1",
       type: "message",
-      turnId: "turn-1",
+      turn_id: "turn-1",
       message: { id: "a-1", role: "assistant", content: "Explanation.", turn_id: "turn-1", timestamp: "2026-07-07T12:00:20.000Z" },
     },
     {
       id: "u-2",
       type: "message",
-      turnId: "turn-2",
+      turn_id: "turn-2",
       message: { id: "u-2", role: "user", content: "Next", turn_id: "turn-2", timestamp: "2026-07-07T12:05:00.000Z" },
     },
     {
       id: "ag-2",
       type: "activityGroup",
-      turnId: "turn-2",
+      turn_id: "turn-2",
       messages: [
         { id: "t-2", role: "activity", kind: "tool-call", turn_id: "turn-2", timestamp: "2026-07-07T12:05:05.000Z", status: "running", tool: { name: "write_file", input: { path: "b.rs" }, status: "running" } },
       ],

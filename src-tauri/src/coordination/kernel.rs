@@ -244,7 +244,6 @@ fn terminal_todo_plan_step_detail_from_value(value: &Value) -> Option<String> {
                 "details",
                 "description",
                 "current_step_detail",
-                "currentStepDetail",
             ]
             .iter()
             .find_map(|key| object.get(*key).and_then(Value::as_str))
@@ -264,11 +263,8 @@ struct TerminalTodoPlanStepUpdate {
 fn terminal_todo_plan_step_update_values(input: &Value) -> Vec<&Value> {
     [
         "step_updates",
-        "stepUpdates",
         "plan_step_updates",
-        "planStepUpdates",
         "plan_steps",
-        "planSteps",
         "steps",
     ]
     .iter()
@@ -280,16 +276,10 @@ fn terminal_todo_plan_step_update_values(input: &Value) -> Vec<&Value> {
 fn terminal_todo_plan_step_index_from_value(value: &Value, fallback: i64) -> i64 {
     optional_i64_field(
         value,
-        &[
-            "step_index",
-            "stepIndex",
-            "plan_step_index",
-            "planStepIndex",
-            "index",
-        ],
+        &["step_index", "plan_step_index", "index"],
     )
     .or_else(|| {
-        optional_i64_field(value, &["ordinal", "stepOrdinal"])
+        optional_i64_field(value, &["ordinal", "step_ordinal"])
             .map(|ordinal| ordinal.saturating_sub(1))
     })
     .unwrap_or(fallback)
@@ -310,13 +300,7 @@ fn terminal_todo_plan_step_updates_from_input(
             let detail = terminal_todo_plan_step_detail_from_value(value);
             let status = string_from_value_keys(
                 value,
-                &[
-                    "status",
-                    "step_status",
-                    "stepStatus",
-                    "plan_step_status",
-                    "planStepStatus",
-                ],
+                &["status", "step_status", "plan_step_status"],
             )
             .map(|value| normalize_terminal_todo_plan_step_status(&value));
             (title.is_some() || detail.is_some() || status.is_some()).then_some(
@@ -516,7 +500,7 @@ fn workspace_mcp_optional_bool(value: &Value, keys: &[&str]) -> Option<bool> {
 }
 
 fn workspace_mcp_ssh_auth_method(value: &str) -> Result<String, String> {
-    let auth_method = required_trimmed(value, "authMethod")?.to_ascii_lowercase();
+    let auth_method = required_trimmed(value, "auth_method")?.to_ascii_lowercase();
     if !matches!(auth_method.as_str(), "agent" | "password" | "key") {
         return Err("SSH target auth method must be agent, password, or key.".to_string());
     }
@@ -1550,10 +1534,10 @@ fn inherited_global_mcp_server_config(server: &Value) -> Option<Value> {
         json!({
             "scope": "global_inherited",
             "authority": "global_mcp_inherited",
-            "shadowedBy": "workspace_mcp_server_key",
-            "serverKey": server_key,
-            "sourceKind": server["source_kind"],
-            "sourceLabel": server["source_label"],
+            "shadowed_by": "workspace_mcp_server_key",
+            "server_key": server_key,
+            "source_kind": server["source_kind"],
+            "source_label": server["source_label"],
         }),
     );
     Some(Value::Object(config))
@@ -2227,7 +2211,7 @@ fn workspace_mcp_user_config(plugin_root: &Path) -> Result<Value, String> {
 
 fn workspace_mcp_placeholder_key(value: &str) -> Option<String> {
     let trimmed = value.trim();
-    let rest = trimmed.strip_prefix("${user_config.")?;
+    let rest = trimmed.strip_prefix("${userConfig.")?;
     rest.strip_suffix('}').map(str::to_string)
 }
 
@@ -3437,25 +3421,10 @@ impl CoordinationKernel {
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
         };
-        let source_todo_id = ref_text(&["source_todo_id", "sourceTodoId", "todo_id", "todoId"]);
-        let source_todo_dispatch_id = ref_text(&[
-            "source_todo_dispatch_id",
-            "sourceTodoDispatchId",
-            "todo_dispatch_id",
-            "todoDispatchId",
-        ]);
-        let source_prompt_event_id = ref_text(&[
-            "source_prompt_event_id",
-            "sourcePromptEventId",
-            "prompt_event_id",
-            "promptEventId",
-        ]);
-        let source_command_id = ref_text(&[
-            "source_command_id",
-            "sourceCommandId",
-            "command_id",
-            "commandId",
-        ]);
+        let source_todo_id = ref_text(&["source_todo_id", "todo_id"]);
+        let source_todo_dispatch_id = ref_text(&["source_todo_dispatch_id", "todo_dispatch_id"]);
+        let source_prompt_event_id = ref_text(&["source_prompt_event_id", "prompt_event_id"]);
+        let source_command_id = ref_text(&["source_command_id", "command_id"]);
         if source_todo_id.is_none()
             && source_todo_dispatch_id.is_none()
             && source_prompt_event_id.is_none()
@@ -5168,32 +5137,31 @@ impl CoordinationKernel {
     ) -> Result<Option<Value>, String> {
         let compact_plan = created
             .get("compact_plan")
-            .or_else(|| created.get("compactPlan"))
             .filter(|value| value.is_object())
             .unwrap_or(created);
-        let plan_id = string_from_value_keys(compact_plan, &["plan_id", "planId", "id"])
-            .or_else(|| string_from_value_keys(created, &["plan_id", "planId", "id"]))
+        let plan_id = string_from_value_keys(compact_plan, &["plan_id", "id"])
+            .or_else(|| string_from_value_keys(created, &["plan_id", "id"]))
             .ok_or_else(|| "create_plan did not return a plan_id.".to_string())?;
         let todo_id = string_from_value_keys(
             compact_plan,
-            &["todo_id", "todoId", "primary_todo_id", "primaryTodoId"],
+            &["todo_id", "primary_todo_id"],
         )
         .or_else(|| {
             string_from_value_keys(
                 created,
-                &["todo_id", "todoId", "primary_todo_id", "primaryTodoId"],
+                &["todo_id", "primary_todo_id"],
             )
         })
         .unwrap_or_else(|| plan_id.clone());
-        let workspace_id = string_from_value_keys(input, &["workspace_id", "workspaceId"])
-            .or_else(|| string_from_value_keys(created, &["workspace_id", "workspaceId"]))
-            .or_else(|| string_from_value_keys(compact_plan, &["workspace_id", "workspaceId"]));
-        let agent_id = string_from_value_keys(input, &["agent_id", "agentId"])
-            .or_else(|| string_from_value_keys(created, &["agent_id", "agentId"]))
-            .or_else(|| string_from_value_keys(compact_plan, &["agent_id", "agentId"]));
-        let session_id = string_from_value_keys(input, &["session_id", "sessionId"])
-            .or_else(|| string_from_value_keys(created, &["session_id", "sessionId"]))
-            .or_else(|| string_from_value_keys(compact_plan, &["session_id", "sessionId"]));
+        let workspace_id = string_from_value_keys(input, &["workspace_id"])
+            .or_else(|| string_from_value_keys(created, &["workspace_id"]))
+            .or_else(|| string_from_value_keys(compact_plan, &["workspace_id"]));
+        let agent_id = string_from_value_keys(input, &["agent_id"])
+            .or_else(|| string_from_value_keys(created, &["agent_id"]))
+            .or_else(|| string_from_value_keys(compact_plan, &["agent_id"]));
+        let session_id = string_from_value_keys(input, &["session_id"])
+            .or_else(|| string_from_value_keys(created, &["session_id"]))
+            .or_else(|| string_from_value_keys(compact_plan, &["session_id"]));
         let title = string_from_value_keys(compact_plan, &["title", "name", "summary"])
             .or_else(|| string_from_value_keys(created, &["title", "name", "summary"]))
             .unwrap_or_else(|| "Local agent plan".to_string());
@@ -5213,22 +5181,12 @@ impl CoordinationKernel {
         }
         let current_step_index = optional_i64_field(
             compact_plan,
-            &[
-                "current_step_index",
-                "currentStepIndex",
-                "plan_step_index",
-                "planStepIndex",
-            ],
+            &["current_step_index", "plan_step_index"],
         )
         .or_else(|| {
             optional_i64_field(
                 created,
-                &[
-                    "current_step_index",
-                    "currentStepIndex",
-                    "plan_step_index",
-                    "planStepIndex",
-                ],
+                &["current_step_index", "plan_step_index"],
             )
         })
         .unwrap_or(0)
@@ -5271,17 +5229,11 @@ impl CoordinationKernel {
             for (index, step) in steps.iter().enumerate() {
                 let step_index = optional_i64_field(
                     step,
-                    &[
-                        "index",
-                        "step_index",
-                        "stepIndex",
-                        "plan_step_index",
-                        "planStepIndex",
-                    ],
+                    &["index", "step_index", "plan_step_index"],
                 )
                 .unwrap_or(index as i64)
                 .max(0);
-                let step_todo_id = string_from_value_keys(step, &["todo_id", "todoId", "id"])
+                let step_todo_id = string_from_value_keys(step, &["todo_id", "id"])
                     .unwrap_or_else(|| format!("{plan_id}-todo-{}", step_index + 1));
                 let step_id = string_from_value_keys(step, &["id"])
                     .unwrap_or_else(|| format!("{plan_id}-step-{step_index}"));
@@ -5364,7 +5316,7 @@ impl CoordinationKernel {
         if session_id.is_empty() {
             return Ok(None);
         }
-        let tool = string_from_value_keys(update, &["tool", "tool_name", "toolName"])
+        let tool = string_from_value_keys(update, &["tool", "tool_name"])
             .map(|value| value.trim().to_ascii_lowercase())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "todowrite".to_string());
@@ -5617,49 +5569,21 @@ impl CoordinationKernel {
     ) -> Result<Option<Value>, String> {
         let requested_current = optional_i64_field(
             input,
-            &[
-                "current_step_index",
-                "currentStepIndex",
-                "plan_step_index",
-                "planStepIndex",
-                "next_step_index",
-                "nextStepIndex",
-            ],
+            &["current_step_index", "plan_step_index", "next_step_index"],
         );
         let completed_index = optional_i64_field(
             input,
-            &[
-                "completed_step_index",
-                "completedStepIndex",
-                "completed_index",
-                "completedIndex",
-            ],
+            &["completed_step_index", "completed_index"],
         );
         let next_detail = string_from_value_keys(
             input,
-            &[
-                "next_step_detail",
-                "nextStepDetail",
-                "current_step_detail",
-                "currentStepDetail",
-                "plan_step_detail",
-                "planStepDetail",
-            ],
+            &["next_step_detail", "current_step_detail", "plan_step_detail"],
         )
         .map(|value| compact_terminal_todo_plan_text(&value, 2000))
         .filter(|value| !value.is_empty());
         let next_title = string_from_value_keys(
             input,
-            &[
-                "next_step_title",
-                "nextStepTitle",
-                "current_step_title",
-                "currentStepTitle",
-                "plan_step_title",
-                "planStepTitle",
-                "step_title",
-                "stepTitle",
-            ],
+            &["next_step_title", "current_step_title", "plan_step_title", "step_title"],
         )
         .map(|value| {
             compact_terminal_todo_plan_text(&value, TERMINAL_TODO_PLAN_STEP_TITLE_MAX_CHARS)
@@ -5667,22 +5591,12 @@ impl CoordinationKernel {
         .filter(|value| !value.is_empty());
         let step_status = string_from_value_keys(
             input,
-            &[
-                "plan_step_status",
-                "planStepStatus",
-                "step_status",
-                "stepStatus",
-            ],
+            &["plan_step_status", "step_status"],
         )
         .map(|value| normalize_terminal_todo_plan_step_status(&value));
         let plan_status = string_from_value_keys(
             input,
-            &[
-                "plan_status",
-                "planStatus",
-                "terminal_plan_status",
-                "terminalPlanStatus",
-            ],
+            &["plan_status", "terminal_plan_status"],
         )
         .map(|value| normalize_terminal_todo_plan_status(&value));
         let has_step_updates = !terminal_todo_plan_step_update_values(input).is_empty();
@@ -6531,14 +6445,7 @@ impl CoordinationKernel {
     ) -> Result<Option<String>, String> {
         if let Some(plan_ref) = string_from_value_keys(
             input,
-            &[
-                "plan_id",
-                "planId",
-                "todo_id",
-                "todoId",
-                "source_todo_id",
-                "sourceTodoId",
-            ],
+            &["plan_id", "todo_id", "source_todo_id"],
         ) {
             if let Some(plan_id) = self.terminal_todo_plan_plan_id_for_plan_ref(&plan_ref)? {
                 return Ok(Some(plan_id));
@@ -7119,7 +7026,7 @@ impl CoordinationKernel {
                 Ok(worktree) => {
                     worktree_id = Some(worktree["id"].as_str().unwrap_or_default().to_string());
                     write_root = worktree["path"].as_str().unwrap_or_default().to_string();
-                    base_git_sha = worktree["baseSha"].as_str().map(str::to_string);
+                    base_git_sha = worktree["base_sha"].as_str().map(str::to_string);
                     self.emit_event(
                         "session_write_root_assigned",
                         "agent",
@@ -7296,7 +7203,7 @@ impl CoordinationKernel {
             context_run_id,
             context_role,
         )?;
-        let agent_id = session["agentId"]
+        let agent_id = session["agent_id"]
             .as_str()
             .ok_or_else(|| "Unable to read created terminal agent id.".to_string())?
             .to_string();
@@ -7304,18 +7211,18 @@ impl CoordinationKernel {
             .as_str()
             .ok_or_else(|| "Unable to read created session id.".to_string())?
             .to_string();
-        let agent_slot_id = session["agentSlotId"].as_str().map(str::to_string);
-        let slot_key = session["slotKey"].as_str().map(str::to_string);
-        let terminal_launch_epoch = session["terminalLaunchEpoch"].as_str().map(str::to_string);
-        let worktree_id = session["worktreeId"].as_str().map(str::to_string);
-        let write_root = session["writeRoot"]
+        let agent_slot_id = session["agent_slot_id"].as_str().map(str::to_string);
+        let slot_key = session["slot_key"].as_str().map(str::to_string);
+        let terminal_launch_epoch = session["terminal_launch_epoch"].as_str().map(str::to_string);
+        let worktree_id = session["worktree_id"].as_str().map(str::to_string);
+        let write_root = session["write_root"]
             .as_str()
             .unwrap_or_else(|| self.paths.repo_path.to_str().unwrap_or(""))
             .to_string();
         let worktree_path = worktree_id
             .as_ref()
-            .and_then(|_| session["writeRoot"].as_str().map(str::to_string));
-        let enforcement_mode = session["enforcementMode"]
+            .and_then(|_| session["write_root"].as_str().map(str::to_string));
+        let enforcement_mode = session["enforcement_mode"]
             .as_str()
             .unwrap_or("coordination_only")
             .to_string();
@@ -7347,7 +7254,7 @@ impl CoordinationKernel {
             .as_ref()
             .map(|config| config.generic_path.clone())
             .unwrap_or_else(|| {
-                session["mcpConfigPath"]
+                session["mcp_config_path"]
                     .as_str()
                     .unwrap_or_default()
                     .to_string()
@@ -7356,7 +7263,7 @@ impl CoordinationKernel {
             .as_ref()
             .map(|config| config.codex_path.clone())
             .unwrap_or_else(|| {
-                session["codexMcpConfigPath"]
+                session["codex_mcp_config_path"]
                     .as_str()
                     .unwrap_or(mcp_config_path.as_str())
                     .to_string()
@@ -7365,7 +7272,7 @@ impl CoordinationKernel {
             .as_ref()
             .map(|config| config.claude_path.clone())
             .unwrap_or_else(|| {
-                session["claudeMcpConfigPath"]
+                session["claude_mcp_config_path"]
                     .as_str()
                     .unwrap_or(mcp_config_path.as_str())
                     .to_string()
@@ -7468,27 +7375,27 @@ impl CoordinationKernel {
         context_run_id: Option<&str>,
         context_role: Option<&str>,
     ) -> Result<TerminalCoordinationContext, String> {
-        let agent_id = session["agentId"]
+        let agent_id = session["agent_id"]
             .as_str()
             .ok_or_else(|| "Unable to read created terminal agent id.".to_string())?
             .to_string();
-        let agent_kind = session["agentKind"].as_str().unwrap_or("agent").to_string();
+        let agent_kind = session["agent_kind"].as_str().unwrap_or("agent").to_string();
         let session_id = session["id"]
             .as_str()
             .ok_or_else(|| "Unable to read created session id.".to_string())?
             .to_string();
-        let agent_slot_id = session["agentSlotId"].as_str().map(str::to_string);
-        let slot_key = session["slotKey"].as_str().map(str::to_string);
-        let terminal_launch_epoch = session["terminalLaunchEpoch"].as_str().map(str::to_string);
-        let worktree_id = session["worktreeId"].as_str().map(str::to_string);
-        let write_root = session["writeRoot"]
+        let agent_slot_id = session["agent_slot_id"].as_str().map(str::to_string);
+        let slot_key = session["slot_key"].as_str().map(str::to_string);
+        let terminal_launch_epoch = session["terminal_launch_epoch"].as_str().map(str::to_string);
+        let worktree_id = session["worktree_id"].as_str().map(str::to_string);
+        let write_root = session["write_root"]
             .as_str()
             .unwrap_or_else(|| self.paths.repo_path.to_str().unwrap_or(""))
             .to_string();
         let worktree_path = worktree_id
             .as_ref()
-            .and_then(|_| session["writeRoot"].as_str().map(str::to_string));
-        let enforcement_mode = session["enforcementMode"]
+            .and_then(|_| session["write_root"].as_str().map(str::to_string));
+        let enforcement_mode = session["enforcement_mode"]
             .as_str()
             .unwrap_or("coordination_only")
             .to_string();
@@ -7505,7 +7412,7 @@ impl CoordinationKernel {
             Some(self.write_or_update_slot_mcp_config(
                 agent_slot_id,
                 &session_id,
-                session["ptyId"].as_str(),
+                session["pty_id"].as_str(),
                 task_id,
                 worktree_id.as_deref(),
                 worktree_path.as_deref(),
@@ -7520,7 +7427,7 @@ impl CoordinationKernel {
             .as_ref()
             .map(|config| config.generic_path.clone())
             .unwrap_or_else(|| {
-                session["mcpConfigPath"]
+                session["mcp_config_path"]
                     .as_str()
                     .unwrap_or_default()
                     .to_string()
@@ -7529,7 +7436,7 @@ impl CoordinationKernel {
             .as_ref()
             .map(|config| config.codex_path.clone())
             .unwrap_or_else(|| {
-                session["codexMcpConfigPath"]
+                session["codex_mcp_config_path"]
                     .as_str()
                     .unwrap_or(mcp_config_path.as_str())
                     .to_string()
@@ -7538,7 +7445,7 @@ impl CoordinationKernel {
             .as_ref()
             .map(|config| config.claude_path.clone())
             .unwrap_or_else(|| {
-                session["claudeMcpConfigPath"]
+                session["claude_mcp_config_path"]
                     .as_str()
                     .unwrap_or(mcp_config_path.as_str())
                     .to_string()
@@ -7612,19 +7519,19 @@ impl CoordinationKernel {
             match self.create_or_reuse_worktree_for_slot_with_refresh(agent_slot_id, true, None) {
                 Ok(worktree) => {
                     slots.push(json!({
-                        "slotKey": slot_key,
-                        "agentSlotId": agent_slot_id,
-                        "worktreeId": worktree["id"].as_str(),
-                        "worktreePath": worktree["path"].as_str(),
-                        "branchName": worktree["branchName"].as_str(),
+                        "slot_key": slot_key,
+                        "agent_slot_id": agent_slot_id,
+                        "worktree_id": worktree["id"].as_str(),
+                        "worktree_path": worktree["path"].as_str(),
+                        "branch_name": worktree["branch_name"].as_str(),
                         "status": "ready",
                     }));
                 }
                 Err(error) => {
                     warnings.push(format!("slot {slot_key}: {error}"));
                     slots.push(json!({
-                        "slotKey": slot_key,
-                        "agentSlotId": agent_slot_id,
+                        "slot_key": slot_key,
+                        "agent_slot_id": agent_slot_id,
                         "status": "error",
                         "error": error,
                     }));
@@ -7646,7 +7553,7 @@ impl CoordinationKernel {
         )?;
 
         Ok(json!({
-            "slotCount": slot_count,
+            "slot_count": slot_count,
             "slots": slots,
             "warnings": warnings,
         }))
@@ -7766,12 +7673,12 @@ impl CoordinationKernel {
 
         Ok(json!({
             "id": id,
-            "agentId": agent_id,
-            "agentSlotId": agent_slot_id,
-            "slotKey": slot_key,
+            "agent_id": agent_id,
+            "agent_slot_id": agent_slot_id,
+            "slot_key": slot_key,
             "path": path_text,
-            "branchName": branch,
-            "baseSha": recorded_sha,
+            "branch_name": branch,
+            "base_sha": recorded_sha,
             "status": "active",
             "mode": "worktree_only",
         }))
@@ -8195,12 +8102,12 @@ impl CoordinationKernel {
         Ok(json!({
             "ok": true,
             "id": candidate_id,
-            "todoId": todo_id,
-            "oldTaskId": task_id,
-            "oldSessionId": session_id,
-            "providerSessionId": provider_session_id,
-            "resumeDispatchId": resume_dispatch_id,
-            "resumeCommandId": resume_command_id,
+            "todo_id": todo_id,
+            "old_task_id": task_id,
+            "old_session_id": session_id,
+            "provider_session_id": provider_session_id,
+            "resume_dispatch_id": resume_dispatch_id,
+            "resume_command_id": resume_command_id,
             "status": "pending",
         }))
     }
@@ -8394,26 +8301,26 @@ impl CoordinationKernel {
             let active_work_signal_count = active_lease_count + startup_cleared_lease_count;
             let active_crashed_task = unfinished_task && active_work_signal_count > 0;
             let mut crashed_terminal = json!({
-                "sessionId": session_id,
-                "agentId": session["agent_id"].as_str().unwrap_or_default(),
-                "agentName": session["agent_name"].as_str().unwrap_or("Agent"),
-                "agentKind": session["agent_kind"].as_str().unwrap_or("agent"),
-                "agentSlotId": session["agent_slot_id"].as_str(),
-                "slotKey": session["slot_key"].as_str(),
-                "taskId": task_id,
-                "taskTitle": session["task_title"].as_str(),
-                "taskStatus": task_status,
-                "claimedSessionId": claimed_session_id,
-                "ptyId": session["pty_id"].as_str(),
-                "providerSessionId": session["provider_session_id"].as_str(),
-                "writeRoot": session["write_root"].as_str(),
-                "lastHeartbeatAt": session["last_heartbeat_at"].as_str(),
-                "sessionUpdatedAt": session["session_updated_at"].as_str(),
-                "activeLeaseCount": active_lease_count,
-                "startupClearedLeaseCount": startup_cleared_lease_count,
-                "activeWorkSignalCount": active_work_signal_count,
-                "unfinishedTask": unfinished_task,
-                "activeCrashedTask": active_crashed_task,
+                "session_id": session_id,
+                "agent_id": session["agent_id"].as_str().unwrap_or_default(),
+                "agent_name": session["agent_name"].as_str().unwrap_or("Agent"),
+                "agent_kind": session["agent_kind"].as_str().unwrap_or("agent"),
+                "agent_slot_id": session["agent_slot_id"].as_str(),
+                "slot_key": session["slot_key"].as_str(),
+                "task_id": task_id,
+                "task_title": session["task_title"].as_str(),
+                "task_status": task_status,
+                "claimed_session_id": claimed_session_id,
+                "pty_id": session["pty_id"].as_str(),
+                "provider_session_id": session["provider_session_id"].as_str(),
+                "write_root": session["write_root"].as_str(),
+                "last_heartbeat_at": session["last_heartbeat_at"].as_str(),
+                "session_updated_at": session["session_updated_at"].as_str(),
+                "active_lease_count": active_lease_count,
+                "startup_cleared_lease_count": startup_cleared_lease_count,
+                "active_work_signal_count": active_work_signal_count,
+                "unfinished_task": unfinished_task,
+                "active_crashed_task": active_crashed_task,
             });
 
             if let Some(task_id) = task_id.filter(|_| active_crashed_task) {
@@ -8461,16 +8368,16 @@ impl CoordinationKernel {
                         })
                     });
                 if let Some(object) = crashed_terminal.as_object_mut() {
-                    object.insert("cleanupReason".to_string(), json!("app_crash_recovery"));
+                    object.insert("cleanup_reason".to_string(), json!("app_crash_recovery"));
                     object.insert(
-                        "recoveryAction".to_string(),
+                        "recovery_action".to_string(),
                         json!("interrupted_active_task"),
                     );
-                    object.insert("taskUpdated".to_string(), json!(task_updates > 0));
-                    object.insert("updatedResourceIntents".to_string(), json!(intent_updates));
-                    object.insert("interruptResult".to_string(), interrupt_result.clone());
+                    object.insert("task_updated".to_string(), json!(task_updates > 0));
+                    object.insert("updated_resource_intents".to_string(), json!(intent_updates));
+                    object.insert("interrupt_result".to_string(), interrupt_result.clone());
                     object.insert(
-                        "crashResumeCandidate".to_string(),
+                        "crash_resume_candidate".to_string(),
                         crash_resume_candidate.clone(),
                     );
                 }
@@ -8502,27 +8409,27 @@ impl CoordinationKernel {
                 )?;
 
                 interrupted_tasks.push(json!({
-                    "sessionId": session_id,
-                    "agentId": session["agent_id"].as_str().unwrap_or_default(),
-                    "agentName": session["agent_name"].as_str().unwrap_or("Agent"),
-                    "agentKind": session["agent_kind"].as_str().unwrap_or("agent"),
-                    "agentSlotId": session["agent_slot_id"].as_str(),
-                    "slotKey": session["slot_key"].as_str(),
-                    "taskId": task_id,
+                    "session_id": session_id,
+                    "agent_id": session["agent_id"].as_str().unwrap_or_default(),
+                    "agent_name": session["agent_name"].as_str().unwrap_or("Agent"),
+                    "agent_kind": session["agent_kind"].as_str().unwrap_or("agent"),
+                    "agent_slot_id": session["agent_slot_id"].as_str(),
+                    "slot_key": session["slot_key"].as_str(),
+                    "task_id": task_id,
                     "title": task_title,
                     "body": task_body,
-                    "previousTaskStatus": task_status,
-                    "ptyId": session["pty_id"].as_str(),
-                    "writeRoot": session["write_root"].as_str(),
-                    "lastHeartbeatAt": session["last_heartbeat_at"].as_str(),
-                    "sessionUpdatedAt": session["session_updated_at"].as_str(),
-                    "activeLeaseCount": active_lease_count,
-                    "startupClearedLeaseCount": startup_cleared_lease_count,
-                    "activeWorkSignalCount": active_work_signal_count,
-                    "taskUpdated": task_updates > 0,
-                    "updatedResourceIntents": intent_updates,
-                    "interruptResult": interrupt_result,
-                    "crashResumeCandidate": crash_resume_candidate,
+                    "previous_task_status": task_status,
+                    "pty_id": session["pty_id"].as_str(),
+                    "write_root": session["write_root"].as_str(),
+                    "last_heartbeat_at": session["last_heartbeat_at"].as_str(),
+                    "session_updated_at": session["session_updated_at"].as_str(),
+                    "active_lease_count": active_lease_count,
+                    "startup_cleared_lease_count": startup_cleared_lease_count,
+                    "active_work_signal_count": active_work_signal_count,
+                    "task_updated": task_updates > 0,
+                    "updated_resource_intents": intent_updates,
+                    "interrupt_result": interrupt_result,
+                    "crash_resume_candidate": crash_resume_candidate,
                 }));
                 crashed_terminals.push(crashed_terminal);
             } else {
@@ -8538,12 +8445,12 @@ impl CoordinationKernel {
                 };
                 let interrupt_result = self.interrupt_session(session_id, cleanup_reason)?;
                 if let Some(object) = crashed_terminal.as_object_mut() {
-                    object.insert("cleanupReason".to_string(), json!(cleanup_reason));
+                    object.insert("cleanup_reason".to_string(), json!(cleanup_reason));
                     object.insert(
-                        "recoveryAction".to_string(),
+                        "recovery_action".to_string(),
                         json!("interrupted_stale_session"),
                     );
-                    object.insert("interruptResult".to_string(), interrupt_result);
+                    object.insert("interrupt_result".to_string(), interrupt_result);
                 }
                 crashed_terminals.push(crashed_terminal);
             }
@@ -8571,12 +8478,12 @@ impl CoordinationKernel {
         }
 
         Ok(json!({
-            "interruptedTasks": interrupted_tasks,
-            "crashedTerminals": crashed_terminals,
-            "idleSessionsInterrupted": idle_sessions_interrupted,
-            "finishedSessionsInterrupted": finished_sessions_interrupted,
-            "rearmedCrashResumeCandidates": rearmed_crash_resume_candidates,
-            "scannedSessions": scanned_sessions,
+            "interrupted_tasks": interrupted_tasks,
+            "crashed_terminals": crashed_terminals,
+            "idle_sessions_interrupted": idle_sessions_interrupted,
+            "finished_sessions_interrupted": finished_sessions_interrupted,
+            "rearmed_crash_resume_candidates": rearmed_crash_resume_candidates,
+            "scanned_sessions": scanned_sessions,
         }))
     }
 
@@ -8625,10 +8532,10 @@ impl CoordinationKernel {
             },
             "diffforge": {
                 "scope": "workspace",
-                "workspaceId": workspace_id,
-                "workspaceName": workspace_name,
-                "objectiveKey": objective_key,
-                "alwaysOn": true,
+                "workspace_id": workspace_id,
+                "workspace_name": workspace_name,
+                "objective_key": objective_key,
+                "always_on": true,
                 "toggleable": false,
                 "authority": "local_coordination_kernel"
             }
@@ -8646,10 +8553,10 @@ impl CoordinationKernel {
             },
             "diffforge": {
                 "scope": "workspace",
-                "workspaceId": workspace_id,
-                "workspaceName": workspace_name,
-                "objectiveKey": objective_key,
-                "alwaysOn": true,
+                "workspace_id": workspace_id,
+                "workspace_name": workspace_name,
+                "objective_key": objective_key,
+                "always_on": true,
                 "toggleable": false,
                 "authority": "workspace_mcp_gateway"
             }
@@ -9239,21 +9146,19 @@ impl CoordinationKernel {
         let port_i64 = port.map(i64::from);
         let username = workspace_mcp_ssh_target_username_from_input(input)?;
         let auth_method_value = input
-            .get("authMethod")
-            .or_else(|| input.get("auth_method"))
+            .get("auth_method")
             .and_then(Value::as_str)
             .ok_or_else(|| "authMethod is required.".to_string())?;
         let auth_method = workspace_mcp_ssh_auth_method(auth_method_value)?;
         let key_path = workspace_mcp_optional_trimmed_text(
-            input.get("keyPath").or_else(|| input.get("key_path")),
+            input.get("key_path"),
         );
         if auth_method == "key" && key_path.is_none() {
             return Err("SSH key path is required for key auth.".to_string());
         }
         let certificate_path = workspace_mcp_optional_trimmed_text(
             input
-                .get("certificatePath")
-                .or_else(|| input.get("certificate_path")),
+                .get("certificate_path"),
         );
         let secret_update = match input.get("secret") {
             Some(Value::String(value)) if value.is_empty() => Some(None),
@@ -9267,7 +9172,7 @@ impl CoordinationKernel {
             .and_then(|row| row["secret"].as_str().map(str::to_string))
             .filter(|value| !value.is_empty());
         let secret = secret_update.unwrap_or(existing_secret);
-        let agent_enabled = workspace_mcp_optional_bool(input, &["agentEnabled", "agent_enabled"])
+        let agent_enabled = workspace_mcp_optional_bool(input, &["agent_enabled"])
             .unwrap_or_else(|| {
                 existing
                     .as_ref()
@@ -9275,7 +9180,7 @@ impl CoordinationKernel {
                     .unwrap_or(false)
             });
         let reveal_password =
-            workspace_mcp_optional_bool(input, &["revealPassword", "reveal_password"])
+            workspace_mcp_optional_bool(input, &["reveal_password"])
                 .unwrap_or_else(|| {
                     existing
                         .as_ref()
@@ -11318,12 +11223,12 @@ impl CoordinationKernel {
             },
             "diffforge": {
                 "scope": "workspace",
-                "slotKey": slot_key,
-                "agentSlotId": agent_slot_id,
-                "workspaceId": workspace_id,
-                "alwaysOn": true,
+                "slot_key": slot_key,
+                "agent_slot_id": agent_slot_id,
+                "workspace_id": workspace_id,
+                "always_on": true,
                 "toggleable": false,
-                "identitySource": "active_session_for_slot",
+                "identity_source": "active_session_for_slot",
                 "authority": "local_coordination_kernel"
             }
         });
@@ -11340,12 +11245,12 @@ impl CoordinationKernel {
             },
             "diffforge": {
                 "scope": "workspace",
-                "slotKey": slot_key,
-                "agentSlotId": agent_slot_id,
-                "workspaceId": workspace_id,
-                "alwaysOn": true,
+                "slot_key": slot_key,
+                "agent_slot_id": agent_slot_id,
+                "workspace_id": workspace_id,
+                "always_on": true,
                 "toggleable": false,
-                "identitySource": "active_session_for_slot",
+                "identity_source": "active_session_for_slot",
                 "authority": "workspace_mcp_gateway"
             }
         });
@@ -16780,7 +16685,7 @@ impl CoordinationKernel {
 
             let detail_agent_slot_id = details["agent_slot_id"]
                 .as_str()
-                .or_else(|| details["agentSlotId"].as_str())
+                .or_else(|| details["agent_slot_id"].as_str())
                 .map(str::trim)
                 .unwrap_or_default();
             if !detail_agent_slot_id.is_empty()
@@ -16791,7 +16696,7 @@ impl CoordinationKernel {
             }
             let detail_worktree_id = details["worktree_id"]
                 .as_str()
-                .or_else(|| details["worktreeId"].as_str())
+                .or_else(|| details["worktree_id"].as_str())
                 .map(str::trim)
                 .unwrap_or_default();
             if !detail_worktree_id.is_empty() && detail_worktree_id != worktree_id {
@@ -17134,16 +17039,16 @@ impl CoordinationKernel {
     pub fn undo_worktree_diff_summary(&self, input: &Value) -> Result<Value, String> {
         let before = self.worktree_diff_summary_data(input)?;
         let expected_summary_key =
-            json_text_any(input, &["expected_summary_key", "expectedSummaryKey"]);
-        let summary_key = before["summaryKey"].as_str().unwrap_or_default();
+            json_text_any(input, &["expected_summary_key"]);
+        let summary_key = before["summary_key"].as_str().unwrap_or_default();
         if let Some(expected_summary_key) = expected_summary_key {
             if expected_summary_key != summary_key {
                 return Ok(api_error(
                     "diff_summary_stale",
                     "The edited files changed since this summary was captured.",
                     json!({
-                        "expectedSummaryKey": expected_summary_key,
-                        "actualSummaryKey": summary_key,
+                        "expected_summary_key": expected_summary_key,
+                        "actual_summary_key": summary_key,
                     }),
                 ));
             }
@@ -17159,15 +17064,15 @@ impl CoordinationKernel {
             return Ok(api_error(
                 "undo_untracked_files_unsupported",
                 "Undo is blocked because this summary includes untracked files.",
-                json!({"untrackedFiles": untracked_files}),
+                json!({"untracked_files": untracked_files}),
             ));
         }
 
-        let worktree_path = before["worktreePath"]
+        let worktree_path = before["worktree_path"]
             .as_str()
             .ok_or_else(|| "Diff summary is missing worktreePath.".to_string())
             .map(PathBuf::from)?;
-        let base_sha = before["baseSha"]
+        let base_sha = before["base_sha"]
             .as_str()
             .ok_or_else(|| "Diff summary is missing baseSha.".to_string())?;
         let diff = run_git_bytes(&worktree_path, &["diff", "--binary", base_sha, "--"])?;
@@ -17248,23 +17153,21 @@ impl CoordinationKernel {
             files.push(json!({
                 "path": changed_file.path.clone(),
                 "name": display_file_name(&changed_file.path),
-                "changeKind": changed_file.change_kind.clone(),
                 "change_kind": changed_file.change_kind.clone(),
                 "additions": additions,
                 "deletions": deletions,
-                "linesAdded": additions,
-                "linesRemoved": deletions,
+                "lines_added": additions,
+                "lines_removed": deletions,
                 "binary": counts.binary,
                 "untracked": changed_file.untracked,
-                "countStatus": counts.status,
                 "count_status": counts.status,
-                "modifiedMs": file_modified_ms(&full_path),
+                "modified_ms": file_modified_ms(&full_path),
             }));
         }
 
         files.sort_by(|left, right| {
-            let left_modified = left["modifiedMs"].as_i64().unwrap_or(0);
-            let right_modified = right["modifiedMs"].as_i64().unwrap_or(0);
+            let left_modified = left["modified_ms"].as_i64().unwrap_or(0);
+            let right_modified = right["modified_ms"].as_i64().unwrap_or(0);
             right_modified
                 .cmp(&left_modified)
                 .then_with(|| left["path"].as_str().cmp(&right["path"].as_str()))
@@ -17273,16 +17176,16 @@ impl CoordinationKernel {
         files.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
 
         let summary_payload = json!({
-            "baseSha": context.base_sha.clone(),
-            "worktreePath": process_path_text(&context.worktree_path),
+            "base_sha": context.base_sha.clone(),
+            "worktree_path": process_path_text(&context.worktree_path),
             "files": files.iter().map(|file| json!({
                 "path": file["path"].clone(),
-                "changeKind": file["changeKind"].clone(),
+                "change_kind": file["change_kind"].clone(),
                 "additions": file["additions"].clone(),
                 "deletions": file["deletions"].clone(),
                 "binary": file["binary"].clone(),
                 "untracked": file["untracked"].clone(),
-                "countStatus": file["countStatus"].clone(),
+                "count_status": file["count_status"].clone(),
             })).collect::<Vec<_>>(),
         });
         let summary_key = sha256_hex(
@@ -17291,27 +17194,21 @@ impl CoordinationKernel {
         );
 
         Ok(json!({
-            "worktreePath": process_path_text(&context.worktree_path),
             "worktree_path": process_path_text(&context.worktree_path),
-            "worktreeId": context.worktree_id.clone(),
             "worktree_id": context.worktree_id.clone(),
-            "baseSha": context.base_sha.clone(),
             "base_sha": context.base_sha.clone(),
-            "summaryKey": summary_key,
             "summary_key": summary_key,
-            "fileCount": files.len(),
             "file_count": files.len(),
             "additions": additions_total,
             "deletions": deletions_total,
             "partial": partial,
-            "latestFile": latest_file,
             "latest_file": latest_file,
             "files": files,
         }))
     }
 
     fn resolve_worktree_diff_context(&self, input: &Value) -> Result<WorktreeDiffContext, String> {
-        let worktree_path_text = json_text_any(input, &["worktree_path", "worktreePath"])
+        let worktree_path_text = json_text_any(input, &["worktree_path"])
             .ok_or_else(|| "worktree_path is required.".to_string())?;
         let worktree_path = PathBuf::from(&worktree_path_text);
         if !worktree_path.exists() {
@@ -17357,7 +17254,7 @@ impl CoordinationKernel {
         let worktree_id = worktree_row
             .as_ref()
             .and_then(|row| row["id"].as_str().map(str::to_string));
-        let base_sha = json_text_any(input, &["base_sha", "baseSha"])
+        let base_sha = json_text_any(input, &["base_sha"])
             .or_else(|| {
                 worktree_row
                     .as_ref()
@@ -21336,18 +21233,11 @@ impl CoordinationKernel {
                     "meter": "coordination.task",
                     "source": "coordination-kernel.start_task",
                     "task_id": task_id,
-                    "taskId": task_id,
                     "created_task": created_task,
-                    "createdTask": created_task,
                     "reused_task": reused_task,
-                    "reusedTask": reused_task,
                     "agent_id": agent_id,
-                    "agentId": agent_id,
                     "session_id": session_id,
-                    "sessionId": session_id,
-                    "repo_path": repo_path.clone(),
-                    "repoPath": repo_path,
-                }),
+                    "repo_path": repo_path}),
             );
         }
         let brief = self.get_brief(agent_id, session_id, task_id_for_brief, context_run_id)?;
@@ -23894,12 +23784,12 @@ impl CoordinationKernel {
             .map_err(|error| format!("Unable to mark prepared worktree active: {error}"))?;
         let response = json!({
             "id": existing_id,
-            "agentId": agent_id,
-            "agentSlotId": agent_slot_id,
-            "slotKey": slot_key,
+            "agent_id": agent_id,
+            "agent_slot_id": agent_slot_id,
+            "slot_key": slot_key,
             "path": existing_path,
-            "branchName": existing["branch_name"].as_str().unwrap_or(""),
-            "baseSha": existing["base_sha"].as_str(),
+            "branch_name": existing["branch_name"].as_str().unwrap_or(""),
+            "base_sha": existing["base_sha"].as_str(),
             "status": "active",
             "prepared": true,
         });
@@ -24025,12 +23915,12 @@ impl CoordinationKernel {
                         )?;
                         let response = json!({
                             "id": existing_id,
-                            "agentId": agent_id,
-                            "agentSlotId": agent_slot_id,
-                            "slotKey": slot_key,
+                            "agent_id": agent_id,
+                            "agent_slot_id": agent_slot_id,
+                            "slot_key": slot_key,
                             "path": existing["path"],
-                            "branchName": existing_branch,
-                            "baseSha": integration.head_sha,
+                            "branch_name": existing_branch,
+                            "base_sha": integration.head_sha,
                             "status": "active",
                         });
                         return Ok(response);
@@ -24278,12 +24168,12 @@ impl CoordinationKernel {
 
         let response = json!({
             "id": id,
-            "agentId": agent_id,
-            "agentSlotId": agent_slot_id,
-            "slotKey": slot_key,
+            "agent_id": agent_id,
+            "agent_slot_id": agent_slot_id,
+            "slot_key": slot_key,
             "path": worktree_path_text,
-            "branchName": branch,
-            "baseSha": recorded_sha,
+            "branch_name": branch,
+            "base_sha": recorded_sha,
             "status": "active",
         });
         Ok(response)
@@ -24392,7 +24282,7 @@ impl CoordinationKernel {
                 params![
                     Some(worktree_id),
                     worktree["path"].as_str(),
-                    worktree["baseSha"].as_str(),
+                    worktree["base_sha"].as_str(),
                     now_rfc3339(),
                     session_id
                 ],
@@ -24400,10 +24290,6 @@ impl CoordinationKernel {
             .map_err(|error| format!("Unable to attach stable worktree to session: {error}"))?;
         let mut worktree = worktree;
         if let Some(object) = worktree.as_object_mut() {
-            object.insert(
-                "taskId".to_string(),
-                task_id.map(Value::from).unwrap_or(Value::Null),
-            );
             object.insert(
                 "task_id".to_string(),
                 task_id.map(Value::from).unwrap_or(Value::Null),
@@ -24453,7 +24339,7 @@ impl CoordinationKernel {
                 "worktree_id": worktree["id"].clone(),
                 "worktree_path": worktree["path"].clone(),
                 "agent_branch_root": worktree["path"].clone(),
-                "branch_name": worktree["branchName"].clone(),
+                "branch_name": worktree["branch_name"].clone(),
             }));
         }
         if policy_session_mode == AGENT_SESSION_MODE_DIRECT_UNMANAGED {
@@ -24602,7 +24488,7 @@ impl CoordinationKernel {
         let worktree = self.create_worktree_for_session(agent_id, session_id, task_id)?;
         let worktree_id = worktree["id"].as_str().unwrap_or_default().to_string();
         let worktree_path = worktree["path"].as_str().unwrap_or_default().to_string();
-        let branch_name = worktree["branchName"]
+        let branch_name = worktree["branch_name"]
             .as_str()
             .unwrap_or_default()
             .to_string();
@@ -24616,7 +24502,7 @@ impl CoordinationKernel {
                 task_id: task_id
                     .filter(|value| !value.trim().is_empty())
                     .map(str::to_string),
-                agent_slot_id: worktree["agentSlotId"].as_str().map(str::to_string),
+                agent_slot_id: worktree["agent_slot_id"].as_str().map(str::to_string),
                 ..EventRefs::default()
             },
             json!({
@@ -24846,21 +24732,21 @@ impl CoordinationKernel {
     ) -> Value {
         json!({
             "id": session["id"].as_str().unwrap_or_default(),
-            "agentId": session["agent_id"].as_str().unwrap_or_default(),
-            "agentKind": slot["agent_kind"].as_str().unwrap_or("agent"),
-            "agentSlotId": slot["id"].as_str().unwrap_or_default(),
-            "slotKey": slot["slot_key"].as_str().unwrap_or_default(),
-            "taskId": session["task_id"].as_str(),
-            "ptyId": session["pty_id"].as_str(),
-            "terminalLaunchEpoch": session["terminal_launch_epoch"].as_str(),
-            "worktreeId": session["worktree_id"].as_str(),
-            "writeRoot": session["write_root"].as_str().unwrap_or_else(|| self.paths.repo_path.to_str().unwrap_or("")),
-            "enforcementMode": session["enforcement_mode"].as_str().unwrap_or("coordination_only"),
-            "baseGitSha": session["base_git_sha"].as_str(),
+            "agent_id": session["agent_id"].as_str().unwrap_or_default(),
+            "agent_kind": slot["agent_kind"].as_str().unwrap_or("agent"),
+            "agent_slot_id": slot["id"].as_str().unwrap_or_default(),
+            "slot_key": slot["slot_key"].as_str().unwrap_or_default(),
+            "task_id": session["task_id"].as_str(),
+            "pty_id": session["pty_id"].as_str(),
+            "terminal_launch_epoch": session["terminal_launch_epoch"].as_str(),
+            "worktree_id": session["worktree_id"].as_str(),
+            "write_root": session["write_root"].as_str().unwrap_or_else(|| self.paths.repo_path.to_str().unwrap_or("")),
+            "enforcement_mode": session["enforcement_mode"].as_str().unwrap_or("coordination_only"),
+            "base_git_sha": session["base_git_sha"].as_str(),
             "status": session["status"].as_str().unwrap_or("unknown"),
-            "mcpConfigPath": mcp_config.generic_path.clone(),
-            "codexMcpConfigPath": mcp_config.codex_path.clone(),
-            "claudeMcpConfigPath": mcp_config.claude_path.clone(),
+            "mcp_config_path": mcp_config.generic_path.clone(),
+            "codex_mcp_config_path": mcp_config.codex_path.clone(),
+            "claude_mcp_config_path": mcp_config.claude_path.clone(),
             "warnings": warnings,
         })
     }
@@ -25721,7 +25607,7 @@ fn probe_mcp_stdio(command: &str, args: &[String]) -> Value {
             continue;
         };
         match message["id"].as_i64() {
-            Some(1) if message["result"]["serverInfo"]["name"].as_str().is_some() => {
+            Some(1) if message["result"]["server_info"]["name"].as_str().is_some() => {
                 initialize_responded = true;
             }
             Some(2) => {
@@ -26505,7 +26391,7 @@ pub(crate) fn codex_managed_hooks_config_toml(hooks_json: &Value) -> String {
                 if let Some(command) = hook.get("command").and_then(Value::as_str) {
                     config.push_str(&format!("command = \"{}\"\n", toml_escape(command)));
                 }
-                if let Some(command_windows) = hook.get("commandWindows").and_then(Value::as_str) {
+                if let Some(command_windows) = hook.get("command_windows").and_then(Value::as_str) {
                     config.push_str(&format!(
                         "commandWindows = \"{}\"\n",
                         toml_escape(command_windows)
@@ -26514,7 +26400,7 @@ pub(crate) fn codex_managed_hooks_config_toml(hooks_json: &Value) -> String {
                 if let Some(timeout) = hook.get("timeout").and_then(Value::as_u64) {
                     config.push_str(&format!("timeout = {timeout}\n"));
                 }
-                if let Some(status_message) = hook.get("statusMessage").and_then(Value::as_str) {
+                if let Some(status_message) = hook.get("status_message").and_then(Value::as_str) {
                     config.push_str(&format!(
                         "statusMessage = \"{}\"\n",
                         toml_escape(status_message)
@@ -26624,7 +26510,7 @@ fn codex_managed_command_hook_json(
     );
     if let Some(status_message) = status_message {
         hook.insert(
-            "statusMessage".to_string(),
+            "status_message".to_string(),
             Value::String(status_message.to_string()),
         );
     }
@@ -28252,15 +28138,7 @@ mod tests {
         run(
             &repo,
             "git",
-            &[
-                "-c",
-                "user.email=test@example.com",
-                "-c",
-                "user.name=Test",
-                "commit",
-                "-m",
-                "init",
-            ],
+            &["-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "init"],
         );
         repo
     }
@@ -29369,9 +29247,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        let agent_a_id = session_a["agentId"].as_str().unwrap();
+        let agent_a_id = session_a["agent_id"].as_str().unwrap();
         let session_a_id = session_a["id"].as_str().unwrap();
-        let worktree_a_id = session_a["worktreeId"].as_str().unwrap();
+        let worktree_a_id = session_a["worktree_id"].as_str().unwrap();
         let task_a = kernel
             .create_task("Task A", Some("first intent"), 0, 1, None, None, None, None)
             .unwrap();
@@ -29393,7 +29271,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let agent_b_id = session_b["agentId"].as_str().unwrap();
+        let agent_b_id = session_b["agent_id"].as_str().unwrap();
         let session_b_id = session_b["id"].as_str().unwrap();
         let task_b = kernel
             .create_task(
@@ -29484,15 +29362,7 @@ mod tests {
         run(
             &repo,
             "git",
-            &[
-                "-c",
-                "user.email=test@example.com",
-                "-c",
-                "user.name=Test",
-                "commit",
-                "-m",
-                "add b",
-            ],
+            &["-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "add b"],
         );
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
         enable_agent_worktrees(&kernel);
@@ -29505,10 +29375,10 @@ mod tests {
                 "route-a", "Agent A", "codex", None, None, None, true, None, None,
             )
             .unwrap();
-        let agent_a_id = session_a["agentId"].as_str().unwrap();
+        let agent_a_id = session_a["agent_id"].as_str().unwrap();
         let session_a_id = session_a["id"].as_str().unwrap();
-        let worktree_a_id = session_a["worktreeId"].as_str().unwrap();
-        let write_root_a = PathBuf::from(session_a["writeRoot"].as_str().unwrap());
+        let worktree_a_id = session_a["worktree_id"].as_str().unwrap();
+        let write_root_a = PathBuf::from(session_a["write_root"].as_str().unwrap());
         let task_a = kernel
             .create_task("Task A", Some("change src"), 0, 1, None, None, None, None)
             .unwrap();
@@ -29533,10 +29403,10 @@ mod tests {
                 "route-b", "Agent B", "codex", None, None, None, true, None, None,
             )
             .unwrap();
-        let agent_b_id = session_b["agentId"].as_str().unwrap();
+        let agent_b_id = session_b["agent_id"].as_str().unwrap();
         let session_b_id = session_b["id"].as_str().unwrap();
-        let worktree_b_id = session_b["worktreeId"].as_str().unwrap();
-        let write_root_b = PathBuf::from(session_b["writeRoot"].as_str().unwrap());
+        let worktree_b_id = session_b["worktree_id"].as_str().unwrap();
+        let write_root_b = PathBuf::from(session_b["write_root"].as_str().unwrap());
         let task_b = kernel
             .create_task("Task B", Some("change b"), 0, 1, None, None, None, None)
             .unwrap();
@@ -29653,7 +29523,7 @@ mod tests {
         let active = kernel
             .query_json(
                 "SELECT * FROM agent_sessions WHERE agent_slot_id=?1 AND status='active'",
-                &[&first["agentSlotId"].as_str().unwrap()],
+                &[&first["agent_slot_id"].as_str().unwrap()],
             )
             .unwrap();
         assert_eq!(active.len(), 1);
@@ -29726,7 +29596,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let slot_id = first["agentSlotId"].as_str().unwrap();
+        let slot_id = first["agent_slot_id"].as_str().unwrap();
         let session_id = first["id"].as_str().unwrap();
         kernel
             .conn
@@ -29773,8 +29643,8 @@ mod tests {
             )
             .unwrap();
         let session_id = session["id"].as_str().unwrap();
-        let mcp_config_path = session["mcpConfigPath"].as_str().unwrap();
-        let worktree_path = session["writeRoot"].as_str().unwrap();
+        let mcp_config_path = session["mcp_config_path"].as_str().unwrap();
+        let worktree_path = session["write_root"].as_str().unwrap();
 
         assert_eq!(
             normalize_path_for_compare(mcp_config_path),
@@ -30288,7 +30158,7 @@ enabled = true
             assert!(hooks[event_index..].contains("--diff-forge-activity-hook"));
         }
         assert!(!hooks.contains("[core]"));
-        assert!(!hooks.contains("hooksPath"));
+        assert!(!hooks.contains("hooks_path"));
     }
 
     #[test]
@@ -30416,15 +30286,7 @@ command = "diffforge --diff-forge-activity-hook"
         run(
             &child,
             "git",
-            &[
-                "-c",
-                "user.email=test@example.com",
-                "-c",
-                "user.name=Test",
-                "commit",
-                "-m",
-                "init",
-            ],
+            &["-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "init"],
         );
 
         let config = codex_managed_profile_config(
@@ -30509,15 +30371,7 @@ command = "diffforge --diff-forge-activity-hook"
         run(
             &child,
             "git",
-            &[
-                "-c",
-                "user.email=test@example.com",
-                "-c",
-                "user.name=Test",
-                "commit",
-                "-m",
-                "init",
-            ],
+            &["-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "init"],
         );
 
         let config = codex_managed_profile_config(
@@ -30853,7 +30707,7 @@ command = "diffforge --diff-forge-activity-hook"
                 None,
             )
             .unwrap();
-        let agent_id = session["agentId"].as_str().unwrap();
+        let agent_id = session["agent_id"].as_str().unwrap();
         let session_id = session["id"].as_str().unwrap();
         let task = kernel
             .create_task(
@@ -30940,8 +30794,8 @@ command = "diffforge --diff-forge-activity-hook"
             .create_session(&agent_id, None, None, false, None, None)
             .unwrap();
         let session_id = session["id"].as_str().unwrap().to_string();
-        let agent_slot_id = session["agentSlotId"].as_str().map(str::to_string);
-        let slot_key = session["slotKey"].as_str().map(str::to_string);
+        let agent_slot_id = session["agent_slot_id"].as_str().map(str::to_string);
+        let slot_key = session["slot_key"].as_str().map(str::to_string);
 
         let initial = kernel.mcp_client_mount_summary().unwrap();
         assert_eq!(initial["status"].as_str(), Some("not_seen"));
@@ -31035,7 +30889,7 @@ command = "diffforge --diff-forge-activity-hook"
             )
             .unwrap();
         assert_eq!(second["id"].as_str(), Some(session_id.as_str()));
-        assert_eq!(second["terminalLaunchEpoch"].as_str(), Some("epoch-2"));
+        assert_eq!(second["terminal_launch_epoch"].as_str(), Some("epoch-2"));
 
         let stale_cleanup = kernel
             .interrupt_session_for_terminal_launch(&session_id, "terminal_close", Some("epoch-1"))
@@ -32042,7 +31896,7 @@ command = "diffforge --diff-forge-activity-hook"
             .unwrap();
         let task_id = task["id"].as_str().unwrap();
         kernel.claim_task(task_id, agent_id, session_id).unwrap();
-        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let write_root = PathBuf::from(session["write_root"].as_str().unwrap());
         fs::write(write_root.join("src.txt"), "changed\n").unwrap();
 
         let scan = kernel.scan_workspace_changes().unwrap();
@@ -32179,7 +32033,7 @@ command = "diffforge --diff-forge-activity-hook"
             .create_session(agent["id"].as_str().unwrap(), None, None, true, None, None)
             .unwrap();
         assert_eq!(
-            session["enforcementMode"].as_str(),
+            session["enforcement_mode"].as_str(),
             Some("bounded_direct_edit")
         );
     }
@@ -32718,7 +32572,7 @@ command = "diffforge --diff-forge-activity-hook"
                 None,
             )
             .unwrap();
-        let agent_id = session["agentId"].as_str().unwrap();
+        let agent_id = session["agent_id"].as_str().unwrap();
         let session_id = session["id"].as_str().unwrap();
         let task = kernel
             .create_task("Managed task", None, 0, 1, None, None, None, None)
@@ -32753,7 +32607,7 @@ command = "diffforge --diff-forge-activity-hook"
                 None,
             )
             .unwrap();
-        let agent_id = session["agentId"].as_str().unwrap();
+        let agent_id = session["agent_id"].as_str().unwrap();
         let session_id = session["id"].as_str().unwrap();
         let task = kernel
             .create_task(
@@ -32940,7 +32794,7 @@ command = "diffforge --diff-forge-activity-hook"
             )
             .unwrap();
         let session_id = session["id"].as_str().unwrap().to_string();
-        let worktree_path = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let worktree_path = PathBuf::from(session["write_root"].as_str().unwrap());
         fs::remove_dir_all(&worktree_path).unwrap();
         drop(kernel);
 
@@ -33539,20 +33393,20 @@ command = "diffforge --diff-forge-activity-hook"
 
         let report = kernel.recover_crashed_terminal_sessions().unwrap();
 
-        assert_eq!(report["interruptedTasks"].as_array().unwrap().len(), 0);
-        let crashed_terminals = report["crashedTerminals"].as_array().unwrap();
+        assert_eq!(report["interrupted_tasks"].as_array().unwrap().len(), 0);
+        let crashed_terminals = report["crashed_terminals"].as_array().unwrap();
         assert_eq!(crashed_terminals.len(), 1);
-        assert_eq!(crashed_terminals[0]["sessionId"].as_str(), Some(session_id));
-        assert_eq!(crashed_terminals[0]["taskId"].as_str(), Some(task_id));
+        assert_eq!(crashed_terminals[0]["session_id"].as_str(), Some(session_id));
+        assert_eq!(crashed_terminals[0]["task_id"].as_str(), Some(task_id));
         assert_eq!(
-            crashed_terminals[0]["cleanupReason"].as_str(),
+            crashed_terminals[0]["cleanup_reason"].as_str(),
             Some("app_crash_idle_claimed_task_cleanup")
         );
         assert_eq!(
-            crashed_terminals[0]["activeCrashedTask"].as_bool(),
+            crashed_terminals[0]["active_crashed_task"].as_bool(),
             Some(false)
         );
-        assert_eq!(report["idleSessionsInterrupted"].as_u64(), Some(1));
+        assert_eq!(report["idle_sessions_interrupted"].as_u64(), Some(1));
         let session = kernel
             .query_one(
                 "SELECT status FROM agent_sessions WHERE id=?1",
@@ -33601,20 +33455,20 @@ command = "diffforge --diff-forge-activity-hook"
 
         let report = kernel.recover_crashed_terminal_sessions().unwrap();
 
-        let interrupted_tasks = report["interruptedTasks"].as_array().unwrap();
+        let interrupted_tasks = report["interrupted_tasks"].as_array().unwrap();
         assert_eq!(interrupted_tasks.len(), 1);
-        assert_eq!(interrupted_tasks[0]["taskId"].as_str(), Some(task_id));
-        assert_eq!(interrupted_tasks[0]["activeLeaseCount"].as_i64(), Some(1));
-        let crashed_terminals = report["crashedTerminals"].as_array().unwrap();
+        assert_eq!(interrupted_tasks[0]["task_id"].as_str(), Some(task_id));
+        assert_eq!(interrupted_tasks[0]["active_lease_count"].as_i64(), Some(1));
+        let crashed_terminals = report["crashed_terminals"].as_array().unwrap();
         assert_eq!(crashed_terminals.len(), 1);
-        assert_eq!(crashed_terminals[0]["sessionId"].as_str(), Some(session_id));
-        assert_eq!(crashed_terminals[0]["taskId"].as_str(), Some(task_id));
+        assert_eq!(crashed_terminals[0]["session_id"].as_str(), Some(session_id));
+        assert_eq!(crashed_terminals[0]["task_id"].as_str(), Some(task_id));
         assert_eq!(
-            crashed_terminals[0]["cleanupReason"].as_str(),
+            crashed_terminals[0]["cleanup_reason"].as_str(),
             Some("app_crash_recovery")
         );
         assert_eq!(
-            crashed_terminals[0]["activeCrashedTask"].as_bool(),
+            crashed_terminals[0]["active_crashed_task"].as_bool(),
             Some(true)
         );
         let task = kernel
@@ -33672,10 +33526,10 @@ command = "diffforge --diff-forge-activity-hook"
             .attach_task_source_refs(
                 task_id,
                 &json!({
-                    "todoId": "todo-123",
-                    "todoDispatchId": "dispatch-123",
-                    "promptEventId": "prompt-123",
-                    "commandId": "command-123",
+                    "todo_id": "todo-123",
+                    "todo_dispatch_id": "dispatch-123",
+                    "prompt_event_id": "prompt-123",
+                    "command_id": "command-123",
                 }),
             )
             .unwrap();
@@ -33693,11 +33547,11 @@ command = "diffforge --diff-forge-activity-hook"
             .unwrap();
 
         let report = kernel.recover_crashed_terminal_sessions().unwrap();
-        let candidate = &report["interruptedTasks"][0]["crashResumeCandidate"];
+        let candidate = &report["interrupted_tasks"][0]["crash_resume_candidate"];
         assert_eq!(candidate["ok"].as_bool(), Some(true));
-        assert_eq!(candidate["todoId"].as_str(), Some("todo-123"));
+        assert_eq!(candidate["todo_id"].as_str(), Some("todo-123"));
         assert_eq!(
-            candidate["providerSessionId"].as_str(),
+            candidate["provider_session_id"].as_str(),
             Some("provider-session-123")
         );
         assert!(kernel
@@ -33737,7 +33591,7 @@ command = "diffforge --diff-forge-activity-hook"
             .is_none());
         let rearm_report = kernel.recover_crashed_terminal_sessions().unwrap();
         assert_eq!(
-            rearm_report["rearmedCrashResumeCandidates"].as_u64(),
+            rearm_report["rearmed_crash_resume_candidates"].as_u64(),
             Some(1)
         );
         let claimed = kernel
@@ -33810,28 +33664,28 @@ command = "diffforge --diff-forge-activity-hook"
             .unwrap();
         let report = kernel.recover_crashed_terminal_sessions().unwrap();
 
-        let interrupted_tasks = report["interruptedTasks"].as_array().unwrap();
+        let interrupted_tasks = report["interrupted_tasks"].as_array().unwrap();
         assert_eq!(interrupted_tasks.len(), 1);
-        assert_eq!(interrupted_tasks[0]["taskId"].as_str(), Some(task_id));
-        assert_eq!(interrupted_tasks[0]["activeLeaseCount"].as_i64(), Some(0));
+        assert_eq!(interrupted_tasks[0]["task_id"].as_str(), Some(task_id));
+        assert_eq!(interrupted_tasks[0]["active_lease_count"].as_i64(), Some(0));
         assert_eq!(
-            interrupted_tasks[0]["startupClearedLeaseCount"].as_i64(),
+            interrupted_tasks[0]["startup_cleared_lease_count"].as_i64(),
             Some(1)
         );
         assert_eq!(
-            interrupted_tasks[0]["activeWorkSignalCount"].as_i64(),
+            interrupted_tasks[0]["active_work_signal_count"].as_i64(),
             Some(1)
         );
-        let crashed_terminals = report["crashedTerminals"].as_array().unwrap();
+        let crashed_terminals = report["crashed_terminals"].as_array().unwrap();
         assert_eq!(crashed_terminals.len(), 1);
-        assert_eq!(crashed_terminals[0]["sessionId"].as_str(), Some(session_id));
-        assert_eq!(crashed_terminals[0]["taskId"].as_str(), Some(task_id));
+        assert_eq!(crashed_terminals[0]["session_id"].as_str(), Some(session_id));
+        assert_eq!(crashed_terminals[0]["task_id"].as_str(), Some(task_id));
         assert_eq!(
-            crashed_terminals[0]["startupClearedLeaseCount"].as_i64(),
+            crashed_terminals[0]["startup_cleared_lease_count"].as_i64(),
             Some(1)
         );
         assert_eq!(
-            crashed_terminals[0]["activeCrashedTask"].as_bool(),
+            crashed_terminals[0]["active_crashed_task"].as_bool(),
             Some(true)
         );
         let task = kernel
@@ -33881,11 +33735,11 @@ command = "diffforge --diff-forge-activity-hook"
             .unwrap();
         let first_id = first["id"].as_str().unwrap().to_string();
         let second_id = second["id"].as_str().unwrap().to_string();
-        let first_worktree_id = first["worktreeId"].as_str().unwrap().to_string();
-        let second_worktree_id = second["worktreeId"].as_str().unwrap().to_string();
+        let first_worktree_id = first["worktree_id"].as_str().unwrap().to_string();
+        let second_worktree_id = second["worktree_id"].as_str().unwrap().to_string();
         assert_eq!(first_id, second_id);
         assert_eq!(first_worktree_id, second_worktree_id);
-        assert_eq!(first["mcpConfigPath"], second["mcpConfigPath"]);
+        assert_eq!(first["mcp_config_path"], second["mcp_config_path"]);
         kernel
             .conn
             .execute(
@@ -34420,7 +34274,7 @@ command = "diffforge --diff-forge-activity-hook"
                 "action": "refresh",
                 "status": "succeeded",
                 "command_name": "coordination_get_snapshot",
-                "details": {"taskCount": 0}
+                "details": {"task_count": 0}
             }))
             .unwrap();
         assert_eq!(ui_log["ok"].as_bool(), Some(true));
@@ -34631,10 +34485,10 @@ command = "diffforge --diff-forge-activity-hook"
             .create_session(agent_id, None, None, true, None, None)
             .unwrap();
         let session_id = session["id"].as_str().unwrap();
-        let worktree_id = session["worktreeId"]
+        let worktree_id = session["worktree_id"]
             .as_str()
             .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
-        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let write_root = PathBuf::from(session["write_root"].as_str().unwrap());
         kernel.claim_task(task_id, agent_id, session_id).unwrap();
         fs::write(write_root.join("src.txt"), "changed\n").unwrap();
 
@@ -34669,10 +34523,10 @@ command = "diffforge --diff-forge-activity-hook"
             .create_session(agent_id, None, None, true, None, None)
             .unwrap();
         let session_id = session["id"].as_str().unwrap();
-        let worktree_id = session["worktreeId"]
+        let worktree_id = session["worktree_id"]
             .as_str()
             .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
-        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let write_root = PathBuf::from(session["write_root"].as_str().unwrap());
         kernel.claim_task(task_id, agent_id, session_id).unwrap();
 
         fs::write(write_root.join("src.txt"), "changed before lease\n").unwrap();
@@ -34760,10 +34614,10 @@ command = "diffforge --diff-forge-activity-hook"
             .create_session(agent_id, None, None, true, None, None)
             .unwrap();
         let session_id = session["id"].as_str().unwrap();
-        let worktree_id = session["worktreeId"]
+        let worktree_id = session["worktree_id"]
             .as_str()
             .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
-        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let write_root = PathBuf::from(session["write_root"].as_str().unwrap());
         let worktree = kernel
             .query_one(
                 "SELECT * FROM worktrees WHERE id=?1",
@@ -34858,10 +34712,10 @@ command = "diffforge --diff-forge-activity-hook"
             .create_session(agent_id, None, None, true, None, None)
             .unwrap();
         let session_id = session["id"].as_str().unwrap();
-        let worktree_id = session["worktreeId"]
+        let worktree_id = session["worktree_id"]
             .as_str()
             .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
-        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let write_root = PathBuf::from(session["write_root"].as_str().unwrap());
         let worktree = kernel
             .query_one(
                 "SELECT * FROM worktrees WHERE id=?1",
@@ -34952,10 +34806,10 @@ command = "diffforge --diff-forge-activity-hook"
             .create_session(agent_id, None, None, true, None, None)
             .unwrap();
         let session_id = session["id"].as_str().unwrap();
-        let worktree_id = session["worktreeId"]
+        let worktree_id = session["worktree_id"]
             .as_str()
             .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
-        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let write_root = PathBuf::from(session["write_root"].as_str().unwrap());
         let worktree = kernel
             .query_one(
                 "SELECT * FROM worktrees WHERE id=?1",
@@ -35016,10 +34870,10 @@ command = "diffforge --diff-forge-activity-hook"
             .create_session(agent_id, None, None, true, None, None)
             .unwrap();
         let session_id = session["id"].as_str().unwrap();
-        let worktree_id = session["worktreeId"]
+        let worktree_id = session["worktree_id"]
             .as_str()
             .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
-        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let write_root = PathBuf::from(session["write_root"].as_str().unwrap());
         let violation_id = kernel
             .create_workspace_violation(
                 None,
@@ -35072,10 +34926,10 @@ command = "diffforge --diff-forge-activity-hook"
             .create_session(agent_id, None, None, true, None, None)
             .unwrap();
         let session_id = session["id"].as_str().unwrap();
-        let worktree_id = session["worktreeId"]
+        let worktree_id = session["worktree_id"]
             .as_str()
             .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
-        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let write_root = PathBuf::from(session["write_root"].as_str().unwrap());
         kernel.claim_task(task_id, agent_id, session_id).unwrap();
         kernel
             .acquire_lease(
@@ -35129,10 +34983,10 @@ command = "diffforge --diff-forge-activity-hook"
             .create_session(agent_id, None, None, true, None, None)
             .unwrap();
         let session_id = session["id"].as_str().unwrap();
-        let worktree_id = session["worktreeId"]
+        let worktree_id = session["worktree_id"]
             .as_str()
             .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
-        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let write_root = PathBuf::from(session["write_root"].as_str().unwrap());
         kernel.claim_task(task_id, agent_id, session_id).unwrap();
         kernel
             .acquire_lease(
@@ -35223,10 +35077,10 @@ command = "diffforge --diff-forge-activity-hook"
             .create_session(agent_id, None, None, true, None, None)
             .unwrap();
         let session_id = session["id"].as_str().unwrap();
-        let worktree_id = session["worktreeId"]
+        let worktree_id = session["worktree_id"]
             .as_str()
             .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
-        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let write_root = PathBuf::from(session["write_root"].as_str().unwrap());
         let violation_id = create_direct_project_root_write_violation(
             &kernel,
             old_task_id,
@@ -35300,9 +35154,9 @@ command = "diffforge --diff-forge-activity-hook"
                 None,
             )
             .unwrap();
-        let old_agent_id = first["agentId"].as_str().unwrap();
+        let old_agent_id = first["agent_id"].as_str().unwrap();
         let old_session_id = first["id"].as_str().unwrap();
-        let old_worktree_id = first["worktreeId"]
+        let old_worktree_id = first["worktree_id"]
             .as_str()
             .unwrap_or_else(|| panic!("missing worktreeId in session: {first}"));
         let old_task = kernel
@@ -35334,13 +35188,13 @@ command = "diffforge --diff-forge-activity-hook"
                 None,
             )
             .unwrap();
-        let agent_id = second["agentId"].as_str().unwrap();
+        let agent_id = second["agent_id"].as_str().unwrap();
         let session_id = second["id"].as_str().unwrap();
-        let worktree_id = second["worktreeId"]
+        let worktree_id = second["worktree_id"]
             .as_str()
             .unwrap_or_else(|| panic!("missing worktreeId in session: {second}"));
         assert_eq!(worktree_id, old_worktree_id);
-        let write_root = PathBuf::from(second["writeRoot"].as_str().unwrap());
+        let write_root = PathBuf::from(second["write_root"].as_str().unwrap());
         let task = kernel
             .create_task("Recovered task", None, 0, 1, None, None, None, None)
             .unwrap();
@@ -35410,10 +35264,10 @@ command = "diffforge --diff-forge-activity-hook"
             .create_session(agent_id, None, None, true, None, None)
             .unwrap();
         let session_id = session["id"].as_str().unwrap();
-        let worktree_id = session["worktreeId"]
+        let worktree_id = session["worktree_id"]
             .as_str()
             .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
-        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let write_root = PathBuf::from(session["write_root"].as_str().unwrap());
         let violation_id = create_direct_project_root_write_violation(
             &kernel,
             old_task_id,
@@ -35480,10 +35334,10 @@ command = "diffforge --diff-forge-activity-hook"
             .create_session(agent_id, None, None, true, None, None)
             .unwrap();
         let session_id = session["id"].as_str().unwrap();
-        let worktree_id = session["worktreeId"]
+        let worktree_id = session["worktree_id"]
             .as_str()
             .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
-        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let write_root = PathBuf::from(session["write_root"].as_str().unwrap());
         let violation_id = create_direct_project_root_write_violation(
             &kernel,
             old_task_id,
@@ -35534,10 +35388,10 @@ command = "diffforge --diff-forge-activity-hook"
             .create_session(agent_id, None, None, true, None, None)
             .unwrap();
         let session_id = session["id"].as_str().unwrap();
-        let worktree_id = session["worktreeId"]
+        let worktree_id = session["worktree_id"]
             .as_str()
             .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
-        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let write_root = PathBuf::from(session["write_root"].as_str().unwrap());
         let violation_id = create_direct_project_root_write_violation(
             &kernel,
             old_task_id,
@@ -35598,9 +35452,9 @@ command = "diffforge --diff-forge-activity-hook"
                 None,
             )
             .unwrap();
-        let first_agent_id = first["agentId"].as_str().unwrap();
+        let first_agent_id = first["agent_id"].as_str().unwrap();
         let first_session_id = first["id"].as_str().unwrap();
-        let first_worktree_id = first["worktreeId"]
+        let first_worktree_id = first["worktree_id"]
             .as_str()
             .unwrap_or_else(|| panic!("missing worktreeId in session: {first}"));
         let old_task = kernel
@@ -35629,13 +35483,13 @@ command = "diffforge --diff-forge-activity-hook"
                 None,
             )
             .unwrap();
-        let agent_id = second["agentId"].as_str().unwrap();
+        let agent_id = second["agent_id"].as_str().unwrap();
         let session_id = second["id"].as_str().unwrap();
-        let worktree_id = second["worktreeId"]
+        let worktree_id = second["worktree_id"]
             .as_str()
             .unwrap_or_else(|| panic!("missing worktreeId in session: {second}"));
         assert_ne!(worktree_id, first_worktree_id);
-        let write_root = PathBuf::from(second["writeRoot"].as_str().unwrap());
+        let write_root = PathBuf::from(second["write_root"].as_str().unwrap());
         let task = kernel
             .create_task(
                 "Different worktree task",
@@ -35702,10 +35556,10 @@ command = "diffforge --diff-forge-activity-hook"
             .create_session(agent_id, None, None, true, None, None)
             .unwrap();
         let session_id = session["id"].as_str().unwrap();
-        let worktree_id = session["worktreeId"]
+        let worktree_id = session["worktree_id"]
             .as_str()
             .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
-        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let write_root = PathBuf::from(session["write_root"].as_str().unwrap());
         kernel.claim_task(task_id, agent_id, session_id).unwrap();
         kernel
             .acquire_lease(

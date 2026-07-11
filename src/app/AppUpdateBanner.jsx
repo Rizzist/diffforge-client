@@ -139,7 +139,7 @@ export default function AppUpdateBanner() {
         } else if (status?.installing) {
           setPhase("downloading");
         }
-        setAutoRestart(Boolean(status?.autoRestartWhenIdle));
+        setAutoRestart(Boolean(status?.auto_restart_when_idle));
       })
       .catch(() => {});
 
@@ -222,7 +222,7 @@ export default function AppUpdateBanner() {
   const toggleAutoRestart = useCallback((event) => {
     const enabled = Boolean(event.target.checked);
     setAutoRestart(enabled);
-    invoke("app_update_settings_update", { autoRestartWhenIdle: enabled })
+    invoke("app_update_settings_update", { auto_restart_when_idle: enabled })
       .catch(() => setAutoRestart(!enabled));
   }, []);
 

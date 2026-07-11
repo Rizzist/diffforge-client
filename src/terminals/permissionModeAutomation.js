@@ -195,7 +195,7 @@ export function findCodexPermissionPickerTarget(text = "", mode = "") {
       rows: pickerCandidates.map((row) => row.label),
       selectedIndex: -1,
       targetIndex: -1,
-      targetMode,
+      target_mode: targetMode,
     };
   }
 
@@ -227,7 +227,7 @@ export function findCodexPermissionPickerTarget(text = "", mode = "") {
     rows: pickerRows.map((row) => row.label),
     selectedIndex,
     targetIndex,
-    targetMode,
+    target_mode: targetMode,
   };
 }
 
@@ -315,7 +315,7 @@ export function codexPermissionPostSelectionState(text = "", mode = "") {
     evidenceRows: statusRows,
     matched: Boolean(targetMode && currentMode === targetMode),
     mode: currentMode,
-    targetMode,
+    target_mode: targetMode,
   };
 }
 
@@ -383,7 +383,7 @@ export async function cyclePermissionModeWithBestEffortRestore({
   cycleMode,
   maxCycleSteps = 8,
   originalMode = "",
-  targetMode = "",
+  target_mode: targetMode = "",
 } = {}) {
   const safeOriginalMode = String(originalMode || "").trim();
   const safeTargetMode = String(targetMode || "").trim();

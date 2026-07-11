@@ -34,7 +34,7 @@ test("normalizeWorkspaceProjectEntry emits the pinned snake_case row", () => {
     id: " board-1 ",
     name: " Board One ",
     path: " hardware/board-1/board-1.board.tsx ",
-    updatedAtMs: 1234.7,
+    updated_at_ms: 1234.7,
   });
   assert.deepEqual(row, {
     id: "board-1",
@@ -69,7 +69,7 @@ test("normalizeWorkspaceProjectList dedupes by path and caps at the inventory li
 
 test("buildPcbProjectInventory keeps board ids and derives missing ones", () => {
   const rows = buildPcbProjectInventory([
-    { id: "main", name: "main", path: "hardware/main/main.board.tsx", updatedAtMs: 42 },
+    { id: "main", name: "main", path: "hardware/main/main.board.tsx", updated_at_ms: 42 },
     { name: "derived", path: "hardware/derived/derived.board.tsx" },
     { name: "skipped-no-path" },
   ]);
@@ -81,7 +81,7 @@ test("buildPcbProjectInventory keeps board ids and derives missing ones", () => 
 
 test("buildVideoProjectInventory derives slug ids from project paths", () => {
   const rows = buildVideoProjectInventory([
-    { name: "Launch", path: "media/projects/launch.video.pipe", updatedAtMs: 7 },
+    { name: "Launch", path: "media/projects/launch.video.pipe", updated_at_ms: 7 },
     { name: "Legacy", path: "media/projects/legacy.video.json" },
   ]);
   assert.deepEqual(rows, [
@@ -96,12 +96,12 @@ test("findWorkspaceProjectMatch prefers path, then id, then name", () => {
     { id: "two", name: "Second", path: "media/projects/two.video.pipe" },
   ];
   assert.equal(
-    findWorkspaceProjectMatch(projects, { projectId: "one", path: "media/projects/two.video.pipe" }).id,
+    findWorkspaceProjectMatch(projects, { project_id: "one", path: "media/projects/two.video.pipe" }).id,
     "two",
   );
-  assert.equal(findWorkspaceProjectMatch(projects, { projectId: "one" }).id, "one");
-  assert.equal(findWorkspaceProjectMatch(projects, { projectId: "Second" }).id, "two");
-  assert.equal(findWorkspaceProjectMatch(projects, { projectId: "missing" }), null);
+  assert.equal(findWorkspaceProjectMatch(projects, { project_id: "one" }).id, "one");
+  assert.equal(findWorkspaceProjectMatch(projects, { project_id: "Second" }).id, "two");
+  assert.equal(findWorkspaceProjectMatch(projects, { project_id: "missing" }), null);
   assert.equal(findWorkspaceProjectMatch(projects, {}), null);
 });
 
@@ -140,12 +140,12 @@ test("validateWorkspaceProjectCommandPayload enforces create names", () => {
 });
 
 test("validateWorkspaceProjectCommandPayload requires a project reference for delete/open", () => {
-  assert.equal(validateWorkspaceProjectCommandPayload({ action: "delete", projectId: "one" }).ok, true);
+  assert.equal(validateWorkspaceProjectCommandPayload({ action: "delete", project_id: "one" }).ok, true);
   assert.equal(validateWorkspaceProjectCommandPayload({ action: "open", path: "media/projects/one.video.pipe" }).ok, true);
   const missing = validateWorkspaceProjectCommandPayload({ action: "open" });
   assert.equal(missing.ok, false);
   assert.equal(missing.reason, "missing_project_reference");
-  const unsupported = validateWorkspaceProjectCommandPayload({ action: "rename", projectId: "one" });
+  const unsupported = validateWorkspaceProjectCommandPayload({ action: "rename", project_id: "one" });
   assert.equal(unsupported.ok, false);
   assert.equal(unsupported.reason, "unsupported_action");
 });
@@ -161,7 +161,7 @@ test("validateWorkspaceProjectCommandWorkspace requires an explicit known worksp
     ok: false,
     reason: "workspace_not_found",
     workspace: null,
-    workspaceId: "",
+    workspace_id: "",
   });
 
   const unknown = validateWorkspaceProjectCommandWorkspace({
@@ -169,13 +169,13 @@ test("validateWorkspaceProjectCommandWorkspace requires an explicit known worksp
   }, workspaces);
   assert.equal(unknown.ok, false);
   assert.equal(unknown.reason, "workspace_not_found");
-  assert.equal(unknown.workspaceId, "ws-missing");
+  assert.equal(unknown.workspace_id, "ws-missing");
 
   const known = validateWorkspaceProjectCommandWorkspace({
-    workspaceId: "ws-known",
+    workspace_id: "ws-known",
   }, (workspaceId) => workspaces.find((workspace) => workspace.id === workspaceId));
   assert.equal(known.ok, true);
-  assert.equal(known.workspaceId, "ws-known");
+  assert.equal(known.workspace_id, "ws-known");
   assert.equal(known.workspace, workspaces[0]);
 });
 

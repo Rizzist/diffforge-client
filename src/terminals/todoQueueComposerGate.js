@@ -20,10 +20,10 @@ function composerSourceLooksHumanInput(source) {
 export function getTodoQueueComposerTargetAvailability(record = {}, options = {}) {
   const draftValue = String(record?.value || "");
   const source = String(record?.source || "").trim();
-  const updatedAt = String(record?.updatedAt || "").trim();
+  const updatedAt = String(record?.updated_at || "").trim();
   const updatedAtMs = Date.parse(updatedAt) || 0;
-  const nowMs = Number.isFinite(Number(options.nowMs))
-    ? Number(options.nowMs)
+  const nowMs = Number.isFinite(Number(options.now_ms))
+    ? Number(options.now_ms)
     : Date.now();
   const idleBeforeSendMs = Math.max(
     0,

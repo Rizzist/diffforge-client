@@ -35,23 +35,13 @@ function hasStructuredContent(value) {
 
 function messageKind(message = {}) {
   return transcriptToken(
-    message.kind
-      || message.canonicalKind
-      || message.canonical_kind
-      || message.messageKind
-      || message.message_kind
-      || message.type,
+    message.kind || message.canonical_kind || message.message_kind || message.type,
   );
 }
 
 function canonicalKind(message = {}) {
   return transcriptToken(
-    message.canonicalKind
-      || message.canonical_kind
-      || message.kind
-      || message.messageKind
-      || message.message_kind
-      || message.type,
+    message.canonical_kind || message.kind || message.message_kind || message.type,
   );
 }
 
@@ -69,43 +59,31 @@ function isTurnDiff(message = {}) {
 }
 
 function desktopToolFromMessage(message = {}) {
-  const existing = plainObject(message.tool || message.tool_call || message.toolCall);
+  const existing = plainObject(message.tool || message.tool_call);
   if (existing) return cloneValue(existing);
 
   const kind = canonicalKind(message);
   const role = transcriptToken(message.role);
-  const hasToolMarker = role === "activity"
-    || kind.startsWith("tool")
-    || kind === "activity"
-    || kind === "system-note"
-    || hasStructuredContent(message.toolInput)
-    || hasStructuredContent(message.tool_input)
-    || hasStructuredContent(message.toolOutput)
-    || hasStructuredContent(message.tool_output)
-    || hasStructuredContent(message.toolError)
-    || hasStructuredContent(message.tool_error)
-    || transcriptText(message.toolName || message.tool_name || message.command || message.filePath || message.file_path);
+  const hasToolMarker = role === "activity" || kind.startsWith("tool") || kind === "activity" || kind === "system-note" || hasStructuredContent(message.tool_input) || hasStructuredContent(message.tool_output) || hasStructuredContent(message.tool_error) || transcriptText(message.tool_name || message.command || message.file_path);
 
   if (!hasToolMarker || kind === "file-change" || kind === "patch" || kind === "reasoning") {
     return null;
   }
 
   const command = transcriptText(message.command);
-  const filePath = transcriptText(message.filePath || message.file_path || message.path);
+  const filePath = transcriptText(message.file_path || message.path);
   const explicitInput = firstPresent(
-    message.toolInput,
     message.tool_input,
     message.input,
     message.arguments,
     message.args,
   );
   const explicitOutput = firstPresent(
-    message.toolOutput,
     message.tool_output,
     message.output,
     message.result,
   );
-  const explicitError = firstPresent(message.toolError, message.tool_error, message.error, message.stderr);
+  const explicitError = firstPresent(message.tool_error, message.error, message.stderr);
   const input = explicitInput !== undefined
     ? explicitInput
     : command
@@ -120,17 +98,11 @@ function desktopToolFromMessage(message = {}) {
       : undefined;
 
   return {
-    durationMs: firstPresent(message.durationMs, message.duration_ms),
-    exitCode: firstPresent(message.exitCode, message.exit_code),
+    duration_ms: firstPresent(message.duration_ms),
+    exit_code: firstPresent(message.exit_code),
     input,
     name: transcriptText(
-      message.toolDisplayName
-        || message.tool_display_name
-        || message.toolName
-        || message.tool_name
-        || message.name
-        || command
-        || filePath,
+      message.tool_display_name || message.tool_name || message.name || command || filePath,
     ),
     output,
     status: transcriptText(message.status),
@@ -139,14 +111,14 @@ function desktopToolFromMessage(message = {}) {
 }
 
 function desktopFileChangeFromMessage(message = {}) {
-  const existing = plainObject(message.file_change || message.fileChange);
+  const existing = plainObject(message.file_change);
   if (existing) return cloneValue(existing);
   // turn_diff records carry per-file unified patches in `files`; they are
   // consumed by extractTurnDiffs, not the file_change detector — never
   // clone the (potentially large) patches into a synthesized file_change.
   if (isTurnDiff(message)) return null;
   const files = transcriptArray(
-    message.files || message.changed_files || message.changedFiles,
+    message.files || message.changed_files,
   );
   if (!files.length) return null;
   return {
@@ -156,38 +128,34 @@ function desktopFileChangeFromMessage(message = {}) {
 }
 
 function desktopUsageFromMessage(message = {}) {
-  const existing = plainObject(message.usage || message.usage_report || message.usageReport);
+  const existing = plainObject(message.usage || message.usage_report);
   if (existing) return cloneValue(existing);
-  const tokenUsage = plainObject(message.token_usage || message.tokenUsage);
+  const tokenUsage = plainObject(message.token_usage);
   return tokenUsage ? cloneValue(tokenUsage) : null;
 }
 
 export function normalizeDesktopTranscriptMessage(message = {}) {
   if (!message || typeof message !== "object" || Array.isArray(message)) return null;
   const next = { ...message };
-  const createdAt = firstPresent(message.createdAt, message.created_at, message.timestamp);
-  const turnId = firstPresent(message.turnId, message.turn_id);
-  const canonical = firstPresent(message.canonicalKind, message.canonical_kind);
-  const legacy = firstPresent(message.legacyKind, message.legacy_kind);
+  const createdAt = firstPresent(message.created_at, message.timestamp);
+  const turnId = firstPresent(message.turn_id);
+  const canonical = firstPresent(message.canonical_kind);
+  const legacy = firstPresent(message.legacy_kind);
   const tool = desktopToolFromMessage(message);
   const fileChange = desktopFileChangeFromMessage(message);
   const usage = desktopUsageFromMessage(message);
 
   if (createdAt !== undefined) {
-    next.createdAt = next.createdAt || createdAt;
     next.created_at = next.created_at || createdAt;
     next.timestamp = next.timestamp || createdAt;
   }
   if (turnId !== undefined) {
-    next.turnId = next.turnId || turnId;
     next.turn_id = next.turn_id || turnId;
   }
   if (canonical !== undefined) {
-    next.canonicalKind = next.canonicalKind || canonical;
     next.canonical_kind = next.canonical_kind || canonical;
   }
   if (legacy !== undefined) {
-    next.legacyKind = next.legacyKind || legacy;
     next.legacy_kind = next.legacy_kind || legacy;
   }
   if (tool && !plainObject(next.tool)) {
@@ -195,18 +163,15 @@ export function normalizeDesktopTranscriptMessage(message = {}) {
   }
   if (fileChange) {
     next.file_change = next.file_change || fileChange;
-    next.fileChange = next.fileChange || fileChange;
   }
   if (usage) {
     next.usage = next.usage || usage;
   }
-  if (message.recordId || message.record_id) {
-    next.recordId = next.recordId || message.recordId || message.record_id;
-    next.record_id = next.record_id || message.record_id || message.recordId;
+  if (message.record_id) {
+    next.record_id = next.record_id || message.record_id;
   }
-  if (message.recordSeq || message.record_seq) {
-    next.recordSeq = next.recordSeq || message.recordSeq || message.record_seq;
-    next.record_seq = next.record_seq || message.record_seq || message.recordSeq;
+  if (message.record_seq) {
+    next.record_seq = next.record_seq || message.record_seq;
   }
 
   return next;
@@ -226,7 +191,7 @@ export function buildDesktopTranscriptItems(messages = [], {
   let activityGroup = [];
 
   const messageId = (message, index) => transcriptText(message?.id, `message-${index}`);
-  const messageTurnId = (message) => transcriptText(message?.turnId || message?.turn_id);
+  const messageTurnId = (message) => transcriptText(message?.turn_id);
 
   const flushActivityGroup = () => {
     if (!activityGroup.length || !assistantBlock) return;
@@ -235,7 +200,6 @@ export function buildDesktopTranscriptItems(messages = [], {
     assistantBlock.items.push({
       id: `activity-group-${messageId(first, items.length)}-${messageId(last, activityGroup.length)}`,
       messages: activityGroup,
-      turnId: messageTurnId(first) || messageTurnId(last),
       turn_id: messageTurnId(first) || messageTurnId(last),
       type: "activity-group",
     });
@@ -251,19 +215,17 @@ export function buildDesktopTranscriptItems(messages = [], {
 
   const ensureAssistantBlock = (message, index) => {
     const turnId = messageTurnId(message);
-    if (assistantBlock?.turnId && turnId && assistantBlock.turnId !== turnId) {
+    if (assistantBlock?.turn_id && turnId && assistantBlock.turn_id !== turnId) {
       flushAssistantBlock();
     }
     if (!assistantBlock) {
       assistantBlock = {
         id: `assistant-block-${messageId(message, index)}`,
         items: [],
-        turnId,
         turn_id: turnId,
         type: "assistant-block",
       };
-    } else if (!assistantBlock.turnId && turnId) {
-      assistantBlock.turnId = turnId;
+    } else if (!assistantBlock.turn_id && turnId) {
       assistantBlock.turn_id = turnId;
     }
     return assistantBlock;
@@ -283,7 +245,6 @@ export function buildDesktopTranscriptItems(messages = [], {
       block.items.push({
         id: messageId(message, index),
         message,
-        turnId: messageTurnId(message),
         turn_id: messageTurnId(message),
         type: "message",
       });
@@ -293,7 +254,6 @@ export function buildDesktopTranscriptItems(messages = [], {
     items.push({
       id: `${itemIdPrefix}-${messageId(message, index)}`,
       message,
-      turnId: messageTurnId(message),
       turn_id: messageTurnId(message),
       type: "message",
     });
@@ -306,13 +266,12 @@ export function buildDesktopTranscriptItems(messages = [], {
 export function normalizeDesktopDiffSummary(summary = null, fallbackTurnId = "") {
   if (!summary || typeof summary !== "object" || Array.isArray(summary)) return null;
   const files = transcriptArray(summary.files).filter(Boolean);
-  if (!files.length && !Number(summary.fileCount || summary.file_count || 0)) return null;
+  if (!files.length && !Number(summary.file_count || 0)) return null;
   return {
     ...summary,
     files,
-    fileCount: Number(summary.fileCount || summary.file_count || files.length || 0) || files.length,
-    turnId: transcriptText(summary.turnId || summary.turn_id || fallbackTurnId),
-    turn_id: transcriptText(summary.turn_id || summary.turnId || fallbackTurnId),
+    file_count: Number(summary.file_count || files.length || 0) || files.length,
+    turn_id: transcriptText(summary.turn_id || fallbackTurnId),
   };
 }
 

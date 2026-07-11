@@ -3,8 +3,8 @@ export const LOOPSPACE_AUTOMATION_APP_CONTROL_MAX_TERMINALS = 3;
 function appControlRoutingDetailSources(detail = {}) {
   const event = detail?.event && typeof detail.event === "object" ? detail.event : {};
   const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
-  const dispatchSource = detail?.dispatchSource && typeof detail.dispatchSource === "object" ? detail.dispatchSource : {};
-  const dispatchTarget = detail?.dispatchTarget && typeof detail.dispatchTarget === "object" ? detail.dispatchTarget : {};
+  const dispatchSource = detail?.dispatch_source && typeof detail.dispatch_source === "object" ? detail.dispatch_source : {};
+  const dispatchTarget = detail?.dispatch_target && typeof detail.dispatch_target === "object" ? detail.dispatch_target : {};
   return [detail, event, payload, dispatchSource, dispatchTarget];
 }
 
@@ -56,7 +56,7 @@ function appControlRoutingDetailBoolean(detail = {}, keys = [], fallback = true)
 }
 
 export function remoteCommandIsMessageIntent(detail = {}) {
-  const actionKind = appControlRoutingDetailString(detail, ["action_kind", "actionKind"])
+  const actionKind = appControlRoutingDetailString(detail, ["action_kind"])
     .toLowerCase()
     .replace(/[. -]+/g, "_");
   if (actionKind === "message") {
@@ -67,7 +67,6 @@ export function remoteCommandIsMessageIntent(detail = {}) {
   }
   const commandKind = appControlRoutingDetailString(detail, [
     "command_kind",
-    "commandKind",
     "action",
     "command",
   ])
@@ -110,7 +109,6 @@ function normalizeTerminalIndexes(indexes = [], maxTerminalCount = 4) {
 export function isLoopspaceAutomationAppControlMessage(detail = {}) {
   const sourceKind = appControlRoutingDetailString(detail, [
     "source_kind",
-    "sourceKind",
     "kind",
     "cause",
   ]).toLowerCase();
@@ -124,45 +122,33 @@ export function isLoopspaceAutomationAppControlMessage(detail = {}) {
   }
 
   return Boolean(
-    appControlRoutingDetailString(detail, ["loopRuntimeRunId", "loop_runtime_run_id", "runId", "run_id"])
-      || appControlRoutingDetailString(detail, ["loopspaceId", "loopspace_id"])
-      || appControlRoutingDetailString(detail, ["triggerRunId", "trigger_run_id"]),
+    appControlRoutingDetailString(detail, ["loop_runtime_run_id", "run_id"])
+      || appControlRoutingDetailString(detail, ["loopspace_id"])
+      || appControlRoutingDetailString(detail, ["trigger_run_id"]),
   );
 }
 
 export function appControlMessageHasExplicitTerminalTarget(detail = {}) {
   return Boolean(
     appControlRoutingDetailString(detail, [
-      "targetTerminalId",
       "target_terminal_id",
-      "terminalId",
       "terminal_id",
-      "paneId",
       "pane_id",
     ])
       || Number.isInteger(appControlRoutingDetailInteger(detail, [
-        "targetTerminalIndex",
         "target_terminal_index",
-        "terminalIndex",
         "terminal_index",
       ]))
       || appControlRoutingDetailString(detail, [
-        "targetTerminalName",
         "target_terminal_name",
-        "targetTerminalNickname",
         "target_terminal_nickname",
-        "terminalName",
         "terminal_name",
-        "terminalNickname",
         "terminal_nickname",
-        "targetName",
         "target_name",
         "name",
       ])
       || appControlRoutingDetailString(detail, [
-        "targetThreadId",
         "target_thread_id",
-        "threadId",
         "thread_id",
       ]),
   );
@@ -170,18 +156,14 @@ export function appControlMessageHasExplicitTerminalTarget(detail = {}) {
 
 export function loopspaceAutomationAutoSpawnEnabled(detail = {}) {
   return appControlRoutingDetailBoolean(detail, [
-    "orchestratorAutoSpawn",
     "orchestrator_auto_spawn",
-    "autoSpawnOrchestrator",
     "auto_spawn_orchestrator",
   ], true);
 }
 
 export function getLoopspaceAutomationAutoSpawnMaxTotal(detail = {}) {
   const explicitMaxTotal = appControlRoutingDetailInteger(detail, [
-    "orchestratorAutoSpawnMaxTotal",
     "orchestrator_auto_spawn_max_total",
-    "maxAutoPoolSize",
     "max_auto_pool_size",
   ]);
   if (Number.isInteger(explicitMaxTotal)) {
@@ -189,9 +171,7 @@ export function getLoopspaceAutomationAutoSpawnMaxTotal(detail = {}) {
   }
 
   const explicitAdditional = appControlRoutingDetailInteger(detail, [
-    "orchestratorAutoSpawnMaxAdditional",
     "orchestrator_auto_spawn_max_additional",
-    "maxAdditionalOrchestrators",
     "max_additional_orchestrators",
   ]);
   if (Number.isInteger(explicitAdditional)) {
@@ -203,8 +183,8 @@ export function getLoopspaceAutomationAutoSpawnMaxTotal(detail = {}) {
 
 export function buildAppControlPromptWithAttachmentMarkers(text = "", stageResult = {}) {
   const prompt = String(text || "").trim();
-  const markerBlock = String(stageResult?.markerBlock || stageResult?.marker_block || "").trim();
-  const warningBlock = String(stageResult?.warningBlock || stageResult?.warning_block || "").trim();
+  const markerBlock = String(stageResult?.marker_block || "").trim();
+  const warningBlock = String(stageResult?.warning_block || "").trim();
   const attachmentBlock = [markerBlock, warningBlock].filter(Boolean).join("\n");
   if (!attachmentBlock) {
     return prompt;
@@ -234,7 +214,7 @@ export function buildAppControlPromptWithAttachmentMarkers(text = "", stageResul
 export function selectLoopspaceAutomationAppControlTerminal({
   indexes = [],
   rolesByIndex = {},
-  targetRole = "",
+  target_role: targetRole = "",
   preferredIndex = null,
   maxAutoTerminalCount = LOOPSPACE_AUTOMATION_APP_CONTROL_MAX_TERMINALS,
   maxTerminalCount = 4,
@@ -274,7 +254,7 @@ export function selectLoopspaceAutomationAppControlTerminal({
       maxAutoPoolSize: safeMaxAutoTerminalCount,
       orchestratorPoolSize: currentIndexes.length,
       reason: "idle_role_match",
-      terminalIndex: idleRoleMatch.index,
+      terminal_index: idleRoleMatch.index,
     };
   }
 
@@ -287,7 +267,7 @@ export function selectLoopspaceAutomationAppControlTerminal({
       maxAutoPoolSize: safeMaxAutoTerminalCount,
       orchestratorPoolSize: currentIndexes.length,
       reason: "idle_preferred",
-      terminalIndex: idlePreferred.index,
+      terminal_index: idlePreferred.index,
     };
   }
 
@@ -298,7 +278,7 @@ export function selectLoopspaceAutomationAppControlTerminal({
       maxAutoPoolSize: safeMaxAutoTerminalCount,
       orchestratorPoolSize: currentIndexes.length,
       reason: "idle_available",
-      terminalIndex: idleAny.index,
+      terminal_index: idleAny.index,
     };
   }
 
@@ -311,7 +291,7 @@ export function selectLoopspaceAutomationAppControlTerminal({
           orchestratorPoolSize: currentIndexes.length + 1,
           previousPoolSize: currentIndexes.length,
           reason: "auto_spawn_loopspace_automation",
-          terminalIndex: index,
+          terminal_index: index,
         };
       }
     }
@@ -332,6 +312,6 @@ export function selectLoopspaceAutomationAppControlTerminal({
     queueDepth: leastLoaded?.queueDepth || 0,
     reason: "least_loaded_queue",
     shouldQueue: true,
-    terminalIndex: leastLoaded?.index ?? currentIndexes[0] ?? 0,
+    terminal_index: leastLoaded?.index ?? currentIndexes[0] ?? 0,
   };
 }

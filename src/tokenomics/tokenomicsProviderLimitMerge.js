@@ -31,21 +31,12 @@ function parseLimitTimestamp(value) {
 
 function limitTimestampMs(row = {}) {
   return parseLimitTimestamp(
-    row.sample_at
-      ?? row.sampleAt
-      ?? row.sample_observed_at
-      ?? row.sampleObservedAt
-      ?? row.limit_observed_at
-      ?? row.limitObservedAt
-      ?? row.updated_at
-      ?? row.updatedAt
-      ?? row.last_known_at
-      ?? row.lastKnownAt,
+    row.sample_at ?? row.sample_observed_at ?? row.limit_observed_at ?? row.updated_at ?? row.last_known_at,
   )?.getTime() || 0;
 }
 
 function providerKey(row = {}) {
-  const agent = String(row?.agent_kind || row?.agentKind || "").toLowerCase();
+  const agent = String(row?.agent_kind || "").toLowerCase();
   const provider = String(row?.provider || "").toLowerCase();
   if (agent.includes("codex") || provider.includes("openai") || provider.includes("codex")) return "codex";
   if (agent.includes("claude") || provider.includes("anthropic") || provider.includes("claude")) return "claude";
@@ -54,14 +45,14 @@ function providerKey(row = {}) {
 }
 
 function rowDeviceId(row = {}) {
-  return String(row?.device_id || row?.deviceId || row?.machine_id || row?.machineId || "").trim();
+  return String(row?.device_id || row?.machine_id || "").trim();
 }
 
 function rowScopeKey(row = {}) {
-  const explicit = String(row?.billing_scope_key || row?.billingScopeKey || "").trim();
+  const explicit = String(row?.billing_scope_key || "").trim();
   if (explicit) return explicit;
-  const type = String(row?.billing_scope_type || row?.billingScopeType || row?.scope_type || row?.scopeType || "").trim().toLowerCase();
-  const teamId = String(row?.billing_team_id || row?.billingTeamId || row?.team_id || row?.teamId || "").trim();
+  const type = String(row?.billing_scope_type || row?.scope_type || "").trim().toLowerCase();
+  const teamId = String(row?.billing_team_id || row?.team_id || "").trim();
   if (type === "team" || teamId) return teamId ? `team:${teamId}` : "team";
   if (type === "personal") return "personal";
   return "unknown";
@@ -76,11 +67,8 @@ function normalizedLimitWindowKind(kind) {
 function hasKnownLimitPercent(limit = {}) {
   return limitNumberOrNull(
     limit.remaining_percent,
-    limit.remainingPercent,
     limit.used_percent,
-    limit.usedPercent,
     limit.limit_used_percent,
-    limit.limitUsedPercent,
   ) != null;
 }
 
@@ -91,7 +79,7 @@ function providerLimitAuthorityKey(row = {}, selectedDeviceId = "all") {
     devicePart,
     providerKey(row),
     rowProviderAccountKey(row),
-    normalizedLimitWindowKind(row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind || "provider_limit"),
+    normalizedLimitWindowKind(row?.window_kind || row?.limit_kind || "provider_limit"),
   ].join("::");
 }
 
@@ -101,7 +89,7 @@ export function providerLimitKey(row = {}) {
     rowDeviceId(row) || "unknown-device",
     providerKey(row),
     rowProviderAccountKey(row),
-    normalizedLimitWindowKind(row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind || "provider_limit"),
+    normalizedLimitWindowKind(row?.window_kind || row?.limit_kind || "provider_limit"),
   ].join("::");
 }
 
@@ -111,14 +99,14 @@ export function providerLimitSampleKey(row = {}) {
     rowDeviceId(row) || "unknown-device",
     providerKey(row),
     rowProviderAccountKey(row),
-    normalizedLimitWindowKind(row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind || "provider_limit"),
-    String(row?.sample_bucket_start || row?.sampleBucketStart || row?.bucket_start || row?.bucketStart || ""),
+    normalizedLimitWindowKind(row?.window_kind || row?.limit_kind || "provider_limit"),
+    String(row?.sample_bucket_start || row?.bucket_start || ""),
   ].join("::");
 }
 
 function providerLimitSourceRank(row = {}) {
-  const sourceKind = String(row?.limit_source_kind || row?.limitSourceKind || "").toLowerCase();
-  const source = String(row?.limit_source || row?.limitSource || "").toLowerCase();
+  const sourceKind = String(row?.limit_source_kind || "").toLowerCase();
+  const source = String(row?.limit_source || "").toLowerCase();
   const confidence = String(row?.confidence || "").toLowerCase();
   if (sourceKind.includes("cloud") || source === "cloud") return 1;
   if (confidence === "live" || source.includes("usage_api") || source.includes("statusline")) return 3;
@@ -127,9 +115,9 @@ function providerLimitSourceRank(row = {}) {
 }
 
 function providerLimitIsUnknown(row = {}) {
-  const source = String(row?.limit_source || row?.limitSource || "").toLowerCase();
+  const source = String(row?.limit_source || "").toLowerCase();
   const confidence = String(row?.confidence || "").toLowerCase();
-  const status = String(row?.status_label || row?.statusLabel || "").toLowerCase();
+  const status = String(row?.status_label || "").toLowerCase();
   const hasPercent = hasKnownLimitPercent(row);
   return source === "not_exposed"
     || source === "claude_statusline_unavailable"

@@ -14,24 +14,24 @@ import {
 
 test("notification prefs normalize defaults and canonical snake case", () => {
   const prefs = normalizeNotificationPreferences({
-    notificationPreferences: {
+    notification_preferences: {
       version: 7,
       push: {
-        uirPrompts: false,
-        loopRunStarted: true,
+        uir_prompts: false,
+        loop_run_started: true,
         loop_run_completed: false,
-        customChannel: "kept",
+        custom_channel: "kept",
       },
-      loopspaceOverrides: {
+      loopspace_overrides: {
         "loop-1": {
           started: "on",
           completed: "inherit",
           failed: "off",
           blocked: true,
-          webOnly: "kept",
+          web_only: "kept",
         },
       },
-      updatedAtMs: "42",
+      updated_at_ms: "42",
       futureTopLevel: { kept: true },
     },
   });
@@ -39,7 +39,7 @@ test("notification prefs normalize defaults and canonical snake case", () => {
   assert.equal(prefs.version, 1);
   assert.equal(prefs.updated_at_ms, 42);
   assert.deepEqual(prefs.push, {
-    customChannel: "kept",
+    custom_channel: "kept",
     uir_prompts: false,
     loop_run_started: true,
     loop_run_completed: false,
@@ -49,7 +49,7 @@ test("notification prefs normalize defaults and canonical snake case", () => {
     account_events: true,
   });
   assert.deepEqual(prefs.loopspace_overrides["loop-1"], {
-    webOnly: "kept",
+    web_only: "kept",
     started: true,
     completed: null,
     failed: false,
@@ -62,7 +62,7 @@ test("notification prefs normalize defaults and canonical snake case", () => {
 
 test("notification prefs update account push values without losing unknown keys", () => {
   const prefs = setNotificationPreferencePushValue({
-    push: { unknown: "preserve", loopRunFailed: false },
+    push: { unknown: "preserve", loop_run_failed: false },
     extra: 1,
   }, "loop_run_failed", true, 1000);
 

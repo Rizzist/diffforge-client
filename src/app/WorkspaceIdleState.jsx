@@ -60,7 +60,7 @@ export const AuthSquareBackdrop = memo(function AuthSquareBackdrop({ tone = "def
 
 export default function WorkspaceIdleState({
   actionLabel = "",
-  ariaLabel = "No workspace selected",
+  aria_label: ariaLabel = "No workspace selected",
   children = null,
   detail = "No workspace selected.",
   flameActive = true,

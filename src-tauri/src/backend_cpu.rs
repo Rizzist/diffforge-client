@@ -352,35 +352,35 @@ fn backend_cpu_attribution_snapshot_value(reset: bool) -> Value {
             json!({
                 "tag": tag,
                 "count": metric.count,
-                "cpuSampleCount": metric.cpu_sample_count,
-                "totalCpuMs": backend_cpu_ns_to_ms(metric.cpu_total_ns),
-                "totalWallMs": backend_cpu_ns_to_ms(metric.wall_total_ns),
-                "maxCpuMs": backend_cpu_ns_to_ms(metric.cpu_max_ns),
-                "maxWallMs": backend_cpu_ns_to_ms(metric.wall_max_ns),
-                "lastCpuMs": metric.cpu_last_ns.map(backend_cpu_ns_to_ms),
-                "lastWallMs": backend_cpu_ns_to_ms(metric.wall_last_ns),
-                "avgCpuMs": if metric.cpu_sample_count > 0 {
+                "cpu_sample_count": metric.cpu_sample_count,
+                "total_cpu_ms": backend_cpu_ns_to_ms(metric.cpu_total_ns),
+                "total_wall_ms": backend_cpu_ns_to_ms(metric.wall_total_ns),
+                "max_cpu_ms": backend_cpu_ns_to_ms(metric.cpu_max_ns),
+                "max_wall_ms": backend_cpu_ns_to_ms(metric.wall_max_ns),
+                "last_cpu_ms": metric.cpu_last_ns.map(backend_cpu_ns_to_ms),
+                "last_wall_ms": backend_cpu_ns_to_ms(metric.wall_last_ns),
+                "avg_cpu_ms": if metric.cpu_sample_count > 0 {
                     backend_cpu_ns_to_ms(metric.cpu_total_ns / u128::from(metric.cpu_sample_count))
                 } else {
                     0.0
                 },
-                "avgWallMs": if metric.count > 0 {
+                "avg_wall_ms": if metric.count > 0 {
                     backend_cpu_ns_to_ms(metric.wall_total_ns / u128::from(metric.count))
                 } else {
                     0.0
                 },
-                "lastFinishedMs": metric.last_finished_ms,
+                "last_finished_ms": metric.last_finished_ms,
             })
         })
         .collect::<Vec<_>>();
 
     metrics.sort_by(|left, right| {
         let left_cpu = left
-            .get("totalCpuMs")
+            .get("total_cpu_ms")
             .and_then(Value::as_f64)
             .unwrap_or_default();
         let right_cpu = right
-            .get("totalCpuMs")
+            .get("total_cpu_ms")
             .and_then(Value::as_f64)
             .unwrap_or_default();
         right_cpu
@@ -390,11 +390,11 @@ fn backend_cpu_attribution_snapshot_value(reset: bool) -> Value {
 
     let payload = json!({
         "enabled": backend_cpu_attribution_enabled(),
-        "sampledAtMs": now_ms,
-        "startedAtMs": state.started_at_ms,
+        "sampled_at_ms": now_ms,
+        "started_at_ms": state.started_at_ms,
         "pid": std::process::id(),
-        "threadCpuSupported": backend_thread_cpu_time_ns().is_some(),
-        "dumpPath": backend_cpu_attribution_dump_path().to_string_lossy().to_string(),
+        "thread_cpu_supported": backend_thread_cpu_time_ns().is_some(),
+        "dump_path": backend_cpu_attribution_dump_path().to_string_lossy().to_string(),
         "metrics": metrics,
     });
 
@@ -423,7 +423,7 @@ fn backend_cpu_attribution_dump_snapshot(reason: &str) {
     );
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn backend_cpu_attribution_snapshot(reset: Option<bool>) -> Result<Value, String> {
     Ok(backend_cpu_attribution_snapshot_value(reset.unwrap_or(false)))
 }

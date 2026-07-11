@@ -117,7 +117,7 @@ const ChipSpinner = styled.i`
 `;
 
 export default function MediaTranscriptChip({
-  localPath = "",
+  local_path: localPath = "",
   mediaName = "",
   onTranscribed = null,
 }) {
@@ -157,9 +157,9 @@ export default function MediaTranscriptChip({
     const provider = apiKey ? "deepgram" : "whisper";
     try {
       const result = await transcribeMediaAsset({
-        apiKey,
+        api_key: apiKey,
         mediaName,
-        mediaPath: localPath,
+        media_path: localPath,
         onStage: (nextStage) => {
           if (mountedRef.current) setStage(nextStage);
         },
@@ -170,7 +170,7 @@ export default function MediaTranscriptChip({
         setStatus(nextStatus);
         setStage("");
       }
-      onTranscribed?.({ localPath, ...result });
+      onTranscribed?.({ local_path: localPath, ...result });
     } catch (transcriptionError) {
       if (mountedRef.current) {
         setStage("");
@@ -203,7 +203,7 @@ export default function MediaTranscriptChip({
     return (
       <ChipRoot
         data-state="transcribed"
-        title={`Transcript attached\n${status.srtPath}\n${status.jsonPath}`}
+        title={`Transcript attached\n${status.srt_path}\n${status.json_path}`}
       >
         <ClosedCaption aria-hidden="true" />
         <span>Transcribed</span>

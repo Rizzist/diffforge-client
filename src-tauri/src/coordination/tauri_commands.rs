@@ -137,25 +137,15 @@ fn coordination_single_workspace_target(
 
 fn coordination_target_value(target: &CoordinationWorkspaceTarget) -> Value {
     json!({
-        "repoPath": crate::workspace_path_display(&target.repo_path),
         "repo_path": crate::workspace_path_display(&target.repo_path),
-        "dbPath": target.db_path.as_ref().map(|path| crate::workspace_path_display(path)),
         "db_path": target.db_path.as_ref().map(|path| crate::workspace_path_display(path)),
-        "mountId": target.mount_id,
         "mount_id": target.mount_id,
-        "projectName": target.project_name,
         "project_name": target.project_name,
-        "projectKind": target.project_kind,
         "project_kind": target.project_kind,
-        "workspaceRelativePath": target.workspace_relative_path,
         "workspace_relative_path": target.workspace_relative_path,
-        "isWorkspaceRoot": target.is_workspace_root,
         "is_workspace_root": target.is_workspace_root,
-        "hasGit": target.has_git,
         "has_git": target.has_git,
-        "hasAgents": target.has_agents,
         "has_agents": target.has_agents,
-        "hasKernelDb": target.has_kernel_db,
         "has_kernel_db": target.has_kernel_db,
     })
 }
@@ -163,7 +153,6 @@ fn coordination_target_value(target: &CoordinationWorkspaceTarget) -> Value {
 fn repo_path_from_worktree_input(input: &Value) -> Option<String> {
     let worktree_path = input["worktree_path"]
         .as_str()
-        .or_else(|| input["worktreePath"].as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
     let path = PathBuf::from(worktree_path);
@@ -214,16 +203,11 @@ fn background_mcp_job_payload(
     extra: Value,
 ) -> Value {
     json!({
-        "jobKey": job_key,
         "job_key": job_key,
-        "jobType": job_type,
         "job_type": job_type,
         "status": status,
-        "repoPath": repo_path,
         "repo_path": repo_path,
-        "workspaceId": workspace_id.unwrap_or_default(),
         "workspace_id": workspace_id.unwrap_or_default(),
-        "workspaceName": workspace_name.unwrap_or_default(),
         "workspace_name": workspace_name.unwrap_or_default(),
         "extra": extra,
     })
@@ -285,15 +269,10 @@ where
             "queued": false,
             "in_flight": true,
             "job_key": job_key,
-            "jobKey": job_key,
             "job_type": job_type,
-            "jobType": job_type,
             "repo_path": repo_path_text,
-            "repoPath": repo_path_text,
             "workspace_id": workspace_id_text,
-            "workspaceId": workspace_id_text,
             "workspace_name": workspace_name_text,
-            "workspaceName": workspace_name_text,
         }));
     }
 
@@ -358,19 +337,14 @@ where
         "queued": true,
         "in_flight": false,
         "job_key": job_key,
-        "jobKey": job_key,
         "job_type": job_type,
-        "jobType": job_type,
         "repo_path": repo_path_text,
-        "repoPath": repo_path_text,
         "workspace_id": workspace_id_text,
-        "workspaceId": workspace_id_text,
         "workspace_name": workspace_name_text,
-        "workspaceName": workspace_name_text,
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_init(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -383,7 +357,7 @@ pub fn coordination_init(
     })))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_bootstrap_workspace(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -409,43 +383,33 @@ pub fn coordination_bootstrap_workspace(
     let has_kernel_db = paths.db_path.exists();
     let has_agents_root = paths.agents_root.is_dir();
     Ok(api_ok(json!({
-        "repoPath": crate::workspace_path_display(&input_root),
         "repo_path": crate::workspace_path_display(&input_root),
-        "agentsRoot": crate::workspace_path_display(&paths.agents_root),
         "agents_root": crate::workspace_path_display(&paths.agents_root),
-        "dbPath": crate::workspace_path_display(&paths.db_path),
         "db_path": crate::workspace_path_display(&paths.db_path),
         "created": !had_kernel_db && has_kernel_db,
-        "hadAgentsRoot": had_agents_root,
         "had_agents_root": had_agents_root,
-        "hasAgentsRoot": has_agents_root,
         "has_agents_root": has_agents_root,
-        "hadKernelDb": had_kernel_db,
         "had_kernel_db": had_kernel_db,
-        "hasKernelDb": has_kernel_db,
         "has_kernel_db": has_kernel_db,
-        "gitRepository": crate::workspace_is_exact_git_root(&input_root),
         "git_repository": crate::workspace_is_exact_git_root(&input_root),
     })))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_workspace_targets(
     repo_path: Option<String>,
     db_path: Option<String>,
 ) -> Result<Value, String> {
     let target = coordination_single_workspace_target(repo_path, db_path)?;
     Ok(api_ok(json!({
-        "repoPath": crate::workspace_path_display(&target.repo_path),
         "repo_path": crate::workspace_path_display(&target.repo_path),
-        "workspaceKind": if target.has_git { "git_repo" } else { "workspace_root" },
         "workspace_kind": if target.has_git { "git_repo" } else { "workspace_root" },
         "container": false,
         "targets": [coordination_target_value(&target)],
     })))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_get_snapshot(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -453,34 +417,21 @@ pub fn coordination_get_snapshot(
     result(root_kernel(repo_path, db_path)?.get_snapshot())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_terminal_todo_plan_snapshot(
     repo_path: Option<String>,
     db_path: Option<String>,
     input: Option<Value>,
 ) -> Result<Value, String> {
     let input = input.unwrap_or_else(|| json!({}));
-    let task_id = input["task_id"]
-        .as_str()
-        .or_else(|| input["taskId"].as_str());
-    let session_id = input["session_id"]
-        .as_str()
-        .or_else(|| input["sessionId"].as_str());
-    let agent_id = input["agent_id"]
-        .as_str()
-        .or_else(|| input["agentId"].as_str());
+    let task_id = input["task_id"].as_str();
+    let session_id = input["session_id"].as_str();
+    let agent_id = input["agent_id"].as_str();
     let pane_id = input["pane_id"]
         .as_str()
-        .or_else(|| input["paneId"].as_str())
-        .or_else(|| input["terminal_id"].as_str())
-        .or_else(|| input["terminalId"].as_str());
-    let workspace_id = input["workspace_id"]
-        .as_str()
-        .or_else(|| input["workspaceId"].as_str());
-    let direct_repo_target = input["direct_repo_target"]
-        .as_bool()
-        .or_else(|| input["directRepoTarget"].as_bool())
-        .unwrap_or(false);
+        .or_else(|| input["terminal_id"].as_str());
+    let workspace_id = input["workspace_id"].as_str();
+    let direct_repo_target = input["direct_repo_target"].as_bool().unwrap_or(false);
 
     if direct_repo_target
         && repo_path
@@ -509,7 +460,7 @@ pub fn coordination_terminal_todo_plan_snapshot(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_terminal_todo_plan_edit_step_title(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -518,26 +469,19 @@ pub fn coordination_terminal_todo_plan_edit_step_title(
     let kernel = kernel(repo_path, db_path)?;
     let plan_ref = input["plan_id"]
         .as_str()
-        .or_else(|| input["planId"].as_str())
         .or_else(|| input["todo_id"].as_str())
-        .or_else(|| input["todoId"].as_str())
         .or_else(|| input["id"].as_str())
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "plan_id or todo_id is required.".to_string())?;
     let step_index = input["step_index"]
         .as_i64()
-        .or_else(|| input["stepIndex"].as_i64())
         .ok_or_else(|| "step_index is required.".to_string())?;
     let title = input["title"]
         .as_str()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "title is required.".to_string())?;
-    let agent_id = input["agent_id"]
-        .as_str()
-        .or_else(|| input["agentId"].as_str());
-    let session_id = input["session_id"]
-        .as_str()
-        .or_else(|| input["sessionId"].as_str());
+    let agent_id = input["agent_id"].as_str();
+    let session_id = input["session_id"].as_str();
     let mut response =
         kernel.edit_terminal_todo_plan_step_title(plan_ref, step_index, title, agent_id)?;
     let compact_plan = response["data"]["compact_plan"].clone();
@@ -545,18 +489,12 @@ pub fn coordination_terminal_todo_plan_edit_step_title(
         match crate::cloud_mcp_forward_terminal_todo_plan_update(
             Some(&kernel.paths.repo_path.display().to_string()),
             Some(&kernel.paths.db_path),
-            input["workspace_id"]
-                .as_str()
-                .or_else(|| input["workspaceId"].as_str()),
+            input["workspace_id"].as_str(),
             agent_id,
             session_id,
             None,
-            input["worktree_id"]
-                .as_str()
-                .or_else(|| input["worktreeId"].as_str()),
-            input["worktree_path"]
-                .as_str()
-                .or_else(|| input["worktreePath"].as_str()),
+            input["worktree_id"].as_str(),
+            input["worktree_path"].as_str(),
             "user_edited_plan_step_title",
             &compact_plan,
         ) {
@@ -572,16 +510,13 @@ pub fn coordination_terminal_todo_plan_edit_step_title(
     Ok(response)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_terminal_todo_plan_finish(
     repo_path: Option<String>,
     db_path: Option<String>,
     input: Value,
 ) -> Result<Value, String> {
-    let direct_repo_target = input["direct_repo_target"]
-        .as_bool()
-        .or_else(|| input["directRepoTarget"].as_bool())
-        .unwrap_or(false);
+    let direct_repo_target = input["direct_repo_target"].as_bool().unwrap_or(false);
     let kernel = if direct_repo_target
         && repo_path
             .as_ref()
@@ -596,21 +531,13 @@ pub fn coordination_terminal_todo_plan_finish(
     };
     let plan_ref = input["plan_id"]
         .as_str()
-        .or_else(|| input["planId"].as_str())
         .or_else(|| input["todo_id"].as_str())
-        .or_else(|| input["todoId"].as_str())
         .or_else(|| input["id"].as_str())
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "plan_id or todo_id is required.".to_string())?
         .to_string();
-    let agent_id = input["agent_id"]
-        .as_str()
-        .or_else(|| input["agentId"].as_str())
-        .map(str::to_string);
-    let session_id = input["session_id"]
-        .as_str()
-        .or_else(|| input["sessionId"].as_str())
-        .map(str::to_string);
+    let agent_id = input["agent_id"].as_str().map(str::to_string);
+    let session_id = input["session_id"].as_str().map(str::to_string);
     let finished = kernel.finish_terminal_todo_plan(
         &plan_ref,
         "completed",
@@ -640,7 +567,7 @@ pub fn coordination_terminal_todo_plan_finish(
     Ok(response)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_log_ui_surface_event(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -649,7 +576,7 @@ pub fn coordination_log_ui_surface_event(
     result(kernel(repo_path, db_path)?.log_ui_surface_event(&input))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_cleanup_bloat_dry_run(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -657,7 +584,7 @@ pub fn coordination_cleanup_bloat_dry_run(
     result(kernel(repo_path, db_path)?.cleanup_bloat_dry_run())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_start_file_watcher(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -667,7 +594,7 @@ pub fn coordination_start_file_watcher(
     result(watcher::start_file_watcher(&kernel, input))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_stop_file_watcher(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -676,7 +603,7 @@ pub fn coordination_stop_file_watcher(
     result(watcher::stop_file_watcher(&kernel))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_get_file_watcher_status(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -685,7 +612,7 @@ pub fn coordination_get_file_watcher_status(
     result(watcher::file_watcher_status(&kernel))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_get_alignment_report(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -693,7 +620,7 @@ pub fn coordination_get_alignment_report(
     result(kernel(repo_path, db_path)?.get_alignment_report())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_get_workspace_mcp_status(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -710,22 +637,19 @@ pub fn coordination_get_workspace_mcp_status(
     )
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_global_mcp_defaults_root() -> Result<Value, String> {
     let root = super::kernel::global_mcp_defaults_root_dir()
         .ok_or_else(|| "Global MCP defaults root is unavailable.".to_string())?;
     let root_display = crate::workspace_path_display(&root);
     Ok(api_ok(json!({
         "root_directory": root_display,
-        "rootDirectory": root_display,
         "workspace_id": super::kernel::GLOBAL_MCP_DEFAULTS_WORKSPACE_ID,
-        "workspaceId": super::kernel::GLOBAL_MCP_DEFAULTS_WORKSPACE_ID,
         "workspace_name": "Global defaults",
-        "workspaceName": "Global defaults",
     })))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_workspace_mcp_registry(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -742,7 +666,7 @@ pub fn coordination_workspace_mcp_registry(
     )
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_workspace_mcp_registry_background(
     app: tauri::AppHandle,
     repo_path: Option<String>,
@@ -773,7 +697,7 @@ pub fn coordination_workspace_mcp_registry_background(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_add_workspace_mcp_marketplace(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -787,7 +711,7 @@ pub fn coordination_add_workspace_mcp_marketplace(
     )
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_remove_workspace_mcp_marketplace(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -804,7 +728,7 @@ pub fn coordination_remove_workspace_mcp_marketplace(
     )
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_index_workspace_mcp_marketplace(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -821,7 +745,7 @@ pub fn coordination_index_workspace_mcp_marketplace(
     )
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_install_workspace_mcp_server(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -835,7 +759,7 @@ pub fn coordination_install_workspace_mcp_server(
     )
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_update_workspace_mcp_server(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -854,7 +778,7 @@ pub fn coordination_update_workspace_mcp_server(
     )
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_uninstall_workspace_mcp_server(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -871,7 +795,7 @@ pub fn coordination_uninstall_workspace_mcp_server(
     )
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_upsert_workspace_mcp_secret(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -889,7 +813,7 @@ pub fn coordination_upsert_workspace_mcp_secret(
     )
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_delete_workspace_mcp_secret(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -907,7 +831,7 @@ pub fn coordination_delete_workspace_mcp_secret(
     )
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_reveal_workspace_mcp_secret(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -923,7 +847,7 @@ pub fn coordination_reveal_workspace_mcp_secret(
     )
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_upsert_workspace_mcp_ssh_target(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -941,7 +865,7 @@ pub fn coordination_upsert_workspace_mcp_ssh_target(
     )
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_delete_workspace_mcp_ssh_target(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -962,7 +886,7 @@ pub fn coordination_delete_workspace_mcp_ssh_target(
     )
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_activate_shared_mcp_daemon(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -983,7 +907,7 @@ pub fn coordination_activate_shared_mcp_daemon(
     Ok(api_ok_from_data(data))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_activate_shared_mcp_daemon_background(
     app: tauri::AppHandle,
     repo_path: Option<String>,
@@ -1025,7 +949,7 @@ pub fn coordination_activate_shared_mcp_daemon_background(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_deactivate_shared_mcp_daemon(
     repo_path: Option<String>,
     reason: Option<String>,
@@ -1040,7 +964,7 @@ pub fn coordination_deactivate_shared_mcp_daemon(
     mcp::stop_shared_daemon_for_repo(input_root, reason).map(api_ok_from_data)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_stop_all_shared_mcp_daemons(reason: Option<String>) -> Result<Value, String> {
     let reason = reason
         .as_deref()
@@ -1051,7 +975,7 @@ pub fn coordination_stop_all_shared_mcp_daemons(reason: Option<String>) -> Resul
     mcp::stop_all_shared_daemons(reason).map(api_ok_from_data)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_create_session(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1103,7 +1027,7 @@ pub fn coordination_create_session(
     )
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_heartbeat_session(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1116,7 +1040,7 @@ pub fn coordination_heartbeat_session(
     )
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_acquire_lease(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1133,7 +1057,7 @@ pub fn coordination_acquire_lease(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_release_lease(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1145,7 +1069,7 @@ pub fn coordination_release_lease(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_list_events(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1154,7 +1078,7 @@ pub fn coordination_list_events(
     result(kernel(repo_path, db_path)?.list_events(limit))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_list_active_leases(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1168,7 +1092,7 @@ pub fn coordination_list_active_leases(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_list_resources(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1181,7 +1105,7 @@ pub fn coordination_list_resources(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_write_memory(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1200,7 +1124,7 @@ pub fn coordination_write_memory(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_search_memory(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1213,7 +1137,7 @@ pub fn coordination_search_memory(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_write_contract_memory(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1222,7 +1146,7 @@ pub fn coordination_write_contract_memory(
     result(kernel(repo_path, db_path)?.write_contract_memory(&input))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_write_handoff_memory(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1231,7 +1155,7 @@ pub fn coordination_write_handoff_memory(
     result(kernel(repo_path, db_path)?.write_handoff_memory(&input))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_get_repo_policy(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1243,7 +1167,7 @@ pub fn coordination_get_repo_policy(
     )
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_update_repo_policy(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1252,7 +1176,7 @@ pub fn coordination_update_repo_policy(
     result(root_kernel(repo_path, db_path)?.update_repo_policy(&input))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_create_worktree(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1269,7 +1193,7 @@ pub fn coordination_create_worktree(
     )
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_validate_patch(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1284,7 +1208,7 @@ pub fn coordination_validate_patch(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_submit_patch(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1299,7 +1223,7 @@ pub fn coordination_submit_patch(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_submit_patch_status(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1312,7 +1236,7 @@ pub fn coordination_submit_patch_status(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_worktree_diff_summary(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1321,7 +1245,7 @@ pub fn coordination_worktree_diff_summary(
     result(kernel_for_worktree_input(repo_path, db_path, &input)?.worktree_diff_summary(&input))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_undo_worktree_diff_summary(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1332,7 +1256,7 @@ pub fn coordination_undo_worktree_diff_summary(
     )
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_request_merge(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1345,7 +1269,7 @@ pub fn coordination_request_merge(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_initialize_merge_resolution(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1359,7 +1283,7 @@ pub fn coordination_initialize_merge_resolution(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_apply_merge(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1368,7 +1292,7 @@ pub fn coordination_apply_merge(
     result(kernel(repo_path, db_path)?.apply_merge(&merge_job_id))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_list_workspace_violations(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1384,7 +1308,7 @@ pub fn coordination_list_workspace_violations(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_list_workspace_changes(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1401,7 +1325,7 @@ pub fn coordination_list_workspace_changes(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_resolve_workspace_violation(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1415,7 +1339,7 @@ pub fn coordination_resolve_workspace_violation(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_db_classify_sql(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1424,7 +1348,7 @@ pub fn coordination_db_classify_sql(
     result(kernel(repo_path, db_path)?.db_classify_sql(&sql))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_db_get_mode(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1432,7 +1356,7 @@ pub fn coordination_db_get_mode(
     result(kernel(repo_path, db_path)?.db_get_mode())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_db_request_change(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1441,7 +1365,7 @@ pub fn coordination_db_request_change(
     result(kernel(repo_path, db_path)?.db_request_change(&input))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_db_list_change_requests(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1454,7 +1378,7 @@ pub fn coordination_db_list_change_requests(
     )
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_db_get_change_request(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1463,7 +1387,7 @@ pub fn coordination_db_get_change_request(
     result(kernel(repo_path, db_path)?.db_get_change_request(&db_change_request_id))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_db_request_approval(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1478,7 +1402,7 @@ pub fn coordination_db_request_approval(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_db_propose_migration(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1500,7 +1424,7 @@ pub fn coordination_db_propose_migration(
     )
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_request_approval(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1516,7 +1440,7 @@ pub fn coordination_request_approval(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_resolve_approval(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1530,7 +1454,7 @@ pub fn coordination_resolve_approval(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn coordination_scan_workspace_violations(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -1606,12 +1530,12 @@ mod tests {
 
         assert_eq!(target_data["container"].as_bool(), Some(false));
         assert_eq!(target_paths.len(), 1);
-        assert_eq!(target_paths[0]["mountId"].as_str(), Some(""));
-        assert!(target_paths[0]["isWorkspaceRoot"]
+        assert_eq!(target_paths[0]["mount_id"].as_str(), Some(""));
+        assert!(target_paths[0]["is_workspace_root"]
             .as_bool()
             .unwrap_or(false));
         assert_eq!(
-            PathBuf::from(target_paths[0]["repoPath"].as_str().unwrap_or_default())
+            PathBuf::from(target_paths[0]["repo_path"].as_str().unwrap_or_default())
                 .canonicalize()
                 .unwrap(),
             root.canonicalize().unwrap()
@@ -1638,12 +1562,12 @@ mod tests {
 
         assert_eq!(target_data["container"].as_bool(), Some(false));
         assert_eq!(target_paths.len(), 1);
-        assert_eq!(target_paths[0]["mountId"].as_str(), Some(""));
-        assert!(target_paths[0]["isWorkspaceRoot"]
+        assert_eq!(target_paths[0]["mount_id"].as_str(), Some(""));
+        assert!(target_paths[0]["is_workspace_root"]
             .as_bool()
             .unwrap_or(false));
         assert_eq!(
-            PathBuf::from(target_paths[0]["repoPath"].as_str().unwrap_or_default())
+            PathBuf::from(target_paths[0]["repo_path"].as_str().unwrap_or_default())
                 .canonicalize()
                 .unwrap(),
             root.canonicalize().unwrap()

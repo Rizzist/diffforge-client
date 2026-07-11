@@ -1,20 +1,20 @@
 {
   "name": "whisper-local-coding-policy",
-  "audioMsMinForSpeechMs": 900,
-  "captureRmsMinForSpeech": 0.01,
-  "capturePeakMinForSpeech": 0.02,
-  "suppressBrackettedMarkers": true,
-  "suppressBrackettedMarkersMaxChars": 24,
-  "noSpeechMarkers": [
+  "audio_ms_min_for_speech_ms": 900,
+  "capture_rms_min_for_speech": 0.01,
+  "capture_peak_min_for_speech": 0.02,
+  "suppress_bracketted_markers": true,
+  "suppress_bracketted_markers_max_chars": 24,
+  "no_speech_markers": [
     "[BLANK_AUDIO]",
     "[BLANK]",
     "[SILENCE]",
     "[NOISE]",
     "[MUSIC]"
   ],
-  "lowEnergySuppressedTokens": [
+  "low_energy_suppressed_tokens": [
     "you"
   ],
-  "lowEnergyMaxChars": 4,
-  "lowEnergyMaxWords": 1
+  "low_energy_max_chars": 4,
+  "low_energy_max_words": 1
 }

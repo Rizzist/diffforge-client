@@ -90,14 +90,14 @@ test("provider account helpers prefer explicit account identity", () => {
 
   assert.equal(rowProviderAccountKey(row), "openai:codex:abc123");
   assert.equal(rowProviderAccountLabel(row), "Codex account abc123");
-  assert.equal(rowProviderAccountKey({ subscriptionKey: "anthropic:claude" }), "anthropic:claude");
+  assert.equal(rowProviderAccountKey({ subscription_key: "anthropic:claude" }), "anthropic:claude");
 });
 
 test("credit wallet normalization prefers the freshest larger used total", () => {
   const normalized = normalizeCreditWallet({
-    planName: "plus",
-    termUsedCredits: 1363,
-    termRemainingCredits: 0,
+    plan_name: "plus",
+    term_used_credits: 1363,
+    term_remaining_credits: 0,
     total: {
       total_credits: 10000,
       used_credits: 9820,
@@ -107,40 +107,40 @@ test("credit wallet normalization prefers the freshest larger used total", () =>
   });
 
   assert.equal(creditSnapshotHasMeaningfulData(normalized), true);
-  assert.equal(normalized.termUsedCredits, 9820);
-  assert.equal(normalized.termRemainingCredits, 180);
-  assert.equal(normalized.termReservedCredits, 0);
-  assert.equal(formatCredits(normalized.termUsedCredits), "9,820");
+  assert.equal(normalized.term_used_credits, 9820);
+  assert.equal(normalized.term_remaining_credits, 180);
+  assert.equal(normalized.term_reserved_credits, 0);
+  assert.equal(formatCredits(normalized.term_used_credits), "9,820");
 });
 
 test("credit wallet normalization reads term and top-level aliases", () => {
   const normalized = normalizeCreditWallet({
     term: {
-      totalCredits: 10000,
-      usedCredits: 9840,
-      reservedCredits: 20,
+      total_credits: 10000,
+      used_credits: 9840,
+      reserved_credits: 20,
     },
-    remainingCredits: 140,
+    remaining_credits: 140,
   });
 
-  assert.equal(normalized.termUsedCredits, 9840);
-  assert.equal(normalized.termRemainingCredits, 140);
-  assert.equal(normalized.termReservedCredits, 20);
+  assert.equal(normalized.term_used_credits, 9840);
+  assert.equal(normalized.term_remaining_credits, 140);
+  assert.equal(normalized.term_reserved_credits, 20);
   assert.equal(creditRemainingWithReserved(normalized), 160);
 });
 
 test("credit wallet normalization derives remaining when partial aliases are stale zeroes", () => {
   const normalized = normalizeCreditWallet({
-    termUsedCredits: 1363,
-    termRemainingCredits: 0,
-    termReservedCredits: 0,
-    termTotalCredits: 10000,
-    localMeteredUsedCredits: 9840,
+    term_used_credits: 1363,
+    term_remaining_credits: 0,
+    term_reserved_credits: 0,
+    term_total_credits: 10000,
+    local_metered_used_credits: 9840,
   });
 
-  assert.equal(normalized.termUsedCredits, 9840);
-  assert.equal(normalized.termRemainingCredits, 160);
-  assert.equal(normalized.termReservedCredits, 0);
+  assert.equal(normalized.term_used_credits, 9840);
+  assert.equal(normalized.term_remaining_credits, 160);
+  assert.equal(normalized.term_reserved_credits, 0);
 });
 
 test("credit wallet normalization does not carry larger used total across term resets", () => {
@@ -153,57 +153,57 @@ test("credit wallet normalization does not carry larger used total across term r
       reserved_credits: 0,
     },
   }, {
-    termId: "term-previous",
-    termUsedCredits: 9840,
-    termRemainingCredits: 160,
-    termReservedCredits: 0,
-    termTotalCredits: 10000,
+    term_id: "term-previous",
+    term_used_credits: 9840,
+    term_remaining_credits: 160,
+    term_reserved_credits: 0,
+    term_total_credits: 10000,
   });
 
-  assert.equal(normalized.termId, "term-next");
-  assert.equal(normalized.termUsedCredits, 20);
-  assert.equal(normalized.termRemainingCredits, 9980);
+  assert.equal(normalized.term_id, "term-next");
+  assert.equal(normalized.term_used_credits, 20);
+  assert.equal(normalized.term_remaining_credits, 9980);
 });
 
 test("credit wallet normalization does not let unknown zero snapshots wipe same-term paid usage", () => {
   const normalized = normalizeCreditWallet({
     known: false,
-    termTotalCredits: 0,
-    termUsedCredits: 0,
-    termRemainingCredits: 0,
-    termReservedCredits: 0,
+    term_total_credits: 0,
+    term_used_credits: 0,
+    term_remaining_credits: 0,
+    term_reserved_credits: 0,
   }, {
-    planName: "plus",
-    termId: "term-current",
-    termTotalCredits: 10000,
-    termUsedCredits: 9700,
-    termRemainingCredits: 300,
-    termReservedCredits: 0,
+    plan_name: "plus",
+    term_id: "term-current",
+    term_total_credits: 10000,
+    term_used_credits: 9700,
+    term_remaining_credits: 300,
+    term_reserved_credits: 0,
   });
 
-  assert.equal(normalized.planName, "plus");
-  assert.equal(normalized.termTotalCredits, 10000);
-  assert.equal(normalized.termUsedCredits, 9700);
-  assert.equal(normalized.termRemainingCredits, 300);
+  assert.equal(normalized.plan_name, "plus");
+  assert.equal(normalized.term_total_credits, 10000);
+  assert.equal(normalized.term_used_credits, 9700);
+  assert.equal(normalized.term_remaining_credits, 300);
 });
 
 test("credit wallet normalization can let live websocket totals replace stale auth credits", () => {
   const normalized = normalizeCreditWallet({
     known: true,
     live: true,
-    planName: "plus",
-    termTotalCredits: 10000,
-    termUsedCredits: 9000,
-    termRemainingCredits: 1000,
+    plan_name: "plus",
+    term_total_credits: 10000,
+    term_used_credits: 9000,
+    term_remaining_credits: 1000,
   }, {
-    planName: "plus",
-    termTotalCredits: 10000,
-    termUsedCredits: 7642,
-    termRemainingCredits: 2358,
+    plan_name: "plus",
+    term_total_credits: 10000,
+    term_used_credits: 7642,
+    term_remaining_credits: 2358,
   }, {
     preferIncomingTotals: true,
   });
 
-  assert.equal(normalized.termUsedCredits, 9000);
-  assert.equal(normalized.termRemainingCredits, 1000);
+  assert.equal(normalized.term_used_credits, 9000);
+  assert.equal(normalized.term_remaining_credits, 1000);
 });

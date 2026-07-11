@@ -1,5 +1,5 @@
 const terminalMetricsState = {
-  terminalCount: 0,
+  terminal_count: 0,
   ipcEvents: 0,
   ipcBytes: 0,
   outputLagMs: 0,

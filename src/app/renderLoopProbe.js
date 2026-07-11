@@ -25,9 +25,9 @@ function renderProbeComponentName(fiber) {
     return "";
   }
   return (
-    type.displayName
+    type.display_name
     || type.name
-    || type.render?.displayName
+    || type.render?.display_name
     || type.render?.name
     || (typeof type === "symbol" ? String(type) : "")
     || ""
@@ -173,15 +173,15 @@ export function installRenderLoopProbe() {
     try {
       fields = {
         commitsPerWindow: delta,
-        stormWindows,
+        storm_windows: stormWindows,
         totalCommits: commits,
-        windowMs: RENDER_PROBE_INTERVAL_MS,
+        window_ms: RENDER_PROBE_INTERVAL_MS,
         ...renderProbeCollect(lastRoot),
       };
     } catch (error) {
       fields = {
         commitsPerWindow: delta,
-        stormWindows,
+        storm_windows: stormWindows,
         error: String(error?.message || error),
       };
     }

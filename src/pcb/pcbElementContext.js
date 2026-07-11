@@ -561,7 +561,7 @@ function resolveCircuitElement(pick, index) {
 export function resolvePcbPickedElementContext(pick, {
   circuitJson,
   source,
-  boardPath,
+  board_path: boardPath,
   boardTitle,
 } = {}) {
   if (!pick || typeof pick !== "object") {

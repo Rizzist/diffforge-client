@@ -7,37 +7,37 @@ import {
 
 test("casual provider turn completions do not reconcile coordination", () => {
   assert.equal(shouldReconcileProviderTurnCompletion({
-    paneId: "workspace-terminal-1",
-    providerTurnIntent: "casual_message",
-    reconcileCoordination: false,
+    pane_id: "workspace-terminal-1",
+    provider_turn_intent: "casual_message",
+    reconcile_coordination: false,
     type: "provider-turn-completed",
   }), false);
 });
 
 test("provider turn completion reconciliation requires explicit opt-in", () => {
   assert.equal(shouldReconcileProviderTurnCompletion({
-    paneId: "workspace-terminal-1",
-    providerTurnIntent: "coordination_task",
+    pane_id: "workspace-terminal-1",
+    provider_turn_intent: "coordination_task",
     type: "provider-turn-completed",
   }), false);
 
   assert.equal(shouldReconcileProviderTurnCompletion({
-    paneId: "workspace-terminal-1",
-    providerTurnIntent: "coordination_task",
-    reconcileCoordination: true,
+    pane_id: "workspace-terminal-1",
+    provider_turn_intent: "coordination_task",
+    reconcile_coordination: true,
     type: "provider-turn-completed",
   }), true);
 });
 
 test("provider turn completion reconciliation requires a terminal pane", () => {
   assert.equal(shouldReconcileProviderTurnCompletion({
-    providerTurnIntent: "coordination_task",
-    reconcileCoordination: true,
+    provider_turn_intent: "coordination_task",
+    reconcile_coordination: true,
     type: "provider-turn-completed",
   }), false);
 });
 
 test("provider turn intent defaults to casual message", () => {
   assert.equal(getProviderTurnCompletionIntent({}), "casual_message");
-  assert.equal(getProviderTurnCompletionIntent({ providerTurnIntent: "  " }), "casual_message");
+  assert.equal(getProviderTurnCompletionIntent({ provider_turn_intent: "  " }), "casual_message");
 });

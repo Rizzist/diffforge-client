@@ -127,14 +127,14 @@ export function terminalActivityStatusIsSendable(activityStatus) {
 }
 
 export function workspaceTerminalStatusFromActivityStatus(activityStatus, options = {}) {
-  const terminalLifecycle = normalizeActivityText(options.terminalLifecycle, "");
+  const terminalLifecycle = normalizeActivityText(options.terminal_lifecycle, "");
   const liveStatus = normalizeActivityText(options.liveStatus, "");
   if (terminalLifecycle === "closed" || liveStatus === "closed") return "closed";
   if (terminalLifecycle === "closing" || liveStatus === "closing") return "closing";
   if (terminalLifecycle === "exited" || liveStatus === "exited") return "closed";
   if (terminalLifecycle === "offline" || liveStatus === "offline") return "offline";
-  if (options.terminalIsParked) return "paused";
-  if (options.terminalIsPromptingUser) return "awaiting_input";
+  if (options.terminal_is_parked) return "paused";
+  if (options.terminal_is_prompting_user) return "awaiting_input";
   return terminalRailStateFromActivityStatus(activityStatus, options.fallbackStatus || "idle");
 }
 
@@ -162,10 +162,10 @@ export function terminalTurnStatusFromActivityStatus(activityStatus, status = ""
 }
 
 export function terminalCommandPhaseFromLifecycleEvent(eventType, fields = {}) {
-  const explicit = normalizeActivityText(fields.commandPhase || fields.command_phase, "");
+  const explicit = normalizeActivityText(fields.command_phase, "");
   if (explicit) return explicit;
 
-  const type = normalizeActivityText(eventType || fields.eventType || fields.type, "");
+  const type = normalizeActivityText(eventType || fields.event_type || fields.type, "");
   if (type === "remote_command_queued" || type === "remote-command-queued") return "queued";
   if (type === "pending_prompt_sent" || type === "pending-prompt-sent") return "submitted";
   if (type === "message_submitted" || type === "message-submitted") return "input_written";
@@ -183,20 +183,16 @@ export function terminalCommandPhaseFromLifecycleEvent(eventType, fields = {}) {
 }
 
 export function terminalExecutionPhaseFromState(fields = {}) {
-  const eventType = normalizeActivityText(fields.eventType || fields.type, "");
-  const commandPhase = normalizeActivityText(fields.commandPhase || fields.command_phase, "");
+  const eventType = normalizeActivityText(fields.event_type || fields.type, "");
+  const commandPhase = normalizeActivityText(fields.command_phase, "");
   const activity = normalizeActivityText(
-    fields.activityStatus
-      || fields.activity_status
-      || fields.nativeRailState
-      || fields.native_rail_state
-      || fields.status,
+    fields.activity_status || fields.native_rail_state || fields.status,
     "",
   );
-  const status = normalizeActivityText(fields.status || fields.statusAfter || fields.status_after, "");
-  const readiness = normalizeActivityText(fields.readiness || fields.readinessAfter || fields.readiness_after, "");
-  const turn = normalizeActivityText(fields.turnStatus || fields.turn_status, "");
-  const lifecycle = normalizeActivityText(fields.terminalLifecycle || fields.terminal_lifecycle, "");
+  const status = normalizeActivityText(fields.status || fields.status_after, "");
+  const readiness = normalizeActivityText(fields.readiness || fields.readiness_after, "");
+  const turn = normalizeActivityText(fields.turn_status, "");
+  const lifecycle = normalizeActivityText(fields.terminal_lifecycle, "");
 
   if (lifecycle === "offline" || activity === "offline" || status === "offline") return "offline";
   if (lifecycle === "exited" || activity === "exited" || status === "exited") return "exited";
@@ -265,13 +261,13 @@ export function terminalRailStateFromExecutionPhase(executionPhase, fallback = "
 }
 
 export function shouldSuppressThreadPropThinking({
-  latestTurn = null,
+  latest_turn: latestTurn = null,
   lastReadyAtMs = 0,
   nextStatus = "",
   previousStatus = "",
   source = "",
   submittedPrompt = null,
-  threadId = "",
+  thread_id: threadId = "",
 } = {}) {
   const normalizedSource = String(source || "").trim().toLowerCase();
   const normalizedNext = String(nextStatus || "").trim().toLowerCase();
@@ -284,16 +280,16 @@ export function shouldSuppressThreadPropThinking({
   }
 
   const safeThreadId = String(threadId || "").trim();
-  const submittedPromptThread = String(submittedPrompt?.threadId || "").trim();
+  const submittedPromptThread = String(submittedPrompt?.thread_id || "").trim();
   if (submittedPrompt && (!safeThreadId || submittedPromptThread === safeThreadId)) {
     return false;
   }
   const latestTurnState = String(latestTurn?.state || latestTurn?.status || "").trim().toLowerCase();
   const turnStartedAtMs = parseTerminalStateTimestampMs(
-    latestTurn?.startedAt
-      || latestTurn?.requestedAt
-      || latestTurn?.createdAt
-      || latestTurn?.updatedAt
+    latestTurn?.started_at
+      || latestTurn?.requested_at
+      || latestTurn?.created_at
+      || latestTurn?.updated_at
       || "",
   );
   const safeLastReadyAtMs = Number(lastReadyAtMs || 0);

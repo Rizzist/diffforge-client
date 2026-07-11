@@ -15,99 +15,99 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 test("observed input gate submit is authoritative only when the prompt matches", () => {
   assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({
-    observedPrompt: "what else is there",
-    promptMatch: true,
-    promptSource: "observed_input_gate",
+    observed_prompt: "what else is there",
+    prompt_match: true,
+    prompt_source: "observed_input_gate",
   }), true);
 
   assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({
-    observedPrompt: "different prompt",
-    promptMatch: false,
-    promptSource: "observed_input_gate",
+    observed_prompt: "different prompt",
+    prompt_match: false,
+    prompt_source: "observed_input_gate",
   }), false);
 });
 
 test("frontend prompt metadata cannot prove submission by itself", () => {
   assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({
-    expectedPrompt: "what else is there",
+    expected_prompt: "what else is there",
     prompt: "what else is there",
-    promptMatch: false,
-    promptSource: "prompt_event_text_unobserved",
+    prompt_match: false,
+    prompt_source: "prompt_event_text_unobserved",
   }), false);
 
   assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({
-    expectedPrompt: "what else is there",
+    expected_prompt: "what else is there",
     prompt: "what else is there",
-    promptMatch: true,
-    promptSource: "prompt_event_text_unobserved",
+    prompt_match: true,
+    prompt_source: "prompt_event_text_unobserved",
   }), false);
 });
 
 test("backend prompt metadata submit is not authoritative by itself", () => {
   assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({
-    expectedPrompt: "what else is there",
+    expected_prompt: "what else is there",
     prompt: "what else is there",
-    promptMatch: true,
-    promptSource: "prompt_event_submit_metadata",
+    prompt_match: true,
+    prompt_source: "prompt_event_submit_metadata",
   }), false);
 
   assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({
-    expectedPrompt: "what else is there",
+    expected_prompt: "what else is there",
     prompt: "",
-    promptMatch: true,
-    promptSource: "prompt_event_submit_metadata",
+    prompt_match: true,
+    prompt_source: "prompt_event_submit_metadata",
   }), false);
 
   assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({
-    promptMatch: true,
-    promptSource: "prompt_event_submit_metadata",
+    prompt_match: true,
+    prompt_source: "prompt_event_submit_metadata",
   }), false);
 
   assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({
-    expectedPrompt: "what else is there",
+    expected_prompt: "what else is there",
     prompt: "different prompt",
-    promptMatch: false,
-    promptSource: "prompt_event_submit_metadata",
+    prompt_match: false,
+    prompt_source: "prompt_event_submit_metadata",
   }), false);
 });
 
 test("parked resume backend submit remains authoritative", () => {
   assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({
-    expectedPrompt: "continue",
-    observedPrompt: "continue",
-    promptMatch: true,
-    promptSource: "parked_resume_backend_submit",
+    expected_prompt: "continue",
+    observed_prompt: "continue",
+    prompt_match: true,
+    prompt_source: "parked_resume_backend_submit",
   }), true);
 });
 
 test("crash todo resume backend submit remains authoritative", () => {
   assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({
-    expectedPrompt: "continue after crash",
-    observedPrompt: "continue after crash",
-    promptMatch: true,
-    promptSource: "crash_todo_resume_backend_submit",
+    expected_prompt: "continue after crash",
+    observed_prompt: "continue after crash",
+    prompt_match: true,
+    prompt_source: "crash_todo_resume_backend_submit",
   }), true);
 });
 
 test("activity hook user prompt submit is authoritative", () => {
   assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({
     prompt: "ship it",
-    promptMatch: true,
-    promptSource: "activity_hook_user_prompt_submit",
+    prompt_match: true,
+    prompt_source: "activity_hook_user_prompt_submit",
   }), true);
 
   assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({
     prompt: "ship it",
-    promptMatch: true,
-    promptSource: "cli_hook_user_prompt_submit",
+    prompt_match: true,
+    prompt_source: "cli_hook_user_prompt_submit",
   }), true);
 });
 
 test("backend todo queue submit remains authoritative", () => {
   assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({
-    expectedPrompt: "fix the drag/drop bug",
-    promptMatch: true,
-    promptSource: "todo_queue_backend_submit",
+    expected_prompt: "fix the drag/drop bug",
+    prompt_match: true,
+    prompt_source: "todo_queue_backend_submit",
   }), true);
 });
 

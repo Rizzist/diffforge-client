@@ -239,7 +239,7 @@ fn voice_rule_default_enabled() -> bool {
 /// dictation backend: Deepgram keyterms (own key and via the cloud start
 /// frame) and the local Whisper glossary prompt.
 #[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(default)]
 struct VoiceDictionaryList {
     id: String,
     name: String,
@@ -268,7 +268,7 @@ impl Default for VoiceDictionaryList {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(default)]
 struct VoiceSnippetEntry {
     id: String,
     trigger: String,
@@ -289,7 +289,7 @@ impl Default for VoiceSnippetEntry {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(default)]
 struct VoiceTransformEntry {
     id: String,
     #[serde(rename = "match")]
@@ -313,7 +313,7 @@ impl Default for VoiceTransformEntry {
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(default)]
 struct VoiceTextRules {
     dictionary: Vec<VoiceDictionaryList>,
     snippets: Vec<VoiceSnippetEntry>,
@@ -516,6 +516,33 @@ fn normalize_voice_text_rules(rules: VoiceTextRules) -> VoiceTextRules {
     }
 }
 
+fn voice_text_rules_map_persisted_keys(value: Value, to_runtime: bool) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| voice_text_rules_map_persisted_keys(item, to_runtime))
+                .collect(),
+        ),
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .map(|(key, item)| {
+                    let mapped = if to_runtime && key == "isRegex" {
+                        "is_regex".to_string()
+                    } else if !to_runtime && key == "is_regex" {
+                        "isRegex".to_string()
+                    } else {
+                        key
+                    };
+                    (mapped, voice_text_rules_map_persisted_keys(item, to_runtime))
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 fn read_voice_text_rules(app: &AppHandle) -> VoiceTextRules {
     let Ok(path) = voice_text_rules_path(app) else {
         return normalize_voice_text_rules(VoiceTextRules::default());
@@ -525,7 +552,9 @@ fn read_voice_text_rules(app: &AppHandle) -> VoiceTextRules {
         return normalize_voice_text_rules(VoiceTextRules::default());
     };
 
-    serde_json::from_str::<VoiceTextRules>(&contents)
+    serde_json::from_str::<Value>(&contents)
+        .map(|value| voice_text_rules_map_persisted_keys(value, true))
+        .and_then(serde_json::from_value::<VoiceTextRules>)
         .map(normalize_voice_text_rules)
         .unwrap_or_else(|_| normalize_voice_text_rules(VoiceTextRules::default()))
 }
@@ -537,7 +566,10 @@ fn write_voice_text_rules(app: &AppHandle, rules: &VoiceTextRules) -> Result<(),
             .map_err(|error| format!("Unable to save voice text rules: {error}"))?;
     }
 
-    let contents = serde_json::to_string_pretty(rules)
+    let persisted = serde_json::to_value(rules)
+        .map(|value| voice_text_rules_map_persisted_keys(value, false))
+        .map_err(|error| format!("Unable to save voice text rules: {error}"))?;
+    let contents = serde_json::to_string_pretty(&persisted)
         .map_err(|error| format!("Unable to save voice text rules: {error}"))?;
 
     if contents.len() > VOICE_TEXT_RULES_MAX_TOTAL_BYTES {
@@ -648,12 +680,12 @@ fn percent_encode_query_component(value: &str) -> String {
     encoded
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn voice_text_rules_get(app: AppHandle) -> Result<VoiceTextRules, String> {
     Ok(read_voice_text_rules(&app))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn voice_text_rules_set(
     app: AppHandle,
     rules: VoiceTextRules,

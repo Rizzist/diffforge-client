@@ -323,7 +323,7 @@ const ChooserCancelButton = styled.button`
 `;
 
 // Inline chooser shown in an empty panel: create a new design or open one.
-function PcbSlotChooser({ available, busy, repoPath, onCreate, onSelect, onClose }) {
+function PcbSlotChooser({ available, busy, repo_path: repoPath, onCreate, onSelect, onClose }) {
   const [creating, setCreating] = useState(false);
   const [draftName, setDraftName] = useState("blinky");
   const inputRef = useRef(null);
@@ -414,7 +414,7 @@ function PcbSlotChooser({ available, busy, repoPath, onCreate, onSelect, onClose
   );
 }
 
-export default function PcbView({ workspace, rootDirectory, initialPanelCount = 0 }) {
+export default function PcbView({ workspace, root_directory: rootDirectory, initialPanelCount = 0 }) {
   const repoPath = rootDirectory || "";
   const workspaceId = workspace?.id || "";
   const [slots, setSlots] = useState([]);
@@ -436,7 +436,7 @@ export default function PcbView({ workspace, rootDirectory, initialPanelCount = 
     if (!repoPath) {
       return;
     }
-    invoke("pcb_documents_list", { repoPath, workspaceId })
+    invoke("pcb_documents_list", { repo_path: repoPath, workspace_id: workspaceId })
       .then((result) => setAvailable(Array.isArray(result?.boards) ? result.boards : []))
       .catch((err) => setError(String(err)));
   }, [repoPath, workspaceId]);
@@ -446,7 +446,7 @@ export default function PcbView({ workspace, rootDirectory, initialPanelCount = 
     if (!repoPath) {
       return;
     }
-    invoke("pcb_watch_start", { repoPath }).catch(() => {});
+    invoke("pcb_watch_start", { repo_path: repoPath }).catch(() => {});
     refreshList();
   }, [repoPath, refreshList]);
 
@@ -460,8 +460,8 @@ export default function PcbView({ workspace, rootDirectory, initialPanelCount = 
       if (disposed) {
         return;
       }
-      const eventRepo = normalizeRepoIdentity(event?.payload?.repoPath);
-      const eventWorkspace = String(event?.payload?.workspaceId || event?.payload?.workspace_id || "").trim();
+      const eventRepo = normalizeRepoIdentity(event?.payload?.repo_path);
+      const eventWorkspace = String(event?.payload?.workspace_id || "").trim();
       if (eventRepo && eventRepo !== normalizeRepoIdentity(repoPath)) {
         return;
       }
@@ -540,7 +540,7 @@ export default function PcbView({ workspace, rootDirectory, initialPanelCount = 
       }
       setBusy(true);
       setError("");
-      return invoke("pcb_document_create", { repoPath, name, workspaceId })
+      return invoke("pcb_document_create", { repo_path: repoPath, name, workspace_id: workspaceId })
         .then((doc) => {
           if (doc?.path) {
             bindSlot(key, { path: doc.path, name: doc.name });
@@ -562,10 +562,10 @@ export default function PcbView({ workspace, rootDirectory, initialPanelCount = 
         return;
       }
       invoke("pcb_window_open", {
-        repoPath,
-        boardPath: board.path,
-        boardName: board.name || board.path,
-        workspaceId,
+        repo_path: repoPath,
+        board_path: board.path,
+        board_name: board.name || board.path,
+        workspace_id: workspaceId,
       }).catch((err) => setError(String(err)));
     },
     [repoPath, workspaceId],
@@ -610,12 +610,12 @@ export default function PcbView({ workspace, rootDirectory, initialPanelCount = 
                   {slot.path ? (
                     <PcbPanel
                       board={{ path: slot.path, name: boardName(slot.path) }}
-                      isActive={activeKey === slot.key}
+                      is_active={activeKey === slot.key}
                       onActivate={() => setActiveKey(slot.key)}
                       onClose={() => closeSlot(slot.key)}
                       onPopOut={popOut}
-                      repoPath={repoPath}
-                      workspaceId={workspaceId}
+                      repo_path={repoPath}
+                      workspace_id={workspaceId}
                     />
                   ) : (
                     <PcbSlotChooser
@@ -624,7 +624,7 @@ export default function PcbView({ workspace, rootDirectory, initialPanelCount = 
                       onClose={slots.length > 1 ? () => closeSlot(slot.key) : null}
                       onCreate={(name) => createInSlot(slot.key, name)}
                       onSelect={(board) => bindSlot(slot.key, board)}
-                      repoPath={repoPath}
+                      repo_path={repoPath}
                     />
                   )}
                 </PanelSlot>

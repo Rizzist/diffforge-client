@@ -407,31 +407,14 @@ function numberValue(value, fallback = 0) {
 }
 
 function snipAssetId(asset) {
-  return text(asset?.assetId || asset?.asset_id || asset?.id);
+  return text(asset?.asset_id || asset?.id);
 }
 
 function snipAssetLooksLikeAsset(row) {
   if (!jsonObject(row) || !snipAssetId(row)) return false;
-  if (snipTransferDirection(row) || text(row?.transferId || row?.transfer_id)) return false;
+  if (snipTransferDirection(row) || text(row?.transfer_id)) return false;
   return Boolean(
-    assetLocalPath(row)
-      || row?.localAvailable != null
-      || row?.local_available != null
-      || row?.cloudAvailable != null
-      || row?.cloud_available != null
-      || row?.clouds
-      || row?.cloudStatuses
-      || row?.cloud_statuses
-      || row?.publicUrl
-      || row?.public_url
-      || row?.publicLink
-      || row?.public_link
-      || row?.blobId
-      || row?.blob_id
-      || row?.kind
-      || row?.mimeType
-      || row?.mime_type
-      || row?.name
+    assetLocalPath(row) || row?.local_available != null || row?.cloud_available != null || row?.clouds || row?.cloud_statuses || row?.public_url || row?.public_link || row?.blob_id || row?.kind || row?.mime_type || row?.name
   );
 }
 
@@ -486,26 +469,26 @@ function collectSnipTransferRows(value) {
 }
 
 function snipTransferAssetId(transfer) {
-  return text(transfer?.assetId || transfer?.asset_id);
+  return text(transfer?.asset_id);
 }
 
 function snipTransferDirection(transfer) {
-  const direction = text(transfer?.direction || transfer?.transferDirection || transfer?.transfer_direction).toLowerCase();
+  const direction = text(transfer?.direction || transfer?.transfer_direction).toLowerCase();
   if (direction.includes("upload")) return "upload";
   if (direction.includes("download")) return "download";
   return "";
 }
 
 function snipTransferUpdatedAt(transfer) {
-  const timestamp = Date.parse(text(transfer?.updatedAt || transfer?.updated_at || transfer?.createdAt || transfer?.created_at));
+  const timestamp = Date.parse(text(transfer?.updated_at || transfer?.created_at));
   return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
 function snipTransferPercent(transfer) {
-  const status = text(transfer?.status || transfer?.transferStatus || transfer?.transfer_status).toLowerCase();
+  const status = text(transfer?.status || transfer?.transfer_status).toLowerCase();
   if (status === "completed") return 100;
-  const total = numberValue(transfer?.bytesTotal ?? transfer?.bytes_total, 0);
-  const done = numberValue(transfer?.bytesDone ?? transfer?.bytes_done, 0);
+  const total = numberValue(transfer?.bytes_total, 0);
+  const done = numberValue(transfer?.bytes_done, 0);
   if (total <= 0) return null;
   if (done <= 0) return null;
   return Math.max(0, Math.min(100, Math.round((done / total) * 100)));
@@ -513,38 +496,28 @@ function snipTransferPercent(transfer) {
 
 function snipUploadEventPaths(payload) {
   return [
-    payload?.localPath,
     payload?.local_path,
     payload?.path,
-    payload?.sourcePath,
     payload?.source_path,
-    payload?.originalPath,
     payload?.original_path,
-    payload?.editedPath,
     payload?.edited_path,
-    payload?.targetPath,
     payload?.target_path,
   ].map((value) => text(value)).filter(Boolean);
 }
 
 function assetLocalPath(asset) {
-  return text(asset?.localPath || asset?.local_path || asset?.path);
+  return text(asset?.local_path || asset?.path);
 }
 
 function snipAssetPublicUrl(asset) {
-  const publicLink = jsonObject(asset?.publicLink || asset?.public_link);
+  const publicLink = jsonObject(asset?.public_link);
   return text(
-    asset?.publicUrl
-      || asset?.public_url
-      || publicLink?.publicUrl
-      || publicLink?.public_url
-      || publicLink?.url,
+    asset?.public_url || publicLink?.public_url || publicLink?.url,
   );
 }
 
 function snipAssetCloudState(asset) {
   const maps = [
-    jsonObject(asset?.cloudStatusByCloud),
     jsonObject(asset?.cloud_status_by_cloud),
   ].filter(Boolean);
   for (const map of maps) {
@@ -553,7 +526,6 @@ function snipAssetCloudState(asset) {
   }
   return [
     ...jsonArray(asset?.clouds),
-    ...jsonArray(asset?.cloudStatuses),
     ...jsonArray(asset?.cloud_statuses),
   ].find(Boolean) || null;
 }
@@ -565,16 +537,16 @@ function snipCloudStatusToken(value) {
 function snipAssetCloudAvailable(asset) {
   const cloudState = snipAssetCloudState(asset);
   if (cloudState) {
-    const explicit = cloudState.cloudAvailable ?? cloudState.cloud_available;
+    const explicit = cloudState.cloud_available;
     if (typeof explicit === "boolean") return explicit;
-    const status = snipCloudStatusToken(cloudState.cloudStatus || cloudState.cloud_status || cloudState.status);
+    const status = snipCloudStatusToken(cloudState.cloud_status || cloudState.status);
     if (["complete", "cloud-available", "available", "ready", "synced", "uploaded"].includes(status)) return true;
     if (["deleted", "cloud-deleted-local-kept", "local-only", "missing", "not-found", "unavailable"].includes(status)) return false;
   }
-  const explicit = asset?.cloudAvailable ?? asset?.cloud_available;
+  const explicit = asset?.cloud_available;
   if (typeof explicit === "boolean") return explicit;
   const status = snipCloudStatusToken(
-    asset?.cloudStatus || asset?.cloud_status || asset?.status || asset?.assetStatus || asset?.asset_status,
+    asset?.cloud_status || asset?.status || asset?.asset_status,
   );
   if (["cloud-deleted-local-kept", "deleted", "local-only", "missing", "not-found", "unavailable"].includes(status)) {
     return false;
@@ -582,20 +554,16 @@ function snipAssetCloudAvailable(asset) {
   if (["available", "cloud-available", "cloud-only", "complete", "completed", "ready", "synced", "uploaded"].includes(status)) {
     return true;
   }
-  return Boolean(asset?.blobId || asset?.blob_id || asset?.objectKey || asset?.object_key);
+  return Boolean(asset?.blob_id || asset?.object_key);
 }
 
 function snipAssetPaths(asset) {
   const metadata = jsonObject(asset?.metadata) || {};
   return [
     assetLocalPath(asset),
-    asset?.sourcePath,
     asset?.source_path,
-    asset?.originalPath,
     asset?.original_path,
-    metadata.sourcePath,
     metadata.source_path,
-    metadata.originalPath,
     metadata.original_path,
   ].map((value) => text(value)).filter(Boolean);
 }
@@ -613,9 +581,9 @@ function snipAssetPresentation(asset) {
   const hasCloud = snipAssetCloudAvailable(asset) || Boolean(publicUrl);
   return {
     asset,
-    assetId: id,
+    asset_id: id,
     hasCloud,
-    publicUrl,
+    public_url: publicUrl,
     uploadState: publicUrl ? "done" : hasCloud ? "private" : "idle",
   };
 }
@@ -630,7 +598,7 @@ function rememberSnipAssetBindings(payload) {
     if (!binding) return;
     const paths = [...new Set([...payloadPaths, ...snipAssetPaths(asset)])];
     paths.forEach((path) => {
-      snipAssetBindingsByPath.set(path, { ...binding, updatedAt: now });
+      snipAssetBindingsByPath.set(path, { ...binding, updated_at: now });
     });
   });
   while (snipAssetBindingsByPath.size > 256) {
@@ -643,7 +611,7 @@ function rememberSnipAssetBindings(payload) {
 function snipAssetBindingForPath(localPath) {
   const binding = snipAssetBindingsByPath.get(text(localPath));
   if (!binding) return null;
-  if (Date.now() - binding.updatedAt > 10 * 60 * 1000) {
+  if (Date.now() - binding.updated_at > 10 * 60 * 1000) {
     snipAssetBindingsByPath.delete(text(localPath));
     return null;
   }
@@ -670,7 +638,7 @@ function assetPreviewUrl(asset) {
 }
 
 function versionedAssetPreviewUrl(localPath, imageVersion = 0) {
-  const url = assetPreviewUrl({ localPath });
+  const url = assetPreviewUrl({ local_path: localPath });
   if (!url || !imageVersion) return url;
   return `${url}${url.includes("?") ? "&" : "?"}v=${imageVersion}`;
 }
@@ -867,9 +835,9 @@ async function renderAnnotatedImageDataUrl(localPath, annotations = []) {
 }
 
 async function copySnipToClipboard(snip) {
-  if (assetIsVideoPath(snip.localPath)) {
+  if (assetIsVideoPath(snip.local_path)) {
     if (navigator?.clipboard?.writeText) {
-      await navigator.clipboard.writeText(snip.localPath);
+      await navigator.clipboard.writeText(snip.local_path);
       return "Copied recording path";
     }
     throw new Error("Clipboard is not available in this webview.");
@@ -877,7 +845,7 @@ async function copySnipToClipboard(snip) {
 
   try {
     await invoke("diffforge_copy_asset_to_clipboard", {
-      path: snip.localPath,
+      path: snip.local_path,
     });
     return "Copied to clipboard";
   } catch {
@@ -902,7 +870,7 @@ async function copySnipToClipboard(snip) {
   }
 
   if (navigator?.clipboard?.writeText) {
-    await navigator.clipboard.writeText(snip.localPath);
+    await navigator.clipboard.writeText(snip.local_path);
     return "Copied to clipboard";
   }
 
@@ -938,7 +906,7 @@ async function copyTextToClipboard(value) {
  * A different adopted snip or an annotation save resets to idle because the
  * uploaded asset no longer matches the visible pixels.
  */
-function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
+function useSnipCloudUpload({ imageVersion, local_path: localPath, name, showStatus }) {
   const [uploadState, setUploadState] = useState("idle");
   const [assetId, setAssetId] = useState("");
   const [publicUrl, setPublicUrl] = useState("");
@@ -948,11 +916,11 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
   const assetIdRef = useRef("");
 
   const applyAssetPresentation = useCallback((presentation, options = {}) => {
-    if (!presentation?.assetId) return;
+    if (!presentation?.asset_id) return;
     const nextState = presentation.uploadState || "idle";
-    assetIdRef.current = presentation.assetId;
-    setAssetId(presentation.assetId);
-    setPublicUrl(presentation.publicUrl || "");
+    assetIdRef.current = presentation.asset_id;
+    setAssetId(presentation.asset_id);
+    setPublicUrl(presentation.public_url || "");
     if (nextState === "done" || nextState === "private") {
       setUploadPercent(100);
     }
@@ -989,7 +957,7 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
       if (!transfer || snipTransferDirection(transfer) !== "upload") return "";
       const percent = snipTransferPercent(transfer);
       if (percent != null) setUploadPercent(percent);
-      const status = text(transfer?.status || transfer?.transferStatus || transfer?.transfer_status).toLowerCase();
+      const status = text(transfer?.status || transfer?.transfer_status).toLowerCase();
       if (["failed", "interrupted", "cancelled", "canceled"].includes(status)) {
         setUploadState("idle");
         setUploadPercent(null);
@@ -1002,7 +970,7 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
     };
     const bindStartedUpload = (payload) => {
       if (!snipUploadEventPaths(payload).includes(localPath)) return;
-      applyUploadAssetId(text(payload?.assetId || payload?.asset_id));
+      applyUploadAssetId(text(payload?.asset_id));
       const status = text(payload?.status).toLowerCase();
       if (status === "failed") {
         setUploadState("idle");
@@ -1099,14 +1067,14 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
     try {
       const result = await invoke("snipping_upload_untracked_asset_to_cloud", {
         request: {
-          assetId: assetId || undefined,
+          asset_id: assetId || undefined,
           group: "snips",
           name,
           path: localPath,
         },
       });
-      setAssetId(text(result?.assetId || result?.asset_id));
-      const url = text(result?.publicUrl || result?.public_url);
+      setAssetId(text(result?.asset_id));
+      const url = text(result?.public_url);
       if (url) {
         setPublicUrl(url);
         setUploadState("done");
@@ -1131,9 +1099,9 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
     setUploadState("publishing");
     try {
       const result = await invoke("snipping_publish_uploaded_asset", {
-        request: { assetId },
+        request: { asset_id: assetId },
       });
-      const url = text(result?.publicUrl || result?.public_url);
+      const url = text(result?.public_url);
       if (!url) {
         throw new Error("Publish finished without a public URL.");
       }
@@ -1152,7 +1120,7 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
     setUploadState("deleting");
     try {
       await invoke("snipping_delete_uploaded_asset_from_cloud", {
-        request: { assetId },
+        request: { asset_id: assetId },
       });
       setAssetId("");
       setPublicUrl("");
@@ -1172,7 +1140,7 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
     setUploadState("deleting");
     try {
       await invoke("snipping_unpublish_uploaded_asset", {
-        request: { assetId },
+        request: { asset_id: assetId },
       });
       setPublicUrl("");
       setUrlCopied(false);
@@ -1349,7 +1317,7 @@ export function SnippingFloatWindow() {
     if (liveFrameUrl && !isVideo) return liveFrameUrl;
     return filePreviewUrl;
   }, [closing, filePreviewUrl, isVideo, liveFrameUrl]);
-  const name = useMemo(() => assetName({ localPath }), [localPath]);
+  const name = useMemo(() => assetName({ local_path: localPath }), [localPath]);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
   const busyRef = useRef(false);
@@ -1371,13 +1339,13 @@ export function SnippingFloatWindow() {
       href: window.location.href,
       initialPath,
       label,
-      localPath: localPathRef.current,
+      local_path: localPathRef.current,
       windowsRuntime,
     });
     return () => {
       logWindowsSnippingDebug(windowsRuntime, "webview.float_unmounted", {
         label,
-        localPath: localPathRef.current,
+        local_path: localPathRef.current,
       });
     };
   }, [initialPath, windowsRuntime]);
@@ -1398,7 +1366,7 @@ export function SnippingFloatWindow() {
       hasPreviewUrl: !!previewUrl,
       isVideo,
       label: getCurrentWindow().label,
-      localPath,
+      local_path: localPath,
       name,
       previewUrlKind,
       previewUrlLength: previewUrl ? previewUrl.length : 0,
@@ -1429,7 +1397,7 @@ export function SnippingFloatWindow() {
     logWindowsSnippingDebug(windowsRuntime, "webview.float_adopt_path", {
       label: getCurrentWindow().label,
       nextPath,
-      previousPath: localPathRef.current,
+      previous_path: localPathRef.current,
     });
     closingRef.current = false;
     setClosing(false);
@@ -1599,7 +1567,7 @@ export function SnippingFloatWindow() {
       const hovered = payload.hovered === true;
       setHoverArmed(hovered);
       if (hovered) {
-        scheduleSyntheticHoverFromPoint(payload.clientX ?? payload.client_x, payload.clientY ?? payload.client_y);
+        scheduleSyntheticHoverFromPoint(payload.client_x, payload.client_y);
       } else {
         if (syntheticHoverFrameRef.current) {
           window.cancelAnimationFrame(syntheticHoverFrameRef.current);
@@ -1635,8 +1603,8 @@ export function SnippingFloatWindow() {
     listen(SNIPPING_SOURCE_UPDATED_EVENT, (event) => {
       if (disposed || closingRef.current) return;
       const payload = event?.payload || {};
-      const original = text(payload.originalPath || payload.original_path);
-      const edited = text(payload.editedPath || payload.edited_path || payload.path);
+      const original = text(payload.original_path);
+      const edited = text(payload.edited_path || payload.path);
       if (!edited) return;
       const current = localPathRef.current;
       if (current !== original && current !== edited) return;
@@ -1667,9 +1635,9 @@ export function SnippingFloatWindow() {
     listen(SNIPPING_LIVE_PREVIEW_EVENT, (event) => {
       if (disposed || closingRef.current) return;
       const payload = event?.payload || {};
-      const sourcePath = text(payload.sourcePath || payload.source_path);
-      const targetPath = text(payload.targetPath || payload.target_path);
-      const dataUrl = text(payload.dataUrl || payload.data_url);
+      const sourcePath = text(payload.source_path);
+      const targetPath = text(payload.target_path);
+      const dataUrl = text(payload.data_url);
       if (!dataUrl) return;
       const current = localPathRef.current;
       if (current !== sourcePath && (!targetPath || current !== targetPath)) return;
@@ -1718,7 +1686,7 @@ export function SnippingFloatWindow() {
     urlCopied,
   } = useSnipCloudUpload({
     imageVersion,
-    localPath,
+    local_path: localPath,
     name,
     showStatus,
   });
@@ -1762,7 +1730,7 @@ export function SnippingFloatWindow() {
     logWindowsSnippingDebug(windowsRuntime, "webview.float_action_start", {
       action,
       label,
-      localPath: actionPath,
+      local_path: actionPath,
     });
     if (action === "delete") {
       beginClosing();
@@ -1773,7 +1741,7 @@ export function SnippingFloatWindow() {
       if (action === "delete") {
         await invoke("diffforge_delete_untracked_asset", { path: actionPath });
       } else if (action === "copy") {
-        const copyStatus = await copySnipToClipboard({ localPath: actionPath, name, previewUrl });
+        const copyStatus = await copySnipToClipboard({ local_path: actionPath, name, previewUrl });
         showStatus(copyStatus);
       } else if (action === "edit") {
         await invoke("snipping_open_annotation_editor", { path: actionPath });
@@ -1795,14 +1763,14 @@ export function SnippingFloatWindow() {
       logWindowsSnippingDebug(windowsRuntime, "webview.float_action_ok", {
         action,
         label,
-        localPath: actionPath,
+        local_path: actionPath,
       });
     } catch (error) {
       logWindowsSnippingDebug(windowsRuntime, "webview.float_action_error", {
         action,
         error: error?.message || String(error || "unknown"),
         label,
-        localPath: actionPath,
+        local_path: actionPath,
       });
       if (action === "delete") {
         closingRef.current = false;
@@ -1813,7 +1781,7 @@ export function SnippingFloatWindow() {
       logWindowsSnippingDebug(windowsRuntime, "webview.float_action_finish", {
         action,
         label,
-        localPath: actionPath,
+        local_path: actionPath,
       });
       if (action !== "delete") {
         setBusy(false);
@@ -1855,7 +1823,7 @@ export function SnippingFloatWindow() {
     const screenX = Number(event.screenX);
     const screenY = Number(event.screenY);
     if (!Number.isFinite(screenX) || !Number.isFinite(screenY)) return null;
-    return { screenX, screenY };
+    return { screen_x: screenX, screen_y: screenY };
   }, []);
 
   const releaseWindowsFloatDrag = useCallback((drag) => {
@@ -1888,8 +1856,8 @@ export function SnippingFloatWindow() {
     }
     invoke("snipping_preview_drag_moved", {
       label,
-      screenX: Number.isFinite(nextPoint.screenX) ? nextPoint.screenX : null,
-      screenY: Number.isFinite(nextPoint.screenY) ? nextPoint.screenY : null,
+      screen_x: Number.isFinite(nextPoint.screen_x) ? nextPoint.screen_x : null,
+      screen_y: Number.isFinite(nextPoint.screen_y) ? nextPoint.screen_y : null,
     }).catch(() => {});
   }, [windowsRuntime]);
 
@@ -1911,7 +1879,7 @@ export function SnippingFloatWindow() {
     }
     const point = pointFromPointerEvent(event);
     logWindowsSnippingDebug(windowsRuntime, "webview.float_drag_finish", {
-      eventType: text(event?.type),
+      event_type: text(event?.type),
       label: drag.label,
       point,
       started: drag.started === true,
@@ -2014,12 +1982,12 @@ export function SnippingFloatWindow() {
       bounds: { height, width },
       clientX: event.clientX,
       clientY: event.clientY,
-      grabOffsetX,
-      grabOffsetY,
+      grab_offset_x: grabOffsetX,
+      grab_offset_y: grabOffsetY,
       label: windowHandle.label,
       pointerId: event.pointerId,
-      screenX: event.screenX,
-      screenY: event.screenY,
+      screen_x: event.screenX,
+      screen_y: event.screenY,
       type: text(event.type),
     });
     if (windowsRuntime) {
@@ -2048,15 +2016,15 @@ export function SnippingFloatWindow() {
         });
       }
       logWindowsSnippingDebug(windowsRuntime, "webview.float_drag_start_send", {
-        grabOffsetX,
-        grabOffsetY,
+        grab_offset_x: grabOffsetX,
+        grab_offset_y: grabOffsetY,
         height,
         label: windowHandle.label,
         width,
       });
       invoke("snipping_preview_drag_started", {
-        grabOffsetX,
-        grabOffsetY,
+        grab_offset_x: grabOffsetX,
+        grab_offset_y: grabOffsetY,
         height,
         label: windowHandle.label,
         width,
@@ -2085,8 +2053,8 @@ export function SnippingFloatWindow() {
       return;
     }
     invoke("snipping_preview_drag_started", {
-      grabOffsetX,
-      grabOffsetY,
+      grab_offset_x: grabOffsetX,
+      grab_offset_y: grabOffsetY,
       height,
       label: windowHandle.label,
       width,
@@ -2128,7 +2096,7 @@ export function SnippingFloatWindow() {
                 : "none",
       currentSrcLength: currentSrc.length,
       label: getCurrentWindow().label,
-      localPath,
+      local_path: localPath,
       name,
       previewUrlLength: previewUrl ? previewUrl.length : 0,
     });
@@ -2138,7 +2106,7 @@ export function SnippingFloatWindow() {
   const handlePreviewImageLoad = useCallback((event) => {
     logWindowsSnippingDebug(windowsRuntime, "webview.float_preview_image_load", {
       label: getCurrentWindow().label,
-      localPath,
+      local_path: localPath,
       name,
       naturalHeight: event?.currentTarget?.naturalHeight || 0,
       naturalWidth: event?.currentTarget?.naturalWidth || 0,
@@ -2860,8 +2828,8 @@ function StripSnipTile({
     listen(SNIPPING_SOURCE_UPDATED_EVENT, (event) => {
       if (disposed) return;
       const payload = event?.payload || {};
-      const original = text(payload.originalPath || payload.original_path || payload.sourcePath || payload.source_path);
-      const promoted = text(payload.editedPath || payload.edited_path || payload.localPath || payload.local_path || payload.path);
+      const original = text(payload.original_path || payload.source_path);
+      const promoted = text(payload.edited_path || payload.local_path || payload.path);
       if (!promoted || localPath !== original) return;
       setLocalPath(promoted);
     }).then((nextUnlisten) => {
@@ -2874,7 +2842,7 @@ function StripSnipTile({
     };
   }, [localPath]);
   const name = useMemo(() => assetName(item), [item]);
-  const imageVersion = useMemo(() => Number(item?.modifiedMs || item?.modified_ms || 0) || 0, [item]);
+  const imageVersion = useMemo(() => Number(item?.modified_ms || 0) || 0, [item]);
   const isVideo = useMemo(() => assetIsVideoPath(localPath), [localPath]);
   const windowsRuntime = useMemo(() => runtimeLooksWindows(), []);
   const {
@@ -2925,7 +2893,7 @@ function StripSnipTile({
     urlCopied,
   } = useSnipCloudUpload({
     imageVersion,
-    localPath,
+    local_path: localPath,
     name,
     showStatus,
   });
@@ -2938,12 +2906,12 @@ function StripSnipTile({
       const result = await invoke("snipping_open_snip_float", {
         path: localPath,
         focused: false,
-        stripAfterPath: stripOrigin?.afterPath || "",
-        stripBeforePath: stripOrigin?.beforePath || "",
-        stripIndex: Number.isFinite(stripOrigin?.index) ? stripOrigin.index : null,
+        strip_after_path: stripOrigin?.after_path || "",
+        strip_before_path: stripOrigin?.before_path || "",
+        strip_index: Number.isFinite(stripOrigin?.index) ? stripOrigin.index : null,
       });
-      const openedPath = text(result?.path || result?.localPath || result?.local_path, localPath);
-      onOpened(openedPath, { item, origin: stripOrigin, originalPath: localPath });
+      const openedPath = text(result?.path || result?.local_path, localPath);
+      onOpened(openedPath, { item, origin: stripOrigin, original_path: localPath });
     } catch (error) {
       if (mountedRef.current) setLaunching(false);
       showStatus(error?.message || String(error || "Unable to pin snip preview."));
@@ -2966,12 +2934,12 @@ function StripSnipTile({
     logWindowsSnippingDebug(windowsRuntime, "webview.strip_action_start", {
       action,
       label,
-      localPath,
+      local_path: localPath,
     });
     setBusy(true);
     try {
       if (action === "copy") {
-        const copyStatus = await copySnipToClipboard({ localPath, name, previewUrl });
+        const copyStatus = await copySnipToClipboard({ local_path: localPath, name, previewUrl });
         showStatus(copyStatus);
       } else if (action === "edit") {
         await invoke("snipping_open_annotation_editor", { path: localPath });
@@ -2996,21 +2964,21 @@ function StripSnipTile({
       logWindowsSnippingDebug(windowsRuntime, "webview.strip_action_ok", {
         action,
         label,
-        localPath,
+        local_path: localPath,
       });
     } catch (error) {
       logWindowsSnippingDebug(windowsRuntime, "webview.strip_action_error", {
         action,
         error: error?.message || String(error || "unknown"),
         label,
-        localPath,
+        local_path: localPath,
       });
       showStatus(error?.message || String(error || "Action failed"));
     } finally {
       logWindowsSnippingDebug(windowsRuntime, "webview.strip_action_finish", {
         action,
         label,
-        localPath,
+        local_path: localPath,
       });
       if (mountedRef.current) setBusy(false);
     }
@@ -3033,8 +3001,8 @@ function StripSnipTile({
   const rememberDragPointer = useCallback((drag, event) => {
     if (!drag || !event) return null;
     const point = {
-      screenX: Number(event.screenX),
-      screenY: Number(event.screenY),
+      screen_x: Number(event.screenX),
+      screen_y: Number(event.screenY),
     };
     drag.lastPointer = point;
     return point;
@@ -3057,8 +3025,8 @@ function StripSnipTile({
     }
     invoke("snipping_preview_drag_moved", {
       label,
-      screenX: Number.isFinite(point.screenX) ? point.screenX : null,
-      screenY: Number.isFinite(point.screenY) ? point.screenY : null,
+      screen_x: Number.isFinite(point.screen_x) ? point.screen_x : null,
+      screen_y: Number.isFinite(point.screen_y) ? point.screen_y : null,
     }).catch(() => {});
   }, [windowsRuntime]);
 
@@ -3081,7 +3049,7 @@ function StripSnipTile({
       drag.released = true;
       rememberDragPointer(drag, event);
       logWindowsSnippingDebug(windowsRuntime, "webview.strip_drag_out_clear", {
-        eventType: text(event?.type),
+        event_type: text(event?.type),
         label: drag.floatLabel || "",
         point: drag.lastPointer || null,
         pointerId: drag.pointerId,
@@ -3130,27 +3098,27 @@ function StripSnipTile({
     const rect = event.currentTarget.getBoundingClientRect();
     event.preventDefault();
     logWindowsSnippingDebug(windowsRuntime, "webview.strip_drag_capture_attempt", {
-      localPath,
+      local_path: localPath,
       pointerId: event.pointerId,
       targetTag: text(event.currentTarget?.tagName),
     });
     try {
       event.currentTarget.setPointerCapture?.(event.pointerId);
       logWindowsSnippingDebug(windowsRuntime, "webview.strip_drag_capture_set", {
-        localPath,
+        local_path: localPath,
         pointerId: event.pointerId,
       });
     } catch (error) {
       logWindowsSnippingDebug(windowsRuntime, "webview.strip_drag_capture_error", {
         error: error?.message || String(error || "unknown"),
-        localPath,
+        local_path: localPath,
         pointerId: event.pointerId,
       });
     }
     dragRef.current = {
       pointerId: event.pointerId,
-      grabOffsetX: event.clientX - rect.left,
-      grabOffsetY: event.clientY - rect.top,
+      grab_offset_x: event.clientX - rect.left,
+      grab_offset_y: event.clientY - rect.top,
       startX: event.clientX,
       startY: event.clientY,
       railBottom: railRect?.bottom ?? 0,
@@ -3158,14 +3126,14 @@ function StripSnipTile({
       mode: "pending",
     };
     logWindowsSnippingDebug(windowsRuntime, "webview.strip_drag_down", {
-      grabOffsetX: event.clientX - rect.left,
-      grabOffsetY: event.clientY - rect.top,
-      localPath,
+      grab_offset_x: event.clientX - rect.left,
+      grab_offset_y: event.clientY - rect.top,
+      local_path: localPath,
       pointerId: event.pointerId,
       railBottom: railRect?.bottom ?? 0,
       railTop: railRect?.top ?? 0,
-      screenX: event.screenX,
-      screenY: event.screenY,
+      screen_x: event.screenX,
+      screen_y: event.screenY,
       tileHeight: rect.height,
       tileWidth: rect.width,
     });
@@ -3221,7 +3189,7 @@ function StripSnipTile({
         absX,
         absY,
         distance,
-        localPath,
+        local_path: localPath,
         pointerId: event.pointerId,
       });
       onReorderStart?.(localPath, event.clientX);
@@ -3244,9 +3212,9 @@ function StripSnipTile({
       absX,
       absY,
       distance,
-      grabOffsetX: drag.grabOffsetX,
-      grabOffsetY: drag.grabOffsetY,
-      localPath,
+      grab_offset_x: drag.grab_offset_x,
+      grab_offset_y: drag.grab_offset_y,
+      local_path: localPath,
       point: drag.lastPointer,
       pointerId: event.pointerId,
     });
@@ -3255,26 +3223,26 @@ function StripSnipTile({
     setBusy(true);
     setLaunching(true);
     logWindowsSnippingDebug(windowsRuntime, "webview.strip_drag_out_open_send", {
-      localPath,
+      local_path: localPath,
       pointerId: event.pointerId,
-      x: event.screenX - Math.max(0, Math.min(STRIP_TILE_WIDTH_PX, drag.grabOffsetX)),
-      y: event.screenY - Math.max(0, Math.min(STRIP_TILE_HEIGHT_PX, drag.grabOffsetY)),
+      x: event.screenX - Math.max(0, Math.min(STRIP_TILE_WIDTH_PX, drag.grab_offset_x)),
+      y: event.screenY - Math.max(0, Math.min(STRIP_TILE_HEIGHT_PX, drag.grab_offset_y)),
     });
     invoke("snipping_open_snip_float_for_drag", {
-      grabOffsetX: Math.max(0, Math.min(STRIP_TILE_WIDTH_PX, drag.grabOffsetX)),
-      grabOffsetY: Math.max(0, Math.min(STRIP_TILE_HEIGHT_PX, drag.grabOffsetY)),
+      grab_offset_x: Math.max(0, Math.min(STRIP_TILE_WIDTH_PX, drag.grab_offset_x)),
+      grab_offset_y: Math.max(0, Math.min(STRIP_TILE_HEIGHT_PX, drag.grab_offset_y)),
       path: localPath,
-      stripAfterPath: stripOrigin?.afterPath || "",
-      stripBeforePath: stripOrigin?.beforePath || "",
-      stripIndex: Number.isFinite(stripOrigin?.index) ? stripOrigin.index : null,
-      x: event.screenX - Math.max(0, Math.min(STRIP_TILE_WIDTH_PX, drag.grabOffsetX)),
-      y: event.screenY - Math.max(0, Math.min(STRIP_TILE_HEIGHT_PX, drag.grabOffsetY)),
+      strip_after_path: stripOrigin?.after_path || "",
+      strip_before_path: stripOrigin?.before_path || "",
+      strip_index: Number.isFinite(stripOrigin?.index) ? stripOrigin.index : null,
+      x: event.screenX - Math.max(0, Math.min(STRIP_TILE_WIDTH_PX, drag.grab_offset_x)),
+      y: event.screenY - Math.max(0, Math.min(STRIP_TILE_HEIGHT_PX, drag.grab_offset_y)),
     })
       .then((result) => {
-        const openedPath = text(result?.path || result?.localPath || result?.local_path, localPath);
+        const openedPath = text(result?.path || result?.local_path, localPath);
         drag.floatLabel = text(result?.label);
         logWindowsSnippingDebug(windowsRuntime, "webview.strip_drag_out_open_ok", {
-          dragStarted: result?.dragStarted === true,
+          drag_started: result?.drag_started === true,
           floatLabel: drag.floatLabel,
           openedPath,
           released: drag.released === true,
@@ -3286,17 +3254,17 @@ function StripSnipTile({
           }
         }
         onOpened(openedPath, {
-          dragStarted: result?.dragStarted === true,
+          drag_started: result?.drag_started === true,
           item,
           origin: stripOrigin,
-          originalPath: localPath,
+          original_path: localPath,
         });
       })
       .catch((error) => {
         drag.openFailed = true;
         logWindowsSnippingDebug(windowsRuntime, "webview.strip_drag_out_open_error", {
           error: error?.message || String(error || "unknown"),
-          localPath,
+          local_path: localPath,
         });
         if (dragRef.current === drag) {
           dragRef.current = null;
@@ -3523,7 +3491,7 @@ export function SnippingRecentStrip({ onContentReady, onDragActivityChange, refr
         const restorePaths = uniqueAssetPaths(
           assetLocalPath(restore?.item),
           restore?.path,
-          restore?.originalPath,
+          restore?.original_path,
           restore?.paths || [],
         );
         const path = restorePaths[0];
@@ -3533,7 +3501,7 @@ export function SnippingRecentStrip({ onContentReady, onDragActivityChange, refr
           return;
         }
         if (seen.has(path)) return;
-        merged.push(restore.item || { path, localPath: path, local_path: path });
+        merged.push(restore.item || { path, local_path: path });
         seen.add(path);
       });
       let nextItems = applyStripOrder(merged, orderRef.current);
@@ -3579,20 +3547,20 @@ export function SnippingRecentStrip({ onContentReady, onDragActivityChange, refr
 
     invoke("snipping_recent_snips", {
       limit: SNIPPING_STRIP_PAGE_SIZE,
-      cursorModifiedMs: cursor?.modifiedMs ?? null,
-      cursorPath: cursor?.path || "",
-      excludeVisibleFreePreviews: true,
+      cursor_modified_ms: cursor?.modified_ms ?? null,
+      cursor_path: cursor?.path || "",
+      exclude_visible_free_previews: true,
     })
       .then((result) => {
         if (pageRequestRef.current !== requestId) return;
         const nextItems = Array.isArray(result?.items) ? result.items : [];
         updateItemsFromServer(nextItems, { reset });
-        const nextHasMore = result?.hasMore === true || result?.has_more === true;
-        const nextCursor = result?.nextCursor || result?.next_cursor || {};
-        const nextModifiedMs = Number(nextCursor?.modifiedMs || nextCursor?.modified_ms || 0) || 0;
+        const nextHasMore = result?.has_more === true;
+        const nextCursor = result?.next_cursor || {};
+        const nextModifiedMs = Number(nextCursor?.modified_ms || 0) || 0;
         const nextPath = text(nextCursor?.path);
         cursorRef.current = nextHasMore && nextModifiedMs && nextPath
-          ? { modifiedMs: nextModifiedMs, path: nextPath }
+          ? { modified_ms: nextModifiedMs, path: nextPath }
           : null;
         hasMoreRef.current = nextHasMore;
         setHasMore(nextHasMore);
@@ -3737,11 +3705,11 @@ export function SnippingRecentStrip({ onContentReady, onDragActivityChange, refr
       const rail = railRef.current;
       const currentItems = itemsRef.current;
       const currentOrder = currentItems.map((item) => assetLocalPath(item)).filter(Boolean);
-      const clientX = Number(payload.clientX);
-      const payloadIndex = Number(payload.index ?? payload.stripIndex ?? payload.strip_index);
+      const clientX = Number(payload.client_x);
+      const payloadIndex = Number(payload.index ?? payload.strip_index);
       const orderWithoutPath = currentOrder.filter((orderedPath) => orderedPath !== path);
-      const beforePath = text(payload.beforePath || payload.before_path);
-      const afterPath = text(payload.afterPath || payload.after_path);
+      const beforePath = text(payload.before_path);
+      const afterPath = text(payload.after_path);
       let index = Number.isFinite(payloadIndex)
         ? clampIndex(Math.round(payloadIndex), 0, currentItems.length)
         : Number.isFinite(clientX)
@@ -3760,14 +3728,14 @@ export function SnippingRecentStrip({ onContentReady, onDragActivityChange, refr
         const restorePaths = uniqueAssetPaths(
           path,
           restore?.path,
-          restore?.originalPath,
+          restore?.original_path,
           restore?.paths || [],
         );
         if (restore?.item) {
           restoredStripItemsRef.current.set(path, {
             ...restore,
-            afterPath: afterPath || restore.afterPath,
-            beforePath: beforePath || restore.beforePath,
+            after_path: afterPath || restore.after_path,
+            before_path: beforePath || restore.before_path,
             index,
             paths: restorePaths,
           });
@@ -3832,7 +3800,7 @@ export function SnippingRecentStrip({ onContentReady, onDragActivityChange, refr
 
   const removePath = useCallback((path) => {
     const restore = floatedStripItemsRef.current.get(path) || restoredStripItemsRef.current.get(path);
-    const paths = uniqueAssetPaths(path, restore?.path, restore?.originalPath, restore?.paths || []);
+    const paths = uniqueAssetPaths(path, restore?.path, restore?.original_path, restore?.paths || []);
     paths.forEach((nextPath) => {
       floatedStripItemsRef.current.delete(nextPath);
       restoredStripItemsRef.current.delete(nextPath);
@@ -3845,17 +3813,17 @@ export function SnippingRecentStrip({ onContentReady, onDragActivityChange, refr
     const openedPath = text(path);
     if (!openedPath) return;
     const origin = details.origin || {};
-    const originalPath = text(details.originalPath || assetLocalPath(details.item), openedPath);
+    const originalPath = text(details.original_path || assetLocalPath(details.item), openedPath);
     const paths = uniqueAssetPaths(openedPath, originalPath);
     const itemSnapshot = details.item
-      ? { ...details.item, path: openedPath, localPath: openedPath, local_path: openedPath }
-      : { path: openedPath, localPath: openedPath, local_path: openedPath };
+      ? { ...details.item, path: openedPath, local_path: openedPath }
+      : { path: openedPath, local_path: openedPath };
     const restore = {
-      afterPath: text(origin.afterPath),
-      beforePath: text(origin.beforePath),
+      after_path: text(origin.after_path),
+      before_path: text(origin.before_path),
       index: Number.isFinite(origin.index) ? origin.index : 0,
       item: itemSnapshot,
-      originalPath,
+      original_path: originalPath,
       path: openedPath,
       paths,
     };
@@ -4007,8 +3975,8 @@ export function SnippingRecentStrip({ onContentReady, onDragActivityChange, refr
                       const path = assetLocalPath(entry.item);
                       const itemIndex = items.findIndex((item) => assetLocalPath(item) === path);
                       return {
-                        afterPath: itemIndex >= 0 ? assetLocalPath(items[itemIndex + 1]) : "",
-                        beforePath: itemIndex > 0 ? assetLocalPath(items[itemIndex - 1]) : "",
+                        after_path: itemIndex >= 0 ? assetLocalPath(items[itemIndex + 1]) : "",
+                        before_path: itemIndex > 0 ? assetLocalPath(items[itemIndex - 1]) : "",
                         index: itemIndex >= 0 ? itemIndex : index,
                       };
                     })()}
@@ -4868,8 +4836,8 @@ const StripRailStatus = styled.div`
 export function SnippingAnnotationEditorWindow() {
   const localPaths = useMemo(() => pathsFromHash(SNIPPING_EDITOR_HASH), []);
   const [activePath, setActivePath] = useState(() => localPaths[0] || "");
-  const previewUrl = useMemo(() => assetPreviewUrl({ localPath: activePath }), [activePath]);
-  const name = useMemo(() => assetName({ localPath: activePath }), [activePath]);
+  const previewUrl = useMemo(() => assetPreviewUrl({ local_path: activePath }), [activePath]);
+  const name = useMemo(() => assetName({ local_path: activePath }), [activePath]);
   const activeIsVideo = useMemo(() => assetIsVideoPath(activePath), [activePath]);
   const containsVideo = useMemo(() => localPaths.some((path) => assetIsVideoPath(path)), [localPaths]);
   const activeIndex = Math.max(0, localPaths.indexOf(activePath));
@@ -4953,8 +4921,8 @@ export function SnippingAnnotationEditorWindow() {
     const nextTargets = normalizeSnippingDispatchTargets(targets);
     setDispatchTargets(nextTargets);
     setTargetWorkspaceId((current) => {
-      if (current && nextTargets.some((target) => target.workspaceId === current)) return current;
-      return text(nextTargets[0]?.workspaceId);
+      if (current && nextTargets.some((target) => target.workspace_id === current)) return current;
+      return text(nextTargets[0]?.workspace_id);
     });
   }, []);
 
@@ -5036,13 +5004,13 @@ export function SnippingAnnotationEditorWindow() {
   }, [applyDispatchTargets]);
 
   const targetWorkspace = useMemo(
-    () => dispatchTargets.find((target) => target.workspaceId === targetWorkspaceId) || null,
+    () => dispatchTargets.find((target) => target.workspace_id === targetWorkspaceId) || null,
     [dispatchTargets, targetWorkspaceId],
   );
 
   const workspaceOptions = useMemo(() => dispatchTargets.map((target) => ({
-    label: text(target.workspaceName, target.workspaceId),
-    value: target.workspaceId,
+    label: text(target.workspace_name, target.workspace_id),
+    value: target.workspace_id,
   })), [dispatchTargets]);
 
   const threadOptions = useMemo(() => [
@@ -5050,15 +5018,15 @@ export function SnippingAnnotationEditorWindow() {
     ...(targetWorkspace?.threads || []).map((thread, index) => ({
       ...thread,
       color: sanitizeTerminalColor(
-        thread.targetTerminalColor || thread.color,
-        Number.isInteger(thread.targetColorSlot)
-          ? thread.targetColorSlot
-          : Number.isInteger(thread.terminalIndex)
-            ? thread.terminalIndex
+        thread.target_terminal_color || thread.color,
+        Number.isInteger(thread.target_color_slot)
+          ? thread.target_color_slot
+          : Number.isInteger(thread.terminal_index)
+            ? thread.terminal_index
             : index,
       ),
-      label: text(thread.label || thread.targetTerminalName, thread.threadId),
-      value: thread.threadId,
+      label: text(thread.label || thread.target_terminal_name, thread.thread_id),
+      value: thread.thread_id,
     })),
   ], [targetWorkspace]);
 
@@ -5066,7 +5034,7 @@ export function SnippingAnnotationEditorWindow() {
     setTargetThreadId((current) => {
       if (!current) return current;
       const threads = targetWorkspace?.threads || [];
-      return threads.some((thread) => thread.threadId === current) ? current : "";
+      return threads.some((thread) => thread.thread_id === current) ? current : "";
     });
   }, [targetWorkspace]);
 
@@ -5831,7 +5799,7 @@ export function SnippingAnnotationEditorWindow() {
   const copyCanvas = useCallback(async () => {
     if (activeIsVideo) {
       try {
-        const copyStatus = await copySnipToClipboard({ localPath: activePath, name, previewUrl });
+        const copyStatus = await copySnipToClipboard({ local_path: activePath, name, previewUrl });
         setStatus(copyStatus);
       } catch (error) {
         setStatus(error?.message || String(error || "Unable to copy recording."));
@@ -5847,7 +5815,7 @@ export function SnippingAnnotationEditorWindow() {
       const imageDataUrl = exportActiveDataUrl();
       if (!imageDataUrl) return;
       await invoke("diffforge_copy_image_data_url_to_clipboard", {
-        imageDataUrl,
+        image_data_url: imageDataUrl,
       });
       setStatus("Copied annotated image");
     } catch (error) {
@@ -5896,9 +5864,9 @@ export function SnippingAnnotationEditorWindow() {
 
     emit(SNIPPING_LIVE_PREVIEW_EVENT, {
       kind: "snip_live_preview",
-      sourcePath: activePath,
-      targetPath: autosaveTargetsRef.current[activePath] || "",
-      dataUrl,
+      source_path: activePath,
+      target_path: autosaveTargetsRef.current[activePath] || "",
+      data_url: dataUrl,
     }).catch(() => {});
   }, [activeIsVideo, activePath]);
 
@@ -5949,11 +5917,11 @@ export function SnippingAnnotationEditorWindow() {
       if (editorClosingRef.current) return;
       const result = await invoke("snipping_save_edited_untracked_asset", {
         request: {
-          imageDataUrl,
-          sourcePath,
+          image_data_url: imageDataUrl,
+          source_path: sourcePath,
         },
       });
-      const savedPath = text(result?.local_path || result?.localPath || result?.path);
+      const savedPath = text(result?.local_path || result?.path);
       if (editorClosingRef.current) return;
       if (savedPath) {
         autosaveTargetsRef.current[activePath] = savedPath;
@@ -6009,7 +5977,7 @@ export function SnippingAnnotationEditorWindow() {
         const imageDataUrl = activePath === path && imageRef.current
           ? exportActiveDataUrl()
           : await renderAnnotatedImageDataUrl(path, annotationsByPath[path] || []);
-        const imageName = assetName({ localPath: path });
+        const imageName = assetName({ local_path: path });
         return {
           name: `${imageName.replace(/\.[^.]+$/u, "") || `image-${index + 1}`}-annotated.png`,
           src: imageDataUrl,
@@ -6017,20 +5985,20 @@ export function SnippingAnnotationEditorWindow() {
         };
       }));
       const targetFields = buildSnippingAnnotationTargetFields({
-        targetThreadId,
+        target_thread_id: targetThreadId,
         targetWorkspace,
       });
       await emit(SNIPPING_ANNOTATION_TODO_EVENT, {
-        createdAt: new Date().toISOString(),
+        created_at: new Date().toISOString(),
         images,
         name,
-        sourceName: name,
-        sourcePath: activePath,
-        sourcePaths: localPaths,
+        source_name: name,
+        source_path: activePath,
+        source_paths: localPaths,
         ...targetFields,
         text,
-        workspaceId: targetWorkspaceId,
-        workspaceName: String(targetWorkspace?.workspaceName || "").trim(),
+        workspace_id: targetWorkspaceId,
+        workspace_name: String(targetWorkspace?.workspace_name || "").trim(),
       });
       setTodoDraft("");
       setStatus(`Queued todo with ${images.length} image${images.length === 1 ? "" : "s"}`);
@@ -6078,8 +6046,8 @@ export function SnippingAnnotationEditorWindow() {
           {multiImage && (
             <EditorBatchStrip aria-label="Selected images">
               {localPaths.map((path, index) => {
-                const itemName = assetName({ localPath: path });
-                const itemPreviewUrl = assetPreviewUrl({ localPath: path });
+                const itemName = assetName({ local_path: path });
+                const itemPreviewUrl = assetPreviewUrl({ local_path: path });
                 const itemIsVideo = assetIsVideoPath(path);
                 const annotationCount = (annotationsByPath[path] || []).length;
                 const active = path === activePath;

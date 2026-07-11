@@ -34,7 +34,7 @@ export function onRuntimeProfilerRender(id, phase, actualDuration, baseDuration)
     id: String(id || ""),
     phase: String(phase || ""),
     actualMs: Math.round(actualDuration),
-    baseMs: Math.round(baseDuration),
+    base_ms: Math.round(baseDuration),
     activationPhase: mark ? String(mark.phase || "") : "",
     activationMsAgo: mark ? Math.round(performance.now() - Number(mark.t || 0)) : -1,
   });

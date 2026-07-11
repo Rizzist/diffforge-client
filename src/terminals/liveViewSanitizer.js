@@ -118,7 +118,7 @@ function isPromptEchoLine(value) {
 }
 
 function isLiveViewArtifactLine(value, options = {}) {
-  const agentKind = String(options.agentKind || "").toLowerCase();
+  const agentKind = String(options.agent_kind || "").toLowerCase();
   const text = compactWhitespace(value);
   if (!text) {
     return true;
@@ -165,20 +165,20 @@ function applyCsiToLine(state, sequence) {
 
   if (finalCode === "K") {
     if (firstParam === 1) {
-      state.currentLine = state.currentLine.slice(state.cursorColumn);
+      state.current_line = state.current_line.slice(state.cursorColumn);
       state.cursorColumn = 0;
     } else if (firstParam === 2) {
-      state.currentLine = "";
+      state.current_line = "";
       state.cursorColumn = 0;
     } else {
-      state.currentLine = state.currentLine.slice(0, state.cursorColumn);
+      state.current_line = state.current_line.slice(0, state.cursorColumn);
     }
     return;
   }
 
   if (finalCode === "J") {
     if (firstParam === 2 || firstParam === 3) {
-      state.currentLine = "";
+      state.current_line = "";
       state.cursorColumn = 0;
       state.pendingLines = [];
     }
@@ -191,32 +191,32 @@ function applyCsiToLine(state, sequence) {
   }
 
   if (finalCode === "H" || finalCode === "f") {
-    state.currentLine = "";
+    state.current_line = "";
     state.cursorColumn = 0;
   }
 }
 
 function appendPrintable(state, character) {
-  const before = state.currentLine.slice(0, state.cursorColumn);
-  const after = state.currentLine.slice(state.cursorColumn + 1);
-  state.currentLine = `${before}${character}${after}`;
+  const before = state.current_line.slice(0, state.cursorColumn);
+  const after = state.current_line.slice(state.cursorColumn + 1);
+  state.current_line = `${before}${character}${after}`;
   state.cursorColumn += 1;
-  if (state.currentLine.length > MAX_PENDING_LINE_CHARS) {
-    state.currentLine = state.currentLine.slice(-MAX_PENDING_LINE_CHARS);
-    state.cursorColumn = Math.min(state.cursorColumn, state.currentLine.length);
+  if (state.current_line.length > MAX_PENDING_LINE_CHARS) {
+    state.current_line = state.current_line.slice(-MAX_PENDING_LINE_CHARS);
+    state.cursorColumn = Math.min(state.cursorColumn, state.current_line.length);
   }
 }
 
 function pushCurrentLine(state) {
-  const line = state.currentLine;
-  state.currentLine = "";
+  const line = state.current_line;
+  state.current_line = "";
   state.cursorColumn = 0;
   state.pendingLines.push(line);
 }
 
 export function createLiveViewSanitizer() {
   return {
-    currentLine: "",
+    current_line: "",
     cursorColumn: 0,
     pendingControlSequence: "",
     pendingLines: [],
@@ -337,7 +337,7 @@ export function sanitizeLiveViewOutput(state, data, options = {}) {
 
     if (codePoint === 0x08 || codePoint === 0x7f) {
       sanitizer.cursorColumn = Math.max(0, sanitizer.cursorColumn - 1);
-      sanitizer.currentLine = `${sanitizer.currentLine.slice(0, sanitizer.cursorColumn)}${sanitizer.currentLine.slice(sanitizer.cursorColumn + 1)}`;
+      sanitizer.current_line = `${sanitizer.current_line.slice(0, sanitizer.cursorColumn)}${sanitizer.current_line.slice(sanitizer.cursorColumn + 1)}`;
       index += 1;
       continue;
     }
@@ -372,8 +372,8 @@ export function sanitizeLiveViewOutput(state, data, options = {}) {
 
 export function flushLiveViewOutput(state, options = {}) {
   const sanitizer = state || createLiveViewSanitizer();
-  const text = compactWhitespace(sanitizer.currentLine);
-  sanitizer.currentLine = "";
+  const text = compactWhitespace(sanitizer.current_line);
+  sanitizer.current_line = "";
   sanitizer.cursorColumn = 0;
   if (!text || isLiveViewArtifactLine(text, options) || hasRecentLine(sanitizer, text)) {
     return "";
@@ -387,7 +387,7 @@ export function stripLiveViewControlSequences(value) {
   sanitizeLiveViewOutput(sanitizer, value, {});
   return [
     ...sanitizer.pendingLines,
-    sanitizer.currentLine,
+    sanitizer.current_line,
   ]
     .map(compactWhitespace)
     .filter(Boolean)

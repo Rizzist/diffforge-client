@@ -155,7 +155,7 @@ function swarmModelOptionsForProvider(provider, opencodeModels) {
 // body portal with fixed positioning so the Members-tab scroll container and
 // narrow pane edges can't clip it; flips above the trigger when the space
 // below is too short.
-function SwarmModelMenuPanel({ anchorRef, currentModel, onClose, onRefresh, onSelect, opencodeModels, provider }) {
+function SwarmModelMenuPanel({ anchorRef, current_model: currentModel, onClose, onRefresh, onSelect, opencodeModels, provider }) {
   const [query, setQuery] = useState("");
   const [placement, setPlacement] = useState(null);
   const menuRef = useRef(null);
@@ -287,8 +287,8 @@ function SwarmModelMenuPanel({ anchorRef, currentModel, onClose, onRefresh, onSe
 }
 
 function describeSwarmRunEvent(event, membersById) {
-  const memberName = event?.memberId
-    ? memberDisplayName(membersById.get(event.memberId) || { provider: "", label: event.memberId })
+  const memberName = event?.member_id
+    ? memberDisplayName(membersById.get(event.member_id) || { provider: "", label: event.member_id })
     : "";
   switch (event?.kind) {
     case "run_started":
@@ -332,8 +332,8 @@ function describeSwarmRunEvent(event, membersById) {
     case "verification_result": {
       const ok = Boolean(event?.data?.ok);
       if (ok) return "Verification passed";
-      const timedOut = Boolean(event?.data?.timedOut);
-      const exitCode = Number(event?.data?.exitCode ?? NaN);
+      const timedOut = Boolean(event?.data?.timed_out);
+      const exitCode = Number(event?.data?.exit_code ?? NaN);
       return timedOut
         ? "Verification timed out"
         : `Verification failed${Number.isFinite(exitCode) ? ` (exit ${exitCode})` : ""}`;
@@ -1892,11 +1892,11 @@ const SwarmSheetBody = styled.div`
 
 export default function SwarmWorkspacePane({
   avoidFloatingAdd = false,
-  isActive = true,
-  paneId = "",
-  repoPath = "",
-  terminalIndex = 0,
-  workspaceId = "",
+  is_active: isActive = true,
+  pane_id: paneId = "",
+  repo_path: repoPath = "",
+  terminal_index: terminalIndex = 0,
+  workspace_id: workspaceId = "",
 }) {
   const swarmId = useMemo(
     () => getSwarmPaneSwarmId(workspaceId, terminalIndex),
@@ -1937,11 +1937,11 @@ export default function SwarmWorkspacePane({
   const stagePanRef = useRef(null);
 
   const members = useMemo(() => (Array.isArray(swarm?.members) ? swarm.members : []), [swarm?.members]);
-  const membersById = useMemo(() => new Map(members.map((member) => [member.memberId, member])), [members]);
+  const membersById = useMemo(() => new Map(members.map((member) => [member.member_id, member])), [members]);
   const runs = useMemo(() => (Array.isArray(swarm?.runs) ? swarm.runs : []), [swarm?.runs]);
-  const activeRunId = String(swarm?.activeRunId || "");
-  const viewedRunId = selectedRunId || activeRunId || String(runs[0]?.runId || "");
-  const viewedRun = runs.find((run) => run.runId === viewedRunId) || null;
+  const activeRunId = String(swarm?.active_run_id || "");
+  const viewedRunId = selectedRunId || activeRunId || String(runs[0]?.run_id || "");
+  const viewedRun = runs.find((run) => run.run_id === viewedRunId) || null;
   const readyMemberCount = members.filter((member) => member.status === "ready" || member.status === "working").length;
   const hasMembers = members.length > 0;
 
@@ -1958,7 +1958,7 @@ export default function SwarmWorkspacePane({
       return;
     }
     try {
-      const state = await invoke("swarm_get_state", { workspaceId, swarmId });
+      const state = await invoke("swarm_get_state", { workspace_id: workspaceId, swarm_id: swarmId });
       if (!mountedRef.current) {
         return;
       }
@@ -1977,7 +1977,7 @@ export default function SwarmWorkspacePane({
       return;
     }
     try {
-      const result = await invoke("swarm_run_events", { workspaceId, swarmId, runId });
+      const result = await invoke("swarm_run_events", { workspace_id: workspaceId, swarm_id: swarmId, run_id: runId });
       if (!mountedRef.current || (selectedRunIdRef.current && selectedRunIdRef.current !== runId)) {
         return;
       }
@@ -2016,14 +2016,14 @@ export default function SwarmWorkspacePane({
     const unlistenPromises = [
       listen(SWARM_STATE_EVENT, (event) => {
         const payload = event?.payload || {};
-        if (cancelled || payload.swarmId !== swarmId || payload.workspaceId !== workspaceId) {
+        if (cancelled || payload.swarm_id !== swarmId || payload.workspace_id !== workspaceId) {
           return;
         }
         refreshState();
       }),
       listen(SWARM_RUN_EVENT, (event) => {
         const payload = event?.payload || {};
-        if (cancelled || payload.swarmId !== swarmId || payload.workspaceId !== workspaceId) {
+        if (cancelled || payload.swarm_id !== swarmId || payload.workspace_id !== workspaceId) {
           return;
         }
         const runEvent = payload.event || null;
@@ -2031,9 +2031,9 @@ export default function SwarmWorkspacePane({
           return;
         }
         const targetRunId = selectedRunIdRef.current
-          || String(swarmRef.current?.activeRunId || "")
-          || String(payload.runId || "");
-        if (payload.runId === targetRunId) {
+          || String(swarmRef.current?.active_run_id || "")
+          || String(payload.run_id || "");
+        if (payload.run_id === targetRunId) {
           setEvents((current) => {
             if (current.some((existing) => existing.seq === runEvent.seq)) {
               return current;
@@ -2043,22 +2043,22 @@ export default function SwarmWorkspacePane({
             return next;
           });
         }
-        if (runEvent.kind === "member_take" && runEvent.memberId) {
+        if (runEvent.kind === "member_take" && runEvent.member_id) {
           setTakeFlashes((current) => {
             const next = new Set(current);
-            next.add(runEvent.memberId);
+            next.add(runEvent.member_id);
             return next;
           });
-          const existingTimer = flashTimersRef.current.get(runEvent.memberId);
+          const existingTimer = flashTimersRef.current.get(runEvent.member_id);
           if (existingTimer) {
             window.clearTimeout(existingTimer);
           }
-          flashTimersRef.current.set(runEvent.memberId, window.setTimeout(() => {
-            flashTimersRef.current.delete(runEvent.memberId);
+          flashTimersRef.current.set(runEvent.member_id, window.setTimeout(() => {
+            flashTimersRef.current.delete(runEvent.member_id);
             if (mountedRef.current) {
               setTakeFlashes((current) => {
                 const next = new Set(current);
-                next.delete(runEvent.memberId);
+                next.delete(runEvent.member_id);
                 return next;
               });
             }
@@ -2100,15 +2100,15 @@ export default function SwarmWorkspacePane({
     setError("");
     try {
       const state = await invoke("swarm_configure", {
-        workspaceId,
-        swarmId,
-        repoPath,
+        workspace_id: workspaceId,
+        swarm_id: swarmId,
+        repo_path: repoPath,
         members: memberSpecs.slice(0, SWARM_MAX_MEMBERS),
-        scoutMemberId: scoutMemberId === undefined
-          ? String(swarmRef.current?.scoutMemberId || "")
+        scout_member_id: scoutMemberId === undefined
+          ? String(swarmRef.current?.scout_member_id || "")
           : String(scoutMemberId || ""),
-        verifyCommand: verifyCommand === undefined
-          ? String(swarmRef.current?.verifyCommand || "")
+        verify_command: verifyCommand === undefined
+          ? String(swarmRef.current?.verify_command || "")
           : String(verifyCommand || ""),
       });
       if (mountedRef.current) {
@@ -2145,7 +2145,7 @@ export default function SwarmWorkspacePane({
     }
     const specs = [
       ...members.map((member) => ({
-        memberId: member.memberId,
+        member_id: member.member_id,
         provider: member.provider,
         model: member.model || "",
         label: member.label || "",
@@ -2158,9 +2158,9 @@ export default function SwarmWorkspacePane({
 
   const handleRemoveMember = useCallback((memberId) => {
     const specs = members
-      .filter((member) => member.memberId !== memberId)
+      .filter((member) => member.member_id !== memberId)
       .map((member) => ({
-        memberId: member.memberId,
+        member_id: member.member_id,
         provider: member.provider,
         model: member.model || "",
         label: member.label || "",
@@ -2168,13 +2168,13 @@ export default function SwarmWorkspacePane({
     if (selectedMemberId === memberId) {
       setSelectedMemberId("");
     }
-    const currentScout = String(swarmRef.current?.scoutMemberId || "");
+    const currentScout = String(swarmRef.current?.scout_member_id || "");
     applyMembers(specs, currentScout === memberId ? "" : currentScout);
   }, [applyMembers, members, selectedMemberId]);
 
   const handleScoutChange = useCallback((scoutMemberId) => {
     const specs = members.map((member) => ({
-      memberId: member.memberId,
+      member_id: member.member_id,
       provider: member.provider,
       model: member.model || "",
       label: member.label || "",
@@ -2184,11 +2184,11 @@ export default function SwarmWorkspacePane({
 
   const handleVerifyCommandCommit = useCallback((verifyCommand) => {
     const next = String(verifyCommand || "").trim();
-    if (next === String(swarmRef.current?.verifyCommand || "")) {
+    if (next === String(swarmRef.current?.verify_command || "")) {
       return;
     }
     const specs = members.map((member) => ({
-      memberId: member.memberId,
+      member_id: member.member_id,
       provider: member.provider,
       model: member.model || "",
       label: member.label || "",
@@ -2201,7 +2201,7 @@ export default function SwarmWorkspacePane({
   const loadOpencodeModels = useCallback(async (forceRefresh = false) => {
     setOpencodeModels((current) => (current.status === "loading" ? current : { ...current, status: "loading" }));
     try {
-      const result = await invoke("opencode_list_models", { forceRefresh });
+      const result = await invoke("opencode_list_models", { force_refresh: forceRefresh });
       if (!mountedRef.current) {
         return;
       }
@@ -2242,9 +2242,9 @@ export default function SwarmWorkspacePane({
       return;
     }
     const specs = members.map((member) => ({
-      memberId: member.memberId,
+      member_id: member.member_id,
       provider: member.provider,
-      model: member.memberId === memberId ? nextModel : (member.model || ""),
+      model: member.member_id === memberId ? nextModel : (member.model || ""),
       label: member.label || "",
     }));
     applyMembers(specs);
@@ -2258,10 +2258,10 @@ export default function SwarmWorkspacePane({
     setError("");
     try {
       const state = await invoke("swarm_activate", {
-        workspaceId,
-        swarmId,
-        repoPath,
-        memberId: memberId || "",
+        workspace_id: workspaceId,
+        swarm_id: swarmId,
+        repo_path: repoPath,
+        member_id: memberId || "",
       });
       if (mountedRef.current) {
         setSwarm(state || null);
@@ -2276,18 +2276,18 @@ export default function SwarmWorkspacePane({
         // or an idempotent re-configure, which respawns missing sessions.
         try {
           const state = memberId
-            ? await invoke("swarm_member_restart", { workspaceId, swarmId, memberId })
+            ? await invoke("swarm_member_restart", { workspace_id: workspaceId, swarm_id: swarmId, member_id: memberId })
             : await invoke("swarm_configure", {
-              workspaceId,
-              swarmId,
-              repoPath,
+              workspace_id: workspaceId,
+              swarm_id: swarmId,
+              repo_path: repoPath,
               members: (swarmRef.current?.members || []).map((member) => ({
-                memberId: member.memberId,
+                member_id: member.member_id,
                 provider: member.provider,
                 model: member.model || "",
                 label: member.label || "",
               })),
-              scoutMemberId: String(swarmRef.current?.scoutMemberId || ""),
+              scout_member_id: String(swarmRef.current?.scout_member_id || ""),
             });
           if (mountedRef.current) {
             setSwarm(state || null);
@@ -2314,7 +2314,7 @@ export default function SwarmWorkspacePane({
     setBusy(true);
     setError("");
     try {
-      const state = await invoke("swarm_member_restart", { workspaceId, swarmId, memberId });
+      const state = await invoke("swarm_member_restart", { workspace_id: workspaceId, swarm_id: swarmId, member_id: memberId });
       if (mountedRef.current) {
         setSwarm(state || null);
       }
@@ -2338,10 +2338,10 @@ export default function SwarmWorkspacePane({
     setBusy(true);
     setError("");
     try {
-      const result = await invoke("swarm_submit_task", { workspaceId, swarmId, prompt: text, mode });
+      const result = await invoke("swarm_submit_task", { workspace_id: workspaceId, swarm_id: swarmId, prompt: text, mode });
       if (mountedRef.current) {
         setPrompt("");
-        setSelectedRunId(String(result?.runId || ""));
+        setSelectedRunId(String(result?.run_id || ""));
         setActiveTab((current) => (current === "overview" ? "overview" : "activity"));
         refreshState();
       }
@@ -2362,7 +2362,7 @@ export default function SwarmWorkspacePane({
     }
     setError("");
     try {
-      const state = await invoke("swarm_cancel_run", { workspaceId, swarmId, runId: activeRunId });
+      const state = await invoke("swarm_cancel_run", { workspace_id: workspaceId, swarm_id: swarmId, run_id: activeRunId });
       if (mountedRef.current) {
         setSwarm(state || null);
       }
@@ -2546,7 +2546,7 @@ export default function SwarmWorkspacePane({
           : lastRun.status === "cancelled"
             ? "Run cancelled"
             : "Run failed",
-        detail: truncateText(lastRun.resultSummary || lastRun.prompt, 52) || "—",
+        detail: truncateText(lastRun.result_summary || lastRun.prompt, 52) || "—",
       };
     }
     if (readyMemberCount === 0) {
@@ -2568,7 +2568,7 @@ export default function SwarmWorkspacePane({
   const selectedMember = selectedMemberId ? membersById.get(selectedMemberId) || null : null;
   const selectedMemberTakes = useMemo(() => (
     selectedMember
-      ? events.filter((event) => event.kind === "member_take" && event.memberId === selectedMember.memberId)
+      ? events.filter((event) => event.kind === "member_take" && event.member_id === selectedMember.member_id)
       : []
   ), [events, selectedMember]);
 
@@ -2653,9 +2653,9 @@ export default function SwarmWorkspacePane({
                 <ellipse cx="50" cy="50" data-orbit="inner" rx="23" ry="20.5" />
                 {orbPlacements.map(({ member, x, y }) => (
                   <line
-                    data-flash={takeFlashes.has(member.memberId) ? "true" : undefined}
+                    data-flash={takeFlashes.has(member.member_id) ? "true" : undefined}
                     data-live={member.status === "working" ? "true" : undefined}
-                    key={member.memberId}
+                    key={member.member_id}
                     style={{ "--swarm-edge-color": providerMeta(member.provider).color }}
                     x1={x}
                     x2={50}
@@ -2664,7 +2664,7 @@ export default function SwarmWorkspacePane({
                   />
                 ))}
                 {isActive ? orbPlacements.map(({ member, x, y }) => {
-                  const flashing = takeFlashes.has(member.memberId);
+                  const flashing = takeFlashes.has(member.member_id);
                   if (member.status !== "working" && !flashing) {
                     return null;
                   }
@@ -2673,7 +2673,7 @@ export default function SwarmWorkspacePane({
                     <circle
                       data-packet="true"
                       fill={meta.color}
-                      key={`packet-${member.memberId}`}
+                      key={`packet-${member.member_id}`}
                       r={flashing ? 1.1 : 0.85}
                       style={{ "--swarm-edge-color": meta.color }}
                     >
@@ -2698,17 +2698,17 @@ export default function SwarmWorkspacePane({
                 const meta = providerMeta(member.provider);
                 return (
                   <SwarmOrbAnchor
-                    key={member.memberId}
+                    key={member.member_id}
                     style={{ left: `${x}%`, top: `${y}%` }}
                   >
                     <SwarmOrbDrift style={{ "--swarm-orb-delay": `${index * 420}ms` }}>
                       <SwarmOrb
                         aria-label={`Inspect ${memberDisplayName(member)}`}
-                        data-flash={takeFlashes.has(member.memberId) ? "true" : undefined}
-                        data-selected={selectedMemberId === member.memberId ? "true" : undefined}
+                        data-flash={takeFlashes.has(member.member_id) ? "true" : undefined}
+                        data-selected={selectedMemberId === member.member_id ? "true" : undefined}
                         data-status={member.status || "offline"}
                         onClick={() => setSelectedMemberId((current) => (
-                          current === member.memberId ? "" : member.memberId
+                          current === member.member_id ? "" : member.member_id
                         ))}
                         style={{
                           "--swarm-orb-color": meta.color,
@@ -2845,20 +2845,20 @@ export default function SwarmWorkspacePane({
               </div>
               <div>
                 <small>Takes</small>
-                <strong>{Number(selectedMember.stats?.takesDelivered || 0)}</strong>
+                <strong>{Number(selectedMember.stats?.takes_delivered || 0)}</strong>
               </div>
               <div>
                 <small>Champion runs</small>
-                <strong>{Number(selectedMember.stats?.championRuns || 0)}</strong>
+                <strong>{Number(selectedMember.stats?.champion_runs || 0)}</strong>
               </div>
               <div>
                 <small>Scout runs</small>
-                <strong>{Number(selectedMember.stats?.scoutRuns || 0)}</strong>
+                <strong>{Number(selectedMember.stats?.scout_runs || 0)}</strong>
               </div>
               <div>
                 <small>Role</small>
                 <strong>
-                  {String(swarm?.scoutMemberId || "") === selectedMember.memberId ? "Scout" : "Member"}
+                  {String(swarm?.scout_member_id || "") === selectedMember.member_id ? "Scout" : "Member"}
                 </strong>
               </div>
               <div style={{ gridColumn: "1 / -1" }}>
@@ -2868,15 +2868,15 @@ export default function SwarmWorkspacePane({
             </SwarmSheetStats>
             <SwarmComposerControls>
               {selectedMember.status === "offline" || selectedMember.status === "dead" || selectedMember.status === "error" ? (
-                <SwarmPrimaryButton disabled={busy} onClick={() => handleActivateSwarm(selectedMember.memberId)} type="button">
+                <SwarmPrimaryButton disabled={busy} onClick={() => handleActivateSwarm(selectedMember.member_id)} type="button">
                   Start
                 </SwarmPrimaryButton>
               ) : (
-                <SwarmGhostButton disabled={busy} onClick={() => handleRestartMember(selectedMember.memberId)} type="button">
+                <SwarmGhostButton disabled={busy} onClick={() => handleRestartMember(selectedMember.member_id)} type="button">
                   Restart
                 </SwarmGhostButton>
               )}
-              <SwarmGhostButton data-danger="true" disabled={busy} onClick={() => handleRemoveMember(selectedMember.memberId)} type="button">
+              <SwarmGhostButton data-danger="true" disabled={busy} onClick={() => handleRemoveMember(selectedMember.member_id)} type="button">
                 Remove
               </SwarmGhostButton>
             </SwarmComposerControls>
@@ -2901,11 +2901,11 @@ export default function SwarmWorkspacePane({
               </SwarmEmptyHint>
             ) : (
               events.map((event) => {
-                const meta = event.memberId ? providerMeta(membersById.get(event.memberId)?.provider) : null;
+                const meta = event.member_id ? providerMeta(membersById.get(event.member_id)?.provider) : null;
                 const expandable = eventHasExpandableText(event);
                 const expanded = expandedSeqs.has(event.seq);
                 return (
-                  <SwarmFeedRow data-tone={swarmFeedEventTone(event)} key={`${event.runId}-${event.seq}`}>
+                  <SwarmFeedRow data-tone={swarmFeedEventTone(event)} key={`${event.run_id}-${event.seq}`}>
                     <SwarmFeedLine style={meta ? { "--swarm-edge-color": meta.color } : undefined}>
                       <time>{formatSwarmTime(event.at)}</time>
                       {meta ? <span data-member-dot="true" /> : null}
@@ -2936,11 +2936,11 @@ export default function SwarmWorkspacePane({
                     disabled={busy || backendMissing}
                     onChange={(event) => handleScoutChange(event.target.value)}
                     style={{ flex: "1 1 auto" }}
-                    value={String(swarm?.scoutMemberId || "")}
+                    value={String(swarm?.scout_member_id || "")}
                   >
                     <option value="">Auto — cheapest ready member</option>
                     {members.map((member) => (
-                      <option key={member.memberId} value={member.memberId}>
+                      <option key={member.member_id} value={member.member_id}>
                         {memberDisplayName(member)}
                         {memberModelText(member) ? ` — ${memberModelText(member)}` : ""}
                       </option>
@@ -2970,14 +2970,14 @@ export default function SwarmWorkspacePane({
                     placeholder="verify command (optional) — e.g. npm test"
                     spellCheck={false}
                     style={{ flex: "1 1 auto" }}
-                    value={verifyDraft === null ? String(swarm?.verifyCommand || "") : verifyDraft}
+                    value={verifyDraft === null ? String(swarm?.verify_command || "") : verifyDraft}
                   />
                 </SwarmAddMemberRow>
               ) : null}
               {members.map((member) => {
                 const meta = providerMeta(member.provider);
                 return (
-                  <SwarmMemberRow key={member.memberId}>
+                  <SwarmMemberRow key={member.member_id}>
                     <SwarmMemberBadge style={{ "--swarm-orb-color": meta.color }}>
                       <SwarmHarnessIcon provider={member.provider} />
                     </SwarmMemberBadge>
@@ -2986,11 +2986,11 @@ export default function SwarmWorkspacePane({
                       <small>
                         {memberModelText(member) ? `${memberModelText(member)} · ` : ""}
                         score {Number(member.score || 0)}
-                        {" · "}takes {Number(member.stats?.takesDelivered || 0)}
-                        {" · "}champion {Number(member.stats?.championRuns || 0)}
-                        {Number(member.stats?.scoutRuns || 0) > 0 ? ` · scouted ${member.stats.scoutRuns}` : ""}
+                        {" · "}takes {Number(member.stats?.takes_delivered || 0)}
+                        {" · "}champion {Number(member.stats?.champion_runs || 0)}
+                        {Number(member.stats?.scout_runs || 0) > 0 ? ` · scouted ${member.stats.scout_runs}` : ""}
                         {Number(member.stats?.reaps || 0) > 0 ? ` · reaps ${member.stats.reaps}` : ""}
-                        {String(swarm?.scoutMemberId || "") === member.memberId ? " · pinned scout" : ""}
+                        {String(swarm?.scout_member_id || "") === member.member_id ? " · pinned scout" : ""}
                       </small>
                     </SwarmMemberMain>
                     <SwarmMemberStatus data-status={member.status || "offline"}>
@@ -3001,7 +3001,7 @@ export default function SwarmWorkspacePane({
                         disabled={busy || backendMissing}
                         onClick={(event) => {
                           modelMenuAnchorRef.current = event.currentTarget;
-                          toggleModelMenu(member.memberId, member.provider);
+                          toggleModelMenu(member.member_id, member.provider);
                         }}
                         style={{ padding: "5px 7px", display: "inline-flex", alignItems: "center" }}
                         title={`Model: ${memberModelText(member) || "harness default"} — click to change (member relaunches)`}
@@ -3009,15 +3009,15 @@ export default function SwarmWorkspacePane({
                       >
                         <Tune size={13} />
                       </SwarmGhostButton>
-                      {modelMenuKey === member.memberId ? (
+                      {modelMenuKey === member.member_id ? (
                         <SwarmModelMenuPanel
                           anchorRef={modelMenuAnchorRef}
-                          currentModel={member.model || ""}
+                          current_model={member.model || ""}
                           onClose={() => setModelMenuKey("")}
                           onRefresh={() => loadOpencodeModels(true)}
                           onSelect={(model) => {
                             setModelMenuKey("");
-                            handleMemberModelChange(member.memberId, model);
+                            handleMemberModelChange(member.member_id, model);
                           }}
                           opencodeModels={opencodeModels}
                           provider={member.provider}
@@ -3027,18 +3027,18 @@ export default function SwarmWorkspacePane({
                     {member.status === "offline" || member.status === "dead" || member.status === "error" ? (
                       <SwarmGhostButton
                         disabled={busy}
-                        onClick={() => handleActivateSwarm(member.memberId)}
+                        onClick={() => handleActivateSwarm(member.member_id)}
                         style={{ borderColor: "rgba(76, 141, 255, 0.5)", color: "#79b8ff" }}
                         type="button"
                       >
                         Start
                       </SwarmGhostButton>
                     ) : (
-                      <SwarmGhostButton disabled={busy} onClick={() => handleRestartMember(member.memberId)} type="button">
+                      <SwarmGhostButton disabled={busy} onClick={() => handleRestartMember(member.member_id)} type="button">
                         Restart
                       </SwarmGhostButton>
                     )}
-                    <SwarmGhostButton data-danger="true" disabled={busy} onClick={() => handleRemoveMember(member.memberId)} type="button">
+                    <SwarmGhostButton data-danger="true" disabled={busy} onClick={() => handleRemoveMember(member.member_id)} type="button">
                       Remove
                     </SwarmGhostButton>
                   </SwarmMemberRow>
@@ -3080,10 +3080,10 @@ export default function SwarmWorkspacePane({
             ) : (
               runs.map((run) => (
                 <SwarmRunRow
-                  data-selected={run.runId === viewedRunId ? "true" : undefined}
-                  key={run.runId}
+                  data-selected={run.run_id === viewedRunId ? "true" : undefined}
+                  key={run.run_id}
                   onClick={() => {
-                    setSelectedRunId(run.runId);
+                    setSelectedRunId(run.run_id);
                     setActiveTab("activity");
                   }}
                   type="button"

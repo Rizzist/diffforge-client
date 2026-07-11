@@ -93,73 +93,62 @@ function finiteNumber(...values) {
 /* ------------------------------------------------------------------ */
 
 export function messageTool(message = {}) {
-  return plainObject(message.tool || message.tool_call || message.toolCall);
+  return plainObject(message.tool || message.tool_call);
 }
 
 export function messageFileChange(message = {}) {
-  const source = plainObject(message.file_change || message.fileChange);
+  const source = plainObject(message.file_change);
   const files = transcriptArray(
-    source?.files
-      || source?.changed_files
-      || source?.changedFiles
-      || message.files
-      || message.changed_files
-      || message.changedFiles,
+    source?.files || source?.changed_files || message.files || message.changed_files,
   );
   if (!files.length) return null;
   return { ...(source || {}), files };
 }
 
 export function messageSubagent(message = {}) {
-  const source = plainObject(message.subagent || message.subAgent);
-  const hasFields = ["subagent_id", "subagentId", "sub_agent_id", "subAgentId"]
+  const source = plainObject(message.subagent);
+  const hasFields = ["subagent_id", "sub_agent_id"]
     .some((key) => hasOwn(message, key));
   if (!source && !hasFields) return null;
   const owner = source || message;
   const id = transcriptText(
-    owner.subagent_id || owner.subagentId || owner.sub_agent_id || owner.subAgentId
-      || (source ? owner.id : ""),
+    owner.subagent_id || owner.sub_agent_id || source ? owner.id : "",
   );
   const agentChatSessionId = transcriptText(
-    owner.agent_chat_session_id || owner.agentChatSessionId,
+    owner.agent_chat_session_id,
   );
   const providerSessionId = transcriptText(
-    owner.provider_session_id || owner.providerSessionId,
+    owner.provider_session_id,
   );
   return {
     ...(source || {}),
     id,
-    parentId: transcriptText(owner.parent_id || owner.parentId),
+    parent_id: transcriptText(owner.parent_id),
     title: transcriptText(owner.title || owner.name || message.title),
     status: transcriptToken(owner.status || owner.state || message.status),
-    sessionRef: agentChatSessionId || providerSessionId
-      ? { agentChatSessionId, providerSessionId }
+    session_ref: agentChatSessionId || providerSessionId
+      ? { agent_chat_session_id: agentChatSessionId, provider_session_id: providerSessionId }
       : null,
   };
 }
 
 export function messageUsage(message = {}) {
-  return plainObject(message.usage || message.usage_report || message.usageReport);
+  return plainObject(message.usage || message.usage_report);
 }
 
 export function messageTruncated(message = {}) {
-  const hasFlag = ["truncated", "is_truncated", "isTruncated", "partial"]
+  const hasFlag = ["truncated", "is_truncated", "partial"]
     .some((key) => hasOwn(message, key));
   if (!hasFlag) return false;
   return transcriptBool(
-    message.truncated ?? message.is_truncated ?? message.isTruncated ?? message.partial,
+    message.truncated ?? message.is_truncated ?? message.partial,
     false,
   );
 }
 
 export function messageKindToken(message = {}) {
   return transcriptToken(
-    message.kind
-      || message.message_kind
-      || message.messageKind
-      || message.content_kind
-      || message.contentKind
-      || message.type,
+    message.kind || message.message_kind || message.content_kind || message.type,
   );
 }
 
@@ -220,26 +209,26 @@ export function isTurnSummaryMessage(message = {}) {
 
 export function normalizeTurnSummary(message = {}) {
   if (!isTurnSummaryMessage(message)) return null;
-  const turnId = transcriptText(message.turn_id || message.turnId);
+  const turnId = transcriptText(message.turn_id);
   if (!turnId) return null;
-  const usage = plainObject(message.usage || message.usage_report || message.usageReport) || null;
-  const fileChangeSource = plainObject(message.file_change || message.fileChange);
+  const usage = plainObject(message.usage || message.usage_report) || null;
+  const fileChangeSource = plainObject(message.file_change);
   const files = transcriptArray(fileChangeSource?.files)
     .map(normalizeFileChangeFile)
     .filter(Boolean);
-  const startedAtMs = transcriptTimestampMs(message.started_at || message.startedAt);
-  const completedAtMs = transcriptTimestampMs(message.completed_at || message.completedAt);
-  let durationMs = finiteNumber(message.duration_ms, message.durationMs);
+  const startedAtMs = transcriptTimestampMs(message.started_at);
+  const completedAtMs = transcriptTimestampMs(message.completed_at);
+  let durationMs = finiteNumber(message.duration_ms);
   if (durationMs == null && Number.isFinite(startedAtMs) && Number.isFinite(completedAtMs)) {
     durationMs = Math.max(0, completedAtMs - startedAtMs);
   }
   return {
-    turnId,
-    startedAtMs,
-    completedAtMs,
-    durationMs,
+    turn_id: turnId,
+    started_at_ms: startedAtMs,
+    completed_at_ms: completedAtMs,
+    duration_ms: durationMs,
     usage,
-    fileChange: files.length
+    file_change: files.length
       ? { files, summary: transcriptText(fileChangeSource?.summary) }
       : null,
   };
@@ -250,7 +239,7 @@ export function extractTurnSummaries(messages = []) {
   transcriptArray(messages).forEach((message) => {
     const summary = normalizeTurnSummary(message);
     if (summary) {
-      summaries.set(summary.turnId, summary);
+      summaries.set(summary.turn_id, summary);
     }
   });
   return summaries;
@@ -269,19 +258,19 @@ const TURN_DIFF_FILE_KINDS = new Set(["edit", "create", "delete", "rename"]);
 export function normalizeTurnDiffFile(file = {}) {
   const source = plainObject(file);
   if (!source) return null;
-  const path = transcriptText(source.path || source.file || source.new_path || source.newPath);
+  const path = transcriptText(source.path || source.file || source.new_path);
   if (!path) return null;
-  const kind = transcriptToken(source.kind || source.change_kind || source.changeKind);
+  const kind = transcriptToken(source.kind || source.change_kind);
   const patch = typeof source.patch === "string" && source.patch ? source.patch : null;
   return {
     path,
-    oldPath: transcriptText(source.old_path || source.oldPath || source.from) || null,
+    old_path: transcriptText(source.old_path || source.from) || null,
     kind: TURN_DIFF_FILE_KINDS.has(kind) ? kind : "edit",
-    additions: finiteNumber(source.additions, source.lines_added, source.linesAdded),
-    deletions: finiteNumber(source.deletions, source.lines_removed, source.linesRemoved),
+    additions: finiteNumber(source.additions, source.lines_added),
+    deletions: finiteNumber(source.deletions, source.lines_removed),
     binary: transcriptBool(source.binary, false),
     patch,
-    patchTruncated: transcriptBool(source.patch_truncated ?? source.patchTruncated, false),
+    patch_truncated: transcriptBool(source.patch_truncated, false),
   };
 }
 
@@ -293,48 +282,48 @@ export function normalizeTurnDiffFile(file = {}) {
 // fetchable from the synthetic file-change row.
 export function normalizeTurnDiff(message = {}) {
   if (!isTurnDiffMessage(message)) return null;
-  const turnId = transcriptText(message.turn_id || message.turnId);
+  const turnId = transcriptText(message.turn_id);
   const files = transcriptArray(message.files)
     .map(normalizeTurnDiffFile)
     .filter(Boolean);
   if (!turnId && !files.length) return null;
   const totals = fileChangeTotals(files);
   const timestampMs = transcriptTimestampMs(
-    message.timestamp || message.created_at || message.createdAt,
+    message.timestamp || message.created_at,
   );
-  const startedAtMs = transcriptTimestampMs(message.started_at || message.startedAt) ?? timestampMs;
-  const completedAtMs = transcriptTimestampMs(message.completed_at || message.completedAt)
+  const startedAtMs = transcriptTimestampMs(message.started_at) ?? timestampMs;
+  const completedAtMs = transcriptTimestampMs(message.completed_at)
     ?? timestampMs;
   const recordSeqRaw = finiteNumber(
-    message.record_seq, message.recordSeq, message.server_seq, message.serverSeq,
+    message.record_seq, message.server_seq,
   );
-  const filesOmittedRaw = finiteNumber(message.files_omitted, message.filesOmitted);
+  const filesOmittedRaw = finiteNumber(message.files_omitted);
   return {
-    turnId,
+    turn_id: turnId,
     files,
-    totalAdditions: finiteNumber(message.total_additions, message.totalAdditions)
+    total_additions: finiteNumber(message.total_additions)
       ?? totals.additions,
-    totalDeletions: finiteNumber(message.total_deletions, message.totalDeletions)
+    total_deletions: finiteNumber(message.total_deletions)
       ?? totals.deletions,
-    truncated: transcriptBool(message.truncated ?? message.is_truncated ?? message.isTruncated, false),
-    filesOmitted: filesOmittedRaw != null && filesOmittedRaw > 0 ? Math.floor(filesOmittedRaw) : 0,
-    recordId: transcriptText(message.record_id || message.recordId),
-    recordSeq: recordSeqRaw != null && recordSeqRaw > 0 ? recordSeqRaw : null,
-    startedAtMs,
-    completedAtMs,
+    truncated: transcriptBool(message.truncated ?? message.is_truncated, false),
+    files_omitted: filesOmittedRaw != null && filesOmittedRaw > 0 ? Math.floor(filesOmittedRaw) : 0,
+    record_id: transcriptText(message.record_id),
+    record_seq: recordSeqRaw != null && recordSeqRaw > 0 ? recordSeqRaw : null,
+    started_at_ms: startedAtMs,
+    completed_at_ms: completedAtMs,
   };
 }
 
 function turnDiffOrderTimestampMs(diff = {}) {
-  return diff.completedAtMs ?? diff.startedAtMs ?? null;
+  return diff.completed_at_ms ?? diff.started_at_ms ?? null;
 }
 
 // Order-independent same-turn replacement: a higher positive recordSeq wins;
 // a seq-bearing record beats a seqless one; with equal/absent seqs the later
 // timestamp wins; otherwise the existing entry stays.
 function turnDiffReplaces(existing, incoming) {
-  const existingSeq = existing.recordSeq;
-  const incomingSeq = incoming.recordSeq;
+  const existingSeq = existing.record_seq;
+  const incomingSeq = incoming.record_seq;
   if (existingSeq != null && incomingSeq != null && existingSeq !== incomingSeq) {
     return incomingSeq > existingSeq;
   }
@@ -349,10 +338,10 @@ export function extractTurnDiffs(messages = []) {
   const diffs = new Map();
   transcriptArray(messages).forEach((message) => {
     const diff = normalizeTurnDiff(message);
-    if (!diff || !diff.turnId) return;
-    const existing = diffs.get(diff.turnId);
+    if (!diff || !diff.turn_id) return;
+    const existing = diffs.get(diff.turn_id);
     if (!existing || turnDiffReplaces(existing, diff)) {
-      diffs.set(diff.turnId, diff);
+      diffs.set(diff.turn_id, diff);
     }
   });
   return diffs;
@@ -363,11 +352,11 @@ export function extractTurnDiffs(messages = []) {
 /* ------------------------------------------------------------------ */
 
 const USAGE_FIELDS = [
-  ["inputTokens", ["input_tokens", "inputTokens", "prompt_tokens", "promptTokens"]],
-  ["outputTokens", ["output_tokens", "outputTokens", "completion_tokens", "completionTokens"]],
-  ["cacheReadTokens", ["cache_read_tokens", "cacheReadTokens", "cache_read_input_tokens"]],
-  ["cacheWriteTokens", ["cache_write_tokens", "cacheWriteTokens", "cache_creation_input_tokens"]],
-  ["costUsd", ["cost_usd", "costUsd"]],
+  ["input_tokens", ["input_tokens", "prompt_tokens"]],
+  ["output_tokens", ["output_tokens", "completion_tokens"]],
+  ["cache_read_tokens", ["cache_read_tokens", "cache_read_input_tokens"]],
+  ["cache_write_tokens", ["cache_write_tokens", "cache_creation_input_tokens"]],
+  ["cost_usd", ["cost_usd"]],
 ];
 
 export function normalizeUsage(usage = null) {
@@ -401,7 +390,7 @@ export function usageTotalsByTurn(messages = []) {
     if (isTurnSummaryMessage(message)) return;
     const usage = messageUsage(message);
     if (!usage) return;
-    const turnId = transcriptText(message.turnId || message.turn_id);
+    const turnId = transcriptText(message.turn_id);
     if (!turnId) return;
     totals.set(turnId, addUsage(totals.get(turnId) || null, usage));
   });
@@ -425,7 +414,7 @@ export function sessionUsageTotals({ stats = null, messages = [] } = {}) {
 export function usageTotalTokens(usage = null) {
   const normalized = normalizeUsage(usage);
   if (!normalized) return null;
-  const total = (normalized.inputTokens || 0) + (normalized.outputTokens || 0);
+  const total = (normalized.input_tokens || 0) + (normalized.output_tokens || 0);
   return total > 0 ? total : null;
 }
 
@@ -444,9 +433,9 @@ export function normalizeFileChangeFile(file = {}) {
   if (!path) return null;
   return {
     path,
-    kind: transcriptToken(source.kind || source.change_kind || source.changeKind || source.status) || "edit",
-    additions: finiteNumber(source.additions, source.lines_added, source.linesAdded),
-    deletions: finiteNumber(source.deletions, source.lines_removed, source.linesRemoved),
+    kind: transcriptToken(source.kind || source.change_kind || source.status) || "edit",
+    additions: finiteNumber(source.additions, source.lines_added),
+    deletions: finiteNumber(source.deletions, source.lines_removed),
   };
 }
 
@@ -465,7 +454,7 @@ export function fileChangeTotals(files = []) {
 /* ------------------------------------------------------------------ */
 
 export function transcriptItemDomId(item = {}, index = 0, prefix = "agent-thread-item") {
-  const raw = transcriptText(item.id || item.message?.id || item.turnId || item.turn_id || index, `${index}`);
+  const raw = transcriptText(item.id || item.message?.id || item.turn_id || index, `${index}`);
   const slug = raw.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
   return `${prefix}-${index}-${slug || "item"}`;
 }
@@ -479,7 +468,7 @@ function messageRowKind(message = {}) {
   if (messageSubagent(message)) return "subagent-note";
   const role = transcriptToken(message.role);
   if (role === "user") return "user";
-  const format = transcriptToken(message.format || message.content_format || message.contentFormat);
+  const format = transcriptToken(message.format || message.content_format);
   if (format === "terminal") return "terminal-output";
   if (role === "activity") return "tool";
   return "assistant";
@@ -487,19 +476,14 @@ function messageRowKind(message = {}) {
 
 function rowTurnId(item = {}, message = {}) {
   return transcriptText(
-    item.turnId
-      || item.turn_id
-      || message.turnId
-      || message.turn_id
-      || "",
+    item.turn_id || message.turn_id || "",
   );
 }
 
 function rowTimestampMs(row = {}) {
   const message = row.message || {};
   return transcriptTimestampMs(
-    message.timestamp || message.created_at || message.createdAt
-      || row.item?.timestamp,
+    message.timestamp || message.created_at || row.item?.timestamp,
   );
 }
 
@@ -515,14 +499,14 @@ export function flattenTranscriptItems(items = [], { itemIdPrefix = "agent-threa
   };
   const walk = (item, keyPath, inheritedTurnId, domId) => {
     if (!item || typeof item !== "object") return;
-    const type = transcriptToken(item.type || item.itemType || item.item_type) || "message";
+    const type = transcriptToken(item.type || item.item_type) || "message";
     const baseKey = transcriptText(item.id, keyPath) || keyPath;
     if (type === "divider") {
       pushRow({
         kind: "divider",
         key: `divider:${baseKey}`,
-        domId,
-        turnId: "",
+        dom_id: domId,
+        turn_id: "",
         item,
         message: null,
       });
@@ -532,22 +516,22 @@ export function flattenTranscriptItems(items = [], { itemIdPrefix = "agent-threa
       pushRow({
         kind: "command",
         key: `command:${baseKey}`,
-        domId,
-        turnId: transcriptText(item.turnId || item.turn_id) || inheritedTurnId,
+        dom_id: domId,
+        turn_id: transcriptText(item.turn_id) || inheritedTurnId,
         item,
         message: item.message || null,
       });
       return;
     }
     if (type === "assistantblock" || type === "assistant-block") {
-      const blockTurnId = transcriptText(item.turnId || item.turn_id) || inheritedTurnId;
+      const blockTurnId = transcriptText(item.turn_id) || inheritedTurnId;
       transcriptArray(item.items).forEach((child, childIndex) => {
         walk(child, `${baseKey}:${childIndex}`, blockTurnId, childIndex === 0 ? domId : undefined);
       });
       return;
     }
     if (type === "activitygroup" || type === "activity-group") {
-      const groupTurnId = transcriptText(item.turnId || item.turn_id) || inheritedTurnId;
+      const groupTurnId = transcriptText(item.turn_id) || inheritedTurnId;
       transcriptArray(item.messages).forEach((message, messageIndex) => {
         if (isTurnSummaryMessage(message || {}) || isTurnDiffMessage(message || {})) return;
         const kind = messageRowKind(message || {});
@@ -555,8 +539,8 @@ export function flattenTranscriptItems(items = [], { itemIdPrefix = "agent-threa
         pushRow({
           kind,
           key: `activity:${baseKey}:${transcriptText(message?.id, `${messageIndex}`)}`,
-          domId: messageIndex === 0 ? domId : undefined,
-          turnId: rowTurnId({ turnId: groupTurnId }, message || {}),
+          dom_id: messageIndex === 0 ? domId : undefined,
+          turn_id: rowTurnId({ turn_id: groupTurnId }, message || {}),
           item,
           message: message || {},
         });
@@ -567,8 +551,8 @@ export function flattenTranscriptItems(items = [], { itemIdPrefix = "agent-threa
       pushRow({
         kind: "reasoning",
         key: `reasoning:${baseKey}`,
-        domId,
-        turnId: rowTurnId(item, item.message || {}) || inheritedTurnId,
+        dom_id: domId,
+        turn_id: rowTurnId(item, item.message || {}) || inheritedTurnId,
         item,
         message: item.message || item,
       });
@@ -581,8 +565,8 @@ export function flattenTranscriptItems(items = [], { itemIdPrefix = "agent-threa
     pushRow({
       kind: messageKind,
       key: `message:${baseKey}`,
-      domId,
-      turnId: rowTurnId(item, message) || inheritedTurnId,
+      dom_id: domId,
+      turn_id: rowTurnId(item, message) || inheritedTurnId,
       item,
       message,
     });
@@ -621,7 +605,7 @@ export function groupRowsIntoTurns(rows = [], options = {}) {
     currentOpenedByAnchor = openedByAnchor;
     current = {
       key: seedKey,
-      turnId: "",
+      turn_id: "",
       rows: [],
     };
     return current;
@@ -629,7 +613,7 @@ export function groupRowsIntoTurns(rows = [], options = {}) {
   transcriptArray(rows).forEach((row) => {
     if (row.kind === "divider") {
       close();
-      groups.push({ key: `divider:${row.key}`, turnId: "", rows: [row], divider: true });
+      groups.push({ key: `divider:${row.key}`, turn_id: "", rows: [row], divider: true });
       return;
     }
     const isAnchor = row.kind === "user" || row.kind === "command";
@@ -638,20 +622,20 @@ export function groupRowsIntoTurns(rows = [], options = {}) {
       open(`turn:${row.key}`, true);
     } else if (
       current
-      && row.turnId
-      && current.turnId
-      && row.turnId !== current.turnId
+      && row.turn_id
+      && current.turn_id
+      && row.turn_id !== current.turn_id
     ) {
       close();
-      open(occurrenceKey(row.turnId));
+      open(occurrenceKey(row.turn_id));
     } else if (!current) {
       open(`turn:${row.key}`);
     }
     current.rows.push(row);
-    if (row.turnId && !current.turnId) {
-      current.turnId = row.turnId;
+    if (row.turn_id && !current.turn_id) {
+      current.turn_id = row.turn_id;
       if (currentOpenedByAnchor) {
-        current.key = occurrenceKey(row.turnId);
+        current.key = occurrenceKey(row.turn_id);
       }
     }
   });
@@ -695,15 +679,15 @@ export const SUBAGENT_NESTING_DEPTH_CAP = 3;
 
 function subagentRefMatchesSession(sessionRef = null, sessionId = "") {
   if (!sessionRef || !sessionId) return false;
-  return sessionRef.agentChatSessionId === sessionId
-    || sessionRef.providerSessionId === sessionId;
+  return sessionRef.agent_chat_session_id === sessionId
+    || sessionRef.provider_session_id === sessionId;
 }
 
 // Consecutive work rows carrying the same subagent linkage nest inside a
 // single subagent-group row. Rows whose subagent carries a parent_id that
 // points at an open group nest recursively (depth cap 3, deeper rows
 // flatten into the depth-cap group). Any non-subagent row closes the run.
-function wrapSubagentRuns(rows = [], { sessionId = "" } = {}) {
+function wrapSubagentRuns(rows = [], { session_id: sessionId = "" } = {}) {
   const wrapped = [];
   let stack = [];
   // runIds flattened into a depth-cap group get no group of their own, so
@@ -714,14 +698,14 @@ function wrapSubagentRuns(rows = [], { sessionId = "" } = {}) {
   const makeGroup = (subagent, runId, row, depth) => ({
     kind: "subagent-group",
     key: `subagent:${runId}:${row.key}`,
-    domId: row.domId,
-    turnId: row.turnId,
-    subagentId: runId,
+    dom_id: row.dom_id,
+    turn_id: row.turn_id,
+    subagent_id: runId,
     title: subagent.title || "Subagent",
     status: subagent.status || "",
     depth,
-    sessionRef: subagent.sessionRef && !subagentRefMatchesSession(subagent.sessionRef, sessionId)
-      ? subagent.sessionRef
+    session_ref: subagent.session_ref && !subagentRefMatchesSession(subagent.session_ref, sessionId)
+      ? subagent.session_ref
       : null,
     childRows: [],
   });
@@ -733,13 +717,13 @@ function wrapSubagentRuns(rows = [], { sessionId = "" } = {}) {
       wrapped.push(row);
       return;
     }
-    const openIndex = stack.findIndex((group) => group.subagentId === runId);
+    const openIndex = stack.findIndex((group) => group.subagent_id === runId);
     if (openIndex >= 0) {
       stack = stack.slice(0, openIndex + 1);
     } else {
-      const parentId = subagent.parentId || "";
+      const parentId = subagent.parent_id || "";
       const parentIndex = parentId
-        ? stack.findIndex((group) => group.subagentId === parentId)
+        ? stack.findIndex((group) => group.subagent_id === parentId)
         : -1;
       if (parentIndex >= 0) {
         stack = stack.slice(0, parentIndex + 1);
@@ -769,17 +753,17 @@ function wrapSubagentRuns(rows = [], { sessionId = "" } = {}) {
       }
     }
     const target = stack[stack.length - 1];
-    if (target.subagentId === runId) {
+    if (target.subagent_id === runId) {
       if ((!target.title || target.title === "Subagent") && subagent.title) {
         target.title = subagent.title;
       }
       if (subagent.status) target.status = subagent.status;
       if (
-        !target.sessionRef
-        && subagent.sessionRef
-        && !subagentRefMatchesSession(subagent.sessionRef, sessionId)
+        !target.session_ref
+        && subagent.session_ref
+        && !subagentRefMatchesSession(subagent.session_ref, sessionId)
       ) {
-        target.sessionRef = subagent.sessionRef;
+        target.session_ref = subagent.session_ref;
       }
     }
     target.childRows.push(row);
@@ -808,7 +792,7 @@ export function subagentGroupStats(group = {}) {
   return {
     messages,
     toolCalls,
-    durationMs: Number.isFinite(spread) && spread > 0 ? spread : null,
+    duration_ms: Number.isFinite(spread) && spread > 0 ? spread : null,
   };
 }
 
@@ -829,13 +813,13 @@ export function countToolCalls(workRows = []) {
 }
 
 function groupFileTotals(group, turnSummary, diffSummary, turnDiff = null) {
-  if (turnSummary?.fileChange?.files?.length) {
-    return fileChangeTotals(turnSummary.fileChange.files);
+  if (turnSummary?.file_change?.files?.length) {
+    return fileChangeTotals(turnSummary.file_change.files);
   }
   if (turnDiff?.files?.length) {
     return {
-      additions: Math.max(0, Number(turnDiff.totalAdditions) || 0),
-      deletions: Math.max(0, Number(turnDiff.totalDeletions) || 0),
+      additions: Math.max(0, Number(turnDiff.total_additions) || 0),
+      deletions: Math.max(0, Number(turnDiff.total_deletions) || 0),
     };
   }
   if (diffSummary) {
@@ -897,11 +881,11 @@ export function attachTurnRecordsToGroups(groups = [], records = new Map()) {
   if (!(records instanceof Map) || !records.size) return byGroupKey;
   const matchedTurnIds = new Set();
   transcriptArray(groups).forEach((group) => {
-    if (group.divider || !group.turnId) return;
-    const record = records.get(group.turnId);
+    if (group.divider || !group.turn_id) return;
+    const record = records.get(group.turn_id);
     if (record) {
       byGroupKey.set(group.key, record);
-      matchedTurnIds.add(group.turnId);
+      matchedTurnIds.add(group.turn_id);
     }
   });
   const candidates = transcriptArray(groups)
@@ -909,10 +893,10 @@ export function attachTurnRecordsToGroups(groups = [], records = new Map()) {
     .map((group) => ({ group, range: groupTimestampRange(group) }))
     .filter((candidate) => candidate.range);
   records.forEach((record) => {
-    if (matchedTurnIds.has(record.turnId)) return;
-    if (!Number.isFinite(record.startedAtMs) || !Number.isFinite(record.completedAtMs)) return;
-    const windowStart = record.startedAtMs - TURN_SUMMARY_WINDOW_TOLERANCE_MS;
-    const windowEnd = record.completedAtMs + TURN_SUMMARY_WINDOW_TOLERANCE_MS;
+    if (matchedTurnIds.has(record.turn_id)) return;
+    if (!Number.isFinite(record.started_at_ms) || !Number.isFinite(record.completed_at_ms)) return;
+    const windowStart = record.started_at_ms - TURN_SUMMARY_WINDOW_TOLERANCE_MS;
+    const windowEnd = record.completed_at_ms + TURN_SUMMARY_WINDOW_TOLERANCE_MS;
     let best = null;
     let bestOverlap = -1;
     candidates.forEach((candidate) => {
@@ -939,8 +923,8 @@ function groupUsage(group, turnSummary, usageByTurn) {
   if (turnSummary?.usage) {
     return normalizeUsage(turnSummary.usage);
   }
-  if (group.turnId && usageByTurn?.get?.(group.turnId)) {
-    return usageByTurn.get(group.turnId);
+  if (group.turn_id && usageByTurn?.get?.(group.turn_id)) {
+    return usageByTurn.get(group.turn_id);
   }
   let totals = null;
   const collect = (row) => {
@@ -980,12 +964,12 @@ export function computeFoldSummary(group, {
   const { additions, deletions } = groupFileTotals(group, turnSummary, diffSummary, turnDiff);
   const usage = groupUsage(group, turnSummary, usageByTurn);
   return {
-    durationMs: turnSummary?.durationMs ?? groupTimestampSpreadMs(group),
+    duration_ms: turnSummary?.duration_ms ?? groupTimestampSpreadMs(group),
     toolCalls: countToolCalls(group.workRows),
     additions,
     deletions,
     usage,
-    totalTokens: usageTotalTokens(usage),
+    total_tokens: usageTotalTokens(usage),
     hasError: groupHasError(group),
     fromTurnSummary: Boolean(turnSummary),
   };
@@ -1000,7 +984,7 @@ function diffSummariesByTurn(diffSummaries = []) {
   const unattached = [];
   transcriptArray(diffSummaries).forEach((summary, index) => {
     if (!summary || typeof summary !== "object") return;
-    const turnId = transcriptText(summary.turnId || summary.turn_id);
+    const turnId = transcriptText(summary.turn_id);
     if (turnId) {
       byTurn.set(turnId, summary);
     } else {
@@ -1016,15 +1000,15 @@ function diffSummariesByTurn(diffSummaries = []) {
 // nothing to carry (no refs, not truncated).
 export function turnDiffSyntheticMessage(turnDiff = null) {
   if (!turnDiff) return null;
-  const recordId = transcriptText(turnDiff.recordId);
-  const recordSeq = Number.isFinite(turnDiff.recordSeq) && turnDiff.recordSeq > 0
-    ? turnDiff.recordSeq
+  const recordId = transcriptText(turnDiff.record_id);
+  const recordSeq = Number.isFinite(turnDiff.record_seq) && turnDiff.record_seq > 0
+    ? turnDiff.record_seq
     : null;
   const truncated = Boolean(turnDiff.truncated);
   if (!recordId && recordSeq == null && !truncated) return null;
   return {
-    ...(recordId ? { record_id: recordId, recordId } : {}),
-    ...(recordSeq != null ? { record_seq: recordSeq, recordSeq } : {}),
+    ...(recordId ? { record_id: recordId } : {}),
+    ...(recordSeq != null ? { record_seq: recordSeq } : {}),
     truncated,
   };
 }
@@ -1036,7 +1020,7 @@ export function syntheticFileChangeRow(source, key, turnId = "") {
   return {
     kind: "file-change",
     key,
-    turnId,
+    turn_id: turnId,
     synthetic: true,
     files,
     additions: totals.additions,
@@ -1056,16 +1040,16 @@ export function syntheticFileChangeRow(source, key, turnId = "") {
 // expanded.
 export function buildTranscriptRows(items = [], {
   itemIdPrefix = "agent-thread-item",
-  diffSummaries = [],
+  diff_summaries: diffSummaries = [],
   turnSummaries = null,
   turnDiffs = null,
   usageByTurn = null,
   expandedTurnKeys = null,
   busy = false,
-  sessionId = "",
+  session_id: sessionId = "",
 } = {}) {
   const flat = flattenTranscriptItems(items, { itemIdPrefix });
-  const groups = groupRowsIntoTurns(flat, { sessionId });
+  const groups = groupRowsIntoTurns(flat, { session_id: sessionId });
   const { byTurn: diffByTurn, unattached: unattachedDiffs } = diffSummariesByTurn(diffSummaries);
   const summaries = turnSummaries instanceof Map ? turnSummaries : new Map();
   const summariesByGroupKey = attachTurnSummariesToGroups(groups, summaries);
@@ -1087,8 +1071,8 @@ export function buildTranscriptRows(items = [], {
     const tagRow = (row) => ({ ...row, groupKey: group.key });
     const turnSummary = summariesByGroupKey.get(group.key) || null;
     const turnDiff = turnDiffsByGroupKey.get(group.key) || null;
-    const diffSummary = group.turnId ? diffByTurn.get(group.turnId) || null : null;
-    if (group.turnId && diffSummary) consumedDiffTurnIds.add(group.turnId);
+    const diffSummary = group.turn_id ? diffByTurn.get(group.turn_id) || null : null;
+    if (group.turn_id && diffSummary) consumedDiffTurnIds.add(group.turn_id);
 
     let workRows = [...group.workRows];
     const hasFileChangeRow = workRows.some((row) => row.kind === "file-change");
@@ -1104,21 +1088,21 @@ export function buildTranscriptRows(items = [], {
         workRows.push({
           kind: "file-change",
           key: `file-change:${group.key}`,
-          turnId: group.turnId,
+          turn_id: group.turn_id,
           synthetic: true,
           files: turnDiff.files,
-          additions: Math.max(0, Number(turnDiff.totalAdditions) || 0),
-          deletions: Math.max(0, Number(turnDiff.totalDeletions) || 0),
-          summary: transcriptText(turnSummary?.fileChange?.summary),
+          additions: Math.max(0, Number(turnDiff.total_additions) || 0),
+          deletions: Math.max(0, Number(turnDiff.total_deletions) || 0),
+          summary: transcriptText(turnSummary?.file_change?.summary),
           turnDiff,
           item: null,
           message: turnDiffSyntheticMessage(turnDiff),
         });
       } else {
-        const source = turnSummary?.fileChange
+        const source = turnSummary?.file_change
           || (diffSummary ? { files: diffSummary.files, summary: diffSummary.summary } : null);
         if (source) {
-          const synthetic = syntheticFileChangeRow(source, `file-change:${group.key}`, group.turnId);
+          const synthetic = syntheticFileChangeRow(source, `file-change:${group.key}`, group.turn_id);
           if (synthetic) workRows.push(synthetic);
         }
       }
@@ -1138,7 +1122,7 @@ export function buildTranscriptRows(items = [], {
         rows.push({
           kind: "fold",
           key: `fold:${group.key}`,
-          turnId: group.turnId,
+          turn_id: group.turn_id,
           groupKey: group.key,
           foldable,
           folded: foldable && !isExpanded,
@@ -1165,7 +1149,7 @@ export function buildTranscriptRows(items = [], {
   unattachedDiffs.forEach(({ summary, index }) => {
     const synthetic = syntheticFileChangeRow(
       { files: summary.files, summary: summary.summary },
-      `file-change:unattached:${transcriptText(summary.summaryKey || summary.summary_key, `${index}`)}`,
+      `file-change:unattached:${transcriptText(summary.summary_key, `${index}`)}`,
     );
     if (synthetic) rows.push(synthetic);
   });
@@ -1218,7 +1202,7 @@ export function formatTokensCompact(count) {
 export function foldHeaderLabel(summary = null) {
   if (!summary) return "Worked";
   const parts = [];
-  const duration = formatDurationMs(summary.durationMs);
+  const duration = formatDurationMs(summary.duration_ms);
   parts.push(duration ? `Worked for ${duration}` : "Worked");
   if (summary.toolCalls > 0) {
     parts.push(`${summary.toolCalls} tool call${summary.toolCalls === 1 ? "" : "s"}`);
@@ -1226,7 +1210,7 @@ export function foldHeaderLabel(summary = null) {
   if ((summary.additions || 0) > 0 || (summary.deletions || 0) > 0) {
     parts.push(`+${summary.additions || 0}/−${summary.deletions || 0}`);
   }
-  const tokens = formatTokensCompact(summary.totalTokens);
+  const tokens = formatTokensCompact(summary.total_tokens);
   if (tokens) {
     parts.push(`${tokens} tokens`);
   }
@@ -1237,11 +1221,11 @@ export function usageTooltip(usage = null) {
   const normalized = normalizeUsage(usage);
   if (!normalized) return "";
   const parts = [];
-  if (Number.isFinite(normalized.inputTokens)) parts.push(`input ${normalized.inputTokens}`);
-  if (Number.isFinite(normalized.outputTokens)) parts.push(`output ${normalized.outputTokens}`);
-  if (Number.isFinite(normalized.cacheReadTokens)) parts.push(`cache read ${normalized.cacheReadTokens}`);
-  if (Number.isFinite(normalized.cacheWriteTokens)) parts.push(`cache write ${normalized.cacheWriteTokens}`);
-  if (Number.isFinite(normalized.costUsd)) parts.push(`$${normalized.costUsd.toFixed(4)}`);
+  if (Number.isFinite(normalized.input_tokens)) parts.push(`input ${normalized.input_tokens}`);
+  if (Number.isFinite(normalized.output_tokens)) parts.push(`output ${normalized.output_tokens}`);
+  if (Number.isFinite(normalized.cache_read_tokens)) parts.push(`cache read ${normalized.cache_read_tokens}`);
+  if (Number.isFinite(normalized.cache_write_tokens)) parts.push(`cache write ${normalized.cache_write_tokens}`);
+  if (Number.isFinite(normalized.cost_usd)) parts.push(`$${normalized.cost_usd.toFixed(4)}`);
   return parts.join(" · ");
 }
 
@@ -1272,9 +1256,7 @@ export function toolDurationMs(message = {}) {
   const tool = messageTool(message) || {};
   return finiteNumber(
     message.duration_ms,
-    message.durationMs,
     tool.duration_ms,
-    tool.durationMs,
   );
 }
 
@@ -1286,25 +1268,22 @@ export function toolExitCode(message = {}) {
   ].map(plainObject).filter(Boolean);
   return finiteNumber(
     tool.exit_code,
-    tool.exitCode,
     message.exit_code,
-    message.exitCode,
-    ...nestedSources.flatMap((source) => [source.exit_code, source.exitCode]),
+    ...nestedSources.flatMap((source) => [source.exit_code]),
   );
 }
 
 export function toolName(message = {}) {
   const tool = messageTool(message) || {};
   return transcriptText(
-    tool.title || tool.name || tool.tool_name || tool.toolName
-      || message.title || message.name,
+    tool.title || tool.name || tool.tool_name || message.title || message.name,
     "Tool call",
   );
 }
 
 const TOOL_INPUT_SUMMARY_KEYS = [
   "command", "cmd", "script",
-  "path", "file_path", "filePath", "file", "notebook_path",
+  "path", "file_path", "file", "notebook_path",
   "pattern", "query", "prompt", "description",
   "url", "name", "target",
 ];
@@ -1369,13 +1348,12 @@ export function artifactImageUrl(artifact = {}) {
   const source = plainObject(artifact);
   if (!source) return "";
   const url = transcriptText(
-    source.url || source.href || source.asset_url || source.assetUrl
-      || source.public_url || source.publicUrl,
+    source.url || source.href || source.asset_url || source.public_url,
   );
   // Local previews (the composer's optimistic sent-bubble attachment
   // thumbnails) ride blob:/data:image URLs; everything else must be http(s).
   if (!/^https?:\/\//i.test(url) && !/^blob:/i.test(url) && !/^data:image\//i.test(url)) return "";
-  const kind = transcriptToken(source.kind || source.type || source.content_type || source.contentType);
+  const kind = transcriptToken(source.kind || source.type || source.content_type);
   if (kind.includes("image") || kind.includes("screenshot") || kind.includes("png") || kind.includes("jpeg")) {
     return url;
   }
@@ -1386,7 +1364,7 @@ export function artifactImageUrl(artifact = {}) {
 }
 
 export function reasoningDurationMs(message = {}) {
-  return finiteNumber(message.duration_ms, message.durationMs);
+  return finiteNumber(message.duration_ms);
 }
 
 export function rowHeightEstimate(row = {}) {

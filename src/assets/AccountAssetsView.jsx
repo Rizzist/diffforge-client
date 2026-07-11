@@ -107,20 +107,19 @@ function assetLibraryClouds(value) {
     ? jsonArray(fanout.clouds)
     : jsonArray(data.clouds).length
     ? jsonArray(data.clouds)
-    : jsonArray(data.assetClouds).length
-      ? jsonArray(data.assetClouds)
+    : jsonArray(data.asset_clouds).length
+      ? jsonArray(data.asset_clouds)
       : jsonArray(data.asset_clouds);
   const byId = new Map();
   const add = (cloud) => {
     if (!cloud || typeof cloud !== "object") return;
-    const id = text(cloud.cloudId || cloud.cloud_id || cloud.id);
+    const id = text(cloud.cloud_id || cloud.id);
     if (!id || byId.has(id)) return;
     byId.set(id, {
       ...cloud,
-      cloudId: id,
       cloud_id: id,
       label: text(cloud.label || cloud.name, id === DEFAULT_ASSET_CLOUD_ID ? "Diff Forge AI Cloud" : id),
-      providerKind: text(cloud.providerKind || cloud.provider_kind || cloud.provider, id === DEFAULT_ASSET_CLOUD_ID ? "diffforge" : "s3"),
+      provider_kind: text(cloud.provider_kind || cloud.provider, id === DEFAULT_ASSET_CLOUD_ID ? "diffforge" : "s3"),
     });
   };
   direct.forEach(add);
@@ -131,12 +130,9 @@ function assetLibraryClouds(value) {
   });
   if (!byId.has(DEFAULT_ASSET_CLOUD_ID)) {
     add({
-      cloudId: DEFAULT_ASSET_CLOUD_ID,
       cloud_id: DEFAULT_ASSET_CLOUD_ID,
       label: "Diff Forge AI Cloud",
-      providerKind: "diffforge",
       provider_kind: "diffforge",
-      defaultCloud: true,
       default_cloud: true,
       builtin: true,
       status: "active",
@@ -146,15 +142,15 @@ function assetLibraryClouds(value) {
 }
 
 function assetId(asset, fallback = "") {
-  return text(asset?.assetId || asset?.asset_id || asset?.id, fallback);
+  return text(asset?.asset_id || asset?.id, fallback);
 }
 
 function assetName(asset, fallback = "asset") {
-  return text(asset?.name || asset?.filename || asset?.fileName || asset?.file_name, fallback);
+  return text(asset?.name || asset?.filename || asset?.file_name, fallback);
 }
 
 function assetKind(asset) {
-  return text(asset?.kind || asset?.assetKind || asset?.asset_kind || asset?.mimeType || asset?.mime_type, "asset");
+  return text(asset?.kind || asset?.asset_kind || asset?.mime_type, "asset");
 }
 
 function assetStatusKind(status) {
@@ -183,35 +179,22 @@ function assetStatusKind(status) {
 }
 
 function assetTransferStatusKind(transfer) {
-  return assetStatusKind(transfer?.status || transfer?.transferStatus || transfer?.transfer_status);
+  return assetStatusKind(transfer?.status || transfer?.transfer_status);
 }
 
 function assetTransferAssetId(transfer) {
-  return text(transfer?.assetId || transfer?.asset_id);
+  return text(transfer?.asset_id);
 }
 
 function assetTransferUpdatedAt(transfer) {
-  const value = Date.parse(text(transfer?.updatedAt || transfer?.updated_at || transfer?.createdAt || transfer?.created_at));
+  const value = Date.parse(text(transfer?.updated_at || transfer?.created_at));
   return Number.isFinite(value) ? value : 0;
 }
 
 function assetTransferDeviceName(transfer) {
   const device = transfer?.device && typeof transfer.device === "object" ? transfer.device : {};
   return text(
-    device.displayName
-      || device.display_name
-      || device.deviceName
-      || device.device_name
-      || transfer?.deviceName
-      || transfer?.device_name
-      || device.machineName
-      || device.machine_name
-      || transfer?.machineName
-      || transfer?.machine_name
-      || device.deviceId
-      || device.device_id
-      || transfer?.deviceId
-      || transfer?.device_id,
+    device.display_name || device.device_name || transfer?.device_name || device.machine_name || transfer?.machine_name || device.device_id || transfer?.device_id,
     "device",
   );
 }
@@ -235,11 +218,11 @@ function assetTransferDeviceSummary(transfers) {
 }
 
 function assetTransferCloudId(transfer) {
-  return text(transfer?.cloudId || transfer?.cloud_id || transfer?.assetCloudId || transfer?.asset_cloud_id, DEFAULT_ASSET_CLOUD_ID);
+  return text(transfer?.cloud_id || transfer?.asset_cloud_id, DEFAULT_ASSET_CLOUD_ID);
 }
 
 function assetTransferDirection(transfer) {
-  const direction = text(transfer?.direction || transfer?.transferDirection || transfer?.transfer_direction).toLowerCase();
+  const direction = text(transfer?.direction || transfer?.transfer_direction).toLowerCase();
   if (direction.includes("download")) return "download";
   if (direction.includes("upload")) return "upload";
   return "";
@@ -252,7 +235,7 @@ function assetTransferCacheKey(assetIdValue, cloudId = DEFAULT_ASSET_CLOUD_ID, d
 }
 
 function assetTransferShadowedByAsset(transfer, asset, cloudId = DEFAULT_ASSET_CLOUD_ID) {
-  const status = text(transfer?.status || transfer?.transferStatus || transfer?.transfer_status).toLowerCase();
+  const status = text(transfer?.status || transfer?.transfer_status).toLowerCase();
   if (!["failed", "interrupted"].includes(status)) return false;
   const direction = assetTransferDirection(transfer);
   if (direction === "upload") return assetCloudAvailable(asset, cloudId);
@@ -261,9 +244,9 @@ function assetTransferShadowedByAsset(transfer, asset, cloudId = DEFAULT_ASSET_C
 }
 
 function assetTransferClearedOnRestart(transfer) {
-  const status = text(transfer?.status || transfer?.transferStatus || transfer?.transfer_status).toLowerCase();
+  const status = text(transfer?.status || transfer?.transfer_status).toLowerCase();
   if (status !== "interrupted") return false;
-  const error = text(transfer?.error || transfer?.errorMessage || transfer?.error_message).toLowerCase();
+  const error = text(transfer?.error || transfer?.error_message).toLowerCase();
   return error.includes("diff forge reopened") || error.includes("previous-process asset transfer");
 }
 
@@ -281,12 +264,12 @@ function latestAssetTransfer(transfers, asset, cloudId = DEFAULT_ASSET_CLOUD_ID)
 }
 
 function assetTransferId(transfer) {
-  return text(transfer?.transferId || transfer?.transfer_id || transfer?.id);
+  return text(transfer?.transfer_id || transfer?.id);
 }
 
 function assetTransferPercent(transfer) {
-  const total = Number(transfer?.bytesTotal ?? transfer?.bytes_total ?? 0) || 0;
-  const done = Number(transfer?.bytesDone ?? transfer?.bytes_done ?? 0) || 0;
+  const total = Number(transfer?.bytes_total ?? 0) || 0;
+  const done = Number(transfer?.bytes_done ?? 0) || 0;
   if (total <= 0) return null;
   const percent = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
   if (assetTransferStatusKind(transfer) === "active") {
@@ -324,8 +307,8 @@ function formatAssetTimestamp(value) {
 }
 
 function assetTransferBytesSummary(transfer) {
-  const total = Number(transfer?.bytesTotal ?? transfer?.bytes_total ?? 0) || 0;
-  const done = Number(transfer?.bytesDone ?? transfer?.bytes_done ?? 0) || 0;
+  const total = Number(transfer?.bytes_total ?? 0) || 0;
+  const done = Number(transfer?.bytes_done ?? 0) || 0;
   if (total <= 0 && done <= 0) return "";
   if (total > 0) {
     const percent = assetTransferPercent(transfer);
@@ -344,9 +327,7 @@ function assetTransferDirectionLabel(transfer) {
 function assetDeviceRows(asset) {
   return [
     ...jsonArray(asset?.devices),
-    ...jsonArray(asset?.assetDevices),
     ...jsonArray(asset?.asset_devices),
-    ...jsonArray(asset?.localCopies),
     ...jsonArray(asset?.local_copies),
     ...jsonArray(asset?.locations),
   ].filter((device) => device && typeof device === "object");
@@ -354,34 +335,22 @@ function assetDeviceRows(asset) {
 
 function assetDeviceId(device) {
   return text(
-    device?.deviceId
-      || device?.device_id
-      || device?.machineId
-      || device?.machine_id
-      || device?.id,
+    device?.device_id || device?.machine_id || device?.id,
   );
 }
 
 function assetDeviceName(device) {
   return text(
-    device?.deviceName
-      || device?.device_name
-      || device?.machineName
-      || device?.machine_name
-      || device?.hostname
-      || device?.name,
+    device?.device_name || device?.machine_name || device?.hostname || device?.name,
     assetDeviceId(device),
   );
 }
 
 function assetDeviceLocalAvailable(device) {
-  const explicit = device?.localAvailable ?? device?.local_available ?? device?.available;
+  const explicit = device?.local_available ?? device?.available;
   if (typeof explicit === "boolean") return explicit;
   const status = text(
-    device?.localStatus
-      || device?.local_status
-      || device?.status
-      || device?.availability,
+    device?.local_status || device?.status || device?.availability,
   ).toLowerCase().replace(/[_\s]+/gu, "-");
   return ["available", "local-available", "present", "ready", "synced"].includes(status);
 }
@@ -392,23 +361,13 @@ function assetCurrentDeviceLocalAvailable(asset, currentDeviceId = "") {
   return assetDeviceRows(asset).some((device) => {
     if (!assetDeviceLocalAvailable(device)) return false;
     const id = assetDeviceId(device).toLowerCase();
-    return id === currentId
-      || device?.current
-      || device?.isCurrent
-      || device?.is_current
-      || device?.currentDevice
-      || device?.current_device;
+    return id === currentId || device?.current || device?.is_current || device?.current_device;
   });
 }
 
 function assetDeviceUpdatedAt(device) {
   return text(
-    device?.updatedAt
-      || device?.updated_at
-      || device?.lastSeenAt
-      || device?.last_seen_at
-      || device?.seenAt
-      || device?.seen_at,
+    device?.updated_at || device?.last_seen_at || device?.seen_at,
   );
 }
 
@@ -422,8 +381,8 @@ function assetRemoteDevices(asset, currentDeviceId = "") {
     const id = assetDeviceId(device);
     const idKey = id.toLowerCase();
     if (currentId && idKey === currentId) return;
-    if (device?.current || device?.isCurrent || device?.is_current || device?.currentDevice || device?.current_device) return;
-    const devicePath = text(device?.localPath || device?.local_path || device?.path);
+    if (device?.current || device?.is_current || device?.current_device) return;
+    const devicePath = text(device?.local_path || device?.path);
     if (!currentId && localPath && devicePath && devicePath === localPath) return;
     const name = assetDeviceName(device);
     const key = (id || name).toLowerCase();
@@ -431,9 +390,9 @@ function assetRemoteDevices(asset, currentDeviceId = "") {
       seen.add(key);
       remoteDevices.push({
         ...device,
-        deviceId: id,
-        deviceName: name,
-        updatedAt: assetDeviceUpdatedAt(device),
+        device_id: id,
+        device_name: name,
+        updated_at: assetDeviceUpdatedAt(device),
       });
     }
   });
@@ -441,21 +400,19 @@ function assetRemoteDevices(asset, currentDeviceId = "") {
 }
 
 function assetRemoteDeviceNames(asset, currentDeviceId = "") {
-  return assetRemoteDevices(asset, currentDeviceId).map((device) => device.deviceName);
+  return assetRemoteDevices(asset, currentDeviceId).map((device) => device.device_name);
 }
 
 function assetLocalPath(asset) {
   return text(
-    asset?.localPath
-      || asset?.local_path
-      || asset?.path,
+    asset?.local_path || asset?.path,
   );
 }
 
 function assetLocalAvailable(asset) {
-  const explicit = asset?.localAvailable ?? asset?.local_available;
+  const explicit = asset?.local_available;
   if (typeof explicit === "boolean") return explicit && Boolean(assetLocalPath(asset));
-  const localStatus = text(asset?.localStatus || asset?.local_status).toLowerCase().replace(/[_\s]+/gu, "-");
+  const localStatus = text(asset?.local_status).toLowerCase().replace(/[_\s]+/gu, "-");
   if (["deleted", "local-deleted", "local-missing", "missing", "not-found", "unavailable"].includes(localStatus)) return false;
   return Boolean(assetLocalPath(asset));
 }
@@ -463,7 +420,6 @@ function assetLocalAvailable(asset) {
 function assetCloudState(asset, cloudId = DEFAULT_ASSET_CLOUD_ID) {
   const selectedCloud = text(cloudId, DEFAULT_ASSET_CLOUD_ID);
   const maps = [
-    jsonObject(asset?.cloudStatusByCloud),
     jsonObject(asset?.cloud_status_by_cloud),
   ].filter(Boolean);
   for (const map of maps) {
@@ -471,27 +427,26 @@ function assetCloudState(asset, cloudId = DEFAULT_ASSET_CLOUD_ID) {
   }
   const rows = [
     ...jsonArray(asset?.clouds),
-    ...jsonArray(asset?.cloudStatuses),
     ...jsonArray(asset?.cloud_statuses),
   ];
-  return rows.find((row) => text(row?.cloudId || row?.cloud_id || row?.id) === selectedCloud) || null;
+  return rows.find((row) => text(row?.cloud_id || row?.id) === selectedCloud) || null;
 }
 
 function assetCloudAvailable(asset, cloudId = DEFAULT_ASSET_CLOUD_ID) {
   const cloudState = assetCloudState(asset, cloudId);
   if (cloudState) {
-    const explicit = cloudState.cloudAvailable ?? cloudState.cloud_available;
+    const explicit = cloudState.cloud_available;
     if (typeof explicit === "boolean") return explicit;
     const stateStatus = text(
-      cloudState.cloudStatus || cloudState.cloud_status || cloudState.status,
+      cloudState.cloud_status || cloudState.status,
     ).toLowerCase().replace(/[_\s]+/gu, "-");
     if (["complete", "cloud-available", "available", "ready", "synced", "uploaded"].includes(stateStatus)) return true;
     if (["deleted", "cloud-deleted-local-kept", "local-only", "missing", "not-found", "unavailable"].includes(stateStatus)) return false;
   }
-  const explicit = asset?.cloudAvailable ?? asset?.cloud_available;
+  const explicit = asset?.cloud_available;
   if (typeof explicit === "boolean") return explicit;
   const cloudStatus = text(
-    asset?.cloudStatus || asset?.cloud_status || asset?.status || asset?.assetStatus || asset?.asset_status,
+    asset?.cloud_status || asset?.status || asset?.asset_status,
   ).toLowerCase().replace(/[_\s]+/gu, "-");
   if (["cloud-deleted-local-kept", "deleted", "local-only", "missing", "not-found", "unavailable"].includes(cloudStatus)) {
     return false;
@@ -499,7 +454,7 @@ function assetCloudAvailable(asset, cloudId = DEFAULT_ASSET_CLOUD_ID) {
   if (["available", "cloud-available", "cloud-only", "complete", "completed", "ready", "synced", "uploaded"].includes(cloudStatus)) {
     return true;
   }
-  return Boolean(asset?.blobId || asset?.blob_id || asset?.objectKey || asset?.object_key);
+  return Boolean(asset?.blob_id || asset?.object_key);
 }
 
 function assetAvailability(asset, cloudId = DEFAULT_ASSET_CLOUD_ID, cloudLabel = "Cloud", currentDeviceId = "") {
@@ -540,8 +495,8 @@ function assetAvailability(asset, cloudId = DEFAULT_ASSET_CLOUD_ID, cloudLabel =
 function AssetAvailabilityBadges({
   availability,
   cloudLabel = "Cloud",
-  currentDeviceName = "this device",
-  isPublic = false,
+  current_device_name: currentDeviceName = "this device",
+  is_public: isPublic = false,
   remoteDeviceNames = [],
 }) {
   const remoteCount = numberValue(availability?.remoteCount);
@@ -588,7 +543,7 @@ function AssetAvailabilityBadges({
 }
 
 function assetMimeType(asset) {
-  return text(asset?.mimeType || asset?.mime_type || asset?.contentType || asset?.content_type);
+  return text(asset?.mime_type || asset?.content_type);
 }
 
 function assetFileExtension(asset) {
@@ -624,21 +579,17 @@ function assetFileTypeLabel(asset) {
 }
 
 function assetSha(asset) {
-  return text(asset?.sha256 || asset?.hash || asset?.contentHash || asset?.content_hash);
+  return text(asset?.sha256 || asset?.hash || asset?.content_hash);
 }
 
 function assetPublicLink(asset) {
-  return jsonObject(asset?.publicLink || asset?.public_link) || null;
+  return jsonObject(asset?.public_link) || null;
 }
 
 function assetPublicUrl(asset) {
   const link = assetPublicLink(asset);
   return text(
-    asset?.publicUrl
-      || asset?.public_url
-      || link?.publicUrl
-      || link?.public_url
-      || link?.url,
+    asset?.public_url || link?.public_url || link?.url,
   );
 }
 
@@ -646,7 +597,7 @@ function assetPublicUrl(asset) {
    URL keys, and the field-level merge keeps the stale URL string around, so
    URL presence alone would leave the card stuck on "Make private". */
 function assetIsPublic(asset) {
-  const explicit = asset?.public ?? asset?.isPublic ?? asset?.is_public;
+  const explicit = asset?.public ?? asset?.is_public;
   if (typeof explicit === "boolean") return explicit;
   return Boolean(assetPublicUrl(asset));
 }
@@ -654,7 +605,7 @@ function assetIsPublic(asset) {
 function assetTransferFailureDetails({
   asset,
   assetIdValue,
-  cloudId,
+  cloud_id: cloudId,
   cloudLabel,
   direction,
   transfer,
@@ -680,12 +631,12 @@ function assetTransferFailureFromAction(action, asset, cloudLabel, cloudId, erro
   const id = assetId(asset);
   const errorMessage = error?.message || String(error || `${operation} failed.`);
   return {
-    assetId: id,
-    cloudId,
+    asset_id: id,
+    cloud_id: cloudId,
     details: assetTransferFailureDetails({
       asset,
       assetIdValue: id,
-      cloudId,
+      cloud_id: cloudId,
       cloudLabel,
       direction,
       transfer: null,
@@ -694,7 +645,7 @@ function assetTransferFailureFromAction(action, asset, cloudLabel, cloudId, erro
     key: `action:${direction}:${cloudId}:${id}:${Date.now()}`,
     message: errorMessage,
     title: `${operation} failed for ${assetName(asset, "asset")}`,
-    updatedAt: Date.now(),
+    updated_at: Date.now(),
   };
 }
 
@@ -732,13 +683,13 @@ async function copyTextToClipboard(value) {
 }
 
 export default function AccountAssetsView({
-  defaultWorkingDirectory = "",
+  default_working_directory: defaultWorkingDirectory = "",
   error = "",
   library = null,
   loading = false,
   onLoadCached = null,
   onRefresh = null,
-  rootDirectory = "",
+  root_directory: rootDirectory = "",
   syncing = false,
   untrackedError = "",
   untrackedLibrary = null,
@@ -836,7 +787,7 @@ function useAssetToastController() {
       ...toast,
       key,
       kind,
-      createdAt: Date.now(),
+      created_at: Date.now(),
       details: jsonArray(toast?.details),
     };
     dismissedToastKeysRef.current.delete(key);
@@ -888,20 +839,10 @@ function AssetsPanel({
   const aggregate = useMemo(() => assetLibraryAggregate(library), [library]);
   const libraryClouds = useMemo(() => assetLibraryClouds(library), [library]);
   const currentDeviceId = text(
-    library?.currentDeviceId
-      || library?.current_device_id
-      || library?.deviceId
-      || library?.device_id
-      || library?.device?.deviceId
-      || library?.device?.device_id,
+    library?.current_device_id || library?.device_id || library?.device?.device_id,
   );
   const currentDeviceName = text(
-    library?.currentDeviceName
-      || library?.current_device_name
-      || library?.deviceName
-      || library?.device_name
-      || library?.device?.deviceName
-      || library?.device?.device_name,
+    library?.current_device_name || library?.device_name || library?.device?.device_name,
     "This device",
   );
   const [cloudsOverride, setCloudsOverride] = useState([]);
@@ -909,11 +850,10 @@ function AssetsPanel({
   const clouds = useMemo(() => {
     const byId = new Map();
     [...libraryClouds, ...cloudsOverride].forEach((cloud) => {
-      const id = text(cloud?.cloudId || cloud?.cloud_id || cloud?.id);
+      const id = text(cloud?.cloud_id || cloud?.id);
       if (!id) return;
       byId.set(id, {
         ...cloud,
-        cloudId: id,
         cloud_id: id,
         label: text(cloud?.label || cloud?.name, id === DEFAULT_ASSET_CLOUD_ID ? "Diff Forge AI Cloud" : id),
       });
@@ -922,8 +862,7 @@ function AssetsPanel({
   }, [cloudsOverride, libraryClouds]);
   const defaultCloudId = useMemo(() => (
     text(
-      clouds.find((cloud) => cloud?.defaultCloud || cloud?.default_cloud)?.cloudId
-        || clouds.find((cloud) => cloud?.defaultCloud || cloud?.default_cloud)?.cloud_id,
+      clouds.find((cloud) => cloud?.default_cloud)?.cloud_id,
       DEFAULT_ASSET_CLOUD_ID,
     )
   ), [clouds]);
@@ -944,16 +883,16 @@ function AssetsPanel({
   const [optimisticTransfers, setOptimisticTransfers] = useState({});
 
   const selectedCloud = useMemo(() => (
-    clouds.find((cloud) => text(cloud.cloudId || cloud.cloud_id || cloud.id) === selectedCloudId)
-      || clouds.find((cloud) => text(cloud.cloudId || cloud.cloud_id || cloud.id) === defaultCloudId)
-      || { cloudId: DEFAULT_ASSET_CLOUD_ID, cloud_id: DEFAULT_ASSET_CLOUD_ID, label: "Diff Forge AI Cloud" }
+    clouds.find((cloud) => text(cloud.cloud_id || cloud.id) === selectedCloudId)
+      || clouds.find((cloud) => text(cloud.cloud_id || cloud.id) === defaultCloudId)
+      || { cloud_id: DEFAULT_ASSET_CLOUD_ID, label: "Diff Forge AI Cloud" }
   ), [clouds, defaultCloudId, selectedCloudId]);
   const selectedCloudLabel = text(selectedCloud?.label || selectedCloud?.name, "Cloud");
-  const effectiveCloudId = text(selectedCloud?.cloudId || selectedCloud?.cloud_id || selectedCloudId, DEFAULT_ASSET_CLOUD_ID);
+  const effectiveCloudId = text(selectedCloud?.cloud_id || selectedCloudId, DEFAULT_ASSET_CLOUD_ID);
 
   useEffect(() => {
     if (!clouds.length) return;
-    const ids = new Set(clouds.map((cloud) => text(cloud.cloudId || cloud.cloud_id || cloud.id)).filter(Boolean));
+    const ids = new Set(clouds.map((cloud) => text(cloud.cloud_id || cloud.id)).filter(Boolean));
     if (!ids.has(selectedCloudId)) {
       setSelectedCloudId(defaultCloudId);
     }
@@ -971,7 +910,7 @@ function AssetsPanel({
   const visibleTransfers = useMemo(() => {
     const rows = [...transfers, ...optimisticTransferRows];
     return rows
-      .filter((transfer) => visibleAssetIds.has(text(transfer?.assetId || transfer?.asset_id)))
+      .filter((transfer) => visibleAssetIds.has(text(transfer?.asset_id)))
       .filter((transfer) => assetTransferCloudId(transfer) === effectiveCloudId);
   }, [effectiveCloudId, optimisticTransferRows, transfers, visibleAssetIds]);
   const activeToastKeySet = useMemo(
@@ -994,7 +933,7 @@ function AssetsPanel({
   const cloudCount = filteredItems.filter((item) => assetAvailability(item, effectiveCloudId, selectedCloudLabel, currentDeviceId).hasCloud).length;
   const localCount = filteredItems.filter((item) => assetAvailability(item, effectiveCloudId, selectedCloudLabel, currentDeviceId).hasLocal).length;
   const remoteCount = filteredItems.filter((item) => assetAvailability(item, effectiveCloudId, selectedCloudLabel, currentDeviceId).hasRemote).length;
-  const activeTransfers = numberValue(aggregate.activeTransfers ?? aggregate.active_transfers, 0)
+  const activeTransfers = numberValue(aggregate.active_transfers, 0)
     || visibleTransfers.filter((transfer) => assetTransferStatusKind(transfer) === "active").length;
   const activeTransferSummary = useMemo(
     () => assetTransferDeviceSummary(visibleTransfers),
@@ -1061,7 +1000,7 @@ function AssetsPanel({
   }, [infoAssetId]);
 
   const runCloudSettingsAction = useCallback(async (action, payload = {}) => {
-    const cloudId = text(payload.cloudId || payload.cloud_id || payload.id);
+    const cloudId = text(payload.cloud_id || payload.id);
     const key = `${action}:${cloudId || "new"}`;
     setCloudSettingsBusy(key);
     setCloudSettingsError("");
@@ -1072,14 +1011,14 @@ function AssetsPanel({
           cloud: payload,
         });
         const savedCloud = jsonObject(response?.cloud) || {};
-        const savedCloudId = text(savedCloud.cloudId || savedCloud.cloud_id || savedCloud.id);
+        const savedCloudId = text(savedCloud.cloud_id || savedCloud.id);
         if (savedCloudId) {
           // A freshly added bucket becomes the active sync target right away
           // and is probed immediately so its verified/error status is honest.
           setSelectedCloudId(savedCloudId);
           try {
             await invoke("cloud_mcp_validate_asset_cloud", {
-              cloudId: savedCloudId,
+              cloud_id: savedCloudId,
             });
           } catch (validationError) {
             setCloudSettingsError(
@@ -1090,16 +1029,16 @@ function AssetsPanel({
         }
       } else if (action === "validate") {
         response = await invoke("cloud_mcp_validate_asset_cloud", {
-          cloudId,
+          cloud_id: cloudId,
         });
       } else if (action === "default") {
         response = await invoke("cloud_mcp_set_default_asset_cloud", {
-          cloudId,
+          cloud_id: cloudId,
         });
         if (cloudId) setSelectedCloudId(cloudId);
       } else if (action === "delete") {
         response = await invoke("cloud_mcp_delete_asset_cloud", {
-          cloudId,
+          cloud_id: cloudId,
         });
         if (cloudId === effectiveCloudId) setSelectedCloudId(DEFAULT_ASSET_CLOUD_ID);
       } else if (action === "refresh") {
@@ -1150,28 +1089,22 @@ function AssetsPanel({
     const key = assetTransferCacheKey(id, cloudId, "upload");
     if (!key) return;
     const now = new Date().toISOString();
-    const sizeBytes = numberValue(asset?.sizeBytes ?? asset?.size_bytes, 0);
+    const sizeBytes = numberValue(asset?.size_bytes, 0);
     setOptimisticTransfers((current) => {
       const currentRow = current[key] || {};
-      const transferId = currentRow.transferId || currentRow.transfer_id || `local-upload-${id}-${Date.now()}`;
-      const bytesDone = status === "completed" ? sizeBytes : numberValue(fields.bytesDone ?? fields.bytes_done, 0);
+      const transferId = currentRow.transfer_id || `local-upload-${id}-${Date.now()}`;
+      const bytesDone = status === "completed" ? sizeBytes : numberValue(fields.bytes_done, 0);
       return {
         ...current,
         [key]: {
           ...currentRow,
-          transferId,
           transfer_id: transferId,
-          assetId: id,
           asset_id: id,
-          cloudId,
           cloud_id: cloudId,
           direction: "upload",
           status,
-          bytesTotal: sizeBytes,
           bytes_total: sizeBytes,
-          bytesDone,
           bytes_done: bytesDone,
-          updatedAt: now,
           updated_at: now,
           ...fields,
         },
@@ -1291,22 +1224,19 @@ function AssetsPanel({
         // stay until the CloudOff action removes private and public storage.
         if (!localPath) return;
         const response = await invoke("diffforge_untrack_account_asset", {
-          assetId: id,
+          asset_id: id,
           name,
           path: localPath,
         });
         adoptAccountAssetsLibraryEvent(response);
       } else if (action === "publish") {
         const response = await invoke("cloud_mcp_publish_account_asset", {
-          assetId: id,
-          cloudId: effectiveCloudId,
+          asset_id: id,
+          cloud_id: effectiveCloudId,
         });
         adoptAccountAssetsLibraryEvent(response);
         const publicUrl = text(
-          response?.publicUrl
-            || response?.public_url
-            || response?.publicLink?.publicUrl
-            || response?.public_link?.public_url,
+          response?.public_url || response?.public_link?.public_url,
         );
         if (publicUrl) {
           const copied = await copyTextToClipboard(publicUrl);
@@ -1319,11 +1249,11 @@ function AssetsPanel({
         }
       } else if (action === "unpublish") {
         const response = await invoke("cloud_mcp_unpublish_account_asset", {
-          assetId: id,
+          asset_id: id,
         });
         adoptAccountAssetsLibraryEvent(response);
-        unpublishCachePurgeFailed = jsonArray(response?.purgeErrors || response?.purge_errors).length > 0
-          || jsonArray(response?.data?.purgeErrors || response?.data?.purge_errors).length > 0;
+        unpublishCachePurgeFailed = jsonArray(response?.purge_errors).length > 0
+          || jsonArray(response?.data?.purge_errors).length > 0;
       } else {
         const command = action === "upload"
           ? "cloud_mcp_upload_account_asset"
@@ -1333,9 +1263,9 @@ function AssetsPanel({
               ? "cloud_mcp_delete_local_account_asset"
               : "cloud_mcp_delete_cloud_account_asset";
         const response = await invoke(command, {
-          assetId: id,
-          cloudId: ["upload", "download", "deleteCloud"].includes(action) ? effectiveCloudId : undefined,
-          deleteFile: action === "deleteLocal" ? true : undefined,
+          asset_id: id,
+          cloud_id: ["upload", "download", "deleteCloud"].includes(action) ? effectiveCloudId : undefined,
+          delete_file: action === "deleteLocal" ? true : undefined,
         });
         adoptAccountAssetsLibraryEvent(response);
         if (action === "upload") {
@@ -1404,8 +1334,8 @@ function AssetsPanel({
     setBusyKey(key);
     try {
       await invoke("cloud_mcp_cancel_asset_transfer", {
-        assetId: id || null,
-        transferId: transferId || null,
+        asset_id: id || null,
+        transfer_id: transferId || null,
       });
       await refresh({ silent: true, force: true });
     } catch (nextError) {
@@ -1444,8 +1374,8 @@ function AssetsPanel({
           }
           if (availability.hasLocal) {
             const response = await invoke("cloud_mcp_delete_local_account_asset", {
-              assetId: id,
-              deleteFile: true,
+              asset_id: id,
+              delete_file: true,
             });
             adoptAccountAssetsLibraryEvent(response);
             deletedCount += 1;
@@ -1527,7 +1457,7 @@ function AssetsPanel({
         </AssetsHeader>
         <AssetCloudControls aria-label="Asset cloud">
           {clouds.map((cloud) => {
-            const cloudId = text(cloud.cloudId || cloud.cloud_id || cloud.id, DEFAULT_ASSET_CLOUD_ID);
+            const cloudId = text(cloud.cloud_id || cloud.id, DEFAULT_ASSET_CLOUD_ID);
             const active = cloudId === effectiveCloudId;
             return (
               <AssetCloudButton
@@ -1535,7 +1465,7 @@ function AssetsPanel({
                 data-active={active}
                 key={cloudId}
                 onClick={() => setSelectedCloudId(cloudId)}
-                title={text(cloud.endpoint || cloud.bucket || cloud.providerKind || cloud.provider_kind, cloud.label)}
+                title={text(cloud.endpoint || cloud.bucket || cloud.provider_kind, cloud.label)}
                 type="button"
               >
                 <Cloud aria-hidden="true" />
@@ -1562,7 +1492,7 @@ function AssetsPanel({
           const availability = assetAvailability(asset, effectiveCloudId, selectedCloudLabel, currentDeviceId);
           return availability.hasLocal && Boolean(assetLocalPath(asset));
         }).length}
-        imageCount={selectedImageAssets.length}
+        image_count={selectedImageAssets.length}
         onAnnotate={() => runSelectedAssetAction("annotate")}
         onClear={clearSelectedAssets}
         onDelete={() => runSelectedAssetAction("delete")}
@@ -1577,7 +1507,7 @@ function AssetsPanel({
         <AssetEmptyState>{loading ? "Loading assets..." : "No assets registered yet."}</AssetEmptyState>
       ) : (
         <VirtualAssetGrid
-          ariaLabel="Asset library grid"
+          aria_label="Asset library grid"
           items={filteredItems}
           renderItem={(asset, index) => {
             const id = assetId(asset, `asset-${index}`);
@@ -1702,8 +1632,8 @@ function AssetsPanel({
                 <AssetAvailabilityBadges
                   availability={availability}
                   cloudLabel={selectedCloudLabel}
-                  currentDeviceName={currentDeviceName}
-                  isPublic={isPublic}
+                  current_device_name={currentDeviceName}
+                  is_public={isPublic}
                   remoteDeviceNames={remoteDeviceNames}
                 />
                 {primaryCloudAction && (
@@ -1809,7 +1739,7 @@ function AssetsPanel({
                   {canCopy && (
                     <AssetPinButton
                       disabled={pinBusy || Boolean(busyKey && !pinBusy)}
-                      localPath={localPath}
+                      local_path={localPath}
                       name={name}
                       onToggle={() => runAssetAction("pin", asset)}
                     />
@@ -1876,7 +1806,7 @@ function AssetsPanel({
                 <AssetCardCaption>
                   <AssetCardName>{name}</AssetCardName>
                   {localPath ? (
-                    <MediaTranscriptChip localPath={localPath} mediaName={name} />
+                    <MediaTranscriptChip local_path={localPath} mediaName={name} />
                   ) : null}
                   {showRemoteDeviceLine && (
                     <AssetCardMetaLine title={`Remote devices: ${remoteDeviceNames.join(", ")}`}>
@@ -1900,9 +1830,9 @@ function AssetsPanel({
         <AssetInfoSheet
           asset={infoAsset}
           availability={assetAvailability(infoAsset, effectiveCloudId, selectedCloudLabel, currentDeviceId)}
-          cloudId={effectiveCloudId}
+          cloud_id={effectiveCloudId}
           cloudLabel={selectedCloudLabel}
-          currentDeviceName={currentDeviceName}
+          current_device_name={currentDeviceName}
           onClose={() => setInfoAssetId("")}
         />
       )}
@@ -1913,33 +1843,25 @@ function AssetsPanel({
 function AssetInfoSheet({
   asset,
   availability,
-  cloudId = DEFAULT_ASSET_CLOUD_ID,
+  cloud_id: cloudId = DEFAULT_ASSET_CLOUD_ID,
   cloudLabel = "Cloud",
-  currentDeviceName = "This device",
+  current_device_name: currentDeviceName = "This device",
   onClose,
 }) {
   const name = assetName(asset, "Asset");
   const localPath = availability?.hasLocal ? assetLocalPath(asset) : "";
   const previousLocalPath = text(
-    asset?.lastLocalPath
-      || asset?.last_local_path
-      || asset?.localPathHint
-      || asset?.local_path_hint,
+    asset?.last_local_path || asset?.local_path_hint,
   );
   const cloudState = assetCloudState(asset, cloudId);
   const cloudStatus = text(
-    cloudState?.cloudStatus
-      || cloudState?.cloud_status
-      || cloudState?.status
-      || asset?.cloudStatus
-      || asset?.cloud_status
-      || asset?.status,
+    cloudState?.cloud_status || cloudState?.status || asset?.cloud_status || asset?.status,
     availability?.hasCloud ? "available" : "not available",
   );
   const publicUrl = assetPublicUrl(asset);
   const remoteDevices = jsonArray(availability?.remoteDevices);
-  const sizeBytes = Number(asset?.sizeBytes ?? asset?.size_bytes ?? 0) || 0;
-  const updatedAt = formatAssetTimestamp(asset?.updatedAt || asset?.updated_at);
+  const sizeBytes = Number(asset?.size_bytes ?? 0) || 0;
+  const updatedAt = formatAssetTimestamp(asset?.updated_at);
   const fileRows = [
     ["Type", assetMimeType(asset) || assetFileTypeLabel(asset)],
     ["Size", sizeBytes > 0 ? formatAssetBytes(sizeBytes) : ""],
@@ -2009,7 +1931,7 @@ function AssetInfoSheet({
               {remoteDevices.map((device) => {
                 const deviceName = assetDeviceName(device);
                 const deviceId = assetDeviceId(device);
-                const updated = formatAssetTimestamp(device.updatedAt || device.updated_at);
+                const updated = formatAssetTimestamp(device.updated_at);
                 return (
                   <AssetInfoDeviceRow key={deviceId || deviceName}>
                     <Devices aria-hidden="true" />
@@ -2087,7 +2009,7 @@ function AssetToastCard({ toast, onDismiss }) {
       onDismiss(toast.key);
     }, 5000);
     return () => window.clearTimeout(timer);
-  }, [onDismiss, paused, toast.createdAt, toast.key]);
+  }, [onDismiss, paused, toast.created_at, toast.key]);
 
   useEffect(() => () => {
     if (copiedTimerRef.current) {
@@ -2161,20 +2083,20 @@ function AssetCloudSettingsPanel({
   selectedCloudId = DEFAULT_ASSET_CLOUD_ID,
 }) {
   const [form, setForm] = useState({
-    accessKeyId: "",
+    access_key_id: "",
     bucket: "",
     endpoint: "",
-    keyPrefix: "diffforge/assets/blobs",
+    key_prefix: "diffforge/assets/blobs",
     label: "",
     makeDefault: false,
-    providerKind: "s3",
+    provider_kind: "s3",
     region: "us-east-1",
-    secretAccessKey: "",
+    secret_access_key: "",
   });
   const setField = useCallback((key, value) => {
     setForm((current) => ({ ...current, [key]: value }));
   }, []);
-  const providerKind = text(form.providerKind, "s3");
+  const providerKind = text(form.provider_kind, "s3");
   // AWS S3 endpoints are derivable from the region; R2/B2 endpoints carry the
   // account/cluster and must be supplied.
   const endpointRequired = providerKind !== "s3";
@@ -2186,8 +2108,8 @@ function AssetCloudSettingsPanel({
   const canSave = text(form.label)
     && text(form.bucket)
     && (!endpointRequired || text(form.endpoint))
-    && text(form.accessKeyId)
-    && text(form.secretAccessKey);
+    && text(form.access_key_id)
+    && text(form.secret_access_key);
   const submit = useCallback(async (event) => {
     event.preventDefault();
     if (!canSave || typeof onAction !== "function") return;
@@ -2196,30 +2118,25 @@ function AssetCloudSettingsPanel({
     const response = await onAction("save", {
       bucket: form.bucket,
       credentials: {
-        accessKeyId: form.accessKeyId,
-        access_key_id: form.accessKeyId,
-        secretAccessKey: form.secretAccessKey,
-        secret_access_key: form.secretAccessKey,
+        access_key_id: form.access_key_id,
+        secret_access_key: form.secret_access_key,
       },
-      defaultCloud: form.makeDefault,
       default_cloud: form.makeDefault,
       endpoint,
-      keyPrefix: form.keyPrefix,
-      key_prefix: form.keyPrefix,
+      key_prefix: form.key_prefix,
       label: form.label,
-      providerKind,
       provider_kind: providerKind,
       region: form.region,
     });
     if (response) {
       setForm((current) => ({
         ...current,
-        accessKeyId: "",
+        access_key_id: "",
         bucket: "",
         endpoint: "",
         label: "",
         makeDefault: false,
-        secretAccessKey: "",
+        secret_access_key: "",
       }));
     }
   }, [canSave, form, onAction, providerKind]);
@@ -2239,15 +2156,15 @@ function AssetCloudSettingsPanel({
       </AssetCloudSettingsHeader>
       <AssetCloudList>
         {clouds.map((cloud) => {
-          const cloudId = text(cloud.cloudId || cloud.cloud_id || cloud.id, DEFAULT_ASSET_CLOUD_ID);
+          const cloudId = text(cloud.cloud_id || cloud.id, DEFAULT_ASSET_CLOUD_ID);
           const builtin = cloudId === DEFAULT_ASSET_CLOUD_ID || cloud.builtin;
-          const isDefault = Boolean(cloud.defaultCloud || cloud.default_cloud);
+          const isDefault = Boolean(cloud.default_cloud);
           const status = text(cloud.status, "active");
-          const verified = Boolean(text(cloud.validatedAt || cloud.validated_at)) && status === "active";
+          const verified = Boolean(text(cloud.validated_at)) && status === "active";
           const detail = (builtin
             ? ["Managed by Diff Forge", isDefault ? "default" : ""]
             : [
-              text(cloud.providerKind || cloud.provider_kind || cloud.provider, "cloud"),
+              text(cloud.provider_kind || cloud.provider, "cloud"),
               verified ? "verified" : status,
               isDefault ? "default" : "",
             ]
@@ -2263,7 +2180,7 @@ function AssetCloudSettingsPanel({
                 {!builtin && (
                   <AssetMiniButton
                     disabled={Boolean(busyKey)}
-                    onClick={() => onAction?.("validate", { cloudId })}
+                    onClick={() => onAction?.("validate", { cloud_id: cloudId })}
                     type="button"
                   >
                     Test
@@ -2272,7 +2189,7 @@ function AssetCloudSettingsPanel({
                 {!isDefault && (
                   <AssetMiniButton
                     disabled={Boolean(busyKey)}
-                    onClick={() => onAction?.("default", { cloudId })}
+                    onClick={() => onAction?.("default", { cloud_id: cloudId })}
                     type="button"
                   >
                     Default
@@ -2284,7 +2201,7 @@ function AssetCloudSettingsPanel({
                     disabled={Boolean(busyKey)}
                     onClick={() => {
                       if (window.confirm(`Remove ${text(cloud.label || cloudId)}?`)) {
-                        void onAction?.("delete", { cloudId });
+                        void onAction?.("delete", { cloud_id: cloudId });
                       }
                     }}
                     type="button"
@@ -2309,7 +2226,7 @@ function AssetCloudSettingsPanel({
               data-active={providerKind === provider}
               key={provider}
               onClick={() => {
-                setField("providerKind", provider);
+                setField("provider_kind", provider);
                 if (provider === "r2") setField("region", "auto");
                 if (provider === "s3" && form.region === "auto") setField("region", "us-east-1");
               }}
@@ -2324,9 +2241,9 @@ function AssetCloudSettingsPanel({
           <AssetCloudInput aria-label="Bucket" placeholder="Bucket" value={form.bucket} onChange={(event) => setField("bucket", event.target.value)} />
           <AssetCloudInput aria-label="Endpoint" placeholder={endpointPlaceholder} value={form.endpoint} onChange={(event) => setField("endpoint", event.target.value)} />
           <AssetCloudInput aria-label="Region" placeholder="Region" value={form.region} onChange={(event) => setField("region", event.target.value)} />
-          <AssetCloudInput aria-label="Key prefix" placeholder="Key prefix" value={form.keyPrefix} onChange={(event) => setField("keyPrefix", event.target.value)} />
-          <AssetCloudInput aria-label="Access key id" placeholder="Access key id" value={form.accessKeyId} onChange={(event) => setField("accessKeyId", event.target.value)} />
-          <AssetCloudInput aria-label="Secret access key" placeholder="Secret access key" type="password" value={form.secretAccessKey} onChange={(event) => setField("secretAccessKey", event.target.value)} />
+          <AssetCloudInput aria-label="Key prefix" placeholder="Key prefix" value={form.key_prefix} onChange={(event) => setField("key_prefix", event.target.value)} />
+          <AssetCloudInput aria-label="Access key id" placeholder="Access key id" value={form.access_key_id} onChange={(event) => setField("access_key_id", event.target.value)} />
+          <AssetCloudInput aria-label="Secret access key" placeholder="Secret access key" type="password" value={form.secret_access_key} onChange={(event) => setField("secret_access_key", event.target.value)} />
         </AssetCloudFields>
         <AssetCloudFormFooter>
           <label>
@@ -2385,7 +2302,7 @@ function useSnipFloatOpen(localPath) {
   return open;
 }
 
-function AssetPinButton({ localPath, name, disabled, onToggle }) {
+function AssetPinButton({ local_path: localPath, name, disabled, onToggle }) {
   const pinned = useSnipFloatOpen(localPath);
   return (
     <AssetFloatPinButton
@@ -2524,7 +2441,7 @@ function UntrackedAssetsPanel({
         if (typeof onPromote !== "function") return;
         // Tracking is account-level: no workspace/repo scope on the asset.
         const result = await onPromote({
-          deleteSource: true,
+          delete_source: true,
           name,
           path: localPath,
         });
@@ -2622,7 +2539,7 @@ function UntrackedAssetsPanel({
       <AssetSelectionDock
         busy={Boolean(busyKey)}
         count={selectedAssets.length}
-        imageCount={selectedImageAssets.length}
+        image_count={selectedImageAssets.length}
         onAnnotate={() => runSelectedUntrackedAction("annotate")}
         onClear={clearSelectedAssets}
         onDelete={() => runSelectedUntrackedAction("delete")}
@@ -2638,7 +2555,7 @@ function UntrackedAssetsPanel({
         </AssetEmptyState>
       ) : (
         <VirtualAssetGrid
-          ariaLabel="Untracked asset scratch grid"
+          aria_label="Untracked asset scratch grid"
           items={items}
           renderItem={(asset, index) => {
             const id = assetId(asset, `untracked-${index}`);
@@ -2708,7 +2625,7 @@ function UntrackedAssetsPanel({
                   {canCopy && (
                     <AssetPinButton
                       disabled={!localPath || pinBusy || Boolean(busyKey && !pinBusy)}
-                      localPath={localPath}
+                      local_path={localPath}
                       name={name}
                       onToggle={() => runUntrackedAction("pin", asset)}
                     />
@@ -2775,7 +2692,7 @@ function UntrackedAssetsPanel({
                 <AssetCardCaption>
                   <AssetCardName>{name}</AssetCardName>
                   {localPath ? (
-                    <MediaTranscriptChip localPath={localPath} mediaName={name} />
+                    <MediaTranscriptChip local_path={localPath} mediaName={name} />
                   ) : null}
                 </AssetCardCaption>
               </AssetCard>
@@ -3450,24 +3367,24 @@ function AssetSelectionDock({
   count,
   deleteCount = count,
   deleteLabel = "Delete",
-  imageCount,
+  image_count: imageCount,
   onAnnotate,
   onClear,
   onDelete,
 }) {
-  const lastCountsRef = useRef({ count: 0, deleteCount: 0, imageCount: 0 });
+  const lastCountsRef = useRef({ count: 0, deleteCount: 0, image_count: 0 });
   if (count > 0) {
-    lastCountsRef.current = { count, deleteCount, imageCount };
+    lastCountsRef.current = { count, deleteCount, image_count: imageCount };
   }
   const visible = count > 0;
-  const shown = visible ? { count, deleteCount, imageCount } : lastCountsRef.current;
+  const shown = visible ? { count, deleteCount, image_count: imageCount } : lastCountsRef.current;
   return (
     <AssetSelectionDockBar
       aria-hidden={visible ? "false" : "true"}
       data-visible={visible ? "true" : "false"}
     >
       <strong>{shown.count} selected</strong>
-      <span>{shown.imageCount} annotatable image{shown.imageCount === 1 ? "" : "s"}</span>
+      <span>{shown.image_count} annotatable image{shown.image_count === 1 ? "" : "s"}</span>
       <AssetBatchButton
         data-primary="true"
         disabled={!visible || !imageCount || busy}
@@ -3609,7 +3526,7 @@ const AssetGridWindow = styled.div`
 // grows. Card markup and styling are unchanged — callers pass the same
 // per-item render they used inside `items.map(...)`, and the absolute item
 // index is preserved so fallbacks/keys keep working.
-function VirtualAssetGrid({ items, renderItem, ariaLabel }) {
+function VirtualAssetGrid({ items, renderItem, aria_label: ariaLabel }) {
   const scrollerRef = useRef(null);
   const windowRef = useRef(null);
   const measureRef = useRef({ columns: 0, cardHeight: 0 });

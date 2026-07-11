@@ -58,19 +58,19 @@ const PANEL_AGENT_PROMPT_MENU_WEBVIEW_BOTTOM_INSET = 224;
 
 function parseWebPanelParams() {
   if (typeof window === "undefined") {
-    return { adoptLabel: "", paneId: "", url: DEFAULT_WEB_URL, theme: "dark", windowId: "", workspaceId: "" };
+    return { adopt_label: "", pane_id: "", url: DEFAULT_WEB_URL, theme: "dark", window_id: "", workspace_id: "" };
   }
   const hash = window.location.hash || "";
   const queryIndex = hash.indexOf("?");
   const params = new URLSearchParams(queryIndex >= 0 ? hash.slice(queryIndex + 1) : "");
   const theme = String(params.get("theme") || "dark").toLowerCase() === "light" ? "light" : "dark";
   return {
-    adoptLabel: String(params.get("adoptLabel") || "").trim(),
-    paneId: params.get("paneId") || "",
+    adopt_label: String(params.get("adopt_label") || "").trim(),
+    pane_id: params.get("pane_id") || "",
     theme,
     url: normalizeWebInput(params.get("url") || "") || DEFAULT_WEB_URL,
-    windowId: params.get("windowId") || "",
-    workspaceId: params.get("workspaceId") || "",
+    window_id: params.get("window_id") || "",
+    workspace_id: params.get("workspace_id") || "",
   };
 }
 
@@ -90,11 +90,11 @@ export default function WebPanelHost() {
   const { isFullscreen, toggleFullscreen } = usePopoutWindowFullscreen(currentWindow);
   const windowLabel = useMemo(() => {
     try {
-      return currentWindow.label || params.windowId || "";
+      return currentWindow.label || params.window_id || "";
     } catch {
-      return params.windowId || "";
+      return params.window_id || "";
     }
-  }, [currentWindow, params.windowId]);
+  }, [currentWindow, params.window_id]);
 
   const [history, setHistory] = useState(() => [params.url]);
   const [historyIndex, setHistoryIndex] = useState(0);
@@ -144,24 +144,24 @@ export default function WebPanelHost() {
     };
   }, []);
 
-  const scopeParts = useMemo(() => [params.paneId || "pane"], [params.paneId]);
+  const scopeParts = useMemo(() => [params.pane_id || "pane"], [params.pane_id]);
 
   // The grid tracks this window's current native webview label so it can adopt
   // the living page back on return (or after an OS close) without a reload.
-  const nativeLabelRef = useRef(params.adoptLabel || "");
+  const nativeLabelRef = useRef(params.adopt_label || "");
 
   const emitNavigate = useCallback((url) => {
-    if (!params.paneId || !url) {
+    if (!params.pane_id || !url) {
       return;
     }
     emit(WEB_PANEL_CONTROL_EVENT, {
       control: WEB_PANEL_CONTROL_NAVIGATE,
-      paneId: params.paneId,
+      pane_id: params.pane_id,
       url,
-      webviewLabel: nativeLabelRef.current || "",
-      windowId: windowLabel,
+      webview_label: nativeLabelRef.current || "",
+      window_id: windowLabel,
     }).catch(() => {});
-  }, [params.paneId, windowLabel]);
+  }, [params.pane_id, windowLabel]);
 
   const handleLoadedUrl = useCallback((loadedUrl) => {
     if (loadedUrl) {
@@ -195,8 +195,8 @@ export default function WebPanelHost() {
     suspended: returningToGrid,
     // Adopt the grid pane's living webview (passed via the window URL) instead
     // of loading the page from scratch.
-    adoptLabel: params.adoptLabel,
-    adoptNonce: params.adoptLabel ? 1 : 0,
+    adopt_label: params.adopt_label,
+    adoptNonce: params.adopt_label ? 1 : 0,
     adoptCurrentUrl: params.url,
     onLabelChange: (label) => {
       nativeLabelRef.current = label;
@@ -207,31 +207,31 @@ export default function WebPanelHost() {
     currentUrl,
     enabled: agentPromptOpen,
     evaluate,
-    panelKind: "web",
-    paneId: params.paneId,
-    workspaceId: params.workspaceId,
+    panel_kind: "web",
+    pane_id: params.pane_id,
+    workspace_id: params.workspace_id,
   });
 
   const requestAgentPromptTargets = useCallback(() => {
     const requestId = createPanelAgentPromptRequestId("web-panel-targets");
     agentPromptTargetsRequestIdRef.current = requestId;
     emit(PANEL_AGENT_PROMPT_TARGETS_REQUEST_EVENT, {
-      panelKind: "web",
-      paneId: params.paneId,
-      requestId,
-      windowId: windowLabel,
-      workspaceId: params.workspaceId,
+      panel_kind: "web",
+      pane_id: params.pane_id,
+      request_id: requestId,
+      window_id: windowLabel,
+      workspace_id: params.workspace_id,
     }).catch(() => {});
-  }, [params.paneId, params.workspaceId, windowLabel]);
+  }, [params.pane_id, params.workspace_id, windowLabel]);
 
   const requestAgentPromptActivity = useCallback(() => {
     emit(PANEL_AGENT_PROMPT_ACTIVITY_REQUEST_EVENT, {
-      panelKind: "web",
-      paneId: params.paneId,
-      windowId: windowLabel,
-      workspaceId: params.workspaceId,
+      panel_kind: "web",
+      pane_id: params.pane_id,
+      window_id: windowLabel,
+      workspace_id: params.workspace_id,
     }).catch(() => {});
-  }, [params.paneId, params.workspaceId, windowLabel]);
+  }, [params.pane_id, params.workspace_id, windowLabel]);
 
   useEffect(() => {
     requestAgentPromptActivity();
@@ -245,15 +245,15 @@ export default function WebPanelHost() {
         return;
       }
       const payload = event?.payload || {};
-      const paneId = String(payload.paneId || payload.pane_id || payload.panelPaneId || payload.panel_pane_id || "").trim();
-      if (!paneId || (params.paneId && paneId !== params.paneId)) {
+      const paneId = String(payload.pane_id || payload.panel_pane_id || "").trim();
+      if (!paneId || (params.pane_id && paneId !== params.pane_id)) {
         return;
       }
-      const workspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
-      if (workspaceId && params.workspaceId && workspaceId !== params.workspaceId) {
+      const workspaceId = String(payload.workspace_id || "").trim();
+      if (workspaceId && params.workspace_id && workspaceId !== params.workspace_id) {
         return;
       }
-      const windowId = String(payload.windowId || payload.window_id || "").trim();
+      const windowId = String(payload.window_id || "").trim();
       if (windowId && windowId !== windowLabel) {
         return;
       }
@@ -271,7 +271,7 @@ export default function WebPanelHost() {
       disposed = true;
       unlisten();
     };
-  }, [params.paneId, params.workspaceId, windowLabel]);
+  }, [params.pane_id, params.workspace_id, windowLabel]);
 
   useEffect(() => {
     if (agentPromptOpen) {
@@ -287,22 +287,22 @@ export default function WebPanelHost() {
         return;
       }
       const payload = event?.payload || {};
-      const requestId = String(payload.requestId || payload.request_id || "").trim();
-      const windowId = String(payload.windowId || payload.window_id || "").trim();
+      const requestId = String(payload.request_id || "").trim();
+      const windowId = String(payload.window_id || "").trim();
       if (requestId && requestId !== agentPromptTargetsRequestIdRef.current) {
         return;
       }
       if (windowId && windowId !== windowLabel) {
         return;
       }
-      const workspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
-      if (workspaceId && params.workspaceId && workspaceId !== params.workspaceId) {
+      const workspaceId = String(payload.workspace_id || "").trim();
+      if (workspaceId && params.workspace_id && workspaceId !== params.workspace_id) {
         return;
       }
       setAgentPromptTargets(normalizePanelAgentPromptTargets(payload.targets));
       setDefaultAgentPromptTargetIds(
-        (Array.isArray(payload.defaultSelectedTargetIds)
-          ? payload.defaultSelectedTargetIds
+        (Array.isArray(payload.default_selected_target_ids)
+          ? payload.default_selected_target_ids
           : Array.isArray(payload.default_selected_target_ids)
             ? payload.default_selected_target_ids
             : []
@@ -321,9 +321,9 @@ export default function WebPanelHost() {
       disposed = true;
       unlisten();
     };
-  }, [params.workspaceId, windowLabel]);
+  }, [params.workspace_id, windowLabel]);
 
-  const submitAgentPrompt = useCallback(async ({ contextRefs, targetIds, targetTerminalIndexes, text }) => {
+  const submitAgentPrompt = useCallback(async ({ context_refs: contextRefs, target_ids: targetIds, target_terminal_indexes: targetTerminalIndexes, text }) => {
     const requestId = createPanelAgentPromptRequestId("web-panel-submit");
     let unlisten = () => {};
     return new Promise((resolve, reject) => {
@@ -341,10 +341,10 @@ export default function WebPanelHost() {
       }, 15000);
       listen(PANEL_AGENT_PROMPT_RESULT_EVENT, (event) => {
         const payload = event?.payload || {};
-        if (String(payload.requestId || payload.request_id || "").trim() !== requestId) {
+        if (String(payload.request_id || "").trim() !== requestId) {
           return;
         }
-        const windowId = String(payload.windowId || payload.window_id || "").trim();
+        const windowId = String(payload.window_id || "").trim();
         if (windowId && windowId !== windowLabel) {
           return;
         }
@@ -362,15 +362,15 @@ export default function WebPanelHost() {
           } else {
             unlisten = nextUnlisten;
             emit(PANEL_AGENT_PROMPT_SUBMIT_EVENT, {
-              contextRefs,
-              panelKind: "web",
-              paneId: params.paneId,
-              requestId,
-              targetIds,
-              targetTerminalIndexes,
+              context_refs: contextRefs,
+              panel_kind: "web",
+              pane_id: params.pane_id,
+              request_id: requestId,
+              target_ids: targetIds,
+              target_terminal_indexes: targetTerminalIndexes,
               text,
-              windowId: windowLabel,
-              workspaceId: params.workspaceId,
+              window_id: windowLabel,
+              workspace_id: params.workspace_id,
             }).catch((error) => {
               window.clearTimeout(timeoutId);
               cleanup();
@@ -384,33 +384,28 @@ export default function WebPanelHost() {
           reject(error);
         });
     });
-  }, [params.paneId, params.workspaceId, windowLabel]);
+  }, [params.pane_id, params.workspace_id, windowLabel]);
 
   const dismissPanelAgentPromptActivityItem = useCallback((itemId) => {
     const safeItemId = String(itemId || "").trim();
     if (!safeItemId) {
       return;
     }
-    setAgentPromptActivityItems((items) => items.filter((item) => String(item.itemId || item.id || "").trim() !== safeItemId));
+    setAgentPromptActivityItems((items) => items.filter((item) => String(item.item_id || item.id || "").trim() !== safeItemId));
     emit(PANEL_AGENT_PROMPT_ACTIVITY_DISMISS_EVENT, {
-      itemId: safeItemId,
       item_id: safeItemId,
-      paneId: params.paneId,
-      pane_id: params.paneId,
-      panelKind: "web",
+      pane_id: params.pane_id,
       panel_kind: "web",
-      windowId: windowLabel,
       window_id: windowLabel,
-      workspaceId: params.workspaceId,
-      workspace_id: params.workspaceId,
+      workspace_id: params.workspace_id,
     }).catch(() => {});
-  }, [params.paneId, params.workspaceId, windowLabel]);
+  }, [params.pane_id, params.workspace_id, windowLabel]);
 
   const webAgentPromptOverlay = useWebAgentPromptOverlay({
     autoDismissCompleted: windowFocused,
     activityItems: agentPromptActivityItems,
-    contextRefs: webElementPicker.contextRefs,
-    defaultSelectedTargetIds: defaultAgentPromptTargetIds,
+    context_refs: webElementPicker.context_refs,
+    default_selected_target_ids: defaultAgentPromptTargetIds,
     enabled: nativeAgentPromptOverlayActive,
     evaluate,
     onClearContext: webElementPicker.clearSelection,
@@ -418,7 +413,7 @@ export default function WebPanelHost() {
     onDismissCompletedItem: dismissPanelAgentPromptActivityItem,
     onSubmit: submitAgentPrompt,
     targets: agentPromptTargets,
-    windowId: windowLabel,
+    window_id: windowLabel,
   });
 
   const navigateTo = useCallback((targetUrl) => {
@@ -486,10 +481,10 @@ export default function WebPanelHost() {
     setReturningToGrid(true);
     emit(WEB_PANEL_CONTROL_EVENT, {
       control: WEB_PANEL_CONTROL_RETURN,
-      paneId: params.paneId,
+      pane_id: params.pane_id,
       url: currentUrl,
-      webviewLabel: nativeLabelRef.current || "",
-      windowId: windowLabel,
+      webview_label: nativeLabelRef.current || "",
+      window_id: windowLabel,
     })
       .catch(() => {})
       .finally(() => {
@@ -500,10 +495,10 @@ export default function WebPanelHost() {
           currentWindow.destroy().catch(() => {});
         }, 900);
       });
-  }, [currentUrl, currentWindow, params.paneId, windowLabel]);
+  }, [currentUrl, currentWindow, params.pane_id, windowLabel]);
 
   useEffect(() => {
-    if (!params.paneId) {
+    if (!params.pane_id) {
       return undefined;
     }
     let disposed = false;
@@ -513,9 +508,9 @@ export default function WebPanelHost() {
         return;
       }
       const payload = event?.payload || {};
-      const paneId = String(payload.paneId || payload.pane_id || "").trim();
-      const windowId = String(payload.windowId || payload.window_id || "").trim();
-      if (paneId && paneId !== params.paneId) {
+      const paneId = String(payload.pane_id || "").trim();
+      const windowId = String(payload.window_id || "").trim();
+      if (paneId && paneId !== params.pane_id) {
         return;
       }
       if (windowId && windowId !== windowLabel) {
@@ -576,7 +571,7 @@ export default function WebPanelHost() {
     goBack,
     goForward,
     navigateTo,
-    params.paneId,
+    params.pane_id,
     refresh,
     returnToGrid,
     windowLabel,
@@ -663,8 +658,8 @@ export default function WebPanelHost() {
             {agentPromptOpen ? (
               <HostIconButton
                 aria-label="Select web element"
-                aria-pressed={webElementPicker.armed || webElementPicker.contextRefs.length ? "true" : "false"}
-                data-active={webElementPicker.armed || webElementPicker.contextRefs.length ? "true" : undefined}
+                aria-pressed={webElementPicker.armed || webElementPicker.context_refs.length ? "true" : "false"}
+                data-active={webElementPicker.armed || webElementPicker.context_refs.length ? "true" : undefined}
                 onClick={webElementPicker.togglePicker}
                 title="Select web element"
                 type="button"
@@ -705,16 +700,16 @@ export default function WebPanelHost() {
         {agentPromptOpen && !webAgentPromptOverlay.active ? (
           <PanelAgentPromptComposer
             autoFocus
-            contextRefs={webElementPicker.contextRefs}
-            defaultSelectedTargetIds={defaultAgentPromptTargetIds}
+            context_refs={webElementPicker.context_refs}
+            default_selected_target_ids={defaultAgentPromptTargetIds}
             onClearContext={webElementPicker.clearSelection}
             onClose={() => setAgentPromptOpen(false)}
             onSubmit={submitAgentPrompt}
             onTargetMenuOpenChange={setAgentPromptTargetMenuOpen}
-            panelKind="web"
-            panelPaneId={params.paneId}
+            panel_kind="web"
+            panel_pane_id={params.pane_id}
             targets={agentPromptTargets}
-            windowId={windowLabel}
+            window_id={windowLabel}
           />
         ) : null}
         {agentPromptOpen && webElementPicker.error ? (

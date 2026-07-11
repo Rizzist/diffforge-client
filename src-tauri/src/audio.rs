@@ -4134,7 +4134,6 @@ fn normalize_transcript_text(text: &str) -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct WhisperTranscriptPolicy {
     name: String,
     audio_ms_min_for_speech_ms: Option<u64>,
@@ -5108,13 +5107,13 @@ fn emit_local_whisper_partial_transcript(
         AUDIO_REALTIME_TRANSCRIPT_EVENT,
         json!({
             "provider": "whisper-local",
-            "sessionId": session_id,
-            "chunkIndex": chunk_index,
+            "session_id": session_id,
+            "chunk_index": chunk_index,
             "text": text,
-            "isFinal": is_final,
-            "speechFinal": true,
-            "audioMs": audio_ms,
-            "historyId": "",
+            "is_final": is_final,
+            "speech_final": true,
+            "audio_ms": audio_ms,
+            "history_id": "",
         }),
     );
 }
@@ -7527,7 +7526,7 @@ const AUDIO_WIDGET_BAR_IDLE_ACTIVATE_HIT_HEIGHT: f64 = 18.0;
 const AUDIO_WIDGET_BAR_IDLE_ACTIVE_HIT_TOP: f64 = 0.0;
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(default)]
 struct AudioWidgetBarHoverSnapshotRequest {
     active: bool,
     bubble: bool,
@@ -7547,13 +7546,12 @@ impl Default for AudioWidgetBarHoverSnapshotRequest {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct AudioWidgetBarHoverSnapshot {
     hovering: bool,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(default)]
 struct AudioWidgetBubblePositionLogRequest {
     phase: String,
     fields: Value,
@@ -7569,7 +7567,7 @@ impl Default for AudioWidgetBubblePositionLogRequest {
 }
 
 #[derive(Deserialize, Clone)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(default)]
 struct AudioWidgetBottomBarPositionRequest {
     width: f64,
     height: f64,
@@ -7644,7 +7642,7 @@ fn audio_widget_bottom_bar_generation_is_stale(
 }
 
 #[derive(Deserialize, Clone)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(default)]
 struct AudioWidgetErrorOverlayRequest {
     width: f64,
     height: f64,
@@ -7861,7 +7859,6 @@ fn audio_widget_last_bottom_bar_layout() -> Option<AudioWidgetBottomBarLayout> {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct AudioWidgetBottomBarPositionResult {
     x: f64,
     y: f64,
@@ -7986,15 +7983,15 @@ fn audio_widget_bottom_bar_layout_event_payload(
         "source": "audio_widget_bottom_bar",
         "surface": "audio-widget",
         "layout": "bottom-bar",
-        "requestId": metadata.request_id.as_str(),
+        "request_id": metadata.request_id.as_str(),
         "reason": metadata.reason.as_str(),
         "applied": metadata.applied,
         "superseded": metadata.superseded,
-        "requestedAnimate": metadata.requested_animate,
-        "nativeAnimate": metadata.native_animate,
-        "positionSource": result.source,
-        "useFullMonitorBounds": result.use_full_monitor_bounds,
-        "scaleFactor": result.scale_factor,
+        "requested_animate": metadata.requested_animate,
+        "native_animate": metadata.native_animate,
+        "position_source": result.source,
+        "use_full_monitor_bounds": result.use_full_monitor_bounds,
+        "scale_factor": result.scale_factor,
         "frame": {
             "x": result.x,
             "y": result.y,
@@ -8109,7 +8106,7 @@ mod audio_widget_bottom_bar_protocol_tests {
             "height": 44.0,
             "margin": 8.0,
             "animate": true,
-            "requestId": "command-42",
+            "request_id": "command-42",
         }))
         .expect("request with requestId should deserialize");
         assert_eq!(with_id.request_id, "command-42");
@@ -8153,17 +8150,17 @@ mod audio_widget_bottom_bar_protocol_tests {
         assert_eq!(payload["source"], "audio_widget_bottom_bar");
         assert_eq!(payload["surface"], "audio-widget");
         assert_eq!(payload["layout"], "bottom-bar");
-        assert_eq!(payload["requestedAnimate"], true);
-        assert_eq!(payload["nativeAnimate"], false);
-        assert_eq!(payload["positionSource"], "appkit-visible-frame");
-        assert_eq!(payload["useFullMonitorBounds"], false);
-        assert_eq!(payload["scaleFactor"], 2.0);
+        assert_eq!(payload["requested_animate"], true);
+        assert_eq!(payload["native_animate"], false);
+        assert_eq!(payload["position_source"], "appkit-visible-frame");
+        assert_eq!(payload["use_full_monitor_bounds"], false);
+        assert_eq!(payload["scale_factor"], 2.0);
         assert_eq!(payload["frame"], json!({"x": 12.0, "y": 34.0, "width": 320.0, "height": 44.0}));
         assert_eq!(
             payload["anchor"],
             json!({"x": 0.0, "y": 20.0, "width": 1440.0, "height": 880.0})
         );
-        assert_eq!(payload["requestId"], "command-42");
+        assert_eq!(payload["request_id"], "command-42");
         assert_eq!(payload["reason"], "command");
         assert_eq!(payload["applied"], false);
         assert_eq!(payload["superseded"], true);
@@ -9645,12 +9642,12 @@ fn toggle_audio_widget_for(app: &AppHandle) -> Result<AudioWidgetVisibility, Str
     show_audio_widget_for(app)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn whisper_model_status(app: AppHandle) -> Result<WhisperModelStatus, String> {
     whisper_model_status_for(&app)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn audio_input_devices() -> Result<Vec<AudioInputDeviceSummary>, String> {
     match timeout(
         Duration::from_secs(AUDIO_INPUT_DEVICE_LIST_TIMEOUT_SECS),
@@ -9670,17 +9667,17 @@ async fn audio_input_devices() -> Result<Vec<AudioInputDeviceSummary>, String> {
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn audio_input_permission_status() -> Result<AudioInputPermissionStatus, String> {
     Ok(audio_input_permission_status_for_platform())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn open_audio_input_permissions() -> Result<AudioInputPermissionStatus, String> {
     open_audio_input_permissions_for_platform()
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn start_audio_input_monitor(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
@@ -9689,7 +9686,7 @@ async fn start_audio_input_monitor(
     audio_state.input_worker.start_monitor(app, request)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn stop_audio_input_monitor(
     audio_state: State<'_, AudioState>,
     request: Option<AudioInputMonitorRequest>,
@@ -9697,19 +9694,19 @@ async fn stop_audio_input_monitor(
     audio_state.input_worker.stop_monitor(request)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn begin_audio_input_capture(audio_state: State<'_, AudioState>) -> Result<(), String> {
     audio_state.input_worker.begin_capture()
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn finish_audio_input_capture(
     audio_state: State<'_, AudioState>,
 ) -> Result<AudioInputCaptureResult, String> {
     audio_state.input_worker.finish_capture()
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn download_whisper_model(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
@@ -9916,7 +9913,7 @@ async fn download_whisper_model(
     whisper_model_status_for(&app)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn select_whisper_model(
     app: AppHandle,
     request: WhisperModelRequest,
@@ -9931,7 +9928,7 @@ async fn select_whisper_model(
     whisper_model_status_for(&app)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn uninstall_whisper_model(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
@@ -9954,7 +9951,7 @@ async fn uninstall_whisper_model(
     whisper_model_status_for(&app)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn prepare_whisper_model(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
@@ -9966,7 +9963,7 @@ async fn prepare_whisper_model(
         .map_err(|error| format!("Unable to prepare local Whisper model: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn transcribe_whisper_audio(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
@@ -9983,7 +9980,7 @@ async fn transcribe_whisper_audio(
     .map_err(|error| format!("Unable to run local Whisper transcription: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn start_local_whisper_partial_transcription(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
@@ -10086,7 +10083,7 @@ async fn start_local_whisper_partial_transcription(
     })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn stop_local_whisper_partial_transcription(
     audio_state: State<'_, AudioState>,
     request: LocalWhisperPartialStopRequest,
@@ -10152,7 +10149,7 @@ async fn stop_local_whisper_partial_transcription(
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn cancel_local_whisper_partial_transcription(
     audio_state: State<'_, AudioState>,
     request: Option<LocalWhisperPartialCancelRequest>,
@@ -10190,7 +10187,7 @@ async fn cancel_local_whisper_partial_transcription(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn cancel_whisper_transcription(audio_state: State<'_, AudioState>) -> Result<(), String> {
     audio_state
         .whisper_cancel_token
@@ -10450,7 +10447,7 @@ fn write_orchestrator_voice_history_blocking(
     })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn read_orchestrator_voice_history(
     request: OrchestratorVoiceHistoryReadRequest,
 ) -> Result<OrchestratorVoiceHistoryReadResult, String> {
@@ -10459,7 +10456,7 @@ async fn read_orchestrator_voice_history(
         .map_err(|error| format!("Unable to load voice history: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn write_orchestrator_voice_history(
     request: OrchestratorVoiceHistoryWriteRequest,
 ) -> Result<OrchestratorVoiceHistoryWriteResult, String> {
@@ -10483,7 +10480,6 @@ fn cloud_voice_agent_event_kind(payload: &Value) -> &str {
     payload
         .get("kind")
         .or_else(|| payload.get("event_kind"))
-        .or_else(|| payload.get("eventKind"))
         .or_else(|| payload.get("type"))
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -10768,7 +10764,7 @@ fn spawn_cloud_voice_agent_desktop_log(
     );
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn prewarm_cloud_voice_agent_stream(
     cloud_mcp_state: State<'_, CloudMcpState>,
 ) -> Result<bool, String> {
@@ -10839,7 +10835,6 @@ async fn run_cloud_voice_agent_stream(
         .unwrap_or_else(|| {
             start_request
                 .get("voice_engine")
-                .or_else(|| start_request.get("voiceEngine"))
                 .and_then(Value::as_str)
                 .map(|engine| {
                     matches!(
@@ -11596,7 +11591,7 @@ async fn run_cloud_voice_agent_text_message(
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn start_cloud_voice_agent_stream(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
@@ -11870,9 +11865,7 @@ async fn start_cloud_voice_agent_stream(
             "workspace_root": workspace_root.clone(),
             "repo_id": repo_id.clone(),
             "agent_session_context": agent_session_context.clone(),
-            "agentSessionContext": agent_session_context.clone(),
             "recent_agent_sessions": agent_session_context["sessions"].clone(),
-            "recentAgentSessions": agent_session_context["sessions"].clone(),
             "submission_mode": submission_mode.clone(),
             "input_mode": submission_mode.clone(),
             "language": voice_language.clone(),
@@ -12085,7 +12078,7 @@ fn cloud_voice_agent_session_matches_control(
     true
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn set_cloud_voice_agent_input_enabled(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
@@ -12225,7 +12218,7 @@ async fn set_cloud_voice_agent_input_enabled(
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn send_cloud_voice_agent_text_message(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
@@ -12410,7 +12403,7 @@ async fn send_cloud_voice_agent_text_message(
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn stop_cloud_voice_agent_stream(
     audio_state: State<'_, AudioState>,
     request: Option<CloudVoiceAgentControlRequest>,
@@ -12465,7 +12458,7 @@ async fn stop_cloud_voice_agent_stream(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn finish_cloud_voice_agent_input(
     audio_state: State<'_, AudioState>,
     request: Option<CloudVoiceAgentControlRequest>,
@@ -12664,7 +12657,7 @@ async fn run_deepgram_realtime_stream(
     }));
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn start_deepgram_realtime_transcription(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
@@ -12801,7 +12794,7 @@ async fn start_deepgram_realtime_transcription(
     })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn stop_deepgram_realtime_transcription(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
@@ -12877,7 +12870,7 @@ async fn stop_deepgram_realtime_transcription(
 }
 
 #[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(default)]
 struct ForgeDictationStartRequest {
     llm_cleanup: Option<bool>,
     language: Option<String>,
@@ -12890,13 +12883,12 @@ struct ForgeDictationStartRequest {
 }
 
 #[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(default)]
 struct ForgeDictationStopRequest {
     cancel: bool,
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct ForgeDictationStartStatus {
     active: bool,
     language: String,
@@ -12906,7 +12898,6 @@ struct ForgeDictationStartStatus {
 }
 
 #[derive(Serialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
 struct ForgeDictationResult {
     text: String,
     raw_text: String,
@@ -12922,7 +12913,6 @@ struct ForgeDictationResult {
 }
 
 #[derive(Serialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
 struct ForgeDictationRawResultEvent {
     history_id: String,
     created_at: String,
@@ -12940,7 +12930,6 @@ struct ForgeDictationRawResultEvent {
 }
 
 #[derive(Serialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
 struct ForgeDictationCleanedResultEvent {
     history_id: String,
     created_at: String,
@@ -12957,7 +12946,7 @@ struct ForgeDictationCleanedResultEvent {
 }
 
 #[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(default)]
 struct AudioTranscriptionPolishRequest {
     text: String,
     fallback_text: String,
@@ -12968,7 +12957,6 @@ struct AudioTranscriptionPolishRequest {
 }
 
 #[derive(Serialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
 struct AudioTranscriptionPolishResult {
     text: String,
     raw_text: String,
@@ -13049,13 +13037,13 @@ fn insert_audio_cleanup_selector_payload(
         return;
     };
     if let Some(value) = clean_audio_cleanup_selector_field(cleanup_engine) {
-        object.insert("cleanupEngine".to_string(), json!(value));
+        object.insert("cleanup_engine".to_string(), json!(value));
     }
     if let Some(value) = clean_audio_cleanup_selector_field(cleanup_provider) {
-        object.insert("cleanupProvider".to_string(), json!(value));
+        object.insert("cleanup_provider".to_string(), json!(value));
     }
     if let Some(value) = clean_audio_cleanup_selector_field(cleanup_model) {
-        object.insert("cleanupModel".to_string(), json!(value));
+        object.insert("cleanup_model".to_string(), json!(value));
     }
 }
 
@@ -13134,7 +13122,7 @@ fn forge_dictation_result_from_payload(
     let cleanup_provider = {
         let provider = audio_payload_text(
             payload,
-            &["cleanup_provider", "cleanupProvider", "llm_cleanup_provider", "llmCleanupProvider"],
+            &["cleanup_provider", "llm_cleanup_provider"],
         );
         if provider.is_empty() {
             audio_payload_text(cleanup, &["provider"])
@@ -13145,7 +13133,7 @@ fn forge_dictation_result_from_payload(
     let cleanup_model = {
         let model = audio_payload_text(
             payload,
-            &["cleanup_model", "cleanupModel", "llm_cleanup_model", "llmCleanupModel"],
+            &["cleanup_model", "llm_cleanup_model"],
         );
         if model.is_empty() {
             audio_payload_text(cleanup, &["model"])
@@ -13154,15 +13142,15 @@ fn forge_dictation_result_from_payload(
         }
     };
     let cleanup_ms =
-        audio_payload_timing_u64(payload, &["cleanup_ms", "cleanupMs"]).unwrap_or(0);
+        audio_payload_timing_u64(payload, &["cleanup_ms"]).unwrap_or(0);
     let stt_ms = audio_payload_timing_u64(
         payload,
-        &["stt_ms", "sttMs", "finish_to_raw_ms", "finishToRawMs"],
+        &["stt_ms", "finish_to_raw_ms"],
     )
     .unwrap_or(0);
     let llm_ms =
-        audio_payload_timing_u64(payload, &["llm_ms", "llmMs"]).unwrap_or(cleanup_ms);
-    let total_ms = audio_payload_timing_u64(payload, &["total_ms", "totalMs"])
+        audio_payload_timing_u64(payload, &["llm_ms"]).unwrap_or(cleanup_ms);
+    let total_ms = audio_payload_timing_u64(payload, &["total_ms"])
         .unwrap_or_else(|| stt_ms.saturating_add(llm_ms));
 
     Ok(ForgeDictationResult {
@@ -13205,7 +13193,6 @@ fn apply_forge_dictation_cleaned_payload(result: &mut ForgeDictationResult, fram
     }
     let raw_text = frame
         .get("raw_text")
-        .or_else(|| frame.get("rawText"))
         .and_then(Value::as_str)
         .unwrap_or_default()
         .trim()
@@ -13215,14 +13202,11 @@ fn apply_forge_dictation_cleaned_payload(result: &mut ForgeDictationResult, fram
     }
     result.llm_cleaned = frame
         .get("llm_cleaned")
-        .or_else(|| frame.get("llmCleaned"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if let Some(provider) = [
         "cleanup_provider",
-        "cleanupProvider",
         "llm_cleanup_provider",
-        "llmCleanupProvider",
     ]
     .iter()
     .find_map(|key| {
@@ -13236,9 +13220,7 @@ fn apply_forge_dictation_cleaned_payload(result: &mut ForgeDictationResult, fram
     }
     if let Some(model) = [
         "cleanup_model",
-        "cleanupModel",
         "llm_cleanup_model",
-        "llmCleanupModel",
     ]
     .iter()
     .find_map(|key| {
@@ -13251,18 +13233,16 @@ fn apply_forge_dictation_cleaned_payload(result: &mut ForgeDictationResult, fram
         result.cleanup_model = model.to_string();
     }
     result.cleanup_ms =
-        audio_payload_timing_u64(frame, &["cleanup_ms", "cleanupMs"]).unwrap_or(result.cleanup_ms);
+        audio_payload_timing_u64(frame, &["cleanup_ms"]).unwrap_or(result.cleanup_ms);
     result.stt_ms = audio_payload_timing_u64(
         frame,
         &[
             "stt_ms",
-            "sttMs",
             "finish_to_raw_ms",
-            "finishToRawMs",
         ],
     )
     .unwrap_or(result.stt_ms);
-    result.llm_ms = audio_payload_timing_u64(frame, &["llm_ms", "llmMs"]).unwrap_or_else(|| {
+    result.llm_ms = audio_payload_timing_u64(frame, &["llm_ms"]).unwrap_or_else(|| {
         if result.cleanup_ms > 0 {
             result.cleanup_ms
         } else {
@@ -13270,7 +13250,7 @@ fn apply_forge_dictation_cleaned_payload(result: &mut ForgeDictationResult, fram
         }
     });
     result.total_ms =
-        audio_payload_timing_u64(frame, &["total_ms", "totalMs"]).unwrap_or_else(|| {
+        audio_payload_timing_u64(frame, &["total_ms"]).unwrap_or_else(|| {
             result.stt_ms.saturating_add(result.llm_ms)
         });
 }
@@ -13357,7 +13337,7 @@ async fn forge_audio_cloud_http_headers(
     );
 
     let device_profile = cloud_mcp_desktop_device_profile();
-    if let Some(device_id) = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"]) {
+    if let Some(device_id) = cloud_mcp_payload_text(&device_profile, &["device_id"]) {
         headers.insert(
             "x-diffforge-device-id",
             reqwest::header::HeaderValue::from_str(&device_id)
@@ -13394,7 +13374,7 @@ async fn forge_audio_cloud_http_headers(
     Ok(headers)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn polish_audio_transcription(
     app: AppHandle,
     cloud_mcp_state: State<'_, CloudMcpState>,
@@ -13425,7 +13405,7 @@ async fn polish_audio_transcription(
     );
     if !polishing_prompt.trim().is_empty() {
         if let Some(object) = payload.as_object_mut() {
-            object.insert("polishingPrompt".to_string(), json!(polishing_prompt));
+            object.insert("polishing_prompt".to_string(), json!(polishing_prompt));
         }
     }
     let response = http_client(Duration::from_secs(CLOUD_DICTATION_POLISH_TIMEOUT_SECS))?
@@ -13494,14 +13474,14 @@ async fn polish_audio_transcription(
     }
     write_audio_transcription_polish_clipboard_text(&polished_text)?;
 
-    let cleanup_ms = audio_payload_timing_u64(data, &["cleanup_ms", "cleanupMs"]).unwrap_or(0);
+    let cleanup_ms = audio_payload_timing_u64(data, &["cleanup_ms"]).unwrap_or(0);
     let stt_ms = audio_payload_timing_u64(
         data,
-        &["stt_ms", "sttMs", "finish_to_raw_ms", "finishToRawMs"],
+        &["stt_ms", "finish_to_raw_ms"],
     )
     .unwrap_or(0);
-    let llm_ms = audio_payload_timing_u64(data, &["llm_ms", "llmMs"]).unwrap_or(cleanup_ms);
-    let total_ms = audio_payload_timing_u64(data, &["total_ms", "totalMs"])
+    let llm_ms = audio_payload_timing_u64(data, &["llm_ms"]).unwrap_or(cleanup_ms);
+    let total_ms = audio_payload_timing_u64(data, &["total_ms"])
         .unwrap_or_else(|| {
             let total = stt_ms.saturating_add(llm_ms);
             if total > 0 { total } else { cleanup_ms }
@@ -13509,7 +13489,7 @@ async fn polish_audio_transcription(
     let provider = {
         let provider = audio_payload_text(
             data,
-            &["provider", "cleanup_provider", "cleanupProvider", "llm_cleanup_provider", "llmCleanupProvider"],
+            &["provider", "cleanup_provider", "llm_cleanup_provider"],
         );
         if provider.is_empty() {
             clean_audio_cleanup_selector_field(request.cleanup_provider.as_deref())
@@ -13521,7 +13501,7 @@ async fn polish_audio_transcription(
     let model = {
         let model = audio_payload_text(
             data,
-            &["model", "cleanup_model", "cleanupModel", "llm_cleanup_model", "llmCleanupModel"],
+            &["model", "cleanup_model", "llm_cleanup_model"],
         );
         if model.is_empty() {
             clean_audio_cleanup_selector_field(request.cleanup_model.as_deref()).unwrap_or_default()
@@ -13534,14 +13514,12 @@ async fn polish_audio_transcription(
         text: polished_text,
         raw_text: data
             .get("raw_text")
-            .or_else(|| data.get("rawText"))
             .and_then(Value::as_str)
             .unwrap_or(&text)
             .trim()
             .to_string(),
         llm_cleaned: data
             .get("llm_cleaned")
-            .or_else(|| data.get("llmCleaned"))
             .and_then(Value::as_bool)
             .unwrap_or(true),
         cleanup_ms,
@@ -14214,12 +14192,12 @@ async fn claim_forge_dictation_warm_stream(
 }
 
 #[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(default)]
 struct ForgeDictationPrewarmRequest {
     enabled: Option<bool>,
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn prewarm_forge_dictation_transcription(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
@@ -14258,7 +14236,7 @@ async fn prewarm_forge_dictation_transcription(
     Ok(true)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn start_forge_dictation_transcription(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
@@ -14434,7 +14412,7 @@ async fn start_forge_dictation_transcription(
     );
     if llm_cleanup && !polishing_prompt.trim().is_empty() {
         if let Some(object) = start_request.as_object_mut() {
-            object.insert("polishingPrompt".to_string(), json!(polishing_prompt));
+            object.insert("polishing_prompt".to_string(), json!(polishing_prompt));
         }
     }
 
@@ -14502,7 +14480,7 @@ async fn start_forge_dictation_transcription(
     })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn stop_forge_dictation_transcription(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
@@ -14615,20 +14593,20 @@ async fn stop_forge_dictation_transcription(
     Ok(result)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn audio_widget_status(app: AppHandle) -> Result<AudioWidgetVisibility, String> {
     log_audio_diagnostic_event("audio.widget.status.command", json!({}));
     audio_widget_status_for(&app)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn audio_widget_set_capture_visible(app: AppHandle, visible: bool) -> Result<(), String> {
     AUDIO_WIDGET_CAPTURE_VISIBLE.store(visible, Ordering::Release);
     audio_widget_apply_capture_visibility_to_existing_windows(&app);
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn audio_widget_bar_hover_snapshot(
     app: AppHandle,
     request: AudioWidgetBarHoverSnapshotRequest,
@@ -14636,7 +14614,7 @@ async fn audio_widget_bar_hover_snapshot(
     Ok(audio_widget_bar_hover_snapshot_for(&app, &request))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn audio_widget_log_bubble_position(
     request: AudioWidgetBubblePositionLogRequest,
 ) -> Result<(), String> {
@@ -14649,7 +14627,7 @@ async fn audio_widget_log_bubble_position(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn audio_widget_position_bottom_bar(
     app: AppHandle,
     request: AudioWidgetBottomBarPositionRequest,
@@ -14657,7 +14635,7 @@ async fn audio_widget_position_bottom_bar(
     audio_widget_position_bottom_bar_for(&app, request)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn audio_widget_clear_bottom_bar_position(app: AppHandle) -> Result<(), String> {
     audio_widget_clear_bottom_bar_position_request();
     // Leaving bar mode hands frame ownership back to JS; a still-ticking
@@ -14667,7 +14645,7 @@ async fn audio_widget_clear_bottom_bar_position(app: AppHandle) -> Result<(), St
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn audio_widget_show_error_overlay(
     app: AppHandle,
     request: AudioWidgetErrorOverlayRequest,
@@ -14675,17 +14653,17 @@ async fn audio_widget_show_error_overlay(
     audio_widget_position_error_overlay_for(&app, request)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn audio_widget_hide_error_overlay(app: AppHandle) -> Result<(), String> {
     audio_widget_hide_error_overlay_for(&app)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn audio_widget_release_keyboard_focus(app: AppHandle) -> Result<bool, String> {
     audio_widget_release_keyboard_focus_on_main_thread(&app)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn show_audio_widget(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
@@ -14719,13 +14697,13 @@ async fn show_audio_widget(
     Ok(visibility)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn hide_audio_widget(app: AppHandle) -> Result<AudioWidgetVisibility, String> {
     log_audio_diagnostic_event("audio.widget.hide.command", json!({}));
     hide_audio_widget_for(&app)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn toggle_audio_widget(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
@@ -14759,7 +14737,7 @@ async fn toggle_audio_widget(
     Ok(visibility)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn insert_transcribed_text(
     app: AppHandle,
     terminal_state: State<'_, TerminalState>,
@@ -14837,7 +14815,6 @@ const HYPERFRAME_DEEPGRAM_TIMEOUT_SECS: u64 = 600;
 const HYPERFRAME_WHISPER_FILE_TIMEOUT_SECS: u64 = 1_800;
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct HyperframeTranscribeRequest {
     provider: String,
     api_key: Option<String>,
@@ -14961,7 +14938,7 @@ async fn hyperframe_transcribe_with_deepgram(
     }
 
     Ok(json!({
-        "durationSeconds": duration_seconds,
+        "duration_seconds": duration_seconds,
         "language": language,
         "tool": "deepgram",
         "utterances": utterances,
@@ -15056,7 +15033,7 @@ fn hyperframe_transcribe_with_whisper(
             .map(|entry| hyperframe_transcript_number(entry.get("end").unwrap_or(&Value::Null)))
             .fold(0.0f64, f64::max);
         Ok(json!({
-            "durationSeconds": duration_seconds,
+            "duration_seconds": duration_seconds,
             "language": language,
             "tool": "whisper-local",
             "utterances": utterances,
@@ -15068,7 +15045,7 @@ fn hyperframe_transcribe_with_whisper(
     parse_result
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn hyperframe_transcribe_audio(
     app: AppHandle,
     request: HyperframeTranscribeRequest,

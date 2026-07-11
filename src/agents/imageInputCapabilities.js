@@ -139,13 +139,13 @@ function lookupClaudeImageInputState(model) {
   return IMAGE_INPUT_UNKNOWN;
 }
 
-function buildCapabilityResult({ activeModel, agentId, agentLabel, state }) {
+function buildCapabilityResult({ active_model: activeModel, agent_id: agentId, agent_label: agentLabel, state }) {
   const label = agentLabel || agentId || "This agent";
   const modelLabel = activeModel || "the selected model";
 
   if (state === IMAGE_INPUT_SUPPORTED) {
     return {
-      activeModel,
+      active_model: activeModel,
       reason: `${label} image input is supported for ${modelLabel}.`,
       state,
       supported: true,
@@ -154,7 +154,7 @@ function buildCapabilityResult({ activeModel, agentId, agentLabel, state }) {
 
   if (state === IMAGE_INPUT_UNSUPPORTED) {
     return {
-      activeModel,
+      active_model: activeModel,
       reason: `${label} image input is not supported for ${modelLabel}.`,
       state,
       supported: false,
@@ -162,7 +162,7 @@ function buildCapabilityResult({ activeModel, agentId, agentLabel, state }) {
   }
 
   return {
-    activeModel,
+    active_model: activeModel,
     reason: activeModel
       ? `${label} image input support is unknown for ${activeModel}.`
       : `${label} image input depends on the selected model.`,
@@ -174,7 +174,7 @@ function buildCapabilityResult({ activeModel, agentId, agentLabel, state }) {
 export function getAgentModelImageInputCapability(agentId, model, options = {}) {
   const normalizedAgentId = normalizeCapabilityAgentId(agentId);
   const activeModel = normalizeModelId(model);
-  const agentLabel = options.agentLabel || (
+  const agentLabel = options.agent_label || (
     normalizedAgentId === "claude"
       ? "Claude"
       : normalizedAgentId === "codex"
@@ -186,7 +186,7 @@ export function getAgentModelImageInputCapability(agentId, model, options = {}) 
 
   if (normalizedAgentId === "opencode") {
     return {
-      activeModel,
+      active_model: activeModel,
       reason: "OpenCode image upload is disabled for now.",
       state: IMAGE_INPUT_UNSUPPORTED,
       supported: false,
@@ -195,24 +195,24 @@ export function getAgentModelImageInputCapability(agentId, model, options = {}) 
 
   if (normalizedAgentId === "codex") {
     return buildCapabilityResult({
-      activeModel,
-      agentId: normalizedAgentId,
-      agentLabel,
+      active_model: activeModel,
+      agent_id: normalizedAgentId,
+      agent_label: agentLabel,
       state: lookupCodexImageInputState(activeModel),
     });
   }
 
   if (normalizedAgentId === "claude") {
     return buildCapabilityResult({
-      activeModel,
-      agentId: normalizedAgentId,
-      agentLabel,
+      active_model: activeModel,
+      agent_id: normalizedAgentId,
+      agent_label: agentLabel,
       state: lookupClaudeImageInputState(activeModel),
     });
   }
 
   return {
-    activeModel,
+    active_model: activeModel,
     reason: "This terminal does not accept image input.",
     state: IMAGE_INPUT_UNSUPPORTED,
     supported: false,

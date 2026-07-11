@@ -85,23 +85,23 @@ function normalizedFilterId(value) {
 }
 
 function documentTitle(entry) {
-  return text(entry?.title || entry?.name || entry?.id || entry?.documentId || entry?.document_id, "Untitled doc");
+  return text(entry?.title || entry?.name || entry?.id || entry?.document_id, "Untitled doc");
 }
 
 function documentBody(entry) {
-  return String(entry?.content ?? entry?.contentMd ?? entry?.content_md ?? entry?.body ?? "");
+  return String(entry?.content ?? entry?.content_md ?? entry?.body ?? "");
 }
 
 function documentKind(entry) {
   return normalizedDocumentKind(
-    entry?.documentKind || entry?.document_kind || entry?.source || entry?.kind,
+    entry?.document_kind || entry?.source || entry?.kind,
     entry?.collection,
   );
 }
 
 function documentIsFolder(entry) {
-  const rowType = text(entry?.rowType || entry?.row_type || entry?.type).toLowerCase();
-  const entryKind = text(entry?.entryKind || entry?.entry_kind).toLowerCase();
+  const rowType = text(entry?.row_type || entry?.type).toLowerCase();
+  const entryKind = text(entry?.entry_kind).toLowerCase();
   return rowType === "folder" || entryKind === "folder";
 }
 
@@ -110,12 +110,12 @@ function docCardEntry(entry) {
   const title = documentTitle(entry);
   return {
     body: documentBody(entry),
-    contentHash: text(entry?.contentHash || entry?.content_hash || entry?.sha256),
-    id: text(entry?.id || entry?.documentId || entry?.document_id || accountDocumentStorageKey(entry)),
+    content_hash: text(entry?.content_hash || entry?.sha256),
+    id: text(entry?.id || entry?.document_id || accountDocumentStorageKey(entry)),
     kind,
     key: accountDocumentStorageKey(entry) || text(entry?.id || title),
-    localPath: text(entry?.localPath || entry?.local_path),
-    pathKey: text(entry?.pathKey || entry?.path_key),
+    local_path: text(entry?.local_path),
+    path_key: text(entry?.path_key),
     title,
     typeLabel: DOC_KIND_LABELS[kind] || "Document",
   };
@@ -139,11 +139,11 @@ function docTodoText(entry) {
 function docDragPayload(entry, sendOnDrop) {
   return {
     document: {
-      content_hash: entry.contentHash,
+      content_hash: entry.content_hash,
       doc_id: entry.id,
       document_kind: entry.kind,
-      local_path: entry.localPath,
-      path_key: entry.pathKey || entry.key,
+      local_path: entry.local_path,
+      path_key: entry.path_key || entry.key,
       title: entry.title,
     },
     send_on_drop: Boolean(sendOnDrop),
@@ -163,8 +163,8 @@ const WorkspaceToolsDragPanel = memo(function WorkspaceToolsDragPanel({
   coordinationTargets = [],
   documentPanelEnabled = false,
   onOpenDocumentPanel = null,
-  rootDirectory = "",
-  workspaceId = "",
+  root_directory: rootDirectory = "",
+  workspace_id: workspaceId = "",
 }) {
   const [filter, setFilter] = useState(() => {
     return normalizedFilterId(readStorage(FILTER_STORAGE_PREFIX, workspaceId, "all"));

@@ -133,7 +133,7 @@ function cleanTextArray(...values) {
   return Array.from(new Set(result));
 }
 
-export function getWorkspaceThreadDetailVisibilityKey({ workspaceId = "", threadId = "" } = {}) {
+export function getWorkspaceThreadDetailVisibilityKey({ workspace_id: workspaceId = "", thread_id: threadId = "" } = {}) {
   const safeWorkspaceId = cleanText(workspaceId);
   const safeThreadId = cleanText(threadId);
   return safeWorkspaceId && safeThreadId ? `${safeWorkspaceId}::${safeThreadId}` : "";
@@ -155,9 +155,9 @@ function getWorkspaceThreadDetailVisibilityRegistry() {
 }
 
 export function setWorkspaceThreadDetailVisibility(detail = {}) {
-  const workspaceId = cleanText(detail.workspaceId || detail.workspace_id);
-  const threadId = cleanText(detail.threadId || detail.thread_id);
-  const key = getWorkspaceThreadDetailVisibilityKey({ workspaceId, threadId });
+  const workspaceId = cleanText(detail.workspace_id);
+  const threadId = cleanText(detail.thread_id);
+  const key = getWorkspaceThreadDetailVisibilityKey({ workspace_id: workspaceId, thread_id: threadId });
   if (!key) {
     return "";
   }
@@ -174,9 +174,9 @@ export function setWorkspaceThreadDetailVisibility(detail = {}) {
       }
       entry.set(token, {
         ...detail,
-        threadId,
+        thread_id: threadId,
         visible: true,
-        workspaceId,
+        workspace_id: workspaceId,
       });
     } else if (entry instanceof Map) {
       if (token) {
@@ -198,9 +198,9 @@ export function setWorkspaceThreadDetailVisibility(detail = {}) {
     window.dispatchEvent(new CustomEvent(WORKSPACE_THREAD_DETAIL_VISIBILITY_EVENT, {
       detail: {
         ...detail,
-        threadId,
+        thread_id: threadId,
         visible,
-        workspaceId,
+        workspace_id: workspaceId,
       },
     }));
   }
@@ -208,9 +208,9 @@ export function setWorkspaceThreadDetailVisibility(detail = {}) {
   return key;
 }
 
-export function workspaceThreadDetailIsVisible({ workspaceId = "", threadId = "" } = {}) {
+export function workspaceThreadDetailIsVisible({ workspace_id: workspaceId = "", thread_id: threadId = "" } = {}) {
   const registry = getWorkspaceThreadDetailVisibilityRegistry();
-  const key = getWorkspaceThreadDetailVisibilityKey({ workspaceId, threadId });
+  const key = getWorkspaceThreadDetailVisibilityKey({ workspace_id: workspaceId, thread_id: threadId });
   if (!registry || !key) {
     return false;
   }
@@ -286,26 +286,8 @@ function promptingPermissionToken(value = {}, fallback = {}) {
   const source = value && typeof value === "object" ? value : {};
   const fallbackSource = fallback && typeof fallback === "object" ? fallback : {};
   return cleanText(
-    source.approvalId
-      || source.approval_id
-      || source.permissionPromptId
-      || source.permission_prompt_id
-      || source.permissionRequestId
-      || source.permission_request_id
-      || source.sourceEventId
-      || source.source_event_id
-      || source.toolUseId
-      || source.tool_use_id,
-    fallbackSource.approvalId
-      || fallbackSource.approval_id
-      || fallbackSource.permissionPromptId
-      || fallbackSource.permission_prompt_id
-      || fallbackSource.permissionRequestId
-      || fallbackSource.permission_request_id
-      || fallbackSource.sourceEventId
-      || fallbackSource.source_event_id
-      || fallbackSource.toolUseId
-      || fallbackSource.tool_use_id,
+    source.approval_id || source.permission_prompt_id || source.permission_request_id || source.source_event_id || source.tool_use_id,
+    fallbackSource.approval_id || fallbackSource.permission_prompt_id || fallbackSource.permission_request_id || fallbackSource.source_event_id || fallbackSource.tool_use_id,
   );
 }
 
@@ -322,49 +304,19 @@ function valueLooksExplicitPermissionPrompt(value = {}, fallback = {}) {
   const sourceValue = value && typeof value === "object" ? value : {};
   const fallbackValue = fallback && typeof fallback === "object" ? fallback : {};
   const active = promptingUserActive(
-    sourceValue.terminalIsPromptingUser
-      ?? sourceValue.terminal_is_prompting_user
-      ?? sourceValue.promptingUser
-      ?? sourceValue.prompting_user
-      ?? sourceValue.requiresUserInput
-      ?? sourceValue.requires_user_input,
-    fallbackValue.terminalIsPromptingUser
-      || fallbackValue.terminal_is_prompting_user
-      || fallbackValue.promptingUser
-      || fallbackValue.prompting_user
-      || fallbackValue.requiresUserInput
-      || fallbackValue.requires_user_input,
+    sourceValue.terminal_is_prompting_user ?? sourceValue.prompting_user ?? sourceValue.requires_user_input,
+    fallbackValue.terminal_is_prompting_user || fallbackValue.prompting_user || fallbackValue.requires_user_input,
   );
   if (!active) {
     return false;
   }
 
   const kind = normalizePromptingUserKind(
-    sourceValue.promptingUserKind
-      || sourceValue.prompting_user_kind
-      || sourceValue.promptingKind
-      || sourceValue.prompting_kind,
-    fallbackValue.promptingUserKind
-      || fallbackValue.prompting_user_kind
-      || fallbackValue.promptingKind
-      || fallbackValue.prompting_kind
-      || "",
+    sourceValue.prompting_user_kind || sourceValue.prompting_kind,
+    fallbackValue.prompting_user_kind || fallbackValue.prompting_kind || "",
   );
-  const source = sourceValue.promptingUserSource
-    || sourceValue.prompting_user_source
-    || sourceValue.promptingSource
-    || sourceValue.prompting_source
-    || sourceValue.source
-    || sourceValue.type
-    || fallbackValue.promptingUserSource
-    || fallbackValue.prompting_user_source
-    || fallbackValue.promptingSource
-    || fallbackValue.prompting_source;
-  const hasPermissionKind = EXPLICIT_PERMISSION_PROMPT_KINDS.has(kind)
-    || sourceValue.requiresUserInput === true
-    || sourceValue.requires_user_input === true
-    || fallbackValue.requiresUserInput === true
-    || fallbackValue.requires_user_input === true;
+  const source = sourceValue.prompting_user_source || sourceValue.prompting_source || sourceValue.source || sourceValue.type || fallbackValue.prompting_user_source || fallbackValue.prompting_source;
+  const hasPermissionKind = EXPLICIT_PERMISSION_PROMPT_KINDS.has(kind) || sourceValue.requires_user_input === true || fallbackValue.requires_user_input === true;
 
   return Boolean(
     hasPermissionKind
@@ -376,23 +328,15 @@ function promptingUserFields(value = {}, fallback = {}) {
   const sourceValue = value && typeof value === "object" ? value : {};
   const fallbackValue = fallback && typeof fallback === "object" ? fallback : {};
   const active = valueLooksExplicitPermissionPrompt(sourceValue, fallbackValue);
-  const sourceText = sourceValue.promptingUserSource
-    || sourceValue.prompting_user_source
-    || sourceValue.promptingSource
-    || sourceValue.prompting_source
-    || sourceValue.source
-    || fallbackValue.promptingUserSource
-    || fallbackValue.prompting_user_source
-    || fallbackValue.promptingSource
-    || fallbackValue.prompting_source;
+  const sourceText = sourceValue.prompting_user_source || sourceValue.prompting_source || sourceValue.source || fallbackValue.prompting_user_source || fallbackValue.prompting_source;
   return {
-    promptingUserConfidence: active
-      ? cleanText(sourceValue.promptingUserConfidence || sourceValue.promptingConfidence, fallbackValue.promptingUserConfidence || fallbackValue.promptingConfidence)
+    prompting_user_confidence: active
+      ? cleanText(sourceValue.prompting_user_confidence || sourceValue.prompting_confidence, fallbackValue.prompting_user_confidence || fallbackValue.prompting_confidence)
       : "",
-    promptingUserKind: active
-      ? normalizePromptingUserKind(sourceValue.promptingUserKind || sourceValue.promptingKind, fallbackValue.promptingUserKind || fallbackValue.promptingKind || "unknown")
+    prompting_user_kind: active
+      ? normalizePromptingUserKind(sourceValue.prompting_user_kind || sourceValue.prompting_kind, fallbackValue.prompting_user_kind || fallbackValue.prompting_kind || "unknown")
       : "",
-    promptingUserSource: active
+    prompting_user_source: active
       ? cleanText(
         promptingSourceLooksExplicitPermission(sourceText)
           ? sourceText
@@ -402,10 +346,10 @@ function promptingUserFields(value = {}, fallback = {}) {
         "permission",
       )
       : "",
-    promptingUserText: active
-      ? cleanText(sourceValue.promptingUserText || sourceValue.promptingText, fallbackValue.promptingUserText || fallbackValue.promptingText).slice(0, 420)
+    prompting_user_text: active
+      ? cleanText(sourceValue.prompting_user_text || sourceValue.prompting_text, fallbackValue.prompting_user_text || fallbackValue.prompting_text).slice(0, 420)
       : "",
-    terminalIsPromptingUser: active,
+    terminal_is_prompting_user: active,
   };
 }
 
@@ -414,20 +358,20 @@ function eventExplicitlyPromptsUser(event = {}) {
 }
 
 function promptingUserFieldsForTerminalEvent(event = {}, fallback = {}, options = {}) {
-  const eventType = cleanText(options.eventType || event?.type).toLowerCase();
+  const eventType = cleanText(options.event_type || event?.type).toLowerCase();
   const shouldClear = Boolean(
     options.clear === true
       || PROMPTING_CLEARING_TERMINAL_EVENT_TYPES.has(eventType)
-      || event?.terminalIsPromptingUser === false
-      || event?.promptingUser === false
-      || event?.requiresUserInput === false,
+      || event?.terminal_is_prompting_user === false
+      || event?.prompting_user === false
+      || event?.requires_user_input === false,
   );
   const value = shouldClear && !eventExplicitlyPromptsUser(event)
     ? {
         ...event,
-        promptingUser: false,
-        requiresUserInput: false,
-        terminalIsPromptingUser: false,
+        prompting_user: false,
+        requires_user_input: false,
+        terminal_is_prompting_user: false,
       }
     : event;
   return promptingUserFields(value, fallback);
@@ -437,21 +381,17 @@ function hookHealthFields(value = {}, fallback = {}) {
   const sourceValue = value && typeof value === "object" ? value : {};
   const fallbackValue = fallback && typeof fallback === "object" ? fallback : {};
   const observedAtMs = Number(
-    sourceValue.hookHealthObservedAtMs
-      || sourceValue.hook_health_observed_at_ms
-      || fallbackValue.hookHealthObservedAtMs
-      || fallbackValue.hook_health_observed_at_ms
-      || 0,
+    sourceValue.hook_health_observed_at_ms || fallbackValue.hook_health_observed_at_ms || 0,
   );
   return {
-    hookHealthEvent: cleanText(
-      sourceValue.hookHealthEvent || sourceValue.hook_health_event,
-      fallbackValue.hookHealthEvent || fallbackValue.hook_health_event,
+    hook_health_event: cleanText(
+      sourceValue.hook_health_event,
+      fallbackValue.hook_health_event,
     ),
-    hookHealthObservedAtMs: Number.isFinite(observedAtMs) && observedAtMs > 0 ? observedAtMs : 0,
-    hookHealthStatus: cleanText(
-      sourceValue.hookHealthStatus || sourceValue.hook_health_status,
-      fallbackValue.hookHealthStatus || fallbackValue.hook_health_status,
+    hook_health_observed_at_ms: Number.isFinite(observedAtMs) && observedAtMs > 0 ? observedAtMs : 0,
+    hook_health_status: cleanText(
+      sourceValue.hook_health_status,
+      fallbackValue.hook_health_status,
     ),
   };
 }
@@ -563,57 +503,45 @@ function pickThreadToolValue(source, keys) {
 function normalizeThreadToolMetadata(value = {}) {
   const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
   const toolInput = pickThreadToolValue(source, [
-    "toolInput",
     "tool_input",
     "input",
     "arguments",
     "args",
   ]);
   const toolOutput = pickThreadToolValue(source, [
-    "toolOutput",
     "tool_output",
     "output",
     "result",
   ]);
   const toolError = pickThreadToolValue(source, [
-    "toolError",
     "tool_error",
     "error",
     "stderr",
   ]);
   const rawToolPayload = pickThreadToolValue(source, [
-    "rawToolPayload",
     "raw_tool_payload",
-    "rawPayload",
     "raw_payload",
     "raw",
   ]);
   const durationMs = Number(
-    source.durationMs
-      || source.duration_ms
-      || source.elapsedMs
-      || source.elapsed_ms
-      || 0,
+    source.duration_ms || source.elapsed_ms || 0,
   );
   const exitCode = Number(
-    source.exitCode
-      ?? source.exit_code
-      ?? source.code
-      ?? Number.NaN,
+    source.exit_code ?? source.code ?? Number.NaN,
   );
   const metadata = {
     command: cleanMessageText(source.command),
-    filePath: cleanText(source.filePath || source.file_path || source.path),
-    toolDisplayName: cleanText(source.toolDisplayName || source.tool_display_name),
-    toolName: cleanText(source.toolName || source.tool_name || source.name),
-    toolServer: cleanText(source.toolServer || source.tool_server || source.server),
+    file_path: cleanText(source.file_path || source.path),
+    tool_display_name: cleanText(source.tool_display_name),
+    tool_name: cleanText(source.tool_name || source.name),
+    tool_server: cleanText(source.tool_server || source.server),
   };
-  if (threadToolValueHasContent(toolInput)) metadata.toolInput = toolInput;
-  if (threadToolValueHasContent(toolOutput)) metadata.toolOutput = toolOutput;
-  if (threadToolValueHasContent(toolError)) metadata.toolError = toolError;
-  if (threadToolValueHasContent(rawToolPayload)) metadata.rawToolPayload = rawToolPayload;
-  if (Number.isFinite(durationMs) && durationMs > 0) metadata.durationMs = Math.round(durationMs);
-  if (Number.isFinite(exitCode)) metadata.exitCode = Math.trunc(exitCode);
+  if (threadToolValueHasContent(toolInput)) metadata.tool_input = toolInput;
+  if (threadToolValueHasContent(toolOutput)) metadata.tool_output = toolOutput;
+  if (threadToolValueHasContent(toolError)) metadata.tool_error = toolError;
+  if (threadToolValueHasContent(rawToolPayload)) metadata.raw_tool_payload = rawToolPayload;
+  if (Number.isFinite(durationMs) && durationMs > 0) metadata.duration_ms = Math.round(durationMs);
+  if (Number.isFinite(exitCode)) metadata.exit_code = Math.trunc(exitCode);
 
   return Object.fromEntries(
     Object.entries(metadata).filter(([, entry]) => (
@@ -655,37 +583,24 @@ function normalizeThreadStructuredTranscriptMetadata(value = {}) {
       || cleanText(source[key]).toLowerCase() === "true";
   };
 
-  copyText("canonicalKind", ["canonicalKind", "canonical_kind"]);
-  copyText("canonical_kind", ["canonical_kind", "canonicalKind"]);
-  copyText("legacyKind", ["legacyKind", "legacy_kind"]);
-  copyText("legacy_kind", ["legacy_kind", "legacyKind"]);
-  copyText("recordId", ["recordId", "record_id"]);
-  copyText("record_id", ["record_id", "recordId"]);
-  copyText("startedAt", ["startedAt", "started_at"]);
-  copyText("started_at", ["started_at", "startedAt"]);
-  copyText("completedAt", ["completedAt", "completed_at"]);
-  copyText("completed_at", ["completed_at", "completedAt"]);
-  copyNumber("recordSeq", ["recordSeq", "record_seq"]);
-  copyNumber("record_seq", ["record_seq", "recordSeq"]);
-  copyNumber("durationMs", ["durationMs", "duration_ms"]);
-  copyNumber("duration_ms", ["duration_ms", "durationMs"]);
-  copyBool("truncated", ["truncated", "is_truncated", "isTruncated", "partial"]);
-  copyBool("is_truncated", ["is_truncated", "isTruncated", "truncated", "partial"]);
-  copyBool("isTruncated", ["isTruncated", "is_truncated", "truncated", "partial"]);
-  copyBool("partial", ["partial", "truncated", "is_truncated", "isTruncated"]);
-  copyValue("tool", ["tool", "tool_call", "toolCall"]);
-  copyValue("tool_call", ["tool_call", "tool", "toolCall"]);
-  copyValue("toolCall", ["toolCall", "tool", "tool_call"]);
-  copyValue("file_change", ["file_change", "fileChange"]);
-  copyValue("fileChange", ["fileChange", "file_change"]);
-  copyValue("subagent", ["subagent", "subAgent"]);
-  copyValue("subAgent", ["subAgent", "subagent"]);
-  copyValue("usage", ["usage", "usage_report", "usageReport", "token_usage", "tokenUsage"]);
-  copyValue("usage_report", ["usage_report", "usage", "usageReport", "token_usage", "tokenUsage"]);
-  copyValue("usageReport", ["usageReport", "usage", "usage_report", "token_usage", "tokenUsage"]);
-  copyValue("files", ["files", "changed_files", "changedFiles"]);
-  copyValue("changed_files", ["changed_files", "files", "changedFiles"]);
-  copyValue("changedFiles", ["changedFiles", "files", "changed_files"]);
+  copyText("canonical_kind", ["canonical_kind"]);
+  copyText("legacy_kind", ["legacy_kind"]);
+  copyText("record_id", ["record_id"]);
+  copyText("started_at", ["started_at"]);
+  copyText("completed_at", ["completed_at"]);
+  copyNumber("record_seq", ["record_seq"]);
+  copyNumber("duration_ms", ["duration_ms"]);
+  copyBool("truncated", ["truncated", "is_truncated", "partial"]);
+  copyBool("is_truncated", ["is_truncated", "truncated", "partial"]);
+  copyBool("partial", ["partial", "truncated", "is_truncated"]);
+  copyValue("tool", ["tool", "tool_call"]);
+  copyValue("tool_call", ["tool_call", "tool"]);
+  copyValue("file_change", ["file_change"]);
+  copyValue("subagent", ["subagent"]);
+  copyValue("usage", ["usage", "usage_report", "token_usage"]);
+  copyValue("usage_report", ["usage_report", "usage", "token_usage"]);
+  copyValue("files", ["files", "changed_files"]);
+  copyValue("changed_files", ["changed_files", "files"]);
 
   return metadata;
 }
@@ -695,9 +610,9 @@ function normalizeThreadArtifact(artifact) {
     return null;
   }
 
-  const mimeType = cleanText(artifact.mimeType || artifact.mime_type || artifact.contentType || artifact.content_type);
-  const path = cleanText(artifact.path || artifact.filePath || artifact.file_path || artifact.localPath || artifact.local_path);
-  const url = cleanText(artifact.url || artifact.uri || artifact.fileUrl || artifact.file_url || artifact.imageUrl || artifact.image_url);
+  const mimeType = cleanText(artifact.mime_type || artifact.content_type);
+  const path = cleanText(artifact.path || artifact.file_path || artifact.local_path);
+  const url = cleanText(artifact.url || artifact.uri || artifact.file_url || artifact.image_url);
   const reference = url || path;
   if (!reference) {
     return null;
@@ -713,8 +628,8 @@ function normalizeThreadArtifact(artifact) {
 
   return {
     kind: kind || "file",
-    mimeType,
-    name: cleanText(artifact.name || artifact.filename || artifact.fileName || artifact.file_name),
+    mime_type: mimeType,
+    name: cleanText(artifact.name || artifact.filename || artifact.file_name),
     path,
     prompt: cleanMessageText(artifact.prompt),
     title: cleanText(artifact.title || artifact.label),
@@ -747,7 +662,7 @@ function threadArtifactsSignature(artifacts) {
   return normalizeThreadArtifacts(artifacts)
     .map((artifact) => [
       artifact.kind,
-      artifact.mimeType,
+      artifact.mime_type,
       artifact.url,
       artifact.path,
       artifact.title,
@@ -910,7 +825,7 @@ function pastedLinesPlaceholderSignature(value) {
   }
 
   return {
-    lineCount: cleanText(match[1]),
+    line_count: cleanText(match[1]),
     path: suffix.startsWith("->")
       ? normalizeAttachmentPathText(suffix.slice(2)).toLowerCase()
       : "",
@@ -1079,7 +994,7 @@ function isTurnCompleteProjectionEvent(event) {
   const kind = cleanText(event?.kind).toLowerCase();
   const status = cleanText(event?.status).toLowerCase();
   const title = cleanText(event?.title).toLowerCase();
-  const messageId = cleanText(event?.messageId || event?.message_id || event?.id).toLowerCase();
+  const messageId = cleanText(event?.message_id || event?.id).toLowerCase();
   return kind === "task_complete"
     || kind === "final_answer"
     || status === "task_complete"
@@ -1226,7 +1141,7 @@ function normalizePendingPrompt(value) {
     return null;
   }
 
-  const rawDeliveryMode = cleanText(value.deliveryMode || value.mode).toLowerCase();
+  const rawDeliveryMode = cleanText(value.delivery_mode || value.mode).toLowerCase();
   const deliveryMode = rawDeliveryMode === "provider-api"
     || rawDeliveryMode === "terminal-confirmed"
     || rawDeliveryMode === "session-acceptance"
@@ -1234,8 +1149,8 @@ function normalizePendingPrompt(value) {
     : "terminal";
 
   return {
-    createdAt: cleanText(value.createdAt, nowIso()),
-    deliveryMode,
+    created_at: cleanText(value.created_at, nowIso()),
+    delivery_mode: deliveryMode,
     id: cleanText(value.id, createRandomId("pending-prompt")),
     model: cleanModelId(value.model),
     text,
@@ -1285,11 +1200,8 @@ function terminalNicknameFromSources(...sources) {
 
 function workspaceTerminalNicknameFromRecord(record) {
   return terminalNicknameFromSources(
-    record?.terminalNickname,
     record?.terminal_nickname,
-    record?.terminalName,
     record?.terminal_name,
-    record?.displayName,
     record?.display_name,
   );
 }
@@ -1310,14 +1222,14 @@ function workspaceTerminalNicknameInUse(entry, nickname, options = {}) {
     return false;
   }
 
-  const excludeThreadId = cleanText(options.excludeThreadId || options.threadId);
-  const excludeTerminalKey = terminalSessionKey(options.excludeTerminalIndex ?? options.terminalIndex);
+  const excludeThreadId = cleanText(options.excludeThreadId || options.thread_id);
+  const excludeTerminalKey = terminalSessionKey(options.excludeTerminalIndex ?? options.terminal_index);
 
   return Object.entries(entry?.terminals || {}).some(([terminalKey, terminal]) => {
     if (excludeTerminalKey && terminalKey === excludeTerminalKey) {
       return false;
     }
-    if (excludeThreadId && cleanText(terminal?.threadId) === excludeThreadId) {
+    if (excludeThreadId && cleanText(terminal?.thread_id) === excludeThreadId) {
       return false;
     }
     return terminalNicknameKey(workspaceTerminalNicknameFromRecord(terminal)) === key;
@@ -1326,8 +1238,8 @@ function workspaceTerminalNicknameInUse(entry, nickname, options = {}) {
       return false;
     }
     const threadTerminalKey = terminalSessionKey(getThreadTerminalIndex(thread));
-    const mappedThreadId = threadTerminalKey ? cleanText(entry?.terminalThreadIds?.[threadTerminalKey]) : "";
-    const activeThreadId = threadTerminalKey ? cleanText(entry?.terminals?.[threadTerminalKey]?.threadId) : "";
+    const mappedThreadId = threadTerminalKey ? cleanText(entry?.terminal_thread_ids?.[threadTerminalKey]) : "";
+    const activeThreadId = threadTerminalKey ? cleanText(entry?.terminals?.[threadTerminalKey]?.thread_id) : "";
     if (mappedThreadId !== thread.id && activeThreadId !== thread.id) {
       return false;
     }
@@ -1360,23 +1272,14 @@ function resolveWorkspaceTerminalNickname(entry, candidates = [], options = {}) 
 
 export function getWorkspaceThreadTerminalNickname(thread, providerBinding = null, terminal = null) {
   return terminalNicknameFromSources(
-    terminal?.terminalNickname,
     terminal?.terminal_nickname,
-    terminal?.terminalName,
     terminal?.terminal_name,
-    terminal?.displayName,
     terminal?.display_name,
-    thread?.terminalNickname,
     thread?.terminal_nickname,
-    thread?.terminalName,
     thread?.terminal_name,
-    thread?.displayName,
     thread?.display_name,
-    providerBinding?.terminalNickname,
     providerBinding?.terminal_nickname,
-    providerBinding?.terminalName,
     providerBinding?.terminal_name,
-    providerBinding?.displayName,
     providerBinding?.display_name,
   );
 }
@@ -1424,20 +1327,20 @@ function terminalSessionKey(terminalIndex) {
 }
 
 function getThreadTerminalIndex(thread) {
-  const terminalIndex = normalizeTerminalIndex(thread?.terminalIndex);
+  const terminalIndex = normalizeTerminalIndex(thread?.terminal_index);
   if (terminalIndex != null) {
     return terminalIndex;
   }
 
-  return normalizeTerminalIndex(thread?.terminalBinding?.terminalIndex);
+  return normalizeTerminalIndex(thread?.terminal_binding?.terminal_index);
 }
 
 function getThreadRestoreTimestamp(thread) {
   return [
-    thread?.lastActiveAt,
-    thread?.lastMessageAt,
-    thread?.updatedAt,
-    thread?.createdAt,
+    thread?.last_active_at,
+    thread?.last_message_at,
+    thread?.updated_at,
+    thread?.created_at,
   ].reduce((latest, value) => {
     const timestamp = Date.parse(value || "");
     return Number.isFinite(timestamp) ? Math.max(latest, timestamp) : latest;
@@ -1466,15 +1369,15 @@ function normalizeThreadsViewState(value, fallback = {}) {
     railCollapsed: source.railCollapsed === true,
     selectedThreadId: cleanText(
       source.selectedThreadId
-        || source.threadId
+        || source.thread_id
         || fallback.selectedThreadId
-        || fallback.threadId,
+        || fallback.thread_id,
     ),
-    selectedWorkspaceId: cleanText(
-      source.selectedWorkspaceId
-        || source.workspaceId
-        || fallback.selectedWorkspaceId
-        || fallback.workspaceId,
+    selected_workspace_id: cleanText(
+      source.selected_workspace_id
+        || source.workspace_id
+        || fallback.selected_workspace_id
+        || fallback.workspace_id,
     ),
   };
 }
@@ -1486,43 +1389,43 @@ function rememberTerminalThread(entry, terminalIndex, threadId) {
     return false;
   }
 
-  if (!entry.terminalThreadIds || typeof entry.terminalThreadIds !== "object") {
-    entry.terminalThreadIds = {};
+  if (!entry.terminal_thread_ids || typeof entry.terminal_thread_ids !== "object") {
+    entry.terminal_thread_ids = {};
   }
 
-  if (entry.terminalThreadIds[key] === safeThreadId) {
+  if (entry.terminal_thread_ids[key] === safeThreadId) {
     return false;
   }
 
-  entry.terminalThreadIds[key] = safeThreadId;
+  entry.terminal_thread_ids[key] = safeThreadId;
   return true;
 }
 
 function forgetTerminalThread(entry, terminalIndex, threadId = "") {
   const key = terminalSessionKey(terminalIndex);
-  if (!key || !entry?.terminalThreadIds?.[key]) {
+  if (!key || !entry?.terminal_thread_ids?.[key]) {
     return false;
   }
 
   const safeThreadId = cleanText(threadId);
-  if (safeThreadId && entry.terminalThreadIds[key] !== safeThreadId) {
+  if (safeThreadId && entry.terminal_thread_ids[key] !== safeThreadId) {
     return false;
   }
 
-  delete entry.terminalThreadIds[key];
+  delete entry.terminal_thread_ids[key];
   return true;
 }
 
 function forgetThreadEverywhere(entry, threadId) {
   const safeThreadId = cleanText(threadId);
-  if (!safeThreadId || !entry?.terminalThreadIds) {
+  if (!safeThreadId || !entry?.terminal_thread_ids) {
     return false;
   }
 
   let changed = false;
-  Object.entries(entry.terminalThreadIds).forEach(([terminalKey, mappedThreadId]) => {
+  Object.entries(entry.terminal_thread_ids).forEach(([terminalKey, mappedThreadId]) => {
     if (mappedThreadId === safeThreadId) {
-      delete entry.terminalThreadIds[terminalKey];
+      delete entry.terminal_thread_ids[terminalKey];
       changed = true;
     }
   });
@@ -1589,37 +1492,36 @@ function normalizeThreadLatestTurn(value) {
     return null;
   }
 
-  const turnId = cleanText(value.turnId || value.turn_id || value.id);
-  const state = normalizeThreadTurnState(value.state || value.status || value.turnState || value.turn_state);
+  const turnId = cleanText(value.turn_id || value.id);
+  const state = normalizeThreadTurnState(value.state || value.status || value.turn_state);
   if (!turnId || !state) {
     return null;
   }
 
-  const requestedAt = cleanText(value.requestedAt || value.requested_at || value.createdAt || value.created_at);
-  const startedAt = cleanText(value.startedAt || value.started_at || requestedAt);
-  const completedAt = cleanText(value.completedAt || value.completed_at);
-  const updatedAt = cleanText(value.updatedAt || value.updated_at || completedAt || startedAt || requestedAt, nowIso());
+  const requestedAt = cleanText(value.requested_at || value.created_at);
+  const startedAt = cleanText(value.started_at || requestedAt);
+  const completedAt = cleanText(value.completed_at);
+  const updatedAt = cleanText(value.updated_at || completedAt || startedAt || requestedAt, nowIso());
 
   return {
-    agentId: cleanAgentId(value.agentId || value.agent_id, ""),
-    assistantMessageId: cleanText(value.assistantMessageId || value.assistant_message_id),
-    completedAt,
+    agent_id: cleanAgentId(value.agent_id, ""),
+    assistant_message_id: cleanText(value.assistant_message_id),
+    completed_at: completedAt,
     error: cleanText(value.error || value.message),
-    messageId: cleanText(value.messageId || value.message_id),
-    promptEpoch: normalizeThreadPromptEpoch(value.promptEpoch || value.prompt_epoch),
-    prompt_epoch: normalizeThreadPromptEpoch(value.promptEpoch || value.prompt_epoch),
-    requestedAt,
-    startedAt,
+    message_id: cleanText(value.message_id),
+    prompt_epoch: normalizeThreadPromptEpoch(value.prompt_epoch),
+    requested_at: requestedAt,
+    started_at: startedAt,
     state,
-    turnId,
-    updatedAt,
+    turn_id: turnId,
+    updated_at: updatedAt,
   };
 }
 
 function createTurnIdForMessage(thread, messageId) {
   return [
     "turn",
-    safeKey(thread?.id || thread?.threadId || "thread"),
+    safeKey(thread?.id || thread?.thread_id || "thread"),
     safeKey(messageId, "message"),
   ].join("-");
 }
@@ -1635,12 +1537,7 @@ function activityStatusForLatestTurn(latestTurn, fallback = "idle") {
 
 function explicitRuntimeActivityStatus(event = {}, fallback = "") {
   const rawStatus = cleanText(
-    event.activityStatus
-      || event.activity_status
-      || event.nativeRailState
-      || event.native_rail_state
-      || event.terminalWorkState
-      || event.terminal_work_state,
+    event.activity_status || event.native_rail_state || event.terminal_work_state,
   );
   if (!rawStatus) {
     return fallback;
@@ -1650,14 +1547,14 @@ function explicitRuntimeActivityStatus(event = {}, fallback = "") {
 
 function providerBindingsHaveNativeSession(providerBindings) {
   return Object.values(providerBindings || {}).some((binding) => (
-    Boolean(cleanText(binding?.nativeSessionId))
+    Boolean(cleanText(binding?.native_session_id))
   ));
 }
 
 function pendingPromptTurnHasInputReady({
-  activityStatus = "",
-  latestTurn = null,
-  pendingPrompt = null,
+  activity_status: activityStatus = "",
+  latest_turn: latestTurn = null,
+  pending_prompt: pendingPrompt = null,
   providerBinding = null,
 } = {}) {
   const latestTurnState = cleanText(latestTurn?.state).toLowerCase();
@@ -1665,18 +1562,18 @@ function pendingPromptTurnHasInputReady({
     latestTurnState === "running"
       && pendingPrompt
       && normalizeThreadActivityStatus(activityStatus) === "idle"
-      && providerBinding?.inputReady === true
+      && providerBinding?.input_ready === true
   );
 }
 
 function isOrphanRunningThreadState({
-  latestTurn,
-  messageCount = 0,
+  latest_turn: latestTurn,
+  message_count: messageCount = 0,
   messages = [],
-  pendingPrompt = null,
-  projectionEvents = [],
-  providerBindings = {},
-  transcriptSessionId = "",
+  pending_prompt: pendingPrompt = null,
+  projection_events: projectionEvents = [],
+  provider_bindings: providerBindings = {},
+  transcript_session_id: transcriptSessionId = "",
 } = {}) {
   const normalizedLatestTurn = normalizeThreadLatestTurn(latestTurn);
   return Boolean(
@@ -1695,7 +1592,7 @@ function clearOrphanRunningProviderBindings(providerBindings) {
       agentId,
       {
         ...binding,
-        activityStatus: "idle",
+        activity_status: "idle",
       },
     ]),
   );
@@ -1746,10 +1643,10 @@ function normalizeThreadMessage(message) {
   }
 
   const normalizedMessage = {
-    agentId: cleanAgentId(message.agentId || message.agent_id, ""),
+    agent_id: cleanAgentId(message.agent_id, ""),
     artifacts,
-    callId: cleanText(message.callId || message.call_id),
-    createdAt: cleanText(message.createdAt || message.created_at, nowIso()),
+    call_id: cleanText(message.call_id),
+    created_at: cleanText(message.created_at, nowIso()),
     id,
     kind: kind || (safeRole === "activity" ? "activity" : "message"),
     role: safeRole,
@@ -1757,7 +1654,7 @@ function normalizeThreadMessage(message) {
     status,
     text,
     title,
-    turnId: cleanText(message.turnId || message.turn_id),
+    turn_id: cleanText(message.turn_id),
     ...structuredMetadata,
     ...toolMetadata,
   };
@@ -1815,10 +1712,10 @@ function compactPersistedThreadToolMetadata(value = {}) {
   return Object.fromEntries(
     Object.entries(metadata)
       .map(([key, entry]) => {
-        if (["toolName", "toolServer", "toolDisplayName", "command", "filePath"].includes(key)) {
+        if (["tool_name", "tool_server", "tool_display_name", "command", "file_path"].includes(key)) {
           return [key, key === "command" ? compactPersistedThreadText(entry) : cleanText(entry)];
         }
-        if (key === "durationMs" || key === "exitCode") {
+        if (key === "duration_ms" || key === "exit_code") {
           return [key, entry];
         }
         return [key, compactPersistedThreadToolValue(entry)];
@@ -1879,10 +1776,7 @@ function getThreadMessageProjectionHash(message) {
   }
 
   return normalizeThreadProjectionHash(
-    message.projectionHash
-      || message.projection_hash
-      || message.stableProjectionHash
-      || message.stable_projection_hash,
+    message.projection_hash || message.stable_projection_hash,
   );
 }
 
@@ -1896,14 +1790,14 @@ function attachThreadMessageProjectionHash(message, hash, options = {}) {
   }
 
   try {
-    Object.defineProperty(message, "projectionHash", {
+    Object.defineProperty(message, "projection_hash", {
       configurable: true,
       enumerable: options.enumerable === true,
       value: safeHash,
       writable: true,
     });
   } catch {
-    message.projectionHash = safeHash;
+    message.projection_hash = safeHash;
   }
   return message;
 }
@@ -1982,10 +1876,9 @@ function normalizeThreadProjectionEvent(event, fallbackSequence = 0) {
     return null;
   }
 
-  const turnId = cleanText(event.turnId || event.turn_id);
+  const turnId = cleanText(event.turn_id);
   const messageId = cleanText(
-    event.messageId
-      || event.message_id
+    event.message_id
       || (isTurnProjectionEventType(type) ? turnId : "")
       || event.id,
   );
@@ -2033,24 +1926,23 @@ function normalizeThreadProjectionEvent(event, fallbackSequence = 0) {
     .replace(/[^a-z0-9_-]/g, "-")
     .slice(0, 48);
   const id = cleanText(
-    event.id || event.eventId || event.event_id,
+    event.id || event.event_id,
     `projection-${messageId}-${type}-${Number.isInteger(sequence) ? sequence : fallbackSequence}`,
   );
 
   return {
-    agentId: cleanAgentId(event.agentId || event.agent_id, ""),
+    agent_id: cleanAgentId(event.agent_id, ""),
     artifacts,
-    callId: cleanText(event.callId || event.call_id),
-    createdAt: cleanText(event.createdAt || event.created_at, nowIso()),
-    completedAt: cleanText(event.completedAt || event.completed_at),
+    call_id: cleanText(event.call_id),
+    created_at: cleanText(event.created_at, nowIso()),
+    completed_at: cleanText(event.completed_at),
     delta,
     id,
     kind,
-    messageId,
-    assistantMessageId: cleanText(event.assistantMessageId || event.assistant_message_id),
-    promptEpoch: normalizeThreadPromptEpoch(event.promptEpoch || event.prompt_epoch),
-    prompt_epoch: normalizeThreadPromptEpoch(event.promptEpoch || event.prompt_epoch),
-    replaceText: event.replaceText === true,
+    message_id: messageId,
+    assistant_message_id: cleanText(event.assistant_message_id),
+    prompt_epoch: normalizeThreadPromptEpoch(event.prompt_epoch),
+    replace_text: event.replace_text === true,
     role: ["activity", "assistant", "system", "user"].includes(role) ? role : "assistant",
     sequence: Number.isInteger(sequence) && sequence >= 0 ? sequence : fallbackSequence,
     source: cleanText(event.source),
@@ -2070,7 +1962,7 @@ function normalizeThreadProjectionEvent(event, fallbackSequence = 0) {
     ),
     text,
     title,
-    turnId: turnId || (isTurnProjectionEventType(type) ? messageId : ""),
+    turn_id: turnId || (isTurnProjectionEventType(type) ? messageId : ""),
     type,
     ...structuredMetadata,
     ...toolMetadata,
@@ -2197,24 +2089,24 @@ function projectThreadProjectionMessagesFromNormalizedEvents(projectionEvents, f
 
     if (event.type === "thread.message.user" || event.type === "thread.message.system") {
       upsertProjectedMessage(messagesById, messageOrder, {
-        agentId: event.agentId,
+        agent_id: event.agent_id,
         artifacts: event.artifacts,
-        createdAt: event.createdAt,
-        id: event.messageId,
+        created_at: event.created_at,
+        id: event.message_id,
         kind: event.type === "thread.message.system" ? event.kind || "message" : "message",
         role: event.type === "thread.message.system" ? "system" : "user",
         source: event.source || "projection",
         status: event.status || "submitted",
         text: event.text || event.delta,
-        turnId: event.turnId,
+        turn_id: event.turn_id,
         ...normalizeThreadStructuredTranscriptMetadata(event),
       });
       return;
     }
 
     if (event.type === "thread.message.assistant.delta") {
-      const existing = messagesById.get(event.messageId);
-      const eventText = event.replaceText
+      const existing = messagesById.get(event.message_id);
+      const eventText = event.replace_text
         ? event.text || event.delta
         : `${existing?.text || ""}${event.delta || event.text}`;
       if (
@@ -2224,28 +2116,28 @@ function projectThreadProjectionMessagesFromNormalizedEvents(projectionEvents, f
         return;
       }
       upsertProjectedMessage(messagesById, messageOrder, {
-        agentId: event.agentId,
+        agent_id: event.agent_id,
         artifacts: event.artifacts,
-        createdAt: event.createdAt,
-        id: event.messageId,
+        created_at: event.created_at,
+        id: event.message_id,
         kind: event.kind || "message",
         role: "assistant",
         source: event.source || "projection",
         status: "streaming",
         text: eventText,
-        turnId: event.turnId,
+        turn_id: event.turn_id,
         ...normalizeThreadStructuredTranscriptMetadata(event),
       });
       return;
     }
 
     if (event.type === "thread.message.assistant.complete") {
-      const existing = messagesById.get(event.messageId);
+      const existing = messagesById.get(event.message_id);
       if (!existing && !(event.text || event.delta || event.artifacts?.length)) {
         return;
       }
 
-      const eventText = event.replaceText || !existing?.text
+      const eventText = event.replace_text || !existing?.text
         ? event.text || event.delta || existing?.text || ""
         : existing.text;
       if (
@@ -2257,16 +2149,16 @@ function projectThreadProjectionMessagesFromNormalizedEvents(projectionEvents, f
 
       upsertProjectedMessage(messagesById, messageOrder, {
         ...(existing || {}),
-        agentId: event.agentId || existing?.agentId || "",
+        agent_id: event.agent_id || existing?.agent_id || "",
         artifacts: mergeThreadArtifacts(existing?.artifacts, event.artifacts),
-        createdAt: event.createdAt || existing?.createdAt,
-        id: event.messageId,
+        created_at: event.created_at || existing?.created_at,
+        id: event.message_id,
         kind: event.kind || existing?.kind || "message",
         role: "assistant",
         source: event.source || existing?.source || "projection",
         status: "complete",
         text: eventText,
-        turnId: event.turnId || existing?.turnId || "",
+        turn_id: event.turn_id || existing?.turn_id || "",
         ...normalizeThreadStructuredTranscriptMetadata(event),
       });
       return;
@@ -2274,18 +2166,18 @@ function projectThreadProjectionMessagesFromNormalizedEvents(projectionEvents, f
 
     if (isActivityProjectionEventType(event.type)) {
       upsertProjectedMessage(messagesById, messageOrder, {
-        agentId: event.agentId,
+        agent_id: event.agent_id,
         artifacts: event.artifacts,
-        callId: event.callId,
-        createdAt: event.createdAt,
-        id: event.messageId,
+        call_id: event.call_id,
+        created_at: event.created_at,
+        id: event.message_id,
         kind: event.kind || "activity",
         role: "activity",
         source: event.source || "projection",
         status: event.status || "complete",
         text: event.text || event.delta,
         title: event.title,
-        turnId: event.turnId,
+        turn_id: event.turn_id,
         ...normalizeThreadStructuredTranscriptMetadata(event),
         ...normalizeThreadToolMetadata(event),
       });
@@ -2317,22 +2209,22 @@ function threadMessageProjectionEventId(prefix, message, suffix = "") {
 }
 
 function projectionEventsFromMessages(messages, options = {}) {
-  const agentId = cleanAgentId(options.agentId, "");
+  const agentId = cleanAgentId(options.agent_id, "");
   const source = cleanText(options.source, "projection-bootstrap");
   const events = [];
   normalizeThreadMessages(messages).forEach((message) => {
     const messageId = cleanText(message.id, createRandomId("message"));
     const base = {
-      agentId: message.agentId || agentId,
+      agent_id: message.agent_id || agentId,
       artifacts: message.artifacts,
-      callId: message.callId,
-      createdAt: message.createdAt,
+      call_id: message.call_id,
+      created_at: message.created_at,
       kind: message.kind,
-      messageId,
+      message_id: messageId,
       source: message.source || source,
       text: message.text,
       title: message.title,
-      turnId: message.turnId,
+      turn_id: message.turn_id,
       ...normalizeThreadStructuredTranscriptMetadata(message),
       ...normalizeThreadToolMetadata(message),
     };
@@ -2371,14 +2263,14 @@ function projectionEventsFromMessages(messages, options = {}) {
 }
 
 function ensureThreadProjectionEvents(thread) {
-  const existingProjectionEvents = normalizeThreadProjectionEvents(thread?.projectionEvents);
+  const existingProjectionEvents = normalizeThreadProjectionEvents(thread?.projection_events);
   if (existingProjectionEvents.length) {
     return existingProjectionEvents;
   }
 
   return normalizeThreadProjectionEvents(
     projectionEventsFromMessages(thread?.messages, {
-      agentId: thread?.currentAgent,
+      agent_id: thread?.current_agent,
     }),
   );
 }
@@ -2413,7 +2305,7 @@ function projectionHasTurnEvent(events, type, turnId) {
   }
 
   return normalizeThreadProjectionEvents(events).some((event) => (
-    event.type === type && event.turnId === safeTurnId
+    event.type === type && event.turn_id === safeTurnId
   ));
 }
 
@@ -2459,10 +2351,10 @@ function transcriptExpectedPromptMessageId(messages, event = {}, expectedUserMes
   const normalizedIncomingMessages = normalizeThreadMessages(messages);
   const expectedText = cleanSubmittedUserMessage(expectedUserMessage);
   const submittedAtMs = threadMessageTimestampMs({
-    createdAt: event.expectedMessageCreatedAt
-      || event.promptEventSubmittedAt
-      || event.submittedAt
-      || event.createdAt,
+    created_at: event.expected_message_created_at
+      || event.prompt_event_submitted_at
+      || event.submitted_at
+      || event.created_at,
   });
   if (expectedText) {
     return cleanText([...normalizedIncomingMessages].reverse().find((message) => (
@@ -2477,13 +2369,13 @@ function transcriptExpectedPromptMessageId(messages, event = {}, expectedUserMes
     ))?.id);
   }
 
-  if (event.promptAccepted !== true) {
+  if (event.prompt_accepted !== true) {
     return "";
   }
 
-  const matchedBy = cleanText(event.matchedBy).toLowerCase();
+  const matchedBy = cleanText(event.matched_by).toLowerCase();
   const canUseTimestampRecovery = Boolean(
-    event.allowTimestampFallback === true
+    event.allow_timestamp_fallback === true
       || matchedBy.includes("timestamp")
       || matchedBy.includes("recovery")
   );
@@ -2512,25 +2404,25 @@ function isTranscriptTurnErrorMessage(message) {
 function projectLatestTurnFromNormalizedEvents(projectionEvents, fallbackLatestTurn = null) {
   const fallbackTurn = normalizeThreadLatestTurn(fallbackLatestTurn);
   const fallbackTurnUpdatedAtMs = threadMessageTimestampMs({
-    createdAt: fallbackTurn?.updatedAt || fallbackTurn?.completedAt || fallbackTurn?.startedAt || fallbackTurn?.requestedAt,
+    created_at: fallbackTurn?.updated_at || fallbackTurn?.completed_at || fallbackTurn?.started_at || fallbackTurn?.requested_at,
   });
   let latestTurn = fallbackTurn;
   const closedTurnIds = new Set();
 
   projectionEvents.forEach((event) => {
-    const turnId = cleanText(event.turnId);
+    const turnId = cleanText(event.turn_id);
     if (!turnId) {
       return;
     }
     const eventTimestampMs = threadMessageTimestampMs({
-      createdAt: event.completedAt || event.createdAt,
+      created_at: event.completed_at || event.created_at,
     });
     const isOlderDifferentTurnThanFallback = Boolean(
       fallbackTurn
         && fallbackTurnUpdatedAtMs
         && eventTimestampMs
         && eventTimestampMs < fallbackTurnUpdatedAtMs
-        && cleanText(fallbackTurn.turnId) !== turnId
+        && cleanText(fallbackTurn.turn_id) !== turnId
     );
 
     if (
@@ -2540,7 +2432,7 @@ function projectLatestTurnFromNormalizedEvents(projectionEvents, fallbackLatestT
         || (
         closedTurnIds.has(turnId)
         || (
-          latestTurn?.turnId === turnId
+          latestTurn?.turn_id === turnId
           && CLOSED_THREAD_TURN_STATES.has(latestTurn?.state)
         )
         )
@@ -2551,19 +2443,19 @@ function projectLatestTurnFromNormalizedEvents(projectionEvents, fallbackLatestT
 
     if (event.type === "thread.turn.started") {
       latestTurn = normalizeThreadLatestTurn({
-        agentId: event.agentId,
-        messageId: event.messageId,
-        promptEpoch: event.promptEpoch || event.prompt_epoch,
-        requestedAt: event.createdAt,
-        startedAt: event.createdAt,
+        agent_id: event.agent_id,
+        message_id: event.message_id,
+        prompt_epoch: event.prompt_epoch,
+        requested_at: event.created_at,
+        started_at: event.created_at,
         state: "running",
-        turnId,
-        updatedAt: event.createdAt,
+        turn_id: turnId,
+        updated_at: event.created_at,
       });
       return;
     }
 
-    if (!latestTurn || latestTurn.turnId !== turnId) {
+    if (!latestTurn || latestTurn.turn_id !== turnId) {
       if (
         event.type === "thread.turn.completed"
         || event.type === "thread.turn.error"
@@ -2577,8 +2469,8 @@ function projectLatestTurnFromNormalizedEvents(projectionEvents, fallbackLatestT
     if (event.type === "thread.message.assistant.delta" || event.type === "thread.message.assistant.complete") {
       latestTurn = normalizeThreadLatestTurn({
         ...latestTurn,
-        assistantMessageId: event.messageId || latestTurn.assistantMessageId,
-        updatedAt: event.createdAt,
+        assistant_message_id: event.message_id || latestTurn.assistant_message_id,
+        updated_at: event.created_at,
       });
       return;
     }
@@ -2586,7 +2478,7 @@ function projectLatestTurnFromNormalizedEvents(projectionEvents, fallbackLatestT
     if (isActivityProjectionEventType(event.type)) {
       latestTurn = normalizeThreadLatestTurn({
         ...latestTurn,
-        updatedAt: event.createdAt,
+        updated_at: event.created_at,
       });
       return;
     }
@@ -2595,10 +2487,10 @@ function projectLatestTurnFromNormalizedEvents(projectionEvents, fallbackLatestT
       closedTurnIds.add(turnId);
       latestTurn = normalizeThreadLatestTurn({
         ...latestTurn,
-        assistantMessageId: event.assistantMessageId || latestTurn.assistantMessageId,
-        completedAt: event.completedAt || event.createdAt,
+        assistant_message_id: event.assistant_message_id || latestTurn.assistant_message_id,
+        completed_at: event.completed_at || event.created_at,
         state: "completed",
-        updatedAt: event.completedAt || event.createdAt,
+        updated_at: event.completed_at || event.created_at,
       });
       return;
     }
@@ -2607,10 +2499,10 @@ function projectLatestTurnFromNormalizedEvents(projectionEvents, fallbackLatestT
       closedTurnIds.add(turnId);
       latestTurn = normalizeThreadLatestTurn({
         ...latestTurn,
-        completedAt: event.completedAt || event.createdAt,
+        completed_at: event.completed_at || event.created_at,
         error: event.text || latestTurn.error,
         state: "error",
-        updatedAt: event.completedAt || event.createdAt,
+        updated_at: event.completed_at || event.created_at,
       });
       return;
     }
@@ -2619,9 +2511,9 @@ function projectLatestTurnFromNormalizedEvents(projectionEvents, fallbackLatestT
       closedTurnIds.add(turnId);
       latestTurn = normalizeThreadLatestTurn({
         ...latestTurn,
-        completedAt: event.completedAt || event.createdAt,
+        completed_at: event.completed_at || event.created_at,
         state: "interrupted",
-        updatedAt: event.completedAt || event.createdAt,
+        updated_at: event.completed_at || event.created_at,
       });
     }
   });
@@ -2640,7 +2532,7 @@ function findMatchingProjectedMessage(projectedMessages, message) {
   const messageId = cleanText(message?.id);
   const role = cleanText(message?.role);
   const kind = cleanText(message?.kind, "message");
-  const callId = cleanText(message?.callId);
+  const callId = cleanText(message?.call_id);
 
   if (messageId) {
     const exactMatch = projectedMessages.find((candidate) => cleanText(candidate.id) === messageId);
@@ -2651,7 +2543,7 @@ function findMatchingProjectedMessage(projectedMessages, message) {
 
   if (callId) {
     const callMatch = projectedMessages.find((candidate) => (
-      cleanText(candidate.callId) === callId
+      cleanText(candidate.call_id) === callId
       && cleanText(candidate.kind, "message") === kind
     ));
     if (callMatch) {
@@ -2686,7 +2578,7 @@ function findMatchingLiveHookAssistantMessage(projectedMessages, {
       ) {
         return false;
       }
-      const candidateTurnId = cleanText(candidate.turnId);
+      const candidateTurnId = cleanText(candidate.turn_id);
       if (!safeTurnId || !candidateTurnId) {
         return true;
       }
@@ -2700,54 +2592,52 @@ function findMatchingLiveHookAssistantMessage(projectedMessages, {
 
 function createSubmittedUserProjectionEvents(thread, event = {}) {
   const text = cleanSubmittedUserMessage(
-    event.expectedUserMessage
-      || event.terminalText
-      || event.terminalMessage
-      || event.userMessage
+    event.expected_user_message
+      || event.terminal_text
+      || event.terminal_message
+      || event.user_message
       || event.message,
   );
   if (!text || isSlashCommandPrompt(text)) {
     return [];
   }
 
-  const promptEventId = cleanText(event.promptEventId || event.pendingPromptId || event.promptId);
+  const promptEventId = cleanText(event.prompt_event_id || event.pending_prompt_id || event.prompt_id);
   const createdAt = cleanText(
-    event.messageCreatedAt
-      || event.promptEventSubmittedAt
-      || event.submittedAt,
+    event.message_created_at
+      || event.prompt_event_submitted_at
+      || event.submitted_at,
     nowIso(),
   );
   const messageId = cleanText(
-    event.messageId || promptEventId,
+    event.message_id || promptEventId,
     createRandomId(`message-${safeKey(thread?.id, "thread")}`),
   );
-  const turnId = cleanText(event.turnId || event.turn_id, createTurnIdForMessage(thread, messageId));
-  const agentId = cleanAgentId(event.agentId || event.currentAgent, "");
-  const source = cleanText(event.source || event.messageSource, "local-submit");
-  const promptEpoch = normalizeThreadPromptEpoch(event.promptEpoch || event.prompt_epoch);
+  const turnId = cleanText(event.turn_id, createTurnIdForMessage(thread, messageId));
+  const agentId = cleanAgentId(event.agent_id || event.current_agent, "");
+  const source = cleanText(event.source || event.message_source, "local-submit");
+  const promptEpoch = normalizeThreadPromptEpoch(event.prompt_epoch);
   return [{
-    agentId,
-    createdAt,
+    agent_id: agentId,
+    created_at: createdAt,
     id: `projection-turn-started-${stableProjectionKey(turnId, "turn")}`,
-    messageId,
-    promptEpoch,
+    message_id: messageId,
     prompt_epoch: promptEpoch,
     source,
     status: "running",
-    turnId,
+    turn_id: turnId,
     type: "thread.turn.started",
   }, {
-    agentId,
-    createdAt,
+    agent_id: agentId,
+    created_at: createdAt,
     id: `projection-user-submitted-${stableProjectionKey(messageId, "message")}`,
-    messageId,
-    promptEpoch,
+    message_id: messageId,
     prompt_epoch: promptEpoch,
     role: "user",
     source,
     status: "submitted",
     text,
-    turnId,
+    turn_id: turnId,
     type: "thread.message.user",
   }];
 }
@@ -2767,24 +2657,19 @@ function liveTextFinalTurnType(eventType) {
 }
 
 export function createWorkspaceThreadLiveTextProjectionEvents(thread, event = {}) {
-  const liveTextKind = cleanText(event.liveTextKind || event.live_text_kind, "assistant")
+  const liveTextKind = cleanText(event.live_text_kind, "assistant")
     .toLowerCase();
   if (liveTextKind !== "assistant") {
     return [];
   }
 
   const deltaValue = firstPresentTextValue([
-    event.liveTextDelta,
     event.live_text_delta,
-    event.assistantDelta,
     event.assistant_delta,
   ]);
   const snapshotValue = firstPresentTextValue([
-    event.liveTextSnapshot,
     event.live_text_snapshot,
-    event.assistantMessageSnapshot,
     event.assistant_message_snapshot,
-    event.assistantMessage,
     event.assistant_message,
   ]);
   const delta = cleanLiveMessageText(deltaValue);
@@ -2793,37 +2678,22 @@ export function createWorkspaceThreadLiveTextProjectionEvents(thread, event = {}
     return [];
   }
 
-  const latestTurn = normalizeThreadLatestTurn(thread?.latestTurn);
+  const latestTurn = normalizeThreadLatestTurn(thread?.latest_turn);
   const promptMessageId = cleanText(
-    event.promptEventId
-      || event.pendingPromptId
-      || event.promptId
-      || event.messageId
-      || event.message_id
-      || latestTurn?.messageId,
+    event.prompt_event_id || event.pending_prompt_id || event.prompt_id || event.message_id || latestTurn?.message_id,
   );
   const liveSessionId = cleanText(
-    event.providerSessionId
-      || event.provider_session_id
-      || event.nativeSessionId
-      || event.native_session_id
-      || event.sessionId
-      || event.session_id
-      || thread?.transcriptSessionId,
+    event.provider_session_id || event.native_session_id || event.session_id || thread?.transcript_session_id,
   );
   const turnId = cleanText(
-    event.turnId
-      || event.turn_id
-      || event.providerTurnId
+    event.turn_id
       || event.provider_turn_id
-      || latestTurn?.turnId
+      || latestTurn?.turn_id
       || (promptMessageId ? createTurnIdForMessage(thread, promptMessageId) : "")
       || (liveSessionId ? `turn-live-${stableProjectionKey(liveSessionId, "session")}` : ""),
   );
   const messageId = cleanText(
-    event.assistantMessageId
-      || event.assistant_message_id
-      || latestTurn?.assistantMessageId,
+    event.assistant_message_id || latestTurn?.assistant_message_id,
     turnId
       ? `assistant-${stableProjectionKey(turnId, "turn")}`
       : createRandomId("assistant-live"),
@@ -2834,41 +2704,30 @@ export function createWorkspaceThreadLiveTextProjectionEvents(thread, event = {}
       ?.text,
   ).length;
   const liveTextEventKey = cleanText(
-    event.liveTextEventId
-      || event.live_text_event_id
-      || event.eventId
-      || event.event_id
-      || event.id
-      || event.sequence
-      || event.seq
-      || event.statusSeq
-      || event.status_seq,
+    event.live_text_event_id || event.event_id || event.id || event.sequence || event.seq || event.status_seq,
     `live-${++liveTextProjectionEventSequence}`,
   );
   const createdAt = cleanText(
-    event.completedAt
-      || event.inputReadyAt
-      || event.hookObservedAt
-      || event.createdAt
-      || event.startedAt,
+    event.completed_at
+      || event.input_ready_at
+      || event.hook_observed_at
+      || event.created_at
+      || event.started_at,
     nowIso(),
   );
-  const agentId = cleanAgentId(event.agentId || event.currentAgent || thread?.currentAgent, "");
+  const agentId = cleanAgentId(event.agent_id || event.current_agent || thread?.current_agent, "");
   const source = cleanText(event.source || event.type, "cli-hook:assistant-message");
   const promptEpoch = normalizeThreadPromptEpoch(
-    event.promptEpoch
-      || event.prompt_epoch
-      || latestTurn?.promptEpoch
-      || latestTurn?.prompt_epoch,
+    event.prompt_epoch || latestTurn?.prompt_epoch,
   );
-  const finalTurnType = liveTextFinalTurnType(event.type || event.eventType);
+  const finalTurnType = liveTextFinalTurnType(event.type || event.event_type);
   const finalText = snapshot || delta;
   const events = [];
 
   if (delta) {
     events.push({
-      agentId,
-      createdAt,
+      agent_id: agentId,
+      created_at: createdAt,
       delta,
       id: [
         "projection-live-assistant-delta",
@@ -2878,80 +2737,76 @@ export function createWorkspaceThreadLiveTextProjectionEvents(thread, event = {}
         delta.length,
         stableProjectionHash(`${turnId}:${existingAssistantTextLength}:${liveTextEventKey}:${delta}`),
       ].join("-"),
-      messageId,
-      promptEpoch,
+      message_id: messageId,
       prompt_epoch: promptEpoch,
       source,
       status: "streaming",
-      turnId,
+      turn_id: turnId,
       type: "thread.message.assistant.delta",
     });
   }
 
   if (snapshot) {
     events.push({
-      agentId,
-      createdAt,
+      agent_id: agentId,
+      created_at: createdAt,
       id: [
         "projection-live-assistant-snapshot",
         safeKey(messageId, "message"),
         snapshot.length,
         stableProjectionHash(`${turnId}:${snapshot}`),
       ].join("-"),
-      messageId,
-      promptEpoch,
+      message_id: messageId,
       prompt_epoch: promptEpoch,
-      replaceText: true,
+      replace_text: true,
       source,
       status: "streaming",
       text: snapshot,
-      turnId,
+      turn_id: turnId,
       type: "thread.message.assistant.delta",
     });
   }
 
   if (finalTurnType && finalText) {
     events.push({
-      agentId,
-      createdAt,
+      agent_id: agentId,
+      created_at: createdAt,
       id: [
         "projection-live-assistant-complete",
         safeKey(messageId, "message"),
         finalText.length,
         stableProjectionHash(`${turnId}:${finalText}`),
       ].join("-"),
-      messageId,
-      promptEpoch,
+      message_id: messageId,
       prompt_epoch: promptEpoch,
-      replaceText: true,
+      replace_text: true,
       source,
       status: "complete",
       text: finalText,
-      turnId,
+      turn_id: turnId,
       type: "thread.message.assistant.complete",
     });
   }
 
   if (finalTurnType && turnId) {
     events.push({
-      agentId,
-      assistantMessageId: messageId,
-      completedAt: createdAt,
-      createdAt,
+      agent_id: agentId,
+      assistant_message_id: messageId,
+      completed_at: createdAt,
+      created_at: createdAt,
       id: [
         "projection-live-turn-finished",
         stableProjectionKey(turnId, "turn"),
         finalTurnType.replace(/^thread\.turn\./, ""),
       ].join("-"),
-      messageId,
-      promptEpoch,
+      message_id: messageId,
       prompt_epoch: promptEpoch,
       source,
       status: finalTurnType.replace(/^thread\.turn\./, ""),
       text: finalTurnType === "thread.turn.error"
         ? cleanMessageText(event.error || event.message || finalText)
         : "",
-      turnId,
+      turn_id: turnId,
       type: finalTurnType,
     });
   }
@@ -2987,12 +2842,12 @@ function providerToolProjectionStatus(eventType, fallback = "") {
 }
 
 function displayNameFromToolMetadata(metadata = {}) {
-  const explicit = cleanText(metadata.toolDisplayName);
+  const explicit = cleanText(metadata.tool_display_name);
   if (explicit) {
     return explicit;
   }
-  const rawName = cleanText(metadata.toolName);
-  const server = cleanText(metadata.toolServer);
+  const rawName = cleanText(metadata.tool_name);
+  const server = cleanText(metadata.tool_server);
   const mcpMatch = /^mcp_{2,}(.+?)_{2,}(.+)$/.exec(rawName);
   if (mcpMatch) {
     return `${mcpMatch[1].replace(/_/g, "-")} / ${mcpMatch[2]}`;
@@ -3000,7 +2855,7 @@ function displayNameFromToolMetadata(metadata = {}) {
   if (server && rawName && !rawName.toLowerCase().startsWith(`${server.toLowerCase()}.`)) {
     return `${server} / ${rawName}`;
   }
-  return rawName || cleanText(metadata.command) || cleanText(metadata.filePath);
+  return rawName || cleanText(metadata.command) || cleanText(metadata.file_path);
 }
 
 function providerToolProjectionTitle(eventType, metadata = {}, event = {}) {
@@ -3030,17 +2885,17 @@ function providerToolProjectionText(eventType, metadata = {}, event = {}) {
     }
     return "";
   }
-  if (threadToolValueHasContent(metadata.toolError)) {
-    return typeof metadata.toolError === "string" ? metadata.toolError : JSON.stringify(metadata.toolError, null, 2);
+  if (threadToolValueHasContent(metadata.tool_error)) {
+    return typeof metadata.tool_error === "string" ? metadata.tool_error : JSON.stringify(metadata.tool_error, null, 2);
   }
-  if (threadToolValueHasContent(metadata.toolOutput)) {
-    return typeof metadata.toolOutput === "string" ? metadata.toolOutput : JSON.stringify(metadata.toolOutput, null, 2);
+  if (threadToolValueHasContent(metadata.tool_output)) {
+    return typeof metadata.tool_output === "string" ? metadata.tool_output : JSON.stringify(metadata.tool_output, null, 2);
   }
   return "";
 }
 
 export function createWorkspaceThreadToolProjectionEvents(thread, event = {}) {
-  const eventType = normalizeProviderToolEventType(event.type || event.eventType || event.event_type);
+  const eventType = normalizeProviderToolEventType(event.type || event.event_type);
   if (![
     "provider-tool-started",
     "provider-tool-completed",
@@ -3050,41 +2905,28 @@ export function createWorkspaceThreadToolProjectionEvents(thread, event = {}) {
     return [];
   }
 
-  const latestTurn = normalizeThreadLatestTurn(thread?.latestTurn);
+  const latestTurn = normalizeThreadLatestTurn(thread?.latest_turn);
   const promptMessageId = cleanText(
-    event.promptEventId
-      || event.pendingPromptId
-      || event.promptId
-      || event.messageId
-      || event.message_id
-      || latestTurn?.messageId,
+    event.prompt_event_id || event.pending_prompt_id || event.prompt_id || event.message_id || latestTurn?.message_id,
   );
   const turnId = cleanText(
-    event.turnId
-      || event.turn_id
-      || event.providerTurnId
-      || event.provider_turn_id
-      || latestTurn?.turnId
-      || (promptMessageId ? createTurnIdForMessage(thread, promptMessageId) : ""),
+    event.turn_id || event.provider_turn_id || latestTurn?.turn_id || promptMessageId ? createTurnIdForMessage(thread, promptMessageId) : "",
   );
-  const agentId = cleanAgentId(event.agentId || event.currentAgent || thread?.currentAgent, "");
+  const agentId = cleanAgentId(event.agent_id || event.current_agent || thread?.current_agent, "");
   const createdAt = cleanText(
-    event.completedAt
-      || event.inputReadyAt
-      || event.hookObservedAt
-      || event.createdAt
-      || event.startedAt,
+    event.completed_at
+      || event.input_ready_at
+      || event.hook_observed_at
+      || event.created_at
+      || event.started_at,
     nowIso(),
   );
   const metadata = normalizeThreadToolMetadata(event);
   const callId = cleanText(
-    event.callId
-      || event.call_id
-      || event.toolUseId
-      || event.tool_use_id,
+    event.call_id || event.tool_use_id,
   );
   const messagePhase = providerToolEventKind(eventType) === "tool_call" ? "call" : "output";
-  const explicitMessageId = cleanText(event.messageId || event.message_id);
+  const explicitMessageId = cleanText(event.message_id);
   const fallbackMessageId = [
     "tool",
     safeKey(turnId || thread?.id || "turn", "turn"),
@@ -3095,10 +2937,7 @@ export function createWorkspaceThreadToolProjectionEvents(thread, event = {}) {
     messagePhase,
   ].join("-");
   const promptEpoch = normalizeThreadPromptEpoch(
-    event.promptEpoch
-      || event.prompt_epoch
-      || latestTurn?.promptEpoch
-      || latestTurn?.prompt_epoch,
+    event.prompt_epoch || latestTurn?.prompt_epoch,
   );
   const title = providerToolProjectionTitle(eventType, metadata, event);
   const text = providerToolProjectionText(eventType, metadata, event);
@@ -3109,38 +2948,36 @@ export function createWorkspaceThreadToolProjectionEvents(thread, event = {}) {
   }
 
   return [{
-    agentId,
-    callId,
-    createdAt,
+    agent_id: agentId,
+    call_id: callId,
+    created_at: createdAt,
     id: [
       "projection-live-tool",
       safeKey(messageId, "message"),
       stableProjectionHash(`${eventType}:${turnId}:${callId}:${title}:${text}:${JSON.stringify(metadata)}:${status}`),
     ].join("-"),
     kind: providerToolEventKind(eventType),
-    messageId,
-    promptEpoch,
+    message_id: messageId,
     prompt_epoch: promptEpoch,
     source: cleanText(event.source || eventType, `cli-hook:${eventType}`),
     status,
     text,
     title,
-    turnId,
+    turn_id: turnId,
     type: providerToolProjectionType(eventType),
     ...metadata,
   }];
 }
 
 function createProjectionEventsFromTranscript(thread, incomingMessages, event = {}) {
-  const agentId = cleanAgentId(event.agentId || event.currentAgent || thread?.currentAgent, "");
+  const agentId = cleanAgentId(event.agent_id || event.current_agent || thread?.current_agent, "");
   const source = transcriptHistoryProjectionSource(agentId, event.source);
-  const preferLiveHookAssistantMessages = event.preferLiveHookAssistantMessages === true
-    || event.prefer_live_hook_assistant_messages === true;
-  const promptEventId = cleanText(event.promptEventId || event.pendingPromptId || event.promptId);
-  const promptEpoch = normalizeThreadPromptEpoch(event.promptEpoch || event.prompt_epoch);
+  const preferLiveHookAssistantMessages = event.prefer_live_hook_assistant_messages === true;
+  const promptEventId = cleanText(event.prompt_event_id || event.pending_prompt_id || event.prompt_id);
+  const promptEpoch = normalizeThreadPromptEpoch(event.prompt_epoch);
   const expectedUserMessage = cleanSubmittedUserMessage(
-    event.expectedUserMessage
-      || event.userMessage
+    event.expected_user_message
+      || event.user_message
       || event.message,
   );
   const normalizedIncomingMessages = normalizeThreadMessages(incomingMessages);
@@ -3162,10 +2999,10 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
     [],
   );
   const events = [];
-  const latestTurn = normalizeThreadLatestTurn(thread?.latestTurn);
-  const runningLatestTurnId = latestTurn?.state === "running" ? cleanText(latestTurn.turnId) : "";
+  const latestTurn = normalizeThreadLatestTurn(thread?.latest_turn);
+  const runningLatestTurnId = latestTurn?.state === "running" ? cleanText(latestTurn.turn_id) : "";
   const expectedPromptTurnId = promptEventId ? createTurnIdForMessage(thread, promptEventId) : "";
-  const promptAccepted = event.promptAccepted === true;
+  const promptAccepted = event.prompt_accepted === true;
   const latestUserMessage = [...normalizeThreadMessages(thread?.messages)]
     .reverse()
     .find((message) => message.role === "user") || null;
@@ -3180,7 +3017,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
         || (
           promptEventId
           && (
-            cleanText(latestTurn?.messageId) === promptEventId
+            cleanText(latestTurn?.message_id) === promptEventId
             || runningLatestTurnId.includes(promptEventId)
             || cleanText(latestUserMessage?.id) === promptEventId
           )
@@ -3188,13 +3025,13 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
         || latestUserMessageMatchesExpectedPrompt
       )
   );
-  const allowTranscriptTurnCompletion = event.allowTranscriptTurnCompletion === true
-    || event.transcriptCompletionCanSettleTurn === true;
-  const assistantResponseCompletesTurn = event.assistantResponseCompletesTurn === true;
+  const allowTranscriptTurnCompletion = event.allow_transcript_turn_completion === true
+    || event.transcript_completion_can_settle_turn === true;
+  const assistantResponseCompletesTurn = event.assistant_response_completes_turn === true;
   const transcriptTurnCompleteSeen = Boolean(
-    event.turnCompleteSeen === true
+    event.turn_complete_seen === true
       || (
-        event.transcriptExplicitCompletionCanSettleTurn === true
+        event.transcript_explicit_completion_can_settle_turn === true
         && transcriptHasTurnCompleteForExpectedPrompt(
           normalizedIncomingMessages,
           expectedPromptTranscriptMessageId,
@@ -3212,7 +3049,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
     };
     const projectedMessage = findMatchingProjectedMessage(projectedMessages, matchCandidate);
     const messageId = cleanText(message.id, createRandomId("message"));
-    const createdAt = cleanText(message.createdAt, nowIso());
+    const createdAt = cleanText(message.created_at, nowIso());
     const isExpectedPromptUserMessage = Boolean(
       expectedPromptTranscriptMessageId
         && message.role === "user"
@@ -3224,7 +3061,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
     const expectedAssistantTurnForMessage = message.role === "assistant" && !currentTurnId
       ? runningLatestTurnId || expectedPromptTurnId
       : "";
-    const incomingMessageTurnId = cleanText(message.turnId || message.turn_id);
+    const incomingMessageTurnId = cleanText(message.turn_id);
     const shouldContinueCurrentTranscriptTurn = Boolean(message.role !== "user" && currentTurnId);
     const messageArtifacts = normalizeThreadArtifacts(message.artifacts);
     const messageArtifactsSignature = threadArtifactsSignature(messageArtifacts);
@@ -3232,23 +3069,22 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
       (shouldContinueCurrentTranscriptTurn ? currentTurnId : "")
         || expectedPromptTurnForMessage
         || expectedAssistantTurnForMessage
-        || projectedMessage?.turnId
+        || projectedMessage?.turn_id
         || incomingMessageTurnId
         || currentTurnId
         || createTurnIdForMessage(thread, messageId),
     );
     const eventBase = {
-      agentId: message.agentId || agentId,
+      agent_id: message.agent_id || agentId,
       artifacts: messageArtifacts,
-      callId: message.callId,
-      createdAt,
+      call_id: message.call_id,
+      created_at: createdAt,
       kind: message.kind,
-      messageId,
-      promptEpoch,
+      message_id: messageId,
       prompt_epoch: promptEpoch,
       source,
       title: message.title,
-      turnId: messageTurnId,
+      turn_id: messageTurnId,
       ...normalizeThreadStructuredTranscriptMetadata(message),
       ...normalizeThreadToolMetadata(message),
     };
@@ -3259,12 +3095,12 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
       }
       currentTurnId = cleanText(
         expectedPromptTurnForMessage
-          || projectedMessage?.turnId
+          || projectedMessage?.turn_id
           || incomingMessageTurnId
           || createTurnIdForMessage(thread, messageId),
       );
       transcriptAdvancedTurn = true;
-      eventBase.turnId = currentTurnId;
+      eventBase.turn_id = currentTurnId;
       if (!projectionHasTurnEvent(projectionEvents, "thread.turn.started", currentTurnId)) {
         events.push({
           ...eventBase,
@@ -3295,7 +3131,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
           && isLiveHookProjectionSource(candidate.source)
           && cleanMessageText(candidate.text)
           && projectionTurnIdsMatchPrompt(
-            candidate.turnId,
+            candidate.turn_id,
             messageTurnId,
             promptEventId || expectedPromptTranscriptMessageId,
           )
@@ -3319,7 +3155,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
         ) {
           events.push({
             ...eventBase,
-            completedAt: createdAt,
+            completed_at: createdAt,
             id: `projection-provider-turn-completed-${stableProjectionKey(messageTurnId, "turn")}-${stableProjectionKey(messageId, "message")}`,
             status: "completed",
             type: "thread.turn.completed",
@@ -3337,8 +3173,8 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
         ) {
           events.push({
             ...eventBase,
-            assistantMessageId: liveHookAssistantMessage.id,
-            completedAt: createdAt,
+            assistant_message_id: liveHookAssistantMessage.id,
+            completed_at: createdAt,
             id: `projection-provider-turn-completed-${stableProjectionKey(messageTurnId, "turn")}-${stableProjectionKey(messageId, "message")}`,
             status: "completed",
             type: "thread.turn.completed",
@@ -3350,7 +3186,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
       const duplicateFinalAssistant = turnComplete
         ? projectedMessages.find((candidate) => (
           candidate.role === "assistant"
-          && (!messageTurnId || candidate.turnId === messageTurnId)
+          && (!messageTurnId || candidate.turn_id === messageTurnId)
           && cleanLiveMessageText(candidate.text) === nextText
         ))
         : null;
@@ -3362,8 +3198,8 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
       const assistantEventBase = liveHookAssistantTarget && !duplicateFinalAssistant
         ? {
           ...eventBase,
-          messageId: liveHookAssistantTarget.id,
-          turnId: messageTurnId || liveHookAssistantTarget.turnId,
+          message_id: liveHookAssistantTarget.id,
+          turn_id: messageTurnId || liveHookAssistantTarget.turn_id,
         }
         : eventBase;
       let delta = nextText;
@@ -3382,11 +3218,11 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
           delta: replaceText ? "" : delta || nextText,
           id: [
             "projection-assistant-delta",
-            safeKey(assistantEventBase.messageId, "message"),
+            safeKey(assistantEventBase.message_id, "message"),
             nextText.length,
           stableProjectionHash(`${nextText}:${messageArtifactsSignature}`),
         ].join("-"),
-        replaceText,
+        replace_text: replaceText,
           text: replaceText ? nextText : "",
           type: "thread.message.assistant.delta",
         });
@@ -3404,11 +3240,11 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
           ...assistantEventBase,
           id: [
             "projection-assistant-complete",
-            safeKey(assistantEventBase.messageId, "message"),
+            safeKey(assistantEventBase.message_id, "message"),
             nextText.length,
             stableProjectionHash(`${nextText}:${messageArtifactsSignature}`),
           ].join("-"),
-          replaceText: true,
+          replace_text: true,
           text: nextText,
           type: "thread.message.assistant.complete",
         });
@@ -3421,8 +3257,8 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
       ) {
         events.push({
           ...eventBase,
-          assistantMessageId: duplicateFinalAssistant?.id || liveHookAssistantTarget?.id || messageId,
-          completedAt: createdAt,
+          assistant_message_id: duplicateFinalAssistant?.id || liveHookAssistantTarget?.id || messageId,
+          completed_at: createdAt,
           id: `projection-provider-turn-completed-${stableProjectionKey(messageTurnId, "turn")}-${stableProjectionKey(messageId, "message")}`,
           status: "completed",
           type: "thread.turn.completed",
@@ -3456,7 +3292,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
       ) {
         events.push({
           ...eventBase,
-          completedAt: createdAt,
+          completed_at: createdAt,
           id: `projection-provider-turn-error-${stableProjectionKey(messageTurnId, "turn")}-${stableProjectionKey(messageId, "message")}`,
           status: "error",
           text: message.text,
@@ -3510,28 +3346,27 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
     && completedTurnId
     && !projectionHasTurnEvent(projectionEvents, "thread.turn.completed", completedTurnId)
   ) {
-    const completedAt = cleanText(event.latestTimestamp || event.completedAt, nowIso());
+    const completedAt = cleanText(event.latest_timestamp || event.completed_at, nowIso());
     const assistantMessage = [...projectedMessages].reverse().find((message) => (
       message?.role === "assistant"
-      && (!message.turnId || message.turnId === completedTurnId)
+      && (!message.turn_id || message.turn_id === completedTurnId)
     ));
     events.push({
-      agentId,
-      assistantMessageId: assistantMessage?.id || "",
-      completedAt,
-      createdAt: completedAt,
+      agent_id: agentId,
+      assistant_message_id: assistantMessage?.id || "",
+      completed_at: completedAt,
+      created_at: completedAt,
       id: [
         "projection-provider-turn-completed",
         stableProjectionKey(completedTurnId, "turn"),
         "fallback",
         stableProjectionHash(completedAt),
       ].join("-"),
-      messageId: assistantMessage?.id || completedTurnId,
-      promptEpoch,
+      message_id: assistantMessage?.id || completedTurnId,
       prompt_epoch: promptEpoch,
       source,
       status: "completed",
-      turnId: completedTurnId,
+      turn_id: completedTurnId,
       type: "thread.turn.completed",
     });
   }
@@ -3543,16 +3378,16 @@ function preserveRunningLatestTurnWhenTranscriptCompletionBlocked(existingLatest
   const normalizedExistingLatestTurn = normalizeThreadLatestTurn(existingLatestTurn);
   const normalizedProjectedLatestTurn = normalizeThreadLatestTurn(projectedLatestTurn);
   const blocked = Boolean(
-    event.allowTranscriptTurnCompletion !== true
+    event.allow_transcript_turn_completion !== true
       && normalizedExistingLatestTurn?.state === "running"
       && normalizedProjectedLatestTurn
-      && cleanText(normalizedProjectedLatestTurn.turnId) === cleanText(normalizedExistingLatestTurn.turnId)
+      && cleanText(normalizedProjectedLatestTurn.turn_id) === cleanText(normalizedExistingLatestTurn.turn_id)
       && CLOSED_THREAD_TURN_STATES.has(normalizedProjectedLatestTurn.state)
   );
 
   return {
     blocked,
-    latestTurn: blocked ? normalizedExistingLatestTurn : normalizedProjectedLatestTurn,
+    latest_turn: blocked ? normalizedExistingLatestTurn : normalizedProjectedLatestTurn,
   };
 }
 
@@ -3567,7 +3402,7 @@ function defaultThreadTitle(terminalIndex, agentId) {
 export function getWorkspaceThreadAgentLabel(threadOrAgentId) {
   const agent = typeof threadOrAgentId === "string"
     ? cleanAgentId(threadOrAgentId, DEFAULT_AGENT_ID)
-    : cleanAgentId(threadOrAgentId?.currentAgent || threadOrAgentId?.preferredAgent, DEFAULT_AGENT_ID);
+    : cleanAgentId(threadOrAgentId?.current_agent || threadOrAgentId?.preferred_agent, DEFAULT_AGENT_ID);
   if (agent === "opencode") {
     return "OpenCode";
   }
@@ -3618,26 +3453,26 @@ function getWorkspaceThreadPromptLabel(message, fallback = "New thread") {
 function normalizeCoordination(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return {
-      agentBranch: "",
-      agentId: "",
-      agentSlotId: "",
-      coordinationMode: "",
-      fileAuthority: "",
-      sessionId: "",
-      sessionMode: "",
-      worktreePath: "",
+      agent_branch: "",
+      agent_id: "",
+      agent_slot_id: "",
+      coordination_mode: "",
+      file_authority: "",
+      session_id: "",
+      session_mode: "",
+      worktree_path: "",
     };
   }
 
   return {
-    agentBranch: cleanText(value.agentBranch),
-    agentId: cleanText(value.agentId),
-    agentSlotId: cleanText(value.agentSlotId),
-    coordinationMode: cleanText(value.coordinationMode),
-    fileAuthority: cleanText(value.fileAuthority),
-    sessionId: cleanText(value.sessionId),
-    sessionMode: cleanText(value.sessionMode),
-    worktreePath: cleanText(value.worktreePath),
+    agent_branch: cleanText(value.agent_branch),
+    agent_id: cleanText(value.agent_id),
+    agent_slot_id: cleanText(value.agent_slot_id),
+    coordination_mode: cleanText(value.coordination_mode),
+    file_authority: cleanText(value.file_authority),
+    session_id: cleanText(value.session_id),
+    session_mode: cleanText(value.session_mode),
+    worktree_path: cleanText(value.worktree_path),
   };
 }
 
@@ -3646,18 +3481,18 @@ function normalizeTerminalBinding(value) {
     return null;
   }
 
-  const paneId = cleanText(value.paneId);
-  const instanceId = Number.parseInt(value.instanceId, 10);
-  const terminalIndex = normalizeTerminalIndex(value.terminalIndex);
+  const paneId = cleanText(value.pane_id);
+  const instanceId = Number.parseInt(value.instance_id, 10);
+  const terminalIndex = normalizeTerminalIndex(value.terminal_index);
 
   if (!paneId || !Number.isInteger(instanceId) || instanceId <= 0) {
     return null;
   }
 
   return {
-    instanceId,
-    paneId,
-    terminalIndex,
+    instance_id: instanceId,
+    pane_id: paneId,
+    terminal_index: terminalIndex,
   };
 }
 
@@ -3666,10 +3501,10 @@ function normalizeActiveTerminal(value) {
     return null;
   }
 
-  const terminalIndex = normalizeTerminalIndex(value.terminalIndex);
+  const terminalIndex = normalizeTerminalIndex(value.terminal_index);
   const key = terminalSessionKey(terminalIndex);
-  const paneId = cleanText(value.paneId);
-  const instanceId = Number.parseInt(value.instanceId, 10);
+  const paneId = cleanText(value.pane_id);
+  const instanceId = Number.parseInt(value.instance_id, 10);
   const status = cleanText(value.status, "idle").toLowerCase();
   const safeStatus = LIVE_TERMINAL_STATUSES.has(status)
     ? status
@@ -3679,57 +3514,50 @@ function normalizeActiveTerminal(value) {
     return null;
   }
 
-  const providerSessionId = cleanText(value.providerSessionId || value.provider_session_id || value.nativeSessionId || value.native_session_id || value.sessionId);
-  const nativeSessionId = cleanText(value.nativeSessionId || value.native_session_id || value.providerSessionId || value.provider_session_id || value.sessionId);
-  const sessionId = cleanText(value.sessionId || value.session_id || providerSessionId || nativeSessionId);
+  const providerSessionId = cleanText(value.provider_session_id || value.native_session_id || value.session_id);
+  const nativeSessionId = cleanText(value.native_session_id || value.provider_session_id || value.session_id);
+  const sessionId = cleanText(value.session_id || providerSessionId || nativeSessionId);
 
   return {
-    activityStatus: normalizeThreadActivityStatus(value.activityStatus || value.activity_status),
-    agentId: cleanAgentId(value.agentId || value.currentAgent),
-    agentDisplayName: cleanAgentDisplayName(value.agentDisplayName || value.agent_display_name),
-    agentType: cleanAgentDisplayName(value.agentType || value.agent_type),
-    commandPhase: cleanText(value.commandPhase || value.command_phase),
-    executionPhase: cleanText(value.executionPhase || value.execution_phase),
-    instanceId: Number.isInteger(instanceId) && instanceId > 0 ? instanceId : 0,
-    inputReady: value.inputReady === true,
-    inputReadyAt: cleanText(value.inputReadyAt),
-    inputReadyConfidence: cleanText(value.inputReadyConfidence),
+    activity_status: normalizeThreadActivityStatus(value.activity_status),
+    agent_id: cleanAgentId(value.agent_id || value.current_agent),
+    agent_display_name: cleanAgentDisplayName(value.agent_display_name),
+    agent_type: cleanAgentDisplayName(value.agent_type),
+    command_phase: cleanText(value.command_phase),
+    execution_phase: cleanText(value.execution_phase),
+    instance_id: Number.isInteger(instanceId) && instanceId > 0 ? instanceId : 0,
+    input_ready: value.input_ready === true,
+    input_ready_at: cleanText(value.input_ready_at),
+    input_ready_confidence: cleanText(value.input_ready_confidence),
     ...hookHealthFields(value),
-    lastActiveAt: cleanText(value.lastActiveAt, value.updatedAt || nowIso()),
-    paneId,
+    last_active_at: cleanText(value.last_active_at, value.updated_at || nowIso()),
+    pane_id: paneId,
     ...promptingUserFields(value),
-    displayName: workspaceTerminalNicknameFromRecord(value),
-    fileAuthority: cleanText(value.fileAuthority || value.coordination?.fileAuthority),
-    forkFromProviderSessionId: cleanText(
-      value.forkFromProviderSessionId
-        || value.fork_from_provider_session_id
-        || value.forkedFromProviderSessionId
-        || value.forked_from_provider_session_id
-        || value.parentProviderSessionId
-        || value.parent_provider_session_id,
+    display_name: workspaceTerminalNicknameFromRecord(value),
+    file_authority: cleanText(value.file_authority || value.coordination?.file_authority),
+    fork_from_provider_session_id: cleanText(
+      value.fork_from_provider_session_id || value.forked_from_provider_session_id || value.parent_provider_session_id,
     ),
-    nativeRailState: cleanText(value.nativeRailState || value.native_rail_state),
+    native_rail_state: cleanText(value.native_rail_state),
     provider: cleanAgentDisplayName(value.provider),
-    providerSessionId,
-    nativeSessionId,
-    relatedProviderSessionIds: cleanTextArray(
-      value.relatedProviderSessionIds,
+    provider_session_id: providerSessionId,
+    native_session_id: nativeSessionId,
+    related_provider_session_ids: cleanTextArray(
       value.related_provider_session_ids,
-      value.relatedSessionIds,
       value.related_session_ids,
     ),
-    sharedHistoryId: cleanText(value.sharedHistoryId || value.shared_history_id || value.historyGroupId || value.history_group_id),
-    slotKey: cleanText(value.slotKey, defaultSlotKey(terminalIndex)),
+    shared_history_id: cleanText(value.shared_history_id || value.history_group_id),
+    slot_key: cleanText(value.slot_key, defaultSlotKey(terminalIndex)),
     status: safeStatus,
-    turnStatus: cleanText(value.turnStatus || value.turn_status),
-    sessionMode: cleanText(value.sessionMode || value.coordination?.sessionMode),
-    sessionId,
-    terminalName: workspaceTerminalNicknameFromRecord(value),
-    terminalNickname: workspaceTerminalNicknameFromRecord(value),
-    terminalIndex,
-    threadId: cleanText(value.threadId),
-    updatedAt: cleanText(value.updatedAt, nowIso()),
-    worktreePath: cleanText(value.worktreePath || value.coordination?.worktreePath),
+    turn_status: cleanText(value.turn_status),
+    session_mode: cleanText(value.session_mode || value.coordination?.session_mode),
+    session_id: sessionId,
+    terminal_name: workspaceTerminalNicknameFromRecord(value),
+    terminal_nickname: workspaceTerminalNicknameFromRecord(value),
+    terminal_index: terminalIndex,
+    thread_id: cleanText(value.thread_id),
+    updated_at: cleanText(value.updated_at, nowIso()),
+    worktree_path: cleanText(value.worktree_path || value.coordination?.worktree_path),
   };
 }
 
@@ -3746,135 +3574,107 @@ function normalizeProviderBinding(value, agentId, fallback = {}, options = {}) {
     : "idle";
   const terminalBinding = options.stripLiveBindings
     ? null
-    : normalizeTerminalBinding(binding.terminalBinding || fallback.terminalBinding);
+    : normalizeTerminalBinding(binding.terminal_binding || fallback.terminal_binding);
 
   return {
-    agentId: safeAgentId,
-    agentDisplayName: cleanAgentDisplayName(
-      binding.agentDisplayName || binding.agent_display_name,
-      fallback.agentDisplayName || fallback.agent_display_name,
+    agent_id: safeAgentId,
+    agent_display_name: cleanAgentDisplayName(
+      binding.agent_display_name,
+      fallback.agent_display_name,
     ),
-    agentType: cleanAgentDisplayName(
-      binding.agentType || binding.agent_type,
-      fallback.agentType || fallback.agent_type,
+    agent_type: cleanAgentDisplayName(
+      binding.agent_type,
+      fallback.agent_type,
     ),
     coordination: normalizeCoordination(binding.coordination || fallback.coordination),
-    activityStatus: options.stripLiveBindings
+    activity_status: options.stripLiveBindings
       ? "idle"
-      : normalizeThreadActivityStatus(binding.activityStatus, fallback.activityStatus),
-    inputReady: options.stripLiveBindings
+      : normalizeThreadActivityStatus(binding.activity_status, fallback.activity_status),
+    input_ready: options.stripLiveBindings
       ? false
-      : Boolean(binding.inputReady ?? fallback.inputReady),
-    inputReadyAt: options.stripLiveBindings
+      : Boolean(binding.input_ready ?? fallback.input_ready),
+    input_ready_at: options.stripLiveBindings
       ? ""
-      : cleanText(binding.inputReadyAt, fallback.inputReadyAt),
-    inputReadyConfidence: options.stripLiveBindings
+      : cleanText(binding.input_ready_at, fallback.input_ready_at),
+    input_ready_confidence: options.stripLiveBindings
       ? ""
       : cleanText(
-        binding.inputReadyConfidence,
-        fallback.inputReadyConfidence,
+        binding.input_ready_confidence,
+        fallback.input_ready_confidence,
       ),
     ...(
       options.stripLiveBindings
-        ? hookHealthFields({ hookHealthEvent: "", hookHealthObservedAtMs: 0, hookHealthStatus: "" })
+        ? hookHealthFields({ hook_health_event: "", hook_health_observed_at_ms: 0, hook_health_status: "" })
         : hookHealthFields(binding, fallback)
     ),
     ...(
       options.stripLiveBindings
-        ? promptingUserFields({ terminalIsPromptingUser: false })
+        ? promptingUserFields({ terminal_is_prompting_user: false })
         : promptingUserFields(binding, fallback)
     ),
-    lastActiveAt: cleanText(binding.lastActiveAt, fallback.lastActiveAt),
-    lastMessageAt: cleanText(binding.lastMessageAt, fallback.lastMessageAt),
-    messageCount: normalizeMessageCount(binding.messageCount ?? fallback.messageCount),
-    modelId: cleanModelId(
-      binding.modelId || binding.model || binding.activeModel,
-      cleanModelId(fallback.modelId || fallback.model || fallback.activeModel),
+    last_active_at: cleanText(binding.last_active_at, fallback.last_active_at),
+    last_message_at: cleanText(binding.last_message_at, fallback.last_message_at),
+    message_count: normalizeMessageCount(binding.message_count ?? fallback.message_count),
+    model_id: cleanModelId(
+      binding.model_id || binding.model || binding.active_model,
+      cleanModelId(fallback.model_id || fallback.model || fallback.active_model),
     ),
-    modelSource: cleanText(binding.modelSource, fallback.modelSource),
+    model_source: cleanText(binding.model_source, fallback.model_source),
     modelUpdatedAt: cleanText(binding.modelUpdatedAt, fallback.modelUpdatedAt),
-    forkFromProviderSessionId: cleanText(
-      binding.forkFromProviderSessionId
-        || binding.fork_from_provider_session_id
-        || binding.forkedFromProviderSessionId
-        || binding.forked_from_provider_session_id
-        || binding.parentProviderSessionId
-        || binding.parent_provider_session_id,
-      fallback.forkFromProviderSessionId || fallback.fork_from_provider_session_id,
+    fork_from_provider_session_id: cleanText(
+      binding.fork_from_provider_session_id || binding.forked_from_provider_session_id || binding.parent_provider_session_id,
+      fallback.fork_from_provider_session_id,
     ),
-    nativeSessionId: cleanText(binding.nativeSessionId, fallback.nativeSessionId),
-    nativeSessionKind: cleanText(binding.nativeSessionKind, fallback.nativeSessionKind || "session"),
-    nativeSessionSource: cleanText(binding.nativeSessionSource, fallback.nativeSessionSource),
-    nativeSessionTitle: cleanThreadLabelCandidate(
-      binding.nativeSessionTitle
-        || binding.sessionTitle
+    native_session_id: cleanText(binding.native_session_id, fallback.native_session_id),
+    native_session_kind: cleanText(binding.native_session_kind, fallback.native_session_kind || "session"),
+    native_session_source: cleanText(binding.native_session_source, fallback.native_session_source),
+    native_session_title: cleanThreadLabelCandidate(
+      binding.native_session_title
+        || binding.session_title
         || binding.title
-        || fallback.nativeSessionTitle
-        || fallback.sessionTitle
+        || fallback.native_session_title
+        || fallback.session_title
         || fallback.title,
     ),
-    nativeSessionTitleSource: cleanText(binding.nativeSessionTitleSource, fallback.nativeSessionTitleSource),
+    native_session_title_source: cleanText(binding.native_session_title_source, fallback.native_session_title_source),
     nativeSessionTitleUpdatedAt: cleanText(binding.nativeSessionTitleUpdatedAt, fallback.nativeSessionTitleUpdatedAt),
-    nativeSessionUpdatedAt: cleanText(binding.nativeSessionUpdatedAt, fallback.nativeSessionUpdatedAt),
+    native_session_updated_at: cleanText(binding.native_session_updated_at, fallback.native_session_updated_at),
     provider: cleanAgentDisplayName(binding.provider, fallback.provider),
-    relatedProviderSessionIds: cleanTextArray(
-      binding.relatedProviderSessionIds,
+    related_provider_session_ids: cleanTextArray(
       binding.related_provider_session_ids,
-      fallback.relatedProviderSessionIds,
       fallback.related_provider_session_ids,
     ),
-    sharedHistoryId: cleanText(
-      binding.sharedHistoryId
-        || binding.shared_history_id
-        || binding.historyGroupId
-        || binding.history_group_id,
-      fallback.sharedHistoryId || fallback.shared_history_id || fallback.historyGroupId || fallback.history_group_id,
+    shared_history_id: cleanText(
+      binding.shared_history_id || binding.history_group_id,
+      fallback.shared_history_id || fallback.history_group_id,
     ),
     status: options.stripLiveBindings && ["active", "starting"].includes(safeStatus) ? "idle" : safeStatus,
-    displayName: terminalNicknameFromSources(
-      binding.displayName,
+    display_name: terminalNicknameFromSources(
       binding.display_name,
-      binding.terminalNickname,
       binding.terminal_nickname,
-      binding.terminalName,
       binding.terminal_name,
-      fallback.displayName,
       fallback.display_name,
-      fallback.terminalNickname,
       fallback.terminal_nickname,
-      fallback.terminalName,
       fallback.terminal_name,
     ),
-    terminalName: terminalNicknameFromSources(
-      binding.terminalName,
+    terminal_name: terminalNicknameFromSources(
       binding.terminal_name,
-      binding.terminalNickname,
       binding.terminal_nickname,
-      binding.displayName,
       binding.display_name,
-      fallback.terminalName,
       fallback.terminal_name,
-      fallback.terminalNickname,
       fallback.terminal_nickname,
-      fallback.displayName,
       fallback.display_name,
     ),
-    terminalNickname: terminalNicknameFromSources(
-      binding.terminalNickname,
+    terminal_nickname: terminalNicknameFromSources(
       binding.terminal_nickname,
-      binding.terminalName,
       binding.terminal_name,
-      binding.displayName,
       binding.display_name,
-      fallback.terminalNickname,
       fallback.terminal_nickname,
-      fallback.terminalName,
       fallback.terminal_name,
-      fallback.displayName,
       fallback.display_name,
     ),
-    terminalBinding,
-    updatedAt: cleanText(binding.updatedAt, fallback.updatedAt || nowIso()),
+    terminal_binding: terminalBinding,
+    updated_at: cleanText(binding.updated_at, fallback.updated_at || nowIso()),
   };
 }
 
@@ -3883,7 +3683,7 @@ function normalizeProviderBindings(source, fallbackAgentId, fallback = {}, optio
   const bindingsSource = source && typeof source === "object" && !Array.isArray(source) ? source : {};
 
   Object.entries(bindingsSource).forEach(([agentId, binding]) => {
-    const safeAgentId = cleanAgentId(agentId || binding?.agentId, "");
+    const safeAgentId = cleanAgentId(agentId || binding?.agent_id, "");
     const normalizedBinding = normalizeProviderBinding(binding, safeAgentId, {}, options);
     if (!normalizedBinding) {
       return;
@@ -3914,20 +3714,20 @@ function normalizeThread(thread, workspaceId, options = {}) {
     return null;
   }
 
-  const terminalIndex = normalizeTerminalIndex(thread.terminalIndex);
+  const terminalIndex = normalizeTerminalIndex(thread.terminal_index);
   const fallbackThreadId = terminalIndex == null
     ? createRandomId(`thread-${safeKey(workspaceId)}`)
     : defaultThreadId(workspaceId, terminalIndex);
   const id = cleanText(thread.id, fallbackThreadId);
-  const preferredAgent = cleanAgentId(thread.preferredAgent || thread.currentAgent);
-  const currentAgent = cleanAgentId(thread.currentAgent || preferredAgent);
-  const createdAt = cleanText(thread.createdAt, nowIso());
-  const updatedAt = cleanText(thread.updatedAt, createdAt);
+  const preferredAgent = cleanAgentId(thread.preferred_agent || thread.current_agent);
+  const currentAgent = cleanAgentId(thread.current_agent || preferredAgent);
+  const createdAt = cleanText(thread.created_at, nowIso());
+  const updatedAt = cleanText(thread.updated_at, createdAt);
   const projectionEvents = options.stripMessages
     ? []
     : options.compactPersistence
-      ? compactPersistedThreadProjectionEvents(thread.projectionEvents || thread.threadProjectionEvents)
-      : normalizeThreadProjectionEvents(thread.projectionEvents || thread.threadProjectionEvents);
+      ? compactPersistedThreadProjectionEvents(thread.projection_events || thread.threadProjectionEvents)
+      : normalizeThreadProjectionEvents(thread.projection_events || thread.threadProjectionEvents);
   const messages = options.stripMessages
     ? []
     : options.compactPersistence
@@ -3938,46 +3738,46 @@ function normalizeThread(thread, workspaceId, options = {}) {
           : normalizeThreadMessages(thread.messages)
       );
   const projectedLatestTurn = options.stripMessages
-    ? normalizeThreadLatestTurn(thread.latestTurn)
+    ? normalizeThreadLatestTurn(thread.latest_turn)
     : options.compactPersistence
-      ? normalizeThreadLatestTurn(thread.latestTurn)
-      : projectLatestTurnFromNormalizedEvents(projectionEvents, thread.latestTurn);
-  const messageCount = Math.max(normalizeMessageCount(thread.messageCount), messages.length);
+      ? normalizeThreadLatestTurn(thread.latest_turn)
+      : projectLatestTurnFromNormalizedEvents(projectionEvents, thread.latest_turn);
+  const messageCount = Math.max(normalizeMessageCount(thread.message_count), messages.length);
   const materialized = thread.materialized === true || messageCount > 0;
   const status = cleanText(thread.status, "idle").toLowerCase();
   const safeStatus = LIVE_TERMINAL_STATUSES.has(status)
     ? status
     : "idle";
   const coordination = normalizeCoordination(thread.coordination);
-  const terminalBinding = options.stripLiveBindings ? null : normalizeTerminalBinding(thread.terminalBinding);
+  const terminalBinding = options.stripLiveBindings ? null : normalizeTerminalBinding(thread.terminal_binding);
   const providerBindings = normalizeProviderBindings(
-    thread.providerBindings,
+    thread.provider_bindings,
     currentAgent,
     {
       coordination,
-      lastActiveAt: cleanText(thread.lastActiveAt, updatedAt),
-      lastMessageAt: cleanText(thread.lastMessageAt),
-      messageCount,
+      last_active_at: cleanText(thread.last_active_at, updatedAt),
+      last_message_at: cleanText(thread.last_message_at),
+      message_count: messageCount,
       status: safeStatus,
-      terminalBinding,
-      updatedAt,
+      terminal_binding: terminalBinding,
+      updated_at: updatedAt,
     },
     options,
   );
-  const pendingPrompt = options.stripLiveBindings ? null : normalizePendingPrompt(thread.pendingPrompt);
+  const pendingPrompt = options.stripLiveBindings ? null : normalizePendingPrompt(thread.pending_prompt);
   const fallbackTitle = defaultThreadTitle(terminalIndex || 0, currentAgent);
-  const storedSessionName = cleanThreadLabelCandidate(thread.sessionName);
+  const storedSessionName = cleanThreadLabelCandidate(thread.session_name);
   const storedTitle = cleanThreadLabelCandidate(thread.title);
 
-  const transcriptSessionId = cleanText(thread.transcriptSessionId);
+  const transcriptSessionId = cleanText(thread.transcript_session_id);
   const orphanRunningThreadState = isOrphanRunningThreadState({
-    latestTurn: projectedLatestTurn,
-    messageCount,
+    latest_turn: projectedLatestTurn,
+    message_count: messageCount,
     messages,
-    pendingPrompt,
-    projectionEvents,
-    providerBindings,
-    transcriptSessionId,
+    pending_prompt: pendingPrompt,
+    projection_events: projectionEvents,
+    provider_bindings: providerBindings,
+    transcript_session_id: transcriptSessionId,
   });
   const latestTurn = orphanRunningThreadState ? null : projectedLatestTurn;
   const detachedNonLiveRunningThread = Boolean(
@@ -3993,9 +3793,9 @@ function normalizeThread(thread, workspaceId, options = {}) {
       : detachedNonLiveRunningThread
         ? "idle"
         : pendingPromptTurnHasInputReady({
-          activityStatus: storedActivityStatus,
-          latestTurn,
-          pendingPrompt,
+          activity_status: storedActivityStatus,
+          latest_turn: latestTurn,
+          pending_prompt: pendingPrompt,
           providerBinding: providerBindings[currentAgent],
         })
           ? "idle"
@@ -4007,83 +3807,65 @@ function normalizeThread(thread, workspaceId, options = {}) {
     ? clearOrphanRunningProviderBindings(providerBindings)
     : providerBindings;
   const terminalNickname = terminalNicknameFromSources(
-    thread.terminalNickname,
     thread.terminal_nickname,
-    thread.terminalName,
     thread.terminal_name,
-    thread.displayName,
     thread.display_name,
-    normalizedProviderBindings[currentAgent]?.terminalNickname,
     normalizedProviderBindings[currentAgent]?.terminal_nickname,
-    normalizedProviderBindings[currentAgent]?.terminalName,
     normalizedProviderBindings[currentAgent]?.terminal_name,
-    normalizedProviderBindings[currentAgent]?.displayName,
     normalizedProviderBindings[currentAgent]?.display_name,
   );
 
   return {
     coordination,
-    activityStatus,
+    activity_status: activityStatus,
     archivedAt: cleanText(thread.archivedAt),
-    createdAt,
-    currentAgent,
-    forkFromProviderSessionId: cleanText(
-      thread.forkFromProviderSessionId
-        || thread.fork_from_provider_session_id
-        || thread.forkedFromProviderSessionId
-        || thread.forked_from_provider_session_id
-        || thread.parentProviderSessionId
-        || thread.parent_provider_session_id,
-      normalizedProviderBindings[currentAgent]?.forkFromProviderSessionId
-        || normalizedProviderBindings[currentAgent]?.fork_from_provider_session_id,
+    created_at: createdAt,
+    current_agent: currentAgent,
+    fork_from_provider_session_id: cleanText(
+      thread.fork_from_provider_session_id || thread.forked_from_provider_session_id || thread.parent_provider_session_id,
+      normalizedProviderBindings[currentAgent]?.fork_from_provider_session_id,
     ),
     id,
-    lastActiveAt: cleanText(thread.lastActiveAt, updatedAt),
-    lastMessageAt: cleanText(thread.lastMessageAt),
+    last_active_at: cleanText(thread.last_active_at, updatedAt),
+    last_message_at: cleanText(thread.last_message_at),
     materialized,
-    messageCount,
+    message_count: messageCount,
     messages,
-    latestTurn,
-    pendingPrompt,
+    latest_turn: latestTurn,
+    pending_prompt: pendingPrompt,
     pinnedAt: cleanText(thread.pinnedAt),
-    projectionEvents,
-    preferredAgent,
-    relatedProviderSessionIds: cleanTextArray(
-      thread.relatedProviderSessionIds,
+    projection_events: projectionEvents,
+    preferred_agent: preferredAgent,
+    related_provider_session_ids: cleanTextArray(
       thread.related_provider_session_ids,
-      normalizedProviderBindings[currentAgent]?.relatedProviderSessionIds,
       normalizedProviderBindings[currentAgent]?.related_provider_session_ids,
     ),
-    freshSessionStartedAt: options.stripLiveBindings ? "" : cleanText(thread.freshSessionStartedAt),
-    sessionName: storedSessionName || storedTitle || fallbackTitle,
-    sharedHistoryId: cleanText(
-      thread.sharedHistoryId
-        || thread.shared_history_id
-        || thread.historyGroupId
-        || thread.history_group_id,
-      normalizedProviderBindings[currentAgent]?.sharedHistoryId
-        || normalizedProviderBindings[currentAgent]?.shared_history_id,
+    fresh_session_started_at: options.stripLiveBindings ? "" : cleanText(thread.fresh_session_started_at),
+    session_name: storedSessionName || storedTitle || fallbackTitle,
+    shared_history_id: cleanText(
+      thread.shared_history_id || thread.history_group_id,
+      normalizedProviderBindings[currentAgent]?.shared_history_id,
     ),
-    slotKey: cleanText(
-      thread.slotKey,
+    slot_key: cleanText(
+      thread.slot_key,
       terminalIndex == null ? `thread-${safeKey(id, "detached")}` : defaultSlotKey(terminalIndex),
     ),
     status: options.stripLiveBindings && ["active", "starting"].includes(safeStatus) ? "idle" : safeStatus,
-    providerBindings: normalizedProviderBindings,
-    terminalBinding,
-    displayName: terminalNickname,
-    terminalName: terminalNickname,
-    terminalNickname,
-    terminalIndex,
+    provider_bindings: normalizedProviderBindings,
+    terminal_binding: terminalBinding,
+    display_name: terminalNickname,
+    terminal_name: terminalNickname,
+    terminal_nickname: terminalNickname,
+    terminal_index: terminalIndex,
     title: storedTitle || storedSessionName || fallbackTitle,
     transcriptHydratedAt: options.stripMessages ? "" : cleanText(thread.transcriptHydratedAt),
-    transcriptHydrationMode: options.stripMessages ? "" : cleanText(thread.transcriptHydrationMode),
+    transcript_hydration_mode: options.stripMessages ? "" : cleanText(thread.transcript_hydration_mode),
     transcriptLatestTimestamp: options.stripMessages ? "" : cleanText(thread.transcriptLatestTimestamp),
-    transcriptSessionId,
+    transcript_session_id: transcriptSessionId,
     transcriptSourcePath: options.stripMessages ? "" : cleanText(thread.transcriptSourcePath),
-    transcriptStatus: options.stripMessages ? "idle" : cleanText(thread.transcriptStatus, "idle"),
-    updatedAt,
-    workspaceId,
+    transcript_status: options.stripMessages ? "idle" : cleanText(thread.transcript_status, "idle"),
+    updated_at: updatedAt,
+    workspace_id: workspaceId,
   };
 }
 
@@ -4092,27 +3874,27 @@ function archiveThreadRecord(thread, archivedAt = nowIso()) {
     return null;
   }
 
-  const latestTurn = normalizeThreadLatestTurn(thread.latestTurn);
+  const latestTurn = normalizeThreadLatestTurn(thread.latest_turn);
   const archivedLatestTurn = latestTurn?.state === "running"
     ? normalizeThreadLatestTurn({
       ...latestTurn,
-      completedAt: archivedAt,
+      completed_at: archivedAt,
       state: "interrupted",
-      updatedAt: archivedAt,
+      updated_at: archivedAt,
     })
     : latestTurn;
   const providerBindings = normalizeProviderBindings(
-    thread.providerBindings,
-    thread.currentAgent,
+    thread.provider_bindings,
+    thread.current_agent,
     {
-      activityStatus: "idle",
+      activity_status: "idle",
       coordination: thread.coordination,
-      lastActiveAt: thread.lastActiveAt,
-      lastMessageAt: thread.lastMessageAt,
-      messageCount: thread.messageCount,
+      last_active_at: thread.last_active_at,
+      last_message_at: thread.last_message_at,
+      message_count: thread.message_count,
       status: "closed",
-      terminalBinding: null,
-      updatedAt: archivedAt,
+      terminal_binding: null,
+      updated_at: archivedAt,
     },
     { stripLiveBindings: true },
   );
@@ -4120,23 +3902,23 @@ function archiveThreadRecord(thread, archivedAt = nowIso()) {
   Object.keys(providerBindings).forEach((agentId) => {
     providerBindings[agentId] = {
       ...providerBindings[agentId],
-      activityStatus: "idle",
+      activity_status: "idle",
       status: "closed",
-      terminalBinding: null,
-      updatedAt: archivedAt,
+      terminal_binding: null,
+      updated_at: archivedAt,
     };
   });
 
   return {
     ...thread,
-    activityStatus: "idle",
+    activity_status: "idle",
     archivedAt: cleanText(thread.archivedAt, archivedAt),
-    latestTurn: archivedLatestTurn,
+    latest_turn: archivedLatestTurn,
     pinnedAt: "",
-    providerBindings,
+    provider_bindings: providerBindings,
     status: "closed",
-    terminalBinding: null,
-    updatedAt: archivedAt,
+    terminal_binding: null,
+    updated_at: archivedAt,
   };
 }
 
@@ -4147,9 +3929,9 @@ function setProviderBindingTerminalNickname(providerBinding, nickname) {
 
   return {
     ...providerBinding,
-    displayName: nickname,
-    terminalName: nickname,
-    terminalNickname: nickname,
+    display_name: nickname,
+    terminal_name: nickname,
+    terminal_nickname: nickname,
   };
 }
 
@@ -4165,9 +3947,9 @@ function applyWorkspaceTerminalNickname(entry, terminalKey, threadId, nickname) 
     if (workspaceTerminalNicknameFromRecord(terminal) !== safeNickname) {
       entry.terminals[terminalKey] = {
         ...terminal,
-        displayName: safeNickname,
-        terminalName: safeNickname,
-        terminalNickname: safeNickname,
+        display_name: safeNickname,
+        terminal_name: safeNickname,
+        terminal_nickname: safeNickname,
       };
       changed = true;
     }
@@ -4175,17 +3957,17 @@ function applyWorkspaceTerminalNickname(entry, terminalKey, threadId, nickname) 
 
   const thread = threadId ? entry.threads?.[threadId] : null;
   if (thread && workspaceTerminalNicknameFromRecord(thread) !== safeNickname) {
-    const agentId = cleanAgentId(thread.currentAgent, "");
-    const providerBindings = { ...(thread.providerBindings || {}) };
+    const agentId = cleanAgentId(thread.current_agent, "");
+    const providerBindings = { ...(thread.provider_bindings || {}) };
     if (isThreadAgentId(agentId) && providerBindings[agentId]) {
       providerBindings[agentId] = setProviderBindingTerminalNickname(providerBindings[agentId], safeNickname);
     }
     entry.threads[threadId] = {
       ...thread,
-      displayName: safeNickname,
-      providerBindings,
-      terminalName: safeNickname,
-      terminalNickname: safeNickname,
+      display_name: safeNickname,
+      provider_bindings: providerBindings,
+      terminal_name: safeNickname,
+      terminal_nickname: safeNickname,
     };
     changed = true;
   }
@@ -4195,8 +3977,8 @@ function applyWorkspaceTerminalNickname(entry, terminalKey, threadId, nickname) 
 
 function reconcileWorkspaceTerminalNicknames(entry) {
   const orderedKeys = [
-    ...entry.terminalOrder,
-    ...Object.keys(entry.terminalThreadIds || {}).sort((left, right) => Number(left) - Number(right)),
+    ...entry.terminal_order,
+    ...Object.keys(entry.terminal_thread_ids || {}).sort((left, right) => Number(left) - Number(right)),
     ...Object.keys(entry.terminals || {}).sort((left, right) => Number(left) - Number(right)),
   ].filter((key, index, keys) => key && keys.indexOf(key) === index);
   const used = new Set();
@@ -4214,12 +3996,12 @@ function reconcileWorkspaceTerminalNicknames(entry) {
 
   orderedKeys.forEach((terminalKey) => {
     const terminal = entry.terminals?.[terminalKey] || null;
-    const threadId = cleanText(terminal?.threadId || entry.terminalThreadIds?.[terminalKey]);
+    const threadId = cleanText(terminal?.thread_id || entry.terminal_thread_ids?.[terminalKey]);
     const thread = threadId ? entry.threads?.[threadId] : null;
     let nickname = terminalNicknameFromSources(
       workspaceTerminalNicknameFromRecord(terminal),
       workspaceTerminalNicknameFromRecord(thread),
-      workspaceTerminalNicknameFromRecord(getWorkspaceThreadProviderBinding(thread, thread?.currentAgent)),
+      workspaceTerminalNicknameFromRecord(getWorkspaceThreadProviderBinding(thread, thread?.current_agent)),
     );
     if (!nickname || used.has(terminalNicknameKey(nickname))) {
       nickname = pickUnused();
@@ -4315,7 +4097,7 @@ function markWorkspaceThreadsMutationResult(previousState, nextState, workspaceI
   const nextEntry = getWorkspaceThreadsStateObject(nextState)[safeWorkspaceId] || null;
   const changedIds = new Set();
   collectChangedWorkspaceThreadIds(previousEntry?.threads, nextEntry?.threads, changedIds);
-  collectChangedWorkspaceThreadIds(previousEntry?.archivedThreads, nextEntry?.archivedThreads, changedIds);
+  collectChangedWorkspaceThreadIds(previousEntry?.archived_threads, nextEntry?.archived_threads, changedIds);
   markWorkspaceThreadsPersistDirty(safeWorkspaceId, [...changedIds], { shell: true });
   return nextState;
 }
@@ -4365,7 +4147,7 @@ function workspaceThreadsDirtySnapshotHasMarks(snapshot) {
 
 export function getWorkspaceThreadsPersistDirtySnapshot(targets = []) {
   const targetIds = new Set((Array.isArray(targets) ? targets : [])
-    .map((target) => cleanText(target?.workspaceId || target?.id || target))
+    .map((target) => cleanText(target?.workspace_id || target?.id || target))
     .filter(Boolean));
   const workspaces = {};
   workspaceThreadsPersistDirtyMarks.forEach((record, workspaceId) => {
@@ -4425,11 +4207,11 @@ function normalizeThreadForPersist(thread, workspaceId, options) {
     return normalizeThread(thread, workspaceId, options);
   }
   const cached = persistThreadNormalizeCache.get(thread);
-  if (cached && cached.workspaceId === workspaceId) {
+  if (cached && cached.workspace_id === workspaceId) {
     return cached.normalized;
   }
   const normalized = normalizeThread(thread, workspaceId, options);
-  persistThreadNormalizeCache.set(thread, { normalized, workspaceId });
+  persistThreadNormalizeCache.set(thread, { normalized, workspace_id: workspaceId });
   return normalized;
 }
 
@@ -4437,14 +4219,14 @@ function normalizeWorkspaceEntry(entry, workspaceId, options = {}) {
   const threadsSource = entry?.threads && typeof entry.threads === "object" && !Array.isArray(entry.threads)
     ? entry.threads
     : {};
-  const archivedThreadsSource = entry?.archivedThreads
-    && typeof entry.archivedThreads === "object"
-    && !Array.isArray(entry.archivedThreads)
-    ? entry.archivedThreads
+  const archivedThreadsSource = entry?.archived_threads
+    && typeof entry.archived_threads === "object"
+    && !Array.isArray(entry.archived_threads)
+    ? entry.archived_threads
     : {};
-  const hasTerminalThreadIdsSource = entry?.terminalThreadIds
-    && typeof entry.terminalThreadIds === "object"
-    && !Array.isArray(entry.terminalThreadIds);
+  const hasTerminalThreadIdsSource = entry?.terminal_thread_ids
+    && typeof entry.terminal_thread_ids === "object"
+    && !Array.isArray(entry.terminal_thread_ids);
   const normalizedThreads = {};
   const normalizedOrder = [];
   const normalizedArchivedThreads = {};
@@ -4463,7 +4245,7 @@ function normalizeWorkspaceEntry(entry, workspaceId, options = {}) {
     const cacheable = isPersistNormalizeOptionSet(options) && thread && typeof thread === "object";
     if (cacheable) {
       const cached = persistThreadNormalizeCache.get(thread);
-      if (cached && cached.workspaceId === workspaceId && cached.archived) {
+      if (cached && cached.workspace_id === workspaceId && cached.archived) {
         archivedThread = cached.normalized;
       }
     }
@@ -4487,7 +4269,7 @@ function normalizeWorkspaceEntry(entry, workspaceId, options = {}) {
         persistThreadNormalizeCache.set(thread, {
           archived: true,
           normalized: archivedThread,
-          workspaceId,
+          workspace_id: workspaceId,
         });
       }
     }
@@ -4519,7 +4301,7 @@ function normalizeWorkspaceEntry(entry, workspaceId, options = {}) {
     normalizedThreads[normalizedThread.id] = normalizedThread;
   });
 
-  const sourceOrder = Array.isArray(entry?.threadOrder) ? entry.threadOrder : [];
+  const sourceOrder = Array.isArray(entry?.thread_order) ? entry.thread_order : [];
   sourceOrder.forEach((threadId) => {
     const safeThreadId = cleanText(threadId);
     if (safeThreadId && normalizedThreads[safeThreadId] && !normalizedOrder.includes(safeThreadId)) {
@@ -4533,7 +4315,7 @@ function normalizeWorkspaceEntry(entry, workspaceId, options = {}) {
     }
   });
 
-  const sourceArchivedOrder = Array.isArray(entry?.archivedThreadOrder) ? entry.archivedThreadOrder : [];
+  const sourceArchivedOrder = Array.isArray(entry?.archived_thread_order) ? entry.archived_thread_order : [];
   sourceArchivedOrder.forEach((threadId) => {
     const safeThreadId = cleanText(threadId);
     if (safeThreadId && normalizedArchivedThreads[safeThreadId] && !normalizedArchivedOrder.includes(safeThreadId)) {
@@ -4549,7 +4331,7 @@ function normalizeWorkspaceEntry(entry, workspaceId, options = {}) {
 
   Object.values(terminalSource).forEach((terminal) => {
     const normalizedTerminal = normalizeActiveTerminal(terminal);
-    const key = terminalSessionKey(normalizedTerminal?.terminalIndex);
+    const key = terminalSessionKey(normalizedTerminal?.terminal_index);
     if (!normalizedTerminal || !key || normalizedTerminals[key]) {
       return;
     }
@@ -4557,7 +4339,7 @@ function normalizeWorkspaceEntry(entry, workspaceId, options = {}) {
     normalizedTerminals[key] = normalizedTerminal;
   });
 
-  const sourceTerminalOrder = Array.isArray(entry?.terminalOrder) ? entry.terminalOrder : [];
+  const sourceTerminalOrder = Array.isArray(entry?.terminal_order) ? entry.terminal_order : [];
   sourceTerminalOrder.forEach((terminalIndex) => {
     const key = terminalSessionKey(terminalIndex);
     if (key && normalizedTerminals[key] && !normalizedTerminalOrder.includes(key)) {
@@ -4573,12 +4355,12 @@ function normalizeWorkspaceEntry(entry, workspaceId, options = {}) {
       }
     });
 
-  const normalizedTerminalThreadIds = normalizeTerminalThreadIds(entry?.terminalThreadIds, normalizedThreads);
+  const normalizedTerminalThreadIds = normalizeTerminalThreadIds(entry?.terminal_thread_ids, normalizedThreads);
 
   Object.values(normalizedTerminals).forEach((terminal) => {
-    const key = terminalSessionKey(terminal?.terminalIndex);
-    if (key && terminal?.threadId && normalizedThreads[terminal.threadId]) {
-      normalizedTerminalThreadIds[key] = terminal.threadId;
+    const key = terminalSessionKey(terminal?.terminal_index);
+    if (key && terminal?.thread_id && normalizedThreads[terminal.thread_id]) {
+      normalizedTerminalThreadIds[key] = terminal.thread_id;
     }
   });
 
@@ -4593,31 +4375,31 @@ function normalizeWorkspaceEntry(entry, workspaceId, options = {}) {
       });
   }
 
-  const activeThreadId = cleanText(entry?.activeThreadId);
+  const activeThreadId = cleanText(entry?.active_thread_id);
   const safeActiveThreadId = normalizedThreads[activeThreadId]
     ? activeThreadId
     : normalizedOrder[0] || "";
-  const threadsView = normalizeThreadsViewState(entry?.threadsView, {
+  const threadsView = normalizeThreadsViewState(entry?.threads_view, {
     selectedThreadId: safeActiveThreadId,
-    selectedWorkspaceId: workspaceId,
+    selected_workspace_id: workspaceId,
   });
   if (threadsView.selectedThreadId && !normalizedThreads[threadsView.selectedThreadId]) {
     threadsView.selectedThreadId = safeActiveThreadId;
   }
-  if (!threadsView.selectedWorkspaceId) {
-    threadsView.selectedWorkspaceId = workspaceId;
+  if (!threadsView.selected_workspace_id) {
+    threadsView.selected_workspace_id = workspaceId;
   }
 
   return reconcileWorkspaceTerminalNicknames({
-    activeThreadId: safeActiveThreadId,
-    archivedThreadOrder: normalizedArchivedOrder,
-    archivedThreads: normalizedArchivedThreads,
-    terminalOrder: normalizedTerminalOrder,
-    terminalThreadIds: normalizedTerminalThreadIds,
+    active_thread_id: safeActiveThreadId,
+    archived_thread_order: normalizedArchivedOrder,
+    archived_threads: normalizedArchivedThreads,
+    terminal_order: normalizedTerminalOrder,
+    terminal_thread_ids: normalizedTerminalThreadIds,
     terminals: normalizedTerminals,
-    threadOrder: normalizedOrder.slice(0, MAX_THREADS_PER_WORKSPACE),
+    thread_order: normalizedOrder.slice(0, MAX_THREADS_PER_WORKSPACE),
     threads: normalizedThreads,
-    threadsView,
+    threads_view: threadsView,
   });
 }
 
@@ -4641,11 +4423,11 @@ export function normalizeWorkspaceThreads(value, options = {}) {
         // its threads.
         if (persistCacheable && entry && typeof entry === "object") {
           const cached = persistEntryNormalizeCache.get(entry);
-          if (cached && cached.workspaceId === safeWorkspaceId) {
+          if (cached && cached.workspace_id === safeWorkspaceId) {
             return [safeWorkspaceId, cached.normalized];
           }
           const normalized = normalizeWorkspaceEntry(entry, safeWorkspaceId, options);
-          persistEntryNormalizeCache.set(entry, { normalized, workspaceId: safeWorkspaceId });
+          persistEntryNormalizeCache.set(entry, { normalized, workspace_id: safeWorkspaceId });
           return [safeWorkspaceId, normalized];
         }
 
@@ -4683,20 +4465,20 @@ function cloneRecord(value) {
 
 function cloneWorkspaceEntryForMutation(entry, workspaceId) {
   const source = entry && typeof entry === "object" && !Array.isArray(entry) ? entry : {};
-  const activeThreadId = cleanText(source.activeThreadId);
+  const activeThreadId = cleanText(source.active_thread_id);
   return {
-    activeThreadId,
-    archivedThreadOrder: Array.isArray(source.archivedThreadOrder) ? source.archivedThreadOrder.slice() : [],
-    archivedThreads: cloneRecord(source.archivedThreads),
-    terminalOrder: Array.isArray(source.terminalOrder) ? source.terminalOrder.slice() : [],
-    terminalThreadIds: cloneRecord(source.terminalThreadIds),
+    active_thread_id: activeThreadId,
+    archived_thread_order: Array.isArray(source.archived_thread_order) ? source.archived_thread_order.slice() : [],
+    archived_threads: cloneRecord(source.archived_threads),
+    terminal_order: Array.isArray(source.terminal_order) ? source.terminal_order.slice() : [],
+    terminal_thread_ids: cloneRecord(source.terminal_thread_ids),
     terminals: cloneRecord(source.terminals),
-    threadOrder: Array.isArray(source.threadOrder) ? source.threadOrder.slice() : [],
+    thread_order: Array.isArray(source.thread_order) ? source.thread_order.slice() : [],
     threads: cloneRecord(source.threads),
-    threadsView: {
-      ...normalizeThreadsViewState(source.threadsView, {
+    threads_view: {
+      ...normalizeThreadsViewState(source.threads_view, {
         selectedThreadId: activeThreadId,
-        selectedWorkspaceId: workspaceId,
+        selected_workspace_id: workspaceId,
       }),
     },
   };
@@ -4726,7 +4508,7 @@ export function mergeHydratedWorkspaceThreads(currentThreads, loadedThreads, opt
   const targetEntries = Array.isArray(options.targets) ? options.targets : [];
   const targetIds = new Set(
     targetEntries
-      .map((target) => cleanText(target?.workspaceId || target?.id || target))
+      .map((target) => cleanText(target?.workspace_id || target?.id || target))
       .filter(Boolean),
   );
   if (!targetIds.size) {
@@ -4747,7 +4529,7 @@ export function mergeHydratedWorkspaceThreads(currentThreads, loadedThreads, opt
   });
 
   targetEntries.forEach((target) => {
-    const workspaceId = cleanText(target?.workspaceId || target?.id || target);
+    const workspaceId = cleanText(target?.workspace_id || target?.id || target);
     if (!workspaceId || !loadedState[workspaceId]) {
       return;
     }
@@ -4768,7 +4550,7 @@ function workspaceThreadsPersistShell(entry) {
   }
 
   const {
-    archivedThreads: _archivedThreads,
+    archived_threads: _archivedThreads,
     threads: _threads,
     ...shell
   } = entry;
@@ -4788,9 +4570,7 @@ function workspaceThreadsJsonEqual(left, right) {
 
 const WORKSPACE_THREAD_ACTIVITY_STAMP_THROTTLE_MS = 1000;
 const WORKSPACE_THREAD_ACTIVITY_STAMP_KEYS = new Set([
-  "hookHealthObservedAtMs",
   "hook_health_observed_at_ms",
-  "updatedAt",
   "updated_at",
 ]);
 
@@ -4820,8 +4600,8 @@ function workspaceThreadActivityStampMs(value) {
   if (!value || typeof value !== "object") {
     return 0;
   }
-  const updatedAtMs = Date.parse(value.updatedAt || value.updated_at || "");
-  const hookObservedAtMs = Number(value.hookHealthObservedAtMs || value.hook_health_observed_at_ms || 0);
+  const updatedAtMs = Date.parse(value.updated_at || "");
+  const hookObservedAtMs = Number(value.hook_health_observed_at_ms || 0);
   return Math.max(
     Number.isFinite(updatedAtMs) ? updatedAtMs : 0,
     Number.isFinite(hookObservedAtMs) ? hookObservedAtMs : 0,
@@ -4851,7 +4631,7 @@ function workspaceThreadPersistRows(currentRows, previousRows) {
     }
     rows.push({
       state: thread,
-      threadId: safeThreadId,
+      thread_id: safeThreadId,
     });
   });
   return rows;
@@ -4870,7 +4650,7 @@ function workspaceThreadPersistRowsForIds(currentRows, previousRows, threadIds) 
     }
     rows.push({
       state: thread,
-      threadId,
+      thread_id: threadId,
     });
   });
   return rows;
@@ -4895,11 +4675,11 @@ function buildWorkspaceThreadsPersistDeltaByIdentityDiff(threads, previousPersis
     : {};
   const targetEntries = Array.isArray(targets) && targets.length
     ? targets
-    : Object.keys(normalizedThreads).map((workspaceId) => ({ workspaceId }));
+    : Object.keys(normalizedThreads).map((workspaceId) => ({ workspace_id: workspaceId }));
 
   const workspaces = targetEntries
     .map((target) => {
-      const workspaceId = cleanText(target?.workspaceId || target?.id || target);
+      const workspaceId = cleanText(target?.workspace_id || target?.id || target);
       if (!workspaceId || !normalizedThreads[workspaceId]) {
         return null;
       }
@@ -4914,8 +4694,8 @@ function buildWorkspaceThreadsPersistDeltaByIdentityDiff(threads, previousPersis
       const shell = workspaceThreadsPersistShell(currentEntry);
       const previousShell = workspaceThreadsPersistShell(previousEntry);
       const delta = {
-        rootDirectory: cleanText(target?.rootDirectory),
-        workspaceId,
+        root_directory: cleanText(target?.root_directory),
+        workspace_id: workspaceId,
       };
       let changed = false;
 
@@ -4931,26 +4711,26 @@ function buildWorkspaceThreadsPersistDeltaByIdentityDiff(threads, previousPersis
       }
 
       const changedArchivedThreads = workspaceThreadPersistRows(
-        currentEntry.archivedThreads,
-        previousEntry?.archivedThreads,
+        currentEntry.archived_threads,
+        previousEntry?.archived_threads,
       );
       if (changedArchivedThreads.length) {
-        delta.archivedThreads = changedArchivedThreads;
+        delta.archived_threads = changedArchivedThreads;
         changed = true;
       }
 
       const removedThreadIds = workspaceThreadRemovedIds(currentEntry.threads, previousEntry?.threads);
       if (removedThreadIds.length) {
-        delta.removedThreadIds = removedThreadIds;
+        delta.removed_thread_ids = removedThreadIds;
         changed = true;
       }
 
       const removedArchivedThreadIds = workspaceThreadRemovedIds(
-        currentEntry.archivedThreads,
-        previousEntry?.archivedThreads,
+        currentEntry.archived_threads,
+        previousEntry?.archived_threads,
       );
       if (removedArchivedThreadIds.length) {
-        delta.removedArchivedThreadIds = removedArchivedThreadIds;
+        delta.removed_archived_thread_ids = removedArchivedThreadIds;
         changed = true;
       }
 
@@ -4981,11 +4761,11 @@ function buildWorkspaceThreadsPersistDeltaFromDirtySet(
   const normalizedThreads = { ...previousThreads };
   const targetEntries = Array.isArray(targets) && targets.length
     ? targets
-    : Object.keys(currentThreads).map((workspaceId) => ({ workspaceId }));
+    : Object.keys(currentThreads).map((workspaceId) => ({ workspace_id: workspaceId }));
 
   const workspaces = targetEntries
     .map((target) => {
-      const workspaceId = cleanText(target?.workspaceId || target?.id || target);
+      const workspaceId = cleanText(target?.workspace_id || target?.id || target);
       const sourceEntry = workspaceId ? currentThreads[workspaceId] : null;
       if (!workspaceId || !sourceEntry || typeof sourceEntry !== "object" || Array.isArray(sourceEntry)) {
         return null;
@@ -4996,8 +4776,8 @@ function buildWorkspaceThreadsPersistDeltaFromDirtySet(
       const dirtyThreadIds = new Set(Object.keys(dirtyRecord?.threadVersions || {}));
       const rawRemovedThreadIds = workspaceThreadRemovedIds(sourceEntry.threads, previousEntry?.threads);
       const rawRemovedArchivedThreadIds = workspaceThreadRemovedIds(
-        sourceEntry.archivedThreads,
-        previousEntry?.archivedThreads,
+        sourceEntry.archived_threads,
+        previousEntry?.archived_threads,
       );
       const isFullWorkspaceWrite = !previousEntry;
       if (
@@ -5017,15 +4797,15 @@ function buildWorkspaceThreadsPersistDeltaFromDirtySet(
 
       const removedThreadIds = workspaceThreadRemovedIds(currentEntry.threads, previousEntry?.threads);
       const removedArchivedThreadIds = workspaceThreadRemovedIds(
-        currentEntry.archivedThreads,
-        previousEntry?.archivedThreads,
+        currentEntry.archived_threads,
+        previousEntry?.archived_threads,
       );
 
       const shell = workspaceThreadsPersistShell(currentEntry);
       const previousShell = workspaceThreadsPersistShell(previousEntry);
       const delta = {
-        rootDirectory: cleanText(target?.rootDirectory),
-        workspaceId,
+        root_directory: cleanText(target?.root_directory),
+        workspace_id: workspaceId,
       };
       let changed = false;
 
@@ -5043,24 +4823,24 @@ function buildWorkspaceThreadsPersistDeltaFromDirtySet(
       }
 
       const changedArchivedThreads = isFullWorkspaceWrite
-        ? workspaceThreadPersistRows(currentEntry.archivedThreads, previousEntry?.archivedThreads)
+        ? workspaceThreadPersistRows(currentEntry.archived_threads, previousEntry?.archived_threads)
         : workspaceThreadPersistRowsForIds(
-          currentEntry.archivedThreads,
-          previousEntry?.archivedThreads,
+          currentEntry.archived_threads,
+          previousEntry?.archived_threads,
           dirtyThreadIds,
         );
       if (changedArchivedThreads.length) {
-        delta.archivedThreads = changedArchivedThreads;
+        delta.archived_threads = changedArchivedThreads;
         changed = true;
       }
 
       if (removedThreadIds.length) {
-        delta.removedThreadIds = removedThreadIds;
+        delta.removed_thread_ids = removedThreadIds;
         changed = true;
       }
 
       if (removedArchivedThreadIds.length) {
-        delta.removedArchivedThreadIds = removedArchivedThreadIds;
+        delta.removed_archived_thread_ids = removedArchivedThreadIds;
         changed = true;
       }
 
@@ -5108,26 +4888,26 @@ export function clearWorkspaceThreadsBrowserPersistence() {
 function ensureWorkspaceEntry(state, workspaceId) {
   const existing = normalizeWorkspaceEntry(state?.[workspaceId], workspaceId);
   return {
-    activeThreadId: existing.activeThreadId,
-    archivedThreadOrder: existing.archivedThreadOrder.slice(),
-    archivedThreads: { ...existing.archivedThreads },
-    terminalOrder: existing.terminalOrder.slice(),
-    terminalThreadIds: { ...existing.terminalThreadIds },
+    active_thread_id: existing.active_thread_id,
+    archived_thread_order: existing.archived_thread_order.slice(),
+    archived_threads: { ...existing.archived_threads },
+    terminal_order: existing.terminal_order.slice(),
+    terminal_thread_ids: { ...existing.terminal_thread_ids },
     terminals: { ...existing.terminals },
-    threadOrder: existing.threadOrder.slice(),
+    thread_order: existing.thread_order.slice(),
     threads: { ...existing.threads },
-    threadsView: { ...existing.threadsView },
+    threads_view: { ...existing.threads_view },
   };
 }
 
 export function ensureWorkspaceThreadsForTerminalIndexes(state, options = {}) {
-  const workspaceId = cleanText(options.workspaceId);
+  const workspaceId = cleanText(options.workspace_id);
   if (!workspaceId) {
     return state || {};
   }
 
-  const terminalIndexes = Array.isArray(options.terminalIndexes)
-    ? options.terminalIndexes.map(normalizeTerminalIndex).filter((index) => index != null)
+  const terminalIndexes = Array.isArray(options.terminal_indexes)
+    ? options.terminal_indexes.map(normalizeTerminalIndex).filter((index) => index != null)
     : [];
   const rolesByIndex = options.rolesByIndex || {};
   const fallbackAgent = cleanAgentId(options.fallbackAgent, DEFAULT_AGENT_ID);
@@ -5141,89 +4921,89 @@ export function ensureWorkspaceThreadsForTerminalIndexes(state, options = {}) {
     const role = cleanAgentId(rolesByIndex[terminalIndex], fallbackAgent);
     const now = nowIso();
 
-    if (existingTerminal && !existingTerminal.threadId && isThreadAgentId(existingTerminal.agentId || role)) {
-      const agentId = cleanAgentId(existingTerminal.agentId || role);
+    if (existingTerminal && !existingTerminal.thread_id && isThreadAgentId(existingTerminal.agent_id || role)) {
+      const agentId = cleanAgentId(existingTerminal.agent_id || role);
       const threadId = createThreadIdForTerminal(workspaceId, terminalIndex);
       entry.threads[threadId] = {
         coordination: normalizeCoordination({
-          worktreePath: existingTerminal.worktreePath,
+          worktree_path: existingTerminal.worktree_path,
         }),
-        createdAt: now,
-        currentAgent: agentId,
+        created_at: now,
+        current_agent: agentId,
         id: threadId,
-        lastActiveAt: now,
-        lastMessageAt: "",
-        latestTurn: null,
+        last_active_at: now,
+        last_message_at: "",
+        latest_turn: null,
         materialized: true,
-        messageCount: 0,
+        message_count: 0,
         messages: [],
-        pendingPrompt: null,
-        projectionEvents: [],
-        preferredAgent: agentId,
-        providerBindings: {
+        pending_prompt: null,
+        projection_events: [],
+        preferred_agent: agentId,
+        provider_bindings: {
           [agentId]: normalizeProviderBinding(null, agentId, {
-            activityStatus: "idle",
-            lastActiveAt: now,
-            messageCount: 0,
+            activity_status: "idle",
+            last_active_at: now,
+            message_count: 0,
             status: existingTerminal.status || "active",
-            terminalBinding: normalizeTerminalBinding({
-              instanceId: existingTerminal.instanceId,
-              paneId: existingTerminal.paneId,
-              terminalIndex,
+            terminal_binding: normalizeTerminalBinding({
+              instance_id: existingTerminal.instance_id,
+              pane_id: existingTerminal.pane_id,
+              terminal_index: terminalIndex,
             }),
-            updatedAt: now,
+            updated_at: now,
           }),
         },
-        sessionName: defaultThreadTitle(terminalIndex, agentId),
-        slotKey: existingTerminal.slotKey || defaultSlotKey(terminalIndex),
+        session_name: defaultThreadTitle(terminalIndex, agentId),
+        slot_key: existingTerminal.slot_key || defaultSlotKey(terminalIndex),
         status: existingTerminal.status || "active",
-        terminalBinding: normalizeTerminalBinding({
-          instanceId: existingTerminal.instanceId,
-          paneId: existingTerminal.paneId,
-          terminalIndex,
+        terminal_binding: normalizeTerminalBinding({
+          instance_id: existingTerminal.instance_id,
+          pane_id: existingTerminal.pane_id,
+          terminal_index: terminalIndex,
         }),
-        terminalIndex,
+        terminal_index: terminalIndex,
         title: defaultThreadTitle(terminalIndex, agentId),
-        updatedAt: now,
-        workspaceId,
+        updated_at: now,
+        workspace_id: workspaceId,
       };
-      entry.threadOrder.push(threadId);
+      entry.thread_order.push(threadId);
       bindExistingThreadToTerminal(entry, threadId, {
-        agentId,
-        instanceId: existingTerminal.instanceId,
-        paneId: existingTerminal.paneId,
-        slotKey: existingTerminal.slotKey,
+        agent_id: agentId,
+        instance_id: existingTerminal.instance_id,
+        pane_id: existingTerminal.pane_id,
+        slot_key: existingTerminal.slot_key,
         status: existingTerminal.status || "active",
-        terminalIndex,
-        workspaceId,
-        worktreePath: existingTerminal.worktreePath,
+        terminal_index: terminalIndex,
+        workspace_id: workspaceId,
+        worktree_path: existingTerminal.worktree_path,
       }, { status: existingTerminal.status || "active" });
       changed = true;
       return;
     }
 
-    if (existingTerminal && existingTerminal.agentId !== role && existingTerminal.status !== "active") {
+    if (existingTerminal && existingTerminal.agent_id !== role && existingTerminal.status !== "active") {
       entry.terminals[terminalKey] = {
         ...existingTerminal,
-        agentId: role,
-        updatedAt: now,
+        agent_id: role,
+        updated_at: now,
       };
       changed = true;
       return;
     }
   });
 
-  entry.threadOrder = entry.threadOrder.filter((threadId, index, order) => (
+  entry.thread_order = entry.thread_order.filter((threadId, index, order) => (
     entry.threads[threadId] && order.indexOf(threadId) === index
   ));
-  entry.terminalOrder = entry.terminalOrder.filter((terminalKey, index, order) => (
+  entry.terminal_order = entry.terminal_order.filter((terminalKey, index, order) => (
     entry.terminals[terminalKey] && order.indexOf(terminalKey) === index
   ));
 
-  if (!entry.activeThreadId || !entry.threads[entry.activeThreadId]) {
-    const nextActiveThreadId = entry.threadOrder[0] || "";
-    if (entry.activeThreadId !== nextActiveThreadId) {
-      entry.activeThreadId = nextActiveThreadId;
+  if (!entry.active_thread_id || !entry.threads[entry.active_thread_id]) {
+    const nextActiveThreadId = entry.thread_order[0] || "";
+    if (entry.active_thread_id !== nextActiveThreadId) {
+      entry.active_thread_id = nextActiveThreadId;
       changed = true;
     }
   }
@@ -5256,22 +5036,22 @@ export function selectWorkspaceThread(state, workspaceId, threadId) {
   const thread = entry.threads[safeThreadId];
   const restoreChanged = rememberTerminalThread(entry, getThreadTerminalIndex(thread), safeThreadId);
   const nextThreadsView = {
-    ...normalizeThreadsViewState(entry.threadsView, {
-      selectedThreadId: entry.activeThreadId,
-      selectedWorkspaceId: safeWorkspaceId,
+    ...normalizeThreadsViewState(entry.threads_view, {
+      selectedThreadId: entry.active_thread_id,
+      selected_workspace_id: safeWorkspaceId,
     }),
     newChatActive: false,
     selectedThreadId: safeThreadId,
-    selectedWorkspaceId: safeWorkspaceId,
+    selected_workspace_id: safeWorkspaceId,
   };
-  const viewChanged = JSON.stringify(entry.threadsView || {}) !== JSON.stringify(nextThreadsView);
+  const viewChanged = JSON.stringify(entry.threads_view || {}) !== JSON.stringify(nextThreadsView);
 
-  if (entry.activeThreadId === safeThreadId && !restoreChanged && !viewChanged) {
+  if (entry.active_thread_id === safeThreadId && !restoreChanged && !viewChanged) {
     return state || {};
   }
 
-  entry.activeThreadId = safeThreadId;
-  entry.threadsView = nextThreadsView;
+  entry.active_thread_id = safeThreadId;
+  entry.threads_view = nextThreadsView;
 
   return markWorkspaceThreadsMutationResult(state, {
     ...currentState,
@@ -5280,7 +5060,7 @@ export function selectWorkspaceThread(state, workspaceId, threadId) {
 }
 
 export function updateWorkspaceThreadsViewState(state, workspaceId, patch = {}) {
-  const safeWorkspaceId = cleanText(workspaceId || patch.workspaceId || patch.selectedWorkspaceId);
+  const safeWorkspaceId = cleanText(workspaceId || patch.workspace_id || patch.selected_workspace_id);
   if (!safeWorkspaceId) {
     return state || {};
   }
@@ -5292,11 +5072,11 @@ export function updateWorkspaceThreadsViewState(state, workspaceId, patch = {}) 
     return state || {};
   }
 
-  const existingView = normalizeThreadsViewState(entry.threadsView, {
-    selectedThreadId: entry.activeThreadId,
-    selectedWorkspaceId: safeWorkspaceId,
+  const existingView = normalizeThreadsViewState(entry.threads_view, {
+    selectedThreadId: entry.active_thread_id,
+    selected_workspace_id: safeWorkspaceId,
   });
-  const requestedThreadId = cleanText(patch.selectedThreadId || patch.threadId);
+  const requestedThreadId = cleanText(patch.selectedThreadId || patch.thread_id);
   const selectedThreadId = requestedThreadId && entry.threads[requestedThreadId]
     ? requestedThreadId
     : requestedThreadId
@@ -5310,15 +5090,15 @@ export function updateWorkspaceThreadsViewState(state, workspaceId, patch = {}) 
     railCollapsed: typeof patch.railCollapsed === "boolean"
       ? patch.railCollapsed
       : existingView.railCollapsed,
-    selectedThreadId: selectedThreadId || entry.activeThreadId || "",
-    selectedWorkspaceId: cleanText(patch.selectedWorkspaceId || safeWorkspaceId, existingView.selectedWorkspaceId || safeWorkspaceId),
+    selectedThreadId: selectedThreadId || entry.active_thread_id || "",
+    selected_workspace_id: cleanText(patch.selected_workspace_id || safeWorkspaceId, existingView.selected_workspace_id || safeWorkspaceId),
   };
 
   if (JSON.stringify(existingView) === JSON.stringify(nextView)) {
     return state || {};
   }
 
-  entry.threadsView = nextView;
+  entry.threads_view = nextView;
   return markWorkspaceThreadsMutationResult(state, {
     ...currentState,
     [safeWorkspaceId]: entry,
@@ -5326,54 +5106,54 @@ export function updateWorkspaceThreadsViewState(state, workspaceId, patch = {}) 
 }
 
 function getTerminalKeyForEvent(entry, event = {}) {
-  const directKey = terminalSessionKey(event.terminalIndex);
+  const directKey = terminalSessionKey(event.terminal_index);
   if (directKey) {
     return directKey;
   }
 
-  const paneId = cleanText(event.paneId);
-  const instanceId = Number.parseInt(event.instanceId, 10);
-  const threadId = cleanText(event.threadId);
+  const paneId = cleanText(event.pane_id);
+  const instanceId = Number.parseInt(event.instance_id, 10);
+  const threadId = cleanText(event.thread_id);
 
   return Object.entries(entry.terminals).find(([, terminal]) => (
-    (paneId && terminal.paneId === paneId)
-    || (Number.isInteger(instanceId) && instanceId > 0 && terminal.instanceId === instanceId)
-    || (threadId && terminal.threadId === threadId)
+    (paneId && terminal.pane_id === paneId)
+    || (Number.isInteger(instanceId) && instanceId > 0 && terminal.instance_id === instanceId)
+    || (threadId && terminal.thread_id === threadId)
   ))?.[0] || "";
 }
 
 function upsertActiveTerminal(entry, event = {}, options = {}) {
-  const terminalIndex = normalizeTerminalIndex(event.terminalIndex);
+  const terminalIndex = normalizeTerminalIndex(event.terminal_index);
   const key = terminalSessionKey(terminalIndex);
   if (!key) {
     return null;
   }
 
   const existing = entry.terminals[key] || {};
-  const nextThreadId = cleanText(options.threadId ?? event.threadId ?? existing.threadId);
-  const displacedThreadId = cleanText(existing.threadId);
+  const nextThreadId = cleanText(options.thread_id ?? event.thread_id ?? existing.thread_id);
+  const displacedThreadId = cleanText(existing.thread_id);
   if (nextThreadId && displacedThreadId && displacedThreadId !== nextThreadId) {
     detachThreadFromTerminalBinding(entry, displacedThreadId, {
-      agentId: existing.agentId || event.agentId || event.currentAgent,
-      currentAgent: existing.agentId || event.currentAgent || event.agentId,
-      instanceId: existing.instanceId,
-      paneId: existing.paneId,
+      agent_id: existing.agent_id || event.agent_id || event.current_agent,
+      current_agent: existing.agent_id || event.current_agent || event.agent_id,
+      instance_id: existing.instance_id,
+      pane_id: existing.pane_id,
       status: "closed",
-      terminalIndex,
-      threadId: displacedThreadId,
-      workspaceId: event.workspaceId,
+      terminal_index: terminalIndex,
+      thread_id: displacedThreadId,
+      workspace_id: event.workspace_id,
     });
   }
   const now = nowIso();
   const eventType = cleanText(event.type).toLowerCase();
-  const eventActivityStatus = normalizeThreadActivityStatus(event.activityStatus, "");
-  const explicitInputReady = typeof event.inputReady === "boolean" ? event.inputReady : null;
-  const eventInstanceId = Number.parseInt(event.instanceId, 10);
+  const eventActivityStatus = normalizeThreadActivityStatus(event.activity_status, "");
+  const explicitInputReady = typeof event.input_ready === "boolean" ? event.input_ready : null;
+  const eventInstanceId = Number.parseInt(event.instance_id, 10);
   const openedExistingReadyInstance = eventType === "opened"
-    && Boolean(existing.inputReady)
+    && Boolean(existing.input_ready)
     && Number.isInteger(eventInstanceId)
     && eventInstanceId > 0
-    && Number(existing.instanceId) === eventInstanceId;
+    && Number(existing.instance_id) === eventInstanceId;
   const terminalReadinessIgnoredEvent = eventType === "terminal-input-ready"
     || eventType === "terminal-prompt-ready";
   const marksInputReady = !terminalReadinessIgnoredEvent && (explicitInputReady === true
@@ -5389,60 +5169,45 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
     ? true
     : marksInputBusy
       ? false
-      : Boolean(existing.inputReady);
+      : Boolean(existing.input_ready);
   const inputReadyAt = inputReady
-    ? cleanText(event.inputReadyAt, existing.inputReadyAt || now)
+    ? cleanText(event.input_ready_at, existing.input_ready_at || now)
     : "";
   const inputReadyConfidence = inputReady
-    ? cleanText(event.inputReadyConfidence, existing.inputReadyConfidence)
+    ? cleanText(event.input_ready_confidence, existing.input_ready_confidence)
     : "";
   const terminalPromptingFields = promptingUserFieldsForTerminalEvent(event, existing, {
     clear: terminalReadinessIgnoredEvent ? false : marksInputBusy || marksInputReady,
-    eventType,
+    event_type: eventType,
   });
   const agentType = cleanAgentDisplayName(
-    event.agentType || event.agent_type,
-    existing.agentType || existing.agent_type,
+    event.agent_type,
+    existing.agent_type,
   );
   const agentDisplayName = cleanAgentDisplayName(
-    event.agentDisplayName || event.agent_display_name || agentType,
-    existing.agentDisplayName || existing.agent_display_name,
+    event.agent_display_name || agentType,
+    existing.agent_display_name,
   );
   const eventProviderSessionId = cleanText(
-    event.providerSessionId
-      || event.provider_session_id
-      || event.nativeSessionId
-      || event.native_session_id,
+    event.provider_session_id || event.native_session_id,
   );
-  const eventSessionId = cleanText(event.sessionId || event.session_id);
+  const eventSessionId = cleanText(event.session_id);
   const eventForkFromProviderSessionId = cleanText(
-    event.forkFromProviderSessionId
-      || event.fork_from_provider_session_id
-      || event.forkedFromProviderSessionId
-      || event.forked_from_provider_session_id
-      || event.parentProviderSessionId
-      || event.parent_provider_session_id,
+    event.fork_from_provider_session_id || event.forked_from_provider_session_id || event.parent_provider_session_id,
   );
-  const eventSharedHistoryId = cleanText(event.sharedHistoryId || event.shared_history_id || event.historyGroupId || event.history_group_id);
+  const eventSharedHistoryId = cleanText(event.shared_history_id || event.history_group_id);
   const eventRelatedProviderSessionIds = cleanTextArray(
-    event.relatedProviderSessionIds,
     event.related_provider_session_ids,
-    event.relatedSessionIds,
     event.related_session_ids,
   );
-  const sessionIdentityCleared = event.providerSessionIdCleared === true
-    || event.provider_session_id_cleared === true
-    || event.nativeSessionIdCleared === true
-    || event.native_session_id_cleared === true
-    || event.sessionIdCleared === true
-    || event.session_id_cleared === true;
+  const sessionIdentityCleared = event.provider_session_id_cleared === true || event.native_session_id_cleared === true || event.session_id_cleared === true;
   const openedNewTerminalGeneration = eventType === "opened"
     && !openedExistingReadyInstance
     && (
       (
         Number.isInteger(eventInstanceId)
         && eventInstanceId > 0
-        && Number(existing.instanceId || 0) !== eventInstanceId
+        && Number(existing.instance_id || 0) !== eventInstanceId
       )
       || (
         nextThreadId
@@ -5455,16 +5220,13 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
   const terminalNickname = resolveWorkspaceTerminalNickname(
     entry,
     [
-      event.terminalNickname,
       event.terminal_nickname,
-      event.terminalName,
       event.terminal_name,
-      event.displayName,
       event.display_name,
       workspaceTerminalNicknameFromRecord(entry.threads?.[nextThreadId]),
       workspaceTerminalNicknameFromRecord(getWorkspaceThreadProviderBinding(
         entry.threads?.[nextThreadId],
-        entry.threads?.[nextThreadId]?.currentAgent || event.agentId || event.currentAgent,
+        entry.threads?.[nextThreadId]?.current_agent || event.agent_id || event.current_agent,
       )),
       workspaceTerminalNicknameFromRecord(existing),
     ],
@@ -5474,71 +5236,50 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
     },
   );
   const terminal = normalizeActiveTerminal({
-    activityStatus: eventActivityStatus || existing.activityStatus || "",
-    agentId: event.agentId || event.currentAgent || existing.agentId,
-    agentDisplayName,
-    agentType,
-    commandPhase: event.commandPhase || event.command_phase || existing.commandPhase || existing.command_phase,
-    displayName: terminalNickname,
-    executionPhase: event.executionPhase || event.execution_phase || existing.executionPhase || existing.execution_phase,
-    forkFromProviderSessionId: clearSessionIdentity && !eventForkFromProviderSessionId
+    activity_status: eventActivityStatus || existing.activity_status || "",
+    agent_id: event.agent_id || event.current_agent || existing.agent_id,
+    agent_display_name: agentDisplayName,
+    agent_type: agentType,
+    command_phase: event.command_phase || existing.command_phase,
+    display_name: terminalNickname,
+    execution_phase: event.execution_phase || existing.execution_phase,
+    fork_from_provider_session_id: clearSessionIdentity && !eventForkFromProviderSessionId
       ? ""
-      : eventForkFromProviderSessionId
-        || existing.forkFromProviderSessionId
-        || existing.fork_from_provider_session_id,
-    inputReady,
-    inputReadyAt,
-    inputReadyConfidence,
+      : eventForkFromProviderSessionId || existing.fork_from_provider_session_id,
+    input_ready: inputReady,
+    input_ready_at: inputReadyAt,
+    input_ready_confidence: inputReadyConfidence,
     ...hookHealthFields(event, existing),
-    instanceId: event.instanceId ?? existing.instanceId,
-    lastActiveAt: now,
-    paneId: event.paneId || existing.paneId,
+    instance_id: event.instance_id ?? existing.instance_id,
+    last_active_at: now,
+    pane_id: event.pane_id || existing.pane_id,
     ...terminalPromptingFields,
-    nativeRailState: event.nativeRailState || event.native_rail_state || existing.nativeRailState || existing.native_rail_state,
+    native_rail_state: event.native_rail_state || existing.native_rail_state,
     provider: event.provider || existing.provider,
-    providerSessionId: clearSessionIdentity
+    provider_session_id: clearSessionIdentity
       ? ""
-      : event.providerSessionId
-        || event.provider_session_id
-        || event.nativeSessionId
-        || event.native_session_id
-        || existing.providerSessionId
-        || existing.provider_session_id,
-    nativeSessionId: clearSessionIdentity
+      : event.provider_session_id || event.native_session_id || existing.provider_session_id,
+    native_session_id: clearSessionIdentity
       ? ""
-      : event.nativeSessionId
-        || event.native_session_id
-        || event.providerSessionId
-        || event.provider_session_id
-        || existing.nativeSessionId
-        || existing.native_session_id,
-    relatedProviderSessionIds: eventRelatedProviderSessionIds.length
+      : event.native_session_id || event.provider_session_id || existing.native_session_id,
+    related_provider_session_ids: eventRelatedProviderSessionIds.length
       ? eventRelatedProviderSessionIds
-      : cleanTextArray(existing.relatedProviderSessionIds, existing.related_provider_session_ids),
-    sharedHistoryId: clearSessionIdentity && !eventSharedHistoryId
+      : cleanTextArray(existing.related_provider_session_ids),
+    shared_history_id: clearSessionIdentity && !eventSharedHistoryId
       ? ""
-      : eventSharedHistoryId
-        || existing.sharedHistoryId
-        || existing.shared_history_id,
-    slotKey: event.slotKey || existing.slotKey || defaultSlotKey(terminalIndex),
+      : eventSharedHistoryId || existing.shared_history_id,
+    slot_key: event.slot_key || existing.slot_key || defaultSlotKey(terminalIndex),
     status: options.status || event.status || existing.status || "active",
-    turnStatus: event.turnStatus || event.turn_status || existing.turnStatus || existing.turn_status,
-    sessionId: clearSessionIdentity
+    turn_status: event.turn_status || existing.turn_status,
+    session_id: clearSessionIdentity
       ? ""
-      : event.sessionId
-        || event.session_id
-        || event.providerSessionId
-        || event.provider_session_id
-        || event.nativeSessionId
-        || event.native_session_id
-        || existing.sessionId
-        || existing.session_id,
-    terminalName: terminalNickname,
-    terminalNickname,
-    terminalIndex,
-    threadId: nextThreadId,
-    updatedAt: now,
-    worktreePath: event.worktreePath || existing.worktreePath,
+      : event.session_id || event.provider_session_id || event.native_session_id || existing.session_id,
+    terminal_name: terminalNickname,
+    terminal_nickname: terminalNickname,
+    terminal_index: terminalIndex,
+    thread_id: nextThreadId,
+    updated_at: now,
+    worktree_path: event.worktree_path || existing.worktree_path,
   });
 
   if (!terminal) {
@@ -5546,11 +5287,11 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
   }
 
   entry.terminals[key] = terminal;
-  if (!entry.terminalOrder.includes(key)) {
-    entry.terminalOrder.push(key);
+  if (!entry.terminal_order.includes(key)) {
+    entry.terminal_order.push(key);
   }
-  if (terminal.threadId && entry.threads[terminal.threadId]) {
-    rememberTerminalThread(entry, terminalIndex, terminal.threadId);
+  if (terminal.thread_id && entry.threads[terminal.thread_id]) {
+    rememberTerminalThread(entry, terminalIndex, terminal.thread_id);
   }
 
   return terminal;
@@ -5571,72 +5312,72 @@ function detachThreadFromTerminalBinding(entry, threadId, event = {}) {
   const status = cleanText(event.status, "closed").toLowerCase();
   const detachedStatus = status === "error" ? "error" : "closed";
   const agentId = cleanAgentId(
-    event.agentId
-      || event.currentAgent
-      || existing.currentAgent,
+    event.agent_id
+      || event.current_agent
+      || existing.current_agent,
   );
   const terminalBinding = normalizeTerminalBinding({
-    instanceId: cleanText(existing.terminalBinding?.instanceId),
-    paneId: cleanText(existing.terminalBinding?.paneId),
-    terminalIndex: existing.terminalIndex,
+    instance_id: cleanText(existing.terminal_binding?.instance_id),
+    pane_id: cleanText(existing.terminal_binding?.pane_id),
+    terminal_index: existing.terminal_index,
   });
-  const existingLatestTurn = normalizeThreadLatestTurn(existing.latestTurn);
+  const existingLatestTurn = normalizeThreadLatestTurn(existing.latest_turn);
   const existingProviderBinding = getWorkspaceThreadProviderBinding(existing, agentId);
   const shouldDeferRunningTurnInterruption = Boolean(
-    event.deferSessionBackedRunningTurnInterruption === true
+    event.defer_session_backed_running_turn_interruption === true
       && detachedStatus !== "error"
       && existingLatestTurn?.state === "running"
-      && (existing.transcriptSessionId || existingProviderBinding?.nativeSessionId),
+      && (existing.transcript_session_id || existingProviderBinding?.native_session_id),
   );
   const latestTurn = existingLatestTurn?.state === "running" && !shouldDeferRunningTurnInterruption
     ? normalizeThreadLatestTurn({
       ...existingLatestTurn,
-      completedAt: now,
+      completed_at: now,
       error: detachedStatus === "error" ? "Terminal detached" : existingLatestTurn.error,
       state: detachedStatus === "error" ? "error" : "interrupted",
-      updatedAt: now,
+      updated_at: now,
     })
     : existingLatestTurn;
   const providerBindings = normalizeProviderBindings(
-    existing.providerBindings,
-    existing.currentAgent,
+    existing.provider_bindings,
+    existing.current_agent,
     {
       coordination: existing.coordination,
-      lastActiveAt: existing.lastActiveAt,
-      lastMessageAt: existing.lastMessageAt,
-      messageCount: existing.messageCount,
+      last_active_at: existing.last_active_at,
+      last_message_at: existing.last_message_at,
+      message_count: existing.message_count,
       status: existing.status,
-      terminalBinding,
-      updatedAt: existing.updatedAt,
+      terminal_binding: terminalBinding,
+      updated_at: existing.updated_at,
     },
   );
   if (isThreadAgentId(agentId)) {
     providerBindings[agentId] = {
       ...normalizeProviderBinding(providerBindings[agentId], agentId, {
-        activityStatus: "idle",
+        activity_status: "idle",
         coordination: existing.coordination,
-        lastActiveAt: existing.lastActiveAt,
-        lastMessageAt: existing.lastMessageAt,
-        messageCount: existing.messageCount,
+        last_active_at: existing.last_active_at,
+        last_message_at: existing.last_message_at,
+        message_count: existing.message_count,
         status: detachedStatus,
-        terminalBinding: null,
-        updatedAt: now,
+        terminal_binding: null,
+        updated_at: now,
       }),
-      activityStatus: "idle",
+      activity_status: "idle",
       status: detachedStatus,
-      terminalBinding: null,
-      updatedAt: now,
+      terminal_binding: null,
+      updated_at: now,
     };
   }
 
   entry.threads[safeThreadId] = {
     ...existing,
-    activityStatus: "idle",
-    latestTurn,
-    providerBindings,
+    activity_status: "idle",
+    latest_turn: latestTurn,
+    provider_bindings: providerBindings,
     status: detachedStatus,
-    terminalBinding: null,
-    updatedAt: now,
+    terminal_binding: null,
+    updated_at: now,
   };
   return true;
 }
@@ -5649,65 +5390,50 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
 
   const terminalKey = getTerminalKeyForEvent(entry, {
     ...event,
-    terminalIndex: event.terminalIndex ?? existing.terminalIndex,
-    threadId,
+    terminal_index: event.terminal_index ?? existing.terminal_index,
+    thread_id: threadId,
   });
   const activeTerminal = terminalKey ? entry.terminals[terminalKey] : null;
-  const displacedThreadId = cleanText(activeTerminal?.threadId);
+  const displacedThreadId = cleanText(activeTerminal?.thread_id);
   if (displacedThreadId && displacedThreadId !== threadId) {
     detachThreadFromTerminalBinding(entry, displacedThreadId, {
       ...event,
       status: "closed",
-      threadId: displacedThreadId,
+      thread_id: displacedThreadId,
     });
   }
-  const terminalIndex = normalizeTerminalIndex(event.terminalIndex ?? activeTerminal?.terminalIndex ?? existing.terminalIndex);
+  const terminalIndex = normalizeTerminalIndex(event.terminal_index ?? activeTerminal?.terminal_index ?? existing.terminal_index);
   const now = nowIso();
   const agentId = cleanAgentId(
-    event.agentId
-      || event.currentAgent
-      || activeTerminal?.agentId
-      || existing.currentAgent,
+    event.agent_id
+      || event.current_agent
+      || activeTerminal?.agent_id
+      || existing.current_agent,
   );
   const status = cleanText(options.status || event.status || "active").toLowerCase();
   const safeStatus = ["active", "closed", "error", "exited", "idle", "starting"].includes(status)
     ? status
     : "active";
   const eventType = cleanText(event.type).toLowerCase();
-  const sessionIdentityCleared = event.providerSessionIdCleared === true
-    || event.provider_session_id_cleared === true
-    || event.nativeSessionIdCleared === true
-    || event.native_session_id_cleared === true
-    || event.sessionIdCleared === true
-    || event.session_id_cleared === true;
+  const sessionIdentityCleared = event.provider_session_id_cleared === true || event.native_session_id_cleared === true || event.session_id_cleared === true;
   const eventForkFromProviderSessionId = cleanText(
-    event.forkFromProviderSessionId
-      || event.fork_from_provider_session_id
-      || event.forkedFromProviderSessionId
-      || event.forked_from_provider_session_id
-      || event.parentProviderSessionId
-      || event.parent_provider_session_id,
+    event.fork_from_provider_session_id || event.forked_from_provider_session_id || event.parent_provider_session_id,
   );
-  const eventSharedHistoryId = cleanText(event.sharedHistoryId || event.shared_history_id || event.historyGroupId || event.history_group_id);
+  const eventSharedHistoryId = cleanText(event.shared_history_id || event.history_group_id);
   const eventRelatedProviderSessionIds = cleanTextArray(
-    event.relatedProviderSessionIds,
     event.related_provider_session_ids,
-    event.relatedSessionIds,
     event.related_session_ids,
   );
   const terminalBinding = normalizeTerminalBinding({
-    instanceId: event.instanceId ?? activeTerminal?.instanceId,
-    paneId: event.paneId || activeTerminal?.paneId,
-    terminalIndex,
+    instance_id: event.instance_id ?? activeTerminal?.instance_id,
+    pane_id: event.pane_id || activeTerminal?.pane_id,
+    terminal_index: terminalIndex,
   });
   const terminalNickname = resolveWorkspaceTerminalNickname(
     entry,
     [
-      event.terminalNickname,
       event.terminal_nickname,
-      event.terminalName,
       event.terminal_name,
-      event.displayName,
       event.display_name,
       workspaceTerminalNicknameFromRecord(existing),
       workspaceTerminalNicknameFromRecord(getWorkspaceThreadProviderBinding(existing, agentId)),
@@ -5719,256 +5445,222 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
     },
   );
   const nextMessageCount = options.incrementMessageCount
-    ? normalizeMessageCount(existing.messageCount) + 1
-    : normalizeMessageCount(existing.messageCount);
+    ? normalizeMessageCount(existing.message_count) + 1
+    : normalizeMessageCount(existing.message_count);
   const coordination = {
-    agentBranch: cleanText(event.agentBranch, existing.coordination?.agentBranch),
-    agentId: cleanText(event.coordinationAgentId || event.agentCoordinationId, existing.coordination?.agentId),
-    agentSlotId: cleanText(event.agentSlotId, existing.coordination?.agentSlotId),
-    coordinationMode: cleanText(event.coordinationMode, existing.coordination?.coordinationMode),
-    fileAuthority: cleanText(event.fileAuthority, existing.coordination?.fileAuthority),
-    sessionId: cleanText(event.sessionId, existing.coordination?.sessionId),
-    sessionMode: cleanText(event.sessionMode, existing.coordination?.sessionMode),
-    worktreePath: cleanText(event.worktreePath, activeTerminal?.worktreePath || existing.coordination?.worktreePath),
+    agent_branch: cleanText(event.agent_branch, existing.coordination?.agent_branch),
+    agent_id: cleanText(event.coordination_agent_id || event.agent_coordination_id, existing.coordination?.agent_id),
+    agent_slot_id: cleanText(event.agent_slot_id, existing.coordination?.agent_slot_id),
+    coordination_mode: cleanText(event.coordination_mode, existing.coordination?.coordination_mode),
+    file_authority: cleanText(event.file_authority, existing.coordination?.file_authority),
+    session_id: cleanText(event.session_id, existing.coordination?.session_id),
+    session_mode: cleanText(event.session_mode, existing.coordination?.session_mode),
+    worktree_path: cleanText(event.worktree_path, activeTerminal?.worktree_path || existing.coordination?.worktree_path),
   };
   const existingProviderBindings = normalizeProviderBindings(
-    existing.providerBindings,
-    existing.currentAgent,
+    existing.provider_bindings,
+    existing.current_agent,
     {
       coordination: existing.coordination,
-      lastActiveAt: existing.lastActiveAt,
-      lastMessageAt: existing.lastMessageAt,
-      messageCount: existing.messageCount,
+      last_active_at: existing.last_active_at,
+      last_message_at: existing.last_message_at,
+      message_count: existing.message_count,
       status: existing.status,
-      terminalBinding: existing.terminalBinding,
-      updatedAt: existing.updatedAt,
+      terminal_binding: existing.terminal_binding,
+      updated_at: existing.updated_at,
     },
   );
   const shouldClearOrphanRunning = !options.incrementMessageCount && isOrphanRunningThreadState({
-    latestTurn: existing.latestTurn,
-    messageCount: existing.messageCount,
+    latest_turn: existing.latest_turn,
+    message_count: existing.message_count,
     messages: normalizeThreadMessages(existing.messages),
-    pendingPrompt: existing.pendingPrompt,
-    projectionEvents: normalizeThreadProjectionEvents(existing.projectionEvents),
-    providerBindings: existingProviderBindings,
-    transcriptSessionId: existing.transcriptSessionId,
+    pending_prompt: existing.pending_prompt,
+    projection_events: normalizeThreadProjectionEvents(existing.projection_events),
+    provider_bindings: existingProviderBindings,
+    transcript_session_id: existing.transcript_session_id,
   });
   const baseProviderBindings = shouldClearOrphanRunning
     ? clearOrphanRunningProviderBindings(existingProviderBindings)
     : existingProviderBindings;
-  const latestTurn = shouldClearOrphanRunning ? null : normalizeThreadLatestTurn(existing.latestTurn);
+  const latestTurn = shouldClearOrphanRunning ? null : normalizeThreadLatestTurn(existing.latest_turn);
   const providerBinding = normalizeProviderBinding(baseProviderBindings[agentId], agentId, {
-    agentDisplayName: event.agentDisplayName
-      || event.agent_display_name
-      || activeTerminal?.agentDisplayName
-      || activeTerminal?.agent_display_name,
-    agentType: event.agentType
-      || event.agent_type
-      || activeTerminal?.agentType
-      || activeTerminal?.agent_type,
+    agent_display_name: event.agent_display_name || activeTerminal?.agent_display_name,
+    agent_type: event.agent_type || activeTerminal?.agent_type,
     coordination,
-    inputReady: Boolean(activeTerminal?.inputReady),
-    inputReadyAt: activeTerminal?.inputReadyAt || "",
-    inputReadyConfidence: activeTerminal?.inputReadyConfidence || "",
-    lastActiveAt: now,
-    lastMessageAt: options.incrementMessageCount ? now : existing.lastMessageAt,
-    messageCount: nextMessageCount,
-    forkFromProviderSessionId: sessionIdentityCleared && !eventForkFromProviderSessionId
+    input_ready: Boolean(activeTerminal?.input_ready),
+    input_ready_at: activeTerminal?.input_ready_at || "",
+    input_ready_confidence: activeTerminal?.input_ready_confidence || "",
+    last_active_at: now,
+    last_message_at: options.incrementMessageCount ? now : existing.last_message_at,
+    message_count: nextMessageCount,
+    fork_from_provider_session_id: sessionIdentityCleared && !eventForkFromProviderSessionId
       ? ""
-      : eventForkFromProviderSessionId
-        || activeTerminal?.forkFromProviderSessionId
-        || activeTerminal?.fork_from_provider_session_id
-        || existing.forkFromProviderSessionId
-        || existing.fork_from_provider_session_id,
+      : eventForkFromProviderSessionId || activeTerminal?.fork_from_provider_session_id || existing.fork_from_provider_session_id,
     provider: event.provider || activeTerminal?.provider,
-    relatedProviderSessionIds: eventRelatedProviderSessionIds.length
+    related_provider_session_ids: eventRelatedProviderSessionIds.length
       ? eventRelatedProviderSessionIds
       : cleanTextArray(
-        activeTerminal?.relatedProviderSessionIds,
         activeTerminal?.related_provider_session_ids,
-        existing.relatedProviderSessionIds,
         existing.related_provider_session_ids,
       ),
-    sharedHistoryId: sessionIdentityCleared && !eventSharedHistoryId
+    shared_history_id: sessionIdentityCleared && !eventSharedHistoryId
       ? ""
-      : eventSharedHistoryId
-        || activeTerminal?.sharedHistoryId
-        || activeTerminal?.shared_history_id
-        || existing.sharedHistoryId
-        || existing.shared_history_id,
+      : eventSharedHistoryId || activeTerminal?.shared_history_id || existing.shared_history_id,
     status: safeStatus,
-    displayName: terminalNickname,
-    terminalName: terminalNickname,
-    terminalNickname,
-    terminalBinding,
-    updatedAt: now,
+    display_name: terminalNickname,
+    terminal_name: terminalNickname,
+    terminal_nickname: terminalNickname,
+    terminal_binding: terminalBinding,
+    updated_at: now,
   });
   const runtimeActivityStatus = explicitRuntimeActivityStatus(event, "")
     || normalizeThreadActivityStatus(
-      activeTerminal?.activityStatus || activeTerminal?.activity_status,
+      activeTerminal?.activity_status,
       "",
     );
   const activityStatus = eventType === "opened" || shouldClearOrphanRunning
     ? "idle"
     : runtimeActivityStatus || "idle";
-  const eventSessionName = cleanThreadLabelCandidate(event.sessionName);
+  const eventSessionName = cleanThreadLabelCandidate(event.session_name);
   const eventTitle = eventSessionName
-    || getWorkspaceThreadPromptLabel(event.title || event.userMessage, "");
-  const existingSessionName = cleanThreadLabelCandidate(existing.sessionName);
+    || getWorkspaceThreadPromptLabel(event.title || event.user_message, "");
+  const existingSessionName = cleanThreadLabelCandidate(existing.session_name);
   const existingTitle = cleanThreadLabelCandidate(existing.title);
   const providerBindings = {
     ...baseProviderBindings,
     [agentId]: {
       ...providerBinding,
-      activityStatus,
-      agentDisplayName: cleanAgentDisplayName(
-        event.agentDisplayName
-          || event.agent_display_name
-          || activeTerminal?.agentDisplayName
-          || activeTerminal?.agent_display_name,
-        providerBinding?.agentDisplayName,
+      activity_status: activityStatus,
+      agent_display_name: cleanAgentDisplayName(
+        event.agent_display_name || activeTerminal?.agent_display_name,
+        providerBinding?.agent_display_name,
       ),
-      agentType: cleanAgentDisplayName(
-        event.agentType
-          || event.agent_type
-          || activeTerminal?.agentType
-          || activeTerminal?.agent_type,
-        providerBinding?.agentType,
+      agent_type: cleanAgentDisplayName(
+        event.agent_type || activeTerminal?.agent_type,
+        providerBinding?.agent_type,
       ),
       coordination,
-      inputReady: Boolean(activeTerminal?.inputReady),
+      input_ready: Boolean(activeTerminal?.input_ready),
       provider: cleanAgentDisplayName(event.provider || activeTerminal?.provider, providerBinding?.provider),
-      inputReadyAt: activeTerminal?.inputReadyAt || "",
-      inputReadyConfidence: activeTerminal?.inputReadyConfidence || "",
-      lastActiveAt: now,
-      lastMessageAt: options.incrementMessageCount ? now : providerBinding?.lastMessageAt || existing.lastMessageAt,
-      messageCount: nextMessageCount,
-      forkFromProviderSessionId: sessionIdentityCleared && !eventForkFromProviderSessionId
+      input_ready_at: activeTerminal?.input_ready_at || "",
+      input_ready_confidence: activeTerminal?.input_ready_confidence || "",
+      last_active_at: now,
+      last_message_at: options.incrementMessageCount ? now : providerBinding?.last_message_at || existing.last_message_at,
+      message_count: nextMessageCount,
+      fork_from_provider_session_id: sessionIdentityCleared && !eventForkFromProviderSessionId
         ? ""
-        : eventForkFromProviderSessionId
-          || providerBinding?.forkFromProviderSessionId
-          || providerBinding?.fork_from_provider_session_id,
+        : eventForkFromProviderSessionId || providerBinding?.fork_from_provider_session_id,
       ...hookHealthFields(activeTerminal, providerBinding),
-      modelId: cleanModelId(event.modelId || event.model, providerBinding?.modelId),
-      modelSource: cleanModelId(event.modelId || event.model) ? cleanText(event.modelSource, "user") : providerBinding?.modelSource,
-      modelUpdatedAt: cleanModelId(event.modelId || event.model) ? now : providerBinding?.modelUpdatedAt || "",
-      nativeSessionId: sessionIdentityCleared
+      model_id: cleanModelId(event.model_id || event.model, providerBinding?.model_id),
+      model_source: cleanModelId(event.model_id || event.model) ? cleanText(event.model_source, "user") : providerBinding?.model_source,
+      modelUpdatedAt: cleanModelId(event.model_id || event.model) ? now : providerBinding?.modelUpdatedAt || "",
+      native_session_id: sessionIdentityCleared
         ? ""
-        : cleanText(event.nativeSessionId, providerBinding?.nativeSessionId),
-      nativeSessionKind: sessionIdentityCleared
+        : cleanText(event.native_session_id, providerBinding?.native_session_id),
+      native_session_kind: sessionIdentityCleared
         ? ""
-        : cleanText(event.nativeSessionKind, providerBinding?.nativeSessionKind || "session"),
-      nativeSessionSource: sessionIdentityCleared
+        : cleanText(event.native_session_kind, providerBinding?.native_session_kind || "session"),
+      native_session_source: sessionIdentityCleared
         ? ""
-        : cleanText(event.nativeSessionSource, providerBinding?.nativeSessionSource),
-      nativeSessionUpdatedAt: sessionIdentityCleared
+        : cleanText(event.native_session_source, providerBinding?.native_session_source),
+      native_session_updated_at: sessionIdentityCleared
         ? ""
-        : event.nativeSessionId ? now : providerBinding?.nativeSessionUpdatedAt || "",
-      relatedProviderSessionIds: eventRelatedProviderSessionIds.length
+        : event.native_session_id ? now : providerBinding?.native_session_updated_at || "",
+      related_provider_session_ids: eventRelatedProviderSessionIds.length
         ? eventRelatedProviderSessionIds
-        : cleanTextArray(providerBinding?.relatedProviderSessionIds, providerBinding?.related_provider_session_ids),
-      sharedHistoryId: sessionIdentityCleared && !eventSharedHistoryId
+        : cleanTextArray(providerBinding?.related_provider_session_ids),
+      shared_history_id: sessionIdentityCleared && !eventSharedHistoryId
         ? ""
-        : eventSharedHistoryId
-          || providerBinding?.sharedHistoryId
-          || providerBinding?.shared_history_id,
-      displayName: terminalNickname,
+        : eventSharedHistoryId || providerBinding?.shared_history_id,
+      display_name: terminalNickname,
       status: safeStatus,
-      terminalName: terminalNickname,
-      terminalNickname,
-      terminalBinding,
-      updatedAt: now,
+      terminal_name: terminalNickname,
+      terminal_nickname: terminalNickname,
+      terminal_binding: terminalBinding,
+      updated_at: now,
     },
   };
 
   entry.threads[threadId] = {
     ...existing,
-    activityStatus,
+    activity_status: activityStatus,
     coordination,
-    currentAgent: agentId,
-    forkFromProviderSessionId: sessionIdentityCleared && !eventForkFromProviderSessionId
+    current_agent: agentId,
+    fork_from_provider_session_id: sessionIdentityCleared && !eventForkFromProviderSessionId
       ? ""
-      : eventForkFromProviderSessionId
-        || existing.forkFromProviderSessionId
-        || existing.fork_from_provider_session_id,
-    lastActiveAt: now,
-    lastMessageAt: options.incrementMessageCount ? now : existing.lastMessageAt,
+      : eventForkFromProviderSessionId || existing.fork_from_provider_session_id,
+    last_active_at: now,
+    last_message_at: options.incrementMessageCount ? now : existing.last_message_at,
     materialized: true,
-    messageCount: nextMessageCount,
+    message_count: nextMessageCount,
     messages: existing.messages,
-    latestTurn,
-    preferredAgent: cleanAgentId(event.preferredAgent || existing.preferredAgent || agentId),
-    providerBindings,
-    relatedProviderSessionIds: eventRelatedProviderSessionIds.length
+    latest_turn: latestTurn,
+    preferred_agent: cleanAgentId(event.preferred_agent || existing.preferred_agent || agentId),
+    provider_bindings: providerBindings,
+    related_provider_session_ids: eventRelatedProviderSessionIds.length
       ? eventRelatedProviderSessionIds
-      : cleanTextArray(existing.relatedProviderSessionIds, existing.related_provider_session_ids),
-    displayName: terminalNickname,
-    sessionName: eventSessionName || existingSessionName || eventTitle || existingTitle,
-    sharedHistoryId: sessionIdentityCleared && !eventSharedHistoryId
+      : cleanTextArray(existing.related_provider_session_ids),
+    display_name: terminalNickname,
+    session_name: eventSessionName || existingSessionName || eventTitle || existingTitle,
+    shared_history_id: sessionIdentityCleared && !eventSharedHistoryId
       ? ""
-      : eventSharedHistoryId
-        || existing.sharedHistoryId
-        || existing.shared_history_id,
-    slotKey: cleanText(event.slotKey || activeTerminal?.slotKey, existing.slotKey),
+      : eventSharedHistoryId || existing.shared_history_id,
+    slot_key: cleanText(event.slot_key || activeTerminal?.slot_key, existing.slot_key),
     status: safeStatus,
-    terminalBinding,
-    terminalName: terminalNickname,
-    terminalNickname,
-    terminalIndex,
+    terminal_binding: terminalBinding,
+    terminal_name: terminalNickname,
+    terminal_nickname: terminalNickname,
+    terminal_index: terminalIndex,
     title: eventTitle || existingTitle || existingSessionName || defaultThreadTitle(terminalIndex, agentId),
-    transcriptSessionId: sessionIdentityCleared ? "" : existing.transcriptSessionId,
-    updatedAt: now,
+    transcript_session_id: sessionIdentityCleared ? "" : existing.transcript_session_id,
+    updated_at: now,
   };
 
   if (terminalKey && entry.terminals[terminalKey]) {
     entry.terminals[terminalKey] = {
       ...entry.terminals[terminalKey],
-      agentId,
-      displayName: terminalNickname,
-      forkFromProviderSessionId: sessionIdentityCleared && !eventForkFromProviderSessionId
+      agent_id: agentId,
+      display_name: terminalNickname,
+      fork_from_provider_session_id: sessionIdentityCleared && !eventForkFromProviderSessionId
         ? ""
-        : eventForkFromProviderSessionId
-          || entry.terminals[terminalKey].forkFromProviderSessionId
-          || entry.terminals[terminalKey].fork_from_provider_session_id,
-      lastActiveAt: now,
-      relatedProviderSessionIds: eventRelatedProviderSessionIds.length
+        : eventForkFromProviderSessionId || entry.terminals[terminalKey].fork_from_provider_session_id,
+      last_active_at: now,
+      related_provider_session_ids: eventRelatedProviderSessionIds.length
         ? eventRelatedProviderSessionIds
-        : cleanTextArray(entry.terminals[terminalKey].relatedProviderSessionIds, entry.terminals[terminalKey].related_provider_session_ids),
-      sharedHistoryId: sessionIdentityCleared && !eventSharedHistoryId
+        : cleanTextArray(entry.terminals[terminalKey].related_provider_session_ids, entry.terminals[terminalKey].related_provider_session_ids),
+      shared_history_id: sessionIdentityCleared && !eventSharedHistoryId
         ? ""
-        : eventSharedHistoryId
-          || entry.terminals[terminalKey].sharedHistoryId
-          || entry.terminals[terminalKey].shared_history_id,
+        : eventSharedHistoryId || entry.terminals[terminalKey].shared_history_id,
       status: safeStatus,
-      terminalName: terminalNickname,
-      terminalNickname,
-      threadId,
-      updatedAt: now,
+      terminal_name: terminalNickname,
+      terminal_nickname: terminalNickname,
+      thread_id: threadId,
+      updated_at: now,
     };
   }
 
   rememberTerminalThread(entry, terminalIndex, threadId);
-  entry.activeThreadId = threadId;
+  entry.active_thread_id = threadId;
   return true;
 }
 
 export function updateWorkspaceActiveTerminal(state, event = {}) {
-  const workspaceId = cleanText(event.workspaceId);
+  const workspaceId = cleanText(event.workspace_id);
   if (!workspaceId) {
     return state || {};
   }
 
   const currentState = getWorkspaceThreadsStateObject(state);
   const entry = cloneWorkspaceEntryForMutation(currentState[workspaceId], workspaceId);
-  const eventAgentId = cleanAgentId(event.agentId || event.currentAgent, "");
-  const eventNativeSessionId = cleanText(event.nativeSessionId || event.providerSessionId);
+  const eventAgentId = cleanAgentId(event.agent_id || event.current_agent, "");
+  const eventNativeSessionId = cleanText(event.native_session_id || event.provider_session_id);
   if (eventNativeSessionId && workspaceEntryHasArchivedSession(entry, eventAgentId, eventNativeSessionId)) {
     return state || {};
   }
-  const terminalIndex = normalizeTerminalIndex(event.terminalIndex);
+  const terminalIndex = normalizeTerminalIndex(event.terminal_index);
   const terminalKey = terminalSessionKey(terminalIndex);
-  const eventThreadId = cleanText(event.threadId);
-  const restoredThreadId = terminalKey ? cleanText(entry.terminalThreadIds?.[terminalKey]) : "";
+  const eventThreadId = cleanText(event.thread_id);
+  const restoredThreadId = terminalKey ? cleanText(entry.terminal_thread_ids?.[terminalKey]) : "";
   const threadId = entry.threads[eventThreadId]
     ? eventThreadId
     : entry.threads[restoredThreadId]
@@ -5976,72 +5668,72 @@ export function updateWorkspaceActiveTerminal(state, event = {}) {
       : "";
   const terminal = upsertActiveTerminal(entry, event, {
     status: event.status || "active",
-    threadId,
+    thread_id: threadId,
   });
 
   if (terminal && threadId && entry.threads[threadId]) {
     bindExistingThreadToTerminal(entry, threadId, event, { status: event.status || "active" });
-  } else if (terminal && !threadId && isThreadAgentId(terminal.agentId)) {
+  } else if (terminal && !threadId && isThreadAgentId(terminal.agent_id)) {
     const now = nowIso();
-    const nextThreadId = createThreadIdForTerminal(workspaceId, terminal.terminalIndex);
-    const freshSessionStartedAt = event.freshSession
-      ? cleanText(event.freshSessionStartedAt, now)
+    const nextThreadId = createThreadIdForTerminal(workspaceId, terminal.terminal_index);
+    const freshSessionStartedAt = event.fresh_session
+      ? cleanText(event.fresh_session_started_at, now)
       : "";
     entry.threads[nextThreadId] = {
       coordination: normalizeCoordination({
-        worktreePath: terminal.worktreePath,
+        worktree_path: terminal.worktree_path,
       }),
-      createdAt: now,
-      currentAgent: terminal.agentId,
+      created_at: now,
+      current_agent: terminal.agent_id,
       id: nextThreadId,
-      lastActiveAt: now,
-      lastMessageAt: "",
-      latestTurn: null,
-      freshSessionStartedAt,
+      last_active_at: now,
+      last_message_at: "",
+      latest_turn: null,
+      fresh_session_started_at: freshSessionStartedAt,
       materialized: true,
-      messageCount: 0,
+      message_count: 0,
       messages: [],
-      pendingPrompt: null,
-      projectionEvents: [],
-      preferredAgent: terminal.agentId,
-      providerBindings: {
-        [terminal.agentId]: normalizeProviderBinding(null, terminal.agentId, {
-          activityStatus: "idle",
-          inputReady: Boolean(terminal.inputReady),
-          inputReadyAt: terminal.inputReadyAt || "",
-          inputReadyConfidence: terminal.inputReadyConfidence || "",
-          lastActiveAt: now,
-          messageCount: 0,
+      pending_prompt: null,
+      projection_events: [],
+      preferred_agent: terminal.agent_id,
+      provider_bindings: {
+        [terminal.agent_id]: normalizeProviderBinding(null, terminal.agent_id, {
+          activity_status: "idle",
+          input_ready: Boolean(terminal.input_ready),
+          input_ready_at: terminal.input_ready_at || "",
+          input_ready_confidence: terminal.input_ready_confidence || "",
+          last_active_at: now,
+          message_count: 0,
           status: terminal.status || event.status || "active",
-          displayName: terminal.terminalNickname,
-          terminalName: terminal.terminalNickname,
-          terminalNickname: terminal.terminalNickname,
-          terminalBinding: normalizeTerminalBinding({
-            instanceId: terminal.instanceId,
-            paneId: terminal.paneId,
-            terminalIndex: terminal.terminalIndex,
+          display_name: terminal.terminal_nickname,
+          terminal_name: terminal.terminal_nickname,
+          terminal_nickname: terminal.terminal_nickname,
+          terminal_binding: normalizeTerminalBinding({
+            instance_id: terminal.instance_id,
+            pane_id: terminal.pane_id,
+            terminal_index: terminal.terminal_index,
           }),
-          updatedAt: now,
+          updated_at: now,
         }),
       },
-      displayName: terminal.terminalNickname,
-      sessionName: defaultThreadTitle(terminal.terminalIndex, terminal.agentId),
-      slotKey: terminal.slotKey || defaultSlotKey(terminal.terminalIndex),
+      display_name: terminal.terminal_nickname,
+      session_name: defaultThreadTitle(terminal.terminal_index, terminal.agent_id),
+      slot_key: terminal.slot_key || defaultSlotKey(terminal.terminal_index),
       status: terminal.status || event.status || "active",
-      terminalBinding: normalizeTerminalBinding({
-        instanceId: terminal.instanceId,
-        paneId: terminal.paneId,
-        terminalIndex: terminal.terminalIndex,
+      terminal_binding: normalizeTerminalBinding({
+        instance_id: terminal.instance_id,
+        pane_id: terminal.pane_id,
+        terminal_index: terminal.terminal_index,
       }),
-      terminalName: terminal.terminalNickname,
-      terminalNickname: terminal.terminalNickname,
-      terminalIndex: terminal.terminalIndex,
-      title: defaultThreadTitle(terminal.terminalIndex, terminal.agentId),
-      transcriptHydrationMode: event.freshSession ? "session-only" : "",
-      updatedAt: now,
-      workspaceId,
+      terminal_name: terminal.terminal_nickname,
+      terminal_nickname: terminal.terminal_nickname,
+      terminal_index: terminal.terminal_index,
+      title: defaultThreadTitle(terminal.terminal_index, terminal.agent_id),
+      transcript_hydration_mode: event.fresh_session ? "session-only" : "",
+      updated_at: now,
+      workspace_id: workspaceId,
     };
-    entry.threadOrder.push(nextThreadId);
+    entry.thread_order.push(nextThreadId);
     bindExistingThreadToTerminal(entry, nextThreadId, event, { status: event.status || "active" });
   }
 
@@ -6052,8 +5744,8 @@ export function updateWorkspaceActiveTerminal(state, event = {}) {
 }
 
 export function materializeWorkspaceThreadForTerminal(state, event = {}) {
-  const workspaceId = cleanText(event.workspaceId);
-  const terminalIndex = normalizeTerminalIndex(event.terminalIndex);
+  const workspaceId = cleanText(event.workspace_id);
+  const terminalIndex = normalizeTerminalIndex(event.terminal_index);
   if (!workspaceId || terminalIndex == null) {
     return state || {};
   }
@@ -6062,63 +5754,60 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
   const entry = cloneWorkspaceEntryForMutation(currentState[workspaceId], workspaceId);
   const terminalKey = terminalSessionKey(terminalIndex);
   const existingTerminal = terminalKey ? entry.terminals[terminalKey] : null;
-  const existingThreadId = cleanText(event.threadId || existingTerminal?.threadId);
+  const existingThreadId = cleanText(event.thread_id || existingTerminal?.thread_id);
   if (workspaceEntryHasArchivedThreadId(entry, existingThreadId)) {
     return state || {};
   }
   const now = nowIso();
-  const agentId = cleanAgentId(event.agentId || existingTerminal?.agentId || DEFAULT_AGENT_ID);
-  const eventNativeSessionId = cleanText(event.nativeSessionId || event.providerSessionId);
+  const agentId = cleanAgentId(event.agent_id || existingTerminal?.agent_id || DEFAULT_AGENT_ID);
+  const eventNativeSessionId = cleanText(event.native_session_id || event.provider_session_id);
   if (eventNativeSessionId && workspaceEntryHasArchivedSession(entry, agentId, eventNativeSessionId)) {
     return state || {};
   }
   const threadId = existingThreadId || createThreadIdForTerminal(workspaceId, terminalIndex);
-  const submittedUserMessage = cleanSubmittedUserMessage(event.userMessage || event.message);
+  const submittedUserMessage = cleanSubmittedUserMessage(event.user_message || event.message);
   const promptLabel = getWorkspaceThreadPromptLabel(
     event.title || submittedUserMessage,
     defaultThreadTitle(terminalIndex, agentId),
   );
-  const rawPendingPrompt = normalizePendingPrompt(event.pendingPrompt || {
-    createdAt: event.messageCreatedAt,
-    deliveryMode: event.pendingPromptDeliveryMode || event.deliveryMode,
-    id: event.pendingPromptId,
-    message: event.pendingPromptText || (event.sessionAcceptancePending === true ? submittedUserMessage : ""),
+  const rawPendingPrompt = normalizePendingPrompt(event.pending_prompt || {
+    created_at: event.message_created_at,
+    delivery_mode: event.pending_prompt_delivery_mode || event.delivery_mode,
+    id: event.pending_prompt_id,
+    message: event.pending_prompt_text || (event.session_acceptance_pending === true ? submittedUserMessage : ""),
     model: event.model,
   });
   const pendingPromptWasAccepted = Boolean(
-    event.promptAccepted === true
-      || event.sessionAcceptancePending === false
-      || event.sessionAccepted === true
+    event.prompt_accepted === true
+      || event.session_acceptance_pending === false
+      || event.session_accepted === true
   );
   const pendingPrompt = pendingPromptWasAccepted ? null : rawPendingPrompt;
   const hasSubmittedPrompt = Boolean(submittedUserMessage || pendingPrompt);
   const previousThread = entry.threads[threadId] || null;
   const previousMessages = normalizeThreadMessages(previousThread?.messages);
-  const previousActivityStatus = normalizeThreadActivityStatus(previousThread?.activityStatus);
-  const freshSessionStartedAt = event.freshSession
-    ? cleanText(event.freshSessionStartedAt, previousThread?.freshSessionStartedAt || now)
-    : previousThread?.freshSessionStartedAt || "";
+  const previousActivityStatus = normalizeThreadActivityStatus(previousThread?.activity_status);
+  const freshSessionStartedAt = event.fresh_session
+    ? cleanText(event.fresh_session_started_at, previousThread?.fresh_session_started_at || now)
+    : previousThread?.fresh_session_started_at || "";
   const transcriptHydrationMode = cleanText(
-    event.transcriptHydrationMode,
-    event.freshSession ? "session-only" : previousThread?.transcriptHydrationMode || "",
+    event.transcript_hydration_mode,
+    event.fresh_session ? "session-only" : previousThread?.transcript_hydration_mode || "",
   );
-  const shouldBindTerminal = event.bindTerminal !== false;
+  const shouldBindTerminal = event.bind_terminal !== false;
 
   if (shouldBindTerminal) {
     upsertActiveTerminal(entry, event, {
       status: event.status || "active",
-      threadId,
+      thread_id: threadId,
     });
   }
   const boundTerminal = terminalKey ? entry.terminals[terminalKey] || existingTerminal : existingTerminal;
   const terminalNickname = resolveWorkspaceTerminalNickname(
     entry,
     [
-      event.terminalNickname,
       event.terminal_nickname,
-      event.terminalName,
       event.terminal_name,
-      event.displayName,
       event.display_name,
       workspaceTerminalNicknameFromRecord(boundTerminal),
       workspaceTerminalNicknameFromRecord(previousThread),
@@ -6132,47 +5821,47 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
   if (!entry.threads[threadId]) {
     entry.threads[threadId] = {
       coordination: normalizeCoordination(null),
-      createdAt: now,
-      currentAgent: agentId,
+      created_at: now,
+      current_agent: agentId,
       id: threadId,
-      lastActiveAt: now,
-      lastMessageAt: now,
-      latestTurn: null,
+      last_active_at: now,
+      last_message_at: now,
+      latest_turn: null,
       materialized: true,
-      messageCount: 0,
+      message_count: 0,
       messages: [],
-      pendingPrompt: null,
-      projectionEvents: [],
-      preferredAgent: agentId,
-      freshSessionStartedAt,
-      providerBindings: isThreadAgentId(agentId)
+      pending_prompt: null,
+      projection_events: [],
+      preferred_agent: agentId,
+      fresh_session_started_at: freshSessionStartedAt,
+      provider_bindings: isThreadAgentId(agentId)
         ? {
           [agentId]: normalizeProviderBinding(null, agentId, {
-            displayName: terminalNickname,
-            lastActiveAt: now,
-            lastMessageAt: now,
-            messageCount: 0,
+            display_name: terminalNickname,
+            last_active_at: now,
+            last_message_at: now,
+            message_count: 0,
             status: "active",
-            terminalName: terminalNickname,
-            terminalNickname,
-            updatedAt: now,
+            terminal_name: terminalNickname,
+            terminal_nickname: terminalNickname,
+            updated_at: now,
           }),
         }
         : {},
-      displayName: terminalNickname,
-      sessionName: promptLabel,
-      slotKey: cleanText(event.slotKey || existingTerminal?.slotKey, defaultSlotKey(terminalIndex)),
+      display_name: terminalNickname,
+      session_name: promptLabel,
+      slot_key: cleanText(event.slot_key || existingTerminal?.slot_key, defaultSlotKey(terminalIndex)),
       status: "active",
-      terminalBinding: null,
-      terminalName: terminalNickname,
-      terminalNickname,
-      terminalIndex,
+      terminal_binding: null,
+      terminal_name: terminalNickname,
+      terminal_nickname: terminalNickname,
+      terminal_index: terminalIndex,
       title: promptLabel,
-      transcriptHydrationMode,
-      updatedAt: now,
-      workspaceId,
+      transcript_hydration_mode: transcriptHydrationMode,
+      updated_at: now,
+      workspace_id: workspaceId,
     };
-    entry.threadOrder.push(threadId);
+    entry.thread_order.push(threadId);
   }
 
   if (shouldBindTerminal) {
@@ -6181,7 +5870,7 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
       status: event.status || "active",
     });
   } else {
-    entry.activeThreadId = threadId;
+    entry.active_thread_id = threadId;
   }
   if (entry.threads[threadId]) {
     const submittedEvents = createSubmittedUserProjectionEvents(entry.threads[threadId], event);
@@ -6193,19 +5882,19 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
     const messageAdded = submittedEvents.length > 0 && messages.length > previousMessages.length;
     const projectedLatestTurn = projectLatestTurnFromNormalizedEvents(
       projectionEvents,
-      entry.threads[threadId].latestTurn,
+      entry.threads[threadId].latest_turn,
     );
     const nextPendingPrompt = pendingPromptWasAccepted
       ? null
-      : pendingPrompt || entry.threads[threadId].pendingPrompt;
+      : pendingPrompt || entry.threads[threadId].pending_prompt;
     const shouldClearOrphanRunning = isOrphanRunningThreadState({
-      latestTurn: projectedLatestTurn,
-      messageCount: messages.length,
+      latest_turn: projectedLatestTurn,
+      message_count: messages.length,
       messages,
-      pendingPrompt: nextPendingPrompt,
-      projectionEvents,
-      providerBindings: entry.threads[threadId].providerBindings,
-      transcriptSessionId: entry.threads[threadId].transcriptSessionId,
+      pending_prompt: nextPendingPrompt,
+      projection_events: projectionEvents,
+      provider_bindings: entry.threads[threadId].provider_bindings,
+      transcript_session_id: entry.threads[threadId].transcript_session_id,
     });
     const latestTurn = shouldClearOrphanRunning ? null : projectedLatestTurn;
     const submittedPromptActive = cleanText(event.type).toLowerCase() === "message-submitted"
@@ -6217,21 +5906,21 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
         : submittedPromptActive
           ? "thinking"
           : messageAdded || pendingPrompt
-            ? entry.threads[threadId].activityStatus
+            ? entry.threads[threadId].activity_status
             : previousActivityStatus,
     );
     let providerBindings = normalizeProviderBindings(
-      entry.threads[threadId].providerBindings,
-      entry.threads[threadId].currentAgent,
+      entry.threads[threadId].provider_bindings,
+      entry.threads[threadId].current_agent,
       {
-        activityStatus,
+        activity_status: activityStatus,
         coordination: entry.threads[threadId].coordination,
-        lastActiveAt: entry.threads[threadId].lastActiveAt,
-        lastMessageAt: entry.threads[threadId].lastMessageAt,
-        messageCount: messages.length,
+        last_active_at: entry.threads[threadId].last_active_at,
+        last_message_at: entry.threads[threadId].last_message_at,
+        message_count: messages.length,
         status: entry.threads[threadId].status,
-        terminalBinding: entry.threads[threadId].terminalBinding,
-        updatedAt: entry.threads[threadId].updatedAt,
+        terminal_binding: entry.threads[threadId].terminal_binding,
+        updated_at: entry.threads[threadId].updated_at,
       },
     );
     if (shouldClearOrphanRunning) {
@@ -6240,24 +5929,24 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
     if (isThreadAgentId(agentId) && providerBindings[agentId]) {
       providerBindings[agentId] = {
         ...providerBindings[agentId],
-        activityStatus,
+        activity_status: activityStatus,
       };
     }
     entry.threads[threadId] = {
       ...entry.threads[threadId],
-      activityStatus,
-      lastMessageAt: messages.length ? messages[messages.length - 1].createdAt : entry.threads[threadId].lastMessageAt,
-      latestTurn,
-      messageCount: messages.length,
+      activity_status: activityStatus,
+      last_message_at: messages.length ? messages[messages.length - 1].created_at : entry.threads[threadId].last_message_at,
+      latest_turn: latestTurn,
+      message_count: messages.length,
       messages,
-      pendingPrompt: nextPendingPrompt,
-      projectionEvents,
-      freshSessionStartedAt,
-      providerBindings,
-      transcriptHydrationMode,
+      pending_prompt: nextPendingPrompt,
+      projection_events: projectionEvents,
+      fresh_session_started_at: freshSessionStartedAt,
+      provider_bindings: providerBindings,
+      transcript_hydration_mode: transcriptHydrationMode,
     };
   }
-  entry.threadOrder = entry.threadOrder.filter((candidateId, index, order) => (
+  entry.thread_order = entry.thread_order.filter((candidateId, index, order) => (
     entry.threads[candidateId] && order.indexOf(candidateId) === index
   )).slice(0, MAX_THREADS_PER_WORKSPACE);
 
@@ -6268,8 +5957,8 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
 }
 
 export function bindWorkspaceThreadTerminal(state, event = {}) {
-  const workspaceId = cleanText(event.workspaceId);
-  const threadId = cleanText(event.threadId);
+  const workspaceId = cleanText(event.workspace_id);
+  const threadId = cleanText(event.thread_id);
   if (!workspaceId || !threadId) {
     return state || {};
   }
@@ -6282,7 +5971,7 @@ export function bindWorkspaceThreadTerminal(state, event = {}) {
 
   upsertActiveTerminal(entry, event, {
     status: event.status || "active",
-    threadId,
+    thread_id: threadId,
   });
   bindExistingThreadToTerminal(entry, threadId, event, { status: event.status || "active" });
 
@@ -6293,7 +5982,7 @@ export function bindWorkspaceThreadTerminal(state, event = {}) {
 }
 
 export function markWorkspaceThreadTerminalDetached(state, event = {}) {
-  const workspaceId = cleanText(event.workspaceId);
+  const workspaceId = cleanText(event.workspace_id);
   if (!workspaceId) {
     return state || {};
   }
@@ -6302,10 +5991,10 @@ export function markWorkspaceThreadTerminalDetached(state, event = {}) {
   const entry = cloneWorkspaceEntryForMutation(currentState[workspaceId], workspaceId);
   const terminalKey = getTerminalKeyForEvent(entry, event);
   const terminal = terminalKey ? entry.terminals[terminalKey] : null;
-  const threadId = cleanText(event.threadId || terminal?.threadId);
+  const threadId = cleanText(event.thread_id || terminal?.thread_id);
   const existing = threadId ? entry.threads[threadId] : null;
   const terminalIndex = normalizeTerminalIndex(
-    event.terminalIndex ?? terminal?.terminalIndex ?? existing?.terminalIndex,
+    event.terminal_index ?? terminal?.terminal_index ?? existing?.terminal_index,
   );
 
   if (!existing && !terminal) {
@@ -6320,74 +6009,74 @@ export function markWorkspaceThreadTerminalDetached(state, event = {}) {
 
   if (terminalKey) {
     delete entry.terminals[terminalKey];
-    entry.terminalOrder = entry.terminalOrder.filter((key) => key !== terminalKey);
+    entry.terminal_order = entry.terminal_order.filter((key) => key !== terminalKey);
   }
 
-  if (event.rememberTerminalThread === false || event.forgetTerminalThread) {
+  if (event.remember_terminal_thread === false || event.forget_terminal_thread) {
     forgetTerminalThread(entry, terminalIndex, threadId);
   } else if (existing) {
     rememberTerminalThread(entry, terminalIndex, threadId);
   }
 
   if (existing) {
-    const agentId = cleanAgentId(event.agentId || terminal?.agentId || existing.currentAgent, "");
-    const existingLatestTurn = normalizeThreadLatestTurn(existing.latestTurn);
+    const agentId = cleanAgentId(event.agent_id || terminal?.agent_id || existing.current_agent, "");
+    const existingLatestTurn = normalizeThreadLatestTurn(existing.latest_turn);
     const existingProviderBinding = getWorkspaceThreadProviderBinding(existing, agentId);
     const shouldDeferRunningTurnInterruption = Boolean(
-      event.deferSessionBackedRunningTurnInterruption === true
+      event.defer_session_backed_running_turn_interruption === true
         && safeStatus !== "error"
         && existingLatestTurn?.state === "running"
-        && (existing.transcriptSessionId || existingProviderBinding?.nativeSessionId),
+        && (existing.transcript_session_id || existingProviderBinding?.native_session_id),
     );
     const latestTurn = existingLatestTurn?.state === "running" && !shouldDeferRunningTurnInterruption
       ? normalizeThreadLatestTurn({
         ...existingLatestTurn,
-        completedAt: now,
+        completed_at: now,
         error: safeStatus === "error" ? "Terminal error" : existingLatestTurn.error,
         state: safeStatus === "error" ? "error" : "interrupted",
-        updatedAt: now,
+        updated_at: now,
       })
       : existingLatestTurn;
     const providerBindings = normalizeProviderBindings(
-      existing.providerBindings,
-      existing.currentAgent,
+      existing.provider_bindings,
+      existing.current_agent,
       {
         coordination: existing.coordination,
-        lastActiveAt: existing.lastActiveAt,
-        lastMessageAt: existing.lastMessageAt,
-        messageCount: existing.messageCount,
+        last_active_at: existing.last_active_at,
+        last_message_at: existing.last_message_at,
+        message_count: existing.message_count,
         status: existing.status,
-        terminalBinding: existing.terminalBinding,
-        updatedAt: existing.updatedAt,
+        terminal_binding: existing.terminal_binding,
+        updated_at: existing.updated_at,
       },
     );
     if (isThreadAgentId(agentId)) {
       providerBindings[agentId] = {
         ...normalizeProviderBinding(providerBindings[agentId], agentId, {
-          activityStatus: "idle",
+          activity_status: "idle",
           coordination: existing.coordination,
-          lastActiveAt: existing.lastActiveAt,
-          lastMessageAt: existing.lastMessageAt,
-          messageCount: existing.messageCount,
+          last_active_at: existing.last_active_at,
+          last_message_at: existing.last_message_at,
+          message_count: existing.message_count,
           status: safeStatus,
-          terminalBinding: null,
-          updatedAt: now,
+          terminal_binding: null,
+          updated_at: now,
         }),
-        activityStatus: "idle",
+        activity_status: "idle",
         status: safeStatus,
-        terminalBinding: null,
-        updatedAt: now,
+        terminal_binding: null,
+        updated_at: now,
       };
     }
 
     entry.threads[threadId] = {
       ...existing,
-      activityStatus: "idle",
-      latestTurn,
-      providerBindings,
+      activity_status: "idle",
+      latest_turn: latestTurn,
+      provider_bindings: providerBindings,
       status: safeStatus,
-      terminalBinding: null,
-      updatedAt: now,
+      terminal_binding: null,
+      updated_at: now,
     };
   }
 
@@ -6398,9 +6087,9 @@ export function markWorkspaceThreadTerminalDetached(state, event = {}) {
 }
 
 export function updateWorkspaceThreadAgent(state, event = {}) {
-  const workspaceId = cleanText(event.workspaceId);
-  const threadId = cleanText(event.threadId);
-  const agentId = cleanAgentId(event.agentId);
+  const workspaceId = cleanText(event.workspace_id);
+  const threadId = cleanText(event.thread_id);
+  const agentId = cleanAgentId(event.agent_id);
   if (!workspaceId || !threadId) {
     return state || {};
   }
@@ -6414,90 +6103,90 @@ export function updateWorkspaceThreadAgent(state, event = {}) {
   }
   const now = nowIso();
   const providerBindings = normalizeProviderBindings(
-    existing.providerBindings,
-    existing.currentAgent,
+    existing.provider_bindings,
+    existing.current_agent,
     {
       coordination: existing.coordination,
-      lastActiveAt: existing.lastActiveAt,
-      lastMessageAt: existing.lastMessageAt,
-      messageCount: existing.messageCount,
+      last_active_at: existing.last_active_at,
+      last_message_at: existing.last_message_at,
+      message_count: existing.message_count,
       status: existing.status,
-      terminalBinding: existing.terminalBinding,
-      updatedAt: existing.updatedAt,
+      terminal_binding: existing.terminal_binding,
+      updated_at: existing.updated_at,
     },
   );
-  const currentAgent = cleanAgentId(existing.currentAgent, "");
+  const currentAgent = cleanAgentId(existing.current_agent, "");
   if (isThreadAgentId(currentAgent) && currentAgent !== agentId) {
     providerBindings[currentAgent] = {
       ...normalizeProviderBinding(providerBindings[currentAgent], currentAgent, {
-        activityStatus: "idle",
+        activity_status: "idle",
         coordination: existing.coordination,
-        lastActiveAt: existing.lastActiveAt,
-        lastMessageAt: existing.lastMessageAt,
-        messageCount: existing.messageCount,
+        last_active_at: existing.last_active_at,
+        last_message_at: existing.last_message_at,
+        message_count: existing.message_count,
         status: "closed",
-        terminalBinding: null,
-        updatedAt: now,
+        terminal_binding: null,
+        updated_at: now,
       }),
-      activityStatus: "idle",
+      activity_status: "idle",
       status: "closed",
-      terminalBinding: null,
-      updatedAt: now,
+      terminal_binding: null,
+      updated_at: now,
     };
   }
   if (isThreadAgentId(agentId)) {
     providerBindings[agentId] = {
       ...normalizeProviderBinding(providerBindings[agentId], agentId, {
-        activityStatus: "idle",
+        activity_status: "idle",
         coordination: existing.coordination,
-        lastActiveAt: now,
-        lastMessageAt: existing.lastMessageAt,
-        messageCount: existing.messageCount,
+        last_active_at: now,
+        last_message_at: existing.last_message_at,
+        message_count: existing.message_count,
         status: event.status || "starting",
-        terminalBinding: null,
-        updatedAt: now,
+        terminal_binding: null,
+        updated_at: now,
       }),
-      activityStatus: "idle",
-      lastActiveAt: now,
+      activity_status: "idle",
+      last_active_at: now,
       status: event.status || "starting",
-      terminalBinding: null,
-      updatedAt: now,
+      terminal_binding: null,
+      updated_at: now,
     };
   }
-  const terminalIndex = normalizeTerminalIndex(event.terminalIndex ?? existing.terminalIndex);
+  const terminalIndex = normalizeTerminalIndex(event.terminal_index ?? existing.terminal_index);
   const terminalKey = terminalSessionKey(terminalIndex);
   const existingTerminal = terminalKey ? entry.terminals[terminalKey] : null;
   if (
     terminalKey
     && existingTerminal
-    && cleanAgentId(existingTerminal.agentId, "") !== agentId
+    && cleanAgentId(existingTerminal.agent_id, "") !== agentId
   ) {
     delete entry.terminals[terminalKey];
-    entry.terminalOrder = entry.terminalOrder.filter((key) => key !== terminalKey);
+    entry.terminal_order = entry.terminal_order.filter((key) => key !== terminalKey);
   }
-  const existingLatestTurn = normalizeThreadLatestTurn(existing.latestTurn);
+  const existingLatestTurn = normalizeThreadLatestTurn(existing.latest_turn);
   const nextLatestTurn = existingLatestTurn?.state === "running"
     ? normalizeThreadLatestTurn({
       ...existingLatestTurn,
-      completedAt: now,
+      completed_at: now,
       error: cleanText(event.reason || "Terminal agent changed."),
       state: "interrupted",
-      updatedAt: now,
+      updated_at: now,
     })
-    : existing.latestTurn;
+    : existing.latest_turn;
   rememberTerminalThread(entry, terminalIndex, threadId);
-  entry.activeThreadId = threadId;
+  entry.active_thread_id = threadId;
   entry.threads[threadId] = {
     ...existing,
-    activityStatus: "idle",
-    currentAgent: agentId,
-    latestTurn: nextLatestTurn,
-    preferredAgent: agentId,
-    providerBindings,
+    activity_status: "idle",
+    current_agent: agentId,
+    latest_turn: nextLatestTurn,
+    preferred_agent: agentId,
+    provider_bindings: providerBindings,
     status: event.status || existing.status,
-    terminalBinding: event.status === "starting" ? null : existing.terminalBinding,
-    terminalIndex,
-    updatedAt: now,
+    terminal_binding: event.status === "starting" ? null : existing.terminal_binding,
+    terminal_index: terminalIndex,
+    updated_at: now,
   };
 
   return markWorkspaceThreadsMutationResult(state, {
@@ -6513,8 +6202,8 @@ function workspaceThreadHasProviderSession(thread, agentId, sessionId) {
   }
 
   const providerBinding = getWorkspaceThreadProviderBinding(thread, agentId);
-  return cleanText(thread.transcriptSessionId) === safeSessionId
-    || cleanText(providerBinding?.nativeSessionId) === safeSessionId;
+  return cleanText(thread.transcript_session_id) === safeSessionId
+    || cleanText(providerBinding?.native_session_id) === safeSessionId;
 }
 
 function workspaceThreadHasConversationContent(thread) {
@@ -6526,11 +6215,11 @@ function workspaceThreadHasConversationContent(thread) {
     return true;
   }
 
-  if (normalizeMessageCount(thread?.messageCount) > 0) {
+  if (normalizeMessageCount(thread?.message_count) > 0) {
     return true;
   }
 
-  return normalizeThreadProjectionEvents(thread?.projectionEvents).some((event) => (
+  return normalizeThreadProjectionEvents(thread?.projection_events).some((event) => (
     event.type === "thread.message.user"
       || event.type === "thread.message.assistant.delta"
       || event.type === "thread.message.assistant.complete"
@@ -6543,14 +6232,14 @@ function workspaceThreadHasAssistantConversationContent(thread) {
     return true;
   }
 
-  return normalizeThreadProjectionEvents(thread?.projectionEvents).some((event) => (
+  return normalizeThreadProjectionEvents(thread?.projection_events).some((event) => (
     (event.type === "thread.message.assistant.delta" || event.type === "thread.message.assistant.complete")
       && cleanMessageText(event.text || event.delta)
   ));
 }
 
 function workspaceThreadIsDetachedSessionClaim(thread) {
-  const duplicateHasTerminalBinding = Boolean(normalizeTerminalBinding(thread?.terminalBinding));
+  const duplicateHasTerminalBinding = Boolean(normalizeTerminalBinding(thread?.terminal_binding));
   const duplicateStatus = cleanText(thread?.status).toLowerCase();
   return !duplicateHasTerminalBinding
     && (!duplicateStatus || ["idle", "closed", "exited"].includes(duplicateStatus));
@@ -6559,7 +6248,7 @@ function workspaceThreadIsDetachedSessionClaim(thread) {
 function workspaceThreadHasLiveSessionClaim(thread) {
   const status = cleanText(thread?.status).toLowerCase();
   return Boolean(
-    normalizeTerminalBinding(thread?.terminalBinding)
+    normalizeTerminalBinding(thread?.terminal_binding)
       || status === "active"
       || status === "starting"
   );
@@ -6567,10 +6256,10 @@ function workspaceThreadHasLiveSessionClaim(thread) {
 
 function workspaceThreadCanClaimProviderSession(thread) {
   return Boolean(
-    thread?.freshSessionStartedAt
-      || thread?.pendingPrompt
+    thread?.fresh_session_started_at
+      || thread?.pending_prompt
       || workspaceThreadHasConversationContent(thread)
-      || normalizeThreadProjectionEvents(thread?.projectionEvents).length > 0
+      || normalizeThreadProjectionEvents(thread?.projection_events).length > 0
       || workspaceThreadHasLiveSessionClaim(thread),
   );
 }
@@ -6594,64 +6283,64 @@ function releaseWorkspaceThreadProviderSession(thread, agentId, sessionId, relea
   }
 
   const providerBindings = normalizeProviderBindings(
-    thread.providerBindings,
-    thread.currentAgent,
+    thread.provider_bindings,
+    thread.current_agent,
     {
-      activityStatus: "idle",
+      activity_status: "idle",
       coordination: thread.coordination,
-      lastActiveAt: thread.lastActiveAt,
-      lastMessageAt: thread.lastMessageAt,
-      messageCount: thread.messageCount,
+      last_active_at: thread.last_active_at,
+      last_message_at: thread.last_message_at,
+      message_count: thread.message_count,
       status: thread.status,
-      terminalBinding: null,
-      updatedAt: releasedAt,
+      terminal_binding: null,
+      updated_at: releasedAt,
     },
   );
   const providerBinding = normalizeProviderBinding(providerBindings[agentId], agentId, {
-    activityStatus: "idle",
+    activity_status: "idle",
     coordination: thread.coordination,
-    lastActiveAt: thread.lastActiveAt,
-    lastMessageAt: thread.lastMessageAt,
-    messageCount: thread.messageCount,
+    last_active_at: thread.last_active_at,
+    last_message_at: thread.last_message_at,
+    message_count: thread.message_count,
     status: thread.status,
-    terminalBinding: null,
-    updatedAt: releasedAt,
+    terminal_binding: null,
+    updated_at: releasedAt,
   });
-  if (providerBinding && cleanText(providerBinding.nativeSessionId) === safeSessionId) {
+  if (providerBinding && cleanText(providerBinding.native_session_id) === safeSessionId) {
     providerBindings[agentId] = {
       ...providerBinding,
-      activityStatus: "idle",
-      inputReady: false,
-      inputReadyAt: "",
-      inputReadyConfidence: "",
-      nativeSessionId: "",
-      nativeSessionKind: "",
-      nativeSessionSource: "",
-      nativeSessionUpdatedAt: releasedAt,
+      activity_status: "idle",
+      input_ready: false,
+      input_ready_at: "",
+      input_ready_confidence: "",
+      native_session_id: "",
+      native_session_kind: "",
+      native_session_source: "",
+      native_session_updated_at: releasedAt,
       status: cleanText(thread.status).toLowerCase() === "active" ? "idle" : providerBinding.status,
-      terminalBinding: null,
-      updatedAt: releasedAt,
+      terminal_binding: null,
+      updated_at: releasedAt,
     };
   }
 
-  const latestTurn = normalizeThreadLatestTurn(thread.latestTurn);
+  const latestTurn = normalizeThreadLatestTurn(thread.latest_turn);
   const isDetachedClaim = workspaceThreadIsDetachedSessionClaim(thread);
   const shouldClearRunningTurn = latestTurn?.state === "running"
     && isDetachedClaim
     && !workspaceThreadHasAssistantConversationContent(thread);
-  const shouldClearTranscriptSession = cleanText(thread.transcriptSessionId) === safeSessionId;
+  const shouldClearTranscriptSession = cleanText(thread.transcript_session_id) === safeSessionId;
 
   return {
     ...thread,
-    activityStatus: "idle",
-    latestTurn: shouldClearRunningTurn ? null : thread.latestTurn,
-    providerBindings,
+    activity_status: "idle",
+    latest_turn: shouldClearRunningTurn ? null : thread.latest_turn,
+    provider_bindings: providerBindings,
     status: cleanText(thread.status).toLowerCase() === "active" ? "idle" : thread.status,
-    terminalBinding: null,
-    transcriptHydrationMode: shouldClearTranscriptSession ? "" : thread.transcriptHydrationMode,
-    transcriptSessionId: shouldClearTranscriptSession ? "" : thread.transcriptSessionId,
-    transcriptStatus: shouldClearTranscriptSession ? "idle" : thread.transcriptStatus,
-    updatedAt: releasedAt,
+    terminal_binding: null,
+    transcript_hydration_mode: shouldClearTranscriptSession ? "" : thread.transcript_hydration_mode,
+    transcript_session_id: shouldClearTranscriptSession ? "" : thread.transcript_session_id,
+    transcript_status: shouldClearTranscriptSession ? "idle" : thread.transcript_status,
+    updated_at: releasedAt,
   };
 }
 
@@ -6709,15 +6398,15 @@ function summarizeTranscriptMessagesForDiagnostics(messages) {
     count: normalizedMessages.length,
     roleCounts,
     lastMessages: normalizedMessages.slice(-4).map((message) => ({
-      agentId: cleanText(message.agentId),
-      createdAtPresent: Boolean(cleanText(message.createdAt)),
+      agent_id: cleanText(message.agent_id),
+      createdAtPresent: Boolean(cleanText(message.created_at)),
       idPresent: Boolean(cleanText(message.id)),
       kind: cleanText(message.kind),
       role: cleanText(message.role),
       source: cleanText(message.source),
       status: cleanText(message.status),
       textLength: cleanMessageText(message.text).length,
-      turnIdPresent: Boolean(cleanText(message.turnId)),
+      turnIdPresent: Boolean(cleanText(message.turn_id)),
     })),
   };
 }
@@ -6728,12 +6417,12 @@ function summarizeWorkspaceThreadSessionClaimForDiagnostics(thread, agentId, ses
   }
 
   const messages = normalizeThreadMessages(thread.messages);
-  const projectionEvents = normalizeThreadProjectionEvents(thread.projectionEvents);
-  const latestTurn = normalizeThreadLatestTurn(thread.latestTurn);
+  const projectionEvents = normalizeThreadProjectionEvents(thread.projection_events);
+  const latestTurn = normalizeThreadLatestTurn(thread.latest_turn);
   const binding = getWorkspaceThreadProviderBinding(thread, agentId);
   const lastMessage = messages[messages.length - 1] || null;
   return {
-    activityStatus: cleanText(thread.activityStatus),
+    activity_status: cleanText(thread.activity_status),
     assistantMessageCount: messages.filter((message) => message.role === "assistant").length,
     canYieldToTarget: targetThread
       ? workspaceThreadDuplicateProviderSessionCanYield(targetThread, thread)
@@ -6742,18 +6431,18 @@ function summarizeWorkspaceThreadSessionClaimForDiagnostics(thread, agentId, ses
     hasConversationContent: workspaceThreadHasConversationContent(thread),
     hasLiveSessionClaim: workspaceThreadHasLiveSessionClaim(thread),
     hasProviderSession: workspaceThreadHasProviderSession(thread, agentId, sessionId),
-    hasTerminalBinding: Boolean(normalizeTerminalBinding(thread.terminalBinding)),
+    hasTerminalBinding: Boolean(normalizeTerminalBinding(thread.terminal_binding)),
     isDetachedSessionClaim: workspaceThreadIsDetachedSessionClaim(thread),
     lastRole: cleanText(lastMessage?.role),
     lastTextLength: cleanMessageText(lastMessage?.text).length,
     latestTurnState: cleanText(latestTurn?.state),
-    messageCount: messages.length,
-    providerSessionIdPresent: Boolean(cleanText(binding?.nativeSessionId)),
+    message_count: messages.length,
+    providerSessionIdPresent: Boolean(cleanText(binding?.native_session_id)),
     projectionEventCount: projectionEvents.length,
     status: cleanText(thread.status),
-    threadId: cleanText(thread.id),
-    transcriptHydrationMode: cleanText(thread.transcriptHydrationMode),
-    transcriptSessionIdPresent: Boolean(cleanText(thread.transcriptSessionId)),
+    thread_id: cleanText(thread.id),
+    transcript_hydration_mode: cleanText(thread.transcript_hydration_mode),
+    transcriptSessionIdPresent: Boolean(cleanText(thread.transcript_session_id)),
     userMessageCount: messages.filter((message) => message.role === "user").length,
   };
 }
@@ -6782,27 +6471,27 @@ function diagnoseWorkspaceThreadSessionDuplicateClaims(entry, agentId, sessionId
 }
 
 function createTranscriptHydrationProjectionPreview(existing, event, agentId) {
-  const transcriptExplicitCompletionCanSettleTurn = event.transcriptExplicitCompletionCanSettleTurn === true;
+  const transcriptExplicitCompletionCanSettleTurn = event.transcript_explicit_completion_can_settle_turn === true;
   const projectionEventsBefore = ensureThreadProjectionEvents(existing);
   const projectionEventsToAdd = createProjectionEventsFromTranscript(existing, event.messages, {
-    agentId,
-    completedAt: event.completedAt,
-    expectedMessageCreatedAt: event.expectedMessageCreatedAt,
-    expectedUserMessage: event.expectedUserMessage,
-    latestTimestamp: event.latestTimestamp,
-    matchedBy: event.matchedBy,
-    preferLiveHookAssistantMessages: event.preferLiveHookAssistantMessages,
-    promptEpoch: event.promptEpoch || event.prompt_epoch,
-    promptEventId: event.promptEventId || event.pendingPromptId || event.promptId,
-    promptAccepted: event.promptAccepted,
-    promptEventSubmittedAt: event.promptEventSubmittedAt,
+    agent_id: agentId,
+    completed_at: event.completed_at,
+    expected_message_created_at: event.expected_message_created_at,
+    expected_user_message: event.expected_user_message,
+    latest_timestamp: event.latest_timestamp,
+    matched_by: event.matched_by,
+    prefer_live_hook_assistant_messages: event.prefer_live_hook_assistant_messages,
+    prompt_epoch: event.prompt_epoch,
+    prompt_event_id: event.prompt_event_id || event.pending_prompt_id || event.prompt_id,
+    prompt_accepted: event.prompt_accepted,
+    prompt_event_submitted_at: event.prompt_event_submitted_at,
     source: cleanText(event.source, `${agentId}-session`),
-    submittedAt: event.submittedAt,
-    allowTranscriptTurnCompletion: event.allowTranscriptTurnCompletion,
-    assistantResponseCompletesTurn: event.assistantResponseCompletesTurn,
-    transcriptCompletionCanSettleTurn: event.transcriptCompletionCanSettleTurn,
-    transcriptExplicitCompletionCanSettleTurn: event.transcriptExplicitCompletionCanSettleTurn,
-    turnCompleteSeen: event.turnCompleteSeen,
+    submitted_at: event.submitted_at,
+    allow_transcript_turn_completion: event.allow_transcript_turn_completion,
+    assistant_response_completes_turn: event.assistant_response_completes_turn,
+    transcript_completion_can_settle_turn: event.transcript_completion_can_settle_turn,
+    transcript_explicit_completion_can_settle_turn: event.transcript_explicit_completion_can_settle_turn,
+    turn_complete_seen: event.turn_complete_seen,
   });
   const projectionEventsAfter = appendThreadProjectionEvents(
     projectionEventsBefore,
@@ -6810,7 +6499,7 @@ function createTranscriptHydrationProjectionPreview(existing, event, agentId) {
   );
   const messagesBefore = normalizeThreadMessages(existing?.messages);
   const messagesAfter = projectThreadProjectionMessagesFromNormalizedEvents(projectionEventsAfter, existing?.messages);
-  const latestTurnBefore = normalizeThreadLatestTurn(existing?.latestTurn);
+  const latestTurnBefore = normalizeThreadLatestTurn(existing?.latest_turn);
   const latestTurnAfter = latestTurnBefore;
   const lastBefore = messagesBefore[messagesBefore.length - 1] || null;
   const lastAfter = messagesAfter[messagesAfter.length - 1] || null;
@@ -6834,27 +6523,27 @@ function createTranscriptHydrationProjectionPreview(existing, event, agentId) {
 }
 
 export function diagnoseWorkspaceThreadSessionTranscriptHydration(state, event = {}) {
-  const workspaceId = cleanText(event.workspaceId);
-  const threadId = cleanText(event.threadId);
-  const agentId = cleanAgentId(event.agentId || event.currentAgent || "codex", "");
-  const sessionId = cleanText(event.sessionId || event.providerSessionId || event.nativeSessionId);
-  const requestedProviderSessionId = cleanText(event.requestedProviderSessionId || event.requestedNativeSessionId);
-  const matchedBy = cleanText(event.matchedBy).toLowerCase();
+  const workspaceId = cleanText(event.workspace_id);
+  const threadId = cleanText(event.thread_id);
+  const agentId = cleanAgentId(event.agent_id || event.current_agent || "codex", "");
+  const sessionId = cleanText(event.session_id || event.provider_session_id || event.native_session_id);
+  const requestedProviderSessionId = cleanText(event.requested_provider_session_id || event.requested_native_session_id);
+  const matchedBy = cleanText(event.matched_by).toLowerCase();
   const currentState = normalizeWorkspaceThreads(state);
   const entry = workspaceId ? currentState[workspaceId] : null;
   const existing = entry?.threads?.[threadId] || null;
   const transcriptMessages = summarizeTranscriptMessagesForDiagnostics(event.messages);
   const base = {
-    agentId,
+    agent_id: agentId,
     hasEntry: Boolean(entry),
     hasExistingThread: Boolean(existing),
     incomingTranscript: transcriptMessages,
-    matchedBy,
+    matched_by: matchedBy,
     requestedProviderSessionIdPresent: Boolean(requestedProviderSessionId),
     sessionIdPresent: Boolean(sessionId),
-    threadId,
+    thread_id: threadId,
     validAgentId: isThreadAgentId(agentId),
-    workspaceId,
+    workspace_id: workspaceId,
   };
 
   if (!workspaceId || !threadId || !isThreadAgentId(agentId)) {
@@ -6900,7 +6589,7 @@ export function diagnoseWorkspaceThreadSessionTranscriptHydration(state, event =
     ? "archived_thread_id"
     : existing.archivedAt
       ? "thread_archived_at"
-      : existing.transcriptHydrationMode === "session-only"
+      : existing.transcript_hydration_mode === "session-only"
         && !requestedProviderSessionId
         && matchedBy !== "sessionid"
         ? "session_only_without_requested_session"
@@ -6918,7 +6607,7 @@ export function diagnoseWorkspaceThreadSessionTranscriptHydration(state, event =
     archivedSession,
     archivedThread,
     blockedReason,
-    blockingDuplicateThreadId: cleanText(blockingDuplicate?.threadId),
+    blockingDuplicateThreadId: cleanText(blockingDuplicate?.thread_id),
     duplicateClaimCount: duplicateClaims.length,
     duplicateClaims,
     existingArchivedAtPresent: Boolean(cleanText(existing.archivedAt)),
@@ -6936,8 +6625,8 @@ function collectWorkspaceThreadSessionIds(thread, agentId = "") {
 
   const sessionIds = new Set();
   [
-    thread.transcriptSessionId,
-    thread.coordination?.sessionId,
+    thread.transcript_session_id,
+    thread.coordination?.session_id,
   ].forEach((sessionId) => {
     const safeSessionId = cleanText(sessionId);
     if (safeSessionId) {
@@ -6948,9 +6637,9 @@ function collectWorkspaceThreadSessionIds(thread, agentId = "") {
   const safeAgentId = cleanAgentId(agentId, "");
   const bindings = safeAgentId
     ? [getWorkspaceThreadProviderBinding(thread, safeAgentId)]
-    : Object.values(thread.providerBindings || {});
+    : Object.values(thread.provider_bindings || {});
   bindings.forEach((binding) => {
-    const safeSessionId = cleanText(binding?.nativeSessionId);
+    const safeSessionId = cleanText(binding?.native_session_id);
     if (safeSessionId) {
       sessionIds.add(safeSessionId);
     }
@@ -6961,16 +6650,16 @@ function collectWorkspaceThreadSessionIds(thread, agentId = "") {
 
 function workspaceEntryHasArchivedThreadId(entry, threadId) {
   const safeThreadId = cleanText(threadId);
-  return Boolean(safeThreadId && entry?.archivedThreads?.[safeThreadId]);
+  return Boolean(safeThreadId && entry?.archived_threads?.[safeThreadId]);
 }
 
 function workspaceEntryHasArchivedSession(entry, agentId, sessionId) {
   const safeSessionId = cleanText(sessionId);
-  if (!entry?.archivedThreads || !safeSessionId) {
+  if (!entry?.archived_threads || !safeSessionId) {
     return false;
   }
 
-  return Object.values(entry.archivedThreads).some((thread) => (
+  return Object.values(entry.archived_threads).some((thread) => (
     collectWorkspaceThreadSessionIds(thread, agentId).includes(safeSessionId)
   ));
 }
@@ -7012,7 +6701,7 @@ function findWorkspaceThreadIdForProviderSession(entry, agentId, sessionId, igno
 }
 
 function findWorkspaceThreadIdForTerminalSessionBinding(entry, event = {}, agentId = "", sessionId = "") {
-  const directThreadId = cleanText(event.threadId);
+  const directThreadId = cleanText(event.thread_id);
   if (directThreadId && entry?.threads?.[directThreadId]) {
     return directThreadId;
   }
@@ -7022,23 +6711,23 @@ function findWorkspaceThreadIdForTerminalSessionBinding(entry, event = {}, agent
     return sessionThreadId;
   }
 
-  const paneId = cleanText(event.paneId);
-  const instanceId = Number.parseInt(event.instanceId, 10);
-  const terminalIndex = normalizeTerminalIndex(event.terminalIndex);
+  const paneId = cleanText(event.pane_id);
+  const instanceId = Number.parseInt(event.instance_id, 10);
+  const terminalIndex = normalizeTerminalIndex(event.terminal_index);
   const terminalKey = terminalSessionKey(terminalIndex);
-  const terminalThreadId = terminalKey ? cleanText(entry?.terminals?.[terminalKey]?.threadId) : "";
+  const terminalThreadId = terminalKey ? cleanText(entry?.terminals?.[terminalKey]?.thread_id) : "";
   if (terminalThreadId && entry?.threads?.[terminalThreadId]) {
     return terminalThreadId;
   }
 
   const exactTerminalThread = Object.values(entry?.threads || {}).find((thread) => {
-    const binding = normalizeTerminalBinding(thread?.terminalBinding);
+    const binding = normalizeTerminalBinding(thread?.terminal_binding);
     const providerBinding = getWorkspaceThreadProviderBinding(thread, agentId);
-    const providerTerminalBinding = normalizeTerminalBinding(providerBinding?.terminalBinding);
+    const providerTerminalBinding = normalizeTerminalBinding(providerBinding?.terminal_binding);
     return [binding, providerTerminalBinding].some((candidate) => (
       candidate
-        && (!paneId || candidate.paneId === paneId)
-        && (!Number.isInteger(instanceId) || Number(candidate.instanceId) === instanceId)
+        && (!paneId || candidate.pane_id === paneId)
+        && (!Number.isInteger(instanceId) || Number(candidate.instance_id) === instanceId)
     ));
   });
   if (exactTerminalThread?.id) {
@@ -7046,14 +6735,14 @@ function findWorkspaceThreadIdForTerminalSessionBinding(entry, event = {}, agent
   }
 
   const terminalByPane = Object.values(entry?.terminals || {}).find((terminal) => (
-    (paneId && terminal?.paneId === paneId)
-      || (Number.isInteger(instanceId) && Number(terminal?.instanceId) === instanceId)
+    (paneId && terminal?.pane_id === paneId)
+      || (Number.isInteger(instanceId) && Number(terminal?.instance_id) === instanceId)
   ));
-  if (terminalByPane?.threadId && entry?.threads?.[terminalByPane.threadId]) {
-    return terminalByPane.threadId;
+  if (terminalByPane?.thread_id && entry?.threads?.[terminalByPane.thread_id]) {
+    return terminalByPane.thread_id;
   }
 
-  const restoredThreadId = terminalKey ? cleanText(entry?.terminalThreadIds?.[terminalKey]) : "";
+  const restoredThreadId = terminalKey ? cleanText(entry?.terminal_thread_ids?.[terminalKey]) : "";
   if (restoredThreadId && entry?.threads?.[restoredThreadId]) {
     return restoredThreadId;
   }
@@ -7063,29 +6752,17 @@ function findWorkspaceThreadIdForTerminalSessionBinding(entry, event = {}, agent
 }
 
 export function applyWorkspaceThreadProviderSessionBinding(state, event = {}) {
-  const workspaceId = cleanText(event.workspaceId);
-  const agentId = cleanAgentId(event.agentId || event.currentAgent, "");
+  const workspaceId = cleanText(event.workspace_id);
+  const agentId = cleanAgentId(event.agent_id || event.current_agent, "");
   const nativeSessionId = cleanText(
-    event.nativeSessionId
-      || event.native_session_id
-      || event.providerSessionId
-      || event.provider_session_id
-      || event.sessionId
-      || event.session_id,
+    event.native_session_id || event.provider_session_id || event.session_id,
   );
   const forkFromProviderSessionId = cleanText(
-    event.forkFromProviderSessionId
-      || event.fork_from_provider_session_id
-      || event.forkedFromProviderSessionId
-      || event.forked_from_provider_session_id
-      || event.parentProviderSessionId
-      || event.parent_provider_session_id,
+    event.fork_from_provider_session_id || event.forked_from_provider_session_id || event.parent_provider_session_id,
   );
-  const sharedHistoryId = cleanText(event.sharedHistoryId || event.shared_history_id || event.historyGroupId || event.history_group_id);
+  const sharedHistoryId = cleanText(event.shared_history_id || event.history_group_id);
   const relatedProviderSessionIds = cleanTextArray(
-    event.relatedProviderSessionIds,
     event.related_provider_session_ids,
-    event.relatedSessionIds,
     event.related_session_ids,
     forkFromProviderSessionId,
   );
@@ -7099,7 +6776,7 @@ export function applyWorkspaceThreadProviderSessionBinding(state, event = {}) {
     return state || {};
   }
 
-  const terminalIndex = normalizeTerminalIndex(event.terminalIndex);
+  const terminalIndex = normalizeTerminalIndex(event.terminal_index);
   let threadId = findWorkspaceThreadIdForTerminalSessionBinding(entry, event, agentId, nativeSessionId);
   if (!threadId && terminalIndex != null) {
     threadId = createThreadIdForTerminal(workspaceId, terminalIndex);
@@ -7112,11 +6789,8 @@ export function applyWorkspaceThreadProviderSessionBinding(state, event = {}) {
   const terminalNickname = resolveWorkspaceTerminalNickname(
     entry,
     [
-      event.terminalNickname,
       event.terminal_nickname,
-      event.terminalName,
       event.terminal_name,
-      event.displayName,
       event.display_name,
       workspaceTerminalNicknameFromRecord(entry.threads?.[threadId]),
       workspaceTerminalNicknameFromRecord(getWorkspaceThreadProviderBinding(entry.threads?.[threadId], agentId)),
@@ -7127,42 +6801,42 @@ export function applyWorkspaceThreadProviderSessionBinding(state, event = {}) {
     },
   );
   if (!entry.threads[threadId]) {
-    const title = cleanRealThreadTitleCandidate(event.nativeSessionTitle || event.sessionTitle)
+    const title = cleanRealThreadTitleCandidate(event.native_session_title || event.session_title)
       || defaultThreadTitle(terminalIndex ?? 0, agentId);
     entry.threads[threadId] = {
       coordination: normalizeCoordination({
-        worktreePath: event.worktreePath || event.cwd,
+        worktree_path: event.worktree_path || event.cwd,
       }),
-      createdAt: now,
-      currentAgent: agentId,
-      displayName: terminalNickname,
-      forkFromProviderSessionId,
+      created_at: now,
+      current_agent: agentId,
+      display_name: terminalNickname,
+      fork_from_provider_session_id: forkFromProviderSessionId,
       id: threadId,
-      lastActiveAt: now,
-      lastMessageAt: "",
-      latestTurn: null,
+      last_active_at: now,
+      last_message_at: "",
+      latest_turn: null,
       materialized: true,
-      messageCount: 0,
+      message_count: 0,
       messages: [],
-      pendingPrompt: null,
-      preferredAgent: agentId,
-      projectionEvents: [],
-      providerBindings: {},
-      relatedProviderSessionIds,
-      sessionName: title,
-      sharedHistoryId,
-      slotKey: cleanText(event.slotKey, defaultSlotKey(terminalIndex)),
+      pending_prompt: null,
+      preferred_agent: agentId,
+      projection_events: [],
+      provider_bindings: {},
+      related_provider_session_ids: relatedProviderSessionIds,
+      session_name: title,
+      shared_history_id: sharedHistoryId,
+      slot_key: cleanText(event.slot_key, defaultSlotKey(terminalIndex)),
       status: cleanText(event.status, "active"),
-      terminalBinding: null,
-      terminalIndex,
-      terminalName: terminalNickname,
-      terminalNickname,
+      terminal_binding: null,
+      terminal_index: terminalIndex,
+      terminal_name: terminalNickname,
+      terminal_nickname: terminalNickname,
       title,
-      transcriptSessionId: nativeSessionId,
-      updatedAt: now,
-      workspaceId,
+      transcript_session_id: nativeSessionId,
+      updated_at: now,
+      workspace_id: workspaceId,
     };
-    entry.threadOrder.push(threadId);
+    entry.thread_order.push(threadId);
   }
 
   const existingThread = entry.threads[threadId] || null;
@@ -7170,31 +6844,29 @@ export function applyWorkspaceThreadProviderSessionBinding(state, event = {}) {
   const existingTerminal = terminalKey ? entry.terminals?.[terminalKey] || null : null;
   const inheritedActivityStatus = explicitRuntimeActivityStatus(event, "")
     || normalizeThreadActivityStatus(
-      existingTerminal?.activityStatus
-        || existingTerminal?.activity_status,
+      existingTerminal?.activity_status,
       "",
     );
   const bindingEvent = {
     ...event,
-    activityStatus: inheritedActivityStatus || event.activityStatus,
     activity_status: inheritedActivityStatus || event.activity_status,
-    agentId,
-    forkFromProviderSessionId,
-    nativeSessionId,
-    nativeSessionKind: cleanText(event.nativeSessionKind || event.native_session_kind, "session"),
-    nativeSessionSource: cleanText(event.nativeSessionSource || event.native_session_source || event.source, "rust-session-binding"),
-    providerSessionId: nativeSessionId,
-    relatedProviderSessionIds,
-    sessionId: event.sessionId || event.session_id || nativeSessionId,
-    sharedHistoryId,
+    agent_id: agentId,
+    fork_from_provider_session_id: forkFromProviderSessionId,
+    native_session_id: nativeSessionId,
+    native_session_kind: cleanText(event.native_session_kind, "session"),
+    native_session_source: cleanText(event.native_session_source || event.source, "rust-session-binding"),
+    provider_session_id: nativeSessionId,
+    related_provider_session_ids: relatedProviderSessionIds,
+    session_id: event.session_id || nativeSessionId,
+    shared_history_id: sharedHistoryId,
     status: event.status || "active",
-    terminalIndex,
-    threadId,
-    workspaceId,
+    terminal_index: terminalIndex,
+    thread_id: threadId,
+    workspace_id: workspaceId,
   };
   upsertActiveTerminal(entry, bindingEvent, {
     status: bindingEvent.status,
-    threadId,
+    thread_id: threadId,
   });
   bindExistingThreadToTerminal(entry, threadId, bindingEvent, {
     status: bindingEvent.status,
@@ -7208,28 +6880,18 @@ export function applyWorkspaceThreadProviderSessionBinding(state, event = {}) {
 }
 
 export function updateWorkspaceThreadProviderSession(state, event = {}) {
-  const workspaceId = cleanText(event.workspaceId);
-  const threadId = cleanText(event.threadId);
-  const agentId = cleanAgentId(event.agentId || event.currentAgent, "");
+  const workspaceId = cleanText(event.workspace_id);
+  const threadId = cleanText(event.thread_id);
+  const agentId = cleanAgentId(event.agent_id || event.current_agent, "");
   const nativeSessionId = cleanText(
-    event.nativeSessionId
-      || event.native_session_id
-      || event.providerSessionId
-      || event.provider_session_id,
+    event.native_session_id || event.provider_session_id,
   );
   const forkFromProviderSessionId = cleanText(
-    event.forkFromProviderSessionId
-      || event.fork_from_provider_session_id
-      || event.forkedFromProviderSessionId
-      || event.forked_from_provider_session_id
-      || event.parentProviderSessionId
-      || event.parent_provider_session_id,
+    event.fork_from_provider_session_id || event.forked_from_provider_session_id || event.parent_provider_session_id,
   );
-  const sharedHistoryId = cleanText(event.sharedHistoryId || event.shared_history_id || event.historyGroupId || event.history_group_id);
+  const sharedHistoryId = cleanText(event.shared_history_id || event.history_group_id);
   const relatedProviderSessionIds = cleanTextArray(
-    event.relatedProviderSessionIds,
     event.related_provider_session_ids,
-    event.relatedSessionIds,
     event.related_session_ids,
     forkFromProviderSessionId,
   );
@@ -7274,107 +6936,107 @@ export function updateWorkspaceThreadProviderSession(state, event = {}) {
   }
 
   const now = nowIso();
-  const nativeSessionTitle = cleanRealThreadTitleCandidate(event.nativeSessionTitle || event.sessionTitle, existing);
+  const nativeSessionTitle = cleanRealThreadTitleCandidate(event.native_session_title || event.session_title, existing);
   const sessionTerminalBinding = normalizeTerminalBinding({
-    instanceId: event.instanceId ?? existing.terminalBinding?.instanceId,
-    paneId: event.paneId || existing.terminalBinding?.paneId,
-    terminalIndex: event.terminalIndex ?? existing.terminalIndex,
+    instance_id: event.instance_id ?? existing.terminal_binding?.instance_id,
+    pane_id: event.pane_id || existing.terminal_binding?.pane_id,
+    terminal_index: event.terminal_index ?? existing.terminal_index,
   });
   const providerBindings = normalizeProviderBindings(
-    existing.providerBindings,
-    existing.currentAgent,
+    existing.provider_bindings,
+    existing.current_agent,
     {
       coordination: existing.coordination,
-      lastActiveAt: existing.lastActiveAt,
-      lastMessageAt: existing.lastMessageAt,
-      messageCount: existing.messageCount,
+      last_active_at: existing.last_active_at,
+      last_message_at: existing.last_message_at,
+      message_count: existing.message_count,
       status: existing.status,
-      terminalBinding: existing.terminalBinding,
-      updatedAt: existing.updatedAt,
+      terminal_binding: existing.terminal_binding,
+      updated_at: existing.updated_at,
     },
   );
-  const modelId = cleanModelId(event.modelId || event.model);
+  const modelId = cleanModelId(event.model_id || event.model);
   providerBindings[agentId] = {
     ...normalizeProviderBinding(providerBindings[agentId], agentId, {
       coordination: existing.coordination,
-      lastActiveAt: existing.lastActiveAt,
-      lastMessageAt: existing.lastMessageAt,
-      messageCount: existing.messageCount,
+      last_active_at: existing.last_active_at,
+      last_message_at: existing.last_message_at,
+      message_count: existing.message_count,
       status: existing.status,
-      terminalBinding: existing.terminalBinding,
-      updatedAt: existing.updatedAt,
+      terminal_binding: existing.terminal_binding,
+      updated_at: existing.updated_at,
     }),
-    modelId: modelId || providerBindings[agentId]?.modelId || "",
-    modelSource: modelId ? cleanText(event.modelSource, "session") : providerBindings[agentId]?.modelSource || "",
+    model_id: modelId || providerBindings[agentId]?.model_id || "",
+    model_source: modelId ? cleanText(event.model_source, "session") : providerBindings[agentId]?.model_source || "",
     modelUpdatedAt: modelId ? now : providerBindings[agentId]?.modelUpdatedAt || "",
-    forkFromProviderSessionId: forkFromProviderSessionId || providerBindings[agentId]?.forkFromProviderSessionId || "",
-    nativeSessionId,
-    nativeSessionKind: cleanText(event.nativeSessionKind, "session"),
-    nativeSessionSource: cleanText(event.nativeSessionSource, "terminal-output"),
-    nativeSessionTitle: nativeSessionTitle || providerBindings[agentId]?.nativeSessionTitle || "",
-    nativeSessionTitleSource: nativeSessionTitle
-      ? cleanText(event.nativeSessionTitleSource || event.source, "provider")
-      : providerBindings[agentId]?.nativeSessionTitleSource || "",
+    fork_from_provider_session_id: forkFromProviderSessionId || providerBindings[agentId]?.fork_from_provider_session_id || "",
+    native_session_id: nativeSessionId,
+    native_session_kind: cleanText(event.native_session_kind, "session"),
+    native_session_source: cleanText(event.native_session_source, "terminal-output"),
+    native_session_title: nativeSessionTitle || providerBindings[agentId]?.native_session_title || "",
+    native_session_title_source: nativeSessionTitle
+      ? cleanText(event.native_session_title_source || event.source, "provider")
+      : providerBindings[agentId]?.native_session_title_source || "",
     nativeSessionTitleUpdatedAt: nativeSessionTitle
       ? now
       : providerBindings[agentId]?.nativeSessionTitleUpdatedAt || "",
-    nativeSessionUpdatedAt: now,
-    relatedProviderSessionIds: relatedProviderSessionIds.length
+    native_session_updated_at: now,
+    related_provider_session_ids: relatedProviderSessionIds.length
       ? relatedProviderSessionIds
-      : cleanTextArray(providerBindings[agentId]?.relatedProviderSessionIds),
-    sharedHistoryId: sharedHistoryId || providerBindings[agentId]?.sharedHistoryId || "",
-    terminalBinding: sessionTerminalBinding || providerBindings[agentId]?.terminalBinding || existing.terminalBinding || null,
-    updatedAt: now,
+      : cleanTextArray(providerBindings[agentId]?.related_provider_session_ids),
+    shared_history_id: sharedHistoryId || providerBindings[agentId]?.shared_history_id || "",
+    terminal_binding: sessionTerminalBinding || providerBindings[agentId]?.terminal_binding || existing.terminal_binding || null,
+    updated_at: now,
   };
-  const effectiveTerminalBinding = providerBindings[agentId]?.terminalBinding
+  const effectiveTerminalBinding = providerBindings[agentId]?.terminal_binding
     || sessionTerminalBinding
-    || existing.terminalBinding
+    || existing.terminal_binding
     || null;
   const terminalKey = getTerminalKeyForEvent(entry, {
     ...event,
-    terminalIndex: event.terminalIndex
-      ?? sessionTerminalBinding?.terminalIndex
-      ?? effectiveTerminalBinding?.terminalIndex
-      ?? existing.terminalIndex,
-    threadId,
+    terminal_index: event.terminal_index
+      ?? sessionTerminalBinding?.terminal_index
+      ?? effectiveTerminalBinding?.terminal_index
+      ?? existing.terminal_index,
+    thread_id: threadId,
   });
   const terminals = { ...entry.terminals };
   if (terminalKey && terminals[terminalKey]) {
     const terminal = terminals[terminalKey];
     terminals[terminalKey] = normalizeActiveTerminal({
       ...terminal,
-      activityStatus: explicitRuntimeActivityStatus(event, "")
-        || normalizeThreadActivityStatus(terminal.activityStatus || terminal.activity_status, "")
+      activity_status: explicitRuntimeActivityStatus(event, "")
+        || normalizeThreadActivityStatus(terminal.activity_status, "")
         || "idle",
-      agentId,
-      agentDisplayName: event.agentDisplayName || event.agent_display_name || terminal.agentDisplayName,
-      agentType: event.agentType || event.agent_type || terminal.agentType,
-      instanceId: event.instanceId ?? terminal.instanceId,
-      nativeSessionId,
-      paneId: event.paneId || terminal.paneId,
+      agent_id: agentId,
+      agent_display_name: event.agent_display_name || terminal.agent_display_name,
+      agent_type: event.agent_type || terminal.agent_type,
+      instance_id: event.instance_id ?? terminal.instance_id,
+      native_session_id: nativeSessionId,
+      pane_id: event.pane_id || terminal.pane_id,
       provider: event.provider || terminal.provider,
-      providerSessionId: nativeSessionId,
-      forkFromProviderSessionId: forkFromProviderSessionId || terminal.forkFromProviderSessionId,
-      relatedProviderSessionIds: relatedProviderSessionIds.length
+      provider_session_id: nativeSessionId,
+      fork_from_provider_session_id: forkFromProviderSessionId || terminal.fork_from_provider_session_id,
+      related_provider_session_ids: relatedProviderSessionIds.length
         ? relatedProviderSessionIds
-        : cleanTextArray(terminal.relatedProviderSessionIds),
-      sessionId: event.sessionId || event.session_id || nativeSessionId,
-      sharedHistoryId: sharedHistoryId || terminal.sharedHistoryId,
-      terminalIndex: normalizeTerminalIndex(
-        event.terminalIndex
-          ?? terminal.terminalIndex
-          ?? sessionTerminalBinding?.terminalIndex
-          ?? existing.terminalIndex,
+        : cleanTextArray(terminal.related_provider_session_ids),
+      session_id: event.session_id || nativeSessionId,
+      shared_history_id: sharedHistoryId || terminal.shared_history_id,
+      terminal_index: normalizeTerminalIndex(
+        event.terminal_index
+          ?? terminal.terminal_index
+          ?? sessionTerminalBinding?.terminal_index
+          ?? existing.terminal_index,
       ),
-      threadId,
-      updatedAt: now,
+      thread_id: threadId,
+      updated_at: now,
     }) || {
       ...terminal,
-      nativeSessionId,
-      providerSessionId: nativeSessionId,
-      sessionId: event.sessionId || event.session_id || nativeSessionId,
-      threadId,
-      updatedAt: now,
+      native_session_id: nativeSessionId,
+      provider_session_id: nativeSessionId,
+      session_id: event.session_id || nativeSessionId,
+      thread_id: threadId,
+      updated_at: now,
     };
   }
 
@@ -7387,18 +7049,18 @@ export function updateWorkspaceThreadProviderSession(state, event = {}) {
         ...entry.threads,
         [threadId]: {
           ...existing,
-          providerBindings,
-          forkFromProviderSessionId: forkFromProviderSessionId || existing.forkFromProviderSessionId || "",
-          relatedProviderSessionIds: relatedProviderSessionIds.length
+          provider_bindings: providerBindings,
+          fork_from_provider_session_id: forkFromProviderSessionId || existing.fork_from_provider_session_id || "",
+          related_provider_session_ids: relatedProviderSessionIds.length
             ? relatedProviderSessionIds
-            : cleanTextArray(existing.relatedProviderSessionIds),
-          sharedHistoryId: sharedHistoryId || existing.sharedHistoryId || "",
-          sessionName: nativeSessionTitle || existing.sessionName,
-          terminalBinding: effectiveTerminalBinding,
-          terminalIndex: effectiveTerminalBinding?.terminalIndex ?? existing.terminalIndex,
+            : cleanTextArray(existing.related_provider_session_ids),
+          shared_history_id: sharedHistoryId || existing.shared_history_id || "",
+          session_name: nativeSessionTitle || existing.session_name,
+          terminal_binding: effectiveTerminalBinding,
+          terminal_index: effectiveTerminalBinding?.terminal_index ?? existing.terminal_index,
           title: nativeSessionTitle || existing.title,
-          transcriptSessionId: nativeSessionId || existing.transcriptSessionId,
-          updatedAt: now,
+          transcript_session_id: nativeSessionId || existing.transcript_session_id,
+          updated_at: now,
         },
       },
     },
@@ -7406,9 +7068,9 @@ export function updateWorkspaceThreadProviderSession(state, event = {}) {
 }
 
 export function invalidateWorkspaceThreadProviderSession(state, event = {}) {
-  const workspaceId = cleanText(event.workspaceId);
-  const threadId = cleanText(event.threadId);
-  const agentId = cleanAgentId(event.agentId || event.currentAgent, "");
+  const workspaceId = cleanText(event.workspace_id);
+  const threadId = cleanText(event.thread_id);
+  const agentId = cleanAgentId(event.agent_id || event.current_agent, "");
   if (!workspaceId || !threadId || !isThreadAgentId(agentId)) {
     return state || {};
   }
@@ -7423,35 +7085,35 @@ export function invalidateWorkspaceThreadProviderSession(state, event = {}) {
   }
 
   const invalidSessionId = cleanText(
-    event.nativeSessionId
-      || event.providerSessionId
-      || event.sessionId
-      || existing.transcriptSessionId,
+    event.native_session_id
+      || event.provider_session_id
+      || event.session_id
+      || existing.transcript_session_id,
   );
   const providerBindings = normalizeProviderBindings(
-    existing.providerBindings,
-    existing.currentAgent,
+    existing.provider_bindings,
+    existing.current_agent,
     {
       coordination: existing.coordination,
-      lastActiveAt: existing.lastActiveAt,
-      lastMessageAt: existing.lastMessageAt,
-      messageCount: existing.messageCount,
+      last_active_at: existing.last_active_at,
+      last_message_at: existing.last_message_at,
+      message_count: existing.message_count,
       status: existing.status,
-      terminalBinding: existing.terminalBinding,
-      updatedAt: existing.updatedAt,
+      terminal_binding: existing.terminal_binding,
+      updated_at: existing.updated_at,
     },
   );
   const providerBinding = normalizeProviderBinding(providerBindings[agentId], agentId, {
     coordination: existing.coordination,
-    lastActiveAt: existing.lastActiveAt,
-    lastMessageAt: existing.lastMessageAt,
-    messageCount: existing.messageCount,
+    last_active_at: existing.last_active_at,
+    last_message_at: existing.last_message_at,
+    message_count: existing.message_count,
     status: existing.status,
-    terminalBinding: existing.terminalBinding,
-    updatedAt: existing.updatedAt,
+    terminal_binding: existing.terminal_binding,
+    updated_at: existing.updated_at,
   });
-  const bindingSessionId = cleanText(providerBinding?.nativeSessionId);
-  const transcriptSessionId = cleanText(existing.transcriptSessionId);
+  const bindingSessionId = cleanText(providerBinding?.native_session_id);
+  const transcriptSessionId = cleanText(existing.transcript_session_id);
   const invalidSessionMatchesThread = Boolean(
     !invalidSessionId
       || bindingSessionId === invalidSessionId
@@ -7467,36 +7129,36 @@ export function invalidateWorkspaceThreadProviderSession(state, event = {}) {
   );
   const nextProviderBinding = {
     ...providerBinding,
-    activityStatus: "idle",
-    inputReady: false,
-    inputReadyAt: "",
-    inputReadyConfidence: "",
+    activity_status: "idle",
+    input_ready: false,
+    input_ready_at: "",
+    input_ready_confidence: "",
     status: "idle",
-    terminalBinding: null,
-    updatedAt: now,
+    terminal_binding: null,
+    updated_at: now,
   };
   if (shouldClearBindingSession) {
-    nextProviderBinding.nativeSessionId = "";
-    nextProviderBinding.nativeSessionKind = "";
-    nextProviderBinding.nativeSessionSource = "";
-    nextProviderBinding.nativeSessionUpdatedAt = now;
+    nextProviderBinding.native_session_id = "";
+    nextProviderBinding.native_session_kind = "";
+    nextProviderBinding.native_session_source = "";
+    nextProviderBinding.native_session_updated_at = now;
   }
   providerBindings[agentId] = nextProviderBinding;
 
   const shouldClearTranscriptSession = Boolean(
-    existing.transcriptSessionId
-      && (!invalidSessionId || existing.transcriptSessionId === invalidSessionId),
+    existing.transcript_session_id
+      && (!invalidSessionId || existing.transcript_session_id === invalidSessionId),
   );
-  const latestTurn = normalizeThreadLatestTurn(existing.latestTurn);
+  const latestTurn = normalizeThreadLatestTurn(existing.latest_turn);
   const nextLatestTurn = latestTurn?.state === "running"
     ? normalizeThreadLatestTurn({
       ...latestTurn,
-      completedAt: now,
+      completed_at: now,
       error: cleanText(event.error || "Provider session was not available locally."),
       state: "interrupted",
-      updatedAt: now,
+      updated_at: now,
     })
-    : existing.latestTurn;
+    : existing.latest_turn;
 
   return markWorkspaceThreadsMutationResult(state, {
     ...currentState,
@@ -7506,14 +7168,14 @@ export function invalidateWorkspaceThreadProviderSession(state, event = {}) {
         ...entry.threads,
         [threadId]: {
           ...existing,
-          activityStatus: "idle",
-          latestTurn: nextLatestTurn,
-          providerBindings,
+          activity_status: "idle",
+          latest_turn: nextLatestTurn,
+          provider_bindings: providerBindings,
           status: existing.status === "active" ? "idle" : existing.status,
-          terminalBinding: null,
-          transcriptSessionId: shouldClearTranscriptSession ? "" : existing.transcriptSessionId,
-          transcriptStatus: shouldClearTranscriptSession ? "idle" : existing.transcriptStatus,
-          updatedAt: now,
+          terminal_binding: null,
+          transcript_session_id: shouldClearTranscriptSession ? "" : existing.transcript_session_id,
+          transcript_status: shouldClearTranscriptSession ? "idle" : existing.transcript_status,
+          updated_at: now,
         },
       },
     },
@@ -7521,10 +7183,10 @@ export function invalidateWorkspaceThreadProviderSession(state, event = {}) {
 }
 
 export function updateWorkspaceThreadProviderModel(state, event = {}) {
-  const workspaceId = cleanText(event.workspaceId);
-  const threadId = cleanText(event.threadId);
-  const agentId = cleanAgentId(event.agentId || event.currentAgent, "");
-  const modelId = cleanModelId(event.modelId || event.model);
+  const workspaceId = cleanText(event.workspace_id);
+  const threadId = cleanText(event.thread_id);
+  const agentId = cleanAgentId(event.agent_id || event.current_agent, "");
+  const modelId = cleanModelId(event.model_id || event.model);
   if (!workspaceId || !threadId || !isThreadAgentId(agentId) || !modelId) {
     return state || {};
   }
@@ -7537,32 +7199,32 @@ export function updateWorkspaceThreadProviderModel(state, event = {}) {
 
   const now = nowIso();
   const providerBindings = normalizeProviderBindings(
-    existing.providerBindings,
-    existing.currentAgent,
+    existing.provider_bindings,
+    existing.current_agent,
     {
       coordination: existing.coordination,
-      lastActiveAt: existing.lastActiveAt,
-      lastMessageAt: existing.lastMessageAt,
-      messageCount: existing.messageCount,
+      last_active_at: existing.last_active_at,
+      last_message_at: existing.last_message_at,
+      message_count: existing.message_count,
       status: existing.status,
-      terminalBinding: existing.terminalBinding,
-      updatedAt: existing.updatedAt,
+      terminal_binding: existing.terminal_binding,
+      updated_at: existing.updated_at,
     },
   );
   providerBindings[agentId] = {
     ...normalizeProviderBinding(providerBindings[agentId], agentId, {
       coordination: existing.coordination,
-      lastActiveAt: existing.lastActiveAt,
-      lastMessageAt: existing.lastMessageAt,
-      messageCount: existing.messageCount,
+      last_active_at: existing.last_active_at,
+      last_message_at: existing.last_message_at,
+      message_count: existing.message_count,
       status: existing.status,
-      terminalBinding: existing.currentAgent === agentId ? existing.terminalBinding : null,
-      updatedAt: existing.updatedAt,
+      terminal_binding: existing.current_agent === agentId ? existing.terminal_binding : null,
+      updated_at: existing.updated_at,
     }),
-    modelId,
-    modelSource: cleanText(event.modelSource, "user"),
+    model_id: modelId,
+    model_source: cleanText(event.model_source, "user"),
     modelUpdatedAt: now,
-    updatedAt: now,
+    updated_at: now,
   };
 
   return markWorkspaceThreadsMutationResult(state, {
@@ -7573,8 +7235,8 @@ export function updateWorkspaceThreadProviderModel(state, event = {}) {
         ...entry.threads,
         [threadId]: {
           ...existing,
-          providerBindings,
-          updatedAt: now,
+          provider_bindings: providerBindings,
+          updated_at: now,
         },
       },
     },
@@ -7582,8 +7244,8 @@ export function updateWorkspaceThreadProviderModel(state, event = {}) {
 }
 
 export function clearWorkspaceThreadPendingPrompt(state, event = {}) {
-  const workspaceId = cleanText(event.workspaceId);
-  const threadId = cleanText(event.threadId);
+  const workspaceId = cleanText(event.workspace_id);
+  const threadId = cleanText(event.thread_id);
   if (!workspaceId || !threadId) {
     return state || {};
   }
@@ -7593,12 +7255,12 @@ export function clearWorkspaceThreadPendingPrompt(state, event = {}) {
     return state || {};
   }
   const { currentState, entry, existing } = target;
-  if (!existing?.pendingPrompt) {
+  if (!existing?.pending_prompt) {
     return state || {};
   }
 
-  const promptId = cleanText(event.promptEventId || event.pendingPromptId || event.promptId);
-  if (promptId && !workspaceThreadPromptIdsMatch(existing.pendingPrompt.id, promptId)) {
+  const promptId = cleanText(event.prompt_event_id || event.pending_prompt_id || event.prompt_id);
+  if (promptId && !workspaceThreadPromptIdsMatch(existing.pending_prompt.id, promptId)) {
     return state || {};
   }
 
@@ -7610,8 +7272,8 @@ export function clearWorkspaceThreadPendingPrompt(state, event = {}) {
         ...entry.threads,
         [threadId]: {
           ...existing,
-          pendingPrompt: null,
-          updatedAt: nowIso(),
+          pending_prompt: null,
+          updated_at: nowIso(),
         },
       },
     },
@@ -7619,7 +7281,7 @@ export function clearWorkspaceThreadPendingPrompt(state, event = {}) {
 }
 
 function threadMessageTimestampMs(message) {
-  const createdAt = String(message?.createdAt || "").trim();
+  const createdAt = String(message?.created_at || "").trim();
   const numericTimestamp = Number.parseFloat(createdAt);
   if (Number.isFinite(numericTimestamp) && numericTimestamp > 1_000_000_000) {
     return numericTimestamp < 10_000_000_000 ? numericTimestamp * 1000 : numericTimestamp;
@@ -7640,9 +7302,9 @@ function areThreadMessagesSameTurn(left, right, maxDeltaMs = 5000) {
 }
 
 export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
-  const workspaceId = cleanText(event.workspaceId);
-  const threadId = cleanText(event.threadId);
-  const agentId = cleanAgentId(event.agentId || event.currentAgent || "codex", "");
+  const workspaceId = cleanText(event.workspace_id);
+  const threadId = cleanText(event.thread_id);
+  const agentId = cleanAgentId(event.agent_id || event.current_agent || "codex", "");
   if (!workspaceId || !threadId || !isThreadAgentId(agentId)) {
     return state || {};
   }
@@ -7659,11 +7321,11 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
   }
 
   const now = nowIso();
-  const sessionId = cleanText(event.sessionId || event.providerSessionId || event.nativeSessionId);
-  const requestedProviderSessionId = cleanText(event.requestedProviderSessionId || event.requestedNativeSessionId);
-  const matchedBy = cleanText(event.matchedBy).toLowerCase();
+  const sessionId = cleanText(event.session_id || event.provider_session_id || event.native_session_id);
+  const requestedProviderSessionId = cleanText(event.requested_provider_session_id || event.requested_native_session_id);
+  const matchedBy = cleanText(event.matched_by).toLowerCase();
   if (
-    existing.transcriptHydrationMode === "session-only"
+    existing.transcript_hydration_mode === "session-only"
     && !requestedProviderSessionId
     && matchedBy !== "sessionid"
   ) {
@@ -7692,29 +7354,29 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
       }
     }
   }
-  const sessionTitle = cleanRealThreadTitleCandidate(event.sessionTitle, existing);
+  const sessionTitle = cleanRealThreadTitleCandidate(event.session_title, existing);
   const existingTitle = cleanRealThreadTitleCandidate(existing.title, existing);
-  const existingSessionName = cleanRealThreadTitleCandidate(existing.sessionName, existing);
-  const title = sessionTitle || existingTitle || existingSessionName || defaultThreadTitle(existing.terminalIndex, agentId);
+  const existingSessionName = cleanRealThreadTitleCandidate(existing.session_name, existing);
+  const title = sessionTitle || existingTitle || existingSessionName || defaultThreadTitle(existing.terminal_index, agentId);
   const projectionEventsToAdd = createProjectionEventsFromTranscript(existing, event.messages, {
-    agentId,
-    completedAt: event.completedAt,
-    expectedMessageCreatedAt: event.expectedMessageCreatedAt,
-    expectedUserMessage: event.expectedUserMessage,
-    latestTimestamp: event.latestTimestamp,
-    matchedBy: event.matchedBy,
-    preferLiveHookAssistantMessages: event.preferLiveHookAssistantMessages,
-    promptEpoch: event.promptEpoch || event.prompt_epoch,
-    promptEventId: event.promptEventId || event.pendingPromptId || event.promptId,
-    promptAccepted: event.promptAccepted,
-    promptEventSubmittedAt: event.promptEventSubmittedAt,
+    agent_id: agentId,
+    completed_at: event.completed_at,
+    expected_message_created_at: event.expected_message_created_at,
+    expected_user_message: event.expected_user_message,
+    latest_timestamp: event.latest_timestamp,
+    matched_by: event.matched_by,
+    prefer_live_hook_assistant_messages: event.prefer_live_hook_assistant_messages,
+    prompt_epoch: event.prompt_epoch,
+    prompt_event_id: event.prompt_event_id || event.pending_prompt_id || event.prompt_id,
+    prompt_accepted: event.prompt_accepted,
+    prompt_event_submitted_at: event.prompt_event_submitted_at,
     source: cleanText(event.source, `${agentId}-session`),
-    submittedAt: event.submittedAt,
-    allowTranscriptTurnCompletion: event.allowTranscriptTurnCompletion,
-    assistantResponseCompletesTurn: event.assistantResponseCompletesTurn,
-    transcriptCompletionCanSettleTurn: event.transcriptCompletionCanSettleTurn,
-    transcriptExplicitCompletionCanSettleTurn: event.transcriptExplicitCompletionCanSettleTurn,
-    turnCompleteSeen: event.turnCompleteSeen,
+    submitted_at: event.submitted_at,
+    allow_transcript_turn_completion: event.allow_transcript_turn_completion,
+    assistant_response_completes_turn: event.assistant_response_completes_turn,
+    transcript_completion_can_settle_turn: event.transcript_completion_can_settle_turn,
+    transcript_explicit_completion_can_settle_turn: event.transcript_explicit_completion_can_settle_turn,
+    turn_complete_seen: event.turn_complete_seen,
   });
   const projectionEvents = appendThreadProjectionEvents(
     ensureThreadProjectionEvents(existing),
@@ -7722,58 +7384,58 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
   );
   const messages = projectThreadProjectionMessagesFromNormalizedEvents(projectionEvents, existing.messages);
   const lifecycleExisting = rawExisting || existing;
-  const existingLatestTurn = normalizeThreadLatestTurn(lifecycleExisting.latestTurn);
+  const existingLatestTurn = normalizeThreadLatestTurn(lifecycleExisting.latest_turn);
   const projectedLatestTurn = projectLatestTurnFromNormalizedEvents(projectionEvents, existingLatestTurn);
   const preservedLatestTurn = preserveRunningLatestTurnWhenTranscriptCompletionBlocked(
     existingLatestTurn,
     projectedLatestTurn,
     event,
   );
-  const latestTurn = preservedLatestTurn.latestTurn;
+  const latestTurn = preservedLatestTurn.latest_turn;
   const pendingPrompt = CLOSED_THREAD_TURN_STATES.has(latestTurn?.state)
     ? null
-    : lifecycleExisting.pendingPrompt || existing.pendingPrompt;
+    : lifecycleExisting.pending_prompt || existing.pending_prompt;
   const activityStatus = activityStatusForLatestTurn(latestTurn, "idle");
   const lastMessageAt = messages.length
-    ? messages[messages.length - 1].createdAt
-    : existing.lastMessageAt;
+    ? messages[messages.length - 1].created_at
+    : existing.last_message_at;
   const providerBindings = normalizeProviderBindings(
-    existing.providerBindings,
-    existing.currentAgent,
+    existing.provider_bindings,
+    existing.current_agent,
     {
-      activityStatus,
+      activity_status: activityStatus,
       coordination: existing.coordination,
-      lastActiveAt: existing.lastActiveAt,
-      lastMessageAt,
-      messageCount: messages.length,
+      last_active_at: existing.last_active_at,
+      last_message_at: lastMessageAt,
+      message_count: messages.length,
       status: existing.status,
-      terminalBinding: existing.terminalBinding,
-      updatedAt: now,
+      terminal_binding: existing.terminal_binding,
+      updated_at: now,
     },
   );
 
   if (sessionId && providerBindings[agentId]) {
     providerBindings[agentId] = {
       ...providerBindings[agentId],
-      activityStatus,
-      nativeSessionId: sessionId,
-      nativeSessionKind: "session",
-      nativeSessionSource: cleanText(event.source, "codex-rollout"),
-      nativeSessionTitle: sessionTitle || providerBindings[agentId].nativeSessionTitle || "",
-      nativeSessionTitleSource: sessionTitle
+      activity_status: activityStatus,
+      native_session_id: sessionId,
+      native_session_kind: "session",
+      native_session_source: cleanText(event.source, "codex-rollout"),
+      native_session_title: sessionTitle || providerBindings[agentId].native_session_title || "",
+      native_session_title_source: sessionTitle
         ? cleanText(event.source, `${agentId}-session`)
-        : providerBindings[agentId].nativeSessionTitleSource || "",
+        : providerBindings[agentId].native_session_title_source || "",
       nativeSessionTitleUpdatedAt: sessionTitle
         ? now
         : providerBindings[agentId].nativeSessionTitleUpdatedAt || now,
-      nativeSessionUpdatedAt: now,
-      updatedAt: now,
+      native_session_updated_at: now,
+      updated_at: now,
     };
   } else if (providerBindings[agentId]) {
     providerBindings[agentId] = {
       ...providerBindings[agentId],
-      activityStatus,
-      updatedAt: now,
+      activity_status: activityStatus,
+      updated_at: now,
     };
   }
 
@@ -7785,23 +7447,23 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
         ...entry.threads,
         [threadId]: {
           ...existing,
-          activityStatus,
-          lastMessageAt,
-          latestTurn,
+          activity_status: activityStatus,
+          last_message_at: lastMessageAt,
+          latest_turn: latestTurn,
           materialized: true,
-          messageCount: messages.length,
+          message_count: messages.length,
           messages,
-          pendingPrompt,
-          projectionEvents,
-          providerBindings,
-          sessionName: sessionTitle || existingSessionName || existingTitle || title,
+          pending_prompt: pendingPrompt,
+          projection_events: projectionEvents,
+          provider_bindings: providerBindings,
+          session_name: sessionTitle || existingSessionName || existingTitle || title,
           title,
           transcriptHydratedAt: now,
-          transcriptLatestTimestamp: cleanText(event.latestTimestamp),
-          transcriptSessionId: sessionId || existing.transcriptSessionId,
-          transcriptSourcePath: cleanText(event.sourcePath || event.rolloutPath),
-          transcriptStatus: "ready",
-          updatedAt: now,
+          transcriptLatestTimestamp: cleanText(event.latest_timestamp),
+          transcript_session_id: sessionId || existing.transcript_session_id,
+          transcriptSourcePath: cleanText(event.source_path || event.rollout_path),
+          transcript_status: "ready",
+          updated_at: now,
         },
       },
     },
@@ -7809,9 +7471,9 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
 }
 
 export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
-  const workspaceId = cleanText(event.workspaceId);
-  const threadId = cleanText(event.threadId);
-  const agentId = cleanAgentId(event.agentId || event.currentAgent, "");
+  const workspaceId = cleanText(event.workspace_id);
+  const threadId = cleanText(event.thread_id);
+  const agentId = cleanAgentId(event.agent_id || event.current_agent, "");
   if (!workspaceId || !threadId || !isThreadAgentId(agentId)) {
     return state || {};
   }
@@ -7825,18 +7487,18 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
   const now = nowIso();
   const projectionEvents = appendThreadProjectionEvents(
     ensureThreadProjectionEvents(existing),
-    event.projectionEvents || event.events || [],
+    event.projection_events || event.events || [],
   );
   const messages = projectThreadProjectionMessagesFromNormalizedEvents(projectionEvents, existing.messages);
-  const projectedLatestTurn = projectLatestTurnFromNormalizedEvents(projectionEvents, existing.latestTurn);
+  const projectedLatestTurn = projectLatestTurnFromNormalizedEvents(projectionEvents, existing.latest_turn);
   const shouldClearOrphanRunning = isOrphanRunningThreadState({
-    latestTurn: projectedLatestTurn,
-    messageCount: messages.length,
+    latest_turn: projectedLatestTurn,
+    message_count: messages.length,
     messages,
-    pendingPrompt: event.clearPendingPrompt === false ? existing.pendingPrompt : null,
-    projectionEvents,
-    providerBindings: existing.providerBindings,
-    transcriptSessionId: cleanText(event.providerSessionId || event.nativeSessionId, existing.transcriptSessionId),
+    pending_prompt: event.clear_pending_prompt === false ? existing.pending_prompt : null,
+    projection_events: projectionEvents,
+    provider_bindings: existing.provider_bindings,
+    transcript_session_id: cleanText(event.provider_session_id || event.native_session_id, existing.transcript_session_id),
   });
   const latestTurn = shouldClearOrphanRunning ? null : projectedLatestTurn;
   const latestTurnState = cleanText(latestTurn?.state).toLowerCase();
@@ -7849,19 +7511,19 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
       : eventType === "provider-turn-completed" || eventType === "provider-turn-interrupted"
         ? "idle"
         : activityStatusForLatestTurn(latestTurn, "idle"));
-  const existingProviderBindingForAgent = normalizeProviderBinding(existing.providerBindings?.[agentId], agentId, {
-    activityStatus: existing.activityStatus,
+  const existingProviderBindingForAgent = normalizeProviderBinding(existing.provider_bindings?.[agentId], agentId, {
+    activity_status: existing.activity_status,
     coordination: existing.coordination,
-    lastActiveAt: existing.lastActiveAt,
-    lastMessageAt: existing.lastMessageAt,
-    messageCount: existing.messageCount,
+    last_active_at: existing.last_active_at,
+    last_message_at: existing.last_message_at,
+    message_count: existing.message_count,
     status: existing.status,
-    terminalBinding: existing.terminalBinding,
-    updatedAt: existing.updatedAt,
+    terminal_binding: existing.terminal_binding,
+    updated_at: existing.updated_at,
   });
   const terminalReadinessIgnoredEvent = eventType === "terminal-input-ready"
     || eventType === "terminal-prompt-ready";
-  const marksInputReady = !terminalReadinessIgnoredEvent && (event.inputReady === true
+  const marksInputReady = !terminalReadinessIgnoredEvent && (event.input_ready === true
     || eventType === "provider-turn-completed"
     || eventType === "provider-turn-interrupted"
     || eventType === "provider-turn-error");
@@ -7869,61 +7531,54 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
     ? true
     : eventType === "provider-turn-started"
       ? false
-      : Boolean(event.inputReady ?? existingProviderBindingForAgent?.inputReady);
+      : Boolean(event.input_ready ?? existingProviderBindingForAgent?.input_ready);
   const inputReadyAt = inputReady
-    ? cleanText(event.inputReadyAt, existingProviderBindingForAgent?.inputReadyAt)
+    ? cleanText(event.input_ready_at, existingProviderBindingForAgent?.input_ready_at)
     : "";
   const inputReadyConfidence = inputReady
     ? cleanText(
-      event.inputReadyConfidence,
-      existingProviderBindingForAgent?.inputReadyConfidence,
+      event.input_ready_confidence,
+      existingProviderBindingForAgent?.input_ready_confidence,
     )
     : "";
   const providerPromptingFields = promptingUserFieldsForTerminalEvent(event, existingProviderBindingForAgent, {
     clear: terminalReadinessIgnoredEvent ? false : !inputReady || marksInputReady,
-    eventType,
+    event_type: eventType,
   });
   const eventAgentType = cleanAgentDisplayName(
-    event.agentType || event.agent_type,
-    existingProviderBindingForAgent?.agentType,
+    event.agent_type,
+    existingProviderBindingForAgent?.agent_type,
   );
   const eventAgentDisplayName = cleanAgentDisplayName(
-    event.agentDisplayName || event.agent_display_name || eventAgentType,
-    existingProviderBindingForAgent?.agentDisplayName,
+    event.agent_display_name || eventAgentType,
+    existingProviderBindingForAgent?.agent_display_name,
   );
   const eventProvider = cleanAgentDisplayName(
     event.provider,
     existingProviderBindingForAgent?.provider,
   );
   const eventForkFromProviderSessionId = cleanText(
-    event.forkFromProviderSessionId
-      || event.fork_from_provider_session_id
-      || event.forkedFromProviderSessionId
-      || event.forked_from_provider_session_id
-      || event.parentProviderSessionId
-      || event.parent_provider_session_id,
+    event.fork_from_provider_session_id || event.forked_from_provider_session_id || event.parent_provider_session_id,
   );
-  const eventSharedHistoryId = cleanText(event.sharedHistoryId || event.shared_history_id || event.historyGroupId || event.history_group_id);
+  const eventSharedHistoryId = cleanText(event.shared_history_id || event.history_group_id);
   const eventRelatedProviderSessionIds = cleanTextArray(
-    event.relatedProviderSessionIds,
     event.related_provider_session_ids,
-    event.relatedSessionIds,
     event.related_session_ids,
     eventForkFromProviderSessionId,
   );
-  const shouldClearPendingPrompt = event.clearPendingPrompt !== false;
+  const shouldClearPendingPrompt = event.clear_pending_prompt !== false;
   let providerBindings = normalizeProviderBindings(
-    existing.providerBindings,
-    existing.currentAgent,
+    existing.provider_bindings,
+    existing.current_agent,
     {
-      activityStatus,
+      activity_status: activityStatus,
       coordination: existing.coordination,
-      lastActiveAt: now,
-      lastMessageAt: messages.length ? messages[messages.length - 1].createdAt : existing.lastMessageAt,
-      messageCount: messages.length,
+      last_active_at: now,
+      last_message_at: messages.length ? messages[messages.length - 1].created_at : existing.last_message_at,
+      message_count: messages.length,
       status: existing.status,
-      terminalBinding: existing.terminalBinding,
-      updatedAt: now,
+      terminal_binding: existing.terminal_binding,
+      updated_at: now,
     },
   );
   if (shouldClearOrphanRunning) {
@@ -7932,32 +7587,32 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
   if (providerBindings[agentId]) {
     providerBindings[agentId] = {
       ...providerBindings[agentId],
-      activityStatus,
-      agentDisplayName: eventAgentDisplayName,
-      agentType: eventAgentType,
-      lastActiveAt: now,
-      lastMessageAt: messages.length ? messages[messages.length - 1].createdAt : providerBindings[agentId].lastMessageAt,
-      messageCount: messages.length,
-      inputReady,
-      inputReadyAt,
-      inputReadyConfidence,
-      forkFromProviderSessionId: eventForkFromProviderSessionId || providerBindings[agentId].forkFromProviderSessionId || "",
+      activity_status: activityStatus,
+      agent_display_name: eventAgentDisplayName,
+      agent_type: eventAgentType,
+      last_active_at: now,
+      last_message_at: messages.length ? messages[messages.length - 1].created_at : providerBindings[agentId].last_message_at,
+      message_count: messages.length,
+      input_ready: inputReady,
+      input_ready_at: inputReadyAt,
+      input_ready_confidence: inputReadyConfidence,
+      fork_from_provider_session_id: eventForkFromProviderSessionId || providerBindings[agentId].fork_from_provider_session_id || "",
       ...hookHealthFields(event, providerBindings[agentId]),
       ...providerPromptingFields,
-      modelId: cleanModelId(event.modelId || event.model, providerBindings[agentId].modelId),
-      modelSource: cleanModelId(event.modelId || event.model) ? cleanText(event.modelSource, "provider-turn") : providerBindings[agentId].modelSource,
-      modelUpdatedAt: cleanModelId(event.modelId || event.model) ? now : providerBindings[agentId].modelUpdatedAt,
-      nativeSessionId: cleanText(event.nativeSessionId || event.providerSessionId, providerBindings[agentId].nativeSessionId),
-      nativeSessionKind: cleanText(event.nativeSessionKind, providerBindings[agentId].nativeSessionKind || "session"),
-      nativeSessionSource: cleanText(event.nativeSessionSource, providerBindings[agentId].nativeSessionSource || "provider-turn"),
-      nativeSessionUpdatedAt: cleanText(event.nativeSessionId || event.providerSessionId) ? now : providerBindings[agentId].nativeSessionUpdatedAt,
+      model_id: cleanModelId(event.model_id || event.model, providerBindings[agentId].model_id),
+      model_source: cleanModelId(event.model_id || event.model) ? cleanText(event.model_source, "provider-turn") : providerBindings[agentId].model_source,
+      modelUpdatedAt: cleanModelId(event.model_id || event.model) ? now : providerBindings[agentId].modelUpdatedAt,
+      native_session_id: cleanText(event.native_session_id || event.provider_session_id, providerBindings[agentId].native_session_id),
+      native_session_kind: cleanText(event.native_session_kind, providerBindings[agentId].native_session_kind || "session"),
+      native_session_source: cleanText(event.native_session_source, providerBindings[agentId].native_session_source || "provider-turn"),
+      native_session_updated_at: cleanText(event.native_session_id || event.provider_session_id) ? now : providerBindings[agentId].native_session_updated_at,
       provider: eventProvider,
-      relatedProviderSessionIds: eventRelatedProviderSessionIds.length
+      related_provider_session_ids: eventRelatedProviderSessionIds.length
         ? eventRelatedProviderSessionIds
-        : cleanTextArray(providerBindings[agentId].relatedProviderSessionIds),
-      sharedHistoryId: eventSharedHistoryId || providerBindings[agentId].sharedHistoryId || "",
+        : cleanTextArray(providerBindings[agentId].related_provider_session_ids),
+      shared_history_id: eventSharedHistoryId || providerBindings[agentId].shared_history_id || "",
       status: cleanText(event.status, existing.status || providerBindings[agentId].status || "active"),
-      updatedAt: now,
+      updated_at: now,
     };
   }
 
@@ -7966,44 +7621,44 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
   if (terminalKey && terminals[terminalKey]) {
     const terminalPromptingFields = promptingUserFieldsForTerminalEvent(event, terminals[terminalKey], {
       clear: terminalReadinessIgnoredEvent ? false : !inputReady || marksInputReady,
-      eventType,
+      event_type: eventType,
     });
     terminals[terminalKey] = {
       ...terminals[terminalKey],
-      activityStatus,
-      commandPhase: cleanText(event.commandPhase || event.command_phase, terminals[terminalKey].commandPhase),
-      executionPhase: cleanText(event.executionPhase || event.execution_phase, terminals[terminalKey].executionPhase),
-      inputReady,
-      inputReadyAt,
-      inputReadyConfidence,
+      activity_status: activityStatus,
+      command_phase: cleanText(event.command_phase, terminals[terminalKey].command_phase),
+      execution_phase: cleanText(event.execution_phase, terminals[terminalKey].execution_phase),
+      input_ready: inputReady,
+      input_ready_at: inputReadyAt,
+      input_ready_confidence: inputReadyConfidence,
       ...hookHealthFields(event, terminals[terminalKey]),
-      agentDisplayName: cleanAgentDisplayName(
-        event.agentDisplayName || event.agent_display_name || eventAgentType,
-        terminals[terminalKey].agentDisplayName,
+      agent_display_name: cleanAgentDisplayName(
+        event.agent_display_name || eventAgentType,
+        terminals[terminalKey].agent_display_name,
       ),
-      agentType: cleanAgentDisplayName(event.agentType || event.agent_type, terminals[terminalKey].agentType),
+      agent_type: cleanAgentDisplayName(event.agent_type, terminals[terminalKey].agent_type),
       ...terminalPromptingFields,
-      nativeRailState: cleanText(event.nativeRailState || event.native_rail_state, terminals[terminalKey].nativeRailState),
+      native_rail_state: cleanText(event.native_rail_state, terminals[terminalKey].native_rail_state),
       provider: cleanAgentDisplayName(event.provider, terminals[terminalKey].provider),
-      forkFromProviderSessionId: eventForkFromProviderSessionId || terminals[terminalKey].forkFromProviderSessionId || "",
-      providerSessionId: cleanText(
-        event.providerSessionId || event.provider_session_id || event.nativeSessionId,
-        terminals[terminalKey].providerSessionId,
+      fork_from_provider_session_id: eventForkFromProviderSessionId || terminals[terminalKey].fork_from_provider_session_id || "",
+      provider_session_id: cleanText(
+        event.provider_session_id || event.native_session_id,
+        terminals[terminalKey].provider_session_id,
       ),
-      nativeSessionId: cleanText(
-        event.nativeSessionId || event.native_session_id || event.providerSessionId || event.provider_session_id,
-        terminals[terminalKey].nativeSessionId,
+      native_session_id: cleanText(
+        event.native_session_id || event.provider_session_id,
+        terminals[terminalKey].native_session_id,
       ),
-      relatedProviderSessionIds: eventRelatedProviderSessionIds.length
+      related_provider_session_ids: eventRelatedProviderSessionIds.length
         ? eventRelatedProviderSessionIds
-        : cleanTextArray(terminals[terminalKey].relatedProviderSessionIds),
-      sessionId: cleanText(
-        event.sessionId || event.session_id || event.providerSessionId || event.provider_session_id || event.nativeSessionId || event.native_session_id,
-        terminals[terminalKey].sessionId,
+        : cleanTextArray(terminals[terminalKey].related_provider_session_ids),
+      session_id: cleanText(
+        event.session_id || event.provider_session_id || event.native_session_id,
+        terminals[terminalKey].session_id,
       ),
-      sharedHistoryId: eventSharedHistoryId || terminals[terminalKey].sharedHistoryId || "",
-      turnStatus: cleanText(event.turnStatus || event.turn_status, terminals[terminalKey].turnStatus),
-      updatedAt: now,
+      shared_history_id: eventSharedHistoryId || terminals[terminalKey].shared_history_id || "",
+      turn_status: cleanText(event.turn_status, terminals[terminalKey].turn_status),
+      updated_at: now,
     };
   }
 
@@ -8011,30 +7666,30 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
     ...currentState,
     [workspaceId]: {
       ...entry,
-      activeThreadId: threadId,
+      active_thread_id: threadId,
       terminals,
       threads: {
         ...entry.threads,
         [threadId]: {
           ...existing,
-          activityStatus,
-          lastActiveAt: now,
-          lastMessageAt: messages.length ? messages[messages.length - 1].createdAt : existing.lastMessageAt,
-          latestTurn,
+          activity_status: activityStatus,
+          last_active_at: now,
+          last_message_at: messages.length ? messages[messages.length - 1].created_at : existing.last_message_at,
+          latest_turn: latestTurn,
           materialized: true,
-          messageCount: messages.length,
+          message_count: messages.length,
           messages,
-          pendingPrompt: shouldClearPendingPrompt ? null : existing.pendingPrompt,
-          projectionEvents,
-          providerBindings,
-          forkFromProviderSessionId: eventForkFromProviderSessionId || existing.forkFromProviderSessionId || "",
-          relatedProviderSessionIds: eventRelatedProviderSessionIds.length
+          pending_prompt: shouldClearPendingPrompt ? null : existing.pending_prompt,
+          projection_events: projectionEvents,
+          provider_bindings: providerBindings,
+          fork_from_provider_session_id: eventForkFromProviderSessionId || existing.fork_from_provider_session_id || "",
+          related_provider_session_ids: eventRelatedProviderSessionIds.length
             ? eventRelatedProviderSessionIds
-            : cleanTextArray(existing.relatedProviderSessionIds),
-          sharedHistoryId: eventSharedHistoryId || existing.sharedHistoryId || "",
+            : cleanTextArray(existing.related_provider_session_ids),
+          shared_history_id: eventSharedHistoryId || existing.shared_history_id || "",
           status: cleanText(event.status, existing.status || "active"),
-          transcriptSessionId: cleanText(event.providerSessionId || event.nativeSessionId, existing.transcriptSessionId),
-          updatedAt: now,
+          transcript_session_id: cleanText(event.provider_session_id || event.native_session_id, existing.transcript_session_id),
+          updated_at: now,
         },
       },
     },
@@ -8042,9 +7697,9 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
 }
 
 export function markWorkspaceThreadAgentActivity(state, event = {}) {
-  const workspaceId = cleanText(event.workspaceId);
-  const threadId = cleanText(event.threadId);
-  const agentId = cleanAgentId(event.agentId || event.currentAgent, "");
+  const workspaceId = cleanText(event.workspace_id);
+  const threadId = cleanText(event.thread_id);
+  const agentId = cleanAgentId(event.agent_id || event.current_agent, "");
   if (!workspaceId || !threadId || !isThreadAgentId(agentId)) {
     return state || {};
   }
@@ -8071,30 +7726,30 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
           : "idle"
   );
   const providerBindings = normalizeProviderBindings(
-    existing.providerBindings,
-    existing.currentAgent,
+    existing.provider_bindings,
+    existing.current_agent,
     {
-      activityStatus: existing.activityStatus,
+      activity_status: existing.activity_status,
       coordination: existing.coordination,
-      lastActiveAt: existing.lastActiveAt,
-      lastMessageAt: existing.lastMessageAt,
-      messageCount: existing.messageCount,
+      last_active_at: existing.last_active_at,
+      last_message_at: existing.last_message_at,
+      message_count: existing.message_count,
       status: existing.status,
-      terminalBinding: existing.terminalBinding,
-      updatedAt: existing.updatedAt,
+      terminal_binding: existing.terminal_binding,
+      updated_at: existing.updated_at,
     },
   );
   const previousProviderBinding = normalizeProviderBinding(providerBindings[agentId], agentId, {
-    activityStatus: existing.activityStatus,
+    activity_status: existing.activity_status,
     coordination: existing.coordination,
-    lastActiveAt: existing.lastActiveAt,
-    lastMessageAt: existing.lastMessageAt,
-    messageCount: existing.messageCount,
+    last_active_at: existing.last_active_at,
+    last_message_at: existing.last_message_at,
+    message_count: existing.message_count,
     status: existing.status,
-    terminalBinding: existing.currentAgent === agentId ? existing.terminalBinding : null,
-    updatedAt: existing.updatedAt,
+    terminal_binding: existing.current_agent === agentId ? existing.terminal_binding : null,
+    updated_at: existing.updated_at,
   });
-  const explicitInputReady = typeof event.inputReady === "boolean" ? event.inputReady : null;
+  const explicitInputReady = typeof event.input_ready === "boolean" ? event.input_ready : null;
   const rawEventStatus = cleanText(event.status).toLowerCase();
   const eventStatus = LIVE_TERMINAL_STATUSES.has(rawEventStatus) ? rawEventStatus : "";
   const providerStatus = eventStatus
@@ -8112,42 +7767,42 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
     ? true
     : marksInputBusy
       ? false
-      : Boolean(previousProviderBinding?.inputReady);
+      : Boolean(previousProviderBinding?.input_ready);
   const inputReadyAt = inputReady
-    ? cleanText(event.inputReadyAt, previousProviderBinding?.inputReadyAt || now)
+    ? cleanText(event.input_ready_at, previousProviderBinding?.input_ready_at || now)
     : "";
   const inputReadyConfidence = inputReady
     ? cleanText(
-      event.inputReadyConfidence,
-      previousProviderBinding?.inputReadyConfidence,
+      event.input_ready_confidence,
+      previousProviderBinding?.input_ready_confidence,
     )
     : "";
   const providerPromptingFields = promptingUserFieldsForTerminalEvent(event, previousProviderBinding, {
     clear: terminalReadinessIgnoredEvent ? false : !inputReady || marksInputReady,
-    eventType,
+    event_type: eventType,
   });
   const eventAgentType = cleanAgentDisplayName(
-    event.agentType || event.agent_type,
-    previousProviderBinding?.agentType,
+    event.agent_type,
+    previousProviderBinding?.agent_type,
   );
   const eventAgentDisplayName = cleanAgentDisplayName(
-    event.agentDisplayName || event.agent_display_name || eventAgentType,
-    previousProviderBinding?.agentDisplayName,
+    event.agent_display_name || eventAgentType,
+    previousProviderBinding?.agent_display_name,
   );
   const eventProvider = cleanAgentDisplayName(event.provider, previousProviderBinding?.provider);
   providerBindings[agentId] = {
     ...previousProviderBinding,
-    activityStatus,
-    agentDisplayName: eventAgentDisplayName,
-    agentType: eventAgentType,
+    activity_status: activityStatus,
+    agent_display_name: eventAgentDisplayName,
+    agent_type: eventAgentType,
     ...hookHealthFields(event, previousProviderBinding),
-    inputReady,
-    inputReadyAt,
-    inputReadyConfidence,
+    input_ready: inputReady,
+    input_ready_at: inputReadyAt,
+    input_ready_confidence: inputReadyConfidence,
     ...providerPromptingFields,
     provider: eventProvider,
     status: providerStatus,
-    updatedAt: now,
+    updated_at: now,
   };
   const terminalKey = getTerminalKeyForEvent(entry, event);
   const terminals = { ...entry.terminals };
@@ -8156,36 +7811,36 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
     previousTerminal = terminals[terminalKey];
     const terminalPromptingFields = promptingUserFieldsForTerminalEvent(event, terminals[terminalKey], {
       clear: terminalReadinessIgnoredEvent ? false : !inputReady || marksInputReady,
-      eventType,
+      event_type: eventType,
     });
     terminals[terminalKey] = {
       ...terminals[terminalKey],
-      inputReady,
-      inputReadyAt,
-      inputReadyConfidence,
+      input_ready: inputReady,
+      input_ready_at: inputReadyAt,
+      input_ready_confidence: inputReadyConfidence,
       ...hookHealthFields(event, terminals[terminalKey]),
-      agentDisplayName: cleanAgentDisplayName(
-        event.agentDisplayName || event.agent_display_name || eventAgentType,
-        terminals[terminalKey].agentDisplayName,
+      agent_display_name: cleanAgentDisplayName(
+        event.agent_display_name || eventAgentType,
+        terminals[terminalKey].agent_display_name,
       ),
-      agentType: cleanAgentDisplayName(event.agentType || event.agent_type, terminals[terminalKey].agentType),
+      agent_type: cleanAgentDisplayName(event.agent_type, terminals[terminalKey].agent_type),
       ...terminalPromptingFields,
       provider: cleanAgentDisplayName(event.provider, terminals[terminalKey].provider),
       status: eventStatus || terminals[terminalKey].status,
-      updatedAt: now,
+      updated_at: now,
     };
   }
-  const nextThreadActivityStatus = existing.currentAgent === agentId ? activityStatus : existing.activityStatus;
-  const nextThreadStatus = existing.currentAgent === agentId && eventStatus ? eventStatus : existing.status;
+  const nextThreadActivityStatus = existing.current_agent === agentId ? activityStatus : existing.activity_status;
+  const nextThreadStatus = existing.current_agent === agentId && eventStatus ? eventStatus : existing.status;
   const threadSemanticallyUnchanged = workspaceThreadActivitySemanticallyEqual(
     {
-      activityStatus: existing.activityStatus,
-      providerBindings: existing.providerBindings,
+      activity_status: existing.activity_status,
+      provider_bindings: existing.provider_bindings,
       status: existing.status,
     },
     {
-      activityStatus: nextThreadActivityStatus,
-      providerBindings,
+      activity_status: nextThreadActivityStatus,
+      provider_bindings: providerBindings,
       status: nextThreadStatus,
     },
   );
@@ -8215,10 +7870,10 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
         ...entry.threads,
         [threadId]: {
           ...existing,
-          activityStatus: nextThreadActivityStatus,
-          providerBindings,
+          activity_status: nextThreadActivityStatus,
+          provider_bindings: providerBindings,
           status: nextThreadStatus,
-          updatedAt: now,
+          updated_at: now,
         },
       },
     },
@@ -8237,27 +7892,27 @@ function getWorkspaceThreadForTerminalIndexFromEntry(entry, terminalIndex) {
 
   const terminalKey = terminalSessionKey(safeTerminalIndex);
   const terminal = terminalKey ? entry.terminals[terminalKey] : null;
-  if (terminal?.threadId && entry.threads[terminal.threadId]) {
-    return entry.threads[terminal.threadId];
+  if (terminal?.thread_id && entry.threads[terminal.thread_id]) {
+    return entry.threads[terminal.thread_id];
   }
 
-  const restoredThreadId = terminalKey ? entry.terminalThreadIds?.[terminalKey] : "";
+  const restoredThreadId = terminalKey ? entry.terminal_thread_ids?.[terminalKey] : "";
   if (restoredThreadId && entry.threads[restoredThreadId]) {
     return entry.threads[restoredThreadId];
   }
 
-  const activeThread = entry.threads[entry.activeThreadId];
+  const activeThread = entry.threads[entry.active_thread_id];
   if (
-    activeThread?.terminalBinding?.terminalIndex === safeTerminalIndex
-    || (activeThread?.terminalIndex === safeTerminalIndex && activeThread.status === "starting")
+    activeThread?.terminal_binding?.terminal_index === safeTerminalIndex
+    || (activeThread?.terminal_index === safeTerminalIndex && activeThread.status === "starting")
   ) {
     return activeThread;
   }
 
   const liveThread = Object.values(entry.threads)
     .filter((thread) => (
-      thread.terminalBinding?.terminalIndex === safeTerminalIndex
-      || (thread.terminalIndex === safeTerminalIndex && thread.status === "starting")
+      thread.terminal_binding?.terminal_index === safeTerminalIndex
+      || (thread.terminal_index === safeTerminalIndex && thread.status === "starting")
     ))
     .sort((left, right) => getThreadRestoreTimestamp(right) - getThreadRestoreTimestamp(left))[0] || null;
   if (liveThread) {
@@ -8278,29 +7933,29 @@ export function getWorkspaceThreadForTerminalIndex(state, workspaceId, terminalI
 }
 
 function workspaceThreadMatchesLiveTerminalIdentity(thread, providerBinding, target = {}) {
-  const terminalIndex = normalizeTerminalIndex(target.terminalIndex);
-  const paneId = cleanText(target.paneId);
-  const instanceId = Number.parseInt(target.instanceId, 10);
+  const terminalIndex = normalizeTerminalIndex(target.terminal_index);
+  const paneId = cleanText(target.pane_id);
+  const instanceId = Number.parseInt(target.instance_id, 10);
   const bindings = [
-    providerBinding?.terminalBinding,
-    thread?.terminalBinding,
+    providerBinding?.terminal_binding,
+    thread?.terminal_binding,
   ]
     .map((binding) => normalizeTerminalBinding(binding))
     .filter(Boolean);
 
   return bindings.some((binding) => {
     const indexMatches = terminalIndex == null
-      || normalizeTerminalIndex(binding.terminalIndex) === terminalIndex;
-    const paneMatches = !paneId || binding.paneId === paneId;
+      || normalizeTerminalIndex(binding.terminal_index) === terminalIndex;
+    const paneMatches = !paneId || binding.pane_id === paneId;
     const instanceMatches = !Number.isInteger(instanceId)
-      || Number(binding.instanceId) === instanceId;
+      || Number(binding.instance_id) === instanceId;
     return indexMatches && paneMatches && instanceMatches;
   });
 }
 
 function workspaceThreadLiveSelectionScore(thread, providerBinding, target = {}) {
-  const liveThreadId = cleanText(target.threadId);
-  const terminalIndex = normalizeTerminalIndex(target.terminalIndex);
+  const liveThreadId = cleanText(target.thread_id);
+  const terminalIndex = normalizeTerminalIndex(target.terminal_index);
   let score = 0;
   if (liveThreadId && thread?.id === liveThreadId) {
     score += 1000;
@@ -8323,19 +7978,14 @@ export function getWorkspaceThreadSelectionForLiveTerminal(entry, target = {}) {
     return "";
   }
 
-  const terminalIndex = normalizeTerminalIndex(target.terminalIndex);
+  const terminalIndex = normalizeTerminalIndex(target.terminal_index);
   const terminalKey = terminalSessionKey(terminalIndex);
   const terminal = terminalKey ? entry.terminals?.[terminalKey] || null : null;
-  const agentId = cleanAgentId(target.agentId || target.currentAgent || terminal?.agentId, "");
+  const agentId = cleanAgentId(target.agent_id || target.current_agent || terminal?.agent_id, "");
   const providerSessionId = cleanText(
-    target.providerSessionId
-      || target.provider_session_id
-      || target.nativeSessionId
-      || target.native_session_id
-      || target.sessionId
-      || target.session_id,
+    target.provider_session_id || target.native_session_id || target.session_id,
   );
-  const liveThreadId = cleanText(target.threadId || terminal?.threadId);
+  const liveThreadId = cleanText(target.thread_id || terminal?.thread_id);
   const threads = Object.values(entry.threads).filter((thread) => {
     if (!thread?.id || workspaceEntryHasArchivedThreadId(entry, thread.id)) {
       return false;
@@ -8343,8 +7993,8 @@ export function getWorkspaceThreadSelectionForLiveTerminal(entry, target = {}) {
     if (!agentId) {
       return true;
     }
-    return cleanAgentId(thread.currentAgent) === agentId
-      || Boolean(thread.providerBindings?.[agentId]);
+    return cleanAgentId(thread.current_agent) === agentId
+      || Boolean(thread.provider_bindings?.[agentId]);
   });
 
   if (providerSessionId) {
@@ -8355,10 +8005,10 @@ export function getWorkspaceThreadSelectionForLiveTerminal(entry, target = {}) {
         const rightBinding = getWorkspaceThreadProviderBinding(right, agentId);
         return workspaceThreadLiveSelectionScore(right, rightBinding, {
           ...target,
-          threadId: liveThreadId,
+          thread_id: liveThreadId,
         }) - workspaceThreadLiveSelectionScore(left, leftBinding, {
           ...target,
-          threadId: liveThreadId,
+          thread_id: liveThreadId,
         });
       })[0] || null;
     return cleanText(sessionThread?.id);
@@ -8368,7 +8018,7 @@ export function getWorkspaceThreadSelectionForLiveTerminal(entry, target = {}) {
   if (
     directThread
     && !getWorkspaceThreadHasSession(directThread)
-    && (!agentId || cleanAgentId(directThread.currentAgent) === agentId || directThread.providerBindings?.[agentId])
+    && (!agentId || cleanAgentId(directThread.current_agent) === agentId || directThread.provider_bindings?.[agentId])
   ) {
     return directThread.id;
   }
@@ -8380,10 +8030,10 @@ export function getWorkspaceThreadSelectionForLiveTerminal(entry, target = {}) {
       const rightBinding = getWorkspaceThreadProviderBinding(right, agentId);
       return workspaceThreadLiveSelectionScore(right, rightBinding, {
         ...target,
-        threadId: liveThreadId,
+        thread_id: liveThreadId,
       }) - workspaceThreadLiveSelectionScore(left, leftBinding, {
         ...target,
-        threadId: liveThreadId,
+        thread_id: liveThreadId,
       });
     })[0] || null;
 
@@ -8430,35 +8080,35 @@ export function archiveWorkspaceThread(state, workspaceId, threadId) {
   }
 
   const archivedAt = nowIso();
-  entry.archivedThreads[safeThreadId] = archiveThreadRecord(existing, archivedAt);
-  entry.archivedThreadOrder = [
+  entry.archived_threads[safeThreadId] = archiveThreadRecord(existing, archivedAt);
+  entry.archived_thread_order = [
     safeThreadId,
-    ...entry.archivedThreadOrder.filter((candidateId) => candidateId !== safeThreadId),
+    ...entry.archived_thread_order.filter((candidateId) => candidateId !== safeThreadId),
   ];
   delete entry.threads[safeThreadId];
   forgetThreadEverywhere(entry, safeThreadId);
-  entry.threadOrder = entry.threadOrder.filter((candidateId) => candidateId !== safeThreadId);
+  entry.thread_order = entry.thread_order.filter((candidateId) => candidateId !== safeThreadId);
   Object.entries(entry.terminals).forEach(([terminalKey, terminal]) => {
-    if (terminal.threadId === safeThreadId) {
+    if (terminal.thread_id === safeThreadId) {
       entry.terminals[terminalKey] = {
         ...terminal,
-        threadId: "",
-        updatedAt: nowIso(),
+        thread_id: "",
+        updated_at: nowIso(),
       };
     }
   });
-  if (entry.activeThreadId === safeThreadId) {
-    entry.activeThreadId = entry.threadOrder[0] || "";
+  if (entry.active_thread_id === safeThreadId) {
+    entry.active_thread_id = entry.thread_order[0] || "";
   }
-  if (entry.threadsView?.selectedThreadId === safeThreadId) {
-    entry.threadsView = {
-      ...normalizeThreadsViewState(entry.threadsView, {
-        selectedThreadId: entry.activeThreadId,
-        selectedWorkspaceId: safeWorkspaceId,
+  if (entry.threads_view?.selectedThreadId === safeThreadId) {
+    entry.threads_view = {
+      ...normalizeThreadsViewState(entry.threads_view, {
+        selectedThreadId: entry.active_thread_id,
+        selected_workspace_id: safeWorkspaceId,
       }),
       newChatActive: false,
-      selectedThreadId: entry.activeThreadId || "",
-      selectedWorkspaceId: safeWorkspaceId,
+      selectedThreadId: entry.active_thread_id || "",
+      selected_workspace_id: safeWorkspaceId,
     };
   }
 
@@ -8483,38 +8133,38 @@ export function deleteWorkspaceThread(state, workspaceId, threadId) {
   }
 
   const activeThread = entry.threads[safeThreadId];
-  const archivedThread = entry.archivedThreads[safeThreadId];
+  const archivedThread = entry.archived_threads[safeThreadId];
   if (!activeThread && !archivedThread) {
     return state || {};
   }
 
   delete entry.threads[safeThreadId];
-  delete entry.archivedThreads[safeThreadId];
+  delete entry.archived_threads[safeThreadId];
   forgetThreadEverywhere(entry, safeThreadId);
-  entry.threadOrder = entry.threadOrder.filter((candidateId) => candidateId !== safeThreadId);
-  entry.archivedThreadOrder = entry.archivedThreadOrder
+  entry.thread_order = entry.thread_order.filter((candidateId) => candidateId !== safeThreadId);
+  entry.archived_thread_order = entry.archived_thread_order
     .filter((candidateId) => candidateId !== safeThreadId);
   Object.entries(entry.terminals).forEach(([terminalKey, terminal]) => {
-    if (terminal.threadId === safeThreadId) {
+    if (terminal.thread_id === safeThreadId) {
       entry.terminals[terminalKey] = {
         ...terminal,
-        threadId: "",
-        updatedAt: nowIso(),
+        thread_id: "",
+        updated_at: nowIso(),
       };
     }
   });
-  if (entry.activeThreadId === safeThreadId) {
-    entry.activeThreadId = entry.threadOrder[0] || "";
+  if (entry.active_thread_id === safeThreadId) {
+    entry.active_thread_id = entry.thread_order[0] || "";
   }
-  if (entry.threadsView?.selectedThreadId === safeThreadId) {
-    entry.threadsView = {
-      ...normalizeThreadsViewState(entry.threadsView, {
-        selectedThreadId: entry.activeThreadId,
-        selectedWorkspaceId: safeWorkspaceId,
+  if (entry.threads_view?.selectedThreadId === safeThreadId) {
+    entry.threads_view = {
+      ...normalizeThreadsViewState(entry.threads_view, {
+        selectedThreadId: entry.active_thread_id,
+        selected_workspace_id: safeWorkspaceId,
       }),
       newChatActive: false,
-      selectedThreadId: entry.activeThreadId || "",
-      selectedWorkspaceId: safeWorkspaceId,
+      selectedThreadId: entry.active_thread_id || "",
+      selected_workspace_id: safeWorkspaceId,
     };
   }
 
@@ -8542,7 +8192,7 @@ export function toggleWorkspaceThreadPinned(state, workspaceId, threadId) {
   entry.threads[safeThreadId] = {
     ...existing,
     pinnedAt: cleanText(existing.pinnedAt) ? "" : nowIso(),
-    updatedAt: nowIso(),
+    updated_at: nowIso(),
   };
 
   return markWorkspaceThreadsMutationResult(state, {
@@ -8556,14 +8206,14 @@ function getThreadSessionLabel(thread) {
     return "";
   }
 
-  const agentId = cleanAgentId(thread.currentAgent, "");
+  const agentId = cleanAgentId(thread.current_agent, "");
   const providerBinding = agentId
     ? getWorkspaceThreadProviderBinding(thread, agentId)
     : null;
   return [
-    providerBinding?.nativeSessionId,
-    thread.transcriptSessionId,
-    thread.coordination?.sessionId,
+    providerBinding?.native_session_id,
+    thread.transcript_session_id,
+    thread.coordination?.session_id,
   ]
     .map(cleanThreadLabelCandidate)
     .find(Boolean) || "";
@@ -8574,12 +8224,12 @@ export function getWorkspaceThreadHasSession(thread) {
     return false;
   }
 
-  if (cleanText(thread.transcriptSessionId)) {
+  if (cleanText(thread.transcript_session_id)) {
     return true;
   }
 
-  return Object.values(thread.providerBindings || {}).some((binding) => (
-    Boolean(cleanText(binding?.nativeSessionId))
+  return Object.values(thread.provider_bindings || {}).some((binding) => (
+    Boolean(cleanText(binding?.native_session_id))
   ));
 }
 
@@ -8600,7 +8250,7 @@ function getThreadNativeTitleLabel(thread) {
     return "";
   }
 
-  const currentAgent = cleanAgentId(thread.currentAgent, "");
+  const currentAgent = cleanAgentId(thread.current_agent, "");
   const agents = [
     currentAgent,
     ...THREAD_AGENT_IDS.filter((agentId) => agentId !== currentAgent),
@@ -8608,7 +8258,7 @@ function getThreadNativeTitleLabel(thread) {
 
   for (const agentId of agents) {
     const providerBinding = getWorkspaceThreadProviderBinding(thread, agentId);
-    const title = cleanRealThreadTitleCandidate(providerBinding?.nativeSessionTitle, thread);
+    const title = cleanRealThreadTitleCandidate(providerBinding?.native_session_title, thread);
     if (title) {
       return title;
     }
@@ -8620,14 +8270,14 @@ function getThreadNativeTitleLabel(thread) {
 function getThreadStoredTitleLabel(thread) {
   return [
     thread?.title,
-    thread?.sessionName,
+    thread?.session_name,
   ]
     .map((candidate) => cleanRealThreadTitleCandidate(candidate, thread))
     .find(Boolean) || "";
 }
 
 function getThreadPromptFallbackLabel(thread) {
-  const pendingLabel = getWorkspaceThreadPromptLabel(thread?.pendingPrompt?.text, "");
+  const pendingLabel = getWorkspaceThreadPromptLabel(thread?.pending_prompt?.text, "");
   if (pendingLabel) {
     return pendingLabel;
   }
@@ -8662,29 +8312,29 @@ export function getWorkspaceThreadLabel(thread) {
     return sessionLabel;
   }
 
-  return cleanRealThreadTitleCandidate(thread?.sessionName || thread?.title, thread)
-    || defaultThreadTitle(getThreadTerminalIndex(thread) || 0, thread?.currentAgent || DEFAULT_AGENT_ID);
+  return cleanRealThreadTitleCandidate(thread?.session_name || thread?.title, thread)
+    || defaultThreadTitle(getThreadTerminalIndex(thread) || 0, thread?.current_agent || DEFAULT_AGENT_ID);
 }
 
 export function getWorkspaceThreadProviderBinding(thread, agentId) {
-  const safeAgentId = cleanAgentId(agentId || thread?.currentAgent, "");
+  const safeAgentId = cleanAgentId(agentId || thread?.current_agent, "");
   if (!thread || !isThreadAgentId(safeAgentId)) {
     return null;
   }
 
-  return normalizeProviderBinding(thread.providerBindings?.[safeAgentId], safeAgentId, {
+  return normalizeProviderBinding(thread.provider_bindings?.[safeAgentId], safeAgentId, {
     coordination: thread.coordination,
-    lastActiveAt: thread.lastActiveAt,
-    lastMessageAt: thread.lastMessageAt,
-    messageCount: thread.messageCount,
+    last_active_at: thread.last_active_at,
+    last_message_at: thread.last_message_at,
+    message_count: thread.message_count,
     status: thread.status,
-    terminalBinding: thread.currentAgent === safeAgentId ? thread.terminalBinding : null,
-    updatedAt: thread.updatedAt,
+    terminal_binding: thread.current_agent === safeAgentId ? thread.terminal_binding : null,
+    updated_at: thread.updated_at,
   });
 }
 
 export function getWorkspaceThreadTurnState(thread) {
-  return normalizeThreadLatestTurn(thread?.latestTurn)?.state || "";
+  return normalizeThreadLatestTurn(thread?.latest_turn)?.state || "";
 }
 
 export { THREAD_AGENT_IDS, WORKSPACE_THREADS_STORAGE_KEY };

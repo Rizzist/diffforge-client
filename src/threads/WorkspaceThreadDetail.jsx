@@ -2492,7 +2492,7 @@ function findAgentStatus(agentStatuses, agentId) {
 
 function getStatusModel(status) {
   return String(
-    status?.activeModel
+    status?.active_model
       || status?.model
       || status?.selectedModel
       || status?.configuredModel
@@ -2504,7 +2504,7 @@ function getAttachmentLogSummary(attachments) {
   return (Array.isArray(attachments) ? attachments : [])
     .map((attachment) => ({
       id: String(attachment?.id || ""),
-      mimeType: String(attachment?.mimeType || ""),
+      mime_type: String(attachment?.mime_type || ""),
       name: String(attachment?.name || ""),
       size: Number(attachment?.size || 0),
     }))
@@ -2516,52 +2516,42 @@ function getModelThinkingPowerMetadata(agentId, option, model) {
   const normalizedModel = String(model || option?.value || "").trim().toLowerCase();
   const configuredOption = getConfiguredModelOption(normalizedAgentId, normalizedModel);
   const explicitValue = String(
-    option?.thinkingPower
-      || option?.reasoningEffort
-      || option?.reasoning_effort
-      || option?.thinkingBudget
-      || option?.thinking_budget
-      || configuredOption?.thinkingPower
-      || configuredOption?.reasoningEffort
-      || configuredOption?.reasoning_effort
-      || configuredOption?.thinkingBudget
-      || configuredOption?.thinking_budget
-      || "",
+    option?.thinking_power || option?.reasoning_effort || option?.thinking_budget || configuredOption?.thinking_power || configuredOption?.reasoning_effort || configuredOption?.thinking_budget || "",
   ).trim();
 
   if (explicitValue) {
     return {
       source: "model_option",
-      thinkingPower: explicitValue,
+      thinking_power: explicitValue,
     };
   }
 
   if (normalizedAgentId === "codex") {
     return {
       source: normalizedModel.includes("spark") ? "codex_spark_default" : "codex_default",
-      thinkingPower: normalizedModel.includes("spark") ? "high" : "medium",
+      thinking_power: normalizedModel.includes("spark") ? "high" : "medium",
     };
   }
 
   if (normalizedAgentId === "claude") {
     return {
       source: "not_configured",
-      thinkingPower: "",
+      thinking_power: "",
     };
   }
 
   return {
     source: "unsupported_agent",
-    thinkingPower: "",
+    thinking_power: "",
   };
 }
 
 function getModelOptions(agentId, status, binding = null) {
   const normalizedAgentId = normalizeAgentId(agentId);
   const sessionModel = String(
-    binding?.modelId
+    binding?.model_id
       || binding?.model
-      || binding?.activeModel
+      || binding?.active_model
       || binding?.nativeModel
       || binding?.selectedModel
       || binding?.configuredModel
@@ -2598,7 +2588,7 @@ function getImageInputSupport(agentId, status, selectedModel) {
   const activeModel = String(selectedModel || getStatusModel(status)).trim();
 
   return getAgentModelImageInputCapability(normalizedAgentId, activeModel, {
-    agentLabel: AGENT_LABELS[normalizedAgentId] || normalizedAgentId,
+    agent_label: AGENT_LABELS[normalizedAgentId] || normalizedAgentId,
   });
 }
 
@@ -2625,7 +2615,7 @@ function formatComposerMetaLabel(value) {
 
 function getThinkingPowerLabel(agentId, option, model) {
   const metadata = getModelThinkingPowerMetadata(agentId, option, model);
-  return String(metadata.thinkingPower || "").trim();
+  return String(metadata.thinking_power || "").trim();
 }
 
 function getModelSpeedLabel(agentId, option, model) {
@@ -2682,9 +2672,9 @@ function readImageFile(file) {
     const reader = new FileReader();
     reader.onerror = () => reject(new Error("Unable to read image."));
     reader.onload = () => resolve({
-      dataUrl: String(reader.result || ""),
+      data_url: String(reader.result || ""),
       id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-      mimeType,
+      mime_type: mimeType,
       name: file.name || "image",
       size: file.size || 0,
     });
@@ -2780,7 +2770,7 @@ function describeImageDropFile(file) {
     inferredMimeType: inferImageMimeType(file),
     isImage: isImageFile(file),
     lastModified: Number(file?.lastModified || 0),
-    mimeType: String(file?.type || ""),
+    mime_type: String(file?.type || ""),
     name: String(file?.name || ""),
     size: Number(file?.size || 0),
   };
@@ -2812,11 +2802,11 @@ function describeImageDropTransfer(dataTransfer) {
   const files = Array.from(dataTransfer?.files || []);
 
   return {
-    dropEffect: String(dataTransfer?.dropEffect || ""),
-    effectAllowed: String(dataTransfer?.effectAllowed || ""),
-    fileCount: files.length,
+    drop_effect: String(dataTransfer?.dropEffect || ""),
+    effect_allowed: String(dataTransfer?.effectAllowed || ""),
+    file_count: files.length,
     files: files.slice(0, IMAGE_DROP_DIAGNOSTIC_LIMIT).map(describeImageDropFile),
-    itemCount: items.length,
+    item_count: items.length,
     items: items.slice(0, IMAGE_DROP_DIAGNOSTIC_LIMIT).map(describeImageDropItem),
     typeCount: Array.from(dataTransfer?.types || []).length,
     types: Array.from(dataTransfer?.types || []),
@@ -2834,15 +2824,15 @@ function describeImageDropEnvironment() {
 function describeImageSupportDiagnostics({
   activeAgentId,
   activeAgentStatus,
-  imageInputSupport,
+  image_input_support: imageInputSupport,
   modelOptions,
   selectedModel,
   selectedModelOption,
 }) {
   return {
     activeAgentId,
-    agentId: activeAgentId,
-    imageSupportActiveModel: imageInputSupport?.activeModel || "",
+    agent_id: activeAgentId,
+    imageSupportActiveModel: imageInputSupport?.active_model || "",
     imageSupportReason: imageInputSupport?.reason || "",
     imageSupportState: imageInputSupport?.state || "",
     imageSupported: Boolean(imageInputSupport?.supported),
@@ -2883,7 +2873,7 @@ function formatSavedFileAttachments(attachments, startIndex = 0) {
       }
 
       const name = String(attachment?.name || `file-${startIndex + index + 1}`).trim();
-      const mimeType = String(attachment?.mimeType || "").trim();
+      const mimeType = String(attachment?.mime_type || "").trim();
       const label = mimeType.startsWith("image/") || String(attachment?.kind || "") === "image"
         ? "image-attached"
         : "file-attached";
@@ -2898,11 +2888,11 @@ async function saveImageAttachments(attachments) {
     .filter((attachment) => String(attachment?.savedPath || attachment?.path || "").trim());
   const images = (Array.isArray(attachments) ? attachments : [])
     .map((attachment) => ({
-      dataUrl: attachment.dataUrl,
-      mimeType: attachment.mimeType,
+      data_url: attachment.data_url,
+      mime_type: attachment.mime_type,
       name: attachment.name,
     }))
-    .filter((attachment) => attachment.dataUrl && attachment.mimeType);
+    .filter((attachment) => attachment.data_url && attachment.mime_type);
 
   if (!images.length && !savedPathAttachments.length) {
     return "";
@@ -2952,7 +2942,7 @@ function getDefaultNewChatAgentId(agentStatuses) {
 }
 
 function NewChatView({
-  agentStatuses,
+  agent_statuses: agentStatuses,
   onCreateChat,
   workspace,
 }) {
@@ -3007,19 +2997,19 @@ function NewChatView({
       ...describeImageSupportDiagnostics({
         activeAgentId,
         activeAgentStatus,
-        imageInputSupport,
+        image_input_support: imageInputSupport,
         modelOptions,
         selectedModel: effectiveSelectedModel,
         selectedModelOption,
       }),
       environment: describeImageDropEnvironment(),
       surface: "new_chat",
-      workspaceId: workspace?.id || "",
+      workspace_id: workspace?.id || "",
     });
   }, [
     activeAgentId,
     activeAgentStatus,
-    imageInputSupport.activeModel,
+    imageInputSupport.active_model,
     imageInputSupport.reason,
     imageInputSupport.state,
     imageInputSupport.supported,
@@ -3031,7 +3021,7 @@ function NewChatView({
 
   useEffect(() => {
     logBigViewSyncDiagnosticEvent("bigview.image.attachment_state", {
-      agentId: activeAgentId,
+      agent_id: activeAgentId,
       attachmentCount: attachments.length,
       attachments: getAttachmentLogSummary(attachments),
       imageSupportReason: imageInputSupport.reason || "",
@@ -3039,7 +3029,7 @@ function NewChatView({
       imageSupported: Boolean(imageInputSupport.supported),
       selectedModel: effectiveSelectedModel || "",
       surface: "new_chat",
-      workspaceId: workspace?.id || "",
+      workspace_id: workspace?.id || "",
     });
   }, [
     activeAgentId,
@@ -3058,16 +3048,16 @@ function NewChatView({
     }
 
     logBigViewSyncDiagnosticEvent("bigview.image.add_start", {
-      agentId: activeAgentId,
+      agent_id: activeAgentId,
       attachmentCountBefore: attachments.length,
-      fileCount: files.length,
+      file_count: files.length,
       files: files.map(describeImageDropFile),
       imageSupportReason: imageInputSupport.reason || "",
       imageSupportState: imageInputSupport.state || "",
       imageSupported: Boolean(imageInputSupport.supported),
       model: effectiveSelectedModel || "",
       surface: "new_chat",
-      workspaceId: workspace?.id || "",
+      workspace_id: workspace?.id || "",
     });
     setError("");
     try {
@@ -3076,22 +3066,22 @@ function NewChatView({
         currentAttachments.concat(nextAttachments).slice(0, IMAGE_ATTACHMENT_LIMIT)
       ));
       logBigViewSyncDiagnosticEvent("bigview.image.add_done", {
-        agentId: activeAgentId,
+        agent_id: activeAgentId,
         attachmentCountAfter: Math.min(IMAGE_ATTACHMENT_LIMIT, attachments.length + nextAttachments.length),
         attachments: getAttachmentLogSummary(nextAttachments),
         model: effectiveSelectedModel || "",
         surface: "new_chat",
-        workspaceId: workspace?.id || "",
+        workspace_id: workspace?.id || "",
       });
     } catch (readError) {
       setError(readError?.message || "Unable to attach image.");
       logBigViewSyncDiagnosticEvent("bigview.image.add_error", {
-        agentId: activeAgentId,
-        fileCount: files.length,
+        agent_id: activeAgentId,
+        file_count: files.length,
         message: readError?.message || String(readError || ""),
         model: effectiveSelectedModel || "",
         surface: "new_chat",
-        workspaceId: workspace?.id || "",
+        workspace_id: workspace?.id || "",
       });
     }
   };
@@ -3100,13 +3090,13 @@ function NewChatView({
     const imageFiles = getClipboardImageFiles(event.clipboardData);
     const clipboardText = String(event.clipboardData?.getData?.("text/plain") || "");
     logBigViewSyncDiagnosticEvent("bigview.text.paste_observed", {
-      agentId: activeAgentId,
+      agent_id: activeAgentId,
       clipboardTypes: Array.from(event.clipboardData?.types || []),
       hasImageFiles: imageFiles.length > 0,
       model: effectiveSelectedModel || "",
       surface: "new_chat",
       text: getBigViewTextDiagnosticFields(clipboardText),
-      workspaceId: workspace?.id || "",
+      workspace_id: workspace?.id || "",
     });
     if (!imageFiles.length) {
       return;
@@ -3114,13 +3104,13 @@ function NewChatView({
 
     event.preventDefault();
     logBigViewSyncDiagnosticEvent("bigview.image.paste_start", {
-      agentId: activeAgentId,
+      agent_id: activeAgentId,
       attachmentCountBefore: attachments.length,
-      fileCount: imageFiles.length,
+      file_count: imageFiles.length,
       files: imageFiles.map(describeImageDropFile),
       model: effectiveSelectedModel || "",
       surface: "new_chat",
-      workspaceId: workspace?.id || "",
+      workspace_id: workspace?.id || "",
     });
     addImageFiles(imageFiles);
   };
@@ -3129,14 +3119,14 @@ function NewChatView({
     const pastedText = String(clipboardText || "");
     if (!pastedText || sending) {
       logBigViewSyncDiagnosticEvent("bigview.text.paste_fallback_skip", {
-        agentId: activeAgentId,
+        agent_id: activeAgentId,
         disabled: Boolean(sending),
         model: effectiveSelectedModel || "",
         reason: !pastedText ? "empty_text" : "composer_unavailable",
         source,
         surface: "new_chat",
         text: getBigViewTextDiagnosticFields(pastedText),
-        workspaceId: workspace?.id || "",
+        workspace_id: workspace?.id || "",
       });
       return false;
     }
@@ -3149,14 +3139,14 @@ function NewChatView({
       newChatInputRef.current?.focus?.();
     }, 0);
     logBigViewSyncDiagnosticEvent("bigview.text.paste_fallback_insert", {
-      agentId: activeAgentId,
+      agent_id: activeAgentId,
       model: effectiveSelectedModel || "",
       nextValueLength: nextDraft.length,
       previousValueLength: previousDraft.length,
       source,
       surface: "new_chat",
       text: getBigViewTextDiagnosticFields(pastedText),
-      workspaceId: workspace?.id || "",
+      workspace_id: workspace?.id || "",
     });
     return true;
   };
@@ -3187,7 +3177,7 @@ function NewChatView({
       }
 
       logBigViewSyncDiagnosticEvent("bigview.text.window_paste_observed", {
-        agentId: activeAgentId,
+        agent_id: activeAgentId,
         activeInsideNewChat,
         clipboardTypes: Array.from(event.clipboardData?.types || []),
         hasImageFiles: imageFiles.length > 0,
@@ -3198,7 +3188,7 @@ function NewChatView({
         targetIsInteractive,
         targetIsNewChatInput,
         text: getBigViewTextDiagnosticFields(clipboardText),
-        workspaceId: workspace?.id || "",
+        workspace_id: workspace?.id || "",
       });
 
       if (
@@ -3242,7 +3232,7 @@ function NewChatView({
       ...describeImageSupportDiagnostics({
         activeAgentId,
         activeAgentStatus,
-        imageInputSupport,
+        image_input_support: imageInputSupport,
         modelOptions,
         selectedModel: effectiveSelectedModel,
         selectedModelOption,
@@ -3252,7 +3242,7 @@ function NewChatView({
       hasWorkspaceFileTransfer: isWorkspaceFileDragTransfer(event.dataTransfer),
       surface: "new_chat",
       transfer: describeImageDropTransfer(event.dataTransfer),
-      workspaceId: workspace?.id || "",
+      workspace_id: workspace?.id || "",
     });
   };
 
@@ -3270,7 +3260,7 @@ function NewChatView({
       ...describeImageSupportDiagnostics({
         activeAgentId,
         activeAgentStatus,
-        imageInputSupport,
+        image_input_support: imageInputSupport,
         modelOptions,
         selectedModel: effectiveSelectedModel,
         selectedModelOption,
@@ -3281,7 +3271,7 @@ function NewChatView({
       hasWorkspaceFileTransfer,
       surface: "new_chat",
       transfer: describeImageDropTransfer(event.dataTransfer),
-      workspaceId: workspace?.id || "",
+      workspace_id: workspace?.id || "",
     });
   };
 
@@ -3292,7 +3282,7 @@ function NewChatView({
       ...describeImageSupportDiagnostics({
         activeAgentId,
         activeAgentStatus,
-        imageInputSupport,
+        image_input_support: imageInputSupport,
         modelOptions,
         selectedModel: effectiveSelectedModel,
         selectedModelOption,
@@ -3304,17 +3294,17 @@ function NewChatView({
       hasWorkspaceFileTransfer: isWorkspaceFileDragTransfer(event.dataTransfer),
       surface: "new_chat",
       transfer: describeImageDropTransfer(event.dataTransfer),
-      workspaceId: workspace?.id || "",
+      workspace_id: workspace?.id || "",
     });
     logBigViewSyncDiagnosticEvent("bigview.text.drop_observed", {
-      agentId: activeAgentId,
+      agent_id: activeAgentId,
       dataTransferTypes: Array.from(event.dataTransfer?.types || []),
       hasImageTransfer: imageFiles.length > 0,
       hasWorkspaceFileTransfer: isWorkspaceFileDragTransfer(event.dataTransfer),
       model: effectiveSelectedModel || "",
       surface: "new_chat",
       text: getBigViewTextDiagnosticFields(event.dataTransfer?.getData?.("text/plain") || ""),
-      workspaceId: workspace?.id || "",
+      workspace_id: workspace?.id || "",
     });
     if (imageFiles.length) {
       event.preventDefault();
@@ -3323,16 +3313,16 @@ function NewChatView({
         ...describeImageSupportDiagnostics({
           activeAgentId,
           activeAgentStatus,
-          imageInputSupport,
+          image_input_support: imageInputSupport,
           modelOptions,
           selectedModel: effectiveSelectedModel,
           selectedModelOption,
         }),
-        fileCount: imageFiles.length,
+        file_count: imageFiles.length,
         files: imageFiles.map(describeImageDropFile),
         surface: "new_chat",
         transfer: describeImageDropTransfer(event.dataTransfer),
-        workspaceId: workspace?.id || "",
+        workspace_id: workspace?.id || "",
       });
       addImageFiles(imageFiles);
       return;
@@ -3349,9 +3339,9 @@ function NewChatView({
         attachmentCreated: Boolean(attachment),
         hasActiveWorkspaceFile: Boolean(activeWorkspaceFile),
         hasWorkspaceFileTransfer,
-        relativePath: workspaceFile?.relativePath || attachment?.relativePath || "",
+        relative_path: workspaceFile?.relative_path || attachment?.relative_path || "",
         types: Array.from(event.dataTransfer?.types || []),
-        workspaceId: workspace?.id || "",
+        workspace_id: workspace?.id || "",
       });
       if (!attachment) {
         setError("Drop an image file.");
@@ -3378,7 +3368,7 @@ function NewChatView({
         ...describeImageSupportDiagnostics({
           activeAgentId,
           activeAgentStatus,
-          imageInputSupport,
+          image_input_support: imageInputSupport,
           modelOptions,
           selectedModel: effectiveSelectedModel,
           selectedModelOption,
@@ -3386,7 +3376,7 @@ function NewChatView({
         reason: "missing_image_file",
         surface: "new_chat",
         transfer: describeImageDropTransfer(event.dataTransfer),
-        workspaceId: workspace?.id || "",
+        workspace_id: workspace?.id || "",
       });
     }
   };
@@ -3396,13 +3386,13 @@ function NewChatView({
       const removedAttachment = currentAttachments.find((attachment) => attachment.id === attachmentId);
       const nextAttachments = currentAttachments.filter((attachment) => attachment.id !== attachmentId);
       logBigViewSyncDiagnosticEvent("bigview.image.remove", {
-        agentId: activeAgentId,
+        agent_id: activeAgentId,
         attachmentCountAfter: nextAttachments.length,
         attachmentCountBefore: currentAttachments.length,
         removedAttachment: getAttachmentLogSummary([removedAttachment])[0] || null,
         selectedModel: effectiveSelectedModel || "",
         surface: "new_chat",
-        workspaceId: workspace?.id || "",
+        workspace_id: workspace?.id || "",
       });
       return nextAttachments;
     });
@@ -3428,7 +3418,7 @@ function NewChatView({
         selectedModelPayload,
       );
       logBigViewSyncDiagnosticEvent("bigview.submit.start", {
-        agentId: activeAgentId,
+        agent_id: activeAgentId,
         attachmentCount: previousAttachments.length,
         attachments: getAttachmentLogSummary(previousAttachments),
         draftLength: text.length,
@@ -3438,18 +3428,18 @@ function NewChatView({
         modelPayload: selectedModelPayload,
         selectedModel: selectedModelPayload || effectiveSelectedModel || "",
         surface: "new_chat",
-        thinkingPower: thinkingPower.thinkingPower,
+        thinking_power: thinkingPower.thinking_power,
         thinkingPowerSource: thinkingPower.source,
-        workspaceId: workspace?.id || "",
+        workspace_id: workspace?.id || "",
       });
       if (previousAttachments.length) {
         logBigViewSyncDiagnosticEvent("bigview.image.save_start", {
-          agentId: activeAgentId,
+          agent_id: activeAgentId,
           attachmentCount: previousAttachments.length,
           attachments: getAttachmentLogSummary(previousAttachments),
           selectedModel: selectedModelPayload || effectiveSelectedModel || "",
           surface: "new_chat",
-          workspaceId: workspace?.id || "",
+          workspace_id: workspace?.id || "",
         });
       }
       let imageBlock = "";
@@ -3458,52 +3448,52 @@ function NewChatView({
       } catch (saveError) {
         if (previousAttachments.length) {
           logBigViewSyncDiagnosticEvent("bigview.image.save_error", {
-            agentId: activeAgentId,
+            agent_id: activeAgentId,
             attachmentCount: previousAttachments.length,
             attachments: getAttachmentLogSummary(previousAttachments),
             message: saveError?.message || String(saveError || ""),
             selectedModel: selectedModelPayload || effectiveSelectedModel || "",
             surface: "new_chat",
-            workspaceId: workspace?.id || "",
+            workspace_id: workspace?.id || "",
           });
         }
         throw saveError;
       }
       if (previousAttachments.length) {
         logBigViewSyncDiagnosticEvent("bigview.image.save_done", {
-          agentId: activeAgentId,
+          agent_id: activeAgentId,
           attachmentCount: previousAttachments.length,
           imageBlockLength: imageBlock.length,
           imageBlockPreview: imageBlock.slice(0, 240),
           selectedModel: selectedModelPayload || effectiveSelectedModel || "",
           surface: "new_chat",
-          workspaceId: workspace?.id || "",
+          workspace_id: workspace?.id || "",
         });
       }
       const message = [text, imageBlock].filter(Boolean).join("\n\n");
       logBigViewSyncDiagnosticEvent("bigview.submit.message_prepared", {
-        agentId: activeAgentId,
+        agent_id: activeAgentId,
         attachmentCount: previousAttachments.length,
         imageBlockPresent: Boolean(imageBlock),
         messageLength: message.length,
         messageText: getBigViewTextDiagnosticFields(message),
         selectedModel: selectedModelPayload || effectiveSelectedModel || "",
         surface: "new_chat",
-        workspaceId: workspace?.id || "",
+        workspace_id: workspace?.id || "",
       });
 
       await onCreateChat?.({
-        agentId: activeAgentId,
+        agent_id: activeAgentId,
         message,
         model: selectedModelPayload,
         workspace,
       });
       logBigViewSyncDiagnosticEvent("bigview.submit.done", {
-        agentId: activeAgentId,
+        agent_id: activeAgentId,
         attachmentCount: previousAttachments.length,
         selectedModel: selectedModelPayload || effectiveSelectedModel || "",
         surface: "new_chat",
-        workspaceId: workspace?.id || "",
+        workspace_id: workspace?.id || "",
       });
       setDraft("");
       setAttachments([]);
@@ -3512,12 +3502,12 @@ function NewChatView({
       setAttachments(previousAttachments);
       setError(submitError?.message || "Unable to start chat.");
       logBigViewSyncDiagnosticEvent("bigview.submit.error", {
-        agentId: activeAgentId,
+        agent_id: activeAgentId,
         attachmentCount: previousAttachments.length,
         message: submitError?.message || String(submitError || ""),
         selectedModel: selectedModelPayload || effectiveSelectedModel || "",
         surface: "new_chat",
-        workspaceId: workspace?.id || "",
+        workspace_id: workspace?.id || "",
       });
     } finally {
       setSending(false);
@@ -3627,10 +3617,10 @@ function NewChatView({
                       onMouseDown={(event) => event.preventDefault()}
                       onClick={() => {
                         logBigViewSyncDiagnosticEvent("bigview.agent_change.selected", {
-                          agentId: option.id,
+                          agent_id: option.id,
                           previousAgentId: activeAgentId,
                           surface: "new_chat",
-                          workspaceId: workspace?.id || "",
+                          workspace_id: workspace?.id || "",
                         });
                         setAgentId(option.id);
                         setAgentMenuOpen(false);
@@ -3680,15 +3670,15 @@ function NewChatView({
                       onClick={() => {
                         const thinkingPower = getModelThinkingPowerMetadata(activeAgentId, option, option.value);
                         logBigViewSyncDiagnosticEvent("bigview.model_change.selected", {
-                          agentId: activeAgentId,
+                          agent_id: activeAgentId,
                           model: option.value || "",
                           modelLabel: option.label || "",
                           requestSent: false,
                           reason: "new_chat_model_selection_only",
                           surface: "new_chat",
-                          thinkingPower: thinkingPower.thinkingPower,
+                          thinking_power: thinkingPower.thinking_power,
                           thinkingPowerSource: thinkingPower.source,
-                          workspaceId: workspace?.id || "",
+                          workspace_id: workspace?.id || "",
                         });
                         setSelectedModel(option.value);
                         setModelMenuOpen(false);
@@ -3756,8 +3746,8 @@ function openWorkspaceFile(workspace, filePath, options = {}) {
   window.dispatchEvent(new CustomEvent(WORKSPACE_FILE_OPEN_EVENT, {
     detail: {
       ...options,
-      relativePath,
-      workspaceId: workspace?.id || "",
+      relative_path: relativePath,
+      workspace_id: workspace?.id || "",
     },
   }));
 }
@@ -4008,14 +3998,14 @@ function MessageTextContent({ message, workspace }) {
 }
 
 function threadLatestTurnState(thread) {
-  return String(thread?.latestTurn?.state || "").trim().toLowerCase();
+  return String(thread?.latest_turn?.state || "").trim().toLowerCase();
 }
 
 function getThreadDiffTurnState(thread, groundTruth) {
   return String(
     groundTruth?.effectiveLatestTurnState
       || groundTruth?.latestTurnState
-      || thread?.latestTurn?.state
+      || thread?.latest_turn?.state
       || "",
   ).trim().toLowerCase();
 }
@@ -4054,12 +4044,55 @@ function getThreadDiffStorageKey(workspaceId, threadId, turnId) {
   ].join(":");
 }
 
+const THREAD_DIFF_PERSISTED_TO_RUNTIME_KEYS = Object.freeze({
+  baseSha: "base_sha",
+  capturedAt: "captured_at",
+  changeKind: "change_kind",
+  countStatus: "count_status",
+  fileCount: "file_count",
+  latestFile: "latest_file",
+  linesAdded: "lines_added",
+  linesRemoved: "lines_removed",
+  modifiedMs: "modified_ms",
+  summaryKey: "summary_key",
+  turnId: "turn_id",
+  undoneAt: "undone_at",
+  undoStatus: "undo_status",
+  worktreeId: "worktree_id",
+  worktreePath: "worktree_path",
+});
+
+const THREAD_DIFF_RUNTIME_TO_PERSISTED_KEYS = Object.freeze(
+  Object.fromEntries(
+    Object.entries(THREAD_DIFF_PERSISTED_TO_RUNTIME_KEYS)
+      .map(([persisted, runtime]) => [runtime, persisted]),
+  ),
+);
+
+function mapThreadDiffPersistedKeys(value, keyMap) {
+  if (Array.isArray(value)) {
+    return value.map((item) => mapThreadDiffPersistedKeys(item, keyMap));
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [
+      keyMap[key] || key,
+      mapThreadDiffPersistedKeys(item, keyMap),
+    ]),
+  );
+}
+
 function readStoredThreadDiffSummary(key) {
   if (!key || typeof window === "undefined") {
     return null;
   }
   try {
-    return normalizeThreadDiffSummary(JSON.parse(window.localStorage.getItem(key) || "null"));
+    return normalizeThreadDiffSummary(mapThreadDiffPersistedKeys(
+      JSON.parse(window.localStorage.getItem(key) || "null"),
+      THREAD_DIFF_PERSISTED_TO_RUNTIME_KEYS,
+    ));
   } catch {
     return null;
   }
@@ -4071,7 +4104,10 @@ function writeStoredThreadDiffSummary(key, summary) {
   }
   try {
     if (summary) {
-      window.localStorage.setItem(key, JSON.stringify(summary));
+      window.localStorage.setItem(key, JSON.stringify(mapThreadDiffPersistedKeys(
+        summary,
+        THREAD_DIFF_RUNTIME_TO_PERSISTED_KEYS,
+      )));
     } else {
       window.localStorage.removeItem(key);
     }
@@ -4082,9 +4118,9 @@ function writeStoredThreadDiffSummary(key, summary) {
 
 function getThreadDiffWorktreePath(thread, providerBinding, liveTerminal) {
   return String(
-    thread?.coordination?.worktreePath
-      || providerBinding?.coordination?.worktreePath
-      || liveTerminal?.worktreePath
+    thread?.coordination?.worktree_path
+      || providerBinding?.coordination?.worktree_path
+      || liveTerminal?.worktree_path
       || "",
   ).trim();
 }
@@ -4096,8 +4132,8 @@ function isThreadDiffWorktreePath(path) {
 
 function getThreadDiffTurnId(thread, latestMessage, latestAssistantBlockId) {
   return String(
-    thread?.latestTurn?.turnId
-      || latestMessage?.turnId
+    thread?.latest_turn?.turn_id
+      || latestMessage?.turn_id
       || latestAssistantBlockId
       || "",
   ).trim();
@@ -4128,12 +4164,12 @@ function normalizeThreadDiffFile(file) {
     return null;
   }
   return {
-    additions: getNumberOrNull(file.additions ?? file.linesAdded ?? file.lines_added),
+    additions: getNumberOrNull(file.additions ?? file.lines_added),
     binary: file.binary === true,
-    changeKind: String(file.changeKind || file.change_kind || "modified").trim() || "modified",
-    countStatus: String(file.countStatus || file.count_status || "").trim(),
-    deletions: getNumberOrNull(file.deletions ?? file.linesRemoved ?? file.lines_removed),
-    modifiedMs: Number(file.modifiedMs || file.modified_ms || 0) || 0,
+    change_kind: String(file.change_kind || "modified").trim() || "modified",
+    count_status: String(file.count_status || "").trim(),
+    deletions: getNumberOrNull(file.deletions ?? file.lines_removed),
+    modified_ms: Number(file.modified_ms || 0) || 0,
     name: String(file.name || path.split("/").filter(Boolean).pop() || path).trim(),
     path,
     untracked: file.untracked === true,
@@ -4149,34 +4185,34 @@ function normalizeThreadDiffSummary(value) {
     .map(normalizeThreadDiffFile)
     .filter(Boolean)
     .sort((left, right) => left.path.localeCompare(right.path));
-  const latestFile = normalizeThreadDiffFile(data.latestFile || data.latest_file)
+  const latestFile = normalizeThreadDiffFile(data.latest_file)
     || [...files].sort((left, right) => (
-      (right.modifiedMs || 0) - (left.modifiedMs || 0)
+      (right.modified_ms || 0) - (left.modified_ms || 0)
       || left.path.localeCompare(right.path)
     ))[0]
     || null;
-  const fileCount = Number(data.fileCount ?? data.file_count ?? files.length) || files.length;
+  const fileCount = Number(data.file_count ?? files.length) || files.length;
 
   return {
     additions: Number(data.additions || 0) || 0,
-    baseSha: String(data.baseSha || data.base_sha || "").trim(),
-    capturedAt: String(data.capturedAt || data.captured_at || "").trim(),
+    base_sha: String(data.base_sha || "").trim(),
+    captured_at: String(data.captured_at || "").trim(),
     deletions: Number(data.deletions || 0) || 0,
-    fileCount,
+    file_count: fileCount,
     files,
-    latestFile,
+    latest_file: latestFile,
     partial: data.partial === true,
-    summaryKey: String(data.summaryKey || data.summary_key || "").trim(),
-    turnId: String(data.turnId || data.turn_id || "").trim(),
-    undoStatus: String(data.undoStatus || data.undo_status || "").trim(),
-    undoneAt: String(data.undoneAt || data.undone_at || "").trim(),
-    worktreeId: String(data.worktreeId || data.worktree_id || "").trim(),
-    worktreePath: String(data.worktreePath || data.worktree_path || "").trim(),
+    summary_key: String(data.summary_key || "").trim(),
+    turn_id: String(data.turn_id || "").trim(),
+    undo_status: String(data.undo_status || "").trim(),
+    undone_at: String(data.undone_at || "").trim(),
+    worktree_id: String(data.worktree_id || "").trim(),
+    worktree_path: String(data.worktree_path || "").trim(),
   };
 }
 
 function getAssistantBlockDiffTurnId(item) {
-  return String(item?.turnId || item?.id || "").trim();
+  return String(item?.turn_id || item?.id || "").trim();
 }
 
 function threadDiffSummaryEntriesEqual(left, right) {
@@ -4187,10 +4223,10 @@ function threadDiffSummaryEntriesEqual(left, right) {
     return false;
   }
 
-  return left.summaryKey === right.summaryKey
-    && left.undoStatus === right.undoStatus
-    && left.fileCount === right.fileCount
-    && left.turnId === right.turnId;
+  return left.summary_key === right.summary_key
+    && left.undo_status === right.undo_status
+    && left.file_count === right.file_count
+    && left.turn_id === right.turn_id;
 }
 
 function threadDiffSummaryMapEqual(left, right) {
@@ -4209,9 +4245,9 @@ function setThreadDiffSummaryInMap(current, turnId, summary) {
     return current;
   }
 
-  const nextSummary = summary?.fileCount ? {
+  const nextSummary = summary?.file_count ? {
     ...summary,
-    turnId: summary.turnId || safeTurnId,
+    turn_id: summary.turn_id || safeTurnId,
   } : null;
 
   if (threadDiffSummaryEntriesEqual(current?.[safeTurnId], nextSummary)) {
@@ -4241,13 +4277,13 @@ function formatThreadDiffCount(value, prefix) {
 }
 
 function getThreadDiffReviewPath(summary, file) {
-  return file?.path || summary?.latestFile?.path || summary?.files?.[0]?.path || "";
+  return file?.path || summary?.latest_file?.path || summary?.files?.[0]?.path || "";
 }
 
 function messagesContainTurnWork(messages, turnId) {
   const safeTurnId = String(turnId || "").trim();
   return (Array.isArray(messages) ? messages : []).some((message) => (
-    (!safeTurnId || message?.turnId === safeTurnId)
+    (!safeTurnId || message?.turn_id === safeTurnId)
     && ["assistant", "activity"].includes(message?.role)
     && String(message?.text || "").trim()
   ));
@@ -4293,7 +4329,7 @@ function getLatestTurnUserMessage(messages, turnId) {
   const safeTurnId = String(turnId || "").trim();
   return [...(Array.isArray(messages) ? messages : [])].reverse().find((message) => (
     message?.role === "user"
-    && (!safeTurnId || message?.turnId === safeTurnId)
+    && (!safeTurnId || message?.turn_id === safeTurnId)
   )) || null;
 }
 
@@ -4303,14 +4339,14 @@ function buildActivityItems(thread, messages = [], groundTruth = null) {
   }
 
   const items = [];
-  const latestTurn = thread.latestTurn || null;
+  const latestTurn = thread.latest_turn || null;
   const rawTurnState = groundTruth?.effectiveLatestTurnState
     || groundTruth?.latestTurnState
     || threadLatestTurnState(thread);
   const isThinking = groundTruth
     ? threadLooksEffectivelyThinking(groundTruth)
     : false;
-  const latestTurnUserMessage = getLatestTurnUserMessage(messages, latestTurn?.turnId);
+  const latestTurnUserMessage = getLatestTurnUserMessage(messages, latestTurn?.turn_id);
   const latestTurnIsSlashCommand = isLocalCommandProjectionMessage(latestTurnUserMessage);
 
   if (latestTurnIsSlashCommand) {
@@ -4319,9 +4355,9 @@ function buildActivityItems(thread, messages = [], groundTruth = null) {
 
   if (isThinking && rawTurnState === "running") {
     items.push({
-      id: `turn-${latestTurn?.turnId || "latest"}-running`,
+      id: `turn-${latestTurn?.turn_id || "latest"}-running`,
       live: true,
-      text: messagesContainTurnWork(messages, latestTurn?.turnId) ? "Working" : "Thinking",
+      text: messagesContainTurnWork(messages, latestTurn?.turn_id) ? "Working" : "Thinking",
     });
   } else if (isThinking) {
     items.push({ id: "thinking", live: true, text: "Thinking" });
@@ -4347,9 +4383,9 @@ function getMessageDiagnosticSummary(message) {
     role: String(message.role || ""),
     status: String(message.status || ""),
     text: getBigViewTextDiagnosticFields(message.text || "", { previewLength: 96 }),
-    timestamp: String(message.timestamp || message.createdAt || message.updatedAt || ""),
+    timestamp: String(message.timestamp || message.created_at || message.updated_at || ""),
     title: String(message.title || ""),
-    turnId: String(message.turnId || ""),
+    turn_id: String(message.turn_id || ""),
   };
 }
 
@@ -4359,15 +4395,15 @@ function getTerminalDiagnosticSummary(terminal) {
   }
 
   return {
-    inputReady: terminal.inputReady === true,
-    inputReadyAt: String(terminal.inputReadyAt || ""),
-    inputReadyConfidence: String(terminal.inputReadyConfidence || ""),
-    instanceId: terminal.instanceId ?? "",
-    paneId: String(terminal.paneId || ""),
+    input_ready: terminal.input_ready === true,
+    input_ready_at: String(terminal.input_ready_at || ""),
+    input_ready_confidence: String(terminal.input_ready_confidence || ""),
+    instance_id: terminal.instance_id ?? "",
+    pane_id: String(terminal.pane_id || ""),
     status: String(terminal.status || ""),
-    terminalIndex: terminal.terminalIndex ?? "",
-    threadId: String(terminal.threadId || ""),
-    workspaceId: String(terminal.workspaceId || ""),
+    terminal_index: terminal.terminal_index ?? "",
+    thread_id: String(terminal.thread_id || ""),
+    workspace_id: String(terminal.workspace_id || ""),
   };
 }
 
@@ -4377,20 +4413,20 @@ function getProviderBindingDiagnosticSummary(binding) {
   }
 
   return {
-    activityStatus: String(binding.activityStatus || ""),
-    inputReady: binding.inputReady === true,
-    inputReadyAt: String(binding.inputReadyAt || ""),
-    modelId: String(
-      binding.modelId
+    activity_status: String(binding.activity_status || ""),
+    input_ready: binding.input_ready === true,
+    input_ready_at: String(binding.input_ready_at || ""),
+    model_id: String(
+      binding.model_id
         || binding.model
-        || binding.activeModel
+        || binding.active_model
         || binding.nativeModel
         || binding.selectedModel
         || binding.configuredModel
         || "",
     ),
-    nativeSessionIdPresent: Boolean(binding.nativeSessionId),
-    terminalBinding: getTerminalDiagnosticSummary(binding.terminalBinding),
+    nativeSessionIdPresent: Boolean(binding.native_session_id),
+    terminal_binding: getTerminalDiagnosticSummary(binding.terminal_binding),
   };
 }
 
@@ -4422,11 +4458,11 @@ function getThreadDetailRenderDiagnosticSnapshot({
 }) {
   const safeMessages = Array.isArray(messages) ? messages : [];
   const safeActivityItems = Array.isArray(activityItems) ? activityItems : [];
-  const latestTurn = thread?.latestTurn || null;
-  const providerBindings = thread?.providerBindings
-    && typeof thread.providerBindings === "object"
-    && !Array.isArray(thread.providerBindings)
-    ? thread.providerBindings
+  const latestTurn = thread?.latest_turn || null;
+  const providerBindings = thread?.provider_bindings
+    && typeof thread.provider_bindings === "object"
+    && !Array.isArray(thread.provider_bindings)
+    ? thread.provider_bindings
     : {};
   const terminalCount = workspaceThreadEntry?.terminals
     && typeof workspaceThreadEntry.terminals === "object"
@@ -4447,47 +4483,47 @@ function getThreadDetailRenderDiagnosticSnapshot({
     effectiveLiveTerminal: getTerminalDiagnosticSummary(effectiveLiveTerminal),
     filteredMessageCount: safeMessages.length,
     groundTruth: threadGroundTruth ? {
-      activityStatus: String(threadGroundTruth.activityStatus || ""),
+      activity_status: String(threadGroundTruth.activity_status || ""),
       agentInputReady: threadGroundTruth.agentInputReady === true,
       completedTurnLooksSendable: threadGroundTruth.completedTurnLooksSendable === true,
       effectiveActivityStatus: String(threadGroundTruth.effectiveActivityStatus || ""),
       effectiveLatestTurnState: String(threadGroundTruth.effectiveLatestTurnState || ""),
       hasPendingPrompt: threadGroundTruth.hasPendingPrompt === true,
-      inputReadyAt: String(threadGroundTruth.inputReadyAt || ""),
+      input_ready_at: String(threadGroundTruth.input_ready_at || ""),
       inputReadyIsFreshForTurn: threadGroundTruth.inputReadyIsFreshForTurn === true,
       latestTurnState: String(threadGroundTruth.latestTurnState || ""),
       recordedAgentInputReady: threadGroundTruth.recordedAgentInputReady === true,
       runningTurnLooksIdle: threadGroundTruth.runningTurnLooksIdle === true,
       terminalGroundTruthStatus: String(threadGroundTruth.terminalGroundTruthStatus || ""),
       terminalLooksActive: threadGroundTruth.terminalLooksActive === true,
-      terminalStatus: String(threadGroundTruth.terminalStatus || ""),
+      terminal_status: String(threadGroundTruth.terminal_status || ""),
       turnStartedAt: String(threadGroundTruth.turnStartedAt || ""),
     } : null,
     latestActivity: getActivityDiagnosticSummary(latestActivity),
     latestMessage: getMessageDiagnosticSummary(latestMessage),
-    latestTurn: latestTurn ? {
-      completedAt: String(latestTurn.completedAt || ""),
+    latest_turn: latestTurn ? {
+      completed_at: String(latestTurn.completed_at || ""),
       error: String(latestTurn.error || ""),
-      messageId: String(latestTurn.messageId || ""),
-      requestedAt: String(latestTurn.requestedAt || ""),
-      startedAt: String(latestTurn.startedAt || ""),
+      message_id: String(latestTurn.message_id || ""),
+      requested_at: String(latestTurn.requested_at || ""),
+      started_at: String(latestTurn.started_at || ""),
       state: String(latestTurn.state || ""),
-      turnId: String(latestTurn.turnId || ""),
-      updatedAt: String(latestTurn.updatedAt || ""),
+      turn_id: String(latestTurn.turn_id || ""),
+      updated_at: String(latestTurn.updated_at || ""),
     } : null,
     liveActivityVisible,
     materialized: thread?.materialized === true,
-    messageCount: Number(thread?.messageCount || 0),
-    pendingPromptPresent: Boolean(thread?.pendingPrompt),
-    projectionEventCount: Array.isArray(thread?.projectionEvents) ? thread.projectionEvents.length : 0,
+    message_count: Number(thread?.message_count || 0),
+    pendingPromptPresent: Boolean(thread?.pending_prompt),
+    projectionEventCount: Array.isArray(thread?.projection_events) ? thread.projection_events.length : 0,
     providerBindingKeys: Object.keys(providerBindings),
-    rawActivityStatus: String(thread?.activityStatus || ""),
+    rawActivityStatus: String(thread?.activity_status || ""),
     rawStatus: String(thread?.status || ""),
     rawTurnState: threadLatestTurnState(thread),
-    terminalCount,
-    threadId: String(thread?.id || ""),
+    terminal_count: terminalCount,
+    thread_id: String(thread?.id || ""),
     transcriptItemCount: Array.isArray(transcriptItems) ? transcriptItems.length : 0,
-    workspaceId: String(workspace?.id || thread?.workspaceId || ""),
+    workspace_id: String(workspace?.id || thread?.workspace_id || ""),
   };
 }
 
@@ -4501,12 +4537,12 @@ function getThreadDetailRenderDiagnosticSignature(snapshot) {
     latestActivity: snapshot?.latestActivity,
     latestMessageHash: snapshot?.latestMessage?.text?.textHash || "",
     latestMessageId: snapshot?.latestMessage?.id || "",
-    latestTurnState: snapshot?.latestTurn?.state || "",
+    latestTurnState: snapshot?.latest_turn?.state || "",
     liveActivityVisible: snapshot?.liveActivityVisible === true,
     rawActivityStatus: snapshot?.rawActivityStatus || "",
     rawStatus: snapshot?.rawStatus || "",
-    threadId: snapshot?.threadId || "",
-    workspaceId: snapshot?.workspaceId || "",
+    thread_id: snapshot?.thread_id || "",
+    workspace_id: snapshot?.workspace_id || "",
   });
 }
 
@@ -4552,12 +4588,12 @@ function getToolCallLabel(message) {
 }
 
 function getToolDisplayName(message) {
-  const explicit = String(message?.toolDisplayName || message?.tool_display_name || "").trim();
+  const explicit = String(message?.tool_display_name || "").trim();
   if (explicit) {
     return explicit;
   }
-  const rawName = String(message?.toolName || message?.tool_name || "").trim();
-  const server = String(message?.toolServer || message?.tool_server || "").trim();
+  const rawName = String(message?.tool_name || "").trim();
+  const server = String(message?.tool_server || "").trim();
   const mcpMatch = /^mcp_{2,}(.+?)_{2,}(.+)$/.exec(rawName);
   if (mcpMatch) {
     return `${mcpMatch[1].replace(/_/g, "-")} / ${mcpMatch[2]}`;
@@ -4565,7 +4601,7 @@ function getToolDisplayName(message) {
   if (server && rawName && !rawName.toLowerCase().startsWith(`${server.toLowerCase()}.`)) {
     return `${server} / ${rawName}`;
   }
-  return rawName || String(message?.command || "").trim() || String(message?.filePath || message?.file_path || "").trim();
+  return rawName || String(message?.command || "").trim() || String(message?.file_path || "").trim();
 }
 
 function isActivityMessage(message) {
@@ -4573,7 +4609,7 @@ function isActivityMessage(message) {
 }
 
 function getMessageTurnId(message) {
-  return String(message?.turnId || message?.turn_id || "").trim();
+  return String(message?.turn_id || "").trim();
 }
 
 function buildTranscriptItems(messages) {
@@ -4591,7 +4627,7 @@ function buildTranscriptItems(messages) {
     assistantBlock?.items.push({
       id: `activity-group-${firstMessage?.id || items.length}-${lastMessage?.id || activityGroup.length}`,
       messages: activityGroup,
-      turnId: getMessageTurnId(firstMessage) || getMessageTurnId(lastMessage),
+      turn_id: getMessageTurnId(firstMessage) || getMessageTurnId(lastMessage),
       type: "activity-group",
     });
     activityGroup = [];
@@ -4599,7 +4635,7 @@ function buildTranscriptItems(messages) {
 
   const ensureAssistantBlock = (message, fallbackIndex) => {
     const turnId = getMessageTurnId(message);
-    if (assistantBlock?.turnId && turnId && assistantBlock.turnId !== turnId) {
+    if (assistantBlock?.turn_id && turnId && assistantBlock.turn_id !== turnId) {
       flushAssistantBlock();
     }
 
@@ -4607,11 +4643,11 @@ function buildTranscriptItems(messages) {
       assistantBlock = {
         id: `assistant-block-${message?.id || fallbackIndex || items.length}`,
         items: [],
-        turnId,
+        turn_id: turnId,
         type: "assistant-block",
       };
-    } else if (!assistantBlock.turnId && turnId) {
-      assistantBlock.turnId = turnId;
+    } else if (!assistantBlock.turn_id && turnId) {
+      assistantBlock.turn_id = turnId;
     }
 
     return assistantBlock;
@@ -4642,7 +4678,7 @@ function buildTranscriptItems(messages) {
       block.items.push({
         id: message?.id || `message-${index}`,
         message,
-        turnId: getMessageTurnId(message),
+        turn_id: getMessageTurnId(message),
         type: "message",
       });
       return;
@@ -4679,14 +4715,12 @@ function getRecoverableThreadMessageStatus(message, thread) {
   }
   const statusCandidates = [
     message.status,
-    message.turnStatus,
     message.turn_status,
-    message.lifecycleStatus,
     message.lifecycle_status,
   ];
   const messageTurnId = getMessageTurnId(message);
-  if (messageTurnId && messageTurnId === String(thread?.latestTurn?.turnId || "")) {
-    statusCandidates.push(thread?.latestTurn?.state, thread?.status);
+  if (messageTurnId && messageTurnId === String(thread?.latest_turn?.turn_id || "")) {
+    statusCandidates.push(thread?.latest_turn?.state, thread?.status);
   }
   const status = statusCandidates
     .map(normalizeThreadMessageStatus)
@@ -4784,17 +4818,7 @@ function cleanArtifactText(value) {
 
 function getArtifactReference(artifact) {
   return cleanArtifactText(
-    artifact?.url
-      || artifact?.uri
-      || artifact?.fileUrl
-      || artifact?.file_url
-      || artifact?.imageUrl
-      || artifact?.image_url
-      || artifact?.path
-      || artifact?.filePath
-      || artifact?.file_path
-      || artifact?.localPath
-      || artifact?.local_path,
+    artifact?.url || artifact?.uri || artifact?.file_url || artifact?.image_url || artifact?.path || artifact?.file_path || artifact?.local_path,
   );
 }
 
@@ -4811,13 +4835,13 @@ function normalizeRenderableArtifacts(artifacts) {
       }
       const normalized = {
         kind: cleanArtifactText(artifact.kind || artifact.type).toLowerCase(),
-        mimeType: cleanArtifactText(artifact.mimeType || artifact.mime_type || artifact.contentType || artifact.content_type),
-        name: cleanArtifactText(artifact.name || artifact.filename || artifact.fileName || artifact.file_name),
-        path: cleanArtifactText(artifact.path || artifact.filePath || artifact.file_path || artifact.localPath || artifact.local_path),
+        mime_type: cleanArtifactText(artifact.mime_type || artifact.content_type),
+        name: cleanArtifactText(artifact.name || artifact.filename || artifact.file_name),
+        path: cleanArtifactText(artifact.path || artifact.file_path || artifact.local_path),
         prompt: cleanArtifactText(artifact.prompt),
         reference,
         title: cleanArtifactText(artifact.title || artifact.label),
-        url: cleanArtifactText(artifact.url || artifact.uri || artifact.fileUrl || artifact.file_url || artifact.imageUrl || artifact.image_url),
+        url: cleanArtifactText(artifact.url || artifact.uri || artifact.file_url || artifact.image_url),
       };
       const key = normalized.url || normalized.path || normalized.reference;
       if (seen.has(key)) {
@@ -4836,7 +4860,7 @@ function artifactExtension(reference) {
 }
 
 function isRenderableImageArtifact(artifact) {
-  const mimeType = cleanArtifactText(artifact?.mimeType || artifact?.mime_type).toLowerCase();
+  const mimeType = cleanArtifactText(artifact?.mime_type).toLowerCase();
   if (mimeType.startsWith("image/")) {
     return true;
   }
@@ -4872,7 +4896,7 @@ function artifactDisplaySrc(artifact) {
     const path = fileUrlToPath(reference);
     return path ? convertFileSrc(path) : reference;
   }
-  const path = cleanArtifactText(artifact?.path || artifact?.filePath || artifact?.file_path || reference);
+  const path = cleanArtifactText(artifact?.path || artifact?.file_path || reference);
   if (path.startsWith("/") || path.startsWith("~/")) {
     return convertFileSrc(path);
   }
@@ -4887,7 +4911,7 @@ function artifactOpenTarget(artifact) {
   if (/^(https?:|file:|data:|blob:)/i.test(reference)) {
     return reference;
   }
-  const path = cleanArtifactText(artifact?.path || artifact?.filePath || artifact?.file_path || reference);
+  const path = cleanArtifactText(artifact?.path || artifact?.file_path || reference);
   if (path.startsWith("/") || path.startsWith("~/")) {
     return `file://${path}`;
   }
@@ -4908,7 +4932,7 @@ function artifactDisplayTitle(artifact, index) {
 }
 
 function artifactDisplaySubtitle(artifact) {
-  return cleanArtifactText(artifact?.prompt || artifact?.mimeType || artifact?.mime_type)
+  return cleanArtifactText(artifact?.prompt || artifact?.mime_type)
     || getArtifactReference(artifact);
 }
 
@@ -5211,7 +5235,7 @@ function activityMessageIsError(message) {
     || status.includes("failed")
     || title.includes("error")
     || title.includes("failed")
-    || activityValueHasContent(message?.toolError || message?.tool_error);
+    || activityValueHasContent(message?.tool_error);
 }
 
 function getActivityDetailSections(messages) {
@@ -5221,22 +5245,22 @@ function getActivityDetailSections(messages) {
     if (message.command) {
       addActivitySection(sections, "Command", `$ ${message.command}`);
     }
-    if (message.filePath || message.file_path) {
-      addActivitySection(sections, "File", message.filePath || message.file_path);
+    if (message.file_path) {
+      addActivitySection(sections, "File", message.file_path);
     }
-    if (activityValueHasContent(message.toolInput || message.tool_input)) {
-      addActivitySection(sections, "Arguments", message.toolInput || message.tool_input);
+    if (activityValueHasContent(message.tool_input)) {
+      addActivitySection(sections, "Arguments", message.tool_input);
     }
-    if (activityValueHasContent(message.toolOutput || message.tool_output)) {
-      addActivitySection(sections, "Output", message.toolOutput || message.tool_output);
+    if (activityValueHasContent(message.tool_output)) {
+      addActivitySection(sections, "Output", message.tool_output);
     }
-    if (activityValueHasContent(message.toolError || message.tool_error)) {
-      addActivitySection(sections, "Error", message.toolError || message.tool_error);
+    if (activityValueHasContent(message.tool_error)) {
+      addActivitySection(sections, "Error", message.tool_error);
     }
     const body = String(message.text || "").trim();
     if (body) {
       if (kind === "tool_call") {
-        addActivitySection(sections, activityValueHasContent(message.toolInput || message.tool_input) ? "Details" : "Arguments", body);
+        addActivitySection(sections, activityValueHasContent(message.tool_input) ? "Details" : "Arguments", body);
       } else if (kind === "tool_output" || kind === "image_generation") {
         addActivitySection(sections, activityMessageIsError(message) ? "Error" : "Output", body);
       } else {
@@ -5244,11 +5268,11 @@ function getActivityDetailSections(messages) {
       }
     }
     const metaParts = [];
-    if (Number.isFinite(Number(message.durationMs || message.duration_ms))) {
-      metaParts.push(`${Number(message.durationMs || message.duration_ms)} ms`);
+    if (Number.isFinite(Number(message.duration_ms))) {
+      metaParts.push(`${Number(message.duration_ms)} ms`);
     }
-    if (Number.isFinite(Number(message.exitCode ?? message.exit_code))) {
-      metaParts.push(`exit ${Number(message.exitCode ?? message.exit_code)}`);
+    if (Number.isFinite(Number(message.exit_code))) {
+      metaParts.push(`exit ${Number(message.exit_code)}`);
     }
     if (metaParts.length) {
       addActivitySection(sections, "Result", metaParts.join(" | "));
@@ -5387,7 +5411,7 @@ function groupActivityMessagesForDisplay(messages) {
   const pendingByCallId = new Map();
   (Array.isArray(messages) ? messages : []).forEach((activityMessage) => {
     const kind = String(activityMessage?.kind || "").toLowerCase();
-    const callId = String(activityMessage?.callId || activityMessage?.call_id || "").trim();
+    const callId = String(activityMessage?.call_id || "").trim();
     if (kind === "tool_call") {
       const row = {
         id: activityMessage?.id || `tool-call-${rows.length}`,
@@ -5491,7 +5515,7 @@ function ThreadMessage({
   copyAlwaysVisible = false,
   isCopied = false,
   message,
-  messageId,
+  message_id: messageId,
   onEditMessage,
   onCopyMessage,
   onRedoMessage,
@@ -5604,8 +5628,8 @@ function ThreadDiffCounts({ additions, deletions }) {
 }
 
 function LiveDiffActivity({ summary }) {
-  const latestFile = summary?.latestFile || summary?.files?.[0] || null;
-  if (!summary?.fileCount || !latestFile) {
+  const latestFile = summary?.latest_file || summary?.files?.[0] || null;
+  if (!summary?.file_count || !latestFile) {
     return null;
   }
 
@@ -5627,14 +5651,14 @@ function LiveDiffActivity({ summary }) {
 }
 
 function ThreadDiffBanner({ onReview, summary }) {
-  if (!summary?.fileCount) {
+  if (!summary?.file_count) {
     return null;
   }
 
   return (
     <ThreadDiffLiveBanner aria-label="Current file changes">
       <ThreadDiffBannerTitle title={summary.partial ? "Some binary or large files could not be line-counted." : undefined}>
-        <span>{formatThreadDiffFileCount(summary.fileCount)}</span>
+        <span>{formatThreadDiffFileCount(summary.file_count)}</span>
         <DiffCount data-tone="add">{formatThreadDiffCount(summary.additions, "+")}</DiffCount>
         <DiffCount data-tone="delete">{formatThreadDiffCount(summary.deletions, "-")}</DiffCount>
       </ThreadDiffBannerTitle>
@@ -5658,16 +5682,16 @@ function ThreadDiffSummaryCard({
   summary,
   undoing = false,
 }) {
-  if (!summary?.fileCount) {
+  if (!summary?.file_count) {
     return null;
   }
-  const undone = summary.undoStatus === "undone";
+  const undone = summary.undo_status === "undone";
 
   return (
     <ThreadDiffCard aria-label="Changed files summary">
       <ThreadDiffCardHeader>
         <ThreadDiffCardTitle title={summary.partial ? "Some binary or large files could not be line-counted." : undefined}>
-          <span>{formatThreadDiffFileCount(summary.fileCount)}</span>
+          <span>{formatThreadDiffFileCount(summary.file_count)}</span>
           <DiffCount data-tone="add">{formatThreadDiffCount(summary.additions, "+")}</DiffCount>
           <DiffCount data-tone="delete">{formatThreadDiffCount(summary.deletions, "-")}</DiffCount>
         </ThreadDiffCardTitle>
@@ -5736,7 +5760,7 @@ function AssistantResponseBlock({
 
   return (
     <AssistantBlock
-      data-has-diff-summary={diffSummary?.fileCount ? "true" : "false"}
+      data-has-diff-summary={diffSummary?.file_count ? "true" : "false"}
       data-message-role="assistant"
     >
       {item?.items?.map((blockItem) => (
@@ -5749,7 +5773,7 @@ function AssistantResponseBlock({
           <ThreadMessage
             key={blockItem.id}
             message={blockItem.message}
-            messageId={blockItem.id}
+            message_id={blockItem.id}
             showCopy={false}
             workspace={workspace}
           />
@@ -5784,7 +5808,7 @@ function AssistantResponseBlock({
 }
 
 function WorkspaceThreadDetail({
-  agentStatuses,
+  agent_statuses: agentStatuses,
   composerAttachments,
   composerDrafts,
   composerFocusToken = 0,
@@ -5801,7 +5825,7 @@ function WorkspaceThreadDetail({
   todoDropUnsupportedMessage = "",
   visible = true,
   workspace,
-  workspaceRoot = "",
+  workspace_root: workspaceRoot = "",
   workspaceThreadEntry,
 }) {
   const [draft, setDraft] = useState("");
@@ -5854,7 +5878,7 @@ function WorkspaceThreadDetail({
   const latestAssistantBlockId = latestAssistantBlock?.id || "";
   const latestAssistantBlockTurnId = getAssistantBlockDiffTurnId(latestAssistantBlock);
   const latestMessage = messages[messages.length - 1] || null;
-  const activeAgentId = normalizeAgentId(thread?.currentAgent || "codex");
+  const activeAgentId = normalizeAgentId(thread?.current_agent || "codex");
   const activeAgentStatus = useMemo(
     () => findAgentStatus(agentStatuses, activeAgentId),
     [activeAgentId, agentStatuses],
@@ -5868,8 +5892,8 @@ function WorkspaceThreadDetail({
   const transcriptHydrating = Boolean(
     !transcriptItems.length
       && !thread?.transcriptHydratedAt
-      && thread?.transcriptStatus !== "ready"
-      && (thread?.transcriptSessionId || activeProviderBinding?.nativeSessionId),
+      && thread?.transcript_status !== "ready"
+      && (thread?.transcript_session_id || activeProviderBinding?.native_session_id),
   );
   const activeLiveTerminal = getLiveTerminalForThread(
     thread,
@@ -5880,7 +5904,7 @@ function WorkspaceThreadDetail({
   const threadGroundTruth = useMemo(() => getThreadTerminalGroundTruth({
     liveTerminal: effectiveLiveTerminal,
     providerBinding: activeProviderBinding,
-    targetRole: activeAgentId,
+    target_role: activeAgentId,
     thread,
   }), [activeAgentId, effectiveLiveTerminal, activeProviderBinding, thread]);
   const activityItems = useMemo(
@@ -5892,9 +5916,8 @@ function WorkspaceThreadDetail({
   const transcriptWorkingStartedAtMs = transcriptBusy
     ? desktopTimestampMs(
       threadGroundTruth?.turnStartedAt,
-      thread?.latestTurn?.startedAt,
-      thread?.latestTurn?.requestedAt,
-      latestMessage?.createdAt,
+      thread?.latest_turn?.started_at,
+      thread?.latest_turn?.requested_at,
       latestMessage?.created_at,
     )
     : 0;
@@ -5902,8 +5925,8 @@ function WorkspaceThreadDetail({
   const diffWorktreePath = getThreadDiffWorktreePath(thread, activeProviderBinding, effectiveLiveTerminal);
   const diffRepoPath = String(
     workspaceRoot
-      || workspace?.rootDirectory
-      || workspace?.workingDirectory
+      || workspace?.root_directory
+      || workspace?.working_directory
       || "",
   ).trim();
   const diffTurnId = getThreadDiffTurnId(
@@ -5912,7 +5935,7 @@ function WorkspaceThreadDetail({
     latestAssistantBlockTurnId || latestAssistantBlockId,
   );
   const diffStorageKey = getThreadDiffStorageKey(
-    workspace?.id || thread?.workspaceId || "",
+    workspace?.id || thread?.workspace_id || "",
     thread?.id || "",
     diffTurnId,
   );
@@ -5920,7 +5943,7 @@ function WorkspaceThreadDetail({
   const diffTurnTerminal = threadDiffTurnIsTerminal(thread, threadGroundTruth, Boolean(latestAssistantBlockId));
   const currentTurnFinalDiffSummary = diffTurnId ? diffSummariesByTurnId[diffTurnId] || null : null;
   const visibleFinalDiffSummary = diffTurnTerminal ? currentTurnFinalDiffSummary : null;
-  const visibleLiveDiffSummary = liveDiffSummary?.fileCount && !visibleFinalDiffSummary?.fileCount
+  const visibleLiveDiffSummary = liveDiffSummary?.file_count && !visibleFinalDiffSummary?.file_count
     ? liveDiffSummary
     : null;
   const transcriptDiffSummaries = useMemo(() => {
@@ -5930,11 +5953,7 @@ function WorkspaceThreadDetail({
       if (!normalized) {
         return;
       }
-      const key = normalized.summaryKey
-        || normalized.summary_key
-        || normalized.turnId
-        || normalized.turn_id
-        || `summary-${byKey.size}`;
+      const key = normalized.summary_key || normalized.turn_id || `summary-${byKey.size}`;
       byKey.set(key, normalized);
     };
     Object.entries(diffSummariesByTurnId || {}).forEach(([turnId, summary]) => {
@@ -5977,11 +5996,11 @@ function WorkspaceThreadDetail({
     if (!visible) {
       return false;
     }
-    if (visibleLiveDiffSummary?.fileCount || visibleFinalDiffSummary?.fileCount) {
+    if (visibleLiveDiffSummary?.file_count || visibleFinalDiffSummary?.file_count) {
       return true;
     }
     return assistantBlockDiffTurnIds.some((turnId) => (
-      diffSummariesByTurnId[turnId]?.fileCount
+      diffSummariesByTurnId[turnId]?.file_count
       && diffSummaryExpandedByTurnId[turnId] !== false
     ));
   }, [
@@ -6033,7 +6052,7 @@ function WorkspaceThreadDetail({
   ]);
 
   useEffect(() => {
-    const workspaceId = workspace?.id || thread?.workspaceId || "";
+    const workspaceId = workspace?.id || thread?.workspace_id || "";
     const threadId = thread?.id || "";
     if (!workspaceId || !threadId) {
       setDiffSummariesByTurnId((current) => (
@@ -6046,10 +6065,10 @@ function WorkspaceThreadDetail({
     assistantBlockDiffTurnIds.forEach((turnId) => {
       const storageKey = getThreadDiffStorageKey(workspaceId, threadId, turnId);
       const storedSummary = readStoredThreadDiffSummary(storageKey);
-      if (storedSummary?.fileCount) {
+      if (storedSummary?.file_count) {
         nextSummaries[turnId] = {
           ...storedSummary,
-          turnId: storedSummary.turnId || turnId,
+          turn_id: storedSummary.turn_id || turnId,
         };
       }
     });
@@ -6060,7 +6079,7 @@ function WorkspaceThreadDetail({
   }, [
     assistantBlockDiffTurnKey,
     thread?.id,
-    thread?.workspaceId,
+    thread?.workspace_id,
     workspace?.id,
   ]);
 
@@ -6090,18 +6109,18 @@ function WorkspaceThreadDetail({
     const fetchSummary = async () => {
       try {
         const result = await invoke("coordination_worktree_diff_summary", {
-          dbPath: null,
+          db_path: null,
           input: {
-            threadId: thread?.id || "",
-            turnId: diffTurnId,
-            worktreePath: diffWorktreePath,
-            workspaceId: workspace?.id || thread?.workspaceId || "",
+            thread_id: thread?.id || "",
+            turn_id: diffTurnId,
+            worktree_path: diffWorktreePath,
+            workspace_id: workspace?.id || thread?.workspace_id || "",
           },
-          repoPath: diffRepoPath || null,
+          repo_path: diffRepoPath || null,
         });
         const summary = normalizeThreadDiffSummary(result);
         if (!cancelled) {
-          setLiveDiffSummary(summary?.fileCount ? summary : null);
+          setLiveDiffSummary(summary?.file_count ? summary : null);
         }
       } catch (summaryError) {
         if (!cancelled) {
@@ -6171,18 +6190,18 @@ function WorkspaceThreadDetail({
     diffTurnLive,
     diffWorktreePath,
     thread?.id,
-    thread?.workspaceId,
+    thread?.workspace_id,
     workspace?.id,
   ]);
 
   useEffect(() => {
-    if (!diffStorageKey || !diffTurnTerminal || !liveDiffSummary?.fileCount) {
+    if (!diffStorageKey || !diffTurnTerminal || !liveDiffSummary?.file_count) {
       return;
     }
     const nextSummary = {
       ...liveDiffSummary,
-      capturedAt: liveDiffSummary.capturedAt || new Date().toISOString(),
-      turnId: diffTurnId,
+      captured_at: liveDiffSummary.captured_at || new Date().toISOString(),
+      turn_id: diffTurnId,
     };
     setDiffSummariesByTurnId((currentSummaries) => {
       writeStoredThreadDiffSummary(diffStorageKey, nextSummary);
@@ -6196,9 +6215,9 @@ function WorkspaceThreadDetail({
   ]);
 
   const activeProviderModelId = String(
-    activeProviderBinding?.modelId
+    activeProviderBinding?.model_id
       || activeProviderBinding?.model
-      || activeProviderBinding?.activeModel
+      || activeProviderBinding?.active_model
       || activeProviderBinding?.nativeModel
       || activeProviderBinding?.selectedModel
       || activeProviderBinding?.configuredModel
@@ -6206,22 +6225,22 @@ function WorkspaceThreadDetail({
   ).trim();
   const currentTuiModel = activeProviderModelId || getStatusModel(activeAgentStatus);
   const modelOptions = useMemo(
-    () => getModelOptions(activeAgentId, activeAgentStatus, { modelId: activeProviderModelId }),
+    () => getModelOptions(activeAgentId, activeAgentStatus, { model_id: activeProviderModelId }),
     [activeAgentId, activeAgentStatus, activeProviderModelId],
   );
   const activeTerminalBinding = effectiveLiveTerminal
     ? {
-      instanceId: effectiveLiveTerminal.instanceId,
-      paneId: effectiveLiveTerminal.paneId,
-      terminalIndex: effectiveLiveTerminal.terminalIndex,
+      instance_id: effectiveLiveTerminal.instance_id,
+      pane_id: effectiveLiveTerminal.pane_id,
+      terminal_index: effectiveLiveTerminal.terminal_index,
     }
     : null;
-  const hasActiveTerminalBinding = Boolean(activeTerminalBinding?.paneId && activeTerminalBinding?.instanceId);
+  const hasActiveTerminalBinding = Boolean(activeTerminalBinding?.pane_id && activeTerminalBinding?.instance_id);
   const hasProviderSession = getWorkspaceThreadHasSession(thread);
   const composerSyncKey = getThreadComposerSyncKey(
     {
       id: thread?.id || "",
-      workspaceId: thread?.workspaceId || workspace?.id || "",
+      workspace_id: thread?.workspace_id || workspace?.id || "",
     },
     activeTerminalBinding,
   );
@@ -6291,10 +6310,10 @@ function WorkspaceThreadDetail({
   const headerAgentLabel = getWorkspaceThreadAgentLabel(activeAgentId);
   const headerTurnState = String(
     threadGroundTruth?.effectiveLatestTurnState
-      || thread?.latestTurn?.state
+      || thread?.latest_turn?.state
       || "",
   ).toLowerCase();
-  const headerTerminalWorkState = String(threadGroundTruth?.terminalWorkState || "").toLowerCase();
+  const headerTerminalWorkState = String(threadGroundTruth?.terminal_work_state || "").toLowerCase();
   const headerWorking = Boolean(latestActivity?.live)
     || headerTerminalWorkState === "running"
     || headerTerminalWorkState === "prompting_user";
@@ -6314,9 +6333,9 @@ function WorkspaceThreadDetail({
         : "No session";
   const headerModelLabel = String(currentTuiModel || "").trim();
   const headerDiffSummary = visibleFinalDiffSummary || visibleLiveDiffSummary;
-  const headerDiffFileCount = Number(headerDiffSummary?.fileCount || 0);
+  const headerDiffFileCount = Number(headerDiffSummary?.file_count || 0);
   const copyWorkspacePath = async () => {
-    const path = diffRepoPath || workspace?.rootDirectory || "";
+    const path = diffRepoPath || workspace?.root_directory || "";
     if (!path) {
       return;
     }
@@ -6336,23 +6355,23 @@ function WorkspaceThreadDetail({
   };
 
   useEffect(() => {
-    const workspaceId = workspace?.id || thread?.workspaceId || "";
+    const workspaceId = workspace?.id || thread?.workspace_id || "";
     const threadId = thread?.id || "";
     if (!detailVisible || newChatActive || !workspaceId || !threadId) {
       return undefined;
     }
 
     const visibilityDetail = {
-      agentId: activeAgentId,
+      agent_id: activeAgentId,
       density,
-      instanceId: activeTerminalBinding?.instanceId || "",
-      paneId: activeTerminalBinding?.paneId || "",
+      instance_id: activeTerminalBinding?.instance_id || "",
+      pane_id: activeTerminalBinding?.pane_id || "",
       surface: density === "compact" ? "terminal-inline-ui" : "threads-overlay",
-      terminalIndex: activeTerminalBinding?.terminalIndex ?? null,
-      threadId,
+      terminal_index: activeTerminalBinding?.terminal_index ?? null,
+      thread_id: threadId,
       token: visibilityTokenRef.current,
       visible: true,
-      workspaceId,
+      workspace_id: workspaceId,
     };
     setWorkspaceThreadDetailVisibility(visibilityDetail);
     return () => {
@@ -6363,14 +6382,14 @@ function WorkspaceThreadDetail({
     };
   }, [
     activeAgentId,
-    activeTerminalBinding?.instanceId,
-    activeTerminalBinding?.paneId,
-    activeTerminalBinding?.terminalIndex,
+    activeTerminalBinding?.instance_id,
+    activeTerminalBinding?.pane_id,
+    activeTerminalBinding?.terminal_index,
     density,
     detailVisible,
     newChatActive,
     thread?.id,
-    thread?.workspaceId,
+    thread?.workspace_id,
     workspace?.id,
   ]);
 
@@ -6418,48 +6437,48 @@ function WorkspaceThreadDetail({
     }
     openWorkspaceFile(workspace, targetPath, {
       reviewMode: "worktree_diff",
-      worktreePath: summary?.worktreePath || diffWorktreePath || "",
+      worktree_path: summary?.worktree_path || diffWorktreePath || "",
     });
   };
 
   const undoDiffSummary = async (summary) => {
-    if (!summary?.summaryKey || !summary?.worktreePath) {
+    if (!summary?.summary_key || !summary?.worktree_path) {
       return;
     }
-    const summaryTurnId = String(summary.turnId || diffTurnId || "").trim();
+    const summaryTurnId = String(summary.turn_id || diffTurnId || "").trim();
     const summaryStorageKey = getThreadDiffStorageKey(
-      workspace?.id || thread?.workspaceId || "",
+      workspace?.id || thread?.workspace_id || "",
       thread?.id || "",
       summaryTurnId,
     );
     if (
       typeof window !== "undefined"
-      && !window.confirm(`Undo ${formatThreadDiffFileCount(summary.fileCount)} from this thread?`)
+      && !window.confirm(`Undo ${formatThreadDiffFileCount(summary.file_count)} from this thread?`)
     ) {
       return;
     }
 
-    setUndoingDiffKey(summary.summaryKey);
+    setUndoingDiffKey(summary.summary_key);
     setError("");
     try {
       const result = await invoke("coordination_undo_worktree_diff_summary", {
-        dbPath: null,
+        db_path: null,
         input: {
-          baseSha: summary.baseSha,
-          expectedSummaryKey: summary.summaryKey,
-          threadId: thread?.id || "",
-          turnId: summaryTurnId,
-          worktreePath: summary.worktreePath,
-          workspaceId: workspace?.id || thread?.workspaceId || "",
+          base_sha: summary.base_sha,
+          expected_summary_key: summary.summary_key,
+          thread_id: thread?.id || "",
+          turn_id: summaryTurnId,
+          worktree_path: summary.worktree_path,
+          workspace_id: workspace?.id || thread?.workspace_id || "",
         },
-        repoPath: diffRepoPath || null,
+        repo_path: diffRepoPath || null,
       });
       unwrapThreadDiffApiResult(result);
       const undoneSummary = {
         ...summary,
-        turnId: summaryTurnId || summary.turnId || "",
-        undoStatus: "undone",
-        undoneAt: new Date().toISOString(),
+        turn_id: summaryTurnId || summary.turn_id || "",
+        undo_status: "undone",
+        undone_at: new Date().toISOString(),
       };
       setDiffSummariesByTurnId((currentSummaries) => (
         setThreadDiffSummaryInMap(currentSummaries, summaryTurnId, undoneSummary)
@@ -6477,16 +6496,16 @@ function WorkspaceThreadDetail({
 
   useEffect(() => {
     logBigViewSyncDiagnosticEvent("bigview.draft.local_sync_effect", {
-      agentId: activeAgentId,
+      agent_id: activeAgentId,
       composerSyncKey,
       currentDraftLength: draft.length,
       hasActiveTerminalBinding,
       hasProviderSession,
       selectedModel: currentTuiModel || "",
       syncedComposerDraftLength: syncedComposerDraft.length,
-      threadId: thread?.id || "",
+      thread_id: thread?.id || "",
       willChangeDraft: draft !== syncedComposerDraft,
-      workspaceId: workspace?.id || thread?.workspaceId || "",
+      workspace_id: workspace?.id || thread?.workspace_id || "",
     });
     setDraft(syncedComposerDraft);
   }, [composerSyncKey, syncedComposerDraft]);
@@ -6534,30 +6553,30 @@ function WorkspaceThreadDetail({
   useEffect(() => {
     logBigViewSyncDiagnosticEvent("bigview.model_state.thread_detail", {
       activeProviderModelId,
-      agentId: activeAgentId,
-      bindingInstanceId: activeTerminalBinding?.instanceId || "",
-      bindingPaneId: activeTerminalBinding?.paneId || "",
+      agent_id: activeAgentId,
+      bindingInstanceId: activeTerminalBinding?.instance_id || "",
+      bindingPaneId: activeTerminalBinding?.pane_id || "",
       currentTuiModel: currentTuiModel || "",
       hasActiveTerminalBinding,
       hasProviderSession,
-      providerSessionPresent: Boolean(activeProviderBinding?.nativeSessionId),
+      providerSessionPresent: Boolean(activeProviderBinding?.native_session_id),
       selectedModelState: selectedModel || "",
       surface: "thread_detail",
-      threadId: thread?.id || "",
-      workspaceId: workspace?.id || thread?.workspaceId || "",
+      thread_id: thread?.id || "",
+      workspace_id: workspace?.id || thread?.workspace_id || "",
     });
   }, [
     activeAgentId,
-    activeProviderBinding?.nativeSessionId,
+    activeProviderBinding?.native_session_id,
     activeProviderModelId,
-    activeTerminalBinding?.instanceId,
-    activeTerminalBinding?.paneId,
+    activeTerminalBinding?.instance_id,
+    activeTerminalBinding?.pane_id,
     currentTuiModel,
     hasActiveTerminalBinding,
     hasProviderSession,
     selectedModel,
     thread?.id,
-    thread?.workspaceId,
+    thread?.workspace_id,
     workspace?.id,
   ]);
 
@@ -6566,48 +6585,48 @@ function WorkspaceThreadDetail({
       ...describeImageSupportDiagnostics({
         activeAgentId,
         activeAgentStatus,
-        imageInputSupport,
+        image_input_support: imageInputSupport,
         modelOptions,
         selectedModel: currentTuiModel || "",
         selectedModelOption,
       }),
-      bindingInstanceId: activeTerminalBinding?.instanceId || "",
-      bindingPaneId: activeTerminalBinding?.paneId || "",
+      bindingInstanceId: activeTerminalBinding?.instance_id || "",
+      bindingPaneId: activeTerminalBinding?.pane_id || "",
       composerSyncKey,
       environment: describeImageDropEnvironment(),
       hasActiveTerminalBinding,
       hasProviderSession,
       surface: "thread_detail",
-      threadId: thread?.id || "",
-      workspaceId: workspace?.id || thread?.workspaceId || "",
+      thread_id: thread?.id || "",
+      workspace_id: workspace?.id || thread?.workspace_id || "",
     });
   }, [
     activeAgentId,
     activeAgentStatus,
-    activeTerminalBinding?.instanceId,
-    activeTerminalBinding?.paneId,
+    activeTerminalBinding?.instance_id,
+    activeTerminalBinding?.pane_id,
     composerSyncKey,
     currentTuiModel,
     hasActiveTerminalBinding,
     hasProviderSession,
-    imageInputSupport.activeModel,
+    imageInputSupport.active_model,
     imageInputSupport.reason,
     imageInputSupport.state,
     imageInputSupport.supported,
     modelOptions,
     selectedModelOption,
     thread?.id,
-    thread?.workspaceId,
+    thread?.workspace_id,
     workspace?.id,
   ]);
 
   useEffect(() => {
     logBigViewSyncDiagnosticEvent("bigview.image.attachment_state", {
-      agentId: activeAgentId,
+      agent_id: activeAgentId,
       attachmentCount: attachments.length,
       attachments: getAttachmentLogSummary(attachments),
-      bindingInstanceId: activeTerminalBinding?.instanceId || "",
-      bindingPaneId: activeTerminalBinding?.paneId || "",
+      bindingInstanceId: activeTerminalBinding?.instance_id || "",
+      bindingPaneId: activeTerminalBinding?.pane_id || "",
       composerSyncKey,
       hasActiveTerminalBinding,
       hasProviderSession,
@@ -6616,13 +6635,13 @@ function WorkspaceThreadDetail({
       imageSupported: Boolean(imageInputSupport.supported),
       selectedModel: currentTuiModel || "",
       surface: "thread_detail",
-      threadId: thread?.id || "",
-      workspaceId: workspace?.id || thread?.workspaceId || "",
+      thread_id: thread?.id || "",
+      workspace_id: workspace?.id || thread?.workspace_id || "",
     });
   }, [
     activeAgentId,
-    activeTerminalBinding?.instanceId,
-    activeTerminalBinding?.paneId,
+    activeTerminalBinding?.instance_id,
+    activeTerminalBinding?.pane_id,
     attachments,
     composerSyncKey,
     currentTuiModel,
@@ -6632,7 +6651,7 @@ function WorkspaceThreadDetail({
     imageInputSupport.state,
     imageInputSupport.supported,
     thread?.id,
-    thread?.workspaceId,
+    thread?.workspace_id,
     workspace?.id,
   ]);
 
@@ -6655,10 +6674,10 @@ function WorkspaceThreadDetail({
     latestMessage?.status,
     latestMessage?.text,
     messages.length,
-    thread?.activityStatus,
+    thread?.activity_status,
     thread?.id,
-    thread?.latestTurn?.state,
-    thread?.latestTurn?.turnId,
+    thread?.latest_turn?.state,
+    thread?.latest_turn?.turn_id,
     thread?.status,
     visible,
   ]);
@@ -6670,10 +6689,10 @@ function WorkspaceThreadDetail({
     }
 
     logBigViewSyncDiagnosticEvent("bigview.image.add_start", {
-      agentId: activeAgentId,
+      agent_id: activeAgentId,
       attachmentCountBefore: attachments.length,
       canSubmit,
-      fileCount: files.length,
+      file_count: files.length,
       files: files.map(describeImageDropFile),
       hasActiveTerminalBinding,
       hasProviderSession,
@@ -6682,8 +6701,8 @@ function WorkspaceThreadDetail({
       imageSupported: Boolean(imageInputSupport.supported),
       model: currentTuiModel || "",
       surface: "thread_detail",
-      threadId: thread?.id || "",
-      workspaceId: workspace?.id || thread?.workspaceId || "",
+      thread_id: thread?.id || "",
+      workspace_id: workspace?.id || thread?.workspace_id || "",
     });
     setError("");
     try {
@@ -6694,19 +6713,19 @@ function WorkspaceThreadDetail({
         status: "queued",
       })), {
         fields: {
-          agentId: activeAgentId,
-          bindingInstanceId: activeTerminalBinding?.instanceId || "",
-          bindingPaneId: activeTerminalBinding?.paneId || "",
+          agent_id: activeAgentId,
+          bindingInstanceId: activeTerminalBinding?.instance_id || "",
+          bindingPaneId: activeTerminalBinding?.pane_id || "",
           model: currentTuiModel || "",
           surface: "thread_detail",
-          threadId: thread?.id || "",
-          workspaceId: workspace?.id || thread?.workspaceId || "",
+          thread_id: thread?.id || "",
+          workspace_id: workspace?.id || thread?.workspace_id || "",
         },
         maxCount: IMAGE_ATTACHMENT_LIMIT,
         source: "bigview_thread_detail",
       });
       logBigViewSyncDiagnosticEvent("bigview.image.add_done", {
-        agentId: activeAgentId,
+        agent_id: activeAgentId,
         attachmentCountAfter: Math.min(IMAGE_ATTACHMENT_LIMIT, attachments.length + nextAttachments.length),
         attachments: getAttachmentLogSummary(nextAttachments),
         hasActiveTerminalBinding,
@@ -6716,19 +6735,19 @@ function WorkspaceThreadDetail({
         syncedToSharedAttachments: true,
         syncKey: composerSyncKey,
         surface: "thread_detail",
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        thread_id: thread?.id || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       });
     } catch (readError) {
       setError(readError?.message || "Unable to attach image.");
       logBigViewSyncDiagnosticEvent("bigview.image.add_error", {
-        agentId: activeAgentId,
-        fileCount: files.length,
+        agent_id: activeAgentId,
+        file_count: files.length,
         message: readError?.message || String(readError || ""),
         model: currentTuiModel || "",
         surface: "thread_detail",
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        thread_id: thread?.id || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       });
     }
   };
@@ -6737,15 +6756,15 @@ function WorkspaceThreadDetail({
     const imageFiles = getClipboardImageFiles(event.clipboardData);
     const clipboardText = String(event.clipboardData?.getData?.("text/plain") || "");
     logBigViewSyncDiagnosticEvent("bigview.text.paste_observed", {
-      agentId: activeAgentId,
+      agent_id: activeAgentId,
       clipboardTypes: Array.from(event.clipboardData?.types || []),
       composerSyncKey,
       hasImageFiles: imageFiles.length > 0,
       model: currentTuiModel || "",
       surface: "thread_detail",
       text: getBigViewTextDiagnosticFields(clipboardText),
-      threadId: thread?.id || "",
-      workspaceId: workspace?.id || thread?.workspaceId || "",
+      thread_id: thread?.id || "",
+      workspace_id: workspace?.id || thread?.workspace_id || "",
     });
     if (!imageFiles.length) {
       return;
@@ -6753,14 +6772,14 @@ function WorkspaceThreadDetail({
 
     event.preventDefault();
     logBigViewSyncDiagnosticEvent("bigview.image.paste_start", {
-      agentId: activeAgentId,
+      agent_id: activeAgentId,
       attachmentCountBefore: attachments.length,
-      fileCount: imageFiles.length,
+      file_count: imageFiles.length,
       files: imageFiles.map(describeImageDropFile),
       model: currentTuiModel || "",
       surface: "thread_detail",
-      threadId: thread?.id || "",
-      workspaceId: workspace?.id || thread?.workspaceId || "",
+      thread_id: thread?.id || "",
+      workspace_id: workspace?.id || thread?.workspace_id || "",
     });
     addImageFiles(imageFiles);
   };
@@ -6769,7 +6788,7 @@ function WorkspaceThreadDetail({
     const pastedText = String(clipboardText || "");
     if (!pastedText || sending || !canSubmit) {
       logBigViewSyncDiagnosticEvent("bigview.text.paste_fallback_skip", {
-        agentId: activeAgentId,
+        agent_id: activeAgentId,
         canSubmit,
         composerSyncKey,
         disabled: Boolean(sending || !canSubmit),
@@ -6778,8 +6797,8 @@ function WorkspaceThreadDetail({
         source,
         surface: "thread_detail",
         text: getBigViewTextDiagnosticFields(pastedText),
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        thread_id: thread?.id || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       });
       return false;
     }
@@ -6798,7 +6817,7 @@ function WorkspaceThreadDetail({
       composerInputRef.current?.focus?.();
     }, 0);
     logBigViewSyncDiagnosticEvent("bigview.text.paste_fallback_insert", {
-      agentId: activeAgentId,
+      agent_id: activeAgentId,
       composerSyncKey,
       model: currentTuiModel || "",
       nextValueLength: nextDraft.length,
@@ -6806,8 +6825,8 @@ function WorkspaceThreadDetail({
       source,
       surface: "thread_detail",
       text: getBigViewTextDiagnosticFields(pastedText),
-      threadId: thread?.id || "",
-      workspaceId: workspace?.id || thread?.workspaceId || "",
+      thread_id: thread?.id || "",
+      workspace_id: workspace?.id || thread?.workspace_id || "",
     });
     return true;
   };
@@ -6865,22 +6884,22 @@ function WorkspaceThreadDetail({
         workspace,
       });
       logBigViewSyncDiagnosticEvent("bigview.thread_message.redo", {
-        agentId: activeAgentId,
-        messageId: String(message?.id || ""),
+        agent_id: activeAgentId,
+        message_id: String(message?.id || ""),
         messageLength: nextText.length,
         surface: "thread_detail",
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        thread_id: thread?.id || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       });
     } catch (redoError) {
       setError(redoError?.message || "Unable to resend message.");
       logBigViewSyncDiagnosticEvent("bigview.thread_message.redo_error", {
-        agentId: activeAgentId,
+        agent_id: activeAgentId,
         message: redoError?.message || String(redoError || ""),
-        messageId: String(message?.id || ""),
+        message_id: String(message?.id || ""),
         surface: "thread_detail",
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        thread_id: thread?.id || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       });
     } finally {
       setSending(false);
@@ -6926,7 +6945,7 @@ function WorkspaceThreadDetail({
       }
 
       logBigViewSyncDiagnosticEvent("bigview.text.window_paste_observed", {
-        agentId: activeAgentId,
+        agent_id: activeAgentId,
         activeInsideDetail,
         clipboardTypes: Array.from(event.clipboardData?.types || []),
         composerSyncKey,
@@ -6939,8 +6958,8 @@ function WorkspaceThreadDetail({
         targetIsEditable,
         targetIsInteractive,
         text: getBigViewTextDiagnosticFields(clipboardText),
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        thread_id: thread?.id || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       });
 
       if (
@@ -6997,7 +7016,7 @@ function WorkspaceThreadDetail({
       ...describeImageSupportDiagnostics({
         activeAgentId,
         activeAgentStatus,
-        imageInputSupport,
+        image_input_support: imageInputSupport,
         modelOptions,
         selectedModel: currentTuiModel || "",
         selectedModelOption,
@@ -7007,9 +7026,9 @@ function WorkspaceThreadDetail({
       hasActiveWorkspaceFile: Boolean(activeWorkspaceFile),
       hasImageTransfer,
       hasWorkspaceFileTransfer,
-      threadId: thread?.id || "",
+      thread_id: thread?.id || "",
       transfer: describeImageDropTransfer(event.dataTransfer),
-      workspaceId: workspace?.id || thread?.workspaceId || "",
+      workspace_id: workspace?.id || thread?.workspace_id || "",
     });
   };
 
@@ -7020,7 +7039,7 @@ function WorkspaceThreadDetail({
       ...describeImageSupportDiagnostics({
         activeAgentId,
         activeAgentStatus,
-        imageInputSupport,
+        image_input_support: imageInputSupport,
         modelOptions,
         selectedModel: currentTuiModel || "",
         selectedModelOption,
@@ -7032,12 +7051,12 @@ function WorkspaceThreadDetail({
       hasImageTransfer: imageFiles.length > 0,
       hasWorkspaceFileTransfer: isWorkspaceFileDragTransfer(event.dataTransfer),
       surface: "thread_detail",
-      threadId: thread?.id || "",
+      thread_id: thread?.id || "",
       transfer: describeImageDropTransfer(event.dataTransfer),
-      workspaceId: workspace?.id || thread?.workspaceId || "",
+      workspace_id: workspace?.id || thread?.workspace_id || "",
     });
     logBigViewSyncDiagnosticEvent("bigview.text.drop_observed", {
-      agentId: activeAgentId,
+      agent_id: activeAgentId,
       composerSyncKey,
       dataTransferTypes: Array.from(event.dataTransfer?.types || []),
       hasImageTransfer: imageFiles.length > 0,
@@ -7045,8 +7064,8 @@ function WorkspaceThreadDetail({
       model: currentTuiModel || "",
       surface: "thread_detail",
       text: getBigViewTextDiagnosticFields(event.dataTransfer?.getData?.("text/plain") || ""),
-      threadId: thread?.id || "",
-      workspaceId: workspace?.id || thread?.workspaceId || "",
+      thread_id: thread?.id || "",
+      workspace_id: workspace?.id || thread?.workspace_id || "",
     });
     if (imageFiles.length) {
       event.preventDefault();
@@ -7055,17 +7074,17 @@ function WorkspaceThreadDetail({
         ...describeImageSupportDiagnostics({
           activeAgentId,
           activeAgentStatus,
-          imageInputSupport,
+          image_input_support: imageInputSupport,
           modelOptions,
           selectedModel: currentTuiModel || "",
           selectedModelOption,
         }),
-        fileCount: imageFiles.length,
+        file_count: imageFiles.length,
         files: imageFiles.map(describeImageDropFile),
         surface: "thread_detail",
-        threadId: thread?.id || "",
+        thread_id: thread?.id || "",
         transfer: describeImageDropTransfer(event.dataTransfer),
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       });
       addImageFiles(imageFiles);
       return;
@@ -7078,16 +7097,16 @@ function WorkspaceThreadDetail({
         ...describeImageSupportDiagnostics({
           activeAgentId,
           activeAgentStatus,
-          imageInputSupport,
+          image_input_support: imageInputSupport,
           modelOptions,
           selectedModel: currentTuiModel || "",
           selectedModelOption,
         }),
         reason: "missing_image_file",
         surface: "thread_detail",
-        threadId: thread?.id || "",
+        thread_id: thread?.id || "",
         transfer: describeImageDropTransfer(event.dataTransfer),
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       });
       return;
     }
@@ -7108,32 +7127,32 @@ function WorkspaceThreadDetail({
       hasActiveWorkspaceFile: Boolean(activeWorkspaceFile),
       hasSyncKey: Boolean(composerSyncKey),
       hasWorkspaceFileTransfer,
-      relativePath: workspaceFile?.relativePath || attachment?.relativePath || "",
-      threadId: thread?.id || "",
+      relative_path: workspaceFile?.relative_path || attachment?.relative_path || "",
+      thread_id: thread?.id || "",
       types: Array.from(event.dataTransfer?.types || []),
-      workspaceId: workspace?.id || thread?.workspaceId || "",
+      workspace_id: workspace?.id || thread?.workspace_id || "",
     });
     if (!attachment || !composerSyncKey) {
       logFileDragDiagnosticEvent("bigview.drop_skip", {
         attachmentCreated: Boolean(attachment),
         hasSyncKey: Boolean(composerSyncKey),
         reason: !attachment ? "missing_attachment" : "missing_sync_key",
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        thread_id: thread?.id || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       });
       return;
     }
 
     appendWorkspaceThreadComposerAttachments(composerSyncKey, [attachment], {
       fields: {
-        agentId: activeAgentId,
-        bindingInstanceId: activeTerminalBinding?.instanceId || "",
-        bindingPaneId: activeTerminalBinding?.paneId || "",
-        relativePath: attachment.relativePath || "",
+        agent_id: activeAgentId,
+        bindingInstanceId: activeTerminalBinding?.instance_id || "",
+        bindingPaneId: activeTerminalBinding?.pane_id || "",
+        relative_path: attachment.relative_path || "",
         selectedModel: currentTuiModel || "",
         surface: "thread_detail",
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        thread_id: thread?.id || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       },
       source: "bigview_fileviewer_drop",
     });
@@ -7142,9 +7161,9 @@ function WorkspaceThreadDetail({
       attachmentPath: attachment.savedPath,
       composerSyncKey,
       kind: attachment.kind,
-      relativePath: attachment.relativePath || "",
-      threadId: thread?.id || "",
-      workspaceId: workspace?.id || thread?.workspaceId || "",
+      relative_path: attachment.relative_path || "",
+      thread_id: thread?.id || "",
+      workspace_id: workspace?.id || thread?.workspace_id || "",
     });
   };
 
@@ -7154,10 +7173,10 @@ function WorkspaceThreadDetail({
       attachmentCreated: Boolean(attachment),
       composerSyncKey,
       hasSyncKey: Boolean(composerSyncKey),
-      relativePath: workspaceFile?.relativePath || attachment?.relativePath || "",
+      relative_path: workspaceFile?.relative_path || attachment?.relative_path || "",
       source,
-      threadId: thread?.id || "",
-      workspaceId: workspace?.id || thread?.workspaceId || "",
+      thread_id: thread?.id || "",
+      workspace_id: workspace?.id || thread?.workspace_id || "",
     });
     if (!attachment || !composerSyncKey) {
       logFileDragDiagnosticEvent("bigview.global_drop_skip", {
@@ -7165,23 +7184,23 @@ function WorkspaceThreadDetail({
         hasSyncKey: Boolean(composerSyncKey),
         reason: !attachment ? "missing_attachment" : "missing_sync_key",
         source,
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        thread_id: thread?.id || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       });
       return false;
     }
 
     appendWorkspaceThreadComposerAttachments(composerSyncKey, [attachment], {
       fields: {
-        agentId: activeAgentId,
-        bindingInstanceId: activeTerminalBinding?.instanceId || "",
-        bindingPaneId: activeTerminalBinding?.paneId || "",
-        relativePath: attachment.relativePath || "",
+        agent_id: activeAgentId,
+        bindingInstanceId: activeTerminalBinding?.instance_id || "",
+        bindingPaneId: activeTerminalBinding?.pane_id || "",
+        relative_path: attachment.relative_path || "",
         selectedModel: currentTuiModel || "",
         source,
         surface: "thread_detail",
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        thread_id: thread?.id || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       },
       source,
     });
@@ -7190,10 +7209,10 @@ function WorkspaceThreadDetail({
       attachmentPath: attachment.savedPath,
       composerSyncKey,
       kind: attachment.kind,
-      relativePath: attachment.relativePath || "",
+      relative_path: attachment.relative_path || "",
       source,
-      threadId: thread?.id || "",
-      workspaceId: workspace?.id || thread?.workspaceId || "",
+      thread_id: thread?.id || "",
+      workspace_id: workspace?.id || thread?.workspace_id || "",
     });
     return true;
   };
@@ -7219,9 +7238,9 @@ function WorkspaceThreadDetail({
         hasActiveWorkspaceFile: Boolean(activeWorkspaceFile),
         hasWorkspaceFileTransfer,
         insideComposer,
-        threadId: thread?.id || "",
+        thread_id: thread?.id || "",
         types: Array.from(event.dataTransfer?.types || []),
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       });
       if (!insideComposer) {
         return;
@@ -7231,9 +7250,9 @@ function WorkspaceThreadDetail({
         composerSyncKey,
         hasActiveWorkspaceFile: Boolean(activeWorkspaceFile),
         hasWorkspaceFileTransfer,
-        threadId: thread?.id || "",
+        thread_id: thread?.id || "",
         types: Array.from(event.dataTransfer?.types || []),
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       });
     };
 
@@ -7256,9 +7275,9 @@ function WorkspaceThreadDetail({
         hasActiveWorkspaceFile: Boolean(activeWorkspaceFile),
         hasWorkspaceFileTransfer,
         insideComposer,
-        threadId: thread?.id || "",
+        thread_id: thread?.id || "",
         types: Array.from(event.dataTransfer?.types || []),
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       });
       if (!insideComposer) {
         return;
@@ -7270,10 +7289,10 @@ function WorkspaceThreadDetail({
         filePresent: Boolean(workspaceFile),
         hasActiveWorkspaceFile: Boolean(activeWorkspaceFile),
         hasWorkspaceFileTransfer,
-        relativePath: workspaceFile?.relativePath || "",
-        threadId: thread?.id || "",
+        relative_path: workspaceFile?.relative_path || "",
+        thread_id: thread?.id || "",
         types: Array.from(event.dataTransfer?.types || []),
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       });
       if (queueWorkspaceFileForBigView(workspaceFile, "bigview_fileviewer_global_drop")) {
         clearActiveWorkspaceFileDrag();
@@ -7288,12 +7307,12 @@ function WorkspaceThreadDetail({
     };
   }, [
     activeAgentId,
-    activeTerminalBinding?.instanceId,
-    activeTerminalBinding?.paneId,
+    activeTerminalBinding?.instance_id,
+    activeTerminalBinding?.pane_id,
     composerSyncKey,
     currentTuiModel,
     thread?.id,
-    thread?.workspaceId,
+    thread?.workspace_id,
     workspace?.id,
   ]);
 
@@ -7316,9 +7335,9 @@ function WorkspaceThreadDetail({
       logFileDragDiagnosticEvent("bigview.pointer_drop_received", {
         composerSyncKey,
         insideComposer,
-        relativePath: workspaceFile.relativePath || "",
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        relative_path: workspaceFile.relative_path || "",
+        thread_id: thread?.id || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       });
       if (!insideComposer) {
         return;
@@ -7336,12 +7355,12 @@ function WorkspaceThreadDetail({
     };
   }, [
     activeAgentId,
-    activeTerminalBinding?.instanceId,
-    activeTerminalBinding?.paneId,
+    activeTerminalBinding?.instance_id,
+    activeTerminalBinding?.pane_id,
     composerSyncKey,
     currentTuiModel,
     thread?.id,
-    thread?.workspaceId,
+    thread?.workspace_id,
     workspace?.id,
   ]);
 
@@ -7349,7 +7368,7 @@ function WorkspaceThreadDetail({
     ...describeImageSupportDiagnostics({
       activeAgentId,
       activeAgentStatus,
-      imageInputSupport,
+      image_input_support: imageInputSupport,
       modelOptions,
       selectedModel: currentTuiModel || "",
       selectedModelOption,
@@ -7359,9 +7378,9 @@ function WorkspaceThreadDetail({
     hasActiveWorkspaceFile: Boolean(getActiveWorkspaceFileDrag()),
     hasImageTransfer: hasImageFileTransfer(event.dataTransfer),
     hasWorkspaceFileType: isWorkspaceFileDragTransfer(event.dataTransfer),
-    threadId: thread?.id || "",
+    thread_id: thread?.id || "",
     transfer: describeImageDropTransfer(event.dataTransfer),
-    workspaceId: workspace?.id || thread?.workspaceId || "",
+    workspace_id: workspace?.id || thread?.workspace_id || "",
   });
 
   const handleComposerRawDragEnterCapture = (event) => {
@@ -7380,14 +7399,14 @@ function WorkspaceThreadDetail({
     const removedAttachment = attachments.find((attachment) => attachment.id === attachmentId);
     removeWorkspaceThreadComposerAttachment(composerSyncKey, attachmentId, {
       fields: {
-        agentId: activeAgentId,
-        bindingInstanceId: activeTerminalBinding?.instanceId || "",
-        bindingPaneId: activeTerminalBinding?.paneId || "",
+        agent_id: activeAgentId,
+        bindingInstanceId: activeTerminalBinding?.instance_id || "",
+        bindingPaneId: activeTerminalBinding?.pane_id || "",
         removedAttachment: getAttachmentLogSummary([removedAttachment])[0] || null,
         selectedModel: currentTuiModel || "",
         surface: "thread_detail",
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        thread_id: thread?.id || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       },
       source: "bigview_thread_detail",
     });
@@ -7397,17 +7416,17 @@ function WorkspaceThreadDetail({
     const nextModel = String(option?.value || "").trim();
     const thinkingPower = getModelThinkingPowerMetadata(activeAgentId, option, nextModel);
     logBigViewSyncDiagnosticEvent("bigview.model_change.selected", {
-      agentId: activeAgentId,
+      agent_id: activeAgentId,
       canSubmit,
       hasActiveTerminalBinding,
       hasProviderSession,
       model: nextModel,
       modelLabel: option?.label || "",
       surface: "thread_detail",
-      thinkingPower: thinkingPower.thinkingPower,
+      thinking_power: thinkingPower.thinking_power,
       thinkingPowerSource: thinkingPower.source,
-      threadId: thread?.id || "",
-      workspaceId: workspace?.id || thread?.workspaceId || "",
+      thread_id: thread?.id || "",
+      workspace_id: workspace?.id || thread?.workspace_id || "",
     });
     setSelectedModel(nextModel);
     setModelMenuOpen(false);
@@ -7415,62 +7434,62 @@ function WorkspaceThreadDetail({
 
     if (!nextModel || !thread || !hasActiveTerminalBinding) {
       logBigViewSyncDiagnosticEvent("bigview.model_change.skip", {
-        agentId: activeAgentId,
+        agent_id: activeAgentId,
         hasActiveTerminalBinding,
         hasModel: Boolean(nextModel),
         hasThread: Boolean(thread),
         model: nextModel,
         reason: !nextModel ? "missing_model" : !thread ? "missing_thread" : "missing_live_terminal_binding",
         surface: "thread_detail",
-        thinkingPower: thinkingPower.thinkingPower,
+        thinking_power: thinkingPower.thinking_power,
         thinkingPowerSource: thinkingPower.source,
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        thread_id: thread?.id || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       });
       return;
     }
 
     logBigViewSyncDiagnosticEvent("bigview.model_change.request", {
-      agentId: activeAgentId,
-      bindingInstanceId: activeTerminalBinding?.instanceId || "",
-      bindingPaneId: activeTerminalBinding?.paneId || "",
+      agent_id: activeAgentId,
+      bindingInstanceId: activeTerminalBinding?.instance_id || "",
+      bindingPaneId: activeTerminalBinding?.pane_id || "",
       model: nextModel,
       modelLabel: option?.label || "",
-      requestIncludesThinkingPower: Boolean(activeAgentId === "codex" && thinkingPower.thinkingPower),
+      requestIncludesThinkingPower: Boolean(activeAgentId === "codex" && thinkingPower.thinking_power),
       surface: "thread_detail",
-      thinkingPower: thinkingPower.thinkingPower,
+      thinking_power: thinkingPower.thinking_power,
       thinkingPowerSource: thinkingPower.source,
-      threadId: thread?.id || "",
-      workspaceId: workspace?.id || thread?.workspaceId || "",
+      thread_id: thread?.id || "",
+      workspace_id: workspace?.id || thread?.workspace_id || "",
     });
     Promise.resolve(onSelectModel?.({
-      agentId: activeAgentId,
+      agent_id: activeAgentId,
       model: nextModel,
       thread,
-      thinkingPower: thinkingPower.thinkingPower,
+      thinking_power: thinkingPower.thinking_power,
       thinkingPowerSource: thinkingPower.source,
       workspace,
     })).then(() => {
       logBigViewSyncDiagnosticEvent("bigview.model_change.done", {
-        agentId: activeAgentId,
+        agent_id: activeAgentId,
         model: nextModel,
         surface: "thread_detail",
-        thinkingPower: thinkingPower.thinkingPower,
+        thinking_power: thinkingPower.thinking_power,
         thinkingPowerSource: thinkingPower.source,
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        thread_id: thread?.id || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       });
     }).catch((modelError) => {
       setError(modelError?.message || "Unable to change model.");
       logBigViewSyncDiagnosticEvent("bigview.model_change.error", {
-        agentId: activeAgentId,
+        agent_id: activeAgentId,
         message: modelError?.message || String(modelError || ""),
         model: nextModel,
         surface: "thread_detail",
-        thinkingPower: thinkingPower.thinkingPower,
+        thinking_power: thinkingPower.thinking_power,
         thinkingPowerSource: thinkingPower.source,
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        thread_id: thread?.id || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       });
     });
   };
@@ -7488,7 +7507,7 @@ function WorkspaceThreadDetail({
     try {
       const thinkingPower = getModelThinkingPowerMetadata(activeAgentId, selectedModelOption, currentTuiModel);
       logBigViewSyncDiagnosticEvent("bigview.submit.start", {
-        agentId: activeAgentId,
+        agent_id: activeAgentId,
         attachmentCount: previousAttachments.length,
         attachments: getAttachmentLogSummary(previousAttachments),
         canSubmit,
@@ -7502,20 +7521,20 @@ function WorkspaceThreadDetail({
         modelPayload: "",
         selectedModel: currentTuiModel || "",
         surface: "thread_detail",
-        thinkingPower: thinkingPower.thinkingPower,
+        thinking_power: thinkingPower.thinking_power,
         thinkingPowerSource: thinkingPower.source,
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        thread_id: thread?.id || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       });
       if (previousAttachments.length) {
         logBigViewSyncDiagnosticEvent("bigview.image.save_start", {
-          agentId: activeAgentId,
+          agent_id: activeAgentId,
           attachmentCount: previousAttachments.length,
           attachments: getAttachmentLogSummary(previousAttachments),
           selectedModel: currentTuiModel || "",
           surface: "thread_detail",
-          threadId: thread?.id || "",
-          workspaceId: workspace?.id || thread?.workspaceId || "",
+          thread_id: thread?.id || "",
+          workspace_id: workspace?.id || thread?.workspace_id || "",
         });
       }
       let imageBlock = "";
@@ -7524,33 +7543,33 @@ function WorkspaceThreadDetail({
       } catch (saveError) {
         if (previousAttachments.length) {
           logBigViewSyncDiagnosticEvent("bigview.image.save_error", {
-            agentId: activeAgentId,
+            agent_id: activeAgentId,
             attachmentCount: previousAttachments.length,
             attachments: getAttachmentLogSummary(previousAttachments),
             message: saveError?.message || String(saveError || ""),
             selectedModel: currentTuiModel || "",
             surface: "thread_detail",
-            threadId: thread?.id || "",
-            workspaceId: workspace?.id || thread?.workspaceId || "",
+            thread_id: thread?.id || "",
+            workspace_id: workspace?.id || thread?.workspace_id || "",
           });
         }
         throw saveError;
       }
       if (previousAttachments.length) {
         logBigViewSyncDiagnosticEvent("bigview.image.save_done", {
-          agentId: activeAgentId,
+          agent_id: activeAgentId,
           attachmentCount: previousAttachments.length,
           imageBlockLength: imageBlock.length,
           imageBlockPreview: imageBlock.slice(0, 240),
           selectedModel: currentTuiModel || "",
           surface: "thread_detail",
-          threadId: thread?.id || "",
-          workspaceId: workspace?.id || thread?.workspaceId || "",
+          thread_id: thread?.id || "",
+          workspace_id: workspace?.id || thread?.workspace_id || "",
         });
       }
       const message = [text, imageBlock].filter(Boolean).join("\n\n");
       logBigViewSyncDiagnosticEvent("bigview.submit.message_prepared", {
-        agentId: activeAgentId,
+        agent_id: activeAgentId,
         attachmentCount: previousAttachments.length,
         hasActiveTerminalBinding,
         imageBlockPresent: Boolean(imageBlock),
@@ -7558,8 +7577,8 @@ function WorkspaceThreadDetail({
         messageText: getBigViewTextDiagnosticFields(message),
         selectedModel: currentTuiModel || "",
         surface: "thread_detail",
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        thread_id: thread?.id || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       });
 
       await onSubmitMessage?.({
@@ -7569,20 +7588,20 @@ function WorkspaceThreadDetail({
         workspace,
       });
       logBigViewSyncDiagnosticEvent("bigview.submit.done", {
-        agentId: activeAgentId,
+        agent_id: activeAgentId,
         attachmentCount: previousAttachments.length,
         selectedModel: currentTuiModel || "",
         surface: "thread_detail",
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        thread_id: thread?.id || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       });
       setDraft("");
       setWorkspaceThreadComposerAttachments(composerSyncKey, [], {
         fields: {
-          agentId: activeAgentId,
+          agent_id: activeAgentId,
           surface: "thread_detail",
-          threadId: thread?.id || "",
-          workspaceId: workspace?.id || thread?.workspaceId || "",
+          thread_id: thread?.id || "",
+          workspace_id: workspace?.id || thread?.workspace_id || "",
         },
         reason: "submit_done_clear",
         source: "bigview_thread_detail",
@@ -7591,13 +7610,13 @@ function WorkspaceThreadDetail({
       setDraft(previousDraft);
       setError(submitError?.message || "Unable to send message.");
       logBigViewSyncDiagnosticEvent("bigview.submit.error", {
-        agentId: activeAgentId,
+        agent_id: activeAgentId,
         attachmentCount: previousAttachments.length,
         message: submitError?.message || String(submitError || ""),
         selectedModel: currentTuiModel || "",
         surface: "thread_detail",
-        threadId: thread?.id || "",
-        workspaceId: workspace?.id || thread?.workspaceId || "",
+        thread_id: thread?.id || "",
+        workspace_id: workspace?.id || thread?.workspace_id || "",
       });
     } finally {
       setSending(false);
@@ -7611,7 +7630,7 @@ function WorkspaceThreadDetail({
   if (newChatActive) {
     return (
       <NewChatView
-        agentStatuses={agentStatuses}
+        agent_statuses={agentStatuses}
         onCreateChat={onCreateChat}
         workspace={workspace}
       />
@@ -7686,7 +7705,7 @@ function WorkspaceThreadDetail({
           <HeaderChipButton
             data-copied={workspacePathCopied ? "true" : "false"}
             onClick={copyWorkspacePath}
-            title={workspacePathCopied ? "Copied workspace path" : `Copy workspace path\n${diffRepoPath || workspace?.rootDirectory || ""}`}
+            title={workspacePathCopied ? "Copied workspace path" : `Copy workspace path\n${diffRepoPath || workspace?.root_directory || ""}`}
             type="button"
           >
             {workspacePathCopied ? <Check aria-hidden="true" /> : <ContentCopy aria-hidden="true" />}
@@ -7722,7 +7741,7 @@ function WorkspaceThreadDetail({
           <AgentTranscript
             anchorTopInsetPx={transcriptAnchorInsetPx}
             busy={transcriptBusy}
-            diffSummaries={transcriptDiffSummaries}
+            diff_summaries={transcriptDiffSummaries}
             emptyLabel="No synced chat records yet."
             itemIdPrefix="workspace-thread-message"
             items={transcriptItems}
@@ -7730,12 +7749,12 @@ function WorkspaceThreadDetail({
             onOpenSession={typeof onOpenTranscriptSession === "function" ? onOpenTranscriptSession : null}
             onUserMessageAction={handleTranscriptUserMessageAction}
             scrollRef={transcriptScrollRef}
-            sessionId={thread?.transcriptSessionId || activeProviderBinding?.nativeSessionId || ""}
+            session_id={thread?.transcript_session_id || activeProviderBinding?.native_session_id || ""}
             windowKey={[
-              workspace?.id || thread?.workspaceId || "workspace",
+              workspace?.id || thread?.workspace_id || "workspace",
               thread?.id || "thread",
               activeAgentId,
-              thread?.transcriptSessionId || activeProviderBinding?.nativeSessionId || "",
+              thread?.transcript_session_id || activeProviderBinding?.native_session_id || "",
               density,
             ].join(":")}
             workingLabel={transcriptWorkingLabel}
@@ -7775,7 +7794,7 @@ function WorkspaceThreadDetail({
           <AttachmentStrip>
             {attachments.map((attachment) => (
               <AttachmentChip key={attachment.id} title={attachment.name}>
-                {attachment.dataUrl && <img alt="" draggable={false} src={attachment.dataUrl} />}
+                {attachment.data_url && <img alt="" draggable={false} src={attachment.data_url} />}
                 <span>{attachment.name}</span>
                 <AttachmentQueueHint>queued</AttachmentQueueHint>
                 <button
@@ -7797,7 +7816,7 @@ function WorkspaceThreadDetail({
               const nextDraft = event.target.value;
               setDraft(nextDraft);
               logBigViewSyncDiagnosticEvent("bigview.draft.input", {
-                agentId: activeAgentId,
+                agent_id: activeAgentId,
                 composerSyncKey,
                 hasActiveTerminalBinding,
                 hasDraftInputHandler: Boolean(onDraftInput),
@@ -7806,8 +7825,8 @@ function WorkspaceThreadDetail({
                 previousValueLength: previousDraft.length,
                 selectedModel: currentTuiModel || "",
                 surface: "thread_detail",
-                threadId: thread?.id || "",
-                workspaceId: workspace?.id || thread?.workspaceId || "",
+                thread_id: thread?.id || "",
+                workspace_id: workspace?.id || thread?.workspace_id || "",
               });
               onDraftInput?.({
                 nextValue: nextDraft,

@@ -177,14 +177,14 @@ const HostNotice = styled.div`
 function parseTerminalWindowParams() {
   if (typeof window === "undefined") {
     return {
-      agentKind: "",
-      agentLabel: "Terminal",
-      colorSlot: "",
-      paneId: "",
-      terminalIndex: 0,
+      agent_kind: "",
+      agent_label: "Terminal",
+      color_slot: "",
+      pane_id: "",
+      terminal_index: 0,
       theme: "",
       title: "Terminal",
-      workspaceId: "",
+      workspace_id: "",
     };
   }
 
@@ -193,14 +193,14 @@ function parseTerminalWindowParams() {
   const params = new URLSearchParams(queryIndex >= 0 ? hash.slice(queryIndex + 1) : "");
 
   return {
-    agentKind: params.get("agentKind") || "",
-    agentLabel: params.get("agentLabel") || params.get("title") || "Terminal",
-    colorSlot: params.get("colorSlot") || "",
-    paneId: params.get("paneId") || "",
-    terminalIndex: Number.parseInt(params.get("terminalIndex") || "0", 10) || 0,
+    agent_kind: params.get("agent_kind") || "",
+    agent_label: params.get("agent_label") || params.get("title") || "Terminal",
+    color_slot: params.get("color_slot") || "",
+    pane_id: params.get("pane_id") || "",
+    terminal_index: Number.parseInt(params.get("terminal_index") || "0", 10) || 0,
     theme: params.get("theme") || "",
     title: params.get("title") || "Terminal",
-    workspaceId: params.get("workspaceId") || "",
+    workspace_id: params.get("workspace_id") || "",
   };
 }
 
@@ -290,7 +290,7 @@ function base64ToUint8Array(value) {
  */
 export default function TerminalWindowHost() {
   const params = useMemo(parseTerminalWindowParams, []);
-  const { paneId, terminalIndex, theme, title, workspaceId } = params;
+  const { pane_id: paneId, terminal_index: terminalIndex, theme, title, workspace_id: workspaceId } = params;
   const containerRef = useRef(null);
   const xtermRef = useRef(null);
   const terminalInstanceIdRef = useRef(0);
@@ -307,13 +307,13 @@ export default function TerminalWindowHost() {
   );
   const terminalFontSizeRef = useRef(terminalFontSize);
   const [meta, setMeta] = useState(() => ({
-    agentKind: params.agentKind,
-    agentLabel: params.agentLabel,
-    agentTitle: params.agentLabel,
+    agent_kind: params.agent_kind,
+    agent_label: params.agent_label,
+    agentTitle: params.agent_label,
     canFork: false,
     canOpenUiView: false,
     canSplit: true,
-    colorSlot: params.colorSlot,
+    color_slot: params.color_slot,
     roleOptions: [],
     stateLabel: "",
   }));
@@ -353,8 +353,8 @@ export default function TerminalWindowHost() {
     if (paneId) {
       emit(TERMINAL_WINDOW_CONTROL_EVENT, {
         control: TERMINAL_WINDOW_CONTROL_FONT_SIZE,
-        fontSize: next,
-        paneId,
+        font_size: next,
+        pane_id: paneId,
       }).catch(() => {});
     }
     setTerminalFontSize(next);
@@ -368,10 +368,10 @@ export default function TerminalWindowHost() {
 
     invoke("set_terminal_audio_input_target", {
       active: true,
-      instanceId,
-      paneId,
+      instance_id: instanceId,
+      pane_id: paneId,
     }).catch(() => {});
-    invoke("set_terminal_audio_route_gate", { allowTerminal: true }).catch(() => {});
+    invoke("set_terminal_audio_route_gate", { allow_terminal: true }).catch(() => {});
   }, [paneId]);
 
   useEffect(() => {
@@ -407,7 +407,7 @@ export default function TerminalWindowHost() {
     let disposed = false;
     let unlisten = () => {};
     listen(TERMINAL_WINDOW_META_EVENT, (event) => {
-      if (disposed || String(event.payload?.paneId || "") !== paneId) {
+      if (disposed || String(event.payload?.pane_id || "") !== paneId) {
         return;
       }
       setMeta((current) => ({ ...current, ...event.payload }));
@@ -418,7 +418,7 @@ export default function TerminalWindowHost() {
           return;
         }
         unlisten = nextUnlisten;
-        emit(TERMINAL_WINDOW_META_REQUEST_EVENT, { paneId }).catch(() => {});
+        emit(TERMINAL_WINDOW_META_REQUEST_EVENT, { pane_id: paneId }).catch(() => {});
       })
       .catch(() => {});
 
@@ -501,7 +501,7 @@ export default function TerminalWindowHost() {
         term.resize(measurement.cols, measurement.rows);
       }
       invoke("terminal_resize", {
-        paneId,
+        pane_id: paneId,
         cols: measurement.cols,
         rows: measurement.rows,
       }).catch(() => {});
@@ -544,8 +544,8 @@ export default function TerminalWindowHost() {
     const attach = async () => {
       let instanceId = 0;
       try {
-        const info = await invoke("terminal_pane_runtime_info", { paneId });
-        instanceId = Number(info?.instanceId || 0);
+        const info = await invoke("terminal_pane_runtime_info", { pane_id: paneId });
+        instanceId = Number(info?.instance_id || 0);
       } catch {
         scheduleReattach();
         return;
@@ -561,11 +561,11 @@ export default function TerminalWindowHost() {
       // Replay the headless scrollback before live frames arrive.
       try {
         const snapshot = await invoke("terminal_headless_output_snapshot", {
-          paneId,
-          instanceId,
+          pane_id: paneId,
+          instance_id: instanceId,
         });
-        if (!disposed && snapshot?.bytesBase64) {
-          term.write(base64ToUint8Array(snapshot.bytesBase64));
+        if (!disposed && snapshot?.bytes_base64) {
+          term.write(base64ToUint8Array(snapshot.bytes_base64));
         }
       } catch {
         // A missing snapshot only loses scrollback; live output still works.
@@ -590,8 +590,8 @@ export default function TerminalWindowHost() {
         try {
           socket.send(JSON.stringify({
             id: `terminal-window-${paneId}`,
-            instanceId,
-            paneId,
+            instance_id: instanceId,
+            pane_id: paneId,
             token: endpoint.token,
             type: "subscribe",
           }));
@@ -678,8 +678,8 @@ export default function TerminalWindowHost() {
 
       term.onData((data) => {
         invoke("terminal_write", {
-          appForkEnabled: metaRef.current?.canFork === true,
-          paneId,
+          app_fork_enabled: metaRef.current?.canFork === true,
+          pane_id: paneId,
           data,
         }).catch(() => {});
       });
@@ -731,7 +731,7 @@ export default function TerminalWindowHost() {
     if (!paneId) {
       return;
     }
-    emit(TERMINAL_WINDOW_CONTROL_EVENT, { control, paneId, ...extra }).catch(() => {});
+    emit(TERMINAL_WINDOW_CONTROL_EVENT, { control, pane_id: paneId, ...extra }).catch(() => {});
   }, [paneId]);
 
   const startWindowDrag = useCallback((event) => {
@@ -754,12 +754,12 @@ export default function TerminalWindowHost() {
       setRestartMenuOpen((isOpen) => !isOpen);
       return;
     }
-    sendControl(TERMINAL_WINDOW_CONTROL_RESTART_AS, { roleId: meta.agentKind });
-  }, [meta.agentKind, meta.roleOptions.length, sendControl]);
+    sendControl(TERMINAL_WINDOW_CONTROL_RESTART_AS, { role_id: meta.agent_kind });
+  }, [meta.agent_kind, meta.roleOptions.length, sendControl]);
 
   const stateBadgeLabel = meta.stateLabel
     || (status === "ready" ? "Live" : status === "connecting" ? "Linking" : "Off");
-  const agentTitle = meta.agentTitle || meta.agentLabel || title;
+  const agentTitle = meta.agentTitle || meta.agent_label || title;
 
   return (
     <HostShell
@@ -801,12 +801,12 @@ export default function TerminalWindowHost() {
           </TerminalRestartButton>
           <TerminalAgentDot
             aria-hidden="true"
-            data-agent={meta.agentKind || undefined}
-            data-slot={meta.colorSlot || undefined}
+            data-agent={meta.agent_kind || undefined}
+            data-slot={meta.color_slot || undefined}
             title={agentTitle}
           />
           <TerminalAgentLabel data-tauri-drag-region title={agentTitle}>
-            {meta.agentLabel || title}
+            {meta.agent_label || title}
           </TerminalAgentLabel>
           <TerminalStateDebugBadge title={`Terminal state: ${stateBadgeLabel}`}>
             {stateBadgeLabel}
@@ -923,18 +923,18 @@ export default function TerminalWindowHost() {
               {meta.roleOptions.map((option) => (
                 <TerminalRestartOption
                   data-role={option.id}
-                  data-selected={option.id === meta.agentKind ? "true" : "false"}
+                  data-selected={option.id === meta.agent_kind ? "true" : "false"}
                   key={option.id}
                   onClick={() => {
                     setRestartMenuOpen(false);
-                    sendControl(TERMINAL_WINDOW_CONTROL_RESTART_AS, { roleId: option.id });
+                    sendControl(TERMINAL_WINDOW_CONTROL_RESTART_AS, { role_id: option.id });
                   }}
                   role="menuitem"
-                  title={option.id === meta.agentKind ? `Restart ${option.label}` : `Restart as ${option.label}`}
+                  title={option.id === meta.agent_kind ? `Restart ${option.label}` : `Restart as ${option.label}`}
                   type="button"
                 >
                   <strong>
-                    {option.id === meta.agentKind ? `Restart ${option.label}` : option.label}
+                    {option.id === meta.agent_kind ? `Restart ${option.label}` : option.label}
                   </strong>
                 </TerminalRestartOption>
               ))}

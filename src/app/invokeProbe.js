@@ -180,14 +180,14 @@ function flushWindow() {
   invoke("terminal_status_log", {
     phase: "frontend.invoke_probe.storm",
     fields: {
-      invokesPerWindow: invokes,
-      eventsPerWindow: events,
-      windowMs: WINDOW_MS,
-      stormWindows,
-      totalInvokes,
-      totalEvents,
-      topInvokes,
-      topEvents,
+      invokes_per_window: invokes,
+      events_per_window: events,
+      window_ms: WINDOW_MS,
+      storm_windows: stormWindows,
+      total_invokes: totalInvokes,
+      total_events: totalEvents,
+      top_invokes: topInvokes,
+      top_events: topEvents,
     },
   }).catch(() => {}).finally(() => {
     reporting = false;

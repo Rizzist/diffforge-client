@@ -192,22 +192,22 @@ fn register_activity_overlay_shortcut(app: &AppHandle) {
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn activity_overlay_status(app: AppHandle) -> Result<ActivityOverlayVisibility, String> {
     Ok(activity_overlay_status_for(&app))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn show_activity_overlay(app: AppHandle) -> Result<ActivityOverlayVisibility, String> {
     show_activity_overlay_for(&app, true)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn hide_activity_overlay(app: AppHandle) -> Result<ActivityOverlayVisibility, String> {
     hide_activity_overlay_for(&app)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn toggle_activity_overlay(app: AppHandle) -> Result<ActivityOverlayVisibility, String> {
     toggle_activity_overlay_for(&app)
 }

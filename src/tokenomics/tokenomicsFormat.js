@@ -115,15 +115,15 @@ export function formatPaceMultiplier(value) {
 }
 
 export function rowTotal(row) {
-  return numeric(row?.total, row?.total_tokens, row?.totalTokens);
+  return numeric(row?.total, row?.total_tokens);
 }
 
 export function rowInput(row) {
-  return numeric(row?.input, row?.input_tokens, row?.inputTokens);
+  return numeric(row?.input, row?.input_tokens);
 }
 
 export function rowOutput(row) {
-  return numeric(row?.output, row?.output_tokens, row?.outputTokens);
+  return numeric(row?.output, row?.output_tokens);
 }
 
 export function rowCache(row) {
@@ -131,30 +131,23 @@ export function rowCache(row) {
     row?.cache,
     row?.cache_tokens,
     row?.cacheTokens,
-    numeric(row?.cache_read_tokens, row?.cacheReadTokens) + numeric(row?.cache_write_tokens, row?.cacheWriteTokens),
+    numeric(row?.cache_read_tokens) + numeric(row?.cache_write_tokens),
   );
 }
 
 export function rowCost(row) {
-  return numeric(row?.cost, row?.estimated_cost_microusd, row?.estimatedCostMicrousd);
+  return numeric(row?.cost, row?.estimated_cost_microusd);
 }
 
 export function rowProviderAccountKey(row) {
   return String(
-    row?.provider_account_key
-      || row?.providerAccountKey
-      || row?.subscription_key
-      || row?.subscriptionKey
-      || "",
+    row?.provider_account_key || row?.subscription_key || "",
   ).trim();
 }
 
 export function rowProviderAccountLabel(row) {
   return String(
-    row?.provider_account_label
-      || row?.providerAccountLabel
-      || rowProviderAccountKey(row)
-      || "Account",
+    row?.provider_account_label || rowProviderAccountKey(row) || "Account",
   ).trim();
 }
 
@@ -176,51 +169,34 @@ export function creditSnapshotHasMeaningfulData(credits) {
   const object = plainObject(credits);
   if (!object) return false;
   const term = plainObject(object.term);
-  const total = plainObject(object.total) || plainObject(object.totalCredits);
+  const total = plainObject(object.total) || plainObject(object.total_credits);
   return Boolean(
     object.known === true
       || object.live === true
-      || textValue(object.planName || object.plan_name)
-      || textValue(term?.plan_name || term?.planName || term?.id)
+      || textValue(object.plan_name)
+      || textValue(term?.plan_name || term?.id)
       || objectHasAny(object, [
-        "termTotalCredits",
         "term_total_credits",
-        "totalCredits",
         "total_credits",
-        "termRemainingCredits",
         "term_remaining_credits",
-        "remainingCredits",
         "remaining_credits",
-        "termReservedCredits",
         "term_reserved_credits",
-        "reservedCredits",
         "reserved_credits",
-        "termUsedCredits",
         "term_used_credits",
-        "usedCredits",
         "used_credits",
-        "localMeteredUsedCredits",
         "local_metered_used_credits",
       ])
       || objectHasAny(total, [
         "total_credits",
-        "totalCredits",
         "remaining_credits",
-        "remainingCredits",
         "reserved_credits",
-        "reservedCredits",
         "used_credits",
-        "usedCredits",
       ])
       || objectHasAny(term, [
         "total_credits",
-        "totalCredits",
         "remaining_credits",
-        "remainingCredits",
         "reserved_credits",
-        "reservedCredits",
         "used_credits",
-        "usedCredits",
       ])
   );
 }
@@ -233,17 +209,17 @@ export function normalizeCreditWallet(wallet, previous = null, options = {}) {
   }
   const preferIncoming = Boolean(options?.preferIncoming || options?.preferIncomingTotals);
 
-  const total = plainObject(credits.total) || plainObject(credits.totalCredits) || {};
+  const total = plainObject(credits.total) || plainObject(credits.total_credits) || {};
   const term = plainObject(credits.term) || {};
-  const termId = textValue(term.id || credits.termId || credits.term_id, "");
-  const rawTermEnd = textValue(term.term_end || term.termEnd || credits.resetAt || credits.reset_at, "");
-  const previousTermId = textValue(previousCredits.termId, "");
-  const previousTermEnd = textValue(previousCredits.termEnd || previousCredits.resetAt, "");
+  const termId = textValue(term.id || credits.term_id, "");
+  const rawTermEnd = textValue(term.term_end || credits.reset_at, "");
+  const previousTermId = textValue(previousCredits.term_id, "");
+  const previousTermEnd = textValue(previousCredits.term_end || previousCredits.reset_at, "");
   const incomingPlanToken = textValue(
-    credits.planName || credits.plan_name || credits.planStatus || credits.plan_status || credits.status,
+    credits.plan_name || credits.plan_status || credits.status,
   ).toLowerCase();
   const previousPlanToken = textValue(
-    previousCredits.planName || previousCredits.plan_name || previousCredits.planStatus || previousCredits.plan_status || previousCredits.status,
+    previousCredits.plan_name || previousCredits.plan_status || previousCredits.status,
   ).toLowerCase();
   const explicitFreeReset = incomingPlanToken === "free" && previousPlanToken && previousPlanToken !== "free";
   const sameTerm = !explicitFreeReset && (termId && previousTermId
@@ -254,55 +230,38 @@ export function normalizeCreditWallet(wallet, previous = null, options = {}) {
   const sameTermPreviousCredits = sameTerm && !preferIncoming ? previousCredits : {};
   const used = maxFiniteNumber(
     total.used_credits,
-    total.usedCredits,
-    credits.termUsedCredits,
     credits.term_used_credits,
-    credits.usedCredits,
     credits.used_credits,
     term.used_credits,
-    term.usedCredits,
-    credits.localMeteredUsedCredits,
     credits.local_metered_used_credits,
-    sameTermPreviousCredits.termUsedCredits,
+    sameTermPreviousCredits.term_used_credits,
   ) ?? 0;
   const reserved = firstFiniteNumber(
     total.reserved_credits,
-    total.reservedCredits,
-    credits.termReservedCredits,
     credits.term_reserved_credits,
-    credits.reservedCredits,
     credits.reserved_credits,
     term.reserved_credits,
-    term.reservedCredits,
-    sameTermPreviousCredits.termReservedCredits,
+    sameTermPreviousCredits.term_reserved_credits,
   ) ?? 0;
   const totalCredits = maxFiniteNumber(
     total.total_credits,
-    total.totalCredits,
-    credits.termTotalCredits,
     credits.term_total_credits,
-    credits.totalCredits,
     credits.total_credits,
     term.total_credits,
-    term.totalCredits,
-    sameTermPreviousCredits.termTotalCredits,
+    sameTermPreviousCredits.term_total_credits,
   ) ?? 0;
   const directRemaining = firstFiniteNumber(
     total.remaining_credits,
-    total.remainingCredits,
-    credits.termRemainingCredits,
     credits.term_remaining_credits,
-    credits.remainingCredits,
     credits.remaining_credits,
     term.remaining_credits,
-    term.remainingCredits,
-    sameTermPreviousCredits.termRemainingCredits,
+    sameTermPreviousCredits.term_remaining_credits,
   );
   const computedRemaining = totalCredits > 0 ? Math.max(0, totalCredits - used - reserved) : null;
   const remaining = directRemaining != null && directRemaining > 0
     ? directRemaining
     : computedRemaining ?? directRemaining ?? 0;
-  const termEnd = rawTermEnd || (sameTerm ? previousCredits.resetAt || previousCredits.termEnd || "" : "");
+  const termEnd = rawTermEnd || (sameTerm ? previousCredits.reset_at || previousCredits.term_end || "" : "");
 
   return {
     ...previousCredits,
@@ -310,28 +269,28 @@ export function normalizeCreditWallet(wallet, previous = null, options = {}) {
     known: credits.known ?? previousCredits.known ?? true,
     live: credits.live ?? previousCredits.live ?? true,
     source: textValue(credits.source, previousCredits.source || "diff_forge_hot_credit_wallet"),
-    walletVersion: firstFiniteNumber(credits.wallet_version, credits.walletVersion, previousCredits.walletVersion) ?? 0,
-    pendingEventCount: firstFiniteNumber(credits.pending_event_count, credits.pendingEventCount, previousCredits.pendingEventCount) ?? 0,
-    planName: textValue(credits.planName || credits.plan_name || term.plan_name || term.planName, previousCredits.planName || ""),
-    resetAt: termEnd || null,
-    termEnd: termEnd || null,
-    termId: termId || previousCredits.termId || "",
-    termRemainingCredits: remaining,
-    termReservedCredits: reserved,
-    termTotalCredits: totalCredits,
-    termUsedCredits: used,
-    providerCostMicrousd: firstFiniteNumber(total.provider_cost_microusd, total.providerCostMicrousd, credits.providerCostMicrousd, credits.provider_cost_microusd, previousCredits.providerCostMicrousd) ?? 0,
-    inputTokens: firstFiniteNumber(total.input_tokens, total.inputTokens, credits.inputTokens, credits.input_tokens, previousCredits.inputTokens) ?? 0,
-    cachedInputTokens: firstFiniteNumber(total.cached_input_tokens, total.cachedInputTokens, credits.cachedInputTokens, credits.cached_input_tokens, previousCredits.cachedInputTokens) ?? 0,
-    outputTokens: firstFiniteNumber(total.output_tokens, total.outputTokens, credits.outputTokens, credits.output_tokens, previousCredits.outputTokens) ?? 0,
-    audioSeconds: firstFiniteNumber(total.audio_seconds, total.audioSeconds, credits.audioSeconds, credits.audio_seconds, previousCredits.audioSeconds) ?? 0,
-    ttsCharacters: firstFiniteNumber(total.tts_characters, total.ttsCharacters, credits.ttsCharacters, credits.tts_characters, previousCredits.ttsCharacters) ?? 0,
-    webSearchCalls: firstFiniteNumber(total.web_search_calls, total.webSearchCalls, credits.webSearchCalls, credits.web_search_calls, previousCredits.webSearchCalls) ?? 0,
-    eventCount: firstFiniteNumber(total.event_count, total.eventCount, credits.eventCount, credits.event_count, previousCredits.eventCount) ?? 0,
-    updatedAt: textValue(credits.updated_at || credits.updatedAt, new Date().toISOString()),
+    wallet_version: firstFiniteNumber(credits.wallet_version, previousCredits.wallet_version) ?? 0,
+    pending_event_count: firstFiniteNumber(credits.pending_event_count, previousCredits.pending_event_count) ?? 0,
+    plan_name: textValue(credits.plan_name || term.plan_name, previousCredits.plan_name || ""),
+    reset_at: termEnd || null,
+    term_end: termEnd || null,
+    term_id: termId || previousCredits.term_id || "",
+    term_remaining_credits: remaining,
+    term_reserved_credits: reserved,
+    term_total_credits: totalCredits,
+    term_used_credits: used,
+    provider_cost_microusd: firstFiniteNumber(total.provider_cost_microusd, credits.provider_cost_microusd, previousCredits.provider_cost_microusd) ?? 0,
+    input_tokens: firstFiniteNumber(total.input_tokens, credits.input_tokens, previousCredits.input_tokens) ?? 0,
+    cached_input_tokens: firstFiniteNumber(total.cached_input_tokens, credits.cached_input_tokens, previousCredits.cached_input_tokens) ?? 0,
+    output_tokens: firstFiniteNumber(total.output_tokens, credits.output_tokens, previousCredits.output_tokens) ?? 0,
+    audio_seconds: firstFiniteNumber(total.audio_seconds, credits.audio_seconds, previousCredits.audio_seconds) ?? 0,
+    tts_characters: firstFiniteNumber(total.tts_characters, credits.tts_characters, previousCredits.tts_characters) ?? 0,
+    web_search_calls: firstFiniteNumber(total.web_search_calls, credits.web_search_calls, previousCredits.web_search_calls) ?? 0,
+    event_count: firstFiniteNumber(total.event_count, credits.event_count, previousCredits.event_count) ?? 0,
+    updated_at: textValue(credits.updated_at, new Date().toISOString()),
   };
 }
 
 export function creditRemainingWithReserved(credits) {
-  return numeric(credits?.termRemainingCredits) + numeric(credits?.termReservedCredits);
+  return numeric(credits?.term_remaining_credits) + numeric(credits?.term_reserved_credits);
 }

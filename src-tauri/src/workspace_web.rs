@@ -63,7 +63,7 @@ fn validate_workspace_webview_url(url: &str) -> Result<tauri::Url, String> {
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn workspace_webview_eval(
     app: AppHandle,
     label: String,
@@ -111,7 +111,7 @@ async fn workspace_webview_eval(
     Ok(serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({ "value": raw })))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn workspace_webview_open(
     app: AppHandle,
     label: String,
@@ -189,7 +189,7 @@ fn workspace_webview_open(
 // Moves a living workspace webview into another host window (main <-> web panel
 // pop-out) without reloading it, preserving page/session/JS state. Returns false
 // when no webview exists for the label so callers can fall back to a fresh open.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn workspace_webview_adopt(
     app: AppHandle,
     label: String,
@@ -227,7 +227,7 @@ fn workspace_webview_adopt(
     Ok(true)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn workspace_webview_fit(
     app: AppHandle,
     label: String,
@@ -261,7 +261,7 @@ fn workspace_webview_fit(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn workspace_webview_close(app: AppHandle, label: String) -> Result<(), String> {
     validate_workspace_webview_label(&label)?;
     if let Some(webview) = workspace_webview_for_label(&app, &label) {

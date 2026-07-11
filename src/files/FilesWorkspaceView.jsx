@@ -436,7 +436,7 @@ function getFileDragElementSummary(element) {
     className: typeof element.className === "string" ? element.className.slice(0, 220) : "",
     dataAttrs,
     id: String(element.id || ""),
-    tagName: String(element.tagName || "").toLowerCase(),
+    tag_name: String(element.tagName || "").toLowerCase(),
   };
 }
 
@@ -558,7 +558,7 @@ function getFileExplorerLayout(workspaceId) {
   return normalizeFileExplorerLayout(readFileExplorerLayouts()[getFileExplorerLayoutKey(workspaceId)]);
 }
 
-function queueFileExplorerLayout({ workspaceId, sizes }) {
+function queueFileExplorerLayout({ workspace_id: workspaceId, sizes }) {
   pendingFileExplorerLayout = {
     key: getFileExplorerLayoutKey(workspaceId),
     sizes: normalizeFileExplorerLayout(sizes),
@@ -910,7 +910,7 @@ function getReviewMarkerTop(lineNumber, lineCount) {
   return Number((((safeLineNumber - 1) / (safeLineCount - 1)) * 100).toFixed(3));
 }
 
-function getInlineReviewModel({ content, diff, relativePath }) {
+function getInlineReviewModel({ content, diff, relative_path: relativePath }) {
   const fileLines = getContentLines(content);
   const lineCount = fileLines.length;
   const insertedRows = new Map();
@@ -1093,8 +1093,8 @@ function FileTreeNode({
   renameDraft = "",
   renamingPath = "",
   selectedFilePath,
-  workspaceId,
-  workspaceRoot,
+  workspace_id: workspaceId,
+  workspace_root: workspaceRoot,
   depth = 0,
 }) {
   const renameInputRef = useRef(null);
@@ -1106,8 +1106,8 @@ function FileTreeNode({
   const filePointerDragRef = useRef(null);
   const suppressFileClickRef = useRef(false);
   const isDirectory = entry.kind === "directory";
-  const directoryPath = entry.relativePath || "";
-  const normalizedEntryPath = normalizeWorkspaceRelativePath(entry.relativePath || entry.name || "");
+  const directoryPath = entry.relative_path || "";
+  const normalizedEntryPath = normalizeWorkspaceRelativePath(entry.relative_path || entry.name || "");
   const isRootEntry = !normalizedEntryPath;
   const isRenaming = Boolean(renamingPath && renamingPath === normalizedEntryPath);
   const isDraggingThisEntry = Boolean(draggingFilePath && draggingFilePath === normalizedEntryPath);
@@ -1120,32 +1120,32 @@ function FileTreeNode({
   const childEntries = directoryEntries[directoryPath] || [];
   const directoryState = directoryStates[directoryPath] || "idle";
   const directoryError = directoryErrors[directoryPath] || "";
-  const gitStatus = normalizeGitStatus(entry.gitStatus);
+  const gitStatus = normalizeGitStatus(entry.git_status);
   const gitStatusName = getGitStatusName(gitStatus);
   const fileIconMeta = isDirectory
     ? {
       codicon: isExpanded ? "codicon-folder-opened" : "codicon-folder",
       tone: "folder",
     }
-    : getFileIconMeta(entry.relativePath || entry.name);
-  const fileTypeLabel = isDirectory ? "Folder" : getFileLanguage(entry.relativePath || entry.name);
+    : getFileIconMeta(entry.relative_path || entry.name);
+  const fileTypeLabel = isDirectory ? "Folder" : getFileLanguage(entry.relative_path || entry.name);
   const getWorkspaceFilePayload = () => {
-    const relativePath = normalizeWorkspaceRelativePath(entry.relativePath || entry.name || "");
+    const relativePath = normalizeWorkspaceRelativePath(entry.relative_path || entry.name || "");
     const absolutePath = joinWorkspaceFilePath(workspaceRoot, relativePath);
     return {
       absolutePath,
       payload: {
         kind: entry.kind || "file",
-        mountId: entry.mountId || "",
+        mount_id: entry.mount_id || "",
         name: getExplorerFileName(relativePath),
         path: absolutePath,
-        projectRelativePath: entry.projectRelativePath || "",
-        projectRoot: entry.projectRoot || "",
-        relativePath,
-        workspaceId: workspaceId || "",
-        workspaceRoot: workspaceRoot || "",
+        project_relative_path: entry.project_relative_path || "",
+        project_root: entry.project_root || "",
+        relative_path: relativePath,
+        workspace_id: workspaceId || "",
+        workspace_root: workspaceRoot || "",
       },
-      relativePath,
+      relative_path: relativePath,
     };
   };
 
@@ -1166,7 +1166,7 @@ function FileTreeNode({
         as={isRenaming ? "div" : "button"}
         data-drop-target={isDropTarget || undefined}
         data-git-status={gitStatus || undefined}
-        data-selected={!isDirectory && selectedFilePath === entry.relativePath}
+        data-selected={!isDirectory && selectedFilePath === entry.relative_path}
         draggable={!isRenaming && !isRootEntry}
         onContextMenu={(event) => {
           event.preventDefault();
@@ -1202,7 +1202,7 @@ function FileTreeNode({
         }}
         onDrop={(event) => {
           const droppedPayload = getWorkspaceDragPayloadFromDataTransfer(event.dataTransfer);
-          const droppedPath = normalizeWorkspaceRelativePath(draggingFilePath || droppedPayload?.relativePath || "");
+          const droppedPath = normalizeWorkspaceRelativePath(draggingFilePath || droppedPayload?.relative_path || "");
           if (!isDirectory || !onMoveEntry || !droppedPath || isDraggingThisEntry) {
             return;
           }
@@ -1226,14 +1226,14 @@ function FileTreeNode({
             return;
           }
 
-          const { absolutePath, payload, relativePath } = getWorkspaceFilePayload();
+          const { absolutePath, payload, relative_path: relativePath } = getWorkspaceFilePayload();
           const rect = event.currentTarget.getBoundingClientRect();
           filePointerDragRef.current = {
             absolutePath,
             payload,
             pointerId: event.pointerId,
             rect,
-            relativePath,
+            relative_path: relativePath,
             startX: event.clientX,
             startY: event.clientY,
           };
@@ -1259,7 +1259,7 @@ function FileTreeNode({
             dropTargetPath: null,
             entry,
             isWorkspaceDragActive: true,
-            relativePath: drag.relativePath,
+            relative_path: drag.relative_path,
           });
           onBeginWorkspaceFileDrag?.({
             clientX: event.clientX,
@@ -1277,8 +1277,8 @@ function FileTreeNode({
             hasAbsolutePath: Boolean(drag.absolutePath),
             name: drag.payload.name,
             path: drag.absolutePath,
-            relativePath: drag.relativePath,
-            workspaceId: workspaceId || "",
+            relative_path: drag.relative_path,
+            workspace_id: workspaceId || "",
           });
         }}
         onPointerUp={(event) => {
@@ -1301,8 +1301,8 @@ function FileTreeNode({
           fileDragDebugRef.current.lastLogAt = now;
           logFileDragDiagnosticEvent("fileviewer.drag_move", {
             ...diagnostic,
-            relativePath: normalizeWorkspaceRelativePath(entry.relativePath || entry.name || ""),
-            workspaceId: workspaceId || "",
+            relative_path: normalizeWorkspaceRelativePath(entry.relative_path || entry.name || ""),
+            workspace_id: workspaceId || "",
           });
         }}
         onDragStart={(event) => {
@@ -1310,18 +1310,18 @@ function FileTreeNode({
             return;
           }
 
-          const relativePath = normalizeWorkspaceRelativePath(entry.relativePath || entry.name || "");
+          const relativePath = normalizeWorkspaceRelativePath(entry.relative_path || entry.name || "");
           const absolutePath = joinWorkspaceFilePath(workspaceRoot, relativePath);
           const payload = {
             kind: entry.kind || "file",
-            mountId: entry.mountId || "",
+            mount_id: entry.mount_id || "",
             name: getExplorerFileName(relativePath),
             path: absolutePath,
-            projectRelativePath: entry.projectRelativePath || "",
-            projectRoot: entry.projectRoot || "",
-            relativePath,
-            workspaceId: workspaceId || "",
-            workspaceRoot: workspaceRoot || "",
+            project_relative_path: entry.project_relative_path || "",
+            project_root: entry.project_root || "",
+            relative_path: relativePath,
+            workspace_id: workspaceId || "",
+            workspace_root: workspaceRoot || "",
           };
           event.dataTransfer.effectAllowed = "copyMove";
           event.dataTransfer.setData(WORKSPACE_FILE_DRAG_MIME, JSON.stringify(payload));
@@ -1331,13 +1331,13 @@ function FileTreeNode({
             dropTargetPath: null,
             entry,
             isWorkspaceDragActive: true,
-            relativePath,
+            relative_path: relativePath,
           });
           const logWindowDragEvent = (phase) => (windowEvent) => {
             logFileDragDiagnosticEvent(phase, {
               ...getFileDragPointDiagnostic(windowEvent),
-              relativePath,
-              workspaceId: workspaceId || "",
+              relative_path: relativePath,
+              workspace_id: workspaceId || "",
             });
           };
           const windowDragOverListener = logWindowDragEvent("fileviewer.window_drag_over_capture");
@@ -1355,8 +1355,8 @@ function FileTreeNode({
             hasAbsolutePath: Boolean(absolutePath),
             name: payload.name,
             path: absolutePath,
-            relativePath,
-            workspaceId: workspaceId || "",
+            relative_path: relativePath,
+            workspace_id: workspaceId || "",
           });
         }}
         onDragEnd={(event) => {
@@ -1364,8 +1364,8 @@ function FileTreeNode({
           logFileDragDiagnosticEvent("fileviewer.drag_end", {
             ...getFileDragPointDiagnostic(event),
             lastPoint: fileDragDebugRef.current.lastPoint,
-            relativePath: normalizeWorkspaceRelativePath(entry.relativePath || entry.name || ""),
-            workspaceId: workspaceId || "",
+            relative_path: normalizeWorkspaceRelativePath(entry.relative_path || entry.name || ""),
+            workspace_id: workspaceId || "",
           });
           window.setTimeout(() => {
             clearActiveWorkspaceFileDrag();
@@ -1373,11 +1373,11 @@ function FileTreeNode({
               dropTargetPath: null,
               entry: null,
               isWorkspaceDragActive: false,
-              relativePath: "",
+              relative_path: "",
             });
             logFileDragDiagnosticEvent("fileviewer.drag_end_clear", {
-              relativePath: normalizeWorkspaceRelativePath(entry.relativePath || entry.name || ""),
-              workspaceId: workspaceId || "",
+              relative_path: normalizeWorkspaceRelativePath(entry.relative_path || entry.name || ""),
+              workspace_id: workspaceId || "",
             });
           }, 120);
         }}
@@ -1397,7 +1397,7 @@ function FileTreeNode({
 
           onOpenFile(entry);
         }}
-        title={entry.isProjectMount && entry.projectRoot ? entry.projectRoot : entry.relativePath || entry.name}
+        title={entry.is_project_mount && entry.project_root ? entry.project_root : entry.relative_path || entry.name}
         type={isRenaming ? undefined : "button"}
       >
         <FileDisclosure aria-hidden="true">
@@ -1469,7 +1469,7 @@ function FileTreeNode({
               entry={childEntry}
               expandedDirectories={expandedDirectories}
               isWorkspaceDragActive={isWorkspaceDragActive}
-              key={`${childEntry.kind}-${childEntry.relativePath}`}
+              key={`${childEntry.kind}-${childEntry.relative_path}`}
               onBeginWorkspaceFileDrag={onBeginWorkspaceFileDrag}
               onContextMenuEntry={onContextMenuEntry}
               onMoveEntry={onMoveEntry}
@@ -1482,8 +1482,8 @@ function FileTreeNode({
               renameDraft={renameDraft}
               renamingPath={renamingPath}
               selectedFilePath={selectedFilePath}
-              workspaceId={workspaceId}
-              workspaceRoot={workspaceRoot}
+              workspace_id={workspaceId}
+              workspace_root={workspaceRoot}
             />
           ))}
         </FileTreeChildren>
@@ -1493,10 +1493,10 @@ function FileTreeNode({
 }
 
 export default function FilesWorkspaceView({
-  defaultWorkingDirectory,
+  default_working_directory: defaultWorkingDirectory,
   onBeginWorkspaceFileDrag,
   onOpenWorkspaceSettings,
-  rootDirectory,
+  root_directory: rootDirectory,
   workspace,
   workspaceError,
 }) {
@@ -1509,7 +1509,7 @@ export default function FilesWorkspaceView({
     dropTargetPath: null,
     entry: null,
     isWorkspaceDragActive: false,
-    relativePath: "",
+    relative_path: "",
   });
   const [directoryEntries, setDirectoryEntries] = useState({});
   const [directoryStates, setDirectoryStates] = useState({});
@@ -1535,7 +1535,7 @@ export default function FilesWorkspaceView({
     dropTargetPath: null,
     entry: null,
     isWorkspaceDragActive: false,
-    relativePath: "",
+    relative_path: "",
   });
   const workspaceId = workspace?.id || "";
   const workspaceRoot = workspaceId
@@ -1563,12 +1563,12 @@ export default function FilesWorkspaceView({
   const rootEntry = useMemo(() => ({
     kind: "directory",
     name: getDirectoryName(workspaceRoot),
-    relativePath: "",
+    relative_path: "",
   }), [workspaceRoot]);
 
   const queueExplorerLayout = useCallback((layout) => {
     queueFileExplorerLayout({
-      workspaceId: fileExplorerLayoutOwner,
+      workspace_id: fileExplorerLayoutOwner,
       sizes: getFileExplorerLayoutSizes(layout, fileExplorerPanelId, filePreviewPanelId),
     });
   }, [fileExplorerLayoutOwner, fileExplorerPanelId, filePreviewPanelId]);
@@ -1595,7 +1595,7 @@ export default function FilesWorkspaceView({
     try {
       const listing = await invoke("list_workspace_directory", {
         root: workspaceRoot,
-        relativePath: directoryPath,
+        relative_path: directoryPath,
       });
       const entries = Array.isArray(listing?.entries) ? listing.entries : [];
 
@@ -1614,11 +1614,11 @@ export default function FilesWorkspaceView({
   }, [workspaceRoot]);
 
   const openFile = useCallback(async (entry) => {
-    if (!workspaceRoot || !entry?.relativePath) {
+    if (!workspaceRoot || !entry?.relative_path) {
       return;
     }
 
-    const relativePath = normalizeWorkspaceRelativePath(entry.relativePath);
+    const relativePath = normalizeWorkspaceRelativePath(entry.relative_path);
     const shouldPreviewImage = isPreviewableImageFile(relativePath);
     const requestId = fileRequestIdRef.current + 1;
     fileRequestIdRef.current = requestId;
@@ -1637,27 +1637,27 @@ export default function FilesWorkspaceView({
     try {
       const result = await invoke(shouldPreviewImage ? "read_workspace_file_image" : "read_workspace_file", {
         root: workspaceRoot,
-        relativePath,
+        relative_path: relativePath,
       });
 
       if (fileRequestIdRef.current !== requestId) {
         return;
       }
 
-      const nextGitStatus = normalizeGitStatus(result?.gitStatus || "");
+      const nextGitStatus = normalizeGitStatus(result?.git_status || "");
 
       setSelectedFile({
         ...entry,
-        gitStatus: nextGitStatus,
-        mountId: result?.mountId || entry.mountId || "",
+        git_status: nextGitStatus,
+        mount_id: result?.mount_id || entry.mount_id || "",
         size: result?.size ?? entry.size,
-        modifiedMs: result?.modifiedMs ?? entry.modifiedMs,
-        projectRelativePath: result?.projectRelativePath || entry.projectRelativePath || "",
-        projectRoot: result?.projectRoot || entry.projectRoot || "",
+        modified_ms: result?.modified_ms ?? entry.modified_ms,
+        project_relative_path: result?.project_relative_path || entry.project_relative_path || "",
+        project_root: result?.project_root || entry.project_root || "",
       });
       setFileContent(shouldPreviewImage ? "" : result?.content || "");
-      setFileImageDataUrl(shouldPreviewImage ? result?.dataUrl || "" : "");
-      setFileImageMimeType(shouldPreviewImage ? result?.mimeType || "" : "");
+      setFileImageDataUrl(shouldPreviewImage ? result?.data_url || "" : "");
+      setFileImageMimeType(shouldPreviewImage ? result?.mime_type || "" : "");
       setFileState("ready");
     } catch (error) {
       if (fileRequestIdRef.current !== requestId) {
@@ -1672,8 +1672,8 @@ export default function FilesWorkspaceView({
   useEffect(() => {
     const handleWorkspaceFileOpen = (event) => {
       const detail = event?.detail || {};
-      const targetWorkspaceId = String(detail.workspaceId || "").trim();
-      const relativePath = String(detail.relativePath || "")
+      const targetWorkspaceId = String(detail.workspace_id || "").trim();
+      const relativePath = String(detail.relative_path || "")
         .trim()
         .replace(/\\/g, "/")
         .replace(/^\/+/, "");
@@ -1685,7 +1685,7 @@ export default function FilesWorkspaceView({
       openFile({
         kind: "file",
         name: getExplorerFileName(relativePath),
-        relativePath,
+        relative_path: relativePath,
       });
       event.preventDefault?.();
     };
@@ -1695,7 +1695,7 @@ export default function FilesWorkspaceView({
   }, [openFile, workspaceId]);
 
   const toggleDirectory = useCallback((entry) => {
-    const directoryPath = entry.relativePath || "";
+    const directoryPath = entry.relative_path || "";
     const shouldExpand = !expandedDirectories[directoryPath];
 
     setExpandedDirectories((directories) => ({
@@ -1775,7 +1775,7 @@ export default function FilesWorkspaceView({
   }, []);
 
   const handlePathOperationPreview = useCallback((sourcePath, targetPath = "") => {
-    const selectedPath = normalizeWorkspaceRelativePath(selectedFile?.relativePath || "");
+    const selectedPath = normalizeWorkspaceRelativePath(selectedFile?.relative_path || "");
     const safeSourcePath = normalizeWorkspaceRelativePath(sourcePath);
     const safeTargetPath = normalizeWorkspaceRelativePath(targetPath);
     if (!selectedPath || !safeSourcePath || !workspaceRelativePathIsSameOrChild(selectedPath, safeSourcePath)) {
@@ -1795,7 +1795,7 @@ export default function FilesWorkspaceView({
       openFile({
         ...selectedFile,
         name: getExplorerFileName(nextPath),
-        relativePath: nextPath,
+        relative_path: nextPath,
       });
       return;
     }
@@ -1829,7 +1829,7 @@ export default function FilesWorkspaceView({
   }, []);
 
   const startRenameEntry = useCallback((entry) => {
-    const relativePath = normalizeWorkspaceRelativePath(entry?.relativePath || "");
+    const relativePath = normalizeWorkspaceRelativePath(entry?.relative_path || "");
     if (!relativePath) return;
     closeFileContextMenu();
     setFileOperationError("");
@@ -1856,11 +1856,11 @@ export default function FilesWorkspaceView({
     setFileOperationError("");
     try {
       const result = await invoke("rename_workspace_entry", {
-        newName: nextName,
-        relativePath,
+        new_name: nextName,
+        relative_path: relativePath,
         root: workspaceRoot,
       });
-      const targetPath = normalizeWorkspaceRelativePath(result?.targetRelativePath || "");
+      const targetPath = normalizeWorkspaceRelativePath(result?.target_relative_path || "");
       cancelRenameEntry();
       rebaseExpandedDirectories(relativePath, targetPath);
       refreshOperationFolders(relativePath, targetPath);
@@ -1881,7 +1881,7 @@ export default function FilesWorkspaceView({
   ]);
 
   const deleteEntry = useCallback(async (entry) => {
-    const relativePath = normalizeWorkspaceRelativePath(entry?.relativePath || "");
+    const relativePath = normalizeWorkspaceRelativePath(entry?.relative_path || "");
     if (!relativePath) return;
     closeFileContextMenu();
     const label = entry?.kind === "directory" ? "folder" : "file";
@@ -1891,7 +1891,7 @@ export default function FilesWorkspaceView({
     setFileOperationError("");
     try {
       await invoke("delete_workspace_entry", {
-        relativePath,
+        relative_path: relativePath,
         root: workspaceRoot,
       });
       rebaseExpandedDirectories(relativePath, "");
@@ -1916,22 +1916,22 @@ export default function FilesWorkspaceView({
     setFileOperationError("");
     try {
       const result = await invoke("move_workspace_entry", {
-        relativePath: safeRelativePath,
+        relative_path: safeRelativePath,
         root: workspaceRoot,
-        targetDirectory: safeTargetDirectory,
+        target_directory: safeTargetDirectory,
       });
-      const targetPath = normalizeWorkspaceRelativePath(result?.targetRelativePath || "");
+      const targetPath = normalizeWorkspaceRelativePath(result?.target_relative_path || "");
       internalFileDragRef.current = {
         dropTargetPath: null,
         entry: null,
         isWorkspaceDragActive: false,
-        relativePath: "",
+        relative_path: "",
       };
       setInternalFileDrag({
         dropTargetPath: null,
         entry: null,
         isWorkspaceDragActive: false,
-        relativePath: "",
+        relative_path: "",
       });
       rebaseExpandedDirectories(safeRelativePath, targetPath);
       refreshOperationFolders(safeRelativePath, targetPath);
@@ -2011,13 +2011,13 @@ export default function FilesWorkspaceView({
       dropTargetPath: null,
       entry: null,
       isWorkspaceDragActive: false,
-      relativePath: "",
+      relative_path: "",
     };
     setInternalFileDrag({
       dropTargetPath: null,
       entry: null,
       isWorkspaceDragActive: false,
-      relativePath: "",
+      relative_path: "",
     });
     fileRequestIdRef.current += 1;
 
@@ -2083,29 +2083,29 @@ export default function FilesWorkspaceView({
     };
   }, [closeFileContextMenu, fileContextMenu]);
 
-  const selectedGitStatus = normalizeGitStatus(selectedFile?.gitStatus);
+  const selectedGitStatus = normalizeGitStatus(selectedFile?.git_status);
   const selectedGitStatusName = getGitStatusName(selectedGitStatus);
   const selectedFileIconMeta = selectedFile
-    ? getFileIconMeta(selectedFile.relativePath || selectedFile.name)
+    ? getFileIconMeta(selectedFile.relative_path || selectedFile.name)
     : { codicon: "codicon-file", tone: "file" };
   const selectedFileIsImagePreview = Boolean(
     selectedFile
     && fileImageDataUrl
-    && isPreviewableImageFile(selectedFile.relativePath || selectedFile.name),
+    && isPreviewableImageFile(selectedFile.relative_path || selectedFile.name),
   );
   const highlightedFileHtml = useMemo(
-    () => (fileState === "ready" ? getHighlightedFileHtml(fileContent, selectedFile?.relativePath) : ""),
-    [fileContent, fileState, selectedFile?.relativePath],
+    () => (fileState === "ready" ? getHighlightedFileHtml(fileContent, selectedFile?.relative_path) : ""),
+    [fileContent, fileState, selectedFile?.relative_path],
   );
-  const selectedPrismLanguage = getPrismLanguage(selectedFile?.relativePath || "");
+  const selectedPrismLanguage = getPrismLanguage(selectedFile?.relative_path || "");
   const diffLines = useMemo(() => getDiffLines(fileDiff), [fileDiff]);
   const inlineReview = useMemo(
     () => getInlineReviewModel({
       content: fileContent,
       diff: fileDiff,
-      relativePath: selectedFile?.relativePath || "",
+      relative_path: selectedFile?.relative_path || "",
     }),
-    [fileContent, fileDiff, selectedFile?.relativePath],
+    [fileContent, fileDiff, selectedFile?.relative_path],
   );
   const shouldShowDiff = selectedGitStatus === "modified" && !selectedFileIsImagePreview;
   const effectivePreviewMode = shouldShowDiff ? filePreviewMode : "file";
@@ -2138,7 +2138,7 @@ export default function FilesWorkspaceView({
     return () => {
       resizeObserver.disconnect();
     };
-  }, [effectivePreviewMode, selectedFile?.relativePath]);
+  }, [effectivePreviewMode, selectedFile?.relative_path]);
 
   const scrollToReviewMarker = useCallback((event, options = {}) => {
     const markers = inlineReview.markers;
@@ -2275,7 +2275,7 @@ export default function FilesWorkspaceView({
                   directoryEntries={directoryEntries}
                   directoryErrors={directoryErrors}
                   directoryStates={directoryStates}
-                  draggingFilePath={internalFileDrag.relativePath}
+                  draggingFilePath={internalFileDrag.relative_path}
                   entry={rootEntry}
                   expandedDirectories={expandedDirectories}
                   isWorkspaceDragActive={internalFileDrag.isWorkspaceDragActive}
@@ -2290,9 +2290,9 @@ export default function FilesWorkspaceView({
                   onToggleDirectory={toggleDirectory}
                   renameDraft={renameDraft}
                   renamingPath={renamingPath}
-                  selectedFilePath={selectedFile?.relativePath || ""}
-                  workspaceId={workspaceId}
-                  workspaceRoot={workspaceRoot}
+                  selectedFilePath={selectedFile?.relative_path || ""}
+                  workspace_id={workspaceId}
+                  workspace_root={workspaceRoot}
                 />
               ) : (
                 <FileTreeEmpty>Set a workspace directory in settings.</FileTreeEmpty>
@@ -2317,7 +2317,7 @@ export default function FilesWorkspaceView({
                 data-git-status={selectedGitStatus || undefined}
               >
                 <span aria-hidden="true" className={`codicon ${selectedFileIconMeta.codicon}`} />
-                <span>{selectedFile ? getExplorerFileName(selectedFile.relativePath) : "No file selected"}</span>
+                <span>{selectedFile ? getExplorerFileName(selectedFile.relative_path) : "No file selected"}</span>
               </FilePreviewTitle>
               {selectedFile && (
                 <FilePreviewMeta>
@@ -2345,15 +2345,15 @@ export default function FilesWorkspaceView({
                     </FileGitStatusPill>
                   )}
                   <FileMetaPill>
-                    {getFileLanguage(selectedFile.relativePath)}
+                    {getFileLanguage(selectedFile.relative_path)}
                     {formatFileSize(selectedFile.size) ? ` / ${formatFileSize(selectedFile.size)}` : ""}
                   </FileMetaPill>
                 </FilePreviewMeta>
               )}
             </FilePreviewHeader>
 
-            <FilePreviewPath data-git-status={selectedGitStatus || undefined} title={selectedFile?.relativePath || ""}>
-              {selectedFile?.relativePath || " "}
+            <FilePreviewPath data-git-status={selectedGitStatus || undefined} title={selectedFile?.relative_path || ""}>
+              {selectedFile?.relative_path || " "}
             </FilePreviewPath>
 
             <FileContentFrame data-state={fileState}>
@@ -2432,7 +2432,7 @@ export default function FilesWorkspaceView({
                   ) : selectedFileIsImagePreview ? (
                     <FileImagePreviewSurface aria-label="Selected image preview">
                       <FileImagePreviewImage
-                        alt={getExplorerFileName(selectedFile?.relativePath || selectedFile?.name || "Image preview")}
+                        alt={getExplorerFileName(selectedFile?.relative_path || selectedFile?.name || "Image preview")}
                         draggable={false}
                         src={fileImageDataUrl}
                         title={fileImageMimeType || undefined}
@@ -2466,7 +2466,7 @@ export default function FilesWorkspaceView({
           onPointerDown={(event) => event.stopPropagation()}
         >
           <FileContextMenuItem
-            disabled={!fileContextMenu.entry?.relativePath}
+            disabled={!fileContextMenu.entry?.relative_path}
             onClick={() => startRenameEntry(fileContextMenu.entry)}
             role="menuitem"
             type="button"
@@ -2475,7 +2475,7 @@ export default function FilesWorkspaceView({
           </FileContextMenuItem>
           <FileContextMenuItem
             data-danger="true"
-            disabled={!fileContextMenu.entry?.relativePath}
+            disabled={!fileContextMenu.entry?.relative_path}
             onClick={() => deleteEntry(fileContextMenu.entry)}
             role="menuitem"
             type="button"

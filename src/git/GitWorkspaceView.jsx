@@ -66,11 +66,11 @@ function shortSha(value) {
 }
 
 function repoLabel(repo) {
-  return text(repo?.relativePath) || text(repo?.name, "Repository");
+  return text(repo?.relative_path) || text(repo?.name, "Repository");
 }
 
 function repoMeta(repo) {
-  const parts = [text(repo?.branch), shortSha(repo?.headSha)];
+  const parts = [text(repo?.branch), shortSha(repo?.head_sha)];
   const ahead = numberValue(repo?.ahead);
   const behind = numberValue(repo?.behind);
   if (ahead || behind) parts.push(`${ahead} ahead / ${behind} behind`);
@@ -78,7 +78,7 @@ function repoMeta(repo) {
 }
 
 function repoChangeSummary(repo) {
-  const counts = repo?.statusCounts || {};
+  const counts = repo?.status_counts || {};
   const total = numberValue(counts.total);
   if (!total) return "Clean";
   const parts = [];
@@ -117,7 +117,7 @@ function repositoryPreloadLoadingStale(preload, nowMs = Date.now()) {
   if (!preload || preload.state !== "loading") {
     return false;
   }
-  const requestedAtMs = numberValue(preload.requestedAtMs || preload.generatedAtMs);
+  const requestedAtMs = numberValue(preload.requestedAtMs || preload.generated_at_ms);
   return requestedAtMs > 0 && nowMs - requestedAtMs >= REPOSITORY_PRELOAD_LOADING_STALE_MS;
 }
 
@@ -463,7 +463,7 @@ export default function GitWorkspaceView({
   onRefreshRepositories = null,
   onRefreshSnapshot = null,
   repositoriesPreload = null,
-  rootDirectory = "",
+  root_directory: rootDirectory = "",
   snapshotsPreload = null,
   workspace = null,
   workspaceError = "",
@@ -494,13 +494,13 @@ export default function GitWorkspaceView({
   const workspaceId = workspace?.id || "";
   const preloadMatches = Boolean(
     repositoriesPreload
-      && repositoriesPreload.workspaceId === workspaceId
-      && workspaceRootDirectoryMatches(repositoriesPreload.rootDirectory, rootDirectory),
+      && repositoriesPreload.workspace_id === workspaceId
+      && workspaceRootDirectoryMatches(repositoriesPreload.root_directory, rootDirectory),
   );
   const snapshotsPreloadMatches = Boolean(
     snapshotsPreload
-      && snapshotsPreload.workspaceId === workspaceId
-      && workspaceRootDirectoryMatches(snapshotsPreload.rootDirectory, rootDirectory)
+      && snapshotsPreload.workspace_id === workspaceId
+      && workspaceRootDirectoryMatches(snapshotsPreload.root_directory, rootDirectory)
       && snapshotsPreload.snapshots
       && typeof snapshotsPreload.snapshots === "object",
   );
@@ -512,10 +512,10 @@ export default function GitWorkspaceView({
     snapshotsPreload?.state || "",
     selectedSnapshotEntry?.state || "",
     selectedSnapshotEntry?.error || "",
-    Number(selectedSnapshotEntry?.generatedAtMs) || 0,
+    Number(selectedSnapshotEntry?.generated_at_ms) || 0,
     Number(selectedSnapshotEntry?.repositoryGeneratedAtMs) || 0,
-    Number(selectedSnapshotEntry?.snapshot?.generatedAtMs) || 0,
-    selectedSnapshotEntry?.snapshot?.repo?.headSha || "",
+    Number(selectedSnapshotEntry?.snapshot?.generated_at_ms) || 0,
+    selectedSnapshotEntry?.snapshot?.repo?.head_sha || "",
     Array.isArray(selectedSnapshotEntry?.snapshot?.history) ? selectedSnapshotEntry.snapshot.history.length : -1,
     Array.isArray(selectedSnapshotEntry?.snapshot?.status?.files) ? selectedSnapshotEntry.snapshot.status.files.length : -1,
   ].join(":");
@@ -523,7 +523,7 @@ export default function GitWorkspaceView({
     repositoriesPreload?.checkKey || "",
     repositoriesPreload?.state || "",
     Number(repositoriesPreload?.requestedAtMs) || 0,
-    Number(repositoriesPreload?.generatedAtMs) || 0,
+    Number(repositoriesPreload?.generated_at_ms) || 0,
     Array.isArray(repositoriesPreload?.repositories) ? repositoriesPreload.repositories.length : -1,
     repositoriesPreload?.error || "",
   ].join(":");
@@ -555,7 +555,7 @@ export default function GitWorkspaceView({
       passLanes: [],
     };
   }, [historyGraph]);
-  const operationBlocked = snapshot?.operationState && snapshot.operationState.clean === false;
+  const operationBlocked = snapshot?.operation_state && snapshot.operation_state.clean === false;
   const hasChanges = changedFiles.length > 0;
   const commitBusy = commitState === "generating" || commitState === "committing";
   const canCommit = Boolean(hasChanges && !operationBlocked && commitMessage.trim() && !commitBusy);
@@ -573,15 +573,15 @@ export default function GitWorkspaceView({
       const result = typeof onRefreshSnapshot === "function"
         ? await onRefreshSnapshot({
           refresh: options.refresh === true,
-          repoPath,
-          rootDirectory,
+          repo_path: repoPath,
+          root_directory: rootDirectory,
           snapshot: options.snapshot || null,
-          repositoryGeneratedAtMs: Number(repositoriesPreload?.generatedAtMs) || 0,
-          workspaceId,
-          workspaceName: workspace?.name || "",
+          repositoryGeneratedAtMs: Number(repositoriesPreload?.generated_at_ms) || 0,
+          workspace_id: workspaceId,
+          workspace_name: workspace?.name || "",
         })
         : {
-          snapshot: options.snapshot || await invoke("workspace_git_snapshot", { repoPath }),
+          snapshot: options.snapshot || await invoke("workspace_git_snapshot", { repo_path: repoPath }),
         };
       const nextSnapshot = result?.snapshot || options.snapshot || null;
       setSnapshot(nextSnapshot);
@@ -594,7 +594,7 @@ export default function GitWorkspaceView({
     }
   }, [
     onRefreshSnapshot,
-    repositoriesPreload?.generatedAtMs,
+    repositoriesPreload?.generated_at_ms,
     rootDirectory,
     workspace?.name,
     workspaceId,
@@ -607,20 +607,20 @@ export default function GitWorkspaceView({
     if (typeof onRefreshRepositories === "function") {
       return onRefreshRepositories({
         refresh: options.refresh === true,
-        rootDirectory,
-        workspaceId,
-        workspaceName: workspace?.name || "",
+        root_directory: rootDirectory,
+        workspace_id: workspaceId,
+        workspace_name: workspace?.name || "",
       });
     }
     // No parent preload plumbing on this render path (defensive): load
     // directly so the Git tab can never sit in "Loading repositories..."
     // waiting for a preload prop that will never arrive.
     const response = await invoke("workspace_git_pull_candidates", {
-      repoPath: rootDirectory,
-      workspaceId,
-      workspaceName: workspace?.name || "",
+      repo_path: rootDirectory,
+      workspace_id: workspaceId,
+      workspace_name: workspace?.name || "",
       refresh: options.refresh === true,
-      fetchRemote: false,
+      fetch_remote: false,
     });
     const nextRepositories = Array.isArray(response?.repositories)
       ? response.repositories.filter((repo) => repo && repo.path)
@@ -652,7 +652,7 @@ export default function GitWorkspaceView({
     setInitializeRepositoryState("running");
     setRepositoriesError("");
     try {
-      await invoke("workspace_initialize_git", { repoPath: rootDirectory });
+      await invoke("workspace_initialize_git", { repo_path: rootDirectory });
       if (typeof onRefreshRepositories === "function") {
         setRepositoriesState("loading");
         await refreshRepositories({ refresh: true });
@@ -674,7 +674,7 @@ export default function GitWorkspaceView({
     if (!preloadMatches || !repositoriesPreload || repositoriesPreload.state !== "loading") {
       return undefined;
     }
-    const requestedAtMs = numberValue(repositoriesPreload.requestedAtMs || repositoriesPreload.generatedAtMs);
+    const requestedAtMs = numberValue(repositoriesPreload.requestedAtMs || repositoriesPreload.generated_at_ms);
     if (!requestedAtMs || repositoryPreloadLoadingStale(repositoriesPreload)) {
       return undefined;
     }
@@ -829,7 +829,7 @@ export default function GitWorkspaceView({
     let cancelled = false;
     setCommitState("generating");
     setCommitError("");
-    invoke("workspace_git_generate_commit_message", { repoPath: selectedRepoPath })
+    invoke("workspace_git_generate_commit_message", { repo_path: selectedRepoPath })
       .then((result) => {
         if (cancelled) return;
         const generated = text(result?.summary || result?.message);
@@ -869,7 +869,7 @@ export default function GitWorkspaceView({
       const result = await invoke("workspace_git_commit_and_push", {
         message: commitMessage,
         push: true,
-        repoPath: selectedRepoPath,
+        repo_path: selectedRepoPath,
       });
       if (result?.snapshot) {
         await loadSnapshot(selectedRepoPath, { snapshot: result.snapshot });
@@ -878,8 +878,8 @@ export default function GitWorkspaceView({
       }
       setCommitMessage("");
       setCommitNotice(result?.pushed
-        ? `Committed and pushed ${shortSha(result?.commitSha)}.`
-        : `Committed ${shortSha(result?.commitSha)}.${result?.pushError ? ` Push failed: ${result.pushError}` : ""}`);
+        ? `Committed and pushed ${shortSha(result?.commit_sha)}.`
+        : `Committed ${shortSha(result?.commit_sha)}.${result?.push_error ? ` Push failed: ${result.push_error}` : ""}`);
       await refreshRepositories({ refresh: true });
     } catch (error) {
       setCommitError(error?.message || String(error || "Unable to commit and push."));
@@ -1073,7 +1073,7 @@ export default function GitWorkspaceView({
         <GitBody>
           {operationBlocked && (
             <GitNotice data-state="warning">
-              Repository is in {snapshot.operationState.state} state. Resolve it before committing from Diff Forge.
+              Repository is in {snapshot.operation_state.state} state. Resolve it before committing from Diff Forge.
             </GitNotice>
           )}
 
@@ -1137,8 +1137,8 @@ export default function GitWorkspaceView({
                           return (
                             <GitFileItem
                               data-git-status={gitStatus}
-                              key={`${file.code}:${file.path}:${file.oldPath || ""}`}
-                              title={file.oldPath ? `${file.oldPath} -> ${file.path}` : file.path}
+                              key={`${file.code}:${file.path}:${file.old_path || ""}`}
+                              title={file.old_path ? `${file.old_path} -> ${file.path}` : file.path}
                             >
                               <GitFileIcon data-file-tone={icon.tone} data-git-status={gitStatus}>
                                 {icon.label ? (
@@ -1176,7 +1176,7 @@ export default function GitWorkspaceView({
                       data-active={active ? "true" : undefined}
                       aria-expanded={active}
                       onClick={() => toggleHistoryKey(commit.sha)}
-                      title={[commit.subject, commit.authorName, commit.date].filter(Boolean).join(" — ")}
+                      title={[commit.subject, commit.author_name, commit.date].filter(Boolean).join(" — ")}
                       type="button"
                     >
                       <HistoryGraphCell maxLanes={historyGraph.maxLanes} row={renderRow} />
@@ -1184,9 +1184,9 @@ export default function GitWorkspaceView({
                         <strong>{commit.subject}</strong>
                       </HistoryCommitLine>
                       <HistoryMeta>
-                        {commit.authorName ? <em>{commit.authorName}</em> : null}
+                        {commit.author_name ? <em>{commit.author_name}</em> : null}
                         {relativeTime ? <span>{relativeTime}</span> : null}
-                        <code>{commit.shortSha || shortSha(commit.sha)}</code>
+                        <code>{commit.short_sha || shortSha(commit.sha)}</code>
                       </HistoryMeta>
                       <HistoryToggleIcon aria-hidden="true" data-open={active ? "true" : undefined}>›</HistoryToggleIcon>
                     </HistoryButton>
@@ -1200,7 +1200,7 @@ export default function GitWorkspaceView({
                             <GitFileItem
                               data-git-status={gitStatus}
                               key={`${commit.sha}:${file.path}:${index}`}
-                              title={file.oldPath ? `${file.oldPath} -> ${file.path}` : file.path}
+                              title={file.old_path ? `${file.old_path} -> ${file.path}` : file.path}
                             >
                               <GitFileIcon data-file-tone={icon.tone} data-git-status={gitStatus}>
                                 {icon.label ? (

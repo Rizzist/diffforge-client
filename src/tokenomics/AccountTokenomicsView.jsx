@@ -91,7 +91,7 @@ const TOKENOMICS_PROVIDER_ACCOUNT_FILTER_NONE = "__none__";
 
 const AGENT_ACCOUNTS_CHANGED_EVENT = "agent-accounts-changed";
 
-function scheduleTokenomicsIdleTask(callback, { delayMs = 0, timeout = 1200 } = {}) {
+function scheduleTokenomicsIdleTask(callback, { delay_ms: delayMs = 0, timeout = 1200 } = {}) {
   if (typeof window === "undefined") {
     callback();
     return () => {};
@@ -470,13 +470,13 @@ function useAgentAccountsState(active = true) {
 
 function tokenomicsAgentCredentialProfileSignature(profile = {}) {
   const identity = profile?.identity || {};
-  const authStatus = profile?.authStatus || {};
+  const authStatus = profile?.auth_status || {};
   return [
     String(profile?.id || "").trim(),
-    profile?.isActive ? "active" : "inactive",
+    profile?.is_active ? "active" : "inactive",
     normalizeTokenomicsEmail(identity?.email || profile?.email),
-    identity?.authReady ? "auth-ready" : "auth-missing",
-    authStatus?.needsLogin ? "needs-login" : "login-ok",
+    identity?.auth_ready ? "auth-ready" : "auth-missing",
+    authStatus?.needs_login ? "needs-login" : "login-ok",
     String(authStatus?.reason || "").trim(),
   ].join("~");
 }
@@ -491,7 +491,7 @@ function tokenomicsAgentCredentialSignature(agentAccounts) {
       .sort();
     return [
       providerId,
-      String(entry?.activeProfileId || "").trim(),
+      String(entry?.active_profile_id || "").trim(),
       profileParts.join("|"),
     ].join(":");
   }).join("||");
@@ -513,17 +513,17 @@ function collapseAgentProfilesByEmail(profiles = []) {
       continue;
     }
     if (
-      profile?.isActive
-      && !existing.isDefault
-      && !existing.isActive
+      profile?.is_active
+      && !existing.is_default
+      && !existing.is_active
     ) {
       const index = visible.indexOf(existing);
       const merged = { ...profile, alias: profile.alias || existing.alias };
       if (index >= 0) visible[index] = merged;
       byEmail.set(email, merged);
-    } else if (profile?.isActive && existing.isDefault && !existing.isActive) {
+    } else if (profile?.is_active && existing.is_default && !existing.is_active) {
       const index = visible.indexOf(existing);
-      const merged = { ...existing, isActive: true, alias: existing.alias || profile.alias };
+      const merged = { ...existing, is_active: true, alias: existing.alias || profile.alias };
       if (index >= 0) visible[index] = merged;
       byEmail.set(email, merged);
     }
@@ -587,7 +587,7 @@ function AgentAccountsManager({ active = true }) {
 
   const setActive = useCallback((kind, profileId) => {
     setActionError("");
-    invoke("agent_accounts_set_active", { agentKind: kind, profileId })
+    invoke("agent_accounts_set_active", { agent_kind: kind, profile_id: profileId })
       .then(refresh)
       .catch((error) => setActionError(String(error?.message || error || "Unable to switch account.")));
   }, [refresh]);
@@ -607,7 +607,7 @@ function AgentAccountsManager({ active = true }) {
 
   const beginProfileLogin = useCallback((kind, profileId) => {
     setActionError("");
-    invoke("agent_accounts_start_profile_login", { agentKind: kind, profileId }).then(() => {
+    invoke("agent_accounts_start_profile_login", { agent_kind: kind, profile_id: profileId }).then(() => {
       setLoginPendingKind(kind);
       if (loginPendingTimerRef.current) {
         window.clearTimeout(loginPendingTimerRef.current);
@@ -629,7 +629,7 @@ function AgentAccountsManager({ active = true }) {
     }
     setConfirmDeleteKey("");
     setActionError("");
-    invoke("agent_accounts_remove", { agentKind: kind, profileId })
+    invoke("agent_accounts_remove", { agent_kind: kind, profile_id: profileId })
       .then(refresh)
       .catch((error) => setActionError(String(error?.message || error || "Unable to delete account.")));
   }, [confirmDeleteKey, refresh]);
@@ -641,8 +641,8 @@ function AgentAccountsManager({ active = true }) {
     }
     setActionError("");
     invoke("agent_accounts_update_display", {
-      agentKind: editing.kind,
-      profileId: editing.profileId,
+      agent_kind: editing.kind,
+      profile_id: editing.profile_id,
       alias: editing.alias,
     }).then(() => {
       setEditing(null);
@@ -690,38 +690,38 @@ function AgentAccountsManager({ active = true }) {
                   // The alias HIDES the email (streaming privacy): captured
                   // pills show the alias as their name, the default pill keeps
                   // "Default" and shows the alias where the email was.
-                  const name = profile.isDefault
+                  const name = profile.is_default
                     ? (profile.label || "Default")
                     : (alias || profile.label || "Account");
-                  const detail = profile.isDefault ? (alias || email) : (alias ? "" : email);
-                  const authStatus = profile.authStatus || {};
-                  const needsLogin = Boolean(authStatus.needsLogin || (!profile.identity?.authReady && !profile.isDefault));
+                  const detail = profile.is_default ? (alias || email) : (alias ? "" : email);
+                  const authStatus = profile.auth_status || {};
+                  const needsLogin = Boolean(authStatus.needs_login || (!profile.identity?.auth_ready && !profile.is_default));
                   const canEdit = Boolean(email);
-                  const canDelete = !profile.isDefault && !profile.isActive;
+                  const canDelete = !profile.is_default && !profile.is_active;
                   const deleteArmed = confirmDeleteKey === `${kind}:${profile.id}`;
                   return (
                     <AgentAccountPill
-                      data-active={profile.isActive && !needsLogin ? "true" : "false"}
+                      data-active={profile.is_active && !needsLogin ? "true" : "false"}
                       key={profile.id}
                       onClick={() => {
                         if (needsLogin) {
                           beginProfileLogin(kind, profile.id);
                           return;
                         }
-                        if (!profile.isActive) {
+                        if (!profile.is_active) {
                           setActive(kind, profile.id);
                         }
                       }}
                       title={needsLogin
                         ? (authStatus.message || "Sign in again for this account")
-                        : profile.isActive
+                        : profile.is_active
                         ? `Active: new ${kind} terminals use this account`
                         : `Use this account for new ${kind} terminals`}
                       type="button"
                     >
                       <i
                         aria-hidden="true"
-                        data-state={needsLogin ? "needs-login" : profile.isActive ? "active" : "none"}
+                        data-state={needsLogin ? "needs-login" : profile.is_active ? "active" : "none"}
                       />
                       <span>{name}</span>
                       {detail ? <em>{detail}</em> : null}
@@ -748,7 +748,7 @@ function AgentAccountsManager({ active = true }) {
                             event.stopPropagation();
                             setEditing({
                               kind,
-                              profileId: profile.id,
+                              profile_id: profile.id,
                               name,
                               alias,
                             });
@@ -912,7 +912,7 @@ function tokenomicsProfileLabelCandidates(profile = {}, providerId = "") {
 }
 
 function tokenomicsRowAgentProfileId(row = {}) {
-  return String(row?.agent_profile_id || row?.agentProfileId || "").trim();
+  return String(row?.agent_profile_id || "").trim();
 }
 
 function tokenomicsAccountLabelScore(label, providerId = "") {
@@ -1013,17 +1013,11 @@ function storageUsageHasMeaningfulData(storageUsage) {
     raw.known === true
       || usage
       || tokenomicsObjectHasAny(raw, [
-        "totalBytes",
         "total_bytes",
-        "totalUsedBytes",
         "total_used_bytes",
-        "sqliteBytes",
         "sqlite_bytes",
-        "sqliteUsedBytes",
         "sqlite_used_bytes",
-        "assetsBytes",
         "assets_bytes",
-        "assetsUsedBytes",
         "assets_used_bytes",
       ])
   );
@@ -1045,24 +1039,20 @@ function formatStorageBytes(value) {
 function storageLimitsForPlan(planName) {
   const normalized = String(planName || "").trim().toLowerCase();
   if (normalized === "ultra") {
-    return { totalBytes: 250 * 1024 ** 3, sqliteBytes: 50 * 1024 ** 3, assetsBytes: 200 * 1024 ** 3 };
+    return { total_bytes: 250 * 1024 ** 3, sqlite_bytes: 50 * 1024 ** 3, assets_bytes: 200 * 1024 ** 3 };
   }
   if (normalized === "pro") {
-    return { totalBytes: 50 * 1024 ** 3, sqliteBytes: 15 * 1024 ** 3, assetsBytes: 35 * 1024 ** 3 };
+    return { total_bytes: 50 * 1024 ** 3, sqlite_bytes: 15 * 1024 ** 3, assets_bytes: 35 * 1024 ** 3 };
   }
   if (normalized === "plus") {
-    return { totalBytes: 10 * 1024 ** 3, sqliteBytes: 3 * 1024 ** 3, assetsBytes: 7 * 1024 ** 3 };
+    return { total_bytes: 10 * 1024 ** 3, sqlite_bytes: 3 * 1024 ** 3, assets_bytes: 7 * 1024 ** 3 };
   }
-  return { totalBytes: 0, sqliteBytes: 0, assetsBytes: 0 };
+  return { total_bytes: 0, sqlite_bytes: 0, assets_bytes: 0 };
 }
 
 function storageUsageModel(billingStatus = {}, liveStorageUsage = null) {
   const planName = String(
-    billingStatus?.planName
-      || billingStatus?.credits?.planName
-      || liveStorageUsage?.planName
-      || liveStorageUsage?.plan_name
-      || "free",
+    billingStatus?.plan_name || billingStatus?.credits?.plan_name || liveStorageUsage?.plan_name || "free",
   ).trim().toLowerCase();
   const raw = liveStorageUsage
     || billingStatus?.storage?.usage
@@ -1076,28 +1066,28 @@ function storageUsageModel(billingStatus = {}, liveStorageUsage = null) {
     || billingStatus?.user?.entitlements?.storage
     || {};
   const limits = {
-    totalBytes: storageByteValue(explicitLimits.totalBytes, explicitLimits.total_bytes, fallback.totalBytes),
-    sqliteBytes: storageByteValue(explicitLimits.sqliteBytes, explicitLimits.sqlite_bytes, fallback.sqliteBytes),
-    assetsBytes: storageByteValue(explicitLimits.assetsBytes, explicitLimits.assets_bytes, fallback.assetsBytes),
+    total_bytes: storageByteValue(explicitLimits.total_bytes, fallback.total_bytes),
+    sqlite_bytes: storageByteValue(explicitLimits.sqlite_bytes, fallback.sqlite_bytes),
+    assets_bytes: storageByteValue(explicitLimits.assets_bytes, fallback.assets_bytes),
   };
   const rows = [
     {
       key: "total",
       label: "Total",
-      used: storageByteValue(usage.totalBytes, usage.total_bytes, raw.totalUsedBytes, raw.total_used_bytes),
-      limit: limits.totalBytes,
+      used: storageByteValue(usage.total_bytes, raw.total_used_bytes),
+      limit: limits.total_bytes,
     },
     {
       key: "sqlite",
       label: "SQLite",
-      used: storageByteValue(usage.sqliteBytes, usage.sqlite_bytes, raw.sqliteUsedBytes, raw.sqlite_used_bytes),
-      limit: limits.sqliteBytes,
+      used: storageByteValue(usage.sqlite_bytes, raw.sqlite_used_bytes),
+      limit: limits.sqlite_bytes,
     },
     {
       key: "assets",
       label: "Assets",
-      used: storageByteValue(usage.assetsBytes, usage.assets_bytes, raw.assetsUsedBytes, raw.assets_used_bytes),
-      limit: limits.assetsBytes,
+      used: storageByteValue(usage.assets_bytes, raw.assets_used_bytes),
+      limit: limits.assets_bytes,
     },
   ].map((row) => ({
     ...row,
@@ -1110,7 +1100,7 @@ function storageUsageModel(billingStatus = {}, liveStorageUsage = null) {
 }
 
 function providerKey(row) {
-  const agent = String(row?.agent_kind || row?.agentKind || "").toLowerCase();
+  const agent = String(row?.agent_kind || "").toLowerCase();
   const provider = String(row?.provider || "").toLowerCase();
   if (agent.includes("codex") || provider.includes("openai") || provider.includes("codex")) return "codex";
   if (agent.includes("claude") || provider.includes("anthropic") || provider.includes("claude")) return "claude";
@@ -1136,14 +1126,14 @@ function providerAccountHeading(providerId) {
 }
 
 function rowDeviceId(row) {
-  return String(row?.device_id || row?.deviceId || row?.machine_id || row?.machineId || "").trim();
+  return String(row?.device_id || row?.machine_id || "").trim();
 }
 
 function rowScopeKey(row) {
-  const explicit = String(row?.billing_scope_key || row?.billingScopeKey || "").trim();
+  const explicit = String(row?.billing_scope_key || "").trim();
   if (explicit) return explicit;
-  const type = String(row?.billing_scope_type || row?.billingScopeType || row?.scope_type || row?.scopeType || "").trim().toLowerCase();
-  const teamId = String(row?.billing_team_id || row?.billingTeamId || row?.team_id || row?.teamId || "").trim();
+  const type = String(row?.billing_scope_type || row?.scope_type || "").trim().toLowerCase();
+  const teamId = String(row?.billing_team_id || row?.team_id || "").trim();
   if (type === "team" || teamId) return teamId ? `team:${teamId}` : "team";
   if (type === "personal") return "personal";
   return "unknown";
@@ -1153,25 +1143,16 @@ function tokenomicsDeviceIdentityRows(summary = {}) {
   const value = summary && typeof summary === "object" ? summary : {};
   return [
     ...(Array.isArray(value.device_identities) ? value.device_identities : []),
-    ...(Array.isArray(value.deviceIdentities) ? value.deviceIdentities : []),
+    ...(Array.isArray(value.device_identities) ? value.device_identities : []),
     ...(Array.isArray(value.devices) ? value.devices : []),
     ...(Array.isArray(value.device_aliases) ? value.device_aliases : []),
-    ...(Array.isArray(value.deviceAliases) ? value.deviceAliases : []),
+    ...(Array.isArray(value.device_aliases) ? value.device_aliases : []),
   ];
 }
 
 function tokenomicsDeviceIdentityLabel(identity = {}) {
   return String(
-    identity?.display_name
-      || identity?.displayName
-      || identity?.label
-      || identity?.device_name
-      || identity?.deviceName
-      || identity?.machine_name
-      || identity?.machineName
-      || identity?.hostname
-      || identity?.name
-      || "",
+    identity?.display_name || identity?.label || identity?.device_name || identity?.machine_name || identity?.hostname || identity?.name || "",
   ).trim();
 }
 
@@ -1180,13 +1161,9 @@ function tokenomicsDeviceIdentityIds(identity = {}) {
     rowDeviceId(identity),
     identity?.id,
     identity?.device_id,
-    identity?.deviceId,
     identity?.machine_id,
-    identity?.machineId,
     identity?.native_device_id,
-    identity?.nativeDeviceId,
     identity?.target_device_id,
-    identity?.targetDeviceId,
   ].map((value) => String(value || "").trim()).filter(Boolean);
 }
 
@@ -1205,7 +1182,7 @@ function tokenomicsEnsureAccountGroup(groups, providerId, email) {
   if (!group) {
     group = {
       id: groupId,
-      providerId,
+      provider_id: providerId,
       email,
       label: tokenomicsEmailLocalPart(email) || email,
       keys: new Set(),
@@ -1217,10 +1194,7 @@ function tokenomicsEnsureAccountGroup(groups, providerId, email) {
 }
 
 function tokenomicsAccountRowIsActive(row = {}) {
-  return row?.active_provider_account === true
-    || row?.activeProviderAccount === true
-    || row?.active_agent_profile === true
-    || row?.activeAgentProfile === true;
+  return row?.active_provider_account === true || row?.active_agent_profile === true;
 }
 
 function tokenomicsAddGroupKey(index, group, key, total = 0) {
@@ -1228,14 +1202,14 @@ function tokenomicsAddGroupKey(index, group, key, total = 0) {
   if (!clean || providerAccountKeyIsUnknown(clean)) return;
   group.keys.add(clean);
   group.keyTotals.set(clean, (group.keyTotals.get(clean) || 0) + Math.max(0, numeric(total)));
-  index.byKey.set(tokenomicsIndexKey(group.providerId, clean), group);
+  index.byKey.set(tokenomicsIndexKey(group.provider_id, clean), group);
 }
 
 function tokenomicsAddGroupLabel(index, group, label) {
   const normalized = normalizeProviderAccountLabel(label);
-  const stripped = normalizeTokenomicsAliasLabel(label, group.providerId);
+  const stripped = normalizeTokenomicsAliasLabel(label, group.provider_id);
   [normalized, stripped].filter(Boolean).forEach((candidate) => {
-    const key = tokenomicsIndexKey(group.providerId, candidate);
+    const key = tokenomicsIndexKey(group.provider_id, candidate);
     registerTokenomicsIdentityAlias(index.byLabel, index.ambiguousLabels, key, group);
   });
 }
@@ -1248,11 +1222,7 @@ function tokenomicsAccountRowsFromSummary(summary = {}) {
     value.forEach((row) => {
       if (row && typeof row === "object" && !Array.isArray(row)) {
         if (
-          rowProviderAccountKey(row)
-          || row?.provider_account_label
-          || row?.providerAccountLabel
-          || row?.subscription_key
-          || row?.subscriptionKey
+          rowProviderAccountKey(row) || row?.provider_account_label || row?.subscription_key
         ) {
           rows.push(row);
         }
@@ -1286,14 +1256,14 @@ function buildTokenomicsAccountIdentityIndex(agentAccounts) {
     // one as a row-matching alias when a single profile claims it.
     const displayNameCounts = new Map();
     for (const profile of profiles) {
-      const name = normalizeProviderAccountLabel(profile?.identity?.displayName);
+      const name = normalizeProviderAccountLabel(profile?.identity?.display_name);
       if (name) displayNameCounts.set(name, (displayNameCounts.get(name) || 0) + 1);
     }
     for (const profile of profiles) {
       const email = normalizeTokenomicsEmail(profile?.email || profile?.identity?.email);
       if (!email) continue;
       const group = tokenomicsEnsureAccountGroup(groups, providerId, email);
-      const label = profile?.alias || (!profile?.isDefault ? profile?.label : "") || tokenomicsEmailLocalPart(email) || email;
+      const label = profile?.alias || (!profile?.is_default ? profile?.label : "") || tokenomicsEmailLocalPart(email) || email;
       group.label = preferredTokenomicsAccountLabel(label, group.label, providerId);
       if (providerId === "claude") {
         // Claude registry labels name accounts exactly like the accounts
@@ -1319,11 +1289,11 @@ function buildTokenomicsAccountIdentityIndex(agentAccounts) {
           });
         }
       });
-      const displayName = normalizeProviderAccountLabel(profile?.identity?.displayName);
+      const displayName = normalizeProviderAccountLabel(profile?.identity?.display_name);
       if (displayName && displayNameCounts.get(displayName) === 1) {
-        tokenomicsAddGroupLabel(index, group, profile.identity.displayName);
+        tokenomicsAddGroupLabel(index, group, profile.identity.display_name);
       }
-      if (profile?.isActive) {
+      if (profile?.is_active) {
         index.activeByProvider.set(providerId, group);
       }
     }
@@ -1340,7 +1310,7 @@ function buildTokenomicsAccountIdentityIndex(agentAccounts) {
     });
   }
   for (const group of groups.values()) {
-    index.providerGroupCount.set(group.providerId, (index.providerGroupCount.get(group.providerId) || 0) + 1);
+    index.providerGroupCount.set(group.provider_id, (index.providerGroupCount.get(group.provider_id) || 0) + 1);
   }
   return groups.size ? index : null;
 }
@@ -1405,7 +1375,7 @@ function tokenomicsResolveAccountGroup(row, index) {
     if (byEmail) return byEmail;
   }
   if (index.providerGroupCount.get(providerId) === 1) {
-    return [...index.groups.values()].find((group) => group.providerId === providerId) || null;
+    return [...index.groups.values()].find((group) => group.provider_id === providerId) || null;
   }
   return null;
 }
@@ -1433,9 +1403,7 @@ function tokenomicsCanonicalizeAccountRow(row, index) {
   return {
     ...row,
     provider_account_key: canonicalKey,
-    providerAccountKey: canonicalKey,
     provider_account_label: label,
-    providerAccountLabel: label,
   };
 }
 
@@ -1450,7 +1418,7 @@ function canonicalizeTokenomicsAccountSummary(summary = {}, agentAccounts = null
       const key = rowProviderAccountKey(row);
       tokenomicsAddGroupKey(index, group, key, rowTotal(row));
       if (!group.labelPinned) {
-        group.label = preferredTokenomicsAccountLabel(rowProviderAccountLabel(row), group.label, group.providerId);
+        group.label = preferredTokenomicsAccountLabel(rowProviderAccountLabel(row), group.label, group.provider_id);
       }
       tokenomicsAddGroupLabel(index, group, rowProviderAccountLabel(row));
     });
@@ -1470,18 +1438,14 @@ function tokenomicsIdentityLooksNative(identity = {}) {
   if (identity.current === true || identity.current === "true") return true;
   const clientKind = [
     identity.client_kind,
-    identity.clientKind,
     identity.source,
     identity.agent_id,
-    identity.agentId,
   ].map((value) => String(value || "").trim()).join(" ").toLowerCase();
   const platformAndForm = [
     identity.platform,
     identity.os,
     identity.form_factor,
-    identity.formFactor,
     identity.device_type,
-    identity.deviceType,
   ].map((value) => String(value || "").trim()).join(" ").toLowerCase();
   const nativeRuntime = ["native", "desktop", "tauri", "rust"].some((token) => clientKind.includes(token));
   const webOnly = clientKind.includes("web") && !nativeRuntime;
@@ -1492,7 +1456,7 @@ function tokenomicsIdentityLooksNative(identity = {}) {
 
 function mappedNativeDeviceIds(summary = {}) {
   const ids = new Set();
-  const currentDeviceId = String(summary?.current_device_id || summary?.currentDeviceId || "").trim();
+  const currentDeviceId = String(summary?.current_device_id || "").trim();
   if (currentDeviceId) ids.add(currentDeviceId);
   tokenomicsDeviceIdentityRows(summary).forEach((identity) => {
     if (!tokenomicsIdentityLooksNative(identity)) return;
@@ -1524,7 +1488,7 @@ function summaryArray(summary = {}, ...keys) {
 }
 
 function summaryIsTokenomicsV2(summary = {}) {
-  return String(summary?.schema_version || summary?.schemaVersion || "").toLowerCase() === "tokenomics_v2";
+  return String(summary?.schema_version || "").toLowerCase() === "tokenomics_v2";
 }
 
 function hourlyRowsForDisplay(summary = {}) {
@@ -1549,7 +1513,7 @@ function modelRowsForDisplay(summary = {}) {
 }
 
 function dailyRowsForDisplay(summary = {}) {
-  const daily = summaryArray(summary, "daily_by_device_provider", "dailyByDeviceProvider", "daily");
+  const daily = summaryArray(summary, "daily_by_device_provider", "daily");
   if (daily.length) return daily;
   return hourlyRowsForDisplay(summary);
 }
@@ -1572,30 +1536,21 @@ function normalizedLimitWindowKind(kind) {
 }
 
 function normalizeLimitRowForDisplay(row = {}) {
-  const rawWindowKind = row?.window_kind
-    ?? row?.windowKind
-    ?? row?.limit_kind
-    ?? row?.limitKind
-    ?? row?.provider_window_kind
-    ?? row?.providerWindowKind
-    ?? "";
+  const rawWindowKind = row?.window_kind ?? row?.limit_kind ?? row?.provider_window_kind ?? "";
   const windowKind = normalizedLimitWindowKind(rawWindowKind);
   if (!windowKind || windowKind === rawWindowKind) return row;
   return {
     ...row,
-    provider_window_kind: row?.provider_window_kind ?? row?.providerWindowKind ?? rawWindowKind,
-    providerWindowKind: row?.providerWindowKind ?? row?.provider_window_kind ?? rawWindowKind,
+    provider_window_kind: row?.provider_window_kind ?? rawWindowKind,
     window_kind: windowKind,
-    windowKind,
     limit_kind: windowKind,
-    limitKind: windowKind,
   };
 }
 
 function limitRowsForDisplay(summary = {}) {
   return [
     ...summaryArray(summary, "limits"),
-    ...summaryArray(summary, "latest_windows", "latestWindows"),
+    ...summaryArray(summary, "latest_windows"),
   ].map(normalizeLimitRowForDisplay);
 }
 
@@ -1608,8 +1563,7 @@ function tokenomicsDeviceIdentityMap(summary = {}) {
       byId.set(id, {
         ...current,
         ...identity,
-        display_name: label || current.display_name || current.displayName || "",
-        displayName: label || current.displayName || current.display_name || "",
+        display_name: label || current.display_name || "",
       });
     });
   });
@@ -1663,14 +1617,14 @@ function aggregateRows(rows) {
       cache: acc.cache + rowCache(row),
       total: acc.total + rowActivityTokens(row),
       cost: acc.cost + rowCost(row),
-      events: acc.events + numeric(row?.event_count, row?.eventCount),
+      events: acc.events + numeric(row?.event_count),
     }),
     { input: 0, output: 0, cache: 0, total: 0, cost: 0, events: 0 },
   );
 }
 
 function bucketDayKey(row) {
-  const raw = row?.bucket_start || row?.bucketStart || row?.bucket_day || row?.bucketDay;
+  const raw = row?.bucket_start || row?.bucket_day;
   if (!raw) return "";
   const value = String(raw);
   const direct = value.match(/^\d{4}-\d{2}-\d{2}/);
@@ -1695,7 +1649,7 @@ function addUtcDays(date, days) {
 
 function compactDayLabel(key) {
   return dateFromDayKey(key)
-    .toLocaleDateString(undefined, { weekday: "short", timeZone: "UTC" })
+    .toLocaleDateString(undefined, { weekday: "short", time_zone: "UTC" })
     .slice(0, 1);
 }
 
@@ -1708,39 +1662,26 @@ function fullDayLabel(key, todayKey) {
     weekday: "long",
     month: "short",
     day: "numeric",
-    timeZone: "UTC",
+    time_zone: "UTC",
   });
 }
 
 function weeklyLimitUsedPercent(row = {}) {
   return limitNumberOrNull(
     row.used_percent,
-    row.usedPercent,
     row.limit_used_percent,
-    row.limitUsedPercent,
     row.used,
   );
 }
 
 function weeklyLimitRowTime(row = {}) {
   return parseLimitTimestamp(
-    row.sample_at
-      ?? row.sampleAt
-      ?? row.sample_bucket_start
-      ?? row.sampleBucketStart
-      ?? row.sample_observed_at
-      ?? row.sampleObservedAt
-      ?? row.limit_observed_at
-      ?? row.limitObservedAt
-      ?? row.updated_at
-      ?? row.updatedAt
-      ?? row.last_known_at
-      ?? row.lastKnownAt,
+    row.sample_at ?? row.sample_bucket_start ?? row.sample_observed_at ?? row.limit_observed_at ?? row.updated_at ?? row.last_known_at,
   );
 }
 
 function weeklyLimitRowResetKey(row = {}) {
-  return String(row.reset_at ?? row.resetAt ?? row.limit_resets_at ?? row.limitResetsAt ?? "");
+  return String(row.reset_at ?? row.limit_resets_at ?? "");
 }
 
 function weeklyLimitSeriesKey(row = {}) {
@@ -1749,7 +1690,7 @@ function weeklyLimitSeriesKey(row = {}) {
 
 function matchingWeeklyLimitRows(rows, selectedProvider, selectedAccountKeys, selectedDeviceId = "all", selectedScopeKey = "all") {
   return (Array.isArray(rows) ? rows : []).filter((row) => (
-    normalizedLimitWindowKind(row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind || "") === "weekly"
+    normalizedLimitWindowKind(row?.window_kind || row?.limit_kind || "") === "weekly"
       && (selectedProvider === "all" || providerKey(row) === selectedProvider)
       && rowMatchesAccountFilter(row, selectedProvider, selectedAccountKeys)
       && (selectedDeviceId === "all" || !rowDeviceId(row) || rowDeviceId(row) === selectedDeviceId)
@@ -1926,16 +1867,7 @@ function parseLimitTimestamp(value) {
 
 function limitTimestampMs(row = {}) {
   return parseLimitTimestamp(
-    row.sample_at
-      ?? row.sampleAt
-      ?? row.sample_observed_at
-      ?? row.sampleObservedAt
-      ?? row.limit_observed_at
-      ?? row.limitObservedAt
-      ?? row.updated_at
-      ?? row.updatedAt
-      ?? row.last_known_at
-      ?? row.lastKnownAt,
+    row.sample_at ?? row.sample_observed_at ?? row.limit_observed_at ?? row.updated_at ?? row.last_known_at,
   )?.getTime() || 0;
 }
 
@@ -1950,10 +1882,7 @@ function filterLimits(limits, selectedProvider, selectedAccountKeys = "all", sel
 }
 
 function providerLimitUsesActiveAccount(row = {}) {
-  return row?.active_provider_account === true
-    || row?.activeProviderAccount === true
-    || row?.active_agent_profile === true
-    || row?.activeAgentProfile === true;
+  return row?.active_provider_account === true || row?.active_agent_profile === true;
 }
 
 function activeProviderAccountKeyForLimits(limits, selectedProvider, selectedScopeKey = "all", selectedDeviceId = "all") {
@@ -1986,18 +1915,11 @@ function limitAccountKeyForDisplay(limits, selectedProvider, selectedAccountKey 
 }
 
 function limitResetDate(limit = {}) {
-  const direct = parseLimitTimestamp(limit.reset_at ?? limit.resetAt ?? limit.limit_resets_at ?? limit.limitResetsAt);
+  const direct = parseLimitTimestamp(limit.reset_at ?? limit.limit_resets_at);
   if (direct) return direct;
-  const resetAfterSeconds = limitNumberOrNull(limit.reset_after_seconds, limit.resetAfterSeconds);
+  const resetAfterSeconds = limitNumberOrNull(limit.reset_after_seconds);
   const updatedAt = parseLimitTimestamp(
-    limit.limit_observed_at
-      ?? limit.limitObservedAt
-      ?? limit.sample_observed_at
-      ?? limit.sampleObservedAt
-      ?? limit.updated_at
-      ?? limit.updatedAt
-      ?? limit.last_known_at
-      ?? limit.lastKnownAt,
+    limit.limit_observed_at ?? limit.sample_observed_at ?? limit.updated_at ?? limit.last_known_at,
   );
   if (resetAfterSeconds != null && updatedAt) {
     return new Date(updatedAt.getTime() + Math.max(0, resetAfterSeconds) * 1000);
@@ -2008,31 +1930,19 @@ function limitResetDate(limit = {}) {
 function hasKnownLimitPercent(limit = {}) {
   return limitNumberOrNull(
     limit.remaining_percent,
-    limit.remainingPercent,
     limit.used_percent,
-    limit.usedPercent,
     limit.limit_used_percent,
-    limit.limitUsedPercent,
   ) != null;
 }
 
 function limitDisplayPercentKind(limit = {}, fallbackWindowKind = "") {
   const explicit = String(
-    limit.display_percent_kind
-      ?? limit.displayPercentKind
-      ?? limit.limit_display_percent_kind
-      ?? limit.limitDisplayPercentKind
-      ?? "",
+    limit.display_percent_kind ?? limit.limit_display_percent_kind ?? "",
   ).toLowerCase();
   if (explicit === "remaining" || explicit === "used") return explicit;
   if (providerKey(limit) === "codex" || providerKey(limit) === "claude") return "remaining";
   const windowKind = String(
-    fallbackWindowKind
-      || limit.window_kind
-      || limit.windowKind
-      || limit.limit_kind
-      || limit.limitKind
-      || "",
+    fallbackWindowKind || limit.window_kind || limit.limit_kind || "",
   );
   return windowKind === "weekly" ? "remaining" : "used";
 }
@@ -2068,13 +1978,13 @@ function limitResetLabelIsPlaceholder(value) {
 }
 
 function meaningfulLimitResetLabel(limit = {}) {
-  const explicit = String(limit.reset_label || limit.resetLabel || "").trim();
+  const explicit = String(limit.reset_label || "").trim();
   return explicit && !limitResetLabelIsPlaceholder(explicit) ? explicit : "";
 }
 
 function limitHasResetTiming(limit = {}) {
   if (meaningfulLimitResetLabel(limit)) return true;
-  const resetAfterSeconds = limitNumberOrNull(limit.reset_after_seconds, limit.resetAfterSeconds);
+  const resetAfterSeconds = limitNumberOrNull(limit.reset_after_seconds);
   if (resetAfterSeconds != null && resetAfterSeconds > 0) return true;
   const resetDate = limitResetDate(limit);
   return Boolean(resetDate && resetDate.getTime() > Date.now());
@@ -2093,7 +2003,7 @@ function limitResetReferenceRow(rows = []) {
 function computedLimitResetLabel(limit = {}, windowKind = "5_hour") {
   const explicit = meaningfulLimitResetLabel(limit);
   if (explicit) return explicit;
-  const resetAfterSeconds = limitNumberOrNull(limit.reset_after_seconds, limit.resetAfterSeconds);
+  const resetAfterSeconds = limitNumberOrNull(limit.reset_after_seconds);
   if (resetAfterSeconds != null && resetAfterSeconds > 0) {
     return `Resets in ${formatLimitResetDuration(resetAfterSeconds)}`;
   }
@@ -2108,9 +2018,9 @@ function computedLimitResetLabel(limit = {}, windowKind = "5_hour") {
 }
 
 function isProviderResetEstimate(limit = {}) {
-  if (!(limit?.client_estimated || limit?.clientEstimated)) return false;
-  const resetAfterSeconds = limitNumberOrNull(limit.reset_after_seconds, limit.resetAfterSeconds);
-  const resetLabel = String(limit.reset_label || limit.resetLabel || "");
+  if (!(limit?.client_estimated)) return false;
+  const resetAfterSeconds = limitNumberOrNull(limit.reset_after_seconds);
+  const resetLabel = String(limit.reset_label || "");
   return resetAfterSeconds === 0 && /provider window reset/i.test(resetLabel);
 }
 
@@ -2123,12 +2033,10 @@ function clientProjectedLimit(limit = {}) {
     return {
       ...limit,
       reset_after_seconds: secondsUntilReset,
-      resetAfterSeconds: secondsUntilReset,
       reset_label: resetLabel,
-      resetLabel,
     };
   }
-  const resetWindowKind = String(limit.window_kind || limit.windowKind || limit.limit_kind || limit.limitKind || "");
+  const resetWindowKind = String(limit.window_kind || limit.limit_kind || "");
   const resetDisplayKind = limitDisplayPercentKind(limit, resetWindowKind);
   const resetDisplayPercent = resetDisplayKind === "remaining" ? 100 : 0;
   return {
@@ -2137,35 +2045,20 @@ function clientProjectedLimit(limit = {}) {
     allowance: 100,
     remaining: 100,
     used_percent: 0,
-    usedPercent: 0,
     limit_used_percent: 0,
-    limitUsedPercent: 0,
     remaining_percent: 100,
-    remainingPercent: 100,
     display_percent: resetDisplayPercent,
-    displayPercent: resetDisplayPercent,
     display_percent_kind: resetDisplayKind,
-    displayPercentKind: resetDisplayKind,
     pace_delta_percent: null,
-    paceDeltaPercent: null,
     pace_status: "unknown",
-    paceStatus: "unknown",
     pace_exhausts_before_reset: false,
-    paceExhaustsBeforeReset: false,
     pace_projected_used_percent: null,
-    paceProjectedUsedPercent: null,
     pace_projected_exhaustion_seconds: null,
-    paceProjectedExhaustionSeconds: null,
     pace_projected_exhaustion_at: null,
-    paceProjectedExhaustionAt: null,
     reset_after_seconds: 0,
-    resetAfterSeconds: 0,
     status_label: "Available",
-    statusLabel: "Available",
     reset_label: "Provider window reset; waiting for live refresh",
-    resetLabel: "Provider window reset; waiting for live refresh",
     client_estimated: true,
-    clientEstimated: true,
   };
 }
 
@@ -2202,25 +2095,25 @@ function mergeLimits(limits, windowKind) {
   const rows = limitDisplayAccountRows(
     limits
       .map(normalizeLimitRowForDisplay)
-      .filter((limit) => normalizedLimitWindowKind(limit?.window_kind || limit?.windowKind || limit?.limit_kind || limit?.limitKind || "") === normalizedWindowKind),
+      .filter((limit) => normalizedLimitWindowKind(limit?.window_kind || limit?.limit_kind || "") === normalizedWindowKind),
   ).map(clientProjectedLimit);
   if (!rows.length) {
     return {
-      windowKind: normalizedWindowKind,
+      window_kind: normalizedWindowKind,
       label: normalizedWindowKind === "5_hour" ? "5-Hour Session" : "Weekly Limit",
-      planDetected: false,
-      planName: "No plan detected",
+      plan_detected: false,
+      plan_name: "No plan detected",
       confidence: "unknown",
-      remainingPercent: null,
-      usedPercent: null,
-      displayPercent: null,
-      displayPercentKind: limitDisplayPercentKind({}, windowKind),
+      remaining_percent: null,
+      used_percent: null,
+      display_percent: null,
+      display_percent_kind: limitDisplayPercentKind({}, windowKind),
       paceDelta: null,
-      paceStatus: "unknown",
+      pace_status: "unknown",
       overPace: false,
-      statusLabel: "Plan limit not exposed",
-      resetLabel: normalizedWindowKind === "5_hour" ? "Resets with provider window" : "Resets on provider schedule",
-      ratePoints: [],
+      status_label: "Plan limit not exposed",
+      reset_label: normalizedWindowKind === "5_hour" ? "Resets with provider window" : "Resets on provider schedule",
+      rate_points: [],
     };
   }
   const resetEstimated = rows.length > 0 && rows.every(isProviderResetEstimate);
@@ -2228,10 +2121,10 @@ function mergeLimits(limits, windowKind) {
   const allowanceValues = rows.map((row) => numeric(row?.allowance)).filter((value) => value > 0);
   const allowance = allowanceValues.length ? allowanceValues.reduce((sum, value) => sum + value, 0) : null;
   const explicitUsedPercents = rows
-    .map((row) => limitNumberOrNull(row?.used_percent, row?.usedPercent, row?.limit_used_percent, row?.limitUsedPercent))
+    .map((row) => limitNumberOrNull(row?.used_percent, row?.limit_used_percent))
     .filter((value) => value != null);
   const explicitRemainingPercents = rows
-    .map((row) => limitNumberOrNull(row?.remaining_percent, row?.remainingPercent))
+    .map((row) => limitNumberOrNull(row?.remaining_percent))
     .filter((value) => value != null);
   const averagePercent = (values) => values.length
     ? Math.round(values.reduce((sum, value) => sum + value, 0) / values.length)
@@ -2253,46 +2146,46 @@ function mergeLimits(limits, windowKind) {
   const paceDelta = resetEstimated
     ? null
     : averagePercent(rows
-      .map((row) => limitNumberOrNull(row?.pace_delta_percent, row?.paceDeltaPercent))
+      .map((row) => limitNumberOrNull(row?.pace_delta_percent))
       .filter((value) => value != null));
-  const plans = [...new Set(rows.map((row) => row?.plan_name || row?.planName).filter(Boolean))];
+  const plans = [...new Set(rows.map((row) => row?.plan_name).filter(Boolean))];
   const confidences = [...new Set(rows.map((row) => row?.confidence).filter(Boolean))];
-  const ratePoints = rows.flatMap((row) => Array.isArray(row?.rate_points || row?.ratePoints) ? (row.rate_points || row.ratePoints) : []);
-  const limitSource = rows.find((row) => row?.limit_source || row?.limitSource)?.limit_source || rows.find((row) => row?.limitSource)?.limitSource || "";
+  const ratePoints = rows.flatMap((row) => Array.isArray(row?.rate_points) ? (row.rate_points) : []);
+  const limitSource = rows.find((row) => row?.limit_source)?.limit_source || "";
   const providerKeys = [...new Set(rows.map(providerKey).filter(Boolean))];
   const claudeUnavailable = isClaudeLimitUnavailable(rows);
   const paceStatus = resetEstimated ? "unknown" : limitPaceStatus(rows);
   const overPace = paceStatus === "over_pace" || (paceDelta != null && paceDelta > 0);
   const resetReference = limitResetReferenceRow(rows);
   return {
-    windowKind: normalizedWindowKind,
+    window_kind: normalizedWindowKind,
     label: rows[0]?.label || (normalizedWindowKind === "5_hour" ? "5-Hour Session" : "Weekly Limit"),
-    planDetected: rows.some((row) => Boolean(row?.plan_detected ?? row?.planDetected)),
-    planName: plans.length ? plans.join(" + ") : "No plan detected",
+    plan_detected: rows.some((row) => Boolean(row?.plan_detected)),
+    plan_name: plans.length ? plans.join(" + ") : "No plan detected",
     confidence: confidences.includes("estimated") ? "estimated" : (confidences[0] || "unknown"),
-    limitSource,
+    limit_source: limitSource,
     providerKeys,
-    remainingPercent,
-    usedPercent,
-    displayPercent,
-    displayPercentKind,
+    remaining_percent: remainingPercent,
+    used_percent: usedPercent,
+    display_percent: displayPercent,
+    display_percent_kind: displayPercentKind,
     paceDelta,
-    paceStatus,
+    pace_status: paceStatus,
     overPace,
-    statusLabel: resetEstimated ? "Available" : limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable, paceStatus),
-    resetLabel: limitResetLabel(rows, normalizedWindowKind, claudeUnavailable, resetReference),
-    ratePoints,
-    limitWindowSeconds: limitNumberOrNull(resetReference?.limit_window_seconds, resetReference?.limitWindowSeconds, rows[0]?.limit_window_seconds, rows[0]?.limitWindowSeconds) ?? 0,
-    resetAfterSeconds: limitNumberOrNull(resetReference?.reset_after_seconds, resetReference?.resetAfterSeconds, rows[0]?.reset_after_seconds, rows[0]?.resetAfterSeconds) ?? 0,
+    status_label: resetEstimated ? "Available" : limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable, paceStatus),
+    reset_label: limitResetLabel(rows, normalizedWindowKind, claudeUnavailable, resetReference),
+    rate_points: ratePoints,
+    limit_window_seconds: limitNumberOrNull(resetReference?.limit_window_seconds, rows[0]?.limit_window_seconds, rows[0]?.limit_window_seconds) ?? 0,
+    reset_after_seconds: limitNumberOrNull(resetReference?.reset_after_seconds, rows[0]?.reset_after_seconds, rows[0]?.reset_after_seconds) ?? 0,
   };
 }
 
 function isClaudeLimitUnavailable(rows) {
   return rows.some((row) => {
     if (providerKey(row) !== "claude") return false;
-    const source = String(row?.limit_source || row?.limitSource || "").toLowerCase();
+    const source = String(row?.limit_source || "").toLowerCase();
     const confidence = String(row?.confidence || "").toLowerCase();
-    const status = String(row?.status_label || row?.statusLabel || "").toLowerCase();
+    const status = String(row?.status_label || "").toLowerCase();
     return source === "claude_statusline_unavailable"
       || source === "not_exposed"
       || confidence === "unknown"
@@ -2308,12 +2201,12 @@ function truthyLimitValue(value) {
 function limitPaceStatus(rows) {
   if (!Array.isArray(rows) || !rows.length) return "unknown";
   if (rows.some((row) => {
-    const status = String(row?.pace_status || row?.paceStatus || "").toLowerCase();
-    return status === "over_pace" || truthyLimitValue(row?.pace_exhausts_before_reset ?? row?.paceExhaustsBeforeReset);
+    const status = String(row?.pace_status || "").toLowerCase();
+    return status === "over_pace" || truthyLimitValue(row?.pace_exhausts_before_reset);
   })) {
     return "over_pace";
   }
-  if (rows.some((row) => String(row?.pace_status || row?.paceStatus || "").toLowerCase() === "on_pace")) {
+  if (rows.some((row) => String(row?.pace_status || "").toLowerCase() === "on_pace")) {
     return "on_pace";
   }
   return "unknown";
@@ -2330,7 +2223,7 @@ function limitResetLabel(rows, windowKind, claudeUnavailable, resetReference = n
     const current = computedLimitResetLabel(reference, windowKind);
     if (current && !limitResetLabelIsPlaceholder(current)) return current;
   }
-  const rawExplicit = String(reference?.reset_label || reference?.resetLabel || "").trim();
+  const rawExplicit = String(reference?.reset_label || "").trim();
   if (!rawExplicit || rawExplicit.includes("Provider limit unavailable")) {
     return "Open Claude Code to publish live limits";
   }
@@ -2343,7 +2236,7 @@ function limitResetLabel(rows, windowKind, claudeUnavailable, resetReference = n
 function limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable = false, paceStatus = "unknown") {
   if (remainingPercent == null) {
     if (claudeUnavailable) return "Live limits unavailable";
-    return rows.find((row) => row?.status_label || row?.statusLabel)?.status_label || "Plan limit not exposed";
+    return rows.find((row) => row?.status_label)?.status_label || "Plan limit not exposed";
   }
   if (remainingPercent <= 0) return "Limit exhausted";
   if (paceStatus === "over_pace" || (paceDelta != null && paceDelta > 0)) return "Pace will exhaust before reset";
@@ -2356,10 +2249,10 @@ function usageRateRowsFromLimit(limit, hourlyRows, selectedProvider, selectedAcc
   const windowSeconds = sessionWindowSeconds(limit);
   const bucketCount = Math.max(1, Math.ceil(windowSeconds / 3600));
   const rows = filterRows(Array.isArray(hourlyRows) ? hourlyRows : [], selectedProvider, selectedAccountKeys, selectedDeviceId, selectedScopeKey);
-  if (rows.some((row) => row?.window_index != null || row?.windowIndex != null)) {
+  if (rows.some((row) => row?.window_index != null)) {
     const byIndex = new Map();
     for (const row of rows) {
-      const index = numeric(row?.window_index, row?.windowIndex);
+      const index = numeric(row?.window_index);
       const previous = byIndex.get(index) || { total: 0, input: 0, output: 0, cache: 0, cost: 0 };
       byIndex.set(index, {
         total: previous.total + rowActivityTokens(row),
@@ -2412,7 +2305,7 @@ function usageRateRowsFromLimit(limit, hourlyRows, selectedProvider, selectedAcc
 }
 
 function parseHourBucketDate(row) {
-  const raw = row?.bucket_start || row?.bucketStart;
+  const raw = row?.bucket_start;
   if (!raw) return null;
   const value = String(raw);
   const date = new Date(value.length === 13 ? `${value}:00:00` : value);
@@ -2470,11 +2363,11 @@ function usageRateAxisLabels(rows, windowKind) {
 }
 
 function sessionWindowSeconds(limit) {
-  return numeric(limit?.limitWindowSeconds, limit?.limit_window_seconds) || 5 * 60 * 60;
+  return numeric(limit?.limit_window_seconds) || 5 * 60 * 60;
 }
 
 function limitSourceText(limit) {
-  const source = limit?.limitSource || limit?.limit_source || "";
+  const source = limit?.limit_source || "";
   const isClaude = Array.isArray(limit?.providerKeys) && limit.providerKeys.includes("claude");
   if (source === "claude_statusline_unavailable") return "Live Claude Code limits unavailable";
   if (source === "claude_statusline") return "Live Claude Code usage";
@@ -2488,10 +2381,10 @@ function limitSourceText(limit) {
 }
 
 function planStatusTitle(limit, selectedProvider) {
-  if (!limit?.planDetected) {
+  if (!limit?.plan_detected) {
     return selectedProvider === "claude" ? "No Claude account detected" : "No provider plan detected";
   }
-  const name = String(limit?.planName || "").trim();
+  const name = String(limit?.plan_name || "").trim();
   if (selectedProvider === "claude" && name === "Claude subscription") {
     return "Claude account signed in";
   }
@@ -2558,7 +2451,7 @@ function modelBreakdown(modelRows, selectedProvider, selectedAccountKeys, select
   const byModel = new Map();
   for (const row of rows) {
     const rawModel = String(row?.model || "").trim();
-    const agentKind = String(row?.agent_kind || row?.agentKind || "").trim();
+    const agentKind = String(row?.agent_kind || "").trim();
     const label = rawModel && rawModel !== agentKind ? rawModel : providerLabel(row);
     const key = label || "Unknown model";
     const current = byModel.get(key) || { label: key, total: 0 };
@@ -2585,7 +2478,7 @@ function providerAccountOptions(summary, selectedProvider, selectedDeviceId = "a
   const provider = PROVIDERS.find((item) => item.id === selectedProvider) || PROVIDERS[0];
   const currentProfileIds = tokenomicsCurrentProfileIdsByProvider(agentAccounts);
   const usageRows = accountRowsForDisplay(summary);
-  const accountRows = summaryArray(summary, "provider_accounts", "providerAccounts");
+  const accountRows = summaryArray(summary, "provider_accounts");
   const limitRows = limitRowsForDisplay(summary);
   const rows = [
     ...usageRows,
@@ -2640,7 +2533,7 @@ function providerAccountOptionGroups(optionsByProvider, selectedProvider) {
       const displayName = providerDisplayName(providerId);
       const heading = providerAccountHeading(providerId);
       return {
-        providerId,
+        provider_id: providerId,
         label: heading,
         options: selectedProvider === "all"
           ? [
@@ -2671,9 +2564,9 @@ function lastUpdatedText(value) {
 }
 
 function providerLimitDisplayedRemainingPercent(row = {}) {
-  const remaining = limitNumberOrNull(row?.remaining_percent, row?.remainingPercent);
+  const remaining = limitNumberOrNull(row?.remaining_percent);
   if (remaining != null) return Math.max(0, Math.min(100, Math.round(remaining)));
-  const used = limitNumberOrNull(row?.used_percent, row?.usedPercent, row?.limit_used_percent, row?.limitUsedPercent);
+  const used = limitNumberOrNull(row?.used_percent, row?.limit_used_percent);
   if (used != null) return Math.max(0, Math.min(100, Math.round(100 - used)));
   const allowance = limitNumberOrNull(row?.allowance);
   const usedAmount = limitNumberOrNull(row?.used);
@@ -2712,34 +2605,29 @@ function providerLimitSyncSignature(row = {}) {
   const remaining = providerLimitDisplayedRemainingPercent(row);
   const used = tokenomicsLimitSignaturePercent(
     row?.used_percent,
-    row?.usedPercent,
     row?.limit_used_percent,
-    row?.limitUsedPercent,
   );
-  const paceDelta = tokenomicsLimitSignatureNumber(row?.pace_delta_percent, row?.paceDeltaPercent);
+  const paceDelta = tokenomicsLimitSignatureNumber(row?.pace_delta_percent);
   const paceTrajectoryDelta = tokenomicsLimitSignatureNumber(
     row?.pace_trajectory_delta_percent,
-    row?.paceTrajectoryDeltaPercent,
   );
   const projectedUsed = tokenomicsLimitSignatureNumber(
     row?.pace_projected_used_percent,
-    row?.paceProjectedUsedPercent,
     row?.pace_trajectory_projected_used_percent,
-    row?.paceTrajectoryProjectedUsedPercent,
   );
   return [
     providerLimitKey(row),
     `remaining:${remaining == null ? "" : remaining}`,
     `used:${used}`,
-    `status:${tokenomicsLimitSignatureText(row?.status_label, row?.statusLabel)}`,
-    `pace:${tokenomicsLimitSignatureText(row?.pace_status, row?.paceStatus, row?.pace_trajectory_status, row?.paceTrajectoryStatus)}`,
+    `status:${tokenomicsLimitSignatureText(row?.status_label)}`,
+    `pace:${tokenomicsLimitSignatureText(row?.pace_status, row?.pace_trajectory_status)}`,
     `pace_delta:${paceDelta}`,
     `pace_trajectory_delta:${paceTrajectoryDelta}`,
     `projected_used:${projectedUsed}`,
-    `source:${tokenomicsLimitSignatureText(row?.limit_source, row?.limitSource, row?.source)}`,
-    `source_kind:${tokenomicsLimitSignatureText(row?.limit_source_kind, row?.limitSourceKind)}`,
+    `source:${tokenomicsLimitSignatureText(row?.limit_source, row?.source)}`,
+    `source_kind:${tokenomicsLimitSignatureText(row?.limit_source_kind)}`,
     `confidence:${tokenomicsLimitSignatureText(row?.confidence)}`,
-    `plan:${tokenomicsLimitSignatureText(row?.plan_name, row?.planName)}`,
+    `plan:${tokenomicsLimitSignatureText(row?.plan_name)}`,
     `reset:${tokenomicsLimitResetSignature(row)}`,
     `active:${providerLimitUsesActiveAccount(row) ? "1" : "0"}`,
   ].join(";");
@@ -2754,18 +2642,18 @@ function tokenomicsLimitPercentSignature(summary = {}) {
     .join("|");
   const samples = Array.isArray(summary?.limit_samples)
     ? summary.limit_samples
-    : (Array.isArray(summary?.limitSamples) ? summary.limitSamples : []);
+    : (Array.isArray(summary?.limit_samples) ? summary.limit_samples : []);
   const sampleSignature = mergeProviderLimitSamples([], samples)
     .map((row) => {
-      const used = limitNumberOrNull(row?.used_percent, row?.usedPercent, row?.limit_used_percent, row?.limitUsedPercent);
+      const used = limitNumberOrNull(row?.used_percent, row?.limit_used_percent);
       if (used == null) return "";
-      const paceDelta = tokenomicsLimitSignatureNumber(row?.pace_delta_percent, row?.paceDeltaPercent);
+      const paceDelta = tokenomicsLimitSignatureNumber(row?.pace_delta_percent);
       return [
         providerLimitSampleKey(row),
         `used:${Math.max(0, Math.min(100, Math.round(used)))}`,
-        `pace:${tokenomicsLimitSignatureText(row?.pace_status, row?.paceStatus)}`,
+        `pace:${tokenomicsLimitSignatureText(row?.pace_status)}`,
         `pace_delta:${paceDelta}`,
-        `source:${tokenomicsLimitSignatureText(row?.limit_source, row?.limitSource, row?.source)}`,
+        `source:${tokenomicsLimitSignatureText(row?.limit_source, row?.source)}`,
         `confidence:${tokenomicsLimitSignatureText(row?.confidence)}`,
       ].join(";");
     })
@@ -2781,7 +2669,7 @@ function dailyRollupMergeKey(row = {}) {
     rowDeviceId(row) || "unknown-device",
     rowScopeKey(row),
     providerKey(row),
-    String(row?.agent_kind || row?.agentKind || ""),
+    String(row?.agent_kind || ""),
     String(row?.model || ""),
     rowProviderAccountKey(row) || "unknown-account",
   ].join("\u001f");
@@ -2799,7 +2687,7 @@ function mergeDailyRollupRows(previousRows, nextRows) {
 function mergeTokenomicsSummary(previous, next) {
   if (!previous) return next || {};
   if (!next) return previous;
-  const nextIsV2 = String(next.schema_version || next.schemaVersion || "").toLowerCase() === "tokenomics_v2";
+  const nextIsV2 = String(next.schema_version || "").toLowerCase() === "tokenomics_v2";
   const previousIsV2 = summaryIsTokenomicsV2(previous);
   const clearLegacyRows = nextIsV2 || previousIsV2;
   return {
@@ -2810,40 +2698,34 @@ function mergeTokenomicsSummary(previous, next) {
     by_device_provider: next.by_device_provider || (clearLegacyRows ? undefined : previous.by_device_provider),
     by_device_account: next.by_device_account || (clearLegacyRows ? undefined : previous.by_device_account),
     by_device_model: next.by_device_model || (clearLegacyRows ? undefined : previous.by_device_model),
-    daily_by_device_provider: next.daily_by_device_provider || next.dailyByDeviceProvider
-      || (clearLegacyRows ? undefined : (previous.daily_by_device_provider || previous.dailyByDeviceProvider)),
+    daily_by_device_provider: next.daily_by_device_provider || clearLegacyRows ? undefined : (previous.daily_by_device_provider),
     monthly_by_device_provider: next.monthly_by_device_provider || (clearLegacyRows ? undefined : previous.monthly_by_device_provider),
     hourly: next.hourly || previous.hourly,
     sources: next.sources || previous.sources,
     limits: mergeProviderLimits(previous.limits, next.limits),
-    limit_samples: mergeProviderLimitSamples(previous.limit_samples || previous.limitSamples, next.limit_samples || next.limitSamples),
-    limitSamples: mergeProviderLimitSamples(previous.limitSamples || previous.limit_samples, next.limitSamples || next.limit_samples),
+    limit_samples: mergeProviderLimitSamples(previous.limit_samples, next.limit_samples),
     device_identities: next.device_identities || previous.device_identities,
-    deviceIdentities: next.deviceIdentities || previous.deviceIdentities,
   };
 }
 
 function mergeTokenomicsSummaryDelta(previous, next) {
   if (!previous) return next || {};
   if (!next) return previous;
-  const nextDaily = next.daily_by_device_provider || next.dailyByDeviceProvider;
+  const nextDaily = next.daily_by_device_provider;
   const mergedDaily = mergeDailyRollupRows(
-    previous.daily_by_device_provider || previous.dailyByDeviceProvider,
+    previous.daily_by_device_provider,
     nextDaily,
   );
   return {
     ...previous,
     schema_version: next.schema_version || previous.schema_version,
-    schemaVersion: next.schemaVersion || next.schema_version || previous.schemaVersion,
     updated_at: next.updated_at || previous.updated_at,
-    updatedAt: next.updatedAt || next.updated_at || previous.updatedAt,
     daily_by_device_provider: mergedDaily,
-    dailyByDeviceProvider: mergedDaily,
   };
 }
 
 const tokenomicsStore = {
-  accountKey: TOKENOMICS_DEFAULT_ACCOUNT_KEY,
+  account_key: TOKENOMICS_DEFAULT_ACCOUNT_KEY,
   loadedAccountKey: "",
   requestEpoch: 0,
   state: createTokenomicsStoreState(),
@@ -2904,18 +2786,18 @@ function tokenomicsProgressNotifySignature(progress) {
   return [
     progress.phase,
     progress.provider,
-    progress.agent_kind ?? progress.agentKind,
-    progress.provider_account_key ?? progress.providerAccountKey,
-    progress.provider_account_label ?? progress.providerAccountLabel,
-    progress.day_index ?? progress.dayIndex,
-    progress.day_total ?? progress.dayTotal,
-    progress.day_label ?? progress.dayLabel,
-    progress.files_scanned ?? progress.filesScanned,
-    progress.inserted_events ?? progress.insertedEvents,
-    progress.day_files_scanned ?? progress.dayFilesScanned,
-    progress.day_inserted_events ?? progress.dayInsertedEvents,
-    progress.candidate_count ?? progress.candidateCount,
-    progress.day_candidate_count ?? progress.dayCandidateCount,
+    progress.agent_kind,
+    progress.provider_account_key,
+    progress.provider_account_label,
+    progress.day_index,
+    progress.day_total,
+    progress.day_label,
+    progress.files_scanned,
+    progress.inserted_events,
+    progress.day_files_scanned,
+    progress.day_inserted_events,
+    progress.candidate_count,
+    progress.day_candidate_count,
     progress.cached,
     progress.mode,
   ].map((value) => String(value ?? "")).join("\u001f");
@@ -3073,7 +2955,7 @@ function scheduleTokenomicsLimitCloudSync() {
     invoke("cloud_mcp_schedule_tokenomics_sync", {
       reason: TOKENOMICS_LIMIT_CLOUD_SYNC_REASON,
       full: false,
-      resyncLast30Days: false,
+      resync_last_30_days: false,
     })
       .catch(() => {})
       .finally(() => {
@@ -3082,13 +2964,13 @@ function scheduleTokenomicsLimitCloudSync() {
           scheduleTokenomicsLimitCloudSync();
         }
       });
-  }, { delayMs: 0, timeout: 1200 });
+  }, { delay_ms: 0, timeout: 1200 });
 }
 
 function mergeSummaryIntoTokenomicsStore(next, { syncLimitChanges = false } = {}) {
   let nextSignature = "";
   let shouldSyncLimits = false;
-  tokenomicsStore.loadedAccountKey = tokenomicsStore.accountKey;
+  tokenomicsStore.loadedAccountKey = tokenomicsStore.account_key;
   updateTokenomicsStore((previous) => ({
     summary: (() => {
       const merged = mergeTokenomicsSummary(previous.summary, next || {});
@@ -3108,7 +2990,7 @@ function mergeSummaryIntoTokenomicsStore(next, { syncLimitChanges = false } = {}
 
 function mergeSummaryDeltaIntoTokenomicsStore(next) {
   if (!next) return;
-  tokenomicsStore.loadedAccountKey = tokenomicsStore.accountKey;
+  tokenomicsStore.loadedAccountKey = tokenomicsStore.account_key;
   updateTokenomicsStore((previous) => ({
     summary: mergeTokenomicsSummaryDelta(previous.summary, next),
   }));
@@ -3121,11 +3003,11 @@ function resetTokenomicsStoreForAccount(accountKey) {
   }
 
   const normalizedAccountKey = normalizeTokenomicsAccountKey(incomingAccountKey);
-  if (tokenomicsStore.accountKey === normalizedAccountKey) {
+  if (tokenomicsStore.account_key === normalizedAccountKey) {
     return;
   }
 
-  const currentAccountKey = String(tokenomicsStore.accountKey || "").trim();
+  const currentAccountKey = String(tokenomicsStore.account_key || "").trim();
   const currentIsInitialAccount = !currentAccountKey || currentAccountKey === TOKENOMICS_DEFAULT_ACCOUNT_KEY;
   const loadedAccountKey = String(tokenomicsStore.loadedAccountKey || "").trim();
   const loadedForDifferentRealAccount = Boolean(
@@ -3135,14 +3017,14 @@ function resetTokenomicsStoreForAccount(accountKey) {
   );
 
   if (currentIsInitialAccount && !loadedForDifferentRealAccount) {
-    tokenomicsStore.accountKey = normalizedAccountKey;
+    tokenomicsStore.account_key = normalizedAccountKey;
     if (tokenomicsStore.state.summary) {
       tokenomicsStore.loadedAccountKey = normalizedAccountKey;
     }
     return;
   }
 
-  tokenomicsStore.accountKey = normalizedAccountKey;
+  tokenomicsStore.account_key = normalizedAccountKey;
   tokenomicsStore.requestEpoch += 1;
   tokenomicsStore.loadedOnce = false;
   tokenomicsStore.loadedAccountKey = "";
@@ -3168,7 +3050,7 @@ function ensureTokenomicsProgressListener() {
       if (payload?.summary) {
         mergeSummaryIntoTokenomicsStore(payload.summary);
       }
-      const summaryDelta = payload?.summary_delta || payload?.summaryDelta;
+      const summaryDelta = payload?.summary_delta;
       if (summaryDelta) {
         mergeSummaryDeltaIntoTokenomicsStore(summaryDelta);
       }
@@ -3223,7 +3105,7 @@ function stopTokenomicsProgressListener() {
   }
 }
 
-function refreshTokenomicsLiveLimits({ force = false, forceProviderRefresh = false, syncLimitChanges = false } = {}) {
+function refreshTokenomicsLiveLimits({ force = false, force_provider_refresh: forceProviderRefresh = false, syncLimitChanges = false } = {}) {
   const now = Date.now();
   const requestEpoch = tokenomicsStore.requestEpoch;
   if (tokenomicsStore.liveLimitsPromise) {
@@ -3236,7 +3118,7 @@ function refreshTokenomicsLiveLimits({ force = false, forceProviderRefresh = fal
         tokenomicsStore.liveLimitsForcedRefreshQueued = false;
         return refreshTokenomicsLiveLimits({
           force: true,
-          forceProviderRefresh: true,
+          force_provider_refresh: true,
           syncLimitChanges,
         });
       });
@@ -3249,7 +3131,7 @@ function refreshTokenomicsLiveLimits({ force = false, forceProviderRefresh = fal
 
   tokenomicsStore.liveLimitsLastAt = now;
   tokenomicsStore.liveLimitsPromise = invoke("tokenomics_get_live_limits", {
-    forceProviderRefresh,
+    force_provider_refresh: forceProviderRefresh,
   })
     .then((limitsSummary) => {
       if (tokenomicsStore.requestEpoch === requestEpoch) {
@@ -3275,8 +3157,8 @@ function refreshTokenomicsSummaryIfStale({ force = false } = {}) {
   return loadTokenomicsStore({ force: true, summaryOnly: true });
 }
 
-function refreshVisibleTokenomicsLimits({ force = false, forceProviderRefresh = true } = {}) {
-  return refreshTokenomicsLiveLimits({ force, forceProviderRefresh, syncLimitChanges: true })
+function refreshVisibleTokenomicsLimits({ force = false, force_provider_refresh: forceProviderRefresh = true } = {}) {
+  return refreshTokenomicsLiveLimits({ force, force_provider_refresh: forceProviderRefresh, syncLimitChanges: true })
     .finally(() => {
       void refreshTokenomicsSummaryIfStale();
     });
@@ -3351,7 +3233,7 @@ function loadTokenomicsStore({
       if (shouldScan) {
         void refreshTokenomicsLiveLimits({
           force: true,
-          forceProviderRefresh: true,
+          force_provider_refresh: true,
           syncLimitChanges: true,
         });
       }
@@ -3367,7 +3249,7 @@ function loadTokenomicsStore({
         return tokenomicsStore.state.summary;
       }
       tokenomicsStore.loadedOnce = true;
-      tokenomicsStore.loadedAccountKey = tokenomicsStore.accountKey;
+      tokenomicsStore.loadedAccountKey = tokenomicsStore.account_key;
       if (summaryOnly) {
         tokenomicsStore.summaryRefreshLastAt = Date.now();
       }
@@ -3399,7 +3281,7 @@ function loadTokenomicsStore({
   return tokenomicsStore.loadPromise;
 }
 
-export function warmAccountTokenomics({ accountKey = "", scan = false } = {}) {
+export function warmAccountTokenomics({ account_key: accountKey = "", scan = false } = {}) {
   resetTokenomicsStoreForAccount(accountKey);
   const requestEpoch = tokenomicsStore.requestEpoch;
   const summaryPromise = loadTokenomicsStore({
@@ -3423,12 +3305,12 @@ export function warmAccountTokenomics({ accountKey = "", scan = false } = {}) {
           if (tokenomicsStore.requestEpoch === requestEpoch) {
             void refreshTokenomicsLiveLimits({
               force: true,
-              forceProviderRefresh: true,
+              force_provider_refresh: true,
               syncLimitChanges: true,
             });
           }
         });
-      }, { delayMs: 120, timeout: 1500 });
+      }, { delay_ms: 120, timeout: 1500 });
     });
   }
 
@@ -3439,9 +3321,9 @@ function startTokenomicsViewPolling() {
   ensureTokenomicsProgressListener();
   tokenomicsStore.pollSubscriberCount += 1;
   let disposed = false;
-  const refreshVisibleTokenomics = ({ force = false, forceProviderRefresh = false } = {}) => {
+  const refreshVisibleTokenomics = ({ force = false, force_provider_refresh: forceProviderRefresh = false } = {}) => {
     if (disposed) return;
-    void refreshVisibleTokenomicsLimits({ force, forceProviderRefresh });
+    void refreshVisibleTokenomicsLimits({ force, force_provider_refresh: forceProviderRefresh });
   };
   // Tokenomics is DEVICE-level state: view activation (workspace switches
   // re-activate the keep-alive Tokens tab) must only subscribe and render the
@@ -3481,7 +3363,7 @@ function startTokenomicsViewPolling() {
     // no-op interval behind for the survivors. Its lifetime is already gated
     // by pollSubscriberCount below.
     tokenomicsStore.pollInterval = window.setInterval(() => {
-      void refreshVisibleTokenomicsLimits({ force: false, forceProviderRefresh: false });
+      void refreshVisibleTokenomicsLimits({ force: false, force_provider_refresh: false });
     }, TOKENOMICS_VIEW_POLL_INTERVAL_MS);
   }
 
@@ -3512,11 +3394,11 @@ function tokenomicsLoadingLabel(status, summary, progress) {
 }
 
 function tokenomicsLoadingDetail(progress) {
-  const dayIndex = numeric(progress?.day_index, progress?.dayIndex);
-  const dayTotal = numeric(progress?.day_total, progress?.dayTotal);
-  const dayLabel = String(progress?.day_label || progress?.dayLabel || "").trim();
-  const files = numeric(progress?.files_scanned, progress?.filesScanned);
-  const events = numeric(progress?.inserted_events, progress?.insertedEvents);
+  const dayIndex = numeric(progress?.day_index);
+  const dayTotal = numeric(progress?.day_total);
+  const dayLabel = String(progress?.day_label || "").trim();
+  const files = numeric(progress?.files_scanned);
+  const events = numeric(progress?.inserted_events);
   const parts = [];
   if (dayLabel) parts.push(dayLabel);
   if (dayIndex > 0 && dayTotal > 0) parts.push(`${dayIndex}/${dayTotal}`);
@@ -3534,8 +3416,8 @@ function CostCell({ value }) {
 }
 
 function LimitMetricCard({ icon: Icon, limit, title }) {
-  const displayPercent = limit.displayPercent;
-  const displayKind = limit.displayPercentKind || "used";
+  const displayPercent = limit.display_percent;
+  const displayKind = limit.display_percent_kind || "used";
   const paceDelta = limitNumberOrNull(limit.paceDelta);
   const paceText = paceDelta == null
     ? "No data"
@@ -3544,7 +3426,7 @@ function LimitMetricCard({ icon: Icon, limit, title }) {
   const paceMultiplierText = paceMultiplier == null ? "" : formatPaceMultiplier(paceMultiplier);
   const progressLabel = displayKind === "remaining" ? `${title} remaining` : `${title} used`;
   return (
-    <LimitCard tone={statusTone(limit.remainingPercent, limit.paceDelta, limit.paceStatus)}>
+    <LimitCard tone={statusTone(limit.remaining_percent, limit.paceDelta, limit.pace_status)}>
       <MetricHeading>
         <MetricName>
           <Icon aria-hidden="true" />
@@ -3563,7 +3445,7 @@ function LimitMetricCard({ icon: Icon, limit, title }) {
         />
       </ProgressTrack>
       <MetricFoot>
-        <span>{limit.resetLabel}</span>
+        <span>{limit.reset_label}</span>
         <strong>
           {paceMultiplierText ? (
             <PaceMultiplier
@@ -3572,14 +3454,14 @@ function LimitMetricCard({ icon: Icon, limit, title }) {
               [{paceMultiplierText}]
             </PaceMultiplier>
           ) : null}
-          {limit.statusLabel}
+          {limit.status_label}
         </strong>
       </MetricFoot>
     </LimitCard>
   );
 }
 
-function ProviderLimitGroup({ fiveHour, providerId, weekly }) {
+function ProviderLimitGroup({ five_hour: fiveHour, provider_id: providerId, weekly }) {
   return (
     <ProviderLimitColumn>
       <ProviderLimitHeading $provider={providerId}>
@@ -3596,10 +3478,10 @@ function ProviderLimitGroup({ fiveHour, providerId, weekly }) {
 }
 
 const AccountTokenomicsView = memo(function AccountTokenomicsView({
-  accountKey = "",
+  account_key: accountKey = "",
   active = true,
-  billingStatus = null,
-  storageUsage = null,
+  billing_status: billingStatus = null,
+  storage_usage: storageUsage = null,
 } = {}) {
   const [{
     summary,
@@ -3652,7 +3534,7 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
       return;
     }
     resetTokenomicsStoreForAccount(accountKey);
-    void refreshVisibleTokenomicsLimits({ force: true, forceProviderRefresh: true });
+    void refreshVisibleTokenomicsLimits({ force: true, force_provider_refresh: true });
     void loadTokenomicsStore({ background: true, force: false, summaryOnly: true });
   }, [accountKey, active]);
 
@@ -3683,7 +3565,7 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
     if (!previousSignature || previousSignature === agentCredentialSignature) return;
     void refreshTokenomicsLiveLimits({
       force: true,
-      forceProviderRefresh: true,
+      force_provider_refresh: true,
       syncLimitChanges: true,
     }).finally(() => {
       void refreshTokenomicsSummaryIfStale({ force: true });
@@ -3701,7 +3583,7 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
   // is pinned to this machine's id (falling back to "all" before the current
   // device id is known, which is local-only data anyway).
   const localDeviceId = String(
-    visibleSummary?.current_device_id || visibleSummary?.currentDeviceId || "",
+    visibleSummary?.current_device_id || "",
   ).trim();
   const selectedDeviceId = localDeviceId || "all";
   const providers = providerRowsForDisplay(visibleSummary);
@@ -3747,7 +3629,7 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
   const limitRowsRaw = useMemo(() => limitRowsForDisplay(visibleSummary), [visibleSummary]);
   const limitSamplesRaw = Array.isArray(visibleSummary?.limit_samples)
     ? visibleSummary.limit_samples
-    : (Array.isArray(visibleSummary?.limitSamples) ? visibleSummary.limitSamples : []);
+    : (Array.isArray(visibleSummary?.limit_samples) ? visibleSummary.limit_samples : []);
   const dailyRows = useMemo(
     () => buildDailyRows(dailyRaw, limitSamplesRaw, limitRowsRaw, selectedProvider, selectedAccountFilter, selectedDeviceId, selectedScopeKey, dailyWindowDays),
     [dailyRaw, dailyWindowDays, limitRowsRaw, limitSamplesRaw, selectedAccountFilter, selectedDeviceId, selectedProvider, selectedScopeKey],
@@ -3828,8 +3710,8 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
       );
       const providerLimits = filterLimits(limitRowsRaw, providerId, providerAccountKey, selectedScopeKey, selectedDeviceId);
       return {
-        providerId,
-        fiveHour: mergeLimits(providerLimits, "5_hour"),
+        provider_id: providerId,
+        five_hour: mergeLimits(providerLimits, "5_hour"),
         weekly: mergeLimits(providerLimits, "weekly"),
       };
     })
@@ -3845,10 +3727,10 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
         {accountOptionGroups.length > 0 ? (
           <ProviderAccountRows aria-label="Provider account filters">
             {accountOptionGroups.map((group) => (
-              <ProviderAccountRow key={group.providerId}>
+              <ProviderAccountRow key={group.provider_id}>
                 <AccountTabs role="tablist" aria-label={`${group.label} filter`}>
                   {group.options.map((account) => {
-                    const active = accountKeyForProvider(providerAccountKeys, group.providerId) === account.key;
+                    const active = accountKeyForProvider(providerAccountKeys, group.provider_id) === account.key;
                     const title = active && account.activeTitle ? account.activeTitle : (account.title || account.label);
                     return (
                       <AccountTab
@@ -3856,9 +3738,9 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
                         key={account.key}
                         $active={active}
                         $iconOnly={account.iconOnly}
-                        $provider={group.providerId}
+                        $provider={group.provider_id}
                         onClick={() => setSelectedProviderAccountKey(
-                          group.providerId,
+                          group.provider_id,
                           active && account.key === TOKENOMICS_PROVIDER_ACCOUNT_FILTER_NONE ? "all" : account.key,
                         )}
                         role="tab"
@@ -3889,9 +3771,9 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
           <ProviderLimitGrid>
             {providerLimitGroups.map((group) => (
               <ProviderLimitGroup
-                key={group.providerId}
-                fiveHour={group.fiveHour}
-                providerId={group.providerId}
+                key={group.provider_id}
+                five_hour={group.five_hour}
+                provider_id={group.provider_id}
                 weekly={group.weekly}
               />
             ))}
@@ -4049,20 +3931,20 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
         <CreditsCard>
           <CreditsTitle>
             <span>Diff Forge Credits</span>
-            <strong>{credits?.planName || "Plan"}</strong>
+            <strong>{credits?.plan_name || "Plan"}</strong>
           </CreditsTitle>
           <CreditsGrid>
             <CreditMetric>
               <span>Used</span>
-              <strong>{formatCredits(credits.termUsedCredits)}</strong>
+              <strong>{formatCredits(credits.term_used_credits)}</strong>
             </CreditMetric>
             <CreditMetric>
               <span>Remaining</span>
-              <strong>{formatCredits(credits.termRemainingCredits)}</strong>
+              <strong>{formatCredits(credits.term_remaining_credits)}</strong>
             </CreditMetric>
             <CreditMetric>
               <span>Reserved</span>
-              <strong>{formatCredits(credits.termReservedCredits)}</strong>
+              <strong>{formatCredits(credits.term_reserved_credits)}</strong>
             </CreditMetric>
           </CreditsGrid>
         </CreditsCard>
@@ -4090,7 +3972,7 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
         <AgentAccountsManager active={active} />
 
         <TokenomicsFooter>
-          <span>{lastUpdatedText(summary?.updated_at || summary?.updatedAt)}</span>
+          <span>{lastUpdatedText(summary?.updated_at)}</span>
           <TokenomicsRescanButton
             disabled={isScanning}
             onClick={() => {

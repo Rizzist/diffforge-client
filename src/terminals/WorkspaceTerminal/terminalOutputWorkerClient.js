@@ -186,7 +186,7 @@ export function createTerminalOutputWorkerSession(options = {}) {
     },
 
     prepareTransport(metadata = {}) {
-      if (!metadata.paneId || !metadata.instanceId) {
+      if (!metadata.pane_id || !metadata.instance_id) {
         return Promise.reject(new Error("Terminal output transport is missing terminal identity."));
       }
       const existing = transportHandshakes.get(id);
@@ -194,8 +194,8 @@ export function createTerminalOutputWorkerSession(options = {}) {
         return existing.promise;
       }
 
-      const timeoutMs = Number.isFinite(metadata.timeoutMs)
-        ? Math.max(200, metadata.timeoutMs)
+      const timeoutMs = Number.isFinite(metadata.timeout_ms)
+        ? Math.max(200, metadata.timeout_ms)
         : 1200;
       let promise = null;
       promise = terminalOutputTransportEndpoint().then((endpoint) => (
@@ -223,8 +223,8 @@ export function createTerminalOutputWorkerSession(options = {}) {
               endpoint,
               id,
               inspect: metadata.inspect === true,
-              instanceId: metadata.instanceId,
-              paneId: metadata.paneId,
+              instance_id: metadata.instance_id,
+              pane_id: metadata.pane_id,
               type: "connectTransport",
             });
           } catch (error) {

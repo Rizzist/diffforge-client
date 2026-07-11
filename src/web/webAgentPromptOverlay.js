@@ -17,21 +17,15 @@ function normalizeOverlayTarget(target) {
   if (!target || typeof target !== "object") {
     return null;
   }
-  const id = cleanText(target.id ?? target.value ?? target.terminalIndex ?? target.terminal_index);
+  const id = cleanText(target.id ?? target.value ?? target.terminal_index);
   if (!id) {
     return null;
   }
-  const terminalIndex = Number.isInteger(target.terminalIndex)
-    ? target.terminalIndex
-    : Number.isInteger(target.terminal_index)
-      ? target.terminal_index
-      : undefined;
+  const terminalIndex = Number.isInteger(target.terminal_index)
+    ? target.terminal_index
+    : undefined;
   const short = cleanText(
-    target.short
-      || target.terminalNickname
-      || target.terminal_nickname
-      || target.label
-      || target.name,
+    target.short || target.terminal_nickname || target.label || target.name,
   );
   return {
     color: cleanText(target.color) || "#8bb8ff",
@@ -39,7 +33,7 @@ function normalizeOverlayTarget(target) {
     label: cleanText(target.label || short || `Agent ${terminalIndex !== undefined ? terminalIndex + 1 : ""}`) || "Agent",
     role: cleanText(target.role),
     short,
-    terminalIndex,
+    terminal_index: terminalIndex,
     title: cleanText(target.title),
   };
 }
@@ -56,7 +50,7 @@ function normalizeOverlayActivityItem(item) {
   if (!item || typeof item !== "object") {
     return null;
   }
-  const itemId = cleanText(item.itemId || item.item_id || item.id);
+  const itemId = cleanText(item.item_id || item.id);
   if (!itemId) {
     return null;
   }
@@ -70,14 +64,14 @@ function normalizeOverlayActivityItem(item) {
         : ["interrupted", "cancelled", "canceled", "stopped", "aborted"].includes(rawStatus)
           ? "interrupted"
           : "queued";
-  const submittedAtMs = Number(item.submittedAtMs ?? item.submitted_at_ms ?? 0);
+  const submittedAtMs = Number(item.submitted_at_ms ?? 0);
   return {
-    color: cleanText(item.color || item.targetTerminalColor || item.target_terminal_color) || "#8bb8ff",
-    itemId,
-    label: cleanText(item.label || item.targetLabel || item.target_label || "Agent") || "Agent",
+    color: cleanText(item.color || item.target_terminal_color) || "#8bb8ff",
+    item_id: itemId,
+    label: cleanText(item.label || item.target_label || "Agent") || "Agent",
     short: cleanText(item.short),
     status,
-    submittedAtMs: Number.isFinite(submittedAtMs) && submittedAtMs > 0 ? submittedAtMs : Date.now(),
+    submitted_at_ms: Number.isFinite(submittedAtMs) && submittedAtMs > 0 ? submittedAtMs : Date.now(),
     text: cleanText(item.text || item.prompt || item.title),
     title: cleanText(item.title),
   };
@@ -87,21 +81,21 @@ function normalizeOverlayActivityItems(items) {
   return cleanArray(items)
     .map(normalizeOverlayActivityItem)
     .filter(Boolean)
-    .sort((left, right) => left.submittedAtMs - right.submittedAtMs);
+    .sort((left, right) => left.submitted_at_ms - right.submitted_at_ms);
 }
 
 function buildOverlayConfig({
   autoDismissCompleted = false,
   activityItems = [],
-  contextRefs = [],
-  defaultSelectedTargetIds = [],
+  context_refs: contextRefs = [],
+  default_selected_target_ids: defaultSelectedTargetIds = [],
   targets = [],
 } = {}) {
   return {
     autoDismissCompleted: Boolean(autoDismissCompleted),
     activityItems: normalizeOverlayActivityItems(activityItems),
-    contextRefs: cleanArray(contextRefs).filter((context) => context && typeof context === "object"),
-    defaultSelectedTargetIds: normalizeOverlayTargetIds(defaultSelectedTargetIds),
+    context_refs: cleanArray(contextRefs).filter((context) => context && typeof context === "object"),
+    default_selected_target_ids: normalizeOverlayTargetIds(defaultSelectedTargetIds),
     targets: normalizeOverlayTargets(targets),
   };
 }
@@ -134,14 +128,14 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
 
     function normalizeTargets(targets) {
       return array(targets).map((target) => {
-        const id = text(target && (target.id || target.value || target.terminalIndex || target.terminal_index));
+        const id = text(target && (target.id || target.value || target.terminal_index));
         if (!id) return null;
         return {
           color: text(target.color) || "#8bb8ff",
           id,
           label: text(target.label || target.short || target.name) || "Agent",
           role: text(target.role).toLowerCase(),
-          short: text(target.short || target.terminalNickname || target.terminal_nickname || target.label || target.name) || "Agent",
+          short: text(target.short || target.terminal_nickname || target.label || target.name) || "Agent",
           title: text(target.title)
         };
       }).filter(Boolean);
@@ -162,7 +156,7 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
 
     function normalizeActivityItems(items) {
       return array(items).map((item) => {
-        const itemId = text(item && (item.itemId || item.item_id || item.id));
+        const itemId = text(item && (item.item_id || item.id));
         if (!itemId) return null;
         const rawStatus = text(item.status || item.state || "queued").toLowerCase().replace(/[\\s-]+/g, "_");
         const status = ["completed", "complete", "done", "success", "succeeded"].includes(rawStatus)
@@ -174,18 +168,18 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
               : ["interrupted", "cancelled", "canceled", "stopped", "aborted"].includes(rawStatus)
                 ? "interrupted"
                 : "queued";
-        const submittedAtMs = Number(item.submittedAtMs || item.submitted_at_ms || 0);
+        const submittedAtMs = Number(item.submitted_at_ms || 0);
         return {
-          color: text(item.color || item.targetTerminalColor || item.target_terminal_color) || "#8bb8ff",
-          itemId,
-          label: text(item.label || item.targetLabel || item.target_label || "Agent") || "Agent",
+          color: text(item.color || item.target_terminal_color) || "#8bb8ff",
+          item_id: itemId,
+          label: text(item.label || item.target_label || "Agent") || "Agent",
           short: text(item.short),
           status,
-          submittedAtMs: Number.isFinite(submittedAtMs) && submittedAtMs > 0 ? submittedAtMs : Date.now(),
+          submitted_at_ms: Number.isFinite(submittedAtMs) && submittedAtMs > 0 ? submittedAtMs : Date.now(),
           text: text(item.text || item.prompt || item.title),
           title: text(item.title)
         };
-      }).filter(Boolean).sort((left, right) => left.submittedAtMs - right.submittedAtMs);
+      }).filter(Boolean).sort((left, right) => left.submitted_at_ms - right.submitted_at_ms);
     }
 
     function statusLabel(status) {
@@ -205,7 +199,7 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
 
     function contextLabel(context) {
       if (!context || typeof context !== "object") return "";
-      const element = text(context.element || context.tagName || context.tag_name || "element");
+      const element = text(context.element || "element");
       let host = "";
       try {
         host = new URL(context.url || "").host;
@@ -223,7 +217,7 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
     function pushEvent(state, event) {
       state.events.push({
         ...event,
-        createdAtMs: Date.now()
+        created_at_ms: Date.now()
       });
     }
 
@@ -373,7 +367,7 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
             const target = item.short || item.label || "Agent";
             const title = [item.text || item.title || "Panel prompt", target ? "Target: " + target : "", statusLabel(item.status)].filter(Boolean).join(" - ");
             const dismiss = item.status === "completed"
-              ? '<button aria-label="Dismiss completed prompt" class="activity-dismiss" data-dismiss-activity-id="' + html(item.itemId) + '" type="button">×</button>'
+              ? '<button aria-label="Dismiss completed prompt" class="activity-dismiss" data-dismiss-activity-id="' + html(item.item_id) + '" type="button">×</button>'
               : "";
             const countdown = item.status === "completed" && state.config.autoDismissCompleted
               ? '<span class="activity-countdown" aria-hidden="true"></span>'
@@ -883,7 +877,7 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
           event.stopPropagation();
           const itemId = text(button.getAttribute("data-dismiss-activity-id"));
           if (itemId) {
-            pushEvent(state, { itemId, type: "dismissActivity" });
+            pushEvent(state, { item_id: itemId, type: "dismissActivity" });
           }
         });
       });
@@ -1024,18 +1018,18 @@ function normalizeOverlayEvents(value) {
 export function useWebAgentPromptOverlay({
   autoDismissCompleted = false,
   activityItems = [],
-  contextRefs = [],
-  defaultSelectedTargetIds = [],
+  context_refs: contextRefs = [],
+  default_selected_target_ids: defaultSelectedTargetIds = [],
   enabled = false,
   evaluate,
   onClearContext = null,
   onClose = null,
   onDismissCompletedItem = null,
   onSubmit = null,
-  panelKind = "",
-  panelPaneId = "",
+  panel_kind: panelKind = "",
+  panel_pane_id: panelPaneId = "",
   targets = [],
-  windowId = "",
+  window_id: windowId = "",
 } = {}) {
   const activityItemsRef = useRef(activityItems);
   const clearContextRef = useRef(onClearContext);
@@ -1067,8 +1061,8 @@ export function useWebAgentPromptOverlay({
   const config = useMemo(() => buildOverlayConfig({
     autoDismissCompleted,
     activityItems,
-    contextRefs,
-    defaultSelectedTargetIds,
+    context_refs: contextRefs,
+    default_selected_target_ids: defaultSelectedTargetIds,
     targets,
   }), [activityItems, autoDismissCompleted, contextRefs, defaultSelectedTargetIds, targets]);
   const configRef = useRef(config);
@@ -1081,18 +1075,18 @@ export function useWebAgentPromptOverlay({
       return Promise.reject(new Error("Workspace web view is unavailable."));
     }
     return evaluator(buildWebAgentPromptOverlayScript(action, payload), {
-      expectResult: options.expectResult !== false,
+      expect_result: options.expect_result !== false,
     });
   }, []);
 
   useEffect(() => {
     if (!nativeEnabled) {
       if (typeof evaluate === "function") {
-        void evaluate(buildWebAgentPromptOverlayScript("hide"), { expectResult: false }).catch(() => {});
+        void evaluate(buildWebAgentPromptOverlayScript("hide"), { expect_result: false }).catch(() => {});
       }
       return undefined;
     }
-    void runOverlayAction("show", configRef.current, { expectResult: false }).catch(() => {});
+    void runOverlayAction("show", configRef.current, { expect_result: false }).catch(() => {});
     return undefined;
   }, [configSignature, evaluate, nativeEnabled, runOverlayAction]);
 
@@ -1103,7 +1097,7 @@ export function useWebAgentPromptOverlay({
     return () => {
       const evaluator = evaluateRef.current;
       if (typeof evaluator === "function") {
-        void evaluator(buildWebAgentPromptOverlayScript("hide"), { expectResult: false }).catch(() => {});
+        void evaluator(buildWebAgentPromptOverlayScript("hide"), { expect_result: false }).catch(() => {});
       }
     };
   }, [nativeEnabled]);
@@ -1121,7 +1115,7 @@ export function useWebAgentPromptOverlay({
       }
       try {
         const events = normalizeOverlayEvents(
-          await runOverlayAction("drain", {}, { expectResult: true }),
+          await runOverlayAction("drain", {}, { expect_result: true }),
         );
         for (const event of events) {
           if (disposed) {
@@ -1136,10 +1130,10 @@ export function useWebAgentPromptOverlay({
             await runOverlayAction("show", buildOverlayConfig({
               autoDismissCompleted: configRef.current.autoDismissCompleted,
               activityItems: activityItemsRef.current,
-              contextRefs: contextRefsRef.current,
-              defaultSelectedTargetIds: defaultSelectedTargetIdsRef.current,
+              context_refs: contextRefsRef.current,
+              default_selected_target_ids: defaultSelectedTargetIdsRef.current,
               targets: targetsRef.current,
-            }), { expectResult: false }).catch(() => {});
+            }), { expect_result: false }).catch(() => {});
             continue;
           }
           if (type === "clearContext") {
@@ -1147,7 +1141,7 @@ export function useWebAgentPromptOverlay({
             continue;
           }
           if (type === "dismissActivity") {
-            const itemId = cleanText(event.itemId || event.item_id);
+            const itemId = cleanText(event.item_id);
             if (itemId) {
               dismissCompletedItemRef.current?.(itemId);
             }
@@ -1157,33 +1151,33 @@ export function useWebAgentPromptOverlay({
             continue;
           }
           const text = cleanText(event.text);
-          const targetIds = normalizeOverlayTargetIds(event.targetIds);
+          const targetIds = normalizeOverlayTargetIds(event.target_ids);
           const currentTargets = normalizeOverlayTargets(targetsRef.current);
           const targetTerminalIndexes = targetIds
-            .map((targetId) => currentTargets.find((target) => target.id === targetId)?.terminalIndex)
+            .map((targetId) => currentTargets.find((target) => target.id === targetId)?.terminal_index)
             .filter((terminalIndex) => Number.isInteger(terminalIndex));
           try {
             await submitRef.current?.({
-              contextRefs: contextRefsRef.current,
-              panelKind: panelKindRef.current,
-              panelPaneId: panelPaneIdRef.current,
-              targetIds,
-              targetTerminalIndexes,
+              context_refs: contextRefsRef.current,
+              panel_kind: panelKindRef.current,
+              panel_pane_id: panelPaneIdRef.current,
+              target_ids: targetIds,
+              target_terminal_indexes: targetTerminalIndexes,
               text,
-              windowId: windowIdRef.current,
+              window_id: windowIdRef.current,
             });
             if (disposed) {
               return;
             }
             await clearContextRef.current?.();
-            await runOverlayAction("submitted", {}, { expectResult: false }).catch(() => {});
+            await runOverlayAction("submitted", {}, { expect_result: false }).catch(() => {});
           } catch (err) {
             if (disposed) {
               return;
             }
             await runOverlayAction("error", {
               message: err?.message || String(err || "Unable to send prompt."),
-            }, { expectResult: false }).catch(() => {});
+            }, { expect_result: false }).catch(() => {});
           }
         }
       } catch {
@@ -1192,10 +1186,10 @@ export function useWebAgentPromptOverlay({
         void runOverlayAction("show", buildOverlayConfig({
           autoDismissCompleted: configRef.current.autoDismissCompleted,
           activityItems: activityItemsRef.current,
-          contextRefs: contextRefsRef.current,
-          defaultSelectedTargetIds: defaultSelectedTargetIdsRef.current,
+          context_refs: contextRefsRef.current,
+          default_selected_target_ids: defaultSelectedTargetIdsRef.current,
           targets: targetsRef.current,
-        }), { expectResult: false }).catch(() => {});
+        }), { expect_result: false }).catch(() => {});
       }
       timeoutId = window.setTimeout(poll, WEB_AGENT_PROMPT_OVERLAY_POLL_MS);
     };

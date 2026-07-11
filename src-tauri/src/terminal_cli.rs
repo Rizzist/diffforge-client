@@ -530,7 +530,6 @@ static OPENCODE_MODEL_LIST_CACHE: OnceLock<StdMutex<Option<OpencodeModelCacheEnt
     OnceLock::new();
 
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct OpencodeModelList {
     models: Vec<String>,
     source: String,
@@ -812,7 +811,7 @@ fn fetch_opencode_models_from_cli() -> Result<OpencodeModelCacheEntry, String> {
     Err(last_error)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn opencode_list_models(force_refresh: Option<bool>) -> OpencodeModelList {
     let force_refresh = force_refresh.unwrap_or(false);
 
@@ -1614,7 +1613,7 @@ Default routing:
 - For Loopspace graph edits, call get_loopspace_graph and list_loopspace_triggers first. Loopspace graphs use .dfblueprint source with explicit node ids, typed node kinds, and edge node.port -> node.port connections. Trigger nodes are references to reusable trigger inventory: if the requested cron/webhook/manual trigger does not exist, call create_loopspace_trigger first with an explicit trigger_type, then patch_loopspace_graph with op=\"attach_trigger\" and trigger_id. Webhook triggers are inbound; they default to signed_hmac, and public_token is allowed only when the user explicitly asks for a public URL and public_webhook_confirmed=true is set. Never invent standalone cron/manual/webhook trigger nodes in the graph source.
 - For add_node, use supported node kinds: document_read, document_write, asset_read, asset_write, run_script, send_message, dispatch_todos, notify_device, or step. Device nodes are legacy saved-graph compatibility only; target devices are selected on send_message, dispatch_todos, run_script, and notify_device nodes. When a Loopspace should send a message to the terminal orchestrator or coding agent, model it as a send_message action region; do not model that as queue_todo, dispatch_todos, or a loose terminal edge. When a Loopspace should dispatch queued todos to workspace terminals, model it as a dispatch_todos action region. send_message and dispatch_todos can both contain child step nodes for internal checkpoints with parent_id set to the action node id; dispatch_todos can also be direct with target_workspace_ids and todo_lines and no children.
 - Connect trigger.out -> send_message.in or dispatch_todos.in; connect document_read.docs or asset_read.assets -> step.in for readable context; connect step.docs -> document_write.in and step.assets -> asset_write.in for generated outputs; and connect step.success -> run_script.in/send_message.in/dispatch_todos.in/notify_device.in for follow-up actions. Legal ports include trigger.out; run_script/send_message/dispatch_todos/notify_device exec, success, failure, and interrupt; document_read/document_write docs; asset_read/asset_write assets; step success/docs/assets; and target .in ports. Resource nodes use doc_refs or asset_refs for selected inputs, create_name for generated outputs, h for height, and target_mode for selection/create behavior. Send-message nodes use prompt plus optional device_id/target_device_id, device_label/target_device_label, target_agent_id, target_terminal_id, model, reasoning_effort, and speed. Dispatch todo nodes use target_workspace_ids and todo_lines plus device_id/target_device_id, target_agent_id, model, reasoning_effort, speed, and terminal targeting; set target_terminal_mode=\"auto\" or omit terminal selectors for any terminal, and set target_terminal_mode=\"pinned\" with target_terminal_id, target_terminal_index, or target_terminal_name for a specific terminal.
-- Loopspace packets use compact LS/1 lines instead of verbose JSON. When executing a Dispatch Todo with loop_runtime_run_id, the initial todo carries run identity only, not the child loop contents. Call coordination-kernel.start_task with loopspace_id, loop_runtime_run_id, loop_runtime_node_id, loop_runtime_edge_id, trigger_id, and trigger_run_id when present, wait for its response, and use the LS/1 run_context in loopspace_run_context. It returns only the connected subloop slice, the main Dispatch Todo action for direct runs or the first/current child checkpoint for stepped runs, and the exact docs/assets read-write resources. coordination-kernel.start_task creates the local task and injects the Cloud-backed Loopspace run context; coordination-kernel.checkpoint remains local visibility only. After each local checkpoint, call record_loopspace_step_progress, include the loop runtime ids, wait for the response, and follow nextCheckpoint before moving on. For dispatch_todos, todo queue status is the final source of completed/failed/interrupted state; checkpoint progress only updates the internal step display. Do not connect send_message.exec, send_message.success, dispatch_todos.exec, dispatch_todos.success, run_script.exec, or other action execution branches directly into document_write or asset_write; route generated docs/assets through child step docs/assets ports. Prefer patch_loopspace_graph for attach_trigger, add_node, move_node, remove_node, connect, disconnect, and update_node_props; specify from_port/fromPort and to_port/toPort on connect operations, especially from run_script/send_message/dispatch_todos/notify_device action nodes. Use update_loopspace_graph only for larger full-source rewrites, preserve existing ids, and wait for the hydrated result.
+- Loopspace packets use compact LS/1 lines instead of verbose JSON. When executing a Dispatch Todo with loop_runtime_run_id, the initial todo carries run identity only, not the child loop contents. Call coordination-kernel.start_task with loopspace_id, loop_runtime_run_id, loop_runtime_node_id, loop_runtime_edge_id, trigger_id, and trigger_run_id when present, wait for its response, and use the LS/1 run_context in loopspace_run_context. It returns only the connected subloop slice, the main Dispatch Todo action for direct runs or the first/current child checkpoint for stepped runs, and the exact docs/assets read-write resources. coordination-kernel.start_task creates the local task and injects the Cloud-backed Loopspace run context; coordination-kernel.checkpoint remains local visibility only. After each local checkpoint, call record_loopspace_step_progress, include the loop runtime ids, wait for the response, and follow next_checkpoint before moving on. For dispatch_todos, todo queue status is the final source of completed/failed/interrupted state; checkpoint progress only updates the internal step display. Do not connect send_message.exec, send_message.success, dispatch_todos.exec, dispatch_todos.success, run_script.exec, or other action execution branches directly into document_write or asset_write; route generated docs/assets through child step docs/assets ports. Prefer patch_loopspace_graph for attach_trigger, add_node, move_node, remove_node, connect, disconnect, and update_node_props; specify from_port and to_port on connect operations, especially from run_script/send_message/dispatch_todos/notify_device action nodes. Use update_loopspace_graph only for larger full-source rewrites, preserve existing ids, and wait for the hydrated result.
 - For tab or workspace navigation and terminal management, use select_tab, select_workspace, list_terminals, open_terminals, close_terminals, or focus_terminal.
 
 Do not search for legacy account-skills.md or random files when the app-control tools can answer or edit the live UI state. Ask a brief clarifying question only when the visible context is missing and the user's target cannot be inferred.";
@@ -1816,7 +1815,7 @@ fn claude_app_control_mcp_config_arg(
             },
             "diffforge": {
                 "scope": "app-control",
-                "alwaysOn": true,
+                "always_on": true,
                 "toggleable": false,
                 "authority": "local_app_control"
             }
@@ -3271,11 +3270,11 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
             &terminal_index,
             &activity_path,
             json!({
-                "argCount": args.len(),
-                "hasEventsPathArg": terminal_cli_arg_value(args, "--events-path").is_some(),
-                "hasPaneIdArg": terminal_cli_arg_value(args, "--pane-id").is_some(),
-                "hasInstanceIdArg": terminal_cli_arg_value(args, "--instance-id").is_some(),
-                "transportConfigured": false,
+                "arg_count": args.len(),
+                "has_events_path_arg": terminal_cli_arg_value(args, "--events-path").is_some(),
+                "has_pane_id_arg": terminal_cli_arg_value(args, "--pane-id").is_some(),
+                "has_instance_id_arg": terminal_cli_arg_value(args, "--instance-id").is_some(),
+                "transport_configured": false,
             }),
         );
     }
@@ -3305,7 +3304,7 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
             &workspace_id,
             &terminal_index,
             &activity_path,
-            json!({ "inputLength": input.len() }),
+            json!({ "input_length": input.len() }),
         );
         return 0;
     };
@@ -3328,13 +3327,13 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
             &terminal_index,
             &activity_path,
             json!({
-                "hookEventName": record.get("hookEventName").and_then(Value::as_str).unwrap_or_default(),
-                "rawKeys": diff_forge_activity_hook_object_keys(&hook_input),
-                "assistantDelta": diff_forge_activity_hook_text_debug_summary(record.get("assistantDelta").and_then(Value::as_str)),
-                "assistantMessage": diff_forge_activity_hook_text_debug_summary(record.get("assistantMessage").and_then(Value::as_str)),
-                "assistantMessageSnapshot": diff_forge_activity_hook_text_debug_summary(record.get("assistantMessageSnapshot").and_then(Value::as_str)),
-                "reasoningDelta": diff_forge_activity_hook_text_debug_summary(record.get("reasoningDelta").and_then(Value::as_str)),
-                "reasoningSnapshot": diff_forge_activity_hook_text_debug_summary(record.get("reasoningSnapshot").and_then(Value::as_str)),
+                "hook_event_name": record.get("hook_event_name").and_then(Value::as_str).unwrap_or_default(),
+                "raw_keys": diff_forge_activity_hook_object_keys(&hook_input),
+                "assistant_delta": diff_forge_activity_hook_text_debug_summary(record.get("assistant_delta").and_then(Value::as_str)),
+                "assistant_message": diff_forge_activity_hook_text_debug_summary(record.get("assistant_message").and_then(Value::as_str)),
+                "assistant_message_snapshot": diff_forge_activity_hook_text_debug_summary(record.get("assistant_message_snapshot").and_then(Value::as_str)),
+                "reasoning_delta": diff_forge_activity_hook_text_debug_summary(record.get("reasoning_delta").and_then(Value::as_str)),
+                "reasoning_snapshot": diff_forge_activity_hook_text_debug_summary(record.get("reasoning_snapshot").and_then(Value::as_str)),
             }),
         );
     }
@@ -3352,7 +3351,7 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
                 &activity_path,
                 json!({
                     "error": error,
-                    "hookEventName": record.get("hookEventName").and_then(Value::as_str).unwrap_or_default(),
+                    "hook_event_name": record.get("hook_event_name").and_then(Value::as_str).unwrap_or_default(),
                 }),
             ),
         }
@@ -3377,7 +3376,7 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
                 &terminal_index,
                 &activity_path,
                 json!({
-                    "hookEventName": record.get("hookEventName").and_then(Value::as_str).unwrap_or_default(),
+                    "hook_event_name": record.get("hook_event_name").and_then(Value::as_str).unwrap_or_default(),
                 }),
             ),
             Err(error) => write_diff_forge_activity_hook_debug(
@@ -3530,15 +3529,15 @@ fn write_diff_forge_activity_hook_debug(
         let _ = fs::create_dir_all(parent);
     }
     let record = json!({
-        "activityPath": activity_path.to_string_lossy(),
+        "activity_path": activity_path.to_string_lossy(),
         "details": details,
-        "instanceId": instance_id,
-        "paneId": pane_id,
+        "instance_id": instance_id,
+        "pane_id": pane_id,
         "phase": phase,
         "provider": provider,
-        "terminalIndex": terminal_index,
-        "timestampMs": terminal_now_ms(),
-        "workspaceId": workspace_id,
+        "terminal_index": terminal_index,
+        "timestamp_ms": terminal_now_ms(),
+        "workspace_id": workspace_id,
     });
     if let Ok(mut file) = fs::OpenOptions::new()
         .create(true)
@@ -3921,7 +3920,7 @@ fn diff_forge_native_plan_update(tool_name: &str, tool_input: &Value, hook_input
                 "tool": "exitplanmode",
                 "title": title,
                 "steps": steps,
-                "planText": plan_text.chars().take(4000).collect::<String>(),
+                "plan_text": plan_text.chars().take(4000).collect::<String>(),
             })
         }
         _ => Value::Null,
@@ -4376,81 +4375,66 @@ fn diff_forge_activity_hook_record(
     };
     let plan_update = diff_forge_native_plan_update(&tool_name, tool_input, hook_input);
     json!({
-        "timestampMs": current_time_ms(),
+        "timestamp_ms": current_time_ms(),
         "provider": provider,
-        "paneId": pane_id,
-        "instanceId": instance_id,
-        "workspaceId": workspace_id,
-        "terminalIndex": terminal_index,
-        "eventName": hook_event_name.clone(),
-        "hookEventName": hook_event_name,
-        "planUpdate": plan_update,
-        "sessionId": session_id,
-        "turnId": turn_id,
+        "pane_id": pane_id,
+        "instance_id": instance_id,
+        "workspace_id": workspace_id,
+        "terminal_index": terminal_index,
+        "event_name": hook_event_name.clone(),
+        "hook_event_name": hook_event_name,
+        "plan_update": plan_update,
+        "session_id": session_id,
+        "turn_id": turn_id,
         "cwd": hook_string(&["cwd"]),
-        "permissionMode": permission_mode,
-        "transcriptPath": transcript_path,
-        "agentId": agent_id,
-        "agentType": agent_type,
-        "agentTranscriptPath": agent_transcript_path,
-        "assistantMessage": assistant_message,
-        "assistantDelta": assistant_delta.clone(),
+        "permission_mode": permission_mode,
+        "transcript_path": transcript_path,
+        "agent_id": agent_id,
+        "agent_type": agent_type,
+        "agent_transcript_path": agent_transcript_path,
+        "assistant_message": assistant_message,
         "assistant_delta": assistant_delta,
-        "assistantMessageSnapshot": assistant_message_snapshot.clone(),
         "assistant_message_snapshot": assistant_message_snapshot,
-        "reasoningDelta": reasoning_delta.clone(),
         "reasoning_delta": reasoning_delta,
-        "reasoningSnapshot": reasoning_snapshot.clone(),
         "reasoning_snapshot": reasoning_snapshot,
-        "lastMessage": last_message.clone(),
-        "lastAssistantMessage": last_message,
+        "last_message": last_message.clone(),
+        "last_assistant_message": last_message,
         "message": display_message,
         "prompt": user_prompt.clone(),
-        "toolName": tool_name,
-        "toolUseId": tool_use_id,
-        "toolServer": tool_server,
-        "toolInput": tool_input.clone(),
-        "toolOutput": tool_output,
-        "toolError": tool_error,
-        "rawToolPayload": raw_tool_payload,
+        "tool_name": tool_name,
+        "tool_use_id": tool_use_id,
+        "tool_server": tool_server,
+        "tool_input": tool_input.clone(),
+        "tool_output": tool_output,
+        "tool_error": tool_error,
+        "raw_tool_payload": raw_tool_payload,
         "command": command,
-        "filePath": tool_paths.first().cloned().unwrap_or_default(),
-        "durationMs": duration_ms.clone(),
+        "file_path": tool_paths.first().cloned().unwrap_or_default(),
         "duration_ms": duration_ms,
-        "exitCode": exit_code.clone(),
         "exit_code": exit_code,
-        "graphFilePath": graph_file_path,
-        "approvalId": approval_id,
-        "permissionPromptId": permission_prompt_id,
-        "permissionRequestId": permission_request_id,
-        "permissionStatus": permission_status,
-        "permissionDecision": permission_decision,
-        "approvalStatus": approval_status,
-        "promptingUserKind": prompting_user_kind,
-        "promptingUserSource": prompting_user_source,
-        "promptingUserText": prompting_user_text,
-        "promptOptions": prompt_options.clone(),
+        "graph_file_path": graph_file_path,
+        "approval_id": approval_id,
+        "permission_prompt_id": permission_prompt_id,
+        "permission_request_id": permission_request_id,
+        "permission_status": permission_status,
+        "permission_decision": permission_decision,
+        "approval_status": approval_status,
+        "prompting_user_kind": prompting_user_kind,
+        "prompting_user_source": prompting_user_source,
+        "prompting_user_text": prompting_user_text,
         "prompt_options": prompt_options,
-        "promptDefaultOption": prompt_default_option.clone(),
         "prompt_default_option": prompt_default_option,
-        "promptTtlMs": prompt_ttl_ms_value.clone(),
         "prompt_ttl_ms": prompt_ttl_ms_value,
-        "manualApprovalRequired": manual_approval_required,
-        "providerBlockedForUser": provider_blocked_for_user,
-        "requiresUserInput": requires_user_input,
-        "promptingUser": prompting_user,
-        "terminalIsPromptingUser": prompting_user,
-        "startupIdleCandidate": startup_idle_candidate,
+        "manual_approval_required": manual_approval_required,
+        "provider_blocked_for_user": provider_blocked_for_user,
+        "requires_user_input": requires_user_input,
+        "prompting_user": prompting_user,
+        "terminal_is_prompting_user": prompting_user,
         "startup_idle_candidate": startup_idle_candidate,
-        "sessionIdleWithoutPrompt": startup_idle_candidate,
         "session_idle_without_prompt": startup_idle_candidate,
-        "startupIdleBuffered": startup_idle_buffered,
         "startup_idle_buffered": startup_idle_buffered,
-        "stopHookActive": stop_hook_active,
         "stop_hook_active": stop_hook_active,
-        "backgroundTasks": background_tasks.clone(),
         "background_tasks": background_tasks,
-        "sessionCrons": session_crons.clone(),
         "session_crons": session_crons,
         "description": if description.is_empty() { user_prompt } else { description },
     })
@@ -5177,7 +5161,7 @@ mod terminal_cli_tests {
             "workspace-1",
             "0",
             &json!({
-                "hookEventName": "UserPromptRequired",
+                "hook_event_name": "UserPromptRequired",
                 "prompting_user_kind": "selection",
                 "prompting_user_text": "Choose what to do",
                 "prompt_default_option": "Use existing config",
@@ -5190,20 +5174,20 @@ mod terminal_cli_tests {
         );
 
         assert_eq!(
-            record.get("promptingUserKind").and_then(Value::as_str),
+            record.get("prompting_user_kind").and_then(Value::as_str),
             Some("selection")
         );
         assert_eq!(
-            record.get("promptDefaultOption").and_then(Value::as_str),
+            record.get("prompt_default_option").and_then(Value::as_str),
             Some("Use existing config")
         );
         assert_eq!(
-            record.get("promptTtlMs").and_then(Value::as_u64),
+            record.get("prompt_ttl_ms").and_then(Value::as_u64),
             Some(45000)
         );
         assert_eq!(
             record
-                .get("promptOptions")
+                .get("prompt_options")
                 .and_then(Value::as_array)
                 .map(Vec::len),
             Some(2)
@@ -5219,10 +5203,10 @@ mod terminal_cli_tests {
             "workspace-1",
             "0",
             &json!({
-                "hookEventName": "PostToolUse",
-                "toolName": "Bash",
-                "toolUseId": "tool-123",
-                "toolInput": { "command": "npm test" },
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_use_id": "tool-123",
+                "tool_input": { "command": "npm test" },
                 "tool_response": {
                     "stdout": "ok",
                     "stderr": "",
@@ -5233,13 +5217,11 @@ mod terminal_cli_tests {
             }),
         );
 
-        assert_eq!(record["toolName"].as_str(), Some("Bash"));
-        assert_eq!(record["toolUseId"].as_str(), Some("tool-123"));
-        assert_eq!(record["toolInput"]["command"].as_str(), Some("npm test"));
-        assert_eq!(record["toolOutput"]["stdout"].as_str(), Some("ok"));
-        assert_eq!(record["durationMs"].as_u64(), Some(1234));
+        assert_eq!(record["tool_name"].as_str(), Some("Bash"));
+        assert_eq!(record["tool_use_id"].as_str(), Some("tool-123"));
+        assert_eq!(record["tool_input"]["command"].as_str(), Some("npm test"));
+        assert_eq!(record["tool_output"]["stdout"].as_str(), Some("ok"));
         assert_eq!(record["duration_ms"].as_u64(), Some(1234));
-        assert_eq!(record["exitCode"].as_i64(), Some(0));
         assert_eq!(record["exit_code"].as_i64(), Some(0));
     }
 
@@ -5527,14 +5509,14 @@ mod terminal_cli_tests {
             "workspace-1",
             "0",
             &json!({
-                "hookEventName": "PostToolUse",
-                "toolName": "TodoWrite",
-                "toolInput": {"todos": [{"content": "Step one", "status": "pending"}]}
+                "hook_event_name": "PostToolUse",
+                "tool_name": "TodoWrite",
+                "tool_input": {"todos": [{"content": "Step one", "status": "pending"}]}
             }),
         );
-        assert_eq!(record["planUpdate"]["tool"], "todowrite");
+        assert_eq!(record["plan_update"]["tool"], "todowrite");
         assert_eq!(
-            record["planUpdate"]["steps"].as_array().map(Vec::len),
+            record["plan_update"]["steps"].as_array().map(Vec::len),
             Some(1)
         );
 
@@ -5545,12 +5527,12 @@ mod terminal_cli_tests {
             "workspace-1",
             "0",
             &json!({
-                "hookEventName": "PostToolUse",
-                "toolName": "Bash",
-                "toolInput": {"command": "ls"}
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"}
             }),
         );
-        assert!(plain["planUpdate"].is_null());
+        assert!(plain["plan_update"].is_null());
     }
 
     #[test]
@@ -5562,7 +5544,7 @@ mod terminal_cli_tests {
             "workspace-1",
             "0",
             &json!({
-                "hookEventName": "AssistantMessageDelta",
+                "hook_event_name": "AssistantMessageDelta",
                 "delta": {"text": "hello from a nested delta"}
             }),
         );
@@ -5571,7 +5553,7 @@ mod terminal_cli_tests {
             Some("hello from a nested delta")
         );
         assert_eq!(
-            record["assistantMessage"].as_str(),
+            record["assistant_message"].as_str(),
             Some("hello from a nested delta")
         );
     }
@@ -5586,12 +5568,11 @@ mod terminal_cli_tests {
             "workspace-1",
             "0",
             &json!({
-                "hookEventName": "AssistantMessageDelta",
+                "hook_event_name": "AssistantMessageDelta",
                 "assistant_message_snapshot": table
             }),
         );
 
-        assert_eq!(record["assistantMessageSnapshot"].as_str(), Some(table));
         assert_eq!(record["assistant_message_snapshot"].as_str(), Some(table));
     }
 
@@ -5604,42 +5585,37 @@ mod terminal_cli_tests {
             "workspace-1",
             "3",
             &json!({
-                "hookEventName": "Stop",
-                "sessionId": "session-123",
-                "turnId": "turn-456",
-                "transcriptPath": "/tmp/session.jsonl",
-                "userPrompt": "ship it",
-                "manualApprovalRequired": true,
-                "sessionIdleWithoutPrompt": true,
-                "stopHookActive": true,
-                "backgroundTasks": [{ "id": "task-1" }],
-                "sessionCrons": [{ "id": "cron-1" }],
-                "approvalId": "approval-123",
-                "promptingUserKind": "approval",
-                "toolInput": {
+                "hook_event_name": "Stop",
+                "session_id": "session-123",
+                "turn_id": "turn-456",
+                "transcript_path": "/tmp/session.jsonl",
+                "user_prompt": "ship it",
+                "manual_approval_required": true,
+                "session_idle_without_prompt": true,
+                "stop_hook_active": true,
+                "background_tasks": [{ "id": "task-1" }],
+                "session_crons": [{ "id": "cron-1" }],
+                "approval_id": "approval-123",
+                "prompting_user_kind": "approval",
+                "tool_input": {
                     "description": "fallback description"
                 }
             }),
         );
 
-        assert_eq!(record["hookEventName"], "Stop");
-        assert_eq!(record["sessionId"], "session-123");
-        assert_eq!(record["turnId"], "turn-456");
-        assert_eq!(record["transcriptPath"], "/tmp/session.jsonl");
+        assert_eq!(record["hook_event_name"], "Stop");
+        assert_eq!(record["session_id"], "session-123");
+        assert_eq!(record["turn_id"], "turn-456");
+        assert_eq!(record["transcript_path"], "/tmp/session.jsonl");
         assert_eq!(record["prompt"], "ship it");
-        assert_eq!(record["manualApprovalRequired"], true);
-        assert_eq!(record["startupIdleCandidate"], true);
+        assert_eq!(record["manual_approval_required"], true);
         assert_eq!(record["startup_idle_candidate"], true);
-        assert_eq!(record["sessionIdleWithoutPrompt"], true);
         assert_eq!(record["session_idle_without_prompt"], true);
-        assert_eq!(record["stopHookActive"], true);
         assert_eq!(record["stop_hook_active"], true);
-        assert_eq!(record["backgroundTasks"][0]["id"], "task-1");
         assert_eq!(record["background_tasks"][0]["id"], "task-1");
-        assert_eq!(record["sessionCrons"][0]["id"], "cron-1");
         assert_eq!(record["session_crons"][0]["id"], "cron-1");
-        assert_eq!(record["approvalId"], "approval-123");
-        assert_eq!(record["promptingUserKind"], "approval");
+        assert_eq!(record["approval_id"], "approval-123");
+        assert_eq!(record["prompting_user_kind"], "approval");
     }
 }
 
@@ -5795,9 +5771,9 @@ fn claude_coordination_mcp_config_arg(
                 },
                 "diffforge": {
                     "scope": "terminal-session",
-                    "alwaysOn": true,
+                    "always_on": true,
                     "toggleable": false,
-                    "identitySource": "terminal_launch_args",
+                    "identity_source": "terminal_launch_args",
                     "authority": "local_coordination_kernel"
                 }
             },
@@ -5807,9 +5783,9 @@ fn claude_coordination_mcp_config_arg(
                 "env": gateway_environment,
                 "diffforge": {
                     "scope": "terminal-session",
-                    "alwaysOn": true,
+                    "always_on": true,
                     "toggleable": false,
-                    "identitySource": "terminal_launch_args",
+                    "identity_source": "terminal_launch_args",
                     "authority": "workspace_mcp_gateway"
                 }
             }
@@ -5851,9 +5827,9 @@ fn inject_claude_workspace_gateway_bridge_env(
                 "args": gateway_args,
                 "diffforge": {
                     "scope": "terminal-session",
-                    "alwaysOn": true,
+                    "always_on": true,
                     "toggleable": false,
-                    "identitySource": "terminal_launch_args",
+                    "identity_source": "terminal_launch_args",
                     "authority": "workspace_mcp_gateway"
                 }
             })
@@ -8376,27 +8352,27 @@ static CHAT_ATTACHMENT_VERIFY_CACHE: OnceLock<
 
 #[derive(Clone, Debug, Deserialize)]
 struct ChatAttachmentRef {
-    #[serde(default, alias = "attachmentId", alias = "id")]
+    #[serde(default)]
     attachment_id: String,
     #[serde(default)]
     sha256: String,
-    #[serde(default, alias = "size", alias = "sizeBytes", alias = "size_bytes")]
+    #[serde(default)]
     bytes: u64,
-    #[serde(default, alias = "mimeType", alias = "mime_type", alias = "type")]
+    #[serde(default)]
     mime: String,
-    #[serde(default, alias = "fileName", alias = "file_name")]
+    #[serde(default)]
     name: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 struct ChatAttachmentStageRequest {
-    #[serde(default, alias = "workspaceId")]
+    #[serde(default)]
     workspace_id: String,
     #[serde(default)]
     attachments: Vec<ChatAttachmentRef>,
-    #[serde(default, alias = "ackCloud")]
+    #[serde(default)]
     ack_cloud: bool,
-    #[serde(default, alias = "markerStartIndex")]
+    #[serde(default)]
     marker_start_index: usize,
 }
 
@@ -8441,7 +8417,6 @@ struct ChatAttachmentPushImage {
 }
 
 #[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct ChatAttachmentStageFailure {
     id: String,
     name: String,
@@ -8449,7 +8424,6 @@ struct ChatAttachmentStageFailure {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct ChatAttachmentStageResult {
     staged: Vec<String>,
     failed: Vec<ChatAttachmentStageFailure>,
@@ -9849,7 +9823,7 @@ fn run_agent_thread_turn_for_context(
     })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn save_todo_image_attachments(
     images: Vec<ForgePromptImage>,
 ) -> Result<Vec<SavedTodoImageAttachment>, String> {
@@ -9858,7 +9832,7 @@ async fn save_todo_image_attachments(
         .map_err(|error| format!("Unable to prepare todo image attachments: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn stage_chat_attachment_refs(
     request: ChatAttachmentStageRequest,
 ) -> Result<ChatAttachmentStageResult, String> {
@@ -9867,7 +9841,7 @@ async fn stage_chat_attachment_refs(
         .map_err(|error| format!("Unable to stage chat attachments: {error}"))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn save_todo_text_attachment(
     request: TodoTextAttachmentRequest,
 ) -> Result<SavedTodoTextAttachment, String> {

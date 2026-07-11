@@ -30,11 +30,11 @@ function buildWindowsPtyOptions(info = null) {
     return undefined;
   }
 
-  const buildNumber = Number(info?.buildNumber ?? info?.build_number ?? 0);
+  const buildNumber = Number(info?.build_number ?? 0);
   if (Number.isFinite(buildNumber) && buildNumber > 0) {
     return {
       backend: TERMINAL_WINDOWS_PTY_BACKEND,
-      buildNumber,
+      build_number: buildNumber,
     };
   }
 

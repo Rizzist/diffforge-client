@@ -916,35 +916,35 @@ function latestCollectionTimestampMs(values, keys) {
 }
 
 function getThreadSortFreshnessMs(thread, threadState, entry) {
-  const providerBinding = getWorkspaceThreadProviderBinding(thread, thread?.currentAgent);
-  const terminalBinding = providerBinding?.terminalBinding || thread?.terminalBinding;
-  const terminalIndex = terminalBinding?.terminalIndex ?? thread?.terminalIndex;
+  const providerBinding = getWorkspaceThreadProviderBinding(thread, thread?.current_agent);
+  const terminalBinding = providerBinding?.terminal_binding || thread?.terminal_binding;
+  const terminalIndex = terminalBinding?.terminal_index ?? thread?.terminal_index;
   const terminalKey = terminalIndex == null ? "" : String(terminalIndex);
   const mappedTerminal = terminalKey ? entry?.terminals?.[terminalKey] : null;
   return maxThreadTimestampMs([
-    thread?.lastMessageAt,
-    thread?.lastActiveAt,
-    thread?.updatedAt,
-    thread?.createdAt,
-    thread?.pendingPrompt?.updatedAt,
-    thread?.pendingPrompt?.submittedAt,
-    thread?.pendingPrompt?.createdAt,
-    thread?.latestTurn?.updatedAt,
-    thread?.latestTurn?.completedAt,
-    thread?.latestTurn?.startedAt,
-    thread?.latestTurn?.requestedAt,
-    thread?.latestTurn?.createdAt,
-    providerBinding?.lastMessageAt,
-    providerBinding?.lastActiveAt,
-    providerBinding?.nativeSessionUpdatedAt,
-    providerBinding?.updatedAt,
-    mappedTerminal?.lastMessageAt,
-    mappedTerminal?.lastActiveAt,
-    mappedTerminal?.updatedAt,
-    mappedTerminal?.createdAt,
-    mappedTerminal?.terminalLaunchEpoch,
-    latestCollectionTimestampMs(thread?.messages, ["createdAt", "created_at"]),
-    latestCollectionTimestampMs(thread?.projectionEvents, ["createdAt", "created_at"]),
+    thread?.last_message_at,
+    thread?.last_active_at,
+    thread?.updated_at,
+    thread?.created_at,
+    thread?.pending_prompt?.updated_at,
+    thread?.pending_prompt?.submitted_at,
+    thread?.pending_prompt?.created_at,
+    thread?.latest_turn?.updated_at,
+    thread?.latest_turn?.completed_at,
+    thread?.latest_turn?.started_at,
+    thread?.latest_turn?.requested_at,
+    thread?.latest_turn?.created_at,
+    providerBinding?.last_message_at,
+    providerBinding?.last_active_at,
+    providerBinding?.native_session_updated_at,
+    providerBinding?.updated_at,
+    mappedTerminal?.last_message_at,
+    mappedTerminal?.last_active_at,
+    mappedTerminal?.updated_at,
+    mappedTerminal?.created_at,
+    mappedTerminal?.terminal_launch_epoch,
+    latestCollectionTimestampMs(thread?.messages, ["created_at"]),
+    latestCollectionTimestampMs(thread?.projection_events, ["created_at"]),
   ]);
 }
 
@@ -970,7 +970,7 @@ function getThreadRows(workspaceThreads, workspaceId) {
     return [];
   }
 
-  return (entry.threadOrder || [])
+  return (entry.thread_order || [])
     .map((threadId) => entry.threads?.[threadId])
     .filter((thread) => thread?.materialized)
     .map((thread, index) => ({
@@ -1008,23 +1008,23 @@ function terminalMatchesThreadBinding(terminal, terminalBinding) {
     return true;
   }
 
-  const terminalIndexMatches = Number(terminal.terminalIndex) === Number(terminalBinding.terminalIndex);
-  const instanceMatches = !terminalBinding.instanceId
-    || Number(terminal.instanceId) === Number(terminalBinding.instanceId);
-  const paneMatches = !terminalBinding.paneId || terminal.paneId === terminalBinding.paneId;
+  const terminalIndexMatches = Number(terminal.terminal_index) === Number(terminalBinding.terminal_index);
+  const instanceMatches = !terminalBinding.instance_id
+    || Number(terminal.instance_id) === Number(terminalBinding.instance_id);
+  const paneMatches = !terminalBinding.pane_id || terminal.pane_id === terminalBinding.pane_id;
   return terminalIndexMatches && instanceMatches && paneMatches;
 }
 
 function getThreadState(thread, entry) {
-  const providerBinding = getWorkspaceThreadProviderBinding(thread, thread?.currentAgent);
-  const terminalBinding = providerBinding?.terminalBinding || thread?.terminalBinding;
+  const providerBinding = getWorkspaceThreadProviderBinding(thread, thread?.current_agent);
+  const terminalBinding = providerBinding?.terminal_binding || thread?.terminal_binding;
   const turnState = getWorkspaceThreadTurnState(thread);
-  const hasProviderSession = Boolean(thread?.transcriptSessionId || providerBinding?.nativeSessionId);
-  const terminalIndex = terminalBinding?.terminalIndex ?? thread?.terminalIndex;
+  const hasProviderSession = Boolean(thread?.transcript_session_id || providerBinding?.native_session_id);
+  const terminalIndex = terminalBinding?.terminal_index ?? thread?.terminal_index;
   const terminalKey = terminalIndex == null ? "" : String(terminalIndex);
   const mappedTerminal = terminalKey ? entry?.terminals?.[terminalKey] : null;
   const isTerminalMappedToThread = Boolean(
-    mappedTerminal?.threadId === thread?.id
+    mappedTerminal?.thread_id === thread?.id
       && terminalMatchesThreadBinding(mappedTerminal, terminalBinding),
   );
   const isActiveTerminal = Boolean(
@@ -1035,7 +1035,7 @@ function getThreadState(thread, entry) {
   const terminalGroundTruth = getThreadTerminalGroundTruth({
     liveTerminal: isTerminalMappedToThread ? mappedTerminal : null,
     providerBinding,
-    targetRole: thread?.currentAgent || "",
+    target_role: thread?.current_agent || "",
     thread,
   });
   let threadViewState = THREAD_VIEW_STATE.INACTIVE_NO_SESSION;
@@ -1048,7 +1048,7 @@ function getThreadState(thread, entry) {
   }
 
   const inactiveNoSession = threadViewState === THREAD_VIEW_STATE.INACTIVE_NO_SESSION;
-  const groundTruthWorkState = String(terminalGroundTruth?.terminalWorkState || "").toLowerCase();
+  const groundTruthWorkState = String(terminalGroundTruth?.terminal_work_state || "").toLowerCase();
   const liveGroundTruthWorkState = isActiveTerminal ? groundTruthWorkState : "";
   const isWorking = inactiveNoSession || !isActiveTerminal
     ? false
@@ -1107,30 +1107,30 @@ function addThreadSearchPart(parts, value) {
 function getThreadSearchText(thread, workspace) {
   const metadataParts = [];
   const messageParts = [];
-  const providerBindings = thread?.providerBindings && typeof thread.providerBindings === "object"
-    ? Object.values(thread.providerBindings)
+  const providerBindings = thread?.provider_bindings && typeof thread.provider_bindings === "object"
+    ? Object.values(thread.provider_bindings)
     : [];
 
   addThreadSearchPart(metadataParts, workspace?.name);
   addThreadSearchPart(metadataParts, thread?.id);
   addThreadSearchPart(metadataParts, thread?.title);
-  addThreadSearchPart(metadataParts, thread?.sessionName);
-  addThreadSearchPart(metadataParts, thread?.currentAgent);
-  addThreadSearchPart(metadataParts, thread?.preferredAgent);
-  addThreadSearchPart(metadataParts, thread?.slotKey);
+  addThreadSearchPart(metadataParts, thread?.session_name);
+  addThreadSearchPart(metadataParts, thread?.current_agent);
+  addThreadSearchPart(metadataParts, thread?.preferred_agent);
+  addThreadSearchPart(metadataParts, thread?.slot_key);
   addThreadSearchPart(metadataParts, thread?.status);
-  addThreadSearchPart(metadataParts, thread?.transcriptSessionId);
-  addThreadSearchPart(metadataParts, thread?.pendingPrompt?.text);
-  addThreadSearchPart(metadataParts, thread?.pendingPrompt?.message);
-  addThreadSearchPart(metadataParts, thread?.latestTurn?.state);
-  addThreadSearchPart(metadataParts, thread?.latestTurn?.error);
+  addThreadSearchPart(metadataParts, thread?.transcript_session_id);
+  addThreadSearchPart(metadataParts, thread?.pending_prompt?.text);
+  addThreadSearchPart(metadataParts, thread?.pending_prompt?.message);
+  addThreadSearchPart(metadataParts, thread?.latest_turn?.state);
+  addThreadSearchPart(metadataParts, thread?.latest_turn?.error);
   addThreadSearchPart(metadataParts, getWorkspaceThreadLabel(thread));
 
   providerBindings.forEach((binding) => {
-    addThreadSearchPart(metadataParts, binding?.agentId);
-    addThreadSearchPart(metadataParts, binding?.modelId);
-    addThreadSearchPart(metadataParts, binding?.nativeSessionId);
-    addThreadSearchPart(metadataParts, binding?.nativeSessionTitle);
+    addThreadSearchPart(metadataParts, binding?.agent_id);
+    addThreadSearchPart(metadataParts, binding?.model_id);
+    addThreadSearchPart(metadataParts, binding?.native_session_id);
+    addThreadSearchPart(metadataParts, binding?.native_session_title);
     addThreadSearchPart(metadataParts, binding?.status);
   });
 
@@ -1192,7 +1192,7 @@ function countThreadRows(threadGroups) {
 }
 
 function WorkspaceThreadsOverlay({
-  agentStatuses,
+  agent_statuses: agentStatuses,
   composerAttachments,
   composerDrafts,
   onClose,
@@ -1207,12 +1207,12 @@ function WorkspaceThreadsOverlay({
   open,
   preferSelectedThreadId = false,
   selectedThreadId,
-  selectedWorkspaceId,
+  selected_workspace_id: selectedWorkspaceId,
   todoDropActive = false,
   todoDropTarget = false,
   todoDropUnsupportedMessage = "",
   viewState,
-  workspaceRoot = "",
+  workspace_root: workspaceRoot = "",
   workspaceThreads,
   workspaces,
 }) {
@@ -1229,18 +1229,18 @@ function WorkspaceThreadsOverlay({
   const normalizedSearchQuery = normalizeThreadSearchText(deferredSearchQuery);
   const searchVisible = searchActive || normalizeThreadSearchText(searchQuery).length > 0;
   const localSelection = {
-    threadId: preferSelectedThreadId
+    thread_id: preferSelectedThreadId
       ? selectedThreadId || ""
       : safeViewState.selectedThreadId || selectedThreadId || "",
-    workspaceId: preferSelectedThreadId
-      ? selectedWorkspaceId || safeViewState.selectedWorkspaceId || ""
-      : safeViewState.selectedWorkspaceId || selectedWorkspaceId || "",
+    workspace_id: preferSelectedThreadId
+      ? selectedWorkspaceId || safeViewState.selected_workspace_id || ""
+      : safeViewState.selected_workspace_id || selectedWorkspaceId || "",
   };
   const commitViewState = (workspaceId, patch = {}) => {
     const safeWorkspaceId = workspaceId
-      || patch.workspaceId
-      || patch.selectedWorkspaceId
-      || localSelection.workspaceId
+      || patch.workspace_id
+      || patch.selected_workspace_id
+      || localSelection.workspace_id
       || selectedWorkspaceId
       || "";
     if (!safeWorkspaceId) {
@@ -1248,7 +1248,7 @@ function WorkspaceThreadsOverlay({
     }
     onViewStateChange?.(safeWorkspaceId, {
       ...patch,
-      workspaceId: safeWorkspaceId,
+      workspace_id: safeWorkspaceId,
     });
   };
   const closeSearch = () => {
@@ -1331,9 +1331,9 @@ function WorkspaceThreadsOverlay({
   const totalThreadCount = useMemo(() => countThreadRows(threadGroups), [threadGroups]);
   const visibleThreadCount = useMemo(() => countThreadRows(visibleThreadGroups), [visibleThreadGroups]);
   const hasVisibleThreads = collapsedThreadGroups.length > 0;
-  const selectedThreadFromLocal = workspaceThreads?.[localSelection.workspaceId]
-    ?.threads?.[localSelection.threadId];
-  const selectedThreadEntry = workspaceThreads?.[localSelection.workspaceId];
+  const selectedThreadFromLocal = workspaceThreads?.[localSelection.workspace_id]
+    ?.threads?.[localSelection.thread_id];
+  const selectedThreadEntry = workspaceThreads?.[localSelection.workspace_id];
   const fallbackSelection = collapsedThreadGroups[0]?.threads?.[0]
     ? {
       thread: collapsedThreadGroups[0].threads[0],
@@ -1344,10 +1344,10 @@ function WorkspaceThreadsOverlay({
     ? selectedThreadFromLocal
     : fallbackSelection.thread;
   const activeWorkspace = activeThread
-    ? (workspaces || []).find((workspace) => workspace.id === activeThread.workspaceId)
+    ? (workspaces || []).find((workspace) => workspace.id === activeThread.workspace_id)
       || fallbackSelection.workspace
     : null;
-  const activeWorkspaceId = activeWorkspace?.id || activeThread?.workspaceId || "";
+  const activeWorkspaceId = activeWorkspace?.id || activeThread?.workspace_id || "";
   const activeThreadId = activeThread?.id || "";
   const newChatWorkspace = (workspaces || []).find((workspace) => workspace.id === selectedWorkspaceId)
     || activeWorkspace
@@ -1361,30 +1361,30 @@ function WorkspaceThreadsOverlay({
     const activeThreadState = activeThread && activeWorkspaceId
       ? getThreadState(activeThread, workspaceThreads?.[activeWorkspaceId])
       : null;
-    const selectedThreadState = selectedThreadFromLocal && localSelection.workspaceId
+    const selectedThreadState = selectedThreadFromLocal && localSelection.workspace_id
       ? getThreadState(selectedThreadFromLocal, selectedThreadEntry)
       : null;
     const fallbackThread = fallbackSelection.thread || null;
     const snapshot = {
-      activeThreadId,
-      activeThreadLatestTurnState: String(activeThread?.latestTurn?.state || ""),
+      active_thread_id: activeThreadId,
+      activeThreadLatestTurnState: String(activeThread?.latest_turn?.state || ""),
       activeThreadMessageCount: Array.isArray(activeThread?.messages) ? activeThread.messages.length : 0,
-      activeThreadRawActivityStatus: String(activeThread?.activityStatus || ""),
+      activeThreadRawActivityStatus: String(activeThread?.activity_status || ""),
       activeThreadRawStatus: String(activeThread?.status || ""),
       activeThreadState,
       activeWorkspaceId,
       fallbackThreadId: String(fallbackThread?.id || ""),
-      localSelectionThreadId: localSelection.threadId,
-      localSelectionWorkspaceId: localSelection.workspaceId,
+      localSelectionThreadId: localSelection.thread_id,
+      localSelectionWorkspaceId: localSelection.workspace_id,
       newChatActive,
       open,
       selectedThreadId: selectedThreadId || "",
-      selectedThreadLatestTurnState: String(selectedThreadFromLocal?.latestTurn?.state || ""),
-      selectedThreadRawActivityStatus: String(selectedThreadFromLocal?.activityStatus || ""),
+      selectedThreadLatestTurnState: String(selectedThreadFromLocal?.latest_turn?.state || ""),
+      selectedThreadRawActivityStatus: String(selectedThreadFromLocal?.activity_status || ""),
       selectedThreadRawStatus: String(selectedThreadFromLocal?.status || ""),
       selectedThreadState,
       selectedThreadVisible,
-      selectedWorkspaceId: selectedWorkspaceId || "",
+      selected_workspace_id: selectedWorkspaceId || "",
       visibleActiveThreadId,
       visibleActiveWorkspaceId,
     };
@@ -1400,8 +1400,8 @@ function WorkspaceThreadsOverlay({
     activeThreadId,
     activeWorkspaceId,
     fallbackSelection.thread,
-    localSelection.threadId,
-    localSelection.workspaceId,
+    localSelection.thread_id,
+    localSelection.workspace_id,
     newChatActive,
     open,
     selectedThreadEntry,
@@ -1416,7 +1416,7 @@ function WorkspaceThreadsOverlay({
     commitViewState(workspaceId, {
       newChatActive: false,
       selectedThreadId: threadId,
-      selectedWorkspaceId: workspaceId,
+      selected_workspace_id: workspaceId,
     });
     onSelectThread?.(workspaceId, threadId);
   };
@@ -1425,7 +1425,7 @@ function WorkspaceThreadsOverlay({
   // nativeSessionId, across all workspaces) and select it. Sessions that do
   // not map to a known thread no-op.
   const openTranscriptSessionRef = (sessionRef = {}) => {
-    const sessionIds = [sessionRef?.agentChatSessionId, sessionRef?.providerSessionId]
+    const sessionIds = [sessionRef?.agent_chat_session_id, sessionRef?.provider_session_id]
       .map((value) => String(value || "").trim())
       .filter(Boolean);
     if (!sessionIds.length) {
@@ -1438,9 +1438,9 @@ function WorkspaceThreadsOverlay({
           continue;
         }
         const candidateIds = [
-          candidate?.transcriptSessionId,
-          ...Object.values(candidate?.providerBindings || {})
-            .map((binding) => binding?.nativeSessionId),
+          candidate?.transcript_session_id,
+          ...Object.values(candidate?.provider_bindings || {})
+            .map((binding) => binding?.native_session_id),
         ].map((value) => String(value || "").trim());
         if (candidateIds.some((value) => value && sessionIds.includes(value))) {
           selectThread(workspace.id, candidate.id);
@@ -1460,12 +1460,12 @@ function WorkspaceThreadsOverlay({
     commitViewState(workspaceId, {
       newChatActive: true,
       railCollapsed: false,
-      selectedWorkspaceId: workspaceId,
+      selected_workspace_id: workspaceId,
     });
   };
   const openSearch = () => {
     setSearchActive(true);
-    const workspaceId = activeWorkspaceId || selectedWorkspaceId || localSelection.workspaceId || "";
+    const workspaceId = activeWorkspaceId || selectedWorkspaceId || localSelection.workspace_id || "";
     if (railCollapsed) {
       commitViewState(workspaceId, {
         railCollapsed: false,
@@ -1481,13 +1481,13 @@ function WorkspaceThreadsOverlay({
       ...request,
       workspace: request?.workspace || newChatWorkspace,
     });
-    const nextWorkspaceId = result?.workspaceId || result?.workspace?.id || newChatWorkspace?.id || "";
-    const nextThreadId = result?.threadId || result?.thread?.id || "";
+    const nextWorkspaceId = result?.workspace_id || result?.workspace?.id || newChatWorkspace?.id || "";
+    const nextThreadId = result?.thread_id || result?.thread?.id || "";
     if (nextWorkspaceId && nextThreadId) {
       commitViewState(nextWorkspaceId, {
         newChatActive: false,
         selectedThreadId: nextThreadId,
-        selectedWorkspaceId: nextWorkspaceId,
+        selected_workspace_id: nextWorkspaceId,
       });
       onSelectThread?.(nextWorkspaceId, nextThreadId);
     }
@@ -1500,7 +1500,7 @@ function WorkspaceThreadsOverlay({
       const workspaceId = newChatWorkspace?.id || selectedWorkspaceId || activeWorkspaceId || "";
       commitViewState(workspaceId, {
         newChatActive: true,
-        selectedWorkspaceId: workspaceId,
+        selected_workspace_id: workspaceId,
       });
     }
   }, [hasVisibleThreads, open]);
@@ -1512,9 +1512,9 @@ function WorkspaceThreadsOverlay({
 
     onActiveThreadChange?.({
       thread: newChatActive ? null : activeThread || null,
-      threadId: newChatActive ? "" : activeThreadId,
+      thread_id: newChatActive ? "" : activeThreadId,
       workspace: newChatActive ? newChatWorkspace : activeWorkspace || null,
-      workspaceId: newChatActive ? newChatWorkspace?.id || "" : activeWorkspaceId,
+      workspace_id: newChatActive ? newChatWorkspace?.id || "" : activeWorkspaceId,
     });
   }, [
     activeThread,
@@ -1765,7 +1765,7 @@ function WorkspaceThreadsOverlay({
         </ThreadRail>
 
         <WorkspaceThreadDetail
-          agentStatuses={agentStatuses}
+          agent_statuses={agentStatuses}
           composerAttachments={composerAttachments}
           composerDrafts={composerDrafts}
           newChatActive={newChatActive}
@@ -1779,7 +1779,7 @@ function WorkspaceThreadsOverlay({
           todoDropTarget={todoDropTarget}
           todoDropUnsupportedMessage={todoDropUnsupportedMessage}
           workspace={newChatActive ? newChatWorkspace : activeWorkspace}
-          workspaceRoot={(newChatActive ? newChatWorkspace?.rootDirectory : activeWorkspace?.rootDirectory) || workspaceRoot || ""}
+          workspace_root={(newChatActive ? newChatWorkspace?.root_directory : activeWorkspace?.root_directory) || workspaceRoot || ""}
           workspaceThreadEntry={workspaceThreads?.[newChatActive ? newChatWorkspace?.id || "" : activeWorkspaceId]}
           visible={open}
         />

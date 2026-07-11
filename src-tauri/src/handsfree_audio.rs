@@ -125,7 +125,6 @@ impl AudioShortcutAction {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct AudioShortcutEvent {
     action: &'static str,
     shortcut: String,
@@ -133,7 +132,6 @@ struct AudioShortcutEvent {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct AudioPushToTalkEvent {
     phase: &'static str,
     pressed: bool,
@@ -843,7 +841,7 @@ static AUDIO_CANCEL_SCOPE_REGISTERED: AtomicBool = AtomicBool::new(false);
 /// `audio_cancel_shortcut_defers_global_registration`); the widget calls this
 /// when it enters/leaves arming/recording/transcribing so ESC cancels even
 /// when another app or terminal has keyboard focus.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn audio_cancel_shortcut_scope(app: AppHandle, active: bool) -> Result<(), String> {
     let manager = app.state::<AudioState>().shortcut_manager.clone();
     let cancel = manager.snapshot().registration(AudioShortcutAction::Cancel);
@@ -2643,13 +2641,13 @@ fn handsfree_insert_result(inserted: bool, method: &'static str, reason: Option<
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn audio_shortcuts_status(app: AppHandle) -> Result<AudioShortcutSettingsStatus, String> {
     log_audio_diagnostic_event("audio.shortcuts.status.command", json!({}));
     Ok(audio_shortcuts_status_for(&app))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn audio_push_to_talk_status(app: AppHandle) -> Result<AudioPushToTalkEvent, String> {
     let status = audio_push_to_talk_status_for(&app);
     log_audio_diagnostic_event(
@@ -2663,7 +2661,7 @@ async fn audio_push_to_talk_status(app: AppHandle) -> Result<AudioPushToTalkEven
     Ok(status)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn open_audio_shortcut_permissions(
     app: AppHandle,
 ) -> Result<AudioShortcutSettingsStatus, String> {
@@ -2676,7 +2674,7 @@ async fn open_audio_shortcut_permissions(
     Ok(audio_shortcuts_status_for(&app))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn open_macos_fn_key_settings(app: AppHandle) -> Result<AudioShortcutSettingsStatus, String> {
     #[cfg(target_os = "macos")]
     {
@@ -2692,7 +2690,7 @@ async fn open_macos_fn_key_settings(app: AppHandle) -> Result<AudioShortcutSetti
     Ok(audio_shortcuts_status_for(&app))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn set_audio_shortcut(
     app: AppHandle,
     request: AudioShortcutUpdateRequest,
@@ -2700,12 +2698,12 @@ async fn set_audio_shortcut(
     set_audio_shortcut_for(&app, request)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn reset_audio_shortcuts(app: AppHandle) -> Result<AudioShortcutSettingsStatus, String> {
     reset_audio_shortcuts_for(&app)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn insert_handsfree_transcribed_text(
     app: AppHandle,
     terminal_state: State<'_, TerminalState>,

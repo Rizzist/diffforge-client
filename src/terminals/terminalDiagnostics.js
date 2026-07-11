@@ -116,7 +116,7 @@ export function logTerminalDiagnosticEvent(phase, fields = {}, options = {}) {
 
   const cleanPhase = cleanDiagnosticText(phase);
 
-  const elapsedMs = Number(fields.elapsedMs);
+  const elapsedMs = Number(fields.elapsed_ms);
   if (
     Number.isFinite(options.minElapsedMs)
     && (!Number.isFinite(elapsedMs) || elapsedMs < options.minElapsedMs)
@@ -196,7 +196,7 @@ export function logTerminalDiagnosticDuration(phase, startedAtMs, fields = {}, o
     phase,
     {
       ...fields,
-      elapsedMs: Math.max(0, nowMs() - startedAtMs),
+      elapsed_ms: Math.max(0, nowMs() - startedAtMs),
     },
     options,
   );
@@ -254,7 +254,7 @@ export function startTerminalDiagnosticHeartbeat() {
 
     if (gapMs >= TERMINAL_DIAGNOSTIC_MAIN_THREAD_GAP_MS) {
       logTerminalDiagnosticEvent("frontend.main_thread_gap", {
-        elapsedMs: gapMs,
+        elapsed_ms: gapMs,
         expectedMs: heartbeatIntervalMs || TERMINAL_DIAGNOSTIC_HEARTBEAT_MS,
       });
     }

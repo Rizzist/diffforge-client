@@ -114,7 +114,6 @@ fn diffforge_untracked_asset_name(path: &Path) -> String {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct DiffforgeSaveUntrackedTextAssetRequest {
     group: Option<String>,
     name: Option<String>,
@@ -124,7 +123,6 @@ struct DiffforgeSaveUntrackedTextAssetRequest {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct DiffforgeSaveUntrackedDataUrlAssetRequest {
     data_url: String,
     group: Option<String>,
@@ -193,35 +191,24 @@ fn diffforge_untracked_asset_item(root: &Path, path: &Path) -> Result<Value, Str
     let local_path = canonical.display().to_string();
     Ok(json!({
         "id": id.clone(),
-        "untracked_id": id.clone(),
-        "untrackedId": id,
+        "untracked_id": id,
         "name": name.clone(),
         "filename": name,
         "kind": kind,
-        "mime_type": mime_type.clone(),
-        "mimeType": mime_type,
+        "mime_type": mime_type,
         "size_bytes": metadata.len(),
-        "sizeBytes": metadata.len(),
         "local_path": local_path.clone(),
-        "localPath": local_path.clone(),
         "path": local_path,
-        "relative_path": relative_path.clone(),
-        "relativePath": relative_path,
+        "relative_path": relative_path,
         "group": group,
         "cloud_status": "untracked",
-        "cloudStatus": "untracked",
         "local_status": "untracked",
-        "localStatus": "untracked",
         "tracking_status": "untracked",
-        "trackingStatus": "untracked",
         "asset_scope": "untracked",
-        "assetScope": "untracked",
         "untracked": true,
         "trackable": true,
         "modified_ms": modified_ms,
-        "modifiedMs": modified_ms,
         "created_ms": created_ms,
-        "createdMs": created_ms,
     }))
 }
 
@@ -285,12 +272,10 @@ fn diffforge_untracked_asset_library(limit: Option<u64>) -> Result<Value, String
     items.sort_by(|left, right| {
         let left_ms = left
             .get("modified_ms")
-            .or_else(|| left.get("modifiedMs"))
             .and_then(Value::as_u64)
             .unwrap_or_default();
         let right_ms = right
             .get("modified_ms")
-            .or_else(|| right.get("modifiedMs"))
             .and_then(Value::as_u64)
             .unwrap_or_default();
         right_ms.cmp(&left_ms)
@@ -303,7 +288,6 @@ fn diffforge_untracked_asset_library(limit: Option<u64>) -> Result<Value, String
         .iter()
         .filter(|item| {
             item.get("mime_type")
-                .or_else(|| item.get("mimeType"))
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .starts_with("image/")
@@ -316,9 +300,7 @@ fn diffforge_untracked_asset_library(limit: Option<u64>) -> Result<Value, String
         "version": 1,
         "source": "local_untracked_asset_directory",
         "asset_root": asset_root.display().to_string(),
-        "assetRoot": asset_root.display().to_string(),
         "untracked_root": root.display().to_string(),
-        "untrackedRoot": root.display().to_string(),
         "items": items.clone(),
         "assets": items,
         "count": count,
@@ -326,10 +308,8 @@ fn diffforge_untracked_asset_library(limit: Option<u64>) -> Result<Value, String
             "status": "local_only",
             "count": count,
             "image_count": image_count,
-            "imageCount": image_count,
             "syncable": false,
             "mcp_visible": false,
-            "mcpVisible": false,
         }
     }))
 }
@@ -456,7 +436,6 @@ fn diffforge_emit_untracked_assets_updated(app: &AppHandle, reason: &str, item: 
     let mut payload = json!({
         "kind": "untracked_assets_updated",
         "event_kind": "untracked_assets_updated",
-        "eventKind": "untracked_assets_updated",
         "reason": reason,
     });
     if let (Some(object), Some(item)) = (payload.as_object_mut(), item) {
@@ -465,7 +444,7 @@ fn diffforge_emit_untracked_assets_updated(app: &AppHandle, reason: &str, item: 
     let _ = app.emit(DIFFFORGE_UNTRACKED_ASSETS_UPDATED_EVENT, payload);
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn diffforge_start_untracked_assets_watcher(app: AppHandle) -> Result<Value, String> {
     let root = diffforge_prepare_untracked_asset_root()?;
     if DIFFFORGE_UNTRACKED_ASSET_WATCHER_STARTED
@@ -476,7 +455,6 @@ fn diffforge_start_untracked_assets_watcher(app: AppHandle) -> Result<Value, Str
             "ok": true,
             "already_running": true,
             "untracked_root": root.display().to_string(),
-            "untrackedRoot": root.display().to_string(),
         }));
     }
 
@@ -529,16 +507,15 @@ fn diffforge_start_untracked_assets_watcher(app: AppHandle) -> Result<Value, Str
         "ok": true,
         "already_running": false,
         "untracked_root": root.display().to_string(),
-        "untrackedRoot": root.display().to_string(),
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn diffforge_list_untracked_assets(limit: Option<u64>) -> Result<Value, String> {
     diffforge_untracked_asset_library(limit)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn diffforge_delete_untracked_asset(app: AppHandle, path: String) -> Result<Value, String> {
     let file = diffforge_untracked_asset_file(&path)?;
     fs::remove_file(&file).map_err(|error| {
@@ -557,7 +534,7 @@ fn diffforge_delete_untracked_asset(app: AppHandle, path: String) -> Result<Valu
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn diffforge_rename_untracked_asset(
     app: AppHandle,
     path: String,
@@ -586,19 +563,18 @@ fn diffforge_rename_untracked_asset(
         "kind": "untracked_asset_renamed",
         "path": target.display().to_string(),
         "old_path": file.display().to_string(),
-        "oldPath": file.display().to_string(),
         "item": item,
         "library": diffforge_untracked_asset_library(None)?,
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn diffforge_copy_asset_to_clipboard(path: String) -> Result<Value, String> {
     let file = diffforge_local_asset_file(&path)?;
     diffforge_copy_image_file_to_clipboard(&file)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn diffforge_save_untracked_text_asset(
     app: AppHandle,
     request: DiffforgeSaveUntrackedTextAssetRequest,
@@ -684,7 +660,7 @@ fn diffforge_save_untracked_text_asset(
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn diffforge_save_untracked_data_url_asset(
     app: AppHandle,
     request: DiffforgeSaveUntrackedDataUrlAssetRequest,
@@ -741,12 +717,12 @@ fn diffforge_save_untracked_data_url_asset(
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn diffforge_copy_image_data_url_to_clipboard(image_data_url: String) -> Result<Value, String> {
     diffforge_copy_image_data_url_to_clipboard_for(&image_data_url)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn diffforge_untrack_account_asset(
     app: AppHandle,
     asset_id: String,
@@ -765,7 +741,7 @@ fn diffforge_untrack_account_asset(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .or_else(|| cloud_mcp_payload_text(&row, &["local_path", "localPath", "path"]))
+        .or_else(|| cloud_mcp_payload_text(&row, &["local_path", "path"]))
         .ok_or_else(|| "Download the asset locally before untracking it.".to_string())?;
     let source = diffforge_local_asset_file(&local_path)?;
     if diffforge_path_is_inside_untracked_assets(&source).unwrap_or(false) {
@@ -831,15 +807,10 @@ fn diffforge_untrack_account_asset(
         json!({
             "kind": "asset_library_untracked",
             "event_kind": "asset_library_untracked",
-            "eventKind": "asset_library_untracked",
             "asset_id": asset_id.clone(),
-            "assetId": asset_id.clone(),
             "local_path": local_path,
-            "localPath": source.display().to_string(),
             "untracked_path": target.display().to_string(),
-            "untrackedPath": target.display().to_string(),
             "source_removed": removed_source,
-            "sourceRemoved": removed_source,
             "cloud": cloud.clone(),
         }),
     );
@@ -847,19 +818,16 @@ fn diffforge_untrack_account_asset(
     Ok(json!({
         "kind": "asset_library_untracked",
         "asset_id": asset_id,
-        "assetId": asset_id,
         "path": target.display().to_string(),
         "local_path": target.display().to_string(),
-        "localPath": target.display().to_string(),
         "item": item,
         "source_removed": removed_source,
-        "sourceRemoved": removed_source,
         "cloud": cloud,
         "library": diffforge_untracked_asset_library(None)?,
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn diffforge_promote_untracked_asset(
     app: AppHandle,
     path: String,
@@ -925,32 +893,24 @@ fn diffforge_promote_untracked_asset(
     let now = cloud_mcp_rfc3339_now();
     let metadata = json!({
         "source": "asset_library",
-        "sourceKind": "snip",
+        "source_kind": "snip",
         "folder": group,
         "group": group,
         "asset_folder": group,
-        "assetFolder": group,
         "asset_group": group,
-        "assetGroup": group,
         "promoted_from": "untracked_scratch",
-        "promotedFrom": "untracked_scratch",
-        "promoted_at": now.clone(),
-        "promotedAt": now,
+        "promoted_at": now,
     });
     let input = json!({
         "asset_id": asset_id.clone(),
-        "assetId": asset_id.clone(),
         "name": filename.clone(),
         "filename": filename,
         "kind": cloud_mcp_asset_kind_for_mime(&mime_type),
-        "mime_type": mime_type.clone(),
-        "mimeType": mime_type,
+        "mime_type": mime_type,
         "folder": group,
         "group": group,
         "asset_folder": group,
-        "assetFolder": group,
         "source_kind": "snip",
-        "sourceKind": "snip",
         "metadata": metadata,
     });
     let row = cloud_mcp_asset_local_row_with_input(
@@ -985,9 +945,7 @@ fn diffforge_promote_untracked_asset(
         json!({
             "kind": "asset_library_local_registered",
             "event_kind": "asset_library_local_registered",
-            "eventKind": "asset_library_local_registered",
             "asset_id": asset_id.clone(),
-            "assetId": asset_id.clone(),
             "payload": {
                 "kind": "asset_library_local_registered",
                 "asset": row.clone(),
@@ -1007,15 +965,11 @@ fn diffforge_promote_untracked_asset(
     Ok(json!({
         "kind": "untracked_asset_promoted",
         "source": "untracked_assets",
-        "asset_id": asset_id.clone(),
-        "assetId": asset_id,
+        "asset_id": asset_id,
         "asset": row,
         "local_path": target_path.display().to_string(),
-        "localPath": target_path.display().to_string(),
         "source_path": source.display().to_string(),
-        "sourcePath": source.display().to_string(),
         "source_removed": removed_source,
-        "sourceRemoved": removed_source,
         "cloud": cloud,
         "library": diffforge_untracked_asset_library(None)?,
     }))
@@ -1064,14 +1018,13 @@ fn hyperframe_transcript_sidecar_paths(media_path: &Path) -> (PathBuf, PathBuf) 
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct HyperframeSaveMediaTranscriptRequest {
     media_path: String,
     srt_text: String,
     transcript_json: String,
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn hyperframe_save_media_transcript(
     app: AppHandle,
     request: HyperframeSaveMediaTranscriptRequest,
@@ -1101,12 +1054,12 @@ fn hyperframe_save_media_transcript(
     }
 
     Ok(json!({
-        "jsonPath": json_path.display().to_string(),
-        "srtPath": srt_path.display().to_string(),
+        "json_path": json_path.display().to_string(),
+        "srt_path": srt_path.display().to_string(),
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn hyperframe_media_transcript_status(media_path: String) -> Result<Value, String> {
     let media_path = hyperframe_validated_media_path(&media_path)?;
     let (srt_path, json_path) = hyperframe_transcript_sidecar_paths(&media_path);
@@ -1121,8 +1074,8 @@ fn hyperframe_media_transcript_status(media_path: String) -> Result<Value, Strin
         .unwrap_or(0);
     Ok(json!({
         "exists": srt_exists && json_exists,
-        "jsonPath": if json_exists { json_path.display().to_string() } else { String::new() },
-        "srtPath": if srt_exists { srt_path.display().to_string() } else { String::new() },
-        "updatedAtMs": updated_at_ms,
+        "json_path": if json_exists { json_path.display().to_string() } else { String::new() },
+        "srt_path": if srt_exists { srt_path.display().to_string() } else { String::new() },
+        "updated_at_ms": updated_at_ms,
     }))
 }

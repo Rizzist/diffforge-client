@@ -53,15 +53,15 @@ function parsePcbWindowParams() {
   const search = queryIndex >= 0 ? hash.slice(queryIndex + 1) : "";
   const params = new URLSearchParams(search);
   return {
-    boardPath: params.get("boardPath") || "",
-    repoPath: params.get("repoPath") || "",
-    boardName: params.get("boardName") || "",
+    board_path: params.get("board_path") || "",
+    repo_path: params.get("repo_path") || "",
+    board_name: params.get("board_name") || "",
     mode: params.get("mode") || "",
-    paneId: params.get("paneId") || "",
+    pane_id: params.get("pane_id") || "",
     tab: params.get("tab") || "pcb",
     theme: params.get("theme") || "dark",
-    windowId: params.get("windowId") || "",
-    workspaceId: params.get("workspaceId") || "",
+    window_id: params.get("window_id") || "",
+    workspace_id: params.get("workspace_id") || "",
   };
 }
 
@@ -97,16 +97,16 @@ export default function PcbWindowHost() {
   const agentPromptTargetsRequestIdRef = React.useRef("");
   const windowLabel = useMemo(() => {
     try {
-      return currentWindow.label || params.windowId || "";
+      return currentWindow.label || params.window_id || "";
     } catch {
-      return params.windowId || "";
+      return params.window_id || "";
     }
-  }, [currentWindow, params.windowId]);
+  }, [currentWindow, params.window_id]);
   const board = useMemo(
-    () => ({ path: params.boardPath, name: params.boardName || params.boardPath }),
+    () => ({ path: params.board_path, name: params.board_name || params.board_path }),
     [params],
   );
-  const isPanelWindow = params.mode === "panel" || Boolean(params.paneId);
+  const isPanelWindow = params.mode === "panel" || Boolean(params.pane_id);
 
   useEffect(() => {
     document.documentElement.dataset.forgeTheme =
@@ -114,10 +114,10 @@ export default function PcbWindowHost() {
   }, [params.theme]);
 
   useEffect(() => {
-    if (params.repoPath) {
-      invoke("pcb_watch_start", { repoPath: params.repoPath }).catch(() => {});
+    if (params.repo_path) {
+      invoke("pcb_watch_start", { repo_path: params.repo_path }).catch(() => {});
     }
-  }, [params.repoPath]);
+  }, [params.repo_path]);
 
   const startWindowDrag = useCallback((event) => {
     if (event.button !== 0) {
@@ -143,46 +143,46 @@ export default function PcbWindowHost() {
   const returnToGrid = useCallback(() => {
     emit(PCB_PANEL_CONTROL_EVENT, {
       control: PCB_PANEL_CONTROL_RETURN,
-      paneId: params.paneId,
-      windowId: windowLabel,
-      workspaceId: params.workspaceId,
+      pane_id: params.pane_id,
+      window_id: windowLabel,
+      workspace_id: params.workspace_id,
     })
       .catch(() => {})
       .finally(() => {
         safeTauriWindowCall(currentWindow, "close");
       });
-  }, [currentWindow, params.paneId, params.workspaceId, windowLabel]);
+  }, [currentWindow, params.pane_id, params.workspace_id, windowLabel]);
 
   const requestAgentPromptTargets = useCallback(() => {
     const requestId = createPanelAgentPromptRequestId("pcb-panel-targets");
     agentPromptTargetsRequestIdRef.current = requestId;
     emit(PANEL_AGENT_PROMPT_TARGETS_REQUEST_EVENT, {
-      panelKind: "pcb",
-      paneId: params.paneId,
-      requestId,
-      windowId: windowLabel,
-      workspaceId: params.workspaceId,
+      panel_kind: "pcb",
+      pane_id: params.pane_id,
+      request_id: requestId,
+      window_id: windowLabel,
+      workspace_id: params.workspace_id,
     }).catch(() => {});
-  }, [params.paneId, params.workspaceId, windowLabel]);
+  }, [params.pane_id, params.workspace_id, windowLabel]);
 
   const requestAgentPromptActivity = useCallback(() => {
-    if (!isPanelWindow || !params.paneId) {
+    if (!isPanelWindow || !params.pane_id) {
       return;
     }
     emit(PANEL_AGENT_PROMPT_ACTIVITY_REQUEST_EVENT, {
-      panelKind: "pcb",
-      paneId: params.paneId,
-      windowId: windowLabel,
-      workspaceId: params.workspaceId,
+      panel_kind: "pcb",
+      pane_id: params.pane_id,
+      window_id: windowLabel,
+      workspace_id: params.workspace_id,
     }).catch(() => {});
-  }, [isPanelWindow, params.paneId, params.workspaceId, windowLabel]);
+  }, [isPanelWindow, params.pane_id, params.workspace_id, windowLabel]);
 
   useEffect(() => {
     requestAgentPromptActivity();
   }, [requestAgentPromptActivity]);
 
   useEffect(() => {
-    if (!isPanelWindow || !params.paneId) {
+    if (!isPanelWindow || !params.pane_id) {
       return undefined;
     }
     let disposed = false;
@@ -192,15 +192,15 @@ export default function PcbWindowHost() {
         return;
       }
       const payload = event?.payload || {};
-      const paneId = String(payload.paneId || payload.pane_id || payload.panelPaneId || payload.panel_pane_id || "").trim();
-      if (!paneId || paneId !== params.paneId) {
+      const paneId = String(payload.pane_id || payload.panel_pane_id || "").trim();
+      if (!paneId || paneId !== params.pane_id) {
         return;
       }
-      const workspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
-      if (workspaceId && params.workspaceId && workspaceId !== params.workspaceId) {
+      const workspaceId = String(payload.workspace_id || "").trim();
+      if (workspaceId && params.workspace_id && workspaceId !== params.workspace_id) {
         return;
       }
-      const windowId = String(payload.windowId || payload.window_id || "").trim();
+      const windowId = String(payload.window_id || "").trim();
       if (windowId && windowId !== windowLabel) {
         return;
       }
@@ -218,7 +218,7 @@ export default function PcbWindowHost() {
       disposed = true;
       unlisten();
     };
-  }, [isPanelWindow, params.paneId, params.workspaceId, windowLabel]);
+  }, [isPanelWindow, params.pane_id, params.workspace_id, windowLabel]);
 
   useEffect(() => {
     if (agentPromptOpen) {
@@ -234,22 +234,22 @@ export default function PcbWindowHost() {
         return;
       }
       const payload = event?.payload || {};
-      const requestId = String(payload.requestId || payload.request_id || "").trim();
-      const windowId = String(payload.windowId || payload.window_id || "").trim();
+      const requestId = String(payload.request_id || "").trim();
+      const windowId = String(payload.window_id || "").trim();
       if (requestId && requestId !== agentPromptTargetsRequestIdRef.current) {
         return;
       }
       if (windowId && windowId !== windowLabel) {
         return;
       }
-      const workspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
-      if (workspaceId && params.workspaceId && workspaceId !== params.workspaceId) {
+      const workspaceId = String(payload.workspace_id || "").trim();
+      if (workspaceId && params.workspace_id && workspaceId !== params.workspace_id) {
         return;
       }
       setAgentPromptTargets(normalizePanelAgentPromptTargets(payload.targets));
       setDefaultAgentPromptTargetIds(
-        (Array.isArray(payload.defaultSelectedTargetIds)
-          ? payload.defaultSelectedTargetIds
+        (Array.isArray(payload.default_selected_target_ids)
+          ? payload.default_selected_target_ids
           : Array.isArray(payload.default_selected_target_ids)
             ? payload.default_selected_target_ids
             : []
@@ -268,9 +268,9 @@ export default function PcbWindowHost() {
       disposed = true;
       unlisten();
     };
-  }, [params.workspaceId, windowLabel]);
+  }, [params.workspace_id, windowLabel]);
 
-  const submitAgentPrompt = useCallback(async ({ contextRefs, targetIds, targetTerminalIndexes, text }) => {
+  const submitAgentPrompt = useCallback(async ({ context_refs: contextRefs, target_ids: targetIds, target_terminal_indexes: targetTerminalIndexes, text }) => {
     const requestId = createPanelAgentPromptRequestId("pcb-panel-submit");
     let unlisten = () => {};
     return new Promise((resolve, reject) => {
@@ -288,10 +288,10 @@ export default function PcbWindowHost() {
       }, 15000);
       listen(PANEL_AGENT_PROMPT_RESULT_EVENT, (event) => {
         const payload = event?.payload || {};
-        if (String(payload.requestId || payload.request_id || "").trim() !== requestId) {
+        if (String(payload.request_id || "").trim() !== requestId) {
           return;
         }
-        const windowId = String(payload.windowId || payload.window_id || "").trim();
+        const windowId = String(payload.window_id || "").trim();
         if (windowId && windowId !== windowLabel) {
           return;
         }
@@ -309,15 +309,15 @@ export default function PcbWindowHost() {
           } else {
             unlisten = nextUnlisten;
             emit(PANEL_AGENT_PROMPT_SUBMIT_EVENT, {
-              contextRefs: Array.isArray(contextRefs) ? contextRefs : [],
-              panelKind: "pcb",
-              paneId: params.paneId,
-              requestId,
-              targetIds,
-              targetTerminalIndexes,
+              context_refs: Array.isArray(contextRefs) ? contextRefs : [],
+              panel_kind: "pcb",
+              pane_id: params.pane_id,
+              request_id: requestId,
+              target_ids: targetIds,
+              target_terminal_indexes: targetTerminalIndexes,
               text,
-              windowId: windowLabel,
-              workspaceId: params.workspaceId,
+              window_id: windowLabel,
+              workspace_id: params.workspace_id,
             }).catch((error) => {
               window.clearTimeout(timeoutId);
               cleanup();
@@ -331,10 +331,10 @@ export default function PcbWindowHost() {
           reject(error);
         });
     });
-  }, [params.paneId, params.workspaceId, windowLabel]);
+  }, [params.pane_id, params.workspace_id, windowLabel]);
 
   useEffect(() => {
-    if (!isPanelWindow || !params.paneId) {
+    if (!isPanelWindow || !params.pane_id) {
       return undefined;
     }
     let disposed = false;
@@ -344,13 +344,13 @@ export default function PcbWindowHost() {
         return;
       }
       const payload = event?.payload || {};
-      const paneId = String(payload.paneId || payload.pane_id || "").trim();
-      const workspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
-      const windowId = String(payload.windowId || payload.window_id || "").trim();
-      if (paneId && paneId !== params.paneId) {
+      const paneId = String(payload.pane_id || "").trim();
+      const workspaceId = String(payload.workspace_id || "").trim();
+      const windowId = String(payload.window_id || "").trim();
+      if (paneId && paneId !== params.pane_id) {
         return;
       }
-      if (workspaceId && workspaceId !== params.workspaceId) {
+      if (workspaceId && workspaceId !== params.workspace_id) {
         return;
       }
       if (windowId && windowId !== windowLabel) {
@@ -383,20 +383,20 @@ export default function PcbWindowHost() {
       disposed = true;
       unlisten();
     };
-  }, [currentWindow, isPanelWindow, params.paneId, params.workspaceId, returnToGrid, windowLabel]);
+  }, [currentWindow, isPanelWindow, params.pane_id, params.workspace_id, returnToGrid, windowLabel]);
 
   const handlePanelBoardChange = useCallback((nextBoard) => {
-    if (!isPanelWindow || !params.paneId) {
+    if (!isPanelWindow || !params.pane_id) {
       return;
     }
     emit(PCB_PANEL_CONTROL_EVENT, {
       board: nextBoard || null,
       control: PCB_PANEL_CONTROL_BOARD_CHANGE,
-      paneId: params.paneId,
-      windowId: windowLabel,
-      workspaceId: params.workspaceId,
+      pane_id: params.pane_id,
+      window_id: windowLabel,
+      workspace_id: params.workspace_id,
     }).catch(() => {});
-  }, [isPanelWindow, params.paneId, params.workspaceId, windowLabel]);
+  }, [isPanelWindow, params.pane_id, params.workspace_id, windowLabel]);
 
   if (isPanelWindow) {
     return (
@@ -483,25 +483,25 @@ export default function PcbWindowHost() {
         <PanelBody>
           <PcbWorkspacePane
             controlCommand={panelCommand}
-            isActive
+            is_active
             onBoardChange={handlePanelBoardChange}
             onElementPickerChange={setElementPicker}
-            paneId={params.paneId}
-            repoPath={params.repoPath}
-            workspaceId={params.workspaceId}
+            pane_id={params.pane_id}
+            repo_path={params.repo_path}
+            workspace_id={params.workspace_id}
           />
           {agentPromptOpen ? (
             <PanelAgentPromptComposer
               autoFocus
-              contextRefs={elementPicker?.contexts || []}
-              defaultSelectedTargetIds={defaultAgentPromptTargetIds}
+              context_refs={elementPicker?.contexts || []}
+              default_selected_target_ids={defaultAgentPromptTargetIds}
               onClearContext={elementPicker?.clear}
               onClose={() => setAgentPromptOpen(false)}
               onSubmit={submitAgentPrompt}
-              panelKind="pcb"
-              panelPaneId={params.paneId}
+              panel_kind="pcb"
+              panel_pane_id={params.pane_id}
               targets={agentPromptTargets}
-              windowId={windowLabel}
+              window_id={windowLabel}
             />
           ) : null}
         </PanelBody>
@@ -515,9 +515,9 @@ export default function PcbWindowHost() {
       <PcbPanel
         board={board}
         defaultTab={params.tab}
-        isActive
-        repoPath={params.repoPath}
-        workspaceId={params.workspaceId}
+        is_active
+        repo_path={params.repo_path}
+        workspace_id={params.workspace_id}
       />
     </WindowRoot>
   );

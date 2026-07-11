@@ -31,10 +31,10 @@ function targetToFormProfile(target) {
     host: target.host || "",
     port: target.port,
     username: target.username || "",
-    authMethod: target.auth_method,
-    keyPath: target.key_path || "",
-    certificatePath: target.certificate_path || "",
-    hasSecret: Boolean(target.has_secret),
+    auth_method: target.auth_method,
+    key_path: target.key_path || "",
+    certificate_path: target.certificate_path || "",
+    has_secret: Boolean(target.has_secret),
   };
 }
 
@@ -47,11 +47,11 @@ function formToUpsertInput(form, { agentEnabled, revealPassword }) {
     host: form.host,
     port: form.port === "" || form.port == null ? null : Number.parseInt(form.port, 10),
     username: form.username || null,
-    authMethod: form.authMethod,
-    keyPath: form.keyPath || null,
-    certificatePath: form.certificatePath || null,
-    agentEnabled: Boolean(agentEnabled),
-    revealPassword: Boolean(revealPassword),
+    auth_method: form.auth_method,
+    key_path: form.key_path || null,
+    certificate_path: form.certificate_path || null,
+    agent_enabled: Boolean(agentEnabled),
+    reveal_password: Boolean(revealPassword),
   };
   if (Object.prototype.hasOwnProperty.call(form, "secret")) {
     input.secret = form.secret == null ? "" : String(form.secret);
@@ -184,12 +184,12 @@ export function SshMcpTargets({
       host: profile.host || "",
       port: profile.port,
       username: profile.username || "",
-      authMethod: profile.authMethod,
-      keyPath: profile.keyPath || "",
-      certificatePath: profile.certificatePath || "",
+      auth_method: profile.auth_method,
+      key_path: profile.key_path || "",
+      certificate_path: profile.certificate_path || "",
       // hasSecret intentionally false: device secrets are not copied — the
       // user re-enters the password here so it lands in the vault.
-      hasSecret: false,
+      has_secret: false,
     });
     setCreating(true);
   }, []);

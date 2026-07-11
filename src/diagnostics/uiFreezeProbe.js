@@ -29,7 +29,7 @@ function lastActivationMark() {
   return {
     phase: String(mark.phase || ""),
     msAgo,
-    workspaceId: String(mark.workspaceId || ""),
+    workspace_id: String(mark.workspace_id || ""),
   };
 }
 
@@ -44,8 +44,8 @@ function flushFreezes() {
     phase: "frontend.freeze_probe.freeze",
     fields: {
       freezes: freezes.slice(0, 12),
-      freezeCount: freezes.length,
-      worstMs: Math.max(...freezes.map((f) => f.blockedMs)),
+      freeze_count: freezes.length,
+      worst_ms: Math.max(...freezes.map((f) => f.blockedMs)),
     },
   }).catch(() => {});
 }

@@ -33,6 +33,7 @@ import {
   DEFAULT_AUDIO_POLISHING_SYSTEM_PROMPT,
   MAX_AUDIO_POLISHING_SYSTEM_PROMPT_CHARS,
   applySyncedAudioPolishingPreferences,
+  audioTranscriptionFromPersisted,
   audioLlmCleanupEngineOption,
   audioInputPermissionNeedsAttention,
   clearAudioInputSetupReady,
@@ -625,7 +626,7 @@ const AUDIO_WIDGET_ERROR_AUTO_DISMISS_MS = 6500;
 // and stop controls at the 124px bar width.
 const AUDIO_BAR_METER_BARS = 8;
 const AUDIO_WIDGET_CLOSE_ANIMATION_MS = 240;
-const EMPTY_AUDIO_INPUT_STATS = { bufferMs: 0, peak: 0, rms: 0 };
+const EMPTY_AUDIO_INPUT_STATS = { buffer_ms: 0, peak: 0, rms: 0 };
 const AUDIO_SHORTCUT_ACTION_PUSH_TO_TALK = "push-to-talk";
 const AUDIO_SHORTCUT_ACTION_CANCEL = "cancel";
 const AUDIO_SHORTCUT_CAPTURE_HINT_MS = 7000;
@@ -960,7 +961,7 @@ function forgeCloudStatusIsConnected(status) {
     return true;
   }
 
-  return Boolean(status.connected && (status.globalWsConnected ?? status.global_ws_connected));
+  return Boolean(status.connected && (status.global_ws_connected));
 }
 
 function audioWidgetBubblePositionPoint(value) {
@@ -1010,7 +1011,7 @@ function audioWidgetBubblePositionMonitorPayload(monitor) {
   return {
     name: monitor.name || "",
     position: audioWidgetBubblePositionPoint(monitor.position),
-    scaleFactor: Number(monitor.scaleFactor || 1) || 1,
+    scale_factor: Number(monitor.scaleFactor || 1) || 1,
     size: audioWidgetBubblePositionSize(monitor.size),
     workArea: audioWidgetBubblePositionRect(monitor.workArea),
   };
@@ -1441,7 +1442,7 @@ function waitForAudioPostBuffer(ms) {
 function notifyAudioSettingsChanged(reason) {
   emit(AUDIO_SETTINGS_CHANGED_EVENT, {
     reason,
-    createdAt: new Date().toISOString(),
+    created_at: new Date().toISOString(),
   }).catch(() => {});
 }
 
@@ -1579,14 +1580,14 @@ function normalizeKeyboardShortcutCode(value) {
 function fallbackShortcutPermissions() {
   return {
     platform: isMacPlatform() ? "macos" : "other",
-    accessibilityRequired: isMacPlatform(),
-    accessibilityGranted: !isMacPlatform(),
-    accessibilitySettingsUrl: isMacPlatform()
+    accessibility_required: isMacPlatform(),
+    accessibility_granted: !isMacPlatform(),
+    accessibility_settings_url: isMacPlatform()
       ? "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
       : "",
-    quarantineDetected: false,
-    quarantinePath: "",
-    quarantineFixCommand: "",
+    quarantine_detected: false,
+    quarantine_path: "",
+    quarantine_fix_command: "",
     message: "",
   };
 }
@@ -1595,15 +1596,15 @@ function fallbackShortcutStatus() {
   const pushToTalk = defaultPushToTalkShortcut();
 
   return {
-    pushToTalk: {
+    push_to_talk: {
       shortcut: pushToTalk,
-      defaultShortcut: pushToTalk,
+      default_shortcut: pushToTalk,
       registered: false,
       error: "",
     },
     cancel: {
       shortcut: "Escape",
-      defaultShortcut: "Escape",
+      default_shortcut: "Escape",
       registered: false,
       error: "",
     },
@@ -1895,22 +1896,22 @@ function normalizeAudioHistoryTimings(value) {
   }
 
   const timings = value.timings && typeof value.timings === "object" ? value.timings : {};
-  const sttMs = readHistoryTimingMs(value, ["sttMs", "stt_ms", "finishToRawMs", "finish_to_raw_ms"])
-    || readHistoryTimingMs(timings, ["sttMs", "stt_ms", "finishToRawMs", "finish_to_raw_ms"]);
-  const cleanupMs = readHistoryTimingMs(value, ["cleanupMs", "cleanup_ms"])
-    || readHistoryTimingMs(timings, ["cleanupMs", "cleanup_ms"]);
-  const llmMs = readHistoryTimingMs(value, ["llmMs", "llm_ms"])
-    || readHistoryTimingMs(timings, ["llmMs", "llm_ms"])
+  const sttMs = readHistoryTimingMs(value, ["stt_ms", "finish_to_raw_ms"])
+    || readHistoryTimingMs(timings, ["stt_ms", "finish_to_raw_ms"]);
+  const cleanupMs = readHistoryTimingMs(value, ["cleanup_ms"])
+    || readHistoryTimingMs(timings, ["cleanup_ms"]);
+  const llmMs = readHistoryTimingMs(value, ["llm_ms"])
+    || readHistoryTimingMs(timings, ["llm_ms"])
     || cleanupMs;
-  const totalMs = readHistoryTimingMs(value, ["totalMs", "total_ms"])
-    || readHistoryTimingMs(timings, ["totalMs", "total_ms"])
+  const totalMs = readHistoryTimingMs(value, ["total_ms"])
+    || readHistoryTimingMs(timings, ["total_ms"])
     || (sttMs || llmMs ? sttMs + llmMs : 0);
 
   const result = {};
-  if (sttMs > 0) result.sttMs = sttMs;
-  if (llmMs > 0) result.llmMs = llmMs;
-  if (totalMs > 0) result.totalMs = totalMs;
-  if (cleanupMs > 0) result.cleanupMs = cleanupMs;
+  if (sttMs > 0) result.stt_ms = sttMs;
+  if (llmMs > 0) result.llm_ms = llmMs;
+  if (totalMs > 0) result.total_ms = totalMs;
+  if (cleanupMs > 0) result.cleanup_ms = cleanupMs;
   return Object.keys(result).length ? result : null;
 }
 
@@ -1930,9 +1931,9 @@ function formatAudioHistoryTimingBreakdown(timings) {
     return "";
   }
 
-  const stt = timings.sttMs > 0 ? formatHistoryDuration(timings.sttMs) : "--";
-  const llm = timings.llmMs > 0 ? formatHistoryDuration(timings.llmMs) : "--";
-  const total = timings.totalMs > 0 ? formatHistoryDuration(timings.totalMs) : "--";
+  const stt = timings.stt_ms > 0 ? formatHistoryDuration(timings.stt_ms) : "--";
+  const llm = timings.llm_ms > 0 ? formatHistoryDuration(timings.llm_ms) : "--";
+  const total = timings.total_ms > 0 ? formatHistoryDuration(timings.total_ms) : "--";
   return `STT Time ${stt} / LLM Time ${llm} / Total Time ${total}`;
 }
 
@@ -1941,18 +1942,18 @@ function cleanAudioHistoryPolishMetadata(value, { allowLabel = true } = {}) {
     return null;
   }
 
-  const provider = String(value.provider || value.cleanupProvider || value.cleanup_provider || "").trim();
-  const model = String(value.model || value.cleanupModel || value.cleanup_model || "").trim();
-  const engine = String(value.engine || value.cleanupEngine || value.cleanup_engine || "").trim();
-  const label = String((allowLabel ? value.label : "") || value.modelLabel || value.polishLabel || "").trim();
-  const polishedAt = String(value.polishedAt || value.updatedAt || "").trim();
+  const provider = String(value.provider || value.cleanup_provider || "").trim();
+  const model = String(value.model || value.cleanup_model || "").trim();
+  const engine = String(value.engine || value.cleanup_engine || "").trim();
+  const label = String((allowLabel ? value.label : "") || value.model_label || value.polish_label || "").trim();
+  const polished_at = String(value.polished_at || value.updated_at || "").trim();
   const timings = normalizeAudioHistoryTimings(value);
   const result = {};
   if (provider) result.provider = provider;
   if (model) result.model = model;
   if (engine) result.engine = engine;
   if (label) result.label = label;
-  if (polishedAt) result.polishedAt = polishedAt;
+  if (polished_at) result.polished_at = polished_at;
   if (timings) result.timings = timings;
   return Object.keys(result).length ? result : null;
 }
@@ -2024,11 +2025,7 @@ function audioHistoryTimingBreakdown(entry, variant) {
     || normalizeAudioHistoryTimings(polish)
     || normalizeAudioHistoryTimings(variant);
   const hasLlmTiming = Boolean(
-    polish
-    || entry?.llmCleaned
-    || entry?.llm_cleaned
-    || entry?.cleanupProvider
-    || entry?.cleanupModel,
+    polish || entry?.llm_cleaned || entry?.cleanup_provider || entry?.cleanup_model,
   );
 
   if (!hasLlmTiming) {
@@ -2040,10 +2037,10 @@ function audioHistoryTimingBreakdown(entry, variant) {
 
 const LOCAL_WHISPER_MODEL_FALLBACKS = [
   {
-    modelId: "tiny.en",
-    modelName: "Whisper tiny.en",
-    approximateDiskMb: 74,
-    approximateMemoryMb: 260,
+    model_id: "tiny.en",
+    model_name: "Whisper tiny.en",
+    approximate_disk_mb: 74,
+    approximate_memory_mb: 260,
     bytes: 0,
     description: "Lowest footprint",
     installed: false,
@@ -2051,10 +2048,10 @@ const LOCAL_WHISPER_MODEL_FALLBACKS = [
     tier: "Fastest",
   },
   {
-    modelId: "base.en",
-    modelName: "Whisper base.en",
-    approximateDiskMb: 142,
-    approximateMemoryMb: 500,
+    model_id: "base.en",
+    model_name: "Whisper base.en",
+    approximate_disk_mb: 142,
+    approximate_memory_mb: 500,
     bytes: 0,
     description: "Current default",
     installed: false,
@@ -2062,10 +2059,10 @@ const LOCAL_WHISPER_MODEL_FALLBACKS = [
     tier: "Balanced",
   },
   {
-    modelId: "small.en",
-    modelName: "Whisper small.en",
-    approximateDiskMb: 465,
-    approximateMemoryMb: 1100,
+    model_id: "small.en",
+    model_name: "Whisper small.en",
+    approximate_disk_mb: 465,
+    approximate_memory_mb: 1100,
     bytes: 0,
     description: "Larger local model",
     installed: false,
@@ -2075,12 +2072,12 @@ const LOCAL_WHISPER_MODEL_FALLBACKS = [
 ];
 
 function formatWhisperModelTitle(model) {
-  return String(model?.modelName || model?.modelId || "Whisper").replace(/^Whisper\s+/i, "");
+  return String(model?.model_name || model?.model_id || "Whisper").replace(/^Whisper\s+/i, "");
 }
 
 function formatWhisperModelMeta(model) {
-  const diskMb = Number(model?.approximateDiskMb || 0);
-  const memoryMb = Number(model?.approximateMemoryMb || 0);
+  const diskMb = Number(model?.approximate_disk_mb || 0);
+  const memoryMb = Number(model?.approximate_memory_mb || 0);
   const parts = [];
   if (model?.tier) {
     parts.push(model.tier);
@@ -2125,17 +2122,15 @@ function findNumberByKeys(value, keys, depth = 0) {
  */
 function extractRemainingForgeCredits(billing) {
   const remaining = findNumberByKeys(billing, [
-    "remainingCredits",
     "remaining_credits",
-    "creditsRemaining",
     "credits_remaining",
   ]);
   if (remaining !== null) {
     return remaining;
   }
 
-  const total = findNumberByKeys(billing, ["totalCredits", "total_credits"]);
-  const used = findNumberByKeys(billing, ["usedCredits", "used_credits"]);
+  const total = findNumberByKeys(billing, ["total_credits"]);
+  const used = findNumberByKeys(billing, ["used_credits"]);
   if (total !== null && used !== null) {
     return total - used;
   }
@@ -2152,9 +2147,9 @@ function formatAudioHistoryMeta(entry, variant, entryText) {
   // Fallback for older entries: turnaround since releasing the record button
   // to transcript landing, or audio length if that was all the entry stored.
   const duration = timingBreakdown || formatHistoryDuration(
-    Number(entry?.latencyMs || 0) > 0 ? entry.latencyMs : entry?.audioMs,
+    Number(entry?.latency_ms || 0) > 0 ? entry.latency_ms : entry?.audio_ms,
   );
-  const wordCount = Number(entry?.wordCount || 0);
+  const word_count = Number(entry?.word_count || 0);
   const characterCount = countAudioHistoryCharacters(entryText);
   const language = String(entry?.language || "").trim();
 
@@ -2164,8 +2159,8 @@ function formatAudioHistoryMeta(entry, variant, entryText) {
   if (duration) {
     pieces.push(duration);
   }
-  if (wordCount > 0) {
-    pieces.push(`${formatInteger(wordCount)} ${wordCount === 1 ? "word" : "words"}`);
+  if (word_count > 0) {
+    pieces.push(`${formatInteger(word_count)} ${word_count === 1 ? "word" : "words"}`);
   }
   if (characterCount > 0) {
     pieces.push(`${formatInteger(characterCount)} ${characterCount === 1 ? "char" : "chars"}`);
@@ -2178,11 +2173,11 @@ function formatAudioHistoryMeta(entry, variant, entryText) {
 }
 
 function getAudioHistoryEntryKey(entry, index = 0) {
-  return entry?.id || `${entry?.createdAt || "audio-history"}-${index}`;
+  return entry?.id || `${entry?.created_at || "audio-history"}-${index}`;
 }
 
 function audioHistoryEntryWords(entry) {
-  const entryWordCount = Number(entry?.wordCount || 0);
+  const entryWordCount = Number(entry?.word_count || 0);
   if (Number.isFinite(entryWordCount) && entryWordCount > 0) {
     return entryWordCount;
   }
@@ -2233,15 +2228,15 @@ function audioWpmPercentileLabel(wpm) {
 function buildAudioHistoryInsights(history) {
   const entries = Array.isArray(history) ? history : [];
   const total = entries.length;
-  const timedEntries = entries.filter((entry) => Number(entry?.audioMs || 0) > 0);
-  const audioMs = timedEntries.reduce((sum, entry) => sum + Number(entry.audioMs || 0), 0);
+  const timedEntries = entries.filter((entry) => Number(entry?.audio_ms || 0) > 0);
+  const audioMs = timedEntries.reduce((sum, entry) => sum + Number(entry.audio_ms || 0), 0);
   const timedWords = timedEntries.reduce((sum, entry) => sum + audioHistoryEntryWords(entry), 0);
   const averageWpm = audioMs > 0 ? Math.round(timedWords / (audioMs / 60000)) : 0;
   const totalWords = entries.reduce((sum, entry) => sum + audioHistoryEntryWords(entry), 0);
 
   const wordsByDay = new Map();
   entries.forEach((entry) => {
-    const created = entry?.createdAt ? new Date(entry.createdAt) : null;
+    const created = entry?.created_at ? new Date(entry.created_at) : null;
     if (!created || Number.isNaN(created.getTime())) return;
     const key = `${created.getFullYear()}-${created.getMonth()}-${created.getDate()}`;
     wordsByDay.set(key, (wordsByDay.get(key) || 0) + audioHistoryEntryWords(entry));
@@ -2283,10 +2278,10 @@ function buildAudioHistoryInsights(history) {
   }
 
   return {
-    audioMs,
-    averageWpm,
-    totalDictations: total,
-    totalWords,
+    audio_ms: audioMs,
+    average_wpm: averageWpm,
+    total_dictations: total,
+    total_words: totalWords,
     weeks,
   };
 }
@@ -2311,8 +2306,8 @@ function isAudioHistoryClampable(entryText) {
 }
 
 function audioHistorySnippetChanges(entry) {
-  const changes = Array.isArray(entry?.snippetChanges)
-    ? entry.snippetChanges
+  const changes = Array.isArray(entry?.snippet_changes)
+    ? entry.snippet_changes
     : Array.isArray(entry?.changes?.snippets)
       ? entry.changes.snippets
       : [];
@@ -2332,9 +2327,9 @@ function audioHistorySnippetChanges(entry) {
     .filter(Boolean);
 }
 
-function audioHistoryEntryDisplayText(entry, snippetChanges) {
-  const sourceText = String(entry?.sourceText || "").trim();
-  if (snippetChanges.length && sourceText) {
+function audioHistoryEntryDisplayText(entry, snippet_changes) {
+  const sourceText = String(entry?.source_text || "").trim();
+  if (snippet_changes.length && sourceText) {
     return sourceText;
   }
 
@@ -2381,7 +2376,7 @@ function audioHistorySelectedVariant(entry, variants, entryKey, selectedVariantI
   }
 
   const selectedId = selectedVariantIds?.get?.(entryKey)
-    || String(entry?.defaultVariantId || "").trim()
+    || String(entry?.default_variant_id || "").trim()
     || variants[variants.length - 1]?.id;
   return variants.find((variant) => variant.id === selectedId) || variants[variants.length - 1];
 }
@@ -2392,8 +2387,8 @@ function buildAudioHistoryRows(history, selectedVariantIds) {
     const variants = audioHistoryVariants(entry);
     const variant = audioHistorySelectedVariant(entry, variants, entryKey, selectedVariantIds);
     const isRawVariant = variant?.id === AUDIO_TRANSCRIPTION_VARIANT_RAW;
-    const snippetChanges = isRawVariant ? [] : audioHistorySnippetChanges(entry);
-    const entryText = variant?.text || audioHistoryEntryDisplayText(entry, snippetChanges);
+    const snippet_changes = isRawVariant ? [] : audioHistorySnippetChanges(entry);
+    const entryText = variant?.text || audioHistoryEntryDisplayText(entry, snippet_changes);
     const variantIndex = variant ? variants.findIndex((candidate) => candidate.id === variant.id) : -1;
     return {
       clampable: isAudioHistoryClampable(entryText),
@@ -2403,8 +2398,8 @@ function buildAudioHistoryRows(history, selectedVariantIds) {
       index,
       meta: formatAudioHistoryMeta(entry, variant, entryText),
       providerLabel: formatAudioProviderLabel(entry?.provider),
-      snippetChanges,
-      timestamp: formatHistoryTimestamp(entry?.createdAt),
+      snippet_changes,
+      timestamp: formatHistoryTimestamp(entry?.created_at),
       variant,
       variantIndex,
       variants,
@@ -2434,28 +2429,13 @@ function buildAudioPolishMetadata(result = {}, overrides = {}) {
     },
   };
   const provider = String(
-    result?.provider
-    || result?.cleanupProvider
-    || result?.cleanup_provider
-    || overrides?.provider
-    || overrides?.cleanupProvider
-    || "",
+    result?.provider || result?.cleanup_provider || overrides?.provider || overrides?.cleanup_provider || "",
   ).trim();
   const model = String(
-    result?.model
-    || result?.cleanupModel
-    || result?.cleanup_model
-    || overrides?.model
-    || overrides?.cleanupModel
-    || "",
+    result?.model || result?.cleanup_model || overrides?.model || overrides?.cleanup_model || "",
   ).trim();
   const engine = String(
-    result?.engine
-    || result?.cleanupEngine
-    || result?.cleanup_engine
-    || overrides?.engine
-    || overrides?.cleanupEngine
-    || "",
+    result?.engine || result?.cleanup_engine || overrides?.engine || overrides?.cleanup_engine || "",
   ).trim();
   const timings = normalizeAudioHistoryTimings(timingSource);
   const label = formatAudioCleanupModelLabel(provider, model);
@@ -2466,7 +2446,7 @@ function buildAudioPolishMetadata(result = {}, overrides = {}) {
   if (engine) metadata.engine = engine;
   if (label) metadata.label = label;
   if (timings) metadata.timings = timings;
-  metadata.polishedAt = new Date().toISOString();
+  metadata.polished_at = new Date().toISOString();
 
   return cleanAudioHistoryPolishMetadata(metadata);
 }
@@ -2522,8 +2502,8 @@ function findAudioHistoryEntryForPolish(history, sourceText) {
   return (Array.isArray(history) ? history : []).find((entry) => {
     const candidates = [
       entry?.text,
-      entry?.sourceText,
-      entry?.rawText,
+      entry?.source_text,
+      entry?.raw_text,
       ...audioHistoryVariants(entry).map((variant) => variant.text),
     ];
     return candidates.some((candidate) => String(candidate || "").trim() === needle);
@@ -2544,7 +2524,7 @@ function estimateAudioHistoryRowHeight(row) {
   const visibleTextLines = row?.clampable
     ? Math.min(3, Math.max(1, hardBreaks, wrappedLines))
     : Math.max(1, Math.min(6, hardBreaks, wrappedLines));
-  const snippetRows = Array.isArray(row?.snippetChanges) ? row.snippetChanges.length : 0;
+  const snippetRows = Array.isArray(row?.snippet_changes) ? row.snippet_changes.length : 0;
   const variantControlAllowance = Array.isArray(row?.variants) && row.variants.length > 1 ? 8 : 0;
   const meta = String(row?.meta || "");
   const metaLines = Math.max(1, Math.min(3, Math.ceil(meta.length / 74)));
@@ -2571,7 +2551,7 @@ function seedAudioHistoryEstimatedRowHeights(rows, rowHeights) {
   return changed;
 }
 
-function scheduleAudioHistoryIdleTask(callback, { delayMs = 0, timeout = 900 } = {}) {
+function scheduleAudioHistoryIdleTask(callback, { delay_ms: delayMs = 0, timeout = 900 } = {}) {
   if (typeof window === "undefined") {
     callback();
     return () => {};
@@ -2627,10 +2607,10 @@ function formatLocalDateKey(date) {
 }
 
 const EMPTY_AUDIO_HISTORY_INSIGHTS = {
-  audioMs: 0,
-  averageWpm: 0,
-  totalDictations: 0,
-  totalWords: 0,
+  audio_ms: 0,
+  average_wpm: 0,
+  total_dictations: 0,
+  total_words: 0,
   weeks: [],
 };
 
@@ -2639,7 +2619,7 @@ const EMPTY_AUDIO_HISTORY_INSIGHTS = {
 // stat chips and grid. The heatmap grid itself is cheap to build from the map.
 function buildAudioHistoryInsightsFromSummary(summary) {
   const safe = summary && typeof summary === "object" ? summary : {};
-  const wordsByDay = safe.wordsByDay && typeof safe.wordsByDay === "object" ? safe.wordsByDay : {};
+  const wordsByDay = safe.words_by_day && typeof safe.words_by_day === "object" ? safe.words_by_day : {};
 
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -2677,10 +2657,10 @@ function buildAudioHistoryInsightsFromSummary(summary) {
   }
 
   return {
-    audioMs: Math.max(0, Number(safe.audioMs) || 0),
-    averageWpm: Math.max(0, Number(safe.averageWpm) || 0),
-    totalDictations: Math.max(0, Number(safe.totalDictations) || 0),
-    totalWords: Math.max(0, Number(safe.totalWords) || 0),
+    audio_ms: Math.max(0, Number(safe.audio_ms) || 0),
+    average_wpm: Math.max(0, Number(safe.average_wpm) || 0),
+    total_dictations: Math.max(0, Number(safe.total_dictations) || 0),
+    total_words: Math.max(0, Number(safe.total_words) || 0),
     weeks,
   };
 }
@@ -2793,7 +2773,7 @@ function AudioHistoryVirtualRow({
   onVariantStep,
   row,
   top,
-  totalCount,
+  total_count: totalCount,
 }) {
   const rowRef = useRef(null);
 
@@ -2842,7 +2822,7 @@ function AudioHistoryVirtualRow({
         window.removeEventListener("resize", measure);
       }
     };
-  }, [active, expanded, onMeasure, row.entryKey, row.entryText, row.snippetChanges, row.variant?.id]);
+  }, [active, expanded, onMeasure, row.entryKey, row.entryText, row.snippet_changes, row.variant?.id]);
 
   return (
     <AudioHistoryRow
@@ -2909,9 +2889,9 @@ function AudioHistoryVirtualRow({
         </AudioHistoryRowActions>
       </AudioHistoryRowTopline>
       <strong>{row.entryText}</strong>
-      {row.snippetChanges.length > 0 && (
+      {row.snippet_changes.length > 0 && (
         <AudioHistorySnippetChanges aria-label="Snippet replacements">
-          {row.snippetChanges.map((change, index) => (
+          {row.snippet_changes.map((change, index) => (
             <AudioHistorySnippetChangeRow
               key={`${change.trigger}-${index}`}
               title={`${change.original} to ${change.replacement}`}
@@ -2952,7 +2932,7 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
   audioStatusState,
   audioWidgetVisible,
   authState = "signedOut",
-  billingStatus = null,
+  billing_status: billingStatus = null,
   billingStatusError = "",
   billingStatusState = "idle",
   onDownloadModel,
@@ -3060,17 +3040,17 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
   const localWhisperModels = Array.isArray(audioModelStatus?.models) && audioModelStatus.models.length
     ? audioModelStatus.models
     : LOCAL_WHISPER_MODEL_FALLBACKS;
-  const selectedWhisperModelId = audioModelStatus?.selectedModelId
-    || audioModelStatus?.modelId
-    || LOCAL_WHISPER_MODEL_FALLBACKS.find((model) => model.selected)?.modelId
+  const selectedWhisperModelId = audioModelStatus?.selected_model_id
+    || audioModelStatus?.model_id
+    || LOCAL_WHISPER_MODEL_FALLBACKS.find((model) => model.selected)?.model_id
     || "base.en";
-  const selectedWhisperModel = localWhisperModels.find((model) => model.modelId === selectedWhisperModelId)
+  const selectedWhisperModel = localWhisperModels.find((model) => model.model_id === selectedWhisperModelId)
     || localWhisperModels[0]
     || null;
   const selectedWhisperModelTitle = selectedWhisperModel
     ? formatWhisperModelTitle(selectedWhisperModel)
     : "Whisper";
-  const downloadingModelId = audioDownloadProgress?.modelId || "";
+  const downloadingModelId = audioDownloadProgress?.model_id || "";
   const forgeBilling = useMemo(() => {
     if (authState !== "authenticated") {
       return {
@@ -3131,11 +3111,11 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
       ? "Press the recorder shortcut to start, then press again to submit."
       : "Hold the recorder shortcut to record, then release to submit.";
   const audioWidgetThemeLabel = audioWidgetTheme === AUDIO_WIDGET_THEME_LIGHT ? "Light" : "Dark";
-  const canUninstall = Boolean(audioModelStatus?.managedAssetsInstalled || audioModelStatus?.modelInstalled);
+  const canUninstall = Boolean(audioModelStatus?.managed_assets_installed || audioModelStatus?.model_installed);
   const downloadPercent = audioDownloadProgress?.percent;
-  const missingLabel = audioModelStatus?.modelInstalled
+  const missingLabel = audioModelStatus?.model_installed
     ? "Runtime missing"
-    : audioModelStatus?.runtimeInstalled
+    : audioModelStatus?.runtime_installed
       ? "Model missing"
       : "Not installed";
   const audioModeStatusLabel = isForgeMode
@@ -3162,12 +3142,12 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
       ? (deepgramReady ? "Cloud ready" : "API key needed")
     : (installed ? `${selectedWhisperModelTitle} ready` : audioActionState === "downloading" ? "Downloading" : missingLabel);
   const isUninstalling = audioActionState === "uninstalling";
-  const selectedAudioInput = audioInputDevices.find((device) => device.deviceId === audioInputDeviceId);
+  const selectedAudioInput = audioInputDevices.find((device) => device.device_id === audioInputDeviceId);
   const selectedAudioInputLabel = selectedAudioInput?.label || "Default microphone";
   const audioInputLevel = Math.round(clampAudioLevel(Math.max(audioInputStats.rms * 2600, audioInputStats.peak * 120)));
   const audioInputHasSignal = audioInputLevel >= 6;
   const audioInputPermissionMissing = audioInputPermissionNeedsAttention(audioInputPermissionStatus);
-  const audioInputPermissionPromptable = Boolean(audioInputPermissionStatus?.microphonePromptable);
+  const audioInputPermissionPromptable = Boolean(audioInputPermissionStatus?.microphone_promptable);
   const isOpeningAudioInputPermissions = audioInputPermissionActionState === "opening";
   const audioInputStatusLabel = {
     checking: "Checking",
@@ -3195,17 +3175,17 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
       ? "Mute (stop monitoring)"
       : "Initialize input";
   const effectiveShortcutStatus = audioShortcutStatus || audioModelStatus?.shortcuts || fallbackShortcutStatus();
-  const pushToTalkShortcut = effectiveShortcutStatus.pushToTalk?.shortcut
+  const pushToTalkShortcut = effectiveShortcutStatus.push_to_talk?.shortcut
     || audioModelStatus?.shortcut
     || defaultPushToTalkShortcut();
   const cancelShortcut = effectiveShortcutStatus.cancel?.shortcut || "Escape";
-  const pushToTalkShortcutError = effectiveShortcutStatus.pushToTalk?.error || "";
+  const pushToTalkShortcutError = effectiveShortcutStatus.push_to_talk?.error || "";
   const cancelShortcutError = effectiveShortcutStatus.cancel?.error || "";
   const shortcutPermissions = effectiveShortcutStatus.permissions || fallbackShortcutPermissions();
   const shortcutPermissionMissing = Boolean(
-    shortcutPermissions.accessibilityRequired && !shortcutPermissions.accessibilityGranted,
+    shortcutPermissions.accessibility_required && !shortcutPermissions.accessibility_granted,
   );
-  const shortcutQuarantineDetected = Boolean(shortcutPermissions.quarantineDetected);
+  const shortcutQuarantineDetected = Boolean(shortcutPermissions.quarantine_detected);
   const isSavingShortcut = audioShortcutActionState === "saving";
   const isOpeningShortcutPermissions = audioShortcutActionState === "opening-permissions";
   const shortcutReady = !pushToTalkShortcutError
@@ -3427,7 +3407,7 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
       if (audioHistorySummaryRunRef.current !== run) {
         return;
       }
-      setAudioHistoryTotal(Math.max(0, Number(summary?.totalDictations) || 0));
+      setAudioHistoryTotal(Math.max(0, Number(summary?.total_dictations) || 0));
       setAudioHistoryInsights(buildAudioHistoryInsightsFromSummary(summary));
       setAudioHistoryReady(true);
     } catch {
@@ -3539,7 +3519,9 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
         audioHistoryRefreshPendingRef.current = true;
         return;
       }
-      const entry = event?.payload && typeof event.payload === "object" ? event.payload : null;
+      const entry = event?.payload && typeof event.payload === "object"
+        ? audioTranscriptionFromPersisted(event.payload)
+        : null;
       if (!entry) {
         resetAudioHistoryPageCache();
         refreshAudioHistorySummary();
@@ -3748,9 +3730,9 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
       setAudioInputDevices(devices);
 
       const currentDeviceId = audioInputDeviceIdRef.current;
-      const hasSelectedDevice = devices.some((device) => device.deviceId === currentDeviceId);
+      const hasSelectedDevice = devices.some((device) => device.device_id === currentDeviceId);
       if (!hasSelectedDevice) {
-        const nextDeviceId = devices.find((device) => device.isDefault)?.deviceId || devices[0]?.deviceId || "default";
+        const nextDeviceId = devices.find((device) => device.is_default)?.device_id || devices[0]?.device_id || "default";
         audioInputDeviceIdRef.current = nextDeviceId;
         setAudioInputDeviceId(nextDeviceId);
         writeSelectedAudioInputDeviceId(nextDeviceId);
@@ -3833,7 +3815,7 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
       }
 
       const audioInputPreview = await startLowPowerAudioBuffer({
-        deviceId,
+        device_id: deviceId,
         owner: "audio-tab",
         onStats: (stats) => {
           if (audioInputRunRef.current === runId) {
@@ -4063,7 +4045,7 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
         }
         : {
           enabled: entry?.enabled !== false,
-          isRegex: entry?.isRegex === true,
+          is_regex: entry?.is_regex === true,
           match: entry?.match || "",
           replacement: entry?.replacement || "",
         };
@@ -4234,7 +4216,7 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
       nextEntry = {
         id: nextId,
         enabled: draft?.enabled !== false,
-        isRegex: draft?.isRegex === true,
+        is_regex: draft?.is_regex === true,
         match,
         replacement: String(draft?.replacement || ""),
       };
@@ -4399,7 +4381,7 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
       if (!preferences) {
         return null;
       }
-      setPolishingSystemPrompt(preferences.polishingSystemPrompt);
+      setPolishingSystemPrompt(preferences.polishing_system_prompt);
       notifyAudioSettingsChanged(reason);
       return preferences;
     };
@@ -4411,17 +4393,17 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
         }
         const applied = applyPreferences(preferences, "polishing-prompt-sync");
         const localPreferences = readAudioPolishingPreferences();
-        if (!applied && localPreferences.polishingSystemPrompt) {
-          writeAudioPolishingSystemPrompt(localPreferences.polishingSystemPrompt, {
+        if (!applied && localPreferences.polishing_system_prompt) {
+          writeAudioPolishingSystemPrompt(localPreferences.polishing_system_prompt, {
             reason: "polishing_prompt_migrated",
-            updatedAtMs: localPreferences.updatedAtMs || Date.now(),
+            updated_at_ms: localPreferences.updated_at_ms || Date.now(),
           });
         }
       })
       .catch(() => {
         const localPreferences = readAudioPolishingPreferences();
-        if (localPreferences.polishingSystemPrompt && !localPreferences.updatedAtMs) {
-          writeAudioPolishingSystemPrompt(localPreferences.polishingSystemPrompt, {
+        if (localPreferences.polishing_system_prompt && !localPreferences.updated_at_ms) {
+          writeAudioPolishingSystemPrompt(localPreferences.polishing_system_prompt, {
             reason: "polishing_prompt_migrated",
           });
         }
@@ -5015,7 +4997,7 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                         isDisabled={audioInputState === "checking" || audioInputState === "starting"}
                         onChange={(value) => selectAudioInputDevice({ target: { value } })}
                         options={audioInputDevices.length
-                          ? audioInputDevices.map((device) => ({ value: device.deviceId, label: device.label }))
+                          ? audioInputDevices.map((device) => ({ value: device.device_id, label: device.label }))
                           : [{ value: "default", label: "Default microphone" }]}
                         value={audioInputDeviceId}
                       />
@@ -5053,7 +5035,7 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                     </AudioSettingsIdentityItem>
                     <AudioSettingsIdentityItem>
                       <span>Buffer</span>
-                      <strong>{Math.round((audioInputStats.bufferMs || 0) / 1000)}s</strong>
+                      <strong>{Math.round((audioInputStats.buffer_ms || 0) / 1000)}s</strong>
                     </AudioSettingsIdentityItem>
                     <AudioSettingsIdentityItem
                       title={audioInputStats.engine === "voice_processing"
@@ -5142,7 +5124,7 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                   {!isCloudMode && !isForgeMode && !isForgeAgentMode && (
                     <AudioLocalModelList aria-label="Local Whisper model">
                       {localWhisperModels.map((model) => {
-                        const modelId = model.modelId || model.model_id || "";
+                        const modelId = model.model_id || "";
                         const modelInstalled = Boolean(model.installed);
                         const modelSelected = model.selected || modelId === selectedWhisperModelId;
                         const modelDownloading = audioActionState === "downloading"
@@ -5162,7 +5144,7 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                           <AudioLocalModelRow
                             data-installed={modelInstalled ? "true" : "false"}
                             data-selected={modelSelected ? "true" : "false"}
-                            key={modelId || model.modelName}
+                            key={modelId || model.model_name}
                           >
                             <AudioLocalModelCopy>
                               <strong>{formatWhisperModelTitle(model)}</strong>
@@ -5238,7 +5220,7 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                                 <span>
                                   {option.id === AUDIO_LOCAL_WHISPER_REALTIME_MODE_OFF
                                     ? "Transcribe at the end"
-                                    : `Segments every ~${option.minChunkMs / 1000}s+`}
+                                    : `Segments every ~${option.min_chunk_ms / 1000}s+`}
                                 </span>
                               </span>
                             </AudioModeButton>
@@ -5349,8 +5331,8 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                       )}
                     </>
                   )}
-                  {!isCloudMode && audioModelStatus && !audioModelStatus.runtimeInstalled && (
-                    <AudioRuntimeHint>{audioModelStatus.runtimeInstallHint}</AudioRuntimeHint>
+                  {!isCloudMode && audioModelStatus && !audioModelStatus.runtime_installed && (
+                    <AudioRuntimeHint>{audioModelStatus.runtime_install_hint}</AudioRuntimeHint>
                   )}
                   {!isCloudMode && audioDownloadProgress && (
                     <AudioProgressPanel>
@@ -5362,8 +5344,8 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                         <AudioProgressBar $progress={Number(downloadPercent) || 0} />
                       </AudioProgressTrack>
                       <AudioProgressMeta>
-                        {formatFileSize(audioDownloadProgress.downloadedBytes || 0)}
-                        {audioDownloadProgress.totalBytes ? ` / ${formatFileSize(audioDownloadProgress.totalBytes)}` : ""}
+                        {formatFileSize(audioDownloadProgress.downloaded_bytes || 0)}
+                        {audioDownloadProgress.total_bytes ? ` / ${formatFileSize(audioDownloadProgress.total_bytes)}` : ""}
                       </AudioProgressMeta>
                     </AudioProgressPanel>
                   )}
@@ -5752,7 +5734,7 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                   </AudioShortcutGrid>
 
                   <SettingsHint>
-                    Default: {formatShortcutLabel(effectiveShortcutStatus.pushToTalk?.defaultShortcut || defaultPushToTalkShortcut())} / {formatShortcutLabel(effectiveShortcutStatus.cancel?.defaultShortcut || "Escape")}
+                    Default: {formatShortcutLabel(effectiveShortcutStatus.push_to_talk?.default_shortcut || defaultPushToTalkShortcut())} / {formatShortcutLabel(effectiveShortcutStatus.cancel?.default_shortcut || "Escape")}
                   </SettingsHint>
 
                   {pushToTalkShortcut === "Fn" && (
@@ -5796,8 +5778,8 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                       <AudioRuntimeHint>
                         {shortcutPermissions.message || "Remove the macOS quarantine attribute, then restart the app."}
                       </AudioRuntimeHint>
-                      {shortcutPermissions.quarantineFixCommand && (
-                        <AudioShortcutKey>{shortcutPermissions.quarantineFixCommand}</AudioShortcutKey>
+                      {shortcutPermissions.quarantine_fix_command && (
+                        <AudioShortcutKey>{shortcutPermissions.quarantine_fix_command}</AudioShortcutKey>
                       )}
                     </>
                   )}
@@ -6067,7 +6049,7 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                         <AudioCloudInput
                           aria-label="Transform match"
                           onChange={(event) => updateVoiceRuleEditorDraft({ match: event.target.value })}
-                          placeholder={editorDraft.isRegex ? "bug (\\d+)" : "new line"}
+                          placeholder={editorDraft.is_regex ? "bug (\\d+)" : "new line"}
                           value={editorDraft.match || ""}
                         />
                       </AudioRuleFieldLabel>
@@ -6076,7 +6058,7 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                         <AudioRuleTextarea
                           aria-label="Transform replacement"
                           onChange={(event) => updateVoiceRuleEditorDraft({ replacement: event.target.value })}
-                          placeholder={editorDraft.isRegex ? "BUG-$1" : "Replacement"}
+                          placeholder={editorDraft.is_regex ? "BUG-$1" : "Replacement"}
                           value={editorDraft.replacement || ""}
                         />
                       </AudioRuleFieldLabel>
@@ -6092,9 +6074,9 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                           Active
                         </McpSwitchButton>
                         <McpSwitchButton
-                          aria-checked={editorDraft.isRegex === true}
-                          aria-pressed={editorDraft.isRegex === true}
-                          onClick={() => updateVoiceRuleEditorDraft({ isRegex: editorDraft.isRegex !== true })}
+                          aria-checked={editorDraft.is_regex === true}
+                          aria-pressed={editorDraft.is_regex === true}
+                          onClick={() => updateVoiceRuleEditorDraft({ is_regex: editorDraft.is_regex !== true })}
                           role="switch"
                           type="button"
                         >
@@ -6189,7 +6171,7 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                             <AudioRuleListMeta>{entryMeta}</AudioRuleListMeta>
                           </AudioRuleListText>
                           <AudioRuleListActions onClick={(event) => event.stopPropagation()}>
-                            {isTransformEntry && entry.isRegex === true && (
+                            {isTransformEntry && entry.is_regex === true && (
                               <AudioDictionaryMetaPill>Regex</AudioDictionaryMetaPill>
                             )}
                             <AudioDictionaryMetaPill data-active={enabled ? "true" : "false"}>
@@ -6237,14 +6219,14 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
             <AudioHistoryStats aria-label="Speech to text statistics">
               <AudioInsightCard
                 aria-label={`Average words per minute${
-                  audioWpmPercentileLabel(audioHistoryInsights.averageWpm)
-                    ? `, ${audioWpmPercentileLabel(audioHistoryInsights.averageWpm)} of speakers`
+                  audioWpmPercentileLabel(audioHistoryInsights.average_wpm)
+                    ? `, ${audioWpmPercentileLabel(audioHistoryInsights.average_wpm)} of speakers`
                     : ""
                 }`}
               >
                 <AudioInsightValue>
-                  {audioHistoryInsights.averageWpm > 0
-                    ? formatInteger(audioHistoryInsights.averageWpm)
+                  {audioHistoryInsights.average_wpm > 0
+                    ? formatInteger(audioHistoryInsights.average_wpm)
                     : "0"}
                 </AudioInsightValue>
                 <AudioInsightLabel>Words per minute</AudioInsightLabel>
@@ -6259,14 +6241,14 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                     style={{
                       strokeDasharray: 131.95,
                       strokeDashoffset: 131.95 * (1 - Math.min(
-                        Math.max(audioHistoryInsights.averageWpm, 0) / AUDIO_WPM_GAUGE_MAX,
+                        Math.max(audioHistoryInsights.average_wpm, 0) / AUDIO_WPM_GAUGE_MAX,
                         1,
                       )),
                     }}
                   />
-                  {audioWpmPercentileLabel(audioHistoryInsights.averageWpm) && (
+                  {audioWpmPercentileLabel(audioHistoryInsights.average_wpm) && (
                     <text className="tier" textAnchor="middle" x="50" y="49">
-                      {audioWpmPercentileLabel(audioHistoryInsights.averageWpm).toUpperCase()}
+                      {audioWpmPercentileLabel(audioHistoryInsights.average_wpm).toUpperCase()}
                     </text>
                   )}
                 </AudioWpmGauge>
@@ -6275,7 +6257,7 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                 <AudioInsightCardTopline>
                   <AudioInsightLabel>Daily speaking</AudioInsightLabel>
                   <AudioInsightSubValue>
-                    {formatInteger(audioHistoryInsights.totalWords)} words
+                    {formatInteger(audioHistoryInsights.total_words)} words
                   </AudioInsightSubValue>
                 </AudioInsightCardTopline>
                 <AudioHeatmapGrid role="img" aria-label="Words spoken per day, recent weeks">
@@ -6299,11 +6281,11 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
               <AudioInsightCard data-kind="totals">
                 <AudioHistoryStatChip>
                   <span>Dictations</span>
-                  <strong>{formatInteger(audioHistoryInsights.totalDictations)}</strong>
+                  <strong>{formatInteger(audioHistoryInsights.total_dictations)}</strong>
                 </AudioHistoryStatChip>
                 <AudioHistoryStatChip>
                   <span>Audio time</span>
-                  <strong>{formatAudioHistoryTotalDuration(audioHistoryInsights.audioMs)}</strong>
+                  <strong>{formatAudioHistoryTotalDuration(audioHistoryInsights.audio_ms)}</strong>
                 </AudioHistoryStatChip>
               </AudioInsightCard>
             </AudioHistoryStats>
@@ -6360,7 +6342,7 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                         onVariantStep={stepAudioHistoryVariant}
                         row={row}
                         top={top}
-                        totalCount={audioHistoryTotal}
+                        total_count={audioHistoryTotal}
                       />
                     );
                   })}
@@ -6577,9 +6559,9 @@ export function AudioWidgetWindow() {
   }, []);
 
   const getForgeVoiceControlRequest = useCallback(() => ({
-    clientSessionId: forgeVoiceClientSessionIdRef.current,
-    ownerId: AUDIO_WIDGET_VOICE_OWNER,
-    voiceSessionId: forgeVoiceServerSessionIdRef.current,
+    client_session_id: forgeVoiceClientSessionIdRef.current,
+    owner_id: AUDIO_WIDGET_VOICE_OWNER,
+    voice_session_id: forgeVoiceServerSessionIdRef.current,
   }), []);
 
   useEffect(() => {
@@ -6786,7 +6768,7 @@ export function AudioWidgetWindow() {
     setMessage("Buffering input");
     const startPromise = (async () => {
       const audioBuffer = await startLowPowerAudioBuffer({
-        deviceId: readSelectedAudioInputDeviceId(),
+        device_id: readSelectedAudioInputDeviceId(),
         owner: "audio-widget",
         // The idle widget never displays the live level (widgetLevel is only
         // read while recording), so applying every stats event just re-renders
@@ -6935,7 +6917,7 @@ export function AudioWidgetWindow() {
     recordingRunRef.current = recordingRunId;
     forgeDictationHistoryRef.current = currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
       ? {
-        createdAt: new Date().toISOString(),
+        created_at: new Date().toISOString(),
         id: `forge-dictation-${Date.now()}-${recordingRunId}`,
       }
       : null;
@@ -6980,11 +6962,11 @@ export function AudioWidgetWindow() {
           const partialHistoryId = `local-whisper-history-${Date.now()}-${recordingRunId}`;
           try {
             await startLocalWhisperPartialTranscription({
-              historyId: partialHistoryId,
-              maxChunkMs: partialTuning.maxChunkMs,
-              minChunkMs: partialTuning.minChunkMs,
-              sessionId: partialSessionId,
-              silenceMs: partialTuning.silenceMs,
+              history_id: partialHistoryId,
+              max_chunk_ms: partialTuning.max_chunk_ms,
+              min_chunk_ms: partialTuning.min_chunk_ms,
+              session_id: partialSessionId,
+              silence_ms: partialTuning.silence_ms,
             });
             localWhisperPartialSessionIdRef.current = partialSessionId;
             localWhisperPartialHistoryIdRef.current = partialHistoryId;
@@ -6999,7 +6981,7 @@ export function AudioWidgetWindow() {
         await audioBuffer.finishCapture({ decode: false }).catch(() => null);
         if (localWhisperPartialSessionIdRef.current) {
           await cancelLocalWhisperPartialTranscription({
-            sessionId: localWhisperPartialSessionIdRef.current,
+            session_id: localWhisperPartialSessionIdRef.current,
           }).catch(() => {});
           localWhisperPartialSessionIdRef.current = "";
         }
@@ -7029,7 +7011,7 @@ export function AudioWidgetWindow() {
         setMessage("Opening Deepgram stream");
         await invoke("start_deepgram_realtime_transcription", {
           request: {
-            apiKey: readDeepgramApiKey(),
+            api_key: readDeepgramApiKey(),
             language: readDeepgramLanguage(),
           },
         });
@@ -7038,11 +7020,11 @@ export function AudioWidgetWindow() {
         const forgeHistory = forgeDictationHistoryRef.current;
         await invoke("start_forge_dictation_transcription", {
           request: {
-            historyCreatedAt: forgeHistory?.createdAt || "",
-            historyId: forgeHistory?.id || "",
-            llmCleanup: readForgeLlmCleanup(),
+            history_created_at: forgeHistory?.created_at || "",
+            history_id: forgeHistory?.id || "",
+            llm_cleanup: readForgeLlmCleanup(),
             language: readDeepgramLanguage(),
-            polishingPrompt: readAutomaticCleanupPolishingPrompt(),
+            polishing_prompt: readAutomaticCleanupPolishingPrompt(),
             ...readAudioLlmCleanupRequestOptions(),
           },
         });
@@ -7055,15 +7037,13 @@ export function AudioWidgetWindow() {
         forgeVoiceStartPendingRunRef.current = recordingRunId;
         try {
           const startResult = await startCloudVoiceAgentStream({
-            clientSessionId,
-            ownerId: AUDIO_WIDGET_VOICE_OWNER,
+            client_session_id: clientSessionId,
+            owner_id: AUDIO_WIDGET_VOICE_OWNER,
             realtime: readOrchestratorRealtimeEnabled(),
-            submissionMode: readOrchestratorVoiceSubmissionMode(),
+            submission_mode: readOrchestratorVoiceSubmissionMode(),
           });
           forgeVoiceServerSessionIdRef.current = String(
-            startResult?.voiceSessionId
-              || startResult?.voice_session_id
-              || "",
+            startResult?.voice_session_id || "",
           ).trim();
         } finally {
           if (forgeVoiceStartPendingRunRef.current === recordingRunId) {
@@ -7120,7 +7100,7 @@ export function AudioWidgetWindow() {
       const failedAudioBuffer = audioBuffer;
       if (localWhisperPartialSessionIdRef.current) {
         await cancelLocalWhisperPartialTranscription({
-          sessionId: localWhisperPartialSessionIdRef.current,
+          session_id: localWhisperPartialSessionIdRef.current,
         }).catch(() => {});
         localWhisperPartialSessionIdRef.current = "";
       }
@@ -7508,7 +7488,7 @@ export function AudioWidgetWindow() {
     const settleRun = widgetDragSettleRunRef.current + 1;
     widgetDragSettleRunRef.current = settleRun;
     logAudioWidgetBubblePosition("audio.widget.bubble.drag.finish_scheduled", {
-      delayMs,
+      delay_ms: delayMs,
       releaseSeen: widgetDragReleaseSeenRef.current,
       settleRun,
       widgetState: widgetStateRef.current,
@@ -7822,8 +7802,8 @@ export function AudioWidgetWindow() {
       const polishStartedAt = Date.now();
       const result = await invoke("polish_audio_transcription", {
         request: {
-          fallbackText,
-          polishingPrompt: readManualPolishingPrompt(),
+          fallback_text: fallbackText,
+          polishing_prompt: readManualPolishingPrompt(),
           ...readAudioLlmCleanupRequestOptions(),
         },
       });
@@ -7831,11 +7811,11 @@ export function AudioWidgetWindow() {
       if (!polishedText) {
         throw new Error("Polish returned empty text.");
       }
-      const sourceText = String(result?.rawText || result?.raw_text || polishedText).trim();
+      const sourceText = String(result?.raw_text || polishedText).trim();
       const entry = findAudioHistoryEntryForPolish(history, sourceText);
       const polishTotalMs = Math.max(0, Date.now() - polishStartedAt);
       const polishMetadata = buildAudioPolishMetadata(result, {
-        totalMs: polishTotalMs,
+        total_ms: polishTotalMs,
       });
 
       const nextVariants = buildPolishedAudioHistoryVariants(
@@ -7846,17 +7826,17 @@ export function AudioWidgetWindow() {
       );
       await publishAudioTranscriptionResult({
         ...(entry || {}),
-        cleanupEngine: result?.cleanupEngine || result?.cleanup_engine || entry?.cleanupEngine || "",
-        cleanupModel: result?.model || result?.cleanupModel || result?.cleanup_model || entry?.cleanupModel || "",
-        cleanupProvider: result?.provider || result?.cleanupProvider || result?.cleanup_provider || entry?.cleanupProvider || "",
-        defaultVariantId: AUDIO_TRANSCRIPTION_VARIANT_POLISHED,
+        cleanup_engine: result?.cleanup_engine || entry?.cleanup_engine || "",
+        cleanup_model: result?.model || result?.cleanup_model || entry?.cleanup_model || "",
+        cleanup_provider: result?.provider || result?.cleanup_provider || entry?.cleanup_provider || "",
+        default_variant_id: AUDIO_TRANSCRIPTION_VARIANT_POLISHED,
         id: entry?.id || `polish-${Date.now()}`,
-        latencyMs: Number(entry?.latencyMs || 0) > 0 ? entry.latencyMs : polishTotalMs,
-        llmCleaned: Boolean(result?.llmCleaned ?? result?.llm_cleaned ?? true),
+        latency_ms: Number(entry?.latency_ms || 0) > 0 ? entry.latency_ms : polishTotalMs,
+        llm_cleaned: Boolean(result?.llm_cleaned ?? true),
         provider: entry?.provider || readAudioTranscriptionProvider(),
-        rawText: sourceText,
+        raw_text: sourceText,
         source: entry?.source || "audio-llm-polished-clipboard",
-        sourceText: sourceText !== polishedText ? sourceText : String(entry?.sourceText || ""),
+        source_text: sourceText !== polishedText ? sourceText : String(entry?.source_text || ""),
         status: entry?.status || AUDIO_TRANSCRIPTION_STATUS_INSERTED,
         text: polishedText,
         timings: entry?.timings || polishMetadata?.timings || null,
@@ -8149,7 +8129,7 @@ export function AudioWidgetWindow() {
         barNativePlacementPendingRef.current = {
           generation: placementGeneration,
           key: targetKey,
-          requestId: placementRequestId,
+          request_id: placementRequestId,
         };
       }
       const nativePlacement = await positionAudioBarWindowNatively({
@@ -8157,7 +8137,7 @@ export function AudioWidgetWindow() {
         height: target.height,
         margin,
         animate: shouldAnimatePlacement,
-        requestId: placementRequestId,
+        request_id: placementRequestId,
       });
       if (!isCurrentPlacement()) {
         const pending = barNativePlacementPendingRef.current;
@@ -8252,7 +8232,7 @@ export function AudioWidgetWindow() {
         return;
       }
 
-      const payloadRequestId = typeof payload.requestId === "string" ? payload.requestId : "";
+      const payloadRequestId = typeof payload.request_id === "string" ? payload.request_id : "";
       const reason = typeof payload.reason === "string" ? payload.reason : "";
       const pending = barNativePlacementPendingRef.current;
       const pendingIsCurrent = Boolean(
@@ -8261,7 +8241,7 @@ export function AudioWidgetWindow() {
 
       if (payloadRequestId) {
         // Acknowledgment for a specific JS-commanded placement.
-        if (!pendingIsCurrent || pending.requestId !== payloadRequestId) {
+        if (!pendingIsCurrent || pending.request_id !== payloadRequestId) {
           return;
         }
         barNativePlacementPendingRef.current = null;
@@ -8936,8 +8916,8 @@ export function AudioWidgetWindow() {
     const pointer = {
       clientX: Math.round(Number(event.clientX || 0)),
       clientY: Math.round(Number(event.clientY || 0)),
-      screenX: Math.round(Number(event.screenX || 0)),
-      screenY: Math.round(Number(event.screenY || 0)),
+      screen_x: Math.round(Number(event.screenX || 0)),
+      screen_y: Math.round(Number(event.screenY || 0)),
     };
 
     if (historyTrayCloseTimerRef.current) {
@@ -9176,7 +9156,7 @@ export function AudioWidgetWindow() {
 
   const publishCancelledTranscript = useCallback(async (result, provider) => {
     const rawText = String(result?.text || "").trim();
-    const audioMs = Number(result?.audioMs || 0);
+    const audioMs = Number(result?.audio_ms || 0);
 
     if (!rawText || (audioMs > 0 && audioMs < AUDIO_CANCEL_SALVAGE_MIN_AUDIO_MS)) {
       return false;
@@ -9188,13 +9168,13 @@ export function AudioWidgetWindow() {
       ? forgeDictationHistoryRef.current
       : null;
     const entry = {
-      audioMs,
-      createdAt: result?.createdAt || forgeHistory?.createdAt || new Date().toISOString(),
-      id: String(result?.id || result?.historyId || forgeHistory?.id || Date.now()),
-      latencyMs: Number(result?.latencyMs || 0),
+      audio_ms: audioMs,
+      created_at: result?.created_at || forgeHistory?.created_at || new Date().toISOString(),
+      id: String(result?.id || result?.history_id || forgeHistory?.id || Date.now()),
+      latency_ms: Number(result?.latency_ms || 0),
       language: provider === AUDIO_TRANSCRIPTION_PROVIDER_LOCAL ? "" : readDeepgramLanguage(),
       provider,
-      snippetChanges: pipeline.changes?.snippets || [],
+      snippet_changes: pipeline.changes?.snippets || [],
       source: provider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
         ? "deepgram-nova-3-live"
         : provider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
@@ -9204,7 +9184,7 @@ export function AudioWidgetWindow() {
           : result?.partial
             ? "whisper-local-partial"
             : "whisper-local",
-      sourceText: pipeline.changed ? rawText : "",
+      source_text: pipeline.changed ? rawText : "",
       text,
     };
 
@@ -9254,7 +9234,7 @@ export function AudioWidgetWindow() {
     dictationStreamActiveRef.current = true;
     emit(AUDIO_DICTATION_STREAM_EVENT, {
       active: true,
-      atMs: Date.now(),
+      at_ms: Date.now(),
       phase,
       text: realtimeTranscript,
     }).catch(() => {});
@@ -9400,7 +9380,7 @@ export function AudioWidgetWindow() {
             const captureResult = await audioBuffer.finishCapture({ decode: false }).catch(() => null);
             return {
               ...(realtimeResult || {}),
-              audioMs: Number(captureResult?.audioMs || realtimeResult?.audioMs || 0),
+              audio_ms: Number(captureResult?.audio_ms || realtimeResult?.audio_ms || 0),
             };
           }
           setMessage("Closing Deepgram stream");
@@ -9408,13 +9388,13 @@ export function AudioWidgetWindow() {
           if (recordingRunRef.current !== recordingRunId) {
             return {
               ...(realtimeResult || {}),
-              audioMs: Number(realtimeResult?.audioMs || 0),
+              audio_ms: Number(realtimeResult?.audio_ms || 0),
             };
           }
           const captureResult = await audioBuffer.finishCapture({ decode: false }).catch(() => null);
           return {
             ...(realtimeResult || {}),
-            audioMs: Number(captureResult?.audioMs || realtimeResult?.audioMs || 0),
+            audio_ms: Number(captureResult?.audio_ms || realtimeResult?.audio_ms || 0),
           };
         })()
       : currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
@@ -9428,9 +9408,9 @@ export function AudioWidgetWindow() {
             const captureResult = await audioBuffer.finishCapture({ decode: false }).catch(() => null);
             return {
               ...(dictationResult || {}),
-              audioMs: Number(
-                captureResult?.audioMs
-                || Number(dictationResult?.audioSeconds || 0) * 1000
+              audio_ms: Number(
+                captureResult?.audio_ms
+                || Number(dictationResult?.audio_seconds || 0) * 1000
                 || 0,
               ),
             };
@@ -9442,15 +9422,15 @@ export function AudioWidgetWindow() {
           if (recordingRunRef.current !== recordingRunId) {
             return {
               ...(dictationResult || {}),
-              audioMs: Number(dictationResult?.audioSeconds || 0) * 1000,
+              audio_ms: Number(dictationResult?.audio_seconds || 0) * 1000,
             };
           }
           const captureResult = await audioBuffer.finishCapture({ decode: false }).catch(() => null);
           return {
             ...(dictationResult || {}),
-            audioMs: Number(
-              captureResult?.audioMs
-              || Number(dictationResult?.audioSeconds || 0) * 1000
+            audio_ms: Number(
+              captureResult?.audio_ms
+              || Number(dictationResult?.audio_seconds || 0) * 1000
               || 0,
             ),
           };
@@ -9468,16 +9448,16 @@ export function AudioWidgetWindow() {
                 finalCapture = await audioBuffer.finishCapture({ decode: false });
               } catch (finalCaptureError) {
                 const partialResult = await stopLocalWhisperPartialTranscription({
-                  sessionId: partialSessionId,
+                  session_id: partialSessionId,
                 }).catch(async () => {
-                  await cancelLocalWhisperPartialTranscription({ sessionId: partialSessionId }).catch(() => {});
+                  await cancelLocalWhisperPartialTranscription({ session_id: partialSessionId }).catch(() => {});
                   return null;
                 });
                 const partialText = String(partialResult?.text || partialPreviewText || "").trim();
                 if (partialText) {
                   return {
                     ...(partialResult || {}),
-                    audioMs: Number(partialResult?.audioMs || 0),
+                    audio_ms: Number(partialResult?.audio_ms || 0),
                     text: partialText,
                     partialFallback: true,
                     partialFallbackReason: "final_capture_failed",
@@ -9486,31 +9466,31 @@ export function AudioWidgetWindow() {
                 throw finalCaptureError;
               }
               partialStopPromise = stopLocalWhisperPartialTranscription({
-                sessionId: partialSessionId,
+                session_id: partialSessionId,
               }).catch(async (partialStopError) => {
                 localWhisperPartialFailedRef.current = true;
-                await cancelLocalWhisperPartialTranscription({ sessionId: partialSessionId }).catch(() => {});
+                await cancelLocalWhisperPartialTranscription({ session_id: partialSessionId }).catch(() => {});
                 return {
                   error: partialStopError,
                   text: partialPreviewText,
                 };
               });
-              const { audioBase64, audioMs } = finalCapture || {};
+              const { audio_base64: audioBase64, audio_ms: audioMs } = finalCapture || {};
               const { peak, rms } = audioBuffer.getCaptureStats();
               if (recordingRunRef.current !== recordingRunId) {
                 void partialStopPromise;
                 return {
-                  audioMs: Number(audioMs || 0),
+                  audio_ms: Number(audioMs || 0),
                 };
               }
               setMessage("Transcribing locally");
               try {
                 const transcriptionResult = await invoke("transcribe_whisper_audio", {
                   request: {
-                    audioBase64,
-                    audioMs,
-                    capturePeak: peak,
-                    captureRms: rms,
+                    audio_base64: audioBase64,
+                    audio_ms: audioMs,
+                    capture_peak: peak,
+                    capture_rms: rms,
                   },
                 });
                 const transcriptText = String(transcriptionResult?.text || "").trim();
@@ -9524,7 +9504,7 @@ export function AudioWidgetWindow() {
                   ) {
                     return {
                       ...(transcriptionResult || {}),
-                      audioMs,
+                      audio_ms: audioMs,
                       partial: false,
                       partialFallback: true,
                       partialFallbackReason: "final_suspicious_short",
@@ -9539,7 +9519,7 @@ export function AudioWidgetWindow() {
                 void partialStopPromise;
                 return {
                   ...(transcriptionResult || {}),
-                  audioMs,
+                  audio_ms: audioMs,
                   partial: false,
                   partialPreviewText,
                 };
@@ -9552,7 +9532,7 @@ export function AudioWidgetWindow() {
                 if (partialText) {
                   return {
                     ...(partialResult || {}),
-                    audioMs: Number(partialResult?.audioMs || audioMs || 0),
+                    audio_ms: Number(partialResult?.audio_ms || audioMs || 0),
                     text: partialText,
                     partialFallback: true,
                   };
@@ -9563,56 +9543,56 @@ export function AudioWidgetWindow() {
               localWhisperPartialFailedRef.current = true;
               localWhisperPartialSessionIdRef.current = "";
               try {
-                const { audioBase64, audioMs } = await audioBuffer.finishCapture({ decode: false });
+                const { audio_base64: audioBase64, audio_ms: audioMs } = await audioBuffer.finishCapture({ decode: false });
                 const { peak, rms } = audioBuffer.getCaptureStats();
-                await cancelLocalWhisperPartialTranscription({ sessionId: partialSessionId }).catch(() => {});
+                await cancelLocalWhisperPartialTranscription({ session_id: partialSessionId }).catch(() => {});
                 if (recordingRunRef.current !== recordingRunId) {
-                  return { audioMs };
+                  return { audio_ms: audioMs };
                 }
                 setMessage("Transcribing locally");
                 const transcriptionResult = await invoke("transcribe_whisper_audio", {
                   request: {
-                    audioBase64,
-                    audioMs,
-                    capturePeak: peak,
-                    captureRms: rms,
+                    audio_base64: audioBase64,
+                    audio_ms: audioMs,
+                    capture_peak: peak,
+                    capture_rms: rms,
                   },
                 });
                 return {
                   ...(transcriptionResult || {}),
-                  audioMs,
+                  audio_ms: audioMs,
                 };
               } catch {
-                await cancelLocalWhisperPartialTranscription({ sessionId: partialSessionId }).catch(() => {});
+                await cancelLocalWhisperPartialTranscription({ session_id: partialSessionId }).catch(() => {});
               }
               throw partialError;
             }
           }
 
-          const { audioBase64, audioMs } = await audioBuffer.finishCapture({ decode: false });
+          const { audio_base64: audioBase64, audio_ms: audioMs } = await audioBuffer.finishCapture({ decode: false });
           const { peak, rms } = audioBuffer.getCaptureStats();
           if (recordingRunRef.current !== recordingRunId) {
-            return { audioMs };
+            return { audio_ms: audioMs };
           }
           setMessage("Transcribing locally");
           const transcriptionResult = await invoke("transcribe_whisper_audio", {
             request: {
-              audioBase64,
-              audioMs,
-              capturePeak: peak,
-              captureRms: rms,
+              audio_base64: audioBase64,
+              audio_ms: audioMs,
+              capture_peak: peak,
+              capture_rms: rms,
             },
           });
           return {
             ...(transcriptionResult || {}),
-            audioMs,
+            audio_ms: audioMs,
           };
       })();
       if (recordingRunRef.current !== recordingRunId) {
         try {
           if (cancelSalvageRunRef.current === recordingRunId) {
             const published = await publishCancelledTranscript(
-              { ...result, latencyMs: Math.max(0, Date.now() - submittedAt) },
+              { ...result, latency_ms: Math.max(0, Date.now() - submittedAt) },
               currentProvider,
             );
             if (published && cancelSalvageRunRef.current === recordingRunId) {
@@ -9627,7 +9607,7 @@ export function AudioWidgetWindow() {
       setMessage(currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
         ? "Deepgram final"
         : currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
-          ? (result?.llmCleaned ? "Forge cloud cleaned" : "Forge cloud final")
+          ? (result?.llm_cleaned ? "Forge cloud cleaned" : "Forge cloud final")
           : "Transcribed locally");
       const rawTranscript = (result?.text || "").trim();
 
@@ -9648,16 +9628,16 @@ export function AudioWidgetWindow() {
         ? forgeDictationHistoryRef.current
         : null;
       const forgeRawTranscript = currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
-        ? String(result?.rawText || "").trim()
+        ? String(result?.raw_text || "").trim()
         : "";
       const forgeCleanupMetadata = currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
-        && result?.llmCleaned
+        && result?.llm_cleaned
         ? buildAudioPolishMetadata(result, {
-          totalMs: resultLatencyMs,
+          total_ms: resultLatencyMs,
         })
         : null;
       const forgeHistoryVariants = currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
-        && result?.llmCleaned
+        && result?.llm_cleaned
         && forgeRawTranscript
         ? [
           {
@@ -9675,31 +9655,31 @@ export function AudioWidgetWindow() {
         : [];
 
       await publishAudioTranscriptionResult({
-        audioMs: Number(result?.audioMs || 0),
-        cleanupModel: result?.cleanupModel || "",
-        cleanupProvider: result?.cleanupProvider || "",
-        createdAt: forgeHistory?.createdAt || new Date().toISOString(),
-        defaultVariantId: forgeHistoryVariants.length > 1 ? AUDIO_TRANSCRIPTION_VARIANT_CLEANED : "",
+        audio_ms: Number(result?.audio_ms || 0),
+        cleanup_model: result?.cleanup_model || "",
+        cleanup_provider: result?.cleanup_provider || "",
+        created_at: forgeHistory?.created_at || new Date().toISOString(),
+        default_variant_id: forgeHistoryVariants.length > 1 ? AUDIO_TRANSCRIPTION_VARIANT_CLEANED : "",
         id: forgeHistory?.id || `${Date.now()}`,
-        latencyMs: resultLatencyMs,
+        latency_ms: resultLatencyMs,
         language: currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_LOCAL ? "" : readDeepgramLanguage(),
-        llmCleaned: Boolean(result?.llmCleaned),
+        llm_cleaned: Boolean(result?.llm_cleaned),
         provider: currentProvider,
-        rawText: forgeHistoryVariants.length > 1 ? forgeRawTranscript : "",
-        snippetChanges: pipeline.changes?.snippets || [],
+        raw_text: forgeHistoryVariants.length > 1 ? forgeRawTranscript : "",
+        snippet_changes: pipeline.changes?.snippets || [],
         source: currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
           ? "deepgram-nova-3-live"
           : currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
             ? "forge-voice-agent"
           : currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
-            ? (result?.llmCleaned ? "forge-nova3-llm-cleaned" : "forge-nova3-dictation")
+            ? (result?.llm_cleaned ? "forge-nova3-llm-cleaned" : "forge-nova3-dictation")
             : result?.partial
               ? "whisper-local-partial"
               : "whisper-local",
-        sourceText: pipeline.changed ? rawTranscript : "",
+        source_text: pipeline.changed ? rawTranscript : "",
         text: nextTranscript,
         timings: forgeCleanupMetadata?.timings
-          || normalizeAudioHistoryTimings({ ...result, totalMs: resultLatencyMs })
+          || normalizeAudioHistoryTimings({ ...result, total_ms: resultLatencyMs })
           || null,
         variants: forgeHistoryVariants,
       });
@@ -9761,8 +9741,8 @@ export function AudioWidgetWindow() {
    * cancelled, never inserted into a target.
    */
   const salvageLocalCancelledCapture = useCallback((captureResult, captureStats) => {
-    const audioMs = Number(captureResult?.audioMs || 0);
-    const audioBase64 = String(captureResult?.audioBase64 || "");
+    const audioMs = Number(captureResult?.audio_ms || 0);
+    const audioBase64 = String(captureResult?.audio_base64 || "");
 
     if (!audioBase64 || audioMs < AUDIO_CANCEL_SALVAGE_MIN_AUDIO_MS) {
       return;
@@ -9772,17 +9752,17 @@ export function AudioWidgetWindow() {
 
     invoke("transcribe_whisper_audio", {
       request: {
-        audioBase64,
-        audioMs,
-        capturePeak: Number(captureStats?.peak || 0),
-        captureRms: Number(captureStats?.rms || 0),
+        audio_base64: audioBase64,
+        audio_ms: audioMs,
+        capture_peak: Number(captureStats?.peak || 0),
+        capture_rms: Number(captureStats?.rms || 0),
       },
     })
       .then((transcriptionResult) => publishCancelledTranscript(
         {
           ...(transcriptionResult || {}),
-          audioMs,
-          latencyMs: Math.max(0, Date.now() - submittedAt),
+          audio_ms: audioMs,
+          latency_ms: Math.max(0, Date.now() - submittedAt),
         },
         AUDIO_TRANSCRIPTION_PROVIDER_LOCAL,
       ))
@@ -9884,7 +9864,7 @@ export function AudioWidgetWindow() {
         if (partialText && salvage) {
           void publishCancelledTranscript(
             {
-              audioMs: recordingStartedAt > 0 ? Math.max(0, Date.now() - recordingStartedAt) : 0,
+              audio_ms: recordingStartedAt > 0 ? Math.max(0, Date.now() - recordingStartedAt) : 0,
               partial: true,
               text: partialText,
             },
@@ -9895,7 +9875,7 @@ export function AudioWidgetWindow() {
           await Promise.all([
             invoke("cancel_whisper_transcription").catch(() => {}),
             partialSessionId
-              ? cancelLocalWhisperPartialTranscription({ sessionId: partialSessionId }).catch(() => {})
+              ? cancelLocalWhisperPartialTranscription({ session_id: partialSessionId }).catch(() => {})
               : Promise.resolve(),
           ]);
           await audioBuffer?.finishCapture({ decode: false }).catch(() => null);
@@ -9928,13 +9908,13 @@ export function AudioWidgetWindow() {
             const published = await publishCancelledTranscript(
               {
                 ...(providerResult || {}),
-                audioMs: Number(
-                  captureResult?.audioMs
-                  || providerResult?.audioMs
-                  || Number(providerResult?.audioSeconds || 0) * 1000
+                audio_ms: Number(
+                  captureResult?.audio_ms
+                  || providerResult?.audio_ms
+                  || Number(providerResult?.audio_seconds || 0) * 1000
                   || 0,
                 ),
-                latencyMs: Math.max(0, Date.now() - cancelledAt),
+                latency_ms: Math.max(0, Date.now() - cancelledAt),
               },
               currentProvider,
             );
@@ -9982,8 +9962,8 @@ export function AudioWidgetWindow() {
         if (partialText) {
           void publishCancelledTranscript(
             {
-              audioMs,
-              latencyMs: Math.max(0, Date.now() - submittedAt),
+              audio_ms: audioMs,
+              latency_ms: Math.max(0, Date.now() - submittedAt),
               partial: true,
               text: partialText,
             },
@@ -9993,7 +9973,7 @@ export function AudioWidgetWindow() {
         trackAudioCaptureTeardown((async () => {
           await Promise.all([
             invoke("cancel_whisper_transcription").catch(() => {}),
-            cancelLocalWhisperPartialTranscription({ sessionId: partialSessionId }).catch(() => {}),
+            cancelLocalWhisperPartialTranscription({ session_id: partialSessionId }).catch(() => {}),
           ]);
           await audioBuffer.finishCapture({ decode: false }).catch(() => null);
           await audioBuffer?.close?.().catch(() => {});
@@ -10022,8 +10002,8 @@ export function AudioWidgetWindow() {
             await publishCancelledTranscript(
               {
                 ...(realtimeResult || {}),
-                audioMs: Number(captureResult?.audioMs || realtimeResult?.audioMs || 0),
-                latencyMs: Math.max(0, Date.now() - submittedAt),
+                audio_ms: Number(captureResult?.audio_ms || realtimeResult?.audio_ms || 0),
+                latency_ms: Math.max(0, Date.now() - submittedAt),
               },
               AUDIO_TRANSCRIPTION_PROVIDER_CLOUD,
             );
@@ -10041,12 +10021,12 @@ export function AudioWidgetWindow() {
             await publishCancelledTranscript(
               {
                 ...(dictationResult || {}),
-                audioMs: Number(
-                  captureResult?.audioMs
-                  || Number(dictationResult?.audioSeconds || 0) * 1000
+                audio_ms: Number(
+                  captureResult?.audio_ms
+                  || Number(dictationResult?.audio_seconds || 0) * 1000
                   || 0,
                 ),
-                latencyMs: Math.max(0, Date.now() - submittedAt),
+                latency_ms: Math.max(0, Date.now() - submittedAt),
               },
               AUDIO_TRANSCRIPTION_PROVIDER_FORGE,
             );
@@ -10096,7 +10076,7 @@ export function AudioWidgetWindow() {
       } else {
         if (localPartialSessionIdForCancel) {
           await cancelLocalWhisperPartialTranscription({
-            sessionId: localPartialSessionIdForCancel,
+            session_id: localPartialSessionIdForCancel,
           }).catch(() => {});
         }
         await invoke("cancel_whisper_transcription").catch(() => {});
@@ -10197,7 +10177,7 @@ export function AudioWidgetWindow() {
       }
       if (localWhisperPartialSessionIdRef.current) {
         cancelLocalWhisperPartialTranscription({
-          sessionId: localWhisperPartialSessionIdRef.current,
+          session_id: localWhisperPartialSessionIdRef.current,
         }).catch(() => {});
         localWhisperPartialSessionIdRef.current = "";
       }
@@ -10351,26 +10331,26 @@ export function AudioWidgetWindow() {
         return;
       }
 
-      const rawText = String(event.payload?.rawText || event.payload?.text || "").trim();
-      const historyId = String(event.payload?.historyId || "").trim();
+      const rawText = String(event.payload?.raw_text || event.payload?.text || "").trim();
+      const historyId = String(event.payload?.history_id || "").trim();
       if (!rawText || !historyId) {
         return;
       }
 
-      const createdAt = String(event.payload?.createdAt || "").trim() || new Date().toISOString();
+      const createdAt = String(event.payload?.created_at || "").trim() || new Date().toISOString();
       const timings = normalizeAudioHistoryTimings(event.payload);
       await publishAudioTranscriptionResult({
-        audioMs: Math.max(0, Number(event.payload?.audioSeconds || 0) * 1000),
-        cleanupModel: event.payload?.cleanupModel || "",
-        cleanupProvider: event.payload?.cleanupProvider || "",
-        createdAt,
-        defaultVariantId: AUDIO_TRANSCRIPTION_VARIANT_RAW,
+        audio_ms: Math.max(0, Number(event.payload?.audio_seconds || 0) * 1000),
+        cleanup_model: event.payload?.cleanup_model || "",
+        cleanup_provider: event.payload?.cleanup_provider || "",
+        created_at: createdAt,
+        default_variant_id: AUDIO_TRANSCRIPTION_VARIANT_RAW,
         id: historyId,
         language: readDeepgramLanguage(),
-        latencyMs: Math.max(0, Date.now() - new Date(createdAt).getTime()),
-        llmCleaned: false,
+        latency_ms: Math.max(0, Date.now() - new Date(createdAt).getTime()),
+        llm_cleaned: false,
         provider: AUDIO_TRANSCRIPTION_PROVIDER_FORGE,
-        rawText,
+        raw_text: rawText,
         source: "forge-nova3-dictation-raw",
         text: rawText,
         timings,
@@ -10410,7 +10390,7 @@ export function AudioWidgetWindow() {
       }
 
       const cleanedText = String(event.payload?.text || "").trim();
-      const historyId = String(event.payload?.historyId || "").trim();
+      const historyId = String(event.payload?.history_id || "").trim();
       if (!cleanedText || !historyId) {
         return;
       }
@@ -10420,25 +10400,21 @@ export function AudioWidgetWindow() {
       if (!existing || existing.status === AUDIO_TRANSCRIPTION_STATUS_CANCELLED) {
         return;
       }
-      const createdAt = String(event.payload?.createdAt || existing?.createdAt || "").trim()
+      const createdAt = String(event.payload?.created_at || existing?.created_at || "").trim()
         || new Date().toISOString();
       const rawText = String(
-        event.payload?.rawText
-        || event.payload?.raw_text
-        || existing?.rawText
-        || existing?.text
-        || "",
+        event.payload?.raw_text || existing?.raw_text || existing?.text || "",
       ).trim();
       const polishMetadata = buildAudioPolishMetadata(event.payload);
       const timings = polishMetadata?.timings
         || normalizeAudioHistoryTimings(event.payload)
         || normalizeAudioHistoryTimings(existing)
         || null;
-      const audioMs = Number(existing?.audioMs || 0) > 0
-        ? Number(existing.audioMs)
-        : Math.max(0, Number(event.payload?.audioSeconds || 0) * 1000);
-      const latencyMs = Number(existing?.latencyMs || 0) > 0
-        ? Number(existing.latencyMs)
+      const audioMs = Number(existing?.audio_ms || 0) > 0
+        ? Number(existing.audio_ms)
+        : Math.max(0, Number(event.payload?.audio_seconds || 0) * 1000);
+      const latency_ms = Number(existing?.latency_ms || 0) > 0
+        ? Number(existing.latency_ms)
         : Math.max(0, Date.now() - new Date(createdAt).getTime());
       const variants = [
         ...(rawText ? [{
@@ -10456,17 +10432,17 @@ export function AudioWidgetWindow() {
 
       await publishAudioTranscriptionResult({
         ...(existing || {}),
-        audioMs,
-        cleanupModel: event.payload?.cleanupModel || existing?.cleanupModel || "",
-        cleanupProvider: event.payload?.cleanupProvider || existing?.cleanupProvider || "",
-        createdAt,
-        defaultVariantId: AUDIO_TRANSCRIPTION_VARIANT_CLEANED,
+        audio_ms: audioMs,
+        cleanup_model: event.payload?.cleanup_model || existing?.cleanup_model || "",
+        cleanup_provider: event.payload?.cleanup_provider || existing?.cleanup_provider || "",
+        created_at: createdAt,
+        default_variant_id: AUDIO_TRANSCRIPTION_VARIANT_CLEANED,
         id: historyId,
         language: existing?.language || readDeepgramLanguage(),
-        latencyMs,
-        llmCleaned: Boolean(event.payload?.llmCleaned ?? true),
+        latency_ms,
+        llm_cleaned: Boolean(event.payload?.llm_cleaned ?? true),
         provider: AUDIO_TRANSCRIPTION_PROVIDER_FORGE,
-        rawText,
+        raw_text: rawText,
         source: "forge-nova3-llm-cleaned",
         status: existing?.status || AUDIO_TRANSCRIPTION_STATUS_INSERTED,
         text: cleanedText,
@@ -10511,7 +10487,7 @@ export function AudioWidgetWindow() {
       const activeProvider = readAudioTranscriptionProvider();
       const eventProvider = String(event.payload?.provider || "").trim();
       if (eventProvider === "forge") {
-        const eventHistoryId = String(event.payload?.historyId || "").trim();
+        const eventHistoryId = String(event.payload?.history_id || "").trim();
         const activeHistoryId = String(forgeDictationHistoryRef.current?.id || "").trim();
         if (
           activeProvider !== AUDIO_TRANSCRIPTION_PROVIDER_FORGE
@@ -10525,7 +10501,7 @@ export function AudioWidgetWindow() {
           return;
         }
       } else if (eventProvider === "whisper-local") {
-        const eventSessionId = String(event.payload?.sessionId || "").trim();
+        const eventSessionId = String(event.payload?.session_id || "").trim();
         if (
           activeProvider !== AUDIO_TRANSCRIPTION_PROVIDER_LOCAL
           || !eventSessionId
@@ -10546,7 +10522,7 @@ export function AudioWidgetWindow() {
         : eventProvider === "whisper-local"
           ? "Local Whisper"
           : "Deepgram";
-      setMessage(event.payload?.isFinal ? `${liveLabel} finalizing` : `${liveLabel} live`);
+      setMessage(event.payload?.is_final ? `${liveLabel} finalizing` : `${liveLabel} live`);
     })
       .then((nextUnlisten) => {
         if (disposed) {
@@ -10763,7 +10739,7 @@ export function AudioWidgetWindow() {
     };
   }, [audioWidgetTheme]);
 
-  const widgetPushToTalkShortcut = shortcutStatus?.pushToTalk?.shortcut || defaultPushToTalkShortcut();
+  const widgetPushToTalkShortcut = shortcutStatus?.push_to_talk?.shortcut || defaultPushToTalkShortcut();
   const widgetCancelShortcut = shortcutStatus?.cancel?.shortcut || "Escape";
 
   useEffect(() => {

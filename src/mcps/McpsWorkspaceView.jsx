@@ -83,9 +83,9 @@ const EXPOSURE_MODE_OPTIONS = [
 const EMPTY_MANUAL = {
   customCommand: "",
   name: "",
-  sourceKind: "manual",
-  sourceLabel: "Manual",
-  packageRef: "",
+  source_kind: "manual",
+  source_label: "Manual",
+  package_ref: "",
   transport: "stdio",
   command: "",
   args: "",
@@ -102,7 +102,7 @@ const EMPTY_MARKETPLACE = {
 };
 
 const EMPTY_SECRET_DRAFT = {
-  draftId: "",
+  draft_id: "",
   key: "",
   value: "",
 };
@@ -749,10 +749,10 @@ function parseMcpAddCommand(value) {
     configValues: configValuesFromPairs(envPairs),
     envSchema: envSchemaFromPairs(envPairs),
     name: name || displayNameFromSource(command || url || "custom-mcp", provider),
-    packageRef: commandTokens.length ? commandTokens.join(" ") : url,
+    package_ref: commandTokens.length ? commandTokens.join(" ") : url,
     provider,
-    sourceKind,
-    sourceLabel,
+    source_kind: sourceKind,
+    source_label: sourceLabel,
     transport: url ? "http" : transport,
     url,
   };
@@ -774,9 +774,9 @@ function manualDraftFromMcpCommand(commandText, draft) {
     customCommand: commandText,
     envSchema: JSON.stringify(parsed.envSchema, null, 2),
     name: parsed.name,
-    packageRef: parsed.packageRef,
-    sourceKind: parsed.sourceKind,
-    sourceLabel: parsed.sourceLabel,
+    package_ref: parsed.package_ref,
+    source_kind: parsed.source_kind,
+    source_label: parsed.source_label,
     transport: parsed.transport,
     url: parsed.url,
   };
@@ -840,9 +840,9 @@ function parseMarketplaceCommand(provider, command) {
 }
 
 export default function McpsWorkspaceView({
-  defaultWorkingDirectory,
+  default_working_directory: defaultWorkingDirectory,
   onScopeChange = null,
-  rootDirectory,
+  root_directory: rootDirectory,
   scopeOptions = [],
   scopeValue = "",
   workspace,
@@ -852,7 +852,7 @@ export default function McpsWorkspaceView({
   const repoPath = workspaceId
     ? rootDirectory || defaultWorkingDirectory || ""
     : "";
-  const commandBase = useMemo(() => ({ repoPath }), [repoPath]);
+  const commandBase = useMemo(() => ({ repo_path: repoPath }), [repoPath]);
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState("");
   const [registry, setRegistry] = useState(null);
@@ -920,8 +920,8 @@ export default function McpsWorkspaceView({
     try {
       const response = await invoke("coordination_workspace_mcp_registry", {
         ...commandBase,
-        workspaceId,
-        workspaceName,
+        workspace_id: workspaceId,
+        workspace_name: workspaceName,
       });
       const data = unwrapData(response);
       setRegistry(data);
@@ -1000,9 +1000,9 @@ export default function McpsWorkspaceView({
     setStatus("ready");
     window.dispatchEvent(new CustomEvent("diffforge:workspace-mcp-registry-updated", {
       detail: {
-        repoPath,
-        workspaceId,
-        workspaceName,
+        repo_path: repoPath,
+        workspace_id: workspaceId,
+        workspace_name: workspaceName,
       },
     }));
     return data;
@@ -1016,7 +1016,7 @@ export default function McpsWorkspaceView({
       try {
         const response = await invoke("coordination_install_workspace_mcp_server", {
           ...commandBase,
-          workspaceId,
+          workspace_id: workspaceId,
           input: {
             workspace_name: workspaceName,
             name: item.name,
@@ -1065,7 +1065,7 @@ export default function McpsWorkspaceView({
       try {
         const response = await invoke("coordination_install_workspace_mcp_server", {
           ...commandBase,
-          workspaceId,
+          workspace_id: workspaceId,
           input: mcpCatalogInstallInput(entry, workspaceName),
         });
         const data = replaceRegistry(response);
@@ -1099,8 +1099,8 @@ export default function McpsWorkspaceView({
       try {
         const response = await invoke("coordination_update_workspace_mcp_server", {
           ...commandBase,
-          workspaceId,
-          serverId: server.id,
+          workspace_id: workspaceId,
+          server_id: server.id,
           input: {
             workspace_name: workspaceName,
             workspace_enabled: enabling,
@@ -1124,8 +1124,8 @@ export default function McpsWorkspaceView({
       try {
         const response = await invoke("coordination_index_workspace_mcp_marketplace", {
           ...commandBase,
-          workspaceId,
-          marketplaceId: marketplace.id,
+          workspace_id: workspaceId,
+          marketplace_id: marketplace.id,
         });
         return replaceRegistry(response);
       } catch (caught) {
@@ -1148,13 +1148,13 @@ export default function McpsWorkspaceView({
     try {
       const response = await invoke("coordination_install_workspace_mcp_server", {
         ...commandBase,
-        workspaceId,
+        workspace_id: workspaceId,
         input: {
           workspace_name: workspaceName,
           name: manualName,
-          source_kind: manualDraft.sourceKind || "manual",
-          source_label: manualDraft.sourceLabel.trim() || "Manual",
-          package_ref: manualDraft.packageRef.trim(),
+          source_kind: manualDraft.source_kind || "manual",
+          source_label: manualDraft.source_label.trim() || "Manual",
+          package_ref: manualDraft.package_ref.trim(),
           transport: manualDraft.transport,
           command: manualDraft.command.trim(),
           args: parseArgs(manualDraft.args),
@@ -1194,7 +1194,7 @@ export default function McpsWorkspaceView({
     try {
       const response = await invoke("coordination_add_workspace_mcp_marketplace", {
         ...commandBase,
-        workspaceId,
+        workspace_id: workspaceId,
         input: {
           provider: marketplaceDraft.provider,
           source_type: parsed.sourceType,
@@ -1230,8 +1230,8 @@ export default function McpsWorkspaceView({
       try {
         await invoke("coordination_remove_workspace_mcp_marketplace", {
           ...commandBase,
-          workspaceId,
-          marketplaceId: marketplace.id,
+          workspace_id: workspaceId,
+          marketplace_id: marketplace.id,
         }).then(replaceRegistry);
       } catch (caught) {
         setError(errorMessage(caught));
@@ -1272,8 +1272,8 @@ export default function McpsWorkspaceView({
       try {
         const response = await invoke("coordination_update_workspace_mcp_server", {
           ...commandBase,
-          workspaceId,
-          serverId: selectedServer.id,
+          workspace_id: workspaceId,
+          server_id: selectedServer.id,
           input: {
             workspace_name: workspaceName,
             workspace_enabled: selectedServer.workspace_enabled,
@@ -1298,8 +1298,8 @@ export default function McpsWorkspaceView({
     try {
       const response = await invoke("coordination_uninstall_workspace_mcp_server", {
         ...commandBase,
-        workspaceId,
-        serverId: selectedServer.id,
+        workspace_id: workspaceId,
+        server_id: selectedServer.id,
       });
       const data = replaceRegistry(response);
       setSelectedId(asArray(data.servers)[0]?.id || "coordination-kernel");
@@ -1316,18 +1316,18 @@ export default function McpsWorkspaceView({
       ...rows,
       {
         ...EMPTY_SECRET_DRAFT,
-        draftId: `secret-draft-${Date.now()}-${rows.length}`,
+        draft_id: `secret-draft-${Date.now()}-${rows.length}`,
       },
     ]);
   }, []);
 
   const removeSecretDraftRow = useCallback((draftId) => {
-    setSecretDraftRows((rows) => rows.filter((row) => row.draftId !== draftId));
+    setSecretDraftRows((rows) => rows.filter((row) => row.draft_id !== draftId));
   }, []);
 
   const updateSecretDraftRow = useCallback((draftId, patch) => {
     setSecretDraftRows((rows) =>
-      rows.map((row) => (row.draftId === draftId ? { ...row, ...patch } : row)),
+      rows.map((row) => (row.draft_id === draftId ? { ...row, ...patch } : row)),
     );
   }, []);
 
@@ -1340,8 +1340,8 @@ export default function McpsWorkspaceView({
     try {
       const response = await invoke("coordination_upsert_workspace_mcp_secret", {
         ...commandBase,
-        workspaceId,
-        workspaceName,
+        workspace_id: workspaceId,
+        workspace_name: workspaceName,
         input: {
           key,
           value,
@@ -1350,8 +1350,8 @@ export default function McpsWorkspaceView({
       const data = replaceRegistry(response);
       const secretsServer = asArray(data.servers).find(isSecretsServer);
       setSelectedId(secretsServer?.id || SECRETS_SERVER_KEY);
-      if (row.draftId) {
-        removeSecretDraftRow(row.draftId);
+      if (row.draft_id) {
+        removeSecretDraftRow(row.draft_id);
       }
       const rowKey = row.id || key;
       // Return the row to its masked, at-rest state: drop the edit buffer, exit
@@ -1407,7 +1407,7 @@ export default function McpsWorkspaceView({
       try {
         const response = await invoke("coordination_reveal_workspace_mcp_secret", {
           ...commandBase,
-          workspaceId,
+          workspace_id: workspaceId,
           key: secret.key,
         });
         const value = String(unwrapData(response)?.value ?? "");
@@ -1456,9 +1456,9 @@ export default function McpsWorkspaceView({
       try {
         const response = await invoke("coordination_delete_workspace_mcp_secret", {
           ...commandBase,
-          workspaceId,
-          workspaceName,
-          secretId: secret.id,
+          workspace_id: workspaceId,
+          workspace_name: workspaceName,
+          secret_id: secret.id,
         });
         replaceRegistry(response);
         setSecretValueDrafts((drafts) => {
@@ -1497,8 +1497,8 @@ export default function McpsWorkspaceView({
       try {
         const response = await invoke("coordination_upsert_workspace_mcp_ssh_target", {
           ...commandBase,
-          workspaceId,
-          workspaceName,
+          workspace_id: workspaceId,
+          workspace_name: workspaceName,
           input,
         });
         const data = replaceRegistry(response);
@@ -1524,9 +1524,9 @@ export default function McpsWorkspaceView({
       try {
         const response = await invoke("coordination_delete_workspace_mcp_ssh_target", {
           ...commandBase,
-          workspaceId,
-          workspaceName,
-          sshTargetId,
+          workspace_id: workspaceId,
+          workspace_name: workspaceName,
+          ssh_target_id: sshTargetId,
         });
         replaceRegistry(response);
         return { ok: true };
@@ -1567,7 +1567,7 @@ export default function McpsWorkspaceView({
       !searchQuery
         || entry.label.toLowerCase().includes(searchQuery)
         || entry.description.toLowerCase().includes(searchQuery)
-        || entry.packageRef.toLowerCase().includes(searchQuery)
+        || entry.package_ref.toLowerCase().includes(searchQuery)
     ))
     .map((entry) => ({
       entry,
@@ -1864,7 +1864,7 @@ export default function McpsWorkspaceView({
         {parsedManualCommand && (
           <McpEmptyAccess>
             Parsed {providerLabel(parsedManualCommand.provider)} MCP · {parsedManualCommand.name} ·{" "}
-            {parsedManualCommand.packageRef || parsedManualCommand.url || "custom server"} ·{" "}
+            {parsedManualCommand.package_ref || parsedManualCommand.url || "custom server"} ·{" "}
             {parsedManualCommand.envSchema.length} config
             {parsedManualCommand.envSchema.length === 1 ? " value" : " values"}
           </McpEmptyAccess>
@@ -1880,18 +1880,18 @@ export default function McpsWorkspaceView({
           <PanelKicker>Source Label</PanelKicker>
           <McpInput
             onChange={(event) =>
-              setManualDraft((draft) => ({ ...draft, sourceLabel: event.target.value }))
+              setManualDraft((draft) => ({ ...draft, source_label: event.target.value }))
             }
-            value={manualDraft.sourceLabel}
+            value={manualDraft.source_label}
           />
         </McpWideField>
         <McpWideField>
           <PanelKicker>Package</PanelKicker>
           <McpInput
             onChange={(event) =>
-              setManualDraft((draft) => ({ ...draft, packageRef: event.target.value }))
+              setManualDraft((draft) => ({ ...draft, package_ref: event.target.value }))
             }
-            value={manualDraft.packageRef}
+            value={manualDraft.package_ref}
           />
         </McpWideField>
         <McpWideField>
@@ -2211,12 +2211,12 @@ export default function McpsWorkspaceView({
               const canSave = row.key.trim() && row.value;
               const savingThis = actionState === "saving_secret" && actionContext.name === row.key.trim();
               return (
-                <McpSecretRow key={row.draftId} data-draft="true">
+                <McpSecretRow key={row.draft_id} data-draft="true">
                   <McpSecretField data-size="key">
                     <PanelKicker>Key</PanelKicker>
                     <McpInput
                       onChange={(event) =>
-                        updateSecretDraftRow(row.draftId, { key: event.target.value })
+                        updateSecretDraftRow(row.draft_id, { key: event.target.value })
                       }
                       placeholder="APP_API_KEY"
                       value={row.key}
@@ -2226,7 +2226,7 @@ export default function McpsWorkspaceView({
                     <PanelKicker>Value</PanelKicker>
                     <McpInput
                       onChange={(event) =>
-                        updateSecretDraftRow(row.draftId, { value: event.target.value })
+                        updateSecretDraftRow(row.draft_id, { value: event.target.value })
                       }
                       placeholder="Enter a value"
                       type="password"
@@ -2244,7 +2244,7 @@ export default function McpsWorkspaceView({
                     </SecretButton>
                     <SecretButton
                       disabled={actionState !== "idle"}
-                      onClick={() => removeSecretDraftRow(row.draftId)}
+                      onClick={() => removeSecretDraftRow(row.draft_id)}
                       type="button"
                     >
                       Cancel

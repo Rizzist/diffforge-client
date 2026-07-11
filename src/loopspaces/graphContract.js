@@ -212,10 +212,10 @@ function cleanKind(value) {
 
 function nodeKindFromValue(value) {
   if (value && typeof value === "object") {
-    if (value.triggerId || value.trigger_id || value.kind === "trigger" || value.role === "trigger") {
+    if (value.trigger_id || value.kind === "trigger" || value.role === "trigger") {
       return "trigger";
     }
-    return cleanKind(value.nodeKind || value.node_kind || value.kind || value.role || "loop");
+    return cleanKind(value.node_kind || value.kind || value.role || "loop");
   }
   return cleanKind(value || "loop");
 }
@@ -223,13 +223,7 @@ function nodeKindFromValue(value) {
 function graphContractNodeParentId(value) {
   if (!value || typeof value !== "object") return "";
   return String(
-    value?.props?.parent_id
-      || value?.props?.parentId
-      || value?.props?.parent
-      || value?.parent_id
-      || value?.parentId
-      || value?.parent
-      || "",
+    value?.props?.parent_id || value?.props?.parent || value?.parent_id || value?.parent || "",
   ).trim();
 }
 
@@ -319,8 +313,8 @@ export function loopspaceGraphNodeHasOutputPort(value, portId = "", options = {}
 export function validateLoopspaceGraphEdgeCandidate(fromNode, toNode, options = {}) {
   const fromId = String(fromNode?.id || options.from || "").trim();
   const toId = String(toNode?.id || options.to || "").trim();
-  const fromPort = String(options.fromPort || options.from_port || "").trim().toLowerCase();
-  const toPort = String(options.toPort || options.to_port || "in").trim().toLowerCase();
+  const fromPort = String(options.from_port || "").trim().toLowerCase();
+  const toPort = String(options.to_port || "in").trim().toLowerCase();
   if (!fromId || !toId) {
     return { error: "Graph edge requires both a source and target node.", ok: false };
   }
@@ -409,11 +403,11 @@ export function validateLoopspaceGraphEdgeCandidate(fromNode, toNode, options = 
       ok: false,
     };
   }
-  return { fromPort, ok: true, toPort };
+  return { from_port: fromPort, ok: true, to_port: toPort };
 }
 
 function graphContractEdgeBranch(edge = {}) {
-  return String(edge?.props?.branch || edge?.branch || edge?.fromPort || "")
+  return String(edge?.props?.branch || edge?.branch || edge?.from_port || "")
     .trim()
     .toLowerCase()
     .replace(/[\s-]+/g, "_");
@@ -432,13 +426,13 @@ function loopspaceGraphLegacyActionOutEdgeKey(edge = {}) {
   return JSON.stringify({
     branch: graphContractEdgeBranch(edge),
     from: String(edge?.from || "").trim(),
-    fromPort: String(edge?.fromPort || "").trim().toLowerCase(),
+    from_port: String(edge?.from_port || "").trim().toLowerCase(),
     id: String(edge?.id || "").trim(),
     label: String(edge?.label || "").trim(),
     props: sortedPlainObject(edge?.props),
     role: String(edge?.role || "").trim(),
     to: String(edge?.to || "").trim(),
-    toPort: String(edge?.toPort || "").trim().toLowerCase(),
+    to_port: String(edge?.to_port || "").trim().toLowerCase(),
   });
 }
 
@@ -450,7 +444,7 @@ function loopspaceGraphLegacyActionOutEdgeCounts(ast = {}) {
   for (const edge of edges) {
     const fromNode = nodeById.get(String(edge?.from || "").trim());
     const fromKind = normalizeLoopspaceGraphNodeKind(fromNode);
-    const fromPort = String(edge?.fromPort || "").trim().toLowerCase();
+    const fromPort = String(edge?.from_port || "").trim().toLowerCase();
     if ((fromKind === "run_script" || fromKind === "send_message" || fromKind === "dispatch_todos") && fromPort === "out") {
       const key = loopspaceGraphLegacyActionOutEdgeKey(edge);
       counts.set(key, (counts.get(key) || 0) + 1);
@@ -484,10 +478,10 @@ export function validateLoopspaceGraphAst(ast = {}, options = {}) {
     const to = String(edge?.to || "").trim();
     let validation = validateLoopspaceGraphEdgeCandidate(nodeById.get(from), nodeById.get(to), {
       from,
-      fromPort: edge?.fromPort,
+      from_port: edge?.from_port,
       nodeById,
       to,
-      toPort: edge?.toPort,
+      to_port: edge?.to_port,
     });
     if (!validation.ok && allowedLegacyActionOutEdgeCounts) {
       const legacyKey = loopspaceGraphLegacyActionOutEdgeKey(edge);
@@ -496,10 +490,10 @@ export function validateLoopspaceGraphAst(ast = {}, options = {}) {
         const legacyValidation = validateLoopspaceGraphEdgeCandidate(nodeById.get(from), nodeById.get(to), {
           allowLegacy: true,
           from,
-          fromPort: edge?.fromPort,
+          from_port: edge?.from_port,
           nodeById,
           to,
-          toPort: edge?.toPort,
+          to_port: edge?.to_port,
         });
         if (legacyValidation.ok) {
           allowedLegacyActionOutEdgeCounts.set(legacyKey, legacyCount - 1);
@@ -510,10 +504,10 @@ export function validateLoopspaceGraphAst(ast = {}, options = {}) {
       validation = validateLoopspaceGraphEdgeCandidate(nodeById.get(from), nodeById.get(to), {
         allowLegacy: true,
         from,
-        fromPort: edge?.fromPort,
+        from_port: edge?.from_port,
         nodeById,
         to,
-        toPort: edge?.toPort,
+        to_port: edge?.to_port,
       });
     }
     if (!validation.ok) {

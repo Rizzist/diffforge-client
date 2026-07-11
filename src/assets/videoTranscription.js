@@ -111,18 +111,18 @@ export function buildSrtFromUtterances(utterances) {
 export async function getMediaTranscriptStatus(mediaPath) {
   const path = text(mediaPath);
   if (!path || !mediaPathIsTranscribable(path)) {
-    return { exists: false, jsonPath: "", srtPath: "", updatedAtMs: 0 };
+    return { exists: false, json_path: "", srt_path: "", updated_at_ms: 0 };
   }
   try {
-    const status = await invoke("hyperframe_media_transcript_status", { mediaPath: path });
+    const status = await invoke("hyperframe_media_transcript_status", { media_path: path });
     return {
       exists: Boolean(status?.exists),
-      jsonPath: text(status?.jsonPath),
-      srtPath: text(status?.srtPath),
-      updatedAtMs: Number(status?.updatedAtMs) || 0,
+      json_path: text(status?.json_path),
+      srt_path: text(status?.srt_path),
+      updated_at_ms: Number(status?.updated_at_ms) || 0,
     };
   } catch {
-    return { exists: false, jsonPath: "", srtPath: "", updatedAtMs: 0 };
+    return { exists: false, json_path: "", srt_path: "", updated_at_ms: 0 };
   }
 }
 
@@ -151,8 +151,8 @@ async function extractWavBase64(mediaPath, onStage) {
   const monoBuffer = await audioBufferToMono16k(audioBuffer);
   const wavBytes = float32ToWavBytes(monoBuffer.getChannelData(0), TRANSCRIPT_TARGET_SAMPLE_RATE);
   return {
-    audioBase64: bytesToBase64(wavBytes),
-    durationSeconds: audioBuffer.duration,
+    audio_base64: bytesToBase64(wavBytes),
+    duration_seconds: audioBuffer.duration,
   };
 }
 
@@ -162,9 +162,9 @@ async function extractWavBase64(mediaPath, onStage) {
  * asset's tracked/untracked/cloud scope automatically).
  */
 export async function transcribeMediaAsset({
-  apiKey = "",
+  api_key: apiKey = "",
   language = "en",
-  mediaPath,
+  media_path: mediaPath,
   mediaName = "",
   onStage,
   provider = "deepgram",
@@ -175,13 +175,13 @@ export async function transcribeMediaAsset({
     throw new Error("This file type cannot be transcribed.");
   }
 
-  const { audioBase64, durationSeconds } = await extractWavBase64(path, onStage);
+  const { audio_base64: audioBase64, duration_seconds: durationSeconds } = await extractWavBase64(path, onStage);
 
   onStage?.(provider === "deepgram" ? "uploading" : "transcribing");
   const result = await invoke("hyperframe_transcribe_audio", {
     request: {
-      apiKey: apiKey || undefined,
-      audioBase64,
+      api_key: apiKey || undefined,
+      audio_base64: audioBase64,
       language,
       provider,
     },
@@ -190,7 +190,7 @@ export async function transcribeMediaAsset({
   onStage?.("saving");
   const utterances = Array.isArray(result?.utterances) ? result.utterances : [];
   const transcriptJson = {
-    durationSeconds: Number(result?.durationSeconds) || durationSeconds,
+    duration_seconds: Number(result?.duration_seconds) || durationSeconds,
     generatedAt: new Date().toISOString(),
     language: text(result?.language, language),
     source: {
@@ -204,18 +204,18 @@ export async function transcribeMediaAsset({
   };
   const saved = await invoke("hyperframe_save_media_transcript", {
     request: {
-      mediaPath: path,
-      srtText: buildSrtFromUtterances(utterances),
-      transcriptJson: JSON.stringify(transcriptJson, null, 2),
+      media_path: path,
+      srt_text: buildSrtFromUtterances(utterances),
+      transcript_json: JSON.stringify(transcriptJson, null, 2),
     },
   });
 
   onStage?.("done");
   return {
-    durationSeconds: transcriptJson.durationSeconds,
-    jsonPath: text(saved?.jsonPath),
+    duration_seconds: transcriptJson.duration_seconds,
+    json_path: text(saved?.json_path),
     language: transcriptJson.language,
-    srtPath: text(saved?.srtPath),
+    srt_path: text(saved?.srt_path),
     tool: transcriptJson.tool,
     utteranceCount: utterances.length,
   };

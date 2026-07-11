@@ -188,17 +188,17 @@ export function useUntrackedAssetsLibrary() {
     runUntrackedMutation("diffforge_delete_untracked_asset", { path })
   ), []);
   const renameAsset = useCallback((path, newName) => (
-    runUntrackedMutation("diffforge_rename_untracked_asset", { newName, path })
+    runUntrackedMutation("diffforge_rename_untracked_asset", { new_name: newName, path })
   ), []);
   const promoteAsset = useCallback((payload) => {
     const {
-      repoPath: _repoPath,
-      workspaceId: _workspaceId,
-      workspaceName: _workspaceName,
+      repo_path: _repoPath,
+      workspace_id: _workspaceId,
+      workspace_name: _workspaceName,
       ...accountPayload
     } = payload || {};
     return runUntrackedMutation("diffforge_promote_untracked_asset", {
-      deleteSource: true,
+      delete_source: true,
       ...accountPayload,
     });
   }, []);

@@ -34,32 +34,29 @@ const PUSH_TERMINAL = new Set(["applied", "wiped", "failed"]);
 const PUSH_SUCCESS = new Set(["applied", "wiped"]);
 
 function deviceIdOf(device) {
-  return String(device?.deviceId || device?.device_id || device?.id || "").trim();
+  return String(device?.device_id || device?.id || "").trim();
 }
 
 function deviceNameOf(device) {
   return String(
-    device?.displayName || device?.label || device?.name || device?.deviceId || "Device",
+    device?.display_name || device?.label || device?.name || device?.device_id || "Device",
   ).trim();
 }
 
 function deviceOnlineOf(device) {
   return Boolean(
-    device?.connected
-      ?? device?.native_connected
-      ?? device?.nativeConnected
-      ?? device?.online,
+    device?.connected ?? device?.native_connected ?? device?.online,
   );
 }
 
 function devicePlatformOf(device) {
-  return String(device?.platformLabel || device?.platform || device?.formFactor || "").trim();
+  return String(device?.platform_label || device?.platform || device?.form_factor || "").trim();
 }
 
 // null = unknown (backend hasn't published the field yet) → allow the attempt and
 // let the command's error be the hard gate; false = explicitly cannot receive.
 function devicePushCapableOf(device) {
-  const value = device?.pushCapable ?? device?.push_capable;
+  const value = device?.push_capable;
   if (value === undefined || value === null) {
     return null;
   }
@@ -67,8 +64,8 @@ function devicePushCapableOf(device) {
 }
 
 function profileNeedsLogin(profile) {
-  const authStatus = profile?.authStatus || {};
-  return Boolean(authStatus.needsLogin || (!profile?.identity?.authReady && !profile?.isDefault));
+  const authStatus = profile?.auth_status || {};
+  return Boolean(authStatus.needs_login || (!profile?.identity?.auth_ready && !profile?.is_default));
 }
 
 function profileDisplayName(profile) {
@@ -77,7 +74,7 @@ function profileDisplayName(profile) {
     return alias;
   }
   const email = String(profile?.identity?.email || "").trim();
-  if (profile?.isDefault) {
+  if (profile?.is_default) {
     return profile?.label || "Default";
   }
   return profile?.label || email || "Account";
@@ -161,7 +158,7 @@ function DevicePushPanel({ device, accounts, push, onSubmit, onDismiss }) {
       return;
     }
     disarmWipe();
-    onSubmit(device, { agentKind: kind, profileId, wipe: true });
+    onSubmit(device, { agent_kind: kind, profile_id: profileId, wipe: true });
   }, [device, disarmWipe, kind, onSubmit, profileId, wipeArmed]);
 
   if (!availableKinds.length) {
@@ -274,7 +271,7 @@ function DevicePushPanel({ device, accounts, push, onSubmit, onDismiss }) {
           disabled={!canSubmit}
           onClick={() => {
             disarmWipe();
-            onSubmit(device, { agentKind: kind, profileId, wipe: false });
+            onSubmit(device, { agent_kind: kind, profile_id: profileId, wipe: false });
           }}
           type="button"
         >
@@ -286,7 +283,7 @@ function DevicePushPanel({ device, accounts, push, onSubmit, onDismiss }) {
   );
 }
 
-export default function DevicesView({ active = true, deviceRows = [], localDeviceId = "" }) {
+export default function DevicesView({ active = true, deviceRows = [], local_device_id: localDeviceId = "" }) {
   const [accounts, setAccounts] = useState(null);
   const [openDeviceId, setOpenDeviceId] = useState("");
   const [pushByDevice, setPushByDevice] = useState({});
@@ -335,23 +332,23 @@ export default function DevicesView({ active = true, deviceRows = [], localDevic
         return;
       }
       const payload = event?.payload || {};
-      const deviceId = String(payload.targetDeviceId || payload.target_device_id || "").trim();
-      const pushId = payload.pushId || payload.push_id || "";
+      const deviceId = String(payload.target_device_id || "").trim();
+      const pushId = payload.push_id || "";
       if (!deviceId) {
         return;
       }
       setPushByDevice((current) => {
         const prev = current[deviceId];
         // Ignore updates from a superseded push for the same device.
-        if (prev?.pushId && pushId && prev.pushId !== pushId) {
+        if (prev?.push_id && pushId && prev.push_id !== pushId) {
           return current;
         }
         return {
           ...current,
           [deviceId]: {
-            pushId: pushId || prev?.pushId || "",
-            agentKind: payload.agentKind || payload.agent_kind || prev?.agentKind || "",
-            profileId: payload.profileId || payload.profile_id || prev?.profileId || "",
+            push_id: pushId || prev?.push_id || "",
+            agent_kind: payload.agent_kind || prev?.agent_kind || "",
+            profile_id: payload.profile_id || prev?.profile_id || "",
             wipe: prev?.wipe ?? false,
             state: payload.state || prev?.state || "",
             message: payload.message || "",
@@ -403,26 +400,26 @@ export default function DevicesView({ active = true, deviceRows = [], localDevic
     return { thisDevice: self, remoteDevices: remotes };
   }, [deviceRows, localId]);
 
-  const submitPush = useCallback((device, { agentKind, profileId, wipe }) => {
+  const submitPush = useCallback((device, { agent_kind: agentKind, profile_id: profileId, wipe }) => {
     const deviceId = deviceIdOf(device);
     if (!deviceId || !agentKind || !profileId) {
       return;
     }
     setPushByDevice((current) => ({
       ...current,
-      [deviceId]: { pushId: "", agentKind, profileId, wipe, state: "sealing", message: "" },
+      [deviceId]: { push_id: "", agent_kind: agentKind, profile_id: profileId, wipe, state: "sealing", message: "" },
     }));
     invoke("agent_account_push_to_device", {
-      agentKind,
-      profileId,
-      targetDeviceId: deviceId,
-      wipeLocalAfter: wipe,
+      agent_kind: agentKind,
+      profile_id: profileId,
+      target_device_id: deviceId,
+      wipe_local_after: wipe,
     })
       .then((result) => {
-        const pushId = result?.pushId || result?.push_id || "";
+        const pushId = result?.push_id || "";
         setPushByDevice((current) => (
           current[deviceId]
-            ? { ...current, [deviceId]: { ...current[deviceId], pushId } }
+            ? { ...current, [deviceId]: { ...current[deviceId], push_id: pushId } }
             : current
         ));
       })
@@ -430,7 +427,7 @@ export default function DevicesView({ active = true, deviceRows = [], localDevic
         setPushByDevice((current) => ({
           ...current,
           [deviceId]: {
-            ...(current[deviceId] || { agentKind, profileId, wipe }),
+            ...(current[deviceId] || { agent_kind: agentKind, profile_id: profileId, wipe }),
             state: "failed",
             message: String(error?.message || error || "Push failed."),
           },

@@ -70,16 +70,7 @@ function normalizePromptingUserSource(value, fallback = "") {
 function promptingPermissionToken(value = {}) {
   const source = value && typeof value === "object" ? value : {};
   return cleanText(
-    source.approvalId
-      || source.approval_id
-      || source.permissionPromptId
-      || source.permission_prompt_id
-      || source.permissionRequestId
-      || source.permission_request_id
-      || source.sourceEventId
-      || source.source_event_id
-      || source.toolUseId
-      || source.tool_use_id,
+    source.approval_id || source.permission_prompt_id || source.permission_request_id || source.source_event_id || source.tool_use_id,
   );
 }
 
@@ -94,12 +85,7 @@ function promptingSourceLooksExplicitPermission(source) {
 
 function valueHasPromptingUserFlag(value = {}) {
   const source = value && typeof value === "object" ? value : {};
-  return source.terminalIsPromptingUser === true
-    || source.terminal_is_prompting_user === true
-    || source.promptingUser === true
-    || source.prompting_user === true
-    || source.requiresUserInput === true
-    || source.requires_user_input === true;
+  return source.terminal_is_prompting_user === true || source.prompting_user === true || source.requires_user_input === true;
 }
 
 function valueLooksExplicitPermissionPrompt(value = {}) {
@@ -109,21 +95,11 @@ function valueLooksExplicitPermissionPrompt(value = {}) {
   }
 
   const kind = normalizePromptingUserKind(
-    sourceValue.promptingUserKind
-      || sourceValue.prompting_user_kind
-      || sourceValue.promptingKind
-      || sourceValue.prompting_kind,
+    sourceValue.prompting_user_kind || sourceValue.prompting_kind,
     "",
   );
-  const source = sourceValue.promptingUserSource
-    || sourceValue.prompting_user_source
-    || sourceValue.promptingSource
-    || sourceValue.prompting_source
-    || sourceValue.source
-    || sourceValue.type;
-  const hasPermissionKind = EXPLICIT_PERMISSION_PROMPT_KINDS.has(kind)
-    || sourceValue.requiresUserInput === true
-    || sourceValue.requires_user_input === true;
+  const source = sourceValue.prompting_user_source || sourceValue.prompting_source || sourceValue.source || sourceValue.type;
+  const hasPermissionKind = EXPLICIT_PERMISSION_PROMPT_KINDS.has(kind) || sourceValue.requires_user_input === true;
 
   return Boolean(
     hasPermissionKind
@@ -156,37 +132,16 @@ function explicitPermissionPromptingUserSignal(source) {
   if (!valueLooksExplicitPermissionPrompt(value)) {
     return emptyPromptingUserSignal();
   }
-  const sourceText = value.promptingUserSource
-    || value.prompting_user_source
-    || value.promptingSource
-    || value.prompting_source
-    || value.source
-    || value.type
-    || "";
+  const sourceText = value.prompting_user_source || value.prompting_source || value.source || value.type || "";
   return promptingUserSignal(
-    value.promptingUserKind
-      || value.prompting_user_kind
-      || value.promptingKind
-      || value.prompting_kind
-      || (value.requiresUserInput || value.requires_user_input ? "permission" : "approval"),
+    value.prompting_user_kind || value.prompting_kind || value.requires_user_input ? "permission" : "approval",
     promptingSourceLooksExplicitPermission(sourceText)
       ? sourceText
       : promptingPermissionToken(value)
         ? "permission-token"
         : sourceText || "permission",
-    value.promptingUserText
-      || value.prompting_user_text
-      || value.promptingText
-      || value.prompting_text
-      || value.terminalPrompt
-      || value.outputText
-      || value.text
-      || "",
-    value.promptingUserConfidence
-      || value.prompting_user_confidence
-      || value.promptingConfidence
-      || value.prompting_confidence
-      || "explicit-permission",
+    value.prompting_user_text || value.prompting_text || value.terminal_prompt || value.output_text || value.text || "",
+    value.prompting_user_confidence || value.prompting_confidence || "explicit-permission",
   );
 }
 
@@ -240,18 +195,13 @@ function parseTimestampMs(value) {
 
 function providerBindingsHaveNativeSession(providerBindings) {
   return Object.values(providerBindings || {}).some((binding) => (
-    Boolean(cleanText(binding?.nativeSessionId))
+    Boolean(cleanText(binding?.native_session_id))
   ));
 }
 
 function explicitLiveTerminalActivityStatus(liveTerminal) {
   return cleanText(
-    liveTerminal?.activityStatus
-      || liveTerminal?.activity_status
-      || liveTerminal?.nativeRailState
-      || liveTerminal?.native_rail_state
-      || liveTerminal?.terminalWorkState
-      || liveTerminal?.terminal_work_state,
+    liveTerminal?.activity_status || liveTerminal?.native_rail_state || liveTerminal?.terminal_work_state,
   ).toLowerCase();
 }
 
@@ -262,9 +212,7 @@ function normalizeLiveTerminalActivityStatus(liveTerminal) {
   }
 
   const status = cleanText(
-    liveTerminal?.terminalStatus
-      || liveTerminal?.terminal_status
-      || liveTerminal?.status,
+    liveTerminal?.terminal_status || liveTerminal?.status,
   ).toLowerCase();
   if (
     terminalActivityStatusIsBusy(status)
@@ -289,8 +237,8 @@ export function getLiveTerminalForThread(thread, providerBinding, workspaceThrea
     return null;
   }
 
-  const storedBinding = providerBinding?.terminalBinding || thread?.terminalBinding;
-  const terminalIndex = storedBinding?.terminalIndex ?? thread?.terminalIndex;
+  const storedBinding = providerBinding?.terminal_binding || thread?.terminal_binding;
+  const terminalIndex = storedBinding?.terminal_index ?? thread?.terminal_index;
   const terminalKey = terminalIndex == null ? "" : String(terminalIndex);
   const terminal = terminalKey ? workspaceThreadEntry.terminals?.[terminalKey] : null;
   if (!terminal) {
@@ -299,20 +247,20 @@ export function getLiveTerminalForThread(thread, providerBinding, workspaceThrea
 
   const activityStatus = normalizeLiveTerminalActivityStatus(terminal);
   if (
-    terminal.threadId !== thread?.id
+    terminal.thread_id !== thread?.id
     || terminalActivityStatusIsClosed(activityStatus)
   ) {
     return null;
   }
 
-  if (storedBinding?.paneId && terminal.paneId && storedBinding.paneId !== terminal.paneId) {
+  if (storedBinding?.pane_id && terminal.pane_id && storedBinding.pane_id !== terminal.pane_id) {
     return null;
   }
 
   if (
-    storedBinding?.instanceId
-    && terminal.instanceId
-    && Number(storedBinding.instanceId) !== Number(terminal.instanceId)
+    storedBinding?.instance_id
+    && terminal.instance_id
+    && Number(storedBinding.instance_id) !== Number(terminal.instance_id)
   ) {
     return null;
   }
@@ -325,29 +273,29 @@ export function getThreadTerminalGroundTruth({
   lifecycleEvent = null,
   liveTerminal = null,
   providerBinding = null,
-  targetRole = "",
+  target_role: targetRole = "",
   terminalOutputText = "",
   thread = null,
 } = {}) {
   const lifecycleType = cleanText(lifecycleEvent?.type).toLowerCase();
   const lifecycleTerminalWorkState = cleanText(
-    lifecycleEvent?.terminalWorkState || lifecycleEvent?.statusTruth || lifecycleEvent?.status_truth,
+    lifecycleEvent?.terminal_work_state || lifecycleEvent?.status_truth,
   ).toLowerCase();
-  const latestTurn = thread?.latestTurn || null;
+  const latestTurn = thread?.latest_turn || null;
   const latestTurnState = cleanText(latestTurn?.state).toLowerCase();
   const terminalStatus = cleanText(liveTerminal?.status).toLowerCase();
   const providerActivityStatus = "";
   const rawLiveActivityStatus = normalizeLiveTerminalActivityStatus(liveTerminal);
   const liveActivityStatusExplicit = Boolean(explicitLiveTerminalActivityStatus(liveTerminal));
-  const providerBindings = thread?.providerBindings
-    && typeof thread.providerBindings === "object"
-    && !Array.isArray(thread.providerBindings)
-    ? thread.providerBindings
+  const providerBindings = thread?.provider_bindings
+    && typeof thread.provider_bindings === "object"
+    && !Array.isArray(thread.provider_bindings)
+    ? thread.provider_bindings
     : {};
-  const recordedAgentInputReady = Boolean(liveTerminal?.inputReady || providerBinding?.inputReady);
+  const recordedAgentInputReady = Boolean(liveTerminal?.input_ready || providerBinding?.input_ready);
   const hookManagedAgent = terminalAgentUsesActivityHooks(targetRole)
-    || terminalAgentUsesActivityHooks(liveTerminal?.agentId || liveTerminal?.agent_id)
-    || terminalAgentUsesActivityHooks(providerBinding?.agentId || providerBinding?.agent_id);
+    || terminalAgentUsesActivityHooks(liveTerminal?.agent_id)
+    || terminalAgentUsesActivityHooks(providerBinding?.agent_id);
   const hookManagedImplicitStartup = Boolean(
     hookManagedAgent
       && liveTerminal
@@ -361,13 +309,13 @@ export function getThreadTerminalGroundTruth({
     PARKED_TERMINAL_STATUSES.has(status)
   )) || "";
   const terminalIsParked = Boolean(parkedStatus);
-  const messageCount = normalizeMessageCount(thread?.messageCount);
+  const messageCount = normalizeMessageCount(thread?.message_count);
   const hasMessages = Array.isArray(thread?.messages) && thread.messages.length > 0;
-  const hasProjectionEvents = Array.isArray(thread?.projectionEvents) && thread.projectionEvents.length > 0;
+  const hasProjectionEvents = Array.isArray(thread?.projection_events) && thread.projection_events.length > 0;
   const hasNativeSession = providerBindingsHaveNativeSession(providerBindings);
-  const hasPendingPrompt = Boolean(thread?.pendingPrompt);
+  const hasPendingPrompt = Boolean(thread?.pending_prompt);
   const promptSubmissionPending = Boolean(hasPendingPrompt && latestTurnState === "running");
-  const hasTranscriptSession = Boolean(cleanText(thread?.transcriptSessionId));
+  const hasTranscriptSession = Boolean(cleanText(thread?.transcript_session_id));
   const orphanRunningLooksIdle = Boolean(
     latestTurnState === "running"
       && !hasMessages
@@ -378,14 +326,14 @@ export function getThreadTerminalGroundTruth({
   );
 
   const inputReadyAt = cleanText(
-    liveTerminal?.inputReadyAt
-      || providerBinding?.inputReadyAt
+    liveTerminal?.input_ready_at
+      || providerBinding?.input_ready_at
   );
   const inputReadyAtMs = parseTimestampMs(inputReadyAt);
   const turnStartedAt = cleanText(
-    latestTurn?.startedAt
-      || latestTurn?.requestedAt
-      || latestTurn?.updatedAt,
+    latestTurn?.started_at
+      || latestTurn?.requested_at
+      || latestTurn?.updated_at,
   );
   const turnStartedAtMs = parseTimestampMs(turnStartedAt);
   const terminalLooksActive = terminalActivityStatusIsBusy(activityStatus);
@@ -403,7 +351,7 @@ export function getThreadTerminalGroundTruth({
   const hasHookRuntimeSession = Boolean(
     hasNativeSession
       || hasTranscriptSession
-      || cleanText(providerBinding?.nativeSessionId || providerBinding?.native_session_id)
+      || cleanText(providerBinding?.native_session_id)
   );
   const inputReadyIsFreshForTurn = Boolean(
     recordedAgentInputReady
@@ -500,9 +448,9 @@ export function getThreadTerminalGroundTruth({
         : "idle_or_unknown";
   const promptClearedByLifecycle = Boolean(
     PROMPTING_CLEARING_LIFECYCLE_TYPES.has(lifecycleType)
-      || lifecycleEvent?.terminalIsPromptingUser === false
-      || lifecycleEvent?.promptingUser === false
-      || lifecycleEvent?.requiresUserInput === false
+      || lifecycleEvent?.terminal_is_prompting_user === false
+      || lifecycleEvent?.prompting_user === false
+      || lifecycleEvent?.requires_user_input === false
       || ["complete", "completed", "running", "processing", "error", "parked"].includes(lifecycleTerminalWorkState),
   );
   const explicitPrompting = valueLooksExplicitPermissionPrompt(lifecycleEvent || {});
@@ -535,7 +483,7 @@ export function getThreadTerminalGroundTruth({
   const terminalIsComplete = terminalWorkState === "complete";
 
   return {
-    activityStatus,
+    activity_status: activityStatus,
     agentInputReady,
     completedTurnLooksSendable,
     completedTurnLooksStaleActive,
@@ -546,13 +494,13 @@ export function getThreadTerminalGroundTruth({
     hasPendingPrompt,
     hookManagedAgent,
     hookManagedImplicitStartup,
-    inputReadyAt,
+    input_ready_at: inputReadyAt,
     inputReadyAtMs,
     inputReadyIsFreshForTurn,
     latestTurnState,
     liveActivityStatus,
     liveActivityStatusExplicit,
-    messageCount,
+    message_count: messageCount,
     orphanRunningLooksIdle,
     promptSubmissionPending,
     rawLiveActivityStatus,
@@ -561,19 +509,19 @@ export function getThreadTerminalGroundTruth({
     restoredRunningTurnLooksIdle,
     runningTurnLooksIdle,
     staleRunningWithoutLiveRuntimeLooksIdle,
-    promptingUserConfidence: terminalIsPromptingUser ? promptingUser.confidence : "",
-    promptingUserKind: terminalIsPromptingUser ? promptingUser.kind : "",
-    promptingUserSource: terminalIsPromptingUser ? promptingUser.source : "",
-    promptingUserText: terminalIsPromptingUser ? promptingUser.text : "",
+    prompting_user_confidence: terminalIsPromptingUser ? promptingUser.confidence : "",
+    prompting_user_kind: terminalIsPromptingUser ? promptingUser.kind : "",
+    prompting_user_source: terminalIsPromptingUser ? promptingUser.source : "",
+    prompting_user_text: terminalIsPromptingUser ? promptingUser.text : "",
     terminalGroundTruthStatus,
-    terminalIsComplete,
-    terminalIsPromptingUser,
-    terminalIsParked,
-    terminalWorkState,
+    terminal_is_complete: terminalIsComplete,
+    terminal_is_prompting_user: terminalIsPromptingUser,
+    terminal_is_parked: terminalIsParked,
+    terminal_work_state: terminalWorkState,
     parkedStatus,
     terminalLooksActive,
     terminalLooksSendable,
-    terminalStatus,
+    terminal_status: terminalStatus,
     turnStartedAt,
     turnStartedAtMs,
   };
@@ -581,17 +529,17 @@ export function getThreadTerminalGroundTruth({
 
 export function terminalPromptingUserBlocksShutdown(groundTruth = {}) {
   const promptingUser = Boolean(
-    groundTruth?.terminalIsPromptingUser === true
-      || cleanText(groundTruth?.terminalWorkState).toLowerCase() === "prompting_user",
+    groundTruth?.terminal_is_prompting_user === true
+      || cleanText(groundTruth?.terminal_work_state).toLowerCase() === "prompting_user",
   );
   if (!promptingUser) {
     return false;
   }
 
-  const source = cleanText(groundTruth?.promptingUserSource)
+  const source = cleanText(groundTruth?.prompting_user_source)
     .toLowerCase()
     .replace(/[_\s]+/g, "-");
-  const kind = normalizePromptingUserKind(groundTruth?.promptingUserKind, "");
+  const kind = normalizePromptingUserKind(groundTruth?.prompting_user_kind, "");
   return Boolean(
     EXPLICIT_PERMISSION_PROMPT_KINDS.has(kind)
       && source !== "latest-assistant-message"
@@ -600,14 +548,14 @@ export function terminalPromptingUserBlocksShutdown(groundTruth = {}) {
 }
 
 export function threadLooksEffectivelyThinking(groundTruth = {}) {
-  if (groundTruth.terminalIsPromptingUser || groundTruth.terminalWorkState === "prompting_user") {
+  if (groundTruth.terminal_is_prompting_user || groundTruth.terminal_work_state === "prompting_user") {
     return false;
   }
   const latestTurnState = cleanText(
     groundTruth.effectiveLatestTurnState || groundTruth.latestTurnState,
   ).toLowerCase();
   const activityStatus = cleanText(
-    groundTruth.effectiveActivityStatus || groundTruth.activityStatus,
+    groundTruth.effectiveActivityStatus || groundTruth.activity_status,
   ).toLowerCase();
   return Boolean(
     latestTurnState === "running"

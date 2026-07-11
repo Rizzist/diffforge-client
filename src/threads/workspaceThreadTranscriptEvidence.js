@@ -7,7 +7,7 @@ function normalizeWorkspaceThreadProjectionText(value) {
 }
 
 function workspaceThreadMessageTimestampMs(message) {
-  const createdAt = String(message?.createdAt || message?.created_at || "").trim();
+  const createdAt = String(message?.created_at || "").trim();
   const numericTimestamp = Number.parseFloat(createdAt);
   if (Number.isFinite(numericTimestamp) && numericTimestamp > 1_000_000_000) {
     return numericTimestamp < 10_000_000_000 ? numericTimestamp * 1000 : numericTimestamp;
@@ -35,13 +35,13 @@ function transcriptMessageStartsUserTurn(message) {
 
 export function transcriptHasTurnCompletionForPrompt(messages, event = {}) {
   const promptText = normalizeWorkspaceThreadProjectionText(
-    event.expectedUserMessage || event.userMessage || event.message,
+    event.expected_user_message || event.user_message || event.message,
   );
   const submittedAtMs = workspaceThreadMessageTimestampMs({
-    createdAt: event.messageCreatedAt || event.submittedAt || event.createdAt,
+    created_at: event.message_created_at || event.submitted_at || event.created_at,
   });
-  const matchedBy = String(event.matchedBy || "").trim().toLowerCase();
-  const allowTimestampFallback = event.allowTimestampFallback === true
+  const matchedBy = String(event.matched_by || "").trim().toLowerCase();
+  const allowTimestampFallback = event.allow_timestamp_fallback === true
     || matchedBy.includes("timestamp")
     || matchedBy.includes("recovery");
   const transcriptMessages = Array.isArray(messages) ? messages : [];

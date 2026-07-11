@@ -15,29 +15,29 @@ function baseEvaluation(overrides = {}) {
     effectiveLatestTurnState: "completed",
     inFlightPrompt: {
       accepted: true,
-      itemId: "todo-1",
-      promptId: "todo-drop-prompt-1",
-      promptText: "i want to make some pages",
-      startedAtMs: submittedAtMs,
-      submittedAt,
-      submittedAtMs,
-      terminalInstanceId: 4,
-      threadId: "thread-1",
+      item_id: "todo-1",
+      prompt_id: "todo-drop-prompt-1",
+      prompt_text: "i want to make some pages",
+      started_at_ms: submittedAtMs,
+      submitted_at: submittedAt,
+      submitted_at_ms: submittedAtMs,
+      terminal_instance_id: 4,
+      thread_id: "thread-1",
     },
     liveTerminal: {
-      inputReady: true,
-      inputReadyAt: "2026-06-01T01:34:53.775Z",
-      instanceId: 4,
+      input_ready: true,
+      input_ready_at: "2026-06-01T01:34:53.775Z",
+      instance_id: 4,
       status: "active",
-      threadId: "thread-1",
+      thread_id: "thread-1",
     },
     providerBinding: {
-      inputReady: true,
-      inputReadyAt: "2026-06-01T01:34:53.775Z",
-      nativeSessionId: "session-1",
+      input_ready: true,
+      input_ready_at: "2026-06-01T01:34:53.775Z",
+      native_session_id: "session-1",
       status: "active",
     },
-    nowMs: submittedAtMs + 5000,
+    now_ms: submittedAtMs + 5000,
     terminalGroundTruth: {
       agentInputReady: true,
       completedTurnLooksSendable: true,
@@ -46,22 +46,22 @@ function baseEvaluation(overrides = {}) {
       hasPendingPrompt: false,
       runningTurnLooksIdle: false,
     },
-    terminalStatus: "active",
+    terminal_status: "active",
     targetThread: {
       id: "thread-1",
-      latestTurn: {
-        messageId: "codex-82-user",
-        startedAt: submittedAt,
+      latest_turn: {
+        message_id: "codex-82-user",
+        started_at: submittedAt,
         state: "completed",
-        turnId: "turn-thread-1-codex-82-user",
+        turn_id: "turn-thread-1-codex-82-user",
       },
       messages: [{
-        createdAt: submittedAt,
+        created_at: submittedAt,
         id: "codex-82-user",
         role: "user",
         text: "i want to make some pages",
       }],
-      transcriptSessionId: "session-1",
+      transcript_session_id: "session-1",
     },
     ...overrides,
   });
@@ -86,25 +86,25 @@ test("terminal-direct Codex prompt completes from matching input-ready without c
     hookManaged: true,
     inFlightPrompt: {
       accepted: false,
-      itemId: "terminal-direct-todo-drop-prompt-1",
-      lifecycleSource: "tui-terminal-direct-input",
-      promptId: "todo-drop-prompt-1",
-      promptText: "i want to make some pages",
+      item_id: "terminal-direct-todo-drop-prompt-1",
+      lifecycle_source: "tui-terminal-direct-input",
+      prompt_id: "todo-drop-prompt-1",
+      prompt_text: "i want to make some pages",
       source: "tui-terminal-direct-input",
-      startedAtMs: submittedAtMs,
-      submittedAt,
-      submittedAtMs,
-      terminalInstanceId: 4,
-      threadId: "thread-1",
+      started_at_ms: submittedAtMs,
+      submitted_at: submittedAt,
+      submitted_at_ms: submittedAtMs,
+      terminal_instance_id: 4,
+      thread_id: "thread-1",
     },
     liveTerminal: {
-      activityStatus: "idle",
-      inputReady: true,
-      inputReadyAt: "2026-06-01T01:35:12.000Z",
-      instanceId: 4,
-      promptEventId: "todo-drop-prompt-1",
+      activity_status: "idle",
+      input_ready: true,
+      input_ready_at: "2026-06-01T01:35:12.000Z",
+      instance_id: 4,
+      prompt_event_id: "todo-drop-prompt-1",
       status: "idle",
-      threadId: "thread-1",
+      thread_id: "thread-1",
     },
     terminalGroundTruth: {
       agentInputReady: true,
@@ -116,19 +116,19 @@ test("terminal-direct Codex prompt completes from matching input-ready without c
     },
     targetThread: {
       id: "thread-1",
-      latestTurn: {
-        messageId: "transcript-stale-message",
-        startedAt: submittedAt,
+      latest_turn: {
+        message_id: "transcript-stale-message",
+        started_at: submittedAt,
         state: "running",
-        turnId: "turn-thread-1-stale",
+        turn_id: "turn-thread-1-stale",
       },
       messages: [{
-        createdAt: submittedAt,
+        created_at: submittedAt,
         id: "todo-drop-prompt-1",
         role: "user",
         text: "i want to make some pages",
       }],
-      transcriptSessionId: "session-1",
+      transcript_session_id: "session-1",
     },
   });
 
@@ -147,24 +147,24 @@ test("queued prompt is released when its terminal closes before acceptance", () 
     effectiveLatestTurnState: "",
     inFlightPrompt: {
       accepted: false,
-      itemId: "todo-1",
-      promptId: "todo-drop-prompt-1",
-      promptText: "i want to make some pages",
-      startedAtMs: submittedAtMs,
-      submittedAt,
-      submittedAtMs,
-      terminalInstanceId: 4,
-      threadId: "thread-1",
+      item_id: "todo-1",
+      prompt_id: "todo-drop-prompt-1",
+      prompt_text: "i want to make some pages",
+      started_at_ms: submittedAtMs,
+      submitted_at: submittedAt,
+      submitted_at_ms: submittedAtMs,
+      terminal_instance_id: 4,
+      thread_id: "thread-1",
     },
     liveTerminal: {
-      inputReady: false,
-      instanceId: 4,
+      input_ready: false,
+      instance_id: 4,
       status: "exited",
-      threadId: "thread-1",
-      terminalLifecycle: "closed",
+      thread_id: "thread-1",
+      terminal_lifecycle: "closed",
     },
     providerBinding: null,
-    terminalStatus: "exited",
+    terminal_status: "exited",
     targetThread: {
       id: "thread-1",
       messages: [],
@@ -172,7 +172,7 @@ test("queued prompt is released when its terminal closes before acceptance", () 
     },
   });
 
-  assert.equal(evaluation.terminalClosed, true);
+  assert.equal(evaluation.terminal_closed, true);
   assert.equal(evaluation.releaseReason, "terminal_closed");
 });
 
@@ -182,18 +182,18 @@ test("queued prompt is released when its terminal disappears before acceptance",
     effectiveLatestTurnState: "",
     inFlightPrompt: {
       accepted: false,
-      itemId: "todo-1",
-      promptId: "todo-drop-prompt-1",
-      promptText: "i want to make some pages",
-      startedAtMs: submittedAtMs,
-      submittedAt,
-      submittedAtMs,
-      terminalInstanceId: 4,
-      threadId: "thread-1",
+      item_id: "todo-1",
+      prompt_id: "todo-drop-prompt-1",
+      prompt_text: "i want to make some pages",
+      started_at_ms: submittedAtMs,
+      submitted_at: submittedAt,
+      submitted_at_ms: submittedAtMs,
+      terminal_instance_id: 4,
+      thread_id: "thread-1",
     },
     liveTerminal: null,
     providerBinding: null,
-    terminalStatus: "",
+    terminal_status: "",
     targetThread: {
       id: "thread-1",
       messages: [],
@@ -224,26 +224,26 @@ test("queued prompt completes after its provider turn closes", () => {
   const evaluation = baseEvaluation({
     targetThread: {
       id: "thread-1",
-      latestTurn: {
-        messageId: "todo-drop-prompt-1",
-        startedAt: submittedAt,
+      latest_turn: {
+        message_id: "todo-drop-prompt-1",
+        started_at: submittedAt,
         state: "completed",
-        turnId: "turn-thread-1-todo-drop-prompt-1",
+        turn_id: "turn-thread-1-todo-drop-prompt-1",
       },
       messages: [{
-        createdAt: submittedAt,
+        created_at: submittedAt,
         id: "todo-drop-prompt-1",
         role: "user",
         text: "i want to make some pages",
       }, {
-        createdAt: "2026-06-01T01:35:12.000Z",
+        created_at: "2026-06-01T01:35:12.000Z",
         id: "assistant-final",
         kind: "message",
         role: "assistant",
         status: "complete",
         text: "Sure, I can build those pages.",
       }],
-      transcriptSessionId: "session-1",
+      transcript_session_id: "session-1",
     },
   });
 
@@ -259,26 +259,26 @@ test("hook-managed queued prompt releases from provider turn closure", () => {
     hookManaged: true,
     targetThread: {
       id: "thread-1",
-      latestTurn: {
-        messageId: "todo-drop-prompt-1",
-        startedAt: submittedAt,
+      latest_turn: {
+        message_id: "todo-drop-prompt-1",
+        started_at: submittedAt,
         state: "completed",
-        turnId: "turn-thread-1-todo-drop-prompt-1",
+        turn_id: "turn-thread-1-todo-drop-prompt-1",
       },
       messages: [{
-        createdAt: submittedAt,
+        created_at: submittedAt,
         id: "todo-drop-prompt-1",
         role: "user",
         text: "i want to make some pages",
       }, {
-        createdAt: "2026-06-01T01:35:12.000Z",
+        created_at: "2026-06-01T01:35:12.000Z",
         id: "assistant-final",
         kind: "message",
         role: "assistant",
         status: "complete",
         text: "Done.",
       }],
-      transcriptSessionId: "session-1",
+      transcript_session_id: "session-1",
     },
   });
 
@@ -304,19 +304,19 @@ test("claude queued prompt interruption releases as interrupted", () => {
     },
     targetThread: {
       id: "thread-1",
-      latestTurn: {
-        messageId: "todo-drop-prompt-1",
-        startedAt: submittedAt,
+      latest_turn: {
+        message_id: "todo-drop-prompt-1",
+        started_at: submittedAt,
         state: "interrupted",
-        turnId: "turn-thread-1-todo-drop-prompt-1",
+        turn_id: "turn-thread-1-todo-drop-prompt-1",
       },
       messages: [{
-        createdAt: submittedAt,
+        created_at: submittedAt,
         id: "todo-drop-prompt-1",
         role: "user",
         text: "i want to make some pages",
       }],
-      transcriptSessionId: "session-1",
+      transcript_session_id: "session-1",
     },
   });
 
@@ -339,19 +339,19 @@ test("codex queued prompt cancellation releases as interrupted", () => {
     },
     targetThread: {
       id: "thread-1",
-      latestTurn: {
-        messageId: "todo-drop-prompt-1",
-        startedAt: submittedAt,
+      latest_turn: {
+        message_id: "todo-drop-prompt-1",
+        started_at: submittedAt,
         state: "canceled",
-        turnId: "turn-thread-1-todo-drop-prompt-1",
+        turn_id: "turn-thread-1-todo-drop-prompt-1",
       },
       messages: [{
-        createdAt: submittedAt,
+        created_at: submittedAt,
         id: "todo-drop-prompt-1",
         role: "user",
         text: "i want to make some pages",
       }],
-      transcriptSessionId: "session-1",
+      transcript_session_id: "session-1",
     },
   });
 
@@ -374,19 +374,19 @@ test("effective interruption beats a stale running transcript turn", () => {
     },
     targetThread: {
       id: "thread-1",
-      latestTurn: {
-        messageId: "todo-drop-prompt-1",
-        startedAt: submittedAt,
+      latest_turn: {
+        message_id: "todo-drop-prompt-1",
+        started_at: submittedAt,
         state: "running",
-        turnId: "turn-thread-1-todo-drop-prompt-1",
+        turn_id: "turn-thread-1-todo-drop-prompt-1",
       },
       messages: [{
-        createdAt: submittedAt,
+        created_at: submittedAt,
         id: "todo-drop-prompt-1",
         role: "user",
         text: "i want to make some pages",
       }],
-      transcriptSessionId: "session-1",
+      transcript_session_id: "session-1",
     },
   });
 
@@ -410,19 +410,19 @@ test("queued prompt error releases as failed provider turn", () => {
     },
     targetThread: {
       id: "thread-1",
-      latestTurn: {
-        messageId: "todo-drop-prompt-1",
-        startedAt: submittedAt,
+      latest_turn: {
+        message_id: "todo-drop-prompt-1",
+        started_at: submittedAt,
         state: "error",
-        turnId: "turn-thread-1-todo-drop-prompt-1",
+        turn_id: "turn-thread-1-todo-drop-prompt-1",
       },
       messages: [{
-        createdAt: submittedAt,
+        created_at: submittedAt,
         id: "todo-drop-prompt-1",
         role: "user",
         text: "i want to make some pages",
       }],
-      transcriptSessionId: "session-1",
+      transcript_session_id: "session-1",
     },
   });
 
@@ -437,30 +437,30 @@ test("hook-managed queued prompt does not accept from matching transcript state"
     hookManaged: true,
     inFlightPrompt: {
       accepted: false,
-      itemId: "todo-1",
-      promptId: "todo-drop-prompt-1",
-      promptText: "i want to make some pages",
-      startedAtMs: submittedAtMs,
-      submittedAt,
-      submittedAtMs,
-      terminalInstanceId: 4,
-      threadId: "thread-1",
+      item_id: "todo-1",
+      prompt_id: "todo-drop-prompt-1",
+      prompt_text: "i want to make some pages",
+      started_at_ms: submittedAtMs,
+      submitted_at: submittedAt,
+      submitted_at_ms: submittedAtMs,
+      terminal_instance_id: 4,
+      thread_id: "thread-1",
     },
     targetThread: {
       id: "thread-1",
-      latestTurn: {
-        messageId: "todo-drop-prompt-1",
-        startedAt: submittedAt,
+      latest_turn: {
+        message_id: "todo-drop-prompt-1",
+        started_at: submittedAt,
         state: "running",
-        turnId: "turn-thread-1-todo-drop-prompt-1",
+        turn_id: "turn-thread-1-todo-drop-prompt-1",
       },
       messages: [{
-        createdAt: submittedAt,
+        created_at: submittedAt,
         id: "todo-drop-prompt-1",
         role: "user",
         text: "i want to make some pages",
       }],
-      transcriptSessionId: "session-1",
+      transcript_session_id: "session-1",
     },
   });
 
@@ -473,26 +473,26 @@ test("queued prompt does not release when transcript completion belongs to a dif
   const evaluation = baseEvaluation({
     targetThread: {
       id: "thread-1",
-      latestTurn: {
-        messageId: "todo-drop-prompt-newer",
-        startedAt: submittedAt,
+      latest_turn: {
+        message_id: "todo-drop-prompt-newer",
+        started_at: submittedAt,
         state: "completed",
-        turnId: "turn-thread-1-todo-drop-prompt-newer",
+        turn_id: "turn-thread-1-todo-drop-prompt-newer",
       },
       messages: [{
-        createdAt: submittedAt,
+        created_at: submittedAt,
         id: "todo-drop-prompt-1",
         role: "user",
         text: "i want to make some pages",
       }, {
-        createdAt: "2026-06-01T01:35:12.000Z",
+        created_at: "2026-06-01T01:35:12.000Z",
         id: "assistant-final",
         kind: "message",
         role: "assistant",
         status: "complete",
         text: "Sure, I can build those pages.",
       }],
-      transcriptSessionId: "session-1",
+      transcript_session_id: "session-1",
     },
   });
 
@@ -507,40 +507,40 @@ test("queued prompt does not release when transcript completion belongs to a dif
 test("exact transcript completion does not release with stale terminal readiness", () => {
   const evaluation = baseEvaluation({
     liveTerminal: {
-      inputReady: true,
-      inputReadyAt: "2026-06-01T01:34:40.000Z",
-      instanceId: 4,
+      input_ready: true,
+      input_ready_at: "2026-06-01T01:34:40.000Z",
+      instance_id: 4,
       status: "idle",
-      threadId: "thread-1",
+      thread_id: "thread-1",
     },
     providerBinding: {
-      inputReady: true,
-      inputReadyAt: "2026-06-01T01:34:40.000Z",
-      nativeSessionId: "session-1",
+      input_ready: true,
+      input_ready_at: "2026-06-01T01:34:40.000Z",
+      native_session_id: "session-1",
       status: "idle",
     },
     targetThread: {
       id: "thread-1",
-      latestTurn: {
-        messageId: "todo-drop-prompt-1",
-        startedAt: submittedAt,
+      latest_turn: {
+        message_id: "todo-drop-prompt-1",
+        started_at: submittedAt,
         state: "completed",
-        turnId: "turn-thread-1-todo-drop-prompt-1",
+        turn_id: "turn-thread-1-todo-drop-prompt-1",
       },
       messages: [{
-        createdAt: submittedAt,
+        created_at: submittedAt,
         id: "todo-drop-prompt-1",
         role: "user",
         text: "i want to make some pages",
       }, {
-        createdAt: "2026-06-01T01:35:12.000Z",
+        created_at: "2026-06-01T01:35:12.000Z",
         id: "assistant-final",
         kind: "message",
         role: "assistant",
         status: "complete",
         text: "Done.",
       }],
-      transcriptSessionId: "session-1",
+      transcript_session_id: "session-1",
     },
   });
 
@@ -555,35 +555,35 @@ test("exact transcript completion does not release with stale terminal readiness
 test("exact transcript completion does not release with mismatched readiness prompt id", () => {
   const evaluation = baseEvaluation({
     liveTerminal: {
-      inputReady: true,
-      inputReadyAt: "2026-06-01T01:35:12.000Z",
-      instanceId: 4,
-      promptEventId: "todo-drop-prompt-other",
+      input_ready: true,
+      input_ready_at: "2026-06-01T01:35:12.000Z",
+      instance_id: 4,
+      prompt_event_id: "todo-drop-prompt-other",
       status: "idle",
-      threadId: "thread-1",
+      thread_id: "thread-1",
     },
     targetThread: {
       id: "thread-1",
-      latestTurn: {
-        messageId: "todo-drop-prompt-1",
-        startedAt: submittedAt,
+      latest_turn: {
+        message_id: "todo-drop-prompt-1",
+        started_at: submittedAt,
         state: "completed",
-        turnId: "turn-thread-1-todo-drop-prompt-1",
+        turn_id: "turn-thread-1-todo-drop-prompt-1",
       },
       messages: [{
-        createdAt: submittedAt,
+        created_at: submittedAt,
         id: "todo-drop-prompt-1",
         role: "user",
         text: "i want to make some pages",
       }, {
-        createdAt: "2026-06-01T01:35:12.000Z",
+        created_at: "2026-06-01T01:35:12.000Z",
         id: "assistant-final",
         kind: "message",
         role: "assistant",
         status: "complete",
         text: "Done.",
       }],
-      transcriptSessionId: "session-1",
+      transcript_session_id: "session-1",
     },
   });
 
@@ -599,14 +599,14 @@ test("exact transcript completion does not release while the terminal is not rea
     effectiveActivityStatus: "thinking",
     effectiveLatestTurnState: "running",
     liveTerminal: {
-      inputReady: false,
-      instanceId: 4,
+      input_ready: false,
+      instance_id: 4,
       status: "active",
-      threadId: "thread-1",
+      thread_id: "thread-1",
     },
     providerBinding: {
-      inputReady: false,
-      nativeSessionId: "session-1",
+      input_ready: false,
+      native_session_id: "session-1",
       status: "active",
     },
     terminalGroundTruth: {
@@ -617,29 +617,29 @@ test("exact transcript completion does not release while the terminal is not rea
       hasPendingPrompt: false,
       runningTurnLooksIdle: false,
     },
-    terminalStatus: "active",
+    terminal_status: "active",
     targetThread: {
       id: "thread-1",
-      latestTurn: {
-        messageId: "todo-drop-prompt-1",
-        startedAt: submittedAt,
+      latest_turn: {
+        message_id: "todo-drop-prompt-1",
+        started_at: submittedAt,
         state: "running",
-        turnId: "turn-todo-drop-prompt-1",
+        turn_id: "turn-todo-drop-prompt-1",
       },
       messages: [{
-        createdAt: submittedAt,
+        created_at: submittedAt,
         id: "todo-drop-prompt-1",
         role: "user",
         text: "i want to make some pages",
       }, {
-        createdAt: "2026-06-01T01:35:10.000Z",
+        created_at: "2026-06-01T01:35:10.000Z",
         id: "assistant-task-complete",
         kind: "task_complete",
         role: "assistant",
         status: "complete",
         text: "Done.",
       }],
-      transcriptSessionId: "session-1",
+      transcript_session_id: "session-1",
     },
   });
 
@@ -657,9 +657,9 @@ test("stale provider state cannot hide an unavailable Rust terminal", () => {
     effectiveLatestTurnState: "running",
     liveTerminal: null,
     providerBinding: {
-      activityStatus: "thinking",
-      inputReady: false,
-      nativeSessionId: "session-1",
+      activity_status: "thinking",
+      input_ready: false,
+      native_session_id: "session-1",
       status: "active",
     },
     terminalGroundTruth: {
@@ -670,24 +670,24 @@ test("stale provider state cannot hide an unavailable Rust terminal", () => {
       hasPendingPrompt: false,
       runningTurnLooksIdle: false,
     },
-    terminalStatus: "",
+    terminal_status: "",
     targetThread: {
-      activityStatus: "thinking",
+      activity_status: "thinking",
       id: "thread-1",
-      latestTurn: {
-        messageId: "todo-drop-prompt-1",
-        startedAt: submittedAt,
+      latest_turn: {
+        message_id: "todo-drop-prompt-1",
+        started_at: submittedAt,
         state: "running",
-        turnId: "turn-thread-1-todo-drop-prompt-1",
+        turn_id: "turn-thread-1-todo-drop-prompt-1",
       },
       messages: [{
-        createdAt: submittedAt,
+        created_at: submittedAt,
         id: "todo-drop-prompt-1",
         role: "user",
         text: "i want to make some pages",
       }],
       status: "active",
-      transcriptSessionId: "session-1",
+      transcript_session_id: "session-1",
     },
   });
 
@@ -701,17 +701,17 @@ test("stale thread and provider activity cannot pause an idle Rust lane", () => 
     effectiveActivityStatus: "idle",
     effectiveLatestTurnState: "completed",
     liveTerminal: {
-      activityStatus: "idle",
-      inputReady: true,
-      inputReadyAt: "2026-06-01T01:34:53.775Z",
-      instanceId: 4,
+      activity_status: "idle",
+      input_ready: true,
+      input_ready_at: "2026-06-01T01:34:53.775Z",
+      instance_id: 4,
       status: "active",
-      threadId: "thread-1",
+      thread_id: "thread-1",
     },
     providerBinding: {
-      activityStatus: "prompting_user",
-      inputReady: false,
-      nativeSessionId: "session-1",
+      activity_status: "prompting_user",
+      input_ready: false,
+      native_session_id: "session-1",
       status: "active",
     },
     terminalGroundTruth: {
@@ -723,21 +723,21 @@ test("stale thread and provider activity cannot pause an idle Rust lane", () => 
       runningTurnLooksIdle: true,
     },
     targetThread: {
-      activityStatus: "prompting_user",
+      activity_status: "prompting_user",
       id: "thread-1",
-      latestTurn: {
-        messageId: "todo-drop-prompt-1",
-        startedAt: submittedAt,
+      latest_turn: {
+        message_id: "todo-drop-prompt-1",
+        started_at: submittedAt,
         state: "running",
-        turnId: "turn-thread-1-todo-drop-prompt-1",
+        turn_id: "turn-thread-1-todo-drop-prompt-1",
       },
       messages: [{
-        createdAt: submittedAt,
+        created_at: submittedAt,
         id: "todo-drop-prompt-1",
         role: "user",
         text: "i want to make some pages",
       }],
-      transcriptSessionId: "session-1",
+      transcript_session_id: "session-1",
     },
   });
 
@@ -749,41 +749,41 @@ test("stale thread and provider activity cannot pause an idle Rust lane", () => 
 test("idle terminal status can release an accepted completed queued prompt", () => {
   const evaluation = baseEvaluation({
     liveTerminal: {
-      inputReady: true,
-      inputReadyAt: "2026-06-01T01:35:12.000Z",
-      instanceId: 4,
+      input_ready: true,
+      input_ready_at: "2026-06-01T01:35:12.000Z",
+      instance_id: 4,
       status: "idle",
-      threadId: "thread-1",
+      thread_id: "thread-1",
     },
     providerBinding: {
-      inputReady: true,
-      inputReadyAt: "2026-06-01T01:35:12.000Z",
-      nativeSessionId: "session-1",
+      input_ready: true,
+      input_ready_at: "2026-06-01T01:35:12.000Z",
+      native_session_id: "session-1",
       status: "idle",
     },
-    terminalStatus: "idle",
+    terminal_status: "idle",
     targetThread: {
       id: "thread-1",
-      latestTurn: {
-        messageId: "todo-drop-prompt-1",
-        startedAt: submittedAt,
+      latest_turn: {
+        message_id: "todo-drop-prompt-1",
+        started_at: submittedAt,
         state: "completed",
-        turnId: "turn-thread-1-todo-drop-prompt-1",
+        turn_id: "turn-thread-1-todo-drop-prompt-1",
       },
       messages: [{
-        createdAt: submittedAt,
+        created_at: submittedAt,
         id: "todo-drop-prompt-1",
         role: "user",
         text: "i want to make some pages",
       }, {
-        createdAt: "2026-06-01T01:35:10.000Z",
+        created_at: "2026-06-01T01:35:10.000Z",
         id: "assistant-final",
         kind: "message",
         role: "assistant",
         status: "complete",
         text: "Done.",
       }],
-      transcriptSessionId: "session-1",
+      transcript_session_id: "session-1",
     },
   });
 
@@ -797,19 +797,19 @@ test("exact matching turn id alone does not release a queued prompt", () => {
   const evaluation = baseEvaluation({
     targetThread: {
       id: "thread-1",
-      latestTurn: {
-        messageId: "todo-drop-prompt-1",
-        startedAt: submittedAt,
+      latest_turn: {
+        message_id: "todo-drop-prompt-1",
+        started_at: submittedAt,
         state: "completed",
-        turnId: "turn-todo-drop-prompt-1",
+        turn_id: "turn-todo-drop-prompt-1",
       },
       messages: [{
-        createdAt: submittedAt,
+        created_at: submittedAt,
         id: "todo-drop-prompt-1",
         role: "user",
         text: "i want to make some pages",
       }],
-      transcriptSessionId: "session-1",
+      transcript_session_id: "session-1",
     },
   });
 
@@ -823,11 +823,11 @@ test("exact matching turn id alone does not release a queued prompt", () => {
 test("terminal restart releases the stale lane without claiming task completion", () => {
   const evaluation = baseEvaluation({
     liveTerminal: {
-      inputReady: true,
-      inputReadyAt: "2026-06-01T01:35:20.000Z",
-      instanceId: 5,
+      input_ready: true,
+      input_ready_at: "2026-06-01T01:35:20.000Z",
+      instance_id: 5,
       status: "active",
-      threadId: "thread-1",
+      thread_id: "thread-1",
     },
   });
 
@@ -844,13 +844,13 @@ test("completion evidence ignores assistant output before the queued prompt", ()
       status: "complete",
       text: "Previous answer.",
     }, {
-      createdAt: submittedAt,
+      created_at: submittedAt,
       id: "codex-82-user",
       role: "user",
       text: "i want to make some pages",
     }],
-    promptText: "i want to make some pages",
-    submittedAtMs,
+    prompt_text: "i want to make some pages",
+    submitted_at_ms: submittedAtMs,
   });
 
   assert.equal(evidence.promptUserMessageSeen, true);

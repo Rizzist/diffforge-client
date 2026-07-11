@@ -401,7 +401,7 @@ fn log_snipping_area_cursor_debug_event(phase: &str, fields: Value) {
     );
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_windows_debug_log(phase: String, details: Value) -> Result<Value, String> {
     log_snipping_area_cursor_debug_event(
         &phase,
@@ -1114,7 +1114,6 @@ fn default_snipping_area_recording_shortcut() -> &'static str {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct SnippingShortcutRegistrationStatus {
     shortcut: String,
     default_shortcut: String,
@@ -1123,7 +1122,6 @@ struct SnippingShortcutRegistrationStatus {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct SnippingPermissionStatus {
     platform: &'static str,
     shortcut_accessibility_required: bool,
@@ -1135,7 +1133,6 @@ struct SnippingPermissionStatus {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct SnippingSettingsStatus {
     enabled: bool,
     hide_desktop_icons: bool,
@@ -1196,56 +1193,47 @@ struct SnippingDismissedToasts {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct SnippingEnabledUpdateRequest {
     enabled: bool,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct SnippingHideDesktopIconsRequest {
     enabled: bool,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct SnippingFreezeScreenRequest {
     enabled: bool,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct SnippingVisibleInCapturesRequest {
     enabled: bool,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct SnippingUploadPublicRequest {
     enabled: bool,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct SnippingPublishAssetRequest {
     asset_id: String,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct SnippingShortcutUpdateRequest {
     action: String,
     shortcut: String,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct SnippingCaptureRequest {
     mode: Option<String>,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct SnippingAreaSelectionRequest {
     x: f64,
     y: f64,
@@ -1257,14 +1245,12 @@ struct SnippingAreaSelectionRequest {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct SnippingAreaCursorLogRequest {
     phase: String,
     fields: Option<Value>,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct SnippingUploadAssetRequest {
     path: String,
     asset_id: Option<String>,
@@ -1273,20 +1259,17 @@ struct SnippingUploadAssetRequest {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct SnippingEditedAssetRequest {
     source_path: String,
     image_data_url: String,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct SnippingAnnotationEditorRequest {
     paths: Vec<String>,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct SnippingCaptureToastDismissRequest {
     id: Option<String>,
     path: Option<String>,
@@ -1294,7 +1277,6 @@ struct SnippingCaptureToastDismissRequest {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct SnippingAreaMonitor {
     name: Option<String>,
     primary: bool,
@@ -4354,7 +4336,6 @@ fn snipping_capture_monitor_image_keeping_session(
 fn snipping_capture_toast_path(value: &Value) -> Option<String> {
     value
         .get("path")
-        .or_else(|| value.get("localPath"))
         .or_else(|| value.get("local_path"))
         .and_then(Value::as_str)
         .map(str::trim)
@@ -4365,7 +4346,6 @@ fn snipping_capture_toast_path(value: &Value) -> Option<String> {
                 .get("item")
                 .and_then(|item| {
                     item.get("path")
-                        .or_else(|| item.get("localPath"))
                         .or_else(|| item.get("local_path"))
                         .and_then(Value::as_str)
                 })
@@ -4503,14 +4483,12 @@ fn snipping_dismiss_capture_toast_for(
                 .as_ref()
                 .and_then(|id| {
                     item.get("id")
-                        .or_else(|| item.get("untrackedId"))
                         .or_else(|| item.get("untracked_id"))
                         .and_then(Value::as_str)
                         .or_else(|| {
                             item.get("item").and_then(|nested| {
                                 nested
                                     .get("id")
-                                    .or_else(|| nested.get("untrackedId"))
                                     .or_else(|| nested.get("untracked_id"))
                                     .and_then(Value::as_str)
                             })
@@ -4621,14 +4599,11 @@ fn snipping_emit_untracked_image_saved_with_toast(
         "shortcut": shortcut,
         "path": target.display().to_string(),
         "local_path": target.display().to_string(),
-        "localPath": target.display().to_string(),
         "filename": target.file_name().and_then(|value| value.to_str()).unwrap_or("snip.png"),
         "width": width,
         "height": height,
         "saved_at_ms": saved_at_ms,
-        "savedAtMs": saved_at_ms,
-        "original_path": original_path.clone(),
-        "originalPath": original_path,
+        "original_path": original_path,
         "item": item,
         "library": diffforge_untracked_asset_library(None)?,
     });
@@ -4671,25 +4646,19 @@ fn snipping_emit_untracked_video_saved_with_toast(
     let saved_at_ms = cloud_mcp_now_ms();
     let payload = json!({
         "kind": "snipping_capture_saved",
-        "assetKind": "video",
         "asset_kind": "video",
-        "mimeType": "video/webm",
         "mime_type": "video/webm",
         "mode": mode,
         "reason": reason,
         "shortcut": shortcut,
         "path": target.display().to_string(),
         "local_path": target.display().to_string(),
-        "localPath": target.display().to_string(),
         "filename": target.file_name().and_then(|value| value.to_str()).unwrap_or("recording.webm"),
         "width": width,
         "height": height,
         "duration_ms": duration_ms,
-        "durationMs": duration_ms,
         "saved_at_ms": saved_at_ms,
-        "savedAtMs": saved_at_ms,
-        "original_path": original_path.clone(),
-        "originalPath": original_path,
+        "original_path": original_path,
         "item": item,
         "library": diffforge_untracked_asset_library(None)?,
     });
@@ -5744,9 +5713,7 @@ fn snipping_recording_status_for(app: &AppHandle) -> Value {
             "active": true,
             "path": session.target_path.display().to_string(),
             "local_path": session.target_path.display().to_string(),
-            "localPath": session.target_path.display().to_string(),
             "started_at_ms": session.started_at_ms,
-            "startedAtMs": session.started_at_ms,
             "width": session.width,
             "height": session.height,
         }),
@@ -5982,8 +5949,8 @@ fn snipping_stop_recording_for(app: &AppHandle, reason: &str) -> Result<Value, S
             "active": true,
             "reason": reason,
             "path": session.target_path.display().to_string(),
-            "localPath": session.target_path.display().to_string(),
-            "startedAtMs": session.started_at_ms,
+            "local_path": session.target_path.display().to_string(),
+            "started_at_ms": session.started_at_ms,
             "width": session.width,
             "height": session.height,
         }));
@@ -8451,9 +8418,7 @@ fn snipping_start_area_recording_for(
         "kind": "snipping_recording_started",
         "path": session.target_path.display().to_string(),
         "local_path": session.target_path.display().to_string(),
-        "localPath": session.target_path.display().to_string(),
         "started_at_ms": session.started_at_ms,
-        "startedAtMs": session.started_at_ms,
         "width": recording_area.output_width,
         "height": recording_area.output_height,
         "source_width": recording_area.frame_width,
@@ -8983,12 +8948,9 @@ fn snipping_save_edited_untracked_asset_for(
         json!({
             "kind": "snip_source_updated",
             "original_path": original_for_event,
-            "originalPath": original_for_event,
             "edited_path": target_path,
-            "editedPath": target_path,
             "path": target_path,
             "in_place": source_is_edited_copy,
-            "inPlace": source_is_edited_copy,
         }),
     );
 
@@ -10884,7 +10846,6 @@ fn snipping_begin_area_for(
             json!({
                 "kind": "snipping_area_overlay_started",
                 "mode": mode.as_str(),
-                "overlayLabel": label,
                 "overlay_label": label,
                 "monitor": monitor.clone(),
             }),
@@ -10913,7 +10874,7 @@ fn snipping_begin_area_for(
             }),
         );
         monitors_payload.push(json!({
-            "overlayLabel": label,
+            "overlay_label": label,
             "monitor": monitor.clone(),
         }));
     }
@@ -11035,9 +10996,7 @@ fn snipping_store_area_snapshot_backdrop(
         SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT,
         json!({
             "kind": "snipping_area_overlay_snapshot",
-            "overlayLabel": overlay_label,
             "overlay_label": overlay_label,
-            "snapshotPath": path_text.clone(),
             "snapshot_path": path_text,
         }),
     );
@@ -11252,7 +11211,7 @@ fn register_snipping_space_change_observer(app: &AppHandle) {
                                 FLOATING_SURFACE_LAYOUT_CHANGED_EVENT,
                                 json!({
                                     "source": "macos_space",
-                                    "useFullMonitorBounds": use_full_monitor_bounds,
+                                    "use_full_monitor_bounds": use_full_monitor_bounds,
                                 }),
                             );
                             snipping_force_area_crosshair_for_visible_overlays(
@@ -11525,17 +11484,17 @@ fn snipping_finish_area_snip_for(
     snipping_save_image(app, image_result?, "area", "overlay", String::new())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_status(app: AppHandle) -> Result<SnippingSettingsStatus, String> {
     snipping_status_for(&app)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_shortcuts_status(app: AppHandle) -> Result<SnippingSettingsStatus, String> {
     snipping_status_for(&app)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn set_snipping_enabled(
     app: AppHandle,
     request: SnippingEnabledUpdateRequest,
@@ -11543,7 +11502,7 @@ fn set_snipping_enabled(
     set_snipping_enabled_for(&app, request)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn set_snipping_hide_desktop_icons(
     app: AppHandle,
     request: SnippingHideDesktopIconsRequest,
@@ -11551,7 +11510,7 @@ fn set_snipping_hide_desktop_icons(
     set_snipping_hide_desktop_icons_for(&app, request)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn set_snipping_freeze_screen(
     app: AppHandle,
     request: SnippingFreezeScreenRequest,
@@ -11559,7 +11518,7 @@ fn set_snipping_freeze_screen(
     set_snipping_freeze_screen_for(&app, request)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn set_snipping_upload_public(
     app: AppHandle,
     request: SnippingUploadPublicRequest,
@@ -11567,7 +11526,7 @@ fn set_snipping_upload_public(
     set_snipping_upload_public_for(&app, request)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn set_snipping_visible_in_captures(
     app: AppHandle,
     request: SnippingVisibleInCapturesRequest,
@@ -11575,7 +11534,7 @@ fn set_snipping_visible_in_captures(
     set_snipping_visible_in_captures_for(&app, request)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn set_snipping_shortcut(
     app: AppHandle,
     request: SnippingShortcutUpdateRequest,
@@ -11583,12 +11542,12 @@ fn set_snipping_shortcut(
     set_snipping_shortcut_for(&app, request)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn reset_snipping_shortcuts(app: AppHandle) -> Result<SnippingSettingsStatus, String> {
     reset_snipping_shortcuts_for(&app)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn open_snipping_permissions(app: AppHandle) -> Result<SnippingSettingsStatus, String> {
     #[cfg(target_os = "macos")]
     {
@@ -11604,7 +11563,7 @@ fn open_snipping_permissions(app: AppHandle) -> Result<SnippingSettingsStatus, S
     snipping_status_for(&app)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_capture_screenshot(
     app: AppHandle,
     request: SnippingCaptureRequest,
@@ -11629,17 +11588,17 @@ fn snipping_capture_screenshot(
     snipping_capture_full_for(&app, "manual", String::new())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_begin_area_snip(app: AppHandle) -> Result<Value, String> {
     snipping_begin_area_snip_for(&app, "manual", String::new())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_begin_area_recording(app: AppHandle) -> Result<Value, String> {
     snipping_toggle_area_recording_shortcut_for(&app, "manual", String::new())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_area_overlay_status(
     app: AppHandle,
     window: tauri::WebviewWindow,
@@ -11650,7 +11609,7 @@ fn snipping_area_overlay_status(
             "kind": "snipping_area_overlay_status",
             "active": false,
             "mode": SnippingAreaMode::Image.as_str(),
-            "overlayLabel": label,
+            "overlay_label": label,
             "monitor": Value::Null,
         }));
     };
@@ -11659,12 +11618,12 @@ fn snipping_area_overlay_status(
         "kind": "snipping_area_overlay_status",
         "active": true,
         "mode": mode.as_str(),
-        "overlayLabel": label,
+        "overlay_label": label,
         "monitor": monitor,
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_area_overlay_ready(
     app: AppHandle,
     window: tauri::WebviewWindow,
@@ -11676,11 +11635,11 @@ fn snipping_area_overlay_ready(
     snipping_mark_area_overlay_ready(&app, &label);
     Ok(json!({
         "kind": "snipping_area_overlay_ready",
-        "overlayLabel": label,
+        "overlay_label": label,
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_log_area_cursor_event(
     app: AppHandle,
     window: tauri::WebviewWindow,
@@ -11707,7 +11666,7 @@ fn snipping_log_area_cursor_event(
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_finish_area_snip(
     app: AppHandle,
     window: tauri::WebviewWindow,
@@ -11716,7 +11675,7 @@ fn snipping_finish_area_snip(
     snipping_finish_area_snip_for(&app, window.label(), request)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_start_area_recording(
     app: AppHandle,
     window: tauri::WebviewWindow,
@@ -11725,22 +11684,22 @@ fn snipping_start_area_recording(
     snipping_start_area_recording_for(&app, window.label(), request)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_stop_recording(app: AppHandle) -> Result<Value, String> {
     snipping_stop_recording_for(&app, "manual")
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_recording_status(app: AppHandle) -> Result<Value, String> {
     Ok(snipping_recording_status_for(&app))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_recent_capture_toasts(app: AppHandle) -> Result<Value, String> {
     Ok(snipping_recent_capture_toasts_for(&app))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_dismiss_capture_toast(
     app: AppHandle,
     request: SnippingCaptureToastDismissRequest,
@@ -11748,7 +11707,7 @@ fn snipping_dismiss_capture_toast(
     snipping_dismiss_capture_toast_for(&app, request)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_upload_untracked_asset(
     app: AppHandle,
     request: SnippingUploadAssetRequest,
@@ -11757,12 +11716,9 @@ fn snipping_upload_untracked_asset(
 }
 
 fn snipping_publish_public_url(published: &Value) -> Option<String> {
-    cloud_mcp_payload_text(published, &["public_url", "publicUrl"]).or_else(|| {
+    cloud_mcp_payload_text(published, &["public_url"]).or_else(|| {
         [
             "/public_link/public_url",
-            "/publicLink/publicUrl",
-            "/public_link/publicUrl",
-            "/publicLink/public_url",
         ]
         .iter()
         .find_map(|path| {
@@ -11789,7 +11745,7 @@ async fn snipping_publish_uploaded_asset_to_cloud(
         .ok_or_else(|| "Snip published, but the cloud did not return a public URL.".to_string())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn snipping_publish_uploaded_asset(
     app: AppHandle,
     request: SnippingPublishAssetRequest,
@@ -11801,14 +11757,12 @@ async fn snipping_publish_uploaded_asset(
     let public_url = snipping_publish_uploaded_asset_to_cloud(&app, asset_id.clone()).await?;
     Ok(json!({
         "kind": "snip_published",
-        "asset_id": asset_id.clone(),
-        "assetId": asset_id,
-        "public_url": public_url.clone(),
-        "publicUrl": public_url,
+        "asset_id": asset_id,
+        "public_url": public_url,
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn snipping_unpublish_uploaded_asset(
     app: AppHandle,
     request: SnippingPublishAssetRequest,
@@ -11821,13 +11775,12 @@ async fn snipping_unpublish_uploaded_asset(
         cloud_mcp_unpublish_account_asset(app.state::<CloudMcpState>(), asset_id.clone()).await?;
     Ok(json!({
         "kind": "snip_unpublished",
-        "asset_id": asset_id.clone(),
-        "assetId": asset_id,
+        "asset_id": asset_id,
         "unpublished": unpublished,
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn snipping_delete_uploaded_asset_from_cloud(
     app: AppHandle,
     request: SnippingPublishAssetRequest,
@@ -11841,8 +11794,7 @@ async fn snipping_delete_uploaded_asset_from_cloud(
             .await?;
     Ok(json!({
         "kind": "snip_cloud_upload_deleted",
-        "asset_id": asset_id.clone(),
-        "assetId": asset_id,
+        "asset_id": asset_id,
         "deleted": deleted,
     }))
 }
@@ -11859,11 +11811,8 @@ async fn snipping_upload_known_asset_to_cloud(
             "kind": "snip_cloud_upload_started",
             "status": "uploading",
             "asset_id": asset_id.clone(),
-            "assetId": asset_id.clone(),
             "local_path": local_path.clone(),
-            "localPath": local_path.clone(),
             "source_path": source_path.clone(),
-            "sourcePath": source_path.clone(),
         }),
     );
 
@@ -11876,11 +11825,8 @@ async fn snipping_upload_known_asset_to_cloud(
                 "kind": "snip_cloud_upload_failed",
                 "status": "failed",
                 "asset_id": asset_id.clone(),
-                "assetId": asset_id.clone(),
-                "local_path": local_path.clone(),
-                "localPath": local_path,
-                "source_path": source_path.clone(),
-                "sourcePath": source_path,
+                "local_path": local_path,
+                "source_path": source_path,
                 "error": error.clone(),
             }),
         );
@@ -11893,21 +11839,16 @@ async fn snipping_upload_known_asset_to_cloud(
             "kind": "snip_cloud_upload_completed",
             "status": "completed",
             "asset_id": asset_id.clone(),
-            "assetId": asset_id.clone(),
             "local_path": local_path.clone(),
-            "localPath": local_path.clone(),
-            "source_path": source_path.clone(),
-            "sourcePath": source_path,
+            "source_path": source_path,
         }),
     );
 
     if !snipping_upload_public_enabled(app) {
         return Ok(json!({
             "kind": "snip_uploaded_to_cloud",
-            "asset_id": asset_id.clone(),
-            "assetId": asset_id,
-            "local_path": local_path.clone(),
-            "localPath": local_path,
+            "asset_id": asset_id,
+            "local_path": local_path,
             "published": false,
         }));
     }
@@ -11915,13 +11856,10 @@ async fn snipping_upload_known_asset_to_cloud(
     let public_url = snipping_publish_uploaded_asset_to_cloud(app, asset_id.clone()).await?;
     Ok(json!({
         "kind": "snip_uploaded_to_cloud",
-        "asset_id": asset_id.clone(),
-        "assetId": asset_id,
-        "local_path": local_path.clone(),
-        "localPath": local_path,
+        "asset_id": asset_id,
+        "local_path": local_path,
         "published": true,
-        "public_url": public_url.clone(),
-        "publicUrl": public_url,
+        "public_url": public_url,
     }))
 }
 
@@ -11934,7 +11872,7 @@ async fn snipping_upload_known_asset_to_cloud(
 /// workspace selection. Every step is idempotent (deterministic asset id,
 /// prepare-upload dedupe, publish returns the existing link), so retrying
 /// after a mid-chain failure is safe.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn snipping_upload_untracked_asset_to_cloud(
     app: AppHandle,
     request: SnippingUploadAssetRequest,
@@ -11954,14 +11892,14 @@ async fn snipping_upload_untracked_asset_to_cloud(
     }
 
     let promoted = snipping_upload_untracked_asset_for(&app, request)?;
-    let asset_id = cloud_mcp_payload_text(&promoted, &["asset_id", "assetId"])
+    let asset_id = cloud_mcp_payload_text(&promoted, &["asset_id"])
         .ok_or_else(|| "Snip was tracked, but no asset id was returned.".to_string())?;
-    let local_path = cloud_mcp_payload_text(&promoted, &["local_path", "localPath", "path"])
+    let local_path = cloud_mcp_payload_text(&promoted, &["local_path", "path"])
         .unwrap_or_else(|| requested_path.clone());
     snipping_upload_known_asset_to_cloud(&app, asset_id, local_path, requested_path).await
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_save_edited_untracked_asset(
     app: AppHandle,
     request: SnippingEditedAssetRequest,
@@ -12101,10 +12039,10 @@ fn snipping_emit_strip_restore_event(
         "index": origin.index,
     });
     if let Some(before_path) = &origin.before_path {
-        payload["beforePath"] = json!(before_path);
+        payload["before_path"] = json!(before_path);
     }
     if let Some(after_path) = &origin.after_path {
-        payload["afterPath"] = json!(after_path);
+        payload["after_path"] = json!(after_path);
     }
     let _ = app.emit_to(
         SNIPPING_STRIP_WINDOW_LABEL,
@@ -13493,7 +13431,7 @@ fn snipping_emit_strip_drag_event(
     });
     if let Some(client_x) = window.and_then(|preview| snipping_preview_strip_client_x(app, preview))
     {
-        payload["clientX"] = json!(client_x);
+        payload["client_x"] = json!(client_x);
     }
     let _ = app.emit_to(
         SNIPPING_STRIP_WINDOW_LABEL,
@@ -13672,8 +13610,8 @@ fn snipping_resolve_preview_drop_candidates(app: &AppHandle) {
                 "kind": "snip_preview_drop",
                 "label": label,
                 "path": path,
-                "clientX": client_x,
-                "clientY": client_y,
+                "client_x": client_x,
+                "client_y": client_y,
             }),
         );
     }
@@ -13709,8 +13647,8 @@ fn snipping_emit_preview_drag_over(app: &AppHandle, label: &str) {
         Some((client_x, client_y)) => json!({
             "kind": "snip_preview_drag_over",
             "label": label,
-            "clientX": client_x,
-            "clientY": client_y,
+            "client_x": client_x,
+            "client_y": client_y,
         }),
         None => json!({ "kind": "snip_preview_drag_over", "label": label, "outside": true }),
     };
@@ -14258,7 +14196,7 @@ fn snipping_take_pooled_preview_window(app: &AppHandle) -> Option<tauri::Webview
 /// Path currently assigned to a preview window. Pool windows boot with no
 /// path in their URL and may miss the assign event if adoption races their
 /// boot; this query closes that gap on mount.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_float_assigned_path(
     app: AppHandle,
     window: tauri::WebviewWindow,
@@ -14753,8 +14691,8 @@ fn snipping_start_float_hover_watcher(app: &AppHandle) {
                         json!({
                             "label": label.as_str(),
                             "hovered": true,
-                            "clientX": client_x,
-                            "clientY": client_y,
+                            "client_x": client_x,
+                            "client_y": client_y,
                         })
                     } else {
                         json!({ "label": label.as_str(), "hovered": false })
@@ -14867,8 +14805,7 @@ fn snipping_recent_snip_items(
                 json!({
                     "path": path_string,
                     "name": name,
-                    "modifiedMs": modified_ms as u64,
-                    "sourceKind": source_kind,
+                    "modified_ms": modified_ms as u64,
                     "source_kind": source_kind,
                 }),
             ))
@@ -14896,7 +14833,7 @@ fn snipping_recent_snip_items(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_recent_snips(
     app: AppHandle,
     limit: Option<usize>,
@@ -14918,17 +14855,9 @@ fn snipping_recent_snips(
     Ok(json!({
         "kind": "snipping_recent_snips",
         "items": items,
-        "totalCount": total_count,
         "total_count": total_count,
-        "hasMore": has_more,
         "has_more": has_more,
-        "nextCursor": {
-            "modifiedMs": next_cursor_modified_ms,
-            "modified_ms": next_cursor_modified_ms,
-            "path": next_cursor_path,
-        },
         "next_cursor": {
-            "modifiedMs": next_cursor_modified_ms,
             "modified_ms": next_cursor_modified_ms,
             "path": next_cursor_path,
         },
@@ -15114,13 +15043,13 @@ fn snipping_strip_start_outside_click_watcher(app: &AppHandle) {
     });
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_set_strip_interaction_guard(app: AppHandle, active: bool) -> Result<(), String> {
     snipping_strip_mark_interaction_guard(&app, active);
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_close_snip_strip(app: AppHandle) -> Result<(), String> {
     snipping_strip_close_if_visible(&app, false);
     Ok(())
@@ -15582,13 +15511,13 @@ pub(crate) fn snipping_strip_toggle(app: &AppHandle) {
     snipping_strip_show(app);
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_toggle_snip_strip(app: AppHandle) -> Result<(), String> {
     snipping_strip_toggle(&app);
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_open_snip_float(
     app: AppHandle,
     path: String,
@@ -15630,7 +15559,7 @@ fn snipping_open_snip_float(
     Ok(opened)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_open_snip_float_for_drag(
     app: AppHandle,
     path: String,
@@ -15700,7 +15629,7 @@ fn snipping_open_snip_float_for_drag(
             "path": opened_path,
             "width": drag_size.0,
             "height": drag_size.1,
-            "dragStarted": false,
+            "drag_started": false,
         });
         let label = opened
             .get("label")
@@ -15936,7 +15865,7 @@ fn snipping_open_snip_float_for_drag(
     #[cfg(target_os = "macos")]
     snipping_start_preview_drag_follow_watchdog_with_takeover(&app, &label, !drag_started);
     let mut opened = opened;
-    opened["dragStarted"] = json!(drag_started);
+    opened["drag_started"] = json!(drag_started);
     log_snipping_area_cursor_debug_event(
         "native.preview_drag_open_ready",
         json!({
@@ -16026,21 +15955,14 @@ fn snipping_handle_promoted_untracked_asset(
         json!({
             "kind": "snip_asset_promoted",
             "asset_id": asset_id,
-            "assetId": asset_id,
             "asset": asset,
             "original_path": source_path,
-            "originalPath": source_path,
             "source_path": source_path,
-            "sourcePath": source_path,
             "edited_path": target_path,
-            "editedPath": target_path,
             "local_path": target_path,
-            "localPath": target_path,
             "path": target_path,
             "source_removed": source_removed,
-            "sourceRemoved": source_removed,
             "in_place": false,
-            "inPlace": false,
         }),
     );
     snipping_emit_floats_changed(app);
@@ -16064,7 +15986,7 @@ fn snipping_float_labels_for_path(app: &AppHandle, path: &str) -> Result<Vec<Str
 
 /// Whether a floating preview is currently open for this snip — drives the
 /// annotation editor's pin/close toggle.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_snip_float_open(app: AppHandle, path: String) -> Result<Value, String> {
     let open = snipping_float_labels_for_path(&app, &path)?
         .iter()
@@ -16078,7 +16000,7 @@ fn snipping_snip_float_open(app: AppHandle, path: String) -> Result<Value, Strin
 }
 
 /// Closes a specific floating preview through the shared dispose lifecycle.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_close_snip_float(app: AppHandle, label: String) -> Result<Value, String> {
     let label = label.trim().to_string();
     if !label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX) {
@@ -16088,7 +16010,7 @@ fn snipping_close_snip_float(app: AppHandle, label: String) -> Result<Value, Str
     Ok(json!({ "ok": true, "closed": closed, "label": label }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_close_snip_float_for_path(app: AppHandle, path: String) -> Result<Value, String> {
     let mut closed = false;
     for label in snipping_float_labels_for_path(&app, &path)? {
@@ -16103,7 +16025,7 @@ fn snipping_close_snip_float_for_path(app: AppHandle, path: String) -> Result<Va
     Ok(json!({ "ok": true, "closed": closed }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_close_annotation_editor(app: AppHandle, label: String) -> Result<Value, String> {
     let label = label.trim().to_string();
     if !label.starts_with(SNIPPING_EDITOR_WINDOW_PREFIX) {
@@ -16166,7 +16088,7 @@ fn snipping_handle_untracked_asset_deleted(app: &AppHandle, deleted_path: &str) 
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_preview_drag_moved(
     app: AppHandle,
     label: String,
@@ -16312,7 +16234,7 @@ fn snipping_preview_drag_moved(
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_preview_drag_released(app: AppHandle, label: String) -> Result<Value, String> {
     let label = label.trim().to_string();
     log_snipping_area_cursor_debug_event(
@@ -16369,7 +16291,7 @@ fn snipping_preview_drag_released(app: AppHandle, label: String) -> Result<Value
 /// Called by a preview window's webview right before it starts the native
 /// window drag. Marks the drag session so the settle pass can tell a real
 /// user drag (drop candidate) from programmatic restacking.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_preview_drag_started(
     app: AppHandle,
     label: String,
@@ -16446,13 +16368,13 @@ fn snipping_preview_drag_started(
     );
     Ok(json!({
         "ok": true,
-        "dragStarted": !cfg!(windows),
+        "drag_started": !cfg!(windows),
     }))
 }
 
 /// A drop target in the main webview accepted the snip: the preview window
 /// closes and its capture toast is dismissed, like a manual dismiss.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_consume_snip_preview(
     app: AppHandle,
     label: String,
@@ -16476,7 +16398,7 @@ fn snipping_consume_snip_preview(
     Ok(json!({ "ok": true, "label": label }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_set_dispatch_targets(app: AppHandle, targets: Value) -> Result<Value, String> {
     let state = app.state::<SnippingState>();
     let next_targets = if targets.is_array() {
@@ -16497,7 +16419,7 @@ fn snipping_set_dispatch_targets(app: AppHandle, targets: Value) -> Result<Value
     Ok(json!({"ok": true}))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_dispatch_targets(app: AppHandle) -> Result<Value, String> {
     app.state::<SnippingState>()
         .dispatch_targets
@@ -16506,7 +16428,7 @@ fn snipping_dispatch_targets(app: AppHandle) -> Result<Value, String> {
         .map_err(|_| "Unable to lock snipping dispatch targets.".to_string())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_read_asset_data_url(path: String) -> Result<String, String> {
     let file = diffforge_local_asset_file(&path)?;
     let bytes = fs::read(&file)
@@ -16523,14 +16445,14 @@ fn snipping_read_asset_data_url(path: String) -> Result<String, String> {
     ))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_open_annotation_editor(app: AppHandle, path: String) -> Result<Value, String> {
     // Same builder as the batch path: transparent rounded window sized to the
     // snip, plus the one-editor-per-asset focus dedupe.
     snipping_open_annotation_editor_for_paths_command(&app, vec![path])
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_open_annotation_editor_batch(
     app: AppHandle,
     request: SnippingAnnotationEditorRequest,
@@ -16538,17 +16460,17 @@ fn snipping_open_annotation_editor_batch(
     snipping_open_annotation_editor_for_paths_command(&app, request.paths)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_copy_untracked_asset_to_clipboard(path: String) -> Result<Value, String> {
     snipping_copy_untracked_asset_to_clipboard_for(path)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_copy_text_to_clipboard(text: String) -> Result<Value, String> {
     snipping_copy_text_to_clipboard_for(text)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn snipping_cancel_area_snip(app: AppHandle) -> Result<Value, String> {
     snipping_cancel_area_snip_for(&app)
 }

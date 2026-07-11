@@ -70,7 +70,7 @@ function RowEnterOnce({ animate = false, children }) {
 
 function rowContainsDomId(row, domId) {
   if (!row || !domId) return false;
-  if (row.domId === domId) return true;
+  if (row.dom_id === domId) return true;
   if (row.kind === "subagent-group") {
     // Subagent groups can nest (parent_id chains) — recurse.
     return transcriptArray(row.childRows).some((child) => rowContainsDomId(child, domId));
@@ -87,7 +87,7 @@ function groupContainsDomId(group, domId) {
 
 export const AgentTranscript = memo(function AgentTranscript({
   items = [],
-  diffSummaries = [],
+  diff_summaries: diffSummaries = [],
   messages = [],
   emptyLabel = "No synced chat records yet.",
   itemIdPrefix = "agent-thread-item",
@@ -107,7 +107,7 @@ export const AgentTranscript = memo(function AgentTranscript({
   onUserMessageAction = null,
   // The current session's id(s); subagent rows whose session reference
   // matches are treated as local (no "Open session" chip).
-  sessionId = "",
+  session_id: sessionId = "",
   // Optional (sessionRef) => void wiring the subagent "Open session" chip to
   // the host's session-open navigation.
   onOpenSession = null,
@@ -169,13 +169,13 @@ export const AgentTranscript = memo(function AgentTranscript({
 
   const built = useMemo(() => buildTranscriptRows(safeItems, {
     itemIdPrefix,
-    diffSummaries,
+    diff_summaries: diffSummaries,
     turnSummaries,
     turnDiffs,
     usageByTurn,
     expandedTurnKeys,
     busy,
-    sessionId,
+    session_id: sessionId,
   }), [busy, diffSummaries, expandedTurnKeys, itemIdPrefix, safeItems, sessionId, turnDiffs, turnSummaries, usageByTurn]);
 
   const rows = useMemo(() => {
@@ -348,7 +348,7 @@ export const AgentTranscript = memo(function AgentTranscript({
     const scroller = scrollRef?.current;
     if (!scroller) return undefined;
     const handler = (event) => {
-      const domId = event?.detail?.domId;
+      const domId = event?.detail?.dom_id;
       if (!domId) return;
       const foldedGroup = transcriptArray(built.groups).find((group) => (
         !group.divider && groupContainsDomId(group, domId)
@@ -389,12 +389,12 @@ export const AgentTranscript = memo(function AgentTranscript({
           {rows.map((row) => (
             <TranscriptRowShell
               $spacing={rowSpacing(row)}
-              id={row.domId || undefined}
+              id={row.dom_id || undefined}
               key={row.key}
               style={{ position: "static" }}
             >
               {row.kind === "working" ? (
-                <WorkingRow label={workingLabel} startedAtMs={workingStartedAtMs} />
+                <WorkingRow label={workingLabel} started_at_ms={workingStartedAtMs} />
               ) : (
                 <TranscriptRowBody
                   live={row.groupKey === liveGroupKey && Boolean(liveGroupKey)}
@@ -430,13 +430,13 @@ export const AgentTranscript = memo(function AgentTranscript({
             <TranscriptRowShell
               $spacing={rowSpacing(row)}
               data-index={virtualItem.index}
-              id={row.domId || undefined}
+              id={row.dom_id || undefined}
               key={virtualItem.key}
               ref={virtualizer.measureElement}
               style={{ transform: `translateY(${virtualItem.start - scrollMargin}px)` }}
             >
               {row.kind === "working" ? (
-                <WorkingRow label={workingLabel} startedAtMs={workingStartedAtMs} />
+                <WorkingRow label={workingLabel} started_at_ms={workingStartedAtMs} />
               ) : (
                 <RowEnterOnce animate={enterKeys.has(row.key) && !animatedKeysRef.current.has(row.key)}>
                   <TranscriptRowBody
