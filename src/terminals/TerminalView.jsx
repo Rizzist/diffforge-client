@@ -9363,6 +9363,7 @@ function getTodoQueuePendingFieldsFromItem(item, source = "") {
     ...(commandId ? { command_id: commandId } : {}),
     ...(dispatchId ? { dispatch_id: dispatchId, todo_dispatch_id: dispatchId } : {}),
     ...(todoId ? { todo_id: todoId } : {}),
+    ...(Object.keys(remoteCommand).length ? { remote_command: remoteCommand } : {}),
     ...(dispatchSource && typeof dispatchSource === "object" ? { dispatch_source: dispatchSource } : {}),
     ...(dispatchTarget && typeof dispatchTarget === "object" ? { dispatch_target: dispatchTarget } : {}),
     ...(targetAgentId ? { target_agent_id: targetAgentId, target_role: targetAgentId } : {}),
@@ -14423,6 +14424,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   const skipEditBlurCommitRef = useRef(false);
   const queueAfterEditItemIdRef = useRef("");
   const [todoDeviceSelectionId, setTodoDeviceSelectionId] = useState("");
+  const todoDeviceSelectionManualRef = useRef(false);
   const [todoDevicePickerExpanded, setTodoDevicePickerExpanded] = useState(false);
   const [todoDeviceSelectionRevealed, setTodoDeviceSelectionRevealed] = useState(false);
   const todoDeviceOptions = useMemo(() => buildTodoQueueDeviceWorkspaceOptions({
@@ -14901,6 +14903,13 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       error: errorMessage,
       workspace_id: APP_CONTROL_AGENT_WORKSPACE.id,
     });
+    emitClientActionAck({
+      action_kind: "message",
+      client_action_id: appControlRemoteDetailString(existingContext.event, ["client_action_id"]),
+      entity_id: existingContext.command_id || safePromptId,
+      error: errorMessage || "Terminal orchestrator message failed.",
+      result: "failed",
+    });
     void recordAppControlRemoteCommandStatus(
       existingContext.event,
       "failed",
@@ -14920,6 +14929,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     clearAppControlAgentRetryTimer,
     clearAppControlAgentSendWatchdog,
     drainAppControlAgentSendQueue,
+    emitClientActionAck,
     getAppControlAgentThreadId,
     recordAppControlRemoteCommandStatus,
     startAppControlAgentPendingPrompt,
@@ -15234,20 +15244,10 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
         workspace_id: APP_CONTROL_AGENT_WORKSPACE.id,
       });
     }
-	    if (failed && !terminalAccepted) {
-	      emitClientActionAck({
-	        action_kind: "message",
-	        client_action_id: appControlRemoteDetailString(
-	          existingContext.event,
-	          ["client_action_id"],
-	        ),
-	        entity_id: existingContext.command_id || promptId,
-	        error: event.error || event.message || "Terminal message injection failed.",
-	        result: "failed",
-	      });
-	      recoverOrFailAppControlAgentSendMessage(promptId, "terminal_lifecycle_failure", event);
-	      return;
-	    }
+    if (failed && !terminalAccepted) {
+      recoverOrFailAppControlAgentSendMessage(promptId, "terminal_lifecycle_failure", event);
+      return;
+    }
 	    const loopspaceId = existingContext.loopspace_id
 	      || appControlRemoteDetailString(existingContext.event, ["loopspace_id"])
 	      || appControlRemoteDetailString(event, ["loopspace_id"]);
@@ -15402,6 +15402,14 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       || String(remoteEvent.command_kind || "").trim()
       || "terminal_orchestrator_send_message";
     if (!rawText) {
+      emitClientActionAck({
+        action_kind: "message",
+        client_action_id: appControlRemoteDetailString(detail, ["client_action_id"])
+          || appControlRemoteDetailString(remoteEvent, ["client_action_id"]),
+        entity_id: commandId,
+        error: "Remote command did not include a terminal orchestrator message.",
+        result: "failed",
+      });
       void recordAppControlRemoteCommandStatus(remoteEvent, "failed", "Remote command did not include a terminal orchestrator message.", {
         command_id: commandId,
         command_kind: commandKind,
@@ -15421,7 +15429,16 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
         });
         text = buildAppControlPromptWithAttachmentMarkers(rawText, stageResult);
       } catch (error) {
-        void recordAppControlRemoteCommandStatus(remoteEvent, "failed", getErrorMessage(error, "Unable to stage chat attachments for the terminal orchestrator."), {
+        const errorMessage = getErrorMessage(error, "Unable to stage chat attachments for the terminal orchestrator.");
+        emitClientActionAck({
+          action_kind: "message",
+          client_action_id: appControlRemoteDetailString(detail, ["client_action_id"])
+            || appControlRemoteDetailString(remoteEvent, ["client_action_id"]),
+          entity_id: commandId,
+          error: errorMessage,
+          result: "failed",
+        });
+        void recordAppControlRemoteCommandStatus(remoteEvent, "failed", errorMessage, {
           attachmentCount: chatAttachments.length,
           command_id: commandId,
           command_kind: commandKind,
@@ -15618,6 +15635,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     appControlAgentTerminalHasActiveRemoteCommand,
     getAppControlAgentSendQueueDepth,
     getAppControlAgentThreadId,
+    emitClientActionAck,
     recordAppControlRemoteCommandStatus,
     resolveAppControlAgentTerminalIndex,
     startAppControlAgentPendingPrompt,
@@ -15837,15 +15855,32 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       if (todoDeviceSelectionId) {
         setTodoDeviceSelectionId("");
       }
+      todoDeviceSelectionManualRef.current = false;
       return;
     }
-    if (!todoDeviceOptions.some((option) => option.id === todoDeviceSelectionId)) {
+    const selectedOption = todoDeviceOptions.find((option) => option.id === todoDeviceSelectionId) || null;
+    const localCurrentOption = todoDeviceOptions.find((option) => (
+      option.is_local
+        && option.isCurrentWorkspace
+        && todoQueueDeviceSelectionIsLocalEditable(option, orchestratorPanelWorkspaceId)
+    )) || null;
+    if (!selectedOption) {
       const defaultOption = todoDeviceOptions.find((option) => option.is_local && option.isCurrentWorkspace)
         || todoDeviceOptions.find((option) => option.is_local)
         || todoDeviceOptions[0];
+      todoDeviceSelectionManualRef.current = false;
       setTodoDeviceSelectionId(defaultOption.id);
+      return;
     }
-  }, [todoDeviceOptions, todoDeviceSelectionId]);
+    if (
+      localCurrentOption
+      && selectedOption.id !== localCurrentOption.id
+      && !todoDeviceSelectionManualRef.current
+      && !todoQueueDeviceSelectionIsLocalEditable(selectedOption, orchestratorPanelWorkspaceId)
+    ) {
+      setTodoDeviceSelectionId(localCurrentOption.id);
+    }
+  }, [orchestratorPanelWorkspaceId, todoDeviceOptions, todoDeviceSelectionId]);
   const selectedTodoDevice = useMemo(() => (
     todoDeviceOptions.find((option) => option.id === todoDeviceSelectionId)
       || todoDeviceOptions[0]
@@ -18207,6 +18242,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
           if (displayOnly) {
             return;
           }
+          todoDeviceSelectionManualRef.current = true;
           setTodoDeviceSelectionId(option.id);
           if (todoDeviceClusterActive) {
             setTodoDevicePickerExpanded(false);
@@ -21375,6 +21411,22 @@ function TerminalView({
     return receiptKey;
   }, [getTodoQueueItemAgentSessionMetadataForSync, terminalWorkspace?.id]);
 
+  const emitTodoQueueMessageClientActionAck = useCallback((itemLike, result, error = "", fallbackEntityId = "") => {
+    const remoteCommand = itemLike?.remote_command && typeof itemLike.remote_command === "object"
+      ? itemLike.remote_command
+      : {};
+    if (!remoteCommandIsMessageIntent(remoteCommand)) {
+      return;
+    }
+    emitClientActionAck({
+      action_kind: "message",
+      client_action_id: remoteCommand.client_action_id,
+      entity_id: remoteCommand.command_id || itemLike?.id || itemLike?.item_id || fallbackEntityId,
+      error,
+      result,
+    });
+  }, [emitClientActionAck]);
+
   const updateWorkspaceFileDragState = useCallback((nextState) => {
     workspaceFileDragStateRef.current = nextState || null;
     setWorkspaceFileDragState(nextState || null);
@@ -21638,7 +21690,9 @@ function TerminalView({
     }
 
     const targetAgentId = getTodoQueueTargetAgentId(item);
-    return targetAgentId ? getTodoQueueAgentAccentColor(targetAgentId) : "";
+    return targetAgentId
+      ? getTodoQueueAgentAccentColor(targetAgentId)
+      : TODO_QUEUE_DEFAULT_DOT_COLOR;
   }, [getTerminalPaneId, getTerminalThread, logicalTerminalIndexes]);
   const getTerminalImageInputSupport = useCallback((terminalIndex) => (
     (() => {
@@ -22939,6 +22993,14 @@ function TerminalView({
           workspace_id: pendingItem?.workspace_id || fields.workspace_id || terminalWorkspace?.id || "",
         });
       }
+      if (["failed", "timed_out"].includes(recoverableSettleStatus)) {
+        emitTodoQueueMessageClientActionAck(
+          settledItem || pendingItem,
+          "failed",
+          fields.message || reason || "Terminal message injection failed.",
+          itemId,
+        );
+      }
       if (pendingItem) {
         logTerminalStatus("frontend.todo_queue.pending_clear", {
           elapsed_ms: Date.now() - Number(pendingItem.started_at_ms || Date.now()),
@@ -23008,6 +23070,12 @@ function TerminalView({
           workspace_id: workspaceId,
         });
       }
+      emitTodoQueueMessageClientActionAck(
+        releasedItem || pendingItem,
+        "failed",
+        fields.message || reason || "Terminal message could not be delivered to the target terminal.",
+        itemId,
+      );
       if (pendingItem) {
         logTerminalStatus("frontend.todo_queue.pending_clear", {
           elapsed_ms: Date.now() - Number(pendingItem.started_at_ms || Date.now()),
@@ -23136,6 +23204,7 @@ function TerminalView({
     });
     setTodoQueueDispatchRevision((revision) => revision + 1);
   }, [
+    emitTodoQueueMessageClientActionAck,
     recordTodoQueueRemoteCommandReceipt,
     cloudDesktopDeviceId,
     cloudDesktopDevicePlatform,
@@ -26909,8 +26978,8 @@ function TerminalView({
       target_terminal_index: fields.target_terminal_index ?? pendingItem.target_terminal_index,
       target_thread_id: fields.target_thread_id || pendingItem.target_thread_id || "",
     };
+    const item = todoQueueItemsRef.current.find((candidate) => candidate.id === safeItemId) || null;
     if (remoteReceiptStatus || releaseReceiptStatus) {
-      const item = todoQueueItemsRef.current.find((candidate) => candidate.id === safeItemId) || null;
       if (item) {
         recordTodoQueueRemoteCommandReceipt(item, remoteReceiptStatus || releaseReceiptStatus, {
           command_id: pendingItem.command_id || fields.command_id || "",
@@ -26923,6 +26992,14 @@ function TerminalView({
           workspace_id: pendingItem.workspace_id || terminalWorkspace?.id || "",
         });
       }
+    }
+    if (["failed", "timed_out"].includes(remoteReceiptStatus) || releaseReceiptStatus) {
+      emitTodoQueueMessageClientActionAck(
+        item || pendingItem,
+        "failed",
+        fields.message || reason || "Terminal message injection failed.",
+        safeItemId,
+      );
     }
 
     logBigViewSyncDiagnosticEvent("tui.text.todo_pending_clear", {
@@ -26985,6 +27062,7 @@ function TerminalView({
       reason: `todo_queue_pending_${reason}`,
     });
   }, [
+    emitTodoQueueMessageClientActionAck,
     recordTodoQueueRemoteCommandReceipt,
     replaceTodoQueuePendingItems,
     terminalWorkspace?.id,
@@ -27033,6 +27111,11 @@ function TerminalView({
       phase,
       prompt_id: String(fields.prompt_id || fields.prompt_event_id || ""),
       reason: String(fields.reason || ""),
+      remote_command: fields.remote_command && typeof fields.remote_command === "object"
+        ? fields.remote_command
+        : fields.item?.remote_command && typeof fields.item.remote_command === "object"
+          ? fields.item.remote_command
+          : null,
       started_at_ms: startedAtMs,
       state: phase,
       awaiting_session_acceptance: awaitingSessionAcceptance,
@@ -27158,6 +27241,12 @@ function TerminalView({
             workspace_id: pendingItem.workspace_id || terminalWorkspace?.id || "",
           });
         }
+        emitTodoQueueMessageClientActionAck(
+          currentItem || pendingItem,
+          "failed",
+          "Timed out waiting for the terminal to accept the queued message.",
+          safeItemId,
+        );
         updateTodoQueueItems((currentItems) => (
           currentItems.map((item) => (
             item.id === safeItemId
@@ -27208,6 +27297,7 @@ function TerminalView({
       [safeItemId]: pendingItem,
     });
   }, [
+    emitTodoQueueMessageClientActionAck,
     recordTodoQueueRemoteCommandReceipt,
     replaceTodoQueuePendingItems,
     terminalWorkspace?.id,

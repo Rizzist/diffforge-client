@@ -203,12 +203,12 @@ const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOG_FILE: &str = "workspace-activation.jsonl";
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOG_FILE: &str = "voice-orchestrator.jsonl";
-const TERMINAL_STATUS_LOGGING_ENABLED: bool = false;
+const TERMINAL_STATUS_LOGGING_ENABLED: bool = cfg!(debug_assertions);
 const TERMINAL_STATUS_LOG_FILE: &str = "terminal-statuses.jsonl";
 /// Persist the cloud sync/connect loop into logs/cloud-sync.jsonl:
 /// every connection-state note, ws phase change, route resolution, open
 /// attempt (with durations), disconnect reason, and outbox depth.
-const CLOUD_SYNC_LOGGING_ENABLED: bool = false;
+const CLOUD_SYNC_LOGGING_ENABLED: bool = cfg!(debug_assertions);
 const CLOUD_SYNC_LOG_FILE: &str = "cloud-sync.jsonl";
 const TERMINAL_CRASH_FORENSICS_LOGGING_ENABLED: bool = false;
 const TERMINAL_CRASH_FORENSICS_LOG_FILE: &str = "terminal-crash-forensics.jsonl";
@@ -4338,20 +4338,14 @@ fn workspace_activation_descriptor_from_sources(
                 &["terminal_name", "display_name", "name"],
             )
         })
-        .or_else(|| {
-            thread.and_then(|value| {
-                workspace_activation_text(value, &["title", "session_name"])
-            })
-        })
         .or_else(|| Some(workspace_activation_agent_label(&role)));
     let terminal_nickname = terminal_record
         .and_then(|value| {
             workspace_activation_text(
                 value,
-                &["terminal_nickname", "nickname", "terminal_name", "display_name"],
+                &["terminal_nickname", "nickname"],
             )
-        })
-        .or_else(|| terminal_name.clone());
+        });
     WorkspaceActivationTerminalDescriptor {
         terminal_index: terminal_index.min(u16::MAX as usize) as u16,
         role,
@@ -5268,6 +5262,43 @@ mod workspace_activation_tests {
         );
         assert_eq!(descriptors[1].permission_mode.as_deref(), Some("ask"));
         assert_eq!(descriptors[1].terminal_name.as_deref(), Some("Review"));
+        assert_eq!(descriptors[1].terminal_nickname.as_deref(), Some("Reviewer"));
+    }
+
+    #[test]
+    fn descriptor_uses_agent_label_instead_of_derived_thread_title() {
+        let workspace = WorkspaceActivationWorkspace {
+            id: "workspace-name".to_string(),
+            name: "Workspace Name".to_string(),
+            root: "/repo".to_string(),
+            root_was_empty_at_selection: false,
+        };
+        let settings = json!({
+            "terminal_count": 1,
+            "terminal_roles": ["codex"]
+        });
+        let threads = json!({
+            "terminal_thread_ids": {
+                "0": "thread-zero"
+            },
+            "threads": {
+                "thread-zero": {
+                    "id": "thread-zero",
+                    "session_name": "Derived session name",
+                    "title": "Derived message title"
+                }
+            }
+        });
+
+        let descriptors = workspace_activation_terminal_descriptors_from_values(
+            &workspace,
+            Some(&settings),
+            &threads,
+        );
+
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].terminal_name.as_deref(), Some("Codex"));
+        assert_eq!(descriptors[0].terminal_nickname.as_deref(), None);
     }
 
     #[test]

@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   appControlMessageHasExplicitTerminalTarget,
+  appControlPreAcceptanceFailureDefersAck,
   buildAppControlPromptWithAttachmentMarkers,
   getLoopspaceAutomationAutoSpawnMaxTotal,
   isLoopspaceAutomationAppControlMessage,
@@ -25,6 +26,33 @@ test("message intent uses explicit action_kind before legacy command aliases", (
   assert.equal(remoteCommandIsMessageIntent({
     command_kind: "todo_queue",
   }), false);
+});
+
+test("pre-acceptance retry failure defers failed ack until terminal outcome", () => {
+  const clientActionId = "client-action-1";
+  const emitted = [];
+  const seenClientActionIds = new Set();
+  const emitAck = (result) => {
+    if (seenClientActionIds.has(clientActionId)) {
+      return;
+    }
+    seenClientActionIds.add(clientActionId);
+    emitted.push(result);
+  };
+
+  const recoveryScheduled = true;
+  if (!appControlPreAcceptanceFailureDefersAck({
+    failed: true,
+    recoveryScheduled,
+    terminalAccepted: false,
+  })) {
+    emitAck("failed");
+  }
+
+  emitAck("applied");
+  emitAck("applied");
+
+  assert.deepEqual(emitted, ["applied"]);
 });
 
 test("loopspace automation detection reads runtime fields and event payload aliases", () => {

@@ -530,13 +530,16 @@ test("device switcher uses next registered device payload as the stable inventor
     },
   });
 
-  assert.equal(options.length, 2);
-  assert.deepEqual(options.map((option) => option.device_name), [
+  assert.equal(options.length, 3);
+  assert.equal(options[0].device_id, "unmatched-local-profile");
+  assert.equal(options[0].device_name, "This device");
+  assert.equal(options[0].is_local, true);
+  assert.deepEqual(options.slice(1).map((option) => option.device_name), [
     "Syed's MacBook Air",
     "Samsung Galaxy S23 Ultra",
   ]);
   assert.ok(options.every((option) => option.device_id !== "web-current-browser"));
-  assert.ok(options.every((option) => option.device_name !== "This device"));
+  assert.ok(options.slice(1).every((option) => option.device_name !== "This device"));
   assert.equal(options.find((option) => option.device_id === "desktop-local")?.web_connected, false);
   assert.equal(options.find((option) => option.device_id === "android-phone")?.liveState, "offline");
 });
@@ -871,6 +874,45 @@ test("account devices rows mirror dashboard registry with live overlays", () => 
   assert.equal(phone?.liveState, "offline");
 });
 
+test("account devices rows include an unmatched local profile with registered inventory", () => {
+  const rows = buildAccountLiveDeviceRows({
+    deviceLiveState: {
+      account_device_live_state_snapshot: {
+        registered_devices: {
+          items: [
+            {
+              device_id: "studio-pc",
+              device_name: "Studio PC",
+              form_factor: "desktop",
+              native_connected: false,
+              platform: "windows",
+              registered: true,
+              status: "offline",
+              web_connected: false,
+            },
+          ],
+        },
+      },
+    },
+    localProfile: {
+      device_id: "native-local-device",
+      device_name: "Local Rig",
+      form_factor: "desktop",
+      platform: "macos",
+    },
+    maxRows: "all",
+  });
+
+  const local = rows.find((row) => row.device_id === "native-local-device");
+  const remote = rows.find((row) => row.device_id === "studio-pc");
+
+  assert.equal(rows[0].device_id, "native-local-device");
+  assert.equal(local?.is_local, true);
+  assert.equal(local?.device_kind, "desktop");
+  assert.equal(local?.serverSeen, false);
+  assert.equal(remote?.registered, true);
+});
+
 test("device switcher treats false server surface flags as offline despite generic connected", () => {
   const options = buildTodoQueueDeviceWorkspaceOptions({
     deviceLiveState: {
@@ -895,7 +937,7 @@ test("device switcher treats false server surface flags as offline despite gener
   assert.equal(options[0].web_connected, false);
 });
 
-test("device switcher does not invent local device rows when server roster is present", () => {
+test("device switcher does not invent local device rows without a local profile when server roster is present", () => {
   const options = buildTodoQueueDeviceWorkspaceOptions({
     currentWorkspaceId: "ws-local",
     deviceLiveState: {
@@ -907,16 +949,100 @@ test("device switcher does not invent local device rows when server roster is pr
         },
       ],
     },
-    localProfile: {
-      device_id: "desktop-local",
-      device_name: "Local Rig",
-      form_factor: "desktop",
-    },
+    localProfile: null,
   });
 
   assert.equal(options.length, 1);
   assert.equal(options[0].device_id, "server-remote");
   assert.equal(options[0].is_local, false);
+});
+
+test("device switcher keeps an unmatched local profile editable despite local mirror rows", () => {
+  const currentWorkspaceId = "ws-local";
+  const workspaceTodos = {
+    source: "local_todo_mirror",
+    dispatches_by_workspace: [{
+      workspace_id: currentWorkspaceId,
+      workspace_name: "Main repo",
+      items: [{
+        mirror_row_kind: "dispatch",
+        status: "pending",
+        target: {
+          device_id: "stale-server-device",
+          workspace_id: currentWorkspaceId,
+        },
+        target_device_id: "stale-server-device",
+        target_workspace_id: currentWorkspaceId,
+        text: "Stale mirror recipient",
+        todo_id: "mirror-1",
+      }],
+    }],
+  };
+  const options = buildTodoQueueDeviceWorkspaceOptions({
+    currentWorkspaceId,
+    currentWorkspaceName: "Main repo",
+    localProfile: {
+      device_id: "native-local-device",
+      device_name: "Local Rig",
+      form_factor: "desktop",
+      platform: "macos",
+    },
+    workspace_todos: workspaceTodos,
+  });
+
+  assert.equal(options[0].device_id, "native-local-device");
+  assert.equal(options[0].is_local, true);
+  assert.equal(options[0].workspace_id, currentWorkspaceId);
+  assert.equal(options[0].workspace_name, "Main repo");
+  assert.equal(options[0].isCurrentWorkspace, true);
+  assert.equal(todoQueueDeviceSelectionIsLocalEditable(options[0], currentWorkspaceId), true);
+  assert.ok(options.some((option) => (
+    option.device_id === "stale-server-device"
+      && option.is_local === false
+  )));
+
+  const displayed = buildTodoQueueDisplayedSelectionArrays({
+    editable: todoQueueDeviceSelectionIsLocalEditable(options[0], currentWorkspaceId),
+    items: [{ id: "own-native-todo", text: "Native own todo" }],
+    selection: options[0],
+    workspace_todos: workspaceTodos,
+  });
+
+  assert.deepEqual(displayed.items, [{ id: "own-native-todo", text: "Native own todo" }]);
+  assert.deepEqual(displayed.peerItems, []);
+});
+
+test("device switcher preserves mirror selection behavior without a local profile", () => {
+  const currentWorkspaceId = "ws-local";
+  const options = buildTodoQueueDeviceWorkspaceOptions({
+    currentWorkspaceId,
+    currentWorkspaceName: "Main repo",
+    localProfile: null,
+    workspace_todos: {
+      source: "local_todo_mirror",
+      dispatches_by_workspace: [{
+        workspace_id: currentWorkspaceId,
+        workspace_name: "Main repo",
+        items: [{
+          mirror_row_kind: "dispatch",
+          status: "pending",
+          target: {
+            device_id: "stale-server-device",
+            workspace_id: currentWorkspaceId,
+          },
+          target_device_id: "stale-server-device",
+          target_workspace_id: currentWorkspaceId,
+          text: "Stale mirror recipient",
+          todo_id: "mirror-1",
+        }],
+      }],
+    },
+  });
+
+  assert.equal(options.length, 1);
+  assert.equal(options[0].device_id, "stale-server-device");
+  assert.equal(options[0].is_local, false);
+  assert.equal(todoQueueDeviceSelectionIsLocalEditable(options[0], currentWorkspaceId), false);
 });
 
 test("mobile devices are selectable as devices without workspace todo views", () => {

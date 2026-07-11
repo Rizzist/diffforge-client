@@ -1132,7 +1132,7 @@ function pruneToRegisteredDeviceRows(devicesById, workspacesByDevice) {
     return;
   }
   for (const [deviceId, device] of Array.from(devicesById.entries())) {
-    if (device?.registered) {
+    if (device?.registered || device?.is_local) {
       continue;
     }
     const targetEntry = registeredEntries.find(([registeredId, registeredDevice]) => (
@@ -1335,6 +1335,8 @@ export function buildAccountLiveDeviceRows({
         is_local: true,
         serverSeen: Boolean(serverDevice.serverSeen || mergedLocalDevice.serverSeen),
       });
+    } else {
+      upsertDevice(devicesById, localDevice);
     }
   }
 
@@ -1523,13 +1525,13 @@ export function buildTodoQueueDeviceWorkspaceOptions({
     (Array.isArray(knownDevices) && knownDevices.length)
       || (Array.isArray(connectedDevices) && connectedDevices.length)
       || (deviceLiveState && typeof deviceLiveState === "object")
-      || (workspaceTodos && typeof workspaceTodos === "object")
   );
 
-  const localDevice = normalizeDeviceRecord(localProfile || {}, 0, {
+  const normalizedLocalProfile = normalizeDeviceRecord(localProfile || {}, 0, {
     is_local: true,
     kind: TODO_QUEUE_DEVICE_KIND_DESKTOP,
-  }) || {
+  });
+  const localDevice = normalizedLocalProfile || {
     connected: null,
     device_aliases: ["local-device"],
     device_id: "local-device",
@@ -1547,6 +1549,32 @@ export function buildTodoQueueDeviceWorkspaceOptions({
     safeCurrentWorkspaceId,
     localDevice.platform_label,
   );
+  const bindCurrentWorkspaceToLocalDevice = (deviceId, device = {}) => {
+    const safeDeviceId = normalizeTodoQueueSwitcherId(deviceId);
+    if (!safeDeviceId || !safeCurrentWorkspaceId) {
+      return;
+    }
+    const workspaceKey = `${safeDeviceId}::${currentWorkspaceMatchId}`;
+    const currentWorkspace = workspacesByDevice.get(workspaceKey);
+    if (currentWorkspace) {
+      workspacesByDevice.set(workspaceKey, {
+        ...currentWorkspace,
+        isCurrentWorkspace: true,
+        is_local: true,
+      });
+      return;
+    }
+    addWorkspace(workspacesByDevice, {
+      device_id: safeDeviceId,
+      device_kind: TODO_QUEUE_DEVICE_KIND_DESKTOP,
+      device_name: device.device_name || localDevice.device_name,
+      isCurrentWorkspace: true,
+      is_local: true,
+      platform_label: device.platform_label || localDevice.platform_label,
+      workspace_id: safeCurrentWorkspaceId,
+      workspace_name: safeCurrentWorkspaceName,
+    });
+  };
 
   const addCanonicalWorkspace = (entry) => {
     const canonicalDeviceId = canonicalDeviceIdFor(devicesById, entry);
@@ -1603,42 +1631,10 @@ export function buildTodoQueueDeviceWorkspaceOptions({
       is_local: true,
       serverSeen: Boolean(serverDevice.serverSeen || mergedLocalDevice.serverSeen),
     });
-    if (safeCurrentWorkspaceId) {
-      const workspaceKey = `${localCanonicalDeviceId}::${currentWorkspaceMatchId}`;
-      const currentWorkspace = workspacesByDevice.get(workspaceKey);
-      if (currentWorkspace) {
-        workspacesByDevice.set(workspaceKey, {
-          ...currentWorkspace,
-          isCurrentWorkspace: true,
-          is_local: true,
-        });
-      } else {
-        addWorkspace(workspacesByDevice, {
-          device_id: localCanonicalDeviceId,
-          device_kind: TODO_QUEUE_DEVICE_KIND_DESKTOP,
-          device_name: mergedLocalDevice.device_name || localDevice.device_name,
-          isCurrentWorkspace: true,
-          is_local: true,
-          platform_label: mergedLocalDevice.platform_label || localDevice.platform_label,
-          workspace_id: safeCurrentWorkspaceId,
-          workspace_name: safeCurrentWorkspaceName,
-        });
-      }
-    }
-  } else if (!serverSourceAvailable && serverBackedDeviceCount === 0) {
+    bindCurrentWorkspaceToLocalDevice(localCanonicalDeviceId, mergedLocalDevice);
+  } else if (normalizedLocalProfile || (!serverSourceAvailable && serverBackedDeviceCount === 0)) {
     const fallbackDeviceId = upsertDevice(devicesById, localDevice);
-    if (fallbackDeviceId && safeCurrentWorkspaceId) {
-      addWorkspace(workspacesByDevice, {
-        device_id: fallbackDeviceId,
-        device_kind: TODO_QUEUE_DEVICE_KIND_DESKTOP,
-        device_name: localDevice.device_name,
-        isCurrentWorkspace: true,
-        is_local: true,
-        platform_label: localDevice.platform_label,
-        workspace_id: safeCurrentWorkspaceId,
-        workspace_name: safeCurrentWorkspaceName,
-      });
-    }
+    bindCurrentWorkspaceToLocalDevice(fallbackDeviceId, devicesById.get(fallbackDeviceId) || localDevice);
   }
 
   foldWebOnlyDeviceRows(devicesById, workspacesByDevice);

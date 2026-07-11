@@ -188,6 +188,8 @@ if [[ -d "$legacy_conflicting_app_path" ]]; then
   rm -rf "$legacy_conflicting_app_path"
 fi
 
+DIFFFORGE_CLOUD_SYNC_LOG="${DIFFFORGE_CLOUD_SYNC_LOG:-1}" \
+DIFFFORGE_TERMINAL_STATUS_LOG="${DIFFFORGE_TERMINAL_STATUS_LOG:-1}" \
 RUST_DIFFFORGE_DESKTOP_CALLBACK_SCHEME="$dev_deeplink_scheme" \
   APPLE_SIGNING_IDENTITY="$signing_identity" \
   npx tauri build --debug --bundles app --config src-tauri/tauri.dev.conf.json
@@ -212,6 +214,8 @@ if ! grep -Fq "com.apple.security.device.audio-input" <<<"$entitlements"; then
   exit 1
 fi
 
+DIFFFORGE_CLOUD_SYNC_LOG="${DIFFFORGE_CLOUD_SYNC_LOG:-1}" \
+DIFFFORGE_TERMINAL_STATUS_LOG="${DIFFFORGE_TERMINAL_STATUS_LOG:-1}" \
 open -n "$app_path"
 
 "$repo_root/scripts/prune-target-cache.sh" || true

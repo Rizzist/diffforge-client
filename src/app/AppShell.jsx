@@ -4241,9 +4241,11 @@ const TERMINAL_BLANK_STARTUP_CONFIRM_MS = 800;
 const WORKSPACE_CLOSE_NATIVE_EXIT_TIMEOUT_MS = 30000;
 const APP_CLOSE_TERMINAL_SNAPSHOT_TIMEOUT_MS = 5000;
 const WORKSPACE_DEACTIVATE_RUNTIME_TIMEOUT_MS = 30000;
+const WORKSPACE_ACTIVATION_COMMIT_TIMEOUT_MS = 30000;
 const WORKSPACE_SETTINGS_TERMINAL_CLEANUP_TIMEOUT_MS = 18000;
 const WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP = !TERMINAL_IS_WINDOWS_HOST;
 const WORKSPACE_SHARED_MCP_TIMEOUT_MS = 8000;
+const CLOUD_DESKTOP_DEVICE_PROFILE_RETRY_DELAYS_MS = [500, 1500, 5000, 15000, 30000];
 const WORKSPACE_MCP_SYNC_TOOL_NAME_LIMIT = 32;
 const WORKSPACE_MCP_SYNC_TEXT_LIMIT = 96;
 const WORKSPACE_MCP_BACKGROUND_JOB_EVENT = "workspace-mcp-background-job";
@@ -19128,11 +19130,13 @@ function remoteWorkspacePanelCountsRequest(value) {
       hasSupportedKeys: false,
       panel_counts: null,
       provided: false,
+      requestedGridPanelCount: 0,
       rejectedFields,
     };
   }
 
   const supportedInput = {};
+  let requestedGridPanelCount = 0;
   Object.entries(value).forEach(([key, fieldValue]) => {
     const canonicalKey = REMOTE_WORKSPACE_PANEL_COUNT_KEY_ALIASES[key];
     if (!canonicalKey) {
@@ -19144,6 +19148,12 @@ function remoteWorkspacePanelCountsRequest(value) {
       return;
     }
     supportedInput[canonicalKey] = fieldValue;
+    if (canonicalKey !== "document") {
+      const count = Number.parseInt(String(fieldValue), 10);
+      if (Number.isInteger(count) && count > 0) {
+        requestedGridPanelCount += count;
+      }
+    }
   });
 
   const hasSupportedKeys = Object.keys(supportedInput).length > 0;
@@ -19151,6 +19161,7 @@ function remoteWorkspacePanelCountsRequest(value) {
     hasSupportedKeys,
     panel_counts: hasSupportedKeys ? normalizeWorkspacePanelCountsInput(supportedInput) : null,
     provided: true,
+    requestedGridPanelCount,
     rejectedFields,
   };
 }
@@ -19326,14 +19337,17 @@ function remoteWorkspaceTerminalRolesRequest(value) {
   const rejectedFields = [];
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return {
+      capacityExceeded: false,
       hasValidRoleCount: false,
       provided: false,
       rejectedFields,
+      requestedCount: 0,
       roles: null,
     };
   }
 
   const roleCounts = new Map();
+  let requestedCount = 0;
   Object.entries(value).forEach(([key, fieldValue]) => {
     const roleId = REMOTE_WORKSPACE_TERMINAL_ROLE_COUNT_ALIASES[String(key || "").trim()];
     if (!roleId || !WORKSPACE_TERMINAL_ROLE_IDS.has(roleId)) {
@@ -19356,6 +19370,7 @@ function remoteWorkspaceTerminalRolesRequest(value) {
     }
 
     roleCounts.set(roleId, (roleCounts.get(roleId) || 0) + count);
+    requestedCount += count;
   });
 
   const roles = [];
@@ -19367,9 +19382,11 @@ function remoteWorkspaceTerminalRolesRequest(value) {
   });
 
   return {
+    capacityExceeded: requestedCount > MAX_WORKSPACE_TERMINAL_COUNT,
     hasValidRoleCount: roleCounts.size > 0,
     provided: true,
     rejectedFields,
+    requestedCount,
     roles,
   };
 }
@@ -22958,6 +22975,85 @@ function buildWorkspaceSettingsLayoutPatch({
   };
 }
 
+function buildWorkspaceSettingsRuntimeTeardownPlan({
+  agentPermissionsChanged = false,
+  currentLogicalIndexesByWorkspace,
+  currentWorkspaceSettings,
+  fallbackRole = WORKSPACE_TERMINAL_ROLE_GENERIC,
+  gitWorktreesChanged = false,
+  nextLogicalIndexesByWorkspace,
+  nextWorkspaceSettings,
+  roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS,
+  rootChanged = false,
+  workspaceId,
+}) {
+  const currentTerminalCount = getWorkspaceTerminalCount(currentWorkspaceSettings, workspaceId);
+  const currentTerminalRoles = getWorkspaceTerminalRoles(
+    currentWorkspaceSettings,
+    workspaceId,
+    currentTerminalCount,
+    fallbackRole,
+    roleOptions,
+  );
+  const currentTerminalIndexes = getWorkspaceLogicalTerminalIndexes(
+    currentLogicalIndexesByWorkspace,
+    workspaceId,
+    currentTerminalCount,
+  );
+  const currentPanelIndexSet = new Set(
+    workspacePaneKindsIndexes(getWorkspacePaneKinds(currentWorkspaceSettings, workspaceId)),
+  );
+  const settingsTerminalCurrentIndexes = currentTerminalIndexes.filter((terminalIndex) => (
+    !currentPanelIndexSet.has(terminalIndex)
+  ));
+  const currentTerminalRoleByIndex = new Map(currentTerminalIndexes.map((terminalIndex, index) => (
+    [terminalIndex, currentTerminalRoles[index] || fallbackRole]
+  )));
+  const nextTerminalCount = getWorkspaceTerminalCount(nextWorkspaceSettings, workspaceId);
+  const nextTerminalRoles = getWorkspaceTerminalRoles(
+    nextWorkspaceSettings,
+    workspaceId,
+    nextTerminalCount,
+    fallbackRole,
+    roleOptions,
+  );
+  const nextTerminalIndexes = getWorkspaceLogicalTerminalIndexes(
+    nextLogicalIndexesByWorkspace || currentLogicalIndexesByWorkspace,
+    workspaceId,
+    nextTerminalCount,
+  );
+  const nextPaneKinds = getWorkspacePaneKinds(nextWorkspaceSettings, workspaceId);
+  const nextPanelIndexSet = new Set(workspacePaneKindsIndexes(nextPaneKinds));
+  const nextTerminalIndexSet = new Set(nextTerminalIndexes);
+  const nextTerminalRoleByIndex = new Map(nextTerminalIndexes.map((terminalIndex, index) => (
+    [terminalIndex, nextTerminalRoles[index] || fallbackRole]
+  )));
+  const removedTerminalIndexes = settingsTerminalCurrentIndexes.filter((terminalIndex) => (
+    !nextTerminalIndexSet.has(terminalIndex)
+  ));
+  const roleChangedTerminalIndexes = settingsTerminalCurrentIndexes.filter((terminalIndex) => (
+    nextTerminalIndexSet.has(terminalIndex)
+    && currentTerminalRoleByIndex.get(terminalIndex) !== nextTerminalRoleByIndex.get(terminalIndex)
+  ));
+  const nextTerminalOnlyCount = nextTerminalIndexes.filter((terminalIndex) => (
+    !nextPanelIndexSet.has(terminalIndex)
+  )).length;
+
+  return {
+    agentPermissionsChanged,
+    currentPanelIndexSet,
+    currentTerminalCount,
+    currentTerminalIndexes,
+    currentTerminalRoles,
+    gitWorktreesChanged,
+    nextTerminalCount: nextTerminalOnlyCount,
+    removedTerminalIndexes,
+    roleChangedTerminalIndexes,
+    rootChanged,
+    settingsTerminalCurrentIndexes,
+  };
+}
+
 function getWorkspaceLogicalTerminalIndexes(workspaceTerminalLogicalIndexes, workspaceId, terminalCount) {
   if (Object.prototype.hasOwnProperty.call(workspaceTerminalLogicalIndexes || {}, workspaceId)) {
     const configuredIndexes = workspaceTerminalLogicalIndexes[workspaceId];
@@ -23874,6 +23970,8 @@ export default function App() {
   const workspaceLifecycleSettingsRef = useRef(workspaceLifecycleSettings);
   const workspaceAgentLaunchKeyRef = useRef("");
   const workspaceActivationSequenceRef = useRef(0);
+  const workspaceActivationWaitersRef = useRef(new Map());
+  const workspaceActivationWaiterSequenceRef = useRef(0);
   const workspaceActivationStartedAtRef = useRef(new Map());
   const workspaceActivationStateLogKeyRef = useRef("");
   const workspaceRuntimeSelectionLogKeyRef = useRef("");
@@ -24365,14 +24463,76 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
-    invoke("cloud_mcp_get_desktop_device_profile").then((profile) => {
-      if (cancelled || !profile || typeof profile !== "object") {
+    let retryTimer = 0;
+    let retryAttempt = 0;
+
+    const clearRetryTimer = () => {
+      if (retryTimer && typeof window !== "undefined") {
+        window.clearTimeout(retryTimer);
+      }
+      retryTimer = 0;
+    };
+
+    const scheduleRetry = () => {
+      if (cancelled || typeof window === "undefined") {
         return;
       }
-      setCloudDesktopDeviceProfile(profile);
-    }).catch(() => {});
+      clearRetryTimer();
+      const delayMs = CLOUD_DESKTOP_DEVICE_PROFILE_RETRY_DELAYS_MS[
+        Math.min(retryAttempt, CLOUD_DESKTOP_DEVICE_PROFILE_RETRY_DELAYS_MS.length - 1)
+      ];
+      retryTimer = window.setTimeout(() => {
+        retryTimer = 0;
+        void fetchDesktopDeviceProfile();
+      }, delayMs);
+      retryAttempt += 1;
+    };
+
+    const fetchDesktopDeviceProfile = async () => {
+      clearRetryTimer();
+      try {
+        const profile = await invoke("cloud_mcp_get_desktop_device_profile");
+        if (cancelled) {
+          return;
+        }
+        if (!profile || typeof profile !== "object") {
+          scheduleRetry();
+          return;
+        }
+        retryAttempt = 0;
+        setCloudDesktopDeviceProfile(profile);
+      } catch {
+        scheduleRetry();
+      }
+    };
+
+    const refetchOnForeground = () => {
+      if (cancelled) {
+        return;
+      }
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        return;
+      }
+      retryAttempt = 0;
+      void fetchDesktopDeviceProfile();
+    };
+
+    void fetchDesktopDeviceProfile();
+    if (typeof window !== "undefined") {
+      window.addEventListener("focus", refetchOnForeground);
+    }
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", refetchOnForeground);
+    }
     return () => {
       cancelled = true;
+      clearRetryTimer();
+      if (typeof window !== "undefined") {
+        window.removeEventListener("focus", refetchOnForeground);
+      }
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", refetchOnForeground);
+      }
     };
   }, []);
 
@@ -26515,9 +26675,51 @@ export default function App() {
     workspaceGraphStateRef.current = workspaceGraphState;
   }, [workspaceGraphState]);
 
+  const workspaceActivationCommitted = useCallback((workspaceId) => {
+    const safeWorkspaceId = String(workspaceId || "").trim();
+    if (!safeWorkspaceId || activatedWorkspaceIdRef.current !== safeWorkspaceId) {
+      return false;
+    }
+    return normalizeEnabledWorkspaceIds(
+      workspaceLifecycleSettingsRef.current?.enabled_workspace_ids,
+    ).includes(safeWorkspaceId);
+  }, []);
+
+  const settleWorkspaceActivationWaiters = useCallback((reason = "workspace_activation_committed") => {
+    workspaceActivationWaitersRef.current.forEach((waiter, waiterId) => {
+      const workspaceId = String(waiter?.workspace_id || "").trim();
+      if (!workspaceActivationCommitted(workspaceId)) {
+        return;
+      }
+      workspaceActivationWaitersRef.current.delete(waiterId);
+      waiter.finish(null, {
+        reason,
+        workspace_id: workspaceId,
+      });
+    });
+  }, [workspaceActivationCommitted]);
+
+  const rejectWorkspaceActivationWaiters = useCallback((workspaceId, message, details = {}) => {
+    const safeWorkspaceId = String(workspaceId || "").trim();
+    if (!safeWorkspaceId) {
+      return;
+    }
+    workspaceActivationWaitersRef.current.forEach((waiter, waiterId) => {
+      if (String(waiter?.workspace_id || "").trim() !== safeWorkspaceId) {
+        return;
+      }
+      workspaceActivationWaitersRef.current.delete(waiterId);
+      waiter.finish(new Error(message || "Workspace activation did not complete."), {
+        ...details,
+        workspace_id: safeWorkspaceId,
+      });
+    });
+  }, []);
+
   useEffect(() => {
     activatedWorkspaceIdRef.current = activatedWorkspaceId;
-  }, [activatedWorkspaceId]);
+    settleWorkspaceActivationWaiters("activated_workspace_state");
+  }, [activatedWorkspaceId, settleWorkspaceActivationWaiters]);
 
   useEffect(() => {
     workspacePendingActivationIdRef.current = workspacePendingActivationId;
@@ -27307,7 +27509,8 @@ export default function App() {
 
   useEffect(() => {
     workspaceLifecycleSettingsRef.current = workspaceLifecycleSettings;
-  }, [workspaceLifecycleSettings]);
+    settleWorkspaceActivationWaiters("workspace_lifecycle_settings_state");
+  }, [settleWorkspaceActivationWaiters, workspaceLifecycleSettings]);
 
   // Layout effect so the html[data-forge-space] flip commits in the same frame
   // as the React render that changed spaceMode — a plain effect repaints the
@@ -28998,6 +29201,10 @@ export default function App() {
       window.clearTimeout(workspaceAgentBatchRetryTimerRef.current);
       workspaceAgentBatchRetryTimerRef.current = 0;
     }
+    workspaceActivationWaitersRef.current.forEach((waiter) => {
+      waiter.finish(new Error("Workspace activation wait was cancelled because the app shell unmounted."));
+    });
+    workspaceActivationWaitersRef.current.clear();
   }, [finishWorkspaceRailAnimation]);
 
   const clearPreparedWorkspaceTerminals = useCallback((workspaceId) => {
@@ -29020,6 +29227,126 @@ export default function App() {
 
     return clearedCount;
   }, []);
+
+  const applyWorkspaceSettingsRuntimeTeardown = useCallback(async ({
+    agentPermissionsChanged = false,
+    currentPanelIndexSet = new Set(),
+    currentTerminalCount = 0,
+    currentTerminalIndexes = [],
+    currentTerminalRoles = [],
+    gitWorktreesChanged = false,
+    nextAgentSessionMode = AGENT_SESSION_MODE_COORDINATED,
+    nextMcpRepoPath = "",
+    nextTerminalCount = 0,
+    previousMcpRepoPath = "",
+    removedTerminalIndexes = [],
+    roleChangedTerminalIndexes = [],
+    rootChanged = false,
+    settingsTerminalCurrentIndexes = [],
+    workspaceId = "",
+  } = {}) => {
+    if (!workspaceId) {
+      return;
+    }
+
+    const terminalIndexesToClose = (rootChanged || gitWorktreesChanged || agentPermissionsChanged
+      ? settingsTerminalCurrentIndexes
+      : Array.from(new Set([
+        ...removedTerminalIndexes,
+        ...roleChangedTerminalIndexes,
+      ])))
+      // Panel panes have no PTY/agent; never close them as terminals.
+      .filter((terminalIndex) => !currentPanelIndexSet.has(terminalIndex));
+
+    if (rootChanged || gitWorktreesChanged || agentPermissionsChanged) {
+      clearPreparedWorkspaceTerminals(workspaceId);
+      workspaceAgentLaunchKeyRef.current = "";
+      workspaceAgentBatchInFlightKeyRef.current = "";
+      workspaceAgentBatchStartedSessionKeysRef.current.clear();
+      workspaceAgentBatchInFlightSessionKeysRef.current.clear();
+      setWorkspaceAgentBatchSentLaunchKey("");
+
+      const cleanupResults = await withTimeout(
+        Promise.all(terminalIndexesToClose.map((terminalIndex) => {
+          const previousIndex = currentTerminalIndexes.indexOf(terminalIndex);
+
+          return closeWorkspaceTerminalPane({
+            agent_id: getWorkspaceTerminalPaneAgentId(currentTerminalRoles[previousIndex] || activeAgent),
+            nextTerminalCount,
+            previousTerminalCount: currentTerminalCount,
+            reason: rootChanged
+              ? "settings_root_change"
+              : gitWorktreesChanged
+                ? "settings_worktree_policy_change"
+                : "settings_permission_change",
+            terminal_index: terminalIndex,
+            wait_for_cleanup: WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP,
+            workspace_id: workspaceId,
+          });
+        })),
+        WORKSPACE_SETTINGS_TERMINAL_CLEANUP_TIMEOUT_MS,
+        "Terminal cleanup timed out.",
+      );
+      const failedCleanup = cleanupResults.filter((result) => !result?.closed);
+
+      if (failedCleanup.length) {
+        throw new Error(failedCleanup[0]?.error || "Unable to close workspace terminals.");
+      }
+
+      if (previousMcpRepoPath && previousMcpRepoPath !== nextMcpRepoPath) {
+        await withTimeout(
+          invoke("coordination_deactivate_shared_mcp_daemon", {
+            repo_path: previousMcpRepoPath,
+            reason: "workspace_root_change",
+          }),
+          WORKSPACE_SHARED_MCP_TIMEOUT_MS,
+          "Shared MCP cleanup timed out.",
+        );
+        const previousRuntimeKey = workspaceRuntimeActivationKey(workspaceId, previousMcpRepoPath);
+        if (previousRuntimeKey) {
+          sharedMcpActiveRuntimeTargetsRef.current.delete(previousRuntimeKey);
+        }
+      }
+    } else if (terminalIndexesToClose.length) {
+      const cleanupResults = await withTimeout(
+        Promise.all(terminalIndexesToClose.map((terminalIndex) => {
+          const previousIndex = currentTerminalIndexes.indexOf(terminalIndex);
+
+          return closeWorkspaceTerminalPane({
+            agent_id: getWorkspaceTerminalPaneAgentId(currentTerminalRoles[previousIndex] || activeAgent),
+            nextTerminalCount,
+            previousTerminalCount: currentTerminalCount,
+            reason: removedTerminalIndexes.includes(terminalIndex) ? "settings_save" : "settings_role_change",
+            terminal_index: terminalIndex,
+            // Windows ConPTY teardown can outlive the settings transaction. The backend
+            // removes the pane immediately, then finishes process cleanup in the background.
+            wait_for_cleanup: WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP,
+            workspace_id: workspaceId,
+          });
+        })),
+        WORKSPACE_SETTINGS_TERMINAL_CLEANUP_TIMEOUT_MS,
+        "Terminal cleanup timed out.",
+      );
+      const failedCleanup = cleanupResults.filter((result) => !result?.closed);
+
+      if (failedCleanup.length) {
+        throw new Error(failedCleanup[0]?.error || "Unable to close workspace terminals.");
+      }
+    }
+
+    if (nextMcpRepoPath && (rootChanged || gitWorktreesChanged)) {
+      await invoke("coordination_update_repo_policy", {
+        repo_path: nextMcpRepoPath,
+        input: {
+          agent_session_mode: nextAgentSessionMode,
+        },
+      });
+    }
+  }, [
+    activeAgent,
+    clearPreparedWorkspaceTerminals,
+    setWorkspaceAgentBatchSentLaunchKey,
+  ]);
 
   const updateWorkspaceLifecycleSettings = useCallback((nextValues) => {
     setWorkspaceLifecycleSettings((settings) => {
@@ -29137,6 +29464,11 @@ export default function App() {
         hasTimeout: Boolean(pending.timeout),
         token: pending.token,
       });
+      rejectWorkspaceActivationWaiters(
+        pending.workspace_id,
+        "Workspace activation was cancelled before it committed.",
+        { reason: "deferred_activation_cancelled" },
+      );
     }
 
     if (pending.frame) {
@@ -29160,7 +29492,7 @@ export default function App() {
       token: pending.token,
       workspace_id: "",
     };
-  }, [logWorkspaceActivationTrace]);
+  }, [logWorkspaceActivationTrace, rejectWorkspaceActivationWaiters]);
 
   const activateWorkspace = useCallback((workspaceId, source = "manual", trace = null) => {
     const workspace = findWorkspaceById(workspaces, workspaceId);
@@ -29682,6 +30014,15 @@ export default function App() {
         transitionKind,
         workspace_name: workspace.name || "",
       };
+      if (activatedWorkspaceIdRef.current !== workspace.id) {
+        activatedWorkspaceIdRef.current = workspace.id;
+        setActivatedWorkspaceId(workspace.id);
+        workspaceAgentLaunchKeyRef.current = "";
+        workspaceAgentBatchInFlightKeyRef.current = "";
+        workspaceAgentBatchStartedSessionKeysRef.current.clear();
+        workspaceAgentBatchInFlightSessionKeysRef.current.clear();
+        setWorkspaceAgentBatchSentLaunchKey("");
+      }
       if (transitionKind === "switch_active_runtime") {
         scheduleWorkspaceActiveSwitchAfterPaint(workspace.id, source, trace, activeSwitchFields);
         return true;
@@ -29712,8 +30053,83 @@ export default function App() {
     logWorkspaceActivationTrace,
     scheduleWorkspaceActivationAfterPaint,
     scheduleWorkspaceActiveSwitchAfterPaint,
+    setWorkspaceAgentBatchSentLaunchKey,
     showView,
     workspaces,
+  ]);
+
+  const ensureWorkspaceActivated = useCallback((workspaceId, options = {}) => {
+    const safeWorkspaceId = String(workspaceId || "").trim();
+    const source = String(options.source || "remote_control").trim() || "remote_control";
+    const timeoutMs = Math.max(
+      1,
+      Number(options.timeout_ms || options.timeoutMs || WORKSPACE_ACTIVATION_COMMIT_TIMEOUT_MS) || WORKSPACE_ACTIVATION_COMMIT_TIMEOUT_MS,
+    );
+    if (!safeWorkspaceId) {
+      return Promise.reject(new Error("Workspace id is required."));
+    }
+    if (!findWorkspaceById(workspacesRef.current, safeWorkspaceId)) {
+      return Promise.reject(new Error("Workspace is not available on this desktop."));
+    }
+    if (workspaceActivationCommitted(safeWorkspaceId)) {
+      return Promise.resolve({
+        already_active: true,
+        workspace_id: safeWorkspaceId,
+      });
+    }
+    const requested = requestWorkspaceActivation(safeWorkspaceId, source);
+    if (!requested) {
+      return Promise.reject(new Error("Workspace activation could not be scheduled on this desktop."));
+    }
+    if (workspaceActivationCommitted(safeWorkspaceId)) {
+      return Promise.resolve({
+        already_active: false,
+        workspace_id: safeWorkspaceId,
+      });
+    }
+    const waiterId = `workspace-activation-${workspaceActivationWaiterSequenceRef.current += 1}`;
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = window.setTimeout(() => {
+        const waiter = workspaceActivationWaitersRef.current.get(waiterId);
+        if (!waiter) {
+          return;
+        }
+        workspaceActivationWaitersRef.current.delete(waiterId);
+        waiter.finish(new Error("Timed out waiting for workspace activation to commit."), {
+          reason: "workspace_activation_timeout",
+          timeout_ms: timeoutMs,
+        });
+      }, timeoutMs);
+      const finish = (error, result = {}) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        window.clearTimeout(timer);
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve({
+          already_active: false,
+          ...(result || {}),
+          workspace_id: safeWorkspaceId,
+        });
+      };
+      workspaceActivationWaitersRef.current.set(waiterId, {
+        finish,
+        source,
+        started_at_ms: Date.now(),
+        timeout_ms: timeoutMs,
+        workspace_id: safeWorkspaceId,
+      });
+      settleWorkspaceActivationWaiters("workspace_activation_wait_registered");
+    });
+  }, [
+    requestWorkspaceActivation,
+    settleWorkspaceActivationWaiters,
+    workspaceActivationCommitted,
   ]);
 
   // Selecting an unactivated workspace reveals its settings surface, but only
@@ -32327,114 +32743,25 @@ export default function App() {
         nextTerminalIndexSet.has(terminalIndex)
         && currentTerminalRoleByIndex.get(terminalIndex) !== nextTerminalRoleByIndex.get(terminalIndex)
       ));
-      const terminalIndexesToClose = (rootChanged || gitWorktreesChanged || agentPermissionsChanged
-        ? settingsTerminalCurrentIndexes
-        : Array.from(new Set([
-          ...removedTerminalIndexes,
-          ...roleChangedTerminalIndexes,
-        ])))
-        // Panel panes have no PTY/agent; never close them as terminals.
-        .filter((terminalIndex) => !currentPanelIndexSet.has(terminalIndex));
       let nextWorkspace = selectedWorkspace;
 
-
-      if (rootChanged || gitWorktreesChanged || agentPermissionsChanged) {
-        clearPreparedWorkspaceTerminals(selectedWorkspace.id);
-        workspaceAgentLaunchKeyRef.current = "";
-        workspaceAgentBatchInFlightKeyRef.current = "";
-        workspaceAgentBatchStartedSessionKeysRef.current.clear();
-        workspaceAgentBatchInFlightSessionKeysRef.current.clear();
-        setWorkspaceAgentBatchSentLaunchKey("");
-
-        const cleanupStartedAt = performance.now();
-
-
-        const cleanupResults = await withTimeout(
-          Promise.all(terminalIndexesToClose.map((terminalIndex) => {
-            const previousIndex = currentTerminalIndexes.indexOf(terminalIndex);
-
-            return closeWorkspaceTerminalPane({
-              agent_id: getWorkspaceTerminalPaneAgentId(currentTerminalRoles[previousIndex] || activeAgent),
-              nextTerminalCount: terminalCount,
-              previousTerminalCount: currentTerminalCount,
-              reason: rootChanged
-                ? "settings_root_change"
-                : gitWorktreesChanged
-                  ? "settings_worktree_policy_change"
-                  : "settings_permission_change",
-              terminal_index: terminalIndex,
-              wait_for_cleanup: WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP,
-              workspace_id: selectedWorkspace.id,
-            });
-          })),
-          WORKSPACE_SETTINGS_TERMINAL_CLEANUP_TIMEOUT_MS,
-          "Terminal cleanup timed out.",
-        );
-        const failedCleanup = cleanupResults.filter((result) => !result?.closed);
-
-
-        if (failedCleanup.length) {
-          throw new Error(failedCleanup[0]?.error || "Unable to close workspace terminals.");
-        }
-
-        if (previousMcpRepoPath && previousMcpRepoPath !== nextMcpRepoPath) {
-          const mcpCleanupStartedAt = performance.now();
-
-
-          const mcpCleanupResult = await withTimeout(
-            invoke("coordination_deactivate_shared_mcp_daemon", {
-              repo_path: previousMcpRepoPath,
-              reason: "workspace_root_change",
-            }),
-            WORKSPACE_SHARED_MCP_TIMEOUT_MS,
-            "Shared MCP cleanup timed out.",
-          );
-          const mcpCleanupData = mcpCleanupResult?.data || mcpCleanupResult || {};
-          const previousRuntimeKey = workspaceRuntimeActivationKey(selectedWorkspace.id, previousMcpRepoPath);
-          if (previousRuntimeKey) {
-            sharedMcpActiveRuntimeTargetsRef.current.delete(previousRuntimeKey);
-          }
-
-        }
-      } else if (terminalIndexesToClose.length) {
-        const cleanupStartedAt = performance.now();
-
-
-        const cleanupResults = await withTimeout(
-          Promise.all(terminalIndexesToClose.map((terminalIndex) => {
-            const previousIndex = currentTerminalIndexes.indexOf(terminalIndex);
-
-            return closeWorkspaceTerminalPane({
-              agent_id: getWorkspaceTerminalPaneAgentId(currentTerminalRoles[previousIndex] || activeAgent),
-              nextTerminalCount: terminalCount,
-              previousTerminalCount: currentTerminalCount,
-              reason: removedTerminalIndexes.includes(terminalIndex) ? "settings_save" : "settings_role_change",
-              terminal_index: terminalIndex,
-              // Windows ConPTY teardown can outlive the settings transaction. The backend
-              // removes the pane immediately, then finishes process cleanup in the background.
-              wait_for_cleanup: WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP,
-              workspace_id: selectedWorkspace.id,
-            });
-          })),
-          WORKSPACE_SETTINGS_TERMINAL_CLEANUP_TIMEOUT_MS,
-          "Terminal cleanup timed out.",
-        );
-        const failedCleanup = cleanupResults.filter((result) => !result?.closed);
-
-
-        if (failedCleanup.length) {
-          throw new Error(failedCleanup[0]?.error || "Unable to close workspace terminals.");
-        }
-      }
-
-      if (nextMcpRepoPath && (rootChanged || gitWorktreesChanged)) {
-        await invoke("coordination_update_repo_policy", {
-          repo_path: nextMcpRepoPath,
-          input: {
-            agent_session_mode: agentSessionMode,
-          },
-        });
-      }
+      await applyWorkspaceSettingsRuntimeTeardown({
+        agentPermissionsChanged,
+        currentPanelIndexSet,
+        currentTerminalCount,
+        currentTerminalIndexes,
+        currentTerminalRoles,
+        gitWorktreesChanged,
+        nextAgentSessionMode: agentSessionMode,
+        nextMcpRepoPath,
+        nextTerminalCount: terminalCount,
+        previousMcpRepoPath,
+        removedTerminalIndexes,
+        roleChangedTerminalIndexes,
+        rootChanged,
+        settingsTerminalCurrentIndexes,
+        workspaceId: selectedWorkspace.id,
+      });
 
       const catalogRootDirectory = cleanWorkspaceRootDirectory(selectedWorkspace.root_directory || "");
       const catalogRootIdentity = selectedWorkspace.root_identity || getWorkspaceRootIdentity(catalogRootDirectory);
@@ -32549,13 +32876,11 @@ export default function App() {
     workspaceTerminalRolesDraft,
     workspaceSettings,
     workspaceTerminalLogicalIndexes,
-    activeAgent,
     defaultWorkingDirectory,
     workspaceTerminalFallbackRole,
     workspaceTerminalRoleOptions,
-    clearPreparedWorkspaceTerminals,
+    applyWorkspaceSettingsRuntimeTeardown,
     closeWorkspaceSettings,
-    setWorkspaceAgentBatchSentLaunchKey,
   ]);
 
   const closeWorkspaceTerminal = useCallback(({ thread_id: threadId, workspace_id: workspaceId, terminal_index: terminalIndex }) => {
@@ -42445,9 +42770,12 @@ export default function App() {
         if (shouldShowWindow) {
           void invoke("app_exit_background").catch(() => {});
         }
-        const activated = requestWorkspaceActivation(workspaceId, "remote_control_activate");
-        if (!activated) {
-          await recordRemoteCommandStatus(event, "blocked", "Workspace could not be activated on this desktop.", {
+        try {
+          await ensureWorkspaceActivated(workspaceId, {
+            source: "remote_control_activate",
+          });
+        } catch (error) {
+          await recordRemoteCommandStatus(event, "blocked", getErrorMessage(error, "Workspace could not be activated on this desktop."), {
             command_id: commandId,
             command_kind: commandKind,
             workspace_id: workspaceId,
@@ -42642,8 +42970,6 @@ export default function App() {
           });
           return;
         }
-        const runtimeActive = normalizeEnabledWorkspaceIds(workspaceLifecycleSettingsRef.current?.enabled_workspace_ids).includes(workspaceId)
-          || activatedWorkspaceIdRef.current === workspaceId;
         if (requestedName && requestedName.length > 80) {
           await recordRemoteCommandStatus(event, "failed", "Workspace name must be 80 characters or fewer.", {
             command_id: commandId,
@@ -42662,107 +42988,149 @@ export default function App() {
           const rejectField = (field, reason, extra = {}) => {
             rejectedFields.push({ field, reason, ...extra });
           };
-          requestedTerminalRoles.rejectedFields.forEach((field) => rejectedFields.push(field));
-          requestedPanelCounts.rejectedFields.forEach((field) => rejectedFields.push(field));
-          let nextSettingsValues = null;
-          let catalogPatch = null;
-          let rootChanged = false;
-          let effectiveRootDirectory = cleanWorkspaceRootDirectory(
-            getWorkspaceRootDirectory(workspaceSettingsRef.current, workspaceId),
-          );
-          let effectiveRootGitRepositoryKnown = getWorkspaceRootGitRepositoryKnown(
-            workspaceSettingsRef.current,
-            workspaceId,
-          );
-          let effectiveRootGitRepository = getWorkspaceRootGitRepository(
-            workspaceSettingsRef.current,
-            workspaceId,
-          );
+	          requestedTerminalRoles.rejectedFields.forEach((field) => rejectedFields.push(field));
+	          requestedPanelCounts.rejectedFields.forEach((field) => rejectedFields.push(field));
+	          let nextSettingsValues = null;
+	          let catalogPatch = null;
+	          let rootChanged = false;
+	          let nextLogicalIndexesByWorkspace = null;
+	          let nextDisplayLayouts = null;
+	          const initialWorkspaceSettings = workspaceSettingsRef.current;
+	          let effectiveRootDirectory = cleanWorkspaceRootDirectory(
+	            getWorkspaceRootDirectory(initialWorkspaceSettings, workspaceId),
+	          );
+	          const initialRootDirectory = effectiveRootDirectory;
+	          const currentAgentSessionMode = getWorkspaceAgentSessionMode(initialWorkspaceSettings, workspaceId);
+	          let effectiveRootGitRepositoryKnown = getWorkspaceRootGitRepositoryKnown(
+	            initialWorkspaceSettings,
+	            workspaceId,
+	          );
+	          let effectiveRootGitRepository = getWorkspaceRootGitRepository(
+	            initialWorkspaceSettings,
+	            workspaceId,
+	          );
           if (requestedRootInput) {
-            if (runtimeActive) {
-              rejectField("workspace_root", "workspace_active");
-            } else {
-              const normalizedRoot = await invoke("validate_workspace_root_directory", { path: requestedRootInput });
-              const rootDirectory = normalizedRoot?.working_directory || "";
-              if (!rootDirectory) {
-                throw new Error("Workspace root directory was not returned by validation.");
-              }
-              rootChanged = getWorkspaceRootIdentity(rootDirectory) !== getWorkspaceRootIdentity(effectiveRootDirectory);
-              if (rootChanged) {
-                const duplicateWorkspace = findWorkspaceByEffectiveRoot(
-                  workspaceCatalogRef.current,
-                  workspaceSettingsRef.current,
-                  rootDirectory,
-                  defaultWorkingDirectoryRef.current,
-                  workspaceId,
-                );
-                if (duplicateWorkspace) {
-                  await recordRemoteCommandStatus(event, "failed", `That folder is already attached to ${duplicateWorkspace.name || "another workspace"}.`, {
-                    command_id: commandId,
-                    command_kind: commandKind,
-                    duplicateWorkspaceId: duplicateWorkspace.id,
-                    workspace_id: workspaceId,
-                  });
-                  return;
-                }
-              }
-              effectiveRootDirectory = rootDirectory;
-              effectiveRootGitRepositoryKnown = true;
-              effectiveRootGitRepository = Boolean(normalizedRoot?.git_repository);
-              nextSettingsValues = {
-                ...(nextSettingsValues || {}),
-                root_directory: rootDirectory,
-                rootWasEmptyAtSelection: Boolean(normalizedRoot?.empty_directory),
-                rootGitRepository: effectiveRootGitRepository,
-              };
-              catalogPatch = {
-                ...(catalogPatch || {}),
-                root_directory: rootDirectory,
-                root_identity: normalizedRoot?.root_identity || getWorkspaceRootIdentity(rootDirectory),
-              };
-              appliedSettings.workspace_root = rootDirectory;
-              appliedFields.push("workspace_root");
+            const normalizedRoot = await invoke("validate_workspace_root_directory", { path: requestedRootInput });
+            const rootDirectory = normalizedRoot?.working_directory || "";
+            if (!rootDirectory) {
+              throw new Error("Workspace root directory was not returned by validation.");
             }
-          }
-          if (wantsTerminalCount
-            && (!Number.isInteger(requestedTerminalCount)
-              || requestedTerminalCount < 0)) {
-            rejectField("terminal_count", "invalid_value", { value: requestedTerminalCountInput });
-          }
-          if (wantsTerminalCount && runtimeActive) {
-            rejectField("terminal_count", "workspace_active");
-          }
-          if (wantsTerminalRoles && !requestedTerminalRoles.hasValidRoleCount) {
-            if (!requestedTerminalRoles.rejectedFields.length) {
-              rejectField("terminal_roles", "invalid_value");
+            rootChanged = getWorkspaceRootIdentity(rootDirectory) !== getWorkspaceRootIdentity(effectiveRootDirectory);
+            if (rootChanged) {
+              const duplicateWorkspace = findWorkspaceByEffectiveRoot(
+                workspaceCatalogRef.current,
+                workspaceSettingsRef.current,
+                rootDirectory,
+                defaultWorkingDirectoryRef.current,
+                workspaceId,
+              );
+              if (duplicateWorkspace) {
+                await recordRemoteCommandStatus(event, "failed", `That folder is already attached to ${duplicateWorkspace.name || "another workspace"}.`, {
+                  command_id: commandId,
+                  command_kind: commandKind,
+                  duplicateWorkspaceId: duplicateWorkspace.id,
+                  workspace_id: workspaceId,
+                });
+                return;
+              }
             }
+            effectiveRootDirectory = rootDirectory;
+            effectiveRootGitRepositoryKnown = true;
+            effectiveRootGitRepository = Boolean(normalizedRoot?.git_repository);
+            nextSettingsValues = {
+              ...(nextSettingsValues || {}),
+              root_directory: rootDirectory,
+              rootWasEmptyAtSelection: Boolean(normalizedRoot?.empty_directory),
+              rootGitRepository: effectiveRootGitRepository,
+            };
+            catalogPatch = {
+              ...(catalogPatch || {}),
+              root_directory: rootDirectory,
+              root_identity: normalizedRoot?.root_identity || getWorkspaceRootIdentity(rootDirectory),
+            };
+            appliedSettings.workspace_root = rootDirectory;
+            appliedFields.push("workspace_root");
           }
-          if (wantsTerminalRoles && runtimeActive) {
-            rejectField("terminal_roles", "workspace_active");
-          }
-          if (wantsPanelCounts && runtimeActive) {
-            rejectField("panel_counts", "workspace_active");
-          }
-          const terminalCountCanApply = wantsTerminalCount
-            && !wantsTerminalRoles
-            && !rejectedFields.some((field) => field.field === "terminal_count");
-          const terminalRolesCanApply = wantsTerminalRoles
-            && requestedTerminalRoles.hasValidRoleCount
-            && !rejectedFields.some((field) => field.field === "terminal_roles");
-          const panelCountsCanApply = wantsPanelCounts
-            && requestedPanelCounts.hasSupportedKeys
-            && !rejectedFields.some((field) => field.field === "panel_counts");
-          if ((terminalCountCanApply || terminalRolesCanApply || panelCountsCanApply)
-            && !runtimeActive
-          ) {
-            const layoutPatch = buildWorkspaceSettingsLayoutPatch({
+	          if (wantsTerminalCount
+	            && (!Number.isInteger(requestedTerminalCount)
+	              || requestedTerminalCount < 0)) {
+	            rejectField("terminal_count", "invalid_value", { value: requestedTerminalCountInput });
+	          }
+	          if (wantsTerminalCount
+	            && Number.isInteger(requestedTerminalCount)
+	            && requestedTerminalCount > MAX_WORKSPACE_TERMINAL_COUNT) {
+	            rejectField("terminal_count", "capacity_exceeded", {
+	              max: MAX_WORKSPACE_TERMINAL_COUNT,
+	              requested: requestedTerminalCount,
+	            });
+	          }
+	          if (wantsTerminalRoles && !requestedTerminalRoles.hasValidRoleCount) {
+	            if (!requestedTerminalRoles.rejectedFields.length) {
+	              rejectField("terminal_roles", "invalid_value");
+	            }
+	          }
+	          if (wantsTerminalRoles && requestedTerminalRoles.capacityExceeded) {
+	            rejectField("terminal_roles", "capacity_exceeded", {
+	              max: MAX_WORKSPACE_TERMINAL_COUNT,
+	              requested: requestedTerminalRoles.requestedCount,
+	            });
+	          }
+	          const terminalCountCanApply = wantsTerminalCount
+	            && !wantsTerminalRoles
+	            && !rejectedFields.some((field) => field.field === "terminal_count");
+	          const terminalRolesCanApply = wantsTerminalRoles
+	            && requestedTerminalRoles.hasValidRoleCount
+	            && !rejectedFields.some((field) => field.field === "terminal_roles");
+	          if (
+	            wantsPanelCounts
+	            && requestedPanelCounts.hasSupportedKeys
+	            && !rejectedFields.some((field) => field.field === "panel_counts")
+	          ) {
+	            const currentTerminalCountForCapacity = getWorkspaceTerminalCount(initialWorkspaceSettings, workspaceId);
+	            const currentLogicalIndexesForCapacity = getWorkspaceLogicalTerminalIndexes(
+	              workspaceTerminalLogicalIndexesRef.current,
+	              workspaceId,
+	              currentTerminalCountForCapacity,
+	            );
+	            const currentTerminalRolesForCapacity = getWorkspaceTerminalRoles(
+	              initialWorkspaceSettings,
+	              workspaceId,
+	              currentTerminalCountForCapacity,
+	              workspaceTerminalFallbackRole,
+	              workspaceTerminalRoleOptions,
+	            );
+	            const currentTerminalOnlyCount = getWorkspaceTerminalOnlyRolesForPaneKinds(
+	              currentLogicalIndexesForCapacity,
+	              currentTerminalRolesForCapacity,
+	              getWorkspacePaneKinds(initialWorkspaceSettings, workspaceId),
+	              workspaceTerminalFallbackRole,
+	            ).length;
+	            const requestedTerminalOnlyCount = terminalRolesCanApply
+	              ? requestedTerminalRoles.roles.length
+	              : terminalCountCanApply
+	                ? requestedTerminalCount
+	                : currentTerminalOnlyCount;
+	            const panelSlotCapacity = Math.max(0, MAX_WORKSPACE_TERMINAL_COUNT - requestedTerminalOnlyCount);
+	            if (requestedPanelCounts.requestedGridPanelCount > panelSlotCapacity) {
+	              rejectField("panel_counts", "capacity_exceeded", {
+	                capacity: panelSlotCapacity,
+	                requested: requestedPanelCounts.requestedGridPanelCount,
+	                terminal_count: requestedTerminalOnlyCount,
+	              });
+	            }
+	          }
+	          const panelCountsCanApply = wantsPanelCounts
+	            && requestedPanelCounts.hasSupportedKeys
+	            && !rejectedFields.some((field) => field.field === "panel_counts");
+	          if (terminalCountCanApply || terminalRolesCanApply || panelCountsCanApply) {
+	            const layoutPatch = buildWorkspaceSettingsLayoutPatch({
               displayLayouts: workspaceTerminalDisplayLayoutsRef.current,
               fallbackRole: workspaceTerminalFallbackRole,
-              panel_counts: panelCountsCanApply ? requestedPanelCounts.panel_counts : null,
-              rootChanged,
-              terminal_count: terminalCountCanApply
-                ? Math.min(MAX_WORKSPACE_TERMINAL_COUNT, requestedTerminalCount)
-                : undefined,
+	              panel_counts: panelCountsCanApply ? requestedPanelCounts.panel_counts : null,
+	              rootChanged,
+	              terminal_count: terminalCountCanApply
+	                ? requestedTerminalCount
+	                : undefined,
               terminal_roles: terminalRolesCanApply ? requestedTerminalRoles.roles : undefined,
               workspace_id: workspaceId,
               workspaceSettings: workspaceSettingsRef.current,
@@ -42784,19 +43152,15 @@ export default function App() {
               displayRows: layoutPatch.displayRows,
               minimizedPaneIndexes: layoutPatch.minimizedPaneIndexes,
             };
-            const nextLogicalIndexesByWorkspace = {
-              ...workspaceTerminalLogicalIndexesRef.current,
-              [workspaceId]: layoutPatch.logical_terminal_indexes,
-            };
-            const nextDisplayLayouts = {
-              ...workspaceTerminalDisplayLayoutsRef.current,
-              [workspaceId]: layoutPatch.displayRows,
-            };
-            workspaceTerminalLogicalIndexesRef.current = nextLogicalIndexesByWorkspace;
-            workspaceTerminalDisplayLayoutsRef.current = nextDisplayLayouts;
-            setWorkspaceTerminalLogicalIndexes(nextLogicalIndexesByWorkspace);
-              setWorkspaceTerminalDisplayLayouts(nextDisplayLayouts);
-            if (terminalRolesCanApply) {
+	            nextLogicalIndexesByWorkspace = {
+	              ...workspaceTerminalLogicalIndexesRef.current,
+	              [workspaceId]: layoutPatch.logical_terminal_indexes,
+	            };
+	            nextDisplayLayouts = {
+	              ...workspaceTerminalDisplayLayoutsRef.current,
+	              [workspaceId]: layoutPatch.displayRows,
+	            };
+	            if (terminalRolesCanApply) {
               appliedSettings.terminal_count = layoutPatch.terminalOnlyCount;
               appliedSettings.terminal_roles = remoteWorkspaceTerminalRoleCountsForAck(layoutPatch.terminalOnlyRoles);
               appliedFields.push("terminal_roles");
@@ -42828,34 +43192,67 @@ export default function App() {
                 ...(nextSettingsValues || {}),
                 agent_session_mode: agentSessionMode,
                 gitWorktreesEnabled: agentSessionMode === AGENT_SESSION_MODE_WORKTREE,
-              };
-              appliedSettings.safety_mode = requestedSafetyMode.safety_mode;
-              appliedFields.push("safety_mode");
-              if (effectiveRootDirectory) {
-                await invoke("coordination_update_repo_policy", {
-                  repo_path: effectiveRootDirectory,
-                  input: {
-                    agent_session_mode: agentSessionMode,
-                  },
-                }).catch(() => {});
-              }
-            }
-          }
-          if (requestedName) {
-            catalogPatch = { ...(catalogPatch || {}), name: requestedName };
-            appliedSettings.workspace_name = requestedName;
-            appliedFields.push("workspace_name");
-          }
-          if (nextSettingsValues) {
-            const nextWorkspaceSettings = updateWorkspaceLocalSettings(
-              workspaceSettingsRef.current,
-              workspaceId,
-              nextSettingsValues,
-            );
-            workspaceSettingsRef.current = nextWorkspaceSettings;
-            persistWorkspaceSettings(nextWorkspaceSettings);
-            setWorkspaceSettings(nextWorkspaceSettings);
-          }
+	              };
+	              appliedSettings.safety_mode = requestedSafetyMode.safety_mode;
+	              appliedFields.push("safety_mode");
+	            }
+	          }
+	          if (requestedName) {
+	            catalogPatch = { ...(catalogPatch || {}), name: requestedName };
+	            appliedSettings.workspace_name = requestedName;
+	            appliedFields.push("workspace_name");
+	          }
+	          if (nextSettingsValues) {
+	            const nextWorkspaceSettings = updateWorkspaceLocalSettings(
+	              initialWorkspaceSettings,
+	              workspaceId,
+	              nextSettingsValues,
+	            );
+	            const nextAgentSessionMode = getWorkspaceAgentSessionMode(nextWorkspaceSettings, workspaceId);
+	            const gitWorktreesChanged = nextAgentSessionMode !== currentAgentSessionMode;
+	            const previousMcpRepoPath = initialRootDirectory || defaultWorkingDirectoryRef.current;
+	            const nextMcpRepoPath = effectiveRootDirectory || defaultWorkingDirectoryRef.current;
+	            const workspaceRuntimeActive = activatedWorkspaceIdRef.current === workspaceId
+	              || normalizeEnabledWorkspaceIds(
+	                workspaceLifecycleSettingsRef.current?.enabled_workspace_ids,
+	              ).includes(workspaceId);
+	            if (workspaceRuntimeActive) {
+	              const teardownPlan = buildWorkspaceSettingsRuntimeTeardownPlan({
+	                currentLogicalIndexesByWorkspace: workspaceTerminalLogicalIndexesRef.current,
+	                currentWorkspaceSettings: initialWorkspaceSettings,
+	                fallbackRole: workspaceTerminalFallbackRole,
+	                gitWorktreesChanged,
+	                nextLogicalIndexesByWorkspace: nextLogicalIndexesByWorkspace || workspaceTerminalLogicalIndexesRef.current,
+	                nextWorkspaceSettings,
+	                roleOptions: workspaceTerminalRoleOptions,
+	                rootChanged,
+	                workspaceId,
+	              });
+	              await applyWorkspaceSettingsRuntimeTeardown({
+	                ...teardownPlan,
+	                nextAgentSessionMode,
+	                nextMcpRepoPath,
+	                previousMcpRepoPath,
+	                workspaceId,
+	              });
+	            } else if (nextMcpRepoPath && (rootChanged || gitWorktreesChanged)) {
+	              await invoke("coordination_update_repo_policy", {
+	                repo_path: nextMcpRepoPath,
+	                input: {
+	                  agent_session_mode: nextAgentSessionMode,
+	                },
+	              });
+	            }
+	            workspaceSettingsRef.current = nextWorkspaceSettings;
+	            persistWorkspaceSettings(nextWorkspaceSettings);
+	            setWorkspaceSettings(nextWorkspaceSettings);
+	            if (nextLogicalIndexesByWorkspace && nextDisplayLayouts) {
+	              workspaceTerminalLogicalIndexesRef.current = nextLogicalIndexesByWorkspace;
+	              workspaceTerminalDisplayLayoutsRef.current = nextDisplayLayouts;
+	              setWorkspaceTerminalLogicalIndexes(nextLogicalIndexesByWorkspace);
+	              setWorkspaceTerminalDisplayLayouts(nextDisplayLayouts);
+	            }
+	          }
           if (catalogPatch) {
             const existingCatalog = Array.isArray(workspaceCatalogRef.current) ? workspaceCatalogRef.current : [];
             const nextCatalog = updateCatalogWorkspace(existingCatalog, {
@@ -42987,11 +43384,22 @@ export default function App() {
           await syncRemoteControlState("remote_workspace_settings_update");
           const appliedCount = appliedFields.length;
           const rejectedCount = rejectedFields.length;
-          const status = appliedCount > 0
-            ? "completed"
-            : rejectedFields.some((field) => field.reason === "workspace_active")
-              ? "blocked"
-              : "failed";
+	          const blockedSettingRejectionReasons = new Set([
+	            "archive_failed",
+	            "already_unarchived",
+	            "capacity_exceeded",
+	            "duplicate_workspace_root",
+	            "safe_requires_git",
+	            "unarchive_unsupported",
+	          ]);
+	          const hasBlockedRejection = rejectedFields.some((field) => (
+	            blockedSettingRejectionReasons.has(field.reason)
+	          ));
+	          const status = hasBlockedRejection
+	              ? "blocked"
+	              : appliedCount > 0
+	                ? "completed"
+	                : "failed";
           const message = appliedCount > 0
             ? rejectedCount > 0
               ? "Workspace settings partially updated on this desktop."
@@ -43525,9 +43933,12 @@ export default function App() {
         if (shouldShowWindow) {
           void invoke("app_exit_background").catch(() => {});
         }
-        const activated = requestWorkspaceActivation(workspaceId, "remote_control_terminal_open");
-        if (!activated) {
-          await recordRemoteCommandStatus(event, "blocked", "Workspace could not be selected before opening terminals.", {
+        try {
+          await ensureWorkspaceActivated(workspaceId, {
+            source: "remote_control_terminal_open",
+          });
+        } catch (error) {
+          await recordRemoteCommandStatus(event, "blocked", getErrorMessage(error, "Workspace could not be selected before opening terminals."), {
             command_id: commandId,
             command_kind: commandKind,
             workspace_id: workspaceId,
@@ -44798,7 +45209,7 @@ export default function App() {
         unlistenDeviceDeleted();
       }
     };
-  }, [activateWorkspace, activeAccountScopeKey, addWorkspaceTerminal, agentStatuses, changeWorkspaceTerminalRole, closeWorkspaceTerminal, deactivateWorkspace, deleteWorkspaceFromForge, logout, manageWorkspaceAgents, refreshAgentStatuses, requestWorkspaceActivation, requestWorkspaceTerminalFocus, rustTerminalAuthorityOrchestrators, showView, syncAgentInstallationsToCloud, workspaces]);
+  }, [activateWorkspace, activeAccountScopeKey, addWorkspaceTerminal, agentStatuses, changeWorkspaceTerminalRole, closeWorkspaceTerminal, deactivateWorkspace, deleteWorkspaceFromForge, ensureWorkspaceActivated, logout, manageWorkspaceAgents, refreshAgentStatuses, requestWorkspaceActivation, requestWorkspaceTerminalFocus, rustTerminalAuthorityOrchestrators, showView, syncAgentInstallationsToCloud, workspaces]);
 
   useEffect(() => {
     let disposed = false;

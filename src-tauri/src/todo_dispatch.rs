@@ -1423,6 +1423,20 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                             changed_kind = "remote_todo_already_current";
                         } else {
                             if let Some(object) = existing.as_object_mut() {
+                                if intake_status == "listed" && !target_explicit {
+                                    for key in [
+                                        "target_agent_id",
+                                        "target_color_slot",
+                                        "target_explicit",
+                                        "target_terminal_color",
+                                        "target_terminal_id",
+                                        "target_terminal_index",
+                                        "target_terminal_name",
+                                        "target_thread_id",
+                                    ] {
+                                        object.remove(key);
+                                    }
+                                }
                                 object.insert("text".to_string(), json!(text.clone()));
                                 object.insert("body".to_string(), json!(text.clone()));
                                 object.insert(
@@ -1545,6 +1559,19 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                                     .entry("remote_command".to_string())
                                     .or_insert_with(|| json!({}));
                                 if let Some(remote_object) = remote.as_object_mut() {
+                                    if intake_status == "listed" && !target_explicit {
+                                        for key in [
+                                            "target_agent_id",
+                                            "target_color_slot",
+                                            "target_terminal_color",
+                                            "target_terminal_id",
+                                            "target_terminal_index",
+                                            "target_terminal_name",
+                                            "target_thread_id",
+                                        ] {
+                                            remote_object.remove(key);
+                                        }
+                                    }
                                     remote_object
                                         .insert("command_id".to_string(), json!(command_id.clone()));
                                     remote_object

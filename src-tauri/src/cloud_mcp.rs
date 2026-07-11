@@ -8131,6 +8131,17 @@ async fn cloud_mcp_send_claimed_outbox_rows(
         match result {
             Ok(response) => {
                 let _ = cloud_mcp_outbox_mark_acked(&row, &response);
+                if row.event_kind == "todo.live_state" {
+                    log_cloud_sync_event(
+                        "todo_sync.sent",
+                        json!({
+                            "attempt_count": row.attempt_count,
+                            "cloud_event_id": cloud_mcp_outbox_cloud_event_id(&response),
+                            "idempotency_key": row.idempotency_key,
+                            "outbox_id": row.outbox_id,
+                        }),
+                    );
+                }
                 if cloud_mcp_tokenomics_device_packet_kind(&row.event_kind) {
                     cloud_mcp_record_tokenomics_sync_log(
                         "outbox_acked",
@@ -17812,27 +17823,49 @@ fn cloud_mcp_is_list_agent_models_request(
     direct_kind: &str,
     direct_request_kind: &str,
 ) -> bool {
-    let matches_list_agent_models = |value: &str| {
+    let normalize_kind = |value: &str| {
         value
             .trim()
             .to_ascii_lowercase()
             .replace(['.', ' ', '-'], "_")
-            == "list_agent_models"
     };
-    let is_request = [
-        Some(direct_kind.to_string()),
-        Some(direct_request_kind.to_string()),
-        cloud_mcp_nested_payload_text(message, &["payload", "kind"]),
-        cloud_mcp_nested_payload_text(message, &["request", "kind"]),
-        cloud_mcp_nested_payload_text(message, &["event", "kind"]),
+    let matches_list_agent_models = |value: &str| normalize_kind(value) == "list_agent_models";
+    let matches_remote_command_requested =
+        |value: &str| normalize_kind(value) == "remote_command_requested";
+    let direct_matches =
+        matches_list_agent_models(direct_kind) || matches_list_agent_models(direct_request_kind);
+    let outer_kind = cloud_mcp_nested_payload_text(message, &["kind"])
+        .unwrap_or_else(|| direct_kind.to_string());
+    let outer_kind = normalize_kind(&outer_kind);
+    let outer_is_cloud_event = outer_kind == "cloud_event";
+    let outer_is_remote_command = outer_kind == "remote_command_requested"
+        || matches_remote_command_requested(direct_kind);
+    let event_kind = [
         cloud_mcp_nested_payload_text(message, &["event", "event_kind"]),
-        cloud_mcp_nested_payload_text(message, &["event", "payload", "kind"]),
-        cloud_mcp_nested_payload_text(message, &["event", "request", "kind"]),
-        cloud_mcp_remote_command_field_text(message, &["command_kind"]),
+        cloud_mcp_nested_payload_text(message, &["event", "kind"]),
+        cloud_mcp_nested_payload_text(message, &["payload", "event_kind"]),
+        cloud_mcp_nested_payload_text(message, &["event_kind"]),
     ]
     .into_iter()
     .flatten()
-    .any(|value| matches_list_agent_models(&value));
+    .next()
+    .unwrap_or_default();
+    let event_kind_is_list_agent_models =
+        outer_is_cloud_event && matches_list_agent_models(&event_kind);
+    let event_kind_is_remote_command_requested =
+        matches_remote_command_requested(&event_kind) || outer_is_remote_command;
+    let command_kind_is_list_agent_models = cloud_mcp_remote_command_field_text(
+        message,
+        &["command_kind"],
+    )
+    .as_deref()
+    .map(matches_list_agent_models)
+    .unwrap_or(false);
+    let is_request = direct_matches
+        || event_kind_is_list_agent_models
+        || ((outer_is_cloud_event || outer_is_remote_command)
+            && event_kind_is_remote_command_requested
+            && command_kind_is_list_agent_models);
     if !is_request {
         return false;
     }
@@ -18529,6 +18562,15 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             return;
         }
         let event_kind = cloud_mcp_account_todo_event_kind(&event, "todo.live_state");
+        log_cloud_sync_event(
+            "todo_sync.received",
+            json!({
+                "event_kind": event_kind,
+                "source": "direct_app_ws",
+                "bytes": cloud_mcp_sync_payload_bytes(&event),
+                "count": cloud_mcp_sync_payload_count(&event),
+            }),
+        );
         match cloud_mcp_apply_account_todo_inbound_event(state, &event_kind, &event).await {
             Ok(result) => {
                 let suppress_local_echo = result.applied == 0
@@ -18658,6 +18700,15 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         }
         let mut suppress_cloud_event = false;
         if is_account_todo_delta_event {
+            log_cloud_sync_event(
+                "todo_sync.received",
+                json!({
+                    "event_kind": event_kind,
+                    "source": "cloud_event",
+                    "bytes": inbound_bytes,
+                    "count": inbound_count,
+                }),
+            );
             match cloud_mcp_apply_account_todo_inbound_event(state, &event_kind, &event).await {
                 Ok(result) => {
                     suppress_cloud_event = result.applied == 0
@@ -21271,6 +21322,7 @@ mod cloud_mcp_agent_model_catalog_tests {
         let message = json!({
             "kind": "cloud_event",
             "event": {
+                "event_kind": "remote_command_requested",
                 "command_kind": "list_agent_models",
                 "request_id": "models-request-3",
                 "agent_kind": "opencode"
@@ -21280,6 +21332,58 @@ mod cloud_mcp_agent_model_catalog_tests {
         assert!(cloud_mcp_is_list_agent_models_request(
             &message,
             "cloud_event",
+            ""
+        ));
+    }
+
+    #[test]
+    fn list_agent_models_detector_ignores_unrelated_nested_lifecycle_kind() {
+        let message = json!({
+            "kind": "workspace_lifecycle",
+            "payload": {
+                "kind": "list_agent_models",
+                "workspace_id": "workspace-1"
+            }
+        });
+
+        assert!(!cloud_mcp_is_list_agent_models_request(
+            &message,
+            "workspace_lifecycle",
+            ""
+        ));
+    }
+
+    #[test]
+    fn list_agent_models_detector_ignores_unrelated_nested_settings_kind() {
+        let message = json!({
+            "kind": "workspace_settings_update",
+            "request": {
+                "kind": "list_agent_models",
+                "workspace_id": "workspace-1"
+            }
+        });
+
+        assert!(!cloud_mcp_is_list_agent_models_request(
+            &message,
+            "workspace_settings_update",
+            ""
+        ));
+    }
+
+    #[test]
+    fn list_agent_models_detector_ignores_unrelated_nested_terminal_kind() {
+        let message = json!({
+            "kind": "terminal_open",
+            "payload": {
+                "kind": "list_agent_models",
+                "target_terminal_id": "term-1"
+            },
+            "command_kind": "terminal_open"
+        });
+
+        assert!(!cloud_mcp_is_list_agent_models_request(
+            &message,
+            "terminal_open",
             ""
         ));
     }
@@ -26122,6 +26226,10 @@ fn cloud_mcp_compact_terminal_live_state(terminal: &Value, index: usize) -> Valu
             &["provider_session_id", "native_session_id", "session_id"][..],
         ),
         (
+            "thread_id",
+            &["thread_id", "target_thread_id"][..],
+        ),
+        (
             "todo_id",
             &["todo_id", "current_todo_id"][..],
         ),
@@ -26131,6 +26239,42 @@ fn cloud_mcp_compact_terminal_live_state(terminal: &Value, index: usize) -> Valu
         ),
     ] {
         cloud_mcp_compact_insert_value(&mut item, key, terminal, aliases);
+    }
+    // Session/thread identity is live terminal state, not optional chat
+    // history metadata. Mirror the aliases on the compact wire shape so web
+    // clients can bind a live row before the first transcript record exists.
+    let session_identity_keys = ["provider_session_id", "native_session_id", "session_id"];
+    let session_id = session_identity_keys
+        .iter()
+        .filter_map(|key| terminal.get(*key).filter(|value| !value.is_null()))
+        .find(|value| value.as_str().is_some_and(|value| !value.trim().is_empty()))
+        .cloned()
+        .or_else(|| {
+            session_identity_keys
+                .iter()
+                .find_map(|key| terminal.get(*key).filter(|value| !value.is_null()))
+                .cloned()
+        });
+    if let Some(session_id) = session_id {
+        item.insert("provider_session_id".to_string(), session_id.clone());
+        item.insert("native_session_id".to_string(), session_id.clone());
+        item.insert("session_id".to_string(), session_id);
+    }
+    let thread_identity_keys = ["thread_id", "target_thread_id"];
+    let thread_id = thread_identity_keys
+        .iter()
+        .filter_map(|key| terminal.get(*key).filter(|value| !value.is_null()))
+        .find(|value| value.as_str().is_some_and(|value| !value.trim().is_empty()))
+        .cloned()
+        .or_else(|| {
+            thread_identity_keys
+                .iter()
+                .find_map(|key| terminal.get(*key).filter(|value| !value.is_null()))
+                .cloned()
+        });
+    if let Some(thread_id) = thread_id {
+        item.insert("thread_id".to_string(), thread_id.clone());
+        item.insert("target_thread_id".to_string(), thread_id);
     }
     if !item.contains_key("busy") {
         let status = cloud_mcp_payload_text(&Value::Object(item.clone()), &["status"])
@@ -26934,6 +27078,23 @@ fn cloud_mcp_device_live_snapshot_force_replay(reason: &str) -> bool {
         })
 }
 
+fn cloud_mcp_device_live_snapshot_lifecycle_fast_lane(reason: &str) -> bool {
+    reason.trim().split(':').any(|part| {
+        let part = part.trim().to_ascii_lowercase();
+        matches!(
+            part.as_str(),
+            "local_workspace_deleted"
+                | "workspace_archive"
+                | "workspace_close"
+                | "workspace_delete"
+                | "workspace_open"
+                | "workspace_registered"
+                | "workspace_registration"
+        ) || part.starts_with("workspace_activate")
+            || part.starts_with("workspace_deactivate")
+    })
+}
+
 fn cloud_mcp_device_live_force_replay_identity(mut payload: Value) -> Value {
     let replay_token = cloud_mcp_payload_text(
         &payload,
@@ -27087,10 +27248,11 @@ async fn cloud_mcp_publish_device_live_state_ready_payload(
     reason: &str,
 ) {
     let force_replay = cloud_mcp_device_live_snapshot_force_replay(reason);
+    let lifecycle_fast_lane = cloud_mcp_device_live_snapshot_lifecycle_fast_lane(reason);
     if force_replay {
         payload = cloud_mcp_device_live_force_replay_identity(payload);
     }
-    match if force_replay {
+    match if force_replay || lifecycle_fast_lane {
         Ok(CloudMcpDeviceLiveSyncDecision::Enqueue)
     } else {
         cloud_mcp_device_live_sync_decision(&payload)
@@ -32308,6 +32470,8 @@ pub(crate) async fn cloud_mcp_mark_terminal_opened(
         "terminal_epoch": format!("{pane_id}:{instance_id}"),
         "terminal_name": terminal_display_name.clone(),
         "terminal_nickname": terminal_nickname_text,
+        "thread_id": metadata.thread_id.as_str(),
+        "target_thread_id": metadata.thread_id.as_str(),
         "terminal_lifecycle": "open",
         "agent_id": agent_id,
         "agent_kind": agent_kind,
@@ -34622,12 +34786,17 @@ fn cloud_mcp_normalize_device_terminal_orchestrator(
     object.insert("target_terminal_id".to_string(), json!(terminal_id));
     object.insert("pane_id".to_string(), json!(pane_id));
     if let Some(thread_id) = thread_id.filter(|value| !value.trim().is_empty()) {
-        object.insert("thread_id".to_string(), json!(thread_id));
+        object.insert("thread_id".to_string(), json!(thread_id.clone()));
+        object.insert("target_thread_id".to_string(), json!(thread_id));
     }
     if let Some(provider_session_id) = provider_session_id.filter(|value| !value.trim().is_empty())
     {
         object.insert(
             "provider_session_id".to_string(),
+            json!(provider_session_id.clone()),
+        );
+        object.insert(
+            "native_session_id".to_string(),
             json!(provider_session_id.clone()),
         );
         object.insert("session_id".to_string(), json!(provider_session_id));
@@ -35572,7 +35741,13 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
     let mut queued = false;
     let mut skipped_reason = Value::Null;
     let mut cloud_event_id = Value::Null;
-    match cloud_mcp_device_live_sync_decision(&payload)? {
+    let lifecycle_fast_lane =
+        cloud_mcp_device_live_snapshot_lifecycle_fast_lane(&reason_for_ack);
+    match if lifecycle_fast_lane {
+        CloudMcpDeviceLiveSyncDecision::Enqueue
+    } else {
+        cloud_mcp_device_live_sync_decision(&payload)?
+    } {
         CloudMcpDeviceLiveSyncDecision::CurrentAcked => {
             skipped_reason = json!("sync_unit_current");
         }
@@ -36238,6 +36413,14 @@ async fn cloud_mcp_publish_device_live_state_snapshot_debounced(
     state: &CloudMcpState,
     reason: &str,
 ) {
+    if cloud_mcp_device_live_snapshot_lifecycle_fast_lane(reason) {
+        if let Ok(mut pending) = state.device_live_snapshot_debounce.lock() {
+            *pending = None;
+        }
+        cloud_mcp_publish_device_live_state_snapshot(state, reason).await;
+        return;
+    }
+
     let mut lock_failed = false;
     let already_scheduled = match state.device_live_snapshot_debounce.lock() {
         Ok(mut pending) => {
@@ -37818,6 +38001,14 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
     let reason = payload.source.as_str();
     let provider_session_id = payload.provider_session_id.clone();
     let fork_from_provider_session_id = payload.fork_from_provider_session_id.clone();
+    let thread_id = if payload.thread_id.trim().is_empty() {
+        context_entry
+            .as_ref()
+            .and_then(|entry| entry.thread_id.clone())
+            .unwrap_or_default()
+    } else {
+        payload.thread_id.clone()
+    };
     let device_terminal_orchestrator = cloud_mcp_is_app_control_workspace_id(&payload.workspace_id)
         || cloud_mcp_is_app_control_pane_id(terminal_id);
     let status_seq = cloud_mcp_next_terminal_lifecycle_seq(state, Some(payload.observed_at_ms));
@@ -37882,6 +38073,8 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         "terminal_epoch": format!("{}:{}", terminal_id, payload.instance_id),
         "terminal_name": payload.terminal_name.as_str(),
         "terminal_nickname": payload.terminal_nickname.as_str(),
+        "thread_id": thread_id.as_str(),
+        "target_thread_id": thread_id.as_str(),
         "terminal_lifecycle": payload.terminal_lifecycle.as_str(),
         "agent_kind": payload.agent_kind,
         "agent_type": payload.agent_type.as_str(),
@@ -55276,6 +55469,20 @@ pub(crate) async fn cloud_mcp_enqueue_workspace_todo_sync_commit(
     let request_value = cloud_mcp_prepare_workspace_todo_sync_request(payload);
     let workspace_id = cloud_mcp_payload_text(&request_value, &["workspace_id"])
         .unwrap_or_else(|| "workspace".to_string());
+    let cid = cloud_mcp_payload_text(
+        &request_value,
+        &["cid", "client_request_id"],
+    )
+    .unwrap_or_else(|| format!("todo-sync-{}", cloud_mcp_now_ms()));
+    log_cloud_sync_event(
+        "todo_sync.enqueued",
+        json!({
+            "cid": cid,
+            "operation": cloud_mcp_payload_text(&request_value, &["todo_operation"]),
+            "reason": reason,
+            "workspace_id": workspace_id,
+        }),
+    );
     if cloud_mcp_todo_sync_payload_is_app_control(&request_value) {
         log_terminal_status_event(
             "backend.cloud_mcp.todo_sync_app_control_enqueue_skip",
@@ -55307,11 +55514,6 @@ pub(crate) async fn cloud_mcp_enqueue_workspace_todo_sync_commit(
     )
     .await;
 
-    let cid = cloud_mcp_payload_text(
-        &request_value,
-        &["cid", "client_request_id"],
-    )
-    .unwrap_or_else(|| format!("todo-sync-{}", cloud_mcp_now_ms()));
     let key = format!("todo.live_state:{workspace_id}:{cid}");
     cloud_mcp_enqueue_background_sync(
         state,
@@ -55694,6 +55896,11 @@ mod cloud_mcp_tests {
             .await
             .expect("production app websocket event")
             .expect("app websocket sender remains open");
+        workspace_consistency_ack_envelope(state, &envelope).await;
+        envelope
+    }
+
+    async fn workspace_consistency_ack_envelope(state: &CloudMcpState, envelope: &Value) {
         let request_id = envelope["id"]
             .as_str()
             .expect("production app websocket request id")
@@ -55709,7 +55916,6 @@ mod cloud_mcp_tests {
                 "cloud_event_id": format!("acked-{request_id}"),
             }))
             .expect("app websocket response receiver");
-        envelope
     }
 
     #[tokio::test]
@@ -56010,6 +56216,15 @@ mod cloud_mcp_tests {
         ));
         assert!(!cloud_mcp_device_live_snapshot_force_replay(
             "workspace_registration"
+        ));
+        assert!(cloud_mcp_device_live_snapshot_lifecycle_fast_lane(
+            "workspace_activate_runtime"
+        ));
+        assert!(cloud_mcp_device_live_snapshot_lifecycle_fast_lane(
+            "local_workspace_deleted"
+        ));
+        assert!(!cloud_mcp_device_live_snapshot_lifecycle_fast_lane(
+            "websocket_ready_replay"
         ));
     }
 
@@ -56504,6 +56719,152 @@ mod cloud_mcp_tests {
         );
         assert_eq!(payload["workspace_snapshot_complete"], json!(true));
         assert_eq!(payload["workspace_snapshot_authoritative"], json!(true));
+
+        let _ = fs::remove_dir_all(data_root);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[tokio::test]
+    async fn workspace_lifecycle_snapshot_sends_while_prior_publish_pending() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let data_root = test_cloud_root("diffforge-lifecycle-pending-workspace-data");
+        let cache_root = test_cloud_root("diffforge-lifecycle-pending-workspace-cache");
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        workspace_consistency_write_catalog(
+            &data_root,
+            json!([{"id": "W1", "name": "One", "root_directory": "/repo/one"}]),
+        );
+        let (state, mut rx) = workspace_consistency_connected_state().await;
+
+        let first_state = state.clone();
+        let first_publish = tokio::spawn(async move {
+            cloud_mcp_sync_device_workspaces_snapshot_internal(
+                &first_state,
+                json!([{
+                    "workspace_id": "W1",
+                    "workspace_name": "One",
+                    "workspace_root": "/repo/one",
+                    "workspace_active": true,
+                    "workspace_status": "active"
+                }]),
+                None,
+                Some("workspace_activate_runtime".to_string()),
+            )
+            .await
+        });
+        let first_envelope = timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("first lifecycle workspace snapshot")
+            .expect("app websocket sender remains open");
+
+        let second_state = state.clone();
+        let second_publish = tokio::spawn(async move {
+            cloud_mcp_sync_device_workspaces_snapshot_internal(
+                &second_state,
+                json!([{
+                    "workspace_id": "W1",
+                    "workspace_name": "One",
+                    "workspace_root": "/repo/one",
+                    "workspace_active": true,
+                    "workspace_status": "active"
+                }]),
+                None,
+                Some("workspace_activate_runtime".to_string()),
+            )
+            .await
+        });
+        let second_envelope = timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("second lifecycle workspace snapshot should not be skipped as pending")
+            .expect("app websocket sender remains open");
+
+        assert_eq!(second_envelope["kind"], json!("event"));
+        assert_eq!(
+            second_envelope["request"]["event_kind"],
+            json!("device_workspaces_snapshot")
+        );
+        assert_eq!(
+            second_envelope["request"]["payload"]["workspaces"][0]["workspace_active"],
+            json!(true)
+        );
+
+        workspace_consistency_ack_envelope(&state, &first_envelope).await;
+        workspace_consistency_ack_envelope(&state, &second_envelope).await;
+        assert_eq!(first_publish.await.unwrap().unwrap()["sent"], json!(true));
+        assert_eq!(second_publish.await.unwrap().unwrap()["sent"], json!(true));
+
+        let _ = fs::remove_dir_all(data_root);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[tokio::test]
+    async fn device_live_lifecycle_snapshot_sends_while_current_pending() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let data_root = test_cloud_root("diffforge-lifecycle-pending-live-data");
+        let cache_root = test_cloud_root("diffforge-lifecycle-pending-live-cache");
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        workspace_consistency_write_catalog(
+            &data_root,
+            json!([{"id": "W1", "name": "One", "root_directory": "/repo/one"}]),
+        );
+        let (state, mut rx) = workspace_consistency_connected_state().await;
+        let device_id = cloud_mcp_desktop_device_profile()["device_id"]
+            .as_str()
+            .expect("local desktop device id")
+            .to_string();
+        let payload = cloud_mcp_device_live_payload_with_sync_identity(json!({
+            "source": "test",
+            "device_id": device_id,
+            "sync_unit": "device_live_state_snapshot",
+            "workspace_catalog_ready": true,
+            "workspace_snapshot_complete": true,
+            "workspace_snapshot_authoritative": true,
+            "workspaces": [{
+                "workspace_id": "W1",
+                "workspace_name": "One",
+                "workspace_root": "/repo/one",
+                "workspace_active": true,
+                "workspace_status": "active"
+            }],
+            "ts_ms": cloud_mcp_now_ms()
+        }));
+        let _ = cloud_mcp_outbox_enqueue_event(
+            "device_live_state_snapshot",
+            &payload,
+            CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
+            "prior_pending",
+        )
+        .unwrap();
+        cloud_mcp_device_live_mark_sync_pending(&payload).unwrap();
+        assert!(matches!(
+            cloud_mcp_device_live_sync_decision(&payload).unwrap(),
+            CloudMcpDeviceLiveSyncDecision::CurrentPending
+        ));
+
+        cloud_mcp_publish_device_live_state_ready_payload(
+            &state,
+            payload,
+            "workspace_activate_runtime",
+        )
+        .await;
+        let envelope = workspace_consistency_capture_and_ack(&state, &mut rx).await;
+        assert_eq!(envelope["kind"], json!("event"));
+        assert_eq!(
+            envelope["request"]["event_kind"],
+            json!("device_live_state_snapshot")
+        );
+        assert_eq!(
+            envelope["request"]["payload"]["workspaces"][0]["workspace_active"],
+            json!(true)
+        );
 
         let _ = fs::remove_dir_all(data_root);
         let _ = fs::remove_dir_all(cache_root);
@@ -57179,12 +57540,17 @@ mod cloud_mcp_tests {
             json!(CLOUD_MCP_APP_CONTROL_WORKSPACE_ID)
         );
         assert_eq!(normalized["thread_id"], json!("thread-app-control"));
+        assert_eq!(normalized["target_thread_id"], json!("thread-app-control"));
         assert_eq!(
             normalized["provider_session_id"],
             json!("session-app-control")
         );
         assert_eq!(
             normalized["provider_session_id"],
+            json!("session-app-control")
+        );
+        assert_eq!(
+            normalized["native_session_id"],
             json!("session-app-control")
         );
         assert_eq!(normalized["session_id"], json!("session-app-control"));
@@ -58856,6 +59222,30 @@ mod cloud_mcp_tests {
         assert_eq!(idle["prompt_id"], json!(""));
         assert_eq!(idle["prompt_options"], json!([]));
         assert_eq!(idle["terminal_is_prompting_user"], json!(false));
+    }
+
+    #[test]
+    fn terminal_wire_compaction_mirrors_live_session_and_thread_identity() {
+        let compacted = cloud_mcp_compact_terminal_live_state(
+            &json!({
+                "pane_id": "pane-session",
+                "provider_session_id": "",
+                "native_session_id": "provider-session-1",
+                "thread_id": "",
+                "target_thread_id": "thread-1",
+                "status": "starting"
+            }),
+            0,
+        );
+
+        assert_eq!(
+            compacted["provider_session_id"],
+            json!("provider-session-1")
+        );
+        assert_eq!(compacted["native_session_id"], json!("provider-session-1"));
+        assert_eq!(compacted["session_id"], json!("provider-session-1"));
+        assert_eq!(compacted["thread_id"], json!("thread-1"));
+        assert_eq!(compacted["target_thread_id"], json!("thread-1"));
     }
 
     #[test]

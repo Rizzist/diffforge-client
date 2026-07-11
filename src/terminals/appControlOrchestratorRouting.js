@@ -1,5 +1,13 @@
 export const LOOPSPACE_AUTOMATION_APP_CONTROL_MAX_TERMINALS = 3;
 
+export function appControlPreAcceptanceFailureDefersAck({
+  failed = false,
+  recoveryScheduled = false,
+  terminalAccepted = false,
+} = {}) {
+  return Boolean(failed && !terminalAccepted && recoveryScheduled);
+}
+
 function appControlRoutingDetailSources(detail = {}) {
   const event = detail?.event && typeof detail.event === "object" ? detail.event : {};
   const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
