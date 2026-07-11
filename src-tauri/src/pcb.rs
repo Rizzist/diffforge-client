@@ -917,7 +917,7 @@ async fn pcb_panel_open(
         .unwrap_or(PCB_PANEL_DEFAULT_HEIGHT);
 
     let url = format!(
-        "index.html#/pcb-window?mode=panel&paneId={}&repoPath={}&theme={}&windowId={}&workspaceId={}",
+        "index.html#/pcb-window?mode=panel&pane_id={}&repo_path={}&theme={}&window_id={}&workspace_id={}",
         percent_encode_query_component(&pane_text),
         percent_encode_query_component(&repo_text),
         percent_encode_query_component(theme_text),
@@ -1025,7 +1025,7 @@ async fn pcb_window_open(
         .unwrap_or_else(|| "pcb".to_string());
 
     let url = format!(
-        "index.html#/pcb-window?boardPath={}&repoPath={}&boardName={}&tab={}&workspaceId={}",
+        "index.html#/pcb-window?board_path={}&repo_path={}&board_name={}&tab={}&workspace_id={}",
         percent_encode_query_component(&board_path),
         percent_encode_query_component(&repo_text),
         percent_encode_query_component(&name),

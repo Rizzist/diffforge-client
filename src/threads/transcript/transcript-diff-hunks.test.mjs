@@ -316,7 +316,7 @@ test("languageFromPath maps extensions to shiki languages", () => {
 /* normalizeTurnDiffFile (§1 file entries)                              */
 /* ------------------------------------------------------------------ */
 
-test("normalizeTurnDiffFile reads snake_case keys and tolerates sparse entries", () => {
+test("normalizeTurnDiffFile reads snake_case and camelCase aliases", () => {
   const snake = normalizeTurnDiffFile({
     path: "src/a.rs",
     old_path: "src/b.rs",
@@ -336,9 +336,9 @@ test("normalizeTurnDiffFile reads snake_case keys and tolerates sparse entries",
 
   const camel = normalizeTurnDiffFile({
     path: "src/a.rs",
-    old_path: "src/b.rs",
+    oldPath: "src/b.rs",
     kind: "rename",
-    patch_truncated: true,
+    patchTruncated: true,
   });
   assert.equal(camel.old_path, "src/b.rs");
   assert.equal(camel.patch_truncated, true);

@@ -173,12 +173,16 @@ fn app_update_effective_auto_restart_when_idle_for_current_process(persisted_aut
     )
 }
 
+fn app_update_persisted_auto_restart_when_idle(raw: &Value) -> bool {
+    raw.get("auto_restart_when_idle")
+        .or_else(|| raw.get("autoRestartWhenIdle"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 pub(crate) fn app_update_settings_initialize(app: &AppHandle) {
     let raw = app_local_state_read(app, APP_UPDATE_SETTINGS_STATE_KEY);
-    let persisted_auto = raw
-        .get("auto_restart_when_idle")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let persisted_auto = app_update_persisted_auto_restart_when_idle(&raw);
     let auto = app_update_effective_auto_restart_when_idle_for_current_process(persisted_auto);
     APP_UPDATE_AUTO_WHEN_IDLE.store(auto, Ordering::Release);
 }
@@ -1095,6 +1099,17 @@ async fn app_update_restart_inner(app: &AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod app_update_tests {
     use super::*;
+
+    #[test]
+    fn persisted_auto_restart_accepts_legacy_camel_case() {
+        assert!(app_update_persisted_auto_restart_when_idle(&json!({
+            "autoRestartWhenIdle": true
+        })));
+        assert!(!app_update_persisted_auto_restart_when_idle(&json!({
+            "auto_restart_when_idle": false,
+            "autoRestartWhenIdle": true
+        })));
+    }
 
     #[test]
     fn effective_auto_restart_uses_daemon_default() {

@@ -67,7 +67,7 @@ export function normalizeWorkspaceProjectEntry(entry) {
   const name = cleanWorkspaceProjectText(
     entry.name ?? entry.project_name ?? entry.title,
   ) || id;
-  const updatedAtMs = Number(entry.updated_at_ms);
+  const updatedAtMs = Number(entry.updated_at_ms ?? entry.updatedAtMs);
   const row = { id, name, path };
   if (Number.isFinite(updatedAtMs) && updatedAtMs > 0) {
     row.updated_at_ms = Math.floor(updatedAtMs);

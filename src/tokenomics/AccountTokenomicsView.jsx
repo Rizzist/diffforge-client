@@ -1143,10 +1143,10 @@ function tokenomicsDeviceIdentityRows(summary = {}) {
   const value = summary && typeof summary === "object" ? summary : {};
   return [
     ...(Array.isArray(value.device_identities) ? value.device_identities : []),
-    ...(Array.isArray(value.device_identities) ? value.device_identities : []),
+    ...(Array.isArray(value.deviceIdentities) ? value.deviceIdentities : []),
     ...(Array.isArray(value.devices) ? value.devices : []),
     ...(Array.isArray(value.device_aliases) ? value.device_aliases : []),
-    ...(Array.isArray(value.device_aliases) ? value.device_aliases : []),
+    ...(Array.isArray(value.deviceAliases) ? value.deviceAliases : []),
   ];
 }
 
@@ -1649,7 +1649,7 @@ function addUtcDays(date, days) {
 
 function compactDayLabel(key) {
   return dateFromDayKey(key)
-    .toLocaleDateString(undefined, { weekday: "short", time_zone: "UTC" })
+    .toLocaleDateString(undefined, { weekday: "short", timeZone: "UTC" })
     .slice(0, 1);
 }
 
@@ -1662,7 +1662,7 @@ function fullDayLabel(key, todayKey) {
     weekday: "long",
     month: "short",
     day: "numeric",
-    time_zone: "UTC",
+    timeZone: "UTC",
   });
 }
 
@@ -2642,7 +2642,7 @@ function tokenomicsLimitPercentSignature(summary = {}) {
     .join("|");
   const samples = Array.isArray(summary?.limit_samples)
     ? summary.limit_samples
-    : (Array.isArray(summary?.limit_samples) ? summary.limit_samples : []);
+    : (Array.isArray(summary?.limitSamples) ? summary.limitSamples : []);
   const sampleSignature = mergeProviderLimitSamples([], samples)
     .map((row) => {
       const used = limitNumberOrNull(row?.used_percent, row?.limit_used_percent);
@@ -2698,7 +2698,7 @@ function mergeTokenomicsSummary(previous, next) {
     by_device_provider: next.by_device_provider || (clearLegacyRows ? undefined : previous.by_device_provider),
     by_device_account: next.by_device_account || (clearLegacyRows ? undefined : previous.by_device_account),
     by_device_model: next.by_device_model || (clearLegacyRows ? undefined : previous.by_device_model),
-    daily_by_device_provider: next.daily_by_device_provider || clearLegacyRows ? undefined : (previous.daily_by_device_provider),
+    daily_by_device_provider: next.daily_by_device_provider || (clearLegacyRows ? undefined : previous.daily_by_device_provider),
     monthly_by_device_provider: next.monthly_by_device_provider || (clearLegacyRows ? undefined : previous.monthly_by_device_provider),
     hourly: next.hourly || previous.hourly,
     sources: next.sources || previous.sources,
@@ -3629,7 +3629,7 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
   const limitRowsRaw = useMemo(() => limitRowsForDisplay(visibleSummary), [visibleSummary]);
   const limitSamplesRaw = Array.isArray(visibleSummary?.limit_samples)
     ? visibleSummary.limit_samples
-    : (Array.isArray(visibleSummary?.limit_samples) ? visibleSummary.limit_samples : []);
+    : (Array.isArray(visibleSummary?.limitSamples) ? visibleSummary.limitSamples : []);
   const dailyRows = useMemo(
     () => buildDailyRows(dailyRaw, limitSamplesRaw, limitRowsRaw, selectedProvider, selectedAccountFilter, selectedDeviceId, selectedScopeKey, dailyWindowDays),
     [dailyRaw, dailyWindowDays, limitRowsRaw, limitSamplesRaw, selectedAccountFilter, selectedDeviceId, selectedProvider, selectedScopeKey],

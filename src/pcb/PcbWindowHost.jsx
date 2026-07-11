@@ -53,15 +53,15 @@ function parsePcbWindowParams() {
   const search = queryIndex >= 0 ? hash.slice(queryIndex + 1) : "";
   const params = new URLSearchParams(search);
   return {
-    board_path: params.get("board_path") || "",
-    repo_path: params.get("repo_path") || "",
-    board_name: params.get("board_name") || "",
+    board_path: params.get("board_path") || params.get("boardPath") || "",
+    repo_path: params.get("repo_path") || params.get("repoPath") || "",
+    board_name: params.get("board_name") || params.get("boardName") || "",
     mode: params.get("mode") || "",
-    pane_id: params.get("pane_id") || "",
+    pane_id: params.get("pane_id") || params.get("paneId") || "",
     tab: params.get("tab") || "pcb",
     theme: params.get("theme") || "dark",
-    window_id: params.get("window_id") || "",
-    workspace_id: params.get("workspace_id") || "",
+    window_id: params.get("window_id") || params.get("windowId") || "",
+    workspace_id: params.get("workspace_id") || params.get("workspaceId") || "",
   };
 }
 
@@ -248,8 +248,8 @@ export default function PcbWindowHost() {
       }
       setAgentPromptTargets(normalizePanelAgentPromptTargets(payload.targets));
       setDefaultAgentPromptTargetIds(
-        (Array.isArray(payload.default_selected_target_ids)
-          ? payload.default_selected_target_ids
+        (Array.isArray(payload.defaultSelectedTargetIds)
+          ? payload.defaultSelectedTargetIds
           : Array.isArray(payload.default_selected_target_ids)
             ? payload.default_selected_target_ids
             : []

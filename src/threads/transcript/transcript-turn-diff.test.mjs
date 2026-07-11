@@ -118,7 +118,7 @@ function turnItems() {
 test("isTurnDiffMessage detects turn_diff kind variants", () => {
   assert.equal(isTurnDiffMessage(turnDiffMessage()), true);
   assert.equal(isTurnDiffMessage({ kind: "turn-diff" }), true);
-  assert.equal(isTurnDiffMessage({ message_kind: "turn_diff" }), true);
+  assert.equal(isTurnDiffMessage({ messageKind: "turn_diff" }), true);
   assert.equal(isTurnDiffMessage({ kind: "turn_summary" }), false);
   assert.equal(isTurnDiffMessage({}), false);
 });
@@ -135,10 +135,10 @@ test("normalizeTurnDiff reads the §1 contract with camelCase aliases", () => {
 
   const camel = normalizeTurnDiff({
     kind: "turn_diff",
-    turn_id: "turn-9",
+    turnId: "turn-9",
     files: [{ path: "a.js", additions: 1, deletions: 0 }],
-    total_additions: 1,
-    total_deletions: 0,
+    totalAdditions: 1,
+    totalDeletions: 0,
     truncated: true,
   });
   assert.equal(camel.turn_id, "turn-9");
@@ -175,9 +175,9 @@ test("normalizeTurnDiff carries the source record refs and files_omitted", () =>
   assert.equal(diff.truncated, true);
 
   const camel = normalizeTurnDiff(turnDiffMessage({
-    record_id: "rec-78",
-    record_seq: 4211,
-    files_omitted: 1,
+    recordId: "rec-78",
+    recordSeq: 4211,
+    filesOmitted: 1,
   }));
   assert.equal(camel.record_id, "rec-78");
   assert.equal(camel.record_seq, 4211);

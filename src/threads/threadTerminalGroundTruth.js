@@ -134,7 +134,7 @@ function explicitPermissionPromptingUserSignal(source) {
   }
   const sourceText = value.prompting_user_source || value.prompting_source || value.source || value.type || "";
   return promptingUserSignal(
-    value.prompting_user_kind || value.prompting_kind || value.requires_user_input ? "permission" : "approval",
+    value.prompting_user_kind || value.prompting_kind || (value.requires_user_input ? "permission" : "approval"),
     promptingSourceLooksExplicitPermission(sourceText)
       ? sourceText
       : promptingPermissionToken(value)

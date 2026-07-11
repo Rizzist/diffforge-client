@@ -138,7 +138,7 @@ fn tools_window_open(
         .map(|value| value.clamp(TOOLS_WINDOW_MIN_HEIGHT, 1800.0))
         .unwrap_or(TOOLS_WINDOW_DEFAULT_HEIGHT);
     let url = format!(
-        "index.html#/tools-window?key={}&mode={}&theme={}&title={}&windowId={}",
+        "index.html#/tools-window?key={}&mode={}&theme={}&title={}&window_id={}",
         percent_encode_query_component(&key_text),
         percent_encode_query_component(&mode_text),
         percent_encode_query_component(&theme_text),

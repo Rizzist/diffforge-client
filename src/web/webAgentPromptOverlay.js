@@ -301,7 +301,7 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
       state.submitting = true;
       state.selectedIds = selectedIds;
       pushEvent(state, {
-        targetIds: selectedIds,
+        target_ids: selectedIds,
         text: prompt,
         type: "submit"
       });
@@ -1001,8 +1001,8 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
     state.config = {
       activityItems: normalizeActivityItems(CONFIG.activityItems),
       autoDismissCompleted: Boolean(CONFIG.autoDismissCompleted),
-      contextRefs: array(CONFIG.contextRefs),
-      defaultSelectedTargetIds: array(CONFIG.defaultSelectedTargetIds).map(text).filter(Boolean),
+      contextRefs: array(CONFIG.context_refs),
+      defaultSelectedTargetIds: array(CONFIG.default_selected_target_ids).map(text).filter(Boolean),
       targets: normalizeTargets(CONFIG.targets)
     };
     state.selectedIds = normalizeSelectedIds(state.config.targets, state.selectedIds, state.config.defaultSelectedTargetIds);

@@ -440,9 +440,9 @@ fn agent_account_push_status_text(event: &Value, keys: &[&str]) -> Option<String
 }
 
 fn agent_account_push_status_push_id(event: &Value) -> Option<String> {
-    agent_account_push_status_text(event, &["push_id", "intent_id"])
+    agent_account_push_status_text(event, &["push_id", "pushId", "intent_id", "intentId"])
         .or_else(|| {
-            cloud_mcp_remote_command_field_text(event, &["command_id"]).and_then(
+            cloud_mcp_remote_command_field_text(event, &["command_id", "commandId"]).and_then(
                 |command_id| {
                     command_id
                         .strip_prefix("agent-account-push-")
@@ -455,9 +455,11 @@ fn agent_account_push_status_push_id(event: &Value) -> Option<String> {
 }
 
 fn agent_account_push_status_reporting_device_id(event: &Value) -> Option<String> {
-    agent_account_push_status_text(event, &["device_id", "machine_id"])
+    agent_account_push_status_text(event, &["device_id", "deviceId", "machine_id", "machineId"])
         .or_else(|| cloud_mcp_payload_text(event, &["device", "device_id"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["device", "deviceId"]))
         .or_else(|| cloud_mcp_payload_text(event, &["payload", "device", "device_id"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "device", "deviceId"]))
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
@@ -468,7 +470,7 @@ fn agent_account_push_status_matches_pending(
     pending: &AgentAccountPushPending,
 ) -> bool {
     let expected_command_id = format!("agent-account-push-{push_id}");
-    let command_id = cloud_mcp_remote_command_field_text(event, &["command_id"])
+    let command_id = cloud_mcp_remote_command_field_text(event, &["command_id", "commandId"])
         .unwrap_or_default();
     if command_id != expected_command_id {
         return false;
@@ -489,14 +491,16 @@ fn agent_account_push_status_has_valid_completion_proof(
         event,
         &[
             "recipient_proof_b64",
+            "recipientProofB64",
             "ack_proof_b64",
+            "ackProofB64",
         ],
     ) else {
         return false;
     };
     let local_device = cloud_mcp_desktop_device_profile();
     let sender_device_id =
-        cloud_mcp_payload_text(&local_device, &["device_id"]).unwrap_or_default();
+        cloud_mcp_payload_text(&local_device, &["device_id", "deviceId"]).unwrap_or_default();
     let Ok(payload) = agent_account_push_ack_payload(
         push_id,
         &pending.ack_nonce_b64,
@@ -516,14 +520,14 @@ fn agent_account_push_status_has_valid_completion_proof(
 
 fn agent_account_push_handle_remote_status_inner(app: Option<&AppHandle>, event: &Value) -> bool {
     let event_kind =
-        cloud_mcp_payload_text(event, &["event_kind", "kind"]).unwrap_or_default();
+        cloud_mcp_payload_text(event, &["event_kind", "eventKind", "kind"]).unwrap_or_default();
     if !matches!(
         event_kind.as_str(),
         "remote_command_ack" | "remote_command_result"
     ) {
         return false;
     }
-    let command_kind = cloud_mcp_remote_command_field_text(event, &["command_kind"])
+    let command_kind = cloud_mcp_remote_command_field_text(event, &["command_kind", "commandKind"])
         .unwrap_or_default()
         .to_ascii_lowercase()
         .replace(['.', ' ', '-'], "_");
@@ -3114,13 +3118,19 @@ fn agent_account_push_device_matches_id(device: &Value, target_device_id: &str) 
     }
     let ids = [
         &["device_id"][..],
+        &["deviceId"][..],
         &["machine_id"][..],
+        &["machineId"][..],
         &["id"][..],
         &["native_device_id"][..],
+        &["nativeDeviceId"][..],
         &["target_native_device_id"][..],
+        &["targetNativeDeviceId"][..],
         &["device", "device_id"][..],
+        &["device", "deviceId"][..],
         &["device", "id"][..],
         &["surfaces", "native", "device_id"][..],
+        &["surfaces", "native", "deviceId"][..],
     ];
     ids.iter().any(|path| {
         cloud_mcp_payload_text(device, path)
@@ -3173,6 +3183,7 @@ fn agent_account_push_find_device_candidate(
 fn agent_account_push_device_online(device: &Value) -> bool {
     let native_connected = [
         &["native_connected"][..],
+        &["nativeConnected"][..],
         &["native", "connected"][..],
         &["surfaces", "native", "connected"][..],
     ]
@@ -3185,8 +3196,11 @@ fn agent_account_push_device_online(device: &Value) -> bool {
         device,
         &[
             &["client_type"][..],
+            &["clientType"][..],
             &["client_kind"][..],
+            &["clientKind"][..],
             &["connection_source"][..],
+            &["connectionSource"][..],
         ],
     )
     .map(|value| {
@@ -3200,6 +3214,7 @@ fn agent_account_push_device_online(device: &Value) -> bool {
             &["status"][..],
             &["state"][..],
             &["connection_status"][..],
+            &["connectionStatus"][..],
         ],
     )
     .map(|value| {
@@ -3224,15 +3239,21 @@ fn agent_account_push_target_key(device: &Value) -> Result<(String, String), Str
         device,
         &[
             &["push_public_key"][..],
+            &["pushPublicKey"][..],
             &["device", "push_public_key"][..],
+            &["device", "pushPublicKey"][..],
             &["surfaces", "native", "push_public_key"][..],
+            &["surfaces", "native", "pushPublicKey"][..],
         ],
     )
     .unwrap_or_default();
     let push_capable = [
         &["push_capable"][..],
+        &["pushCapable"][..],
         &["device", "push_capable"][..],
+        &["device", "pushCapable"][..],
         &["surfaces", "native", "push_capable"][..],
+        &["surfaces", "native", "pushCapable"][..],
     ]
     .iter()
     .any(|path| cloud_mcp_payload_bool(device, path, false));
@@ -3246,8 +3267,11 @@ fn agent_account_push_target_key(device: &Value) -> Result<(String, String), Str
         device,
         &[
             &["push_key_algorithm"][..],
+            &["pushKeyAlgorithm"][..],
             &["device", "push_key_algorithm"][..],
+            &["device", "pushKeyAlgorithm"][..],
             &["surfaces", "native", "push_key_algorithm"][..],
+            &["surfaces", "native", "pushKeyAlgorithm"][..],
         ],
     )
     .unwrap_or_default();
@@ -7210,6 +7234,67 @@ mod agent_accounts_tests {
 
         assert!(error.contains("outside managed storage"));
         assert!(escaped_dir.join("auth.json").is_file());
+    }
+
+    #[test]
+    fn agent_account_push_accepts_legacy_camel_case_device_and_status_payloads() {
+        let device = json!({
+            "nativeDeviceId": "Device-B",
+            "clientType": "desktop",
+            "connectionStatus": "online",
+            "connected": true,
+            "device": {
+                "pushPublicKey": "legacy-public-key",
+                "pushCapable": true,
+                "pushKeyAlgorithm": AGENT_ACCOUNT_PUSH_SEALED_ALGORITHM
+            }
+        });
+        assert!(agent_account_push_device_matches_id(&device, "device-b"));
+        assert!(agent_account_push_device_online(&device));
+        assert_eq!(
+            agent_account_push_target_key(&device).unwrap(),
+            (
+                "legacy-public-key".to_string(),
+                AGENT_ACCOUNT_PUSH_SEALED_ALGORITHM.to_string()
+            )
+        );
+
+        let event = json!({
+            "eventKind": "remote_command_ack",
+            "commandKind": "agent_account_push",
+            "commandId": "agent-account-push-push-legacy",
+            "pushId": "push-legacy",
+            "status": "accepted",
+            "device": { "deviceId": "Device-B" }
+        });
+        let pending = AgentAccountPushPending {
+            agent_kind: "codex".to_string(),
+            profile_id: "default".to_string(),
+            target_device_id: "device-b".to_string(),
+            wipe_local_after: false,
+            identity_email: String::new(),
+            delivered: false,
+            created_at_ms: todo_dispatch_now_ms(),
+            expires_at_ms: todo_dispatch_now_ms()
+                .saturating_add(AGENT_ACCOUNT_PUSH_BLOB_TTL_MS),
+            ack_nonce_b64: String::new(),
+            target_push_public_key_b64: String::new(),
+            source_credentials_sha256: String::new(),
+        };
+        assert_eq!(
+            agent_account_push_status_push_id(&event).as_deref(),
+            Some("push-legacy")
+        );
+        assert_eq!(
+            agent_account_push_status_reporting_device_id(&event).as_deref(),
+            Some("Device-B")
+        );
+        assert!(agent_account_push_status_matches_pending(
+            &event,
+            "push-legacy",
+            &pending
+        ));
+        assert!(agent_account_push_handle_remote_status_inner(None, &event));
     }
 
     #[test]

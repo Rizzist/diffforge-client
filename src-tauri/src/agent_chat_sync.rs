@@ -2536,7 +2536,9 @@ fn agent_chat_session_sync_claude_messages_for_line(
     }
     if role == "assistant"
         && claude_stop_reason_completes_turn(&value_string(
-            message.get("stop_reason"),
+            message
+                .get("stop_reason")
+                .or_else(|| value.get("stop_reason")),
         ))
     {
         messages.push(transcript_task_complete_message(
@@ -4621,6 +4623,28 @@ fn agent_chat_session_sync_spawn_from_payload_repair(
 #[cfg(test)]
 mod agent_chat_session_sync_tests {
     use super::*;
+
+    #[test]
+    fn claude_sync_accepts_top_level_stop_reason() {
+        let value = json!({
+            "type": "assistant",
+            "stop_reason": "end_turn",
+            "message": {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "Done." }]
+            }
+        });
+        let messages = agent_chat_session_sync_claude_messages_for_line(
+            1,
+            "2026-07-11T00:00:00Z",
+            &value,
+            &mut TranscriptClaudeSidechainTracker::default(),
+        );
+
+        assert!(messages
+            .iter()
+            .any(|message| message.kind == "task_complete"));
+    }
 
     fn test_history_item(
         provider_session_id: &str,

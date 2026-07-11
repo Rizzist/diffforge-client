@@ -196,11 +196,11 @@ function parseTerminalWindowParams() {
     agent_kind: params.get("agent_kind") || "",
     agent_label: params.get("agent_label") || params.get("title") || "Terminal",
     color_slot: params.get("color_slot") || "",
-    pane_id: params.get("pane_id") || "",
-    terminal_index: Number.parseInt(params.get("terminal_index") || "0", 10) || 0,
+    pane_id: params.get("pane_id") || params.get("paneId") || "",
+    terminal_index: Number.parseInt(params.get("terminal_index") || params.get("terminalIndex") || "0", 10) || 0,
     theme: params.get("theme") || "",
     title: params.get("title") || "Terminal",
-    workspace_id: params.get("workspace_id") || "",
+    workspace_id: params.get("workspace_id") || params.get("workspaceId") || "",
   };
 }
 

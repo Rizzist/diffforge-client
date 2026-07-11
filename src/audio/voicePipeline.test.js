@@ -160,6 +160,7 @@ test("default programmer dictionary is selected and not duplicated", () => {
   assert.equal(first.dictionary[0].id, DEFAULT_VOICE_DICTIONARY_LIST_ID);
   assert.equal(first.dictionary[0].selected, true);
   assert.ok(first.dictionary[0].terms.includes("Diff Forge AI"));
+  assert.ok(first.dictionary[0].terms.includes("DiffForge"));
   assert.ok(first.dictionary[0].terms.includes("tokenomics"));
   assert.equal(
     second.dictionary.filter((list) => list.id === DEFAULT_VOICE_DICTIONARY_LIST_ID).length,

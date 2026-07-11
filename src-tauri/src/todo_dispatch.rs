@@ -1625,8 +1625,6 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                                     }
                                     remote_object
                                         .insert("action_kind".to_string(), json!(action_kind));
-                                    remote_object
-                                        .insert("action_kind".to_string(), json!(action_kind));
                                     remote_object.insert(
                                         "command_kind".to_string(),
                                         json!(command_kind.clone()),
@@ -3184,7 +3182,7 @@ fn todo_store_strip_legacy_queue_state(item: &mut Value) -> bool {
         return false;
     };
     let mut changed = false;
-    for key in ["queue_state"] {
+    for key in ["queue_state", "queueState"] {
         if object.remove(key).is_some() {
             changed = true;
         }
@@ -3228,14 +3226,12 @@ fn todo_store_set_item_status(item: &mut Value, status: &str, reason: &str) {
         object.insert("lifecycle_owner".to_string(), json!("rust"));
         object.insert("rust_owned".to_string(), json!(true));
         object.remove("queue_state");
+        object.remove("queueState");
         match status.as_str() {
             "queued" => {
                 object
                     .entry("queued_at".to_string())
                     .or_insert_with(|| json!(now_iso.clone()));
-                object
-                    .entry("queued_at".to_string())
-                    .or_insert_with(|| json!(now_iso));
             }
             "listed" => {}
             "completed" => {
@@ -3534,12 +3530,10 @@ fn todo_dispatch_todo_sync_commit_payload(
                 "client_action_id".to_string(),
                 json!(client_action_id.clone()),
             );
-            meta_object.insert("client_action_id".to_string(), json!(client_action_id));
         }
         meta_object.insert("action_kind".to_string(), json!(action_kind));
         if !command_kind.is_empty() {
             meta_object.insert("command_kind".to_string(), json!(command_kind.clone()));
-            meta_object.insert("command_kind".to_string(), json!(command_kind));
         }
         if !origin_client_id.is_empty() {
             meta_object.insert(
@@ -3556,7 +3550,6 @@ fn todo_dispatch_todo_sync_commit_payload(
                 "request_device_id".to_string(),
                 json!(origin_device_id.clone()),
             );
-            meta_object.insert("request_device_id".to_string(), json!(origin_device_id));
         }
         if !origin_workspace_id.is_empty() {
             meta_object.insert(
@@ -4478,20 +4471,8 @@ fn todo_store_build_created_item(
                 &["loop_runtime_run_id", "run_id"][..],
             ),
             (
-                "loop_runtime_run_id",
-                &["loop_runtime_run_id", "run_id"][..],
-            ),
-            (
                 "loop_runtime_node_id",
                 &["loop_runtime_node_id", "node_id"][..],
-            ),
-            (
-                "loop_runtime_node_id",
-                &["loop_runtime_node_id", "node_id"][..],
-            ),
-            (
-                "loop_runtime_edge_id",
-                &["loop_runtime_edge_id", "edge_id"][..],
             ),
             (
                 "loop_runtime_edge_id",
@@ -4502,15 +4483,7 @@ fn todo_store_build_created_item(
                 "trigger_run_id",
                 &["trigger_run_id"][..],
             ),
-            (
-                "trigger_run_id",
-                &["trigger_run_id"][..],
-            ),
             ("source", &["source", "source_kind"][..]),
-            (
-                "target_terminal_mode",
-                &["target_terminal_mode"][..],
-            ),
             (
                 "target_terminal_mode",
                 &["target_terminal_mode"][..],
@@ -4520,12 +4493,6 @@ fn todo_store_build_created_item(
             if !value.is_empty() {
                 remote_command.insert(target_key.to_string(), json!(value));
             }
-        }
-        if source_kind == "loopspace-dispatch-todos" && !remote_command.contains_key("command_kind") {
-            remote_command.insert(
-                "command_kind".to_string(),
-                json!("loopspace_dispatch_todos"),
-            );
         }
         if source_kind == "loopspace-dispatch-todos" && !remote_command.contains_key("command_kind") {
             remote_command.insert(
@@ -4910,14 +4877,6 @@ async fn todo_store_dispatch_loopspace_batch(
                 &["command_kind", "kind", "type", "action"][..],
             ),
             (
-                "command_kind",
-                &["command_kind", "kind", "type", "action"][..],
-            ),
-            (
-                "target_terminal_mode",
-                &["target_terminal_mode", "terminal_mode"][..],
-            ),
-            (
                 "target_terminal_mode",
                 &["target_terminal_mode", "terminal_mode"][..],
             ),
@@ -4930,23 +4889,11 @@ async fn todo_store_dispatch_loopspace_batch(
                 json!("loopspace_dispatch_todos"),
             );
         }
-        if !base.contains_key("command_kind") {
-            base.insert(
-                "command_kind".to_string(),
-                json!("loopspace_dispatch_todos"),
-            );
-        }
         let default_target_terminal_mode = if !target_terminal_id.is_empty() || target_terminal_index.is_some() {
             "pinned"
         } else {
             "auto"
         };
-        if !base.contains_key("target_terminal_mode") {
-            base.insert(
-                "target_terminal_mode".to_string(),
-                json!(default_target_terminal_mode),
-            );
-        }
         if !base.contains_key("target_terminal_mode") {
             base.insert(
                 "target_terminal_mode".to_string(),
@@ -8194,7 +8141,7 @@ mod todo_store_tests {
     fn status_setter_stamps_both_field_families_and_timestamps() {
         let mut item = json!({
             "id": "item-1",
-            "queue_state": { "phase": "sending" },
+            "queueState": { "phase": "sending" },
             "queue_state": { "phase": "queued" },
             "todo_status": "running",
             "status": "running",
@@ -8206,6 +8153,7 @@ mod todo_store_tests {
         assert_eq!(item["status_reason"], "todo_history_cancel");
         assert!(item["updated_at_ms"].as_u64().unwrap() > 0);
         assert!(item["updated_at"].as_str().unwrap().ends_with('Z'));
+        assert!(item.get("queueState").is_none());
         assert!(item.get("queue_state").is_none());
     }
 
@@ -8213,11 +8161,12 @@ mod todo_store_tests {
     fn queue_snapshot_canonicalization_strips_js_queue_state() {
         let items = todo_store_canonicalize_settled_items(vec![json!({
             "id": "item-1",
-            "queue_state": { "phase": "sending" },
+            "queueState": { "phase": "sending" },
             "queue_state": { "phase": "queued" },
             "status": "running",
         })]);
         assert_eq!(items.len(), 1);
+        assert!(items[0].get("queueState").is_none());
         assert!(items[0].get("queue_state").is_none());
         assert_eq!(items[0]["status"], "running");
     }
@@ -9068,7 +9017,6 @@ fn todo_dispatch_set_value_inputs(value: &mut Value, inputs: Vec<Value>) {
                 .unwrap_or(0)),
         );
         if let Some(inputs) = object.get("inputs").cloned() {
-            object.insert("todo_inputs".to_string(), inputs.clone());
             object.insert("todo_inputs".to_string(), inputs);
         }
     }

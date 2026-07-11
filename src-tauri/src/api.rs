@@ -1615,19 +1615,31 @@ fn desktop_auth_percent_encode_query_component(value: &str) -> String {
 fn desktop_auth_login_url(state: &str) -> String {
     let mut pairs = vec![("state".to_string(), state.to_string())];
     pairs.push((
-        "desktopCallbackScheme".to_string(),
+        "desktop_callback_scheme".to_string(),
         desktop_auth_callback_scheme().to_string(),
     ));
     let device_profile = cloud_mcp_desktop_device_profile();
-	    for (key, path) in [
-	        ("desktopDeviceId", &["device_id", "deviceId"][..]),
-	        ("desktopDeviceName", &["device_name", "deviceName", "machine_name", "machineName"][..]),
-	        ("desktopPlatform", &["platform", "os"][..]),
-	        ("desktopFormFactor", &["form_factor", "formFactor", "device_type", "deviceType"][..]),
-	        ("desktopAppVersion", &["app_version", "appVersion"][..]),
-	        ("desktopArchitecture", &["architecture", "arch"][..]),
-	        ("desktopBuildChannel", &["build_channel", "buildChannel"][..]),
-	    ] {
+    for (key, path) in [
+        ("desktop_device_id", &["device_id", "deviceId"][..]),
+        (
+            "desktop_device_name",
+            &["device_name", "deviceName", "machine_name", "machineName"][..],
+        ),
+        ("desktop_platform", &["platform", "os"][..]),
+        (
+            "desktop_form_factor",
+            &["form_factor", "formFactor", "device_type", "deviceType"][..],
+        ),
+        (
+            "desktop_app_version",
+            &["app_version", "appVersion"][..],
+        ),
+        ("desktop_architecture", &["architecture", "arch"][..]),
+        (
+            "desktop_build_channel",
+            &["build_channel", "buildChannel"][..],
+        ),
+    ] {
         if let Some(value) = cloud_mcp_payload_text(&device_profile, path) {
             pairs.push((key.to_string(), value));
         }
@@ -1862,7 +1874,7 @@ async fn desktop_billing_start_topup_checkout(
         .bearer_auth(token)
         .json(&json!({
             "packs": packs,
-            "desktopCallbackScheme": desktop_auth_callback_scheme(),
+            "desktop_callback_scheme": desktop_auth_callback_scheme(),
         }))
         .send()
         .await
@@ -2514,7 +2526,7 @@ fn poll_desktop_device_authorization_blocking(device_code: &str) -> Result<Value
     let client = blocking_http_client(Duration::from_secs(DEVICE_AUTH_POLL_TIMEOUT_SECS))?;
     let response = client
         .post(api_endpoint("desktop/device-codes/token"))
-        .json(&json!({ "deviceCode": device_code }))
+        .json(&json!({ "device_code": device_code }))
         .send()
         .map_err(|error| format!("Unable to check device sign in: {error}"))?;
     let (status, body) =
@@ -3010,21 +3022,21 @@ fn desktop_auth_cli_login(args: &[String]) -> i32 {
         }
     };
     let device_code = authorization
-        .get("deviceCode")
+        .get("device_code")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
     let user_code = authorization
-        .get("userCode")
+        .get("user_code")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
     let verification_uri = authorization
-        .get("verificationUri")
+        .get("verification_uri")
         .and_then(Value::as_str)
         .unwrap_or("https://diffforge.ai/device");
     let verification_uri_complete = authorization
-        .get("verificationUriComplete")
+        .get("verification_uri_complete")
         .and_then(Value::as_str)
         .unwrap_or(verification_uri);
     let mut interval = authorization
@@ -3033,7 +3045,7 @@ fn desktop_auth_cli_login(args: &[String]) -> i32 {
         .unwrap_or(5)
         .clamp(2, 30);
     let expires_in = authorization
-        .get("expiresIn")
+        .get("expires_in")
         .and_then(Value::as_u64)
         .unwrap_or(600);
 
@@ -3235,6 +3247,42 @@ pub fn run_desktop_auth_cli(args: &[String]) -> i32 {
 #[cfg(test)]
 mod desktop_auth_tests {
     use super::*;
+
+    #[test]
+    fn desktop_auth_login_url_uses_snake_case_query_keys() {
+        let url = reqwest::Url::parse(&desktop_auth_login_url("state-123"))
+            .expect("desktop login URL");
+        let query = url
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        for key in [
+            "state",
+            "desktop_callback_scheme",
+            "desktop_device_id",
+            "desktop_device_name",
+            "desktop_platform",
+            "desktop_form_factor",
+            "desktop_app_version",
+            "desktop_architecture",
+            "desktop_build_channel",
+        ] {
+            assert!(query.contains_key(key), "missing snake_case query key {key}");
+        }
+        for key in [
+            "desktopCallbackScheme",
+            "desktopDeviceId",
+            "desktopDeviceName",
+            "desktopPlatform",
+            "desktopFormFactor",
+            "desktopAppVersion",
+            "desktopArchitecture",
+            "desktopBuildChannel",
+        ] {
+            assert!(!query.contains_key(key), "found camelCase query key {key}");
+        }
+    }
 
     #[test]
     fn public_snapshot_redacts_private_auth_values() {

@@ -12,6 +12,7 @@ export const DEFAULT_VOICE_DICTIONARY_TERMS = Object.freeze([
   "Diff Forge AI",
   "Diff Forge Cloud",
   "Diff Forge",
+  "DiffForge",
   "Rust client",
   "token",
   "tokens",

@@ -97,7 +97,7 @@ function parseToolsWindowParams() {
     mode: normalizedMode(params.get("mode")),
     theme: normalizedWindowTheme(params.get("theme")),
     title: params.get("title") || "Tools",
-    window_id: params.get("window_id") || getCurrentWebviewWindow().label || "",
+    window_id: params.get("window_id") || params.get("windowId") || getCurrentWebviewWindow().label || "",
   };
 }
 
@@ -560,8 +560,8 @@ export default function ToolsWindowHost() {
       }
       setAgentPromptTargets(normalizePanelAgentPromptTargets(payload.targets));
       setDefaultAgentPromptTargetIds(
-        (Array.isArray(payload.default_selected_target_ids)
-          ? payload.default_selected_target_ids
+        (Array.isArray(payload.defaultSelectedTargetIds)
+          ? payload.defaultSelectedTargetIds
           : Array.isArray(payload.default_selected_target_ids)
             ? payload.default_selected_target_ids
             : []

@@ -14307,14 +14307,9 @@ fn tokenomics_normalize_cloud_relay_summary(summary: &Value) -> Value {
     normalized.insert("hourly".to_string(), json!(hourly));
     normalized.insert(
         "hourly_group_replacements".to_string(),
-        json!(hourly_group_replacements.clone()),
-    );
-    normalized.insert(
-        "hourly_group_replacements".to_string(),
         json!(hourly_group_replacements),
     );
     normalized.insert("limits".to_string(), json!(limits));
-    normalized.insert("limit_samples".to_string(), json!(limit_samples.clone()));
     normalized.insert("limit_samples".to_string(), json!(limit_samples));
     Value::Object(normalized)
 }
@@ -16296,7 +16291,6 @@ fn tokenomics_mark_usage_updated_at(usage: &mut Value, updated_at: String) {
         return;
     };
     object.insert("updated_at".to_string(), json!(updated_at.clone()));
-    object.insert("last_known_at".to_string(), json!(updated_at.clone()));
     object.insert("last_known_at".to_string(), json!(updated_at));
 }
 

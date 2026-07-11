@@ -107,8 +107,8 @@ function assetLibraryClouds(value) {
     ? jsonArray(fanout.clouds)
     : jsonArray(data.clouds).length
     ? jsonArray(data.clouds)
-    : jsonArray(data.asset_clouds).length
-      ? jsonArray(data.asset_clouds)
+    : jsonArray(data.assetClouds).length
+      ? jsonArray(data.assetClouds)
       : jsonArray(data.asset_clouds);
   const byId = new Map();
   const add = (cloud) => {

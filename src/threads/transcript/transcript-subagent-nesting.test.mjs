@@ -80,13 +80,32 @@ test("messageSubagent extracts parent and session references", () => {
     provider_session_id: "ps-9",
   });
   const camel = messageSubagent({
-    subagent: { id: "sa-3", parent_id: "sa-2", provider_session_id: "ps-1" },
+    subagent: {
+      id: "sa-3",
+      parentId: "sa-2",
+      agentChatSessionId: "acs-1",
+      providerSessionId: "ps-1",
+    },
   });
   assert.equal(camel.parent_id, "sa-2");
-  assert.deepEqual(camel.session_ref, { agent_chat_session_id: "", provider_session_id: "ps-1" });
+  assert.deepEqual(camel.session_ref, { agent_chat_session_id: "acs-1", provider_session_id: "ps-1" });
   const bare = messageSubagent({ subagent: { id: "sa-4" } });
   assert.equal(bare.parent_id, "");
   assert.equal(bare.session_ref, null);
+});
+
+test("messageSubagent preserves a top-level subagent id", () => {
+  const subagent = messageSubagent({
+    id: "message-1",
+    subagent_id: "sa-top-level",
+  });
+  const camel = messageSubagent({
+    id: "message-2",
+    subagentId: "sa-top-level-camel",
+  });
+
+  assert.equal(subagent.id, "sa-top-level");
+  assert.equal(camel.id, "sa-top-level-camel");
 });
 
 /* ------------------------------------------------------------------ */

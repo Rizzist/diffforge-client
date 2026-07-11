@@ -1402,6 +1402,7 @@ const WORKSPACE_THREADS_PERSISTED_CAMEL_KEYS: &[&str] = &[
     "agentKind",
     "archivedThreadOrder",
     "archivedThreads",
+    "callId",
     "canonicalKind",
     "changedFiles",
     "completedAt",
@@ -1518,6 +1519,73 @@ fn workspace_threads_dynamic_schema_map_key(key: &str) -> bool {
     )
 }
 
+fn workspace_threads_opaque_payload_key(key: &str) -> bool {
+    matches!(
+        key,
+        "rawPayload"
+            | "raw_payload"
+            | "rawToolPayload"
+            | "raw_tool_payload"
+            | "toolError"
+            | "tool_error"
+            | "toolInput"
+            | "tool_input"
+            | "toolOutput"
+            | "tool_output"
+    )
+}
+
+fn workspace_threads_tool_wrapper_key(key: &str) -> bool {
+    matches!(key, "tool" | "toolCall" | "tool_call")
+}
+
+fn workspace_threads_tool_payload_child_key(key: &str) -> bool {
+    matches!(
+        key,
+        "args"
+            | "arguments"
+            | "error"
+            | "input"
+            | "output"
+            | "raw"
+            | "result"
+            | "stderr"
+            | "toolError"
+            | "tool_error"
+            | "toolInput"
+            | "tool_input"
+            | "toolOutput"
+            | "tool_output"
+    )
+}
+
+fn workspace_threads_map_tool_wrapper_values(value: Value, to_runtime: bool) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| workspace_threads_map_tool_wrapper_values(item, to_runtime))
+                .collect(),
+        ),
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .map(|(key, item)| {
+                    let opaque = workspace_threads_tool_payload_child_key(&key);
+                    let mapped_key = workspace_threads_persisted_key(key, to_runtime);
+                    let mapped_item = if opaque {
+                        item
+                    } else {
+                        workspace_threads_map_persisted_keys(item, to_runtime)
+                    };
+                    (mapped_key, mapped_item)
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 fn workspace_threads_map_dynamic_schema_values(value: Value, to_runtime: bool) -> Value {
     match value {
         Value::Object(object) => Value::Object(
@@ -1548,8 +1616,14 @@ fn workspace_threads_map_persisted_keys(value: Value, to_runtime: bool) -> Value
                 .into_iter()
                 .map(|(key, item)| {
                     let dynamic = workspace_threads_dynamic_schema_map_key(&key);
+                    let opaque = workspace_threads_opaque_payload_key(&key);
+                    let tool_wrapper = workspace_threads_tool_wrapper_key(&key);
                     let mapped_key = workspace_threads_persisted_key(key, to_runtime);
-                    let mapped_item = if dynamic {
+                    let mapped_item = if opaque {
+                        item
+                    } else if tool_wrapper {
+                        workspace_threads_map_tool_wrapper_values(item, to_runtime)
+                    } else if dynamic {
                         workspace_threads_map_dynamic_schema_values(item, to_runtime)
                     } else {
                         workspace_threads_map_persisted_keys(item, to_runtime)
@@ -2550,6 +2624,96 @@ async fn workspace_agent_session_history_list(
 #[cfg(test)]
 mod workspace_threads_store_tests {
     use super::*;
+
+    #[test]
+    fn persisted_key_mapping_preserves_opaque_provider_payloads() {
+        let runtime = json!({
+            "raw_payload": {
+                "filePath": "/tmp/input",
+                "nestedPayload": { "toolInput": { "someValue": 1 } }
+            },
+            "raw_tool_payload": [{ "toolCall": { "callId": "call-1" } }],
+            "tool_error": { "errorCode": "E_PROVIDER", "retryAfterMs": 250 },
+            "tool_input": { "filePath": "/tmp/tool-input", "workspaceId": "vendor-workspace" },
+            "tool_output": { "resultPath": "/tmp/tool-output", "nestedValue": { "rowId": 7 } },
+            "tool": {
+                "call_id": "call-structured",
+                "input": { "filePath": "/tmp/structured-input", "workspaceId": "opaque-workspace" },
+                "output": { "resultPath": "/tmp/structured-output" }
+            },
+            "call_id": "call-top-level",
+            "thread_id": "thread-1"
+        });
+        let persisted = workspace_threads_map_persisted_keys(runtime.clone(), false);
+
+        assert_eq!(
+            persisted.pointer("/rawPayload/filePath").and_then(Value::as_str),
+            Some("/tmp/input")
+        );
+        assert_eq!(
+            persisted
+                .pointer("/rawPayload/nestedPayload/toolInput/someValue")
+                .and_then(Value::as_i64),
+            Some(1)
+        );
+        assert_eq!(
+            persisted
+                .pointer("/rawToolPayload/0/toolCall/callId")
+                .and_then(Value::as_str),
+            Some("call-1")
+        );
+        assert_eq!(
+            persisted
+                .pointer("/toolInput/filePath")
+                .and_then(Value::as_str),
+            Some("/tmp/tool-input")
+        );
+        assert_eq!(
+            persisted
+                .pointer("/toolInput/workspaceId")
+                .and_then(Value::as_str),
+            Some("vendor-workspace")
+        );
+        assert_eq!(
+            persisted
+                .pointer("/toolOutput/nestedValue/rowId")
+                .and_then(Value::as_i64),
+            Some(7)
+        );
+        assert_eq!(
+            persisted
+                .pointer("/toolError/retryAfterMs")
+                .and_then(Value::as_i64),
+            Some(250)
+        );
+        assert_eq!(
+            persisted.pointer("/tool/callId").and_then(Value::as_str),
+            Some("call-structured")
+        );
+        assert_eq!(
+            persisted.get("callId").and_then(Value::as_str),
+            Some("call-top-level")
+        );
+        assert_eq!(
+            persisted
+                .pointer("/tool/input/filePath")
+                .and_then(Value::as_str),
+            Some("/tmp/structured-input")
+        );
+        assert_eq!(
+            persisted
+                .pointer("/tool/input/workspaceId")
+                .and_then(Value::as_str),
+            Some("opaque-workspace")
+        );
+        assert!(persisted.pointer("/tool/input/file_path").is_none());
+        assert!(persisted.get("threadId").is_some());
+
+        assert_eq!(
+            workspace_threads_map_persisted_keys(persisted, true),
+            runtime
+        );
+    }
 
     fn unique_workspace_threads_test_root(name: &str) -> PathBuf {
         let nanos = SystemTime::now()

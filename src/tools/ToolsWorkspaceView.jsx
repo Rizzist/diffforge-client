@@ -4306,11 +4306,11 @@ function ToolsWorkspaceView({
     const requestedFileName = hasOwn("file_name") ? text(input.file_name) : "";
     const requestedFilePath = hasOwn("file_path") ? normalizedDocumentPath(input.file_path) : "";
     const requestedPathKey = hasOwn("path_key") ? normalizedDocumentPath(input.path_key) : "";
-    const hasContentPatch = hasOwn("content_md") || hasOwn("content") || hasOwn("body");
+    const hasContentPatch = hasOwn("content_md") || hasOwn("contentMd") || hasOwn("content") || hasOwn("body");
     const requestedContent = hasOwn("content_md")
       ? String(input.content_md ?? "")
-      : hasOwn("content_md")
-        ? String(input.content_md ?? "")
+      : hasOwn("contentMd")
+        ? String(input.contentMd ?? "")
       : hasOwn("content")
         ? String(input.content ?? "")
         : hasOwn("body")

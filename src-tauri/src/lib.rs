@@ -3853,7 +3853,7 @@ fn workspace_activation_role_for_index(
         settings,
         slot_index,
         position,
-        &["terminalRoles"],
+        &["terminalRoles", "terminal_roles"],
     )
     .and_then(|value| match value {
         Value::String(text) => Some(text.as_str()),
@@ -3873,12 +3873,18 @@ fn workspace_activation_permission_for_index(
         settings,
         slot_index,
         position,
-        &["agentPermissions", "permissionModes"],
+        &[
+            "agentPermissions",
+            "agent_permissions",
+            "permissionModes",
+            "permission_modes",
+        ],
     )
     .and_then(|value| match value {
         Value::String(text) => Some(text.as_str()),
         Value::Object(object) => object
             .get("permissionMode")
+            .or_else(|| object.get("permission_mode"))
             .or_else(|| object.get("mode"))
             .and_then(Value::as_str),
         _ => None,
@@ -3891,7 +3897,14 @@ fn workspace_activation_pane_kind(value: Option<&Value>) -> Option<String> {
         Value::String(text) => Some(text.trim().to_ascii_lowercase()),
         Value::Object(_) => workspace_activation_text(
             value,
-            &["kind", "paneKind", "type", "surfaceKind"],
+            &[
+                "kind",
+                "paneKind",
+                "pane_kind",
+                "type",
+                "surfaceKind",
+                "surface_kind",
+            ],
         )
         .map(|value| value.to_ascii_lowercase()),
         _ => None,
@@ -3910,7 +3923,7 @@ fn workspace_activation_pane_kind(value: Option<&Value>) -> Option<String> {
 
 fn workspace_activation_pane_records(settings: &Value) -> HashMap<usize, Value> {
     let mut records = HashMap::new();
-    for key in ["panes", "workspacePanes"] {
+    for key in ["panes", "workspacePanes", "workspace_panes"] {
         let Some(value) = settings.get(key) else {
             continue;
         };
@@ -3918,7 +3931,15 @@ fn workspace_activation_pane_records(settings: &Value) -> HashMap<usize, Value> 
             for (fallback_index, item) in array.iter().enumerate() {
                 let index = workspace_activation_i64(
                     item,
-                    &["logicalIndex", "terminalIndex", "slotIndex", "index"],
+                    &[
+                        "logicalIndex",
+                        "logical_index",
+                        "terminalIndex",
+                        "terminal_index",
+                        "slotIndex",
+                        "slot_index",
+                        "index",
+                    ],
                 )
                 .and_then(|value| (value >= 0).then_some(value as usize))
                 .unwrap_or(fallback_index);
@@ -3937,7 +3958,7 @@ fn workspace_activation_pane_records(settings: &Value) -> HashMap<usize, Value> 
 
 fn workspace_activation_panel_indexes(settings: &Value) -> HashMap<usize, String> {
     let mut indexes = HashMap::new();
-    for key in ["paneKinds", "panelKinds"] {
+    for key in ["paneKinds", "pane_kinds", "panelKinds", "panel_kinds"] {
         let Some(value) = settings.get(key) else {
             continue;
         };
@@ -3971,23 +3992,25 @@ fn workspace_activation_terminal_count(settings: Option<&Value>) -> usize {
         return WORKSPACE_ACTIVATE_DEFAULT_TERMINAL_COUNT;
     };
     if let Some(count) =
-        workspace_activation_usize(settings, &["terminalCount", "terminals"])
+        workspace_activation_usize(settings, &["terminalCount", "terminal_count", "terminals"])
     {
         return count.min(WORKSPACE_ACTIVATE_MAX_TERMINAL_COUNT);
     }
     if let Some(array) = settings
         .get("terminalRoles")
+        .or_else(|| settings.get("terminal_roles"))
         .and_then(Value::as_array)
     {
         return array.len().min(WORKSPACE_ACTIVATE_MAX_TERMINAL_COUNT);
     }
     if let Some(array) = settings
         .get("logicalTerminalIndexes")
+        .or_else(|| settings.get("logical_terminal_indexes"))
         .and_then(Value::as_array)
     {
         return array.len().min(WORKSPACE_ACTIVATE_MAX_TERMINAL_COUNT);
     }
-    if workspace_activation_text(settings, &["rootDirectory"]).is_some() {
+    if workspace_activation_text(settings, &["rootDirectory", "root_directory"]).is_some() {
         return 0;
     }
     WORKSPACE_ACTIVATE_DEFAULT_TERMINAL_COUNT
@@ -4008,6 +4031,7 @@ fn workspace_activation_terminal_indexes(
     let mut indexes = Vec::new();
     if let Some(array) = settings
         .get("logicalTerminalIndexes")
+        .or_else(|| settings.get("logical_terminal_indexes"))
         .and_then(Value::as_array)
     {
         for item in array {
@@ -4016,7 +4040,15 @@ fn workspace_activation_terminal_indexes(
                 Value::String(text) => text.trim().parse::<i64>().ok(),
                 Value::Object(_) => workspace_activation_i64(
                     item,
-                    &["logicalIndex", "terminalIndex", "slotIndex", "index"],
+                    &[
+                        "logicalIndex",
+                        "logical_index",
+                        "terminalIndex",
+                        "terminal_index",
+                        "slotIndex",
+                        "slot_index",
+                        "index",
+                    ],
                 ),
                 _ => None,
             };
@@ -6970,6 +7002,50 @@ mod device_data_migration_tests {
     }
 
     #[test]
+    fn local_workspace_catalog_accepts_legacy_camel_case_and_emits_snake_case() {
+        let legacy = json!({
+            "workspaceId": "ws-legacy",
+            "workspaceName": "Legacy workspace",
+            "rootDirectory": "/tmp/legacy-workspace",
+            "rootIdentity": "legacy-root",
+            "pendingDelete": true,
+            "deletedAtMs": "123",
+            "deviceIds": ["device-1"],
+            "updatedAt": "2026-07-01T00:00:00Z"
+        });
+
+        assert_eq!(
+            local_workspace_catalog_entry_id(&legacy).as_deref(),
+            Some("ws-legacy")
+        );
+        assert_eq!(
+            local_workspace_catalog_root_text(&legacy, &json!({})).as_deref(),
+            Some("/tmp/legacy-workspace")
+        );
+        assert!(local_workspace_catalog_entry_is_deleted(&legacy));
+        assert_eq!(local_workspace_catalog_entry_deleted_at_ms(&legacy), Some(123));
+
+        let stored = local_workspace_catalog_store_items(
+            vec![legacy],
+            vec![],
+            &json!({}),
+            200,
+        )
+        .unwrap();
+        let item = stored.first().expect("legacy tombstone retained");
+        assert_eq!(item["workspace_id"], json!("ws-legacy"));
+        assert_eq!(item["workspace_name"], json!("Legacy workspace"));
+        assert_eq!(item["root_directory"], json!("/tmp/legacy-workspace"));
+        assert_eq!(item["root_identity"], json!("legacy-root"));
+        assert_eq!(item["deleted_at_ms"], json!("123"));
+        assert_eq!(item["device_ids"], json!(["device-1"]));
+        assert_eq!(item["updated_at"], json!("2026-07-01T00:00:00Z"));
+        assert!(item.get("workspaceId").is_none());
+        assert!(item.get("rootDirectory").is_none());
+        assert!(item.get("deletedAtMs").is_none());
+    }
+
+    #[test]
     fn local_workspace_reusable_id_for_root_matches_only_same_scope_tombstones() {
         let root = TestDir::new("diffforge-reusable-workspace-id");
         let store_dir = root.path().join("catalog");
@@ -7204,7 +7280,10 @@ fn local_workspace_catalog_read_items_from_path(path: &Path) -> Result<Vec<Value
         .get("workspaces")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default())
+        .unwrap_or_default()
+        .into_iter()
+        .map(local_workspace_catalog_canonicalize_entry)
+        .collect())
 }
 
 fn local_workspace_catalog_visible_items(items: Vec<Value>) -> Vec<Value> {
@@ -7462,18 +7541,59 @@ fn local_workspace_catalog_text(value: &Value, keys: &[&str]) -> Option<String> 
         .map(ToOwned::to_owned)
 }
 
+fn local_workspace_catalog_canonicalize_entry(entry: Value) -> Value {
+    let Value::Object(mut object) = entry else {
+        return entry;
+    };
+    for (camel, snake) in [
+        ("workspaceId", "workspace_id"),
+        ("workspaceName", "workspace_name"),
+        ("rootDirectory", "root_directory"),
+        ("workspaceRoot", "workspace_root"),
+        ("repoPath", "repo_path"),
+        ("rootIdentity", "root_identity"),
+        ("workspaceRootIdentity", "workspace_root_identity"),
+        ("pendingDelete", "pending_delete"),
+        ("deletedAtMs", "deleted_at_ms"),
+        ("deletedAt", "deleted_at"),
+        ("createdAt", "created_at"),
+        ("updatedAt", "updated_at"),
+        ("originDeviceId", "origin_device_id"),
+        ("deviceIds", "device_ids"),
+        ("localArchived", "local_archived"),
+        ("locallyArchived", "locally_archived"),
+        ("localArchivedAt", "local_archived_at"),
+        ("locallyArchivedAt", "locally_archived_at"),
+        ("syncState", "sync_state"),
+        ("workspaceStatus", "workspace_status"),
+    ] {
+        if let Some(value) = object.remove(camel) {
+            object.entry(snake.to_string()).or_insert(value);
+        }
+    }
+    Value::Object(object)
+}
+
 fn local_workspace_catalog_root_text(entry: &Value, workspace_settings: &Value) -> Option<String> {
-    let workspace_id = local_workspace_catalog_text(entry, &["id", "workspace_id"]);
+    let workspace_id =
+        local_workspace_catalog_text(entry, &["id", "workspace_id", "workspaceId"]);
     let settings = workspace_id
         .as_deref()
         .and_then(|id| workspace_settings.get(id));
     local_workspace_catalog_text(
         entry,
-        &["root_directory", "workspace_root", "repo_path"],
+        &[
+            "root_directory",
+            "rootDirectory",
+            "workspace_root",
+            "workspaceRoot",
+            "repo_path",
+            "repoPath",
+        ],
     )
     .or_else(|| {
         settings.and_then(|settings| {
-            local_workspace_catalog_text(settings, &["rootDirectory"])
+            local_workspace_catalog_text(settings, &["root_directory", "rootDirectory"])
         })
     })
 }
@@ -7484,7 +7604,12 @@ fn local_workspace_catalog_root_identity(
 ) -> Option<(String, Option<String>)> {
     let explicit_identity = local_workspace_catalog_text(
         entry,
-        &["root_identity", "workspace_root_identity"],
+        &[
+            "root_identity",
+            "rootIdentity",
+            "workspace_root_identity",
+            "workspaceRootIdentity",
+        ],
     )
     .map(|value| normalized_literal_path_key(&value))
     .filter(|value| !value.is_empty());
@@ -7512,11 +7637,11 @@ fn local_workspace_catalog_now_ms() -> u64 {
 }
 
 fn local_workspace_catalog_entry_id(entry: &Value) -> Option<String> {
-    local_workspace_catalog_text(entry, &["id", "workspace_id"])
+    local_workspace_catalog_text(entry, &["id", "workspace_id", "workspaceId"])
 }
 
 fn local_workspace_catalog_entry_deleted_at_ms(entry: &Value) -> Option<u64> {
-    for key in ["deleted_at_ms", "deleted_at"] {
+    for key in ["deleted_at_ms", "deletedAtMs", "deleted_at", "deletedAt"] {
         if let Some(value) = entry.get(key) {
             if let Some(number) = value.as_u64() {
                 return Some(number);
@@ -7553,7 +7678,7 @@ fn local_workspace_catalog_mark_tombstoned(entry: &mut Value, now_ms: u64) {
 fn local_workspace_catalog_ensure_tombstone_shape(entry: &mut Value, now_ms: u64) {
     if let Value::Object(object) = entry {
         object.insert("deleted".to_string(), json!(true));
-        if !object.contains_key("deleted_at_ms") && !object.contains_key("deleted_at_ms") {
+        if !object.contains_key("deleted_at_ms") && !object.contains_key("deletedAtMs") {
             object.insert("deleted_at_ms".to_string(), json!(now_ms));
         }
     }
@@ -7564,11 +7689,14 @@ fn local_workspace_catalog_clear_tombstone(entry: &mut Value) {
         return;
     };
     for key in [
+        "pendingDelete",
         "pending_delete",
         "deleted",
         "removed",
         "tombstoned",
+        "deletedAtMs",
         "deleted_at_ms",
+        "deletedAt",
         "deleted_at",
     ] {
         object.remove(key);
@@ -7665,8 +7793,9 @@ fn local_workspace_catalog_normalize_items(
     let mut normalized_items = Vec::with_capacity(items.len());
 
     for item in items {
+        let item = local_workspace_catalog_canonicalize_entry(item);
         let workspace_id =
-            local_workspace_catalog_text(&item, &["id", "workspace_id"])
+            local_workspace_catalog_text(&item, &["id", "workspace_id", "workspaceId"])
                 .unwrap_or_default();
         let root_details = local_workspace_catalog_root_identity(&item, workspace_settings);
 
@@ -7842,7 +7971,7 @@ fn local_workspace_catalog_all_workspace_ids(app: &AppHandle) -> Result<HashSet<
                     continue;
                 }
                 if let Some(id) =
-                    local_workspace_catalog_text(item, &["id", "workspace_id"])
+                    local_workspace_catalog_text(item, &["id", "workspace_id", "workspaceId"])
                 {
                     ids.insert(id);
                 }
@@ -7927,6 +8056,7 @@ fn local_workspace_catalog_prune_orphan_workspace_settings(
 fn local_workspace_catalog_entry_is_deleted(entry: &Value) -> bool {
     if entry
         .get("pending_delete")
+        .or_else(|| entry.get("pendingDelete"))
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
@@ -7949,7 +8079,7 @@ fn local_workspace_catalog_entry_is_deleted(entry: &Value) -> bool {
     {
         return true;
     }
-    if local_workspace_catalog_text(entry, &["deleted_at"]).is_some() {
+    if local_workspace_catalog_text(entry, &["deleted_at", "deletedAt"]).is_some() {
         return true;
     }
     local_workspace_catalog_text(entry, &["status", "workspace_status"])

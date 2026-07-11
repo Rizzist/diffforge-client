@@ -1274,8 +1274,8 @@ function appControlLoopspaceTriggerRows(value) {
     ? rows.map((row) => {
       const loopspaceIds = Array.isArray(row?.loopspace_ids)
         ? row.loopspace_ids
-        : Array.isArray(row?.loopspace_ids)
-          ? row.loopspace_ids
+        : Array.isArray(row?.loopspaceIds)
+          ? row.loopspaceIds
           : [];
       const config = row?.config && typeof row.config === "object" ? row.config : {};
       const id = appControlText(row, ["id", "trigger_id"]);
@@ -1311,8 +1311,8 @@ function appControlLoopspaceTriggerRunRows(value) {
     ? rows.map((row) => {
       const loopspaceIds = Array.isArray(row?.loopspace_ids)
         ? row.loopspace_ids
-        : Array.isArray(row?.loopspace_ids)
-          ? row.loopspace_ids
+        : Array.isArray(row?.loopspaceIds)
+          ? row.loopspaceIds
           : [];
       return {
         ...row,
@@ -4974,11 +4974,30 @@ function cloudAccountUsageSnapshotFromEventPayload(payload) {
   const liveRuntime = envelope.live_runtime_status || {};
   const data = envelope.data && typeof envelope.data === "object" ? envelope.data : null;
   const payloadObject = envelope.payload && typeof envelope.payload === "object" ? envelope.payload : null;
-  const direct = envelope.account_usage_snapshot || envelope.runtime_account_usage || envelope.account_usage || envelope.billing_status || envelope.account_status || liveRuntime.account_usage_snapshot || liveRuntime.runtime_account_usage || liveRuntime.account_usage || payloadObject?.account_usage_snapshot || payloadObject?.runtime_account_usage || payloadObject?.account_usage || payloadObject?.billing_status || data?.account_usage_snapshot || data?.runtime_account_usage || data?.account_usage || data?.billing_status || data && Object.keys(data).length ? data : null || String(envelope.contract || "") === "diffforge.account_usage.v1"
+  const direct = envelope.account_usage_snapshot
+    || envelope.runtime_account_usage
+    || envelope.account_usage
+    || envelope.billing_status
+    || envelope.account_status
+    || liveRuntime.account_usage_snapshot
+    || liveRuntime.runtime_account_usage
+    || liveRuntime.account_usage
+    || payloadObject?.account_usage_snapshot
+    || payloadObject?.runtime_account_usage
+    || payloadObject?.account_usage
+    || payloadObject?.billing_status
+    || data?.account_usage_snapshot
+    || data?.runtime_account_usage
+    || data?.account_usage
+    || data?.billing_status
+    || (data && Object.keys(data).length ? data : null)
+    || (String(envelope.contract || "") === "diffforge.account_usage.v1"
       ? envelope.payload
-      : null || String(envelope.kind || envelope.event_kind || "") === "account_usage_snapshot"
+      : null)
+    || (String(envelope.kind || envelope.event_kind || "") === "account_usage_snapshot"
       ? envelope.payload
-      : null || envelope;
+      : null)
+    || envelope;
   const snapshot = direct && typeof direct === "object" ? direct : {};
   const nestedData = snapshot.data && typeof snapshot.data === "object" ? snapshot.data : {};
   const nestedPayload = snapshot.payload && typeof snapshot.payload === "object" ? snapshot.payload : {};
@@ -9031,9 +9050,11 @@ function LoopspaceRuntimeView({
       ? value.trigger_refs
       : Array.isArray(row?.trigger_refs)
         ? row.trigger_refs
-        : Array.isArray(row?.trigger_refs)
-          ? row.trigger_refs
-          : [];
+        : Array.isArray(value?.triggerRefs)
+          ? value.triggerRefs
+          : Array.isArray(row?.triggerRefs)
+            ? row.triggerRefs
+            : [];
     triggerRefsRef.current = refs;
     setTriggerRefs(refs);
     const nextRuntimeHead = value?.runtime_head || row?.runtime_head || null;
@@ -20299,18 +20320,18 @@ function normalizeLoopspaceEntry(entry) {
     graph_epoch: Number(entry?.graph_epoch || entry?.graph?.epoch || entry?.graph?.graph_epoch || 0) || 0,
     log_segments: Array.isArray(entry?.log_segments)
       ? entry.log_segments
-      : Array.isArray(entry?.log_segments)
-        ? entry.log_segments
+      : Array.isArray(entry?.logSegments)
+        ? entry.logSegments
         : [],
     runtime_head: entry?.runtime_head && typeof entry.runtime_head === "object"
       ? entry.runtime_head
-      : entry?.runtime_head && typeof entry.runtime_head === "object"
-        ? entry.runtime_head
+      : entry?.runtimeHead && typeof entry.runtimeHead === "object"
+        ? entry.runtimeHead
         : null,
     trigger_refs: Array.isArray(entry?.trigger_refs)
       ? entry.trigger_refs
-      : Array.isArray(entry?.trigger_refs)
-        ? entry.trigger_refs
+      : Array.isArray(entry?.triggerRefs)
+        ? entry.triggerRefs
         : [],
     updated_at: String(entry?.updated_at || ""),
     revision: Number(entry?.revision || entry?.server_seq || 0) || 0,
@@ -36427,15 +36448,15 @@ export default function App() {
           const visibleIdle = ["idle", "ready", "completed", "complete", "done"].includes(visibleStatus);
           merged.status = visibleTerminal.status || visibleStatus;
           merged.activity_status = visibleTerminal.activity_status || visibleStatus;
-          merged.command_phase = visibleTerminal.command_phase || visibleIdle ? "completed" : visibleStatus;
+          merged.command_phase = visibleTerminal.command_phase || (visibleIdle ? "completed" : visibleStatus);
           merged.display_status = visibleTerminal.display_status || visibleStatus;
-          merged.execution_phase = visibleTerminal.execution_phase || visibleIdle ? "idle" : visibleStatus;
+          merged.execution_phase = visibleTerminal.execution_phase || (visibleIdle ? "idle" : visibleStatus);
           merged.input_ready = visibleTerminal.input_ready ?? visibleIdle;
           merged.native_rail_state = visibleTerminal.native_rail_state || visibleStatus;
           merged.readiness = visibleTerminal.readiness || (visibleIdle ? "ready" : "busy");
           merged.terminal_lifecycle = visibleTerminal.terminal_lifecycle || "open";
           merged.terminal_status = visibleTerminal.terminal_status || visibleTerminal.status || visibleStatus;
-          merged.turn_status = visibleTerminal.turn_status || visibleIdle ? "completed" : visibleStatus;
+          merged.turn_status = visibleTerminal.turn_status || (visibleIdle ? "completed" : visibleStatus);
         }
         if (visibleStopped) {
           merged.activity_status = visibleTerminal.activity_status || visibleStatus;
@@ -36764,7 +36785,7 @@ export default function App() {
           || videoProjects.length > 0;
         if (shouldScanVideoProjects) {
           try {
-            const listing = await invoke("video_projects_list", { repo_path: rootDirectory });
+            const listing = await invoke("video_projects_list", { repoPath: rootDirectory });
             videoProjects = buildVideoProjectInventory(listing?.projects);
           } catch {
             // Keep the last known list; the next scan retries.
@@ -37827,9 +37848,9 @@ export default function App() {
                 || "",
             ).trim();
             const paneId = String(
-              terminal?.pane_id || terminal?.terminal_id || Number.isInteger(terminalIndex)
+              terminal?.pane_id || terminal?.terminal_id || (Number.isInteger(terminalIndex)
                   ? getWorkspaceTerminalPaneId(workspaceId, terminalIndex, agentId)
-                  : "",
+                  : ""),
             ).trim();
             return normalizeSnippingDispatchTargetThread({
               agent_id: agentId,
@@ -37911,8 +37932,8 @@ export default function App() {
         || new Date().toISOString();
       const sourcePaths = Array.isArray(payload.source_paths)
         ? payload.source_paths
-        : Array.isArray(payload.source_paths)
-          ? payload.source_paths
+        : Array.isArray(payload.sourcePaths)
+          ? payload.sourcePaths
           : undefined;
       const targetThreadId = String(payload.target_thread_id || "").trim();
       const targetFields = buildSnippingAnnotationTargetFields({
@@ -42775,7 +42796,7 @@ export default function App() {
             const listing = await invoke("pcb_documents_list", { repo_path: repoPath, workspace_id: workspaceId });
             return buildPcbProjectInventory(listing?.boards);
           }
-          const listing = await invoke("video_projects_list", { repo_path: repoPath });
+          const listing = await invoke("video_projects_list", { repoPath });
           return buildVideoProjectInventory(listing?.projects);
         };
         const projectFailureReason = (message) => {
@@ -42804,13 +42825,13 @@ export default function App() {
             } else {
               const created = await invoke("video_project_create", {
                 name: requestedProjectName,
-                repo_path: repoPath,
+                repoPath,
               });
               project = normalizeWorkspaceProjectEntry({
                 id: videoProjectIdFromPath(created?.path),
                 name: created?.project?.name,
                 path: created?.path,
-                updated_at_ms: created?.project?.updated_at_ms,
+                updated_at_ms: created?.project?.updatedAtMs,
               });
             }
             if (!project) {
@@ -42848,14 +42869,14 @@ export default function App() {
               });
             } else {
               await emit(VIDEO_PROJECT_DELETED_EVENT, {
-                project_path: project.path,
-                repo_path: repoPath,
+                projectPath: project.path,
+                repoPath,
                 source: "remote_project_command",
-                workspace_id: workspaceId,
+                workspaceId,
               }).catch(() => {});
               await invoke("video_project_delete", {
-                project_path: project.path,
-                repo_path: repoPath,
+                projectPath: project.path,
+                repoPath,
               });
             }
             refreshProjectInventory();
@@ -42963,8 +42984,8 @@ export default function App() {
               pane_id: String(selectedPanel.pane_id || selectedPanel.panel_id || ""),
               terminal_index: Number.isInteger(selectedPanel.terminal_index)
                 ? selectedPanel.terminal_index
-                : Number.isInteger(selectedPanel.terminal_index)
-                  ? selectedPanel.terminal_index
+                : Number.isInteger(selectedPanel.terminalIndex)
+                  ? selectedPanel.terminalIndex
                   : null,
             }
             : null;
@@ -46242,11 +46263,11 @@ export default function App() {
       }
 
       const existingContent = String(context.full_content ?? context.draft_content ?? context.content ?? "");
-      const hasContentPatch = hasOwn("content_md") || hasOwn("content") || hasOwn("body");
+      const hasContentPatch = hasOwn("content_md") || hasOwn("contentMd") || hasOwn("content") || hasOwn("body");
       const content = hasOwn("content_md")
         ? String(input.content_md ?? "")
-        : hasOwn("content_md")
-          ? String(input.content_md ?? "")
+        : hasOwn("contentMd")
+          ? String(input.contentMd ?? "")
         : hasOwn("content")
           ? String(input.content ?? "")
           : hasOwn("body")
@@ -47256,8 +47277,8 @@ export default function App() {
           const hasOwn = (key) => Object.prototype.hasOwnProperty.call(input || {}, key);
           const loopspaceIdsInput = Array.isArray(input.loopspace_ids)
             ? input.loopspace_ids
-            : Array.isArray(input.loopspace_ids)
-              ? input.loopspace_ids
+            : Array.isArray(input.loopspaceIds)
+              ? input.loopspaceIds
               : null;
           const loopspaceIds = loopspaceIdsInput
             ? loopspaceIdsInput.map((id) => String(id || "").trim()).filter(Boolean)

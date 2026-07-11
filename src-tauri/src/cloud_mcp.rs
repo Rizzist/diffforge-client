@@ -17184,7 +17184,6 @@ async fn cloud_mcp_account_sync_resume_payload(reason: &str) -> Value {
     if let Some(sync_cursor) = cloud_mcp_asset_library_local_sync_cursor() {
         if let Some(object) = assets.as_object_mut() {
             object.insert("since_sync_cursor".to_string(), json!(sync_cursor.clone()));
-            object.insert("sync_cursor".to_string(), json!(sync_cursor.clone()));
             object.insert("sync_cursor".to_string(), json!(sync_cursor));
         }
     }
@@ -17194,7 +17193,6 @@ async fn cloud_mcp_account_sync_resume_payload(reason: &str) -> Value {
             .and_then(Value::as_array)
             .map(|rows| rows.is_empty())
             .unwrap_or(true)
-            && object.get("sync_cursor").is_none()
             && object.get("sync_cursor").is_none();
         object.insert("store_empty".to_string(), json!(store_empty));
     }
@@ -44537,7 +44535,6 @@ async fn cloud_mcp_list_account_assets(
         object.insert("limit".to_string(), json!(effective_limit));
         if let Some(sync_cursor) = cloud_mcp_asset_library_local_sync_cursor() {
             object.insert("since_sync_cursor".to_string(), json!(sync_cursor.clone()));
-            object.insert("sync_cursor".to_string(), json!(sync_cursor.clone()));
             object.insert("sync_cursor".to_string(), json!(sync_cursor));
             object.insert("store_empty".to_string(), json!(false));
         } else {

@@ -258,7 +258,7 @@ export default function VideoWindowHost() {
   }, [params.workspaceId, windowLabel]);
 
   const submitAgentPrompt = useCallback(
-    async ({ targetIds, targetTerminalIndexes, text }) => {
+    async ({ target_ids: targetIds, target_terminal_indexes: targetTerminalIndexes, text }) => {
       const requestId = createPanelAgentPromptRequestId("video-panel-submit");
       let unlisten = () => {};
       return new Promise((resolve, reject) => {
@@ -473,13 +473,13 @@ export default function VideoWindowHost() {
         {agentPromptOpen ? (
           <PanelAgentPromptComposer
             autoFocus
-            defaultSelectedTargetIds={defaultAgentPromptTargetIds}
+            default_selected_target_ids={defaultAgentPromptTargetIds}
             onClose={() => setAgentPromptOpen(false)}
             onSubmit={submitAgentPrompt}
-            panelKind="video"
-            panelPaneId={params.paneId}
+            panel_kind="video"
+            panel_pane_id={params.paneId}
             targets={agentPromptTargets}
-            windowId={windowLabel}
+            window_id={windowLabel}
           />
         ) : null}
       </PanelBody>

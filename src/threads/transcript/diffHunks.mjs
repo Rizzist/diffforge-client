@@ -24,7 +24,7 @@ function stripDiffPathPrefix(raw = "") {
 }
 
 // Parses one file's unified diff into hunks with old/new line numbers.
-// Returns { oldPath, newPath, binary, hunks } — never throws; malformed
+// Returns { old_path, new_path, binary, hunks } — never throws; malformed
 // input degrades to whatever hunks parsed cleanly.
 export function parseUnifiedPatch(patch = "") {
   const result = {

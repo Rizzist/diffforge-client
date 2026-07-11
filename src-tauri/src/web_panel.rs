@@ -183,7 +183,7 @@ fn web_panel_open(
         .unwrap_or_default()
         .to_string();
     let app_url = format!(
-        "index.html#/web-panel?paneId={}&url={}&theme={}&title={}&windowId={}&workspaceId={}&adoptLabel={}",
+        "index.html#/web-panel?pane_id={}&url={}&theme={}&title={}&window_id={}&workspace_id={}&adopt_label={}",
         percent_encode_query_component(&pane_text),
         percent_encode_query_component(&url_text),
         percent_encode_query_component(&theme_text),

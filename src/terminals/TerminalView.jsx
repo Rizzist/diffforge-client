@@ -861,8 +861,8 @@ function normalizeLoopspaceTriggerRows(value) {
       const config = row?.config && typeof row.config === "object" ? row.config : {};
       const loopspaceIds = Array.isArray(row?.loopspace_ids)
         ? row.loopspace_ids
-        : Array.isArray(row?.loopspace_ids)
-          ? row.loopspace_ids
+        : Array.isArray(row?.loopspaceIds)
+          ? row.loopspaceIds
           : [];
       return {
         ...row,
@@ -11871,8 +11871,8 @@ function getTodoQueuePendingFieldsFromItem(item, source = "") {
   const queueMeta = normalizeTodoQueueFlatQueueMetadata(item) || {};
   const remoteCommand = item?.remote_command && typeof item.remote_command === "object"
     ? item.remote_command
-    : item?.remote_command && typeof item.remote_command === "object"
-      ? item.remote_command
+    : item?.remoteCommand && typeof item.remoteCommand === "object"
+      ? item.remoteCommand
       : {};
   const targetInfo = getTodoQueueExplicitTerminalTargetInfo(item);
   const targetAgentId = getTodoQueueTargetAgentId(item);
@@ -13427,8 +13427,8 @@ function getTodoQueueStringField(item, keys = []) {
   const queueMeta = getTodoQueueRawQueueMetadata(item);
   const remoteCommand = item?.remote_command && typeof item.remote_command === "object"
     ? item.remote_command
-    : item?.remote_command && typeof item.remote_command === "object"
-      ? item.remote_command
+    : item?.remoteCommand && typeof item.remoteCommand === "object"
+      ? item.remoteCommand
       : null;
   for (const source of [item, queueMeta, remoteCommand]) {
     if (!source || typeof source !== "object") {
@@ -13602,14 +13602,24 @@ function getTodoQueueTargetTerminalIndex(item) {
   }
 
   const colorSlot = normalizeTerminalColorSlot(
-    item?.target_color_slot ?? item?.terminal_color_slot ?? item?.color_slot ?? item?.remote_command?.target_color_slot ?? item?.remote_command?.terminal_color_slot ?? item?.remote_command?.color_slot ?? queueTargetExplicit
+    item?.target_color_slot
+      ?? item?.terminal_color_slot
+      ?? item?.color_slot
+      ?? item?.remote_command?.target_color_slot
+      ?? item?.remote_command?.terminal_color_slot
+      ?? item?.remote_command?.color_slot
+      ?? (queueTargetExplicit
         ? queueMeta?.target_color_slot ?? queueMeta?.terminal_color_slot ?? queueMeta?.color_slot
-        : undefined,
+        : undefined),
   );
   const hasTerminalColor = Boolean(normalizeTerminalHexColor(
-    item?.target_terminal_color || item?.terminal_color || item?.remote_command?.target_terminal_color || item?.remote_command?.terminal_color || queueTargetExplicit
+    item?.target_terminal_color
+      || item?.terminal_color
+      || item?.remote_command?.target_terminal_color
+      || item?.remote_command?.terminal_color
+      || (queueTargetExplicit
         ? queueMeta?.target_terminal_color || queueMeta?.terminal_color
-        : "",
+        : ""),
   ));
   return hasTerminalColor ? colorSlot : null;
 }
@@ -14779,8 +14789,8 @@ function getTodoQueueItemInputs(item) {
     ? item.inputs
     : Array.isArray(item?.todo_inputs)
       ? item.todo_inputs
-      : Array.isArray(item?.todo_inputs)
-        ? item.todo_inputs
+      : Array.isArray(item?.todoInputs)
+        ? item.todoInputs
         : [];
   const keyed = new Map();
   const unkeyed = [];
@@ -14875,8 +14885,8 @@ function getTodoQueueLatestInput(item) {
 function createTodoQueueItem(text, options = {}) {
   const createdAt = typeof options.created_at === "string" && options.created_at.trim()
     ? options.created_at
-    : typeof options.created_at === "string" && options.created_at.trim()
-    ? options.created_at
+    : typeof options.createdAt === "string" && options.createdAt.trim()
+    ? options.createdAt
     : new Date().toISOString();
   const id = typeof options.id === "string" && options.id.trim()
     ? options.id.trim()
@@ -14999,8 +15009,8 @@ function normalizeTodoQueueItem(item) {
 
   const createdAt = typeof item.created_at === "string" && item.created_at.trim()
     ? item.created_at
-    : typeof item.created_at === "string" && item.created_at.trim()
-    ? item.created_at
+    : typeof item.createdAt === "string" && item.createdAt.trim()
+    ? item.createdAt
     : new Date().toISOString();
   const text = normalizeTodoQueueText(item.text);
   const images = getTodoQueueItemImages(item);
@@ -15766,7 +15776,16 @@ function normalizeOrchestratorConnectedDevice(device, index = 0) {
     return null;
   }
   const displayName = String(
-    device.display_name || device.label || device.device_name || device.machine_name || device.hostname || device.name || index === 0 ? "Diff Forge client" : `Device ${index + 1}`,
+    device.display_name
+      || device.displayName
+      || device.label
+      || device.device_name
+      || device.deviceName
+      || device.machine_name
+      || device.machineName
+      || device.hostname
+      || device.name
+      || (index === 0 ? "Diff Forge client" : `Device ${index + 1}`),
   ).trim();
   const deviceId = String(device.device_id || device.machine_id || device.id || displayName || `device-${index}`)
     .trim()
@@ -15818,7 +15837,16 @@ function normalizeWorkspaceTodoDeviceEntry(device, index = 0) {
     return null;
   }
   const displayName = String(
-    device.display_name || device.label || device.device_name || device.machine_name || device.hostname || device.name || index === 0 ? "Diff Forge client" : `Device ${index + 1}`,
+    device.display_name
+      || device.displayName
+      || device.label
+      || device.device_name
+      || device.deviceName
+      || device.machine_name
+      || device.machineName
+      || device.hostname
+      || device.name
+      || (index === 0 ? "Diff Forge client" : `Device ${index + 1}`),
   ).trim();
   const deviceId = normalizeWorkspaceTodoDeviceId(
     device.device_id || device.machine_id || device.id || displayName,
@@ -22446,12 +22474,12 @@ function WorkspaceVideoGridPane({
           createRequestNonce={createRequestNonce}
           deleteRequestNonce={deleteRequestNonce}
           externalProject={poppedOut ? breakoutProject : undefined}
-          is_active={isActive && !poppedOut}
+          isActive={isActive && !poppedOut}
           onProjectChange={handleProjectChange}
-          pane_id={paneId}
+          paneId={paneId}
           refreshRequestNonce={refreshRequestNonce}
-          repo_path={repoPath}
-          workspace_id={workspaceId}
+          repoPath={repoPath}
+          workspaceId={workspaceId}
         />
         {poppedOut ? (
           <TerminalVideoBreakoutOverlay>
@@ -24196,7 +24224,7 @@ function TerminalView({
       removedBreakout = true;
       const panelWorkspaceId = String(videoPanelWorkspaceIdsRef.current[paneId] || workspaceId || "").trim();
       if (panelWorkspaceId) {
-        invoke("video_panel_close", { pane_id: paneId, workspace_id: panelWorkspaceId }).catch(() => {});
+        invoke("video_panel_close", { paneId, workspaceId: panelWorkspaceId }).catch(() => {});
       }
     });
     if (removedBreakout) {
@@ -28824,9 +28852,9 @@ function TerminalView({
     if (videoBreakoutPanesRef.current[safePaneId]) {
       emit(VIDEO_PANEL_COMMAND_EVENT, {
         ...nextCommand,
-        pane_id: safePaneId,
-        window_id: "",
-        workspace_id: terminalWorkspace?.id || "",
+        paneId: safePaneId,
+        windowId: "",
+        workspaceId: terminalWorkspace?.id || "",
       }).catch(() => {});
       return nextCommand;
     }
@@ -29239,7 +29267,7 @@ function TerminalView({
       }));
     }
     if (wasPoppedOut && panelWorkspaceId) {
-      invoke("video_panel_close", { pane_id: safePaneId, workspace_id: panelWorkspaceId }).catch(() => {});
+      invoke("video_panel_close", { paneId: safePaneId, workspaceId: panelWorkspaceId }).catch(() => {});
     }
   }, [restoreWorkspacePaneIfMinimized, terminalWorkspace?.id]);
 
@@ -29251,18 +29279,18 @@ function TerminalView({
       return false;
     }
     if (videoBreakoutPanesRef.current[safePaneId]) {
-      invoke("video_panel_focus", { pane_id: safePaneId, workspace_id: workspaceId }).catch(() => {});
+      invoke("video_panel_focus", { paneId: safePaneId, workspaceId }).catch(() => {});
       return true;
     }
     try {
       const rect = terminalLayoutRectsRef.current?.[terminalIndex] || null;
       await invoke("video_panel_open", {
         height: rect?.height || null,
-        pane_id: safePaneId,
-        repo_path: repoPath,
+        paneId: safePaneId,
+        repoPath,
         theme: document.documentElement?.dataset?.forgeTheme || "",
         width: rect?.width || null,
-        workspace_id: workspaceId,
+        workspaceId,
       });
       const nextSync = { ...videoPaneBreakoutSyncRef.current };
       delete nextSync[safePaneId];
@@ -29294,7 +29322,7 @@ function TerminalView({
       return;
     }
     clearVideoPanelBreakout(safePaneId);
-    invoke("video_panel_close", { pane_id: safePaneId, workspace_id: workspaceId }).catch(() => {});
+    invoke("video_panel_close", { paneId: safePaneId, workspaceId }).catch(() => {});
   }, [clearVideoPanelBreakout, terminalWorkspace?.id]);
 
   const focusVideoPanel = useCallback((terminalIndex, paneId) => {
@@ -29303,7 +29331,7 @@ function TerminalView({
     if (!safePaneId || !workspaceId) {
       return;
     }
-    invoke("video_panel_focus", { pane_id: safePaneId, workspace_id: workspaceId }).catch(() => {});
+    invoke("video_panel_focus", { paneId: safePaneId, workspaceId }).catch(() => {});
   }, [terminalWorkspace?.id]);
 
   // A web breakout window closing returns the pane to the grid and bumps its
@@ -29456,11 +29484,11 @@ function TerminalView({
       if (disposed) {
         return;
       }
-      const workspaceId = String(event.payload?.workspace_id || "").trim();
+      const workspaceId = String(event.payload?.workspaceId || event.payload?.workspace_id || "").trim();
       if (workspaceId && terminalWorkspace?.id && workspaceId !== terminalWorkspace.id) {
         return;
       }
-      const paneId = String(event.payload?.pane_id || "").trim();
+      const paneId = String(event.payload?.paneId || event.payload?.pane_id || "").trim();
       if (!paneId) {
         return;
       }
@@ -29482,12 +29510,12 @@ function TerminalView({
         return;
       }
       const payload = event?.payload || {};
-      const workspaceId = String(payload.workspace_id || "").trim();
+      const workspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
       if (workspaceId && terminalWorkspace?.id && workspaceId !== terminalWorkspace.id) {
         return;
       }
       const control = String(payload.control || "").trim();
-      const paneId = String(payload.pane_id || "").trim();
+      const paneId = String(payload.paneId || payload.pane_id || "").trim();
       if (!paneId) {
         return;
       }
@@ -29660,8 +29688,8 @@ function TerminalView({
       const panelWorkspaceId = String(videoPanelWorkspaceIdsRef.current[paneId] || workspaceId || "").trim();
       if (panelWorkspaceId) {
         invoke("video_panel_close", {
-          pane_id: paneId,
-          workspace_id: panelWorkspaceId,
+          paneId,
+          workspaceId: panelWorkspaceId,
         }).catch(() => {});
       }
       clearVideoPanelBreakout(paneId, { dropSyncedState: true });
@@ -34860,9 +34888,9 @@ function TerminalView({
     if (!workspaceId) {
       return;
     }
-    const paneId = String(payload.pane_id || payload.panel_pane_id || "").trim();
-    const panelKind = String(payload.panel_kind || "panel").trim();
-    const windowId = String(payload.window_id || "").trim();
+    const paneId = String(payload.paneId || payload.panelPaneId || payload.pane_id || payload.panel_pane_id || "").trim();
+    const panelKind = String(payload.panelKind || payload.panel_kind || "panel").trim();
+    const windowId = String(payload.windowId || payload.window_id || "").trim();
     if (!paneId) {
       return;
     }
@@ -34879,9 +34907,13 @@ function TerminalView({
     );
     emit(PANEL_AGENT_PROMPT_ACTIVITY_EVENT, {
       items,
+      panelKind,
       panel_kind: panelKind,
+      paneId,
       pane_id: paneId,
+      windowId,
       window_id: windowId,
+      workspaceId,
       workspace_id: workspaceId,
     }).catch(() => {});
   }, [panelAgentPromptActivityItems, terminalWorkspace?.id]);
@@ -34932,7 +34964,7 @@ function TerminalView({
     };
 
     const payloadMatchesWorkspace = (payload = {}) => {
-      const eventWorkspaceId = String(payload.workspace_id || "").trim();
+      const eventWorkspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
       return !eventWorkspaceId || eventWorkspaceId === workspaceId;
     };
 
@@ -34942,12 +34974,18 @@ function TerminalView({
         return;
       }
       emit(PANEL_AGENT_PROMPT_TARGETS_EVENT, {
+        defaultSelectedTargetIds: defaultPanelAgentPromptTargetIds,
         default_selected_target_ids: defaultPanelAgentPromptTargetIds,
-        panel_kind: payload.panel_kind || "panel",
-        pane_id: payload.pane_id || "",
-        request_id: payload.request_id || "",
+        panelKind: payload.panelKind || payload.panel_kind || "panel",
+        panel_kind: payload.panel_kind || payload.panelKind || "panel",
+        paneId: payload.paneId || payload.pane_id || "",
+        pane_id: payload.pane_id || payload.paneId || "",
+        requestId: payload.requestId || payload.request_id || "",
+        request_id: payload.request_id || payload.requestId || "",
         targets: normalizePanelAgentPromptTargets(panelAgentPromptTargets),
-        window_id: payload.window_id || "",
+        windowId: payload.windowId || payload.window_id || "",
+        window_id: payload.window_id || payload.windowId || "",
+        workspaceId,
         workspace_id: workspaceId,
       }).catch(() => {});
     });
@@ -34965,7 +35003,7 @@ function TerminalView({
       if (!payloadMatchesWorkspace(payload)) {
         return;
       }
-      const itemId = String(payload.item_id || payload.id || "").trim();
+      const itemId = String(payload.itemId || payload.item_id || payload.id || "").trim();
       if (itemId) {
         removePanelAgentPromptActivityItems(itemId);
       }
@@ -34976,23 +35014,28 @@ function TerminalView({
       if (!payloadMatchesWorkspace(payload)) {
         return;
       }
-      const requestId = String(payload.request_id || "").trim();
+      const requestId = String(payload.requestId || payload.request_id || "").trim();
       submitPanelAgentPrompt({
-        context_refs: payload.context_refs || payload.context_ref || [],
-        panel_pane_id: payload.panel_pane_id || payload.pane_id || "",
-        panel_kind: payload.panel_kind || "panel",
-        target_ids: payload.target_ids || [],
-        target_terminal_indexes: payload.target_terminal_indexes || [],
+        context_refs: payload.contextRefs || payload.context_refs || payload.contextRef || payload.context_ref || [],
+        panel_pane_id: payload.panelPaneId || payload.panel_pane_id || payload.paneId || payload.pane_id || "",
+        panel_kind: payload.panelKind || payload.panel_kind || "panel",
+        target_ids: payload.targetIds || payload.target_ids || [],
+        target_terminal_indexes: payload.targetTerminalIndexes || payload.target_terminal_indexes || [],
         text: payload.text || payload.prompt || "",
-        window_id: payload.window_id || "",
+        window_id: payload.windowId || payload.window_id || "",
       })
         .then((items) => {
           emit(PANEL_AGENT_PROMPT_RESULT_EVENT, {
+            itemCount: items.length,
             item_count: items.length,
             ok: true,
-            pane_id: payload.pane_id || "",
+            paneId: payload.paneId || payload.pane_id || "",
+            pane_id: payload.pane_id || payload.paneId || "",
+            requestId,
             request_id: requestId,
-            window_id: payload.window_id || "",
+            windowId: payload.windowId || payload.window_id || "",
+            window_id: payload.window_id || payload.windowId || "",
+            workspaceId,
             workspace_id: workspaceId,
           }).catch(() => {});
         })
@@ -35000,9 +35043,13 @@ function TerminalView({
           emit(PANEL_AGENT_PROMPT_RESULT_EVENT, {
             error: error?.message || String(error || "Unable to send prompt."),
             ok: false,
-            pane_id: payload.pane_id || "",
+            paneId: payload.paneId || payload.pane_id || "",
+            pane_id: payload.pane_id || payload.paneId || "",
+            requestId,
             request_id: requestId,
-            window_id: payload.window_id || "",
+            windowId: payload.windowId || payload.window_id || "",
+            window_id: payload.window_id || payload.windowId || "",
+            workspaceId,
             workspace_id: workspaceId,
           }).catch(() => {});
         });
@@ -36325,8 +36372,8 @@ function TerminalView({
       } else if (projectPath || projectName) {
         sendVideoPaneCommand(paneId, {
           action: "select",
-          project_name: projectName,
-          project_path: projectPath,
+          projectName,
+          projectPath,
         });
       }
     }
@@ -36529,8 +36576,8 @@ function TerminalView({
       if (action === "open" && (inputProjectPath || inputProjectName)) {
         sendVideoPaneCommand(panel.pane_id, {
           action: "select",
-          project_name: inputProjectName,
-          project_path: inputProjectPath,
+          projectName: inputProjectName,
+          projectPath: inputProjectPath,
         });
       } else if (action === "open" || action === "popout" || action === "open-window") {
         void popOutVideoPanelForIndex(panel.terminal_index, panel.pane_id);
@@ -36552,8 +36599,8 @@ function TerminalView({
       } else if (videoSelectActions.includes(action)) {
         sendVideoPaneCommand(panel.pane_id, {
           action: "select",
-          project_name: inputProjectName,
-          project_path: inputProjectPath,
+          projectName: inputProjectName,
+          projectPath: inputProjectPath,
         });
       } else if (action === "tab") {
         sendVideoPaneCommand(panel.pane_id, {

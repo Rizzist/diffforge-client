@@ -77,49 +77,53 @@ struct CodexThreadSessionDiscoverRequest {
 #[serde(default)]
 struct CodexThreadTranscriptArtifact {
     kind: String,
+    #[serde(alias = "mime", alias = "mimeType")]
     mime_type: String,
     path: String,
     url: String,
     title: String,
     prompt: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(alias = "assetId", skip_serializing_if = "String::is_empty")]
     asset_id: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(alias = "assetPath", skip_serializing_if = "String::is_empty")]
     asset_path: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(alias = "originalPath", skip_serializing_if = "String::is_empty")]
     original_path: String,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct CodexThreadTranscriptMessage {
+    #[serde(alias = "messageId")]
     id: String,
     role: String,
     kind: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(alias = "legacyKind", skip_serializing_if = "String::is_empty")]
     legacy_kind: String,
     text: String,
     title: String,
+    #[serde(alias = "callId")]
     call_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     status: String,
+    #[serde(alias = "createdAt")]
     created_at: String,
     source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "toolOutput", skip_serializing_if = "Option::is_none")]
     tool_output: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "toolError", skip_serializing_if = "Option::is_none")]
     tool_error: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "fileChange", skip_serializing_if = "Option::is_none")]
     file_change: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "durationMs", skip_serializing_if = "Option::is_none")]
     duration_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "exitCode", skip_serializing_if = "Option::is_none")]
     exit_code: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     subagent: Option<Value>,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(alias = "subagentId", skip_serializing_if = "String::is_empty")]
     subagent_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     usage: Option<Value>,
@@ -3651,6 +3655,34 @@ pub(crate) static OPENCODE_DB_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()
 mod agent_sessions_tests {
     use super::*;
 
+    #[test]
+    fn transcript_artifact_accepts_legacy_camel_case_fields() {
+        let artifact: CodexThreadTranscriptArtifact = serde_json::from_value(json!({
+            "kind": "image",
+            "mimeType": "image/png",
+            "assetId": "asset-legacy",
+            "assetPath": "assets/legacy.png",
+            "originalPath": "/tmp/legacy.png"
+        }))
+        .expect("deserialize artifact");
+
+        assert_eq!(artifact.mime_type, "image/png");
+        assert_eq!(artifact.asset_id, "asset-legacy");
+        assert_eq!(artifact.asset_path, "assets/legacy.png");
+        assert_eq!(artifact.original_path, "/tmp/legacy.png");
+        let serialized = serde_json::to_value(artifact).expect("serialize artifact");
+        assert_eq!(serialized.get("mime_type"), Some(&json!("image/png")));
+        assert_eq!(serialized.get("asset_id"), Some(&json!("asset-legacy")));
+        assert!(serialized.get("mimeType").is_none());
+        assert!(serialized.get("assetId").is_none());
+
+        let mime_alias: CodexThreadTranscriptArtifact = serde_json::from_value(json!({
+            "mime": "image/jpeg"
+        }))
+        .expect("deserialize mime alias");
+        assert_eq!(mime_alias.mime_type, "image/jpeg");
+    }
+
     fn unique_test_dir(name: &str) -> PathBuf {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -4230,6 +4262,76 @@ mod agent_sessions_tests {
     }
 
     #[test]
+    fn cloud_session_response_accepts_legacy_camel_case_fields() {
+        let response = json!({
+            "session": {
+                "agentChatSessionId": "agent-chat-session-camel",
+                "providerSessionId": "provider-session-camel",
+                "sessionTitle": "Legacy session",
+                "workingDirectory": "/tmp/legacy",
+                "latestTimestamp": "2026-01-02T00:00:05Z"
+            },
+            "records": [{
+                "recordTimestamp": "2026-01-02T00:00:04Z",
+                "messages": [{
+                    "messageId": "legacy-message",
+                    "role": "assistant",
+                    "kind": "tool",
+                    "text": "Legacy tool result",
+                    "callId": "legacy-call",
+                    "createdAt": "2026-01-02T00:00:04Z",
+                    "toolOutput": { "ok": true },
+                    "toolError": { "message": "warning" },
+                    "fileChange": { "path": "src/main.rs" },
+                    "durationMs": 42,
+                    "exitCode": 0
+                }]
+            }]
+        });
+
+        let result = agent_thread_transcript_from_cloud_session_response(
+            "claude",
+            "provider-session-camel",
+            "/fallback",
+            10,
+            &response,
+        )
+        .expect("rehydrate camel-case cloud session");
+
+        assert_eq!(result.session_id, "provider-session-camel");
+        assert_eq!(result.session_title, "Legacy session");
+        assert_eq!(result.cwd, "/tmp/legacy");
+        assert_eq!(result.latest_timestamp, "2026-01-02T00:00:05Z");
+        assert_eq!(
+            result.rollout_path,
+            "cloud://agent-chat-session/agent-chat-session-camel"
+        );
+        assert!(agent_thread_cloud_session_matches_provider_session(
+            &response["session"],
+            "provider-session-camel"
+        ));
+
+        let message = result.messages.first().expect("legacy message");
+        assert_eq!(message.id, "legacy-message");
+        assert_eq!(message.call_id, "legacy-call");
+        assert_eq!(message.created_at, "2026-01-02T00:00:04Z");
+        assert_eq!(message.tool_output, Some(json!({ "ok": true })));
+        assert_eq!(
+            message.tool_error,
+            Some(json!({ "message": "warning" }))
+        );
+        assert_eq!(
+            message.file_change,
+            Some(json!({ "path": "src/main.rs" }))
+        );
+        assert_eq!(message.duration_ms, Some(42));
+        assert_eq!(message.exit_code, Some(0));
+        let serialized = serde_json::to_value(message).expect("serialize normalized message");
+        assert!(serialized.get("tool_output").is_some());
+        assert!(serialized.get("toolOutput").is_none());
+    }
+
+    #[test]
     fn opencode_session_last_model_prefers_latest_assistant_then_session_column() {
         let _guard = OPENCODE_DB_TEST_LOCK
             .get_or_init(|| StdMutex::new(()))
@@ -4434,7 +4536,7 @@ mod agent_sessions_tests {
     }
 
     #[test]
-    fn claude_session_parser_keeps_assistant_output_visible() {
+    fn claude_session_parser_accepts_top_level_stop_reason() {
         let root = unique_test_dir("claude-transcript-output");
         fs::create_dir_all(&root).unwrap();
         let path = root.join("claude-session.jsonl");
@@ -4454,10 +4556,10 @@ mod agent_sessions_tests {
             "sessionId": "claude-session",
             "cwd": "/tmp/project",
             "timestamp": "2026-06-18T20:50:17Z",
+            "stop_reason": "end_turn",
             "message": {
                 "role": "assistant",
-                "content": [{"type": "text", "text": "Hey! How can I help you today?"}],
-                "stop_reason": "end_turn"
+                "content": [{"type": "text", "text": "Hey! How can I help you today?"}]
             }
         })
         .to_string();
@@ -5896,7 +5998,9 @@ fn parse_claude_session(
 
             if role == "assistant"
                 && claude_stop_reason_completes_turn(&value_string(
-                    message.get("stop_reason"),
+                    message
+                        .get("stop_reason")
+                        .or_else(|| value.get("stop_reason")),
                 ))
             {
                 push_codex_message_with_tool_metadata(
@@ -6876,26 +6980,35 @@ fn agent_thread_cloud_message_from_value(
 
     let role = agent_thread_cloud_message_role(value, &kind);
     Some(CodexThreadTranscriptMessage {
-        id: cloud_mcp_payload_text(value, &["id", "message_id"])
+        id: cloud_mcp_payload_text(value, &["id", "message_id", "messageId"])
             .unwrap_or(fallback_id),
         role,
         kind,
         text,
         title,
-        call_id: cloud_mcp_payload_text(value, &["call_id"]).unwrap_or_default(),
+        call_id: cloud_mcp_payload_text(value, &["call_id", "callId"]).unwrap_or_default(),
         created_at: cloud_mcp_payload_text(
             value,
-            &["created_at", "timestamp", "time"],
+            &["created_at", "createdAt", "timestamp", "time"],
         )
         .unwrap_or_else(|| fallback_timestamp.to_string()),
         source: cloud_mcp_payload_text(value, &["source"]).unwrap_or_else(|| agent_id.to_string()),
         tool: value.get("tool").cloned(),
-        tool_output: value.get("tool_output").cloned(),
-        tool_error: value.get("tool_error").cloned(),
-        file_change: value.get("file_change").cloned(),
-        duration_ms: first_value_i64(&[value.get("duration_ms")])
+        tool_output: value
+            .get("tool_output")
+            .or_else(|| value.get("toolOutput"))
+            .cloned(),
+        tool_error: value
+            .get("tool_error")
+            .or_else(|| value.get("toolError"))
+            .cloned(),
+        file_change: value
+            .get("file_change")
+            .or_else(|| value.get("fileChange"))
+            .cloned(),
+        duration_ms: first_value_i64(&[value.get("duration_ms"), value.get("durationMs")])
             .and_then(|value| (value >= 0).then_some(value as u64)),
-        exit_code: first_value_i64(&[value.get("exit_code")]),
+        exit_code: first_value_i64(&[value.get("exit_code"), value.get("exitCode")]),
         subagent: value.get("subagent").cloned(),
         usage: value.get("usage").cloned(),
         truncated: cloud_mcp_payload_bool(value, &["truncated"], false),
@@ -6918,17 +7031,29 @@ fn agent_thread_transcript_from_cloud_session_response(
         .ok_or_else(|| "Cloud session response did not include a session.".to_string())?;
     let cloud_session_id = cloud_mcp_payload_text(
         session,
-        &["id", "agent_chat_session_id"],
+        &["id", "agent_chat_session_id", "agentChatSessionId"],
     )
     .unwrap_or_default();
     let session_id = cloud_mcp_payload_text(
         session,
-        &["session_id", "provider_session_id"],
+        &[
+            "session_id",
+            "provider_session_id",
+            "sessionId",
+            "providerSessionId",
+        ],
     )
     .unwrap_or_else(|| provider_session_id.to_string());
     let mut latest_timestamp = cloud_mcp_payload_text(
         session,
-        &["latest_timestamp", "updated_at", "created_at"],
+        &[
+            "latest_timestamp",
+            "updated_at",
+            "created_at",
+            "latestTimestamp",
+            "updatedAt",
+            "createdAt",
+        ],
     )
     .unwrap_or_default();
     let records = root
@@ -6940,7 +7065,14 @@ fn agent_thread_transcript_from_cloud_session_response(
     for (record_index, record) in records.iter().enumerate() {
         let record_timestamp = cloud_mcp_payload_text(
             record,
-            &["record_timestamp", "latest_timestamp", "created_at"],
+            &[
+                "record_timestamp",
+                "latest_timestamp",
+                "created_at",
+                "recordTimestamp",
+                "latestTimestamp",
+                "createdAt",
+            ],
         )
         .unwrap_or_else(|| latest_timestamp.clone());
         for (message_index, message) in agent_thread_cloud_record_messages(record)
@@ -6970,14 +7102,14 @@ fn agent_thread_transcript_from_cloud_session_response(
 
     Ok(CodexThreadTranscriptResult {
         session_id,
-        session_title: cloud_mcp_payload_text(session, &["title", "session_title"])
+        session_title: cloud_mcp_payload_text(session, &["title", "session_title", "sessionTitle"])
             .unwrap_or_default(),
         rollout_path: if cloud_session_id.trim().is_empty() {
             format!("cloud://agent-chat-session/{provider_session_id}")
         } else {
             format!("cloud://agent-chat-session/{cloud_session_id}")
         },
-        cwd: cloud_mcp_payload_text(session, &["cwd", "working_directory"])
+        cwd: cloud_mcp_payload_text(session, &["cwd", "working_directory", "workingDirectory"])
             .unwrap_or_else(|| fallback_cwd.to_string()),
         matched_by: "sessionId".to_string(),
         latest_timestamp,
@@ -6995,7 +7127,12 @@ fn agent_thread_cloud_session_matches_provider_session(
     }
     cloud_mcp_payload_text(
         session,
-        &["session_id", "provider_session_id"],
+        &[
+            "session_id",
+            "provider_session_id",
+            "sessionId",
+            "providerSessionId",
+        ],
     )
     .map(|value| value.trim() == expected)
     .unwrap_or(false)
@@ -7040,7 +7177,7 @@ fn read_agent_thread_cloud_transcript(
         .ok_or_else(|| "Cloud did not return a synced session for this provider id.".to_string())?;
     let cloud_session_id = cloud_mcp_payload_text(
         session,
-        &["id", "agent_chat_session_id"],
+        &["id", "agent_chat_session_id", "agentChatSessionId"],
     )
     .ok_or_else(|| "Cloud session list row did not include a session id.".to_string())?;
 

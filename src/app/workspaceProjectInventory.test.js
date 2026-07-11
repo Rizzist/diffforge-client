@@ -81,7 +81,7 @@ test("buildPcbProjectInventory keeps board ids and derives missing ones", () => 
 
 test("buildVideoProjectInventory derives slug ids from project paths", () => {
   const rows = buildVideoProjectInventory([
-    { name: "Launch", path: "media/projects/launch.video.pipe", updated_at_ms: 7 },
+    { name: "Launch", path: "media/projects/launch.video.pipe", updatedAtMs: 7 },
     { name: "Legacy", path: "media/projects/legacy.video.json" },
   ]);
   assert.deepEqual(rows, [

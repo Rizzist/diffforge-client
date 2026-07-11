@@ -3496,6 +3496,26 @@ test("failed live provider tool hooks carry structured errors", () => {
   assert.match(projectionEvents[0].text, /DRC failed/);
 });
 
+test("live provider tool hooks preserve an explicit turn id", () => {
+  const projectionEvents = createWorkspaceThreadToolProjectionEvents({
+    current_agent: "codex",
+    id: "thread-explicit-turn",
+    latest_turn: {
+      message_id: "prompt-latest",
+      turn_id: "turn-latest",
+    },
+  }, {
+    agent_id: "codex",
+    message_id: "tool-message",
+    tool_name: "exec_command",
+    turn_id: "turn-provider-explicit",
+    type: "provider-tool-started",
+  });
+
+  assert.equal(projectionEvents.length, 1);
+  assert.equal(projectionEvents[0].turn_id, "turn-provider-explicit");
+});
+
 test("title-only tool projection events remain visible", () => {
   const workspaceId = "workspace-title-only-tool";
   const threadId = "thread-title-only-tool";

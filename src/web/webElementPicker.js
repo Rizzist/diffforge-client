@@ -168,13 +168,13 @@ function buildWebElementPickerScript(action) {
       const id = "webctx_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
       return {
         attributes: attributeMap(element),
-        capturedAtMs: Date.now(),
-        childrenCount: element.children ? element.children.length : 0,
-        devicePixelRatio: number(window.devicePixelRatio || 1),
+        captured_at_ms: Date.now(),
+        children_count: element.children ? element.children.length : 0,
+        device_pixel_ratio: number(window.devicePixelRatio || 1),
         element: elementName(element),
         id,
         kind: "web-element",
-        pageRect: {
+        page_rect: {
           height: rect.height,
           left: number(rect.left + window.scrollX),
           top: number(rect.top + window.scrollY),
@@ -192,7 +192,7 @@ function buildWebElementPickerScript(action) {
         },
         selector: selectorFor(element),
         styles: styleMap(element),
-        tagName: element.tagName.toLowerCase(),
+        tag_name: element.tagName.toLowerCase(),
         text: clampText(element.textContent, MAX_TEXT),
         title: document.title || "",
         url: location.href,

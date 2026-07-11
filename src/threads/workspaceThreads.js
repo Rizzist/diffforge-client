@@ -2910,7 +2910,7 @@ export function createWorkspaceThreadToolProjectionEvents(thread, event = {}) {
     event.prompt_event_id || event.pending_prompt_id || event.prompt_id || event.message_id || latestTurn?.message_id,
   );
   const turnId = cleanText(
-    event.turn_id || event.provider_turn_id || latestTurn?.turn_id || promptMessageId ? createTurnIdForMessage(thread, promptMessageId) : "",
+    event.turn_id || event.provider_turn_id || latestTurn?.turn_id || (promptMessageId ? createTurnIdForMessage(thread, promptMessageId) : ""),
   );
   const agentId = cleanAgentId(event.agent_id || event.current_agent || thread?.current_agent, "");
   const createdAt = cleanText(

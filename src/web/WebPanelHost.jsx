@@ -65,12 +65,12 @@ function parseWebPanelParams() {
   const params = new URLSearchParams(queryIndex >= 0 ? hash.slice(queryIndex + 1) : "");
   const theme = String(params.get("theme") || "dark").toLowerCase() === "light" ? "light" : "dark";
   return {
-    adopt_label: String(params.get("adopt_label") || "").trim(),
-    pane_id: params.get("pane_id") || "",
+    adopt_label: String(params.get("adopt_label") || params.get("adoptLabel") || "").trim(),
+    pane_id: params.get("pane_id") || params.get("paneId") || "",
     theme,
     url: normalizeWebInput(params.get("url") || "") || DEFAULT_WEB_URL,
-    window_id: params.get("window_id") || "",
-    workspace_id: params.get("workspace_id") || "",
+    window_id: params.get("window_id") || params.get("windowId") || "",
+    workspace_id: params.get("workspace_id") || params.get("workspaceId") || "",
   };
 }
 
@@ -301,8 +301,8 @@ export default function WebPanelHost() {
       }
       setAgentPromptTargets(normalizePanelAgentPromptTargets(payload.targets));
       setDefaultAgentPromptTargetIds(
-        (Array.isArray(payload.default_selected_target_ids)
-          ? payload.default_selected_target_ids
+        (Array.isArray(payload.defaultSelectedTargetIds)
+          ? payload.defaultSelectedTargetIds
           : Array.isArray(payload.default_selected_target_ids)
             ? payload.default_selected_target_ids
             : []

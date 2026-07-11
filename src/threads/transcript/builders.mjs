@@ -107,23 +107,24 @@ export function messageFileChange(message = {}) {
 
 export function messageSubagent(message = {}) {
   const source = plainObject(message.subagent);
-  const hasFields = ["subagent_id", "sub_agent_id"]
+  const hasFields = ["subagent_id", "subagentId", "sub_agent_id", "subAgentId"]
     .some((key) => hasOwn(message, key));
   if (!source && !hasFields) return null;
   const owner = source || message;
   const id = transcriptText(
-    owner.subagent_id || owner.sub_agent_id || source ? owner.id : "",
+    owner.subagent_id || owner.subagentId || owner.sub_agent_id || owner.subAgentId
+      || (source ? owner.id : ""),
   );
   const agentChatSessionId = transcriptText(
-    owner.agent_chat_session_id,
+    owner.agent_chat_session_id || owner.agentChatSessionId,
   );
   const providerSessionId = transcriptText(
-    owner.provider_session_id,
+    owner.provider_session_id || owner.providerSessionId,
   );
   return {
     ...(source || {}),
     id,
-    parent_id: transcriptText(owner.parent_id),
+    parent_id: transcriptText(owner.parent_id || owner.parentId),
     title: transcriptText(owner.title || owner.name || message.title),
     status: transcriptToken(owner.status || owner.state || message.status),
     session_ref: agentChatSessionId || providerSessionId
@@ -148,7 +149,7 @@ export function messageTruncated(message = {}) {
 
 export function messageKindToken(message = {}) {
   return transcriptToken(
-    message.kind || message.message_kind || message.content_kind || message.type,
+    message.kind || message.message_kind || message.messageKind || message.content_kind || message.type,
   );
 }
 
@@ -264,13 +265,13 @@ export function normalizeTurnDiffFile(file = {}) {
   const patch = typeof source.patch === "string" && source.patch ? source.patch : null;
   return {
     path,
-    old_path: transcriptText(source.old_path || source.from) || null,
+    old_path: transcriptText(source.old_path || source.oldPath || source.from) || null,
     kind: TURN_DIFF_FILE_KINDS.has(kind) ? kind : "edit",
     additions: finiteNumber(source.additions, source.lines_added),
     deletions: finiteNumber(source.deletions, source.lines_removed),
     binary: transcriptBool(source.binary, false),
     patch,
-    patch_truncated: transcriptBool(source.patch_truncated, false),
+    patch_truncated: transcriptBool(source.patch_truncated ?? source.patchTruncated, false),
   };
 }
 
@@ -282,7 +283,7 @@ export function normalizeTurnDiffFile(file = {}) {
 // fetchable from the synthetic file-change row.
 export function normalizeTurnDiff(message = {}) {
   if (!isTurnDiffMessage(message)) return null;
-  const turnId = transcriptText(message.turn_id);
+  const turnId = transcriptText(message.turn_id || message.turnId);
   const files = transcriptArray(message.files)
     .map(normalizeTurnDiffFile)
     .filter(Boolean);
@@ -295,19 +296,19 @@ export function normalizeTurnDiff(message = {}) {
   const completedAtMs = transcriptTimestampMs(message.completed_at)
     ?? timestampMs;
   const recordSeqRaw = finiteNumber(
-    message.record_seq, message.server_seq,
+    message.record_seq, message.recordSeq, message.server_seq,
   );
-  const filesOmittedRaw = finiteNumber(message.files_omitted);
+  const filesOmittedRaw = finiteNumber(message.files_omitted, message.filesOmitted);
   return {
     turn_id: turnId,
     files,
-    total_additions: finiteNumber(message.total_additions)
+    total_additions: finiteNumber(message.total_additions, message.totalAdditions)
       ?? totals.additions,
-    total_deletions: finiteNumber(message.total_deletions)
+    total_deletions: finiteNumber(message.total_deletions, message.totalDeletions)
       ?? totals.deletions,
     truncated: transcriptBool(message.truncated ?? message.is_truncated, false),
     files_omitted: filesOmittedRaw != null && filesOmittedRaw > 0 ? Math.floor(filesOmittedRaw) : 0,
-    record_id: transcriptText(message.record_id),
+    record_id: transcriptText(message.record_id || message.recordId),
     record_seq: recordSeqRaw != null && recordSeqRaw > 0 ? recordSeqRaw : null,
     started_at_ms: startedAtMs,
     completed_at_ms: completedAtMs,

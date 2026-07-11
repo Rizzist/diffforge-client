@@ -487,8 +487,8 @@ function normalizeAssetsLibrary(library) {
     ? jsonArray(fanout.clouds)
     : jsonArray(payload.clouds).length
       ? jsonArray(payload.clouds)
-      : jsonArray(payload.asset_clouds).length
-        ? jsonArray(payload.asset_clouds)
+      : jsonArray(payload.assetClouds).length
+        ? jsonArray(payload.assetClouds)
         : jsonArray(payload.asset_clouds);
   return {
     ...payload,

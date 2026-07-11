@@ -198,8 +198,8 @@ export default function WebWorkspaceView({
       }
       setAgentPromptTargets(normalizePanelAgentPromptTargets(payload.targets));
       setDefaultAgentPromptTargetIds(
-        (Array.isArray(payload.default_selected_target_ids)
-          ? payload.default_selected_target_ids
+        (Array.isArray(payload.defaultSelectedTargetIds)
+          ? payload.defaultSelectedTargetIds
           : Array.isArray(payload.default_selected_target_ids)
             ? payload.default_selected_target_ids
             : []

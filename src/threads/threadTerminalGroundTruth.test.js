@@ -274,6 +274,40 @@ test("live terminal permission prompts still block shutdown", () => {
   assert.equal(terminalPromptingUserBlocksShutdown(groundTruth), true);
 });
 
+test("explicit approval prompts preserve their approval kind", () => {
+  const groundTruth = getThreadTerminalGroundTruth({
+    lifecycleEvent: {
+      prompting_user_kind: "approval",
+      prompting_user_source: "provider-permission",
+      prompting_user_text: "Approve this action?",
+      terminal_is_prompting_user: true,
+      tool_use_id: "tool-approval",
+      type: "terminal-output",
+    },
+    liveTerminal: {
+      activity_status: "idle",
+      input_ready: true,
+      status: "idle",
+    },
+    providerBinding: {
+      activity_status: "idle",
+      input_ready: true,
+      status: "idle",
+    },
+    target_role: "codex",
+    thread: {
+      activity_status: "idle",
+      latest_turn: { state: "completed" },
+      message_count: 0,
+      messages: [],
+      projection_events: [],
+    },
+  });
+
+  assert.equal(groundTruth.terminal_is_prompting_user, true);
+  assert.equal(groundTruth.prompting_user_kind, "approval");
+});
+
 test("terminal output permission-looking text does not create needs-input state", () => {
   const groundTruth = getThreadTerminalGroundTruth({
     lifecycleEvent: {

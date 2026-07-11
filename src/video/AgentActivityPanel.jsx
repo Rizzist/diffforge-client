@@ -495,7 +495,7 @@ export default function AgentActivityPanel({ entries = [], onNavigate, promptIte
         return (
           <PromptRow
             data-status={status}
-            key={item.itemId}
+            key={item.item_id}
             style={{ "--prompt-activity-color": item.color || "#8bb8ff" }}
             title={`${label} — ${target} · ${statusWord}${item.error ? ` — ${item.error}` : ""}`}
           >
@@ -505,7 +505,7 @@ export default function AgentActivityPanel({ entries = [], onNavigate, promptIte
               <i>{status === "failed" && item.error ? item.error : target}</i>
             </PromptInfo>
             <PromptStatusWord>{statusWord}</PromptStatusWord>
-            <TimeStamp>{timeAgo(item.submittedAtMs)}</TimeStamp>
+            <TimeStamp>{timeAgo(item.submitted_at_ms)}</TimeStamp>
           </PromptRow>
         );
       })}

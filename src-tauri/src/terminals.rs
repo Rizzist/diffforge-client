@@ -21042,7 +21042,7 @@ async fn terminal_window_open(
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "Terminal".to_string());
     let mut url = format!(
-        "index.html#/terminal-window?paneId={}&title={}",
+        "index.html#/terminal-window?pane_id={}&title={}",
         percent_encode_query_component(&pane_id),
         percent_encode_query_component(&title_text),
     );
@@ -21066,7 +21066,7 @@ async fn terminal_window_open(
         ));
     }
     if let Some(terminal_index) = terminal_index.filter(|value| *value >= 0) {
-        url.push_str(&format!("&terminalIndex={terminal_index}"));
+        url.push_str(&format!("&terminal_index={terminal_index}"));
     }
 
     // Open at the pane's current grid size so the terminal carries its exact
