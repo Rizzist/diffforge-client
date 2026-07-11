@@ -114,7 +114,11 @@ impl Engine {
         {
             use futures::executor::block_on;
 
-            block_on(self.mac.2.stop()).expect("Failed to stop capture");
+            // ScreenCaptureKit may stop a stream itself before our owner drops
+            // it (for example after the recording loop receives an error).
+            // Calling stop again returns SCStreamErrorDomain -3808. Shutdown is
+            // best-effort and must never panic the host application.
+            let _ = block_on(self.mac.2.stop());
         }
 
         #[cfg(target_os = "windows")]

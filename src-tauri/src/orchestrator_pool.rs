@@ -39,7 +39,7 @@ struct OrchestratorInFlightSend {
 struct OrchestratorQueuedSend {
     event: Value,
     state: CloudMcpState,
-    prompt: String,
+    prepared: TodoDispatchPreparedPrompt,
     entry: OrchestratorPoolEntry,
 }
 
@@ -498,20 +498,43 @@ async fn orchestrator_pool_submit_prompt(
     app: &AppHandle,
     event: &Value,
     entry: &OrchestratorPoolEntry,
-    prompt: String,
+    prepared: TodoDispatchPreparedPrompt,
 ) -> Result<String, String> {
     let prompt_id = orchestrator_pool_prompt_id(event);
     let submit_sequence = orchestrator_pool_submit_sequence(&entry.agent_id);
+    let input = format!(
+        "\u{15}{}",
+        todo_dispatch_prepared_terminal_input(&prepared, submit_sequence),
+    );
+    let attachment_inject_started_at_ms = cloud_mcp_now_ms();
+    if !prepared.attachments.is_empty() {
+        let model = orchestrator_pool_event_text(event, &["model", "model_id"]);
+        log_terminal_status_event(
+            "backend.todo_dispatch.attachments_inject_start",
+            json!({
+                "agent_id": entry.agent_id,
+                "attachment_count": prepared.attachments.len(),
+                "attachments": todo_dispatch_staged_attachment_log_summary(&prepared.attachments),
+                "delivery": "native_bracketed_paste",
+                "model": clean_terminal_diagnostic_log_text(&model),
+                "model_image_support": todo_dispatch_attachment_model_support(&entry.agent_id, &model),
+                "pane_id": entry.pane_id,
+                "prompt_id": prompt_id,
+                "source": "orchestrator_pool",
+                "workspace_id": CLOUD_MCP_APP_CONTROL_WORKSPACE_ID,
+            }),
+        );
+    }
     let payload = TerminalInputEventPayload {
         pane_id: entry.pane_id.clone(),
         instance_id: Some(entry.instance_id),
-        data: format!("{prompt}{submit_sequence}"),
+        data: input,
         app_fork_enabled: Some(false),
         prompt_event_id: Some(prompt_id.clone()),
         prompt_event_revision: None,
         prompt_event_source: Some("orchestrator_pool".to_string()),
         prompt_event_submitted_at: Some(cloud_mcp_now_ms().to_string()),
-        prompt_event_text: Some(prompt),
+        prompt_event_text: Some(prepared.text.clone()),
         todo_id: None,
         todo_dispatch_id: None,
         todo_command_id: Some(cloud_mcp_remote_command_id(event)),
@@ -521,7 +544,24 @@ async fn orchestrator_pool_submit_prompt(
     };
     let ack = enqueue_terminal_input_event_with_ack(app, payload);
     match timeout(Duration::from_secs(ORCHESTRATOR_POOL_ACK_TIMEOUT_SECS), ack).await {
-        Ok(Ok(Ok(()))) => Ok(prompt_id),
+        Ok(Ok(Ok(()))) => {
+            if !prepared.attachments.is_empty() {
+                log_terminal_status_event(
+                    "backend.todo_dispatch.attachments_injected",
+                    json!({
+                        "agent_id": entry.agent_id,
+                        "attachment_count": prepared.attachments.len(),
+                        "delivery": "native_bracketed_paste",
+                        "elapsed_ms": cloud_mcp_now_ms().saturating_sub(attachment_inject_started_at_ms),
+                        "pane_id": entry.pane_id,
+                        "prompt_id": prompt_id,
+                        "source": "orchestrator_pool",
+                        "workspace_id": CLOUD_MCP_APP_CONTROL_WORKSPACE_ID,
+                    }),
+                );
+            }
+            Ok(prompt_id)
+        }
         Ok(Ok(Err(error))) => Err(error),
         Ok(Err(_)) => Err("Terminal input acknowledgement channel closed.".to_string()),
         Err(_) => Err("Terminal input write acknowledgement timed out.".to_string()),
@@ -554,16 +594,18 @@ async fn orchestrator_pool_deliver(
     state: &CloudMcpState,
     event: &Value,
 ) -> Result<Value, String> {
-    let prompt = todo_dispatch_text_with_remote_attachments(
+    let prepared = todo_dispatch_text_with_remote_attachments(
         orchestrator_pool_prompt_text(event),
         event,
         CLOUD_MCP_APP_CONTROL_WORKSPACE_ID,
     )
     .await;
-    if prompt.is_empty() {
+    if !prepared.has_content() {
         return Err("orchestrator send message is empty".to_string());
     }
-    if prompt.len() + TERMINAL_ENTER_SEQUENCE.len() > MAX_TERMINAL_WRITE_BYTES {
+    if todo_dispatch_prepared_terminal_input(&prepared, TERMINAL_ENTER_SEQUENCE).len() + 1
+        > MAX_TERMINAL_WRITE_BYTES
+    {
         return Err("orchestrator send message is too large".to_string());
     }
     let pool_key = orchestrator_pool_key(event);
@@ -585,7 +627,7 @@ async fn orchestrator_pool_deliver(
                 pane_state.queued.push_back(OrchestratorQueuedSend {
                     event: event.clone(),
                     state: state.clone(),
-                    prompt,
+                    prepared,
                     entry: entry.clone(),
                 });
                 return Ok(orchestrator_pool_result_details(
@@ -621,7 +663,7 @@ async fn orchestrator_pool_deliver(
             pane_state.queued.push_back(OrchestratorQueuedSend {
                 event: event.clone(),
                 state: state.clone(),
-                prompt,
+                prepared,
                 entry: entry.clone(),
             });
             return Ok(orchestrator_pool_result_details(
@@ -634,7 +676,7 @@ async fn orchestrator_pool_deliver(
         return Err("orchestrator sends lock poisoned".to_string());
     }
 
-    let prompt_id = orchestrator_pool_submit_prompt(app, event, &entry, prompt).await?;
+    let prompt_id = orchestrator_pool_submit_prompt(app, event, &entry, prepared).await?;
     if let Ok(mut guard) = orchestrator_pool_sends().lock() {
         let pane_state = guard.entry(entry.pane_id.clone()).or_default();
         pane_state.in_flight = Some(OrchestratorInFlightSend {
@@ -693,7 +735,12 @@ pub(crate) fn orchestrator_pool_observe_turn_settled(
     if let Some(queued) = next {
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
-            match orchestrator_pool_submit_prompt(&app, &queued.event, &queued.entry, queued.prompt)
+            match orchestrator_pool_submit_prompt(
+                &app,
+                &queued.event,
+                &queued.entry,
+                queued.prepared,
+            )
                 .await
             {
                 Ok(prompt_id) => {

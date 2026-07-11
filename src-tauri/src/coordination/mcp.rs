@@ -5545,16 +5545,13 @@ fn value_has_content(value: &Value) -> bool {
 }
 
 fn cloud_start_task_source_refs(response: &Value) -> Value {
-    let todo_id =
-        cloud_start_task_source_ref_text(response, &["todo_id", "source_todo_id"]);
+    let todo_id = cloud_start_task_source_ref_text(response, &["todo_id", "source_todo_id"]);
     let todo_dispatch_id = cloud_start_task_source_ref_text(
         response,
         &["todo_dispatch_id", "source_todo_dispatch_id"],
     );
-    let prompt_event_id = cloud_start_task_source_ref_text(
-        response,
-        &["prompt_event_id", "source_prompt_event_id"],
-    );
+    let prompt_event_id =
+        cloud_start_task_source_ref_text(response, &["prompt_event_id", "source_prompt_event_id"]);
     let command_id =
         cloud_start_task_source_ref_text(response, &["command_id", "source_command_id"]);
     let mut source = Map::new();
@@ -6153,8 +6150,7 @@ fn loopspace_df_normalize_asset_write_operation(value: Option<String>) -> String
 }
 
 fn loopspace_df_resource_entry(node: &LoopspaceDfNode, resource_kind: &str) -> Value {
-    let create_name =
-        loopspace_df_prop(&node.props, &["create_name", "name"]).unwrap_or_default();
+    let create_name = loopspace_df_prop(&node.props, &["create_name", "name"]).unwrap_or_default();
     let refs = if resource_kind == "asset" {
         loopspace_df_split_refs(loopspace_df_prop(
             &node.props,
@@ -6774,8 +6770,7 @@ fn loopspace_df_compact_resource_lines(step_id: &str, checkpoint: &Value) -> Vec
             let operation = loopspace_df_value_text(resource, &["operation", "op"]);
             let create_name = loopspace_df_value_text(resource, &["create_name"]);
             let target_mode = loopspace_df_value_text(resource, &["target_mode"]);
-            let template =
-                loopspace_df_value_text(resource, &["content_template", "template"]);
+            let template = loopspace_df_value_text(resource, &["content_template", "template"]);
             let mut extras = Vec::new();
             if !operation.is_empty() {
                 extras.push(format!("op={operation}"));
@@ -6885,8 +6880,7 @@ fn loopspace_df_compact_run_context_packet(context: &Value) -> String {
         if !todo.is_empty() {
             lines.push(format!("todo: {todo}"));
         }
-        let workspace =
-            loopspace_df_value_text(parent, &["target_workspace_ids", "workspace_id"]);
+        let workspace = loopspace_df_value_text(parent, &["target_workspace_ids", "workspace_id"]);
         let terminal = loopspace_df_value_text(parent, &["target_terminal_mode", "terminal"]);
         let mut target = Vec::new();
         if !workspace.is_empty() {
@@ -6905,8 +6899,7 @@ fn loopspace_df_compact_run_context_packet(context: &Value) -> String {
         .or_else(|| context.get("current"))
         .unwrap_or(&Value::Null);
     if current.is_object() {
-        let id =
-            loopspace_df_value_text(current, &["id", "step_id", "checkpoint_id"]);
+        let id = loopspace_df_value_text(current, &["id", "step_id", "checkpoint_id"]);
         let kind = loopspace_df_value_text(current, &["kind", "type"]);
         let label = loopspace_df_value_text(current, &["label", "title", "name"]);
         let kind = if kind.is_empty() && !id.is_empty() {
@@ -6986,36 +6979,25 @@ fn start_task_loopspace_run_context_for_agent(input: &Value, cloud: &Value) -> O
         return Some(loopspace_df_compact_run_context_value(&context));
     }
 
-    let loop_runtime_run_id = loopspace_runtime_field_text_from_start(
-        input,
-        cloud,
-        &["loop_runtime_run_id", "run_id"],
-    )
-    .unwrap_or_default();
-    let loop_runtime_node_id = loopspace_runtime_field_text_from_start(
-        input,
-        cloud,
-        &["loop_runtime_node_id", "node_id"],
-    )
-    .unwrap_or_default();
+    let loop_runtime_run_id =
+        loopspace_runtime_field_text_from_start(input, cloud, &["loop_runtime_run_id", "run_id"])
+            .unwrap_or_default();
+    let loop_runtime_node_id =
+        loopspace_runtime_field_text_from_start(input, cloud, &["loop_runtime_node_id", "node_id"])
+            .unwrap_or_default();
     if loop_runtime_run_id.trim().is_empty() && loop_runtime_node_id.trim().is_empty() {
         return None;
     }
 
-    let loopspace_id =
-        loopspace_runtime_field_text_from_start(input, cloud, &["loopspace_id"])
-            .unwrap_or_default();
-    let loop_runtime_edge_id = loopspace_runtime_field_text_from_start(
-        input,
-        cloud,
-        &["loop_runtime_edge_id", "edge_id"],
-    )
-    .unwrap_or_default();
-    let trigger_id = loopspace_runtime_field_text_from_start(input, cloud, &["trigger_id"])
+    let loopspace_id = loopspace_runtime_field_text_from_start(input, cloud, &["loopspace_id"])
         .unwrap_or_default();
-    let trigger_run_id =
-        loopspace_runtime_field_text_from_start(input, cloud, &["trigger_run_id"])
+    let loop_runtime_edge_id =
+        loopspace_runtime_field_text_from_start(input, cloud, &["loop_runtime_edge_id", "edge_id"])
             .unwrap_or_default();
+    let trigger_id =
+        loopspace_runtime_field_text_from_start(input, cloud, &["trigger_id"]).unwrap_or_default();
+    let trigger_run_id = loopspace_runtime_field_text_from_start(input, cloud, &["trigger_run_id"])
+        .unwrap_or_default();
 
     if loopspace_id.trim().is_empty() || loop_runtime_node_id.trim().is_empty() {
         let context = loopspace_df_context_error(

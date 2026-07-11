@@ -12572,6 +12572,9 @@ async fn cloud_mcp_start_global_ws(state: &CloudMcpState) {
 }
 
 fn cloud_mcp_spawn_global_ws(state: &CloudMcpState) {
+    if app_shutdown_requested() {
+        return;
+    }
     if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
         return;
     }
@@ -13523,6 +13526,23 @@ async fn cloud_mcp_clear_global_ws_sender_if_current(
         return;
     }
 
+    if app_shutdown_requested() {
+        let message = "Diff Forge is shutting down.";
+        {
+            let mut runtime = state.inner.lock().await;
+            runtime.connected = false;
+            runtime.status = "offline".to_string();
+            runtime.last_error.clear();
+            runtime.global_ws_connected = false;
+            runtime.global_ws_status = "offline".to_string();
+            runtime.global_ws_last_error.clear();
+            runtime.global_ws_connection_id = None;
+            runtime.global_ws_message_token = None;
+        }
+        cloud_mcp_fail_pending_ws_requests(state, message).await;
+        return;
+    }
+
     let message = error
         .map(|value| clean_terminal_telemetry_text(value))
         .unwrap_or_else(|| "Cloud MCP app websocket disconnected.".to_string());
@@ -13577,6 +13597,26 @@ async fn cloud_mcp_mark_global_ws_disconnected_inner(
         state.global_ws_epoch.fetch_add(1, Ordering::SeqCst);
         let _ = state.global_ws_tx.lock().await.take();
         cloud_mcp_mark_global_ws_offline_permanent(state).await;
+        return;
+    }
+    if app_shutdown_requested() {
+        state.global_ws_epoch.fetch_add(1, Ordering::SeqCst);
+        let _ = state.global_ws_tx.lock().await.take();
+        if let Ok(mut subscriptions) = state.terminal_output_stream_subscriptions.lock() {
+            subscriptions.clear();
+        }
+        {
+            let mut runtime = state.inner.lock().await;
+            runtime.connected = false;
+            runtime.status = "offline".to_string();
+            runtime.last_error.clear();
+            runtime.global_ws_connected = false;
+            runtime.global_ws_status = "offline".to_string();
+            runtime.global_ws_last_error.clear();
+            runtime.global_ws_connection_id = None;
+            runtime.global_ws_message_token = None;
+        }
+        cloud_mcp_fail_pending_ws_requests(state, "Diff Forge is shutting down.").await;
         return;
     }
     let message = clean_terminal_telemetry_text(error);
@@ -14241,7 +14281,7 @@ fn cloud_mcp_spawn_account_live_state_reconcile(state: &CloudMcpState, reason: &
                 &state,
                 "account_live_state",
                 &payload,
-                Duration::from_secs(8),
+                Duration::from_secs(CLOUD_MCP_CONNECT_TIMEOUT_SECS),
             )
             .await
             {
@@ -14272,7 +14312,23 @@ fn cloud_mcp_spawn_account_live_state_reconcile(state: &CloudMcpState, reason: &
                     );
                 }
                 Err(error) => {
-                    let retryable = error.to_ascii_lowercase().contains("no account live state");
+                    let normalized_error = error.to_ascii_lowercase();
+                    // A reconcile is a background snapshot refresh, not a
+                    // websocket health probe. Under a busy startup queue the
+                    // request can time out while the socket remains healthy;
+                    // account_sync_resume will still converge the domains.
+                    if normalized_error.contains("request timed out") {
+                        log_cloud_sync_event(
+                            "account_live_state.reconcile_deferred",
+                            json!({
+                                "reason": reason,
+                                "attempt": attempt + 1,
+                                "error": clean_terminal_telemetry_text(&error),
+                            }),
+                        );
+                        return;
+                    }
+                    let retryable = normalized_error.contains("no account live state");
                     log_cloud_sync_event(
                         "account_live_state.reconcile_error",
                         json!({
@@ -17236,6 +17292,27 @@ async fn cloud_mcp_apply_account_sync_resume_response(
     ) {
         match cloud_mcp_apply_account_todo_inbound_event(state, "todo.live_state", &todos).await {
             Ok(result) => {
+                let reconciliation_commits =
+                    todo_store_account_resume_reconciliation_commits(&todos);
+                let mut reconciliation_items = 0usize;
+                for commit in reconciliation_commits {
+                    reconciliation_items = reconciliation_items.saturating_add(commit.item_count);
+                    let response = cloud_mcp_enqueue_workspace_todo_sync_commit(
+                        state,
+                        commit.payload,
+                        "account_sync_resume_authoritative_reconcile",
+                    )
+                    .await;
+                    log_cloud_sync_event(
+                        "account_sync_resume.todo_authoritative_reconcile_queued",
+                        json!({
+                            "item_count": commit.item_count,
+                            "operation": commit.operation,
+                            "response": response,
+                            "workspace_id": commit.workspace_id,
+                        }),
+                    );
+                }
                 let _ =
                     cloud_mcp_send_account_todo_delta_ack(state, &result, "account_sync_resume")
                         .await;
@@ -17247,6 +17324,7 @@ async fn cloud_mcp_apply_account_sync_resume_response(
                         "deleted": result.deleted,
                         "highest_seq": result.highest_seq,
                         "cursor": result.cursor,
+                        "reconciliation_items": reconciliation_items,
                     }),
                 );
             }
@@ -17442,6 +17520,7 @@ async fn cloud_mcp_apply_account_sync_resume_remote_commands(
         }
         if !cloud_mcp_claim_remote_command_receipt(state, &event).await {
             duplicate += 1;
+            cloud_mcp_ack_duplicate_remote_command(&app, state, &event).await;
             continue;
         }
         let _ = cloud_mcp_send_remote_command_status_event(
@@ -17814,6 +17893,7 @@ async fn cloud_mcp_receive_chat_attachment_push(message: &Value) -> Result<Value
         "image_count": image_count,
         "total_bytes": total_bytes,
         "staged": result.staged,
+        "attachments": result.attachments,
         "marker_block": result.marker_block,
     }))
 }
@@ -18347,6 +18427,7 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
                         "workspace_id": result.get("workspace_id").cloned().unwrap_or(Value::Null),
                         "image_count": result.get("image_count").cloned().unwrap_or(Value::Null),
                         "total_bytes": result.get("total_bytes").cloned().unwrap_or(Value::Null),
+                        "attachments": result.get("attachments").cloned().unwrap_or_else(|| json!([])),
                         "staged_count": result.get("staged").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
                     }),
                 );
@@ -19504,6 +19585,55 @@ async fn cloud_mcp_claim_remote_command_receipt(state: &CloudMcpState, event: &V
     true
 }
 
+fn cloud_mcp_duplicate_remote_command_is_ui_retry_for(
+    event: &Value,
+    webview_dispatcher_active: bool,
+    daemon_mode_active: bool,
+) -> bool {
+    webview_dispatcher_active
+        && !daemon_mode_active
+        && !cloud_mcp_remote_command_is_rust_owned(event)
+}
+
+fn cloud_mcp_duplicate_remote_command_is_ui_retry(event: &Value) -> bool {
+    cloud_mcp_duplicate_remote_command_is_ui_retry_for(
+        event,
+        todo_dispatch_webview_dispatcher_active(),
+        crate::daemon_mode_active(),
+    )
+}
+
+async fn cloud_mcp_ack_duplicate_remote_command(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    event: &Value,
+) {
+    let ui_retry = cloud_mcp_duplicate_remote_command_is_ui_retry(event);
+    if ui_retry {
+        // Rust claims the network receipt before handing UI-owned commands to
+        // React. If that first Tauri event raced a webview remount, a delivery
+        // retry must cross the bridge again. React has its own command-id
+        // receipt guard, so an already handled command remains exactly-once.
+        let _ = app.emit(CLOUD_MCP_REMOTE_COMMAND_EVENT, event.clone());
+    }
+    let details = json!({
+        "duplicate_delivery": true,
+        "ui_redelivered": ui_retry,
+    });
+    let _ = cloud_mcp_send_remote_command_status_event(
+        state,
+        event,
+        "received",
+        if ui_retry {
+            "Remote command delivery retried to the desktop UI."
+        } else {
+            "Remote command was already received by the desktop."
+        },
+        Some(&details),
+    )
+    .await;
+}
+
 async fn cloud_mcp_remote_command_cancelled_before_receipt(
     state: &CloudMcpState,
     event: &Value,
@@ -19640,7 +19770,6 @@ async fn cloud_mcp_send_remote_command_status_event(
     details: Option<&Value>,
 ) -> Result<Value, String> {
     let now = cloud_mcp_now_ms();
-    let auth = cloud_mcp_ws_auth_object(state).await?;
     let device_profile = cloud_mcp_desktop_device_profile();
     let target_terminal_nickname = cloud_mcp_terminal_nickname_text(
         event,
@@ -19770,24 +19899,22 @@ async fn cloud_mcp_send_remote_command_status_event(
             payload["result"] = details.clone();
         }
     }
-    let request = cloud_mcp_event_envelope(status_kind, &payload);
-    let envelope = json!({
-        "kind": "event",
-        "id": format!("remote-command-status-{}-{}", now, uuid::Uuid::new_v4()),
-        "contract": "diffforge.app_ws.v1",
-        "auth": auth,
-        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
-        "repo_id": cloud_mcp_payload_text(&request, &["repo_id"])
-            .or_else(|| cloud_mcp_payload_text(&request, &["payload", "repo_id"])),
-        "workspace_id": cloud_mcp_payload_text(&request, &["workspace_id"])
-            .or_else(|| cloud_mcp_payload_text(&request, &["payload", "workspace_id"])),
-        "request": request,
-    });
-    let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() else {
-        return Err("Cloud MCP app websocket is not connected.".to_string());
-    };
-    tx.send(envelope)
-        .map_err(|_| "Cloud MCP app websocket sender is closed.".to_string())?;
+    // Remote controls are user-visible state transitions, so their callbacks
+    // need the same durable delivery contract as todo/live-state writes. A
+    // direct websocket send could succeed locally and then disappear during a
+    // reconnect, leaving the dashboard stuck in pending even though the
+    // desktop already performed the action. The outbox retries the exact
+    // status payload (and its command id) until Cloud acknowledges it.
+    let command_id = cloud_mcp_remote_command_id(event);
+    cloud_mcp_enqueue_background_sync(
+        state,
+        format!("remote-command-status:{command_id}:{status}:{now}"),
+        status_kind,
+        payload.clone(),
+        cloud_mcp_outbox_priority_for_event(status_kind),
+        "remote_command_status",
+    )
+    .await;
     if cloud_mcp_payload_text(&payload, &["todo_dispatch_id"]).is_some() {
         let _ = cloud_mcp_apply_local_workspace_todo_event(
             state,
@@ -19797,7 +19924,12 @@ async fn cloud_mcp_send_remote_command_status_event(
         )
         .await;
     }
-    Ok(json!({"ok": true, "sent": true, "status": status}))
+    Ok(json!({
+        "ok": true,
+        "queued": true,
+        "durable": true,
+        "status": status,
+    }))
 }
 
 fn cloud_mcp_client_action_ack_payload(
@@ -20229,14 +20361,7 @@ async fn cloud_mcp_start_remote_command_listener(
                 continue;
             }
             if !cloud_mcp_claim_remote_command_receipt(&state_clone, &event).await {
-                let _ = cloud_mcp_send_remote_command_status_event(
-                    &state_clone,
-                    &event,
-                    "duplicate_ignored",
-                    "Duplicate remote command ignored by desktop.",
-                    None,
-                )
-                .await;
+                cloud_mcp_ack_duplicate_remote_command(&app, &state_clone, &event).await;
                 continue;
             }
             let _ = cloud_mcp_send_remote_command_status_event(
@@ -33971,6 +34096,14 @@ fn cloud_mcp_auth_context_changed(
         || previous_team_id != team_id
 }
 
+fn cloud_mcp_account_scope_change_requires_disconnect(
+    account_context_changed: bool,
+    global_ws_connected: bool,
+    connection_id_present: bool,
+) -> bool {
+    account_context_changed && (global_ws_connected || connection_id_present)
+}
+
 async fn cloud_mcp_apply_desktop_auth_session(
     app: AppHandle,
     state: &CloudMcpState,
@@ -34045,18 +34178,30 @@ async fn cloud_mcp_apply_desktop_auth_session(
             let mut snapshots = state.runtime_snapshots.lock().await;
             *snapshots = CloudMcpRuntimeSnapshots::default();
         }
-        {
+        let websocket_was_established = {
             let mut runtime = state.inner.lock().await;
             runtime.account_key = account_key.clone();
             runtime.account_usage_snapshot = None;
             runtime.account_device_live_state_snapshot = None;
             runtime.registered_workspaces.clear();
+            cloud_mcp_account_scope_change_requires_disconnect(
+                true,
+                runtime.global_ws_connected,
+                runtime.global_ws_connection_id.is_some(),
+            )
+        };
+        if websocket_was_established {
+            cloud_mcp_mark_global_ws_disconnected(
+                state,
+                "Cloud MCP account scope changed; reconnecting websocket with fresh scope.",
+            )
+            .await;
+        } else {
+            // Initial auth hydration commonly changes the empty bootstrap
+            // scope before any socket exists. Wake connection startup without
+            // recording a false ws.disconnected error.
+            state.global_ws_reconnect.notify_waiters();
         }
-        cloud_mcp_mark_global_ws_disconnected(
-            state,
-            "Cloud MCP account scope changed; reconnecting websocket with fresh scope.",
-        )
-        .await;
     } else {
         state.inner.lock().await.account_key = account_key;
     }
@@ -51507,35 +51652,30 @@ fn cloud_mcp_todo_sync_entries_from_ops(value: &Value) -> Vec<Value> {
             if !speed.is_null() {
                 payload.insert("speed".to_string(), speed);
             }
-            if !target_terminal_id.is_null() {
-                payload.insert("target_terminal_id".to_string(), target_terminal_id);
-            }
-            if !target_terminal_index.is_null() {
-                payload.insert("target_terminal_index".to_string(), target_terminal_index);
-            }
-            if !target_terminal_name.is_null() {
-                payload.insert("target_terminal_name".to_string(), target_terminal_name);
-            }
-            if !target_thread_id.is_null() {
-                payload.insert("target_thread_id".to_string(), target_thread_id);
-            }
             if !target_agent_id.is_null() {
                 payload.insert("target_agent_id".to_string(), target_agent_id);
             }
-            if !target_color_slot.is_null() {
-                payload.insert("target_color_slot".to_string(), target_color_slot);
-            }
-            if !target_terminal_color.is_null() {
-                payload.insert("target_terminal_color".to_string(), target_terminal_color);
-            }
-            if payload.contains_key("target_terminal_id")
-                || payload.contains_key("target_terminal_index")
-                || payload.contains_key("target_terminal_name")
-                || payload.contains_key("target_thread_id")
-                || payload.contains_key("target_agent_id")
-                || payload.contains_key("target_color_slot")
-                || payload.contains_key("target_terminal_color")
-            {
+            let has_terminal_assignment = target_terminal_id
+                .as_str()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+            if has_terminal_assignment {
+                payload.insert("target_terminal_id".to_string(), target_terminal_id);
+                if !target_terminal_index.is_null() {
+                    payload.insert("target_terminal_index".to_string(), target_terminal_index);
+                }
+                if !target_terminal_name.is_null() {
+                    payload.insert("target_terminal_name".to_string(), target_terminal_name);
+                }
+                if !target_thread_id.is_null() {
+                    payload.insert("target_thread_id".to_string(), target_thread_id);
+                }
+                if !target_color_slot.is_null() {
+                    payload.insert("target_color_slot".to_string(), target_color_slot);
+                }
+                if !target_terminal_color.is_null() {
+                    payload.insert("target_terminal_color".to_string(), target_terminal_color);
+                }
                 payload.insert("target_explicit".to_string(), json!(true));
             }
             if let Some(items) = inputs.as_array().filter(|items| !items.is_empty()) {
@@ -55818,6 +55958,35 @@ mod cloud_mcp_tests {
     static CLOUD_MCP_TEST_ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 
     #[test]
+    fn todo_sync_decoder_requires_terminal_id_for_assignment_fields() {
+        let generic = cloud_mcp_todo_sync_entries_from_ops(&json!({
+            "contract": "diffforge.todo.live_state.v1",
+            "ops": [["u", 0, "todo-generic", "device-a", "workspace-a", "listed", "", {
+                "target_terminal_index": 2,
+                "target_thread_id": "thread-2",
+                "target_terminal_color": "#ff9d48"
+            }]]
+        }));
+        let generic_payload = &generic[0]["payload"];
+        assert!(generic_payload.get("target_terminal_index").is_none());
+        assert!(generic_payload.get("target_thread_id").is_none());
+        assert!(generic_payload.get("target_explicit").is_none());
+
+        let targeted = cloud_mcp_todo_sync_entries_from_ops(&json!({
+            "contract": "diffforge.todo.live_state.v1",
+            "ops": [["u", 0, "todo-targeted", "device-a", "workspace-a", "listed", "", {
+                "target_terminal_id": "pane-2",
+                "target_terminal_index": 2,
+                "target_thread_id": "thread-2"
+            }]]
+        }));
+        let targeted_payload = &targeted[0]["payload"];
+        assert_eq!(targeted_payload["target_terminal_id"], "pane-2");
+        assert_eq!(targeted_payload["target_terminal_index"], 2);
+        assert_eq!(targeted_payload["target_explicit"], true);
+    }
+
+    #[test]
     fn desktop_auth_context_changes_on_account_identity_not_same_account_token_rotation() {
         assert!(cloud_mcp_auth_context_changed(
             "account-a",
@@ -55848,6 +56017,22 @@ mod cloud_mcp_tests {
             false,
             "personal",
             None,
+        ));
+    }
+
+    #[test]
+    fn initial_account_scope_hydration_does_not_report_a_websocket_disconnect() {
+        assert!(!cloud_mcp_account_scope_change_requires_disconnect(
+            true, false, false
+        ));
+        assert!(cloud_mcp_account_scope_change_requires_disconnect(
+            true, true, false
+        ));
+        assert!(cloud_mcp_account_scope_change_requires_disconnect(
+            true, false, true
+        ));
+        assert!(!cloud_mcp_account_scope_change_requires_disconnect(
+            false, true, true
         ));
     }
 
@@ -56055,7 +56240,7 @@ mod cloud_mcp_tests {
     }
 
     #[tokio::test]
-    async fn chat_attachment_push_receive_reassembles_stages_and_reuses_marker_injection() {
+    async fn chat_attachment_push_receive_reassembles_and_stages_native_image_paths() {
         let bytes = chat_attachment_push_test_png(1);
         let sha = chat_attachment_sha256_hex(&bytes);
         cleanup_chat_attachment_push_test_sha(&sha);
@@ -56066,6 +56251,10 @@ mod cloud_mcp_tests {
             .expect("chunked websocket image stages");
         assert_eq!(received["workspace_id"], json!("workspace-test"));
         assert_eq!(received["image_count"], json!(1));
+        assert_eq!(received["attachments"][0]["name"], json!("desktop-shot.png"));
+        assert!(received["attachments"][0]["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with(".png")));
         assert!(received["marker_block"]
             .as_str()
             .unwrap_or_default()
@@ -65683,6 +65872,39 @@ mod cloud_mcp_tests {
             "event_kind": "remote_command_requested",
         });
         assert!(cloud_mcp_claim_remote_command_receipt(&state, &other_workspace).await);
+    }
+
+    #[test]
+    fn duplicate_ui_commands_redeliver_without_replaying_rust_owned_work() {
+        let workspace_activate = json!({
+            "command_kind": "workspace_activate",
+            "command_id": "activate-1",
+        });
+        assert!(cloud_mcp_duplicate_remote_command_is_ui_retry_for(
+            &workspace_activate,
+            true,
+            false,
+        ));
+        assert!(!cloud_mcp_duplicate_remote_command_is_ui_retry_for(
+            &workspace_activate,
+            false,
+            false,
+        ));
+        assert!(!cloud_mcp_duplicate_remote_command_is_ui_retry_for(
+            &workspace_activate,
+            true,
+            true,
+        ));
+
+        let rust_owned_todo = json!({
+            "command_kind": "todo_create",
+            "command_id": "todo-1",
+        });
+        assert!(!cloud_mcp_duplicate_remote_command_is_ui_retry_for(
+            &rust_owned_todo,
+            true,
+            false,
+        ));
     }
 
     #[test]

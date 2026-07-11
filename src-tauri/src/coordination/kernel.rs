@@ -239,14 +239,9 @@ fn terminal_todo_plan_step_detail_from_value(value: &Value) -> Option<String> {
     value
         .as_object()
         .and_then(|object| {
-            [
-                "detail",
-                "details",
-                "description",
-                "current_step_detail",
-            ]
-            .iter()
-            .find_map(|key| object.get(*key).and_then(Value::as_str))
+            ["detail", "details", "description", "current_step_detail"]
+                .iter()
+                .find_map(|key| object.get(*key).and_then(Value::as_str))
         })
         .map(|value| compact_terminal_todo_plan_text(value, 2000))
         .filter(|value| !value.is_empty())
@@ -261,28 +256,20 @@ struct TerminalTodoPlanStepUpdate {
 }
 
 fn terminal_todo_plan_step_update_values(input: &Value) -> Vec<&Value> {
-    [
-        "step_updates",
-        "plan_step_updates",
-        "plan_steps",
-        "steps",
-    ]
-    .iter()
-    .find_map(|key| input.get(*key).and_then(Value::as_array))
-    .map(|values| values.iter().collect())
-    .unwrap_or_default()
+    ["step_updates", "plan_step_updates", "plan_steps", "steps"]
+        .iter()
+        .find_map(|key| input.get(*key).and_then(Value::as_array))
+        .map(|values| values.iter().collect())
+        .unwrap_or_default()
 }
 
 fn terminal_todo_plan_step_index_from_value(value: &Value, fallback: i64) -> i64 {
-    optional_i64_field(
-        value,
-        &["step_index", "plan_step_index", "index"],
-    )
-    .or_else(|| {
-        optional_i64_field(value, &["ordinal", "step_ordinal"])
-            .map(|ordinal| ordinal.saturating_sub(1))
-    })
-    .unwrap_or(fallback)
+    optional_i64_field(value, &["step_index", "plan_step_index", "index"])
+        .or_else(|| {
+            optional_i64_field(value, &["ordinal", "step_ordinal"])
+                .map(|ordinal| ordinal.saturating_sub(1))
+        })
+        .unwrap_or(fallback)
 }
 
 fn terminal_todo_plan_step_updates_from_input(
@@ -298,11 +285,9 @@ fn terminal_todo_plan_step_updates_from_input(
                 .min(max_index);
             let title = terminal_todo_plan_step_title_from_value(value);
             let detail = terminal_todo_plan_step_detail_from_value(value);
-            let status = string_from_value_keys(
-                value,
-                &["status", "step_status", "plan_step_status"],
-            )
-            .map(|value| normalize_terminal_todo_plan_step_status(&value));
+            let status =
+                string_from_value_keys(value, &["status", "step_status", "plan_step_status"])
+                    .map(|value| normalize_terminal_todo_plan_step_status(&value));
             (title.is_some() || detail.is_some() || status.is_some()).then_some(
                 TerminalTodoPlanStepUpdate {
                     step_index,
@@ -5142,17 +5127,9 @@ impl CoordinationKernel {
         let plan_id = string_from_value_keys(compact_plan, &["plan_id", "id"])
             .or_else(|| string_from_value_keys(created, &["plan_id", "id"]))
             .ok_or_else(|| "create_plan did not return a plan_id.".to_string())?;
-        let todo_id = string_from_value_keys(
-            compact_plan,
-            &["todo_id", "primary_todo_id"],
-        )
-        .or_else(|| {
-            string_from_value_keys(
-                created,
-                &["todo_id", "primary_todo_id"],
-            )
-        })
-        .unwrap_or_else(|| plan_id.clone());
+        let todo_id = string_from_value_keys(compact_plan, &["todo_id", "primary_todo_id"])
+            .or_else(|| string_from_value_keys(created, &["todo_id", "primary_todo_id"]))
+            .unwrap_or_else(|| plan_id.clone());
         let workspace_id = string_from_value_keys(input, &["workspace_id"])
             .or_else(|| string_from_value_keys(created, &["workspace_id"]))
             .or_else(|| string_from_value_keys(compact_plan, &["workspace_id"]));
@@ -5179,19 +5156,12 @@ impl CoordinationKernel {
         if steps.is_empty() {
             return Ok(None);
         }
-        let current_step_index = optional_i64_field(
-            compact_plan,
-            &["current_step_index", "plan_step_index"],
-        )
-        .or_else(|| {
-            optional_i64_field(
-                created,
-                &["current_step_index", "plan_step_index"],
-            )
-        })
-        .unwrap_or(0)
-        .max(0)
-        .min(steps.len().saturating_sub(1) as i64);
+        let current_step_index =
+            optional_i64_field(compact_plan, &["current_step_index", "plan_step_index"])
+                .or_else(|| optional_i64_field(created, &["current_step_index", "plan_step_index"]))
+                .unwrap_or(0)
+                .max(0)
+                .min(steps.len().saturating_sub(1) as i64);
         let now = now_rfc3339();
         let actor_id = agent_id.as_deref().unwrap_or(REPO_ID);
         let result = (|| {
@@ -5227,12 +5197,10 @@ impl CoordinationKernel {
                 )
                 .map_err(|error| format!("Unable to record terminal todo plan: {error}"))?;
             for (index, step) in steps.iter().enumerate() {
-                let step_index = optional_i64_field(
-                    step,
-                    &["index", "step_index", "plan_step_index"],
-                )
-                .unwrap_or(index as i64)
-                .max(0);
+                let step_index =
+                    optional_i64_field(step, &["index", "step_index", "plan_step_index"])
+                        .unwrap_or(index as i64)
+                        .max(0);
                 let step_todo_id = string_from_value_keys(step, &["todo_id", "id"])
                     .unwrap_or_else(|| format!("{plan_id}-todo-{}", step_index + 1));
                 let step_id = string_from_value_keys(step, &["id"])
@@ -5571,34 +5539,35 @@ impl CoordinationKernel {
             input,
             &["current_step_index", "plan_step_index", "next_step_index"],
         );
-        let completed_index = optional_i64_field(
-            input,
-            &["completed_step_index", "completed_index"],
-        );
+        let completed_index =
+            optional_i64_field(input, &["completed_step_index", "completed_index"]);
         let next_detail = string_from_value_keys(
             input,
-            &["next_step_detail", "current_step_detail", "plan_step_detail"],
+            &[
+                "next_step_detail",
+                "current_step_detail",
+                "plan_step_detail",
+            ],
         )
         .map(|value| compact_terminal_todo_plan_text(&value, 2000))
         .filter(|value| !value.is_empty());
         let next_title = string_from_value_keys(
             input,
-            &["next_step_title", "current_step_title", "plan_step_title", "step_title"],
+            &[
+                "next_step_title",
+                "current_step_title",
+                "plan_step_title",
+                "step_title",
+            ],
         )
         .map(|value| {
             compact_terminal_todo_plan_text(&value, TERMINAL_TODO_PLAN_STEP_TITLE_MAX_CHARS)
         })
         .filter(|value| !value.is_empty());
-        let step_status = string_from_value_keys(
-            input,
-            &["plan_step_status", "step_status"],
-        )
-        .map(|value| normalize_terminal_todo_plan_step_status(&value));
-        let plan_status = string_from_value_keys(
-            input,
-            &["plan_status", "terminal_plan_status"],
-        )
-        .map(|value| normalize_terminal_todo_plan_status(&value));
+        let step_status = string_from_value_keys(input, &["plan_step_status", "step_status"])
+            .map(|value| normalize_terminal_todo_plan_step_status(&value));
+        let plan_status = string_from_value_keys(input, &["plan_status", "terminal_plan_status"])
+            .map(|value| normalize_terminal_todo_plan_status(&value));
         let has_step_updates = !terminal_todo_plan_step_update_values(input).is_empty();
 
         if requested_current.is_none()
@@ -6443,10 +6412,9 @@ impl CoordinationKernel {
         input: &Value,
         task_id: &str,
     ) -> Result<Option<String>, String> {
-        if let Some(plan_ref) = string_from_value_keys(
-            input,
-            &["plan_id", "todo_id", "source_todo_id"],
-        ) {
+        if let Some(plan_ref) =
+            string_from_value_keys(input, &["plan_id", "todo_id", "source_todo_id"])
+        {
             if let Some(plan_id) = self.terminal_todo_plan_plan_id_for_plan_ref(&plan_ref)? {
                 return Ok(Some(plan_id));
             }
@@ -7213,7 +7181,9 @@ impl CoordinationKernel {
             .to_string();
         let agent_slot_id = session["agent_slot_id"].as_str().map(str::to_string);
         let slot_key = session["slot_key"].as_str().map(str::to_string);
-        let terminal_launch_epoch = session["terminal_launch_epoch"].as_str().map(str::to_string);
+        let terminal_launch_epoch = session["terminal_launch_epoch"]
+            .as_str()
+            .map(str::to_string);
         let worktree_id = session["worktree_id"].as_str().map(str::to_string);
         let write_root = session["write_root"]
             .as_str()
@@ -7379,14 +7349,19 @@ impl CoordinationKernel {
             .as_str()
             .ok_or_else(|| "Unable to read created terminal agent id.".to_string())?
             .to_string();
-        let agent_kind = session["agent_kind"].as_str().unwrap_or("agent").to_string();
+        let agent_kind = session["agent_kind"]
+            .as_str()
+            .unwrap_or("agent")
+            .to_string();
         let session_id = session["id"]
             .as_str()
             .ok_or_else(|| "Unable to read created session id.".to_string())?
             .to_string();
         let agent_slot_id = session["agent_slot_id"].as_str().map(str::to_string);
         let slot_key = session["slot_key"].as_str().map(str::to_string);
-        let terminal_launch_epoch = session["terminal_launch_epoch"].as_str().map(str::to_string);
+        let terminal_launch_epoch = session["terminal_launch_epoch"]
+            .as_str()
+            .map(str::to_string);
         let worktree_id = session["worktree_id"].as_str().map(str::to_string);
         let write_root = session["write_root"]
             .as_str()
@@ -8374,7 +8349,10 @@ impl CoordinationKernel {
                         json!("interrupted_active_task"),
                     );
                     object.insert("task_updated".to_string(), json!(task_updates > 0));
-                    object.insert("updated_resource_intents".to_string(), json!(intent_updates));
+                    object.insert(
+                        "updated_resource_intents".to_string(),
+                        json!(intent_updates),
+                    );
                     object.insert("interrupt_result".to_string(), interrupt_result.clone());
                     object.insert(
                         "crash_resume_candidate".to_string(),
@@ -9150,16 +9128,11 @@ impl CoordinationKernel {
             .and_then(Value::as_str)
             .ok_or_else(|| "authMethod is required.".to_string())?;
         let auth_method = workspace_mcp_ssh_auth_method(auth_method_value)?;
-        let key_path = workspace_mcp_optional_trimmed_text(
-            input.get("key_path"),
-        );
+        let key_path = workspace_mcp_optional_trimmed_text(input.get("key_path"));
         if auth_method == "key" && key_path.is_none() {
             return Err("SSH key path is required for key auth.".to_string());
         }
-        let certificate_path = workspace_mcp_optional_trimmed_text(
-            input
-                .get("certificate_path"),
-        );
+        let certificate_path = workspace_mcp_optional_trimmed_text(input.get("certificate_path"));
         let secret_update = match input.get("secret") {
             Some(Value::String(value)) if value.is_empty() => Some(None),
             Some(Value::String(value)) => Some(Some(value.to_string())),
@@ -9172,21 +9145,20 @@ impl CoordinationKernel {
             .and_then(|row| row["secret"].as_str().map(str::to_string))
             .filter(|value| !value.is_empty());
         let secret = secret_update.unwrap_or(existing_secret);
-        let agent_enabled = workspace_mcp_optional_bool(input, &["agent_enabled"])
-            .unwrap_or_else(|| {
+        let agent_enabled =
+            workspace_mcp_optional_bool(input, &["agent_enabled"]).unwrap_or_else(|| {
                 existing
                     .as_ref()
                     .map(|row| row["agent_enabled"].as_i64().unwrap_or_default() != 0)
                     .unwrap_or(false)
             });
-        let reveal_password =
-            workspace_mcp_optional_bool(input, &["reveal_password"])
-                .unwrap_or_else(|| {
-                    existing
-                        .as_ref()
-                        .map(|row| row["reveal_password"].as_i64().unwrap_or_default() != 0)
-                        .unwrap_or(false)
-                });
+        let reveal_password = workspace_mcp_optional_bool(input, &["reveal_password"])
+            .unwrap_or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|row| row["reveal_password"].as_i64().unwrap_or_default() != 0)
+                    .unwrap_or(false)
+            });
         let now = now_rfc3339();
         let created_at = existing
             .as_ref()
@@ -17038,8 +17010,7 @@ impl CoordinationKernel {
 
     pub fn undo_worktree_diff_summary(&self, input: &Value) -> Result<Value, String> {
         let before = self.worktree_diff_summary_data(input)?;
-        let expected_summary_key =
-            json_text_any(input, &["expected_summary_key"]);
+        let expected_summary_key = json_text_any(input, &["expected_summary_key"]);
         let summary_key = before["summary_key"].as_str().unwrap_or_default();
         if let Some(expected_summary_key) = expected_summary_key {
             if expected_summary_key != summary_key {
@@ -28138,7 +28109,15 @@ mod tests {
         run(
             &repo,
             "git",
-            &["-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "init"],
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "init",
+            ],
         );
         repo
     }
@@ -29362,7 +29341,15 @@ mod tests {
         run(
             &repo,
             "git",
-            &["-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "add b"],
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "add b",
+            ],
         );
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
         enable_agent_worktrees(&kernel);
@@ -30286,7 +30273,15 @@ command = "diffforge --diff-forge-activity-hook"
         run(
             &child,
             "git",
-            &["-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "init"],
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "init",
+            ],
         );
 
         let config = codex_managed_profile_config(
@@ -30371,7 +30366,15 @@ command = "diffforge --diff-forge-activity-hook"
         run(
             &child,
             "git",
-            &["-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "init"],
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "init",
+            ],
         );
 
         let config = codex_managed_profile_config(
@@ -33396,7 +33399,10 @@ command = "diffforge --diff-forge-activity-hook"
         assert_eq!(report["interrupted_tasks"].as_array().unwrap().len(), 0);
         let crashed_terminals = report["crashed_terminals"].as_array().unwrap();
         assert_eq!(crashed_terminals.len(), 1);
-        assert_eq!(crashed_terminals[0]["session_id"].as_str(), Some(session_id));
+        assert_eq!(
+            crashed_terminals[0]["session_id"].as_str(),
+            Some(session_id)
+        );
         assert_eq!(crashed_terminals[0]["task_id"].as_str(), Some(task_id));
         assert_eq!(
             crashed_terminals[0]["cleanup_reason"].as_str(),
@@ -33461,7 +33467,10 @@ command = "diffforge --diff-forge-activity-hook"
         assert_eq!(interrupted_tasks[0]["active_lease_count"].as_i64(), Some(1));
         let crashed_terminals = report["crashed_terminals"].as_array().unwrap();
         assert_eq!(crashed_terminals.len(), 1);
-        assert_eq!(crashed_terminals[0]["session_id"].as_str(), Some(session_id));
+        assert_eq!(
+            crashed_terminals[0]["session_id"].as_str(),
+            Some(session_id)
+        );
         assert_eq!(crashed_terminals[0]["task_id"].as_str(), Some(task_id));
         assert_eq!(
             crashed_terminals[0]["cleanup_reason"].as_str(),
@@ -33678,7 +33687,10 @@ command = "diffforge --diff-forge-activity-hook"
         );
         let crashed_terminals = report["crashed_terminals"].as_array().unwrap();
         assert_eq!(crashed_terminals.len(), 1);
-        assert_eq!(crashed_terminals[0]["session_id"].as_str(), Some(session_id));
+        assert_eq!(
+            crashed_terminals[0]["session_id"].as_str(),
+            Some(session_id)
+        );
         assert_eq!(crashed_terminals[0]["task_id"].as_str(), Some(task_id));
         assert_eq!(
             crashed_terminals[0]["startup_cleared_lease_count"].as_i64(),

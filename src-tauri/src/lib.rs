@@ -1799,7 +1799,7 @@ struct TodoTextAttachmentRequest {
     text: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct SavedTodoImageAttachment {
     name: String,
     mime_type: String,
@@ -4107,11 +4107,8 @@ fn workspace_activation_thread_for_index<'a>(
         .and_then(Value::as_object)
         .and_then(|threads| {
             threads.values().find(|thread| {
-                workspace_activation_i64(
-                    thread,
-                    &["terminal_index", "logical_index"],
-                )
-                .is_some_and(|value| value == terminal_index as i64)
+                workspace_activation_i64(thread, &["terminal_index", "logical_index"])
+                    .is_some_and(|value| value == terminal_index as i64)
             })
         })
 }
@@ -4158,17 +4155,11 @@ fn workspace_activation_descriptor_from_sources(
     let pane_id = pane_record
         .as_ref()
         .and_then(|value| {
-            workspace_activation_text(
-                value,
-                &["pane_id", "panel_id", "terminal_id", "id"],
-            )
+            workspace_activation_text(value, &["pane_id", "panel_id", "terminal_id", "id"])
         })
         .or_else(|| {
             binding.and_then(|value| {
-                workspace_activation_text(
-                    value,
-                    &["pane_id", "terminal_id", "target_terminal_id"],
-                )
+                workspace_activation_text(value, &["pane_id", "terminal_id", "target_terminal_id"])
             })
         })
         .or_else(|| {
@@ -4182,20 +4173,12 @@ fn workspace_activation_descriptor_from_sources(
                         &["terminal_binding", "pane_id"],
                     ],
                 )
-                .or_else(|| {
-                    workspace_activation_text(
-                        value,
-                        &["pane_id", "terminal_id"],
-                    )
-                })
+                .or_else(|| workspace_activation_text(value, &["pane_id", "terminal_id"]))
             })
         })
         .or_else(|| {
             terminal_record.and_then(|value| {
-                workspace_activation_text(
-                    value,
-                    &["pane_id", "terminal_id", "target_terminal_id"],
-                )
+                workspace_activation_text(value, &["pane_id", "terminal_id", "target_terminal_id"])
             })
         })
         .unwrap_or_else(|| {
@@ -4204,27 +4187,21 @@ fn workspace_activation_descriptor_from_sources(
     let slot_key = pane_record
         .as_ref()
         .and_then(|value| workspace_activation_text(value, &["slot_key"]))
+        .or_else(|| binding.and_then(|value| workspace_activation_text(value, &["slot_key"])))
         .or_else(|| {
-            binding.and_then(|value| workspace_activation_text(value, &["slot_key"]))
-        })
-        .or_else(|| {
-            terminal_record
-                .and_then(|value| workspace_activation_text(value, &["slot_key"]))
+            terminal_record.and_then(|value| workspace_activation_text(value, &["slot_key"]))
         })
         .unwrap_or_else(|| (terminal_index + 1).to_string());
     let thread_id = thread
         .and_then(|value| workspace_activation_text(value, &["id", "thread_id"]))
         .or_else(|| {
-            terminal_record
-                .and_then(|value| workspace_activation_text(value, &["thread_id"]))
+            terminal_record.and_then(|value| workspace_activation_text(value, &["thread_id"]))
         });
     let provider = if plain_shell {
         None
     } else {
         binding
-            .and_then(|value| {
-                workspace_activation_text(value, &["provider", "agent_id"])
-            })
+            .and_then(|value| workspace_activation_text(value, &["provider", "agent_id"]))
             .map(|value| workspace_activation_clean_role(Some(&value)))
             .or_else(|| Some(role.clone()))
     };
@@ -4239,7 +4216,11 @@ fn workspace_activation_descriptor_from_sources(
             thread.and_then(|value| {
                 workspace_activation_text(
                     value,
-                    &["provider_session_id", "native_session_id", "transcript_session_id"],
+                    &[
+                        "provider_session_id",
+                        "native_session_id",
+                        "transcript_session_id",
+                    ],
                 )
             })
         })
@@ -4253,62 +4234,39 @@ fn workspace_activation_descriptor_from_sources(
         })
         .filter(|_| !plain_shell);
     let fork_from_provider_session_id = binding
-        .and_then(|value| {
-            workspace_activation_text(
-                value,
-                &["fork_from_provider_session_id"],
-            )
-        })
+        .and_then(|value| workspace_activation_text(value, &["fork_from_provider_session_id"]))
         .filter(|_| !plain_shell);
     let model = binding
         .and_then(|value| workspace_activation_text(value, &["model_id", "model"]))
         .or_else(|| {
             terminal_record.and_then(|value| {
-                workspace_activation_text(
-                    value,
-                    &["model", "model_id", "current_model"],
-                )
+                workspace_activation_text(value, &["model", "model_id", "current_model"])
             })
         });
     let reasoning_effort = binding
         .and_then(|value| {
-            workspace_activation_text(
-                value,
-                &["reasoning_effort", "effort", "thinking_power"],
-            )
+            workspace_activation_text(value, &["reasoning_effort", "effort", "thinking_power"])
         })
         .or_else(|| {
             terminal_record.and_then(|value| {
-                workspace_activation_text(
-                    value,
-                    &["reasoning_effort", "current_effort"],
-                )
+                workspace_activation_text(value, &["reasoning_effort", "current_effort"])
             })
         });
     let speed = binding
-        .and_then(|value| {
-            workspace_activation_text(value, &["speed", "service_tier"])
-        })
+        .and_then(|value| workspace_activation_text(value, &["speed", "service_tier"]))
         .or_else(|| {
-            terminal_record.and_then(|value| {
-                workspace_activation_text(value, &["speed", "service_tier"])
-            })
+            terminal_record
+                .and_then(|value| workspace_activation_text(value, &["speed", "service_tier"]))
         });
     let permission_mode =
         workspace_activation_permission_for_index(settings, terminal_index, position, &role);
     let working_directory = binding
         .and_then(|value| {
-            workspace_activation_text(
-                value,
-                &["working_directory", "cwd", "repo_path"],
-            )
+            workspace_activation_text(value, &["working_directory", "cwd", "repo_path"])
         })
         .or_else(|| {
             terminal_record.and_then(|value| {
-                workspace_activation_text(
-                    value,
-                    &["working_directory", "cwd", "repo_path"],
-                )
+                workspace_activation_text(value, &["working_directory", "cwd", "repo_path"])
             })
         })
         .or_else(|| {
@@ -4323,29 +4281,18 @@ fn workspace_activation_descriptor_from_sources(
                     ],
                 )
                 .or_else(|| {
-                    workspace_activation_text(
-                        value,
-                        &["working_directory", "cwd", "repo_path"],
-                    )
+                    workspace_activation_text(value, &["working_directory", "cwd", "repo_path"])
                 })
             })
         })
         .unwrap_or_else(|| workspace.root.clone());
     let terminal_name = terminal_record
         .and_then(|value| {
-            workspace_activation_text(
-                value,
-                &["terminal_name", "display_name", "name"],
-            )
+            workspace_activation_text(value, &["terminal_name", "display_name", "name"])
         })
         .or_else(|| Some(workspace_activation_agent_label(&role)));
     let terminal_nickname = terminal_record
-        .and_then(|value| {
-            workspace_activation_text(
-                value,
-                &["terminal_nickname", "nickname"],
-            )
-        });
+        .and_then(|value| workspace_activation_text(value, &["terminal_nickname", "nickname"]));
     WorkspaceActivationTerminalDescriptor {
         terminal_index: terminal_index.min(u16::MAX as usize) as u16,
         role,
@@ -4458,10 +4405,7 @@ fn workspace_activation_resolve_workspace(
         })
         .or_else(|| {
             settings.and_then(|settings| {
-                workspace_activation_text(
-                    settings,
-                    &["rootDirectory", "root", "path", "repoPath"],
-                )
+                workspace_activation_text(settings, &["rootDirectory", "root", "path", "repoPath"])
             })
         })
         .ok_or_else(|| format!("Unknown workspace: {workspace_id}"))?;
@@ -4482,20 +4426,12 @@ fn workspace_activation_resolve_workspace(
         })
         .or_else(|| {
             settings.and_then(|settings| {
-                workspace_activation_text(
-                    settings,
-                    &["name", "workspace_name", "label", "title"],
-                )
+                workspace_activation_text(settings, &["name", "workspace_name", "label", "title"])
             })
         })
         .unwrap_or_else(|| workspace_id.to_string());
     let root_was_empty_at_selection = settings
-        .and_then(|settings| {
-            workspace_activation_bool(
-                settings,
-                &["rootWasEmptyAtSelection"],
-            )
-        })
+        .and_then(|settings| workspace_activation_bool(settings, &["rootWasEmptyAtSelection"]))
         .unwrap_or(false);
     Ok(WorkspaceActivationWorkspace {
         id: workspace_id.to_string(),
@@ -4510,10 +4446,7 @@ fn workspace_activation_remote_intent_clear_if_matching(
     workspace_id: &str,
 ) -> Result<(), String> {
     let remote_intents = app_local_state_read(app, "remote-intents");
-    let pending = workspace_activation_text(
-        &remote_intents,
-        &["pendingActivationWorkspaceId"],
-    );
+    let pending = workspace_activation_text(&remote_intents, &["pendingActivationWorkspaceId"]);
     if pending.as_deref() != Some(workspace_id) {
         return Ok(());
     }
@@ -5262,7 +5195,10 @@ mod workspace_activation_tests {
         );
         assert_eq!(descriptors[1].permission_mode.as_deref(), Some("ask"));
         assert_eq!(descriptors[1].terminal_name.as_deref(), Some("Review"));
-        assert_eq!(descriptors[1].terminal_nickname.as_deref(), Some("Reviewer"));
+        assert_eq!(
+            descriptors[1].terminal_nickname.as_deref(),
+            Some("Reviewer")
+        );
     }
 
     #[test]
@@ -6419,11 +6355,7 @@ fn device_data_workspace_catalog_scope_files(candidate_dirs: &[PathBuf]) -> Vec<
 }
 
 fn workspace_catalog_entry_updated_key(entry: &Value) -> (u8, u128, String) {
-    for key in [
-        "updated_at_ms",
-        "modified_at_ms",
-        "created_at_ms",
-    ] {
+    for key in ["updated_at_ms", "modified_at_ms", "created_at_ms"] {
         if let Some(value) = entry.get(key) {
             if let Some(number) = value.as_u64() {
                 return (2, number as u128, String::new());
@@ -6439,11 +6371,7 @@ fn workspace_catalog_entry_updated_key(entry: &Value) -> (u8, u128, String) {
         }
     }
 
-    for key in [
-        "updated_at",
-        "modified_at",
-        "created_at",
-    ] {
+    for key in ["updated_at", "modified_at", "created_at"] {
         if let Some(value) = entry
             .get(key)
             .and_then(Value::as_str)
@@ -6478,19 +6406,16 @@ fn resolve_workspace_catalog_root_collisions(items: &mut [Value], workspace_sett
         else {
             continue;
         };
-        let workspace_id =
-            local_workspace_catalog_text(&items[index], &["id", "workspace_id"])
-                .unwrap_or_default();
+        let workspace_id = local_workspace_catalog_text(&items[index], &["id", "workspace_id"])
+            .unwrap_or_default();
         if workspace_id.is_empty() {
             continue;
         }
 
         if let Some(existing_index) = root_owners.get(&root_identity).copied() {
-            let existing_id = local_workspace_catalog_text(
-                &items[existing_index],
-                &["id", "workspace_id"],
-            )
-            .unwrap_or_default();
+            let existing_id =
+                local_workspace_catalog_text(&items[existing_index], &["id", "workspace_id"])
+                    .unwrap_or_default();
             if existing_id == workspace_id {
                 continue;
             }
@@ -6526,8 +6451,7 @@ fn merge_workspace_catalog_files(
         };
         for item in workspaces {
             let item = item.clone();
-            let workspace_id =
-                local_workspace_catalog_text(&item, &["id", "workspace_id"]);
+            let workspace_id = local_workspace_catalog_text(&item, &["id", "workspace_id"]);
             let Some(workspace_id) = workspace_id else {
                 items.push(item);
                 continue;
@@ -6704,8 +6628,7 @@ mod device_data_migration_tests {
             .unwrap()
             .iter()
             .find(|workspace| {
-                local_workspace_catalog_text(workspace, &["id", "workspace_id"])
-                    .as_deref()
+                local_workspace_catalog_text(workspace, &["id", "workspace_id"]).as_deref()
                     == Some(id)
             })
             .unwrap_or_else(|| panic!("missing workspace {id}"))
@@ -7054,15 +6977,13 @@ mod device_data_migration_tests {
             Some("/tmp/legacy-workspace")
         );
         assert!(local_workspace_catalog_entry_is_deleted(&legacy));
-        assert_eq!(local_workspace_catalog_entry_deleted_at_ms(&legacy), Some(123));
+        assert_eq!(
+            local_workspace_catalog_entry_deleted_at_ms(&legacy),
+            Some(123)
+        );
 
-        let stored = local_workspace_catalog_store_items(
-            vec![legacy],
-            vec![],
-            &json!({}),
-            200,
-        )
-        .unwrap();
+        let stored =
+            local_workspace_catalog_store_items(vec![legacy], vec![], &json!({}), 200).unwrap();
         let item = stored.first().expect("legacy tombstone retained");
         assert_eq!(item["workspace_id"], json!("ws-legacy"));
         assert_eq!(item["workspace_name"], json!("Legacy workspace"));
@@ -7606,8 +7527,7 @@ fn local_workspace_catalog_canonicalize_entry(entry: Value) -> Value {
 }
 
 fn local_workspace_catalog_root_text(entry: &Value, workspace_settings: &Value) -> Option<String> {
-    let workspace_id =
-        local_workspace_catalog_text(entry, &["id", "workspace_id", "workspaceId"]);
+    let workspace_id = local_workspace_catalog_text(entry, &["id", "workspace_id", "workspaceId"]);
     let settings = workspace_id
         .as_deref()
         .and_then(|id| workspace_settings.get(id));

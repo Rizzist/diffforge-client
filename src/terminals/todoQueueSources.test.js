@@ -8,9 +8,50 @@ import {
   TODO_QUEUE_SOURCE_VOICE_AGENT,
   TODO_QUEUE_SOURCE_VOICE_PLAN,
   getTodoQueueAutoQueueSourceForSource,
+  getTodoQueueDirectTargetTerminalIndexCandidate,
+  getTodoQueueTerminalTargetIdCandidate,
   getTodoQueueLifecycleSourceForSource,
   getTodoQueuePromptEventSourceForSource,
+  todoQueueRemoteCommandIsListOnly,
 } from "./todoQueueSources.js";
+
+test("generic web todo bookkeeping index is not treated as an explicit terminal target", () => {
+  assert.equal(
+    getTodoQueueDirectTargetTerminalIndexCandidate({
+      terminal_index: 0,
+      target_explicit: false,
+    }),
+    undefined,
+  );
+  assert.equal(
+    getTodoQueueDirectTargetTerminalIndexCandidate({ target_terminal_index: 2 }),
+    undefined,
+  );
+  assert.equal(
+    getTodoQueueDirectTargetTerminalIndexCandidate({
+      target_terminal_id: "pane-1",
+      terminal_index: 1,
+    }),
+    1,
+  );
+  assert.equal(
+    getTodoQueueTerminalTargetIdCandidate({
+      remoteCommand: { paneId: "pane-2" },
+    }),
+    "pane-2",
+  );
+});
+
+test("Next todo_create defaults to list-only instead of auto-queueing", () => {
+  assert.equal(todoQueueRemoteCommandIsListOnly({ command_kind: "todo_create" }), true);
+  assert.equal(todoQueueRemoteCommandIsListOnly({ command_kind: "todo_create", status: "listed" }), true);
+  assert.equal(todoQueueRemoteCommandIsListOnly({ command_kind: "todo_create", status: "queued" }), false);
+});
+
+test("explicit listed status stays list-only for compatible remote commands", () => {
+  assert.equal(todoQueueRemoteCommandIsListOnly({ command_kind: "create_task", status: "listed" }), true);
+  assert.equal(todoQueueRemoteCommandIsListOnly({ command_kind: "create_task", status: "running" }), false);
+});
 
 test("remote control source is preserved through queued auto dispatch", () => {
   assert.equal(

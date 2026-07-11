@@ -2094,3 +2094,30 @@ export function todoQueueDeviceSelectionIsLocalEditable(selection, currentWorksp
       && selectionWorkspaceId === safeCurrentWorkspaceId,
   );
 }
+
+function todoQueueSnapshotItemAliases(item = {}) {
+  return new Set([
+    item?.id,
+    item?.todo_id,
+    item?.command_id,
+    item?.dispatch_id,
+    item?.client_action_id,
+    item?.remote_command?.id,
+    item?.remote_command?.command_id,
+    item?.remote_command?.todo_id,
+  ].map((value) => String(value || "").trim()).filter(Boolean));
+}
+
+// todo_store_snapshot is a complete queue snapshot. Hard deletes deliberately
+// have no tombstone, so callers must also treat an item missing by every stable
+// alias as deleted instead of retaining a stale webview copy.
+export function todoQueueItemFromAuthoritativeSnapshot(items = [], item = {}) {
+  const aliases = todoQueueSnapshotItemAliases(item);
+  if (!aliases.size) {
+    return null;
+  }
+  return (Array.isArray(items) ? items : []).find((candidate) => {
+    const candidateAliases = todoQueueSnapshotItemAliases(candidate);
+    return [...candidateAliases].some((alias) => aliases.has(alias));
+  }) || null;
+}

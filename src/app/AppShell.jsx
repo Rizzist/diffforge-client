@@ -168,6 +168,7 @@ import TerminalView, {
   useTerminalGridSeparatorDragGate,
 } from "../terminals/TerminalView.jsx";
 import { buildAccountLiveDeviceRows } from "../terminals/todoQueueDeviceSwitcher.js";
+import { todoQueueRemoteCommandIsListOnly } from "../terminals/todoQueueSources.js";
 import { useWorkspaceToolPanelBridge } from "../terminals/workspaceToolPanelBridge.js";
 
 const TODO_STORE_CHANGED_TAURI_EVENT = "todo-store-changed";
@@ -38684,6 +38685,11 @@ export default function App() {
   );
   const selectedWorkspaceToolWorkspace = selectedWorkspaceIsActivated ? selectedWorkspace : null;
   const selectedWorkspaceToolWorkspaceId = selectedWorkspaceToolWorkspace?.id || "";
+  /* Todo editing works for ANY selected workspace — activation only gates the
+     runtime-owned tool tabs, not the Rust todo store the queue lives in. */
+  const accountTodoWorkspace = selectedWorkspace || null;
+  const accountTodoWorkspaceId = accountTodoWorkspace?.id || "";
+  const accountTodoPanelActive = Boolean(!workspaceToolPanelHasRuntime && accountTodoWorkspaceId);
   const selectedWorkspaceToolFileRoot = selectedWorkspaceToolWorkspace ? selectedWorkspaceFileRoot : "";
   const selectedWorkspaceToolCoordinationTargets = selectedWorkspaceToolWorkspace
     ? selectedWorkspaceCoordinationTargets
@@ -39037,7 +39043,7 @@ export default function App() {
     setAuraModeOpen(false);
   }, []);
   const accountToolTodoDeviceId = cloudDesktopDeviceProfile?.device_id || cloudDesktopDeviceProfile?.machine_id || "";
-  const refreshAccountToolItemsFromRust = useCallback(async (workspaceId = selectedWorkspaceToolWorkspaceId) => {
+  const refreshAccountToolItemsFromRust = useCallback(async (workspaceId = accountTodoWorkspaceId) => {
     const safeWorkspaceId = String(workspaceId || "").trim();
     if (!safeWorkspaceId) {
       setAccountToolItems([]);
@@ -39047,10 +39053,10 @@ export default function App() {
     const items = normalizeAccountToolTodoItems(snapshot?.items, safeWorkspaceId);
     setAccountToolItems(items);
     return items;
-  }, [selectedWorkspaceToolWorkspaceId]);
+  }, [accountTodoWorkspaceId]);
 
   useEffect(() => {
-    const workspaceId = String(selectedWorkspaceToolWorkspaceId || "").trim();
+    const workspaceId = String(accountTodoWorkspaceId || "").trim();
     if (!workspaceId) {
       setAccountToolItems([]);
       return undefined;
@@ -39071,10 +39077,10 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [refreshAccountToolItemsFromRust, selectedWorkspaceToolWorkspaceId]);
+  }, [refreshAccountToolItemsFromRust, accountTodoWorkspaceId]);
 
   useEffect(() => {
-    const workspaceId = String(selectedWorkspaceToolWorkspaceId || "").trim();
+    const workspaceId = String(accountTodoWorkspaceId || "").trim();
     if (!workspaceId) {
       return undefined;
     }
@@ -39094,13 +39100,13 @@ export default function App() {
       disposed = true;
       unsubscribe();
     };
-  }, [refreshAccountToolItemsFromRust, selectedWorkspaceToolWorkspaceId]);
+  }, [refreshAccountToolItemsFromRust, accountTodoWorkspaceId]);
 
   const submitAccountToolDraft = useCallback(async (options = {}) => {
     const text = String(accountToolDraft || "").trim();
     const images = Array.isArray(options?.images) ? options.images.filter(Boolean) : [];
     const note = options?.note && typeof options.note === "object" ? options.note : null;
-    const workspaceId = String(selectedWorkspaceToolWorkspaceId || "").trim();
+    const workspaceId = String(accountTodoWorkspaceId || "").trim();
     if ((!text && !images.length && !note) || !workspaceId) {
       return [];
     }
@@ -39137,11 +39143,11 @@ export default function App() {
     accountToolDraft,
     accountToolTodoDeviceId,
     refreshAccountToolItemsFromRust,
-    selectedWorkspaceToolWorkspaceId,
+    accountTodoWorkspaceId,
   ]);
   const removeAccountToolTodo = useCallback((itemId) => {
     const todoId = String(itemId || "").trim();
-    const workspaceId = String(selectedWorkspaceToolWorkspaceId || "").trim();
+    const workspaceId = String(accountTodoWorkspaceId || "").trim();
     if (!todoId || !workspaceId) {
       return;
     }
@@ -39158,11 +39164,11 @@ export default function App() {
     }).catch((error) => {
       setAccountToolError(error?.message || String(error || "Unable to delete todo"));
     });
-  }, [refreshAccountToolItemsFromRust, selectedWorkspaceToolWorkspaceId]);
+  }, [refreshAccountToolItemsFromRust, accountTodoWorkspaceId]);
   const updateAccountToolTodoText = useCallback((itemId, text) => {
     const todoId = String(itemId || "").trim();
     const nextText = String(text || "").trim();
-    const workspaceId = String(selectedWorkspaceToolWorkspaceId || "").trim();
+    const workspaceId = String(accountTodoWorkspaceId || "").trim();
     if (!todoId || !workspaceId) {
       return;
     }
@@ -39193,11 +39199,11 @@ export default function App() {
   }, [
     refreshAccountToolItemsFromRust,
     removeAccountToolTodo,
-    selectedWorkspaceToolWorkspaceId,
+    accountTodoWorkspaceId,
   ]);
   const setAccountToolTodoStatus = useCallback((itemId, status, reason, item = null) => {
     const todoId = String(itemId || item?.id || "").trim();
-    const workspaceId = String(selectedWorkspaceToolWorkspaceId || item?.workspace_id || "").trim();
+    const workspaceId = String(accountTodoWorkspaceId || item?.workspace_id || "").trim();
     if (!todoId || !workspaceId) {
       return;
     }
@@ -39229,13 +39235,13 @@ export default function App() {
   }, [
     accountToolItems,
     refreshAccountToolItemsFromRust,
-    selectedWorkspaceToolWorkspaceId,
+    accountTodoWorkspaceId,
   ]);
   const queueAccountToolTodo = useCallback((itemId, item = null) => {
     setAccountToolTodoStatus(itemId || item?.id, "queued", "account_tool_todo_queued", item);
   }, [setAccountToolTodoStatus]);
   const queueAllAccountToolTodos = useCallback(() => {
-    const workspaceId = String(selectedWorkspaceToolWorkspaceId || "").trim();
+    const workspaceId = String(accountTodoWorkspaceId || "").trim();
     if (!workspaceId) {
       return;
     }
@@ -39273,11 +39279,46 @@ export default function App() {
   }, [
     accountToolComposerItems,
     refreshAccountToolItemsFromRust,
-    selectedWorkspaceToolWorkspaceId,
+    accountTodoWorkspaceId,
   ]);
   const cancelAccountToolQueuedTodo = useCallback((itemId, item = null) => {
     setAccountToolTodoStatus(itemId || item?.id, "listed", "account_tool_todo_unqueued", item);
   }, [setAccountToolTodoStatus]);
+  const reorderAccountToolTodo = useCallback((itemId, targetIndex) => {
+    const todoId = String(itemId || "").trim();
+    const workspaceId = String(accountTodoWorkspaceId || "").trim();
+    if (!todoId || !workspaceId) {
+      return;
+    }
+    setAccountToolItems((currentItems) => {
+      const items = Array.isArray(currentItems) ? currentItems : [];
+      const currentIndex = items.findIndex((item) => item?.id === todoId);
+      if (currentIndex < 0) {
+        return currentItems;
+      }
+      const movingItem = items[currentIndex];
+      const withoutItem = items.filter((item) => item?.id !== todoId);
+      const rawTargetIndex = Math.max(
+        0,
+        Math.min(Number.parseInt(targetIndex, 10) || 0, items.length),
+      );
+      const adjustedTargetIndex = currentIndex < rawTargetIndex ? rawTargetIndex - 1 : rawTargetIndex;
+      const nextTargetIndex = Math.max(0, Math.min(adjustedTargetIndex, withoutItem.length));
+      if (nextTargetIndex === currentIndex) {
+        return currentItems;
+      }
+      withoutItem.splice(nextTargetIndex, 0, movingItem);
+      void invoke("todo_dispatch_queue_sync", {
+        items: withoutItem,
+        reason: "account_tool_todo_reordered",
+        removed_ids: [],
+        workspace_id: workspaceId,
+      }).catch((error) => {
+        setAccountToolError(error?.message || String(error || "Unable to reorder todos"));
+      });
+      return withoutItem;
+    });
+  }, [accountTodoWorkspaceId]);
 
   useLayoutEffect(() => {
     const element = workspaceToolLayoutRef.current;
@@ -44655,6 +44696,15 @@ export default function App() {
           const actionKind = remoteCommandStringField(event, [
             "action_kind",
           ]).toLowerCase();
+          const requestedTodoStatus = remoteCommandStringField(event, [
+            "todo_status",
+            "status",
+            "mode",
+          ]);
+          const listOnlyTodo = todoQueueRemoteCommandIsListOnly({
+            command_kind: commandKind,
+            status: requestedTodoStatus,
+          });
           const sendMessageTask = remoteCommandIsSendMessageTask(commandKind);
           let text = remoteCommandText(event);
           const workspaceId = sendMessageTask ? "" : remoteCommandWorkspaceId(event);
@@ -44740,7 +44790,14 @@ export default function App() {
             "target_name",
             "name",
           ]);
-          const resolvedRemoteTarget = workspaceId
+          const hasExplicitRemoteTarget = Boolean(
+            agentId
+              || targetTerminalId
+              || targetThreadId
+              || Number.isInteger(targetTerminalIndex)
+              || targetTerminalName,
+          );
+          const resolvedRemoteTarget = workspaceId && hasExplicitRemoteTarget
             ? findRemoteControlTerminal(workspaceId, {
               target_terminal_id: targetTerminalId,
               target_terminal_index: targetTerminalIndex,
@@ -44833,15 +44890,20 @@ export default function App() {
             return;
           }
           if (!claimRemoteCommandReceipt(event, commandId, receiptWorkspaceId)) {
-            logBigViewSyncDiagnosticEvent("remote_control.duplicate_ignored", {
+            logBigViewSyncDiagnosticEvent("remote_control.delivery_retry_deduped", {
               command_id: commandId,
               source: "app_shell",
               surface: "remote_command_listener",
               workspace_id: receiptWorkspaceId,
             });
-            await recordRemoteCommandStatus(event, "duplicate_ignored", "Duplicate remote command ignored by desktop UI.", {
+            // Rust re-emits a UI-owned command when Cloud retries delivery so
+            // a webview-remount race can recover. If this listener already
+            // applied the command, keep it committed without reporting a
+            // terminal cancellation/failure to the dashboard.
+            await recordRemoteCommandStatus(event, "received", "Remote command was already received by the desktop UI.", {
               command_id: commandId,
               command_kind: commandKind,
+              duplicate_delivery: true,
               workspace_id: receiptWorkspaceId,
             });
             return;
@@ -45060,6 +45122,7 @@ export default function App() {
                 created_at: event.created_at || new Date().toISOString(),
                 id: commandId,
                 kind: "todo",
+                ...(listOnlyTodo ? { status: "listed", todo_status: "listed" } : {}),
                 ...(actionKind ? {
                   action_kind: actionKind,
                 } : {}),
@@ -45137,6 +45200,7 @@ export default function App() {
                 workspace_id: workspaceId,
               },
               command_id: commandId,
+              todo_status: listOnlyTodo ? "listed" : requestedTodoStatus,
               source: "next-diffforge",
               workspace_id: workspaceId,
               workspace_name: targetWorkspace?.name || "",
@@ -45175,8 +45239,10 @@ export default function App() {
           }
           await recordRemoteCommandStatus(
             event,
-            "queued",
-            Number.isInteger(targetTerminalIndex)
+            listOnlyTodo ? "listed" : "queued",
+            listOnlyTodo
+              ? "Listed on the desktop todo board."
+              : Number.isInteger(targetTerminalIndex)
               ? `Queued for terminal ${targetTerminalIndex + 1}.`
               : targetTerminalName
                 ? `Queued for ${targetTerminalName}.`
@@ -56852,6 +56918,7 @@ export default function App() {
                                 >
                                 <TodoQueuePanel
                                   account_key={resolvedTokenomicsAccountKey}
+                                  accountTodoScopeEnabled={accountTodoPanelActive}
                                   activeDragItemId={workspaceToolPanelData.activeDragItemId || ""}
                                   agent_statuses={agentStatuses}
                                   agentStatusError={agentStatusError}
@@ -56873,7 +56940,11 @@ export default function App() {
                                   documentPanelEnabled={Boolean(
                                     workspaceToolPanelHasRuntime && workspaceToolPanelData.documentPanelEnabled,
                                   )}
-                                  draft={workspaceToolPanelHasRuntime ? workspaceToolPanelData.draft || "" : ""}
+                                  draft={
+                                    workspaceToolPanelHasRuntime
+                                      ? workspaceToolPanelData.draft || ""
+                                      : accountTodoPanelActive ? accountToolDraft : ""
+                                  }
                                   dropError={workspaceToolPanelHasRuntime ? workspaceToolPanelData.dropError || "" : ""}
                                   getItemAccentColor={workspaceToolPanelData.getItemAccentColor || null}
                                   gitRepositoriesPreload={workspaceToolPanelData.gitRepositoriesPreload || null}
@@ -56881,18 +56952,26 @@ export default function App() {
                                   items={
                                     workspaceToolPanelHasRuntime
                                       ? workspaceToolPanelData.items || EMPTY_ARRAY
-                                      : EMPTY_ARRAY
+                                      : accountTodoPanelActive ? accountToolComposerItems : EMPTY_ARRAY
                                   }
                                   knownDevices={cloudWorkspaceProgress.knownDevices}
                                   localDesktopProfile={cloudDesktopDeviceProfile}
                                   onAddToolTodo={workspaceToolPanelActuators.onAddToolTodo}
                                   onBeginTodoDrag={workspaceToolPanelActuators.onBeginTodoDrag}
                                   onBeginWorkspaceFileDrag={workspaceToolPanelActuators.onBeginWorkspaceFileDrag}
-                                  onCancelQueuedItem={workspaceToolPanelActuators.onCancelQueuedItem}
+                                  onCancelQueuedItem={
+                                    workspaceToolPanelHasRuntime
+                                      ? workspaceToolPanelActuators.onCancelQueuedItem
+                                      : cancelAccountToolQueuedTodo
+                                  }
                                   onCancelVoicePlan={workspaceToolPanelActuators.onCancelVoicePlan}
                                   onCancelVoicePlanTask={workspaceToolPanelActuators.onCancelVoicePlanTask}
                                   onDispatchTodoToTarget={workspaceToolPanelActuators.onDispatchTodoToTarget}
-                                  onDraftChange={workspaceToolPanelActuators.onDraftChange}
+                                  onDraftChange={
+                                    workspaceToolPanelHasRuntime
+                                      ? workspaceToolPanelActuators.onDraftChange
+                                      : setAccountToolDraft
+                                  }
                                   onMinimizePane={
                                     workspaceToolPanelHasRuntime
                                       ? workspaceToolPanelActuators.onMinimizePane
@@ -56904,23 +56983,47 @@ export default function App() {
                                   onRecheckAgents={workspaceToolPanelActuators.onRecheckAgents}
                                   onOpenDocumentPanel={workspaceToolPanelActuators.onOpenDocumentPanel}
                                   onOpenWorkspaceSettings={workspaceToolPanelActuators.onOpenWorkspaceSettings}
-                                  onQueueAllItems={workspaceToolPanelActuators.onQueueAllItems}
-                                  onQueueItem={workspaceToolPanelActuators.onQueueItem}
-                                  onRemoveItem={workspaceToolPanelActuators.onRemoveItem}
+                                  onQueueAllItems={
+                                    workspaceToolPanelHasRuntime
+                                      ? workspaceToolPanelActuators.onQueueAllItems
+                                      : queueAllAccountToolTodos
+                                  }
+                                  onQueueItem={
+                                    workspaceToolPanelHasRuntime
+                                      ? workspaceToolPanelActuators.onQueueItem
+                                      : queueAccountToolTodo
+                                  }
+                                  onRemoveItem={
+                                    workspaceToolPanelHasRuntime
+                                      ? workspaceToolPanelActuators.onRemoveItem
+                                      : removeAccountToolTodo
+                                  }
                                   onRemoveItemAttachment={workspaceToolPanelActuators.onRemoveItemAttachment}
-                                  onReorderItem={workspaceToolPanelActuators.onReorderItem}
+                                  onReorderItem={
+                                    workspaceToolPanelHasRuntime
+                                      ? workspaceToolPanelActuators.onReorderItem
+                                      : reorderAccountToolTodo
+                                  }
                                   onResumePlan={workspaceToolPanelActuators.onResumePlan}
                                   onResumeTodoSession={workspaceToolPanelActuators.onResumeTodoSession}
                                   onRequeueVoicePlanTask={workspaceToolPanelActuators.onRequeueVoicePlanTask}
                                   onRequeueVoicePlanUnfinished={workspaceToolPanelActuators.onRequeueVoicePlanUnfinished}
-                                  onSubmitDraft={workspaceToolPanelActuators.onSubmitDraft}
+                                  onSubmitDraft={
+                                    workspaceToolPanelHasRuntime
+                                      ? workspaceToolPanelActuators.onSubmitDraft
+                                      : submitAccountToolDraft
+                                  }
                                   onToggleWindowBreakout={workspaceToolPanelActuators.onToggleWindowBreakout}
                                   onToggleFullscreenPane={
                                     workspaceToolPanelHasRuntime
                                       ? workspaceToolPanelActuators.onToggleFullscreenPane
                                       : toggleFullscreenWorkspaceToolPane
                                   }
-                                  onUpdateItem={workspaceToolPanelActuators.onUpdateItem}
+                                  onUpdateItem={
+                                    workspaceToolPanelHasRuntime
+                                      ? workspaceToolPanelActuators.onUpdateItem
+                                      : updateAccountToolTodoText
+                                  }
                                   onVoiceAgentToolCall={workspaceToolPanelActuators.onVoiceAgentToolCall}
                                   onVoicePlanNeedsRequeue={workspaceToolPanelActuators.onVoicePlanNeedsRequeue}
                                   onVoicePlanServerResult={workspaceToolPanelActuators.onVoicePlanServerResult}
@@ -56933,12 +57036,12 @@ export default function App() {
                                   pendingItems={
                                     workspaceToolPanelHasRuntime
                                       ? workspaceToolPanelData.pendingItems || EMPTY_OBJECT
-                                      : EMPTY_OBJECT
+                                      : accountTodoPanelActive ? accountToolPendingItems : EMPTY_OBJECT
                                   }
                                   queueItems={
                                     workspaceToolPanelHasRuntime
                                       ? workspaceToolPanelData.queueItems || EMPTY_ARRAY
-                                      : EMPTY_ARRAY
+                                      : accountTodoPanelActive ? accountToolComposerItems : EMPTY_ARRAY
                                   }
                                   root_directory={workspaceToolPanelData.root_directory || defaultWorkingDirectory}
                                   selectedTerminalPlanTarget={workspaceToolPanelData.selectedTerminalPlanTarget || null}
@@ -56946,9 +57049,21 @@ export default function App() {
                                   windowBreakoutActive={Boolean(
                                     workspaceToolPanelHasRuntime && workspaceToolPanelData.windowBreakoutActive,
                                   )}
-                                  workspace={workspaceToolPanelHasRuntime ? workspaceToolPanelData.workspace : null}
-                                  workspaceError={workspaceToolPanelHasRuntime ? workspaceToolPanelData.workspaceError || "" : ""}
-                                  workspace_id={workspaceToolPanelHasRuntime ? workspaceToolPanelData.workspace_id || "" : ""}
+                                  workspace={
+                                    workspaceToolPanelHasRuntime
+                                      ? workspaceToolPanelData.workspace
+                                      : accountTodoPanelActive ? accountTodoWorkspace : null
+                                  }
+                                  workspaceError={
+                                    workspaceToolPanelHasRuntime
+                                      ? workspaceToolPanelData.workspaceError || ""
+                                      : accountTodoPanelActive ? accountToolError : ""
+                                  }
+                                  workspace_id={
+                                    workspaceToolPanelHasRuntime
+                                      ? workspaceToolPanelData.workspace_id || ""
+                                      : accountTodoPanelActive ? accountTodoWorkspaceId : ""
+                                  }
                                   workspaceScopedTabsEnabled={Boolean(
                                     workspaceToolPanelHasRuntime && workspaceToolPanelData.workspaceScopedTabsEnabled,
                                   )}

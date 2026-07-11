@@ -11,6 +11,7 @@ import {
   normalizeTodoQueueSwitcherId,
   normalizeTodoQueueWorkspaceMatchId,
   todoQueueDeviceSelectionIsLocalEditable,
+  todoQueueItemFromAuthoritativeSnapshot,
   workspaceTodoItemsForDeviceWorkspace,
 } from "./todoQueueDeviceSwitcher.js";
 
@@ -1405,4 +1406,21 @@ test("todo_store_snapshot hydration keeps a Windows workspace across slash and d
   assert.equal(hydratedRows.length, 1);
   assert.equal(hydratedRows[0].id, "todo-23");
   assert.equal(hydratedRows[0].workspace_id, "C:\\Code\\Recipient");
+});
+
+test("authoritative todo_store_snapshot absence removes hard-deleted webview rows", () => {
+  const stale = {
+    id: "todo-hard-deleted",
+    remote_command: { command_id: "command-hard-deleted" },
+  };
+
+  assert.equal(todoQueueItemFromAuthoritativeSnapshot([], stale), null);
+  assert.equal(
+    todoQueueItemFromAuthoritativeSnapshot([{ id: "different-todo" }], stale),
+    null,
+  );
+  assert.equal(
+    todoQueueItemFromAuthoritativeSnapshot([{ id: "command-hard-deleted" }], stale)?.id,
+    "command-hard-deleted",
+  );
 });
