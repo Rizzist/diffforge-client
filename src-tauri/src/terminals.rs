@@ -523,16 +523,16 @@ const CODEX_CROSS_THREAD_OPTIONS: &[TerminalScreenPromptStaticOption] = &[
 const CLAUDE_WORKSPACE_TRUST_OPTIONS: &[TerminalScreenPromptStaticOption] = &[
     TerminalScreenPromptStaticOption {
         id: "trust",
-        label: "Yes, I trust this folder",
-        value: Some("y"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("y"),
+        label: "Yes, proceed",
+        value: Some("1"),
+        answer: TerminalScreenPromptStaticAnswerPlan::Key("1"),
         danger: true,
     },
     TerminalScreenPromptStaticOption {
         id: "exit",
         label: "No, exit",
-        value: Some("n"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("n"),
+        value: Some("2"),
+        answer: TerminalScreenPromptStaticAnswerPlan::Key("2"),
         danger: false,
     },
 ];
@@ -781,14 +781,14 @@ const TERMINAL_SCREEN_PROMPT_DETECTORS: &[TerminalScreenPromptDetectorSpec] = &[
     TerminalScreenPromptDetectorSpec {
         id: "claude_workspace_trust",
         providers: &["claude"],
-        required_any: &["quick safety check: is this a project you created or one you trust"],
-        confirm_any: &["permission required: accessing workspace", "enter y/n"],
+        required_any: &["is this a project you trust", "accessing workspace:"],
+        confirm_any: &["enter to confirm", "esc to cancel"],
         prompt_kind: "approval",
         manual_approval_required: true,
         allow_while_busy: false,
         allows_free_text: false,
         default_option: Some("exit"),
-        danger_labels: &["trust"],
+        danger_labels: &["trust", "proceed"],
         option_strategy: TerminalScreenPromptOptionStrategy::Menu,
     },
     TerminalScreenPromptDetectorSpec {
@@ -19779,13 +19779,9 @@ fn terminal_remote_command_u64(event: &Value, keys: &[&str]) -> Option<u64> {
         .or_else(|| event.get("request").and_then(|request| value_from(request)))
 }
 
-#[tauri::command(rename_all = "snake_case")]
-async fn terminal_answer_agent_prompt_remote_command(
-    app: AppHandle,
-    event: Value,
-) -> Result<Value, String> {
+fn terminal_answer_agent_prompt_target_pane_id(event: &Value) -> Result<String, String> {
     let pane_id = terminal_remote_command_string(
-        &event,
+        event,
         &[
             "target_terminal_id",
             "terminal_id",
@@ -19794,6 +19790,15 @@ async fn terminal_answer_agent_prompt_remote_command(
     )
     .ok_or_else(|| "Prompt answer requires a target terminal id.".to_string())?;
     validate_terminal_pane_id(&pane_id)?;
+    Ok(pane_id)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn terminal_answer_agent_prompt_remote_command(
+    app: AppHandle,
+    event: Value,
+) -> Result<Value, String> {
+    let pane_id = terminal_answer_agent_prompt_target_pane_id(&event)?;
     let _control_operation_guard = terminal_control_prompt_answer_begin(&pane_id)?;
     let instance_id =
         terminal_remote_command_u64(&event, &["terminal_instance_id"]);
@@ -23581,6 +23586,32 @@ Press enter to confirm
     }
 
     #[test]
+    fn screen_prompt_detector_matches_current_claude_workspace_trust_prompt() {
+        let tail = "\
+Is this a project you trust?
+
+Accessing workspace: /Users/dev/project
+
+1. Yes, proceed
+2. No, exit
+
+Enter to confirm · Esc to cancel
+";
+        let prompt = terminal_screen_prompt_detect("claude", tail).expect("detected prompt");
+
+        assert_eq!(prompt.detector_id, "claude_workspace_trust");
+        assert_eq!(prompt.prompt_kind, "approval");
+        assert_eq!(prompt.options.len(), 2);
+        assert_eq!(prompt.options[0].option.label, "Yes, proceed");
+        assert_eq!(prompt.options[0].option.danger, Some(true));
+        assert_eq!(prompt.options[1].option.label, "No, exit");
+        assert_eq!(prompt.options[1].option.danger, None);
+        assert_eq!(prompt.default_option.as_deref(), Some("2"));
+        assert!(prompt.manual_approval_required);
+        assert!(!prompt.allows_free_text);
+    }
+
+    #[test]
     fn screen_prompt_runtime_gate_allows_startup_and_coordination_pauses() {
         let tail = "\
 Hooks need review
@@ -23782,6 +23813,64 @@ Press enter to confirm
             .expect("registry")
             .remove(&key);
         terminal_screen_prompt_clear_scan(&key);
+    }
+
+    #[test]
+    fn screen_prompt_answer_plan_accepts_stable_orchestrator_terminal_id() {
+        let pane_id = "forge-app-control-agent-terminal-1";
+        let tail = "\
+Is this a project you trust?
+Accessing workspace: /Users/dev/project
+1. Yes, proceed
+2. No, exit
+Enter to confirm · Esc to cancel
+";
+        let candidate = terminal_screen_prompt_detect("claude", tail).expect("detected prompt");
+        let prompt_id = terminal_screen_prompt_hash_id(
+            &candidate.detector_id,
+            pane_id,
+            &candidate.fingerprint_text,
+        );
+        let active =
+            terminal_screen_prompt_active_from_candidate(pane_id, 7, prompt_id.clone(), candidate, 1);
+        let key = terminal_screen_prompt_active_key(pane_id, 7);
+        terminal_screen_prompt_registry()
+            .lock()
+            .expect("registry")
+            .insert(key.clone(), active);
+
+        let (input, resolved) = terminal_screen_prompt_answer_input(
+            &prompt_id,
+            "2",
+            "No, exit",
+            Some("2"),
+            None,
+        )
+        .expect("answer input")
+        .expect("synthetic prompt");
+        assert_eq!(input, "2\r");
+        assert_eq!(resolved.pane_id, pane_id);
+        assert_eq!(resolved.prompt_id, prompt_id);
+
+        terminal_screen_prompt_registry()
+            .lock()
+            .expect("registry")
+            .remove(&key);
+        terminal_screen_prompt_clear_scan(&key);
+    }
+
+    #[test]
+    fn prompt_answer_handler_accepts_stable_orchestrator_terminal_id() {
+        let event = json!({
+            "terminal_id": "forge-app-control-agent-terminal-1",
+            "prompt_id": "screen-claude_workspace_trust-123",
+            "option_id": "2"
+        });
+
+        assert_eq!(
+            terminal_answer_agent_prompt_target_pane_id(&event).expect("target pane id"),
+            "forge-app-control-agent-terminal-1"
+        );
     }
 
     #[test]

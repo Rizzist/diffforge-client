@@ -25818,11 +25818,17 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
             })
         {
             has_terminal_orchestrator_state = true;
+            let observed_at_ms = cloud_mcp_now_ms();
             terminal_orchestrators = cloud_mcp_live_state_values(Some(orchestrator_source))
                 .into_iter()
                 .enumerate()
-                .map(|(index, terminal)| {
-                    cloud_mcp_compact_terminal_live_state(&terminal, index)
+                .filter_map(|(index, terminal)| {
+                    cloud_mcp_normalize_device_terminal_orchestrator(
+                        &terminal,
+                        index,
+                        observed_at_ms,
+                    )
+                    .map(|normalized| cloud_mcp_compact_terminal_live_state(&normalized, index))
                 })
                 .collect();
         }
@@ -33493,9 +33499,18 @@ fn cloud_mcp_json_collection_items(value: &Value) -> Vec<Value> {
 }
 
 fn cloud_mcp_is_app_control_pane_id(pane_id: &str) -> bool {
-    pane_id
-        .trim()
-        .eq_ignore_ascii_case(CLOUD_MCP_APP_CONTROL_PANE_ID)
+    let pane_id = pane_id.trim();
+    let pane_id_key = pane_id.to_ascii_lowercase();
+    if pane_id_key == CLOUD_MCP_APP_CONTROL_PANE_ID {
+        return true;
+    }
+    let Some(suffix) = pane_id_key.strip_prefix(CLOUD_MCP_APP_CONTROL_PANE_ID) else {
+        return false;
+    };
+    let Some(index) = suffix.strip_prefix('-') else {
+        return false;
+    };
+    !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn cloud_mcp_terminal_value_is_device_orchestrator(value: &Value) -> bool {
@@ -33543,16 +33558,20 @@ fn cloud_mcp_normalize_device_terminal_orchestrator(
     fallback_index: usize,
     observed_at_ms: u64,
 ) -> Option<Value> {
-    let terminal_id = cloud_mcp_payload_text(
-        terminal,
-        &["terminal_id", "target_terminal_id", "pane_id"],
-    )
-    .unwrap_or_else(|| format!("device-terminal-orchestrator-{}", fallback_index + 1));
     let pane_id = cloud_mcp_payload_text(
         terminal,
         &["pane_id", "target_terminal_id", "terminal_id"],
-    )
-    .unwrap_or_else(|| terminal_id.clone());
+    );
+    let terminal_id = pane_id
+        .clone()
+        .or_else(|| {
+            cloud_mcp_payload_text(
+                terminal,
+                &["terminal_id", "target_terminal_id", "pane_id"],
+            )
+        })
+        .unwrap_or_else(|| format!("device-terminal-orchestrator-{}", fallback_index + 1));
+    let pane_id = pane_id.unwrap_or_else(|| terminal_id.clone());
     if terminal_id.trim().is_empty() && pane_id.trim().is_empty() {
         return None;
     }
@@ -33624,6 +33643,7 @@ fn cloud_mcp_normalize_device_terminal_orchestrator(
         .or_insert(json!(true));
     object.insert("updated_at_ms".to_string(), json!(observed_at_ms));
     object.insert("ts_ms".to_string(), json!(observed_at_ms));
+    cloud_mcp_enforce_terminal_prompt_status_projection(&mut normalized);
     Some(normalized)
 }
 
@@ -34180,6 +34200,7 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
                         normalized.insert(key.clone(), value.clone());
                     }
                 }
+                cloud_mcp_enforce_terminal_prompt_status_projection(&mut normalized);
                 Some(normalized)
             })
             .collect::<Vec<_>>();
@@ -34649,18 +34670,54 @@ fn cloud_mcp_lifecycle_status_key(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace([' ', '-'], "_")
 }
 
+fn cloud_mcp_terminal_lifecycle_value_is_awaiting_input(value: &str) -> bool {
+    matches!(
+        cloud_mcp_lifecycle_status_key(value).as_str(),
+        "awaiting_input"
+            | "awaiting_user"
+            | "needs_input"
+            | "prompting_user"
+            | "requires_input"
+            | "requires_user_input"
+            | "provider_user_prompt_started"
+    )
+}
+
+fn cloud_mcp_terminal_lifecycle_has_open_prompt(
+    terminal_is_prompting_user: Option<bool>,
+    prompt_id: Option<&str>,
+    prompt_signals: &[&str],
+) -> bool {
+    let has_prompt_id = prompt_id
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let has_prompt_signal = prompt_signals
+        .iter()
+        .any(|value| cloud_mcp_terminal_lifecycle_value_is_awaiting_input(value));
+
+    match terminal_is_prompting_user {
+        Some(true) => has_prompt_id || has_prompt_signal,
+        Some(false) => false,
+        None => has_prompt_signal,
+    }
+}
+
 fn cloud_mcp_terminal_lifecycle_state(
     event_type: &str,
     status: &str,
     activity_status: &str,
     readiness: &str,
+    command_phase: &str,
     execution_phase: &str,
     turn_status: &str,
+    terminal_is_prompting_user: Option<bool>,
+    prompt_id: Option<&str>,
 ) -> &'static str {
     let event_type = cloud_mcp_lifecycle_status_key(event_type);
     let status = cloud_mcp_lifecycle_status_key(status);
     let activity_status = cloud_mcp_lifecycle_status_key(activity_status);
     let readiness = cloud_mcp_lifecycle_status_key(readiness);
+    let command_phase = cloud_mcp_lifecycle_status_key(command_phase);
     let execution_phase = cloud_mcp_lifecycle_status_key(execution_phase);
     let turn_status = cloud_mcp_lifecycle_status_key(turn_status);
     let values = [
@@ -34668,6 +34725,7 @@ fn cloud_mcp_terminal_lifecycle_state(
         status.as_str(),
         activity_status.as_str(),
         readiness.as_str(),
+        command_phase.as_str(),
         execution_phase.as_str(),
         turn_status.as_str(),
     ];
@@ -34684,16 +34742,17 @@ fn cloud_mcp_terminal_lifecycle_state(
     {
         return "error";
     }
+    if cloud_mcp_terminal_lifecycle_has_open_prompt(
+        terminal_is_prompting_user,
+        prompt_id,
+        &values,
+    ) {
+        return "awaiting_input";
+    }
     if values.iter().any(|value| {
         matches!(
             *value,
-            "paused"
-                | "parked"
-                | "needs_input"
-                | "awaiting_input"
-                | "awaiting_user"
-                | "provider_user_prompt_started"
-                | "resume_ready"
+            "paused" | "parked" | "resume_ready"
         )
     }) {
         return "paused";
@@ -34767,6 +34826,52 @@ fn cloud_mcp_terminal_lifecycle_state(
     }
 
     "thinking"
+}
+
+fn cloud_mcp_terminal_value_projected_status(terminal: &Value, fallback_status: &str) -> String {
+    let status = cloud_mcp_payload_text(terminal, &["status", "state"])
+        .unwrap_or_else(|| fallback_status.to_string());
+    let activity_status =
+        cloud_mcp_payload_text(terminal, &["activity_status"]).unwrap_or_default();
+    let readiness = cloud_mcp_payload_text(terminal, &["readiness", "terminal_readiness"])
+        .unwrap_or_default();
+    let command_phase = cloud_mcp_payload_text(terminal, &["command_phase"]).unwrap_or_default();
+    let execution_phase =
+        cloud_mcp_payload_text(terminal, &["execution_phase"]).unwrap_or_default();
+    let turn_status = cloud_mcp_payload_text(terminal, &["turn_status", "latest_turn_status"])
+        .unwrap_or_default();
+    let event_type = cloud_mcp_payload_text(terminal, &["event_type", "hook_event_name"])
+        .unwrap_or_default();
+    let terminal_is_prompting_user = terminal
+        .get("terminal_is_prompting_user")
+        .and_then(Value::as_bool);
+    let prompt_id = cloud_mcp_payload_text(terminal, &["prompt_id"]);
+    if cloud_mcp_terminal_lifecycle_state(
+        &event_type,
+        &status,
+        &activity_status,
+        &readiness,
+        &command_phase,
+        &execution_phase,
+        &turn_status,
+        terminal_is_prompting_user,
+        prompt_id.as_deref(),
+    ) == "awaiting_input"
+    {
+        "awaiting_input".to_string()
+    } else {
+        status
+    }
+}
+
+fn cloud_mcp_enforce_terminal_prompt_status_projection(terminal: &mut Value) {
+    let status = cloud_mcp_terminal_value_projected_status(terminal, "");
+    if status != "awaiting_input" {
+        return;
+    }
+    if let Some(object) = terminal.as_object_mut() {
+        object.insert("status".to_string(), json!("awaiting_input"));
+    }
 }
 
 fn cloud_mcp_terminal_lifecycle_turn_status(
@@ -35025,6 +35130,7 @@ async fn cloud_mcp_apply_terminal_state_to_device_live_snapshot(
             );
             object.insert("observed_at_ms".to_string(), json!(observed_at_ms));
         }
+        cloud_mcp_enforce_terminal_prompt_status_projection(&mut terminal_value);
         let workspace_runtime_shutdown =
             cloud_mcp_terminal_state_is_workspace_runtime_shutdown(&terminal_value);
         if workspace_runtime_shutdown {
@@ -36697,8 +36803,11 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         &payload.terminal_status,
         &payload.native_rail_state,
         &payload.readiness,
+        &payload.command_phase,
         &payload.execution_phase,
         &payload.turn_status,
+        Some(payload.terminal_is_prompting_user),
+        payload.prompt_id.as_deref(),
     );
     let turn_status = cloud_mcp_terminal_lifecycle_turn_status(
         &payload.event_type,
@@ -54133,10 +54242,7 @@ fn cloud_mcp_todo_sync_value_is_app_control(value: &Value) -> bool {
         &["target_terminal_id", "pane_id"],
     )
     .unwrap_or_default();
-    if pane_id
-        .trim()
-        .eq_ignore_ascii_case(CLOUD_MCP_APP_CONTROL_PANE_ID)
-    {
+    if cloud_mcp_is_app_control_pane_id(&pane_id) {
         return true;
     }
     value
@@ -56081,6 +56187,57 @@ mod cloud_mcp_tests {
             json!("session-app-control")
         );
         assert_eq!(normalized["session_id"], json!("session-app-control"));
+        assert_eq!(
+            normalized["terminal_id"],
+            json!("forge-app-control-agent-terminal")
+        );
+        assert_eq!(
+            normalized["target_terminal_id"],
+            json!("forge-app-control-agent-terminal")
+        );
+        assert_eq!(
+            normalized["pane_id"],
+            json!("forge-app-control-agent-terminal")
+        );
+    }
+
+    #[test]
+    fn device_terminal_orchestrator_normalizer_prefers_stable_indexed_pane_id() {
+        assert!(cloud_mcp_is_app_control_pane_id(
+            "forge-app-control-agent-terminal-1"
+        ));
+        assert!(cloud_mcp_is_app_control_pane_id(
+            "FORGE-APP-CONTROL-AGENT-TERMINAL-2"
+        ));
+        assert!(!cloud_mcp_is_app_control_pane_id(
+            "forge-app-control-agent-terminal-alpha"
+        ));
+
+        let normalized = cloud_mcp_normalize_device_terminal_orchestrator(
+            &json!({
+                "pane_id": "forge-app-control-agent-terminal-1",
+                "terminal_id": "device-terminal-orchestrator-1",
+                "target_terminal_id": "device-terminal-orchestrator-1",
+                "agent_kind": "claude",
+                "workspace_id": CLOUD_MCP_APP_CONTROL_WORKSPACE_ID,
+            }),
+            0,
+            456,
+        )
+        .expect("normalized orchestrator");
+
+        assert_eq!(
+            normalized["terminal_id"],
+            json!("forge-app-control-agent-terminal-1")
+        );
+        assert_eq!(
+            normalized["target_terminal_id"],
+            json!("forge-app-control-agent-terminal-1")
+        );
+        assert_eq!(
+            normalized["pane_id"],
+            json!("forge-app-control-agent-terminal-1")
+        );
     }
 
     fn cloud_mcp_test_dir(prefix: &str) -> PathBuf {
@@ -56277,7 +56434,7 @@ mod cloud_mcp_tests {
             .workspace_terminals
             .as_ref()
             .expect("workspace terminals")["workspaces"][0]["terminals"][0];
-        assert_eq!(terminal["status"], json!("paused"));
+        assert_eq!(terminal["status"], json!("awaiting_input"));
         assert_eq!(
             terminal["prompt_id"],
             json!("screen-codex_hooks_need_review-abc")
@@ -56286,6 +56443,87 @@ mod cloud_mcp_tests {
         assert_eq!(terminal["prompt_options"][0]["danger"], json!(true));
         assert_eq!(terminal["allows_free_text"], json!(true));
         assert_eq!(terminal["terminal_is_prompting_user"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn terminal_state_live_update_projects_prompting_paused_and_idle_statuses() {
+        let state = CloudMcpState::new();
+
+        for payload in [
+            json!({
+                "event_kind": "terminal_state_update",
+                "workspace_id": "workspace-a",
+                "workspace_name": "Workspace A",
+                "terminal_id": "pane-prompting",
+                "pane_id": "pane-prompting",
+                "terminal_instance_id": 1,
+                "agent_kind": "codex",
+                "status": "paused",
+                "activity_status": "awaiting_input",
+                "command_phase": "awaiting_input",
+                "prompt_id": "prompt-open-1",
+                "terminal_is_prompting_user": true
+            }),
+            json!({
+                "event_kind": "terminal_state_update",
+                "workspace_id": "workspace-a",
+                "workspace_name": "Workspace A",
+                "terminal_id": "pane-paused",
+                "pane_id": "pane-paused",
+                "terminal_instance_id": 1,
+                "agent_kind": "codex",
+                "status": "paused",
+                "activity_status": "paused",
+                "command_phase": "parked",
+                "prompt_id": "",
+                "terminal_is_prompting_user": false
+            }),
+            json!({
+                "event_kind": "terminal_state_update",
+                "workspace_id": "workspace-a",
+                "workspace_name": "Workspace A",
+                "terminal_id": "pane-idle",
+                "pane_id": "pane-idle",
+                "terminal_instance_id": 1,
+                "agent_kind": "codex",
+                "status": "idle",
+                "activity_status": "idle",
+                "command_phase": "completed",
+                "prompt_id": "",
+                "terminal_is_prompting_user": false
+            }),
+        ] {
+            cloud_mcp_apply_terminal_state_to_device_live_snapshot(
+                &state,
+                &payload,
+                "terminal_state_update",
+            )
+            .await;
+        }
+
+        let snapshots = state.runtime_snapshots.lock().await;
+        let terminals = snapshots
+            .workspace_terminals
+            .as_ref()
+            .expect("workspace terminals")["workspaces"][0]["terminals"]
+            .as_array()
+            .expect("terminal rows");
+        let prompting = terminals
+            .iter()
+            .find(|terminal| terminal["pane_id"] == json!("pane-prompting"))
+            .expect("prompting terminal row");
+        let paused = terminals
+            .iter()
+            .find(|terminal| terminal["pane_id"] == json!("pane-paused"))
+            .expect("paused terminal row");
+        let idle = terminals
+            .iter()
+            .find(|terminal| terminal["pane_id"] == json!("pane-idle"))
+            .expect("idle terminal row");
+
+        assert_eq!(prompting["status"], json!("awaiting_input"));
+        assert_eq!(paused["status"], json!("paused"));
+        assert_eq!(idle["status"], json!("idle"));
     }
 
     #[tokio::test]
@@ -56326,6 +56564,50 @@ mod cloud_mcp_tests {
             terminal["future_terminal_field"],
             json!({"verbatim": [1, 2, 3]})
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_orchestrator_full_snapshot_uses_stable_pane_terminal_id() {
+        let state = CloudMcpState::new();
+        {
+            let mut snapshots = state.runtime_snapshots.lock().await;
+            snapshots.workspace_terminals = Some(json!({
+                "terminal_orchestrators": [{
+                    "pane_id": "forge-app-control-agent-terminal-1",
+                    "terminal_id": "device-terminal-orchestrator-1",
+                    "target_terminal_id": "device-terminal-orchestrator-1",
+                    "terminal_kind": "terminal_orchestrator",
+                    "terminal_scope": "device",
+                    "agent_kind": "claude",
+                    "status": "awaiting_input",
+                    "prompt_id": "app-prompt-stable",
+                    "terminal_is_prompting_user": true
+                }]
+            }));
+        }
+
+        let snapshot =
+            cloud_mcp_device_live_state_snapshot_payload(&state, "terminal_orchestrator_stable_id")
+                .await;
+        let terminal = &snapshot["terminal_orchestrators"][0];
+        assert_eq!(snapshot["terminal_orchestrator_count"], json!(1));
+        assert_eq!(
+            terminal["terminal_id"],
+            json!("forge-app-control-agent-terminal-1")
+        );
+        assert_eq!(
+            terminal["target_terminal_id"],
+            json!("forge-app-control-agent-terminal-1")
+        );
+        assert_eq!(
+            terminal["pane_id"],
+            json!("forge-app-control-agent-terminal-1")
+        );
+        assert_eq!(
+            terminal["id"],
+            json!("forge-app-control-agent-terminal-1")
+        );
+        assert_eq!(terminal["prompt_id"], json!("app-prompt-stable"));
     }
 
     #[test]
@@ -59701,8 +59983,11 @@ mod cloud_mcp_tests {
                 "active",
                 "idle",
                 "ready",
+                "completed",
                 "idle",
                 "completed",
+                None,
+                None,
             ),
             "idle"
         );
@@ -59714,8 +59999,57 @@ mod cloud_mcp_tests {
                 "busy",
                 "running",
                 "running",
+                "running",
+                None,
+                None,
             ),
             "thinking"
+        );
+    }
+
+    #[test]
+    fn terminal_lifecycle_projects_prompting_paused_and_idle_statuses() {
+        assert_eq!(
+            cloud_mcp_terminal_lifecycle_state(
+                "provider-user-prompt-started",
+                "paused",
+                "paused",
+                "busy",
+                "awaiting_input",
+                "paused",
+                "pending",
+                Some(true),
+                Some("prompt-open-1"),
+            ),
+            "awaiting_input"
+        );
+        assert_eq!(
+            cloud_mcp_terminal_lifecycle_state(
+                "task-parked-for-resource-queue",
+                "paused",
+                "paused",
+                "paused",
+                "parked",
+                "paused",
+                "pending",
+                Some(false),
+                Some(""),
+            ),
+            "paused"
+        );
+        assert_eq!(
+            cloud_mcp_terminal_lifecycle_state(
+                "provider-turn-completed",
+                "idle",
+                "idle",
+                "ready",
+                "completed",
+                "idle",
+                "completed",
+                Some(false),
+                Some(""),
+            ),
+            "idle"
         );
     }
 

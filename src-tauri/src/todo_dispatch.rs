@@ -211,14 +211,26 @@ fn todo_dispatch_is_app_control_workspace_id(workspace_id: &str) -> bool {
         || workspace_id.eq_ignore_ascii_case(TODO_DISPATCH_APP_CONTROL_WORKSPACE_ID_NORMALIZED)
 }
 
+fn todo_dispatch_is_app_control_pane_id(pane_id: &str) -> bool {
+    let pane_id = pane_id.trim().to_ascii_lowercase();
+    if pane_id == TODO_DISPATCH_APP_CONTROL_PANE_ID {
+        return true;
+    }
+    let Some(suffix) = pane_id.strip_prefix(TODO_DISPATCH_APP_CONTROL_PANE_ID) else {
+        return false;
+    };
+    let Some(index) = suffix.strip_prefix('-') else {
+        return false;
+    };
+    !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 pub(crate) fn todo_dispatch_is_app_control_terminal_surface(
     workspace_id: &str,
     pane_id: &str,
 ) -> bool {
     todo_dispatch_is_app_control_workspace_id(workspace_id)
-        || pane_id
-            .trim()
-            .eq_ignore_ascii_case(TODO_DISPATCH_APP_CONTROL_PANE_ID)
+        || todo_dispatch_is_app_control_pane_id(pane_id)
 }
 
 /// Keeps ledger filenames aligned with the workspace identity normalization

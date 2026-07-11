@@ -30,6 +30,7 @@ import {
   mergeProviderLimitRowsForDisplay,
   mergeProviderLimits,
   mergeProviderLimitSamples,
+  projectProviderLimitForDisplay,
   providerLimitKey,
   providerLimitSampleKey,
 } from "./tokenomicsProviderLimitMerge.js";
@@ -2026,51 +2027,6 @@ function computedLimitResetLabel(limit = {}, windowKind = "5_hour") {
   return windowKind === "5_hour" ? "Resets with provider window" : "Resets on provider schedule";
 }
 
-function isProviderResetEstimate(limit = {}) {
-  if (!(limit?.client_estimated)) return false;
-  const resetAfterSeconds = limitNumberOrNull(limit.reset_after_seconds);
-  const resetLabel = String(limit.reset_label || "");
-  return resetAfterSeconds === 0 && /provider window reset/i.test(resetLabel);
-}
-
-function clientProjectedLimit(limit = {}) {
-  const resetDate = limitResetDate(limit);
-  if (!resetDate || !hasKnownLimitPercent(limit)) return limit;
-  const secondsUntilReset = Math.round((resetDate.getTime() - Date.now()) / 1000);
-  if (secondsUntilReset > 0) {
-    const resetLabel = `Resets in ${formatLimitResetDuration(secondsUntilReset)}`;
-    return {
-      ...limit,
-      reset_after_seconds: secondsUntilReset,
-      reset_label: resetLabel,
-    };
-  }
-  const resetWindowKind = String(limit.window_kind || limit.limit_kind || "");
-  const resetDisplayKind = limitDisplayPercentKind(limit, resetWindowKind);
-  const resetDisplayPercent = resetDisplayKind === "remaining" ? 100 : 0;
-  return {
-    ...limit,
-    used: 0,
-    allowance: 100,
-    remaining: 100,
-    used_percent: 0,
-    limit_used_percent: 0,
-    remaining_percent: 100,
-    display_percent: resetDisplayPercent,
-    display_percent_kind: resetDisplayKind,
-    pace_delta_percent: null,
-    pace_status: "unknown",
-    pace_exhausts_before_reset: false,
-    pace_projected_used_percent: null,
-    pace_projected_exhaustion_seconds: null,
-    pace_projected_exhaustion_at: null,
-    reset_after_seconds: 0,
-    status_label: "Available",
-    reset_label: "Provider window reset; waiting for live refresh",
-    client_estimated: true,
-  };
-}
-
 // One account per provider: limit gauges always describe a single plan (the
 // active account when tagged, else the freshest live account), never an
 // average across every logged-in account of that provider.
@@ -2105,7 +2061,7 @@ function mergeLimits(limits, windowKind) {
     limits
       .map(normalizeLimitRowForDisplay)
       .filter((limit) => normalizedLimitWindowKind(limit?.window_kind || limit?.limit_kind || "") === normalizedWindowKind),
-  ).map(clientProjectedLimit);
+  ).map((limit) => projectProviderLimitForDisplay(limit));
   if (!rows.length) {
     return {
       window_kind: normalizedWindowKind,
@@ -2125,7 +2081,6 @@ function mergeLimits(limits, windowKind) {
       rate_points: [],
     };
   }
-  const resetEstimated = rows.length > 0 && rows.every(isProviderResetEstimate);
   const used = rows.reduce((sum, row) => sum + numeric(row?.used), 0);
   const allowanceValues = rows.map((row) => numeric(row?.allowance)).filter((value) => value > 0);
   const allowance = allowanceValues.length ? allowanceValues.reduce((sum, value) => sum + value, 0) : null;
@@ -2138,32 +2093,26 @@ function mergeLimits(limits, windowKind) {
   const averagePercent = (values) => values.length
     ? Math.round(values.reduce((sum, value) => sum + value, 0) / values.length)
     : null;
-  const usedPercent = resetEstimated
-    ? 0
+  const usedPercent = explicitUsedPercents.length
+    ? averagePercent(explicitUsedPercents)
     : allowance
       ? Math.max(0, Math.min(100, Math.round((used / allowance) * 100)))
-      : averagePercent(explicitUsedPercents);
-  const remainingPercent = resetEstimated
-    ? 100
-    : explicitRemainingPercents.length
-      ? Math.max(0, Math.min(100, averagePercent(explicitRemainingPercents)))
-      : (usedPercent == null ? null : Math.max(0, 100 - usedPercent));
+      : null;
+  const remainingPercent = explicitRemainingPercents.length
+    ? Math.max(0, Math.min(100, averagePercent(explicitRemainingPercents)))
+    : (usedPercent == null ? null : Math.max(0, 100 - usedPercent));
   const displayPercentKind = limitDisplayPercentKind(rows[0], normalizedWindowKind);
-  const displayPercent = resetEstimated
-    ? (displayPercentKind === "remaining" ? 100 : 0)
-    : limitDisplayPercent(rows[0], usedPercent, remainingPercent, normalizedWindowKind);
-  const paceDelta = resetEstimated
-    ? null
-    : averagePercent(rows
-      .map((row) => limitNumberOrNull(row?.pace_delta_percent))
-      .filter((value) => value != null));
+  const displayPercent = limitDisplayPercent(rows[0], usedPercent, remainingPercent, normalizedWindowKind);
+  const paceDelta = averagePercent(rows
+    .map((row) => limitNumberOrNull(row?.pace_delta_percent))
+    .filter((value) => value != null));
   const plans = [...new Set(rows.map((row) => row?.plan_name).filter(Boolean))];
   const confidences = [...new Set(rows.map((row) => row?.confidence).filter(Boolean))];
   const ratePoints = rows.flatMap((row) => Array.isArray(row?.rate_points) ? (row.rate_points) : []);
   const limitSource = rows.find((row) => row?.limit_source)?.limit_source || "";
   const providerKeys = [...new Set(rows.map(providerKey).filter(Boolean))];
   const claudeUnavailable = isClaudeLimitUnavailable(rows);
-  const paceStatus = resetEstimated ? "unknown" : limitPaceStatus(rows);
+  const paceStatus = limitPaceStatus(rows);
   const overPace = paceStatus === "over_pace" || (paceDelta != null && paceDelta > 0);
   const resetReference = limitResetReferenceRow(rows);
   return {
@@ -2181,7 +2130,7 @@ function mergeLimits(limits, windowKind) {
     paceDelta,
     pace_status: paceStatus,
     overPace,
-    status_label: resetEstimated ? "Available" : limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable, paceStatus),
+    status_label: limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable, paceStatus),
     reset_label: limitResetLabel(rows, normalizedWindowKind, claudeUnavailable, resetReference),
     rate_points: ratePoints,
     limit_window_seconds: limitNumberOrNull(resetReference?.limit_window_seconds, rows[0]?.limit_window_seconds, rows[0]?.limit_window_seconds) ?? 0,

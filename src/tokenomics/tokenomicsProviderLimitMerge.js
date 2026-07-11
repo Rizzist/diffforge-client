@@ -83,6 +83,59 @@ function providerLimitAuthorityKey(row = {}, selectedDeviceId = "all") {
   ].join("::");
 }
 
+function providerLimitCrossScopeKey(row = {}, selectedDeviceId = "all") {
+  const devicePart = selectedDeviceId === "all" ? "account" : (rowDeviceId(row) || "unknown-device");
+  return [
+    devicePart,
+    providerKey(row),
+    rowProviderAccountKey(row),
+    normalizedLimitWindowKind(row?.window_kind || row?.limit_kind || "provider_limit"),
+  ].join("::");
+}
+
+function formatLimitResetDuration(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  const days = Math.floor(total / 86_400);
+  const hours = Math.floor((total % 86_400) / 3_600);
+  const minutes = Math.floor((total % 3_600) / 60);
+  if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m`;
+  return `${total}s`;
+}
+
+function providerLimitResetDate(row = {}) {
+  const direct = parseLimitTimestamp(row.reset_at ?? row.limit_resets_at);
+  if (direct) return direct;
+  const resetAfterSeconds = limitNumberOrNull(row.reset_after_seconds);
+  const observedAt = parseLimitTimestamp(
+    row.limit_observed_at ?? row.sample_observed_at ?? row.updated_at ?? row.last_known_at,
+  );
+  if (resetAfterSeconds == null || !observedAt) return null;
+  return new Date(observedAt.getTime() + Math.max(0, resetAfterSeconds) * 1000);
+}
+
+export function projectProviderLimitForDisplay(row = {}, nowMs = Date.now()) {
+  const resetDate = providerLimitResetDate(row);
+  if (!resetDate || !hasKnownLimitPercent(row)) return row;
+  const secondsUntilReset = Math.round((resetDate.getTime() - nowMs) / 1000);
+  if (secondsUntilReset > 0) {
+    return {
+      ...row,
+      reset_after_seconds: secondsUntilReset,
+      reset_label: `Resets in ${formatLimitResetDuration(secondsUntilReset)}`,
+    };
+  }
+  // A provider window ending does not prove that usage reset to zero. Keep the
+  // last provider-reported percentage until the next live sample arrives.
+  return {
+    ...row,
+    reset_after_seconds: 0,
+    reset_label: "Provider window ended; waiting for live refresh",
+    client_reset_pending: true,
+  };
+}
+
 export function providerLimitKey(row = {}) {
   return [
     rowScopeKey(row),
@@ -139,8 +192,23 @@ function shouldReplaceProviderLimit(existing = {}, incoming = {}) {
 }
 
 export function mergeProviderLimitRowsForDisplay(rows, selectedDeviceId = "all") {
+  const inputRows = Array.isArray(rows) ? rows : [];
+  const canonicalScopeKeys = new Set(
+    inputRows
+      .filter((row) => rowScopeKey(row) !== "unknown")
+      .map((row) => providerLimitCrossScopeKey(row, selectedDeviceId)),
+  );
   const merged = new Map();
-  (Array.isArray(rows) ? rows : []).forEach((row) => {
+  inputRows.forEach((row) => {
+    // Legacy rows were persisted before billing scope was known. Once the
+    // same account/window has a canonical scope, the unknown row is only a
+    // stale alias and must not participate in display aggregation.
+    if (
+      rowScopeKey(row) === "unknown"
+      && canonicalScopeKeys.has(providerLimitCrossScopeKey(row, selectedDeviceId))
+    ) {
+      return;
+    }
     const key = providerLimitAuthorityKey(row, selectedDeviceId);
     const existing = merged.get(key);
     if (!existing || shouldReplaceProviderLimit(existing, row)) {

@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   mergeProviderLimitRowsForDisplay,
   mergeProviderLimits,
+  projectProviderLimitForDisplay,
 } from "./tokenomicsProviderLimitMerge.js";
 
 const knownClaudeSession = {
@@ -113,4 +114,51 @@ test("provider limit store merge rejects newer Codex no-data over known percent"
   assert.equal(merged[0].remaining_percent, 16);
   assert.equal(merged[0].pace_status, "over_pace");
   assert.equal(merged[0].pace_delta_percent, 109);
+});
+
+test("Claude display drops expired unknown-scope aliases once a canonical row exists", () => {
+  const currentPersonal = {
+    ...knownClaudeSession,
+    billing_scope_type: "personal",
+    used_percent: 89,
+    remaining_percent: 11,
+    reset_at: "unix:2000",
+    updated_at: "unix:1100",
+  };
+  const expiredUnknownAlias = {
+    ...knownClaudeSession,
+    billing_scope_type: "unknown",
+    used_percent: 33,
+    remaining_percent: 67,
+    reset_at: "unix:1000",
+    updated_at: "unix:900",
+  };
+
+  const merged = mergeProviderLimitRowsForDisplay([
+    expiredUnknownAlias,
+    currentPersonal,
+  ]);
+  const projected = merged.map((row) => projectProviderLimitForDisplay(row, 1_500_000));
+
+  assert.equal(projected.length, 1);
+  assert.equal(projected[0].billing_scope_type, "personal");
+  assert.equal(projected[0].used_percent, 89);
+  assert.equal(projected[0].remaining_percent, 11);
+  assert.equal(projected[0].reset_label, "Resets in 8m");
+});
+
+test("an expired Claude window preserves the last provider percentage until refresh", () => {
+  const projected = projectProviderLimitForDisplay({
+    ...knownClaudeSession,
+    display_percent: 16,
+    display_percent_kind: "remaining",
+    reset_at: "unix:1000",
+  }, 1_100_000);
+
+  assert.equal(projected.used_percent, 84);
+  assert.equal(projected.remaining_percent, 16);
+  assert.equal(projected.display_percent, 16);
+  assert.equal(projected.reset_after_seconds, 0);
+  assert.equal(projected.client_reset_pending, true);
+  assert.equal(projected.reset_label, "Provider window ended; waiting for live refresh");
 });
