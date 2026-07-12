@@ -139,6 +139,7 @@ const TERMINAL_ACTIVITY_HOOK_FALLBACK_POLL_MS: u64 = 2_000;
 const TERMINAL_ACTIVITY_HOOK_BACKOFF_UNCHANGED_POLLS: u32 = 4;
 const TERMINAL_ACTIVITY_TRANSPORT_CONNECT_TIMEOUT_MS: u64 = 150;
 const TERMINAL_ACTIVITY_TRANSPORT_IO_TIMEOUT_MS: u64 = 1_000;
+const TERMINAL_STRUCTURED_INTERACTION_WAIT_SECONDS: u64 = 570;
 const TERMINAL_ENTER_SEQUENCE: &str = "\x1b[13u";
 const TERMINAL_ENTER_SEQUENCE_MOD1: &str = "\x1b[13;1u";
 const TERMINAL_SHIFT_ENTER_SEQUENCE: &str = "\x1b[13;2u";
@@ -594,6 +595,8 @@ struct TerminalState {
     terminal_output_transport: Arc<StdMutex<Option<TerminalOutputTransportEndpoint>>>,
     terminal_activity_transport: Arc<StdMutex<Option<TerminalActivityTransportEndpoint>>>,
     terminal_activity_transport_tokens: Arc<StdMutex<HashMap<String, String>>>,
+    terminal_structured_interactions: Arc<StdMutex<HashMap<String, TerminalStructuredInteraction>>>,
+    terminal_structured_interaction_waiters: Arc<StdMutex<HashMap<String, oneshot::Sender<Value>>>>,
     terminal_output_transport_subscribers:
         Arc<StdMutex<HashMap<String, Vec<TerminalOutputTransportSubscriber>>>>,
     parked_prompts: Arc<RwLock<HashMap<String, TerminalParkedPrompt>>>,
@@ -665,6 +668,23 @@ struct TerminalActivityTransportAck {
     r#type: &'static str,
     ok: bool,
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hook_response: Option<Value>,
+}
+
+#[derive(Clone, Debug)]
+struct TerminalStructuredInteraction {
+    interaction_id: String,
+    revision: u64,
+    pane_id: String,
+    instance_id: u64,
+    provider: String,
+    provider_request_id: String,
+    prompt_id: String,
+    hook_event_name: String,
+    response_mode: String,
+    options: Vec<TerminalActivityHookPromptOption>,
+    permission_suggestions: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -894,6 +914,12 @@ impl Drop for TerminalState {
         }
         if let Ok(mut tokens) = self.terminal_activity_transport_tokens.lock() {
             tokens.clear();
+        }
+        if let Ok(mut interactions) = self.terminal_structured_interactions.lock() {
+            interactions.clear();
+        }
+        if let Ok(mut waiters) = self.terminal_structured_interaction_waiters.lock() {
+            waiters.clear();
         }
         if let Ok(mut subscribers) = self.terminal_output_transport_subscribers.lock() {
             subscribers.clear();
@@ -2186,6 +2212,11 @@ struct TerminalActivityHookPayload {
     prompt_options: Vec<TerminalActivityHookPromptOption>,
     allows_free_text: bool,
     prompt_answer_option: Option<String>,
+    interaction_id: Option<String>,
+    interaction_revision: Option<u64>,
+    interaction_source: Option<String>,
+    interaction_response_mode: Option<String>,
+    provider_request_id: Option<String>,
     manual_prompt_source: Option<String>,
     manual_approval_required: bool,
     provider_blocked_for_user: bool,
@@ -9433,6 +9464,8 @@ fn run_app(daemon: bool) {
             terminal_output_transport: Arc::new(StdMutex::new(None)),
             terminal_activity_transport: Arc::new(StdMutex::new(None)),
             terminal_activity_transport_tokens: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_structured_interactions: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_structured_interaction_waiters: Arc::new(StdMutex::new(HashMap::new())),
             terminal_output_transport_subscribers: Arc::new(StdMutex::new(HashMap::new())),
             parked_prompts: Arc::new(RwLock::new(HashMap::new())),
             active_audio_input_target: Arc::new(StdMutex::new(None)),

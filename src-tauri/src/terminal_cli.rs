@@ -2968,7 +2968,7 @@ fn claude_write_authority_guard_settings(
                         {
                             "type": "command",
                             "command": activity_command.clone(),
-                            "timeout": 5
+                            "timeout": 600
                         }
                     ]
                 }
@@ -3001,7 +3001,7 @@ fn claude_write_authority_guard_settings(
                         {
                             "type": "command",
                             "command": activity_command.clone(),
-                            "timeout": 5
+                            "timeout": 600
                         }
                     ]
                 }
@@ -3416,34 +3416,6 @@ fn refresh_codex_activity_hook_profile_for_terminal(
     Ok(updated)
 }
 
-#[allow(dead_code)] // Legacy `hooksPath` reader; codex 0.142 ignores profile-layer hooks paths.
-fn codex_hooks_path_from_profile(profile_path: &Path) -> Result<Option<PathBuf>, String> {
-    let Ok(body) = fs::read_to_string(profile_path) else {
-        return Ok(None);
-    };
-    let profile_dir = profile_path.parent().unwrap_or_else(|| Path::new("."));
-    for line in body.lines() {
-        let trimmed = line.trim();
-        let Some(value) = trimmed.strip_prefix("hooksPath") else {
-            continue;
-        };
-        let Some(value) = value.trim_start().strip_prefix('=') else {
-            continue;
-        };
-        let value = value.trim();
-        let Some(path) = terminal_toml_string_literal_value(value) else {
-            continue;
-        };
-        let path = PathBuf::from(path);
-        return Ok(Some(if path.is_absolute() {
-            path
-        } else {
-            profile_dir.join(path)
-        }));
-    }
-    Ok(None)
-}
-
 fn terminal_toml_string_literal_value(value: &str) -> Option<String> {
     let value = value.trim();
     if value.starts_with("'''") && value.ends_with("'''") && value.len() >= 6 {
@@ -3813,24 +3785,59 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
             }),
         );
     }
+    let blocking_fallback = diff_forge_activity_hook_blocking_fallback_response(&record);
     if let Some(transport) = activity_transport.as_ref() {
         match send_diff_forge_activity_hook_transport(transport, &record) {
-            Ok(()) => return 0,
-            Err(error) => write_diff_forge_activity_hook_debug(
-                &debug_path,
-                "transport_fallback",
-                &provider,
-                &pane_id,
-                instance_id,
-                &workspace_id,
-                &terminal_index,
-                &activity_path,
-                json!({
-                    "error": error,
-                    "hook_event_name": record.get("hook_event_name").and_then(Value::as_str).unwrap_or_default(),
-                }),
-            ),
+            Ok(hook_response) => {
+                if let Some(hook_response) = hook_response {
+                    if let Ok(response) = serde_json::to_string(&hook_response) {
+                        println!("{response}");
+                    }
+                }
+                return 0;
+            }
+            Err(error) => {
+                write_diff_forge_activity_hook_debug(
+                    &debug_path,
+                    if blocking_fallback.is_some() {
+                        "blocking_transport_failed_closed"
+                    } else {
+                        "transport_fallback"
+                    },
+                    &provider,
+                    &pane_id,
+                    instance_id,
+                    &workspace_id,
+                    &terminal_index,
+                    &activity_path,
+                    json!({
+                        "error": error,
+                        "hook_event_name": record.get("hook_event_name").and_then(Value::as_str).unwrap_or_default(),
+                    }),
+                );
+                if let Some(response) = blocking_fallback.as_ref() {
+                    println!("{response}");
+                    return 0;
+                }
+            }
         }
+    }
+    if let Some(response) = blocking_fallback {
+        write_diff_forge_activity_hook_debug(
+            &debug_path,
+            "blocking_transport_missing_failed_closed",
+            &provider,
+            &pane_id,
+            instance_id,
+            &workspace_id,
+            &terminal_index,
+            &activity_path,
+            json!({
+                "hook_event_name": record.get("hook_event_name").and_then(Value::as_str).unwrap_or_default(),
+            }),
+        );
+        println!("{response}");
+        return 0;
     }
     if let Some(parent) = activity_path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -3921,7 +3928,7 @@ fn diff_forge_activity_hook_transport_config(args: &[String]) -> Option<(String,
 fn send_diff_forge_activity_hook_transport(
     transport: &(String, u16, String),
     record: &Value,
-) -> Result<(), String> {
+) -> Result<Option<Value>, String> {
     let (host, port, token) = transport;
     let address = (host.as_str(), *port)
         .to_socket_addrs()
@@ -3933,11 +3940,30 @@ fn send_diff_forge_activity_hook_transport(
         Duration::from_millis(TERMINAL_ACTIVITY_TRANSPORT_CONNECT_TIMEOUT_MS),
     )
     .map_err(|error| format!("Unable to connect to activity transport: {error}"))?;
-    let timeout = Some(Duration::from_millis(
+    let io_timeout = Some(Duration::from_millis(
         TERMINAL_ACTIVITY_TRANSPORT_IO_TIMEOUT_MS,
     ));
-    let _ = stream.set_write_timeout(timeout);
-    let _ = stream.set_read_timeout(timeout);
+    let hook_name = record
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let provider = record
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let waits_for_structured_response = provider.contains("claude")
+        && matches!(hook_name.as_str(), "permissionrequest" | "elicitation");
+    let read_timeout = if waits_for_structured_response {
+        Some(Duration::from_secs(590))
+    } else {
+        io_timeout
+    };
+    let _ = stream.set_write_timeout(io_timeout);
+    let _ = stream.set_read_timeout(read_timeout);
 
     let envelope = json!({
         "type": "terminal-activity-hook",
@@ -3960,7 +3986,7 @@ fn send_diff_forge_activity_hook_transport(
             break;
         }
         response.extend_from_slice(&chunk[..response_len]);
-        if response.len() > 1024 {
+        if response.len() > 16 * 1024 {
             return Err("Activity acknowledgement is too large.".to_string());
         }
         if response.iter().any(|byte| *byte == b'\n') {
@@ -3980,13 +4006,49 @@ fn send_diff_forge_activity_hook_transport(
     let response_value = serde_json::from_str::<Value>(response_text)
         .map_err(|error| format!("Unable to parse activity acknowledgement: {error}"))?;
     if response_value.get("ok").and_then(Value::as_bool) == Some(true) {
-        Ok(())
+        Ok(response_value.get("hook_response").cloned())
     } else {
         Err(response_value
             .get("error")
             .and_then(Value::as_str)
             .unwrap_or("Activity transport rejected event.")
             .to_string())
+    }
+}
+
+fn diff_forge_activity_hook_blocking_fallback_response(record: &Value) -> Option<Value> {
+    let hook_name = record
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let provider = record
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if !provider.contains("claude") {
+        return None;
+    }
+    match hook_name.as_str() {
+        "permissionrequest" => Some(json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {
+                    "behavior": "deny",
+                    "message": "Diff Forge could not establish its authenticated UIR transport.",
+                }
+            }
+        })),
+        "elicitation" => Some(json!({
+            "hookSpecificOutput": {
+                "hookEventName": "Elicitation",
+                "action": "cancel",
+            }
+        })),
+        _ => None,
     }
 }
 
@@ -4782,6 +4844,24 @@ fn diff_forge_activity_hook_record(
             value
         }
     };
+    let permission_suggestions = {
+        let value = hook_value(&[
+            "permissionSuggestions",
+            "permission_suggestions",
+            "updatedPermissions",
+            "updated_permissions",
+        ]);
+        if value.is_null() {
+            tool_value(&[
+                "permissionSuggestions",
+                "permission_suggestions",
+                "updatedPermissions",
+                "updated_permissions",
+            ])
+        } else {
+            value
+        }
+    };
     let prompt_default_option = first_string(vec![
         hook_string(&[
             "promptDefaultOption",
@@ -4899,6 +4979,7 @@ fn diff_forge_activity_hook_record(
         "prompting_user_source": prompting_user_source,
         "prompting_user_text": prompting_user_text,
         "prompt_options": prompt_options,
+        "permission_suggestions": permission_suggestions,
         "prompt_default_option": prompt_default_option,
         "prompt_ttl_ms": prompt_ttl_ms_value,
         "manual_approval_required": manual_approval_required,
@@ -6094,6 +6175,34 @@ mod terminal_cli_tests {
         assert_eq!(record["session_crons"][0]["id"], "cron-1");
         assert_eq!(record["approval_id"], "approval-123");
         assert_eq!(record["prompting_user_kind"], "approval");
+    }
+
+    #[test]
+    fn claude_blocking_hooks_fail_closed_without_authenticated_transport() {
+        let permission = diff_forge_activity_hook_blocking_fallback_response(&json!({
+            "provider": "claude",
+            "hook_event_name": "PermissionRequest",
+        }))
+        .expect("permission fallback");
+        assert_eq!(
+            permission.pointer("/hookSpecificOutput/decision/behavior"),
+            Some(&json!("deny")),
+        );
+
+        let elicitation = diff_forge_activity_hook_blocking_fallback_response(&json!({
+            "provider": "claude-code",
+            "hook_event_name": "Elicitation",
+        }))
+        .expect("elicitation fallback");
+        assert_eq!(
+            elicitation.pointer("/hookSpecificOutput/action"),
+            Some(&json!("cancel")),
+        );
+        assert!(diff_forge_activity_hook_blocking_fallback_response(&json!({
+            "provider": "codex",
+            "hook_event_name": "PermissionRequest",
+        }))
+        .is_none());
     }
 }
 

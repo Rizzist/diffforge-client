@@ -12,8 +12,6 @@ const TERMINAL_STARTING_WATCHDOG_MS: u64 = 30_000;
 const TERMINAL_WATCHDOG_OUTPUT_QUIET_MS: u64 = 2_500;
 const TERMINAL_HOT_STALE_WATCHDOG_MS: u64 = 10 * 60_000;
 const TERMINAL_STARTUP_READY_SCAN_BYTES: usize = 16 * 1024;
-const TERMINAL_SCREEN_PROMPT_STABILITY_MS: u64 = 400;
-const TERMINAL_SCREEN_PROMPT_ANSWER_VERIFY_MS: u64 = 2_000;
 const TERMINAL_CONTROL_AUTOMATION_GUARD_TTL_MS: u64 = 60_000;
 const TERMINAL_CONTROL_PROMPT_ANSWER_GUARD_TTL_MS: u64 = 10_000;
 const TERMINAL_CONTROL_AUTOMATION_WAIT_POLL_MS: u64 = 25;
@@ -78,123 +76,6 @@ fn terminal_output_current_prompt_marker(text: &str) -> bool {
         || terminal_output_prompt_marker_after_working_indicator(&cleaned)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TerminalScreenPromptStaticAnswerPlan {
-    Key(&'static str),
-    Enter,
-    Escape,
-    FreeText,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum TerminalScreenPromptAnswerPlan {
-    Key(String),
-    Enter,
-    Escape,
-    FreeText,
-}
-
-#[derive(Clone, Copy)]
-struct TerminalScreenPromptStaticOption {
-    id: &'static str,
-    label: &'static str,
-    value: Option<&'static str>,
-    answer: TerminalScreenPromptStaticAnswerPlan,
-    danger: bool,
-}
-
-#[derive(Clone, Copy)]
-enum TerminalScreenPromptOptionStrategy {
-    Static(&'static [TerminalScreenPromptStaticOption]),
-    Menu,
-}
-
-#[derive(Clone, Copy)]
-struct TerminalScreenPromptDetectorSpec {
-    id: &'static str,
-    providers: &'static [&'static str],
-    required_any: &'static [&'static str],
-    confirm_any: &'static [&'static str],
-    prompt_kind: &'static str,
-    manual_approval_required: bool,
-    allow_while_busy: bool,
-    allows_free_text: bool,
-    default_option: Option<&'static str>,
-    danger_labels: &'static [&'static str],
-    option_strategy: TerminalScreenPromptOptionStrategy,
-}
-
-#[derive(Clone, Debug)]
-struct TerminalScreenPromptDetectedOption {
-    option: TerminalActivityHookPromptOption,
-    answer: TerminalScreenPromptAnswerPlan,
-}
-
-#[derive(Clone, Debug)]
-struct TerminalScreenPromptCandidate {
-    detector_id: String,
-    prompt_kind: String,
-    fingerprint_text: String,
-    prompt_text: String,
-    options: Vec<TerminalScreenPromptDetectedOption>,
-    default_option: Option<String>,
-    manual_approval_required: bool,
-    allow_while_busy: bool,
-    allows_free_text: bool,
-}
-
-#[derive(Clone, Debug)]
-struct TerminalScreenPromptBlock {
-    normalized_text: String,
-    signature_line: String,
-}
-
-#[derive(Clone)]
-struct TerminalScreenPromptActive {
-    pane_id: String,
-    instance_id: u64,
-    prompt_id: String,
-    detector_id: String,
-    prompt_kind: String,
-    prompt_text: String,
-    options: Vec<TerminalActivityHookPromptOption>,
-    answer_plans: HashMap<String, TerminalScreenPromptAnswerPlan>,
-    default_option: Option<String>,
-    manual_approval_required: bool,
-    allows_free_text: bool,
-    last_emitted_ms: u64,
-    missing_scans: u8,
-}
-
-enum TerminalScreenPromptEmission {
-    Resolved(TerminalScreenPromptActive, &'static str),
-    Started(TerminalScreenPromptActive),
-}
-
-fn terminal_screen_prompt_supersession_emissions(
-    superseded: TerminalScreenPromptActive,
-    replacement: TerminalScreenPromptActive,
-) -> Vec<TerminalScreenPromptEmission> {
-    vec![
-        TerminalScreenPromptEmission::Resolved(superseded, "superseded"),
-        TerminalScreenPromptEmission::Started(replacement),
-    ]
-}
-
-#[derive(Clone)]
-struct TerminalScreenPromptScanState {
-    detector_id: String,
-    fingerprint_text: String,
-    total_bytes: u64,
-    observed_at_ms: u64,
-}
-
-static TERMINAL_SCREEN_PROMPTS: OnceLock<StdMutex<HashMap<String, TerminalScreenPromptActive>>> =
-    OnceLock::new();
-static TERMINAL_SCREEN_PROMPT_SCANS: OnceLock<
-    StdMutex<HashMap<String, TerminalScreenPromptScanState>>,
-> = OnceLock::new();
-
 #[derive(Clone, Debug)]
 struct TerminalControlOperation {
     operation_id: String,
@@ -218,6 +99,7 @@ fn terminal_control_operation_prune_expired(
     operations.retain(|_, operation| operation.expires_at_ms > now_ms);
 }
 
+#[cfg(test)]
 fn terminal_control_automation_owned(pane_id: &str) -> bool {
     let now_ms = terminal_now_ms();
     let Ok(mut operations) = terminal_control_operation_registry().lock() else {
@@ -359,594 +241,6 @@ fn terminal_control_automation_end(pane_id: String, operation_id: String) -> Res
     ))
 }
 
-const CODEX_HOOKS_REVIEW_OPTIONS: &[TerminalScreenPromptStaticOption] = &[
-    TerminalScreenPromptStaticOption {
-        id: "review_hooks",
-        label: "Review hooks",
-        value: Some("1"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("1"),
-        danger: false,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "trust_all_and_continue",
-        label: "Trust all and continue",
-        value: Some("2"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("2"),
-        danger: true,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "continue_without_trusting",
-        label: "Continue without trusting",
-        value: Some("3"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("3"),
-        danger: false,
-    },
-];
-
-const CODEX_TRUST_OPTIONS: &[TerminalScreenPromptStaticOption] = &[
-    TerminalScreenPromptStaticOption {
-        id: "trust",
-        label: "Trust folder",
-        value: Some("y"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("y"),
-        danger: true,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "do_not_trust",
-        label: "Do not trust",
-        value: Some("n"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("n"),
-        danger: false,
-    },
-];
-
-const CODEX_LOGIN_OPTIONS: &[TerminalScreenPromptStaticOption] = &[
-    TerminalScreenPromptStaticOption {
-        id: "sign_in_with_chatgpt",
-        label: "Sign in with ChatGPT",
-        value: Some("1"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("1"),
-        danger: false,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "api_key",
-        label: "API key",
-        value: Some("2"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("2"),
-        danger: false,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "enter_code",
-        label: "Enter code",
-        value: None,
-        answer: TerminalScreenPromptStaticAnswerPlan::FreeText,
-        danger: false,
-    },
-];
-
-const CODEX_UPDATE_OPTIONS: &[TerminalScreenPromptStaticOption] = &[
-    TerminalScreenPromptStaticOption {
-        id: "install",
-        label: "Install update",
-        value: Some("1"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("1"),
-        danger: false,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "later",
-        label: "Later",
-        value: Some("2"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("2"),
-        danger: false,
-    },
-];
-
-const CODEX_PERMISSION_PROFILE_OPTIONS: &[TerminalScreenPromptStaticOption] = &[
-    TerminalScreenPromptStaticOption {
-        id: "grant_turn",
-        label: "Grant for this turn",
-        value: Some("y"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("y"),
-        danger: true,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "strict_auto_review",
-        label: "Strict auto-review",
-        value: Some("r"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("r"),
-        danger: false,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "grant_session",
-        label: "Grant for session",
-        value: Some("a"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("a"),
-        danger: true,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "deny",
-        label: "Deny",
-        value: Some("d"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("d"),
-        danger: false,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "cancel",
-        label: "Cancel",
-        value: None,
-        answer: TerminalScreenPromptStaticAnswerPlan::Escape,
-        danger: false,
-    },
-];
-
-const CODEX_MCP_ELICITATION_OPTIONS: &[TerminalScreenPromptStaticOption] = &[
-    TerminalScreenPromptStaticOption {
-        id: "provide_info",
-        label: "Provide info",
-        value: None,
-        answer: TerminalScreenPromptStaticAnswerPlan::FreeText,
-        danger: false,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "continue_without",
-        label: "Continue without",
-        value: Some("n"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("n"),
-        danger: false,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "cancel",
-        label: "Cancel",
-        value: None,
-        answer: TerminalScreenPromptStaticAnswerPlan::Escape,
-        danger: false,
-    },
-];
-
-const CODEX_CROSS_THREAD_OPTIONS: &[TerminalScreenPromptStaticOption] = &[
-    TerminalScreenPromptStaticOption {
-        id: "open_thread",
-        label: "Open thread",
-        value: Some("o"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("o"),
-        danger: false,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "cancel",
-        label: "Cancel",
-        value: None,
-        answer: TerminalScreenPromptStaticAnswerPlan::Escape,
-        danger: false,
-    },
-];
-
-const CLAUDE_WORKSPACE_TRUST_OPTIONS: &[TerminalScreenPromptStaticOption] = &[
-    TerminalScreenPromptStaticOption {
-        id: "trust",
-        label: "Yes, proceed",
-        value: Some("1"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("1"),
-        danger: true,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "exit",
-        label: "No, exit",
-        value: Some("2"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("2"),
-        danger: false,
-    },
-];
-
-const CLAUDE_THEME_OPTIONS: &[TerminalScreenPromptStaticOption] = &[
-    TerminalScreenPromptStaticOption {
-        id: "continue",
-        label: "Continue",
-        value: None,
-        answer: TerminalScreenPromptStaticAnswerPlan::Enter,
-        danger: false,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "cancel",
-        label: "Cancel",
-        value: None,
-        answer: TerminalScreenPromptStaticAnswerPlan::Escape,
-        danger: false,
-    },
-];
-
-const CLAUDE_PLAN_OPTIONS: &[TerminalScreenPromptStaticOption] = &[
-    TerminalScreenPromptStaticOption {
-        id: "proceed",
-        label: "Proceed",
-        value: Some("y"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("y"),
-        danger: false,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "keep_planning",
-        label: "No, keep planning",
-        value: Some("n"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("n"),
-        danger: false,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "deny_with_message",
-        label: "Tell Claude what to do differently",
-        value: None,
-        answer: TerminalScreenPromptStaticAnswerPlan::FreeText,
-        danger: false,
-    },
-];
-
-const CLAUDE_EXTERNAL_IMPORT_OPTIONS: &[TerminalScreenPromptStaticOption] = &[
-    TerminalScreenPromptStaticOption {
-        id: "proceed",
-        label: "Proceed",
-        value: Some("y"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("y"),
-        danger: true,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "deny",
-        label: "Deny",
-        value: Some("n"),
-        answer: TerminalScreenPromptStaticAnswerPlan::Key("n"),
-        danger: false,
-    },
-];
-
-const CLAUDE_LOGIN_OPTIONS: &[TerminalScreenPromptStaticOption] = &[
-    TerminalScreenPromptStaticOption {
-        id: "login",
-        label: "Login",
-        value: None,
-        answer: TerminalScreenPromptStaticAnswerPlan::Enter,
-        danger: false,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "enter_code",
-        label: "Enter code",
-        value: None,
-        answer: TerminalScreenPromptStaticAnswerPlan::FreeText,
-        danger: false,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "cancel",
-        label: "Cancel",
-        value: None,
-        answer: TerminalScreenPromptStaticAnswerPlan::Escape,
-        danger: false,
-    },
-];
-
-const OPENCODE_UPDATE_OPTIONS: &[TerminalScreenPromptStaticOption] = &[
-    TerminalScreenPromptStaticOption {
-        id: "confirm",
-        label: "Confirm",
-        value: None,
-        answer: TerminalScreenPromptStaticAnswerPlan::Enter,
-        danger: false,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "skip",
-        label: "Skip",
-        value: None,
-        answer: TerminalScreenPromptStaticAnswerPlan::Escape,
-        danger: false,
-    },
-];
-
-const OPENCODE_LOGIN_OPTIONS: &[TerminalScreenPromptStaticOption] = &[
-    TerminalScreenPromptStaticOption {
-        id: "select",
-        label: "Select",
-        value: None,
-        answer: TerminalScreenPromptStaticAnswerPlan::Enter,
-        danger: false,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "enter_credential",
-        label: "Enter credential",
-        value: None,
-        answer: TerminalScreenPromptStaticAnswerPlan::FreeText,
-        danger: false,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "cancel",
-        label: "Cancel",
-        value: None,
-        answer: TerminalScreenPromptStaticAnswerPlan::Escape,
-        danger: false,
-    },
-];
-
-const OPENCODE_SHARE_OPTIONS: &[TerminalScreenPromptStaticOption] = &[
-    TerminalScreenPromptStaticOption {
-        id: "confirm",
-        label: "Confirm",
-        value: None,
-        answer: TerminalScreenPromptStaticAnswerPlan::Enter,
-        danger: true,
-    },
-    TerminalScreenPromptStaticOption {
-        id: "cancel",
-        label: "Cancel",
-        value: None,
-        answer: TerminalScreenPromptStaticAnswerPlan::Escape,
-        danger: false,
-    },
-];
-
-const TERMINAL_SCREEN_PROMPT_DETECTORS: &[TerminalScreenPromptDetectorSpec] = &[
-    TerminalScreenPromptDetectorSpec {
-        id: "codex_hooks_need_review",
-        providers: &["codex"],
-        required_any: &["hooks need review", "review hooks"],
-        confirm_any: &[
-            "trust all and continue",
-            "continue without trusting",
-            "/hooks",
-        ],
-        prompt_kind: "approval",
-        manual_approval_required: true,
-        allow_while_busy: false,
-        allows_free_text: false,
-        default_option: Some("continue_without_trusting"),
-        danger_labels: &["trust all"],
-        option_strategy: TerminalScreenPromptOptionStrategy::Menu,
-    },
-    TerminalScreenPromptDetectorSpec {
-        id: "codex_directory_trust",
-        providers: &["codex"],
-        required_any: &["trust this directory", "trust this folder", "do you trust"],
-        confirm_any: &["project config", ".codex", "trust"],
-        prompt_kind: "approval",
-        manual_approval_required: true,
-        allow_while_busy: false,
-        allows_free_text: false,
-        default_option: Some("do_not_trust"),
-        danger_labels: &["trust"],
-        option_strategy: TerminalScreenPromptOptionStrategy::Static(CODEX_TRUST_OPTIONS),
-    },
-    TerminalScreenPromptDetectorSpec {
-        id: "codex_login_first_run",
-        providers: &["codex"],
-        required_any: &["sign in with chatgpt", "authenticate", "api key"],
-        confirm_any: &["first time", "sign in", "login", "authenticate"],
-        prompt_kind: "selection",
-        manual_approval_required: false,
-        allow_while_busy: false,
-        allows_free_text: true,
-        default_option: Some("sign_in_with_chatgpt"),
-        danger_labels: &[],
-        option_strategy: TerminalScreenPromptOptionStrategy::Menu,
-    },
-    TerminalScreenPromptDetectorSpec {
-        id: "codex_update_available",
-        providers: &["codex"],
-        required_any: &["update available", "new version"],
-        confirm_any: &["upgrade", "rerun installer", "install"],
-        prompt_kind: "selection",
-        manual_approval_required: false,
-        allow_while_busy: false,
-        allows_free_text: false,
-        default_option: Some("later"),
-        danger_labels: &[],
-        option_strategy: TerminalScreenPromptOptionStrategy::Menu,
-    },
-    TerminalScreenPromptDetectorSpec {
-        id: "codex_mcp_elicitation",
-        providers: &["codex"],
-        required_any: &["needs your approval", "needs your input"],
-        confirm_any: &["continue without", "mcp", "cancel"],
-        prompt_kind: "selection",
-        manual_approval_required: false,
-        allow_while_busy: true,
-        allows_free_text: true,
-        default_option: Some("continue_without"),
-        danger_labels: &[],
-        option_strategy: TerminalScreenPromptOptionStrategy::Static(CODEX_MCP_ELICITATION_OPTIONS),
-    },
-    TerminalScreenPromptDetectorSpec {
-        id: "codex_cross_thread_blocked",
-        providers: &["codex"],
-        required_any: &["approval needed in"],
-        confirm_any: &["/agent to switch threads", "open thread"],
-        prompt_kind: "selection",
-        manual_approval_required: true,
-        allow_while_busy: true,
-        allows_free_text: false,
-        default_option: Some("open_thread"),
-        danger_labels: &[],
-        option_strategy: TerminalScreenPromptOptionStrategy::Static(CODEX_CROSS_THREAD_OPTIONS),
-    },
-    TerminalScreenPromptDetectorSpec {
-        id: "codex_permission_profile_escalation",
-        providers: &["codex"],
-        required_any: &[
-            "would you like to grant these permissions",
-            "permission rule",
-        ],
-        confirm_any: &["grant", "deny", "cancel"],
-        prompt_kind: "permission",
-        manual_approval_required: true,
-        allow_while_busy: true,
-        allows_free_text: false,
-        default_option: Some("deny"),
-        danger_labels: &["grant"],
-        option_strategy: TerminalScreenPromptOptionStrategy::Static(
-            CODEX_PERMISSION_PROFILE_OPTIONS,
-        ),
-    },
-    TerminalScreenPromptDetectorSpec {
-        id: "claude_workspace_trust",
-        providers: &["claude"],
-        required_any: &["is this a project you trust", "accessing workspace:"],
-        confirm_any: &["enter to confirm", "esc to cancel"],
-        prompt_kind: "approval",
-        manual_approval_required: true,
-        allow_while_busy: false,
-        allows_free_text: false,
-        default_option: Some("exit"),
-        danger_labels: &["trust", "proceed"],
-        option_strategy: TerminalScreenPromptOptionStrategy::Menu,
-    },
-    TerminalScreenPromptDetectorSpec {
-        id: "claude_theme_onboarding",
-        providers: &["claude"],
-        required_any: &[
-            "choose a theme",
-            "select theme",
-            "tips for getting started",
-            "what's new",
-        ],
-        confirm_any: &["welcome", "theme", "continue"],
-        prompt_kind: "selection",
-        manual_approval_required: false,
-        allow_while_busy: false,
-        allows_free_text: false,
-        default_option: Some("continue"),
-        danger_labels: &[],
-        option_strategy: TerminalScreenPromptOptionStrategy::Menu,
-    },
-    TerminalScreenPromptDetectorSpec {
-        id: "claude_external_claude_md_imports",
-        providers: &["claude"],
-        required_any: &["allow external claude.md file imports"],
-        confirm_any: &["external claude.md", "proceed", "deny"],
-        prompt_kind: "approval",
-        manual_approval_required: true,
-        allow_while_busy: false,
-        allows_free_text: false,
-        default_option: Some("deny"),
-        danger_labels: &["proceed", "allow"],
-        option_strategy: TerminalScreenPromptOptionStrategy::Menu,
-    },
-    TerminalScreenPromptDetectorSpec {
-        id: "claude_plan_approval",
-        providers: &["claude"],
-        required_any: &["do you want to proceed", "claude has written up a plan"],
-        confirm_any: &[
-            "no, keep planning",
-            "plan approved",
-            "tell claude what to do differently",
-        ],
-        prompt_kind: "approval",
-        manual_approval_required: true,
-        allow_while_busy: true,
-        allows_free_text: true,
-        default_option: Some("keep_planning"),
-        danger_labels: &[],
-        option_strategy: TerminalScreenPromptOptionStrategy::Static(CLAUDE_PLAN_OPTIONS),
-    },
-    TerminalScreenPromptDetectorSpec {
-        id: "claude_login",
-        providers: &["claude"],
-        required_any: &[
-            "authorization code",
-            "paste",
-            "/login",
-            "auth login",
-            "login",
-        ],
-        confirm_any: &["browser", "code", "authorization", "login"],
-        prompt_kind: "input",
-        manual_approval_required: false,
-        allow_while_busy: false,
-        allows_free_text: true,
-        default_option: Some("login"),
-        danger_labels: &[],
-        option_strategy: TerminalScreenPromptOptionStrategy::Menu,
-    },
-    TerminalScreenPromptDetectorSpec {
-        id: "opencode_update",
-        providers: &["opencode"],
-        required_any: &["update available", "a new release v"],
-        confirm_any: &["would you like to update now", "skip", "confirm"],
-        prompt_kind: "selection",
-        manual_approval_required: false,
-        allow_while_busy: false,
-        allows_free_text: false,
-        default_option: Some("skip"),
-        danger_labels: &[],
-        option_strategy: TerminalScreenPromptOptionStrategy::Menu,
-    },
-    TerminalScreenPromptDetectorSpec {
-        id: "opencode_login",
-        providers: &["opencode"],
-        required_any: &[
-            "add credential",
-            "select provider",
-            "login method",
-            "enter your api key",
-            "waiting for authorization",
-            "paste the authorization code here",
-        ],
-        confirm_any: &[
-            "credential",
-            "provider",
-            "api key",
-            "authorization",
-            "login",
-        ],
-        prompt_kind: "input",
-        manual_approval_required: false,
-        allow_while_busy: false,
-        allows_free_text: true,
-        default_option: Some("select"),
-        danger_labels: &[],
-        option_strategy: TerminalScreenPromptOptionStrategy::Menu,
-    },
-    TerminalScreenPromptDetectorSpec {
-        id: "opencode_share_session",
-        providers: &["opencode"],
-        required_any: &["share session", "are you sure you want to share"],
-        confirm_any: &["cancel", "confirm"],
-        prompt_kind: "approval",
-        manual_approval_required: true,
-        allow_while_busy: true,
-        allows_free_text: false,
-        default_option: Some("cancel"),
-        danger_labels: &["confirm", "share"],
-        option_strategy: TerminalScreenPromptOptionStrategy::Menu,
-    },
-];
-
-fn terminal_screen_prompt_active_key(pane_id: &str, instance_id: u64) -> String {
-    format!("{pane_id}:{instance_id}")
-}
-
-fn terminal_screen_prompt_registry(
-) -> &'static StdMutex<HashMap<String, TerminalScreenPromptActive>> {
-    TERMINAL_SCREEN_PROMPTS.get_or_init(|| StdMutex::new(HashMap::new()))
-}
-
-fn terminal_screen_prompt_scan_registry(
-) -> &'static StdMutex<HashMap<String, TerminalScreenPromptScanState>> {
-    TERMINAL_SCREEN_PROMPT_SCANS.get_or_init(|| StdMutex::new(HashMap::new()))
-}
-
-fn terminal_screen_prompt_remove_for_close(pane_id: &str, instance_id: u64) {
-    let key = terminal_screen_prompt_active_key(pane_id, instance_id);
-    if let Ok(mut active) = terminal_screen_prompt_registry().lock() {
-        active.remove(&key);
-    }
-    terminal_screen_prompt_clear_scan(&key);
-}
-
-fn terminal_screen_prompt_take_for_instance(
-    pane_id: &str,
-    instance_id: u64,
-) -> Option<TerminalScreenPromptActive> {
-    let key = terminal_screen_prompt_active_key(pane_id, instance_id);
-    let removed = terminal_screen_prompt_registry()
-        .lock()
-        .ok()
-        .and_then(|mut active| active.remove(&key));
-    terminal_screen_prompt_clear_scan(&key);
-    removed
-}
-
 fn terminal_activity_payload_is_non_prompting_lifecycle(
     payload: &TerminalActivityHookPayload,
 ) -> bool {
@@ -999,1110 +293,14 @@ fn terminal_activity_hook_reconcile_prompt_state(payload: &mut TerminalActivityH
     }
 
     if terminal_activity_payload_is_non_prompting_lifecycle(payload) {
-        let _ = terminal_screen_prompt_take_for_instance(&payload.pane_id, payload.instance_id);
         terminal_activity_payload_clear_prompt_state(payload);
         return;
     }
 
-    let key = terminal_screen_prompt_active_key(&payload.pane_id, payload.instance_id);
-    let screen_prompt = terminal_screen_prompt_registry()
-        .lock()
-        .ok()
-        .and_then(|active| active.get(&key).cloned());
-    let Some(screen_prompt) = screen_prompt else {
-        terminal_activity_payload_clear_prompt_state(payload);
-        return;
-    };
-
-    payload.prompt_id = Some(screen_prompt.prompt_id.clone());
-    payload.prompt_kind = Some(screen_prompt.prompt_kind.clone());
-    payload.prompt_default_option = screen_prompt.default_option.clone();
-    payload.prompt_options = screen_prompt.options.clone();
-    payload.allows_free_text = screen_prompt.allows_free_text;
-    payload.manual_prompt_source = Some("screen_detector".to_string());
-    payload.manual_approval_required = screen_prompt.manual_approval_required;
-    payload.provider_blocked_for_user = true;
-    payload.terminal_is_prompting_user = true;
-    payload.prompting_user_kind = Some(screen_prompt.prompt_kind);
-    payload.prompting_user_source = Some("screen_detector".to_string());
-    payload.prompting_user_confidence = Some("stable_tail".to_string());
-    payload.prompting_user_text = Some(screen_prompt.prompt_text);
-}
-
-fn terminal_screen_prompt_provider_matches(provider: &str, allowed: &[&str]) -> bool {
-    let provider = terminal_normalize_agent_kind(Some(provider)).unwrap_or_else(|| {
-        provider
-            .trim()
-            .to_ascii_lowercase()
-            .replace(['-', ' '], "_")
-    });
-    allowed.iter().any(|candidate| {
-        terminal_normalize_agent_kind(Some(candidate))
-            .as_deref()
-            .unwrap_or(candidate)
-            == provider
-    })
-}
-
-fn terminal_screen_prompt_normalized_text(value: &str) -> String {
-    let cleaned = terminal_activity_strip_terminal_sequences(value);
-    let lines = cleaned
-        .lines()
-        .map(terminal_activity_compact_text)
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    let start = lines.len().saturating_sub(40);
-    lines[start..].join("\n")
-}
-
-fn terminal_screen_prompt_tail_screen_lines(value: &str) -> Vec<String> {
-    let cleaned = terminal_activity_strip_terminal_sequences(value);
-    let lines = cleaned
-        .lines()
-        .map(terminal_activity_compact_text)
-        .map(|line| line.trim().to_string())
-        .collect::<Vec<_>>();
-    let start = lines.len().saturating_sub(80);
-    lines[start..].to_vec()
-}
-
-fn terminal_screen_prompt_footer_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return true;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    lower.contains("esc to interrupt")
-        || lower.contains("ctrl+c")
-        || lower.contains("ctrl-d")
-        || lower.contains("ctrl+d")
-        || lower.contains("ctrl+p commands")
-        || (lower.contains("tokens") && lower.contains("context"))
-        || (lower.contains("press") && lower.contains("ctrl") && lower.contains("cancel"))
-}
-
-fn terminal_screen_prompt_transcript_marker_line(line: &str) -> bool {
-    let trimmed = line
-        .trim_start()
-        .trim_start_matches(|ch: char| matches!(ch, '│' | '┃' | '┆' | '┊' | '|' | '║'))
-        .trim_start();
-    if trimmed.starts_with("> ") || trimmed.starts_with(">>") {
-        return true;
-    }
-    if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-        return true;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    lower.starts_with("assistant:")
-        || lower.starts_with("assistant >")
-        || lower.starts_with("assistant -")
-        || lower.starts_with("assistant output")
-        || lower.starts_with("assistant says")
-}
-
-fn terminal_screen_prompt_confirm_hint_line(line: &str) -> bool {
-    terminal_screen_prompt_confirm_hint(&line.to_ascii_lowercase())
-}
-
-fn terminal_screen_prompt_bottom_block(value: &str) -> Option<TerminalScreenPromptBlock> {
-    let lines = terminal_screen_prompt_tail_screen_lines(value);
-    let mut end = lines.len();
-    while end > 0 && terminal_screen_prompt_footer_line(&lines[end - 1]) {
-        end -= 1;
-    }
-    if end == 0 {
-        return None;
-    }
-    let content_lines = lines[..end]
-        .iter()
-        .filter(|line| !line.trim().is_empty())
-        .cloned()
-        .collect::<Vec<_>>();
-    let last_line = content_lines.last()?;
-    if !terminal_screen_prompt_confirm_hint_line(last_line) {
-        return None;
-    }
-    let start = content_lines.len().saturating_sub(16);
-    let block_lines = content_lines[start..].to_vec();
-    if block_lines
-        .iter()
-        .any(|line| terminal_screen_prompt_transcript_marker_line(line))
-    {
-        return None;
-    }
-    let normalized_text = block_lines.join("\n");
-    let signature_line = block_lines
-        .iter()
-        .find(|line| !terminal_screen_prompt_confirm_hint_line(line))
-        .cloned()
-        .unwrap_or_else(|| last_line.clone());
-    Some(TerminalScreenPromptBlock {
-        normalized_text,
-        signature_line,
-    })
-}
-
-fn terminal_screen_prompt_compact_tail(value: &str) -> String {
-    let normalized = terminal_screen_prompt_normalized_text(value);
-    let chars = normalized.chars().collect::<Vec<_>>();
-    let start = chars.len().saturating_sub(2_000);
-    chars[start..].iter().collect()
-}
-
-fn terminal_screen_prompt_phrase_matches(haystack: &str, phrases: &[&str]) -> bool {
-    phrases.is_empty()
-        || phrases
-            .iter()
-            .any(|phrase| haystack.contains(&phrase.to_ascii_lowercase()))
-}
-
-fn terminal_screen_prompt_static_answer_plan(
-    answer: TerminalScreenPromptStaticAnswerPlan,
-) -> TerminalScreenPromptAnswerPlan {
-    match answer {
-        TerminalScreenPromptStaticAnswerPlan::Key(key) => {
-            TerminalScreenPromptAnswerPlan::Key(key.to_string())
-        }
-        TerminalScreenPromptStaticAnswerPlan::Enter => TerminalScreenPromptAnswerPlan::Enter,
-        TerminalScreenPromptStaticAnswerPlan::Escape => TerminalScreenPromptAnswerPlan::Escape,
-        TerminalScreenPromptStaticAnswerPlan::FreeText => TerminalScreenPromptAnswerPlan::FreeText,
-    }
-}
-
-fn terminal_screen_prompt_static_options(
-    options: &[TerminalScreenPromptStaticOption],
-) -> Vec<TerminalScreenPromptDetectedOption> {
-    options
-        .iter()
-        .map(|option| TerminalScreenPromptDetectedOption {
-            option: TerminalActivityHookPromptOption {
-                id: option.id.to_string(),
-                label: option.label.to_string(),
-                description: None,
-                value: option.value.map(str::to_string),
-                danger: option.danger.then_some(true),
-            },
-            answer: terminal_screen_prompt_static_answer_plan(option.answer),
-        })
-        .collect()
-}
-
-fn terminal_screen_prompt_menu_token(line: &str) -> Option<(String, String)> {
-    let trimmed = line
-        .trim()
-        .trim_start_matches(|ch: char| {
-            ch.is_whitespace()
-                || matches!(
-                    ch,
-                    '>' | '›' | '❯' | '❱' | '•' | '-' | '*' | '│' | '┃' | '┆' | '┊'
-                )
-        })
-        .trim();
-    let mut chars = trimmed.char_indices();
-    let (_, first) = chars.next()?;
-    if !(first.is_ascii_alphanumeric()) {
-        return None;
-    }
-    let mut token_end = first.len_utf8();
-    for (index, ch) in chars {
-        if ch.is_ascii_alphanumeric() {
-            token_end = index + ch.len_utf8();
-            continue;
-        }
-        if matches!(ch, '.' | ')' | ':' | ']' | '-') {
-            let token = trimmed[..token_end].trim();
-            let label = trimmed[index + ch.len_utf8()..].trim();
-            if !token.is_empty()
-                && !label.is_empty()
-                && token.len() <= 3
-                && (token.chars().all(|ch| ch.is_ascii_digit()) || token.len() == 1)
-            {
-                return Some((token.to_string(), label.to_string()));
-            }
-        }
-        break;
-    }
-    None
-}
-
-fn terminal_screen_prompt_menu_options(
-    normalized: &str,
-    danger_labels: &[&str],
-) -> Vec<TerminalScreenPromptDetectedOption> {
-    let mut options: Vec<TerminalScreenPromptDetectedOption> = Vec::new();
-    for line in normalized.lines() {
-        let Some((token, mut label)) = terminal_screen_prompt_menu_token(line) else {
-            continue;
-        };
-        label = label
-            .trim_matches(|ch: char| matches!(ch, '│' | '┃' | '┆' | '┊'))
-            .trim()
-            .to_string();
-        if label.is_empty() || label.len() > 120 {
-            continue;
-        }
-        let id = terminal_activity_hook_prompt_option_id(&token);
-        if id.is_empty() || options.iter().any(|existing| existing.option.id == id) {
-            continue;
-        }
-        let label_lower = label.to_ascii_lowercase();
-        let danger = danger_labels
-            .iter()
-            .any(|needle| label_lower.contains(&needle.to_ascii_lowercase()));
-        let answer = if token.eq_ignore_ascii_case("esc") {
-            TerminalScreenPromptAnswerPlan::Escape
-        } else {
-            TerminalScreenPromptAnswerPlan::Key(token.clone())
-        };
-        options.push(TerminalScreenPromptDetectedOption {
-            option: TerminalActivityHookPromptOption {
-                id,
-                label: label.chars().take(80).collect(),
-                description: None,
-                value: Some(token),
-                danger: danger.then_some(true),
-            },
-            answer,
-        });
-    }
-    options
-}
-
-fn terminal_screen_prompt_generic_numbered_menu_options(
-    normalized: &str,
-) -> Vec<TerminalScreenPromptDetectedOption> {
-    let options = terminal_screen_prompt_menu_options(normalized, &[]);
-    let numeric = options
-        .iter()
-        .filter(|option| {
-            option
-                .option
-                .value
-                .as_deref()
-                .is_some_and(|value| value.chars().all(|ch| ch.is_ascii_digit()))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if (2..=6).contains(&numeric.len()) {
-        numeric
-    } else {
-        Vec::new()
-    }
-}
-
-fn terminal_screen_prompt_signature_line(normalized: &str, phrases: &[&str]) -> String {
-    if phrases.is_empty() {
-        let lines = normalized.lines().collect::<Vec<_>>();
-        if let Some(first_option_index) = lines
-            .iter()
-            .position(|line| terminal_screen_prompt_menu_token(line).is_some())
-        {
-            if let Some(line) = lines[..first_option_index]
-                .iter()
-                .rev()
-                .find(|line| !terminal_screen_prompt_confirm_hint_line(line))
-            {
-                return line.trim().to_string();
-            }
-        }
-    }
-    let phrase_lowers = phrases
-        .iter()
-        .map(|phrase| phrase.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    normalized
-        .lines()
-        .find(|line| {
-            let lower = line.to_ascii_lowercase();
-            phrase_lowers
-                .iter()
-                .any(|phrase| !phrase.is_empty() && lower.contains(phrase))
-        })
-        .or_else(|| {
-            normalized
-                .lines()
-                .find(|line| terminal_screen_prompt_menu_token(line).is_none())
-        })
-        .unwrap_or_default()
-        .trim()
-        .to_string()
-}
-
-fn terminal_screen_prompt_fingerprint_text(
-    signature_line: &str,
-    options: &[TerminalScreenPromptDetectedOption],
-) -> String {
-    let mut lines = vec![terminal_activity_compact_text(signature_line)
-        .trim()
-        .to_string()];
-    for option in options {
-        lines.push(
-            terminal_activity_compact_text(&option.option.label)
-                .trim()
-                .to_string(),
-        );
-    }
-    lines
-        .into_iter()
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn terminal_screen_prompt_confirm_hint(normalized_lower: &str) -> bool {
-    [
-        "press enter to confirm",
-        "enter to confirm",
-        "esc to go back",
-        "enter y/n",
-        "confirm",
-        "cancel",
-        "deny",
-        "proceed",
-    ]
-    .iter()
-    .any(|needle| normalized_lower.contains(needle))
-}
-
-fn terminal_screen_prompt_candidate_from_spec(
-    provider: &str,
-    raw_tail: &str,
-    spec: &TerminalScreenPromptDetectorSpec,
-) -> Option<TerminalScreenPromptCandidate> {
-    if !terminal_screen_prompt_provider_matches(provider, spec.providers) {
-        return None;
-    }
-    let block = terminal_screen_prompt_bottom_block(raw_tail)?;
-    let normalized = block.normalized_text;
-    if normalized.is_empty() {
-        return None;
-    }
-    let normalized_lower = normalized.to_ascii_lowercase();
-    if !terminal_screen_prompt_phrase_matches(&normalized_lower, spec.required_any)
-        || !terminal_screen_prompt_phrase_matches(&normalized_lower, spec.confirm_any)
-    {
-        return None;
-    }
-    let mut options = match spec.option_strategy {
-        TerminalScreenPromptOptionStrategy::Static(options) => {
-            terminal_screen_prompt_static_options(options)
-        }
-        TerminalScreenPromptOptionStrategy::Menu => {
-            terminal_screen_prompt_menu_options(&normalized, spec.danger_labels)
-        }
-    };
-    if options.is_empty() {
-        options = match spec.id {
-            "codex_hooks_need_review" => {
-                terminal_screen_prompt_static_options(CODEX_HOOKS_REVIEW_OPTIONS)
-            }
-            "codex_login_first_run" => terminal_screen_prompt_static_options(CODEX_LOGIN_OPTIONS),
-            "codex_update_available" => terminal_screen_prompt_static_options(CODEX_UPDATE_OPTIONS),
-            "claude_workspace_trust" => {
-                terminal_screen_prompt_static_options(CLAUDE_WORKSPACE_TRUST_OPTIONS)
-            }
-            "claude_theme_onboarding" => {
-                terminal_screen_prompt_static_options(CLAUDE_THEME_OPTIONS)
-            }
-            "claude_external_claude_md_imports" => {
-                terminal_screen_prompt_static_options(CLAUDE_EXTERNAL_IMPORT_OPTIONS)
-            }
-            "claude_login" => terminal_screen_prompt_static_options(CLAUDE_LOGIN_OPTIONS),
-            "opencode_update" => terminal_screen_prompt_static_options(OPENCODE_UPDATE_OPTIONS),
-            "opencode_login" => terminal_screen_prompt_static_options(OPENCODE_LOGIN_OPTIONS),
-            "opencode_share_session" => {
-                terminal_screen_prompt_static_options(OPENCODE_SHARE_OPTIONS)
-            }
-            _ => Vec::new(),
-        };
-    }
-    if options.is_empty() {
-        return None;
-    }
-    let signature_line = terminal_screen_prompt_signature_line(&normalized, spec.required_any);
-    let signature_line = if signature_line.is_empty() {
-        block.signature_line
-    } else {
-        signature_line
-    };
-    let fingerprint_text = terminal_screen_prompt_fingerprint_text(&signature_line, &options);
-    let default_option = spec.default_option.and_then(|default| {
-        let default_id = terminal_activity_hook_prompt_option_id(default);
-        options
-            .iter()
-            .find(|option| option.option.id == default_id)
-            .or_else(|| {
-                options.iter().find(|option| {
-                    terminal_activity_hook_prompt_option_id(&option.option.label) == default_id
-                })
-            })
-            .or_else(|| {
-                options.iter().find(|option| {
-                    option
-                        .option
-                        .label
-                        .to_ascii_lowercase()
-                        .contains(&default.replace('_', " ").to_ascii_lowercase())
-                })
-            })
-            .map(|option| option.option.id.clone())
-    });
-    Some(TerminalScreenPromptCandidate {
-        detector_id: spec.id.to_string(),
-        prompt_kind: spec.prompt_kind.to_string(),
-        fingerprint_text,
-        prompt_text: terminal_screen_prompt_compact_tail(&normalized),
-        options,
-        default_option,
-        manual_approval_required: spec.manual_approval_required,
-        allow_while_busy: spec.allow_while_busy,
-        allows_free_text: spec.allows_free_text,
-    })
-}
-
-fn terminal_screen_prompt_generic_menu_candidate(
-    provider: &str,
-    raw_tail: &str,
-) -> Option<TerminalScreenPromptCandidate> {
-    let provider = terminal_normalize_agent_kind(Some(provider))?;
-    if !matches!(provider.as_str(), "codex" | "claude" | "opencode") {
-        return None;
-    }
-    let block = terminal_screen_prompt_bottom_block(raw_tail)?;
-    let normalized = block.normalized_text;
-    let normalized_lower = normalized.to_ascii_lowercase();
-    if !terminal_screen_prompt_confirm_hint(&normalized_lower) {
-        return None;
-    }
-    let options = terminal_screen_prompt_generic_numbered_menu_options(&normalized);
-    if options.is_empty() {
-        return None;
-    }
-    let signature_line = terminal_screen_prompt_signature_line(&normalized, &[]);
-    let signature_line = if signature_line.is_empty() {
-        block.signature_line
-    } else {
-        signature_line
-    };
-    let fingerprint_text = terminal_screen_prompt_fingerprint_text(&signature_line, &options);
-    Some(TerminalScreenPromptCandidate {
-        detector_id: format!("{provider}_generic_numbered_menu"),
-        prompt_kind: "selection".to_string(),
-        fingerprint_text,
-        prompt_text: terminal_screen_prompt_compact_tail(&normalized),
-        default_option: options.first().map(|option| option.option.id.clone()),
-        options,
-        manual_approval_required: false,
-        allow_while_busy: false,
-        allows_free_text: false,
-    })
-}
-
-fn terminal_screen_prompt_detect(
-    provider: &str,
-    raw_tail: &str,
-) -> Option<TerminalScreenPromptCandidate> {
-    TERMINAL_SCREEN_PROMPT_DETECTORS
-        .iter()
-        .find_map(|spec| terminal_screen_prompt_candidate_from_spec(provider, raw_tail, spec))
-        .or_else(|| terminal_screen_prompt_generic_menu_candidate(provider, raw_tail))
-}
-
-fn terminal_screen_prompt_hash_id(
-    detector_id: &str,
-    pane_id: &str,
-    fingerprint_text: &str,
-) -> String {
-    let mut hasher = Sha1::new();
-    hasher.update(detector_id.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(pane_id.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(fingerprint_text.as_bytes());
-    let digest = hasher.finalize();
-    let suffix = digest
-        .iter()
-        .take(10)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("screen-{detector_id}-{suffix}")
-}
-
-fn terminal_screen_prompt_event_options(
-    options: &[TerminalActivityHookPromptOption],
-) -> Vec<Value> {
-    options
-        .iter()
-        .map(|option| {
-            let mut value = json!({
-                "id": option.id.as_str(),
-                "label": option.label.as_str(),
-            });
-            if let Some(object) = value.as_object_mut() {
-                if let Some(description) = option.description.as_ref() {
-                    object.insert("description".to_string(), json!(description));
-                }
-                if let Some(raw_value) = option.value.as_ref() {
-                    object.insert("value".to_string(), json!(raw_value));
-                }
-                if option.danger.unwrap_or(false) {
-                    object.insert("danger".to_string(), json!(true));
-                }
-            }
-            value
-        })
-        .collect()
-}
-
-fn terminal_screen_prompt_active_from_candidate(
-    pane_id: &str,
-    instance_id: u64,
-    prompt_id: String,
-    candidate: TerminalScreenPromptCandidate,
-    now_ms: u64,
-) -> TerminalScreenPromptActive {
-    let mut answer_plans = HashMap::new();
-    let mut options = Vec::new();
-    for detected in candidate.options {
-        answer_plans.insert(detected.option.id.clone(), detected.answer);
-        options.push(detected.option);
-    }
-    TerminalScreenPromptActive {
-        pane_id: pane_id.to_string(),
-        instance_id,
-        prompt_id,
-        detector_id: candidate.detector_id,
-        prompt_kind: candidate.prompt_kind,
-        prompt_text: candidate.prompt_text,
-        options,
-        answer_plans,
-        default_option: candidate.default_option,
-        manual_approval_required: candidate.manual_approval_required,
-        allows_free_text: candidate.allows_free_text,
-        last_emitted_ms: now_ms,
-        missing_scans: 0,
-    }
-}
-
-fn terminal_screen_prompt_headless_snapshot(
-    headless_output: &Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
-) -> (String, u64) {
-    let Ok(output) = headless_output.lock() else {
-        return (String::new(), 0);
-    };
-    let tail = output.tail.iter().copied().collect::<Vec<_>>();
-    if tail.is_empty() {
-        return (String::new(), output.total_bytes);
-    }
-    let start = tail.len().saturating_sub(TERMINAL_STARTUP_READY_SCAN_BYTES);
-    (
-        String::from_utf8_lossy(&tail[start..]).to_string(),
-        output.total_bytes,
-    )
-}
-
-fn terminal_screen_prompt_stability_ready(
-    key: &str,
-    candidate: &TerminalScreenPromptCandidate,
-    total_bytes: u64,
-    now_ms: u64,
-) -> bool {
-    let Ok(mut scans) = terminal_screen_prompt_scan_registry().lock() else {
-        return false;
-    };
-    if let Some(previous) = scans.get(key) {
-        if previous.detector_id == candidate.detector_id
-            && previous.fingerprint_text == candidate.fingerprint_text
-            && previous.total_bytes == total_bytes
-            && now_ms.saturating_sub(previous.observed_at_ms) >= TERMINAL_SCREEN_PROMPT_STABILITY_MS
-        {
-            return true;
-        }
-    }
-    scans.insert(
-        key.to_string(),
-        TerminalScreenPromptScanState {
-            detector_id: candidate.detector_id.clone(),
-            fingerprint_text: candidate.fingerprint_text.clone(),
-            total_bytes,
-            observed_at_ms: now_ms,
-        },
-    );
-    false
-}
-
-fn terminal_screen_prompt_clear_scan(key: &str) {
-    if let Ok(mut scans) = terminal_screen_prompt_scan_registry().lock() {
-        scans.remove(key);
-    }
-}
-
-fn terminal_screen_prompt_runtime_has_hook_prompt(runtime: &TerminalRuntimeSnapshot) -> bool {
-    if runtime
-        .source
-        .to_ascii_lowercase()
-        .contains("screen_detector")
-    {
-        return false;
-    }
-
-    let event_type = terminal_projection_text(&runtime.event_type, "");
-    if matches!(
-        event_type.as_str(),
-        "provider_permission_requested" | "provider_user_prompt_started"
-    ) {
-        return true;
-    }
-
-    // The hook's prompt state outlives the event that opened it. Coordination
-    // park/heartbeat updates may roll `event_type` while the provider is still
-    // awaiting the same answer, so gate on the prompt-specific runtime state.
-    // Deliberately exclude generic `paused`/`parked` values: those can describe
-    // a coordination lease wait with no live provider prompt.
-    let status = terminal_projection_text(&runtime.status, "");
-    let activity_status = terminal_projection_text(&runtime.activity_status, "");
-    let command_phase = terminal_projection_text(&runtime.command_phase, "");
-    [
-        status.as_str(),
-        activity_status.as_str(),
-        command_phase.as_str(),
-    ]
-    .iter()
-    .any(|value| {
-        matches!(
-            *value,
-            "awaiting_input"
-                | "awaiting_permission"
-                | "awaiting_user"
-                | "manual_prompt"
-                | "needs_input"
-                | "permission"
-                | "permission_requested"
-                | "prompting_user"
-                | "requires_input"
-                | "requires_user_input"
-                | "uir"
-                | "user_input_required"
-        )
-    })
-}
-
-fn terminal_screen_prompt_runtime_allows_candidate(
-    runtime: &TerminalRuntimeSnapshot,
-    candidate: &TerminalScreenPromptCandidate,
-) -> bool {
-    if terminal_screen_prompt_runtime_has_hook_prompt(runtime) {
-        return false;
-    }
-    terminal_runtime_snapshot_is_starting(runtime)
-        || !terminal_runtime_snapshot_is_busy_turn(runtime)
-        || candidate.allow_while_busy
-        || runtime
-            .source
-            .to_ascii_lowercase()
-            .contains("screen_detector")
-}
-
-fn terminal_screen_prompt_runtime_should_reemit(runtime: &TerminalRuntimeSnapshot) -> bool {
-    let status = terminal_projection_text(&runtime.status, "");
-    let activity = terminal_projection_text(&runtime.activity_status, "");
-    let command_phase = terminal_projection_text(&runtime.command_phase, "");
-    [status.as_str(), activity.as_str(), command_phase.as_str()]
-        .iter()
-        .any(|value| matches!(*value, "parked" | "resume_ready" | "resume_requested"))
-        || !runtime
-            .source
-            .to_ascii_lowercase()
-            .contains("screen_detector")
-}
-
-fn terminal_screen_prompt_hook_payload_should_supersede(
-    terminal_is_prompting_user: bool,
-    prompting_user_source: Option<&str>,
-    manual_prompt_source: Option<&str>,
-) -> bool {
-    terminal_is_prompting_user
-        && prompting_user_source != Some("screen_detector")
-        && manual_prompt_source != Some("screen_detector")
-}
-
-async fn terminal_screen_prompt_emit_started(
-    app: &AppHandle,
-    terminals: &Arc<RwLock<HashMap<String, TerminalInstance>>>,
-    cloud_mcp_state: &CloudMcpState,
-    instance: &TerminalInstance,
-    active: &TerminalScreenPromptActive,
-    source: &str,
-) {
-    if terminal_control_automation_owned(&active.pane_id) {
-        return;
-    }
-    let mut event = json!({
-        "hook_event_name": "UserInputRequired",
-        "provider": instance.metadata.agent_kind.clone(),
-        "source": source,
-        "origin": "screen_detector",
-        "screen_detector_id": active.detector_id.as_str(),
-        "status": "awaiting_input",
-        "activity_status": "awaiting_input",
-        "command_phase": "awaiting_input",
-        "prompt_id": active.prompt_id.as_str(),
-        "prompt_kind": active.prompt_kind.as_str(),
-        "prompt_default_option": active.default_option.as_deref(),
-        "prompt_options": terminal_screen_prompt_event_options(&active.options),
-        "manual_approval_required": active.manual_approval_required,
-        "provider_blocked_for_user": true,
-        "terminal_is_prompting_user": true,
-        "prompting_user_kind": active.prompt_kind.as_str(),
-        "prompting_user_source": "screen_detector",
-        "prompting_user_confidence": "stable_tail",
-        "prompting_user_text": active.prompt_text.as_str(),
-        "allows_free_text": active.allows_free_text,
-        "timestamp": crate::coordination::kernel::now_rfc3339(),
-        "timestamp_ms": terminal_now_ms(),
-    });
-    if let Some(object) = event.as_object_mut() {
-        let runtime = terminal_runtime_snapshot(instance);
-        if let Some(provider_session_id) = runtime
-            .provider_session_id
-            .as_deref()
-            .or(runtime.native_session_id.as_deref())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            object.insert("session_id".to_string(), json!(provider_session_id));
-            object.insert("provider_session_id".to_string(), json!(provider_session_id));
-            object.insert("native_session_id".to_string(), json!(provider_session_id));
-        }
-        if let Some(turn_id) = runtime
-            .turn_id
-            .as_deref()
-            .or(runtime.provider_turn_id.as_deref())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            object.insert("turn_id".to_string(), json!(turn_id));
-        }
-    }
-    process_terminal_activity_hook_event(
-        app,
-        terminals,
-        cloud_mcp_state,
-        &active.pane_id,
-        active.instance_id,
-        instance,
-        &event,
-        source,
-    )
-    .await;
-}
-
-async fn terminal_screen_prompt_emit_resolved(
-    app: &AppHandle,
-    terminals: &Arc<RwLock<HashMap<String, TerminalInstance>>>,
-    cloud_mcp_state: &CloudMcpState,
-    pane_id: &str,
-    instance_id: u64,
-    active: &TerminalScreenPromptActive,
-    option_id: Option<&str>,
-    reason: &str,
-) {
-    let Some(instance) =
-        terminal_activity_hook_current_instance(terminals, pane_id, instance_id).await
-    else {
-        return;
-    };
-    let runtime = terminal_runtime_snapshot(&instance);
-    let (tail, _) = terminal_screen_prompt_headless_snapshot(&instance.headless_output);
-    let input_ready = terminal_output_current_prompt_marker(&tail);
-    let (activity_status, command_phase) = if input_ready {
-        ("idle", "completed")
-    } else {
-        ("thinking", "running")
-    };
-    let mut event = json!({
-        "hook_event_name": "ScreenPromptResolved",
-        "provider": instance.metadata.agent_kind.clone(),
-        "source": "screen_detector:prompt_resolved",
-        "origin": "screen_detector",
-        "screen_detector_id": active.detector_id.as_str(),
-        "status": "active",
-        "activity_status": activity_status,
-        "command_phase": command_phase,
-        "input_ready": input_ready,
-        "provider_blocked_for_user": false,
-        "manual_approval_required": false,
-        "terminal_is_prompting_user": false,
-        "prompt_id": active.prompt_id.as_str(),
-        "prompt_kind": active.prompt_kind.as_str(),
-        "prompt_options": [],
-        "allows_free_text": false,
-        "option_id": option_id.unwrap_or_default(),
-        "prompt_answer_option": option_id.unwrap_or_default(),
-        "screen_prompt_resolved_reason": reason,
-        "timestamp": crate::coordination::kernel::now_rfc3339(),
-        "timestamp_ms": terminal_now_ms(),
-    });
-    if let Some(object) = event.as_object_mut() {
-        if let Some(provider_session_id) = runtime
-            .provider_session_id
-            .as_deref()
-            .or(runtime.native_session_id.as_deref())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            object.insert("session_id".to_string(), json!(provider_session_id));
-            object.insert("provider_session_id".to_string(), json!(provider_session_id));
-            object.insert("native_session_id".to_string(), json!(provider_session_id));
-        }
-        if let Some(turn_id) = runtime
-            .turn_id
-            .as_deref()
-            .or(runtime.provider_turn_id.as_deref())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            object.insert("turn_id".to_string(), json!(turn_id));
-        }
-    }
-    process_terminal_activity_hook_event(
-        app,
-        terminals,
-        cloud_mcp_state,
-        pane_id,
-        instance_id,
-        &instance,
-        &event,
-        "screen_detector:prompt_resolved",
-    )
-    .await;
-}
-
-async fn terminal_screen_prompt_mark_missing(
-    app: &AppHandle,
-    terminals: &Arc<RwLock<HashMap<String, TerminalInstance>>>,
-    cloud_mcp_state: &CloudMcpState,
-    pane_id: &str,
-    instance_id: u64,
-    key: &str,
-) {
-    terminal_screen_prompt_clear_scan(key);
-    let maybe_resolved = {
-        let Ok(mut active) = terminal_screen_prompt_registry().lock() else {
-            return;
-        };
-        let Some(entry) = active.get_mut(key) else {
-            return;
-        };
-        entry.missing_scans = entry.missing_scans.saturating_add(1);
-        if entry.missing_scans < 2 {
-            return;
-        }
-        active.remove(key)
-    };
-    if let Some(resolved) = maybe_resolved {
-        terminal_screen_prompt_emit_resolved(
-            app,
-            terminals,
-            cloud_mcp_state,
-            pane_id,
-            instance_id,
-            &resolved,
-            None,
-            "screen_no_longer_matches",
-        )
-        .await;
-    }
-}
-
-async fn terminal_screen_prompt_reemit_if_visible(
-    app: &AppHandle,
-    terminals: &Arc<RwLock<HashMap<String, TerminalInstance>>>,
-    cloud_mcp_state: &CloudMcpState,
-    instance: &TerminalInstance,
-    pane_id: &str,
-    instance_id: u64,
-    reason: &'static str,
-) -> bool {
-    if terminal_control_automation_owned(pane_id) {
-        return false;
-    }
-    let key = terminal_screen_prompt_active_key(pane_id, instance_id);
-    let Some(active) = terminal_screen_prompt_registry()
-        .lock()
-        .ok()
-        .and_then(|active| active.get(&key).cloned())
-    else {
-        return false;
-    };
-    let (tail, _) = terminal_screen_prompt_headless_snapshot(&instance.headless_output);
-    let Some(candidate) = terminal_screen_prompt_detect(&instance.metadata.agent_kind, &tail)
-    else {
-        return false;
-    };
-    let visible_prompt_id = terminal_screen_prompt_hash_id(
-        &candidate.detector_id,
-        pane_id,
-        &candidate.fingerprint_text,
-    );
-    if visible_prompt_id != active.prompt_id {
-        return false;
-    }
-    terminal_screen_prompt_emit_started(app, terminals, cloud_mcp_state, instance, &active, reason)
-        .await;
-    true
-}
-
-async fn terminal_screen_prompt_observe_candidate(
-    app: &AppHandle,
-    terminals: &Arc<RwLock<HashMap<String, TerminalInstance>>>,
-    cloud_mcp_state: &CloudMcpState,
-    pane_id: &str,
-    instance_id: u64,
-    key: &str,
-    candidate: TerminalScreenPromptCandidate,
-) {
-    if terminal_control_automation_owned(pane_id) {
-        terminal_screen_prompt_clear_scan(key);
-        return;
-    }
-    let Some(instance) =
-        terminal_activity_hook_current_instance(terminals, pane_id, instance_id).await
-    else {
-        return;
-    };
-    let runtime = terminal_runtime_snapshot(&instance);
-    if !terminal_screen_prompt_runtime_allows_candidate(&runtime, &candidate) {
-        return;
-    }
-    let prompt_id = terminal_screen_prompt_hash_id(
-        &candidate.detector_id,
-        pane_id,
-        &candidate.fingerprint_text,
-    );
-    let now_ms = terminal_now_ms();
-    let emissions = {
-        let Ok(mut active) = terminal_screen_prompt_registry().lock() else {
-            return;
-        };
-        if let Some(existing) = active.get_mut(key) {
-            if existing.prompt_id == prompt_id {
-                existing.missing_scans = 0;
-                let should_reemit = terminal_screen_prompt_runtime_should_reemit(&runtime)
-                    && now_ms.saturating_sub(existing.last_emitted_ms) >= 1_000;
-                if should_reemit {
-                    existing.last_emitted_ms = now_ms;
-                }
-                if should_reemit {
-                    vec![TerminalScreenPromptEmission::Started(existing.clone())]
-                } else {
-                    Vec::new()
-                }
-            } else {
-                let superseded = existing.clone();
-                let replacement = terminal_screen_prompt_active_from_candidate(
-                    pane_id,
-                    instance_id,
-                    prompt_id,
-                    candidate,
-                    now_ms,
-                );
-                active.insert(key.to_string(), replacement.clone());
-                terminal_screen_prompt_supersession_emissions(superseded, replacement)
-            }
-        } else {
-            let active_prompt = terminal_screen_prompt_active_from_candidate(
-                pane_id,
-                instance_id,
-                prompt_id,
-                candidate,
-                now_ms,
-            );
-            active.insert(key.to_string(), active_prompt.clone());
-            vec![TerminalScreenPromptEmission::Started(active_prompt)]
-        }
-    };
-    for emission in emissions {
-        match emission {
-            TerminalScreenPromptEmission::Resolved(active, reason) => {
-                terminal_screen_prompt_emit_resolved(
-                    app,
-                    terminals,
-                    cloud_mcp_state,
-                    pane_id,
-                    instance_id,
-                    &active,
-                    None,
-                    reason,
-                )
-                .await;
-            }
-            TerminalScreenPromptEmission::Started(active) => {
-                terminal_screen_prompt_emit_started(
-                    app,
-                    terminals,
-                    cloud_mcp_state,
-                    &instance,
-                    &active,
-                    "screen_detector",
-                )
-                .await;
-            }
-        }
-    }
-}
-
-async fn observe_terminal_screen_prompt(
-    app: AppHandle,
-    terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
-    cloud_mcp_state: CloudMcpState,
-    headless_output: Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
-    pane_id: String,
-    instance_id: u64,
-) {
-    let key = terminal_screen_prompt_active_key(&pane_id, instance_id);
-    for _ in 0..4 {
-        if terminal_control_automation_owned(&pane_id) {
-            terminal_screen_prompt_clear_scan(&key);
-            return;
-        }
-        let Some(instance) =
-            terminal_activity_hook_current_instance(&terminals, &pane_id, instance_id).await
-        else {
-            terminal_screen_prompt_clear_scan(&key);
-            return;
-        };
-        let (tail, total_bytes) = terminal_screen_prompt_headless_snapshot(&headless_output);
-        let provider = instance.metadata.agent_kind.clone();
-        let Some(candidate) = terminal_screen_prompt_detect(&provider, &tail) else {
-            terminal_screen_prompt_mark_missing(
-                &app,
-                &terminals,
-                &cloud_mcp_state,
-                &pane_id,
-                instance_id,
-                &key,
-            )
-            .await;
-            return;
-        };
-        let now_ms = terminal_now_ms();
-        if terminal_screen_prompt_stability_ready(&key, &candidate, total_bytes, now_ms) {
-            terminal_screen_prompt_observe_candidate(
-                &app,
-                &terminals,
-                &cloud_mcp_state,
-                &pane_id,
-                instance_id,
-                &key,
-                candidate,
-            )
-            .await;
-            return;
-        }
-        sleep(Duration::from_millis(TERMINAL_SCREEN_PROMPT_STABILITY_MS)).await;
-    }
+    // PTY content is observability only. A terminal screen that resembles a
+    // menu must never manufacture actionable UIR state; only provider hooks
+    // or provider control protocols may set terminal_is_prompting_user.
+    terminal_activity_payload_clear_prompt_state(payload);
 }
 
 #[cfg(windows)]
@@ -5025,7 +3223,6 @@ fn cleanup_terminal_instance_with_context(
         app_control_mcp_requested: _,
     } = instance;
     let metadata_fields = terminal_metadata_forensics_json(&metadata);
-    terminal_screen_prompt_remove_for_close(&metadata.pane_id, id);
     unregister_agent_thread_transcript_native_watch(&metadata.pane_id, Some(id));
     log_terminal_crash_forensics_event(
         "backend.terminal_cleanup.begin",
@@ -7131,8 +5328,17 @@ fn spawn_terminal_reader(
         {
             return;
         }
-        let (screen_tail, _) = terminal_screen_prompt_headless_snapshot(&headless_output);
-        if terminal_screen_prompt_detect(&instance.metadata.agent_kind, &screen_tail).is_some() {
+        let structured_prompt_open = app
+            .state::<TerminalState>()
+            .terminal_structured_interactions
+            .lock()
+            .ok()
+            .is_some_and(|interactions| {
+                interactions.values().any(|interaction| {
+                    interaction.pane_id == pane_id && interaction.instance_id == instance_id
+                })
+            });
+        if structured_prompt_open {
             return;
         }
         let mut runtime = terminal_runtime_snapshot(&instance);
@@ -7271,7 +5477,6 @@ fn spawn_terminal_reader(
 
     let reader_pane_id = pane_id.clone();
     let prompt_ready_observer_in_flight = Arc::new(AtomicBool::new(false));
-    let screen_prompt_observer_in_flight = Arc::new(AtomicBool::new(false));
 
     log_terminal_crash_forensics_event(
         "backend.terminal_reader.spawn",
@@ -7600,31 +5805,6 @@ fn spawn_terminal_reader(
                             )
                             .await;
                             readiness_observer_in_flight.store(false, Ordering::Release);
-                        });
-                    }
-                    if rust_readiness_observer_enabled
-                        && screen_prompt_observer_in_flight
-                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                            .is_ok()
-                    {
-                        let screen_app = app.clone();
-                        let screen_terminals = Arc::clone(&terminals);
-                        let screen_cloud_state = cloud_mcp_state.clone();
-                        let screen_headless_output = Arc::clone(&headless_output);
-                        let screen_pane_id = reader_pane_id.clone();
-                        let screen_observer_in_flight =
-                            Arc::clone(&screen_prompt_observer_in_flight);
-                        tauri::async_runtime::spawn(async move {
-                            observe_terminal_screen_prompt(
-                                screen_app,
-                                screen_terminals,
-                                screen_cloud_state,
-                                screen_headless_output,
-                                screen_pane_id,
-                                instance_id,
-                            )
-                            .await;
-                            screen_observer_in_flight.store(false, Ordering::Release);
                         });
                     }
                     if !auth_failure_marked
@@ -12886,17 +11066,18 @@ async fn terminal_resume_parked_prompt_once(
         return false;
     }
 
-    if terminal_screen_prompt_reemit_if_visible(
-        &app,
-        &terminals,
-        &cloud_mcp_state,
-        &instance,
-        &parked.pane_id,
-        parked.instance_id,
-        "screen_detector:parked_resume_reemit",
-    )
-    .await
-    {
+    let structured_prompt_open = app
+        .state::<TerminalState>()
+        .terminal_structured_interactions
+        .lock()
+        .ok()
+        .is_some_and(|interactions| {
+            interactions.values().any(|interaction| {
+                interaction.pane_id == parked.pane_id
+                    && interaction.instance_id == parked.instance_id
+            })
+        });
+    if structured_prompt_open {
         if let Some(parked) = parked_prompts.write().await.get_mut(&parked_key) {
             parked.resume_claimed = false;
         }
@@ -13729,6 +11910,11 @@ fn emit_terminal_prompt_submitted_activity_started(
         prompt_options: Vec::new(),
         allows_free_text: false,
         prompt_answer_option: None,
+        interaction_id: None,
+        interaction_revision: None,
+        interaction_source: None,
+        interaction_response_mode: None,
+        provider_request_id: None,
         manual_prompt_source: None,
         manual_approval_required: false,
         provider_blocked_for_user: false,
@@ -14620,6 +12806,7 @@ fn terminal_activity_hook_manual_prompt(
             | "elicitationrequest"
             | "elicitationrequested"
             | "manualprompt"
+            | "permissionrequest"
             | "permissionprompt"
             | "permissionpromptstarted"
             | "providerblockedforuser"
@@ -15038,22 +13225,15 @@ fn terminal_activity_hook_activity_kind(
             false,
             "cli_hook_permission_resolved",
         )),
-        "screenpromptresolved" => {
-            let input_ready = terminal_activity_hook_bool(event, &["input_ready"]);
-            let activity_status = terminal_activity_hook_string(
-                event,
-                &["activity_status", "status"],
-            )
-            .map(|value| terminal_projection_text(&value, ""))
-            .unwrap_or_default();
-            if input_ready || matches!(activity_status.as_str(), "idle" | "input_ready" | "ready") {
+        "permissionresult" | "permissionresolved" => {
+            if terminal_activity_hook_resolution_is_failure(event) {
                 Some((
-                    "provider-user-prompt-completed",
-                    "idle",
+                    "provider-tool-failed",
+                    "thinking",
                     "active",
-                    "completed",
-                    true,
-                    "screen_detector_prompt_resolved",
+                    "tool_failed",
+                    false,
+                    "cli_hook_permission_resolved",
                 ))
             } else {
                 Some((
@@ -15062,7 +13242,7 @@ fn terminal_activity_hook_activity_kind(
                     "active",
                     "running",
                     false,
-                    "screen_detector_prompt_resolved",
+                    "cli_hook_permission_resolved",
                 ))
             }
         }
@@ -15149,6 +13329,8 @@ fn terminal_activity_hook_non_lifecycle_is_expected(hook_event_name: &str) -> bo
             | "messagedisplay"
             | "notification"
             | "permissiondenied"
+            | "permissionresult"
+            | "permissionresolved"
             | "permissionprompt"
             | "permissionpromptstarted"
             | "permissionrequest"
@@ -15537,27 +13719,15 @@ fn terminal_activity_hook_payload(
     let manual_prompt = terminal_activity_hook_manual_prompt(&hook_event_name, event);
     let metadata = instance.metadata.clone();
     let mut background_work_active = false;
-    let screen_detector_prompt = manual_prompt.is_some()
-        && terminal_activity_hook_string(event, &["origin", "prompt_origin"])
-            .as_deref()
-            .is_some_and(|value| value.eq_ignore_ascii_case("screen_detector"));
     let (event_type, activity_status, status, command_phase, input_ready, completion_evidence) =
         if manual_prompt.is_some() {
             (
                 "provider-user-prompt-started",
-                if screen_detector_prompt {
-                    "awaiting_input"
-                } else {
-                    "paused"
-                },
+                "paused",
                 "active",
                 "awaiting_input",
                 false,
-                if screen_detector_prompt {
-                    "screen_detector_manual_prompt"
-                } else {
-                    "cli_hook_manual_prompt"
-                },
+                "cli_hook_manual_prompt",
             )
         } else {
             let (event_type, activity_status, status, command_phase, input_ready, evidence) =
@@ -15899,6 +14069,49 @@ fn terminal_activity_hook_payload(
     } else {
         None
     };
+    let resolved_interaction_id = terminal_activity_hook_string(
+        event,
+        &["resolved_interaction_id", "resolvedInteractionId"],
+    );
+    let resolved_interaction_revision = terminal_activity_hook_u64(
+        event,
+        &["resolved_interaction_revision", "resolvedInteractionRevision"],
+    );
+    let provider_request_id = manual_prompt
+        .as_ref()
+        .and_then(|_| prompt_id.clone())
+        .or_else(|| {
+            resolved_interaction_id
+                .as_ref()
+                .and_then(|_| prompt_id.clone())
+        });
+    let interaction_id = resolved_interaction_id.or_else(|| provider_request_id.as_ref().map(|request_id| {
+        format!(
+            "uir:{}:{}:{}:{}:{}",
+            terminal_projection_text(&provider, "provider"),
+            metadata.pane_id,
+            instance.id,
+            provider_session_id.as_deref().unwrap_or("session"),
+            request_id,
+        )
+    }));
+    let interaction_revision = interaction_id
+        .as_ref()
+        .map(|_| resolved_interaction_revision.unwrap_or(event_time_ms));
+    let interaction_source = interaction_id
+        .as_ref()
+        .map(|_| "provider_hook".to_string());
+    let interaction_response_mode = interaction_id.as_ref().map(|_| {
+        if resolved_interaction_revision.is_some() {
+            "resolved".to_string()
+        } else if terminal_metadata_is_claude(&metadata)
+            && matches!(hook_key.as_str(), "permissionrequest" | "elicitation")
+        {
+            "blocking_hook".to_string()
+        } else {
+            "structured_pty".to_string()
+        }
+    });
     let current_runtime = terminal_runtime_snapshot(instance);
     let projected_runtime = terminal_project_runtime(
         &metadata,
@@ -15916,11 +14129,7 @@ fn terminal_activity_hook_payload(
             provider_turn_id: provider_turn_id.clone(),
             turn_id: provider_turn_id.clone(),
             source: if manual_prompt.is_some() {
-                if screen_detector_prompt {
-                    "screen_detector:manual-prompt".to_string()
-                } else {
-                    "cli-hook:manual-prompt".to_string()
-                }
+                "cli-hook:manual-prompt".to_string()
             } else {
                 format!("cli-hook:{event_type}")
             },
@@ -15949,11 +14158,7 @@ fn terminal_activity_hook_payload(
         event_type: event_type.to_string(),
         hook_event_name,
         source: if manual_prompt.is_some() {
-            if screen_detector_prompt {
-                "screen_detector:manual-prompt".to_string()
-            } else {
-                "cli-hook:manual-prompt".to_string()
-            }
+            "cli-hook:manual-prompt".to_string()
         } else {
             format!("cli-hook:{event_type}")
         },
@@ -16037,29 +14242,22 @@ fn terminal_activity_hook_payload(
         prompt_options,
         allows_free_text,
         prompt_answer_option,
-        manual_prompt_source: if screen_detector_prompt {
-            Some("screen_detector".to_string())
-        } else {
-            manual_prompt_source
-        },
+        interaction_id,
+        interaction_revision,
+        interaction_source,
+        interaction_response_mode,
+        provider_request_id,
+        manual_prompt_source,
         manual_approval_required,
         provider_blocked_for_user,
         terminal_is_prompting_user,
         prompting_user_kind,
-        prompting_user_source: manual_prompt.as_ref().map(|_| {
-            if screen_detector_prompt {
-                "screen_detector".to_string()
-            } else {
-                "cli-hook:manual-prompt".to_string()
-            }
-        }),
-        prompting_user_confidence: manual_prompt.as_ref().map(|_| {
-            if screen_detector_prompt {
-                "screen_detector_stable_tail".to_string()
-            } else {
-                "cli_hook_manual_prompt".to_string()
-            }
-        }),
+        prompting_user_source: manual_prompt
+            .as_ref()
+            .map(|_| "cli-hook:manual-prompt".to_string()),
+        prompting_user_confidence: manual_prompt
+            .as_ref()
+            .map(|_| "cli_hook_manual_prompt".to_string()),
         prompting_user_text,
         hook_health_status: "ok".to_string(),
         hook_health_event: "event_observed".to_string(),
@@ -17171,6 +15369,137 @@ fn terminal_activity_hook_buffer_final_stop_candidate(
     );
 }
 
+fn terminal_structured_interaction_reconcile(
+    app: &AppHandle,
+    event: &Value,
+    payload: &TerminalActivityHookPayload,
+) {
+    let state = app.state::<TerminalState>();
+    let Ok(mut interactions) = state.terminal_structured_interactions.lock() else {
+        return;
+    };
+
+    let provider_interaction = payload
+        .interaction_source
+        .as_deref()
+        .is_some_and(|source| source == "provider_hook")
+        && payload.terminal_is_prompting_user;
+    if provider_interaction {
+        let Some(interaction_id) = payload.interaction_id.clone() else {
+            return;
+        };
+        let Some(provider_request_id) = payload.provider_request_id.clone() else {
+            return;
+        };
+        let superseded_ids = interactions
+            .iter()
+            .filter_map(|(id, interaction)| {
+                (id != &interaction_id
+                    && interaction.pane_id == payload.pane_id
+                    && interaction.instance_id == payload.instance_id)
+                    .then(|| id.clone())
+            })
+            .collect::<Vec<_>>();
+        interactions.retain(|id, interaction| {
+            id == &interaction_id
+                || interaction.pane_id != payload.pane_id
+                || interaction.instance_id != payload.instance_id
+        });
+        interactions.insert(
+            interaction_id.clone(),
+            TerminalStructuredInteraction {
+                interaction_id: interaction_id.clone(),
+                revision: payload.interaction_revision.unwrap_or(payload.observed_at_ms),
+                pane_id: payload.pane_id.clone(),
+                instance_id: payload.instance_id,
+                provider: payload.provider.clone(),
+                provider_request_id,
+                prompt_id: payload.prompt_id.clone().unwrap_or_default(),
+                hook_event_name: payload.hook_event_name.clone(),
+                response_mode: payload
+                    .interaction_response_mode
+                    .clone()
+                    .unwrap_or_else(|| "structured_pty".to_string()),
+                options: payload.prompt_options.clone(),
+                permission_suggestions: terminal_activity_hook_value(
+                    event,
+                    &["permission_suggestions", "updated_permissions"],
+                ),
+            },
+        );
+        log_terminal_status_event(
+            "backend.terminal_structured_interaction.opened",
+            json!({
+                "hook_event_name": payload.hook_event_name,
+                "instance_id": payload.instance_id,
+                "interaction_id": interaction_id,
+                "pane_id": payload.pane_id,
+                "provider": payload.provider,
+                "response_mode": payload.interaction_response_mode,
+                "revision": payload.interaction_revision,
+            }),
+        );
+        drop(interactions);
+        if !superseded_ids.is_empty() {
+            if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
+                for id in superseded_ids {
+                    waiters.remove(&id);
+                }
+            }
+        }
+        return;
+    }
+
+    let hook_key = terminal_activity_hook_name_key(&payload.hook_event_name);
+    let provider_resolved_interaction = matches!(
+        hook_key.as_str(),
+        "permissiondenied"
+            | "permissionresult"
+            | "permissionresolved"
+            | "elicitationresult"
+            | "elicitationresolved"
+    );
+    if terminal_activity_payload_is_non_prompting_lifecycle(payload)
+        || provider_resolved_interaction
+    {
+        let resolved_request_id = terminal_activity_hook_string(
+            event,
+            &[
+                "permission_request_id",
+                "permission_prompt_id",
+                "approval_id",
+                "prompt_id",
+                "question_id",
+                "selection_id",
+                "tool_use_id",
+                "id",
+            ],
+        );
+        let removed_ids = interactions
+            .iter()
+            .filter_map(|(id, interaction)| {
+                let same_terminal = interaction.pane_id == payload.pane_id
+                    && interaction.instance_id == payload.instance_id;
+                let same_request = !provider_resolved_interaction
+                    || resolved_request_id.as_deref().is_none_or(|request_id| {
+                        interaction.provider_request_id == request_id
+                            || interaction.prompt_id == request_id
+                    });
+                (same_terminal && same_request).then(|| id.clone())
+            })
+            .collect::<Vec<_>>();
+        interactions.retain(|id, _| !removed_ids.contains(id));
+        drop(interactions);
+        if !removed_ids.is_empty() {
+            if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
+                for id in removed_ids {
+                    waiters.remove(&id);
+                }
+            }
+        }
+    }
+}
+
 fn apply_terminal_activity_hook_payload(
     app: &AppHandle,
     terminals: &Arc<RwLock<HashMap<String, TerminalInstance>>>,
@@ -17182,6 +15511,34 @@ fn apply_terminal_activity_hook_payload(
     source: &str,
 ) {
     terminal_activity_hook_reconcile_prompt_state(&mut payload);
+    if payload.interaction_response_mode.as_deref() == Some("blocking_hook")
+        && source != "transport"
+    {
+        payload.terminal_is_prompting_user = false;
+        payload.provider_blocked_for_user = false;
+        payload.prompt_id = None;
+        payload.prompt_kind = None;
+        payload.prompt_options.clear();
+        payload.prompt_default_option = None;
+        payload.interaction_id = None;
+        payload.interaction_revision = None;
+        payload.interaction_source = None;
+        payload.interaction_response_mode = None;
+        payload.provider_request_id = None;
+        payload.hook_health_status = "error".to_string();
+        payload.hook_health_event = "blocking_hook_transport_required".to_string();
+        payload.completion_evidence = "blocking_hook_transport_unavailable".to_string();
+        log_terminal_status_event(
+            "backend.terminal_structured_interaction.unanswerable_suppressed",
+            json!({
+                "hook_event_name": payload.hook_event_name,
+                "instance_id": payload.instance_id,
+                "pane_id": payload.pane_id,
+                "source": source,
+            }),
+        );
+    }
+    terminal_structured_interaction_reconcile(app, event, &payload);
     let runtime_snapshot = terminal_runtime_apply_activity_payload(instance, &payload);
     log_terminal_status_event(
         "backend.terminal_activity_hook.lifecycle",
@@ -17351,25 +15708,6 @@ async fn process_terminal_activity_hook_event(
         );
         return;
     };
-    if terminal_screen_prompt_hook_payload_should_supersede(
-        payload.terminal_is_prompting_user,
-        payload.prompting_user_source.as_deref(),
-        payload.manual_prompt_source.as_deref(),
-    ) {
-        if let Some(superseded) = terminal_screen_prompt_take_for_instance(pane_id, instance_id) {
-            Box::pin(terminal_screen_prompt_emit_resolved(
-                app,
-                terminals,
-                cloud_mcp_state,
-                pane_id,
-                instance_id,
-                &superseded,
-                None,
-                "superseded_by_hook_prompt",
-            ))
-            .await;
-        }
-    }
     let current_runtime = terminal_runtime_snapshot(instance);
     let current_runtime_is_starting = terminal_runtime_snapshot_is_starting(&current_runtime);
     let current_runtime_is_busy_turn = terminal_runtime_snapshot_is_busy_turn(&current_runtime);
@@ -17831,6 +16169,30 @@ fn spawn_terminal_activity_hook_watcher(
         let state = app.state::<TerminalState>();
         if let Ok(mut tokens) = state.terminal_activity_transport_tokens.lock() {
             tokens.remove(&terminal_output_transport_key(&pane_id, instance_id));
+        };
+        let removed_interaction_ids = state
+            .terminal_structured_interactions
+            .lock()
+            .ok()
+            .map(|mut interactions| {
+                let removed = interactions
+                    .iter()
+                    .filter_map(|(id, interaction)| {
+                        (interaction.pane_id == pane_id
+                            && interaction.instance_id == instance_id)
+                            .then(|| id.clone())
+                    })
+                    .collect::<Vec<_>>();
+                interactions.retain(|_, interaction| {
+                    interaction.pane_id != pane_id || interaction.instance_id != instance_id
+                });
+                removed
+            })
+            .unwrap_or_default();
+        if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
+            for interaction_id in removed_interaction_ids {
+                waiters.remove(&interaction_id);
+            }
         };
     });
 }
@@ -18458,10 +16820,15 @@ async fn handle_terminal_activity_transport_connection(app: AppHandle, mut strea
         Ok(text) => handle_terminal_activity_transport_message(&app, &text).await,
         Err(error) => Err(error),
     };
+    let (ok, error, hook_response) = match result {
+        Ok(hook_response) => (true, None, hook_response),
+        Err(error) => (false, Some(error), None),
+    };
     let ack = TerminalActivityTransportAck {
         r#type: "terminal-activity-ack",
-        ok: result.is_ok(),
-        error: result.err(),
+        ok,
+        error,
+        hook_response,
     };
     let response = serde_json::to_string(&ack).unwrap_or_else(|_| {
         "{\"type\":\"terminal-activity-ack\",\"ok\":false,\"error\":\"Unable to serialize terminal activity acknowledgement.\"}".to_string()
@@ -18509,7 +16876,7 @@ async fn read_terminal_activity_transport_message(
 async fn handle_terminal_activity_transport_message(
     app: &AppHandle,
     text: &str,
-) -> Result<(), String> {
+) -> Result<Option<Value>, String> {
     if text.len() > MAX_TERMINAL_ACTIVITY_TRANSPORT_MESSAGE_BYTES {
         return Err("Terminal activity transport message is too large.".to_string());
     }
@@ -18542,17 +16909,130 @@ async fn handle_terminal_activity_transport_message(
     if envelope.token != expected_token {
         return Err("Terminal activity transport authentication failed.".to_string());
     }
+    let instance = terminal_activity_hook_current_instance(
+        &state.terminals,
+        &pane_id,
+        instance_id,
+    )
+    .await
+    .ok_or_else(|| "Terminal activity event target is not active.".to_string())?;
+    let blocking_payload = terminal_activity_hook_payload(&instance, &envelope.event)
+        .filter(|payload| payload.interaction_response_mode.as_deref() == Some("blocking_hook"));
+    let mut blocking_receiver = None;
+    if let Some(payload) = blocking_payload.as_ref() {
+        let interaction_id = payload
+            .interaction_id
+            .as_deref()
+            .ok_or_else(|| "Blocking provider interaction is missing its identity.".to_string())?;
+        let (sender, receiver) = oneshot::channel::<Value>();
+        state
+            .terminal_structured_interaction_waiters
+            .lock()
+            .map_err(|_| "Unable to register structured terminal interaction response.".to_string())?
+            .insert(interaction_id.to_string(), sender);
+        blocking_receiver = Some((interaction_id.to_string(), receiver));
+    }
     let cloud_mcp_state = app.state::<CloudMcpState>();
-    handle_terminal_activity_hook_event(
+    if let Err(error) = handle_terminal_activity_hook_event(
         app,
         &state.terminals,
         cloud_mcp_state.inner(),
         &pane_id,
         instance_id,
-        envelope.event,
+        envelope.event.clone(),
         "transport",
     )
     .await
+    {
+        if let Some((interaction_id, _)) = blocking_receiver.as_ref() {
+            if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
+                waiters.remove(interaction_id);
+            }
+        }
+        return Err(error);
+    }
+
+    let Some((interaction_id, receiver)) = blocking_receiver else {
+        return Ok(None);
+    };
+
+    let interaction = state
+        .terminal_structured_interactions
+        .lock()
+        .map_err(|_| "Unable to read structured terminal interaction state.".to_string())?
+        .get(&interaction_id)
+        .cloned();
+    let Some(interaction) = interaction else {
+        if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
+            waiters.remove(&interaction_id);
+        }
+        return Err("Blocking provider interaction was not published.".to_string());
+    };
+    log_terminal_status_event(
+        "backend.terminal_structured_interaction.waiting",
+        json!({
+            "interaction_id": interaction.interaction_id,
+            "pane_id": interaction.pane_id,
+            "provider": interaction.provider,
+            "revision": interaction.revision,
+        }),
+    );
+    let response = timeout(
+        Duration::from_secs(TERMINAL_STRUCTURED_INTERACTION_WAIT_SECONDS),
+        receiver,
+    )
+    .await;
+    if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
+        waiters.remove(&interaction.interaction_id);
+    }
+    match response {
+        Ok(Ok(response)) => Ok(Some(response)),
+        Ok(Err(_)) => Err("Structured terminal interaction response channel closed.".to_string()),
+        Err(_) => {
+            if let Ok(mut interactions) = state.terminal_structured_interactions.lock() {
+                interactions.remove(&interaction.interaction_id);
+            }
+            log_terminal_status_event(
+                "backend.terminal_structured_interaction.expired",
+                json!({
+                    "interaction_id": interaction.interaction_id,
+                    "pane_id": interaction.pane_id,
+                    "provider": interaction.provider,
+                    "revision": interaction.revision,
+                }),
+            );
+            let elicitation =
+                terminal_activity_hook_name_key(&interaction.hook_event_name) == "elicitation";
+            let timeout_event = json!({
+                "hook_event_name": if elicitation { "ElicitationResult" } else { "PermissionDenied" },
+                "provider": interaction.provider,
+                "permission_request_id": interaction.provider_request_id,
+                "prompt_id": interaction.prompt_id,
+                "resolved_interaction_id": interaction.interaction_id,
+                "resolved_interaction_revision": interaction.revision,
+                "decision": "timeout",
+                "timestamp_ms": terminal_now_ms(),
+                "resolution_reason": "structured_interaction_timeout",
+            });
+            process_terminal_activity_hook_event(
+                app,
+                &state.terminals,
+                cloud_mcp_state.inner(),
+                &pane_id,
+                instance_id,
+                &instance,
+                &timeout_event,
+                "structured-interaction-timeout",
+            )
+            .await;
+            Ok(Some(terminal_structured_interaction_hook_response(
+                &interaction,
+                if elicitation { "cancel" } else { "deny" },
+                None,
+                Some("Timed out waiting for user input."),
+            )))
+        }
+    }
 }
 
 fn remove_terminal_output_transport_subscriber(
@@ -19804,7 +18284,7 @@ async fn terminal_write(
     app_fork_enabled: Option<bool>,
 ) -> Result<(), String> {
     terminal_write_inner(
-        app,
+        app.clone(),
         state.inner(),
         cloud_mcp_state.inner(),
         pane_id,
@@ -19847,146 +18327,6 @@ fn terminal_opencode_prompt_answer_input(key: &str) -> Option<String> {
         "continue" | "default" | "enter" | "ok" => Some("\r".to_string()),
         _ => None,
     }
-}
-
-fn terminal_screen_prompt_active_by_prompt_id(
-    prompt_id: &str,
-) -> Option<TerminalScreenPromptActive> {
-    let active = terminal_screen_prompt_registry().lock().ok()?;
-    active
-        .values()
-        .find(|entry| entry.prompt_id == prompt_id)
-        .cloned()
-}
-
-fn terminal_screen_prompt_answer_plan_for_option(
-    active: &TerminalScreenPromptActive,
-    option_id: &str,
-    option_label: &str,
-    option_value: Option<&str>,
-) -> Option<TerminalScreenPromptAnswerPlan> {
-    let option_key = terminal_activity_hook_prompt_option_id(option_id);
-    let label_key = terminal_activity_hook_prompt_option_id(option_label);
-    let value_key = option_value
-        .map(terminal_activity_hook_prompt_option_id)
-        .unwrap_or_default();
-    let keys = [
-        option_id.trim().to_string(),
-        option_key,
-        label_key,
-        value_key,
-    ];
-    keys.iter()
-        .map(|key| key.trim())
-        .filter(|key| !key.is_empty())
-        .find_map(|key| active.answer_plans.get(key).cloned())
-}
-
-fn terminal_screen_prompt_answer_input(
-    prompt_id: &str,
-    option_id: &str,
-    option_label: &str,
-    option_value: Option<&str>,
-    answer_text: Option<&str>,
-) -> Result<Option<(String, TerminalScreenPromptActive)>, String> {
-    let Some(active) = terminal_screen_prompt_active_by_prompt_id(prompt_id) else {
-        return Ok(None);
-    };
-    let Some(plan) = terminal_screen_prompt_answer_plan_for_option(
-        &active,
-        option_id,
-        option_label,
-        option_value,
-    ) else {
-        return Err(format!(
-            "Prompt answer option {option_id} is not valid for synthetic prompt {prompt_id}."
-        ));
-    };
-    let input = match plan {
-        TerminalScreenPromptAnswerPlan::Key(key) => format!("{key}\r"),
-        TerminalScreenPromptAnswerPlan::Enter => "\r".to_string(),
-        TerminalScreenPromptAnswerPlan::Escape => "\x1b".to_string(),
-        TerminalScreenPromptAnswerPlan::FreeText => {
-            let text = answer_text
-                .or(option_value)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    format!(
-                        "Prompt answer option {option_id} requires answer_text or option_value."
-                    )
-                })?;
-            format!("{text}\r")
-        }
-    };
-    Ok(Some((input, active)))
-}
-
-fn terminal_screen_prompt_visible_prompt_id(
-    provider: &str,
-    pane_id: &str,
-    raw_tail: &str,
-) -> Option<String> {
-    let candidate = terminal_screen_prompt_detect(provider, raw_tail)?;
-    Some(terminal_screen_prompt_hash_id(
-        &candidate.detector_id,
-        pane_id,
-        &candidate.fingerprint_text,
-    ))
-}
-
-fn terminal_screen_prompt_tail_matches_prompt_id(
-    provider: &str,
-    pane_id: &str,
-    raw_tail: &str,
-    prompt_id: &str,
-) -> bool {
-    terminal_screen_prompt_visible_prompt_id(provider, pane_id, raw_tail).as_deref()
-        == Some(prompt_id)
-}
-
-fn terminal_screen_prompt_prewrite_allows_answer(
-    provider: &str,
-    pane_id: &str,
-    raw_tail: &str,
-    prompt_id: &str,
-) -> bool {
-    terminal_screen_prompt_tail_matches_prompt_id(provider, pane_id, raw_tail, prompt_id)
-}
-
-async fn terminal_screen_prompt_same_prompt_visible(
-    state: &TerminalState,
-    pane_id: &str,
-    instance_id: Option<u64>,
-    prompt_id: &str,
-) -> (bool, String) {
-    let Ok(Some(instance)) = get_terminal_instance_if_current(state, pane_id, instance_id).await
-    else {
-        return (false, String::new());
-    };
-    let (tail, _) = terminal_screen_prompt_headless_snapshot(&instance.headless_output);
-    let cleaned_tail = terminal_screen_prompt_compact_tail(&tail);
-    (
-        terminal_screen_prompt_prewrite_allows_answer(
-            &instance.metadata.agent_kind,
-            pane_id,
-            &tail,
-            prompt_id,
-        ),
-        cleaned_tail,
-    )
-}
-
-fn terminal_screen_prompt_clear_by_prompt_id(
-    prompt_id: &str,
-) -> Option<TerminalScreenPromptActive> {
-    let mut active = terminal_screen_prompt_registry().lock().ok()?;
-    let key = active
-        .iter()
-        .find_map(|(key, entry)| (entry.prompt_id == prompt_id).then(|| key.clone()))?;
-    let removed = active.remove(&key);
-    terminal_screen_prompt_clear_scan(&key);
-    removed
 }
 
 fn terminal_agent_prompt_answer_input(
@@ -20070,6 +18410,113 @@ fn terminal_answer_agent_prompt_target_pane_id(event: &Value) -> Result<String, 
     Ok(pane_id)
 }
 
+fn terminal_structured_interaction_hook_response(
+    interaction: &TerminalStructuredInteraction,
+    option_id: &str,
+    option_value: Option<&str>,
+    answer_text: Option<&str>,
+) -> Value {
+    let option_key = terminal_activity_hook_name_key(option_id);
+    let hook_key = terminal_activity_hook_name_key(&interaction.hook_event_name);
+    if hook_key == "permissionrequest" {
+        let denied = matches!(
+            option_key.as_str(),
+            "deny" | "denied" | "reject" | "rejected" | "cancel"
+        );
+        let mut decision = if denied {
+            json!({
+                "behavior": "deny",
+                "message": answer_text.unwrap_or("Rejected by the user."),
+            })
+        } else {
+            json!({ "behavior": "allow" })
+        };
+        if !denied && option_key == "allowalways" {
+            if let Some(suggestions) = interaction.permission_suggestions.clone() {
+                decision["updatedPermissions"] = suggestions;
+            }
+        }
+        return json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": decision,
+            }
+        });
+    }
+    if hook_key == "elicitation" {
+        let action = if matches!(option_key.as_str(), "deny" | "reject" | "decline") {
+            "decline"
+        } else if option_key == "cancel" {
+            "cancel"
+        } else {
+            "accept"
+        };
+        let content = answer_text
+            .or(option_value)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                serde_json::from_str::<Value>(value)
+                    .unwrap_or_else(|_| json!({ "answer": value }))
+            });
+        let mut output = json!({
+            "hookEventName": "Elicitation",
+            "action": action,
+        });
+        if let Some(content) = content {
+            output["content"] = content;
+        }
+        return json!({ "hookSpecificOutput": output });
+    }
+    json!({})
+}
+
+async fn terminal_structured_interaction_publish_answered(
+    app: &AppHandle,
+    state: &TerminalState,
+    cloud_mcp_state: &CloudMcpState,
+    instance: &TerminalInstance,
+    interaction: &TerminalStructuredInteraction,
+    option_id: &str,
+    source: &str,
+) {
+    let denied = matches!(
+        terminal_activity_hook_name_key(option_id).as_str(),
+        "deny" | "denied" | "reject" | "rejected" | "decline" | "cancel"
+    );
+    let permission_request =
+        terminal_activity_hook_name_key(&interaction.hook_event_name) == "permissionrequest";
+    let event = json!({
+        "hook_event_name": if denied && permission_request {
+            "PermissionDenied"
+        } else if permission_request {
+            "PermissionResult"
+        } else {
+            "ElicitationResult"
+        },
+        "provider": interaction.provider,
+        "permission_request_id": interaction.provider_request_id,
+        "prompt_id": interaction.prompt_id,
+        "resolved_interaction_id": interaction.interaction_id,
+        "resolved_interaction_revision": interaction.revision,
+        "selected_option_id": option_id,
+        "decision": if denied { "denied" } else { "accepted" },
+        "timestamp_ms": terminal_now_ms(),
+        "resolution_reason": "structured_interaction_answered",
+    });
+    process_terminal_activity_hook_event(
+        app,
+        &state.terminals,
+        cloud_mcp_state,
+        &interaction.pane_id,
+        interaction.instance_id,
+        instance,
+        &event,
+        source,
+    )
+    .await;
+}
+
 #[tauri::command(rename_all = "snake_case")]
 async fn terminal_answer_agent_prompt_remote_command(
     app: AppHandle,
@@ -20087,6 +18534,12 @@ async fn terminal_answer_agent_prompt_remote_command(
         .unwrap_or_else(|| option_id.clone());
     let option_value =
         terminal_remote_command_string(&event, &["option_value", "value"]);
+    let requested_interaction_id = terminal_remote_command_string(&event, &["interaction_id"])
+        .ok_or_else(|| "Prompt answer requires a structured interaction id.".to_string())?;
+    let requested_interaction_revision =
+        terminal_remote_command_u64(&event, &["interaction_revision"])
+            .filter(|revision| *revision > 0)
+            .ok_or_else(|| "Prompt answer requires a structured interaction revision.".to_string())?;
     let answer_text = terminal_remote_command_string(
         &event,
         &[
@@ -20105,68 +18558,97 @@ async fn terminal_answer_agent_prompt_remote_command(
     else {
         return Err("Terminal session is not running.".to_string());
     };
-    let synthetic_answer = terminal_screen_prompt_answer_input(
-        &prompt_id,
-        &option_id,
-        &option_label,
-        option_value.as_deref(),
-        answer_text.as_deref(),
-    )?;
-    let (data, synthetic_prompt) = if let Some((data, active)) = synthetic_answer {
-        (data, Some(active))
-    } else {
-        (
-            terminal_agent_prompt_answer_input(
-                &instance.metadata.agent_kind,
-                &option_id,
-                &option_label,
-                option_value.as_deref(),
-            ),
-            None,
-        )
-    };
-    if let Some(active_prompt) = synthetic_prompt.as_ref() {
-        let (same_prompt_visible, _) = terminal_screen_prompt_same_prompt_visible(
+    let interaction = state
+        .terminal_structured_interactions
+        .lock()
+        .map_err(|_| "Structured terminal interaction state is unavailable.".to_string())?
+        .values()
+        .find(|interaction| {
+            interaction.pane_id == pane_id
+                && interaction.instance_id == instance.id
+                && interaction.prompt_id == prompt_id
+        })
+        .cloned()
+        .ok_or_else(|| "This provider interaction is no longer open.".to_string())?;
+    if requested_interaction_id != interaction.interaction_id {
+        return Err("Structured terminal interaction id is stale.".to_string());
+    }
+    if requested_interaction_revision != interaction.revision {
+        return Err("Structured terminal interaction revision is stale.".to_string());
+    }
+    if !interaction.options.is_empty()
+        && !interaction.options.iter().any(|option| option.id == option_id)
+    {
+        return Err("The selected provider interaction option is unavailable.".to_string());
+    }
+
+    if interaction.response_mode == "blocking_hook" {
+        let response = terminal_structured_interaction_hook_response(
+            &interaction,
+            &option_id,
+            option_value.as_deref(),
+            answer_text.as_deref(),
+        );
+        let sender = state
+            .terminal_structured_interaction_waiters
+            .lock()
+            .map_err(|_| "Structured terminal response state is unavailable.".to_string())?
+            .remove(&interaction.interaction_id)
+            .ok_or_else(|| "The provider is no longer waiting for this response.".to_string())?;
+        sender
+            .send(response)
+            .map_err(|_| "The provider stopped waiting before the response was applied.".to_string())?;
+        if let Ok(mut interactions) = state.terminal_structured_interactions.lock() {
+            interactions.remove(&interaction.interaction_id);
+        }
+        terminal_structured_interaction_publish_answered(
+            &app,
             state.inner(),
-            &pane_id,
-            instance_id,
-            &prompt_id,
+            cloud_mcp_state.inner(),
+            &instance,
+            &interaction,
+            &option_id,
+            "blocking-hook-answer",
         )
         .await;
-        if !same_prompt_visible {
-            let resolved = terminal_screen_prompt_clear_by_prompt_id(&prompt_id);
-            if let Some(resolved) = resolved.as_ref() {
-                terminal_screen_prompt_emit_resolved(
-                    &cloud_app,
-                    &state.inner().terminals,
-                    cloud_mcp_state.inner(),
-                    &active_prompt.pane_id,
-                    active_prompt.instance_id,
-                    resolved,
-                    None,
-                    "prompt_no_longer_visible",
-                )
-                .await;
-            }
-            let runtime = terminal_runtime_snapshot(&instance);
-            return Ok(json!({
-                "prompt_id": prompt_id,
+        log_terminal_status_event(
+            "backend.terminal_structured_interaction.answered",
+            json!({
+                "interaction_id": interaction.interaction_id,
                 "option_id": option_id,
-                "option_value": option_value.clone().unwrap_or_default(),
                 "pane_id": pane_id,
-                "terminal_instance_id": instance_id,
-                "turn_id": runtime.turn_id.unwrap_or_default(),
-                "provider_turn_id": runtime.provider_turn_id.unwrap_or_default(),
-                "provider_session_id": runtime.provider_session_id.unwrap_or_default(),
-                "native_session_id": runtime.native_session_id.unwrap_or_default(),
-                "status": "failed",
-                "message": "prompt no longer visible",
-                "answered": false,
-            }));
-        }
+                "provider": interaction.provider,
+                "response_mode": interaction.response_mode,
+                "revision": interaction.revision,
+            }),
+        );
+        let runtime = terminal_runtime_snapshot(&instance);
+        return Ok(json!({
+            "interaction_id": interaction.interaction_id,
+            "interaction_revision": interaction.revision,
+            "prompt_id": prompt_id,
+            "option_id": option_id,
+            "option_value": option_value.unwrap_or_default(),
+            "pane_id": pane_id,
+            "terminal_instance_id": instance.id,
+            "turn_id": runtime.turn_id.unwrap_or_default(),
+            "provider_turn_id": runtime.provider_turn_id.unwrap_or_default(),
+            "provider_session_id": runtime.provider_session_id.unwrap_or_default(),
+            "native_session_id": runtime.native_session_id.unwrap_or_default(),
+            "status": "applied",
+            "message": "",
+            "answered": true,
+        }));
     }
+
+    let data = terminal_agent_prompt_answer_input(
+        &instance.metadata.agent_kind,
+        &option_id,
+        &option_label,
+        option_value.as_deref().or(answer_text.as_deref()),
+    );
     terminal_write_inner(
-        app,
+        app.clone(),
         state.inner(),
         cloud_mcp_state.inner(),
         pane_id.clone(),
@@ -20187,46 +18669,30 @@ async fn terminal_answer_agent_prompt_remote_command(
         true,
     )
     .await?;
-    let mut answer_status = "applied".to_string();
-    let mut answer_message = String::new();
-    if let Some(active_prompt) = synthetic_prompt.as_ref() {
-        let verify_started = terminal_now_ms();
-        let mut same_prompt_visible = true;
-        let mut latest_tail = String::new();
-        while terminal_now_ms().saturating_sub(verify_started)
-            < TERMINAL_SCREEN_PROMPT_ANSWER_VERIFY_MS
-        {
-            sleep(Duration::from_millis(250)).await;
-            let (same, tail) = terminal_screen_prompt_same_prompt_visible(
-                state.inner(),
-                &pane_id,
-                instance_id,
-                &prompt_id,
-            )
-            .await;
-            latest_tail = tail;
-            same_prompt_visible = same;
-            if !same_prompt_visible {
-                break;
-            }
-        }
-        if same_prompt_visible {
-            answer_status = "failed".to_string();
-            answer_message = format!("answer did not dismiss the prompt: {}", latest_tail);
-        } else if let Some(resolved) = terminal_screen_prompt_clear_by_prompt_id(&prompt_id) {
-            terminal_screen_prompt_emit_resolved(
-                &cloud_app,
-                &state.inner().terminals,
-                cloud_mcp_state.inner(),
-                &active_prompt.pane_id,
-                active_prompt.instance_id,
-                &resolved,
-                Some(&option_id),
-                "answer_applied",
-            )
-            .await;
-        }
+    if let Ok(mut interactions) = state.terminal_structured_interactions.lock() {
+        interactions.remove(&interaction.interaction_id);
     }
+    terminal_structured_interaction_publish_answered(
+        &app,
+        state.inner(),
+        cloud_mcp_state.inner(),
+        &instance,
+        &interaction,
+        &option_id,
+        "structured-pty-answer",
+    )
+    .await;
+    log_terminal_status_event(
+        "backend.terminal_structured_interaction.answered",
+        json!({
+            "interaction_id": interaction.interaction_id,
+            "option_id": option_id,
+            "pane_id": pane_id,
+            "provider": interaction.provider,
+            "response_mode": interaction.response_mode,
+            "revision": interaction.revision,
+        }),
+    );
     let runtime = match get_terminal_instance_if_current(state.inner(), &pane_id, instance_id).await
     {
         Ok(Some(instance)) => Some(terminal_runtime_snapshot(&instance)),
@@ -20254,8 +18720,10 @@ async fn terminal_answer_agent_prompt_remote_command(
             .as_ref()
             .and_then(|snapshot| snapshot.native_session_id.clone())
             .unwrap_or_default(),
-        "status": answer_status,
-        "message": answer_message,
+        "interaction_id": interaction.interaction_id,
+        "interaction_revision": interaction.revision,
+        "status": "applied",
+        "message": "",
         "answered": true,
     }))
 }
@@ -23707,6 +22175,11 @@ mod terminal_tests {
             prompt_options: Vec::new(),
             allows_free_text: false,
             prompt_answer_option: None,
+            interaction_id: None,
+            interaction_revision: None,
+            interaction_source: None,
+            interaction_response_mode: None,
+            provider_request_id: None,
             manual_prompt_source: None,
             manual_approval_required: false,
             provider_blocked_for_user: false,
@@ -23899,593 +22372,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn screen_prompt_detector_matches_codex_hooks_review_menu() {
-        let tail = "\
-Hooks need review
-
-1. Review hooks
-2. Trust all and continue
-3. Continue without trusting
-
-Press enter to confirm
-";
-        let prompt = terminal_screen_prompt_detect("codex", tail).expect("detected prompt");
-
-        assert_eq!(prompt.detector_id, "codex_hooks_need_review");
-        assert_eq!(prompt.prompt_kind, "approval");
-        assert_eq!(prompt.options.len(), 3);
-        assert_eq!(prompt.options[0].option.value.as_deref(), Some("1"));
-        assert_eq!(prompt.options[1].option.label, "Trust all and continue");
-        assert_eq!(prompt.options[1].option.danger, Some(true));
-        assert_eq!(prompt.default_option.as_deref(), Some("3"));
-        assert!(prompt.manual_approval_required);
-    }
-
-    #[test]
-    fn screen_prompt_detector_matches_current_claude_workspace_trust_prompt() {
-        let tail = "\
-Is this a project you trust?
-
-Accessing workspace: /Users/dev/project
-
-1. Yes, proceed
-2. No, exit
-
-Enter to confirm · Esc to cancel
-";
-        let prompt = terminal_screen_prompt_detect("claude", tail).expect("detected prompt");
-
-        assert_eq!(prompt.detector_id, "claude_workspace_trust");
-        assert_eq!(prompt.prompt_kind, "approval");
-        assert_eq!(prompt.options.len(), 2);
-        assert_eq!(prompt.options[0].option.label, "Yes, proceed");
-        assert_eq!(prompt.options[0].option.danger, Some(true));
-        assert_eq!(prompt.options[1].option.label, "No, exit");
-        assert_eq!(prompt.options[1].option.danger, None);
-        assert_eq!(prompt.default_option.as_deref(), Some("2"));
-        assert!(prompt.manual_approval_required);
-        assert!(!prompt.allows_free_text);
-    }
-
-    #[test]
-    fn screen_prompt_runtime_gate_allows_startup_and_coordination_pauses() {
-        let tail = "\
-Hooks need review
-
-1. Review hooks
-2. Trust all and continue
-3. Continue without trusting
-
-Press enter to confirm
-";
-        let candidate = terminal_screen_prompt_detect("codex", tail).expect("detected prompt");
-        let mut runtime = TerminalRuntimeSnapshot::opened_starting(None, "terminal-open");
-
-        assert!(terminal_screen_prompt_runtime_allows_candidate(
-            &runtime, &candidate
-        ));
-
-        runtime.status = "active".to_string();
-        runtime.activity_status = "paused".to_string();
-        runtime.command_phase = "parked".to_string();
-        runtime.source = "terminal-parked-lifecycle".to_string();
-        runtime.event_type = "task_parked_for_resource_queue".to_string();
-        runtime.hook_event_name = "task_parked_for_resource_queue".to_string();
-        assert!(terminal_screen_prompt_runtime_allows_candidate(
-            &runtime, &candidate
-        ));
-
-        runtime.command_phase = "awaiting_input".to_string();
-        runtime.source = "cli-hook:manual-prompt".to_string();
-        runtime.event_type = "provider-user-prompt-started".to_string();
-        runtime.hook_event_name = "UserInputRequired".to_string();
-        assert!(!terminal_screen_prompt_runtime_allows_candidate(
-            &runtime, &candidate
-        ));
-
-        runtime.source = "terminal-parked-lifecycle".to_string();
-        runtime.event_type = "task_parked_for_resource_queue".to_string();
-        runtime.hook_event_name = "coordination_heartbeat".to_string();
-        assert!(
-            terminal_screen_prompt_runtime_has_hook_prompt(&runtime),
-            "rolling event_type must not reopen the detector over a live hook prompt"
-        );
-        assert!(!terminal_screen_prompt_runtime_allows_candidate(
-            &runtime, &candidate
-        ));
-
-        runtime.command_phase = "awaiting_permission".to_string();
-        assert!(!terminal_screen_prompt_runtime_allows_candidate(
-            &runtime, &candidate
-        ));
-
-        runtime.activity_status = "paused".to_string();
-        runtime.command_phase = "parked".to_string();
-        assert!(terminal_screen_prompt_runtime_allows_candidate(
-            &runtime, &candidate
-        ));
-    }
-
-    #[test]
-    fn screen_prompt_detector_rejects_quoted_menu_mid_transcript() {
-        let quoted_tail = "\
-Assistant:
-> Hooks need review
-> 1. Review hooks
-> 2. Trust all and continue
-> 3. Continue without trusting
-> Press enter to confirm
-";
-        assert!(terminal_screen_prompt_detect("codex", quoted_tail).is_none());
-
-        let boxed_quoted_tail = "\
-│ > Hooks need review
-│ > 1. Review hooks
-│ > 2. Trust all and continue
-│ > 3. Continue without trusting
-│ > Press enter to confirm
-";
-        assert!(terminal_screen_prompt_detect("codex", boxed_quoted_tail).is_none());
-
-        let mid_transcript_tail = "\
-Assistant response:
-Hooks need review
-1. Review hooks
-2. Trust all and continue
-3. Continue without trusting
-Press enter to confirm
-
-That is what the menu looks like when it appears.
-";
-        assert!(terminal_screen_prompt_detect("codex", mid_transcript_tail).is_none());
-    }
-
-    #[test]
-    fn screen_prompt_id_uses_detector_relevant_lines_only() {
-        let menu = "\
-Hooks need review
-1. Review hooks
-2. Trust all and continue
-3. Continue without trusting
-Press enter to confirm
-";
-        let tail_with_footer_a = format!("Earlier transcript line\n{menu}\nCtrl+C to cancel\n");
-        let tail_with_footer_b = format!("Different repaint noise\n{menu}\nEsc to interrupt\n");
-        let first =
-            terminal_screen_prompt_detect("codex", &tail_with_footer_a).expect("first prompt");
-        let second =
-            terminal_screen_prompt_detect("codex", &tail_with_footer_b).expect("second prompt");
-        let first_id = terminal_screen_prompt_hash_id(
-            &first.detector_id,
-            "pane-stable",
-            &first.fingerprint_text,
-        );
-        let second_id = terminal_screen_prompt_hash_id(
-            &second.detector_id,
-            "pane-stable",
-            &second.fingerprint_text,
-        );
-        assert_eq!(first_id, second_id);
-
-        let changed_menu = "\
-Hooks need review
-1. Inspect hooks
-2. Trust all and continue
-3. Continue without trusting
-Press enter to confirm
-";
-        let changed = terminal_screen_prompt_detect("codex", changed_menu).expect("changed prompt");
-        let changed_id = terminal_screen_prompt_hash_id(
-            &changed.detector_id,
-            "pane-stable",
-            &changed.fingerprint_text,
-        );
-        assert_ne!(first_id, changed_id);
-    }
-
-    #[test]
-    fn screen_prompt_detector_generic_numbered_menu_requires_confirm_hint() {
-        let no_hint = "\
-Choose one
-1. Alpha
-2. Beta
-";
-        assert!(terminal_screen_prompt_detect("codex", no_hint).is_none());
-
-        let with_hint = "\
-Choose one
-1. Alpha
-2. Beta
-Esc to go back
-";
-        let prompt = terminal_screen_prompt_detect("codex", with_hint).expect("generic prompt");
-        assert_eq!(prompt.detector_id, "codex_generic_numbered_menu");
-        assert_eq!(prompt.options.len(), 2);
-        assert_eq!(prompt.default_option.as_deref(), Some("1"));
-    }
-
-    #[test]
-    fn screen_prompt_answer_plan_uses_current_digit_menu_value() {
-        let tail = "\
-Hooks need review
-1. Review hooks
-2. Trust all and continue
-3. Continue without trusting
-Press enter to confirm
-";
-        let candidate = terminal_screen_prompt_detect("codex", tail).expect("detected prompt");
-        let prompt_id = terminal_screen_prompt_hash_id(
-            &candidate.detector_id,
-            "pane-answer",
-            &candidate.fingerprint_text,
-        );
-        let active = terminal_screen_prompt_active_from_candidate(
-            "pane-answer",
-            7,
-            prompt_id.clone(),
-            candidate,
-            1,
-        );
-        let key = terminal_screen_prompt_active_key("pane-answer", 7);
-        terminal_screen_prompt_registry()
-            .lock()
-            .expect("registry")
-            .insert(key.clone(), active);
-
-        let (input, resolved) = terminal_screen_prompt_answer_input(
-            &prompt_id,
-            "2",
-            "Trust all and continue",
-            Some("2"),
-            None,
-        )
-        .expect("answer input")
-        .expect("synthetic prompt");
-        assert_eq!(input, "2\r");
-        assert_eq!(resolved.prompt_id, prompt_id);
-
-        terminal_screen_prompt_registry()
-            .lock()
-            .expect("registry")
-            .remove(&key);
-        terminal_screen_prompt_clear_scan(&key);
-    }
-
-    #[test]
-    fn screen_prompt_answer_plan_accepts_stable_orchestrator_terminal_id() {
-        let pane_id = "forge-app-control-agent-terminal-1";
-        let tail = "\
-Is this a project you trust?
-Accessing workspace: /Users/dev/project
-1. Yes, proceed
-2. No, exit
-Enter to confirm · Esc to cancel
-";
-        let candidate = terminal_screen_prompt_detect("claude", tail).expect("detected prompt");
-        let prompt_id = terminal_screen_prompt_hash_id(
-            &candidate.detector_id,
-            pane_id,
-            &candidate.fingerprint_text,
-        );
-        let active =
-            terminal_screen_prompt_active_from_candidate(pane_id, 7, prompt_id.clone(), candidate, 1);
-        let key = terminal_screen_prompt_active_key(pane_id, 7);
-        terminal_screen_prompt_registry()
-            .lock()
-            .expect("registry")
-            .insert(key.clone(), active);
-
-        let (input, resolved) = terminal_screen_prompt_answer_input(
-            &prompt_id,
-            "2",
-            "No, exit",
-            Some("2"),
-            None,
-        )
-        .expect("answer input")
-        .expect("synthetic prompt");
-        assert_eq!(input, "2\r");
-        assert_eq!(resolved.pane_id, pane_id);
-        assert_eq!(resolved.prompt_id, prompt_id);
-
-        terminal_screen_prompt_registry()
-            .lock()
-            .expect("registry")
-            .remove(&key);
-        terminal_screen_prompt_clear_scan(&key);
-    }
-
-    #[test]
-    fn prompt_answer_handler_accepts_stable_orchestrator_terminal_id() {
-        let event = json!({
-            "terminal_id": "forge-app-control-agent-terminal-1",
-            "prompt_id": "screen-claude_workspace_trust-123",
-            "option_id": "2"
-        });
-
-        assert_eq!(
-            terminal_answer_agent_prompt_target_pane_id(&event).expect("target pane id"),
-            "forge-app-control-agent-terminal-1"
-        );
-    }
-
-    #[test]
-    fn screen_prompt_answer_preflight_rejects_prompt_that_is_not_visible() {
-        let visible_tail = "\
-Hooks need review
-1. Review hooks
-2. Trust all and continue
-3. Continue without trusting
-Press enter to confirm
-";
-        let prompt_id =
-            terminal_screen_prompt_visible_prompt_id("codex", "pane-preflight", visible_tail)
-                .expect("visible prompt id");
-        assert!(terminal_screen_prompt_tail_matches_prompt_id(
-            "codex",
-            "pane-preflight",
-            visible_tail,
-            &prompt_id,
-        ));
-        assert!(terminal_screen_prompt_prewrite_allows_answer(
-            "codex",
-            "pane-preflight",
-            visible_tail,
-            &prompt_id,
-        ));
-
-        let stale_tail = "\
-Hooks need review
-1. Review hooks
-2. Trust all and continue
-3. Continue without trusting
-Press enter to confirm
-
-Done. Ready for the next command.
-";
-        assert!(!terminal_screen_prompt_tail_matches_prompt_id(
-            "codex",
-            "pane-preflight",
-            stale_tail,
-            &prompt_id,
-        ));
-        assert!(!terminal_screen_prompt_prewrite_allows_answer(
-            "codex",
-            "pane-preflight",
-            stale_tail,
-            &prompt_id,
-        ));
-    }
-
-    #[test]
-    fn screen_prompt_resolved_hook_derives_idle_without_forcing_busy() {
-        let idle = json!({
-            "hook_event_name": "ScreenPromptResolved",
-            "activity_status": "idle",
-            "input_ready": true,
-        });
-        let resolved_idle =
-            terminal_activity_hook_activity_kind("ScreenPromptResolved", &idle).expect("idle");
-        assert_eq!(resolved_idle.0, "provider-user-prompt-completed");
-        assert_eq!(resolved_idle.1, "idle");
-        assert_eq!(resolved_idle.3, "completed");
-        assert!(resolved_idle.4);
-
-        let running = json!({
-            "hook_event_name": "ScreenPromptResolved",
-            "activity_status": "thinking",
-            "input_ready": false,
-        });
-        let resolved_running =
-            terminal_activity_hook_activity_kind("ScreenPromptResolved", &running)
-                .expect("running");
-        assert_eq!(resolved_running.0, "provider-user-prompt-answered");
-        assert_eq!(resolved_running.1, "thinking");
-        assert_eq!(resolved_running.3, "running");
-        assert!(!resolved_running.4);
-    }
-
-    #[test]
-    fn detected_prompt_supersession_resolves_old_prompt_before_starting_replacement() {
-        let first_candidate = terminal_screen_prompt_detect(
-            "codex",
-            "Hooks need review\n1. Review hooks\n2. Trust all and continue\n3. Continue without trusting\nPress enter to confirm\n",
-        )
-        .expect("first prompt");
-        let second_candidate = terminal_screen_prompt_detect(
-            "codex",
-            "Do you trust the contents of this folder?\n1. Trust folder\n2. Do not trust\nPress enter to confirm\n",
-        )
-        .expect("replacement prompt");
-        let first = terminal_screen_prompt_active_from_candidate(
-            "pane-supersession-order",
-            11,
-            "prompt-old".to_string(),
-            first_candidate,
-            1,
-        );
-        let replacement = terminal_screen_prompt_active_from_candidate(
-            "pane-supersession-order",
-            11,
-            "prompt-new".to_string(),
-            second_candidate,
-            2,
-        );
-
-        let emissions = terminal_screen_prompt_supersession_emissions(first, replacement);
-        assert_eq!(emissions.len(), 2);
-        match &emissions[0] {
-            TerminalScreenPromptEmission::Resolved(active, reason) => {
-                assert_eq!(active.prompt_id, "prompt-old");
-                assert_eq!(*reason, "superseded");
-            }
-            TerminalScreenPromptEmission::Started(_) => panic!("old prompt must resolve first"),
-        }
-        match &emissions[1] {
-            TerminalScreenPromptEmission::Started(active) => {
-                assert_eq!(active.prompt_id, "prompt-new");
-            }
-            TerminalScreenPromptEmission::Resolved(_, _) => {
-                panic!("replacement prompt must start second")
-            }
-        }
-    }
-
-    #[test]
-    fn hook_prompt_supersedes_active_screen_prompt_registry_entry() {
-        assert!(terminal_screen_prompt_hook_payload_should_supersede(
-            true,
-            Some("cli-hook:manual-prompt"),
-            Some("hook"),
-        ));
-        assert!(!terminal_screen_prompt_hook_payload_should_supersede(
-            true,
-            Some("screen_detector"),
-            Some("screen_detector"),
-        ));
-        assert!(!terminal_screen_prompt_hook_payload_should_supersede(
-            false,
-            Some("cli-hook:manual-prompt"),
-            Some("hook"),
-        ));
-
-        let tail = "\
-Hooks need review
-1. Review hooks
-2. Trust all and continue
-3. Continue without trusting
-Press enter to confirm
-";
-        let candidate = terminal_screen_prompt_detect("codex", tail).expect("detected prompt");
-        let prompt_id = terminal_screen_prompt_hash_id(
-            &candidate.detector_id,
-            "pane-superseded",
-            &candidate.fingerprint_text,
-        );
-        let active = terminal_screen_prompt_active_from_candidate(
-            "pane-superseded",
-            9,
-            prompt_id.clone(),
-            candidate,
-            1,
-        );
-        let key = terminal_screen_prompt_active_key("pane-superseded", 9);
-        terminal_screen_prompt_registry()
-            .lock()
-            .expect("registry")
-            .insert(key.clone(), active);
-
-        let removed = terminal_screen_prompt_take_for_instance("pane-superseded", 9)
-            .expect("superseded prompt");
-        assert_eq!(removed.prompt_id, prompt_id);
-        assert!(terminal_screen_prompt_active_by_prompt_id(&prompt_id).is_none());
-        terminal_screen_prompt_clear_scan(&key);
-    }
-
-    #[test]
-    fn idle_lifecycle_retracts_registered_screen_prompt_and_emits_explicit_clear() {
-        let pane_id = "pane-screen-prompt-idle-retract";
-        let instance_id = 41;
-        let tail = "Hooks need review\n1. Trust all and continue\n2. Continue without trusting\nPress enter to confirm";
-        let candidate = terminal_screen_prompt_detect("codex", tail).expect("detected prompt");
-        let prompt_id = terminal_screen_prompt_hash_id(
-            &candidate.detector_id,
-            pane_id,
-            &candidate.fingerprint_text,
-        );
-        let active = terminal_screen_prompt_active_from_candidate(
-            pane_id,
-            instance_id,
-            prompt_id.clone(),
-            candidate,
-            1,
-        );
-        let key = terminal_screen_prompt_active_key(pane_id, instance_id);
-        terminal_screen_prompt_registry()
-            .lock()
-            .unwrap()
-            .insert(key.clone(), active);
-
-        let mut payload = terminal_activity_hook_test_payload(
-            "provider-turn-completed",
-            "idle",
-            "completed",
-            true,
-            Some("session-main"),
-        );
-        payload.pane_id = pane_id.to_string();
-        payload.instance_id = instance_id;
-        payload.prompt_id = Some(prompt_id);
-        payload.prompt_options.push(TerminalActivityHookPromptOption {
-            id: "stale".to_string(),
-            label: "Stale".to_string(),
-            description: None,
-            value: None,
-            danger: None,
-        });
-
-        terminal_activity_hook_reconcile_prompt_state(&mut payload);
-
-        assert!(!payload.terminal_is_prompting_user);
-        assert_eq!(payload.prompt_id.as_deref(), Some(""));
-        assert!(payload.prompt_options.is_empty());
-        assert!(!terminal_screen_prompt_registry()
-            .lock()
-            .unwrap()
-            .contains_key(&key));
-        terminal_screen_prompt_clear_scan(&key);
-    }
-
-    #[test]
-    fn screen_registry_prompt_is_unioned_into_hook_live_state() {
-        let pane_id = "pane-screen-prompt-union";
-        let instance_id = 42;
-        let tail = "Hooks need review\n1. Trust all and continue\n2. Continue without trusting\nPress enter to confirm";
-        let candidate = terminal_screen_prompt_detect("codex", tail).expect("detected prompt");
-        let prompt_id = terminal_screen_prompt_hash_id(
-            &candidate.detector_id,
-            pane_id,
-            &candidate.fingerprint_text,
-        );
-        let active = terminal_screen_prompt_active_from_candidate(
-            pane_id,
-            instance_id,
-            prompt_id.clone(),
-            candidate,
-            1,
-        );
-        let key = terminal_screen_prompt_active_key(pane_id, instance_id);
-        terminal_screen_prompt_registry()
-            .lock()
-            .unwrap()
-            .insert(key.clone(), active);
-
-        let mut payload = terminal_activity_hook_test_payload(
-            "provider-user-prompt-started",
-            "paused",
-            "awaiting_input",
-            false,
-            Some("session-main"),
-        );
-        payload.pane_id = pane_id.to_string();
-        payload.instance_id = instance_id;
-        payload.execution_phase = "needs_input".to_string();
-        payload.native_rail_state = "paused".to_string();
-        payload.terminal_status = "paused".to_string();
-        payload.terminal_work_state = "paused".to_string();
-        payload.turn_status = "pending".to_string();
-
-        terminal_activity_hook_reconcile_prompt_state(&mut payload);
-
-        assert!(payload.terminal_is_prompting_user);
-        assert_eq!(payload.prompt_id.as_deref(), Some(prompt_id.as_str()));
-        assert!(!payload.prompt_options.is_empty());
-        assert_eq!(payload.prompting_user_source.as_deref(), Some("screen_detector"));
-        terminal_screen_prompt_clear_scan(&key);
-    }
-
-    #[test]
-    fn synthetic_prompt_runtime_is_guarded_from_stale_hot_watchdog() {
+    fn structured_prompt_runtime_is_guarded_from_stale_hot_watchdog() {
         let runtime = TerminalRuntimeSnapshot {
             status: "active".to_string(),
             activity_status: "awaiting_input".to_string(),
@@ -24499,7 +22386,7 @@ Press enter to confirm
             fork_from_provider_session_id: None,
             provider_turn_id: Some("turn-1".to_string()),
             turn_id: Some("turn-1".to_string()),
-            source: "screen_detector:manual-prompt".to_string(),
+            source: "cli-hook:manual-prompt".to_string(),
             event_type: "provider-user-prompt-started".to_string(),
             hook_event_name: "UserInputRequired".to_string(),
             updated_at_ms: 1,
@@ -25053,6 +22940,65 @@ Press enter to confirm
         assert_eq!(prompt.default_option.as_deref(), Some("reject"));
         assert!(prompt.options.iter().any(|option| option.id == "reject"));
         assert!(!prompt.options.iter().any(|option| option.id == "deny"));
+    }
+
+    #[test]
+    fn claude_permission_request_is_a_structured_provider_prompt() {
+        let prompt = terminal_activity_hook_manual_prompt(
+            "PermissionRequest",
+            &json!({
+                "hook_event_name": "PermissionRequest",
+                "permission_request_id": "permission-structured-1",
+                "permission_suggestions": [{ "type": "addRules", "rules": ["Bash(git status)"] }],
+            }),
+        )
+        .expect("structured Claude permission prompt");
+
+        assert_eq!(
+            prompt.permission_request_id.as_deref(),
+            Some("permission-structured-1")
+        );
+        assert_eq!(
+            prompt.options.iter().map(|option| option.id.as_str()).collect::<Vec<_>>(),
+            vec!["allow_once", "allow_always", "reject"]
+        );
+    }
+
+    #[test]
+    fn structured_claude_permission_response_preserves_always_suggestions() {
+        let interaction = TerminalStructuredInteraction {
+            interaction_id: "uir:permission-1".to_string(),
+            revision: 7,
+            pane_id: "pane-1".to_string(),
+            instance_id: 1,
+            provider: "claude".to_string(),
+            provider_request_id: "permission-1".to_string(),
+            prompt_id: "permission-1".to_string(),
+            hook_event_name: "PermissionRequest".to_string(),
+            response_mode: "blocking_hook".to_string(),
+            options: Vec::new(),
+            permission_suggestions: Some(json!([
+                { "type": "addRules", "rules": ["Bash(git status)"] }
+            ])),
+        };
+        let response = terminal_structured_interaction_hook_response(
+            &interaction,
+            "allow_always",
+            None,
+            None,
+        );
+
+        assert_eq!(
+            response.pointer("/hookSpecificOutput/hookEventName"),
+            Some(&json!("PermissionRequest"))
+        );
+        assert_eq!(
+            response.pointer("/hookSpecificOutput/decision/behavior"),
+            Some(&json!("allow"))
+        );
+        assert!(response
+            .pointer("/hookSpecificOutput/decision/updatedPermissions")
+            .is_some());
     }
 
     #[test]

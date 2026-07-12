@@ -19938,6 +19938,26 @@ async fn cloud_mcp_send_remote_command_status_event(
             "workspace_id": cloud_mcp_remote_command_field_text(event, &["workspace_id"]),
         }),
     );
+    let direct_state = state.clone();
+    let direct_payload = payload.clone();
+    let direct_status_kind = status_kind.to_string();
+    tauri::async_runtime::spawn(async move {
+        let result = cloud_mcp_send_event_over_app_ws_once(
+            &direct_state,
+            &direct_status_kind,
+            &direct_payload,
+            "remote-command-status-live",
+        )
+        .await;
+        log_cloud_sync_event(
+            "remote_command.status_live_sent",
+            json!({
+                "event_kind": direct_status_kind,
+                "ok": result.is_ok(),
+                "error": result.err().map(|error| clean_terminal_telemetry_text(&error)),
+            }),
+        );
+    });
     cloud_mcp_enqueue_background_sync(
         state,
         format!("remote-command-status:{command_id}:{status}:{now}"),
@@ -38190,6 +38210,50 @@ fn cloud_mcp_agent_chat_hook_workspace_root(
         .unwrap_or_default()
 }
 
+fn cloud_mcp_provider_command_catalog(provider: &str) -> Value {
+    let provider = provider.trim().to_ascii_lowercase();
+    let commands: &[(&str, &str, &str)] = if provider.contains("claude") {
+        &[
+            ("/model", "Change the model", "model"),
+            ("/permissions", "Review permission mode", "passthrough"),
+            ("/compact", "Compact conversation context", "passthrough"),
+            ("/clear", "Start a fresh conversation", "passthrough"),
+            ("/context", "Inspect context usage", "passthrough"),
+            ("/cost", "Show token cost", "passthrough"),
+            ("/hooks", "Review configured hooks", "passthrough"),
+            ("/mcp", "Review MCP servers", "passthrough"),
+            ("/status", "Show provider status", "passthrough"),
+        ]
+    } else if provider.contains("opencode") {
+        &[
+            ("/models", "Change the model", "passthrough"),
+            ("/new", "Start a fresh conversation", "passthrough"),
+            ("/sessions", "Browse sessions", "passthrough"),
+            ("/compact", "Compact conversation context", "passthrough"),
+            ("/share", "Share this session", "passthrough"),
+            ("/unshare", "Stop sharing this session", "passthrough"),
+            ("/help", "Show provider help", "passthrough"),
+        ]
+    } else {
+        &[
+            ("/model", "Change the model", "model"),
+            ("/permissions", "Review permission mode", "passthrough"),
+            ("/compact", "Compact conversation context", "passthrough"),
+            ("/review", "Review current changes", "passthrough"),
+            ("/status", "Show provider status", "passthrough"),
+            ("/new", "Start a fresh conversation", "passthrough"),
+            ("/resume", "Resume a saved session", "passthrough"),
+            ("/mcp", "Review MCP servers", "passthrough"),
+        ]
+    };
+    Value::Array(
+        commands
+            .iter()
+            .map(|(id, hint, kind)| json!({ "id": id, "hint": hint, "kind": kind }))
+            .collect(),
+    )
+}
+
 pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
     state: &CloudMcpState,
     payload: &TerminalActivityHookPayload,
@@ -38322,6 +38386,9 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         "agent_type": payload.agent_type.as_str(),
         "agent_display_name": payload.agent_display_name.as_str(),
         "provider": payload.provider,
+        "command_catalog": cloud_mcp_provider_command_catalog(&payload.provider),
+        "command_catalog_source": "provider_adapter",
+        "command_catalog_revision": 1,
         "event_type": payload.event_type,
         "hook_event_name": payload.hook_event_name,
         "state": state_value,
@@ -38343,6 +38410,11 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         "observed_at_ms": payload.observed_at_ms,
         "hook_timestamp_ms": payload.hook_timestamp_ms,
         "prompt_id": prompt_id,
+        "interaction_id": payload.interaction_id.clone(),
+        "interaction_revision": payload.interaction_revision,
+        "interaction_source": payload.interaction_source.clone(),
+        "interaction_response_mode": payload.interaction_response_mode.clone(),
+        "provider_request_id": payload.provider_request_id.clone(),
         "prompt_kind": payload.prompt_kind.clone(),
         "prompt_default_option": payload.prompt_default_option.clone(),
         "prompt_ttl_ms": payload.prompt_ttl_ms,
@@ -57795,6 +57867,11 @@ mod cloud_mcp_tests {
             prompt_options: Vec::new(),
             allows_free_text: false,
             prompt_answer_option: None,
+            interaction_id: None,
+            interaction_revision: None,
+            interaction_source: None,
+            interaction_response_mode: None,
+            provider_request_id: None,
             manual_prompt_source: None,
             manual_approval_required: false,
             provider_blocked_for_user: false,
@@ -58033,11 +58110,14 @@ mod cloud_mcp_tests {
         .is_none());
 
         let mut payload = agent_chat_status_hook_test_payload("provider-user-prompt-started");
-        payload.source = "screen_detector:manual-prompt".to_string();
+        payload.source = "cli-hook:manual-prompt".to_string();
         payload.activity_status = "awaiting_input".to_string();
         payload.command_phase = "awaiting_input".to_string();
         payload.terminal_is_prompting_user = true;
-        payload.prompt_id = Some("screen-codex_hooks_need_review-abc".to_string());
+        payload.prompt_id = Some("permission-request-abc".to_string());
+        payload.interaction_id = Some("uir:permission-request-abc".to_string());
+        payload.interaction_revision = Some(7);
+        payload.interaction_source = Some("provider_hook".to_string());
         payload.prompt_kind = Some("approval".to_string());
         payload.prompt_options = vec![TerminalActivityHookPromptOption {
             id: "trust_all_and_continue".to_string(),
