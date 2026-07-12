@@ -1843,7 +1843,9 @@ function TerminalAccountStaleChip({ pane_id: paneId, agent_kind: agentKind }) {
   useEffect(() => {
     const kind = String(agentKind || "").toLowerCase().includes("claude")
       ? "claude"
-      : String(agentKind || "").toLowerCase().includes("codex") ? "codex" : "";
+      : String(agentKind || "").toLowerCase().includes("codex")
+        ? "codex"
+        : String(agentKind || "").toLowerCase().includes("opencode") ? "opencode" : "";
     const safePaneId = String(paneId || "").trim();
     if (!kind || !safePaneId) {
       setStatus(null);
@@ -1873,7 +1875,11 @@ function TerminalAccountStaleChip({ pane_id: paneId, agent_kind: agentKind }) {
           });
           return;
         }
-        if (String(stamp.profile_id || "") !== String(active.profile_id)) {
+        const profileChanged = String(stamp.profile_id || "") !== String(active.profile_id);
+        const authChanged = !profileChanged
+          && Boolean(active.auth_revision)
+          && String(stamp.auth_revision || "") !== String(active.auth_revision);
+        if (profileChanged || authChanged) {
           setStatus({ mode: "stale", label: String(active.profile_label || "new account") });
         } else {
           setStatus(null);

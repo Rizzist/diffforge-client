@@ -685,6 +685,9 @@ struct TerminalStructuredInteraction {
     response_mode: String,
     options: Vec<TerminalActivityHookPromptOption>,
     permission_suggestions: Option<Value>,
+    prompt_questions: Option<Value>,
+    prompt_schema: Option<Value>,
+    provider_payload: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -1173,10 +1176,31 @@ struct TerminalInstance {
     metadata: TerminalInstanceMetadata,
     runtime: Arc<StdMutex<TerminalRuntimeSnapshot>>,
     launch_metadata: Arc<StdMutex<TerminalLaunchRuntimeMetadata>>,
+    // Managed Codex panes run the stock TUI against a per-terminal local
+    // app-server gateway.  The gateway is deliberately separate from the PTY:
+    // terminal rendering/input remain native while structured JSON-RPC server
+    // requests can also be answered from the web dashboard.
+    codex_gateway: Arc<StdMutex<Option<TerminalCodexGatewayHandle>>>,
     // Whether this pane was opened with the app-control orchestrator MCP. Kept
     // so deferred/resume agent starts can re-inject app-control (and its
     // auto-approval) the same way the initial open does.
     app_control_mcp_requested: bool,
+}
+
+#[derive(Clone)]
+struct TerminalCodexGatewayHandle {
+    endpoint: String,
+    shutdown: Arc<StdMutex<Option<oneshot::Sender<()>>>>,
+}
+
+impl TerminalCodexGatewayHandle {
+    fn shutdown(&self) {
+        if let Ok(mut shutdown) = self.shutdown.lock() {
+            if let Some(sender) = shutdown.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
 }
 
 struct TerminalHeadlessOutputBuffer {
@@ -1247,7 +1271,16 @@ impl TerminalHeadlessOutputBuffer {
     }
 
     fn resize_vt(&mut self, rows: u16, cols: u16) {
-        self.vt.screen_mut().set_size(rows.max(1), cols.max(1));
+        // vt100::Grid::set_size truncates rows and cells in place. That makes
+        // the headless checkpoint permanently lose fullscreen TUI content
+        // even though the native xterm still renders it. Rebuild the parser
+        // from the retained ordered PTY bytes at the new geometry instead.
+        let mut resized = vt100::Parser::new(rows.max(1), cols.max(1), 10_000);
+        if !self.tail.is_empty() {
+            let replay = self.tail.iter().copied().collect::<Vec<_>>();
+            resized.process(&replay);
+        }
+        self.vt = resized;
     }
 
     fn vt_state(&self) -> Vec<u8> {
@@ -1559,6 +1592,7 @@ impl TerminalInstance {
                 metadata,
                 runtime: Arc::new(StdMutex::new(initial_runtime)),
                 launch_metadata: Arc::new(StdMutex::new(launch_metadata)),
+                codex_gateway: Arc::new(StdMutex::new(None)),
                 app_control_mcp_requested,
             },
             reader,
@@ -2247,6 +2281,10 @@ struct TerminalActivityHookPayload {
     prompt_default_option: Option<String>,
     prompt_ttl_ms: Option<u64>,
     prompt_options: Vec<TerminalActivityHookPromptOption>,
+    prompt_questions: Option<Value>,
+    prompt_schema: Option<Value>,
+    prompt_url: Option<String>,
+    provider_payload: Option<Value>,
     allows_free_text: bool,
     prompt_answer_option: Option<String>,
     interaction_id: Option<String>,
@@ -9785,6 +9823,8 @@ fn run_app(daemon: bool) {
             start_agent_login,
             start_agent_account_login,
             agent_accounts_start_profile_login,
+            agent_accounts_web_login_command,
+            agent_accounts_reconcile_workspace_trust,
             disconnect_agent,
             install_agent,
             update_agent,

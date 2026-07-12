@@ -2852,6 +2852,17 @@ fn claude_write_authority_guard_settings(
             "deny": deny_rules
         },
         "hooks": {
+            "SessionStart": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ],
             "UserPromptSubmit": [
                 {
                     "hooks": [
@@ -2924,7 +2935,7 @@ fn claude_write_authority_guard_settings(
                         {
                             "type": "command",
                             "command": activity_command.clone(),
-                            "timeout": 5
+                            "timeout": 600
                         }
                     ]
                 }
@@ -2979,7 +2990,7 @@ fn claude_write_authority_guard_settings(
                         {
                             "type": "command",
                             "command": activity_command.clone(),
-                            "timeout": 5
+                            "timeout": 600
                         }
                     ]
                 }
@@ -3041,6 +3052,46 @@ fn claude_write_authority_guard_settings(
             ]
         }
     });
+
+    // Keep the managed profile aligned with Claude Code's complete hook
+    // surface. Most of these are observational lifecycle events. WorktreeCreate
+    // is intentionally not installed here: Claude defines it as an exclusive
+    // worktree provider that must return an absolute path, not an observation.
+    if let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) {
+        for event_name in [
+            "UserPromptExpansion",
+            "TaskCreated",
+            "TaskCompleted",
+            "TeammateIdle",
+            "SessionEnd",
+            "ConfigChange",
+            "CwdChanged",
+            "InstructionsLoaded",
+            "FileChanged",
+            "WorktreeRemove",
+            "Setup",
+        ] {
+            hooks.entry(event_name.to_string()).or_insert_with(|| {
+                let mut group = json!({
+                    "hooks": [{
+                        "type": "command",
+                        "command": activity_command.clone(),
+                        "timeout": 5
+                    }]
+                });
+                if event_name == "FileChanged" {
+                    // Claude's FileChanged matcher is also its literal watch
+                    // list. Watch the portable project/config files Diff
+                    // Forge can know ahead of time; provider/project settings
+                    // may add more literal names alongside this group.
+                    group["matcher"] = json!(
+                        ".env|.envrc|.tool-versions|AGENTS.md|CLAUDE.md|Cargo.toml|package.json|pyproject.toml|requirements.txt"
+                    );
+                }
+                json!([group])
+            });
+        }
+    }
 
     if !cfg!(windows) {
         settings["sandbox"] = json!({
@@ -3217,6 +3268,7 @@ fn terminal_activity_env_vars(
 
 fn extend_terminal_activity_env_vars(
     env_vars: &mut Vec<(String, String)>,
+    workspace_root: Option<&Path>,
     pane_id: &str,
     instance_id: u64,
     workspace_id: Option<&str>,
@@ -3224,6 +3276,13 @@ fn extend_terminal_activity_env_vars(
     provider_id: &str,
     activity_transport: Option<&TerminalActivityTransportEndpoint>,
 ) {
+    if let Some(workspace_root) = workspace_root {
+        set_terminal_env_var(
+            env_vars,
+            "DIFFFORGE_WORKSPACE_ROOT",
+            &workspace_root.to_string_lossy(),
+        );
+    }
     let activity_env = terminal_activity_env_vars(
         pane_id,
         instance_id,
@@ -3514,28 +3573,43 @@ fn ensure_codex_activity_hooks(value: &mut Value, scoped_command: &str) -> usize
         return 0;
     };
 
-    let mut added = 0usize;
-    for event_name in [
+    const OFFICIAL_CODEX_HOOKS: &[&str] = &[
+        "SessionStart",
         "UserPromptSubmit",
-        "MessageDisplay",
         "PreCompact",
         "PostCompact",
         "Stop",
-        "StopFailure",
         "PreToolUse",
         "PostToolUse",
-        "PostToolUseFailure",
-        "PostToolBatch",
         "PermissionRequest",
-        "PermissionDenied",
-        "Notification",
-        "Elicitation",
-        "ElicitationResult",
         "SubagentStart",
         "SubagentStop",
-    ] {
+    ];
+    // Codex ignores unknown hook names, but leaving Diff Forge registrations
+    // under Claude-only names creates a false sense of coverage. Remove only
+    // our generated entries and preserve every user-authored hook.
+    let unsupported_keys = hooks
+        .keys()
+        .filter(|name| !OFFICIAL_CODEX_HOOKS.contains(&name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in unsupported_keys {
+        if let Some(entries) = hooks.get_mut(&key).and_then(Value::as_array_mut) {
+            entries.retain(|entry| !hook_entry_contains_activity_command(entry));
+        }
+        if hooks
+            .get(&key)
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
+            hooks.remove(&key);
+        }
+    }
+
+    let mut added = 0usize;
+    for event_name in OFFICIAL_CODEX_HOOKS {
         let entry = hooks
-            .entry(event_name)
+            .entry((*event_name).to_string())
             .or_insert_with(|| Value::Array(Vec::new()));
         let Some(entries) = entry.as_array_mut() else {
             continue;
@@ -3549,7 +3623,7 @@ fn ensure_codex_activity_hooks(value: &mut Value, scoped_command: &str) -> usize
                     {
                         "type": "command",
                         "command": scoped_command,
-                        "timeout": 5
+                        "timeout": if *event_name == "PermissionRequest" { 120 } else { 5 }
                     }
                 ]
             }));
@@ -3764,6 +3838,56 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
         &terminal_index,
         &hook_input,
     );
+    let codex_app_server_uir_active = provider.to_ascii_lowercase().contains("codex")
+        && env::var("DIFFFORGE_CODEX_APP_SERVER_UIR")
+            .ok()
+            .is_some_and(|value| terminal_env_truthy(&value));
+    let record_hook_key = record
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    let record_tool_key = record
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    if codex_app_server_uir_active
+        && (record_hook_key == "permissionrequest"
+            || (record_hook_key == "pretooluse"
+                && matches!(
+                    record_tool_key.as_str(),
+                    "askuserquestion"
+                        | "requestuserinput"
+                        | "elicitation"
+                        | "mcpelicitation"
+                )))
+    {
+        // The app-server gateway owns these blocking requests. Keep the
+        // official Codex hook registered, but do not publish a second prompt
+        // or block the hook process while the JSON-RPC request is active.
+        write_diff_forge_activity_hook_debug(
+            &debug_path,
+            "app_server_uir_authoritative",
+            &provider,
+            &pane_id,
+            instance_id,
+            &workspace_id,
+            &terminal_index,
+            &activity_path,
+            json!({
+                "hook_event_name": record.get("hook_event_name").and_then(Value::as_str).unwrap_or_default(),
+                "tool_name": record.get("tool_name").and_then(Value::as_str).unwrap_or_default(),
+            }),
+        );
+        return 0;
+    }
     if diff_forge_activity_stream_debug_enabled() {
         write_diff_forge_activity_hook_debug(
             &debug_path,
@@ -3955,10 +4079,32 @@ fn send_diff_forge_activity_hook_transport(
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    let waits_for_structured_response = provider.contains("claude")
-        && matches!(hook_name.as_str(), "permissionrequest" | "elicitation");
+    let tool_name = record
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .chars()
+        .filter(|value| value.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let waits_for_structured_response = (provider.contains("claude")
+        && (matches!(hook_name.as_str(), "permissionrequest" | "permissiondenied" | "elicitation")
+            || (hook_name == "pretooluse"
+                && matches!(tool_name.as_str(), "askuserquestion" | "exitplanmode"))))
+        || (provider.contains("codex")
+            && (hook_name == "permissionrequest"
+                || (hook_name == "pretooluse"
+                    && matches!(
+                        tool_name.as_str(),
+                        "askuserquestion"
+                            | "requestuserinput"
+                            | "elicitation"
+                            | "mcpelicitation"
+                    ))))
+        || (provider.contains("opencode")
+            && matches!(hook_name.as_str(), "permissionrequest" | "userpromptrequired"));
     let read_timeout = if waits_for_structured_response {
-        Some(Duration::from_secs(590))
+        Some(Duration::from_secs(if provider.contains("codex") { 110 } else { 590 }))
     } else {
         io_timeout
     };
@@ -4048,6 +4194,26 @@ fn diff_forge_activity_hook_blocking_fallback_response(record: &Value) -> Option
                 "action": "cancel",
             }
         })),
+        "permissiondenied" => Some(json!({ "retry": false })),
+        "pretooluse" => {
+            let tool_name = record
+                .get("tool_name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .chars()
+                .filter(|value| value.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            matches!(tool_name.as_str(), "askuserquestion" | "exitplanmode").then(|| {
+                json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": "Diff Forge could not establish its authenticated UIR transport."
+                    }
+                })
+            })
+        }
         _ => None,
     }
 }
@@ -4873,6 +5039,68 @@ fn diff_forge_activity_hook_record(
             value
         }
     };
+    let prompt_questions = {
+        let value = hook_value(&[
+            "promptQuestions",
+            "prompt_questions",
+            "questions",
+            "questionSet",
+            "question_set",
+        ]);
+        if value.is_null() {
+            tool_value(&[
+                "promptQuestions",
+                "prompt_questions",
+                "questions",
+                "questionSet",
+                "question_set",
+            ])
+        } else {
+            value
+        }
+    };
+    let prompt_schema = {
+        let value = hook_value(&[
+            "promptSchema",
+            "prompt_schema",
+            "requestedSchema",
+            "requested_schema",
+            "schema",
+        ]);
+        if value.is_null() {
+            tool_value(&[
+                "promptSchema",
+                "prompt_schema",
+                "requestedSchema",
+                "requested_schema",
+                "schema",
+            ])
+        } else {
+            value
+        }
+    };
+    let prompt_url = first_string(vec![
+        hook_string(&["promptUrl", "prompt_url", "url"]),
+        tool_string(&["promptUrl", "prompt_url", "url"]),
+    ]);
+    let native_provider_payload = hook_value(&["provider_payload", "providerPayload"]);
+    let provider_payload = json!({
+        "hook_event_name": hook_event_name,
+        "tool_name": tool_name,
+        "tool_input": tool_input,
+        "questions": prompt_questions,
+        "schema": prompt_schema,
+        "url": prompt_url,
+        "notification_type": hook_string(&["notification_type", "notificationType"]),
+        "source": hook_string(&["source"]),
+        "mode": hook_string(&["mode"]),
+        "metadata": hook_value(&["metadata"]),
+        "mcp_server_name": hook_string(&["mcp_server_name", "mcpServerName", "server_name", "serverName"]),
+        "elicitation_id": hook_string(&["elicitation_id", "elicitationId"]),
+        "permission_patterns": hook_value(&["patterns", "permission_patterns", "permissionPatterns"]),
+        "permission_always": hook_value(&["always", "permission_always", "permissionAlways"]),
+        "provider_request": native_provider_payload,
+    });
     let permission_suggestions = {
         let value = hook_value(&[
             "permissionSuggestions",
@@ -5012,6 +5240,10 @@ fn diff_forge_activity_hook_record(
         "prompting_user_source": prompting_user_source,
         "prompting_user_text": prompting_user_text,
         "prompt_options": prompt_options,
+        "prompt_questions": prompt_questions,
+        "prompt_schema": prompt_schema,
+        "prompt_url": prompt_url,
+        "provider_payload": provider_payload,
         "permission_suggestions": permission_suggestions,
         "prompt_default_option": prompt_default_option,
         "prompt_ttl_ms": prompt_ttl_ms_value,
@@ -5787,6 +6019,36 @@ mod terminal_cli_tests {
     }
 
     #[test]
+    fn activity_hook_record_preserves_native_question_and_schema_payloads() {
+        let record = diff_forge_activity_hook_record(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "AskUserQuestion",
+                "tool_input": {
+                    "questions": [{
+                        "header": "Framework",
+                        "question": "Which framework?",
+                        "multiSelect": true,
+                        "options": [{"label": "React"}, {"label": "Vue"}]
+                    }]
+                },
+                "requested_schema": {"type": "object"},
+                "url": "https://example.invalid/form"
+            }),
+        );
+
+        assert_eq!(record["prompt_questions"][0]["header"], "Framework");
+        assert_eq!(record["prompt_schema"]["type"], "object");
+        assert_eq!(record["prompt_url"], "https://example.invalid/form");
+        assert_eq!(record["provider_payload"]["tool_name"], "AskUserQuestion");
+    }
+
+    #[test]
     fn activity_hook_record_preserves_tool_response_timing_and_exit_code() {
         let record = diff_forge_activity_hook_record(
             "claude",
@@ -5845,6 +6107,7 @@ mod terminal_cli_tests {
         assert!(settings.contains("\"StopFailure\""));
         assert!(!settings.contains("\"Error\""));
         assert!(!settings.contains("\"Interrupt\""));
+        assert!(settings.contains("\"SessionStart\""));
         assert!(settings.contains("\"UserPromptSubmit\""));
         assert!(settings.contains("\"MessageDisplay\""));
         assert!(settings.contains("\"PreCompact\""));
@@ -5852,6 +6115,22 @@ mod terminal_cli_tests {
         assert!(settings.contains("\"Stop\""));
         assert!(settings.contains("\"PostToolUse\""));
         assert!(settings.contains("\"SubagentStop\""));
+        for event_name in [
+            "UserPromptExpansion",
+            "TaskCreated",
+            "TaskCompleted",
+            "TeammateIdle",
+            "SessionEnd",
+            "ConfigChange",
+            "CwdChanged",
+            "InstructionsLoaded",
+            "FileChanged",
+            "WorktreeRemove",
+            "Setup",
+        ] {
+            assert!(settings.contains(&format!("\"{event_name}\"")));
+        }
+        assert!(!settings.contains("\"WorktreeCreate\""));
         assert!(settings.contains("--pane-id"));
         assert!(settings.contains("pane-claude"));
         assert!(settings.contains("--instance-id"));
@@ -5862,6 +6141,38 @@ mod terminal_cli_tests {
         assert!(settings.contains("3"));
         assert!(settings.contains("--events-path"));
         assert!(settings.contains("--debug-path"));
+    }
+
+    #[test]
+    fn codex_activity_hooks_register_only_the_official_surface() {
+        let mut hooks = json!({
+            "hooks": {
+                "MessageDisplay": [{"hooks": [{"type": "command", "command": "diff-forge --diff-forge-activity-hook"}]}],
+                "CustomUserHook": [{"hooks": [{"type": "command", "command": "user-script"}]}]
+            }
+        });
+        ensure_codex_activity_hooks(&mut hooks, "diff-forge --diff-forge-activity-hook");
+        let object = hooks["hooks"].as_object().expect("hooks object");
+        for event_name in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreCompact",
+            "PostCompact",
+            "Stop",
+            "PreToolUse",
+            "PostToolUse",
+            "PermissionRequest",
+            "SubagentStart",
+            "SubagentStop",
+        ] {
+            assert!(object.contains_key(event_name), "missing {event_name}");
+        }
+        assert!(!object.contains_key("MessageDisplay"));
+        assert!(object.contains_key("CustomUserHook"));
+        assert_eq!(
+            object["PermissionRequest"][0]["hooks"][0]["timeout"],
+            json!(120)
+        );
     }
 
     #[test]
@@ -5889,6 +6200,13 @@ mod terminal_cli_tests {
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
             .contains("scheduleIdle(sessionId, \"session.idle\")"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("clearTimeout(timer)"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("/permission/${id}/reply"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("postSessionIdPermissionsPermissionId"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("/question/${id}/reply"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("hook_event_name: \"TranscriptChanged\""));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("permission_decision: props.reply"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("permission.replied"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("texts.join(\"\\n\")"));
         assert!(!DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains(
             "if (statusValue === \"idle\" || statusValue === \"cooldown\") {\n          emitStop(sessionId);"
@@ -6801,23 +7119,34 @@ function clearAssistantTextForSession(sessionId) {
 	}
 
 function spawnHook(payload) {
-  if (!HOOK_BIN) return Promise.resolve();
+  if (!HOOK_BIN) return Promise.resolve(null);
   return new Promise((resolve) => {
     let settled = false;
+    let stdout = "";
     const finish = () => {
       if (settled) return;
       settled = true;
-      resolve();
+      try {
+        const text = stdout.trim();
+        resolve(text ? JSON.parse(text.split(/\r?\n/).filter(Boolean).at(-1)) : null);
+      } catch {
+        resolve(null);
+      }
     };
     try {
       const child = spawn(HOOK_BIN, ["--diff-forge-activity-hook", "--provider", PROVIDER], {
-        stdio: ["pipe", "ignore", "ignore"],
+        stdio: ["pipe", "pipe", "ignore"],
         windowsHide: true,
       });
+      child.stdout.on("data", (chunk) => {
+        if (stdout.length < 64 * 1024) stdout += String(chunk || "");
+      });
+      const hookName = String((payload && payload.hook_event_name) || "").toLowerCase();
+      const waitsForUser = hookName === "permissionrequest" || hookName === "userpromptrequired";
       const timeout = setTimeout(() => {
         try { child.kill(); } catch {}
         finish();
-      }, HOOK_EMIT_TIMEOUT_MS);
+      }, waitsForUser ? 590000 : HOOK_EMIT_TIMEOUT_MS);
       const done = () => {
         clearTimeout(timeout);
         finish();
@@ -6834,7 +7163,14 @@ function spawnHook(payload) {
 }
 
 function emit(payload) {
-  if (!HOOK_BIN) return Promise.resolve();
+  if (!HOOK_BIN) return Promise.resolve(null);
+  const hookName = String((payload && payload.hook_event_name) || "").toLowerCase();
+  if (hookName === "permissionrequest" || hookName === "userpromptrequired") {
+    // Never head-of-line block the provider's resolution event behind a UIR
+    // request that is intentionally waiting for the user. Native TUI, web,
+    // and push answers must be able to race and resolve one interaction.
+    return spawnHook(payload);
+  }
   const sessionKey = (payload && payload.session_id) || "global";
   const previous = emitQueues.get(sessionKey) || Promise.resolve();
   const next = previous.catch(() => {}).then(() => spawnHook(payload));
@@ -6843,6 +7179,116 @@ function emit(payload) {
     if (emitQueues.get(sessionKey) === next) emitQueues.delete(sessionKey);
   });
   return next;
+}
+
+async function opencodeFetch(serverUrl, path, body) {
+  if (!serverUrl || typeof fetch !== "function") return false;
+  const response = await fetch(`${String(serverUrl).replace(/\/$/, "")}${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  if (!response.ok) throw new Error(`OpenCode API ${path} returned ${response.status}`);
+  return true;
+}
+
+async function replyOpenCodePermission(client, serverUrl, sessionId, requestId, reply) {
+  const id = encodeURIComponent(requestId);
+  const api = client && client.permission && client.permission.reply;
+  if (typeof api === "function") {
+    try {
+      await api({ path: { requestID: requestId }, body: { reply }, throwOnError: true });
+      return;
+    } catch {}
+  }
+  const authenticatedTransport = client && client._client;
+  if (authenticatedTransport && typeof authenticatedTransport.post === "function") {
+    try {
+      await authenticatedTransport.post({
+        url: "/permission/{requestID}/reply",
+        path: { requestID: requestId },
+        body: { reply },
+        throwOnError: true,
+      });
+      return;
+    } catch {}
+  }
+  const legacyApi = client && client.postSessionIdPermissionsPermissionId;
+  if (sessionId && typeof legacyApi === "function") {
+    try {
+      await legacyApi.call(client, {
+        path: { id: sessionId, permissionID: requestId },
+        body: { response: reply },
+        throwOnError: true,
+      });
+      return;
+    } catch {}
+  }
+  try {
+    if (await opencodeFetch(serverUrl, `/permission/${id}/reply`, { reply })) return;
+  } catch {}
+  if (sessionId) {
+    try {
+      if (await opencodeFetch(
+        serverUrl,
+        `/session/${encodeURIComponent(sessionId)}/permissions/${id}`,
+        { response: reply }
+      )) return;
+    } catch {}
+  }
+  throw new Error("OpenCode permission reply API is unavailable.");
+}
+
+async function replyOpenCodeQuestion(client, serverUrl, requestId, response) {
+  const id = encodeURIComponent(requestId);
+  const authenticatedTransport = client && client._client;
+  if (response && response.rejected) {
+    const reject = client && client.question && client.question.reject;
+    if (typeof reject === "function") {
+      try {
+        await reject({ path: { requestID: requestId }, throwOnError: true });
+        return;
+      } catch {}
+    }
+    if (authenticatedTransport && typeof authenticatedTransport.post === "function") {
+      try {
+        await authenticatedTransport.post({
+          url: "/question/{requestID}/reject",
+          path: { requestID: requestId },
+          body: {},
+          throwOnError: true,
+        });
+        return;
+      } catch {}
+    }
+    try {
+      if (await opencodeFetch(serverUrl, `/question/${id}/reject`, {})) return;
+    } catch {}
+    throw new Error("OpenCode question rejection API is unavailable.");
+  }
+  const answers = response && Array.isArray(response.answers) ? response.answers : [];
+  const reply = client && client.question && client.question.reply;
+  if (typeof reply === "function") {
+    try {
+      await reply({ path: { requestID: requestId }, body: { answers }, throwOnError: true });
+      return;
+    } catch {}
+  }
+  if (authenticatedTransport && typeof authenticatedTransport.post === "function") {
+    try {
+      await authenticatedTransport.post({
+        url: "/question/{requestID}/reply",
+        path: { requestID: requestId },
+        body: { answers },
+        throwOnError: true,
+      });
+      return;
+    } catch {}
+  }
+  try {
+    if (await opencodeFetch(serverUrl, `/question/${id}/reply`, { answers })) return;
+  } catch {}
+  throw new Error("OpenCode question reply API is unavailable.");
 }
 
 	function pickText(parts) {
@@ -7076,7 +7522,7 @@ function emitPartText(sessionId, kind, text, snapshot, messageId, partId) {
   return false;
 }
 
-export const DiffForgeActivityPlugin = async () => {
+export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
   // Track which sessions have an in-flight turn so a stray, startup, duplicate,
   // or child/sub-agent `session.idle` cannot settle the wrong turn: we only
   // emit `Stop` for a session we actually observed a prompt for. Keyed by
@@ -7086,6 +7532,13 @@ export const DiffForgeActivityPlugin = async () => {
   const completedAssistantMessages = new Set();
   const pendingStopTimers = new Map();
   const partKinds = new Map();
+  const handledInteractionIds = new Set();
+  const pendingInteractionIds = new Set();
+  const rememberHandledInteraction = (key) => {
+    if (!key) return;
+    if (handledInteractionIds.size >= 2048) handledInteractionIds.clear();
+    handledInteractionIds.add(key);
+  };
   let startupIdleCandidateEmitted = false;
   const cancelPendingStop = (sessionId) => {
     if (!sessionId) return;
@@ -7229,13 +7682,16 @@ export const DiffForgeActivityPlugin = async () => {
         tool_input: (output && output.args) || {},
       });
     },
-	    "tool.execute.after": async (input) => {
+	    "tool.execute.after": async (input, output) => {
 	      noteActivity((input && input.sessionID) || "", "tool.execute.after");
       emit({
         hook_event_name: "PostToolUse",
         session_id: (input && input.sessionID) || "",
         tool_name: (input && input.tool) || "",
         tool_use_id: (input && input.callID) || "",
+        tool_input: (input && input.args) || {},
+        tool_output: (output && (output.output || output.result || output)) || {},
+        duration_ms: (output && (output.durationMs || output.duration_ms)) || null,
       });
     },
 	    "permission.ask": async (input) => {
@@ -7244,7 +7700,7 @@ export const DiffForgeActivityPlugin = async () => {
       // never ask), so surface it as a manual-approval attention event. We do
       // not touch `output` — OpenCode's own permission config decides.
       emit({
-        hook_event_name: "PermissionRequest",
+        hook_event_name: "PermissionObserved",
         session_id: (input && input.sessionID) || "",
         manual_approval_required: true,
         permission_request_id: (input && input.id) || "",
@@ -7327,16 +7783,21 @@ export const DiffForgeActivityPlugin = async () => {
           session_id: sessionId,
         });
       }
-	      if (type === "permission.asked") {
+      if (type === "permission.asked") {
 	        noteActivity(sessionId, type);
-        emit({
+        const requestId = props.id || props.permissionID || props.permissionId || "";
+        const interactionKey = requestId ? `${sessionId}:permission:${requestId}` : "";
+        if (interactionKey && (handledInteractionIds.has(interactionKey) || pendingInteractionIds.has(interactionKey))) return;
+        if (interactionKey) pendingInteractionIds.add(interactionKey);
+        const response = await emit({
           hook_event_name: "PermissionRequest",
           session_id: sessionId,
           manual_approval_required: true,
-          permission_request_id: props.id || props.permissionID || "",
-          tool_use_id: props.callID || props.toolCallID || "",
-          tool_name: props.type || props.tool || "",
-          description: props.title || props.description || "",
+          permission_request_id: requestId,
+          tool_use_id: props.callID || props.toolCallID || props.toolCallId || props.tool?.callID || props.tool?.callId || "",
+          tool_name: props.permission || props.type || props.tool || "",
+          description: props.title || props.description || props.metadata?.title || "",
+          provider_payload: props,
           prompt_default_option: "reject",
           prompt_options: [
             ["allow_once", "Allow once"],
@@ -7344,19 +7805,148 @@ export const DiffForgeActivityPlugin = async () => {
             ["reject", "Reject"]
           ],
         });
+        if (requestId && response && response.reply) {
+          try {
+            await replyOpenCodePermission(client, serverUrl, sessionId, requestId, response.reply);
+            rememberHandledInteraction(interactionKey);
+            emit({
+              hook_event_name: "PermissionResult",
+              session_id: sessionId,
+              permission_request_id: requestId,
+              permission_decision: response.reply,
+            });
+          } catch (error) {
+            emit({
+              hook_event_name: "StopFailure",
+              session_id: sessionId,
+              error_code: "permission_reply_failed",
+              error: String((error && error.message) || error || "OpenCode permission reply failed."),
+              retryable: true,
+            });
+          }
+        }
+        if (interactionKey) pendingInteractionIds.delete(interactionKey);
       }
 	      if (type === "question.ask" || type === "question.asked" || type === "selection.ask" || type === "selection.asked") {
 	        noteActivity(sessionId, type);
         const promptId = props.id || props.questionID || props.questionId || props.promptID || props.promptId || props.selectionID || props.selectionId || "";
-        emit({
+        const interactionKey = promptId ? `${sessionId}:question:${promptId}` : "";
+        if (interactionKey && (handledInteractionIds.has(interactionKey) || pendingInteractionIds.has(interactionKey))) return;
+        if (interactionKey) pendingInteractionIds.add(interactionKey);
+        const questions = Array.isArray(props.questions)
+          ? props.questions
+          : (props.question ? [props.question] : []);
+        const response = await emit({
           hook_event_name: "UserPromptRequired",
           session_id: sessionId,
           requires_user_input: true,
           provider_blocked_for_user: true,
           permission_request_id: promptId || (sessionId ? `${type}:${sessionId}:${Date.now()}` : `${type}:${Date.now()}`),
           prompting_user_kind: type.startsWith("selection.") ? "selection" : "question",
-          prompting_user_text: props.title || props.question || props.description || "",
+          prompting_user_text: props.title || (questions[0] && questions[0].question) || props.description || "",
+          prompt_questions: questions,
           prompt_options: props.options || props.choices || props.actions || [],
+          provider_payload: props,
+        });
+        if (promptId && response) {
+          try {
+            await replyOpenCodeQuestion(client, serverUrl, promptId, response);
+            rememberHandledInteraction(interactionKey);
+            emit({
+              hook_event_name: "ElicitationResult",
+              session_id: sessionId,
+              permission_request_id: promptId,
+              decision: response.rejected ? "rejected" : "accepted",
+            });
+          } catch (error) {
+            emit({
+              hook_event_name: "StopFailure",
+              session_id: sessionId,
+              error_code: "question_reply_failed",
+              error: String((error && error.message) || error || "OpenCode question reply failed."),
+              retryable: true,
+            });
+          }
+        }
+        if (interactionKey) pendingInteractionIds.delete(interactionKey);
+      }
+      if (type === "permission.replied" || type === "question.replied" || type === "question.rejected") {
+        const requestId = props.id || props.permissionID || props.questionID || props.requestID || "";
+        const interactionKind = type.startsWith("permission.") ? "permission" : "question";
+        if (requestId) {
+          rememberHandledInteraction(`${sessionId}:${interactionKind}:${requestId}`);
+          pendingInteractionIds.delete(`${sessionId}:${interactionKind}:${requestId}`);
+        }
+        emit({
+          hook_event_name: type === "permission.replied" ? "PermissionResult" : "ElicitationResult",
+          session_id: sessionId,
+          permission_request_id: requestId,
+          decision: type.endsWith("rejected") || String(props.reply || props.response || "").toLowerCase() === "reject"
+            ? "rejected"
+            : "accepted",
+          permission_decision: props.reply || props.response || "",
+          provider_payload: props,
+        });
+      }
+      if (type === "session.created") {
+        emit({
+          hook_event_name: "SessionStart",
+          session_id: sessionId,
+          provider_payload: props,
+        });
+      } else if (type === "session.updated") {
+        emit({
+          hook_event_name: "Notification",
+          session_id: sessionId,
+          notification_type: type,
+          provider_payload: props,
+        });
+      } else if (type === "session.deleted") {
+        emit({
+          hook_event_name: "SessionEnd",
+          session_id: sessionId,
+          provider_payload: props,
+        });
+      }
+      if (type === "todo.updated") {
+        noteActivity(sessionId, type);
+        emit({
+          hook_event_name: "PostToolUse",
+          session_id: sessionId,
+          tool_name: "TodoWrite",
+          tool_input: { todos: props.todos || props.items || [] },
+          provider_payload: props,
+        });
+      } else if (type === "command.executed" || type === "tool.updated") {
+        noteActivity(sessionId, type);
+        emit({
+          hook_event_name: "Notification",
+          session_id: sessionId,
+          notification_type: type,
+          provider_payload: props,
+        });
+      }
+      if (type === "message.removed" || type === "message.part.removed" || type === "session.diff") {
+        emit({
+          hook_event_name: "TranscriptChanged",
+          session_id: sessionId,
+          notification_type: type,
+          provider_passive: true,
+          provider_payload: props,
+        });
+      }
+      if (
+        type === "file.edited"
+        || type === "file.watcher.updated"
+        || type === "installation.updated"
+        || type === "installation.update-available"
+      ) {
+        emit({
+          hook_event_name: "Notification",
+          session_id: sessionId,
+          notification_type: type,
+          provider_passive: true,
+          provider_payload: props,
         });
       }
       if (type === "session.status") {
@@ -7372,9 +7962,21 @@ export const DiffForgeActivityPlugin = async () => {
             ? (raw.type || raw.phase || raw.state || raw.status)
             : raw) || ""
         ).toLowerCase();
-		        if (statusValue === "idle" || statusValue === "cooldown") {
-		          scheduleIdle(sessionId, "session.status");
-		        } else if (statusValue) {
+	        if (statusValue === "idle" || statusValue === "cooldown") {
+	          scheduleIdle(sessionId, "session.status");
+	        } else if (statusValue === "retry") {
+          noteActivity(sessionId, "session.status.retry");
+          emit({
+            hook_event_name: "ProviderRetry",
+            session_id: sessionId,
+            retryable: true,
+            retry_attempt: raw && raw.attempt,
+            retry_message: raw && raw.message,
+            retry_action: raw && raw.action,
+            retry_next_at: raw && raw.next,
+            provider_payload: raw,
+          });
+	        } else if (statusValue) {
 		          noteActivity(sessionId, "session.status");
 		        }
 	      }
@@ -8613,7 +9215,7 @@ fn launch_account_login_terminal(provider: AgentProvider) -> Result<(), String> 
 
     match provider {
         AgentProvider::Codex => run_login_terminal(definition.label, &binary, &["login"]),
-        AgentProvider::Claude => run_login_terminal(definition.label, &binary, &["/login"]),
+        AgentProvider::Claude => run_login_terminal(definition.label, &binary, &["auth", "login"]),
         AgentProvider::OpenCode => {
             run_login_terminal(definition.label, &binary, &["auth", "login"])
         }

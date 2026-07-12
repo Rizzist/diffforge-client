@@ -15427,6 +15427,9 @@ function WorkspaceCreatePanel({
   const [initializeGitDraft, setInitializeGitDraft] = useState(false);
   const [unsafeModeArmed, setUnsafeModeArmed] = useState(false);
   const [panelView, setPanelView] = useState("create");
+  // Two-step create: name first (the field people forget), then settings —
+  // where the name stays editable.
+  const [createStep, setCreateStep] = useState("name");
   const browseSeqRef = useRef(0);
   const browseRef = useRef(null);
   const directoryStripRef = useRef(null);
@@ -15470,6 +15473,7 @@ function WorkspaceCreatePanel({
     setCdDraft("");
     setBrowseError("");
     setPanelView("create");
+    setCreateStep("name");
     setAgentCounts(fallbackRole ? { [fallbackRole]: 1 } : {});
     setPanelCounts({
       document: DEFAULT_WORKSPACE_DOCUMENT_COUNT,
@@ -15808,6 +15812,73 @@ function WorkspaceCreatePanel({
     );
   }
 
+  if (createStep === "name") {
+    const nameReady = Boolean(workspaceName.trim());
+    return (
+      <WorkspaceCreateSurface>
+        <WorkspaceCreateCard
+          aria-label="Name your workspace"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (nameReady) {
+              setCreateStep("settings");
+            }
+          }}
+        >
+          <WorkspaceCreateHeader>
+            <div>
+              <PanelKicker>New workspace · Step 1 of 2</PanelKicker>
+              <PanelHeading>Name your workspace</PanelHeading>
+            </div>
+            <WorkspaceSettingsHeaderActions>
+              <SecondaryButton
+                disabled={creating}
+                onClick={() => setPanelView("archived")}
+                type="button"
+              >
+                <ButtonArchiveIcon aria-hidden="true" />
+                <span>Archived {archivedRows.length}</span>
+              </SecondaryButton>
+              {onClose && (
+                <WorkspaceModalCloseButton
+                  aria-label="Close create workspace"
+                  disabled={creating}
+                  onClick={onClose}
+                  title="Close"
+                  type="button"
+                >
+                  <ButtonCloseIcon aria-hidden="true" />
+                </WorkspaceModalCloseButton>
+              )}
+            </WorkspaceSettingsHeaderActions>
+          </WorkspaceCreateHeader>
+
+          <WorkspaceCreateSection>
+            <SettingsLabel>Name</SettingsLabel>
+            <WorkspaceSettingsInput
+              autoFocus
+              autoComplete="off"
+              autoCorrect="off"
+              maxLength={80}
+              onChange={(event) => setWorkspaceName(event.target.value)}
+              placeholder="My workspace"
+              spellCheck={false}
+              value={workspaceName}
+            />
+            <SettingsHint>
+              Step 1 of 2 — pick the name now so it never gets forgotten. Project root,
+              harnesses, and panels come next; the name stays editable there.
+            </SettingsHint>
+          </WorkspaceCreateSection>
+
+          <PrimaryButton disabled={!nameReady} type="submit">
+            <span>Continue</span>
+          </PrimaryButton>
+        </WorkspaceCreateCard>
+      </WorkspaceCreateSurface>
+    );
+  }
+
   return (
     <WorkspaceCreateSurface>
       <WorkspaceCreateCard
@@ -15830,10 +15901,17 @@ function WorkspaceCreatePanel({
       >
         <WorkspaceCreateHeader>
           <div>
-            <PanelKicker>New workspace</PanelKicker>
-            <PanelHeading>Create workspace</PanelHeading>
+            <PanelKicker>New workspace · Step 2 of 2</PanelKicker>
+            <PanelHeading>{workspaceName.trim() || "Create workspace"}</PanelHeading>
           </div>
           <WorkspaceSettingsHeaderActions>
+            <SecondaryButton
+              disabled={creating}
+              onClick={() => setCreateStep("name")}
+              type="button"
+            >
+              <span>Back</span>
+            </SecondaryButton>
             <SecondaryButton
               disabled={creating}
               onClick={() => setPanelView("archived")}
@@ -40424,6 +40502,8 @@ export default function App() {
     let disposed = false;
     let unlistenRemoteCommand = null;
     let unlistenDeviceDeleted = null;
+    let unlistenAgentAccounts = null;
+    let pendingProviderAuth = null;
 
     const remoteCommandText = (event) => {
       const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
@@ -42224,6 +42304,7 @@ export default function App() {
         return;
       }
       if ([
+        "provider_auth_start",
         "agent_account_login",
         "terminal_provider_login",
         "provider_login",
@@ -42247,18 +42328,94 @@ export default function App() {
           return;
         }
         try {
-          const result = await invoke("start_agent_account_login", { provider });
+          const profileId = remoteCommandStringField(event, ["profile_id", "account_profile_id"]) || "default";
+          const authWorkspaceId = workspaceId
+            || activatedWorkspaceIdRef.current
+            || selectedWorkspaceIdRef.current
+            || workspacesRef.current?.[0]?.id
+            || "";
+          if (!authWorkspaceId) {
+            throw new Error("Open or create a workspace before starting a web provider login shell.");
+          }
+          const accountsBefore = await invoke("agent_accounts_state").catch(() => null);
+          const profileBefore = accountsBefore?.agents?.[provider]?.profiles?.find?.((profile) => (
+            String(profile?.id || "") === profileId
+          ));
+          const initialAuthRevision = String(profileBefore?.auth_status?.auth_revision || "");
+          await invoke("agent_accounts_set_active", {
+            agent_kind: provider,
+            profile_id: profileId,
+          });
+          const login = await invoke("agent_accounts_web_login_command", {
+            agent_kind: provider,
+            profile_id: profileId,
+          });
+          const authTerminal = addWorkspaceTerminal({
+            reuseExistingSession: false,
+            role: WORKSPACE_TERMINAL_ROLE_GENERIC,
+            source: "provider-auth-session",
+            title: `${getManagedAgentLabel(provider)} sign in`,
+            workspace_id: authWorkspaceId,
+          });
+          if (!authTerminal || !Number.isInteger(authTerminal.terminal_index)) {
+            throw new Error("Unable to allocate a managed shell for provider sign-in.");
+          }
+          const paneId = getWorkspaceTerminalPaneId(
+            authWorkspaceId,
+            authTerminal.terminal_index,
+            getWorkspaceTerminalPaneAgentId(WORKSPACE_TERMINAL_ROLE_GENERIC),
+          );
+          const submittedCommand = `${String(login?.command || "").trim()}\r`;
+          if (!submittedCommand.trim()) {
+            throw new Error("Provider login command was not available on this device.");
+          }
+          let started = false;
+          let lastError = null;
+          for (let attempt = 0; attempt < 24; attempt += 1) {
+            try {
+              await invoke("terminal_write", {
+                data: submittedCommand,
+                pane_id: paneId,
+                prompt_event_source: "provider-auth-session",
+              });
+              started = true;
+              break;
+            } catch (error) {
+              lastError = error;
+              await new Promise((resolve) => window.setTimeout(resolve, 125));
+            }
+          }
+          if (!started) {
+            throw new Error(getErrorMessage(lastError, "Provider login shell did not become ready."));
+          }
+          pendingProviderAuth = {
+            initial_auth_revision: initialAuthRevision,
+            profile_id: profileId,
+            provider,
+            workspace_id: authWorkspaceId,
+          };
+          await syncRemoteControlState("provider_auth_session_started");
+          const result = {
+            contract: login?.contract || "diffforge.provider_auth_session.v1",
+            kind: provider,
+            profile_id: profileId,
+            state: "awaiting_user",
+            pane_id: paneId,
+            terminal_id: paneId,
+            terminal_index: authTerminal.terminal_index,
+            workspace_id: authWorkspaceId,
+          };
           await recordRemoteCommandStatus(
             event,
             "completed",
-            result?.message || `Opened ${getManagedAgentLabel(provider)} sign-in on this desktop.`,
+            `Opened ${getManagedAgentLabel(provider)} sign-in in a managed web shell.`,
             {
               agent_id: provider,
               command_id: commandId,
               command_kind: commandKind,
               login: result || null,
               target,
-              workspace_id: workspaceId,
+              workspace_id: authWorkspaceId,
             },
           );
         } catch (error) {
@@ -42269,6 +42426,122 @@ export default function App() {
             workspace_id: workspaceId,
           });
         }
+        return;
+      }
+      if ([
+        "provider_account_set_active",
+        "agent_account_set_active",
+        "provider_account_select",
+        "select_provider_account",
+      ].includes(normalizedKind)) {
+        const provider = normalizeManagedAgentProviderId(
+          agentId || remoteCommandStringField(event, ["provider", "agent_provider", "agent_id"]),
+        );
+        const profileId = remoteCommandStringField(event, ["profile_id", "account_profile_id"]);
+        if (!provider || !profileId) {
+          await recordRemoteCommandStatus(event, "failed", "Account selection requires a provider and profile id.", {
+            command_id: commandId,
+            command_kind: commandKind,
+          });
+          return;
+        }
+        try {
+          const result = await invoke("agent_accounts_set_active", {
+            agent_kind: provider,
+            profile_id: profileId,
+          });
+          await syncRemoteControlState("provider_account_selected");
+          await recordRemoteCommandStatus(event, "completed", `${getManagedAgentLabel(provider)} account selected. New terminals will use it immediately.`, {
+            command_id: commandId,
+            command_kind: commandKind,
+            provider,
+            profile_id: profileId,
+            result,
+          });
+        } catch (error) {
+          await recordRemoteCommandStatus(event, "failed", getErrorMessage(error, "Unable to select provider account."), {
+            command_id: commandId,
+            command_kind: commandKind,
+            provider,
+            profile_id: profileId,
+          });
+        }
+        return;
+      }
+      if ([
+        "provider_terminals_restart",
+        "restart_provider_terminals",
+        "provider_restart_when_idle",
+      ].includes(normalizedKind)) {
+        const provider = normalizeManagedAgentProviderId(
+          agentId || remoteCommandStringField(event, ["provider", "agent_provider", "agent_id"]),
+        );
+        if (!provider) {
+          await recordRemoteCommandStatus(event, "failed", "Provider terminal restart requires codex, claude, or opencode.", {
+            command_id: commandId,
+            command_kind: commandKind,
+          });
+          return;
+        }
+        const activeWorkspaceId = workspaceId || activatedWorkspaceIdRef.current || "";
+        if (!activeWorkspaceId) {
+          await recordRemoteCommandStatus(event, "completed", "No active provider terminals needed a restart.", {
+            command_id: commandId,
+            command_kind: commandKind,
+            provider,
+            restarted: 0,
+          });
+          return;
+        }
+        const settings = workspaceSettingsRef.current;
+        const terminalCount = getWorkspaceTerminalCount(settings, activeWorkspaceId);
+        const indexes = getWorkspaceLogicalTerminalIndexes(
+          workspaceTerminalLogicalIndexesRef.current,
+          activeWorkspaceId,
+          terminalCount,
+        );
+        const roles = getWorkspaceTerminalRoles(
+          settings,
+          activeWorkspaceId,
+          terminalCount,
+          workspaceTerminalFallbackRole,
+          workspaceTerminalRoleOptions,
+        );
+        let restarted = 0;
+        let blocked = 0;
+        indexes.forEach((terminalIndex, orderIndex) => {
+          if (roles[orderIndex] !== provider) return;
+          const { terminal } = findRemoteControlTerminal(activeWorkspaceId, {
+            target_terminal_index: terminalIndex,
+          });
+          if (terminal && !assessRemoteControlTerminalIdle(terminal).idle) {
+            blocked += 1;
+            return;
+          }
+          changeWorkspaceTerminalRole({
+            restart: true,
+            role: provider,
+            terminal_index: terminalIndex,
+            workspace_id: activeWorkspaceId,
+          });
+          restarted += 1;
+        });
+        await syncRemoteControlState("provider_terminals_restarted");
+        await recordRemoteCommandStatus(
+          event,
+          blocked ? "blocked" : "completed",
+          blocked
+            ? `Restarted ${restarted} idle terminal(s); ${blocked} busy terminal(s) were left running.`
+            : `Restarted ${restarted} ${getManagedAgentLabel(provider)} terminal(s).`,
+          {
+            blocked,
+            command_id: commandId,
+            command_kind: commandKind,
+            provider,
+            restarted,
+            workspace_id: activeWorkspaceId,
+          },
+        );
         return;
       }
       if ([
@@ -45397,6 +45670,51 @@ export default function App() {
       }
     };
 
+    unlistenAgentAccounts = listenShared("agent-accounts-changed", async () => {
+      void syncRemoteControlState("provider_accounts_changed");
+      const pending = pendingProviderAuth;
+      if (!pending) return;
+      const accounts = await invoke("agent_accounts_state").catch(() => null);
+      const profile = accounts?.agents?.[pending.provider]?.profiles?.find?.((candidate) => (
+        String(candidate?.id || "") === pending.profile_id
+      ));
+      const authReady = profile?.auth_status?.auth_ready === true;
+      const authRevision = String(profile?.auth_status?.auth_revision || "");
+      if (!authReady || !authRevision || authRevision === pending.initial_auth_revision) return;
+      pendingProviderAuth = null;
+
+      // The successful login is now durable provider state. Adopt it only on
+      // idle coding terminals; busy turns keep their launch-stamped revision
+      // and surface the normal restart chip when they settle.
+      const settings = workspaceSettingsRef.current;
+      const terminalCount = getWorkspaceTerminalCount(settings, pending.workspace_id);
+      const indexes = getWorkspaceLogicalTerminalIndexes(
+        workspaceTerminalLogicalIndexesRef.current,
+        pending.workspace_id,
+        terminalCount,
+      );
+      const roles = getWorkspaceTerminalRoles(
+        settings,
+        pending.workspace_id,
+        terminalCount,
+        workspaceTerminalFallbackRole,
+        workspaceTerminalRoleOptions,
+      );
+      indexes.forEach((terminalIndex, orderIndex) => {
+        if (roles[orderIndex] !== pending.provider) return;
+        const { terminal } = findRemoteControlTerminal(pending.workspace_id, {
+          target_terminal_index: terminalIndex,
+        });
+        if (terminal && !assessRemoteControlTerminalIdle(terminal).idle) return;
+        changeWorkspaceTerminalRole({
+          restart: true,
+          role: pending.provider,
+          terminal_index: terminalIndex,
+          workspace_id: pending.workspace_id,
+        });
+      });
+      await syncRemoteControlState("provider_auth_completed_idle_restarts");
+    });
     startRemoteCommandListener();
     return () => {
       disposed = true;
@@ -45405,6 +45723,9 @@ export default function App() {
       }
       if (typeof unlistenDeviceDeleted === "function") {
         unlistenDeviceDeleted();
+      }
+      if (typeof unlistenAgentAccounts === "function") {
+        unlistenAgentAccounts();
       }
     };
   }, [activateWorkspace, activeAccountScopeKey, addWorkspaceTerminal, agentStatuses, changeWorkspaceTerminalRole, closeWorkspaceTerminal, deactivateWorkspace, deleteWorkspaceFromForge, ensureWorkspaceActivated, logout, manageWorkspaceAgents, refreshAgentStatuses, requestWorkspaceActivation, requestWorkspaceTerminalFocus, rustTerminalAuthorityOrchestrators, showView, syncAgentInstallationsToCloud, workspaces]);

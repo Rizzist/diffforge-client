@@ -839,13 +839,64 @@ fn agent_accounts_opencode_default_home() -> Option<PathBuf> {
         .or_else(|| candidates.into_iter().next())
 }
 
-fn agent_accounts_registry_read() -> Value {
-    agent_accounts_file_path()
-        .and_then(|path| fs::read_to_string(path).ok())
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .map(|value| agent_accounts_registry_map_keys(value, true))
-        .filter(Value::is_object)
+static AGENT_ACCOUNTS_REGISTRY_LAST_GOOD: OnceLock<StdMutex<Option<Value>>> = OnceLock::new();
+
+fn agent_accounts_registry_last_good_cell() -> &'static StdMutex<Option<Value>> {
+    AGENT_ACCOUNTS_REGISTRY_LAST_GOOD.get_or_init(|| StdMutex::new(None))
+}
+
+fn agent_accounts_registry_remember_last_good(registry: &Value) {
+    let mut guard = agent_accounts_registry_last_good_cell()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    *guard = Some(registry.clone());
+}
+
+fn agent_accounts_registry_last_good_or_empty() -> Value {
+    agent_accounts_registry_last_good_cell()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
         .unwrap_or_else(|| json!({ "agents": {} }))
+}
+
+fn agent_accounts_registry_parse(raw: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .map(|value| agent_accounts_registry_map_keys(value, true))
+        // A structurally invalid registry (no object-valued `agents`) must
+        // not become "last known good" — it would collapse the roster just
+        // like the torn writes this cache exists to survive.
+        .filter(|value| value.get("agents").map(Value::is_object).unwrap_or(false))
+}
+
+fn agent_accounts_registry_read() -> Value {
+    let Some(path) = agent_accounts_file_path() else {
+        return json!({ "agents": {} });
+    };
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A missing file IS an authoritative empty registry (fresh
+            // install / explicit wipe). Remember it so a later transient
+            // failure cannot resurrect pre-wipe accounts.
+            let empty = json!({ "agents": {} });
+            agent_accounts_registry_remember_last_good(&empty);
+            return empty;
+        }
+        // Transient I/O failure must never become an authoritative empty
+        // account set: downstream views treat absent profiles as removed.
+        Err(_) => return agent_accounts_registry_last_good_or_empty(),
+    };
+    match agent_accounts_registry_parse(&raw) {
+        Some(registry) => {
+            agent_accounts_registry_remember_last_good(&registry);
+            registry
+        }
+        // Same for a torn/partial write: serve the last-known-good registry
+        // until a readable one lands.
+        None => agent_accounts_registry_last_good_or_empty(),
+    }
 }
 
 fn agent_accounts_registry_read_checked() -> Result<Value, String> {
@@ -854,7 +905,11 @@ fn agent_accounts_registry_read_checked() -> Result<Value, String> {
     let raw = match fs::read_to_string(&path) {
         Ok(raw) => raw,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(json!({ "agents": {} }));
+            // Authoritative empty: refresh the fallback cache too, so a later
+            // transient failure cannot resurrect pre-reset accounts.
+            let empty = json!({ "agents": {} });
+            agent_accounts_registry_remember_last_good(&empty);
+            return Ok(empty);
         }
         Err(error) => return Err(format!("Unable to read agent accounts registry: {error}")),
     };
@@ -863,6 +918,9 @@ fn agent_accounts_registry_read_checked() -> Result<Value, String> {
         .map_err(|_| "Agent accounts registry is not valid JSON.".to_string())?;
     if !registry.is_object() {
         return Err("Agent accounts registry root is not an object.".to_string());
+    }
+    if registry.get("agents").map(Value::is_object).unwrap_or(false) {
+        agent_accounts_registry_remember_last_good(&registry);
     }
     Ok(registry)
 }
@@ -873,7 +931,16 @@ fn agent_accounts_registry_write(registry: &Value) -> Result<(), String> {
     let persisted = agent_accounts_registry_map_keys(registry.clone(), false);
     let bytes = serde_json::to_vec_pretty(&persisted)
         .map_err(|error| format!("Unable to encode agent accounts registry: {error}"))?;
-    agent_accounts_write_private_file_atomic(&path, &bytes, "agent accounts registry")
+    // Hold the cache lock across disk commit + cache refresh so two in-process
+    // writers cannot leave the cache pointing at the older revision. (Cross-
+    // process writers — GUI + daemon — still race on the file itself; that
+    // exposure predates the cache and needs an OS-level lock to close.)
+    let mut guard = agent_accounts_registry_last_good_cell()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    agent_accounts_write_private_file_atomic(&path, &bytes, "agent accounts registry")?;
+    *guard = Some(registry.clone());
+    Ok(())
 }
 
 fn agent_accounts_kind_entry(registry: &Value, kind: &str) -> (String, Vec<Value>) {
@@ -1037,11 +1104,16 @@ fn agent_accounts_codex_email_from_auth(auth: &Value) -> String {
 }
 
 fn agent_accounts_login_command(kind: &str, dir: &str) -> String {
+    let dir = agent_accounts_shell_quote(dir);
     match kind {
-        "claude" => format!("CLAUDE_CONFIG_DIR=\"{dir}\" claude"),
-        "opencode" => format!("OPENCODE_DATA_DIR=\"{dir}\" opencode auth login"),
-        _ => format!("CODEX_HOME=\"{dir}\" codex login"),
+        "claude" => format!("CLAUDE_CONFIG_DIR={dir} claude auth login"),
+        "opencode" => format!("OPENCODE_DATA_DIR={dir} opencode auth login"),
+        _ => format!("CODEX_HOME={dir} codex login --device-auth"),
     }
+}
+
+fn agent_accounts_shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn agent_accounts_profile_view(kind: &str, profile: &Value, active_id: &str) -> Value {
@@ -1487,6 +1559,34 @@ fn agent_accounts_auth_signature_for_profile(
         .and_then(|path| agent_accounts_auth_file_signature(&path))
 }
 
+fn agent_accounts_auth_revision_for_profile(
+    kind: &str,
+    profile_id: &str,
+    profile: Option<&Value>,
+) -> String {
+    let auth_signature = agent_accounts_auth_signature_for_profile(kind, profile_id, profile)
+        .unwrap_or_default();
+    let provider_state_signature = if kind == "claude" {
+        let state_path = if profile_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
+            env::var_os("HOME").map(PathBuf::from).map(|home| home.join(".claude.json"))
+        } else {
+            profile.and_then(agent_accounts_profile_dir).map(|dir| dir.join(".claude.json"))
+        };
+        state_path
+            .as_deref()
+            .and_then(agent_accounts_auth_file_signature)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    if auth_signature.is_empty() && provider_state_signature.is_empty() {
+        return String::new();
+    }
+    cloud_mcp_short_hash(&format!(
+        "{kind}:{profile_id}:{auth_signature}:{provider_state_signature}"
+    ))
+}
+
 fn agent_accounts_auth_issue_is_current(
     kind: &str,
     profile_id: &str,
@@ -1555,6 +1655,7 @@ fn agent_accounts_auth_status(
         "auth_ready": file_ready && !issue_current,
         "file_ready": file_ready,
         "needs_login": needs_login,
+        "auth_revision": agent_accounts_auth_revision_for_profile(kind, profile_id, profile),
         "reason": reason,
         "message": message,
         "detected_at_ms": issue.and_then(|issue| issue.get("detected_at_ms")).and_then(Value::as_u64).unwrap_or(0),
@@ -1609,7 +1710,14 @@ fn agent_accounts_clear_resolved_auth_issues_for_kind(registry: &mut Value, kind
 }
 
 fn agent_accounts_registry_read_resolved() -> Value {
-    let mut registry = agent_accounts_registry_read();
+    // Mutations must never build on the last-known-good fallback: a stale
+    // snapshot written back whole would erase registry state committed by
+    // another writer. On a transient/torn read, serve the fallback for
+    // display and skip the cleanup write.
+    let mut registry = match agent_accounts_registry_read_checked() {
+        Ok(registry) => registry,
+        Err(_) => return agent_accounts_registry_read(),
+    };
     let claude_changed =
         agent_accounts_clear_resolved_auth_issues_for_kind(&mut registry, "claude");
     let codex_changed = agent_accounts_clear_resolved_auth_issues_for_kind(&mut registry, "codex");
@@ -1792,6 +1900,21 @@ pub(crate) fn agent_accounts_apply_spawn_env(
         return;
     };
     let (active_id, active_label) = agent_accounts_launch_profile_label(kind);
+    let auth_revision = agent_accounts_active_auth_revision(kind);
+    let workspace_trust = env_vars
+        .iter()
+        .find_map(|(key, value)| {
+            matches!(key.as_str(), "COORDINATION_REPO_PATH" | "DIFFFORGE_WORKSPACE_ROOT")
+                .then_some(value.as_str())
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|workspace_root| {
+            // Trust is reconciled through provider-owned state before launch.
+            // PTY output is intentionally never inspected to infer or resolve it.
+            agent_accounts_reconcile_workspace_trust_for(kind, Path::new(workspace_root))
+                .unwrap_or_else(|error| json!({ "state": "failed", "message": error, "source": "provider_native_state" }))
+        });
     {
         let registry = AGENT_ACCOUNTS_PANE_PROFILES.get_or_init(|| StdMutex::new(HashMap::new()));
         if let Ok(mut map) = registry.lock() {
@@ -1804,6 +1927,9 @@ pub(crate) fn agent_accounts_apply_spawn_env(
                     "kind": kind,
                     "profile_id": active_id,
                     "profile_label": active_label,
+                    "auth_revision": auth_revision,
+                    "workspace_trust_state": workspace_trust.as_ref().and_then(|value| value.get("state")).cloned().unwrap_or_else(|| json!("unknown")),
+                    "workspace_trust_source": workspace_trust.as_ref().and_then(|value| value.get("source")).cloned().unwrap_or_else(|| json!("provider_native_state")),
                     "stamped_at_ms": todo_dispatch_now_ms(),
                 }),
             );
@@ -4332,7 +4458,11 @@ fn agent_accounts_capture_kind(kind: &'static str) -> bool {
     let capture_cycle = (kind == "claude")
         .then(agent_accounts_next_claude_capture_cycle)
         .unwrap_or(0);
-    let mut registry = agent_accounts_registry_read();
+    // Never reconcile-and-persist on top of the fallback snapshot: a stale
+    // base written back whole would erase another writer's registry state.
+    let Ok(mut registry) = agent_accounts_registry_read_checked() else {
+        return false;
+    };
     let mut registry_changed = agent_accounts_dedupe_captured_profile_labels(&mut registry, kind);
     let reconcile_result = if kind == "claude" {
         agent_accounts_reconcile_captured_claude_identities_in_cycle(
@@ -4473,7 +4603,10 @@ fn agent_accounts_capture_startup_reconcile() -> bool {
         .get_or_init(|| StdMutex::new(()))
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    let mut registry = agent_accounts_registry_read();
+    // See agent_accounts_capture_kind: mutations never build on the fallback.
+    let Ok(mut registry) = agent_accounts_registry_read_checked() else {
+        return false;
+    };
     let mut registry_changed = false;
     for kind in ["claude", "codex", "opencode"] {
         registry_changed |= agent_accounts_dedupe_captured_profile_labels(&mut registry, kind);
@@ -4759,7 +4892,10 @@ fn agent_accounts_mark_pane_auth_issue(
         .unwrap_or(AGENT_ACCOUNTS_DEFAULT_PROFILE_ID)
         .to_string();
 
-    let mut registry = agent_accounts_registry_read();
+    // Mutation base: never the fallback snapshot (see agent_accounts_capture_kind).
+    let Ok(mut registry) = agent_accounts_registry_read_checked() else {
+        return false;
+    };
     agent_accounts_ensure_kind_entry(&mut registry, kind);
     let mut profile_for_signature = None;
     if profile_id != AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
@@ -4889,7 +5025,7 @@ fn agent_accounts_launch_profile_login_terminal(
     let dir_text = dir.to_string_lossy().to_string();
     let (args, env_vars): (Vec<&str>, Vec<(String, String)>) = match kind {
         "claude" => (
-            vec!["/login"],
+            vec!["auth", "login"],
             vec![("CLAUDE_CONFIG_DIR".to_string(), dir_text)],
         ),
         "opencode" => (
@@ -4908,6 +5044,231 @@ fn agent_accounts_launch_profile_login_terminal(
         agent_accounts_clear_profile_login_marker(&dir);
     }
     launch
+}
+
+fn agent_accounts_profile_for_id(registry: &Value, kind: &str, profile_id: &str) -> Option<Value> {
+    let (_, profiles) = agent_accounts_kind_entry(registry, kind);
+    profiles.into_iter().find(|profile| {
+        profile.get("id").and_then(Value::as_str).map(str::trim) == Some(profile_id)
+    })
+}
+
+fn agent_accounts_active_auth_revision(kind: &str) -> String {
+    let registry = agent_accounts_registry_read();
+    let (profile_id, _) = agent_accounts_launch_profile_label(
+        agent_accounts_supported_kind(kind).unwrap_or("codex"),
+    );
+    let profile = agent_accounts_profile_for_id(&registry, kind, &profile_id);
+    agent_accounts_auth_revision_for_profile(kind, &profile_id, profile.as_ref())
+}
+
+fn agent_accounts_active_home_for_kind(kind: &'static str) -> Option<PathBuf> {
+    agent_accounts_profile_home_for_launch(kind).or_else(|| agent_accounts_default_home(kind))
+}
+
+fn agent_accounts_toml_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn agent_accounts_upsert_codex_trust(body: &str, workspace_root: &Path) -> String {
+    let path = workspace_root.to_string_lossy();
+    let header = format!("[projects.\"{}\"]", agent_accounts_toml_escape(&path));
+    let mut lines = body.lines().map(str::to_string).collect::<Vec<_>>();
+    if let Some(start) = lines.iter().position(|line| line.trim() == header) {
+        let end = lines[start + 1..]
+            .iter()
+            .position(|line| line.trim_start().starts_with('['))
+            .map(|offset| start + 1 + offset)
+            .unwrap_or(lines.len());
+        if let Some(index) = (start + 1..end).find(|index| {
+            lines[*index]
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "trust_level")
+        }) {
+            lines[index] = "trust_level = \"trusted\"".to_string();
+        } else {
+            lines.insert(start + 1, "trust_level = \"trusted\"".to_string());
+        }
+    } else {
+        if !lines.is_empty() && !lines.last().is_some_and(|line| line.trim().is_empty()) {
+            lines.push(String::new());
+        }
+        lines.push(header);
+        lines.push("trust_level = \"trusted\"".to_string());
+    }
+    let mut output = lines.join("\n");
+    output.push('\n');
+    output
+}
+
+fn agent_accounts_reconcile_workspace_trust_for(
+    kind: &'static str,
+    workspace_root: &Path,
+) -> Result<Value, String> {
+    let workspace_root = fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    if !workspace_root.is_dir() {
+        return Err("Workspace trust requires an existing project directory.".to_string());
+    }
+    match kind {
+        "opencode" => Ok(json!({
+            "contract": "diffforge.provider_workspace_trust.v1",
+            "provider": kind,
+            "state": "not_applicable",
+            "workspace_root": workspace_root.to_string_lossy(),
+            "source": "provider_native_state",
+        })),
+        "claude" => {
+            let profile_home = agent_accounts_active_home_for_kind(kind)
+                .ok_or_else(|| "Unable to resolve the active Claude profile home.".to_string())?;
+            let state_path = if profile_home.file_name().and_then(|value| value.to_str()) == Some(".claude") {
+                profile_home.parent().unwrap_or(&profile_home).join(".claude.json")
+            } else {
+                profile_home.join(".claude.json")
+            };
+            let mut state = fs::read_to_string(&state_path)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .filter(Value::is_object)
+                .unwrap_or_else(|| json!({}));
+            if !state.get("projects").is_some_and(Value::is_object) {
+                state["projects"] = json!({});
+            }
+            let key = workspace_root.to_string_lossy().to_string();
+            if !state["projects"].get(&key).is_some_and(Value::is_object) {
+                state["projects"][&key] = json!({});
+            }
+            state["projects"][&key]["hasTrustDialogAccepted"] = json!(true);
+            let bytes = serde_json::to_vec_pretty(&state)
+                .map_err(|error| format!("Unable to encode Claude trust state: {error}"))?;
+            agent_accounts_write_private_file_atomic(&state_path, &bytes, "Claude workspace trust")?;
+            Ok(json!({
+                "contract": "diffforge.provider_workspace_trust.v1",
+                "provider": kind,
+                "state": "resolved",
+                "workspace_root": key,
+                "source": "provider_native_state",
+            }))
+        }
+        _ => {
+            let mut homes = Vec::new();
+            if let Some(home) = agent_accounts_active_home_for_kind("codex") {
+                homes.push(home);
+            }
+            if let Some(home) = agent_accounts_default_home("codex") {
+                if !homes.contains(&home) {
+                    homes.push(home);
+                }
+            }
+            if homes.is_empty() {
+                return Err("Unable to resolve the active Codex home.".to_string());
+            }
+            for home in homes {
+                let path = home.join("config.toml");
+                let current = fs::read_to_string(&path).unwrap_or_default();
+                let next = agent_accounts_upsert_codex_trust(&current, &workspace_root);
+                if next != current {
+                    agent_accounts_write_private_file_atomic(&path, next.as_bytes(), "Codex workspace trust")?;
+                }
+            }
+            Ok(json!({
+                "contract": "diffforge.provider_workspace_trust.v1",
+                "provider": "codex",
+                "state": "resolved",
+                "workspace_root": workspace_root.to_string_lossy(),
+                "source": "provider_native_state",
+            }))
+        }
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn agent_accounts_reconcile_workspace_trust(
+    agent_kind: String,
+    workspace_root: String,
+) -> Result<Value, String> {
+    let kind = agent_accounts_supported_kind(&agent_kind)
+        .ok_or_else(|| format!("Unsupported agent kind for trust: {agent_kind}"))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        agent_accounts_reconcile_workspace_trust_for(kind, Path::new(workspace_root.trim()))
+    })
+    .await
+    .map_err(|error| format!("Provider workspace trust worker failed: {error}"))?
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn agent_accounts_web_login_command(
+    app: AppHandle,
+    agent_kind: String,
+    profile_id: String,
+) -> Result<Value, String> {
+    let kind = agent_accounts_supported_kind(&agent_kind)
+        .ok_or_else(|| format!("Unsupported agent kind for accounts: {agent_kind}"))?;
+    let profile_id = profile_id.trim().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (dir, is_default) = agent_accounts_profile_login_target(kind, &profile_id)?;
+        if kind == "claude" && !is_default {
+            agent_accounts_prepare_captured_claude_profile_login(&profile_id, &dir)?;
+        }
+        let command = if is_default {
+            match kind {
+                "claude" => "claude auth login".to_string(),
+                "opencode" => "opencode auth login".to_string(),
+                _ => "codex login --device-auth".to_string(),
+            }
+        } else {
+            agent_accounts_login_command(kind, &dir.to_string_lossy())
+        };
+        agent_accounts_watch_profile_login_completion(app.clone(), kind, profile_id.clone());
+        let _ = app.emit(
+            AGENT_ACCOUNTS_CHANGED_EVENT,
+            json!({ "kind": kind, "profile_id": profile_id, "login_started": true, "web_shell": true }),
+        );
+        Ok(json!({
+            "contract": "diffforge.provider_auth_session.v1",
+            "kind": kind,
+            "profile_id": profile_id,
+            "command": command,
+            "state": "starting",
+        }))
+    })
+    .await
+    .map_err(|error| format!("Provider web login worker failed: {error}"))?
+}
+
+pub(crate) fn agent_accounts_device_live_state() -> Value {
+    let registry = agent_accounts_registry_read_resolved();
+    let sanitize = |kind: &'static str| {
+        let mut state = agent_accounts_kind_state(&registry, kind);
+        if let Some(profiles) = state.get_mut("profiles").and_then(Value::as_array_mut) {
+            for profile in profiles {
+                if let Some(object) = profile.as_object_mut() {
+                    object.remove("dir");
+                    object.remove("login_command");
+                    if let Some(identity) = object.get_mut("identity").and_then(Value::as_object_mut) {
+                        identity.remove("tokenomics_account_key");
+                    }
+                }
+            }
+        }
+        state
+    };
+    json!({
+        "contract": "diffforge.provider_accounts_live.v1",
+        "updated_at_ms": todo_dispatch_now_ms(),
+        "agents": {
+            "codex": sanitize("codex"),
+            "claude": sanitize("claude"),
+            "opencode": sanitize("opencode"),
+        }
+    })
+}
+
+pub(crate) fn agent_accounts_pane_profile_stamp(pane_id: &str) -> Option<Value> {
+    AGENT_ACCOUNTS_PANE_PROFILES
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|panes| panes.get(pane_id).cloned())
 }
 
 fn agent_accounts_watch_profile_login_completion(
@@ -5090,7 +5451,8 @@ async fn agent_accounts_update_display(
         return Err("A profile id is required.".to_string());
     }
     tauri::async_runtime::spawn_blocking(move || {
-        let mut registry = agent_accounts_registry_read();
+        let mut registry = agent_accounts_registry_read_checked()
+            .map_err(|error| format!("Agent accounts registry is unavailable: {error}"))?;
         if profile_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
             let default_email = agent_accounts_default_email(kind);
             if default_email.is_empty() {
@@ -5159,7 +5521,8 @@ async fn agent_accounts_set_active(
         return Err("A profile id is required.".to_string());
     }
     tauri::async_runtime::spawn_blocking(move || {
-        let mut registry = agent_accounts_registry_read();
+        let mut registry = agent_accounts_registry_read_checked()
+            .map_err(|error| format!("Agent accounts registry is unavailable: {error}"))?;
         let (_, profiles) = agent_accounts_kind_entry(&registry, kind);
         if profile_id != AGENT_ACCOUNTS_DEFAULT_PROFILE_ID
             && !profiles.iter().any(|profile| {
@@ -5432,7 +5795,8 @@ async fn agent_accounts_remove(
         return Err("The default account cannot be removed.".to_string());
     }
     tauri::async_runtime::spawn_blocking(move || {
-        let mut registry = agent_accounts_registry_read();
+        let mut registry = agent_accounts_registry_read_checked()
+            .map_err(|error| format!("Agent accounts registry is unavailable: {error}"))?;
         let (active_id, profiles) = agent_accounts_kind_entry(&registry, kind);
         if active_id == profile_id {
             return Err(
@@ -5451,6 +5815,27 @@ async fn agent_accounts_remove(
             })
             .cloned()
             .ok_or_else(|| format!("Unknown {kind} account profile: {profile_id}"))?;
+        // Duplicate profiles are only retired DYNAMICALLY (derived from the
+        // registry), so deleting one would resurrect its synthetic usage pill
+        // from durable Tokenomics history. Capture the duplicate verdict from
+        // the pre-removal roster; the retirement is persisted after the
+        // registry write succeeds.
+        let removed_was_duplicate = {
+            let default_email = agent_accounts_default_email(kind);
+            let effective_active_id = agent_accounts_effective_active_profile_id(
+                kind,
+                &active_id,
+                &profiles,
+                &default_email,
+            );
+            !agent_accounts_canonical_profile_ids_by_email(
+                kind,
+                &profiles,
+                &effective_active_id,
+                &default_email,
+            )
+            .contains(&profile_id)
+        };
         if let Some(entries) = registry
             .get_mut("agents")
             .and_then(|agents| agents.get_mut(kind))
@@ -5478,11 +5863,35 @@ async fn agent_accounts_remove(
             agent_accounts_ensure_kind_entry(&mut registry, kind);
             let mut suppressed = agent_accounts_suppressed_emails(&registry, kind);
             if !suppressed.iter().any(|entry| entry == &removed_email) {
-                suppressed.push(removed_email);
+                suppressed.push(removed_email.clone());
             }
             registry["agents"][kind]["captured_suppressed"] = json!(suppressed);
         }
         agent_accounts_registry_write(&registry)?;
+        if removed_was_duplicate {
+            let (provider, tokenomics_agent_kind) = match kind {
+                "claude" => ("anthropic", "claude"),
+                "codex" => ("openai", "codex"),
+                _ => ("opencode", "opencode"),
+            };
+            let synthetic_key =
+                format!("{provider}:{tokenomics_agent_kind}:profile:{profile_id}");
+            // When the removed identity is the one signed into the default
+            // home, fold its synthetic history into the live canonical
+            // account; otherwise a durable retirement keeps the phantom pill
+            // hidden without deleting its rows.
+            let canonical_key = (!removed_email.is_empty()
+                && removed_email == current_email)
+                .then(|| tokenomics_provider_account(provider, tokenomics_agent_kind).key)
+                .filter(|key| !tokenomics_provider_account_key_is_unknown(key));
+            let _ = tokenomics_persist_retired_provider_account_key_for_app(
+                &app,
+                provider,
+                tokenomics_agent_kind,
+                &synthetic_key,
+                canonical_key.as_deref(),
+            );
+        }
         // Profiles are credential snapshots, so a delete is a real delete —
         // but only ever inside the managed agent-profiles root.
         if let (Some(dir), Some(root)) = (
@@ -5532,9 +5941,9 @@ async fn agent_accounts_pane_profiles() -> Result<Value, String> {
     Ok(json!({
         "panes": panes,
         "active": {
-            "claude": { "profile_id": claude_active, "profile_label": claude_label },
-            "codex": { "profile_id": codex_active, "profile_label": codex_label },
-            "opencode": { "profile_id": opencode_active, "profile_label": opencode_label },
+            "claude": { "profile_id": claude_active, "profile_label": claude_label, "auth_revision": agent_accounts_active_auth_revision("claude") },
+            "codex": { "profile_id": codex_active, "profile_label": codex_label, "auth_revision": agent_accounts_active_auth_revision("codex") },
+            "opencode": { "profile_id": opencode_active, "profile_label": opencode_label, "auth_revision": agent_accounts_active_auth_revision("opencode") },
         },
         "auth": auth,
     }))
@@ -5545,6 +5954,43 @@ mod agent_accounts_tests {
     use super::*;
 
     static AGENT_ACCOUNTS_TEST_ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+
+    #[test]
+    fn registry_parse_rejects_torn_writes_and_last_good_survives() {
+        let _env_guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert!(agent_accounts_registry_parse("{\"agents\": {\"codex\"").is_none());
+        assert!(agent_accounts_registry_parse("[1, 2]").is_none());
+        // Structurally invalid shapes must not become "last known good".
+        assert!(agent_accounts_registry_parse("{}").is_none());
+        assert!(agent_accounts_registry_parse("{\"agents\": null}").is_none());
+        let registry = json!({ "agents": { "codex": { "profiles": [{ "id": "p1" }] } } });
+        assert_eq!(
+            agent_accounts_registry_parse(&registry.to_string()).as_ref(),
+            Some(&registry)
+        );
+
+        agent_accounts_registry_remember_last_good(&registry);
+        assert_eq!(agent_accounts_registry_last_good_or_empty(), registry);
+        let empty = json!({ "agents": {} });
+        agent_accounts_registry_remember_last_good(&empty);
+        assert_eq!(agent_accounts_registry_last_good_or_empty(), empty);
+    }
+
+    #[test]
+    fn codex_workspace_trust_upsert_is_idempotent_and_overrides_untrusted() {
+        let root = Path::new("/tmp/diff-forge trust/project");
+        let original = format!(
+            "model = \"gpt-5\"\n\n[projects.\"{}\"]\ntrust_level = \"untrusted\"\n",
+            agent_accounts_toml_escape(&root.to_string_lossy()),
+        );
+        let trusted = agent_accounts_upsert_codex_trust(&original, root);
+        assert!(trusted.contains("trust_level = \"trusted\""));
+        assert!(!trusted.contains("trust_level = \"untrusted\""));
+        assert_eq!(agent_accounts_upsert_codex_trust(&trusted, root), trusted);
+    }
 
     struct ScopedAgentAccountsEnv {
         key: &'static str,

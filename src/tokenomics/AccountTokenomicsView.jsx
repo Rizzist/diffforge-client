@@ -40,6 +40,18 @@ import {
   tokenomicsAccountsFromDistinctKeys,
   uniqueTokenomicsAliasesByOwner,
 } from "./tokenomicsAccountIdentity.js";
+import {
+  PROVIDER_ACCOUNT_FILTER_PROVIDERS,
+  mergeTokenomicsProviderAccounts,
+  providerKey,
+  rowDeviceId,
+  rowScopeKey,
+  tokenomicsCurrentProfileIdsByProvider,
+  tokenomicsProfileIdFromAccountKey,
+  tokenomicsProviderProfileAccountKey,
+  tokenomicsRowAgentProfileId,
+  tokenomicsRowReferencesRemovedProfile,
+} from "./tokenomicsAccountRoster.js";
 
 const TOKENOMICS_SCAN_PROGRESS_EVENT = "diffforge://tokenomics-scan-progress";
 const TOKENOMICS_UPDATED_EVENT = "diffforge://tokenomics-updated";
@@ -87,7 +99,6 @@ const PROVIDER_ACCENTS = {
   opencode: "#34d399",
 };
 
-const PROVIDER_ACCOUNT_FILTER_PROVIDERS = ["codex", "claude", "opencode"];
 const TOKENOMICS_PROVIDER_ACCOUNT_FILTER_NONE = "__none__";
 
 const AGENT_ACCOUNTS_CHANGED_EVENT = "agent-accounts-changed";
@@ -851,21 +862,6 @@ function tokenomicsEmailLocalPart(value) {
   return normalizeTokenomicsEmail(value).split("@")[0] || "";
 }
 
-function tokenomicsProviderProfileAccountKey(providerId, profileId) {
-  const cleanProfileId = String(profileId || "").trim();
-  if (!cleanProfileId || cleanProfileId === "default") return "";
-  if (providerId === "claude") return `anthropic:claude:profile:${cleanProfileId}`;
-  if (providerId === "codex") return `openai:codex:profile:${cleanProfileId}`;
-  if (providerId === "opencode") return `opencode:opencode:profile:${cleanProfileId}`;
-  return "";
-}
-
-function tokenomicsProfileIdFromAccountKey(providerId, accountKey) {
-  const clean = String(accountKey || "").trim();
-  const prefix = tokenomicsProviderProfileAccountKey(providerId, "__profile__").replace("__profile__", "");
-  return prefix && clean.startsWith(prefix) ? clean.slice(prefix.length).trim() : "";
-}
-
 function normalizeTokenomicsAliasLabel(value, providerId = "") {
   let label = normalizeProviderAccountLabel(value)
     .replace(/[·•]/gu, " ")
@@ -910,10 +906,6 @@ function tokenomicsProfileLabelCandidates(profile = {}, providerId = "") {
   labels.delete("");
   labels.delete("default");
   return [...labels];
-}
-
-function tokenomicsRowAgentProfileId(row = {}) {
-  return String(row?.agent_profile_id || "").trim();
 }
 
 function tokenomicsAccountLabelScore(label, providerId = "") {
@@ -1109,15 +1101,6 @@ function storageUsageModel(billingStatus = {}, liveStorageUsage = null) {
   };
 }
 
-function providerKey(row) {
-  const agent = String(row?.agent_kind || "").toLowerCase();
-  const provider = String(row?.provider || "").toLowerCase();
-  if (agent.includes("codex") || provider.includes("openai") || provider.includes("codex")) return "codex";
-  if (agent.includes("claude") || provider.includes("anthropic") || provider.includes("claude")) return "claude";
-  if (agent.includes("opencode") || provider.includes("opencode")) return "opencode";
-  return provider || agent || "agent";
-}
-
 function providerLabel(row) {
   const key = providerKey(row);
   return PROVIDER_LABELS[key] || PROVIDER_LABELS[String(row?.provider || "").toLowerCase()] || row?.label || "Agent";
@@ -1133,20 +1116,6 @@ function providerAccountHeading(providerId) {
   if (providerId === "codex") return "Codex";
   if (providerId === "claude") return "Claude";
   return providerDisplayName(providerId);
-}
-
-function rowDeviceId(row) {
-  return String(row?.device_id || row?.machine_id || "").trim();
-}
-
-function rowScopeKey(row) {
-  const explicit = String(row?.billing_scope_key || "").trim();
-  if (explicit) return explicit;
-  const type = String(row?.billing_scope_type || row?.scope_type || "").trim().toLowerCase();
-  const teamId = String(row?.billing_team_id || row?.team_id || "").trim();
-  if (type === "team" || teamId) return teamId ? `team:${teamId}` : "team";
-  if (type === "personal") return "personal";
-  return "unknown";
 }
 
 function tokenomicsDeviceIdentityRows(summary = {}) {
@@ -1323,32 +1292,6 @@ function buildTokenomicsAccountIdentityIndex(agentAccounts) {
     index.providerGroupCount.set(group.provider_id, (index.providerGroupCount.get(group.provider_id) || 0) + 1);
   }
   return groups.size ? index : null;
-}
-
-function tokenomicsCurrentProfileIdsByProvider(agentAccounts) {
-  if (!agentAccounts || typeof agentAccounts !== "object") return null;
-  return PROVIDER_ACCOUNT_FILTER_PROVIDERS.reduce((acc, providerId) => {
-    const profiles = Array.isArray(agentAccounts?.[providerId]?.profiles)
-      ? agentAccounts[providerId].profiles
-      : [];
-    acc[providerId] = new Set(
-      profiles
-        .map((profile) => String(profile?.id || "").trim())
-        .filter(Boolean),
-    );
-    return acc;
-  }, {});
-}
-
-function tokenomicsRowReferencesRemovedProfile(row, currentProfileIdsByProvider) {
-  const providerId = providerKey(row);
-  const profileId = tokenomicsRowAgentProfileId(row)
-    || tokenomicsProfileIdFromAccountKey(providerId, rowProviderAccountKey(row));
-  if (!profileId || profileId === "default") return false;
-  if (!currentProfileIdsByProvider) return true;
-  const currentIds = currentProfileIdsByProvider[providerId];
-  if (!currentIds) return false;
-  return Boolean(profileId && !currentIds.has(profileId));
 }
 
 function tokenomicsResolveAccountGroup(row, index) {
@@ -2203,8 +2146,8 @@ function limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable =
   return "Safe at current pace";
 }
 
-function usageRateRowsFromLimit(limit, hourlyRows, selectedProvider, selectedAccountKeys, selectedDeviceId, selectedScopeKey = "all") {
-  const windowSeconds = sessionWindowSeconds(limit);
+function usageRateRowsFromLimit(limit, hourlyRows, selectedProvider, selectedAccountKeys, selectedDeviceId, selectedScopeKey = "all", windowKind = "5_hour") {
+  const windowSeconds = usageRateWindowSeconds(limit, windowKind);
   const bucketCount = Math.max(1, Math.ceil(windowSeconds / 3600));
   const rows = filterRows(Array.isArray(hourlyRows) ? hourlyRows : [], selectedProvider, selectedAccountKeys, selectedDeviceId, selectedScopeKey);
   if (rows.some((row) => row?.window_index != null)) {
@@ -2320,8 +2263,18 @@ function usageRateAxisLabels(rows, windowKind) {
     .filter(Boolean);
 }
 
-function sessionWindowSeconds(limit) {
-  return numeric(limit?.limit_window_seconds) || 5 * 60 * 60;
+// The graph must follow the toggle: a limit row can carry a window duration
+// that contradicts its kind (old builds classified codex windows by API
+// position, so "5h" rows could hold week- or month-long windows, and stale
+// cloud-synced rows from un-updated devices still can). Durations outside the
+// toggle's band snap to its canonical window instead of silently redrawing
+// the other graph.
+function usageRateWindowSeconds(limit, windowKind) {
+  const seconds = numeric(limit?.limit_window_seconds);
+  if (windowKind === "weekly") {
+    return seconds >= 5 * 24 * 3600 && seconds <= 14 * 24 * 3600 ? seconds : 7 * 24 * 60 * 60;
+  }
+  return seconds >= 3600 && seconds <= 6 * 3600 ? seconds : 5 * 60 * 60;
 }
 
 function limitSourceText(limit) {
@@ -2438,13 +2391,16 @@ function providerAccountOptions(summary, selectedProvider, selectedDeviceId = "a
   const usageRows = accountRowsForDisplay(summary);
   const accountRows = summaryArray(summary, "provider_accounts");
   const limitRows = limitRowsForDisplay(summary);
+  // Usage history and the durable account catalog are never gated on the
+  // CURRENT registry view: canonical-dedupe hiding (or mid-login churn) must
+  // not erase known accounts. Only ephemeral live-limit rows — whose whole
+  // point is "what is signed in right now" — honor profile removal.
   const rows = [
     ...usageRows,
     ...accountRows,
-    ...limitRows,
+    ...limitRows.filter((row) => !tokenomicsRowReferencesRemovedProfile(row, currentProfileIds)),
   ].filter((row) => (
     provider.match(row)
-      && !tokenomicsRowReferencesRemovedProfile(row, currentProfileIds)
       && (selectedDeviceId === "all" || !rowDeviceId(row) || rowDeviceId(row) === selectedDeviceId)
       && (selectedScopeKey === "all" || rowScopeKey(row) === selectedScopeKey)
   ));
@@ -2651,6 +2607,7 @@ function mergeTokenomicsSummary(previous, next) {
   return {
     ...previous,
     ...next,
+    provider_accounts: mergeTokenomicsProviderAccounts(previous, next),
     total: next.total || previous.total,
     by_device: next.by_device || (clearLegacyRows ? undefined : previous.by_device),
     by_device_provider: next.by_device_provider || (clearLegacyRows ? undefined : previous.by_device_provider),
@@ -3638,8 +3595,8 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
   const weekly = useMemo(() => mergeLimits(limits, "weekly"), [limits]);
   const usageRateLimit = usageRateWindowKind === "weekly" ? weekly : fiveHour;
   const sessionUsageRows = useMemo(
-    () => usageRateRowsFromLimit(usageRateLimit, hourlyRaw, selectedProvider, selectedAccountFilter, selectedDeviceId, selectedScopeKey),
-    [hourlyRaw, selectedAccountFilter, selectedDeviceId, selectedProvider, selectedScopeKey, usageRateLimit],
+    () => usageRateRowsFromLimit(usageRateLimit, hourlyRaw, selectedProvider, selectedAccountFilter, selectedDeviceId, selectedScopeKey, usageRateWindowKind),
+    [hourlyRaw, selectedAccountFilter, selectedDeviceId, selectedProvider, selectedScopeKey, usageRateLimit, usageRateWindowKind],
   );
   const sessionUsageBarWidth = usageRateBarWidth(sessionUsageRows.length);
   const sessionUsageLabels = usageRateAxisLabels(sessionUsageRows, usageRateWindowKind);

@@ -541,7 +541,8 @@ struct CloudMcpState {
     global_ws_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Value>>>>,
     global_ws_pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     global_ws_events: tokio::sync::broadcast::Sender<Value>,
-    terminal_io_stream_subscriptions: Arc<StdMutex<HashMap<String, HashSet<String>>>>,
+    terminal_io_stream_subscriptions:
+        Arc<StdMutex<HashMap<String, HashMap<String, String>>>>,
     terminal_io_control_owners: Arc<StdMutex<HashMap<String, String>>>,
     terminal_io_tail_by_stream: Arc<StdMutex<HashMap<String, CloudMcpTerminalIoTail>>>,
     terminal_io_output_send_lock: Arc<Mutex<()>>,
@@ -21083,7 +21084,24 @@ fn cloud_mcp_run_codex_app_server_candidate(candidate: &str) -> Result<Value, St
         .map(|stderr| spawn_opencode_models_pipe_reader("stderr", stderr));
     let (stdout_sender, stdout_receiver) = std::sync::mpsc::channel();
     let stdout_reader = cloud_mcp_spawn_codex_app_server_stdout_reader(stdout, stdout_sender);
-    let request_id = 1_i64;
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {
+                "name": "diff-forge",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": {}
+        },
+    });
+    let initialized = json!({
+        "jsonrpc": "2.0",
+        "method": "initialized",
+        "params": {},
+    });
+    let request_id = 2_i64;
     let request = json!({
         "jsonrpc": "2.0",
         "id": request_id,
@@ -21091,8 +21109,8 @@ fn cloud_mcp_run_codex_app_server_candidate(candidate: &str) -> Result<Value, St
         "params": {},
     });
     stdin
-        .write_all(format!("{request}\n").as_bytes())
-        .map_err(|error| format!("Unable to write Codex model/list request: {error}"))?;
+        .write_all(format!("{initialize}\n{initialized}\n{request}\n").as_bytes())
+        .map_err(|error| format!("Unable to initialize Codex app-server model discovery: {error}"))?;
     let _ = stdin.flush();
     drop(stdin);
 
@@ -26362,6 +26380,26 @@ fn cloud_mcp_compact_terminal_live_state(terminal: &Value, index: usize) -> Valu
             .or_insert_with(|| terminal_id.clone());
         item.entry("pane_id".to_string()).or_insert(terminal_id);
     }
+    if let Some(pane_id) = item
+        .get("pane_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let Some(stamp) = agent_accounts_pane_profile_stamp(pane_id) {
+            for (target, source) in [
+                ("provider_account_id", "profile_id"),
+                ("provider_account_label", "profile_label"),
+                ("provider_auth_revision", "auth_revision"),
+                ("provider_workspace_trust_state", "workspace_trust_state"),
+                ("provider_workspace_trust_source", "workspace_trust_source"),
+            ] {
+                if let Some(value) = stamp.get(source).cloned() {
+                    item.insert(target.to_string(), value);
+                }
+            }
+        }
+    }
     cloud_mcp_compact_insert_value(
         &mut item,
         "terminal_instance_id",
@@ -27207,6 +27245,7 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
             "active": false,
             "target_device_id": device_id,
         },
+        "provider_accounts": agent_accounts_device_live_state(),
     });
     if let Some(object) = payload.as_object_mut() {
         if has_app_context {
@@ -30637,7 +30676,7 @@ async fn cloud_mcp_handle_terminal_io_message(
                 subscriptions
                     .entry(target.stream_key.clone())
                     .or_default()
-                    .insert(origin.clone());
+                    .insert(origin.clone(), request_id.clone());
             }
             let size = *instance.size.lock().await;
             let (total, bytes, retained_tail_bytes) = {
@@ -30662,7 +30701,7 @@ async fn cloud_mcp_handle_terminal_io_message(
                 &target,
                 "termio.attached",
                 request_id.clone(),
-                json!({"cols": size.cols, "rows": size.rows, "seq": seq, "q": seq, "f": total, "n": total, "from_total_bytes": total, "total_bytes": total, "mode": "vt", "retained_tail_bytes": retained_tail_bytes}),
+                json!({"attachment_id": request_id, "cols": size.cols, "rows": size.rows, "seq": seq, "q": seq, "f": total, "n": total, "from_total_bytes": total, "total_bytes": total, "mode": "vt", "retained_tail_bytes": retained_tail_bytes}),
             )
             .await;
             let _ = cloud_mcp_send_terminal_io_message(
@@ -30672,6 +30711,7 @@ async fn cloud_mcp_handle_terminal_io_message(
                 "termio.snapshot",
                 format!("{}-snapshot", request_id),
                 json!({
+                    "attachment_id": request_id,
                     "q": seq,
                     "seq": seq,
                     "f": total,
@@ -30688,9 +30728,15 @@ async fn cloud_mcp_handle_terminal_io_message(
             .await;
         }
         "termio.detach" => {
+            let attachment_id = cloud_mcp_payload_text(message, &["attachment_id", "attach_id"]);
             if let Ok(mut subscriptions) = state.terminal_io_stream_subscriptions.lock() {
                 if let Some(origins) = subscriptions.get_mut(&target.stream_key) {
-                    origins.remove(&origin);
+                    let current_attachment = origins.get(&origin).cloned();
+                    if attachment_id.as_deref().is_none_or(|requested| {
+                        current_attachment.as_deref() == Some(requested)
+                    }) {
+                        origins.remove(&origin);
+                    }
                     if origins.is_empty() {
                         subscriptions.remove(&target.stream_key);
                     }
@@ -31044,12 +31090,11 @@ fn cloud_mcp_terminal_output_replay_frame(
 
 pub(crate) fn cloud_mcp_publish_terminal_output_delta(
     state: &CloudMcpState,
+    headless_output: &Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
     workspace_id: &str,
     pane_id: &str,
     instance_id: u64,
     seq: u64,
-    from_total_bytes: u64,
-    total_bytes: u64,
     chunk: &[u8],
 ) {
     if chunk.is_empty() {
@@ -31063,35 +31108,44 @@ pub(crate) fn cloud_mcp_publish_terminal_output_delta(
         pane_id,
         instance_id,
     );
-    let gap = state
-        .terminal_io_tail_by_stream
-        .lock()
-        .ok()
-        .and_then(|tails| tails.get(&stream_key).cloned())
-        .filter(|previous| {
-            previous.seq.saturating_add(1) != seq
-                || previous.total_bytes != from_total_bytes
-        })
-        .map(|previous| (previous.seq, previous.total_bytes));
-    // The reader calls this synchronously in PTY order. Retain and enqueue the
-    // websocket frame before returning; spawning one task per chunk allowed
-    // later chunks to acquire the async send lock first and manufacture gaps.
-    if !cloud_mcp_remember_terminal_output_tail(
-        state,
-        &stream_key,
-        seq,
-        total_bytes,
-        chunk,
-    ) {
-        return;
-    }
-    if !cloud_mcp_terminal_output_stream_is_subscribed(state, &stream_key) {
-        return;
-    }
     let state = state.clone();
+    let headless_output = Arc::clone(headless_output);
     let chunk = chunk.to_vec();
     tauri::async_runtime::block_on(async move {
+        // This lock is the terminal journal barrier. A checkpoint and a delta
+        // can no longer observe two different byte clocks: parser append,
+        // replay-tail advance, and websocket enqueue happen as one ordered cut.
         let _send_guard = state.terminal_io_output_send_lock.lock().await;
+        let (from_total_bytes, total_bytes) = {
+            let Ok(mut output) = headless_output.lock() else {
+                return;
+            };
+            let from = output.total_bytes;
+            output.append(&chunk);
+            (from, output.total_bytes)
+        };
+        let gap = state
+            .terminal_io_tail_by_stream
+            .lock()
+            .ok()
+            .and_then(|tails| tails.get(&stream_key).cloned())
+            .filter(|previous| {
+                previous.seq.saturating_add(1) != seq
+                    || previous.total_bytes != from_total_bytes
+            })
+            .map(|previous| (previous.seq, previous.total_bytes));
+        if !cloud_mcp_remember_terminal_output_tail(
+            &state,
+            &stream_key,
+            seq,
+            total_bytes,
+            &chunk,
+        ) {
+            return;
+        }
+        if !cloud_mcp_terminal_output_stream_is_subscribed(&state, &stream_key) {
+            return;
+        }
         let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() else {
             return;
         };
@@ -31234,6 +31288,27 @@ pub(crate) async fn cloud_mcp_revoke_terminal_io_control_for_local_action(
         json!({"released": true, "reason": reason, "source": "native"}),
     )
     .await;
+}
+
+pub(crate) fn cloud_mcp_terminal_io_has_remote_control(
+    state: &CloudMcpState,
+    workspace_id: &str,
+    pane_id: &str,
+    instance_id: u64,
+) -> bool {
+    let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
+        .unwrap_or_else(|| "desktop-primary".to_string());
+    let stream_key = cloud_mcp_terminal_output_stream_key(
+        &device_id,
+        workspace_id,
+        pane_id,
+        instance_id,
+    );
+    state
+        .terminal_io_control_owners
+        .lock()
+        .map(|owners| owners.contains_key(&stream_key))
+        .unwrap_or(false)
 }
 
 async fn cloud_mcp_flush_pending_device_live_snapshot(state: &CloudMcpState) {
@@ -56761,6 +56836,47 @@ mod cloud_mcp_tests {
     }
 
     #[test]
+    fn termio_vt_resize_rebuild_preserves_recent_fullscreen_prompt_content() {
+        let mut output = TerminalHeadlessOutputBuffer::new(12, 48);
+        output.append(b"\x1b[2J\x1b[HHooks need review\r\n1. Review hooks\r\n2. Trust all and continue\r\n3. Continue without trusting");
+        output.resize_vt(6, 32);
+        output.resize_vt(18, 80);
+        let contents = output.vt.screen().contents();
+        assert!(contents.contains("Hooks need review"));
+        assert!(contents.contains("Trust all and continue"));
+        assert!(contents.contains("Continue without trusting"));
+    }
+
+    #[test]
+    fn termio_journal_advances_headless_and_replay_offsets_together() {
+        let state = CloudMcpState::new();
+        let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
+        cloud_mcp_publish_terminal_output_delta(
+            &state,
+            &output,
+            "workspace",
+            "pane",
+            77,
+            1,
+            b"first",
+        );
+        let total = output.lock().unwrap().total_bytes;
+        assert_eq!(total, 5);
+        let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
+            .unwrap_or_else(|| "desktop-primary".to_string());
+        let stream_key = cloud_mcp_terminal_output_stream_key(
+            &device_id,
+            "workspace",
+            "pane",
+            77,
+        );
+        let tail = state.terminal_io_tail_by_stream.lock().unwrap();
+        let retained = tail.get(&stream_key).expect("journal tail");
+        assert_eq!((retained.seq, retained.total_bytes), (1, total));
+        assert_eq!(retained.tail, b"first");
+    }
+
+    #[test]
     fn termio_control_and_subscriptions_are_scoped_by_origin_connection() {
         let state = CloudMcpState::new();
         let stream_key = "device:workspace:pane:9".to_string();
@@ -56770,7 +56886,10 @@ mod cloud_mcp_tests {
             .unwrap()
             .insert(
                 stream_key.clone(),
-                HashSet::from(["viewer-a".to_string(), "viewer-b".to_string()]),
+                HashMap::from([
+                    ("viewer-a".to_string(), "attach-a".to_string()),
+                    ("viewer-b".to_string(), "attach-b".to_string()),
+                ]),
             );
         state
             .terminal_io_control_owners
@@ -58562,6 +58681,10 @@ mod cloud_mcp_tests {
             prompt_default_option: None,
             prompt_ttl_ms: None,
             prompt_options: Vec::new(),
+            prompt_questions: None,
+            prompt_schema: None,
+            prompt_url: None,
+            provider_payload: None,
             allows_free_text: false,
             prompt_answer_option: None,
             interaction_id: None,
