@@ -228,8 +228,8 @@ fn agent_chat_session_set_terminal_observed(
     active: bool,
 ) -> usize {
     let key = agent_chat_session_observed_terminal_key(workspace_id, pane_id, instance_id);
-    let observed = AGENT_CHAT_SESSION_OBSERVED_TERMINALS
-        .get_or_init(|| StdMutex::new(HashSet::new()));
+    let observed =
+        AGENT_CHAT_SESSION_OBSERVED_TERMINALS.get_or_init(|| StdMutex::new(HashSet::new()));
     let Ok(mut observed) = observed.lock() else {
         return 0;
     };
@@ -488,9 +488,43 @@ fn normalize_prompt_match_text(value: impl AsRef<str>) -> String {
     output.trim().to_string()
 }
 
+fn codex_strip_native_image_envelopes(value: impl AsRef<str>) -> String {
+    let mut output = value.as_ref().to_string();
+    loop {
+        let Some(start) = output.find("<image") else {
+            break;
+        };
+        let Some(relative_end) = output[start..].find("</image>") else {
+            break;
+        };
+        let end = start + relative_end + "</image>".len();
+        output.replace_range(start..end, "");
+    }
+    output
+}
+
+fn codex_strip_image_attachment_summary(value: impl AsRef<str>) -> String {
+    value
+        .as_ref()
+        .lines()
+        .filter(|line| {
+            let token = line.trim().to_ascii_lowercase();
+            !(token.starts_with('[')
+                && token.ends_with("image attachment(s)]")
+                && token[1..]
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|count| count.parse::<usize>().is_ok()))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn codex_normalize_user_prompt_text(value: impl AsRef<str>) -> String {
+    let without_envelopes = codex_strip_native_image_envelopes(value);
+    let without_summary = codex_strip_image_attachment_summary(without_envelopes);
     normalize_prompt_match_text(clean_codex_transcript_text(
-        value,
+        without_summary,
         CODEX_TRANSCRIPT_MAX_TEXT,
     ))
 }
@@ -1438,13 +1472,12 @@ fn promote_generated_image_artifacts(
                 continue;
             };
             let asset_path =
-                cloud_mcp_payload_text(&promoted, &["local_path", "path"])
-                    .unwrap_or_default();
+                cloud_mcp_payload_text(&promoted, &["local_path", "path"]).unwrap_or_default();
             if asset_path.is_empty() {
                 continue;
             }
-            let asset_id = cloud_mcp_payload_text(&promoted, &["asset_id", "id"])
-                .unwrap_or_default();
+            let asset_id =
+                cloud_mcp_payload_text(&promoted, &["asset_id", "id"]).unwrap_or_default();
             let original_path = artifact.path.clone();
             artifact.asset_id = asset_id;
             artifact.asset_path = asset_path.clone();
@@ -1667,6 +1700,27 @@ fn collect_codex_image_artifacts_from_text(
         let trimmed = line.trim();
         let lower = trimmed.to_lowercase();
         collect_codex_generated_image_notice_artifacts(trimmed, title, prompt, artifacts, seen);
+
+        if lower.starts_with("<image") {
+            if let Some(path_index) = lower.find("path=") {
+                let value = trimmed[path_index + "path=".len()..].trim_start();
+                let reference = if let Some(quote) =
+                    value.chars().next().filter(|ch| *ch == '"' || *ch == '\'')
+                {
+                    value[quote.len_utf8()..]
+                        .split(quote)
+                        .next()
+                        .unwrap_or_default()
+                } else {
+                    value
+                        .split(|ch: char| ch.is_whitespace() || ch == '>')
+                        .next()
+                        .unwrap_or_default()
+                };
+                push_codex_image_artifact(artifacts, seen, reference, title, prompt, "");
+            }
+            continue;
+        }
 
         for marker in ["saved to:", "generated image:", "image:", "path:"] {
             if lower.starts_with(marker) {
@@ -3481,10 +3535,32 @@ fn codex_messages_from_response_item(
                 .unwrap_or_default();
             let content = payload.get("content").unwrap_or(&Value::Null);
             let raw_text = codex_content_text(content);
-            let (text, truncated) =
-                clean_codex_transcript_text_with_truncation(&raw_text, CODEX_TRANSCRIPT_MAX_TEXT);
-            let artifacts =
-                codex_image_artifacts_from_content(content, &raw_text, "Generated image");
+            let artifact_title = if role == "user" {
+                "Attached image"
+            } else {
+                "Generated image"
+            };
+            let artifacts = codex_image_artifacts_from_content(content, &raw_text, artifact_title);
+            let display_text = if role == "user" {
+                let mut text = codex_strip_native_image_envelopes(&raw_text)
+                    .trim()
+                    .to_string();
+                if !artifacts.is_empty()
+                    && !text.to_ascii_lowercase().contains("image attachment(s)]")
+                {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&format!("[{} image attachment(s)]", artifacts.len()));
+                }
+                text
+            } else {
+                raw_text.clone()
+            };
+            let (text, truncated) = clean_codex_transcript_text_with_truncation(
+                &display_text,
+                CODEX_TRANSCRIPT_MAX_TEXT,
+            );
             if role == "developer" {
                 if artifacts.is_empty() {
                     return Vec::new();
@@ -3955,6 +4031,37 @@ mod agent_sessions_tests {
     }
 
     #[test]
+    fn codex_response_item_normalizes_native_attached_image_envelope() {
+        let path = "/tmp/diffforge-todo-attachments/chat-images-staged/image.jpg";
+        let messages = codex_messages_from_response_item(
+            7,
+            "2026-07-12T12:00:00Z",
+            &json!({
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": format!(
+                        "<image name=[Image #1] path=\"{path}\">\n</image>\n[Image #1] what is this?"
+                    )
+                }]
+            }),
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert!(!messages[0].text.contains("<image"));
+        assert!(messages[0].text.contains("[Image #1] what is this?"));
+        assert!(messages[0].text.contains("[1 image attachment(s)]"));
+        assert_eq!(messages[0].artifacts.len(), 1);
+        assert_eq!(messages[0].artifacts[0].path, path);
+        assert_eq!(messages[0].artifacts[0].title, "Attached image");
+        assert_eq!(
+            codex_normalize_user_prompt_text(&messages[0].text),
+            "[Image #1] what is this?"
+        );
+    }
+
+    #[test]
     fn codex_rollout_prefers_event_user_message_over_adjacent_response_item() {
         let root = unique_test_dir("codex-user-dedupe");
         fs::create_dir_all(&root).unwrap();
@@ -4421,14 +4528,8 @@ mod agent_sessions_tests {
         assert_eq!(message.call_id, "legacy-call");
         assert_eq!(message.created_at, "2026-01-02T00:00:04Z");
         assert_eq!(message.tool_output, Some(json!({ "ok": true })));
-        assert_eq!(
-            message.tool_error,
-            Some(json!({ "message": "warning" }))
-        );
-        assert_eq!(
-            message.file_change,
-            Some(json!({ "path": "src/main.rs" }))
-        );
+        assert_eq!(message.tool_error, Some(json!({ "message": "warning" })));
+        assert_eq!(message.file_change, Some(json!({ "path": "src/main.rs" })));
         assert_eq!(message.duration_ms, Some(42));
         assert_eq!(message.exit_code, Some(0));
         let serialized = serde_json::to_value(message).expect("serialize normalized message");
@@ -7464,8 +7565,8 @@ fn agent_thread_transcript_signature(result: &CodexThreadTranscriptResult) -> St
 
 fn agent_thread_transcript_direct_message_value(message: &CodexThreadTranscriptMessage) -> Value {
     let mut value = serde_json::to_value(message).unwrap_or_else(|_| json!({}));
-    let legacy_kind = cloud_mcp_payload_text(&value, &["legacy_kind"])
-        .filter(|value| !value.trim().is_empty());
+    let legacy_kind =
+        cloud_mcp_payload_text(&value, &["legacy_kind"]).filter(|value| !value.trim().is_empty());
     if let Some(legacy_kind) = legacy_kind {
         let canonical_kind = cloud_mcp_payload_text(&value, &["kind"]).unwrap_or_default();
         if let Some(object) = value.as_object_mut() {

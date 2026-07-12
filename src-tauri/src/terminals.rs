@@ -574,6 +574,7 @@ fn terminal_launch_runtime_metadata_from_resolved(
         reasoning_effort: launch.reasoning_effort.clone(),
         speed: launch.speed.clone(),
         permission_mode: launch.permission_mode.clone(),
+        provider_error: None,
     }
 }
 
@@ -736,11 +737,8 @@ fn terminal_uuid_session_id_from_text(value: &str) -> Option<String> {
 }
 
 fn terminal_provider_session_id_from_transcript_path(event: &Value) -> Option<String> {
-    terminal_activity_hook_string(
-        event,
-        &["transcript_path", "agent_transcript_path"],
-    )
-    .and_then(|path| terminal_uuid_session_id_from_text(&path))
+    terminal_activity_hook_string(event, &["transcript_path", "agent_transcript_path"])
+        .and_then(|path| terminal_uuid_session_id_from_text(&path))
 }
 
 fn terminal_activity_hook_provider_session_id(event: &Value) -> Option<String> {
@@ -1873,8 +1871,7 @@ fn terminal_record_workspace_agent_session_history(
     });
 }
 
-const TERMINAL_CODEX_SESSION_DISCOVERY_DELAYS_MS: [u64; 6] =
-    [100, 250, 500, 1_000, 2_000, 4_000];
+const TERMINAL_CODEX_SESSION_DISCOVERY_DELAYS_MS: [u64; 6] = [100, 250, 500, 1_000, 2_000, 4_000];
 const TERMINAL_PROMPT_SESSION_DISCOVERY_DELAYS_MS: [u64; 8] =
     [50, 150, 300, 600, 1_200, 2_500, 5_000, 10_000];
 
@@ -3530,6 +3527,10 @@ struct TerminalSessionCapabilities {
     prompt_answer_mechanism: String,
     interrupt_mechanism: String,
     raw_input_mechanism: String,
+    control_protocol: String,
+    control_health: String,
+    structured_error_events: bool,
+    structured_safety_events: bool,
 }
 
 fn terminal_session_capabilities(
@@ -3571,10 +3572,10 @@ fn terminal_session_capabilities(
     };
     let can_list_models = matches!(provider.as_str(), "codex" | "claude" | "opencode");
     let can_select_model = can_list_models;
-    let can_change_model_now = matches!(provider.as_str(), "codex" | "claude");
+    let can_change_model_now = matches!(provider.as_str(), "codex" | "claude" | "opencode");
     let can_change_effort_now = matches!(provider.as_str(), "codex" | "claude");
     TerminalSessionCapabilities {
-        provider,
+        provider: provider.clone(),
         current_model,
         current_model_source: launch_metadata.model_source.clone(),
         current_effort: launch_metadata.reasoning_effort.clone(),
@@ -3591,11 +3592,63 @@ fn terminal_session_capabilities(
         can_select_model,
         can_change_model_now,
         can_change_effort_now,
-        can_change_permission_mode_now: false,
+        can_change_permission_mode_now: matches!(provider.as_str(), "codex" | "claude" | "opencode"),
         prompt_answer_mechanism: "pty_keystroke".to_string(),
         interrupt_mechanism: "pty_escape".to_string(),
         raw_input_mechanism: "unsupported_cloud_lane".to_string(),
+        control_protocol: match provider.as_str() {
+            "opencode" => "opencode_event_bridge",
+            "claude" => "claude_hooks_statusline",
+            "codex" => "codex_hooks_auth_observer",
+            _ => "pty_fallback",
+        }
+        .to_string(),
+        control_health: "available".to_string(),
+        structured_error_events: matches!(provider.as_str(), "codex" | "claude" | "opencode"),
+        structured_safety_events: matches!(provider.as_str(), "codex" | "claude" | "opencode"),
     }
+}
+
+fn terminal_effective_safety_state(
+    provider: &str,
+    launch_metadata: &TerminalLaunchRuntimeMetadata,
+    coordination: Option<&TerminalCoordinationSession>,
+) -> Value {
+    let permission_mode = launch_metadata
+        .permission_mode
+        .as_deref()
+        .unwrap_or(TERMINAL_PERMISSION_MODE_ACCEPT_EDITS);
+    let dangerous_bypass = permission_mode == TERMINAL_PERMISSION_MODE_BYPASS;
+    let hook_trust_bypassed = coordination.is_some_and(|context| {
+        context.env_vars.iter().any(|(key, value)| {
+            key == "DIFFFORGE_CODEX_BYPASS_HOOK_TRUST"
+                && matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        })
+    });
+    let (approval_policy, sandbox_policy) = match provider {
+        "codex" => match permission_mode {
+            TERMINAL_PERMISSION_MODE_PLAN => ("never", "read-only"),
+            TERMINAL_PERMISSION_MODE_ASK => ("on-request", "workspace-write"),
+            TERMINAL_PERMISSION_MODE_FULL_ACCESS => ("never", "danger-full-access"),
+            TERMINAL_PERMISSION_MODE_BYPASS => ("bypass", "danger-full-access"),
+            _ => ("never", "workspace-write"),
+        },
+        "claude" => (permission_mode, "provider-managed"),
+        "opencode" => (permission_mode, "provider-managed"),
+        _ => (permission_mode, "unknown"),
+    };
+    json!({
+        "contract": "diffforge.terminal_safety.v1",
+        "provider": provider,
+        "permission_mode": permission_mode,
+        "approval_policy": approval_policy,
+        "sandbox_policy": sandbox_policy,
+        "dangerous_bypass": dangerous_bypass,
+        "managed_policy_enforced": coordination.is_some(),
+        "hook_trust_bypassed": hook_trust_bypassed,
+        "fail_closed": !dangerous_bypass && !hook_trust_bypassed,
+        "decision_source": "desktop_launch_configuration",
+    })
 }
 
 #[derive(Serialize, Clone)]
@@ -3636,6 +3689,11 @@ struct TerminalLiveSessionSummary {
     runtime_event_type: String,
     runtime_hook_event_name: String,
     runtime_updated_at_ms: u64,
+    connectivity_state: String,
+    attention_state: String,
+    provider_health: String,
+    provider_error: Option<Value>,
+    effective_safety: Value,
     working_directory: String,
     session_mode: String,
     file_authority: String,
@@ -5398,7 +5456,10 @@ fn spawn_terminal_reader(
                 .filter(|value| !value.is_empty())
             {
                 object.insert("session_id".to_string(), json!(provider_session_id));
-                object.insert("provider_session_id".to_string(), json!(provider_session_id));
+                object.insert(
+                    "provider_session_id".to_string(),
+                    json!(provider_session_id),
+                );
                 object.insert("native_session_id".to_string(), json!(provider_session_id));
             }
             if let Some(turn_id) = runtime
@@ -5757,7 +5818,7 @@ fn spawn_terminal_reader(
         let mut forensics_total_chunks: u64 = 0;
         let mut forensics_total_bytes: u64 = 0;
         let mut auth_failure_scan_tail = String::new();
-        let mut auth_failure_marked = false;
+        let mut auth_failure_last_marked_at: Option<Instant> = None;
         let exit_reason = loop {
             if output_channel_closed.load(Ordering::SeqCst) {
                 break "output_channel_closed";
@@ -5807,15 +5868,60 @@ fn spawn_terminal_reader(
                             readiness_observer_in_flight.store(false, Ordering::Release);
                         });
                     }
-                    if !auth_failure_marked
-                        && agent_accounts_observe_terminal_auth_output(
+                    let auth_failure_debounce_elapsed = auth_failure_last_marked_at
+                        .map(|marked_at| marked_at.elapsed() >= Duration::from_secs(30))
+                        .unwrap_or(true);
+                    if auth_failure_debounce_elapsed {
+                        if let Some(auth_error) = agent_accounts_observe_terminal_auth_output(
                             &app,
                             &reader_pane_id,
                             &mut auth_failure_scan_tail,
                             chunk,
-                        )
-                    {
-                        auth_failure_marked = true;
+                        ) {
+                            auth_failure_last_marked_at = Some(Instant::now());
+                            auth_failure_scan_tail.clear();
+                            let error_app = app.clone();
+                            let error_terminals = Arc::clone(&terminals);
+                            let error_cloud_state = cloud_mcp_state.clone();
+                            let error_pane_id = reader_pane_id.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let Some(instance) = terminal_activity_hook_current_instance(
+                                    &error_terminals,
+                                    &error_pane_id,
+                                    instance_id,
+                                )
+                                .await
+                                else {
+                                    return;
+                                };
+                                let runtime = terminal_runtime_snapshot(&instance);
+                                let event = json!({
+                                    "hook_event_name": "StopFailure",
+                                    "provider": "codex",
+                                    "session_id": runtime.provider_session_id,
+                                    "turn_id": runtime.provider_turn_id.or(runtime.turn_id),
+                                    "error": auth_error.get("safe_message").cloned().unwrap_or(Value::Null),
+                                    "error_code": auth_error.get("provider_code").cloned().unwrap_or(Value::Null),
+                                    "error_type": "Unauthorized",
+                                    "retryable": false,
+                                    "source": "pty_auth_observer",
+                                });
+                                let Some(payload) = terminal_activity_hook_payload(&instance, &event)
+                                else {
+                                    return;
+                                };
+                                apply_terminal_activity_hook_payload(
+                                    &error_app,
+                                    &error_terminals,
+                                    &error_cloud_state,
+                                    &instance,
+                                    &event,
+                                    payload,
+                                    None,
+                                    "pty-auth-observer",
+                                );
+                            });
+                        }
                     }
                     ssh_password_autofill_observe_output(
                         &terminals,
@@ -6544,7 +6650,9 @@ fn agent_launch_input_allows_inline_fallback(input: &str) -> bool {
         .unwrap_or(input);
     let encoded_units = input.len().max(input.encode_utf16().count());
     encoded_units < AGENT_LAUNCH_INLINE_FALLBACK_MAX_ENCODED_UNITS
-        && !command.chars().any(|character| matches!(character, '\r' | '\n'))
+        && !command
+            .chars()
+            .any(|character| matches!(character, '\r' | '\n'))
 }
 
 fn agent_launch_stage_filename_matches(file_name: &str, extension: &str) -> bool {
@@ -6574,12 +6682,12 @@ fn prune_agent_launch_stage_files() {
     let now = SystemTime::now();
     for entry in entries.flatten() {
         let path = entry.path();
-        let matches_stage_file = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| {
-                agent_launch_stage_filename_matches(name, AGENT_LAUNCH_STAGE_EXTENSION)
-            });
+        let matches_stage_file =
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    agent_launch_stage_filename_matches(name, AGENT_LAUNCH_STAGE_EXTENSION)
+                });
         let should_prune = matches_stage_file
             && entry
                 .metadata()
@@ -6690,17 +6798,13 @@ fn stage_agent_launch_input_as_source_command(
     if !input.trim().is_empty() {
         ensure_agent_launch_stage_cleanup_sweeper();
     }
-    stage_agent_launch_input_as_source_command_in_directory_with(
-        input,
-        &env::temp_dir(),
-        |path| {
-            fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)
-        },
-    )
+    stage_agent_launch_input_as_source_command_in_directory_with(input, &env::temp_dir(), |path| {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    })
 }
 
 // Windows console line input is hard-capped well below our launch payloads
@@ -7882,8 +7986,9 @@ fn terminal_recover_crashed_sessions_report(roots: Option<Vec<String>>) -> Resul
                 scanned_sessions += report["scanned_sessions"].as_u64().unwrap_or(0);
                 idle_sessions_interrupted +=
                     report["idle_sessions_interrupted"].as_u64().unwrap_or(0);
-                finished_sessions_interrupted +=
-                    report["finished_sessions_interrupted"].as_u64().unwrap_or(0);
+                finished_sessions_interrupted += report["finished_sessions_interrupted"]
+                    .as_u64()
+                    .unwrap_or(0);
 
                 if let Some(tasks) = report["interrupted_tasks"].as_array_mut() {
                     for task in tasks.iter_mut() {
@@ -7892,8 +7997,10 @@ fn terminal_recover_crashed_sessions_report(roots: Option<Vec<String>>) -> Resul
                             if let Some(db_key) = &db_key {
                                 object.insert("db_path".to_string(), json!(db_key));
                             }
-                            object
-                                .insert("recovery_source".to_string(), json!(target.source.clone()));
+                            object.insert(
+                                "recovery_source".to_string(),
+                                json!(target.source.clone()),
+                            );
                         }
                         interrupted_tasks.push(task.clone());
                     }
@@ -7906,8 +8013,10 @@ fn terminal_recover_crashed_sessions_report(roots: Option<Vec<String>>) -> Resul
                             if let Some(db_key) = &db_key {
                                 object.insert("db_path".to_string(), json!(db_key));
                             }
-                            object
-                                .insert("recovery_source".to_string(), json!(target.source.clone()));
+                            object.insert(
+                                "recovery_source".to_string(),
+                                json!(target.source.clone()),
+                            );
                         }
                         crashed_terminals.push(terminal.clone());
                     }
@@ -10236,10 +10345,7 @@ pub(crate) fn observe_terminal_coordination_event(
             .filter(|value| !value.is_null());
             let selected_plan = plan_snapshot
                 .as_ref()
-                .and_then(|snapshot| {
-                    snapshot
-                        .get("selected_plan")
-                })
+                .and_then(|snapshot| snapshot.get("selected_plan"))
                 .cloned()
                 .filter(|value| !value.is_null());
             let plan_history = plan_snapshot
@@ -11881,6 +11987,7 @@ fn emit_terminal_prompt_submitted_activity_started(
         fork_from_provider_session_id,
         provider_turn_id: Some(prompt_event_id.clone()),
         turn_id: Some(prompt_event_id),
+        provider_error: None,
         transcript_path: None,
         cwd: Some(instance.working_directory.display().to_string()),
         user_message: Some(prompt.to_string()),
@@ -12499,10 +12606,7 @@ fn terminal_activity_hook_background_field_is_active(event: &Value, keys: &[&str
 }
 
 fn terminal_activity_hook_claude_stop_has_background_work(event: &Value) -> bool {
-    terminal_activity_hook_background_field_is_active(
-        event,
-        &["background_tasks", "session_crons"],
-    )
+    terminal_activity_hook_background_field_is_active(event, &["background_tasks", "session_crons"])
 }
 
 fn terminal_activity_hook_background_stop_forces_busy(
@@ -12518,16 +12622,16 @@ fn terminal_activity_hook_background_stop_forces_busy(
 
 fn terminal_activity_hook_explicit_input_not_ready(event: &Value) -> bool {
     ["input_ready", "is_input_ready", "ready_for_input"]
-    .iter()
-    .filter_map(|key| event.get(*key))
-    .any(|value| match value {
-        Value::Bool(value) => !*value,
-        Value::String(value) => matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "false" | "0" | "no" | "busy" | "not_ready" | "not-ready"
-        ),
-        _ => false,
-    })
+        .iter()
+        .filter_map(|key| event.get(*key))
+        .any(|value| match value {
+            Value::Bool(value) => !*value,
+            Value::String(value) => matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "false" | "0" | "no" | "busy" | "not_ready" | "not-ready"
+            ),
+            _ => false,
+        })
 }
 
 fn terminal_activity_hook_status_key(event: &Value, keys: &[&str]) -> Option<String> {
@@ -12909,8 +13013,7 @@ fn terminal_activity_hook_manual_prompt(
     }
 
     let approval_id = terminal_activity_hook_string(event, &["approval_id"]);
-    let permission_prompt_id =
-        terminal_activity_hook_string(event, &["permission_prompt_id"]);
+    let permission_prompt_id = terminal_activity_hook_string(event, &["permission_prompt_id"]);
     let permission_request_id = terminal_activity_hook_string(
         event,
         &[
@@ -12930,36 +13033,31 @@ fn terminal_activity_hook_manual_prompt(
         return None;
     }
 
-    let kind = terminal_activity_hook_string(
-        event,
-        &["prompting_user_kind", "prompting_kind"],
-    )
-    .map(|value| terminal_activity_hook_name_key(&value))
-    .filter(|value| {
-        matches!(
-            value.as_str(),
-            "approval" | "permission" | "question" | "selection" | "input" | "text" | "choice"
-        )
-    })
-    .unwrap_or_else(|| {
-        if terminal_activity_hook_bool(
-            event,
-            &["manual_approval_required"],
-        ) || hook_key.contains("approval")
-        {
-            "approval".to_string()
-        } else if hook_key.contains("elicitation") {
-            "selection".to_string()
-        } else if hook_key.contains("selection") {
-            "selection".to_string()
-        } else if hook_key.contains("question") {
-            "question".to_string()
-        } else if hook_key.contains("input") {
-            "input".to_string()
-        } else {
-            "permission".to_string()
-        }
-    });
+    let kind = terminal_activity_hook_string(event, &["prompting_user_kind", "prompting_kind"])
+        .map(|value| terminal_activity_hook_name_key(&value))
+        .filter(|value| {
+            matches!(
+                value.as_str(),
+                "approval" | "permission" | "question" | "selection" | "input" | "text" | "choice"
+            )
+        })
+        .unwrap_or_else(|| {
+            if terminal_activity_hook_bool(event, &["manual_approval_required"])
+                || hook_key.contains("approval")
+            {
+                "approval".to_string()
+            } else if hook_key.contains("elicitation") {
+                "selection".to_string()
+            } else if hook_key.contains("selection") {
+                "selection".to_string()
+            } else if hook_key.contains("question") {
+                "question".to_string()
+            } else if hook_key.contains("input") {
+                "input".to_string()
+            } else {
+                "permission".to_string()
+            }
+        });
     let text = terminal_activity_hook_string(
         event,
         &[
@@ -12992,14 +13090,14 @@ fn terminal_activity_hook_manual_prompt(
         }
     });
     let ttl_ms = ["prompt_ttl_ms", "ttl_ms", "timeout_ms"]
-    .iter()
-    .find_map(|key| {
-        event.get(*key).and_then(|value| {
-            value
-                .as_u64()
-                .or_else(|| value.as_str()?.parse::<u64>().ok())
-        })
-    });
+        .iter()
+        .find_map(|key| {
+            event.get(*key).and_then(|value| {
+                value
+                    .as_u64()
+                    .or_else(|| value.as_str()?.parse::<u64>().ok())
+            })
+        });
     let mut options = terminal_activity_hook_prompt_options_from_event(event, &kind);
     if let Some(default_option) = default_option.as_deref() {
         if !options.iter().any(|option| option.id == default_option) {
@@ -13079,6 +13177,235 @@ fn terminal_activity_hook_lifecycle_kind(
     }
 }
 
+fn terminal_provider_error_text_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_string())
+        }
+        Value::Object(object) => [
+            "message",
+            "error",
+            "detail",
+            "description",
+            "reason",
+            "body",
+        ]
+        .iter()
+        .find_map(|key| object.get(*key).and_then(terminal_provider_error_text_from_value)),
+        Value::Array(items) => items
+            .iter()
+            .find_map(terminal_provider_error_text_from_value),
+        _ => None,
+    }
+}
+
+fn terminal_provider_error_nested_text(event: &Value, keys: &[&str]) -> Option<String> {
+    let direct = keys.iter().find_map(|key| {
+        event
+            .get(*key)
+            .and_then(terminal_provider_error_text_from_value)
+    });
+    direct.or_else(|| {
+        ["error", "error_details", "errorDetails", "properties"]
+            .iter()
+            .filter_map(|key| event.get(*key).and_then(Value::as_object))
+            .find_map(|object| {
+                keys.iter().find_map(|key| {
+                    object
+                        .get(*key)
+                        .and_then(terminal_provider_error_text_from_value)
+                })
+            })
+    })
+}
+
+fn terminal_provider_error_safe_message(value: &str) -> String {
+    let mut cleaned = cloud_mcp_clean_terminal_state_text(value)
+        .replace('\0', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for prefix in [
+        "sk-proj-",
+        "sk-",
+        "github_pat_",
+        "ghp_",
+        "gho_",
+        "glpat-",
+        "Bearer ",
+        "api_key=",
+        "apiKey=",
+        "access_token=",
+        "refresh_token=",
+    ] {
+        let mut search_from = 0usize;
+        while let Some(relative_index) = cleaned[search_from..].find(prefix) {
+            let index = search_from + relative_index;
+            let secret_start = index + prefix.len();
+            let secret_end = cleaned[secret_start..]
+                .find(|character: char| {
+                    character.is_whitespace()
+                        || matches!(character, '"' | '\'' | '`' | ',' | ';' | ')' | ']' | '}')
+                })
+                .map(|offset| secret_start + offset)
+                .unwrap_or(cleaned.len());
+            cleaned.replace_range(secret_start..secret_end, "[redacted]");
+            search_from = secret_start + "[redacted]".len();
+        }
+    }
+    let lower = cleaned.to_ascii_lowercase();
+    if lower.contains("authorization: bearer") || lower.contains("refresh_token=") {
+        return "The provider reported an authentication failure. Sign in again.".to_string();
+    }
+    cleaned.chars().take(600).collect()
+}
+
+fn terminal_provider_error_category(code: &str, message: &str) -> &'static str {
+    let evidence = format!("{code} {message}").to_ascii_lowercase();
+    if evidence.contains("unauthorized")
+        || evidence.contains("authentication")
+        || evidence.contains("access token")
+        || evidence.contains("refresh token")
+        || evidence.contains("sign in")
+        || evidence.contains("login")
+        || evidence.contains("oauth")
+    {
+        "auth"
+    } else if evidence.contains("billing") || evidence.contains("payment") {
+        "billing"
+    } else if evidence.contains("rate_limit")
+        || evidence.contains("rate limit")
+        || evidence.contains("too many requests")
+    {
+        "rate_limit"
+    } else if evidence.contains("usage_limit")
+        || evidence.contains("usage limit")
+        || evidence.contains("quota")
+        || evidence.contains("context window")
+        || evidence.contains("max_output_tokens")
+    {
+        "quota"
+    } else if evidence.contains("model_not_found")
+        || evidence.contains("model not found")
+        || evidence.contains("unsupported model")
+    {
+        "model"
+    } else if evidence.contains("sandbox") || evidence.contains("policy") {
+        "policy"
+    } else if evidence.contains("permission") || evidence.contains("denied") {
+        "permission"
+    } else if evidence.contains("mcp") {
+        "mcp"
+    } else if evidence.contains("network")
+        || evidence.contains("connection")
+        || evidence.contains("stream")
+        || evidence.contains("timeout")
+    {
+        "network"
+    } else if evidence.contains("overloaded")
+        || evidence.contains("server_error")
+        || evidence.contains("internal server")
+    {
+        "server"
+    } else if evidence.contains("tool") || evidence.contains("command") {
+        "tool"
+    } else if evidence.contains("update") || evidence.contains("version") {
+        "update"
+    } else {
+        "unknown"
+    }
+}
+
+fn terminal_provider_error_actions(category: &str) -> Vec<Value> {
+    let mut actions = match category {
+        "auth" => vec![json!({"id": "sign_in", "label": "Sign in"})],
+        "model" => vec![json!({"id": "choose_model", "label": "Choose model"})],
+        "mcp" => vec![json!({"id": "reconnect_mcp", "label": "Reconnect MCP"})],
+        "rate_limit" | "network" | "server" => {
+            vec![json!({"id": "retry", "label": "Retry"})]
+        }
+        _ => Vec::new(),
+    };
+    actions.push(json!({"id": "open_terminal", "label": "Open terminal"}));
+    actions
+}
+
+fn terminal_provider_error_from_event(
+    provider: &str,
+    event_type: &str,
+    event: &Value,
+    provider_turn_id: Option<&str>,
+    observed_at_ms: u64,
+) -> Option<Value> {
+    if event_type != "provider-turn-error" {
+        return None;
+    }
+    let code = terminal_provider_error_nested_text(
+        event,
+        &[
+            "provider_code",
+            "error_code",
+            "errorCode",
+            "error_type",
+            "errorType",
+            "codexErrorInfo",
+            "type",
+            "code",
+        ],
+    )
+    .unwrap_or_else(|| "provider_error".to_string());
+    let message = terminal_provider_error_nested_text(
+        event,
+        &[
+            "safe_message",
+            "message",
+            "error",
+            "detail",
+            "description",
+            "reason",
+            "tool_error",
+        ],
+    )
+    .map(|message| terminal_provider_error_safe_message(&message))
+    .filter(|message| !message.is_empty())
+    .unwrap_or_else(|| format!("{} reported a turn failure.", provider.trim()));
+    let category = terminal_provider_error_category(&code, &message);
+    let retryable = event
+        .get("retryable")
+        .or_else(|| event.get("isRetryable"))
+        .or_else(|| event.get("willRetry"))
+        .and_then(Value::as_bool)
+        .unwrap_or(matches!(category, "network" | "server" | "rate_limit"));
+    let turn_id = provider_turn_id.unwrap_or_default();
+    let fingerprint = format!(
+        "{}:{}:{}:{}",
+        provider.trim().to_ascii_lowercase(),
+        category,
+        code.trim().to_ascii_lowercase(),
+        message.to_ascii_lowercase()
+    )
+    .chars()
+    .take(360)
+    .collect::<String>();
+    Some(json!({
+        "contract": "diffforge.terminal_error.v1",
+        "error_id": format!("terminal-error-{observed_at_ms}"),
+        "fingerprint": fingerprint,
+        "revision": observed_at_ms,
+        "scope": if category == "auth" { "auth" } else { "turn" },
+        "category": category,
+        "provider_code": code,
+        "safe_message": message,
+        "retryable": retryable,
+        "remediation_actions": terminal_provider_error_actions(category),
+        "turn_id": turn_id,
+        "occurred_at_ms": observed_at_ms,
+        "resolved_at_ms": Value::Null,
+        "source": "provider_event",
+    }))
+}
+
 fn terminal_activity_hook_is_prompt_submit_key(hook_key: &str) -> bool {
     matches!(
         hook_key,
@@ -13091,8 +13418,7 @@ fn terminal_activity_hook_is_prompt_submit(hook_event_name: &str) -> bool {
 }
 
 fn terminal_activity_hook_tool_activity_status(event: &Value) -> &'static str {
-    let tool_name =
-        terminal_activity_hook_string(event, &["tool_name"]).unwrap_or_default();
+    let tool_name = terminal_activity_hook_string(event, &["tool_name"]).unwrap_or_default();
     let tool_key = terminal_activity_hook_name_key(&tool_name);
     if tool_key.contains("mcp") {
         return "mcp";
@@ -13624,15 +13950,8 @@ fn terminal_architecture_activity_payload(
     instance: &TerminalInstance,
     event: &Value,
 ) -> Option<TerminalArchitectureActivityPayload> {
-    let hook_event_name = terminal_activity_hook_string(
-        event,
-        &[
-            "hook_event_name",
-            "event_name",
-        ],
-    )?;
-    let tool_name =
-        terminal_activity_hook_string(event, &["tool_name"]).unwrap_or_default();
+    let hook_event_name = terminal_activity_hook_string(event, &["hook_event_name", "event_name"])?;
+    let tool_name = terminal_activity_hook_string(event, &["tool_name"]).unwrap_or_default();
     let tool_key = terminal_activity_hook_name_key(&tool_name);
     let graph_file_path = terminal_architecture_graph_path_from_event(event);
     let is_architecture_tool = tool_key.contains("architecturecontext")
@@ -13665,22 +13984,11 @@ fn terminal_architecture_activity_payload(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| instance.working_directory.display().to_string());
     let cwd = terminal_activity_hook_string(event, &["cwd"]).unwrap_or_else(|| repo_path.clone());
-    let graph_id = terminal_activity_hook_string(
-        event,
-        &[
-            "graph_id",
-            "architecture_graph_id",
-        ],
-    )
-    .unwrap_or_else(|| terminal_architecture_graph_id_from_path(&graph_file_path));
-    let graph_title = terminal_activity_hook_string(
-        event,
-        &[
-            "graph_title",
-            "architecture_graph_title",
-        ],
-    )
-    .unwrap_or_else(|| terminal_architecture_graph_title_from_id(&graph_id));
+    let graph_id = terminal_activity_hook_string(event, &["graph_id", "architecture_graph_id"])
+        .unwrap_or_else(|| terminal_architecture_graph_id_from_path(&graph_file_path));
+    let graph_title =
+        terminal_activity_hook_string(event, &["graph_title", "architecture_graph_title"])
+            .unwrap_or_else(|| terminal_architecture_graph_title_from_id(&graph_id));
 
     Some(TerminalArchitectureActivityPayload {
         pane_id: metadata.pane_id,
@@ -13709,13 +14017,7 @@ fn terminal_activity_hook_payload(
     instance: &TerminalInstance,
     event: &Value,
 ) -> Option<TerminalActivityHookPayload> {
-    let hook_event_name = terminal_activity_hook_string(
-        event,
-        &[
-            "hook_event_name",
-            "event_name",
-        ],
-    )?;
+    let hook_event_name = terminal_activity_hook_string(event, &["hook_event_name", "event_name"])?;
     let manual_prompt = terminal_activity_hook_manual_prompt(&hook_event_name, event);
     let metadata = instance.metadata.clone();
     let mut background_work_active = false;
@@ -13784,10 +14086,7 @@ fn terminal_activity_hook_payload(
     let event_time = crate::coordination::kernel::now_rfc3339();
     let provider = terminal_activity_hook_string(event, &["provider"])
         .unwrap_or_else(|| metadata.agent_kind.clone());
-    let agent_type = terminal_activity_hook_string(
-        event,
-        &["agent_type", "subagent_type"],
-    );
+    let agent_type = terminal_activity_hook_string(event, &["agent_type", "subagent_type"]);
     let agent_display_name = terminal_activity_hook_agent_display_name(
         agent_type.as_deref(),
         &provider,
@@ -13795,11 +14094,17 @@ fn terminal_activity_hook_payload(
     );
     let hook_key = terminal_activity_hook_name_key(&hook_event_name);
     let provider_session_id = terminal_activity_hook_provider_session_id(event);
-    let provider_turn_id =
-        terminal_activity_hook_string(event, &["turn_id"]).or_else(|| {
-            terminal_activity_hook_is_prompt_submit_key(&hook_key)
-                .then(|| format!("hook-turn-{}-{event_time_ms}", metadata.pane_id))
-        });
+    let provider_turn_id = terminal_activity_hook_string(event, &["turn_id"]).or_else(|| {
+        terminal_activity_hook_is_prompt_submit_key(&hook_key)
+            .then(|| format!("hook-turn-{}-{event_time_ms}", metadata.pane_id))
+    });
+    let provider_error = terminal_provider_error_from_event(
+        &provider,
+        event_type,
+        event,
+        provider_turn_id.as_deref(),
+        event_time_ms,
+    );
     let final_message_hook = matches!(
         hook_key.as_str(),
         "stop" | "turnstop" | "assistantstop" | "subagentstop"
@@ -13871,8 +14176,7 @@ fn terminal_activity_hook_payload(
     let input_ready_at = input_ready.then(|| event_time.clone());
     let prompt_ready_at = input_ready.then(|| event_time.clone());
     let completed_at = input_ready.then(|| event_time.clone());
-    let permission_mode =
-        terminal_activity_hook_string(event, &["permission_mode"]);
+    let permission_mode = terminal_activity_hook_string(event, &["permission_mode"]);
     let prompt_is_open = matches!(
         event_type,
         "provider-permission-requested" | "provider-user-prompt-started"
@@ -13881,22 +14185,12 @@ fn terminal_activity_hook_payload(
     let manual_approval_required = manual_prompt
         .as_ref()
         .is_some_and(|prompt| prompt.kind == "approval")
-        || terminal_activity_hook_bool(
-            event,
-            &["manual_approval_required"],
-        );
+        || terminal_activity_hook_bool(event, &["manual_approval_required"]);
     let provider_blocked_for_user = manual_prompt.is_some()
-        || terminal_activity_hook_bool(
-            event,
-            &["provider_blocked_for_user"],
-        );
+        || terminal_activity_hook_bool(event, &["provider_blocked_for_user"]);
     let explicit_prompt_kind = terminal_activity_hook_string(
         event,
-        &[
-            "prompt_kind",
-            "prompting_user_kind",
-            "prompting_kind",
-        ],
+        &["prompt_kind", "prompting_user_kind", "prompting_kind"],
     )
     .map(|value| terminal_activity_hook_name_key(&value))
     .filter(|value| {
@@ -13998,19 +14292,15 @@ fn terminal_activity_hook_payload(
             (prompt_is_open && matches!(prompt_kind.as_deref(), Some("approval" | "permission")))
                 .then(|| "reject".to_string())
         });
-    let event_prompt_ttl_ms = [
-        "prompt_ttl_ms",
-        "ttl_ms",
-        "timeout_ms",
-    ]
-    .iter()
-    .find_map(|key| {
-        event.get(*key).and_then(|value| {
-            value
-                .as_u64()
-                .or_else(|| value.as_str()?.parse::<u64>().ok())
-        })
-    });
+    let event_prompt_ttl_ms = ["prompt_ttl_ms", "ttl_ms", "timeout_ms"]
+        .iter()
+        .find_map(|key| {
+            event.get(*key).and_then(|value| {
+                value
+                    .as_u64()
+                    .or_else(|| value.as_str()?.parse::<u64>().ok())
+            })
+        });
     let prompt_ttl_ms = manual_prompt
         .as_ref()
         .and_then(|prompt| prompt.ttl_ms)
@@ -14033,11 +14323,7 @@ fn terminal_activity_hook_payload(
         .is_some_and(|prompt| prompt.allows_free_text)
         || terminal_activity_hook_bool(
             event,
-            &[
-                "allows_free_text",
-                "free_text",
-                "supports_free_text",
-            ],
+            &["allows_free_text", "free_text", "supports_free_text"],
         )
         || prompt_options.iter().any(|option| {
             let id = terminal_activity_hook_prompt_option_id(&option.id);
@@ -14069,13 +14355,14 @@ fn terminal_activity_hook_payload(
     } else {
         None
     };
-    let resolved_interaction_id = terminal_activity_hook_string(
-        event,
-        &["resolved_interaction_id", "resolvedInteractionId"],
-    );
+    let resolved_interaction_id =
+        terminal_activity_hook_string(event, &["resolved_interaction_id", "resolvedInteractionId"]);
     let resolved_interaction_revision = terminal_activity_hook_u64(
         event,
-        &["resolved_interaction_revision", "resolvedInteractionRevision"],
+        &[
+            "resolved_interaction_revision",
+            "resolvedInteractionRevision",
+        ],
     );
     let provider_request_id = manual_prompt
         .as_ref()
@@ -14085,22 +14372,22 @@ fn terminal_activity_hook_payload(
                 .as_ref()
                 .and_then(|_| prompt_id.clone())
         });
-    let interaction_id = resolved_interaction_id.or_else(|| provider_request_id.as_ref().map(|request_id| {
-        format!(
-            "uir:{}:{}:{}:{}:{}",
-            terminal_projection_text(&provider, "provider"),
-            metadata.pane_id,
-            instance.id,
-            provider_session_id.as_deref().unwrap_or("session"),
-            request_id,
-        )
-    }));
+    let interaction_id = resolved_interaction_id.or_else(|| {
+        provider_request_id.as_ref().map(|request_id| {
+            format!(
+                "uir:{}:{}:{}:{}:{}",
+                terminal_projection_text(&provider, "provider"),
+                metadata.pane_id,
+                instance.id,
+                provider_session_id.as_deref().unwrap_or("session"),
+                request_id,
+            )
+        })
+    });
     let interaction_revision = interaction_id
         .as_ref()
         .map(|_| resolved_interaction_revision.unwrap_or(event_time_ms));
-    let interaction_source = interaction_id
-        .as_ref()
-        .map(|_| "provider_hook".to_string());
+    let interaction_source = interaction_id.as_ref().map(|_| "provider_hook".to_string());
     let interaction_response_mode = interaction_id.as_ref().map(|_| {
         if resolved_interaction_revision.is_some() {
             "resolved".to_string()
@@ -14184,10 +14471,8 @@ fn terminal_activity_hook_payload(
         fork_from_provider_session_id: current_runtime.fork_from_provider_session_id,
         provider_turn_id: provider_turn_id.clone(),
         turn_id: provider_turn_id,
-        transcript_path: terminal_activity_hook_string(
-            event,
-            &["transcript_path"],
-        ),
+        provider_error,
+        transcript_path: terminal_activity_hook_string(event, &["transcript_path"]),
         cwd: terminal_activity_hook_string(event, &["cwd"]),
         user_message: user_message.clone(),
         message: user_message,
@@ -14212,24 +14497,14 @@ fn terminal_activity_hook_payload(
                 "stdout",
             ],
         ),
-        tool_error: terminal_activity_hook_value(
-            event,
-            &["tool_error", "error", "stderr"],
-        ),
+        tool_error: terminal_activity_hook_value(event, &["tool_error", "error", "stderr"]),
         raw_tool_payload: terminal_activity_hook_value(
             event,
-            &[
-                "raw_tool_payload",
-                "raw_payload",
-                "raw",
-            ],
+            &["raw_tool_payload", "raw_payload", "raw"],
         ),
         command: terminal_activity_hook_string(event, &["command"]),
         file_path: terminal_activity_hook_string(event, &["file_path", "path"]),
-        duration_ms: terminal_activity_hook_u64(
-            event,
-            &["duration_ms", "elapsed_ms"],
-        ),
+        duration_ms: terminal_activity_hook_u64(event, &["duration_ms", "elapsed_ms"]),
         exit_code: terminal_activity_hook_i64(event, &["exit_code", "code"]),
         approval_id,
         permission_prompt_id,
@@ -14803,7 +15078,10 @@ fn terminal_activity_watchdog_event(
             .filter(|value| !value.is_empty())
         {
             object.insert("session_id".to_string(), json!(provider_session_id));
-            object.insert("provider_session_id".to_string(), json!(provider_session_id));
+            object.insert(
+                "provider_session_id".to_string(),
+                json!(provider_session_id),
+            );
             object.insert("native_session_id".to_string(), json!(provider_session_id));
         }
         if let Some(turn_id) = runtime
@@ -14850,21 +15128,12 @@ async fn handle_terminal_activity_hook_event(
 fn terminal_activity_hook_startup_idle_candidate(event: &Value) -> bool {
     terminal_activity_hook_bool(
         event,
-        &[
-            "startup_idle_candidate",
-            "session_idle_without_prompt",
-        ],
+        &["startup_idle_candidate", "session_idle_without_prompt"],
     )
 }
 
 fn terminal_activity_hook_startup_idle_buffered(event: &Value) -> bool {
-    terminal_activity_hook_bool(
-        event,
-        &[
-            "startup_idle_buffered",
-            "starting_idle_buffered",
-        ],
-    )
+    terminal_activity_hook_bool(event, &["startup_idle_buffered", "starting_idle_buffered"])
 }
 
 fn terminal_activity_hook_codex_idle_quiesce_buffered(event: &Value) -> bool {
@@ -15409,7 +15678,9 @@ fn terminal_structured_interaction_reconcile(
             interaction_id.clone(),
             TerminalStructuredInteraction {
                 interaction_id: interaction_id.clone(),
-                revision: payload.interaction_revision.unwrap_or(payload.observed_at_ms),
+                revision: payload
+                    .interaction_revision
+                    .unwrap_or(payload.observed_at_ms),
                 pane_id: payload.pane_id.clone(),
                 instance_id: payload.instance_id,
                 provider: payload.provider.clone(),
@@ -15539,7 +15810,18 @@ fn apply_terminal_activity_hook_payload(
         );
     }
     terminal_structured_interaction_reconcile(app, event, &payload);
+    let previous_runtime = terminal_runtime_snapshot(instance);
     let runtime_snapshot = terminal_runtime_apply_activity_payload(instance, &payload);
+    if let Ok(mut launch_metadata) = instance.launch_metadata.lock() {
+        if let Some(provider_error) = payload.provider_error.clone() {
+            launch_metadata.provider_error = Some(provider_error);
+        } else if matches!(
+            payload.event_type.as_str(),
+            "provider-turn-started" | "provider-turn-completed" | "provider-turn-interrupted"
+        ) {
+            launch_metadata.provider_error = None;
+        }
+    }
     log_terminal_status_event(
         "backend.terminal_activity_hook.lifecycle",
         json!({
@@ -15589,19 +15871,27 @@ fn apply_terminal_activity_hook_payload(
     if let Some(provider_session_id) = payload.provider_session_id.as_deref().and_then(|value| {
         terminal_recordable_provider_session_id_for_metadata(&instance.metadata, Some(value))
     }) {
-        terminal_record_workspace_provider_session_binding_with_transcript_path(
-            Some(app.clone()),
-            instance,
-            provider_session_id.clone(),
-            "terminal_activity_hook",
-            payload.transcript_path.as_deref(),
-        );
-        if let Some(coordination) = instance.coordination.clone() {
-            terminal_record_coordination_provider_session_id(
-                coordination,
-                provider_session_id,
+        let binding_changed = previous_runtime
+            .provider_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            != Some(provider_session_id.as_str());
+        if binding_changed {
+            terminal_record_workspace_provider_session_binding_with_transcript_path(
+                Some(app.clone()),
+                instance,
+                provider_session_id.clone(),
                 "terminal_activity_hook",
+                payload.transcript_path.as_deref(),
             );
+            if let Some(coordination) = instance.coordination.clone() {
+                terminal_record_coordination_provider_session_id(
+                    coordination,
+                    provider_session_id,
+                    "terminal_activity_hook",
+                );
+            }
         }
     }
     if matches!(
@@ -15676,14 +15966,9 @@ async fn process_terminal_activity_hook_event(
         if let Some(payload) = architecture_payload {
             let _ = app.emit(TERMINAL_ARCHITECTURE_ACTIVITY_EVENT, payload);
         }
-        let hook_event_name = terminal_activity_hook_string(
-            event,
-            &[
-                "hook_event_name",
-                "event_name",
-            ],
-        )
-        .unwrap_or_default();
+        let hook_event_name =
+            terminal_activity_hook_string(event, &["hook_event_name", "event_name"])
+                .unwrap_or_default();
         if terminal_activity_hook_non_lifecycle_is_expected(&hook_event_name) {
             return;
         }
@@ -16178,8 +16463,7 @@ fn spawn_terminal_activity_hook_watcher(
                 let removed = interactions
                     .iter()
                     .filter_map(|(id, interaction)| {
-                        (interaction.pane_id == pane_id
-                            && interaction.instance_id == instance_id)
+                        (interaction.pane_id == pane_id && interaction.instance_id == instance_id)
                             .then(|| id.clone())
                     })
                     .collect::<Vec<_>>();
@@ -16909,13 +17193,9 @@ async fn handle_terminal_activity_transport_message(
     if envelope.token != expected_token {
         return Err("Terminal activity transport authentication failed.".to_string());
     }
-    let instance = terminal_activity_hook_current_instance(
-        &state.terminals,
-        &pane_id,
-        instance_id,
-    )
-    .await
-    .ok_or_else(|| "Terminal activity event target is not active.".to_string())?;
+    let instance = terminal_activity_hook_current_instance(&state.terminals, &pane_id, instance_id)
+        .await
+        .ok_or_else(|| "Terminal activity event target is not active.".to_string())?;
     let blocking_payload = terminal_activity_hook_payload(&instance, &envelope.event)
         .filter(|payload| payload.interaction_response_mode.as_deref() == Some("blocking_hook"));
     let mut blocking_receiver = None;
@@ -16928,7 +17208,9 @@ async fn handle_terminal_activity_transport_message(
         state
             .terminal_structured_interaction_waiters
             .lock()
-            .map_err(|_| "Unable to register structured terminal interaction response.".to_string())?
+            .map_err(|_| {
+                "Unable to register structured terminal interaction response.".to_string()
+            })?
             .insert(interaction_id.to_string(), sender);
         blocking_receiver = Some((interaction_id.to_string(), receiver));
     }
@@ -17222,6 +17504,8 @@ fn terminal_write_source_is_model_change(prompt_event_source: Option<&str>) -> b
                     | "model-change"
                     | "remote_model_config"
                     | "remote-model-config"
+                    | "remote_model_config_picker"
+                    | "remote-model-config-picker"
                     | "startup_model_restore"
                     | "startup-model-restore"
             )
@@ -17341,9 +17625,9 @@ fn terminal_codex_model_change_request_from_input(
     let effort = effort.map(str::to_string);
     if let Some(effort) = effort.as_deref() {
         if effort.len() > 40
-            || !effort
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+            || !effort.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            })
         {
             return None;
         }
@@ -17375,14 +17659,6 @@ fn terminal_codex_model_change_input_requests_submit(data: &str) -> bool {
         || data.contains(TERMINAL_ENTER_SEQUENCE_MOD1)
         || data.contains('\r')
         || data.contains('\n')
-}
-
-fn terminal_codex_model_change_pty_input(command: &str, submit: bool) -> String {
-    if submit {
-        format!("\u{15}{command}\r")
-    } else {
-        format!("\u{15}{command}")
-    }
 }
 
 async fn terminal_write_inner(
@@ -17468,9 +17744,7 @@ async fn terminal_write_inner(
         if let Some(model_change) = terminal_codex_model_change_request_from_input(&data) {
             let runtime = terminal_runtime_snapshot(&instance);
             let submit = terminal_codex_model_change_input_requests_submit(&data);
-            if !model_change.catalog_match
-                || model_change.effort_catalog_match == Some(false)
-            {
+            if !model_change.catalog_match || model_change.effort_catalog_match == Some(false) {
                 log_terminal_status_event(
                     "backend.agent_chat_model_change.catalog_warning",
                     json!({
@@ -17506,9 +17780,10 @@ async fn terminal_write_inner(
                     "sequence": if submit { "ctrl_u_slash_model_plain_cr" } else { "ctrl_u_slash_model_defer_submit" },
                 }),
             );
-            data = terminal_codex_model_change_pty_input(&model_change.command, submit);
-            prompt_event_id = None;
-            prompt_event_text = None;
+            return Err(
+                "Codex model changes must use the native /model picker transaction; refusing to send an inline /model value as chat input."
+                    .to_string(),
+            );
         }
     }
     if terminal_write_source_suppresses_prompt_tracking(prompt_event_source.as_deref()) {
@@ -17886,9 +18161,10 @@ async fn terminal_write_inner(
             // prompt discovery so the provider session enters live state
             // without waiting for periodic reconciliation. Native hook IDs
             // still win whenever they arrive first.
-            let normalized_agent = terminal_normalize_agent_kind(Some(&instance.metadata.agent_kind))
-                .or_else(|| terminal_normalize_agent_kind(Some(&instance.metadata.agent_id)))
-                .unwrap_or_default();
+            let normalized_agent =
+                terminal_normalize_agent_kind(Some(&instance.metadata.agent_kind))
+                    .or_else(|| terminal_normalize_agent_kind(Some(&instance.metadata.agent_id)))
+                    .unwrap_or_default();
             log_terminal_status_event(
                 "backend.terminal_provider_session.prompt_discovery_armed",
                 json!({
@@ -18397,15 +18673,9 @@ fn terminal_remote_command_u64(event: &Value, keys: &[&str]) -> Option<u64> {
 }
 
 fn terminal_answer_agent_prompt_target_pane_id(event: &Value) -> Result<String, String> {
-    let pane_id = terminal_remote_command_string(
-        event,
-        &[
-            "target_terminal_id",
-            "terminal_id",
-            "pane_id",
-        ],
-    )
-    .ok_or_else(|| "Prompt answer requires a target terminal id.".to_string())?;
+    let pane_id =
+        terminal_remote_command_string(event, &["target_terminal_id", "terminal_id", "pane_id"])
+            .ok_or_else(|| "Prompt answer requires a target terminal id.".to_string())?;
     validate_terminal_pane_id(&pane_id)?;
     Ok(pane_id)
 }
@@ -18456,8 +18726,7 @@ fn terminal_structured_interaction_hook_response(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| {
-                serde_json::from_str::<Value>(value)
-                    .unwrap_or_else(|_| json!({ "answer": value }))
+                serde_json::from_str::<Value>(value).unwrap_or_else(|_| json!({ "answer": value }))
             });
         let mut output = json!({
             "hookEventName": "Elicitation",
@@ -18524,31 +18793,24 @@ async fn terminal_answer_agent_prompt_remote_command(
 ) -> Result<Value, String> {
     let pane_id = terminal_answer_agent_prompt_target_pane_id(&event)?;
     let _control_operation_guard = terminal_control_prompt_answer_begin(&pane_id)?;
-    let instance_id =
-        terminal_remote_command_u64(&event, &["terminal_instance_id"]);
+    let instance_id = terminal_remote_command_u64(&event, &["terminal_instance_id"]);
     let prompt_id = terminal_remote_command_string(&event, &["prompt_id"])
         .ok_or_else(|| "Prompt answer requires a prompt id.".to_string())?;
     let option_id = terminal_remote_command_string(&event, &["option_id", "choice"])
         .ok_or_else(|| "Prompt answer requires an option id.".to_string())?;
     let option_label = terminal_remote_command_string(&event, &["option_label"])
         .unwrap_or_else(|| option_id.clone());
-    let option_value =
-        terminal_remote_command_string(&event, &["option_value", "value"]);
+    let option_value = terminal_remote_command_string(&event, &["option_value", "value"]);
     let requested_interaction_id = terminal_remote_command_string(&event, &["interaction_id"])
         .ok_or_else(|| "Prompt answer requires a structured interaction id.".to_string())?;
     let requested_interaction_revision =
         terminal_remote_command_u64(&event, &["interaction_revision"])
             .filter(|revision| *revision > 0)
-            .ok_or_else(|| "Prompt answer requires a structured interaction revision.".to_string())?;
-    let answer_text = terminal_remote_command_string(
-        &event,
-        &[
-            "answer_text",
-            "message",
-            "text",
-            "free_text",
-        ],
-    );
+            .ok_or_else(|| {
+                "Prompt answer requires a structured interaction revision.".to_string()
+            })?;
+    let answer_text =
+        terminal_remote_command_string(&event, &["answer_text", "message", "text", "free_text"]);
     let state_app = app.clone();
     let cloud_app = app.clone();
     let state = state_app.state::<TerminalState>();
@@ -18577,7 +18839,10 @@ async fn terminal_answer_agent_prompt_remote_command(
         return Err("Structured terminal interaction revision is stale.".to_string());
     }
     if !interaction.options.is_empty()
-        && !interaction.options.iter().any(|option| option.id == option_id)
+        && !interaction
+            .options
+            .iter()
+            .any(|option| option.id == option_id)
     {
         return Err("The selected provider interaction option is unavailable.".to_string());
     }
@@ -18595,9 +18860,9 @@ async fn terminal_answer_agent_prompt_remote_command(
             .map_err(|_| "Structured terminal response state is unavailable.".to_string())?
             .remove(&interaction.interaction_id)
             .ok_or_else(|| "The provider is no longer waiting for this response.".to_string())?;
-        sender
-            .send(response)
-            .map_err(|_| "The provider stopped waiting before the response was applied.".to_string())?;
+        sender.send(response).map_err(|_| {
+            "The provider stopped waiting before the response was applied.".to_string()
+        })?;
         if let Ok(mut interactions) = state.terminal_structured_interactions.lock() {
             interactions.remove(&interaction.interaction_id);
         }
@@ -20250,6 +20515,28 @@ async fn terminal_live_sessions(
             .lock()
             .map(|metadata| metadata.clone())
             .unwrap_or_default();
+        let provider = terminal_normalize_agent_kind(Some(&metadata.agent_kind))
+            .unwrap_or_else(|| metadata.agent_kind.trim().to_ascii_lowercase())
+            .replace('-', "_");
+        let provider_error = launch_metadata.provider_error.clone();
+        let attention_state = provider_error
+            .as_ref()
+            .and_then(|error| error.get("category"))
+            .and_then(Value::as_str)
+            .map(|category| if category == "auth" { "auth" } else { "error" })
+            .unwrap_or("none")
+            .to_string();
+        let provider_health = if provider_error.is_some() {
+            "fatal"
+        } else {
+            "healthy"
+        }
+        .to_string();
+        let effective_safety = terminal_effective_safety_state(
+            &provider,
+            &launch_metadata,
+            instance.coordination.as_ref(),
+        );
         let capabilities = terminal_session_capabilities(&metadata.agent_kind, &launch_metadata);
 
         summaries.push(TerminalLiveSessionSummary {
@@ -20289,6 +20576,11 @@ async fn terminal_live_sessions(
             runtime_event_type: runtime.event_type,
             runtime_hook_event_name: runtime.hook_event_name,
             runtime_updated_at_ms: runtime.updated_at_ms,
+            connectivity_state: "connected".to_string(),
+            attention_state,
+            provider_health,
+            provider_error,
+            effective_safety,
             working_directory: instance.working_directory.to_string_lossy().to_string(),
             session_mode: instance.session_mode.as_str().to_string(),
             file_authority: instance.session_mode.file_authority().to_string(),
@@ -20480,12 +20772,9 @@ mod terminal_tests {
     fn agent_launch_staging_failure_allows_small_single_line_inline_fallback() {
         let input = "claude --version\n";
         let mut delivered = Vec::new();
-        write_agent_start_input_to_writer_with_stager(
-            &mut delivered,
-            input,
-            "test launch",
-            |_| Err("injected staging failure".to_string()),
-        )
+        write_agent_start_input_to_writer_with_stager(&mut delivered, input, "test launch", |_| {
+            Err("injected staging failure".to_string())
+        })
         .expect("short single-line input should use the bounded fallback");
         assert_eq!(delivered, input.as_bytes());
     }
@@ -20600,7 +20889,10 @@ mod terminal_tests {
                 },
             );
             assert!(result.is_err());
-            assert!(!path.exists(), "PTY failure left staged launch input behind");
+            assert!(
+                !path.exists(),
+                "PTY failure left staged launch input behind"
+            );
         }
     }
 
@@ -20618,7 +20910,10 @@ mod terminal_tests {
         assert!(staged.source_command.ends_with("\r"));
         let path = staged.path;
         // Not a .ps1: execution policy must never gate the staged payload.
-        assert_eq!(path.extension().and_then(|value| value.to_str()), Some("txt"));
+        assert_eq!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("txt")
+        );
         let bytes = std::fs::read(&path).expect("staged file exists");
         assert!(bytes.starts_with(b"\xEF\xBB\xBF"));
         let text = String::from_utf8(bytes[3..].to_vec()).expect("utf-8 body");
@@ -20717,20 +21012,12 @@ mod terminal_tests {
     }
 
     #[test]
-    fn codex_model_change_rewrite_uses_plain_submit_after_clear() {
+    fn codex_inline_model_command_is_recognized_but_picker_source_is_distinct() {
         let input = format!("/model gpt-5.1-codex high{TERMINAL_ENTER_SEQUENCE}");
         let command = terminal_codex_model_change_request_from_input(&input)
             .expect("valid model command")
             .command;
         assert_eq!(command, "/model gpt-5.1-codex high");
-        assert_eq!(
-            terminal_codex_model_change_pty_input(&command, true),
-            "\u{15}/model gpt-5.1-codex high\r"
-        );
-        assert_eq!(
-            terminal_codex_model_change_pty_input(&command, false),
-            "\u{15}/model gpt-5.1-codex high"
-        );
         assert!(terminal_codex_model_change_input_requests_submit(&input));
         assert!(!terminal_codex_model_change_input_requests_submit(
             "/model gpt-5.1-codex high"
@@ -20739,11 +21026,18 @@ mod terminal_tests {
         assert!(terminal_write_source_is_model_change(Some(
             "remote-model-config"
         )));
+        assert!(terminal_write_source_is_model_change(Some(
+            "remote-model-config-picker"
+        )));
         assert!(!terminal_write_source_is_model_change(Some(
             "remote-permission-config"
         )));
         assert!(terminal_codex_model_change_request_from_input("/model\r").is_none());
-        assert!(terminal_codex_model_change_request_from_input("/model bad model\r").is_none());
+        let invalid_catalog_request =
+            terminal_codex_model_change_request_from_input("/model bad model\r")
+                .expect("safe invalid selection is recognized before rejection");
+        assert!(!invalid_catalog_request.catalog_match);
+        assert_eq!(invalid_catalog_request.effort_catalog_match, Some(false));
         assert_eq!(
             terminal_codex_model_change_request_from_input("/model gpt-5 max\r")
                 .map(|request| request.command)
@@ -20754,17 +21048,71 @@ mod terminal_tests {
     }
 
     #[test]
-    fn codex_model_change_soft_gate_injects_unknown_model() {
+    fn codex_model_change_parser_recognizes_safe_unknown_model_for_rejection() {
         let request = terminal_codex_model_change_request_from_input(
             "/model gpt-softgate-unknown-zz ultra\r",
         )
-        .expect("safe unknown model should still inject");
+        .expect("safe unknown model should be recognized before it can be rejected");
 
         assert_eq!(request.command, "/model gpt-softgate-unknown-zz ultra");
         assert_eq!(request.model, "gpt-softgate-unknown-zz");
         assert_eq!(request.effort.as_deref(), Some("ultra"));
         assert!(!request.catalog_match);
         assert_eq!(request.effort_catalog_match, Some(false));
+    }
+
+    #[test]
+    fn provider_error_normalizes_auth_failures_and_sign_in_action() {
+        let error = terminal_provider_error_from_event(
+            "codex",
+            "provider-turn-error",
+            &json!({
+                "error_code": "refresh_token_revoked",
+                "message": "Your access token could not be refreshed because your refresh token was revoked.",
+                "retryable": false,
+            }),
+            Some("turn-auth-1"),
+            1234,
+        )
+        .expect("normalized provider error");
+
+        assert_eq!(error["contract"], json!("diffforge.terminal_error.v1"));
+        assert_eq!(error["category"], json!("auth"));
+        assert_eq!(error["scope"], json!("auth"));
+        assert_eq!(error["retryable"], json!(false));
+        assert_eq!(error["turn_id"], json!("turn-auth-1"));
+        assert_eq!(error["remediation_actions"][0]["id"], json!("sign_in"));
+    }
+
+    #[test]
+    fn provider_error_normalizes_retryable_network_failures() {
+        let error = terminal_provider_error_from_event(
+            "opencode",
+            "provider-turn-error",
+            &json!({
+                "error": { "message": "Connection timed out while streaming response" },
+                "error_code": "stream_timeout",
+            }),
+            None,
+            5678,
+        )
+        .expect("normalized provider error");
+
+        assert_eq!(error["category"], json!("network"));
+        assert_eq!(error["retryable"], json!(true));
+        assert_eq!(error["remediation_actions"][0]["id"], json!("retry"));
+    }
+
+    #[test]
+    fn provider_error_ignores_non_error_lifecycle_events() {
+        assert!(terminal_provider_error_from_event(
+            "claude",
+            "provider-turn-completed",
+            &json!({ "message": "done" }),
+            Some("turn-1"),
+            9876,
+        )
+        .is_none());
     }
 
     #[test]
@@ -20787,7 +21135,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn opencode_session_capabilities_allow_model_listing_without_live_change() {
+    fn opencode_session_capabilities_allow_native_picker_model_change() {
         let launch_metadata = TerminalLaunchRuntimeMetadata {
             model: Some("anthropic/claude-sonnet-4-5".to_string()),
             ..TerminalLaunchRuntimeMetadata::default()
@@ -20796,11 +21144,29 @@ mod terminal_tests {
 
         assert!(capabilities.can_list_models);
         assert!(capabilities.can_select_model);
-        assert!(!capabilities.can_change_model_now);
+        assert!(capabilities.can_change_model_now);
         assert!(capabilities
             .available_models
             .iter()
             .any(|model| model.id == "anthropic/claude-sonnet-4-5"));
+    }
+
+    #[test]
+    fn effective_safety_reports_explicit_hook_trust_bypass() {
+        let mut coordination = terminal_test_coordination("effective_safety_hook_trust");
+        coordination.env_vars.push((
+            "DIFFFORGE_CODEX_BYPASS_HOOK_TRUST".to_string(),
+            "1".to_string(),
+        ));
+        let safety = terminal_effective_safety_state(
+            "codex",
+            &TerminalLaunchRuntimeMetadata::default(),
+            Some(&coordination),
+        );
+
+        assert_eq!(safety["hook_trust_bypassed"], json!(true));
+        assert_eq!(safety["managed_policy_enforced"], json!(true));
+        assert_eq!(safety["fail_closed"], json!(false));
     }
 
     #[test]
@@ -22146,6 +22512,7 @@ mod terminal_tests {
             fork_from_provider_session_id: None,
             provider_turn_id: None,
             turn_id: None,
+            provider_error: None,
             transcript_path: None,
             cwd: None,
             user_message: None,
@@ -22865,9 +23232,7 @@ mod terminal_tests {
                 .map(|candidate| candidate.generation),
             Some(rebuffered_generation)
         );
-        assert!(
-            terminal_pending_final_stop_take_generation(&key, rebuffered_generation).is_some()
-        );
+        assert!(terminal_pending_final_stop_take_generation(&key, rebuffered_generation).is_some());
     }
 
     #[test]
@@ -22959,7 +23324,11 @@ mod terminal_tests {
             Some("permission-structured-1")
         );
         assert_eq!(
-            prompt.options.iter().map(|option| option.id.as_str()).collect::<Vec<_>>(),
+            prompt
+                .options
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["allow_once", "allow_always", "reject"]
         );
     }
@@ -22981,12 +23350,8 @@ mod terminal_tests {
                 { "type": "addRules", "rules": ["Bash(git status)"] }
             ])),
         };
-        let response = terminal_structured_interaction_hook_response(
-            &interaction,
-            "allow_always",
-            None,
-            None,
-        );
+        let response =
+            terminal_structured_interaction_hook_response(&interaction, "allow_always", None, None);
 
         assert_eq!(
             response.pointer("/hookSpecificOutput/hookEventName"),
@@ -23822,7 +24187,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn coordinated_codex_secondary_untrusted_hook_launch_uses_bypass_flag() {
+    fn coordinated_codex_explicit_hook_trust_override_uses_bypass_flag() {
         let mut coordination = terminal_test_coordination("codex_hook_bypass_args");
         coordination.env_vars.push((
             "COORDINATION_AGENT_BRANCH_ROOT".to_string(),

@@ -11097,10 +11097,30 @@ fn todo_dispatch_backend_model_command(item: &Value, target: &Value) -> String {
     }) {
         return String::new();
     }
-    if valid_codex_effort {
-        return format!("/model {model} {effort}");
+    if agent.contains("codex") {
+        // Codex's TUI treats an inline `/model <id>` as ordinary prompt text.
+        // The caller drives its native picker with the requested model/effort
+        // instead; returning the bare command here makes that distinction
+        // impossible to accidentally regress into a chat submission.
+        return "/model".to_string();
     }
     format!("/model {model}")
+}
+
+fn todo_dispatch_backend_codex_model_picker(
+    item: &Value,
+    target: &Value,
+) -> Option<(String, Option<String>)> {
+    let agent = todo_dispatch_backend_target_agent(item, target);
+    if !agent.contains("codex") || todo_dispatch_backend_model_command(item, target) != "/model" {
+        return None;
+    }
+    let model = todo_dispatch_text(item, &["model", "model_id"]);
+    let effort = todo_dispatch_text(item, &["reasoning_effort", "thinking_power", "effort"])
+        .to_ascii_lowercase();
+    let effort = matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh")
+        .then_some(effort);
+    Some((model, effort))
 }
 
 #[cfg(test)]
@@ -11274,7 +11294,11 @@ mod todo_dispatch_backend_tests {
         });
         assert_eq!(
             todo_dispatch_backend_model_command(&codex_item, &codex_target),
-            "/model gpt-5.1-codex high",
+            "/model",
+        );
+        assert_eq!(
+            todo_dispatch_backend_codex_model_picker(&codex_item, &codex_target),
+            Some(("gpt-5.1-codex".to_string(), Some("high".to_string()))),
         );
 
         let claude_target = json!({ "agent_kind": "claude" });
@@ -11319,7 +11343,7 @@ mod todo_dispatch_backend_tests {
         });
         assert_eq!(
             todo_dispatch_backend_model_command(&codex_alias_item, &codex_alias_target),
-            "/model openai/gpt-5-5 xhigh",
+            "/model",
         );
 
         let codex_alias_same_effort_target = json!({
@@ -11661,6 +11685,7 @@ mod todo_dispatch_backend_tests {
             fork_from_provider_session_id: None,
             provider_turn_id: None,
             turn_id: None,
+            provider_error: None,
             transcript_path: None,
             cwd: None,
             user_message: None,
@@ -12789,6 +12814,7 @@ async fn todo_dispatch_backend_submit(
     }
     let submit_sequence = todo_dispatch_backend_submit_sequence(item, target);
     let model_switch_command = todo_dispatch_backend_model_command(item, target);
+    let codex_model_picker = todo_dispatch_backend_codex_model_picker(item, target);
     let prepared_input = todo_dispatch_prepared_terminal_input(&prepared, "");
     if prepared_input.len() + submit_sequence.len() + 1 > MAX_TERMINAL_WRITE_BYTES {
         return false;
@@ -12935,6 +12961,35 @@ async fn todo_dispatch_backend_submit(
         .await
         {
             return false;
+        }
+        if let Some((picker_model, picker_effort)) = codex_model_picker.as_ref() {
+            // `/model` opens Codex's native picker. Select the model and, when
+            // requested, the following effort screen as one serialized PTY
+            // transaction before the queued prompt is injected.
+            sleep(Duration::from_millis(220)).await;
+            if !todo_dispatch_write_current_terminal_chunks(
+                &terminal_state,
+                &pane_id,
+                &instance,
+                &[picker_model.as_bytes(), submit_sequence.as_bytes()],
+            )
+            .await
+            {
+                return false;
+            }
+            if let Some(picker_effort) = picker_effort.as_ref() {
+                sleep(Duration::from_millis(220)).await;
+                if !todo_dispatch_write_current_terminal_chunks(
+                    &terminal_state,
+                    &pane_id,
+                    &instance,
+                    &[picker_effort.as_bytes(), submit_sequence.as_bytes()],
+                )
+                .await
+                {
+                    return false;
+                }
+            }
         }
         if !todo_dispatch_wait_for_pane_input_ready_after_model(app, &pane_id, target_instance_id)
             .await

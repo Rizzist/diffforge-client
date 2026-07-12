@@ -10988,33 +10988,6 @@ function todoQueueModelIdsEqual(agentId, left, right) {
   return Boolean(leftModel && rightModel && leftModel === rightModel);
 }
 
-function buildTodoQueueAgentModelCommand(agentId, model, reasoningEffort, currentModel = "", currentReasoningEffort = "") {
-  const targetAgentId = normalizeTodoTerminalAgentId(agentId);
-  const effort = String(reasoningEffort || "").trim().toLowerCase();
-  const codexEfforts = new Set(["low", "medium", "high", "xhigh"]);
-  const validCodexEffort = targetAgentId === "codex" && codexEfforts.has(effort);
-  const targetModel = String(model || (validCodexEffort ? currentModel : "") || "").trim();
-  if (!targetModel || !["codex", "claude"].includes(targetAgentId)) {
-    return "";
-  }
-  if (currentModel && todoQueueModelIdsEqual(targetAgentId, currentModel, targetModel)) {
-    const currentEffort = String(currentReasoningEffort || "").trim().toLowerCase();
-    if (!validCodexEffort || (currentEffort && currentEffort === effort)) {
-      return "";
-    }
-  }
-  if (
-    targetModel.length > 120
-    || !targetModel.split("").every((character) => /[A-Za-z0-9._:/-]/.test(character))
-  ) {
-    return "";
-  }
-  if (validCodexEffort) {
-    return `/model ${targetModel} ${effort}`;
-  }
-  return `/model ${targetModel}`;
-}
-
 function getTodoQueueTargetTerminalName(item) {
   if (String(item?.target_kind || "").trim().toLowerCase() === "swarm") {
     return "Swarm agents";

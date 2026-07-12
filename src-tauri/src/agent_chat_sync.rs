@@ -80,9 +80,9 @@ const AGENT_CHAT_SESSION_HISTORY_BACKFILL_SPAWN_LIMIT: usize = 24;
 const AGENT_CHAT_SESSION_HISTORY_BACKFILL_INTERVAL_MS: u64 = 60_000;
 const AGENT_CHAT_SESSION_HISTORY_SYNC_VERIFY_INTERVAL_MS: u64 = 30 * 60_000;
 const AGENT_CHAT_SESSION_SYNC_BUILD_CONCURRENCY: usize = 4;
-const AGENT_CHAT_SESSION_SYNC_PARSER_SCHEMA_VERSION: u64 = 3;
+const AGENT_CHAT_SESSION_SYNC_PARSER_SCHEMA_VERSION: u64 = 4;
 const AGENT_CHAT_SESSION_SYNC_RECORD_KEY_VERSION: u64 = 2;
-const AGENT_CHAT_SESSION_SYNC_RECORD_HASH_SCHEMA_VERSION: u64 = 3;
+const AGENT_CHAT_SESSION_SYNC_RECORD_HASH_SCHEMA_VERSION: u64 = 4;
 
 static AGENT_CHAT_SESSION_HISTORY_BACKFILL_LAST: OnceLock<StdMutex<HashMap<String, u64>>> =
     OnceLock::new();
@@ -164,9 +164,7 @@ fn agent_chat_session_sync_touch_turn_summary_cache_session(
 }
 
 fn agent_chat_session_sync_message_has_file_change(message: &Value) -> bool {
-    message
-        .get("file_change")
-        .is_some_and(Value::is_object)
+    message.get("file_change").is_some_and(Value::is_object)
 }
 
 fn agent_chat_session_sync_turn_summary_has_git_skip(
@@ -382,12 +380,7 @@ fn agent_chat_session_sync_mark_workspace_history_dirty(workspace_id: &str) {
 fn agent_chat_session_sync_mark_payload_workspace_history_dirty(payload: &Value) {
     let workspace_id = cloud_mcp_payload_text(
         payload,
-        &[
-            "workspace_id",
-            "w",
-            "repo_id",
-            "target_workspace_id",
-        ],
+        &["workspace_id", "w", "repo_id", "target_workspace_id"],
     )
     .unwrap_or_default();
     agent_chat_session_sync_mark_workspace_history_dirty(&workspace_id);
@@ -557,14 +550,11 @@ fn agent_chat_session_sync_message_error_evidence(message: &Value) -> bool {
     {
         return true;
     }
-    if ["error", "tool_error", "stderr"]
-        .iter()
-        .any(|key| {
-            message
-                .get(*key)
-                .is_some_and(agent_chat_session_sync_value_has_content)
-        })
-    {
+    if ["error", "tool_error", "stderr"].iter().any(|key| {
+        message
+            .get(*key)
+            .is_some_and(agent_chat_session_sync_value_has_content)
+    }) {
         return true;
     }
     let kind = agent_chat_session_sync_message_kind(message);
@@ -619,11 +609,8 @@ fn agent_chat_session_sync_subagent_has_explicit_sidechain(subagent: &Value) -> 
         .get("is_sidechain")
         .and_then(Value::as_bool)
         .unwrap_or(false)
-        || cloud_mcp_payload_text(
-            subagent,
-            &["sidechain_id", "sidechain_uuid"],
-        )
-        .is_some_and(|value| !value.trim().is_empty())
+        || cloud_mcp_payload_text(subagent, &["sidechain_id", "sidechain_uuid"])
+            .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn agent_chat_session_sync_canonical_kind(message: &Value, legacy_kind: &str) -> String {
@@ -733,10 +720,7 @@ fn agent_chat_session_sync_normalize_message_value(mut value: Value) -> Value {
                     subagent.get("session_id"),
                 ]);
                 let subagent_id = if subagent_id.trim().is_empty() && allow_parent_id {
-                    first_value_string(&[
-                        subagent.get("parent_uuid"),
-                        subagent.get("parent_id"),
-                    ])
+                    first_value_string(&[subagent.get("parent_uuid"), subagent.get("parent_id")])
                 } else {
                     subagent_id
                 };
@@ -1010,8 +994,8 @@ fn agent_chat_session_sync_flush_assistant_block(
 }
 
 fn agent_chat_session_sync_thread_detail_legacy_kind(message: &Value) -> String {
-    if let Some(kind) = cloud_mcp_payload_text(message, &["legacy_kind"])
-        .filter(|value| !value.trim().is_empty())
+    if let Some(kind) =
+        cloud_mcp_payload_text(message, &["legacy_kind"]).filter(|value| !value.trim().is_empty())
     {
         if agent_chat_session_sync_normalize_kind_token(&kind) == "turn_summary" {
             return "turn_summary".to_string();
@@ -1047,9 +1031,7 @@ fn agent_chat_session_sync_thread_detail_message(message: &Value) -> Value {
 }
 
 fn agent_chat_session_sync_file_change_value(message: &Value) -> Option<&Value> {
-    message
-        .get("file_change")
-        .filter(|value| value.is_object())
+    message.get("file_change").filter(|value| value.is_object())
 }
 
 fn agent_chat_session_sync_thread_detail_diff_summaries(
@@ -1879,13 +1861,9 @@ fn agent_chat_session_sync_latest_model_id(model_config: &Value, fallback: &str)
 }
 
 fn agent_chat_session_sync_model_config_fingerprint(model_config: &Value) -> String {
-    let model_id =
-        cloud_mcp_payload_text(model_config, &["model_id"]).unwrap_or_default();
-    let reasoning_effort = cloud_mcp_payload_text(
-        model_config,
-        &["reasoning_effort", "effort"],
-    )
-    .unwrap_or_default();
+    let model_id = cloud_mcp_payload_text(model_config, &["model_id"]).unwrap_or_default();
+    let reasoning_effort =
+        cloud_mcp_payload_text(model_config, &["reasoning_effort", "effort"]).unwrap_or_default();
     if model_id.trim().is_empty() && reasoning_effort.trim().is_empty() {
         return String::new();
     }
@@ -1906,11 +1884,8 @@ fn agent_chat_session_sync_model_config_record(
     model_config: &Value,
 ) -> Option<Value> {
     let model_id = cloud_mcp_payload_text(model_config, &["model_id"]);
-    let reasoning_effort = cloud_mcp_payload_text(
-        model_config,
-        &["reasoning_effort", "effort"],
-    )
-    .map(|value| value.to_ascii_lowercase());
+    let reasoning_effort = cloud_mcp_payload_text(model_config, &["reasoning_effort", "effort"])
+        .map(|value| value.to_ascii_lowercase());
     if model_id.as_deref().unwrap_or_default().trim().is_empty()
         && reasoning_effort
             .as_deref()
@@ -3074,19 +3049,17 @@ fn agent_chat_session_sync_opencode_source(
     let mut thread_detail_messages = Vec::new();
     let mut total_record_count = 0usize;
     let mut latest_timestamp = opencode_timestamp(session_updated_at_ms);
-    let session_raw =
-        agent_chat_session_sync_opencode_session_raw_row(&connection, &session_id).unwrap_or_else(
-            || {
-                json!({
-                    "id": session_id.clone(),
-                    "title": session_title.clone(),
-                    "directory": session_cwd.clone(),
-                    "time_updated": session_updated_at_ms,
-                    "model": cloud_mcp_payload_text(&model_config, &["model_id"])
-                        .unwrap_or_default(),
-                })
-            },
-        );
+    let session_raw = agent_chat_session_sync_opencode_session_raw_row(&connection, &session_id)
+        .unwrap_or_else(|| {
+            json!({
+                "id": session_id.clone(),
+                "title": session_title.clone(),
+                "directory": session_cwd.clone(),
+                "time_updated": session_updated_at_ms,
+                "model": cloud_mcp_payload_text(&model_config, &["model_id"])
+                    .unwrap_or_default(),
+            })
+        });
     total_record_count = total_record_count.saturating_add(1);
     if let Some(record) = agent_chat_session_sync_record(
         acked,
@@ -3989,8 +3962,7 @@ fn agent_chat_session_sync_spawn_with_state(
             agent_chat_session_sync_mark_workspace_history_dirty(&context.workspace_id);
             let key = format!(
                 "agent-chat-session:{}:{}:{}:{}",
-                cloud_mcp_payload_text(&payload, &["workspace_id"])
-                    .unwrap_or_default(),
+                cloud_mcp_payload_text(&payload, &["workspace_id"]).unwrap_or_default(),
                 cloud_mcp_payload_text(&payload, &["provider"]).unwrap_or_default(),
                 cloud_mcp_payload_text(&payload, &["session_id"]).unwrap_or_default(),
                 cloud_mcp_payload_text(&payload, &["packet_key"])
@@ -4574,65 +4546,42 @@ fn agent_chat_session_sync_spawn_from_payload_repair(
     payload: &Value,
     reason: &'static str,
 ) -> bool {
-    let provider = cloud_mcp_payload_text(payload, &["provider", "agent_kind"])
-        .unwrap_or_default();
-    let provider_session_id = cloud_mcp_payload_text(
-        payload,
-        &["provider_session_id", "session_id"],
-    )
-    .unwrap_or_default();
-    let workspace_id =
-        cloud_mcp_payload_text(payload, &["workspace_id"]).unwrap_or_default();
+    let provider = cloud_mcp_payload_text(payload, &["provider", "agent_kind"]).unwrap_or_default();
+    let provider_session_id =
+        cloud_mcp_payload_text(payload, &["provider_session_id", "session_id"]).unwrap_or_default();
+    let workspace_id = cloud_mcp_payload_text(payload, &["workspace_id"]).unwrap_or_default();
     if provider.trim().is_empty()
         || provider_session_id.trim().is_empty()
         || workspace_id.trim().is_empty()
     {
         return false;
     }
-    let cwd = cloud_mcp_payload_text(payload, &["cwd", "workspace_root"])
-        .unwrap_or_default();
+    let cwd = cloud_mcp_payload_text(payload, &["cwd", "workspace_root"]).unwrap_or_default();
     agent_chat_session_sync_mark_workspace_history_dirty(&workspace_id);
     let context = AgentChatSessionSyncContext {
         workspace_id,
-        workspace_name: cloud_mcp_payload_text(payload, &["workspace_name"])
-            .unwrap_or_default(),
+        workspace_name: cloud_mcp_payload_text(payload, &["workspace_name"]).unwrap_or_default(),
         thread_id: cloud_mcp_payload_text(payload, &["thread_id"]).unwrap_or_default(),
         pane_id: cloud_mcp_payload_text(payload, &["pane_id"]).unwrap_or_default(),
-        terminal_instance_id: payload
-            .get("terminal_instance_id")
-            .and_then(Value::as_u64),
-        terminal_index: payload
-            .get("terminal_index")
-            .and_then(|value| {
-                value
-                    .as_i64()
-                    .or_else(|| value.as_u64().map(|number| number as i64))
-            }),
-        model_id: cloud_mcp_payload_text(payload, &["model_id", "model"])
-            .unwrap_or_default(),
+        terminal_instance_id: payload.get("terminal_instance_id").and_then(Value::as_u64),
+        terminal_index: payload.get("terminal_index").and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().map(|number| number as i64))
+        }),
+        model_id: cloud_mcp_payload_text(payload, &["model_id", "model"]).unwrap_or_default(),
         model_source: String::new(),
-        session_mode: cloud_mcp_payload_text(payload, &["session_mode"])
+        session_mode: cloud_mcp_payload_text(payload, &["session_mode"]).unwrap_or_default(),
+        file_authority: cloud_mcp_payload_text(payload, &["file_authority"]).unwrap_or_default(),
+        coordination_mode: cloud_mcp_payload_text(payload, &["coordination_mode"])
             .unwrap_or_default(),
-        file_authority: cloud_mcp_payload_text(payload, &["file_authority"])
-            .unwrap_or_default(),
-        coordination_mode: cloud_mcp_payload_text(
-            payload,
-            &["coordination_mode"],
-        )
-        .unwrap_or_default(),
         status: "waiting".to_string(),
         source: "agent_chat_ack_repair".to_string(),
-        shared_history_id: cloud_mcp_payload_text(
-            payload,
-            &["shared_history_id"],
-        )
-        .unwrap_or_default(),
+        shared_history_id: cloud_mcp_payload_text(payload, &["shared_history_id"])
+            .unwrap_or_default(),
         fork_from_provider_session_id: cloud_mcp_payload_text(
             payload,
-            &[
-                "fork_from_provider_session_id",
-                "fork_from_session_id",
-            ],
+            &["fork_from_provider_session_id", "fork_from_session_id"],
         )
         .unwrap_or_default(),
         metadata_only: false,
@@ -5604,10 +5553,10 @@ mod agent_chat_session_sync_tests {
             "raw": raw,
         }));
 
-        assert_eq!(AGENT_CHAT_SESSION_SYNC_PARSER_SCHEMA_VERSION, 3);
+        assert_eq!(AGENT_CHAT_SESSION_SYNC_PARSER_SCHEMA_VERSION, 4);
         assert_eq!(AGENT_CHAT_SESSION_SYNC_RECORD_KEY_VERSION, 2);
-        assert_eq!(AGENT_CHAT_SESSION_SYNC_RECORD_HASH_SCHEMA_VERSION, 3);
-        assert_eq!(record["parser_schema_version"], json!(3));
+        assert_eq!(AGENT_CHAT_SESSION_SYNC_RECORD_HASH_SCHEMA_VERSION, 4);
+        assert_eq!(record["parser_schema_version"], json!(4));
         assert_eq!(record["record_hash"], json!(expected_hash));
     }
 

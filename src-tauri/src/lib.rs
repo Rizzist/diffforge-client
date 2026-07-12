@@ -1091,6 +1091,10 @@ struct TerminalLaunchRuntimeMetadata {
     reasoning_effort: Option<String>,
     speed: Option<String>,
     permission_mode: Option<String>,
+    /// Latest unresolved provider/session error. Kept with the launch/runtime
+    /// metadata so periodic live-state snapshots cannot erase an error that
+    /// arrived on the faster hook or protocol lane.
+    provider_error: Option<Value>,
 }
 
 impl TerminalRuntimeSnapshot {
@@ -2183,6 +2187,7 @@ struct TerminalActivityHookPayload {
     fork_from_provider_session_id: Option<String>,
     provider_turn_id: Option<String>,
     turn_id: Option<String>,
+    provider_error: Option<Value>,
     transcript_path: Option<String>,
     cwd: Option<String>,
     user_message: Option<String>,

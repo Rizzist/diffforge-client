@@ -896,7 +896,10 @@ export class AuraSceneEngine {
     );
     this.pointerActive = true;
     if (this.dragging) {
-      this.orbit.targetTheta -= event.movementX * 0.0045;
+      // Horizontal drag follows the pointer (grab-the-scene): dragging right
+      // swings the camera so the scene appears to move right. Vertical keeps
+      // its existing (correct) direction.
+      this.orbit.targetTheta += event.movementX * 0.0045;
       this.orbit.targetPhi = THREE.MathUtils.clamp(
         this.orbit.targetPhi - event.movementY * 0.0038,
         0.45,

@@ -16958,38 +16958,6 @@ fn tokenomics_ensure_claude_statusline_collector(plan: &Value) -> Result<(), Str
         .map_err(|error| format!("Unable to create Claude config directory: {error}"))?;
     let collector_path = claude_dir.join("diffforge-statusline.cjs");
     let cache_path = claude_dir.join("diffforge-rate-limits.json");
-    let collector = format!(
-        r#"const fs = require("fs");
-const input = [];
-process.stdin.on("data", chunk => input.push(chunk));
-process.stdin.on("end", () => {{
-  try {{
-    const payload = JSON.parse(Buffer.concat(input).toString("utf8") || "{{}}");
-    if (payload && payload.rate_limits) {{
-      const out = {{
-        updated_at: new Date().toISOString(),
-        session_id: payload.session_id || payload.sessionId || null,
-        transcript_path: payload.transcript_path || payload.transcriptPath || null,
-        cwd: payload.cwd || null,
-        version: payload.version || null,
-        model: payload.model || null,
-        rate_limits: payload.rate_limits
-      }};
-      fs.writeFileSync({cache:?}, JSON.stringify(out, null, 2));
-    }}
-  }} catch (_) {{}}
-}});
-"#,
-        cache = cache_path.display().to_string()
-    );
-    let should_write = fs::read_to_string(&collector_path)
-        .map(|current| current != collector)
-        .unwrap_or(true);
-    if should_write {
-        fs::write(&collector_path, collector)
-            .map_err(|error| format!("Unable to write Claude statusline collector: {error}"))?;
-    }
-
     let settings_path = claude_dir.join("settings.json");
     let mut settings = fs::read_to_string(&settings_path)
         .ok()
@@ -17000,9 +16968,62 @@ process.stdin.on("end", () => {{
         .and_then(|value| value.get("command"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    if !status_command.trim().is_empty() && !status_command.contains("diffforge-statusline") {
-        return Ok(());
+    let delegated_status_command = if status_command.trim().is_empty()
+        || status_command.contains("diffforge-statusline")
+    {
+        String::new()
+    } else {
+        status_command.trim().to_string()
+    };
+    let collector = format!(
+        r#"const fs = require("fs");
+const childProcess = require("child_process");
+const input = [];
+process.stdin.on("data", chunk => input.push(chunk));
+process.stdin.on("end", () => {{
+  try {{
+    const raw = Buffer.concat(input).toString("utf8");
+    const payload = JSON.parse(raw || "{{}}");
+    if (payload) {{
+      const out = {{
+        updated_at: new Date().toISOString(),
+        session_id: payload.session_id || payload.sessionId || null,
+        transcript_path: payload.transcript_path || payload.transcriptPath || null,
+        cwd: payload.cwd || null,
+        version: payload.version || null,
+        model: payload.model || null,
+        effort: payload.effort || payload.reasoning_effort || payload.reasoningEffort || null,
+        thinking: payload.thinking || null,
+        permission_mode: payload.permission_mode || payload.permissionMode || null,
+        context_window: payload.context_window || payload.contextWindow || null,
+        rate_limits: payload.rate_limits || null
+      }};
+      fs.writeFileSync({cache:?}, JSON.stringify(out, null, 2));
+    }}
+    const delegate = {delegate:?};
+    if (delegate) {{
+      const result = childProcess.spawnSync(delegate, {{
+        shell: true,
+        input: raw,
+        encoding: "utf8",
+        maxBuffer: 1024 * 1024
+      }});
+      if (result.stdout) process.stdout.write(result.stdout);
+    }}
+  }} catch (_) {{}}
+}});
+"#,
+        cache = cache_path.display().to_string(),
+        delegate = delegated_status_command,
+    );
+    let should_write = fs::read_to_string(&collector_path)
+        .map(|current| current != collector)
+        .unwrap_or(true);
+    if should_write {
+        fs::write(&collector_path, collector)
+            .map_err(|error| format!("Unable to write Claude statusline collector: {error}"))?;
     }
+
     let command = format!("node \"{}\"", collector_path.display());
     if status_command == command {
         return Ok(());

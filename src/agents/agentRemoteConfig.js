@@ -47,11 +47,13 @@ export function buildAgentChatChangeEffortCommand({
     return { error: "Codex effort changes require the current model_id." };
   }
   return {
-    awaitingDetection: !effortIsKnown,
-    command: `/model ${model} ${effort}`,
+    awaitingDetection: true,
+    command: "/model",
     model_id: model,
+    picker_model: model,
+    picker_effort: effort,
     recordModelId: "",
-    recordReasoningEffort: effortIsKnown ? effort : "",
+    recordReasoningEffort: "",
     reasoning_effort: effort,
   };
 }

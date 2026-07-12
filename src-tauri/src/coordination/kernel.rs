@@ -25885,7 +25885,11 @@ fn prepare_managed_codex_profile_for_terminal(
     );
     let hooks_json_text = serde_json::to_string(&hooks_json)
         .map_err(|error| format!("Unable to serialize Codex hooks self-test payload: {error}"))?;
-    let bypass_hook_trust = true;
+    // Managed hooks are no longer launched with Codex's dangerous trust
+    // bypass. Codex remains the authority for hook trust and managed-policy
+    // restrictions; an untrusted hook must surface as an actionable safety
+    // request instead of silently executing.
+    let bypass_hook_trust = false;
     if enforcement_mode == "worktree_required" {
         codex_managed_git_launch_self_test(
             &config,

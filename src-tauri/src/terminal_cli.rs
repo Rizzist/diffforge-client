@@ -4676,6 +4676,35 @@ fn diff_forge_activity_hook_record(
         "stdout",
     ]);
     let tool_error = hook_value(&["tool_error", "toolError", "error", "stderr"]);
+    let error_details = hook_value(&[
+        "error_details",
+        "errorDetails",
+        "details",
+        "api_error",
+        "apiError",
+    ]);
+    let error_code = first_string(vec![
+        hook_string(&[
+            "provider_code",
+            "providerCode",
+            "error_code",
+            "errorCode",
+            "error_type",
+            "errorType",
+            "code",
+        ]),
+        tool_string(&[
+            "provider_code",
+            "providerCode",
+            "error_code",
+            "errorCode",
+            "error_type",
+            "errorType",
+            "code",
+        ]),
+    ]);
+    let error_retryable = hook_bool(&["retryable", "isRetryable", "willRetry"])
+        || tool_bool(&["retryable", "isRetryable", "willRetry"]);
     let raw_tool_payload = hook_value(&[
         "rawToolPayload",
         "raw_tool_payload",
@@ -4962,7 +4991,11 @@ fn diff_forge_activity_hook_record(
         "tool_server": tool_server,
         "tool_input": tool_input.clone(),
         "tool_output": tool_output,
+        "error": tool_error.clone(),
         "tool_error": tool_error,
+        "error_details": error_details,
+        "error_code": error_code,
+        "retryable": error_retryable,
         "raw_tool_payload": raw_tool_payload,
         "command": command,
         "file_path": tool_paths.first().cloned().unwrap_or_default(),
@@ -7345,7 +7378,7 @@ export const DiffForgeActivityPlugin = async () => {
 		          noteActivity(sessionId, "session.status");
 		        }
 	      }
-	      if (type === "session.idle") {
+      if (type === "session.idle") {
 	        scheduleIdle(sessionId, "session.idle");
 	      } else if (type === "session.error") {
         cancelPendingStop(sessionId);
@@ -7353,8 +7386,27 @@ export const DiffForgeActivityPlugin = async () => {
         if (turn) {
           turn.settled = true;
           activeSessions.set(sessionId, turn);
-          emit({ hook_event_name: "StopFailure", session_id: sessionId });
         }
+        const providerError = props.error || props.apiError || props.api_error || props;
+        const providerCode = (providerError && (
+          providerError.name
+          || providerError.type
+          || providerError.code
+          || providerError.statusCode
+        )) || "session_error";
+        const providerMessage = (providerError && (
+          providerError.message
+          || providerError.body
+          || providerError.detail
+        )) || props.message || "OpenCode session failed.";
+        emit({
+          hook_event_name: "StopFailure",
+          session_id: sessionId,
+          error: providerMessage,
+          error_code: String(providerCode),
+          error_details: providerError,
+          retryable: Boolean(providerError && (providerError.isRetryable || providerError.retryable)),
+        });
       }
     },
   };

@@ -19506,6 +19506,13 @@ fn cloud_mcp_daemon_gui_block_message(command_kind: &str) -> Option<&'static str
         | "session_effort_change" => {
             Some("Remote live-session configuration is unavailable in daemon mode.")
         }
+        "agent_account_login"
+        | "terminal_provider_login"
+        | "provider_login"
+        | "agent_login"
+        | "sign_in_agent" => {
+            Some("Provider sign-in requires the desktop application UI.")
+        }
         "todo_requeue"
         | "requeue_todo"
         | "todo_retry"
@@ -23993,6 +24000,7 @@ fn cloud_mcp_notification_preferences_push_alias(key: &str) -> bool {
     matches!(
         key,
         "uir_prompts"
+            | "terminal_errors"
             | "loop_run_started"
             | "loop_run_completed"
             | "loop_run_failed"
@@ -24040,6 +24048,7 @@ fn cloud_mcp_default_notification_preferences() -> Value {
         "version": 1,
         "push": {
             "uir_prompts": true,
+            "terminal_errors": true,
             "loop_run_started": false,
             "loop_run_completed": true,
             "loop_run_failed": true,
@@ -24084,6 +24093,7 @@ fn cloud_mcp_sanitize_notification_preferences(value: &Value) -> Option<Value> {
     let source_push_value = Value::Object(source_push);
     for (key, aliases, fallback) in [
         ("uir_prompts", ["uir_prompts"], true),
+        ("terminal_errors", ["terminal_errors"], true),
         (
             "loop_run_started",
             ["loop_run_started"],
@@ -38226,7 +38236,7 @@ fn cloud_mcp_provider_command_catalog(provider: &str) -> Value {
         ]
     } else if provider.contains("opencode") {
         &[
-            ("/models", "Change the model", "passthrough"),
+            ("/models", "Change the model", "model"),
             ("/new", "Start a fresh conversation", "passthrough"),
             ("/sessions", "Browse sessions", "passthrough"),
             ("/compact", "Compact conversation context", "passthrough"),
@@ -38429,6 +38439,13 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         "prompting_user_text": payload.prompting_user_text.clone(),
         "turn_id": payload.turn_id,
         "provider_turn_id": payload.provider_turn_id,
+        "provider_error": payload.provider_error.clone(),
+        "attention_state": payload.provider_error.as_ref()
+            .and_then(|error| error.get("category"))
+            .and_then(Value::as_str)
+            .map(|category| if category == "auth" { "auth" } else { "error" })
+            .unwrap_or("none"),
+        "provider_health": if payload.provider_error.is_some() { "fatal" } else { "healthy" },
         "provider_session_id": provider_session_id.clone(),
         "native_session_id": provider_session_id.clone(),
         "session_id": provider_session_id,
@@ -57838,6 +57855,7 @@ mod cloud_mcp_tests {
             fork_from_provider_session_id: None,
             provider_turn_id: Some("turn-a".to_string()),
             turn_id: Some("turn-a".to_string()),
+            provider_error: None,
             transcript_path: None,
             cwd: Some("/tmp/project".to_string()),
             user_message: None,

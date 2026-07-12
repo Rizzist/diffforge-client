@@ -41191,10 +41191,7 @@ export default function App() {
         "effort",
         "thinking_power",
       ]).toLowerCase();
-      if (provider === "opencode") {
-        return { error: "OpenCode does not expose a reliable live model or effort slash command." };
-      }
-      if (!["codex", "claude"].includes(provider)) {
+      if (!["codex", "claude", "opencode"].includes(provider)) {
         return { error: "Remote model configuration requires a supported provider." };
       }
       const modelPattern = /^[A-Za-z0-9._:/-]+$/;
@@ -41206,33 +41203,56 @@ export default function App() {
           return { error: "Remote model change included an invalid model_id." };
         }
         const codexEfforts = new Set(["low", "medium", "high", "xhigh"]);
-        const advertisedModels = remoteControlTerminalCapabilityValues(terminal, [
-          "models",
-          "available_models",
-          "model_ids",
-        ]);
-        const canConfirmModelImmediately = advertisedModels.length > 0
-          && advertisedModels.includes(requestedModel);
+        // Catalog membership proves only that a value may be selected; the
+        // provider/status stream must still confirm that the live session
+        // applied it. Never acknowledge a model change optimistically.
+        if (provider === "opencode") {
+          return {
+            awaitingDetection: true,
+            command: "/models",
+            model_id: requestedModel,
+            picker_model: requestedModel,
+            recordModelId: "",
+            recordReasoningEffort: "",
+            reasoning_effort: "",
+          };
+        }
         if (provider === "codex" && codexEfforts.has(requestedEffort)) {
           return {
-            awaitingDetection: !canConfirmModelImmediately,
-            command: `/model ${requestedModel} ${requestedEffort}`,
+            awaitingDetection: true,
+            command: "/model",
             model_id: requestedModel,
-            recordModelId: canConfirmModelImmediately ? requestedModel : "",
-            recordReasoningEffort: canConfirmModelImmediately ? requestedEffort : "",
+            picker_model: requestedModel,
+            picker_effort: requestedEffort,
+            recordModelId: "",
+            recordReasoningEffort: "",
             reasoning_effort: requestedEffort,
           };
         }
+        if (provider === "codex") {
+          return {
+            awaitingDetection: true,
+            command: "/model",
+            model_id: requestedModel,
+            picker_model: requestedModel,
+            recordModelId: "",
+            recordReasoningEffort: "",
+            reasoning_effort: "",
+          };
+        }
         return {
-          awaitingDetection: !canConfirmModelImmediately,
+          awaitingDetection: true,
           command: `/model ${requestedModel}`,
           model_id: requestedModel,
-          recordModelId: canConfirmModelImmediately ? requestedModel : "",
+          recordModelId: "",
           recordReasoningEffort: "",
           reasoning_effort: "",
         };
       }
       if (commandKind === "agent_chat_change_effort") {
+        if (provider === "opencode") {
+          return { error: "OpenCode does not advertise a live reasoning-effort control." };
+        }
         const currentModel = remoteAgentChatConfigCurrentModel(event, terminal);
         return buildAgentChatChangeEffortCommand({
           currentModel,
@@ -41244,7 +41264,7 @@ export default function App() {
       return { error: "Unsupported model configuration command." };
     };
     const remoteAgentChatConfigCommandIsBareSlash = (command) => (
-      /^\/(?:model|effort)\s*$/i.test(String(command || "").trim())
+      /^\/(?:model|models|effort)\s*$/i.test(String(command || "").trim())
     );
     const waitRemoteAgentChatConfigSubmitSettle = (delayMs = 120) => (
       new Promise((resolve) => {
@@ -41296,61 +41316,56 @@ export default function App() {
           : "model";
       return runRemotePaneControlOperation({ operation_kind: operationKind, pane_id: paneId }, () => operation(request));
     };
-    const remoteAgentChatConfigSubmitSequences = (provider) => {
-      const primary = getTerminalSubmitSequence(provider, false);
-      const sequences = [];
-      if (primary) {
-        sequences.push(primary);
-      }
-      if (provider === "codex" && primary !== "\r") {
-        sequences.push("\r");
-      }
-      return [...new Set(sequences)];
-    };
     const writeRemoteAgentChatConfigCommand = async ({
       command,
       instance_id: instanceId,
       pane_id: paneId,
+      picker_effort: pickerEffort,
+      picker_model: pickerModel,
       provider,
       thread_id: threadId,
     }) => {
-      if (remoteAgentChatConfigCommandIsBareSlash(command)) {
+      if (remoteAgentChatConfigCommandIsBareSlash(command) && !pickerModel) {
         throw new Error("Refusing to send a bare model or effort slash command.");
       }
-      if (provider !== "codex") {
+      if (pickerModel) {
+        // Codex and OpenCode expose model selection as a native picker. Drive
+        // that picker as a serialized control transaction so `/model <id>` can
+        // never leak into the chat composer as a user prompt.
         await invoke("terminal_write", {
           data: buildTerminalSubmittedInput(command, provider),
           instance_id: Number.isInteger(instanceId) ? instanceId : undefined,
           pane_id: paneId,
-          prompt_event_source: "remote-model-config",
+          prompt_event_source: "remote-model-config-picker",
           thread_id: threadId || undefined,
         });
+        await waitRemoteAgentChatConfigSubmitSettle(220);
+        await invoke("terminal_write", {
+          data: buildTerminalSubmittedInput(pickerModel, provider),
+          instance_id: Number.isInteger(instanceId) ? instanceId : undefined,
+          pane_id: paneId,
+          prompt_event_source: "remote-model-config-picker",
+          thread_id: threadId || undefined,
+        });
+        if (pickerEffort) {
+          await waitRemoteAgentChatConfigSubmitSettle(220);
+          await invoke("terminal_write", {
+            data: buildTerminalSubmittedInput(pickerEffort, provider),
+            instance_id: Number.isInteger(instanceId) ? instanceId : undefined,
+            pane_id: paneId,
+            prompt_event_source: "remote-model-config-picker",
+            thread_id: threadId || undefined,
+          });
+        }
         return;
       }
       await invoke("terminal_write", {
-        data: command,
+        data: buildTerminalSubmittedInput(command, provider),
         instance_id: Number.isInteger(instanceId) ? instanceId : undefined,
         pane_id: paneId,
         prompt_event_source: "remote-model-config",
         thread_id: threadId || undefined,
       });
-      await waitRemoteAgentChatConfigSubmitSettle();
-      const submitSequences = remoteAgentChatConfigSubmitSequences(provider);
-      if (!submitSequences.length) {
-        throw new Error("Remote model configuration could not resolve a submit sequence.");
-      }
-      for (const submitSequence of submitSequences) {
-        await invoke("terminal_write", {
-          data: submitSequence,
-          instance_id: Number.isInteger(instanceId) ? instanceId : undefined,
-          pane_id: paneId,
-          prompt_event_source: "remote-model-config",
-          thread_id: threadId || undefined,
-        });
-        if (submitSequences.length > 1) {
-          await waitRemoteAgentChatConfigSubmitSettle();
-        }
-      }
     };
     const remoteAgentChatConfigDedupeKey = ({
       command_kind: commandKind,
@@ -41577,6 +41592,8 @@ export default function App() {
         command: built.command,
         instance_id: instanceId,
         pane_id: paneId,
+        picker_effort: built.picker_effort,
+        picker_model: built.picker_model,
         provider,
         thread_id: threadId,
       });
@@ -42204,6 +42221,54 @@ export default function App() {
           command_id: commandId,
           command_kind: commandKind,
         });
+        return;
+      }
+      if ([
+        "agent_account_login",
+        "terminal_provider_login",
+        "provider_login",
+        "agent_login",
+        "sign_in_agent",
+      ].includes(normalizedKind)) {
+        const provider = normalizeManagedAgentProviderId(
+          agentId
+            || remoteCommandStringField(event, [
+              "provider",
+              "agent_provider",
+              "agent_id",
+              "target_agent_id",
+            ]),
+        );
+        if (!provider) {
+          await recordRemoteCommandStatus(event, "failed", "Provider sign-in requires codex, claude, or opencode.", {
+            command_id: commandId,
+            command_kind: commandKind,
+          });
+          return;
+        }
+        try {
+          const result = await invoke("start_agent_account_login", { provider });
+          await recordRemoteCommandStatus(
+            event,
+            "completed",
+            result?.message || `Opened ${getManagedAgentLabel(provider)} sign-in on this desktop.`,
+            {
+              agent_id: provider,
+              command_id: commandId,
+              command_kind: commandKind,
+              login: result || null,
+              target,
+              workspace_id: workspaceId,
+            },
+          );
+        } catch (error) {
+          await recordRemoteCommandStatus(event, "failed", getErrorMessage(error, "Unable to start provider sign-in."), {
+            agent_id: provider,
+            command_id: commandId,
+            command_kind: commandKind,
+            workspace_id: workspaceId,
+          });
+        }
         return;
       }
       if ([

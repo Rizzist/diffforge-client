@@ -4696,9 +4696,9 @@ pub(crate) fn agent_accounts_observe_terminal_auth_output(
     pane_id: &str,
     scan_tail: &mut String,
     chunk: &[u8],
-) -> bool {
+) -> Option<Value> {
     if chunk.is_empty() {
-        return false;
+        return None;
     }
     scan_tail.push_str(&String::from_utf8_lossy(chunk));
     if scan_tail.len() > AGENT_ACCOUNTS_AUTH_SCAN_MAX_CHARS {
@@ -4713,9 +4713,18 @@ pub(crate) fn agent_accounts_observe_terminal_auth_output(
         }
     }
     let Some((reason, message)) = agent_accounts_codex_auth_failure_reason(scan_tail) else {
-        return false;
+        return None;
     };
-    agent_accounts_mark_pane_auth_issue(app, pane_id, reason, message)
+    // Account metadata and terminal turn state are deliberately separate. The
+    // caller uses this structured result to fail the active turn immediately,
+    // even when the same account issue was already recorded earlier.
+    let _ = agent_accounts_mark_pane_auth_issue(app, pane_id, reason, message);
+    Some(json!({
+        "category": "auth",
+        "provider_code": reason,
+        "safe_message": message,
+        "retryable": false,
+    }))
 }
 
 fn agent_accounts_mark_pane_auth_issue(

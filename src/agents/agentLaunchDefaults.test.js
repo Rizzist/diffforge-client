@@ -112,7 +112,10 @@ test("builds change-effort command for catalog-only ultra effort", () => {
   });
 
   assert.equal(built.error, undefined);
-  assert.equal(built.command, "/model gpt-5.6-sol ultra");
-  assert.equal(built.recordReasoningEffort, "ultra");
+  assert.equal(built.command, "/model");
+  assert.equal(built.picker_model, "gpt-5.6-sol");
+  assert.equal(built.picker_effort, "ultra");
+  assert.equal(built.recordReasoningEffort, "");
+  assert.equal(built.awaitingDetection, true);
   assert.equal(built.reasoning_effort, "ultra");
 });
