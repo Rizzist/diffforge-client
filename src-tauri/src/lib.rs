@@ -1179,11 +1179,11 @@ struct TerminalInstance {
     app_control_mcp_requested: bool,
 }
 
-#[derive(Default)]
 struct TerminalHeadlessOutputBuffer {
     epoch: u64,
     total_bytes: u64,
     tail: VecDeque<u8>,
+    vt: vt100::Parser,
 }
 
 #[derive(Serialize)]
@@ -1209,11 +1209,21 @@ struct TerminalHeadlessOutputDelta {
 }
 
 impl TerminalHeadlessOutputBuffer {
+    fn new(rows: u16, cols: u16) -> Self {
+        Self {
+            epoch: 0,
+            total_bytes: 0,
+            tail: VecDeque::new(),
+            vt: vt100::Parser::new(rows.max(1), cols.max(1), 10_000),
+        }
+    }
+
     fn append(&mut self, data: &[u8]) {
         if data.is_empty() {
             return;
         }
 
+        self.vt.process(data);
         self.epoch = self.epoch.saturating_add(1);
         self.total_bytes = self.total_bytes.saturating_add(data.len() as u64);
         if data.len() >= TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES {
@@ -1234,6 +1244,20 @@ impl TerminalHeadlessOutputBuffer {
         if overflow > 0 {
             self.tail.drain(..overflow);
         }
+    }
+
+    fn resize_vt(&mut self, rows: u16, cols: u16) {
+        self.vt.screen_mut().set_size(rows.max(1), cols.max(1));
+    }
+
+    fn vt_state(&self) -> Vec<u8> {
+        let screen = self.vt.screen();
+        let mut state = Vec::new();
+        if screen.alternate_screen() {
+            state.extend_from_slice(b"\x1b[?1049h");
+        }
+        state.extend_from_slice(&screen.state_formatted());
+        state
     }
 
     fn snapshot(&self, pane_id: &str, instance_id: u64) -> TerminalHeadlessOutputSnapshot {
@@ -1280,6 +1304,12 @@ impl TerminalHeadlessOutputBuffer {
             total_bytes: self.total_bytes,
             truncated,
         }
+    }
+}
+
+impl Default for TerminalHeadlessOutputBuffer {
+    fn default() -> Self {
+        Self::new(24, 80)
     }
 }
 
@@ -1516,7 +1546,9 @@ impl TerminalInstance {
                 master: Arc::new(Mutex::new(master)),
                 writer: Arc::new(Mutex::new(writer)),
                 size: Arc::new(Mutex::new(size)),
-                headless_output: Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::default())),
+                headless_output: Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(
+                    size.rows, size.cols,
+                ))),
                 working_directory: Arc::new(working_directory),
                 agent_started: Arc::new(Mutex::new(agent_started)),
                 input_gate: Arc::new(Mutex::new(TerminalInputGate::default())),

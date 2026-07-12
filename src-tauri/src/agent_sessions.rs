@@ -7133,7 +7133,7 @@ fn agent_thread_cloud_message_role(value: &Value, fallback_kind: &str) -> String
     }
     let kind = fallback_kind.trim().to_ascii_lowercase();
     if kind.contains("terminal")
-        || kind.contains("termout")
+        || kind.contains("termio")
         || kind.contains("output")
         || kind.contains("stdout")
         || kind.contains("stderr")

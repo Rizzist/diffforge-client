@@ -2537,6 +2537,17 @@ async fn write_terminal_input(
         instance
     };
     let input_kind = terminal_input_forensics_kind(data);
+    if let Some(app) = app {
+        let cloud_state = app.state::<CloudMcpState>();
+        cloud_mcp_revoke_terminal_io_control_for_local_action(
+            cloud_state.inner(),
+            &instance.metadata.workspace_id,
+            pane_id,
+            instance.id,
+            "native_input",
+        )
+        .await;
+    }
     log_terminal_crash_forensics_event(
         "backend.terminal_input.write.begin",
         json!({
@@ -2621,6 +2632,65 @@ async fn write_terminal_input(
         }
     }
 
+    Ok(true)
+}
+
+/// Writes an exact byte frame from a remote terminal controller. This is
+/// intentionally below the prompt/todo command layer: termio mirrors the PTY
+/// and must preserve control bytes and non-UTF-8 input without interpreting it
+/// as a chat submission.
+async fn write_terminal_input_bytes(
+    state: &TerminalState,
+    pane_id: &str,
+    instance_id: u64,
+    data: &[u8],
+) -> Result<bool, String> {
+    validate_terminal_pane_id(pane_id)?;
+    if data.is_empty() {
+        return Ok(true);
+    }
+    if data.len() > MAX_TERMINAL_WRITE_BYTES {
+        return Err("Terminal input chunk is too large.".to_string());
+    }
+
+    let Some(instance) = get_terminal_instance_if_current(state, pane_id, Some(instance_id)).await?
+    else {
+        return Ok(false);
+    };
+    let _input_guard = instance.input_queue.lock().await;
+    let terminals = state.terminals.read().await;
+    if terminals
+        .get(pane_id)
+        .map(|current| current.id != instance_id)
+        .unwrap_or(true)
+    {
+        return Ok(false);
+    }
+    let mut writer = instance.writer.lock().await;
+    writer
+        .write_all(data)
+        .map_err(|error| format!("Unable to write terminal input: {error}"))?;
+    writer
+        .flush()
+        .map_err(|error| format!("Unable to flush terminal input: {error}"))?;
+    Ok(true)
+}
+
+async fn resize_terminal_instance_exact(
+    app: &AppHandle,
+    state: &TerminalState,
+    pane_id: &str,
+    instance_id: u64,
+    cols: u16,
+    rows: u16,
+) -> Result<bool, String> {
+    validate_terminal_pane_id(pane_id)?;
+    let size = validate_terminal_size(cols, rows)?;
+    let Some(instance) = get_terminal_instance_if_current(state, pane_id, Some(instance_id)).await?
+    else {
+        return Ok(false);
+    };
+    resize_terminal_instance(Some(app), &instance, size, false).await?;
     Ok(true)
 }
 
@@ -5334,6 +5404,7 @@ fn spawn_terminal_reader(
     output_subscribers: Arc<StdMutex<HashMap<String, Vec<TerminalOutputTransportSubscriber>>>>,
     pane_id: String,
     instance_id: u64,
+    workspace_id: String,
     headless_output: Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
     cloud_mcp_state: CloudMcpState,
     output_channel: Channel<InvokeResponseBody>,
@@ -5561,6 +5632,7 @@ fn spawn_terminal_reader(
         let output_app = app.clone();
         let output_cloud_mcp_state = cloud_mcp_state.clone();
         let output_pane_id = reader_pane_id.clone();
+        let output_workspace_id = workspace_id.clone();
         let output_subscribers = Arc::clone(&output_subscribers);
         let output_sender_handle = thread::spawn(move || {
             let coalesce_window = Duration::from_millis(TERMINAL_OUTPUT_COALESCE_WINDOW_MS);
@@ -5651,6 +5723,7 @@ fn spawn_terminal_reader(
                 cloud_output_seq = cloud_output_seq.saturating_add(1);
                 cloud_mcp_publish_terminal_output_delta(
                     &output_cloud_mcp_state,
+                    &output_workspace_id,
                     &output_pane_id,
                     instance_id,
                     cloud_output_seq,
@@ -7625,6 +7698,7 @@ async fn terminal_open(
         Arc::clone(&state.terminal_output_transport_subscribers),
         pane_id.clone(),
         instance_id,
+        terminal_metadata_for_log.workspace_id.clone(),
         headless_output,
         cloud_mcp_state.inner().clone(),
         output_channel,
@@ -19777,6 +19851,9 @@ async fn resize_terminal_instance(
         return Err(format!("Unable to resize terminal: {error}"));
     }
     *current_size = size;
+    if let Ok(mut output) = instance.headless_output.lock() {
+        output.resize_vt(size.rows, size.cols);
+    }
     let elapsed_ms = terminal_diagnostic_elapsed_ms(resize_started_at);
     log_terminal_crash_forensics_event(
         "backend.terminal_resize.done",
@@ -19870,6 +19947,16 @@ async fn resize_terminal(
         return Ok(());
     };
 
+    let cloud_state = app.state::<CloudMcpState>();
+    cloud_mcp_revoke_terminal_io_control_for_local_action(
+        cloud_state.inner(),
+        &instance.metadata.workspace_id,
+        &instance.metadata.pane_id,
+        instance.id,
+        "native_resize",
+    )
+    .await;
+
     resize_terminal_instance(Some(&app), &instance, size, force.unwrap_or(false)).await?;
 
     Ok(())
@@ -19899,6 +19986,15 @@ async fn terminal_resize(
             return Err(error);
         }
     };
+    let cloud_state = app.state::<CloudMcpState>();
+    cloud_mcp_revoke_terminal_io_control_for_local_action(
+        cloud_state.inner(),
+        &instance.metadata.workspace_id,
+        &pane_id,
+        instance.id,
+        "native_resize",
+    )
+    .await;
     resize_terminal_instance(Some(&app), &instance, size, false).await?;
 
     Ok(())
