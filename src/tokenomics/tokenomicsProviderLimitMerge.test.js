@@ -147,7 +147,7 @@ test("Claude display drops expired unknown-scope aliases once a canonical row ex
   assert.equal(projected[0].reset_label, "Resets in 8m");
 });
 
-test("an expired Claude window preserves the last provider percentage until refresh", () => {
+test("an expired Claude window assumes a fresh window until refresh", () => {
   const projected = projectProviderLimitForDisplay({
     ...knownClaudeSession,
     display_percent: 16,
@@ -155,10 +155,26 @@ test("an expired Claude window preserves the last provider percentage until refr
     reset_at: "unix:1000",
   }, 1_100_000);
 
-  assert.equal(projected.used_percent, 84);
-  assert.equal(projected.remaining_percent, 16);
-  assert.equal(projected.display_percent, 16);
+  /* Visual-only assumption: an ended window is shown as fully reset until
+     the next live sample lands (client_reset_pending marks the guess). */
+  assert.equal(projected.used_percent, 0);
+  assert.equal(projected.remaining_percent, 100);
+  assert.equal(projected.display_percent, 100);
   assert.equal(projected.reset_after_seconds, 0);
   assert.equal(projected.client_reset_pending, true);
-  assert.equal(projected.reset_label, "Provider window ended; waiting for live refresh");
+  assert.equal(projected.reset_label, "Provider window ended; assuming 100% until live refresh");
+});
+
+test("an expired used-kind window assumes zero used until refresh", () => {
+  const projected = projectProviderLimitForDisplay({
+    ...knownClaudeSession,
+    display_percent: 84,
+    display_percent_kind: "used",
+    reset_at: "unix:1000",
+  }, 1_100_000);
+
+  assert.equal(projected.used_percent, 0);
+  assert.equal(projected.remaining_percent, 100);
+  assert.equal(projected.display_percent, 0);
+  assert.equal(projected.client_reset_pending, true);
 });

@@ -10,10 +10,28 @@ import {
   buildTodoQueueDeviceWorkspaceOptions,
   normalizeTodoQueueSwitcherId,
   normalizeTodoQueueWorkspaceMatchId,
+  todoQueueDeviceRecordsShareIdentity,
   todoQueueDeviceSelectionIsLocalEditable,
   todoQueueItemFromAuthoritativeSnapshot,
   workspaceTodoItemsForDeviceWorkspace,
 } from "./todoQueueDeviceSwitcher.js";
+
+test("device rows match workspace options through server and local aliases", () => {
+  assert.equal(todoQueueDeviceRecordsShareIdentity(
+    {
+      device_aliases: ["DESKTOP-M87SHCL", "web-windows-rig"],
+      device_id: "web-windows-rig",
+    },
+    {
+      device_aliases: ["desktop-m87shcl"],
+      device_id: "desktop-m87shcl",
+    },
+  ), true);
+  assert.equal(todoQueueDeviceRecordsShareIdentity(
+    { device_aliases: ["DESKTOP-M87SHCL"], device_id: "web-windows-rig" },
+    { device_aliases: ["syeds-macbook-air"], device_id: "mac-local" },
+  ), false);
+});
 
 test("device switcher puts the server-seen local desktop first and dedupes its echo", () => {
   const options = buildTodoQueueDeviceWorkspaceOptions({
@@ -1243,7 +1261,7 @@ test("devices graph model preserves device, workspace, terminal, tool, and todo 
   assert.equal(remoteDevice.workspaces[0].status, "idle");
 });
 
-test("only local device current workspace selections are editable", () => {
+test("local desktop ownership controls editability instead of workspace mirror metadata", () => {
   assert.equal(todoQueueDeviceSelectionIsLocalEditable({
     device_kind: "desktop",
     is_local: true,
@@ -1253,7 +1271,7 @@ test("only local device current workspace selections are editable", () => {
     device_kind: "desktop",
     is_local: true,
     workspace_id: "ws-other",
-  }, "ws-local"), false);
+  }, "ws-local"), true);
   assert.equal(todoQueueDeviceSelectionIsLocalEditable({
     device_kind: "desktop",
     is_local: false,
@@ -1263,6 +1281,10 @@ test("only local device current workspace selections are editable", () => {
     device_kind: "desktop",
     is_local: true,
     workspace_id: "",
+  }, ""), true);
+  assert.equal(todoQueueDeviceSelectionIsLocalEditable({
+    device_kind: "mobile",
+    is_local: true,
   }, ""), false);
 });
 
@@ -1386,6 +1408,33 @@ test("displayed todo arrays render a production dispatch for its remote Windows 
   assert.equal(displayed.items[0].readOnly, true);
   assert.deepEqual(displayed.pendingItems, {});
   assert.deepEqual(displayed.peerItems, []);
+});
+
+test("targeted mirror rows belong only to the recipient device and workspace", () => {
+  const workspaceTodos = {
+    dispatches_by_workspace: [{
+      workspace_id: "ws-recipient",
+      items: [{
+        dispatch_id: "dispatch-1",
+        todo_device_id: "mac-source",
+        todo_workspace_id: "ws-source",
+        target_device_id: "windows-recipient",
+        target_workspace_id: "ws-recipient",
+        text: "Run remotely",
+      }],
+    }],
+  };
+  const recipientItems = workspaceTodoItemsForDeviceWorkspace(workspaceTodos, {
+    device_id: "windows-recipient",
+    workspace_id: "ws-recipient",
+  });
+  const sourceItems = workspaceTodoItemsForDeviceWorkspace(workspaceTodos, {
+    device_id: "mac-source",
+    workspace_id: "ws-source",
+  });
+
+  assert.equal(recipientItems.length, 1);
+  assert.equal(sourceItems.length, 0);
 });
 
 test("todo_store_snapshot hydration keeps a Windows workspace across slash and drive case", () => {

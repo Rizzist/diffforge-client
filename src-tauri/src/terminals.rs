@@ -3146,13 +3146,22 @@ fn terminal_project_runtime(
         native_rail_label,
         readiness,
         terminal_lifecycle: terminal_lifecycle.to_string(),
-        terminal_status: status,
+        terminal_status: status.clone(),
         terminal_work_state,
         turn_status,
         session_state: if terminal_lifecycle == "closed" {
             "no_session".to_string()
-        } else {
+        } else if runtime
+            .provider_session_id
+            .as_deref()
+            .or(runtime.native_session_id.as_deref())
+            .is_some_and(|value| !value.trim().is_empty())
+        {
             "session_attached".to_string()
+        } else if status == "starting" {
+            "session_starting".to_string()
+        } else {
+            "no_session".to_string()
         },
     }
 }
@@ -3667,7 +3676,9 @@ fn terminal_record_workspace_agent_session_history(
 }
 
 const TERMINAL_CODEX_SESSION_DISCOVERY_DELAYS_MS: [u64; 6] =
-    [700, 1_500, 3_000, 6_000, 12_000, 20_000];
+    [100, 250, 500, 1_000, 2_000, 4_000];
+const TERMINAL_PROMPT_SESSION_DISCOVERY_DELAYS_MS: [u64; 8] =
+    [50, 150, 300, 600, 1_200, 2_500, 5_000, 10_000];
 
 fn terminal_runtime_has_provider_session(instance: &TerminalInstance) -> bool {
     terminal_runtime_snapshot(instance)
@@ -3697,10 +3708,11 @@ fn spawn_terminal_codex_session_discovery(
     instance_id: u64,
     launched_at_ms: u64,
     source: impl Into<String>,
+    delays_ms: &'static [u64],
 ) {
     let source = source.into();
     tauri::async_runtime::spawn(async move {
-        for delay_ms in TERMINAL_CODEX_SESSION_DISCOVERY_DELAYS_MS {
+        for &delay_ms in delays_ms {
             sleep(Duration::from_millis(delay_ms)).await;
 
             let Some(instance) =
@@ -3800,6 +3812,127 @@ fn spawn_terminal_codex_session_discovery(
                 }),
             );
             break;
+        }
+    });
+}
+
+fn spawn_terminal_non_codex_session_discovery_for_prompt(
+    app: AppHandle,
+    terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    pane_id: String,
+    instance_id: u64,
+    prompt: String,
+    source: impl Into<String>,
+) {
+    let source = source.into();
+    let prompt = prompt.trim().to_string();
+    if prompt.is_empty() {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        for (attempt, &delay_ms) in TERMINAL_PROMPT_SESSION_DISCOVERY_DELAYS_MS
+            .iter()
+            .enumerate()
+        {
+            sleep(Duration::from_millis(delay_ms)).await;
+
+            let Some(instance) =
+                terminal_activity_hook_current_instance(&terminals, &pane_id, instance_id).await
+            else {
+                return;
+            };
+            if terminal_runtime_has_provider_session(&instance) {
+                return;
+            }
+            let agent_id = terminal_normalize_agent_kind(Some(&instance.metadata.agent_kind))
+                .or_else(|| terminal_normalize_agent_kind(Some(&instance.metadata.agent_id)))
+                .unwrap_or_default();
+            if !matches!(agent_id.as_str(), "claude" | "opencode") {
+                return;
+            }
+
+            let cwd = instance.working_directory.to_string_lossy().to_string();
+            let prompt_for_discovery = prompt.clone();
+            let agent_for_discovery = agent_id.clone();
+            let discovered = tauri::async_runtime::spawn_blocking(move || {
+                if agent_for_discovery == "claude" {
+                    discover_claude_session_by_prompt(
+                        &prompt_for_discovery,
+                        &cwd,
+                        CODEX_TRANSCRIPT_DEFAULT_LIMIT,
+                    )
+                } else {
+                    discover_opencode_session_by_prompt(
+                        &prompt_for_discovery,
+                        &cwd,
+                        CODEX_TRANSCRIPT_DEFAULT_LIMIT,
+                    )
+                }
+            })
+            .await
+            .ok()
+            .and_then(Result::ok);
+
+            let Some(discovered) = discovered else {
+                if attempt + 1 == TERMINAL_PROMPT_SESSION_DISCOVERY_DELAYS_MS.len() {
+                    log_terminal_status_event(
+                        "backend.terminal_provider_session.prompt_discovery_exhausted",
+                        json!({
+                            "agent_id": agent_id,
+                            "attempt_count": attempt + 1,
+                            "instance_id": instance_id,
+                            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                            "source": source.clone(),
+                        }),
+                    );
+                }
+                continue;
+            };
+            let Some(provider_session_id) =
+                terminal_clean_provider_session_id(Some(&discovered.session_id))
+            else {
+                continue;
+            };
+            let Some(current_instance) =
+                terminal_activity_hook_current_instance(&terminals, &pane_id, instance_id).await
+            else {
+                return;
+            };
+            if terminal_runtime_has_provider_session(&current_instance) {
+                return;
+            }
+
+            terminal_runtime_apply_provider_session_id(
+                &current_instance,
+                &provider_session_id,
+                "prompt-transcript-discovery",
+            );
+            terminal_record_workspace_provider_session_binding_with_transcript_path(
+                Some(app.clone()),
+                &current_instance,
+                provider_session_id.clone(),
+                "prompt-transcript-discovery",
+                Some(discovered.rollout_path.as_str()),
+            );
+            if let Some(coordination) = current_instance.coordination.clone() {
+                terminal_record_coordination_provider_session_id(
+                    coordination,
+                    provider_session_id,
+                    "prompt-transcript-discovery",
+                );
+            }
+            log_terminal_status_event(
+                "backend.terminal_provider_session.prompt_discovered",
+                json!({
+                    "agent_id": agent_id,
+                    "attempt": attempt + 1,
+                    "instance_id": instance_id,
+                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    "provider_session_id_present": true,
+                    "source": source.clone(),
+                }),
+            );
+            return;
         }
     });
 }
@@ -9231,6 +9364,7 @@ async fn terminal_open(
         instance_id,
         provider_session_discovery_started_at_ms,
         "terminal_open",
+        &TERMINAL_CODEX_SESSION_DISCOVERY_DELAYS_MS,
     );
 
     log_terminal_crash_forensics_event(
@@ -10394,6 +10528,7 @@ async fn start_terminal_agent_in_prepared_pty(
                     instance.id,
                     provider_session_discovery_started_at_ms,
                     "terminal_start_agent",
+                    &TERMINAL_CODEX_SESSION_DISCOVERY_DELAYS_MS,
                 );
                 return TerminalStartAgentPaneResult {
                     pane_id,
@@ -17112,6 +17247,28 @@ fn apply_terminal_activity_hook_payload(
             );
         }
     }
+    if matches!(
+        payload.event_type.as_str(),
+        "provider-turn-completed" | "provider-turn-error" | "provider-turn-interrupted"
+    ) {
+        let triggered = trigger_agent_thread_transcript_native_watch(
+            app,
+            &payload.pane_id,
+            Some(payload.instance_id),
+            "terminal-activity-final",
+        );
+        log_terminal_status_event(
+            "backend.agent_thread_transcript.native_watch_triggered",
+            json!({
+                "event_type": payload.event_type.clone(),
+                "hook_event_name": payload.hook_event_name.clone(),
+                "instance_id": payload.instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(&payload.pane_id),
+                "reason": "terminal-activity-final",
+                "watch_count": triggered,
+            }),
+        );
+    }
     let resume_app = app.clone();
     let resume_cloud_state = cloud_mcp_state.clone();
     let resume_terminals = Arc::clone(terminals);
@@ -19243,6 +19400,47 @@ async fn terminal_write_inner(
             submitted_prompt_source,
             thread_id.as_deref(),
         );
+        if submitted_prompt_authoritative && !terminal_runtime_has_provider_session(&instance) {
+            // Harness session stores can materialize only after the first
+            // prompt, after launch-time discovery has elapsed. Re-arm exact
+            // prompt discovery so the provider session enters live state
+            // without waiting for periodic reconciliation. Native hook IDs
+            // still win whenever they arrive first.
+            let normalized_agent = terminal_normalize_agent_kind(Some(&instance.metadata.agent_kind))
+                .or_else(|| terminal_normalize_agent_kind(Some(&instance.metadata.agent_id)))
+                .unwrap_or_default();
+            log_terminal_status_event(
+                "backend.terminal_provider_session.prompt_discovery_armed",
+                json!({
+                    "agent_id": normalized_agent.clone(),
+                    "instance_id": instance.id,
+                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
+                    "source": submitted_prompt_source,
+                    "workspace_id": clean_terminal_diagnostic_log_text(&instance.metadata.workspace_id),
+                }),
+            );
+            if normalized_agent == "codex" {
+                spawn_terminal_codex_session_discovery(
+                    app.clone(),
+                    Arc::clone(&state.terminals),
+                    pane_id.clone(),
+                    instance.id,
+                    terminal_now_ms().saturating_sub(30_000),
+                    "terminal_prompt_submitted",
+                    &TERMINAL_PROMPT_SESSION_DISCOVERY_DELAYS_MS,
+                );
+            } else if matches!(normalized_agent.as_str(), "claude" | "opencode") {
+                spawn_terminal_non_codex_session_discovery_for_prompt(
+                    app.clone(),
+                    Arc::clone(&state.terminals),
+                    pane_id.clone(),
+                    instance.id,
+                    event_prompt.clone(),
+                    "terminal_prompt_submitted",
+                );
+            }
+        }
         log_terminal_status_event(
             "backend.terminal_write.prompt_observed",
             json!({
@@ -23586,6 +23784,7 @@ mod terminal_tests {
         assert_eq!(projected.terminal_work_state, "complete");
         assert_eq!(projected.execution_phase, "idle");
         assert_eq!(projected.native_rail_state, "idle");
+        assert_eq!(projected.session_state, "no_session");
     }
 
     #[test]
@@ -23600,6 +23799,7 @@ mod terminal_tests {
         assert_eq!(projected.terminal_work_state, "running");
         assert_eq!(projected.execution_phase, "starting");
         assert_eq!(projected.native_rail_state, "starting");
+        assert_eq!(projected.session_state, "session_starting");
     }
 
     #[test]

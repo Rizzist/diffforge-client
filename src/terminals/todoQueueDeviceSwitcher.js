@@ -2,6 +2,13 @@ export const TODO_QUEUE_DEVICE_KIND_DESKTOP = "desktop";
 export const TODO_QUEUE_DEVICE_KIND_MOBILE = "mobile";
 export const TODO_QUEUE_DEVICE_KIND_UNKNOWN = "unknown";
 
+function todoQueueDeviceWorkspaceKey(deviceId, workspaceId) {
+  return JSON.stringify([
+    normalizeTodoQueueSwitcherId(deviceId),
+    normalizeWorkspaceId(workspaceId),
+  ]);
+}
+
 const LIVE_STATE_PRESENT_KEYS = [
   "connected",
   "online",
@@ -315,6 +322,13 @@ function aliasesIntersect(left = [], right = []) {
     .map(normalizeTodoQueueSwitcherId)
     .filter(Boolean)
     .some((alias) => rightSet.has(alias));
+}
+
+export function todoQueueDeviceRecordsShareIdentity(left = {}, right = {}) {
+  return aliasesIntersect(
+    deviceAliasesForRecord(left, left?.device_id),
+    deviceAliasesForRecord(right, right?.device_id),
+  );
 }
 
 function firstDeviceObject(...values) {
@@ -725,18 +739,30 @@ function workspaceIdForRecord(record, fallback = "") {
 }
 
 function todoMirrorWorkspaceIdsForRecord(record, fallback = "") {
-  const values = [
+  const targetDeviceIds = [
+    record?.target_device_id,
+    record?.target?.device_id,
+  ]
+    .map(normalizeTodoQueueSwitcherId)
+    .filter(Boolean);
+  const targetWorkspaceIds = [
     record?.target_workspace_id,
     record?.target?.workspace_id,
+  ]
+    .map(normalizeWorkspaceId)
+    .filter(Boolean);
+  const values = targetDeviceIds.length && targetWorkspaceIds.length
+    ? targetWorkspaceIds
+    : [
     record?.workspace_id,
     record?.source_workspace_id,
     record?.todo_workspace_id,
     record?.requested_by_workspace_id,
     record?.origin_workspace_id,
     record?.origin?.workspace_id,
-  ]
-    .map(normalizeWorkspaceId)
-    .filter(Boolean);
+    ]
+      .map(normalizeWorkspaceId)
+      .filter(Boolean);
   if (!values.length && fallback) {
     values.push(normalizeWorkspaceId(fallback));
   }
@@ -744,9 +770,16 @@ function todoMirrorWorkspaceIdsForRecord(record, fallback = "") {
 }
 
 function todoMirrorDeviceIdsForRecord(record) {
-  const values = [
+  const targetValues = [
     record?.target_device_id,
     record?.target?.device_id,
+  ]
+    .map(normalizeTodoQueueSwitcherId)
+    .filter(Boolean);
+  if (targetValues.length) {
+    return Array.from(new Set(targetValues));
+  }
+  const values = [
     record?.device_id,
     record?.machine_id,
     record?.source_device_id,
@@ -1028,7 +1061,7 @@ function addWorkspace(workspacesByDevice, entry) {
   if (!deviceId || !workspaceId || !workspaceMatchId) {
     return;
   }
-  const key = `${deviceId}::${workspaceMatchId}`;
+  const key = todoQueueDeviceWorkspaceKey(deviceId, workspaceMatchId);
   const previous = workspacesByDevice.get(key) || {};
   workspacesByDevice.set(key, {
     ...previous,
@@ -1094,10 +1127,9 @@ function moveWorkspaceEntriesToDevice(workspacesByDevice, fromDeviceId, toDevice
   if (!safeFromDeviceId || !safeToDeviceId || safeFromDeviceId === safeToDeviceId) {
     return;
   }
-  const fromPrefix = `${safeFromDeviceId}::`;
   const entriesToMove = [];
   for (const [key, entry] of workspacesByDevice.entries()) {
-    if (String(key || "").startsWith(fromPrefix)) {
+    if (normalizeTodoQueueSwitcherId(entry?.device_id) === safeFromDeviceId) {
       entriesToMove.push([key, entry]);
     }
   }
@@ -1117,9 +1149,8 @@ function removeWorkspaceEntriesForDevice(workspacesByDevice, deviceId) {
   if (!safeDeviceId) {
     return;
   }
-  const prefix = `${safeDeviceId}::`;
-  Array.from(workspacesByDevice.keys()).forEach((key) => {
-    if (String(key || "").startsWith(prefix)) {
+  Array.from(workspacesByDevice.entries()).forEach(([key, entry]) => {
+    if (normalizeTodoQueueSwitcherId(entry?.device_id) === safeDeviceId) {
       workspacesByDevice.delete(key);
     }
   });
@@ -1500,8 +1531,8 @@ function selectionIdFor({
   const safeDeviceId = normalizeTodoQueueSwitcherId(deviceId) || "device";
   const safeWorkspaceId = normalizeTodoQueueWorkspaceMatchId(workspaceId, platform);
   return safeWorkspaceId
-    ? `${safeDeviceId}::${safeWorkspaceId}`
-    : `${safeDeviceId}::${deviceKind}`;
+    ? todoQueueDeviceWorkspaceKey(safeDeviceId, safeWorkspaceId)
+    : todoQueueDeviceWorkspaceKey(safeDeviceId, `device-kind:${deviceKind}`);
 }
 
 function sortWorkspaceEntries(a, b) {
@@ -1554,7 +1585,7 @@ export function buildTodoQueueDeviceWorkspaceOptions({
     if (!safeDeviceId || !safeCurrentWorkspaceId) {
       return;
     }
-    const workspaceKey = `${safeDeviceId}::${currentWorkspaceMatchId}`;
+    const workspaceKey = todoQueueDeviceWorkspaceKey(safeDeviceId, currentWorkspaceMatchId);
     const currentWorkspace = workspacesByDevice.get(workspaceKey);
     if (currentWorkspace) {
       workspacesByDevice.set(workspaceKey, {
@@ -2056,19 +2087,7 @@ export function buildDevicesGraphModel({
   };
 }
 
-export function todoQueueDeviceSelectionIsLocalEditable(selection, currentWorkspaceId = "") {
-  const platform = firstText(
-    selection?.platform,
-    selection?.os,
-    selection?.platform_label,
-    selection?.rawDevice?.platform,
-    selection?.rawDevice?.os,
-  );
-  const selectionWorkspaceId = normalizeTodoQueueWorkspaceMatchId(
-    selection?.workspace_id,
-    platform,
-  );
-  const safeCurrentWorkspaceId = normalizeTodoQueueWorkspaceMatchId(currentWorkspaceId, platform);
+export function todoQueueDeviceSelectionIsLocalEditable(selection, _currentWorkspaceId = "") {
   const deviceKind = [
     selection?.device_kind,
     selection?.form_factor,
@@ -2088,10 +2107,7 @@ export function todoQueueDeviceSelectionIsLocalEditable(selection, currentWorksp
   ) === true;
   return Boolean(
     isLocal
-      && deviceKind === TODO_QUEUE_DEVICE_KIND_DESKTOP
-      && selectionWorkspaceId
-      && safeCurrentWorkspaceId
-      && selectionWorkspaceId === safeCurrentWorkspaceId,
+      && deviceKind === TODO_QUEUE_DEVICE_KIND_DESKTOP,
   );
 }
 

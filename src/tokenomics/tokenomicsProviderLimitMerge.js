@@ -126,12 +126,21 @@ export function projectProviderLimitForDisplay(row = {}, nowMs = Date.now()) {
       reset_label: `Resets in ${formatLimitResetDuration(secondsUntilReset)}`,
     };
   }
-  // A provider window ending does not prove that usage reset to zero. Keep the
-  // last provider-reported percentage until the next live sample arrives.
+  // The provider window has ended: until the next live sample proves
+  // otherwise, assume the window rolled over fresh (visual only — raw
+  // counters stay untouched). Keeping the stale mid-window percentage reads
+  // as "still capped", which is the wrong default for an expired window.
+  const displayKind = String(row.display_percent_kind || "").toLowerCase();
   return {
     ...row,
+    remaining_percent: 100,
+    used_percent: 0,
+    limit_used_percent: 0,
+    ...(row.display_percent != null
+      ? { display_percent: displayKind === "used" ? 0 : 100 }
+      : {}),
     reset_after_seconds: 0,
-    reset_label: "Provider window ended; waiting for live refresh",
+    reset_label: "Provider window ended; assuming 100% until live refresh",
     client_reset_pending: true,
   };
 }

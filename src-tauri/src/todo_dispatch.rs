@@ -1187,6 +1187,12 @@ fn todo_dispatch_remote_intake_already_current(
     )
 }
 
+fn todo_dispatch_remote_intake_is_stale(existing: &Value, incoming: &Value) -> bool {
+    let existing_updated_ms = todo_store_item_updated_ms(existing);
+    let incoming_updated_ms = todo_store_item_updated_ms(incoming);
+    incoming_updated_ms > 0 && existing_updated_ms > incoming_updated_ms
+}
+
 fn todo_dispatch_remote_intake_success_outcome(
     event: &Value,
     command_id: &str,
@@ -1227,7 +1233,7 @@ fn todo_dispatch_remote_intake_success_outcome(
 fn todo_dispatch_remote_intake_should_ack_cloud(changed_kind: &str) -> bool {
     matches!(
         changed_kind.trim(),
-        "remote_todo_created" | "remote_todo_updated"
+        "remote_todo_created" | "remote_todo_updated" | "remote_todo_stale_ignored"
     )
 }
 
@@ -1419,7 +1425,10 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                         current_status.as_str(),
                         "" | "listed" | "queued" | "pending" | "requested"
                     ) {
-                        if todo_dispatch_remote_intake_already_current(
+                        if todo_dispatch_remote_intake_is_stale(existing, event) {
+                            changed_item = Some(existing.clone());
+                            changed_kind = "remote_todo_stale_ignored";
+                        } else if todo_dispatch_remote_intake_already_current(
                             existing,
                             &text,
                             intake_status,
@@ -1793,6 +1802,7 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                 if let Some(item) = changed_item {
                     if changed_kind != "remote_todo_conflict_current"
                         && changed_kind != "remote_todo_already_current"
+                        && changed_kind != "remote_todo_stale_ignored"
                     {
                         todo_dispatch_queue_write(&workspace_id, &items);
                         todo_store_orphan_sweep_trigger("remote_todo_intake");
@@ -7862,8 +7872,34 @@ mod todo_store_tests {
     fn remote_intake_only_acks_new_or_updated_rows() {
         assert!(todo_dispatch_remote_intake_should_ack_cloud("remote_todo_created"));
         assert!(todo_dispatch_remote_intake_should_ack_cloud("remote_todo_updated"));
+        assert!(todo_dispatch_remote_intake_should_ack_cloud("remote_todo_stale_ignored"));
         assert!(!todo_dispatch_remote_intake_should_ack_cloud("remote_todo_already_current"));
         assert!(!todo_dispatch_remote_intake_should_ack_cloud("remote_todo_conflict_current"));
+    }
+
+    #[test]
+    fn remote_intake_cannot_undo_a_newer_local_edit() {
+        let existing = json!({
+            "id": "todo-1",
+            "status": "listed",
+            "text": "new local text",
+            "updated_at": "2026-07-12T07:13:00.000Z",
+        });
+        let stale_remote = json!({
+            "command_id": "todo-1",
+            "status": "listed",
+            "text": "old cloud text",
+            "updated_at": "2026-07-12T07:12:00.000Z",
+        });
+        let newer_remote = json!({
+            "command_id": "todo-1",
+            "status": "listed",
+            "text": "newer web text",
+            "updated_at": "2026-07-12T07:14:00.000Z",
+        });
+
+        assert!(todo_dispatch_remote_intake_is_stale(&existing, &stale_remote));
+        assert!(!todo_dispatch_remote_intake_is_stale(&existing, &newer_remote));
     }
 
     #[test]
@@ -8639,6 +8675,7 @@ mod todo_store_tests {
                 "plan_task": { "task_id": "task-1", "title": "Ship task" },
                 "status": "done",
                 "target_explicit": true,
+                "target_terminal_id": "pane-2",
                 "target_terminal_index": 2,
                 "text": " ship\r\nit ",
                 "title": "Ship it",
@@ -8663,6 +8700,7 @@ mod todo_store_tests {
         assert_eq!(item["plan_task"]["task_id"], "task-1");
         assert_eq!(item["title"], "Ship it");
         assert_eq!(item["target_explicit"], true);
+        assert_eq!(item["target_terminal_id"], "pane-2");
         assert_eq!(item["target_terminal_index"], 2);
         assert!(item["todo_status_updated_at"].as_str().unwrap().ends_with('Z'));
     }
@@ -11890,7 +11928,7 @@ fn todo_dispatch_prepare_immediate_backend_item(
         if !pane_id.is_empty() {
             object.insert("target_terminal_id".to_string(), json!(pane_id));
         }
-        if !thread_id.is_empty() {
+        if !pane_id.is_empty() && !thread_id.is_empty() {
             object.insert("target_thread_id".to_string(), json!(thread_id));
         }
         if !target_agent.is_empty() {
@@ -11900,8 +11938,10 @@ fn todo_dispatch_prepare_immediate_backend_item(
             object.insert("target_kind".to_string(), json!("swarm"));
             object.insert("target_swarm_id".to_string(), json!(target_swarm_id.clone()));
         }
-        if let Some(index) = terminal_index {
-            object.insert("target_terminal_index".to_string(), json!(index));
+        if !pane_id.is_empty() {
+            if let Some(index) = terminal_index {
+                object.insert("target_terminal_index".to_string(), json!(index));
+            }
         }
         if let Some(prompt_event_id) = prompt_event_id
             .map(str::trim)

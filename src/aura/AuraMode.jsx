@@ -1,18 +1,14 @@
 // Aura Mode — full-screen "Jarvis" orchestration view. UI-only for now: the
-// scene renders mock workspace/terminal/todo/docs/MCP state (auraMockData.js)
-// and the voice button is a visual preview, not wired to the voice pipeline.
-// Lazy-loaded from AppShell so three.js stays out of the main bundle.
+// scene renders mock fleet state (auraMockData.js) inside one containment
+// sphere, and the mic mute button is a visual preview, not wired to the
+// voice pipeline. Lazy-loaded from AppShell so three.js stays out of the
+// main bundle.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled, { css, keyframes } from "styled-components";
 
 import { AuraSceneEngine } from "./AuraSceneEngine.js";
-import {
-  AURA_DEVICE_KIND_LABELS,
-  AURA_MOCK_STATE,
-  AURA_STATE_COLORS,
-  auraWorkspaceState,
-} from "./auraMockData.js";
+import { AURA_MOCK_STATE, AURA_STATE_COLORS } from "./auraMockData.js";
 
 const EXIT_ANIMATION_MS = 260;
 
@@ -49,17 +45,6 @@ const hudInStill = keyframes`
   }
   to {
     opacity: 1;
-  }
-`;
-
-const voicePulse = keyframes`
-  0% {
-    opacity: 0.55;
-    transform: scale(1);
-  }
-  100% {
-    opacity: 0;
-    transform: scale(1.85);
   }
 `;
 
@@ -235,10 +220,8 @@ const AuraWordmark = styled.div`
   display: grid;
   justify-items: center;
   gap: 6px;
-  animation-delay: 120ms;
-
-  /* keep the entrance slide from fighting the centering transform */
   animation-name: ${hudInStill};
+  animation-delay: 120ms;
 `;
 
 const AuraWordmarkTitle = styled.div`
@@ -270,58 +253,35 @@ const AuraWordmarkStatus = styled.div`
     animation: ${statusBlink} 2.4s ease-in-out infinite;
     ${reducedMotion};
   }
-`;
 
-const AuraPanel = styled.section`
-  ${auraHudLayer};
-  top: 50%;
-  width: 226px;
-  max-height: min(64vh, 540px);
-  overflow-y: auto;
-  scrollbar-width: thin;
-  padding: 15px 17px;
-  transform: translateY(-50%);
-  animation-name: ${hudInStill};
-  border: 1px solid rgba(148, 180, 255, 0.13);
-  border-radius: 14px;
-  background: rgba(6, 10, 19, 0.46);
-  backdrop-filter: blur(16px) saturate(130%);
-
-  &[data-side="left"] {
-    left: 26px;
-    animation-delay: 220ms;
+  &[data-mode="user"] {
+    color: rgba(120, 235, 190, 0.8);
   }
 
-  &[data-side="right"] {
-    right: 26px;
-    animation-delay: 300ms;
+  &[data-mode="user"]::before {
+    background: #52e5a3;
+    box-shadow: 0 0 8px rgba(82, 229, 163, 0.9);
   }
 
-  @media (max-width: 980px) {
-    display: none;
+  &[data-mode="orchestrator"] {
+    color: rgba(255, 196, 120, 0.85);
   }
-`;
 
-const AuraPanelHeading = styled.h3`
-  margin: 0 0 10px;
-  font-size: 9px;
-  font-weight: 700;
-  letter-spacing: 0.3em;
-  color: rgba(148, 180, 255, 0.62);
-`;
+  &[data-mode="orchestrator"]::before {
+    background: #ff9a3c;
+    box-shadow: 0 0 8px rgba(255, 154, 60, 0.9);
+    animation-duration: 0.9s;
+  }
 
-const AuraPanelDivider = styled.div`
-  height: 1px;
-  margin: 13px 0;
-  background: linear-gradient(90deg, rgba(148, 180, 255, 0.24), transparent);
-`;
+  &[data-mode="muted"] {
+    color: rgba(150, 172, 210, 0.6);
+  }
 
-const AuraPanelRow = styled.div`
-  display: grid;
-  grid-template-columns: 8px minmax(0, 1fr);
-  align-items: baseline;
-  column-gap: 9px;
-  padding: 4px 0;
+  &[data-mode="muted"]::before {
+    background: #77839a;
+    box-shadow: none;
+    animation: none;
+  }
 `;
 
 const dotPulse = keyframes`
@@ -333,7 +293,45 @@ const dotPulse = keyframes`
   }
 `;
 
-const AuraPanelDot = styled.span`
+/* Top-right activity queue: the one HUD panel. */
+const AuraActivityPanel = styled.section`
+  ${auraHudLayer};
+  top: 92px;
+  right: 26px;
+  width: 238px;
+  max-height: min(58vh, 480px);
+  overflow-y: auto;
+  scrollbar-width: thin;
+  padding: 14px 16px;
+  animation-name: ${hudInStill};
+  animation-delay: 220ms;
+  border: 1px solid rgba(148, 180, 255, 0.13);
+  border-radius: 14px;
+  background: rgba(6, 10, 19, 0.46);
+  backdrop-filter: blur(16px) saturate(130%);
+
+  @media (max-width: 760px) {
+    display: none;
+  }
+`;
+
+const AuraActivityHeading = styled.h3`
+  margin: 0 0 10px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.3em;
+  color: rgba(148, 180, 255, 0.62);
+`;
+
+const AuraActivityRow = styled.div`
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr);
+  align-items: baseline;
+  column-gap: 9px;
+  padding: 4px 0;
+`;
+
+const AuraActivityDot = styled.span`
   align-self: center;
   width: 7px;
   height: 7px;
@@ -347,21 +345,7 @@ const AuraPanelDot = styled.span`
   }
 `;
 
-const AuraPanelTag = styled.span`
-  display: inline-block;
-  margin-left: 7px;
-  padding: 1px 6px;
-  border: 1px solid rgba(79, 216, 255, 0.34);
-  border-radius: 999px;
-  color: rgba(79, 216, 255, 0.85);
-  font-size: 8px;
-  font-weight: 800;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  vertical-align: 2px;
-`;
-
-const AuraPanelName = styled.div`
+const AuraActivityName = styled.div`
   overflow: hidden;
   font-size: 11.5px;
   font-weight: 600;
@@ -370,126 +354,93 @@ const AuraPanelName = styled.div`
   white-space: nowrap;
 `;
 
-const AuraPanelMeta = styled.div`
+const AuraActivityMeta = styled.div`
   grid-column: 2;
   font-size: 9.5px;
   letter-spacing: 0.04em;
   color: rgba(160, 180, 214, 0.6);
 `;
 
-const AuraVoiceCluster = styled.div`
+const AuraActivitySummary = styled.div`
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px solid rgba(148, 180, 255, 0.12);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  color: rgba(160, 180, 214, 0.62);
+`;
+
+/* Small mic mute toggle, bottom center — replaces the big voice button. */
+const AuraMuteCluster = styled.div`
   ${auraHudLayer};
-  bottom: 40px;
+  bottom: 34px;
   left: 50%;
   transform: translateX(-50%);
   display: grid;
   justify-items: center;
-  gap: 13px;
+  gap: 8px;
   animation-name: ${hudInStill};
   animation-delay: 420ms;
 `;
 
-const AuraVoiceRing = styled.span`
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 78px;
-  height: 78px;
-  margin: -39px 0 0 -39px;
-  border: 1px solid rgba(79, 216, 255, 0.5);
-  border-radius: 999px;
-  pointer-events: none;
-  animation: ${voicePulse} 2.8s ease-out infinite;
-  ${reducedMotion};
-
-  &[data-ring="2"] {
-    border-color: rgba(255, 154, 60, 0.4);
-    animation-delay: 1.4s;
-  }
-`;
-
-const AuraVoiceButtonShell = styled.div`
-  position: relative;
-
-  &[data-engaged="true"] ${AuraVoiceRing} {
-    animation-duration: 1.3s;
-  }
-`;
-
-const AuraVoiceButton = styled.button`
+const AuraMuteButton = styled.button`
   display: grid;
-  position: relative;
-  z-index: 2;
-  width: 78px;
-  height: 78px;
+  width: 46px;
+  height: 46px;
   padding: 0;
   place-items: center;
   pointer-events: auto;
   appearance: none;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(148, 180, 255, 0.22);
   border-radius: 999px;
-  background: #000000;
-  box-shadow:
-    0 0 0 5px rgba(244, 247, 250, 0.08),
-    0 12px 44px rgba(0, 0, 0, 0.55);
+  background: rgba(8, 14, 26, 0.6);
+  color: rgba(196, 226, 255, 0.9);
   cursor: pointer;
   line-height: 0;
-  outline: none;
+  backdrop-filter: blur(14px) saturate(130%);
   transition:
-    border-color 160ms ease,
-    box-shadow 160ms ease,
-    transform 160ms ease;
+    border-color 150ms ease,
+    background 150ms ease,
+    box-shadow 150ms ease,
+    color 150ms ease,
+    transform 150ms ease;
 
-  img {
-    width: 46px;
-    height: 46px;
-    border-radius: 999px;
-    pointer-events: none;
+  svg {
+    width: 18px;
+    height: 18px;
   }
 
   &:hover {
     border-color: rgba(79, 216, 255, 0.45);
-    box-shadow:
-      0 0 0 5px rgba(79, 216, 255, 0.12),
-      0 0 34px rgba(79, 216, 255, 0.22),
-      0 12px 44px rgba(0, 0, 0, 0.55);
+    box-shadow: 0 0 18px rgba(79, 216, 255, 0.16);
   }
 
   &:focus-visible {
-    border-color: rgba(79, 216, 255, 0.7);
-    box-shadow:
-      0 0 0 4px rgba(79, 216, 255, 0.24),
-      0 12px 44px rgba(0, 0, 0, 0.55);
+    outline: none;
+    border-color: rgba(79, 216, 255, 0.65);
+    box-shadow: 0 0 0 3px rgba(79, 216, 255, 0.18);
   }
 
   &:active {
-    transform: scale(0.96);
+    transform: scale(0.94);
   }
 
-  &[data-engaged="true"] {
-    border-color: rgba(79, 216, 255, 0.6);
-    box-shadow:
-      0 0 0 5px rgba(79, 216, 255, 0.16),
-      0 0 44px rgba(79, 216, 255, 0.3),
-      0 12px 44px rgba(0, 0, 0, 0.55);
+  &[data-muted="true"] {
+    border-color: rgba(255, 178, 77, 0.5);
+    color: rgba(255, 196, 120, 0.95);
+    box-shadow: 0 0 16px rgba(255, 154, 60, 0.16);
   }
 `;
 
-const AuraVoiceCaption = styled.div`
-  font-size: 9.5px;
-  font-weight: 600;
-  letter-spacing: 0.26em;
-  text-indent: 0.26em;
-  text-align: center;
-  color: rgba(196, 212, 240, 0.66);
+const AuraMuteCaption = styled.div`
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.28em;
+  text-indent: 0.28em;
+  color: rgba(150, 172, 210, 0.6);
 
-  em {
-    display: block;
-    margin-top: 5px;
-    font-size: 8.5px;
-    font-style: normal;
-    letter-spacing: 0.18em;
-    color: rgba(79, 216, 255, 0.7);
+  &[data-muted="true"] {
+    color: rgba(255, 196, 120, 0.75);
   }
 `;
 
@@ -567,6 +518,26 @@ function AuraBackIcon(props) {
   );
 }
 
+function AuraMicIcon({ muted = false, ...props }) {
+  return (
+    <svg
+      fill="none"
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth="1.8"
+      viewBox="0 0 24 24"
+      xmlns="http://www.w3.org/2000/svg"
+      {...props}
+    >
+      <rect x="9" y="3" width="6" height="11" rx="3" />
+      <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0" />
+      <path d="M12 18v3" />
+      {muted && <path d="M4 4l16 16" stroke="currentColor" strokeWidth="2" />}
+    </svg>
+  );
+}
+
 export function AuraMode({
   isWindowFrameExpanded = false,
   onExit,
@@ -577,44 +548,77 @@ export function AuraMode({
   const engineRef = useRef(null);
   const exitTimerRef = useRef(0);
   const [leaving, setLeaving] = useState(false);
-  const [voiceEngaged, setVoiceEngaged] = useState(false);
+  const [micMuted, setMicMuted] = useState(false);
   const [hoveredNode, setHoveredNode] = useState(null);
 
   const data = AURA_MOCK_STATE;
 
   const totals = useMemo(() => {
     let workspaces = 0;
-    let terminals = 0;
+    let panels = 0;
     let inFlight = 0;
     for (const device of data.devices) {
       workspaces += device.workspaces.length;
       for (const workspace of device.workspaces) {
-        terminals += workspace.terminals.length;
+        panels += workspace.panels.length;
         inFlight += (workspace.todos?.queued || 0) + (workspace.todos?.running || 0);
       }
     }
-    return { devices: data.devices.length, workspaces, terminals, inFlight };
+    return { devices: data.devices.length, workspaces, panels, inFlight };
   }, [data]);
 
-  const localDevice = useMemo(
-    () => data.devices.find((device) => device.kind === "local") || null,
-    [data],
-  );
-
-  const localActivity = useMemo(() => {
-    if (!localDevice) return { running: [], waiting: [] };
-    const running = [];
-    const waiting = [];
-    for (const workspace of localDevice.workspaces) {
-      for (const todo of workspace.todos?.active || []) {
-        running.push({ todo, workspace: workspace.name });
-      }
-      for (const todo of workspace.todos?.waiting || []) {
-        waiting.push({ todo, workspace: workspace.name });
+  /* Activity queue: running scripts, running loop runs, local running todos,
+     plus a queued summary line. */
+  const activity = useMemo(() => {
+    const rows = [];
+    const localDevice = data.devices.find((device) => device.kind === "local") || null;
+    for (const device of data.devices) {
+      for (const script of device.scripts || []) {
+        if (script.state === "running") {
+          rows.push({
+            id: `script:${script.id}`,
+            name: script.name,
+            meta: `script · ${device.name}`,
+            color: AURA_STATE_COLORS.running,
+            pulse: true,
+          });
+        }
       }
     }
-    return { running, waiting };
-  }, [localDevice]);
+    for (const loopRun of data.loopRuns || []) {
+      if (loopRun.state === "running") {
+        rows.push({
+          id: `loop:${loopRun.id}`,
+          name: loopRun.name,
+          meta: "loop run",
+          color: "#b48cff",
+          pulse: true,
+        });
+      }
+    }
+    if (localDevice) {
+      for (const workspace of localDevice.workspaces) {
+        for (const todo of workspace.todos?.active || []) {
+          rows.push({
+            id: `todo:${workspace.id}:${todo}`,
+            name: todo,
+            meta: `todo · ${workspace.name}`,
+            color: AURA_STATE_COLORS.running,
+            pulse: true,
+          });
+        }
+      }
+    }
+    const queuedTodos = data.devices.reduce(
+      (sum, device) => sum + device.workspaces.reduce(
+        (wsSum, workspace) => wsSum + (workspace.todos?.queued || 0),
+        0,
+      ),
+      0,
+    );
+    const queuedLoops = (data.loopRuns || []).filter((loopRun) => loopRun.state === "queued").length;
+    return { rows, queuedTodos, queuedLoops };
+  }, [data]);
 
   const [feedIndex, setFeedIndex] = useState(0);
   useEffect(() => {
@@ -626,6 +630,43 @@ export function AuraMode({
     );
     return () => window.clearInterval(timer);
   }, [data]);
+
+  /* Preview conversation loop — the wiring seam for the real voice pipeline
+     (user speech start/stop + orchestrator TTS start/stop should drive
+     setVoiceMode directly). While unmuted, the sphere surface reacts:
+     listening ripples cool, responding ripples warm. */
+  const [voiceMode, setVoiceMode] = useState("idle");
+  useEffect(() => {
+    if (micMuted) {
+      setVoiceMode("idle");
+      return undefined;
+    }
+    const steps = [
+      ["idle", 2800],
+      ["user", 2300],
+      ["idle", 650],
+      ["orchestrator", 3600],
+    ];
+    let cancelled = false;
+    let timer = 0;
+    let index = 0;
+    const step = () => {
+      if (cancelled) return;
+      const [mode, duration] = steps[index % steps.length];
+      index += 1;
+      setVoiceMode(mode);
+      timer = window.setTimeout(step, duration);
+    };
+    step();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [micMuted]);
+
+  useEffect(() => {
+    engineRef.current?.setVoiceActivity(micMuted ? "idle" : voiceMode);
+  }, [micMuted, voiceMode]);
 
   const beginExit = useCallback(() => {
     setLeaving((already) => {
@@ -674,6 +715,11 @@ export function AuraMode({
     ? `▸ ${hoveredNode.label} — ${hoveredNode.detail}`
     : "drag to orbit · scroll to zoom";
 
+  const queuedSummary = [
+    activity.queuedTodos ? `${activity.queuedTodos} todo${activity.queuedTodos === 1 ? "" : "s"} queued` : null,
+    activity.queuedLoops ? `${activity.queuedLoops} loop${activity.queuedLoops === 1 ? "" : "s"} queued` : null,
+  ].filter(Boolean).join(" · ");
+
   return (
     <AuraBackdrop
       data-leaving={leaving ? "true" : "false"}
@@ -699,132 +745,54 @@ export function AuraMode({
 
       <AuraWordmark aria-hidden="true">
         <AuraWordmarkTitle>AURA</AuraWordmarkTitle>
-        <AuraWordmarkStatus>Orchestrator · Online</AuraWordmarkStatus>
+        <AuraWordmarkStatus
+          data-mode={micMuted ? "muted" : voiceMode !== "idle" ? voiceMode : undefined}
+        >
+          {micMuted
+            ? "Mic Muted"
+            : voiceMode === "user"
+              ? "Listening…"
+              : voiceMode === "orchestrator"
+                ? "Responding…"
+                : "Orchestrator · Online"}
+        </AuraWordmarkStatus>
       </AuraWordmark>
 
-      <AuraPanel aria-label="Devices and workspaces" data-side="left">
-        <AuraPanelHeading>Devices</AuraPanelHeading>
-        {data.devices.map((device) => {
-          const terminals = device.workspaces.reduce(
-            (sum, ws) => sum + ws.terminals.length,
-            0,
-          );
-          const running = device.workspaces.reduce(
-            (sum, ws) => sum + (ws.todos?.running || 0),
-            0,
-          );
-          return (
-            <AuraPanelRow key={device.id}>
-              <AuraPanelDot
-                $color={AURA_STATE_COLORS[device.status] || AURA_STATE_COLORS.idle}
-                data-pulse={device.status === "online" ? "true" : undefined}
-              />
-              <AuraPanelName>
-                {device.name}
-                {device.kind === "local" && <AuraPanelTag>{AURA_DEVICE_KIND_LABELS.local}</AuraPanelTag>}
-              </AuraPanelName>
-              <AuraPanelMeta>
-                {device.workspaces.length} ws · {terminals} term
-                {running ? ` · ${running} running` : ""}
-              </AuraPanelMeta>
-            </AuraPanelRow>
-          );
-        })}
-        <AuraPanelDivider />
-        <AuraPanelHeading>Workspaces</AuraPanelHeading>
-        {data.devices.flatMap((device) => device.workspaces).map((workspace) => {
-          const state = auraWorkspaceState(workspace);
-          return (
-            <AuraPanelRow key={workspace.id}>
-              <AuraPanelDot
-                $color={AURA_STATE_COLORS[state]}
-                data-pulse={state === "running" || state === "attention" ? "true" : undefined}
-              />
-              <AuraPanelName>{workspace.name}</AuraPanelName>
-            </AuraPanelRow>
-          );
-        })}
-        <AuraPanelDivider />
-        <AuraPanelHeading>Local activity</AuraPanelHeading>
-        {localActivity.running.map((entry) => (
-          <AuraPanelRow key={`run:${entry.workspace}:${entry.todo}`}>
-            <AuraPanelDot $color={AURA_STATE_COLORS.running} data-pulse="true" />
-            <AuraPanelName>{entry.todo}</AuraPanelName>
-            <AuraPanelMeta>{entry.workspace}</AuraPanelMeta>
-          </AuraPanelRow>
+      <AuraActivityPanel aria-label="Activity in queue">
+        <AuraActivityHeading>Activity · In Flight</AuraActivityHeading>
+        {activity.rows.map((row) => (
+          <AuraActivityRow key={row.id}>
+            <AuraActivityDot $color={row.color} data-pulse={row.pulse ? "true" : undefined} />
+            <AuraActivityName>{row.name}</AuraActivityName>
+            <AuraActivityMeta>{row.meta}</AuraActivityMeta>
+          </AuraActivityRow>
         ))}
-        {localActivity.waiting.slice(0, 3).map((entry) => (
-          <AuraPanelRow key={`wait:${entry.workspace}:${entry.todo}`}>
-            <AuraPanelDot $color={AURA_STATE_COLORS.attention} />
-            <AuraPanelName>{entry.todo}</AuraPanelName>
-            <AuraPanelMeta>queued · {entry.workspace}</AuraPanelMeta>
-          </AuraPanelRow>
-        ))}
-        {!localActivity.running.length && !localActivity.waiting.length && (
-          <AuraPanelMeta>No todos in flight</AuraPanelMeta>
-        )}
-      </AuraPanel>
+        {!activity.rows.length && <AuraActivityMeta>Nothing running right now</AuraActivityMeta>}
+        {queuedSummary && <AuraActivitySummary>{queuedSummary}</AuraActivitySummary>}
+      </AuraActivityPanel>
 
-      <AuraPanel aria-label="Scripts, docs and MCP servers" data-side="right">
-        {localDevice && localDevice.scripts.length > 0 && (
-          <>
-            <AuraPanelHeading>Scripts · {localDevice.name}</AuraPanelHeading>
-            {localDevice.scripts.map((script) => (
-              <AuraPanelRow key={script.id}>
-                <AuraPanelDot
-                  $color={AURA_STATE_COLORS[script.state] || AURA_STATE_COLORS.idle}
-                  data-pulse={script.state === "running" ? "true" : undefined}
-                />
-                <AuraPanelName>{script.name}</AuraPanelName>
-                <AuraPanelMeta>{script.state}</AuraPanelMeta>
-              </AuraPanelRow>
-            ))}
-            <AuraPanelDivider />
-          </>
-        )}
-        <AuraPanelHeading>Docs</AuraPanelHeading>
-        {data.docs.map((doc) => (
-          <AuraPanelRow key={doc.id}>
-            <AuraPanelDot $color="#ffd27d" />
-            <AuraPanelName>{doc.name}</AuraPanelName>
-          </AuraPanelRow>
-        ))}
-        <AuraPanelDivider />
-        <AuraPanelHeading>MCP Servers</AuraPanelHeading>
-        {data.mcps.map((mcp) => (
-          <AuraPanelRow key={mcp.id}>
-            <AuraPanelDot $color="#b48cff" />
-            <AuraPanelName>{mcp.name}</AuraPanelName>
-          </AuraPanelRow>
-        ))}
-      </AuraPanel>
+      <AuraMuteCluster>
+        <AuraMuteButton
+          aria-label={micMuted ? "Unmute orchestrator mic (preview)" : "Mute orchestrator mic (preview)"}
+          aria-pressed={micMuted}
+          data-muted={micMuted ? "true" : "false"}
+          onClick={() => setMicMuted((value) => !value)}
+          title={micMuted ? "Unmute — preview only, not wired" : "Mute — preview only, not wired"}
+          type="button"
+        >
+          <AuraMicIcon aria-hidden="true" muted={micMuted} />
+        </AuraMuteButton>
+        <AuraMuteCaption data-muted={micMuted ? "true" : "false"}>
+          {micMuted ? "Muted" : "Mic Live"}
+        </AuraMuteCaption>
+      </AuraMuteCluster>
 
       <AuraActivityTicker aria-live="polite">
         <span key={feedIndex}>▸ {(data.activityFeed || [])[feedIndex] || ""}</span>
       </AuraActivityTicker>
 
-      <AuraVoiceCluster>
-        <AuraVoiceButtonShell data-engaged={voiceEngaged ? "true" : "false"}>
-          <AuraVoiceRing data-ring="1" />
-          <AuraVoiceRing data-ring="2" />
-          <AuraVoiceButton
-            aria-label="Speak to the orchestrator (preview)"
-            data-engaged={voiceEngaged ? "true" : "false"}
-            onClick={() => setVoiceEngaged((value) => !value)}
-            title="Voice orchestrator — visual preview, not wired yet"
-            type="button"
-          >
-            <img alt="" src="/logo.webp" />
-          </AuraVoiceButton>
-        </AuraVoiceButtonShell>
-        <AuraVoiceCaption>
-          Speak to the Orchestrator
-          {voiceEngaged && <em>Listening · preview only</em>}
-        </AuraVoiceCaption>
-      </AuraVoiceCluster>
-
       <AuraFooterLine data-side="left">
-        {totals.devices} devices · {totals.workspaces} workspaces · {totals.terminals} terminals ·{" "}
+        {totals.devices} devices · {totals.workspaces} workspaces · {totals.panels} panels ·{" "}
         {totals.inFlight} todos in flight
       </AuraFooterLine>
       <AuraFooterLine data-side="right">{hoverReadout}</AuraFooterLine>

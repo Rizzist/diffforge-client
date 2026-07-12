@@ -18319,7 +18319,11 @@ function buildRustTerminalAuthorityWorkspaces({
       readiness,
       runtime_read_only: false,
       session_id: providerSessionId,
-      session_state: session.session_state || "session_attached",
+      session_state: session.session_state || (providerSessionId
+        ? "session_attached"
+        : terminalStatus === "starting"
+          ? "session_starting"
+          : "no_session"),
       status: terminalStatus,
       status_seq: session.runtime_updated_at_ms || liveSnapshot.generated_at_ms || Date.now(),
       target_terminal_id: session.pane_id,
@@ -22454,7 +22458,9 @@ function buildWorkspaceConfiguredTerminalSnapshots({
         readiness: workspaceRuntimeEnabled ? "ready" : "offline",
         runtime_read_only: lastKnownRuntime,
         session_id: providerSessionId,
-        session_state: workspaceRuntimeEnabled ? "session_attached" : "no_session",
+        session_state: workspaceRuntimeEnabled && providerSessionId
+          ? "session_attached"
+          : "no_session",
         status,
         status_source: workspaceRuntimeEnabled ? "desktop_configured_workspace" : "desktop_inactive_workspace",
         target_terminal_id: paneId,
@@ -24406,6 +24412,7 @@ export default function App() {
   const rustTerminalAuthoritySnapshotRef = useRef(null);
   const rustTerminalAuthorityRefreshInFlightRef = useRef(false);
   const rustTerminalAuthorityRefreshPendingRef = useRef("");
+  const rustTerminalAuthoritySessionBindingKeysRef = useRef(new Set());
   const workspaceVisibleTerminalStatusRef = useRef(new Map());
   const workspaceTerminalExplicitEmptyRef = useRef(new Set());
   const workspaceCoordinationBootstrapKeysRef = useRef(new Set());
@@ -36999,7 +37006,13 @@ export default function App() {
               readiness,
               runtime_read_only: false,
               session_id: providerSessionId,
-              session_state: terminalLifecycle === "open" ? "session_attached" : "no_session",
+              session_state: terminalLifecycle !== "open"
+                ? "no_session"
+                : providerSessionId
+                  ? "session_attached"
+                  : status === "starting"
+                    ? "session_starting"
+                    : "no_session",
               status,
               status_source: stoppedLiveStatus ? "desktop_visible_terminal_lifecycle" : "desktop_visible_workspace",
               status_seq: statusSeq,
@@ -37071,38 +37084,15 @@ export default function App() {
           visibleTerminal?.status || visibleTerminal?.terminal_status || "",
         ).trim().toLowerCase();
         const visibleStopped = stoppedTerminalStatuses.has(visibleStatus);
-        const startingTerminalStatuses = new Set(["prewarmed", "starting"]);
-        const rustStarting = [
-          rustTerminal?.status,
-          rustTerminal?.terminal_status,
-          rustTerminal?.activity_status,
-          rustTerminal?.terminal_lifecycle,
-        ].some((value) => startingTerminalStatuses.has(String(value || "").trim().toLowerCase()));
-        const preferVisibleLifecycle = Boolean(
-          visibleStatus
-            && !startingTerminalStatuses.has(visibleStatus)
-            && rustStarting,
-        );
         const merged = {
           ...visibleTerminal,
           ...rustTerminal,
           status_source: visibleTerminal?.status_source || rustTerminal?.status_source,
           visible_terminal: true,
         };
-        if (preferVisibleLifecycle) {
-          const visibleIdle = ["idle", "ready", "completed", "complete", "done"].includes(visibleStatus);
-          merged.status = visibleTerminal.status || visibleStatus;
-          merged.activity_status = visibleTerminal.activity_status || visibleStatus;
-          merged.command_phase = visibleTerminal.command_phase || (visibleIdle ? "completed" : visibleStatus);
-          merged.display_status = visibleTerminal.display_status || visibleStatus;
-          merged.execution_phase = visibleTerminal.execution_phase || (visibleIdle ? "idle" : visibleStatus);
-          merged.input_ready = visibleTerminal.input_ready ?? visibleIdle;
-          merged.native_rail_state = visibleTerminal.native_rail_state || visibleStatus;
-          merged.readiness = visibleTerminal.readiness || (visibleIdle ? "ready" : "busy");
-          merged.terminal_lifecycle = visibleTerminal.terminal_lifecycle || "open";
-          merged.terminal_status = visibleTerminal.terminal_status || visibleTerminal.status || visibleStatus;
-          merged.turn_status = visibleTerminal.turn_status || (visibleIdle ? "completed" : visibleStatus);
-        }
+        // Rust owns the launch lifecycle. Do not overwrite a fresh `starting`
+        // runtime with the configured workspace's synthetic `idle` row; that
+        // hid startup from live-state consumers.
         if (visibleStopped) {
           merged.activity_status = visibleTerminal.activity_status || visibleStatus;
           merged.commandable = false;
@@ -40486,6 +40476,20 @@ export default function App() {
       }
       return false;
     };
+    const remoteCommandOptionalBooleanField = (event, keys) => {
+      const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+      const request = event?.request && typeof event.request === "object" ? event.request : {};
+      const payloadRequest = payload?.request && typeof payload.request === "object" ? payload.request : {};
+      for (const key of keys) {
+        const value = event?.[key] ?? payload?.[key] ?? request?.[key] ?? payloadRequest?.[key];
+        if (typeof value === "boolean") return value;
+        if (typeof value === "number") return value !== 0;
+        const text = String(value ?? "").trim().toLowerCase();
+        if (["1", "true", "yes", "on"].includes(text)) return true;
+        if (["0", "false", "no", "off"].includes(text)) return false;
+      }
+      return null;
+    };
     const remoteCommandObjectField = (event, keys) => {
       const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
       const request = event?.request && typeof event.request === "object" ? event.request : {};
@@ -40627,8 +40631,14 @@ export default function App() {
       if (isDeviceTerminalOrchestratorWorkspaceId(requestedWorkspaceId)) {
         return DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID;
       }
-      if (requestedWorkspaceId && findWorkspaceById(workspaces, requestedWorkspaceId)) {
-        return requestedWorkspaceId;
+      if (requestedWorkspaceId) {
+        const localWorkspace = findWorkspaceById(workspaceCatalogRef.current, requestedWorkspaceId)
+          || findWorkspaceById(workspacesRef.current, requestedWorkspaceId);
+        // Preserve the Cloud-requested id even during a React snapshot gap.
+        // Rust/headless activation resolves aliases against the on-disk
+        // catalog; dropping it here produced "No local workspace" for valid
+        // workspace_activate commands.
+        return localWorkspace?.id || requestedWorkspaceId;
       }
       return activatedWorkspaceIdRef.current
         || selectedWorkspaceIdRef.current
@@ -40730,14 +40740,21 @@ export default function App() {
         "update_agent",
       ].includes(normalizeRemoteCommandName(commandKind))
     );
-    const recordRemoteCommandStatus = (event, status, message, details = null) => (
-      invoke("cloud_mcp_record_remote_command_status", {
+    const recordRemoteCommandStatus = (event, status, message, details = null) => {
+      logBigViewSyncDiagnosticEvent("remote_control.status", {
+        command_id: remoteCommandStringField(event, ["command_id"]),
+        command_kind: remoteCommandKind(event),
+        message: String(message || "").slice(0, 240),
+        status,
+        workspace_id: remoteCommandStringField(event, ["workspace_id"]),
+      });
+      return invoke("cloud_mcp_record_remote_command_status", {
         event,
         status,
         message,
         ...(details && typeof details === "object" ? { details } : {}),
-      }).catch(() => {})
-    );
+      }).catch(() => {});
+    };
     const remoteControlWorkspaceLifecycleDetails = (workspaceId, active, phase, details = {}) => ({
       ...details,
       lifecycle_phase: phase,
@@ -42189,6 +42206,33 @@ export default function App() {
         });
         return;
       }
+      if ([
+        "workspace_directory_browse",
+        "browse_workspace_directory",
+        "workspace_root_browse",
+      ].includes(normalizedKind)) {
+        const basePath = remoteCommandStringField(event, ["base_path", "base"]);
+        const command = remoteCommandStringField(event, ["directory_command", "command_text", "cd"]);
+        const path = remoteCommandStringField(event, ["path", "workspace_root", "root_directory", "root"]);
+        try {
+          const browse = await invoke("browse_workspace_root_directory", {
+            base_path: command ? basePath || null : null,
+            command: command || null,
+            path: command ? null : path || null,
+          });
+          await recordRemoteCommandStatus(event, "completed", "Workspace directory listing loaded from the desktop.", {
+            ...(browse && typeof browse === "object" ? browse : {}),
+            command_id: commandId,
+            command_kind: commandKind,
+          });
+        } catch (error) {
+          await recordRemoteCommandStatus(event, "failed", getErrorMessage(error, "Unable to browse that desktop directory."), {
+            command_id: commandId,
+            command_kind: commandKind,
+          });
+        }
+        return;
+      }
       if (["workspace_create", "create_workspace"].includes(normalizedKind)) {
         const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
         const request = event?.request && typeof event.request === "object" ? event.request : {};
@@ -42779,7 +42823,7 @@ export default function App() {
           telemetrySource: "remote_control_navigation",
           telemetryWorkspaceId: workspaceId,
         });
-        await recordRemoteCommandStatus(event, "completed", `Opened ${tabId} for ${targetWorkspace.name || workspaceId}.`, {
+        await recordRemoteCommandStatus(event, "completed", `Opened ${tabId} for ${targetWorkspace?.name || workspaceId}.`, {
           command_id: commandId,
           command_kind: commandKind,
           workspace_id: workspaceId,
@@ -42876,7 +42920,7 @@ export default function App() {
           return;
         }
         await syncRemoteControlState("remote_workspace_delete");
-        await recordRemoteCommandStatus(event, "completed", `Workspace "${targetWorkspace.name || workspaceId}" deleted from Diff Forge; project files stay on disk.`, {
+        await recordRemoteCommandStatus(event, "completed", `Workspace "${targetWorkspace?.name || workspaceId}" deleted from Diff Forge; project files stay on disk.`, {
           command_id: commandId,
           command_kind: commandKind,
           workspace_id: workspaceId,
@@ -44690,6 +44734,13 @@ export default function App() {
           const commandId = String(event.command_id || event.payload?.command_id || "").trim()
             || `remote-command-${Date.now()}-${Math.random().toString(16).slice(2)}`;
           const commandKind = remoteCommandKind(event);
+          logBigViewSyncDiagnosticEvent("remote_control.trigger_received", {
+            command_id: commandId,
+            command_kind: commandKind,
+            correlation_id: remoteCommandStringField(event, ["correlation_id"]),
+            target_device_id: remoteCommandStringField(event, ["target_device_id"]),
+            workspace_id: remoteCommandStringField(event, ["workspace_id"]),
+          });
           const clientActionId = remoteCommandStringField(event, [
             "client_action_id",
           ]);
@@ -44880,7 +44931,23 @@ export default function App() {
               : agentPackageAction || deviceOnlyNavigationAction || attachmentStageAction
                 ? "device"
                 : "");
-          if (!workspaceId && !agentPackageAction && !deviceOnlyNavigationAction && !terminalOrchestratorMessageAction && !attachmentStageAction) {
+          const requiresWorkspace = remoteCommandOptionalBooleanField(event, ["requires_workspace"]);
+          const workspaceOptionalAction = [
+            "workspace_create",
+            "create_workspace",
+            "workspace_directory_browse",
+            "browse_workspace_directory",
+            "workspace_root_browse",
+          ].includes(normalizeRemoteCommandName(commandKind));
+          if (
+            !workspaceId
+            && requiresWorkspace !== false
+            && !workspaceOptionalAction
+            && !agentPackageAction
+            && !deviceOnlyNavigationAction
+            && !terminalOrchestratorMessageAction
+            && !attachmentStageAction
+          ) {
             await recordRemoteCommandStatus(
               event,
               "failed",
@@ -52475,8 +52542,27 @@ export default function App() {
         workspace_id: workspaceId,
       });
       handleThreadTerminalLifecycle(lifecycleEvent);
+      // The Rust runtime has the canonical session identity at this point.
+      // Refresh its terminal snapshot immediately so the device workspace
+      // live-state frame carries the id without waiting for another status
+      // event or periodic reconciliation.
+      const bindingRefreshKey = [
+        workspaceId,
+        lifecycleEvent.pane_id,
+        lifecycleEvent.instance_id,
+        sessionId,
+      ].map((value) => String(value ?? "").trim()).join(":");
+      if (!rustTerminalAuthoritySessionBindingKeysRef.current.has(bindingRefreshKey)) {
+        rustTerminalAuthoritySessionBindingKeysRef.current.add(bindingRefreshKey);
+        while (rustTerminalAuthoritySessionBindingKeysRef.current.size > 256) {
+          const oldest = rustTerminalAuthoritySessionBindingKeysRef.current.values().next().value;
+          rustTerminalAuthoritySessionBindingKeysRef.current.delete(oldest);
+        }
+        workspaceTerminalsSyncKeyRef.current = "";
+        refreshRustTerminalAuthoritySnapshot("provider_session_bound");
+      }
     };
-  }, [handleThreadTerminalLifecycle]);
+  }, [handleThreadTerminalLifecycle, refreshRustTerminalAuthoritySnapshot]);
 
   useEffect(() => {
     let cancelled = false;

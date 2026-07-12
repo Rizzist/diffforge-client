@@ -204,6 +204,70 @@ struct AgentThreadTranscriptWatchDebounce {
 static AGENT_THREAD_TRANSCRIPT_WATCHES: OnceLock<
     StdMutex<HashMap<String, AgentThreadTranscriptWatchEntry>>,
 > = OnceLock::new();
+static AGENT_CHAT_SESSION_OBSERVED_TERMINALS: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
+
+fn agent_chat_session_observed_terminal_key(
+    workspace_id: &str,
+    pane_id: &str,
+    instance_id: Option<u64>,
+) -> String {
+    format!(
+        "{}|{}|{}",
+        workspace_id.trim(),
+        pane_id.trim(),
+        instance_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+    )
+}
+
+fn agent_chat_session_set_terminal_observed(
+    workspace_id: &str,
+    pane_id: &str,
+    instance_id: Option<u64>,
+    active: bool,
+) -> usize {
+    let key = agent_chat_session_observed_terminal_key(workspace_id, pane_id, instance_id);
+    let observed = AGENT_CHAT_SESSION_OBSERVED_TERMINALS
+        .get_or_init(|| StdMutex::new(HashSet::new()));
+    let Ok(mut observed) = observed.lock() else {
+        return 0;
+    };
+    if active {
+        observed.insert(key);
+    } else {
+        observed.remove(&key);
+    }
+    observed.len()
+}
+
+fn agent_chat_session_clear_observed_terminals() {
+    if let Some(observed) = AGENT_CHAT_SESSION_OBSERVED_TERMINALS.get() {
+        if let Ok(mut observed) = observed.lock() {
+            observed.clear();
+        }
+    }
+}
+
+fn agent_chat_session_terminal_identity_is_observed(
+    workspace_id: &str,
+    pane_id: &str,
+    instance_id: Option<u64>,
+) -> bool {
+    let key = agent_chat_session_observed_terminal_key(workspace_id, pane_id, instance_id);
+    AGENT_CHAT_SESSION_OBSERVED_TERMINALS
+        .get()
+        .and_then(|observed| observed.lock().ok())
+        .is_some_and(|observed| observed.contains(&key))
+}
+
+fn agent_chat_session_terminal_is_observed(context: &AgentThreadTranscriptWatchContext) -> bool {
+    agent_chat_session_terminal_identity_is_observed(
+        &context.workspace_id,
+        &context.pane_id,
+        context.instance_id,
+    )
+}
 
 fn codex_home_dir() -> Option<PathBuf> {
     env::var_os("CODEX_HOME")
@@ -3724,6 +3788,47 @@ mod agent_sessions_tests {
             path.as_deref(),
             Some(Path::new("/tmp/diffforge-explicit-transcript.jsonl"))
         );
+    }
+
+    #[test]
+    fn transcript_watch_targets_parent_so_atomic_replacements_stay_observed() {
+        let root = unique_test_dir("transcript-watch-parent");
+        fs::create_dir_all(&root).unwrap();
+        let transcript = root.join("rollout-session.jsonl");
+        fs::write(&transcript, "{}\n").unwrap();
+
+        assert_eq!(
+            agent_thread_transcript_watch_target("codex", &transcript),
+            root,
+        );
+        assert!(agent_thread_transcript_watch_event_matches(
+            &transcript,
+            &[transcript.parent().unwrap().to_path_buf()],
+        ));
+        let _ = fs::remove_dir_all(transcript.parent().unwrap());
+    }
+
+    #[test]
+    fn terminal_observer_state_is_explicit_and_reversible() {
+        let workspace_id = format!("workspace-observed-{}", current_time_ms());
+        let pane_id = "pane-observed";
+        assert!(!agent_chat_session_terminal_identity_is_observed(
+            &workspace_id,
+            pane_id,
+            Some(7),
+        ));
+        agent_chat_session_set_terminal_observed(&workspace_id, pane_id, Some(7), true);
+        assert!(agent_chat_session_terminal_identity_is_observed(
+            &workspace_id,
+            pane_id,
+            Some(7),
+        ));
+        agent_chat_session_set_terminal_observed(&workspace_id, pane_id, Some(7), false);
+        assert!(!agent_chat_session_terminal_identity_is_observed(
+            &workspace_id,
+            pane_id,
+            Some(7),
+        ));
     }
 
     #[test]
@@ -7534,7 +7639,11 @@ fn trim_agent_thread_transcript_native_owner_from_other_watches(
 }
 
 fn agent_thread_transcript_watch_target(agent_id: &str, watch_path: &Path) -> PathBuf {
-    if (agent_id == "opencode" && watch_path.is_file()) || !watch_path.exists() {
+    // Harnesses commonly update their transcript with an atomic rename. A
+    // watcher attached to the file follows the old inode and silently misses
+    // every record after replacement. Watch the containing directory and
+    // retain exact-path filtering in `agent_thread_transcript_watch_event_matches`.
+    if watch_path.is_file() || !watch_path.exists() || agent_id == "opencode" {
         return watch_path
             .parent()
             .map(Path::to_path_buf)
@@ -7551,9 +7660,11 @@ fn agent_thread_transcript_watch_event_matches(watch_path: &Path, paths: &[PathB
         .file_name()
         .map(|value| value.to_string_lossy().to_string())
         .unwrap_or_default();
+    let watch_parent = watch_path.parent();
     paths.iter().any(|path| {
         path == watch_path
             || path.starts_with(watch_path)
+            || watch_parent.is_some_and(|parent| path == parent)
             || (!watch_name.is_empty()
                 && path
                     .file_name()
@@ -7635,13 +7746,17 @@ async fn emit_agent_thread_transcript_watch_update(
             true
         }
     };
-    if !should_emit {
+    let observed = agent_chat_session_terminal_is_observed(&context);
+    let final_flush = reason == "terminal-activity-final";
+    let should_sync_durable = observed || final_flush;
+    if !should_emit && !should_sync_durable {
         return;
     }
 
-    let _ = app.emit(
-        AGENT_THREAD_TRANSCRIPT_UPDATED_EVENT,
-        json!({
+    if should_emit {
+        let _ = app.emit(
+            AGENT_THREAD_TRANSCRIPT_UPDATED_EVENT,
+            json!({
             "agent_id": context.agent_id,
             "allow_timestamp_fallback": context.allow_timestamp_fallback,
             "cwd": context.cwd,
@@ -7662,15 +7777,36 @@ async fn emit_agent_thread_transcript_watch_update(
             "terminal_prompt_accepted": context.terminal_prompt_accepted,
             "thread_id": context.thread_id,
             "workspace_id": context.workspace_id,
-        }),
-    );
-    if !agent_thread_transcript_result_is_cloud_backed(&result) {
+            }),
+        );
+    }
+    if should_sync_durable && !agent_thread_transcript_result_is_cloud_backed(&result) {
+        log_terminal_status_event(
+            "backend.agent_chat_session_sync.transcript_flush",
+            json!({
+                "instance_id": context.instance_id,
+                "observed": observed,
+                "pane_id": context.pane_id,
+                "reason": reason,
+                "workspace_id": context.workspace_id,
+            }),
+        );
         agent_chat_session_sync_spawn_from_result(
             app,
             &context.agent_id,
             &result,
             agent_chat_session_sync_context_from_watch(&context),
             "transcript_watch_update",
+        );
+    } else if should_emit && !agent_thread_transcript_result_is_cloud_backed(&result) {
+        log_terminal_status_event(
+            "backend.agent_chat_session_sync.transcript_flush_deferred",
+            json!({
+                "instance_id": context.instance_id,
+                "pane_id": context.pane_id,
+                "reason": reason,
+                "workspace_id": context.workspace_id,
+            }),
         );
     }
 }
@@ -7871,13 +8007,23 @@ fn register_agent_thread_transcript_native_watch(
     ) else {
         return Ok(());
     };
+    let watch_key = agent_thread_transcript_watch_key(&context, &watch_path);
     register_agent_thread_transcript_watch_internal(
         app,
         context,
         watch_path,
         String::new(),
         agent_thread_transcript_native_watch_owner_key(&request.pane_id, request.instance_id),
-    )
+    )?;
+
+    // Discovery can bind after the first response is already present. A file
+    // watcher only observes future writes, so immediately seed session history
+    // from the transcript that exists at bind time.
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        emit_agent_thread_transcript_watch_update(app, watch_key, "native-watch-initial").await;
+    });
+    Ok(())
 }
 
 fn unregister_agent_thread_transcript_native_watch(pane_id: &str, instance_id: Option<u64>) {
@@ -7892,6 +8038,44 @@ fn unregister_agent_thread_transcript_native_watch(pane_id: &str, instance_id: O
         entry.owners.remove(&owner_key);
         !entry.owners.is_empty()
     });
+}
+
+fn trigger_agent_thread_transcript_native_watch(
+    app: &AppHandle,
+    pane_id: &str,
+    instance_id: Option<u64>,
+    reason: &'static str,
+) -> usize {
+    let owner_key = agent_thread_transcript_native_watch_owner_key(pane_id, instance_id);
+    let Some(watches) = AGENT_THREAD_TRANSCRIPT_WATCHES.get() else {
+        return 0;
+    };
+    let watch_keys = watches
+        .lock()
+        .ok()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|(_, entry)| entry.owners.contains(&owner_key))
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for watch_key in &watch_keys {
+        let app = app.clone();
+        let watch_key = watch_key.clone();
+        tauri::async_runtime::spawn(async move {
+            emit_agent_thread_transcript_watch_update(app.clone(), watch_key.clone(), reason).await;
+            // Some harnesses emit their completion hook just before the final
+            // atomic transcript replace. Short signature-deduped retries cover
+            // that write without returning to periodic history polling.
+            sleep(Duration::from_millis(250)).await;
+            emit_agent_thread_transcript_watch_update(app.clone(), watch_key.clone(), reason).await;
+            sleep(Duration::from_millis(750)).await;
+            emit_agent_thread_transcript_watch_update(app, watch_key, reason).await;
+        });
+    }
+    watch_keys.len()
 }
 
 #[tauri::command(rename_all = "snake_case")]

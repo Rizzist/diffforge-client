@@ -4163,6 +4163,29 @@ fn agent_chat_session_sync_spawn_from_history_record(
     if provider_session_id.trim().is_empty() {
         return;
     }
+    let observed = agent_chat_session_terminal_identity_is_observed(
+        &record.workspace_id,
+        &record.pane_id,
+        record.terminal_instance_id,
+    );
+    let status_key = record
+        .status
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-'], "_");
+    let final_turn = matches!(
+        status_key.as_str(),
+        "idle"
+            | "completed"
+            | "complete"
+            | "done"
+            | "error"
+            | "failed"
+            | "interrupted"
+            | "cancelled"
+            | "canceled"
+            | "closed"
+    );
     agent_chat_session_sync_mark_workspace_history_dirty(&record.workspace_id);
     let context = AgentChatSessionSyncContext {
         workspace_id: record.workspace_id.clone(),
@@ -4180,7 +4203,7 @@ fn agent_chat_session_sync_spawn_from_history_record(
         source: record.source.clone(),
         shared_history_id: record.shared_history_id.clone(),
         fork_from_provider_session_id: record.fork_from_provider_session_id.clone(),
-        metadata_only: false,
+        metadata_only: !(observed || final_turn),
         turn_summary: None,
         turn_diff: None,
     };

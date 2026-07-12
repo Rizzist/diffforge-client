@@ -7443,6 +7443,10 @@ fn cloud_mcp_outbox_error_is_permanent_rejection(error: &str) -> bool {
         "id is required to delete a workspace",
         "reached the workspace limit",
         "idempotency key was reused with a different payload",
+        // The workspace is absent from this device's current catalog. The
+        // exact todo packet cannot become valid by retrying; a future catalog
+        // registration will enqueue a fresh commit under the active scope.
+        "workspace todo sync requires a known workspace for this device",
         // Tokenomics day packets: the server pinned this packet_id/device_seq
         // to a different payload hash; retrying the identical packet can never
         // succeed. Rejection resets the day sync state below so the day
@@ -13503,6 +13507,7 @@ async fn cloud_mcp_clear_global_ws_sender_if_current(
     if let Ok(mut subscriptions) = state.terminal_output_stream_subscriptions.lock() {
         subscriptions.clear();
     }
+    agent_chat_session_clear_observed_terminals();
 
     if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
         let message = {
@@ -13590,6 +13595,7 @@ async fn cloud_mcp_mark_global_ws_disconnected_inner(
     CLOUD_MCP_GLOBAL_WS_LIVE.store(false, Ordering::Release);
     cloud_mcp_clear_live_app_ws_route_cache();
     cloud_mcp_clear_ws_heartbeat_telemetry();
+    agent_chat_session_clear_observed_terminals();
     if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
         return;
     }
@@ -13605,6 +13611,7 @@ async fn cloud_mcp_mark_global_ws_disconnected_inner(
         if let Ok(mut subscriptions) = state.terminal_output_stream_subscriptions.lock() {
             subscriptions.clear();
         }
+        agent_chat_session_clear_observed_terminals();
         {
             let mut runtime = state.inner.lock().await;
             runtime.connected = false;
@@ -13625,6 +13632,7 @@ async fn cloud_mcp_mark_global_ws_disconnected_inner(
     if let Ok(mut subscriptions) = state.terminal_output_stream_subscriptions.lock() {
         subscriptions.clear();
     }
+    agent_chat_session_clear_observed_terminals();
     {
         let mut runtime = state.inner.lock().await;
         runtime.connected = false;
@@ -18472,6 +18480,9 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         let _ = state.global_ws_events.send(message);
         return;
     }
+    if cloud_mcp_handle_agent_session_observer_subscription(state, &message, &direct_kind) {
+        return;
+    }
     if cloud_mcp_handle_terminal_output_subscription(state, &message, &direct_kind) {
         return;
     }
@@ -18688,6 +18699,9 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        if cloud_mcp_handle_agent_session_observer_subscription(state, &event, &event_kind) {
+            return;
+        }
         if cloud_mcp_handle_terminal_output_subscription(state, &event, &event_kind) {
             return;
         }
@@ -19560,6 +19574,15 @@ fn cloud_mcp_remote_command_receipts_contains_id(
 }
 
 async fn cloud_mcp_claim_remote_command_receipt(state: &CloudMcpState, event: &Value) -> bool {
+    log_cloud_sync_event(
+        "remote_command.received",
+        json!({
+            "command_id": cloud_mcp_remote_command_id(event),
+            "command_kind": cloud_mcp_remote_command_kind(event),
+            "target_device_id": cloud_mcp_remote_command_field_text(event, &["target_device_id"]),
+            "workspace_id": cloud_mcp_remote_command_field_text(event, &["workspace_id"]),
+        }),
+    );
     let Some(receipt_key) = cloud_mcp_remote_command_receipt_key(event) else {
         return true;
     };
@@ -19906,6 +19929,15 @@ async fn cloud_mcp_send_remote_command_status_event(
     // desktop already performed the action. The outbox retries the exact
     // status payload (and its command id) until Cloud acknowledges it.
     let command_id = cloud_mcp_remote_command_id(event);
+    log_cloud_sync_event(
+        "remote_command.status_queued",
+        json!({
+            "command_id": command_id.clone(),
+            "command_kind": cloud_mcp_remote_command_kind(event),
+            "status": status,
+            "workspace_id": cloud_mcp_remote_command_field_text(event, &["workspace_id"]),
+        }),
+    );
     cloud_mcp_enqueue_background_sync(
         state,
         format!("remote-command-status:{command_id}:{status}:{now}"),
@@ -30418,6 +30450,71 @@ fn cloud_mcp_handle_terminal_output_subscription(
             let _ = tx.send(envelope);
         });
     }
+    true
+}
+
+fn cloud_mcp_handle_agent_session_observer_subscription(
+    _state: &CloudMcpState,
+    message: &Value,
+    fallback_kind: &str,
+) -> bool {
+    let direct_kind = cloud_mcp_terminal_output_message_kind(message);
+    let kind = if direct_kind.is_empty() {
+        fallback_kind.trim().to_ascii_lowercase()
+    } else {
+        direct_kind
+    };
+    if !matches!(kind.as_str(), "session.watch" | "session.unwatch") {
+        return false;
+    }
+    let active = kind == "session.watch"
+        && message.get("active").and_then(Value::as_bool) != Some(false);
+    let stream_key = cloud_mcp_terminal_output_message_stream_key(message).unwrap_or_default();
+    let parts = stream_key.split(':').collect::<Vec<_>>();
+    let workspace_id = cloud_mcp_payload_text(message, &["w", "workspace_id"])
+        .or_else(|| parts.get(1).map(|value| (*value).to_string()))
+        .unwrap_or_default();
+    let pane_id = cloud_mcp_payload_text(message, &["p", "pane_id", "terminal_id"])
+        .or_else(|| parts.get(2).map(|value| (*value).to_string()))
+        .unwrap_or_default();
+    let instance_id = cloud_mcp_payload_u64(message, &["i", "terminal_instance_id", "instance_id"])
+        .or_else(|| parts.get(3).and_then(|value| value.parse::<u64>().ok()));
+    if workspace_id.trim().is_empty() || pane_id.trim().is_empty() {
+        return true;
+    }
+    let subscription_count = agent_chat_session_set_terminal_observed(
+        &workspace_id,
+        &pane_id,
+        instance_id,
+        active,
+    );
+    let triggered = if active {
+        CLOUD_MCP_SYNC_STATUS_APP
+            .get()
+            .map(|app| {
+                trigger_agent_thread_transcript_native_watch(
+                    app,
+                    &pane_id,
+                    instance_id,
+                    "session-observer-opened",
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        0
+    };
+    log_cloud_sync_event(
+        "agent_chat_session.observer_subscription",
+        json!({
+            "active": active,
+            "instance_id": instance_id,
+            "pane_id": pane_id,
+            "stream_key": stream_key,
+            "subscription_count": subscription_count,
+            "triggered_watch_count": triggered,
+            "workspace_id": workspace_id,
+        }),
+    );
     true
 }
 
@@ -55956,6 +56053,16 @@ mod cloud_mcp_tests {
     use super::*;
 
     static CLOUD_MCP_TEST_ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+
+    #[test]
+    fn obsolete_workspace_todo_commits_are_permanent_rejections() {
+        assert!(cloud_mcp_outbox_error_is_permanent_rejection(
+            "Workspace todo sync requires a known workspace for this device.",
+        ));
+        assert!(!cloud_mcp_outbox_error_is_permanent_rejection(
+            "Cloud MCP app websocket disconnected.",
+        ));
+    }
 
     #[test]
     fn todo_sync_decoder_requires_terminal_id_for_assignment_fields() {

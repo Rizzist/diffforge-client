@@ -236,6 +236,7 @@ import {
   buildTodoQueueDeviceWorkspaceOptions,
   normalizeTodoQueueSwitcherId,
   normalizeTodoQueueWorkspaceMatchId,
+  todoQueueDeviceRecordsShareIdentity,
   todoQueueDeviceSelectionIsLocalEditable,
   todoQueueItemFromAuthoritativeSnapshot,
 } from "./todoQueueDeviceSwitcher.js";
@@ -3752,7 +3753,14 @@ const TodoDeviceButton = styled.button`
 
   &[data-strip="true"][data-active="true"] {
     border-bottom-color: rgba(var(--forge-tint-soft-rgb), 0.14);
-    background: rgba(var(--forge-tint-rgb), 0.1);
+    border-left: 3px solid var(--forge-tint);
+    padding-left: 7px;
+    background: rgba(var(--forge-tint-rgb), 0.13);
+  }
+
+  &[data-strip="true"][data-active="false"] {
+    color: #8e9bad;
+    background: transparent;
   }
 
   &[data-cluster="true"] {
@@ -10848,19 +10856,6 @@ function normalizeTodoTerminalIndex(value) {
   return Number.isInteger(number) && number >= 0 ? number : null;
 }
 
-function getTodoQueueTerminalIdentityIndex(value) {
-  const match = String(value || "").trim().match(/-(\d+)-[a-z][a-z0-9_-]*$/i);
-  return match ? normalizeTodoTerminalIndex(match[1]) : null;
-}
-
-function todoQueueTerminalIdentityConflictsWithIndex(identity, terminalIndex) {
-  const requestedIndex = normalizeTodoTerminalIndex(terminalIndex);
-  const identityIndex = getTodoQueueTerminalIdentityIndex(identity);
-  return Number.isInteger(requestedIndex)
-    && Number.isInteger(identityIndex)
-    && identityIndex !== requestedIndex;
-}
-
 function todoQueueTimestampMs(value) {
   const parsed = Date.parse(String(value || "").trim());
   return Number.isFinite(parsed) ? parsed : 0;
@@ -11026,9 +11021,11 @@ function getTodoQueueTargetTerminalName(item) {
   }
   const queueMeta = getTodoQueueRawQueueMetadata(item);
   const queueTargetExplicit = todoQueueMetadataTargetIsExplicit(queueMeta);
-  const directTargetTerminalName = normalizeTodoTerminalName(
-    item?.target_terminal_name || item?.terminal_name || item?.target_name || item?.remote_command?.target_terminal_name || item?.remote_command?.terminal_name || item?.remote_command?.target_name || "",
-  );
+  const directTargetTerminalName = getTodoQueueTerminalTargetIdCandidate(item)
+    ? normalizeTodoTerminalName(
+      item?.target_terminal_name || item?.terminal_name || item?.target_name || item?.remote_command?.target_terminal_name || item?.remote_command?.terminal_name || item?.remote_command?.target_name || "",
+    )
+    : "";
   const queueTargetTerminalName = queueTargetExplicit
     ? normalizeTodoTerminalName(
       queueMeta?.target_terminal_name || queueMeta?.terminal_name || queueMeta?.target_name || "",
@@ -11041,7 +11038,7 @@ function getTodoQueueTargetTerminalId(item) {
   const queueMeta = getTodoQueueRawQueueMetadata(item);
   const queueTargetExplicit = todoQueueMetadataTargetIsExplicit(queueMeta);
   const directTargetTerminalId = normalizeTodoTerminalIdentity(
-    item?.target_terminal_id || item?.terminal_id || item?.pane_id || item?.remote_command?.target_terminal_id || item?.remote_command?.terminal_id || item?.remote_command?.pane_id || "",
+    getTodoQueueTerminalTargetIdCandidate(item),
   );
   const queueTargetTerminalId = queueTargetExplicit
     ? normalizeTodoTerminalIdentity(
@@ -11051,18 +11048,17 @@ function getTodoQueueTargetTerminalId(item) {
   const targetTerminalId = normalizeTodoTerminalIdentity(
     directTargetTerminalId || queueTargetTerminalId,
   );
-  const targetTerminalIndex = getTodoQueueTargetTerminalIndex(item);
-  return todoQueueTerminalIdentityConflictsWithIndex(targetTerminalId, targetTerminalIndex)
-    ? ""
-    : targetTerminalId;
+  return targetTerminalId;
 }
 
 function getTodoQueueTargetThreadId(item) {
   const queueMeta = getTodoQueueRawQueueMetadata(item);
   const queueTargetExplicit = todoQueueMetadataTargetIsExplicit(queueMeta);
-  const directTargetThreadId = normalizeTodoTerminalIdentity(
-    item?.target_thread_id || item?.thread_id || item?.remote_command?.target_thread_id || item?.remote_command?.thread_id || "",
-  );
+  const directTargetThreadId = getTodoQueueTerminalTargetIdCandidate(item)
+    ? normalizeTodoTerminalIdentity(
+      item?.target_thread_id || item?.thread_id || item?.remote_command?.target_thread_id || item?.remote_command?.thread_id || "",
+    )
+    : "";
   const queueTargetThreadId = queueTargetExplicit
     ? normalizeTodoTerminalIdentity(
       queueMeta?.target_thread_id || queueMeta?.thread_id || "",
@@ -11074,6 +11070,7 @@ function getTodoQueueTargetThreadId(item) {
 function getTodoQueueTargetTerminalIndex(item) {
   const queueMeta = getTodoQueueRawQueueMetadata(item);
   const queueTargetExplicit = todoQueueMetadataTargetIsExplicit(queueMeta);
+  const directTargetExplicit = Boolean(getTodoQueueTerminalTargetIdCandidate(item));
   const directIndex = normalizeTodoTerminalIndex(
     getTodoQueueDirectTargetTerminalIndexCandidate(
       item,
@@ -11092,21 +11089,25 @@ function getTodoQueueTargetTerminalIndex(item) {
   }
 
   const colorSlot = normalizeTerminalColorSlot(
-    item?.target_color_slot
-      ?? item?.terminal_color_slot
-      ?? item?.color_slot
-      ?? item?.remote_command?.target_color_slot
-      ?? item?.remote_command?.terminal_color_slot
-      ?? item?.remote_command?.color_slot
+    (directTargetExplicit
+      ? item?.target_color_slot
+        ?? item?.terminal_color_slot
+        ?? item?.color_slot
+        ?? item?.remote_command?.target_color_slot
+        ?? item?.remote_command?.terminal_color_slot
+        ?? item?.remote_command?.color_slot
+      : undefined)
       ?? (queueTargetExplicit
         ? queueMeta?.target_color_slot ?? queueMeta?.terminal_color_slot ?? queueMeta?.color_slot
         : undefined),
   );
   const hasTerminalColor = Boolean(normalizeTerminalHexColor(
-    item?.target_terminal_color
-      || item?.terminal_color
-      || item?.remote_command?.target_terminal_color
-      || item?.remote_command?.terminal_color
+    (directTargetExplicit
+      ? item?.target_terminal_color
+        || item?.terminal_color
+        || item?.remote_command?.target_terminal_color
+        || item?.remote_command?.terminal_color
+      : "")
       || (queueTargetExplicit
         ? queueMeta?.target_terminal_color || queueMeta?.terminal_color
         : ""),
@@ -11117,9 +11118,11 @@ function getTodoQueueTargetTerminalIndex(item) {
 function getTodoQueueTargetColorSlot(item) {
   const queueMeta = getTodoQueueRawQueueMetadata(item);
   const queueTargetExplicit = todoQueueMetadataTargetIsExplicit(queueMeta);
-  const directColorSlot = normalizeTerminalColorSlot(
-    item?.target_color_slot ?? item?.terminal_color_slot ?? item?.color_slot ?? item?.remote_command?.target_color_slot ?? item?.remote_command?.terminal_color_slot ?? item?.remote_command?.color_slot,
-  );
+  const directColorSlot = getTodoQueueTerminalTargetIdCandidate(item)
+    ? normalizeTerminalColorSlot(
+      item?.target_color_slot ?? item?.terminal_color_slot ?? item?.color_slot ?? item?.remote_command?.target_color_slot ?? item?.remote_command?.terminal_color_slot ?? item?.remote_command?.color_slot,
+    )
+    : null;
   if (directColorSlot !== null) {
     return directColorSlot;
   }
@@ -11135,10 +11138,12 @@ function getTodoQueueTargetTerminalColor(item) {
   const queueMeta = getTodoQueueRawQueueMetadata(item);
   const queueTargetExplicit = todoQueueMetadataTargetIsExplicit(queueMeta);
   const candidates = [
-    item?.target_terminal_color,
-    item?.terminal_color,
-    item?.remote_command?.target_terminal_color,
-    item?.remote_command?.terminal_color,
+    ...(getTodoQueueTerminalTargetIdCandidate(item) ? [
+      item?.target_terminal_color,
+      item?.terminal_color,
+      item?.remote_command?.target_terminal_color,
+      item?.remote_command?.terminal_color,
+    ] : []),
     ...(queueTargetExplicit ? [
       queueMeta?.target_terminal_color,
       queueMeta?.terminal_color,
@@ -11318,26 +11323,12 @@ function getTodoQueueExplicitTerminalTargetInfo(item) {
   const requestedTargetThreadId = queueTargetExplicit
     ? queueTargetThreadId || (queueMetaHasIndexTarget ? "" : directTargetThreadId)
     : directTargetThreadId;
-  const requestedTargetTerminalIdConflicts = todoQueueTerminalIdentityConflictsWithIndex(
+  return {
+    hasExplicitTerminalTarget: Boolean(requestedTargetTerminalId),
     requestedTargetTerminalId,
     requestedTargetTerminalIndex,
-  );
-  const safeRequestedTargetTerminalId = requestedTargetTerminalIdConflicts
-    ? ""
-    : requestedTargetTerminalId;
-  const safeRequestedTargetThreadId = requestedTargetTerminalIdConflicts
-    ? ""
-    : requestedTargetThreadId;
-
-  return {
-    hasExplicitTerminalTarget: Number.isInteger(requestedTargetTerminalIndex)
-      || Boolean(safeRequestedTargetTerminalId)
-      || Boolean(requestedTargetTerminalName)
-      || Boolean(safeRequestedTargetThreadId),
-    requestedTargetTerminalId: safeRequestedTargetTerminalId,
-    requestedTargetTerminalIndex,
     requestedTargetTerminalName,
-    requestedTargetThreadId: safeRequestedTargetThreadId,
+    requestedTargetThreadId,
   };
 }
 
@@ -13498,7 +13489,7 @@ function normalizeWorkspaceTodoDispatchTargets(workspaceTodos, workspaceId) {
       if (!targetDeviceId || !targetWorkspaceId) {
         return null;
       }
-      const key = `${targetDeviceId}::${targetWorkspaceId}`;
+      const key = JSON.stringify([targetDeviceId, targetWorkspaceId]);
       if (seen.has(key)) {
         return null;
       }
@@ -13697,9 +13688,8 @@ function todoDeviceOptionRank(option, selectedOptionId = "", currentWorkspaceId 
 }
 
 function todoDeviceOptionForRow(row, options = [], selectedOptionId = "", currentWorkspaceId = "") {
-  const deviceId = normalizeWorkspaceTodoDeviceId(row?.device_id);
   const matches = (Array.isArray(options) ? options : [])
-    .filter((option) => normalizeWorkspaceTodoDeviceId(option?.device_id) === deviceId);
+    .filter((option) => todoQueueDeviceRecordsShareIdentity(row, option));
   if (!matches.length) {
     return null;
   }
@@ -13711,6 +13701,34 @@ function todoDeviceOptionForRow(row, options = [], selectedOptionId = "", curren
       if (rank !== 0) return rank;
       return String(left.device_name || "").localeCompare(String(right.device_name || ""));
     })[0];
+}
+
+function todoDeviceOptionForRememberedSelection(selection, options = [], currentWorkspaceId = "") {
+  if (!selection) {
+    return null;
+  }
+  const matches = (Array.isArray(options) ? options : [])
+    .filter((option) => todoQueueDeviceRecordsShareIdentity(selection, option));
+  if (!matches.length) {
+    return null;
+  }
+  const selectionPlatform = selection.platform || selection.os || selection.platform_label || "";
+  const selectionWorkspaceId = normalizeTodoQueueWorkspaceMatchId(
+    selection.workspace_id,
+    selectionPlatform,
+  );
+  const workspaceMatches = selectionWorkspaceId
+    ? matches.filter((option) => normalizeTodoQueueWorkspaceMatchId(
+      option.workspace_id,
+      option.platform || option.os || option.platform_label || "",
+    ) === selectionWorkspaceId)
+    : matches;
+  return (workspaceMatches.length ? workspaceMatches : matches)
+    .slice()
+    .sort((left, right) => (
+      todoDeviceOptionRank(left, selection.id || "", currentWorkspaceId)
+        - todoDeviceOptionRank(right, selection.id || "", currentWorkspaceId)
+    ))[0] || null;
 }
 
 function todoDeviceDisplayOnlyOptionForRow(row = {}) {
@@ -14443,6 +14461,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   const queueAfterEditItemIdRef = useRef("");
   const [todoDeviceSelectionId, setTodoDeviceSelectionId] = useState("");
   const todoDeviceSelectionManualRef = useRef(false);
+  const todoDeviceSelectionOptionRef = useRef(null);
   const [todoDevicePickerExpanded, setTodoDevicePickerExpanded] = useState(false);
   const [todoDeviceSelectionRevealed, setTodoDeviceSelectionRevealed] = useState(false);
   const todoDeviceOptions = useMemo(() => buildTodoQueueDeviceWorkspaceOptions({
@@ -15876,9 +15895,15 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
         setTodoDeviceSelectionId("");
       }
       todoDeviceSelectionManualRef.current = false;
+      todoDeviceSelectionOptionRef.current = null;
       return;
     }
-    const selectedOption = todoDeviceOptions.find((option) => option.id === todoDeviceSelectionId) || null;
+    const selectedOption = todoDeviceOptions.find((option) => option.id === todoDeviceSelectionId)
+      || todoDeviceOptionForRememberedSelection(
+        todoDeviceSelectionOptionRef.current,
+        todoDeviceOptions,
+        orchestratorPanelWorkspaceId,
+      );
     const localCurrentOption = todoDeviceOptions.find((option) => (
       option.is_local
         && option.isCurrentWorkspace
@@ -15889,7 +15914,13 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
         || todoDeviceOptions.find((option) => option.is_local)
         || todoDeviceOptions[0];
       todoDeviceSelectionManualRef.current = false;
+      todoDeviceSelectionOptionRef.current = defaultOption;
       setTodoDeviceSelectionId(defaultOption.id);
+      return;
+    }
+    todoDeviceSelectionOptionRef.current = selectedOption;
+    if (selectedOption.id !== todoDeviceSelectionId) {
+      setTodoDeviceSelectionId(selectedOption.id);
       return;
     }
     if (
@@ -15898,14 +15929,20 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       && !todoDeviceSelectionManualRef.current
       && !todoQueueDeviceSelectionIsLocalEditable(selectedOption, orchestratorPanelWorkspaceId)
     ) {
+      todoDeviceSelectionOptionRef.current = localCurrentOption;
       setTodoDeviceSelectionId(localCurrentOption.id);
     }
   }, [orchestratorPanelWorkspaceId, todoDeviceOptions, todoDeviceSelectionId]);
   const selectedTodoDevice = useMemo(() => (
     todoDeviceOptions.find((option) => option.id === todoDeviceSelectionId)
+      || todoDeviceOptionForRememberedSelection(
+        todoDeviceSelectionOptionRef.current,
+        todoDeviceOptions,
+        orchestratorPanelWorkspaceId,
+      )
       || todoDeviceOptions[0]
       || null
-  ), [todoDeviceOptions, todoDeviceSelectionId]);
+  ), [orchestratorPanelWorkspaceId, todoDeviceOptions, todoDeviceSelectionId]);
   const todoDeviceRows = useMemo(() => todoDevicePickerRows(
     orchestratorDeviceRows,
     todoDeviceOptions,
@@ -18253,7 +18290,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       <TodoDeviceButton
         aria-disabled={displayOnly ? "true" : undefined}
         aria-pressed={active ? "true" : "false"}
-        data-active={active ? "true" : undefined}
+        data-active={active ? "true" : "false"}
         data-display-only={displayOnly ? "true" : undefined}
         data-strip="true"
         data-todo-control="true"
@@ -18265,6 +18302,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
             return;
           }
           todoDeviceSelectionManualRef.current = true;
+          todoDeviceSelectionOptionRef.current = option;
           setTodoDeviceSelectionId(option.id);
           if (todoDeviceClusterActive) {
             setTodoDevicePickerExpanded(false);
@@ -20610,6 +20648,9 @@ function TerminalView({
   const todoQueueRemoteCommandReceiptsRef = useRef({});
   const todoQueueBackendReconcileRef = useRef(null);
   const todoQueueTombstonedIdsRef = useRef(new Set());
+  // IDs inserted into React before todo_store_create resolves. Store snapshot
+  // reconciliation must not treat their brief absence as a hard delete.
+  const todoQueueOptimisticStoreWritesRef = useRef(new Set());
   const todoQueueTerminalInFlightPromptsRef = useRef(new Map());
   const todoQueueLiveTerminalsRef = useRef(new Map());
   const todoQueueTerminalReservationsRef = useRef(new Map());
@@ -21680,41 +21721,21 @@ function TerminalView({
   };
   const getTodoQueueItemAccentColor = useCallback((item) => {
     const targetTerminalId = getTodoQueueTargetTerminalId(item);
-    const targetThreadId = getTodoQueueTargetThreadId(item);
-    const targetTerminalIndex = getTodoQueueTargetTerminalIndex(item);
-    const targetColorSlot = getTodoQueueTargetColorSlot(item);
-    const hasTerminalTarget = Boolean(
-      targetTerminalId
-      || targetThreadId
-      || Number.isInteger(targetTerminalIndex)
-    );
-
-    if (hasTerminalTarget) {
-      const identityMatchedIndex = targetTerminalId
-        ? logicalTerminalIndexes.find((terminalIndex) => todoQueueSendTargetMatchesIdentity({
-          pane_id: getTerminalPaneId(terminalIndex),
-          targetThread: getTerminalThread(terminalIndex),
-        }, targetTerminalId, ""))
-        : null;
-      const liveTerminalIndex = Number.isInteger(identityMatchedIndex)
-        ? identityMatchedIndex
-        : Number.isInteger(targetTerminalIndex) && logicalTerminalIndexes.includes(targetTerminalIndex)
-          ? targetTerminalIndex
-          : null;
-      if (Number.isInteger(liveTerminalIndex)) {
-        return terminalColorForSlot(getTerminalAgentColorSlot(liveTerminalIndex));
-      }
-
-      return getTodoQueueTargetTerminalColor(item)
-        || (Number.isInteger(targetColorSlot) ? terminalColorForSlot(targetColorSlot) : "")
-        || (Number.isInteger(targetTerminalIndex) ? terminalColorForSlot(targetTerminalIndex) : "")
-        || TODO_QUEUE_DEFAULT_DOT_COLOR;
+    if (!targetTerminalId) {
+      return TODO_QUEUE_DEFAULT_DOT_COLOR;
     }
 
-    const targetAgentId = getTodoQueueTargetAgentId(item);
-    return targetAgentId
-      ? getTodoQueueAgentAccentColor(targetAgentId)
-      : TODO_QUEUE_DEFAULT_DOT_COLOR;
+    const identityMatchedIndex = logicalTerminalIndexes.find((terminalIndex) => (
+      todoQueueSendTargetMatchesIdentity({
+        pane_id: getTerminalPaneId(terminalIndex),
+        targetThread: getTerminalThread(terminalIndex),
+      }, targetTerminalId, "")
+    ));
+    if (Number.isInteger(identityMatchedIndex)) {
+      return terminalColorForSlot(getTerminalAgentColorSlot(identityMatchedIndex));
+    }
+
+    return getTodoQueueTargetTerminalColor(item) || TODO_QUEUE_DEFAULT_DOT_COLOR;
   }, [getTerminalPaneId, getTerminalThread, logicalTerminalIndexes]);
   const getTerminalImageInputSupport = useCallback((terminalIndex) => (
     (() => {
@@ -27441,7 +27462,14 @@ function TerminalView({
       return;
     }
 
-    const activeInFlightForTerminal = todoQueueTerminalInFlightPromptsRef.current.get(targetTerminalIndex) || null;
+    const indexedInFlightForTerminal = todoQueueTerminalInFlightPromptsRef.current.get(targetTerminalIndex) || null;
+    const indexedInFlightPaneId = normalizeTodoTerminalIdentity(
+      indexedInFlightForTerminal?.pane_id || indexedInFlightForTerminal?.target_terminal_id,
+    );
+    const activeInFlightForTerminal = indexedInFlightForTerminal
+      && (!paneId || !indexedInFlightPaneId || indexedInFlightPaneId === paneId)
+      ? indexedInFlightForTerminal
+      : null;
     const activeInFlightItemId = String(activeInFlightForTerminal?.item_id || "").trim();
     const activeItemForPane = todoQueueItemsRef.current
       .filter((candidate) => {
@@ -27454,10 +27482,8 @@ function TerminalView({
           return false;
         }
         const candidatePaneId = normalizeTodoTerminalIdentity(getTodoQueueTargetTerminalId(candidate));
-        const candidateIndex = getTodoQueueTargetTerminalIndex(candidate);
         return Boolean(
-          (paneId && candidatePaneId && candidatePaneId === paneId)
-            || (Number.isInteger(candidateIndex) && candidateIndex === targetTerminalIndex)
+          paneId && candidatePaneId && candidatePaneId === paneId
         );
       })
       .sort((left, right) => getTodoQueueItemStorageUpdatedMs(right) - getTodoQueueItemStorageUpdatedMs(left))[0] || null;
@@ -29198,6 +29224,7 @@ function TerminalView({
 	    });
 	    todoQueueComposerIdleTimersRef.current.clear();
 	    todoQueuePendingItemsRef.current = {};
+	    todoQueueOptimisticStoreWritesRef.current.clear();
 	  }, []);
 
   const submitTodoQueueDraft = useCallback(async (options = {}) => {
@@ -29228,17 +29255,38 @@ function TerminalView({
         workspace_id: workspaceId,
       };
 
+    const optimisticItem = createTodoQueueItem(text, draft);
+    const persistedDraft = {
+      ...draft,
+      created_at: optimisticItem.created_at,
+      id: optimisticItem.id,
+      todo_id: optimisticItem.id,
+    };
+
     setTodoDropError("");
+    todoQueueOptimisticStoreWritesRef.current.add(optimisticItem.id);
+    updateTodoQueueItems((currentItems) => (
+      currentItems
+        .filter((item) => item.id !== optimisticItem.id)
+        .concat(optimisticItem)
+    ), {
+      force: true,
+      immediate: true,
+      reason: "todo_queue_draft_optimistic",
+      skipCloudSync: true,
+    });
     setTodoQueueDraft("");
 
     try {
       const nextItems = await createTodoQueueItemsInRust(
-        [draft],
+        [persistedDraft],
         "todo_queue_draft_submitted",
       );
       if (!nextItems.length) {
+        todoQueueOptimisticStoreWritesRef.current.delete(optimisticItem.id);
         return [];
       }
+      todoQueueOptimisticStoreWritesRef.current.delete(optimisticItem.id);
       if (images.length) {
         logBigViewSyncDiagnosticEvent("tui.image.queue_add", {
           draftLength: text.length,
@@ -29252,7 +29300,17 @@ function TerminalView({
       }
       return nextItems;
     } catch (error) {
+      todoQueueOptimisticStoreWritesRef.current.delete(optimisticItem.id);
       setTodoDropError(error?.message || String(error || "Unable to create todo"));
+      updateTodoQueueItems(
+        (currentItems) => currentItems.filter((item) => item.id !== optimisticItem.id),
+        {
+          force: true,
+          immediate: true,
+          reason: "todo_queue_draft_optimistic_rollback",
+          skipCloudSync: true,
+        },
+      );
       setTodoQueueDraft((currentDraft) => currentDraft || text);
       if (images.length) {
         logBigViewSyncDiagnosticEvent("tui.image.queue_add", {
@@ -29272,6 +29330,7 @@ function TerminalView({
     createTodoQueueItemsInRust,
     terminalWorkspace?.id,
     todoQueueDraft,
+    updateTodoQueueItems,
   ]);
 
   const removeTodoQueueItem = useCallback((itemId) => {
@@ -30078,6 +30137,10 @@ function TerminalView({
             // made a remotely hard-deleted todo survive until the user clicked
             // Delete a second time.
             if (!storeItem) {
+              if (todoQueueOptimisticStoreWritesRef.current.has(itemId)) {
+                nextItems.push(item);
+                return;
+              }
               changed = true;
               if (todoQueuePendingItemsRef.current[itemId]) {
                 const nextPendingItems = { ...todoQueuePendingItemsRef.current };
@@ -33391,6 +33454,23 @@ function TerminalView({
       return;
     }
 
+    const optimisticUpdatedAt = new Date().toISOString();
+    const optimisticItem = normalizeTodoQueueItem({
+      ...existingItem,
+      text,
+      updated_at: optimisticUpdatedAt,
+    });
+    if (optimisticItem) {
+      updateTodoQueueItems((currentItems) => currentItems.map((item) => (
+        item.id === safeItemId ? optimisticItem : item
+      )), {
+        force: true,
+        immediate: true,
+        reason: "todo_queue_item_text_optimistic",
+        skipCloudSync: true,
+      });
+    }
+
     void invoke("todo_store_update", {
       patch: { text },
       reason: "todo_queue_item_text_updated",
@@ -33413,6 +33493,18 @@ function TerminalView({
       });
     }).catch((error) => {
       setTodoDropError(error?.message || String(error || "Unable to update todo"));
+      updateTodoQueueItems((currentItems) => currentItems.map((item) => (
+        item.id === safeItemId
+          && normalizeTodoQueueText(item.text) === text
+          && item.updated_at === optimisticUpdatedAt
+          ? existingItem
+          : item
+      )), {
+        force: true,
+        immediate: true,
+        reason: "todo_queue_item_text_optimistic_rollback",
+        skipCloudSync: true,
+      });
     });
   }, [
     markTodoQueueTombstonedIds,
