@@ -4810,7 +4810,10 @@ async fn workspace_activation_workspace_snapshot(
         "reason": reason,
         "repo_path": workspace.root,
         "root_directory": workspace.root,
-        "selected": true,
+        // This snapshot is produced by the Rust-owned headless orchestrator.
+        // Runtime liveness is authoritative here, but React selection is not:
+        // only AppShell may publish selected=true after its UI commits.
+        "selected": false,
         "status": "active",
         "terminals": terminals,
         "workspace_active": true,
@@ -10154,7 +10157,9 @@ fn run_app(daemon: bool) {
             todo_dispatch_notify_queue_drained,
             todo_dispatch_queue_sync,
             todo_dispatch_settle_terminal_input_ready,
+            todo_dispatch_ack_deferred_remote_command,
             todo_dispatch_dispatcher_heartbeat,
+            todo_dispatch_dispatcher_ready,
             todo_dispatch_startup_reconciliation_state,
             todo_dispatch_backend_submit_now,
             todo_dispatch_backend_submissions_drain,

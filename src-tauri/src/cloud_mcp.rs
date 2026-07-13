@@ -189,6 +189,9 @@ const CLOUD_MCP_TOKENOMICS_DEVICE_SNAPSHOT_EVENT: &str = "tokenomics_device_snap
 const CLOUD_MCP_TOKENOMICS_INGEST_ACK_EVENT: &str = "tokenomics_ingest_ack";
 const CLOUD_MCP_TOKENOMICS_DELIVERY_ACK_EVENT: &str = "tokenomics_delivery_ack";
 static CLOUD_MCP_DEVICE_LIVE_SYNC_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static CLOUD_MCP_REMOTE_COMMAND_HANDOFF_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static CLOUD_MCP_REMOTE_COMMAND_HANDOFF_PENDING: AtomicBool = AtomicBool::new(false);
+const CLOUD_MCP_REMOTE_COMMAND_HANDOFF_STATE_KEY: &str = "remote-command-handoffs";
 const CLOUD_MCP_WORKSPACE_MCP_TOOL_NAME_LIMIT: usize = 32;
 const CLOUD_MCP_AUDIO_PREFERENCES_STATE_KEY: &str = "audio-preferences";
 const CLOUD_MCP_NOTIFICATION_PREFERENCES_STATE_KEY: &str = "notification-preferences";
@@ -19310,6 +19313,54 @@ fn cloud_mcp_remote_command_field_i64(event: &Value, keys: &[&str]) -> Option<i6
         })
 }
 
+fn cloud_mcp_remote_command_field_bool(event: &Value, keys: &[&str]) -> Option<bool> {
+    let parse = |value: &Value| match value {
+        Value::Bool(value) => Some(*value),
+        Value::Number(value) => value.as_i64().map(|value| value != 0),
+        Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    };
+    let payload = event.get("payload").filter(|value| value.is_object());
+    let request = event.get("request").filter(|value| value.is_object());
+    let payload_request = payload
+        .and_then(|value| value.get("request"))
+        .filter(|value| value.is_object());
+    let nested_event = event.get("event").filter(|value| value.is_object());
+    let nested_event_payload = nested_event
+        .and_then(|value| value.get("payload"))
+        .filter(|value| value.is_object());
+    let nested_event_request = nested_event
+        .and_then(|value| value.get("request"))
+        .filter(|value| value.is_object());
+    for key in keys {
+        for source in [
+            Some(event),
+            payload,
+            request,
+            payload_request,
+            nested_event,
+            nested_event_payload,
+            nested_event_request,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(value) = source.get(*key).and_then(&parse) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn cloud_mcp_remote_workspace_requires_foreground(event: &Value) -> bool {
+    cloud_mcp_remote_command_field_bool(event, &["show_window"]).unwrap_or(true)
+}
+
 fn cloud_mcp_remote_command_matches_device(event: &Value) -> bool {
     let device = cloud_mcp_desktop_device_profile();
     let profile_matches = |candidate: &str| {
@@ -19451,10 +19502,9 @@ fn cloud_mcp_daemon_gui_block_message(command_kind: &str) -> Option<&'static str
         | "app_hide_window" | "hide_window" | "app_background" | "hide_app_window" => {
             Some("Window visibility controls are unavailable in daemon mode.")
         }
-        // workspace_activate/open_workspace intentionally NOT blocked: the
-        // workspace lever persists pendingActivationWorkspaceId to shared
-        // disk state and answers "queued", so the intent survives a later
-        // GUI launch even when received by the daemon.
+        // workspace_activate/open_workspace intentionally NOT blocked: its
+        // complete command is journaled to shared disk and answered "queued",
+        // so a later GUI listener can replay and acknowledge the UI handoff.
         "app_view_select"
         | "select_app_view"
         | "switch_app_view"
@@ -20541,9 +20591,7 @@ fn cloud_mcp_apply_remote_workspace_lever(
     state: &CloudMcpState,
     event: &Value,
 ) -> bool {
-    if todo_dispatch_webview_dispatcher_active() {
-        return false;
-    }
+    let webview_dispatcher_active = todo_dispatch_webview_dispatcher_active();
     let command_kind = cloud_mcp_remote_command_kind(event);
     let requested_workspace_id =
         cloud_mcp_remote_command_field_text(event, &["workspace_id"])
@@ -20555,6 +20603,78 @@ fn cloud_mcp_apply_remote_workspace_lever(
     }
     match command_kind.as_str() {
         "workspace_activate" | "activate_workspace" | "open_workspace" | "workspace_open" => {
+            // The public workspace_activate contract includes selecting the
+            // workspace and opening its terminal tab. A hidden webview can
+            // miss its short heartbeat lease even though it is healthy; do
+            // not silently downgrade that request to runtime-only headless
+            // activation. Journal the exact command, reveal the app, and let
+            // AppShell acknowledge and apply the UI lifecycle atomically.
+            if cloud_mcp_remote_workspace_requires_foreground(event) {
+                let dropped = match cloud_mcp_defer_remote_command_for_foreground(app, event) {
+                    Ok(dropped) => dropped,
+                    Err(error) => {
+                        let state = state.clone();
+                        let event = event.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let details = json!({
+                                "handoff_persisted": false,
+                                "persistence_error": clean_terminal_telemetry_text(&error),
+                            });
+                            let _ = cloud_mcp_send_remote_command_status_event(
+                                &state,
+                                &event,
+                                "failed",
+                                "Workspace activation could not be handed to the desktop UI safely.",
+                                Some(&details),
+                            )
+                            .await;
+                        });
+                        return true;
+                    }
+                };
+                app_exit_background_internal(app);
+                if webview_dispatcher_active {
+                    // The command was journaled before emit. If AppShell is
+                    // between listener registrations this emit can be missed,
+                    // but dispatcher_ready will replay the retained entry.
+                    todo_dispatch_flush_deferred_remote_commands(app);
+                }
+                let state = state.clone();
+                let event = event.clone();
+                let workspace_id = workspace_id.clone();
+                tauri::async_runtime::spawn(async move {
+                    for dropped_event in dropped {
+                        let _ = cloud_mcp_send_remote_command_status_event(
+                            &state,
+                            &dropped_event,
+                            "dropped",
+                            "Queued remote command was dropped because the foreground replay queue is full.",
+                            None,
+                        )
+                        .await;
+                    }
+                    if !webview_dispatcher_active {
+                        let details = json!({
+                            "runtime_active": false,
+                            "ui_handoff_pending": true,
+                            "ui_selected": false,
+                            "workspace_id": workspace_id,
+                        });
+                        let _ = cloud_mcp_send_remote_command_status_event(
+                            &state,
+                            &event,
+                            "queued",
+                            "Workspace activation queued for the desktop UI; opening Diff Forge.",
+                            Some(&details),
+                        )
+                        .await;
+                    }
+                });
+                return true;
+            }
+            if webview_dispatcher_active {
+                return false;
+            }
             let app = app.clone();
             let state = state.clone();
             let event = event.clone();
@@ -20574,12 +20694,16 @@ fn cloud_mcp_apply_remote_workspace_lever(
                 )
                 .await;
                 match result {
-                    Ok(result) => {
+                    Ok(mut result) => {
+                        if let Some(details) = result.as_object_mut() {
+                            details.insert("runtime_active".to_string(), json!(true));
+                            details.insert("ui_selected".to_string(), json!(false));
+                        }
                         let _ = cloud_mcp_send_remote_command_status_event(
                             &state,
                             &event,
                             "completed",
-                            "Workspace runtime activated headless from the web dashboard.",
+                            "Workspace runtime activated headless; the desktop UI was not selected.",
                             Some(&result),
                         )
                         .await;
@@ -20641,6 +20765,7 @@ fn cloud_mcp_apply_remote_workspace_lever(
             });
             true
         }
+        _ if webview_dispatcher_active => false,
         "workspace_deactivate_if_idle"
         | "deactivate_workspace_if_idle"
         | "workspace_deactivate" => {
@@ -22045,25 +22170,43 @@ fn cloud_mcp_apply_remote_agent_lever(
     true
 }
 
-fn cloud_mcp_defer_remote_command_for_foreground(app: &AppHandle, event: &Value) -> Vec<Value> {
-    let current = app_local_state_read(app, "remote-intents");
+fn cloud_mcp_defer_remote_command_for_foreground(
+    app: &AppHandle,
+    event: &Value,
+) -> Result<Vec<Value>, String> {
+    let lock = CLOUD_MCP_REMOTE_COMMAND_HANDOFF_LOCK.get_or_init(|| StdMutex::new(()));
+    let _guard = lock
+        .lock()
+        .map_err(|_| "remote command handoff lock is poisoned".to_string())?;
+    // Remote command handoffs have their own state file. Sharing the older
+    // remote-intents object with activation hints allowed unrelated whole-file
+    // read/merge/write cycles to overwrite this delivery journal.
+    let current = app_local_state_read(app, CLOUD_MCP_REMOTE_COMMAND_HANDOFF_STATE_KEY);
     let mut pending = current
         .get("pendingRemoteCommands")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    pending.push(event.clone());
+    let command_id = cloud_mcp_remote_command_id(event);
+    let already_pending = !command_id.is_empty()
+        && pending
+            .iter()
+            .any(|queued| cloud_mcp_remote_command_id(queued) == command_id);
+    if !already_pending {
+        pending.push(event.clone());
+    }
     let mut dropped = Vec::new();
     if pending.len() > 8 {
         let overflow = pending.len() - 8;
         dropped.extend(pending.drain(0..overflow));
     }
-    let _ = app_local_state_merge(
+    app_local_state_merge(
         app,
-        "remote-intents",
+        CLOUD_MCP_REMOTE_COMMAND_HANDOFF_STATE_KEY,
         &json!({ "pendingRemoteCommands": pending }),
-    );
-    dropped
+    )?;
+    CLOUD_MCP_REMOTE_COMMAND_HANDOFF_PENDING.store(true, Ordering::Release);
+    Ok(dropped)
 }
 
 fn cloud_mcp_headless_terminal_panel_close_command(
@@ -22491,7 +22634,24 @@ fn cloud_mcp_apply_remote_terminal_lever(
                 .await;
                 return;
             }
-            let dropped = cloud_mcp_defer_remote_command_for_foreground(&app, &event);
+            let dropped = match cloud_mcp_defer_remote_command_for_foreground(&app, &event) {
+                Ok(dropped) => dropped,
+                Err(error) => {
+                    let details = json!({
+                        "handoff_persisted": false,
+                        "persistence_error": clean_terminal_telemetry_text(&error),
+                    });
+                    let _ = cloud_mcp_send_remote_command_status_event(
+                        &state,
+                        &event,
+                        "failed",
+                        "Remote command could not be handed to the desktop UI safely.",
+                        Some(&details),
+                    )
+                    .await;
+                    return;
+                }
+            };
             for dropped_event in dropped {
                 let _ = cloud_mcp_send_remote_command_status_event(
                     &state,
@@ -22656,10 +22816,27 @@ fn cloud_mcp_apply_remote_terminal_lever(
                             &terminal,
                         )
                     {
-                        let dropped = cloud_mcp_defer_remote_command_for_foreground(
+                        let dropped = match cloud_mcp_defer_remote_command_for_foreground(
                             &app,
                             &panel_close_command,
-                        );
+                        ) {
+                            Ok(dropped) => dropped,
+                            Err(error) => {
+                                let details = json!({
+                                    "handoff_persisted": false,
+                                    "persistence_error": clean_terminal_telemetry_text(&error),
+                                });
+                                let _ = cloud_mcp_send_remote_command_status_event(
+                                    &state,
+                                    &panel_close_command,
+                                    "failed",
+                                    "Panel-close follow-up could not be handed to the desktop UI safely.",
+                                    Some(&details),
+                                )
+                                .await;
+                                continue;
+                            }
+                        };
                         for dropped_event in dropped {
                             let _ = cloud_mcp_send_remote_command_status_event(
                                 &state,
@@ -56754,6 +56931,25 @@ mod cloud_mcp_tests {
     use super::*;
 
     static CLOUD_MCP_TEST_ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+
+    #[test]
+    fn remote_workspace_activation_defaults_to_foreground_and_honors_explicit_headless() {
+        assert!(cloud_mcp_remote_workspace_requires_foreground(&json!({
+            "command_kind": "workspace_activate",
+        })));
+        assert!(!cloud_mcp_remote_workspace_requires_foreground(&json!({
+            "command_kind": "workspace_activate",
+            "payload": { "show_window": false },
+        })));
+        assert!(!cloud_mcp_remote_workspace_requires_foreground(&json!({
+            "command_kind": "workspace_activate",
+            "request": { "show_window": "off" },
+        })));
+        assert!(cloud_mcp_remote_workspace_requires_foreground(&json!({
+            "command_kind": "workspace_activate",
+            "event": { "payload": { "show_window": "yes" } },
+        })));
+    }
 
     #[test]
     fn termio_stream_key_requires_exact_instance_generation() {

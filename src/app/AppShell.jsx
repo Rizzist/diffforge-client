@@ -34,7 +34,7 @@ import { Fragment, lazy, memo, Profiler, startTransition, Suspense, useCallback,
 import { createPortal } from "react-dom";
 import { onRuntimeProfilerRender } from "../diagnostics/commitProfiler.js";
 import { authStore, DEFAULT_AUTH_MESSAGE, useAuthSnapshot } from "../authStore";
-import { listenShared } from "./sharedTauriEvents.js";
+import { listenShared, waitSharedListenerReady } from "./sharedTauriEvents.js";
 import {
   buildPcbProjectInventory,
   buildVideoProjectInventory,
@@ -24496,6 +24496,7 @@ export default function App() {
   const workspaceCoordinationBootstrapKeysRef = useRef(new Set());
   const terminalStatusEventEmitterRef = useRef(null);
   const remoteCommandReceiptsRef = useRef(new Map());
+  const completedRemoteCommandHandoffsRef = useRef(new Map());
   const remoteControlConfigWaitQueueRef = useRef(new Map());
   const remotePaneControlQueueRef = useRef(new Map());
   const workspaceMcpSyncKeyRef = useRef("");
@@ -26187,8 +26188,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    // Foreground presence for remote app-control levers. Todo queue dispatch
-    // itself is Rust-owned in both foreground and background.
+    // Mounted-webview presence for remote app-control levers. A minimized or
+    // backgrounded Tauri webview is still able to consume navigation events;
+    // visibility must not make Rust misclassify it as absent.
     let cancelled = false;
     let timerId = 0;
     const beat = () => {
@@ -26196,14 +26198,9 @@ export default function App() {
         void invoke("todo_dispatch_dispatcher_heartbeat").catch(() => {});
       }
     };
-    const documentHidden = () => document.visibilityState === "hidden";
     const schedule = () => {
       window.clearTimeout(timerId);
-      if (documentHidden()) {
-        timerId = 0;
-        return;
-      }
-      const delay = readMainWindowFocusedFallback()
+      const delay = document.visibilityState !== "hidden" && readMainWindowFocusedFallback()
         ? TODO_DISPATCH_HEARTBEAT_ACTIVE_MS
         : TODO_DISPATCH_HEARTBEAT_IDLE_MS;
       timerId = window.setTimeout(() => {
@@ -26212,16 +26209,10 @@ export default function App() {
       }, delay);
     };
     const handlePresenceChange = () => {
-      if (documentHidden()) {
-        schedule();
-        return;
-      }
       beat();
       schedule();
     };
-    if (!documentHidden()) {
-      beat();
-    }
+    beat();
     schedule();
     window.addEventListener("focus", handlePresenceChange);
     window.addEventListener("blur", handlePresenceChange);
@@ -30157,19 +30148,17 @@ export default function App() {
     if (!findWorkspaceById(workspacesRef.current, safeWorkspaceId)) {
       return Promise.reject(new Error("Workspace is not available on this desktop."));
     }
-    if (workspaceActivationCommitted(safeWorkspaceId)) {
-      return Promise.resolve({
-        already_active: true,
-        workspace_id: safeWorkspaceId,
-      });
-    }
+    const alreadyActive = workspaceActivationCommitted(safeWorkspaceId);
+    // Runtime activation and desktop selection are separate facts. Even when
+    // Rust already has this workspace running, route through the selection
+    // path so a remote activation repairs an active-but-unselected UI.
     const requested = requestWorkspaceActivation(safeWorkspaceId, source);
     if (!requested) {
       return Promise.reject(new Error("Workspace activation could not be scheduled on this desktop."));
     }
-    if (workspaceActivationCommitted(safeWorkspaceId)) {
+    if (alreadyActive || workspaceActivationCommitted(safeWorkspaceId)) {
       return Promise.resolve({
-        already_active: false,
+        already_active: alreadyActive,
         workspace_id: safeWorkspaceId,
       });
     }
@@ -40843,14 +40832,12 @@ export default function App() {
       workspace_id: workspaceId,
       workspace_status: active ? "active" : "deactivated",
     });
-    const completeRemoteControlStateSync = (event, reason, lifecycleOverride, message, details = {}) => {
-      void (async () => {
-        await syncRemoteControlState(reason, lifecycleOverride);
-        await recordRemoteCommandStatus(event, "completed", message, {
-          ...details,
-          lifecycle_phase: "sync_complete",
-        });
-      })();
+    const completeRemoteControlStateSync = async (event, reason, lifecycleOverride, message, details = {}) => {
+      await syncRemoteControlState(reason, lifecycleOverride);
+      await recordRemoteCommandStatus(event, "completed", message, {
+        ...details,
+        lifecycle_phase: "sync_complete",
+      });
     };
     const syncRemoteControlState = async (reason, lifecycleOverride = null) => {
       workspaceTerminalsSyncKeyRef.current = "";
@@ -43222,7 +43209,7 @@ export default function App() {
           "Workspace activated and selected on this desktop; syncing live state.",
           lifecycleDetails,
         );
-        completeRemoteControlStateSync(
+        await completeRemoteControlStateSync(
           event,
           "remote_workspace_activate",
           lifecycleOverride,
@@ -44697,7 +44684,7 @@ export default function App() {
           workspace_id: workspaceId,
         };
         await recordRemoteCommandStatus(event, "state_changed", `Closed ${closedCount} idle terminal(s); syncing live state.`, lifecycleDetails);
-        completeRemoteControlStateSync(
+        await completeRemoteControlStateSync(
           event,
           "remote_workspace_close_idle_terminals",
           null,
@@ -44744,7 +44731,7 @@ export default function App() {
           "Workspace deactivated on this desktop; syncing live state.",
           lifecycleDetails,
         );
-        completeRemoteControlStateSync(
+        await completeRemoteControlStateSync(
           event,
           "remote_workspace_deactivate_if_idle",
           lifecycleOverride,
@@ -45056,7 +45043,6 @@ export default function App() {
 
     const startRemoteCommandListener = async () => {
       try {
-        await invoke("cloud_mcp_start_remote_command_listener");
         const nextUnlistenDeviceDeleted = listenShared(CLOUD_MCP_DEVICE_DELETED_EVENT, async () => {
           if (disposed) return;
           await logout();
@@ -45069,7 +45055,8 @@ export default function App() {
         const nextUnlistenRemoteCommand = listenShared(CLOUD_MCP_REMOTE_COMMAND_EVENT, async (remoteEvent) => {
           if (disposed) return;
           const event = remoteEvent?.payload || {};
-          const commandId = String(event.command_id || event.payload?.command_id || "").trim()
+          const durableCommandId = String(event.command_id || event.payload?.command_id || "").trim();
+          const commandId = durableCommandId
             || `remote-command-${Date.now()}-${Math.random().toString(16).slice(2)}`;
           const commandKind = remoteCommandKind(event);
           logBigViewSyncDiagnosticEvent("remote_control.trigger_received", {
@@ -45079,6 +45066,8 @@ export default function App() {
             target_device_id: remoteCommandStringField(event, ["target_device_id"]),
             workspace_id: remoteCommandStringField(event, ["workspace_id"]),
           });
+          let shouldAcknowledgeDurableHandoff = true;
+          try {
           const clientActionId = remoteCommandStringField(event, [
             "client_action_id",
           ]);
@@ -45301,16 +45290,10 @@ export default function App() {
               surface: "remote_command_listener",
               workspace_id: receiptWorkspaceId,
             });
-            // Rust re-emits a UI-owned command when Cloud retries delivery so
-            // a webview-remount race can recover. If this listener already
-            // applied the command, keep it committed without reporting a
-            // terminal cancellation/failure to the dashboard.
-            await recordRemoteCommandStatus(event, "received", "Remote command was already received by the desktop UI.", {
-              command_id: commandId,
-              command_kind: commandKind,
-              duplicate_delivery: true,
-              workspace_id: receiptWorkspaceId,
-            });
+            // The original handler owns the durable handoff until it reaches
+            // its terminal outcome. A retry must neither regress its status
+            // to "received" nor remove the crash-recovery journal early.
+            shouldAcknowledgeDurableHandoff = completedRemoteCommandHandoffsRef.current.has(commandId);
             return;
           }
           let graphCheckpointParentKind = dispatchTodosAction
@@ -45656,12 +45639,38 @@ export default function App() {
                 : "Queued for the next available terminal.",
             { command_id: commandId, command_kind: commandKind, target_terminal_name: targetTerminalName, workspace_id: workspaceId },
           );
+          } catch (error) {
+            // Leave the journal intact so the next mounted dispatcher can
+            // retry a command that escaped the normal handled-error paths.
+            shouldAcknowledgeDurableHandoff = false;
+            throw error;
+          } finally {
+            if (durableCommandId && shouldAcknowledgeDurableHandoff) {
+              const completedHandoffs = completedRemoteCommandHandoffsRef.current;
+              completedHandoffs.set(commandId, Date.now());
+              if (completedHandoffs.size > CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX) {
+                const oldest = [...completedHandoffs.entries()]
+                  .sort((left, right) => Number(left[1] || 0) - Number(right[1] || 0))[0];
+                if (oldest?.[0]) {
+                  completedHandoffs.delete(oldest[0]);
+                }
+              }
+              await invoke("todo_dispatch_ack_deferred_remote_command", {
+                command_id: durableCommandId,
+              }).catch(() => {});
+            }
+          }
         });
         if (disposed) {
           nextUnlistenRemoteCommand();
           return;
         }
         unlistenRemoteCommand = nextUnlistenRemoteCommand;
+        // Subscribe before starting the Rust intake so the first command of a
+        // fresh connection cannot land in a listener-registration gap.
+        await waitSharedListenerReady(CLOUD_MCP_REMOTE_COMMAND_EVENT);
+        await invoke("cloud_mcp_start_remote_command_listener");
+        await invoke("todo_dispatch_dispatcher_ready").catch(() => {});
       } catch (error) {
         logBigViewSyncDiagnosticEvent("remote_control.listener_error", {
           message: getErrorMessage(error, "Remote command listener failed."),

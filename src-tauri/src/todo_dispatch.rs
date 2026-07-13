@@ -10339,8 +10339,32 @@ fn todo_dispatch_dispatcher_heartbeat(app: AppHandle) -> Result<Value, String> {
             sleep(Duration::from_secs(3)).await;
             todo_dispatch_flush_deferred_remote_commands(&app);
         });
+    } else if CLOUD_MCP_REMOTE_COMMAND_HANDOFF_PENDING.load(Ordering::Acquire) {
+        // A successful handler removes its journal entry. Re-emitting any
+        // entry that remains lets a transient local ack failure retry without
+        // waiting for an app restart; AppShell dedupes in-flight handlers and
+        // only acknowledges duplicates already known to have completed.
+        todo_dispatch_flush_deferred_remote_commands(&app);
     }
-    Ok(todo_dispatch_startup_reconcile_payload("webview_heartbeat"))
+    let mut payload = todo_dispatch_startup_reconcile_payload("webview_heartbeat");
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("webview_dispatcher_resumed".to_string(), json!(was_stale));
+    }
+    Ok(payload)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn todo_dispatch_dispatcher_ready(app: AppHandle) -> Result<Value, String> {
+    TODO_DISPATCH_WEBVIEW_HEARTBEAT_MS.store(todo_dispatch_now_ms(), Ordering::Release);
+    todo_dispatch_note_startup_reconciliation_evidence(&app, "webview_dispatcher_ready");
+    // This call is made only after AppShell's event listener is installed, so
+    // it is a stronger delivery signal than a visibility/focus heartbeat.
+    todo_dispatch_flush_deferred_remote_commands(&app);
+    let mut payload = todo_dispatch_startup_reconcile_payload("webview_dispatcher_ready");
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("webview_dispatcher_ready".to_string(), json!(true));
+    }
+    Ok(payload)
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -10349,23 +10373,88 @@ fn todo_dispatch_startup_reconciliation_state() -> Result<Value, String> {
 }
 
 pub(crate) fn todo_dispatch_flush_deferred_remote_commands(app: &AppHandle) {
-    let intents = app_local_state_read(app, "remote-intents");
+    let pending = {
+        let lock = CLOUD_MCP_REMOTE_COMMAND_HANDOFF_LOCK.get_or_init(|| StdMutex::new(()));
+        let Ok(_guard) = lock.lock() else {
+            return;
+        };
+        let intents = app_local_state_read(app, CLOUD_MCP_REMOTE_COMMAND_HANDOFF_STATE_KEY);
+        intents
+            .get("pendingRemoteCommands")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    if pending.is_empty() {
+        CLOUD_MCP_REMOTE_COMMAND_HANDOFF_PENDING.store(false, Ordering::Release);
+        return;
+    }
+    CLOUD_MCP_REMOTE_COMMAND_HANDOFF_PENDING.store(true, Ordering::Release);
+    // Keep commands journaled until the mounted AppShell handler finishes the
+    // command without an unhandled exception. Tauri emit success alone does
+    // not prove that any JavaScript listener consumed or applied the event.
+    for event in pending {
+        let _ = app.emit(CLOUD_MCP_REMOTE_COMMAND_EVENT, event);
+    }
+}
+
+fn todo_dispatch_ack_deferred_remote_commands(
+    pending: Vec<Value>,
+    command_id: &str,
+) -> (Vec<Value>, bool) {
+    let command_id = command_id.trim();
+    if command_id.is_empty() {
+        return (pending, false);
+    }
+    let before = pending.len();
+    let pending = pending
+        .into_iter()
+        .filter(|event| todo_dispatch_text(event, &["command_id"]) != command_id)
+        .collect::<Vec<_>>();
+    let acknowledged = pending.len() != before;
+    (pending, acknowledged)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn todo_dispatch_ack_deferred_remote_command(
+    app: AppHandle,
+    command_id: String,
+) -> Result<Value, String> {
+    let command_id = command_id.trim();
+    if command_id.is_empty() {
+        return Err("command_id is required".to_string());
+    }
+    let lock = CLOUD_MCP_REMOTE_COMMAND_HANDOFF_LOCK.get_or_init(|| StdMutex::new(()));
+    let _guard = lock
+        .lock()
+        .map_err(|_| "remote command handoff lock is poisoned".to_string())?;
+    let intents = app_local_state_read(&app, CLOUD_MCP_REMOTE_COMMAND_HANDOFF_STATE_KEY);
     let pending = intents
         .get("pendingRemoteCommands")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    if pending.is_empty() {
-        return;
+    let (remaining, acknowledged) =
+        todo_dispatch_ack_deferred_remote_commands(pending, command_id);
+    if acknowledged {
+        app_local_state_merge(
+            &app,
+            CLOUD_MCP_REMOTE_COMMAND_HANDOFF_STATE_KEY,
+            &json!({
+                "pendingRemoteCommands": if remaining.is_empty() {
+                    Value::Null
+                } else {
+                    Value::Array(remaining.clone())
+                },
+            }),
+        )?;
     }
-    let _ = app_local_state_merge(
-        app,
-        "remote-intents",
-        &json!({ "pendingRemoteCommands": Value::Null }),
-    );
-    for event in pending {
-        let _ = app.emit(CLOUD_MCP_REMOTE_COMMAND_EVENT, event);
-    }
+    CLOUD_MCP_REMOTE_COMMAND_HANDOFF_PENDING.store(!remaining.is_empty(), Ordering::Release);
+    Ok(json!({
+        "acknowledged": acknowledged,
+        "command_id": command_id,
+        "pending_count": remaining.len(),
+    }))
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -11126,6 +11215,33 @@ fn todo_dispatch_backend_codex_model_picker(
 #[cfg(test)]
 mod todo_dispatch_backend_tests {
     use super::*;
+
+    #[test]
+    fn deferred_remote_commands_remain_until_exact_ui_handler_ack() {
+        let pending = vec![
+            json!({ "command_id": "activate-one", "command_kind": "workspace_activate" }),
+            json!({
+                "payload": {
+                    "command_id": "activate-two",
+                    "command_kind": "workspace_activate"
+                }
+            }),
+        ];
+
+        let (unchanged, acknowledged) =
+            todo_dispatch_ack_deferred_remote_commands(pending.clone(), "missing");
+        assert!(!acknowledged);
+        assert_eq!(unchanged, pending);
+
+        let (remaining, acknowledged) =
+            todo_dispatch_ack_deferred_remote_commands(pending, "activate-two");
+        assert!(acknowledged);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            todo_dispatch_text(&remaining[0], &["command_id"]),
+            "activate-one"
+        );
+    }
 
     #[test]
     fn hook_managed_backend_targets_normalize_agent_names_and_submit_sequences() {

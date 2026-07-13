@@ -68,3 +68,19 @@ export const listenShared = (eventName, handler) => {
     entry.handlers.delete(handler);
   };
 };
+
+// Tauri's native event subscription is asynchronous. Callers that must emit
+// immediately after mounting (notably durable remote-command replay) need a
+// positive signal that the native listener exists, rather than merely that a
+// JavaScript handler was added to this registry.
+export const waitSharedListenerReady = async (eventName) => {
+  const entry = ensureSharedListener(eventName);
+  if (typeof entry.unlisten === "function") {
+    return true;
+  }
+  const unlisten = await entry.listenPromise;
+  if (typeof unlisten !== "function") {
+    throw new Error(`Shared Tauri event listener is not ready for ${String(eventName)}`);
+  }
+  return true;
+};
