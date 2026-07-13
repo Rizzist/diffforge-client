@@ -7807,6 +7807,7 @@ async fn terminal_open(
             pane_id.clone(),
             instance_id,
             process_working_directory.clone(),
+            terminal_codex_home_for_coordination(terminal_coordination.as_ref()),
         );
     }
     spawn_terminal_codex_session_discovery(
@@ -8506,6 +8507,7 @@ async fn terminal_start_agent(
             pane_id.clone(),
             instance.id,
             instance.working_directory.as_ref().to_path_buf(),
+            terminal_codex_home_for_coordination(instance.coordination.as_ref()),
         );
     }
 
@@ -9120,6 +9122,7 @@ async fn start_terminal_agent_in_prepared_pty(
                         pane_id.clone(),
                         instance.id,
                         instance.working_directory.as_ref().to_path_buf(),
+                        terminal_codex_home_for_coordination(instance.coordination.as_ref()),
                     );
                 }
                 return TerminalStartAgentPaneResult {
@@ -20299,6 +20302,15 @@ fn terminal_agent_kind_is_codex(value: &str) -> bool {
     terminal_projection_text(value, "") == "codex"
 }
 
+fn terminal_codex_home_for_coordination(
+    coordination: Option<&TerminalCoordinationSession>,
+) -> Option<PathBuf> {
+    let coordination = coordination?;
+    terminal_coordination_env_value(coordination, "DIFFFORGE_CODEX_HOME")
+        .or_else(|| terminal_coordination_env_value(coordination, "CODEX_HOME"))
+        .map(PathBuf::from)
+}
+
 fn terminal_codex_hook_trust_prompt_answer_input(key: &str) -> Option<String> {
     match key {
         "trust_all_and_continue" | "trustallandcontinue" | "trust" | "2" => {
@@ -20310,6 +20322,30 @@ fn terminal_codex_hook_trust_prompt_answer_input(key: &str) -> Option<String> {
         "review_hooks" | "reviewhooks" | "review" | "1" => Some("1\r".to_string()),
         _ => None,
     }
+}
+
+fn terminal_codex_hook_trust_prompt_options() -> Vec<Value> {
+    vec![
+        json!({
+            "id": "review_hooks",
+            "label": "Review hooks",
+            "value": "1",
+            "description": "Open Codex's native hook-review screen before deciding."
+        }),
+        json!({
+            "id": "trust_all_and_continue",
+            "label": "Trust all and continue",
+            "value": "2",
+            "danger": true,
+            "description": "Trust the exact hook hashes listed above and allow them to run."
+        }),
+        json!({
+            "id": "continue_without_trusting",
+            "label": "Continue without trusting",
+            "value": "3",
+            "description": "Continue this Codex session with these hooks disabled."
+        }),
+    ]
 }
 
 fn terminal_agent_prompt_answer_input(
@@ -20398,7 +20434,10 @@ fn terminal_codex_hooks_requiring_trust(catalog: &Value) -> Vec<Value> {
         .collect()
 }
 
-fn terminal_codex_untrusted_hooks(workspace_root: &Path) -> Result<Vec<Value>, String> {
+fn terminal_codex_untrusted_hooks(
+    workspace_root: &Path,
+    terminal_codex_home: Option<&Path>,
+) -> Result<Vec<Value>, String> {
     let mut command = Command::new("codex");
     command
         .arg("app-server")
@@ -20407,7 +20446,14 @@ fn terminal_codex_untrusted_hooks(workspace_root: &Path) -> Result<Vec<Value>, S
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    if let Some(codex_home) = agent_accounts_active_home_for_kind("codex") {
+    // Coordination uses an isolated CODEX_HOME per workspace/slot. Hook trust
+    // is stored in that exact home, so querying the global active-account home
+    // can report every hook as trusted while the real TUI is blocked on a
+    // different catalog. Always prefer the environment bound to this pane.
+    if let Some(codex_home) = terminal_codex_home
+        .map(Path::to_path_buf)
+        .or_else(|| agent_accounts_active_home_for_kind("codex"))
+    {
         command.env("CODEX_HOME", codex_home);
     }
     let mut child = command
@@ -20471,11 +20517,13 @@ fn spawn_terminal_codex_hook_trust_discovery(
     pane_id: String,
     instance_id: u64,
     workspace_root: PathBuf,
+    terminal_codex_home: Option<PathBuf>,
 ) {
     tauri::async_runtime::spawn(async move {
         let query_root = workspace_root.clone();
+        let query_home = terminal_codex_home.clone();
         let hooks = match tauri::async_runtime::spawn_blocking(move || {
-            terminal_codex_untrusted_hooks(&query_root)
+            terminal_codex_untrusted_hooks(&query_root, query_home.as_deref())
         })
         .await
         {
@@ -20557,21 +20605,7 @@ fn spawn_terminal_codex_hook_trust_discovery(
             "prompting_user_kind": "approval",
             "prompting_user_text": prompt_text,
             "prompt_default_option": "continue_without_trusting",
-            "prompt_options": [
-                {
-                    "id": "trust_all_and_continue",
-                    "label": "Trust all and continue",
-                    "value": "2",
-                    "danger": true,
-                    "description": "Trust the exact hook hashes listed above and allow them to run."
-                },
-                {
-                    "id": "continue_without_trusting",
-                    "label": "Continue without trusting",
-                    "value": "3",
-                    "description": "Continue this Codex session with these hooks disabled."
-                }
-            ],
+            "prompt_options": terminal_codex_hook_trust_prompt_options(),
             "manual_approval_required": true,
             "provider_blocked_for_user": true,
             "requires_user_input": true,
@@ -22965,7 +22999,44 @@ mod terminal_tests {
     }
 
     #[test]
+    fn codex_hook_trust_discovery_prefers_terminal_coordination_home() {
+        let mut coordination = terminal_test_coordination("codex_hook_trust_home");
+        coordination.env_vars.push((
+            "CODEX_HOME".to_string(),
+            "/tmp/diffforge-global-codex-home".to_string(),
+        ));
+        coordination.env_vars.push((
+            "DIFFFORGE_CODEX_HOME".to_string(),
+            "/tmp/diffforge-terminal-codex-home".to_string(),
+        ));
+
+        assert_eq!(
+            terminal_codex_home_for_coordination(Some(&coordination)),
+            Some(PathBuf::from("/tmp/diffforge-terminal-codex-home"))
+        );
+    }
+
+    #[test]
+    fn codex_hook_trust_prompt_exposes_all_native_menu_choices() {
+        assert_eq!(
+            terminal_codex_hook_trust_prompt_options()
+                .iter()
+                .filter_map(|option| option.get("id").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec![
+                "review_hooks",
+                "trust_all_and_continue",
+                "continue_without_trusting"
+            ]
+        );
+    }
+
+    #[test]
     fn codex_hook_trust_prompt_answers_use_native_menu_choices() {
+        assert_eq!(
+            terminal_codex_hook_trust_prompt_answer_input("review_hooks").as_deref(),
+            Some("1\r")
+        );
         assert_eq!(
             terminal_codex_hook_trust_prompt_answer_input("trust_all_and_continue").as_deref(),
             Some("2\r")
