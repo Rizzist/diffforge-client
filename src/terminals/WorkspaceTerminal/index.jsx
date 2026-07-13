@@ -162,6 +162,8 @@ import {
   TerminalAgentLabel,
   TerminalAgentDot,
   TerminalStateDebugBadge,
+  TerminalRemotePresenceGroup,
+  TerminalRemotePresenceBadge,
   TerminalRailControls,
   TerminalRestartMenu,
   TerminalRestartDropdown,
@@ -344,6 +346,7 @@ import {
   ButtonAddIcon,
   ButtonLoginIcon,
   ButtonBrowserIcon,
+  ButtonWebIcon,
   ButtonCloseIcon,
   ButtonFolderIcon,
   ButtonLogoutIcon,
@@ -359,6 +362,7 @@ import {
   FileFolderTreeIcon,
   FileDocumentIcon
 } from "../../app/appStyles";
+import { useTerminalRemotePresence } from "../terminalRemotePresence.js";
 import {
   createTerminalResizeController,
   measureTerminalGrid,
@@ -2446,6 +2450,7 @@ function WorkspaceTerminal({
   const [restartRoleMenuOpen, setRestartRoleMenuOpen] = useState(false);
   const [restartMenuAlign, setRestartMenuAlign] = useState("right");
   const [terminalLaunchInfo, setTerminalLaunchInfo] = useState(null);
+  const [terminalInstanceId, setTerminalInstanceId] = useState(0);
   const [parkedPrompt, setParkedPrompt] = useState(null);
   const [terminalUiViewActive, setTerminalUiViewActive] = useState(false);
   const [shellLauncherAgentId, setShellLauncherAgentId] = useState(SHELL_LAUNCHER_MODE_TERMINAL);
@@ -2505,6 +2510,11 @@ function WorkspaceTerminal({
   const paneAgentId = isGenericTerminal ? "generic" : agent?.id;
   const paneId = String(paneIdOverride || "").trim()
     || getWorkspaceTerminalPaneId(workspace?.id, terminalIndex, paneAgentId);
+  const terminalRemotePresence = useTerminalRemotePresence({
+    workspaceId: workspace?.id || "",
+    paneId,
+    instanceId: terminalInstanceId,
+  });
   const terminalPaneConfirmed = Boolean(
     confirmedTerminalPane
       && paneId
@@ -6306,6 +6316,7 @@ function WorkspaceTerminal({
       checkTerminalSizeDesyncOnInput(reason);
     };
     terminalInstanceIdRef.current = terminalInstanceId;
+    setTerminalInstanceId(terminalInstanceId);
     resetTerminalReadinessForEpoch({
       activity_status: "idle",
       instance_id: terminalInstanceId,
@@ -14863,6 +14874,9 @@ function WorkspaceTerminal({
         preserve_coordination_session: preserveCoordinationSession,
         wait_for_cleanup: true,
       }).catch(() => {});
+      setTerminalInstanceId((current) => (
+        Number(current || 0) === Number(terminalInstanceId || 0) ? 0 : current
+      ));
       terminal.dispose();
     };
   // PTY lifetime must be tied to pane identity and explicit lifecycle actions only.
@@ -17251,6 +17265,23 @@ function WorkspaceTerminal({
       : undefined;
   const showDockedTerminalDragHandle = terminalChromeDocked && showDockedDragHandle && canDragTerminalPane;
   const terminalDragHandleVisible = !terminalChromeDocked || showDockedTerminalDragHandle;
+  const remoteShellViewerCount = Number(terminalRemotePresence?.shell_viewers || 0);
+  const remoteShellHasController = Boolean(terminalRemotePresence?.shell_controller);
+  const remoteChatWatcherCount = Number(terminalRemotePresence?.chat_watchers || 0);
+  const showRemotePresence = Boolean(
+    !terminalChromeDocked
+      && !terminalClosed
+      && !terminalClosing
+      && (remoteShellViewerCount > 0 || remoteShellHasController || remoteChatWatcherCount > 0),
+  );
+  const remoteShellPresenceTitle = remoteShellViewerCount > 0
+    ? `${remoteShellViewerCount} web shell ${remoteShellViewerCount === 1 ? "viewer" : "viewers"}${remoteShellHasController ? " · controlling" : ""}`
+    : remoteShellHasController
+      ? "Web shell controller connected"
+      : "";
+  const remoteChatPresenceTitle = remoteChatWatcherCount > 0
+    ? `${remoteChatWatcherCount} web chat ${remoteChatWatcherCount === 1 ? "viewer" : "viewers"} connected`
+    : "";
 
   return (
     <TerminalWorkspaceSurface
@@ -17298,6 +17329,29 @@ function WorkspaceTerminal({
               <TerminalStateDebugBadge title={`Terminal state: ${shellLauncherRailStateLabel}`}>
                 {shellLauncherRailStateLabel}
               </TerminalStateDebugBadge>
+              {showRemotePresence && (
+                <TerminalRemotePresenceGroup aria-label="Remote web presence" role="status">
+                  {(remoteShellViewerCount > 0 || remoteShellHasController) && (
+                    <TerminalRemotePresenceBadge
+                      data-control={remoteShellHasController ? "true" : undefined}
+                      data-kind="shell"
+                      title={remoteShellPresenceTitle}
+                    >
+                      <ButtonWebIcon aria-hidden="true" />
+                      {Math.max(1, remoteShellViewerCount)}
+                    </TerminalRemotePresenceBadge>
+                  )}
+                  {remoteChatWatcherCount > 0 && (
+                    <TerminalRemotePresenceBadge
+                      data-kind="chat"
+                      title={remoteChatPresenceTitle}
+                    >
+                      <ButtonBotIcon aria-hidden="true" />
+                      {remoteChatWatcherCount}
+                    </TerminalRemotePresenceBadge>
+                  )}
+                </TerminalRemotePresenceGroup>
+              )}
               <TerminalAccountStaleChip agent_kind={terminalAgentKind} pane_id={paneId} />
             </>
           )}

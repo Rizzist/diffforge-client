@@ -933,17 +933,22 @@ fn terminal_prompt_ready_recovery_allowed(
     metadata: &TerminalInstanceMetadata,
     runtime: &TerminalRuntimeSnapshot,
 ) -> bool {
-    // Claude Code exposes deterministic SessionStart, UserPromptSubmit, Stop,
-    // and StopFailure hooks. Its Ink TUI keeps the composer prompt on screen
-    // while a turn is still reasoning, so a visible prompt glyph is not
-    // evidence that input is ready. Let the provider hooks own Claude's whole
-    // lifecycle instead of allowing PTY chrome to synthesize an early Stop.
-    if !terminal_activity_provider_allows_pty_lifecycle_recovery(metadata) {
-        return false;
-    }
-
+    // Startup is the one PTY recovery every hook-managed provider (Claude
+    // included) is allowed: this path only runs once a prompt marker is
+    // already on screen and a Claude terminal sitting at its composer prompt
+    // during startup is genuinely idle/ready. Without it a missed SessionStart
+    // hook strands the cloud/web row on "starting" forever, since Claude's
+    // busy-turn PTY recovery stays disabled below.
     if terminal_runtime_snapshot_is_starting(runtime) {
         return true;
+    }
+
+    // Claude Code exposes deterministic SessionStart/UserPromptSubmit/Stop
+    // hooks and keeps its composer prompt on screen while a turn is still
+    // reasoning, so a visible prompt glyph mid-turn is not proof input is
+    // ready. Outside startup, let provider hooks own Claude's lifecycle.
+    if !terminal_activity_provider_allows_pty_lifecycle_recovery(metadata) {
+        return false;
     }
 
     // Provider Stop/session-idle hooks remain the primary completion signal,
@@ -25127,7 +25132,8 @@ mod terminal_tests {
         runtime.status = "starting".to_string();
         runtime.activity_status = "starting".to_string();
         runtime.command_phase = "starting".to_string();
-        assert!(!terminal_prompt_ready_recovery_allowed(
+        // Claude allows prompt-ready PTY recovery only during startup.
+        assert!(terminal_prompt_ready_recovery_allowed(
             &claude_metadata,
             &runtime
         ));

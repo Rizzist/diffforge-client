@@ -11,8 +11,8 @@ logs/
 .env.*
 !.env.example
 .agents
-/pwa/Diff Forge AI - Google Play package/signing-key-info.txt
-/pwa/Diff Forge AI - Google Play package/signing.keystore
+# PWABuilder store packages (Android keystore + signed binaries) — never commit
+/pwa/
 /docs
 .DS_Store
 .claude/settings.local.json

@@ -48,6 +48,13 @@ const CLOUD_MCP_NOTIFICATION_PREFERENCES_MAX_CLOCK_SKEW_MS: u64 = 2 * 60_000;
 const CLOUD_MCP_ACCOUNT_USAGE_EVENT: &str = "cloud-mcp-account-usage";
 const CLOUD_MCP_ACCOUNT_TOOLS_UPDATED_EVENT: &str = "cloud-mcp-account-tools-updated";
 const CLOUD_MCP_NATIVE_SESSIONS_UPDATED_EVENT: &str = "cloud-mcp-native-sessions-updated";
+const TERMINAL_REMOTE_PRESENCE_CHANGED_EVENT: &str = "terminal-remote-presence-changed";
+const TERMINAL_REMOTE_PRESENCE_DEBOUNCE_MS: u64 = 180;
+// The cloud app websocket currently forwards origin_connection_id on relayed
+// client frames, but not a per-origin leave/disconnect control frame. Presence
+// is therefore bounded by last-seen TTL in addition to explicit detach/unwatch.
+const TERMINAL_REMOTE_PRESENCE_STALE_ORIGIN_TTL_MS: u64 = 3 * 60 * 1000;
+const TERMINAL_REMOTE_PRESENCE_REAPER_GRACE_MS: u64 = 1_000;
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT: &str = "cloud-mcp-workspace-todos-updated";
 const CLOUD_MCP_LOOPSPACES_UPDATED_EVENT: &str = "cloud-mcp-loopspaces-updated";
 const CLOUD_MCP_LOOPSPACES_CONTRACT: &str = "diffforge.loopspaces.v1";
@@ -525,6 +532,18 @@ struct CloudMcpTerminalIoTail {
 }
 
 #[derive(Clone)]
+struct CloudMcpTerminalIoSubscription {
+    attachment_id: String,
+    last_seen_ms: u64,
+}
+
+#[derive(Clone)]
+struct CloudMcpTerminalIoControlOwner {
+    origin: String,
+    last_seen_ms: u64,
+}
+
+#[derive(Clone)]
 struct CloudMcpState {
     inner: Arc<Mutex<CloudMcpRuntime>>,
     auth: Arc<Mutex<CloudMcpAuthRuntime>>,
@@ -545,10 +564,12 @@ struct CloudMcpState {
     global_ws_pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     global_ws_events: tokio::sync::broadcast::Sender<Value>,
     terminal_io_stream_subscriptions:
-        Arc<StdMutex<HashMap<String, HashMap<String, String>>>>,
-    terminal_io_control_owners: Arc<StdMutex<HashMap<String, String>>>,
+        Arc<StdMutex<HashMap<String, HashMap<String, CloudMcpTerminalIoSubscription>>>>,
+    terminal_io_control_owners: Arc<StdMutex<HashMap<String, CloudMcpTerminalIoControlOwner>>>,
     terminal_io_tail_by_stream: Arc<StdMutex<HashMap<String, CloudMcpTerminalIoTail>>>,
     terminal_io_output_send_lock: Arc<Mutex<()>>,
+    terminal_remote_presence_emit_scheduled: Arc<AtomicBool>,
+    terminal_remote_presence_reaper_scheduled: Arc<AtomicBool>,
     device_live_snapshot_debounce: Arc<StdMutex<Option<String>>>,
     device_live_catalog_retry_scheduled: Arc<AtomicBool>,
     device_live_catalog_ready_notify: Arc<tokio::sync::Notify>,
@@ -818,6 +839,8 @@ impl CloudMcpState {
             terminal_io_control_owners: Arc::new(StdMutex::new(HashMap::new())),
             terminal_io_tail_by_stream: Arc::new(StdMutex::new(HashMap::new())),
             terminal_io_output_send_lock: Arc::new(Mutex::new(())),
+            terminal_remote_presence_emit_scheduled: Arc::new(AtomicBool::new(false)),
+            terminal_remote_presence_reaper_scheduled: Arc::new(AtomicBool::new(false)),
             device_live_snapshot_debounce: Arc::new(StdMutex::new(None)),
             device_live_catalog_retry_scheduled: Arc::new(AtomicBool::new(false)),
             device_live_catalog_ready_notify: Arc::new(tokio::sync::Notify::new()),
@@ -13513,13 +13536,7 @@ async fn cloud_mcp_clear_global_ws_sender_if_current(
         cloud_mcp_clear_live_app_ws_route_cache();
     }
     cloud_mcp_clear_ws_heartbeat_telemetry();
-    if let Ok(mut subscriptions) = state.terminal_io_stream_subscriptions.lock() {
-        subscriptions.clear();
-    }
-    if let Ok(mut owners) = state.terminal_io_control_owners.lock() {
-        owners.clear();
-    }
-    agent_chat_session_clear_observed_terminals();
+    cloud_mcp_clear_terminal_remote_presence_state(state, "websocket_sender_cleared");
 
     if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
         let message = {
@@ -13607,7 +13624,7 @@ async fn cloud_mcp_mark_global_ws_disconnected_inner(
     CLOUD_MCP_GLOBAL_WS_LIVE.store(false, Ordering::Release);
     cloud_mcp_clear_live_app_ws_route_cache();
     cloud_mcp_clear_ws_heartbeat_telemetry();
-    agent_chat_session_clear_observed_terminals();
+    cloud_mcp_clear_terminal_remote_presence_state(state, "websocket_disconnected");
     if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
         return;
     }
@@ -13620,13 +13637,7 @@ async fn cloud_mcp_mark_global_ws_disconnected_inner(
     if app_shutdown_requested() {
         state.global_ws_epoch.fetch_add(1, Ordering::SeqCst);
         let _ = state.global_ws_tx.lock().await.take();
-        if let Ok(mut subscriptions) = state.terminal_io_stream_subscriptions.lock() {
-            subscriptions.clear();
-        }
-        if let Ok(mut owners) = state.terminal_io_control_owners.lock() {
-            owners.clear();
-        }
-        agent_chat_session_clear_observed_terminals();
+        cloud_mcp_clear_terminal_remote_presence_state(state, "app_shutdown");
         {
             let mut runtime = state.inner.lock().await;
             runtime.connected = false;
@@ -13644,13 +13655,7 @@ async fn cloud_mcp_mark_global_ws_disconnected_inner(
     let message = clean_terminal_telemetry_text(error);
     log_cloud_sync_event("ws.disconnected", json!({ "error": message }));
     state.global_ws_epoch.fetch_add(1, Ordering::SeqCst);
-    if let Ok(mut subscriptions) = state.terminal_io_stream_subscriptions.lock() {
-        subscriptions.clear();
-    }
-    if let Ok(mut owners) = state.terminal_io_control_owners.lock() {
-        owners.clear();
-    }
-    agent_chat_session_clear_observed_terminals();
+    cloud_mcp_clear_terminal_remote_presence_state(state, "websocket_disconnected");
     {
         let mut runtime = state.inner.lock().await;
         runtime.connected = false;
@@ -25811,6 +25816,11 @@ fn cloud_mcp_platform_is_windows(platform: &str) -> bool {
 }
 
 fn cloud_mcp_workspace_id_match_key_for_platform(value: &str, platform: &str) -> String {
+    // Workspace match keys trim surrounding whitespace. Windows paths then
+    // convert backslashes to '/', strip a leading '//?/' device prefix, restore
+    // 'UNC/' to '//', remove a leading slash before drive roots, collapse
+    // repeated slashes, drop trailing slashes except drive roots, and lowercase.
+    // Non-Windows keys only trim and drop trailing slashes; they keep case.
     let raw = value.trim();
     let windows_path = cloud_mcp_platform_is_windows(platform);
     let mut normalized = if windows_path {
@@ -30651,6 +30661,494 @@ fn cloud_mcp_terminal_io_origin(message: &Value) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+#[derive(Clone, Default)]
+struct CloudMcpTerminalRemotePresenceEntry {
+    workspace_id: String,
+    pane_id: String,
+    instance_id: Option<u64>,
+    stream_key: String,
+    shell_viewers: usize,
+    shell_controller: bool,
+    chat_watchers: usize,
+}
+
+fn cloud_mcp_terminal_remote_presence_identity_key(
+    workspace_id: &str,
+    pane_id: &str,
+    instance_id: Option<u64>,
+) -> String {
+    format!(
+        "{}|{}|{}",
+        cloud_mcp_workspace_id_match_key(workspace_id),
+        pane_id.trim(),
+        instance_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+    )
+}
+
+fn cloud_mcp_remote_presence_origin_is_remote(
+    origin: &str,
+    local_connection_id: Option<&str>,
+) -> bool {
+    let origin = origin.trim();
+    if origin.is_empty() {
+        return false;
+    }
+    if local_connection_id.is_some_and(|local| !local.is_empty() && local == origin) {
+        return false;
+    }
+    let normalized = origin.to_ascii_lowercase();
+    !matches!(
+        normalized.as_str(),
+        "local"
+            | "loopback"
+            | "localhost"
+            | "native"
+            | "desktop"
+            | "unknown"
+            | "rust"
+            | "rust-diffforge"
+            | CLOUD_MCP_RUST_CLIENT_ID
+    ) && !normalized.starts_with("local:")
+        && !normalized.starts_with("loopback:")
+        && !normalized.starts_with("localhost:")
+}
+
+fn cloud_mcp_terminal_remote_presence_origin_is_fresh(last_seen_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(last_seen_ms) < TERMINAL_REMOTE_PRESENCE_STALE_ORIGIN_TTL_MS
+}
+
+fn cloud_mcp_prune_terminal_remote_presence_stale_origins_at(
+    state: &CloudMcpState,
+    now_ms: u64,
+) -> bool {
+    let mut changed = false;
+    if let Ok(mut subscriptions) = state.terminal_io_stream_subscriptions.lock() {
+        subscriptions.retain(|_, origins| {
+            let before = origins.len();
+            origins.retain(|_, subscription| {
+                cloud_mcp_terminal_remote_presence_origin_is_fresh(
+                    subscription.last_seen_ms,
+                    now_ms,
+                )
+            });
+            changed |= origins.len() != before;
+            let keep = !origins.is_empty();
+            changed |= !keep;
+            keep
+        });
+    }
+    if let Ok(mut owners) = state.terminal_io_control_owners.lock() {
+        let before = owners.len();
+        owners.retain(|_, owner| {
+            cloud_mcp_terminal_remote_presence_origin_is_fresh(owner.last_seen_ms, now_ms)
+        });
+        changed |= owners.len() != before;
+    }
+    changed |= agent_chat_session_prune_stale_observed_terminals(
+        now_ms,
+        TERMINAL_REMOTE_PRESENCE_STALE_ORIGIN_TTL_MS,
+    );
+    changed
+}
+
+fn cloud_mcp_prune_terminal_remote_presence_stale_origins(state: &CloudMcpState) -> bool {
+    cloud_mcp_prune_terminal_remote_presence_stale_origins_at(state, cloud_mcp_now_ms())
+}
+
+fn cloud_mcp_terminal_remote_presence_has_tracked_origins(state: &CloudMcpState) -> bool {
+    let has_shell_viewers = state
+        .terminal_io_stream_subscriptions
+        .lock()
+        .map(|subscriptions| subscriptions.values().any(|origins| !origins.is_empty()))
+        .unwrap_or(false);
+    let has_shell_controllers = state
+        .terminal_io_control_owners
+        .lock()
+        .map(|owners| !owners.is_empty())
+        .unwrap_or(false);
+    has_shell_viewers
+        || has_shell_controllers
+        || agent_chat_session_has_observed_terminal_origins()
+}
+
+fn cloud_mcp_schedule_terminal_remote_presence_reaper(state: &CloudMcpState) {
+    if state
+        .terminal_remote_presence_reaper_scheduled
+        .swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+    let state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        sleep(Duration::from_millis(
+            TERMINAL_REMOTE_PRESENCE_STALE_ORIGIN_TTL_MS
+                .saturating_add(TERMINAL_REMOTE_PRESENCE_REAPER_GRACE_MS),
+        ))
+        .await;
+        state
+            .terminal_remote_presence_reaper_scheduled
+            .store(false, Ordering::SeqCst);
+        if cloud_mcp_prune_terminal_remote_presence_stale_origins(&state) {
+            cloud_mcp_schedule_terminal_remote_presence_emit(
+                &state,
+                "terminal_remote_presence_stale_reaper",
+            );
+        }
+        if cloud_mcp_terminal_remote_presence_has_tracked_origins(&state) {
+            cloud_mcp_schedule_terminal_remote_presence_reaper(&state);
+        }
+    });
+}
+
+fn cloud_mcp_touch_terminal_io_presence_origin(
+    state: &CloudMcpState,
+    stream_key: &str,
+    origin: &str,
+) {
+    let origin = origin.trim();
+    if origin.is_empty() {
+        return;
+    }
+    let now_ms = cloud_mcp_now_ms();
+    let mut touched = false;
+    if let Ok(mut subscriptions) = state.terminal_io_stream_subscriptions.lock() {
+        if let Some(origins) = subscriptions.get_mut(stream_key) {
+            if let Some(subscription) = origins.get_mut(origin) {
+                subscription.last_seen_ms = now_ms;
+                touched = true;
+            }
+        }
+    }
+    if let Ok(mut owners) = state.terminal_io_control_owners.lock() {
+        if let Some(owner) = owners.get_mut(stream_key) {
+            if owner.origin.as_str() == origin {
+                owner.last_seen_ms = now_ms;
+                touched = true;
+            }
+        }
+    }
+    if touched {
+        cloud_mcp_schedule_terminal_remote_presence_reaper(state);
+    }
+}
+
+fn cloud_mcp_terminal_remote_presence_entry_value(
+    entry: &CloudMcpTerminalRemotePresenceEntry,
+) -> Value {
+    json!({
+        "workspace_id": entry.workspace_id,
+        "pane_id": entry.pane_id,
+        "instance_id": entry.instance_id,
+        "stream_key": entry.stream_key,
+        "shell_viewers": entry.shell_viewers,
+        "shell_controller": entry.shell_controller,
+        "chat_watchers": entry.chat_watchers,
+    })
+}
+
+async fn cloud_mcp_terminal_remote_presence_snapshot_payload(
+    state: &CloudMcpState,
+) -> Value {
+    let _ = cloud_mcp_prune_terminal_remote_presence_stale_origins(state);
+    let local_device = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
+        .unwrap_or_else(|| "desktop-primary".to_string());
+    let local_connection_id = {
+        let runtime = state.inner.lock().await;
+        runtime.global_ws_connection_id.clone()
+    };
+    let local_connection_id = local_connection_id.as_deref();
+    let mut entries: HashMap<String, CloudMcpTerminalRemotePresenceEntry> = HashMap::new();
+
+    if let Ok(subscriptions) = state.terminal_io_stream_subscriptions.lock() {
+        for (stream_key, origins) in subscriptions.iter() {
+            let Ok(target) = cloud_mcp_terminal_io_target(stream_key) else {
+                continue;
+            };
+            if target.device_id != local_device {
+                continue;
+            }
+            let shell_viewers = origins
+                .keys()
+                .filter(|origin| {
+                    cloud_mcp_remote_presence_origin_is_remote(origin, local_connection_id)
+                })
+                .count();
+            if shell_viewers == 0 {
+                continue;
+            }
+            let key = cloud_mcp_terminal_remote_presence_identity_key(
+                &target.workspace_id,
+                &target.pane_id,
+                Some(target.instance_id),
+            );
+            let entry = entries.entry(key).or_insert_with(|| {
+                CloudMcpTerminalRemotePresenceEntry {
+                    workspace_id: cloud_mcp_workspace_id_match_key(&target.workspace_id),
+                    pane_id: target.pane_id.trim().to_string(),
+                    instance_id: Some(target.instance_id),
+                    stream_key: target.stream_key.clone(),
+                    ..CloudMcpTerminalRemotePresenceEntry::default()
+                }
+            });
+            entry.shell_viewers = shell_viewers;
+            if entry.stream_key.is_empty() {
+                entry.stream_key = target.stream_key.clone();
+            }
+        }
+    }
+
+    if let Ok(owners) = state.terminal_io_control_owners.lock() {
+        for (stream_key, owner) in owners.iter() {
+            if !cloud_mcp_remote_presence_origin_is_remote(&owner.origin, local_connection_id) {
+                continue;
+            }
+            let Ok(target) = cloud_mcp_terminal_io_target(stream_key) else {
+                continue;
+            };
+            if target.device_id != local_device {
+                continue;
+            }
+            let key = cloud_mcp_terminal_remote_presence_identity_key(
+                &target.workspace_id,
+                &target.pane_id,
+                Some(target.instance_id),
+            );
+            let entry = entries.entry(key).or_insert_with(|| {
+                CloudMcpTerminalRemotePresenceEntry {
+                    workspace_id: cloud_mcp_workspace_id_match_key(&target.workspace_id),
+                    pane_id: target.pane_id.trim().to_string(),
+                    instance_id: Some(target.instance_id),
+                    stream_key: target.stream_key.clone(),
+                    ..CloudMcpTerminalRemotePresenceEntry::default()
+                }
+            });
+            entry.shell_controller = true;
+            if entry.stream_key.is_empty() {
+                entry.stream_key = target.stream_key.clone();
+            }
+        }
+    }
+
+    for observed in agent_chat_session_observed_terminal_presence_entries() {
+        let chat_watchers = observed
+            .origins
+            .iter()
+            .filter(|origin| {
+                cloud_mcp_remote_presence_origin_is_remote(origin, local_connection_id)
+            })
+            .count();
+        if chat_watchers == 0 {
+            continue;
+        }
+        let workspace_id = cloud_mcp_workspace_id_match_key(&observed.workspace_id);
+        let key = cloud_mcp_terminal_remote_presence_identity_key(
+            &workspace_id,
+            &observed.pane_id,
+            observed.instance_id,
+        );
+        let stream_key = observed.instance_id.map(|instance_id| {
+            cloud_mcp_terminal_output_stream_key(
+                &local_device,
+                &workspace_id,
+                observed.pane_id.trim(),
+                instance_id,
+            )
+        });
+        let entry = entries.entry(key).or_insert_with(|| {
+            CloudMcpTerminalRemotePresenceEntry {
+                workspace_id,
+                pane_id: observed.pane_id.trim().to_string(),
+                instance_id: observed.instance_id,
+                stream_key: stream_key.clone().unwrap_or_default(),
+                ..CloudMcpTerminalRemotePresenceEntry::default()
+            }
+        });
+        entry.chat_watchers = chat_watchers;
+        if entry.stream_key.is_empty() {
+            if let Some(stream_key) = stream_key {
+                entry.stream_key = stream_key;
+            }
+        }
+    }
+
+    let mut items = entries.into_values().collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        (
+            &left.workspace_id,
+            &left.pane_id,
+            left.instance_id.unwrap_or(0),
+            &left.stream_key,
+        )
+            .cmp(&(
+                &right.workspace_id,
+                &right.pane_id,
+                right.instance_id.unwrap_or(0),
+                &right.stream_key,
+            ))
+    });
+
+    let mut by_stream_key = serde_json::Map::new();
+    let mut by_terminal_key = serde_json::Map::new();
+    let item_values = items
+        .iter()
+        .map(|entry| {
+            let value = cloud_mcp_terminal_remote_presence_entry_value(entry);
+            if !entry.stream_key.is_empty() {
+                by_stream_key.insert(entry.stream_key.clone(), value.clone());
+            }
+            by_terminal_key.insert(
+                cloud_mcp_terminal_remote_presence_identity_key(
+                    &entry.workspace_id,
+                    &entry.pane_id,
+                    entry.instance_id,
+                ),
+                value.clone(),
+            );
+            value
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "items": item_values,
+        "by_stream_key": Value::Object(by_stream_key),
+        "by_terminal_key": Value::Object(by_terminal_key),
+        "updated_at_ms": cloud_mcp_now_ms(),
+    })
+}
+
+async fn cloud_mcp_emit_terminal_remote_presence_snapshot(
+    state: &CloudMcpState,
+    reason: &str,
+) {
+    let Some(app) = CLOUD_MCP_SYNC_STATUS_APP.get() else {
+        return;
+    };
+    let mut payload = cloud_mcp_terminal_remote_presence_snapshot_payload(state).await;
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("reason".to_string(), json!(reason));
+    }
+    let _ = app.emit(TERMINAL_REMOTE_PRESENCE_CHANGED_EVENT, payload);
+}
+
+fn cloud_mcp_schedule_terminal_remote_presence_emit(state: &CloudMcpState, reason: &'static str) {
+    if state
+        .terminal_remote_presence_emit_scheduled
+        .swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+    let state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        sleep(Duration::from_millis(TERMINAL_REMOTE_PRESENCE_DEBOUNCE_MS)).await;
+        state
+            .terminal_remote_presence_emit_scheduled
+            .store(false, Ordering::SeqCst);
+        cloud_mcp_emit_terminal_remote_presence_snapshot(&state, reason).await;
+    });
+}
+
+fn cloud_mcp_clear_terminal_remote_presence_state(state: &CloudMcpState, reason: &'static str) {
+    if let Ok(mut subscriptions) = state.terminal_io_stream_subscriptions.lock() {
+        subscriptions.clear();
+    }
+    if let Ok(mut owners) = state.terminal_io_control_owners.lock() {
+        owners.clear();
+    }
+    let _ = agent_chat_session_clear_observed_terminals();
+    cloud_mcp_schedule_terminal_remote_presence_emit(state, reason);
+}
+
+fn cloud_mcp_terminal_remote_presence_stream_matches_terminal(
+    stream_key: &str,
+    local_device_id: &str,
+    workspace_match_key: Option<&str>,
+    pane_id: &str,
+    instance_id: u64,
+) -> bool {
+    let Ok(target) = cloud_mcp_terminal_io_target(stream_key) else {
+        return false;
+    };
+    if target.device_id != local_device_id
+        || target.pane_id.trim() != pane_id.trim()
+        || target.instance_id != instance_id
+    {
+        return false;
+    }
+    workspace_match_key.is_none_or(|workspace_match_key| {
+        cloud_mcp_workspace_id_match_key(&target.workspace_id) == workspace_match_key
+    })
+}
+
+fn cloud_mcp_clear_terminal_remote_presence_for_terminal(
+    state: &CloudMcpState,
+    workspace_id: &str,
+    pane_id: &str,
+    instance_id: u64,
+    reason: &'static str,
+) -> bool {
+    if pane_id.trim().is_empty() {
+        return false;
+    }
+    let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
+        .unwrap_or_else(|| "desktop-primary".to_string());
+    let workspace_match_key = cloud_mcp_workspace_id_match_key(workspace_id);
+    let workspace_match_key = (!workspace_match_key.is_empty()).then_some(workspace_match_key);
+    let mut changed = false;
+    if let Ok(mut subscriptions) = state.terminal_io_stream_subscriptions.lock() {
+        subscriptions.retain(|stream_key, _| {
+            let remove = cloud_mcp_terminal_remote_presence_stream_matches_terminal(
+                stream_key,
+                &device_id,
+                workspace_match_key.as_deref(),
+                pane_id,
+                instance_id,
+            );
+            changed |= remove;
+            !remove
+        });
+    }
+    if let Ok(mut owners) = state.terminal_io_control_owners.lock() {
+        owners.retain(|stream_key, _| {
+            let remove = cloud_mcp_terminal_remote_presence_stream_matches_terminal(
+                stream_key,
+                &device_id,
+                workspace_match_key.as_deref(),
+                pane_id,
+                instance_id,
+            );
+            changed |= remove;
+            !remove
+        });
+    }
+    if let Ok(mut tails) = state.terminal_io_tail_by_stream.lock() {
+        tails.retain(|stream_key, _| {
+            !cloud_mcp_terminal_remote_presence_stream_matches_terminal(
+                stream_key,
+                &device_id,
+                workspace_match_key.as_deref(),
+                pane_id,
+                instance_id,
+            )
+        });
+    }
+    changed |= agent_chat_session_clear_observed_terminal_matching(
+        workspace_match_key.as_deref(),
+        pane_id,
+        Some(instance_id),
+    );
+    changed |= agent_chat_session_clear_observed_terminal_matching(
+        workspace_match_key.as_deref(),
+        pane_id,
+        None,
+    );
+    if changed {
+        cloud_mcp_schedule_terminal_remote_presence_emit(state, reason);
+    }
+    changed
+}
+
 async fn cloud_mcp_send_terminal_io_message(
     state: &CloudMcpState,
     request: Option<&Value>,
@@ -30726,7 +31224,7 @@ fn cloud_mcp_terminal_io_has_control(
         .lock()
         .ok()
         .and_then(|owners| owners.get(stream_key).cloned())
-        .is_some_and(|owner| owner == origin)
+        .is_some_and(|owner| owner.origin.as_str() == origin)
 }
 
 fn cloud_mcp_terminal_io_attachment_refs(
@@ -30843,6 +31341,7 @@ async fn cloud_mcp_handle_terminal_io_message(
     let origin = cloud_mcp_terminal_io_origin(message);
     let request_id = cloud_mcp_payload_text(message, &["id"])
         .unwrap_or_else(|| format!("termio-{}", cloud_mcp_now_ms()));
+    cloud_mcp_touch_terminal_io_presence_origin(state, &target.stream_key, &origin);
 
     match kind.as_str() {
         "termio.attach" => {
@@ -30853,8 +31352,16 @@ async fn cloud_mcp_handle_terminal_io_message(
                 subscriptions
                     .entry(target.stream_key.clone())
                     .or_default()
-                    .insert(origin.clone(), request_id.clone());
+                    .insert(
+                        origin.clone(),
+                        CloudMcpTerminalIoSubscription {
+                            attachment_id: request_id.clone(),
+                            last_seen_ms: cloud_mcp_now_ms(),
+                        },
+                    );
             }
+            cloud_mcp_schedule_terminal_remote_presence_reaper(state);
+            cloud_mcp_schedule_terminal_remote_presence_emit(state, "termio_attach");
             let size = *instance.size.lock().await;
             let (total, bytes, retained_tail_bytes) = {
                 let output = instance.headless_output.lock().ok();
@@ -30908,7 +31415,8 @@ async fn cloud_mcp_handle_terminal_io_message(
             let attachment_id = cloud_mcp_payload_text(message, &["attachment_id", "attach_id"]);
             if let Ok(mut subscriptions) = state.terminal_io_stream_subscriptions.lock() {
                 if let Some(origins) = subscriptions.get_mut(&target.stream_key) {
-                    let current_attachment = origins.get(&origin).cloned();
+                    let current_attachment =
+                        origins.get(&origin).map(|subscription| subscription.attachment_id.clone());
                     if attachment_id.as_deref().is_none_or(|requested| {
                         current_attachment.as_deref() == Some(requested)
                     }) {
@@ -30920,29 +31428,46 @@ async fn cloud_mcp_handle_terminal_io_message(
                 }
             }
             if let Ok(mut owners) = state.terminal_io_control_owners.lock() {
-                if owners.get(&target.stream_key).is_some_and(|owner| owner == &origin) {
+                if owners
+                    .get(&target.stream_key)
+                    .is_some_and(|owner| owner.origin.as_str() == origin)
+                {
                     owners.remove(&target.stream_key);
                 }
             }
+            cloud_mcp_schedule_terminal_remote_presence_emit(state, "termio_detach");
         }
         "termio.control.request" => {
             let granted = if let Ok(mut owners) = state.terminal_io_control_owners.lock() {
                 match owners.get(&target.stream_key) {
-                    Some(owner) => owner == &origin,
+                    Some(owner) => owner.origin.as_str() == origin,
                     None => {
-                        owners.insert(target.stream_key.clone(), origin.clone());
+                        owners.insert(
+                            target.stream_key.clone(),
+                            CloudMcpTerminalIoControlOwner {
+                                origin: origin.clone(),
+                                last_seen_ms: cloud_mcp_now_ms(),
+                            },
+                        );
                         true
                     }
                 }
             } else {
                 false
             };
+            if granted {
+                cloud_mcp_schedule_terminal_remote_presence_reaper(state);
+                cloud_mcp_schedule_terminal_remote_presence_emit(state, "termio_control_request");
+            }
             let response_kind = if granted { "termio.control.granted" } else { "termio.control.denied" };
             let _ = cloud_mcp_send_terminal_io_message(state, Some(message), &target, response_kind, request_id, json!({"granted": granted})).await;
         }
         "termio.control.release" => {
             let released = if let Ok(mut owners) = state.terminal_io_control_owners.lock() {
-                if owners.get(&target.stream_key).is_some_and(|owner| owner == &origin) {
+                if owners
+                    .get(&target.stream_key)
+                    .is_some_and(|owner| owner.origin.as_str() == origin)
+                {
                     owners.remove(&target.stream_key);
                     true
                 } else {
@@ -30951,9 +31476,25 @@ async fn cloud_mcp_handle_terminal_io_message(
             } else {
                 false
             };
+            if released {
+                cloud_mcp_schedule_terminal_remote_presence_emit(state, "termio_control_release");
+            }
             let response_kind = if released { "termio.control.released" } else { "termio.control.denied" };
             let _ = cloud_mcp_send_terminal_io_message(state, Some(message), &target, response_kind, request_id, json!({"released": released})).await;
         }
+        "termio.heartbeat" => {
+            let heartbeat_seq = cloud_mcp_payload_u64(message, &["seq", "q"]).unwrap_or(0);
+            let _ = cloud_mcp_send_terminal_io_message(
+                state,
+                Some(message),
+                &target,
+                "termio.heartbeat.ack",
+                request_id,
+                json!({"seq": heartbeat_seq, "q": heartbeat_seq}),
+            )
+            .await;
+        }
+        "termio.output.ack" | "termio.output_ack" => {}
         "termio.input" => {
             let input_seq = cloud_mcp_payload_u64(message, &["seq", "q"]).unwrap_or(0);
             if !cloud_mcp_terminal_io_has_control(state, &target.stream_key, &origin) {
@@ -31094,7 +31635,7 @@ async fn cloud_mcp_handle_terminal_io_message(
 }
 
 fn cloud_mcp_handle_agent_session_observer_subscription(
-    _state: &CloudMcpState,
+    state: &CloudMcpState,
     message: &Value,
     fallback_kind: &str,
 ) -> bool {
@@ -31104,30 +31645,77 @@ fn cloud_mcp_handle_agent_session_observer_subscription(
     } else {
         direct_kind
     };
-    if !matches!(kind.as_str(), "session.watch" | "session.unwatch") {
+    if !matches!(
+        kind.as_str(),
+        "session.watch" | "session.unwatch" | "session.heartbeat"
+    ) {
         return false;
     }
+    let heartbeat = kind == "session.heartbeat";
     let active = kind == "session.watch"
         && message.get("active").and_then(Value::as_bool) != Some(false);
     let stream_key = cloud_mcp_terminal_output_message_stream_key(message).unwrap_or_default();
+    let stream_target = cloud_mcp_terminal_io_target(&stream_key).ok();
     let parts = stream_key.split(':').collect::<Vec<_>>();
     let workspace_id = cloud_mcp_payload_text(message, &["w", "workspace_id"])
-        .or_else(|| parts.get(1).map(|value| (*value).to_string()))
+        .or_else(|| stream_target.as_ref().map(|target| target.workspace_id.clone()))
+        .or_else(|| {
+            parts
+                .get(1)
+                .map(|value| cloud_mcp_terminal_output_decode_key_component(value))
+        })
+        .map(|value| cloud_mcp_workspace_id_match_key(&value))
         .unwrap_or_default();
     let pane_id = cloud_mcp_payload_text(message, &["p", "pane_id", "terminal_id"])
-        .or_else(|| parts.get(2).map(|value| (*value).to_string()))
+        .or_else(|| stream_target.as_ref().map(|target| target.pane_id.clone()))
+        .or_else(|| {
+            parts
+                .get(2)
+                .map(|value| cloud_mcp_terminal_output_decode_key_component(value))
+        })
         .unwrap_or_default();
     let instance_id = cloud_mcp_payload_u64(message, &["i", "terminal_instance_id", "instance_id"])
-        .or_else(|| parts.get(3).and_then(|value| value.parse::<u64>().ok()));
+        .or_else(|| stream_target.as_ref().map(|target| target.instance_id))
+        .or_else(|| {
+            parts.get(3).and_then(|value| {
+                cloud_mcp_terminal_output_decode_key_component(value)
+                    .parse::<u64>()
+                    .ok()
+            })
+        });
     if workspace_id.trim().is_empty() || pane_id.trim().is_empty() {
         return true;
     }
-    let subscription_count = agent_chat_session_set_terminal_observed(
-        &workspace_id,
-        &pane_id,
-        instance_id,
-        active,
-    );
+    let origin = cloud_mcp_payload_text(message, &["origin_connection_id"]);
+    let subscription_count = if heartbeat {
+        agent_chat_session_touch_terminal_observed(
+            &workspace_id,
+            &pane_id,
+            instance_id,
+            origin.as_deref(),
+        )
+    } else {
+        agent_chat_session_set_terminal_observed(
+            &workspace_id,
+            &pane_id,
+            instance_id,
+            origin.as_deref(),
+            active,
+        )
+    };
+    if active || (heartbeat && subscription_count > 0) {
+        cloud_mcp_schedule_terminal_remote_presence_reaper(state);
+    }
+    if !heartbeat {
+        cloud_mcp_schedule_terminal_remote_presence_emit(
+            state,
+            if active {
+                "session_watch"
+            } else {
+                "session_unwatch"
+            },
+        );
+    }
     let triggered = if active {
         CLOUD_MCP_SYNC_STATUS_APP
             .get()
@@ -31147,7 +31735,9 @@ fn cloud_mcp_handle_agent_session_observer_subscription(
         "agent_chat_session.observer_subscription",
         json!({
             "active": active,
+            "heartbeat": heartbeat,
             "instance_id": instance_id,
+            "origin_connection_id": origin,
             "pane_id": pane_id,
             "stream_key": stream_key,
             "subscription_count": subscription_count,
@@ -31414,15 +32004,13 @@ async fn cloud_mcp_publish_terminal_io_ended(
         )
         .await;
     }
-    if let Ok(mut subscriptions) = state.terminal_io_stream_subscriptions.lock() {
-        subscriptions.remove(&stream_key);
-    }
-    if let Ok(mut owners) = state.terminal_io_control_owners.lock() {
-        owners.remove(&stream_key);
-    }
-    if let Ok(mut tails) = state.terminal_io_tail_by_stream.lock() {
-        tails.remove(&stream_key);
-    }
+    let _ = cloud_mcp_clear_terminal_remote_presence_for_terminal(
+        state,
+        workspace_id,
+        pane_id,
+        instance_id,
+        "termio_ended",
+    );
 }
 
 pub(crate) async fn cloud_mcp_revoke_terminal_io_control_for_local_action(
@@ -31448,6 +32036,7 @@ pub(crate) async fn cloud_mcp_revoke_terminal_io_control_for_local_action(
     let Some(previous_owner) = previous_owner else {
         return;
     };
+    cloud_mcp_schedule_terminal_remote_presence_emit(state, "termio_control_local_revoke");
     let target = CloudMcpTerminalIoTarget {
         stream_key,
         device_id,
@@ -31455,7 +32044,7 @@ pub(crate) async fn cloud_mcp_revoke_terminal_io_control_for_local_action(
         pane_id: pane_id.to_string(),
         instance_id,
     };
-    let request = json!({"origin_connection_id": previous_owner});
+    let request = json!({"origin_connection_id": previous_owner.origin});
     let _ = cloud_mcp_send_terminal_io_message(
         state,
         Some(&request),
@@ -33900,16 +34489,35 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
         let runtime = state.inner.lock().await;
         runtime.terminal_contexts.get(&terminal_key).cloned()
     };
-    if let Some(context) = context_entry.as_ref() {
+    let context_workspace_id = context_entry
+        .as_ref()
+        .map(|context| context.workspace_id.trim())
+        .filter(|workspace_id| !workspace_id.is_empty())
+        .map(str::to_string);
+    if let Some(workspace_id) = context_workspace_id.as_deref() {
         cloud_mcp_publish_terminal_io_ended(
             state,
-            &context.workspace_id,
+            workspace_id,
             pane_id,
             instance_id,
             reason,
         )
         .await;
     }
+    let cleanup_workspace_id = context_workspace_id
+        .as_deref()
+        .or_else(|| {
+            let workspace_id = close_context.metadata.workspace_id.trim();
+            (!workspace_id.is_empty()).then_some(workspace_id)
+        })
+        .unwrap_or_default();
+    let _ = cloud_mcp_clear_terminal_remote_presence_for_terminal(
+        state,
+        cleanup_workspace_id,
+        pane_id,
+        instance_id,
+        "terminal_closed",
+    );
     let local_task_id = active_task
         .as_ref()
         .map(|task| task.task_id.clone())
@@ -35144,6 +35752,14 @@ async fn cloud_mcp_apply_desktop_auth_session(
 async fn cloud_mcp_get_status(state: State<'_, CloudMcpState>) -> Result<CloudMcpStatus, String> {
     let _span = BackendCpuSpan::new("cloud_mcp.command.get_status");
     Ok(cloud_mcp_status_snapshot_cached(state.inner()).await)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn terminal_remote_presence_snapshot(
+    state: State<'_, CloudMcpState>,
+) -> Result<Value, String> {
+    let _span = BackendCpuSpan::new("cloud_mcp.command.terminal_remote_presence_snapshot");
+    Ok(cloud_mcp_terminal_remote_presence_snapshot_payload(state.inner()).await)
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -57083,15 +57699,33 @@ mod cloud_mcp_tests {
             .insert(
                 stream_key.clone(),
                 HashMap::from([
-                    ("viewer-a".to_string(), "attach-a".to_string()),
-                    ("viewer-b".to_string(), "attach-b".to_string()),
+                    (
+                        "viewer-a".to_string(),
+                        CloudMcpTerminalIoSubscription {
+                            attachment_id: "attach-a".to_string(),
+                            last_seen_ms: cloud_mcp_now_ms(),
+                        },
+                    ),
+                    (
+                        "viewer-b".to_string(),
+                        CloudMcpTerminalIoSubscription {
+                            attachment_id: "attach-b".to_string(),
+                            last_seen_ms: cloud_mcp_now_ms(),
+                        },
+                    ),
                 ]),
             );
         state
             .terminal_io_control_owners
             .lock()
             .unwrap()
-            .insert(stream_key.clone(), "viewer-a".to_string());
+            .insert(
+                stream_key.clone(),
+                CloudMcpTerminalIoControlOwner {
+                    origin: "viewer-a".to_string(),
+                    last_seen_ms: cloud_mcp_now_ms(),
+                },
+            );
         assert!(cloud_mcp_terminal_output_stream_is_subscribed(
             &state,
             &stream_key,
@@ -57106,6 +57740,270 @@ mod cloud_mcp_tests {
             &stream_key,
             "viewer-b",
         ));
+    }
+
+    #[tokio::test]
+    async fn terminal_remote_presence_ignores_unknown_origin() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let _ = agent_chat_session_clear_observed_terminals();
+        let state = CloudMcpState::new();
+        let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
+            .unwrap_or_else(|| "desktop-primary".to_string());
+        let stream_key = cloud_mcp_terminal_output_stream_key(
+            &device_id,
+            "workspace-unknown-origin",
+            "pane-unknown-origin",
+            10,
+        );
+        state
+            .terminal_io_stream_subscriptions
+            .lock()
+            .unwrap()
+            .insert(
+                stream_key.clone(),
+                HashMap::from([(
+                    "unknown".to_string(),
+                    CloudMcpTerminalIoSubscription {
+                        attachment_id: "attach-unknown".to_string(),
+                        last_seen_ms: cloud_mcp_now_ms(),
+                    },
+                )]),
+            );
+        state
+            .terminal_io_control_owners
+            .lock()
+            .unwrap()
+            .insert(
+                stream_key,
+                CloudMcpTerminalIoControlOwner {
+                    origin: "unknown".to_string(),
+                    last_seen_ms: cloud_mcp_now_ms(),
+                },
+            );
+        agent_chat_session_set_terminal_observed(
+            "workspace-unknown-origin",
+            "pane-unknown-origin",
+            Some(10),
+            None,
+            true,
+        );
+
+        let snapshot = cloud_mcp_terminal_remote_presence_snapshot_payload(&state).await;
+        assert_eq!(
+            snapshot["items"].as_array().map(Vec::len).unwrap_or(0),
+            0
+        );
+        let _ = agent_chat_session_clear_observed_terminals();
+    }
+
+    #[tokio::test]
+    async fn terminal_remote_presence_emits_normalized_workspace_key() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let _ = agent_chat_session_clear_observed_terminals();
+        let state = CloudMcpState::new();
+        let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
+            .unwrap_or_else(|| "desktop-primary".to_string());
+        let workspace_id = "/tmp/diffforge-presence-workspace/";
+        let pane_id = " pane-normalized-presence ";
+        let stream_key =
+            cloud_mcp_terminal_output_stream_key(&device_id, workspace_id, pane_id, 13);
+        state
+            .terminal_io_stream_subscriptions
+            .lock()
+            .unwrap()
+            .insert(
+                stream_key.clone(),
+                HashMap::from([(
+                    "remote-browser-normalized".to_string(),
+                    CloudMcpTerminalIoSubscription {
+                        attachment_id: "attach-normalized".to_string(),
+                        last_seen_ms: cloud_mcp_now_ms(),
+                    },
+                )]),
+            );
+
+        let snapshot = cloud_mcp_terminal_remote_presence_snapshot_payload(&state).await;
+        let items = snapshot["items"].as_array().expect("presence items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0]["workspace_id"],
+            json!(cloud_mcp_workspace_id_match_key(workspace_id))
+        );
+        assert_eq!(items[0]["pane_id"], json!("pane-normalized-presence"));
+        assert_eq!(items[0]["instance_id"], json!(13));
+        assert_eq!(items[0]["stream_key"], json!(stream_key));
+        assert_eq!(items[0]["shell_viewers"], json!(1));
+        let _ = agent_chat_session_clear_observed_terminals();
+    }
+
+    #[test]
+    fn terminal_remote_presence_reaper_drops_stale_origins() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let _ = agent_chat_session_clear_observed_terminals();
+        let state = CloudMcpState::new();
+        let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
+            .unwrap_or_else(|| "desktop-primary".to_string());
+        let workspace_id = "workspace-stale-origin";
+        let pane_id = "pane-stale-origin";
+        let stream_key = cloud_mcp_terminal_output_stream_key(&device_id, workspace_id, pane_id, 11);
+        let last_seen_ms = cloud_mcp_now_ms();
+        state
+            .terminal_io_stream_subscriptions
+            .lock()
+            .unwrap()
+            .insert(
+                stream_key.clone(),
+                HashMap::from([(
+                    "viewer-stale".to_string(),
+                    CloudMcpTerminalIoSubscription {
+                        attachment_id: "attach-stale".to_string(),
+                        last_seen_ms,
+                    },
+                )]),
+            );
+        state
+            .terminal_io_control_owners
+            .lock()
+            .unwrap()
+            .insert(
+                stream_key.clone(),
+                CloudMcpTerminalIoControlOwner {
+                    origin: "viewer-stale".to_string(),
+                    last_seen_ms,
+                },
+            );
+        agent_chat_session_set_terminal_observed(
+            workspace_id,
+            pane_id,
+            Some(11),
+            Some("viewer-stale"),
+            true,
+        );
+
+        let changed = cloud_mcp_prune_terminal_remote_presence_stale_origins_at(
+            &state,
+            cloud_mcp_now_ms()
+                .saturating_add(TERMINAL_REMOTE_PRESENCE_STALE_ORIGIN_TTL_MS)
+                .saturating_add(5_000),
+        );
+        assert!(changed);
+        assert!(state
+            .terminal_io_stream_subscriptions
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert!(state.terminal_io_control_owners.lock().unwrap().is_empty());
+        assert!(!agent_chat_session_terminal_identity_is_observed(
+            workspace_id,
+            pane_id,
+            Some(11),
+        ));
+        let _ = agent_chat_session_clear_observed_terminals();
+    }
+
+    #[test]
+    fn terminal_remote_presence_close_cleanup_clears_pane_identity() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let _ = agent_chat_session_clear_observed_terminals();
+        let state = CloudMcpState::new();
+        let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
+            .unwrap_or_else(|| "desktop-primary".to_string());
+        let workspace_id = "workspace-close-presence";
+        let pane_id = "pane-close-presence";
+        let stream_key = cloud_mcp_terminal_output_stream_key(&device_id, workspace_id, pane_id, 12);
+        state
+            .terminal_io_stream_subscriptions
+            .lock()
+            .unwrap()
+            .insert(
+                stream_key.clone(),
+                HashMap::from([(
+                    "viewer-close".to_string(),
+                    CloudMcpTerminalIoSubscription {
+                        attachment_id: "attach-close".to_string(),
+                        last_seen_ms: cloud_mcp_now_ms(),
+                    },
+                )]),
+            );
+        state
+            .terminal_io_control_owners
+            .lock()
+            .unwrap()
+            .insert(
+                stream_key.clone(),
+                CloudMcpTerminalIoControlOwner {
+                    origin: "viewer-close".to_string(),
+                    last_seen_ms: cloud_mcp_now_ms(),
+                },
+            );
+        state
+            .terminal_io_tail_by_stream
+            .lock()
+            .unwrap()
+            .insert(stream_key.clone(), CloudMcpTerminalIoTail::default());
+        agent_chat_session_set_terminal_observed(
+            workspace_id,
+            pane_id,
+            Some(12),
+            Some("viewer-close"),
+            true,
+        );
+        agent_chat_session_set_terminal_observed(
+            workspace_id,
+            pane_id,
+            None,
+            Some("viewer-close"),
+            true,
+        );
+
+        assert!(cloud_mcp_clear_terminal_remote_presence_for_terminal(
+            &state,
+            "",
+            pane_id,
+            12,
+            "test_terminal_close",
+        ));
+        assert!(state
+            .terminal_io_stream_subscriptions
+            .lock()
+            .unwrap()
+            .get(&stream_key)
+            .is_none());
+        assert!(state
+            .terminal_io_control_owners
+            .lock()
+            .unwrap()
+            .get(&stream_key)
+            .is_none());
+        assert!(state
+            .terminal_io_tail_by_stream
+            .lock()
+            .unwrap()
+            .get(&stream_key)
+            .is_none());
+        assert!(!agent_chat_session_terminal_identity_is_observed(
+            workspace_id,
+            pane_id,
+            Some(12),
+        ));
+        assert!(!agent_chat_session_terminal_identity_is_observed(
+            workspace_id,
+            pane_id,
+            None,
+        ));
+        let _ = agent_chat_session_clear_observed_terminals();
     }
 
     #[test]

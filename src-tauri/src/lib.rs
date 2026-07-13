@@ -10058,6 +10058,7 @@ fn run_app(daemon: bool) {
             cloud_mcp_enter_offline_mode,
             cloud_mcp_get_desktop_device_profile,
             cloud_mcp_get_status,
+            terminal_remote_presence_snapshot,
             cloud_mcp_get_network_diagnostics,
             cloud_mcp_get_cached_workspace_todos,
             cloud_mcp_get_billing_status,

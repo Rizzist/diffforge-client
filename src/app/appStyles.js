@@ -12384,6 +12384,90 @@ export const TerminalStateDebugBadge = styled.span`
   }
 `;
 
+export const TerminalRemotePresenceGroup = styled.span`
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 3px;
+  pointer-events: none;
+`;
+
+/* A remote party actively HOLDING control can type into this terminal, so
+   that one state gets a soft breathing glow to earn the glance; viewing and
+   chat stay calm. */
+const terminalRemoteControlPulse = keyframes`
+  0%, 100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.28); }
+  50% { box-shadow: 0 0 0 3px rgba(245, 158, 11, 0); }
+`;
+
+/* Pane-header pill echoing TerminalStateDebugBadge's shape (18px, pill,
+   10px/850) so remote-web presence sits naturally beside the state chip.
+   Blue = someone viewing the shell over the web, amber = someone holding
+   control (can type), teal = someone watching the chat transcript. */
+export const TerminalRemotePresenceBadge = styled.span`
+  display: inline-flex;
+  min-width: 18px;
+  height: 18px;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  flex: 0 0 auto;
+  padding: 0 6px;
+  border: 1px solid rgba(96, 165, 250, 0.30);
+  border-radius: 999px;
+  color: rgba(191, 219, 254, 0.95);
+  background: rgba(37, 99, 235, 0.16);
+  font-size: 10px;
+  font-weight: 850;
+  letter-spacing: 0;
+  line-height: 1;
+  white-space: nowrap;
+
+  svg {
+    width: 11px;
+    height: 11px;
+    flex: 0 0 auto;
+    opacity: 0.9;
+  }
+
+  &[data-control="true"] {
+    border-color: rgba(245, 158, 11, 0.42);
+    color: rgba(253, 210, 128, 0.98);
+    background: rgba(146, 64, 14, 0.26);
+    animation: ${terminalRemoteControlPulse} 2.4s ease-in-out infinite;
+  }
+
+  &[data-kind="chat"] {
+    border-color: rgba(45, 212, 191, 0.30);
+    color: rgba(153, 246, 228, 0.92);
+    background: rgba(13, 148, 136, 0.16);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(37, 99, 235, 0.26);
+    color: rgba(29, 78, 216, 0.90);
+    background: rgba(219, 234, 254, 0.78);
+  }
+
+  html[data-forge-theme="light"] &[data-control="true"] {
+    border-color: rgba(180, 83, 9, 0.34);
+    color: rgba(146, 64, 14, 0.92);
+    background: rgba(254, 243, 199, 0.88);
+  }
+
+  html[data-forge-theme="light"] &[data-kind="chat"] {
+    border-color: rgba(13, 148, 136, 0.28);
+    color: rgba(15, 118, 110, 0.90);
+    background: rgba(204, 251, 241, 0.82);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    &[data-control="true"] {
+      animation: none;
+    }
+  }
+`;
+
 export const TerminalRestartButton = styled.button`
   display: inline-flex;
   width: 22px;

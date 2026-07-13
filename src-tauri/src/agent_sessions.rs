@@ -204,13 +204,32 @@ struct AgentThreadTranscriptWatchDebounce {
 static AGENT_THREAD_TRANSCRIPT_WATCHES: OnceLock<
     StdMutex<HashMap<String, AgentThreadTranscriptWatchEntry>>,
 > = OnceLock::new();
-static AGENT_CHAT_SESSION_OBSERVED_TERMINALS: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
+#[derive(Clone)]
+struct AgentChatSessionObservedTerminalPresence {
+    workspace_id: String,
+    pane_id: String,
+    instance_id: Option<u64>,
+    origins: Vec<String>,
+}
+
+#[derive(Clone)]
+struct AgentChatSessionObservedTerminal {
+    workspace_id: String,
+    pane_id: String,
+    instance_id: Option<u64>,
+    origins: HashMap<String, u64>,
+}
+
+static AGENT_CHAT_SESSION_OBSERVED_TERMINALS: OnceLock<
+    StdMutex<HashMap<String, AgentChatSessionObservedTerminal>>,
+> = OnceLock::new();
 
 fn agent_chat_session_observed_terminal_key(
     workspace_id: &str,
     pane_id: &str,
     instance_id: Option<u64>,
 ) -> String {
+    let workspace_id = cloud_mcp_workspace_id_match_key(workspace_id);
     format!(
         "{}|{}|{}",
         workspace_id.trim(),
@@ -221,32 +240,156 @@ fn agent_chat_session_observed_terminal_key(
     )
 }
 
+fn agent_chat_session_observer_origin(origin: Option<&str>) -> Option<String> {
+    let origin = origin
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(origin.to_string())
+}
+
 fn agent_chat_session_set_terminal_observed(
     workspace_id: &str,
     pane_id: &str,
     instance_id: Option<u64>,
+    origin: Option<&str>,
     active: bool,
 ) -> usize {
-    let key = agent_chat_session_observed_terminal_key(workspace_id, pane_id, instance_id);
+    let workspace_id = cloud_mcp_workspace_id_match_key(workspace_id);
+    let key = agent_chat_session_observed_terminal_key(&workspace_id, pane_id, instance_id);
     let observed =
-        AGENT_CHAT_SESSION_OBSERVED_TERMINALS.get_or_init(|| StdMutex::new(HashSet::new()));
+        AGENT_CHAT_SESSION_OBSERVED_TERMINALS.get_or_init(|| StdMutex::new(HashMap::new()));
     let Ok(mut observed) = observed.lock() else {
         return 0;
     };
+    let origin = agent_chat_session_observer_origin(origin);
     if active {
-        observed.insert(key);
+        let origin = origin.unwrap_or_else(|| "unknown".to_string());
+        let now_ms = cloud_mcp_now_ms();
+        let entry =
+            observed
+                .entry(key)
+                .or_insert_with(|| AgentChatSessionObservedTerminal {
+                    workspace_id,
+                    pane_id: pane_id.trim().to_string(),
+                    instance_id,
+                    origins: HashMap::new(),
+                });
+        entry.origins.insert(origin, now_ms);
+        entry.origins.len()
     } else {
-        observed.remove(&key);
+        let Some(origin) = origin else {
+            observed.remove(&key);
+            return 0;
+        };
+        let count = if let Some(entry) = observed.get_mut(&key) {
+            entry.origins.remove(&origin);
+            entry.origins.len()
+        } else {
+            0
+        };
+        if count == 0 {
+            observed.remove(&key);
+        }
+        count
     }
-    observed.len()
 }
 
-fn agent_chat_session_clear_observed_terminals() {
+fn agent_chat_session_touch_terminal_observed(
+    workspace_id: &str,
+    pane_id: &str,
+    instance_id: Option<u64>,
+    origin: Option<&str>,
+) -> usize {
+    let Some(origin) = agent_chat_session_observer_origin(origin) else {
+        return 0;
+    };
+    let key = agent_chat_session_observed_terminal_key(workspace_id, pane_id, instance_id);
+    AGENT_CHAT_SESSION_OBSERVED_TERMINALS
+        .get()
+        .and_then(|observed| observed.lock().ok())
+        .and_then(|mut observed| {
+            observed.get_mut(&key).map(|entry| {
+                if let Some(last_seen_ms) = entry.origins.get_mut(&origin) {
+                    *last_seen_ms = cloud_mcp_now_ms();
+                }
+                entry.origins.len()
+            })
+        })
+        .unwrap_or(0)
+}
+
+fn agent_chat_session_clear_observed_terminal_matching(
+    workspace_id: Option<&str>,
+    pane_id: &str,
+    instance_id: Option<u64>,
+) -> bool {
+    let pane_id = pane_id.trim();
+    if pane_id.is_empty() {
+        return false;
+    }
+    let workspace_id = workspace_id
+        .map(cloud_mcp_workspace_id_match_key)
+        .filter(|value| !value.is_empty());
+    let Some(observed) = AGENT_CHAT_SESSION_OBSERVED_TERMINALS.get() else {
+        return false;
+    };
+    let Ok(mut observed) = observed.lock() else {
+        return false;
+    };
+    let mut changed = false;
+    observed.retain(|_, entry| {
+        let workspace_matches = workspace_id.as_ref().is_none_or(|workspace_id| {
+            cloud_mcp_workspace_id_match_key(&entry.workspace_id) == *workspace_id
+        });
+        let remove = workspace_matches
+            && entry.pane_id.trim() == pane_id
+            && entry.instance_id == instance_id;
+        changed |= remove;
+        !remove
+    });
+    changed
+}
+
+fn agent_chat_session_clear_observed_terminals() -> bool {
     if let Some(observed) = AGENT_CHAT_SESSION_OBSERVED_TERMINALS.get() {
         if let Ok(mut observed) = observed.lock() {
+            let changed = !observed.is_empty();
             observed.clear();
+            return changed;
         }
     }
+    false
+}
+
+fn agent_chat_session_prune_stale_observed_terminals(
+    now_ms: u64,
+    stale_after_ms: u64,
+) -> bool {
+    let Some(observed) = AGENT_CHAT_SESSION_OBSERVED_TERMINALS.get() else {
+        return false;
+    };
+    let Ok(mut observed) = observed.lock() else {
+        return false;
+    };
+    let mut changed = false;
+    observed.retain(|_, entry| {
+        let before = entry.origins.len();
+        entry.origins.retain(|_, last_seen_ms| {
+            now_ms.saturating_sub(*last_seen_ms) < stale_after_ms
+        });
+        changed |= entry.origins.len() != before;
+        let keep = !entry.origins.is_empty();
+        changed |= !keep;
+        keep
+    });
+    changed
+}
+
+fn agent_chat_session_has_observed_terminal_origins() -> bool {
+    AGENT_CHAT_SESSION_OBSERVED_TERMINALS
+        .get()
+        .and_then(|observed| observed.lock().ok())
+        .is_some_and(|observed| observed.values().any(|entry| !entry.origins.is_empty()))
 }
 
 fn agent_chat_session_terminal_identity_is_observed(
@@ -258,7 +401,11 @@ fn agent_chat_session_terminal_identity_is_observed(
     AGENT_CHAT_SESSION_OBSERVED_TERMINALS
         .get()
         .and_then(|observed| observed.lock().ok())
-        .is_some_and(|observed| observed.contains(&key))
+        .is_some_and(|observed| {
+            observed
+                .get(&key)
+                .is_some_and(|entry| !entry.origins.is_empty())
+        })
 }
 
 fn agent_chat_session_terminal_is_observed(context: &AgentThreadTranscriptWatchContext) -> bool {
@@ -267,6 +414,30 @@ fn agent_chat_session_terminal_is_observed(context: &AgentThreadTranscriptWatchC
         &context.pane_id,
         context.instance_id,
     )
+}
+
+fn agent_chat_session_observed_terminal_presence_entries(
+) -> Vec<AgentChatSessionObservedTerminalPresence> {
+    AGENT_CHAT_SESSION_OBSERVED_TERMINALS
+        .get()
+        .and_then(|observed| observed.lock().ok())
+        .map(|observed| {
+            observed
+                .values()
+                .filter(|entry| !entry.origins.is_empty())
+                .map(|entry| {
+                    let mut origins = entry.origins.keys().cloned().collect::<Vec<_>>();
+                    origins.sort();
+                    AgentChatSessionObservedTerminalPresence {
+                        workspace_id: entry.workspace_id.clone(),
+                        pane_id: entry.pane_id.clone(),
+                        instance_id: entry.instance_id,
+                        origins,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 fn codex_home_dir() -> Option<PathBuf> {
@@ -3893,13 +4064,25 @@ mod agent_sessions_tests {
             pane_id,
             Some(7),
         ));
-        agent_chat_session_set_terminal_observed(&workspace_id, pane_id, Some(7), true);
+        agent_chat_session_set_terminal_observed(
+            &workspace_id,
+            pane_id,
+            Some(7),
+            Some("viewer-a"),
+            true,
+        );
         assert!(agent_chat_session_terminal_identity_is_observed(
             &workspace_id,
             pane_id,
             Some(7),
         ));
-        agent_chat_session_set_terminal_observed(&workspace_id, pane_id, Some(7), false);
+        agent_chat_session_set_terminal_observed(
+            &workspace_id,
+            pane_id,
+            Some(7),
+            Some("viewer-a"),
+            false,
+        );
         assert!(!agent_chat_session_terminal_identity_is_observed(
             &workspace_id,
             pane_id,
