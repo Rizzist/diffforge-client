@@ -178,3 +178,38 @@ test("an expired used-kind window assumes zero used until refresh", () => {
   assert.equal(projected.display_percent, 0);
   assert.equal(projected.client_reset_pending, true);
 });
+
+test("an expired window drops the dead window's pace verdict with the percents", () => {
+  const projected = projectProviderLimitForDisplay({
+    ...knownClaudeSession,
+    display_percent: 16,
+    display_percent_kind: "remaining",
+    reset_at: "unix:1000",
+    pace_status: "over_pace",
+    pace_delta_percent: 549,
+    pace_exhausts_before_reset: true,
+    status_label: "Pace will exhaust before reset",
+  }, 1_100_000);
+
+  /* Pace belongs to the window it was measured in: an assumed-fresh 100%
+     window has no observed usage, so its pace is unknown — never red. */
+  assert.equal(projected.remaining_percent, 100);
+  assert.equal(projected.pace_status, "unknown");
+  assert.equal(projected.pace_delta_percent, null);
+  assert.equal(projected.pace_exhausts_before_reset, false);
+  assert.equal(projected.status_label, "");
+});
+
+test("a live mid-window sample keeps its pace verdict", () => {
+  const projected = projectProviderLimitForDisplay({
+    ...knownClaudeSession,
+    display_percent: 16,
+    display_percent_kind: "remaining",
+    reset_at: "unix:2000",
+    pace_status: "over_pace",
+    pace_delta_percent: 43,
+  }, 1_100_000);
+
+  assert.equal(projected.pace_status, "over_pace");
+  assert.equal(projected.pace_delta_percent, 43);
+});

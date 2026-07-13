@@ -19,6 +19,8 @@ const TERMINAL_CODEX_APP_SERVER_READY_TIMEOUT_MS: u64 = 8_000;
 const TERMINAL_CODEX_APP_SERVER_READY_POLL_MS: u64 = 80;
 const TERMINAL_CODEX_APP_SERVER_CONNECT_ATTEMPTS: usize = 50;
 const TERMINAL_CODEX_APP_SERVER_CONNECT_RETRY_MS: u64 = 100;
+const TERMINAL_CODEX_HOOK_TRUST_DISCOVERY_DELAYS_MS: &[u64] =
+    &[0, 200, 600, 1_200, 2_500, 5_000, 8_000];
 // Agent-start commands must never hang the frontend launch pipeline: a
 // wedged lifecycle holder (slow terminal_open, close teardown) or a stuck
 // pane future previously left the invoke pending forever, so panes sat at
@@ -26,6 +28,132 @@ const TERMINAL_CODEX_APP_SERVER_CONNECT_RETRY_MS: u64 = 100;
 // frontend's retry/backoff loop recover.
 const TERMINAL_AGENT_START_LIFECYCLE_LOCK_TIMEOUT_SECS: u64 = 60;
 const TERMINAL_AGENT_START_PANE_TIMEOUT_SECS: u64 = 120;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalCodexHookTrustDiscoveryState {
+    Pending,
+    Open,
+    Resolved,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TerminalCodexHookTrustDiscoveryEntry {
+    generation: u64,
+    state: TerminalCodexHookTrustDiscoveryState,
+}
+
+static TERMINAL_CODEX_HOOK_TRUST_DISCOVERY_GENERATION: AtomicU64 = AtomicU64::new(0);
+static TERMINAL_CODEX_HOOK_TRUST_DISCOVERY_STATES: OnceLock<
+    StdMutex<HashMap<(String, u64), TerminalCodexHookTrustDiscoveryEntry>>,
+> = OnceLock::new();
+
+fn terminal_codex_hook_trust_discovery_states(
+) -> &'static StdMutex<HashMap<(String, u64), TerminalCodexHookTrustDiscoveryEntry>> {
+    TERMINAL_CODEX_HOOK_TRUST_DISCOVERY_STATES.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn terminal_codex_hook_trust_discovery_begin(pane_id: &str, instance_id: u64) -> u64 {
+    let generation = TERMINAL_CODEX_HOOK_TRUST_DISCOVERY_GENERATION
+        .fetch_add(1, Ordering::SeqCst)
+        .saturating_add(1);
+    if let Ok(mut states) = terminal_codex_hook_trust_discovery_states().lock() {
+        states.retain(|(candidate_pane_id, _), _| candidate_pane_id != pane_id);
+        states.insert(
+            (pane_id.to_string(), instance_id),
+            TerminalCodexHookTrustDiscoveryEntry {
+                generation,
+                state: TerminalCodexHookTrustDiscoveryState::Pending,
+            },
+        );
+    }
+    generation
+}
+
+fn terminal_codex_hook_trust_discovery_set(
+    pane_id: &str,
+    instance_id: u64,
+    state: TerminalCodexHookTrustDiscoveryState,
+) {
+    if state == TerminalCodexHookTrustDiscoveryState::Pending {
+        terminal_codex_hook_trust_discovery_begin(pane_id, instance_id);
+        return;
+    }
+    if let Ok(mut states) = terminal_codex_hook_trust_discovery_states().lock() {
+        if let Some(entry) = states.get_mut(&(pane_id.to_string(), instance_id)) {
+            entry.state = state;
+        }
+    }
+}
+
+fn terminal_codex_hook_trust_discovery_snapshot(
+    pane_id: &str,
+    instance_id: u64,
+) -> Option<TerminalCodexHookTrustDiscoveryEntry> {
+    terminal_codex_hook_trust_discovery_states()
+        .lock()
+        .ok()
+        .and_then(|states| states.get(&(pane_id.to_string(), instance_id)).copied())
+}
+
+fn terminal_codex_hook_trust_discovery_transition(
+    pane_id: &str,
+    instance_id: u64,
+    generation: u64,
+    expected: &[TerminalCodexHookTrustDiscoveryState],
+    state: TerminalCodexHookTrustDiscoveryState,
+) -> bool {
+    let Ok(mut states) = terminal_codex_hook_trust_discovery_states().lock() else {
+        return false;
+    };
+    let Some(entry) = states.get_mut(&(pane_id.to_string(), instance_id)) else {
+        return false;
+    };
+    if entry.generation != generation || !expected.contains(&entry.state) {
+        return false;
+    }
+    entry.state = state;
+    true
+}
+
+fn terminal_codex_hook_trust_discovery_blocks_idle(pane_id: &str, instance_id: u64) -> bool {
+    terminal_codex_hook_trust_discovery_state(pane_id, instance_id).is_some_and(|state| {
+        matches!(
+            state,
+            TerminalCodexHookTrustDiscoveryState::Pending
+                | TerminalCodexHookTrustDiscoveryState::Open
+        )
+    })
+}
+
+fn terminal_codex_hook_trust_discovery_state(
+    pane_id: &str,
+    instance_id: u64,
+) -> Option<TerminalCodexHookTrustDiscoveryState> {
+    terminal_codex_hook_trust_discovery_snapshot(pane_id, instance_id).map(|entry| entry.state)
+}
+
+fn terminal_codex_hook_trust_discovery_clear(pane_id: &str, instance_id: u64) {
+    if let Ok(mut states) = terminal_codex_hook_trust_discovery_states().lock() {
+        states.remove(&(pane_id.to_string(), instance_id));
+    }
+}
+
+fn terminal_codex_hook_trust_discovery_clear_generation(
+    pane_id: &str,
+    instance_id: u64,
+    generation: u64,
+) {
+    if let Ok(mut states) = terminal_codex_hook_trust_discovery_states().lock() {
+        let key = (pane_id.to_string(), instance_id);
+        if states
+            .get(&key)
+            .is_some_and(|entry| entry.generation == generation)
+        {
+            states.remove(&key);
+        }
+    }
+}
 
 fn terminal_output_latest_working_indicator_index(text: &str) -> Option<usize> {
     let lower = text.to_lowercase();
@@ -3318,6 +3446,7 @@ fn cleanup_terminal_instance_with_context(
         codex_gateway,
         app_control_mcp_requested: _,
     } = instance;
+    terminal_codex_hook_trust_discovery_clear(&metadata.pane_id, id);
     if let Ok(mut gateway) = codex_gateway.lock() {
         if let Some(gateway) = gateway.take() {
             log_terminal_status_event(
@@ -5482,6 +5611,9 @@ fn spawn_terminal_reader(
         pane_id: String,
         instance_id: u64,
     ) {
+        if terminal_codex_hook_trust_discovery_blocks_idle(&pane_id, instance_id) {
+            return;
+        }
         if !terminal_headless_tail_has_prompt_marker(&headless_output) {
             return;
         }
@@ -7413,6 +7545,7 @@ async fn terminal_open(
         .unwrap_or(session_mode);
     let provider_session_discovery_started_at_ms = terminal_now_ms();
     let mut codex_gateway_for_instance: Option<TerminalCodexGatewayHandle> = None;
+    let mut codex_hook_trust_query_for_instance: Option<TerminalCodexHookTrustQuery> = None;
 
     let shell_pty = is_prewarm_pty || plain_shell;
     let warm_pty = if shell_pty {
@@ -7619,6 +7752,16 @@ async fn terminal_open(
                     );
                 }
             }
+            codex_hook_trust_query_for_instance = Some(terminal_codex_hook_trust_query(
+                &command_path,
+                &launch_env_vars,
+                terminal_coordination.as_ref(),
+            ));
+            terminal_codex_hook_trust_discovery_set(
+                &pane_id,
+                instance_id,
+                TerminalCodexHookTrustDiscoveryState::Pending,
+            );
         }
 
         let warm_pty = match create_agent_terminal_pty(
@@ -7631,6 +7774,7 @@ async fn terminal_open(
         ) {
             Ok(warm_pty) => warm_pty,
             Err(error) => {
+                terminal_codex_hook_trust_discovery_clear(&pane_id, instance_id);
                 if let Some(gateway) = codex_gateway_for_instance.take() {
                     gateway.shutdown();
                 }
@@ -7644,6 +7788,7 @@ async fn terminal_open(
     };
 
     if let Err(error) = ensure_app_not_shutting_down("terminal open") {
+        terminal_codex_hook_trust_discovery_clear(&pane_id, instance_id);
         cleanup_warm_pty_with_context(warm_pty);
         return Err(error);
     }
@@ -7805,15 +7950,17 @@ async fn terminal_open(
         activity_hook_poll_ms,
     );
     if terminal_metadata_is_codex(&terminal_metadata_for_log) {
-        spawn_terminal_codex_hook_trust_discovery(
-            app.clone(),
-            Arc::clone(&state.terminals),
-            cloud_mcp_state.inner().clone(),
-            pane_id.clone(),
-            instance_id,
-            process_working_directory.clone(),
-            terminal_codex_home_for_coordination(terminal_coordination.as_ref()),
-        );
+        if let Some(query) = codex_hook_trust_query_for_instance {
+            spawn_terminal_codex_hook_trust_discovery(
+                app.clone(),
+                Arc::clone(&state.terminals),
+                cloud_mcp_state.inner().clone(),
+                pane_id.clone(),
+                instance_id,
+                process_working_directory.clone(),
+                query,
+            );
+        }
     }
     spawn_terminal_codex_session_discovery(
         app.clone(),
@@ -8465,6 +8612,13 @@ async fn terminal_start_agent(
             }
         }
     }
+    let codex_hook_trust_query = (definition.id == "codex").then(|| {
+        terminal_codex_hook_trust_query(
+            &command_path,
+            &launch_env_vars,
+            instance.coordination.as_ref(),
+        )
+    });
     let input = terminal_agent_start_input_with_env_in_directory(
         &command_path,
         &launch_args,
@@ -8489,10 +8643,18 @@ async fn terminal_start_agent(
     }
 
     let mut writer = instance.writer.lock().await;
+    if codex_hook_trust_query.is_some() {
+        terminal_codex_hook_trust_discovery_set(
+            &pane_id,
+            instance.id,
+            TerminalCodexHookTrustDiscoveryState::Pending,
+        );
+    }
 
     if let Err(error) =
         write_agent_start_input_to_writer(writer.as_mut(), &input, "terminal agent launch")
     {
+        terminal_codex_hook_trust_discovery_clear(&pane_id, instance.id);
         if let Some(gateway) = codex_gateway.take() {
             gateway.shutdown();
         }
@@ -8504,7 +8666,7 @@ async fn terminal_start_agent(
     if let Some(gateway) = codex_gateway.take() {
         terminal_replace_codex_gateway(&instance, gateway)?;
     }
-    if definition.id == "codex" {
+    if let Some(query) = codex_hook_trust_query {
         spawn_terminal_codex_hook_trust_discovery(
             app.clone(),
             Arc::clone(&state.terminals),
@@ -8512,7 +8674,7 @@ async fn terminal_start_agent(
             pane_id.clone(),
             instance.id,
             instance.working_directory.as_ref().to_path_buf(),
-            terminal_codex_home_for_coordination(instance.coordination.as_ref()),
+            query,
         );
     }
 
@@ -9031,6 +9193,13 @@ async fn start_terminal_agent_in_prepared_pty(
                 }
             }
         }
+        let codex_hook_trust_query = (definition.id == "codex").then(|| {
+            terminal_codex_hook_trust_query(
+                &command_path,
+                &launch_env_vars,
+                instance.coordination.as_ref(),
+            )
+        });
         let input = terminal_agent_start_input_with_env_in_directory(
             &command_path,
             &launch_args,
@@ -9056,6 +9225,13 @@ async fn start_terminal_agent_in_prepared_pty(
         drop(child_guard);
         let mut writer = instance.writer.lock().await;
         let provider_session_discovery_started_at_ms = terminal_now_ms();
+        if codex_hook_trust_query.is_some() {
+            terminal_codex_hook_trust_discovery_set(
+                &pane_id,
+                instance.id,
+                TerminalCodexHookTrustDiscoveryState::Pending,
+            );
+        }
 
         match write_agent_start_input_to_writer(writer.as_mut(), &input, "terminal agent launch") {
             Ok(()) => {
@@ -9119,7 +9295,7 @@ async fn start_terminal_agent_in_prepared_pty(
                     "terminal_start_agent",
                     &TERMINAL_CODEX_SESSION_DISCOVERY_DELAYS_MS,
                 );
-                if definition.id == "codex" {
+                if let Some(query) = codex_hook_trust_query {
                     spawn_terminal_codex_hook_trust_discovery(
                         app.clone(),
                         Arc::clone(&terminals),
@@ -9127,7 +9303,7 @@ async fn start_terminal_agent_in_prepared_pty(
                         pane_id.clone(),
                         instance.id,
                         instance.working_directory.as_ref().to_path_buf(),
-                        terminal_codex_home_for_coordination(instance.coordination.as_ref()),
+                        query,
                     );
                 }
                 return TerminalStartAgentPaneResult {
@@ -9141,6 +9317,7 @@ async fn start_terminal_agent_in_prepared_pty(
                 };
             }
             Err(error) => {
+                terminal_codex_hook_trust_discovery_clear(&pane_id, instance.id);
                 if let Some(gateway) = codex_gateway.take() {
                     gateway.shutdown();
                 }
@@ -16286,8 +16463,22 @@ fn terminal_structured_interaction_reconcile(
                 (same_terminal && same_request).then(|| id.clone())
             })
             .collect::<Vec<_>>();
+        let resolved_codex_hook_trust = removed_ids.iter().any(|id| {
+            interactions.get(id).is_some_and(|interaction| {
+                interaction
+                    .provider_request_id
+                    .starts_with("codex-hook-trust-")
+            })
+        });
         interactions.retain(|id, _| !removed_ids.contains(id));
         drop(interactions);
+        if resolved_codex_hook_trust {
+            terminal_codex_hook_trust_discovery_set(
+                &payload.pane_id,
+                payload.instance_id,
+                TerminalCodexHookTrustDiscoveryState::Resolved,
+            );
+        }
         if !removed_ids.is_empty() {
             if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
                 for id in removed_ids {
@@ -16536,6 +16727,32 @@ async fn process_terminal_activity_hook_event(
         );
         return;
     };
+    if terminal_codex_hook_trust_discovery_blocks_idle(pane_id, instance_id)
+        && terminal_activity_payload_is_idle_ready(&payload)
+    {
+        let hook_key = terminal_activity_hook_name_key(&payload.hook_event_name);
+        if matches!(hook_key.as_str(), "sessionstart" | "sessionstarted") {
+            // A real provider SessionStart can only run after the native hook
+            // trust gate has been answered.  It is deterministic resolution,
+            // unlike PTY prompt text, and may now establish the ready state.
+            terminal_codex_hook_trust_discovery_set(
+                pane_id,
+                instance_id,
+                TerminalCodexHookTrustDiscoveryState::Resolved,
+            );
+        } else {
+            log_terminal_status_event(
+                "backend.codex_hook_trust.idle_transition_ignored",
+                json!({
+                    "hook_event_name": payload.hook_event_name.clone(),
+                    "instance_id": instance_id,
+                    "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                    "source": source,
+                }),
+            );
+            return;
+        }
+    }
     let current_runtime = terminal_runtime_snapshot(instance);
     let current_runtime_is_starting = terminal_runtime_snapshot_is_starting(&current_runtime);
     let current_runtime_is_busy_turn = terminal_runtime_snapshot_is_busy_turn(&current_runtime);
@@ -16762,9 +16979,10 @@ fn spawn_terminal_activity_hook_watcher(
             let prompt_marker_visible = terminal_headless_tail_has_prompt_marker(&headless_output);
             let live_process = terminal_activity_watchdog_child_is_live(&instance).await;
             let starting_age_ms = now_ms.saturating_sub(runtime.updated_at_ms);
-            let watchdog_action = terminal_activity_provider_allows_pty_lifecycle_recovery(
-                &instance.metadata,
-            )
+            let watchdog_action = (!terminal_codex_hook_trust_discovery_blocks_idle(
+                &pane_id,
+                instance_id,
+            ) && terminal_activity_provider_allows_pty_lifecycle_recovery(&instance.metadata))
             .then(|| {
                 terminal_activity_watchdog_starting_action(
                     &runtime,
@@ -17001,6 +17219,7 @@ fn spawn_terminal_activity_hook_watcher(
                 "poll_ms": poll_ms,
             }),
         );
+        terminal_codex_hook_trust_discovery_clear(&pane_id, instance_id);
         let state = app.state::<TerminalState>();
         if let Ok(mut tokens) = state.terminal_activity_transport_tokens.lock() {
             tokens.remove(&terminal_output_transport_key(&pane_id, instance_id));
@@ -17944,6 +18163,161 @@ fn terminal_codex_app_server_enable_tui_capabilities(message: &mut Value) {
     );
 }
 
+fn terminal_codex_gateway_message_completes_startup_hook_review(message: &Value) -> bool {
+    message.get("id").is_some()
+        && matches!(
+            message.get("method").and_then(Value::as_str),
+            Some("thread/start" | "thread/resume" | "thread/fork")
+        )
+}
+
+fn terminal_codex_gateway_resolve_startup_hook_review(
+    pane_id: &str,
+    instance_id: u64,
+    message: &Value,
+) -> bool {
+    if !terminal_codex_gateway_message_completes_startup_hook_review(message) {
+        return false;
+    }
+    let Some(discovery) =
+        terminal_codex_hook_trust_discovery_snapshot(pane_id, instance_id)
+    else {
+        return false;
+    };
+    terminal_codex_hook_trust_discovery_transition(
+        pane_id,
+        instance_id,
+        discovery.generation,
+        &[
+            TerminalCodexHookTrustDiscoveryState::Pending,
+            TerminalCodexHookTrustDiscoveryState::Open,
+        ],
+        TerminalCodexHookTrustDiscoveryState::Resolved,
+    )
+}
+
+async fn terminal_codex_gateway_publish_startup_hook_review_resolved(
+    app: AppHandle,
+    pane_id: String,
+    instance_id: u64,
+    method: String,
+) {
+    let state = app.state::<TerminalState>();
+    let cloud_mcp_state = app.state::<CloudMcpState>();
+    let Some(instance) = terminal_activity_hook_current_instance(
+        &state.terminals,
+        &pane_id,
+        instance_id,
+    )
+    .await
+    else {
+        return;
+    };
+    let interactions = state
+        .terminal_structured_interactions
+        .lock()
+        .ok()
+        .map(|interactions| {
+            interactions
+                .values()
+                .filter(|interaction| {
+                    interaction.pane_id == pane_id
+                        && interaction.instance_id == instance_id
+                        && interaction
+                            .provider_request_id
+                            .starts_with("codex-hook-trust-")
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let resolved_count = interactions.len();
+    for interaction in interactions {
+        terminal_structured_interaction_publish_answered(
+            &app,
+            state.inner(),
+            cloud_mcp_state.inner(),
+            &instance,
+            &interaction,
+            "native_tui",
+            "codex-app-server-startup-hook-review-resolved",
+        )
+        .await;
+    }
+    log_terminal_status_event(
+        "backend.codex_hook_trust.native_tui_resolved",
+        json!({
+            "instance_id": instance_id,
+            "method": method,
+            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+            "structured_interactions_resolved": resolved_count,
+        }),
+    );
+}
+
+async fn terminal_codex_hook_trust_withdraw_stale_publication(
+    app: &AppHandle,
+    cloud_mcp_state: &CloudMcpState,
+    pane_id: &str,
+    instance_id: u64,
+    provider_request_id: &str,
+    terminal_closed: bool,
+    reason: &str,
+) {
+    // Publication and terminal cleanup are separate asynchronous paths. If
+    // cleanup wins after publication cloned the terminal, remove only this
+    // exact interaction and update the already-existing cloud row directly.
+    // Never run a removed TerminalInstance through the normal activity path:
+    // that would project it as thinking/running and could race after close.
+    let state = app.state::<TerminalState>();
+    let removed_ids = state
+        .terminal_structured_interactions
+        .lock()
+        .ok()
+        .map(|mut interactions| {
+            let removed_ids = interactions
+                .iter()
+                .filter_map(|(id, interaction)| {
+                    (interaction.pane_id == pane_id
+                        && interaction.instance_id == instance_id
+                        && interaction.provider_request_id == provider_request_id)
+                        .then(|| id.clone())
+                })
+                .collect::<Vec<_>>();
+            interactions.retain(|id, _| !removed_ids.contains(id));
+            removed_ids
+        })
+        .unwrap_or_default();
+    if !removed_ids.is_empty() {
+        if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
+            for interaction_id in &removed_ids {
+                waiters.remove(interaction_id);
+            }
+        }
+    }
+    let cloud_changed = cloud_mcp_withdraw_stale_terminal_prompt(
+        cloud_mcp_state,
+        pane_id,
+        instance_id,
+        provider_request_id,
+        terminal_closed,
+        reason,
+    )
+    .await;
+    log_terminal_status_event(
+        "backend.codex_hook_trust.stale_publication_withdrawn",
+        json!({
+            "cloud_changed": cloud_changed,
+            "instance_id": instance_id,
+            "local_interactions_removed": removed_ids.len(),
+            "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+            "provider_request_id": provider_request_id,
+            "reason": reason,
+            "terminal_closed": terminal_closed,
+        }),
+    );
+}
+
 fn terminal_codex_gateway_claim(
     pending: &Arc<StdMutex<HashMap<String, TerminalCodexGatewayPendingRequest>>>,
     request_key: &str,
@@ -18201,6 +18575,27 @@ async fn terminal_codex_gateway_connection(
                         if let Some(value) = value.as_mut() {
                             terminal_codex_app_server_enable_tui_capabilities(value);
                         }
+                        if let Some(value) = value.as_ref() {
+                            if terminal_codex_gateway_resolve_startup_hook_review(
+                                &pane_id,
+                                instance_id,
+                                value,
+                            ) {
+                                let method = value
+                                    .get("method")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                tauri::async_runtime::spawn(
+                                    terminal_codex_gateway_publish_startup_hook_review_resolved(
+                                        app.clone(),
+                                        pane_id.clone(),
+                                        instance_id,
+                                        method,
+                                    ),
+                                );
+                            }
+                        }
                         let is_response = value.as_ref().is_some_and(|value| {
                             value.get("method").is_none()
                                 && value.get("id").and_then(terminal_codex_app_server_request_id_key).is_some()
@@ -18399,6 +18794,7 @@ fn terminal_spawn_codex_app_server_process(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    apply_desktop_command_environment(&mut command);
     for (key, value) in env_vars {
         if !key.trim().is_empty() {
             command.env(key, value);
@@ -20329,6 +20725,14 @@ fn terminal_codex_hook_trust_prompt_answer_input(key: &str) -> Option<String> {
     }
 }
 
+fn terminal_codex_hook_trust_answer_keeps_open(
+    provider_request_id: &str,
+    option_id: &str,
+) -> bool {
+    provider_request_id.starts_with("codex-hook-trust-")
+        && terminal_activity_hook_prompt_option_id(option_id) == "review_hooks"
+}
+
 fn terminal_codex_hook_trust_prompt_options() -> Vec<Value> {
     vec![
         json!({
@@ -20415,8 +20819,8 @@ fn terminal_codex_app_server_response(
     }
 }
 
-fn terminal_codex_hooks_requiring_trust(catalog: &Value) -> Vec<Value> {
-    catalog
+fn terminal_codex_catalog_hooks(catalog: &Value) -> Vec<Value> {
+    let mut hooks = catalog
         .get("data")
         .and_then(Value::as_array)
         .into_iter()
@@ -20424,6 +20828,28 @@ fn terminal_codex_hooks_requiring_trust(catalog: &Value) -> Vec<Value> {
         .flat_map(|row| row.get("hooks").and_then(Value::as_array).into_iter().flatten())
         .filter(|hook| hook.get("enabled").and_then(Value::as_bool) != Some(false))
         .filter(|hook| hook.get("isManaged").and_then(Value::as_bool) != Some(true))
+        .cloned()
+        .collect::<Vec<_>>();
+    // hooks/list order is not an API guarantee.  Stable ordering keeps the
+    // interaction id/revision unchanged across retries without collapsing
+    // profile-scoped entries that Codex presents as distinct native rows.
+    hooks.sort_by(|left, right| {
+        terminal_codex_hook_identity(left).cmp(&terminal_codex_hook_identity(right))
+    });
+    hooks
+}
+
+fn terminal_codex_hook_identity(hook: &Value) -> String {
+    ["key", "currentHash", "eventName", "sourcePath", "trustStatus"]
+        .iter()
+        .map(|key| hook.get(*key).and_then(Value::as_str).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn terminal_codex_hooks_requiring_trust(catalog: &Value) -> Vec<Value> {
+    terminal_codex_catalog_hooks(catalog)
+        .into_iter()
         .filter(|hook| {
             !matches!(
                 hook.get("trustStatus")
@@ -20435,15 +20861,73 @@ fn terminal_codex_hooks_requiring_trust(catalog: &Value) -> Vec<Value> {
                 "approved" | "trusted"
             )
         })
-        .cloned()
         .collect()
+}
+
+#[derive(Clone, Debug)]
+struct TerminalCodexHookTrustQuery {
+    command_path: String,
+    env_vars: Vec<(String, String)>,
+    codex_home: Option<PathBuf>,
+    profile: Option<String>,
+}
+
+#[derive(Debug)]
+struct TerminalCodexHookTrustCatalog {
+    configured_hook_count: usize,
+    untrusted_hooks: Vec<Value>,
+}
+
+fn terminal_launch_env_value(env_vars: &[(String, String)], key: &str) -> Option<String> {
+    env_vars.iter().rev().find_map(|(candidate, value)| {
+        (candidate == key)
+            .then(|| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn terminal_codex_hook_trust_query(
+    command_path: &str,
+    env_vars: &[(String, String)],
+    coordination: Option<&TerminalCoordinationSession>,
+) -> TerminalCodexHookTrustQuery {
+    let coordination_value = |key: &str| {
+        coordination.and_then(|coordination| terminal_coordination_env_value(coordination, key))
+    };
+    let codex_home = terminal_launch_env_value(env_vars, "DIFFFORGE_CODEX_HOME")
+        .or_else(|| terminal_launch_env_value(env_vars, "CODEX_HOME"))
+        .or_else(|| coordination_value("DIFFFORGE_CODEX_HOME"))
+        .or_else(|| coordination_value("CODEX_HOME"))
+        .map(PathBuf::from)
+        .or_else(|| agent_accounts_active_home_for_kind("codex"));
+    let profile = terminal_launch_env_value(env_vars, "DIFFFORGE_CODEX_PROFILE")
+        .or_else(|| coordination_value("DIFFFORGE_CODEX_PROFILE"));
+    TerminalCodexHookTrustQuery {
+        command_path: command_path.to_string(),
+        env_vars: env_vars.to_vec(),
+        codex_home,
+        profile,
+    }
 }
 
 fn terminal_codex_untrusted_hooks(
     workspace_root: &Path,
-    terminal_codex_home: Option<&Path>,
-) -> Result<Vec<Value>, String> {
-    let mut command = Command::new("codex");
+    query: &TerminalCodexHookTrustQuery,
+) -> Result<TerminalCodexHookTrustCatalog, String> {
+    #[cfg(windows)]
+    let mut command = {
+        let lower = query.command_path.to_ascii_lowercase();
+        if lower.ends_with(".cmd") || lower.ends_with(".bat") {
+            let mut command = Command::new("cmd.exe");
+            command.args(["/D", "/S", "/C", query.command_path.as_str()]);
+            command
+        } else {
+            Command::new(&query.command_path)
+        }
+    };
+    #[cfg(not(windows))]
+    let mut command = Command::new(&query.command_path);
     command
         .arg("app-server")
         .arg("--stdio")
@@ -20451,14 +20935,18 @@ fn terminal_codex_untrusted_hooks(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    // Coordination uses an isolated CODEX_HOME per workspace/slot. Hook trust
-    // is stored in that exact home, so querying the global active-account home
-    // can report every hook as trusted while the real TUI is blocked on a
-    // different catalog. Always prefer the environment bound to this pane.
-    if let Some(codex_home) = terminal_codex_home
-        .map(Path::to_path_buf)
-        .or_else(|| agent_accounts_active_home_for_kind("codex"))
-    {
+    // app-server is not a runtime command and rejects --profile.  The profile
+    // name remains in diagnostics, while refresh-time canonicalization keeps
+    // hook definitions in the home-level hooks.json catalog app-server reads.
+    apply_desktop_command_environment(&mut command);
+    for (key, value) in &query.env_vars {
+        if !key.trim().is_empty() {
+            command.env(key, value);
+        }
+    }
+    // The launch environment is authoritative for account/profile selection,
+    // including resume-specific homes which are not stored on coordination.
+    if let Some(codex_home) = query.codex_home.as_deref() {
         command.env("CODEX_HOME", codex_home);
     }
     let mut child = command
@@ -20506,7 +20994,11 @@ fn terminal_codex_untrusted_hooks(
             .and_then(|_| stdin.flush())
             .map_err(|error| format!("Unable to query Codex hook trust: {error}"))?;
         let catalog = terminal_codex_app_server_response(&receiver, 2, Duration::from_secs(5))?;
-        Ok(terminal_codex_hooks_requiring_trust(&catalog))
+        let configured_hook_count = terminal_codex_catalog_hooks(&catalog).len();
+        Ok(TerminalCodexHookTrustCatalog {
+            configured_hook_count,
+            untrusted_hooks: terminal_codex_hooks_requiring_trust(&catalog),
+        })
     })();
     drop(stdin);
     let _ = child.kill();
@@ -20522,113 +21014,364 @@ fn spawn_terminal_codex_hook_trust_discovery(
     pane_id: String,
     instance_id: u64,
     workspace_root: PathBuf,
-    terminal_codex_home: Option<PathBuf>,
+    query: TerminalCodexHookTrustQuery,
 ) {
+    // Launch prepares this generation before writing the native start input.
+    // If it was already resolved or cleared, this spawn is stale and must not
+    // recreate the latch after an answer, cleanup, or pane replacement.
+    let Some(discovery) = terminal_codex_hook_trust_discovery_snapshot(&pane_id, instance_id)
+    else {
+        return;
+    };
+    if discovery.state != TerminalCodexHookTrustDiscoveryState::Pending {
+        return;
+    }
+    let generation = discovery.generation;
     tauri::async_runtime::spawn(async move {
-        let query_root = workspace_root.clone();
-        let query_home = terminal_codex_home.clone();
-        let hooks = match tauri::async_runtime::spawn_blocking(move || {
-            terminal_codex_untrusted_hooks(&query_root, query_home.as_deref())
-        })
-        .await
+        let mut last_error = None::<String>;
+        for (attempt_index, delay_ms) in TERMINAL_CODEX_HOOK_TRUST_DISCOVERY_DELAYS_MS
+            .iter()
+            .copied()
+            .enumerate()
         {
-            Ok(Ok(hooks)) => hooks,
-            Ok(Err(error)) => {
+            if delay_ms > 0 {
+                sleep(Duration::from_millis(delay_ms)).await;
+            }
+            if !terminal_codex_hook_trust_discovery_snapshot(&pane_id, instance_id).is_some_and(
+                |entry| {
+                    entry.generation == generation
+                        && entry.state == TerminalCodexHookTrustDiscoveryState::Pending
+                },
+            ) {
+                return;
+            }
+            let Some(instance) = terminal_activity_hook_current_instance(
+                &terminals,
+                &pane_id,
+                instance_id,
+            )
+            .await
+            else {
+                terminal_codex_hook_trust_discovery_clear_generation(
+                    &pane_id,
+                    instance_id,
+                    generation,
+                );
+                return;
+            };
+            if !terminal_metadata_is_codex(&instance.metadata) {
+                terminal_codex_hook_trust_discovery_clear_generation(
+                    &pane_id,
+                    instance_id,
+                    generation,
+                );
+                return;
+            }
+            let already_open = app
+                .state::<TerminalState>()
+                .terminal_structured_interactions
+                .lock()
+                .ok()
+                .is_some_and(|interactions| {
+                    interactions.values().any(|interaction| {
+                        interaction.pane_id == pane_id
+                            && interaction.instance_id == instance_id
+                            && interaction
+                                .provider_request_id
+                                .starts_with("codex-hook-trust-")
+                    })
+                });
+            if already_open {
+                // The structured interaction is the durable in-process latch.
+                // Do not replace it with a newer timestamp/revision while the
+                // same native prompt remains unanswered.
+                terminal_codex_hook_trust_discovery_transition(
+                    &pane_id,
+                    instance_id,
+                    generation,
+                    &[TerminalCodexHookTrustDiscoveryState::Pending],
+                    TerminalCodexHookTrustDiscoveryState::Open,
+                );
+                return;
+            }
+
+            let query_root = workspace_root.clone();
+            let attempt_query = query.clone();
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                terminal_codex_untrusted_hooks(&query_root, &attempt_query)
+            })
+            .await;
+            // The app-server query can overlap a native answer, SessionStart,
+            // cleanup, or a replacement launch. Never apply its result unless
+            // both the terminal instance and discovery generation are current.
+            if terminal_activity_hook_current_instance(&terminals, &pane_id, instance_id)
+                .await
+                .is_none()
+            {
+                terminal_codex_hook_trust_discovery_clear_generation(
+                    &pane_id,
+                    instance_id,
+                    generation,
+                );
+                return;
+            }
+            if !terminal_codex_hook_trust_discovery_snapshot(&pane_id, instance_id).is_some_and(
+                |entry| {
+                    entry.generation == generation
+                        && entry.state == TerminalCodexHookTrustDiscoveryState::Pending
+                },
+            ) {
+                return;
+            }
+            let catalog = match result {
+                Ok(Ok(catalog)) => catalog,
+                Ok(Err(error)) => {
+                    last_error = Some(error.clone());
+                    log_terminal_status_event(
+                        "backend.codex_hook_trust.discovery_error",
+                        json!({
+                            "attempt": attempt_index + 1,
+                            "error": clean_terminal_diagnostic_log_text(&error),
+                            "instance_id": instance_id,
+                            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                            "profile": query.profile.clone().unwrap_or_default(),
+                            "retrying": attempt_index + 1 < TERMINAL_CODEX_HOOK_TRUST_DISCOVERY_DELAYS_MS.len(),
+                        }),
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    last_error = Some(error.clone());
+                    log_terminal_status_event(
+                        "backend.codex_hook_trust.discovery_error",
+                        json!({
+                            "attempt": attempt_index + 1,
+                            "error": clean_terminal_diagnostic_log_text(&error),
+                            "instance_id": instance_id,
+                            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                            "profile": query.profile.clone().unwrap_or_default(),
+                            "retrying": attempt_index + 1 < TERMINAL_CODEX_HOOK_TRUST_DISCOVERY_DELAYS_MS.len(),
+                        }),
+                    );
+                    continue;
+                }
+            };
+            if catalog.configured_hook_count == 0 {
+                last_error = Some("Codex returned an empty hook catalog.".to_string());
                 log_terminal_status_event(
-                    "backend.codex_hook_trust.discovery_error",
+                    "backend.codex_hook_trust.discovery_empty",
                     json!({
-                        "error": clean_terminal_diagnostic_log_text(&error),
+                        "attempt": attempt_index + 1,
                         "instance_id": instance_id,
                         "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                        "profile": query.profile.clone().unwrap_or_default(),
+                        "retrying": attempt_index + 1 < TERMINAL_CODEX_HOOK_TRUST_DISCOVERY_DELAYS_MS.len(),
+                    }),
+                );
+                continue;
+            }
+            let hooks = catalog.untrusted_hooks;
+            if hooks.is_empty() {
+                if !terminal_codex_hook_trust_discovery_transition(
+                    &pane_id,
+                    instance_id,
+                    generation,
+                    &[TerminalCodexHookTrustDiscoveryState::Pending],
+                    TerminalCodexHookTrustDiscoveryState::Resolved,
+                ) {
+                    return;
+                }
+                log_terminal_status_event(
+                    "backend.codex_hook_trust.discovery_trusted",
+                    json!({
+                        "configured_hook_count": catalog.configured_hook_count,
+                        "instance_id": instance_id,
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                        "profile": query.profile.clone().unwrap_or_default(),
                     }),
                 );
                 return;
             }
-            Err(error) => {
-                log_terminal_status_event(
-                    "backend.codex_hook_trust.discovery_error",
-                    json!({
-                        "error": clean_terminal_diagnostic_log_text(&error.to_string()),
-                        "instance_id": instance_id,
-                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                    }),
+            // The query is generation-bound on both sides of the blocking
+            // app-server call, so a late result cannot attach to a replacement
+            // terminal reusing the same pane id.
+            if terminal_activity_hook_current_instance(&terminals, &pane_id, instance_id)
+                .await
+                .is_none()
+            {
+                terminal_codex_hook_trust_discovery_clear_generation(
+                    &pane_id,
+                    instance_id,
+                    generation,
                 );
                 return;
             }
-        };
-        if hooks.is_empty() {
-            return;
-        }
-        let Some(instance) = terminal_activity_hook_current_instance(
-            &terminals,
-            &pane_id,
-            instance_id,
-        )
-        .await
-        else {
-            return;
-        };
-        if !terminal_metadata_is_codex(&instance.metadata) {
-            return;
-        }
-        let identities = hooks
-            .iter()
-            .map(|hook| {
-                format!(
-                    "{}:{}:{}",
-                    hook.get("key").and_then(Value::as_str).unwrap_or_default(),
-                    hook.get("currentHash").and_then(Value::as_str).unwrap_or_default(),
-                    hook.get("trustStatus").and_then(Value::as_str).unwrap_or_default(),
+            if !terminal_codex_hook_trust_discovery_snapshot(&pane_id, instance_id).is_some_and(
+                |entry| {
+                    entry.generation == generation
+                        && entry.state == TerminalCodexHookTrustDiscoveryState::Pending
+                },
+            ) {
+                return;
+            }
+            let identities = hooks
+                .iter()
+                .map(terminal_codex_hook_identity)
+                .collect::<Vec<_>>();
+            let catalog_hash = cloud_mcp_short_hash(&identities.join("|"));
+            let request_id = format!("codex-hook-trust-{catalog_hash}");
+            let hook_labels = hooks
+                .iter()
+                .take(12)
+                .map(|hook| {
+                    let event = hook.get("eventName").and_then(Value::as_str).unwrap_or("hook");
+                    let source = hook.get("sourcePath").and_then(Value::as_str).unwrap_or("Codex configuration");
+                    format!("{event} — {source}")
+                })
+                .collect::<Vec<_>>();
+            let overflow = hooks.len().saturating_sub(hook_labels.len());
+            let mut prompt_text = format!(
+                "{} Codex {} new or changed and need review before they can run.\n{}",
+                hooks.len(),
+                if hooks.len() == 1 { "hook is" } else { "hooks are" },
+                hook_labels.join("\n"),
+            );
+            if overflow > 0 {
+                prompt_text.push_str(&format!("\n…and {overflow} more."));
+            }
+            let event = json!({
+                "hook_event_name": "UserInputRequired",
+                "provider": "codex",
+                "permission_request_id": request_id,
+                "prompting_user_kind": "approval",
+                "prompting_user_text": prompt_text,
+                "prompt_default_option": "continue_without_trusting",
+                "prompt_options": terminal_codex_hook_trust_prompt_options(),
+                "manual_approval_required": true,
+                "provider_blocked_for_user": true,
+                "requires_user_input": true,
+                "terminal_is_prompting_user": true,
+                "timestamp_ms": terminal_now_ms(),
+                "trust_catalog_hash": catalog_hash,
+                "trust_source": "codex_app_server_hooks_list",
+            });
+            // Reserve Open before the asynchronous interaction publish.  A
+            // native TUI answer may bootstrap the Codex thread while that
+            // publish is in flight; the gateway then moves this exact
+            // generation Open -> Resolved instead of racing a later
+            // Pending -> Open write.
+            if !terminal_codex_hook_trust_discovery_transition(
+                &pane_id,
+                instance_id,
+                generation,
+                &[TerminalCodexHookTrustDiscoveryState::Pending],
+                TerminalCodexHookTrustDiscoveryState::Open,
+            ) {
+                return;
+            }
+            if let Err(error) = handle_terminal_activity_hook_event(
+                &app,
+                &terminals,
+                &cloud_mcp_state,
+                &pane_id,
+                instance_id,
+                event,
+                "codex-app-server-hook-trust",
+            )
+            .await
+            {
+                last_error = Some(error);
+                // Retry discovery only if this generation is still open.  If
+                // the native TUI resolved it concurrently, never reopen it.
+                if !terminal_codex_hook_trust_discovery_transition(
+                    &pane_id,
+                    instance_id,
+                    generation,
+                    &[TerminalCodexHookTrustDiscoveryState::Open],
+                    TerminalCodexHookTrustDiscoveryState::Pending,
+                ) {
+                    return;
+                }
+                continue;
+            }
+            let post_publish_discovery =
+                terminal_codex_hook_trust_discovery_snapshot(&pane_id, instance_id);
+            let post_publish_terminal_is_current = terminal_activity_hook_current_instance(
+                &terminals,
+                &pane_id,
+                instance_id,
+            )
+            .await
+            .is_some();
+            if post_publish_terminal_is_current
+                && post_publish_discovery.is_some_and(|entry| {
+                    entry.generation == generation
+                        && entry.state == TerminalCodexHookTrustDiscoveryState::Resolved
+                })
+            {
+                // The gateway's first resolution task can win before the
+                // interaction has entered the map.  Re-run the idempotent
+                // answered lifecycle now that publication completed so the
+                // dashboard and push state cannot be left stale.
+                terminal_codex_gateway_publish_startup_hook_review_resolved(
+                    app.clone(),
+                    pane_id.clone(),
+                    instance_id,
+                    "thread/bootstrap-during-hook-publish".to_string(),
                 )
-            })
-            .collect::<Vec<_>>();
-        let catalog_hash = cloud_mcp_short_hash(&identities.join("|"));
-        let request_id = format!("codex-hook-trust-{catalog_hash}");
-        let hook_labels = hooks
-            .iter()
-            .take(12)
-            .map(|hook| {
-                let event = hook.get("eventName").and_then(Value::as_str).unwrap_or("hook");
-                let source = hook.get("sourcePath").and_then(Value::as_str).unwrap_or("Codex configuration");
-                format!("{event} — {source}")
-            })
-            .collect::<Vec<_>>();
-        let overflow = hooks.len().saturating_sub(hook_labels.len());
-        let mut prompt_text = format!(
-            "{} Codex {} new or changed and need review before they can run.\n{}",
-            hooks.len(),
-            if hooks.len() == 1 { "hook is" } else { "hooks are" },
-            hook_labels.join("\n"),
-        );
-        if overflow > 0 {
-            prompt_text.push_str(&format!("\n…and {overflow} more."));
+                .await;
+                return;
+            }
+            let publication_is_current = post_publish_terminal_is_current
+                && post_publish_discovery.is_some_and(|entry| {
+                entry.generation == generation
+                    && entry.state == TerminalCodexHookTrustDiscoveryState::Open
+                });
+            if !publication_is_current {
+                terminal_codex_hook_trust_withdraw_stale_publication(
+                    &app,
+                    &cloud_mcp_state,
+                    &pane_id,
+                    instance_id,
+                    &request_id,
+                    !post_publish_terminal_is_current,
+                    "codex_hook_trust_discovery_generation_or_terminal_replaced",
+                )
+                .await;
+                return;
+            }
+            log_terminal_status_event(
+                "backend.codex_hook_trust.discovery_opened",
+                json!({
+                    "configured_hook_count": catalog.configured_hook_count,
+                    "instance_id": instance_id,
+                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    "profile": query.profile.clone().unwrap_or_default(),
+                    "untrusted_hook_count": hooks.len(),
+                }),
+            );
+            return;
         }
-        let event = json!({
-            "hook_event_name": "UserInputRequired",
-            "provider": "codex",
-            "permission_request_id": request_id,
-            "prompting_user_kind": "approval",
-            "prompting_user_text": prompt_text,
-            "prompt_default_option": "continue_without_trusting",
-            "prompt_options": terminal_codex_hook_trust_prompt_options(),
-            "manual_approval_required": true,
-            "provider_blocked_for_user": true,
-            "requires_user_input": true,
-            "terminal_is_prompting_user": true,
-            "timestamp_ms": terminal_now_ms(),
-            "trust_catalog_hash": catalog_hash,
-            "trust_source": "codex_app_server_hooks_list",
-        });
-        let _ = handle_terminal_activity_hook_event(
-            &app,
-            &terminals,
-            &cloud_mcp_state,
+        if !terminal_codex_hook_trust_discovery_transition(
             &pane_id,
             instance_id,
-            event,
-            "codex-app-server-hook-trust",
-        )
-        .await;
+            generation,
+            &[TerminalCodexHookTrustDiscoveryState::Pending],
+            TerminalCodexHookTrustDiscoveryState::Failed,
+        ) {
+            return;
+        }
+        log_terminal_status_event(
+            "backend.codex_hook_trust.discovery_exhausted",
+            json!({
+                "attempts": TERMINAL_CODEX_HOOK_TRUST_DISCOVERY_DELAYS_MS.len(),
+                "error": clean_terminal_diagnostic_log_text(last_error.as_deref().unwrap_or("unknown error")),
+                "instance_id": instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                "profile": query.profile.unwrap_or_default(),
+            }),
+        );
     });
 }
 
@@ -20667,6 +21410,29 @@ fn terminal_answer_agent_prompt_target_pane_id(event: &Value) -> Result<String, 
             .ok_or_else(|| "Prompt answer requires a target terminal id.".to_string())?;
     validate_terminal_pane_id(&pane_id)?;
     Ok(pane_id)
+}
+
+fn terminal_agent_prompt_already_resolved_result(
+    pane_id: &str,
+    instance_id: Option<u64>,
+    prompt_id: &str,
+    interaction_id: &str,
+    interaction_revision: u64,
+    reason: &str,
+) -> Value {
+    json!({
+        "answered": true,
+        "applied": false,
+        "noop": true,
+        "status": "already_resolved",
+        "message": "This provider interaction is already closed or resolved.",
+        "reason": reason,
+        "pane_id": pane_id,
+        "terminal_instance_id": instance_id.unwrap_or_default(),
+        "prompt_id": prompt_id,
+        "interaction_id": interaction_id,
+        "interaction_revision": interaction_revision,
+    })
 }
 
 fn terminal_structured_interaction_hook_response(
@@ -20904,7 +21670,14 @@ async fn terminal_answer_agent_prompt_remote_command(
     let Some(instance) =
         get_terminal_instance_if_current(state.inner(), &pane_id, instance_id).await?
     else {
-        return Err("Terminal session is not running.".to_string());
+        return Ok(terminal_agent_prompt_already_resolved_result(
+            &pane_id,
+            instance_id,
+            &prompt_id,
+            &requested_interaction_id,
+            requested_interaction_revision,
+            "terminal_not_running",
+        ));
     };
     let interaction = state
         .terminal_structured_interactions
@@ -20916,13 +21689,36 @@ async fn terminal_answer_agent_prompt_remote_command(
                 && interaction.instance_id == instance.id
                 && interaction.prompt_id == prompt_id
         })
-        .cloned()
-        .ok_or_else(|| "This provider interaction is no longer open.".to_string())?;
+        .cloned();
+    let Some(interaction) = interaction else {
+        return Ok(terminal_agent_prompt_already_resolved_result(
+            &pane_id,
+            Some(instance.id),
+            &prompt_id,
+            &requested_interaction_id,
+            requested_interaction_revision,
+            "interaction_not_open",
+        ));
+    };
     if requested_interaction_id != interaction.interaction_id {
-        return Err("Structured terminal interaction id is stale.".to_string());
+        return Ok(terminal_agent_prompt_already_resolved_result(
+            &pane_id,
+            Some(instance.id),
+            &prompt_id,
+            &requested_interaction_id,
+            requested_interaction_revision,
+            "stale_interaction_id",
+        ));
     }
     if requested_interaction_revision != interaction.revision {
-        return Err("Structured terminal interaction revision is stale.".to_string());
+        return Ok(terminal_agent_prompt_already_resolved_result(
+            &pane_id,
+            Some(instance.id),
+            &prompt_id,
+            &requested_interaction_id,
+            requested_interaction_revision,
+            "stale_interaction_revision",
+        ));
     }
     if !interaction.options.is_empty()
         && !interaction
@@ -20948,11 +21744,31 @@ async fn terminal_answer_agent_prompt_remote_command(
             .terminal_structured_interaction_waiters
             .lock()
             .map_err(|_| "Structured terminal response state is unavailable.".to_string())?
-            .remove(&interaction.interaction_id)
-            .ok_or_else(|| "The provider is no longer waiting for this response.".to_string())?;
-        sender.send(response).map_err(|_| {
-            "The provider stopped waiting before the response was applied.".to_string()
-        })?;
+            .remove(&interaction.interaction_id);
+        let response_applied = sender.is_some_and(|sender| sender.send(response).is_ok());
+        if !response_applied {
+            if let Ok(mut interactions) = state.terminal_structured_interactions.lock() {
+                interactions.remove(&interaction.interaction_id);
+            }
+            terminal_structured_interaction_publish_answered(
+                &app,
+                state.inner(),
+                cloud_mcp_state.inner(),
+                &instance,
+                &interaction,
+                "provider_no_longer_waiting",
+                "already-resolved-noop",
+            )
+            .await;
+            return Ok(terminal_agent_prompt_already_resolved_result(
+                &pane_id,
+                Some(instance.id),
+                &prompt_id,
+                &requested_interaction_id,
+                requested_interaction_revision,
+                "provider_no_longer_waiting",
+            ));
+        }
         let provider_ack_pending = interaction.response_mode == "provider_api";
         if !provider_ack_pending {
             if let Ok(mut interactions) = state.terminal_structured_interactions.lock() {
@@ -21005,7 +21821,7 @@ async fn terminal_answer_agent_prompt_remote_command(
         &option_label,
         option_value.as_deref().or(answer_text.as_deref()),
     );
-    terminal_write_inner(
+    let write_result = terminal_write_inner(
         app.clone(),
         state.inner(),
         cloud_mcp_state.inner(),
@@ -21026,22 +21842,67 @@ async fn terminal_answer_agent_prompt_remote_command(
         Some(false),
         true,
     )
-    .await?;
-    if let Ok(mut interactions) = state.terminal_structured_interactions.lock() {
-        interactions.remove(&interaction.interaction_id);
-    }
-    terminal_structured_interaction_publish_answered(
-        &app,
-        state.inner(),
-        cloud_mcp_state.inner(),
-        &instance,
-        &interaction,
-        &option_id,
-        "structured-pty-answer",
-    )
     .await;
+    if let Err(error) = write_result {
+        let terminal_still_current = get_terminal_instance_if_current(
+            state.inner(),
+            &pane_id,
+            Some(instance.id),
+        )
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+        if terminal_still_current {
+            return Err(error);
+        }
+        if let Ok(mut interactions) = state.terminal_structured_interactions.lock() {
+            interactions.remove(&interaction.interaction_id);
+        }
+        return Ok(terminal_agent_prompt_already_resolved_result(
+            &pane_id,
+            Some(instance.id),
+            &prompt_id,
+            &requested_interaction_id,
+            requested_interaction_revision,
+            "terminal_closed_before_write",
+        ));
+    }
+    let codex_hook_trust_interaction = interaction
+        .provider_request_id
+        .starts_with("codex-hook-trust-");
+    let review_hooks = terminal_codex_hook_trust_answer_keeps_open(
+        &interaction.provider_request_id,
+        &option_id,
+    );
+    if !review_hooks {
+        if let Ok(mut interactions) = state.terminal_structured_interactions.lock() {
+            interactions.remove(&interaction.interaction_id);
+        }
+        if codex_hook_trust_interaction {
+            terminal_codex_hook_trust_discovery_set(
+                &pane_id,
+                instance.id,
+                TerminalCodexHookTrustDiscoveryState::Resolved,
+            );
+        }
+        terminal_structured_interaction_publish_answered(
+            &app,
+            state.inner(),
+            cloud_mcp_state.inner(),
+            &instance,
+            &interaction,
+            &option_id,
+            "structured-pty-answer",
+        )
+        .await;
+    }
     log_terminal_status_event(
-        "backend.terminal_structured_interaction.answered",
+        if review_hooks {
+            "backend.terminal_structured_interaction.review_opened"
+        } else {
+            "backend.terminal_structured_interaction.answered"
+        },
         json!({
             "interaction_id": interaction.interaction_id,
             "option_id": option_id,
@@ -21080,9 +21941,9 @@ async fn terminal_answer_agent_prompt_remote_command(
             .unwrap_or_default(),
         "interaction_id": interaction.interaction_id,
         "interaction_revision": interaction.revision,
-        "status": "applied",
+        "status": if review_hooks { "reviewing_hooks" } else { "applied" },
         "message": "",
-        "answered": true,
+        "answered": !review_hooks,
     }))
 }
 
@@ -22827,6 +23688,53 @@ mod terminal_tests {
     }
 
     #[test]
+    fn codex_app_server_thread_bootstrap_resolves_native_startup_hook_review() {
+        let pane_id = format!("codex-native-hook-review-{}", uuid::Uuid::new_v4());
+        let instance_id = 42;
+        terminal_codex_hook_trust_discovery_begin(&pane_id, instance_id);
+        terminal_codex_hook_trust_discovery_set(
+            &pane_id,
+            instance_id,
+            TerminalCodexHookTrustDiscoveryState::Open,
+        );
+
+        assert!(terminal_codex_gateway_resolve_startup_hook_review(
+            &pane_id,
+            instance_id,
+            &json!({"id": 7, "method": "thread/start", "params": {}}),
+        ));
+        assert_eq!(
+            terminal_codex_hook_trust_discovery_state(&pane_id, instance_id),
+            Some(TerminalCodexHookTrustDiscoveryState::Resolved),
+        );
+        terminal_codex_hook_trust_discovery_clear(&pane_id, instance_id);
+    }
+
+    #[test]
+    fn codex_app_server_non_bootstrap_messages_do_not_resolve_hook_review() {
+        let pane_id = format!("codex-native-hook-review-{}", uuid::Uuid::new_v4());
+        let instance_id = 43;
+        terminal_codex_hook_trust_discovery_begin(&pane_id, instance_id);
+
+        for message in [
+            json!({"id": 1, "method": "initialize", "params": {}}),
+            json!({"id": 2, "method": "turn/start", "params": {}}),
+            json!({"method": "thread/started", "params": {}}),
+        ] {
+            assert!(!terminal_codex_gateway_resolve_startup_hook_review(
+                &pane_id,
+                instance_id,
+                &message,
+            ));
+        }
+        assert_eq!(
+            terminal_codex_hook_trust_discovery_state(&pane_id, instance_id),
+            Some(TerminalCodexHookTrustDiscoveryState::Pending),
+        );
+        terminal_codex_hook_trust_discovery_clear(&pane_id, instance_id);
+    }
+
+    #[test]
     fn codex_app_server_gateway_accepts_exactly_one_answer_source() {
         let request_key = "number:7".to_string();
         let pending = Arc::new(StdMutex::new(HashMap::from([(
@@ -22999,7 +23907,7 @@ mod terminal_tests {
         let hooks = terminal_codex_hooks_requiring_trust(&catalog);
         assert_eq!(
             hooks.iter().filter_map(|hook| hook.get("key").and_then(Value::as_str)).collect::<Vec<_>>(),
-            vec!["new", "changed"]
+            vec!["changed", "new"]
         );
     }
 
@@ -23059,6 +23967,222 @@ mod terminal_tests {
             ),
             "2\r"
         );
+    }
+
+    #[test]
+    fn codex_hook_trust_discovery_latch_blocks_idle_until_resolved() {
+        let pane_id = format!("codex-hook-trust-latch-{}", uuid::Uuid::new_v4());
+        let instance_id = 41;
+        terminal_codex_hook_trust_discovery_set(
+            &pane_id,
+            instance_id,
+            TerminalCodexHookTrustDiscoveryState::Pending,
+        );
+        assert!(terminal_codex_hook_trust_discovery_blocks_idle(
+            &pane_id,
+            instance_id
+        ));
+        terminal_codex_hook_trust_discovery_set(
+            &pane_id,
+            instance_id,
+            TerminalCodexHookTrustDiscoveryState::Open,
+        );
+        assert!(terminal_codex_hook_trust_discovery_blocks_idle(
+            &pane_id,
+            instance_id
+        ));
+        terminal_codex_hook_trust_discovery_set(
+            &pane_id,
+            instance_id,
+            TerminalCodexHookTrustDiscoveryState::Resolved,
+        );
+        assert!(!terminal_codex_hook_trust_discovery_blocks_idle(
+            &pane_id,
+            instance_id
+        ));
+        terminal_codex_hook_trust_discovery_clear(&pane_id, instance_id);
+        assert_eq!(
+            terminal_codex_hook_trust_discovery_state(&pane_id, instance_id),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_hook_trust_discovery_late_result_cannot_overwrite_resolution() {
+        let pane_id = format!("codex-hook-trust-resolved-race-{}", uuid::Uuid::new_v4());
+        let instance_id = 42;
+        terminal_codex_hook_trust_discovery_set(
+            &pane_id,
+            instance_id,
+            TerminalCodexHookTrustDiscoveryState::Pending,
+        );
+        let generation = terminal_codex_hook_trust_discovery_snapshot(&pane_id, instance_id)
+            .expect("pending discovery")
+            .generation;
+
+        // A native answer or SessionStart resolves the gate while hooks/list
+        // is still in flight.
+        terminal_codex_hook_trust_discovery_set(
+            &pane_id,
+            instance_id,
+            TerminalCodexHookTrustDiscoveryState::Resolved,
+        );
+        assert!(!terminal_codex_hook_trust_discovery_transition(
+            &pane_id,
+            instance_id,
+            generation,
+            &[TerminalCodexHookTrustDiscoveryState::Pending],
+            TerminalCodexHookTrustDiscoveryState::Open,
+        ));
+        assert_eq!(
+            terminal_codex_hook_trust_discovery_state(&pane_id, instance_id),
+            Some(TerminalCodexHookTrustDiscoveryState::Resolved)
+        );
+        terminal_codex_hook_trust_discovery_clear(&pane_id, instance_id);
+    }
+
+    #[test]
+    fn codex_hook_trust_publish_failure_cannot_reopen_native_resolution() {
+        let pane_id = format!("codex-hook-trust-publish-race-{}", uuid::Uuid::new_v4());
+        let instance_id = 44;
+        terminal_codex_hook_trust_discovery_set(
+            &pane_id,
+            instance_id,
+            TerminalCodexHookTrustDiscoveryState::Pending,
+        );
+        let generation = terminal_codex_hook_trust_discovery_snapshot(&pane_id, instance_id)
+            .expect("pending discovery")
+            .generation;
+        assert!(terminal_codex_hook_trust_discovery_transition(
+            &pane_id,
+            instance_id,
+            generation,
+            &[TerminalCodexHookTrustDiscoveryState::Pending],
+            TerminalCodexHookTrustDiscoveryState::Open,
+        ));
+
+        // A provider-native thread bootstrap resolves the prompt while the
+        // structured interaction publish is still in flight.
+        terminal_codex_hook_trust_discovery_set(
+            &pane_id,
+            instance_id,
+            TerminalCodexHookTrustDiscoveryState::Resolved,
+        );
+        assert!(!terminal_codex_hook_trust_discovery_transition(
+            &pane_id,
+            instance_id,
+            generation,
+            &[TerminalCodexHookTrustDiscoveryState::Open],
+            TerminalCodexHookTrustDiscoveryState::Pending,
+        ));
+        assert_eq!(
+            terminal_codex_hook_trust_discovery_state(&pane_id, instance_id),
+            Some(TerminalCodexHookTrustDiscoveryState::Resolved)
+        );
+        terminal_codex_hook_trust_discovery_clear(&pane_id, instance_id);
+    }
+
+    #[test]
+    fn codex_hook_trust_discovery_stale_generation_cannot_reinsert_after_cleanup() {
+        let pane_id = format!("codex-hook-trust-cleanup-race-{}", uuid::Uuid::new_v4());
+        let instance_id = 43;
+        terminal_codex_hook_trust_discovery_set(
+            &pane_id,
+            instance_id,
+            TerminalCodexHookTrustDiscoveryState::Pending,
+        );
+        let stale_generation = terminal_codex_hook_trust_discovery_snapshot(
+            &pane_id,
+            instance_id,
+        )
+        .expect("pending discovery")
+        .generation;
+        terminal_codex_hook_trust_discovery_clear(&pane_id, instance_id);
+
+        assert!(!terminal_codex_hook_trust_discovery_transition(
+            &pane_id,
+            instance_id,
+            stale_generation,
+            &[TerminalCodexHookTrustDiscoveryState::Pending],
+            TerminalCodexHookTrustDiscoveryState::Open,
+        ));
+        assert_eq!(
+            terminal_codex_hook_trust_discovery_state(&pane_id, instance_id),
+            None
+        );
+
+        // A replacement discovery using the same logical pane/instance key is
+        // also protected from an older task by its generation token.
+        terminal_codex_hook_trust_discovery_set(
+            &pane_id,
+            instance_id,
+            TerminalCodexHookTrustDiscoveryState::Pending,
+        );
+        let replacement = terminal_codex_hook_trust_discovery_snapshot(&pane_id, instance_id)
+            .expect("replacement discovery");
+        assert_ne!(replacement.generation, stale_generation);
+        assert!(!terminal_codex_hook_trust_discovery_transition(
+            &pane_id,
+            instance_id,
+            stale_generation,
+            &[TerminalCodexHookTrustDiscoveryState::Pending],
+            TerminalCodexHookTrustDiscoveryState::Failed,
+        ));
+        assert_eq!(
+            terminal_codex_hook_trust_discovery_state(&pane_id, instance_id),
+            Some(TerminalCodexHookTrustDiscoveryState::Pending)
+        );
+        terminal_codex_hook_trust_discovery_clear(&pane_id, instance_id);
+    }
+
+    #[test]
+    fn codex_hook_trust_review_keeps_only_the_matching_interaction_open() {
+        assert!(terminal_codex_hook_trust_answer_keeps_open(
+            "codex-hook-trust-catalog",
+            "review_hooks"
+        ));
+        assert!(!terminal_codex_hook_trust_answer_keeps_open(
+            "codex-hook-trust-catalog",
+            "trust_all_and_continue"
+        ));
+        assert!(!terminal_codex_hook_trust_answer_keeps_open(
+            "another-request",
+            "review_hooks"
+        ));
+    }
+
+    #[test]
+    fn codex_profile_cleanup_removes_only_diff_forge_managed_inline_hooks() {
+        let body = r#"model = "gpt-5.5"
+
+[[hooks.SessionStart]]
+matcher = "user"
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "user-hook"
+# Documentation may mention --diff-forge-activity-hook without making this a managed hook.
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "diffforge --diff-forge-activity-hook --provider codex"
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "diffforge --diff-forge-activity-hook --provider codex"
+
+[tui]
+notifications = true
+"#;
+        let cleaned = strip_codex_profile_managed_inline_hook_events(body);
+        assert!(cleaned.contains("command = \"user-hook\""));
+        assert!(cleaned.contains("[[hooks.SessionStart]]"));
+        assert_eq!(cleaned.matches("[[hooks.SessionStart.hooks]]").count(), 1);
+        assert!(cleaned.contains("[tui]"));
+        assert!(cleaned.contains("# Documentation may mention --diff-forge-activity-hook"));
+        assert!(!cleaned.contains(
+            "command = \"diffforge --diff-forge-activity-hook --provider codex\""
+        ));
+        assert!(!cleaned.contains("[[hooks.Stop]]"));
     }
 
     #[test]
@@ -26001,6 +27125,23 @@ mod terminal_tests {
     }
 
     #[test]
+    fn closed_terminal_prompt_answer_is_idempotent_noop() {
+        let result = terminal_agent_prompt_already_resolved_result(
+            "pane-1",
+            Some(7),
+            "prompt-1",
+            "uir:prompt-1",
+            4,
+            "terminal_not_running",
+        );
+        assert_eq!(result["status"], json!("already_resolved"));
+        assert_eq!(result["answered"], json!(true));
+        assert_eq!(result["applied"], json!(false));
+        assert_eq!(result["noop"], json!(true));
+        assert_eq!(result["terminal_instance_id"], json!(7));
+    }
+
+    #[test]
     fn prompt_ready_marker_must_follow_working_indicator() {
         assert!(terminal_output_current_prompt_marker(
             "working (press esc to interrupt)\ncompleted\n> "
@@ -26936,17 +28077,11 @@ mod terminal_tests {
         // One scoped command per ensured activity-hook event.
         assert_eq!(hooks.matches("--pane-id").count(), 10);
         let profile_config = fs::read_to_string(&profile_path).unwrap();
-        assert!(profile_config.contains("[[hooks.UserPromptSubmit]]"));
-        assert!(profile_config.contains("[[hooks.Stop]]"));
-        assert!(profile_config.contains("[[hooks.PreToolUse]]"));
-        assert!(profile_config.contains("[[hooks.PostToolUse]]"));
-        assert!(profile_config.contains("[[hooks.PermissionRequest]]"));
-        assert!(profile_config.contains("[[hooks.SubagentStart]]"));
-        assert!(profile_config.contains("[[hooks.SubagentStop]]"));
-        assert!(profile_config.contains("--diff-forge-activity-hook"));
-        assert!(profile_config.contains("--pane-id"));
-        assert!(profile_config.contains("workspace-terminal/workspace-1-0-codex"));
-        assert!(profile_config.contains("--debug-path"));
+        assert!(profile_config.contains("default_permissions = \"diffforge-coordinated\""));
+        assert!(!profile_config.contains("[[hooks."));
+        assert!(!profile_config.contains("--diff-forge-activity-hook"));
+        assert!(!profile_config.contains("--pane-id"));
+        assert!(!profile_config.contains("--debug-path"));
         assert!(!profile_config.contains("--diff-forge-write-guard"));
         assert!(!profile_config.contains("hooksPath ="));
     }
@@ -26988,8 +28123,9 @@ mod terminal_tests {
         assert!(hooks.contains("UserPromptSubmit"));
         assert!(hooks.contains("--diff-forge-activity-hook"));
         let profile_config = fs::read_to_string(&profile_path).unwrap();
-        assert!(profile_config.contains("[[hooks.UserPromptSubmit]]"));
-        assert!(profile_config.contains("--diff-forge-activity-hook"));
+        assert!(profile_config.contains("default_permissions = \"diffforge-coordinated\""));
+        assert!(!profile_config.contains("[[hooks."));
+        assert!(!profile_config.contains("--diff-forge-activity-hook"));
     }
 
     #[test]

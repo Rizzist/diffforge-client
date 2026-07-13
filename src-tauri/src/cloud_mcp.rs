@@ -27517,6 +27517,8 @@ fn cloud_mcp_device_live_snapshot_lifecycle_fast_lane(reason: &str) -> bool {
                 | "workspace_open"
                 | "workspace_registered"
                 | "workspace_registration"
+                | "terminal_close"
+                | "terminal_prompt_resolved"
         ) || part.starts_with("workspace_activate")
             || part.starts_with("workspace_deactivate")
     })
@@ -34199,7 +34201,25 @@ fn cloud_mcp_terminal_state_removes_from_live_snapshot(terminal: &Value) -> bool
 }
 
 fn cloud_mcp_terminal_state_is_workspace_runtime_shutdown(terminal: &Value) -> bool {
-    [
+    let explicit_closed_lifecycle = [
+        "status",
+        "state",
+        "activity_status",
+        "terminal_lifecycle",
+        "command_phase",
+        "execution_phase",
+    ]
+    .iter()
+    .filter_map(|key| terminal.get(*key).and_then(Value::as_str))
+    .map(|value| value.trim().to_ascii_lowercase())
+    .any(|value| {
+        matches!(
+            value.as_str(),
+            "closed" | "exited" | "terminated" | "disconnected"
+        )
+    });
+    explicit_closed_lifecycle
+        || [
         "reason",
         "close_reason",
         "event_kind",
@@ -34220,6 +34240,9 @@ fn cloud_mcp_terminal_state_is_workspace_runtime_shutdown(terminal: &Value) -> b
             || value.contains("workspace-runtime")
             || value.contains("close_workspace")
             || value.contains("close-workspace")
+            || value.contains("terminal_close")
+            || value.contains("terminal-close")
+            || value.contains("terminal.closed")
     })
 }
 
@@ -34232,6 +34255,89 @@ fn cloud_mcp_mark_terminal_last_known_read_only(value: &mut Value) {
     object.insert("commandable".to_string(), json!(false));
     object.insert("native_connected".to_string(), json!(false));
     object.insert("connected".to_string(), json!(false));
+}
+
+/// An interaction is actionable only while its exact native terminal
+/// generation is alive.  Closed terminals and deactivated workspaces must
+/// carry an explicit prompt clear so Cloud can retire the matching push
+/// generation; merely omitting these fields would preserve the older prompt
+/// during lossless live-state merges.
+fn cloud_mcp_clear_terminal_prompt_state(
+    value: &mut Value,
+    resolved_provider_request_id: Option<&str>,
+    reason: &str,
+    observed_at_ms: u64,
+) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.insert("prompt_id".to_string(), json!(""));
+    object.insert("prompt_kind".to_string(), Value::Null);
+    object.insert("prompt_default_option".to_string(), Value::Null);
+    object.insert("prompt_ttl_ms".to_string(), Value::Null);
+    object.insert("prompt_options".to_string(), json!([]));
+    object.insert("prompt_questions".to_string(), Value::Null);
+    object.insert("prompt_schema".to_string(), Value::Null);
+    object.insert("prompt_url".to_string(), Value::Null);
+    object.insert("allows_free_text".to_string(), json!(false));
+    object.insert("manual_approval_required".to_string(), json!(false));
+    object.insert("provider_blocked_for_user".to_string(), json!(false));
+    object.insert("terminal_is_prompting_user".to_string(), json!(false));
+    object.insert("prompting_user_kind".to_string(), Value::Null);
+    object.insert("prompting_user_source".to_string(), Value::Null);
+    object.insert("prompting_user_confidence".to_string(), Value::Null);
+    object.insert("prompting_user_text".to_string(), Value::Null);
+    object.insert("interaction_id".to_string(), Value::Null);
+    object.insert("interaction_revision".to_string(), Value::Null);
+    object.insert("interaction_source".to_string(), Value::Null);
+    object.insert("interaction_response_mode".to_string(), Value::Null);
+    object.insert("provider_request_id".to_string(), Value::Null);
+    object.insert("approval_id".to_string(), Value::Null);
+    object.insert("permission_prompt_id".to_string(), Value::Null);
+    object.insert("permission_request_id".to_string(), Value::Null);
+    object.insert("interaction_resolution_reason".to_string(), json!(reason));
+    object.insert(
+        "interaction_resolved_at_ms".to_string(),
+        json!(observed_at_ms),
+    );
+    if let Some(request_id) = resolved_provider_request_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        object.insert(
+            "resolved_provider_request_id".to_string(),
+            json!(request_id),
+        );
+    }
+}
+
+fn cloud_mcp_mark_terminal_value_closed(
+    value: &mut Value,
+    status_seq: u64,
+    observed_at_ms: u64,
+    reason: &str,
+) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.insert("status".to_string(), json!("closed"));
+    object.insert("state".to_string(), json!("closed"));
+    object.insert("activity_status".to_string(), json!("closed"));
+    object.insert("native_rail_state".to_string(), json!("closed"));
+    object.insert("terminal_lifecycle".to_string(), json!("closed"));
+    object.insert("readiness".to_string(), json!("closed"));
+    object.insert("command_phase".to_string(), json!("closed"));
+    object.insert("execution_phase".to_string(), json!("closed"));
+    object.insert("turn_status".to_string(), json!("interrupted"));
+    object.insert("input_ready".to_string(), json!(false));
+    object.insert("session_state".to_string(), json!("no_session"));
+    object.insert("active".to_string(), json!(false));
+    object.insert("commandable".to_string(), json!(false));
+    object.insert("native_connected".to_string(), json!(false));
+    object.insert("connected".to_string(), json!(false));
+    object.insert("status_seq".to_string(), json!(status_seq));
+    object.insert("observed_at_ms".to_string(), json!(observed_at_ms));
+    object.insert("close_reason".to_string(), json!(reason));
 }
 
 fn cloud_mcp_mark_panel_last_known_read_only(value: &mut Value) {
@@ -34247,19 +34353,73 @@ fn cloud_mcp_mark_panel_last_known_read_only(value: &mut Value) {
 }
 
 fn cloud_mcp_mark_workspace_terminals_last_known_read_only(workspace: &mut Value) {
+    let observed_at_ms = cloud_mcp_now_ms();
     let Some(terminals) = workspace.get_mut("terminals") else {
         return;
     };
     if let Some(terminals) = terminals.as_array_mut() {
         for terminal in terminals {
             cloud_mcp_mark_terminal_last_known_read_only(terminal);
+            cloud_mcp_clear_terminal_prompt_state(
+                terminal,
+                None,
+                "workspace_deactivated",
+                observed_at_ms,
+            );
         }
         return;
     }
     if let Some(terminals) = terminals.as_object_mut() {
         for terminal in terminals.values_mut() {
             cloud_mcp_mark_terminal_last_known_read_only(terminal);
+            cloud_mcp_clear_terminal_prompt_state(
+                terminal,
+                None,
+                "workspace_deactivated",
+                observed_at_ms,
+            );
         }
+    }
+}
+
+fn cloud_mcp_recount_workspace_terminal_activity(workspace: &mut Value) {
+    let Some(terminals) = workspace.get("terminals").and_then(Value::as_array) else {
+        return;
+    };
+    let terminal_count = terminals.len();
+    let active_count = terminals
+        .iter()
+        .filter(|terminal| {
+            let status = cloud_mcp_payload_text(
+                terminal,
+                &[
+                    "status",
+                    "state",
+                    "activity_status",
+                    "terminal_lifecycle",
+                    "session_state",
+                ],
+            )
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+            !matches!(
+                status.as_str(),
+                "closed"
+                    | "deleted"
+                    | "removed"
+                    | "exited"
+                    | "terminated"
+                    | "no_session"
+                    | "offline"
+                    | "deactivated"
+                    | "disabled"
+            )
+        })
+        .count();
+    if let Some(object) = workspace.as_object_mut() {
+        object.insert("terminal_count".to_string(), json!(terminal_count));
+        object.insert("active_count".to_string(), json!(active_count));
     }
 }
 
@@ -34296,22 +34456,16 @@ async fn cloud_mcp_mark_device_live_terminal_closed(
             }
             matched = matched.saturating_add(1);
             workspace_matched = true;
-            if let Some(object) = terminal.as_object_mut() {
-                object.insert("status".to_string(), json!("closed"));
-                object.insert("state".to_string(), json!("closed"));
-                object.insert("activity_status".to_string(), json!("closed"));
-                object.insert("native_rail_state".to_string(), json!("closed"));
-                object.insert("terminal_lifecycle".to_string(), json!("closed"));
-                object.insert("readiness".to_string(), json!("closed"));
-                object.insert("turn_status".to_string(), json!("interrupted"));
-                object.insert("input_ready".to_string(), json!(false));
-                object.insert("session_state".to_string(), json!("no_session"));
-                object.insert("status_seq".to_string(), json!(status_seq));
-                object.insert("observed_at_ms".to_string(), json!(observed_at_ms));
-                object.insert("close_reason".to_string(), json!(reason));
-            }
+            cloud_mcp_clear_terminal_prompt_state(terminal, None, reason, observed_at_ms);
+            cloud_mcp_mark_terminal_value_closed(
+                terminal,
+                status_seq,
+                observed_at_ms,
+                reason,
+            );
         }
         if workspace_matched {
+            cloud_mcp_recount_workspace_terminal_activity(workspace);
             if let Some(object) = workspace.as_object_mut() {
                 object.insert(
                     "workspace_runtime_seq".to_string(),
@@ -34330,6 +34484,133 @@ async fn cloud_mcp_mark_device_live_terminal_closed(
             object.insert("ts_ms".to_string(), json!(observed_at_ms));
         }
     }
+}
+
+/// Withdraw a prompt that finished publishing after its discovery generation
+/// or terminal instance had already been invalidated.  This mutates only an
+/// existing exact terminal row and never routes the stale instance through the
+/// normal activity pipeline, so it cannot create a phantom terminal or
+/// resurrect a closed one as `thinking`.
+fn cloud_mcp_withdraw_stale_terminal_prompt_in_snapshot(
+    snapshot: &mut Value,
+    pane_id: &str,
+    instance_id: u64,
+    provider_request_id: &str,
+    terminal_closed: bool,
+    status_seq: u64,
+    observed_at_ms: u64,
+    reason: &str,
+) -> bool {
+    let Some(workspaces) = snapshot.get_mut("workspaces").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    for workspace in workspaces {
+        let mut workspace_changed = false;
+        let Some(terminals) = workspace.get_mut("terminals").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for terminal in terminals {
+            if !cloud_mcp_presence_terminal_matches_instance_for_close(
+                terminal,
+                pane_id,
+                instance_id,
+            ) {
+                continue;
+            }
+            if !terminal_closed {
+                let published_request_id = cloud_mcp_payload_text(
+                    terminal,
+                    &["provider_request_id", "permission_request_id", "prompt_id"],
+                )
+                .unwrap_or_default();
+                if published_request_id.trim() != provider_request_id.trim() {
+                    // A newer prompt generation already owns this live row.
+                    // The stale generation is resolved locally, but must not
+                    // clear the replacement interaction.
+                    continue;
+                }
+            }
+            cloud_mcp_clear_terminal_prompt_state(
+                terminal,
+                Some(provider_request_id),
+                reason,
+                observed_at_ms,
+            );
+            if terminal_closed {
+                cloud_mcp_mark_terminal_value_closed(
+                    terminal,
+                    status_seq,
+                    observed_at_ms,
+                    reason,
+                );
+            } else if let Some(object) = terminal.as_object_mut() {
+                // The terminal is still current but a newer deterministic
+                // discovery generation replaced this prompt. Keep it alive in
+                // a non-actionable startup state until that generation settles.
+                object.insert("status".to_string(), json!("starting"));
+                object.insert("state".to_string(), json!("starting"));
+                object.insert("activity_status".to_string(), json!("starting"));
+                object.insert("native_rail_state".to_string(), json!("starting"));
+                object.insert("terminal_lifecycle".to_string(), json!("starting"));
+                object.insert("readiness".to_string(), json!("starting"));
+                object.insert("command_phase".to_string(), json!("starting"));
+                object.insert("execution_phase".to_string(), json!("starting"));
+                object.insert("turn_status".to_string(), json!("idle"));
+                object.insert("input_ready".to_string(), json!(false));
+                object.insert("status_seq".to_string(), json!(status_seq));
+                object.insert("observed_at_ms".to_string(), json!(observed_at_ms));
+            }
+            workspace_changed = true;
+            changed = true;
+        }
+        if workspace_changed {
+            cloud_mcp_recount_workspace_terminal_activity(workspace);
+        }
+    }
+    if changed {
+        if let Some(object) = snapshot.as_object_mut() {
+            object.insert("reason".to_string(), json!(reason));
+            object.insert("ts_ms".to_string(), json!(observed_at_ms));
+        }
+    }
+    changed
+}
+
+pub(crate) async fn cloud_mcp_withdraw_stale_terminal_prompt(
+    state: &CloudMcpState,
+    pane_id: &str,
+    instance_id: u64,
+    provider_request_id: &str,
+    terminal_closed: bool,
+    reason: &str,
+) -> bool {
+    let observed_at_ms = cloud_mcp_now_ms();
+    let status_seq = cloud_mcp_next_terminal_lifecycle_seq(state, Some(observed_at_ms));
+    let changed = {
+        let mut snapshots = state.runtime_snapshots.lock().await;
+        snapshots.workspace_terminals.as_mut().is_some_and(|snapshot| {
+            cloud_mcp_withdraw_stale_terminal_prompt_in_snapshot(
+                snapshot,
+                pane_id,
+                instance_id,
+                provider_request_id,
+                terminal_closed,
+                status_seq,
+                observed_at_ms,
+                reason,
+            )
+        })
+    };
+    if changed {
+        let publish_reason = if terminal_closed {
+            format!("terminal_close:{reason}")
+        } else {
+            format!("terminal_prompt_resolved:{reason}")
+        };
+        cloud_mcp_publish_device_live_state_snapshot_debounced(state, &publish_reason).await;
+    }
+    changed
 }
 
 async fn cloud_mcp_enqueue_terminal_closed_delta(
@@ -34450,6 +34731,27 @@ async fn cloud_mcp_enqueue_terminal_closed_delta(
         "input_ready": false,
         "session_mode": close_context.session_mode.as_str(),
         "session_state": "no_session",
+        "prompt_id": "",
+        "prompt_kind": null,
+        "prompt_default_option": null,
+        "prompt_ttl_ms": null,
+        "prompt_options": [],
+        "prompt_questions": null,
+        "prompt_schema": null,
+        "prompt_url": null,
+        "allows_free_text": false,
+        "manual_approval_required": false,
+        "provider_blocked_for_user": false,
+        "terminal_is_prompting_user": false,
+        "prompting_user_kind": null,
+        "prompting_user_source": null,
+        "prompting_user_confidence": null,
+        "prompting_user_text": null,
+        "interaction_id": null,
+        "interaction_revision": null,
+        "interaction_source": null,
+        "interaction_response_mode": null,
+        "provider_request_id": null,
         "task_id": local_task_id,
         "run_id": local_task_id,
         "last_prompt": last_prompt,
@@ -37846,6 +38148,8 @@ async fn cloud_mcp_apply_terminal_state_to_device_live_snapshot(
     payload: &Value,
     reason: &str,
 ) {
+    let payload_is_runtime_shutdown =
+        cloud_mcp_terminal_state_is_workspace_runtime_shutdown(payload);
     let workspace_id = cloud_mcp_payload_text(&payload, &["workspace_id"])
         .unwrap_or_else(|| "workspace".to_string());
     let repo_id = cloud_mcp_payload_text(payload, &["repo_id"]);
@@ -37867,6 +38171,12 @@ async fn cloud_mcp_apply_terminal_state_to_device_live_snapshot(
 
     let mut snapshots = state.runtime_snapshots.lock().await;
     if snapshots.workspace_terminals.is_none() {
+        // A late close cannot close anything if no live snapshot exists. Do
+        // not materialize a phantom workspace/terminal solely to carry the
+        // stale tombstone.
+        if payload_is_runtime_shutdown {
+            return;
+        }
         snapshots.workspace_terminals = Some(json!({
             "source": "rust-diffforge-device-live-terminals",
             "event_kind": "device_live_state_snapshot",
@@ -37928,6 +38238,9 @@ async fn cloud_mcp_apply_terminal_state_to_device_live_snapshot(
         let workspace_index = match workspace_index {
             Some(index) => index,
             None => {
+                if payload_is_runtime_shutdown {
+                    return;
+                }
                 let mut workspace_value = json!({
                     "repo_id": repo_id.clone(),
                     "workspace_id": workspace_id.clone(),
@@ -37951,8 +38264,10 @@ async fn cloud_mcp_apply_terminal_state_to_device_live_snapshot(
             return;
         };
         if let Some(object) = workspace.as_object_mut() {
-            object.insert("workspace_active".to_string(), json!(true));
-            object.insert("workspace_status".to_string(), json!("active"));
+            if !payload_is_runtime_shutdown {
+                object.insert("workspace_active".to_string(), json!(true));
+                object.insert("workspace_status".to_string(), json!("active"));
+            }
             if let Some(workspace_root) = workspace_root.as_deref() {
                 object.insert("workspace_root".to_string(), json!(workspace_root));
             }
@@ -37988,15 +38303,29 @@ async fn cloud_mcp_apply_terminal_state_to_device_live_snapshot(
             cloud_mcp_terminal_state_is_workspace_runtime_shutdown(&terminal_value);
         if workspace_runtime_shutdown {
             cloud_mcp_mark_terminal_last_known_read_only(&mut terminal_value);
+            cloud_mcp_clear_terminal_prompt_state(
+                &mut terminal_value,
+                None,
+                reason,
+                observed_at_ms,
+            );
         }
         let terminal_removes_from_snapshot = !workspace_runtime_shutdown
             && cloud_mcp_terminal_state_removes_from_live_snapshot(&terminal_value);
         let existing_index = terminals.iter().position(|terminal| {
-            cloud_mcp_presence_terminal_matches_instance(
-                terminal,
-                &terminal_id,
-                terminal_instance_id,
-            )
+            if workspace_runtime_shutdown && terminal_instance_id > 0 {
+                cloud_mcp_presence_terminal_matches_instance_for_close(
+                    terminal,
+                    &terminal_id,
+                    terminal_instance_id,
+                )
+            } else {
+                cloud_mcp_presence_terminal_matches_instance(
+                    terminal,
+                    &terminal_id,
+                    terminal_instance_id,
+                )
+            }
         });
         if terminal_removes_from_snapshot {
             terminals.retain(|terminal| {
@@ -38010,30 +38339,8 @@ async fn cloud_mcp_apply_terminal_state_to_device_live_snapshot(
             if let Some(existing) = terminals.get_mut(existing_index) {
                 cloud_mcp_live_state_merge_object(existing, terminal_value);
             }
-        } else {
-            // Close notifications run detached from workspace close: a late
-            // shutdown payload for an old instance must not materialize a
-            // phantom last-known row when the pane already re-registered
-            // with a newer instance.
-            let stale_shutdown_for_reopened_pane = workspace_runtime_shutdown
-                && terminal_instance_id > 0
-                && terminals.iter().any(|terminal| {
-                    cloud_mcp_payload_text(
-                        terminal,
-                        &["pane_id", "terminal_id", "target_terminal_id"],
-                    )
-                    .unwrap_or_default()
-                        == terminal_id
-                        && cloud_mcp_payload_u64(
-                            terminal,
-                            &["terminal_instance_id", "instance_id"],
-                        )
-                        .map(|value| value > terminal_instance_id)
-                        .unwrap_or(false)
-                });
-            if !stale_shutdown_for_reopened_pane {
-                terminals.push(terminal_value);
-            }
+        } else if !workspace_runtime_shutdown {
+            terminals.push(terminal_value);
         }
         let terminal_count = terminals.len();
         let active_count = terminals
@@ -38063,7 +38370,6 @@ async fn cloud_mcp_apply_terminal_state_to_device_live_snapshot(
         if let Some(object) = workspace.as_object_mut() {
             object.insert("terminal_count".to_string(), json!(terminal_count));
             object.insert("active_count".to_string(), json!(active_count));
-            object.insert("workspace_active".to_string(), json!(terminal_count > 0));
         }
         let total_terminal_count = workspaces
             .iter()
@@ -58500,6 +58806,12 @@ mod cloud_mcp_tests {
         assert!(cloud_mcp_device_live_snapshot_lifecycle_fast_lane(
             "local_workspace_deleted"
         ));
+        assert!(cloud_mcp_device_live_snapshot_lifecycle_fast_lane(
+            "terminal_close:stale_prompt_withdrawal"
+        ));
+        assert!(cloud_mcp_device_live_snapshot_lifecycle_fast_lane(
+            "terminal_prompt_resolved:stale_generation"
+        ));
         assert!(!cloud_mcp_device_live_snapshot_lifecycle_fast_lane(
             "websocket_ready_replay"
         ));
@@ -60100,6 +60412,275 @@ mod cloud_mcp_tests {
         assert_eq!(terminal["prompt_options"][0]["danger"], json!(true));
         assert_eq!(terminal["allows_free_text"], json!(true));
         assert_eq!(terminal["terminal_is_prompting_user"], json!(true));
+    }
+
+    #[test]
+    fn stale_prompt_withdrawal_closes_only_exact_terminal_instance_without_phantom() {
+        let mut snapshot = json!({
+            "workspaces": [{
+                "workspace_id": "workspace-a",
+                "workspace_active": true,
+                "active_count": 2,
+                "terminal_count": 2,
+                "terminals": [{
+                    "pane_id": "pane-1",
+                    "terminal_instance_id": 7,
+                    "status": "awaiting_input",
+                    "provider_request_id": "codex-hook-trust-old",
+                    "prompt_id": "codex-hook-trust-old",
+                    "interaction_id": "uir:old",
+                    "interaction_revision": 7,
+                    "interaction_source": "provider_hook",
+                    "terminal_is_prompting_user": true,
+                    "provider_blocked_for_user": true,
+                    "manual_approval_required": true,
+                    "prompt_options": [{"id": "trust", "label": "Trust"}]
+                }, {
+                    "pane_id": "pane-1",
+                    "terminal_instance_id": 8,
+                    "status": "awaiting_input",
+                    "provider_request_id": "codex-hook-trust-new",
+                    "prompt_id": "codex-hook-trust-new",
+                    "interaction_id": "uir:new",
+                    "interaction_revision": 8,
+                    "interaction_source": "provider_hook",
+                    "terminal_is_prompting_user": true
+                }]
+            }]
+        });
+
+        assert!(cloud_mcp_withdraw_stale_terminal_prompt_in_snapshot(
+            &mut snapshot,
+            "pane-1",
+            7,
+            "codex-hook-trust-old",
+            true,
+            101,
+            1_000,
+            "terminal_replaced",
+        ));
+        let terminals = snapshot["workspaces"][0]["terminals"]
+            .as_array()
+            .expect("terminal rows");
+        let old = &terminals[0];
+        let current = &terminals[1];
+        assert_eq!(old["status"], json!("closed"));
+        assert_eq!(old["terminal_is_prompting_user"], json!(false));
+        assert_eq!(old["prompt_id"], json!(""));
+        assert!(old["interaction_id"].is_null());
+        assert!(old["provider_request_id"].is_null());
+        assert_eq!(old["resolved_provider_request_id"], json!("codex-hook-trust-old"));
+        assert_eq!(current["status"], json!("awaiting_input"));
+        assert_eq!(current["provider_request_id"], json!("codex-hook-trust-new"));
+        assert_eq!(current["terminal_is_prompting_user"], json!(true));
+        assert_eq!(snapshot["workspaces"][0]["active_count"], json!(1));
+        assert_eq!(snapshot["workspaces"][0]["workspace_active"], json!(true));
+
+        let before = snapshot.clone();
+        assert!(!cloud_mcp_withdraw_stale_terminal_prompt_in_snapshot(
+            &mut snapshot,
+            "missing-pane",
+            99,
+            "missing-request",
+            true,
+            102,
+            1_001,
+            "terminal_replaced",
+        ));
+        assert_eq!(snapshot, before, "withdrawal must never create a phantom row");
+    }
+
+    #[test]
+    fn stale_prompt_withdrawal_does_not_clear_newer_generation_on_current_instance() {
+        let mut snapshot = json!({
+            "workspaces": [{
+                "workspace_id": "workspace-a",
+                "workspace_active": true,
+                "terminals": [{
+                    "pane_id": "pane-1",
+                    "terminal_instance_id": 7,
+                    "status": "awaiting_input",
+                    "provider_request_id": "codex-hook-trust-new",
+                    "prompt_id": "codex-hook-trust-new",
+                    "interaction_id": "uir:new",
+                    "interaction_revision": 8,
+                    "interaction_source": "provider_hook",
+                    "terminal_is_prompting_user": true
+                }]
+            }]
+        });
+        let before = snapshot.clone();
+
+        assert!(!cloud_mcp_withdraw_stale_terminal_prompt_in_snapshot(
+            &mut snapshot,
+            "pane-1",
+            7,
+            "codex-hook-trust-old",
+            false,
+            102,
+            1_001,
+            "generation_replaced",
+        ));
+        assert_eq!(snapshot, before);
+    }
+
+    #[tokio::test]
+    async fn late_terminal_close_is_exact_no_phantom_and_preserves_workspace_state() {
+        let state = CloudMcpState::new();
+        {
+            let mut snapshots = state.runtime_snapshots.lock().await;
+            snapshots.workspace_terminals = Some(json!({
+                "workspaces": [{
+                    "workspace_id": "workspace-a",
+                    "workspace_active": true,
+                    "active_count": 2,
+                    "terminal_count": 2,
+                    "terminals": [{
+                        "pane_id": "pane-1",
+                        "terminal_id": "pane-1",
+                        "terminal_instance_id": 7,
+                        "status": "awaiting_input",
+                        "provider_request_id": "request-old",
+                        "prompt_id": "prompt-old",
+                        "interaction_id": "uir:old",
+                        "interaction_revision": 7,
+                        "interaction_source": "provider_hook",
+                        "terminal_is_prompting_user": true
+                    }, {
+                        "pane_id": "pane-1",
+                        "terminal_id": "pane-1",
+                        "terminal_instance_id": 8,
+                        "status": "idle",
+                        "terminal_is_prompting_user": false
+                    }]
+                }]
+            }));
+        }
+        let close_old = json!({
+            "event_kind": "terminal_state_update",
+            "event_type": "terminal.closed",
+            "workspace_id": "workspace-a",
+            "pane_id": "pane-1",
+            "terminal_instance_id": 7,
+            "status": "closed",
+            "state": "closed",
+            "terminal_lifecycle": "closed",
+            "terminal_is_prompting_user": false,
+            "prompt_id": "",
+            "observed_at_ms": 3_000,
+        });
+
+        cloud_mcp_apply_terminal_state_to_device_live_snapshot(
+            &state,
+            &close_old,
+            "terminal_close_test",
+        )
+        .await;
+        let after_exact_close = {
+            let snapshots = state.runtime_snapshots.lock().await;
+            snapshots
+                .workspace_terminals
+                .clone()
+                .expect("workspace terminals")
+        };
+        let terminals = after_exact_close["workspaces"][0]["terminals"]
+            .as_array()
+            .expect("terminal rows");
+        assert_eq!(terminals.len(), 2);
+        assert_eq!(terminals[0]["terminal_instance_id"], json!(7));
+        assert_eq!(terminals[0]["status"], json!("closed"));
+        assert_eq!(terminals[0]["terminal_is_prompting_user"], json!(false));
+        assert_eq!(terminals[1]["terminal_instance_id"], json!(8));
+        assert_eq!(terminals[1]["status"], json!("idle"));
+        assert_eq!(after_exact_close["workspaces"][0]["active_count"], json!(1));
+        assert_eq!(after_exact_close["workspaces"][0]["workspace_active"], json!(true));
+
+        let before_missing_close = after_exact_close.clone();
+        let mut missing_close = close_old.clone();
+        missing_close["terminal_instance_id"] = json!(6);
+        cloud_mcp_apply_terminal_state_to_device_live_snapshot(
+            &state,
+            &missing_close,
+            "terminal_close_missing_exact_test",
+        )
+        .await;
+        let after_missing_close = {
+            let snapshots = state.runtime_snapshots.lock().await;
+            snapshots
+                .workspace_terminals
+                .clone()
+                .expect("workspace terminals")
+        };
+        assert_eq!(
+            after_missing_close["workspaces"][0]["terminals"],
+            before_missing_close["workspaces"][0]["terminals"],
+            "a missing exact close must not create or mutate a terminal row",
+        );
+
+        let mut close_current = close_old;
+        close_current["terminal_instance_id"] = json!(8);
+        close_current["observed_at_ms"] = json!(3_001);
+        cloud_mcp_apply_terminal_state_to_device_live_snapshot(
+            &state,
+            &close_current,
+            "terminal_close_last_active_test",
+        )
+        .await;
+        let snapshots = state.runtime_snapshots.lock().await;
+        let workspace = &snapshots
+            .workspace_terminals
+            .as_ref()
+            .expect("workspace terminals")["workspaces"][0];
+        assert_eq!(workspace["active_count"], json!(0));
+        assert_eq!(workspace["workspace_active"], json!(true));
+    }
+
+    #[test]
+    fn workspace_deactivation_explicitly_clears_all_terminal_prompts() {
+        let mut snapshot = Some(json!({
+            "workspaces": [{
+                "workspace_id": "workspace-a",
+                "workspace_active": true,
+                "terminals": [{
+                    "pane_id": "pane-1",
+                    "terminal_instance_id": 1,
+                    "status": "awaiting_input",
+                    "prompt_id": "prompt-1",
+                    "interaction_id": "uir:1",
+                    "interaction_revision": 1,
+                    "interaction_source": "provider_hook",
+                    "provider_request_id": "request-1",
+                    "terminal_is_prompting_user": true
+                }, {
+                    "pane_id": "pane-2",
+                    "terminal_instance_id": 2,
+                    "status": "awaiting_input",
+                    "prompt_id": "prompt-2",
+                    "interaction_id": "uir:2",
+                    "interaction_revision": 2,
+                    "interaction_source": "provider_hook",
+                    "provider_request_id": "request-2",
+                    "terminal_is_prompting_user": true
+                }]
+            }]
+        }));
+
+        assert!(cloud_mcp_mark_workspace_inactive_in_snapshot(
+            &mut snapshot,
+            "workspace-a",
+            "macos",
+            "workspace_deactivate_test",
+            2_000,
+        ));
+        let workspace = &snapshot.expect("snapshot")["workspaces"][0];
+        assert_eq!(workspace["workspace_active"], json!(false));
+        for terminal in workspace["terminals"].as_array().expect("terminals") {
+            assert_eq!(terminal["terminal_is_prompting_user"], json!(false));
+            assert_eq!(terminal["prompt_id"], json!(""));
+            assert!(terminal["interaction_id"].is_null());
+            assert!(terminal["provider_request_id"].is_null());
+            assert_eq!(terminal["commandable"], json!(false));
+        }
     }
 
     #[tokio::test]

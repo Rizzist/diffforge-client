@@ -1944,8 +1944,15 @@ function limitHasResetTiming(limit = {}) {
 }
 
 function limitResetReferenceRow(rows = []) {
-  const candidates = (Array.isArray(rows) ? rows : []).filter(limitHasResetTiming);
-  const source = candidates.length ? candidates : (Array.isArray(rows) ? rows : []);
+  const pool = Array.isArray(rows) ? rows : [];
+  // A projected "assume fresh" row (client_reset_pending) is a guess: it
+  // must not narrate the card's reset timing while live rows exist —
+  // otherwise the caption reads "window ended; assuming 100%" beside a real
+  // over-pace warning contributed by a live account.
+  const live = pool.filter((row) => !row?.client_reset_pending);
+  const preferred = live.length ? live : pool;
+  const candidates = preferred.filter(limitHasResetTiming);
+  const source = candidates.length ? candidates : preferred;
   return [...source].sort((left, right) => {
     const activeDelta = Number(providerLimitUsesActiveAccount(right)) - Number(providerLimitUsesActiveAccount(left));
     if (activeDelta) return activeDelta;
@@ -2073,7 +2080,12 @@ function mergeLimits(limits, windowKind) {
     paceDelta,
     pace_status: paceStatus,
     overPace,
-    status_label: limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable, paceStatus),
+    // A card built ONLY from projected "assume fresh" rows has no observed
+    // usage: "Safe at current pace" would be a claim about a pace nobody
+    // measured yet.
+    status_label: rows.every((row) => row?.client_reset_pending)
+      ? "Fresh window; awaiting live usage"
+      : limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable, paceStatus),
     reset_label: limitResetLabel(rows, normalizedWindowKind, claudeUnavailable, resetReference),
     rate_points: ratePoints,
     limit_window_seconds: limitNumberOrNull(resetReference?.limit_window_seconds, rows[0]?.limit_window_seconds, rows[0]?.limit_window_seconds) ?? 0,
