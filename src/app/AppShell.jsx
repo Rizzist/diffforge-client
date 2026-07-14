@@ -19317,19 +19317,21 @@ function getWorkspaceTerminalRoleIds(roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIO
   return new Set(roleOptions.map((role) => role.id));
 }
 
-function getWorkspaceTerminalRoleOptions(agentStatuses = DEFAULT_AGENT_STATUSES) {
-  const installedAgentIds = new Set(
-    (Array.isArray(agentStatuses) ? agentStatuses : [])
-      .filter((agent) => agent.installed)
-      .map((agent) => agent.id),
-  );
-  const options = WORKSPACE_TERMINAL_ROLE_OPTIONS.filter((option) => (
-    option.id === WORKSPACE_TERMINAL_ROLE_GENERIC || installedAgentIds.has(option.id)
-  ));
-
-  return options.some((option) => option.id === WORKSPACE_TERMINAL_ROLE_GENERIC)
-    ? options
-    : WORKSPACE_TERMINAL_ROLE_OPTIONS.filter((option) => option.id === WORKSPACE_TERMINAL_ROLE_GENERIC);
+function getWorkspaceTerminalRoleOptions(_agentStatuses = DEFAULT_AGENT_STATUSES) {
+  // The harness roster is STATIC and monotonic: every known harness is always a
+  // valid role, independent of a transient CLI-probe result. Filtering by
+  // `installed` here previously let a single failed/torn `--version` probe — e.g.
+  // while the harness npm package self-updated and its bin symlink was momentarily
+  // swapped — drop a harness from the options. That dropped role then failed
+  // `normalizeWorkspaceTerminalRole` and was coerced to the "codex" fallback, which
+  // rewrote persisted AND live terminal identity and tore down the running PTY
+  // (terminal_close → terminal_open as Codex). Roster membership must never depend
+  // on availability. Availability now only gates NEW launches — the picker's
+  // per-agent `available` flag disables the "+" stepper, and the spawn paths still
+  // enforce installed/authenticated — never roster membership or the identity of an
+  // already-running terminal. (Mirrors the fail-open badge roster + "Never forced"
+  // pane-identity precedents.)
+  return WORKSPACE_TERMINAL_ROLE_OPTIONS;
 }
 
 function getWorkspaceTerminalFallbackRole(
@@ -19557,11 +19559,46 @@ function getReadyWorkspaceTerminalAgent(agentStatuses, role) {
   const exactAgent = (Array.isArray(agentStatuses) ? agentStatuses : [])
     .find((agent) => agent?.id === roleId);
 
-  if (exactAgent?.installed || exactAgent?.authenticated) {
+  // Sticky identity: a canonical harness role must ALWAYS resolve to a stable agent
+  // identity for rendering + pane-id derivation, even when a transient `--version`
+  // probe reports it not-installed/not-authenticated. Returning null on a probe
+  // flicker previously made a live terminal's `paneAgentId` (= agent?.id) undefined,
+  // which changed its `paneId` and tore down the running PTY (reopening it as the
+  // codex default). Availability is a display/spawn concern read from the returned
+  // object's `installed`/`authenticated` fields — never a reason to drop identity.
+  if (exactAgent) {
     return exactAgent;
   }
 
-  return null;
+  return DEFAULT_AGENT_STATUSES.find((agent) => agent?.id === roleId) || null;
+}
+
+// Fail-open harness availability. A `<binary> --version` probe returns Err (→
+// installed:false) not only for a genuine uninstall but for a transient miss — most
+// commonly while the harness's own npm package self-updates and its bin symlink is
+// momentarily swapped (the exact trigger observed for the OpenCode→Codex incident).
+// Demoting a previously-installed harness on that flicker hides its Settings card and
+// disables new launches for a few seconds. Retain the last-known installed identity
+// when the new snapshot omits the provider entirely, or reports it not-installed while
+// the independent npm package check still detects the package. Only a corroborated
+// removal (probe AND npm both absent) demotes. Roster membership + live-pane identity
+// are already sticky (getWorkspaceTerminalRoleOptions / getReadyWorkspaceTerminalAgent);
+// this keeps the availability signal itself from thrashing.
+function mergeAgentStatusFailOpen(prev, next, present) {
+  if (!prev?.installed || next?.installed) {
+    return next;
+  }
+  const packageStillDetected = Boolean(next?.npm_installed);
+  if (!present || packageStillDetected) {
+    return {
+      ...next,
+      installed: true,
+      authenticated: prev.authenticated,
+      version: prev.version,
+      auth_message: prev.auth_message,
+    };
+  }
+  return next;
 }
 
 function isWorkspacePermissionAgentRole(role) {
@@ -31602,11 +31639,21 @@ export default function App() {
     try {
       const statuses = await invoke("agent_statuses");
       const statusMap = new Map(statuses.map((status) => [status.id, status]));
-      const nextStatuses = AGENT_PROVIDERS.map((provider) => ({
-        ...DEFAULT_AGENT_STATUSES.find((status) => status.id === provider.id),
-        ...provider,
-        ...(statusMap.get(provider.id) || {}),
-      }));
+      const prevStatusMap = new Map(
+        (agentStatusesRef.current || []).map((status) => [status.id, status]),
+      );
+      const nextStatuses = AGENT_PROVIDERS.map((provider) => {
+        const merged = {
+          ...DEFAULT_AGENT_STATUSES.find((status) => status.id === provider.id),
+          ...provider,
+          ...(statusMap.get(provider.id) || {}),
+        };
+        return mergeAgentStatusFailOpen(
+          prevStatusMap.get(provider.id),
+          merged,
+          statusMap.has(provider.id),
+        );
+      });
       persistAgentStatusCache(nextStatuses);
       agentStatusesRef.current = nextStatuses;
       setAgentStatuses(nextStatuses);
@@ -31635,11 +31682,21 @@ export default function App() {
         return;
       }
       const statusMap = new Map(statuses.map((status) => [status.id, status]));
-      const nextStatuses = AGENT_PROVIDERS.map((provider) => ({
-        ...DEFAULT_AGENT_STATUSES.find((status) => status.id === provider.id),
-        ...provider,
-        ...(statusMap.get(provider.id) || {}),
-      }));
+      const prevStatusMap = new Map(
+        (agentStatusesRef.current || []).map((status) => [status.id, status]),
+      );
+      const nextStatuses = AGENT_PROVIDERS.map((provider) => {
+        const merged = {
+          ...DEFAULT_AGENT_STATUSES.find((status) => status.id === provider.id),
+          ...provider,
+          ...(statusMap.get(provider.id) || {}),
+        };
+        return mergeAgentStatusFailOpen(
+          prevStatusMap.get(provider.id),
+          merged,
+          statusMap.has(provider.id),
+        );
+      });
       persistAgentStatusCache(nextStatuses);
       agentStatusesRef.current = nextStatuses;
       setAgentStatuses(nextStatuses);

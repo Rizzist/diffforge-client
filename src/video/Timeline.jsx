@@ -42,6 +42,7 @@ import {
   findClip,
   formatTimecode,
   gainAtMs,
+  isStillImageAsset,
   linkClips,
   MEME_TEXT_STYLE,
   motionPresetPatch,
@@ -59,6 +60,7 @@ import {
   rippleTrim,
   serializeClips,
   setClipKeyframe,
+  setClipSpeed,
   snapMs,
   splitClip,
   splitLinkedAt,
@@ -1692,6 +1694,18 @@ export default function Timeline({
     [onChange, project, selectedClipId],
   );
 
+  // Playback rate: keeps the consumed footage and rescales the clip's timeline
+  // length (linked A/V partners follow inside setClipSpeed).
+  const applySelectedSpeed = useCallback(
+    (speed) => {
+      if (!selectedClipId) {
+        return;
+      }
+      onChange?.(setClipSpeed(project, selectedClipId, speed), { transient: false });
+    },
+    [onChange, project, selectedClipId],
+  );
+
   const selectedGain = selected && selected.track.kind !== "text" ? normalizeGain(selected.clip.gain) : null;
 
   // --- Transitions + keyframe lane editor -----------------------------------
@@ -2479,6 +2493,38 @@ export default function Timeline({
                     value={selected.clip.motion || "none"}
                   />
                 </VideoLabel>
+              ) : null}
+              {!isStillImageAsset(selected.clip.assetPath) ? (
+                <>
+                  <SliderLabel>
+                    Speed · {(selected.clip.speed || 1).toFixed(2)}×
+                    <input
+                      max={4}
+                      min={0.25}
+                      onChange={(event) => applySelectedSpeed(Number(event.target.value))}
+                      step={0.05}
+                      type="range"
+                      value={Math.min(4, Math.max(0.25, selected.clip.speed || 1))}
+                    />
+                  </SliderLabel>
+                  <InspectorRow>
+                    {[0.5, 1, 1.5, 2].map((preset) => (
+                      <VideoSecondaryButton
+                        key={preset}
+                        onClick={() => applySelectedSpeed(preset)}
+                        style={
+                          Math.abs((selected.clip.speed || 1) - preset) < 0.005
+                            ? { borderColor: "rgba(16,185,129,0.5)", color: "#a7f3d0" }
+                            : undefined
+                        }
+                        title={`Play at ${preset}× — the clip's length rescales to keep the same footage`}
+                        type="button"
+                      >
+                        {preset}×
+                      </VideoSecondaryButton>
+                    ))}
+                  </InspectorRow>
+                </>
               ) : null}
               <SliderLabel>
                 Volume · {Math.round((selectedGain?.level ?? 1) * 100)}%

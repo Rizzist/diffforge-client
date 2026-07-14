@@ -41,6 +41,8 @@ test("notification prefs normalize defaults and canonical snake case", () => {
   assert.deepEqual(prefs.push, {
     custom_channel: "kept",
     uir_prompts: false,
+    todo_started: true,
+    todo_completed: true,
     loop_run_started: true,
     loop_run_completed: false,
     loop_run_failed: true,

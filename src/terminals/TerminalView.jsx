@@ -1789,8 +1789,14 @@ const TerminalGridScaffold = styled.div`
      invisible: the panels/anchors are pure layout+measurement chrome (the
      surface slots render the real panes), and their opaque backgrounds
      would otherwise blank every terminal. Only the separators show. */
+  /* ResizePanelGroup and ResizePanel both own an opaque terminal background.
+     Clearing only the library's data-panel node leaves each group painting a
+     solid black sheet above TerminalSurfaceLayer. Scope the override to this
+     measurement scaffold so resize groups elsewhere retain their surfaces. */
+  && ${ResizePanelGroup},
+  && ${ResizePanel},
   && [data-panel] {
-    background: transparent;
+    background: transparent !important;
   }
 
   && [data-terminal-panel-anchor="true"],

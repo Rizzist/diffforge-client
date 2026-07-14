@@ -973,14 +973,19 @@ export function trimClipStart(project, clipId, deltaMs) {
   });
 }
 
+// Still images have no source clock: their duration is pure display time and
+// playback speed is meaningless.
+export function isStillImageAsset(assetPath) {
+  return /\.(png|jpe?g|webp|gif|bmp|tiff)$/i.test(assetPath || "");
+}
+
 export function trimClipEnd(project, clipId, deltaMs) {
   return updateClipIn(project, clipId, (clip) => {
     const requestedDuration = Math.max(
       MIN_CLIP_DURATION_MS,
       clip.durationMs + Math.round(deltaMs),
     );
-    const isStillImage = /\.(png|jpe?g|webp|gif|bmp|tiff)$/i.test(clip.assetPath || "");
-    if (requestedDuration > clip.durationMs && clip.sourceInMs != null && !isStillImage) {
+    if (requestedDuration > clip.durationMs && clip.sourceInMs != null && !isStillImageAsset(clip.assetPath)) {
       // Extending a media edge is a time-stretch, not permission to read past
       // the source EOF. Preserve the currently-used source span and lower the
       // playback rate to fill the new timeline duration. This also keeps
@@ -1010,6 +1015,32 @@ export function trimClips(project, clipIds, edge, deltaMs) {
   let next = project;
   for (const id of ids) {
     next = edge === "start" ? trimClipStart(next, id, deltaMs) : trimClipEnd(next, id, deltaMs);
+  }
+  return next;
+}
+
+// Set a media clip's playback rate directly (the inspector's Speed control).
+// The consumed source span is preserved — timeline duration rescales to
+// span / speed, exactly like trim-stretching — and linked partners follow so
+// A/V stays sample-aligned.
+export function setClipSpeed(project, clipId, speed) {
+  const nextSpeed = Math.min(8, Math.max(0.1, cleanNumber(speed, 1)));
+  const found = findClip(project, clipId);
+  if (!found || found.track.kind === "text" || isStillImageAsset(found.clip.assetPath)) {
+    return project;
+  }
+  const ids = linkedClipIds(project, clipId);
+  const members = ids.map((id) => findClip(project, id));
+  if (members.some((member) => !member || member.track.locked)) {
+    return project;
+  }
+  let next = project;
+  for (const id of ids) {
+    next = updateClipIn(next, id, (clip) => {
+      const sourceSpanMs = clip.durationMs * (clip.speed || 1);
+      clip.speed = nextSpeed;
+      clip.durationMs = Math.max(MIN_CLIP_DURATION_MS, Math.round(sourceSpanMs / nextSpeed));
+    });
   }
   return next;
 }

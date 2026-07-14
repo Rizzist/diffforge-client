@@ -43,6 +43,7 @@ import {
   rippleTrim,
   serializeClips,
   setClipKeyframe,
+  setClipSpeed,
   snapMs,
   splitClip,
   splitLinkedAt,
@@ -177,6 +178,47 @@ test("linked A/V end stretching keeps both partners at the same speed", () => {
   assert.equal(pair.length, 2);
   assert.ok(pair.every((clip) => clip.durationMs === 5000));
   assert.ok(pair.every((clip) => Math.abs(clip.speed - 0.6) < 1e-9));
+});
+
+test("setClipSpeed rescales duration to preserve the consumed source span", () => {
+  const project = projectWithClip(); // 4000ms of timeline at 1x = 4000ms of source
+  const spedUp = setClipSpeed(project, "clip-1", 2);
+  const clip = spedUp.tracks.find((track) => track.kind === "video").clips[0];
+  assert.equal(clip.speed, 2);
+  assert.equal(clip.durationMs, 2000);
+  assertClose(clip.durationMs * clip.speed, 4000);
+
+  const slowed = setClipSpeed(spedUp, "clip-1", 0.5);
+  const slowClip = slowed.tracks.find((track) => track.kind === "video").clips[0];
+  assert.equal(slowClip.speed, 0.5);
+  assert.equal(slowClip.durationMs, 8000);
+});
+
+test("setClipSpeed keeps linked A/V partners in lockstep", () => {
+  const linked = addMediaClip(
+    makeStarterProject("speed"),
+    { path: "media/assets/av.mp4", kind: "video", durationMs: 3000, hasAudio: true },
+  );
+  const spedUp = setClipSpeed(linked.project, linked.clipId, 1.5);
+  const pair = spedUp.tracks.flatMap((track) => track.clips).filter((clip) => clip.linkId);
+  assert.equal(pair.length, 2);
+  assert.ok(pair.every((clip) => clip.speed === 1.5));
+  assert.ok(pair.every((clip) => clip.durationMs === 2000));
+});
+
+test("setClipSpeed clamps the rate and refuses text, still images, and locked tracks", () => {
+  const clamped = setClipSpeed(projectWithClip(), "clip-1", 99);
+  assert.equal(clamped.tracks.find((track) => track.kind === "video").clips[0].speed, 8);
+
+  const image = projectWithClip({ assetPath: "media/assets/a.png" });
+  assert.equal(setClipSpeed(image, "clip-1", 2), image);
+
+  const withText = addTextClip(makeStarterProject("text"), { text: "hi", timelineStartMs: 0 });
+  assert.equal(setClipSpeed(withText.project, withText.clipId, 2), withText.project);
+
+  const locked = projectWithClip();
+  locked.tracks.find((track) => track.kind === "video").locked = true;
+  assert.equal(setClipSpeed(locked, "clip-1", 2), locked);
 });
 
 test("splits a clip preserving source continuity and gain envelope", () => {

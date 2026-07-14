@@ -1852,6 +1852,11 @@ fn terminal_agent_start_input_with_env_in_directory(
     working_directory: &Path,
     env_vars: &[(String, String)],
 ) -> String {
+    preflight_interactive_claude_workspace_trust(
+        command_path,
+        working_directory,
+        env_vars,
+    );
     let mut input = terminal_set_working_directory_input(working_directory);
     for (key, value) in env_vars {
         if key.trim().is_empty() {
@@ -1888,15 +1893,19 @@ fn terminal_args_with_codex_mcp_identity(
     instance_id: u64,
     activity_transport: Option<&TerminalActivityTransportEndpoint>,
 ) -> Vec<String> {
-    let mut next = args.to_vec();
     let provider_id = provider_id.to_ascii_lowercase();
     let is_codex = provider_id.contains("codex");
     let is_claude = provider_id.contains("claude");
+    let mut next = terminal_interactive_resume_args(&provider_id, args);
     if !is_codex && !is_claude {
         return next;
     }
     if is_codex {
         apply_codex_terminal_display_args(&mut next);
+        apply_codex_interactive_permission_args(&mut next, permission_mode);
+    }
+    if is_claude {
+        apply_claude_interactive_permission_mode_arg(&mut next, permission_mode);
     }
     let Some(coordination) = coordination else {
         return next;
@@ -2546,20 +2555,61 @@ fn apply_codex_terminal_display_args(args: &mut Vec<String>) {
     }
 }
 
-fn apply_codex_coordinated_auto_approval_args(
+fn terminal_interactive_resume_args(provider_id: &str, args: &[String]) -> Vec<String> {
+    let provider_id = provider_id.trim().to_ascii_lowercase();
+    if provider_id.contains("claude") {
+        let mut next = Vec::with_capacity(args.len());
+        let mut index = 0;
+        while index < args.len() {
+            let arg = args[index].as_str();
+            if matches!(arg, "--continue" | "-c") {
+                index += 1;
+                continue;
+            }
+            if matches!(arg, "--resume" | "-r") {
+                let has_explicit_session = args
+                    .get(index + 1)
+                    .is_some_and(|value| !value.trim().is_empty() && !value.starts_with('-'));
+                if has_explicit_session {
+                    next.push(args[index].clone());
+                    next.push(args[index + 1].clone());
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+                continue;
+            }
+            if arg == "--resume=" || arg == "-r=" {
+                index += 1;
+                continue;
+            }
+            next.push(args[index].clone());
+            index += 1;
+        }
+        return next;
+    }
+
+    let mut next = args.to_vec();
+    if provider_id.contains("codex")
+        && next.first().is_some_and(|arg| arg == "resume")
+        && !next.iter().any(|arg| arg == "--last")
+        && !next
+            .get(1)
+            .is_some_and(|arg| !arg.trim().is_empty() && !arg.starts_with('-'))
+    {
+        // Codex documents `resume --last` as the non-picker fallback. A
+        // tracked session id remains preferable and is preserved above.
+        next.insert(1, "--last".to_string());
+    }
+    next
+}
+
+fn apply_codex_interactive_permission_args(
     args: &mut Vec<String>,
-    codex_profile: Option<&str>,
-    bypass_hook_trust: bool,
     permission_mode: Option<&str>,
 ) {
     let permission_mode = permission_mode.unwrap_or(TERMINAL_PERMISSION_MODE_ACCEPT_EDITS);
     strip_terminal_arg_option(args, "--ask-for-approval", "-a", true);
-    strip_terminal_arg_option(args, "--profile", "-p", true);
-    if let Some(profile) = codex_profile.filter(|value| !value.trim().is_empty()) {
-        args.insert(0, profile.to_string());
-        args.insert(0, "--profile".to_string());
-    }
-
     strip_terminal_arg_option(args, "--sandbox", "-s", true);
     strip_terminal_arg_option(
         args,
@@ -2569,18 +2619,34 @@ fn apply_codex_coordinated_auto_approval_args(
     );
     if permission_mode == TERMINAL_PERMISSION_MODE_BYPASS {
         args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
-    } else {
-        let (approval, sandbox) = match permission_mode {
-            TERMINAL_PERMISSION_MODE_PLAN => ("never", "read-only"),
-            TERMINAL_PERMISSION_MODE_ASK => ("on-request", "workspace-write"),
-            TERMINAL_PERMISSION_MODE_FULL_ACCESS => ("never", "danger-full-access"),
-            _ => ("never", "workspace-write"),
-        };
-        args.push("--ask-for-approval".to_string());
-        args.push(approval.to_string());
-        args.push("--sandbox".to_string());
-        args.push(sandbox.to_string());
+        return;
     }
+
+    let (approval, sandbox) = match permission_mode {
+        TERMINAL_PERMISSION_MODE_PLAN => ("never", "read-only"),
+        TERMINAL_PERMISSION_MODE_ASK => ("on-request", "workspace-write"),
+        TERMINAL_PERMISSION_MODE_FULL_ACCESS => ("never", "danger-full-access"),
+        _ => ("never", "workspace-write"),
+    };
+    args.push("--ask-for-approval".to_string());
+    args.push(approval.to_string());
+    args.push("--sandbox".to_string());
+    args.push(sandbox.to_string());
+}
+
+fn apply_codex_coordinated_auto_approval_args(
+    args: &mut Vec<String>,
+    codex_profile: Option<&str>,
+    bypass_hook_trust: bool,
+    permission_mode: Option<&str>,
+) {
+    apply_codex_interactive_permission_args(args, permission_mode);
+    strip_terminal_arg_option(args, "--profile", "-p", true);
+    if let Some(profile) = codex_profile.filter(|value| !value.trim().is_empty()) {
+        args.insert(0, profile.to_string());
+        args.insert(0, "--profile".to_string());
+    }
+
     strip_terminal_arg_option(args, "--dangerously-bypass-hook-trust", "", false);
     strip_terminal_arg_option_value(args, "--enable", "", "apps");
     strip_terminal_arg_option_value(args, "--disable", "", "apps");
@@ -2693,9 +2759,7 @@ fn apply_claude_coordinated_auto_approval_args(
         coordination_args,
     ));
 
-    strip_terminal_arg_option(args, "--permission-mode", "", true);
-    args.push("--permission-mode".to_string());
-    args.push(claude_permission_mode_arg(permission_mode).to_string());
+    apply_claude_interactive_permission_mode_arg(args, Some(permission_mode));
 
     strip_terminal_arg_option(args, "--settings", "", true);
     args.push("--settings".to_string());
@@ -2712,6 +2776,16 @@ fn apply_claude_coordinated_auto_approval_args(
     strip_terminal_arg_option(args, "--setting-sources", "", true);
 
     apply_claude_managed_mcp_isolation_args(args);
+}
+
+fn apply_claude_interactive_permission_mode_arg(
+    args: &mut Vec<String>,
+    permission_mode: Option<&str>,
+) {
+    let permission_mode = permission_mode.unwrap_or(TERMINAL_PERMISSION_MODE_ACCEPT_EDITS);
+    strip_terminal_arg_option(args, "--permission-mode", "", true);
+    args.push("--permission-mode".to_string());
+    args.push(claude_permission_mode_arg(permission_mode).to_string());
 }
 
 fn apply_claude_managed_mcp_isolation_args(args: &mut Vec<String>) {
@@ -3896,13 +3970,14 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
         );
         return 0;
     };
-    let record = diff_forge_activity_hook_record(
+    let record = diff_forge_activity_hook_record_with_persisted_claude_state(
         &provider,
         &pane_id,
         instance_id,
         &workspace_id,
         &terminal_index,
         &hook_input,
+        &activity_path,
     );
     let codex_app_server_uir_active = provider.to_ascii_lowercase().contains("codex")
         && env::var("DIFFFORGE_CODEX_APP_SERVER_UIR")
@@ -4260,7 +4335,12 @@ fn diff_forge_activity_hook_blocking_fallback_response(record: &Value) -> Option
                 "action": "cancel",
             }
         })),
-        "permissiondenied" => Some(json!({ "retry": false })),
+        "permissiondenied" => Some(json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionDenied",
+                "retry": false,
+            }
+        })),
         "pretooluse" => {
             let tool_name = record
                 .get("tool_name")
@@ -4697,7 +4777,142 @@ fn diff_forge_native_plan_update(tool_name: &str, tool_input: &Value, hook_input
     }
 }
 
-fn diff_forge_activity_hook_record(
+const CLAUDE_HOOK_CORRELATION_MAX_PER_SESSION: usize = 32;
+const CLAUDE_HOOK_CORRELATION_MAX_TOTAL: usize = 128;
+const CLAUDE_HOOK_CORRELATION_LOCK_ATTEMPTS: usize = 50;
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct ClaudePreToolUseCorrelation {
+    session_id: String,
+    common_prompt_id: String,
+    tool_name: String,
+    canonical_tool_input_sha256: String,
+    tool_use_id: String,
+    arrival_ordinal: u64,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+struct ClaudeHookCorrelationState {
+    next_arrival_ordinal: u64,
+    pre_tool_uses: VecDeque<ClaudePreToolUseCorrelation>,
+}
+
+impl ClaudeHookCorrelationState {
+    fn next_ordinal(&mut self) -> u64 {
+        self.next_arrival_ordinal = self.next_arrival_ordinal.saturating_add(1).max(1);
+        self.next_arrival_ordinal
+    }
+
+    fn remember_pre_tool_use(
+        &mut self,
+        session_id: &str,
+        common_prompt_id: &str,
+        tool_name: &str,
+        tool_input: &Value,
+        tool_use_id: &str,
+    ) {
+        let arrival_ordinal = self.next_ordinal();
+        while self
+            .pre_tool_uses
+            .iter()
+            .filter(|record| record.session_id == session_id)
+            .count()
+            >= CLAUDE_HOOK_CORRELATION_MAX_PER_SESSION
+        {
+            let Some(index) = self
+                .pre_tool_uses
+                .iter()
+                .position(|record| record.session_id == session_id)
+            else {
+                break;
+            };
+            self.pre_tool_uses.remove(index);
+        }
+        self.pre_tool_uses.push_back(ClaudePreToolUseCorrelation {
+            session_id: session_id.to_string(),
+            common_prompt_id: common_prompt_id.to_string(),
+            tool_name: tool_name.to_string(),
+            canonical_tool_input_sha256: diff_forge_activity_hook_canonical_sha256(tool_input),
+            tool_use_id: tool_use_id.to_string(),
+            arrival_ordinal,
+        });
+        while self.pre_tool_uses.len() > CLAUDE_HOOK_CORRELATION_MAX_TOTAL {
+            self.pre_tool_uses.pop_front();
+        }
+    }
+
+    fn take_permission_match(
+        &mut self,
+        session_id: &str,
+        tool_name: &str,
+        tool_input: &Value,
+    ) -> Option<ClaudePreToolUseCorrelation> {
+        let tool_key = diff_forge_activity_hook_name_key(tool_name);
+        let canonical_tool_input_sha256 = diff_forge_activity_hook_canonical_sha256(tool_input);
+        let index = self.pre_tool_uses.iter().position(|record| {
+            record.session_id == session_id
+                && diff_forge_activity_hook_name_key(&record.tool_name) == tool_key
+                && record.canonical_tool_input_sha256 == canonical_tool_input_sha256
+        })?;
+        self.pre_tool_uses.remove(index)
+    }
+
+    fn evict_tool_use(&mut self, session_id: &str, tool_use_id: &str) {
+        self.pre_tool_uses
+            .retain(|record| record.session_id != session_id || record.tool_use_id != tool_use_id);
+    }
+
+    fn evict_session(&mut self, session_id: &str) {
+        self.pre_tool_uses
+            .retain(|record| record.session_id != session_id);
+    }
+}
+
+fn diff_forge_activity_hook_name_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn diff_forge_activity_hook_canonical_value(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(diff_forge_activity_hook_canonical_value)
+                .collect(),
+        ),
+        Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort();
+            let mut canonical = serde_json::Map::new();
+            for key in keys {
+                canonical.insert(
+                    key.clone(),
+                    diff_forge_activity_hook_canonical_value(&object[key]),
+                );
+            }
+            Value::Object(canonical)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn diff_forge_activity_hook_canonical_json(value: &Value) -> String {
+    serde_json::to_string(&diff_forge_activity_hook_canonical_value(value)).unwrap_or_default()
+}
+
+fn diff_forge_activity_hook_canonical_sha256(value: &Value) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(diff_forge_activity_hook_canonical_json(value).as_bytes())
+    )
+}
+
+fn diff_forge_activity_hook_record_base(
     provider: &str,
     pane_id: &str,
     instance_id: u64,
@@ -5328,9 +5543,698 @@ fn diff_forge_activity_hook_record(
     })
 }
 
+fn diff_forge_activity_hook_record_string(record: &Value, key: &str) -> String {
+    record
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn diff_forge_activity_hook_set_prompt_identity(record: &mut Value, prompt_id: &str) {
+    if prompt_id.trim().is_empty() {
+        return;
+    }
+    record["permission_request_id"] = json!(prompt_id);
+    record["prompt_id"] = json!(prompt_id);
+}
+
+fn diff_forge_activity_hook_exit_plan_body(tool_input: &Value) -> String {
+    let plan_text = ["plan", "plan_text", "planText"]
+        .iter()
+        .find_map(|key| tool_input.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let plan_path = [
+        "plan_path",
+        "planPath",
+        "plan_file_path",
+        "planFilePath",
+        "file_path",
+        "filePath",
+        "path",
+    ]
+    .iter()
+    .find_map(|key| tool_input.get(*key).and_then(Value::as_str))
+    .map(str::trim)
+    .filter(|value| !value.is_empty());
+    match (plan_text, plan_path) {
+        (Some(text), Some(path)) => format!("{text}\n\nPlan file: {path}"),
+        (Some(text), None) => text.to_string(),
+        (None, Some(path)) => format!("Plan file: {path}"),
+        (None, None) => String::new(),
+    }
+}
+
+fn diff_forge_activity_hook_apply_claude_source_fidelity(
+    hook_input: &Value,
+    record: &mut Value,
+    state: &mut ClaudeHookCorrelationState,
+) {
+    let hook_key = diff_forge_activity_hook_name_key(&diff_forge_activity_hook_record_string(
+        record,
+        "hook_event_name",
+    ));
+    let session_id = diff_forge_activity_hook_record_string(record, "session_id");
+    let tool_name = diff_forge_activity_hook_record_string(record, "tool_name");
+    let tool_key = diff_forge_activity_hook_name_key(&tool_name);
+    let tool_use_id = diff_forge_activity_hook_record_string(record, "tool_use_id");
+    let tool_input = record.get("tool_input").cloned().unwrap_or(Value::Null);
+
+    if hook_key == "pretooluse" && !tool_use_id.is_empty() {
+        let common_prompt_id =
+            diff_forge_activity_hook_record_string(record, "permission_request_id");
+        state.remember_pre_tool_use(
+            &session_id,
+            &common_prompt_id,
+            &tool_name,
+            &tool_input,
+            &tool_use_id,
+        );
+
+        if matches!(tool_key.as_str(), "askuserquestion" | "exitplanmode") {
+            diff_forge_activity_hook_set_prompt_identity(record, &tool_use_id);
+        }
+        if tool_key == "askuserquestion" {
+            // The provider's question array is the menu. Keep it grouped by
+            // question (including multiSelect) and leave the flat option list
+            // empty so projection cannot manufacture a synthetic Continue.
+            record["prompt_options"] = json!([]);
+            record["prompting_user_kind"] = json!("question");
+        } else if tool_key == "exitplanmode" {
+            let body = diff_forge_activity_hook_exit_plan_body(&tool_input);
+            if !body.is_empty() {
+                record["message"] = json!(body);
+                record["prompt"] = json!(body);
+                record["prompting_user_text"] = json!(body);
+                record["description"] = json!(body);
+            }
+            record["prompting_user_kind"] = json!("approval");
+            record["prompt_default_option"] = json!("keep_planning");
+            record["prompt_options"] = json!([
+                {
+                    "id": "approve_plan",
+                    "label": "Approve plan",
+                    "value": "approve_plan"
+                },
+                {
+                    "id": "keep_planning",
+                    "label": "Keep planning",
+                    "value": "keep_planning"
+                }
+            ]);
+            record["allows_free_text"] = json!(true);
+        }
+    } else if hook_key == "permissionrequest" {
+        if let Some(matched) = state.take_permission_match(&session_id, &tool_name, &tool_input) {
+            diff_forge_activity_hook_set_prompt_identity(record, &matched.tool_use_id);
+        } else {
+            // Preserve the historical common prompt id when Claude did not
+            // provide a preceding correlatable PreToolUse event.
+            let fallback_id =
+                diff_forge_activity_hook_record_string(record, "permission_request_id");
+            diff_forge_activity_hook_set_prompt_identity(record, &fallback_id);
+        }
+
+        let has_permission_suggestions = record
+            .get("permission_suggestions")
+            .is_some_and(|value| !value.is_null());
+        let mut options = vec![json!({
+            "id": "allow_once",
+            "label": "Allow once",
+            "value": "allow_once"
+        })];
+        if has_permission_suggestions {
+            options.push(json!({
+                "id": "allow_always",
+                "label": "Allow always",
+                "value": "allow_always"
+            }));
+        }
+        options.push(json!({
+            "id": "reject",
+            "label": "Reject",
+            "value": "reject"
+        }));
+        record["prompt_options"] = Value::Array(options);
+        record["prompt_default_option"] = json!("reject");
+    } else if hook_key == "elicitation" {
+        let native_elicitation_id = ["elicitation_id", "elicitationId"]
+            .iter()
+            .find_map(|key| hook_input.get(*key).and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                hook_input
+                    .get("provider_payload")
+                    .or_else(|| hook_input.get("providerPayload"))
+                    .and_then(|payload| {
+                        ["elicitation_id", "elicitationId"]
+                            .iter()
+                            .find_map(|key| payload.get(*key).and_then(Value::as_str))
+                    })
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                record
+                    .pointer("/provider_payload/elicitation_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            });
+        let elicitation_id = native_elicitation_id.unwrap_or_else(|| {
+            let server = [
+                "mcp_server_name",
+                "mcpServerName",
+                "server_name",
+                "serverName",
+                "server",
+            ]
+            .iter()
+            .find_map(|key| hook_input.get(*key).and_then(Value::as_str))
+            .or_else(|| {
+                hook_input
+                    .get("provider_payload")
+                    .or_else(|| hook_input.get("providerPayload"))
+                    .and_then(|payload| {
+                        [
+                            "mcp_server_name",
+                            "mcpServerName",
+                            "server_name",
+                            "serverName",
+                            "server",
+                        ]
+                        .iter()
+                        .find_map(|key| payload.get(*key).and_then(Value::as_str))
+                    })
+            })
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("server");
+            let payload = hook_input
+                .get("provider_payload")
+                .or_else(|| hook_input.get("providerPayload"))
+                .filter(|value| !value.is_null())
+                .unwrap_or(hook_input);
+            let ordinal = state.next_ordinal();
+            // Claude does not always expose elicitation_id. This documented
+            // fallback is stable for an ordered hook stream and distinct for
+            // repeated identical payloads: session + server + canonical
+            // provider payload + arrival ordinal.
+            let seed = format!(
+                "{}\n{}\n{}\n{}",
+                session_id,
+                server,
+                diff_forge_activity_hook_canonical_json(payload),
+                ordinal
+            );
+            let digest = format!("{:x}", Sha256::digest(seed.as_bytes()));
+            format!("elicitation-derived-{}", &digest[..32])
+        });
+        diff_forge_activity_hook_set_prompt_identity(record, &elicitation_id);
+        record["elicitation_id"] = json!(elicitation_id);
+        record["prompting_user_kind"] = json!("selection");
+        record["prompt_default_option"] = json!("decline");
+        record["prompt_options"] = json!([
+            { "id": "accept", "label": "Accept", "value": "accept" },
+            { "id": "decline", "label": "Decline", "value": "decline" },
+            { "id": "cancel", "label": "Cancel", "value": "cancel" }
+        ]);
+    } else if hook_key == "permissiondenied" {
+        // PermissionDenied reports a decision Claude has already finalized.
+        // DiffForge may still offer a useful retry, but it is an intervention,
+        // never a provider-native live blocking menu.
+        record["interaction_response_mode"] = json!("diffforge_intervention");
+        record["interaction_kind"] = json!("diffforge_retry_intervention");
+        record["provider_native_prompt"] = json!(false);
+    }
+
+    if matches!(
+        hook_key.as_str(),
+        "posttooluse" | "posttoolusefailure" | "permissionresult"
+    ) && !tool_use_id.is_empty()
+    {
+        state.evict_tool_use(&session_id, &tool_use_id);
+    }
+    if matches!(
+        hook_key.as_str(),
+        "stop" | "stopfailure" | "sessionend" | "userpromptcancelled"
+    ) {
+        state.evict_session(&session_id);
+    }
+}
+
+fn diff_forge_activity_hook_record_with_claude_state(
+    provider: &str,
+    pane_id: &str,
+    instance_id: u64,
+    workspace_id: &str,
+    terminal_index: &str,
+    hook_input: &Value,
+    state: &mut ClaudeHookCorrelationState,
+) -> Value {
+    let mut record = diff_forge_activity_hook_record_base(
+        provider,
+        pane_id,
+        instance_id,
+        workspace_id,
+        terminal_index,
+        hook_input,
+    );
+    if diff_forge_activity_hook_name_key(provider).contains("claude") {
+        diff_forge_activity_hook_apply_claude_source_fidelity(hook_input, &mut record, state);
+    }
+    record
+}
+
+fn diff_forge_activity_hook_record(
+    provider: &str,
+    pane_id: &str,
+    instance_id: u64,
+    workspace_id: &str,
+    terminal_index: &str,
+    hook_input: &Value,
+) -> Value {
+    diff_forge_activity_hook_record_with_claude_state(
+        provider,
+        pane_id,
+        instance_id,
+        workspace_id,
+        terminal_index,
+        hook_input,
+        &mut ClaudeHookCorrelationState::default(),
+    )
+}
+
+fn diff_forge_claude_hook_correlation_state_path(activity_path: &Path) -> PathBuf {
+    let mut path = activity_path.to_path_buf();
+    path.set_extension("claude-hook-state.json");
+    path
+}
+
+fn diff_forge_claude_hook_correlation_lock_path(activity_path: &Path) -> PathBuf {
+    let mut path = activity_path.to_path_buf();
+    path.set_extension("claude-hook-state.lock");
+    path
+}
+
+struct DiffForgeClaudeHookCorrelationLock {
+    path: PathBuf,
+}
+
+impl Drop for DiffForgeClaudeHookCorrelationLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn diff_forge_claude_hook_correlation_lock(
+    activity_path: &Path,
+) -> Option<DiffForgeClaudeHookCorrelationLock> {
+    let lock_path = diff_forge_claude_hook_correlation_lock_path(activity_path);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).ok()?;
+    }
+    for _ in 0..CLAUDE_HOOK_CORRELATION_LOCK_ATTEMPTS {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(_) => return Some(DiffForgeClaudeHookCorrelationLock { path: lock_path }),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = fs::metadata(&lock_path)
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > Duration::from_secs(5));
+                if stale {
+                    let _ = fs::remove_file(&lock_path);
+                } else {
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn diff_forge_activity_hook_record_with_persisted_claude_state(
+    provider: &str,
+    pane_id: &str,
+    instance_id: u64,
+    workspace_id: &str,
+    terminal_index: &str,
+    hook_input: &Value,
+    activity_path: &Path,
+) -> Value {
+    if !diff_forge_activity_hook_name_key(provider).contains("claude") {
+        return diff_forge_activity_hook_record(
+            provider,
+            pane_id,
+            instance_id,
+            workspace_id,
+            terminal_index,
+            hook_input,
+        );
+    }
+    let Some(_lock) = diff_forge_claude_hook_correlation_lock(activity_path) else {
+        return diff_forge_activity_hook_record(
+            provider,
+            pane_id,
+            instance_id,
+            workspace_id,
+            terminal_index,
+            hook_input,
+        );
+    };
+    let state_path = diff_forge_claude_hook_correlation_state_path(activity_path);
+    let mut state = fs::read(&state_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ClaudeHookCorrelationState>(&bytes).ok())
+        .unwrap_or_default();
+    let record = diff_forge_activity_hook_record_with_claude_state(
+        provider,
+        pane_id,
+        instance_id,
+        workspace_id,
+        terminal_index,
+        hook_input,
+        &mut state,
+    );
+    if let Ok(bytes) = serde_json::to_vec(&state) {
+        let temporary_path =
+            state_path.with_extension(format!("claude-hook-state.{}.tmp", std::process::id()));
+        if fs::write(&temporary_path, bytes).is_ok() {
+            if fs::rename(&temporary_path, &state_path).is_err() {
+                let _ = fs::remove_file(&state_path);
+                let _ = fs::rename(&temporary_path, &state_path);
+            }
+        }
+        let _ = fs::remove_file(temporary_path);
+    }
+    record
+}
+
 #[cfg(test)]
 mod terminal_cli_tests {
     use super::*;
+
+    #[test]
+    fn claude_workspace_trust_merge_preserves_state_and_is_missing_file_safe() {
+        let root = env::temp_dir().join(format!(
+            "diffforge-claude-trust-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = root.join("workspace");
+        let sibling_workspace = root.join("sibling");
+        let config_path = root.join("profile").join(".claude.json");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&sibling_workspace).unwrap();
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let workspace = fs::canonicalize(workspace).unwrap();
+        let sibling_workspace = fs::canonicalize(sibling_workspace).unwrap();
+        let initial = json!({
+            "oauthAccount": { "emailAddress": "dev@example.com" },
+            "projects": {
+                (workspace_path_display(&sibling_workspace)): {
+                    "hasTrustDialogAccepted": false,
+                    "allowedTools": ["Read", "Bash(git status)"]
+                },
+                (workspace_path_display(&workspace)): {
+                    "allowedTools": ["Read"],
+                    "customSibling": { "keep": true }
+                }
+            },
+            "unrelatedCache": { "keep": [1, 2, 3] }
+        });
+        fs::write(&config_path, serde_json::to_vec_pretty(&initial).unwrap()).unwrap();
+
+        assert_eq!(
+            ensure_claude_workspace_trust_in_config(&config_path, &workspace).unwrap(),
+            ClaudeWorkspaceTrustMergeOutcome::Updated
+        );
+        let first_bytes = fs::read(&config_path).unwrap();
+        let merged: Value = serde_json::from_slice(&first_bytes).unwrap();
+        let project = &merged["projects"][workspace_path_display(&workspace)];
+        assert_eq!(project["hasTrustDialogAccepted"], true);
+        assert_eq!(project["hasCompletedProjectOnboarding"], true);
+        assert_eq!(project["allowedTools"], json!(["Read"]));
+        assert_eq!(project["customSibling"], json!({ "keep": true }));
+        assert_eq!(merged["oauthAccount"], initial["oauthAccount"]);
+        assert_eq!(merged["unrelatedCache"], initial["unrelatedCache"]);
+        assert_eq!(
+            merged["projects"][workspace_path_display(&sibling_workspace)],
+            initial["projects"][workspace_path_display(&sibling_workspace)]
+        );
+
+        assert_eq!(
+            ensure_claude_workspace_trust_in_config(&config_path, &workspace).unwrap(),
+            ClaudeWorkspaceTrustMergeOutcome::Unchanged
+        );
+        assert_eq!(fs::read(&config_path).unwrap(), first_bytes);
+
+        let missing_path = root.join("missing-profile").join(".claude.json");
+        assert_eq!(
+            ensure_claude_workspace_trust_in_config(&missing_path, &workspace).unwrap(),
+            ClaudeWorkspaceTrustMergeOutcome::Updated
+        );
+        let missing_state: Value =
+            serde_json::from_slice(&fs::read(&missing_path).unwrap()).unwrap();
+        assert_eq!(
+            missing_state["projects"][workspace_path_display(&workspace)]
+                ["hasTrustDialogAccepted"],
+            true
+        );
+
+        let corrupt_path = root.join("corrupt-profile").join(".claude.json");
+        fs::create_dir_all(corrupt_path.parent().unwrap()).unwrap();
+        fs::write(&corrupt_path, b"{not-json").unwrap();
+        assert_eq!(
+            ensure_claude_workspace_trust_in_config(&corrupt_path, &workspace).unwrap(),
+            ClaudeWorkspaceTrustMergeOutcome::SkippedInvalidConfig
+        );
+        assert_eq!(fs::read(&corrupt_path).unwrap(), b"{not-json");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_claude_workspace_trust_merges_preserve_both_projects() {
+        use std::sync::Barrier;
+
+        let root = env::temp_dir().join(format!(
+            "diffforge-claude-trust-concurrent-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("profile").join(".claude.json");
+        let workspace_a = root.join("workspace-a");
+        let workspace_b = root.join("workspace-b");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(&workspace_a).unwrap();
+        fs::create_dir_all(&workspace_b).unwrap();
+        fs::write(&config_path, b"{\"sibling\":{\"keep\":true}}").unwrap();
+        let workspace_a = fs::canonicalize(workspace_a).unwrap();
+        let workspace_b = fs::canonicalize(workspace_b).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+
+        let handles = [workspace_a.clone(), workspace_b.clone()].map(|workspace| {
+            let config_path = config_path.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                ensure_claude_workspace_trust_in_config(&config_path, &workspace).unwrap()
+            })
+        });
+        for handle in handles {
+            assert!(matches!(
+                handle.join().unwrap(),
+                ClaudeWorkspaceTrustMergeOutcome::Updated
+                    | ClaudeWorkspaceTrustMergeOutcome::Unchanged
+            ));
+        }
+
+        let merged: Value =
+            serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        assert_eq!(merged["sibling"]["keep"], true);
+        for workspace in [&workspace_a, &workspace_b] {
+            assert_eq!(
+                merged["projects"][workspace_path_display(workspace)]
+                    ["hasTrustDialogAccepted"],
+                true
+            );
+            assert_eq!(
+                merged["projects"][workspace_path_display(workspace)]
+                    ["hasCompletedProjectOnboarding"],
+                true
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_interactive_preflight_targets_final_launch_config_and_managed_cwd() {
+        let root = env::temp_dir().join(format!(
+            "diffforge-claude-trust-launch-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = root.join("workspace");
+        let other_directory = root.join("other");
+        let profile = root.join("selected-profile");
+        let overridden_home = root.join("overridden-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&other_directory).unwrap();
+        fs::create_dir_all(&profile).unwrap();
+        fs::create_dir_all(&overridden_home).unwrap();
+        let workspace = fs::canonicalize(workspace).unwrap();
+        let other_directory = fs::canonicalize(other_directory).unwrap();
+        let env_vars = vec![
+            (
+                "DIFFFORGE_MANAGED_AGENT_TERMINAL".to_string(),
+                "1".to_string(),
+            ),
+            (
+                "DIFFFORGE_TERMINAL_PROVIDER".to_string(),
+                "claude".to_string(),
+            ),
+            (
+                "DIFFFORGE_WORKSPACE_ROOT".to_string(),
+                workspace.to_string_lossy().to_string(),
+            ),
+            (
+                "CLAUDE_CONFIG_DIR".to_string(),
+                profile.to_string_lossy().to_string(),
+            ),
+            (
+                "HOME".to_string(),
+                overridden_home.to_string_lossy().to_string(),
+            ),
+        ];
+
+        preflight_interactive_claude_workspace_trust(
+            "/usr/local/bin/claude",
+            &workspace,
+            &env_vars,
+        );
+        let state_path = profile.join(".claude.json");
+        let state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(
+            state["projects"][workspace_path_display(&workspace)]
+                ["hasTrustDialogAccepted"],
+            true
+        );
+        assert!(!overridden_home.join(".claude.json").exists());
+
+        fs::remove_file(&state_path).unwrap();
+        preflight_interactive_claude_workspace_trust(
+            "/usr/local/bin/claude",
+            &other_directory,
+            &env_vars,
+        );
+        assert!(!state_path.exists());
+
+        let mut unmanaged_env = env_vars;
+        unmanaged_env.retain(|(key, _)| key != "DIFFFORGE_MANAGED_AGENT_TERMINAL");
+        preflight_interactive_claude_workspace_trust(
+            "/usr/local/bin/claude",
+            &workspace,
+            &unmanaged_env,
+        );
+        assert!(!state_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_interactive_resume_requires_an_explicit_session() {
+        let explicit = terminal_interactive_resume_args(
+            "claude",
+            &[
+                "--resume".to_string(),
+                "claude-session-1".to_string(),
+                "--model".to_string(),
+                "opus".to_string(),
+            ],
+        );
+        assert_eq!(&explicit[..2], ["--resume", "claude-session-1"]);
+        assert!(!explicit.iter().any(|arg| arg == "--continue"));
+
+        let bare_resume = terminal_interactive_resume_args(
+            "claude",
+            &["--resume".to_string(), "--model".to_string(), "opus".to_string()],
+        );
+        assert_eq!(bare_resume, ["--model", "opus"]);
+        let bare_continue =
+            terminal_interactive_resume_args("claude", &["--continue".to_string()]);
+        assert!(bare_continue.is_empty());
+        assert!(terminal_interactive_resume_args("claude", &[]).is_empty());
+    }
+
+    #[test]
+    fn codex_interactive_resume_never_reaches_the_picker() {
+        let explicit = terminal_interactive_resume_args(
+            "codex",
+            &["resume".to_string(), "codex-session-1".to_string()],
+        );
+        assert_eq!(explicit, ["resume", "codex-session-1"]);
+        assert_eq!(
+            terminal_interactive_resume_args("codex", &["resume".to_string()]),
+            ["resume", "--last"]
+        );
+        assert!(terminal_interactive_resume_args("codex", &[]).is_empty());
+    }
+
+    #[test]
+    fn interactive_launches_make_permission_and_model_choices_explicit() {
+        let claude = terminal_args_with_codex_mcp_identity(
+            "claude",
+            &["--model".to_string(), "opus".to_string()],
+            None,
+            None,
+            "pane-launch",
+            1,
+            None,
+        );
+        assert!(claude.windows(2).any(|pair| pair == ["--model", "opus"]));
+        assert!(claude
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode", "acceptEdits"]));
+
+        let codex = terminal_args_with_codex_mcp_identity(
+            "codex",
+            &[
+                "resume".to_string(),
+                "codex-session-1".to_string(),
+                "--model".to_string(),
+                "gpt-5.4".to_string(),
+                "-c".to_string(),
+                "model_reasoning_effort=\"high\"".to_string(),
+            ],
+            None,
+            None,
+            "pane-launch",
+            1,
+            None,
+        );
+        assert_eq!(&codex[..2], ["resume", "codex-session-1"]);
+        assert!(codex
+            .windows(2)
+            .any(|pair| pair == ["--model", "gpt-5.4"]));
+        assert!(codex
+            .windows(2)
+            .any(|pair| pair == ["-c", "model_reasoning_effort=\"high\""]));
+        assert!(codex
+            .windows(2)
+            .any(|pair| pair == ["--ask-for-approval", "never"]));
+        assert!(codex
+            .windows(2)
+            .any(|pair| pair == ["--sandbox", "workspace-write"]));
+    }
 
     #[test]
     fn windows_claude_staging_prunes_only_files_at_or_beyond_max_age() {
@@ -6115,6 +7019,377 @@ mod terminal_cli_tests {
     }
 
     #[test]
+    fn claude_permission_requests_correlate_fifo_to_distinct_tool_use_ids() {
+        let mut state = ClaudeHookCorrelationState::default();
+        for tool_use_id in ["tool-use-1", "tool-use-2"] {
+            let record = diff_forge_activity_hook_record_with_claude_state(
+                "claude",
+                "pane-1",
+                7,
+                "workspace-1",
+                "0",
+                &json!({
+                    "hook_event_name": "PreToolUse",
+                    "session_id": "session-1",
+                    "prompt_id": "common-turn-prompt",
+                    "tool_name": "Bash",
+                    "tool_use_id": tool_use_id,
+                    "tool_input": {"command": "git status", "timeout": 30}
+                }),
+                &mut state,
+            );
+            assert_eq!(record["permission_request_id"], "common-turn-prompt");
+        }
+
+        let first = diff_forge_activity_hook_record_with_claude_state(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "PermissionRequest",
+                "session_id": "session-1",
+                "prompt_id": "common-turn-prompt",
+                "tool_name": "Bash",
+                "tool_input": {"timeout": 30, "command": "git status"}
+            }),
+            &mut state,
+        );
+        let second = diff_forge_activity_hook_record_with_claude_state(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "PermissionRequest",
+                "session_id": "session-1",
+                "prompt_id": "common-turn-prompt",
+                "tool_name": "Bash",
+                "tool_input": {"command": "git status", "timeout": 30}
+            }),
+            &mut state,
+        );
+
+        assert_eq!(first["permission_request_id"], "tool-use-1");
+        assert_eq!(first["prompt_id"], "tool-use-1");
+        assert_eq!(second["permission_request_id"], "tool-use-2");
+        assert_eq!(second["prompt_id"], "tool-use-2");
+        assert!(state.pre_tool_uses.is_empty());
+    }
+
+    #[test]
+    fn claude_single_permission_without_correlation_keeps_common_prompt_id() {
+        let record = diff_forge_activity_hook_record(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "PermissionRequest",
+                "session_id": "session-1",
+                "prompt_id": "existing-single-prompt",
+                "tool_name": "Bash",
+                "tool_input": {"command": "git status"}
+            }),
+        );
+
+        assert_eq!(record["permission_request_id"], "existing-single-prompt");
+        assert_eq!(record["prompt_id"], "existing-single-prompt");
+    }
+
+    #[test]
+    fn claude_permission_correlation_survives_separate_hook_process_state_loads() {
+        let root = env::temp_dir().join(format!(
+            "diffforge-claude-hook-correlation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let activity_path = root.join("events.jsonl");
+        let pre_tool = diff_forge_activity_hook_record_with_persisted_claude_state(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "session-1",
+                "prompt_id": "common-turn-prompt",
+                "tool_name": "Bash",
+                "tool_use_id": "persisted-tool-use-1",
+                "tool_input": {"command": "git status"}
+            }),
+            &activity_path,
+        );
+        assert_eq!(pre_tool["permission_request_id"], "common-turn-prompt");
+        assert!(diff_forge_claude_hook_correlation_state_path(&activity_path).exists());
+
+        let permission = diff_forge_activity_hook_record_with_persisted_claude_state(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "PermissionRequest",
+                "session_id": "session-1",
+                "prompt_id": "common-turn-prompt",
+                "tool_name": "Bash",
+                "tool_input": {"command": "git status"}
+            }),
+            &activity_path,
+        );
+
+        assert_eq!(permission["prompt_id"], "persisted-tool-use-1");
+        let persisted = fs::read(diff_forge_claude_hook_correlation_state_path(
+            &activity_path,
+        ))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ClaudeHookCorrelationState>(&bytes).ok())
+        .expect("persisted correlation state");
+        assert!(persisted.pre_tool_uses.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_ask_user_question_uses_tool_identity_and_structured_questions_only() {
+        let record = diff_forge_activity_hook_record(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "session-1",
+                "prompt_id": "common-turn-prompt",
+                "tool_name": "AskUserQuestion",
+                "tool_use_id": "ask-tool-use-1",
+                "tool_input": {
+                    "questions": [
+                        {
+                            "header": "Framework",
+                            "question": "Which frameworks?",
+                            "multiSelect": true,
+                            "options": [
+                                {"label": "React", "description": "Use React"},
+                                {"label": "Vue", "description": "Use Vue"}
+                            ]
+                        },
+                        {
+                            "header": "Tests",
+                            "question": "Which runner?",
+                            "multiSelect": false,
+                            "options": [{"label": "Vitest", "description": "Fast tests"}]
+                        }
+                    ]
+                }
+            }),
+        );
+
+        assert_eq!(record["permission_request_id"], "ask-tool-use-1");
+        assert_eq!(record["prompt_id"], "ask-tool-use-1");
+        assert_eq!(record["prompt_questions"].as_array().map(Vec::len), Some(2));
+        assert_eq!(record["prompt_questions"][0]["multiSelect"], true);
+        assert_eq!(record["prompt_questions"][1]["multiSelect"], false);
+        assert_eq!(
+            record["prompt_questions"][0]["options"][0]["description"],
+            "Use React"
+        );
+        assert_eq!(record["prompt_options"], json!([]));
+    }
+
+    #[test]
+    fn claude_exit_plan_mode_uses_tool_identity_and_source_actions() {
+        let record = diff_forge_activity_hook_record(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "session-1",
+                "prompt_id": "common-turn-prompt",
+                "tool_name": "ExitPlanMode",
+                "tool_use_id": "plan-tool-use-1",
+                "tool_input": {
+                    "plan": "# Plan\n\n- Implement the fix",
+                    "plan_file_path": "/tmp/plan.md"
+                }
+            }),
+        );
+
+        assert_eq!(record["permission_request_id"], "plan-tool-use-1");
+        assert_eq!(record["prompt_id"], "plan-tool-use-1");
+        assert_eq!(record["prompt_default_option"], "keep_planning");
+        assert_eq!(record["prompt_options"][0]["id"], "approve_plan");
+        assert_eq!(record["prompt_options"][1]["id"], "keep_planning");
+        assert_eq!(record["prompt_options"].as_array().map(Vec::len), Some(2));
+        assert!(record["message"].as_str().is_some_and(|message| message
+            .contains("Implement the fix")
+            && message.contains("/tmp/plan.md")));
+        assert_eq!(record["allows_free_text"], true);
+    }
+
+    #[test]
+    fn claude_elicitation_promotes_native_id_actions_and_schema_defaults() {
+        let record = diff_forge_activity_hook_record(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "Elicitation",
+                "session_id": "session-1",
+                "mcp_server_name": "example-server",
+                "provider_payload": {
+                    "elicitation_id": "elicitation-native-1",
+                    "request": "Choose a region"
+                },
+                "requested_schema": {
+                    "type": "object",
+                    "properties": {
+                        "region": {"type": "string", "default": "us-east-1"}
+                    }
+                }
+            }),
+        );
+
+        assert_eq!(record["permission_request_id"], "elicitation-native-1");
+        assert_eq!(record["prompt_id"], "elicitation-native-1");
+        assert_eq!(record["prompt_options"][0]["id"], "accept");
+        assert_eq!(record["prompt_options"][1]["id"], "decline");
+        assert_eq!(record["prompt_options"][2]["id"], "cancel");
+        assert_eq!(
+            record.pointer("/prompt_schema/properties/region/default"),
+            Some(&json!("us-east-1"))
+        );
+    }
+
+    #[test]
+    fn claude_elicitation_fallback_id_is_deterministic_and_ordinally_distinct() {
+        let input = json!({
+            "hook_event_name": "Elicitation",
+            "session_id": "session-1",
+            "mcp_server_name": "example-server",
+            "requested_schema": {"type": "string", "default": "hello"}
+        });
+        let mut first_state = ClaudeHookCorrelationState::default();
+        let first = diff_forge_activity_hook_record_with_claude_state(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &input,
+            &mut first_state,
+        );
+        let second = diff_forge_activity_hook_record_with_claude_state(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &input,
+            &mut first_state,
+        );
+        let mut replay_state = ClaudeHookCorrelationState::default();
+        let replay = diff_forge_activity_hook_record_with_claude_state(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &input,
+            &mut replay_state,
+        );
+
+        assert_eq!(first["prompt_id"], replay["prompt_id"]);
+        assert_ne!(first["prompt_id"], second["prompt_id"]);
+        assert!(first["prompt_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("elicitation-derived-")));
+    }
+
+    #[test]
+    fn claude_permission_allow_always_requires_source_suggestions() {
+        let without = diff_forge_activity_hook_record(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "PermissionRequest",
+                "session_id": "session-1",
+                "prompt_id": "permission-1",
+                "tool_name": "Bash",
+                "tool_input": {"command": "git status"}
+            }),
+        );
+        let with = diff_forge_activity_hook_record(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "PermissionRequest",
+                "session_id": "session-1",
+                "prompt_id": "permission-2",
+                "tool_name": "Bash",
+                "tool_input": {"command": "git status"},
+                "permission_suggestions": [
+                    {"type": "addRules", "rules": ["Bash(git status)"]}
+                ]
+            }),
+        );
+        let option_ids = |record: &Value| {
+            record["prompt_options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|option| option["id"].as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(option_ids(&without), vec!["allow_once", "reject"]);
+        assert_eq!(
+            option_ids(&with),
+            vec!["allow_once", "allow_always", "reject"]
+        );
+    }
+
+    #[test]
+    fn claude_permission_denied_is_labeled_as_diffforge_intervention() {
+        let record = diff_forge_activity_hook_record(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "PermissionDenied",
+                "session_id": "session-1",
+                "prompt_id": "permission-denied-1",
+                "tool_name": "Bash"
+            }),
+        );
+
+        assert_eq!(
+            record["interaction_response_mode"],
+            "diffforge_intervention"
+        );
+        assert_eq!(record["interaction_kind"], "diffforge_retry_intervention");
+        assert_eq!(record["provider_native_prompt"], false);
+    }
+
+    #[test]
     fn activity_hook_record_preserves_tool_response_timing_and_exit_code() {
         let record = diff_forge_activity_hook_record(
             "claude",
@@ -6269,6 +7544,23 @@ mod terminal_cli_tests {
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("/permission/${id}/reply"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
             .contains("postSessionIdPermissionsPermissionId"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("handlePendingPermission"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("reconcilePendingPermissions"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("client.permission.list"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("opencodeFetch(serverUrl, \"/permission\", undefined, \"GET\")"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("if (type === \"permission.asked\")"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("await handlePendingPermission(sessionId, requestId, props)"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("hook_event_name: \"PermissionRequest\""));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("reconcilePendingPermissions(\"session.status\")"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("reconcilePendingPermissions(\"session.idle\")"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("clearInterval(permissionReconcileInterval)"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("/question/${id}/reply"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("hook_event_name: \"TranscriptChanged\""));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("permission_decision: props.reply"));
@@ -6615,6 +7907,22 @@ mod terminal_cli_tests {
             elicitation.pointer("/hookSpecificOutput/action"),
             Some(&json!("cancel")),
         );
+
+        let permission_denied =
+            diff_forge_activity_hook_blocking_fallback_response(&json!({
+                "provider": "claude",
+                "hook_event_name": "PermissionDenied",
+            }))
+            .expect("permission-denied fallback");
+        assert_eq!(
+            permission_denied.pointer("/hookSpecificOutput/hookEventName"),
+            Some(&json!("PermissionDenied")),
+        );
+        assert_eq!(
+            permission_denied.pointer("/hookSpecificOutput/retry"),
+            Some(&json!(false)),
+        );
+
         assert!(diff_forge_activity_hook_blocking_fallback_response(&json!({
             "provider": "codex",
             "hook_event_name": "PermissionRequest",
@@ -7004,6 +8312,11 @@ fn terminal_agent_start_input_with_env_in_directory(
     working_directory: &Path,
     env_vars: &[(String, String)],
 ) -> String {
+    preflight_interactive_claude_workspace_trust(
+        command_path,
+        working_directory,
+        env_vars,
+    );
     let mut input = terminal_set_working_directory_input(working_directory);
     for (key, value) in env_vars {
         if key.trim().is_empty() {
@@ -7132,6 +8445,297 @@ fn terminal_env_vars_with_opencode_tui_config(
     Ok(next)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClaudeWorkspaceTrustMergeOutcome {
+    Updated,
+    Unchanged,
+    SkippedInvalidConfig,
+}
+
+struct ClaudeWorkspaceTrustLock {
+    path: PathBuf,
+}
+
+impl Drop for ClaudeWorkspaceTrustLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn terminal_launch_env_value<'a>(
+    env_vars: &'a [(String, String)],
+    key: &str,
+) -> Option<&'a str> {
+    env_vars
+        .iter()
+        .rev()
+        .find_map(|(candidate, value)| (candidate == key).then_some(value.as_str()))
+}
+
+fn terminal_safe_absolute_launch_path(value: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(value.trim());
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return None;
+    }
+    Some(path)
+}
+
+fn claude_config_path_for_interactive_launch(
+    env_vars: &[(String, String)],
+) -> Option<PathBuf> {
+    if let Some(config_dir) = terminal_launch_env_value(env_vars, "CLAUDE_CONFIG_DIR") {
+        return terminal_safe_absolute_launch_path(config_dir)
+            .map(|directory| directory.join(".claude.json"));
+    }
+
+    let launch_home = terminal_launch_env_value(env_vars, "HOME")
+        .or_else(|| terminal_launch_env_value(env_vars, "USERPROFILE"))
+        .map(str::to_string)
+        .or_else(|| env::var("HOME").ok())
+        .or_else(|| env::var("USERPROFILE").ok())?;
+    terminal_safe_absolute_launch_path(&launch_home).map(|home| home.join(".claude.json"))
+}
+
+fn claude_managed_workspace_for_interactive_launch(
+    command_path: &str,
+    working_directory: &Path,
+    env_vars: &[(String, String)],
+) -> Option<PathBuf> {
+    if !terminal_launch_env_value(env_vars, "DIFFFORGE_MANAGED_AGENT_TERMINAL")
+        .is_some_and(terminal_env_truthy)
+    {
+        return None;
+    }
+    let provider = terminal_launch_env_value(env_vars, "DIFFFORGE_TERMINAL_PROVIDER")?;
+    if !provider.trim().to_ascii_lowercase().contains("claude") {
+        return None;
+    }
+    let command_name = Path::new(command_path)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if command_name != "claude" {
+        return None;
+    }
+
+    let managed_root = terminal_safe_absolute_launch_path(terminal_launch_env_value(
+        env_vars,
+        "DIFFFORGE_WORKSPACE_ROOT",
+    )?)?;
+    let managed_root = fs::canonicalize(managed_root).ok()?;
+    let working_directory = fs::canonicalize(working_directory).ok()?;
+    (managed_root == working_directory && working_directory.is_dir()).then_some(working_directory)
+}
+
+fn claude_workspace_trust_lock_path(config_path: &Path) -> Option<PathBuf> {
+    let parent = config_path.parent()?;
+    let name = config_path.file_name()?.to_string_lossy();
+    Some(parent.join(format!(".{name}.diffforge-trust.lock")))
+}
+
+fn acquire_claude_workspace_trust_lock(
+    config_path: &Path,
+) -> Result<ClaudeWorkspaceTrustLock, String> {
+    const ATTEMPTS: usize = 100;
+    let lock_path = claude_workspace_trust_lock_path(config_path)
+        .ok_or_else(|| "Unable to resolve the Claude workspace-trust lock path.".to_string())?;
+    let parent = lock_path
+        .parent()
+        .ok_or_else(|| "Unable to resolve the Claude workspace-trust config directory.".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!("Unable to prepare the Claude workspace-trust config directory: {error}")
+    })?;
+
+    for _ in 0..ATTEMPTS {
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(_) => return Ok(ClaudeWorkspaceTrustLock { path: lock_path }),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Never steal an apparently stale lock: another process may
+                // have replaced it between metadata inspection and removal.
+                // A genuinely orphaned lock safely degrades to today's trust
+                // dialog instead of risking a concurrent config overwrite.
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Unable to lock Claude workspace-trust state: {error}"
+                ));
+            }
+        }
+    }
+    Err("Timed out locking Claude workspace-trust state.".to_string())
+}
+
+fn merge_claude_workspace_trust_config(
+    config: &mut Value,
+    workspace: &Path,
+) -> Result<bool, String> {
+    let root = config
+        .as_object_mut()
+        .ok_or_else(|| "Claude state is not a JSON object.".to_string())?;
+    let projects = root
+        .entry("projects".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let projects = projects
+        .as_object_mut()
+        .ok_or_else(|| "Claude state has an invalid projects value.".to_string())?;
+    // `canonicalize` yields verbatim `\\?\` paths on Windows. Claude keys
+    // project state by the normal provider-facing cwd, so strip that prefix
+    // while retaining the canonical path for the trust-boundary comparison.
+    let workspace_key = workspace_path_display(workspace);
+    let project = projects
+        .entry(workspace_key)
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let project = project
+        .as_object_mut()
+        .ok_or_else(|| "Claude state has invalid project state for this workspace.".to_string())?;
+
+    let already_trusted = project
+        .get("hasTrustDialogAccepted")
+        .and_then(Value::as_bool)
+        == Some(true);
+    let already_onboarded = project
+        .get("hasCompletedProjectOnboarding")
+        .and_then(Value::as_bool)
+        == Some(true);
+    if already_trusted && already_onboarded {
+        return Ok(false);
+    }
+    project.insert("hasTrustDialogAccepted".to_string(), json!(true));
+    project.insert("hasCompletedProjectOnboarding".to_string(), json!(true));
+    Ok(true)
+}
+
+fn ensure_claude_workspace_trust_in_config(
+    config_path: &Path,
+    workspace: &Path,
+) -> Result<ClaudeWorkspaceTrustMergeOutcome, String> {
+    // Every DiffForge atomic private-state writer shares this in-process
+    // guard, including account snapshot refresh/wipe paths that may replace
+    // the same `.claude.json`. The adjacent lock file additionally
+    // serializes separate DiffForge processes.
+    let _process_guard = AGENT_ACCOUNTS_PRIVATE_FILE_WRITE_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let _lock = acquire_claude_workspace_trust_lock(config_path)?;
+    let read_current = || {
+        match fs::symlink_metadata(config_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(
+                    "Claude workspace-trust state is a symlink; skipped the merge.".to_string(),
+                );
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(
+                    "Claude workspace-trust state is not a regular file; skipped the merge."
+                        .to_string(),
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Unable to inspect Claude workspace-trust state: {error}"
+                ));
+            }
+        }
+        match fs::read(config_path) {
+            Ok(raw) => Ok(raw),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(format!(
+                "Unable to read Claude workspace-trust state: {error}"
+            )),
+        }
+    };
+
+    // The lock serializes every DiffForge writer. The stability check also
+    // catches a provider process replacing the file while this merge is being
+    // prepared, so the retry always starts from its newest complete JSON.
+    for _ in 0..8 {
+        let raw = read_current()?;
+        let mut config = if raw.iter().all(u8::is_ascii_whitespace) {
+            json!({})
+        } else {
+            match serde_json::from_slice::<Value>(&raw) {
+                Ok(Value::Object(object)) => Value::Object(object),
+                Ok(_) | Err(_) => {
+                    return Ok(ClaudeWorkspaceTrustMergeOutcome::SkippedInvalidConfig);
+                }
+            }
+        };
+        let changed = match merge_claude_workspace_trust_config(&mut config, workspace) {
+            Ok(changed) => changed,
+            Err(_) => return Ok(ClaudeWorkspaceTrustMergeOutcome::SkippedInvalidConfig),
+        };
+        if read_current()? != raw {
+            continue;
+        }
+        if !changed {
+            return Ok(ClaudeWorkspaceTrustMergeOutcome::Unchanged);
+        }
+
+        let mut bytes = serde_json::to_vec_pretty(&config)
+            .map_err(|error| format!("Unable to encode Claude workspace-trust state: {error}"))?;
+        bytes.push(b'\n');
+        agent_accounts_write_private_file_atomic_unlocked(
+            config_path,
+            &bytes,
+            "Claude workspace trust",
+        )?;
+        return Ok(ClaudeWorkspaceTrustMergeOutcome::Updated);
+    }
+    Err("Claude workspace-trust state kept changing during preflight; skipped the merge.".to_string())
+}
+
+fn preflight_interactive_claude_workspace_trust(
+    command_path: &str,
+    working_directory: &Path,
+    env_vars: &[(String, String)],
+) {
+    let Some(workspace) = claude_managed_workspace_for_interactive_launch(
+        command_path,
+        working_directory,
+        env_vars,
+    ) else {
+        return;
+    };
+    let Some(config_path) = claude_config_path_for_interactive_launch(env_vars) else {
+        log_terminal_status_event(
+            "backend.claude_workspace_trust.skipped",
+            json!({ "reason": "unsafe_config_path" }),
+        );
+        return;
+    };
+    match ensure_claude_workspace_trust_in_config(&config_path, &workspace) {
+        Ok(ClaudeWorkspaceTrustMergeOutcome::Updated) => log_terminal_status_event(
+            "backend.claude_workspace_trust.updated",
+            json!({ "workspace": clean_terminal_diagnostic_log_text(&workspace_path_display(&workspace)) }),
+        ),
+        Ok(ClaudeWorkspaceTrustMergeOutcome::Unchanged) => {}
+        Ok(ClaudeWorkspaceTrustMergeOutcome::SkippedInvalidConfig) => log_terminal_status_event(
+            "backend.claude_workspace_trust.skipped",
+            json!({ "reason": "invalid_config" }),
+        ),
+        Err(error) => log_terminal_status_event(
+            "backend.claude_workspace_trust.skipped",
+            json!({
+                "error": clean_terminal_diagnostic_log_text(&error),
+                "reason": "preflight_failed",
+            }),
+        ),
+    }
+}
+
 const OPENCODE_ACTIVITY_HOOK_BIN_ENV: &str = "DIFFFORGE_OPENCODE_ACTIVITY_HOOK_BIN";
 
 // OpenCode plugin that bridges OpenCode's lifecycle events to the Diff Forge
@@ -7247,15 +8851,16 @@ function emit(payload) {
   return next;
 }
 
-async function opencodeFetch(serverUrl, path, body) {
+async function opencodeFetch(serverUrl, path, body, method = "POST") {
   if (!serverUrl || typeof fetch !== "function") return false;
-  const response = await fetch(`${String(serverUrl).replace(/\/$/, "")}${path}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body || {}),
-  });
+  const options = { method };
+  if (method !== "GET") {
+    options.headers = { "content-type": "application/json" };
+    options.body = JSON.stringify(body || {});
+  }
+  const response = await fetch(`${String(serverUrl).replace(/\/$/, "")}${path}`, options);
   if (!response.ok) throw new Error(`OpenCode API ${path} returned ${response.status}`);
-  return true;
+  return method === "GET" ? response.json() : true;
 }
 
 async function replyOpenCodePermission(client, serverUrl, sessionId, requestId, reply) {
@@ -7723,6 +9328,109 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
     }
     setTimeout(() => emitStartupIdleCandidate(sessionId, source), IDLE_STOP_DELAY_MS);
   };
+  const handlePendingPermission = async (sessionId, requestId, props = {}) => {
+    noteActivity(sessionId, "permission.asked");
+    const interactionKey = requestId ? `${sessionId}:permission:${requestId}` : "";
+    if (interactionKey && (handledInteractionIds.has(interactionKey) || pendingInteractionIds.has(interactionKey))) return;
+    if (interactionKey) pendingInteractionIds.add(interactionKey);
+    try {
+      const response = await emit({
+        hook_event_name: "PermissionRequest",
+        session_id: sessionId,
+        manual_approval_required: true,
+        permission_request_id: requestId,
+        tool_use_id: props.callID || props.callId || props.toolCallID || props.toolCallId || props.tool?.callID || props.tool?.callId || "",
+        tool_name: props.permission || props.type || props.tool || "",
+        description: props.title || props.description || props.metadata?.title || "",
+        provider_payload: props,
+        prompt_default_option: "reject",
+        prompt_options: [
+          ["allow_once", "Allow once"],
+          ["allow_always", "Allow always"],
+          ["reject", "Reject"]
+        ],
+      });
+      if (requestId && response && response.reply) {
+        try {
+          await replyOpenCodePermission(client, serverUrl, sessionId, requestId, response.reply);
+          rememberHandledInteraction(interactionKey);
+          emit({
+            hook_event_name: "PermissionResult",
+            session_id: sessionId,
+            permission_request_id: requestId,
+            permission_decision: response.reply,
+          });
+        } catch (error) {
+          emit({
+            hook_event_name: "StopFailure",
+            session_id: sessionId,
+            error_code: "permission_reply_failed",
+            error: String((error && error.message) || error || "OpenCode permission reply failed."),
+            retryable: true,
+          });
+        }
+      }
+    } finally {
+      if (interactionKey) pendingInteractionIds.delete(interactionKey);
+    }
+  };
+  const pendingPermissionsFromResponse = (response) => {
+    if (Array.isArray(response)) return response;
+    if (!response || typeof response !== "object") return [];
+    for (const key of ["data", "permissions", "items", "result", "body"]) {
+      if (Array.isArray(response[key])) return response[key];
+    }
+    return [];
+  };
+  let permissionReconciliationInFlight = false;
+  let permissionReconciliationStopped = false;
+  const reconcilePendingPermissions = async (reason) => {
+    if (permissionReconciliationStopped || permissionReconciliationInFlight) return;
+    permissionReconciliationInFlight = true;
+    try {
+      let response;
+      if (client && client.permission && typeof client.permission.list === "function") {
+        try {
+          response = await client.permission.list();
+          if (response && response.error) throw response.error;
+        } catch {
+          response = await opencodeFetch(serverUrl, "/permission", undefined, "GET");
+        }
+      } else {
+        response = await opencodeFetch(serverUrl, "/permission", undefined, "GET");
+      }
+      if (permissionReconciliationStopped) return;
+      for (const permission of pendingPermissionsFromResponse(response)) {
+        const props = permission && typeof permission === "object" ? permission : {};
+        const sessionId = props.sessionID || props.sessionId || props.session_id || props.session?.id || "";
+        const requestId = props.id || props.permissionID || props.permissionId || props.requestID || props.requestId || "";
+        const interactionKey = requestId ? `${sessionId}:permission:${requestId}` : "";
+        if (!requestId || (interactionKey && (handledInteractionIds.has(interactionKey) || pendingInteractionIds.has(interactionKey)))) continue;
+        handlePendingPermission(sessionId, requestId, props).catch(() => {});
+      }
+    } catch {
+      // Permission reconciliation is a recovery path; live provider events
+      // remain authoritative when the SDK/server is temporarily unavailable.
+    } finally {
+      permissionReconciliationInFlight = false;
+    }
+  };
+  const startupPermissionReconcileTimer = setTimeout(
+    () => reconcilePendingPermissions("startup"),
+    750
+  );
+  const permissionReconcileInterval = setInterval(
+    () => reconcilePendingPermissions("interval"),
+    4000
+  );
+  if (typeof startupPermissionReconcileTimer.unref === "function") startupPermissionReconcileTimer.unref();
+  if (typeof permissionReconcileInterval.unref === "function") permissionReconcileInterval.unref();
+  const stopPermissionReconciliation = () => {
+    if (permissionReconciliationStopped) return;
+    permissionReconciliationStopped = true;
+    clearTimeout(startupPermissionReconcileTimer);
+    clearInterval(permissionReconcileInterval);
+  };
   return {
     "chat.message": async (input, output) => {
       const sessionId = (input && input.sessionID) || "";
@@ -7785,6 +9493,10 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
       const type = (event && event.type) || "";
       const sessionId = eventSessionId(event);
 	      const props = (event && event.properties) || {};
+	      if (type === "server.instance.disposed" || type === "global.disposed") {
+	        stopPermissionReconciliation();
+	        return;
+	      }
 	      if (type === "message.updated" || type === "message.created") {
 	        const message = props.message || props.info || {};
         const role = rememberMessageRole(sessionId, message, props);
@@ -7850,48 +9562,8 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
         });
       }
       if (type === "permission.asked") {
-	        noteActivity(sessionId, type);
-        const requestId = props.id || props.permissionID || props.permissionId || "";
-        const interactionKey = requestId ? `${sessionId}:permission:${requestId}` : "";
-        if (interactionKey && (handledInteractionIds.has(interactionKey) || pendingInteractionIds.has(interactionKey))) return;
-        if (interactionKey) pendingInteractionIds.add(interactionKey);
-        const response = await emit({
-          hook_event_name: "PermissionRequest",
-          session_id: sessionId,
-          manual_approval_required: true,
-          permission_request_id: requestId,
-          tool_use_id: props.callID || props.toolCallID || props.toolCallId || props.tool?.callID || props.tool?.callId || "",
-          tool_name: props.permission || props.type || props.tool || "",
-          description: props.title || props.description || props.metadata?.title || "",
-          provider_payload: props,
-          prompt_default_option: "reject",
-          prompt_options: [
-            ["allow_once", "Allow once"],
-            ["allow_always", "Allow always"],
-            ["reject", "Reject"]
-          ],
-        });
-        if (requestId && response && response.reply) {
-          try {
-            await replyOpenCodePermission(client, serverUrl, sessionId, requestId, response.reply);
-            rememberHandledInteraction(interactionKey);
-            emit({
-              hook_event_name: "PermissionResult",
-              session_id: sessionId,
-              permission_request_id: requestId,
-              permission_decision: response.reply,
-            });
-          } catch (error) {
-            emit({
-              hook_event_name: "StopFailure",
-              session_id: sessionId,
-              error_code: "permission_reply_failed",
-              error: String((error && error.message) || error || "OpenCode permission reply failed."),
-              retryable: true,
-            });
-          }
-        }
-        if (interactionKey) pendingInteractionIds.delete(interactionKey);
+        const requestId = props.id || props.permissionID || props.permissionId || props.requestID || props.requestId || "";
+        await handlePendingPermission(sessionId, requestId, props);
       }
 	      if (type === "question.ask" || type === "question.asked" || type === "selection.ask" || type === "selection.asked") {
 	        noteActivity(sessionId, type);
@@ -8016,6 +9688,7 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
         });
       }
       if (type === "session.status") {
+        reconcilePendingPermissions("session.status");
         // OpenCode >= 1.17 reports turn phases via session.status; treat a
         // return to idle/cooldown as a quiet-period completion candidate.
         // OpenCode can publish idle before the final message/tool events have
@@ -8045,8 +9718,9 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
 	        } else if (statusValue) {
 		          noteActivity(sessionId, "session.status");
 		        }
-	      }
+      }
       if (type === "session.idle") {
+	        reconcilePendingPermissions("session.idle");
 	        scheduleIdle(sessionId, "session.idle");
 	      } else if (type === "session.error") {
         cancelPendingStop(sessionId);
@@ -8456,6 +10130,11 @@ fn create_agent_terminal_pty(
     env_vars: &[(String, String)],
     banner: Option<&str>,
 ) -> Result<WarmPty, String> {
+    preflight_interactive_claude_workspace_trust(
+        command_path,
+        working_directory,
+        env_vars,
+    );
     let mut command = terminal_agent_launch_command(command_path, args, working_directory, banner);
 
     for (key, value) in env_vars {

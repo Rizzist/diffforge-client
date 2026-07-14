@@ -45,6 +45,7 @@ static AGENT_ACCOUNT_PUSH_KEY_FILE_CACHE: OnceLock<
 > = OnceLock::new();
 static AGENT_ACCOUNT_PUSH_TRUSTED_KEYS_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static AGENT_ACCOUNT_PUSH_APPLIED_FILE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static AGENT_ACCOUNTS_PRIVATE_FILE_WRITE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static AGENT_ACCOUNTS_CLAUDE_CREDENTIAL_OBSERVATIONS: OnceLock<
     StdMutex<HashMap<PathBuf, AgentAccountsClaudeCredentialObservation>>,
 > = OnceLock::new();
@@ -185,6 +186,25 @@ fn agent_account_push_random_32() -> Result<[u8; AGENT_ACCOUNT_PUSH_KEY_BYTES], 
 }
 
 fn agent_accounts_write_private_file_atomic(
+    path: &Path,
+    bytes: &[u8],
+    description: &str,
+) -> Result<(), String> {
+    let _guard = AGENT_ACCOUNTS_PRIVATE_FILE_WRITE_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let _claude_state_guard = if path.file_name().and_then(|name| name.to_str())
+        == Some(".claude.json")
+    {
+        Some(acquire_claude_workspace_trust_lock(path)?)
+    } else {
+        None
+    };
+    agent_accounts_write_private_file_atomic_unlocked(path, bytes, description)
+}
+
+fn agent_accounts_write_private_file_atomic_unlocked(
     path: &Path,
     bytes: &[u8],
     description: &str,
@@ -1901,20 +1921,33 @@ pub(crate) fn agent_accounts_apply_spawn_env(
     };
     let (active_id, active_label) = agent_accounts_launch_profile_label(kind);
     let auth_revision = agent_accounts_active_auth_revision(kind);
-    let workspace_trust = env_vars
-        .iter()
-        .find_map(|(key, value)| {
-            matches!(key.as_str(), "COORDINATION_REPO_PATH" | "DIFFFORGE_WORKSPACE_ROOT")
+    let workspace_trust = if kind == "claude" {
+        // Claude trust must wait until the actual interactive launch boundary:
+        // only then are the final CLAUDE_CONFIG_DIR/HOME and canonical PTY cwd
+        // known. In particular, this function also runs while preparing warm
+        // shells, which must never pre-trust a directory on their own.
+        Some(json!({
+            "state": "pending",
+            "source": "interactive_launch_preflight",
+        }))
+    } else {
+        env_vars
+            .iter()
+            .find_map(|(key, value)| {
+                matches!(
+                    key.as_str(),
+                    "COORDINATION_REPO_PATH" | "DIFFFORGE_WORKSPACE_ROOT"
+                )
                 .then_some(value.as_str())
-        })
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|workspace_root| {
-            // Trust is reconciled through provider-owned state before launch.
-            // PTY output is intentionally never inspected to infer or resolve it.
-            agent_accounts_reconcile_workspace_trust_for(kind, Path::new(workspace_root))
-                .unwrap_or_else(|error| json!({ "state": "failed", "message": error, "source": "provider_native_state" }))
-        });
+            })
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|workspace_root| {
+                // PTY output is intentionally never inspected to infer or resolve trust.
+                agent_accounts_reconcile_workspace_trust_for(kind, Path::new(workspace_root))
+                    .unwrap_or_else(|error| json!({ "state": "failed", "message": error, "source": "provider_native_state" }))
+            })
+    };
     {
         let registry = AGENT_ACCOUNTS_PANE_PROFILES.get_or_init(|| StdMutex::new(HashMap::new()));
         if let Ok(mut map) = registry.lock() {
@@ -5125,22 +5158,18 @@ fn agent_accounts_reconcile_workspace_trust_for(
             } else {
                 profile_home.join(".claude.json")
             };
-            let mut state = fs::read_to_string(&state_path)
-                .ok()
-                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-                .filter(Value::is_object)
-                .unwrap_or_else(|| json!({}));
-            if !state.get("projects").is_some_and(Value::is_object) {
-                state["projects"] = json!({});
-            }
             let key = workspace_root.to_string_lossy().to_string();
-            if !state["projects"].get(&key).is_some_and(Value::is_object) {
-                state["projects"][&key] = json!({});
+            let outcome = ensure_claude_workspace_trust_in_config(&state_path, &workspace_root)?;
+            if outcome == ClaudeWorkspaceTrustMergeOutcome::SkippedInvalidConfig {
+                return Ok(json!({
+                    "contract": "diffforge.provider_workspace_trust.v1",
+                    "provider": kind,
+                    "state": "skipped",
+                    "workspace_root": key,
+                    "source": "provider_native_state",
+                    "message": "Claude state is malformed; DiffForge left it unchanged.",
+                }));
             }
-            state["projects"][&key]["hasTrustDialogAccepted"] = json!(true);
-            let bytes = serde_json::to_vec_pretty(&state)
-                .map_err(|error| format!("Unable to encode Claude trust state: {error}"))?;
-            agent_accounts_write_private_file_atomic(&state_path, &bytes, "Claude workspace trust")?;
             Ok(json!({
                 "contract": "diffforge.provider_workspace_trust.v1",
                 "provider": kind,

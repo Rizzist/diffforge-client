@@ -2,6 +2,8 @@ export const NOTIFICATION_PREFERENCES_CONTRACT = "diffforge.notification_prefs.v
 
 export const NOTIFICATION_PREFERENCE_DEFAULT_PUSH = Object.freeze({
   uir_prompts: true,
+  todo_started: true,
+  todo_completed: true,
   loop_run_started: false,
   loop_run_completed: true,
   loop_run_failed: true,
@@ -15,6 +17,16 @@ export const NOTIFICATION_PREFERENCE_PUSH_OPTIONS = Object.freeze([
     key: "uir_prompts",
     label: "Input prompts",
     detail: "User-input-required prompts from agent terminals.",
+  },
+  {
+    key: "todo_started",
+    label: "Todo started",
+    detail: "A terminal started a workspace task.",
+  },
+  {
+    key: "todo_completed",
+    label: "Todo completed",
+    detail: "A terminal completed a workspace task.",
   },
   {
     key: "loop_run_started",
@@ -70,6 +82,8 @@ const TOP_LEVEL_ALIASES = new Set([
 
 const PUSH_ALIASES = Object.freeze({
   uir_prompts: ["uir_prompts"],
+  todo_started: ["todo_started", "todoStarted"],
+  todo_completed: ["todo_completed", "todoCompleted"],
   loop_run_started: ["loop_run_started"],
   loop_run_completed: ["loop_run_completed"],
   loop_run_failed: ["loop_run_failed"],

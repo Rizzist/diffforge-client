@@ -3243,8 +3243,11 @@ fn terminal_coordination_session_from_context(
 }
 
 fn clear_terminal_activity_hook_files(pane_id: &str, instance_id: u64) {
-    let _ = fs::remove_file(terminal_activity_events_path(pane_id, instance_id));
+    let events_path = terminal_activity_events_path(pane_id, instance_id);
+    let _ = fs::remove_file(&events_path);
     let _ = fs::remove_file(terminal_activity_debug_path(pane_id, instance_id));
+    let _ = fs::remove_file(diff_forge_claude_hook_correlation_state_path(&events_path));
+    let _ = fs::remove_file(diff_forge_claude_hook_correlation_lock_path(&events_path));
 }
 
 fn refresh_codex_activity_hook_profile_for_launch(
@@ -12951,6 +12954,19 @@ fn terminal_activity_hook_name_key(value: &str) -> String {
         .collect()
 }
 
+fn terminal_activity_hook_interaction_source_label(event: &Value) -> &'static str {
+    if terminal_activity_hook_string(
+        event,
+        &["interaction_response_mode", "interactionResponseMode"],
+    )
+    .is_some_and(|mode| terminal_activity_hook_name_key(&mode) == "diffforgeintervention")
+    {
+        "diffforge_intervention"
+    } else {
+        "provider_hook"
+    }
+}
+
 fn terminal_activity_hook_display_text(value: &str) -> String {
     value
         .chars()
@@ -13296,6 +13312,44 @@ fn terminal_activity_hook_prompt_options_from_event(
     event: &Value,
     prompt_kind: &str,
 ) -> Vec<TerminalActivityHookPromptOption> {
+    let provider_key = terminal_activity_hook_string(event, &["provider"])
+        .map(|provider| terminal_activity_hook_name_key(&provider))
+        .unwrap_or_default();
+    let hook_key = terminal_activity_hook_string(event, &["hook_event_name", "event_name"])
+        .map(|hook| terminal_activity_hook_name_key(&hook))
+        .unwrap_or_default();
+    let tool_key = terminal_activity_hook_string(event, &["tool_name", "toolName"])
+        .map(|tool| terminal_activity_hook_name_key(&tool))
+        .unwrap_or_default();
+    let has_structured_questions = provider_key.contains("claude")
+        && hook_key == "pretooluse"
+        && tool_key == "askuserquestion"
+        && terminal_activity_hook_value(
+            event,
+            &[
+                "prompt_questions",
+                "questions",
+                "question_set",
+                "questionSet",
+            ],
+        )
+        .or_else(|| {
+            terminal_activity_hook_value(event, &["tool_input", "input"])
+                .and_then(|value| value.get("questions").cloned())
+        })
+        .is_some_and(|questions| {
+            questions
+                .as_array()
+                .map(|questions| !questions.is_empty())
+                .unwrap_or(true)
+        });
+    let exit_plan_mode =
+        provider_key.contains("claude") && hook_key == "pretooluse" && tool_key == "exitplanmode";
+    let claude_elicitation = provider_key.contains("claude") && hook_key == "elicitation";
+    let claude_permission = provider_key.contains("claude") && prompt_kind == "permission";
+    let claude_permission_has_suggestions =
+        terminal_activity_hook_value(event, &["permission_suggestions", "updated_permissions"])
+            .is_some();
     let mut options = [
         "prompt_options",
         "options",
@@ -13315,18 +13369,52 @@ fn terminal_activity_hook_prompt_options_from_event(
     .filter_map(|value| terminal_activity_hook_prompt_option_from_value(&value))
     .collect::<Vec<_>>();
 
-    if options.is_empty() && matches!(prompt_kind, "approval" | "permission") {
+    if options.is_empty() && exit_plan_mode {
+        options.extend([
+            TerminalActivityHookPromptOption {
+                id: "approve_plan".to_string(),
+                label: "Approve plan".to_string(),
+                description: None,
+                value: Some("approve_plan".to_string()),
+                danger: None,
+            },
+            TerminalActivityHookPromptOption {
+                id: "keep_planning".to_string(),
+                label: "Keep planning".to_string(),
+                description: None,
+                value: Some("keep_planning".to_string()),
+                danger: None,
+            },
+        ]);
+    } else if options.is_empty() && claude_elicitation {
+        options.extend([
+            TerminalActivityHookPromptOption {
+                id: "accept".to_string(),
+                label: "Accept".to_string(),
+                description: None,
+                value: Some("accept".to_string()),
+                danger: None,
+            },
+            TerminalActivityHookPromptOption {
+                id: "decline".to_string(),
+                label: "Decline".to_string(),
+                description: None,
+                value: Some("decline".to_string()),
+                danger: None,
+            },
+            TerminalActivityHookPromptOption {
+                id: "cancel".to_string(),
+                label: "Cancel".to_string(),
+                description: None,
+                value: Some("cancel".to_string()),
+                danger: None,
+            },
+        ]);
+    } else if options.is_empty() && matches!(prompt_kind, "approval" | "permission") {
         options.extend([
             TerminalActivityHookPromptOption {
                 id: "allow_once".to_string(),
                 label: "Allow once".to_string(),
-                description: None,
-                value: None,
-                danger: None,
-            },
-            TerminalActivityHookPromptOption {
-                id: "allow_always".to_string(),
-                label: "Allow always".to_string(),
                 description: None,
                 value: None,
                 danger: None,
@@ -13339,7 +13427,19 @@ fn terminal_activity_hook_prompt_options_from_event(
                 danger: None,
             },
         ]);
-    } else if options.is_empty() {
+        if !claude_permission || claude_permission_has_suggestions {
+            options.insert(
+                1,
+                TerminalActivityHookPromptOption {
+                    id: "allow_always".to_string(),
+                    label: "Allow always".to_string(),
+                    description: None,
+                    value: None,
+                    danger: None,
+                },
+            );
+        }
+    } else if options.is_empty() && !has_structured_questions {
         options.push(TerminalActivityHookPromptOption {
             id: "continue".to_string(),
             label: "Continue".to_string(),
@@ -13351,15 +13451,18 @@ fn terminal_activity_hook_prompt_options_from_event(
 
     let mut deduped = Vec::<TerminalActivityHookPromptOption>::new();
     for option in options {
-        let codex_permission = prompt_kind == "permission"
-            && terminal_activity_hook_string(event, &["provider"])
-                .map(|provider| terminal_activity_hook_name_key(&provider).contains("codex"))
-                .unwrap_or(false);
-        if codex_permission
-            && terminal_activity_hook_name_key(&option.id) == "allowalways"
-        {
+        let codex_permission = prompt_kind == "permission" && provider_key.contains("codex");
+        if codex_permission && terminal_activity_hook_name_key(&option.id) == "allowalways" {
             // Codex command-hook PermissionRequest supports allow/deny only.
             // Session-persistent approval belongs to the app-server protocol.
+            continue;
+        }
+        if claude_permission
+            && !claude_permission_has_suggestions
+            && terminal_activity_hook_name_key(&option.id) == "allowalways"
+        {
+            // Claude can only persist a grant by returning source-provided
+            // permission suggestions in updatedPermissions.
             continue;
         }
         if option.id.is_empty() || deduped.iter().any(|existing| existing.id == option.id) {
@@ -13375,6 +13478,9 @@ fn terminal_activity_hook_manual_prompt(
     event: &Value,
 ) -> Option<TerminalActivityHookManualPrompt> {
     let hook_key = terminal_activity_hook_name_key(hook_event_name);
+    let provider_key = terminal_activity_hook_string(event, &["provider"])
+        .map(|value| terminal_activity_hook_name_key(&value))
+        .unwrap_or_default();
     let tool_key = terminal_activity_hook_string(event, &["tool_name", "toolName"])
         .map(|value| terminal_activity_hook_name_key(&value))
         .unwrap_or_default();
@@ -13403,7 +13509,8 @@ fn terminal_activity_hook_manual_prompt(
             | "userinputrequested"
             | "userpromptrequired"
             | "userpromptstarted"
-    ) || blocking_tool_prompt || permission_retry_prompt;
+    ) || blocking_tool_prompt
+        || permission_retry_prompt;
     let resolved_decision = terminal_activity_hook_status_key(
         event,
         &["permission_decision", "decision", "approval_decision"],
@@ -13499,7 +13606,7 @@ fn terminal_activity_hook_manual_prompt(
 
     let approval_id = terminal_activity_hook_string(event, &["approval_id"]);
     let permission_prompt_id = terminal_activity_hook_string(event, &["permission_prompt_id"]);
-    let permission_request_id = terminal_activity_hook_string(
+    let event_permission_request_id = terminal_activity_hook_string(
         event,
         &[
             "permission_request_id",
@@ -13510,6 +13617,20 @@ fn terminal_activity_hook_manual_prompt(
         ],
     );
     let tool_use_id = terminal_activity_hook_string(event, &["tool_use_id"]);
+    let elicitation_id = terminal_activity_hook_string(event, &["elicitation_id"]).or_else(|| {
+        terminal_activity_hook_value(event, &["provider_payload"])
+            .and_then(|payload| terminal_activity_hook_string(&payload, &["elicitation_id"]))
+    });
+    let permission_request_id = if provider_key.contains("claude")
+        && hook_key == "pretooluse"
+        && matches!(tool_key.as_str(), "askuserquestion" | "exitplanmode")
+    {
+        tool_use_id.clone().or(event_permission_request_id)
+    } else if provider_key.contains("claude") && hook_key == "elicitation" {
+        elicitation_id.or(event_permission_request_id)
+    } else {
+        event_permission_request_id
+    };
     let has_action_token = approval_id.is_some()
         || permission_prompt_id.is_some()
         || permission_request_id.is_some()
@@ -13529,7 +13650,10 @@ fn terminal_activity_hook_manual_prompt(
         .unwrap_or_else(|| {
             if permission_retry_prompt {
                 "selection".to_string()
-            } else if matches!(tool_key.as_str(), "askuserquestion" | "requestuserinput" | "elicitation" | "mcpelicitation") {
+            } else if matches!(
+                tool_key.as_str(),
+                "askuserquestion" | "requestuserinput" | "elicitation" | "mcpelicitation"
+            ) {
                 "question".to_string()
             } else if tool_key == "exitplanmode" {
                 "approval".to_string()
@@ -13565,9 +13689,15 @@ fn terminal_activity_hook_manual_prompt(
     .or_else(|| {
         if permission_retry_prompt {
             Some("Claude denied this operation. Should it retry?".to_string())
+        } else if provider_key.contains("claude") && tool_key == "exitplanmode" {
+            terminal_activity_hook_value(event, &["tool_input", "input"])
+                .map(|tool_input| diff_forge_activity_hook_exit_plan_body(&tool_input))
+                .filter(|value| !value.is_empty())
+                .or_else(|| Some("Review and approve the proposed plan.".to_string()))
+        } else if tool_key == "exitplanmode" {
+            Some("Review and approve the proposed plan.".to_string())
         } else {
-            (tool_key == "exitplanmode")
-                .then(|| "Review and approve the proposed plan.".to_string())
+            None
         }
     });
     let default_option = terminal_activity_hook_string(
@@ -13582,7 +13712,11 @@ fn terminal_activity_hook_manual_prompt(
     .map(|value| terminal_activity_hook_prompt_option_id(&value))
     .filter(|value| !value.is_empty())
     .or_else(|| {
-        if matches!(kind.as_str(), "approval" | "permission") {
+        if provider_key.contains("claude") && tool_key == "exitplanmode" {
+            Some("keep_planning".to_string())
+        } else if provider_key.contains("claude") && hook_key == "elicitation" {
+            Some("decline".to_string())
+        } else if matches!(kind.as_str(), "approval" | "permission") {
             Some("reject".to_string())
         } else {
             None
@@ -13631,16 +13765,17 @@ fn terminal_activity_hook_manual_prompt(
     let allows_free_text = terminal_activity_hook_bool(
         event,
         &["allows_free_text", "free_text", "supports_free_text"],
-    ) || options.iter().any(|option| {
-        let id = terminal_activity_hook_prompt_option_id(&option.id);
-        let value = option
-            .value
-            .as_deref()
-            .map(terminal_activity_hook_prompt_option_id)
-            .unwrap_or_default();
-        matches!(id.as_str(), "free_text" | "freetext")
-            || matches!(value.as_str(), "free_text" | "freetext")
-    });
+    ) || (provider_key.contains("claude") && tool_key == "exitplanmode")
+        || options.iter().any(|option| {
+            let id = terminal_activity_hook_prompt_option_id(&option.id);
+            let value = option
+                .value
+                .as_deref()
+                .map(terminal_activity_hook_prompt_option_id)
+                .unwrap_or_default();
+            matches!(id.as_str(), "free_text" | "freetext")
+                || matches!(value.as_str(), "free_text" | "freetext")
+        });
 
     Some(TerminalActivityHookManualPrompt {
         kind,
@@ -14769,7 +14904,19 @@ fn terminal_activity_hook_payload(
         event_type,
         "provider-permission-requested" | "provider-user-prompt-started"
     );
-    let manual_prompt_source = manual_prompt.as_ref().map(|_| "hook".to_string());
+    let explicit_interaction_response_mode = terminal_activity_hook_string(
+        event,
+        &["interaction_response_mode", "interactionResponseMode"],
+    );
+    let interaction_source_label = terminal_activity_hook_interaction_source_label(event);
+    let diffforge_intervention = interaction_source_label == "diffforge_intervention";
+    let manual_prompt_source = manual_prompt.as_ref().map(|_| {
+        if diffforge_intervention {
+            "diffforge_intervention".to_string()
+        } else {
+            "hook".to_string()
+        }
+    });
     let manual_approval_required = manual_prompt
         .as_ref()
         .is_some_and(|prompt| prompt.kind == "approval")
@@ -14862,9 +15009,9 @@ fn terminal_activity_hook_payload(
         .or_else(|| event_permission_request_id.clone())
         .or_else(|| terminal_activity_hook_string(event, &["tool_use_id"]))
         .or_else(|| {
-            manual_prompt.as_ref().map(|_| {
-                format!("{}:{}:{}", hook_key, metadata.pane_id, event_time_ms)
-            })
+            manual_prompt
+                .as_ref()
+                .map(|_| format!("{}:{}:{}", hook_key, metadata.pane_id, event_time_ms))
         });
     let explicit_default_option = terminal_activity_hook_string(
         event,
@@ -14913,7 +15060,12 @@ fn terminal_activity_hook_payload(
         });
     let prompt_questions = terminal_activity_hook_value(
         event,
-        &["prompt_questions", "questions", "question_set", "questionSet"],
+        &[
+            "prompt_questions",
+            "questions",
+            "question_set",
+            "questionSet",
+        ],
     )
     .or_else(|| {
         terminal_activity_hook_value(event, &["tool_input", "input"])
@@ -14931,7 +15083,12 @@ fn terminal_activity_hook_payload(
     let prompt_url = terminal_activity_hook_string(event, &["prompt_url", "url"]);
     let provider_payload = terminal_activity_hook_value(
         event,
-        &["provider_payload", "providerPayload", "request_payload", "requestPayload"],
+        &[
+            "provider_payload",
+            "providerPayload",
+            "request_payload",
+            "requestPayload",
+        ],
     )
     .or_else(|| {
         manual_prompt.as_ref().map(|_| {
@@ -15017,29 +15174,32 @@ fn terminal_activity_hook_payload(
     let interaction_revision = interaction_id
         .as_ref()
         .map(|_| resolved_interaction_revision.unwrap_or(event_time_ms));
-    let interaction_source = interaction_id.as_ref().map(|_| "provider_hook".to_string());
+    let interaction_source = interaction_id
+        .as_ref()
+        .map(|_| interaction_source_label.to_string());
     let provider_key = terminal_activity_hook_name_key(&provider);
-    let explicit_interaction_response_mode = terminal_activity_hook_string(
-        event,
-        &["interaction_response_mode", "interactionResponseMode"],
-    );
     let interaction_response_mode = interaction_id.as_ref().map(|_| {
         if let Some(response_mode) = explicit_interaction_response_mode.clone() {
             response_mode
         } else if resolved_interaction_revision.is_some() {
             "resolved".to_string()
         } else if terminal_metadata_is_claude(&metadata)
-            && (matches!(hook_key.as_str(), "permissionrequest" | "permissiondenied" | "elicitation")
-                || (hook_key == "pretooluse"
-                    && terminal_activity_hook_string(event, &["tool_name"])
-                        .map(|value| terminal_activity_hook_name_key(&value))
-                        .is_some_and(|value| {
-                            matches!(value.as_str(), "askuserquestion" | "exitplanmode")
-                        })))
+            && (matches!(
+                hook_key.as_str(),
+                "permissionrequest" | "permissiondenied" | "elicitation"
+            ) || (hook_key == "pretooluse"
+                && terminal_activity_hook_string(event, &["tool_name"])
+                    .map(|value| terminal_activity_hook_name_key(&value))
+                    .is_some_and(|value| {
+                        matches!(value.as_str(), "askuserquestion" | "exitplanmode")
+                    })))
         {
             "blocking_hook".to_string()
         } else if provider_key.contains("opencode")
-            && matches!(hook_key.as_str(), "permissionrequest" | "userpromptrequired")
+            && matches!(
+                hook_key.as_str(),
+                "permissionrequest" | "userpromptrequired"
+            )
         {
             "provider_api".to_string()
         } else if provider_key.contains("codex")
@@ -15194,9 +15354,13 @@ fn terminal_activity_hook_payload(
         provider_blocked_for_user,
         terminal_is_prompting_user,
         prompting_user_kind,
-        prompting_user_source: manual_prompt
-            .as_ref()
-            .map(|_| "cli-hook:manual-prompt".to_string()),
+        prompting_user_source: manual_prompt.as_ref().map(|_| {
+            if diffforge_intervention {
+                "diffforge:permission-retry-intervention".to_string()
+            } else {
+                "cli-hook:manual-prompt".to_string()
+            }
+        }),
         prompting_user_confidence: manual_prompt
             .as_ref()
             .map(|_| "cli_hook_manual_prompt".to_string()),
@@ -16318,7 +16482,7 @@ fn terminal_structured_interaction_reconcile(
     let provider_interaction = payload
         .interaction_source
         .as_deref()
-        .is_some_and(|source| source == "provider_hook")
+        .is_some_and(|source| matches!(source, "provider_hook" | "diffforge_intervention"))
         && payload.terminal_is_prompting_user;
     if provider_interaction {
         let Some(interaction_id) = payload.interaction_id.clone() else {
@@ -16464,7 +16628,7 @@ fn terminal_structured_interaction_uses_blocking_transport(
 ) -> bool {
     matches!(
         interaction.response_mode.as_str(),
-        "blocking_hook" | "provider_api" | "codex_app_server"
+        "blocking_hook" | "provider_api" | "codex_app_server" | "diffforge_intervention"
     )
 }
 
@@ -19341,14 +19505,18 @@ async fn handle_terminal_activity_transport_message(
     let instance = terminal_activity_hook_current_instance(&state.terminals, &pane_id, instance_id)
         .await
         .ok_or_else(|| "Terminal activity event target is not active.".to_string())?;
-    let blocking_payload = terminal_activity_hook_payload(&instance, &envelope.event).filter(
-        |payload| {
+    let blocking_payload =
+        terminal_activity_hook_payload(&instance, &envelope.event).filter(|payload| {
             matches!(
                 payload.interaction_response_mode.as_deref(),
-                Some("blocking_hook" | "provider_api" | "codex_app_server")
+                Some(
+                    "blocking_hook"
+                        | "provider_api"
+                        | "codex_app_server"
+                        | "diffforge_intervention"
+                )
             )
-        },
-    );
+        });
     let mut blocking_receiver = None;
     if let Some(payload) = blocking_payload.as_ref() {
         let interaction_id = payload
@@ -21263,16 +21431,19 @@ fn terminal_structured_interaction_hook_response(
             .and_then(|value| value.get("answers"))
             .cloned()
             .or_else(|| answer_payload.cloned())
-            .unwrap_or_else(|| {
-                json!([[answer_text.or(option_value).unwrap_or_default()]])
-            });
+            .unwrap_or_else(|| json!([[answer_text.or(option_value).unwrap_or_default()]]));
         return json!({
             "answers": answers,
             "rejected": matches!(option_key.as_str(), "deny" | "reject" | "cancel"),
         });
     }
     if hook_key == "permissiondenied" {
-        return json!({ "retry": option_key == "retry" });
+        return json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionDenied",
+                "retry": option_key == "retry",
+            }
+        });
     }
     if hook_key == "permissionrequest" {
         let denied = matches!(
@@ -21338,7 +21509,10 @@ fn terminal_structured_interaction_hook_response(
             .and_then(Value::as_str)
             .unwrap_or_default();
         let tool_key = terminal_activity_hook_name_key(tool_name);
-        let denied = matches!(option_key.as_str(), "deny" | "reject" | "cancel");
+        let denied = matches!(option_key.as_str(), "deny" | "reject" | "cancel")
+            || (provider_key.contains("claude")
+                && tool_key == "exitplanmode"
+                && option_key == "keepplanning");
         let mut output = json!({
             "hookEventName": "PreToolUse",
             "permissionDecision": if denied { "deny" } else { "allow" },
@@ -21525,7 +21699,7 @@ async fn terminal_answer_agent_prompt_remote_command(
 
     if matches!(
         interaction.response_mode.as_str(),
-        "blocking_hook" | "provider_api" | "codex_app_server"
+        "blocking_hook" | "provider_api" | "codex_app_server" | "diffforge_intervention"
     ) {
         let response = terminal_structured_interaction_hook_response(
             &interaction,
@@ -26789,6 +26963,253 @@ notifications = true
     }
 
     #[test]
+    fn claude_permission_without_suggestions_omits_persistent_grant() {
+        let prompt = terminal_activity_hook_manual_prompt(
+            "PermissionRequest",
+            &json!({
+                "hook_event_name": "PermissionRequest",
+                "provider": "claude",
+                "permission_request_id": "permission-structured-1",
+            }),
+        )
+        .expect("structured Claude permission prompt");
+
+        assert_eq!(
+            prompt
+                .options
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["allow_once", "reject"]
+        );
+    }
+
+    #[test]
+    fn claude_question_projection_keeps_boundaries_and_has_no_continue_option() {
+        let record = diff_forge_activity_hook_record(
+            "claude",
+            "pane-1",
+            1,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "session-1",
+                "prompt_id": "common-turn-prompt",
+                "tool_name": "AskUserQuestion",
+                "tool_use_id": "question-tool-use-1",
+                "tool_input": {
+                    "questions": [
+                        {
+                            "header": "Targets",
+                            "question": "Which targets?",
+                            "multiSelect": true,
+                            "options": [{"label": "Web", "description": "Browser build"}]
+                        },
+                        {
+                            "header": "Mode",
+                            "question": "Which mode?",
+                            "multiSelect": false,
+                            "options": [{"label": "Debug", "description": "Debug build"}]
+                        }
+                    ]
+                }
+            }),
+        );
+        let prompt = terminal_activity_hook_manual_prompt("PreToolUse", &record)
+            .expect("structured Claude question prompt");
+
+        assert_eq!(
+            prompt.permission_request_id.as_deref(),
+            Some("question-tool-use-1")
+        );
+        assert!(prompt.options.is_empty());
+        assert_eq!(record["prompt_questions"].as_array().map(Vec::len), Some(2));
+        assert_eq!(record["prompt_questions"][0]["multiSelect"], true);
+        assert_eq!(record["prompt_questions"][1]["multiSelect"], false);
+    }
+
+    #[test]
+    fn claude_exit_plan_projection_has_only_native_actions() {
+        let record = diff_forge_activity_hook_record(
+            "claude",
+            "pane-1",
+            1,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "session-1",
+                "prompt_id": "common-turn-prompt",
+                "tool_name": "ExitPlanMode",
+                "tool_use_id": "plan-tool-use-1",
+                "tool_input": {"plan": "Implement the identity fix"}
+            }),
+        );
+        let prompt = terminal_activity_hook_manual_prompt("PreToolUse", &record)
+            .expect("structured Claude plan prompt");
+
+        assert_eq!(
+            prompt.permission_request_id.as_deref(),
+            Some("plan-tool-use-1")
+        );
+        assert_eq!(prompt.default_option.as_deref(), Some("keep_planning"));
+        assert_eq!(
+            prompt
+                .options
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["approve_plan", "keep_planning"]
+        );
+        assert_eq!(prompt.text.as_deref(), Some("Implement the identity fix"));
+        assert!(prompt.allows_free_text);
+    }
+
+    #[test]
+    fn non_claude_pretool_projection_and_answers_keep_legacy_behavior() {
+        let prompt = terminal_activity_hook_manual_prompt(
+            "PreToolUse",
+            &json!({
+                "hook_event_name": "PreToolUse",
+                "provider": "codex",
+                "prompt_id": "codex-plan-1",
+                "tool_name": "ExitPlanMode"
+            }),
+        )
+        .expect("legacy non-Claude plan prompt");
+        assert_eq!(
+            prompt.text.as_deref(),
+            Some("Review and approve the proposed plan.")
+        );
+
+        let interaction = TerminalStructuredInteraction {
+            interaction_id: "uir:codex-question-1".to_string(),
+            revision: 1,
+            pane_id: "pane-1".to_string(),
+            instance_id: 1,
+            provider: "codex".to_string(),
+            provider_request_id: "codex-question-1".to_string(),
+            prompt_id: "codex-question-1".to_string(),
+            hook_event_name: "PreToolUse".to_string(),
+            response_mode: "blocking_hook".to_string(),
+            options: Vec::new(),
+            permission_suggestions: None,
+            prompt_questions: None,
+            prompt_schema: None,
+            provider_payload: Some(json!({
+                "tool_name": "RequestUserInput",
+                "tool_input": {}
+            })),
+        };
+        let response = terminal_structured_interaction_hook_response(
+            &interaction,
+            "keep_planning",
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            response.pointer("/hookSpecificOutput/permissionDecision"),
+            Some(&json!("allow"))
+        );
+    }
+
+    #[test]
+    fn claude_elicitation_projection_uses_native_identity_actions_and_defaults() {
+        let record = diff_forge_activity_hook_record(
+            "claude",
+            "pane-1",
+            1,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "Elicitation",
+                "session_id": "session-1",
+                "elicitation_id": "elicitation-native-1",
+                "requested_schema": {
+                    "type": "object",
+                    "properties": {
+                        "region": {"type": "string", "default": "ca-central-1"}
+                    }
+                }
+            }),
+        );
+        let prompt = terminal_activity_hook_manual_prompt("Elicitation", &record)
+            .expect("structured Claude elicitation prompt");
+
+        assert_eq!(
+            prompt.permission_request_id.as_deref(),
+            Some("elicitation-native-1")
+        );
+        assert_eq!(prompt.default_option.as_deref(), Some("decline"));
+        assert_eq!(
+            prompt
+                .options
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["accept", "decline", "cancel"]
+        );
+        assert_eq!(
+            record.pointer("/prompt_schema/properties/region/default"),
+            Some(&json!("ca-central-1"))
+        );
+    }
+
+    #[test]
+    fn claude_permission_denied_retry_is_not_provider_native() {
+        let record = diff_forge_activity_hook_record(
+            "claude",
+            "pane-1",
+            1,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "PermissionDenied",
+                "session_id": "session-1",
+                "prompt_id": "permission-denied-1"
+            }),
+        );
+
+        assert!(terminal_activity_hook_manual_prompt("PermissionDenied", &record).is_some());
+        assert_eq!(
+            terminal_activity_hook_interaction_source_label(&record),
+            "diffforge_intervention"
+        );
+        assert_eq!(record["provider_native_prompt"], false);
+
+        let interaction = TerminalStructuredInteraction {
+            interaction_id: "uir:permission-denied-1".to_string(),
+            revision: 1,
+            pane_id: "pane-1".to_string(),
+            instance_id: 1,
+            provider: "claude".to_string(),
+            provider_request_id: "permission-denied-1".to_string(),
+            prompt_id: "permission-denied-1".to_string(),
+            hook_event_name: "PermissionDenied".to_string(),
+            response_mode: "diffforge_intervention".to_string(),
+            options: Vec::new(),
+            permission_suggestions: None,
+            prompt_questions: None,
+            prompt_schema: None,
+            provider_payload: None,
+        };
+        assert!(terminal_structured_interaction_uses_blocking_transport(
+            &interaction
+        ));
+        assert_eq!(
+            terminal_structured_interaction_hook_response(&interaction, "retry", None, None, None,),
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionDenied",
+                    "retry": true
+                }
+            })
+        );
+    }
+
+    #[test]
     fn structured_claude_permission_response_preserves_always_suggestions() {
         let interaction = TerminalStructuredInteraction {
             interaction_id: "uir:permission-1".to_string(),
@@ -26945,6 +27366,25 @@ notifications = true
             response.pointer("/hookSpecificOutput/updatedInput/plan"),
             Some(&json!("Implement the approved change"))
         );
+
+        let keep_planning = terminal_structured_interaction_hook_response(
+            &interaction,
+            "keep_planning",
+            None,
+            Some("Please address the rollback case."),
+            None,
+        );
+        assert_eq!(
+            keep_planning.pointer("/hookSpecificOutput/permissionDecision"),
+            Some(&json!("deny"))
+        );
+        assert_eq!(
+            keep_planning.pointer("/hookSpecificOutput/permissionDecisionReason"),
+            Some(&json!("Please address the rollback case."))
+        );
+        assert!(keep_planning
+            .pointer("/hookSpecificOutput/updatedInput")
+            .is_none());
     }
 
     #[test]

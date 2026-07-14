@@ -1205,11 +1205,16 @@ export default function VideoEditor({
     });
   }, [applyPreviewStyles, playback, playheadMs, syncMediaForTime, updateTransportDom]);
 
+  // `project` is a dependency on purpose: trim-stretch/speed/move edits change
+  // the clip's source-time mapping, so the paused preview must re-seek (and
+  // playbackRate must reapply) live while the gesture is still in flight. The
+  // <60ms tolerance in seekEntryToTimeline keeps unchanged mappings seek-free,
+  // so unrelated project edits stay cheap.
   useEffect(() => {
     const currentMs = playback?.getMs?.() ?? playheadMs;
     syncMediaForTime(currentMs, { now: performance.now(), playing, seekActive: !playing });
     applyPreviewStyles(currentMs);
-  }, [applyPreviewStyles, playback, playing, playheadMs, syncMediaForTime, visual?.clip.id, visualIsImage, visualLayerNonce]);
+  }, [applyPreviewStyles, playback, playing, playheadMs, project, syncMediaForTime, visual?.clip.id, visualIsImage, visualLayerNonce]);
 
   // FX/crop on the pooled <video> element when editing while paused: the
   // per-tick path above only runs on playback/seek, so an inspector fx edit
