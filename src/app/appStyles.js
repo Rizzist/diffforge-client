@@ -11324,6 +11324,11 @@ export const ResizeHandle = styled(Separator)`
   z-index: 48;
   flex: 0 0 auto;
   background: transparent;
+  /* Parents (TerminalGridScaffold) are pointer-transparent so the pane
+     surfaces below stay interactive; the separator is the one element that
+     opts back in — its whole 17px strip grabs even though it overlaps the
+     panes visually. */
+  pointer-events: auto;
 
   /* The root is a wide invisible hit target; ::before carries the visible
      9px gutter so widening the grab area doesn't widen the divider. */
@@ -11338,29 +11343,30 @@ export const ResizeHandle = styled(Separator)`
   }
 
   &[data-direction="horizontal"] {
-    width: 13px;
-    margin: 0 -6px;
+    width: 17px;
+    margin: 0 -8px;
     cursor: col-resize;
   }
 
   &[data-direction="horizontal"]::before {
-    left: 2px;
-    right: 2px;
+    left: 4px;
+    right: 4px;
   }
 
   &[data-direction="vertical"] {
-    height: 13px;
-    margin: -6px 0;
+    height: 17px;
+    margin: -8px 0;
     cursor: row-resize;
   }
 
   &[data-direction="vertical"]::before {
-    top: 2px;
-    bottom: 2px;
+    top: 4px;
+    bottom: 4px;
   }
 
   ${WorkspaceTerminalPanels}[data-terminal-dragging="true"] &,
   ${WorkspaceTerminalPanels}[data-todo-dragging="true"] &,
+  ${WorkspaceTerminalPanels}[data-terminal-document-maximized="true"] &,
   ${WorkspaceTerminalPanels}[data-terminal-fullscreen="true"] & {
     opacity: 0;
     pointer-events: none;
@@ -11374,15 +11380,15 @@ export const ResizeHandle = styled(Separator)`
   }
 
   &[data-direction="horizontal"]::after {
-    left: 6px;
-    right: 6px;
-    background: rgba(255, 255, 255, 0.1);
+    left: 8px;
+    right: 8px;
+    background: rgba(255, 255, 255, 0.14);
   }
 
   &[data-direction="vertical"]::after {
-    top: 6px;
-    bottom: 6px;
-    background: rgba(255, 255, 255, 0.1);
+    top: 8px;
+    bottom: 8px;
+    background: rgba(255, 255, 255, 0.14);
   }
 
   &:hover::before,

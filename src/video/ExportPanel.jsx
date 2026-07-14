@@ -30,6 +30,10 @@ function readStoredExportDir() {
   }
 }
 
+function isFfmpegInstallError(value) {
+  return /ffmpeg|ffprobe|drawtext|video tools/i.test(String(value || ""));
+}
+
 // Hardware H.264 encoding (VideoToolbox / NVENC / QSV / VAAPI) for mp4
 // exports; default ON — the backend retries with libx264 automatically.
 const HW_ENCODE_STORAGE_KEY = "diffforge.video.hwEncode";
@@ -181,12 +185,15 @@ const WarningsList = styled.div`
 export default function ExportPanel({
   ffmpegReady = false,
   ffmpegTextSupport = null,
+  installBusy = false,
   // Flushes the pane's debounced project autosave. Exports read the saved
   // file, so this must run before any export command.
   onFlushProjectSave = null,
+  onFfmpegInstallRequired = null,
   project,
   projectPath = "",
   repoPath = "",
+  toolsInstallNonce = 0,
 }) {
   const durationMs = useMemo(() => projectDurationMs(project), [project]);
   const [fileName, setFileName] = useState("");
@@ -209,6 +216,24 @@ export default function ExportPanel({
   // Hardware-encoder probe: null = unknown (old backend without the command,
   // or probe still in flight) — keep the historical optimistic behavior then.
   const [hwProbe, setHwProbe] = useState(null); // { hardwareAvailable, encoder } | null
+
+  useEffect(() => {
+    if (!installBusy && (
+      (!ffmpegReady || ffmpegTextSupport === false)
+      || isFfmpegInstallError(error)
+      || isFfmpegInstallError(job?.error)
+    )) {
+      onFfmpegInstallRequired?.();
+    }
+  }, [error, ffmpegReady, ffmpegTextSupport, installBusy, job?.error, onFfmpegInstallRequired]);
+
+  useEffect(() => {
+    if (toolsInstallNonce <= 0) {
+      return;
+    }
+    setError((current) => (isFfmpegInstallError(current) ? "" : current));
+    setJob((current) => (isFfmpegInstallError(current?.error) ? null : current));
+  }, [toolsInstallNonce]);
 
   useEffect(() => {
     let disposed = false;
@@ -435,10 +460,10 @@ export default function ExportPanel({
         Timeline: <strong>{formatTimecode(durationMs)}</strong> · renders to{" "}
         <code>{outputDir || "media/exports/"}</code>
       </VideoHint>
-      {!ffmpegReady ? (
+      {!installBusy && !ffmpegReady ? (
         <VideoErrorText>ffmpeg is not installed — use the Install chip in the top bar first.</VideoErrorText>
       ) : null}
-      {ffmpegReady && ffmpegTextSupport === false ? (
+      {!installBusy && ffmpegReady && ffmpegTextSupport === false ? (
         <VideoErrorText>
           Your ffmpeg build can’t render text or captions (Homebrew’s ffmpeg 8 removed the
           drawtext filter). Use the Install chip in the top bar to get the bundled build —

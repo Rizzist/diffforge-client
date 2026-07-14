@@ -682,12 +682,19 @@ const CountStepper = styled.div`
 // exists) + model/prompt/progress + status/action column.
 const HistRow = styled.div`
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   padding: 6px 7px;
   border: 1px solid rgba(148, 163, 184, 0.12);
   border-radius: 8px;
   background: rgba(4, 8, 14, 0.6);
+  cursor: pointer;
+
+  &[data-expanded="true"] {
+    border-color: rgba(96, 165, 250, 0.38);
+    background: rgba(8, 16, 28, 0.82);
+  }
 
   /* Jump-to-job flash (from a failed timeline ghost) — amber, same feel as
      the terminals/audio navigate-highlight. */
@@ -847,6 +854,21 @@ const HistGlyph = styled.span`
   }
 `;
 
+const GenerationSpinner = styled.span`
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  flex: none;
+  border: 2px solid rgba(147, 197, 253, 0.25);
+  border-top-color: #93c5fd;
+  border-radius: 999px;
+  animation: generation-spinner 720ms linear infinite;
+
+  @keyframes generation-spinner {
+    to { transform: rotate(360deg); }
+  }
+`;
+
 const HistInfo = styled.div`
   flex: 1 1 auto;
   min-width: 0;
@@ -891,9 +913,40 @@ const HistError = styled.div`
   color: #fca5a5;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 
   html[data-forge-theme="light"] & {
     color: #dc2626;
+  }
+`;
+
+const HistDetails = styled.div`
+  flex: 1 0 100%;
+  display: grid;
+  gap: 7px;
+  padding: 9px;
+  border-top: 1px solid rgba(148, 163, 184, 0.14);
+  cursor: text;
+
+  dl {
+    margin: 0;
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    gap: 5px 10px;
+    font-size: 9.5px;
+    line-height: 1.45;
+  }
+
+  dt { color: #7f8da3; font-weight: 750; }
+  dd { margin: 0; color: #cbd5e1; overflow-wrap: anywhere; white-space: pre-wrap; }
+
+  html[data-forge-theme="light"] & {
+    border-top-color: rgba(15, 23, 42, 0.12);
+    dt { color: #64748b; }
+    dd { color: #1e293b; }
   }
 `;
 
@@ -1005,6 +1058,51 @@ function promptIsOptionalFor(model, caps) {
   return model?.kind === "audio" && Boolean(caps?.requiresSourceVideo);
 }
 
+function historyCatalogModel(job) {
+  const recorded = String(job?.request?.model || job?.model || "");
+  return (
+    getGenerationModel(recorded)
+    || GENERATION_MODELS.find(
+      (entry) => entry.jobType === recorded || entry.direct?.model === recorded,
+    )
+    || null
+  );
+}
+
+function historyCostLabel(job) {
+  const catalogModel = historyCatalogModel(job);
+  if (!catalogModel) {
+    return "Not available";
+  }
+  const params = job?.request?.params || {};
+  const estimateArgs = {
+    durationSec: Number(params.durationSec) || catalogModel.caps?.defaultDuration || 0,
+    numImages: Number(params.numImages) || 1,
+  };
+  if (job?.providerId === "cloud") {
+    const credits = estimateModelCredits(catalogModel, estimateArgs);
+    return credits == null ? "Not available" : `≈ ${credits.toLocaleString()} Diff Forge credits`;
+  }
+  const usd = estimateModelUsd(catalogModel, estimateArgs);
+  return usd == null ? "Provider billed (amount unavailable)" : `≈ $${usd.toFixed(2)} via provider key`;
+}
+
+function historySettingsLabel(job) {
+  const params = job?.request?.params || {};
+  const values = [
+    params.durationSec ? `${params.durationSec}s` : "",
+    params.aspect,
+    params.resolution,
+    params.quality,
+    params.providerMode,
+    params.sound === true ? "sound on" : params.sound === false ? "sound off" : "",
+    params.numImages ? `${params.numImages} image${Number(params.numImages) === 1 ? "" : "s"}` : "",
+    params.voice ? `voice: ${params.voice}` : "",
+    params.seed != null ? `seed: ${params.seed}` : "",
+  ].filter(Boolean);
+  return values.length ? values.join(" · ") : "Default settings";
+}
+
 // Generation panel — palmier-style: Image / Video / Audio type tabs, one
 // provider (Higgsfield, keys held by your cloud), a real model catalog, and a
 // capability-driven form: the slots and parameters each model actually
@@ -1012,6 +1110,7 @@ function promptIsOptionalFor(model, caps) {
 // qualities, sound) appear only when that model supports them.
 export default function GeneratePanel({
   assets = [],
+  generationBusy = false,
   historyFocus = null,
   onGenerated,
   onInsertAsset,
@@ -1062,6 +1161,7 @@ export default function GeneratePanel({
   const [intoTimeline, setIntoTimeline] = useState(true);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historyJobs, setHistoryJobs] = useState([]);
+  const [expandedJobId, setExpandedJobId] = useState("");
   const seedSeenRef = useRef(0);
 
   // Code (Hyperframes) local-render runtime: status + one-click install.
@@ -1461,6 +1561,9 @@ export default function GeneratePanel({
     });
     return [...liveById.values(), ...merged];
   }, [historyJobs, jobs]);
+  const hasRunningJobs = generationBusy || displayJobs.some(
+    (job) => !job.done && !job.error && job.state !== "authoring",
+  );
 
   const assetsByPath = useMemo(() => {
     const map = {};
@@ -2110,6 +2213,7 @@ export default function GeneratePanel({
             type="button"
           >
             History
+            {hasRunningJobs ? <GenerationSpinner aria-label="Generation in progress" /> : null}
           </VideoSecondaryButton>
           {!isCodeKind && directRoute && estUsd != null ? (
             <VideoHint title="Ballpark — billed by the provider directly to your API key">
@@ -2319,7 +2423,10 @@ export default function GeneratePanel({
           <VideoSecondaryButton onClick={() => setHistoryOpen(false)} type="button">
             ‹ Back
           </VideoSecondaryButton>
-          <SectionTitle>Job history</SectionTitle>
+          <SectionTitle style={{ display: "inline-flex", alignItems: "center", gap: 7 }}>
+            Job history
+            {hasRunningJobs ? <GenerationSpinner aria-label="Generation in progress" /> : null}
+          </SectionTitle>
         </HistoryHeader>
         <HistoryList>
           {displayJobs.length ? (
@@ -2336,9 +2443,30 @@ export default function GeneratePanel({
                 job.request &&
                 job.request.kind !== "upscale" &&
                 !String(job.request.mode || "").startsWith("upscale");
+              const expanded = expandedJobId === job.jobId;
+              const requestParams = job.request?.params || {};
+              const inputPaths = [
+                ...(job.request?.inputAssetPaths || []),
+                ...(job.request?.audioAssetPaths || []),
+              ];
+              const outputPaths = [
+                ...(job.outputPaths || []),
+                ...(job.plannedPaths || []),
+              ].filter((path, index, list) => path && list.indexOf(path) === index);
               return (
                 <HistRow
+                  aria-expanded={expanded}
                   data-flash={focusJob?.jobId === job.jobId ? "true" : "false"}
+                  data-expanded={expanded ? "true" : "false"}
+                  onClick={() => setExpandedJobId((current) => (current === job.jobId ? "" : job.jobId))}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      setExpandedJobId((current) => (current === job.jobId ? "" : job.jobId));
+                    }
+                  }}
+                  role="button"
+                  tabIndex={0}
                   // Re-focusing the same job bumps `at` into the key, so the
                   // remount replays the flash animation.
                   key={
@@ -2378,7 +2506,7 @@ export default function GeneratePanel({
                       <img alt="" draggable={false} src={previewAsset.thumbnailDataUrl} />
                     ) : (
                       <HistGlyph aria-hidden data-status={status}>
-                        {status === "running" ? "✦" : status === "authoring" ? "✎" : status === "error" ? "⚠" : "◇"}
+                        {status === "running" ? <GenerationSpinner /> : status === "authoring" ? "✎" : status === "error" ? "⚠" : "◇"}
                       </HistGlyph>
                     )}
                   </HistThumb>
@@ -2395,7 +2523,7 @@ export default function GeneratePanel({
                     {job.error ? <HistError>{job.error}</HistError> : null}
                     {modelRetired ? <VideoHint>Model retired</VideoHint> : null}
                   </HistInfo>
-                  <HistSide>
+                  <HistSide onClick={(event) => event.stopPropagation()}>
                     <HistStatus data-status={status}>
                       {status === "running" ? `${Math.round(job.percent || 0)}%` : status}
                     </HistStatus>
@@ -2488,6 +2616,49 @@ export default function GeneratePanel({
                       </HistDelete>
                     ) : null}
                   </HistSide>
+                  {expanded ? (
+                    <HistDetails onClick={(event) => event.stopPropagation()}>
+                      <dl>
+                        <dt>Prompt</dt>
+                        <dd>{promptText || "—"}</dd>
+                        {job.error ? (
+                          <>
+                            <dt>Error</dt>
+                            <dd style={{ color: "#fca5a5" }}>{job.error}</dd>
+                          </>
+                        ) : null}
+                        <dt>Model</dt>
+                        <dd>{job.request?.model || job.model || "—"}</dd>
+                        <dt>Provider</dt>
+                        <dd>{job.providerId === "cloud" ? "Diff Forge Cloud" : job.providerId || "—"}</dd>
+                        <dt>Mode</dt>
+                        <dd>{job.request?.mode || job.mode || "—"}</dd>
+                        <dt>Cost</dt>
+                        <dd>{historyCostLabel(job)}</dd>
+                        <dt>Settings</dt>
+                        <dd>{historySettingsLabel(job)}</dd>
+                        {requestParams.durationSec ? (
+                          <>
+                            <dt>Length</dt>
+                            <dd>
+                              {previewAsset?.durationMs
+                                ? `${(Number(previewAsset.durationMs) / 1000).toFixed(2).replace(/\.00$/, "")} seconds actual · `
+                                : ""}
+                              {requestParams.durationSec} seconds requested
+                            </dd>
+                          </>
+                        ) : null}
+                        <dt>Inputs</dt>
+                        <dd>{inputPaths.length ? inputPaths.join("\n") : "None"}</dd>
+                        <dt>Outputs</dt>
+                        <dd>{outputPaths.length ? outputPaths.join("\n") : "None yet"}</dd>
+                        <dt>Created</dt>
+                        <dd>{job.createdAtMs ? new Date(job.createdAtMs).toLocaleString() : "—"}</dd>
+                        <dt>Job ID</dt>
+                        <dd>{job.jobId || "—"}</dd>
+                      </dl>
+                    </HistDetails>
+                  ) : null}
                 </HistRow>
               );
             })

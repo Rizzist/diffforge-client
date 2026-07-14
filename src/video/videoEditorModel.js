@@ -975,7 +975,23 @@ export function trimClipStart(project, clipId, deltaMs) {
 
 export function trimClipEnd(project, clipId, deltaMs) {
   return updateClipIn(project, clipId, (clip) => {
-    clip.durationMs = Math.max(MIN_CLIP_DURATION_MS, clip.durationMs + Math.round(deltaMs));
+    const requestedDuration = Math.max(
+      MIN_CLIP_DURATION_MS,
+      clip.durationMs + Math.round(deltaMs),
+    );
+    const isStillImage = /\.(png|jpe?g|webp|gif|bmp|tiff)$/i.test(clip.assetPath || "");
+    if (requestedDuration > clip.durationMs && clip.sourceInMs != null && !isStillImage) {
+      // Extending a media edge is a time-stretch, not permission to read past
+      // the source EOF. Preserve the currently-used source span and lower the
+      // playback rate to fill the new timeline duration. This also keeps
+      // linked video/audio pairs sample-aligned.
+      const sourceSpanMs = clip.durationMs * (clip.speed || 1);
+      const maxDurationMs = Math.max(clip.durationMs, Math.floor(sourceSpanMs / 0.1));
+      clip.durationMs = Math.min(requestedDuration, maxDurationMs);
+      clip.speed = Math.min(8, Math.max(0.1, sourceSpanMs / clip.durationMs));
+      return;
+    }
+    clip.durationMs = requestedDuration;
   });
 }
 
@@ -2278,6 +2294,102 @@ export function addMediaClip(project, asset, { trackId = "", timelineStartMs = 0
     }
   }
   return { project: next, clipId: clip.id, trackId: track.id, audioClipId };
+}
+
+// A generated video is inserted as a placeholder before its file exists, so
+// its initial media record cannot tell us whether the finished MP4 has audio.
+// Once probing completes, retrofit the same linked A/V shape used by normal
+// media insertion without moving or replacing the placeholder clip.
+export function reconcileGeneratedAssetClips(project, asset) {
+  if (!project || asset?.kind !== "video" || !asset?.path) {
+    return project;
+  }
+  let next = cloneProject(project);
+  const videoClips = next.tracks
+    .filter((track) => track.kind === "video")
+    .flatMap((track) => track.clips || [])
+    .filter((clip) => clip.assetPath === asset.path);
+  let changed = false;
+
+  for (const videoClip of videoClips) {
+    const probedDurationMs = Math.round(Number(asset.durationMs));
+    if (Number.isFinite(probedDurationMs) && probedDurationMs >= MIN_CLIP_DURATION_MS) {
+      if (videoClip.durationMs !== probedDurationMs) {
+        videoClip.durationMs = probedDurationMs;
+        changed = true;
+      }
+      if (videoClip.linkId) {
+        for (const track of next.tracks) {
+          if (track.kind !== "audio") {
+            continue;
+          }
+          for (const clip of track.clips || []) {
+            if (clip.linkId === videoClip.linkId && clip.durationMs !== probedDurationMs) {
+              clip.durationMs = probedDurationMs;
+              changed = true;
+            }
+          }
+        }
+      }
+    }
+    if (asset.hasAudio !== true) {
+      continue;
+    }
+    const alreadyLinked = Boolean(
+      videoClip.linkId
+      && next.tracks.some(
+        (track) =>
+          track.kind === "audio"
+          && (track.clips || []).some(
+            (clip) =>
+              clip.linkId === videoClip.linkId
+              && clip.assetPath === videoClip.assetPath
+              && clip.timelineStartMs === videoClip.timelineStartMs
+              && clip.durationMs === videoClip.durationMs,
+          ),
+      ),
+    );
+    if (alreadyLinked) {
+      continue;
+    }
+
+    let audioTrack = next.tracks.find(
+      (track) =>
+        track.kind === "audio"
+        && !track.locked
+        && firstFreePositionOnTrack(track, videoClip.timelineStartMs, videoClip.durationMs)
+          === videoClip.timelineStartMs,
+    );
+    if (!audioTrack) {
+      next = addTrack(next, "audio");
+      audioTrack = next.tracks[next.tracks.length - 1];
+    }
+    const currentVideo = findClip(next, videoClip.id)?.clip;
+    if (!currentVideo) {
+      continue;
+    }
+    const audioClip = normalizeClip(
+      {
+        id: makeVideoId("clip"),
+        assetPath: currentVideo.assetPath,
+        timelineStartMs: currentVideo.timelineStartMs,
+        durationMs: currentVideo.durationMs,
+        sourceInMs: currentVideo.sourceInMs || 0,
+        speed: currentVideo.speed || 1,
+      },
+      "audio",
+    );
+    linkIdSeq += 1;
+    const linkId = `link-${Date.now().toString(36)}-genav${linkIdSeq}`;
+    currentVideo.linkId = linkId;
+    currentVideo.gain = { level: 0, keyframes: [] };
+    audioClip.linkId = linkId;
+    audioTrack.clips.push(audioClip);
+    audioTrack.clips.sort((left, right) => left.timelineStartMs - right.timelineStartMs);
+    changed = true;
+  }
+
+  return changed ? next : project;
 }
 
 export function addTextClip(project, { trackId = "", timelineStartMs = 0, text = "Text" } = {}) {

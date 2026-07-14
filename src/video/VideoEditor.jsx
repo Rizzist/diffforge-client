@@ -275,6 +275,21 @@ function timelineMsFromMedia(clip, element) {
   return (clip?.timelineStartMs || 0) + ((element.currentTime * 1000 - (clip?.sourceInMs || 0)) / speed);
 }
 
+function mediaElementAtEnd(element) {
+  if (!element) {
+    return false;
+  }
+  const duration = Number(element.duration);
+  return Boolean(
+    element.ended
+    || (Number.isFinite(duration) && duration > 0 && Number(element.currentTime) >= duration - 0.004),
+  );
+}
+
+function isFfmpegInstallError(value) {
+  return /ffmpeg|ffprobe|drawtext|video tools/i.test(String(value || ""));
+}
+
 function sameTimingWindow(left, right) {
   return Boolean(
     left
@@ -537,9 +552,11 @@ export default function VideoEditor({
   // Flushes the pane's debounced project autosave. Draft render reads the
   // saved file, so this must run before video_draft_render.
   onFlushProjectSave = null,
+  onFfmpegInstallRequired = null,
   onSeek,
   onTogglePlay,
   onUpdateTextClip,
+  toolsInstallNonce = 0,
 }) {
   const frameRef = useRef(null);
   const stageRef = useRef(null);
@@ -600,6 +617,18 @@ export default function VideoEditor({
   durationRef.current = durationMs;
   playingRef.current = playing;
   selectedClipRef.current = selectedClip;
+
+  useEffect(() => {
+    if (isFfmpegInstallError(draftError)) {
+      onFfmpegInstallRequired?.();
+    }
+  }, [draftError, onFfmpegInstallRequired]);
+
+  useEffect(() => {
+    if (toolsInstallNonce > 0) {
+      setDraftError((current) => (isFfmpegInstallError(current) ? "" : current));
+    }
+  }, [toolsInstallNonce]);
 
   const settings = project?.settings || { width: 1920, height: 1080, background: "#000000" };
   const aspect = settings.width / Math.max(1, settings.height);
@@ -985,7 +1014,11 @@ export default function VideoEditor({
         entry.element.muted = false;
         entry.element.playbackRate = entry.clip.speed || 1;
         setEntryVolume(entry, item.volumeClip, timelineMs);
-        if (shouldPlay && entry.element.paused) {
+        // Calling play() on an ended HTMLMediaElement implicitly restarts it
+        // at zero. The playback clock reads currentTime immediately after
+        // this sync, so that restart used to teleport the whole timeline to
+        // the clip's beginning instead of reaching its end.
+        if (shouldPlay && entry.element.paused && !mediaElementAtEnd(entry.element)) {
           entry.element.play().catch(() => {});
         }
         if (!shouldPlay && !entry.element.paused) {
@@ -1260,7 +1293,9 @@ export default function VideoEditor({
       primaryClockIdRef.current = sync.primary?.clip.id || "";
       let nextMs = currentMs;
       if (sync.primary?.element) {
-        nextMs = Math.max(0, Math.min(clipEndMs(sync.primary.clip), timelineMsFromMedia(sync.primary.clip, sync.primary.element)));
+        nextMs = mediaElementAtEnd(sync.primary.element)
+          ? clipEndMs(sync.primary.clip)
+          : Math.max(0, Math.min(clipEndMs(sync.primary.clip), timelineMsFromMedia(sync.primary.clip, sync.primary.element)));
         lastGapTickRef.current = 0;
         if (nextMs >= clipEndMs(sync.primary.clip) - 4) {
           nextMs = clipEndMs(sync.primary.clip);

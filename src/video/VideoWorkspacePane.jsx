@@ -41,6 +41,7 @@ import {
   addCaptionsForClip,
   addMediaClip,
   clipsInRange,
+  reconcileGeneratedAssetClips,
   formatTimecode,
   normalizeProject,
   rippleDeleteWords,
@@ -555,6 +556,18 @@ const InstallChip = styled.button`
   white-space: nowrap;
   flex: none;
 
+  @keyframes video-install-attention {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(251, 191, 36, 0.2); }
+    50% { box-shadow: 0 0 0 4px rgba(251, 191, 36, 0.32), 0 0 18px rgba(251, 191, 36, 0.3); }
+  }
+
+  &[data-attention="true"] {
+    border-color: #fbbf24;
+    background: rgba(180, 83, 9, 0.42);
+    color: #fef3c7;
+    animation: video-install-attention 1.15s ease-in-out infinite;
+  }
+
   &:disabled {
     cursor: default;
     opacity: 0.85;
@@ -1009,6 +1022,9 @@ export default function VideoWorkspacePane({
   // plannedPath → { model, percent } for jobs still running; feeds the
   // timeline's ghost-clip treatment on placeholder clips.
   const [generationByPath, setGenerationByPath] = useState({});
+  const [activeGenerationJobs, setActiveGenerationJobs] = useState(() => new Set());
+  const [ffmpegAttention, setFfmpegAttention] = useState(false);
+  const [toolsInstallNonce, setToolsInstallNonce] = useState(0);
   const seedNonceRef = useRef(0);
   const restoredPanelAssetRef = useRef(false);
 
@@ -1170,18 +1186,24 @@ export default function VideoWorkspacePane({
 
   const refreshAssets = useCallback(() => {
     if (!repoPath) {
-      return;
+      return Promise.resolve([]);
     }
-    invoke("video_media_list", { repoPath })
+    const mediaRequest = invoke("video_media_list", { repoPath })
       .then((result) => {
-        setAssets(Array.isArray(result?.items) ? result.items : []);
+        const items = Array.isArray(result?.items) ? result.items : [];
+        setAssets(items);
         setMediaRootAbs(String(result?.mediaRoot || ""));
         setMediaError("");
+        return items;
       })
-      .catch((err) => setMediaError(String(err)));
+      .catch((err) => {
+        setMediaError(String(err));
+        return [];
+      });
     invoke("video_media_manifest_get", { repoPath })
       .then((manifest) => setFolders(Array.isArray(manifest?.folders) ? manifest.folders : []))
       .catch(() => {});
+    return mediaRequest;
   }, [repoPath]);
 
   // Auto-describe: photos without an annotation get a cloud vision blurb in
@@ -1823,10 +1845,22 @@ export default function VideoWorkspacePane({
   // done/error event, matched by id. Rendered icon-first in the Agent tab.
   const [agentActivity, setAgentActivity] = useState([]);
   const [agentActivityUnseen, setAgentActivityUnseen] = useState(0);
-  const agentPromptBusy = useMemo(() => (
+  const agentPromptBusyRaw = useMemo(() => (
     Array.isArray(agentPromptActivity)
     && agentPromptActivity.some((item) => ["queued", "running"].includes(String(item?.status || "").trim()))
   ), [agentPromptActivity]);
+  const [agentPromptBusy, setAgentPromptBusy] = useState(agentPromptBusyRaw);
+  // Queue snapshots can briefly arrive empty between a queued→running state
+  // transition. Keep the indicator latched across that handoff so its CSS
+  // animation node is not removed and recreated (which looks stuck/reset).
+  useEffect(() => {
+    if (agentPromptBusyRaw) {
+      setAgentPromptBusy(true);
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setAgentPromptBusy(false), 1500);
+    return () => window.clearTimeout(timer);
+  }, [agentPromptBusyRaw]);
   const sidePanelRef = useRef(sidePanel);
   sidePanelRef.current = sidePanel;
   useEffect(() => {
@@ -2089,6 +2123,8 @@ export default function VideoWorkspacePane({
     if (installing) {
       return;
     }
+    setFfmpegAttention(false);
+    setToolsInstallNonce((nonce) => nonce + 1);
     setInstalling(true);
     setInstallProgress({ state: "starting", message: "Preparing download…" });
     invoke("video_tools_install").catch((err) => {
@@ -2317,6 +2353,26 @@ export default function VideoWorkspacePane({
     }
   }, [commitSeek]);
 
+  const reconcileGeneratedOutputs = useCallback(
+    async (paths) => {
+      const wanted = new Set((Array.isArray(paths) ? paths : []).filter(Boolean));
+      const items = await refreshAssets();
+      if (!wanted.size || !projectStateRef.current) {
+        return;
+      }
+      let next = projectStateRef.current;
+      for (const asset of items) {
+        if (wanted.has(asset?.path)) {
+          next = reconcileGeneratedAssetClips(next, asset);
+        }
+      }
+      if (next !== projectStateRef.current) {
+        handleProjectChange(next, { transient: false });
+      }
+    },
+    [handleProjectChange, refreshAssets],
+  );
+
   // Placeholder-first: a reserved generation path becomes a clip immediately.
   // A failed generation must take its timeline placeholder with it — the
   // ghost clip's assetPath is one of the job's plannedPaths.
@@ -2329,6 +2385,17 @@ export default function VideoWorkspacePane({
         return;
       }
       const payload = event?.payload || {};
+      if (payload.jobId) {
+        setActiveGenerationJobs((current) => {
+          const next = new Set(current);
+          if (payload.done || payload.error) {
+            next.delete(payload.jobId);
+          } else {
+            next.add(payload.jobId);
+          }
+          return next;
+        });
+      }
       const planned = Array.isArray(payload.plannedPaths) ? payload.plannedPaths.filter(Boolean) : [];
       // Live ghost-clip telemetry: the timeline dresses placeholder clips
       // with the job's model + percent while it runs, and drops the entry
@@ -2404,7 +2471,9 @@ export default function VideoWorkspacePane({
       // Success: swap the ghost for the real asset even when the Generate
       // panel (whose onGenerated normally refreshes) has been closed.
       if (payload.done && !payload.error && planned.length) {
-        refreshAssets();
+        void reconcileGeneratedOutputs(
+          Array.from(new Set([...(payload.outputPaths || []), ...planned])),
+        );
       }
       if (payload.error && planned.length) {
         // The failed ghost clip stays (red, clickable → history); only the
@@ -2424,7 +2493,7 @@ export default function VideoWorkspacePane({
       disposed = true;
       unlisten();
     };
-  }, [handleProjectChange, refreshAssets]);
+  }, [handleProjectChange, reconcileGeneratedOutputs, refreshAssets]);
 
   const generationRecoveryProjectRef = useRef("");
   useEffect(() => {
@@ -2448,6 +2517,7 @@ export default function VideoWorkspacePane({
             job.state !== "unknown-outcome" &&
             job.providerId !== "hyperframes",
         );
+        setActiveGenerationJobs(new Set(pending.map((job) => job.jobId).filter(Boolean)));
         return Promise.allSettled(
           pending.map((job) =>
             invoke("video_generate_resume", {
@@ -2931,6 +3001,7 @@ export default function VideoWorkspacePane({
   }, [paneWidth]);
 
   const installBusy = installing || (installProgress && !installProgress.done && !installProgress.error);
+  const requireFfmpegInstall = useCallback(() => setFfmpegAttention(true), []);
 
   const binProps = {
     assets,
@@ -2984,6 +3055,8 @@ export default function VideoWorkspacePane({
         repoPath={repoPath}
         selectedClip={selectedMediaClip}
         selectedRange={ranges[0] || null}
+        onFfmpegInstallRequired={requireFfmpegInstall}
+        toolsInstallNonce={toolsInstallNonce}
       />
     </PreviewCell>
   );
@@ -3016,6 +3089,7 @@ export default function VideoWorkspacePane({
     <GeneratePanel
       assets={assets}
       historyFocus={generateHistoryFocus}
+      generationBusy={activeGenerationJobs.size > 0}
       onGenerated={refreshAssets}
       onInsertAsset={insertAssetPath}
       onJobDeleted={removeJobGhosts}
@@ -3052,10 +3126,13 @@ export default function VideoWorkspacePane({
     <ExportPanel
       ffmpegReady={ffmpegReady}
       ffmpegTextSupport={tools?.ffmpeg?.textSupport ?? null}
+      installBusy={Boolean(installBusy)}
+      onFfmpegInstallRequired={requireFfmpegInstall}
       onFlushProjectSave={flushProjectSave}
       project={project}
       projectPath={projectPath}
       repoPath={repoPath}
+      toolsInstallNonce={toolsInstallNonce}
     />
   ) : sidePanel === "agent" ? (
     <AgentActivityPanel
@@ -3186,6 +3263,7 @@ export default function VideoWorkspacePane({
               <VideoRailSpacer />
               {tools && (!ffmpegReady || ffmpegLimited) ? (
                 <InstallChip
+                  data-attention={ffmpegAttention ? "true" : "false"}
                   disabled={Boolean(installBusy)}
                   onClick={installTools}
                   title={
@@ -3219,6 +3297,7 @@ export default function VideoWorkspacePane({
               >
                 <AutoAwesome aria-hidden="true" />
                 Generate
+                {activeGenerationJobs.size > 0 ? <AgentBusySpinner aria-hidden /> : null}
               </VideoRailButton>
               <VideoRailButton
                 data-active={sidePanel === "agent" ? "true" : "false"}

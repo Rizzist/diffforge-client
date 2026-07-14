@@ -639,6 +639,26 @@ const LinkBadge = styled.span`
   }
 `;
 
+const SpeedBadge = styled.span`
+  position: absolute;
+  right: 16px;
+  bottom: 2px;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: rgba(2, 6, 23, 0.72);
+  color: #fbbf24;
+  font-size: 8px;
+  font-weight: 850;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+  pointer-events: none;
+
+  html[data-forge-theme="light"] & {
+    background: rgba(255, 255, 255, 0.82);
+    color: #b45309;
+  }
+`;
+
 // Transition marker straddling the junction between two exactly-adjacent
 // clips; the width reflects the transition duration at the current zoom.
 const TransitionMarker = styled.button`
@@ -2032,7 +2052,7 @@ export default function Timeline({
                           ? `Generation failed${generation?.error ? `: ${generation.error}` : ""} — click for the job details`
                           : generating
                             ? `Generating${generationModel ? ` with ${generationModel}` : ""} — the clip fills in when the job finishes`
-                            : `${clipDisplayName(clip, track)} · ${formatTimecode(clip.timelineStartMs)} → ${formatTimecode(clipEndMs(clip))}`
+                            : `${clipDisplayName(clip, track)} · ${formatTimecode(clip.timelineStartMs)} → ${formatTimecode(clipEndMs(clip))}${Math.abs((clip.speed || 1) - 1) > 0.005 ? ` · ${(clip.speed || 1).toFixed(2)}× speed` : ""}`
                       }
                     >
                       {filmstripFrames ? (
@@ -2069,6 +2089,11 @@ export default function Timeline({
                         <LinkBadge title="Linked clip">
                           <Link aria-hidden="true" />
                         </LinkBadge>
+                      ) : null}
+                      {track.kind !== "text" && Math.abs((clip.speed || 1) - 1) > 0.005 ? (
+                        <SpeedBadge title={`Playback speed ${(clip.speed || 1).toFixed(2)}×`}>
+                          {(clip.speed || 1).toFixed(2)}×
+                        </SpeedBadge>
                       ) : null}
                       {track.kind !== "text" && clip.kf && Object.keys(clip.kf).length
                         ? Object.values(clip.kf)

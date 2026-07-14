@@ -19,6 +19,7 @@ import {
   clipsInRange,
   collectSnapPoints,
   expandWithLinks,
+  reconcileGeneratedAssetClips,
   formatTimecode,
   gainAtMs,
   kfValueAtMs,
@@ -152,6 +153,32 @@ test("never trims below the minimum duration", () => {
   assert.ok(clip.durationMs > 0);
 });
 
+test("extending a media clip time-stretches its source instead of reading past EOF", () => {
+  const project = projectWithClip({ timelineStartMs: 0, sourceInMs: 0, durationMs: 3000, speed: 1 });
+  const stretched = trimClipEnd(project, "clip-1", 2000);
+  const clip = stretched.tracks.find((track) => track.kind === "video").clips[0];
+  assert.equal(clip.durationMs, 5000);
+  assertClose(clip.speed, 0.6);
+  assertClose(clip.durationMs * clip.speed, 3000);
+});
+
+test("linked A/V end stretching keeps both partners at the same speed", () => {
+  const linked = addMediaClip(
+    makeStarterProject("stretch"),
+    { path: "media/assets/av.mp4", kind: "video", durationMs: 3000, hasAudio: true },
+  );
+  const stretched = trimClips(
+    linked.project,
+    [linked.clipId, linked.audioClipId],
+    "end",
+    2000,
+  );
+  const pair = stretched.tracks.flatMap((track) => track.clips).filter((clip) => clip.linkId);
+  assert.equal(pair.length, 2);
+  assert.ok(pair.every((clip) => clip.durationMs === 5000));
+  assert.ok(pair.every((clip) => Math.abs(clip.speed - 0.6) < 1e-9));
+});
+
 test("splits a clip preserving source continuity and gain envelope", () => {
   const project = projectWithClip({
     gain: { level: 1, keyframes: [{ atMs: 0, level: 1 }, { atMs: 4000, level: 0 }] },
@@ -211,6 +238,37 @@ test("videos with audio expand into a linked, separately-editable A/V pair", () 
   const silent = addMediaClip(starter, { path: "media/assets/b.mp4", kind: "video", hasAudio: false });
   assert.equal(silent.audioClipId, "");
   assert.equal(silent.project.tracks.find((track) => track.kind === "audio").clips.length, 0);
+});
+
+test("finished generated MP4s retrofit linked audio onto placeholder clips", () => {
+  const placeholder = addMediaClip(
+    makeStarterProject("generated"),
+    { path: "media/generated/job.mp4", kind: "video", durationMs: 5000 },
+    { timelineStartMs: 1200 },
+  ).project;
+  const upgraded = reconcileGeneratedAssetClips(placeholder, {
+    path: "media/generated/job.mp4",
+    kind: "video",
+    durationMs: 3000,
+    hasAudio: true,
+  });
+  const video = upgraded.tracks.find((track) => track.kind === "video").clips[0];
+  const audio = upgraded.tracks.find((track) => track.kind === "audio").clips[0];
+  assert.equal(audio.assetPath, video.assetPath);
+  assert.equal(audio.timelineStartMs, 1200);
+  assert.equal(video.durationMs, 3000);
+  assert.equal(audio.durationMs, 3000);
+  assert.equal(audio.linkId, video.linkId);
+  assert.ok(video.linkId);
+  assert.equal(video.gain.level, 0);
+
+  // Repeated store refreshes are idempotent.
+  assert.equal(reconcileGeneratedAssetClips(upgraded, {
+    path: "media/generated/job.mp4",
+    kind: "video",
+    durationMs: 3000,
+    hasAudio: true,
+  }), upgraded);
 });
 
 test("clips never overlap: adds, moves, and group moves slide into free space", () => {

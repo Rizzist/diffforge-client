@@ -16426,7 +16426,11 @@ fn terminal_structured_interaction_reconcile(
                         interaction.provider_request_id == request_id
                             || interaction.prompt_id == request_id
                     });
-                (same_terminal && same_request).then(|| id.clone())
+                let lifecycle_can_close = terminal_structured_interaction_lifecycle_can_close(
+                    interaction,
+                    provider_resolved_interaction,
+                );
+                (same_terminal && same_request && lifecycle_can_close).then(|| id.clone())
             })
             .collect::<Vec<_>>();
         let resolved_codex_hook_trust = removed_ids.iter().any(|id| {
@@ -16453,6 +16457,23 @@ fn terminal_structured_interaction_reconcile(
             }
         }
     }
+}
+
+fn terminal_structured_interaction_uses_blocking_transport(
+    interaction: &TerminalStructuredInteraction,
+) -> bool {
+    matches!(
+        interaction.response_mode.as_str(),
+        "blocking_hook" | "provider_api" | "codex_app_server"
+    )
+}
+
+fn terminal_structured_interaction_lifecycle_can_close(
+    interaction: &TerminalStructuredInteraction,
+    provider_resolved_interaction: bool,
+) -> bool {
+    provider_resolved_interaction
+        || !terminal_structured_interaction_uses_blocking_transport(interaction)
 }
 
 fn apply_terminal_activity_hook_payload(
@@ -26847,6 +26868,45 @@ notifications = true
             response.pointer("/hookSpecificOutput/updatedInput/answers/Which framework?"),
             Some(&json!("React"))
         );
+    }
+
+    #[test]
+    fn blocking_structured_interactions_survive_unrelated_lifecycle_events() {
+        let blocking = TerminalStructuredInteraction {
+            interaction_id: "uir:question-1".to_string(),
+            revision: 9,
+            pane_id: "pane-1".to_string(),
+            instance_id: 1,
+            provider: "claude".to_string(),
+            provider_request_id: "question-1".to_string(),
+            prompt_id: "question-1".to_string(),
+            hook_event_name: "PreToolUse".to_string(),
+            response_mode: "blocking_hook".to_string(),
+            options: Vec::new(),
+            permission_suggestions: None,
+            prompt_questions: None,
+            prompt_schema: None,
+            provider_payload: None,
+        };
+        let mut observed_only = blocking.clone();
+        observed_only.response_mode = "structured_pty".to_string();
+
+        assert!(terminal_structured_interaction_uses_blocking_transport(
+            &blocking
+        ));
+        assert!(!terminal_structured_interaction_uses_blocking_transport(
+            &observed_only
+        ));
+        assert!(!terminal_structured_interaction_lifecycle_can_close(
+            &blocking, false
+        ));
+        assert!(terminal_structured_interaction_lifecycle_can_close(
+            &blocking, true
+        ));
+        assert!(terminal_structured_interaction_lifecycle_can_close(
+            &observed_only,
+            false
+        ));
     }
 
     #[test]

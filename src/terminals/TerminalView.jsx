@@ -1771,14 +1771,32 @@ const TerminalWindowBreakoutOverlayButton = styled.button`
 const TerminalGridScaffold = styled.div`
   position: absolute;
   inset: 0;
-  z-index: 6;
+  /* Above TerminalSurfaceLayer (z 20): the resize separators must sit on top
+     of the pane surfaces or their widened hit areas are swallowed by the
+     slots, leaving only the 1px layout corridor grabbable. The scaffold
+     itself is pointer-transparent — ResizeHandle opts back in — so the
+     terminals underneath keep receiving every other event. */
+  z-index: 30;
   min-width: 0;
   min-height: 0;
   opacity: 1;
-  pointer-events: auto;
+  pointer-events: none;
   transition:
     opacity 170ms ease,
     filter 170ms ease;
+
+  /* Painting above the surfaces means the scaffold's own boxes must be
+     invisible: the panels/anchors are pure layout+measurement chrome (the
+     surface slots render the real panes), and their opaque backgrounds
+     would otherwise blank every terminal. Only the separators show. */
+  && [data-panel] {
+    background: transparent;
+  }
+
+  && [data-terminal-panel-anchor="true"],
+  && [data-terminal-document-panel-anchor="true"] {
+    visibility: hidden;
+  }
 `;
 
 const TerminalDocumentPanelWindow = styled(TerminalSurfaceSlot)`
@@ -35106,6 +35124,7 @@ function TerminalView({
   const todoDragHasPreview = Boolean(todoDragImages.length || todoDragNote);
   const terminalWorkspaceContent = hasVisibleWorkspacePanels ? (
     <WorkspaceTerminalPanels
+      data-terminal-document-maximized={terminalDocumentPanelMaximized ? "true" : "false"}
       data-terminal-dragging={terminalDragActive ? "true" : "false"}
       data-terminal-fullscreen={fullscreenActive ? "true" : "false"}
       data-terminal-fullscreen-state={fullscreenState}
