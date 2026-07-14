@@ -1306,18 +1306,25 @@ fn run_mcp_cli(program: &str, args: &[String]) -> Result<String, String> {
     if !command_on_path(program) {
         return Err(format!("`{program}` was not found on PATH."));
     }
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            format!(
-                "Unable to run `{program} {}`: {error}",
-                mcp_cli_display_args(args)
-            )
-        })?;
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command.spawn().map_err(|error| {
+        format!(
+            "Unable to run `{program} {}`: {error}",
+            mcp_cli_display_args(args)
+        )
+    })?;
     let mut stdout = child
         .stdout
         .take()
@@ -25478,13 +25485,20 @@ fn probe_mcp_stdio(command: &str, args: &[String]) -> Value {
         });
     }
 
-    let mut child = match Command::new(command)
+    let mut child_command = Command::new(command);
+    child_command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt as _;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        child_command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = match child_command.spawn() {
         Ok(child) => child,
         Err(error) => {
             return json!({

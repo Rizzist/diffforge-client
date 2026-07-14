@@ -3886,19 +3886,26 @@ fn workspace_gateway_child_request_blocking(
         .flatten()
         .filter_map(|value| value.as_str().map(str::to_string))
         .collect::<Vec<_>>();
-    let mut child = Command::new(command)
+    let mut child_command = Command::new(command);
+    child_command
         .args(&args)
         .envs(workspace_gateway_child_env(server))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            format!(
-                "Unable to start workspace MCP `{}` with `{command}`: {error}",
-                server["name"].as_str().unwrap_or(command)
-            )
-        })?;
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        child_command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = child_command.spawn().map_err(|error| {
+        format!(
+            "Unable to start workspace MCP `{}` with `{command}`: {error}",
+            server["name"].as_str().unwrap_or(command)
+        )
+    })?;
     let _ = pid_tx.send(child.id());
     let mut child_stdin = child
         .stdin
@@ -4149,20 +4156,27 @@ fn spawn_workspace_gateway_pooled_child_attempt(
             rpc_transport_label(rpc_transport)
         ));
     }
-    let mut child = Command::new(&config.command)
+    let mut child_command = Command::new(&config.command);
+    child_command
         .args(&config.args)
         .envs(config.env.clone())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            format!(
-                "Unable to start workspace MCP `{}` with `{}`: {error}",
-                server["name"].as_str().unwrap_or(&config.command),
-                config.command
-            )
-        })?;
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        child_command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = child_command.spawn().map_err(|error| {
+        format!(
+            "Unable to start workspace MCP `{}` with `{}`: {error}",
+            server["name"].as_str().unwrap_or(&config.command),
+            config.command
+        )
+    })?;
     let pid = child.id();
     for pid_tx in pid_txs {
         let _ = pid_tx.send(pid);
@@ -4414,9 +4428,14 @@ fn terminate_workspace_gateway_child(pid: u32) {
     }
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
+        use std::os::windows::process::CommandExt as _;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut command = Command::new("taskkill");
+        command
             .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .status();
+            .creation_flags(CREATE_NO_WINDOW);
+        let _ = command.status();
     }
 }
 
