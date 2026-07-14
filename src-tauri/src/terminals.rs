@@ -2832,6 +2832,14 @@ async fn write_terminal_input_bytes(
     Ok(true)
 }
 
+fn terminal_output_coalesce_window_ms(remote_controlled: bool) -> u64 {
+    if remote_controlled {
+        TERMINAL_REMOTE_OUTPUT_COALESCE_WINDOW_MS
+    } else {
+        TERMINAL_OUTPUT_COALESCE_WINDOW_MS
+    }
+}
+
 async fn resize_terminal_instance_exact(
     app: &AppHandle,
     state: &TerminalState,
@@ -5812,9 +5820,9 @@ fn spawn_terminal_reader(
         let output_workspace_id = workspace_id.clone();
         let output_subscribers = Arc::clone(&output_subscribers);
         let output_sender_handle = thread::spawn(move || {
-            let coalesce_window = Duration::from_millis(TERMINAL_OUTPUT_COALESCE_WINDOW_MS);
             let mut pending = Vec::with_capacity(TERMINAL_OUTPUT_COALESCE_MAX_BYTES);
             let mut pending_started_at: Option<Instant> = None;
+            let mut pending_coalesce_window_ms = TERMINAL_OUTPUT_COALESCE_WINDOW_MS;
             let mut pending_source_chunks: u64 = 0;
             let mut stats_started_at = Instant::now();
             let mut stats_frames: u64 = 0;
@@ -5843,6 +5851,7 @@ fn spawn_terminal_reader(
                         .map(Some)
                         .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
                 } else {
+                    let coalesce_window = Duration::from_millis(pending_coalesce_window_ms);
                     let elapsed = pending_started_at
                         .map(|started_at| started_at.elapsed())
                         .unwrap_or_default();
@@ -5863,6 +5872,14 @@ fn spawn_terminal_reader(
                         }
                         if pending.is_empty() {
                             pending_started_at = Some(Instant::now());
+                            pending_coalesce_window_ms = terminal_output_coalesce_window_ms(
+                                cloud_mcp_terminal_io_has_remote_control(
+                                    &output_cloud_mcp_state,
+                                    &output_workspace_id,
+                                    &output_pane_id,
+                                    instance_id,
+                                ),
+                            );
                         }
                         pending_source_chunks += 1;
                         pending.extend_from_slice(&chunk);
@@ -5932,7 +5949,7 @@ fn spawn_terminal_reader(
                         "backend.terminal_reader.output_window",
                         json!({
                             "bytes": forensics_bytes,
-                            "coalesce_window_ms": TERMINAL_OUTPUT_COALESCE_WINDOW_MS,
+                            "coalesce_window_ms": pending_coalesce_window_ms,
                             "elapsed_ms": terminal_diagnostic_elapsed_ms(forensics_started_at),
                             "frames": forensics_frames,
                             "instance_id": instance_id,
@@ -23620,6 +23637,12 @@ async fn terminal_live_sessions(
 #[cfg(test)]
 mod terminal_tests {
     use super::*;
+
+    #[test]
+    fn remote_terminal_output_uses_low_latency_coalesce_window() {
+        assert_eq!(terminal_output_coalesce_window_ms(true), 4);
+        assert_eq!(terminal_output_coalesce_window_ms(false), 16);
+    }
 
     fn codex_app_server_test_interaction(method: &str, params: Value) -> TerminalStructuredInteraction {
         TerminalStructuredInteraction {

@@ -561,6 +561,7 @@ struct CloudMcpState {
     global_ws_perma_offline: Arc<AtomicBool>,
     global_ws_window_start: Arc<StdMutex<Instant>>,
     global_ws_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Value>>>>,
+    global_ws_termio_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Value>>>>,
     global_ws_pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     global_ws_events: tokio::sync::broadcast::Sender<Value>,
     terminal_io_stream_subscriptions:
@@ -833,6 +834,7 @@ impl CloudMcpState {
             global_ws_perma_offline: Arc::new(AtomicBool::new(false)),
             global_ws_window_start: Arc::new(StdMutex::new(Instant::now())),
             global_ws_tx: Arc::new(Mutex::new(None)),
+            global_ws_termio_tx: Arc::new(Mutex::new(None)),
             global_ws_pending: Arc::new(Mutex::new(HashMap::new())),
             global_ws_events,
             terminal_io_stream_subscriptions: Arc::new(StdMutex::new(HashMap::new())),
@@ -13207,6 +13209,7 @@ async fn cloud_mcp_open_global_ws(
     .await;
     let (mut write, mut read) = stream.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+    let (termio_tx, mut termio_rx) = mpsc::unbounded_channel::<Value>();
     let ws_epoch = state.global_ws_epoch.fetch_add(1, Ordering::SeqCst) + 1;
     cloud_mcp_log_voice_shared_ws(
         "voice_agent.shared_ws.epoch_opened",
@@ -13223,7 +13226,12 @@ async fn cloud_mcp_open_global_ws(
         let mut tx_slot = state.global_ws_tx.lock().await;
         *tx_slot = Some(tx.clone());
     }
+    {
+        let mut tx_slot = state.global_ws_termio_tx.lock().await;
+        *tx_slot = Some(termio_tx.clone());
+    }
     drop(tx);
+    drop(termio_tx);
     {
         let mut runtime = state.inner.lock().await;
         runtime.connected = false;
@@ -13247,6 +13255,42 @@ async fn cloud_mcp_open_global_ws(
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     CLOUD_MCP_GLOBAL_WS_LIVE.store(true, Ordering::Release);
     let result: Result<(), String> = loop {
+        // Inbound is intentionally first in the biased select below, but a
+        // continuous shared-socket stream (for example voice audio) must not
+        // starve authoritative PTY echoes. Drain a small, bounded terminal
+        // burst before polling inbound again.
+        let mut terminal_write_error = None;
+        for _ in 0..8 {
+            let outgoing = match termio_rx.try_recv() {
+                Ok(outgoing) => outgoing,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            };
+            let outgoing_kind = outgoing
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("termio.message");
+            if let Err(error) = write
+                .send(Message::Text(outgoing.to_string().into()))
+                .await
+            {
+                terminal_write_error = Some(format!(
+                    "Cloud MCP app websocket terminal write failed: {error}"
+                ));
+                break;
+            }
+            cloud_mcp_store_ws_outbound(
+                outgoing_kind,
+                cloud_mcp_sync_payload_bytes(&outgoing),
+                json!({
+                    "id": outgoing.get("id").cloned().unwrap_or(Value::Null),
+                    "source": "terminal_fast_lane_eager",
+                }),
+            );
+        }
+        if let Some(error) = terminal_write_error {
+            break Err(error);
+        }
         tokio::select! {
             biased;
             _ = cloud_mcp_shutdown_goodbye_notify().notified() => {
@@ -13331,6 +13375,32 @@ async fn cloud_mcp_open_global_ws(
                     last_inbound_at = Instant::now();
                     CLOUD_MCP_WS_LAST_INBOUND_MS.store(cloud_mcp_now_ms(), Ordering::Release);
                 }
+            }
+            outgoing = termio_rx.recv() => {
+                let Some(outgoing) = outgoing else {
+                    if state.global_ws_epoch.load(Ordering::SeqCst) != ws_epoch {
+                        break Ok(());
+                    }
+                    break Err("Cloud MCP app websocket terminal sender closed.".to_string());
+                };
+                let outgoing_kind = outgoing
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("termio.message");
+                if let Err(error) = write
+                    .send(Message::Text(outgoing.to_string().into()))
+                    .await
+                {
+                    break Err(format!("Cloud MCP app websocket terminal write failed: {error}"));
+                }
+                cloud_mcp_store_ws_outbound(
+                    outgoing_kind,
+                    cloud_mcp_sync_payload_bytes(&outgoing),
+                    json!({
+                        "id": outgoing.get("id").cloned().unwrap_or(Value::Null),
+                        "source": "terminal_fast_lane",
+                    }),
+                );
             }
             _ = &mut ready_timeout, if !ready_seen => {
                 break Err(format!(
@@ -13523,6 +13593,8 @@ async fn cloud_mcp_clear_global_ws_sender_if_current(
     let cleared = if state.global_ws_epoch.load(Ordering::SeqCst) == ws_epoch {
         let mut tx_slot = state.global_ws_tx.lock().await;
         *tx_slot = None;
+        let mut termio_tx_slot = state.global_ws_termio_tx.lock().await;
+        *termio_tx_slot = None;
         true
     } else {
         false
@@ -13631,12 +13703,14 @@ async fn cloud_mcp_mark_global_ws_disconnected_inner(
     if state.global_ws_perma_offline.load(Ordering::SeqCst) {
         state.global_ws_epoch.fetch_add(1, Ordering::SeqCst);
         let _ = state.global_ws_tx.lock().await.take();
+        let _ = state.global_ws_termio_tx.lock().await.take();
         cloud_mcp_mark_global_ws_offline_permanent(state).await;
         return;
     }
     if app_shutdown_requested() {
         state.global_ws_epoch.fetch_add(1, Ordering::SeqCst);
         let _ = state.global_ws_tx.lock().await.take();
+        let _ = state.global_ws_termio_tx.lock().await.take();
         cloud_mcp_clear_terminal_remote_presence_state(state, "app_shutdown");
         {
             let mut runtime = state.inner.lock().await;
@@ -13668,6 +13742,7 @@ async fn cloud_mcp_mark_global_ws_disconnected_inner(
         runtime.global_ws_message_token = None;
     }
     let _ = state.global_ws_tx.lock().await.take();
+    let _ = state.global_ws_termio_tx.lock().await.take();
     cloud_mcp_fail_pending_ws_requests(state, &message).await;
     if wake_reconnect {
         state.global_ws_reconnect.notify_waiters();
@@ -13734,6 +13809,7 @@ async fn cloud_mcp_mark_registration_blocked(
         runtime.global_ws_message_token = None;
     }
     let _ = state.global_ws_tx.lock().await.take();
+    let _ = state.global_ws_termio_tx.lock().await.take();
     cloud_mcp_fail_pending_ws_requests(state, &message).await;
     cloud_mcp_record_connection_diagnostic(
         state,
@@ -31159,13 +31235,17 @@ async fn cloud_mcp_send_terminal_io_message(
     id: String,
     payload: Value,
 ) -> Result<(), String> {
-    let tx = state
-        .global_ws_tx
-        .lock()
-        .await
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| "Cloud MCP websocket is unavailable.".to_string())?;
+    let tx = if let Some(tx) = state.global_ws_termio_tx.lock().await.as_ref().cloned() {
+        tx
+    } else {
+        state
+            .global_ws_tx
+            .lock()
+            .await
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "Cloud MCP websocket is unavailable.".to_string())?
+    };
     let auth = cloud_mcp_ws_auth_object(state).await?;
     let mut envelope = json!({
         "v": 1,
@@ -31915,7 +31995,11 @@ pub(crate) fn cloud_mcp_publish_terminal_output_delta(
         if !cloud_mcp_terminal_output_stream_is_subscribed(&state, &stream_key) {
             return;
         }
-        let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() else {
+        let tx = if let Some(tx) = state.global_ws_termio_tx.lock().await.as_ref().cloned() {
+            tx
+        } else if let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() {
+            tx
+        } else {
             return;
         };
         let Ok(auth) = cloud_mcp_ws_auth_object(&state).await else {
@@ -35840,6 +35924,7 @@ async fn cloud_mcp_enter_offline_mode(
     let close_result = cloud_mcp_send_app_ws_close_request(state, "user_offline_mode").await;
     state.global_ws_epoch.fetch_add(1, Ordering::SeqCst);
     let _ = state.global_ws_tx.lock().await.take();
+    let _ = state.global_ws_termio_tx.lock().await.take();
     cloud_mcp_mark_global_ws_offline_permanent(state).await;
     state.global_ws_reconnect.notify_waiters();
     if let Err(error) = close_result {

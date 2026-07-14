@@ -127,6 +127,10 @@ const TERMINAL_OUTPUT_READ_BUFFER_BYTES: usize = 8192;
 // the resulting message-event + microtask storm at ~5s of a 26s recording.
 // 16ms halves-to-thirds the event rate at an imperceptible echo latency.
 const TERMINAL_OUTPUT_COALESCE_WINDOW_MS: u64 = 16;
+// A remote controller is waiting on the authoritative PTY echo. Keep a small
+// batching window to absorb split escape sequences without paying a full
+// display frame for ordinary interactive typing.
+const TERMINAL_REMOTE_OUTPUT_COALESCE_WINDOW_MS: u64 = 4;
 const TERMINAL_OUTPUT_COALESCE_MAX_BYTES: usize = 64 * 1024;
 const TERMINAL_OUTPUT_COALESCE_QUEUE_CAPACITY: usize = 64;
 const TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES: usize = 512 * 1024;
