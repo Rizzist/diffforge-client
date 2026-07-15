@@ -3079,10 +3079,14 @@ fn agent_accounts_metadata_file_id(metadata: &fs::Metadata) -> String {
 #[cfg(windows)]
 fn agent_accounts_metadata_file_id(metadata: &fs::Metadata) -> String {
     use std::os::windows::fs::MetadataExt as _;
+    // volume_serial_number()/file_index() need the nightly windows_by_handle
+    // feature. creation_time travels with the underlying file object, so a
+    // swapped-in replacement between metadata samples still changes the id
+    // (the callers' len/mtime guards catch in-place rewrites).
     format!(
         "{}:{}",
-        metadata.volume_serial_number().unwrap_or_default(),
-        metadata.file_index().unwrap_or_default()
+        metadata.creation_time(),
+        metadata.file_attributes()
     )
 }
 

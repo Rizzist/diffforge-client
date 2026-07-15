@@ -80,6 +80,9 @@ objc2-user-notifications = "0.3.2"
 block2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
+# Stable file-identity checks (GetFileInformationByHandle) — std's
+# volume_serial_number()/file_index() are nightly-only (windows_by_handle).
+same-file = "1.0"
 windows-capture = "1.5.0"
 windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_SystemInformation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 

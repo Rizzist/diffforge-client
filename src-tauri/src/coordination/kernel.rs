@@ -26240,26 +26240,23 @@ fn codex_paths_refer_to_same_file(source: &Path, destination: &Path) -> bool {
             return true;
         }
     }
-    let (Ok(source_metadata), Ok(destination_metadata)) =
-        (fs::metadata(source), fs::metadata(destination))
-    else {
-        return false;
-    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
+        let (Ok(source_metadata), Ok(destination_metadata)) =
+            (fs::metadata(source), fs::metadata(destination))
+        else {
+            return false;
+        };
         return source_metadata.dev() == destination_metadata.dev()
             && source_metadata.ino() == destination_metadata.ino();
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt as _;
-        return codex_windows_file_ids_match(
-            source_metadata.volume_serial_number(),
-            source_metadata.file_index(),
-            destination_metadata.volume_serial_number(),
-            destination_metadata.file_index(),
-        );
+        // std's volume_serial_number()/file_index() are nightly-only
+        // (windows_by_handle); same-file wraps GetFileInformationByHandle on
+        // stable and fails closed on error.
+        return same_file::is_same_file(source, destination).unwrap_or(false);
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -26267,7 +26264,7 @@ fn codex_paths_refer_to_same_file(source: &Path, destination: &Path) -> bool {
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(test)]
 fn codex_windows_file_ids_match(
     source_volume: Option<u32>,
     source_index: Option<u64>,
@@ -30295,11 +30292,15 @@ mod tests {
         }
         #[cfg(windows)]
         {
+            // Stable identity check (windows_by_handle fields are nightly):
+            // creation_time travels with the file object, and the hardlink
+            // relationship must have survived the bridge.
             use std::os::windows::fs::MetadataExt as _;
-            assert_eq!(
-                (before.volume_serial_number(), before.file_index()),
-                (after.volume_serial_number(), after.file_index())
-            );
+            assert_eq!(before.creation_time(), after.creation_time());
+            assert!(codex_paths_refer_to_same_file(
+                &source_auth,
+                &destination_auth
+            ));
         }
     }
 
