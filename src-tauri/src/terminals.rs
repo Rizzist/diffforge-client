@@ -699,6 +699,11 @@ fn terminal_provider_session_fork_error(provider: AgentProvider) -> String {
     )
 }
 
+fn terminal_claude_resume_unavailable_message() -> String {
+    "This Claude session was created on another device and isn't available to resume here."
+        .to_string()
+}
+
 fn terminal_resolve_provider_resume_session(
     provider: AgentProvider,
     requested_resume_session_id: Option<String>,
@@ -727,7 +732,21 @@ fn terminal_resolve_provider_resume_session(
                 }
             }
         }
-        AgentProvider::Claude => (Some(requested_session_id), None),
+        AgentProvider::Claude => {
+            match resolve_claude_resume_session(&requested_session_id, working_directory) {
+                Ok(session_id) => (Some(session_id), None),
+                Err(error) => {
+                    log_terminal_status_event(
+                        "backend.terminal_provider_session.resume_drop",
+                        json!({
+                            "error": clean_terminal_diagnostic_log_text(&error),
+                            "provider": "claude",
+                        }),
+                    );
+                    (None, None)
+                }
+            }
+        }
         AgentProvider::OpenCode => {
             match resolve_opencode_resume_session(&requested_session_id, working_directory) {
                 Ok(session_id) => (Some(session_id), None),
@@ -2437,6 +2456,7 @@ fn terminal_launch(
     let requested_resume_session_id = provider_session_id
         .as_deref()
         .and_then(|session_id| terminal_clean_provider_session_id(Some(session_id)));
+    let resume_was_requested = requested_resume_session_id.is_some();
     let requested_fork_session_id = fork_from_provider_session_id
         .as_deref()
         .and_then(|session_id| terminal_clean_provider_session_id(Some(session_id)));
@@ -2458,6 +2478,13 @@ fn terminal_launch(
             working_directory,
         )
     };
+    if !is_fork_launch
+        && matches!(provider, AgentProvider::Claude)
+        && resume_was_requested
+        && source_session_id.is_none()
+    {
+        return Err(terminal_claude_resume_unavailable_message());
+    }
     let mut args = if is_fork_launch {
         terminal_provider_fork_args(provider, source_session_id.as_deref())
     } else {
@@ -3391,9 +3418,9 @@ fn refresh_codex_activity_hook_profile_for_launch(
     instance_id: u64,
     workspace_id: Option<&str>,
     terminal_index: Option<u16>,
-) {
+) -> bool {
     if !provider_id.to_ascii_lowercase().contains("codex") || coordination.is_none() {
-        return;
+        return false;
     }
     clear_terminal_activity_hook_files(pane_id, instance_id);
     match refresh_codex_activity_hook_profile_for_terminal(
@@ -3404,30 +3431,42 @@ fn refresh_codex_activity_hook_profile_for_launch(
         workspace_id,
         terminal_index,
     ) {
-        Ok(updated) => log_terminal_status_event(
-            "backend.terminal_activity_hook.profile_scoped",
-            json!({
-                "activity_debug_path": terminal_activity_debug_path(pane_id, instance_id).to_string_lossy().to_string(),
-                "activity_events_path": terminal_activity_events_path(pane_id, instance_id).to_string_lossy().to_string(),
-                "instance_id": instance_id,
-                "pane_id": clean_terminal_diagnostic_log_text(pane_id),
-                "provider_id": provider_id,
-                "terminal_index": terminal_index,
-                "updated": updated,
-                "workspace_id": workspace_id.unwrap_or_default(),
-            }),
-        ),
-        Err(error) => log_terminal_status_event(
-            "backend.terminal_activity_hook.profile_scope_error",
-            json!({
-                "error": clean_terminal_diagnostic_log_text(&error),
-                "instance_id": instance_id,
-                "pane_id": clean_terminal_diagnostic_log_text(pane_id),
-                "provider_id": provider_id,
-                "terminal_index": terminal_index,
-                "workspace_id": workspace_id.unwrap_or_default(),
-            }),
-        ),
+        Ok(updated) => {
+            log_terminal_status_event(
+                "backend.terminal_activity_hook.profile_scoped",
+                json!({
+                    "activity_debug_path": terminal_activity_debug_path(pane_id, instance_id).to_string_lossy().to_string(),
+                    "activity_events_path": terminal_activity_events_path(pane_id, instance_id).to_string_lossy().to_string(),
+                    "auto_trusted": true,
+                    "instance_id": instance_id,
+                    "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                    "provider_id": provider_id,
+                    "terminal_index": terminal_index,
+                    "updated": updated,
+                    "workspace_id": workspace_id.unwrap_or_default(),
+                }),
+            );
+            false
+        }
+        Err(error) => {
+            // A managed terminal must never land on Codex's startup review
+            // wall with inert Diff Forge hooks. Persisted per-hook trust is
+            // the normal path; the dangerous bypass is a launch-local last
+            // resort when the managed home could not be updated.
+            log_terminal_status_event(
+                "backend.terminal_activity_hook.profile_scope_error",
+                json!({
+                    "error": clean_terminal_diagnostic_log_text(&error),
+                    "fallback": "codex_hook_trust_bypass",
+                    "instance_id": instance_id,
+                    "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                    "provider_id": provider_id,
+                    "terminal_index": terminal_index,
+                    "workspace_id": workspace_id.unwrap_or_default(),
+                }),
+            );
+            true
+        }
     }
 }
 
@@ -7930,7 +7969,7 @@ async fn terminal_open(
                     kind.as_str()
                 }
             });
-        refresh_codex_activity_hook_profile_for_launch(
+        let codex_hook_trust_bypass = refresh_codex_activity_hook_profile_for_launch(
             terminal_coordination.as_ref(),
             launch_provider_id,
             &pane_id,
@@ -7947,6 +7986,9 @@ async fn terminal_open(
             instance_id,
             activity_transport.as_ref(),
         );
+        if codex_hook_trust_bypass {
+            apply_codex_hook_trust_bypass_arg(&mut launch_args);
+        }
         let app_control_mcp_launch = if app_control_mcp_requested {
             let endpoint =
                 app_control_mcp_endpoint_for_state(app.clone(), app_control_mcp_state.inner())
@@ -8050,6 +8092,7 @@ async fn terminal_open(
                 terminal_coordination.as_ref(),
                 resolved_launch.permission_mode.as_deref(),
                 app_control_mcp_launch.as_ref(),
+                codex_hook_trust_bypass,
             );
             match terminal_start_codex_app_server_gateway(
                 app.clone(),
@@ -8824,7 +8867,7 @@ async fn terminal_start_agent(
             None
         }
     };
-    refresh_codex_activity_hook_profile_for_launch(
+    let codex_hook_trust_bypass = refresh_codex_activity_hook_profile_for_launch(
         instance.coordination.as_ref(),
         definition.id,
         &pane_id,
@@ -8841,6 +8884,9 @@ async fn terminal_start_agent(
         instance.id,
         activity_transport.as_ref(),
     );
+    if codex_hook_trust_bypass {
+        apply_codex_hook_trust_bypass_arg(&mut launch_args);
+    }
     let app_control_mcp_launch =
         resolve_app_control_mcp_launch(&app, instance.app_control_mcp_requested).await?;
     if let Some((app_control_command, app_control_args)) = app_control_mcp_launch.as_ref() {
@@ -8900,6 +8946,7 @@ async fn terminal_start_agent(
             instance.coordination.as_ref(),
             launch.permission_mode.as_deref(),
             app_control_mcp_launch.as_ref(),
+            codex_hook_trust_bypass,
         );
         match terminal_start_codex_app_server_gateway(
             app.clone(),
@@ -9042,6 +9089,7 @@ async fn start_terminal_agent_in_prepared_pty(
         .provider_session_id
         .as_deref()
         .and_then(|session_id| terminal_clean_provider_session_id(Some(session_id)));
+    let resume_was_requested = requested_resume_session_id.is_some();
     let requested_fork_session_id = request
         .fork_from_provider_session_id
         .as_deref()
@@ -9089,6 +9137,21 @@ async fn start_terminal_agent_in_prepared_pty(
             &working_directory_text,
         )
     };
+    if !is_fork_launch
+        && matches!(provider, AgentProvider::Claude)
+        && resume_was_requested
+        && source_session_id.is_none()
+    {
+        return TerminalStartAgentPaneResult {
+            pane_id,
+            instance_id: Some(instance.id),
+            model: None,
+            model_source: None,
+            started: false,
+            skipped: true,
+            message: terminal_claude_resume_unavailable_message(),
+        };
+    }
     let mut args = if is_fork_launch {
         terminal_provider_fork_args(provider, source_session_id.as_deref())
     } else {
@@ -9242,7 +9305,7 @@ async fn start_terminal_agent_in_prepared_pty(
                 ),
             };
         };
-        refresh_codex_activity_hook_profile_for_launch(
+        let codex_hook_trust_bypass = refresh_codex_activity_hook_profile_for_launch(
             instance.coordination.as_ref(),
             definition.id,
             &pane_id,
@@ -9281,6 +9344,9 @@ async fn start_terminal_agent_in_prepared_pty(
             instance.id,
             activity_transport.as_ref(),
         );
+        if codex_hook_trust_bypass {
+            apply_codex_hook_trust_bypass_arg(&mut launch_args);
+        }
         let app_control_mcp_launch =
             match resolve_app_control_mcp_launch(&app, instance.app_control_mcp_requested).await {
                 Ok(value) => value,
@@ -9486,6 +9552,7 @@ async fn start_terminal_agent_in_prepared_pty(
                 instance.coordination.as_ref(),
                 resolved_launch.permission_mode.as_deref(),
                 app_control_mcp_launch.as_ref(),
+                codex_hook_trust_bypass,
             );
             match terminal_start_codex_app_server_gateway(
                 app.clone(),
@@ -20868,8 +20935,12 @@ fn terminal_codex_app_server_trusted_args(
     coordination: Option<&TerminalCoordinationSession>,
     permission_mode: Option<&str>,
     app_control_mcp_launch: Option<&(String, Vec<String>)>,
+    bypass_hook_trust: bool,
 ) -> Vec<String> {
     let mut args = Vec::new();
+    if bypass_hook_trust {
+        terminal_codex_push_config_override(&mut args, "bypass_hook_trust=true".to_string());
+    }
     if coordination.is_some() {
         let permission_mode = permission_mode.unwrap_or(TERMINAL_PERMISSION_MODE_ACCEPT_EDITS);
         let (approval_policy, sandbox_mode) = match permission_mode {
@@ -27978,6 +28049,28 @@ notifications = true
     }
 
     #[test]
+    fn missing_local_claude_resume_fails_before_launch_with_a_clear_message() {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let cwd = env::temp_dir()
+            .join(format!("diffforge-missing-claude-resume-{session_id}"))
+            .to_string_lossy()
+            .to_string();
+        let result = terminal_launch(
+            "claude",
+            Some("claude".to_string()),
+            TerminalProviderLaunchOptions::default(),
+            Some(session_id),
+            None,
+            &cwd,
+        );
+
+        match result {
+            Ok(_) => panic!("missing local Claude session must not launch"),
+            Err(error) => assert_eq!(error, terminal_claude_resume_unavailable_message()),
+        }
+    }
+
+    #[test]
     fn provider_fork_args_are_provider_specific() {
         assert_eq!(
             terminal_provider_fork_args(AgentProvider::Codex, Some("codex-session-1")),
@@ -32057,6 +32150,7 @@ notifications = true
             Some(&coordination),
             Some(TERMINAL_PERMISSION_MODE_ASK),
             Some(&app_control),
+            false,
         );
 
         assert!(args
@@ -32122,7 +32216,7 @@ notifications = true
         );
 
         let unmanaged_args =
-            terminal_codex_app_server_trusted_args(None, None, Some(&app_control));
+            terminal_codex_app_server_trusted_args(None, None, Some(&app_control), false);
         assert!(unmanaged_args
             .iter()
             .any(|arg| arg.starts_with("developer_instructions=")));
@@ -32235,6 +32329,7 @@ notifications = true
                 Some(&coordination),
                 Some(mode),
                 None,
+                false,
             );
             assert!(args.iter().any(|arg| {
                 arg == &format!(
@@ -32284,6 +32379,92 @@ notifications = true
     }
 
     #[test]
+    fn codex_hook_trust_persistence_fallback_bypasses_both_processes() {
+        let mut interactive_args = vec![
+            "--model".to_string(),
+            "gpt-5.2".to_string(),
+            "--dangerously-bypass-hook-trust".to_string(),
+        ];
+        apply_codex_hook_trust_bypass_arg(&mut interactive_args);
+        assert_eq!(
+            interactive_args
+                .iter()
+                .filter(|arg| arg.as_str() == "--dangerously-bypass-hook-trust")
+                .count(),
+            1
+        );
+
+        let app_server_args = terminal_codex_app_server_trusted_args(None, None, None, true);
+        assert!(app_server_args
+            .windows(2)
+            .any(|pair| pair == ["-c", "bypass_hook_trust=true"]));
+    }
+
+    #[test]
+    fn coordinated_codex_missing_trust_metadata_requests_launch_fallback() {
+        let coordination = terminal_test_coordination("codex_hook_trust_missing_metadata");
+        assert!(refresh_codex_activity_hook_profile_for_launch(
+            Some(&coordination),
+            "codex",
+            "pane-auto",
+            42,
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn codex_0144_hook_hash_matches_provider_known_answer() {
+        let handler = json!({
+            "type": "command",
+            "command": "echo pane-hook",
+            "timeout": 5
+        });
+        assert_eq!(
+            codex_hook_normalized_hash("stop", None, handler.as_object().unwrap()).unwrap(),
+            "sha256:7d4b81fe7de7a92dc17d1f7c7c63b332a4e403c77d8a3383b9713be412fc1dbe"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_hook_trust_keys_use_provider_canonical_hooks_path() {
+        let root = terminal_test_directory("codex_hook_trust_canonical_path");
+        let real_home = root.join("real-home");
+        let alias_home = root.join("alias-home");
+        fs::create_dir_all(&real_home).unwrap();
+        std::os::unix::fs::symlink(&real_home, &alias_home).unwrap();
+        let hooks_path = alias_home.join("hooks.json");
+        let hooks_json = json!({
+            "hooks": {
+                "Stop": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "coordination_mcp --diff-forge-activity-hook --provider codex",
+                        "timeout": 5
+                    }]
+                }]
+            }
+        });
+        fs::write(
+            &hooks_path,
+            serde_json::to_vec_pretty(&hooks_json).unwrap(),
+        )
+        .unwrap();
+
+        let records = codex_managed_activity_hook_trust_records(&hooks_path, &hooks_json).unwrap();
+        assert_eq!(records.len(), 1);
+        let canonical_hooks_path = fs::canonicalize(&hooks_path).unwrap();
+        assert_eq!(
+            records[0].0,
+            format!("{}:stop:0:0", canonical_hooks_path.to_string_lossy())
+        );
+        assert!(!records[0]
+            .0
+            .starts_with(alias_home.to_string_lossy().as_ref()));
+    }
+
+    #[test]
     fn coordinated_codex_activity_hook_profile_refresh_scopes_commands() {
         let mut coordination = terminal_test_coordination("codex_hook_profile_scope");
         let home = terminal_test_directory("codex_hook_profile_home");
@@ -32307,6 +32488,11 @@ notifications = true
                                 {
                                     "type": "command",
                                     "command": "'coordination_mcp' --diff-forge-activity-hook --provider 'codex'",
+                                    "timeout": 5
+                                },
+                                {
+                                    "type": "command",
+                                    "command": "echo user-hook",
                                     "timeout": 5
                                 }
                             ]
@@ -32395,6 +32581,93 @@ notifications = true
         assert!(!profile_config.contains("--debug-path"));
         assert!(!profile_config.contains("--diff-forge-write-guard"));
         assert!(!profile_config.contains("hooksPath ="));
+
+        let hooks_json: Value = serde_json::from_str(&hooks).unwrap();
+        let records = codex_managed_activity_hook_trust_records(&hooks_path, &hooks_json).unwrap();
+        assert_eq!(records.len(), 10);
+        let user_hook_location = hooks_json["hooks"]["Stop"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .find_map(|(group_index, group)| {
+                group["hooks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .enumerate()
+                    .find_map(|(handler_index, handler)| {
+                        (handler["command"].as_str() == Some("echo user-hook"))
+                            .then_some((group_index, handler_index))
+                    })
+            })
+            .expect("neighboring user hook must survive the managed refresh");
+        let user_hook_key = format!(
+            "{}:stop:{}:{}",
+            hooks_path.to_string_lossy(),
+            user_hook_location.0,
+            user_hook_location.1
+        );
+        let base_config_path = home.join("config.toml");
+        for config_path in [&base_config_path, &profile_path] {
+            let config: toml::Value =
+                toml::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
+            let state = config["hooks"]["state"].as_table().unwrap();
+            assert_eq!(state.len(), 10);
+            assert!(!state.contains_key(&user_hook_key));
+            for (key, current_hash) in &records {
+                let entry = state.get(key).unwrap().as_table().unwrap();
+                assert_eq!(
+                    entry.get("trusted_hash").and_then(toml::Value::as_str),
+                    Some(current_hash.as_str())
+                );
+                assert_eq!(
+                    entry.get("enabled").and_then(toml::Value::as_bool),
+                    Some(true)
+                );
+            }
+        }
+
+        // A stale/disabled profile entry overrides the base layer in Codex.
+        // Refreshing a launch must repair both layers so the hook is active.
+        let stale_key = &records[0].0;
+        for config_path in [&base_config_path, &profile_path] {
+            let mut config: toml::Value =
+                toml::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
+            let entry = config["hooks"]["state"][stale_key]
+                .as_table_mut()
+                .unwrap();
+            entry.insert(
+                "trusted_hash".to_string(),
+                toml::Value::String("sha256:stale".to_string()),
+            );
+            entry.insert("enabled".to_string(), toml::Value::Boolean(false));
+            fs::write(config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
+        }
+        assert!(refresh_codex_activity_hook_profile_for_terminal(
+            Some(&coordination),
+            "codex",
+            "workspace-terminal/workspace-1-0-codex",
+            42,
+            Some("workspace-1"),
+            Some(2),
+        )
+        .unwrap());
+        for config_path in [&base_config_path, &profile_path] {
+            let config: toml::Value =
+                toml::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
+            let entry = config["hooks"]["state"][stale_key]
+                .as_table()
+                .unwrap();
+            assert_eq!(
+                entry.get("trusted_hash").and_then(toml::Value::as_str),
+                Some(records[0].1.as_str())
+            );
+            assert_eq!(
+                entry.get("enabled").and_then(toml::Value::as_bool),
+                Some(true)
+            );
+        }
     }
 
     #[test]

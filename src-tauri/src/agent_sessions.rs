@@ -4967,6 +4967,129 @@ mod agent_sessions_tests {
     }
 
     #[test]
+    fn claude_resume_requires_a_local_conversation_in_the_launch_home() {
+        let root = unique_test_dir("claude-resume-local-home");
+        let launch_home = root.join("active-account");
+        let other_home = root.join("other-account");
+        let cwd = root.join("workspace");
+        let session_id = "8b11443c-1111-4222-8333-123456789abc";
+        let other_project_dir = other_home
+            .join("projects")
+            .join(claude_project_dir_name(&cwd.to_string_lossy()));
+        fs::create_dir_all(&other_project_dir).unwrap();
+        fs::write(
+            other_project_dir.join(format!("{session_id}.jsonl")),
+            format!(
+                "{}\n",
+                json!({
+                    "type": "user",
+                    "sessionId": session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "timestamp": "2026-07-12T12:00:00Z",
+                    "message": {"role": "user", "content": "remote session"}
+                })
+            ),
+        )
+        .unwrap();
+
+        assert!(resolve_claude_resume_session_in_home(
+            session_id,
+            &cwd.to_string_lossy(),
+            &launch_home,
+        )
+        .is_err());
+        assert_eq!(
+            resolve_claude_resume_session_in_home(
+                session_id,
+                &cwd.to_string_lossy(),
+                &other_home,
+            )
+            .unwrap(),
+            session_id
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_resume_rejects_a_local_conversation_from_another_workspace() {
+        let root = unique_test_dir("claude-resume-cwd");
+        let home = root.join("account");
+        let stored_cwd = root.join("workspace-a");
+        let requested_cwd = root.join("workspace-b");
+        let session_id = "9c22554d-2222-4333-8444-abcdef123456";
+        let project_dir = home
+            .join("projects")
+            .join(claude_project_dir_name(&stored_cwd.to_string_lossy()));
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join(format!("{session_id}.jsonl")),
+            format!(
+                "{}\n",
+                json!({
+                    "type": "user",
+                    "sessionId": session_id,
+                    "cwd": stored_cwd.to_string_lossy(),
+                    "timestamp": "2026-07-12T12:00:00Z",
+                    "message": {"role": "user", "content": "local session"}
+                })
+            ),
+        )
+        .unwrap();
+
+        assert!(resolve_claude_resume_session_in_home(
+            session_id,
+            &requested_cwd.to_string_lossy(),
+            &home,
+        )
+        .is_err());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_resume_rejects_orphaned_subagent_transcripts() {
+        let root = unique_test_dir("claude-resume-subagent-only");
+        let home = root.join("account");
+        let cwd = root.join("workspace");
+        let session_id = "7a11443c-3333-4444-8555-123456789abc";
+        let subagents_dir = home
+            .join("projects")
+            .join(claude_project_dir_name(&cwd.to_string_lossy()))
+            .join(session_id)
+            .join("subagents");
+        fs::create_dir_all(&subagents_dir).unwrap();
+        fs::write(
+            subagents_dir.join("agent-a1b2c3.jsonl"),
+            format!(
+                "{}\n",
+                json!({
+                    "type": "user",
+                    "sessionId": session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "timestamp": "2026-07-12T12:00:00Z",
+                    "message": {"role": "user", "content": "orphaned subagent"}
+                })
+            ),
+        )
+        .unwrap();
+
+        assert!(resolve_claude_resume_session_in_home(
+            session_id,
+            &cwd.to_string_lossy(),
+            &home,
+        )
+        .is_err());
+        assert!(!claude_local_resume_index_contains(
+            &claude_local_resume_index_in_home(&home),
+            session_id,
+            &cwd.to_string_lossy(),
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn claude_session_parser_promotes_result_text_to_assistant_message() {
         let root = unique_test_dir("claude-result-output");
         fs::create_dir_all(&root).unwrap();
@@ -5911,6 +6034,14 @@ fn claude_home_candidates() -> Vec<PathBuf> {
     paths
 }
 
+fn claude_home_for_launch() -> Option<PathBuf> {
+    // Spawn-time account binding prefers the selected/captured Claude profile
+    // over the process-wide default. Resume validation must inspect that same
+    // store; finding the id under a different local account would still make
+    // `claude --resume` fail after the launch env is applied.
+    agent_accounts_profile_home_for_launch("claude").or_else(claude_home_dir)
+}
+
 fn claude_project_dir_name(cwd: &str) -> String {
     cwd.chars()
         .map(|character| {
@@ -6039,49 +6170,189 @@ fn claude_file_meta(path: &Path) -> Option<CodexRolloutMeta> {
     })
 }
 
+fn find_claude_session_in_homes(
+    provider_session_id: &str,
+    cwd: &str,
+    homes: &[PathBuf],
+    top_level_only: bool,
+) -> Result<(PathBuf, CodexRolloutMeta, String), String> {
+    let requested_session_id = clean_codex_id(provider_session_id);
+    if requested_session_id.is_empty() {
+        return Err("Claude Code session id is required.".to_string());
+    }
+
+    let mut direct_matches = Vec::new();
+    let mut seen = HashSet::new();
+    for home in homes {
+        let projects_dir = home.join("projects");
+        if !cwd.trim().is_empty() {
+            let encoded = claude_project_dir_name(cwd);
+            for project_dir in [
+                projects_dir.join(&encoded),
+                projects_dir.join(encoded.to_lowercase()),
+            ] {
+                let path = project_dir.join(format!("{requested_session_id}.jsonl"));
+                if path.is_file() {
+                    push_unique_path(&mut direct_matches, &mut seen, path);
+                }
+            }
+        }
+
+        let Ok(entries) = fs::read_dir(&projects_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path().join(format!("{requested_session_id}.jsonl"));
+            if path.is_file() {
+                push_unique_path(&mut direct_matches, &mut seen, path);
+            }
+        }
+    }
+
+    for path in direct_matches {
+        let Some(meta) = claude_file_meta(&path) else {
+            continue;
+        };
+        if meta.session_id != requested_session_id {
+            continue;
+        }
+        if !cwd.trim().is_empty()
+            && !meta.cwd.trim().is_empty()
+            && !agent_paths_match(&meta.cwd, cwd)
+        {
+            continue;
+        }
+        return Ok((path, meta, "sessionId".to_string()));
+    }
+
+    if top_level_only {
+        return Err(
+            "No local Claude Code conversation matched this session and workspace.".to_string(),
+        );
+    }
+
+    // Claude normally stores a top-level conversation directly below its
+    // encoded project directory. Keep the recursive fallback for provider
+    // layouts that nest transcripts (and for older stores), while still
+    // requiring both the exact session id and the requested project cwd.
+    let mut files = Vec::new();
+    for home in homes {
+        collect_claude_session_files(&home.join("projects"), &mut files);
+    }
+    sort_rollouts_newest_first(&mut files);
+    for path in files {
+        let file_match = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|name| name == requested_session_id);
+        let Some(meta) = claude_file_meta(&path) else {
+            continue;
+        };
+        if !file_match || meta.session_id != requested_session_id {
+            continue;
+        }
+        if !cwd.trim().is_empty()
+            && !meta.cwd.trim().is_empty()
+            && !agent_paths_match(&meta.cwd, cwd)
+        {
+            continue;
+        }
+        return Ok((path, meta, "sessionId".to_string()));
+    }
+
+    Err("No local Claude Code conversation matched this session and workspace.".to_string())
+}
+
 fn find_claude_session(
     provider_session_id: &str,
     cwd: &str,
 ) -> Result<(PathBuf, CodexRolloutMeta, String), String> {
-    let requested_session_id = clean_codex_id(provider_session_id);
-    if !requested_session_id.is_empty() {
-        let mut direct_matches = Vec::new();
-        for home in claude_home_candidates() {
-            let projects_dir = home.join("projects");
-            let Ok(entries) = fs::read_dir(projects_dir) else {
+    find_claude_session_in_homes(
+        provider_session_id,
+        cwd,
+        &claude_home_candidates(),
+        false,
+    )
+}
+
+fn resolve_claude_resume_session_in_home(
+    provider_session_id: &str,
+    cwd: &str,
+    home: &Path,
+) -> Result<String, String> {
+    let (_, meta, _) =
+        find_claude_session_in_homes(provider_session_id, cwd, &[home.to_path_buf()], true)?;
+    let session_id = clean_codex_id(meta.session_id);
+    if session_id.is_empty() {
+        return Err("Claude Code transcript has no resumable session id.".to_string());
+    }
+    Ok(session_id)
+}
+
+fn resolve_claude_resume_session(provider_session_id: &str, cwd: &str) -> Result<String, String> {
+    let home = claude_home_for_launch()
+        .ok_or_else(|| "Unable to locate the active Claude Code home.".to_string())?;
+    resolve_claude_resume_session_in_home(provider_session_id, cwd, &home)
+}
+
+fn claude_local_resume_index_in_home(home: &Path) -> HashMap<String, Vec<String>> {
+    let mut files = Vec::new();
+    if let Ok(projects) = fs::read_dir(home.join("projects")) {
+        for project in projects.flatten() {
+            let project_dir = project.path();
+            if !project_dir.is_dir() {
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(project_dir) else {
                 continue;
             };
-            direct_matches.extend(entries.flatten().filter_map(|entry| {
-                let path = entry.path().join(format!("{requested_session_id}.jsonl"));
-                path.exists().then_some(path)
+            files.extend(entries.flatten().filter_map(|entry| {
+                let path = entry.path();
+                (path.is_file()
+                    && path.extension().and_then(|extension| extension.to_str()) == Some("jsonl"))
+                .then_some(path)
             }));
         }
-
-        for path in direct_matches {
-            if let Some(meta) = claude_file_meta(&path) {
-                return Ok((path, meta, "sessionId".to_string()));
-            }
-        }
     }
-
-    let files = collect_claude_candidate_files(cwd)?;
-
-    if !requested_session_id.is_empty() {
-        for path in &files {
-            let file_match = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .is_some_and(|name| name == requested_session_id);
-            let Some(meta) = claude_file_meta(path) else {
-                continue;
-            };
-            if file_match || meta.session_id == requested_session_id {
-                return Ok((path.clone(), meta, "sessionId".to_string()));
-            }
+    let mut sessions = HashMap::<String, Vec<String>>::new();
+    for path in files {
+        let Some(meta) = claude_file_meta(&path) else {
+            continue;
+        };
+        let session_id = clean_codex_id(meta.session_id);
+        let file_session_id = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(clean_codex_id)
+            .unwrap_or_default();
+        if session_id.is_empty() || file_session_id != session_id {
+            continue;
         }
+        sessions.entry(session_id).or_default().push(meta.cwd);
     }
+    sessions
+}
 
-    Err("No Claude Code transcript matched this thread session.".to_string())
+fn claude_local_resume_index_for_launch() -> HashMap<String, Vec<String>> {
+    claude_home_for_launch()
+        .as_deref()
+        .map(claude_local_resume_index_in_home)
+        .unwrap_or_default()
+}
+
+fn claude_local_resume_index_contains(
+    sessions: &HashMap<String, Vec<String>>,
+    provider_session_id: &str,
+    cwd: &str,
+) -> bool {
+    let session_id = clean_codex_id(provider_session_id);
+    sessions.get(&session_id).is_some_and(|session_cwds| {
+        session_cwds.iter().any(|session_cwd| {
+            cwd.trim().is_empty()
+                || session_cwd.trim().is_empty()
+                || agent_paths_match(session_cwd, cwd)
+        })
+    })
 }
 
 fn claude_content_text(value: &Value) -> String {

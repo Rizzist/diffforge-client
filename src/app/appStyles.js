@@ -12383,10 +12383,22 @@ export const TerminalStateDebugBadge = styled.span`
   text-transform: lowercase;
   white-space: nowrap;
 
+  &[data-tone="attention"] {
+    border-color: rgba(247, 181, 83, 0.45);
+    color: #fff8ea;
+    background: rgba(184, 93, 25, 0.94);
+  }
+
   html[data-forge-theme="light"] & {
     border-color: rgba(99, 102, 118, 0.2);
     color: rgba(48, 54, 68, 0.82);
     background: rgba(255, 255, 255, 0.72);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="attention"] {
+    border-color: rgba(247, 181, 83, 0.45);
+    color: #fff8ea;
+    background: rgba(184, 93, 25, 0.94);
   }
 `;
 

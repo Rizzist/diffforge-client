@@ -9,9 +9,28 @@ import {
 } from "./terminalPromptSubmission.js";
 import {
   extractNativeSessionIdFromOutput,
+  getClaudeResumeExitMessage,
 } from "./WorkspaceTerminal/terminalCore.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+test("Claude missing-conversation exit explains the cross-device resume failure", () => {
+  assert.equal(
+    getClaudeResumeExitMessage({
+      agentId: "claude",
+      exitCode: 1,
+      output: "No conversation found with session ID: 8b11443c-1111-4222-8333-123456789abc",
+      providerSessionId: "8b11443c-1111-4222-8333-123456789abc",
+    }),
+    "This Claude session was created on another device and isn't available to resume here.",
+  );
+  assert.equal(getClaudeResumeExitMessage({
+    agentId: "codex",
+    exitCode: 1,
+    output: "No conversation found",
+    providerSessionId: "codex-session",
+  }), "");
+});
 
 test("observed input gate submit is authoritative only when the prompt matches", () => {
   assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({

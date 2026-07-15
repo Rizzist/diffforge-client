@@ -46,18 +46,22 @@ const TERMINAL_ACTIVITY_IDLE_STATES = new Set([
   "ready",
 ]);
 
-const TERMINAL_ACTIVITY_PAUSED_STATES = new Set([
+const TERMINAL_ACTIVITY_ATTENTION_STATES = new Set([
   "awaiting_input",
   "awaiting_user",
   "needs_input",
-  "parked",
-  "paused",
   "prompting_user",
   "requires_input",
   "requires_user_input",
-  "resume_ready",
   "uir",
   "user_input_required",
+]);
+
+const TERMINAL_ACTIVITY_PAUSED_STATES = new Set([
+  ...TERMINAL_ACTIVITY_ATTENTION_STATES,
+  "parked",
+  "paused",
+  "resume_ready",
   "waiting",
 ]);
 
@@ -122,6 +126,10 @@ export function terminalActivityStatusIsPaused(activityStatus) {
   return TERMINAL_ACTIVITY_PAUSED_STATES.has(normalizeActivityText(activityStatus, ""));
 }
 
+export function terminalActivityStatusNeedsAttention(activityStatus) {
+  return TERMINAL_ACTIVITY_ATTENTION_STATES.has(normalizeActivityText(activityStatus, ""));
+}
+
 export function terminalActivityStatusIsSendable(activityStatus) {
   return TERMINAL_ACTIVITY_IDLE_STATES.has(normalizeActivityText(activityStatus, ""));
 }
@@ -129,12 +137,15 @@ export function terminalActivityStatusIsSendable(activityStatus) {
 export function workspaceTerminalStatusFromActivityStatus(activityStatus, options = {}) {
   const terminalLifecycle = normalizeActivityText(options.terminal_lifecycle, "");
   const liveStatus = normalizeActivityText(options.liveStatus, "");
+  const normalizedActivity = normalizeActivityText(activityStatus, "");
   if (terminalLifecycle === "closed" || liveStatus === "closed") return "closed";
   if (terminalLifecycle === "closing" || liveStatus === "closing") return "closing";
   if (terminalLifecycle === "exited" || liveStatus === "exited") return "closed";
   if (terminalLifecycle === "offline" || liveStatus === "offline") return "offline";
+  if (options.terminal_is_prompting_user || TERMINAL_ACTIVITY_ATTENTION_STATES.has(normalizedActivity)) {
+    return "awaiting_input";
+  }
   if (options.terminal_is_parked) return "paused";
-  if (options.terminal_is_prompting_user) return "awaiting_input";
   return terminalRailStateFromActivityStatus(activityStatus, options.fallbackStatus || "idle");
 }
 
@@ -215,7 +226,18 @@ export function terminalExecutionPhaseFromState(fields = {}) {
   if (turn === "cancelled" || turn === "canceled" || commandPhase === "cancelled" || commandPhase === "canceled") return "cancelled";
   if (eventType === "provider_turn_error" || eventType === "pending_prompt_error" || turn === "failed" || turn === "error") return "failed";
   if (TERMINAL_ACTIVITY_ERROR_STATES.has(activity) || readiness === "error" || status === "error") return "failed";
-  if (TERMINAL_ACTIVITY_PAUSED_STATES.has(activity) || readiness === "needs_input" || readiness === "paused") return "needs_input";
+  if (
+    TERMINAL_ACTIVITY_ATTENTION_STATES.has(activity)
+      || TERMINAL_ACTIVITY_ATTENTION_STATES.has(commandPhase)
+      || TERMINAL_ACTIVITY_ATTENTION_STATES.has(status)
+  ) return "awaiting_input";
+  if (
+    TERMINAL_ACTIVITY_PAUSED_STATES.has(activity)
+      || TERMINAL_ACTIVITY_PAUSED_STATES.has(commandPhase)
+      || TERMINAL_ACTIVITY_PAUSED_STATES.has(status)
+  ) return "paused";
+  if (TERMINAL_ACTIVITY_ATTENTION_STATES.has(readiness)) return "awaiting_input";
+  if (TERMINAL_ACTIVITY_PAUSED_STATES.has(readiness)) return "paused";
   if (commandPhase === "queued") return "queued";
   if (
     ["submitted", "input_written", "accepted", "running"].includes(commandPhase)
@@ -244,20 +266,36 @@ export function terminalRailStateFromExecutionPhase(executionPhase, fallback = "
   const phase = normalizeActivityText(executionPhase, "");
   if (["offline", "closed", "closing", "exited"].includes(phase)) return phase;
   if (phase === "failed") return "error";
+  if (TERMINAL_ACTIVITY_ATTENTION_STATES.has(phase)) return "awaiting_input";
   if (
-    phase === "awaiting_input"
-      || phase === "needs_input"
-      || phase === "paused"
+    phase === "paused"
       || phase === "parked"
       || phase === "resume_ready"
-      || phase === "uir"
-      || phase === "user_input_required"
   ) return "paused";
   if (phase === "compacting" || phase === "compaction") return "compacting";
   if (["queued", "submitted", "input_written", "accepted", "running", "cancelling"].includes(phase)) return "thinking";
   if (["cancelled", "canceled", "interrupted"].includes(phase)) return "interrupted";
   if (["completed", "complete", "done", "idle"].includes(phase)) return "idle";
   return terminalRailStateFromActivityStatus("", fallback);
+}
+
+export function terminalRailBadgePresentation(railState, fallback = "idle") {
+  const rawState = normalizeActivityText(railState, normalizeActivityText(fallback, "idle"));
+  const state = TERMINAL_ACTIVITY_ATTENTION_STATES.has(rawState)
+    ? "awaiting_input"
+    : rawState;
+  if (state === "awaiting_input") {
+    return {
+      label: "Input required",
+      state,
+      tone: "attention",
+    };
+  }
+  return {
+    label: state.replace(/[_-]+/g, " "),
+    state,
+    tone: "neutral",
+  };
 }
 
 export function shouldSuppressThreadPropThinking({

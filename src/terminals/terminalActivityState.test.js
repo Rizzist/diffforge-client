@@ -6,10 +6,12 @@ import {
   terminalActivityStatusIsBusy,
   terminalActivityStatusIsSendable,
   terminalAgentUsesActivityHooks,
+  terminalActivityStatusNeedsAttention,
   terminalExecutionPhaseFromState,
   shouldSuppressThreadPropThinking,
   workspaceTerminalStatusFromActivityStatus,
   terminalRailStateFromActivityStatus,
+  terminalRailBadgePresentation,
   terminalRailStateFromExecutionPhase,
   terminalReadinessFromPresenceStatus,
   terminalTurnStatusFromActivityStatus,
@@ -66,14 +68,24 @@ test("visible terminal presence follows activity status instead of running turn 
   assert.equal(terminalTurnStatusFromActivityStatus("idle"), "completed");
 });
 
-test("user-input-required aliases map to the paused needs-input bucket", () => {
-  for (const status of ["awaiting_input", "user_input_required", "uir"]) {
+test("user-input-required aliases map to a distinct attention rail and badge", () => {
+  for (const status of ["awaiting_input", "needs_input", "user_input_required", "uir"]) {
+    assert.equal(terminalActivityStatusNeedsAttention(status), true);
     assert.equal(terminalReadinessFromPresenceStatus(status), "needs_input");
     assert.equal(terminalExecutionPhaseFromState({
       activity_status: status,
       readiness: "needs_input",
-    }), "needs_input");
-    assert.equal(terminalRailStateFromExecutionPhase(status), "paused");
+    }), "awaiting_input");
+    assert.equal(terminalExecutionPhaseFromState({
+      command_phase: status,
+      readiness: "ready",
+    }), "awaiting_input");
+    assert.equal(terminalRailStateFromExecutionPhase(status), "awaiting_input");
+    assert.deepEqual(terminalRailBadgePresentation(status), {
+      label: "Input required",
+      state: "awaiting_input",
+      tone: "attention",
+    });
     assert.equal(terminalTurnStatusFromActivityStatus(status), "pending");
   }
   assert.equal(workspaceTerminalStatusFromActivityStatus("idle", {
@@ -84,7 +96,25 @@ test("user-input-required aliases map to the paused needs-input bucket", () => {
     terminal_lifecycle: "open",
     terminal_is_parked: true,
     terminal_is_prompting_user: true,
+  }), "awaiting_input");
+});
+
+test("a parked terminal without a user prompt stays paused", () => {
+  assert.equal(workspaceTerminalStatusFromActivityStatus("paused", {
+    terminal_lifecycle: "open",
+    terminal_is_parked: true,
+    terminal_is_prompting_user: false,
   }), "paused");
+  assert.equal(terminalExecutionPhaseFromState({
+    activity_status: "parked",
+    readiness: terminalReadinessFromPresenceStatus("parked"),
+  }), "paused");
+  assert.equal(terminalRailStateFromExecutionPhase("parked"), "paused");
+  assert.deepEqual(terminalRailBadgePresentation("paused"), {
+    label: "paused",
+    state: "paused",
+    tone: "neutral",
+  });
 });
 
 test("visible terminal rail preserves exact activity status", () => {

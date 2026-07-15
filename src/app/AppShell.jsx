@@ -1044,7 +1044,10 @@ import {
   WEB_PANEL_CONTROL_RETURN,
   WEB_PANEL_WEBVIEW_PRESERVED_EVENT,
 } from "../web/webPanelBridge.js";
-import ArchitectureWorkspaceView from "../architecture/ArchitectureWorkspaceView.jsx";
+import ArchitectureWorkspaceView, {
+  invalidateClaudeSessionHistoryCache,
+} from "../architecture/ArchitectureWorkspaceView.jsx";
+import { getSessionHistoryResumeAvailability } from "../architecture/sessionHistoryResumability.js";
 import AppSelect from "./AppSelect.jsx";
 import AccountAssetsView from "../assets/AccountAssetsView.jsx";
 import BackgroundMonitorWindow from "../background/BackgroundMonitorWindow.jsx";
@@ -37396,6 +37399,11 @@ export default function App() {
       setWorkspaceError("No provider session id was recorded for this history row.");
       return false;
     }
+    const resumeAvailability = getSessionHistoryResumeAvailability(item, targetProviderSessionId);
+    if (!resumeAvailability.canOpen) {
+      setWorkspaceError(resumeAvailability.reason);
+      return false;
+    }
     const role = normalizeWorkspaceTerminalRole(
       item?.agent_id || item?.provider || "",
       workspaceTerminalFallbackRole,
@@ -45782,6 +45790,12 @@ export default function App() {
         ? event.payload
         : event || {};
       const completedProvider = normalizeManagedAgentProviderId(payload?.kind);
+      if (!completedProvider || completedProvider === "claude") {
+        // Architecture/Session History is usually unmounted while accounts
+        // are switched in Tokenomics. Invalidate its module cache here so a
+        // previous account's local Claude session can never flash as Open.
+        invalidateClaudeSessionHistoryCache();
+      }
       if (payload?.login_completed && completedProvider) {
         // Backend validation has already atomically activated the expected
         // changed auth.json. Restart only inventory-confirmed idle panes in

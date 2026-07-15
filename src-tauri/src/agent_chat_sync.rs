@@ -4649,6 +4649,8 @@ mod agent_chat_session_sync_tests {
             title: "Test session".to_string(),
             first_user_message: String::new(),
             chat_sync,
+            resumable: true,
+            resume_unavailable_reason: String::new(),
             source: "test".to_string(),
             created_at_ms: 10,
             latest_at_ms: 20,

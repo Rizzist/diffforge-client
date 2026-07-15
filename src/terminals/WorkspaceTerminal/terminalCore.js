@@ -487,6 +487,26 @@ export function getClaudeResizeDuplicateRepaintDecision() {
   };
 }
 
+export function getClaudeResumeExitMessage({
+  agentId = "",
+  exitCode = null,
+  output = "",
+  providerSessionId = "",
+} = {}) {
+  if (
+    String(agentId || "").trim().toLowerCase() !== "claude"
+    || !String(providerSessionId || "").trim()
+    || Number(exitCode) === 0
+  ) {
+    return "";
+  }
+  const visibleOutput = stripLiveViewControlSequences(String(output || ""));
+  if (!/\bNo conversation found(?:\s+with\s+session\s+ID)?\b/i.test(visibleOutput)) {
+    return "";
+  }
+  return "This Claude session was created on another device and isn't available to resume here.";
+}
+
 export function extractNativeSessionIdFromOutput(agentId, text) {
   const output = stripLiveViewControlSequences(text);
   if (

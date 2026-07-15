@@ -2655,6 +2655,11 @@ fn apply_codex_coordinated_auto_approval_args(
     }
 }
 
+fn apply_codex_hook_trust_bypass_arg(args: &mut Vec<String>) {
+    strip_terminal_arg_option(args, "--dangerously-bypass-hook-trust", "", false);
+    args.push("--dangerously-bypass-hook-trust".to_string());
+}
+
 fn terminal_env_truthy(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -3497,12 +3502,14 @@ fn refresh_codex_activity_hook_profile_for_terminal(
     };
     let Some(profile) = terminal_coordination_env_value(coordination, "DIFFFORGE_CODEX_PROFILE")
     else {
-        return Ok(false);
+        return Err(
+            "Managed Codex launch is missing DIFFFORGE_CODEX_PROFILE for hook trust.".to_string(),
+        );
     };
     let Some(home) = terminal_coordination_env_value(coordination, "DIFFFORGE_CODEX_HOME")
         .or_else(|| terminal_coordination_env_value(coordination, "CODEX_HOME"))
     else {
-        return Ok(false);
+        return Err("Managed Codex launch is missing CODEX_HOME for hook trust.".to_string());
     };
 
     let profile_path = PathBuf::from(&home).join(format!("{profile}.config.toml"));
@@ -3577,7 +3584,320 @@ fn refresh_codex_activity_hook_profile_for_terminal(
     if strip_codex_profile_managed_inline_hooks(&profile_path)? {
         updated = true;
     }
+    // Codex 0.144 persists hook trust in the user config layer as an exact
+    // per-handler key/hash pair.  The pane app-server reads config.toml while
+    // the interactive CLI also layers the active profile on top, so both
+    // files must contain the freshly computed hashes before either process is
+    // spawned.  Trust only Diff Forge's own activity-hook handlers; unrelated
+    // user/project hooks keep Codex's native review gate.
+    let base_config_path = PathBuf::from(&home).join("config.toml");
+    if persist_codex_managed_activity_hook_trust(
+        &[base_config_path.as_path(), profile_path.as_path()],
+        &hooks_path,
+        &hooks_json,
+    )? {
+        updated = true;
+    }
     Ok(updated)
+}
+
+fn codex_hook_event_trust_identity(event_name: &str) -> Option<(&'static str, bool)> {
+    match event_name {
+        "PreToolUse" => Some(("pre_tool_use", true)),
+        "PermissionRequest" => Some(("permission_request", true)),
+        "PostToolUse" => Some(("post_tool_use", true)),
+        "PreCompact" => Some(("pre_compact", true)),
+        "PostCompact" => Some(("post_compact", true)),
+        "SessionStart" => Some(("session_start", true)),
+        "UserPromptSubmit" => Some(("user_prompt_submit", false)),
+        "SubagentStart" => Some(("subagent_start", true)),
+        "SubagentStop" => Some(("subagent_stop", true)),
+        "Stop" => Some(("stop", false)),
+        _ => None,
+    }
+}
+
+fn codex_hook_platform_command(handler: &serde_json::Map<String, Value>) -> Option<String> {
+    #[cfg(windows)]
+    let command = handler
+        .get("commandWindows")
+        .or_else(|| handler.get("command_windows"))
+        .or_else(|| handler.get("command"));
+    #[cfg(not(windows))]
+    let command = handler.get("command");
+
+    command.and_then(Value::as_str).map(ToString::to_string)
+}
+
+fn codex_hook_normalized_hash(
+    event_label: &str,
+    matcher: Option<&str>,
+    handler: &serde_json::Map<String, Value>,
+) -> Result<String, String> {
+    let command = codex_hook_platform_command(handler)
+        .ok_or_else(|| "Codex command hook is missing its platform command.".to_string())?;
+    let timeout = match handler.get("timeout") {
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| "Codex command hook timeout must be an unsigned integer.".to_string())?,
+        None => 600,
+    }
+    .max(1);
+    let is_async = match handler.get("async") {
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| "Codex command hook async must be a boolean.".to_string())?,
+        None => false,
+    };
+
+    let mut normalized_handler = serde_json::Map::new();
+    normalized_handler.insert("type".to_string(), json!("command"));
+    normalized_handler.insert("command".to_string(), json!(command));
+    normalized_handler.insert("timeout".to_string(), json!(timeout));
+    normalized_handler.insert("async".to_string(), json!(is_async));
+    if let Some(status_message) = handler.get("statusMessage") {
+        let status_message = status_message.as_str().ok_or_else(|| {
+            "Codex command hook statusMessage must be a string when present.".to_string()
+        })?;
+        normalized_handler.insert("statusMessage".to_string(), json!(status_message));
+    }
+
+    let mut identity = serde_json::Map::new();
+    identity.insert("event_name".to_string(), json!(event_label));
+    if let Some(matcher) = matcher {
+        identity.insert("matcher".to_string(), json!(matcher));
+    }
+    // Codex hashes each handler separately even when multiple handlers share
+    // one matcher group.  This is what lets Diff Forge trust only its own
+    // command without implicitly trusting a neighboring user hook.
+    identity.insert(
+        "hooks".to_string(),
+        Value::Array(vec![Value::Object(normalized_handler)]),
+    );
+    Ok(format!(
+        "sha256:{}",
+        diff_forge_activity_hook_canonical_sha256(&Value::Object(identity))
+    ))
+}
+
+fn codex_managed_activity_hook_trust_records(
+    hooks_path: &Path,
+    hooks_json: &Value,
+) -> Result<Vec<(String, String)>, String> {
+    let hooks = hooks_json
+        .get("hooks")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Codex hooks config must contain a hooks object.".to_string())?;
+    // Discovery canonicalizes the source file before constructing the trust
+    // key. Match that exactly: on macOS `/var/...` becomes `/private/var/...`,
+    // and keeping the lexical launch path would leave an otherwise correct
+    // hash untrusted. The hooks file has already been materialized above.
+    let key_source = fs::canonicalize(hooks_path).map_err(|error| {
+        format!(
+            "Unable to canonicalize Codex hooks config {} for trust: {error}",
+            hooks_path.display()
+        )
+    })?;
+    let key_source = key_source.to_string_lossy();
+    let mut records = Vec::new();
+
+    for (event_name, groups) in hooks {
+        let Some((event_label, matcher_supported)) =
+            codex_hook_event_trust_identity(event_name.as_str())
+        else {
+            continue;
+        };
+        let groups = groups.as_array().ok_or_else(|| {
+            format!("Codex {event_name} hooks config must contain an array of matcher groups.")
+        })?;
+        for (group_index, group) in groups.iter().enumerate() {
+            let group = group.as_object().ok_or_else(|| {
+                format!("Codex {event_name} matcher group {group_index} must be an object.")
+            })?;
+            let matcher = if matcher_supported {
+                match group.get("matcher") {
+                    Some(value) => Some(value.as_str().ok_or_else(|| {
+                        format!(
+                            "Codex {event_name} matcher group {group_index} matcher must be a string."
+                        )
+                    })?),
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let handlers = group
+                .get("hooks")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    format!(
+                        "Codex {event_name} matcher group {group_index} must contain a hooks array."
+                    )
+                })?;
+            for (handler_index, handler) in handlers.iter().enumerate() {
+                let Some(handler) = handler.as_object() else {
+                    continue;
+                };
+                if handler.get("type").and_then(Value::as_str) != Some("command") {
+                    continue;
+                }
+                let declared_command = handler
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let windows_command = handler
+                    .get("commandWindows")
+                    .or_else(|| handler.get("command_windows"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !declared_command.contains("--diff-forge-activity-hook")
+                    && !windows_command.contains("--diff-forge-activity-hook")
+                {
+                    continue;
+                }
+                if handler.get("async").and_then(Value::as_bool) == Some(true) {
+                    return Err(format!(
+                        "Diff Forge Codex activity hook {event_name}:{group_index}:{handler_index} cannot be async."
+                    ));
+                }
+                let current_hash = codex_hook_normalized_hash(event_label, matcher, handler)?;
+                records.push((
+                    format!(
+                        "{key_source}:{event_label}:{group_index}:{handler_index}"
+                    ),
+                    current_hash,
+                ));
+            }
+        }
+    }
+
+    if records.is_empty() {
+        return Err("Codex hooks config contains no Diff Forge activity hooks to trust.".to_string());
+    }
+    Ok(records)
+}
+
+fn codex_config_with_managed_hook_trust(
+    path: &Path,
+    records: &[(String, String)],
+) -> Result<Option<Vec<u8>>, String> {
+    let body = match fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(format!(
+                "Unable to read Codex hook-trust config {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let mut config = if body.trim().is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
+        toml::from_str::<toml::Value>(&body).map_err(|error| {
+            format!(
+                "Unable to parse Codex hook-trust config {}: {error}",
+                path.display()
+            )
+        })?
+    };
+    let root = config.as_table_mut().ok_or_else(|| {
+        format!(
+            "Codex hook-trust config {} must contain a TOML table.",
+            path.display()
+        )
+    })?;
+    let hooks = root
+        .entry("hooks".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| {
+            format!(
+                "Codex hook-trust config {} has an invalid hooks value.",
+                path.display()
+            )
+        })?;
+    let state = hooks
+        .entry("state".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| {
+            format!(
+                "Codex hook-trust config {} has an invalid hooks.state value.",
+                path.display()
+            )
+        })?;
+    let mut changed = false;
+    for (key, current_hash) in records {
+        let entry = state
+            .entry(key.clone())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+            .as_table_mut()
+            .ok_or_else(|| {
+                format!(
+                    "Codex hook-trust config {} has invalid state for {key}.",
+                    path.display()
+                )
+            })?;
+        if entry.get("trusted_hash").and_then(toml::Value::as_str)
+            != Some(current_hash.as_str())
+        {
+            entry.insert(
+                "trusted_hash".to_string(),
+                toml::Value::String(current_hash.clone()),
+            );
+            changed = true;
+        }
+        // A previously reviewed handler can still be explicitly disabled in
+        // the same state entry. Diff Forge owns these exact commands and
+        // requires them for UIR/push settlement, so make the managed handler
+        // active as well as trusted. This does not touch neighboring hooks.
+        if entry.get("enabled").and_then(toml::Value::as_bool) != Some(true) {
+            entry.insert("enabled".to_string(), toml::Value::Boolean(true));
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(None);
+    }
+    let mut body = toml::to_string_pretty(&config).map_err(|error| {
+        format!(
+            "Unable to serialize Codex hook-trust config {}: {error}",
+            path.display()
+        )
+    })?;
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    Ok(Some(body.into_bytes()))
+}
+
+fn persist_codex_managed_activity_hook_trust(
+    config_paths: &[&Path],
+    hooks_path: &Path,
+    hooks_json: &Value,
+) -> Result<bool, String> {
+    let records = codex_managed_activity_hook_trust_records(hooks_path, hooks_json)?;
+    // Serialize the base/profile pair as one pre-launch critical section so
+    // concurrent pane startup cannot preserve a stale profile override.
+    let _guard = AGENT_ACCOUNTS_PRIVATE_FILE_WRITE_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut updates = Vec::new();
+    for path in config_paths {
+        if let Some(bytes) = codex_config_with_managed_hook_trust(path, &records)? {
+            updates.push((path.to_path_buf(), bytes));
+        }
+    }
+    for (path, bytes) in &updates {
+        agent_accounts_write_private_file_atomic_unlocked(
+            path,
+            bytes,
+            "Codex managed hook trust",
+        )?;
+    }
+    Ok(!updates.is_empty())
 }
 
 fn terminal_toml_string_literal_value(value: &str) -> Option<String> {
@@ -12797,11 +13117,21 @@ fn run_agent_thread_turn_for_context(
     let working_directory = resolve_workspace_root_directory(request.working_directory.as_deref())?;
     let working_directory_text = working_directory.to_string_lossy().to_string();
     let mut launch_env_vars = env_vars.to_vec();
+    let resume_was_requested = terminal_clean_provider_session_id(Some(
+        &requested_provider_session_id,
+    ))
+    .is_some();
     let (launch_provider_session_id, codex_resume_home) = terminal_resolve_provider_resume_session(
         provider,
         terminal_clean_provider_session_id(Some(&requested_provider_session_id)),
         &working_directory_text,
     );
+    if matches!(provider, AgentProvider::Claude)
+        && resume_was_requested
+        && launch_provider_session_id.is_none()
+    {
+        return Err(terminal_claude_resume_unavailable_message());
+    }
     if let Some(home) = codex_resume_home.as_deref() {
         apply_codex_resume_home_env(
             &mut launch_env_vars,

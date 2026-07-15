@@ -100,6 +100,10 @@ import {
 } from "../snipping/snippingAnnotationTargets.js";
 import { sanitizeTerminalColor } from "../terminals/terminalColors.js";
 import AppSelect from "../app/AppSelect.jsx";
+import {
+  getSessionHistoryResumeAvailability,
+  invalidateClaudeSessionHistoryResumability,
+} from "./sessionHistoryResumability.js";
 
 function text(value, fallback = "") {
   const normalized = String(value ?? "").trim();
@@ -223,6 +227,16 @@ const SESSION_HISTORY_CACHE_LIMIT = 24;
 const SESSION_HISTORY_ENRICH_REFRESH_DELAY_MS = 250;
 const SESSION_HISTORY_SYNC_REFRESH_DELAY_MS = 900;
 const sessionHistoryCache = new Map();
+
+export function invalidateClaudeSessionHistoryCache() {
+  sessionHistoryCache.forEach((cached, cacheKey) => {
+    sessionHistoryCache.set(cacheKey, {
+      ...cached,
+      items: invalidateClaudeSessionHistoryResumability(jsonArray(cached?.items)),
+      updated_at_ms: Date.now(),
+    });
+  });
+}
 
 function sessionHistoryCacheKey(workspaceId, rootDirectory) {
   const workspaceKey = text(workspaceId);
@@ -5492,6 +5506,25 @@ function ArchitectureWorkspaceView({
       }
       unlisteners.push(unlisten);
     }).catch(() => {});
+    listen("agent-accounts-changed", (event) => {
+      if (cancelled) return;
+      const kind = String(event?.payload?.kind || "").trim().toLowerCase();
+      if (!kind || kind.includes("claude")) {
+        const invalidatedItems = invalidateClaudeSessionHistoryResumability(
+          sessionHistoryItemsRef.current,
+        );
+        sessionHistoryItemsRef.current = invalidatedItems;
+        writeSessionHistoryCache(cacheKey, invalidatedItems);
+        setSessionHistoryItems(invalidatedItems);
+        scheduleSessionHistoryRefresh(0, { fast: true });
+      }
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlisteners.push(unlisten);
+    }).catch(() => {});
     return () => {
       cancelled = true;
       if (sessionHistorySyncRefreshTimerRef.current) {
@@ -9821,6 +9854,7 @@ function SessionHistoryPanel({
             const terminalMatch = sessionHistoryFindExactTerminal(item, terminalOptions);
             const syncBadge = sessionHistoryChatSyncStatus(item);
             const providerSessionId = sessionHistoryProviderSessionId(item);
+            const resumeAvailability = getSessionHistoryResumeAvailability(item, providerSessionId);
             const forkParentSessionId = sessionHistoryForkParentSessionId(item);
             const hasForkParentRow = Boolean(forkParentSessionId && items.some((candidate) => (
               sessionHistoryRowMatchesSession(candidate, forkParentSessionId, sessionHistoryAgentKey(item))
@@ -9873,19 +9907,21 @@ function SessionHistoryPanel({
                             </SessionHistoryActionButton>
                           ) : (
                             <SessionHistoryActionButton
-                              aria-label={`Open terminal for ${sessionTitle}`}
+                              aria-label={resumeAvailability.canOpen
+                                ? `Open terminal for ${sessionTitle}`
+                                : `${sessionTitle} is not resumable on this device`}
                               data-variant="open"
-                              disabled={!providerSessionId}
+                              disabled={!resumeAvailability.canOpen}
                               onClick={() => onOpenTerminal?.({
                                 item,
                                 provider_session_id: providerSessionId,
                                 workspace_id: workspaceId,
                               })}
-                              title={providerSessionId ? "Open this session in a terminal" : "No provider session id recorded"}
+                              title={resumeAvailability.reason}
                               type="button"
                             >
                               <Add aria-hidden="true" />
-                              <span>Open</span>
+                              <span>{resumeAvailability.label}</span>
                             </SessionHistoryActionButton>
                           )}
                         </SessionHistoryActionGroup>
@@ -9897,6 +9933,9 @@ function SessionHistoryPanel({
                         <Sync aria-hidden="true" />
                         <span>{syncBadge.label}</span>
                       </SessionHistorySyncBadge>
+                      {resumeAvailability.remoteOnly && (
+                        <span title={resumeAvailability.reason}>not resumable on this device</span>
+                      )}
                       <span>created {formatRelativeTimeMs(createdMs) || formatTime(createdMs) || "unknown"}</span>
                       <span>latest {formatRelativeTimeMs(latestMs) || formatTime(latestMs) || "unknown"}</span>
                     </SessionHistoryMeta>

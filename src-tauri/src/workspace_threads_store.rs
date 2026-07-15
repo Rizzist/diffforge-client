@@ -138,6 +138,8 @@ struct WorkspaceAgentSessionHistoryItem {
     title: String,
     first_user_message: String,
     chat_sync: WorkspaceAgentSessionHistoryChatSync,
+    resumable: bool,
+    resume_unavailable_reason: String,
     source: String,
     created_at_ms: u64,
     latest_at_ms: u64,
@@ -1269,6 +1271,69 @@ fn workspace_agent_session_history_enrich_chat_sync(items: &mut [WorkspaceAgentS
     }
 }
 
+fn workspace_agent_session_history_enrich_resumability(
+    items: &mut [WorkspaceAgentSessionHistoryItem],
+) {
+    let has_claude = items.iter().any(|item| {
+        workspace_threads_clean_agent_id(if item.agent_id.trim().is_empty() {
+            &item.provider
+        } else {
+            &item.agent_id
+        })
+        .as_deref()
+            == Some("claude")
+    });
+    let claude_sessions = if has_claude {
+        claude_local_resume_index_for_launch()
+    } else {
+        HashMap::new()
+    };
+    for item in items {
+        let agent_id = workspace_threads_clean_agent_id(if item.agent_id.trim().is_empty() {
+            &item.provider
+        } else {
+            &item.agent_id
+        })
+        .unwrap_or_default();
+        let provider_session_id = workspace_agent_session_history_item_session_id(item)
+            .unwrap_or_default();
+        if provider_session_id.trim().is_empty() {
+            item.resumable = false;
+            item.resume_unavailable_reason = "No provider session id was recorded.".to_string();
+            continue;
+        }
+
+        if agent_id != "claude" {
+            // Codex/OpenCode keep their existing launch-time resolution. This
+            // flag is introduced for Claude's cross-device distinction and
+            // intentionally does not alter the other providers' affordances.
+            item.resumable = true;
+            item.resume_unavailable_reason.clear();
+            continue;
+        }
+
+        let cwd = workspace_agent_session_history_resume_cwd(item);
+        if claude_local_resume_index_contains(&claude_sessions, &provider_session_id, cwd) {
+            item.resumable = true;
+            item.resume_unavailable_reason.clear();
+        } else {
+            item.resumable = false;
+            item.resume_unavailable_reason = terminal_claude_resume_unavailable_message();
+        }
+    }
+}
+
+fn workspace_agent_session_history_resume_cwd(item: &WorkspaceAgentSessionHistoryItem) -> &str {
+    // Session History opens a new terminal at the workspace root, not at the
+    // historical pane's (possibly ephemeral worktree) cwd. Validate against
+    // the exact cwd that terminal_open will pass to Claude.
+    if item.workspace_root.trim().is_empty() {
+        item.cwd.as_str()
+    } else {
+        item.workspace_root.as_str()
+    }
+}
+
 fn workspace_agent_session_history_list_blocking(
     request: WorkspaceAgentSessionHistoryListRequest,
 ) -> Result<WorkspaceAgentSessionHistoryListResult, String> {
@@ -1366,6 +1431,8 @@ fn workspace_agent_session_history_list_blocking(
                     title: row.get(23)?,
                     first_user_message: String::new(),
                     chat_sync: WorkspaceAgentSessionHistoryChatSync::default(),
+                    resumable: true,
+                    resume_unavailable_reason: String::new(),
                     source: row.get(24)?,
                     created_at_ms,
                     latest_at_ms,
@@ -1382,6 +1449,7 @@ fn workspace_agent_session_history_list_blocking(
     items.retain(workspace_agent_session_history_item_is_visible);
     items = workspace_agent_session_history_dedupe_items(items);
     items = workspace_agent_session_history_limit_with_fork_parents(items, limit);
+    workspace_agent_session_history_enrich_resumability(&mut items);
     if !fast {
         workspace_agent_session_history_enrich_chat_sync(&mut items);
         workspace_agent_session_history_enrich_previews(&mut items);
@@ -3084,6 +3152,8 @@ mod workspace_threads_store_tests {
         assert_eq!(item.native_session_id, "codex-native-123");
         assert_eq!(item.status, "idle");
         assert_eq!(item.title, "Ada");
+        assert!(item.resumable);
+        assert!(item.resume_unavailable_reason.is_empty());
         assert_eq!(item.created_at_ms, 1000);
         assert_eq!(item.latest_at_ms, 3000);
         assert_eq!(item.terminal_index, Some(2));
@@ -3239,7 +3309,9 @@ mod workspace_threads_store_tests {
                         42i64,
                         2i64,
                         "slot-legacy",
-                        root_text,
+                        root.join(".agents/worktrees/slot-legacy")
+                            .to_string_lossy()
+                            .to_string(),
                         "idle",
                         "Second Prompt - Do Nothing",
                         "terminal_activity_hook:provider-session",
@@ -3263,6 +3335,16 @@ mod workspace_threads_store_tests {
         assert_eq!(result.items.len(), 1);
         let item = &result.items[0];
         assert_eq!(item.provider_session_id, "claude-session-legacy-123");
+        assert_ne!(item.cwd, item.workspace_root);
+        assert_eq!(
+            workspace_agent_session_history_resume_cwd(item),
+            item.workspace_root
+        );
+        assert!(!item.resumable);
+        assert_eq!(
+            item.resume_unavailable_reason,
+            terminal_claude_resume_unavailable_message()
+        );
         assert_eq!(item.created_at_ms, 1000);
         assert_eq!(item.latest_at_ms, 5000);
 

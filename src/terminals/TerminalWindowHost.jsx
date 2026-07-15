@@ -316,6 +316,7 @@ export default function TerminalWindowHost() {
     color_slot: params.color_slot,
     roleOptions: [],
     stateLabel: "",
+    stateTone: "neutral",
   }));
   const metaRef = useRef(meta);
 
@@ -808,7 +809,10 @@ export default function TerminalWindowHost() {
           <TerminalAgentLabel data-tauri-drag-region title={agentTitle}>
             {meta.agent_label || title}
           </TerminalAgentLabel>
-          <TerminalStateDebugBadge title={`Terminal state: ${stateBadgeLabel}`}>
+          <TerminalStateDebugBadge
+            data-tone={meta.stateTone || "neutral"}
+            title={`Terminal state: ${stateBadgeLabel}`}
+          >
             {stateBadgeLabel}
           </TerminalStateDebugBadge>
         </TerminalRailIdentity>

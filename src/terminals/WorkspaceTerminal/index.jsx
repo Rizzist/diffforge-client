@@ -408,6 +408,8 @@ import {
   parseTerminalStateTimestampMs,
   shouldSuppressThreadPropThinking,
   terminalAgentUsesActivityHooks,
+  terminalRailBadgePresentation,
+  terminalRailStateFromExecutionPhase,
 } from "../terminalActivityState.js";
 import {
   createWorkspaceThreadId,
@@ -508,6 +510,7 @@ import {
   createCodexResizeGateState,
   createCodexSlashMenuCloseCleanupState,
   createSlashCommandDiagnosticState,
+  getClaudeResumeExitMessage,
   extractNativeSessionIdFromOutput,
   findTerminalViewportAnchorMatch,
   getClaudeResizeDuplicateRepaintDecision,
@@ -1503,6 +1506,14 @@ function terminalActivityHookEventTypeFromPayload(payload = {}) {
 }
 
 function terminalActivityStatusFromHookPayload(payload = {}, eventType = "") {
+  const terminalPromptingUser = payload.terminal_is_prompting_user;
+  if (
+    terminalPromptingUser === true
+      || terminalPromptingUser === 1
+      || String(terminalPromptingUser || "").trim().toLowerCase() === "true"
+  ) {
+    return "awaiting_input";
+  }
   const explicitActivity = normalizeTerminalNativeRailState(
     payload.native_rail_state || payload.activity_status,
     "",
@@ -1555,11 +1566,14 @@ function resolveTerminalNativeRailState({
   parked = false,
   terminal_state: terminalState = "",
 } = {}) {
+  const activity = normalizeTerminalNativeRailState(activityStatus, "");
+  if (terminalRailStateFromExecutionPhase(activity, activity) === "awaiting_input") {
+    return "awaiting_input";
+  }
   if (parked) {
     return "paused";
   }
   const state = normalizeTerminalNativeRailState(terminalState, "");
-  const activity = normalizeTerminalNativeRailState(activityStatus, "");
   if (state && !["prewarmed", "running"].includes(state)) {
     return state;
   }
@@ -11260,6 +11274,11 @@ function WorkspaceTerminal({
           const shouldInspectTerminalText = outputSessionInspectionEnabled && (
             isFirstOutputChunk
             || (!capturedProviderSessionId && terminalThreadIdRef.current && outputChunks <= 80)
+            || (
+              terminalAgentKind === "claude"
+              && startupThreadProviderSessionId
+              && outputChunks <= 80
+            )
           );
           const visibleTerminalText = shouldInspectTerminalText
             ? String(payload.inspection_text || "")
@@ -11458,6 +11477,11 @@ function WorkspaceTerminal({
           const shouldInspectTerminalText = outputSessionInspectionEnabled && (
             isFirstOutputChunk
             || (!capturedProviderSessionId && terminalThreadIdRef.current && outputChunks <= 80)
+            || (
+              terminalAgentKind === "claude"
+              && startupThreadProviderSessionId
+              && outputChunks <= 80
+            )
           );
           const inspectionText = shouldInspectTerminalText
             ? stripLiveViewControlSequences(outputTextDecoder.decode(terminalData, { stream: true }))
@@ -11672,12 +11696,20 @@ function WorkspaceTerminal({
               });
               return;
             }
+            const claudeResumeExitMessage = getClaudeResumeExitMessage({
+              agentId: terminalAgentKind,
+              exitCode: event.payload.exit_code,
+              output: providerSessionErrorBuffer,
+              providerSessionId: startupThreadProviderSessionId,
+            });
             setPaneStage(
               "exited",
-              "Terminal Exited",
-              event.payload.exit_code == null
-                ? "Process ended."
-                : `Process exited with code ${event.payload.exit_code}.`,
+              claudeResumeExitMessage ? "Claude Session Unavailable" : "Terminal Exited",
+              claudeResumeExitMessage || (
+                event.payload.exit_code == null
+                  ? "Process ended."
+                  : `Process exited with code ${event.payload.exit_code}.`
+              ),
             );
             onThreadTerminalLifecycle?.({
               instance_id: terminalInstanceId,
@@ -17013,11 +17045,12 @@ function WorkspaceTerminal({
   const terminalStatusMode = isTerminalStatusErrorOverlay
     ? "detail"
     : terminalStatus?.mode || (terminalState === "starting" ? "compact" : "detail");
-  const terminalStateDebugLabel = formatTerminalNativeRailLabel(resolveTerminalNativeRailState({
+  const terminalStateDebugPresentation = terminalRailBadgePresentation(resolveTerminalNativeRailState({
     activity_status: terminalRuntimeActivityStatus || "idle",
     parked: Boolean(parkedPrompt),
     terminal_state: terminalState,
   }));
+  const terminalStateDebugLabel = terminalStateDebugPresentation.label;
 
   // Window Breakout bridge: while this pane lives in its own native window,
   // the grid pane (still mounted as the placeholder) stays the source of
@@ -17037,6 +17070,7 @@ function WorkspaceTerminal({
       roleOptions: getTerminalRoleSwitchOptions(agentStatuses)
         .map((option) => ({ id: option.id, label: option.label })),
       stateLabel: terminalStateDebugLabel,
+      stateTone: terminalStateDebugPresentation.tone,
     })
     : "";
 
@@ -17255,6 +17289,9 @@ function WorkspaceTerminal({
               : shellLauncherSelectedStatus
         : shellTerminalRailStateLabel
     : terminalStateDebugLabel;
+  const shellLauncherRailStateTone = isGenericTerminal
+    ? "neutral"
+    : terminalStateDebugPresentation.tone;
   const shellLauncherRailDotStyle = isGenericTerminal
     && shellLauncherSelectedAgentId !== SHELL_LAUNCHER_MODE_TERMINAL
       ? {
@@ -17324,7 +17361,10 @@ function WorkspaceTerminal({
           )}
           {!terminalChromeDocked && (
             <>
-              <TerminalStateDebugBadge title={`Terminal state: ${shellLauncherRailStateLabel}`}>
+              <TerminalStateDebugBadge
+                data-tone={shellLauncherRailStateTone}
+                title={`Terminal state: ${shellLauncherRailStateLabel}`}
+              >
                 {shellLauncherRailStateLabel}
               </TerminalStateDebugBadge>
               {showRemotePresence && (
