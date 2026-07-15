@@ -53,7 +53,9 @@ const TERMINAL_REMOTE_PRESENCE_DEBOUNCE_MS: u64 = 180;
 // The cloud app websocket currently forwards origin_connection_id on relayed
 // client frames, but not a per-origin leave/disconnect control frame. Presence
 // is therefore bounded by last-seen TTL in addition to explicit detach/unwatch.
-const TERMINAL_REMOTE_PRESENCE_STALE_ORIGIN_TTL_MS: u64 = 3 * 60 * 1000;
+// Viewers keep leases alive with heartbeats/keepalives; this TTL is a backstop,
+// and reaped origins are told via termio.expired so they can re-attach.
+const TERMINAL_REMOTE_PRESENCE_STALE_ORIGIN_TTL_MS: u64 = 10 * 60 * 1000;
 const TERMINAL_REMOTE_PRESENCE_REAPER_GRACE_MS: u64 = 1_000;
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT: &str = "cloud-mcp-workspace-todos-updated";
 const CLOUD_MCP_LOOPSPACES_UPDATED_EVENT: &str = "cloud-mcp-loopspaces-updated";
@@ -568,6 +570,7 @@ struct CloudMcpState {
         Arc<StdMutex<HashMap<String, HashMap<String, CloudMcpTerminalIoSubscription>>>>,
     terminal_io_control_owners: Arc<StdMutex<HashMap<String, CloudMcpTerminalIoControlOwner>>>,
     terminal_io_tail_by_stream: Arc<StdMutex<HashMap<String, CloudMcpTerminalIoTail>>>,
+    terminal_io_expired_recently_emitted: Arc<StdMutex<HashMap<(String, String), u64>>>,
     terminal_io_output_send_lock: Arc<Mutex<()>>,
     terminal_remote_presence_emit_scheduled: Arc<AtomicBool>,
     terminal_remote_presence_reaper_scheduled: Arc<AtomicBool>,
@@ -840,6 +843,7 @@ impl CloudMcpState {
             terminal_io_stream_subscriptions: Arc::new(StdMutex::new(HashMap::new())),
             terminal_io_control_owners: Arc::new(StdMutex::new(HashMap::new())),
             terminal_io_tail_by_stream: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_io_expired_recently_emitted: Arc::new(StdMutex::new(HashMap::new())),
             terminal_io_output_send_lock: Arc::new(Mutex::new(())),
             terminal_remote_presence_emit_scheduled: Arc::new(AtomicBool::new(false)),
             terminal_remote_presence_reaper_scheduled: Arc::new(AtomicBool::new(false)),
@@ -12879,8 +12883,11 @@ async fn cloud_mcp_open_global_ws(
     let websocket_config = WebSocketConfig::default()
         .max_message_size(Some(64 * 1024 * 1024))
         .max_frame_size(Some(32 * 1024 * 1024));
+    // disable_nagle=true sets TCP_NODELAY on the socket (tokio-tungstenite
+    // calls set_nodelay(true)); coalesced 16ms terminal frames must not also
+    // wait out Nagle's algorithm.
     let (stream, response) =
-        match connect_async_with_config(request, Some(websocket_config), false).await {
+        match connect_async_with_config(request, Some(websocket_config), true).await {
             Ok(result) => result,
             Err(error) => {
                 let message = format!(
@@ -30427,19 +30434,24 @@ fn cloud_mcp_terminal_remote_presence_origin_is_fresh(last_seen_ms: u64, now_ms:
     now_ms.saturating_sub(last_seen_ms) < TERMINAL_REMOTE_PRESENCE_STALE_ORIGIN_TTL_MS
 }
 
-fn cloud_mcp_prune_terminal_remote_presence_stale_origins_at(
+fn cloud_mcp_collect_terminal_remote_presence_stale_origins_at(
     state: &CloudMcpState,
     now_ms: u64,
-) -> bool {
+) -> (bool, Vec<(String, String)>) {
     let mut changed = false;
+    let mut expired: Vec<(String, String)> = Vec::new();
     if let Ok(mut subscriptions) = state.terminal_io_stream_subscriptions.lock() {
-        subscriptions.retain(|_, origins| {
+        subscriptions.retain(|stream_key, origins| {
             let before = origins.len();
-            origins.retain(|_, subscription| {
-                cloud_mcp_terminal_remote_presence_origin_is_fresh(
+            origins.retain(|origin, subscription| {
+                let fresh = cloud_mcp_terminal_remote_presence_origin_is_fresh(
                     subscription.last_seen_ms,
                     now_ms,
-                )
+                );
+                if !fresh {
+                    expired.push((stream_key.clone(), origin.clone()));
+                }
+                fresh
             });
             changed |= origins.len() != before;
             let keep = !origins.is_empty();
@@ -30449,8 +30461,17 @@ fn cloud_mcp_prune_terminal_remote_presence_stale_origins_at(
     }
     if let Ok(mut owners) = state.terminal_io_control_owners.lock() {
         let before = owners.len();
-        owners.retain(|_, owner| {
-            cloud_mcp_terminal_remote_presence_origin_is_fresh(owner.last_seen_ms, now_ms)
+        owners.retain(|stream_key, owner| {
+            let fresh =
+                cloud_mcp_terminal_remote_presence_origin_is_fresh(owner.last_seen_ms, now_ms);
+            if !fresh
+                && !expired
+                    .iter()
+                    .any(|(sk, origin)| sk == stream_key && origin == &owner.origin)
+            {
+                expired.push((stream_key.clone(), owner.origin.clone()));
+            }
+            fresh
         });
         changed |= owners.len() != before;
     }
@@ -30458,7 +30479,141 @@ fn cloud_mcp_prune_terminal_remote_presence_stale_origins_at(
         now_ms,
         TERMINAL_REMOTE_PRESENCE_STALE_ORIGIN_TTL_MS,
     );
+    (changed, expired)
+}
+
+fn cloud_mcp_prune_terminal_remote_presence_stale_origins_at(
+    state: &CloudMcpState,
+    now_ms: u64,
+) -> bool {
+    let (changed, expired) =
+        cloud_mcp_collect_terminal_remote_presence_stale_origins_at(state, now_ms);
+    if !expired.is_empty() {
+        // Collected under the std mutexes above; emit on the async runtime so
+        // no std Mutex is ever held across an await.
+        let state = state.clone();
+        tauri::async_runtime::spawn(async move {
+            cloud_mcp_publish_terminal_io_expired(&state, &expired).await;
+        });
+    }
     changed
+}
+
+// Hard cap on the recently-emitted expiry map. Accepted tradeoff: a burst of
+// more than 512 distinct (stream, origin) expiries inside one grace window
+// can evict entries early and let a duplicate termio.expired through — the
+// web handles expiries idempotently, so the degradation is benign.
+const CLOUD_MCP_TERMINAL_IO_EXPIRED_RECENT_MAX: usize = 512;
+
+fn cloud_mcp_terminal_io_expired_recent_prune(state: &CloudMcpState, now_ms: u64) {
+    if let Ok(mut recent) = state.terminal_io_expired_recently_emitted.lock() {
+        recent.retain(|_, emitted_at_ms| {
+            now_ms.saturating_sub(*emitted_at_ms)
+                <= TERMINAL_REMOTE_PRESENCE_REAPER_GRACE_MS.saturating_mul(2)
+        });
+    }
+}
+
+// Collection and emission of expiries are decoupled (spawned task), so a pair
+// can be stale by the time it is sent: an attach may have re-inserted the
+// lease, or a concurrent pruner may have collected the same pair. The gate
+// and the send are therefore one atomic step: the pair is re-checked against
+// BOTH lease tables and the frame is enqueued while the table guards are
+// still held — tx.send on the unbounded channel is synchronous and
+// non-blocking, so no await happens under the locks. A concurrent attach
+// either lands before the gate (the pair is suppressed) or after the enqueue
+// (the wire carries expired-then-attached, never attached-then-expired).
+// Nested lock order matches the sequential order used module-wide:
+// subscriptions, then owners; nothing acquires them in reverse.
+fn cloud_mcp_terminal_io_expired_emit_pair(
+    state: &CloudMcpState,
+    tx: &mpsc::UnboundedSender<Value>,
+    stream_key: &str,
+    origin: &str,
+    envelope: Value,
+    now_ms: u64,
+) -> bool {
+    let Ok(subscriptions) = state.terminal_io_stream_subscriptions.lock() else {
+        return false;
+    };
+    let Ok(owners) = state.terminal_io_control_owners.lock() else {
+        return false;
+    };
+    if subscriptions
+        .get(stream_key)
+        .is_some_and(|origins| origins.contains_key(origin))
+        || owners
+            .get(stream_key)
+            .is_some_and(|owner| owner.origin.as_str() == origin)
+    {
+        return false;
+    }
+    let Ok(mut recent) = state.terminal_io_expired_recently_emitted.lock() else {
+        // Poisoned dedupe bookkeeping must not block expiries entirely.
+        return tx.send(envelope).is_ok();
+    };
+    let key = (stream_key.to_string(), origin.to_string());
+    if recent.get(&key).is_some_and(|emitted_at_ms| {
+        now_ms.saturating_sub(*emitted_at_ms) < TERMINAL_REMOTE_PRESENCE_REAPER_GRACE_MS
+    }) {
+        return false;
+    }
+    // Recorded only AFTER a successful enqueue, with the guard held through
+    // the send: a task still holding the closed pre-reconnect sender must not
+    // record the pair and suppress a concurrent publisher that already owns
+    // the fresh one.
+    if tx.send(envelope).is_err() {
+        return false;
+    }
+    recent.insert(key, now_ms);
+    while recent.len() > CLOUD_MCP_TERMINAL_IO_EXPIRED_RECENT_MAX {
+        let Some(oldest) = recent
+            .iter()
+            .min_by_key(|(_, emitted_at_ms)| **emitted_at_ms)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        recent.remove(&oldest);
+    }
+    true
+}
+
+async fn cloud_mcp_publish_terminal_io_expired(
+    state: &CloudMcpState,
+    expired: &[(String, String)],
+) {
+    let tx = if let Some(tx) = state.global_ws_termio_tx.lock().await.as_ref().cloned() {
+        tx
+    } else if let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() {
+        tx
+    } else {
+        return;
+    };
+    let Ok(auth) = cloud_mcp_ws_auth_object(state).await else {
+        return;
+    };
+    let now_ms = cloud_mcp_now_ms();
+    cloud_mcp_terminal_io_expired_recent_prune(state, now_ms);
+    for (stream_key, origin) in expired {
+        let instance_id = cloud_mcp_terminal_io_target(stream_key)
+            .map(|target| target.instance_id)
+            .unwrap_or(0);
+        let envelope = json!({
+            "v": 1,
+            "kind": "termio.expired",
+            "contract": CLOUD_MCP_TERMINAL_IO_CONTRACT,
+            "auth": auth.clone(),
+            "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+            "id": format!("termio-expired-{instance_id}-{now_ms}"),
+            "sk": stream_key.as_str(),
+            "origin": origin.as_str(),
+            "reason": "viewer_lease_expired",
+        });
+        let _ = cloud_mcp_terminal_io_expired_emit_pair(
+            state, &tx, stream_key, origin, envelope, now_ms,
+        );
+    }
 }
 
 fn cloud_mcp_prune_terminal_remote_presence_stale_origins(state: &CloudMcpState) -> bool {
@@ -30479,6 +30634,59 @@ fn cloud_mcp_terminal_remote_presence_has_tracked_origins(state: &CloudMcpState)
     has_shell_viewers || has_shell_controllers || agent_chat_session_has_observed_terminal_origins()
 }
 
+fn cloud_mcp_terminal_remote_presence_next_reaper_delay_ms(
+    state: &CloudMcpState,
+    now_ms: u64,
+) -> Option<u64> {
+    let ceiling_ms = TERMINAL_REMOTE_PRESENCE_STALE_ORIGIN_TTL_MS
+        .saturating_add(TERMINAL_REMOTE_PRESENCE_REAPER_GRACE_MS);
+    let mut earliest_last_seen: Option<u64> = None;
+    let mut track = |last_seen_ms: u64| {
+        earliest_last_seen = Some(match earliest_last_seen {
+            Some(value) => value.min(last_seen_ms),
+            None => last_seen_ms,
+        });
+    };
+    if let Ok(subscriptions) = state.terminal_io_stream_subscriptions.lock() {
+        for origins in subscriptions.values() {
+            for subscription in origins.values() {
+                track(subscription.last_seen_ms);
+            }
+        }
+    }
+    if let Ok(owners) = state.terminal_io_control_owners.lock() {
+        for owner in owners.values() {
+            track(owner.last_seen_ms);
+        }
+    }
+    match earliest_last_seen {
+        // Sleep until the EARLIEST tracked lease can go stale, not a fixed
+        // TTL from arm time: a lease touched right after arming must still be
+        // reaped near its true deadline instead of surviving up to 2x TTL —
+        // that matters most for a vanished viewer holding control.
+        Some(last_seen_ms) => Some(
+            last_seen_ms
+                .saturating_add(ceiling_ms)
+                .saturating_sub(now_ms)
+                .clamp(TERMINAL_REMOTE_PRESENCE_REAPER_GRACE_MS, ceiling_ms),
+        ),
+        // Chat-observed terminal origins are pruned by the same pass but do
+        // not expose per-origin deadlines; fall back to the full interval.
+        None if agent_chat_session_has_observed_terminal_origins() => Some(ceiling_ms),
+        None => None,
+    }
+}
+
+// The exact sleep the spawned reaper task uses for its next pass; kept as a
+// standalone function so tests can pin the scheduling behavior at the same
+// seam the task calls.
+fn cloud_mcp_terminal_remote_presence_reaper_sleep_ms(state: &CloudMcpState, now_ms: u64) -> u64 {
+    cloud_mcp_terminal_remote_presence_next_reaper_delay_ms(state, now_ms).unwrap_or(
+        TERMINAL_REMOTE_PRESENCE_STALE_ORIGIN_TTL_MS
+            .saturating_add(TERMINAL_REMOTE_PRESENCE_REAPER_GRACE_MS),
+    )
+}
+
 fn cloud_mcp_schedule_terminal_remote_presence_reaper(state: &CloudMcpState) {
     if state
         .terminal_remote_presence_reaper_scheduled
@@ -30488,11 +30696,9 @@ fn cloud_mcp_schedule_terminal_remote_presence_reaper(state: &CloudMcpState) {
     }
     let state = state.clone();
     tauri::async_runtime::spawn(async move {
-        sleep(Duration::from_millis(
-            TERMINAL_REMOTE_PRESENCE_STALE_ORIGIN_TTL_MS
-                .saturating_add(TERMINAL_REMOTE_PRESENCE_REAPER_GRACE_MS),
-        ))
-        .await;
+        let delay_ms =
+            cloud_mcp_terminal_remote_presence_reaper_sleep_ms(&state, cloud_mcp_now_ms());
+        sleep(Duration::from_millis(delay_ms)).await;
         state
             .terminal_remote_presence_reaper_scheduled
             .store(false, Ordering::SeqCst);
@@ -30932,6 +31138,29 @@ fn cloud_mcp_terminal_io_has_control(
         .is_some_and(|owner| owner.origin.as_str() == origin)
 }
 
+fn cloud_mcp_terminal_io_heartbeat_ack_payload(
+    heartbeat_seq: u64,
+    subscribed: bool,
+    control: bool,
+    total_bytes: Option<u64>,
+) -> Value {
+    let mut payload = json!({
+        "seq": heartbeat_seq,
+        "q": heartbeat_seq,
+        "subscribed": subscribed,
+        "control": control,
+    });
+    // The byte clock lets the web audit an idle stream for lost replay or
+    // snapshot frames. When the headless output state is unavailable the
+    // fields are omitted entirely (old-device semantics: the web skips the
+    // audit rather than treating the stream as reset to 0).
+    if let (Some(object), Some(total_bytes)) = (payload.as_object_mut(), total_bytes) {
+        object.insert("n".to_string(), json!(total_bytes));
+        object.insert("total_bytes".to_string(), json!(total_bytes));
+    }
+    payload
+}
+
 fn cloud_mcp_terminal_io_attachment_refs(
     message: &Value,
 ) -> Result<Vec<ChatAttachmentRef>, String> {
@@ -31079,54 +31308,106 @@ async fn cloud_mcp_handle_terminal_io_message(
             cloud_mcp_schedule_terminal_remote_presence_reaper(state);
             cloud_mcp_schedule_terminal_remote_presence_emit(state, "termio_attach");
             let size = *instance.size.lock().await;
-            let (total, bytes, retained_tail_bytes) = {
+            let requested_from = cloud_mcp_payload_u64(message, &["from", "f", "from_total_bytes"])
+                .unwrap_or(0);
+            let resnapshot = cloud_mcp_payload_bool(message, &["resnapshot"], false);
+            let (total, retained_tail_bytes) = {
                 let output = instance.headless_output.lock().ok();
                 let total = output.as_ref().map(|value| value.total_bytes).unwrap_or(0);
-                let bytes = output
-                    .as_ref()
-                    .map(|value| value.vt_state())
-                    .unwrap_or_default();
                 let retained_tail_bytes =
                     output.as_ref().map(|value| value.tail.len()).unwrap_or(0);
-                (total, bytes, retained_tail_bytes)
+                (total, retained_tail_bytes)
             };
-            let seq = state
-                .terminal_io_tail_by_stream
-                .lock()
-                .ok()
-                .and_then(|tails| tails.get(&target.stream_key).map(|tail| tail.seq))
-                .unwrap_or(0);
-            let _ = cloud_mcp_send_terminal_io_message(
+            let replay = cloud_mcp_terminal_output_resume_replay(
                 state,
-                Some(message),
-                &target,
-                "termio.attached",
-                request_id.clone(),
-                json!({"attachment_id": request_id, "cols": size.cols, "rows": size.rows, "seq": seq, "q": seq, "f": total, "n": total, "from_total_bytes": total, "total_bytes": total, "mode": "vt", "retained_tail_bytes": retained_tail_bytes}),
-            )
-            .await;
-            let _ = cloud_mcp_send_terminal_io_message(
-                state,
-                Some(message),
-                &target,
-                "termio.snapshot",
-                format!("{}-snapshot", request_id),
-                json!({
-                    "attachment_id": request_id,
-                    "q": seq,
-                    "seq": seq,
-                    "f": total,
-                    "n": total,
-                    "from_total_bytes": total,
-                    "total_bytes": total,
-                    "b": general_purpose::STANDARD.encode(bytes),
-                    "mode": "vt",
-                    "reset": true,
-                    "truncated": false,
-                    "retained_tail_bytes": retained_tail_bytes,
-                }),
-            )
-            .await;
+                &target.stream_key,
+                requested_from,
+                resnapshot,
+                total,
+            );
+            if let Some((seq, replay_from, replay_bytes)) = replay {
+                // Resume reports the CLIENT's byte clock (f=n=from): the web
+                // reducer only applies output frames whose n advances past its
+                // current n, so reporting the desktop total here would make it
+                // drop the replay range sent below.
+                let _ = cloud_mcp_send_terminal_io_message(
+                    state,
+                    Some(message),
+                    &target,
+                    "termio.attached",
+                    request_id.clone(),
+                    json!({"attachment_id": request_id, "cols": size.cols, "rows": size.rows, "seq": seq, "q": seq, "f": replay_from, "n": replay_from, "from_total_bytes": replay_from, "total_bytes": replay_from, "mode": "vt", "resume": true, "retained_tail_bytes": retained_tail_bytes, "capabilities": ["resume", "expired", "hb_sub"]}),
+                )
+                .await;
+                for (chunk_from, chunk_to, chunk) in
+                    cloud_mcp_terminal_output_replay_chunks(replay_from, &replay_bytes)
+                {
+                    let _ = cloud_mcp_send_terminal_io_message(
+                        state,
+                        Some(message),
+                        &target,
+                        "termio.output",
+                        format!(
+                            "termio-replay-{}-{}-{}",
+                            target.instance_id, seq, chunk_from
+                        ),
+                        json!({
+                            "q": seq,
+                            "seq": seq,
+                            "f": chunk_from,
+                            "n": chunk_to,
+                            "from_total_bytes": chunk_from,
+                            "total_bytes": chunk_to,
+                            "b": general_purpose::STANDARD.encode(chunk),
+                        }),
+                    )
+                    .await;
+                }
+            } else {
+                let bytes = instance
+                    .headless_output
+                    .lock()
+                    .ok()
+                    .map(|output| output.vt_state())
+                    .unwrap_or_default();
+                let seq = state
+                    .terminal_io_tail_by_stream
+                    .lock()
+                    .ok()
+                    .and_then(|tails| tails.get(&target.stream_key).map(|tail| tail.seq))
+                    .unwrap_or(0);
+                let _ = cloud_mcp_send_terminal_io_message(
+                    state,
+                    Some(message),
+                    &target,
+                    "termio.attached",
+                    request_id.clone(),
+                    json!({"attachment_id": request_id, "cols": size.cols, "rows": size.rows, "seq": seq, "q": seq, "f": total, "n": total, "from_total_bytes": total, "total_bytes": total, "mode": "vt", "retained_tail_bytes": retained_tail_bytes, "capabilities": ["resume", "expired", "hb_sub"]}),
+                )
+                .await;
+                let _ = cloud_mcp_send_terminal_io_message(
+                    state,
+                    Some(message),
+                    &target,
+                    "termio.snapshot",
+                    format!("{}-snapshot", request_id),
+                    json!({
+                        "attachment_id": request_id,
+                        "q": seq,
+                        "seq": seq,
+                        "f": total,
+                        "n": total,
+                        "from_total_bytes": total,
+                        "total_bytes": total,
+                        "b": general_purpose::STANDARD.encode(bytes),
+                        "mode": "vt",
+                        "reset": true,
+                        "truncated": false,
+                        "retained_tail_bytes": retained_tail_bytes,
+                    }),
+                )
+                .await;
+            }
         }
         "termio.detach" => {
             let attachment_id = cloud_mcp_payload_text(message, &["attachment_id", "attach_id"]);
@@ -31227,13 +31508,31 @@ async fn cloud_mcp_handle_terminal_io_message(
         }
         "termio.heartbeat" => {
             let heartbeat_seq = cloud_mcp_payload_u64(message, &["seq", "q"]).unwrap_or(0);
+            let subscribed =
+                cloud_mcp_terminal_io_origin_is_subscribed(state, &target.stream_key, &origin);
+            let control = cloud_mcp_terminal_io_has_control(state, &target.stream_key, &origin);
+            // The byte-clock read AND the ack enqueue happen under the output
+            // send lock: otherwise the ack could report a total whose delta
+            // has not been enqueued yet, and the web would see ack(N) before
+            // output(N) and spuriously degrade to resume during live output.
+            let _send_guard = state.terminal_io_output_send_lock.lock().await;
+            let total_bytes = instance
+                .headless_output
+                .lock()
+                .ok()
+                .map(|output| output.total_bytes);
             let _ = cloud_mcp_send_terminal_io_message(
                 state,
                 Some(message),
                 &target,
                 "termio.heartbeat.ack",
                 request_id,
-                json!({"seq": heartbeat_seq, "q": heartbeat_seq}),
+                cloud_mcp_terminal_io_heartbeat_ack_payload(
+                    heartbeat_seq,
+                    subscribed,
+                    control,
+                    total_bytes,
+                ),
             )
             .await;
         }
@@ -31655,6 +31954,22 @@ fn cloud_mcp_terminal_output_stream_is_subscribed(state: &CloudMcpState, stream_
         .unwrap_or(false)
 }
 
+fn cloud_mcp_terminal_io_origin_is_subscribed(
+    state: &CloudMcpState,
+    stream_key: &str,
+    origin: &str,
+) -> bool {
+    state
+        .terminal_io_stream_subscriptions
+        .lock()
+        .map(|subscriptions| {
+            subscriptions
+                .get(stream_key)
+                .is_some_and(|origins| origins.contains_key(origin))
+        })
+        .unwrap_or(false)
+}
+
 fn cloud_mcp_terminal_output_stream_key(
     device_id: &str,
     workspace_id: &str,
@@ -31672,6 +31987,7 @@ fn cloud_mcp_terminal_output_stream_key(
 }
 
 const CLOUD_MCP_TERMINAL_OUTPUT_REPLAY_TAIL_BYTES: usize = TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES;
+const CLOUD_MCP_TERMINAL_OUTPUT_REPLAY_CHUNK_BYTES: usize = 48 * 1024;
 
 fn cloud_mcp_remember_terminal_output_tail(
     state: &CloudMcpState,
@@ -31716,7 +32032,6 @@ fn cloud_mcp_remember_terminal_output_tail(
     true
 }
 
-#[cfg(test)]
 fn cloud_mcp_terminal_output_replay_frame(
     state: &CloudMcpState,
     stream_key: &str,
@@ -31747,6 +32062,57 @@ fn cloud_mcp_terminal_output_replay_frame(
         tail.tail[start_index..].to_vec(),
         truncated,
     ))
+}
+
+fn cloud_mcp_terminal_output_resume_replay(
+    state: &CloudMcpState,
+    stream_key: &str,
+    requested_from: u64,
+    resnapshot: bool,
+    headless_total_bytes: u64,
+) -> Option<(u64, u64, Vec<u8>)> {
+    if resnapshot || requested_from == 0 {
+        return None;
+    }
+    // A caught-up viewer (idle terminal whose lease expired) resumes with
+    // zero replay frames instead of a reset+repaint snapshot — but only when
+    // a retained tail entry proves both byte clocks belong to the same
+    // terminal generation; a pruned tail entry cannot verify that. Checked
+    // against the tail entry directly because the replay frame requires a
+    // non-empty tail buffer.
+    let (tail_seq, tail_total_bytes) =
+        state.terminal_io_tail_by_stream.lock().ok().and_then(|tails| {
+            tails
+                .get(stream_key)
+                .map(|tail| (tail.seq, tail.total_bytes))
+        })?;
+    if requested_from == tail_total_bytes && tail_total_bytes == headless_total_bytes {
+        return Some((tail_seq, requested_from, Vec::new()));
+    }
+    let (seq, replay_from, replay_total, replay_bytes, truncated) =
+        cloud_mcp_terminal_output_replay_frame(state, stream_key, requested_from)?;
+    // The replay tail and the headless byte clock advance together under the
+    // output send lock; a truncated tail cannot reconstruct the requested
+    // range, and a total mismatch means the tail belongs to a different byte
+    // clock (terminal restart) — both fall back to the full snapshot.
+    if truncated || replay_total != headless_total_bytes {
+        return None;
+    }
+    Some((seq, replay_from, replay_bytes))
+}
+
+fn cloud_mcp_terminal_output_replay_chunks(
+    replay_from: u64,
+    replay_bytes: &[u8],
+) -> Vec<(u64, u64, &[u8])> {
+    let mut chunks = Vec::new();
+    let mut chunk_from = replay_from;
+    for chunk in replay_bytes.chunks(CLOUD_MCP_TERMINAL_OUTPUT_REPLAY_CHUNK_BYTES) {
+        let chunk_to = chunk_from.saturating_add(chunk.len() as u64);
+        chunks.push((chunk_from, chunk_to, chunk));
+        chunk_from = chunk_to;
+    }
+    chunks
 }
 
 pub(crate) fn cloud_mcp_publish_terminal_output_delta(
@@ -57570,6 +57936,138 @@ mod cloud_mcp_tests {
     }
 
     #[test]
+    fn termio_resume_replay_serves_covered_tail_slice_with_chunked_offsets() {
+        let state = CloudMcpState::new();
+        let stream_key = "device:workspace:pane:21";
+        let head = vec![b'a'; 40];
+        let rest = vec![b'r'; CLOUD_MCP_TERMINAL_OUTPUT_REPLAY_CHUNK_BYTES + 500];
+        assert!(cloud_mcp_remember_terminal_output_tail(
+            &state,
+            stream_key,
+            1,
+            head.len() as u64,
+            &head,
+        ));
+        let total = (head.len() + rest.len()) as u64;
+        assert!(cloud_mcp_remember_terminal_output_tail(
+            &state, stream_key, 2, total, &rest,
+        ));
+
+        let (seq, replay_from, replay_bytes) =
+            cloud_mcp_terminal_output_resume_replay(&state, stream_key, 40, false, total)
+                .expect("covered tail resumes");
+        assert_eq!((seq, replay_from), (2, 40));
+        assert_eq!(replay_bytes, rest);
+
+        let chunks = cloud_mcp_terminal_output_replay_chunks(replay_from, &replay_bytes);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(
+            (chunks[0].0, chunks[0].1),
+            (40, 40 + CLOUD_MCP_TERMINAL_OUTPUT_REPLAY_CHUNK_BYTES as u64)
+        );
+        assert_eq!(chunks[0].2.len(), CLOUD_MCP_TERMINAL_OUTPUT_REPLAY_CHUNK_BYTES);
+        assert_eq!((chunks[1].0, chunks[1].1), (chunks[0].1, total));
+        assert_eq!(chunks[1].2, &replay_bytes[CLOUD_MCP_TERMINAL_OUTPUT_REPLAY_CHUNK_BYTES..]);
+        let ids = chunks
+            .iter()
+            .map(|(chunk_from, _, _)| format!("termio-replay-21-{seq}-{chunk_from}"))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), chunks.len());
+
+        // A caught-up viewer (idle terminal re-attach) resumes with zero
+        // replay frames and keeps the client byte clock (f=n=from), instead
+        // of a reset+repaint snapshot.
+        let (caught_up_seq, caught_up_from, caught_up_bytes) =
+            cloud_mcp_terminal_output_resume_replay(&state, stream_key, total, false, total)
+                .expect("caught-up viewer resumes");
+        assert_eq!((caught_up_seq, caught_up_from), (2, total));
+        assert!(caught_up_bytes.is_empty());
+        assert!(cloud_mcp_terminal_output_replay_chunks(caught_up_from, &caught_up_bytes)
+            .is_empty());
+
+        // Non-resume attaches keep the snapshot path: no `from` or an explicit
+        // resnapshot must never yield a replay.
+        assert!(cloud_mcp_terminal_output_resume_replay(&state, stream_key, 0, false, total)
+            .is_none());
+        assert!(
+            cloud_mcp_terminal_output_resume_replay(&state, stream_key, 40, true, total).is_none()
+        );
+        assert!(
+            cloud_mcp_terminal_output_resume_replay(&state, stream_key, total, true, total)
+                .is_none()
+        );
+        // Replaying must not mutate the tail bookkeeping.
+        let tails = state.terminal_io_tail_by_stream.lock().unwrap();
+        let tail = tails.get(stream_key).expect("tail retained");
+        assert_eq!((tail.seq, tail.total_bytes), (2, total));
+        assert_eq!(tail.tail.len(), head.len() + rest.len());
+    }
+
+    #[test]
+    fn termio_resume_replay_falls_back_to_snapshot_when_tail_cannot_cover() {
+        let state = CloudMcpState::new();
+        let stream_key = "device:workspace:pane:22";
+        let bytes = vec![b'x'; CLOUD_MCP_TERMINAL_OUTPUT_REPLAY_TAIL_BYTES + 17];
+        let total = bytes.len() as u64;
+        assert!(cloud_mcp_remember_terminal_output_tail(
+            &state, stream_key, 1, total, &bytes,
+        ));
+        // The tail starts at offset 17: a client clock inside the evicted
+        // range would need a truncated replay, so it falls back to snapshot.
+        assert!(
+            cloud_mcp_terminal_output_resume_replay(&state, stream_key, 5, false, total).is_none()
+        );
+        // A tail total that disagrees with the live headless byte clock means
+        // the retained tail is from another terminal generation.
+        assert!(cloud_mcp_terminal_output_resume_replay(
+            &state,
+            stream_key,
+            total - 3,
+            false,
+            total + 9,
+        )
+        .is_none());
+        // A viewer caught up to the TAIL's clock still snapshots when the
+        // live headless clock disagrees (different terminal generation).
+        assert!(cloud_mcp_terminal_output_resume_replay(
+            &state,
+            stream_key,
+            total,
+            false,
+            total + 9,
+        )
+        .is_none());
+        // Unknown streams have no tail at all.
+        assert!(cloud_mcp_terminal_output_resume_replay(
+            &state,
+            "device:workspace:pane:404",
+            10,
+            false,
+            20,
+        )
+        .is_none());
+        // A caught-up viewer whose stream pruned its tail entry entirely
+        // cannot verify the generation, so it falls back to snapshot too.
+        assert!(cloud_mcp_terminal_output_resume_replay(
+            &state,
+            "device:workspace:pane:404",
+            20,
+            false,
+            20,
+        )
+        .is_none());
+        // A covered offset still resumes.
+        assert!(cloud_mcp_terminal_output_resume_replay(
+            &state,
+            stream_key,
+            total - 3,
+            false,
+            total,
+        )
+        .is_some());
+    }
+
+    #[test]
     fn termio_vt_snapshot_rehydrates_the_current_screen_not_raw_history() {
         let mut output = TerminalHeadlessOutputBuffer::new(3, 20);
         output.append(b"old line\r\nsecond line");
@@ -57827,6 +58325,562 @@ mod cloud_mcp_tests {
             Some(11),
         ));
         let _ = agent_chat_session_clear_observed_terminals();
+    }
+
+    #[test]
+    fn termio_stale_reap_collects_expired_stream_origin_pairs() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let _ = agent_chat_session_clear_observed_terminals();
+        let state = CloudMcpState::new();
+        let now_ms = cloud_mcp_now_ms();
+        let stale_seen_ms =
+            now_ms.saturating_sub(TERMINAL_REMOTE_PRESENCE_STALE_ORIGIN_TTL_MS + 5_000);
+        let stream_a = "device:workspace:pane:31".to_string();
+        let stream_b = "device:workspace:pane:32".to_string();
+        state
+            .terminal_io_stream_subscriptions
+            .lock()
+            .unwrap()
+            .insert(
+                stream_a.clone(),
+                HashMap::from([
+                    (
+                        "viewer-expired".to_string(),
+                        CloudMcpTerminalIoSubscription {
+                            attachment_id: "attach-expired".to_string(),
+                            last_seen_ms: stale_seen_ms,
+                        },
+                    ),
+                    (
+                        "viewer-live".to_string(),
+                        CloudMcpTerminalIoSubscription {
+                            attachment_id: "attach-live".to_string(),
+                            last_seen_ms: now_ms,
+                        },
+                    ),
+                ]),
+            );
+        state
+            .terminal_io_stream_subscriptions
+            .lock()
+            .unwrap()
+            .insert(
+                stream_b.clone(),
+                HashMap::from([(
+                    "viewer-b".to_string(),
+                    CloudMcpTerminalIoSubscription {
+                        attachment_id: "attach-b".to_string(),
+                        last_seen_ms: stale_seen_ms,
+                    },
+                )]),
+            );
+        // The control owner shares an origin with an expired subscription on
+        // the same stream: the pair must be reported once, not twice.
+        state.terminal_io_control_owners.lock().unwrap().insert(
+            stream_a.clone(),
+            CloudMcpTerminalIoControlOwner {
+                origin: "viewer-expired".to_string(),
+                last_seen_ms: stale_seen_ms,
+            },
+        );
+
+        let (changed, mut expired) =
+            cloud_mcp_collect_terminal_remote_presence_stale_origins_at(&state, now_ms);
+        assert!(changed);
+        expired.sort();
+        assert_eq!(
+            expired,
+            vec![
+                (stream_a.clone(), "viewer-expired".to_string()),
+                (stream_b.clone(), "viewer-b".to_string()),
+            ]
+        );
+        let subscriptions = state.terminal_io_stream_subscriptions.lock().unwrap();
+        assert_eq!(
+            subscriptions
+                .get(&stream_a)
+                .map(|origins| origins.keys().cloned().collect::<Vec<_>>()),
+            Some(vec!["viewer-live".to_string()])
+        );
+        assert!(subscriptions.get(&stream_b).is_none());
+        drop(subscriptions);
+        assert!(state.terminal_io_control_owners.lock().unwrap().is_empty());
+        let _ = agent_chat_session_clear_observed_terminals();
+    }
+
+    #[test]
+    fn terminal_remote_presence_reaper_tracks_earliest_deadline_not_double_ttl() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let _ = agent_chat_session_clear_observed_terminals();
+        let state = CloudMcpState::new();
+        let stream_key = "device:workspace:pane:41".to_string();
+        let ceiling_ms = TERMINAL_REMOTE_PRESENCE_STALE_ORIGIN_TTL_MS
+            .saturating_add(TERMINAL_REMOTE_PRESENCE_REAPER_GRACE_MS);
+        // Simulated clock: the reaper math takes explicit now_ms/last_seen_ms,
+        // so the drift scenario is driven without wall-clock sleeps.
+        let t0 = 1_000_000_000_u64;
+        state
+            .terminal_io_stream_subscriptions
+            .lock()
+            .unwrap()
+            .insert(
+                stream_key.clone(),
+                HashMap::from([(
+                    "viewer-drift".to_string(),
+                    CloudMcpTerminalIoSubscription {
+                        attachment_id: "attach-drift".to_string(),
+                        last_seen_ms: t0,
+                    },
+                )]),
+            );
+        state.terminal_io_control_owners.lock().unwrap().insert(
+            stream_key.clone(),
+            CloudMcpTerminalIoControlOwner {
+                origin: "viewer-drift".to_string(),
+                last_seen_ms: t0,
+            },
+        );
+        // Arm at attach time: first pass waits the full interval. Asserted
+        // through the same function the spawned reaper task calls to pick
+        // its sleep, so a revert to fixed-interval scheduling fails here.
+        assert_eq!(
+            cloud_mcp_terminal_remote_presence_reaper_sleep_ms(&state, t0),
+            ceiling_ms
+        );
+        // Heartbeat 2s after arming extends the lease deadline.
+        let touched_ms = t0 + 2_000;
+        if let Ok(mut subscriptions) = state.terminal_io_stream_subscriptions.lock() {
+            for origins in subscriptions.values_mut() {
+                for subscription in origins.values_mut() {
+                    subscription.last_seen_ms = touched_ms;
+                }
+            }
+        }
+        if let Ok(mut owners) = state.terminal_io_control_owners.lock() {
+            for owner in owners.values_mut() {
+                owner.last_seen_ms = touched_ms;
+            }
+        }
+        // The armed pass wakes at t0+ceiling and must NOT reap the touched lease.
+        let wake_ms = t0 + ceiling_ms;
+        assert!(!cloud_mcp_prune_terminal_remote_presence_stale_origins_at(
+            &state, wake_ms
+        ));
+        assert!(cloud_mcp_terminal_io_origin_is_subscribed(
+            &state,
+            &stream_key,
+            "viewer-drift",
+        ));
+        // Reschedule from the earliest tracked deadline: 2s out (the touch
+        // delta), clamped to the grace floor — NOT another full TTL, so the
+        // lease dies within grace-plus-clamp of its true deadline instead of
+        // surviving ~2x TTL while holding control.
+        let next_delay_ms = cloud_mcp_terminal_remote_presence_reaper_sleep_ms(&state, wake_ms);
+        assert_eq!(next_delay_ms, 2_000);
+        assert!(next_delay_ms >= TERMINAL_REMOTE_PRESENCE_REAPER_GRACE_MS);
+        assert!(next_delay_ms < ceiling_ms);
+        assert!(cloud_mcp_prune_terminal_remote_presence_stale_origins_at(
+            &state,
+            wake_ms + next_delay_ms,
+        ));
+        assert!(state
+            .terminal_io_stream_subscriptions
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert!(state.terminal_io_control_owners.lock().unwrap().is_empty());
+        // Nothing tracked: the reaper is allowed to disarm, and a spuriously
+        // armed task falls back to the full interval.
+        assert_eq!(
+            cloud_mcp_terminal_remote_presence_next_reaper_delay_ms(
+                &state,
+                wake_ms + next_delay_ms,
+            ),
+            None
+        );
+        assert_eq!(
+            cloud_mcp_terminal_remote_presence_reaper_sleep_ms(&state, wake_ms + next_delay_ms),
+            ceiling_ms
+        );
+        let _ = agent_chat_session_clear_observed_terminals();
+    }
+
+    #[tokio::test]
+    async fn terminal_remote_presence_reaper_task_reaps_overdue_lease_promptly() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let _ = agent_chat_session_clear_observed_terminals();
+        let state = CloudMcpState::new();
+        let stream_key = "device:workspace:pane:61".to_string();
+        let overdue_ms = cloud_mcp_now_ms()
+            .saturating_sub(TERMINAL_REMOTE_PRESENCE_STALE_ORIGIN_TTL_MS + 10_000);
+        state
+            .terminal_io_stream_subscriptions
+            .lock()
+            .unwrap()
+            .insert(
+                stream_key.clone(),
+                HashMap::from([(
+                    "viewer-overdue".to_string(),
+                    CloudMcpTerminalIoSubscription {
+                        attachment_id: "attach-overdue".to_string(),
+                        last_seen_ms: overdue_ms,
+                    },
+                )]),
+            );
+        // An already-overdue lease clamps the task's sleep to the grace floor.
+        assert_eq!(
+            cloud_mcp_terminal_remote_presence_reaper_sleep_ms(&state, cloud_mcp_now_ms()),
+            TERMINAL_REMOTE_PRESENCE_REAPER_GRACE_MS
+        );
+        // Drive the REAL spawned reaper task: with deadline-based scheduling
+        // it fires within roughly the grace floor; a fixed TTL+grace interval
+        // would leave the lease alive for the full TTL and fail this budget.
+        cloud_mcp_schedule_terminal_remote_presence_reaper(&state);
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            if state
+                .terminal_io_stream_subscriptions
+                .lock()
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reaper task did not reap the overdue lease within the deadline budget",
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+        let _ = agent_chat_session_clear_observed_terminals();
+    }
+
+    #[test]
+    fn termio_expired_emission_suppresses_reattached_and_duplicate_pairs() {
+        let state = CloudMcpState::new();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+        let stream_key = "device:workspace:pane:51";
+        let origin = "viewer-flap";
+        let now_ms = 2_000_000_000_u64;
+        let envelope = json!({"kind": "termio.expired", "sk": stream_key, "origin": origin});
+        // A reaped pair with no live lease is enqueued.
+        assert!(cloud_mcp_terminal_io_expired_emit_pair(
+            &state,
+            &tx,
+            stream_key,
+            origin,
+            envelope.clone(),
+            now_ms,
+        ));
+        assert_eq!(rx.try_recv().ok(), Some(envelope.clone()));
+        // Double collection (two concurrent pruners) enqueues exactly once.
+        assert!(!cloud_mcp_terminal_io_expired_emit_pair(
+            &state,
+            &tx,
+            stream_key,
+            origin,
+            envelope.clone(),
+            now_ms + 10,
+        ));
+        assert!(rx.try_recv().is_err());
+        // Once the grace window has passed, a fresh expiry may emit again.
+        assert!(cloud_mcp_terminal_io_expired_emit_pair(
+            &state,
+            &tx,
+            stream_key,
+            origin,
+            envelope.clone(),
+            now_ms + TERMINAL_REMOTE_PRESENCE_REAPER_GRACE_MS,
+        ));
+        assert_eq!(rx.try_recv().ok(), Some(envelope.clone()));
+        // A lease re-inserted between collection and emission (the attach won
+        // the gate's lock) suppresses the stale expiry for that pair...
+        let stream_b = "device:workspace:pane:52";
+        state
+            .terminal_io_stream_subscriptions
+            .lock()
+            .unwrap()
+            .insert(
+                stream_b.to_string(),
+                HashMap::from([(
+                    origin.to_string(),
+                    CloudMcpTerminalIoSubscription {
+                        attachment_id: "attach-flap".to_string(),
+                        last_seen_ms: now_ms,
+                    },
+                )]),
+            );
+        assert!(!cloud_mcp_terminal_io_expired_emit_pair(
+            &state,
+            &tx,
+            stream_b,
+            origin,
+            envelope.clone(),
+            now_ms,
+        ));
+        assert!(rx.try_recv().is_err());
+        // ...and the suppression is NOT recorded as an emission.
+        assert!(!state
+            .terminal_io_expired_recently_emitted
+            .lock()
+            .unwrap()
+            .contains_key(&(stream_b.to_string(), origin.to_string())));
+        // Regained control alone also counts as a live lease.
+        let stream_c = "device:workspace:pane:53";
+        state.terminal_io_control_owners.lock().unwrap().insert(
+            stream_c.to_string(),
+            CloudMcpTerminalIoControlOwner {
+                origin: origin.to_string(),
+                last_seen_ms: now_ms,
+            },
+        );
+        assert!(!cloud_mcp_terminal_io_expired_emit_pair(
+            &state,
+            &tx,
+            stream_c,
+            origin,
+            envelope.clone(),
+            now_ms,
+        ));
+        assert!(rx.try_recv().is_err());
+        assert!(!state
+            .terminal_io_expired_recently_emitted
+            .lock()
+            .unwrap()
+            .contains_key(&(stream_c.to_string(), origin.to_string())));
+        // The batch prune drops entries older than twice the grace window.
+        cloud_mcp_terminal_io_expired_recent_prune(
+            &state,
+            now_ms
+                + TERMINAL_REMOTE_PRESENCE_REAPER_GRACE_MS
+                + TERMINAL_REMOTE_PRESENCE_REAPER_GRACE_MS.saturating_mul(2)
+                + 1,
+        );
+        assert!(state
+            .terminal_io_expired_recently_emitted
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn termio_expired_recent_map_is_bounded_by_hard_cap() {
+        let state = CloudMcpState::new();
+        let (tx, _rx) = mpsc::unbounded_channel::<Value>();
+        let base_ms = 3_000_000_000_u64;
+        for index in 0..=CLOUD_MCP_TERMINAL_IO_EXPIRED_RECENT_MAX {
+            let stream_key = format!("device:workspace:pane-{index}:71");
+            assert!(cloud_mcp_terminal_io_expired_emit_pair(
+                &state,
+                &tx,
+                &stream_key,
+                "viewer-cap",
+                json!({"index": index}),
+                base_ms + index as u64,
+            ));
+        }
+        let recent = state.terminal_io_expired_recently_emitted.lock().unwrap();
+        assert_eq!(recent.len(), CLOUD_MCP_TERMINAL_IO_EXPIRED_RECENT_MAX);
+        // The oldest entry by emission timestamp is the one evicted.
+        assert!(!recent.contains_key(&(
+            "device:workspace:pane-0:71".to_string(),
+            "viewer-cap".to_string(),
+        )));
+        assert!(recent.contains_key(&(
+            format!(
+                "device:workspace:pane-{}:71",
+                CLOUD_MCP_TERMINAL_IO_EXPIRED_RECENT_MAX
+            ),
+            "viewer-cap".to_string(),
+        )));
+    }
+
+    #[test]
+    fn termio_expired_failed_send_leaves_pair_eligible_for_retry() {
+        let state = CloudMcpState::new();
+        let stream_key = "device:workspace:pane:55";
+        let origin = "viewer-reconnect";
+        let now_ms = 4_000_000_000_u64;
+        let envelope = json!({"kind": "termio.expired", "sk": stream_key, "origin": origin});
+        // A task still holding the OLD sender from before a ws reconnect
+        // fails the enqueue...
+        let (closed_tx, closed_rx) = mpsc::unbounded_channel::<Value>();
+        drop(closed_rx);
+        assert!(!cloud_mcp_terminal_io_expired_emit_pair(
+            &state,
+            &closed_tx,
+            stream_key,
+            origin,
+            envelope.clone(),
+            now_ms,
+        ));
+        // ...and must NOT have recorded the pair, so a concurrent publisher
+        // holding the fresh sender still emits within the same grace window.
+        assert!(!state
+            .terminal_io_expired_recently_emitted
+            .lock()
+            .unwrap()
+            .contains_key(&(stream_key.to_string(), origin.to_string())));
+        let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+        assert!(cloud_mcp_terminal_io_expired_emit_pair(
+            &state,
+            &tx,
+            stream_key,
+            origin,
+            envelope.clone(),
+            now_ms + 10,
+        ));
+        assert_eq!(rx.try_recv().ok(), Some(envelope));
+    }
+
+    #[test]
+    fn termio_expired_batch_prune_runs_once_before_the_publish_loop() {
+        // Structural pin, chosen over an instrumented call counter because
+        // driving the real publish fn end-to-end needs a live ws auth
+        // context. The batch publisher must prune the dedupe map exactly
+        // once, before the pair loop, and the per-pair gate must not prune at
+        // all — moving the retain back into the gate would reintroduce
+        // quadratic scans up to the cap.
+        let source = include_str!("cloud_mcp.rs");
+        let emit_pair_body = source
+            .split("fn cloud_mcp_terminal_io_expired_emit_pair")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("async fn cloud_mcp_publish_terminal_io_expired")
+                    .next()
+            })
+            .expect("emit_pair precedes the batch publisher");
+        assert_eq!(
+            emit_pair_body
+                .matches("cloud_mcp_terminal_io_expired_recent_prune(")
+                .count(),
+            0,
+            "the per-pair gate must not prune the dedupe map",
+        );
+        let publish_body = source
+            .split("async fn cloud_mcp_publish_terminal_io_expired")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("publish fn body");
+        assert_eq!(
+            publish_body
+                .matches("cloud_mcp_terminal_io_expired_recent_prune(")
+                .count(),
+            1,
+            "the batch publisher prunes exactly once",
+        );
+        let prune_at = publish_body
+            .find("cloud_mcp_terminal_io_expired_recent_prune(")
+            .expect("publish batch prune call");
+        let loop_at = publish_body
+            .find("for (stream_key, origin)")
+            .expect("publish pair loop");
+        assert!(
+            prune_at < loop_at,
+            "the batch prune must run before the pair loop",
+        );
+    }
+
+    #[test]
+    fn termio_heartbeat_subscription_report_tracks_origin_and_control() {
+        let state = CloudMcpState::new();
+        let stream_key = "device:workspace:pane:33".to_string();
+        state
+            .terminal_io_stream_subscriptions
+            .lock()
+            .unwrap()
+            .insert(
+                stream_key.clone(),
+                HashMap::from([(
+                    "viewer-a".to_string(),
+                    CloudMcpTerminalIoSubscription {
+                        attachment_id: "attach-a".to_string(),
+                        last_seen_ms: cloud_mcp_now_ms(),
+                    },
+                )]),
+            );
+        state.terminal_io_control_owners.lock().unwrap().insert(
+            stream_key.clone(),
+            CloudMcpTerminalIoControlOwner {
+                origin: "viewer-b".to_string(),
+                last_seen_ms: cloud_mcp_now_ms(),
+            },
+        );
+        // These two reads feed the termio.heartbeat.ack `subscribed`/`control`
+        // fields: a reaped origin sees subscribed=false and re-attaches.
+        assert!(cloud_mcp_terminal_io_origin_is_subscribed(
+            &state,
+            &stream_key,
+            "viewer-a",
+        ));
+        assert!(!cloud_mcp_terminal_io_origin_is_subscribed(
+            &state,
+            &stream_key,
+            "viewer-b",
+        ));
+        assert!(!cloud_mcp_terminal_io_origin_is_subscribed(
+            &state,
+            "device:workspace:pane:404",
+            "viewer-a",
+        ));
+        assert!(!cloud_mcp_terminal_io_has_control(
+            &state,
+            &stream_key,
+            "viewer-a",
+        ));
+        assert!(cloud_mcp_terminal_io_has_control(
+            &state,
+            &stream_key,
+            "viewer-b",
+        ));
+        // The ack carries the stream's byte clock so the web can audit idle
+        // streams for lost replay/snapshot frames...
+        let ack = cloud_mcp_terminal_io_heartbeat_ack_payload(7, true, false, Some(4_096));
+        assert_eq!(ack["seq"], json!(7));
+        assert_eq!(ack["q"], json!(7));
+        assert_eq!(ack["subscribed"], json!(true));
+        assert_eq!(ack["control"], json!(false));
+        assert_eq!(ack["n"], json!(4_096));
+        assert_eq!(ack["total_bytes"], json!(4_096));
+        // ...and omits it entirely when there is no headless output state, so
+        // old-web clients and the byte-clock audit both skip cleanly.
+        let ack = cloud_mcp_terminal_io_heartbeat_ack_payload(8, false, true, None);
+        assert_eq!(ack["subscribed"], json!(false));
+        assert_eq!(ack["control"], json!(true));
+        assert!(ack.get("n").is_none());
+        assert!(ack.get("total_bytes").is_none());
+    }
+
+    #[test]
+    fn termio_heartbeat_ack_is_built_under_the_output_send_lock() {
+        // The ack/output wire ordering cannot be driven end-to-end in unit
+        // tests (the handler needs a live Tauri app), so pin the lock span
+        // structurally instead: between entering the "termio.heartbeat" match
+        // arm and building the ack via the payload helper, the handler must
+        // acquire the output send lock. The arm pattern below does not match
+        // this test's own source because the quotes here are escaped.
+        let source = include_str!("cloud_mcp.rs");
+        let heartbeat_arm = source
+            .split("\"termio.heartbeat\" => {")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("cloud_mcp_terminal_io_heartbeat_ack_payload")
+                    .next()
+            })
+            .expect("termio.heartbeat arm builds its ack via the payload helper");
+        assert!(
+            heartbeat_arm.contains("terminal_io_output_send_lock"),
+            "termio.heartbeat.ack must read the byte clock and enqueue under the output send lock",
+        );
     }
 
     #[test]
