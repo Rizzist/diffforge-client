@@ -531,6 +531,10 @@ struct CloudMcpTerminalIoTail {
     seq: u64,
     total_bytes: u64,
     tail: Vec<u8>,
+    // High-water mark of the broadcast output lane: the `n` of the last
+    // termio.output/termio.snapshot frame actually enqueued to the cloud.
+    // Falls behind total_bytes while ack-window flow control pauses emission.
+    emitted_n: u64,
 }
 
 #[derive(Clone)]
@@ -571,6 +575,14 @@ struct CloudMcpState {
     terminal_io_control_owners: Arc<StdMutex<HashMap<String, CloudMcpTerminalIoControlOwner>>>,
     terminal_io_tail_by_stream: Arc<StdMutex<HashMap<String, CloudMcpTerminalIoTail>>>,
     terminal_io_expired_recently_emitted: Arc<StdMutex<HashMap<(String, String), u64>>>,
+    // stream_key -> origin -> highest contiguous rendered byte offset the
+    // origin has acked. Presence of an origin marks it as "acking" (feature
+    // detection: legacy webs never ack and are exempt from flow control).
+    terminal_io_acked_n_by_stream: Arc<StdMutex<HashMap<String, HashMap<String, u64>>>>,
+    // Count of streams with any acking origin — the publisher's per-frame
+    // fast path: zero means flow control is inactive everywhere and the hot
+    // path skips every extra lock. Only mutated under the acked-map mutex.
+    terminal_io_acking_streams: Arc<AtomicUsize>,
     terminal_io_output_send_lock: Arc<Mutex<()>>,
     terminal_remote_presence_emit_scheduled: Arc<AtomicBool>,
     terminal_remote_presence_reaper_scheduled: Arc<AtomicBool>,
@@ -844,6 +856,8 @@ impl CloudMcpState {
             terminal_io_control_owners: Arc::new(StdMutex::new(HashMap::new())),
             terminal_io_tail_by_stream: Arc::new(StdMutex::new(HashMap::new())),
             terminal_io_expired_recently_emitted: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_io_acked_n_by_stream: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_io_acking_streams: Arc::new(AtomicUsize::new(0)),
             terminal_io_output_send_lock: Arc::new(Mutex::new(())),
             terminal_remote_presence_emit_scheduled: Arc::new(AtomicBool::new(false)),
             terminal_remote_presence_reaper_scheduled: Arc::new(AtomicBool::new(false)),
@@ -30475,6 +30489,11 @@ fn cloud_mcp_collect_terminal_remote_presence_stale_origins_at(
         });
         changed |= owners.len() != before;
     }
+    // A reaped origin's ack state goes with its lease so it stops
+    // constraining the flow-control window.
+    for (stream_key, origin) in &expired {
+        cloud_mcp_terminal_io_forget_acked_origin(state, stream_key, origin);
+    }
     changed |= agent_chat_session_prune_stale_observed_terminals(
         now_ms,
         TERMINAL_REMOTE_PRESENCE_STALE_ORIGIN_TTL_MS,
@@ -30963,6 +30982,10 @@ fn cloud_mcp_clear_terminal_remote_presence_state(state: &CloudMcpState, reason:
     if let Ok(mut owners) = state.terminal_io_control_owners.lock() {
         owners.clear();
     }
+    if let Ok(mut acked) = state.terminal_io_acked_n_by_stream.lock() {
+        acked.clear();
+        state.terminal_io_acking_streams.store(0, Ordering::SeqCst);
+    }
     let _ = agent_chat_session_clear_observed_terminals();
     cloud_mcp_schedule_terminal_remote_presence_emit(state, reason);
 }
@@ -31039,6 +31062,24 @@ fn cloud_mcp_clear_terminal_remote_presence_for_terminal(
                 instance_id,
             )
         });
+    }
+    if let Ok(mut acked) = state.terminal_io_acked_n_by_stream.lock() {
+        let before = acked.len();
+        acked.retain(|stream_key, _| {
+            !cloud_mcp_terminal_remote_presence_stream_matches_terminal(
+                stream_key,
+                &device_id,
+                workspace_match_key.as_deref(),
+                pane_id,
+                instance_id,
+            )
+        });
+        let removed = before.saturating_sub(acked.len());
+        if removed > 0 {
+            state
+                .terminal_io_acking_streams
+                .fetch_sub(removed, Ordering::SeqCst);
+        }
     }
     changed |= agent_chat_session_clear_observed_terminal_matching(
         workspace_match_key.as_deref(),
@@ -31411,22 +31452,12 @@ async fn cloud_mcp_handle_terminal_io_message(
         }
         "termio.detach" => {
             let attachment_id = cloud_mcp_payload_text(message, &["attachment_id", "attach_id"]);
-            if let Ok(mut subscriptions) = state.terminal_io_stream_subscriptions.lock() {
-                if let Some(origins) = subscriptions.get_mut(&target.stream_key) {
-                    let current_attachment = origins
-                        .get(&origin)
-                        .map(|subscription| subscription.attachment_id.clone());
-                    if attachment_id
-                        .as_deref()
-                        .is_none_or(|requested| current_attachment.as_deref() == Some(requested))
-                    {
-                        origins.remove(&origin);
-                    }
-                    if origins.is_empty() {
-                        subscriptions.remove(&target.stream_key);
-                    }
-                }
-            }
+            let _ = cloud_mcp_terminal_io_detach_origin(
+                state,
+                &target.stream_key,
+                &origin,
+                attachment_id.as_deref(),
+            );
             if let Ok(mut owners) = state.terminal_io_control_owners.lock() {
                 if owners
                     .get(&target.stream_key)
@@ -31536,7 +31567,24 @@ async fn cloud_mcp_handle_terminal_io_message(
             )
             .await;
         }
-        "termio.output.ack" | "termio.output_ack" => {}
+        "termio.output.ack" | "termio.output_ack" => {
+            // First accepted ack marks the origin as acking (feature
+            // detection): only attached acking origins constrain the
+            // flow-control window; legacy webs that never ack stay exempt.
+            let Some(acked_n) =
+                cloud_mcp_payload_u64(message, CLOUD_MCP_TERMINAL_IO_OUTPUT_ACK_N_ALIASES)
+            else {
+                return true;
+            };
+            cloud_mcp_terminal_io_handle_output_ack(
+                state,
+                &instance.headless_output,
+                &target,
+                &origin,
+                acked_n,
+            )
+            .await;
+        }
         "termio.input" => {
             let input_seq = cloud_mcp_payload_u64(message, &["seq", "q"]).unwrap_or(0);
             if !cloud_mcp_terminal_io_has_control(state, &target.stream_key, &origin) {
@@ -32007,7 +32055,12 @@ fn cloud_mcp_remember_terminal_output_tail(
         return false;
     }
     if total_bytes < entry.total_bytes {
+        // Byte-clock generation rollback: the retained bytes AND the
+        // broadcast-lane high-water mark belong to the old clock. Keeping
+        // emitted_n would make flow control compare fresh acks against an
+        // unreachable offset and pause the stream indefinitely.
         entry.tail.clear();
+        entry.emitted_n = 0;
     }
     entry.seq = seq;
     entry.total_bytes = total_bytes;
@@ -32115,6 +32168,349 @@ fn cloud_mcp_terminal_output_replay_chunks(
     chunks
 }
 
+// W5 ack-window flow control: how far the broadcast output lane may run past
+// the slowest attached acking viewer before emission pauses, and how far the
+// lane may still be ahead when it resumes. Legacy viewers never ack and never
+// constrain the window.
+const CLOUD_MCP_TERMINAL_IO_FLOW_PAUSE_LAG_BYTES: u64 = 96 * 1024;
+const CLOUD_MCP_TERMINAL_IO_FLOW_RESUME_LAG_BYTES: u64 = 8 * 1024;
+// W6 latest-wins bound: a flow resume whose missing range exceeds this never
+// replays the backlog — it skips forward with ONE fresh vt snapshot, so a
+// `yes` flood costs one repaint regardless of how far the journal ran ahead.
+const CLOUD_MCP_TERMINAL_IO_SKIP_FORWARD_BYTES: u64 = 256 * 1024;
+// Payload aliases the termio.output.ack handler accepts for the acked byte
+// offset, in priority order. Shared with tests so the accepted wire shapes
+// stay pinned to what the handler actually parses.
+const CLOUD_MCP_TERMINAL_IO_OUTPUT_ACK_N_ALIASES: &[&str] = &["n", "acked_n", "total_bytes"];
+
+// Test-only failpoint for the flow-resume replay loop: pretends the
+// websocket sender died after a successful prefix of chunks. One-shot: it
+// clears itself when triggered so the retry proceeds normally. Thread-local
+// because the test harness reuses worker threads across tests.
+#[cfg(test)]
+thread_local! {
+    static TERMIO_FLOW_REPLAY_FAIL_AFTER_CHUNKS: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn termio_flow_replay_fail_point_triggered(enqueued_chunks: usize) -> bool {
+    TERMIO_FLOW_REPLAY_FAIL_AFTER_CHUNKS.with(|cell| match cell.get() {
+        Some(fail_after) if enqueued_chunks >= fail_after => {
+            cell.set(None);
+            true
+        }
+        _ => false,
+    })
+}
+
+// Validate and insert under the same guards (subscriptions, then acked — the
+// established nesting order): a lease reap between a separate check and the
+// insert could otherwise resurrect ack state for an origin whose lease is
+// already gone. Returns false when the origin holds no live subscription.
+fn cloud_mcp_terminal_io_record_output_ack_if_subscribed(
+    state: &CloudMcpState,
+    stream_key: &str,
+    origin: &str,
+    acked_n: u64,
+) -> bool {
+    let origin = origin.trim();
+    if origin.is_empty() {
+        return false;
+    }
+    let Ok(subscriptions) = state.terminal_io_stream_subscriptions.lock() else {
+        return false;
+    };
+    if !subscriptions
+        .get(stream_key)
+        .is_some_and(|origins| origins.contains_key(origin))
+    {
+        return false;
+    }
+    let Ok(mut acked) = state.terminal_io_acked_n_by_stream.lock() else {
+        return false;
+    };
+    if !acked.contains_key(stream_key) {
+        state
+            .terminal_io_acking_streams
+            .fetch_add(1, Ordering::SeqCst);
+    }
+    let origins = acked.entry(stream_key.to_string()).or_default();
+    let entry = origins.entry(origin.to_string()).or_insert(0);
+    // Monotonic: acks are idempotent and may arrive reordered.
+    *entry = (*entry).max(acked_n);
+    true
+}
+
+fn cloud_mcp_terminal_io_forget_acked_origin(
+    state: &CloudMcpState,
+    stream_key: &str,
+    origin: &str,
+) {
+    if let Ok(mut acked) = state.terminal_io_acked_n_by_stream.lock() {
+        if let Some(origins) = acked.get_mut(stream_key) {
+            origins.remove(origin);
+            if origins.is_empty() {
+                acked.remove(stream_key);
+                state
+                    .terminal_io_acking_streams
+                    .fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+// Remove an origin's subscription (honoring an attachment-id-scoped detach)
+// and, when it was actually removed, its ack state — a departed origin must
+// stop constraining the flow-control window.
+fn cloud_mcp_terminal_io_detach_origin(
+    state: &CloudMcpState,
+    stream_key: &str,
+    origin: &str,
+    requested_attachment_id: Option<&str>,
+) -> bool {
+    let mut detached = false;
+    if let Ok(mut subscriptions) = state.terminal_io_stream_subscriptions.lock() {
+        if let Some(origins) = subscriptions.get_mut(stream_key) {
+            let current_attachment = origins
+                .get(origin)
+                .map(|subscription| subscription.attachment_id.clone());
+            if requested_attachment_id
+                .is_none_or(|requested| current_attachment.as_deref() == Some(requested))
+            {
+                detached = origins.remove(origin).is_some();
+            }
+            if origins.is_empty() {
+                subscriptions.remove(stream_key);
+            }
+        }
+    }
+    if detached {
+        cloud_mcp_terminal_io_forget_acked_origin(state, stream_key, origin);
+    }
+    detached
+}
+
+// Minimum acked_n over origins that are BOTH acking and currently attached;
+// None means no such origin exists and flow control is inactive (legacy
+// behavior). The nested lock order (subscriptions, then acked) is the only
+// place both are held at once; mutations elsewhere take them sequentially.
+fn cloud_mcp_terminal_io_flow_min_acked_n(
+    state: &CloudMcpState,
+    stream_key: &str,
+) -> Option<u64> {
+    let subscriptions = state.terminal_io_stream_subscriptions.lock().ok()?;
+    let attached = subscriptions.get(stream_key)?;
+    let acked = state.terminal_io_acked_n_by_stream.lock().ok()?;
+    acked
+        .get(stream_key)?
+        .iter()
+        .filter(|(origin, _)| attached.contains_key(origin.as_str()))
+        .map(|(_, acked_n)| *acked_n)
+        .min()
+}
+
+fn cloud_mcp_terminal_output_emitted_n(state: &CloudMcpState, stream_key: &str) -> u64 {
+    state
+        .terminal_io_tail_by_stream
+        .lock()
+        .ok()
+        .and_then(|tails| tails.get(stream_key).map(|tail| tail.emitted_n))
+        .unwrap_or(0)
+}
+
+fn cloud_mcp_terminal_output_note_emitted_n(
+    state: &CloudMcpState,
+    stream_key: &str,
+    emitted_n: u64,
+) {
+    if let Ok(mut tails) = state.terminal_io_tail_by_stream.lock() {
+        if let Some(tail) = tails.get_mut(stream_key) {
+            tail.emitted_n = tail.emitted_n.max(emitted_n);
+        }
+    }
+}
+
+fn cloud_mcp_terminal_output_flow_should_pause(state: &CloudMcpState, stream_key: &str) -> bool {
+    // Hot-path fast gate: with no acking stream anywhere (the legacy common
+    // case) the per-16ms publisher pays one atomic load and no extra locks.
+    if state.terminal_io_acking_streams.load(Ordering::SeqCst) == 0 {
+        return false;
+    }
+    let Some(min_acked_n) = cloud_mcp_terminal_io_flow_min_acked_n(state, stream_key) else {
+        return false;
+    };
+    cloud_mcp_terminal_output_emitted_n(state, stream_key).saturating_sub(min_acked_n)
+        > CLOUD_MCP_TERMINAL_IO_FLOW_PAUSE_LAG_BYTES
+}
+
+// The complete device side of one termio.output.ack: the ack becomes visible
+// to the flow gate only INSIDE the output send lock, and the catch-up replay
+// runs in the same critical section. Recording before taking the lock would
+// let a publisher already holding it observe the fresh ack, unpause, and
+// emit live [total, total+chunk) — after which emitted_n >= total and the
+// skipped range [emitted_n_old, total) would never be replayed.
+async fn cloud_mcp_terminal_io_handle_output_ack(
+    state: &CloudMcpState,
+    headless_output: &Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
+    target: &CloudMcpTerminalIoTarget,
+    origin: &str,
+    acked_n: u64,
+) {
+    let _send_guard = state.terminal_io_output_send_lock.lock().await;
+    if !cloud_mcp_terminal_io_record_output_ack_if_subscribed(
+        state,
+        &target.stream_key,
+        origin,
+        acked_n,
+    ) {
+        return;
+    }
+    cloud_mcp_terminal_output_flow_resume_locked(state, headless_output, target).await;
+}
+
+// Catch the broadcast output lane up after a flow-control pause: replay the
+// skipped emitted_n..total range from the tail (same chunking as attach
+// resume), or skip forward with one fresh vt snapshot when the range exceeds
+// the latest-wins bound or the tail cannot reconstruct it. The decision is
+// made ONCE from the missing-range size — never a partial replay followed by
+// a snapshot. CALLER MUST HOLD terminal_io_output_send_lock, so the catch-up
+// cannot interleave with live deltas — the byte clock stays one ordered cut.
+// emitted_n advances only after every selected frame enqueued successfully;
+// any failed enqueue leaves it untouched so the next ack retries the same
+// range (a dead websocket is detected and torn down by its own reader/writer
+// paths, which clear all presence and flow state).
+async fn cloud_mcp_terminal_output_flow_resume_locked(
+    state: &CloudMcpState,
+    headless_output: &Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
+    target: &CloudMcpTerminalIoTarget,
+) {
+    let total = headless_output
+        .lock()
+        .ok()
+        .map(|output| output.total_bytes)
+        .unwrap_or(0);
+    let emitted_n = cloud_mcp_terminal_output_emitted_n(state, &target.stream_key);
+    if emitted_n >= total {
+        return;
+    }
+    let Some(min_acked_n) = cloud_mcp_terminal_io_flow_min_acked_n(state, &target.stream_key)
+    else {
+        return;
+    };
+    if emitted_n.saturating_sub(min_acked_n) > CLOUD_MCP_TERMINAL_IO_FLOW_RESUME_LAG_BYTES {
+        return;
+    }
+    let replay = if total.saturating_sub(emitted_n) <= CLOUD_MCP_TERMINAL_IO_SKIP_FORWARD_BYTES {
+        match cloud_mcp_terminal_output_replay_frame(state, &target.stream_key, emitted_n) {
+            Some((seq, replay_from, replay_total, replay_bytes, truncated))
+                if !truncated && replay_total == total && replay_from == emitted_n =>
+            {
+                Some((seq, replay_from, replay_bytes))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some((seq, replay_from, replay_bytes)) = replay {
+        for (_index, (chunk_from, chunk_to, chunk)) in
+            cloud_mcp_terminal_output_replay_chunks(replay_from, &replay_bytes)
+                .into_iter()
+                .enumerate()
+        {
+            // Test-only failpoint: simulates the sender dying mid-replay
+            // after a successful prefix of chunks.
+            #[cfg(test)]
+            if termio_flow_replay_fail_point_triggered(_index) {
+                return;
+            }
+            if cloud_mcp_send_terminal_io_message(
+                state,
+                None,
+                target,
+                "termio.output",
+                format!(
+                    "termio-flow-replay-{}-{}-{}",
+                    target.instance_id, seq, chunk_from
+                ),
+                json!({
+                    "q": seq,
+                    "seq": seq,
+                    "f": chunk_from,
+                    "n": chunk_to,
+                    "from_total_bytes": chunk_from,
+                    "total_bytes": chunk_to,
+                    "b": general_purpose::STANDARD.encode(chunk),
+                }),
+            )
+            .await
+            .is_err()
+            {
+                // Bytes from chunk_from onward were never enqueued: leave
+                // emitted_n behind so the next ack replays them.
+                return;
+            }
+        }
+        cloud_mcp_terminal_output_note_emitted_n(state, &target.stream_key, total);
+    } else {
+        // Skip forward with a fresh vt snapshot instead of replaying a
+        // backlog. Deliberately UNSTAMPED: the web snapshot gate only drops
+        // a snapshot when both its attachment_id and the stream's active id
+        // are present and mismatch, so an id-free snapshot is accepted by
+        // every attached viewer — a per-origin stamp would be rejected by
+        // all the others. (Attach-path snapshots keep their ids.)
+        let (snapshot_total, bytes, retained_tail_bytes) = {
+            let output = headless_output.lock().ok();
+            let total = output.as_ref().map(|value| value.total_bytes).unwrap_or(0);
+            let bytes = output
+                .as_ref()
+                .map(|value| value.vt_state())
+                .unwrap_or_default();
+            let retained_tail_bytes = output.as_ref().map(|value| value.tail.len()).unwrap_or(0);
+            (total, bytes, retained_tail_bytes)
+        };
+        let seq = state
+            .terminal_io_tail_by_stream
+            .lock()
+            .ok()
+            .and_then(|tails| tails.get(&target.stream_key).map(|tail| tail.seq))
+            .unwrap_or(0);
+        if cloud_mcp_send_terminal_io_message(
+            state,
+            None,
+            target,
+            "termio.snapshot",
+            format!(
+                "termio-flow-snapshot-{}-{}",
+                target.instance_id,
+                cloud_mcp_now_ms()
+            ),
+            json!({
+                "q": seq,
+                "seq": seq,
+                "f": snapshot_total,
+                "n": snapshot_total,
+                "from_total_bytes": snapshot_total,
+                "total_bytes": snapshot_total,
+                "b": general_purpose::STANDARD.encode(bytes),
+                "mode": "vt",
+                "reset": true,
+                "truncated": false,
+                "retained_tail_bytes": retained_tail_bytes,
+            }),
+        )
+        .await
+        .is_err()
+        {
+            // Snapshot never left the device: keep emitted_n behind so the
+            // next ack retries the skip-forward.
+            return;
+        }
+        cloud_mcp_terminal_output_note_emitted_n(state, &target.stream_key, snapshot_total);
+    }
+}
+
 pub(crate) fn cloud_mcp_publish_terminal_output_delta(
     state: &CloudMcpState,
     headless_output: &Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
@@ -32160,6 +32556,14 @@ pub(crate) fn cloud_mcp_publish_terminal_output_delta(
             return;
         }
         if !cloud_mcp_terminal_output_stream_is_subscribed(&state, &stream_key) {
+            return;
+        }
+        // W5 ack-window flow control: when the SLOWEST attached acking viewer
+        // falls too far behind the broadcast lane, skip the enqueue exactly
+        // like the unsubscribed gate above — the journal and replay tail have
+        // already advanced, so the ack-triggered resume can replay the
+        // skipped range.
+        if cloud_mcp_terminal_output_flow_should_pause(&state, &stream_key) {
             return;
         }
         let tx = if let Some(tx) = state.global_ws_termio_tx.lock().await.as_ref().cloned() {
@@ -32219,7 +32623,9 @@ pub(crate) fn cloud_mcp_publish_terminal_output_delta(
                 "Cloud MCP app websocket terminal-output sender is closed.",
             )
             .await;
+            return;
         }
+        cloud_mcp_terminal_output_note_emitted_n(&state, &stream_key, total_bytes);
     });
 }
 
@@ -58117,6 +58523,1032 @@ mod cloud_mcp_tests {
         let retained = tail.get(&stream_key).expect("journal tail");
         assert_eq!((retained.seq, retained.total_bytes), (1, total));
         assert_eq!(retained.tail, b"first");
+    }
+
+    fn termio_test_subscription(attachment_id: &str, last_seen_ms: u64) -> CloudMcpTerminalIoSubscription {
+        CloudMcpTerminalIoSubscription {
+            attachment_id: attachment_id.to_string(),
+            last_seen_ms,
+        }
+    }
+
+    fn termio_test_install_ws(state: &CloudMcpState) -> mpsc::UnboundedReceiver<Value> {
+        let (tx, rx) = mpsc::unbounded_channel::<Value>();
+        tauri::async_runtime::block_on(async {
+            {
+                let mut runtime = state.inner.lock().await;
+                runtime.global_ws_connection_id = Some("conn-flow-test".to_string());
+                runtime.global_ws_message_token = Some("token-flow-test".to_string());
+            }
+            *state.global_ws_termio_tx.lock().await = Some(tx);
+        });
+        rx
+    }
+
+    fn termio_test_subscribe(state: &CloudMcpState, stream_key: &str, origin: &str) {
+        state
+            .terminal_io_stream_subscriptions
+            .lock()
+            .unwrap()
+            .entry(stream_key.to_string())
+            .or_default()
+            .insert(
+                origin.to_string(),
+                termio_test_subscription(&format!("attach-{origin}"), cloud_mcp_now_ms()),
+            );
+    }
+
+    #[test]
+    fn termio_output_ack_state_is_monotonic_gated_and_cleaned_up() {
+        let state = CloudMcpState::new();
+        let stream_a = "device:workspace:pane:81";
+        let stream_b = "device:workspace:pane:82";
+        termio_test_subscribe(&state, stream_a, "viewer-1");
+        termio_test_subscribe(&state, stream_a, "viewer-2");
+        termio_test_subscribe(&state, stream_b, "viewer-1");
+        // An origin without a live subscription is rejected and records
+        // nothing (validate and insert happen under the same guards).
+        assert!(!cloud_mcp_terminal_io_record_output_ack_if_subscribed(
+            &state,
+            stream_a,
+            "viewer-ghost",
+            9,
+        ));
+        assert!(!cloud_mcp_terminal_io_record_output_ack_if_subscribed(
+            &state,
+            "device:workspace:pane:404",
+            "viewer-1",
+            9,
+        ));
+        assert!(state.terminal_io_acked_n_by_stream.lock().unwrap().is_empty());
+        assert_eq!(state.terminal_io_acking_streams.load(Ordering::SeqCst), 0);
+
+        assert!(cloud_mcp_terminal_io_record_output_ack_if_subscribed(
+            &state, stream_a, "viewer-1", 100,
+        ));
+        assert_eq!(state.terminal_io_acking_streams.load(Ordering::SeqCst), 1);
+        assert!(cloud_mcp_terminal_io_record_output_ack_if_subscribed(
+            &state, stream_a, "viewer-2", 40,
+        ));
+        // Second origin on the same stream does not bump the stream counter.
+        assert_eq!(state.terminal_io_acking_streams.load(Ordering::SeqCst), 1);
+        assert!(cloud_mcp_terminal_io_record_output_ack_if_subscribed(
+            &state, stream_b, "viewer-1", 7,
+        ));
+        assert_eq!(state.terminal_io_acking_streams.load(Ordering::SeqCst), 2);
+        // Monotonic: a stale or duplicate ack never regresses the offset.
+        assert!(cloud_mcp_terminal_io_record_output_ack_if_subscribed(
+            &state, stream_a, "viewer-1", 60,
+        ));
+        assert!(cloud_mcp_terminal_io_record_output_ack_if_subscribed(
+            &state, stream_a, "viewer-1", 150,
+        ));
+        {
+            let acked = state.terminal_io_acked_n_by_stream.lock().unwrap();
+            assert_eq!(acked.get(stream_a).unwrap().get("viewer-1"), Some(&150));
+            assert_eq!(acked.get(stream_a).unwrap().get("viewer-2"), Some(&40));
+            assert_eq!(acked.get(stream_b).unwrap().get("viewer-1"), Some(&7));
+        }
+        cloud_mcp_terminal_io_forget_acked_origin(&state, stream_a, "viewer-1");
+        {
+            let acked = state.terminal_io_acked_n_by_stream.lock().unwrap();
+            assert!(!acked.get(stream_a).unwrap().contains_key("viewer-1"));
+        }
+        assert_eq!(state.terminal_io_acking_streams.load(Ordering::SeqCst), 2);
+        // The stream entry (and its slot in the fast-path counter) goes with
+        // its last acking origin.
+        cloud_mcp_terminal_io_forget_acked_origin(&state, stream_a, "viewer-2");
+        {
+            let acked = state.terminal_io_acked_n_by_stream.lock().unwrap();
+            assert!(!acked.contains_key(stream_a));
+            assert!(acked.contains_key(stream_b));
+        }
+        assert_eq!(state.terminal_io_acking_streams.load(Ordering::SeqCst), 1);
+        // Global clear resets both the map and the fast-path counter.
+        cloud_mcp_clear_terminal_remote_presence_state(&state, "test_ack_clear_all");
+        assert!(state.terminal_io_acked_n_by_stream.lock().unwrap().is_empty());
+        assert_eq!(state.terminal_io_acking_streams.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn termio_output_ack_aliases_resolve_like_the_handler() {
+        // The ack arm reads the byte offset through this shared alias list,
+        // in order — the same constant the handler parses with, so dropping
+        // an alias from the handler fails here.
+        let keys = CLOUD_MCP_TERMINAL_IO_OUTPUT_ACK_N_ALIASES;
+        assert_eq!(cloud_mcp_payload_u64(&json!({"n": 5}), keys), Some(5));
+        assert_eq!(cloud_mcp_payload_u64(&json!({"acked_n": 6}), keys), Some(6));
+        assert_eq!(
+            cloud_mcp_payload_u64(&json!({"total_bytes": 7}), keys),
+            Some(7)
+        );
+        assert_eq!(
+            cloud_mcp_payload_u64(&json!({"n": 5, "total_bytes": 7}), keys),
+            Some(5)
+        );
+        assert_eq!(cloud_mcp_payload_u64(&json!({"n": "12"}), keys), Some(12));
+        assert_eq!(cloud_mcp_payload_u64(&json!({}), keys), None);
+    }
+
+    #[test]
+    fn termio_detach_scoped_by_attachment_id_drops_ack_state_with_the_lease() {
+        let state = CloudMcpState::new();
+        let stream_key = "device:workspace:pane:84";
+        termio_test_subscribe(&state, stream_key, "viewer-d");
+        assert!(cloud_mcp_terminal_io_record_output_ack_if_subscribed(
+            &state, stream_key, "viewer-d", 33,
+        ));
+        // A stale detach naming a different attachment id is a no-op for
+        // both the lease and the ack state.
+        assert!(!cloud_mcp_terminal_io_detach_origin(
+            &state,
+            stream_key,
+            "viewer-d",
+            Some("attach-other"),
+        ));
+        assert!(cloud_mcp_terminal_io_origin_is_subscribed(
+            &state,
+            stream_key,
+            "viewer-d",
+        ));
+        assert_eq!(state.terminal_io_acking_streams.load(Ordering::SeqCst), 1);
+        // A matching (or unscoped) detach removes the lease AND the origin's
+        // ack state.
+        assert!(cloud_mcp_terminal_io_detach_origin(
+            &state,
+            stream_key,
+            "viewer-d",
+            Some("attach-viewer-d"),
+        ));
+        assert!(!cloud_mcp_terminal_io_origin_is_subscribed(
+            &state,
+            stream_key,
+            "viewer-d",
+        ));
+        assert!(state.terminal_io_acked_n_by_stream.lock().unwrap().is_empty());
+        assert_eq!(state.terminal_io_acking_streams.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn termio_flow_gate_pauses_on_slowest_attached_acking_origin() {
+        let state = CloudMcpState::new();
+        let stream_key = "device:workspace:pane:83".to_string();
+        state
+            .terminal_io_tail_by_stream
+            .lock()
+            .unwrap()
+            .insert(
+                stream_key.clone(),
+                CloudMcpTerminalIoTail {
+                    seq: 9,
+                    total_bytes: 400_000,
+                    tail: vec![b'x'; 8],
+                    emitted_n: 200_000,
+                },
+            );
+        state
+            .terminal_io_stream_subscriptions
+            .lock()
+            .unwrap()
+            .insert(
+                stream_key.clone(),
+                HashMap::from([
+                    ("viewer-slow".to_string(), termio_test_subscription("a-slow", 10)),
+                    ("viewer-fast".to_string(), termio_test_subscription("a-fast", 20)),
+                    ("viewer-legacy".to_string(), termio_test_subscription("a-legacy", 30)),
+                ]),
+            );
+        // Legacy stream: nobody acks, flow control never pauses.
+        assert!(!cloud_mcp_terminal_output_flow_should_pause(
+            &state,
+            &stream_key
+        ));
+        // The slowest attached acking origin governs the window; the
+        // non-acking legacy viewer is exempt.
+        assert!(cloud_mcp_terminal_io_record_output_ack_if_subscribed(
+            &state,
+            &stream_key,
+            "viewer-fast",
+            200_000,
+        ));
+        assert!(cloud_mcp_terminal_io_record_output_ack_if_subscribed(
+            &state,
+            &stream_key,
+            "viewer-slow",
+            200_000 - CLOUD_MCP_TERMINAL_IO_FLOW_PAUSE_LAG_BYTES - 1,
+        ));
+        assert_eq!(
+            cloud_mcp_terminal_io_flow_min_acked_n(&state, &stream_key),
+            Some(200_000 - CLOUD_MCP_TERMINAL_IO_FLOW_PAUSE_LAG_BYTES - 1)
+        );
+        assert!(cloud_mcp_terminal_output_flow_should_pause(
+            &state,
+            &stream_key
+        ));
+        // Exactly at the window edge the lane keeps flowing.
+        assert!(cloud_mcp_terminal_io_record_output_ack_if_subscribed(
+            &state,
+            &stream_key,
+            "viewer-slow",
+            200_000 - CLOUD_MCP_TERMINAL_IO_FLOW_PAUSE_LAG_BYTES,
+        ));
+        assert!(!cloud_mcp_terminal_output_flow_should_pause(
+            &state,
+            &stream_key
+        ));
+        // An acking origin that is no longer attached stops constraining.
+        // (Set directly: recorded acks are monotonic and cannot regress.)
+        state
+            .terminal_io_acked_n_by_stream
+            .lock()
+            .unwrap()
+            .get_mut(&stream_key)
+            .unwrap()
+            .insert("viewer-slow".to_string(), 1);
+        assert!(cloud_mcp_terminal_output_flow_should_pause(
+            &state,
+            &stream_key
+        ));
+        state
+            .terminal_io_stream_subscriptions
+            .lock()
+            .unwrap()
+            .get_mut(&stream_key)
+            .unwrap()
+            .remove("viewer-slow");
+        assert_eq!(
+            cloud_mcp_terminal_io_flow_min_acked_n(&state, &stream_key),
+            Some(200_000)
+        );
+        assert!(!cloud_mcp_terminal_output_flow_should_pause(
+            &state,
+            &stream_key
+        ));
+        // No attached acking origins at all: back to legacy behavior.
+        cloud_mcp_terminal_io_forget_acked_origin(&state, &stream_key, "viewer-slow");
+        cloud_mcp_terminal_io_forget_acked_origin(&state, &stream_key, "viewer-fast");
+        assert_eq!(
+            cloud_mcp_terminal_io_flow_min_acked_n(&state, &stream_key),
+            None
+        );
+        assert!(!cloud_mcp_terminal_output_flow_should_pause(
+            &state,
+            &stream_key
+        ));
+    }
+
+    #[test]
+    fn termio_flow_publisher_pauses_then_ack_resume_replays_missing_range() {
+        let state = CloudMcpState::new();
+        let mut rx = termio_test_install_ws(&state);
+        let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
+        let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
+            .unwrap_or_else(|| "desktop-primary".to_string());
+        let workspace_id = "workspace-flow";
+        let pane_id = "pane-flow";
+        let instance_id = 91_u64;
+        let stream_key =
+            cloud_mcp_terminal_output_stream_key(&device_id, workspace_id, pane_id, instance_id);
+        let target = cloud_mcp_terminal_io_target(&stream_key).expect("flow stream target");
+        state
+            .terminal_io_stream_subscriptions
+            .lock()
+            .unwrap()
+            .insert(
+                stream_key.clone(),
+                HashMap::from([(
+                    "viewer-flow".to_string(),
+                    termio_test_subscription("attach-flow", cloud_mcp_now_ms()),
+                )]),
+            );
+
+        // Legacy live frame before any ack.
+        cloud_mcp_publish_terminal_output_delta(
+            &state, &output, workspace_id, pane_id, instance_id, 1, b"hello",
+        );
+        let frame = rx.try_recv().expect("first live frame");
+        assert_eq!(frame["kind"], json!("termio.output"));
+        assert_eq!((frame["f"].as_u64(), frame["n"].as_u64()), (Some(0), Some(5)));
+
+        // The viewer starts acking; a window-sized burst still emits (the
+        // window is measured on bytes outstanding BEFORE the frame).
+        tauri::async_runtime::block_on(cloud_mcp_terminal_io_handle_output_ack(
+            &state, &output, &target, "viewer-flow", 5,
+        ));
+        let burst = vec![b'x'; 100 * 1024];
+        cloud_mcp_publish_terminal_output_delta(
+            &state, &output, workspace_id, pane_id, instance_id, 2, &burst,
+        );
+        let frame = rx.try_recv().expect("burst frame");
+        assert_eq!(frame["n"].as_u64(), Some(5 + 100 * 1024));
+
+        // Outstanding bytes now exceed the window: the next frame is PAUSED —
+        // no enqueue, no gap frame — while journal and tail keep advancing.
+        cloud_mcp_publish_terminal_output_delta(
+            &state, &output, workspace_id, pane_id, instance_id, 3, b"after-pause",
+        );
+        assert!(rx.try_recv().is_err());
+        let total = output.lock().unwrap().total_bytes;
+        assert_eq!(total, 5 + 100 * 1024 + 11);
+        {
+            let tails = state.terminal_io_tail_by_stream.lock().unwrap();
+            let tail = tails.get(&stream_key).expect("tail during pause");
+            assert_eq!((tail.seq, tail.total_bytes), (3, total));
+            assert_eq!(tail.emitted_n, 5 + 100 * 1024);
+        }
+
+        // A partial ack that leaves the lag above the resume threshold does
+        // not resume.
+        tauri::async_runtime::block_on(cloud_mcp_terminal_io_handle_output_ack(
+            &state,
+            &output,
+            &target,
+            "viewer-flow",
+            90 * 1024,
+        ));
+        assert!(rx.try_recv().is_err());
+
+        // Catching up within the resume threshold replays exactly the
+        // skipped range from the tail, broadcast (no origin stamp), then the
+        // lane continues live.
+        tauri::async_runtime::block_on(cloud_mcp_terminal_io_handle_output_ack(
+            &state,
+            &output,
+            &target,
+            "viewer-flow",
+            100 * 1024,
+        ));
+        let frame = rx.try_recv().expect("flow resume replay frame");
+        assert_eq!(frame["kind"], json!("termio.output"));
+        assert_eq!(frame["f"].as_u64(), Some(5 + 100 * 1024));
+        assert_eq!(frame["n"].as_u64(), Some(total));
+        assert_eq!(frame["q"], json!(3));
+        assert_eq!(
+            frame["id"],
+            json!(format!("termio-flow-replay-{}-3-{}", instance_id, 5 + 100 * 1024))
+        );
+        assert!(frame.get("origin_connection_id").is_none());
+        let decoded = general_purpose::STANDARD
+            .decode(frame["b"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(decoded, b"after-pause");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
+
+        // A duplicate ack is a no-op (lane already current).
+        tauri::async_runtime::block_on(cloud_mcp_terminal_io_handle_output_ack(
+            &state,
+            &output,
+            &target,
+            "viewer-flow",
+            100 * 1024,
+        ));
+        assert!(rx.try_recv().is_err());
+
+        // Live emission continues after resume.
+        cloud_mcp_publish_terminal_output_delta(
+            &state, &output, workspace_id, pane_id, instance_id, 4, b"live-again",
+        );
+        let frame = rx.try_recv().expect("post-resume live frame");
+        assert_eq!(frame["kind"], json!("termio.output"));
+        assert_eq!(frame["f"].as_u64(), Some(total));
+        assert_eq!(frame["n"].as_u64(), Some(total + 10));
+    }
+
+    #[test]
+    fn termio_flow_resume_skips_forward_with_snapshot_when_tail_cannot_cover() {
+        let state = CloudMcpState::new();
+        let mut rx = termio_test_install_ws(&state);
+        let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
+        let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
+            .unwrap_or_else(|| "desktop-primary".to_string());
+        let stream_key = cloud_mcp_terminal_output_stream_key(
+            &device_id,
+            "workspace-snap",
+            "pane-snap",
+            92,
+        );
+        let target = cloud_mcp_terminal_io_target(&stream_key).expect("snap stream target");
+        // A small missing range (below the skip-forward bound) whose bytes
+        // the tail nevertheless cannot reconstruct: the retained tail starts
+        // far past emitted_n.
+        let filler = vec![b'x'; 300_000];
+        output.lock().unwrap().append(&filler);
+        let total = filler.len() as u64;
+        assert!(cloud_mcp_remember_terminal_output_tail(
+            &state,
+            &stream_key,
+            1,
+            total,
+            b"0123456789",
+        ));
+        cloud_mcp_terminal_output_note_emitted_n(&state, &stream_key, 299_000);
+        state
+            .terminal_io_stream_subscriptions
+            .lock()
+            .unwrap()
+            .insert(
+                stream_key.clone(),
+                HashMap::from([
+                    (
+                        "viewer-snap-a".to_string(),
+                        termio_test_subscription("attach-snap-a", 50),
+                    ),
+                    (
+                        "viewer-snap-b".to_string(),
+                        termio_test_subscription("attach-snap-b", 100),
+                    ),
+                ]),
+            );
+        tauri::async_runtime::block_on(cloud_mcp_terminal_io_handle_output_ack(
+            &state,
+            &output,
+            &target,
+            "viewer-snap-b",
+            299_000,
+        ));
+        let frame = rx.try_recv().expect("skip-forward snapshot");
+        assert_eq!(frame["kind"], json!("termio.snapshot"));
+        assert_eq!(frame["reset"], json!(true));
+        // Flow snapshots are unstamped so every attached viewer's snapshot
+        // gate accepts them (the web gate only drops on a present-and-
+        // mismatched id pair).
+        assert!(frame.get("attachment_id").is_none());
+        assert_eq!(frame["f"].as_u64(), Some(total));
+        assert_eq!(frame["n"].as_u64(), Some(total));
+        assert!(frame.get("origin_connection_id").is_none());
+        assert!(!general_purpose::STANDARD
+            .decode(frame["b"].as_str().expect("snapshot carries vt bytes"))
+            .unwrap()
+            .is_empty());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
+    }
+
+    #[test]
+    fn termio_flow_resume_bounds_backlog_with_skip_forward_snapshot() {
+        let state = CloudMcpState::new();
+        let mut rx = termio_test_install_ws(&state);
+        let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
+            .unwrap_or_else(|| "desktop-primary".to_string());
+
+        // Missing range ONE BYTE past the bound, fully tail-covered: the
+        // latest-wins decision still skips forward with one snapshot instead
+        // of replaying the backlog.
+        let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
+        let stream_key = cloud_mcp_terminal_output_stream_key(
+            &device_id,
+            "workspace-bound",
+            "pane-bound",
+            95,
+        );
+        let target = cloud_mcp_terminal_io_target(&stream_key).expect("bound stream target");
+        let emitted = 8_u64;
+        let over = vec![b'x'; emitted as usize
+            + CLOUD_MCP_TERMINAL_IO_SKIP_FORWARD_BYTES as usize
+            + 1];
+        output.lock().unwrap().append(&over);
+        let total = over.len() as u64;
+        assert!(cloud_mcp_remember_terminal_output_tail(
+            &state,
+            &stream_key,
+            1,
+            total,
+            &over,
+        ));
+        cloud_mcp_terminal_output_note_emitted_n(&state, &stream_key, emitted);
+        state
+            .terminal_io_stream_subscriptions
+            .lock()
+            .unwrap()
+            .insert(
+                stream_key.clone(),
+                HashMap::from([(
+                    "viewer-bound".to_string(),
+                    termio_test_subscription("attach-bound", cloud_mcp_now_ms()),
+                )]),
+            );
+        tauri::async_runtime::block_on(cloud_mcp_terminal_io_handle_output_ack(
+            &state,
+            &output,
+            &target,
+            "viewer-bound",
+            emitted,
+        ));
+        let frame = rx.try_recv().expect("latest-wins snapshot");
+        assert_eq!(frame["kind"], json!("termio.snapshot"));
+        assert_eq!(frame["reset"], json!(true));
+        assert!(frame.get("attachment_id").is_none());
+        assert_eq!(frame["n"].as_u64(), Some(total));
+        assert!(!general_purpose::STANDARD
+            .decode(frame["b"].as_str().expect("snapshot carries vt bytes"))
+            .unwrap()
+            .is_empty());
+        assert!(rx.try_recv().is_err(), "one snapshot, no replay frames");
+        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
+
+        // Missing range EXACTLY at the bound: still a tail replay.
+        let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
+        let stream_key = cloud_mcp_terminal_output_stream_key(
+            &device_id,
+            "workspace-bound",
+            "pane-bound-edge",
+            96,
+        );
+        let target = cloud_mcp_terminal_io_target(&stream_key).expect("edge stream target");
+        let at = vec![b'y'; emitted as usize + CLOUD_MCP_TERMINAL_IO_SKIP_FORWARD_BYTES as usize];
+        output.lock().unwrap().append(&at);
+        let total = at.len() as u64;
+        assert!(cloud_mcp_remember_terminal_output_tail(
+            &state,
+            &stream_key,
+            1,
+            total,
+            &at,
+        ));
+        cloud_mcp_terminal_output_note_emitted_n(&state, &stream_key, emitted);
+        state
+            .terminal_io_stream_subscriptions
+            .lock()
+            .unwrap()
+            .insert(
+                stream_key.clone(),
+                HashMap::from([(
+                    "viewer-edge".to_string(),
+                    termio_test_subscription("attach-edge", cloud_mcp_now_ms()),
+                )]),
+            );
+        tauri::async_runtime::block_on(cloud_mcp_terminal_io_handle_output_ack(
+            &state,
+            &output,
+            &target,
+            "viewer-edge",
+            emitted,
+        ));
+        let mut next_from = emitted;
+        let mut frames = 0_usize;
+        while let Ok(frame) = rx.try_recv() {
+            assert_eq!(frame["kind"], json!("termio.output"));
+            assert_eq!(frame["f"].as_u64(), Some(next_from));
+            next_from = frame["n"].as_u64().expect("replay frame n");
+            frames += 1;
+        }
+        assert_eq!(next_from, total, "replay ends at the journal total");
+        assert_eq!(
+            frames,
+            (CLOUD_MCP_TERMINAL_IO_SKIP_FORWARD_BYTES as usize)
+                .div_ceil(CLOUD_MCP_TERMINAL_OUTPUT_REPLAY_CHUNK_BYTES)
+        );
+        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
+
+        // Structural pin: attach-path snapshots stay stamped with the
+        // requesting attachment_id; the flow resume never stamps one.
+        // (Driving the real attach handler would need a live Tauri app plus a
+        // registered PTY-backed TerminalState instance, so the SNAPSHOT
+        // payload specifically is pinned: the assertion is scoped to the
+        // json built after the "termio.snapshot" kind inside the attach arm,
+        // not the whole arm — the attached payload also carries the id and
+        // must not satisfy this check on the snapshot's behalf.)
+        let source = include_str!("cloud_mcp.rs");
+        let attach_arm = source
+            .split("\"termio.attach\" => {")
+            .nth(1)
+            .and_then(|rest| rest.split("\"termio.detach\" => {").next())
+            .expect("attach arm precedes detach arm");
+        let attach_snapshot_payload = attach_arm
+            .split("\"termio.snapshot\"")
+            .nth(1)
+            .expect("attach arm sends a snapshot");
+        assert!(
+            attach_snapshot_payload.contains("\"attachment_id\": request_id"),
+            "the attach-path snapshot itself must stay stamped",
+        );
+        let flow_fns = source
+            .split("async fn cloud_mcp_terminal_io_handle_output_ack")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("pub(crate) fn cloud_mcp_publish_terminal_output_delta")
+                    .next()
+            })
+            .expect("ack handling precedes the publisher");
+        assert!(
+            !flow_fns.contains("\"attachment_id\""),
+            "flow-control frames must stay unstamped",
+        );
+    }
+
+    #[tokio::test]
+    async fn termio_flow_ack_is_invisible_until_the_send_lock_is_held() {
+        let state = CloudMcpState::new();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+        {
+            let mut runtime = state.inner.lock().await;
+            runtime.global_ws_connection_id = Some("conn-contended".to_string());
+            runtime.global_ws_message_token = Some("token-contended".to_string());
+        }
+        *state.global_ws_termio_tx.lock().await = Some(tx);
+        let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
+        let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
+            .unwrap_or_else(|| "desktop-primary".to_string());
+        let stream_key = cloud_mcp_terminal_output_stream_key(
+            &device_id,
+            "workspace-contended",
+            "pane-contended",
+            97,
+        );
+        let target = cloud_mcp_terminal_io_target(&stream_key).expect("contended stream target");
+        // Paused stream: the lane sits 16 bytes behind the journal with the
+        // acking viewer far outside the pause window.
+        let body = vec![b'z'; 200_016];
+        output.lock().unwrap().append(&body);
+        let total = body.len() as u64;
+        assert!(cloud_mcp_remember_terminal_output_tail(
+            &state,
+            &stream_key,
+            1,
+            total,
+            &body,
+        ));
+        cloud_mcp_terminal_output_note_emitted_n(&state, &stream_key, 200_000);
+        termio_test_subscribe(&state, &stream_key, "viewer-contended");
+        assert!(cloud_mcp_terminal_io_record_output_ack_if_subscribed(
+            &state,
+            &stream_key,
+            "viewer-contended",
+            10_000,
+        ));
+        assert!(cloud_mcp_terminal_output_flow_should_pause(
+            &state,
+            &stream_key
+        ));
+
+        // Simulate a publisher mid-frame: the test holds the output send
+        // lock while the catch-up ack arrives concurrently.
+        let guard = state.terminal_io_output_send_lock.lock().await;
+        let ack_state = state.clone();
+        let ack_output = Arc::clone(&output);
+        let ack_target = target.clone();
+        let ack_task = tauri::async_runtime::spawn(async move {
+            cloud_mcp_terminal_io_handle_output_ack(
+                &ack_state,
+                &ack_output,
+                &ack_target,
+                "viewer-contended",
+                200_000,
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // While the lock is held elsewhere the ack is invisible: nothing
+        // recorded, gate unflipped, nothing on the wire.
+        assert_eq!(
+            state
+                .terminal_io_acked_n_by_stream
+                .lock()
+                .unwrap()
+                .get(&stream_key)
+                .and_then(|origins| origins.get("viewer-contended").copied()),
+            Some(10_000)
+        );
+        assert!(cloud_mcp_terminal_output_flow_should_pause(
+            &state,
+            &stream_key
+        ));
+        assert!(rx.try_recv().is_err());
+        drop(guard);
+        let _ = ack_task.await;
+        // Once the lock releases, the ack lands and the replay covers the
+        // skipped [emitted_n, total) range before anything else can emit.
+        assert_eq!(
+            state
+                .terminal_io_acked_n_by_stream
+                .lock()
+                .unwrap()
+                .get(&stream_key)
+                .and_then(|origins| origins.get("viewer-contended").copied()),
+            Some(200_000)
+        );
+        let frame = rx.try_recv().expect("contended catch-up replay");
+        assert_eq!(frame["kind"], json!("termio.output"));
+        assert_eq!(frame["f"].as_u64(), Some(200_000));
+        assert_eq!(frame["n"].as_u64(), Some(total));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
+        assert!(!cloud_mcp_terminal_output_flow_should_pause(
+            &state,
+            &stream_key
+        ));
+    }
+
+    #[test]
+    fn termio_flow_resume_does_not_advance_emitted_on_failed_enqueue() {
+        let state = CloudMcpState::new();
+        // A sender whose receiver is already gone: every enqueue fails, as
+        // with a websocket torn down between reconnects.
+        let (dead_tx, dead_rx) = mpsc::unbounded_channel::<Value>();
+        drop(dead_rx);
+        tauri::async_runtime::block_on(async {
+            {
+                let mut runtime = state.inner.lock().await;
+                runtime.global_ws_connection_id = Some("conn-dead".to_string());
+                runtime.global_ws_message_token = Some("token-dead".to_string());
+            }
+            *state.global_ws_termio_tx.lock().await = Some(dead_tx);
+        });
+        let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
+        let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
+            .unwrap_or_else(|| "desktop-primary".to_string());
+        let stream_key = cloud_mcp_terminal_output_stream_key(
+            &device_id,
+            "workspace-deadtx",
+            "pane-deadtx",
+            98,
+        );
+        let target = cloud_mcp_terminal_io_target(&stream_key).expect("deadtx stream target");
+        // Multi-chunk missing range (> one 48KiB frame) so a mid-loop
+        // failure would be observable as partial advancement.
+        let emitted = 8_u64;
+        let body = vec![b'w'; emitted as usize + 100 * 1024];
+        output.lock().unwrap().append(&body);
+        let total = body.len() as u64;
+        assert!(cloud_mcp_remember_terminal_output_tail(
+            &state,
+            &stream_key,
+            1,
+            total,
+            &body,
+        ));
+        cloud_mcp_terminal_output_note_emitted_n(&state, &stream_key, emitted);
+        termio_test_subscribe(&state, &stream_key, "viewer-deadtx");
+        tauri::async_runtime::block_on(cloud_mcp_terminal_io_handle_output_ack(
+            &state,
+            &output,
+            &target,
+            "viewer-deadtx",
+            emitted,
+        ));
+        // Nothing was enqueued, so no byte may be claimed as emitted.
+        assert_eq!(
+            cloud_mcp_terminal_output_emitted_n(&state, &stream_key),
+            emitted
+        );
+        // A healthy sender arrives (reconnect): the retry replays the ENTIRE
+        // missing range from the original emitted_n — no partial advancement
+        // survived the failure.
+        let mut rx = termio_test_install_ws(&state);
+        tauri::async_runtime::block_on(cloud_mcp_terminal_io_handle_output_ack(
+            &state,
+            &output,
+            &target,
+            "viewer-deadtx",
+            emitted,
+        ));
+        let mut next_from = emitted;
+        while let Ok(frame) = rx.try_recv() {
+            assert_eq!(frame["kind"], json!("termio.output"));
+            assert_eq!(frame["f"].as_u64(), Some(next_from));
+            next_from = frame["n"].as_u64().expect("replay frame n");
+        }
+        assert_eq!(next_from, total);
+        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
+
+        // Snapshot skip-forward path under a dead sender: same contract.
+        let (dead_tx, dead_rx) = mpsc::unbounded_channel::<Value>();
+        drop(dead_rx);
+        tauri::async_runtime::block_on(async {
+            *state.global_ws_termio_tx.lock().await = Some(dead_tx);
+        });
+        let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
+        let stream_key = cloud_mcp_terminal_output_stream_key(
+            &device_id,
+            "workspace-deadsnap",
+            "pane-deadsnap",
+            99,
+        );
+        let target = cloud_mcp_terminal_io_target(&stream_key).expect("deadsnap stream target");
+        let big = vec![b'v'; CLOUD_MCP_TERMINAL_IO_SKIP_FORWARD_BYTES as usize + 4_096];
+        output.lock().unwrap().append(&big);
+        let total = big.len() as u64;
+        assert!(cloud_mcp_remember_terminal_output_tail(
+            &state,
+            &stream_key,
+            1,
+            total,
+            &big,
+        ));
+        cloud_mcp_terminal_output_note_emitted_n(&state, &stream_key, 8);
+        termio_test_subscribe(&state, &stream_key, "viewer-deadsnap");
+        tauri::async_runtime::block_on(cloud_mcp_terminal_io_handle_output_ack(
+            &state,
+            &output,
+            &target,
+            "viewer-deadsnap",
+            8,
+        ));
+        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), 8);
+        let mut rx = termio_test_install_ws(&state);
+        tauri::async_runtime::block_on(cloud_mcp_terminal_io_handle_output_ack(
+            &state,
+            &output,
+            &target,
+            "viewer-deadsnap",
+            8,
+        ));
+        let frame = rx.try_recv().expect("retried skip-forward snapshot");
+        assert_eq!(frame["kind"], json!("termio.snapshot"));
+        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
+    }
+
+    #[test]
+    fn termio_flow_resume_partial_replay_failure_never_advances_emitted() {
+        let state = CloudMcpState::new();
+        let mut rx = termio_test_install_ws(&state);
+        let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
+        let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
+            .unwrap_or_else(|| "desktop-primary".to_string());
+        let stream_key = cloud_mcp_terminal_output_stream_key(
+            &device_id,
+            "workspace-partial",
+            "pane-partial",
+            100,
+        );
+        let target = cloud_mcp_terminal_io_target(&stream_key).expect("partial stream target");
+        // Three-chunk missing range: 49152 + 49152 + 4096 bytes.
+        let emitted = 8_u64;
+        let body = vec![b'p'; emitted as usize + 100 * 1024];
+        output.lock().unwrap().append(&body);
+        let total = body.len() as u64;
+        assert!(cloud_mcp_remember_terminal_output_tail(
+            &state,
+            &stream_key,
+            1,
+            total,
+            &body,
+        ));
+        cloud_mcp_terminal_output_note_emitted_n(&state, &stream_key, emitted);
+        termio_test_subscribe(&state, &stream_key, "viewer-partial");
+        // The sender dies AFTER one successfully enqueued chunk.
+        TERMIO_FLOW_REPLAY_FAIL_AFTER_CHUNKS.with(|cell| cell.set(Some(1)));
+        tauri::async_runtime::block_on(cloud_mcp_terminal_io_handle_output_ack(
+            &state,
+            &output,
+            &target,
+            "viewer-partial",
+            emitted,
+        ));
+        // Exactly the successful prefix reached the wire...
+        let frame = rx.try_recv().expect("successful prefix chunk");
+        assert_eq!(frame["f"].as_u64(), Some(emitted));
+        assert_eq!(
+            frame["n"].as_u64(),
+            Some(emitted + CLOUD_MCP_TERMINAL_OUTPUT_REPLAY_CHUNK_BYTES as u64)
+        );
+        assert!(rx.try_recv().is_err());
+        // ...but emitted_n must NOT advance past the original offset even
+        // though a prefix succeeded: a partial replay is a failed replay.
+        assert_eq!(
+            cloud_mcp_terminal_output_emitted_n(&state, &stream_key),
+            emitted
+        );
+        // The failpoint is one-shot; the healthy retry replays the ENTIRE
+        // range from the original emitted_n (the duplicated prefix is
+        // dropped web-side by the n-monotonic acceptance).
+        tauri::async_runtime::block_on(cloud_mcp_terminal_io_handle_output_ack(
+            &state,
+            &output,
+            &target,
+            "viewer-partial",
+            emitted,
+        ));
+        let mut next_from = emitted;
+        let mut frames = 0_usize;
+        while let Ok(frame) = rx.try_recv() {
+            assert_eq!(frame["kind"], json!("termio.output"));
+            assert_eq!(frame["f"].as_u64(), Some(next_from));
+            next_from = frame["n"].as_u64().expect("replay frame n");
+            frames += 1;
+        }
+        assert_eq!(frames, 3);
+        assert_eq!(next_from, total);
+        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
+    }
+
+    #[test]
+    fn termio_flow_emitted_clock_resets_on_generation_rollback() {
+        let state = CloudMcpState::new();
+        let stream_key = "device:workspace:pane:85";
+        let body = vec![b'r'; 100];
+        assert!(cloud_mcp_remember_terminal_output_tail(
+            &state, stream_key, 1, 100, &body,
+        ));
+        cloud_mcp_terminal_output_note_emitted_n(&state, stream_key, 100);
+        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, stream_key), 100);
+        // Defensive same-instance byte-clock rollback: the retained tail AND
+        // the broadcast-lane high-water mark reset together, so flow control
+        // never compares fresh acks against the old, unreachable clock.
+        assert!(cloud_mcp_remember_terminal_output_tail(
+            &state,
+            stream_key,
+            2,
+            50,
+            b"rollback",
+        ));
+        {
+            let tails = state.terminal_io_tail_by_stream.lock().unwrap();
+            let tail = tails.get(stream_key).expect("rolled-back tail");
+            assert_eq!((tail.seq, tail.total_bytes, tail.emitted_n), (2, 50, 0));
+            assert_eq!(tail.tail, b"rollback");
+        }
+        // The max-only note helper works on the fresh clock again.
+        cloud_mcp_terminal_output_note_emitted_n(&state, stream_key, 50);
+        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, stream_key), 50);
+    }
+
+    #[test]
+    fn termio_flow_ack_state_follows_lease_reap_and_terminal_close() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let _ = agent_chat_session_clear_observed_terminals();
+        let state = CloudMcpState::new();
+        let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
+            .unwrap_or_else(|| "desktop-primary".to_string());
+        // Lease reap drops the reaped origin's ack state.
+        let reap_stream = cloud_mcp_terminal_output_stream_key(
+            &device_id,
+            "workspace-ack-reap",
+            "pane-ack-reap",
+            93,
+        );
+        let now_ms = cloud_mcp_now_ms();
+        let stale_ms =
+            now_ms.saturating_sub(TERMINAL_REMOTE_PRESENCE_STALE_ORIGIN_TTL_MS + 5_000);
+        state
+            .terminal_io_stream_subscriptions
+            .lock()
+            .unwrap()
+            .insert(
+                reap_stream.clone(),
+                HashMap::from([(
+                    "viewer-ack-stale".to_string(),
+                    termio_test_subscription("attach-ack-stale", stale_ms),
+                )]),
+            );
+        assert!(cloud_mcp_terminal_io_record_output_ack_if_subscribed(
+            &state,
+            &reap_stream,
+            "viewer-ack-stale",
+            55,
+        ));
+        assert_eq!(state.terminal_io_acking_streams.load(Ordering::SeqCst), 1);
+        assert!(cloud_mcp_prune_terminal_remote_presence_stale_origins_at(
+            &state, now_ms
+        ));
+        assert!(!state
+            .terminal_io_acked_n_by_stream
+            .lock()
+            .unwrap()
+            .contains_key(&reap_stream));
+        assert_eq!(state.terminal_io_acking_streams.load(Ordering::SeqCst), 0);
+        // Terminal close clears the whole stream's ack state.
+        let close_stream = cloud_mcp_terminal_output_stream_key(
+            &device_id,
+            "workspace-ack-close",
+            "pane-ack-close",
+            94,
+        );
+        state
+            .terminal_io_stream_subscriptions
+            .lock()
+            .unwrap()
+            .insert(
+                close_stream.clone(),
+                HashMap::from([(
+                    "viewer-ack-close".to_string(),
+                    termio_test_subscription("attach-ack-close", cloud_mcp_now_ms()),
+                )]),
+            );
+        assert!(cloud_mcp_terminal_io_record_output_ack_if_subscribed(
+            &state,
+            &close_stream,
+            "viewer-ack-close",
+            9,
+        ));
+        assert!(cloud_mcp_clear_terminal_remote_presence_for_terminal(
+            &state,
+            "",
+            "pane-ack-close",
+            94,
+            "test_ack_terminal_close",
+        ));
+        assert!(!state
+            .terminal_io_acked_n_by_stream
+            .lock()
+            .unwrap()
+            .contains_key(&close_stream));
+        assert_eq!(state.terminal_io_acking_streams.load(Ordering::SeqCst), 0);
+        let _ = agent_chat_session_clear_observed_terminals();
     }
 
     #[test]
