@@ -567,7 +567,12 @@ struct CloudMcpState {
     global_ws_perma_offline: Arc<AtomicBool>,
     global_ws_window_start: Arc<StdMutex<Instant>>,
     global_ws_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Value>>>>,
-    global_ws_termio_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Value>>>>,
+    // The termio fast lane is published as one unit: the sender AND the
+    // connection's binary-output capability live in the same slot, so a
+    // publisher can never observe a fresh sender with a stale capability —
+    // the capability it reads was set by the ready frame of the SAME
+    // connection whose sender it holds.
+    global_ws_termio_tx: Arc<Mutex<Option<CloudMcpTermioLane>>>,
     global_ws_pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     global_ws_events: tokio::sync::broadcast::Sender<Value>,
     terminal_io_stream_subscriptions:
@@ -12962,7 +12967,7 @@ async fn cloud_mcp_open_global_ws(
     .await;
     let (mut write, mut read) = stream.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
-    let (termio_tx, mut termio_rx) = mpsc::unbounded_channel::<Value>();
+    let (termio_tx, mut termio_rx) = mpsc::unbounded_channel::<CloudMcpTermioOutbound>();
     let ws_epoch = state.global_ws_epoch.fetch_add(1, Ordering::SeqCst) + 1;
     cloud_mcp_log_voice_shared_ws(
         "voice_agent.shared_ws.epoch_opened",
@@ -12979,9 +12984,16 @@ async fn cloud_mcp_open_global_ws(
         let mut tx_slot = state.global_ws_tx.lock().await;
         *tx_slot = Some(tx.clone());
     }
+    // The lane's capability flag is created FALSE for every connection and
+    // published in the same slot as the sender: the capability any publisher
+    // observes was set by the ready frame of this very connection.
+    let termio_binary = Arc::new(AtomicBool::new(false));
     {
         let mut tx_slot = state.global_ws_termio_tx.lock().await;
-        *tx_slot = Some(termio_tx.clone());
+        *tx_slot = Some(CloudMcpTermioLane {
+            tx: termio_tx.clone(),
+            binary: Arc::clone(&termio_binary),
+        });
     }
     drop(tx);
     drop(termio_tx);
@@ -13019,24 +13031,15 @@ async fn cloud_mcp_open_global_ws(
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
             };
-            let outgoing_kind = outgoing
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or("termio.message");
-            if let Err(error) = write.send(Message::Text(outgoing.to_string().into())).await {
+            let (ws_message, outgoing_kind, outgoing_bytes, outgoing_meta) =
+                cloud_mcp_termio_outbound_wire(outgoing, "terminal_fast_lane_eager");
+            if let Err(error) = write.send(ws_message).await {
                 terminal_write_error = Some(format!(
                     "Cloud MCP app websocket terminal write failed: {error}"
                 ));
                 break;
             }
-            cloud_mcp_store_ws_outbound(
-                outgoing_kind,
-                cloud_mcp_sync_payload_bytes(&outgoing),
-                json!({
-                    "id": outgoing.get("id").cloned().unwrap_or(Value::Null),
-                    "source": "terminal_fast_lane_eager",
-                }),
-            );
+            cloud_mcp_store_ws_outbound(&outgoing_kind, outgoing_bytes, outgoing_meta);
         }
         if let Some(error) = terminal_write_error {
             break Err(error);
@@ -13072,10 +13075,13 @@ async fn cloud_mcp_open_global_ws(
                     CLOUD_MCP_WS_LAST_INBOUND_MS.store(cloud_mcp_now_ms(), Ordering::Release);
                 }
                 match incoming {
-                    Ok(Message::Text(text)) => cloud_mcp_handle_global_ws_message(state, text.as_str()).await,
+                    Ok(Message::Text(text)) => {
+                        cloud_mcp_handle_global_ws_message(state, text.as_str(), &termio_binary)
+                            .await
+                    }
                     Ok(Message::Binary(bytes)) => {
                         if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-                            cloud_mcp_handle_global_ws_message(state, &text).await;
+                            cloud_mcp_handle_global_ws_message(state, &text, &termio_binary).await;
                         } else {
                             cloud_mcp_store_ws_inbound(
                                 "binary",
@@ -13133,24 +13139,12 @@ async fn cloud_mcp_open_global_ws(
                     }
                     break Err("Cloud MCP app websocket terminal sender closed.".to_string());
                 };
-                let outgoing_kind = outgoing
-                    .get("kind")
-                    .and_then(Value::as_str)
-                    .unwrap_or("termio.message");
-                if let Err(error) = write
-                    .send(Message::Text(outgoing.to_string().into()))
-                    .await
-                {
+                let (ws_message, outgoing_kind, outgoing_bytes, outgoing_meta) =
+                    cloud_mcp_termio_outbound_wire(outgoing, "terminal_fast_lane");
+                if let Err(error) = write.send(ws_message).await {
                     break Err(format!("Cloud MCP app websocket terminal write failed: {error}"));
                 }
-                cloud_mcp_store_ws_outbound(
-                    outgoing_kind,
-                    cloud_mcp_sync_payload_bytes(&outgoing),
-                    json!({
-                        "id": outgoing.get("id").cloned().unwrap_or(Value::Null),
-                        "source": "terminal_fast_lane",
-                    }),
-                );
+                cloud_mcp_store_ws_outbound(&outgoing_kind, outgoing_bytes, outgoing_meta);
             }
             _ = &mut ready_timeout, if !ready_seen => {
                 break Err(format!(
@@ -17888,7 +17882,11 @@ async fn cloud_mcp_handle_list_agent_models_request(state: CloudMcpState, reques
     }
 }
 
-async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
+async fn cloud_mcp_handle_global_ws_message(
+    state: &CloudMcpState,
+    text: &str,
+    termio_binary: &Arc<AtomicBool>,
+) {
     let Ok(message) = serde_json::from_str::<Value>(text) else {
         return;
     };
@@ -17968,6 +17966,12 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             runtime.global_ws_connection_id = Some(connection_id.clone());
             runtime.global_ws_message_token = Some(message_token.clone());
         }
+        // Bound to THIS connection: the flag lives in the lane published by
+        // the same websocket task that is executing this handler.
+        termio_binary.store(
+            cloud_mcp_ready_frame_advertises_termio_binary(&message),
+            Ordering::SeqCst,
+        );
         CLOUD_MCP_WS_TIMEOUT_STRIKES.store(0, Ordering::Release);
         log_cloud_sync_event(
             "ws.ready",
@@ -20564,11 +20568,21 @@ fn cloud_mcp_remote_workspace_activation_error_allows_pending(error: &str) -> bo
 }
 
 fn cloud_mcp_agent_prompt_answer_details_failed(details: &Value) -> bool {
+    if cloud_mcp_agent_prompt_answer_details_pending_confirmation(details) {
+        return false;
+    }
     details
         .get("status")
         .and_then(Value::as_str)
         .is_some_and(|status| status.eq_ignore_ascii_case("failed"))
         || details.get("answered").and_then(Value::as_bool) == Some(false)
+}
+
+fn cloud_mcp_agent_prompt_answer_details_pending_confirmation(details: &Value) -> bool {
+    details
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status.eq_ignore_ascii_case("accepted_pending_confirmation"))
 }
 
 fn cloud_mcp_apply_remote_agent_prompt_lever(
@@ -20587,6 +20601,18 @@ fn cloud_mcp_apply_remote_agent_prompt_lever(
     let event = event.clone();
     tauri::async_runtime::spawn(async move {
         match crate::terminal_answer_agent_prompt_remote_command(app, event.clone()).await {
+            Ok(details)
+                if cloud_mcp_agent_prompt_answer_details_pending_confirmation(&details) =>
+            {
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state,
+                    &event,
+                    "accepted",
+                    "Agent prompt answer submitted; awaiting provider confirmation.",
+                    Some(&details),
+                )
+                .await;
+            }
             Ok(details) if cloud_mcp_agent_prompt_answer_details_failed(&details) => {
                 let _ = cloud_mcp_send_remote_command_status_event(
                     &state,
@@ -20643,6 +20669,16 @@ mod cloud_mcp_agent_prompt_answer_tests {
             "status": "applied",
             "answered": true,
         })));
+        let pending = json!({
+            "status": "accepted_pending_confirmation",
+            "answered": false,
+            "accepted": true,
+            "resolved": false,
+        });
+        assert!(cloud_mcp_agent_prompt_answer_details_pending_confirmation(
+            &pending
+        ));
+        assert!(!cloud_mcp_agent_prompt_answer_details_failed(&pending));
     }
 }
 
@@ -30546,7 +30582,7 @@ fn cloud_mcp_terminal_io_expired_recent_prune(state: &CloudMcpState, now_ms: u64
 // subscriptions, then owners; nothing acquires them in reverse.
 fn cloud_mcp_terminal_io_expired_emit_pair(
     state: &CloudMcpState,
-    tx: &mpsc::UnboundedSender<Value>,
+    tx: &CloudMcpTermioSender,
     stream_key: &str,
     origin: &str,
     envelope: Value,
@@ -30569,7 +30605,7 @@ fn cloud_mcp_terminal_io_expired_emit_pair(
     }
     let Ok(mut recent) = state.terminal_io_expired_recently_emitted.lock() else {
         // Poisoned dedupe bookkeeping must not block expiries entirely.
-        return tx.send(envelope).is_ok();
+        return tx.send_json(envelope).is_ok();
     };
     let key = (stream_key.to_string(), origin.to_string());
     if recent.get(&key).is_some_and(|emitted_at_ms| {
@@ -30581,7 +30617,7 @@ fn cloud_mcp_terminal_io_expired_emit_pair(
     // the send: a task still holding the closed pre-reconnect sender must not
     // record the pair and suppress a concurrent publisher that already owns
     // the fresh one.
-    if tx.send(envelope).is_err() {
+    if tx.send_json(envelope).is_err() {
         return false;
     }
     recent.insert(key, now_ms);
@@ -30602,11 +30638,7 @@ async fn cloud_mcp_publish_terminal_io_expired(
     state: &CloudMcpState,
     expired: &[(String, String)],
 ) {
-    let tx = if let Some(tx) = state.global_ws_termio_tx.lock().await.as_ref().cloned() {
-        tx
-    } else if let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() {
-        tx
-    } else {
+    let Some(tx) = cloud_mcp_termio_sender(state).await else {
         return;
     };
     let Ok(auth) = cloud_mcp_ws_auth_object(state).await else {
@@ -31097,25 +31129,213 @@ fn cloud_mcp_clear_terminal_remote_presence_for_terminal(
     changed
 }
 
-async fn cloud_mcp_send_terminal_io_message(
+// W7 binary output lane (DFTB): termio.output/termio.snapshot payloads travel
+// as websocket binary frames when the current cloud connection advertised
+// "termio.binary". Wire format: [0..4) magic "DFTB" | [4] version u8=1 |
+// [5..9) header_len u32 BE | header JSON (the frame exactly as the JSON path
+// would send it, minus b/bytes_base64 — the payload moves to the raw tail).
+// Control frames always stay JSON; every emit site keeps its JSON path.
+const CLOUD_MCP_TERMIO_BINARY_MAGIC: &[u8; 4] = b"DFTB";
+const CLOUD_MCP_TERMIO_BINARY_VERSION: u8 = 1;
+// Same decoded-byte budget the cloud enforces on base64 payloads today
+// (APP_WS_TERMIO_MAX_DECODED_BYTES): the binary lane must never admit more
+// than the base64 lane did.
+const CLOUD_MCP_TERMIO_BINARY_MAX_PAYLOAD_BYTES: usize = 6 * 1024 * 1024;
+
+struct CloudMcpTermioBinaryFrame {
+    kind: String,
+    id: String,
+    bytes: Vec<u8>,
+}
+
+enum CloudMcpTermioOutbound {
+    Json(Value),
+    Binary(CloudMcpTermioBinaryFrame),
+}
+
+#[cfg(test)]
+impl CloudMcpTermioOutbound {
+    fn is_binary(&self) -> bool {
+        matches!(self, Self::Binary(_))
+    }
+
+    // Reassemble the frame the receiving side would materialize: for binary
+    // frames, the decoded header plus the payload re-encoded as `b` must be
+    // exactly the JSON-path frame.
+    fn to_frame_value(&self) -> Value {
+        match self {
+            Self::Json(value) => value.clone(),
+            Self::Binary(frame) => {
+                let (mut header, payload) =
+                    cloud_mcp_termio_binary_decode(&frame.bytes).expect("valid DFTB frame");
+                header["b"] = json!(general_purpose::STANDARD.encode(payload));
+                header
+            }
+        }
+    }
+}
+
+fn cloud_mcp_termio_binary_encode(header: &Value, payload: &[u8]) -> Result<Vec<u8>, String> {
+    if payload.len() > CLOUD_MCP_TERMIO_BINARY_MAX_PAYLOAD_BYTES {
+        return Err(format!(
+            "Terminal binary payload exceeds {CLOUD_MCP_TERMIO_BINARY_MAX_PAYLOAD_BYTES} bytes."
+        ));
+    }
+    let header_bytes = serde_json::to_vec(header)
+        .map_err(|error| format!("Terminal binary header failed to serialize: {error}"))?;
+    let header_len = u32::try_from(header_bytes.len())
+        .map_err(|_| "Terminal binary header is too large.".to_string())?;
+    let mut wire = Vec::with_capacity(9 + header_bytes.len() + payload.len());
+    wire.extend_from_slice(CLOUD_MCP_TERMIO_BINARY_MAGIC);
+    wire.push(CLOUD_MCP_TERMIO_BINARY_VERSION);
+    wire.extend_from_slice(&header_len.to_be_bytes());
+    wire.extend_from_slice(&header_bytes);
+    wire.extend_from_slice(payload);
+    Ok(wire)
+}
+
+#[cfg(test)]
+fn cloud_mcp_termio_binary_decode(bytes: &[u8]) -> Result<(Value, &[u8]), String> {
+    if bytes.len() < 9 {
+        return Err("Terminal binary frame is too short.".to_string());
+    }
+    if &bytes[0..4] != CLOUD_MCP_TERMIO_BINARY_MAGIC {
+        return Err("Terminal binary frame has a bad magic.".to_string());
+    }
+    if bytes[4] != CLOUD_MCP_TERMIO_BINARY_VERSION {
+        return Err("Terminal binary frame has an unsupported version.".to_string());
+    }
+    let header_len = u32::from_be_bytes(bytes[5..9].try_into().expect("4 header-length bytes"));
+    let header_end = 9usize
+        .checked_add(header_len as usize)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| "Terminal binary frame header length is invalid.".to_string())?;
+    let header = serde_json::from_slice::<Value>(&bytes[9..header_end])
+        .map_err(|error| format!("Terminal binary frame header is not JSON: {error}"))?;
+    if cloud_mcp_termio_binary_payload_exceeds_cap(bytes.len() - header_end) {
+        return Err("Terminal binary payload exceeds the decoded-byte cap.".to_string());
+    }
+    Ok((header, &bytes[header_end..]))
+}
+
+#[cfg(test)]
+fn cloud_mcp_termio_binary_payload_exceeds_cap(payload_len: usize) -> bool {
+    payload_len > CLOUD_MCP_TERMIO_BINARY_MAX_PAYLOAD_BYTES
+}
+
+// Materialize one termio outbound item for the websocket writer, plus the
+// telemetry fields — binary frames report kind/bytes/id from the pre-built
+// meta without re-parsing the wire bytes.
+fn cloud_mcp_termio_outbound_wire(
+    outgoing: CloudMcpTermioOutbound,
+    source: &'static str,
+) -> (Message, String, u64, Value) {
+    match outgoing {
+        CloudMcpTermioOutbound::Json(value) => {
+            let kind = value
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("termio.message")
+                .to_string();
+            let meta = json!({
+                "id": value.get("id").cloned().unwrap_or(Value::Null),
+                "source": source,
+            });
+            let bytes = cloud_mcp_sync_payload_bytes(&value);
+            (Message::Text(value.to_string().into()), kind, bytes, meta)
+        }
+        CloudMcpTermioOutbound::Binary(frame) => {
+            let meta = json!({
+                "id": frame.id,
+                "encoding": "binary",
+                "source": source,
+            });
+            let bytes = frame.bytes.len() as u64;
+            (Message::Binary(frame.bytes.into()), frame.kind, bytes, meta)
+        }
+    }
+}
+
+// One published fast lane = one connection: the sender and that connection's
+// binary-output capability travel together. The capability flag is created
+// FALSE with every lane and set only by the ready frame of the connection
+// that owns the lane, so "fresh sender + stale capability" cannot exist.
+#[derive(Clone)]
+struct CloudMcpTermioLane {
+    tx: mpsc::UnboundedSender<CloudMcpTermioOutbound>,
+    binary: Arc<AtomicBool>,
+}
+
+// The termio send lane a publisher holds: the fast lane carries both JSON and
+// pre-encoded binary frames plus the capability snapshot taken from the SAME
+// slot as the sender; the global lane (fallback when the fast lane is not
+// installed) is JSON-only, so binary emission requires the fast lane.
+#[derive(Clone)]
+enum CloudMcpTermioSender {
+    Fast(mpsc::UnboundedSender<CloudMcpTermioOutbound>, bool),
+    Global(mpsc::UnboundedSender<Value>),
+}
+
+impl CloudMcpTermioSender {
+    fn send_json(&self, envelope: Value) -> Result<(), ()> {
+        match self {
+            Self::Fast(tx, _) => tx
+                .send(CloudMcpTermioOutbound::Json(envelope))
+                .map_err(|_| ()),
+            Self::Global(tx) => tx.send(envelope).map_err(|_| ()),
+        }
+    }
+
+    fn send_binary(&self, frame: CloudMcpTermioBinaryFrame) -> Result<(), ()> {
+        match self {
+            Self::Fast(tx, _) => tx
+                .send(CloudMcpTermioOutbound::Binary(frame))
+                .map_err(|_| ()),
+            Self::Global(_) => Err(()),
+        }
+    }
+
+    fn supports_binary(&self) -> bool {
+        matches!(self, Self::Fast(_, true))
+    }
+}
+
+async fn cloud_mcp_termio_sender(state: &CloudMcpState) -> Option<CloudMcpTermioSender> {
+    if let Some(lane) = state.global_ws_termio_tx.lock().await.as_ref() {
+        return Some(CloudMcpTermioSender::Fast(
+            lane.tx.clone(),
+            lane.binary.load(Ordering::SeqCst),
+        ));
+    }
+    state
+        .global_ws_tx
+        .lock()
+        .await
+        .as_ref()
+        .cloned()
+        .map(CloudMcpTermioSender::Global)
+}
+
+fn cloud_mcp_ready_frame_advertises_termio_binary(message: &Value) -> bool {
+    message
+        .get("message_types")
+        .and_then(Value::as_array)
+        .is_some_and(|types| {
+            types
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|value| value.trim().eq_ignore_ascii_case("termio.binary"))
+        })
+}
+
+async fn cloud_mcp_terminal_io_envelope(
     state: &CloudMcpState,
     request: Option<&Value>,
     target: &CloudMcpTerminalIoTarget,
     kind: &str,
-    id: String,
+    id: &str,
     payload: Value,
-) -> Result<(), String> {
-    let tx = if let Some(tx) = state.global_ws_termio_tx.lock().await.as_ref().cloned() {
-        tx
-    } else {
-        state
-            .global_ws_tx
-            .lock()
-            .await
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| "Cloud MCP websocket is unavailable.".to_string())?
-    };
+) -> Result<Value, String> {
     let auth = cloud_mcp_ws_auth_object(state).await?;
     let mut envelope = json!({
         "v": 1,
@@ -31141,7 +31361,61 @@ async fn cloud_mcp_send_terminal_io_message(
     {
         envelope["origin_connection_id"] = json!(origin);
     }
-    tx.send(envelope)
+    Ok(envelope)
+}
+
+async fn cloud_mcp_send_terminal_io_message(
+    state: &CloudMcpState,
+    request: Option<&Value>,
+    target: &CloudMcpTerminalIoTarget,
+    kind: &str,
+    id: String,
+    payload: Value,
+) -> Result<(), String> {
+    let sender = cloud_mcp_termio_sender(state)
+        .await
+        .ok_or_else(|| "Cloud MCP websocket is unavailable.".to_string())?;
+    let envelope = cloud_mcp_terminal_io_envelope(state, request, target, kind, &id, payload).await?;
+    sender
+        .send_json(envelope)
+        .map_err(|_| "Cloud MCP websocket terminal sender is closed.".to_string())
+}
+
+// Payload-carrying termio send (termio.output / termio.snapshot): binary DFTB
+// when the connection advertised the capability AND the fast lane is
+// installed; otherwise the byte-identical JSON frame with base64 `b`. The
+// header IS the JSON envelope (auth included — the cloud validates then
+// strips it, exactly like the JSON path).
+async fn cloud_mcp_send_terminal_io_payload_message(
+    state: &CloudMcpState,
+    request: Option<&Value>,
+    target: &CloudMcpTerminalIoTarget,
+    kind: &str,
+    id: String,
+    meta: Value,
+    payload: &[u8],
+) -> Result<(), String> {
+    let sender = cloud_mcp_termio_sender(state)
+        .await
+        .ok_or_else(|| "Cloud MCP websocket is unavailable.".to_string())?;
+    let mut envelope =
+        cloud_mcp_terminal_io_envelope(state, request, target, kind, &id, meta).await?;
+    if sender.supports_binary() {
+        // Over-cap payloads fall back to the JSON path: identical to today's
+        // behavior, where the receiving side enforces the byte budget.
+        if let Ok(bytes) = cloud_mcp_termio_binary_encode(&envelope, payload) {
+            return sender
+                .send_binary(CloudMcpTermioBinaryFrame {
+                    kind: kind.to_string(),
+                    id,
+                    bytes,
+                })
+                .map_err(|_| "Cloud MCP websocket terminal sender is closed.".to_string());
+        }
+    }
+    envelope["b"] = json!(general_purpose::STANDARD.encode(payload));
+    sender
+        .send_json(envelope)
         .map_err(|_| "Cloud MCP websocket terminal sender is closed.".to_string())
 }
 
@@ -31383,7 +31657,7 @@ async fn cloud_mcp_handle_terminal_io_message(
                 for (chunk_from, chunk_to, chunk) in
                     cloud_mcp_terminal_output_replay_chunks(replay_from, &replay_bytes)
                 {
-                    let _ = cloud_mcp_send_terminal_io_message(
+                    let _ = cloud_mcp_send_terminal_io_payload_message(
                         state,
                         Some(message),
                         &target,
@@ -31399,8 +31673,8 @@ async fn cloud_mcp_handle_terminal_io_message(
                             "n": chunk_to,
                             "from_total_bytes": chunk_from,
                             "total_bytes": chunk_to,
-                            "b": general_purpose::STANDARD.encode(chunk),
                         }),
+                        chunk,
                     )
                     .await;
                 }
@@ -31426,7 +31700,7 @@ async fn cloud_mcp_handle_terminal_io_message(
                     json!({"attachment_id": request_id, "cols": size.cols, "rows": size.rows, "seq": seq, "q": seq, "f": total, "n": total, "from_total_bytes": total, "total_bytes": total, "mode": "vt", "retained_tail_bytes": retained_tail_bytes, "capabilities": ["resume", "expired", "hb_sub"]}),
                 )
                 .await;
-                let _ = cloud_mcp_send_terminal_io_message(
+                let _ = cloud_mcp_send_terminal_io_payload_message(
                     state,
                     Some(message),
                     &target,
@@ -31440,12 +31714,12 @@ async fn cloud_mcp_handle_terminal_io_message(
                         "n": total,
                         "from_total_bytes": total,
                         "total_bytes": total,
-                        "b": general_purpose::STANDARD.encode(bytes),
                         "mode": "vt",
                         "reset": true,
                         "truncated": false,
                         "retained_tail_bytes": retained_tail_bytes,
                     }),
+                    &bytes,
                 )
                 .await;
             }
@@ -32425,7 +32699,7 @@ async fn cloud_mcp_terminal_output_flow_resume_locked(
             if termio_flow_replay_fail_point_triggered(_index) {
                 return;
             }
-            if cloud_mcp_send_terminal_io_message(
+            if cloud_mcp_send_terminal_io_payload_message(
                 state,
                 None,
                 target,
@@ -32441,8 +32715,8 @@ async fn cloud_mcp_terminal_output_flow_resume_locked(
                     "n": chunk_to,
                     "from_total_bytes": chunk_from,
                     "total_bytes": chunk_to,
-                    "b": general_purpose::STANDARD.encode(chunk),
                 }),
+                chunk,
             )
             .await
             .is_err()
@@ -32476,7 +32750,7 @@ async fn cloud_mcp_terminal_output_flow_resume_locked(
             .ok()
             .and_then(|tails| tails.get(&target.stream_key).map(|tail| tail.seq))
             .unwrap_or(0);
-        if cloud_mcp_send_terminal_io_message(
+        if cloud_mcp_send_terminal_io_payload_message(
             state,
             None,
             target,
@@ -32493,12 +32767,12 @@ async fn cloud_mcp_terminal_output_flow_resume_locked(
                 "n": snapshot_total,
                 "from_total_bytes": snapshot_total,
                 "total_bytes": snapshot_total,
-                "b": general_purpose::STANDARD.encode(bytes),
                 "mode": "vt",
                 "reset": true,
                 "truncated": false,
                 "retained_tail_bytes": retained_tail_bytes,
             }),
+            &bytes,
         )
         .await
         .is_err()
@@ -32566,11 +32840,7 @@ pub(crate) fn cloud_mcp_publish_terminal_output_delta(
         if cloud_mcp_terminal_output_flow_should_pause(&state, &stream_key) {
             return;
         }
-        let tx = if let Some(tx) = state.global_ws_termio_tx.lock().await.as_ref().cloned() {
-            tx
-        } else if let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() {
-            tx
-        } else {
+        let Some(sender) = cloud_mcp_termio_sender(&state).await else {
             return;
         };
         let Ok(auth) = cloud_mcp_ws_auth_object(&state).await else {
@@ -32592,7 +32862,7 @@ pub(crate) fn cloud_mcp_publish_terminal_output_delta(
                 "previous_seq": previous_seq,
                 "reason": "desktop_output_sequence_gap",
             });
-            if tx.send(gap_envelope).is_err() {
+            if sender.send_json(gap_envelope).is_err() {
                 cloud_mcp_mark_global_ws_disconnected(
                     &state,
                     "Cloud MCP app websocket terminal-output sender is closed.",
@@ -32601,13 +32871,14 @@ pub(crate) fn cloud_mcp_publish_terminal_output_delta(
                 return;
             }
         }
-        let envelope = json!({
+        let frame_id = format!("termio-output-{instance_id}-{seq}");
+        let mut envelope = json!({
             "v": 1,
             "kind": "termio.output",
             "contract": CLOUD_MCP_TERMINAL_IO_CONTRACT,
             "auth": auth,
             "client_id": CLOUD_MCP_RUST_CLIENT_ID,
-            "id": format!("termio-output-{instance_id}-{seq}"),
+            "id": frame_id.as_str(),
             "sk": stream_key.as_str(),
             "q": seq,
             "seq": seq,
@@ -32615,9 +32886,29 @@ pub(crate) fn cloud_mcp_publish_terminal_output_delta(
             "n": total_bytes,
             "from_total_bytes": from_total_bytes,
             "total_bytes": total_bytes,
-            "b": general_purpose::STANDARD.encode(chunk),
         });
-        if tx.send(envelope).is_err() {
+        // Binary DFTB when the connection advertised the capability; the
+        // envelope above (without b) IS the binary header. Over-cap payloads
+        // fall back to JSON, matching today's receiver-enforced budget.
+        let binary_wire = if sender.supports_binary() {
+            cloud_mcp_termio_binary_encode(&envelope, &chunk).ok()
+        } else {
+            None
+        };
+        let sent = match binary_wire {
+            Some(bytes) => sender
+                .send_binary(CloudMcpTermioBinaryFrame {
+                    kind: "termio.output".to_string(),
+                    id: frame_id,
+                    bytes,
+                })
+                .is_ok(),
+            None => {
+                envelope["b"] = json!(general_purpose::STANDARD.encode(&chunk));
+                sender.send_json(envelope).is_ok()
+            }
+        };
+        if !sent {
             cloud_mcp_mark_global_ws_disconnected(
                 &state,
                 "Cloud MCP app websocket terminal-output sender is closed.",
@@ -40755,6 +41046,7 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         "session_state": payload.session_state.as_str(),
         "input_ready": payload.input_ready,
         "status_seq": status_seq,
+        "prompt_state_seq": status_seq,
         "observed_at_ms": payload.observed_at_ms,
         "hook_timestamp_ms": payload.hook_timestamp_ms,
         "prompt_id": prompt_id,
@@ -58532,17 +58824,433 @@ mod cloud_mcp_tests {
         }
     }
 
-    fn termio_test_install_ws(state: &CloudMcpState) -> mpsc::UnboundedReceiver<Value> {
-        let (tx, rx) = mpsc::unbounded_channel::<Value>();
+    fn termio_test_install_ws(
+        state: &CloudMcpState,
+    ) -> mpsc::UnboundedReceiver<CloudMcpTermioOutbound> {
+        let (tx, rx) = mpsc::unbounded_channel::<CloudMcpTermioOutbound>();
         tauri::async_runtime::block_on(async {
             {
                 let mut runtime = state.inner.lock().await;
                 runtime.global_ws_connection_id = Some("conn-flow-test".to_string());
                 runtime.global_ws_message_token = Some("token-flow-test".to_string());
             }
-            *state.global_ws_termio_tx.lock().await = Some(tx);
+            // Like the real open path: a fresh lane always starts non-binary.
+            *state.global_ws_termio_tx.lock().await = Some(CloudMcpTermioLane {
+                tx,
+                binary: Arc::new(AtomicBool::new(false)),
+            });
         });
         rx
+    }
+
+    // Flip the CURRENT lane's capability, as the ready handler of the owning
+    // connection would.
+    fn termio_test_set_binary(state: &CloudMcpState, enabled: bool) {
+        tauri::async_runtime::block_on(async {
+            if let Some(lane) = state.global_ws_termio_tx.lock().await.as_ref() {
+                lane.binary.store(enabled, Ordering::SeqCst);
+            }
+        });
+    }
+
+    // Frames as the receiving side would materialize them: binary DFTB
+    // frames reassemble to the exact JSON-path equivalent (header + b).
+    fn termio_test_try_recv(
+        rx: &mut mpsc::UnboundedReceiver<CloudMcpTermioOutbound>,
+    ) -> Result<Value, mpsc::error::TryRecvError> {
+        rx.try_recv().map(|outgoing| outgoing.to_frame_value())
+    }
+
+    #[test]
+    fn termio_binary_encoder_round_trips_and_rejects_malformed_frames() {
+        let header = json!({
+            "v": 1,
+            "kind": "termio.output",
+            "contract": CLOUD_MCP_TERMINAL_IO_CONTRACT,
+            "auth": {"connection_id": "conn-rt", "message_token": "token-rt"},
+            "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+            "id": "termio-output-1-7",
+            "sk": "device:workspace:pane:1",
+            "q": 7,
+            "seq": 7,
+            "f": 100,
+            "n": 112,
+            "from_total_bytes": 100,
+            "total_bytes": 112,
+        });
+        let payload = b"raw pty tail";
+        let wire = cloud_mcp_termio_binary_encode(&header, payload).expect("encodes");
+        assert_eq!(&wire[0..4], CLOUD_MCP_TERMIO_BINARY_MAGIC);
+        assert_eq!(wire[4], CLOUD_MCP_TERMIO_BINARY_VERSION);
+        let (decoded_header, decoded_payload) =
+            cloud_mcp_termio_binary_decode(&wire).expect("decodes");
+        assert_eq!(decoded_header, header);
+        assert!(decoded_header.get("b").is_none());
+        assert!(decoded_header.get("bytes_base64").is_none());
+        assert!(decoded_header.get("bl").is_none());
+        assert_eq!(decoded_payload, payload);
+        // Empty payloads are legal (payload length is implicit).
+        let empty_wire = cloud_mcp_termio_binary_encode(&header, b"").expect("encodes empty");
+        let (empty_header, empty_payload) =
+            cloud_mcp_termio_binary_decode(&empty_wire).expect("decodes empty");
+        assert_eq!(empty_header, header);
+        assert!(empty_payload.is_empty());
+        // The binary lane enforces the same decoded-byte budget as base64.
+        let oversized = vec![b'x'; CLOUD_MCP_TERMIO_BINARY_MAX_PAYLOAD_BYTES + 1];
+        assert!(cloud_mcp_termio_binary_encode(&header, &oversized).is_err());
+        assert!(!cloud_mcp_termio_binary_payload_exceeds_cap(
+            CLOUD_MCP_TERMIO_BINARY_MAX_PAYLOAD_BYTES
+        ));
+        assert!(cloud_mcp_termio_binary_payload_exceeds_cap(
+            CLOUD_MCP_TERMIO_BINARY_MAX_PAYLOAD_BYTES + 1
+        ));
+        // Malformed frames are rejected like invalid base64 is today.
+        assert!(cloud_mcp_termio_binary_decode(b"DFTB").is_err());
+        let mut bad_magic = wire.clone();
+        bad_magic[0] = b'X';
+        assert!(cloud_mcp_termio_binary_decode(&bad_magic).is_err());
+        let mut bad_version = wire.clone();
+        bad_version[4] = 9;
+        assert!(cloud_mcp_termio_binary_decode(&bad_version).is_err());
+        let mut bad_header_len = wire.clone();
+        bad_header_len[5..9].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(cloud_mcp_termio_binary_decode(&bad_header_len).is_err());
+        let mut not_json = wire.clone();
+        not_json[9] = b'{';
+        not_json[10] = b'{';
+        assert!(cloud_mcp_termio_binary_decode(&not_json).is_err());
+    }
+
+    #[test]
+    fn termio_binary_capability_follows_ready_frame_and_resets() {
+        // Ready-frame parsing: only an explicit termio.binary advertisement
+        // enables the lane.
+        assert!(cloud_mcp_ready_frame_advertises_termio_binary(&json!({
+            "kind": "cloud_app_ws_ready",
+            "message_types": ["termio.output", "termio.binary"],
+        })));
+        assert!(cloud_mcp_ready_frame_advertises_termio_binary(&json!({
+            "message_types": [" TERMIO.BINARY "],
+        })));
+        assert!(!cloud_mcp_ready_frame_advertises_termio_binary(&json!({
+            "message_types": ["termio.output"],
+        })));
+        assert!(!cloud_mcp_ready_frame_advertises_termio_binary(&json!({
+            "kind": "cloud_app_ws_ready",
+        })));
+        assert!(!cloud_mcp_ready_frame_advertises_termio_binary(&json!({
+            "message_types": "termio.binary",
+        })));
+        // Epoch binding: the capability lives IN the lane slot, so the value
+        // a sender snapshot carries was set for that very lane.
+        let state = CloudMcpState::new();
+        let _rx_first = termio_test_install_ws(&state);
+        let sender = tauri::async_runtime::block_on(cloud_mcp_termio_sender(&state))
+            .expect("fast lane installed");
+        assert!(!sender.supports_binary(), "a fresh lane starts non-binary");
+        termio_test_set_binary(&state, true);
+        // A sender acquired BEFORE the flip keeps its snapshot (the snapshot
+        // is taken from the slot at acquisition time)...
+        assert!(!sender.supports_binary());
+        // ...and a fresh acquisition observes the owning connection's ready.
+        let sender = tauri::async_runtime::block_on(cloud_mcp_termio_sender(&state))
+            .expect("fast lane installed");
+        assert!(sender.supports_binary());
+        // RECONNECT ordering: a new lane (new connection epoch) replaces the
+        // slot with a fresh non-binary flag even though the previous epoch
+        // advertised binary — a fresh sender can never be observed with the
+        // stale capability, by construction.
+        let _rx_second = termio_test_install_ws(&state);
+        let sender = tauri::async_runtime::block_on(cloud_mcp_termio_sender(&state))
+            .expect("fresh fast lane installed");
+        assert!(
+            !sender.supports_binary(),
+            "a fresh sender epoch must start non-binary",
+        );
+        // Structural pins for the wiring not drivable without a live
+        // websocket: the open path publishes the lane with a FALSE flag as
+        // one slot write, and the ready handler stores the parsed capability
+        // through the connection-local flag handle. (No teardown pin needed:
+        // the flag drops with the lane when the slot clears — the type makes
+        // stale-flag-after-teardown unrepresentable.)
+        let source = include_str!("cloud_mcp.rs");
+        let open_span = source
+            .split("mpsc::unbounded_channel::<CloudMcpTermioOutbound>();")
+            .nth(1)
+            .and_then(|rest| rest.split("websocket_handshaking").next())
+            .expect("connection-open span");
+        assert!(open_span.contains("CloudMcpTermioLane {"));
+        assert!(open_span.contains("AtomicBool::new(false)"));
+        let ready_span = source
+            .split("Some(\"cloud_app_ws_ready\")")
+            .nth(1)
+            .and_then(|rest| rest.split("CLOUD_MCP_WS_TIMEOUT_STRIKES").next())
+            .expect("ready-handler span");
+        assert!(ready_span.contains("cloud_mcp_ready_frame_advertises_termio_binary"));
+        assert!(ready_span.contains("termio_binary.store"));
+    }
+
+    #[test]
+    fn termio_binary_payload_helper_gates_raw_variant_by_sender_capability() {
+        let state = CloudMcpState::new();
+        let mut rx = termio_test_install_ws(&state);
+        let stream_key = "device:workspace:pane:104".to_string();
+        let target = cloud_mcp_terminal_io_target(&stream_key).expect("helper target");
+        let meta = json!({"q": 1, "seq": 1, "f": 0, "n": 4, "from_total_bytes": 0, "total_bytes": 4});
+        // Capability unset: the shared payload helper (used by ALL four
+        // attach/flow emit sites) produces a raw JSON variant with base64 b.
+        tauri::async_runtime::block_on(cloud_mcp_send_terminal_io_payload_message(
+            &state,
+            None,
+            &target,
+            "termio.output",
+            "helper-json".to_string(),
+            meta.clone(),
+            b"gate",
+        ))
+        .expect("json send");
+        let outgoing = rx.try_recv().expect("json variant");
+        assert!(!outgoing.is_binary());
+        let frame = outgoing.to_frame_value();
+        assert_eq!(
+            frame["b"],
+            json!(general_purpose::STANDARD.encode(b"gate"))
+        );
+        // Capability set: the SAME call produces a raw Binary variant.
+        termio_test_set_binary(&state, true);
+        tauri::async_runtime::block_on(cloud_mcp_send_terminal_io_payload_message(
+            &state,
+            None,
+            &target,
+            "termio.snapshot",
+            "helper-binary".to_string(),
+            json!({"q": 1, "seq": 1, "f": 4, "n": 4, "mode": "vt", "reset": true}),
+            b"snap",
+        ))
+        .expect("binary send");
+        let outgoing = rx.try_recv().expect("binary variant");
+        assert!(outgoing.is_binary());
+        let CloudMcpTermioOutbound::Binary(binary) = &outgoing else {
+            unreachable!();
+        };
+        assert_eq!(binary.kind, "termio.snapshot");
+        let (header, payload) =
+            cloud_mcp_termio_binary_decode(&binary.bytes).expect("valid frame");
+        assert!(header.get("b").is_none());
+        assert_eq!(payload, b"snap");
+        // Over-cap payloads fall back to the JSON variant even with the
+        // capability set (receiver-enforced budget, today's semantics).
+        let oversized = vec![b'x'; CLOUD_MCP_TERMIO_BINARY_MAX_PAYLOAD_BYTES + 1];
+        tauri::async_runtime::block_on(cloud_mcp_send_terminal_io_payload_message(
+            &state,
+            None,
+            &target,
+            "termio.output",
+            "helper-overcap".to_string(),
+            meta.clone(),
+            &oversized,
+        ))
+        .expect("over-cap send");
+        let outgoing = rx.try_recv().expect("over-cap fallback");
+        assert!(!outgoing.is_binary());
+        // Control frames never ride the binary lane regardless of capability.
+        tauri::async_runtime::block_on(cloud_mcp_send_terminal_io_message(
+            &state,
+            None,
+            &target,
+            "termio.heartbeat.ack",
+            "helper-control".to_string(),
+            json!({"seq": 9, "q": 9}),
+        ))
+        .expect("control send");
+        let outgoing = rx.try_recv().expect("control frame");
+        assert!(!outgoing.is_binary());
+        // Both attach-arm emit sites (resume replay chunks + full snapshot)
+        // route through this same gated helper — pinned structurally since
+        // the attach handler needs a live Tauri app to drive.
+        let source = include_str!("cloud_mcp.rs");
+        let attach_arm = source
+            .split("\"termio.attach\" => {")
+            .nth(1)
+            .and_then(|rest| rest.split("\"termio.detach\" => {").next())
+            .expect("attach arm precedes detach arm");
+        assert_eq!(
+            attach_arm
+                .matches("cloud_mcp_send_terminal_io_payload_message(")
+                .count(),
+            2,
+            "attach replay + attach snapshot must use the gated payload helper",
+        );
+    }
+
+    #[test]
+    fn termio_binary_publisher_gates_on_capability_and_interleaves_coherently() {
+        let state = CloudMcpState::new();
+        let mut rx = termio_test_install_ws(&state);
+        let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
+        let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
+            .unwrap_or_else(|| "desktop-primary".to_string());
+        let workspace_id = "workspace-binary";
+        let pane_id = "pane-binary";
+        let instance_id = 101_u64;
+        let stream_key =
+            cloud_mcp_terminal_output_stream_key(&device_id, workspace_id, pane_id, instance_id);
+        termio_test_subscribe(&state, &stream_key, "viewer-binary");
+
+        // No ready capability: the publisher emits JSON.
+        cloud_mcp_publish_terminal_output_delta(
+            &state, &output, workspace_id, pane_id, instance_id, 1, b"hello",
+        );
+        let legacy = rx.try_recv().expect("legacy frame");
+        assert!(!legacy.is_binary());
+        let legacy = legacy.to_frame_value();
+        assert_eq!(legacy["kind"], json!("termio.output"));
+        assert_eq!(
+            (legacy["f"].as_u64(), legacy["n"].as_u64()),
+            (Some(0), Some(5))
+        );
+
+        // Capability on: the same publisher emits a DFTB binary frame whose
+        // header+payload reassemble to the exact JSON-path equivalent.
+        termio_test_set_binary(&state, true);
+        cloud_mcp_publish_terminal_output_delta(
+            &state, &output, workspace_id, pane_id, instance_id, 2, b"binary!",
+        );
+        let outgoing = rx.try_recv().expect("binary frame");
+        assert!(outgoing.is_binary());
+        let CloudMcpTermioOutbound::Binary(frame) = &outgoing else {
+            unreachable!();
+        };
+        assert_eq!(frame.kind, "termio.output");
+        assert_eq!(frame.id, format!("termio-output-{instance_id}-2"));
+        let (header, payload) =
+            cloud_mcp_termio_binary_decode(&frame.bytes).expect("valid wire frame");
+        assert_eq!(payload, b"binary!");
+        assert!(header.get("b").is_none());
+        assert_eq!(header["kind"], json!("termio.output"));
+        assert_eq!(header["id"], json!(format!("termio-output-{instance_id}-2")));
+        assert_eq!(header["sk"], json!(stream_key.as_str()));
+        assert_eq!((header["f"].as_u64(), header["n"].as_u64()), (Some(5), Some(12)));
+        assert_eq!(header["q"], json!(2));
+        // The binary header carries the same auth object as JSON frames.
+        assert_eq!(header["auth"]["connection_id"], json!("conn-flow-test"));
+        assert_eq!(header["auth"]["message_token"], json!("token-flow-test"));
+        let reassembled = outgoing.to_frame_value();
+        assert_eq!(
+            reassembled["b"],
+            json!(general_purpose::STANDARD.encode(b"binary!"))
+        );
+        assert_eq!(reassembled["contract"], json!(CLOUD_MCP_TERMINAL_IO_CONTRACT));
+
+        // Capability lost (reconnect to an older cloud): back to JSON on the
+        // SAME stream — mixed encodings interleave with coherent offsets/ids.
+        termio_test_set_binary(&state, false);
+        cloud_mcp_publish_terminal_output_delta(
+            &state, &output, workspace_id, pane_id, instance_id, 3, b"json-again",
+        );
+        let tail = rx.try_recv().expect("post-downgrade frame");
+        assert!(!tail.is_binary());
+        let tail = tail.to_frame_value();
+        assert_eq!(
+            (tail["f"].as_u64(), tail["n"].as_u64()),
+            (Some(12), Some(22))
+        );
+        assert_eq!(tail["id"], json!(format!("termio-output-{instance_id}-3")));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn termio_binary_flow_resume_and_skip_forward_emit_binary_frames() {
+        let state = CloudMcpState::new();
+        let mut rx = termio_test_install_ws(&state);
+        termio_test_set_binary(&state, true);
+        let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
+            .unwrap_or_else(|| "desktop-primary".to_string());
+
+        // Flow-control resume replay rides the binary lane.
+        let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
+        let stream_key = cloud_mcp_terminal_output_stream_key(
+            &device_id,
+            "workspace-binflow",
+            "pane-binflow",
+            102,
+        );
+        let target = cloud_mcp_terminal_io_target(&stream_key).expect("binflow target");
+        let body = vec![b'k'; 200_016];
+        output.lock().unwrap().append(&body);
+        let total = body.len() as u64;
+        assert!(cloud_mcp_remember_terminal_output_tail(
+            &state,
+            &stream_key,
+            1,
+            total,
+            &body,
+        ));
+        cloud_mcp_terminal_output_note_emitted_n(&state, &stream_key, 200_000);
+        termio_test_subscribe(&state, &stream_key, "viewer-binflow");
+        tauri::async_runtime::block_on(cloud_mcp_terminal_io_handle_output_ack(
+            &state,
+            &output,
+            &target,
+            "viewer-binflow",
+            200_000,
+        ));
+        let outgoing = rx.try_recv().expect("binary flow replay");
+        assert!(outgoing.is_binary());
+        let replay = outgoing.to_frame_value();
+        assert_eq!(replay["kind"], json!("termio.output"));
+        assert_eq!(
+            (replay["f"].as_u64(), replay["n"].as_u64()),
+            (Some(200_000), Some(total))
+        );
+        assert_eq!(
+            replay["id"],
+            json!(format!("termio-flow-replay-102-1-{}", 200_000))
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
+
+        // Skip-forward snapshot rides the binary lane too, still unstamped.
+        let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
+        let stream_key = cloud_mcp_terminal_output_stream_key(
+            &device_id,
+            "workspace-binsnap",
+            "pane-binsnap",
+            103,
+        );
+        let target = cloud_mcp_terminal_io_target(&stream_key).expect("binsnap target");
+        let big = vec![b'm'; CLOUD_MCP_TERMINAL_IO_SKIP_FORWARD_BYTES as usize + 4_096];
+        output.lock().unwrap().append(&big);
+        let total = big.len() as u64;
+        assert!(cloud_mcp_remember_terminal_output_tail(
+            &state,
+            &stream_key,
+            1,
+            total,
+            &big,
+        ));
+        cloud_mcp_terminal_output_note_emitted_n(&state, &stream_key, 8);
+        termio_test_subscribe(&state, &stream_key, "viewer-binsnap");
+        tauri::async_runtime::block_on(cloud_mcp_terminal_io_handle_output_ack(
+            &state,
+            &output,
+            &target,
+            "viewer-binsnap",
+            8,
+        ));
+        let outgoing = rx.try_recv().expect("binary skip-forward snapshot");
+        assert!(outgoing.is_binary());
+        let snapshot = outgoing.to_frame_value();
+        assert_eq!(snapshot["kind"], json!("termio.snapshot"));
+        assert_eq!(snapshot["reset"], json!(true));
+        assert!(snapshot.get("attachment_id").is_none());
+        assert_eq!(snapshot["n"].as_u64(), Some(total));
+        assert!(!general_purpose::STANDARD
+            .decode(snapshot["b"].as_str().expect("snapshot carries vt bytes"))
+            .unwrap()
+            .is_empty());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
     }
 
     fn termio_test_subscribe(state: &CloudMcpState, stream_key: &str, origin: &str) {
@@ -58826,7 +59534,7 @@ mod cloud_mcp_tests {
         cloud_mcp_publish_terminal_output_delta(
             &state, &output, workspace_id, pane_id, instance_id, 1, b"hello",
         );
-        let frame = rx.try_recv().expect("first live frame");
+        let frame = termio_test_try_recv(&mut rx).expect("first live frame");
         assert_eq!(frame["kind"], json!("termio.output"));
         assert_eq!((frame["f"].as_u64(), frame["n"].as_u64()), (Some(0), Some(5)));
 
@@ -58839,7 +59547,7 @@ mod cloud_mcp_tests {
         cloud_mcp_publish_terminal_output_delta(
             &state, &output, workspace_id, pane_id, instance_id, 2, &burst,
         );
-        let frame = rx.try_recv().expect("burst frame");
+        let frame = termio_test_try_recv(&mut rx).expect("burst frame");
         assert_eq!(frame["n"].as_u64(), Some(5 + 100 * 1024));
 
         // Outstanding bytes now exceed the window: the next frame is PAUSED —
@@ -58847,7 +59555,7 @@ mod cloud_mcp_tests {
         cloud_mcp_publish_terminal_output_delta(
             &state, &output, workspace_id, pane_id, instance_id, 3, b"after-pause",
         );
-        assert!(rx.try_recv().is_err());
+        assert!(termio_test_try_recv(&mut rx).is_err());
         let total = output.lock().unwrap().total_bytes;
         assert_eq!(total, 5 + 100 * 1024 + 11);
         {
@@ -58866,7 +59574,7 @@ mod cloud_mcp_tests {
             "viewer-flow",
             90 * 1024,
         ));
-        assert!(rx.try_recv().is_err());
+        assert!(termio_test_try_recv(&mut rx).is_err());
 
         // Catching up within the resume threshold replays exactly the
         // skipped range from the tail, broadcast (no origin stamp), then the
@@ -58878,7 +59586,7 @@ mod cloud_mcp_tests {
             "viewer-flow",
             100 * 1024,
         ));
-        let frame = rx.try_recv().expect("flow resume replay frame");
+        let frame = termio_test_try_recv(&mut rx).expect("flow resume replay frame");
         assert_eq!(frame["kind"], json!("termio.output"));
         assert_eq!(frame["f"].as_u64(), Some(5 + 100 * 1024));
         assert_eq!(frame["n"].as_u64(), Some(total));
@@ -58892,7 +59600,7 @@ mod cloud_mcp_tests {
             .decode(frame["b"].as_str().unwrap())
             .unwrap();
         assert_eq!(decoded, b"after-pause");
-        assert!(rx.try_recv().is_err());
+        assert!(termio_test_try_recv(&mut rx).is_err());
         assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
 
         // A duplicate ack is a no-op (lane already current).
@@ -58903,13 +59611,13 @@ mod cloud_mcp_tests {
             "viewer-flow",
             100 * 1024,
         ));
-        assert!(rx.try_recv().is_err());
+        assert!(termio_test_try_recv(&mut rx).is_err());
 
         // Live emission continues after resume.
         cloud_mcp_publish_terminal_output_delta(
             &state, &output, workspace_id, pane_id, instance_id, 4, b"live-again",
         );
-        let frame = rx.try_recv().expect("post-resume live frame");
+        let frame = termio_test_try_recv(&mut rx).expect("post-resume live frame");
         assert_eq!(frame["kind"], json!("termio.output"));
         assert_eq!(frame["f"].as_u64(), Some(total));
         assert_eq!(frame["n"].as_u64(), Some(total + 10));
@@ -58967,7 +59675,7 @@ mod cloud_mcp_tests {
             "viewer-snap-b",
             299_000,
         ));
-        let frame = rx.try_recv().expect("skip-forward snapshot");
+        let frame = termio_test_try_recv(&mut rx).expect("skip-forward snapshot");
         assert_eq!(frame["kind"], json!("termio.snapshot"));
         assert_eq!(frame["reset"], json!(true));
         // Flow snapshots are unstamped so every attached viewer's snapshot
@@ -58981,7 +59689,7 @@ mod cloud_mcp_tests {
             .decode(frame["b"].as_str().expect("snapshot carries vt bytes"))
             .unwrap()
             .is_empty());
-        assert!(rx.try_recv().is_err());
+        assert!(termio_test_try_recv(&mut rx).is_err());
         assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
     }
 
@@ -59035,7 +59743,7 @@ mod cloud_mcp_tests {
             "viewer-bound",
             emitted,
         ));
-        let frame = rx.try_recv().expect("latest-wins snapshot");
+        let frame = termio_test_try_recv(&mut rx).expect("latest-wins snapshot");
         assert_eq!(frame["kind"], json!("termio.snapshot"));
         assert_eq!(frame["reset"], json!(true));
         assert!(frame.get("attachment_id").is_none());
@@ -59044,7 +59752,7 @@ mod cloud_mcp_tests {
             .decode(frame["b"].as_str().expect("snapshot carries vt bytes"))
             .unwrap()
             .is_empty());
-        assert!(rx.try_recv().is_err(), "one snapshot, no replay frames");
+        assert!(termio_test_try_recv(&mut rx).is_err(), "one snapshot, no replay frames");
         assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
 
         // Missing range EXACTLY at the bound: still a tail replay.
@@ -59087,7 +59795,7 @@ mod cloud_mcp_tests {
         ));
         let mut next_from = emitted;
         let mut frames = 0_usize;
-        while let Ok(frame) = rx.try_recv() {
+        while let Ok(frame) = termio_test_try_recv(&mut rx) {
             assert_eq!(frame["kind"], json!("termio.output"));
             assert_eq!(frame["f"].as_u64(), Some(next_from));
             next_from = frame["n"].as_u64().expect("replay frame n");
@@ -59140,13 +59848,16 @@ mod cloud_mcp_tests {
     #[tokio::test]
     async fn termio_flow_ack_is_invisible_until_the_send_lock_is_held() {
         let state = CloudMcpState::new();
-        let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<CloudMcpTermioOutbound>();
         {
             let mut runtime = state.inner.lock().await;
             runtime.global_ws_connection_id = Some("conn-contended".to_string());
             runtime.global_ws_message_token = Some("token-contended".to_string());
         }
-        *state.global_ws_termio_tx.lock().await = Some(tx);
+        *state.global_ws_termio_tx.lock().await = Some(CloudMcpTermioLane {
+            tx,
+            binary: Arc::new(AtomicBool::new(false)),
+        });
         let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
         let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
             .unwrap_or_else(|| "desktop-primary".to_string());
@@ -59214,7 +59925,7 @@ mod cloud_mcp_tests {
             &state,
             &stream_key
         ));
-        assert!(rx.try_recv().is_err());
+        assert!(termio_test_try_recv(&mut rx).is_err());
         drop(guard);
         let _ = ack_task.await;
         // Once the lock releases, the ack lands and the replay covers the
@@ -59228,11 +59939,11 @@ mod cloud_mcp_tests {
                 .and_then(|origins| origins.get("viewer-contended").copied()),
             Some(200_000)
         );
-        let frame = rx.try_recv().expect("contended catch-up replay");
+        let frame = termio_test_try_recv(&mut rx).expect("contended catch-up replay");
         assert_eq!(frame["kind"], json!("termio.output"));
         assert_eq!(frame["f"].as_u64(), Some(200_000));
         assert_eq!(frame["n"].as_u64(), Some(total));
-        assert!(rx.try_recv().is_err());
+        assert!(termio_test_try_recv(&mut rx).is_err());
         assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
         assert!(!cloud_mcp_terminal_output_flow_should_pause(
             &state,
@@ -59245,7 +59956,7 @@ mod cloud_mcp_tests {
         let state = CloudMcpState::new();
         // A sender whose receiver is already gone: every enqueue fails, as
         // with a websocket torn down between reconnects.
-        let (dead_tx, dead_rx) = mpsc::unbounded_channel::<Value>();
+        let (dead_tx, dead_rx) = mpsc::unbounded_channel::<CloudMcpTermioOutbound>();
         drop(dead_rx);
         tauri::async_runtime::block_on(async {
             {
@@ -59253,7 +59964,10 @@ mod cloud_mcp_tests {
                 runtime.global_ws_connection_id = Some("conn-dead".to_string());
                 runtime.global_ws_message_token = Some("token-dead".to_string());
             }
-            *state.global_ws_termio_tx.lock().await = Some(dead_tx);
+            *state.global_ws_termio_tx.lock().await = Some(CloudMcpTermioLane {
+                tx: dead_tx,
+                binary: Arc::new(AtomicBool::new(false)),
+            });
         });
         let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
         let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
@@ -59304,7 +60018,7 @@ mod cloud_mcp_tests {
             emitted,
         ));
         let mut next_from = emitted;
-        while let Ok(frame) = rx.try_recv() {
+        while let Ok(frame) = termio_test_try_recv(&mut rx) {
             assert_eq!(frame["kind"], json!("termio.output"));
             assert_eq!(frame["f"].as_u64(), Some(next_from));
             next_from = frame["n"].as_u64().expect("replay frame n");
@@ -59313,10 +60027,13 @@ mod cloud_mcp_tests {
         assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
 
         // Snapshot skip-forward path under a dead sender: same contract.
-        let (dead_tx, dead_rx) = mpsc::unbounded_channel::<Value>();
+        let (dead_tx, dead_rx) = mpsc::unbounded_channel::<CloudMcpTermioOutbound>();
         drop(dead_rx);
         tauri::async_runtime::block_on(async {
-            *state.global_ws_termio_tx.lock().await = Some(dead_tx);
+            *state.global_ws_termio_tx.lock().await = Some(CloudMcpTermioLane {
+                tx: dead_tx,
+                binary: Arc::new(AtomicBool::new(false)),
+            });
         });
         let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
         let stream_key = cloud_mcp_terminal_output_stream_key(
@@ -59354,7 +60071,7 @@ mod cloud_mcp_tests {
             "viewer-deadsnap",
             8,
         ));
-        let frame = rx.try_recv().expect("retried skip-forward snapshot");
+        let frame = termio_test_try_recv(&mut rx).expect("retried skip-forward snapshot");
         assert_eq!(frame["kind"], json!("termio.snapshot"));
         assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
     }
@@ -59397,13 +60114,13 @@ mod cloud_mcp_tests {
             emitted,
         ));
         // Exactly the successful prefix reached the wire...
-        let frame = rx.try_recv().expect("successful prefix chunk");
+        let frame = termio_test_try_recv(&mut rx).expect("successful prefix chunk");
         assert_eq!(frame["f"].as_u64(), Some(emitted));
         assert_eq!(
             frame["n"].as_u64(),
             Some(emitted + CLOUD_MCP_TERMINAL_OUTPUT_REPLAY_CHUNK_BYTES as u64)
         );
-        assert!(rx.try_recv().is_err());
+        assert!(termio_test_try_recv(&mut rx).is_err());
         // ...but emitted_n must NOT advance past the original offset even
         // though a prefix succeeded: a partial replay is a failed replay.
         assert_eq!(
@@ -59422,7 +60139,7 @@ mod cloud_mcp_tests {
         ));
         let mut next_from = emitted;
         let mut frames = 0_usize;
-        while let Ok(frame) = rx.try_recv() {
+        while let Ok(frame) = termio_test_try_recv(&mut rx) {
             assert_eq!(frame["kind"], json!("termio.output"));
             assert_eq!(frame["f"].as_u64(), Some(next_from));
             next_from = frame["n"].as_u64().expect("replay frame n");
@@ -60000,6 +60717,7 @@ mod cloud_mcp_tests {
     fn termio_expired_emission_suppresses_reattached_and_duplicate_pairs() {
         let state = CloudMcpState::new();
         let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+        let tx = CloudMcpTermioSender::Global(tx);
         let stream_key = "device:workspace:pane:51";
         let origin = "viewer-flap";
         let now_ms = 2_000_000_000_u64;
@@ -60108,6 +60826,7 @@ mod cloud_mcp_tests {
     fn termio_expired_recent_map_is_bounded_by_hard_cap() {
         let state = CloudMcpState::new();
         let (tx, _rx) = mpsc::unbounded_channel::<Value>();
+        let tx = CloudMcpTermioSender::Global(tx);
         let base_ms = 3_000_000_000_u64;
         for index in 0..=CLOUD_MCP_TERMINAL_IO_EXPIRED_RECENT_MAX {
             let stream_key = format!("device:workspace:pane-{index}:71");
@@ -60146,6 +60865,7 @@ mod cloud_mcp_tests {
         // A task still holding the OLD sender from before a ws reconnect
         // fails the enqueue...
         let (closed_tx, closed_rx) = mpsc::unbounded_channel::<Value>();
+        let closed_tx = CloudMcpTermioSender::Global(closed_tx);
         drop(closed_rx);
         assert!(!cloud_mcp_terminal_io_expired_emit_pair(
             &state,
@@ -60163,6 +60883,7 @@ mod cloud_mcp_tests {
             .unwrap()
             .contains_key(&(stream_key.to_string(), origin.to_string())));
         let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+        let tx = CloudMcpTermioSender::Global(tx);
         assert!(cloud_mcp_terminal_io_expired_emit_pair(
             &state,
             &tx,
