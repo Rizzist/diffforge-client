@@ -3092,14 +3092,14 @@ function WorkspaceTerminal({
         });
       }
 
-      if (completed || payload.input_ready === true) {
+      if (completed) {
+        terminalThreadSubmittedPromptRef.current = null;
+      }
+      if (payload.input_ready === true) {
         const inputReadyAt = String(
           payload.input_ready_at || payload.completed_at || new Date().toISOString(),
         ).trim();
         terminalThreadLastReadyAtMsRef.current = parseTerminalStateTimestampMs(inputReadyAt) || Date.now();
-        if (completed) {
-          terminalThreadSubmittedPromptRef.current = null;
-        }
       }
 
       logTerminalStatus("frontend.terminal_cli.activity_hook_badge_state", listenerState.getTerminalCliStatusLogBase?.({
@@ -14094,7 +14094,6 @@ function WorkspaceTerminal({
               const interruptedTodoCount = Number(
                 result?.interrupted_todo_count ?? 0,
               ) || 0;
-              const inputReadyAt = new Date().toISOString();
               const interruptSource = interruptedActiveTask || interruptedParkedPromptCount > 0 || interruptedTodoCount > 0
                 ? "escape_key_task_interrupted"
                 : "escape_key_manual_cancel";
@@ -14102,16 +14101,15 @@ function WorkspaceTerminal({
               markTerminalThreadActivityStatus("interrupted", {
                 reason: interruptSource,
               });
-              terminalThreadLastReadyAtMsRef.current = parseTerminalStateTimestampMs(inputReadyAt) || Date.now();
               terminalThreadSubmittedPromptRef.current = null;
               onThreadTerminalLifecycle?.({
                 activity_status: "interrupted",
                 agent_id: terminalAgentKind,
                 command_phase: "interrupted",
                 execution_phase: "interrupted",
-                input_ready: true,
-                input_ready_at: inputReadyAt,
-                input_ready_confidence: interruptSource,
+                input_ready: false,
+                input_ready_at: "",
+                input_ready_confidence: "",
                 instance_id: terminalInstanceId,
                 ...getTerminalNativeRailStateFields("interrupted"),
                 pane_id: paneId,

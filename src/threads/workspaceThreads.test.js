@@ -2577,7 +2577,7 @@ test("live terminal thread selection uses a sessionless thread for no-session co
   assert.equal(selectedThreadId, sessionlessThreadId);
 });
 
-test("provider turn interruption settles running thread and keeps terminal input ready", () => {
+test("provider turn interruption settles running thread without claiming input readiness", () => {
   const workspaceId = "workspace-interrupt";
   const threadId = "thread-interrupt";
   const promptId = "prompt-interrupt";
@@ -2658,12 +2658,12 @@ test("provider turn interruption settles running thread and keeps terminal input
   };
 
   const next = appendWorkspaceThreadProjectionEvents(state, {
-    activity_status: "idle",
+    activity_status: "interrupted",
     agent_id: "codex",
     clear_pending_prompt: true,
-    input_ready: true,
-    input_ready_at: interruptedAt,
-    input_ready_confidence: "escape_key_task_interrupted",
+    input_ready: false,
+    input_ready_at: "",
+    input_ready_confidence: "",
     instance_id: 1,
     pane_id: paneId,
     projection_events: [{
@@ -2685,11 +2685,11 @@ test("provider turn interruption settles running thread and keeps terminal input
 
   const thread = next[workspaceId].threads[threadId];
   assert.equal(thread.latest_turn.state, "interrupted");
-  assert.equal(thread.activity_status, "idle");
+  assert.equal(thread.activity_status, "interrupted");
   assert.equal(thread.pending_prompt, null);
-  assert.equal(thread.provider_bindings.codex.input_ready, true);
-  assert.equal(thread.provider_bindings.codex.activity_status, "idle");
-  assert.equal(next[workspaceId].terminals[0].input_ready, true);
+  assert.equal(thread.provider_bindings.codex.input_ready, false);
+  assert.equal(thread.provider_bindings.codex.activity_status, "interrupted");
+  assert.equal(next[workspaceId].terminals[0].input_ready, false);
 });
 
 test("live hook snapshots replace streamed assistant text and survive transcript hydration", () => {

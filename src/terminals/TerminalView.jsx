@@ -22605,8 +22605,9 @@ function TerminalView({
       || openedLoadedActivityStatus
       || (
         eventType === "provider-turn-completed"
-        || eventType === "provider-turn-interrupted"
           ? "idle"
+          : eventType === "provider-turn-interrupted"
+            ? "interrupted"
           : ""
       )
       || (
@@ -22617,10 +22618,11 @@ function TerminalView({
           : ""
       )
       || String(existing.activity_status || "").trim().toLowerCase();
-    const marksReady = event.input_ready === true
-      || eventType === "provider-turn-completed"
-      || eventType === "provider-turn-interrupted"
-      || isTodoQueueSendableActivityStatus(activityStatus);
+    const marksReady = event.input_ready !== false && (
+      event.input_ready === true
+        || eventType === "provider-turn-completed"
+        || isTodoQueueSendableActivityStatus(activityStatus)
+    );
     const marksBusy = event.input_ready === false
       || eventType === "message-submitted"
       || eventType === "agent-output"
@@ -28759,15 +28761,14 @@ function TerminalView({
     }
 
     if (safeTerminalIndex != null) {
-      const interruptedAt = new Date().toISOString();
       handleWorkspaceTerminalLifecycle({
         activity_status: "interrupted",
         agent_id: inFlightPrompt?.agent_id || "",
         command_phase: "interrupted",
         execution_phase: "interrupted",
-        input_ready: true,
-        input_ready_at: interruptedAt,
-        input_ready_confidence: reason,
+        input_ready: false,
+        input_ready_at: "",
+        input_ready_confidence: "",
         instance_id: terminalInstanceId || "",
         pane_id: paneId,
         pending_prompt_id: planTask?.task_id || inFlightPrompt?.prompt_id || "",

@@ -241,9 +241,7 @@ fn agent_chat_session_observed_terminal_key(
 }
 
 fn agent_chat_session_observer_origin(origin: Option<&str>) -> Option<String> {
-    let origin = origin
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
+    let origin = origin.map(str::trim).filter(|value| !value.is_empty())?;
     Some(origin.to_string())
 }
 
@@ -265,15 +263,14 @@ fn agent_chat_session_set_terminal_observed(
     if active {
         let origin = origin.unwrap_or_else(|| "unknown".to_string());
         let now_ms = cloud_mcp_now_ms();
-        let entry =
-            observed
-                .entry(key)
-                .or_insert_with(|| AgentChatSessionObservedTerminal {
-                    workspace_id,
-                    pane_id: pane_id.trim().to_string(),
-                    instance_id,
-                    origins: HashMap::new(),
-                });
+        let entry = observed
+            .entry(key)
+            .or_insert_with(|| AgentChatSessionObservedTerminal {
+                workspace_id,
+                pane_id: pane_id.trim().to_string(),
+                instance_id,
+                origins: HashMap::new(),
+            });
         entry.origins.insert(origin, now_ms);
         entry.origins.len()
     } else {
@@ -361,10 +358,7 @@ fn agent_chat_session_clear_observed_terminals() -> bool {
     false
 }
 
-fn agent_chat_session_prune_stale_observed_terminals(
-    now_ms: u64,
-    stale_after_ms: u64,
-) -> bool {
+fn agent_chat_session_prune_stale_observed_terminals(now_ms: u64, stale_after_ms: u64) -> bool {
     let Some(observed) = AGENT_CHAT_SESSION_OBSERVED_TERMINALS.get() else {
         return false;
     };
@@ -374,9 +368,9 @@ fn agent_chat_session_prune_stale_observed_terminals(
     let mut changed = false;
     observed.retain(|_, entry| {
         let before = entry.origins.len();
-        entry.origins.retain(|_, last_seen_ms| {
-            now_ms.saturating_sub(*last_seen_ms) < stale_after_ms
-        });
+        entry
+            .origins
+            .retain(|_, last_seen_ms| now_ms.saturating_sub(*last_seen_ms) < stale_after_ms);
         changed |= entry.origins.len() != before;
         let keep = !entry.origins.is_empty();
         changed |= !keep;
@@ -4728,8 +4722,9 @@ mod agent_sessions_tests {
             .unwrap_or_else(|poison| poison.into_inner());
 
         let dir = unique_test_dir("opencode-model-db");
-        fs::create_dir_all(&dir).unwrap();
-        let db_path = dir.join("opencode.db");
+        let data_dir = dir.join("opencode");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("opencode.db");
         {
             let connection = rusqlite::Connection::open(&db_path).unwrap();
             connection
@@ -4773,8 +4768,8 @@ mod agent_sessions_tests {
                 .unwrap();
         }
 
-        let previous = env::var_os("OPENCODE_DATA_DIR");
-        env::set_var("OPENCODE_DATA_DIR", &dir);
+        let previous = env::var_os("XDG_DATA_HOME");
+        env::set_var("XDG_DATA_HOME", &dir);
 
         assert_eq!(
             opencode_session_last_model("ses_1"),
@@ -4793,8 +4788,8 @@ mod agent_sessions_tests {
         );
 
         match previous {
-            Some(value) => env::set_var("OPENCODE_DATA_DIR", value),
-            None => env::remove_var("OPENCODE_DATA_DIR"),
+            Some(value) => env::set_var("XDG_DATA_HOME", value),
+            None => env::remove_var("XDG_DATA_HOME"),
         }
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4811,7 +4806,9 @@ mod agent_sessions_tests {
         let other_workspace = dir.join("other-workspace");
         fs::create_dir_all(&workspace).unwrap();
         fs::create_dir_all(&other_workspace).unwrap();
-        let db_path = dir.join("opencode.db");
+        let data_dir = dir.join("opencode");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("opencode.db");
         {
             let connection = rusqlite::Connection::open(&db_path).unwrap();
             connection
@@ -4848,8 +4845,8 @@ mod agent_sessions_tests {
                 .unwrap();
         }
 
-        let previous = env::var_os("OPENCODE_DATA_DIR");
-        env::set_var("OPENCODE_DATA_DIR", &dir);
+        let previous = env::var_os("XDG_DATA_HOME");
+        env::set_var("XDG_DATA_HOME", &dir);
 
         assert_eq!(
             resolve_opencode_resume_session(
@@ -4877,8 +4874,8 @@ mod agent_sessions_tests {
         );
 
         match previous {
-            Some(value) => env::set_var("OPENCODE_DATA_DIR", value),
-            None => env::remove_var("OPENCODE_DATA_DIR"),
+            Some(value) => env::set_var("XDG_DATA_HOME", value),
+            None => env::remove_var("XDG_DATA_HOME"),
         }
         let _ = fs::remove_dir_all(&dir);
     }
@@ -5753,6 +5750,109 @@ fn prepare_codex_rollout_for_resume(provider_session_id: &str, cwd: &str) -> Res
     Ok(removed)
 }
 
+fn find_codex_rollout_in_home(
+    provider_session_id: &str,
+    home: &Path,
+) -> Result<PathBuf, String> {
+    let requested_session_id = clean_codex_id(provider_session_id);
+    if requested_session_id.is_empty() {
+        return Err("Codex rollout transcript has no resumable session id.".to_string());
+    }
+    let mut files = Vec::new();
+    collect_codex_rollout_files(&home.join("sessions"), &mut files);
+    sort_rollouts_newest_first(&mut files);
+    for path in files {
+        let name_match = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(&requested_session_id));
+        let meta_match = codex_rollout_meta(&path)
+            .is_some_and(|meta| meta.session_id == requested_session_id);
+        if name_match || meta_match {
+            return Ok(path);
+        }
+    }
+    Err(format!(
+        "No Codex transcript matched this thread session in {}.",
+        home.join("sessions").display()
+    ))
+}
+
+fn materialize_codex_rollout_in_managed_home(
+    provider_session_id: &str,
+    source_home: &Path,
+    managed_home: &Path,
+) -> Result<PathBuf, String> {
+    let source_sessions = source_home.join("sessions");
+    let source = find_codex_rollout_in_home(provider_session_id, source_home)?;
+    let relative = source.strip_prefix(&source_sessions).map_err(|_| {
+        format!(
+            "Codex rollout {} is outside its source home {}.",
+            source.display(),
+            source_sessions.display()
+        )
+    })?;
+    let destination = managed_home.join("sessions").join(relative);
+    let paths_match = source == destination
+        || matches!(
+            (source.canonicalize(), destination.canonicalize()),
+            (Ok(source), Ok(destination)) if source == destination
+        );
+    if paths_match {
+        return Ok(destination);
+    }
+    if fs::symlink_metadata(&destination).is_ok() {
+        if destination.is_file() {
+            return Ok(destination);
+        }
+        fs::remove_file(&destination).map_err(|error| {
+            format!(
+                "Unable to replace staged Codex rollout {}: {error}",
+                destination.display()
+            )
+        })?;
+    }
+    let parent = destination.parent().ok_or_else(|| {
+        format!(
+            "Codex rollout destination has no parent: {}.",
+            destination.display()
+        )
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "Unable to prepare managed Codex sessions directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    codex_link_or_copy_rollout(&source, &destination).map_err(|error| {
+        format!(
+            "Unable to stage Codex rollout {} in managed home {}: {error}",
+            source.display(),
+            managed_home.display()
+        )
+    })?;
+    Ok(destination)
+}
+
+#[cfg(unix)]
+fn codex_link_or_copy_rollout(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(source, destination)
+        .or_else(|_| fs::hard_link(source, destination))
+        .or_else(|_| fs::copy(source, destination).map(|_| ()))
+}
+
+#[cfg(windows)]
+fn codex_link_or_copy_rollout(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(source, destination)
+        .or_else(|_| fs::hard_link(source, destination))
+        .or_else(|_| fs::copy(source, destination).map(|_| ()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn codex_link_or_copy_rollout(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::hard_link(source, destination).or_else(|_| fs::copy(source, destination).map(|_| ()))
+}
+
 fn codex_home_from_rollout_path(path: &Path) -> Option<PathBuf> {
     let mut current = path.parent();
     while let Some(parent) = current {
@@ -6414,29 +6514,26 @@ fn parse_claude_session(
     Ok((meta, messages))
 }
 
-fn opencode_data_home() -> Vec<PathBuf> {
+fn opencode_native_data_home() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(value) = env::var_os("OPENCODE_DATA_DIR") {
-        candidates.push(PathBuf::from(value));
-    }
     if let Some(value) = env::var_os("XDG_DATA_HOME") {
         candidates.push(PathBuf::from(value).join("opencode"));
     }
-    if let Some(value) = env::var_os("USERPROFILE") {
-        let home = PathBuf::from(value);
+    if let Some(home) = user_home_dir() {
         candidates.push(home.join(".local").join("share").join("opencode"));
         candidates.push(home.join("AppData").join("Roaming").join("opencode"));
         candidates.push(home.join("AppData").join("Local").join("opencode"));
     }
-    if let Some(value) = env::var_os("HOME") {
-        candidates.push(
-            PathBuf::from(value)
-                .join(".local")
-                .join("share")
-                .join("opencode"),
-        );
-    }
+    candidates.dedup();
+    candidates
+}
 
+fn opencode_data_home() -> Vec<PathBuf> {
+    let mut candidates = agent_accounts_active_profile_dir("opencode")
+        .map(|profile_root| vec![PathBuf::from(profile_root).join("opencode")])
+        .unwrap_or_default();
+    candidates.extend(opencode_native_data_home());
+    candidates.dedup();
     candidates
 }
 

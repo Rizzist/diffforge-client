@@ -54,6 +54,12 @@ static AGENT_ACCOUNTS_REGISTRY_ACTIVITY_LOCK: OnceLock<StdMutex<()>> = OnceLock:
 static AGENT_ACCOUNTS_PROFILE_LOGIN_MARKERS: OnceLock<
     StdMutex<HashMap<PathBuf, AgentAccountsProfileLoginMarker>>,
 > = OnceLock::new();
+static AGENT_ACCOUNTS_LOGIN_TRANSACTIONS: OnceLock<StdMutex<AgentAccountsLoginTransactions>> =
+    OnceLock::new();
+static AGENT_ACCOUNTS_LOGIN_GENERATION: AtomicU64 = AtomicU64::new(0);
+static AGENT_ACCOUNTS_LOGIN_PANES: OnceLock<
+    StdMutex<HashMap<(String, u64, u64), AgentAccountsLoginPaneBinding>>,
+> = OnceLock::new();
 
 const AGENT_ACCOUNTS_PROFILE_LOGIN_MARKER_TTL_SECS: u64 = 30 * 60;
 const AGENT_ACCOUNTS_PROFILE_LOGIN_CREDENTIAL_ONLY_CONFIRM_SECS: u64 = 30;
@@ -82,6 +88,286 @@ struct AgentAccountsProfileLoginMarker {
     baseline_email: String,
     matching_credentials_sha256: Option<String>,
     matching_credentials_observed_at: Option<std::time::Instant>,
+}
+
+#[derive(Default)]
+struct AgentAccountsLoginTransactions {
+    current: HashMap<(String, String), AgentAccountsLoginTransaction>,
+    newest_selection: HashMap<String, (String, u64)>,
+}
+
+#[derive(Clone)]
+struct AgentAccountsLoginTransaction {
+    generation: u64,
+    baseline: Option<AgentAccountsLoginCompletionBaseline>,
+    exit_marker: Option<PathBuf>,
+    bound_instance: Option<(String, u64)>,
+}
+
+fn agent_accounts_login_transactions() -> &'static StdMutex<AgentAccountsLoginTransactions> {
+    AGENT_ACCOUNTS_LOGIN_TRANSACTIONS
+        .get_or_init(|| StdMutex::new(AgentAccountsLoginTransactions::default()))
+}
+
+fn agent_accounts_login_transaction_begin(
+    kind: &str,
+    profile_id: &str,
+    baseline: Option<AgentAccountsLoginCompletionBaseline>,
+) -> u64 {
+    let generation = AGENT_ACCOUNTS_LOGIN_GENERATION
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1);
+    let mut transactions = agent_accounts_login_transactions()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    transactions
+        .current
+        .retain(|(current_kind, _), _| current_kind != kind);
+    // A new selection supersedes every older terminal binding for the same
+    // provider while the transaction CAS is held. This prevents the same
+    // pane/instance from accumulating multiple generations that teardown
+    // could otherwise select nondeterministically.
+    if let Ok(mut panes) = AGENT_ACCOUNTS_LOGIN_PANES
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+    {
+        panes.retain(|_, binding| binding.kind != kind);
+    }
+    transactions
+        .current
+        .insert(
+            (kind.to_string(), profile_id.to_string()),
+            AgentAccountsLoginTransaction {
+                generation,
+                baseline,
+                exit_marker: None,
+                bound_instance: None,
+            },
+        );
+    transactions
+        .newest_selection
+        .insert(kind.to_string(), (profile_id.to_string(), generation));
+    generation
+}
+
+fn agent_accounts_login_transaction_is_current(
+    kind: &str,
+    profile_id: &str,
+    generation: u64,
+) -> bool {
+    let transactions = agent_accounts_login_transactions()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    transactions
+        .current
+        .get(&(kind.to_string(), profile_id.to_string()))
+        .is_some_and(|transaction| transaction.generation == generation)
+        && transactions.newest_selection.get(kind) == Some(&(profile_id.to_string(), generation))
+}
+
+fn agent_accounts_login_transaction_claim(kind: &str, profile_id: &str, generation: u64) -> bool {
+    let mut transactions = agent_accounts_login_transactions()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let key = (kind.to_string(), profile_id.to_string());
+    if !transactions
+        .current
+        .get(&key)
+        .is_some_and(|transaction| transaction.generation == generation)
+        || transactions.newest_selection.get(kind) != Some(&(profile_id.to_string(), generation))
+    {
+        return false;
+    }
+    transactions.current.remove(&key);
+    transactions.newest_selection.remove(kind);
+    true
+}
+
+fn agent_accounts_login_transaction_set_exit_marker(
+    kind: &str,
+    profile_id: &str,
+    generation: u64,
+    marker: PathBuf,
+) -> bool {
+    let mut transactions = agent_accounts_login_transactions()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if transactions.newest_selection.get(kind) != Some(&(profile_id.to_string(), generation)) {
+        return false;
+    }
+    let Some(transaction) = transactions
+        .current
+        .get_mut(&(kind.to_string(), profile_id.to_string()))
+    else {
+        return false;
+    };
+    if transaction.generation != generation {
+        return false;
+    }
+    transaction.exit_marker = Some(marker);
+    true
+}
+
+fn agent_accounts_login_transaction_bind_terminal(
+    kind: &'static str,
+    profile_id: &str,
+    generation: u64,
+    pane_id: &str,
+    instance_id: u64,
+) -> Result<AgentAccountsLoginPaneBinding, String> {
+    let mut transactions = agent_accounts_login_transactions()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if transactions.newest_selection.get(kind) != Some(&(profile_id.to_string(), generation)) {
+        return Err("The provider login transaction is no longer current.".to_string());
+    }
+    let transaction = transactions
+        .current
+        .get_mut(&(kind.to_string(), profile_id.to_string()))
+        .filter(|transaction| transaction.generation == generation)
+        .ok_or_else(|| "The provider login transaction is no longer current.".to_string())?;
+    let baseline = transaction
+        .baseline
+        .clone()
+        .ok_or_else(|| "The provider login transaction has no completion baseline.".to_string())?;
+    let exit_marker = transaction
+        .exit_marker
+        .clone()
+        .ok_or_else(|| "The provider login transaction has no exit-status marker.".to_string())?;
+    let binding_target = (pane_id.to_string(), instance_id);
+    if transaction
+        .bound_instance
+        .as_ref()
+        .is_some_and(|bound| bound != &binding_target)
+    {
+        return Err("The provider login transaction is already bound to another terminal instance."
+            .to_string());
+    }
+    let binding = AgentAccountsLoginPaneBinding {
+        kind,
+        profile_id: profile_id.to_string(),
+        generation,
+        baseline,
+        exit_marker,
+    };
+    // This insert and the transaction CAS share the transaction mutex. Two
+    // binds cannot both displace one another after separately observing the
+    // same generation.
+    AGENT_ACCOUNTS_LOGIN_PANES
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| "Unable to bind the provider login terminal.".to_string())?
+        .insert(
+            (pane_id.to_string(), instance_id, generation),
+            binding.clone(),
+        );
+    transaction.bound_instance = Some(binding_target);
+    Ok(binding)
+}
+
+fn agent_accounts_login_transaction_invalidate(
+    kind: &str,
+    profile_id: Option<&str>,
+    generation: Option<u64>,
+) -> bool {
+    let mut transactions = agent_accounts_login_transactions()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut changed = false;
+    transactions
+        .current
+        .retain(|(current_kind, current_profile), transaction| {
+            let matches = current_kind == kind
+                && profile_id.map_or(true, |profile| profile == current_profile)
+                && generation.map_or(true, |wanted| wanted == transaction.generation);
+            changed |= matches;
+            !matches
+        });
+    let remove_newest = transactions.newest_selection.get(kind).is_some_and(
+        |(current_profile, current_generation)| {
+            profile_id.map_or(true, |profile| profile == current_profile)
+                && generation.map_or(true, |wanted| wanted == *current_generation)
+        },
+    );
+    if remove_newest {
+        transactions.newest_selection.remove(kind);
+        changed = true;
+    }
+    changed
+}
+
+#[derive(Clone)]
+struct AgentAccountsLoginPaneBinding {
+    kind: &'static str,
+    profile_id: String,
+    generation: u64,
+    baseline: AgentAccountsLoginCompletionBaseline,
+    exit_marker: PathBuf,
+}
+
+fn agent_accounts_remove_login_bindings(kind: &str, profile_id: &str, generation: u64) {
+    if let Ok(mut panes) = AGENT_ACCOUNTS_LOGIN_PANES
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+    {
+        panes.retain(|_, binding| {
+            binding.kind != kind
+                || binding.profile_id != profile_id
+                || binding.generation != generation
+        });
+    }
+}
+
+pub(crate) fn agent_accounts_login_terminal_process_exited(
+    app: Option<&AppHandle>,
+    pane_id: &str,
+    instance_id: u64,
+    exit_status: Option<i32>,
+) {
+    let transaction = AGENT_ACCOUNTS_LOGIN_PANES
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|mut panes| {
+            let key = panes
+                .keys()
+                .find(|(candidate_pane, candidate_instance, _)| {
+                    candidate_pane == pane_id && *candidate_instance == instance_id
+                })
+                .cloned()?;
+            panes.remove(&key)
+        });
+    if let Some(transaction) = transaction {
+        // Managed login activation is gated by both the PTY's real exit code
+        // and the atomically-published inner-command marker. A watcher and
+        // teardown racing here still get only one marker claim and one CAS.
+        let completed = exit_status == Some(0)
+            && app.is_some_and(|app| {
+                agent_accounts_consume_login_exit_marker(
+                    transaction.kind,
+                    &transaction.profile_id,
+                    transaction.generation,
+                    &transaction.exit_marker,
+                    || {
+                        agent_accounts_try_complete_profile_login(
+                            app,
+                            transaction.kind,
+                            &transaction.profile_id,
+                            &transaction.baseline,
+                            transaction.generation,
+                        )
+                    },
+                ) == Some(true)
+            });
+        if !completed {
+            agent_accounts_login_transaction_invalidate(
+                transaction.kind,
+                Some(&transaction.profile_id),
+                Some(transaction.generation),
+            );
+            let _ = fs::remove_file(&transaction.exit_marker);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -194,13 +480,12 @@ fn agent_accounts_write_private_file_atomic(
         .get_or_init(|| StdMutex::new(()))
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    let _claude_state_guard = if path.file_name().and_then(|name| name.to_str())
-        == Some(".claude.json")
-    {
-        Some(acquire_claude_workspace_trust_lock(path)?)
-    } else {
-        None
-    };
+    let _claude_state_guard =
+        if path.file_name().and_then(|name| name.to_str()) == Some(".claude.json") {
+            Some(acquire_claude_workspace_trust_lock(path)?)
+        } else {
+            None
+        };
     agent_accounts_write_private_file_atomic_unlocked(path, bytes, description)
 }
 
@@ -218,6 +503,11 @@ fn agent_accounts_write_private_file_atomic_unlocked(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("private-state");
+    agent_accounts_cleanup_stale_private_file_temps(
+        parent,
+        file_name,
+        Duration::from_secs(60 * 60),
+    );
     let temp_path = parent.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
     let write_result = (|| -> Result<(), String> {
         #[cfg(unix)]
@@ -252,6 +542,47 @@ fn agent_accounts_write_private_file_atomic_unlocked(
         let _ = fs::remove_file(&temp_path);
     }
     write_result
+}
+
+fn agent_accounts_cleanup_stale_private_file_temps(
+    parent: &Path,
+    file_name: &str,
+    minimum_age: Duration,
+) -> usize {
+    const MAX_REMOVALS: usize = 32;
+    let prefix = format!(".{file_name}.tmp-");
+    let Ok(entries) = fs::read_dir(parent) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        if removed >= MAX_REMOVALS {
+            break;
+        }
+        let candidate_name = entry.file_name();
+        let Some(candidate_name) = candidate_name.to_str() else {
+            continue;
+        };
+        if !candidate_name.starts_with(&prefix) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file()
+            || metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_none_or(|age| age < minimum_age)
+        {
+            continue;
+        }
+        if fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 fn agent_account_push_write_private_json(
@@ -823,35 +1154,319 @@ fn agent_accounts_supported_kind(kind: &str) -> Option<&'static str> {
     None
 }
 
-/// OpenCode's auth.json is provider-keyed API keys with no email, so derive a
-/// stable non-secret identity from the configured key (preferring the Go plan
-/// key). This lets the email-keyed multi-account machinery dedupe/pin OpenCode
-/// accounts the same way it does Claude/Codex.
-fn agent_accounts_opencode_identity_from_auth(auth: &Value) -> String {
-    let key = auth
+fn agent_accounts_jwt_claims(token: &str) -> Option<Value> {
+    let payload = token.trim().split('.').nth(1)?;
+    general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| general_purpose::URL_SAFE.decode(payload))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+}
+
+fn agent_accounts_first_text_for_keys(value: &Value, keys: &[&str]) -> Option<String> {
+    match value {
+        Value::Object(object) => {
+            for key in keys {
+                if let Some(text) = object
+                    .get(*key)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                {
+                    return Some(text.to_string());
+                }
+            }
+            object
+                .values()
+                .find_map(|child| agent_accounts_first_text_for_keys(child, keys))
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|child| agent_accounts_first_text_for_keys(child, keys)),
+        _ => None,
+    }
+}
+
+fn agent_accounts_jwt_identity_for_entry(entry: &Value) -> Option<String> {
+    let object = entry.as_object()?;
+    for key in [
+        "id_token",
+        "idToken",
+        "access",
+        "access_token",
+        "accessToken",
+    ] {
+        let Some(token) = object.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(claims) = agent_accounts_jwt_claims(token) else {
+            continue;
+        };
+        if let Some(account_id) = agent_accounts_first_text_for_keys(
+            &claims,
+            &[
+                "chatgpt_account_id",
+                "chatgptAccountId",
+                "account_id",
+                "accountId",
+                "workspace_id",
+                "workspaceId",
+                "organization_id",
+                "organizationId",
+            ],
+        ) {
+            return Some(format!("account:{account_id}"));
+        }
+        if let Some(subject) =
+            agent_accounts_first_text_for_keys(&claims, &["sub", "user_id", "userId", "userid"])
+        {
+            return Some(format!("subject:{subject}"));
+        }
+    }
+    None
+}
+
+/// OpenCode API-key identities intentionally retain the pre-iteration-1
+/// format and selection order: prefer `opencode-go`, otherwise use the first
+/// provider entry as stored in auth.json, and always prefix `opencode-go-`.
+/// Existing registry rows therefore continue to dedupe after upgrade.
+fn agent_accounts_opencode_api_key_identity(auth: &Value) -> Option<String> {
+    let providers = auth.as_object()?;
+    let key = providers
         .get("opencode-go")
         .and_then(|entry| entry.get("key"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|key| !key.is_empty())
         .or_else(|| {
-            auth.as_object().and_then(|providers| {
-                providers
-                    .values()
-                    .filter_map(|entry| entry.get("key").and_then(Value::as_str).map(str::trim))
-                    .find(|key| !key.is_empty())
+            providers.values().find_map(|entry| {
+                entry
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty())
             })
-        });
-    match key {
-        Some(key) => format!("opencode-go-{}", cloud_mcp_short_hash(key)),
-        None => String::new(),
+        })?;
+    Some(format!("opencode-go-{}", cloud_mcp_short_hash(key)))
+}
+
+fn agent_accounts_opencode_oauth_identity_from_auth(auth: &Value) -> Option<String> {
+    let providers = auth.as_object()?;
+    for (provider, entry) in providers {
+        if entry.get("key").and_then(Value::as_str).is_some() {
+            continue;
+        }
+        let account_id =
+            agent_accounts_first_text_for_keys(entry, &["accountId", "account_id", "accountID"])
+                .map(|value| format!("account:{value}"))
+                .or_else(|| agent_accounts_jwt_identity_for_entry(entry));
+        if let Some(account_id) = account_id {
+            return Some(format!(
+                "opencode-oauth-{provider}-{}",
+                cloud_mcp_short_hash(&account_id)
+            ));
+        }
     }
+    None
+}
+
+pub(crate) fn agent_accounts_opencode_identity_from_auth(auth: &Value) -> String {
+    agent_accounts_opencode_api_key_identity(auth)
+        .or_else(|| agent_accounts_opencode_oauth_identity_from_auth(auth))
+        .unwrap_or_default()
+}
+
+const AGENT_ACCOUNTS_OPENCODE_IDENTITY_FILE: &str = ".diffforge-account-identity.json";
+
+fn agent_accounts_persisted_opencode_identity(path: &Path) -> Option<String> {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .get("identity_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn agent_accounts_opencode_identity_lock(path: &Path) -> Result<fs::File, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Unable to resolve the OpenCode identity directory.".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Unable to create the OpenCode identity directory: {error}"))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(AGENT_ACCOUNTS_OPENCODE_IDENTITY_FILE);
+    let lock_path = parent.join(format!(".{name}.lock"));
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|error| format!("Unable to open the OpenCode identity lock: {error}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(format!(
+                "Unable to lock the OpenCode identity: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        if unsafe {
+            LockFileEx(
+                file.as_raw_handle(),
+                LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        } == 0
+        {
+            return Err(format!(
+                "Unable to lock the OpenCode identity: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(file)
+}
+
+fn agent_accounts_opencode_oauth_provider(auth: &Value) -> Option<String> {
+    auth.as_object()?.iter().find_map(|(provider, entry)| {
+        let has_oauth = [
+            "access",
+            "access_token",
+            "accessToken",
+            "refresh",
+            "refresh_token",
+            "refreshToken",
+        ]
+        .iter()
+        .any(|key| {
+            entry
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+        });
+        has_oauth.then(|| provider.clone())
+    })
+}
+
+fn agent_accounts_opencode_identity_with_first_seen(auth: &Value, home: &Path) -> String {
+    let api_key_identity = agent_accounts_opencode_api_key_identity(auth);
+    let oauth_provider = agent_accounts_opencode_oauth_provider(auth);
+    if api_key_identity.is_none() && oauth_provider.is_none() {
+        // A sidecar pins identity; it is not evidence that current
+        // credentials are usable. Logout/empty auth must remain fail-closed.
+        return String::new();
+    }
+    let path = home.join(AGENT_ACCOUNTS_OPENCODE_IDENTITY_FILE);
+    // The first observed OAuth identity is immutable for this profile. A
+    // token that later gains accountId/JWT claims must not fork tokenomics or
+    // capture a second profile.
+    let _guard = AGENT_ACCOUNTS_PRIVATE_FILE_WRITE_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let Ok(_cross_process_guard) = agent_accounts_opencode_identity_lock(&path) else {
+        return String::new();
+    };
+    if let Some(identity) = agent_accounts_persisted_opencode_identity(&path) {
+        return identity;
+    }
+    // Existing sidecars win even if a later credential set gains an API-key
+    // entry. Profiles that have always been API-key-only retain the legacy
+    // deterministic identity and do not create a sidecar.
+    if oauth_provider.is_none() {
+        return api_key_identity.unwrap_or_default();
+    }
+    let Some(provider) = oauth_provider else {
+        return String::new();
+    };
+    let direct = agent_accounts_opencode_oauth_identity_from_auth(auth).unwrap_or_default();
+    let identity = if direct.is_empty() {
+        format!(
+            "opencode-oauth-{provider}-first-seen-{}",
+            uuid::Uuid::new_v4()
+        )
+    } else {
+        direct
+    };
+    let bytes = serde_json::to_vec_pretty(&json!({
+        "version": 1,
+        "provider": provider,
+        "identity_id": identity,
+        "created_at_ms": todo_dispatch_now_ms(),
+    }))
+    .unwrap_or_default();
+    if !bytes.is_empty()
+        && agent_accounts_write_private_file_atomic_unlocked(
+            &path,
+            &bytes,
+            "OpenCode first-seen account identity",
+        )
+        .is_ok()
+    {
+        return identity;
+    }
+    String::new()
+}
+
+fn agent_accounts_persist_opencode_identity(home: &Path, identity: &str) -> bool {
+    let identity = identity.trim();
+    if identity.is_empty() {
+        return false;
+    }
+    let path = home.join(AGENT_ACCOUNTS_OPENCODE_IDENTITY_FILE);
+    let _guard = AGENT_ACCOUNTS_PRIVATE_FILE_WRITE_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let Ok(_cross_process_guard) = agent_accounts_opencode_identity_lock(&path) else {
+        return false;
+    };
+    // Never overwrite a first-seen value, even if a later credential gains a
+    // stronger-looking claim. Explicit migration would need to update the
+    // registry row atomically; ordinary refresh is not such a migration.
+    if agent_accounts_persisted_opencode_identity(&path).is_some() {
+        return false;
+    }
+    serde_json::to_vec_pretty(&json!({
+        "version": 1,
+        "identity_id": identity,
+        "created_at_ms": todo_dispatch_now_ms(),
+    }))
+    .ok()
+    .is_some_and(|bytes| {
+        agent_accounts_write_private_file_atomic_unlocked(
+            &path,
+            &bytes,
+            "OpenCode persisted account identity",
+        )
+        .is_ok()
+    })
 }
 
 /// Canonical OpenCode data home (where auth.json + opencode.db live). Prefers an
 /// existing candidate, else the first by OpenCode's own resolution order.
 fn agent_accounts_opencode_default_home() -> Option<PathBuf> {
-    let candidates = opencode_data_home();
+    let candidates = opencode_native_data_home();
     candidates
         .iter()
         .find(|path| path.exists())
@@ -939,7 +1554,11 @@ fn agent_accounts_registry_read_checked() -> Result<Value, String> {
     if !registry.is_object() {
         return Err("Agent accounts registry root is not an object.".to_string());
     }
-    if registry.get("agents").map(Value::is_object).unwrap_or(false) {
+    if registry
+        .get("agents")
+        .map(Value::is_object)
+        .unwrap_or(false)
+    {
         agent_accounts_registry_remember_last_good(&registry);
     }
     Ok(registry)
@@ -981,9 +1600,7 @@ fn agent_accounts_kind_entry(registry: &Value, kind: &str) -> (String, Vec<Value
 }
 
 fn agent_accounts_default_home(kind: &str) -> Option<PathBuf> {
-    let home = env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .map(PathBuf::from)?;
+    let home = user_home_dir()?;
     Some(match kind {
         "claude" => home.join(".claude"),
         "opencode" => {
@@ -991,6 +1608,39 @@ fn agent_accounts_default_home(kind: &str) -> Option<PathBuf> {
         }
         _ => home.join(".codex"),
     })
+}
+
+/// Saved OpenCode profile dirs are XDG roots. OpenCode appends `opencode`
+/// itself, so the authoritative credential file is
+/// `<profile>/opencode/auth.json`. Iteration-0 profiles stored auth.json at
+/// the profile root; migrate that file once without deleting the source so a
+/// crash during upgrade cannot strand the account.
+fn agent_accounts_profile_auth_path(kind: &str, profile_dir: &Path) -> PathBuf {
+    if kind == "opencode" {
+        profile_dir.join("opencode").join("auth.json")
+    } else {
+        profile_dir.join(agent_accounts_auth_file_name(kind))
+    }
+}
+
+fn agent_accounts_migrate_opencode_profile_layout(profile_dir: &Path) -> Result<bool, String> {
+    let legacy = profile_dir.join("auth.json");
+    let destination = agent_accounts_profile_auth_path("opencode", profile_dir);
+    if destination.is_file() || !legacy.is_file() {
+        return Ok(false);
+    }
+    let bytes = fs::read(&legacy).map_err(|error| {
+        format!(
+            "Unable to read legacy OpenCode profile credentials {}: {error}",
+            legacy.display()
+        )
+    })?;
+    agent_accounts_write_private_file_atomic(
+        &destination,
+        &bytes,
+        "migrated OpenCode profile credentials",
+    )?;
+    Ok(true)
 }
 
 /// Identity probe for one profile dir. Reads only non-secret metadata the
@@ -1003,14 +1653,12 @@ fn agent_accounts_profile_identity(kind: &str, dir: Option<&Path>) -> Value {
             // profile dir; the default account keeps it at `~/.claude.json`.
             let state_path = match dir {
                 Some(dir) => dir.join(".claude.json"),
-                None => match env::var_os("HOME").map(PathBuf::from) {
+                None => match user_home_dir() {
                     Some(home) => home.join(".claude.json"),
                     None => return json!({ "email": "", "auth_ready": false }),
                 },
             };
-            let state = fs::read_to_string(&state_path)
-                .ok()
-                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+            let state = agent_accounts_read_json_stable_with_retry(&state_path);
             let email = state
                 .as_ref()
                 .and_then(|state| state.pointer("/oauthAccount/emailAddress"))
@@ -1046,27 +1694,33 @@ fn agent_accounts_profile_identity(kind: &str, dir: Option<&Path>) -> Value {
             })
         }
         "opencode" => {
+            if let Some(dir) = dir {
+                let _ = agent_accounts_migrate_opencode_profile_layout(dir);
+            }
             let auth_path = match dir {
-                Some(dir) => dir.join("auth.json"),
+                Some(dir) => agent_accounts_profile_auth_path("opencode", dir),
                 None => match agent_accounts_default_home("opencode") {
                     Some(home) => home.join("auth.json"),
                     None => return json!({ "email": "", "auth_ready": false }),
                 },
             };
-            let auth = fs::read_to_string(&auth_path)
-                .ok()
-                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+            let auth = agent_accounts_read_json_stable_with_retry(&auth_path);
             // The synthetic "email" is a stable key fingerprint, which the
             // dedupe/capture machinery treats as the account identity.
+            let identity_home = dir
+                .map(Path::to_path_buf)
+                .or_else(|| agent_accounts_default_home("opencode"));
             let identity = auth
                 .as_ref()
-                .map(agent_accounts_opencode_identity_from_auth)
+                .zip(identity_home.as_deref())
+                .map(|(auth, home)| agent_accounts_opencode_identity_with_first_seen(auth, home))
                 .unwrap_or_default();
-            let auth_ready = auth
-                .as_ref()
-                .and_then(Value::as_object)
-                .is_some_and(|providers| !providers.is_empty());
-            json!({ "email": identity, "auth_ready": auth_ready })
+            let auth_ready = !identity.is_empty();
+            json!({
+                "email": identity,
+                "stable_identity": identity,
+                "auth_ready": auth_ready,
+            })
         }
         _ => {
             let auth_path = match dir {
@@ -1076,20 +1730,90 @@ fn agent_accounts_profile_identity(kind: &str, dir: Option<&Path>) -> Value {
                     None => return json!({ "email": "", "auth_ready": false }),
                 },
             };
-            let auth = fs::read_to_string(&auth_path)
-                .ok()
-                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+            let auth = agent_accounts_read_json_stable_with_retry(&auth_path);
             let email = auth
                 .as_ref()
                 .map(agent_accounts_codex_email_from_auth)
                 .unwrap_or_default();
-            json!({ "email": email, "auth_ready": auth.is_some() })
+            let stable_identity = auth
+                .as_ref()
+                .map(agent_accounts_codex_stable_identity_from_auth)
+                .unwrap_or_default();
+            json!({
+                "email": email,
+                "stable_identity": stable_identity,
+                "account_id": stable_identity,
+                "auth_ready": auth.is_some() && !stable_identity.is_empty(),
+            })
         }
     }
 }
 
-/// Codex `auth.json` carries the account email inside the OIDC id token; the
-/// payload segment is plain base64url JSON — no signature use, display only.
+pub(crate) fn agent_accounts_codex_stable_identity_from_auth(auth: &Value) -> String {
+    if let Some(account_id) = agent_accounts_first_text_for_keys(
+        auth.get("tokens").unwrap_or(auth),
+        &[
+            "chatgpt_account_id",
+            "chatgptAccountId",
+            "account_id",
+            "accountId",
+            "workspace_id",
+            "workspaceId",
+            "organization_id",
+            "organizationId",
+        ],
+    ) {
+        return format!("codex-account:{account_id}");
+    }
+
+    for token_path in [
+        "/tokens/id_token",
+        "/tokens/access_token",
+        "/id_token",
+        "/access_token",
+    ] {
+        let Some(token) = auth.pointer(token_path).and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(claims) = agent_accounts_jwt_claims(token) else {
+            continue;
+        };
+        if let Some(account_id) = agent_accounts_first_text_for_keys(
+            &claims,
+            &[
+                "chatgpt_account_id",
+                "chatgptAccountId",
+                "account_id",
+                "accountId",
+                "workspace_id",
+                "workspaceId",
+                "organization_id",
+                "organizationId",
+            ],
+        ) {
+            return format!("codex-account:{account_id}");
+        }
+        // A JWT subject identifies a person, not the selected ChatGPT
+        // workspace. Never accept it (or display email) as switch identity.
+        // JWT-backed profiles must expose an immutable account/workspace/org
+        // claim; API-key-only profiles use the key fingerprint below.
+    }
+
+    let api_key = auth
+        .get("OPENAI_API_KEY")
+        .or_else(|| auth.get("api_key"))
+        .or_else(|| auth.pointer("/tokens/api_key"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    api_key
+        .map(|key| format!("codex-api-key:{}", cloud_mcp_short_hash(key)))
+        .unwrap_or_default()
+}
+
+/// Codex `auth.json` carries account email inside the OIDC id token. Email is
+/// display metadata only; activation and dedupe use the immutable identity
+/// returned by `agent_accounts_codex_stable_identity_from_auth`.
 fn agent_accounts_codex_email_from_auth(auth: &Value) -> String {
     if let Some(email) = auth
         .pointer("/tokens/email")
@@ -1107,13 +1831,7 @@ fn agent_accounts_codex_email_from_auth(auth: &Value) -> String {
     else {
         return String::new();
     };
-    let Some(payload_b64) = id_token.split('.').nth(1) else {
-        return String::new();
-    };
-    general_purpose::URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    agent_accounts_jwt_claims(id_token)
         .and_then(|claims| {
             claims
                 .get("email")
@@ -1123,13 +1841,64 @@ fn agent_accounts_codex_email_from_auth(auth: &Value) -> String {
         .unwrap_or_default()
 }
 
-fn agent_accounts_login_command(kind: &str, dir: &str) -> String {
+fn agent_accounts_login_command_for_shell(kind: &str, dir: &str, powershell: bool) -> String {
+    if powershell {
+        let dir = format!("'{}'", dir.replace('\'', "''"));
+        return match kind {
+            "claude" => format!("$env:CLAUDE_CONFIG_DIR = {dir}; claude auth login"),
+            "opencode" => format!("$env:XDG_DATA_HOME = {dir}; opencode auth login"),
+            _ => format!("$env:CODEX_HOME = {dir}; codex login --device-auth"),
+        };
+    }
     let dir = agent_accounts_shell_quote(dir);
     match kind {
         "claude" => format!("CLAUDE_CONFIG_DIR={dir} claude auth login"),
-        "opencode" => format!("OPENCODE_DATA_DIR={dir} opencode auth login"),
+        "opencode" => format!("XDG_DATA_HOME={dir} opencode auth login"),
         _ => format!("CODEX_HOME={dir} codex login --device-auth"),
     }
+}
+
+fn agent_accounts_login_command(kind: &str, dir: &str) -> String {
+    agent_accounts_login_command_for_shell(kind, dir, cfg!(windows))
+}
+
+fn agent_accounts_login_exit_marker_path(
+    kind: &str,
+    profile_id: &str,
+    generation: u64,
+) -> PathBuf {
+    env::temp_dir().join(format!(
+        "diffforge-login-exit-{}-{}-{generation}-{}",
+        kind,
+        cloud_mcp_short_hash(profile_id),
+        uuid::Uuid::new_v4()
+    ))
+}
+
+fn agent_accounts_managed_login_command_with_exit_marker(
+    command: &str,
+    marker: &Path,
+    powershell: bool,
+) -> String {
+    let marker_temp = marker.with_extension(format!(
+        "pending-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    if powershell {
+        let marker = format!("'{}'", marker.to_string_lossy().replace('\'', "''"));
+        let marker_temp = format!(
+            "'{}'",
+            marker_temp.to_string_lossy().replace('\'', "''")
+        );
+        return format!(
+            "& {{ {command} }}; $diffforgeSucceeded = $?; $diffforgeStatus = if ($null -ne $LASTEXITCODE) {{ [int]$LASTEXITCODE }} elseif ($diffforgeSucceeded) {{ 0 }} else {{ 1 }}; Set-Content -LiteralPath {marker_temp} -Value $diffforgeStatus -NoNewline; Move-Item -Force -LiteralPath {marker_temp} -Destination {marker}; exit $diffforgeStatus"
+        );
+    }
+    let marker = agent_accounts_shell_quote(&marker.to_string_lossy());
+    let marker_temp = agent_accounts_shell_quote(&marker_temp.to_string_lossy());
+    format!(
+        "{{ {command}; diffforge_status=$?; printf '%s\\n' \"$diffforge_status\" > {marker_temp} && mv -f -- {marker_temp} {marker}; exit \"$diffforge_status\"; }}"
+    )
 }
 
 fn agent_accounts_shell_quote(value: &str) -> String {
@@ -1181,6 +1950,7 @@ fn agent_accounts_profile_view(kind: &str, profile: &Value, active_id: &str) -> 
         "id": id,
         "label": profile.get("label").and_then(Value::as_str).unwrap_or_default(),
         "email": stored_email,
+        "identity_id": profile.get("identity_id").and_then(Value::as_str).unwrap_or_default(),
         "alias": profile.get("alias").and_then(Value::as_str).unwrap_or_default(),
         "show_alias": profile.get("show_alias").and_then(Value::as_bool).unwrap_or(true),
         "show_email": profile.get("show_email").and_then(Value::as_bool).unwrap_or(true),
@@ -1344,11 +2114,8 @@ fn agent_accounts_default_alias_for_state(
 }
 
 fn agent_accounts_default_email(kind: &str) -> String {
-    agent_accounts_profile_identity(kind, None)
-        .get("email")
-        .and_then(Value::as_str)
-        .map(agent_accounts_email_key)
-        .unwrap_or_default()
+    let identity = agent_accounts_profile_identity(kind, None);
+    agent_accounts_identity_key(kind, &identity)
 }
 
 /// Ids of non-canonical profiles suppressed because their email already maps
@@ -1404,11 +2171,7 @@ pub(crate) fn agent_accounts_active_profile_id_for_tokenomics(kind: &str) -> Str
 fn agent_accounts_kind_state(registry: &Value, kind: &str) -> Value {
     let (active_id, profiles) = agent_accounts_kind_entry(registry, kind);
     let default_identity = agent_accounts_profile_identity(kind, None);
-    let default_email = default_identity
-        .get("email")
-        .and_then(Value::as_str)
-        .map(agent_accounts_email_key)
-        .unwrap_or_default();
+    let default_email = agent_accounts_identity_key(kind, &default_identity);
     let effective_active_id =
         agent_accounts_effective_active_profile_id(kind, &active_id, &profiles, &default_email);
     let canonical_ids = agent_accounts_canonical_profile_ids_by_email(
@@ -1544,16 +2307,18 @@ fn agent_accounts_auth_file_name(kind: &str) -> &'static str {
 }
 
 fn agent_accounts_auth_file_signature(path: &Path) -> Option<String> {
-    let metadata = fs::metadata(path).ok()?;
-    let modified_ms = metadata
-        .modified()
-        .ok()
+    let snapshot = agent_accounts_read_stable_file(path)?;
+    Some(agent_accounts_file_snapshot_signature(&snapshot))
+}
+
+fn agent_accounts_file_snapshot_signature(snapshot: &AgentAccountsFileSnapshot) -> String {
+    let modified_ms = snapshot
+        .modified
         .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default();
-    let bytes = fs::read(path).ok()?;
-    let digest = cloud_mcp_short_hash(&String::from_utf8_lossy(&bytes));
-    Some(format!("{modified_ms}:{}:{digest}", metadata.len()))
+    let digest = cloud_mcp_short_hash(&String::from_utf8_lossy(&snapshot.bytes));
+    format!("{modified_ms}:{}:{digest}", snapshot.len)
 }
 
 fn agent_accounts_auth_file_path(
@@ -1567,7 +2332,7 @@ fn agent_accounts_auth_file_path(
     }
     profile
         .and_then(agent_accounts_profile_dir)
-        .map(|dir| dir.join(agent_accounts_auth_file_name(kind)))
+        .map(|dir| agent_accounts_profile_auth_path(kind, &dir))
 }
 
 fn agent_accounts_auth_signature_for_profile(
@@ -1584,13 +2349,15 @@ fn agent_accounts_auth_revision_for_profile(
     profile_id: &str,
     profile: Option<&Value>,
 ) -> String {
-    let auth_signature = agent_accounts_auth_signature_for_profile(kind, profile_id, profile)
-        .unwrap_or_default();
+    let auth_signature =
+        agent_accounts_auth_signature_for_profile(kind, profile_id, profile).unwrap_or_default();
     let provider_state_signature = if kind == "claude" {
         let state_path = if profile_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
-            env::var_os("HOME").map(PathBuf::from).map(|home| home.join(".claude.json"))
+            user_home_dir().map(|home| home.join(".claude.json"))
         } else {
-            profile.and_then(agent_accounts_profile_dir).map(|dir| dir.join(".claude.json"))
+            profile
+                .and_then(agent_accounts_profile_dir)
+                .map(|dir| dir.join(".claude.json"))
         };
         state_path
             .as_deref()
@@ -1768,37 +2535,32 @@ fn agent_accounts_profile_dir(profile: &Value) -> Option<PathBuf> {
 
 fn agent_accounts_default_profile_for_launch(kind: &'static str) -> Option<Value> {
     let identity = agent_accounts_profile_identity(kind, None);
-    let email = identity
-        .get("email")
-        .and_then(Value::as_str)
-        .map(agent_accounts_email_key)
-        .unwrap_or_default();
+    let identity_key = agent_accounts_identity_key(kind, &identity);
     let auth_ready = identity
         .get("auth_ready")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if email.is_empty() || !auth_ready {
+    if identity_key.is_empty() || !auth_ready {
         return None;
     }
 
     let _ = agent_accounts_capture_kind(kind);
     let registry = agent_accounts_registry_read();
     let (_, profiles) = agent_accounts_kind_entry(&registry, kind);
-    let auth_file = agent_accounts_auth_file_name(kind);
     profiles.into_iter().find_map(|profile| {
-        if agent_accounts_profile_email(kind, &profile) != email {
+        if agent_accounts_profile_email(kind, &profile) != identity_key {
             return None;
         }
         agent_accounts_profile_dir(&profile)
-            .filter(|path| path.join(auth_file).is_file())
+            .filter(|path| agent_accounts_profile_auth_path(kind, path).is_file())
             .map(|_| profile)
     })
 }
 
 fn agent_accounts_default_profile_home_for_launch(kind: &'static str) -> Option<PathBuf> {
     agent_accounts_default_profile_for_launch(kind).and_then(|profile| {
-        let auth_file = agent_accounts_auth_file_name(kind);
-        agent_accounts_profile_dir(&profile).filter(|path| path.join(auth_file).is_file())
+        agent_accounts_profile_dir(&profile)
+            .filter(|path| agent_accounts_profile_auth_path(kind, path).is_file())
     })
 }
 
@@ -1906,6 +2668,14 @@ pub(crate) fn agent_accounts_codex_home_for_launch() -> Option<PathBuf> {
     agent_accounts_default_profile_home_for_launch("codex")
 }
 
+fn agent_accounts_bind_opencode_env(env_vars: &mut Vec<(String, String)>, xdg_root: &Path) {
+    env_vars.retain(|(key, _)| key != "OPENCODE_DATA_DIR" && key != "XDG_DATA_HOME");
+    env_vars.push((
+        "XDG_DATA_HOME".to_string(),
+        xdg_root.to_string_lossy().to_string(),
+    ));
+}
+
 /// Spawn-time account binding: stamps the pane with the active profile and
 /// injects the CLI home override for non-default profiles. Called from
 /// `extend_terminal_activity_env_vars`, which every agent spawn/relaunch
@@ -1915,10 +2685,21 @@ pub(crate) fn agent_accounts_apply_spawn_env(
     env_vars: &mut Vec<(String, String)>,
     pane_id: &str,
     provider_id: &str,
+    workspace_id: Option<&str>,
+    workspace_label: Option<&str>,
+    terminal_index: Option<u16>,
 ) {
     let Some(kind) = agent_accounts_supported_kind(provider_id) else {
         return;
     };
+    // Migrate before computing the launch revision. Otherwise the first
+    // post-upgrade OpenCode pane can be stamped with an empty legacy-path
+    // revision and immediately appear stale after the migration below.
+    if kind == "opencode" {
+        if let Some(dir) = agent_accounts_active_profile_dir(kind) {
+            let _ = agent_accounts_migrate_opencode_profile_layout(Path::new(&dir));
+        }
+    }
     let (active_id, active_label) = agent_accounts_launch_profile_label(kind);
     let auth_revision = agent_accounts_active_auth_revision(kind);
     let workspace_trust = if kind == "claude" {
@@ -1961,6 +2742,9 @@ pub(crate) fn agent_accounts_apply_spawn_env(
                     "profile_id": active_id,
                     "profile_label": active_label,
                     "auth_revision": auth_revision,
+                    "workspace_id": workspace_id.unwrap_or_default(),
+                    "workspace_label": workspace_label.unwrap_or_default(),
+                    "terminal_index": terminal_index,
                     "workspace_trust_state": workspace_trust.as_ref().and_then(|value| value.get("state")).cloned().unwrap_or_else(|| json!("unknown")),
                     "workspace_trust_source": workspace_trust.as_ref().and_then(|value| value.get("source")).cloned().unwrap_or_else(|| json!("provider_native_state")),
                     "stamped_at_ms": todo_dispatch_now_ms(),
@@ -1983,13 +2767,15 @@ pub(crate) fn agent_accounts_apply_spawn_env(
             let Some(dir) = agent_accounts_active_profile_dir(kind) else {
                 return;
             };
-            env_vars.retain(|(key, _)| key != "OPENCODE_DATA_DIR");
-            env_vars.push(("OPENCODE_DATA_DIR".to_string(), dir));
+            let dir = PathBuf::from(dir);
+            let _ = agent_accounts_migrate_opencode_profile_layout(&dir);
+            agent_accounts_bind_opencode_env(env_vars, &dir);
         }
         _ => {
-            let Some(dir) = agent_accounts_active_profile_dir(kind) else {
+            let Some(dir) = agent_accounts_codex_home_for_launch() else {
                 return;
             };
+            let dir = dir.to_string_lossy().to_string();
             // Coordinated Codex panes already run a Diff Forge managed
             // CODEX_HOME (hook profiles live there); their auth re-links from
             // the active profile via the kernel's auth bridge instead.
@@ -2175,9 +2961,46 @@ fn agent_accounts_dedupe_captured_profile_labels(registry: &mut Value, kind: &st
     changed
 }
 
-/// The identity a profile is pinned to: the email stored at capture time, or
-/// a live probe of the profile dir for manually created legacy profiles.
+fn agent_accounts_identity_key(kind: &str, identity: &Value) -> String {
+    let key = if matches!(kind, "codex" | "opencode") {
+        identity
+            .get("stable_identity")
+            .or_else(|| identity.get("account_id"))
+            .or_else(|| identity.get("email"))
+    } else {
+        identity.get("email")
+    };
+    key.and_then(Value::as_str)
+        .map(agent_accounts_email_key)
+        .unwrap_or_default()
+}
+
+/// The stable identity a profile is pinned to. Claude retains its historical
+/// email identity. Codex/OpenCode prefer the persisted immutable identity and
+/// only fall back to legacy email rows while their auth file is migrated.
 fn agent_accounts_profile_email(kind: &str, profile: &Value) -> String {
+    if matches!(kind, "codex" | "opencode") {
+        if let Some(stored) = profile
+            .get("identity_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return agent_accounts_email_key(stored);
+        }
+        if let Some(dir) = profile
+            .get("dir")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let identity = agent_accounts_profile_identity(kind, Some(Path::new(dir)));
+            let stable = agent_accounts_identity_key(kind, &identity);
+            if !stable.is_empty() {
+                return stable;
+            }
+        }
+    }
     if let Some(stored) = profile
         .get("email")
         .and_then(Value::as_str)
@@ -2194,11 +3017,23 @@ fn agent_accounts_profile_email(kind: &str, profile: &Value) -> String {
     let Some(dir) = dir else {
         return String::new();
     };
-    agent_accounts_profile_identity(kind, Some(Path::new(dir)))
-        .get("email")
-        .and_then(Value::as_str)
-        .map(agent_accounts_email_key)
-        .unwrap_or_default()
+    let identity = agent_accounts_profile_identity(kind, Some(Path::new(dir)));
+    agent_accounts_identity_key(kind, &identity)
+}
+
+pub(crate) fn agent_accounts_active_stable_identity(kind: &str) -> Option<String> {
+    let registry = agent_accounts_registry_read_resolved();
+    let (active_profile_id, profiles) = agent_accounts_kind_entry(&registry, kind);
+    if active_profile_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
+        let identity = agent_accounts_profile_identity(kind, None);
+        let key = agent_accounts_identity_key(kind, &identity);
+        return (!key.is_empty()).then_some(key);
+    }
+    profiles
+        .iter()
+        .find(|profile| agent_accounts_profile_id(profile).as_deref() == Some(&active_profile_id))
+        .map(|profile| agent_accounts_profile_email(kind, profile))
+        .filter(|identity| !identity.is_empty())
 }
 
 fn agent_accounts_source_is_newer(source: &Path, destination: &Path) -> bool {
@@ -2223,25 +3058,92 @@ fn agent_accounts_source_is_newer(source: &Path, destination: &Path) -> bool {
 }
 
 fn agent_accounts_copy_if_newer(source: &Path, destination: &Path) -> bool {
-    agent_accounts_source_is_newer(source, destination)
-        && fs::copy(source, destination).is_ok()
+    agent_accounts_source_is_newer(source, destination) && fs::copy(source, destination).is_ok()
 }
 
+#[derive(Clone)]
 struct AgentAccountsFileSnapshot {
     bytes: Vec<u8>,
     modified: Option<std::time::SystemTime>,
     len: u64,
+    file_id: String,
+    revision_id: String,
+}
+
+#[cfg(unix)]
+fn agent_accounts_metadata_file_id(metadata: &fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt as _;
+    format!("{}:{}", metadata.dev(), metadata.ino())
+}
+
+#[cfg(windows)]
+fn agent_accounts_metadata_file_id(metadata: &fs::Metadata) -> String {
+    use std::os::windows::fs::MetadataExt as _;
+    format!(
+        "{}:{}",
+        metadata.volume_serial_number().unwrap_or_default(),
+        metadata.file_index().unwrap_or_default()
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn agent_accounts_metadata_file_id(_metadata: &fs::Metadata) -> String {
+    String::new()
+}
+
+#[cfg(unix)]
+fn agent_accounts_metadata_revision_id(metadata: &fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt as _;
+    format!(
+        "{}:{}:{}:{}",
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec()
+    )
+}
+
+#[cfg(windows)]
+fn agent_accounts_metadata_revision_id(metadata: &fs::Metadata) -> String {
+    use std::os::windows::fs::MetadataExt as _;
+    format!("{}:{}", metadata.last_write_time(), metadata.file_size())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn agent_accounts_metadata_revision_id(metadata: &fs::Metadata) -> String {
+    format!("{:?}:{}", metadata.modified().ok(), metadata.len())
+}
+
+fn agent_accounts_metadata_matches_snapshot(
+    metadata: &fs::Metadata,
+    snapshot: &AgentAccountsFileSnapshot,
+) -> bool {
+    metadata.len() == snapshot.len
+        && metadata.modified().ok() == snapshot.modified
+        && agent_accounts_metadata_file_id(metadata) == snapshot.file_id
+        && agent_accounts_metadata_revision_id(metadata) == snapshot.revision_id
 }
 
 fn agent_accounts_read_stable_file(path: &Path) -> Option<AgentAccountsFileSnapshot> {
-    let before = path.metadata().ok()?;
-    let bytes = fs::read(path).ok()?;
-    let after = path.metadata().ok()?;
+    let mut file = fs::File::open(path).ok()?;
+    let before = file.metadata().ok()?;
+    let mut bytes = Vec::with_capacity(before.len().min(1024 * 1024) as usize);
+    file.read_to_end(&mut bytes).ok()?;
+    let after = file.metadata().ok()?;
+    let path_after = path.metadata().ok()?;
     let before_modified = before.modified().ok();
     let after_modified = after.modified().ok();
     if before.len() != after.len()
         || before_modified != after_modified
         || after.len() != bytes.len() as u64
+        || agent_accounts_metadata_file_id(&before) != agent_accounts_metadata_file_id(&after)
+        || agent_accounts_metadata_file_id(&after) != agent_accounts_metadata_file_id(&path_after)
+        || agent_accounts_metadata_revision_id(&before)
+            != agent_accounts_metadata_revision_id(&after)
+        || agent_accounts_metadata_revision_id(&after)
+            != agent_accounts_metadata_revision_id(&path_after)
+        || path_after.len() != after.len()
+        || path_after.modified().ok() != after_modified
     {
         return None;
     }
@@ -2249,7 +3151,42 @@ fn agent_accounts_read_stable_file(path: &Path) -> Option<AgentAccountsFileSnaps
         bytes,
         modified: after_modified,
         len: after.len(),
+        file_id: agent_accounts_metadata_file_id(&after),
+        revision_id: agent_accounts_metadata_revision_id(&after),
     })
+}
+
+#[derive(Clone)]
+struct AgentAccountsJsonSnapshot {
+    file: AgentAccountsFileSnapshot,
+    json: Value,
+}
+
+fn agent_accounts_read_json_snapshot_with_retry(path: &Path) -> Option<AgentAccountsJsonSnapshot> {
+    const ATTEMPTS: usize = 6;
+    const RETRY_MS: u64 = 100;
+    for attempt in 0..ATTEMPTS {
+        match path.metadata() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            _ => {}
+        }
+        if let Some(file) = agent_accounts_read_stable_file(path) {
+            if let Ok(json) = serde_json::from_slice::<Value>(&file.bytes) {
+                return Some(AgentAccountsJsonSnapshot { file, json });
+            }
+        }
+        if attempt + 1 < ATTEMPTS {
+            thread::sleep(Duration::from_millis(RETRY_MS));
+        }
+    }
+    None
+}
+
+/// Login CLIs replace auth files atomically on Unix and can expose a brief
+/// sharing violation or partial write on Windows. Require one stable,
+/// parseable snapshot, retrying for a bounded 500ms window.
+fn agent_accounts_read_json_stable_with_retry(path: &Path) -> Option<Value> {
+    agent_accounts_read_json_snapshot_with_retry(path).map(|snapshot| snapshot.json)
 }
 
 fn agent_accounts_claude_state_email(state: &Value) -> String {
@@ -2267,9 +3204,7 @@ fn agent_accounts_claude_default_state_for_email(
     if expected_email.is_empty() {
         return None;
     }
-    let path = env::var_os("HOME")
-        .map(PathBuf::from)?
-        .join(".claude.json");
+    let path = user_home_dir()?.join(".claude.json");
     let snapshot = agent_accounts_read_stable_file(&path)?;
     let state = serde_json::from_slice::<Value>(&snapshot.bytes).ok()?;
     (agent_accounts_claude_state_email(&state) == expected_email).then_some(snapshot)
@@ -2292,9 +3227,7 @@ fn agent_accounts_claude_credentials_consistent_for_copy(
     capture_cycle: u64,
 ) -> bool {
     let credentials_are_newer = match (credentials.modified, state.modified) {
-        (Some(credentials_modified), Some(state_modified)) => {
-            credentials_modified > state_modified
-        }
+        (Some(credentials_modified), Some(state_modified)) => credentials_modified > state_modified,
         // If either timestamp is unavailable, require the same conservative
         // confirmation as the credentials-first case.
         _ => true,
@@ -2366,12 +3299,19 @@ fn agent_accounts_next_claude_capture_cycle() -> u64 {
 }
 
 fn agent_accounts_snapshot_refresh(kind: &str, dir: &Path, expected_email: &str) -> bool {
-    agent_accounts_snapshot_refresh_in_cycle(
+    let validated_auth = if matches!(kind, "codex" | "opencode") {
+        agent_accounts_default_home(kind)
+            .and_then(|home| agent_accounts_read_json_snapshot_with_retry(&home.join("auth.json")))
+    } else {
+        None
+    };
+    agent_accounts_snapshot_refresh_in_cycle_with_auth(
         kind,
         dir,
         expected_email,
         false,
         agent_accounts_next_claude_capture_cycle(),
+        validated_auth.as_ref(),
     )
 }
 
@@ -2381,6 +3321,84 @@ fn agent_accounts_snapshot_refresh_in_cycle(
     expected_email: &str,
     force_credentials: bool,
     capture_cycle: u64,
+) -> bool {
+    let validated_auth = if matches!(kind, "codex" | "opencode") {
+        agent_accounts_default_home(kind)
+            .and_then(|home| agent_accounts_read_json_snapshot_with_retry(&home.join("auth.json")))
+    } else {
+        None
+    };
+    agent_accounts_snapshot_refresh_in_cycle_with_auth(
+        kind,
+        dir,
+        expected_email,
+        force_credentials,
+        capture_cycle,
+        validated_auth.as_ref(),
+    )
+}
+
+fn agent_accounts_validated_auth_identity(
+    kind: &str,
+    source_home: &Path,
+    snapshot: &AgentAccountsJsonSnapshot,
+) -> String {
+    match kind {
+        "opencode" => agent_accounts_opencode_identity_with_first_seen(&snapshot.json, source_home),
+        "codex" => agent_accounts_codex_stable_identity_from_auth(&snapshot.json),
+        _ => String::new(),
+    }
+}
+
+fn agent_accounts_install_validated_auth_snapshot(
+    kind: &str,
+    source: &Path,
+    destination: &Path,
+    expected_identity: &str,
+    snapshot: &AgentAccountsJsonSnapshot,
+) -> Option<bool> {
+    let expected_identity = agent_accounts_email_key(expected_identity);
+    let source_home = source.parent().unwrap_or(source);
+    let validated_identity = agent_accounts_email_key(&agent_accounts_validated_auth_identity(
+        kind,
+        source_home,
+        snapshot,
+    ));
+    if expected_identity.is_empty() || validated_identity != expected_identity {
+        return None;
+    }
+    // Final revision check is metadata/file-id only: the credential bytes are
+    // never read a second time. If auth.json was replaced or rewritten after
+    // validation, defer to the next capture instead of committing stale or
+    // mismatched bytes.
+    let Ok(metadata) = source.metadata() else {
+        return None;
+    };
+    if !agent_accounts_metadata_matches_snapshot(&metadata, &snapshot.file) {
+        return None;
+    }
+    let unchanged = fs::read(destination)
+        .ok()
+        .is_some_and(|current| current == snapshot.file.bytes);
+    if unchanged {
+        return Some(false);
+    }
+    agent_accounts_write_private_file_atomic(
+        destination,
+        &snapshot.file.bytes,
+        "captured validated credentials",
+    )
+    .ok()
+    .map(|_| true)
+}
+
+fn agent_accounts_snapshot_refresh_in_cycle_with_auth(
+    kind: &str,
+    dir: &Path,
+    expected_email: &str,
+    force_credentials: bool,
+    capture_cycle: u64,
+    validated_auth: Option<&AgentAccountsJsonSnapshot>,
 ) -> bool {
     let _span = BackendCpuSpan::new("agent_accounts.snapshot_refresh");
     let Some(default_home) = agent_accounts_default_home(kind) else {
@@ -2399,10 +3417,7 @@ fn agent_accounts_snapshot_refresh_in_cycle(
             };
             let credentials_source = default_home.join(".credentials.json");
             let credentials_snapshot = (force_credentials
-                || agent_accounts_source_is_newer(
-                    &credentials_source,
-                    &credentials_destination,
-                ))
+                || agent_accounts_source_is_newer(&credentials_source, &credentials_destination))
             .then(|| agent_accounts_read_stable_file(&credentials_source))
             .flatten();
             if credentials_snapshot.is_none() {
@@ -2464,21 +3479,30 @@ fn agent_accounts_snapshot_refresh_in_cycle(
             }
             let settings_destination = dir.join("settings.json");
             if !settings_destination.exists() {
-                changed |= fs::copy(default_home.join("settings.json"), &settings_destination)
-                    .is_ok();
+                changed |=
+                    fs::copy(default_home.join("settings.json"), &settings_destination).is_ok();
             }
             changed
         }
         "opencode" => {
-            if agent_accounts_default_email(kind) != expected_email {
+            let Some(validated_auth) = validated_auth else {
+                return false;
+            };
+            let data_dir = dir.join("opencode");
+            if fs::create_dir_all(&data_dir).is_err() {
                 return false;
             }
-            let mut changed = agent_accounts_copy_if_newer(
+            let Some(mut changed) = agent_accounts_install_validated_auth_snapshot(
+                kind,
                 &default_home.join("auth.json"),
-                &dir.join("auth.json"),
-            );
+                &data_dir.join("auth.json"),
+                &expected_email,
+                validated_auth,
+            ) else {
+                return false;
+            };
             for config_name in ["config.json", "opencode.json", "opencode.jsonc"] {
-                let destination = dir.join(config_name);
+                let destination = data_dir.join(config_name);
                 if !destination.exists() {
                     changed |= fs::copy(default_home.join(config_name), &destination).is_ok();
                 }
@@ -2486,16 +3510,24 @@ fn agent_accounts_snapshot_refresh_in_cycle(
             changed
         }
         _ => {
-            if agent_accounts_default_email(kind) != expected_email {
+            let Some(validated_auth) = validated_auth else {
                 return false;
-            }
-            let mut changed = agent_accounts_copy_if_newer(
+            };
+            let Some(mut changed) = agent_accounts_install_validated_auth_snapshot(
+                kind,
                 &default_home.join("auth.json"),
                 &dir.join("auth.json"),
-            );
+                &expected_email,
+                validated_auth,
+            ) else {
+                return false;
+            };
             let config_destination = dir.join("config.toml");
             if !config_destination.exists() {
                 changed |= fs::copy(default_home.join("config.toml"), &config_destination).is_ok();
+            }
+            if agent_accounts_ensure_codex_file_auth_store(dir).is_err() {
+                return false;
             }
             changed
         }
@@ -2523,21 +3555,19 @@ fn agent_accounts_neutralize_captured_claude_identity(profile_dir: &Path) -> boo
     let Some(object) = state.as_object_mut() else {
         return changed;
     };
-    let removed = object.remove("oauthAccount").is_some()
-        | object.remove("oauth_account").is_some();
+    let removed =
+        object.remove("oauthAccount").is_some() | object.remove("oauth_account").is_some();
     if !removed {
         return changed;
     }
-    changed |= serde_json::to_vec_pretty(&state)
-        .ok()
-        .is_some_and(|bytes| {
-            agent_accounts_write_private_file_atomic(
-                &state_path,
-                &bytes,
-                "neutralized captured Claude identity state",
-            )
-            .is_ok()
-        });
+    changed |= serde_json::to_vec_pretty(&state).ok().is_some_and(|bytes| {
+        agent_accounts_write_private_file_atomic(
+            &state_path,
+            &bytes,
+            "neutralized captured Claude identity state",
+        )
+        .is_ok()
+    });
     changed
 }
 
@@ -2553,9 +3583,7 @@ fn agent_accounts_profile_state_sha256(profile_dir: &Path) -> Option<String> {
         .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
 }
 
-fn agent_accounts_profile_state_modified(
-    profile_dir: &Path,
-) -> Option<std::time::SystemTime> {
+fn agent_accounts_profile_state_modified(profile_dir: &Path) -> Option<std::time::SystemTime> {
     profile_dir
         .join(".claude.json")
         .metadata()
@@ -2675,9 +3703,7 @@ fn agent_accounts_profile_login_marker_matching_completion(
         .matching_credentials_observed_at
         .is_some_and(|observed_at| {
             observed_at.elapsed()
-                >= Duration::from_secs(
-                    AGENT_ACCOUNTS_PROFILE_LOGIN_CREDENTIAL_ONLY_CONFIRM_SECS,
-                )
+                >= Duration::from_secs(AGENT_ACCOUNTS_PROFILE_LOGIN_CREDENTIAL_ONLY_CONFIRM_SECS)
         })
 }
 
@@ -2859,11 +3885,7 @@ fn agent_accounts_reconcile_captured_claude_identities_in_cycle(
             {
                 result.profile_files_changed |= fs::remove_file(&credentials_path).is_ok();
             }
-            if agent_accounts_rebind_captured_claude_profile(
-                registry,
-                profile_id,
-                &live_email,
-            ) {
+            if agent_accounts_rebind_captured_claude_profile(registry, profile_id, &live_email) {
                 result.registry_changed = true;
                 result.rebound_profile_dirs.push(profile_dir);
             }
@@ -2921,9 +3943,7 @@ fn agent_account_push_required_files(kind: &str) -> &'static [&'static str] {
 
 fn agent_account_push_default_file_path(kind: &str, name: &str) -> Option<PathBuf> {
     match (kind, name) {
-        ("claude", ".claude.json") => env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|home| home.join(name)),
+        ("claude", ".claude.json") => user_home_dir().map(|home| home.join(name)),
         _ => agent_accounts_default_home(kind).map(|home| home.join(name)),
     }
 }
@@ -2937,7 +3957,13 @@ fn agent_account_push_source_file_path(
     if profile_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
         return agent_account_push_default_file_path(kind, name);
     }
-    profile_dir.map(|dir| dir.join(name))
+    profile_dir.map(|dir| {
+        if kind == "opencode" && name == "auth.json" {
+            agent_accounts_profile_auth_path(kind, dir)
+        } else {
+            dir.join(name)
+        }
+    })
 }
 
 fn agent_accounts_write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -3038,8 +4064,7 @@ fn agent_account_push_read_claude_state_subset_file(path: &Path) -> Result<Optio
 }
 
 fn agent_account_push_claude_default_state_path() -> Result<PathBuf, String> {
-    env::var_os("HOME")
-        .map(PathBuf::from)
+    user_home_dir()
         .map(|home| home.join(".claude.json"))
         .ok_or_else(|| "Unable to locate Claude global state for local wipe.".to_string())
 }
@@ -3927,7 +4952,7 @@ fn agent_account_push_read_applied_unlocked() -> Result<HashMap<String, u64>, St
         Err(error) => {
             return Err(format!(
                 "Unable to read agent account push replay guard: {error}"
-            ))
+            ));
         }
     };
     serde_json::from_str::<HashMap<String, u64>>(&raw)
@@ -4031,7 +5056,12 @@ fn agent_accounts_materialize_pushed_account(blob: AgentAccountPushBlob) -> Resu
             let bytes = general_purpose::STANDARD
                 .decode(&file.data_b64)
                 .map_err(|_| "Pushed agent account file is not valid base64.".to_string())?;
-            agent_accounts_write_private_file(&temp_dir.join(&file.name), &bytes).map_err(|_| {
+            let destination = if kind == "opencode" && file.name == "auth.json" {
+                agent_accounts_profile_auth_path(kind, &temp_dir)
+            } else {
+                temp_dir.join(&file.name)
+            };
+            agent_accounts_write_private_file(&destination, &bytes).map_err(|_| {
                 format!(
                     "Unable to durably write pushed {kind} credential file: {}",
                     file.name
@@ -4058,9 +5088,7 @@ fn agent_accounts_materialize_pushed_account(blob: AgentAccountPushBlob) -> Resu
     fs::rename(&temp_dir, &final_dir)
         .map_err(|error| format!("Unable to install pushed account profile: {error}"))?;
     #[cfg(unix)]
-    if let Err(error) = fs::File::open(&kind_root)
-        .and_then(|directory| directory.sync_all())
-    {
+    if let Err(error) = fs::File::open(&kind_root).and_then(|directory| directory.sync_all()) {
         let _ = fs::remove_dir_all(&final_dir);
         return Err(format!(
             "Unable to sync pushed account profile directory: {error}"
@@ -4288,7 +5316,11 @@ fn agent_accounts_wipe_pushed_profile_internal(
         }
     }
 
-    let default_email = agent_accounts_default_email(kind);
+    let default_email = agent_accounts_profile_identity(kind, None)
+        .get("email")
+        .and_then(Value::as_str)
+        .map(agent_accounts_email_key)
+        .unwrap_or_default();
     let wipe_default_home = default_email == expected_email;
     let default_paths = if wipe_default_home {
         agent_account_push_default_wipe_paths(kind)
@@ -4474,12 +5506,46 @@ fn agent_accounts_available_capture_profile_id(
 /// snapshot state changed.
 fn agent_accounts_capture_kind(kind: &'static str) -> bool {
     let _span = BackendCpuSpan::new("agent_accounts.capture_kind");
-    let identity = agent_accounts_profile_identity(kind, None);
+    let validated_auth = if matches!(kind, "codex" | "opencode") {
+        agent_accounts_default_home(kind)
+            .and_then(|home| agent_accounts_read_json_snapshot_with_retry(&home.join("auth.json")))
+    } else {
+        None
+    };
+    let identity = match (kind, validated_auth.as_ref()) {
+        ("codex", Some(snapshot)) => {
+            let email = agent_accounts_codex_email_from_auth(&snapshot.json);
+            let stable_identity = agent_accounts_codex_stable_identity_from_auth(&snapshot.json);
+            json!({
+                "email": email,
+                "stable_identity": stable_identity,
+                "account_id": stable_identity,
+                "auth_ready": !stable_identity.is_empty(),
+            })
+        }
+        ("opencode", Some(snapshot)) => {
+            let stable_identity = agent_accounts_default_home("opencode")
+                .map(|home| agent_accounts_opencode_identity_with_first_seen(&snapshot.json, &home))
+                .unwrap_or_default();
+            json!({
+                "email": stable_identity,
+                "stable_identity": stable_identity,
+                "auth_ready": !stable_identity.is_empty(),
+            })
+        }
+        ("codex" | "opencode", None) => json!({
+            "email": "",
+            "stable_identity": "",
+            "auth_ready": false,
+        }),
+        _ => agent_accounts_profile_identity(kind, None),
+    };
     let email = identity
         .get("email")
         .and_then(Value::as_str)
         .map(agent_accounts_email_key)
         .unwrap_or_default();
+    let stable_identity = agent_accounts_identity_key(kind, &identity);
     let auth_ready = identity
         .get("auth_ready")
         .and_then(Value::as_bool)
@@ -4517,12 +5583,12 @@ fn agent_accounts_capture_kind(kind: &'static str) -> bool {
         }
         persisted
     };
-    if email.is_empty() || !auth_ready {
+    if stable_identity.is_empty() || !auth_ready {
         let registry_persisted = persist_registry(&registry, registry_changed);
         return snapshot_changed || registry_persisted;
     }
     let suppressed = agent_accounts_suppressed_emails(&registry, kind);
-    if suppressed.iter().any(|entry| entry == &email) {
+    if suppressed.iter().any(|entry| entry == &stable_identity) {
         let registry_persisted = persist_registry(&registry, registry_changed);
         return snapshot_changed || registry_persisted;
     }
@@ -4537,8 +5603,32 @@ fn agent_accounts_capture_kind(kind: &'static str) -> bool {
     let (_, profiles) = agent_accounts_kind_entry(&registry, kind);
     let existing = profiles
         .iter()
-        .any(|profile| agent_accounts_profile_email(kind, profile) == email);
+        .any(|profile| agent_accounts_profile_email(kind, profile) == stable_identity);
     if existing {
+        if matches!(kind, "codex" | "opencode") {
+            if let Some(profile) = registry["agents"][kind]["profiles"]
+                .as_array_mut()
+                .and_then(|profiles| {
+                    profiles.iter_mut().find(|profile| {
+                        agent_accounts_profile_email(kind, profile) == stable_identity
+                    })
+                })
+            {
+                if profile.get("identity_id").and_then(Value::as_str)
+                    != Some(stable_identity.as_str())
+                {
+                    profile["identity_id"] = json!(stable_identity.clone());
+                    registry_changed = true;
+                }
+                if kind == "codex"
+                    && !email.is_empty()
+                    && profile.get("email").and_then(Value::as_str) != Some(email.as_str())
+                {
+                    profile["email"] = json!(email.clone());
+                    registry_changed = true;
+                }
+            }
+        }
         // Same account still signed in: keep its snapshot's tokens fresh so
         // switching back later doesn't land on an expired refresh token. Walk
         // every matching captured profile: a manual/duplicate first in
@@ -4546,7 +5636,7 @@ fn agent_accounts_capture_kind(kind: &'static str) -> bool {
         let mut refresh_changed = false;
         for existing in profiles.iter().filter(|profile| {
             profile.get("source").and_then(Value::as_str) == Some("captured")
-                && agent_accounts_profile_email(kind, profile) == email
+                && agent_accounts_profile_email(kind, profile) == stable_identity
         }) {
             if let Some(dir) = existing
                 .get("dir")
@@ -4554,23 +5644,30 @@ fn agent_accounts_capture_kind(kind: &'static str) -> bool {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             {
-                if kind == "claude"
-                    && agent_accounts_profile_login_marker(Path::new(dir)).is_some()
+                if kind == "claude" && agent_accounts_profile_login_marker(Path::new(dir)).is_some()
                 {
                     continue;
+                }
+                if kind == "opencode" {
+                    refresh_changed |=
+                        agent_accounts_persist_opencode_identity(Path::new(dir), &stable_identity);
                 }
                 let registered_email = existing
                     .get("email")
                     .and_then(Value::as_str)
                     .map(agent_accounts_email_key)
                     .filter(|email| !email.is_empty())
-                    .unwrap_or_else(|| email.clone());
-                refresh_changed |= agent_accounts_snapshot_refresh_in_cycle(
+                    .and_then(|_| {
+                        matches!(kind, "codex" | "opencode").then(|| stable_identity.clone())
+                    })
+                    .unwrap_or_else(|| stable_identity.clone());
+                refresh_changed |= agent_accounts_snapshot_refresh_in_cycle_with_auth(
                     kind,
                     Path::new(dir),
                     &registered_email,
                     false,
                     capture_cycle,
+                    validated_auth.as_ref(),
                 );
             }
         }
@@ -4585,23 +5682,31 @@ fn agent_accounts_capture_kind(kind: &'static str) -> bool {
         let registry_persisted = persist_registry(&registry, registry_changed);
         return snapshot_changed || registry_persisted;
     };
-    let profile_id =
-        agent_accounts_available_capture_profile_id(kind, &email, &profiles, &profile_root);
+    let profile_id = agent_accounts_available_capture_profile_id(
+        kind,
+        &stable_identity,
+        &profiles,
+        &profile_root,
+    );
     let dir = profile_root.join(kind).join(&profile_id);
     if fs::create_dir_all(&dir).is_err() {
         let registry_persisted = persist_registry(&registry, registry_changed);
         return snapshot_changed || registry_persisted;
     }
-    if !agent_accounts_snapshot_refresh_in_cycle(
+    if !agent_accounts_snapshot_refresh_in_cycle_with_auth(
         kind,
         &dir,
-        &email,
+        &stable_identity,
         false,
         capture_cycle,
+        validated_auth.as_ref(),
     ) {
         let _ = fs::remove_dir(&dir);
         let registry_persisted = persist_registry(&registry, registry_changed);
         return snapshot_changed || registry_persisted;
+    }
+    if kind == "opencode" {
+        let _ = agent_accounts_persist_opencode_identity(&dir, &stable_identity);
     }
     agent_accounts_ensure_kind_entry(&mut registry, kind);
     let used_labels = profiles
@@ -4610,11 +5715,17 @@ fn agent_accounts_capture_kind(kind: &'static str) -> bool {
         .map(agent_accounts_label_key)
         .filter(|label| !label.is_empty())
         .collect::<HashSet<_>>();
-    let label = agent_accounts_unique_capture_label(&email, &used_labels);
+    let display_identity = if email.is_empty() {
+        stable_identity.as_str()
+    } else {
+        email.as_str()
+    };
+    let label = agent_accounts_unique_capture_label(display_identity, &used_labels);
     let profile = json!({
         "id": profile_id,
         "label": label,
         "email": email,
+        "identity_id": stable_identity,
         "source": "captured",
         "dir": dir.to_string_lossy().to_string(),
         "created_at_ms": todo_dispatch_now_ms(),
@@ -4644,20 +5755,108 @@ fn agent_accounts_capture_startup_reconcile() -> bool {
     for kind in ["claude", "codex", "opencode"] {
         registry_changed |= agent_accounts_dedupe_captured_profile_labels(&mut registry, kind);
     }
+    let (_, opencode_profiles) = agent_accounts_kind_entry(&registry, "opencode");
+    let mut opencode_profiles_migrated = false;
+    for profile in &opencode_profiles {
+        opencode_profiles_migrated |= agent_accounts_profile_dir(profile)
+            .and_then(|dir| agent_accounts_migrate_opencode_profile_layout(&dir).ok())
+            .unwrap_or(false);
+    }
     let default_claude_email = agent_accounts_default_email("claude");
-    let reconcile_result = agent_accounts_reconcile_captured_claude_identities(
-        &mut registry,
-        &default_claude_email,
-    );
+    let reconcile_result =
+        agent_accounts_reconcile_captured_claude_identities(&mut registry, &default_claude_email);
     registry_changed |= reconcile_result.registry_changed;
-    let registry_persisted =
-        registry_changed && agent_accounts_registry_write(&registry).is_ok();
+    let registry_persisted = registry_changed && agent_accounts_registry_write(&registry).is_ok();
     if registry_persisted && reconcile_result.registry_changed {
         for dir in &reconcile_result.rebound_profile_dirs {
             agent_accounts_clear_profile_login_marker(dir);
         }
     }
-    reconcile_result.profile_files_changed || registry_persisted
+    reconcile_result.profile_files_changed || opencode_profiles_migrated || registry_persisted
+}
+
+fn agent_accounts_nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut candidate = path.to_path_buf();
+    loop {
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        if !candidate.pop() {
+            return None;
+        }
+    }
+}
+
+fn agent_accounts_capture_watch_targets() -> Vec<(&'static str, PathBuf)> {
+    let mut targets = ["claude", "codex", "opencode"]
+        .into_iter()
+        .filter_map(|kind| {
+            agent_accounts_default_home(kind)
+                .map(|path| (kind, path.join(agent_accounts_auth_file_name(kind))))
+        })
+        .collect::<Vec<_>>();
+    if let Some(home) = user_home_dir() {
+        targets.push(("claude-state", home.join(".claude.json")));
+    }
+    targets
+}
+
+fn agent_accounts_capture_watch_registration_plan(
+    targets: &[(&'static str, PathBuf)],
+    watched_paths: &HashMap<&'static str, PathBuf>,
+) -> Vec<(&'static str, PathBuf)> {
+    let mut registrations = Vec::new();
+    for (provider, target) in targets {
+        let Some(target_parent) = target.parent() else {
+            continue;
+        };
+        let Some(registration) = agent_accounts_nearest_existing_ancestor(target_parent) else {
+            continue;
+        };
+        if watched_paths.get(provider) != Some(&registration) {
+            registrations.push((*provider, registration));
+        }
+    }
+    registrations
+}
+
+fn agent_accounts_capture_event_is_relevant(
+    event: &notify::Event,
+    targets: &[(&'static str, PathBuf)],
+) -> bool {
+    event
+        .paths
+        .iter()
+        .any(|event_path| targets.iter().any(|(_, target)| event_path == target))
+}
+
+fn agent_accounts_capture_promoted_target_exists(
+    provider: &str,
+    targets: &[(&'static str, PathBuf)],
+) -> bool {
+    targets
+        .iter()
+        .find(|(candidate, _)| *candidate == provider)
+        .is_some_and(|(_, target)| target.is_file())
+}
+
+fn agent_accounts_log_capture_watcher_error(
+    provider: &str,
+    path: &Path,
+    error: &dyn std::fmt::Display,
+) {
+    let path_label = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("home");
+    log_terminal_status_event(
+        "backend.agent_accounts.capture_watcher_error",
+        json!({
+            "provider": clean_terminal_diagnostic_log_text(provider),
+            "path": clean_terminal_diagnostic_log_text(path_label),
+            "error": clean_terminal_diagnostic_log_text(&error.to_string()),
+        }),
+    );
 }
 
 pub(crate) fn agent_accounts_capture_watch_start(app: AppHandle) {
@@ -4708,32 +5907,38 @@ pub(crate) fn agent_accounts_capture_watch_start(app: AppHandle) {
             // emits when the credential signature changed, and a 5-min backstop
             // covers missed events or dirs that didn't exist at startup.
             let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
-            let mut watcher = notify::recommended_watcher(tx).ok();
-            if let Some(watcher) = watcher.as_mut() {
-                let mut watched_paths = HashSet::new();
-                for kind in ["claude", "codex", "opencode"] {
-                    if let Some(dir) = agent_accounts_default_home(kind) {
-                        if watched_paths.insert(dir.clone()) {
-                            let _ = notify::Watcher::watch(
-                                watcher,
-                                &dir,
-                                notify::RecursiveMode::NonRecursive,
-                            );
-                        }
-                    }
+            let mut watcher = match notify::recommended_watcher(tx) {
+                Ok(watcher) => Some(watcher),
+                Err(error) => {
+                    agent_accounts_log_capture_watcher_error(
+                        "all",
+                        Path::new("credential-homes"),
+                        &error,
+                    );
+                    None
                 }
-                // Claude keeps identity state beside (not inside) ~/.claude.
-                // Watch the parent so creation and replacement of the sibling
-                // ~/.claude.json are both observable.
-                if let Some(claude_parent) = agent_accounts_default_home("claude")
-                    .and_then(|dir| dir.parent().map(Path::to_path_buf))
+            };
+            let watch_targets = agent_accounts_capture_watch_targets();
+            let mut watched_paths = HashMap::new();
+            if let Some(watcher) = watcher.as_mut() {
+                for (provider, path) in
+                    agent_accounts_capture_watch_registration_plan(&watch_targets, &watched_paths)
                 {
-                    if watched_paths.insert(claude_parent.clone()) {
-                        let _ = notify::Watcher::watch(
-                            watcher,
-                            &claude_parent,
-                            notify::RecursiveMode::NonRecursive,
-                        );
+                    if watched_paths.values().any(|watched| watched == &path) {
+                        watched_paths.insert(provider, path);
+                        continue;
+                    }
+                    match notify::Watcher::watch(
+                        watcher,
+                        &path,
+                        notify::RecursiveMode::NonRecursive,
+                    ) {
+                        Ok(()) => {
+                            watched_paths.insert(provider, path);
+                        }
+                        Err(error) => {
+                            agent_accounts_log_capture_watcher_error(provider, &path, &error);
+                        }
                     }
                 }
             }
@@ -4744,14 +5949,6 @@ pub(crate) fn agent_accounts_capture_watch_start(app: AppHandle) {
             // full identity/capture pass (which re-reads and re-parses large
             // state files) on every unrelated write produced ~15s CPU spikes
             // whenever any agent was active.
-            let event_is_credential_related = |event: &notify::Event| {
-                event.paths.iter().any(|path| {
-                    matches!(
-                        path.file_name().and_then(|name| name.to_str()),
-                        Some(".credentials.json" | "auth.json" | ".claude.json")
-                    )
-                })
-            };
             const EVENT_CAPTURE_MIN_GAP_SECS: u64 = 30;
             const EVENT_DEBOUNCE_MS: u64 = 400;
             const BACKSTOP_SECS: u64 = 300;
@@ -4789,20 +5986,84 @@ pub(crate) fn agent_accounts_capture_watch_start(app: AppHandle) {
                 let wait = deadline.saturating_duration_since(now);
                 match rx.recv_timeout(wait) {
                     Ok(event) => {
-                        let relevant = event
-                            .as_ref()
-                            .map(&event_is_credential_related)
-                            .unwrap_or(false);
+                        let mut promoted_existing_credential = false;
+                        if let Some(watcher) = watcher.as_mut() {
+                            // Directory creation events are topology signals,
+                            // not credential events. Reconcile registrations
+                            // before filtering so a newly created provider
+                            // home becomes watched immediately.
+                            for (provider, path) in agent_accounts_capture_watch_registration_plan(
+                                &watch_targets,
+                                &watched_paths,
+                            ) {
+                                let previous = watched_paths.get(provider).cloned();
+                                let path_already_watched = watched_paths
+                                    .iter()
+                                    .any(|(other, watched)| *other != provider && watched == &path);
+                                let registration = if path_already_watched {
+                                    Ok(())
+                                } else {
+                                    notify::Watcher::watch(
+                                        watcher,
+                                        &path,
+                                        notify::RecursiveMode::NonRecursive,
+                                    )
+                                };
+                                match registration {
+                                    Ok(()) => {
+                                        let promoted = previous.as_ref() != Some(&path);
+                                        watched_paths.insert(provider, path.clone());
+                                        if let Some(previous) = previous.filter(|old| old != &path)
+                                        {
+                                            let still_used = watched_paths
+                                                .iter()
+                                                .any(|(_, watched)| watched == &previous);
+                                            if !still_used {
+                                                let _ =
+                                                    notify::Watcher::unwatch(watcher, &previous);
+                                            }
+                                        }
+                                        // The provider directory and auth file can be
+                                        // created in the same filesystem burst. The
+                                        // auth write then predates this promoted watch,
+                                        // so schedule capture immediately rather than
+                                        // waiting for the five-minute backstop.
+                                        promoted_existing_credential |= promoted
+                                            && agent_accounts_capture_promoted_target_exists(
+                                                provider,
+                                                &watch_targets,
+                                            );
+                                    }
+                                    Err(error) => agent_accounts_log_capture_watcher_error(
+                                        provider, &path, &error,
+                                    ),
+                                }
+                            }
+                        }
+                        if let Err(error) = event.as_ref() {
+                            agent_accounts_log_capture_watcher_error(
+                                "event",
+                                Path::new("credential-homes"),
+                                error,
+                            );
+                        }
+                        let relevant = promoted_existing_credential
+                            || event
+                                .as_ref()
+                                .map(|event| {
+                                    agent_accounts_capture_event_is_relevant(event, &watch_targets)
+                                })
+                                .unwrap_or(false);
                         if !relevant {
                             continue;
                         }
                         // Debounce credential bursts, but never drop a change
                         // inside the post-capture gap: carry it to the first
                         // allowed deadline instead.
-                        let event_deadline = std::time::Instant::now()
-                            + Duration::from_millis(EVENT_DEBOUNCE_MS);
-                        let gap_deadline = last_capture
-                            + Duration::from_secs(EVENT_CAPTURE_MIN_GAP_SECS);
+                        let event_deadline =
+                            std::time::Instant::now() + Duration::from_millis(EVENT_DEBOUNCE_MS);
+                        let gap_deadline =
+                            last_capture + Duration::from_secs(EVENT_CAPTURE_MIN_GAP_SECS);
                         pending_event_capture = Some(event_deadline.max(gap_deadline));
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -4812,6 +6073,52 @@ pub(crate) fn agent_accounts_capture_watch_start(app: AppHandle) {
                         std::thread::sleep(wait.min(Duration::from_secs(60)));
                     }
                 }
+            }
+        });
+}
+
+pub(crate) fn agent_accounts_default_login_capture_baseline(kind: &str) -> String {
+    agent_accounts_auth_revision_for_profile(kind, AGENT_ACCOUNTS_DEFAULT_PROFILE_ID, None)
+}
+
+pub(crate) fn agent_accounts_watch_default_login_capture_completion(
+    app: AppHandle,
+    kind: &'static str,
+    baseline_revision: String,
+) {
+    let _ = thread::Builder::new()
+        .name("agent-account-default-login".to_string())
+        .spawn(move || {
+            for _ in 0..(10 * 60) {
+                let identity = agent_accounts_profile_identity(kind, None);
+                let identity_ready = identity
+                    .get("auth_ready")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    && identity
+                        .get("email")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.trim().is_empty());
+                let revision = agent_accounts_auth_revision_for_profile(
+                    kind,
+                    AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+                    None,
+                );
+                if identity_ready && !revision.is_empty() && revision != baseline_revision {
+                    let captured = agent_accounts_capture_kind(kind);
+                    let _ = app.emit(
+                        AGENT_ACCOUNTS_CHANGED_EVENT,
+                        json!({
+                            "kind": kind,
+                            "profile_id": AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+                            "auth_revision": revision,
+                            "login_completed": true,
+                            "captured": captured,
+                        }),
+                    );
+                    break;
+                }
+                thread::sleep(Duration::from_secs(1));
             }
         });
 }
@@ -5041,14 +6348,223 @@ fn agent_accounts_profile_login_target(
     Ok((dir, false))
 }
 
+#[derive(Clone)]
+struct AgentAccountsLoginCompletionBaseline {
+    auth_signature: String,
+    expected_identity: String,
+}
+
+fn agent_accounts_login_auth_path(kind: &str, dir: &Path, is_default: bool) -> PathBuf {
+    if is_default {
+        dir.join(agent_accounts_auth_file_name(kind))
+    } else {
+        agent_accounts_profile_auth_path(kind, dir)
+    }
+}
+
+fn agent_accounts_login_completion_baseline(
+    kind: &'static str,
+    profile_id: &str,
+) -> Result<Option<AgentAccountsLoginCompletionBaseline>, String> {
+    if !matches!(kind, "codex" | "opencode") {
+        return Ok(None);
+    }
+    let (dir, is_default) = agent_accounts_profile_login_target(kind, profile_id)?;
+    let registry = agent_accounts_registry_read();
+    let profile = (!is_default)
+        .then(|| agent_accounts_profile_for_id(&registry, kind, profile_id))
+        .flatten();
+    let expected_identity = profile
+        .as_ref()
+        .and_then(|profile| profile.get("identity_id").or_else(|| profile.get("email")))
+        .and_then(Value::as_str)
+        .map(agent_accounts_email_key)
+        .filter(|identity| !identity.is_empty())
+        .unwrap_or_else(|| {
+            let identity =
+                agent_accounts_profile_identity(kind, if is_default { None } else { Some(&dir) });
+            agent_accounts_identity_key(kind, &identity)
+        });
+    if expected_identity.is_empty() {
+        return Err(format!(
+            "Unable to identify the {kind} account selected for login."
+        ));
+    }
+    Ok(Some(AgentAccountsLoginCompletionBaseline {
+        auth_signature: agent_accounts_auth_file_signature(&agent_accounts_login_auth_path(
+            kind, &dir, is_default,
+        ))
+        .unwrap_or_default(),
+        expected_identity,
+    }))
+}
+
+fn agent_accounts_codex_login_completion_matches(
+    baseline: &AgentAccountsLoginCompletionBaseline,
+    current_signature: &str,
+    identity: &Value,
+) -> bool {
+    if current_signature.is_empty() || current_signature == baseline.auth_signature {
+        return false;
+    }
+    let auth_ready = identity
+        .get("auth_ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let current_identity = identity
+        .get("stable_identity")
+        .or_else(|| identity.get("account_id"))
+        .or_else(|| identity.get("email"))
+        .and_then(Value::as_str)
+        .map(agent_accounts_email_key)
+        .unwrap_or_default();
+    auth_ready && current_identity == baseline.expected_identity
+}
+
+fn agent_accounts_activate_profile_in_registry(
+    registry: &mut Value,
+    kind: &str,
+    profile_id: &str,
+) -> Result<bool, String> {
+    let (active_id, profiles) = agent_accounts_kind_entry(registry, kind);
+    if profile_id != AGENT_ACCOUNTS_DEFAULT_PROFILE_ID
+        && !profiles
+            .iter()
+            .any(|profile| agent_accounts_profile_id(profile).as_deref() == Some(profile_id))
+    {
+        return Err(format!("Unknown {kind} account profile: {profile_id}"));
+    }
+    agent_accounts_ensure_kind_entry(registry, kind);
+    registry["agents"][kind]["active_profile_id"] = json!(profile_id);
+    Ok(active_id != profile_id)
+}
+
+fn agent_accounts_login_transaction_commit_activation(
+    registry: &mut Value,
+    kind: &str,
+    profile_id: &str,
+    generation: u64,
+) -> Result<bool, String> {
+    // Keep the transaction lock across registry persistence. A later
+    // selection therefore cannot begin after the CAS check but before the old
+    // selection is written active.
+    let mut transactions = agent_accounts_login_transactions()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let key = (kind.to_string(), profile_id.to_string());
+    if !transactions
+        .current
+        .get(&key)
+        .is_some_and(|transaction| transaction.generation == generation)
+        || transactions.newest_selection.get(kind) != Some(&(profile_id.to_string(), generation))
+    {
+        return Ok(false);
+    }
+    agent_accounts_activate_profile_in_registry(registry, kind, profile_id)?;
+    agent_accounts_registry_write(registry)?;
+    transactions.current.remove(&key);
+    transactions.newest_selection.remove(kind);
+    Ok(true)
+}
+
+fn agent_accounts_login_identity_from_snapshot(
+    kind: &'static str,
+    home: &Path,
+    snapshot: &AgentAccountsJsonSnapshot,
+) -> Value {
+    match kind {
+        "opencode" => {
+            let stable_identity =
+                agent_accounts_opencode_identity_with_first_seen(&snapshot.json, home);
+            json!({
+                "email": stable_identity,
+                "stable_identity": stable_identity,
+                "auth_ready": !stable_identity.is_empty(),
+            })
+        }
+        _ => {
+            let email = agent_accounts_codex_email_from_auth(&snapshot.json);
+            let stable_identity = agent_accounts_codex_stable_identity_from_auth(&snapshot.json);
+            json!({
+                "email": email,
+                "stable_identity": stable_identity,
+                "account_id": stable_identity,
+                "auth_ready": !stable_identity.is_empty(),
+            })
+        }
+    }
+}
+
+fn agent_accounts_try_complete_profile_login(
+    app: &AppHandle,
+    kind: &'static str,
+    profile_id: &str,
+    baseline: &AgentAccountsLoginCompletionBaseline,
+    generation: u64,
+) -> bool {
+    if !agent_accounts_login_transaction_is_current(kind, profile_id, generation) {
+        return false;
+    }
+    let Ok((profile_dir, is_default)) = agent_accounts_profile_login_target(kind, profile_id)
+    else {
+        return false;
+    };
+    let auth_path = agent_accounts_login_auth_path(kind, &profile_dir, is_default);
+    let Some(snapshot) = agent_accounts_read_json_snapshot_with_retry(&auth_path) else {
+        return false;
+    };
+    let identity = agent_accounts_login_identity_from_snapshot(kind, &profile_dir, &snapshot);
+    let current_signature = agent_accounts_file_snapshot_signature(&snapshot.file);
+    if !agent_accounts_codex_login_completion_matches(baseline, &current_signature, &identity) {
+        return false;
+    }
+
+    let registry_guard = AGENT_ACCOUNTS_REGISTRY_ACTIVITY_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let Ok(mut registry) = agent_accounts_registry_read_checked() else {
+        return false;
+    };
+    let committed = agent_accounts_login_transaction_commit_activation(
+        &mut registry,
+        kind,
+        profile_id,
+        generation,
+    )
+    .unwrap_or(false);
+    if !committed {
+        return false;
+    }
+    drop(registry_guard);
+
+    // Login completion is an explicit capture trigger; correctness never
+    // waits on the FS watcher or its five-minute backstop.
+    let captured = agent_accounts_capture_kind(kind);
+    let revision = agent_accounts_active_auth_revision(kind);
+    let _ = app.emit(
+        AGENT_ACCOUNTS_CHANGED_EVENT,
+        json!({
+            "kind": kind,
+            "profile_id": profile_id,
+            "active_profile_id": profile_id,
+            "auth_revision": revision,
+            "login_completed": true,
+            "captured": captured,
+        }),
+    );
+    true
+}
+
 fn agent_accounts_launch_profile_login_terminal(
     kind: &'static str,
     profile_id: &str,
-) -> Result<(), String> {
+    generation: Option<u64>,
+) -> Result<Option<PathBuf>, String> {
     let (dir, is_default) = agent_accounts_profile_login_target(kind, profile_id)?;
     let provider = agent_accounts_provider_for_kind(kind);
-    if is_default {
-        return launch_account_login_terminal(provider);
+    if is_default && kind == "claude" {
+        return launch_account_login_terminal(provider).map(|_| None);
     }
 
     let definition = agent_definition(provider);
@@ -5063,20 +6579,93 @@ fn agent_accounts_launch_profile_login_terminal(
         ),
         "opencode" => (
             vec!["auth", "login"],
-            vec![("OPENCODE_DATA_DIR".to_string(), dir_text)],
+            vec![(
+                "XDG_DATA_HOME".to_string(),
+                if is_default {
+                    dir.parent().unwrap_or(&dir).to_string_lossy().to_string()
+                } else {
+                    dir_text
+                },
+            )],
         ),
-        _ => (vec!["login"], vec![("CODEX_HOME".to_string(), dir_text)]),
+        _ => {
+            agent_accounts_ensure_codex_file_auth_store(&dir)?;
+            (
+                vec!["login", "--device-auth"],
+                vec![("CODEX_HOME".to_string(), dir_text)],
+            )
+        }
     };
     let marker_set = if kind == "claude" {
         agent_accounts_prepare_captured_claude_profile_login(profile_id, &dir)?
     } else {
         false
     };
-    let launch = run_login_terminal_with_env(definition.label, &binary, &args, &env_vars);
+    let exit_marker = generation
+        .map(|generation| agent_accounts_login_exit_marker_path(kind, profile_id, generation));
+    let mut launch_env = env_vars;
+    if let Some(marker) = exit_marker.as_ref() {
+        launch_env.push((
+            "DIFFFORGE_LOGIN_EXIT_MARKER".to_string(),
+            marker.to_string_lossy().to_string(),
+        ));
+    }
+    #[cfg(windows)]
+    let launch = if let Some(marker) = exit_marker.as_ref() {
+        let marker_temp = marker.with_extension(format!(
+            "pending-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut command_line = format!("call {}", quote_cmd_arg(&binary));
+        for arg in &args {
+            command_line.push(' ');
+            command_line.push_str(&quote_cmd_arg(arg));
+        }
+        command_line.push_str(" & set \"DIFFFORGE_LOGIN_STATUS=!errorlevel!\"");
+        command_line.push_str(" & > ");
+        command_line.push_str(&quote_cmd_arg(&marker_temp.to_string_lossy()));
+        command_line.push_str(" echo !DIFFFORGE_LOGIN_STATUS!");
+        command_line.push_str(" & move /Y ");
+        command_line.push_str(&quote_cmd_arg(&marker_temp.to_string_lossy()));
+        command_line.push(' ');
+        command_line.push_str(&quote_cmd_arg(&marker.to_string_lossy()));
+        command_line.push_str(" >nul & exit /B !DIFFFORGE_LOGIN_STATUS!");
+        run_login_terminal_with_env(
+            definition.label,
+            "cmd.exe",
+            &["/D", "/V:ON", "/S", "/C", &command_line],
+            &launch_env,
+        )
+    } else {
+        run_login_terminal_with_env(definition.label, &binary, &args, &launch_env)
+    };
+    #[cfg(not(windows))]
+    let launch = if let Some(marker) = exit_marker.as_ref() {
+        let invocation = std::iter::once(binary.as_str())
+            .chain(args.iter().copied())
+            .map(quote_shell_arg)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let marker_temp = marker.with_extension(format!(
+            "pending-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let marker = quote_shell_arg(&marker.to_string_lossy());
+        let marker_temp = quote_shell_arg(&marker_temp.to_string_lossy());
+        let script = format!(
+            "marker={marker}; marker_tmp={marker_temp}; \
+             publish_status() {{ printf '%s\\n' \"$1\" > \"$marker_tmp\" && mv -f -- \"$marker_tmp\" \"$marker\"; }}; \
+             trap 'publish_status 130; trap - HUP INT TERM; exit 130' HUP INT TERM; \
+             {invocation}; status=$?; trap - HUP INT TERM; publish_status \"$status\"; exit \"$status\""
+        );
+        run_login_terminal_with_env(definition.label, "/bin/sh", &["-lc", &script], &launch_env)
+    } else {
+        run_login_terminal_with_env(definition.label, &binary, &args, &launch_env)
+    };
     if launch.is_err() && marker_set {
         agent_accounts_clear_profile_login_marker(&dir);
     }
-    launch
+    launch.map(|_| exit_marker)
 }
 
 fn agent_accounts_profile_for_id(registry: &Value, kind: &str, profile_id: &str) -> Option<Value> {
@@ -5088,9 +6677,8 @@ fn agent_accounts_profile_for_id(registry: &Value, kind: &str, profile_id: &str)
 
 fn agent_accounts_active_auth_revision(kind: &str) -> String {
     let registry = agent_accounts_registry_read();
-    let (profile_id, _) = agent_accounts_launch_profile_label(
-        agent_accounts_supported_kind(kind).unwrap_or("codex"),
-    );
+    let (profile_id, _) =
+        agent_accounts_launch_profile_label(agent_accounts_supported_kind(kind).unwrap_or("codex"));
     let profile = agent_accounts_profile_for_id(&registry, kind, &profile_id);
     agent_accounts_auth_revision_for_profile(kind, &profile_id, profile.as_ref())
 }
@@ -5134,11 +6722,57 @@ fn agent_accounts_upsert_codex_trust(body: &str, workspace_root: &Path) -> Strin
     output
 }
 
+fn agent_accounts_upsert_codex_file_auth_store(body: &str) -> String {
+    let setting = "cli_auth_credentials_store = \"file\"";
+    let mut lines = body.lines().map(str::to_string).collect::<Vec<_>>();
+    let mut found = false;
+    lines.retain_mut(|line| {
+        let is_setting = line
+            .split_once('=')
+            .is_some_and(|(key, _)| key.trim() == "cli_auth_credentials_store");
+        if !is_setting {
+            return true;
+        }
+        if found {
+            return false;
+        }
+        *line = setting.to_string();
+        found = true;
+        true
+    });
+    if !found {
+        let section = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with('['))
+            .unwrap_or(lines.len());
+        lines.insert(section, setting.to_string());
+        if section + 1 < lines.len() && !lines[section + 1].trim().is_empty() {
+            lines.insert(section + 1, String::new());
+        }
+    }
+    let mut output = lines.join("\n");
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output
+}
+
+fn agent_accounts_ensure_codex_file_auth_store(home: &Path) -> Result<(), String> {
+    let path = home.join("config.toml");
+    let current = fs::read_to_string(&path).unwrap_or_default();
+    let next = agent_accounts_upsert_codex_file_auth_store(&current);
+    if next != current {
+        agent_accounts_write_private_file_atomic(&path, next.as_bytes(), "Codex file auth config")?;
+    }
+    Ok(())
+}
+
 fn agent_accounts_reconcile_workspace_trust_for(
     kind: &'static str,
     workspace_root: &Path,
 ) -> Result<Value, String> {
-    let workspace_root = fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    let workspace_root =
+        fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
     if !workspace_root.is_dir() {
         return Err("Workspace trust requires an existing project directory.".to_string());
     }
@@ -5153,11 +6787,15 @@ fn agent_accounts_reconcile_workspace_trust_for(
         "claude" => {
             let profile_home = agent_accounts_active_home_for_kind(kind)
                 .ok_or_else(|| "Unable to resolve the active Claude profile home.".to_string())?;
-            let state_path = if profile_home.file_name().and_then(|value| value.to_str()) == Some(".claude") {
-                profile_home.parent().unwrap_or(&profile_home).join(".claude.json")
-            } else {
-                profile_home.join(".claude.json")
-            };
+            let state_path =
+                if profile_home.file_name().and_then(|value| value.to_str()) == Some(".claude") {
+                    profile_home
+                        .parent()
+                        .unwrap_or(&profile_home)
+                        .join(".claude.json")
+                } else {
+                    profile_home.join(".claude.json")
+                };
             let key = workspace_root.to_string_lossy().to_string();
             let outcome = ensure_claude_workspace_trust_in_config(&state_path, &workspace_root)?;
             if outcome == ClaudeWorkspaceTrustMergeOutcome::SkippedInvalidConfig {
@@ -5196,7 +6834,11 @@ fn agent_accounts_reconcile_workspace_trust_for(
                 let current = fs::read_to_string(&path).unwrap_or_default();
                 let next = agent_accounts_upsert_codex_trust(&current, &workspace_root);
                 if next != current {
-                    agent_accounts_write_private_file_atomic(&path, next.as_bytes(), "Codex workspace trust")?;
+                    agent_accounts_write_private_file_atomic(
+                        &path,
+                        next.as_bytes(),
+                        "Codex workspace trust",
+                    )?;
                 }
             }
             Ok(json!({
@@ -5234,11 +6876,17 @@ async fn agent_accounts_web_login_command(
         .ok_or_else(|| format!("Unsupported agent kind for accounts: {agent_kind}"))?;
     let profile_id = profile_id.trim().to_string();
     tauri::async_runtime::spawn_blocking(move || {
+        let baseline = agent_accounts_login_completion_baseline(kind, &profile_id)?;
         let (dir, is_default) = agent_accounts_profile_login_target(kind, &profile_id)?;
+        let default_claude_revision = (kind == "claude" && is_default)
+            .then(|| agent_accounts_default_login_capture_baseline(kind));
         if kind == "claude" && !is_default {
             agent_accounts_prepare_captured_claude_profile_login(&profile_id, &dir)?;
         }
-        let command = if is_default {
+        if kind == "codex" {
+            agent_accounts_ensure_codex_file_auth_store(&dir)?;
+        }
+        let base_command = if is_default {
             match kind {
                 "claude" => "claude auth login".to_string(),
                 "opencode" => "opencode auth login".to_string(),
@@ -5247,7 +6895,54 @@ async fn agent_accounts_web_login_command(
         } else {
             agent_accounts_login_command(kind, &dir.to_string_lossy())
         };
-        agent_accounts_watch_profile_login_completion(app.clone(), kind, profile_id.clone());
+        let generation = matches!(kind, "codex" | "opencode").then(|| {
+            agent_accounts_login_transaction_begin(kind, &profile_id, baseline.clone())
+        });
+        let exit_marker = generation
+            .map(|generation| agent_accounts_login_exit_marker_path(kind, &profile_id, generation));
+        if let (Some(generation), Some(marker)) = (generation, exit_marker.as_ref()) {
+            if !agent_accounts_login_transaction_set_exit_marker(
+                kind,
+                &profile_id,
+                generation,
+                marker.clone(),
+            ) {
+                agent_accounts_login_transaction_invalidate(
+                    kind,
+                    Some(&profile_id),
+                    Some(generation),
+                );
+                return Err("The provider login transaction changed during shell setup."
+                    .to_string());
+            }
+        }
+        let command = exit_marker
+            .as_deref()
+            .map(|marker| {
+                agent_accounts_managed_login_command_with_exit_marker(
+                    &base_command,
+                    marker,
+                    cfg!(windows),
+                )
+            })
+            .unwrap_or(base_command);
+        if let Some(baseline_revision) = default_claude_revision {
+            agent_accounts_watch_default_login_capture_completion(
+                app.clone(),
+                kind,
+                baseline_revision,
+            );
+        } else {
+            agent_accounts_watch_profile_login_completion(
+                app.clone(),
+                kind,
+                profile_id.clone(),
+                baseline,
+                generation,
+                exit_marker,
+                true,
+            );
+        }
         let _ = app.emit(
             AGENT_ACCOUNTS_CHANGED_EVENT,
             json!({ "kind": kind, "profile_id": profile_id, "login_started": true, "web_shell": true }),
@@ -5257,6 +6952,7 @@ async fn agent_accounts_web_login_command(
             "kind": kind,
             "profile_id": profile_id,
             "command": command,
+            "generation": generation,
             "state": "starting",
         }))
     })
@@ -5264,7 +6960,7 @@ async fn agent_accounts_web_login_command(
     .map_err(|error| format!("Provider web login worker failed: {error}"))?
 }
 
-pub(crate) fn agent_accounts_device_live_state() -> Value {
+fn agent_accounts_device_live_state_payload(stale_terminal_inventory: Vec<Value>) -> Value {
     let registry = agent_accounts_registry_read_resolved();
     let sanitize = |kind: &'static str| {
         let mut state = agent_accounts_kind_state(&registry, kind);
@@ -5273,7 +6969,9 @@ pub(crate) fn agent_accounts_device_live_state() -> Value {
                 if let Some(object) = profile.as_object_mut() {
                     object.remove("dir");
                     object.remove("login_command");
-                    if let Some(identity) = object.get_mut("identity").and_then(Value::as_object_mut) {
+                    if let Some(identity) =
+                        object.get_mut("identity").and_then(Value::as_object_mut)
+                    {
                         identity.remove("tokenomics_account_key");
                     }
                 }
@@ -5284,12 +6982,29 @@ pub(crate) fn agent_accounts_device_live_state() -> Value {
     json!({
         "contract": "diffforge.provider_accounts_live.v1",
         "updated_at_ms": todo_dispatch_now_ms(),
+        "stale_terminal_inventory": stale_terminal_inventory,
         "agents": {
             "codex": sanitize("codex"),
             "claude": sanitize("claude"),
             "opencode": sanitize("opencode"),
         }
     })
+}
+
+pub(crate) fn agent_accounts_device_live_state() -> Value {
+    agent_accounts_device_live_state_payload(Vec::new())
+}
+
+pub(crate) async fn agent_accounts_device_live_state_for_terminal_state(
+    state: &TerminalState,
+) -> Value {
+    let pane_profiles = agent_accounts_pane_profiles_for_state(state).await;
+    let stale_terminal_inventory = pane_profiles
+        .get("stale_inventory")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    agent_accounts_device_live_state_payload(stale_terminal_inventory)
 }
 
 pub(crate) fn agent_accounts_pane_profile_stamp(pane_id: &str) -> Option<Value> {
@@ -5304,7 +7019,109 @@ fn agent_accounts_watch_profile_login_completion(
     app: AppHandle,
     kind: &'static str,
     profile_id: String,
+    baseline: Option<AgentAccountsLoginCompletionBaseline>,
+    generation: Option<u64>,
+    exit_marker: Option<PathBuf>,
+    terminal_exit_owns_completion: bool,
 ) {
+    if matches!(kind, "codex" | "opencode") {
+        let Some(baseline) = baseline else {
+            if let Some(generation) = generation {
+                agent_accounts_login_transaction_invalidate(
+                    kind,
+                    Some(&profile_id),
+                    Some(generation),
+                );
+                agent_accounts_remove_login_bindings(kind, &profile_id, generation);
+            }
+            if let Some(path) = exit_marker.as_ref() {
+                let _ = fs::remove_file(path);
+            }
+            return;
+        };
+        let Some(generation) = generation else {
+            return;
+        };
+        if agent_accounts_profile_login_target(kind, &profile_id).is_err() {
+            agent_accounts_login_transaction_invalidate(kind, Some(&profile_id), Some(generation));
+            agent_accounts_remove_login_bindings(kind, &profile_id, generation);
+            if let Some(path) = exit_marker.as_ref() {
+                let _ = fs::remove_file(path);
+            }
+            return;
+        }
+        let cleanup_profile_id = profile_id.clone();
+        let cleanup_exit_marker = exit_marker.clone();
+        let spawned = thread::Builder::new()
+            .name("agent-account-codex-login".to_string())
+            .spawn(move || {
+                for _ in 0..(10 * 60) {
+                    if !agent_accounts_login_transaction_is_current(kind, &profile_id, generation) {
+                        if let Some(path) = exit_marker.as_ref() {
+                            let _ = fs::remove_file(path);
+                        }
+                        return;
+                    }
+                    if let Some(path) = exit_marker.as_ref() {
+                        // External CLI logins complete only at process exit.
+                        // Status 0 receives one final exact-identity CAS attempt;
+                        // failure/cancel/forced-close invalidates without ever
+                        // consulting later credential changes. Managed-shell
+                        // watchers call the same helper in cleanup-only mode;
+                        // exact terminal teardown owns their marker.
+                        if agent_accounts_login_watcher_consume_exit_marker(
+                            kind,
+                            &profile_id,
+                            generation,
+                            path,
+                            terminal_exit_owns_completion,
+                            || {
+                                agent_accounts_try_complete_profile_login(
+                                    &app,
+                                    kind,
+                                    &profile_id,
+                                    &baseline,
+                                    generation,
+                                )
+                            },
+                        )
+                        .is_some()
+                        {
+                            return;
+                        }
+                    } else if agent_accounts_try_complete_profile_login(
+                        &app,
+                        kind,
+                        &profile_id,
+                        &baseline,
+                        generation,
+                    ) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                }
+                agent_accounts_login_transaction_invalidate(
+                    kind,
+                    Some(&profile_id),
+                    Some(generation),
+                );
+                if let Some(path) = exit_marker.as_ref() {
+                    let _ = fs::remove_file(path);
+                }
+            });
+        if spawned.is_err() {
+            agent_accounts_login_transaction_invalidate(
+                kind,
+                Some(&cleanup_profile_id),
+                Some(generation),
+            );
+            agent_accounts_remove_login_bindings(kind, &cleanup_profile_id, generation);
+            if let Some(path) = cleanup_exit_marker.as_ref() {
+                let _ = fs::remove_file(path);
+            }
+        }
+        return;
+    }
     if kind != "claude" || profile_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
         return;
     }
@@ -5313,46 +7130,48 @@ fn agent_accounts_watch_profile_login_completion(
     };
     let _ = thread::Builder::new()
         .name("agent-account-profile-login".to_string())
-        .spawn(move || loop {
-            if agent_accounts_profile_login_marker(&profile_dir).is_none() {
-                break;
-            }
-            let registry_guard = AGENT_ACCOUNTS_REGISTRY_ACTIVITY_LOCK
-                .get_or_init(|| StdMutex::new(()))
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            let mut registry = match agent_accounts_registry_read_checked() {
-                Ok(registry) => registry,
-                Err(_) => {
-                    // A concurrent atomic replacement can be briefly
-                    // unreadable. Preserve the authorization marker and retry
-                    // instead of treating an empty fallback as profile removal.
-                    drop(registry_guard);
-                    thread::sleep(Duration::from_secs(1));
-                    continue;
+        .spawn(move || {
+            loop {
+                if agent_accounts_profile_login_marker(&profile_dir).is_none() {
+                    break;
                 }
-            };
-            let (_, profiles) = agent_accounts_kind_entry(&registry, "claude");
-            let registered_email = profiles.iter().find_map(|profile| {
-                (profile.get("id").and_then(Value::as_str) == Some(profile_id.as_str()))
-                    .then(|| {
-                        profile
-                            .get("email")
-                            .and_then(Value::as_str)
-                            .map(agent_accounts_email_key)
-                            .unwrap_or_default()
-                    })
-            });
-            let Some(registered_email) = registered_email else {
-                agent_accounts_clear_profile_login_marker(&profile_dir);
-                break;
-            };
-            let live_email = agent_accounts_profile_identity("claude", Some(&profile_dir))
-                .get("email")
-                .and_then(Value::as_str)
-                .map(agent_accounts_email_key)
-                .unwrap_or_default();
-            if !live_email.is_empty()
+                let registry_guard = AGENT_ACCOUNTS_REGISTRY_ACTIVITY_LOCK
+                    .get_or_init(|| StdMutex::new(()))
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                let mut registry = match agent_accounts_registry_read_checked() {
+                    Ok(registry) => registry,
+                    Err(_) => {
+                        // A concurrent atomic replacement can be briefly
+                        // unreadable. Preserve the authorization marker and retry
+                        // instead of treating an empty fallback as profile removal.
+                        drop(registry_guard);
+                        thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+                };
+                let (_, profiles) = agent_accounts_kind_entry(&registry, "claude");
+                let registered_email = profiles.iter().find_map(|profile| {
+                    (profile.get("id").and_then(Value::as_str) == Some(profile_id.as_str())).then(
+                        || {
+                            profile
+                                .get("email")
+                                .and_then(Value::as_str)
+                                .map(agent_accounts_email_key)
+                                .unwrap_or_default()
+                        },
+                    )
+                });
+                let Some(registered_email) = registered_email else {
+                    agent_accounts_clear_profile_login_marker(&profile_dir);
+                    break;
+                };
+                let live_email = agent_accounts_profile_identity("claude", Some(&profile_dir))
+                    .get("email")
+                    .and_then(Value::as_str)
+                    .map(agent_accounts_email_key)
+                    .unwrap_or_default();
+                if !live_email.is_empty()
                 && live_email == registered_email
                 // Credentials can arrive before identity during a deliberate
                 // account switch. State writes complete immediately; a
@@ -5361,51 +7180,134 @@ fn agent_accounts_watch_profile_login_completion(
                 && agent_accounts_profile_login_marker_matching_completion(
                     &profile_dir,
                     &live_email,
-                )
-            {
-                agent_accounts_clear_profile_login_marker(&profile_dir);
-                let _ = app.emit(
-                    AGENT_ACCOUNTS_CHANGED_EVENT,
-                    json!({
-                        "kind": "claude",
-                        "profile_id": profile_id,
-                        "login_completed": true,
-                        "rebound": false,
-                    }),
-                );
-                break;
-            }
-            if !live_email.is_empty() && live_email != registered_email {
-                let default_email = agent_accounts_default_email("claude");
-                let result = agent_accounts_reconcile_captured_claude_identities(
-                    &mut registry,
-                    &default_email,
-                );
-                let persisted = !result.registry_changed
-                    || agent_accounts_registry_write(&registry).is_ok();
-                if persisted && result.registry_changed {
-                    for dir in &result.rebound_profile_dirs {
-                        agent_accounts_clear_profile_login_marker(dir);
-                    }
-                }
-                if result.changed() {
+                ) {
+                    agent_accounts_clear_profile_login_marker(&profile_dir);
                     let _ = app.emit(
                         AGENT_ACCOUNTS_CHANGED_EVENT,
                         json!({
                             "kind": "claude",
                             "profile_id": profile_id,
-                            "login_completed": persisted,
-                            "rebound": persisted && result.registry_changed,
+                            "login_completed": true,
+                            "rebound": false,
                         }),
                     );
-                }
-                if persisted && result.registry_changed {
                     break;
                 }
+                if !live_email.is_empty() && live_email != registered_email {
+                    let default_email = agent_accounts_default_email("claude");
+                    let result = agent_accounts_reconcile_captured_claude_identities(
+                        &mut registry,
+                        &default_email,
+                    );
+                    let persisted = !result.registry_changed
+                        || agent_accounts_registry_write(&registry).is_ok();
+                    if persisted && result.registry_changed {
+                        for dir in &result.rebound_profile_dirs {
+                            agent_accounts_clear_profile_login_marker(dir);
+                        }
+                    }
+                    if result.changed() {
+                        let _ = app.emit(
+                            AGENT_ACCOUNTS_CHANGED_EVENT,
+                            json!({
+                                "kind": "claude",
+                                "profile_id": profile_id,
+                                "login_completed": persisted,
+                                "rebound": persisted && result.registry_changed,
+                            }),
+                        );
+                    }
+                    if persisted && result.registry_changed {
+                        break;
+                    }
+                }
+                drop(registry_guard);
+                thread::sleep(Duration::from_secs(1));
             }
-            drop(registry_guard);
-            thread::sleep(Duration::from_secs(1));
         });
+}
+
+fn agent_accounts_login_watcher_consume_exit_marker<F>(
+    kind: &str,
+    profile_id: &str,
+    generation: u64,
+    marker: &Path,
+    terminal_exit_owns_completion: bool,
+    complete: F,
+) -> Option<bool>
+where
+    F: FnOnce() -> bool,
+{
+    if terminal_exit_owns_completion {
+        return None;
+    }
+    agent_accounts_consume_login_exit_marker(
+        kind,
+        profile_id,
+        generation,
+        marker,
+        complete,
+    )
+}
+
+fn agent_accounts_login_exit_marker_status(marker: &Path) -> Option<i32> {
+    match fs::read_to_string(marker) {
+        Ok(status) => Some(status.trim().parse::<i32>().unwrap_or(-1)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => Some(-1),
+    }
+}
+
+#[cfg(windows)]
+fn agent_accounts_login_exit_marker_ack_path(marker: &Path) -> PathBuf {
+    marker.with_extension("consumed")
+}
+
+#[cfg(any(windows, test))]
+fn agent_accounts_publish_login_exit_marker(marker: &Path, status: i32) -> std::io::Result<()> {
+    let pending = marker.with_extension(format!("pending-{}", uuid::Uuid::new_v4().simple()));
+    fs::write(&pending, format!("{status}\n"))?;
+    match fs::rename(&pending, marker) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&pending);
+            Err(error)
+        }
+    }
+}
+
+fn agent_accounts_consume_login_exit_marker<F>(
+    kind: &str,
+    profile_id: &str,
+    generation: u64,
+    marker: &Path,
+    complete: F,
+) -> Option<bool>
+where
+    F: FnOnce() -> bool,
+{
+    let claimed = marker.with_extension(format!(
+        "consuming-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    match fs::rename(marker, &claimed) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return None,
+    }
+    let status = agent_accounts_login_exit_marker_status(&claimed).unwrap_or(-1);
+    let completed = status == 0 && complete();
+    if !completed {
+        agent_accounts_login_transaction_invalidate(kind, Some(profile_id), Some(generation));
+    }
+    #[cfg(windows)]
+    {
+        // The console-process monitor uses this acknowledgement to distinguish
+        // a consumed inner-command status from a later forced console close.
+        let _ = fs::write(agent_accounts_login_exit_marker_ack_path(marker), b"consumed\n");
+    }
+    let _ = fs::remove_file(&claimed);
+    Some(completed)
 }
 
 fn agent_accounts_provider_for_kind(kind: &str) -> AgentProvider {
@@ -5446,16 +7348,124 @@ async fn agent_accounts_start_profile_login(
         return Err("A profile id is required.".to_string());
     }
     tauri::async_runtime::spawn_blocking(move || {
-        agent_accounts_launch_profile_login_terminal(kind, &profile_id)?;
-        agent_accounts_watch_profile_login_completion(app.clone(), kind, profile_id.clone());
+        let baseline = agent_accounts_login_completion_baseline(kind, &profile_id)?;
+        let generation = matches!(kind, "codex" | "opencode").then(|| {
+            agent_accounts_login_transaction_begin(kind, &profile_id, baseline.clone())
+        });
+        let exit_marker =
+            match agent_accounts_launch_profile_login_terminal(kind, &profile_id, generation) {
+                Ok(exit_marker) => exit_marker,
+                Err(error) => {
+                    if let Some(generation) = generation {
+                        agent_accounts_login_transaction_invalidate(
+                            kind,
+                            Some(&profile_id),
+                            Some(generation),
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+        if let (Some(generation), Some(marker)) = (generation, exit_marker.as_ref()) {
+            if !agent_accounts_login_transaction_set_exit_marker(
+                kind,
+                &profile_id,
+                generation,
+                marker.clone(),
+            ) {
+                let _ = fs::remove_file(marker);
+                agent_accounts_login_transaction_invalidate(
+                    kind,
+                    Some(&profile_id),
+                    Some(generation),
+                );
+                return Err("The provider login transaction changed during launch.".to_string());
+            }
+        }
+        agent_accounts_watch_profile_login_completion(
+            app.clone(),
+            kind,
+            profile_id.clone(),
+            baseline,
+            generation,
+            exit_marker,
+            false,
+        );
         let _ = app.emit(
             AGENT_ACCOUNTS_CHANGED_EVENT,
             json!({ "kind": kind, "profile_id": profile_id, "login_started": true }),
         );
-        Ok(json!({ "ok": true, "kind": kind, "profile_id": profile_id }))
+        Ok(json!({ "ok": true, "kind": kind, "profile_id": profile_id, "generation": generation }))
     })
     .await
     .map_err(|error| format!("Agent account login worker failed: {error}"))?
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn agent_accounts_cancel_profile_login(
+    agent_kind: String,
+    profile_id: String,
+    generation: Option<u64>,
+) -> Result<Value, String> {
+    let kind = agent_accounts_supported_kind(&agent_kind)
+        .ok_or_else(|| format!("Unsupported agent kind for accounts: {agent_kind}"))?;
+    let profile_id = profile_id.trim().to_string();
+    if profile_id.is_empty() {
+        return Err("A profile id is required.".to_string());
+    }
+    let cancelled =
+        agent_accounts_login_transaction_invalidate(kind, Some(&profile_id), generation);
+    Ok(json!({
+        "ok": true,
+        "kind": kind,
+        "profile_id": profile_id,
+        "generation": generation,
+        "cancelled": cancelled,
+    }))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn agent_accounts_bind_login_terminal(
+    state: State<'_, TerminalState>,
+    agent_kind: String,
+    profile_id: String,
+    generation: u64,
+    pane_id: String,
+) -> Result<Value, String> {
+    let kind = agent_accounts_supported_kind(&agent_kind)
+        .ok_or_else(|| format!("Unsupported agent kind for accounts: {agent_kind}"))?;
+    let profile_id = profile_id.trim().to_string();
+    validate_terminal_pane_id(&pane_id)?;
+    let mut instance_id = None;
+    for _ in 0..100 {
+        instance_id = state
+            .terminals
+            .read()
+            .await
+            .get(&pane_id)
+            .map(|instance| instance.id);
+        if instance_id.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    let instance_id = instance_id
+        .ok_or_else(|| "The provider login terminal did not start in time.".to_string())?;
+    agent_accounts_login_transaction_bind_terminal(
+        kind,
+        &profile_id,
+        generation,
+        &pane_id,
+        instance_id,
+    )?;
+    Ok(json!({
+        "ok": true,
+        "kind": kind,
+        "profile_id": profile_id,
+        "generation": generation,
+        "pane_id": pane_id,
+        "instance_id": instance_id,
+    }))
 }
 
 /// Alias + display preferences for one account pill. The pill shows the alias
@@ -5549,29 +7559,42 @@ async fn agent_accounts_set_active(
     if profile_id.is_empty() {
         return Err("A profile id is required.".to_string());
     }
+    if kind == "codex" {
+        return Err(
+            "Codex account switches require device authorization; start a profile login instead."
+                .to_string(),
+        );
+    }
     tauri::async_runtime::spawn_blocking(move || {
+        // Any explicit selection supersedes an in-flight login for this
+        // provider. A completion watcher must never overwrite that newer
+        // choice later.
+        agent_accounts_login_transaction_invalidate(kind, None, None);
         let mut registry = agent_accounts_registry_read_checked()
             .map_err(|error| format!("Agent accounts registry is unavailable: {error}"))?;
-        let (_, profiles) = agent_accounts_kind_entry(&registry, kind);
-        if profile_id != AGENT_ACCOUNTS_DEFAULT_PROFILE_ID
-            && !profiles.iter().any(|profile| {
-                profile
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    == profile_id
-            })
-        {
-            return Err(format!("Unknown {kind} account profile: {profile_id}"));
+        let profile = agent_accounts_profile_for_id(&registry, kind, &profile_id);
+        if kind == "opencode" {
+            let identity = if profile_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
+                agent_accounts_profile_identity(kind, None)
+            } else {
+                let dir = profile
+                    .as_ref()
+                    .and_then(agent_accounts_profile_dir)
+                    .ok_or_else(|| format!("Unknown {kind} account profile: {profile_id}"))?;
+                agent_accounts_profile_identity(kind, Some(&dir))
+            };
+            if !identity
+                .get("auth_ready")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return Err(
+                    "This OpenCode account needs login before it can be selected.".to_string(),
+                );
+            }
         }
         let active_profile_id = profile_id.clone();
-        if !registry.get("agents").is_some_and(Value::is_object) {
-            registry["agents"] = json!({});
-        }
-        if !registry["agents"].get(kind).is_some_and(Value::is_object) {
-            registry["agents"][kind] = json!({ "profiles": [] });
-        }
-        registry["agents"][kind]["active_profile_id"] = json!(active_profile_id);
+        agent_accounts_activate_profile_in_registry(&mut registry, kind, &active_profile_id)?;
         agent_accounts_registry_write(&registry)?;
         let _ = app.emit(
             AGENT_ACCOUNTS_CHANGED_EVENT,
@@ -5619,8 +7642,7 @@ async fn agent_account_push_to_device(
         return Err("A target device id is required.".to_string());
     }
     let local_device = cloud_mcp_desktop_device_profile();
-    let local_device_id =
-        cloud_mcp_payload_text(&local_device, &["device_id"]).unwrap_or_default();
+    let local_device_id = cloud_mcp_payload_text(&local_device, &["device_id"]).unwrap_or_default();
     if local_device_id.trim().is_empty() {
         return Err(
             "Current device identity is unavailable; credential push cancelled.".to_string(),
@@ -5754,11 +7776,7 @@ async fn agent_account_push_to_device(
     let sender_device = cloud_mcp_desktop_device_profile();
     let target_device_name = agent_account_push_first_text(
         &target_device,
-        &[
-            &["device_name"][..],
-            &["machine_name"][..],
-            &["name"][..],
-        ],
+        &[&["device_name"][..], &["machine_name"][..], &["name"][..]],
     )
     .unwrap_or_else(|| target_device_id.clone());
     let request = json!({
@@ -5903,14 +7921,12 @@ async fn agent_accounts_remove(
                 "codex" => ("openai", "codex"),
                 _ => ("opencode", "opencode"),
             };
-            let synthetic_key =
-                format!("{provider}:{tokenomics_agent_kind}:profile:{profile_id}");
+            let synthetic_key = format!("{provider}:{tokenomics_agent_kind}:profile:{profile_id}");
             // When the removed identity is the one signed into the default
             // home, fold its synthetic history into the live canonical
             // account; otherwise a durable retirement keeps the phantom pill
             // hidden without deleting its rows.
-            let canonical_key = (!removed_email.is_empty()
-                && removed_email == current_email)
+            let canonical_key = (!removed_email.is_empty() && removed_email == current_email)
                 .then(|| tokenomics_provider_account(provider, tokenomics_agent_kind).key)
                 .filter(|key| !tokenomics_provider_account_key_is_unknown(key));
             let _ = tokenomics_persist_retired_provider_account_key_for_app(
@@ -5947,8 +7963,134 @@ async fn agent_accounts_remove(
 /// stale-terminal chips ("account switched — restart to use X"). Default
 /// accounts resolve to captured snapshots when possible, so a later default
 /// login change can still mark older panes stale.
-#[tauri::command(rename_all = "snake_case")]
-async fn agent_accounts_pane_profiles() -> Result<Value, String> {
+fn agent_accounts_restart_eligible(execution_phase: &str, terminal_lifecycle: &str) -> bool {
+    terminal_lifecycle == "open"
+        && matches!(
+            execution_phase,
+            "idle" | "completed" | "complete" | "done" | "cancelled" | "canceled" | "interrupted"
+        )
+}
+
+fn agent_accounts_build_stale_inventory(
+    panes: &serde_json::Map<String, Value>,
+    active: &Value,
+    live_panes: &HashMap<String, Value>,
+) -> Vec<Value> {
+    let mut inventory = panes
+        .iter()
+        .filter_map(|(pane_id, stamp)| {
+            let kind = stamp.get("kind").and_then(Value::as_str)?;
+            let target = active.get(kind)?;
+            let stamped_profile_id = stamp
+                .get("profile_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let stamped_revision = stamp
+                .get("auth_revision")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let target_profile_id = target
+                .get("profile_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let target_revision = target
+                .get("auth_revision")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let profile_changed = !target_profile_id.is_empty()
+                && stamped_profile_id != target_profile_id;
+            let revision_changed = !profile_changed
+                && !target_revision.is_empty()
+                && stamped_revision != target_revision;
+            if !profile_changed && !revision_changed {
+                return None;
+            }
+            // Closed panes can leave a bounded historical launch stamp behind;
+            // the provider-wide restart inventory is live-terminal state only.
+            let live = live_panes.get(pane_id)?;
+            let open = live
+                .get("open")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if !open {
+                return None;
+            }
+            let workspace_id = live
+                .get("workspace_id")
+                .and_then(Value::as_str)
+                .or_else(|| stamp.get("workspace_id").and_then(Value::as_str))
+                .unwrap_or_default();
+            let workspace_label = live
+                .get("workspace_label")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| stamp.get("workspace_label").and_then(Value::as_str))
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(workspace_id);
+            let terminal_index = live
+                .get("terminal_index")
+                .and_then(Value::as_u64)
+                .or_else(|| stamp.get("terminal_index").and_then(Value::as_u64));
+            let instance_id = live.get("instance_id").and_then(Value::as_u64)?;
+            let launch_epoch = live
+                .get("launch_epoch")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())?;
+            let restart_eligible = live
+                .get("restart_eligible")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let busy = !restart_eligible;
+            let activity = live
+                .get("activity")
+                .and_then(Value::as_str)
+                .unwrap_or(if busy { "blocked" } else { "idle" });
+            Some(json!({
+                "kind": kind,
+                "provider": kind,
+                "workspace_id": workspace_id,
+                "workspace_label": workspace_label,
+                "pane_id": pane_id,
+                "terminal_index": terminal_index,
+                "instance_id": instance_id,
+                "launch_epoch": launch_epoch,
+                "activity": activity,
+                "busy": busy,
+                "idle": restart_eligible,
+                "restart_eligible": restart_eligible,
+                "needs_restart": true,
+                "stamped_profile_id": stamped_profile_id,
+                "stamped_profile_label": stamp.get("profile_label").and_then(Value::as_str).unwrap_or_default(),
+                "stamped_auth_revision": stamped_revision,
+                "target_profile_id": target_profile_id,
+                "target_profile_label": target.get("profile_label").and_then(Value::as_str).unwrap_or_default(),
+                "target_auth_revision": target_revision,
+                "stale_reason": if profile_changed { "profile_changed" } else { "auth_revision_changed" },
+            }))
+        })
+        .collect::<Vec<_>>();
+    inventory.sort_by(|left, right| {
+        let text = |value: &Value, key: &str| {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        text(left, "workspace_label")
+            .cmp(&text(right, "workspace_label"))
+            .then_with(|| text(left, "workspace_id").cmp(&text(right, "workspace_id")))
+            .then_with(|| {
+                left.get("terminal_index")
+                    .and_then(Value::as_u64)
+                    .cmp(&right.get("terminal_index").and_then(Value::as_u64))
+            })
+            .then_with(|| text(left, "pane_id").cmp(&text(right, "pane_id")))
+    });
+    inventory
+}
+
+async fn agent_accounts_pane_profiles_for_state(state: &TerminalState) -> Value {
     let registry = agent_accounts_registry_read_resolved();
     let panes = AGENT_ACCOUNTS_PANE_PROFILES
         .get_or_init(|| StdMutex::new(HashMap::new()))
@@ -5962,20 +8104,56 @@ async fn agent_accounts_pane_profiles() -> Result<Value, String> {
     let (claude_active, claude_label) = agent_accounts_launch_profile_label("claude");
     let (codex_active, codex_label) = agent_accounts_launch_profile_label("codex");
     let (opencode_active, opencode_label) = agent_accounts_launch_profile_label("opencode");
+    let active = json!({
+        "claude": { "profile_id": claude_active, "profile_label": claude_label, "auth_revision": agent_accounts_active_auth_revision("claude") },
+        "codex": { "profile_id": codex_active, "profile_label": codex_label, "auth_revision": agent_accounts_active_auth_revision("codex") },
+        "opencode": { "profile_id": opencode_active, "profile_label": opencode_label, "auth_revision": agent_accounts_active_auth_revision("opencode") },
+    });
     let auth = json!({
         "claude": agent_accounts_kind_auth_statuses(&registry, "claude"),
         "codex": agent_accounts_kind_auth_statuses(&registry, "codex"),
         "opencode": agent_accounts_kind_auth_statuses(&registry, "opencode"),
     });
-    Ok(json!({
+    let live_panes = {
+        let terminals = state.terminals.read().await;
+        terminals
+            .iter()
+            .map(|(pane_id, instance)| {
+                let runtime = terminal_runtime_snapshot(instance);
+                let projected = terminal_project_runtime(&instance.metadata, &runtime, false);
+                let open = projected.terminal_lifecycle == "open";
+                let restart_eligible = agent_accounts_restart_eligible(
+                    &projected.execution_phase,
+                    &projected.terminal_lifecycle,
+                );
+                (
+                    pane_id.clone(),
+                    json!({
+                        "instance_id": instance.id,
+                        "launch_epoch": instance.coordination.as_ref().and_then(|coordination| coordination.terminal_launch_epoch.as_deref()),
+                        "workspace_id": instance.metadata.workspace_id.as_str(),
+                        "workspace_label": instance.metadata.workspace_name.as_str(),
+                        "terminal_index": instance.metadata.terminal_index,
+                        "activity": projected.execution_phase,
+                        "open": open,
+                        "restart_eligible": restart_eligible,
+                    }),
+                )
+            })
+            .collect::<HashMap<_, _>>()
+    };
+    let inventory = agent_accounts_build_stale_inventory(&panes, &active, &live_panes);
+    json!({
         "panes": panes,
-        "active": {
-            "claude": { "profile_id": claude_active, "profile_label": claude_label, "auth_revision": agent_accounts_active_auth_revision("claude") },
-            "codex": { "profile_id": codex_active, "profile_label": codex_label, "auth_revision": agent_accounts_active_auth_revision("codex") },
-            "opencode": { "profile_id": opencode_active, "profile_label": opencode_label, "auth_revision": agent_accounts_active_auth_revision("opencode") },
-        },
+        "active": active,
         "auth": auth,
-    }))
+        "stale_inventory": inventory,
+    })
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn agent_accounts_pane_profiles(state: State<'_, TerminalState>) -> Result<Value, String> {
+    Ok(agent_accounts_pane_profiles_for_state(state.inner()).await)
 }
 
 #[cfg(test)]
@@ -6045,10 +8223,22 @@ mod agent_accounts_tests {
     }
 
     fn test_codex_auth_for_email(email: &str) -> String {
-        let claims = general_purpose::URL_SAFE_NO_PAD
-            .encode(serde_json::to_vec(&json!({ "email": email })).unwrap());
-        serde_json::to_string(&json!({ "tokens": { "id_token": format!("h.{claims}.s") } }))
-            .unwrap()
+        test_codex_auth_for_account(email, &format!("acct-{email}"), "refresh-a")
+    }
+
+    fn test_codex_auth_for_account(email: &str, account_id: &str, refresh: &str) -> String {
+        let claims = general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "email": email,
+                "chatgpt_account_id": account_id,
+            }))
+            .unwrap(),
+        );
+        serde_json::to_string(&json!({ "tokens": {
+            "id_token": format!("h.{claims}.s"),
+            "refresh_token": refresh,
+        } }))
+        .unwrap()
     }
 
     fn test_claude_state_for_email(email: &str) -> String {
@@ -6063,6 +8253,1116 @@ mod agent_accounts_tests {
             "theme": "dark",
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn userprofile_without_home_resolves_all_provider_identities() {
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_userprofile_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let status = std::process::Command::new(env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("agent_accounts_tests::userprofile_without_home_capture_child")
+            .arg("--nocapture")
+            .env("DIFFFORGE_USERPROFILE_CAPTURE_CHILD", &root)
+            .env("USERPROFILE", &root)
+            .env_remove("HOME")
+            .env_remove("XDG_DATA_HOME")
+            .env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, root.join("diffforge-data"))
+            .status()
+            .unwrap();
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            status.success(),
+            "isolated USERPROFILE capture child failed"
+        );
+    }
+
+    /// Environment variables are process-global. Run the Windows-home capture
+    /// regression in an exact child test so unrelated parallel tests cannot
+    /// replace HOME/local-data between the three provider captures.
+    #[test]
+    fn userprofile_without_home_capture_child() {
+        let Some(root) = env::var_os("DIFFFORGE_USERPROFILE_CAPTURE_CHILD").map(PathBuf::from)
+        else {
+            return;
+        };
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        fs::create_dir_all(root.join(".codex")).unwrap();
+        fs::create_dir_all(root.join(".local/share/opencode")).unwrap();
+        fs::write(root.join(".claude/.credentials.json"), "{}").unwrap();
+        fs::write(
+            root.join(".claude.json"),
+            test_claude_state_for_email("claude@example.com"),
+        )
+        .unwrap();
+        fs::write(
+            root.join(".codex/auth.json"),
+            test_codex_auth_for_email("codex@example.com"),
+        )
+        .unwrap();
+        fs::write(
+            root.join(".local/share/opencode/auth.json"),
+            serde_json::to_vec(&json!({ "opencode-go": { "type": "api", "key": "oc-key" } }))
+                .unwrap(),
+        )
+        .unwrap();
+
+        for kind in ["claude", "codex", "opencode"] {
+            let identity = agent_accounts_profile_identity(kind, None);
+            assert_eq!(identity["auth_ready"], json!(true), "{kind}");
+            assert!(
+                identity["email"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()),
+                "{kind}"
+            );
+        }
+        assert_eq!(
+            user_home_dir_from(Some(root.clone().into_os_string()), None),
+            Some(root.clone())
+        );
+        for kind in ["claude", "codex", "opencode"] {
+            assert!(agent_accounts_capture_kind(kind), "capture {kind}");
+        }
+        let registry = agent_accounts_registry_read_checked().unwrap();
+        for kind in ["claude", "codex", "opencode"] {
+            let (_, profiles) = agent_accounts_kind_entry(&registry, kind);
+            assert_eq!(profiles.len(), 1, "captured registry profile for {kind}");
+            let profile_dir = agent_accounts_profile_dir(&profiles[0]).unwrap();
+            let auth_path = agent_accounts_profile_auth_path(kind, &profile_dir);
+            assert!(auth_path.is_file(), "captured auth snapshot for {kind}");
+            assert!(
+                agent_accounts_profile_identity(kind, Some(&profile_dir))["auth_ready"]
+                    .as_bool()
+                    .unwrap_or(false),
+                "captured profile identity for {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_watcher_promotes_later_created_provider_dir() {
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_watch_plan_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let provider_dir = root.join(".codex");
+        let auth_path = provider_dir.join("auth.json");
+        let targets = vec![("codex", auth_path.clone())];
+        let mut watched = HashMap::new();
+        let initial = agent_accounts_capture_watch_registration_plan(&targets, &watched);
+        assert_eq!(initial, vec![("codex", root.clone())]);
+        watched.insert("codex", root.clone());
+
+        fs::create_dir_all(&provider_dir).unwrap();
+        fs::write(&auth_path, test_codex_auth_for_email("watch@example.com")).unwrap();
+        let promoted = agent_accounts_capture_watch_registration_plan(&targets, &watched);
+        assert_eq!(promoted, vec![("codex", provider_dir.clone())]);
+        assert!(agent_accounts_capture_promoted_target_exists(
+            "codex", &targets
+        ));
+        watched.insert("codex", provider_dir.clone());
+        assert!(agent_accounts_capture_watch_registration_plan(&targets, &watched).is_empty());
+
+        let relevant = notify::Event::new(notify::EventKind::Any).add_path(auth_path);
+        let unrelated = notify::Event::new(notify::EventKind::Any)
+            .add_path(root.join("another/provider/auth.json"));
+        assert!(agent_accounts_capture_event_is_relevant(
+            &relevant, &targets
+        ));
+        assert!(!agent_accounts_capture_event_is_relevant(
+            &unrelated, &targets
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_login_transaction_requires_changed_expected_auth_before_activation() {
+        let baseline = AgentAccountsLoginCompletionBaseline {
+            auth_signature: "before".to_string(),
+            expected_identity: "codex-account:workspace-expected".to_string(),
+        };
+        let expected = json!({
+            "email": "same@example.com",
+            "stable_identity": "codex-account:workspace-expected",
+            "auth_ready": true,
+        });
+        let wrong = json!({
+            "email": "same@example.com",
+            "stable_identity": "codex-account:workspace-wrong",
+            "auth_ready": true,
+        });
+        assert!(!agent_accounts_codex_login_completion_matches(
+            &baseline, "before", &expected
+        ));
+        assert!(!agent_accounts_codex_login_completion_matches(
+            &baseline, "after", &wrong
+        ));
+        assert!(agent_accounts_codex_login_completion_matches(
+            &baseline, "after", &expected
+        ));
+        assert_eq!(
+            agent_accounts_login_command("codex", "/tmp/profile"),
+            "CODEX_HOME='/tmp/profile' codex login --device-auth"
+        );
+
+        let mut registry = json!({
+            "agents": { "codex": {
+                "active_profile_id": "old",
+                "profiles": [{ "id": "old" }, { "id": "target" }]
+            }}
+        });
+        assert_eq!(registry["agents"]["codex"]["active_profile_id"], "old");
+        agent_accounts_activate_profile_in_registry(&mut registry, "codex", "target").unwrap();
+        assert_eq!(registry["agents"]["codex"]["active_profile_id"], "target");
+    }
+
+    #[test]
+    fn failed_external_login_marker_cannot_claim_changed_matching_auth() {
+        let kind = format!("test-exit-kind-{}", uuid::Uuid::new_v4());
+        let profile = "external-profile";
+        let generation = agent_accounts_login_transaction_begin(&kind, profile, None);
+        let marker =
+            env::temp_dir().join(format!("agent-account-login-exit-{}", uuid::Uuid::new_v4()));
+        agent_accounts_publish_login_exit_marker(&marker, 1).unwrap();
+        let completion_attempted = AtomicBool::new(false);
+        assert_eq!(
+            agent_accounts_consume_login_exit_marker(
+                &kind,
+                profile,
+                generation,
+                &marker,
+                || {
+                    // Models a matching auth.json revision appearing after the
+                    // failed process exited. Failure must not call completion.
+                    completion_attempted.store(true, Ordering::SeqCst);
+                    true
+                },
+            ),
+            Some(false)
+        );
+        assert!(!completion_attempted.load(Ordering::SeqCst));
+        assert!(!agent_accounts_login_transaction_is_current(
+            &kind,
+            profile,
+            generation,
+        ));
+        assert!(!agent_accounts_login_transaction_claim(
+            &kind, profile, generation
+        ));
+        assert!(!marker.exists());
+
+        let success_generation = agent_accounts_login_transaction_begin(&kind, profile, None);
+        agent_accounts_publish_login_exit_marker(&marker, 0).unwrap();
+        assert_eq!(
+            agent_accounts_consume_login_exit_marker(
+                &kind,
+                profile,
+                success_generation,
+                &marker,
+                || agent_accounts_login_transaction_claim(&kind, profile, success_generation),
+            ),
+            Some(true)
+        );
+        assert!(!agent_accounts_login_transaction_is_current(
+            &kind,
+            profile,
+            success_generation,
+        ));
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_web_shell_login_is_exit_status_gated() {
+        let kind = format!("managed-exit-kind-{}", uuid::Uuid::new_v4());
+        let profile = "managed-profile";
+        let failed_generation =
+            agent_accounts_login_transaction_begin(&kind, profile, None);
+        let failed_marker = env::temp_dir().join(format!(
+            "agent-account-managed-failed-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let failed_command = agent_accounts_managed_login_command_with_exit_marker(
+            "false",
+            &failed_marker,
+            false,
+        );
+        let completion_attempted = Arc::new(AtomicBool::new(false));
+        assert!(agent_accounts_consume_login_exit_marker(
+            &kind,
+            profile,
+            failed_generation,
+            &failed_marker,
+            || true,
+        )
+        .is_none(), "pre-exit credential changes cannot activate");
+        let status = Command::new("/bin/sh")
+            .args(["-c", &failed_command])
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        let attempted = Arc::clone(&completion_attempted);
+        assert_eq!(
+            agent_accounts_consume_login_exit_marker(
+                &kind,
+                profile,
+                failed_generation,
+                &failed_marker,
+                move || {
+                    attempted.store(true, Ordering::SeqCst);
+                    true
+                },
+            ),
+            Some(false)
+        );
+        assert!(!completion_attempted.load(Ordering::SeqCst));
+
+        let success_generation =
+            agent_accounts_login_transaction_begin(&kind, profile, None);
+        let success_marker = env::temp_dir().join(format!(
+            "agent-account-managed-success-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let success_command = agent_accounts_managed_login_command_with_exit_marker(
+            "trap 'sleep 1' EXIT; true",
+            &success_marker,
+            false,
+        );
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", &success_command])
+            .spawn()
+            .unwrap();
+        for _ in 0..100 {
+            if success_marker.is_file() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(success_marker.is_file());
+        assert!(child.try_wait().unwrap().is_none(), "the PTY command is still alive after publishing its inner status");
+        assert_eq!(
+            agent_accounts_login_watcher_consume_exit_marker(
+                &kind,
+                profile,
+                success_generation,
+                &success_marker,
+                true,
+                || panic!("a managed watcher must never attempt activation"),
+            ),
+            None
+        );
+        assert!(success_marker.is_file());
+        assert!(child.wait().unwrap().success());
+        assert_eq!(
+            agent_accounts_consume_login_exit_marker(
+                &kind,
+                profile,
+                success_generation,
+                &success_marker,
+                || agent_accounts_login_transaction_claim(
+                    &kind,
+                    profile,
+                    success_generation,
+                ),
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn login_transaction_generation_cas_rejects_stale_cancelled_and_exited_watchers() {
+        agent_accounts_login_transaction_invalidate("codex", None, None);
+        let old = agent_accounts_login_transaction_begin("codex", "profile-a", None);
+        let current = agent_accounts_login_transaction_begin("codex", "profile-b", None);
+        assert!(!agent_accounts_login_transaction_is_current(
+            "codex",
+            "profile-a",
+            old
+        ));
+        assert!(!agent_accounts_login_transaction_claim(
+            "codex",
+            "profile-a",
+            old
+        ));
+        assert!(agent_accounts_login_transaction_is_current(
+            "codex",
+            "profile-b",
+            current
+        ));
+        assert!(agent_accounts_login_transaction_invalidate(
+            "codex",
+            Some("profile-b"),
+            Some(current)
+        ));
+        assert!(!agent_accounts_login_transaction_claim(
+            "codex",
+            "profile-b",
+            current
+        ));
+
+        let baseline = AgentAccountsLoginCompletionBaseline {
+            auth_signature: "before".to_string(),
+            expected_identity: "codex-account:profile-c".to_string(),
+        };
+        let exited = agent_accounts_login_transaction_begin(
+            "codex",
+            "profile-c",
+            Some(baseline),
+        );
+        let marker = env::temp_dir().join(format!(
+            "agent-account-bound-exit-{}",
+            uuid::Uuid::new_v4()
+        ));
+        assert!(agent_accounts_login_transaction_set_exit_marker(
+            "codex",
+            "profile-c",
+            exited,
+            marker.clone(),
+        ));
+        agent_accounts_login_transaction_bind_terminal(
+            "codex",
+            "profile-c",
+            exited,
+            "login-pane",
+            91,
+        )
+        .unwrap();
+        agent_accounts_publish_login_exit_marker(&marker, 1).unwrap();
+        agent_accounts_login_terminal_process_exited(None, "login-pane", 91, Some(1));
+        assert!(!agent_accounts_login_transaction_is_current(
+            "codex",
+            "profile-c",
+            exited
+        ));
+    }
+
+    #[test]
+    fn login_pane_binding_is_atomic_and_instance_scoped() {
+        let kind = "opencode";
+        let profile = format!("atomic-bind-{}", uuid::Uuid::new_v4());
+        let baseline = AgentAccountsLoginCompletionBaseline {
+            auth_signature: "original-baseline".to_string(),
+            expected_identity: "opencode-account".to_string(),
+        };
+        let first = agent_accounts_login_transaction_begin(
+            kind,
+            &profile,
+            Some(baseline.clone()),
+        );
+        let first_marker = env::temp_dir().join(format!(
+            "agent-account-bind-first-{}",
+            uuid::Uuid::new_v4()
+        ));
+        assert!(agent_accounts_login_transaction_set_exit_marker(
+            kind,
+            &profile,
+            first,
+            first_marker.clone(),
+        ));
+        let first_binding = agent_accounts_login_transaction_bind_terminal(
+            kind,
+            &profile,
+            first,
+            "shared-pane",
+            101,
+        )
+        .unwrap();
+        assert_eq!(first_binding.baseline.auth_signature, "original-baseline");
+
+        let second = agent_accounts_login_transaction_begin(
+            kind,
+            &profile,
+            Some(AgentAccountsLoginCompletionBaseline {
+                auth_signature: "new-baseline".to_string(),
+                expected_identity: "opencode-account".to_string(),
+            }),
+        );
+        let second_marker = env::temp_dir().join(format!(
+            "agent-account-bind-second-{}",
+            uuid::Uuid::new_v4()
+        ));
+        assert!(agent_accounts_login_transaction_set_exit_marker(
+            kind,
+            &profile,
+            second,
+            second_marker.clone(),
+        ));
+        agent_accounts_login_transaction_bind_terminal(
+            kind,
+            &profile,
+            second,
+            "shared-pane",
+            102,
+        )
+        .unwrap();
+
+        agent_accounts_login_terminal_process_exited(None, "shared-pane", 101, Some(1));
+        assert!(agent_accounts_login_transaction_is_current(
+            kind,
+            &profile,
+            second,
+        ));
+        assert!(AGENT_ACCOUNTS_LOGIN_PANES
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .contains_key(&("shared-pane".to_string(), 102, second)));
+        agent_accounts_login_terminal_process_exited(None, "shared-pane", 102, Some(1));
+        let _ = fs::remove_file(first_marker);
+        let _ = fs::remove_file(second_marker);
+
+        let race_profile = format!("atomic-bind-race-{}", uuid::Uuid::new_v4());
+        let race = agent_accounts_login_transaction_begin(
+            kind,
+            &race_profile,
+            Some(AgentAccountsLoginCompletionBaseline {
+                auth_signature: "race-baseline".to_string(),
+                expected_identity: "opencode-account".to_string(),
+            }),
+        );
+        let race_marker = env::temp_dir().join(format!(
+            "agent-account-bind-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        assert!(agent_accounts_login_transaction_set_exit_marker(
+            kind,
+            &race_profile,
+            race,
+            race_marker.clone(),
+        ));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let attempts = [201_u64, 202_u64]
+            .into_iter()
+            .map(|instance_id| {
+                let profile = race_profile.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    agent_accounts_login_transaction_bind_terminal(
+                        kind,
+                        &profile,
+                        race,
+                        "racing-pane",
+                        instance_id,
+                    )
+                    .is_ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attempts
+                .into_iter()
+                .map(|attempt| attempt.join().unwrap())
+                .filter(|bound| *bound)
+                .count(),
+            1,
+            "the transaction CAS must allow exactly one concurrent terminal binding"
+        );
+        agent_accounts_login_transaction_invalidate(kind, Some(&race_profile), Some(race));
+        agent_accounts_remove_login_bindings(kind, &race_profile, race);
+        let _ = fs::remove_file(race_marker);
+    }
+
+    #[test]
+    fn codex_identity_uses_workspace_account_id_not_display_email() {
+        let personal: Value = serde_json::from_str(&test_codex_auth_for_account(
+            "shared@example.com",
+            "workspace-personal",
+            "refresh-personal",
+        ))
+        .unwrap();
+        let organization: Value = serde_json::from_str(&test_codex_auth_for_account(
+            "shared@example.com",
+            "workspace-org",
+            "refresh-org",
+        ))
+        .unwrap();
+        assert_eq!(
+            agent_accounts_codex_email_from_auth(&personal),
+            agent_accounts_codex_email_from_auth(&organization)
+        );
+        assert_eq!(
+            agent_accounts_codex_stable_identity_from_auth(&personal),
+            "codex-account:workspace-personal"
+        );
+        assert_eq!(
+            agent_accounts_codex_stable_identity_from_auth(&organization),
+            "codex-account:workspace-org"
+        );
+        assert_ne!(
+            agent_accounts_codex_stable_identity_from_auth(&personal),
+            agent_accounts_codex_stable_identity_from_auth(&organization)
+        );
+    }
+
+    #[test]
+    fn codex_jwt_subject_without_workspace_claim_is_not_switch_identity() {
+        let claims = general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "sub": "same-person",
+                "email": "shared@example.com"
+            }))
+            .unwrap(),
+        );
+        let auth = json!({ "tokens": {
+            "id_token": format!("h.{claims}.s"),
+            "refresh_token": "rotating-secret"
+        }});
+        assert_eq!(
+            agent_accounts_codex_email_from_auth(&auth),
+            "shared@example.com"
+        );
+        assert!(agent_accounts_codex_stable_identity_from_auth(&auth).is_empty());
+    }
+
+    #[test]
+    fn opencode_first_seen_oauth_identity_is_single_under_concurrency() {
+        const OBSERVERS: usize = 16;
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_opencode_first_seen_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let auth = Arc::new(json!({
+            "provider-oauth": {
+                "type": "oauth",
+                "access": "rotating-access",
+                "refresh": "rotating-refresh"
+            }
+        }));
+        let barrier = Arc::new(std::sync::Barrier::new(OBSERVERS));
+        let mut observers = Vec::new();
+        for _ in 0..OBSERVERS {
+            let root = root.clone();
+            let auth = Arc::clone(&auth);
+            let barrier = Arc::clone(&barrier);
+            observers.push(thread::spawn(move || {
+                barrier.wait();
+                agent_accounts_opencode_identity_with_first_seen(&auth, &root)
+            }));
+        }
+        let identities = observers
+            .into_iter()
+            .map(|observer| observer.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!identities[0].is_empty());
+        assert!(identities.iter().all(|identity| identity == &identities[0]));
+        let persisted = agent_accounts_opencode_identity_with_first_seen(&auth, &root);
+        assert_eq!(persisted, identities[0]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn opencode_mixed_oauth_and_api_first_observation_survives_rotation() {
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_opencode_mixed_rotation_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let first_auth = json!({
+            "opencode-go": {"type": "api", "key": "api-before"},
+            "provider-oauth": {
+                "type": "oauth",
+                "access": "access-before",
+                "refresh": "refresh-before"
+            }
+        });
+        let first = agent_accounts_opencode_identity_with_first_seen(&first_auth, &root);
+        assert!(
+            first.contains("opencode-oauth-provider-oauth-first-seen-"),
+            "mixed credentials must persist the OAuth account identity on first observation"
+        );
+        assert!(root.join(AGENT_ACCOUNTS_OPENCODE_IDENTITY_FILE).is_file());
+
+        let rotated_auth = json!({
+            "opencode-go": {"type": "api", "key": "api-after"},
+            "provider-oauth": {
+                "type": "oauth",
+                "access": "access-after",
+                "refresh": "refresh-after"
+            }
+        });
+        let rotated = agent_accounts_opencode_identity_with_first_seen(&rotated_auth, &root);
+        assert_eq!(rotated, first);
+        assert_eq!(
+            [first.clone(), rotated.clone()]
+                .into_iter()
+                .collect::<HashSet<_>>()
+                .len(),
+            1,
+            "rotating either credential in a mixed set must not create another account"
+        );
+        assert_eq!(
+            tokenomics_opencode_account_key_identifiers_with_stable(&first_auth, Some(&first)),
+            tokenomics_opencode_account_key_identifiers_with_stable(
+                &rotated_auth,
+                Some(&rotated)
+            )
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn opencode_no_claim_then_claimed_token_rotation_keeps_one_identity() {
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_opencode_identity_rotation_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let no_claim = json!({
+            "provider-oauth": {
+                "type": "oauth",
+                "access": "first-access",
+                "refresh": "first-refresh"
+            }
+        });
+        let first = agent_accounts_opencode_identity_with_first_seen(&no_claim, &root);
+        assert!(first.contains("first-seen"));
+        let claimed = json!({
+            "provider-oauth": {
+                "type": "oauth",
+                "access": "rotated-access",
+                "refresh": "rotated-refresh",
+                "accountId": "provider-account-123"
+            }
+        });
+        assert_ne!(
+            agent_accounts_opencode_identity_from_auth(&claimed),
+            first,
+            "the later direct claim would have forked the account without the sidecar"
+        );
+        let rotated = agent_accounts_opencode_identity_with_first_seen(&claimed, &root);
+        assert_eq!(rotated, first);
+        assert_eq!(
+            tokenomics_opencode_account_key_identifiers_with_stable(&no_claim, Some(&first)),
+            tokenomics_opencode_account_key_identifiers_with_stable(&claimed, Some(&first)),
+            "tokenomics must prefer the immutable profile identity over a later direct claim"
+        );
+        let mixed = json!({
+            "opencode-go": {"type": "api", "key": "later-api-key"},
+            "provider-oauth": {
+                "type": "oauth",
+                "access": "rotated-again",
+                "refresh": "rotated-again",
+                "accountId": "provider-account-456"
+            }
+        });
+        assert_eq!(
+            agent_accounts_opencode_identity_with_first_seen(&mixed, &root),
+            first,
+            "a later API-key entry cannot bypass an existing first-seen sidecar"
+        );
+        assert!(
+            agent_accounts_opencode_identity_with_first_seen(&json!({}), &root).is_empty(),
+            "a persisted identity must not make logged-out or empty auth appear ready"
+        );
+        assert_eq!(
+            tokenomics_opencode_account_key_identifiers_with_stable(&mixed, Some(&first)),
+            vec![first.clone()]
+        );
+        let legacy_api = json!({"opencode-go": {"type": "api", "key": "legacy-key"}});
+        let legacy_identity = agent_accounts_opencode_identity_from_auth(&legacy_api);
+        assert!(legacy_identity.starts_with("opencode-go-"));
+        assert_eq!(
+            tokenomics_opencode_account_key_identifiers_with_stable(
+                &legacy_api,
+                Some(&legacy_identity),
+            ),
+            vec![tokenomics_hash("legacy-key")],
+            "API-only profiles retain their historical tokenomics key"
+        );
+        assert_eq!(
+            [first, rotated].into_iter().collect::<HashSet<_>>().len(),
+            1,
+            "token rotation must still describe exactly one captured account"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore]
+    fn opencode_first_seen_cross_process_helper() {
+        let Ok(root) = env::var("DIFFFORGE_TEST_OPENCODE_IDENTITY_HOME") else {
+            return;
+        };
+        let auth = json!({
+            "provider-oauth": {
+                "type": "oauth",
+                "access": "cross-process-access",
+                "refresh": "cross-process-refresh"
+            }
+        });
+        let identity = agent_accounts_opencode_identity_with_first_seen(&auth, Path::new(&root));
+        assert!(!identity.is_empty());
+    }
+
+    #[test]
+    fn opencode_first_seen_identity_is_single_across_backend_processes() {
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_opencode_cross_process_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let executable = env::current_exe().unwrap();
+        let mut children = Vec::new();
+        for _ in 0..4 {
+            children.push(
+                Command::new(&executable)
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "agent_accounts_tests::opencode_first_seen_cross_process_helper",
+                    ])
+                    .env("DIFFFORGE_TEST_OPENCODE_IDENTITY_HOME", &root)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        for mut child in children {
+            assert!(child.wait().unwrap().success());
+        }
+        let identity = agent_accounts_persisted_opencode_identity(
+            &root.join(AGENT_ACCOUNTS_OPENCODE_IDENTITY_FILE),
+        )
+        .expect("one backend must persist the shared first-seen identity");
+        let auth = json!({
+            "provider-oauth": {"type": "oauth", "access": "next", "refresh": "next"}
+        });
+        assert_eq!(
+            agent_accounts_opencode_identity_with_first_seen(&auth, &root),
+            identity
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_atomic_credential_temps_are_cleaned_with_a_bounded_prefix() {
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_stale_temp_cleanup_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..40 {
+            fs::write(root.join(format!(".auth.json.tmp-{index}")), b"partial").unwrap();
+        }
+        let unrelated = root.join(".another.json.tmp-1");
+        fs::write(&unrelated, b"keep").unwrap();
+        assert_eq!(
+            agent_accounts_cleanup_stale_private_file_temps(
+                &root,
+                "auth.json",
+                Duration::ZERO,
+            ),
+            32
+        );
+        assert!(unrelated.is_file());
+        assert_eq!(
+            fs::read_dir(&root)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with(".auth.json.tmp-"))
+                .count(),
+            8
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validated_auth_capture_commits_exact_bytes_and_rejects_changed_revision() {
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_atomic_snapshot_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("auth.json");
+        let destination = root.join("profile-auth.json");
+        let first =
+            test_codex_auth_for_account("same@example.com", "workspace-stable", "refresh-first");
+        fs::write(&source, first.as_bytes()).unwrap();
+        fs::write(&destination, b"old-destination").unwrap();
+        let validated = agent_accounts_read_json_snapshot_with_retry(&source).unwrap();
+
+        let replacement = root.join("auth.replacement.json");
+        fs::write(
+            &replacement,
+            test_codex_auth_for_account("same@example.com", "workspace-stable", "refresh-second"),
+        )
+        .unwrap();
+        fs::rename(&replacement, &source).unwrap();
+        assert_eq!(
+            agent_accounts_install_validated_auth_snapshot(
+                "codex",
+                &source,
+                &destination,
+                "codex-account:workspace-stable",
+                &validated,
+            ),
+            None,
+            "a changed source revision must never commit the earlier validation"
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"old-destination");
+
+        let current = agent_accounts_read_json_snapshot_with_retry(&source).unwrap();
+        assert_eq!(
+            agent_accounts_install_validated_auth_snapshot(
+                "codex",
+                &source,
+                &destination,
+                "codex-account:workspace-stable",
+                &current,
+            ),
+            Some(true)
+        );
+        assert_eq!(fs::read(&destination).unwrap(), current.file.bytes);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stable_json_retry_returns_immediately_when_file_is_absent() {
+        let missing = env::temp_dir().join(format!(
+            "agent_accounts_missing_{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let started = std::time::Instant::now();
+        assert!(agent_accounts_read_json_snapshot_with_retry(&missing).is_none());
+        assert!(
+            started.elapsed() < Duration::from_millis(80),
+            "NotFound must not pay the 500ms torn-write retry budget"
+        );
+    }
+
+    #[test]
+    fn stale_inventory_spans_workspaces_and_preserves_busy_state() {
+        let panes = json!({
+            "pane-a": { "kind": "codex", "profile_id": "old", "profile_label": "Old", "auth_revision": "r1", "refresh_token": "inventory-must-not-leak" },
+            "pane-b": { "kind": "codex", "profile_id": "old", "profile_label": "Old", "auth_revision": "r1" },
+            "pane-failed": { "kind": "codex", "profile_id": "old", "profile_label": "Old", "auth_revision": "r1" },
+            "pane-closed": { "kind": "codex", "profile_id": "old", "profile_label": "Old", "auth_revision": "r1" },
+            "pane-current": { "kind": "codex", "profile_id": "new", "profile_label": "New", "auth_revision": "r2" },
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let active = json!({
+            "codex": { "profile_id": "new", "profile_label": "New", "auth_revision": "r2" }
+        });
+        let live = HashMap::from([
+            (
+                "pane-a".to_string(),
+                json!({ "instance_id": 11, "launch_epoch": "pane-a:11", "workspace_id": "w1", "workspace_label": "Alpha", "terminal_index": 0, "activity": "idle", "open": true, "restart_eligible": true, "access_token": "live-terminal-secret" }),
+            ),
+            (
+                "pane-b".to_string(),
+                json!({ "instance_id": 12, "launch_epoch": "pane-b:12", "workspace_id": "w2", "workspace_label": "Beta", "terminal_index": 3, "activity": "needs_input", "open": true, "restart_eligible": false }),
+            ),
+            (
+                "pane-failed".to_string(),
+                json!({ "instance_id": 13, "launch_epoch": "pane-failed:13", "workspace_id": "w2", "workspace_label": "Beta", "terminal_index": 4, "activity": "failed", "open": true, "restart_eligible": false }),
+            ),
+            (
+                "pane-closed".to_string(),
+                json!({ "instance_id": 14, "launch_epoch": "pane-closed:14", "workspace_id": "w3", "workspace_label": "Closed", "terminal_index": 0, "activity": "closed", "open": false, "restart_eligible": false }),
+            ),
+        ]);
+        let inventory = agent_accounts_build_stale_inventory(&panes, &active, &live);
+        assert_eq!(inventory.len(), 3);
+        assert_eq!(inventory[0]["workspace_id"], "w1");
+        assert_eq!(inventory[0]["terminal_index"], 0);
+        assert_eq!(inventory[0]["idle"], true);
+        assert_eq!(inventory[0]["needs_restart"], true);
+        assert_eq!(inventory[1]["workspace_id"], "w2");
+        assert_eq!(inventory[1]["busy"], true);
+        assert_eq!(inventory[1]["activity"], "needs_input");
+        assert_eq!(inventory[1]["target_profile_id"], "new");
+        assert_eq!(inventory[2]["activity"], "failed");
+        assert!(!inventory.iter().any(|row| row["workspace_id"] == "w3"));
+        let allowed_fields = HashSet::from([
+            "kind",
+            "provider",
+            "workspace_id",
+            "workspace_label",
+            "pane_id",
+            "terminal_index",
+            "instance_id",
+            "launch_epoch",
+            "activity",
+            "busy",
+            "idle",
+            "restart_eligible",
+            "needs_restart",
+            "stamped_profile_id",
+            "stamped_profile_label",
+            "stamped_auth_revision",
+            "target_profile_id",
+            "target_profile_label",
+            "target_auth_revision",
+            "stale_reason",
+        ]);
+        for row in &inventory {
+            let keys = row
+                .as_object()
+                .expect("inventory rows are objects")
+                .keys()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            assert!(
+                keys.is_subset(&allowed_fields),
+                "stale inventory added a non-contract field: {:?}",
+                keys.difference(&allowed_fields).collect::<Vec<_>>()
+            );
+        }
+        let serialized = serde_json::to_string(&inventory).unwrap();
+        assert!(!serialized.contains("inventory-must-not-leak"));
+        assert!(!serialized.contains("live-terminal-secret"));
+        assert!(!serialized.contains("refresh_token"));
+        assert!(!serialized.contains("access_token"));
+        let provider_accounts = agent_accounts_device_live_state_payload(inventory.clone());
+        assert_eq!(
+            provider_accounts["stale_terminal_inventory"],
+            Value::Array(inventory),
+            "the secret-free native inventory is the provider_accounts sync source"
+        );
+    }
+
+    #[test]
+    fn stale_restart_eligibility_is_fail_closed() {
+        for phase in [
+            "starting",
+            "queued",
+            "running",
+            "compacting",
+            "needs_input",
+            "failed",
+            "offline",
+            "unknown",
+        ] {
+            assert!(
+                !agent_accounts_restart_eligible(phase, "open"),
+                "{phase} must remain stale"
+            );
+        }
+        for phase in ["idle", "completed", "cancelled", "interrupted"] {
+            assert!(agent_accounts_restart_eligible(phase, "open"), "{phase}");
+        }
+        assert!(!agent_accounts_restart_eligible("idle", "closed"));
+    }
+
+    #[test]
+    fn opencode_uses_xdg_nested_auth_and_oauth_identity() {
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_opencode_xdg_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let legacy = json!({
+            "provider-oauth": {
+                "type": "oauth",
+                "access": "access-token",
+                "refresh": "stable-refresh",
+                "accountId": "account-123",
+                "expires": 1234
+            }
+        });
+        fs::write(root.join("auth.json"), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(agent_accounts_migrate_opencode_profile_layout(&root).unwrap());
+        assert!(!agent_accounts_migrate_opencode_profile_layout(&root).unwrap());
+        assert_eq!(
+            agent_accounts_profile_auth_path("opencode", &root),
+            root.join("opencode/auth.json")
+        );
+        let identity = agent_accounts_profile_identity("opencode", Some(&root));
+        assert_eq!(identity["auth_ready"], true);
+        let identity_id = identity["email"].as_str().unwrap().to_string();
+        assert!(identity_id.starts_with("opencode-oauth-provider-oauth-"));
+        let refreshed = json!({
+            "provider-oauth": {
+                "type": "oauth",
+                "access": "rotated-access-token",
+                "refresh": "rotated-refresh-token",
+                "accountId": "account-123",
+                "expires": 9999
+            }
+        });
+        assert_eq!(
+            agent_accounts_opencode_identity_from_auth(&legacy),
+            agent_accounts_opencode_identity_from_auth(&refreshed),
+            "rotating OAuth secrets must not split one OpenCode account"
+        );
+        let command = agent_accounts_login_command("opencode", &root.to_string_lossy());
+        assert!(command.starts_with("XDG_DATA_HOME="));
+        assert!(!command.contains("OPENCODE_DATA_DIR"));
+        let mut env_vars = vec![
+            ("OPENCODE_DATA_DIR".to_string(), "legacy".to_string()),
+            ("XDG_DATA_HOME".to_string(), "stale".to_string()),
+        ];
+        agent_accounts_bind_opencode_env(&mut env_vars, &root);
+        assert_eq!(
+            env_vars,
+            vec![(
+                "XDG_DATA_HOME".to_string(),
+                root.to_string_lossy().to_string()
+            )]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn opencode_api_key_identity_preserves_legacy_prefix_and_first_provider_order() {
+        let auth = json!({
+            "custom-provider": { "type": "api", "key": "first-key" }
+        });
+        assert_eq!(
+            agent_accounts_opencode_identity_from_auth(&auth),
+            format!("opencode-go-{}", cloud_mcp_short_hash("first-key"))
+        );
+        let preferred = json!({
+            "z-provider": { "type": "api", "key": "first-key" },
+            "opencode-go": { "type": "api", "key": "go-key" }
+        });
+        assert_eq!(
+            agent_accounts_opencode_identity_from_auth(&preferred),
+            format!("opencode-go-{}", cloud_mcp_short_hash("go-key"))
+        );
+    }
+
+    #[test]
+    fn windows_managed_login_commands_use_powershell_environment_syntax() {
+        let dir = r"C:\Users\O'Brien\Diff Forge\profile";
+        assert_eq!(
+            agent_accounts_login_command_for_shell("codex", dir, true),
+            "$env:CODEX_HOME = 'C:\\Users\\O''Brien\\Diff Forge\\profile'; codex login --device-auth"
+        );
+        assert_eq!(
+            agent_accounts_login_command_for_shell("opencode", dir, true),
+            "$env:XDG_DATA_HOME = 'C:\\Users\\O''Brien\\Diff Forge\\profile'; opencode auth login"
+        );
+        assert_eq!(
+            agent_accounts_login_command_for_shell("claude", dir, true),
+            "$env:CLAUDE_CONFIG_DIR = 'C:\\Users\\O''Brien\\Diff Forge\\profile'; claude auth login"
+        );
+    }
+
+    #[test]
+    fn codex_file_auth_store_upsert_is_idempotent() {
+        let original = "model = \"gpt-5\"\n\n[projects.\"/tmp/repo\"]\ntrust_level = \"trusted\"\n";
+        let updated = agent_accounts_upsert_codex_file_auth_store(original);
+        assert!(updated.starts_with("model = \"gpt-5\"\n\ncli_auth_credentials_store = \"file\""));
+        assert_eq!(
+            updated
+                .matches("cli_auth_credentials_store = \"file\"")
+                .count(),
+            1
+        );
+        assert_eq!(
+            agent_accounts_upsert_codex_file_auth_store(&updated),
+            updated
+        );
     }
 
     fn test_write_codex_profile(dir: &Path, email: &str) {
@@ -6249,14 +9549,9 @@ mod agent_accounts_tests {
             &mut registry,
             "claude"
         ));
-        let profiles = registry["agents"]["claude"]["profiles"]
-            .as_array()
-            .unwrap();
+        let profiles = registry["agents"]["claude"]["profiles"].as_array().unwrap();
         assert_eq!(profiles[0]["label"].as_str(), Some("support"));
-        assert_eq!(
-            profiles[1]["label"].as_str(),
-            Some("support-diffforge.ai")
-        );
+        assert_eq!(profiles[1]["label"].as_str(), Some("support-diffforge.ai"));
         assert_eq!(profiles[1]["alias"].as_str(), Some("Work Support"));
 
         agent_accounts_registry_write(&registry).unwrap();
@@ -6302,11 +9597,7 @@ mod agent_accounts_tests {
             test_claude_state_for_email("support@example.test"),
         )
         .unwrap();
-        fs::write(
-            profile_dir.join(".credentials.json"),
-            "support-credentials",
-        )
-        .unwrap();
+        fs::write(profile_dir.join(".credentials.json"), "support-credentials").unwrap();
         let _home_env = ScopedAgentAccountsEnv::set("HOME", &home);
 
         assert!(!agent_accounts_snapshot_refresh(
@@ -6420,7 +9711,11 @@ mod agent_accounts_tests {
             test_claude_state_for_email("b@example.test"),
         )
         .unwrap();
-        fs::write(profile_dir.join(".credentials.json"), "account-b-credentials").unwrap();
+        fs::write(
+            profile_dir.join(".credentials.json"),
+            "account-b-credentials",
+        )
+        .unwrap();
         fs::write(profile_dir.join("settings.json"), "settings").unwrap();
         let _home_env = ScopedAgentAccountsEnv::set("HOME", &home);
 
@@ -6599,15 +9894,12 @@ mod agent_accounts_tests {
         });
         let _home_env = ScopedAgentAccountsEnv::set("HOME", &home);
 
-        let result = agent_accounts_reconcile_captured_claude_identities(
-            &mut registry,
-            "syed@example.test",
-        );
+        let result =
+            agent_accounts_reconcile_captured_claude_identities(&mut registry, "syed@example.test");
         assert!(result.changed());
-        let captured_state = serde_json::from_slice::<Value>(
-            &fs::read(captured_dir.join(".claude.json")).unwrap(),
-        )
-        .unwrap();
+        let captured_state =
+            serde_json::from_slice::<Value>(&fs::read(captured_dir.join(".claude.json")).unwrap())
+                .unwrap();
         assert!(captured_state.get("oauthAccount").is_none());
         assert!(captured_state.get("projects").is_some());
         assert!(!captured_dir.join(".credentials.json").exists());
@@ -6804,11 +10096,10 @@ mod agent_accounts_tests {
         }))
         .unwrap();
 
-        assert!(agent_accounts_prepare_captured_claude_profile_login(
-            "cap-support",
-            &captured_dir
-        )
-        .unwrap());
+        assert!(
+            agent_accounts_prepare_captured_claude_profile_login("cap-support", &captured_dir)
+                .unwrap()
+        );
         assert_eq!(
             agent_accounts_profile_identity("claude", Some(&captured_dir))["email"].as_str(),
             Some("")
@@ -6932,12 +10223,8 @@ mod agent_accounts_tests {
         let default_claude_home = home.join(".claude");
         let profile_root = data.join(AGENT_ACCOUNTS_PROFILE_DIR);
         let old_email = "support@example.test";
-        let rebound_id = agent_accounts_available_capture_profile_id(
-            "claude",
-            old_email,
-            &[],
-            &profile_root,
-        );
+        let rebound_id =
+            agent_accounts_available_capture_profile_id("claude", old_email, &[], &profile_root);
         let rebound_dir = profile_root.join("claude").join(&rebound_id);
         fs::create_dir_all(&default_claude_home).unwrap();
         fs::create_dir_all(&rebound_dir).unwrap();
@@ -6989,10 +10276,7 @@ mod agent_accounts_tests {
             test_claude_state_for_email("admin@example.test"),
         )
         .unwrap();
-        let result = agent_accounts_reconcile_captured_claude_identities(
-            &mut registry,
-            old_email,
-        );
+        let result = agent_accounts_reconcile_captured_claude_identities(&mut registry, old_email);
         assert!(result.registry_changed);
         agent_accounts_registry_write(&registry).unwrap();
         agent_accounts_clear_profile_login_marker(&rebound_dir);
@@ -7003,14 +10287,22 @@ mod agent_accounts_tests {
         assert_eq!(profiles.len(), 2);
         let rebound = profiles
             .iter()
-            .find(|profile| profile.get("email").and_then(Value::as_str) == Some("admin@example.test"))
+            .find(|profile| {
+                profile.get("email").and_then(Value::as_str) == Some("admin@example.test")
+            })
             .unwrap();
         let recaptured = profiles
             .iter()
             .find(|profile| profile.get("email").and_then(Value::as_str) == Some(old_email))
             .unwrap();
-        assert_eq!(rebound.get("id").and_then(Value::as_str), Some(rebound_id.as_str()));
-        assert_ne!(recaptured.get("id").and_then(Value::as_str), Some(rebound_id.as_str()));
+        assert_eq!(
+            rebound.get("id").and_then(Value::as_str),
+            Some(rebound_id.as_str())
+        );
+        assert_ne!(
+            recaptured.get("id").and_then(Value::as_str),
+            Some(rebound_id.as_str())
+        );
         assert_ne!(
             agent_accounts_profile_dir(recaptured).as_deref(),
             Some(rebound_dir.as_path())
@@ -7110,6 +10402,7 @@ mod agent_accounts_tests {
                         {
                             "id": "cap-admin",
                             "email": "admin@example.com",
+                            "identity_id": "codex-account:acct-admin@example.com",
                             "alias": "Admin",
                             "label": "admin",
                             "source": "captured",
@@ -7118,6 +10411,7 @@ mod agent_accounts_tests {
                         {
                             "id": "cap-work",
                             "email": "work@example.com",
+                            "identity_id": "codex-account:acct-work@example.com",
                             "label": "work",
                             "source": "captured",
                             "dir": work_dir.to_string_lossy().to_string(),
@@ -7443,7 +10737,14 @@ mod agent_accounts_tests {
         let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data);
 
         let mut env_vars = Vec::new();
-        agent_accounts_apply_spawn_env(&mut env_vars, "pane-test-claude", "claude");
+        agent_accounts_apply_spawn_env(
+            &mut env_vars,
+            "pane-test-claude",
+            "claude",
+            Some("workspace-a"),
+            Some("Workspace A"),
+            Some(2),
+        );
         let launch_dir = env_vars
             .iter()
             .find_map(|(key, value)| (key == "CLAUDE_CONFIG_DIR").then(|| PathBuf::from(value)))
@@ -7473,7 +10774,14 @@ mod agent_accounts_tests {
     #[test]
     fn spawn_env_skips_unsupported_providers() {
         let mut env_vars = Vec::new();
-        agent_accounts_apply_spawn_env(&mut env_vars, "pane-test-unsupported", "generic");
+        agent_accounts_apply_spawn_env(
+            &mut env_vars,
+            "pane-test-unsupported",
+            "generic",
+            None,
+            None,
+            None,
+        );
         assert!(env_vars.is_empty());
     }
 
@@ -7487,7 +10795,7 @@ mod agent_accounts_tests {
         // CODEX_HOME must win; this asserts the guard path compiles and the
         // managed entry survives untouched.
         let mut env_vars = vec![("CODEX_HOME".to_string(), "/tmp/managed".to_string())];
-        agent_accounts_apply_spawn_env(&mut env_vars, "pane-test-codex", "codex");
+        agent_accounts_apply_spawn_env(&mut env_vars, "pane-test-codex", "codex", None, None, None);
         assert_eq!(
             env_vars
                 .iter()
@@ -7759,8 +11067,7 @@ mod agent_accounts_tests {
             identity_email: String::new(),
             delivered: false,
             created_at_ms: todo_dispatch_now_ms(),
-            expires_at_ms: todo_dispatch_now_ms()
-                .saturating_add(AGENT_ACCOUNT_PUSH_BLOB_TTL_MS),
+            expires_at_ms: todo_dispatch_now_ms().saturating_add(AGENT_ACCOUNT_PUSH_BLOB_TTL_MS),
             ack_nonce_b64: String::new(),
             target_push_public_key_b64: String::new(),
             source_credentials_sha256: String::new(),
@@ -7875,8 +11182,7 @@ mod agent_accounts_tests {
         let local_key = agent_account_push_public_key_metadata().unwrap();
         let local_public = agent_account_push_decode_public_key(&local_key.public_key_b64).unwrap();
         let local_device = cloud_mcp_desktop_device_profile();
-        let local_device_id =
-            cloud_mcp_payload_text(&local_device, &["device_id"]).unwrap();
+        let local_device_id = cloud_mcp_payload_text(&local_device, &["device_id"]).unwrap();
         let target_secret = crypto_box::SecretKey::from(agent_account_push_random_32().unwrap());
         let target_public_b64 =
             general_purpose::STANDARD.encode(target_secret.public_key().as_bytes());
@@ -7907,13 +11213,9 @@ mod agent_accounts_tests {
                 .unwrap(),
             todo_dispatch_now_ms(),
         ));
-        let payload = agent_account_push_ack_payload(
-            "push-stale",
-            &nonce_b64,
-            &local_device_id,
-            "device-b",
-        )
-        .unwrap();
+        let payload =
+            agent_account_push_ack_payload("push-stale", &nonce_b64, &local_device_id, "device-b")
+                .unwrap();
         let shared = x25519_dalek::x25519(target_secret.to_bytes(), local_public);
         let mut mac = hmac::Hmac::<Sha256>::new_from_slice(&shared).unwrap();
         mac.update(b"diffforge.agent_account_push.ack.v2\0");
@@ -8007,8 +11309,7 @@ mod agent_accounts_tests {
         let local_key = agent_account_push_public_key_metadata().unwrap();
         let local_public = agent_account_push_decode_public_key(&local_key.public_key_b64).unwrap();
         let local_device = cloud_mcp_desktop_device_profile();
-        let local_device_id =
-            cloud_mcp_payload_text(&local_device, &["device_id"]).unwrap();
+        let local_device_id = cloud_mcp_payload_text(&local_device, &["device_id"]).unwrap();
         let target_secret = crypto_box::SecretKey::from(agent_account_push_random_32().unwrap());
         let target_public_b64 =
             general_purpose::STANDARD.encode(target_secret.public_key().as_bytes());

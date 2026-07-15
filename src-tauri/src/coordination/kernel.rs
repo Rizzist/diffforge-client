@@ -59,14 +59,7 @@ const MCP_CLIENT_EVENT_TYPES: &[&str] = &[
     "mcp_agent_tool_called",
     "mcp_agent_tool_failed",
 ];
-const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] = &[
-    "start_task",
-    "acquire_lease",
-    "checkpoint",
-    "complete_task",
-    "submit_patch",
-    "submit_patch_status",
-];
+const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] = crate::coordination::mcp::TOOL_NAMES;
 const CLAUDE_AUTO_APPROVED_REPO_VIEW_TOOLS: &[&str] = &["Read", "Glob", "Grep", "LS"];
 const WORKSPACE_MCP_GATEWAY_TOOLS: &[&str] = &[
     "workspace_mcp__sync_manifest",
@@ -83,6 +76,13 @@ const WORKSPACE_MCP_GATEWAY_TOOLS: &[&str] = &[
     "secrets__ssh_list",
     "secrets__ssh_connect",
     "secrets__ssh_get",
+    "video_context",
+    "video_edit",
+    "video_transcribe",
+    "video_look",
+    "video_media",
+    "video_generate",
+    "video_export",
 ];
 const WORKSPACE_MCP_SECRETS_TOOLS: &[&str] = &[
     "secrets__list",
@@ -1681,9 +1681,7 @@ fn ensure_native_global_mcp_approval_policy(
 }
 
 fn codex_global_config_path() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".codex").join("config.toml"))
+    crate::user_home_dir().map(|home| home.join(".codex").join("config.toml"))
 }
 
 fn ensure_codex_mcp_server_approval_policy(
@@ -1766,9 +1764,7 @@ fn codex_config_with_mcp_server_approval_mode(
 }
 
 fn claude_user_settings_path() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".claude").join("settings.json"))
+    crate::user_home_dir().map(|home| home.join(".claude").join("settings.json"))
 }
 
 fn claude_mcp_server_allow_rule(server_key: &str) -> Option<String> {
@@ -7267,6 +7263,7 @@ impl CoordinationKernel {
             &write_root,
             &enforcement_mode,
             &mcp_command,
+            &codex_mcp_config_path,
             &self.inherited_global_mcp_servers_for_workspace(workspace_id),
         )?;
 
@@ -7445,6 +7442,7 @@ impl CoordinationKernel {
             &write_root,
             &enforcement_mode,
             &mcp_command,
+            &codex_mcp_config_path,
             &self.inherited_global_mcp_servers_for_workspace(workspace_id),
         )?;
 
@@ -9883,7 +9881,7 @@ impl CoordinationKernel {
         let mut registry = global_mcp_load_registry()?;
         let mut changed = false;
         let mut discovered = Vec::new();
-        if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        if let Some(home) = crate::user_home_dir() {
             discovered.extend(read_codex_native_mcp_servers(
                 &home.join(".codex").join("config.toml"),
             )?);
@@ -25834,6 +25832,7 @@ fn prepare_managed_codex_profile_for_terminal(
     write_root: &str,
     enforcement_mode: &str,
     mcp_command: &str,
+    codex_mcp_config_path: &str,
     inherited_global_mcp_servers: &[Value],
 ) -> Result<ManagedCodexProfileLaunch, String> {
     if !agent_kind.to_ascii_lowercase().contains("codex") {
@@ -25865,11 +25864,18 @@ fn prepare_managed_codex_profile_for_terminal(
             }
         });
     let profile = codex_managed_profile_name(&paths.repo_path, &slot_segment);
+    let managed_mcp_config = fs::read_to_string(codex_mcp_config_path).map_err(|error| {
+        format!(
+            "Unable to read Diff Forge managed Codex MCP config {}: {error}",
+            codex_mcp_config_path
+        )
+    })?;
     let profile_home = codex_profile_home_for_launch(
         paths,
         &slot_segment,
         Path::new(write_root),
         enforcement_mode,
+        &managed_mcp_config,
         inherited_global_mcp_servers,
     )?;
     let profile_path = profile_home.join(format!("{profile}.config.toml"));
@@ -25934,6 +25940,7 @@ fn codex_profile_home_for_launch(
     slot_segment: &str,
     write_root: &Path,
     enforcement_mode: &str,
+    managed_mcp_config: &str,
     inherited_global_mcp_servers: &[Value],
 ) -> Result<PathBuf, String> {
     let home = crate::coordination::db::coordination_repo_state_root(&paths.repo_path)
@@ -25951,6 +25958,7 @@ fn codex_profile_home_for_launch(
         &paths.repo_path,
         write_root,
         enforcement_mode,
+        managed_mcp_config,
         inherited_global_mcp_servers,
     )?;
     Ok(home)
@@ -25961,6 +25969,7 @@ fn codex_prepare_private_home(
     repo_path: &Path,
     write_root: &Path,
     enforcement_mode: &str,
+    managed_mcp_config: &str,
     inherited_global_mcp_servers: &[Value],
 ) -> Result<(), String> {
     let trust_sources = codex_private_home_project_trust_source_paths(home);
@@ -25969,20 +25978,16 @@ fn codex_prepare_private_home(
         repo_path,
         write_root,
         enforcement_mode,
+        Some(managed_mcp_config),
         inherited_global_mcp_servers,
-    );
+    )?;
     write_text_file_atomic(&home.join("config.toml"), &config)?;
 
     let Some(source_home) = codex_user_home_for_auth_bridge() else {
         return Ok(());
     };
     for file_name in ["auth.json", "installation_id", "version.json"] {
-        codex_bridge_private_home_file(
-            &source_home.home,
-            home,
-            file_name,
-            source_home.copy_auth_json && file_name == "auth.json",
-        )?;
+        codex_bridge_private_home_file(&source_home.home, home, file_name)?;
     }
     Ok(())
 }
@@ -25992,9 +25997,10 @@ fn codex_private_home_base_config(
     repo_path: &Path,
     write_root: &Path,
     enforcement_mode: &str,
+    managed_mcp_config: Option<&str>,
     inherited_global_mcp_servers: &[Value],
-) -> String {
-    let mut config = "# Diff Forge managed Codex home. Workspace terminals inherit trusted project entries and unshadowed global MCP servers, but not global plugins or apps.\n".to_string();
+) -> Result<String, String> {
+    let mut config = "# Diff Forge managed Codex home. Workspace terminals inherit trusted project entries and unshadowed global MCP servers, but not global plugins or apps. Diff Forge managed permissions and pane MCPs are materialized here so the pane-owned app-server receives them without request config.\ncli_auth_credentials_store = \"file\"\n\n[shell_environment_policy]\ninherit = \"all\"\n".to_string();
     let mut seen = HashSet::new();
     for path in trust_source_paths {
         let Ok(body) = fs::read_to_string(path) else {
@@ -26012,8 +26018,59 @@ fn codex_private_home_base_config(
     if !config.ends_with('\n') {
         config.push('\n');
     }
+    if let Some(managed_mcp_config) = managed_mcp_config {
+        append_codex_managed_pane_mcp_servers(&mut config, managed_mcp_config)?;
+    }
     append_codex_inherited_global_mcp_servers(&mut config, inherited_global_mcp_servers);
-    config
+    append_codex_managed_permission_profile(
+        config,
+        repo_path,
+        write_root,
+        enforcement_mode,
+        None,
+        "codex",
+        None,
+    )
+}
+
+pub(crate) fn codex_managed_home_set_app_control_instructions(
+    home: &Path,
+    enabled: bool,
+) -> Result<(), String> {
+    let path = home.join("config.toml");
+    let body = fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "Unable to read managed Codex config {}: {error}",
+            path.display()
+        )
+    })?;
+    let mut config = toml::from_str::<toml::Value>(&body).map_err(|error| {
+        format!(
+            "Unable to parse managed Codex config {}: {error}",
+            path.display()
+        )
+    })?;
+    let root = config.as_table_mut().ok_or_else(|| {
+        format!(
+            "Managed Codex config {} must contain a TOML table.",
+            path.display()
+        )
+    })?;
+    if enabled {
+        root.insert(
+            "developer_instructions".to_string(),
+            toml::Value::String(crate::APP_CONTROL_ORCHESTRATOR_SYSTEM_PROMPT.to_string()),
+        );
+    } else {
+        root.remove("developer_instructions");
+    }
+    let next = toml::to_string_pretty(&config).map_err(|error| {
+        format!(
+            "Unable to serialize managed Codex config {}: {error}",
+            path.display()
+        )
+    })?;
+    write_text_file_atomic(&path, &next)
 }
 
 fn codex_private_home_project_trust_source_paths(home: &Path) -> Vec<PathBuf> {
@@ -26129,35 +26186,26 @@ fn codex_project_trust_line_is_trusted(line: &str) -> bool {
 #[derive(Debug, Clone)]
 struct CodexAuthBridgeSource {
     home: PathBuf,
-    copy_auth_json: bool,
 }
 
 fn codex_user_home_for_auth_bridge() -> Option<CodexAuthBridgeSource> {
-    // Prefer a stable agent-account snapshot. Falling back to the mutable
-    // default home is allowed, but auth.json is copied so later account logins
-    // do not rewrite already launched managed Codex homes through a symlink.
+    // Prefer a stable agent-account snapshot. Every managed home links to the
+    // one authoritative auth.json; independent refresh-token copies are never
+    // created.
     if let Some(profile_home) = crate::agent_accounts_codex_home_for_launch() {
-        return Some(CodexAuthBridgeSource {
-            home: profile_home,
-            copy_auth_json: false,
-        });
+        return Some(CodexAuthBridgeSource { home: profile_home });
     }
     env::var_os("CODEX_HOME")
         .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-        .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".codex")))
+        .or_else(|| crate::user_home_dir().map(|home| home.join(".codex")))
         .filter(|path| path.exists())
-        .map(|home| CodexAuthBridgeSource {
-            home,
-            copy_auth_json: true,
-        })
+        .map(|home| CodexAuthBridgeSource { home })
 }
 
 fn codex_bridge_private_home_file(
     source_home: &Path,
     private_home: &Path,
     file_name: &str,
-    copy_file: bool,
 ) -> Result<(), String> {
     let source = source_home.join(file_name);
     if !source.is_file() {
@@ -26165,11 +26213,7 @@ fn codex_bridge_private_home_file(
     }
     let destination = private_home.join(file_name);
     if fs::symlink_metadata(&destination).is_ok() {
-        let source_key = source.canonicalize().unwrap_or_else(|_| source.clone());
-        let destination_key = destination
-            .canonicalize()
-            .unwrap_or_else(|_| destination.clone());
-        if !copy_file && source_key == destination_key {
+        if codex_paths_refer_to_same_file(&source, &destination) {
             return Ok(());
         }
         fs::remove_file(&destination).map_err(|error| {
@@ -26178,18 +26222,6 @@ fn codex_bridge_private_home_file(
                 destination.display()
             )
         })?;
-    }
-    if copy_file {
-        fs::copy(&source, &destination)
-            .map(|_| ())
-            .map_err(|error| {
-                format!(
-                    "Unable to copy Codex file {} into managed home {}: {error}",
-                    source.display(),
-                    private_home.display()
-                )
-            })?;
-        return Ok(());
     }
     codex_link_or_copy_private_home_file(&source, &destination).map_err(|error| {
         format!(
@@ -26200,21 +26232,74 @@ fn codex_bridge_private_home_file(
     })
 }
 
+fn codex_paths_refer_to_same_file(source: &Path, destination: &Path) -> bool {
+    if let (Ok(source_key), Ok(destination_key)) =
+        (source.canonicalize(), destination.canonicalize())
+    {
+        if source_key == destination_key {
+            return true;
+        }
+    }
+    let (Ok(source_metadata), Ok(destination_metadata)) =
+        (fs::metadata(source), fs::metadata(destination))
+    else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        return source_metadata.dev() == destination_metadata.dev()
+            && source_metadata.ino() == destination_metadata.ino();
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        return codex_windows_file_ids_match(
+            source_metadata.volume_serial_number(),
+            source_metadata.file_index(),
+            destination_metadata.volume_serial_number(),
+            destination_metadata.file_index(),
+        );
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+#[cfg(any(windows, test))]
+fn codex_windows_file_ids_match(
+    source_volume: Option<u32>,
+    source_index: Option<u64>,
+    destination_volume: Option<u32>,
+    destination_index: Option<u64>,
+) -> bool {
+    matches!(
+        (
+            source_volume,
+            source_index,
+            destination_volume,
+            destination_index,
+        ),
+        (Some(source_volume), Some(source_index), Some(destination_volume), Some(destination_index))
+            if source_volume == destination_volume && source_index == destination_index
+    )
+}
+
 #[cfg(unix)]
 fn codex_link_or_copy_private_home_file(source: &Path, destination: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(source, destination)
-        .or_else(|_| fs::copy(source, destination).map(|_| ()))
 }
 
 #[cfg(windows)]
 fn codex_link_or_copy_private_home_file(source: &Path, destination: &Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_file(source, destination)
-        .or_else(|_| fs::copy(source, destination).map(|_| ()))
+        .or_else(|_| fs::hard_link(source, destination))
 }
 
 #[cfg(not(any(unix, windows)))]
 fn codex_link_or_copy_private_home_file(source: &Path, destination: &Path) -> std::io::Result<()> {
-    fs::copy(source, destination).map(|_| ())
+    fs::hard_link(source, destination)
 }
 
 fn codex_managed_profile_name(repo_path: &Path, slot_segment: &str) -> String {
@@ -26253,7 +26338,7 @@ fn codex_managed_profile_config(
     agent_kind: &str,
     hooks_config: Option<&str>,
 ) -> Result<String, String> {
-    let mut config = String::new();
+    let mut config = "cli_auth_credentials_store = \"file\"\n".to_string();
     config = ensure_codex_project_trust_entry(&config, repo_path);
     config = ensure_codex_project_trust_entry(&config, write_root);
     if codex_architecture_graphs_write_enabled(enforcement_mode) {
@@ -26854,11 +26939,65 @@ fn codex_config_toml_with_gateway_tools_and_global_servers(
     config
 }
 
+fn append_codex_managed_pane_mcp_servers(
+    config: &mut String,
+    managed_mcp_config: &str,
+) -> Result<(), String> {
+    let source = toml::from_str::<toml::Value>(managed_mcp_config)
+        .map_err(|error| format!("Unable to parse Diff Forge managed Codex MCP config: {error}"))?;
+    let source_servers = source
+        .get("mcp_servers")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| {
+            "Diff Forge managed Codex MCP config is missing `mcp_servers`.".to_string()
+        })?;
+    let mut selected_servers = toml::map::Map::new();
+    for server_key in ["coordination-kernel", "workspace-mcp-gateway"] {
+        let mut server = source_servers.get(server_key).cloned().ok_or_else(|| {
+            format!("Diff Forge managed Codex MCP config is missing `{server_key}`.")
+        })?;
+        let server_table = server.as_table_mut().ok_or_else(|| {
+            format!("Diff Forge managed Codex MCP server `{server_key}` is not a table.")
+        })?;
+        server_table.insert("enabled".to_string(), toml::Value::Boolean(true));
+        selected_servers.insert(server_key.to_string(), server);
+    }
+
+    let mut root = toml::map::Map::new();
+    root.insert(
+        "mcp_servers".to_string(),
+        toml::Value::Table(selected_servers),
+    );
+    let managed = toml::to_string(&toml::Value::Table(root)).map_err(|error| {
+        format!("Unable to serialize Diff Forge managed Codex MCP config: {error}")
+    })?;
+    if !config.ends_with('\n') {
+        config.push('\n');
+    }
+    config.push('\n');
+    config.push_str(&managed);
+    Ok(())
+}
+
 fn append_codex_inherited_global_mcp_servers(
     config: &mut String,
     inherited_global_servers: &[Value],
 ) {
-    let mut seen = HashSet::new();
+    let mut seen = toml::from_str::<toml::Value>(config)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("mcp_servers")
+                .and_then(toml::Value::as_table)
+                .cloned()
+        })
+        .map(|servers| {
+            servers
+                .into_iter()
+                .map(|(server_key, _)| server_key)
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
     for server in inherited_global_servers {
         if !global_mcp_server_provider_supports_codex(server) {
             continue;
@@ -29582,6 +29721,43 @@ mod tests {
         assert!(first
             .env_vars()
             .contains(&("CODEX_HOME".to_string(), first_codex_home.to_string())));
+        let first_base =
+            fs::read_to_string(PathBuf::from(first_codex_home).join("config.toml")).unwrap();
+        let first_base = toml::from_str::<toml::Value>(&first_base).unwrap();
+        assert_eq!(
+            first_base["default_permissions"].as_str(),
+            Some("diffforge-coordinated")
+        );
+        assert_eq!(
+            first_base["permissions"]["diffforge-coordinated"]["filesystem"][":root"].as_str(),
+            Some("write")
+        );
+        assert_eq!(
+            first_base["shell_environment_policy"]["inherit"].as_str(),
+            Some("all")
+        );
+        for server_key in ["coordination-kernel", "workspace-mcp-gateway"] {
+            assert_eq!(
+                first_base["mcp_servers"][server_key]["enabled"].as_bool(),
+                Some(true)
+            );
+            assert_eq!(
+                first_base["mcp_servers"][server_key]["default_tools_approval_mode"].as_str(),
+                Some("prompt")
+            );
+        }
+        assert_eq!(
+            first_base["mcp_servers"]["coordination-kernel"]["tools"]["start_task"]
+                ["approval_mode"]
+                .as_str(),
+            Some("approve")
+        );
+        assert_eq!(
+            first_base["mcp_servers"]["workspace-mcp-gateway"]["tools"]
+                ["workspace_mcp__sync_manifest"]["approval_mode"]
+                .as_str(),
+            Some("approve")
+        );
     }
 
     #[test]
@@ -29940,33 +30116,209 @@ mod tests {
             &repo,
             &worktree,
             "worktree_required",
+            None,
             &[test_global_mcp_server("github", "manual")],
-        );
+        )
+        .unwrap();
 
         assert!(config.contains("[mcp_servers.github]"));
+        assert!(config.contains("cli_auth_credentials_store = \"file\""));
         assert!(config.contains("default_tools_approval_mode = \"prompt\""));
         assert!(config.contains("[mcp_servers.github.env]"));
         assert!(config.contains("TEST_TOKEN = \"secret\""));
     }
 
     #[test]
-    fn managed_codex_auth_copy_replaces_mutable_default_symlink() {
+    fn managed_codex_private_home_materializes_pane_mcps_and_permission_posture() {
+        let repo = init_git_repo("managed_codex_private_home_pane_policy");
+        let worktree = repo.join(".agents").join("worktrees").join("4");
+        fs::create_dir_all(&worktree).unwrap();
+        let managed_mcp = codex_config_toml_with_gateway_tools_and_global_servers(
+            "/opt/diffforge",
+            &[
+                "--coordination-mcp-proxy".to_string(),
+                "--repo-path".to_string(),
+                process_path_text(&repo),
+            ],
+            &["appwrite-api__appwrite_search_tools".to_string()],
+            &[],
+        );
+
+        let config = codex_private_home_base_config(
+            &[],
+            &repo,
+            &worktree,
+            "worktree_required",
+            Some(&managed_mcp),
+            &[test_global_mcp_server("github", "manual")],
+        )
+        .unwrap();
+        let parsed = toml::from_str::<toml::Value>(&config).unwrap();
+
+        assert_eq!(
+            parsed["default_permissions"].as_str(),
+            Some("diffforge-coordinated")
+        );
+        assert_eq!(
+            parsed["permissions"]["diffforge-coordinated"]["filesystem"][":root"].as_str(),
+            Some("write")
+        );
+        assert_eq!(
+            parsed["shell_environment_policy"]["inherit"].as_str(),
+            Some("all")
+        );
+        assert!(parsed.get("developer_instructions").is_none());
+        for server_key in ["coordination-kernel", "workspace-mcp-gateway"] {
+            let server = &parsed["mcp_servers"][server_key];
+            assert_eq!(server["enabled"].as_bool(), Some(true));
+            assert_eq!(server["command"].as_str(), Some("/opt/diffforge"));
+            assert_eq!(
+                server["default_tools_approval_mode"].as_str(),
+                Some("prompt")
+            );
+        }
+        let coordination_args = parsed["mcp_servers"]["coordination-kernel"]["args"]
+            .as_array()
+            .unwrap();
+        assert!(coordination_args
+            .iter()
+            .any(|arg| arg.as_str() == Some("--coordination-mcp-proxy")));
+        let gateway_args = parsed["mcp_servers"]["workspace-mcp-gateway"]["args"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            gateway_args.first().and_then(toml::Value::as_str),
+            Some("--workspace-mcp-gateway")
+        );
+        for tool in crate::coordination::mcp::TOOL_NAMES {
+            assert_eq!(
+                parsed["mcp_servers"]["coordination-kernel"]["tools"][*tool]["approval_mode"]
+                    .as_str(),
+                Some("approve"),
+                "missing managed coordination approval for {tool}"
+            );
+        }
+        for tool in WORKSPACE_MCP_GATEWAY_TOOLS {
+            assert_eq!(
+                parsed["mcp_servers"]["workspace-mcp-gateway"]["tools"][*tool]["approval_mode"]
+                    .as_str(),
+                Some("approve"),
+                "missing managed gateway approval for {tool}"
+            );
+        }
+        assert_eq!(
+            parsed["mcp_servers"]["workspace-mcp-gateway"]["tools"]
+                ["appwrite-api__appwrite_search_tools"]["approval_mode"]
+                .as_str(),
+            Some("approve")
+        );
+        assert_eq!(
+            parsed["mcp_servers"]["github"]["command"].as_str(),
+            Some("uvx")
+        );
+        assert!(parsed["mcp_servers"].get("diffforge-app-control").is_none());
+        assert_eq!(config.matches("[mcp_servers.github]").count(), 1);
+    }
+
+    #[test]
+    fn managed_codex_app_control_instructions_are_materialized_only_when_enabled() {
+        let home = temp_repo("managed_codex_conditional_app_control_instructions");
+        fs::write(
+            home.join("config.toml"),
+            "cli_auth_credentials_store = \"file\"\n\n[shell_environment_policy]\ninherit = \"all\"\n",
+        )
+        .unwrap();
+
+        codex_managed_home_set_app_control_instructions(&home, true).unwrap();
+        let enabled =
+            toml::from_str::<toml::Value>(&fs::read_to_string(home.join("config.toml")).unwrap())
+                .unwrap();
+        assert_eq!(
+            enabled["developer_instructions"].as_str(),
+            Some(crate::APP_CONTROL_ORCHESTRATOR_SYSTEM_PROMPT)
+        );
+        assert_eq!(
+            enabled["shell_environment_policy"]["inherit"].as_str(),
+            Some("all")
+        );
+
+        codex_managed_home_set_app_control_instructions(&home, false).unwrap();
+        let disabled =
+            toml::from_str::<toml::Value>(&fs::read_to_string(home.join("config.toml")).unwrap())
+                .unwrap();
+        assert!(disabled.get("developer_instructions").is_none());
+        assert_eq!(
+            disabled["shell_environment_policy"]["inherit"].as_str(),
+            Some("all")
+        );
+    }
+
+    #[test]
+    fn managed_codex_auth_bridge_stays_authoritative_in_both_directions() {
         let source = temp_repo("codex_auth_bridge_source");
         let managed = temp_repo("codex_auth_bridge_managed");
         fs::write(source.join("auth.json"), "account-a").unwrap();
 
-        codex_bridge_private_home_file(&source, &managed, "auth.json", false).unwrap();
-        codex_bridge_private_home_file(&source, &managed, "auth.json", true).unwrap();
+        codex_bridge_private_home_file(&source, &managed, "auth.json").unwrap();
         fs::write(source.join("auth.json"), "account-b").unwrap();
 
         assert_eq!(
             fs::read_to_string(managed.join("auth.json")).unwrap(),
-            "account-a"
+            "account-b"
         );
-        assert!(!fs::symlink_metadata(managed.join("auth.json"))
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        fs::write(managed.join("auth.json"), "account-c").unwrap();
+        assert_eq!(
+            fs::read_to_string(source.join("auth.json")).unwrap(),
+            "account-c"
+        );
+    }
+
+    #[test]
+    fn managed_codex_auth_bridge_keeps_existing_hardlink_idempotently() {
+        let source = temp_repo("codex_auth_hardlink_source");
+        let managed = temp_repo("codex_auth_hardlink_managed");
+        let source_auth = source.join("auth.json");
+        let destination_auth = managed.join("auth.json");
+        fs::write(&source_auth, "account-a").unwrap();
+        fs::hard_link(&source_auth, &destination_auth).unwrap();
+        assert!(codex_paths_refer_to_same_file(
+            &source_auth,
+            &destination_auth
+        ));
+        let before = fs::metadata(&destination_auth).unwrap();
+        codex_bridge_private_home_file(&source, &managed, "auth.json").unwrap();
+        let after = fs::metadata(&destination_auth).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt as _;
+            assert_eq!(
+                (before.volume_serial_number(), before.file_index()),
+                (after.volume_serial_number(), after.file_index())
+            );
+        }
+    }
+
+    #[test]
+    fn windows_same_file_ids_fail_closed_when_metadata_ids_are_missing() {
+        assert!(!codex_windows_file_ids_match(None, None, None, None));
+        assert!(!codex_windows_file_ids_match(Some(7), None, Some(7), None));
+        assert!(!codex_windows_file_ids_match(
+            Some(7),
+            Some(11),
+            Some(7),
+            Some(12)
+        ));
+        assert!(codex_windows_file_ids_match(
+            Some(7),
+            Some(11),
+            Some(7),
+            Some(11)
+        ));
     }
 
     #[test]
@@ -30102,8 +30454,10 @@ enabled = true
             &repo,
             &worktree,
             "worktree_required",
+            None,
             &[],
-        );
+        )
+        .unwrap();
 
         assert!(config.contains(&format!(
             "[projects.\"{}\"]\ntrust_level = \"trusted\"",

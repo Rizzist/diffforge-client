@@ -2,6 +2,7 @@ export const NOTIFICATION_PREFERENCES_CONTRACT = "diffforge.notification_prefs.v
 
 export const NOTIFICATION_PREFERENCE_DEFAULT_PUSH = Object.freeze({
   uir_prompts: true,
+  agent_update_available: true,
   todo_started: true,
   todo_completed: true,
   loop_run_started: false,
@@ -17,6 +18,11 @@ export const NOTIFICATION_PREFERENCE_PUSH_OPTIONS = Object.freeze([
     key: "uir_prompts",
     label: "Input prompts",
     detail: "User-input-required prompts from agent terminals.",
+  },
+  {
+    key: "agent_update_available",
+    label: "Agent updates",
+    detail: "New Codex, Claude Code, and OpenCode CLI versions.",
   },
   {
     key: "todo_started",
@@ -82,6 +88,7 @@ const TOP_LEVEL_ALIASES = new Set([
 
 const PUSH_ALIASES = Object.freeze({
   uir_prompts: ["uir_prompts"],
+  agent_update_available: ["agent_update_available", "agentUpdateAvailable"],
   todo_started: ["todo_started", "todoStarted"],
   todo_completed: ["todo_completed", "todoCompleted"],
   loop_run_started: ["loop_run_started"],

@@ -9,6 +9,7 @@ const TERMINAL_STARTING_IDLE_BUFFER_MS: u64 = 5_000;
 const TERMINAL_ACTIVITY_IDLE_QUIESCE_MS: u64 = 1_750;
 const TERMINAL_PROMPT_READY_BUSY_DEBOUNCE_MS: u64 = 750;
 const TERMINAL_STARTING_WATCHDOG_MS: u64 = 30_000;
+const TERMINAL_MCP_STARTUP_DEGRADED_MS: u64 = 30_000;
 const TERMINAL_WATCHDOG_OUTPUT_QUIET_MS: u64 = 2_500;
 const TERMINAL_HOT_STALE_WATCHDOG_MS: u64 = 10 * 60_000;
 const TERMINAL_STARTUP_READY_SCAN_BYTES: usize = 16 * 1024;
@@ -19,6 +20,13 @@ const TERMINAL_CODEX_APP_SERVER_READY_TIMEOUT_MS: u64 = 8_000;
 const TERMINAL_CODEX_APP_SERVER_READY_POLL_MS: u64 = 80;
 const TERMINAL_CODEX_APP_SERVER_CONNECT_ATTEMPTS: usize = 50;
 const TERMINAL_CODEX_APP_SERVER_CONNECT_RETRY_MS: u64 = 100;
+const TERMINAL_CODEX_AUTH_RELOAD_MAX_ATTEMPTS: usize = 3;
+const TERMINAL_CODEX_AUTH_RELOAD_BACKOFF_BASE_MS: u64 = 100;
+const TERMINAL_CODEX_AUTH_RELOAD_JITTER_MAX_MS: u64 = 75;
+const TERMINAL_CODEX_AUTH_EXHAUSTED_FLUSH_TIMEOUT_MS: u64 = 2_000;
+const TERMINAL_CODEX_AUTH_RECOVERY_DOWNSTREAM_QUEUE_MAX: usize = 128;
+const TERMINAL_CODEX_APP_SERVER_STARTUP_JITTER_MIN_MS: u64 = 20;
+const TERMINAL_CODEX_APP_SERVER_STARTUP_JITTER_SPAN_MS: u64 = 131;
 const TERMINAL_CODEX_HOOK_TRUST_RESPONSE_TIMEOUT_MS: u64 = 10_000;
 // Agent-start commands must never hang the frontend launch pipeline: a
 // wedged lifecycle holder (slow terminal_open, close teardown) or a stuck
@@ -32,6 +40,7 @@ const TERMINAL_AGENT_START_PANE_TIMEOUT_SECS: u64 = 120;
 enum TerminalCodexHookTrustDiscoveryState {
     Pending,
     Open,
+    FailedClosed,
     Resolved,
 }
 
@@ -79,6 +88,14 @@ fn terminal_codex_hook_trust_discovery_set(
     }
     if let Ok(mut states) = terminal_codex_hook_trust_discovery_states().lock() {
         if let Some(entry) = states.get_mut(&(pane_id.to_string(), instance_id)) {
+            if matches!(
+                entry.state,
+                TerminalCodexHookTrustDiscoveryState::FailedClosed
+            )
+                && state == TerminalCodexHookTrustDiscoveryState::Resolved
+            {
+                return;
+            }
             entry.state = state;
         }
     }
@@ -120,6 +137,7 @@ fn terminal_codex_hook_trust_discovery_blocks_idle(pane_id: &str, instance_id: u
             state,
             TerminalCodexHookTrustDiscoveryState::Pending
                 | TerminalCodexHookTrustDiscoveryState::Open
+                | TerminalCodexHookTrustDiscoveryState::FailedClosed
         )
     })
 }
@@ -154,11 +172,43 @@ fn terminal_codex_hook_trust_discovery_clear_generation(
 }
 
 fn terminal_output_latest_working_indicator_index(text: &str) -> Option<usize> {
-    let lower = text.to_lowercase();
-    ["working (", "esc to interrupt", "context refresh"]
+    let lower = text.to_ascii_lowercase();
+    ["Working (", "Working("]
+        .into_iter()
+        .flat_map(|needle| text.match_indices(needle).map(|(index, _)| index))
+        .filter(|index| {
+            *index == 0
+                || text[..*index]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|character| {
+                        !character.is_ascii_alphanumeric() && character != '_'
+                    })
+        })
+        .filter_map(|index| {
+            lower[index..]
+                .find("esc to interrupt")
+                .filter(|suffix_index| *suffix_index <= 160)
+                .map(|_| index)
+        })
+        .max()
+}
+
+fn terminal_output_latest_mcp_startup_indicator_index(text: &str) -> Option<usize> {
+    let lower = text.to_ascii_lowercase();
+    let startup = ["booting mcp server", "starting mcp server"]
         .into_iter()
         .filter_map(|needle| lower.rfind(needle))
-        .max()
+        .max();
+    let failed = (lower.contains("mcp client for") && lower.contains("failed to start"))
+        .then(|| lower.rfind("mcp client for"))
+        .flatten();
+    startup.max(failed)
+}
+
+fn terminal_output_latest_readiness_blocker_index(text: &str) -> Option<usize> {
+    terminal_output_latest_working_indicator_index(text)
+        .max(terminal_output_latest_mcp_startup_indicator_index(text))
 }
 
 fn terminal_output_latest_prompt_marker_index(text: &str) -> Option<usize> {
@@ -192,9 +242,23 @@ fn terminal_output_prompt_marker_after_working_indicator(text: &str) -> bool {
     let Some(prompt_index) = terminal_output_latest_prompt_marker_index(text) else {
         return false;
     };
-    terminal_output_latest_working_indicator_index(text)
+    terminal_output_latest_readiness_blocker_index(text)
         .map(|working_index| prompt_index > working_index)
         .unwrap_or(true)
+}
+
+fn terminal_output_current_mcp_startup_marker(text: &str) -> bool {
+    let current_in_text = |value: &str| {
+        let Some(startup_index) = terminal_output_latest_mcp_startup_indicator_index(value) else {
+            return false;
+        };
+        terminal_output_latest_prompt_marker_index(value)
+            .max(terminal_output_latest_working_indicator_index(value))
+            .map(|newer_activity_index| startup_index > newer_activity_index)
+            .unwrap_or(true)
+    };
+    let cleaned = terminal_activity_strip_terminal_sequences(text);
+    current_in_text(&cleaned)
 }
 
 fn terminal_output_current_prompt_marker(text: &str) -> bool {
@@ -896,12 +960,41 @@ fn terminal_runtime_snapshot(instance: &TerminalInstance) -> TerminalRuntimeSnap
         .unwrap_or_else(|_| TerminalRuntimeSnapshot::opened_idle(None))
 }
 
+struct TerminalOperationAdmissionGuard {
+    admission: Arc<StdMutex<TerminalOperationAdmissionState>>,
+}
+
+impl Drop for TerminalOperationAdmissionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut admission) = self.admission.lock() {
+            admission.active = admission.active.saturating_sub(1);
+        }
+    }
+}
+
+fn terminal_operation_try_admit(
+    instance: &TerminalInstance,
+) -> Option<TerminalOperationAdmissionGuard> {
+    let admission = Arc::clone(&instance.operation_admission);
+    {
+        let mut state = admission.lock().ok()?;
+        if state.closing {
+            return None;
+        }
+        state.active = state.active.saturating_add(1);
+    }
+    Some(TerminalOperationAdmissionGuard { admission })
+}
+
 fn terminal_runtime_apply_opened(
     instance: &TerminalInstance,
     provider_session_id: Option<&str>,
     fork_from_provider_session_id: Option<&str>,
     source: &str,
 ) -> TerminalRuntimeSnapshot {
+    let Some(_operation) = terminal_operation_try_admit(instance) else {
+        return terminal_runtime_snapshot(instance);
+    };
     let provider_session_id = terminal_recordable_provider_session_id_for_metadata(
         &instance.metadata,
         provider_session_id,
@@ -932,6 +1025,7 @@ fn terminal_runtime_apply_provider_session_id(
     provider_session_id: &str,
     source: &str,
 ) -> Option<TerminalRuntimeSnapshot> {
+    let _operation = terminal_operation_try_admit(instance)?;
     let provider_session_id = terminal_recordable_provider_session_id_for_metadata(
         &instance.metadata,
         Some(provider_session_id),
@@ -948,6 +1042,9 @@ fn terminal_runtime_apply_activity_payload(
     instance: &TerminalInstance,
     payload: &TerminalActivityHookPayload,
 ) -> TerminalRuntimeSnapshot {
+    let Some(_operation) = terminal_operation_try_admit(instance) else {
+        return terminal_runtime_snapshot(instance);
+    };
     let previous = terminal_runtime_snapshot(instance);
     let provider_session_id = terminal_recordable_provider_session_id_for_metadata(
         &instance.metadata,
@@ -1012,6 +1109,24 @@ fn terminal_runtime_snapshot_is_starting(runtime: &TerminalRuntimeSnapshot) -> b
     ) || terminal_projection_text(&runtime.command_phase, "") == "starting"
 }
 
+fn terminal_runtime_snapshot_is_interrupted(runtime: &TerminalRuntimeSnapshot) -> bool {
+    terminal_projection_text(&runtime.event_type, "") == "provider_turn_interrupted"
+        || matches!(
+            terminal_projection_text(&runtime.activity_status, "").as_str(),
+            "cancelled" | "canceled" | "interrupted"
+        )
+        || matches!(
+            terminal_projection_text(&runtime.command_phase, "").as_str(),
+            "cancelled" | "canceled" | "interrupted"
+        )
+}
+
+fn terminal_runtime_snapshot_is_recoverable_startup_error(
+    runtime: &TerminalRuntimeSnapshot,
+) -> bool {
+    terminal_projection_text(&runtime.event_type, "") == "provider_startup_error"
+}
+
 fn terminal_runtime_snapshot_is_busy_turn(runtime: &TerminalRuntimeSnapshot) -> bool {
     let status = terminal_projection_text(&runtime.status, "");
     let activity = terminal_projection_text(&runtime.activity_status, "");
@@ -1067,6 +1182,16 @@ fn terminal_prompt_ready_recovery_allowed(
     // busy-turn PTY recovery stays disabled below.
     if terminal_runtime_snapshot_is_starting(runtime) {
         return true;
+    }
+
+    // An interrupt is authoritative immediately, but it is not itself proof
+    // that the provider has returned to its composer. Likewise, an MCP
+    // startup timeout remains recoverable. In both states, a later prompt
+    // marker is the explicit provider boundary that may restore input-ready.
+    if terminal_runtime_snapshot_is_interrupted(runtime)
+        || terminal_runtime_snapshot_is_recoverable_startup_error(runtime)
+    {
+        return terminal_activity_provider_allows_pty_lifecycle_recovery(metadata);
     }
 
     // Claude Code exposes deterministic SessionStart/UserPromptSubmit/Stop
@@ -1212,7 +1337,9 @@ fn terminal_projection_state_is_compacting(value: &str) -> bool {
 
 fn terminal_projection_readiness(status: &str) -> &'static str {
     let status = terminal_projection_text(status, "idle");
-    if terminal_projection_state_is_busy(&status) {
+    if matches!(status.as_str(), "cancelled" | "canceled" | "interrupted") {
+        "interrupted"
+    } else if terminal_projection_state_is_busy(&status) {
         "busy"
     } else if terminal_projection_state_is_paused(&status) {
         "needs_input"
@@ -2301,6 +2428,7 @@ fn terminal_launch(
         Option<String>,
         TerminalProviderResolvedLaunchOptions,
         Option<String>,
+        Option<String>,
     ),
     String,
 > {
@@ -2381,6 +2509,7 @@ fn terminal_launch(
         definition.label.to_string(),
         codex_resume_home,
         resolved_launch,
+        source_session_id.clone(),
         if is_fork_launch {
             None
         } else {
@@ -2807,8 +2936,12 @@ async fn write_terminal_input_bytes(
         return Err("Terminal input chunk is too large.".to_string());
     }
 
-    let Some(instance) = get_terminal_instance_if_current(state, pane_id, Some(instance_id)).await?
+    let Some(instance) =
+        get_terminal_instance_if_current(state, pane_id, Some(instance_id)).await?
     else {
+        return Ok(false);
+    };
+    let Some(_operation) = terminal_operation_try_admit(&instance) else {
         return Ok(false);
     };
     let _input_guard = instance.input_queue.lock().await;
@@ -2848,7 +2981,8 @@ async fn resize_terminal_instance_exact(
 ) -> Result<bool, String> {
     validate_terminal_pane_id(pane_id)?;
     let size = validate_terminal_size(cols, rows)?;
-    let Some(instance) = get_terminal_instance_if_current(state, pane_id, Some(instance_id)).await?
+    let Some(instance) =
+        get_terminal_instance_if_current(state, pane_id, Some(instance_id)).await?
     else {
         return Ok(false);
     };
@@ -3447,6 +3581,7 @@ fn cleanup_terminal_instance_with_context(
         input_gate,
         input_queue,
         active_task,
+        operation_admission: _,
         coordination,
         session_mode: _,
         metadata,
@@ -3843,7 +3978,10 @@ fn terminal_session_capabilities(
         can_select_model,
         can_change_model_now,
         can_change_effort_now,
-        can_change_permission_mode_now: matches!(provider.as_str(), "codex" | "claude" | "opencode"),
+        can_change_permission_mode_now: matches!(
+            provider.as_str(),
+            "codex" | "claude" | "opencode"
+        ),
         prompt_answer_mechanism: "pty_keystroke".to_string(),
         interrupt_mechanism: "pty_escape".to_string(),
         raw_input_mechanism: "unsupported_cloud_lane".to_string(),
@@ -3873,7 +4011,10 @@ fn terminal_effective_safety_state(
     let hook_trust_bypassed = coordination.is_some_and(|context| {
         context.env_vars.iter().any(|(key, value)| {
             key == "DIFFFORGE_CODEX_BYPASS_HOOK_TRUST"
-                && matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+                && matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
         })
     });
     let (approval_policy, sandbox_policy) = match provider {
@@ -5691,13 +5832,26 @@ fn spawn_terminal_reader(
             }
         }
 
-        let recovery_source = if terminal_runtime_snapshot_is_starting(&runtime) {
-            "backend-startup-prompt-ready"
+        let interrupted_ready = terminal_runtime_snapshot_is_interrupted(&runtime);
+        let startup_error_ready =
+            terminal_runtime_snapshot_is_recoverable_startup_error(&runtime);
+        let (recovery_source, hook_event_name) = if interrupted_ready {
+            (
+                "backend-interrupt-prompt-ready",
+                "PromptReadyAfterInterrupt",
+            )
+        } else if startup_error_ready {
+            (
+                "backend-startup-error-prompt-ready",
+                "PromptReadyAfterStartupError",
+            )
+        } else if terminal_runtime_snapshot_is_starting(&runtime) {
+            ("backend-startup-prompt-ready", "Stop")
         } else {
-            "backend-output-prompt-ready"
+            ("backend-output-prompt-ready", "Stop")
         };
         let mut event = json!({
-            "hook_event_name": "Stop",
+            "hook_event_name": hook_event_name,
             "provider": instance.metadata.agent_kind.clone(),
             "source": recovery_source,
             "timestamp": crate::coordination::kernel::now_rfc3339(),
@@ -6169,7 +6323,8 @@ fn spawn_terminal_reader(
                                     "retryable": false,
                                     "source": "pty_auth_observer",
                                 });
-                                let Some(payload) = terminal_activity_hook_payload(&instance, &event)
+                                let Some(payload) =
+                                    terminal_activity_hook_payload(&instance, &event)
                                 else {
                                     return;
                                 };
@@ -6272,6 +6427,7 @@ fn spawn_terminal_reader(
         let cleanup_pane_id = reader_pane_id.clone();
         tauri::async_runtime::spawn(async move {
             ssh_password_autofill_disarm_if_instance(&cleanup_pane_id, instance_id);
+            let mut terminal_exit_code = None;
             if let Some(instance) = remove_terminal_instance_if_current(
                 &cleanup_terminals,
                 &cleanup_pane_id,
@@ -6279,6 +6435,22 @@ fn spawn_terminal_reader(
             )
             .await
             {
+                // EOF normally follows process exit, but allow a short reap
+                // window so managed-login completion receives the PTY's real
+                // status instead of an unconditional/unknown success.
+                for _ in 0..20 {
+                    terminal_exit_code = {
+                        let mut child = instance.child.lock().await;
+                        child
+                            .as_mut()
+                            .and_then(|child| child.try_wait().ok().flatten())
+                            .and_then(|status| i32::try_from(status.exit_code()).ok())
+                    };
+                    if terminal_exit_code.is_some() {
+                        break;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
                 terminal_record_workspace_agent_session_history(
                     Some(cleanup_app.clone()),
                     &instance,
@@ -6312,12 +6484,21 @@ fn spawn_terminal_reader(
                 todo_store_orphan_sweep_trigger("terminal_reader_exit");
             }
 
+            // Provider-auth shells are bound to a backend login generation.
+            // Once that shell process exits, the generation is cancelled so
+            // its watcher cannot activate on a later unrelated token refresh.
+            agent_accounts_login_terminal_process_exited(
+                Some(&cleanup_app),
+                &cleanup_pane_id,
+                instance_id,
+                terminal_exit_code,
+            );
             let _ = cleanup_app.emit(
                 "forge-terminal-exit",
                 TerminalExitPayload {
                     pane_id: cleanup_pane_id,
                     instance_id,
-                    exit_code: None,
+                    exit_code: terminal_exit_code,
                     exited_at_ms: terminal_now_ms(),
                 },
             );
@@ -6362,6 +6543,19 @@ async fn remove_terminal_parked_prompts_for_close(
     removed
 }
 
+fn terminal_restart_guard_allows(
+    current_instance_id: u64,
+    expected_instance_id: u64,
+    current_launch_epoch: &str,
+    expected_launch_epoch: &str,
+    execution_phase: &str,
+    terminal_lifecycle: &str,
+) -> bool {
+    current_instance_id == expected_instance_id
+        && current_launch_epoch == expected_launch_epoch
+        && agent_accounts_restart_eligible(execution_phase, terminal_lifecycle)
+}
+
 async fn close_terminal_session(
     app: Option<AppHandle>,
     state: &TerminalState,
@@ -6370,6 +6564,7 @@ async fn close_terminal_session(
     instance_id: Option<u64>,
     preserve_coordination_session: bool,
     wait_for_cleanup: bool,
+    restart_if_idle_launch_epoch: Option<&str>,
 ) -> Result<bool, String> {
     validate_terminal_pane_id(pane_id)?;
     log_terminal_crash_forensics_event(
@@ -6404,7 +6599,110 @@ async fn close_terminal_session(
             }
         }
 
-        terminals.remove(pane_id)
+        if let Some(expected_launch_epoch) = restart_if_idle_launch_epoch {
+            let Some(current) = terminals.get(pane_id) else {
+                return Ok(false);
+            };
+            let current_id = current.id;
+            let operation_admission_handle = Arc::clone(&current.operation_admission);
+            let runtime_handle = Arc::clone(&current.runtime);
+            let active_task_handle = Arc::clone(&current.active_task);
+            let input_queue_handle = Arc::clone(&current.input_queue);
+            let current_launch_epoch = current
+                .coordination
+                .as_ref()
+                .and_then(|coordination| coordination.terminal_launch_epoch.as_deref())
+                .unwrap_or_default();
+            if current_launch_epoch != expected_launch_epoch {
+                log_terminal_crash_forensics_event(
+                    "backend.terminal_restart_if_idle.skip",
+                    json!({
+                        "expected_instance_id": instance_id,
+                        "expected_launch_epoch": clean_terminal_diagnostic_log_text(expected_launch_epoch),
+                        "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                        "reason": "launch_epoch_mismatch",
+                    }),
+                );
+                return Ok(false);
+            }
+            // No runtime publisher, prompt preflight, or PTY input transaction
+            // may overlap the final idle decision. Holding this state lock
+            // through `closing = true` makes stale instance clones fail closed.
+            let mut operation_admission = match operation_admission_handle.try_lock() {
+                Ok(admission) if !admission.closing && admission.active == 0 => admission,
+                _ => return Ok(false),
+            };
+            // Fail closed if activity is being published or input is being
+            // written. These guards remain held through map removal, making
+            // the final idle decision atomic with task/input admission.
+            let active_task = match active_task_handle.try_lock() {
+                Ok(active_task) if active_task.is_none() => active_task,
+                _ => return Ok(false),
+            };
+            let input_queue = match input_queue_handle.try_lock() {
+                Ok(input_queue) => input_queue,
+                Err(_) => return Ok(false),
+            };
+            let parked_prompts = match state.parked_prompts.try_read() {
+                Ok(parked) => parked,
+                Err(_) => return Ok(false),
+            };
+            if parked_prompts
+                .values()
+                .any(|parked| parked.pane_id == pane_id && parked.instance_id == current_id)
+            {
+                return Ok(false);
+            }
+            // The terminal-map write guard excludes all actual PTY input
+            // writes (they retain a map read guard through writer flush). Hold
+            // the runtime lock through the final classification and removal so
+            // a busy transition cannot slip between the idle check and close.
+            let runtime = runtime_handle
+                .lock()
+                .map_err(|_| "Unable to verify terminal activity before restart.".to_string())?;
+            let metadata = terminals
+                .get(pane_id)
+                .map(|current| current.metadata.clone())
+                .ok_or_else(|| "Terminal disappeared during guarded restart.".to_string())?;
+            let projected = terminal_project_runtime(&metadata, &runtime, false);
+            if !terminal_restart_guard_allows(
+                current_id,
+                instance_id.unwrap_or_default(),
+                current_launch_epoch,
+                expected_launch_epoch,
+                &projected.execution_phase,
+                &projected.terminal_lifecycle,
+            ) {
+                log_terminal_crash_forensics_event(
+                    "backend.terminal_restart_if_idle.skip",
+                    json!({
+                        "activity": projected.execution_phase,
+                        "expected_instance_id": instance_id,
+                        "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                        "reason": "became_busy",
+                    }),
+                );
+                return Ok(false);
+            }
+            operation_admission.closing = true;
+            let removed = terminals.remove(pane_id);
+            drop(runtime);
+            drop(parked_prompts);
+            drop(input_queue);
+            drop(active_task);
+            drop(operation_admission);
+            removed
+        } else {
+            let Some(current) = terminals.get(pane_id) else {
+                return Ok(false);
+            };
+            // Explicit closes may interrupt admitted work, but no stale clone
+            // may begin a new write/publication after map removal.
+            if let Ok(mut admission) = current.operation_admission.lock() {
+                admission.closing = true;
+            }
+            terminals.remove(pane_id)
+        }
     };
 
     if let Some(instance) = instance {
@@ -7402,6 +7700,7 @@ async fn terminal_open(
         None,
         preserve_coordination_session,
         true,
+        None,
     )
     .await?;
 
@@ -7454,6 +7753,7 @@ async fn terminal_open(
         label,
         codex_resume_home,
         resolved_launch,
+        codex_resume_session_id,
         effective_provider_session_id,
     ) = if is_prewarm_pty || plain_shell {
         (
@@ -7462,6 +7762,7 @@ async fn terminal_open(
             "Prepared PTY".to_string(),
             None,
             TerminalProviderResolvedLaunchOptions::default(),
+            None,
             if requested_fork_provider_session_id.is_some() {
                 None
             } else {
@@ -7572,7 +7873,11 @@ async fn terminal_open(
             .map(|coordination| coordination.env_vars.clone())
             .unwrap_or_default();
         if let Some(home) = codex_resume_home.as_deref() {
-            apply_codex_resume_home_env(&mut coordination_env_vars, home);
+            apply_codex_resume_home_env(
+                &mut coordination_env_vars,
+                home,
+                codex_resume_session_id.as_deref().unwrap_or_default(),
+            )?;
         }
         let activity_provider_id = provider_for_coordination
             .as_deref()
@@ -7669,7 +7974,11 @@ async fn terminal_open(
             .map(|coordination| coordination.env_vars.clone())
             .unwrap_or_default();
         if let Some(home) = codex_resume_home.as_deref() {
-            apply_codex_resume_home_env(&mut coordination_env_vars, home);
+            apply_codex_resume_home_env(
+                &mut coordination_env_vars,
+                home,
+                codex_resume_session_id.as_deref().unwrap_or_default(),
+            )?;
         }
         extend_terminal_activity_env_vars(
             &mut coordination_env_vars,
@@ -7737,11 +8046,20 @@ async fn terminal_open(
                 "DIFFFORGE_CODEX_APP_SERVER_UIR".to_string(),
                 "1".to_string(),
             ));
+            let app_server_trusted_args = terminal_codex_app_server_trusted_args(
+                terminal_coordination.as_ref(),
+                resolved_launch.permission_mode.as_deref(),
+                app_control_mcp_launch.as_ref(),
+            );
             match terminal_start_codex_app_server_gateway(
                 app.clone(),
                 &command_path,
                 &process_working_directory,
                 &launch_env_vars,
+                &app_server_trusted_args,
+                terminal_coordination
+                    .as_ref()
+                    .map(|_| app_control_mcp_launch.is_some()),
                 &pane_id,
                 instance_id,
             )
@@ -8578,11 +8896,21 @@ async fn terminal_start_agent(
             "DIFFFORGE_CODEX_APP_SERVER_UIR".to_string(),
             "1".to_string(),
         ));
+        let app_server_trusted_args = terminal_codex_app_server_trusted_args(
+            instance.coordination.as_ref(),
+            launch.permission_mode.as_deref(),
+            app_control_mcp_launch.as_ref(),
+        );
         match terminal_start_codex_app_server_gateway(
             app.clone(),
             &command_path,
             instance.working_directory.as_ref(),
             &launch_env_vars,
+            &app_server_trusted_args,
+            instance
+                .coordination
+                .as_ref()
+                .map(|_| app_control_mcp_launch.is_some()),
             &pane_id,
             instance.id,
         )
@@ -9026,7 +9354,21 @@ async fn start_terminal_agent_in_prepared_pty(
             .map(|coordination| coordination.env_vars.clone())
             .unwrap_or_default();
         if let Some(home) = codex_resume_home.as_deref() {
-            apply_codex_resume_home_env(&mut coordination_env_vars, home);
+            if let Err(error) = apply_codex_resume_home_env(
+                &mut coordination_env_vars,
+                home,
+                source_session_id.as_deref().unwrap_or_default(),
+            ) {
+                return TerminalStartAgentPaneResult {
+                    pane_id,
+                    instance_id: Some(instance.id),
+                    model: None,
+                    model_source: None,
+                    started: false,
+                    skipped: false,
+                    message: error,
+                };
+            }
         }
         extend_terminal_activity_env_vars(
             &mut coordination_env_vars,
@@ -9140,11 +9482,21 @@ async fn start_terminal_agent_in_prepared_pty(
                 "DIFFFORGE_CODEX_APP_SERVER_UIR".to_string(),
                 "1".to_string(),
             ));
+            let app_server_trusted_args = terminal_codex_app_server_trusted_args(
+                instance.coordination.as_ref(),
+                resolved_launch.permission_mode.as_deref(),
+                app_control_mcp_launch.as_ref(),
+            );
             match terminal_start_codex_app_server_gateway(
                 app.clone(),
                 &command_path,
                 instance.working_directory.as_ref(),
                 &launch_env_vars,
+                &app_server_trusted_args,
+                instance
+                    .coordination
+                    .as_ref()
+                    .map(|_| app_control_mcp_launch.is_some()),
                 &pane_id,
                 instance.id,
             )
@@ -11084,7 +11436,18 @@ async fn terminal_handle_task_started_event(
         })
         .unwrap_or_else(|| "Active terminal task".to_string());
 
-    let mut active_task = instance.active_task.lock().await;
+    // Rejoin the terminal map before publishing busy state. A guarded restart
+    // owns the map write lock through its final idle check and removal, so a
+    // task start can either publish before that check or observe that the old
+    // instance is gone; it can never make a removed pane busy afterwards.
+    let terminals_guard = terminals.read().await;
+    let Some(current) = terminals_guard
+        .get(&pane_id)
+        .filter(|current| current.id == instance.id)
+    else {
+        return;
+    };
+    let mut active_task = current.active_task.lock().await;
     if active_task
         .as_ref()
         .is_some_and(|active| active.task_id == task_id)
@@ -11096,6 +11459,7 @@ async fn terminal_handle_task_started_event(
         title: title.clone(),
     });
     drop(active_task);
+    drop(terminals_guard);
 
     log_terminal_diagnostic_event(
         &app,
@@ -11388,6 +11752,17 @@ async fn terminal_register_parked_prompt_from_snapshot(
     )
     .await;
 
+    // Rejoin the terminal map before publishing either active-task or parked
+    // state. Guarded restart owns the map write lock through its final checks,
+    // so late coordination events cannot attach work to a removed instance.
+    let terminal_admission = terminals.read().await;
+    if !terminal_admission
+        .get(&pane_id)
+        .is_some_and(|current| current.id == instance.id)
+    {
+        return;
+    }
+
     if snapshot.terminal {
         if let Some(parked) = parked_prompts.write().await.remove(&parked_key) {
             emit_terminal_parked_prompt_event(&app, &parked, "resumed", Some("task_terminal"));
@@ -11399,6 +11774,8 @@ async fn terminal_register_parked_prompt_from_snapshot(
         {
             *active_task = None;
         }
+        drop(active_task);
+        drop(terminal_admission);
         return;
     }
 
@@ -11472,6 +11849,7 @@ async fn terminal_register_parked_prompt_from_snapshot(
             }
         }
     }
+    drop(terminal_admission);
 
     if let Some(parked) = prompt_to_emit {
         emit_terminal_parked_prompt_event(&app, &parked, "parked", Some(reason));
@@ -11631,6 +12009,9 @@ async fn terminal_resume_parked_prompt_once(
         );
         return false;
     }
+    let Some(_operation) = terminal_operation_try_admit(&instance) else {
+        return false;
+    };
 
     let structured_prompt_open = app
         .state::<TerminalState>()
@@ -11975,6 +12356,9 @@ async fn terminal_try_crash_todo_resume_prompt_once(
         return false;
     };
     let Some(coordination) = instance.coordination.clone() else {
+        return false;
+    };
+    let Some(_operation) = terminal_operation_try_admit(&instance) else {
         return false;
     };
     let coordination_repo_path = coordination.repo_path.clone();
@@ -13795,13 +14179,9 @@ fn terminal_activity_hook_lifecycle_kind(
 ) -> Option<(&'static str, &'static str, &'static str, &'static str, bool)> {
     let hook_key = terminal_activity_hook_name_key(hook_event_name);
     match hook_key.as_str() {
-        "sessionstart" | "sessionstarted" => Some((
-            "provider-session-ready",
-            "idle",
-            "active",
-            "ready",
-            true,
-        )),
+        "sessionstart" | "sessionstarted" => {
+            Some(("provider-session-ready", "idle", "active", "ready", true))
+        }
         key if terminal_activity_hook_is_prompt_submit_key(key) => Some((
             "provider-turn-started",
             "thinking",
@@ -13819,6 +14199,27 @@ fn terminal_activity_hook_lifecycle_kind(
         "error" | "turnerror" | "assistantturnerror" | "stopfailure" => {
             Some(("provider-turn-error", "error", "error", "failed", true))
         }
+        "mcpstartup" => Some((
+            "provider-mcp-starting",
+            "starting",
+            "starting",
+            "starting",
+            false,
+        )),
+        "mcpstartuperror" => Some((
+            "provider-startup-error",
+            "error",
+            "error",
+            "failed",
+            false,
+        )),
+        "promptreadyafterinterrupt" | "promptreadyafterstartuperror" => Some((
+            "terminal-input-ready",
+            "idle",
+            "active",
+            "ready",
+            true,
+        )),
         "interrupt"
         | "interrupted"
         | "turninterrupt"
@@ -13831,7 +14232,7 @@ fn terminal_activity_hook_lifecycle_kind(
             "interrupted",
             "active",
             "interrupted",
-            true,
+            false,
         )),
         _ => None,
     }
@@ -13852,7 +14253,11 @@ fn terminal_provider_error_text_from_value(value: &Value) -> Option<String> {
             "body",
         ]
         .iter()
-        .find_map(|key| object.get(*key).and_then(terminal_provider_error_text_from_value)),
+        .find_map(|key| {
+            object
+                .get(*key)
+                .and_then(terminal_provider_error_text_from_value)
+        }),
         Value::Array(items) => items
             .iter()
             .find_map(terminal_provider_error_text_from_value),
@@ -13998,7 +14403,7 @@ fn terminal_provider_error_from_event(
     provider_turn_id: Option<&str>,
     observed_at_ms: u64,
 ) -> Option<Value> {
-    if event_type != "provider-turn-error" {
+    if !matches!(event_type, "provider-turn-error" | "provider-startup-error") {
         return None;
     }
     let code = terminal_provider_error_nested_text(
@@ -14053,7 +14458,7 @@ fn terminal_provider_error_from_event(
         "error_id": format!("terminal-error-{observed_at_ms}"),
         "fingerprint": fingerprint,
         "revision": observed_at_ms,
-        "scope": if category == "auth" { "auth" } else { "turn" },
+        "scope": if category == "auth" { "auth" } else if event_type == "provider-startup-error" { "startup" } else { "turn" },
         "category": category,
         "provider_code": code,
         "safe_message": message,
@@ -14253,29 +14658,31 @@ fn terminal_activity_hook_activity_kind(
                 ))
             }
         }
-        "notification" => Some(if terminal_activity_hook_bool(event, &["provider_passive"])
-            || terminal_activity_hook_string(event, &["provider"])
-                .map(|provider| terminal_activity_hook_name_key(&provider).contains("claude"))
-                .unwrap_or(false)
-        {
-            (
-                "provider-observation",
-                "idle",
-                "active",
-                "observed",
-                false,
-                "cli_hook_provider_observation",
-            )
-        } else {
-            (
-                "provider-work-update",
-                "thinking",
-                "active",
-                "running",
-                false,
-                "cli_hook_notification",
-            )
-        }),
+        "notification" => Some(
+            if terminal_activity_hook_bool(event, &["provider_passive"])
+                || terminal_activity_hook_string(event, &["provider"])
+                    .map(|provider| terminal_activity_hook_name_key(&provider).contains("claude"))
+                    .unwrap_or(false)
+            {
+                (
+                    "provider-observation",
+                    "idle",
+                    "active",
+                    "observed",
+                    false,
+                    "cli_hook_provider_observation",
+                )
+            } else {
+                (
+                    "provider-work-update",
+                    "thinking",
+                    "active",
+                    "running",
+                    false,
+                    "cli_hook_notification",
+                )
+            },
+        ),
         "transcriptchanged" => Some((
             "provider-transcript-changed",
             "idle",
@@ -14482,10 +14889,8 @@ fn terminal_activity_line_is_tui_context(line: &str) -> bool {
     let lower = compact.to_ascii_lowercase();
     let deduped_lower = terminal_activity_collapse_duplicate_runs(&lower);
     let status_line = |value: &str| {
-        value.contains("esc to interrupt")
-            || value == "working"
-            || (value.starts_with("working ") && value.contains(" esc "))
-            || (value.starts_with("working ") && value.contains(" interrupt"))
+        cloud_mcp_terminal_output_has_mcp_startup_indicator(value)
+            || cloud_mcp_terminal_output_has_working_indicator(value)
             || value.contains("context refresh")
     };
     if status_line(&lower) || status_line(&deduped_lower) {
@@ -14534,13 +14939,19 @@ fn terminal_activity_tui_activity_text(value: &str) -> Option<String> {
     let cleaned = terminal_activity_strip_terminal_sequences(value);
     let compact = terminal_activity_compact_text(&cleaned);
     let lower = compact.to_ascii_lowercase();
-    let deduped_lower = terminal_activity_collapse_duplicate_runs(&lower);
-    if lower.contains("working")
-        || lower.contains("esc to interrupt")
-        || deduped_lower.contains("working")
-        || deduped_lower.contains("esc to interrupt")
-    {
-        return Some("Working".to_string());
+    let deduped = terminal_activity_collapse_duplicate_runs(&compact);
+    let deduped_lower = deduped.to_ascii_lowercase();
+    for candidate in [&compact, &deduped] {
+        let working_index = terminal_output_latest_working_indicator_index(candidate);
+        let mcp_startup_index = terminal_output_latest_mcp_startup_indicator_index(candidate);
+        match (working_index, mcp_startup_index) {
+            (Some(working), Some(startup)) if working > startup => {
+                return Some("Working".to_string());
+            }
+            (_, Some(_)) => return Some("MCP startup".to_string()),
+            (Some(_), None) => return Some("Working".to_string()),
+            (None, None) => {}
+        }
     }
     if lower.contains("context refresh") || deduped_lower.contains("context refresh") {
         return Some("Context refresh".to_string());
@@ -14738,8 +15149,16 @@ fn terminal_activity_hook_payload(
     let hook_event_name = terminal_activity_hook_string(event, &["hook_event_name", "event_name"])?;
     let manual_prompt = terminal_activity_hook_manual_prompt(&hook_event_name, event);
     let metadata = instance.metadata.clone();
+    let current_runtime = terminal_runtime_snapshot(instance);
     let mut background_work_active = false;
-    let (event_type, activity_status, status, command_phase, input_ready, completion_evidence) =
+    let (
+        mut event_type,
+        activity_status,
+        status,
+        command_phase,
+        input_ready,
+        mut completion_evidence,
+    ) =
         if manual_prompt.is_some() {
             (
                 "provider-user-prompt-started",
@@ -14771,15 +15190,14 @@ fn terminal_activity_hook_payload(
                             "cli_hook_stop_background_active",
                         )
                     } else {
-                        let completion_evidence = if hook_key == "sessionstart"
-                            || hook_key == "sessionstarted"
-                        {
-                            "cli_hook_session_start"
-                        } else if input_ready {
-                            "cli_hook_stop"
-                        } else {
-                            "cli_hook_prompt_submit"
-                        };
+                        let completion_evidence =
+                            if hook_key == "sessionstart" || hook_key == "sessionstarted" {
+                                "cli_hook_session_start"
+                            } else if input_ready {
+                                "cli_hook_stop"
+                            } else {
+                                "cli_hook_prompt_submit"
+                            };
                         (
                             event_type,
                             activity_status,
@@ -14801,6 +15219,14 @@ fn terminal_activity_hook_payload(
                 evidence,
             )
         };
+    if event_type == "provider-turn-completed"
+        && input_ready
+        && (terminal_runtime_snapshot_is_interrupted(&current_runtime)
+            || terminal_runtime_snapshot_is_recoverable_startup_error(&current_runtime))
+    {
+        event_type = "terminal-input-ready";
+        completion_evidence = "cli_hook_recovery_stop";
+    }
     let now_ms = terminal_now_ms();
     let event_time_ms = event
         .get("timestamp_ms")
@@ -14898,7 +15324,8 @@ fn terminal_activity_hook_payload(
     };
     let input_ready_at = input_ready.then(|| event_time.clone());
     let prompt_ready_at = input_ready.then(|| event_time.clone());
-    let completed_at = input_ready.then(|| event_time.clone());
+    let completed_at = (input_ready && event_type != "terminal-input-ready")
+        .then(|| event_time.clone());
     let permission_mode = terminal_activity_hook_string(event, &["permission_mode"]);
     let prompt_is_open = matches!(
         event_type,
@@ -15222,7 +15649,6 @@ fn terminal_activity_hook_payload(
             "structured_pty".to_string()
         }
     });
-    let current_runtime = terminal_runtime_snapshot(instance);
     let projected_runtime = terminal_project_runtime(
         &metadata,
         &TerminalRuntimeSnapshot {
@@ -15740,6 +16166,7 @@ fn terminal_activity_hook_next_poll_ms(current_poll_ms: u64) -> u64 {
 enum TerminalActivityWatchdogAction {
     StartupStop,
     StartupDowngradeRunning,
+    McpStartupError,
     StaleHotStop,
 }
 
@@ -15819,6 +16246,7 @@ fn terminal_activity_watchdog_starting_action(
     starting_age_ms: u64,
     live_process: bool,
     prompt_marker_visible: bool,
+    mcp_startup_visible: bool,
     output_quiet: bool,
     output_flowing: bool,
 ) -> Option<TerminalActivityWatchdogAction> {
@@ -15829,6 +16257,9 @@ fn terminal_activity_watchdog_starting_action(
     {
         return None;
     }
+    if mcp_startup_visible {
+        return None;
+    }
     if prompt_marker_visible || output_quiet {
         return Some(TerminalActivityWatchdogAction::StartupStop);
     }
@@ -15836,6 +16267,26 @@ fn terminal_activity_watchdog_starting_action(
         return Some(TerminalActivityWatchdogAction::StartupDowngradeRunning);
     }
     None
+}
+
+fn terminal_activity_watchdog_mcp_startup_action(
+    runtime: &TerminalRuntimeSnapshot,
+    mcp_startup_visible: bool,
+    mcp_startup_age_ms: u64,
+) -> Option<TerminalActivityWatchdogAction> {
+    let status = terminal_projection_text(&runtime.status, "");
+    let activity_status = terminal_projection_text(&runtime.activity_status, "");
+    if mcp_startup_visible
+        && mcp_startup_age_ms >= TERMINAL_MCP_STARTUP_DEGRADED_MS
+        && !terminal_projection_state_is_error(&status)
+        && !terminal_projection_state_is_error(&activity_status)
+        && !terminal_projection_state_is_closed(&status)
+        && !terminal_projection_state_is_closed(&activity_status)
+    {
+        Some(TerminalActivityWatchdogAction::McpStartupError)
+    } else {
+        None
+    }
 }
 
 fn terminal_activity_watchdog_stale_hot_action(
@@ -15876,6 +16327,23 @@ fn terminal_headless_tail_has_prompt_marker(
     recent_lines.reverse();
     let recent_text = recent_lines.join("\n");
     terminal_output_current_prompt_marker(&recent_text)
+}
+
+fn terminal_headless_tail_has_mcp_startup_marker(
+    headless_output: &Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
+) -> bool {
+    let Ok(output) = headless_output.lock() else {
+        return false;
+    };
+    let tail = output.tail.iter().copied().collect::<Vec<_>>();
+    if tail.is_empty() {
+        return false;
+    }
+    let start = tail.len().saturating_sub(TERMINAL_STARTUP_READY_SCAN_BYTES);
+    let text = String::from_utf8_lossy(&tail[start..]);
+    let mut recent_lines = text.lines().rev().take(8).collect::<Vec<_>>();
+    recent_lines.reverse();
+    terminal_output_current_mcp_startup_marker(&recent_lines.join("\n"))
 }
 
 async fn terminal_activity_watchdog_child_is_live(instance: &TerminalInstance) -> bool {
@@ -16066,11 +16534,20 @@ fn terminal_activity_hook_should_skip_todo_settlement(event: &Value, source: &st
         || terminal_activity_hook_startup_idle_buffered(event)
         || source == "startup-idle-buffer"
         || source == "backend-startup-prompt-ready"
+        || source == "backend-interrupt-prompt-ready"
+        || source == "backend-startup-error-prompt-ready"
         || event
             .get("source")
             .and_then(Value::as_str)
             .map(str::trim)
-            .is_some_and(|value| value.eq_ignore_ascii_case("backend-startup-prompt-ready"))
+            .is_some_and(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "backend-startup-prompt-ready"
+                        | "backend-interrupt-prompt-ready"
+                        | "backend-startup-error-prompt-ready"
+                )
+            })
 }
 
 #[derive(Clone)]
@@ -16232,6 +16709,12 @@ fn terminal_activity_hook_idle_stop_already_settled(
     instance_id: u64,
 ) -> bool {
     if current_runtime_is_busy_turn || !terminal_activity_hook_is_idle_stop_payload(payload) {
+        return false;
+    }
+    if !current_runtime.input_ready
+        && (terminal_runtime_snapshot_is_interrupted(current_runtime)
+            || terminal_runtime_snapshot_is_recoverable_startup_error(current_runtime))
+    {
         return false;
     }
     let runtime_session_id = terminal_activity_runtime_session_id(current_runtime);
@@ -16599,9 +17082,7 @@ fn terminal_structured_interaction_reconcile(
             .collect::<Vec<_>>();
         let resolved_codex_hook_trust = removed_ids.iter().any(|id| {
             interactions.get(id).is_some_and(|interaction| {
-                interaction
-                    .provider_request_id
-                    .starts_with("codex-hook-trust-")
+                terminal_codex_hook_trust_is_catalog_request(&interaction.provider_request_id)
             })
         });
         interactions.retain(|id, _| !removed_ids.contains(id));
@@ -16650,6 +17131,18 @@ fn apply_terminal_activity_hook_payload(
     architecture_payload: Option<TerminalArchitectureActivityPayload>,
     source: &str,
 ) {
+    let Some(_operation) = terminal_operation_try_admit(instance) else {
+        log_terminal_status_event(
+            "backend.terminal_activity_hook.publish_rejected",
+            json!({
+                "instance_id": instance.id,
+                "pane_id": clean_terminal_diagnostic_log_text(&instance.metadata.pane_id),
+                "reason": "terminal_closing",
+                "source": source,
+            }),
+        );
+        return;
+    };
     terminal_activity_hook_reconcile_prompt_state(&mut payload);
     if payload.interaction_response_mode.as_deref() == Some("blocking_hook")
         && source != "transport"
@@ -17104,6 +17597,7 @@ fn spawn_terminal_activity_hook_watcher(
         let mut last_output_total_bytes = 0u64;
         let mut last_output_activity_ms = terminal_now_ms();
         let mut last_hook_or_output_activity_ms = last_output_activity_ms;
+        let mut mcp_startup_observed_at_ms: Option<u64> = None;
         loop {
             if app_shutdown_requested() {
                 break;
@@ -17128,29 +17622,78 @@ fn spawn_terminal_activity_hook_watcher(
                 now_ms.saturating_sub(last_output_activity_ms) >= TERMINAL_WATCHDOG_OUTPUT_QUIET_MS;
             let output_flowing = output_changed && !output_quiet;
             let prompt_marker_visible = terminal_headless_tail_has_prompt_marker(&headless_output);
+            let mcp_startup_visible =
+                terminal_headless_tail_has_mcp_startup_marker(&headless_output);
+            if mcp_startup_visible {
+                mcp_startup_observed_at_ms.get_or_insert(now_ms);
+            } else {
+                mcp_startup_observed_at_ms = None;
+            }
+            let mcp_startup_age_ms = mcp_startup_observed_at_ms
+                .map(|observed_at_ms| now_ms.saturating_sub(observed_at_ms))
+                .unwrap_or_default();
             let live_process = terminal_activity_watchdog_child_is_live(&instance).await;
             let starting_age_ms = now_ms.saturating_sub(runtime.updated_at_ms);
-            let watchdog_action = (!terminal_codex_hook_trust_discovery_blocks_idle(
-                &pane_id,
-                instance_id,
-            ) && terminal_activity_provider_allows_pty_lifecycle_recovery(&instance.metadata))
-            .then(|| {
-                terminal_activity_watchdog_starting_action(
+            let runtime_activity = terminal_projection_text(&runtime.activity_status, "");
+            let runtime_interrupted = matches!(
+                runtime_activity.as_str(),
+                "cancelled" | "canceled" | "interrupted"
+            ) || terminal_projection_text(&runtime.event_type, "")
+                == "provider_turn_interrupted";
+            if mcp_startup_visible
+                && !runtime_interrupted
+                && runtime.event_type != "provider-mcp-starting"
+                && !terminal_projection_state_is_error(&runtime.status)
+                && !terminal_projection_state_is_error(&runtime.activity_status)
+            {
+                let event = terminal_activity_watchdog_event(
+                    &instance,
                     &runtime,
-                    starting_age_ms,
-                    live_process,
-                    prompt_marker_visible,
-                    output_quiet,
-                    output_flowing,
+                    "McpStartup",
+                    "backend-mcp-startup-classifier",
+                    "mcp_startup_visible",
+                );
+                process_terminal_activity_hook_event(
+                    &app,
+                    &terminals,
+                    &cloud_mcp_state,
+                    &pane_id,
+                    instance_id,
+                    &instance,
+                    &event,
+                    "backend-mcp-startup-classifier",
                 )
-                .or_else(|| {
-                    terminal_activity_watchdog_stale_hot_action(
+                .await;
+            }
+            let watchdog_action = terminal_activity_watchdog_mcp_startup_action(
+                &runtime,
+                mcp_startup_visible,
+                mcp_startup_age_ms,
+            )
+            .or_else(|| {
+                (!terminal_codex_hook_trust_discovery_blocks_idle(&pane_id, instance_id)
+                    && terminal_activity_provider_allows_pty_lifecycle_recovery(
+                        &instance.metadata,
+                    ))
+                .then(|| {
+                    terminal_activity_watchdog_starting_action(
                         &runtime,
-                        now_ms.saturating_sub(last_hook_or_output_activity_ms),
+                        starting_age_ms,
+                        live_process,
+                        prompt_marker_visible,
+                        mcp_startup_visible,
+                        output_quiet,
+                        output_flowing,
                     )
+                    .or_else(|| {
+                        terminal_activity_watchdog_stale_hot_action(
+                            &runtime,
+                            now_ms.saturating_sub(last_hook_or_output_activity_ms),
+                        )
+                    })
                 })
-            })
-            .flatten();
+                .flatten()
+            });
             if let Some(action) = watchdog_action {
                 let (hook_event_name, source, reason) = match action {
                     TerminalActivityWatchdogAction::StartupStop => (
@@ -17167,6 +17710,11 @@ fn spawn_terminal_activity_hook_watcher(
                         "backend-startup-output-flowing",
                         "starting_output_flowing",
                     ),
+                    TerminalActivityWatchdogAction::McpStartupError => (
+                        "McpStartupError",
+                        "backend-mcp-startup-watchdog",
+                        "mcp_startup_deadline_exceeded",
+                    ),
                     TerminalActivityWatchdogAction::StaleHotStop => (
                         "Stop",
                         "backend-stale-hot-watchdog",
@@ -17182,6 +17730,8 @@ fn spawn_terminal_activity_hook_watcher(
                         "instance_id": instance_id,
                         "launch_mode": terminal_activity_watchdog_launch_mode(&runtime),
                         "output_quiet": output_quiet,
+                        "mcp_startup_age_ms": mcp_startup_age_ms,
+                        "mcp_startup_visible": mcp_startup_visible,
                         "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
                         "prompt_marker_visible": prompt_marker_visible,
                         "provider": clean_terminal_diagnostic_log_text(&instance.metadata.agent_kind),
@@ -17191,13 +17741,23 @@ fn spawn_terminal_activity_hook_watcher(
                         "stale_age_ms": now_ms.saturating_sub(last_hook_or_output_activity_ms),
                     }),
                 );
-                let event = terminal_activity_watchdog_event(
+                let mut event = terminal_activity_watchdog_event(
                     &instance,
                     &runtime,
                     hook_event_name,
                     source,
                     reason,
                 );
+                if matches!(action, TerminalActivityWatchdogAction::McpStartupError) {
+                    if let Some(object) = event.as_object_mut() {
+                        object.insert("error_code".to_string(), json!("mcp_startup_timeout"));
+                        object.insert(
+                            "error".to_string(),
+                            json!("An MCP server is still starting. The terminal remains open; retry the MCP connection or sign in again if authentication failed."),
+                        );
+                        object.insert("retryable".to_string(), json!(true));
+                    }
+                }
                 process_terminal_activity_hook_event(
                     &app,
                     &terminals,
@@ -17787,6 +18347,19 @@ struct TerminalCodexGatewayPendingRequest {
     winner: Option<TerminalCodexGatewayWinner>,
 }
 
+#[derive(Clone, Debug)]
+struct TerminalCodexGatewayClientRequest {
+    method: String,
+    message: Value,
+    sequence: u64,
+}
+
+#[derive(Clone, Debug)]
+struct TerminalCodexGatewayActiveTurn {
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+}
+
 fn terminal_codex_app_server_request_id_key(value: &Value) -> Option<String> {
     match value {
         Value::String(value) if !value.trim().is_empty() => {
@@ -17806,7 +18379,8 @@ fn terminal_codex_app_server_request_id_text(value: &Value) -> String {
 }
 
 fn terminal_codex_gateway_track_client_request(
-    requests: &mut HashMap<String, String>,
+    requests: &mut HashMap<String, TerminalCodexGatewayClientRequest>,
+    next_sequence: &mut u64,
     message: &Value,
 ) {
     if let (Some(request_key), Some(method)) = (
@@ -17815,18 +18389,84 @@ fn terminal_codex_gateway_track_client_request(
             .and_then(terminal_codex_app_server_request_id_key),
         message.get("method").and_then(Value::as_str),
     ) {
-        requests.insert(request_key, method.to_string());
+        let sequence = *next_sequence;
+        *next_sequence = next_sequence.saturating_add(1);
+        requests.insert(
+            request_key,
+            TerminalCodexGatewayClientRequest {
+                method: method.to_string(),
+                message: message.clone(),
+                sequence,
+            },
+        );
     }
 }
 
 fn terminal_codex_gateway_take_client_response_method(
-    requests: &mut HashMap<String, String>,
+    requests: &mut HashMap<String, TerminalCodexGatewayClientRequest>,
     message: &Value,
 ) -> Option<String> {
     message
         .get("id")
         .and_then(terminal_codex_app_server_request_id_key)
         .and_then(|request_key| requests.remove(&request_key))
+        .map(|request| request.method)
+}
+
+fn terminal_codex_gateway_outstanding_requests(
+    requests: &HashMap<String, TerminalCodexGatewayClientRequest>,
+) -> Vec<Value> {
+    let mut requests = requests.values().collect::<Vec<_>>();
+    requests.sort_by_key(|request| request.sequence);
+    requests
+        .into_iter()
+        .map(|request| request.message.clone())
+        .collect()
+}
+
+fn terminal_codex_gateway_active_turn(request: &Value) -> TerminalCodexGatewayActiveTurn {
+    TerminalCodexGatewayActiveTurn {
+        thread_id: request
+            .pointer("/params/threadId")
+            .or_else(|| request.pointer("/params/thread_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        turn_id: None,
+    }
+}
+
+fn terminal_codex_gateway_observe_turn_started(
+    active_turn: &mut Option<TerminalCodexGatewayActiveTurn>,
+    value: &Value,
+) {
+    if value.get("method").and_then(Value::as_str) != Some("turn/started") {
+        return;
+    }
+    let Some(active_turn) = active_turn.as_mut() else {
+        return;
+    };
+    if let Some(thread_id) = value.pointer("/params/threadId").and_then(Value::as_str) {
+        active_turn.thread_id = Some(thread_id.to_string());
+    }
+    if let Some(turn_id) = value.pointer("/params/turn/id").and_then(Value::as_str) {
+        active_turn.turn_id = Some(turn_id.to_string());
+    }
+}
+
+fn terminal_codex_gateway_clear_completed_turn(
+    active_turn: &mut Option<TerminalCodexGatewayActiveTurn>,
+    value: &Value,
+) {
+    if terminal_codex_turn_completed(value) {
+        *active_turn = None;
+    }
+}
+
+fn terminal_codex_gateway_record_replacement_started(
+    connected_generation: &mut u64,
+    replacement_generation: u64,
+) {
+    *connected_generation = replacement_generation;
 }
 
 fn terminal_codex_app_server_uir_method(method: &str) -> bool {
@@ -18084,27 +18724,9 @@ fn terminal_codex_app_server_request_event(
             ),
         ],
         "mcpServer/elicitation/request" if params.get("url").is_some() => vec![
-            terminal_codex_app_server_option(
-                "continue",
-                "Continue",
-                None,
-                json!("accept"),
-                false,
-            ),
-            terminal_codex_app_server_option(
-                "reject",
-                "Decline",
-                None,
-                json!("decline"),
-                true,
-            ),
-            terminal_codex_app_server_option(
-                "cancel",
-                "Cancel",
-                None,
-                json!("cancel"),
-                true,
-            ),
+            terminal_codex_app_server_option("continue", "Continue", None, json!("accept"), false),
+            terminal_codex_app_server_option("reject", "Decline", None, json!("decline"), true),
+            terminal_codex_app_server_option("cancel", "Cancel", None, json!("cancel"), true),
         ],
         _ => Vec::new(),
     };
@@ -18179,6 +18801,27 @@ fn terminal_codex_app_server_request_event(
     }))
 }
 
+fn terminal_codex_gateway_register_server_request(
+    pending: &Arc<StdMutex<HashMap<String, TerminalCodexGatewayPendingRequest>>>,
+    pane_id: &str,
+    instance_id: u64,
+    request: &Value,
+) -> Option<Value> {
+    let event = terminal_codex_app_server_request_event(pane_id, instance_id, request)?;
+    let request_key = request
+        .get("id")
+        .and_then(terminal_codex_app_server_request_id_key)?;
+    let method = request.get("method")?.as_str()?.to_string();
+    pending.lock().ok()?.insert(
+        request_key,
+        TerminalCodexGatewayPendingRequest {
+            method,
+            winner: None,
+        },
+    );
+    Some(event)
+}
+
 fn terminal_codex_app_server_parse_option_value(
     option_id: &str,
     option_value: Option<&str>,
@@ -18187,12 +18830,14 @@ fn terminal_codex_app_server_parse_option_value(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .and_then(|value| serde_json::from_str::<Value>(value).ok())
-        .unwrap_or_else(|| match terminal_activity_hook_name_key(option_id).as_str() {
-            "allowalways" => json!("acceptForSession"),
-            "reject" | "deny" | "decline" => json!("decline"),
-            "cancel" => json!("cancel"),
-            _ => json!("accept"),
-        })
+        .unwrap_or_else(
+            || match terminal_activity_hook_name_key(option_id).as_str() {
+                "allowalways" => json!("acceptForSession"),
+                "reject" | "deny" | "decline" => json!("decline"),
+                "cancel" => json!("cancel"),
+                _ => json!("accept"),
+            },
+        )
 }
 
 fn terminal_codex_app_server_interaction_response(
@@ -18202,7 +18847,10 @@ fn terminal_codex_app_server_interaction_response(
     answer_text: Option<&str>,
     answer_payload: Option<&Value>,
 ) -> Value {
-    let payload = interaction.provider_payload.as_ref().unwrap_or(&Value::Null);
+    let payload = interaction
+        .provider_payload
+        .as_ref()
+        .unwrap_or(&Value::Null);
     let method = payload
         .get("app_server_method")
         .and_then(Value::as_str)
@@ -18214,7 +18862,8 @@ fn terminal_codex_app_server_interaction_response(
             "decision": terminal_codex_app_server_parse_option_value(option_id, option_value),
         }),
         "execCommandApproval" | "applyPatchApproval" => {
-            let mut decision = terminal_codex_app_server_parse_option_value(option_id, option_value);
+            let mut decision =
+                terminal_codex_app_server_parse_option_value(option_id, option_value);
             if let Some(value) = decision.as_str() {
                 decision = json!(match value {
                     "accept" => "approved",
@@ -18227,7 +18876,10 @@ fn terminal_codex_app_server_interaction_response(
             json!({ "decision": decision })
         }
         "item/permissions/requestApproval" => {
-            let denied = matches!(option_key.as_str(), "reject" | "deny" | "decline" | "cancel");
+            let denied = matches!(
+                option_key.as_str(),
+                "reject" | "deny" | "decline" | "cancel"
+            );
             let mut permissions = serde_json::Map::new();
             if !denied {
                 if let Some(network) = params.pointer("/permissions/network") {
@@ -18296,9 +18948,10 @@ fn terminal_codex_app_server_interaction_response(
                     .cloned()
                     .or_else(|| answer_payload.cloned())
                     .or_else(|| {
-                        answer_text
-                            .or(option_value)
-                            .map(|value| serde_json::from_str(value).unwrap_or_else(|_| json!({ "answer": value })))
+                        answer_text.or(option_value).map(|value| {
+                            serde_json::from_str(value)
+                                .unwrap_or_else(|_| json!({ "answer": value }))
+                        })
                     })
                     .unwrap_or_else(|| json!({}))
             } else {
@@ -18332,43 +18985,7 @@ fn terminal_codex_app_server_enable_tui_capabilities(message: &mut Value) {
     capabilities
         .entry("requestAttestation".to_string())
         .or_insert_with(|| json!(false));
-    capabilities.insert(
-        "mcpServerOpenaiFormElicitation".to_string(),
-        json!(true),
-    );
-}
-
-fn terminal_codex_gateway_message_completes_startup_hook_review(message: &Value) -> bool {
-    message.get("id").is_some()
-        && matches!(
-            message.get("method").and_then(Value::as_str),
-            Some("thread/start" | "thread/resume" | "thread/fork")
-        )
-}
-
-fn terminal_codex_gateway_resolve_startup_hook_review(
-    pane_id: &str,
-    instance_id: u64,
-    message: &Value,
-) -> bool {
-    if !terminal_codex_gateway_message_completes_startup_hook_review(message) {
-        return false;
-    }
-    let Some(discovery) =
-        terminal_codex_hook_trust_discovery_snapshot(pane_id, instance_id)
-    else {
-        return false;
-    };
-    terminal_codex_hook_trust_discovery_transition(
-        pane_id,
-        instance_id,
-        discovery.generation,
-        &[
-            TerminalCodexHookTrustDiscoveryState::Pending,
-            TerminalCodexHookTrustDiscoveryState::Open,
-        ],
-        TerminalCodexHookTrustDiscoveryState::Resolved,
-    )
+    capabilities.insert("mcpServerOpenaiFormElicitation".to_string(), json!(true));
 }
 
 async fn terminal_codex_gateway_publish_startup_hook_review_resolved(
@@ -18379,12 +18996,8 @@ async fn terminal_codex_gateway_publish_startup_hook_review_resolved(
 ) {
     let state = app.state::<TerminalState>();
     let cloud_mcp_state = app.state::<CloudMcpState>();
-    let Some(instance) = terminal_activity_hook_current_instance(
-        &state.terminals,
-        &pane_id,
-        instance_id,
-    )
-    .await
+    let Some(instance) =
+        terminal_activity_hook_current_instance(&state.terminals, &pane_id, instance_id).await
     else {
         return;
     };
@@ -18398,9 +19011,9 @@ async fn terminal_codex_gateway_publish_startup_hook_review_resolved(
                 .filter(|interaction| {
                     interaction.pane_id == pane_id
                         && interaction.instance_id == instance_id
-                        && interaction
-                            .provider_request_id
-                            .starts_with("codex-hook-trust-")
+                        && terminal_codex_hook_trust_is_catalog_request(
+                            &interaction.provider_request_id,
+                        )
                 })
                 .cloned()
                 .collect::<Vec<_>>()
@@ -18520,13 +19133,12 @@ async fn terminal_codex_gateway_publish_resolution(
     let state = app.state::<TerminalState>();
     let cloud_mcp_state = app.state::<CloudMcpState>();
     let request_id_text = terminal_codex_app_server_request_id_text(request_id);
-    let hook_event_name = if method == "mcpServer/elicitation/request"
-        || method == "item/tool/requestUserInput"
-    {
-        "ElicitationResult"
-    } else {
-        "PermissionResult"
-    };
+    let hook_event_name =
+        if method == "mcpServer/elicitation/request" || method == "item/tool/requestUserInput" {
+            "ElicitationResult"
+        } else {
+            "PermissionResult"
+        };
     let event = json!({
         "hook_event_name": hook_event_name,
         "provider": "codex",
@@ -18654,12 +19266,8 @@ fn terminal_codex_gateway_spawn_web_waiter(
         let Ok(Some(result)) = response else {
             return;
         };
-        if terminal_codex_gateway_claim(
-            &pending,
-            &request_key,
-            TerminalCodexGatewayWinner::Web,
-        )
-        .is_none()
+        if terminal_codex_gateway_claim(&pending, &request_key, TerminalCodexGatewayWinner::Web)
+            .is_none()
         {
             return;
         }
@@ -18674,24 +19282,519 @@ fn terminal_codex_gateway_spawn_web_waiter(
     ready_receiver
 }
 
-async fn terminal_codex_gateway_connection(
-    app: AppHandle,
-    stream: TcpStream,
-    upstream_url: String,
-    pane_id: String,
-    instance_id: u64,
-) -> Result<(), String> {
-    let downstream = accept_async(stream)
+struct TerminalCodexGatewayDownstreamMessage {
+    message: Message,
+    flushed: Option<oneshot::Sender<bool>>,
+}
+
+async fn terminal_codex_gateway_send_downstream(
+    sender: &mpsc::Sender<TerminalCodexGatewayDownstreamMessage>,
+    message: Message,
+    require_flush: bool,
+) -> bool {
+    if !require_flush {
+        return sender
+            .send(TerminalCodexGatewayDownstreamMessage {
+                message,
+                flushed: None,
+            })
+            .await
+            .is_ok();
+    }
+    let (flushed_sender, flushed_receiver) = oneshot::channel();
+    if sender
+        .send(TerminalCodexGatewayDownstreamMessage {
+            message,
+            flushed: Some(flushed_sender),
+        })
         .await
-        .map_err(|error| format!("Unable to accept Codex TUI websocket: {error}"))?;
-    let mut upstream = None;
+        .is_err()
+    {
+        return false;
+    }
+    timeout(
+        Duration::from_millis(TERMINAL_CODEX_AUTH_EXHAUSTED_FLUSH_TIMEOUT_MS),
+        flushed_receiver,
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or(false)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalCodexRecoveryControlOutcome {
+    NotControl,
+    Continue,
+    Close,
+}
+
+async fn terminal_codex_gateway_service_recovery_control(
+    sender: &mpsc::Sender<TerminalCodexGatewayDownstreamMessage>,
+    message: &Message,
+) -> TerminalCodexRecoveryControlOutcome {
+    let (reply, outcome) = match message {
+        Message::Ping(bytes) => (
+            Some(Message::Pong(bytes.clone())),
+            TerminalCodexRecoveryControlOutcome::Continue,
+        ),
+        Message::Close(frame) => (
+            Some(Message::Close(frame.clone())),
+            TerminalCodexRecoveryControlOutcome::Close,
+        ),
+        Message::Pong(_) | Message::Frame(_) => {
+            return TerminalCodexRecoveryControlOutcome::Continue
+        }
+        Message::Text(_) | Message::Binary(_) => {
+            return TerminalCodexRecoveryControlOutcome::NotControl
+        }
+    };
+    if sender
+        .send(TerminalCodexGatewayDownstreamMessage {
+            message: reply.expect("recovery control reply"),
+            flushed: None,
+        })
+        .await
+        .is_err()
+    {
+        return TerminalCodexRecoveryControlOutcome::Close;
+    }
+    outcome
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum TerminalCodexThreadBootstrapForward {
+    Blocked,
+    Sent,
+    Full,
+    Closed,
+}
+
+#[derive(Default)]
+struct TerminalCodexAuthReloadBudget {
+    attempts: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalCodexAuthReloadDecision {
+    Retry { attempt: usize, delay_ms: u64 },
+    Exhausted,
+}
+
+struct TerminalCodexAppServerRestartRequest {
+    observed_generation: u64,
+    delay_ms: u64,
+    response: oneshot::Sender<Result<u64, String>>,
+}
+
+fn terminal_codex_stable_jitter_seed(pane_id: &str, instance_id: u64, salt: u64) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in pane_id
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain(instance_id.to_le_bytes())
+        .chain(salt.to_le_bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn terminal_codex_app_server_startup_jitter_ms(pane_id: &str, instance_id: u64) -> u64 {
+    TERMINAL_CODEX_APP_SERVER_STARTUP_JITTER_MIN_MS
+        + terminal_codex_stable_jitter_seed(pane_id, instance_id, u64::from(std::process::id()))
+            % TERMINAL_CODEX_APP_SERVER_STARTUP_JITTER_SPAN_MS
+}
+
+fn terminal_codex_auth_reload_backoff_ms(
+    pane_id: &str,
+    instance_id: u64,
+    attempt: usize,
+) -> u64 {
+    let exponent = u32::try_from(attempt.saturating_sub(1).min(2)).unwrap_or(2);
+    let base = TERMINAL_CODEX_AUTH_RELOAD_BACKOFF_BASE_MS.saturating_mul(1_u64 << exponent);
+    let jitter = terminal_codex_stable_jitter_seed(
+        pane_id,
+        instance_id,
+        u64::try_from(attempt).unwrap_or(u64::MAX),
+    ) % (TERMINAL_CODEX_AUTH_RELOAD_JITTER_MAX_MS + 1);
+    base.saturating_add(jitter)
+}
+
+fn terminal_codex_auth_reload_next(
+    budget: &mut TerminalCodexAuthReloadBudget,
+    pane_id: &str,
+    instance_id: u64,
+    _now_ms: u64,
+) -> TerminalCodexAuthReloadDecision {
+    // This is deliberately a lifetime budget for the pane instance. A time
+    // window (or a successful turn) must never reset it: otherwise two panes
+    // with slowly alternating auth failures can restart each other forever.
+    if budget.attempts >= TERMINAL_CODEX_AUTH_RELOAD_MAX_ATTEMPTS {
+        return TerminalCodexAuthReloadDecision::Exhausted;
+    }
+    budget.attempts += 1;
+    TerminalCodexAuthReloadDecision::Retry {
+        attempt: budget.attempts,
+        delay_ms: terminal_codex_auth_reload_backoff_ms(
+            pane_id,
+            instance_id,
+            budget.attempts,
+        ),
+    }
+}
+
+fn terminal_codex_app_server_auth_error_payload(value: &Value) -> Option<&Value> {
+    if let Some(error) = value.get("error") {
+        return Some(error);
+    }
+    match value.get("method").and_then(Value::as_str) {
+        Some("error") => value.pointer("/params/error").or_else(|| value.get("params")),
+        Some("turn/completed") => value.pointer("/params/turn/error"),
+        Some("account/chatgptAuthTokens/refresh")
+            if value
+                .pointer("/params/reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| {
+                    matches!(
+                        reason.trim().to_ascii_lowercase().as_str(),
+                        "unauthorized" | "refresh-unauthorized" | "refresh_unauthorized"
+                    )
+                }) =>
+        {
+            value.get("params")
+        }
+        _ => None,
+    }
+}
+
+fn terminal_codex_gateway_client_response_method<'a>(
+    requests: &'a HashMap<String, TerminalCodexGatewayClientRequest>,
+    message: &Value,
+) -> Option<&'a str> {
+    message
+        .get("id")
+        .and_then(terminal_codex_app_server_request_id_key)
+        .and_then(|request_key| requests.get(&request_key))
+        .map(|request| request.method.as_str())
+}
+
+fn terminal_codex_auth_request_method(method: Option<&str>) -> bool {
+    method.is_some_and(|method| {
+        let method = method.trim().to_ascii_lowercase();
+        method.starts_with("account/")
+            || method
+                .split(['/', '.', '_', '-', ':'])
+                .any(|segment| {
+                    matches!(
+                        segment,
+                        "auth"
+                            | "authenticate"
+                            | "authentication"
+                            | "token"
+                            | "tokens"
+                            | "refresh"
+                            | "login"
+                    )
+                })
+    })
+}
+
+fn terminal_codex_app_server_auth_invalidated(
+    value: &Value,
+    correlated_request_method: Option<&str>,
+) -> bool {
+    if value.get("method").and_then(Value::as_str)
+        == Some("account/chatgptAuthTokens/refresh")
+        && value
+            .pointer("/params/reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| {
+                matches!(
+                    reason.trim().to_ascii_lowercase().as_str(),
+                    "unauthorized" | "refresh-unauthorized" | "refresh_unauthorized"
+                )
+            })
+    {
+        return true;
+    }
+    let Some(error) = terminal_codex_app_server_auth_error_payload(value) else {
+        return false;
+    };
+    let lower = error.to_string().to_ascii_lowercase();
+    if [
+        "token_invalidated",
+        "token-invalidation",
+        "refresh_token_reused",
+        "refresh_token_invalidated",
+        "refresh-unauthorized",
+        "refresh_unauthorized",
+        "auth-invalidated",
+        "auth_invalidated",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return true;
+    }
+    if lower.contains("refresh token")
+        && ["already used", "has been used", "reused", "revoked", "invalidated"]
+            .iter()
+            .any(|marker| lower.contains(marker))
+    {
+        return true;
+    }
+    let codex_unauthorized = (lower.contains("codexerrorinfo")
+        || lower.contains("codex_error_info"))
+        && lower.contains("unauthorized");
+    let status_401 = [
+        "\"status\":401",
+        "\"statuscode\":401",
+        "\"httpstatuscode\":401",
+        "\"status\":\"401\"",
+        "401 unauthorized",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    codex_unauthorized
+        || (status_401
+            && terminal_codex_auth_request_method(correlated_request_method)
+            && [
+                "\"auth",
+                "authentication",
+                "token",
+                "credential",
+                "login",
+                "invalid_request_error",
+            ]
+                .iter()
+                .any(|marker| lower.contains(marker)))
+}
+
+fn terminal_codex_auth_reload_retryable_error(
+    original: &Value,
+    active_turn: Option<&TerminalCodexGatewayActiveTurn>,
+) -> Value {
+    let message = "Codex reloaded the pane credentials, but did not automatically retry the interrupted operation because it may already have produced side effects. Re-submit it explicitly if appropriate.";
+    let data = json!({
+        "code": "codex_auth_reloaded_retry_required",
+        "retryable": true,
+        "automaticallyRetried": false,
+    });
+    if original.get("method").is_none() {
+        let Some(id) = original.get("id") else {
+            return original.clone();
+        };
+        return json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32096,
+                "message": message,
+                "data": data,
+            }
+        });
+    }
+    let turn_error = json!({
+        "message": message,
+        "additionalDetails": "codex_auth_reloaded_retry_required",
+        "code": "codex_auth_reloaded_retry_required",
+        "retryable": true,
+        "automaticallyRetried": false,
+    });
+    if original.get("method").and_then(Value::as_str) == Some("turn/completed") {
+        let mut retryable = original.clone();
+        retryable["params"]["turn"]["error"] = turn_error;
+        return retryable;
+    }
+    let thread_id = original
+        .pointer("/params/threadId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| active_turn.and_then(|turn| turn.thread_id.clone()));
+    let turn_id = original
+        .pointer("/params/turnId")
+        .or_else(|| original.pointer("/params/turn/id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| active_turn.and_then(|turn| turn.turn_id.clone()));
+    let (Some(thread_id), Some(turn_id)) = (thread_id, turn_id) else {
+        return json!({
+            "jsonrpc": "2.0",
+            "method": "error",
+            "params": {
+                "error": turn_error,
+                "willRetry": false,
+            }
+        });
+    };
+    json!({
+        "jsonrpc": "2.0",
+        "method": "error",
+        "params": {
+            "error": turn_error,
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "willRetry": false,
+        }
+    })
+}
+
+fn terminal_codex_auth_reload_abandoned_request_error(request: &Value) -> Option<Value> {
+    let id = request.get("id")?;
+    Some(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32096,
+            "message": "Codex reloaded the pane credentials. This already-submitted request was not automatically retried because its prior execution outcome is uncertain.",
+            "data": {
+                "code": "codex_auth_reloaded_retry_required",
+                "retryable": true,
+                "automaticallyRetried": false,
+            }
+        }
+    }))
+}
+
+fn terminal_codex_auth_reload_recovery_reports(
+    original: &Value,
+    active_turn: Option<&TerminalCodexGatewayActiveTurn>,
+    outstanding_requests: &[Value],
+) -> Vec<Value> {
+    let trigger_key = original
+        .get("id")
+        .and_then(terminal_codex_app_server_request_id_key);
+    let mut reports = vec![terminal_codex_auth_reload_retryable_error(
+        original,
+        active_turn,
+    )];
+    reports.extend(outstanding_requests.iter().filter_map(|request| {
+        let request_key = request
+            .get("id")
+            .and_then(terminal_codex_app_server_request_id_key);
+        (request_key != trigger_key)
+            .then(|| terminal_codex_auth_reload_abandoned_request_error(request))
+            .flatten()
+    }));
+    reports
+}
+
+fn terminal_codex_auth_reload_exhausted_error(
+    original: &Value,
+    active_turn: Option<&TerminalCodexGatewayActiveTurn>,
+    detail: &str,
+) -> Value {
+    let message = format!(
+        "Codex authentication remained invalid after {TERMINAL_CODEX_AUTH_RELOAD_MAX_ATTEMPTS} on-disk reload attempts. Sign in again for this account."
+    );
+    let clean_detail = clean_terminal_diagnostic_log_text(detail);
+    let data = json!({
+        "code": "codex_auth_reload_exhausted",
+        "detail": clean_detail,
+        "retryable": false,
+    });
+    if original.get("method").is_none() {
+        let Some(id) = original.get("id") else {
+            return json!({
+                "jsonrpc": "2.0",
+                "method": "error",
+                "params": {
+                    "error": {
+                        "code": "codex_auth_reload_exhausted",
+                        "message": message,
+                        "additionalDetails": format!(
+                            "codex_auth_reload_exhausted: {clean_detail}"
+                        ),
+                        "retryable": false,
+                        "automaticallyRetried": false,
+                    },
+                    "willRetry": false,
+                }
+            });
+        };
+        return json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32097,
+                "message": message,
+                "data": data,
+            }
+        });
+    }
+    let turn_error = json!({
+        "message": message,
+        "additionalDetails": format!(
+            "codex_auth_reload_exhausted: {clean_detail}"
+        ),
+        "codexErrorInfo": "unauthorized",
+    });
+    if original.get("method").and_then(Value::as_str) == Some("turn/completed") {
+        let mut exhausted = original.clone();
+        exhausted["params"]["turn"]["error"] = turn_error;
+        return exhausted;
+    }
+    let thread_id = original
+        .pointer("/params/threadId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| active_turn.and_then(|turn| turn.thread_id.clone()));
+    let turn_id = original
+        .pointer("/params/turnId")
+        .or_else(|| original.pointer("/params/turn/id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| active_turn.and_then(|turn| turn.turn_id.clone()));
+    let (Some(thread_id), Some(turn_id)) = (thread_id, turn_id) else {
+        // Background external-token refresh notifications have no turn
+        // correlation. Still surface the deterministic terminal condition;
+        // forwarding the original invalidation would make exhaustion
+        // indistinguishable from another recoverable auth notification.
+        return json!({
+            "jsonrpc": "2.0",
+            "method": "error",
+            "params": {
+                "error": {
+                    "code": "codex_auth_reload_exhausted",
+                    "message": message,
+                    "additionalDetails": format!(
+                        "codex_auth_reload_exhausted: {clean_detail}"
+                    ),
+                    "retryable": false,
+                    "automaticallyRetried": false,
+                },
+                "willRetry": false,
+            }
+        });
+    };
+    json!({
+        "jsonrpc": "2.0",
+        "method": "error",
+        "params": {
+            "error": turn_error,
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "willRetry": false,
+        }
+    })
+}
+
+fn terminal_codex_turn_completed(value: &Value) -> bool {
+    value.get("method").and_then(Value::as_str) == Some("turn/completed")
+}
+
+type TerminalCodexUpstreamSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+async fn terminal_codex_gateway_connect_upstream(
+    upstream_url: &str,
+) -> Result<TerminalCodexUpstreamSocket, String> {
     let mut last_error = None;
     for _ in 0..TERMINAL_CODEX_APP_SERVER_CONNECT_ATTEMPTS {
-        match connect_async(&upstream_url).await {
-            Ok((socket, _)) => {
-                upstream = Some(socket);
-                break;
-            }
+        match connect_async(upstream_url).await {
+            Ok((socket, _)) => return Ok(socket),
             Err(error) => {
                 last_error = Some(error.to_string());
                 sleep(Duration::from_millis(
@@ -18701,17 +19804,273 @@ async fn terminal_codex_gateway_connection(
             }
         }
     }
-    let upstream = upstream.ok_or_else(|| {
-        format!(
-            "Unable to connect Codex TUI gateway to app-server: {}",
-            last_error.unwrap_or_else(|| "connection timed out".to_string())
-        )
-    })?;
+    Err(format!(
+        "Unable to connect Codex TUI gateway to its pane app-server: {}",
+        last_error.unwrap_or_else(|| "connection timed out".to_string())
+    ))
+}
+
+fn terminal_codex_gateway_response_matches(request: &Value, response: &Value) -> bool {
+    let Some(request_id) = request
+        .get("id")
+        .and_then(terminal_codex_app_server_request_id_key)
+    else {
+        return false;
+    };
+    response
+        .get("id")
+        .and_then(terminal_codex_app_server_request_id_key)
+        .is_some_and(|response_id| response_id == request_id)
+}
+
+async fn terminal_codex_gateway_send_internal_request(
+    upstream: &mut TerminalCodexUpstreamSocket,
+    request: &Value,
+    buffered: &mut Vec<Message>,
+) -> Result<(), String> {
+    upstream
+        .send(Message::Text(request.to_string().into()))
+        .await
+        .map_err(|error| format!("Unable to initialize replacement Codex app-server: {error}"))?;
+    loop {
+        let message = timeout(Duration::from_secs(8), upstream.next())
+            .await
+            .map_err(|_| "Replacement Codex app-server initialization timed out.".to_string())?
+            .ok_or_else(|| {
+                "Replacement Codex app-server disconnected during initialization.".to_string()
+            })?
+            .map_err(|error| {
+                format!("Replacement Codex app-server initialization failed: {error}")
+            })?;
+        match message {
+            Message::Text(text) => {
+                let value = serde_json::from_str::<Value>(text.as_ref()).map_err(|error| {
+                    format!("Replacement Codex app-server returned invalid JSON: {error}")
+                })?;
+                if terminal_codex_gateway_response_matches(request, &value) {
+                    if value.get("error").is_some() {
+                        return Err(format!(
+                            "Replacement Codex app-server rejected {}: {}",
+                            request
+                                .get("method")
+                                .and_then(Value::as_str)
+                                .unwrap_or("request"),
+                            value.get("error").unwrap_or(&Value::Null)
+                        ));
+                    }
+                    return Ok(());
+                }
+                buffered.push(Message::Text(text));
+            }
+            Message::Ping(bytes) => {
+                upstream.send(Message::Pong(bytes)).await.map_err(|error| {
+                    format!("Unable to answer replacement Codex app-server ping: {error}")
+                })?;
+            }
+            Message::Close(_) => {
+                return Err(
+                    "Replacement Codex app-server closed during initialization.".to_string(),
+                )
+            }
+            other => buffered.push(other),
+        }
+    }
+}
+
+async fn terminal_codex_gateway_reinitialize_upstream(
+    upstream: &mut TerminalCodexUpstreamSocket,
+    initialize: &Value,
+    initialized: &Value,
+    resume_thread_id: Option<&str>,
+    pane_cwd: &str,
+    pane_config: &Value,
+) -> Result<Vec<Message>, String> {
+    let mut buffered = Vec::new();
+    terminal_codex_gateway_send_internal_request(upstream, initialize, &mut buffered).await?;
+    upstream
+        .send(Message::Text(initialized.to_string().into()))
+        .await
+        .map_err(|error| {
+            format!("Unable to finish replacement Codex app-server initialization: {error}")
+        })?;
+    if let Some(thread_id) = resume_thread_id {
+        let mut resume = json!({
+            "id": format!("diffforge-auth-reload-resume-{}", uuid::Uuid::new_v4()),
+            "method": "thread/resume",
+            "params": { "threadId": thread_id },
+        });
+        terminal_codex_gateway_bind_pane_request(&mut resume, pane_cwd, pane_config);
+        terminal_codex_gateway_send_internal_request(upstream, &resume, &mut buffered).await?;
+    }
+    Ok(buffered)
+}
+
+struct TerminalCodexGatewayRecoveredUpstream {
+    upstream: TerminalCodexUpstreamSocket,
+    connected_generation: u64,
+    buffered: Vec<Message>,
+    attempt: usize,
+}
+
+enum TerminalCodexGatewayRecoveryOutcome {
+    Recovered(TerminalCodexGatewayRecoveredUpstream),
+    Exhausted { detail: String },
+}
+
+struct TerminalCodexGatewayRecoveryInFlight {
+    original: Value,
+    active_turn: Option<TerminalCodexGatewayActiveTurn>,
+    future: futures_util::future::BoxFuture<'static, TerminalCodexGatewayRecoveryOutcome>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn terminal_codex_gateway_recover_upstream(
+    upstream_url: String,
+    restart_sender: mpsc::Sender<TerminalCodexAppServerRestartRequest>,
+    mut connected_generation: u64,
+    auth_reload_budget: Arc<StdMutex<TerminalCodexAuthReloadBudget>>,
+    initialize_request: Option<Value>,
+    initialized_notification: Option<Value>,
+    resume_thread_id: Option<String>,
+    pane_id: String,
+    instance_id: u64,
+    pane_cwd: String,
+    pane_config: Value,
+) -> TerminalCodexGatewayRecoveryOutcome {
+    let mut last_recovery_error =
+        "the replacement app-server did not validate the rotated credentials".to_string();
+    loop {
+        let decision = auth_reload_budget
+            .lock()
+            .ok()
+            .map(|mut budget| {
+                terminal_codex_auth_reload_next(
+                    &mut budget,
+                    &pane_id,
+                    instance_id,
+                    terminal_now_ms(),
+                )
+            })
+            .unwrap_or(TerminalCodexAuthReloadDecision::Exhausted);
+        let TerminalCodexAuthReloadDecision::Retry { attempt, delay_ms } = decision else {
+            log_terminal_status_event(
+                "backend.codex_app_server_gateway.auth_reload_exhausted",
+                json!({
+                    "attempts": TERMINAL_CODEX_AUTH_RELOAD_MAX_ATTEMPTS,
+                    "error": clean_terminal_diagnostic_log_text(&last_recovery_error),
+                    "instance_id": instance_id,
+                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                }),
+            );
+            return TerminalCodexGatewayRecoveryOutcome::Exhausted {
+                detail: last_recovery_error,
+            };
+        };
+        log_terminal_status_event(
+            "backend.codex_app_server_gateway.auth_reload_retry",
+            json!({
+                "attempt": attempt,
+                "delay_ms": delay_ms,
+                "instance_id": instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+            }),
+        );
+        let (response_sender, response_receiver) = oneshot::channel();
+        if restart_sender
+            .send(TerminalCodexAppServerRestartRequest {
+                observed_generation: connected_generation,
+                delay_ms,
+                response: response_sender,
+            })
+            .await
+            .is_err()
+        {
+            last_recovery_error = "the pane app-server supervisor stopped".to_string();
+            continue;
+        }
+        let replacement_generation = match response_receiver.await {
+            Ok(Ok(generation)) => generation,
+            Ok(Err(error)) => {
+                last_recovery_error = error;
+                continue;
+            }
+            Err(_) => {
+                last_recovery_error =
+                    "the pane app-server supervisor dropped its restart response".to_string();
+                continue;
+            }
+        };
+        // The supervisor already replaced the child. A later failed connect
+        // must charge another absolute-budget attempt against that generation.
+        terminal_codex_gateway_record_replacement_started(
+            &mut connected_generation,
+            replacement_generation,
+        );
+        let mut replacement = match terminal_codex_gateway_connect_upstream(&upstream_url).await {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                last_recovery_error = error;
+                continue;
+            }
+        };
+        let buffered = match (initialize_request.as_ref(), initialized_notification.as_ref()) {
+            (Some(initialize), Some(initialized)) => {
+                match terminal_codex_gateway_reinitialize_upstream(
+                    &mut replacement,
+                    initialize,
+                    initialized,
+                    resume_thread_id.as_deref(),
+                    &pane_cwd,
+                    &pane_config,
+                )
+                .await
+                {
+                    Ok(buffered) => buffered,
+                    Err(error) => {
+                        last_recovery_error = error;
+                        continue;
+                    }
+                }
+            }
+            // The failed initialize itself is already an accepted request and
+            // is therefore never replayed. Leave the replacement pristine so
+            // a future explicit initialize can start normally.
+            _ => Vec::new(),
+        };
+        return TerminalCodexGatewayRecoveryOutcome::Recovered(
+            TerminalCodexGatewayRecoveredUpstream {
+                upstream: replacement,
+                connected_generation,
+                buffered,
+                attempt,
+            },
+        );
+    }
+}
+
+async fn terminal_codex_gateway_connection(
+    app: AppHandle,
+    stream: TcpStream,
+    upstream_url: String,
+    restart_sender: mpsc::Sender<TerminalCodexAppServerRestartRequest>,
+    app_server_generation: Arc<AtomicU64>,
+    auth_reload_budget: Arc<StdMutex<TerminalCodexAuthReloadBudget>>,
+    pane_id: String,
+    instance_id: u64,
+    pane_cwd: String,
+    pane_config: Value,
+) -> Result<(), String> {
+    let downstream = accept_async(stream)
+        .await
+        .map_err(|error| format!("Unable to accept Codex TUI websocket: {error}"))?;
+    let upstream = terminal_codex_gateway_connect_upstream(&upstream_url).await?;
+    let mut connected_generation = app_server_generation.load(Ordering::Acquire);
     let (mut downstream_write, mut downstream_read) = downstream.split();
     let (mut upstream_write, mut upstream_read) = upstream.split();
-    let (upstream_sender, mut upstream_receiver) = mpsc::channel::<Message>(1024);
-    let (downstream_sender, mut downstream_receiver) = mpsc::channel::<Message>(1024);
-    let upstream_writer = tauri::async_runtime::spawn(async move {
+    let (mut upstream_sender, mut upstream_receiver) = mpsc::channel::<Message>(1024);
+    let (downstream_sender, mut downstream_receiver) =
+        mpsc::channel::<TerminalCodexGatewayDownstreamMessage>(1024);
+    let mut upstream_writer = tauri::async_runtime::spawn(async move {
         while let Some(message) = upstream_receiver.recv().await {
             if upstream_write.send(message).await.is_err() {
                 break;
@@ -18719,8 +20078,12 @@ async fn terminal_codex_gateway_connection(
         }
     });
     let downstream_writer = tauri::async_runtime::spawn(async move {
-        while let Some(message) = downstream_receiver.recv().await {
-            if downstream_write.send(message).await.is_err() {
+        while let Some(outbound) = downstream_receiver.recv().await {
+            let sent = downstream_write.send(outbound.message).await.is_ok();
+            if let Some(flushed) = outbound.flushed {
+                let _ = flushed.send(sent);
+            }
+            if !sent {
                 break;
             }
         }
@@ -18729,7 +20092,15 @@ async fn terminal_codex_gateway_connection(
         String,
         TerminalCodexGatewayPendingRequest,
     >::new()));
-    let mut client_requests = HashMap::<String, String>::new();
+    let mut client_requests = HashMap::<String, TerminalCodexGatewayClientRequest>::new();
+    let mut client_request_sequence = 0_u64;
+    let mut blocked_bootstrap_requests = VecDeque::<Value>::new();
+    let mut initialize_request = None::<Value>;
+    let mut initialized_notification = None::<Value>;
+    let mut active_turn = None::<TerminalCodexGatewayActiveTurn>;
+    let mut auth_recovery = None::<TerminalCodexGatewayRecoveryInFlight>;
+    let mut recovery_buffered_upstream = VecDeque::<Message>::new();
+    let mut recovery_deferred_downstream = VecDeque::<Message>::new();
 
     log_terminal_status_event(
         "backend.codex_app_server_gateway.connected",
@@ -18740,41 +20111,137 @@ async fn terminal_codex_gateway_connection(
     );
 
     loop {
+        let recovering = auth_recovery.is_some();
+        let has_buffered_upstream = !recovery_buffered_upstream.is_empty();
+        let replay_deferred_downstream =
+            !recovering && !has_buffered_upstream && !recovery_deferred_downstream.is_empty();
         tokio::select! {
-            downstream_message = downstream_read.next() => {
+            downstream_message = async {
+                if replay_deferred_downstream {
+                    return recovery_deferred_downstream.pop_front().map(Ok);
+                }
+                downstream_read.next().await
+            }, if recovering || !has_buffered_upstream => {
                 let Some(downstream_message) = downstream_message else { break; };
                 let message = downstream_message
                     .map_err(|error| format!("Codex TUI websocket read failed: {error}"))?;
+                if recovering {
+                    match terminal_codex_gateway_service_recovery_control(
+                        &downstream_sender,
+                        &message,
+                    )
+                    .await
+                    {
+                        TerminalCodexRecoveryControlOutcome::Continue => continue,
+                        TerminalCodexRecoveryControlOutcome::Close => break,
+                        TerminalCodexRecoveryControlOutcome::NotControl => {
+                            // These messages have provably not crossed the
+                            // replacement app-server boundary, so they are the
+                            // only operations recovery may later submit.
+                            if recovery_deferred_downstream.len()
+                                < TERMINAL_CODEX_AUTH_RECOVERY_DOWNSTREAM_QUEUE_MAX
+                            {
+                                recovery_deferred_downstream.push_back(message);
+                            } else {
+                                let error = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "error",
+                                    "params": {
+                                        "error": {
+                                            "message": "Codex authentication recovery queue is full; the request was not submitted.",
+                                            "additionalDetails": "codex_auth_recovery_queue_full"
+                                        },
+                                        "willRetry": false
+                                    }
+                                });
+                                if !terminal_codex_gateway_send_downstream(
+                                    &downstream_sender,
+                                    Message::Text(error.to_string().into()),
+                                    false,
+                                )
+                                .await
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 match message {
                     Message::Text(text) => {
                         let mut value = serde_json::from_str::<Value>(text.as_ref()).ok();
                         if let Some(value) = value.as_mut() {
                             terminal_codex_app_server_enable_tui_capabilities(value);
+                            terminal_codex_gateway_bind_pane_request(
+                                value,
+                                &pane_cwd,
+                                &pane_config,
+                            );
+                            match value.get("method").and_then(Value::as_str) {
+                                Some("initialize") => initialize_request = Some(value.clone()),
+                                Some("initialized") => {
+                                    initialized_notification = Some(value.clone())
+                                }
+                                _ => {}
+                            }
+                        }
+                        if value.as_ref().is_some_and(terminal_codex_gateway_is_thread_bootstrap) {
+                            let request = value.take().expect("checked Codex thread request");
+                            // Preserve request order once any bootstrap is waiting.
+                            // Otherwise verify and enqueue the request while holding
+                            // the same mutex used by terminal cleanup to revoke the
+                            // pane trust state. This makes clear-vs-forward ordering
+                            // atomic instead of awaiting after a stale state read.
+                            let outcome = if blocked_bootstrap_requests.is_empty() {
+                                terminal_codex_gateway_try_forward_thread_bootstrap(
+                                    &upstream_sender,
+                                    &pane_id,
+                                    instance_id,
+                                    &request,
+                                )
+                            } else {
+                                TerminalCodexThreadBootstrapForward::Blocked
+                            };
+                            match outcome {
+                                TerminalCodexThreadBootstrapForward::Sent => {
+                                    terminal_codex_gateway_track_client_request(
+                                        &mut client_requests,
+                                        &mut client_request_sequence,
+                                        &request,
+                                    );
+                                }
+                                TerminalCodexThreadBootstrapForward::Blocked
+                                | TerminalCodexThreadBootstrapForward::Full => {
+                                    if blocked_bootstrap_requests.len() < 16 {
+                                        blocked_bootstrap_requests.push_back(request);
+                                    } else if let Some(request_id) = request.get("id").cloned() {
+                                        let error = json!({
+                                            "jsonrpc": "2.0",
+                                            "id": request_id,
+                                            "error": {
+                                                "code": -32091,
+                                                "message": "Codex hook trust review is still required for this pane."
+                                            }
+                                        });
+                                        let _ = downstream_sender
+                                            .send(TerminalCodexGatewayDownstreamMessage {
+                                                message: Message::Text(error.to_string().into()),
+                                                flushed: None,
+                                            })
+                                            .await;
+                                    }
+                                }
+                                TerminalCodexThreadBootstrapForward::Closed => break,
+                            }
+                            continue;
                         }
                         if let Some(value) = value.as_ref() {
                             terminal_codex_gateway_track_client_request(
                                 &mut client_requests,
+                                &mut client_request_sequence,
                                 value,
                             );
-                            if terminal_codex_gateway_resolve_startup_hook_review(
-                                &pane_id,
-                                instance_id,
-                                value,
-                            ) {
-                                let method = value
-                                    .get("method")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string();
-                                tauri::async_runtime::spawn(
-                                    terminal_codex_gateway_publish_startup_hook_review_resolved(
-                                        app.clone(),
-                                        pane_id.clone(),
-                                        instance_id,
-                                        method,
-                                    ),
-                                );
-                            }
                         }
                         let is_response = value.as_ref().is_some_and(|value| {
                             value.get("method").is_none()
@@ -18808,16 +20275,30 @@ async fn terminal_codex_gateway_connection(
                                 continue;
                             }
                         }
+                        let sent_request = value.clone();
                         let text = value.map(|value| value.to_string()).unwrap_or_else(|| text.to_string());
                         if upstream_sender.send(Message::Text(text.into())).await.is_err() {
                             break;
+                        }
+                        match sent_request
+                            .as_ref()
+                            .and_then(|request| request.get("method"))
+                            .and_then(Value::as_str)
+                        {
+                            Some("turn/start") => {
+                                active_turn = sent_request
+                                    .as_ref()
+                                    .map(terminal_codex_gateway_active_turn);
+                            }
+                            Some("turn/interrupt") => active_turn = None,
+                            _ => {}
                         }
                     }
                     Message::Binary(bytes) => {
                         if upstream_sender.send(Message::Binary(bytes)).await.is_err() { break; }
                     }
                     Message::Ping(bytes) => {
-                        if downstream_sender.send(Message::Pong(bytes)).await.is_err() { break; }
+                        if downstream_sender.send(TerminalCodexGatewayDownstreamMessage { message: Message::Pong(bytes), flushed: None }).await.is_err() { break; }
                     }
                     Message::Close(frame) => {
                         let _ = upstream_sender.send(Message::Close(frame)).await;
@@ -18826,15 +20307,69 @@ async fn terminal_codex_gateway_connection(
                     Message::Pong(_) | Message::Frame(_) => {}
                 }
             }
-            upstream_message = upstream_read.next() => {
+            upstream_message = async {
+                if let Some(message) = recovery_buffered_upstream.pop_front() {
+                    Some(Ok(message))
+                } else {
+                    upstream_read.next().await
+                }
+            }, if !recovering => {
                 let Some(upstream_message) = upstream_message else { break; };
-                let message = upstream_message
-                    .map_err(|error| format!("Codex app-server websocket read failed: {error}"))?;
+                let message = match upstream_message {
+                    Ok(message) => message,
+                    Err(error) => {
+                        return Err(format!("Codex pane app-server connection failed: {error}"));
+                    }
+                };
                 match message {
                     Message::Text(text) => {
-                        if let Ok(value) = serde_json::from_str::<Value>(text.as_ref()) {
+                        if let Ok(mut value) = serde_json::from_str::<Value>(text.as_ref()) {
+                            terminal_codex_gateway_observe_turn_started(
+                                &mut active_turn,
+                                &value,
+                            );
+                            let correlated_method = terminal_codex_gateway_client_response_method(
+                                &client_requests,
+                                &value,
+                            );
+                            if terminal_codex_app_server_auth_invalidated(
+                                &value,
+                                correlated_method,
+                            ) {
+                                // Once a request crossed upstream, recovery can no longer prove
+                                // that it did not start. Never replay it. Keep only the correlation
+                                // needed to surface a deterministic retry-required result.
+                                let interrupted_turn = active_turn.take();
+                                let resume_thread_id = interrupted_turn
+                                    .as_ref()
+                                    .and_then(|turn| turn.thread_id.clone());
+                                let recovery_future = terminal_codex_gateway_recover_upstream(
+                                    upstream_url.clone(),
+                                    restart_sender.clone(),
+                                    connected_generation,
+                                    Arc::clone(&auth_reload_budget),
+                                    initialize_request.clone(),
+                                    initialized_notification.clone(),
+                                    resume_thread_id,
+                                    pane_id.clone(),
+                                    instance_id,
+                                    pane_cwd.clone(),
+                                    pane_config.clone(),
+                                )
+                                .boxed();
+                                auth_recovery = Some(TerminalCodexGatewayRecoveryInFlight {
+                                    original: value,
+                                    active_turn: interrupted_turn,
+                                    future: recovery_future,
+                                });
+                                continue;
+                            }
                             let client_method = terminal_codex_gateway_take_client_response_method(
                                 &mut client_requests,
+                                &value,
+                            );
+                            terminal_codex_gateway_clear_completed_turn(
+                                &mut active_turn,
                                 &value,
                             );
                             if client_method.as_deref() == Some("hooks/list") {
@@ -18846,53 +20381,41 @@ async fn terminal_codex_gateway_connection(
                                 )
                                 .await;
                             }
-                            if let Some(event) = terminal_codex_app_server_request_event(
+                            if client_method.as_deref() == Some("config/read") {
+                                terminal_codex_gateway_merge_pane_config_response(
+                                    &mut value,
+                                    &pane_config,
+                                );
+                            }
+                            if let Some(event) = terminal_codex_gateway_register_server_request(
+                                &pending,
                                 &pane_id,
                                 instance_id,
                                 &value,
                             ) {
-                                if let Some(request_key) = value
-                                    .get("id")
-                                    .and_then(terminal_codex_app_server_request_id_key)
-                                {
-                                    let method = value
-                                        .get("method")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or_default()
-                                        .to_string();
-                                    if let Ok(mut requests) = pending.lock() {
-                                        requests.insert(
-                                            request_key,
-                                            TerminalCodexGatewayPendingRequest {
-                                                method,
-                                                winner: None,
-                                            },
-                                        );
-                                    }
-                                    let web_ready = terminal_codex_gateway_spawn_web_waiter(
-                                        app.clone(),
-                                        pane_id.clone(),
-                                        instance_id,
-                                        value.clone(),
-                                        event,
-                                        Arc::clone(&pending),
-                                        upstream_sender.clone(),
+                                let web_ready = terminal_codex_gateway_spawn_web_waiter(
+                                    app.clone(),
+                                    pane_id.clone(),
+                                    instance_id,
+                                    value.clone(),
+                                    event,
+                                    Arc::clone(&pending),
+                                    upstream_sender.clone(),
+                                );
+                                let published = timeout(Duration::from_millis(500), web_ready)
+                                    .await
+                                    .ok()
+                                    .and_then(Result::ok)
+                                    .unwrap_or(false);
+                                if !published {
+                                    log_terminal_status_event(
+                                        "backend.codex_app_server_gateway.uir_publish_error",
+                                        json!({
+                                            "instance_id": instance_id,
+                                            "method": value.get("method").and_then(Value::as_str).unwrap_or_default(),
+                                            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                                        }),
                                     );
-                                    let published = timeout(Duration::from_millis(500), web_ready)
-                                        .await
-                                        .ok()
-                                        .and_then(Result::ok)
-                                        .unwrap_or(false);
-                                    if !published {
-                                        log_terminal_status_event(
-                                            "backend.codex_app_server_gateway.uir_publish_error",
-                                            json!({
-                                                "instance_id": instance_id,
-                                                "method": value.get("method").and_then(Value::as_str).unwrap_or_default(),
-                                                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                                            }),
-                                        );
-                                    }
                                 }
                             } else if value.get("method").and_then(Value::as_str)
                                 == Some("serverRequest/resolved")
@@ -18916,20 +20439,162 @@ async fn terminal_codex_gateway_connection(
                                     }
                                 }
                             }
+                            let text = value.to_string();
+                            if !terminal_codex_gateway_send_downstream(
+                                &downstream_sender,
+                                Message::Text(text.into()),
+                                false,
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                            continue;
                         }
-                        if downstream_sender.send(Message::Text(text)).await.is_err() { break; }
+                        if downstream_sender.send(TerminalCodexGatewayDownstreamMessage { message: Message::Text(text), flushed: None }).await.is_err() { break; }
                     }
                     Message::Binary(bytes) => {
-                        if downstream_sender.send(Message::Binary(bytes)).await.is_err() { break; }
+                        if downstream_sender.send(TerminalCodexGatewayDownstreamMessage { message: Message::Binary(bytes), flushed: None }).await.is_err() { break; }
                     }
                     Message::Ping(bytes) => {
                         if upstream_sender.send(Message::Pong(bytes)).await.is_err() { break; }
                     }
                     Message::Close(frame) => {
-                        let _ = downstream_sender.send(Message::Close(frame)).await;
+                        let _ = downstream_sender.send(TerminalCodexGatewayDownstreamMessage { message: Message::Close(frame), flushed: None }).await;
                         break;
                     }
                     Message::Pong(_) | Message::Frame(_) => {}
+                }
+            }
+            recovery_result = async {
+                auth_recovery
+                    .as_mut()
+                    .expect("guarded Codex auth recovery")
+                    .future
+                    .as_mut()
+                    .await
+            }, if recovering => {
+                let recovery = auth_recovery
+                    .take()
+                    .expect("completed Codex auth recovery");
+                match recovery_result {
+                    TerminalCodexGatewayRecoveryOutcome::Exhausted { detail } => {
+                        let exhausted = terminal_codex_auth_reload_exhausted_error(
+                            &recovery.original,
+                            recovery.active_turn.as_ref(),
+                            &detail,
+                        );
+                        let _ = terminal_codex_gateway_send_downstream(
+                            &downstream_sender,
+                            Message::Text(exhausted.to_string().into()),
+                            true,
+                        )
+                        .await;
+                        // The pane-instance restart budget is permanently
+                        // exhausted. Stop this connection instead of allowing
+                        // another request to start an unbounded recovery cycle.
+                        break;
+                    }
+                    TerminalCodexGatewayRecoveryOutcome::Recovered(recovered) => {
+                        connected_generation = recovered.connected_generation;
+                        let stale_server_requests = pending
+                            .lock()
+                            .ok()
+                            .map(|mut pending| pending.drain().collect::<Vec<_>>())
+                            .unwrap_or_default();
+                        for (request_key, request) in stale_server_requests {
+                            let request_id = request_key
+                                .split_once(':')
+                                .map(|(_, value)| json!(value))
+                                .unwrap_or(Value::Null);
+                            terminal_codex_gateway_publish_resolution(
+                                &app,
+                                &pane_id,
+                                instance_id,
+                                &request_id,
+                                &request.method,
+                                "codex_app_server_auth_reload",
+                            )
+                            .await;
+                        }
+
+                        upstream_writer.abort();
+                        let (mut replacement_write, replacement_read) =
+                            recovered.upstream.split();
+                        let (replacement_sender, mut replacement_receiver) =
+                            mpsc::channel::<Message>(1024);
+                        let replacement_writer = tauri::async_runtime::spawn(async move {
+                            while let Some(message) = replacement_receiver.recv().await {
+                                if replacement_write.send(message).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                        upstream_read = replacement_read;
+                        upstream_sender = replacement_sender;
+                        upstream_writer = replacement_writer;
+
+                        // Re-enter every message observed during initialize/resume through
+                        // the ordinary upstream branch. This preserves auth detection, turn
+                        // state, hooks/list correlation, and permission/UIR registration.
+                        recovery_buffered_upstream.extend(recovered.buffered);
+                        let outstanding_requests =
+                            terminal_codex_gateway_outstanding_requests(&client_requests);
+                        let reports = terminal_codex_auth_reload_recovery_reports(
+                            &recovery.original,
+                            recovery.active_turn.as_ref(),
+                            &outstanding_requests,
+                        );
+                        let abandoned_count = reports.len().saturating_sub(1);
+                        for report in reports {
+                            recovery_buffered_upstream
+                                .push_back(Message::Text(report.to_string().into()));
+                        }
+                        log_terminal_status_event(
+                            "backend.codex_app_server_gateway.auth_reload_recovered",
+                            json!({
+                                "attempt": recovered.attempt,
+                                "deferred_unsubmitted_requests": recovery_deferred_downstream.len(),
+                                "instance_id": instance_id,
+                                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                                "replayed_active_turn": false,
+                                "replayed_accepted_requests": 0,
+                                "reported_abandoned_requests": abandoned_count,
+                            }),
+                        );
+                    }
+                }
+            }
+            _ = sleep(Duration::from_millis(50)), if !recovering && !blocked_bootstrap_requests.is_empty() => {
+                let mut upstream_closed = false;
+                while let Some(value) = blocked_bootstrap_requests.front().cloned() {
+                    // Re-check under the discovery mutex for every request. If
+                    // cleanup clears the pane between queued items, no later
+                    // item can inherit the first request's stale allow result.
+                    match terminal_codex_gateway_try_forward_thread_bootstrap(
+                        &upstream_sender,
+                        &pane_id,
+                        instance_id,
+                        &value,
+                    ) {
+                        TerminalCodexThreadBootstrapForward::Sent => {
+                            blocked_bootstrap_requests.pop_front();
+                            terminal_codex_gateway_track_client_request(
+                                &mut client_requests,
+                                &mut client_request_sequence,
+                                &value,
+                            );
+                        }
+                        TerminalCodexThreadBootstrapForward::Blocked
+                        | TerminalCodexThreadBootstrapForward::Full => break,
+                        TerminalCodexThreadBootstrapForward::Closed => {
+                            upstream_closed = true;
+                            break;
+                        }
+                    }
+                }
+                if upstream_closed {
+                    break;
                 }
             }
         }
@@ -18960,19 +20625,465 @@ async fn terminal_codex_gateway_connection(
     Ok(())
 }
 
+fn terminal_json_merge(base: &mut Value, overlay: &Value) {
+    match (base, overlay) {
+        (Value::Object(base), Value::Object(overlay)) => {
+            for (key, value) in overlay {
+                terminal_json_merge(base.entry(key.clone()).or_insert(Value::Null), value);
+            }
+        }
+        (base, overlay) => *base = overlay.clone(),
+    }
+}
+
+/// ALLOWLIST of Codex request-`config` override keys that are safe to pass
+/// through to thread execution. Everything NOT in this set is stripped, so
+/// thread execution resolves the SAME hooks as `hooks/list` (which in Codex
+/// 0.144 accepts only `cwds` and receives no request config) — guaranteeing
+/// reviewed catalog == executed hooks. This is an allowlist, not a denylist, on
+/// purpose: a denylist is fragile and un-upgrade-safe (the hook-injection surface
+/// spans `hooks`/`hooks.*`, `bypass_hook_trust`, `notify`→legacy_notify,
+/// `project_root_markers`/`projects.*`, AND `features.hooks`/`features.plugins`/
+/// `features.remote_plugin` feature gates — and future Codex versions can add
+/// more). The allowlisted keys reflect the user's in-TUI selections (model,
+/// reasoning effort) and cannot inject/trust/redirect hook discovery. Non-hook
+/// operational settings DiffForge cares about (sandbox/approval/mcp) are already
+/// applied via managed launch args + CODEX_HOME config, not per-request.
+/// Case/separator-insensitive on the full key.
+fn terminal_codex_thread_config_passthrough(key: &str) -> bool {
+    let canon: String = key
+        .trim()
+        .chars()
+        .filter(|character| *character != '_' && *character != '-')
+        .flat_map(char::to_lowercase)
+        .collect();
+    matches!(canon.as_str(), "model" | "modelreasoningeffort")
+}
+
+fn terminal_codex_gateway_bind_pane_request(
+    request: &mut Value,
+    pane_cwd: &str,
+    _pane_config: &Value,
+) {
+    let Some(method) = request
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    if !matches!(
+        method.as_str(),
+        "thread/start" | "thread/resume" | "thread/fork" | "hooks/list" | "config/read"
+    ) {
+        return;
+    }
+    let Some(object) = request.as_object_mut() else {
+        return;
+    };
+    let params = object.entry("params").or_insert_with(|| json!({}));
+    if !params.is_object() {
+        *params = json!({});
+    }
+    let Some(params) = params.as_object_mut() else {
+        return;
+    };
+    match method.as_str() {
+        "thread/start" | "thread/resume" | "thread/fork" => {
+            params.insert("cwd".to_string(), json!(pane_cwd));
+            // hooks/list and thread execution must resolve the same natural
+            // layered configuration (managed CODEX_HOME + pane cwd project
+            // layers). A request-level hooks override would either mask a
+            // reviewed project hook or add a hook that was never reviewed.
+            // `hooks/list` receives NO request config, so thread execution must
+            // carry no config override that could inject/trust/redirect a hook,
+            // else reviewed catalog != executed hooks (a trust bypass). Rather
+            // than deny an ever-growing set of hook-affecting keys, ALLOWLIST the
+            // few proven-safe passthroughs (model / reasoning effort) and strip
+            // everything else — see terminal_codex_thread_config_passthrough.
+            let remove_config = match params.get_mut("config") {
+                Some(Value::Object(config)) => {
+                    config.retain(|key, _| terminal_codex_thread_config_passthrough(key));
+                    config.is_empty()
+                }
+                Some(_) => true,
+                None => false,
+            };
+            if remove_config {
+                params.remove("config");
+            }
+        }
+        // Codex 0.144 HooksListParams accepts `cwds`, not `cwd`/`config`.
+        // The pane-owned app-server evaluates this native request against
+        // its own working directory and CODEX_HOME hook configuration.
+        "hooks/list" => {
+            params.insert("cwds".to_string(), json!([pane_cwd]));
+            params.remove("cwd");
+            params.remove("config");
+        }
+        // ConfigReadParams accepts cwd but no arbitrary config overlay.
+        "config/read" => {
+            params.insert("cwd".to_string(), json!(pane_cwd));
+            params.remove("config");
+        }
+        _ => {}
+    }
+}
+
+fn terminal_codex_gateway_is_thread_bootstrap(request: &Value) -> bool {
+    matches!(
+        request.get("method").and_then(Value::as_str),
+        Some("thread/start" | "thread/resume" | "thread/fork")
+    )
+}
+
+fn terminal_codex_gateway_try_forward_thread_bootstrap(
+    sender: &mpsc::Sender<Message>,
+    pane_id: &str,
+    instance_id: u64,
+    request: &Value,
+) -> TerminalCodexThreadBootstrapForward {
+    let Ok(states) = terminal_codex_hook_trust_discovery_states().lock() else {
+        return TerminalCodexThreadBootstrapForward::Blocked;
+    };
+    let state = states
+        .get(&(pane_id.to_string(), instance_id))
+        .map(|entry| entry.state);
+    if !terminal_codex_hook_trust_allows_thread(state) {
+        return TerminalCodexThreadBootstrapForward::Blocked;
+    }
+    match sender.try_send(Message::Text(request.to_string().into())) {
+        Ok(()) => TerminalCodexThreadBootstrapForward::Sent,
+        Err(mpsc::error::TrySendError::Full(_)) => TerminalCodexThreadBootstrapForward::Full,
+        Err(mpsc::error::TrySendError::Closed(_)) => TerminalCodexThreadBootstrapForward::Closed,
+    }
+}
+
+fn terminal_codex_hook_trust_allows_thread(
+    state: Option<TerminalCodexHookTrustDiscoveryState>,
+) -> bool {
+    matches!(
+        state,
+        Some(
+            TerminalCodexHookTrustDiscoveryState::Open
+                | TerminalCodexHookTrustDiscoveryState::Resolved
+        )
+    )
+}
+
+fn terminal_codex_gateway_pane_config(env_vars: &[(String, String)]) -> Value {
+    let env_value = |key: &str| {
+        env_vars
+            .iter()
+            .find_map(|(candidate, value)| (candidate == key).then(|| value.trim().to_string()))
+            .filter(|value| !value.is_empty())
+    };
+    let Some(home) = env_value("CODEX_HOME").or_else(|| env_value("DIFFFORGE_CODEX_HOME")) else {
+        return json!({});
+    };
+    let home = PathBuf::from(home);
+    let mut config = json!({});
+    let mut merge_toml_file = |path: PathBuf| {
+        let Ok(body) = fs::read_to_string(path) else {
+            return;
+        };
+        let Ok(value) = toml::from_str::<toml::Value>(&body) else {
+            return;
+        };
+        if let Ok(value) = serde_json::to_value(value) {
+            terminal_json_merge(&mut config, &value);
+        }
+    };
+    merge_toml_file(home.join("config.toml"));
+    if let Some(profile) = env_value("DIFFFORGE_CODEX_PROFILE") {
+        merge_toml_file(home.join(format!("{profile}.config.toml")));
+    }
+    if let Ok(hooks) = fs::read(home.join("hooks.json"))
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).map_err(std::io::Error::other))
+    {
+        if let Some(hooks) = hooks.get("hooks") {
+            if let Some(object) = config.as_object_mut() {
+                object.insert("hooks".to_string(), hooks.clone());
+            }
+        }
+    }
+    config
+}
+
+fn terminal_codex_gateway_merge_pane_config_response(response: &mut Value, pane_config: &Value) {
+    if response.get("error").is_some() {
+        return;
+    }
+    let Some(response) = response.as_object_mut() else {
+        return;
+    };
+    let result = response.entry("result").or_insert_with(|| json!({}));
+    if !result.is_object() {
+        *result = json!({});
+    }
+    let Some(result) = result.as_object_mut() else {
+        return;
+    };
+    let config = result.entry("config").or_insert_with(|| json!({}));
+    terminal_json_merge(config, pane_config);
+    result.entry("origins").or_insert_with(|| json!({}));
+}
+
+struct TerminalCodexAppServerStartingChild {
+    child: Option<std::process::Child>,
+}
+
+impl TerminalCodexAppServerStartingChild {
+    fn new(child: std::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child_mut(&mut self) -> &mut std::process::Child {
+        self.child
+            .as_mut()
+            .expect("Codex startup child must exist until gateway handoff")
+    }
+
+    fn into_child(mut self) -> std::process::Child {
+        self.child
+            .take()
+            .expect("Codex startup child must exist at gateway handoff")
+    }
+
+    fn stop_and_wait(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for TerminalCodexAppServerStartingChild {
+    fn drop(&mut self) {
+        self.stop_and_wait();
+    }
+}
+
+fn terminal_codex_app_server_trusted_args(
+    coordination: Option<&TerminalCoordinationSession>,
+    permission_mode: Option<&str>,
+    app_control_mcp_launch: Option<&(String, Vec<String>)>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if coordination.is_some() {
+        let permission_mode = permission_mode.unwrap_or(TERMINAL_PERMISSION_MODE_ACCEPT_EDITS);
+        let (approval_policy, sandbox_mode) = match permission_mode {
+            TERMINAL_PERMISSION_MODE_PLAN => ("never", "read-only"),
+            TERMINAL_PERMISSION_MODE_ASK => ("on-request", "workspace-write"),
+            TERMINAL_PERMISSION_MODE_FULL_ACCESS | TERMINAL_PERMISSION_MODE_BYPASS => {
+                ("never", "danger-full-access")
+            }
+            _ => ("never", "workspace-write"),
+        };
+
+        // The pane-owned CODEX_HOME base config already contains the managed
+        // permission definition, selected default permission profile,
+        // coordination-kernel, workspace-mcp-gateway, their tool approvals,
+        // and shell environment policy. App-control instructions are synced
+        // into this trusted base only for app-control launches. Pass only the
+        // launch-specific approval/sandbox posture here.
+        for (key, value) in [
+            ("approval_policy", approval_policy),
+            ("sandbox_mode", sandbox_mode),
+        ] {
+            terminal_codex_push_config_override(
+                &mut args,
+                format!("{key}={}", terminal_toml_string(value)),
+            );
+        }
+    }
+
+    if let Some((command, server_args)) = app_control_mcp_launch {
+        if coordination.is_none() {
+            // Uncoordinated app-control sessions have no pane-owned managed
+            // home to update, so preserve their trusted launch override.
+            append_codex_app_control_developer_instructions_arg(&mut args);
+        }
+        let app_control_tools = APP_CONTROL_MCP_TOOL_NAMES
+            .iter()
+            .map(|tool| (*tool).to_string())
+            .collect::<Vec<_>>();
+        terminal_codex_push_config_override(
+            &mut args,
+            terminal_codex_mcp_server_inline_override(
+                APP_CONTROL_MCP_SERVER_NAME,
+                command,
+                server_args,
+                &app_control_tools,
+                &[],
+            ),
+        );
+        if coordination.is_none() {
+            terminal_codex_push_config_override(
+                &mut args,
+                format!(
+                    "shell_environment_policy.inherit={}",
+                    terminal_toml_string("all")
+                ),
+            );
+        }
+    }
+    args
+}
+
+fn terminal_codex_push_config_override(args: &mut Vec<String>, config: String) {
+    args.push("-c".to_string());
+    args.push(config);
+}
+
+fn terminal_codex_mcp_server_inline_override(
+    server_key: &str,
+    command: &str,
+    server_args: &[String],
+    approved_tools: &[String],
+    env_vars: &[(String, String)],
+) -> String {
+    let mut seen_tools = HashSet::new();
+    let tools = approved_tools
+        .iter()
+        .map(|tool| tool.trim())
+        .filter(|tool| !tool.is_empty() && seen_tools.insert((*tool).to_string()))
+        .map(|tool| {
+            format!(
+                "{}={{approval_mode={}}}",
+                terminal_toml_key_segment(tool),
+                terminal_toml_string("approve")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut seen_env = HashSet::new();
+    let env = env_vars
+        .iter()
+        .filter(|(key, _)| !key.trim().is_empty() && seen_env.insert(key.clone()))
+        .map(|(key, value)| {
+            format!(
+                "{}={}",
+                terminal_toml_key_segment(key),
+                terminal_toml_string(value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let env = if env.is_empty() {
+        String::new()
+    } else {
+        format!(",env={{{env}}}")
+    };
+    format!(
+        "mcp_servers.{}={{enabled=true,command={},args={},default_tools_approval_mode={},tools={{{tools}}}{env}}}",
+        terminal_toml_key_segment(server_key),
+        terminal_toml_string(command),
+        terminal_toml_string_array(server_args),
+        terminal_toml_string("prompt"),
+    )
+}
+
+fn terminal_codex_app_server_process_args(
+    listen_url: &str,
+    trusted_args: &[String],
+) -> Vec<String> {
+    let mut args = Vec::with_capacity(trusted_args.len().saturating_add(3));
+    args.push("app-server".to_string());
+    args.extend_from_slice(trusted_args);
+    args.extend(["--listen".to_string(), listen_url.to_string()]);
+    args
+}
+
+#[cfg(any(windows, test))]
+fn terminal_codex_windows_node_entrypoint(command_path: &Path) -> Option<PathBuf> {
+    let extension = command_path.extension()?.to_str()?;
+    if !extension.eq_ignore_ascii_case("cmd") && !extension.eq_ignore_ascii_case("bat") {
+        return None;
+    }
+    let parent = command_path.parent()?;
+    let mut candidates = vec![parent
+        .join("node_modules")
+        .join("@openai")
+        .join("codex")
+        .join("bin")
+        .join("codex.js")];
+    if parent
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(".bin"))
+    {
+        if let Some(node_modules) = parent.parent() {
+            candidates.push(
+                node_modules
+                    .join("@openai")
+                    .join("codex")
+                    .join("bin")
+                    .join("codex.js"),
+            );
+        }
+    }
+    candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+#[cfg(any(windows, test))]
+fn terminal_codex_windows_node_program(command_path: &Path) -> PathBuf {
+    command_path
+        .parent()
+        .map(|parent| parent.join("node.exe"))
+        .filter(|candidate| candidate.is_file())
+        .unwrap_or_else(|| PathBuf::from("node.exe"))
+}
+
 fn terminal_spawn_codex_app_server_process(
     command_path: &str,
     listen_url: &str,
     working_directory: &Path,
     env_vars: &[(String, String)],
+    trusted_args: &[String],
 ) -> Result<std::process::Child, String> {
+    let process_args = terminal_codex_app_server_process_args(listen_url, trusted_args);
     #[cfg(windows)]
     let mut command = {
         let lower = command_path.to_ascii_lowercase();
         if lower.ends_with(".cmd") || lower.ends_with(".bat") {
-            let mut command = Command::new("cmd.exe");
-            command.args(["/D", "/S", "/C", command_path]);
-            command
+            let command_path_buf = PathBuf::from(command_path);
+            if let Some(entrypoint) =
+                terminal_codex_windows_node_entrypoint(command_path_buf.as_path())
+            {
+                // npm's codex.cmd shim routes through cmd.exe, whose command
+                // line limit is only about 8191 UTF-16 code units. App-control
+                // carries a large trusted developer prompt, so invoke the
+                // package's Node entrypoint directly under CreateProcessW's
+                // much larger native limit. This preserves the exact trusted
+                // arguments instead of weakening or truncating them.
+                let node_program = terminal_codex_windows_node_program(&command_path_buf);
+                let mut native_args = vec![entrypoint.to_string_lossy().to_string()];
+                native_args.extend(process_args.iter().cloned());
+                let native_len = windows_agent_launch_command_line_len(
+                    node_program.to_string_lossy().as_ref(),
+                    &native_args,
+                );
+                if native_len >= WINDOWS_NATIVE_CLAUDE_LAUNCH_STAGE_THRESHOLD {
+                    return Err(format!(
+                        "Codex app-server launch is too long even for the native Windows Node entrypoint ({native_len} characters)."
+                    ));
+                }
+                let mut command = Command::new(node_program);
+                command.arg(entrypoint);
+                command
+            } else {
+                let batch_len =
+                    windows_agent_launch_command_line_len(command_path, &process_args);
+                if batch_len >= WINDOWS_CLAUDE_LAUNCH_STAGE_THRESHOLD {
+                    return Err(format!(
+                        "Codex app-server batch launch is too long for cmd.exe ({batch_len} characters), and the trusted @openai/codex Node entrypoint could not be located."
+                    ));
+                }
+                let mut command = Command::new("cmd.exe");
+                command.args(["/D", "/S", "/C", command_path]);
+                command
+            }
         } else {
             Command::new(command_path)
         }
@@ -18980,9 +21091,7 @@ fn terminal_spawn_codex_app_server_process(
     #[cfg(not(windows))]
     let mut command = Command::new(command_path);
     command
-        .arg("app-server")
-        .arg("--listen")
-        .arg(listen_url)
+        .args(process_args)
         .current_dir(working_directory)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -19005,14 +21114,83 @@ fn terminal_spawn_codex_app_server_process(
         .map_err(|error| format!("Unable to start Codex app-server: {error}"))
 }
 
+async fn terminal_start_ready_codex_app_server_process(
+    command_path: &str,
+    upstream_url: &str,
+    upstream_port: u16,
+    working_directory: &Path,
+    env_vars: &[(String, String)],
+    trusted_args: &[String],
+) -> Result<std::process::Child, String> {
+    let mut starting_child = TerminalCodexAppServerStartingChild::new(
+        terminal_spawn_codex_app_server_process(
+            command_path,
+            upstream_url,
+            working_directory,
+            env_vars,
+            trusted_args,
+        )?,
+    );
+    let readiness_url = format!("http://127.0.0.1:{upstream_port}/readyz");
+    let readiness_client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+        .map_err(|error| format!("Unable to create Codex app-server probe: {error}"))?;
+    let ready_started = Instant::now();
+    loop {
+        if let Ok(Some(status)) = starting_child.child_mut().try_wait() {
+            starting_child.child.take();
+            return Err(format!(
+                "Codex app-server exited before becoming ready ({status})."
+            ));
+        }
+        if readiness_client
+            .get(&readiness_url)
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            return Ok(starting_child.into_child());
+        }
+        if ready_started.elapsed()
+            >= Duration::from_millis(TERMINAL_CODEX_APP_SERVER_READY_TIMEOUT_MS)
+        {
+            return Err("Codex app-server did not become ready in time.".to_string());
+        }
+        sleep(Duration::from_millis(
+            TERMINAL_CODEX_APP_SERVER_READY_POLL_MS,
+        ))
+        .await;
+    }
+}
+
+fn terminal_stop_codex_app_server_process(child: &mut Option<std::process::Child>) {
+    if let Some(mut child) = child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 async fn terminal_start_codex_app_server_gateway(
     app: AppHandle,
     command_path: &str,
     working_directory: &Path,
     env_vars: &[(String, String)],
+    trusted_args: &[String],
+    managed_app_control_enabled: Option<bool>,
     pane_id: &str,
     instance_id: u64,
 ) -> Result<TerminalCodexGatewayHandle, String> {
+    if let Some(enabled) = managed_app_control_enabled {
+        let home = terminal_launch_env_value(env_vars, "DIFFFORGE_CODEX_HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                "Managed Codex app-server launch is missing DIFFFORGE_CODEX_HOME.".to_string()
+            })?;
+        crate::coordination::kernel::codex_managed_home_set_app_control_instructions(
+            &home, enabled,
+        )?;
+    }
     let upstream_reservation = TcpListener::bind(("127.0.0.1", 0))
         .await
         .map_err(|error| format!("Unable to reserve Codex app-server port: {error}"))?;
@@ -19030,63 +21208,88 @@ async fn terminal_start_codex_app_server_gateway(
         .map_err(|error| format!("Unable to read Codex TUI gateway port: {error}"))?
         .port();
     let endpoint = format!("ws://127.0.0.1:{proxy_port}");
-    let mut child = terminal_spawn_codex_app_server_process(
+
+    sleep(Duration::from_millis(
+        terminal_codex_app_server_startup_jitter_ms(pane_id, instance_id),
+    ))
+    .await;
+    let child = terminal_start_ready_codex_app_server_process(
         command_path,
         &upstream_url,
+        upstream_port,
         working_directory,
         env_vars,
-    )?;
-    let readiness_url = format!("http://127.0.0.1:{upstream_port}/readyz");
-    let readiness_client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(500))
-        .build()
-        .map_err(|error| format!("Unable to create Codex app-server probe: {error}"))?;
-    let ready_started = Instant::now();
-    loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            return Err(format!(
-                "Codex app-server exited before becoming ready ({status})."
-            ));
-        }
-        if readiness_client
-            .get(&readiness_url)
-            .send()
-            .await
-            .is_ok_and(|response| response.status().is_success())
-        {
-            break;
-        }
-        if ready_started.elapsed()
-            >= Duration::from_millis(TERMINAL_CODEX_APP_SERVER_READY_TIMEOUT_MS)
-        {
-            let _ = child.kill();
-            return Err("Codex app-server did not become ready in time.".to_string());
-        }
-        sleep(Duration::from_millis(
-            TERMINAL_CODEX_APP_SERVER_READY_POLL_MS,
-        ))
-        .await;
-    }
+        trusted_args,
+    )
+    .await?;
     let (shutdown_sender, mut shutdown_receiver) = oneshot::channel::<()>();
     let handle = TerminalCodexGatewayHandle {
         endpoint: endpoint.clone(),
         shutdown: Arc::new(StdMutex::new(Some(shutdown_sender))),
     };
+    let (restart_sender, mut restart_receiver) =
+        mpsc::channel::<TerminalCodexAppServerRestartRequest>(8);
+    let app_server_generation = Arc::new(AtomicU64::new(1));
+    let auth_reload_budget = Arc::new(StdMutex::new(TerminalCodexAuthReloadBudget::default()));
     let gateway_pane_id = pane_id.to_string();
     let gateway_upstream_url = upstream_url.clone();
+    let gateway_command_path = command_path.to_string();
+    let gateway_working_directory = working_directory.to_path_buf();
+    let gateway_env_vars = env_vars.to_vec();
+    let gateway_trusted_args = trusted_args.to_vec();
+    let pane_cwd = working_directory.to_string_lossy().to_string();
+    let pane_config = terminal_codex_gateway_pane_config(env_vars);
+    let supervisor_generation = Arc::clone(&app_server_generation);
     tauri::async_runtime::spawn(async move {
+        let mut child = Some(child);
         log_terminal_status_event(
             "backend.codex_app_server_gateway.ready",
             json!({
                 "endpoint": clean_terminal_diagnostic_log_text(&endpoint),
                 "instance_id": instance_id,
+                "pane_cwd": clean_terminal_diagnostic_log_text(&pane_cwd),
                 "pane_id": clean_terminal_diagnostic_log_text(&gateway_pane_id),
+                "process_model": "one_app_server_per_pane",
                 "transport": "localhost_websocket",
             }),
         );
         loop {
             tokio::select! {
                 _ = &mut shutdown_receiver => break,
+                Some(restart_request) = restart_receiver.recv() => {
+                    let current_generation = supervisor_generation.load(Ordering::Acquire);
+                    if restart_request.observed_generation != current_generation {
+                        let response = if child.is_some() {
+                            Ok(current_generation)
+                        } else {
+                            Err("The pane app-server replacement is not running.".to_string())
+                        };
+                        let _ = restart_request.response.send(response);
+                        continue;
+                    }
+                    terminal_stop_codex_app_server_process(&mut child);
+                    sleep(Duration::from_millis(restart_request.delay_ms)).await;
+                    match terminal_start_ready_codex_app_server_process(
+                        &gateway_command_path,
+                        &gateway_upstream_url,
+                        upstream_port,
+                        &gateway_working_directory,
+                        &gateway_env_vars,
+                        &gateway_trusted_args,
+                    )
+                    .await
+                    {
+                        Ok(replacement) => {
+                            child = Some(replacement);
+                            let generation = current_generation.saturating_add(1);
+                            supervisor_generation.store(generation, Ordering::Release);
+                            let _ = restart_request.response.send(Ok(generation));
+                        }
+                        Err(error) => {
+                            let _ = restart_request.response.send(Err(error));
+                        }
+                    }
+                }
                 accepted = proxy_listener.accept() => {
                     let Ok((stream, _)) = accepted else {
                         sleep(Duration::from_millis(100)).await;
@@ -19094,14 +21297,24 @@ async fn terminal_start_codex_app_server_gateway(
                     };
                     let app = app.clone();
                     let upstream_url = gateway_upstream_url.clone();
+                    let restart_sender = restart_sender.clone();
+                    let app_server_generation = Arc::clone(&app_server_generation);
+                    let auth_reload_budget = Arc::clone(&auth_reload_budget);
                     let pane_id = gateway_pane_id.clone();
+                    let pane_cwd = pane_cwd.clone();
+                    let pane_config = pane_config.clone();
                     tauri::async_runtime::spawn(async move {
                         if let Err(error) = terminal_codex_gateway_connection(
                             app,
                             stream,
                             upstream_url,
+                            restart_sender,
+                            app_server_generation,
+                            auth_reload_budget,
                             pane_id.clone(),
                             instance_id,
+                            pane_cwd,
+                            pane_config,
                         ).await {
                             log_terminal_status_event(
                                 "backend.codex_app_server_gateway.connection_error",
@@ -19115,7 +21328,10 @@ async fn terminal_start_codex_app_server_gateway(
                     });
                 }
                 _ = sleep(Duration::from_secs(1)) => {
-                    if child.try_wait().ok().flatten().is_some() {
+                    if child
+                        .as_mut()
+                        .is_some_and(|child| child.try_wait().ok().flatten().is_some())
+                    {
                         log_terminal_status_event(
                             "backend.codex_app_server_gateway.app_server_exited",
                             json!({
@@ -19128,8 +21344,7 @@ async fn terminal_start_codex_app_server_gateway(
                 }
             }
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        terminal_stop_codex_app_server_process(&mut child);
     });
     Ok(handle)
 }
@@ -20048,6 +22263,12 @@ async fn terminal_write_inner(
         }
         return Ok(());
     };
+    // Claim the pane before app-fork/coordination awaits and retain the claim
+    // through activity publication and the PTY flush. An idle restart cannot
+    // discard a prompt that was admitted from the inventory snapshot.
+    let Some(_operation) = terminal_operation_try_admit(&instance) else {
+        return Err("Terminal session is closing.".to_string());
+    };
     let mut prompt_event_id = prompt_event_id;
     let mut prompt_event_text = prompt_event_text;
     if terminal_write_source_is_permission_config(prompt_event_source.as_deref())
@@ -20251,23 +22472,28 @@ async fn terminal_write_inner(
         },
     }));
 
-    let escape_interrupt_task_id = if terminal_write_escape_should_interrupt(
+    let escape_should_interrupt = terminal_write_escape_should_interrupt(
         &data,
         instance.coordination.is_some(),
         prompt_event_source.as_deref(),
         todo_action.as_deref(),
-    ) {
-        instance
+    );
+    if escape_should_interrupt {
+        let active_task_id = instance
             .active_task
             .lock()
             .await
             .as_ref()
-            .map(|task| task.task_id.clone())
-    } else {
-        None
-    };
-    if let Some(active_task_id) = escape_interrupt_task_id.as_deref() {
+            .map(|task| task.task_id.clone());
         write_terminal_interrupt_escape(&instance).await?;
+        publish_terminal_provider_turn_interrupted(
+            &app,
+            state,
+            cloud_mcp_state,
+            &instance,
+            "escape_key",
+        )
+        .await?;
         mark_terminal_active_task_interrupted(
             cloud_mcp_state,
             &pane_id,
@@ -20283,7 +22509,7 @@ async fn terminal_write_inner(
             &pane_id,
             &instance,
             "escape_key",
-            Some(active_task_id),
+            active_task_id.as_deref(),
         )
         .await?;
         todo_dispatch_mark_active_for_pane_interrupted(
@@ -20909,9 +23135,7 @@ fn terminal_agent_kind_is_codex(value: &str) -> bool {
 
 fn terminal_codex_hook_trust_prompt_answer_input(key: &str) -> Option<String> {
     match key {
-        "trust_all_and_continue" | "trustallandcontinue" | "trust" | "2" => {
-            Some("2\r".to_string())
-        }
+        "trust_all_and_continue" | "trustallandcontinue" | "trust" | "2" => Some("2\r".to_string()),
         "continue_without_trusting" | "continuewithouttrusting" | "without_trusting" | "3" => {
             Some("3\r".to_string())
         }
@@ -20920,12 +23144,17 @@ fn terminal_codex_hook_trust_prompt_answer_input(key: &str) -> Option<String> {
     }
 }
 
-fn terminal_codex_hook_trust_answer_keeps_open(
-    provider_request_id: &str,
-    option_id: &str,
-) -> bool {
-    provider_request_id.starts_with("codex-hook-trust-")
+fn terminal_codex_hook_trust_answer_keeps_open(provider_request_id: &str, option_id: &str) -> bool {
+    terminal_codex_hook_trust_is_catalog_request(provider_request_id)
         && terminal_activity_hook_prompt_option_id(option_id) == "review_hooks"
+}
+
+fn terminal_codex_hook_trust_is_catalog_request(provider_request_id: &str) -> bool {
+    provider_request_id.starts_with("codex-hook-trust-catalog-")
+}
+
+fn terminal_codex_hook_trust_is_fail_closed_request(provider_request_id: &str) -> bool {
+    provider_request_id.starts_with("codex-hook-trust-error-")
 }
 
 fn terminal_codex_hook_trust_prompt_options() -> Vec<Value> {
@@ -20996,7 +23225,12 @@ fn terminal_codex_catalog_hooks(catalog: &Value) -> Vec<Value> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .flat_map(|row| row.get("hooks").and_then(Value::as_array).into_iter().flatten())
+        .flat_map(|row| {
+            row.get("hooks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
         .filter(|hook| hook.get("enabled").and_then(Value::as_bool) != Some(false))
         .filter(|hook| hook.get("isManaged").and_then(Value::as_bool) != Some(true))
         .cloned()
@@ -21011,11 +23245,17 @@ fn terminal_codex_catalog_hooks(catalog: &Value) -> Vec<Value> {
 }
 
 fn terminal_codex_hook_identity(hook: &Value) -> String {
-    ["key", "currentHash", "eventName", "sourcePath", "trustStatus"]
-        .iter()
-        .map(|key| hook.get(*key).and_then(Value::as_str).unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join(":")
+    [
+        "key",
+        "currentHash",
+        "eventName",
+        "sourcePath",
+        "trustStatus",
+    ]
+    .iter()
+    .map(|key| hook.get(*key).and_then(Value::as_str).unwrap_or_default())
+    .collect::<Vec<_>>()
+    .join(":")
 }
 
 fn terminal_codex_hooks_requiring_trust(catalog: &Value) -> Vec<Value> {
@@ -21035,13 +23275,150 @@ fn terminal_codex_hooks_requiring_trust(catalog: &Value) -> Vec<Value> {
         .collect()
 }
 
+fn terminal_codex_validated_hook_catalog(
+    response: &Value,
+    expected_cwd: &Path,
+) -> Result<Value, String> {
+    if let Some(error) = response.get("error") {
+        return Err(format!("hooks/list returned an error: {error}"));
+    }
+    let result = response
+        .get("result")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "hooks/list did not return an object result".to_string())?;
+    let rows = result
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "hooks/list result.data is missing or malformed".to_string())?;
+    if rows.len() != 1 {
+        return Err(format!(
+            "hooks/list returned {} cwd rows for a single-cwd request",
+            rows.len()
+        ));
+    }
+    let row = rows[0]
+        .as_object()
+        .ok_or_else(|| "hooks/list returned a malformed cwd row".to_string())?;
+    let row_cwd = row
+        .get("cwd")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "hooks/list cwd row omitted its cwd".to_string())?;
+    if Path::new(row_cwd) != expected_cwd {
+        return Err("hooks/list returned a row for a different cwd".to_string());
+    }
+    let errors = row
+        .get("errors")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "hooks/list cwd row omitted its errors array".to_string())?;
+    if !errors.is_empty() {
+        return Err(format!(
+            "hooks/list cwd row reported errors: {}",
+            Value::Array(errors.clone())
+        ));
+    }
+    let hooks = row
+        .get("hooks")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "hooks/list cwd row omitted or malformed its hooks array".to_string())?;
+    for hook in hooks {
+        let hook = hook
+            .as_object()
+            .ok_or_else(|| "hooks/list cwd row contained a malformed hook entry".to_string())?;
+        for field in ["key", "currentHash", "trustStatus"] {
+            if !hook
+                .get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err(format!(
+                    "hooks/list hook entry omitted or malformed {field}"
+                ));
+            }
+        }
+        for field in ["enabled", "isManaged"] {
+            if !hook.get(field).is_some_and(Value::is_boolean) {
+                return Err(format!(
+                    "hooks/list hook entry omitted or malformed {field}"
+                ));
+            }
+        }
+    }
+    Ok(json!({"data": [Value::Object(row.clone())]}))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn terminal_codex_gateway_fail_hook_discovery(
+    app: &AppHandle,
+    state: &TerminalState,
+    cloud_mcp_state: &CloudMcpState,
+    pane_id: &str,
+    instance_id: u64,
+    generation: u64,
+    error: &str,
+) {
+    let prompt_text = format!(
+        "Codex could not load a valid hook trust catalog from app-server. The agent remains blocked; close and reopen this terminal to retry.\n\n{error}"
+    );
+    if !terminal_codex_hook_trust_discovery_transition(
+        pane_id,
+        instance_id,
+        generation,
+        &[TerminalCodexHookTrustDiscoveryState::Pending],
+        TerminalCodexHookTrustDiscoveryState::FailedClosed,
+    ) {
+        return;
+    }
+    let event = json!({
+        "hook_event_name": "UserInputRequired",
+        "provider": "codex",
+        "permission_request_id": format!("codex-hook-trust-error-{generation}"),
+        "prompting_user_kind": "error",
+        "prompting_user_text": prompt_text,
+        "prompt_options": [{
+            "id": "acknowledge",
+            "label": "Acknowledge",
+            "description": "Keep Codex blocked until this terminal is reopened."
+        }],
+        "manual_approval_required": true,
+        "provider_blocked_for_user": true,
+        "provider_health_error": true,
+        "requires_user_input": true,
+        "terminal_is_prompting_user": true,
+        "timestamp_ms": terminal_now_ms(),
+        "trust_source": "codex_app_server_hooks_list",
+    });
+    let publish_error = handle_terminal_activity_hook_event(
+        app,
+        &state.terminals,
+        cloud_mcp_state,
+        pane_id,
+        instance_id,
+        event,
+        "codex-app-server-hook-trust-error",
+    )
+    .await
+    .err();
+    log_terminal_status_event(
+        "backend.codex_hook_trust.discovery_error",
+        json!({
+            "error": clean_terminal_diagnostic_log_text(error),
+            "instance_id": instance_id,
+            "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+            "publish_error": publish_error
+                .as_deref()
+                .map(clean_terminal_diagnostic_log_text)
+                .unwrap_or_default(),
+            "source": "gateway_hooks_list_response",
+        }),
+    );
+}
+
 fn spawn_terminal_codex_hook_trust_response_watchdog(
     app: AppHandle,
     pane_id: String,
     instance_id: u64,
 ) {
-    let Some(discovery) =
-        terminal_codex_hook_trust_discovery_snapshot(&pane_id, instance_id)
+    let Some(discovery) = terminal_codex_hook_trust_discovery_snapshot(&pane_id, instance_id)
     else {
         return;
     };
@@ -21082,9 +23459,7 @@ async fn terminal_codex_gateway_handle_hooks_list_response(
     instance_id: u64,
     response: &Value,
 ) {
-    let Some(discovery) =
-        terminal_codex_hook_trust_discovery_snapshot(pane_id, instance_id)
-    else {
+    let Some(discovery) = terminal_codex_hook_trust_discovery_snapshot(pane_id, instance_id) else {
         return;
     };
     if discovery.state != TerminalCodexHookTrustDiscoveryState::Pending {
@@ -21125,66 +23500,24 @@ async fn terminal_codex_gateway_handle_hooks_list_response(
         return;
     }
 
-    let catalog = match response.get("error") {
-        Some(error) => {
-            let prompt_text = format!(
-                "Codex could not load its hook trust state from app-server. The agent remains blocked; close and reopen this terminal to retry.\n\n{error}"
-            );
-            if !terminal_codex_hook_trust_discovery_transition(
-                pane_id,
-                instance_id,
-                discovery.generation,
-                &[TerminalCodexHookTrustDiscoveryState::Pending],
-                TerminalCodexHookTrustDiscoveryState::Open,
-            ) {
-                return;
-            }
-            let event = json!({
-                "hook_event_name": "UserInputRequired",
-                "provider": "codex",
-                "permission_request_id": format!("codex-hook-trust-error-{}", discovery.generation),
-                "prompting_user_kind": "error",
-                "prompting_user_text": prompt_text,
-                "prompt_options": [{
-                    "id": "acknowledge",
-                    "label": "Acknowledge",
-                    "description": "Keep Codex blocked until this terminal is reopened."
-                }],
-                "manual_approval_required": true,
-                "provider_blocked_for_user": true,
-                "provider_health_error": true,
-                "requires_user_input": true,
-                "terminal_is_prompting_user": true,
-                "timestamp_ms": terminal_now_ms(),
-                "trust_source": "codex_app_server_hooks_list",
-            });
-            let publish_error = handle_terminal_activity_hook_event(
+    let catalog = match terminal_codex_validated_hook_catalog(
+        response,
+        instance.working_directory.as_ref(),
+    ) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            terminal_codex_gateway_fail_hook_discovery(
                 app,
-                &state.terminals,
+                state.inner(),
                 cloud_mcp_state.inner(),
                 pane_id,
                 instance_id,
-                event,
-                "codex-app-server-hook-trust-error",
+                discovery.generation,
+                &error,
             )
-            .await
-            .err();
-            log_terminal_status_event(
-                "backend.codex_hook_trust.discovery_error",
-                json!({
-                    "error": clean_terminal_diagnostic_log_text(&error.to_string()),
-                    "instance_id": instance_id,
-                    "pane_id": clean_terminal_diagnostic_log_text(pane_id),
-                    "publish_error": publish_error
-                        .as_deref()
-                        .map(clean_terminal_diagnostic_log_text)
-                        .unwrap_or_default(),
-                    "source": "gateway_hooks_list_response",
-                }),
-            );
+            .await;
             return;
         }
-        None => response.get("result").cloned().unwrap_or(Value::Null),
     };
     let configured_hook_count = terminal_codex_catalog_hooks(&catalog).len();
     let hooks = terminal_codex_hooks_requiring_trust(&catalog);
@@ -21214,12 +23547,15 @@ async fn terminal_codex_gateway_handle_hooks_list_response(
         .map(terminal_codex_hook_identity)
         .collect::<Vec<_>>();
     let catalog_hash = cloud_mcp_short_hash(&identities.join("|"));
-    let request_id = format!("codex-hook-trust-{catalog_hash}");
+    let request_id = format!("codex-hook-trust-catalog-{catalog_hash}");
     let hook_labels = hooks
         .iter()
         .take(12)
         .map(|hook| {
-            let event = hook.get("eventName").and_then(Value::as_str).unwrap_or("hook");
+            let event = hook
+                .get("eventName")
+                .and_then(Value::as_str)
+                .unwrap_or("hook");
             let source = hook
                 .get("sourcePath")
                 .and_then(Value::as_str)
@@ -21231,7 +23567,11 @@ async fn terminal_codex_gateway_handle_hooks_list_response(
     let mut prompt_text = format!(
         "{} Codex {} new or changed and need review before they can run.\n{}",
         hooks.len(),
-        if hooks.len() == 1 { "hook is" } else { "hooks are" },
+        if hooks.len() == 1 {
+            "hook is"
+        } else {
+            "hooks are"
+        },
         hook_labels.join("\n"),
     );
     if overflow > 0 {
@@ -21283,15 +23623,11 @@ async fn terminal_codex_gateway_handle_hooks_list_response(
         );
         return;
     }
-    let post_publish_discovery =
-        terminal_codex_hook_trust_discovery_snapshot(pane_id, instance_id);
-    let post_publish_terminal_is_current = terminal_activity_hook_current_instance(
-        &state.terminals,
-        pane_id,
-        instance_id,
-    )
-    .await
-    .is_some();
+    let post_publish_discovery = terminal_codex_hook_trust_discovery_snapshot(pane_id, instance_id);
+    let post_publish_terminal_is_current =
+        terminal_activity_hook_current_instance(&state.terminals, pane_id, instance_id)
+            .await
+            .is_some();
     if post_publish_terminal_is_current
         && post_publish_discovery.is_some_and(|entry| {
             entry.generation == discovery.generation
@@ -21783,10 +24119,7 @@ async fn terminal_answer_agent_prompt_remote_command(
         }));
     }
 
-    if interaction
-        .provider_request_id
-        .starts_with("codex-hook-trust-error-")
-    {
+    if terminal_codex_hook_trust_is_fail_closed_request(&interaction.provider_request_id) {
         if let Ok(mut interactions) = state.terminal_structured_interactions.lock() {
             interactions.remove(&interaction.interaction_id);
         }
@@ -21842,15 +24175,12 @@ async fn terminal_answer_agent_prompt_remote_command(
     )
     .await;
     if let Err(error) = write_result {
-        let terminal_still_current = get_terminal_instance_if_current(
-            state.inner(),
-            &pane_id,
-            Some(instance.id),
-        )
-        .await
-        .ok()
-        .flatten()
-        .is_some();
+        let terminal_still_current =
+            get_terminal_instance_if_current(state.inner(), &pane_id, Some(instance.id))
+                .await
+                .ok()
+                .flatten()
+                .is_some();
         if terminal_still_current {
             return Err(error);
         }
@@ -21866,13 +24196,10 @@ async fn terminal_answer_agent_prompt_remote_command(
             "terminal_closed_before_write",
         ));
     }
-    let codex_hook_trust_interaction = interaction
-        .provider_request_id
-        .starts_with("codex-hook-trust-");
-    let review_hooks = terminal_codex_hook_trust_answer_keeps_open(
-        &interaction.provider_request_id,
-        &option_id,
-    );
+    let codex_hook_trust_interaction =
+        terminal_codex_hook_trust_is_catalog_request(&interaction.provider_request_id);
+    let review_hooks =
+        terminal_codex_hook_trust_answer_keeps_open(&interaction.provider_request_id, &option_id);
     let awaiting_provider_confirmation = codex_hook_trust_interaction && !review_hooks;
     if !review_hooks && !awaiting_provider_confirmation {
         if let Ok(mut interactions) = state.terminal_structured_interactions.lock() {
@@ -22246,6 +24573,12 @@ async fn terminal_delete_selection(
             "reason": "stale_or_missing_terminal",
         }));
     };
+    let Some(_operation) = terminal_operation_try_admit(&instance) else {
+        return Ok(json!({
+            "deleted": false,
+            "reason": "terminal_closing",
+        }));
+    };
 
     let _input_guard = instance.input_queue.lock().await;
     let mut gate = instance.input_gate.lock().await;
@@ -22452,6 +24785,43 @@ async fn write_terminal_interrupt_escape(instance: &TerminalInstance) -> Result<
     Ok(())
 }
 
+async fn publish_terminal_provider_turn_interrupted(
+    app: &AppHandle,
+    state: &TerminalState,
+    cloud_mcp_state: &CloudMcpState,
+    instance: &TerminalInstance,
+    reason: &str,
+) -> Result<(), String> {
+    let runtime = terminal_runtime_snapshot(instance);
+    let event = terminal_activity_watchdog_event(
+        instance,
+        &runtime,
+        "Interrupt",
+        "backend-terminal-interrupt",
+        reason,
+    );
+    process_terminal_activity_hook_event(
+        app,
+        &state.terminals,
+        cloud_mcp_state,
+        &instance.metadata.pane_id,
+        instance.id,
+        instance,
+        &event,
+        "backend-terminal-interrupt",
+    )
+    .await;
+    let applied = terminal_runtime_snapshot(instance);
+    if applied.event_type != "provider-turn-interrupted"
+        || applied.activity_status != "interrupted"
+        || applied.command_phase != "interrupted"
+        || applied.input_ready
+    {
+        return Err("Unable to publish terminal interrupt runtime state.".to_string());
+    }
+    Ok(())
+}
+
 async fn mark_terminal_active_task_interrupted(
     cloud_mcp_state: &CloudMcpState,
     pane_id: &str,
@@ -22636,6 +25006,14 @@ async fn terminal_interrupt_agent_inner(
         .as_ref()
         .map(|task| task.task_id.clone());
     write_terminal_interrupt_escape(&instance).await?;
+    publish_terminal_provider_turn_interrupted(
+        app,
+        state,
+        cloud_mcp_state,
+        &instance,
+        &reason,
+    )
+    .await?;
     let interrupted_active_task = mark_terminal_active_task_interrupted(
         cloud_mcp_state,
         &pane_id,
@@ -22923,10 +25301,48 @@ async fn terminal_close(
         instance_id,
         preserve_coordination_session,
         wait_for_cleanup,
+        None,
     )
     .await?;
 
     Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn terminal_restart_if_idle(
+    app: AppHandle,
+    state: State<'_, TerminalState>,
+    cloud_mcp_state: State<'_, CloudMcpState>,
+    pane_id: String,
+    instance_id: u64,
+    launch_epoch: String,
+) -> Result<Value, String> {
+    validate_terminal_pane_id(&pane_id)?;
+    let launch_epoch = launch_epoch.trim().to_string();
+    if launch_epoch.is_empty() {
+        return Err("A launch epoch is required for guarded terminal restart.".to_string());
+    }
+    let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
+    let _lifecycle_guard = lifecycle_lock.lock().await;
+    let restarted = close_terminal_session(
+        Some(app),
+        &state,
+        Some(cloud_mcp_state.inner()),
+        &pane_id,
+        Some(instance_id),
+        true,
+        false,
+        Some(&launch_epoch),
+    )
+    .await?;
+    Ok(json!({
+        "contract": "diffforge.terminal_restart_if_idle.v1",
+        "pane_id": pane_id,
+        "instance_id": instance_id,
+        "launch_epoch": launch_epoch,
+        "restarted": restarted,
+        "reason": if restarted { "idle_closed" } else { "stale_or_busy" },
+    }))
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -23621,7 +26037,203 @@ mod terminal_tests {
         assert_eq!(terminal_output_coalesce_window_ms(false), 16);
     }
 
-    fn codex_app_server_test_interaction(method: &str, params: Value) -> TerminalStructuredInteraction {
+    #[test]
+    fn restart_if_idle_guard_aborts_on_busy_instance_or_epoch_race() {
+        assert!(terminal_restart_guard_allows(
+            7, 7, "pane:7", "pane:7", "idle", "open"
+        ));
+        assert!(!terminal_restart_guard_allows(
+            7, 7, "pane:7", "pane:7", "running", "open"
+        ));
+        assert!(!terminal_restart_guard_allows(
+            8, 7, "pane:8", "pane:7", "idle", "open"
+        ));
+        assert!(!terminal_restart_guard_allows(
+            7, 7, "pane:new", "pane:7", "idle", "open"
+        ));
+    }
+
+    #[tokio::test]
+    async fn restart_if_idle_serializes_task_prompt_and_runtime_admission() {
+        let root = env::temp_dir().join(format!("restart-if-idle-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let size = PtySize {
+            rows: 12,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let warm = create_warm_shell_pty_in_directory(size, &root).unwrap();
+        let coordination = TerminalCoordinationSession {
+            repo_path: root.to_string_lossy().to_string(),
+            db_path: root.join("coordination.db").to_string_lossy().to_string(),
+            mcp_command: "diffforge".to_string(),
+            agent_id: "codex".to_string(),
+            agent_kind: "codex".to_string(),
+            session_id: "session-restart-race".to_string(),
+            terminal_launch_epoch: Some("pane-race:41".to_string()),
+            env_vars: Vec::new(),
+        };
+        let metadata = TerminalInstanceMetadata {
+            pane_id: "pane-race".to_string(),
+            agent_kind: "codex".to_string(),
+            ..TerminalInstanceMetadata::default()
+        };
+        let (instance, _reader) = TerminalInstance::from_warm_shell(
+            41,
+            warm,
+            root.clone(),
+            false,
+            Some(coordination),
+            TerminalSessionMode::General,
+            metadata,
+            TerminalLaunchRuntimeMetadata::default(),
+            false,
+        );
+        let terminals = Arc::new(RwLock::new(HashMap::from([(
+            "pane-race".to_string(),
+            instance.clone(),
+        )])));
+        let state = TerminalState {
+            terminals: Arc::clone(&terminals),
+            terminal_input_queues: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_input_transport: Arc::new(StdMutex::new(None)),
+            terminal_output_transport: Arc::new(StdMutex::new(None)),
+            terminal_activity_transport: Arc::new(StdMutex::new(None)),
+            terminal_activity_transport_tokens: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_structured_interactions: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_structured_interaction_waiters: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_output_transport_subscribers: Arc::new(StdMutex::new(HashMap::new())),
+            parked_prompts: Arc::new(RwLock::new(HashMap::new())),
+            active_audio_input_target: Arc::new(StdMutex::new(None)),
+            audio_route_gate: Arc::new(StdMutex::new(TerminalAudioRouteGate::default())),
+            lifecycle_lock: Arc::new(Mutex::new(())),
+            pty_pool: Arc::new(PtyPool::new()),
+            cleanup_tracker: Arc::new(TerminalCleanupTracker::new()),
+            workspace_topology_cache: Arc::new(RwLock::new(HashMap::new())),
+            next_terminal_instance_id: AtomicU64::new(42),
+            next_terminal_input_queue_id: AtomicU64::new(1),
+            next_terminal_output_subscriber_id: AtomicU64::new(1),
+        };
+
+        // This clone models the UI inventory snapshot. Busy state is
+        // published only afterwards, before the backend's atomic final check.
+        let _inventory_snapshot = instance.clone();
+        {
+            let map = terminals.read().await;
+            let current = map.get("pane-race").unwrap();
+            *current.active_task.lock().await = Some(TerminalActiveTask {
+                task_id: "task-arrived-after-snapshot".to_string(),
+                title: "Busy now".to_string(),
+            });
+        }
+        let restarted = close_terminal_session(
+            None,
+            &state,
+            None,
+            "pane-race",
+            Some(41),
+            true,
+            false,
+            Some("pane-race:41"),
+        )
+        .await
+        .unwrap();
+        assert!(!restarted);
+        assert!(terminals.read().await.contains_key("pane-race"));
+
+        *instance.active_task.lock().await = None;
+        *instance.runtime.lock().unwrap() = TerminalRuntimeSnapshot::opened_idle(None);
+
+        // A prompt accepted before async coordination/app-fork preflight owns
+        // an operation claim. The final restart check must fail even though
+        // runtime and the input queue still look idle at this instant.
+        let pending_prompt = terminal_operation_try_admit(&instance).unwrap();
+        let restarted = close_terminal_session(
+            None,
+            &state,
+            None,
+            "pane-race",
+            Some(41),
+            true,
+            false,
+            Some("pane-race:41"),
+        )
+        .await
+        .unwrap();
+        assert!(!restarted);
+        assert!(terminals.read().await.contains_key("pane-race"));
+        drop(pending_prompt);
+
+        // A delayed hook that wins admission publishes busy state first; close
+        // then observes that state and retains the pane.
+        let activity_publication = terminal_operation_try_admit(&instance).unwrap();
+        *instance.runtime.lock().unwrap() = TerminalRuntimeSnapshot {
+            status: "active".to_string(),
+            activity_status: "thinking".to_string(),
+            command_phase: "running".to_string(),
+            input_ready: false,
+            input_ready_at: None,
+            prompt_ready_at: None,
+            completed_at: None,
+            provider_session_id: None,
+            native_session_id: None,
+            fork_from_provider_session_id: None,
+            provider_turn_id: Some("turn-race".to_string()),
+            turn_id: Some("turn-race".to_string()),
+            source: "test-delayed-hook".to_string(),
+            event_type: "provider-turn-started".to_string(),
+            hook_event_name: "UserPromptSubmit".to_string(),
+            updated_at_ms: terminal_now_ms(),
+        };
+        drop(activity_publication);
+        let restarted = close_terminal_session(
+            None,
+            &state,
+            None,
+            "pane-race",
+            Some(41),
+            true,
+            false,
+            Some("pane-race:41"),
+        )
+        .await
+        .unwrap();
+        assert!(!restarted);
+        assert!(terminals.read().await.contains_key("pane-race"));
+
+        // If close wins while truly idle, it marks the admission state closing
+        // before removal. A previously cloned delayed publisher cannot mutate
+        // that removed instance afterwards.
+        *instance.runtime.lock().unwrap() = TerminalRuntimeSnapshot::opened_idle(None);
+        let delayed_clone = instance.clone();
+        let restarted = close_terminal_session(
+            None,
+            &state,
+            None,
+            "pane-race",
+            Some(41),
+            true,
+            true,
+            Some("pane-race:41"),
+        )
+        .await
+        .unwrap();
+        assert!(restarted);
+        assert!(!terminals.read().await.contains_key("pane-race"));
+        assert!(terminal_operation_try_admit(&delayed_clone).is_none());
+
+        // TerminalState::drop is the production process-shutdown fallback and
+        // intentionally flips global shutdown state. This isolated command
+        // regression already closed its PTY, so do not poison parallel tests.
+        std::mem::forget(state);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn codex_app_server_test_interaction(
+        method: &str,
+        params: Value,
+    ) -> TerminalStructuredInteraction {
         TerminalStructuredInteraction {
             interaction_id: "uir:codex:request-1".to_string(),
             revision: 1,
@@ -23682,20 +26294,337 @@ mod terminal_tests {
         assert_eq!(args[0], "--remote");
         assert_eq!(args[1], gateway.endpoint);
         assert!(args.iter().any(|arg| arg == "--no-alt-screen"));
-        assert!(env_vars.iter().any(|(key, value)| {
-            key == "DIFFFORGE_CODEX_APP_SERVER_UIR" && value == "1"
-        }));
+        assert!(env_vars
+            .iter()
+            .any(|(key, value)| { key == "DIFFFORGE_CODEX_APP_SERVER_UIR" && value == "1" }));
+    }
+
+    #[test]
+    fn per_pane_codex_thread_uses_natural_layered_hooks_and_its_own_cwd() {
+        let mut first = json!({
+            "id": 1,
+            "method": "thread/start",
+            "params": { "config": {
+                "model": "client-override",
+                "hooks": { "after_agent": [{ "command": "unreviewed-client-hook" }] }
+            } }
+        });
+        let mut second = json!({
+            "id": 2,
+            "method": "thread/start",
+            "params": {}
+        });
+        terminal_codex_gateway_bind_pane_request(
+            &mut first,
+            "/workspace/alpha",
+            &json!({
+                "model": "slot-alpha",
+                "mcp_servers": { "alpha": { "command": "alpha-mcp" } },
+                "hooks": { "after_agent": [{ "command": "alpha-hook" }] }
+            }),
+        );
+        terminal_codex_gateway_bind_pane_request(
+            &mut second,
+            "/workspace/beta",
+            &json!({
+                "model": "slot-beta",
+                "mcp_servers": { "beta": { "command": "beta-mcp" } },
+                "hooks": { "after_agent": [{ "command": "beta-hook" }] }
+            }),
+        );
+        assert_eq!(
+            first.pointer("/params/cwd"),
+            Some(&json!("/workspace/alpha"))
+        );
+        assert_eq!(
+            second.pointer("/params/cwd"),
+            Some(&json!("/workspace/beta"))
+        );
+        assert_eq!(
+            first.pointer("/params/config/model"),
+            Some(&json!("client-override"))
+        );
+        assert!(first.pointer("/params/config/mcp_servers/alpha").is_none());
+        assert!(first.pointer("/params/config/mcp_servers/beta").is_none());
+        assert!(second.pointer("/params/config/mcp_servers/beta").is_none());
+        assert!(second.pointer("/params/config/mcp_servers/alpha").is_none());
+        assert!(first.pointer("/params/config/hooks").is_none());
+        assert!(second.pointer("/params/config").is_none());
+        let mut config_read = json!({
+            "id": 3,
+            "method": "config/read",
+            "params": {"includeLayers": true, "config": {"model": "attacker"}}
+        });
+        let pane_config = json!({
+            "model": "pane-model",
+            "hooks": {"after_agent": [{"command": "reviewed-pane-hook"}]}
+        });
+        terminal_codex_gateway_bind_pane_request(
+            &mut config_read,
+            "/workspace/alpha",
+            &pane_config,
+        );
+        assert_eq!(config_read.pointer("/params/cwd"), Some(&json!("/workspace/alpha")));
+        assert!(config_read.pointer("/params/config").is_none());
+        let mut config_response = json!({
+            "id": 3,
+            "result": {"config": {"model": "account-model"}, "origins": {}}
+        });
+        terminal_codex_gateway_merge_pane_config_response(&mut config_response, &pane_config);
+        assert_eq!(
+            config_response.pointer("/result/config/model"),
+            Some(&json!("pane-model"))
+        );
+        assert_eq!(
+            config_response.pointer("/result/config/hooks/after_agent/0/command"),
+            Some(&json!("reviewed-pane-hook"))
+        );
+    }
+
+    #[test]
+    fn thread_start_config_allowlists_only_safe_keys_and_strips_all_hook_vectors() {
+        // `hooks/list` gets no request config, so thread execution must carry no
+        // hook-affecting override. We ALLOWLIST proven-safe passthroughs (model /
+        // reasoning effort) and strip everything else — this is upgrade-robust vs
+        // a denylist (which kept missing vectors: hooks → bypass_hook_trust →
+        // notify → project_root_markers → features.hooks/plugins/remote_plugin).
+        let mut request = json!({
+            "id": 7,
+            "method": "thread/start",
+            "params": { "config": {
+                "model": "client-override",
+                "model_reasoning_effort": "high",
+                "hooks": { "after_agent": [{ "command": "nested-unreviewed" }] },
+                "hooks.SessionStart": [{ "command": "dotted-unreviewed" }],
+                "bypass_hook_trust": true,
+                "bypassHookTrust": true,
+                "notify": ["/tmp/attacker-notify.sh"],
+                "project_root_markers": [".attacker"],
+                "projects": { "/attacker": { "trust_level": "trusted" } },
+                "projects./attacker": { "trust_level": "trusted" },
+                "features.hooks": true,
+                "features.plugins": true,
+                "features.remote_plugin": true,
+                "features": { "hooks": true, "plugins": true },
+                "sandbox_mode": "danger-full-access",
+                "approval_policy": "never",
+                "mcp_servers": { "attacker": { "command": "x" } },
+                "profile": "attacker-profile",
+                "future_unknown_setting": true
+            } }
+        });
+        terminal_codex_gateway_bind_pane_request(&mut request, "/workspace/alpha", &json!({}));
+        // Every non-allowlisted key (all hook/feature/plugin/trust/project
+        // vectors AND unrelated overrides like sandbox/approval/mcp) is gone.
+        for pointer in [
+            "/params/config/hooks",
+            "/params/config/hooks.SessionStart",
+            "/params/config/bypass_hook_trust",
+            "/params/config/bypassHookTrust",
+            "/params/config/notify",
+            "/params/config/project_root_markers",
+            "/params/config/projects",
+            "/params/config/projects./attacker",
+            "/params/config/features.hooks",
+            "/params/config/features.plugins",
+            "/params/config/features.remote_plugin",
+            "/params/config/features",
+            "/params/config/sandbox_mode",
+            "/params/config/approval_policy",
+            "/params/config/mcp_servers",
+            "/params/config/profile",
+            "/params/config/future_unknown_setting",
+        ] {
+            assert!(request.pointer(pointer).is_none(), "survived: {pointer}");
+        }
+        // The remaining config contains ONLY allowlisted keys.
+        if let Some(config) = request.pointer("/params/config").and_then(Value::as_object) {
+            for key in config.keys() {
+                assert!(
+                    terminal_codex_thread_config_passthrough(key),
+                    "non-allowlisted override key survived: {key}"
+                );
+            }
+        }
+        // The user's in-TUI selections survive.
+        assert_eq!(
+            request.pointer("/params/config/model"),
+            Some(&json!("client-override"))
+        );
+        assert_eq!(
+            request.pointer("/params/config/model_reasoning_effort"),
+            Some(&json!("high"))
+        );
+        // Allowlist predicate: only model / reasoning-effort (any case/separator).
+        assert!(terminal_codex_thread_config_passthrough("model"));
+        assert!(terminal_codex_thread_config_passthrough("modelReasoningEffort"));
+        assert!(!terminal_codex_thread_config_passthrough("hooks"));
+        assert!(!terminal_codex_thread_config_passthrough("features.hooks"));
+        assert!(!terminal_codex_thread_config_passthrough("bypass_hook_trust"));
+        assert!(!terminal_codex_thread_config_passthrough("sandbox_mode"));
+    }
+
+    #[test]
+    fn thread_resume_and_fork_keep_allowlist_and_strip_client_managed_settings() {
+        for method in ["thread/resume", "thread/fork"] {
+            let mut request = json!({
+                "id": method,
+                "method": method,
+                "params": { "config": {
+                    "model": "gpt-safe",
+                    "model_reasoning_effort": "high",
+                    "mcp_servers": { "attacker": { "command": "malicious" } },
+                    "profile": "attacker-profile",
+                    "hooks": { "after_agent": [{ "command": "malicious" }] },
+                    "notify": ["/tmp/malicious"],
+                    "features": { "hooks": true },
+                    "unknown_future_vector": { "enabled": true }
+                } }
+            });
+
+            terminal_codex_gateway_bind_pane_request(
+                &mut request,
+                "/workspace/alpha",
+                &json!({}),
+            );
+
+            assert_eq!(
+                request.pointer("/params/config"),
+                Some(&json!({
+                    "model": "gpt-safe",
+                    "model_reasoning_effort": "high"
+                })),
+                "allowlist changed for {method}"
+            );
+            assert_eq!(
+                request.pointer("/params/cwd"),
+                Some(&json!("/workspace/alpha"))
+            );
+        }
+    }
+
+    #[test]
+    fn thread_bootstrap_removes_non_object_and_unknown_only_config() {
+        for method in ["thread/start", "thread/resume", "thread/fork"] {
+            for config in [json!(null), json!(false), json!("profile=attacker"), json!([])] {
+                let mut request = json!({
+                    "id": method,
+                    "method": method,
+                    "params": { "config": config }
+                });
+                terminal_codex_gateway_bind_pane_request(
+                    &mut request,
+                    "/workspace/alpha",
+                    &json!({}),
+                );
+                assert!(
+                    request.pointer("/params/config").is_none(),
+                    "non-object config survived for {method}: {request}"
+                );
+            }
+
+            let mut unknown_only = json!({
+                "id": method,
+                "method": method,
+                "params": { "config": { "future_unknown_setting": true } }
+            });
+            terminal_codex_gateway_bind_pane_request(
+                &mut unknown_only,
+                "/workspace/alpha",
+                &json!({}),
+            );
+            assert!(unknown_only.pointer("/params/config").is_none());
+        }
+    }
+
+    #[test]
+    fn per_pane_hooks_list_uses_provider_native_cwd_and_hashes() {
+        let mut alpha_request =
+            json!({"id": "hooks-alpha", "method": "hooks/list", "params": {}});
+        let mut beta_request =
+            json!({"id": "hooks-beta", "method": "hooks/list", "params": {}});
+        terminal_codex_gateway_bind_pane_request(
+            &mut alpha_request,
+            "/workspace/alpha",
+            &json!({}),
+        );
+        terminal_codex_gateway_bind_pane_request(
+            &mut beta_request,
+            "/workspace/beta",
+            &json!({}),
+        );
+        assert_eq!(
+            alpha_request.pointer("/params/cwds"),
+            Some(&json!(["/workspace/alpha"]))
+        );
+        assert_eq!(
+            beta_request.pointer("/params/cwds"),
+            Some(&json!(["/workspace/beta"]))
+        );
+
+        let alpha_catalog = json!({"data": [{
+            "cwd": "/workspace/alpha",
+            "errors": [],
+            "warnings": [],
+            "hooks": [{
+                "key": "alpha-hook",
+                "enabled": true,
+                "isManaged": false,
+                "currentHash": "sha256:alpha-native",
+                "sourcePath": "/workspace/alpha/.codex/hooks.json",
+                "trustStatus": "untrusted"
+            }]
+        }]});
+        let beta_catalog = json!({"data": [{
+            "cwd": "/workspace/beta",
+            "errors": [],
+            "warnings": [],
+            "hooks": [{
+                "key": "beta-hook",
+                "enabled": true,
+                "isManaged": false,
+                "currentHash": "sha256:beta-native",
+                "sourcePath": "/workspace/beta/.codex/hooks.json",
+                "trustStatus": "changed"
+            }]
+        }]});
+        let alpha_catalog = terminal_codex_validated_hook_catalog(
+            &json!({"result": alpha_catalog}),
+            Path::new("/workspace/alpha"),
+        )
+        .expect("alpha catalog must match its execution cwd");
+        let beta_catalog = terminal_codex_validated_hook_catalog(
+            &json!({"result": beta_catalog}),
+            Path::new("/workspace/beta"),
+        )
+        .expect("beta catalog must match its execution cwd");
+        let alpha = terminal_codex_hooks_requiring_trust(&alpha_catalog);
+        let beta = terminal_codex_hooks_requiring_trust(&beta_catalog);
+        assert_eq!(alpha.len(), 1);
+        assert_eq!(beta.len(), 1);
+        assert_eq!(alpha[0]["key"], json!("alpha-hook"));
+        assert_eq!(alpha[0]["currentHash"], json!("sha256:alpha-native"));
+        assert_eq!(beta[0]["key"], json!("beta-hook"));
+        assert_eq!(beta[0]["currentHash"], json!("sha256:beta-native"));
+        assert_ne!(
+            terminal_codex_hook_identity(&alpha[0]),
+            terminal_codex_hook_identity(&beta[0]),
+            "each pane must review exactly the hashes returned by its own app-server"
+        );
     }
 
     #[test]
     fn codex_app_server_gateway_correlates_tui_hooks_list_response() {
         let mut requests = HashMap::new();
+        let mut sequence = 0;
         terminal_codex_gateway_track_client_request(
             &mut requests,
+            &mut sequence,
             &json!({"id": "hooks-7", "method": "hooks/list", "params": {}}),
         );
         terminal_codex_gateway_track_client_request(
             &mut requests,
+            &mut sequence,
             &json!({"id": 8, "method": "thread/list", "params": {}}),
         );
 
@@ -23716,44 +26645,441 @@ mod terminal_tests {
     }
 
     #[test]
-    fn codex_app_server_thread_bootstrap_resolves_native_startup_hook_review() {
+    fn codex_auth_invalidation_detection_is_specific_to_auth_errors() {
+        for (value, method) in [
+            (json!({"id": 1, "error": {"code": "token_invalidated", "type": "invalid_request_error", "status": 401}}), None),
+            (json!({"id": "auth-401", "error": {"type": "invalid_request_error", "status": 401, "message": "Unauthorized"}}), Some("account/login")),
+            (json!({"id": 2, "error": {"code": "refresh_token_reused", "message": "refresh token was already used"}}), None),
+            (json!({"id": 3, "error": {"message": "refresh-unauthorized"}}), None),
+            (json!({"id": 4, "error": {"message": "refresh_unauthorized"}}), None),
+            (json!({"method": "error", "params": {"error": {"message": "request failed", "codexErrorInfo": "unauthorized"}}}), None),
+            (json!({"method": "account/chatgptAuthTokens/refresh", "params": {"reason": "unauthorized"}}), None),
+            (json!({"method": "account/chatgptAuthTokens/refresh", "params": {"reason": "refresh-unauthorized"}}), None),
+            (json!({"method": "account/chatgptAuthTokens/refresh", "params": {"reason": "refresh_unauthorized"}}), None),
+        ] {
+            assert!(
+                terminal_codex_app_server_auth_invalidated(&value, method),
+                "expected auth collision shape: {value}"
+            );
+        }
+        for (value, method) in [
+            (json!({"id": 3, "error": {"type": "invalid_request_error", "status": 400, "message": "bad argument"}}), Some("account/login")),
+            (json!({"id": 4, "error": {"type": "invalid_request_error", "status": 401, "message": "Unauthorized"}}), Some("mcpServer/call")),
+            (json!({"id": 5, "error": {"type": "invalid_request_error", "status": 401, "message": "Unauthorized"}}), None),
+            (json!({"id": 6, "error": {"type": "invalid_request_error", "status": 401, "message": "Unauthorized"}}), Some("thread/author")),
+            (json!({"method": "item/completed", "params": {"item": {"text": "documentation mentions token_invalidated"}}}), None),
+            (json!({"method": "error", "params": {"error": {"message": "MCP tool returned 401", "source": "weather-tool"}}}), None),
+        ] {
+            assert!(
+                !terminal_codex_app_server_auth_invalidated(&value, method),
+                "ordinary app/tool error must not restart auth: {value}"
+            );
+        }
+        let recovered_background = terminal_codex_auth_reload_retryable_error(
+            &json!({"method": "account/chatgptAuthTokens/refresh", "params": {"reason": "unauthorized"}}),
+            None,
+        );
+        assert_eq!(
+            recovered_background.pointer("/params/error/code"),
+            Some(&json!("codex_auth_reloaded_retry_required"))
+        );
+        assert!(
+            !terminal_codex_app_server_auth_invalidated(&recovered_background, None),
+            "the surfaced recovery result must not recursively restart the pane"
+        );
+    }
+
+    #[test]
+    fn codex_token_invalidated_reload_retry_recovers_without_wedging() {
+        let invalidated = json!({
+            "id": "turn-1",
+            "error": {
+                "code": "token_invalidated",
+                "type": "invalid_request_error",
+                "status": 401
+            }
+        });
+        assert!(terminal_codex_app_server_auth_invalidated(
+            &invalidated,
+            Some("turn/start")
+        ));
+        let mut budget = TerminalCodexAuthReloadBudget::default();
+        let decision = terminal_codex_auth_reload_next(
+            &mut budget,
+            "pane-reload",
+            9,
+            1_000,
+        );
+        let TerminalCodexAuthReloadDecision::Retry { attempt, delay_ms } = decision else {
+            panic!("first invalidation must be recoverable");
+        };
+        assert_eq!(attempt, 1);
+        assert!((100..=175).contains(&delay_ms));
+
+        // Models another pane atomically rotating the shared linked auth.json
+        // while this pane waits, then the replacement process reading it.
+        let disk_auth_revision = Arc::new(StdMutex::new("refresh-before"));
+        assert_eq!(*disk_auth_revision.lock().unwrap(), "refresh-before");
+        *disk_auth_revision.lock().unwrap() = "refresh-after";
+        let replacement_loaded = *disk_auth_revision.lock().unwrap();
+        assert_eq!(replacement_loaded, "refresh-after");
+        assert_eq!(budget.attempts, 1, "successful reloads do not reset the lifetime cap");
+    }
+
+    #[tokio::test]
+    async fn codex_auth_recovery_answers_tui_ping_while_requests_remain_deferred() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        assert_eq!(
+            terminal_codex_gateway_service_recovery_control(
+                &sender,
+                &Message::Ping(vec![1, 2, 3].into()),
+            )
+            .await,
+            TerminalCodexRecoveryControlOutcome::Continue
+        );
+        assert_eq!(
+            receiver.recv().await.map(|outbound| outbound.message),
+            Some(Message::Pong(vec![1, 2, 3].into()))
+        );
+        assert_eq!(
+            terminal_codex_gateway_service_recovery_control(
+                &sender,
+                &Message::Text(
+                    json!({"id": 8, "method": "turn/start"})
+                        .to_string()
+                        .into(),
+                ),
+            )
+            .await,
+            TerminalCodexRecoveryControlOutcome::NotControl,
+            "operations are held unsent until replacement is ready"
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn codex_auth_reload_is_bounded_and_surfaces_deterministic_error() {
+        let mut budget = TerminalCodexAuthReloadBudget::default();
+        let mut delays = Vec::new();
+        for attempt in 1..=TERMINAL_CODEX_AUTH_RELOAD_MAX_ATTEMPTS {
+            match terminal_codex_auth_reload_next(
+                &mut budget,
+                "pane-exhausted",
+                11,
+                5_000,
+            ) {
+                TerminalCodexAuthReloadDecision::Retry {
+                    attempt: actual,
+                    delay_ms,
+                } => {
+                    assert_eq!(actual, attempt);
+                    delays.push(delay_ms);
+                }
+                TerminalCodexAuthReloadDecision::Exhausted => {
+                    panic!("retry budget exhausted too early")
+                }
+            }
+        }
+        assert!(delays[0] < delays[1] && delays[1] < delays[2]);
+        assert_eq!(
+            terminal_codex_auth_reload_next(
+                &mut budget,
+                "pane-exhausted",
+                11,
+                5_000 + 24 * 60 * 60 * 1_000,
+            ),
+            TerminalCodexAuthReloadDecision::Exhausted
+        );
+        let mut pane_a = TerminalCodexAuthReloadBudget::default();
+        let mut pane_b = TerminalCodexAuthReloadBudget::default();
+        for round in 0..TERMINAL_CODEX_AUTH_RELOAD_MAX_ATTEMPTS {
+            let now = u64::try_from(round).unwrap_or_default() * 60_000;
+            assert!(matches!(
+                terminal_codex_auth_reload_next(&mut pane_a, "pane-a", 1, now),
+                TerminalCodexAuthReloadDecision::Retry { .. }
+            ));
+            assert!(matches!(
+                terminal_codex_auth_reload_next(&mut pane_b, "pane-b", 2, now + 30_000),
+                TerminalCodexAuthReloadDecision::Retry { .. }
+            ));
+        }
+        assert_eq!(
+            terminal_codex_auth_reload_next(&mut pane_a, "pane-a", 1, u64::MAX),
+            TerminalCodexAuthReloadDecision::Exhausted
+        );
+        assert_eq!(
+            terminal_codex_auth_reload_next(&mut pane_b, "pane-b", 2, u64::MAX),
+            TerminalCodexAuthReloadDecision::Exhausted,
+            "alternating panes cannot reset each other's absolute caps"
+        );
+        let error = terminal_codex_auth_reload_exhausted_error(
+            &json!({"id": 7, "error": {"code": "token_invalidated"}}),
+            None,
+            "still invalid",
+        );
+        assert_eq!(
+            error.pointer("/error/data/code"),
+            Some(&json!("codex_auth_reload_exhausted"))
+        );
+        assert_eq!(error.pointer("/error/data/retryable"), Some(&json!(false)));
+
+        let active_turn = TerminalCodexGatewayActiveTurn {
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+        };
+        let notification = terminal_codex_auth_reload_exhausted_error(
+            &json!({"method": "error", "params": {"error": {"code": "token_invalidated"}}}),
+            Some(&active_turn),
+            "still invalid",
+        );
+        assert_eq!(notification["method"], json!("error"));
+        assert_eq!(notification.pointer("/params/threadId"), Some(&json!("thread-1")));
+        assert_eq!(notification.pointer("/params/turnId"), Some(&json!("turn-1")));
+        assert_eq!(notification.pointer("/params/willRetry"), Some(&json!(false)));
+        assert_eq!(
+            notification.pointer("/params/error/codexErrorInfo"),
+            Some(&json!("unauthorized"))
+        );
+        let background_notification = terminal_codex_auth_reload_exhausted_error(
+            &json!({
+                "method": "account/chatgptAuthTokens/refresh",
+                "params": {"reason": "unauthorized"}
+            }),
+            None,
+            "still invalid",
+        );
+        assert_eq!(background_notification["method"], json!("error"));
+        assert_eq!(
+            background_notification.pointer("/params/error/code"),
+            Some(&json!("codex_auth_reload_exhausted"))
+        );
+        assert_eq!(
+            background_notification.pointer("/params/error/retryable"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            background_notification.pointer("/params/willRetry"),
+            Some(&json!(false))
+        );
+        assert_ne!(
+            background_notification,
+            json!({
+                "method": "account/chatgptAuthTokens/refresh",
+                "params": {"reason": "unauthorized"}
+            }),
+            "budget exhaustion must not masquerade as another auth notification"
+        );
+    }
+
+    #[test]
+    fn codex_auth_reload_never_replays_an_accepted_or_active_turn() {
+        let mut requests = HashMap::new();
+        let mut sequence = 0;
+        terminal_codex_gateway_track_client_request(
+            &mut requests,
+            &mut sequence,
+            &json!({"id": 2, "method": "hooks/list", "params": {"cwds": ["/repo"]}}),
+        );
+        terminal_codex_gateway_track_client_request(
+            &mut requests,
+            &mut sequence,
+            &json!({"id": 1, "method": "config/read", "params": {"cwd": "/repo"}}),
+        );
+        let outstanding = terminal_codex_gateway_outstanding_requests(&requests);
+        assert_eq!(outstanding.len(), 2);
+        assert_eq!(outstanding[0]["method"], json!("hooks/list"));
+        assert_eq!(outstanding[1]["method"], json!("config/read"));
+
+        let turn_start = json!({
+            "id": 3,
+            "method": "turn/start",
+            "params": {"threadId": "thread-1", "input": [{"type": "text", "text": "once"}]}
+        });
+        let mut active_turn = Some(terminal_codex_gateway_active_turn(&turn_start));
+        terminal_codex_gateway_observe_turn_started(
+            &mut active_turn,
+            &json!({
+                "method": "turn/started",
+                "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}}
+            }),
+        );
+        let invalidated_completion = json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1", "error": {"code": "token_invalidated"}}
+            }
+        });
+        let reports = terminal_codex_auth_reload_recovery_reports(
+            &invalidated_completion,
+            active_turn.as_ref(),
+            &outstanding,
+        );
+        assert_eq!(reports.len(), 3);
+        assert_eq!(reports[0]["method"], json!("turn/completed"));
+        assert_eq!(
+            reports[0].pointer("/params/turn/error/retryable"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            reports[0].pointer("/params/turn/error/automaticallyRetried"),
+            Some(&json!(false))
+        );
+        assert!(reports.iter().all(|report| {
+            report.get("method").and_then(Value::as_str) != Some("turn/start")
+                && !report.to_string().contains("\"text\":\"once\"")
+        }));
+
+        terminal_codex_gateway_clear_completed_turn(&mut active_turn, &invalidated_completion);
+        assert!(active_turn.is_none(), "the interrupted turn is cleared for explicit resubmission");
+
+        // Model replacement N+1 starting and the first reconnect failing.
+        // Attempt two must observe N+1 so the supervisor replaces it again.
+        let mut connected_generation = 4;
+        terminal_codex_gateway_record_replacement_started(&mut connected_generation, 5);
+        assert_eq!(connected_generation, 5);
+    }
+
+    #[tokio::test]
+    async fn codex_auth_reload_exhaustion_is_flushed_before_connection_stops() {
+        let exhausted = json!({
+            "id": "diffforge-auth-reload-turn-test",
+            "error": {"data": {"code": "codex_auth_reload_exhausted"}}
+        });
+        let (sender, mut receiver) = mpsc::channel(1);
+        let send_task = tokio::spawn(async move {
+            terminal_codex_gateway_send_downstream(
+                &sender,
+                Message::Text(exhausted.to_string().into()),
+                true,
+            )
+            .await
+        });
+        let outbound = receiver.recv().await.expect("exhaustion must be queued");
+        let flushed = outbound
+            .flushed
+            .expect("exhaustion must request websocket-send acknowledgement");
+        flushed.send(true).unwrap();
+        assert!(send_task.await.unwrap());
+    }
+
+    #[test]
+    fn codex_per_pane_startup_jitter_is_small_and_deterministic() {
+        let first = terminal_codex_app_server_startup_jitter_ms("pane-alpha", 1);
+        let repeated = terminal_codex_app_server_startup_jitter_ms("pane-alpha", 1);
+        assert_eq!(first, repeated);
+        assert!((20..=150).contains(&first));
+        let distinct = (0..8)
+            .map(|index| terminal_codex_app_server_startup_jitter_ms("pane-alpha", index))
+            .collect::<HashSet<_>>();
+        assert!(distinct.len() > 1);
+    }
+
+    #[test]
+    fn codex_app_server_thread_submission_does_not_resolve_hook_review() {
         let pane_id = format!("codex-native-hook-review-{}", uuid::Uuid::new_v4());
         let instance_id = 42;
+        terminal_codex_hook_trust_discovery_begin(&pane_id, instance_id);
+        let mut request = json!({"id": 7, "method": "thread/start", "params": {}});
+        terminal_codex_gateway_bind_pane_request(&mut request, "/repo", &json!({}));
+        let (sender, mut receiver) = mpsc::channel(2);
+        assert_eq!(
+            terminal_codex_gateway_try_forward_thread_bootstrap(
+                &sender,
+                &pane_id,
+                instance_id,
+                &request,
+            ),
+            TerminalCodexThreadBootstrapForward::Blocked,
+        );
+        terminal_codex_hook_trust_discovery_set(
+            &pane_id,
+            instance_id,
+            TerminalCodexHookTrustDiscoveryState::Open,
+        );
+        assert_eq!(
+            terminal_codex_gateway_try_forward_thread_bootstrap(
+                &sender,
+                &pane_id,
+                instance_id,
+                &request,
+            ),
+            TerminalCodexThreadBootstrapForward::Sent,
+            "a nonempty catalog is enforced by Codex's native review barrier"
+        );
+        assert_eq!(receiver.try_recv().unwrap(), Message::Text(request.to_string().into()));
+        assert_eq!(
+            terminal_codex_hook_trust_discovery_state(&pane_id, instance_id),
+            Some(TerminalCodexHookTrustDiscoveryState::Open),
+        );
+        terminal_codex_hook_trust_discovery_clear(&pane_id, instance_id);
+        assert_eq!(
+            terminal_codex_gateway_try_forward_thread_bootstrap(
+                &sender,
+                &pane_id,
+                instance_id,
+                &request,
+            ),
+            TerminalCodexThreadBootstrapForward::Blocked,
+            "a missing or cleared discovery record must fail closed"
+        );
+        assert!(!terminal_codex_hook_trust_allows_thread(None));
+    }
+
+    #[test]
+    fn codex_app_server_queued_thread_forward_rechecks_revoked_trust_per_request() {
+        let pane_id = format!("codex-queued-hook-review-{}", uuid::Uuid::new_v4());
+        let instance_id = 44;
         terminal_codex_hook_trust_discovery_begin(&pane_id, instance_id);
         terminal_codex_hook_trust_discovery_set(
             &pane_id,
             instance_id,
             TerminalCodexHookTrustDiscoveryState::Open,
         );
+        let (sender, mut receiver) = mpsc::channel(4);
+        let first = json!({"id": 1, "method": "thread/start", "params": {}});
+        let second = json!({"id": 2, "method": "thread/resume", "params": {}});
 
-        assert!(terminal_codex_gateway_resolve_startup_hook_review(
-            &pane_id,
-            instance_id,
-            &json!({"id": 7, "method": "thread/start", "params": {}}),
-        ));
         assert_eq!(
-            terminal_codex_hook_trust_discovery_state(&pane_id, instance_id),
-            Some(TerminalCodexHookTrustDiscoveryState::Resolved),
+            terminal_codex_gateway_try_forward_thread_bootstrap(
+                &sender,
+                &pane_id,
+                instance_id,
+                &first,
+            ),
+            TerminalCodexThreadBootstrapForward::Sent,
         );
         terminal_codex_hook_trust_discovery_clear(&pane_id, instance_id);
+        assert_eq!(
+            terminal_codex_gateway_try_forward_thread_bootstrap(
+                &sender,
+                &pane_id,
+                instance_id,
+                &second,
+            ),
+            TerminalCodexThreadBootstrapForward::Blocked,
+            "cleanup revocation between queued requests must stop the drain",
+        );
+        let forwarded = receiver.try_recv().expect("first request was forwarded");
+        assert_eq!(
+            forwarded.into_text().expect("forwarded request is text"),
+            first.to_string(),
+        );
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
-    fn codex_app_server_non_bootstrap_messages_do_not_resolve_hook_review() {
+    fn codex_app_server_messages_do_not_implicitly_resolve_hook_review() {
         let pane_id = format!("codex-native-hook-review-{}", uuid::Uuid::new_v4());
         let instance_id = 43;
         terminal_codex_hook_trust_discovery_begin(&pane_id, instance_id);
 
-        for message in [
+        for mut message in [
             json!({"id": 1, "method": "initialize", "params": {}}),
             json!({"id": 2, "method": "turn/start", "params": {}}),
             json!({"method": "thread/started", "params": {}}),
         ] {
-            assert!(!terminal_codex_gateway_resolve_startup_hook_review(
-                &pane_id,
-                instance_id,
-                &message,
-            ));
+            terminal_codex_gateway_bind_pane_request(&mut message, "/repo", &json!({}));
         }
         assert_eq!(
             terminal_codex_hook_trust_discovery_state(&pane_id, instance_id),
@@ -23774,11 +27100,7 @@ mod terminal_tests {
         )])));
 
         assert_eq!(
-            terminal_codex_gateway_claim(
-                &pending,
-                &request_key,
-                TerminalCodexGatewayWinner::Web,
-            ),
+            terminal_codex_gateway_claim(&pending, &request_key, TerminalCodexGatewayWinner::Web,),
             Some("item/tool/requestUserInput".to_string()),
         );
         assert_eq!(
@@ -23788,6 +27110,39 @@ mod terminal_tests {
                 TerminalCodexGatewayWinner::NativeTui,
             ),
             None,
+        );
+    }
+
+    #[test]
+    fn codex_recovery_buffered_permission_reenters_normal_registration_pipeline() {
+        let pending = Arc::new(StdMutex::new(HashMap::new()));
+        let buffered = [json!({
+            "id": "restored-approval-1",
+            "method": "item/permissions/requestApproval",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "permissions": {"network": {"enabled": true}}
+            }
+        })];
+        for message in buffered {
+            let event = terminal_codex_gateway_register_server_request(
+                &pending,
+                "pane-recovered",
+                91,
+                &message,
+            )
+            .expect("buffered permission must produce the same web UIR event");
+            assert_eq!(event["hook_event_name"], json!("PermissionRequest"));
+            assert_eq!(event["pane_id"], json!("pane-recovered"));
+        }
+        let pending = pending.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending
+                .get("string:restored-approval-1")
+                .map(|request| request.method.as_str()),
+            Some("item/permissions/requestApproval")
         );
     }
 
@@ -23813,7 +27168,10 @@ mod terminal_tests {
         });
         let event = terminal_codex_app_server_request_event("pane-1", 1, &request)
             .expect("structured request event");
-        assert_eq!(event["interaction_response_mode"], json!("codex_app_server"));
+        assert_eq!(
+            event["interaction_response_mode"],
+            json!("codex_app_server")
+        );
         assert_eq!(event["prompt_questions"][0]["custom"], json!(true));
         assert_eq!(event["prompt_ttl_ms"], json!(60000));
 
@@ -23888,7 +27246,10 @@ mod terminal_tests {
             None,
         );
         assert_eq!(accepted["scope"], json!("session"));
-        assert_eq!(accepted.pointer("/permissions/network/enabled"), Some(&json!(true)));
+        assert_eq!(
+            accepted.pointer("/permissions/network/enabled"),
+            Some(&json!(true))
+        );
         let denied = terminal_structured_interaction_hook_response(
             &interaction,
             "reject",
@@ -23934,16 +27295,77 @@ mod terminal_tests {
         });
         let hooks = terminal_codex_hooks_requiring_trust(&catalog);
         assert_eq!(
-            hooks.iter().filter_map(|hook| hook.get("key").and_then(Value::as_str)).collect::<Vec<_>>(),
+            hooks
+                .iter()
+                .filter_map(|hook| hook.get("key").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
             vec!["changed", "new"]
         );
     }
 
     #[test]
-    fn codex_hook_trust_empty_catalog_requires_no_review() {
-        let catalog = json!({"data": [{"cwd": "/repo", "hooks": []}]});
+    fn codex_provider_native_empty_hook_catalog_resolves_as_authoritative() {
+        let catalog = terminal_codex_validated_hook_catalog(
+            &json!({"result": {"data": [{"cwd": "/repo", "errors": [], "hooks": []}]}}),
+            Path::new("/repo"),
+        )
+        .expect("an explicit valid empty row is authoritative");
         assert!(terminal_codex_catalog_hooks(&catalog).is_empty());
         assert!(terminal_codex_hooks_requiring_trust(&catalog).is_empty());
+        let pane_id = format!("codex-hook-empty-{}", uuid::Uuid::new_v4());
+        let instance_id = 87;
+        let generation = terminal_codex_hook_trust_discovery_begin(&pane_id, instance_id);
+        assert!(terminal_codex_hook_trust_discovery_transition(
+            &pane_id,
+            instance_id,
+            generation,
+            &[TerminalCodexHookTrustDiscoveryState::Pending],
+            TerminalCodexHookTrustDiscoveryState::Resolved,
+        ));
+        assert_eq!(
+            terminal_codex_hook_trust_discovery_state(&pane_id, instance_id),
+            Some(TerminalCodexHookTrustDiscoveryState::Resolved),
+            "an empty native response from the pane app-server is authoritative"
+        );
+        assert!(terminal_codex_hook_trust_allows_thread(Some(
+            TerminalCodexHookTrustDiscoveryState::Resolved
+        )));
+        terminal_codex_hook_trust_discovery_clear(&pane_id, instance_id);
+    }
+
+    #[test]
+    fn codex_malformed_or_ambiguous_hook_catalog_never_resolves_trust() {
+        let malformed = [
+            json!({"error": {"code": "failed"}}),
+            json!({}),
+            json!({"result": null}),
+            json!({"result": {"data": []}}),
+            json!({"result": {"data": [{"cwd": "/other", "errors": [], "hooks": []}]}}),
+            json!({"result": {"data": [{"cwd": "/repo", "hooks": []}]}}),
+            json!({"result": {"data": [{"cwd": "/repo", "errors": ["bad config"], "hooks": []}]}}),
+            json!({"result": {"data": [{"cwd": "/repo", "errors": [], "hooks": null}]}}),
+            json!({"result": {"data": [{"cwd": "/repo", "errors": [], "hooks": ["bad"]}]}}),
+            json!({"result": {"data": [{"cwd": "/repo", "errors": [], "hooks": [{"enabled": false}]}]}}),
+            json!({"result": {"data": [
+                {"cwd": "/repo", "errors": [], "hooks": []},
+                {"cwd": "/repo", "errors": [], "hooks": []}
+            ]}}),
+        ];
+        let pane_id = format!("codex-hook-malformed-{}", uuid::Uuid::new_v4());
+        let instance_id = 88;
+        terminal_codex_hook_trust_discovery_begin(&pane_id, instance_id);
+        for response in malformed {
+            assert!(
+                terminal_codex_validated_hook_catalog(&response, Path::new("/repo")).is_err(),
+                "malformed response must fail closed: {response}"
+            );
+            assert_eq!(
+                terminal_codex_hook_trust_discovery_state(&pane_id, instance_id),
+                Some(TerminalCodexHookTrustDiscoveryState::Pending),
+                "validation failure cannot be collapsed into trusted zero hooks"
+            );
+        }
+        terminal_codex_hook_trust_discovery_clear(&pane_id, instance_id);
     }
 
     #[test]
@@ -24108,12 +27530,9 @@ mod terminal_tests {
             instance_id,
             TerminalCodexHookTrustDiscoveryState::Pending,
         );
-        let stale_generation = terminal_codex_hook_trust_discovery_snapshot(
-            &pane_id,
-            instance_id,
-        )
-        .expect("pending discovery")
-        .generation;
+        let stale_generation = terminal_codex_hook_trust_discovery_snapshot(&pane_id, instance_id)
+            .expect("pending discovery")
+            .generation;
         terminal_codex_hook_trust_discovery_clear(&pane_id, instance_id);
 
         assert!(!terminal_codex_hook_trust_discovery_transition(
@@ -24155,11 +27574,11 @@ mod terminal_tests {
     #[test]
     fn codex_hook_trust_review_keeps_only_the_matching_interaction_open() {
         assert!(terminal_codex_hook_trust_answer_keeps_open(
-            "codex-hook-trust-catalog",
+            "codex-hook-trust-catalog-deadbeef",
             "review_hooks"
         ));
         assert!(!terminal_codex_hook_trust_answer_keeps_open(
-            "codex-hook-trust-catalog",
+            "codex-hook-trust-catalog-deadbeef",
             "trust_all_and_continue"
         ));
         assert!(!terminal_codex_hook_trust_answer_keeps_open(
@@ -24196,9 +27615,8 @@ notifications = true
         assert_eq!(cleaned.matches("[[hooks.SessionStart.hooks]]").count(), 1);
         assert!(cleaned.contains("[tui]"));
         assert!(cleaned.contains("# Documentation may mention --diff-forge-activity-hook"));
-        assert!(!cleaned.contains(
-            "command = \"diffforge --diff-forge-activity-hook --provider codex\""
-        ));
+        assert!(!cleaned
+            .contains("command = \"diffforge --diff-forge-activity-hook --provider codex\""));
         assert!(!cleaned.contains("[[hooks.Stop]]"));
     }
 
@@ -25324,6 +28742,83 @@ notifications = true
     }
 
     #[test]
+    fn codex_resume_from_sibling_home_preserves_new_pane_managed_home() {
+        let source_home = terminal_test_directory("codex_resume_source_home");
+        let managed_home = terminal_test_directory("codex_resume_managed_home");
+        let session_id = "0198f5e2-77f0-7db3-b164-42dada73c111";
+        let relative = PathBuf::from("2026")
+            .join("07")
+            .join("14")
+            .join(format!("rollout-2026-07-14T00-00-00-{session_id}.jsonl"));
+        let source_rollout = source_home.join("sessions").join(&relative);
+        fs::create_dir_all(source_rollout.parent().unwrap()).unwrap();
+        fs::write(
+            &source_rollout,
+            format!(
+                "{{\"timestamp\":\"2026-07-14T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"cwd\":\"/workspace\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(managed_home.join("config.toml"), "managed-pane-policy\n").unwrap();
+        let managed_home_text = managed_home.to_string_lossy().to_string();
+        let mut env_vars = vec![
+            ("CODEX_HOME".to_string(), managed_home_text.clone()),
+            (
+                "DIFFFORGE_CODEX_HOME".to_string(),
+                managed_home_text.clone(),
+            ),
+        ];
+
+        apply_codex_resume_home_env(
+            &mut env_vars,
+            &source_home.to_string_lossy(),
+            session_id,
+        )
+        .unwrap();
+
+        for key in ["CODEX_HOME", "DIFFFORGE_CODEX_HOME"] {
+            assert_eq!(
+                env_vars
+                    .iter()
+                    .rev()
+                    .find_map(|(candidate, value)| (candidate == key).then_some(value.as_str())),
+                Some(managed_home_text.as_str())
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(managed_home.join("sessions").join(relative)).unwrap(),
+            fs::read_to_string(source_rollout).unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(managed_home.join("config.toml")).unwrap(),
+            "managed-pane-policy\n"
+        );
+    }
+
+    #[test]
+    fn codex_unmanaged_resume_uses_transcript_source_home() {
+        let source_home = terminal_test_directory("codex_unmanaged_resume_home");
+        let mut env_vars = Vec::new();
+
+        apply_codex_resume_home_env(
+            &mut env_vars,
+            &source_home.to_string_lossy(),
+            "unused-without-managed-home",
+        )
+        .unwrap();
+
+        for key in ["CODEX_HOME", "DIFFFORGE_CODEX_HOME"] {
+            assert_eq!(
+                env_vars
+                    .iter()
+                    .rev()
+                    .find_map(|(candidate, value)| (candidate == key).then_some(value.as_str())),
+                Some(source_home.to_string_lossy().as_ref())
+            );
+        }
+    }
+
+    #[test]
     fn non_free_modes_prepare_coordination_and_only_managed_patch_requires_worktree() {
         let modes = [
             TerminalSessionMode::General,
@@ -26229,6 +29724,157 @@ notifications = true
     }
 
     #[test]
+    fn terminal_projection_keeps_interrupt_distinct_from_input_ready() {
+        let runtime = TerminalRuntimeSnapshot {
+            status: "active".to_string(),
+            activity_status: "interrupted".to_string(),
+            command_phase: "interrupted".to_string(),
+            input_ready: false,
+            input_ready_at: None,
+            prompt_ready_at: None,
+            completed_at: None,
+            provider_session_id: Some("session-1".to_string()),
+            native_session_id: Some("session-1".to_string()),
+            fork_from_provider_session_id: None,
+            provider_turn_id: Some("turn-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            source: "backend-terminal-interrupt".to_string(),
+            event_type: "provider-turn-interrupted".to_string(),
+            hook_event_name: "Interrupt".to_string(),
+            updated_at_ms: 1,
+        };
+
+        let projected =
+            terminal_project_runtime(&terminal_projection_test_metadata(), &runtime, false);
+
+        assert_eq!(projected.readiness, "interrupted");
+        assert_eq!(projected.terminal_status, "interrupted");
+        assert_eq!(projected.execution_phase, "interrupted");
+        assert_eq!(projected.native_rail_state, "interrupted");
+        assert!(!runtime.input_ready);
+        assert!(runtime.input_ready_at.is_none());
+    }
+
+    #[test]
+    fn backend_interrupt_lifecycle_applies_authoritative_runtime_state() {
+        let root = env::temp_dir().join(format!(
+            "terminal-interrupt-runtime-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let size = PtySize {
+            rows: 12,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let warm = create_warm_shell_pty_in_directory(size, &root).unwrap();
+        let metadata = TerminalInstanceMetadata {
+            pane_id: "pane-interrupt-runtime".to_string(),
+            agent_id: "codex".to_string(),
+            agent_kind: "codex".to_string(),
+            ..TerminalInstanceMetadata::default()
+        };
+        let (instance, reader) = TerminalInstance::from_warm_shell(
+            71,
+            warm,
+            root.clone(),
+            true,
+            None,
+            TerminalSessionMode::General,
+            metadata,
+            TerminalLaunchRuntimeMetadata::default(),
+            false,
+        );
+        *instance.runtime.lock().unwrap() = TerminalRuntimeSnapshot {
+            status: "active".to_string(),
+            activity_status: "thinking".to_string(),
+            command_phase: "running".to_string(),
+            input_ready: false,
+            input_ready_at: None,
+            prompt_ready_at: None,
+            completed_at: None,
+            provider_session_id: Some("session-1".to_string()),
+            native_session_id: Some("session-1".to_string()),
+            fork_from_provider_session_id: None,
+            provider_turn_id: Some("turn-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            source: "test".to_string(),
+            event_type: "provider-turn-started".to_string(),
+            hook_event_name: "UserPromptSubmit".to_string(),
+            updated_at_ms: 1,
+        };
+        let event = json!({
+            "hook_event_name": "Interrupt",
+            "provider": "codex",
+            "session_id": "session-1",
+            "turn_id": "turn-1",
+            "source": "backend-terminal-interrupt",
+        });
+        let payload = terminal_activity_hook_payload(&instance, &event).unwrap();
+        assert_eq!(payload.event_type, "provider-turn-interrupted");
+        assert_eq!(payload.activity_status, "interrupted");
+        assert!(!payload.input_ready);
+        assert!(payload.input_ready_at.is_none());
+
+        let runtime = terminal_runtime_apply_activity_payload(&instance, &payload);
+        assert_eq!(runtime.event_type, "provider-turn-interrupted");
+        assert_eq!(runtime.activity_status, "interrupted");
+        assert_eq!(runtime.command_phase, "interrupted");
+        assert!(!runtime.input_ready);
+        assert!(runtime.input_ready_at.is_none());
+
+        let provider_stop_event = json!({
+            "hook_event_name": "Stop",
+            "provider": "codex",
+            "session_id": "session-1",
+            "turn_id": "turn-1",
+        });
+        let provider_stop_payload =
+            terminal_activity_hook_payload(&instance, &provider_stop_event).unwrap();
+        assert_eq!(provider_stop_payload.event_type, "terminal-input-ready");
+        assert!(provider_stop_payload.input_ready);
+        assert!(!terminal_activity_hook_idle_stop_already_settled(
+            &provider_stop_payload,
+            &runtime,
+            false,
+            "pane-interrupt-runtime",
+            71,
+        ));
+
+        let prompt_ready_event = json!({
+            "hook_event_name": "PromptReadyAfterInterrupt",
+            "provider": "codex",
+            "session_id": "session-1",
+            "turn_id": "turn-1",
+            "source": "backend-interrupt-prompt-ready",
+        });
+        let prompt_ready_payload =
+            terminal_activity_hook_payload(&instance, &prompt_ready_event).unwrap();
+        assert_eq!(prompt_ready_payload.event_type, "terminal-input-ready");
+        assert_eq!(prompt_ready_payload.activity_status, "idle");
+        assert!(prompt_ready_payload.input_ready);
+
+        let ready_runtime =
+            terminal_runtime_apply_activity_payload(&instance, &prompt_ready_payload);
+        assert_eq!(ready_runtime.event_type, "terminal-input-ready");
+        assert_eq!(ready_runtime.activity_status, "idle");
+        assert!(ready_runtime.input_ready);
+        assert!(ready_runtime.input_ready_at.is_some());
+        assert!(ready_runtime.completed_at.is_none());
+
+        drop(reader);
+        cleanup_terminal_instance_async(
+            instance,
+            true,
+            "terminal_interrupt_runtime_test",
+            true,
+            None,
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn terminal_prompt_ready_recovery_uses_provider_structured_lifecycle_for_claude() {
         let mut runtime = TerminalRuntimeSnapshot {
             status: "active".to_string(),
@@ -26280,6 +29926,28 @@ notifications = true
         ));
         assert!(terminal_prompt_ready_recovery_allowed(
             &opencode_metadata,
+            &runtime
+        ));
+
+        runtime.status = "active".to_string();
+        runtime.activity_status = "interrupted".to_string();
+        runtime.command_phase = "interrupted".to_string();
+        runtime.event_type = "provider-turn-interrupted".to_string();
+        assert!(terminal_prompt_ready_recovery_allowed(
+            &codex_metadata,
+            &runtime
+        ));
+        assert!(!terminal_prompt_ready_recovery_allowed(
+            &claude_metadata,
+            &runtime
+        ));
+
+        runtime.status = "error".to_string();
+        runtime.activity_status = "error".to_string();
+        runtime.command_phase = "failed".to_string();
+        runtime.event_type = "provider-startup-error".to_string();
+        assert!(terminal_prompt_ready_recovery_allowed(
+            &codex_metadata,
             &runtime
         ));
 
@@ -26451,6 +30119,7 @@ notifications = true
                 true,
                 false,
                 false,
+                false,
             ),
             Some(TerminalActivityWatchdogAction::StartupStop)
         );
@@ -26459,6 +30128,7 @@ notifications = true
                 &runtime,
                 TERMINAL_STARTING_WATCHDOG_MS,
                 true,
+                false,
                 false,
                 true,
                 false,
@@ -26470,6 +30140,7 @@ notifications = true
                 &runtime,
                 TERMINAL_STARTING_WATCHDOG_MS,
                 true,
+                false,
                 false,
                 false,
                 true,
@@ -26482,10 +30153,32 @@ notifications = true
                 TERMINAL_STARTING_WATCHDOG_MS - 1,
                 true,
                 true,
+                false,
                 true,
                 false,
             ),
             None
+        );
+        assert_eq!(
+            terminal_activity_watchdog_starting_action(
+                &runtime,
+                TERMINAL_STARTING_WATCHDOG_MS,
+                true,
+                false,
+                true,
+                true,
+                false,
+            ),
+            None,
+            "an MCP boot marker must block false startup readiness"
+        );
+        assert_eq!(
+            terminal_activity_watchdog_mcp_startup_action(
+                &runtime,
+                true,
+                TERMINAL_MCP_STARTUP_DEGRADED_MS,
+            ),
+            Some(TerminalActivityWatchdogAction::McpStartupError)
         );
     }
 
@@ -27229,14 +30922,13 @@ notifications = true
             prompt_schema: None,
             provider_payload: None,
         };
-        let response =
-            terminal_structured_interaction_hook_response(
-                &interaction,
-                "allow_always",
-                None,
-                None,
-                None,
-            );
+        let response = terminal_structured_interaction_hook_response(
+            &interaction,
+            "allow_always",
+            None,
+            None,
+            None,
+        );
 
         assert_eq!(
             response.pointer("/hookSpecificOutput/hookEventName"),
@@ -27466,11 +31158,59 @@ notifications = true
     #[test]
     fn prompt_ready_marker_must_follow_working_indicator() {
         assert!(terminal_output_current_prompt_marker(
-            "working (press esc to interrupt)\ncompleted\n> "
+            "Working (press esc to interrupt)\ncompleted\n> "
         ));
         assert!(!terminal_output_current_prompt_marker(
-            "> \nworking (press esc to interrupt)"
+            "> \nWorking (press esc to interrupt)"
         ));
+        assert!(!terminal_output_current_prompt_marker(
+            "> \nBooting MCP server: codex_apps (12s • esc to interrupt)"
+        ));
+        assert!(terminal_output_current_prompt_marker(
+            "Booting MCP server: codex_apps (12s • esc to interrupt)\n> "
+        ));
+    }
+
+    #[test]
+    fn codex_turn_spinner_and_mcp_boot_are_distinct_activity_markers() {
+        let working = "Working (10s • esc to interrupt)";
+        let mcp_boot = "Booting MCP server: codex_apps (12s • esc to interrupt)";
+
+        assert!(terminal_output_latest_working_indicator_index(working).is_some());
+        assert!(terminal_output_latest_working_indicator_index(mcp_boot).is_none());
+        assert!(terminal_output_latest_working_indicator_index(
+            "Networking (10s • esc to interrupt)"
+        )
+        .is_none());
+        assert!(terminal_output_latest_working_indicator_index(
+            "not working (10s • esc to interrupt)"
+        )
+        .is_none());
+        assert!(terminal_output_latest_mcp_startup_indicator_index(mcp_boot).is_some());
+        assert_eq!(
+            terminal_activity_tui_activity_text(working).as_deref(),
+            Some("Working")
+        );
+        assert_eq!(
+            terminal_activity_tui_activity_text(mcp_boot).as_deref(),
+            Some("MCP startup")
+        );
+        assert_eq!(
+            terminal_activity_tui_activity_text(&format!("{mcp_boot}\n{working}")).as_deref(),
+            Some("Working"),
+            "a fresh turn spinner must supersede an older MCP startup line"
+        );
+        assert_eq!(
+            terminal_activity_tui_activity_text(&format!("{working}\n{mcp_boot}")).as_deref(),
+            Some("MCP startup"),
+            "a fresh MCP startup line must not inherit an older turn spinner"
+        );
+        assert!(!terminal_output_current_mcp_startup_marker(&format!(
+            "> stale\n{mcp_boot}\n{working}"
+        )));
+        assert!(terminal_output_current_mcp_startup_marker(&format!(
+            "> stale\n{working}\n{mcp_boot}"
+        )));
     }
 
     #[test]
@@ -27552,6 +31292,12 @@ notifications = true
 \u{1b}[49;3H\u{1b}[38;2;246;226;183;49mgpt-5.5 xhigh\u{1b}[39;49m · \
 \u{1b}[38;2;171;223;167;49m~/Documents/CODING/testforge\u{1b}[39m";
 
+        let compact = terminal_activity_compact_text(&terminal_activity_strip_terminal_sequences(tui));
+        assert!(
+            terminal_output_latest_working_indicator_index(&compact).is_some(),
+            "compact={compact:?}"
+        );
+        assert!(cloud_mcp_terminal_output_has_working_indicator(&compact));
         assert_eq!(terminal_activity_hook_live_message_text(tui), None);
         assert_eq!(
             terminal_activity_hook_activity_message_text(tui).as_deref(),
@@ -27750,6 +31496,36 @@ notifications = true
             Some(("provider-turn-error", "error", "error", "failed", true))
         );
         assert_eq!(
+            terminal_activity_hook_lifecycle_kind("McpStartup"),
+            Some((
+                "provider-mcp-starting",
+                "starting",
+                "starting",
+                "starting",
+                false
+            ))
+        );
+        assert_eq!(
+            terminal_activity_hook_lifecycle_kind("McpStartupError"),
+            Some((
+                "provider-startup-error",
+                "error",
+                "error",
+                "failed",
+                false
+            ))
+        );
+        assert_eq!(
+            terminal_activity_hook_lifecycle_kind("PromptReadyAfterInterrupt"),
+            Some((
+                "terminal-input-ready",
+                "idle",
+                "active",
+                "ready",
+                true
+            ))
+        );
+        assert_eq!(
             terminal_activity_hook_activity_kind("PermissionRequest", &json!({})),
             Some((
                 "provider-permission-requested",
@@ -27813,7 +31589,7 @@ notifications = true
                 "interrupted",
                 "active",
                 "interrupted",
-                true
+                false
             ))
         );
     }
@@ -28208,7 +31984,7 @@ notifications = true
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--profile", "diffforge-test-profile"]));
-        assert!(args.windows(2).any(|pair| pair == ["--disable", "apps"]));
+        assert!(!args.windows(2).any(|pair| pair == ["--disable", "apps"]));
         assert!(args.windows(2).any(|pair| pair == ["--enable", "hooks"]));
         assert!(!args
             .iter()
@@ -28261,6 +32037,219 @@ notifications = true
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn codex_app_server_launch_receives_trusted_app_control_and_permission_posture() {
+        let coordination = terminal_test_coordination("codex_app_server_trusted_config");
+        let app_control = (
+            "/opt/diffforge".to_string(),
+            vec![
+                "--app-control-mcp".to_string(),
+                "--endpoint".to_string(),
+                "127.0.0.1:43123".to_string(),
+                "--token".to_string(),
+                "trusted-token".to_string(),
+            ],
+        );
+
+        let args = terminal_codex_app_server_trusted_args(
+            Some(&coordination),
+            Some(TERMINAL_PERMISSION_MODE_ASK),
+            Some(&app_control),
+        );
+
+        assert!(args
+            .iter()
+            .any(|arg| arg == "approval_policy=\"on-request\""));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "sandbox_mode=\"workspace-write\""));
+        let app_control_config = args
+            .windows(2)
+            .find_map(|pair| {
+                (pair[0] == "-c"
+                    && pair[1].starts_with("mcp_servers.diffforge-app-control="))
+                .then_some(pair[1].as_str())
+            })
+            .expect("trusted app-control MCP launch override");
+        assert!(app_control_config.contains("enabled=true"));
+        assert!(app_control_config.contains("command=\"/opt/diffforge\""));
+        assert!(app_control_config.contains("--app-control-mcp"));
+        assert!(app_control_config.contains("trusted-token"));
+        assert!(app_control_config.contains("default_tools_approval_mode=\"prompt\""));
+        for tool in APP_CONTROL_MCP_TOOL_NAMES {
+            assert!(
+                app_control_config.contains(&format!(
+                    "{tool}={{approval_mode=\"approve\"}}"
+                )),
+                "missing trusted approval for app-control tool {tool}"
+            );
+        }
+        assert!(!args
+            .iter()
+            .any(|arg| arg.starts_with("developer_instructions=")));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.starts_with("default_permissions=")));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.starts_with("shell_environment_policy.")));
+        assert!(!args.iter().any(|arg| arg.starts_with("hooks=")));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.starts_with("mcp_servers.coordination-kernel.")));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.starts_with("mcp_servers.workspace-mcp-gateway.")));
+        let process_args =
+            terminal_codex_app_server_process_args("ws://127.0.0.1:43124", &args);
+        assert_eq!(process_args.first().map(String::as_str), Some("app-server"));
+        assert!(process_args.windows(2).any(|pair| {
+            pair[0] == "--listen" && pair[1] == "ws://127.0.0.1:43124"
+        }));
+        assert!(process_args
+            .iter()
+            .any(|arg| arg == app_control_config));
+        let windows_cmd_units = "C:\\Program Files\\nodejs\\codex.cmd".encode_utf16().count()
+            + process_args
+                .iter()
+                .map(|arg| arg.encode_utf16().count().saturating_add(3))
+                .sum::<usize>();
+        assert!(
+            windows_cmd_units < 7_000,
+            "trusted app-server command must stay below cmd.exe's limit: {windows_cmd_units}"
+        );
+
+        let unmanaged_args =
+            terminal_codex_app_server_trusted_args(None, None, Some(&app_control));
+        assert!(unmanaged_args
+            .iter()
+            .any(|arg| arg.starts_with("developer_instructions=")));
+        assert!(unmanaged_args
+            .iter()
+            .any(|arg| arg == "shell_environment_policy.inherit=\"all\""));
+        let unmanaged_process_args =
+            terminal_codex_app_server_process_args("ws://127.0.0.1:43124", &unmanaged_args);
+        let batch_len = windows_agent_launch_command_line_len(
+            r"C:\Program Files\nodejs\codex.cmd",
+            &unmanaged_process_args,
+        );
+        assert!(
+            batch_len >= WINDOWS_CLAUDE_LAUNCH_STAGE_THRESHOLD,
+            "fixture must exercise the cmd.exe overflow path: {batch_len}"
+        );
+        let mut native_args = vec![
+            r"C:\Program Files\nodejs\node_modules\@openai\codex\bin\codex.js"
+                .to_string(),
+        ];
+        native_args.extend(unmanaged_process_args);
+        let native_len = windows_agent_launch_command_line_len(
+            r"C:\Program Files\nodejs\node.exe",
+            &native_args,
+        );
+        assert!(
+            native_len < WINDOWS_NATIVE_CLAUDE_LAUNCH_STAGE_THRESHOLD,
+            "unmanaged trusted app-control launch must fit the native Windows process limit: {native_len}"
+        );
+    }
+
+    #[test]
+    fn codex_windows_batch_shim_resolves_trusted_native_node_entrypoints() {
+        let global_root = terminal_test_directory("codex_windows_global_node_entrypoint");
+        let global_shim = global_root.join("codex.cmd");
+        let global_node = global_root.join("node.exe");
+        let global_entrypoint = global_root
+            .join("node_modules")
+            .join("@openai")
+            .join("codex")
+            .join("bin")
+            .join("codex.js");
+        fs::create_dir_all(global_entrypoint.parent().unwrap()).unwrap();
+        fs::write(&global_shim, "@echo off").unwrap();
+        fs::write(&global_node, []).unwrap();
+        fs::write(&global_entrypoint, "#!/usr/bin/env node").unwrap();
+        assert_eq!(
+            terminal_codex_windows_node_entrypoint(&global_shim),
+            Some(global_entrypoint.clone())
+        );
+        assert_eq!(
+            terminal_codex_windows_node_program(&global_shim),
+            global_node
+        );
+
+        let local_root = terminal_test_directory("codex_windows_local_node_entrypoint");
+        let local_bin = local_root.join("node_modules").join(".bin");
+        let local_shim = local_bin.join("codex.CMD");
+        let local_entrypoint = local_root
+            .join("node_modules")
+            .join("@openai")
+            .join("codex")
+            .join("bin")
+            .join("codex.js");
+        fs::create_dir_all(&local_bin).unwrap();
+        fs::create_dir_all(local_entrypoint.parent().unwrap()).unwrap();
+        fs::write(&local_shim, "@echo off").unwrap();
+        fs::write(&local_entrypoint, "#!/usr/bin/env node").unwrap();
+        assert_eq!(
+            terminal_codex_windows_node_entrypoint(&local_shim),
+            Some(local_entrypoint)
+        );
+        assert_eq!(
+            terminal_codex_windows_node_program(&local_shim),
+            PathBuf::from("node.exe")
+        );
+        assert_eq!(
+            terminal_codex_windows_node_entrypoint(&local_bin.join("codex.exe")),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_app_server_launch_maps_every_managed_permission_mode() {
+        let coordination = terminal_test_coordination("codex_app_server_permission_modes");
+        for (mode, approval_policy, sandbox_mode) in [
+            (TERMINAL_PERMISSION_MODE_PLAN, "never", "read-only"),
+            (
+                TERMINAL_PERMISSION_MODE_ASK,
+                "on-request",
+                "workspace-write",
+            ),
+            (
+                TERMINAL_PERMISSION_MODE_ACCEPT_EDITS,
+                "never",
+                "workspace-write",
+            ),
+            (
+                TERMINAL_PERMISSION_MODE_FULL_ACCESS,
+                "never",
+                "danger-full-access",
+            ),
+            (
+                TERMINAL_PERMISSION_MODE_BYPASS,
+                "never",
+                "danger-full-access",
+            ),
+        ] {
+            let args = terminal_codex_app_server_trusted_args(
+                Some(&coordination),
+                Some(mode),
+                None,
+            );
+            assert!(args.iter().any(|arg| {
+                arg == &format!(
+                    "approval_policy={}",
+                    terminal_toml_string(approval_policy)
+                )
+            }));
+            assert!(args.iter().any(|arg| {
+                arg == &format!("sandbox_mode={}", terminal_toml_string(sandbox_mode))
+            }));
+            assert!(!args.iter().any(|arg| arg.contains("mcp_servers.")));
+            assert!(!args
+                .iter()
+                .any(|arg| arg.starts_with("default_permissions=")));
+        }
     }
 
     #[test]
@@ -28463,7 +32452,7 @@ notifications = true
             None,
         );
 
-        assert!(args.windows(2).any(|pair| pair == ["--disable", "apps"]));
+        assert!(!args.windows(2).any(|pair| pair == ["--disable", "apps"]));
         assert!(!args.iter().any(|arg| arg.starts_with("plugins.")));
         assert!(!args.iter().any(|arg| arg.contains("computer-use")));
         assert!(!args
@@ -29584,7 +33573,7 @@ notifications = true
     }
 
     #[test]
-    fn coordinated_codex_launch_disables_apps_without_codex_apps_mcp_config() {
+    fn coordinated_codex_launch_keeps_builtin_apps_without_manual_mcp_config() {
         let coordination = terminal_test_coordination("codex_disable_apps");
         let args = terminal_args_with_codex_mcp_identity(
             "codex",
@@ -29606,7 +33595,7 @@ notifications = true
             args.windows(2)
                 .filter(|pair| pair[0] == "--disable" && pair[1] == "apps")
                 .count(),
-            1
+            0
         );
         assert!(!args
             .iter()

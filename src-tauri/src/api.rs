@@ -32,8 +32,9 @@ fn http_client(timeout: Duration) -> Result<reqwest::Client, String> {
     // Cache one client per distinct timeout so the trust store is loaded once
     // per timeout value instead of on every call. Timeouts come from a small,
     // fixed set of constants, so the cache stays tiny.
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, reqwest::Client>>> =
-        std::sync::OnceLock::new();
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u64, reqwest::Client>>,
+    > = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let key = timeout.as_millis() as u64;
     if let Ok(map) = cache.lock() {
@@ -100,7 +101,9 @@ async fn read_api_response(
     Err(api_error.to_string())
 }
 
-fn desktop_auth_failure_kind_for_status(status: reqwest::StatusCode) -> DesktopAuthSessionFailureKind {
+fn desktop_auth_failure_kind_for_status(
+    status: reqwest::StatusCode,
+) -> DesktopAuthSessionFailureKind {
     if matches!(
         status,
         reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
@@ -149,10 +152,7 @@ async fn read_desktop_auth_api_response(
                 } else {
                     non_json_api_response_message(status, fallback_message, error)
                 };
-                return Err(DesktopAuthSessionFailure::new(
-                    kind,
-                    message,
-                ));
+                return Err(DesktopAuthSessionFailure::new(kind, message));
             }
         }
     };
@@ -229,9 +229,8 @@ fn read_blocking_api_body(
     let response_body = if response_text.trim().is_empty() {
         json!({})
     } else {
-        serde_json::from_str::<Value>(&response_text).map_err(|error| {
-            non_json_api_response_message(status, fallback_message, error)
-        })?
+        serde_json::from_str::<Value>(&response_text)
+            .map_err(|error| non_json_api_response_message(status, fallback_message, error))?
     };
 
     Ok((status, response_body))
@@ -279,6 +278,8 @@ const DESKTOP_AUTH_RENEWAL_NO_SESSION_SECS: u64 = 15 * 60;
 const DESKTOP_AUTH_RENEWAL_MIN_BACKOFF_SECS: u64 = 15 * 60;
 const DESKTOP_AUTH_RENEWAL_MAX_BACKOFF_SECS: u64 = 6 * 60 * 60;
 const DESKTOP_AUTH_RENEWAL_CONNECTIVITY_POLL_SECS: u64 = 60;
+const DESKTOP_AUTH_PROVISION_REDEEM_INITIAL_BACKOFF_SECS: u64 = 1;
+const DESKTOP_AUTH_PROVISION_REDEEM_MAX_BACKOFF_SECS: u64 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DesktopAuthSessionFailureKind {
@@ -290,6 +291,33 @@ enum DesktopAuthSessionFailureKind {
 struct DesktopAuthSessionFailure {
     kind: DesktopAuthSessionFailureKind,
     message: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DesktopProvisionRedeemFailureKind {
+    Retryable,
+    Terminal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DesktopProvisionRedeemFailure {
+    kind: DesktopProvisionRedeemFailureKind,
+    message: String,
+    retry_after_secs: Option<u64>,
+}
+
+impl DesktopProvisionRedeemFailure {
+    fn new(
+        kind: DesktopProvisionRedeemFailureKind,
+        message: impl Into<String>,
+        retry_after_secs: Option<u64>,
+    ) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            retry_after_secs,
+        }
+    }
 }
 
 impl DesktopAuthSessionFailure {
@@ -470,7 +498,9 @@ fn desktop_auth_remove_duplicate_usage_history(value: Option<&mut Value>, canoni
     }
 }
 
-fn desktop_auth_prune_duplicate_billing_history_aliases(object: &mut serde_json::Map<String, Value>) {
+fn desktop_auth_prune_duplicate_billing_history_aliases(
+    object: &mut serde_json::Map<String, Value>,
+) {
     if let Some(items) = object.get("items").cloned() {
         if object.get("history") == Some(&items) {
             object.remove("history");
@@ -546,7 +576,10 @@ fn desktop_auth_slim_billing_status(billing_status: Value) -> Value {
     if !billing_status.is_object() {
         return billing_status;
     }
-    if billing_status.get(DESKTOP_AUTH_BILLING_SLIM_MARKER).is_some() {
+    if billing_status
+        .get(DESKTOP_AUTH_BILLING_SLIM_MARKER)
+        .is_some()
+    {
         return billing_status;
     }
     let mut slimmed = desktop_auth_slim_billing_snapshot_value(billing_status);
@@ -607,7 +640,14 @@ fn desktop_auth_plan_name_from_snapshot(snapshot: &Value) -> String {
         .or_else(|| desktop_auth_text(billing, &["credits", "plan_name"]))
         .or_else(|| user.and_then(|user| desktop_auth_text(user, &["planName"])))
         .or_else(|| user.and_then(|user| desktop_auth_text(user, &["plan_name"])))
-        .unwrap_or_else(|| if plan_status == "paid" { "plus" } else { "free" }.to_string());
+        .unwrap_or_else(|| {
+            if plan_status == "paid" {
+                "plus"
+            } else {
+                "free"
+            }
+            .to_string()
+        });
     cloud_mcp_plan_name_from_value(Some(plan_name))
 }
 
@@ -760,7 +800,9 @@ fn desktop_auth_credit_same_term(incoming: Option<&Value>, previous: Option<&Val
         ],
     );
     match (incoming_term_end, previous_term_end) {
-        (Some(incoming_term_end), Some(previous_term_end)) => incoming_term_end == previous_term_end,
+        (Some(incoming_term_end), Some(previous_term_end)) => {
+            incoming_term_end == previous_term_end
+        }
         _ => true,
     }
 }
@@ -778,7 +820,8 @@ fn desktop_auth_normalize_credit_wallet(
     let incoming_source = incoming_credits.unwrap_or(&empty);
     let incoming_unknown = incoming_source.get("known").and_then(Value::as_bool) == Some(false)
         && incoming_source.get("live").and_then(Value::as_bool) != Some(true);
-    let trusted_incoming = (!incoming_unknown && incoming_source.is_object()).then_some(incoming_source);
+    let trusted_incoming =
+        (!incoming_unknown && incoming_source.is_object()).then_some(incoming_source);
     let incoming_authoritative = trusted_incoming.is_some_and(|incoming| {
         incoming.get("known").and_then(Value::as_bool) == Some(true)
             || incoming.get("live").and_then(Value::as_bool) == Some(true)
@@ -786,8 +829,8 @@ fn desktop_auth_normalize_credit_wallet(
     let incoming_top_term_id = trusted_incoming.and_then(|incoming| {
         desktop_auth_first_text(incoming, &[&["termId"][..], &["term_id"][..]])
     });
-    let incoming_nested_term_id = trusted_incoming
-        .and_then(|incoming| desktop_auth_text(incoming, &["term", "id"]));
+    let incoming_nested_term_id =
+        trusted_incoming.and_then(|incoming| desktop_auth_text(incoming, &["term", "id"]));
     let incoming_nested_term_conflicts = matches!(
         (&incoming_top_term_id, &incoming_nested_term_id),
         (Some(top), Some(nested)) if top != nested
@@ -1028,10 +1071,10 @@ fn desktop_auth_normalize_credit_wallet(
             ],
         )
     });
-    let computed_remaining = (total > 0).then(|| total.saturating_sub(used).saturating_sub(reserved).max(0));
-    let incoming_changes_balance = incoming_used.is_some()
-        || incoming_total.is_some()
-        || incoming_reserved.is_some();
+    let computed_remaining =
+        (total > 0).then(|| total.saturating_sub(used).saturating_sub(reserved).max(0));
+    let incoming_changes_balance =
+        incoming_used.is_some() || incoming_total.is_some() || incoming_reserved.is_some();
     let remaining = match (incoming_remaining, fallback_remaining, computed_remaining) {
         (Some(direct), _, _) if incoming_authoritative => direct.max(0),
         (Some(direct), _, _) if direct > 0 => direct,
@@ -1119,10 +1162,10 @@ fn desktop_auth_normalize_credit_wallet(
             desktop_auth_first_text(
                 previous_source,
                 &[
-                &["termEnd"][..],
-                &["term_end"][..],
-                &["resetAt"][..],
-                &["reset_at"][..],
+                    &["termEnd"][..],
+                    &["term_end"][..],
+                    &["resetAt"][..],
+                    &["reset_at"][..],
                     &["term", "termEnd"][..],
                     &["term", "term_end"][..],
                 ],
@@ -1368,7 +1411,9 @@ fn desktop_auth_snapshot_from_raw(raw: Value) -> Value {
         .unwrap_or("signedOut");
     let status = if !token.is_empty() && user.is_some() {
         "authenticated"
-    } else if matches!(stored_status, "waiting" | "exchanging" | "checking") && !pending_state.is_empty() {
+    } else if matches!(stored_status, "waiting" | "exchanging" | "checking")
+        && !pending_state.is_empty()
+    {
         stored_status
     } else if stored_status == "checking" {
         "checking"
@@ -1380,7 +1425,13 @@ fn desktop_auth_snapshot_from_raw(raw: Value) -> Value {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| if status == "authenticated" { "authenticated" } else { "idle" });
+        .unwrap_or_else(|| {
+            if status == "authenticated" {
+                "authenticated"
+            } else {
+                "idle"
+            }
+        });
     let message = raw
         .get("message")
         .and_then(Value::as_str)
@@ -1398,9 +1449,8 @@ fn desktop_auth_snapshot_from_raw(raw: Value) -> Value {
         .map(|scope| desktop_auth_normalize_scope(scope, user.as_ref()))
         .unwrap_or_else(desktop_auth_personal_scope);
     let account_scopes = desktop_auth_account_scopes(user.as_ref());
-    let billing_status = desktop_auth_slim_billing_status(
-        raw.get("billingStatus").cloned().unwrap_or(Value::Null),
-    );
+    let billing_status =
+        desktop_auth_slim_billing_status(raw.get("billingStatus").cloned().unwrap_or(Value::Null));
     let expires_at = raw
         .get("expiresAt")
         .or_else(|| raw.get("expires_at"))
@@ -1470,9 +1520,7 @@ fn desktop_auth_snapshot(app: &AppHandle) -> Value {
     // Migrate a fat legacy file to the slimmed shape once so cold reads and
     // the frontend localStorage mirror stop paying for megabytes of
     // duplicated billing history.
-    if raw_was_fat
-        && !DESKTOP_AUTH_SLIM_MIGRATED.swap(true, std::sync::atomic::Ordering::SeqCst)
-    {
+    if raw_was_fat && !DESKTOP_AUTH_SLIM_MIGRATED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         let write_result = app_local_state_write(app, DESKTOP_AUTH_STATE_KEY, &snapshot);
         log_terminal_status_event(
             "backend.desktop_auth.slim_migration",
@@ -1501,9 +1549,11 @@ fn desktop_auth_exchange_lock() -> &'static Mutex<()> {
 /// Cheap scalar identity of a billing snapshot for burst dedupe: no history
 /// walks, only shallow gets. Empty when the payload lacks the scalars.
 fn desktop_auth_billing_shallow_fingerprint(billing_status: &Value) -> String {
-    let credits = billing_status
-        .get("credits")
-        .or_else(|| billing_status.get("user").and_then(|user| user.get("credits")));
+    let credits = billing_status.get("credits").or_else(|| {
+        billing_status
+            .get("user")
+            .and_then(|user| user.get("credits"))
+    });
     let field = |source: Option<&Value>, keys: &[&str]| -> String {
         let Some(source) = source else {
             return String::new();
@@ -1522,16 +1572,41 @@ fn desktop_auth_billing_shallow_fingerprint(billing_status: &Value) -> String {
         .or_else(|| credits.and_then(|credits| credits.get("wallet")));
     let parts = [
         field(Some(billing_status), &["walletVersion", "wallet_version"]),
-        field(Some(billing_status), &["updatedAt", "updated_at", "updatedAtMs", "updated_at_ms"]),
+        field(
+            Some(billing_status),
+            &["updatedAt", "updated_at", "updatedAtMs", "updated_at_ms"],
+        ),
         field(Some(billing_status), &["planName", "plan_name"]),
-        field(credits, &["termUsedCredits", "term_used_credits", "usedCredits", "used_credits"]),
-        field(credits, &["termRemainingCredits", "term_remaining_credits", "remainingCredits", "remaining_credits"]),
+        field(
+            credits,
+            &[
+                "termUsedCredits",
+                "term_used_credits",
+                "usedCredits",
+                "used_credits",
+            ],
+        ),
+        field(
+            credits,
+            &[
+                "termRemainingCredits",
+                "term_remaining_credits",
+                "remainingCredits",
+                "remaining_credits",
+            ],
+        ),
         field(credits, &["walletVersion", "wallet_version"]),
-        field(credits, &["updatedAt", "updated_at", "updatedAtMs", "updated_at_ms"]),
+        field(
+            credits,
+            &["updatedAt", "updated_at", "updatedAtMs", "updated_at_ms"],
+        ),
         field(wallet, &["walletVersion", "wallet_version", "version"]),
         field(wallet, &["usedCredits", "used_credits"]),
         field(wallet, &["remainingCredits", "remaining_credits"]),
-        field(wallet, &["updatedAt", "updated_at", "updatedAtMs", "updated_at_ms"]),
+        field(
+            wallet,
+            &["updatedAt", "updated_at", "updatedAtMs", "updated_at_ms"],
+        ),
     ];
     if parts.iter().all(String::is_empty) {
         return String::new();
@@ -1579,7 +1654,10 @@ fn desktop_auth_snapshot_has_rejected_session(snapshot: &Value) -> bool {
     }
     let text = [
         snapshot.get("error").and_then(Value::as_str).unwrap_or(""),
-        snapshot.get("message").and_then(Value::as_str).unwrap_or(""),
+        snapshot
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
     ]
     .join(" ")
     .to_ascii_lowercase();
@@ -1607,10 +1685,10 @@ fn desktop_auth_snapshot_still_current(app: &AppHandle, snapshot: &Value) -> boo
     if let Some(expected_version) = desktop_auth_snapshot_version(snapshot) {
         return desktop_auth_snapshot_version(&current) == Some(expected_version);
     }
-    current.get("status").and_then(Value::as_str)
-        == snapshot.get("status").and_then(Value::as_str)
+    current.get("status").and_then(Value::as_str) == snapshot.get("status").and_then(Value::as_str)
         && desktop_auth_snapshot_token(&current) == desktop_auth_snapshot_token(snapshot)
-        && desktop_auth_snapshot_pending_state(&current) == desktop_auth_snapshot_pending_state(snapshot)
+        && desktop_auth_snapshot_pending_state(&current)
+            == desktop_auth_snapshot_pending_state(snapshot)
 }
 
 fn desktop_auth_persist_lock() -> &'static StdMutex<()> {
@@ -1936,10 +2014,7 @@ fn desktop_auth_login_url(state: &str) -> String {
             "desktop_form_factor",
             &["form_factor", "formFactor", "device_type", "deviceType"][..],
         ),
-        (
-            "desktop_app_version",
-            &["app_version", "appVersion"][..],
-        ),
+        ("desktop_app_version", &["app_version", "appVersion"][..]),
         ("desktop_architecture", &["architecture", "arch"][..]),
         (
             "desktop_build_channel",
@@ -2097,9 +2172,7 @@ fn desktop_auth_macos_bundle_looks_dev() -> bool {
         let info_plist = ancestor.join("Contents").join("Info.plist");
         if let Ok(bytes) = fs::read(info_plist) {
             let text = String::from_utf8_lossy(&bytes);
-            if text.contains("ai.diffforge.desktop.dev")
-                || text.contains("Diff Forge AI Dev")
-            {
+            if text.contains("ai.diffforge.desktop.dev") || text.contains("Diff Forge AI Dev") {
                 return true;
             }
         }
@@ -2327,14 +2400,11 @@ async fn desktop_auth_handle_deep_link(
                 &session,
                 Some("Initializing workspace..."),
             )?;
-            let next = desktop_auth_persist_snapshot(
-                &app,
-                {
-                    let mut next = next;
-                    next["billingStatus"] = Value::Null;
-                    next
-                },
-            )?;
+            let next = desktop_auth_persist_snapshot(&app, {
+                let mut next = next;
+                next["billingStatus"] = Value::Null;
+                next
+            })?;
             desktop_auth_sync_cloud_state_background(&app, cloud_mcp_state.inner(), &next);
             Ok(json!({
                 "handled": true,
@@ -2352,11 +2422,7 @@ async fn desktop_auth_handle_deep_link(
             }
             let next = desktop_auth_persist_snapshot(
                 &app,
-                desktop_auth_signed_out_snapshot(
-                    DESKTOP_AUTH_DEFAULT_MESSAGE,
-                    &error,
-                    true,
-                ),
+                desktop_auth_signed_out_snapshot(DESKTOP_AUTH_DEFAULT_MESSAGE, &error, true),
             )?;
             desktop_auth_sync_cloud_state_background(&app, cloud_mcp_state.inner(), &next);
             Ok(json!({
@@ -2489,10 +2555,7 @@ async fn desktop_auth_renew_stored_session_once(
                 return DesktopAuthRenewOutcome::NoSession;
             };
             let next = match desktop_auth_authenticated_snapshot_from_session(
-                &current,
-                &token,
-                &session,
-                None,
+                &current, &token, &session, None,
             ) {
                 Ok(next) => next,
                 Err(error) => {
@@ -2538,7 +2601,9 @@ fn desktop_auth_renewal_startup_delay_secs(seed_ms: u64) -> u64 {
 }
 
 fn desktop_auth_renewal_interval_secs(seed_ms: u64) -> u64 {
-    let jitter_window = DESKTOP_AUTH_RENEWAL_JITTER_SECS.saturating_mul(2).saturating_add(1);
+    let jitter_window = DESKTOP_AUTH_RENEWAL_JITTER_SECS
+        .saturating_mul(2)
+        .saturating_add(1);
     let offset = seed_ms % jitter_window.max(1);
     DESKTOP_AUTH_RENEWAL_INTERVAL_SECS
         .saturating_sub(DESKTOP_AUTH_RENEWAL_JITTER_SECS)
@@ -2546,9 +2611,10 @@ fn desktop_auth_renewal_interval_secs(seed_ms: u64) -> u64 {
 }
 
 fn desktop_auth_next_renew_backoff_secs(current_secs: u64) -> u64 {
-    current_secs
-        .saturating_mul(2)
-        .clamp(DESKTOP_AUTH_RENEWAL_MIN_BACKOFF_SECS, DESKTOP_AUTH_RENEWAL_MAX_BACKOFF_SECS)
+    current_secs.saturating_mul(2).clamp(
+        DESKTOP_AUTH_RENEWAL_MIN_BACKOFF_SECS,
+        DESKTOP_AUTH_RENEWAL_MAX_BACKOFF_SECS,
+    )
 }
 
 async fn desktop_auth_cloud_connected(cloud_mcp_state: &CloudMcpState) -> bool {
@@ -2574,10 +2640,7 @@ fn desktop_auth_renewal_log_state(
     );
 }
 
-pub(crate) fn desktop_auth_start_renewal_loop(
-    app: AppHandle,
-    cloud_mcp_state: CloudMcpState,
-) {
+pub(crate) fn desktop_auth_start_renewal_loop(app: AppHandle, cloud_mcp_state: CloudMcpState) {
     static DESKTOP_AUTH_RENEWAL_LOOP_STARTED: AtomicBool = AtomicBool::new(false);
     if DESKTOP_AUTH_RENEWAL_LOOP_STARTED.swap(true, Ordering::AcqRel) {
         return;
@@ -2659,7 +2722,9 @@ pub(crate) fn desktop_auth_start_renewal_loop(
                 .checked_duration_since(now)
                 .unwrap_or(Duration::ZERO);
             let sleep_for = until_next
-                .min(Duration::from_secs(DESKTOP_AUTH_RENEWAL_CONNECTIVITY_POLL_SECS))
+                .min(Duration::from_secs(
+                    DESKTOP_AUTH_RENEWAL_CONNECTIVITY_POLL_SECS,
+                ))
                 .max(Duration::from_secs(1));
             sleep(sleep_for).await;
         }
@@ -2718,14 +2783,12 @@ pub(crate) async fn desktop_auth_preflight_automatic_restart(
         DesktopAuthRenewOutcome::Renewed | DesktopAuthRenewOutcome::NoSession => {
             DesktopAuthPreflightResult::new(DesktopAuthPreflightStatus::AuthOk, None)
         }
-        DesktopAuthRenewOutcome::AuthRejected(error) => DesktopAuthPreflightResult::new(
-            DesktopAuthPreflightStatus::AuthRejected,
-            Some(error),
-        ),
-        DesktopAuthRenewOutcome::TransportError(error) => DesktopAuthPreflightResult::new(
-            DesktopAuthPreflightStatus::TransportError,
-            Some(error),
-        ),
+        DesktopAuthRenewOutcome::AuthRejected(error) => {
+            DesktopAuthPreflightResult::new(DesktopAuthPreflightStatus::AuthRejected, Some(error))
+        }
+        DesktopAuthRenewOutcome::TransportError(error) => {
+            DesktopAuthPreflightResult::new(DesktopAuthPreflightStatus::TransportError, Some(error))
+        }
     }
 }
 
@@ -2754,9 +2817,10 @@ async fn validate_desktop_session_checked(
         DesktopAuthSessionFailure::new(DesktopAuthSessionFailureKind::AuthRejected, error)
     })?;
 
-    let client = http_client(Duration::from_secs(SESSION_VALIDATE_TIMEOUT_SECS)).map_err(|error| {
-        DesktopAuthSessionFailure::new(DesktopAuthSessionFailureKind::Transport, error)
-    })?;
+    let client =
+        http_client(Duration::from_secs(SESSION_VALIDATE_TIMEOUT_SECS)).map_err(|error| {
+            DesktopAuthSessionFailure::new(DesktopAuthSessionFailureKind::Transport, error)
+        })?;
     let response = client
         .get(api_endpoint("desktop/session"))
         .bearer_auth(token)
@@ -2832,8 +2896,7 @@ fn poll_desktop_device_authorization_blocking(device_code: &str) -> Result<Value
         .json(&json!({ "device_code": device_code }))
         .send()
         .map_err(|error| format!("Unable to check device sign in: {error}"))?;
-    let (status, body) =
-        read_blocking_api_body(response, "Unable to check device sign in.")?;
+    let (status, body) = read_blocking_api_body(response, "Unable to check device sign in.")?;
 
     if status.as_u16() >= 500 {
         let error = body
@@ -2931,10 +2994,91 @@ fn desktop_auth_provisioning_token_hash(token: &str) -> String {
     format!("{digest:x}")
 }
 
-fn desktop_auth_provisioning_token_consumed_marker_matches(
-    marker: &str,
-    token_hash: &str,
-) -> bool {
+fn desktop_auth_redact_provisioning_token(message: &str, token: &str) -> String {
+    if token.is_empty() {
+        message.to_string()
+    } else {
+        message.replace(token, "[redacted provisioning token]")
+    }
+}
+
+fn desktop_auth_normalize_provisioning_token_hash(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Some(value.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+fn desktop_auth_provisioning_token_consumed_marker_hash() -> Option<String> {
+    let path = desktop_auth_provisioning_token_consumed_marker_path().ok()?;
+    let marker = fs::read_to_string(path).ok()?;
+    desktop_auth_normalize_provisioning_token_hash(&marker)
+}
+
+fn desktop_auth_public_correlation_env(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= MAX_AUTH_VALUE_LENGTH
+                    && value.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric()
+                            || matches!(byte, b'-' | b'_' | b'.' | b':')
+                    })
+            })
+    })
+}
+
+fn desktop_auth_apply_provisioning_profile_correlation_values(
+    profile: &mut Value,
+    token_hash: Option<String>,
+    byoc_job_id: Option<String>,
+    provisioning_token_id: Option<String>,
+) {
+    let Some(object) = profile.as_object_mut() else {
+        return;
+    };
+    if let Some(token_hash) = token_hash {
+        object.insert("provisioning_token_hash".to_string(), json!(token_hash));
+    }
+    if let Some(byoc_job_id) = byoc_job_id {
+        object.insert("byoc_job_id".to_string(), json!(byoc_job_id));
+    }
+    if let Some(provisioning_token_id) = provisioning_token_id {
+        object.insert(
+            "provisioning_token_id".to_string(),
+            json!(provisioning_token_id),
+        );
+    }
+}
+
+/// Attach only the irreversible provisioning-token fingerprint and optional
+/// public BYOC identifiers. The raw token is never added to a device profile.
+/// This runs on every profile read so a post-startup redeem is visible on the
+/// next websocket hello instead of being frozen out by the base-profile cache.
+fn desktop_auth_apply_provisioning_profile_correlation(profile: &mut Value) {
+    let token_hash = desktop_auth_provisioning_token_from_env()
+        .map(|token| desktop_auth_provisioning_token_hash(&token))
+        .or_else(desktop_auth_provisioning_token_consumed_marker_hash);
+    let byoc_job_id =
+        desktop_auth_public_correlation_env(&["DIFFFORGE_BYOC_JOB_ID", "BYOC_JOB_ID"]);
+    let provisioning_token_id = desktop_auth_public_correlation_env(&[
+        "DIFFFORGE_PROVISION_TOKEN_ID",
+        "DIFFFORGE_PROVISIONING_TOKEN_ID",
+    ]);
+    desktop_auth_apply_provisioning_profile_correlation_values(
+        profile,
+        token_hash,
+        byoc_job_id,
+        provisioning_token_id,
+    );
+}
+
+fn desktop_auth_provisioning_token_consumed_marker_matches(marker: &str, token_hash: &str) -> bool {
     marker.trim() == token_hash
 }
 
@@ -2943,9 +3087,7 @@ fn desktop_auth_provisioning_token_consumed_marker_matches_path(
     token_hash: &str,
 ) -> bool {
     fs::read_to_string(path)
-        .map(|marker| {
-            desktop_auth_provisioning_token_consumed_marker_matches(&marker, token_hash)
-        })
+        .map(|marker| desktop_auth_provisioning_token_consumed_marker_matches(&marker, token_hash))
         .unwrap_or(false)
 }
 
@@ -2981,14 +3123,56 @@ fn desktop_auth_write_provisioning_token_consumed_marker_hash(
     desktop_auth_write_provisioning_token_consumed_marker_hash_to_path(&path, token_hash)
 }
 
-fn redeem_desktop_provisioning_token_blocking(token: &str) -> Result<Value, String> {
+fn desktop_auth_provision_redeem_failure_kind(
+    status: reqwest::StatusCode,
+    error_code: Option<&str>,
+    parsed_json: bool,
+) -> DesktopProvisionRedeemFailureKind {
+    let error_code = error_code
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(
+        error_code.as_str(),
+        "invalid_token" | "expired_token" | "access_denied" | "invalid_request"
+    ) {
+        return DesktopProvisionRedeemFailureKind::Terminal;
+    }
+    if status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+        || !parsed_json
+    {
+        return DesktopProvisionRedeemFailureKind::Retryable;
+    }
+    if status.is_client_error() {
+        DesktopProvisionRedeemFailureKind::Terminal
+    } else {
+        DesktopProvisionRedeemFailureKind::Retryable
+    }
+}
+
+fn redeem_desktop_provisioning_token_blocking_checked(
+    token: &str,
+) -> Result<Value, DesktopProvisionRedeemFailure> {
     if !is_safe_desktop_provisioning_token_value(token) {
-        return Err("Provisioning token is invalid.".to_string());
+        return Err(DesktopProvisionRedeemFailure::new(
+            DesktopProvisionRedeemFailureKind::Terminal,
+            "Provisioning token is invalid.",
+            None,
+        ));
     }
 
     let client = blocking_http_client(Duration::from_secs(
         DESKTOP_AUTH_PROVISION_REDEEM_TIMEOUT_SECS,
-    ))?;
+    ))
+    .map_err(|error| {
+        DesktopProvisionRedeemFailure::new(
+            DesktopProvisionRedeemFailureKind::Retryable,
+            format!("Unable to redeem provisioning token: {error}"),
+            None,
+        )
+    })?;
     let response = client
         .post(api_endpoint("desktop/provisioning-tokens/redeem"))
         .json(&json!({
@@ -2996,10 +3180,109 @@ fn redeem_desktop_provisioning_token_blocking(token: &str) -> Result<Value, Stri
             "device": desktop_auth_cli_device_metadata("provisioning_token"),
         }))
         .send()
-        .map_err(|error| format!("Unable to redeem provisioning token: {error}"))?;
+        .map_err(|error| {
+            DesktopProvisionRedeemFailure::new(
+                DesktopProvisionRedeemFailureKind::Retryable,
+                format!("Unable to redeem provisioning token: {error}"),
+                None,
+            )
+        })?;
 
-    read_blocking_api_response(response, "Unable to redeem provisioning token.")
-        .map_err(|error| format!("Unable to redeem provisioning token: {error}"))
+    let status = response.status();
+    let retry_after_secs = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.min(DESKTOP_AUTH_PROVISION_REDEEM_MAX_BACKOFF_SECS));
+    let response_text = response.text().map_err(|error| {
+        DesktopProvisionRedeemFailure::new(
+            DesktopProvisionRedeemFailureKind::Retryable,
+            format!("Unable to redeem provisioning token: unable to read response: {error}"),
+            retry_after_secs,
+        )
+    })?;
+    let parsed = (!response_text.trim().is_empty())
+        .then(|| serde_json::from_str::<Value>(&response_text).ok())
+        .flatten();
+
+    if status.is_success() {
+        return parsed.ok_or_else(|| {
+            DesktopProvisionRedeemFailure::new(
+                DesktopProvisionRedeemFailureKind::Retryable,
+                "Unable to redeem provisioning token: API returned invalid JSON.",
+                retry_after_secs,
+            )
+        });
+    }
+
+    let error_code = parsed
+        .as_ref()
+        .and_then(|body| body.get("error"))
+        .and_then(Value::as_str);
+    let kind = desktop_auth_provision_redeem_failure_kind(status, error_code, parsed.is_some());
+    let detail = error_code
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("API returned {status}"));
+    let message = desktop_auth_redact_provisioning_token(
+        &format!("Unable to redeem provisioning token: {detail}"),
+        token,
+    );
+    Err(DesktopProvisionRedeemFailure::new(
+        kind,
+        message,
+        retry_after_secs,
+    ))
+}
+
+fn redeem_desktop_provisioning_token_blocking(token: &str) -> Result<Value, String> {
+    redeem_desktop_provisioning_token_blocking_checked(token).map_err(|failure| failure.message)
+}
+
+fn desktop_auth_next_provision_redeem_backoff_secs(current: u64) -> u64 {
+    current
+        .max(DESKTOP_AUTH_PROVISION_REDEEM_INITIAL_BACKOFF_SECS)
+        .saturating_mul(2)
+        .min(DESKTOP_AUTH_PROVISION_REDEEM_MAX_BACKOFF_SECS)
+}
+
+fn redeem_desktop_provisioning_token_with_retry<F, W>(
+    token: &str,
+    mut redeem: F,
+    mut wait: W,
+) -> Result<Value, String>
+where
+    F: FnMut(&str) -> Result<Value, DesktopProvisionRedeemFailure>,
+    W: FnMut(Duration),
+{
+    let mut backoff_secs = DESKTOP_AUTH_PROVISION_REDEEM_INITIAL_BACKOFF_SECS;
+    loop {
+        match redeem(token) {
+            Ok(session) => return Ok(session),
+            Err(failure) if failure.kind == DesktopProvisionRedeemFailureKind::Terminal => {
+                return Err(failure.message);
+            }
+            Err(failure) => {
+                let delay_secs = backoff_secs
+                    .max(failure.retry_after_secs.unwrap_or_default())
+                    .min(DESKTOP_AUTH_PROVISION_REDEEM_MAX_BACKOFF_SECS);
+                eprintln!(
+                    "diffforge daemon: provisioning token redeem transient failure; retrying in {delay_secs}s: {}",
+                    failure.message
+                );
+                wait(Duration::from_secs(delay_secs));
+                backoff_secs = desktop_auth_next_provision_redeem_backoff_secs(backoff_secs);
+            }
+        }
+    }
+}
+
+fn redeem_desktop_provisioning_token_for_daemon_blocking(token: &str) -> Result<Value, String> {
+    redeem_desktop_provisioning_token_with_retry(
+        token,
+        redeem_desktop_provisioning_token_blocking_checked,
+        thread::sleep,
+    )
 }
 
 fn desktop_auth_try_provision_from_environment() -> Result<bool, String> {
@@ -3039,13 +3322,28 @@ fn desktop_auth_try_provision_from_environment() -> Result<bool, String> {
         desktop_auth_provisioning_token_file_path_from_env()
     };
 
-    let session = redeem_desktop_provisioning_token_blocking(&token)?;
-    // The token is consumed server-side the moment the redeem succeeds —
-    // clear the file before anything else can fail, or the next boot
-    // re-redeems a burned token and loops on access_denied.
-    let _ = desktop_auth_write_provisioning_token_consumed_marker_hash(&token_hash);
-    if let Some(path) = token_file {
-        let _ = fs::write(path, "");
+    let session = redeem_desktop_provisioning_token_for_daemon_blocking(&token)?;
+    // The token is consumed server-side the moment the redeem succeeds.
+    // Persist its correlation hash before clearing a file-backed raw token so
+    // every future websocket hello can still prove which token was redeemed.
+    let marker_persisted = match desktop_auth_write_provisioning_token_consumed_marker_hash(
+        &token_hash,
+    ) {
+        Ok(()) => true,
+        Err(error) => {
+            // Keep a file-backed raw token in place as the durable fallback
+            // when the hash marker cannot be written. The valid session still
+            // gets persisted below, and the token is never logged.
+            eprintln!(
+                "diffforge auth: unable to persist provisioning token correlation hash: {error}"
+            );
+            false
+        }
+    };
+    if marker_persisted {
+        if let Some(path) = token_file {
+            let _ = fs::write(path, "");
+        }
     }
     desktop_auth_cli_snapshot_from_session(session)?;
     Ok(true)
@@ -3553,8 +3851,8 @@ mod desktop_auth_tests {
 
     #[test]
     fn desktop_auth_login_url_uses_snake_case_query_keys() {
-        let url = reqwest::Url::parse(&desktop_auth_login_url("state-123"))
-            .expect("desktop login URL");
+        let url =
+            reqwest::Url::parse(&desktop_auth_login_url("state-123")).expect("desktop login URL");
         let query = url
             .query_pairs()
             .map(|(key, value)| (key.into_owned(), value.into_owned()))
@@ -3571,7 +3869,10 @@ mod desktop_auth_tests {
             "desktop_architecture",
             "desktop_build_channel",
         ] {
-            assert!(query.contains_key(key), "missing snake_case query key {key}");
+            assert!(
+                query.contains_key(key),
+                "missing snake_case query key {key}"
+            );
         }
         for key in [
             "desktopCallbackScheme",
@@ -3602,7 +3903,10 @@ mod desktop_auth_tests {
             "user": { "id": "user-1", "email": "user@example.com" },
         }));
 
-        assert_eq!(snapshot.get("token").and_then(Value::as_str), Some(token.as_str()));
+        assert_eq!(
+            snapshot.get("token").and_then(Value::as_str),
+            Some(token.as_str())
+        );
         let public_snapshot = desktop_auth_public_snapshot(&snapshot);
 
         assert!(public_snapshot.get("token").is_none());
@@ -3711,10 +4015,12 @@ mod desktop_auth_tests {
         let different_token_hash = desktop_auth_provisioning_token_hash("inline-token-B_456");
 
         assert_ne!(token_hash, different_token_hash);
-        assert!(!desktop_auth_provisioning_token_consumed_marker_matches_path(
-            &marker_path,
-            &token_hash
-        ));
+        assert!(
+            !desktop_auth_provisioning_token_consumed_marker_matches_path(
+                &marker_path,
+                &token_hash
+            )
+        );
 
         desktop_auth_write_provisioning_token_consumed_marker_hash_to_path(
             &marker_path,
@@ -3726,14 +4032,15 @@ mod desktop_auth_tests {
             std::fs::read_to_string(&marker_path).expect("read consumed token marker"),
             token_hash
         );
-        assert!(desktop_auth_provisioning_token_consumed_marker_matches_path(
-            &marker_path,
-            &token_hash
-        ));
-        assert!(!desktop_auth_provisioning_token_consumed_marker_matches_path(
-            &marker_path,
-            &different_token_hash
-        ));
+        assert!(
+            desktop_auth_provisioning_token_consumed_marker_matches_path(&marker_path, &token_hash)
+        );
+        assert!(
+            !desktop_auth_provisioning_token_consumed_marker_matches_path(
+                &marker_path,
+                &different_token_hash
+            )
+        );
 
         #[cfg(unix)]
         {
@@ -3747,6 +4054,131 @@ mod desktop_auth_tests {
         }
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn provisioning_profile_reports_cloud_compatible_token_hash_without_raw_token() {
+        let raw_token = "dfprov-byoc-job-token-online";
+        let token_hash = desktop_auth_provisioning_token_hash(raw_token);
+        assert_eq!(
+            token_hash,
+            "08252d840f273eca545e6c4b055a622db018c6252c3f2594a876294033cf11b8"
+        );
+        assert_eq!(
+            desktop_auth_normalize_provisioning_token_hash(&token_hash),
+            Some(token_hash.clone())
+        );
+        assert_eq!(
+            desktop_auth_redact_provisioning_token(
+                &format!("server echoed {raw_token}"),
+                raw_token
+            ),
+            "server echoed [redacted provisioning token]"
+        );
+
+        let mut profile = json!({ "device_id": "device-1" });
+        desktop_auth_apply_provisioning_profile_correlation_values(
+            &mut profile,
+            Some(token_hash.clone()),
+            Some("byoc-job-1".to_string()),
+            Some("provision-token-1".to_string()),
+        );
+
+        assert_eq!(profile["provisioning_token_hash"], json!(token_hash));
+        assert_eq!(profile["byoc_job_id"], json!("byoc-job-1"));
+        assert_eq!(
+            profile["provisioning_token_id"],
+            json!("provision-token-1")
+        );
+        assert!(!profile.to_string().contains(raw_token));
+    }
+
+    #[test]
+    fn provisioning_redeem_classifier_retries_transient_and_stops_terminal_responses() {
+        for (status, code) in [
+            (reqwest::StatusCode::UNAUTHORIZED, "invalid_token"),
+            (reqwest::StatusCode::FORBIDDEN, "expired_token"),
+            (reqwest::StatusCode::FORBIDDEN, "access_denied"),
+            (reqwest::StatusCode::BAD_REQUEST, "invalid_request"),
+        ] {
+            assert_eq!(
+                desktop_auth_provision_redeem_failure_kind(status, Some(code), true),
+                DesktopProvisionRedeemFailureKind::Terminal
+            );
+        }
+        for status in [
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::BAD_GATEWAY,
+        ] {
+            assert_eq!(
+                desktop_auth_provision_redeem_failure_kind(status, None, true),
+                DesktopProvisionRedeemFailureKind::Retryable
+            );
+        }
+        // Cloudflare can answer an otherwise terminal-looking HTTP status with
+        // a transient HTML challenge/error page. Only a parsed token response
+        // is allowed to burn the retry loop.
+        assert_eq!(
+            desktop_auth_provision_redeem_failure_kind(
+                reqwest::StatusCode::FORBIDDEN,
+                None,
+                false
+            ),
+            DesktopProvisionRedeemFailureKind::Retryable
+        );
+    }
+
+    #[test]
+    fn daemon_provisioning_redeem_retries_with_cap_and_stops_on_success_or_terminal() {
+        let mut outcomes = std::collections::VecDeque::from([
+            Err(DesktopProvisionRedeemFailure::new(
+                DesktopProvisionRedeemFailureKind::Retryable,
+                "network unavailable",
+                None,
+            )),
+            Err(DesktopProvisionRedeemFailure::new(
+                DesktopProvisionRedeemFailureKind::Retryable,
+                "rate limited",
+                Some(7),
+            )),
+            Ok(json!({ "status": "authorized" })),
+        ]);
+        let mut waits = Vec::new();
+        let result = redeem_desktop_provisioning_token_with_retry(
+            "safe-token",
+            |_| outcomes.pop_front().expect("scripted redeem outcome"),
+            |delay| waits.push(delay.as_secs()),
+        )
+        .expect("eventual redeem success");
+        assert_eq!(result["status"], json!("authorized"));
+        assert_eq!(waits, vec![1, 7]);
+        assert!(outcomes.is_empty());
+
+        for terminal_code in ["expired_token", "access_denied", "invalid_token"] {
+            let mut attempts = 0;
+            let result = redeem_desktop_provisioning_token_with_retry(
+                "safe-token",
+                |_| {
+                    attempts += 1;
+                    Err(DesktopProvisionRedeemFailure::new(
+                        DesktopProvisionRedeemFailureKind::Terminal,
+                        terminal_code,
+                        None,
+                    ))
+                },
+                |_| panic!("terminal token response must not wait or retry"),
+            );
+            assert_eq!(result, Err(terminal_code.to_string()));
+            assert_eq!(attempts, 1);
+        }
+
+        let mut backoff = DESKTOP_AUTH_PROVISION_REDEEM_INITIAL_BACKOFF_SECS;
+        for _ in 0..20 {
+            backoff = desktop_auth_next_provision_redeem_backoff_secs(backoff);
+        }
+        assert_eq!(backoff, DESKTOP_AUTH_PROVISION_REDEEM_MAX_BACKOFF_SECS);
     }
 
     #[test]
@@ -3840,7 +4272,9 @@ mod desktop_auth_tests {
         assert!(billing_status.get("billingHistory").is_none());
         assert!(billing_status["credits"].get("usage_history").is_none());
         assert!(billing_status["credits"].get("usageHistory").is_none());
-        assert!(billing_status["user"]["credits"].get("usageHistory").is_none());
+        assert!(billing_status["user"]["credits"]
+            .get("usageHistory")
+            .is_none());
 
         let items = billing_status["creditLedger"]["items"]
             .as_array()
@@ -3928,7 +4362,10 @@ mod desktop_auth_tests {
         );
 
         assert_eq!(merged["credits"]["termUsedCredits"].as_i64(), Some(9820));
-        assert_eq!(merged["credits"]["termRemainingCredits"].as_i64(), Some(180));
+        assert_eq!(
+            merged["credits"]["termRemainingCredits"].as_i64(),
+            Some(180)
+        );
         assert_eq!(merged["credits"]["termReservedCredits"].as_i64(), Some(0));
         assert_eq!(
             merged["user"]["credits"]["termUsedCredits"].as_i64(),
@@ -3963,7 +4400,10 @@ mod desktop_auth_tests {
         );
 
         assert_eq!(merged["credits"]["termUsedCredits"].as_i64(), Some(9840));
-        assert_eq!(merged["credits"]["termRemainingCredits"].as_i64(), Some(160));
+        assert_eq!(
+            merged["credits"]["termRemainingCredits"].as_i64(),
+            Some(160)
+        );
     }
 
     #[test]
@@ -3992,7 +4432,10 @@ mod desktop_auth_tests {
         );
 
         assert_eq!(merged["credits"]["termUsedCredits"].as_i64(), Some(20));
-        assert_eq!(merged["credits"]["termRemainingCredits"].as_i64(), Some(9980));
+        assert_eq!(
+            merged["credits"]["termRemainingCredits"].as_i64(),
+            Some(9980)
+        );
         assert_eq!(merged["credits"]["termId"].as_str(), Some("term-next"));
     }
 
@@ -4093,7 +4536,10 @@ mod desktop_auth_tests {
         assert_eq!(rolled["credits"]["termId"].as_str(), Some("term-b"));
         assert_eq!(rolled["credits"]["term"]["id"].as_str(), Some("term-b"));
         assert_eq!(rolled["credits"]["termUsedCredits"].as_i64(), Some(20));
-        assert_eq!(rolled["credits"]["termRemainingCredits"].as_i64(), Some(9980));
+        assert_eq!(
+            rolled["credits"]["termRemainingCredits"].as_i64(),
+            Some(9980)
+        );
 
         let after_partial = desktop_auth_merge_billing_status(
             &rolled,
@@ -4105,9 +4551,18 @@ mod desktop_auth_tests {
             }),
         );
         assert_eq!(after_partial["credits"]["termId"].as_str(), Some("term-b"));
-        assert_eq!(after_partial["credits"]["term"]["id"].as_str(), Some("term-b"));
-        assert_eq!(after_partial["credits"]["termUsedCredits"].as_i64(), Some(100));
-        assert_eq!(after_partial["credits"]["termRemainingCredits"].as_i64(), Some(9900));
+        assert_eq!(
+            after_partial["credits"]["term"]["id"].as_str(),
+            Some("term-b")
+        );
+        assert_eq!(
+            after_partial["credits"]["termUsedCredits"].as_i64(),
+            Some(100)
+        );
+        assert_eq!(
+            after_partial["credits"]["termRemainingCredits"].as_i64(),
+            Some(9900)
+        );
     }
 
     #[test]
@@ -4132,8 +4587,14 @@ mod desktop_auth_tests {
         );
 
         assert_eq!(merged["credits"]["termRemainingCredits"].as_i64(), Some(0));
-        assert_eq!(merged["credits"]["total"]["remainingCredits"].as_i64(), Some(0));
-        assert_eq!(merged["credits"]["term"]["remainingCredits"].as_i64(), Some(0));
+        assert_eq!(
+            merged["credits"]["total"]["remainingCredits"].as_i64(),
+            Some(0)
+        );
+        assert_eq!(
+            merged["credits"]["term"]["remainingCredits"].as_i64(),
+            Some(0)
+        );
     }
 
     #[test]
@@ -4168,7 +4629,11 @@ mod desktop_auth_tests {
         );
 
         for key in ["status", "token", "user", "entitlements", "version"] {
-            assert_eq!(rebased.get(key), current.get(key), "changed nonbilling field {key}");
+            assert_eq!(
+                rebased.get(key),
+                current.get(key),
+                "changed nonbilling field {key}"
+            );
         }
         assert_eq!(
             rebased["billingStatus"]["credits"]["termRemainingCredits"].as_i64(),
@@ -4203,7 +4668,10 @@ mod desktop_auth_tests {
         assert_eq!(merged["credits"]["planName"].as_str(), Some("plus"));
         assert_eq!(merged["credits"]["termTotalCredits"].as_i64(), Some(10000));
         assert_eq!(merged["credits"]["termUsedCredits"].as_i64(), Some(9700));
-        assert_eq!(merged["credits"]["termRemainingCredits"].as_i64(), Some(300));
+        assert_eq!(
+            merged["credits"]["termRemainingCredits"].as_i64(),
+            Some(300)
+        );
     }
 }
 
@@ -4299,12 +4767,14 @@ async fn agent_statuses() -> Result<Vec<AgentStatus>, String> {
 }
 
 #[tauri::command(rename_all = "snake_case")]
-async fn start_agent_login(provider: String) -> Result<AgentLoginStart, String> {
+async fn start_agent_login(app: AppHandle, provider: String) -> Result<AgentLoginStart, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let provider = parse_agent_provider(&provider)?;
         let definition = agent_definition(provider);
+        let baseline = agent_accounts_default_login_capture_baseline(definition.id);
 
         launch_login_terminal(provider)?;
+        agent_accounts_watch_default_login_capture_completion(app, definition.id, baseline);
 
         Ok(AgentLoginStart {
             provider: definition.id,
@@ -4317,12 +4787,17 @@ async fn start_agent_login(provider: String) -> Result<AgentLoginStart, String> 
 }
 
 #[tauri::command(rename_all = "snake_case")]
-async fn start_agent_account_login(provider: String) -> Result<AgentLoginStart, String> {
+async fn start_agent_account_login(
+    app: AppHandle,
+    provider: String,
+) -> Result<AgentLoginStart, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let provider = parse_agent_provider(&provider)?;
         let definition = agent_definition(provider);
+        let baseline = agent_accounts_default_login_capture_baseline(definition.id);
 
         launch_account_login_terminal(provider)?;
+        agent_accounts_watch_default_login_capture_completion(app, definition.id, baseline);
 
         Ok(AgentLoginStart {
             provider: definition.id,
@@ -4432,7 +4907,10 @@ fn tools_binary_on_path(binary: &str) -> Option<String> {
         let home = std::env::var("HOME").unwrap_or_default();
         let mut fallback_dirs: Vec<String> = Vec::new();
         #[cfg(target_os = "macos")]
-        fallback_dirs.extend(["/opt/homebrew/bin".to_string(), "/usr/local/bin".to_string()]);
+        fallback_dirs.extend([
+            "/opt/homebrew/bin".to_string(),
+            "/usr/local/bin".to_string(),
+        ]);
         #[cfg(target_os = "linux")]
         fallback_dirs.extend([
             "/usr/local/bin".to_string(),
@@ -4789,11 +5267,9 @@ async fn delete_workspace_entry(
     root: String,
     relative_path: String,
 ) -> Result<WorkspaceFileOperationResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        delete_workspace_entry_for(root, relative_path)
-    })
-    .await
-    .map_err(|error| format!("Unable to delete workspace item: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || delete_workspace_entry_for(root, relative_path))
+        .await
+        .map_err(|error| format!("Unable to delete workspace item: {error}"))?
 }
 
 #[tauri::command(rename_all = "snake_case")]

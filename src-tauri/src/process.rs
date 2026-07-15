@@ -1,7 +1,12 @@
-fn user_home_dir() -> Option<PathBuf> {
-    env::var_os("USERPROFILE")
-        .or_else(|| env::var_os("HOME"))
-        .map(PathBuf::from)
+fn user_home_dir_from(
+    userprofile: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    userprofile.or(home).map(PathBuf::from)
+}
+
+pub(crate) fn user_home_dir() -> Option<PathBuf> {
+    user_home_dir_from(env::var_os("USERPROFILE"), env::var_os("HOME"))
 }
 
 fn claude_credentials_detected() -> bool {

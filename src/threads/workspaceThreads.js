@@ -1456,6 +1456,7 @@ function normalizeThreadActivityStatus(value, fallback = "idle") {
     "error",
     "failed",
     "idle",
+    "interrupted",
     "mcp",
     "needs_input",
     "paused",
@@ -5158,7 +5159,6 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
     || eventType === "terminal-prompt-ready";
   const marksInputReady = !terminalReadinessIgnoredEvent && (explicitInputReady === true
     || eventType === "provider-turn-completed"
-    || eventType === "provider-turn-interrupted"
     || eventType === "provider-turn-error");
   const marksInputBusy = explicitInputReady === false
     || (eventType === "opened" && !openedExistingReadyInstance)
@@ -7508,8 +7508,10 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
     ? "thinking"
     : eventType === "provider-turn-error"
       ? "error"
-      : eventType === "provider-turn-completed" || eventType === "provider-turn-interrupted"
+      : eventType === "provider-turn-completed"
         ? "idle"
+        : eventType === "provider-turn-interrupted"
+          ? "interrupted"
         : activityStatusForLatestTurn(latestTurn, "idle"));
   const existingProviderBindingForAgent = normalizeProviderBinding(existing.provider_bindings?.[agentId], agentId, {
     activity_status: existing.activity_status,
@@ -7525,7 +7527,6 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
     || eventType === "terminal-prompt-ready";
   const marksInputReady = !terminalReadinessIgnoredEvent && (event.input_ready === true
     || eventType === "provider-turn-completed"
-    || eventType === "provider-turn-interrupted"
     || eventType === "provider-turn-error");
   const inputReady = marksInputReady
     ? true
@@ -7721,8 +7722,10 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
       ? "thinking"
       : eventType === "provider-turn-error"
         ? "error"
-        : eventType === "provider-turn-completed" || eventType === "provider-turn-interrupted"
+        : eventType === "provider-turn-completed"
           ? "idle"
+          : eventType === "provider-turn-interrupted"
+            ? "interrupted"
           : "idle"
   );
   const providerBindings = normalizeProviderBindings(
@@ -7760,7 +7763,6 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
     || eventType === "terminal-prompt-ready";
   const marksInputReady = !terminalReadinessIgnoredEvent && (explicitInputReady === true
     || eventType === "provider-turn-completed"
-    || eventType === "provider-turn-interrupted"
     || eventType === "provider-turn-error");
   const marksInputBusy = explicitInputReady === false || activityStatus === "thinking";
   const inputReady = marksInputReady

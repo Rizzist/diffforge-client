@@ -92,6 +92,9 @@ import {
   normalizeCreditWallet,
 } from "../tokenomics/tokenomicsFormat.js";
 import {
+  restartStaleProviderTerminalsAcrossWorkspaces as restartProviderTerminalRows,
+} from "../tokenomics/providerTerminalRestart.js";
+import {
   TERMINAL_ACTIVITY_HOOK_EVENT,
   TERMINAL_ARCHITECTURE_ACTIVITY_EVENT,
   TERMINAL_PROVIDER_SESSION_BOUND_EVENT,
@@ -5475,7 +5478,7 @@ const DEFAULT_AGENT_STATUSES = AGENT_PROVIDERS.map((provider) => ({
   npm_update_available: false,
   recommend_native_install: true,
   connect_command: provider.id === "codex"
-    ? "codex login"
+    ? "codex login --device-auth"
     : provider.id === "opencode"
       ? "opencode auth login"
       : "claude",
@@ -34199,7 +34202,7 @@ export default function App() {
     persistWorkspaceSettings(nextSettings);
   }, []);
 
-  const changeWorkspaceTerminalRole = useCallback(({ role, restart = false, terminal_index: terminalIndex, thread_id: threadId, workspace_id: workspaceId, startNewSession = false }) => {
+  const changeWorkspaceTerminalRole = useCallback(({ role, restart = false, terminal_index: terminalIndex, thread_id: threadId, workspace_id: workspaceId, startNewSession = false, backend_already_closed: backendAlreadyClosed = false }) => {
     if (!workspaceId) {
       return;
     }
@@ -34359,7 +34362,7 @@ export default function App() {
       }));
     }
 
-    if (currentIndexes.includes(targetTerminalIndex)) {
+    if (currentIndexes.includes(targetTerminalIndex) && !backendAlreadyClosed) {
       closeWorkspaceTerminalPane({
         agent_id: getWorkspaceTerminalPaneAgentId(previousRole),
         nextTerminalCount,
@@ -40549,7 +40552,47 @@ export default function App() {
     let unlistenRemoteCommand = null;
     let unlistenDeviceDeleted = null;
     let unlistenAgentAccounts = null;
-    let pendingProviderAuth = null;
+    let removeAccountRestartListener = null;
+
+    const restartStaleProviderTerminalsAcrossWorkspaces = async (provider) => {
+      const normalizedProvider = normalizeManagedAgentProviderId(provider);
+      if (!normalizedProvider) return { blocked: 0, restarted: 0, workspaces: [] };
+      const paneProfiles = await invoke("agent_accounts_pane_profiles").catch(() => null);
+      const staleRows = Array.isArray(paneProfiles?.stale_inventory)
+        ? paneProfiles.stale_inventory
+        : [];
+      const enabledWorkspaceIds = new Set(normalizeEnabledWorkspaceIds(
+        workspaceLifecycleSettingsRef.current?.enabled_workspace_ids,
+      ));
+      if (activatedWorkspaceIdRef.current) {
+        enabledWorkspaceIds.add(activatedWorkspaceIdRef.current);
+      }
+      // Native inventory eligibility and the live presence check are both
+      // fail-closed; the final close remains atomic in terminal_restart_if_idle.
+      return restartProviderTerminalRows({
+        enabledWorkspaceIds,
+        provider: normalizedProvider,
+        staleRows,
+        resolveTerminal: ({ paneId, terminalIndex, workspaceId }) => findRemoteControlTerminal(workspaceId, {
+          target_terminal_id: paneId,
+          target_terminal_index: terminalIndex,
+        }).terminal,
+        terminalPaneId: (terminal) => remoteControlTerminalText(terminal, ["pane_id", "terminal_id"]),
+        terminalIsIdle: (terminal) => assessRemoteControlTerminalIdle(terminal).idle,
+        restartIfIdle: ({ instanceId, launchEpoch, paneId }) => invoke("terminal_restart_if_idle", {
+          pane_id: paneId,
+          instance_id: instanceId,
+          launch_epoch: launchEpoch,
+        }).catch(() => null),
+        relaunchTerminal: ({ provider: terminalProvider, terminalIndex, workspaceId }) => changeWorkspaceTerminalRole({
+          backend_already_closed: true,
+          restart: true,
+          role: terminalProvider,
+          terminal_index: terminalIndex,
+          workspace_id: workspaceId,
+        }),
+      });
+    };
 
     const remoteCommandText = (event) => {
       const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
@@ -42381,19 +42424,29 @@ export default function App() {
           if (!authWorkspaceId) {
             throw new Error("Open or create a workspace before starting a web provider login shell.");
           }
-          const accountsBefore = await invoke("agent_accounts_state").catch(() => null);
-          const profileBefore = accountsBefore?.agents?.[provider]?.profiles?.find?.((profile) => (
-            String(profile?.id || "") === profileId
-          ));
-          const initialAuthRevision = String(profileBefore?.auth_status?.auth_revision || "");
-          await invoke("agent_accounts_set_active", {
-            agent_kind: provider,
-            profile_id: profileId,
-          });
+          // Preserve Claude's established re-auth flow. Codex activation is a
+          // backend-owned changed-auth transaction; OpenCode activates only
+          // after its isolated XDG credential is validated.
+          if (provider === "claude") {
+            await invoke("agent_accounts_set_active", {
+              agent_kind: provider,
+              profile_id: profileId,
+            });
+          }
           const login = await invoke("agent_accounts_web_login_command", {
             agent_kind: provider,
             profile_id: profileId,
           });
+          const loginGeneration = Number(login?.generation);
+          const cancelLoginTransaction = () => (
+            Number.isSafeInteger(loginGeneration) && loginGeneration > 0
+              ? invoke("agent_accounts_cancel_profile_login", {
+                agent_kind: provider,
+                generation: loginGeneration,
+                profile_id: profileId,
+              }).catch(() => {})
+              : Promise.resolve()
+          );
           const authTerminal = addWorkspaceTerminal({
             reuseExistingSession: false,
             role: WORKSPACE_TERMINAL_ROLE_GENERIC,
@@ -42402,6 +42455,7 @@ export default function App() {
             workspace_id: authWorkspaceId,
           });
           if (!authTerminal || !Number.isInteger(authTerminal.terminal_index)) {
+            await cancelLoginTransaction();
             throw new Error("Unable to allocate a managed shell for provider sign-in.");
           }
           const paneId = getWorkspaceTerminalPaneId(
@@ -42409,10 +42463,29 @@ export default function App() {
             authTerminal.terminal_index,
             getWorkspaceTerminalPaneAgentId(WORKSPACE_TERMINAL_ROLE_GENERIC),
           );
-          const submittedCommand = `${String(login?.command || "").trim()}\r`;
-          if (!submittedCommand.trim()) {
+          if (Number.isSafeInteger(loginGeneration) && loginGeneration > 0) {
+            try {
+              await invoke("agent_accounts_bind_login_terminal", {
+                agent_kind: provider,
+                generation: loginGeneration,
+                pane_id: paneId,
+                profile_id: profileId,
+              });
+            } catch (error) {
+              await cancelLoginTransaction();
+              throw error;
+            }
+          }
+          // Close the dedicated auth shell when its login process exits. The
+          // backend binds that pane to the generation above and invalidates it
+          // on process exit, preventing a dead shell's watcher from activating
+          // after a later same-account refresh.
+          const loginCommand = String(login?.command || "").trim();
+          if (!loginCommand) {
+            await cancelLoginTransaction();
             throw new Error("Provider login command was not available on this device.");
           }
+          const submittedCommand = `${loginCommand}; exit\r`;
           let started = false;
           let lastError = null;
           for (let attempt = 0; attempt < 24; attempt += 1) {
@@ -42430,14 +42503,9 @@ export default function App() {
             }
           }
           if (!started) {
+            await cancelLoginTransaction();
             throw new Error(getErrorMessage(lastError, "Provider login shell did not become ready."));
           }
-          pendingProviderAuth = {
-            initial_auth_revision: initialAuthRevision,
-            profile_id: profileId,
-            provider,
-            workspace_id: authWorkspaceId,
-          };
           await syncRemoteControlState("provider_auth_session_started");
           const result = {
             contract: login?.contract || "diffforge.provider_auth_session.v1",
@@ -42490,12 +42558,19 @@ export default function App() {
           return;
         }
         try {
-          const result = await invoke("agent_accounts_set_active", {
+          const result = await invoke(
+            provider === "codex"
+              ? "agent_accounts_start_profile_login"
+              : "agent_accounts_set_active",
+            {
             agent_kind: provider,
             profile_id: profileId,
-          });
+            },
+          );
           await syncRemoteControlState("provider_account_selected");
-          await recordRemoteCommandStatus(event, "completed", `${getManagedAgentLabel(provider)} account selected. New terminals will use it immediately.`, {
+          await recordRemoteCommandStatus(event, "completed", provider === "codex"
+            ? "Codex device authorization opened; the account will activate after the expected login is validated."
+            : `${getManagedAgentLabel(provider)} account selected. New terminals will use it immediately.`, {
             command_id: commandId,
             command_kind: commandKind,
             provider,
@@ -42527,49 +42602,8 @@ export default function App() {
           });
           return;
         }
-        const activeWorkspaceId = workspaceId || activatedWorkspaceIdRef.current || "";
-        if (!activeWorkspaceId) {
-          await recordRemoteCommandStatus(event, "completed", "No active provider terminals needed a restart.", {
-            command_id: commandId,
-            command_kind: commandKind,
-            provider,
-            restarted: 0,
-          });
-          return;
-        }
-        const settings = workspaceSettingsRef.current;
-        const terminalCount = getWorkspaceTerminalCount(settings, activeWorkspaceId);
-        const indexes = getWorkspaceLogicalTerminalIndexes(
-          workspaceTerminalLogicalIndexesRef.current,
-          activeWorkspaceId,
-          terminalCount,
-        );
-        const roles = getWorkspaceTerminalRoles(
-          settings,
-          activeWorkspaceId,
-          terminalCount,
-          workspaceTerminalFallbackRole,
-          workspaceTerminalRoleOptions,
-        );
-        let restarted = 0;
-        let blocked = 0;
-        indexes.forEach((terminalIndex, orderIndex) => {
-          if (roles[orderIndex] !== provider) return;
-          const { terminal } = findRemoteControlTerminal(activeWorkspaceId, {
-            target_terminal_index: terminalIndex,
-          });
-          if (terminal && !assessRemoteControlTerminalIdle(terminal).idle) {
-            blocked += 1;
-            return;
-          }
-          changeWorkspaceTerminalRole({
-            restart: true,
-            role: provider,
-            terminal_index: terminalIndex,
-            workspace_id: activeWorkspaceId,
-          });
-          restarted += 1;
-        });
+        const { blocked, restarted, workspaces: restartedWorkspaceIds } =
+          await restartStaleProviderTerminalsAcrossWorkspaces(provider);
         await syncRemoteControlState("provider_terminals_restarted");
         await recordRemoteCommandStatus(
           event,
@@ -42583,7 +42617,7 @@ export default function App() {
             command_kind: commandKind,
             provider,
             restarted,
-            workspace_id: activeWorkspaceId,
+            workspace_ids: restartedWorkspaceIds,
           },
         );
         return;
@@ -45289,6 +45323,7 @@ export default function App() {
             "app_show_window", "show_window", "open_app_window", "app_open_window",
             "app_hide_window", "hide_window", "app_background", "hide_app_window",
             "device_notify", "notify_device", "device_notification", "send_notification",
+            "agent_account_start_login_transaction",
             "agent_account_switch", "switch_agent_account", "agent_profile_switch", "account_switch",
             "terminal_output_status", "terminal_status", "terminal_output", "terminal_activity_status",
             "plan_release_stage", "release_plan_stage", "plan_release", "release_stage",
@@ -45309,10 +45344,15 @@ export default function App() {
             "stage_chat_attachment",
             "stage_chat_attachments",
           ].includes(normalizeRemoteCommandName(commandKind));
+          const providerWideRestartAction = [
+            "provider_terminals_restart",
+            "restart_provider_terminals",
+            "provider_restart_when_idle",
+          ].includes(normalizeRemoteCommandName(commandKind));
           const receiptWorkspaceId = workspaceId
             || (terminalOrchestratorMessageAction
               ? DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID
-              : agentPackageAction || deviceOnlyNavigationAction || attachmentStageAction
+              : agentPackageAction || deviceOnlyNavigationAction || attachmentStageAction || providerWideRestartAction
                 ? "device"
                 : "");
           const requiresWorkspace = remoteCommandOptionalBooleanField(event, ["requires_workspace"]);
@@ -45322,7 +45362,7 @@ export default function App() {
             "workspace_directory_browse",
             "browse_workspace_directory",
             "workspace_root_browse",
-          ].includes(normalizeRemoteCommandName(commandKind));
+          ].includes(normalizeRemoteCommandName(commandKind)) || providerWideRestartAction;
           if (
             !workspaceId
             && requiresWorkspace !== false
@@ -45736,51 +45776,30 @@ export default function App() {
       }
     };
 
-    unlistenAgentAccounts = listenShared("agent-accounts-changed", async () => {
+    unlistenAgentAccounts = listenShared("agent-accounts-changed", async (event) => {
       void syncRemoteControlState("provider_accounts_changed");
-      const pending = pendingProviderAuth;
-      if (!pending) return;
-      const accounts = await invoke("agent_accounts_state").catch(() => null);
-      const profile = accounts?.agents?.[pending.provider]?.profiles?.find?.((candidate) => (
-        String(candidate?.id || "") === pending.profile_id
-      ));
-      const authReady = profile?.auth_status?.auth_ready === true;
-      const authRevision = String(profile?.auth_status?.auth_revision || "");
-      if (!authReady || !authRevision || authRevision === pending.initial_auth_revision) return;
-      pendingProviderAuth = null;
-
-      // The successful login is now durable provider state. Adopt it only on
-      // idle coding terminals; busy turns keep their launch-stamped revision
-      // and surface the normal restart chip when they settle.
-      const settings = workspaceSettingsRef.current;
-      const terminalCount = getWorkspaceTerminalCount(settings, pending.workspace_id);
-      const indexes = getWorkspaceLogicalTerminalIndexes(
-        workspaceTerminalLogicalIndexesRef.current,
-        pending.workspace_id,
-        terminalCount,
-      );
-      const roles = getWorkspaceTerminalRoles(
-        settings,
-        pending.workspace_id,
-        terminalCount,
-        workspaceTerminalFallbackRole,
-        workspaceTerminalRoleOptions,
-      );
-      indexes.forEach((terminalIndex, orderIndex) => {
-        if (roles[orderIndex] !== pending.provider) return;
-        const { terminal } = findRemoteControlTerminal(pending.workspace_id, {
-          target_terminal_index: terminalIndex,
-        });
-        if (terminal && !assessRemoteControlTerminalIdle(terminal).idle) return;
-        changeWorkspaceTerminalRole({
-          restart: true,
-          role: pending.provider,
-          terminal_index: terminalIndex,
-          workspace_id: pending.workspace_id,
-        });
-      });
-      await syncRemoteControlState("provider_auth_completed_idle_restarts");
+      const payload = event?.payload && typeof event.payload === "object"
+        ? event.payload
+        : event || {};
+      const completedProvider = normalizeManagedAgentProviderId(payload?.kind);
+      if (payload?.login_completed && completedProvider) {
+        // Backend validation has already atomically activated the expected
+        // changed auth.json. Restart only inventory-confirmed idle panes in
+        // every enabled workspace; busy panes remain visibly stale.
+        await restartStaleProviderTerminalsAcrossWorkspaces(completedProvider);
+        await syncRemoteControlState("provider_auth_completed_idle_restarts");
+      }
     });
+    const handleAccountRestartRequest = async (event) => {
+      const provider = normalizeManagedAgentProviderId(event?.detail?.provider);
+      if (!provider) return;
+      await restartStaleProviderTerminalsAcrossWorkspaces(provider);
+      await syncRemoteControlState("provider_terminals_restarted_from_tokenomics");
+    };
+    window.addEventListener("diffforge:restart-stale-provider-terminals", handleAccountRestartRequest);
+    removeAccountRestartListener = () => {
+      window.removeEventListener("diffforge:restart-stale-provider-terminals", handleAccountRestartRequest);
+    };
     startRemoteCommandListener();
     return () => {
       disposed = true;
@@ -45792,6 +45811,9 @@ export default function App() {
       }
       if (typeof unlistenAgentAccounts === "function") {
         unlistenAgentAccounts();
+      }
+      if (typeof removeAccountRestartListener === "function") {
+        removeAccountRestartListener();
       }
     };
   }, [activateWorkspace, activeAccountScopeKey, addWorkspaceTerminal, agentStatuses, changeWorkspaceTerminalRole, closeWorkspaceTerminal, deactivateWorkspace, deleteWorkspaceFromForge, ensureWorkspaceActivated, logout, manageWorkspaceAgents, refreshAgentStatuses, requestWorkspaceActivation, requestWorkspaceTerminalFocus, rustTerminalAuthorityOrchestrators, showView, syncAgentInstallationsToCloud, workspaces]);
@@ -52257,13 +52279,17 @@ export default function App() {
             ...lifecycleEvent,
             activity_status: "interrupted",
             clear_pending_prompt: true,
-            input_ready: true,
+            input_ready: false,
+            input_ready_at: "",
+            input_ready_confidence: "",
             projection_events: projectionEvents,
           })
           : markWorkspaceThreadAgentActivity(threads, {
             ...lifecycleEvent,
             activity_status: "interrupted",
-            input_ready: true,
+            input_ready: false,
+            input_ready_at: "",
+            input_ready_confidence: "",
             status: lifecycleEvent.status || "active",
           });
       } else if (lifecycleEvent.type === "provider-turn-completed" || lifecycleEvent.type === "provider-turn-error") {
@@ -52830,10 +52856,9 @@ export default function App() {
         });
         return;
       }
-      const inputReady = payload.input_ready === true
-        || type === "provider-turn-completed"
-        || type === "provider-turn-error"
-        || type === "provider-turn-interrupted";
+      const inputReady = typeof payload.input_ready === "boolean"
+        ? payload.input_ready
+        : type === "provider-turn-completed" || type === "provider-turn-error";
       const payloadNativeRailState = payload.native_rail_state || "";
       const payloadActivityStatus = payload.activity_status || "";
       const activityStatus = payloadNativeRailState

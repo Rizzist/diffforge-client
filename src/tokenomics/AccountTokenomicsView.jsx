@@ -267,6 +267,51 @@ const AgentAccountLoginHint = styled.div`
   }
 `;
 
+const AgentAccountStaleInventory = styled.div`
+  display: flex;
+  width: 100%;
+  flex-direction: column;
+  gap: 5px;
+  padding-left: 2px;
+`;
+
+const AgentAccountStaleWorkspace = styled.div`
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  color: rgba(148, 163, 184, 0.82);
+  font-size: 10.5px;
+
+  > strong {
+    color: rgba(203, 213, 225, 0.9);
+    font-size: 10.5px;
+  }
+
+  > span {
+    padding: 3px 7px;
+    border: 1px solid rgba(251, 146, 60, 0.34);
+    border-radius: 999px;
+    color: rgba(254, 215, 170, 0.94);
+    background: rgba(251, 146, 60, 0.1);
+  }
+
+  html[data-forge-theme="light"] & > strong {
+    color: rgba(30, 41, 59, 0.9);
+  }
+`;
+
+const AgentAccountRestartIdleButton = styled.button`
+  padding: 3px 8px;
+  border: 1px solid rgba(74, 222, 128, 0.38);
+  border-radius: 999px;
+  color: rgba(187, 247, 208, 0.94);
+  background: rgba(34, 197, 94, 0.1);
+  font-size: 10.5px;
+  font-weight: 750;
+  cursor: pointer;
+`;
+
 const AgentAccountPill = styled.button`
   display: inline-flex;
   align-items: center;
@@ -545,16 +590,22 @@ function collapseAgentProfilesByEmail(profiles = []) {
 
 function AgentAccountsManager({ active = true }) {
   const [accounts, setAccounts] = useState(null);
+  const [staleInventory, setStaleInventory] = useState([]);
   const [editing, setEditing] = useState(null);
   const [confirmDeleteKey, setConfirmDeleteKey] = useState("");
   const [actionError, setActionError] = useState("");
   const [loginPendingKind, setLoginPendingKind] = useState("");
+  const loginPendingRef = useRef("");
   const confirmDeleteTimerRef = useRef(null);
   const loginPendingTimerRef = useRef(null);
 
   const refresh = useCallback(() => {
-    invoke("agent_accounts_state").then((state) => {
+    Promise.all([
+      invoke("agent_accounts_state"),
+      invoke("agent_accounts_pane_profiles").catch(() => null),
+    ]).then(([state, panes]) => {
       setAccounts(state?.agents || null);
+      setStaleInventory(Array.isArray(panes?.stale_inventory) ? panes.stale_inventory : []);
     }).catch(() => {});
   }, []);
 
@@ -570,7 +621,8 @@ function AgentAccountsManager({ active = true }) {
     const interval = window.setInterval(refresh, 6000);
     listen(AGENT_ACCOUNTS_CHANGED_EVENT, (event) => {
       if (!cancelled) {
-        if (event?.payload?.captured) {
+        if (event?.payload?.captured || event?.payload?.login_completed) {
+          loginPendingRef.current = "";
           setLoginPendingKind("");
         }
         refresh();
@@ -599,34 +651,65 @@ function AgentAccountsManager({ active = true }) {
 
   const setActive = useCallback((kind, profileId) => {
     setActionError("");
-    invoke("agent_accounts_set_active", { agent_kind: kind, profile_id: profileId })
-      .then(refresh)
+    const command = kind === "codex"
+      ? "agent_accounts_start_profile_login"
+      : "agent_accounts_set_active";
+    invoke(command, { agent_kind: kind, profile_id: profileId })
+      .then(() => {
+        if (kind === "codex") setLoginPendingKind(kind);
+        refresh();
+      })
       .catch((error) => setActionError(String(error?.message || error || "Unable to switch account.")));
   }, [refresh]);
 
+  const requestStaleRestart = useCallback((kind) => {
+    window.dispatchEvent(new CustomEvent("diffforge:restart-stale-provider-terminals", {
+      detail: { provider: kind },
+    }));
+    window.setTimeout(refresh, 800);
+  }, [refresh]);
+
   const beginLogin = useCallback((kind) => {
+    if (loginPendingRef.current) return;
+    loginPendingRef.current = kind;
+    setLoginPendingKind(kind);
     setActionError("");
     invoke("start_agent_account_login", { provider: kind }).then(() => {
-      setLoginPendingKind(kind);
       if (loginPendingTimerRef.current) {
         window.clearTimeout(loginPendingTimerRef.current);
       }
       // The hint is only a pointer at the terminal that just opened; the
       // capture watcher clears it sooner once the new login is pinned.
-      loginPendingTimerRef.current = window.setTimeout(() => setLoginPendingKind(""), 30000);
-    }).catch((error) => setActionError(String(error?.message || error || "Unable to open the login terminal.")));
+      loginPendingTimerRef.current = window.setTimeout(() => {
+        loginPendingRef.current = "";
+        setLoginPendingKind("");
+      }, 30000);
+    }).catch((error) => {
+      loginPendingRef.current = "";
+      setLoginPendingKind("");
+      setActionError(String(error?.message || error || "Unable to open the login terminal."));
+    });
   }, []);
 
   const beginProfileLogin = useCallback((kind, profileId) => {
+    if (loginPendingRef.current) return;
+    loginPendingRef.current = kind;
+    setLoginPendingKind(kind);
     setActionError("");
     invoke("agent_accounts_start_profile_login", { agent_kind: kind, profile_id: profileId }).then(() => {
-      setLoginPendingKind(kind);
       if (loginPendingTimerRef.current) {
         window.clearTimeout(loginPendingTimerRef.current);
       }
-      loginPendingTimerRef.current = window.setTimeout(() => setLoginPendingKind(""), 30000);
+      loginPendingTimerRef.current = window.setTimeout(() => {
+        loginPendingRef.current = "";
+        setLoginPendingKind("");
+      }, 30000);
       refresh();
-    }).catch((error) => setActionError(String(error?.message || error || "Unable to open the account login terminal.")));
+    }).catch((error) => {
+      loginPendingRef.current = "";
+      setLoginPendingKind("");
+      setActionError(String(error?.message || error || "Unable to open the account login terminal."));
+    });
   }, [refresh]);
 
   const requestDelete = useCallback((kind, profileId) => {
@@ -679,6 +762,19 @@ function AgentAccountsManager({ active = true }) {
         }
         const kindLabel = PROVIDER_LABELS[kind] || kind;
         const profiles = collapseAgentProfilesByEmail(entry.profiles);
+        const staleForKind = staleInventory.filter((row) => String(row?.kind || row?.provider || "") === kind);
+        const staleByWorkspace = staleForKind.reduce((groups, row) => {
+          const workspaceId = String(row?.workspace_id || "").trim() || "unknown";
+          const current = groups.get(workspaceId) || {
+            id: workspaceId,
+            label: String(row?.workspace_label || workspaceId),
+            rows: [],
+          };
+          current.rows.push(row);
+          groups.set(workspaceId, current);
+          return groups;
+        }, new Map());
+        const idleStaleCount = staleForKind.filter((row) => row?.idle === true && row?.busy !== true).length;
         return (
           <Fragment key={kind}>
             <AgentAccountsRow>
@@ -707,15 +803,21 @@ function AgentAccountsManager({ active = true }) {
                     : (alias || profile.label || "Account");
                   const detail = profile.is_default ? (alias || email) : (alias ? "" : email);
                   const authStatus = profile.auth_status || {};
-                  const needsLogin = Boolean(authStatus.needs_login || (!profile.identity?.auth_ready && !profile.is_default));
+                  const needsLogin = Boolean(authStatus.needs_login || !profile.identity?.auth_ready);
                   const canEdit = Boolean(email);
                   const canDelete = !profile.is_default && !profile.is_active;
                   const deleteArmed = confirmDeleteKey === `${kind}:${profile.id}`;
                   return (
                     <AgentAccountPill
+                      aria-busy={loginPendingKind === kind ? "true" : undefined}
                       data-active={profile.is_active && !needsLogin ? "true" : "false"}
+                      disabled={loginPendingKind === kind}
                       key={profile.id}
                       onClick={() => {
+                        if (kind === "codex") {
+                          beginProfileLogin(kind, profile.id);
+                          return;
+                        }
                         if (needsLogin) {
                           beginProfileLogin(kind, profile.id);
                           return;
@@ -791,6 +893,28 @@ function AgentAccountsManager({ active = true }) {
                   );
                 })}
               </AgentAccountsPillsRow>
+              {staleForKind.length ? (
+                <AgentAccountStaleInventory aria-label={`${kindLabel} stale terminals`}>
+                  {idleStaleCount ? (
+                    <AgentAccountRestartIdleButton
+                      onClick={() => requestStaleRestart(kind)}
+                      type="button"
+                    >
+                      {`Restart ${idleStaleCount} idle`}
+                    </AgentAccountRestartIdleButton>
+                  ) : null}
+                  {[...staleByWorkspace.values()].map((workspace) => (
+                    <AgentAccountStaleWorkspace key={workspace.id}>
+                      <strong>{workspace.label}</strong>
+                      {workspace.rows.map((row) => (
+                        <span key={String(row?.pane_id || `${workspace.id}:${row?.terminal_index}`)}>
+                          {`Terminal ${Number(row?.terminal_index || 0) + 1} · ${row?.busy ? "busy — restart pending" : "idle — restart ready"}`}
+                        </span>
+                      ))}
+                    </AgentAccountStaleWorkspace>
+                  ))}
+                </AgentAccountStaleInventory>
+              ) : null}
             </AgentAccountsRow>
             {editing?.kind === kind ? (
               <AgentAccountEditorForm onSubmit={submitEdit}>

@@ -42,6 +42,7 @@ use tokio_tungstenite::{
     tungstenite::{
         client::IntoClientRequest, http::HeaderValue, protocol::WebSocketConfig, Message,
     },
+    MaybeTlsStream, WebSocketStream,
 };
 
 pub mod coordination;
@@ -362,11 +363,9 @@ const WHISPER_RUNTIME_SHA256: Option<&str> =
 #[cfg(not(windows))]
 const WHISPER_RUNTIME_SHA256: Option<&str> = None;
 #[cfg(target_os = "macos")]
-const WHISPER_RUNTIME_INSTALL_HINT: &str =
-    "Install whisper.cpp CLI with Homebrew: brew install whisper-cpp. If Homebrew is missing, install it from https://brew.sh, then recheck.";
+const WHISPER_RUNTIME_INSTALL_HINT: &str = "Install whisper.cpp CLI with Homebrew: brew install whisper-cpp. If Homebrew is missing, install it from https://brew.sh, then recheck.";
 #[cfg(target_os = "macos")]
-const WHISPER_HOMEBREW_MISSING_HINT: &str =
-    "Homebrew is required to install whisper.cpp automatically. Install Homebrew from https://brew.sh, then recheck.";
+const WHISPER_HOMEBREW_MISSING_HINT: &str = "Homebrew is required to install whisper.cpp automatically. Install Homebrew from https://brew.sh, then recheck.";
 #[cfg(target_os = "linux")]
 const WHISPER_RUNTIME_INSTALL_HINT: &str =
     "Install whisper.cpp CLI and make whisper-cli, whisper, or main available on PATH.";
@@ -1175,6 +1174,10 @@ struct TerminalInstance {
     input_gate: Arc<Mutex<TerminalInputGate>>,
     input_queue: Arc<Mutex<()>>,
     active_task: Arc<Mutex<Option<TerminalActiveTask>>>,
+    // Admission is the close/write/runtime-publication linearization point.
+    // A guarded idle restart may only mark `closing` while no operation is
+    // active; stale clones then fail closed instead of writing after removal.
+    operation_admission: Arc<StdMutex<TerminalOperationAdmissionState>>,
     coordination: Option<TerminalCoordinationSession>,
     session_mode: TerminalSessionMode,
     metadata: TerminalInstanceMetadata,
@@ -1195,6 +1198,12 @@ struct TerminalInstance {
 struct TerminalCodexGatewayHandle {
     endpoint: String,
     shutdown: Arc<StdMutex<Option<oneshot::Sender<()>>>>,
+}
+
+#[derive(Default)]
+struct TerminalOperationAdmissionState {
+    active: usize,
+    closing: bool,
 }
 
 impl TerminalCodexGatewayHandle {
@@ -1591,6 +1600,9 @@ impl TerminalInstance {
                 input_gate: Arc::new(Mutex::new(TerminalInputGate::default())),
                 input_queue: Arc::new(Mutex::new(())),
                 active_task: Arc::new(Mutex::new(None)),
+                operation_admission: Arc::new(StdMutex::new(
+                    TerminalOperationAdmissionState::default(),
+                )),
                 coordination,
                 session_mode,
                 metadata,
@@ -9831,6 +9843,8 @@ fn run_app(daemon: bool) {
             start_agent_account_login,
             agent_accounts_start_profile_login,
             agent_accounts_web_login_command,
+            agent_accounts_cancel_profile_login,
+            agent_accounts_bind_login_terminal,
             agent_accounts_reconcile_workspace_trust,
             disconnect_agent,
             install_agent,
@@ -10269,6 +10283,7 @@ fn run_app(daemon: bool) {
             resize_terminal,
             terminal_resize,
             terminal_close,
+            terminal_restart_if_idle,
             terminal_close_all,
             terminal_headless_output_delta,
             terminal_headless_output_snapshot,

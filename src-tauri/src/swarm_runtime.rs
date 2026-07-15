@@ -1017,10 +1017,7 @@ fn swarm_load_run_summaries_and_stats(
         };
         let mut events = Vec::new();
         let mut run_mode = "plan".to_string();
-        for event in text
-            .lines()
-            .filter_map(swarm_run_event_from_persisted_line)
-        {
+        for event in text.lines().filter_map(swarm_run_event_from_persisted_line) {
             if event.kind == "run_started" {
                 run_mode = event
                     .data
@@ -2137,7 +2134,14 @@ async fn swarm_context_pack_phase(
         Some(json!({ "chars": chars, "incremental": incremental })),
     )
     .await;
-    swarm_increment_member_stat(state, workspace_id, swarm_id, &scout.member_id, "scout_runs").await;
+    swarm_increment_member_stat(
+        state,
+        workspace_id,
+        swarm_id,
+        &scout.member_id,
+        "scout_runs",
+    )
+    .await;
     swarm_emit_state(app, workspace_id, swarm_id);
     Some(pack_text)
 }
@@ -2158,7 +2162,9 @@ async fn swarm_increment_member_stat(
         "takes_delivered" => {
             member.stats.takes_delivered = member.stats.takes_delivered.saturating_add(1)
         }
-        "champion_runs" => member.stats.champion_runs = member.stats.champion_runs.saturating_add(1),
+        "champion_runs" => {
+            member.stats.champion_runs = member.stats.champion_runs.saturating_add(1)
+        }
         "reaps" => member.stats.reaps = member.stats.reaps.saturating_add(1),
         "errors" => member.stats.errors = member.stats.errors.saturating_add(1),
         "scout_runs" => member.stats.scout_runs = member.stats.scout_runs.saturating_add(1),
@@ -3170,6 +3176,7 @@ async fn swarm_close_member(app: &AppHandle, member: &SwarmMemberRuntime) -> Res
         member.instance_id,
         false,
         false,
+        None,
     )
     .await
 }

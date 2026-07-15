@@ -17,7 +17,7 @@ fn agent_definition(provider: AgentProvider) -> AgentDefinition {
             install_command: "npm install -g @openai/codex",
             native_install_url: "https://github.com/openai/codex/releases/latest",
             native_install_label: "GitHub release binaries",
-            connect_command: "codex login",
+            connect_command: "codex login --device-auth",
         },
         AgentProvider::Claude => AgentDefinition {
             id: "claude",
@@ -525,8 +525,7 @@ fn clear_agent_command_candidate_cache(provider: AgentProvider) {
 
 const AGENT_MODEL_CATALOG_CLAUDE_REASONING_EFFORTS: [&str; 6] =
     ["default", "low", "medium", "high", "xhigh", "max"];
-const AGENT_MODEL_CATALOG_CODEX_REASONING_EFFORTS: [&str; 4] =
-    ["low", "medium", "high", "xhigh"];
+const AGENT_MODEL_CATALOG_CODEX_REASONING_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct AgentModelCatalogEntry {
@@ -839,11 +838,7 @@ fn agent_model_baseline_catalog_entries(agent_kind: &str) -> Vec<AgentModelCatal
         "opencode" => vec![
             opencode_model_catalog_entry("openai/gpt-5.5", "device_baseline", false),
             opencode_model_catalog_entry("openai/gpt-5.4-mini", "device_baseline", false),
-            opencode_model_catalog_entry(
-                "anthropic/claude-sonnet-4-5",
-                "device_baseline",
-                true,
-            ),
+            opencode_model_catalog_entry("anthropic/claude-sonnet-4-5", "device_baseline", true),
             opencode_model_catalog_entry("google/gemini-2.5-pro", "device_baseline", false),
         ],
         _ => Vec::new(),
@@ -901,7 +896,13 @@ fn agent_model_catalog_merge_live_with_baseline(
 
 fn agent_model_catalog_fallback(agent_kind: &str, harness_version: &str) -> AgentModelCatalog {
     let models = agent_model_catalog_merge_live_with_baseline(agent_kind, Vec::new());
-    agent_model_catalog(agent_kind, harness_version, "device_baseline", false, models)
+    agent_model_catalog(
+        agent_kind,
+        harness_version,
+        "device_baseline",
+        false,
+        models,
+    )
 }
 
 const OPENCODE_MODELS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1852,11 +1853,7 @@ fn terminal_agent_start_input_with_env_in_directory(
     working_directory: &Path,
     env_vars: &[(String, String)],
 ) -> String {
-    preflight_interactive_claude_workspace_trust(
-        command_path,
-        working_directory,
-        env_vars,
-    );
+    preflight_interactive_claude_workspace_trust(command_path, working_directory, env_vars);
     let mut input = terminal_set_working_directory_input(working_directory);
     for (key, value) in env_vars {
         if key.trim().is_empty() {
@@ -2604,10 +2601,7 @@ fn terminal_interactive_resume_args(provider_id: &str, args: &[String]) -> Vec<S
     next
 }
 
-fn apply_codex_interactive_permission_args(
-    args: &mut Vec<String>,
-    permission_mode: Option<&str>,
-) {
+fn apply_codex_interactive_permission_args(args: &mut Vec<String>, permission_mode: Option<&str>) {
     let permission_mode = permission_mode.unwrap_or(TERMINAL_PERMISSION_MODE_ACCEPT_EDITS);
     strip_terminal_arg_option(args, "--ask-for-approval", "-a", true);
     strip_terminal_arg_option(args, "--sandbox", "-s", true);
@@ -2651,8 +2645,6 @@ fn apply_codex_coordinated_auto_approval_args(
     strip_terminal_arg_option_value(args, "--enable", "", "apps");
     strip_terminal_arg_option_value(args, "--disable", "", "apps");
     strip_terminal_arg_option(args, "--cd", "-C", true);
-    args.push("--disable".to_string());
-    args.push("apps".to_string());
 
     if !terminal_args_have_option_value(args, "--enable", "", "hooks") {
         args.push("--enable".to_string());
@@ -3373,7 +3365,14 @@ fn extend_terminal_activity_env_vars(
     // and injects CLAUDE_CONFIG_DIR / CODEX_HOME for non-default profiles.
     // Every agent spawn and relaunch path funnels through here, so switching
     // accounts applies to the next spawn without an app restart.
-    agent_accounts_apply_spawn_env(env_vars, pane_id, provider_id);
+    agent_accounts_apply_spawn_env(
+        env_vars,
+        pane_id,
+        provider_id,
+        workspace_id,
+        None,
+        terminal_index,
+    );
 }
 
 fn set_terminal_env_var(env_vars: &mut Vec<(String, String)>, key: &str, value: &str) {
@@ -3446,13 +3445,40 @@ fn terminal_workspace_gateway_environment(
     environment
 }
 
-fn apply_codex_resume_home_env(env_vars: &mut Vec<(String, String)>, home: &str) {
-    let home = home.trim();
-    if home.is_empty() {
-        return;
+fn apply_codex_resume_home_env(
+    env_vars: &mut Vec<(String, String)>,
+    source_home: &str,
+    provider_session_id: &str,
+) -> Result<(), String> {
+    let source_home = source_home.trim();
+    if source_home.is_empty() {
+        return Ok(());
     }
-    set_terminal_env_var(env_vars, "CODEX_HOME", home);
-    set_terminal_env_var(env_vars, "DIFFFORGE_CODEX_HOME", home);
+    let managed_home = env_vars
+        .iter()
+        .rev()
+        .find_map(|(key, value)| {
+            (key == "DIFFFORGE_CODEX_HOME")
+                .then_some(value.trim())
+                .filter(|value| !value.is_empty())
+        })
+        .map(ToString::to_string);
+    if let Some(managed_home) = managed_home {
+        materialize_codex_rollout_in_managed_home(
+            provider_session_id,
+            Path::new(source_home),
+            Path::new(&managed_home),
+        )?;
+        // Resume/fork may originate in a global home or another coordinated
+        // slot. The new pane's managed home remains authoritative so its MCP
+        // identity and permission roots cannot be inherited from the source.
+        set_terminal_env_var(env_vars, "CODEX_HOME", &managed_home);
+        set_terminal_env_var(env_vars, "DIFFFORGE_CODEX_HOME", &managed_home);
+        return Ok(());
+    }
+    set_terminal_env_var(env_vars, "CODEX_HOME", source_home);
+    set_terminal_env_var(env_vars, "DIFFFORGE_CODEX_HOME", source_home);
+    Ok(())
 }
 
 fn refresh_codex_activity_hook_profile_for_terminal(
@@ -3831,9 +3857,8 @@ fn codex_profile_inline_hook_block_is_diff_forge_managed(lines: &[&str]) -> bool
         let Some(value) = rest.trim_start().strip_prefix('=') else {
             return false;
         };
-        terminal_toml_string_literal_value(value).is_some_and(|command| {
-            command.contains("--diff-forge-activity-hook")
-        })
+        terminal_toml_string_literal_value(value)
+            .is_some_and(|command| command.contains("--diff-forge-activity-hook"))
     })
 }
 
@@ -3841,9 +3866,7 @@ fn codex_toml_section_is_inline_hook_event_root(section: &str) -> bool {
     let Some(event_name) = section.strip_prefix("hooks.") else {
         return false;
     };
-    !event_name.is_empty()
-        && !event_name.contains('.')
-        && event_name != "state"
+    !event_name.is_empty() && !event_name.contains('.') && event_name != "state"
 }
 
 fn terminal_toml_section_header_name(line: &str) -> Option<String> {
@@ -4004,10 +4027,7 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
             || (record_hook_key == "pretooluse"
                 && matches!(
                     record_tool_key.as_str(),
-                    "askuserquestion"
-                        | "requestuserinput"
-                        | "elicitation"
-                        | "mcpelicitation"
+                    "askuserquestion" | "requestuserinput" | "elicitation" | "mcpelicitation"
                 )))
     {
         // The app-server gateway owns these blocking requests. Keep the
@@ -4229,23 +4249,29 @@ fn send_diff_forge_activity_hook_transport(
         .collect::<String>()
         .to_ascii_lowercase();
     let waits_for_structured_response = (provider.contains("claude")
-        && (matches!(hook_name.as_str(), "permissionrequest" | "permissiondenied" | "elicitation")
-            || (hook_name == "pretooluse"
-                && matches!(tool_name.as_str(), "askuserquestion" | "exitplanmode"))))
+        && (matches!(
+            hook_name.as_str(),
+            "permissionrequest" | "permissiondenied" | "elicitation"
+        ) || (hook_name == "pretooluse"
+            && matches!(tool_name.as_str(), "askuserquestion" | "exitplanmode"))))
         || (provider.contains("codex")
             && (hook_name == "permissionrequest"
                 || (hook_name == "pretooluse"
                     && matches!(
                         tool_name.as_str(),
-                        "askuserquestion"
-                            | "requestuserinput"
-                            | "elicitation"
-                            | "mcpelicitation"
+                        "askuserquestion" | "requestuserinput" | "elicitation" | "mcpelicitation"
                     ))))
         || (provider.contains("opencode")
-            && matches!(hook_name.as_str(), "permissionrequest" | "userpromptrequired"));
+            && matches!(
+                hook_name.as_str(),
+                "permissionrequest" | "userpromptrequired"
+            ));
     let read_timeout = if waits_for_structured_response {
-        Some(Duration::from_secs(if provider.contains("codex") { 110 } else { 590 }))
+        Some(Duration::from_secs(if provider.contains("codex") {
+            110
+        } else {
+            590
+        }))
     } else {
         io_timeout
     };
@@ -5949,10 +5975,7 @@ mod terminal_cli_tests {
 
     #[test]
     fn claude_workspace_trust_merge_preserves_state_and_is_missing_file_safe() {
-        let root = env::temp_dir().join(format!(
-            "diffforge-claude-trust-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root = env::temp_dir().join(format!("diffforge-claude-trust-{}", uuid::Uuid::new_v4()));
         let workspace = root.join("workspace");
         let sibling_workspace = root.join("sibling");
         let config_path = root.join("profile").join(".claude.json");
@@ -6009,8 +6032,7 @@ mod terminal_cli_tests {
         let missing_state: Value =
             serde_json::from_slice(&fs::read(&missing_path).unwrap()).unwrap();
         assert_eq!(
-            missing_state["projects"][workspace_path_display(&workspace)]
-                ["hasTrustDialogAccepted"],
+            missing_state["projects"][workspace_path_display(&workspace)]["hasTrustDialogAccepted"],
             true
         );
 
@@ -6060,13 +6082,11 @@ mod terminal_cli_tests {
             ));
         }
 
-        let merged: Value =
-            serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        let merged: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
         assert_eq!(merged["sibling"]["keep"], true);
         for workspace in [&workspace_a, &workspace_b] {
             assert_eq!(
-                merged["projects"][workspace_path_display(workspace)]
-                    ["hasTrustDialogAccepted"],
+                merged["projects"][workspace_path_display(workspace)]["hasTrustDialogAccepted"],
                 true
             );
             assert_eq!(
@@ -6125,8 +6145,7 @@ mod terminal_cli_tests {
         let state_path = profile.join(".claude.json");
         let state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
         assert_eq!(
-            state["projects"][workspace_path_display(&workspace)]
-                ["hasTrustDialogAccepted"],
+            state["projects"][workspace_path_display(&workspace)]["hasTrustDialogAccepted"],
             true
         );
         assert!(!overridden_home.join(".claude.json").exists());
@@ -6166,11 +6185,14 @@ mod terminal_cli_tests {
 
         let bare_resume = terminal_interactive_resume_args(
             "claude",
-            &["--resume".to_string(), "--model".to_string(), "opus".to_string()],
+            &[
+                "--resume".to_string(),
+                "--model".to_string(),
+                "opus".to_string(),
+            ],
         );
         assert_eq!(bare_resume, ["--model", "opus"]);
-        let bare_continue =
-            terminal_interactive_resume_args("claude", &["--continue".to_string()]);
+        let bare_continue = terminal_interactive_resume_args("claude", &["--continue".to_string()]);
         assert!(bare_continue.is_empty());
         assert!(terminal_interactive_resume_args("claude", &[]).is_empty());
     }
@@ -6222,9 +6244,7 @@ mod terminal_cli_tests {
             None,
         );
         assert_eq!(&codex[..2], ["resume", "codex-session-1"]);
-        assert!(codex
-            .windows(2)
-            .any(|pair| pair == ["--model", "gpt-5.4"]));
+        assert!(codex.windows(2).any(|pair| pair == ["--model", "gpt-5.4"]));
         assert!(codex
             .windows(2)
             .any(|pair| pair == ["-c", "model_reasoning_effort=\"high\""]));
@@ -6234,6 +6254,64 @@ mod terminal_cli_tests {
         assert!(codex
             .windows(2)
             .any(|pair| pair == ["--sandbox", "workspace-write"]));
+    }
+
+    #[test]
+    fn coordinated_interactive_codex_keeps_apps_while_internal_turns_disable_them() {
+        let mut interactive = vec![
+            "--disable".to_string(),
+            "apps".to_string(),
+            "resume".to_string(),
+            "session-1".to_string(),
+        ];
+        apply_codex_coordinated_auto_approval_args(
+            &mut interactive,
+            None,
+            false,
+            Some(TERMINAL_PERMISSION_MODE_ACCEPT_EDITS),
+        );
+        assert!(!interactive
+            .windows(2)
+            .any(|pair| pair == ["--disable", "apps"]));
+
+        let coordination = TerminalCoordinationSession {
+            repo_path: "/tmp/diffforge-workspace".to_string(),
+            db_path: "/tmp/diffforge-workspace/coordination.db".to_string(),
+            mcp_command: "diffforge".to_string(),
+            agent_id: "codex".to_string(),
+            agent_kind: "codex".to_string(),
+            session_id: "session-1".to_string(),
+            terminal_launch_epoch: Some("pane-1:1".to_string()),
+            env_vars: Vec::new(),
+        };
+        let coordinated = terminal_args_with_codex_mcp_identity(
+            "codex",
+            &[],
+            Some(&coordination),
+            Some(TERMINAL_PERMISSION_MODE_ACCEPT_EDITS),
+            "pane-1",
+            1,
+            None,
+        );
+        assert!(!coordinated
+            .windows(2)
+            .any(|pair| pair == ["--disable", "apps"]));
+        assert!(coordinated.iter().any(|arg| arg.contains("coordination-kernel")));
+        assert!(coordinated
+            .iter()
+            .any(|arg| arg.contains("workspace-mcp-gateway")));
+
+        let output = env::temp_dir().join("diffforge-codex-internal-turn-output.txt");
+        let internal = build_codex_turn_args(None, "", &output);
+        assert!(internal
+            .windows(2)
+            .any(|pair| pair == ["--disable", "apps"]));
+
+        let mut coordinated_exec = vec!["exec".to_string(), "-".to_string()];
+        apply_codex_coordinated_exec_args(&mut coordinated_exec, &coordination);
+        assert!(coordinated_exec
+            .windows(2)
+            .any(|pair| pair == ["--disable", "apps"]));
     }
 
     #[test]
@@ -6364,11 +6442,8 @@ mod terminal_cli_tests {
             "--model".to_string(),
             "m".repeat(WINDOWS_NATIVE_CLAUDE_LAUNCH_STAGE_THRESHOLD),
         ];
-        let error = stage_windows_claude_launch_args(
-            native_command_path,
-            &native_unstageable_args,
-        )
-        .expect_err("non-file-backed native launch should remain over the native bound");
+        let error = stage_windows_claude_launch_args(native_command_path, &native_unstageable_args)
+            .expect_err("non-file-backed native launch should remain over the native bound");
         assert!(error.contains(&format!(
             "limit {WINDOWS_NATIVE_CLAUDE_LAUNCH_STAGE_THRESHOLD}"
         )));
@@ -7542,15 +7617,17 @@ mod terminal_cli_tests {
             .contains("scheduleIdle(sessionId, \"session.idle\")"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("clearTimeout(timer)"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("/permission/${id}/reply"));
-        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
-            .contains("postSessionIdPermissionsPermissionId"));
+        assert!(
+            DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("postSessionIdPermissionsPermissionId")
+        );
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("handlePendingPermission"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("reconcilePendingPermissions"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("client.permission.list"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
             .contains("opencodeFetch(serverUrl, \"/permission\", undefined, \"GET\")"));
-        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
-            .contains("if (type === \"permission.asked\")"));
+        assert!(
+            DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("if (type === \"permission.asked\")")
+        );
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
             .contains("await handlePendingPermission(sessionId, requestId, props)"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
@@ -7562,7 +7639,8 @@ mod terminal_cli_tests {
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
             .contains("clearInterval(permissionReconcileInterval)"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("/question/${id}/reply"));
-        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("hook_event_name: \"TranscriptChanged\""));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("hook_event_name: \"TranscriptChanged\""));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("permission_decision: props.reply"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("permission.replied"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("texts.join(\"\\n\")"));
@@ -7908,12 +7986,11 @@ mod terminal_cli_tests {
             Some(&json!("cancel")),
         );
 
-        let permission_denied =
-            diff_forge_activity_hook_blocking_fallback_response(&json!({
-                "provider": "claude",
-                "hook_event_name": "PermissionDenied",
-            }))
-            .expect("permission-denied fallback");
+        let permission_denied = diff_forge_activity_hook_blocking_fallback_response(&json!({
+            "provider": "claude",
+            "hook_event_name": "PermissionDenied",
+        }))
+        .expect("permission-denied fallback");
         assert_eq!(
             permission_denied.pointer("/hookSpecificOutput/hookEventName"),
             Some(&json!("PermissionDenied")),
@@ -8312,11 +8389,7 @@ fn terminal_agent_start_input_with_env_in_directory(
     working_directory: &Path,
     env_vars: &[(String, String)],
 ) -> String {
-    preflight_interactive_claude_workspace_trust(
-        command_path,
-        working_directory,
-        env_vars,
-    );
+    preflight_interactive_claude_workspace_trust(command_path, working_directory, env_vars);
     let mut input = terminal_set_working_directory_input(working_directory);
     for (key, value) in env_vars {
         if key.trim().is_empty() {
@@ -8462,10 +8535,7 @@ impl Drop for ClaudeWorkspaceTrustLock {
     }
 }
 
-fn terminal_launch_env_value<'a>(
-    env_vars: &'a [(String, String)],
-    key: &str,
-) -> Option<&'a str> {
+fn terminal_launch_env_value<'a>(env_vars: &'a [(String, String)], key: &str) -> Option<&'a str> {
     env_vars
         .iter()
         .rev()
@@ -8484,19 +8554,16 @@ fn terminal_safe_absolute_launch_path(value: &str) -> Option<PathBuf> {
     Some(path)
 }
 
-fn claude_config_path_for_interactive_launch(
-    env_vars: &[(String, String)],
-) -> Option<PathBuf> {
+fn claude_config_path_for_interactive_launch(env_vars: &[(String, String)]) -> Option<PathBuf> {
     if let Some(config_dir) = terminal_launch_env_value(env_vars, "CLAUDE_CONFIG_DIR") {
         return terminal_safe_absolute_launch_path(config_dir)
             .map(|directory| directory.join(".claude.json"));
     }
 
-    let launch_home = terminal_launch_env_value(env_vars, "HOME")
-        .or_else(|| terminal_launch_env_value(env_vars, "USERPROFILE"))
+    let launch_home = terminal_launch_env_value(env_vars, "USERPROFILE")
+        .or_else(|| terminal_launch_env_value(env_vars, "HOME"))
         .map(str::to_string)
-        .or_else(|| env::var("HOME").ok())
-        .or_else(|| env::var("USERPROFILE").ok())?;
+        .or_else(|| user_home_dir().map(|home| home.to_string_lossy().to_string()))?;
     terminal_safe_absolute_launch_path(&launch_home).map(|home| home.join(".claude.json"))
 }
 
@@ -8544,9 +8611,9 @@ fn acquire_claude_workspace_trust_lock(
     const ATTEMPTS: usize = 100;
     let lock_path = claude_workspace_trust_lock_path(config_path)
         .ok_or_else(|| "Unable to resolve the Claude workspace-trust lock path.".to_string())?;
-    let parent = lock_path
-        .parent()
-        .ok_or_else(|| "Unable to resolve the Claude workspace-trust config directory.".to_string())?;
+    let parent = lock_path.parent().ok_or_else(|| {
+        "Unable to resolve the Claude workspace-trust config directory.".to_string()
+    })?;
     fs::create_dir_all(parent).map_err(|error| {
         format!("Unable to prepare the Claude workspace-trust config directory: {error}")
     })?;
@@ -8694,7 +8761,10 @@ fn ensure_claude_workspace_trust_in_config(
         )?;
         return Ok(ClaudeWorkspaceTrustMergeOutcome::Updated);
     }
-    Err("Claude workspace-trust state kept changing during preflight; skipped the merge.".to_string())
+    Err(
+        "Claude workspace-trust state kept changing during preflight; skipped the merge."
+            .to_string(),
+    )
 }
 
 fn preflight_interactive_claude_workspace_trust(
@@ -8702,11 +8772,9 @@ fn preflight_interactive_claude_workspace_trust(
     working_directory: &Path,
     env_vars: &[(String, String)],
 ) {
-    let Some(workspace) = claude_managed_workspace_for_interactive_launch(
-        command_path,
-        working_directory,
-        env_vars,
-    ) else {
+    let Some(workspace) =
+        claude_managed_workspace_for_interactive_launch(command_path, working_directory, env_vars)
+    else {
         return;
     };
     let Some(config_path) = claude_config_path_for_interactive_launch(env_vars) else {
@@ -10130,11 +10198,7 @@ fn create_agent_terminal_pty(
     env_vars: &[(String, String)],
     banner: Option<&str>,
 ) -> Result<WarmPty, String> {
-    preflight_interactive_claude_workspace_trust(
-        command_path,
-        working_directory,
-        env_vars,
-    );
+    preflight_interactive_claude_workspace_trust(command_path, working_directory, env_vars);
     let mut command = terminal_agent_launch_command(command_path, args, working_directory, banner);
 
     for (key, value) in env_vars {
@@ -10555,10 +10619,7 @@ fn opencode_config_paths() -> Vec<PathBuf> {
         paths.push(current_dir.join(".opencode.json"));
     }
 
-    if let Some(home) = env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-    {
+    if let Some(home) = user_home_dir() {
         paths.push(home.join(".config").join("opencode").join("opencode.json"));
         paths.push(home.join(".config").join("opencode").join("config.json"));
         paths.push(home.join(".opencode").join("opencode.json"));
@@ -10939,7 +11000,12 @@ fn launch_login_terminal(provider: AgentProvider) -> Result<(), String> {
         .unwrap_or_else(|| definition.binary.to_string());
 
     match provider {
-        AgentProvider::Codex => run_login_terminal(definition.label, &binary, &["login"]),
+        AgentProvider::Codex => {
+            if let Some(home) = agent_accounts_default_home("codex") {
+                agent_accounts_ensure_codex_file_auth_store(&home)?;
+            }
+            run_login_terminal(definition.label, &binary, &["login", "--device-auth"])
+        }
         AgentProvider::Claude => run_login_terminal(definition.label, &binary, &[]),
         AgentProvider::OpenCode => {
             run_login_terminal(definition.label, &binary, &["auth", "login"])
@@ -10959,7 +11025,12 @@ fn launch_account_login_terminal(provider: AgentProvider) -> Result<(), String> 
         .unwrap_or_else(|| definition.binary.to_string());
 
     match provider {
-        AgentProvider::Codex => run_login_terminal(definition.label, &binary, &["login"]),
+        AgentProvider::Codex => {
+            if let Some(home) = agent_accounts_default_home("codex") {
+                agent_accounts_ensure_codex_file_auth_store(&home)?;
+            }
+            run_login_terminal(definition.label, &binary, &["login", "--device-auth"])
+        }
         AgentProvider::Claude => run_login_terminal(definition.label, &binary, &["auth", "login"]),
         AgentProvider::OpenCode => {
             run_login_terminal(definition.label, &binary, &["auth", "login"])
@@ -11180,7 +11251,41 @@ fn run_login_terminal_with_env(
         .spawn()
         .map_err(|error| format!("Unable to open {title} login terminal: {error}"))?;
 
-    track_login_terminal_child(child);
+    if let Some(marker) = env_vars.iter().find_map(|(key, value)| {
+        (key == "DIFFFORGE_LOGIN_EXIT_MARKER" && !value.trim().is_empty())
+            .then(|| PathBuf::from(value))
+    }) {
+        // A Windows console close can bypass the inner cmd's final redirection.
+        // Observe the actual console process as the authoritative exit signal.
+        let _ = thread::Builder::new()
+            .name("provider-login-exit".to_string())
+            .spawn(move || {
+                let mut child = child;
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) | Err(_) => break,
+                        Ok(None) if crate::app_shutdown_requested() => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            break;
+                        }
+                        Ok(None) => thread::sleep(Duration::from_millis(100)),
+                    }
+                }
+                let acknowledgement = agent_accounts_login_exit_marker_ack_path(&marker);
+                if acknowledgement.is_file() {
+                    let _ = fs::remove_file(acknowledgement);
+                    let _ = fs::remove_file(marker);
+                } else if !marker.is_file() {
+                    // Forced console close bypasses the inner cmd's status
+                    // publisher. Publish cancellation atomically and never
+                    // overwrite a completed inner-command marker.
+                    let _ = agent_accounts_publish_login_exit_marker(&marker, 130);
+                }
+            });
+    } else {
+        track_login_terminal_child(child);
+    }
 
     Ok(())
 }
@@ -12113,7 +12218,7 @@ fn stage_chat_attachment_refs_for(
             let attachment_id = sanitized_chat_attachment_id(&attachment.attachment_id);
             if chat_attachment_is_websocket_id(&attachment_id) {
                 return Err(
-                    "Websocket-staged attachment is unavailable on this device.".to_string(),
+                    "Websocket-staged attachment is unavailable on this device.".to_string()
                 );
             }
             cloud_mcp_download_chat_attachment_blocking(&attachment_id)
@@ -12133,7 +12238,7 @@ fn stage_chat_attachment_refs_for_dispatch(
             let attachment_id = sanitized_chat_attachment_id(&attachment.attachment_id);
             if chat_attachment_is_websocket_id(&attachment_id) {
                 return Err(
-                    "Websocket-staged attachment is unavailable on this device.".to_string(),
+                    "Websocket-staged attachment is unavailable on this device.".to_string()
                 );
             }
             cloud_mcp_download_chat_attachment_blocking(&attachment_id)
@@ -12698,7 +12803,11 @@ fn run_agent_thread_turn_for_context(
         &working_directory_text,
     );
     if let Some(home) = codex_resume_home.as_deref() {
-        apply_codex_resume_home_env(&mut launch_env_vars, home);
+        apply_codex_resume_home_env(
+            &mut launch_env_vars,
+            home,
+            launch_provider_session_id.as_deref().unwrap_or_default(),
+        )?;
     }
     let launch_provider_session_id = launch_provider_session_id.unwrap_or_default();
     let mut output_path = None;
