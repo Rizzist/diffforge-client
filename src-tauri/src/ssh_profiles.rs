@@ -159,7 +159,10 @@ fn ssh_profile_validate_request(
         return Err("SSH profile host must not start with '-'.".to_string());
     }
     let username = ssh_profile_optional_trim(request.username);
-    if username.as_deref().is_some_and(|value| value.starts_with('-')) {
+    if username
+        .as_deref()
+        .is_some_and(|value| value.starts_with('-'))
+    {
         return Err("SSH profile username must not start with '-'.".to_string());
     }
     if request.port == Some(0) {
@@ -750,6 +753,8 @@ async fn terminal_ssh_connect(
         None,
         None,
         Some(false),
+        None,
+        false,
         false,
     )
     .await;

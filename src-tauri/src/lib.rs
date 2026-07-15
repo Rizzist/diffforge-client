@@ -145,6 +145,10 @@ const TERMINAL_ACTIVITY_HOOK_BACKOFF_UNCHANGED_POLLS: u32 = 4;
 const TERMINAL_ACTIVITY_TRANSPORT_CONNECT_TIMEOUT_MS: u64 = 150;
 const TERMINAL_ACTIVITY_TRANSPORT_IO_TIMEOUT_MS: u64 = 1_000;
 const TERMINAL_STRUCTURED_INTERACTION_WAIT_SECONDS: u64 = 570;
+// Once an answer has been written or handed to a provider API, only the
+// provider's resolution event remains. Bound that confirmation gap so a lost
+// follow-up cannot leave the terminal prompting forever.
+const STRUCTURED_ANSWER_CONFIRMATION_TIMEOUT_SECS: u64 = 90;
 const TERMINAL_ENTER_SEQUENCE: &str = "\x1b[13u";
 const TERMINAL_ENTER_SEQUENCE_MOD1: &str = "\x1b[13;1u";
 const TERMINAL_SHIFT_ENTER_SEQUENCE: &str = "\x1b[13;2u";
@@ -686,6 +690,8 @@ struct TerminalStructuredInteraction {
     prompt_id: String,
     hook_event_name: String,
     response_mode: String,
+    awaiting_provider_confirmation: bool,
+    claimed_option_id: Option<String>,
     options: Vec<TerminalActivityHookPromptOption>,
     permission_suggestions: Option<Value>,
     prompt_questions: Option<Value>,

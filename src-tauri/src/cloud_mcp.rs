@@ -35184,6 +35184,160 @@ fn cloud_mcp_mark_terminal_last_known_read_only(value: &mut Value) {
     object.insert("connected".to_string(), json!(false));
 }
 
+const CLOUD_MCP_TERMINAL_PROMPT_COHORT_FIELDS: &[&str] = &[
+    "prompt_state_seq",
+    "prompt_id",
+    "prompt_kind",
+    "prompt_default_option",
+    "prompt_ttl_ms",
+    "prompt_options",
+    "prompt_questions",
+    "prompt_schema",
+    "prompt_url",
+    "provider_payload",
+    "allows_free_text",
+    "manual_approval_required",
+    "provider_blocked_for_user",
+    "terminal_is_prompting_user",
+    "prompting_user_kind",
+    "prompting_user_source",
+    "prompting_user_confidence",
+    "prompting_user_text",
+    "interaction_id",
+    "interaction_revision",
+    "interaction_source",
+    "interaction_response_mode",
+    "provider_request_id",
+    "approval_id",
+    "permission_prompt_id",
+    "permission_request_id",
+];
+
+const CLOUD_MCP_TERMINAL_PROMPT_OWNER_FIELDS: &[&str] = &[
+    "terminal_instance_id",
+    "instance_id",
+    "terminal_epoch",
+    "agent_kind",
+    "agent_id",
+    "agent_type",
+    "provider",
+    "provider_session_id",
+    "native_session_id",
+    "session_id",
+    "thread_id",
+    "target_thread_id",
+];
+
+fn cloud_mcp_terminal_prompt_state_seq(terminal: &Value) -> Option<u64> {
+    cloud_mcp_payload_u64(terminal, &["prompt_state_seq"])
+}
+
+fn cloud_mcp_terminal_pane_id(terminal: &Value) -> Option<String> {
+    cloud_mcp_payload_text(
+        terminal,
+        &["pane_id", "terminal_id", "target_terminal_id"],
+    )
+}
+
+fn cloud_mcp_merge_cached_terminal_prompt_cohort(target: &mut Value, cached: &Value) {
+    let Some(cached_seq) = cloud_mcp_terminal_prompt_state_seq(cached) else {
+        return;
+    };
+    if cloud_mcp_terminal_prompt_state_seq(target).is_some_and(|target_seq| target_seq > cached_seq) {
+        return;
+    }
+    let (Some(target), Some(cached)) = (target.as_object_mut(), cached.as_object()) else {
+        return;
+    };
+    for key in CLOUD_MCP_TERMINAL_PROMPT_COHORT_FIELDS
+        .iter()
+        .chain(CLOUD_MCP_TERMINAL_PROMPT_OWNER_FIELDS)
+    {
+        if let Some(value) = cached.get(*key) {
+            target.insert((*key).to_string(), value.clone());
+        }
+    }
+}
+
+/// Workspace status snapshots and prompt-hook deltas share this cache. A status
+/// refresh may update lifecycle fields, but without a prompt_state_seq it cannot
+/// supersede the latest prompt generation already written by the hook path.
+fn cloud_mcp_preserve_cached_snapshot_prompt_cohorts(target: &mut Value, cached: Option<&Value>) {
+    let Some(cached_workspaces) = cached
+        .and_then(|value| value.get("workspaces"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    let Some(target_workspaces) = target
+        .get_mut("workspaces")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+
+    for target_workspace in target_workspaces {
+        if !cloud_mcp_workspace_explicit_active_state(target_workspace).unwrap_or(true) {
+            continue;
+        }
+        let Some(workspace_id) = cloud_mcp_payload_text(target_workspace, &["workspace_id", "id"])
+        else {
+            continue;
+        };
+        let workspace_id = cloud_mcp_workspace_id_match_key(&workspace_id);
+        let cached_terminals = cached_workspaces
+            .iter()
+            .find(|workspace| {
+                cloud_mcp_payload_text(workspace, &["workspace_id", "id"])
+                    .map(|value| cloud_mcp_workspace_id_match_key(&value))
+                    .as_deref()
+                    == Some(workspace_id.as_str())
+            })
+            .map(cloud_mcp_workspace_terminal_items)
+            .unwrap_or_default();
+        if cached_terminals.is_empty() {
+            continue;
+        }
+        let Some(target_terminals) = target_workspace
+            .get_mut("terminals")
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+
+        for target_terminal in target_terminals.iter_mut() {
+            let Some(pane_id) = cloud_mcp_terminal_pane_id(target_terminal) else {
+                continue;
+            };
+            let cached_terminal = cached_terminals
+                .iter()
+                .filter(|candidate| {
+                    cloud_mcp_terminal_pane_id(candidate).as_deref() == Some(pane_id.as_str())
+                })
+                .max_by_key(|candidate| {
+                    cloud_mcp_terminal_prompt_state_seq(candidate).unwrap_or_default()
+                });
+            if let Some(cached_terminal) = cached_terminal {
+                cloud_mcp_merge_cached_terminal_prompt_cohort(target_terminal, cached_terminal);
+            }
+        }
+
+        for cached_terminal in cached_terminals.iter().filter(|terminal| {
+            cloud_mcp_terminal_prompt_state_seq(terminal).is_some()
+                && cloud_mcp_payload_bool(terminal, &["terminal_is_prompting_user"], false)
+        }) {
+            let Some(pane_id) = cloud_mcp_terminal_pane_id(cached_terminal) else {
+                continue;
+            };
+            if !target_terminals.iter().any(|terminal| {
+                cloud_mcp_terminal_pane_id(terminal).as_deref() == Some(pane_id.as_str())
+            }) {
+                target_terminals.push(cached_terminal.clone());
+            }
+        }
+    }
+}
+
 /// An interaction is actionable only while its exact native terminal
 /// generation is alive.  Closed terminals and deactivated workspaces must
 /// carry an explicit prompt clear so Cloud can retire the matching push
@@ -38150,6 +38304,10 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
                     .get("status_seq")
                     .cloned()
                     .unwrap_or(Value::Null);
+                let prompt_state_seq = terminal
+                    .get("prompt_state_seq")
+                    .cloned()
+                    .unwrap_or(Value::Null);
                 let status_source = terminal
                     .get("status_source")
                     .cloned()
@@ -38232,6 +38390,7 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
                     "turn_id": cloud_mcp_payload_text(terminal, &["turn_id", "latest_turn_id"]),
                     "turn_status": cloud_mcp_payload_text(terminal, &["turn_status", "latest_turn_status"]),
                     "status_seq": status_seq,
+                    "prompt_state_seq": prompt_state_seq,
                     "input_ready": input_ready,
                     "parked": terminal
                         .get("parked")
@@ -38636,13 +38795,17 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
         payload["workspace_set_empty_authoritative"] = json!(true);
         payload["workspace_clear_reason"] = json!("complete_local_catalog_empty");
     }
-    let payload = cloud_mcp_device_live_payload_with_sync_identity(payload);
-
-    {
+    let payload = {
         let mut snapshots = state.runtime_snapshots.lock().await;
+        cloud_mcp_preserve_cached_snapshot_prompt_cohorts(
+            &mut payload,
+            snapshots.workspace_terminals.as_ref(),
+        );
+        let payload = cloud_mcp_device_live_payload_with_sync_identity(payload);
         snapshots.workspace_terminals = Some(payload.clone());
         snapshots.workspace_catalog = Some(payload.clone());
-    }
+        payload
+    };
 
     let mut sent = false;
     let mut queued = false;
@@ -63224,6 +63387,81 @@ mod cloud_mcp_tests {
         assert_eq!(terminal["prompt_kind"], json!("approval"));
         assert_eq!(terminal["prompt_options"][0]["danger"], json!(true));
         assert_eq!(terminal["allows_free_text"], json!(true));
+        assert_eq!(terminal["terminal_is_prompting_user"], json!(true));
+    }
+
+    #[test]
+    fn workspace_status_snapshot_preserves_pending_sequenced_prompt_cohort() {
+        let cached_prompt = json!({
+            "workspaces": [{
+                "workspace_id": "workspace-a",
+                "workspace_active": true,
+                "terminals": [
+                    {
+                        "pane_id": "pane-1",
+                        "terminal_id": "pane-1",
+                        "terminal_instance_id": 7,
+                        "terminal_epoch": "pane-1:7",
+                        "provider": "opencode",
+                        "status": "awaiting_input",
+                        "prompt_state_seq": 50,
+                        "prompt_id": "prompt-a",
+                        "interaction_id": "uir:a",
+                        "interaction_revision": 50,
+                        "terminal_is_prompting_user": true
+                    },
+                    {
+                        "pane_id": "pane-1",
+                        "terminal_id": "pane-1",
+                        "terminal_instance_id": 8,
+                        "terminal_epoch": "pane-1:8",
+                        "provider": "codex",
+                        "status": "awaiting_input",
+                        "prompt_state_seq": 51,
+                        "prompt_id": "prompt-b",
+                        "prompt_options": [{"id": "continue"}],
+                        "interaction_id": "uir:b",
+                        "interaction_revision": 51,
+                        "provider_request_id": "request-b",
+                        "terminal_is_prompting_user": true
+                    }
+                ]
+            }]
+        });
+        let mut status_snapshot = json!({
+            "workspaces": [{
+                "workspace_id": "workspace-a",
+                "workspace_active": true,
+                "terminals": [{
+                    "pane_id": "pane-1",
+                    "terminal_id": "pane-1",
+                    "terminal_instance_id": 7,
+                    "terminal_epoch": "pane-1:7",
+                    "provider": "opencode",
+                    "status": "running",
+                    "prompt_id": "",
+                    "prompt_options": [],
+                    "interaction_id": null,
+                    "terminal_is_prompting_user": false
+                }]
+            }]
+        });
+
+        cloud_mcp_preserve_cached_snapshot_prompt_cohorts(
+            &mut status_snapshot,
+            Some(&cached_prompt),
+        );
+
+        let terminal = &status_snapshot["workspaces"][0]["terminals"][0];
+        assert_eq!(terminal["status"], json!("running"));
+        assert_eq!(terminal["terminal_instance_id"], json!(8));
+        assert_eq!(terminal["terminal_epoch"], json!("pane-1:8"));
+        assert_eq!(terminal["provider"], json!("codex"));
+        assert_eq!(terminal["prompt_state_seq"], json!(51));
+        assert_eq!(terminal["prompt_id"], json!("prompt-b"));
+        assert_eq!(terminal["prompt_options"], json!([{"id": "continue"}]));
+        assert_eq!(terminal["interaction_id"], json!("uir:b"));
+        assert_eq!(terminal["provider_request_id"], json!("request-b"));
         assert_eq!(terminal["terminal_is_prompting_user"], json!(true));
     }
 

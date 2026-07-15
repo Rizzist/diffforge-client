@@ -43023,12 +43023,17 @@ export default function App() {
             paneId,
             () => invoke("terminal_answer_agent_prompt_remote_command", { event }),
           );
-          const failed = String(details?.status || "").trim().toLowerCase() === "failed"
-            || details?.answered === false;
+          const acceptedPendingConfirmation = String(details?.status || "").trim().toLowerCase()
+            === "accepted_pending_confirmation";
+          const failed = !acceptedPendingConfirmation
+            && (String(details?.status || "").trim().toLowerCase() === "failed"
+              || details?.answered === false);
           await recordRemoteCommandStatus(
             event,
-            failed ? "failed" : "completed",
-            failed
+            failed ? "failed" : acceptedPendingConfirmation ? "accepted" : "completed",
+            acceptedPendingConfirmation
+              ? "Agent prompt answer submitted; awaiting provider confirmation."
+              : failed
               ? "Agent prompt answer was rejected or did not dismiss the prompt."
               : "Agent prompt answer sent to the terminal.",
             details || { pane_id: paneId },

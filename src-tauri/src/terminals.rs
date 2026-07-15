@@ -91,8 +91,7 @@ fn terminal_codex_hook_trust_discovery_set(
             if matches!(
                 entry.state,
                 TerminalCodexHookTrustDiscoveryState::FailedClosed
-            )
-                && state == TerminalCodexHookTrustDiscoveryState::Resolved
+            ) && state == TerminalCodexHookTrustDiscoveryState::Resolved
             {
                 return;
             }
@@ -181,9 +180,7 @@ fn terminal_output_latest_working_indicator_index(text: &str) -> Option<usize> {
                 || text[..*index]
                     .chars()
                     .next_back()
-                    .is_none_or(|character| {
-                        !character.is_ascii_alphanumeric() && character != '_'
-                    })
+                    .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
         })
         .filter_map(|index| {
             lower[index..]
@@ -2818,6 +2815,7 @@ async fn write_terminal_input(
     pane_id: &str,
     instance_id: Option<u64>,
     data: &str,
+    structured_answer: Option<&TerminalStructuredInteraction>,
     _skipped_phase: &str,
 ) -> Result<bool, String> {
     validate_terminal_pane_id(pane_id)?;
@@ -2833,6 +2831,9 @@ async fn write_terminal_input(
     let instance = {
         let terminals = state.terminals.read().await;
         let Some(instance) = terminals.get(pane_id).cloned() else {
+            if let Some(interaction) = structured_answer {
+                terminal_structured_interaction_remove_generation(state, interaction);
+            }
             return if instance_id.is_some() {
                 Ok(false)
             } else {
@@ -2841,6 +2842,9 @@ async fn write_terminal_input(
         };
 
         if instance_id.is_some_and(|expected_id| expected_id != instance.id) {
+            if let Some(interaction) = structured_answer {
+                terminal_structured_interaction_remove_generation(state, interaction);
+            }
             return Ok(false);
         }
 
@@ -2876,8 +2880,47 @@ async fn write_terminal_input(
         .map(|current| current.id != instance.id)
         .unwrap_or(true)
     {
+        if let Some(interaction) = structured_answer {
+            terminal_structured_interaction_remove_generation(state, interaction);
+        }
         return Ok(false);
     }
+    let structured_interactions = if let Some(interaction) = structured_answer {
+        let interactions = state
+            .terminal_structured_interactions
+            .lock()
+            .map_err(|_| "Structured terminal interaction state is unavailable.".to_string())?;
+        let exact_claim_is_open =
+            interactions
+                .get(&interaction.interaction_id)
+                .is_some_and(|current| {
+                    terminal_structured_interaction_same_generation(current, interaction)
+                        && current.awaiting_provider_confirmation
+                });
+        if !exact_claim_is_open {
+            return Ok(false);
+        }
+        Some(interactions)
+    } else {
+        None
+    };
+    let structured_runtime = if structured_answer.is_some() {
+        let runtime = instance
+            .runtime
+            .lock()
+            .map_err(|_| "Terminal runtime state is unavailable.".to_string())?;
+        if !terminal_runtime_is_prompting_for_structured_interaction(&runtime) {
+            drop(runtime);
+            drop(structured_interactions);
+            if let Some(interaction) = structured_answer {
+                terminal_structured_interaction_remove_generation(state, interaction);
+            }
+            return Ok(false);
+        }
+        Some(runtime)
+    } else {
+        None
+    };
     let write_started_at = Instant::now();
 
     if let Err(error) = writer.write_all(data.as_bytes()) {
@@ -2893,6 +2936,11 @@ async fn write_terminal_input(
                 "stage": "write_all",
             }),
         );
+        drop(structured_runtime);
+        drop(structured_interactions);
+        if let Some(interaction) = structured_answer {
+            terminal_structured_interaction_remove_generation(state, interaction);
+        }
         return Err(format!("Unable to write terminal input: {error}"));
     }
     if let Err(error) = writer.flush() {
@@ -2908,6 +2956,11 @@ async fn write_terminal_input(
                 "stage": "flush",
             }),
         );
+        drop(structured_runtime);
+        drop(structured_interactions);
+        if let Some(interaction) = structured_answer {
+            terminal_structured_interaction_remove_generation(state, interaction);
+        }
         return Err(format!("Unable to flush terminal input: {error}"));
     }
     let write_ms = terminal_diagnostic_elapsed_ms(write_started_at);
@@ -3081,6 +3134,8 @@ async fn write_to_active_terminal_audio_input_target(
         None,
         None,
         None,
+        None,
+        true,
         true,
     )
     .await?;
@@ -5872,8 +5927,7 @@ fn spawn_terminal_reader(
         }
 
         let interrupted_ready = terminal_runtime_snapshot_is_interrupted(&runtime);
-        let startup_error_ready =
-            terminal_runtime_snapshot_is_recoverable_startup_error(&runtime);
+        let startup_error_ready = terminal_runtime_snapshot_is_recoverable_startup_error(&runtime);
         let (recovery_source, hook_event_name) = if interrupted_ready {
             (
                 "backend-interrupt-prompt-ready",
@@ -14273,20 +14327,10 @@ fn terminal_activity_hook_lifecycle_kind(
             "starting",
             false,
         )),
-        "mcpstartuperror" => Some((
-            "provider-startup-error",
-            "error",
-            "error",
-            "failed",
-            false,
-        )),
-        "promptreadyafterinterrupt" | "promptreadyafterstartuperror" => Some((
-            "terminal-input-ready",
-            "idle",
-            "active",
-            "ready",
-            true,
-        )),
+        "mcpstartuperror" => Some(("provider-startup-error", "error", "error", "failed", false)),
+        "promptreadyafterinterrupt" | "promptreadyafterstartuperror" => {
+            Some(("terminal-input-ready", "idle", "active", "ready", true))
+        }
         "interrupt"
         | "interrupted"
         | "turninterrupt"
@@ -15220,72 +15264,80 @@ fn terminal_activity_hook_payload(
     let mut background_work_active = false;
     let (
         mut event_type,
-        activity_status,
-        status,
-        command_phase,
-        input_ready,
+        mut activity_status,
+        mut status,
+        mut command_phase,
+        mut input_ready,
         mut completion_evidence,
-    ) =
-        if manual_prompt.is_some() {
-            (
-                "provider-user-prompt-started",
-                "paused",
-                "active",
-                "awaiting_input",
-                false,
-                "cli_hook_manual_prompt",
-            )
-        } else {
-            let (event_type, activity_status, status, command_phase, input_ready, evidence) =
-                if let Some((event_type, activity_status, status, command_phase, input_ready)) =
-                    terminal_activity_hook_lifecycle_kind(&hook_event_name)
-                {
-                    let hook_key = terminal_activity_hook_name_key(&hook_event_name);
-                    let claude_stop_has_background_work = hook_key == "stop"
-                        && terminal_metadata_is_claude(&metadata)
-                        && terminal_activity_hook_claude_stop_has_background_work(event);
-                    background_work_active = claude_stop_has_background_work;
-                    if terminal_activity_hook_background_stop_forces_busy(
-                        &metadata, &hook_key, event,
-                    ) {
-                        (
-                            "provider-turn-background-active",
-                            "thinking",
-                            "active",
-                            "background_running",
-                            false,
-                            "cli_hook_stop_background_active",
-                        )
-                    } else {
-                        let completion_evidence =
-                            if hook_key == "sessionstart" || hook_key == "sessionstarted" {
-                                "cli_hook_session_start"
-                            } else if input_ready {
-                                "cli_hook_stop"
-                            } else {
-                                "cli_hook_prompt_submit"
-                            };
-                        (
-                            event_type,
-                            activity_status,
-                            status,
-                            command_phase,
-                            input_ready,
-                            completion_evidence,
-                        )
-                    }
+    ) = if manual_prompt.is_some() {
+        (
+            "provider-user-prompt-started",
+            "paused",
+            "active",
+            "awaiting_input",
+            false,
+            "cli_hook_manual_prompt",
+        )
+    } else {
+        let (event_type, activity_status, status, command_phase, input_ready, evidence) =
+            if let Some((event_type, activity_status, status, command_phase, input_ready)) =
+                terminal_activity_hook_lifecycle_kind(&hook_event_name)
+            {
+                let hook_key = terminal_activity_hook_name_key(&hook_event_name);
+                let claude_stop_has_background_work = hook_key == "stop"
+                    && terminal_metadata_is_claude(&metadata)
+                    && terminal_activity_hook_claude_stop_has_background_work(event);
+                background_work_active = claude_stop_has_background_work;
+                if terminal_activity_hook_background_stop_forces_busy(&metadata, &hook_key, event) {
+                    (
+                        "provider-turn-background-active",
+                        "thinking",
+                        "active",
+                        "background_running",
+                        false,
+                        "cli_hook_stop_background_active",
+                    )
                 } else {
-                    terminal_activity_hook_activity_kind(&hook_event_name, event)?
-                };
-            (
-                event_type,
-                activity_status,
-                status,
-                command_phase,
-                input_ready,
-                evidence,
-            )
-        };
+                    let completion_evidence =
+                        if hook_key == "sessionstart" || hook_key == "sessionstarted" {
+                            "cli_hook_session_start"
+                        } else if input_ready {
+                            "cli_hook_stop"
+                        } else {
+                            "cli_hook_prompt_submit"
+                        };
+                    (
+                        event_type,
+                        activity_status,
+                        status,
+                        command_phase,
+                        input_ready,
+                        completion_evidence,
+                    )
+                }
+            } else {
+                terminal_activity_hook_activity_kind(&hook_event_name, event)?
+            };
+        (
+            event_type,
+            activity_status,
+            status,
+            command_phase,
+            input_ready,
+            evidence,
+        )
+    };
+    if terminal_activity_hook_string(event, &["resolution_reason"]).as_deref()
+        == Some("structured_answer_confirmation_timeout")
+        && terminal_activity_hook_string(event, &["resolution_next_state"]).as_deref()
+            == Some("idle")
+    {
+        activity_status = "idle";
+        status = "active";
+        command_phase = "completed";
+        input_ready = true;
+        completion_evidence = "structured_answer_confirmation_timeout_idle";
+    }
     if event_type == "provider-turn-completed"
         && input_ready
         && (terminal_runtime_snapshot_is_interrupted(&current_runtime)
@@ -15391,8 +15443,8 @@ fn terminal_activity_hook_payload(
     };
     let input_ready_at = input_ready.then(|| event_time.clone());
     let prompt_ready_at = input_ready.then(|| event_time.clone());
-    let completed_at = (input_ready && event_type != "terminal-input-ready")
-        .then(|| event_time.clone());
+    let completed_at =
+        (input_ready && event_type != "terminal-input-ready").then(|| event_time.clone());
     let permission_mode = terminal_activity_hook_string(event, &["permission_mode"]);
     let prompt_is_open = matches!(
         event_type,
@@ -15645,6 +15697,10 @@ fn terminal_activity_hook_payload(
             "resolvedInteractionRevision",
         ],
     );
+    let supplied_interaction_id =
+        terminal_activity_hook_string(event, &["interaction_id", "interactionId"]);
+    let supplied_interaction_revision =
+        terminal_activity_hook_u64(event, &["interaction_revision", "interactionRevision"]);
     let provider_request_id = manual_prompt
         .as_ref()
         .and_then(|_| prompt_id.clone())
@@ -15653,21 +15709,25 @@ fn terminal_activity_hook_payload(
                 .as_ref()
                 .and_then(|_| prompt_id.clone())
         });
-    let interaction_id = resolved_interaction_id.or_else(|| {
-        provider_request_id.as_ref().map(|request_id| {
-            format!(
-                "uir:{}:{}:{}:{}:{}",
-                terminal_projection_text(&provider, "provider"),
-                metadata.pane_id,
-                instance.id,
-                provider_session_id.as_deref().unwrap_or("session"),
-                request_id,
-            )
-        })
+    let interaction_id = resolved_interaction_id
+        .or(supplied_interaction_id)
+        .or_else(|| {
+            provider_request_id.as_ref().map(|request_id| {
+                format!(
+                    "uir:{}:{}:{}:{}:{}",
+                    terminal_projection_text(&provider, "provider"),
+                    metadata.pane_id,
+                    instance.id,
+                    provider_session_id.as_deref().unwrap_or("session"),
+                    request_id,
+                )
+            })
+        });
+    let interaction_revision = interaction_id.as_ref().map(|_| {
+        resolved_interaction_revision
+            .or(supplied_interaction_revision)
+            .unwrap_or(event_time_ms)
     });
-    let interaction_revision = interaction_id
-        .as_ref()
-        .map(|_| resolved_interaction_revision.unwrap_or(event_time_ms));
     let interaction_source = interaction_id
         .as_ref()
         .map(|_| interaction_source_label.to_string());
@@ -17019,14 +17079,27 @@ fn terminal_activity_hook_buffer_final_stop_candidate(
     );
 }
 
+fn terminal_structured_interaction_matches_resolution(
+    interaction: &TerminalStructuredInteraction,
+    resolved_interaction_id: Option<&str>,
+    resolved_interaction_revision: Option<u64>,
+    resolved_request_id: Option<&str>,
+) -> bool {
+    resolved_interaction_id == Some(interaction.interaction_id.as_str())
+        && resolved_interaction_revision == Some(interaction.revision)
+        && resolved_request_id.is_none_or(|request_id| {
+            interaction.provider_request_id == request_id || interaction.prompt_id == request_id
+        })
+}
+
 fn terminal_structured_interaction_reconcile(
     app: &AppHandle,
     event: &Value,
     payload: &TerminalActivityHookPayload,
-) {
+) -> bool {
     let state = app.state::<TerminalState>();
     let Ok(mut interactions) = state.terminal_structured_interactions.lock() else {
-        return;
+        return false;
     };
 
     let provider_interaction = payload
@@ -17036,10 +17109,10 @@ fn terminal_structured_interaction_reconcile(
         && payload.terminal_is_prompting_user;
     if provider_interaction {
         let Some(interaction_id) = payload.interaction_id.clone() else {
-            return;
+            return false;
         };
         let Some(provider_request_id) = payload.provider_request_id.clone() else {
-            return;
+            return false;
         };
         let superseded_ids = interactions
             .iter()
@@ -17055,6 +17128,25 @@ fn terminal_structured_interaction_reconcile(
                 || interaction.pane_id != payload.pane_id
                 || interaction.instance_id != payload.instance_id
         });
+        let awaiting_provider_confirmation =
+            interactions
+                .get(&interaction_id)
+                .is_some_and(|interaction| {
+                    interaction.revision
+                        == payload
+                            .interaction_revision
+                            .unwrap_or(payload.observed_at_ms)
+                        && interaction.awaiting_provider_confirmation
+                });
+        let claimed_option_id = interactions
+            .get(&interaction_id)
+            .filter(|interaction| {
+                interaction.revision
+                    == payload
+                        .interaction_revision
+                        .unwrap_or(payload.observed_at_ms)
+            })
+            .and_then(|interaction| interaction.claimed_option_id.clone());
         interactions.insert(
             interaction_id.clone(),
             TerminalStructuredInteraction {
@@ -17072,6 +17164,8 @@ fn terminal_structured_interaction_reconcile(
                     .interaction_response_mode
                     .clone()
                     .unwrap_or_else(|| "structured_pty".to_string()),
+                awaiting_provider_confirmation,
+                claimed_option_id,
                 options: payload.prompt_options.clone(),
                 permission_suggestions: terminal_activity_hook_value(
                     event,
@@ -17102,7 +17196,7 @@ fn terminal_structured_interaction_reconcile(
                 }
             }
         }
-        return;
+        return false;
     }
 
     let hook_key = terminal_activity_hook_name_key(&payload.hook_event_name);
@@ -17114,9 +17208,7 @@ fn terminal_structured_interaction_reconcile(
             | "elicitationresult"
             | "elicitationresolved"
     );
-    if terminal_activity_payload_is_non_prompting_lifecycle(payload)
-        || provider_resolved_interaction
-    {
+    if !payload.terminal_is_prompting_user || provider_resolved_interaction {
         let resolved_request_id = terminal_activity_hook_string(
             event,
             &[
@@ -17130,28 +17222,76 @@ fn terminal_structured_interaction_reconcile(
                 "id",
             ],
         );
+        let same_terminal_open = interactions.values().any(|interaction| {
+            interaction.pane_id == payload.pane_id && interaction.instance_id == payload.instance_id
+        });
         let removed_ids = interactions
             .iter()
             .filter_map(|(id, interaction)| {
                 let same_terminal = interaction.pane_id == payload.pane_id
                     && interaction.instance_id == payload.instance_id;
-                let same_request = !provider_resolved_interaction
-                    || resolved_request_id.as_deref().is_none_or(|request_id| {
-                        interaction.provider_request_id == request_id
-                            || interaction.prompt_id == request_id
-                    });
+                let same_resolution = !provider_resolved_interaction
+                    || terminal_structured_interaction_matches_resolution(
+                        interaction,
+                        payload.interaction_id.as_deref(),
+                        payload.interaction_revision,
+                        resolved_request_id.as_deref(),
+                    );
                 let lifecycle_can_close = terminal_structured_interaction_lifecycle_can_close(
                     interaction,
                     provider_resolved_interaction,
                 );
-                (same_terminal && same_request && lifecycle_can_close).then(|| id.clone())
+                (same_terminal && same_resolution && lifecycle_can_close).then(|| id.clone())
             })
             .collect::<Vec<_>>();
-        let resolved_codex_hook_trust = removed_ids.iter().any(|id| {
-            interactions.get(id).is_some_and(|interaction| {
-                terminal_codex_hook_trust_is_catalog_request(&interaction.provider_request_id)
-            })
-        });
+        let explicitly_correlated_resolution =
+            payload.interaction_id.is_some() || payload.interaction_revision.is_some();
+        let rejected_resolution = provider_resolved_interaction
+            && removed_ids.is_empty()
+            && (same_terminal_open || explicitly_correlated_resolution);
+        if rejected_resolution {
+            let pending_native_provider_confirmation = (!explicitly_correlated_resolution)
+                .then_some(resolved_request_id.as_deref())
+                .flatten()
+                .and_then(|resolved_request_id| {
+                    interactions
+                        .values()
+                        .find(|interaction| {
+                            interaction.pane_id == payload.pane_id
+                                && interaction.instance_id == payload.instance_id
+                                && interaction.response_mode == "provider_api"
+                                && (interaction.provider_request_id == resolved_request_id
+                                    || interaction.prompt_id == resolved_request_id)
+                        })
+                        .cloned()
+                });
+            drop(interactions);
+            log_terminal_status_event(
+                "backend.terminal_structured_interaction.stale_resolution_rejected",
+                json!({
+                    "instance_id": payload.instance_id,
+                    "pane_id": payload.pane_id,
+                    "resolved_interaction_id": payload.interaction_id,
+                    "resolved_interaction_revision": payload.interaction_revision,
+                    "resolved_request_id": resolved_request_id,
+                    "same_terminal_open": same_terminal_open,
+                }),
+            );
+            if let Some(interaction) = pending_native_provider_confirmation {
+                terminal_structured_interaction_arm_answer_confirmation_timeout(
+                    app,
+                    interaction,
+                    "provider_api",
+                );
+            }
+            return true;
+        }
+        let resolved_codex_hook_trust = provider_resolved_interaction
+            && removed_ids.iter().any(|id| {
+                interactions.get(id).is_some_and(|interaction| {
+                    terminal_codex_hook_trust_is_catalog_request(&interaction.provider_request_id)
+                })
+            });
         interactions.retain(|id, _| !removed_ids.contains(id));
         drop(interactions);
         if resolved_codex_hook_trust {
@@ -17169,6 +17309,7 @@ fn terminal_structured_interaction_reconcile(
             }
         }
     }
+    false
 }
 
 fn terminal_structured_interaction_uses_blocking_transport(
@@ -17176,7 +17317,11 @@ fn terminal_structured_interaction_uses_blocking_transport(
 ) -> bool {
     matches!(
         interaction.response_mode.as_str(),
-        "blocking_hook" | "provider_api" | "codex_app_server" | "diffforge_intervention"
+        "blocking_hook"
+            | "structured_pty"
+            | "provider_api"
+            | "codex_app_server"
+            | "diffforge_intervention"
     )
 }
 
@@ -17210,7 +17355,6 @@ fn apply_terminal_activity_hook_payload(
         );
         return;
     };
-    terminal_activity_hook_reconcile_prompt_state(&mut payload);
     if payload.interaction_response_mode.as_deref() == Some("blocking_hook")
         && source != "transport"
     {
@@ -17238,7 +17382,10 @@ fn apply_terminal_activity_hook_payload(
             }),
         );
     }
-    terminal_structured_interaction_reconcile(app, event, &payload);
+    if terminal_structured_interaction_reconcile(app, event, &payload) {
+        return;
+    }
+    terminal_activity_hook_reconcile_prompt_state(&mut payload);
     let previous_runtime = terminal_runtime_snapshot(instance);
     if payload.completion_evidence == "cli_hook_provider_observation" {
         payload.status = previous_runtime.status.clone();
@@ -17739,9 +17886,7 @@ fn spawn_terminal_activity_hook_watcher(
             )
             .or_else(|| {
                 (!terminal_codex_hook_trust_discovery_blocks_idle(&pane_id, instance_id)
-                    && terminal_activity_provider_allows_pty_lifecycle_recovery(
-                        &instance.metadata,
-                    ))
+                    && terminal_activity_provider_allows_pty_lifecycle_recovery(&instance.metadata))
                 .then(|| {
                     terminal_activity_watchdog_starting_action(
                         &runtime,
@@ -18119,6 +18264,8 @@ fn spawn_terminal_input_queue_worker(
                 payload.todo_resume_requested,
                 payload.thread_id,
                 payload.app_fork_enabled,
+                None,
+                true,
                 true,
             )
             .await;
@@ -18410,8 +18557,39 @@ enum TerminalCodexGatewayWinner {
 
 #[derive(Clone, Debug)]
 struct TerminalCodexGatewayPendingRequest {
+    request_id: Value,
     method: String,
+    interaction_id: String,
+    interaction_revision: u64,
     winner: Option<TerminalCodexGatewayWinner>,
+}
+
+#[derive(Default)]
+struct TerminalCodexGatewayPendingRequests {
+    by_request_id: HashMap<String, VecDeque<TerminalCodexGatewayPendingRequest>>,
+    ambiguous_request_ids: HashSet<String>,
+}
+
+const TERMINAL_CODEX_GATEWAY_PENDING_PER_REQUEST_ID_MAX: usize = 16;
+const TERMINAL_CODEX_GATEWAY_PENDING_TOTAL_MAX: usize = 256;
+
+static TERMINAL_CODEX_GATEWAY_INTERACTION_REVISION: AtomicU64 = AtomicU64::new(0);
+
+fn terminal_codex_gateway_next_interaction_revision() -> u64 {
+    let now_ms = terminal_now_ms();
+    let mut current = TERMINAL_CODEX_GATEWAY_INTERACTION_REVISION.load(Ordering::SeqCst);
+    loop {
+        let next = now_ms.max(current.saturating_add(1));
+        match TERMINAL_CODEX_GATEWAY_INTERACTION_REVISION.compare_exchange(
+            current,
+            next,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return next,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -18834,7 +19012,15 @@ fn terminal_codex_app_server_request_event(
     };
     let prompt_ttl_ms = params.get("autoResolutionMs").cloned();
     let message = terminal_codex_app_server_prompt_message(method, &params);
-    let observed_at_ms = terminal_now_ms();
+    let observed_at_ms = terminal_codex_gateway_next_interaction_revision();
+    let interaction_id = format!(
+        "uir:codex:{pane_id}:{instance_id}:{}:{request_id_text}",
+        if thread_id.is_empty() {
+            "session"
+        } else {
+            thread_id
+        },
+    );
     Some(json!({
         "hook_event_name": hook_event_name,
         "provider": "codex",
@@ -18857,6 +19043,8 @@ fn terminal_codex_app_server_request_event(
         "manual_approval_required": true,
         "provider_blocked_for_user": true,
         "terminal_is_prompting_user": true,
+        "interaction_id": interaction_id,
+        "interaction_revision": observed_at_ms,
         "interaction_response_mode": "codex_app_server",
         "provider_payload": {
             "app_server_method": method,
@@ -18869,7 +19057,7 @@ fn terminal_codex_app_server_request_event(
 }
 
 fn terminal_codex_gateway_register_server_request(
-    pending: &Arc<StdMutex<HashMap<String, TerminalCodexGatewayPendingRequest>>>,
+    pending: &Arc<StdMutex<TerminalCodexGatewayPendingRequests>>,
     pane_id: &str,
     instance_id: u64,
     request: &Value,
@@ -18878,14 +19066,40 @@ fn terminal_codex_gateway_register_server_request(
     let request_key = request
         .get("id")
         .and_then(terminal_codex_app_server_request_id_key)?;
+    let request_id = request.get("id")?.clone();
     let method = request.get("method")?.as_str()?.to_string();
-    pending.lock().ok()?.insert(
-        request_key,
-        TerminalCodexGatewayPendingRequest {
+    let interaction_id = event.get("interaction_id")?.as_str()?.to_string();
+    let interaction_revision = event.get("interaction_revision")?.as_u64()?;
+    let mut pending = pending.lock().ok()?;
+    let total_pending = pending
+        .by_request_id
+        .values()
+        .map(VecDeque::len)
+        .sum::<usize>();
+    let queue_len = pending
+        .by_request_id
+        .get(&request_key)
+        .map(VecDeque::len)
+        .unwrap_or_default();
+    if total_pending >= TERMINAL_CODEX_GATEWAY_PENDING_TOTAL_MAX
+        || queue_len >= TERMINAL_CODEX_GATEWAY_PENDING_PER_REQUEST_ID_MAX
+    {
+        return None;
+    }
+    if queue_len > 0 {
+        pending.ambiguous_request_ids.insert(request_key.clone());
+    }
+    pending
+        .by_request_id
+        .entry(request_key)
+        .or_default()
+        .push_back(TerminalCodexGatewayPendingRequest {
+            request_id,
             method,
+            interaction_id,
+            interaction_revision,
             winner: None,
-        },
-    );
+        });
     Some(event)
 }
 
@@ -19174,50 +19388,267 @@ async fn terminal_codex_hook_trust_withdraw_stale_publication(
 }
 
 fn terminal_codex_gateway_claim(
-    pending: &Arc<StdMutex<HashMap<String, TerminalCodexGatewayPendingRequest>>>,
+    pending: &Arc<StdMutex<TerminalCodexGatewayPendingRequests>>,
     request_key: &str,
+    response: &Value,
     winner: TerminalCodexGatewayWinner,
-) -> Option<String> {
+) -> Option<TerminalCodexGatewayPendingRequest> {
     let Ok(mut pending) = pending.lock() else {
         return None;
     };
-    let request = pending.get_mut(request_key)?;
+    let queue_len = pending.by_request_id.get(request_key)?.len();
+    let ambiguous = queue_len > 1;
+    if ambiguous {
+        pending.ambiguous_request_ids.insert(request_key.to_string());
+    } else {
+        pending.ambiguous_request_ids.remove(request_key);
+    }
+    let queue = pending.by_request_id.get_mut(request_key)?;
+    let matching = queue
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| terminal_codex_gateway_response_matches_request(request, response))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let index = if matching.len() == 1 {
+        matching[0]
+    } else if !ambiguous && queue.len() == 1 && queue[0].winner.is_none() {
+        0
+    } else {
+        return None;
+    };
+    let request = queue.get_mut(index)?;
     if request.winner.is_some() {
         return None;
     }
     request.winner = Some(winner);
-    Some(request.method.clone())
+    Some(request.clone())
+}
+
+fn terminal_codex_gateway_response_matches_request(
+    request: &TerminalCodexGatewayPendingRequest,
+    response: &Value,
+) -> bool {
+    let method_hint = response
+        .pointer("/params/method")
+        .or_else(|| response.pointer("/params/requestMethod"))
+        .or_else(|| response.get("method"))
+        .and_then(Value::as_str);
+    if let Some(method_hint) = method_hint {
+        return request.method == method_hint;
+    }
+    let result = response
+        .get("result")
+        .or_else(|| response.pointer("/params/result"))
+        .or_else(|| response.pointer("/params/response"));
+    let Some(result) = result else {
+        return false;
+    };
+    match request.method.as_str() {
+        "item/permissions/requestApproval" => {
+            result.get("permissions").is_some() || result.get("scope").is_some()
+        }
+        "item/tool/requestUserInput" => result.get("answers").is_some(),
+        "mcpServer/elicitation/request" => result.get("action").is_some(),
+        "item/commandExecution/requestApproval"
+        | "item/fileChange/requestApproval"
+        | "execCommandApproval"
+        | "applyPatchApproval" => result.get("decision").is_some(),
+        _ => false,
+    }
+}
+
+fn terminal_codex_gateway_claim_generation(
+    pending: &Arc<StdMutex<TerminalCodexGatewayPendingRequests>>,
+    request_key: &str,
+    interaction_id: &str,
+    interaction_revision: u64,
+    winner: TerminalCodexGatewayWinner,
+) -> Option<TerminalCodexGatewayPendingRequest> {
+    let Ok(mut pending) = pending.lock() else {
+        return None;
+    };
+    let request = pending
+        .by_request_id
+        .get_mut(request_key)?
+        .iter_mut()
+        .find(|request| {
+            request.interaction_id == interaction_id
+                && request.interaction_revision == interaction_revision
+                && request.winner.is_none()
+        })?;
+    request.winner = Some(winner);
+    Some(request.clone())
+}
+
+fn terminal_codex_gateway_take_resolved(
+    pending: &Arc<StdMutex<TerminalCodexGatewayPendingRequests>>,
+    request_key: &str,
+    resolution: &Value,
+) -> Option<TerminalCodexGatewayPendingRequest> {
+    let Ok(mut pending) = pending.lock() else {
+        return None;
+    };
+    let explicit_interaction_id = resolution
+        .pointer("/params/interactionId")
+        .or_else(|| resolution.pointer("/params/resolvedInteractionId"))
+        .and_then(Value::as_str);
+    let explicit_revision = resolution
+        .pointer("/params/interactionRevision")
+        .or_else(|| resolution.pointer("/params/resolvedInteractionRevision"))
+        .and_then(Value::as_u64);
+    let has_explicit_identity = explicit_interaction_id.is_some() || explicit_revision.is_some();
+    let has_generation_hint = has_explicit_identity
+        || resolution.pointer("/params/method").is_some()
+        || resolution.pointer("/params/requestMethod").is_some()
+        || resolution.get("result").is_some()
+        || resolution.pointer("/params/result").is_some()
+        || resolution.pointer("/params/response").is_some();
+    let queue_len = pending.by_request_id.get(request_key)?.len();
+    let ambiguous = queue_len > 1;
+    if ambiguous {
+        pending.ambiguous_request_ids.insert(request_key.to_string());
+    } else {
+        pending.ambiguous_request_ids.remove(request_key);
+    }
+    let (request, remaining) = {
+        let queue = pending.by_request_id.get_mut(request_key)?;
+        let matching = queue
+            .iter()
+            .enumerate()
+            .filter(|(_, request)| {
+                let explicit_match = match (explicit_interaction_id, explicit_revision) {
+                    (Some(interaction_id), revision) => {
+                        request.interaction_id == interaction_id
+                            && revision
+                                .is_none_or(|revision| request.interaction_revision == revision)
+                    }
+                    (None, Some(revision)) => request.interaction_revision == revision,
+                    (None, None) => false,
+                };
+                if has_explicit_identity {
+                    explicit_match
+                } else {
+                    terminal_codex_gateway_response_matches_request(request, resolution)
+                }
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let index = if matching.len() == 1 {
+            matching[0]
+        } else if !ambiguous && queue.len() == 1 && !has_generation_hint {
+            0
+        } else {
+            return None;
+        };
+        let request = queue.remove(index)?;
+        (request, queue.len())
+    };
+    if remaining == 0 {
+        pending.by_request_id.remove(request_key);
+    }
+    if remaining <= 1 {
+        pending.ambiguous_request_ids.remove(request_key);
+    }
+    Some(request)
+}
+
+fn terminal_codex_gateway_remove_generation(
+    pending: &Arc<StdMutex<TerminalCodexGatewayPendingRequests>>,
+    request_key: &str,
+    interaction_id: &str,
+    interaction_revision: u64,
+) -> bool {
+    let Ok(mut pending) = pending.lock() else {
+        return false;
+    };
+    let (removed, remaining) = {
+        let Some(queue) = pending.by_request_id.get_mut(request_key) else {
+            return false;
+        };
+        let before = queue.len();
+        queue.retain(|request| {
+            request.interaction_id != interaction_id
+                || request.interaction_revision != interaction_revision
+        });
+        (queue.len() != before, queue.len())
+    };
+    if remaining == 0 {
+        pending.by_request_id.remove(request_key);
+    }
+    if remaining <= 1 {
+        pending.ambiguous_request_ids.remove(request_key);
+    }
+    removed
+}
+
+struct TerminalCodexGatewayPendingGenerationCleanup {
+    pending: Arc<StdMutex<TerminalCodexGatewayPendingRequests>>,
+    request_key: String,
+    interaction_id: String,
+    interaction_revision: u64,
+}
+
+impl Drop for TerminalCodexGatewayPendingGenerationCleanup {
+    fn drop(&mut self) {
+        terminal_codex_gateway_remove_generation(
+            &self.pending,
+            &self.request_key,
+            &self.interaction_id,
+            self.interaction_revision,
+        );
+    }
+}
+
+fn terminal_codex_gateway_response_already_won_by_web(
+    pending: &Arc<StdMutex<TerminalCodexGatewayPendingRequests>>,
+    request_key: &str,
+    response: &Value,
+) -> bool {
+    let Ok(pending) = pending.lock() else {
+        return false;
+    };
+    let Some(queue) = pending.by_request_id.get(request_key) else {
+        return false;
+    };
+    let matching = queue
+        .iter()
+        .filter(|request| terminal_codex_gateway_response_matches_request(request, response))
+        .collect::<Vec<_>>();
+    if matching.len() == 1 {
+        return matching[0].winner == Some(TerminalCodexGatewayWinner::Web);
+    }
+    queue.len() == 1 && queue[0].winner == Some(TerminalCodexGatewayWinner::Web)
+}
+
+fn terminal_codex_gateway_drain_pending(
+    pending: &Arc<StdMutex<TerminalCodexGatewayPendingRequests>>,
+) -> Vec<TerminalCodexGatewayPendingRequest> {
+    pending
+        .lock()
+        .ok()
+        .map(|mut pending| {
+            let drained = pending
+                .by_request_id
+                .drain()
+                .flat_map(|(_, requests)| requests)
+                .collect();
+            pending.ambiguous_request_ids.clear();
+            drained
+        })
+        .unwrap_or_default()
 }
 
 async fn terminal_codex_gateway_publish_resolution(
     app: &AppHandle,
     pane_id: &str,
     instance_id: u64,
-    request_id: &Value,
-    method: &str,
+    request: &TerminalCodexGatewayPendingRequest,
     source: &str,
 ) {
     let state = app.state::<TerminalState>();
     let cloud_mcp_state = app.state::<CloudMcpState>();
-    let request_id_text = terminal_codex_app_server_request_id_text(request_id);
-    let hook_event_name =
-        if method == "mcpServer/elicitation/request" || method == "item/tool/requestUserInput" {
-            "ElicitationResult"
-        } else {
-            "PermissionResult"
-        };
-    let event = json!({
-        "hook_event_name": hook_event_name,
-        "provider": "codex",
-        "pane_id": pane_id,
-        "instance_id": instance_id,
-        "permission_request_id": request_id_text,
-        "prompt_id": request_id_text,
-        "decision": "resolved",
-        "timestamp_ms": terminal_now_ms(),
-        "resolution_reason": source,
-        "source": "codex_app_server",
-    });
+    let event = terminal_codex_gateway_resolution_event(pane_id, instance_id, request, source);
     let _ = handle_terminal_activity_hook_event(
         app,
         &state.terminals,
@@ -19230,13 +19661,43 @@ async fn terminal_codex_gateway_publish_resolution(
     .await;
 }
 
+fn terminal_codex_gateway_resolution_event(
+    pane_id: &str,
+    instance_id: u64,
+    request: &TerminalCodexGatewayPendingRequest,
+    source: &str,
+) -> Value {
+    let request_id_text = terminal_codex_app_server_request_id_text(&request.request_id);
+    let hook_event_name = if request.method == "mcpServer/elicitation/request"
+        || request.method == "item/tool/requestUserInput"
+    {
+        "ElicitationResult"
+    } else {
+        "PermissionResult"
+    };
+    json!({
+        "hook_event_name": hook_event_name,
+        "provider": "codex",
+        "pane_id": pane_id,
+        "instance_id": instance_id,
+        "permission_request_id": request_id_text,
+        "prompt_id": request_id_text,
+        "resolved_interaction_id": request.interaction_id,
+        "resolved_interaction_revision": request.interaction_revision,
+        "decision": "resolved",
+        "timestamp_ms": terminal_now_ms(),
+        "resolution_reason": source,
+        "source": "codex_app_server",
+    })
+}
+
 fn terminal_codex_gateway_spawn_web_waiter(
     app: AppHandle,
     pane_id: String,
     instance_id: u64,
     request: Value,
     event: Value,
-    pending: Arc<StdMutex<HashMap<String, TerminalCodexGatewayPendingRequest>>>,
+    pending: Arc<StdMutex<TerminalCodexGatewayPendingRequests>>,
     upstream_sender: mpsc::Sender<Message>,
 ) -> oneshot::Receiver<bool> {
     let (ready_sender, ready_receiver) = oneshot::channel::<bool>();
@@ -19252,6 +19713,21 @@ fn terminal_codex_gateway_spawn_web_waiter(
             .get("id")
             .map(terminal_codex_app_server_request_id_text)
             .unwrap_or_default();
+        let interaction_id = event
+            .get("interaction_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let interaction_revision = event
+            .get("interaction_revision")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let _pending_cleanup = TerminalCodexGatewayPendingGenerationCleanup {
+            pending: Arc::clone(&pending),
+            request_key: request_key.clone(),
+            interaction_id: interaction_id.clone(),
+            interaction_revision,
+        };
         let state = app.state::<TerminalState>();
         let token = {
             let Ok(tokens) = state.terminal_activity_transport_tokens.lock() else {
@@ -19287,6 +19763,8 @@ fn terminal_codex_gateway_spawn_web_waiter(
                         interaction.pane_id == pane_id
                             && interaction.instance_id == instance_id
                             && interaction.provider_request_id == request_id_text
+                            && interaction.interaction_id == interaction_id
+                            && interaction.revision == interaction_revision
                     })
                 });
             if published {
@@ -19307,7 +19785,9 @@ fn terminal_codex_gateway_spawn_web_waiter(
                         .filter_map(|(id, interaction)| {
                             (interaction.pane_id == pane_id
                                 && interaction.instance_id == instance_id
-                                && interaction.provider_request_id == request_id_text)
+                                && interaction.provider_request_id == request_id_text
+                                && interaction.interaction_id == interaction_id
+                                && interaction.revision == interaction_revision)
                                 .then(|| id.clone())
                         })
                         .collect::<Vec<_>>();
@@ -19315,6 +19795,8 @@ fn terminal_codex_gateway_spawn_web_waiter(
                         interaction.pane_id != pane_id
                             || interaction.instance_id != instance_id
                             || interaction.provider_request_id != request_id_text
+                            || interaction.interaction_id != interaction_id
+                            || interaction.revision != interaction_revision
                     });
                     removed
                 })
@@ -19326,15 +19808,18 @@ fn terminal_codex_gateway_spawn_web_waiter(
             }
             return;
         }
-        let response = match response_task.await {
-            Ok(response) => response,
-            Err(_) => return,
+        let result = match response_task.await {
+            Ok(Ok(Some(result))) => result,
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => return,
         };
-        let Ok(Some(result)) = response else {
-            return;
-        };
-        if terminal_codex_gateway_claim(&pending, &request_key, TerminalCodexGatewayWinner::Web)
-            .is_none()
+        if terminal_codex_gateway_claim_generation(
+            &pending,
+            &request_key,
+            &interaction_id,
+            interaction_revision,
+            TerminalCodexGatewayWinner::Web,
+        )
+        .is_none()
         {
             return;
         }
@@ -19342,9 +19827,13 @@ fn terminal_codex_gateway_spawn_web_waiter(
             "id": request.get("id").cloned().unwrap_or(Value::Null),
             "result": result,
         });
-        let _ = upstream_sender
+        if upstream_sender
             .send(Message::Text(response.to_string().into()))
-            .await;
+            .await
+            .is_err()
+        {
+            return;
+        }
     });
     ready_receiver
 }
@@ -19475,11 +19964,7 @@ fn terminal_codex_app_server_startup_jitter_ms(pane_id: &str, instance_id: u64) 
             % TERMINAL_CODEX_APP_SERVER_STARTUP_JITTER_SPAN_MS
 }
 
-fn terminal_codex_auth_reload_backoff_ms(
-    pane_id: &str,
-    instance_id: u64,
-    attempt: usize,
-) -> u64 {
+fn terminal_codex_auth_reload_backoff_ms(pane_id: &str, instance_id: u64, attempt: usize) -> u64 {
     let exponent = u32::try_from(attempt.saturating_sub(1).min(2)).unwrap_or(2);
     let base = TERMINAL_CODEX_AUTH_RELOAD_BACKOFF_BASE_MS.saturating_mul(1_u64 << exponent);
     let jitter = terminal_codex_stable_jitter_seed(
@@ -19505,11 +19990,7 @@ fn terminal_codex_auth_reload_next(
     budget.attempts += 1;
     TerminalCodexAuthReloadDecision::Retry {
         attempt: budget.attempts,
-        delay_ms: terminal_codex_auth_reload_backoff_ms(
-            pane_id,
-            instance_id,
-            budget.attempts,
-        ),
+        delay_ms: terminal_codex_auth_reload_backoff_ms(pane_id, instance_id, budget.attempts),
     }
 }
 
@@ -19518,7 +19999,9 @@ fn terminal_codex_app_server_auth_error_payload(value: &Value) -> Option<&Value>
         return Some(error);
     }
     match value.get("method").and_then(Value::as_str) {
-        Some("error") => value.pointer("/params/error").or_else(|| value.get("params")),
+        Some("error") => value
+            .pointer("/params/error")
+            .or_else(|| value.get("params")),
         Some("turn/completed") => value.pointer("/params/turn/error"),
         Some("account/chatgptAuthTokens/refresh")
             if value
@@ -19552,20 +20035,18 @@ fn terminal_codex_auth_request_method(method: Option<&str>) -> bool {
     method.is_some_and(|method| {
         let method = method.trim().to_ascii_lowercase();
         method.starts_with("account/")
-            || method
-                .split(['/', '.', '_', '-', ':'])
-                .any(|segment| {
-                    matches!(
-                        segment,
-                        "auth"
-                            | "authenticate"
-                            | "authentication"
-                            | "token"
-                            | "tokens"
-                            | "refresh"
-                            | "login"
-                    )
-                })
+            || method.split(['/', '.', '_', '-', ':']).any(|segment| {
+                matches!(
+                    segment,
+                    "auth"
+                        | "authenticate"
+                        | "authentication"
+                        | "token"
+                        | "tokens"
+                        | "refresh"
+                        | "login"
+                )
+            })
     })
 }
 
@@ -19573,8 +20054,7 @@ fn terminal_codex_app_server_auth_invalidated(
     value: &Value,
     correlated_request_method: Option<&str>,
 ) -> bool {
-    if value.get("method").and_then(Value::as_str)
-        == Some("account/chatgptAuthTokens/refresh")
+    if value.get("method").and_then(Value::as_str) == Some("account/chatgptAuthTokens/refresh")
         && value
             .pointer("/params/reason")
             .and_then(Value::as_str)
@@ -19607,9 +20087,15 @@ fn terminal_codex_app_server_auth_invalidated(
         return true;
     }
     if lower.contains("refresh token")
-        && ["already used", "has been used", "reused", "revoked", "invalidated"]
-            .iter()
-            .any(|marker| lower.contains(marker))
+        && [
+            "already used",
+            "has been used",
+            "reused",
+            "revoked",
+            "invalidated",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
     {
         return true;
     }
@@ -19636,8 +20122,8 @@ fn terminal_codex_app_server_auth_invalidated(
                 "login",
                 "invalid_request_error",
             ]
-                .iter()
-                .any(|marker| lower.contains(marker)))
+            .iter()
+            .any(|marker| lower.contains(marker)))
 }
 
 fn terminal_codex_auth_reload_retryable_error(
@@ -19935,9 +20421,7 @@ async fn terminal_codex_gateway_send_internal_request(
                 })?;
             }
             Message::Close(_) => {
-                return Err(
-                    "Replacement Codex app-server closed during initialization.".to_string(),
-                )
+                return Err("Replacement Codex app-server closed during initialization.".to_string())
             }
             other => buffered.push(other),
         }
@@ -20080,7 +20564,10 @@ async fn terminal_codex_gateway_recover_upstream(
                 continue;
             }
         };
-        let buffered = match (initialize_request.as_ref(), initialized_notification.as_ref()) {
+        let buffered = match (
+            initialize_request.as_ref(),
+            initialized_notification.as_ref(),
+        ) {
             (Some(initialize), Some(initialized)) => {
                 match terminal_codex_gateway_reinitialize_upstream(
                     &mut replacement,
@@ -20155,10 +20642,7 @@ async fn terminal_codex_gateway_connection(
             }
         }
     });
-    let pending = Arc::new(StdMutex::new(HashMap::<
-        String,
-        TerminalCodexGatewayPendingRequest,
-    >::new()));
+    let pending = Arc::new(StdMutex::new(TerminalCodexGatewayPendingRequests::default()));
     let mut client_requests = HashMap::<String, TerminalCodexGatewayClientRequest>::new();
     let mut client_request_sequence = 0_u64;
     let mut blocked_bootstrap_requests = VecDeque::<Value>::new();
@@ -20318,25 +20802,31 @@ async fn terminal_codex_gateway_connection(
                             let value_ref = value.as_ref().unwrap();
                             let request_id = value_ref.get("id").unwrap();
                             let request_key = terminal_codex_app_server_request_id_key(request_id).unwrap();
-                            let method = terminal_codex_gateway_claim(
+                            let request = terminal_codex_gateway_claim(
                                 &pending,
                                 &request_key,
+                                value_ref,
                                 TerminalCodexGatewayWinner::NativeTui,
                             );
-                            if let Some(method) = method {
+                            if let Some(request) = request {
                                 terminal_codex_gateway_publish_resolution(
                                     &app,
                                     &pane_id,
                                     instance_id,
-                                    request_id,
-                                    &method,
+                                    &request,
                                     "codex_app_server_native_tui_answer",
                                 ).await;
-                            } else if pending
-                                .lock()
-                                .ok()
-                                .is_some_and(|pending| pending.contains_key(&request_key))
-                            {
+                                terminal_codex_gateway_remove_generation(
+                                    &pending,
+                                    &request_key,
+                                    &request.interaction_id,
+                                    request.interaction_revision,
+                                );
+                            } else if terminal_codex_gateway_response_already_won_by_web(
+                                &pending,
+                                &request_key,
+                                value_ref,
+                            ) {
                                 // The web answer already won. App-server has a response;
                                 // suppress the TUI's late duplicate.
                                 continue;
@@ -20489,17 +20979,17 @@ async fn terminal_codex_gateway_connection(
                             {
                                 if let Some(request_id) = value.pointer("/params/requestId") {
                                     if let Some(request_key) = terminal_codex_app_server_request_id_key(request_id) {
-                                        let request = pending
-                                            .lock()
-                                            .ok()
-                                            .and_then(|mut pending| pending.remove(&request_key));
+                                        let request = terminal_codex_gateway_take_resolved(
+                                            &pending,
+                                            &request_key,
+                                            &value,
+                                        );
                                         if let Some(request) = request {
                                             terminal_codex_gateway_publish_resolution(
                                                 &app,
                                                 &pane_id,
                                                 instance_id,
-                                                request_id,
-                                                &request.method,
+                                                &request,
                                                 "codex_app_server_resolved",
                                             ).await;
                                         }
@@ -20564,22 +21054,14 @@ async fn terminal_codex_gateway_connection(
                     }
                     TerminalCodexGatewayRecoveryOutcome::Recovered(recovered) => {
                         connected_generation = recovered.connected_generation;
-                        let stale_server_requests = pending
-                            .lock()
-                            .ok()
-                            .map(|mut pending| pending.drain().collect::<Vec<_>>())
-                            .unwrap_or_default();
-                        for (request_key, request) in stale_server_requests {
-                            let request_id = request_key
-                                .split_once(':')
-                                .map(|(_, value)| json!(value))
-                                .unwrap_or(Value::Null);
+                        let stale_server_requests =
+                            terminal_codex_gateway_drain_pending(&pending);
+                        for request in stale_server_requests {
                             terminal_codex_gateway_publish_resolution(
                                 &app,
                                 &pane_id,
                                 instance_id,
-                                &request_id,
-                                &request.method,
+                                &request,
                                 "codex_app_server_auth_reload",
                             )
                             .await;
@@ -20667,22 +21149,13 @@ async fn terminal_codex_gateway_connection(
         }
     }
 
-    let unresolved = pending
-        .lock()
-        .ok()
-        .map(|mut pending| pending.drain().collect::<Vec<_>>())
-        .unwrap_or_default();
-    for (request_key, request) in unresolved {
-        let request_id = request_key
-            .split_once(':')
-            .map(|(_, value)| json!(value))
-            .unwrap_or(Value::Null);
+    let unresolved = terminal_codex_gateway_drain_pending(&pending);
+    for request in unresolved {
         terminal_codex_gateway_publish_resolution(
             &app,
             &pane_id,
             instance_id,
-            &request_id,
-            &request.method,
+            &request,
             "codex_app_server_gateway_disconnected",
         )
         .await;
@@ -21144,8 +21617,7 @@ fn terminal_spawn_codex_app_server_process(
                 command.arg(entrypoint);
                 command
             } else {
-                let batch_len =
-                    windows_agent_launch_command_line_len(command_path, &process_args);
+                let batch_len = windows_agent_launch_command_line_len(command_path, &process_args);
                 if batch_len >= WINDOWS_CLAUDE_LAUNCH_STAGE_THRESHOLD {
                     return Err(format!(
                         "Codex app-server batch launch is too long for cmd.exe ({batch_len} characters), and the trusted @openai/codex Node entrypoint could not be located."
@@ -21193,15 +21665,14 @@ async fn terminal_start_ready_codex_app_server_process(
     env_vars: &[(String, String)],
     trusted_args: &[String],
 ) -> Result<std::process::Child, String> {
-    let mut starting_child = TerminalCodexAppServerStartingChild::new(
-        terminal_spawn_codex_app_server_process(
+    let mut starting_child =
+        TerminalCodexAppServerStartingChild::new(terminal_spawn_codex_app_server_process(
             command_path,
             upstream_url,
             working_directory,
             env_vars,
             trusted_args,
-        )?,
-    );
+        )?);
     let readiness_url = format!("http://127.0.0.1:{upstream_port}/readyz");
     let readiness_client = reqwest::Client::builder()
         .timeout(Duration::from_millis(500))
@@ -21876,9 +22347,6 @@ async fn handle_terminal_activity_transport_message(
         Ok(Ok(response)) => Ok(Some(response)),
         Ok(Err(_)) => Err("Structured terminal interaction response channel closed.".to_string()),
         Err(_) => {
-            if let Ok(mut interactions) = state.terminal_structured_interactions.lock() {
-                interactions.remove(&interaction.interaction_id);
-            }
             log_terminal_status_event(
                 "backend.terminal_structured_interaction.expired",
                 json!({
@@ -21891,7 +22359,7 @@ async fn handle_terminal_activity_transport_message(
             let elicitation =
                 terminal_activity_hook_name_key(&interaction.hook_event_name) == "elicitation";
             let timeout_event = json!({
-                "hook_event_name": if elicitation { "ElicitationResult" } else { "PermissionDenied" },
+                "hook_event_name": if elicitation { "ElicitationResult" } else { "PermissionResult" },
                 "provider": interaction.provider,
                 "permission_request_id": interaction.provider_request_id,
                 "prompt_id": interaction.prompt_id,
@@ -22286,6 +22754,8 @@ async fn terminal_write_inner(
     todo_resume_requested: Option<bool>,
     thread_id: Option<String>,
     app_fork_enabled: Option<bool>,
+    structured_answer_option_id: Option<String>,
+    arm_structured_answer_confirmation: bool,
     _realtime_write: bool,
 ) -> Result<(), String> {
     validate_terminal_pane_id(&pane_id)?;
@@ -22543,12 +23013,24 @@ async fn terminal_write_inner(
         },
     }));
 
-    let escape_should_interrupt = terminal_write_escape_should_interrupt(
-        &data,
-        instance.coordination.is_some(),
-        prompt_event_source.as_deref(),
-        todo_action.as_deref(),
-    );
+    let structured_answer_bypasses_interrupt = arm_structured_answer_confirmation
+        && terminal_structured_interaction_for_written_answer(
+            state,
+            &pane_id,
+            instance.id,
+            prompt_event_id.as_deref(),
+            prompt_event_revision,
+        )
+        .is_some_and(|interaction| {
+            terminal_structured_answer_bypasses_interrupt(&interaction, &data)
+        });
+    let escape_should_interrupt = !structured_answer_bypasses_interrupt
+        && terminal_write_escape_should_interrupt(
+            &data,
+            instance.coordination.is_some(),
+            prompt_event_source.as_deref(),
+            todo_action.as_deref(),
+        );
     if escape_should_interrupt {
         let active_task_id = instance
             .active_task
@@ -22617,6 +23099,56 @@ async fn terminal_write_inner(
         }));
     }
 
+    let mut claimed_structured_answer = None;
+    if arm_structured_answer_confirmation {
+        if let Some(interaction) = terminal_structured_interaction_for_written_answer(
+            state,
+            &pane_id,
+            instance.id,
+            prompt_event_id.as_deref(),
+            prompt_event_revision,
+        ) {
+            let local_option_id = terminal_structured_answer_local_option(&interaction, &data);
+            let claimed_option_id = structured_answer_option_id
+                .as_deref()
+                .or(local_option_id.as_deref());
+            let submitted_structured_answer = prompt_answer_requested
+                || local_option_id.is_some()
+                || terminal_structured_answer_local_submission(&data);
+            if submitted_structured_answer
+                && !terminal_structured_answer_keeps_open_for_input(&interaction, &data)
+            {
+                let runtime = terminal_runtime_snapshot(&instance);
+                let still_prompting =
+                    terminal_runtime_is_prompting_for_structured_interaction(&runtime);
+                let confirmation_already_arms_write =
+                    terminal_structured_answer_confirmation_allows_continuation(
+                        &interaction,
+                        &data,
+                    );
+                let claimed = still_prompting
+                    && (terminal_structured_interaction_arm_answer_confirmation_timeout(
+                        &app,
+                        interaction.clone(),
+                        claimed_option_id.unwrap_or_default(),
+                    ) || confirmation_already_arms_write);
+                if !claimed {
+                    if !still_prompting {
+                        terminal_structured_interaction_remove_generation(state, &interaction);
+                    }
+                    // The per-instance input queue serializes local and remote
+                    // writers. Claiming the exact generation here, immediately
+                    // before the PTY write, makes a late second answer a no-op.
+                    if prompt_answer_requested {
+                        return Err(STRUCTURED_INTERACTION_ALREADY_RESOLVED_ERROR.to_string());
+                    }
+                    return Ok(());
+                }
+                claimed_structured_answer = Some(interaction);
+            }
+        }
+    }
+
     let input_write_started_at = Instant::now();
     let input_write_result = match write_terminal_input(
         Some(&app),
@@ -22624,6 +23156,7 @@ async fn terminal_write_inner(
         &pane_id,
         instance_id,
         &data,
+        claimed_structured_answer.as_ref(),
         "terminal.write.skipped_stale_or_missing",
     )
     .await
@@ -22650,6 +23183,12 @@ async fn terminal_write_inner(
         }
     };
     let input_write_elapsed_ms = terminal_diagnostic_elapsed_ms(input_write_started_at);
+    if !input_write_result && claimed_structured_answer.is_some() {
+        if prompt_answer_requested {
+            return Err(STRUCTURED_INTERACTION_ALREADY_RESOLVED_ERROR.to_string());
+        }
+        return Ok(());
+    }
     if prompt_answer_requested && !input_write_result {
         return Err("Agent prompt answer was not written to the terminal.".to_string());
     }
@@ -23195,6 +23734,8 @@ async fn terminal_write(
         todo_resume_requested,
         thread_id,
         app_fork_enabled,
+        None,
+        true,
         false,
     )
     .await
@@ -23832,7 +24373,12 @@ fn terminal_structured_interaction_hook_response(
             } else {
                 "once"
             };
-            return json!({ "reply": reply });
+            return json!({
+                "reply": reply,
+                "_diffforge_interaction_id": interaction.interaction_id,
+                "_diffforge_interaction_revision": interaction.revision,
+                "_diffforge_provider_request_id": interaction.provider_request_id,
+            });
         }
         let answers = answer_payload
             .and_then(|value| value.get("answers"))
@@ -23842,6 +24388,9 @@ fn terminal_structured_interaction_hook_response(
         return json!({
             "answers": answers,
             "rejected": matches!(option_key.as_str(), "deny" | "reject" | "cancel"),
+            "_diffforge_interaction_id": interaction.interaction_id,
+            "_diffforge_interaction_revision": interaction.revision,
+            "_diffforge_provider_request_id": interaction.provider_request_id,
         });
     }
     if hook_key == "permissiondenied" {
@@ -23960,6 +24509,362 @@ fn terminal_structured_interaction_hook_response(
     json!({})
 }
 
+fn terminal_structured_interaction_same_generation(
+    current: &TerminalStructuredInteraction,
+    expected: &TerminalStructuredInteraction,
+) -> bool {
+    current.interaction_id == expected.interaction_id
+        && current.revision == expected.revision
+        && current.pane_id == expected.pane_id
+        && current.instance_id == expected.instance_id
+        && current.provider_request_id == expected.provider_request_id
+        && current.response_mode == expected.response_mode
+}
+
+fn terminal_structured_interaction_remove_generation(
+    state: &TerminalState,
+    interaction: &TerminalStructuredInteraction,
+) -> bool {
+    let removed = state
+        .terminal_structured_interactions
+        .lock()
+        .ok()
+        .is_some_and(|mut interactions| {
+            let matches = interactions
+                .get(&interaction.interaction_id)
+                .is_some_and(|current| {
+                    terminal_structured_interaction_same_generation(current, interaction)
+                });
+            if matches {
+                interactions.remove(&interaction.interaction_id);
+            }
+            matches
+        });
+    if removed {
+        if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
+            waiters.remove(&interaction.interaction_id);
+        }
+    }
+    removed
+}
+
+fn terminal_structured_interaction_expire_answer_confirmation(
+    interactions: &mut HashMap<String, TerminalStructuredInteraction>,
+    interaction: &TerminalStructuredInteraction,
+) -> bool {
+    let matches_answered_generation =
+        interactions
+            .get(&interaction.interaction_id)
+            .is_some_and(|current| {
+                terminal_structured_interaction_same_generation(current, interaction)
+                    && current.awaiting_provider_confirmation
+            });
+    if matches_answered_generation {
+        interactions.remove(&interaction.interaction_id);
+    }
+    matches_answered_generation
+}
+
+fn terminal_structured_interaction_remove_answered_generation(
+    state: &TerminalState,
+    interaction: &TerminalStructuredInteraction,
+) -> bool {
+    let removed = state
+        .terminal_structured_interactions
+        .lock()
+        .ok()
+        .is_some_and(|mut interactions| {
+            terminal_structured_interaction_expire_answer_confirmation(
+                &mut interactions,
+                interaction,
+            )
+        });
+    if removed {
+        if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
+            waiters.remove(&interaction.interaction_id);
+        }
+    }
+    removed
+}
+
+fn terminal_structured_interaction_for_written_answer(
+    state: &TerminalState,
+    pane_id: &str,
+    instance_id: u64,
+    prompt_event_id: Option<&str>,
+    prompt_event_revision: Option<u64>,
+) -> Option<TerminalStructuredInteraction> {
+    let prompt_event_id = prompt_event_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    state
+        .terminal_structured_interactions
+        .lock()
+        .ok()?
+        .values()
+        .find(|interaction| {
+            interaction.pane_id == pane_id
+                && interaction.instance_id == instance_id
+                && interaction.response_mode == "structured_pty"
+                && prompt_event_id.is_none_or(|prompt_event_id| {
+                    interaction.prompt_id == prompt_event_id
+                        || interaction.interaction_id == prompt_event_id
+                })
+                && prompt_event_revision.is_none_or(|revision| revision == interaction.revision)
+        })
+        .cloned()
+}
+
+fn terminal_structured_answer_keeps_open_for_input(
+    interaction: &TerminalStructuredInteraction,
+    data: &str,
+) -> bool {
+    terminal_codex_hook_trust_is_catalog_request(&interaction.provider_request_id)
+        && terminal_codex_hook_trust_prompt_answer_input("review_hooks")
+            .is_some_and(|review_input| review_input == data)
+}
+
+fn terminal_structured_answer_local_option(
+    interaction: &TerminalStructuredInteraction,
+    data: &str,
+) -> Option<String> {
+    if data.is_empty() {
+        return None;
+    }
+    if interaction.awaiting_provider_confirmation
+        && interaction.claimed_option_id.as_deref() == Some("")
+        && data.chars().all(|character| matches!(character, '\r' | '\n'))
+    {
+        return None;
+    }
+    if terminal_codex_hook_trust_is_catalog_request(&interaction.provider_request_id) {
+        return match data {
+            "2" | "2\r" | "2\n" => Some("trust_all_and_continue".to_string()),
+            "3" | "3\r" | "3\n" => Some("continue_without_trusting".to_string()),
+            _ => None,
+        };
+    }
+    let option_input = data.trim_end_matches(['\r', '\n']);
+    interaction
+        .options
+        .iter()
+        .find(|option| {
+            option.id == option_input
+                || option.value.as_deref() == Some(option_input)
+                || terminal_agent_prompt_answer_input(
+                    &interaction.provider,
+                    &option.id,
+                    &option.label,
+                    option.value.as_deref(),
+                )
+                .trim_end_matches(['\r', '\n'])
+                    == option_input
+        })
+        .map(|option| option.id.clone())
+}
+
+fn terminal_structured_answer_local_submission(data: &str) -> bool {
+    !data.is_empty()
+}
+
+fn terminal_structured_answer_confirmation_allows_continuation(
+    interaction: &TerminalStructuredInteraction,
+    data: &str,
+) -> bool {
+    if !interaction.awaiting_provider_confirmation {
+        return false;
+    }
+    match interaction.claimed_option_id.as_deref() {
+        Some("") => true,
+        Some(_) => {
+            !data.is_empty() && data.chars().all(|character| matches!(character, '\r' | '\n'))
+        }
+        None => false,
+    }
+}
+
+fn terminal_structured_answer_bypasses_interrupt(
+    interaction: &TerminalStructuredInteraction,
+    data: &str,
+) -> bool {
+    data == "\x1b" && terminal_structured_answer_local_option(interaction, data).is_some()
+}
+
+fn terminal_runtime_is_prompting_for_structured_interaction(
+    runtime: &TerminalRuntimeSnapshot,
+) -> bool {
+    terminal_workspace_agent_session_status_requires_input(
+        &runtime.event_type,
+        &runtime.activity_status,
+        &runtime.command_phase,
+    )
+}
+
+fn terminal_runtime_is_done_after_structured_answer(runtime: &TerminalRuntimeSnapshot) -> bool {
+    !terminal_runtime_snapshot_is_busy_turn(runtime)
+}
+
+const STRUCTURED_INTERACTION_ALREADY_RESOLVED_ERROR: &str =
+    "Structured terminal interaction is already resolved.";
+
+fn terminal_structured_interaction_claim_answer_confirmation(
+    interactions: &mut HashMap<String, TerminalStructuredInteraction>,
+    interaction: &TerminalStructuredInteraction,
+    claimed_option_id: &str,
+) -> bool {
+    let Some(current) = interactions.get_mut(&interaction.interaction_id) else {
+        return false;
+    };
+    if !terminal_structured_interaction_same_generation(current, interaction)
+        || !matches!(
+            current.response_mode.as_str(),
+            "structured_pty" | "provider_api"
+        )
+    {
+        return false;
+    }
+    if current.awaiting_provider_confirmation {
+        if current.claimed_option_id.as_deref() == Some("") && !claimed_option_id.is_empty() {
+            current.claimed_option_id = Some(claimed_option_id.to_string());
+            return true;
+        }
+        return false;
+    }
+    current.awaiting_provider_confirmation = true;
+    current.claimed_option_id = Some(claimed_option_id.to_string());
+    true
+}
+
+fn terminal_structured_interaction_claim_matches_option(
+    interaction: &TerminalStructuredInteraction,
+    option_id: &str,
+) -> bool {
+    interaction.awaiting_provider_confirmation
+        && interaction.claimed_option_id.as_deref() == Some(option_id)
+}
+
+fn terminal_structured_interaction_arm_answer_confirmation_timeout(
+    app: &AppHandle,
+    interaction: TerminalStructuredInteraction,
+    claimed_option_id: &str,
+) -> bool {
+    let state = app.state::<TerminalState>();
+    let newly_armed = state
+        .terminal_structured_interactions
+        .lock()
+        .ok()
+        .map(|mut interactions| {
+            terminal_structured_interaction_claim_answer_confirmation(
+                &mut interactions,
+                &interaction,
+                claimed_option_id,
+            )
+        })
+        .unwrap_or(false);
+    if !newly_armed {
+        return false;
+    }
+    log_terminal_status_event(
+        "backend.terminal_structured_interaction.confirmation_timeout_armed",
+        json!({
+            "interaction_id": interaction.interaction_id,
+            "pane_id": interaction.pane_id,
+            "provider": interaction.provider,
+            "provider_request_id": interaction.provider_request_id,
+            "response_mode": interaction.response_mode,
+            "revision": interaction.revision,
+            "timeout_secs": STRUCTURED_ANSWER_CONFIRMATION_TIMEOUT_SECS,
+        }),
+    );
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        sleep(Duration::from_secs(
+            STRUCTURED_ANSWER_CONFIRMATION_TIMEOUT_SECS,
+        ))
+        .await;
+        let state = app.state::<TerminalState>();
+        let still_open = state
+            .terminal_structured_interactions
+            .lock()
+            .ok()
+            .and_then(|interactions| interactions.get(&interaction.interaction_id).cloned())
+            .is_some_and(|current| {
+                terminal_structured_interaction_same_generation(&current, &interaction)
+                    && current.awaiting_provider_confirmation
+                    && matches!(
+                        current.response_mode.as_str(),
+                        "structured_pty" | "provider_api"
+                    )
+            });
+        if !still_open {
+            return;
+        }
+        let Some(instance) = terminal_activity_hook_current_instance(
+            &state.terminals,
+            &interaction.pane_id,
+            interaction.instance_id,
+        )
+        .await
+        else {
+            terminal_structured_interaction_remove_answered_generation(&state, &interaction);
+            return;
+        };
+        let runtime = terminal_runtime_snapshot(&instance);
+        let resolution_next_state = if terminal_runtime_is_done_after_structured_answer(&runtime) {
+            "idle"
+        } else {
+            "running"
+        };
+        log_terminal_status_event(
+            "backend.terminal_structured_interaction.confirmation_expired",
+            json!({
+                "interaction_id": interaction.interaction_id,
+                "pane_id": interaction.pane_id,
+                "provider": interaction.provider,
+                "provider_request_id": interaction.provider_request_id,
+                "reason": "structured_answer_confirmation_timeout",
+                "resolution_next_state": resolution_next_state,
+                "response_mode": interaction.response_mode,
+                "revision": interaction.revision,
+            }),
+        );
+        let elicitation = matches!(
+            terminal_activity_hook_name_key(&interaction.hook_event_name).as_str(),
+            "elicitation" | "userpromptrequired"
+        );
+        let event = json!({
+            "hook_event_name": if elicitation { "ElicitationResult" } else { "PermissionResult" },
+            "provider": interaction.provider,
+            "permission_request_id": interaction.provider_request_id,
+            "prompt_id": interaction.prompt_id,
+            "resolved_interaction_id": interaction.interaction_id,
+            "resolved_interaction_revision": interaction.revision,
+            "decision": "accepted",
+            "timestamp_ms": terminal_now_ms(),
+            "resolution_next_state": resolution_next_state,
+            "resolution_reason": "structured_answer_confirmation_timeout",
+        });
+        let cloud_mcp_state = app.state::<CloudMcpState>();
+        process_terminal_activity_hook_event(
+            &app,
+            &state.terminals,
+            cloud_mcp_state.inner(),
+            &interaction.pane_id,
+            interaction.instance_id,
+            &instance,
+            &event,
+            "structured-answer-confirmation-timeout",
+        )
+        .await;
+        // The hook-trust idle guard can intentionally reject this synthetic
+        // lifecycle event before structured reconciliation.  The timeout is
+        // still the terminal condition for this exact generation, so remove
+        // it directly as a final self-heal guard.
+        terminal_structured_interaction_remove_answered_generation(&state, &interaction);
+    });
+    true
+}
+
 async fn terminal_structured_interaction_publish_answered(
     app: &AppHandle,
     state: &TerminalState,
@@ -23978,9 +24883,7 @@ async fn terminal_structured_interaction_publish_answered(
         "permissionrequest" | "permissiondenied"
     );
     let event = json!({
-        "hook_event_name": if denied && permission_request {
-            "PermissionDenied"
-        } else if permission_request {
+        "hook_event_name": if permission_request {
             "PermissionResult"
         } else {
             "ElicitationResult"
@@ -24095,6 +24998,76 @@ async fn terminal_answer_agent_prompt_remote_command(
             "stale_interaction_revision",
         ));
     }
+    if interaction.response_mode == "structured_pty" {
+        let runtime = terminal_runtime_snapshot(&instance);
+        if !terminal_runtime_is_prompting_for_structured_interaction(&runtime) {
+            terminal_structured_interaction_remove_generation(state.inner(), &interaction);
+            return Ok(terminal_agent_prompt_already_resolved_result(
+                &pane_id,
+                Some(instance.id),
+                &prompt_id,
+                &requested_interaction_id,
+                requested_interaction_revision,
+                "terminal_no_longer_prompting",
+            ));
+        }
+    }
+    if interaction.awaiting_provider_confirmation {
+        let _pending_write_guard = if interaction.response_mode == "structured_pty" {
+            Some(instance.input_queue.lock().await)
+        } else {
+            None
+        };
+        let submitted_answer = state
+            .terminal_structured_interactions
+            .lock()
+            .map_err(|_| "Structured terminal interaction state is unavailable.".to_string())?
+            .get(&interaction.interaction_id)
+            .filter(|current| {
+                terminal_structured_interaction_same_generation(current, &interaction)
+                    && current.awaiting_provider_confirmation
+            })
+            .cloned();
+        let Some(submitted_answer) = submitted_answer else {
+            return Ok(terminal_agent_prompt_already_resolved_result(
+                &pane_id,
+                Some(instance.id),
+                &prompt_id,
+                &requested_interaction_id,
+                requested_interaction_revision,
+                "interaction_no_longer_open",
+            ));
+        };
+        if !terminal_structured_interaction_claim_matches_option(&submitted_answer, &option_id) {
+            return Ok(terminal_agent_prompt_already_resolved_result(
+                &pane_id,
+                Some(instance.id),
+                &prompt_id,
+                &requested_interaction_id,
+                requested_interaction_revision,
+                "different_answer_already_submitted",
+            ));
+        }
+        let runtime = terminal_runtime_snapshot(&instance);
+        return Ok(json!({
+            "interaction_id": interaction.interaction_id,
+            "interaction_revision": interaction.revision,
+            "prompt_id": prompt_id,
+            "option_id": option_id,
+            "option_value": option_value.unwrap_or_default(),
+            "pane_id": pane_id,
+            "terminal_instance_id": instance.id,
+            "turn_id": runtime.turn_id.unwrap_or_default(),
+            "provider_turn_id": runtime.provider_turn_id.unwrap_or_default(),
+            "provider_session_id": runtime.provider_session_id.unwrap_or_default(),
+            "native_session_id": runtime.native_session_id.unwrap_or_default(),
+            "status": "accepted_pending_confirmation",
+            "message": "Answer already submitted; awaiting provider confirmation.",
+            "answered": false,
+            "accepted": true,
+            "resolved": false,
+        }));
+    }
     if !interaction.options.is_empty()
         && !interaction
             .options
@@ -24122,9 +25095,6 @@ async fn terminal_answer_agent_prompt_remote_command(
             .remove(&interaction.interaction_id);
         let response_applied = sender.is_some_and(|sender| sender.send(response).is_ok());
         if !response_applied {
-            if let Ok(mut interactions) = state.terminal_structured_interactions.lock() {
-                interactions.remove(&interaction.interaction_id);
-            }
             terminal_structured_interaction_publish_answered(
                 &app,
                 state.inner(),
@@ -24145,10 +25115,13 @@ async fn terminal_answer_agent_prompt_remote_command(
             ));
         }
         let provider_ack_pending = interaction.response_mode == "provider_api";
-        if !provider_ack_pending {
-            if let Ok(mut interactions) = state.terminal_structured_interactions.lock() {
-                interactions.remove(&interaction.interaction_id);
-            }
+        if provider_ack_pending {
+            terminal_structured_interaction_arm_answer_confirmation_timeout(
+                &app,
+                interaction.clone(),
+                &option_id,
+            );
+        } else {
             terminal_structured_interaction_publish_answered(
                 &app,
                 state.inner(),
@@ -24184,16 +25157,15 @@ async fn terminal_answer_agent_prompt_remote_command(
             "provider_turn_id": runtime.provider_turn_id.unwrap_or_default(),
             "provider_session_id": runtime.provider_session_id.unwrap_or_default(),
             "native_session_id": runtime.native_session_id.unwrap_or_default(),
-            "status": if provider_ack_pending { "pending_provider_ack" } else { "applied" },
+            "status": if provider_ack_pending { "accepted_pending_confirmation" } else { "applied" },
             "message": if provider_ack_pending { "Waiting for OpenCode to confirm the response." } else { "" },
             "answered": !provider_ack_pending,
+            "accepted": true,
+            "resolved": !provider_ack_pending,
         }));
     }
 
     if terminal_codex_hook_trust_is_fail_closed_request(&interaction.provider_request_id) {
-        if let Ok(mut interactions) = state.terminal_structured_interactions.lock() {
-            interactions.remove(&interaction.interaction_id);
-        }
         terminal_structured_interaction_publish_answered(
             &app,
             state.inner(),
@@ -24217,6 +25189,9 @@ async fn terminal_answer_agent_prompt_remote_command(
         }));
     }
 
+    let review_hooks =
+        terminal_codex_hook_trust_answer_keeps_open(&interaction.provider_request_id, &option_id);
+    let awaiting_provider_confirmation = !review_hooks;
     let data = terminal_agent_prompt_answer_input(
         &instance.metadata.agent_kind,
         &option_id,
@@ -24231,7 +25206,7 @@ async fn terminal_answer_agent_prompt_remote_command(
         instance_id,
         data,
         Some(prompt_id.clone()).filter(|value| !value.trim().is_empty()),
-        None,
+        Some(interaction.revision),
         Some("agent_prompt_answer".to_string()),
         Some(crate::coordination::kernel::now_rfc3339()),
         None,
@@ -24242,10 +25217,22 @@ async fn terminal_answer_agent_prompt_remote_command(
         Some(false),
         None,
         Some(false),
+        Some(option_id.clone()),
+        awaiting_provider_confirmation,
         true,
     )
     .await;
     if let Err(error) = write_result {
+        if error == STRUCTURED_INTERACTION_ALREADY_RESOLVED_ERROR {
+            return Ok(terminal_agent_prompt_already_resolved_result(
+                &pane_id,
+                Some(instance.id),
+                &prompt_id,
+                &requested_interaction_id,
+                requested_interaction_revision,
+                "interaction_no_longer_open",
+            ));
+        }
         let terminal_still_current =
             get_terminal_instance_if_current(state.inner(), &pane_id, Some(instance.id))
                 .await
@@ -24267,15 +25254,7 @@ async fn terminal_answer_agent_prompt_remote_command(
             "terminal_closed_before_write",
         ));
     }
-    let codex_hook_trust_interaction =
-        terminal_codex_hook_trust_is_catalog_request(&interaction.provider_request_id);
-    let review_hooks =
-        terminal_codex_hook_trust_answer_keeps_open(&interaction.provider_request_id, &option_id);
-    let awaiting_provider_confirmation = codex_hook_trust_interaction && !review_hooks;
     if !review_hooks && !awaiting_provider_confirmation {
-        if let Ok(mut interactions) = state.terminal_structured_interactions.lock() {
-            interactions.remove(&interaction.interaction_id);
-        }
         terminal_structured_interaction_publish_answered(
             &app,
             state.inner(),
@@ -24333,9 +25312,21 @@ async fn terminal_answer_agent_prompt_remote_command(
             .unwrap_or_default(),
         "interaction_id": interaction.interaction_id,
         "interaction_revision": interaction.revision,
-        "status": if review_hooks { "reviewing_hooks" } else { "applied" },
-        "message": "",
-        "answered": !review_hooks,
+        "status": if review_hooks {
+            "reviewing_hooks"
+        } else if awaiting_provider_confirmation {
+            "accepted_pending_confirmation"
+        } else {
+            "applied"
+        },
+        "message": if awaiting_provider_confirmation {
+            "Answer submitted; waiting for Codex to confirm the response."
+        } else {
+            ""
+        },
+        "answered": !review_hooks && !awaiting_provider_confirmation,
+        "accepted": !review_hooks || awaiting_provider_confirmation,
+        "resolved": !review_hooks && !awaiting_provider_confirmation,
     }))
 }
 
@@ -24472,6 +25463,8 @@ async fn terminal_write_realtime(
             todo_resume_requested,
             thread_id,
             app_fork_enabled,
+            None,
+            true,
             true,
         )
         .await
@@ -25077,14 +26070,8 @@ async fn terminal_interrupt_agent_inner(
         .as_ref()
         .map(|task| task.task_id.clone());
     write_terminal_interrupt_escape(&instance).await?;
-    publish_terminal_provider_turn_interrupted(
-        app,
-        state,
-        cloud_mcp_state,
-        &instance,
-        &reason,
-    )
-    .await?;
+    publish_terminal_provider_turn_interrupted(app, state, cloud_mcp_state, &instance, &reason)
+        .await?;
     let interrupted_active_task = mark_terminal_active_task_interrupted(
         cloud_mcp_state,
         &pane_id,
@@ -26319,6 +27306,8 @@ mod terminal_tests {
                 "PermissionRequest".to_string()
             },
             response_mode: "codex_app_server".to_string(),
+            awaiting_provider_confirmation: false,
+            claimed_option_id: None,
             options: Vec::new(),
             permission_suggestions: None,
             prompt_questions: None,
@@ -26435,7 +27424,10 @@ mod terminal_tests {
             "/workspace/alpha",
             &pane_config,
         );
-        assert_eq!(config_read.pointer("/params/cwd"), Some(&json!("/workspace/alpha")));
+        assert_eq!(
+            config_read.pointer("/params/cwd"),
+            Some(&json!("/workspace/alpha"))
+        );
         assert!(config_read.pointer("/params/config").is_none());
         let mut config_response = json!({
             "id": 3,
@@ -26528,10 +27520,14 @@ mod terminal_tests {
         );
         // Allowlist predicate: only model / reasoning-effort (any case/separator).
         assert!(terminal_codex_thread_config_passthrough("model"));
-        assert!(terminal_codex_thread_config_passthrough("modelReasoningEffort"));
+        assert!(terminal_codex_thread_config_passthrough(
+            "modelReasoningEffort"
+        ));
         assert!(!terminal_codex_thread_config_passthrough("hooks"));
         assert!(!terminal_codex_thread_config_passthrough("features.hooks"));
-        assert!(!terminal_codex_thread_config_passthrough("bypass_hook_trust"));
+        assert!(!terminal_codex_thread_config_passthrough(
+            "bypass_hook_trust"
+        ));
         assert!(!terminal_codex_thread_config_passthrough("sandbox_mode"));
     }
 
@@ -26553,11 +27549,7 @@ mod terminal_tests {
                 } }
             });
 
-            terminal_codex_gateway_bind_pane_request(
-                &mut request,
-                "/workspace/alpha",
-                &json!({}),
-            );
+            terminal_codex_gateway_bind_pane_request(&mut request, "/workspace/alpha", &json!({}));
 
             assert_eq!(
                 request.pointer("/params/config"),
@@ -26577,7 +27569,12 @@ mod terminal_tests {
     #[test]
     fn thread_bootstrap_removes_non_object_and_unknown_only_config() {
         for method in ["thread/start", "thread/resume", "thread/fork"] {
-            for config in [json!(null), json!(false), json!("profile=attacker"), json!([])] {
+            for config in [
+                json!(null),
+                json!(false),
+                json!("profile=attacker"),
+                json!([]),
+            ] {
                 let mut request = json!({
                     "id": method,
                     "method": method,
@@ -26610,20 +27607,14 @@ mod terminal_tests {
 
     #[test]
     fn per_pane_hooks_list_uses_provider_native_cwd_and_hashes() {
-        let mut alpha_request =
-            json!({"id": "hooks-alpha", "method": "hooks/list", "params": {}});
-        let mut beta_request =
-            json!({"id": "hooks-beta", "method": "hooks/list", "params": {}});
+        let mut alpha_request = json!({"id": "hooks-alpha", "method": "hooks/list", "params": {}});
+        let mut beta_request = json!({"id": "hooks-beta", "method": "hooks/list", "params": {}});
         terminal_codex_gateway_bind_pane_request(
             &mut alpha_request,
             "/workspace/alpha",
             &json!({}),
         );
-        terminal_codex_gateway_bind_pane_request(
-            &mut beta_request,
-            "/workspace/beta",
-            &json!({}),
-        );
+        terminal_codex_gateway_bind_pane_request(&mut beta_request, "/workspace/beta", &json!({}));
         assert_eq!(
             alpha_request.pointer("/params/cwds"),
             Some(&json!(["/workspace/alpha"]))
@@ -26718,15 +27709,42 @@ mod terminal_tests {
     #[test]
     fn codex_auth_invalidation_detection_is_specific_to_auth_errors() {
         for (value, method) in [
-            (json!({"id": 1, "error": {"code": "token_invalidated", "type": "invalid_request_error", "status": 401}}), None),
-            (json!({"id": "auth-401", "error": {"type": "invalid_request_error", "status": 401, "message": "Unauthorized"}}), Some("account/login")),
-            (json!({"id": 2, "error": {"code": "refresh_token_reused", "message": "refresh token was already used"}}), None),
-            (json!({"id": 3, "error": {"message": "refresh-unauthorized"}}), None),
-            (json!({"id": 4, "error": {"message": "refresh_unauthorized"}}), None),
-            (json!({"method": "error", "params": {"error": {"message": "request failed", "codexErrorInfo": "unauthorized"}}}), None),
-            (json!({"method": "account/chatgptAuthTokens/refresh", "params": {"reason": "unauthorized"}}), None),
-            (json!({"method": "account/chatgptAuthTokens/refresh", "params": {"reason": "refresh-unauthorized"}}), None),
-            (json!({"method": "account/chatgptAuthTokens/refresh", "params": {"reason": "refresh_unauthorized"}}), None),
+            (
+                json!({"id": 1, "error": {"code": "token_invalidated", "type": "invalid_request_error", "status": 401}}),
+                None,
+            ),
+            (
+                json!({"id": "auth-401", "error": {"type": "invalid_request_error", "status": 401, "message": "Unauthorized"}}),
+                Some("account/login"),
+            ),
+            (
+                json!({"id": 2, "error": {"code": "refresh_token_reused", "message": "refresh token was already used"}}),
+                None,
+            ),
+            (
+                json!({"id": 3, "error": {"message": "refresh-unauthorized"}}),
+                None,
+            ),
+            (
+                json!({"id": 4, "error": {"message": "refresh_unauthorized"}}),
+                None,
+            ),
+            (
+                json!({"method": "error", "params": {"error": {"message": "request failed", "codexErrorInfo": "unauthorized"}}}),
+                None,
+            ),
+            (
+                json!({"method": "account/chatgptAuthTokens/refresh", "params": {"reason": "unauthorized"}}),
+                None,
+            ),
+            (
+                json!({"method": "account/chatgptAuthTokens/refresh", "params": {"reason": "refresh-unauthorized"}}),
+                None,
+            ),
+            (
+                json!({"method": "account/chatgptAuthTokens/refresh", "params": {"reason": "refresh_unauthorized"}}),
+                None,
+            ),
         ] {
             assert!(
                 terminal_codex_app_server_auth_invalidated(&value, method),
@@ -26734,12 +27752,30 @@ mod terminal_tests {
             );
         }
         for (value, method) in [
-            (json!({"id": 3, "error": {"type": "invalid_request_error", "status": 400, "message": "bad argument"}}), Some("account/login")),
-            (json!({"id": 4, "error": {"type": "invalid_request_error", "status": 401, "message": "Unauthorized"}}), Some("mcpServer/call")),
-            (json!({"id": 5, "error": {"type": "invalid_request_error", "status": 401, "message": "Unauthorized"}}), None),
-            (json!({"id": 6, "error": {"type": "invalid_request_error", "status": 401, "message": "Unauthorized"}}), Some("thread/author")),
-            (json!({"method": "item/completed", "params": {"item": {"text": "documentation mentions token_invalidated"}}}), None),
-            (json!({"method": "error", "params": {"error": {"message": "MCP tool returned 401", "source": "weather-tool"}}}), None),
+            (
+                json!({"id": 3, "error": {"type": "invalid_request_error", "status": 400, "message": "bad argument"}}),
+                Some("account/login"),
+            ),
+            (
+                json!({"id": 4, "error": {"type": "invalid_request_error", "status": 401, "message": "Unauthorized"}}),
+                Some("mcpServer/call"),
+            ),
+            (
+                json!({"id": 5, "error": {"type": "invalid_request_error", "status": 401, "message": "Unauthorized"}}),
+                None,
+            ),
+            (
+                json!({"id": 6, "error": {"type": "invalid_request_error", "status": 401, "message": "Unauthorized"}}),
+                Some("thread/author"),
+            ),
+            (
+                json!({"method": "item/completed", "params": {"item": {"text": "documentation mentions token_invalidated"}}}),
+                None,
+            ),
+            (
+                json!({"method": "error", "params": {"error": {"message": "MCP tool returned 401", "source": "weather-tool"}}}),
+                None,
+            ),
         ] {
             assert!(
                 !terminal_codex_app_server_auth_invalidated(&value, method),
@@ -26775,12 +27811,7 @@ mod terminal_tests {
             Some("turn/start")
         ));
         let mut budget = TerminalCodexAuthReloadBudget::default();
-        let decision = terminal_codex_auth_reload_next(
-            &mut budget,
-            "pane-reload",
-            9,
-            1_000,
-        );
+        let decision = terminal_codex_auth_reload_next(&mut budget, "pane-reload", 9, 1_000);
         let TerminalCodexAuthReloadDecision::Retry { attempt, delay_ms } = decision else {
             panic!("first invalidation must be recoverable");
         };
@@ -26794,7 +27825,10 @@ mod terminal_tests {
         *disk_auth_revision.lock().unwrap() = "refresh-after";
         let replacement_loaded = *disk_auth_revision.lock().unwrap();
         assert_eq!(replacement_loaded, "refresh-after");
-        assert_eq!(budget.attempts, 1, "successful reloads do not reset the lifetime cap");
+        assert_eq!(
+            budget.attempts, 1,
+            "successful reloads do not reset the lifetime cap"
+        );
     }
 
     #[tokio::test]
@@ -26815,11 +27849,7 @@ mod terminal_tests {
         assert_eq!(
             terminal_codex_gateway_service_recovery_control(
                 &sender,
-                &Message::Text(
-                    json!({"id": 8, "method": "turn/start"})
-                        .to_string()
-                        .into(),
-                ),
+                &Message::Text(json!({"id": 8, "method": "turn/start"}).to_string().into(),),
             )
             .await,
             TerminalCodexRecoveryControlOutcome::NotControl,
@@ -26833,12 +27863,7 @@ mod terminal_tests {
         let mut budget = TerminalCodexAuthReloadBudget::default();
         let mut delays = Vec::new();
         for attempt in 1..=TERMINAL_CODEX_AUTH_RELOAD_MAX_ATTEMPTS {
-            match terminal_codex_auth_reload_next(
-                &mut budget,
-                "pane-exhausted",
-                11,
-                5_000,
-            ) {
+            match terminal_codex_auth_reload_next(&mut budget, "pane-exhausted", 11, 5_000) {
                 TerminalCodexAuthReloadDecision::Retry {
                     attempt: actual,
                     delay_ms,
@@ -26904,9 +27929,18 @@ mod terminal_tests {
             "still invalid",
         );
         assert_eq!(notification["method"], json!("error"));
-        assert_eq!(notification.pointer("/params/threadId"), Some(&json!("thread-1")));
-        assert_eq!(notification.pointer("/params/turnId"), Some(&json!("turn-1")));
-        assert_eq!(notification.pointer("/params/willRetry"), Some(&json!(false)));
+        assert_eq!(
+            notification.pointer("/params/threadId"),
+            Some(&json!("thread-1"))
+        );
+        assert_eq!(
+            notification.pointer("/params/turnId"),
+            Some(&json!("turn-1"))
+        );
+        assert_eq!(
+            notification.pointer("/params/willRetry"),
+            Some(&json!(false))
+        );
         assert_eq!(
             notification.pointer("/params/error/codexErrorInfo"),
             Some(&json!("unauthorized"))
@@ -27002,7 +28036,10 @@ mod terminal_tests {
         }));
 
         terminal_codex_gateway_clear_completed_turn(&mut active_turn, &invalidated_completion);
-        assert!(active_turn.is_none(), "the interrupted turn is cleared for explicit resubmission");
+        assert!(
+            active_turn.is_none(),
+            "the interrupted turn is cleared for explicit resubmission"
+        );
 
         // Model replacement N+1 starting and the first reconnect failing.
         // Attempt two must observe N+1 so the supervisor replaces it again.
@@ -27078,7 +28115,10 @@ mod terminal_tests {
             TerminalCodexThreadBootstrapForward::Sent,
             "a nonempty catalog is enforced by Codex's native review barrier"
         );
-        assert_eq!(receiver.try_recv().unwrap(), Message::Text(request.to_string().into()));
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            Message::Text(request.to_string().into())
+        );
         assert_eq!(
             terminal_codex_hook_trust_discovery_state(&pane_id, instance_id),
             Some(TerminalCodexHookTrustDiscoveryState::Open),
@@ -27162,31 +28202,43 @@ mod terminal_tests {
     #[test]
     fn codex_app_server_gateway_accepts_exactly_one_answer_source() {
         let request_key = "number:7".to_string();
-        let pending = Arc::new(StdMutex::new(HashMap::from([(
-            request_key.clone(),
-            TerminalCodexGatewayPendingRequest {
-                method: "item/tool/requestUserInput".to_string(),
-                winner: None,
-            },
-        )])));
+        let pending = Arc::new(StdMutex::new(TerminalCodexGatewayPendingRequests {
+            by_request_id: HashMap::from([(
+                request_key.clone(),
+                VecDeque::from([TerminalCodexGatewayPendingRequest {
+                    request_id: json!(7),
+                    method: "item/tool/requestUserInput".to_string(),
+                    interaction_id: "uir:request-7".to_string(),
+                    interaction_revision: 10,
+                    winner: None,
+                }]),
+            )]),
+            ambiguous_request_ids: HashSet::new(),
+        }));
+        let response = json!({"id": 7, "result": {"answers": {}}});
 
-        assert_eq!(
-            terminal_codex_gateway_claim(&pending, &request_key, TerminalCodexGatewayWinner::Web,),
-            Some("item/tool/requestUserInput".to_string()),
-        );
         assert_eq!(
             terminal_codex_gateway_claim(
                 &pending,
                 &request_key,
-                TerminalCodexGatewayWinner::NativeTui,
-            ),
-            None,
+                &response,
+                TerminalCodexGatewayWinner::Web,
+            )
+            .map(|request| request.method),
+            Some("item/tool/requestUserInput".to_string()),
         );
+        assert!(terminal_codex_gateway_claim(
+            &pending,
+            &request_key,
+            &response,
+            TerminalCodexGatewayWinner::NativeTui,
+        )
+        .is_none());
     }
 
     #[test]
     fn codex_recovery_buffered_permission_reenters_normal_registration_pipeline() {
-        let pending = Arc::new(StdMutex::new(HashMap::new()));
+        let pending = Arc::new(StdMutex::new(TerminalCodexGatewayPendingRequests::default()));
         let buffered = [json!({
             "id": "restored-approval-1",
             "method": "item/permissions/requestApproval",
@@ -27208,13 +28260,274 @@ mod terminal_tests {
             assert_eq!(event["pane_id"], json!("pane-recovered"));
         }
         let pending = pending.lock().unwrap();
-        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.by_request_id.len(), 1);
         assert_eq!(
             pending
+                .by_request_id
                 .get("string:restored-approval-1")
+                .and_then(|requests| requests.front())
                 .map(|request| request.method.as_str()),
             Some("item/permissions/requestApproval")
         );
+    }
+
+    #[test]
+    fn codex_app_server_reused_request_id_matches_out_of_order_resolution_generation() {
+        let pending = Arc::new(StdMutex::new(TerminalCodexGatewayPendingRequests::default()));
+        let first = json!({
+            "id": 1,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "thread-1", "command": "first"}
+        });
+        let second = json!({
+            "id": 1,
+            "method": "item/permissions/requestApproval",
+            "params": {"threadId": "thread-1", "permissions": {"network": {"enabled": true}}}
+        });
+        let first_event =
+            terminal_codex_gateway_register_server_request(&pending, "pane-1", 7, &first)
+                .expect("first request registration");
+        let second_event =
+            terminal_codex_gateway_register_server_request(&pending, "pane-1", 7, &second)
+                .expect("second request registration");
+        assert_ne!(
+            first_event["interaction_revision"],
+            second_event["interaction_revision"],
+        );
+
+        let second_resolved = terminal_codex_gateway_take_resolved(
+            &pending,
+            "number:1",
+            &json!({
+                "params": {
+                    "requestId": 1,
+                    "result": {"permissions": {}, "scope": "turn"}
+                }
+            }),
+        )
+        .expect("the response shape must select the matching later generation");
+        let second_resolution = terminal_codex_gateway_resolution_event(
+            "pane-1",
+            7,
+            &second_resolved,
+            "codex_app_server_resolved",
+        );
+        assert_eq!(
+            second_resolution["resolved_interaction_id"],
+            second_event["interaction_id"],
+        );
+        assert_eq!(
+            second_resolution["resolved_interaction_revision"],
+            second_event["interaction_revision"],
+        );
+        assert!(
+            terminal_codex_gateway_take_resolved(
+                &pending,
+                "number:1",
+                &json!({"params": {
+                    "requestId": 1,
+                    "resolvedInteractionId": second_event["interaction_id"],
+                    "resolvedInteractionRevision": second_event["interaction_revision"]
+                }}),
+            )
+            .is_none(),
+            "a stale explicitly correlated duplicate must not fall back to the sole generation",
+        );
+
+        let remaining = pending.lock().unwrap();
+        let first_pending = remaining
+            .by_request_id
+            .get("number:1")
+            .and_then(|requests| requests.front())
+            .expect("the non-matching first generation must remain pending");
+        assert_eq!(
+            first_pending.interaction_revision,
+            first_event["interaction_revision"].as_u64().unwrap(),
+        );
+        assert!(!remaining.ambiguous_request_ids.contains("number:1"));
+    }
+
+    #[test]
+    fn codex_app_server_native_claim_cannot_skip_web_winner_on_reused_id() {
+        let request_key = "number:1".to_string();
+        let first = TerminalCodexGatewayPendingRequest {
+            request_id: json!(1),
+            method: "item/commandExecution/requestApproval".to_string(),
+            interaction_id: "uir:first".to_string(),
+            interaction_revision: 10,
+            winner: Some(TerminalCodexGatewayWinner::Web),
+        };
+        let second = TerminalCodexGatewayPendingRequest {
+            request_id: json!(1),
+            method: "item/commandExecution/requestApproval".to_string(),
+            interaction_id: "uir:second".to_string(),
+            interaction_revision: 11,
+            winner: None,
+        };
+        let pending = Arc::new(StdMutex::new(TerminalCodexGatewayPendingRequests {
+            by_request_id: HashMap::from([(request_key.clone(), VecDeque::from([first, second]))]),
+            ambiguous_request_ids: HashSet::from([request_key.clone()]),
+        }));
+        let response = json!({"id": 1, "result": {"decision": "approved"}});
+
+        assert!(terminal_codex_gateway_claim(
+            &pending,
+            &request_key,
+            &response,
+            TerminalCodexGatewayWinner::NativeTui,
+        )
+        .is_none());
+        assert_eq!(
+            pending
+                .lock()
+                .unwrap()
+                .by_request_id
+                .get(&request_key)
+                .and_then(|requests| requests.get(1))
+                .and_then(|request| request.winner),
+            None,
+        );
+        assert!(
+            terminal_codex_gateway_take_resolved(
+                &pending,
+                &request_key,
+                &json!({"params": {"requestId": 1}}),
+            )
+            .is_none(),
+            "an uncorrelated reused-id notification must fail closed"
+        );
+
+        let resolved = terminal_codex_gateway_take_resolved(
+            &pending,
+            &request_key,
+            &json!({"params": {
+                "requestId": 1,
+                "resolvedInteractionId": "uir:first",
+                "resolvedInteractionRevision": 10
+            }}),
+        )
+        .expect("an explicit correlation may resolve the web-won generation");
+        assert_eq!(resolved.interaction_id, "uir:first");
+        assert!(!pending
+            .lock()
+            .unwrap()
+            .ambiguous_request_ids
+            .contains(&request_key));
+        assert_eq!(
+            terminal_codex_gateway_claim(
+                &pending,
+                &request_key,
+                &response,
+                TerminalCodexGatewayWinner::NativeTui,
+            )
+            .map(|request| request.interaction_id),
+            Some("uir:second".to_string()),
+        );
+    }
+
+    #[test]
+    fn codex_app_server_pending_reused_id_queue_is_bounded() {
+        let pending = Arc::new(StdMutex::new(TerminalCodexGatewayPendingRequests::default()));
+        for generation in 0..TERMINAL_CODEX_GATEWAY_PENDING_PER_REQUEST_ID_MAX {
+            let request = json!({
+                "id": 9,
+                "method": "item/commandExecution/requestApproval",
+                "params": {"threadId": "thread-1", "command": format!("command-{generation}")}
+            });
+            assert!(terminal_codex_gateway_register_server_request(
+                &pending, "pane-1", 7, &request,
+            )
+            .is_some());
+        }
+        let overflow = json!({
+            "id": 9,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "thread-1", "command": "overflow"}
+        });
+        assert!(
+            terminal_codex_gateway_register_server_request(&pending, "pane-1", 7, &overflow,)
+                .is_none()
+        );
+        assert_eq!(
+            pending
+                .lock()
+                .unwrap()
+                .by_request_id
+                .get("number:9")
+                .map(VecDeque::len),
+            Some(TERMINAL_CODEX_GATEWAY_PENDING_PER_REQUEST_ID_MAX),
+        );
+    }
+
+    #[test]
+    fn codex_app_server_pending_cleanup_removes_only_exact_generation() {
+        let request_key = "number:4".to_string();
+        let first = TerminalCodexGatewayPendingRequest {
+            request_id: json!(4),
+            method: "item/commandExecution/requestApproval".to_string(),
+            interaction_id: "uir:first".to_string(),
+            interaction_revision: 40,
+            winner: None,
+        };
+        let second = TerminalCodexGatewayPendingRequest {
+            request_id: json!(4),
+            method: "item/permissions/requestApproval".to_string(),
+            interaction_id: "uir:second".to_string(),
+            interaction_revision: 41,
+            winner: None,
+        };
+        let pending = Arc::new(StdMutex::new(TerminalCodexGatewayPendingRequests {
+            by_request_id: HashMap::from([(request_key.clone(), VecDeque::from([first, second]))]),
+            ambiguous_request_ids: HashSet::from([request_key.clone()]),
+        }));
+
+        assert!(terminal_codex_gateway_remove_generation(
+            &pending,
+            &request_key,
+            "uir:first",
+            40,
+        ));
+        let remaining = pending.lock().unwrap();
+        let queue = remaining
+            .by_request_id
+            .get(&request_key)
+            .expect("second generation remains");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].interaction_id, "uir:second");
+        assert!(!remaining.ambiguous_request_ids.contains(&request_key));
+        drop(remaining);
+
+        assert!(
+            terminal_codex_gateway_take_resolved(
+                &pending,
+                &request_key,
+                &json!({"params": {
+                    "requestId": 4,
+                    "resolvedInteractionId": "uir:first",
+                    "resolvedInteractionRevision": 40,
+                    "method": "item/permissions/requestApproval",
+                    "result": {"permissions": []}
+                }}),
+            )
+            .is_none(),
+            "a stale explicit duplicate for the removed generation cannot close the survivor",
+        );
+        assert_eq!(
+            terminal_codex_gateway_take_resolved(
+                &pending,
+                &request_key,
+                &json!({"method": "serverRequest/resolved", "params": {"requestId": 4}}),
+            )
+            .map(|request| request.interaction_id),
+            Some("uir:second".to_string()),
+            "the sole remaining generation is unambiguous for the metadata-free resolution",
+        );
+
+        let drained = terminal_codex_gateway_drain_pending(&pending);
+        assert!(drained.is_empty());
+        let empty = pending.lock().unwrap();
+        assert!(empty.by_request_id.is_empty());
+        assert!(empty.ambiguous_request_ids.is_empty());
     }
 
     #[test]
@@ -27477,6 +28790,289 @@ mod terminal_tests {
             ),
             "2\r"
         );
+
+        let interaction = TerminalStructuredInteraction {
+            interaction_id: "uir:hook-trust".to_string(),
+            revision: 7,
+            pane_id: "pane-1".to_string(),
+            instance_id: 1,
+            provider: "codex".to_string(),
+            provider_request_id: "codex-hook-trust-catalog-deadbeef".to_string(),
+            prompt_id: "codex-hook-trust-catalog-deadbeef".to_string(),
+            hook_event_name: "PermissionRequest".to_string(),
+            response_mode: "structured_pty".to_string(),
+            awaiting_provider_confirmation: false,
+            claimed_option_id: None,
+            options: Vec::new(),
+            permission_suggestions: None,
+            prompt_questions: None,
+            prompt_schema: None,
+            provider_payload: None,
+        };
+        assert_eq!(
+            terminal_structured_answer_local_option(&interaction, "2"),
+            Some("trust_all_and_continue".to_string()),
+            "the option byte must claim before a separately delivered Enter",
+        );
+        assert_eq!(
+            terminal_structured_answer_local_option(&interaction, "3\r"),
+            Some("continue_without_trusting".to_string()),
+        );
+        assert_eq!(
+            terminal_structured_answer_local_option(&interaction, "1\r"),
+            None,
+        );
+
+        let generic = TerminalStructuredInteraction {
+            provider: "other".to_string(),
+            provider_request_id: "request-1".to_string(),
+            options: vec![TerminalActivityHookPromptOption {
+                id: "allow_once".to_string(),
+                label: "Allow once".to_string(),
+                description: None,
+                value: None,
+                danger: None,
+            }],
+            ..interaction
+        };
+        assert_eq!(
+            terminal_structured_answer_local_option(&generic, "y"),
+            Some("allow_once".to_string()),
+            "all structured PTY menu choices claim on the option chunk",
+        );
+
+        let enter_only = TerminalStructuredInteraction {
+            options: vec![TerminalActivityHookPromptOption {
+                id: "continue".to_string(),
+                label: "Continue".to_string(),
+                description: None,
+                value: None,
+                danger: None,
+            }],
+            ..generic.clone()
+        };
+        assert_eq!(
+            terminal_structured_answer_local_option(&enter_only, "\r"),
+            Some("continue".to_string()),
+            "an Enter-only structured answer must be claimed",
+        );
+
+        let escape_cancel = TerminalStructuredInteraction {
+            options: vec![TerminalActivityHookPromptOption {
+                id: "cancel".to_string(),
+                label: "Cancel".to_string(),
+                description: None,
+                value: None,
+                danger: None,
+            }],
+            ..generic
+        };
+        assert!(terminal_structured_answer_bypasses_interrupt(
+            &escape_cancel,
+            "\x1b",
+        ));
+        assert_eq!(
+            terminal_structured_answer_local_option(&escape_cancel, "\x1b"),
+            Some("cancel".to_string()),
+            "a structured cancel Escape must reach the claim path",
+        );
+    }
+
+    #[test]
+    fn structured_pty_injection_requires_current_prompting_runtime() {
+        let mut runtime = TerminalRuntimeSnapshot::opened_idle(None);
+        runtime.status = "awaiting_input".to_string();
+        runtime.activity_status = "awaiting_input".to_string();
+        runtime.command_phase = "awaiting_input".to_string();
+        runtime.input_ready = false;
+        assert!(terminal_runtime_is_prompting_for_structured_interaction(
+            &runtime,
+        ));
+
+        runtime.status = "active".to_string();
+        runtime.activity_status = "running".to_string();
+        runtime.command_phase = "running".to_string();
+        assert!(!terminal_runtime_is_prompting_for_structured_interaction(
+            &runtime,
+        ));
+    }
+
+    #[test]
+    fn unrecognized_local_structured_answer_submission_arms_generic_confirmation() {
+        let interaction = TerminalStructuredInteraction {
+            interaction_id: "uir:free-text".to_string(),
+            revision: 9,
+            pane_id: "pane-1".to_string(),
+            instance_id: 1,
+            provider: "codex".to_string(),
+            provider_request_id: "request-free-text".to_string(),
+            prompt_id: "prompt-free-text".to_string(),
+            hook_event_name: "UserInputRequired".to_string(),
+            response_mode: "structured_pty".to_string(),
+            awaiting_provider_confirmation: false,
+            claimed_option_id: None,
+            options: vec![
+                TerminalActivityHookPromptOption {
+                    id: "approve".to_string(),
+                    label: "Approve".to_string(),
+                    description: None,
+                    value: Some("1".to_string()),
+                    danger: None,
+                },
+                TerminalActivityHookPromptOption {
+                    id: "continue".to_string(),
+                    label: "Continue".to_string(),
+                    description: None,
+                    value: None,
+                    danger: None,
+                },
+                TerminalActivityHookPromptOption {
+                    id: "reject".to_string(),
+                    label: "Reject".to_string(),
+                    description: None,
+                    value: Some("2".to_string()),
+                    danger: None,
+                },
+            ],
+            permission_suggestions: None,
+            prompt_questions: None,
+            prompt_schema: None,
+            provider_payload: None,
+        };
+        let answer = "custom answer\r";
+
+        assert_eq!(
+            terminal_structured_answer_local_option(&interaction, answer),
+            None,
+            "free text must not be mis-claimed as a catalog option",
+        );
+        assert!(terminal_structured_answer_local_submission(answer));
+        assert!(terminal_structured_answer_local_submission("\r"));
+        assert!(terminal_structured_answer_local_submission("\x1b[B"));
+        assert!(!terminal_structured_answer_local_submission(""));
+
+        let mut interactions =
+            HashMap::from([(interaction.interaction_id.clone(), interaction.clone())]);
+        assert!(terminal_structured_interaction_claim_answer_confirmation(
+            &mut interactions,
+            &interaction,
+            "",
+        ));
+        let armed = interactions
+            .get(&interaction.interaction_id)
+            .expect("open structured interaction remains tracked");
+        assert!(armed.awaiting_provider_confirmation);
+        assert_eq!(armed.claimed_option_id.as_deref(), Some(""));
+        assert!(terminal_structured_answer_confirmation_allows_continuation(
+            armed, "more text"
+        ));
+        assert_eq!(
+            terminal_structured_answer_local_option(armed, "\r"),
+            None,
+            "Enter after an arrow/free-text chunk must not mis-claim Continue",
+        );
+        assert!(terminal_structured_answer_confirmation_allows_continuation(
+            armed, "\r"
+        ));
+        assert_eq!(armed.claimed_option_id.as_deref(), Some(""));
+        assert!(terminal_structured_interaction_claim_answer_confirmation(
+            &mut interactions,
+            &interaction,
+            "approve",
+        ));
+        assert_eq!(
+            interactions
+                .get(&interaction.interaction_id)
+                .and_then(|current| current.claimed_option_id.as_deref()),
+            Some("approve"),
+            "a later recognized option upgrades the generic timer to the specific claim",
+        );
+        let specifically_claimed = interactions
+            .get(&interaction.interaction_id)
+            .expect("specific claim remains tracked");
+        assert!(terminal_structured_answer_confirmation_allows_continuation(
+            specifically_claimed,
+            "\r",
+        ));
+        assert!(!terminal_structured_answer_confirmation_allows_continuation(
+            specifically_claimed,
+            "2",
+        ));
+        assert!(!terminal_structured_interaction_claim_answer_confirmation(
+            &mut interactions,
+            &interaction,
+            "reject",
+        ));
+    }
+
+    #[test]
+    fn structured_pty_answer_generation_can_only_be_claimed_once() {
+        let interaction = TerminalStructuredInteraction {
+            interaction_id: "uir:hook-trust".to_string(),
+            revision: 7,
+            pane_id: "pane-1".to_string(),
+            instance_id: 1,
+            provider: "codex".to_string(),
+            provider_request_id: "codex-hook-trust-catalog-deadbeef".to_string(),
+            prompt_id: "codex-hook-trust-catalog-deadbeef".to_string(),
+            hook_event_name: "PermissionRequest".to_string(),
+            response_mode: "structured_pty".to_string(),
+            awaiting_provider_confirmation: false,
+            claimed_option_id: None,
+            options: Vec::new(),
+            permission_suggestions: None,
+            prompt_questions: None,
+            prompt_schema: None,
+            provider_payload: None,
+        };
+        let mut interactions =
+            HashMap::from([(interaction.interaction_id.clone(), interaction.clone())]);
+
+        assert!(terminal_structured_interaction_claim_answer_confirmation(
+            &mut interactions,
+            &interaction,
+            "trust_all_and_continue",
+        ));
+        assert!(!terminal_structured_interaction_claim_answer_confirmation(
+            &mut interactions,
+            &interaction,
+            "continue_without_trusting",
+        ));
+        let claimed = interactions
+            .get(&interaction.interaction_id)
+            .expect("claimed interaction");
+        assert!(terminal_structured_interaction_claim_matches_option(
+            claimed,
+            "trust_all_and_continue",
+        ));
+        assert!(!terminal_structured_interaction_claim_matches_option(
+            claimed,
+            "continue_without_trusting",
+        ));
+        assert!(
+            !terminal_structured_interaction_lifecycle_can_close(&interaction, false,),
+            "an unanswered structured PTY prompt survives passive lifecycle events"
+        );
+        let answered = interactions
+            .get(&interaction.interaction_id)
+            .expect("claimed generation")
+            .clone();
+        assert!(terminal_structured_interaction_expire_answer_confirmation(
+            &mut interactions,
+            &answered,
+        ));
+        assert!(
+            interactions.is_empty(),
+            "the confirmation timeout removes the answered generation"
+        );
+        let provider_api = TerminalStructuredInteraction {
+            response_mode: "provider_api".to_string(),
+            ..interaction
+        };
+        assert!(!terminal_structured_interaction_lifecycle_can_close(
+            &provider_api,
+            false,
+        ));
     }
 
     #[test]
@@ -28862,12 +30458,8 @@ notifications = true
             ),
         ];
 
-        apply_codex_resume_home_env(
-            &mut env_vars,
-            &source_home.to_string_lossy(),
-            session_id,
-        )
-        .unwrap();
+        apply_codex_resume_home_env(&mut env_vars, &source_home.to_string_lossy(), session_id)
+            .unwrap();
 
         for key in ["CODEX_HOME", "DIFFFORGE_CODEX_HOME"] {
             assert_eq!(
@@ -30879,6 +32471,8 @@ notifications = true
             prompt_id: "codex-question-1".to_string(),
             hook_event_name: "PreToolUse".to_string(),
             response_mode: "blocking_hook".to_string(),
+            awaiting_provider_confirmation: false,
+            claimed_option_id: None,
             options: Vec::new(),
             permission_suggestions: None,
             prompt_questions: None,
@@ -30975,6 +32569,8 @@ notifications = true
             prompt_id: "permission-denied-1".to_string(),
             hook_event_name: "PermissionDenied".to_string(),
             response_mode: "diffforge_intervention".to_string(),
+            awaiting_provider_confirmation: false,
+            claimed_option_id: None,
             options: Vec::new(),
             permission_suggestions: None,
             prompt_questions: None,
@@ -31007,6 +32603,8 @@ notifications = true
             prompt_id: "permission-1".to_string(),
             hook_event_name: "PermissionRequest".to_string(),
             response_mode: "blocking_hook".to_string(),
+            awaiting_provider_confirmation: false,
+            claimed_option_id: None,
             options: Vec::new(),
             permission_suggestions: Some(json!([
                 { "type": "addRules", "rules": ["Bash(git status)"] }
@@ -31048,6 +32646,8 @@ notifications = true
             prompt_id: "question-1".to_string(),
             hook_event_name: "PreToolUse".to_string(),
             response_mode: "blocking_hook".to_string(),
+            awaiting_provider_confirmation: false,
+            claimed_option_id: None,
             options: Vec::new(),
             permission_suggestions: None,
             prompt_questions: Some(json!([{"question": "Which framework?"}])),
@@ -31077,7 +32677,7 @@ notifications = true
     }
 
     #[test]
-    fn blocking_structured_interactions_survive_unrelated_lifecycle_events() {
+    fn blocking_transports_survive_passive_lifecycle_until_explicit_resolution() {
         let blocking = TerminalStructuredInteraction {
             interaction_id: "uir:question-1".to_string(),
             revision: 9,
@@ -31088,6 +32688,8 @@ notifications = true
             prompt_id: "question-1".to_string(),
             hook_event_name: "PreToolUse".to_string(),
             response_mode: "blocking_hook".to_string(),
+            awaiting_provider_confirmation: false,
+            claimed_option_id: None,
             options: Vec::new(),
             permission_suggestions: None,
             prompt_questions: None,
@@ -31100,7 +32702,7 @@ notifications = true
         assert!(terminal_structured_interaction_uses_blocking_transport(
             &blocking
         ));
-        assert!(!terminal_structured_interaction_uses_blocking_transport(
+        assert!(terminal_structured_interaction_uses_blocking_transport(
             &observed_only
         ));
         assert!(!terminal_structured_interaction_lifecycle_can_close(
@@ -31109,9 +32711,49 @@ notifications = true
         assert!(terminal_structured_interaction_lifecycle_can_close(
             &blocking, true
         ));
-        assert!(terminal_structured_interaction_lifecycle_can_close(
+        assert!(!terminal_structured_interaction_lifecycle_can_close(
             &observed_only,
             false
+        ));
+    }
+
+    #[test]
+    fn structured_resolution_requires_exact_interaction_revision() {
+        let interaction = TerminalStructuredInteraction {
+            interaction_id: "uir:permission-1".to_string(),
+            revision: 8,
+            pane_id: "pane-1".to_string(),
+            instance_id: 1,
+            provider: "opencode".to_string(),
+            provider_request_id: "permission-1".to_string(),
+            prompt_id: "permission-1".to_string(),
+            hook_event_name: "PermissionRequest".to_string(),
+            response_mode: "provider_api".to_string(),
+            awaiting_provider_confirmation: false,
+            claimed_option_id: None,
+            options: Vec::new(),
+            permission_suggestions: None,
+            prompt_questions: None,
+            prompt_schema: None,
+            provider_payload: None,
+        };
+        assert!(terminal_structured_interaction_matches_resolution(
+            &interaction,
+            Some("uir:permission-1"),
+            Some(8),
+            Some("permission-1"),
+        ));
+        assert!(!terminal_structured_interaction_matches_resolution(
+            &interaction,
+            Some("uir:permission-1"),
+            Some(7),
+            Some("permission-1"),
+        ));
+        assert!(!terminal_structured_interaction_matches_resolution(
+            &interaction,
+            Some("uir:permission-old"),
+            Some(8),
+            Some("permission-1"),
         ));
     }
 
@@ -31127,6 +32769,8 @@ notifications = true
             prompt_id: "plan-1".to_string(),
             hook_event_name: "PreToolUse".to_string(),
             response_mode: "blocking_hook".to_string(),
+            awaiting_provider_confirmation: false,
+            claimed_option_id: None,
             options: Vec::new(),
             permission_suggestions: None,
             prompt_questions: None,
@@ -31205,22 +32849,27 @@ notifications = true
             prompt_id: "permission-1".to_string(),
             hook_event_name: "PermissionRequest".to_string(),
             response_mode: "provider_api".to_string(),
+            awaiting_provider_confirmation: false,
+            claimed_option_id: None,
             options: Vec::new(),
             permission_suggestions: None,
             prompt_questions: None,
             prompt_schema: None,
             provider_payload: None,
         };
-        assert_eq!(
-            terminal_structured_interaction_hook_response(
-                &interaction,
-                "allow_always",
-                None,
-                None,
-                None,
-            ),
-            json!({"reply": "always"})
+        let response = terminal_structured_interaction_hook_response(
+            &interaction,
+            "allow_always",
+            None,
+            None,
+            None,
         );
+        assert_eq!(response["reply"], json!("always"));
+        assert_eq!(
+            response["_diffforge_interaction_id"],
+            json!("uir:permission-1")
+        );
+        assert_eq!(response["_diffforge_interaction_revision"], json!(10));
     }
 
     #[test]
@@ -31385,7 +33034,8 @@ notifications = true
 \u{1b}[49;3H\u{1b}[38;2;246;226;183;49mgpt-5.5 xhigh\u{1b}[39;49m · \
 \u{1b}[38;2;171;223;167;49m~/Documents/CODING/testforge\u{1b}[39m";
 
-        let compact = terminal_activity_compact_text(&terminal_activity_strip_terminal_sequences(tui));
+        let compact =
+            terminal_activity_compact_text(&terminal_activity_strip_terminal_sequences(tui));
         assert!(
             terminal_output_latest_working_indicator_index(&compact).is_some(),
             "compact={compact:?}"
@@ -31600,23 +33250,11 @@ notifications = true
         );
         assert_eq!(
             terminal_activity_hook_lifecycle_kind("McpStartupError"),
-            Some((
-                "provider-startup-error",
-                "error",
-                "error",
-                "failed",
-                false
-            ))
+            Some(("provider-startup-error", "error", "error", "failed", false))
         );
         assert_eq!(
             terminal_activity_hook_lifecycle_kind("PromptReadyAfterInterrupt"),
-            Some((
-                "terminal-input-ready",
-                "idle",
-                "active",
-                "ready",
-                true
-            ))
+            Some(("terminal-input-ready", "idle", "active", "ready", true))
         );
         assert_eq!(
             terminal_activity_hook_activity_kind("PermissionRequest", &json!({})),
@@ -32162,9 +33800,8 @@ notifications = true
         let app_control_config = args
             .windows(2)
             .find_map(|pair| {
-                (pair[0] == "-c"
-                    && pair[1].starts_with("mcp_servers.diffforge-app-control="))
-                .then_some(pair[1].as_str())
+                (pair[0] == "-c" && pair[1].starts_with("mcp_servers.diffforge-app-control="))
+                    .then_some(pair[1].as_str())
             })
             .expect("trusted app-control MCP launch override");
         assert!(app_control_config.contains("enabled=true"));
@@ -32174,9 +33811,7 @@ notifications = true
         assert!(app_control_config.contains("default_tools_approval_mode=\"prompt\""));
         for tool in APP_CONTROL_MCP_TOOL_NAMES {
             assert!(
-                app_control_config.contains(&format!(
-                    "{tool}={{approval_mode=\"approve\"}}"
-                )),
+                app_control_config.contains(&format!("{tool}={{approval_mode=\"approve\"}}")),
                 "missing trusted approval for app-control tool {tool}"
             );
         }
@@ -32196,16 +33831,15 @@ notifications = true
         assert!(!args
             .iter()
             .any(|arg| arg.starts_with("mcp_servers.workspace-mcp-gateway.")));
-        let process_args =
-            terminal_codex_app_server_process_args("ws://127.0.0.1:43124", &args);
+        let process_args = terminal_codex_app_server_process_args("ws://127.0.0.1:43124", &args);
         assert_eq!(process_args.first().map(String::as_str), Some("app-server"));
-        assert!(process_args.windows(2).any(|pair| {
-            pair[0] == "--listen" && pair[1] == "ws://127.0.0.1:43124"
-        }));
         assert!(process_args
-            .iter()
-            .any(|arg| arg == app_control_config));
-        let windows_cmd_units = "C:\\Program Files\\nodejs\\codex.cmd".encode_utf16().count()
+            .windows(2)
+            .any(|pair| { pair[0] == "--listen" && pair[1] == "ws://127.0.0.1:43124" }));
+        assert!(process_args.iter().any(|arg| arg == app_control_config));
+        let windows_cmd_units = "C:\\Program Files\\nodejs\\codex.cmd"
+            .encode_utf16()
+            .count()
             + process_args
                 .iter()
                 .map(|arg| arg.encode_utf16().count().saturating_add(3))
@@ -32233,10 +33867,8 @@ notifications = true
             batch_len >= WINDOWS_CLAUDE_LAUNCH_STAGE_THRESHOLD,
             "fixture must exercise the cmd.exe overflow path: {batch_len}"
         );
-        let mut native_args = vec![
-            r"C:\Program Files\nodejs\node_modules\@openai\codex\bin\codex.js"
-                .to_string(),
-        ];
+        let mut native_args =
+            vec![r"C:\Program Files\nodejs\node_modules\@openai\codex\bin\codex.js".to_string()];
         native_args.extend(unmanaged_process_args);
         let native_len = windows_agent_launch_command_line_len(
             r"C:\Program Files\nodejs\node.exe",
@@ -32332,10 +33964,7 @@ notifications = true
                 false,
             );
             assert!(args.iter().any(|arg| {
-                arg == &format!(
-                    "approval_policy={}",
-                    terminal_toml_string(approval_policy)
-                )
+                arg == &format!("approval_policy={}", terminal_toml_string(approval_policy))
             }));
             assert!(args.iter().any(|arg| {
                 arg == &format!("sandbox_mode={}", terminal_toml_string(sandbox_mode))
@@ -32446,11 +34075,7 @@ notifications = true
                 }]
             }
         });
-        fs::write(
-            &hooks_path,
-            serde_json::to_vec_pretty(&hooks_json).unwrap(),
-        )
-        .unwrap();
+        fs::write(&hooks_path, serde_json::to_vec_pretty(&hooks_json).unwrap()).unwrap();
 
         let records = codex_managed_activity_hook_trust_records(&hooks_path, &hooks_json).unwrap();
         assert_eq!(records.len(), 1);
@@ -32634,9 +34259,7 @@ notifications = true
         for config_path in [&base_config_path, &profile_path] {
             let mut config: toml::Value =
                 toml::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
-            let entry = config["hooks"]["state"][stale_key]
-                .as_table_mut()
-                .unwrap();
+            let entry = config["hooks"]["state"][stale_key].as_table_mut().unwrap();
             entry.insert(
                 "trusted_hash".to_string(),
                 toml::Value::String("sha256:stale".to_string()),
@@ -32656,9 +34279,7 @@ notifications = true
         for config_path in [&base_config_path, &profile_path] {
             let config: toml::Value =
                 toml::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
-            let entry = config["hooks"]["state"][stale_key]
-                .as_table()
-                .unwrap();
+            let entry = config["hooks"]["state"][stale_key].as_table().unwrap();
             assert_eq!(
                 entry.get("trusted_hash").and_then(toml::Value::as_str),
                 Some(records[0].1.as_str())
