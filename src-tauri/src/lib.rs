@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     env, fs,
-    io::{BufRead, Read, SeekFrom, Write},
+    io::{BufRead, Read, Seek, SeekFrom, Write},
     net::ToSocketAddrs,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
@@ -164,6 +164,11 @@ const PROD_BUNDLE_IDENTIFIER: &str = "ai.diffforge.desktop";
 const DEV_BUNDLE_IDENTIFIER: &str = "ai.diffforge.desktop.dev";
 const DEVICE_APP_STATE_DIR: &str = "app-state";
 const DEVICE_WORKSPACE_CATALOG_DIR: &str = "workspace-catalog";
+const TERMINAL_PROCESS_EPOCH_COUNTER_FILE: &str = "terminal-process-epoch-counter.log";
+// Keep the leading order token above every plausible legacy millisecond
+// epoch while remaining exactly representable by JavaScript Number.
+const TERMINAL_PROCESS_EPOCH_SEQUENCE_BASE: u64 = 4_000_000_000_000_000;
+const TERMINAL_PROCESS_EPOCH_MAX_SAFE_SEQUENCE: u64 = 9_007_199_254_740_991;
 const DEVICE_DATA_MIGRATION_LOCK_STALE_SECS: u64 = 30 * 60;
 const LOCAL_WORKSPACE_TOMBSTONE_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 const WORKSPACE_PROJECT_MOUNT_CACHE_TTL_MS: u64 = 60_000;
@@ -613,6 +618,7 @@ struct TerminalState {
     pty_pool: Arc<PtyPool>,
     cleanup_tracker: Arc<TerminalCleanupTracker>,
     workspace_topology_cache: Arc<RwLock<HashMap<String, TerminalWorkspaceTopologySnapshot>>>,
+    terminal_process_epoch: String,
     next_terminal_instance_id: AtomicU64,
     next_terminal_input_queue_id: AtomicU64,
     next_terminal_output_subscriber_id: AtomicU64,
@@ -697,6 +703,26 @@ struct TerminalStructuredInteraction {
     prompt_questions: Option<Value>,
     prompt_schema: Option<Value>,
     provider_payload: Option<Value>,
+    prompt_metadata: TerminalStructuredInteractionPromptMetadata,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TerminalStructuredInteractionPromptMetadata {
+    approval_id: Option<String>,
+    permission_prompt_id: Option<String>,
+    permission_request_id: Option<String>,
+    permission_mode: Option<String>,
+    prompt_kind: Option<String>,
+    prompt_default_option: Option<String>,
+    prompt_ttl_ms: Option<u64>,
+    prompt_url: Option<String>,
+    allows_free_text: bool,
+    manual_prompt_source: Option<String>,
+    manual_approval_required: bool,
+    prompting_user_kind: Option<String>,
+    prompting_user_source: Option<String>,
+    prompting_user_confidence: Option<String>,
+    prompting_user_text: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1078,6 +1104,17 @@ struct ForgeDictationWarmSlot {
 
 #[derive(Clone)]
 struct TerminalRuntimeSnapshot {
+    terminal_state_contract_version: u8,
+    canonical_state: String,
+    canonical_badge_label: String,
+    canonical_state_seq: u64,
+    prompt_state_seq: u64,
+    turn_generation: u64,
+    completed_turn_generation: u64,
+    turn_active: bool,
+    active_interaction_id: Option<String>,
+    active_interaction_revision: Option<u64>,
+    interaction_actionable: bool,
     status: String,
     activity_status: String,
     command_phase: String,
@@ -1124,7 +1161,26 @@ impl TerminalRuntimeSnapshot {
             .unwrap_or(0);
         let now = crate::coordination::kernel::now_rfc3339();
         let native_session_id = provider_session_id.clone();
+        let canonical_state = if activity_status == "starting" || status == "starting" {
+            "starting"
+        } else {
+            "idle"
+        };
         Self {
+            terminal_state_contract_version: 1,
+            canonical_state: canonical_state.to_string(),
+            canonical_badge_label: canonical_state.to_string(),
+            // Canonical lifecycle ordering is per terminal instance. Wall-clock
+            // time belongs in `updated_at_ms`; using it here lets a later open
+            // snapshot outrank a real runtime transition.
+            canonical_state_seq: 1,
+            prompt_state_seq: 0,
+            turn_generation: 0,
+            completed_turn_generation: 0,
+            turn_active: false,
+            active_interaction_id: None,
+            active_interaction_revision: None,
+            interaction_actionable: false,
             status: status.to_string(),
             activity_status: activity_status.to_string(),
             command_phase: command_phase.to_string(),
@@ -1376,6 +1432,7 @@ struct TerminalInstanceMetadata {
     agent_kind: String,
     terminal_name: String,
     terminal_nickname: String,
+    terminal_process_epoch: String,
 }
 
 impl Default for TerminalInstanceMetadata {
@@ -1390,6 +1447,7 @@ impl Default for TerminalInstanceMetadata {
             agent_kind: String::new(),
             terminal_name: String::new(),
             terminal_nickname: String::new(),
+            terminal_process_epoch: String::new(),
         }
     }
 }
@@ -1401,6 +1459,7 @@ struct TerminalCloudMcpCloseContext {
     coordination: Option<TerminalCoordinationSession>,
     session_mode: TerminalSessionMode,
     metadata: TerminalInstanceMetadata,
+    runtime: TerminalRuntimeSnapshot,
 }
 
 impl TerminalCloudMcpCloseContext {
@@ -1411,6 +1470,7 @@ impl TerminalCloudMcpCloseContext {
             coordination: instance.coordination.clone(),
             session_mode: instance.session_mode,
             metadata: instance.metadata.clone(),
+            runtime: terminal_runtime_snapshot(instance),
         }
     }
 }
@@ -2238,6 +2298,7 @@ struct TerminalActivityHookPromptOption {
 struct TerminalActivityHookPayload {
     pane_id: String,
     instance_id: u64,
+    terminal_process_epoch: String,
     workspace_id: String,
     workspace_name: String,
     terminal_index: Option<u16>,
@@ -2250,6 +2311,20 @@ struct TerminalActivityHookPayload {
     terminal_name: String,
     terminal_nickname: String,
     provider: String,
+    terminal_state_contract_version: u8,
+    canonical_state: String,
+    canonical_badge_label: String,
+    canonical_state_seq: u64,
+    prompt_state_seq: u64,
+    turn_generation: u64,
+    #[serde(skip_serializing)]
+    turn_generation_explicit: bool,
+    completed_turn_generation: u64,
+    turn_active: bool,
+    active_interaction_id: Option<String>,
+    active_interaction_revision: Option<u64>,
+    interaction_actionable: bool,
+    turn_settlement_accepted: bool,
     event_type: String,
     hook_event_name: String,
     source: String,
@@ -2311,6 +2386,10 @@ struct TerminalActivityHookPayload {
     prompt_answer_option: Option<String>,
     interaction_id: Option<String>,
     interaction_revision: Option<u64>,
+    #[serde(skip_serializing)]
+    event_interaction_id: Option<String>,
+    #[serde(skip_serializing)]
+    event_interaction_revision: Option<u64>,
     interaction_source: Option<String>,
     interaction_response_mode: Option<String>,
     provider_request_id: Option<String>,
@@ -4787,6 +4866,17 @@ async fn workspace_activation_workspace_snapshot(
             todo_dispatch_core_terminal_ready_for_submit(&runtime, &projected, is_parked)
                 == Some(true);
         terminals.push(json!({
+            "terminal_state_contract_version": runtime.terminal_state_contract_version,
+            "canonical_state": runtime.canonical_state.clone(),
+            "canonical_badge_label": runtime.canonical_badge_label.clone(),
+            "canonical_state_seq": runtime.canonical_state_seq,
+            "prompt_state_seq": runtime.prompt_state_seq,
+            "turn_active": runtime.turn_active,
+            "turn_generation": runtime.turn_generation,
+            "completed_turn_generation": runtime.completed_turn_generation,
+            "active_interaction_id": runtime.active_interaction_id.clone(),
+            "active_interaction_revision": runtime.active_interaction_revision,
+            "interaction_actionable": runtime.interaction_actionable,
             "activity_status": runtime.activity_status.clone(),
             "agent_id": metadata.agent_id.clone(),
             "agent_kind": metadata.agent_kind.clone(),
@@ -4811,6 +4901,7 @@ async fn workspace_activation_workspace_snapshot(
             "terminal_id": pane_id.clone(),
             "terminal_index": metadata.terminal_index,
             "terminal_instance_id": instance.id,
+            "terminal_process_epoch": metadata.terminal_process_epoch.clone(),
             "terminal_name": projected.terminal_name.clone(),
             "terminal_nickname": projected.terminal_nickname.clone(),
             "terminal_status": projected.terminal_status.clone(),
@@ -9467,6 +9558,169 @@ fn daemon_spawn_signal_handler(app: AppHandle) {
     });
 }
 
+fn terminal_process_epoch_lock_file(file: &fs::File) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(format!(
+                "Unable to lock the terminal process epoch counter: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        if unsafe {
+            LockFileEx(
+                file.as_raw_handle(),
+                LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        } == 0
+        {
+            return Err(format!(
+                "Unable to lock the terminal process epoch counter: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        return Err(
+            "Terminal process epoch persistence is unsupported on this platform.".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn terminal_process_epoch_allocate_at(
+    counter_path: &Path,
+    timestamp_ms: u64,
+    unique_suffix: &str,
+) -> Result<String, String> {
+    let parent = counter_path
+        .parent()
+        .ok_or_else(|| "Unable to resolve the terminal process epoch directory.".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "Unable to create the terminal process epoch directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(counter_path)
+        .map_err(|error| {
+            format!(
+                "Unable to open terminal process epoch counter {}: {error}",
+                counter_path.display()
+            )
+        })?;
+    terminal_process_epoch_lock_file(&file)?;
+
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        format!(
+            "Unable to seek terminal process epoch counter {}: {error}",
+            counter_path.display()
+        )
+    })?;
+    let mut persisted = String::new();
+    file.read_to_string(&mut persisted).map_err(|error| {
+        format!(
+            "Unable to read terminal process epoch counter {}: {error}",
+            counter_path.display()
+        )
+    })?;
+    let previous_counter = persisted
+        .lines()
+        .filter_map(|line| line.trim().parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    let counter = previous_counter
+        .checked_add(1)
+        .ok_or_else(|| "Terminal process epoch counter is exhausted.".to_string())?;
+    let sequence = TERMINAL_PROCESS_EPOCH_SEQUENCE_BASE
+        .checked_add(counter)
+        .filter(|sequence| *sequence <= TERMINAL_PROCESS_EPOCH_MAX_SAFE_SEQUENCE)
+        .ok_or_else(|| "Terminal process epoch sequence is exhausted.".to_string())?;
+    writeln!(file, "{counter}").map_err(|error| {
+        format!(
+            "Unable to append terminal process epoch counter {}: {error}",
+            counter_path.display()
+        )
+    })?;
+    file.flush().map_err(|error| {
+        format!(
+            "Unable to flush terminal process epoch counter {}: {error}",
+            counter_path.display()
+        )
+    })?;
+    file.sync_all().map_err(|error| {
+        format!(
+            "Unable to persist terminal process epoch counter {}: {error}",
+            counter_path.display()
+        )
+    })?;
+
+    Ok(format!(
+        "{sequence:020}-{timestamp_ms:020}-{unique_suffix}"
+    ))
+}
+
+fn terminal_process_epoch_allocate() -> Result<String, String> {
+    let root = cloud_mcp_native_data_root()
+        .ok_or_else(|| "Unable to resolve the Diff Forge device data directory.".to_string())?;
+    terminal_process_epoch_allocate_at(
+        &root
+            .join(DEVICE_APP_STATE_DIR)
+            .join(TERMINAL_PROCESS_EPOCH_COUNTER_FILE),
+        current_time_ms(),
+        &uuid::Uuid::new_v4().to_string(),
+    )
+}
+
+#[cfg(test)]
+mod terminal_process_epoch_tests {
+    use super::*;
+
+    #[test]
+    fn persistent_counter_orders_clock_rollback_and_same_millisecond_antisymmetrically() {
+        let root = env::temp_dir().join(format!(
+            "diffforge-terminal-process-epoch-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let counter_path = root.join(TERMINAL_PROCESS_EPOCH_COUNTER_FILE);
+
+        let first = terminal_process_epoch_allocate_at(&counter_path, 200, "process-a").unwrap();
+        let rollback =
+            terminal_process_epoch_allocate_at(&counter_path, 100, "process-b").unwrap();
+        let same_millisecond =
+            terminal_process_epoch_allocate_at(&counter_path, 100, "process-c").unwrap();
+
+        assert!(rollback > first, "persistent counter must beat a clock rollback");
+        assert!(
+            same_millisecond > rollback,
+            "same-millisecond processes must have a strict total order"
+        );
+        assert!(first.contains("-00000000000000000200-process-a"));
+        assert!(rollback.contains("-00000000000000000100-process-b"));
+        assert_eq!(fs::read_to_string(&counter_path).unwrap(), "1\n2\n3\n");
+
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
 pub fn run() {
     run_app(false)
 }
@@ -9500,6 +9754,13 @@ fn run_app(daemon: bool) {
     };
     let mut builder = tauri::Builder::default();
     let pty_pool = Arc::new(PtyPool::new());
+    let terminal_process_epoch = match terminal_process_epoch_allocate() {
+        Ok(epoch) => epoch,
+        Err(error) => {
+            eprintln!("Unable to allocate terminal process epoch: {error}");
+            std::process::exit(1);
+        }
+    };
     log_terminal_crash_forensics_event(
         "backend.process_start",
         json!({
@@ -9574,6 +9835,7 @@ fn run_app(daemon: bool) {
             pty_pool: Arc::clone(&pty_pool),
             cleanup_tracker: Arc::new(TerminalCleanupTracker::new()),
             workspace_topology_cache: Arc::new(RwLock::new(HashMap::new())),
+            terminal_process_epoch,
             next_terminal_instance_id: AtomicU64::new(1),
             next_terminal_input_queue_id: AtomicU64::new(1),
             next_terminal_output_subscriber_id: AtomicU64::new(1),

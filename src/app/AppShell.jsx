@@ -130,6 +130,10 @@ import {
   terminalActivityStatusIsPaused,
   terminalActivityStatusIsSendable,
   terminalAgentUsesActivityHooks,
+  terminalCanonicalCohortForInstance,
+  terminalCanonicalEventIsStale,
+  terminalCanonicalStateFromFields,
+  terminalLifecycleSettlementSideEffectsAllowed,
   terminalExecutionPhaseFromState,
   workspaceTerminalStatusFromActivityStatus,
   terminalRailStateFromExecutionPhase,
@@ -18126,12 +18130,13 @@ function normalizeTerminalLiveSessionsPayload(payload) {
           : null;
         const activeTask = normalizeAppCloseLiveTask(session.active_task);
         const parkedPrompt = normalizeAppCloseParkedPrompt(session.parked_prompt);
+        const canonicalState = terminalCanonicalStateFromFields(session);
         const nativeRailState = normalizeTerminalNativeRailState(
-          session.native_rail_state || session.activity_status,
+          canonicalState || session.native_rail_state || session.activity_status,
           "",
         );
         const terminalStatus = normalizeTerminalNativeRailState(
-          session.terminal_status || session.status,
+          canonicalState || session.terminal_status || session.status,
           nativeRailState || "idle",
         );
         const readiness = normalizeTerminalNativeRailState(
@@ -18184,6 +18189,17 @@ function normalizeTerminalLiveSessionsPayload(payload) {
           session.display_name,
         );
         return {
+          terminal_state_contract_version: session.terminal_state_contract_version,
+          canonical_state: canonicalState,
+          canonical_badge_label: session.canonical_badge_label,
+          canonical_state_seq: session.canonical_state_seq,
+          prompt_state_seq: session.prompt_state_seq,
+          turn_active: session.turn_active,
+          turn_generation: session.turn_generation,
+          completed_turn_generation: session.completed_turn_generation,
+          active_interaction_id: session.active_interaction_id,
+          active_interaction_revision: session.active_interaction_revision,
+          interaction_actionable: session.interaction_actionable,
           active_task: activeTask,
           agent_id: cleanAppCloseText(session.agent_id),
           agent_kind: cleanAppCloseText(session.agent_kind),
@@ -18198,7 +18214,7 @@ function normalizeTerminalLiveSessionsPayload(payload) {
           instance_id: instanceId,
           input_ready: session.input_ready === true,
           native_rail_label: cleanAppCloseText(
-            session.native_rail_label,
+            canonicalState ? session.canonical_badge_label : session.native_rail_label,
             formatTerminalNativeRailLabel(nativeRailState || terminalStatus),
           ),
           native_rail_state: nativeRailState || terminalStatus,
@@ -18348,14 +18364,16 @@ function buildRustTerminalAuthorityWorkspaces({
     );
     const colorSlot = getTerminalAgentColorSlot(terminalIndex);
     const color = TERMINAL_AGENT_COLOR_HEX_BY_SLOT[Number(colorSlot)] || "";
-    const terminalStatus = normalizeTerminalNativeRailState(session.terminal_status || session.status, "idle");
+    const canonicalState = terminalCanonicalStateFromFields(session);
+    const terminalStatus = canonicalState
+      || normalizeTerminalNativeRailState(session.terminal_status || session.status, "idle");
     const nativeRailState = normalizeTerminalNativeRailState(
-      session.native_rail_state,
+      canonicalState || session.native_rail_state,
       terminalRailStateFromActivityStatus(session.activity_status || terminalStatus, terminalStatus),
     );
     const nativeRailFields = getTerminalNativeRailStateFields(
       nativeRailState,
-      session.native_rail_label || "",
+      canonicalState ? session.canonical_badge_label : session.native_rail_label || "",
     );
     const readiness = normalizeTerminalNativeRailState(
       session.readiness,
@@ -18380,6 +18398,17 @@ function buildRustTerminalAuthorityWorkspaces({
       session.provider_session_id || session.native_session_id || session.session_id || "",
     ).trim();
     workspaceGroup.terminals.push({
+      terminal_state_contract_version: session.terminal_state_contract_version,
+      canonical_state: canonicalState || undefined,
+      canonical_badge_label: canonicalState ? session.canonical_badge_label : undefined,
+      canonical_state_seq: session.canonical_state_seq,
+      prompt_state_seq: session.prompt_state_seq,
+      turn_active: session.turn_active,
+      turn_generation: session.turn_generation,
+      completed_turn_generation: session.completed_turn_generation,
+      active_interaction_id: session.active_interaction_id,
+      active_interaction_revision: session.active_interaction_revision,
+      interaction_actionable: session.interaction_actionable,
       agent_id: agentId,
       agent_kind: agentId,
       agent_label: agentId === WORKSPACE_TERMINAL_ROLE_GENERIC ? "Terminal" : getManagedAgentLabel(agentId),
@@ -18391,9 +18420,13 @@ function buildRustTerminalAuthorityWorkspaces({
       command_phase: session.command_phase || "",
       commandable: workspaceRuntimeCommandable,
       connected: workspaceRuntimeCommandable,
-      display_status: nativeRailFields.native_rail_label,
+      display_status: canonicalState ? session.canonical_badge_label : nativeRailFields.native_rail_label,
       execution_phase: executionPhase,
-      input_ready: session.input_ready === true || readiness === "ready",
+      input_ready: canonicalState
+        ? canonicalState === "idle"
+          && session.turn_active === false
+          && Number(session.completed_turn_generation || 0) === Number(session.turn_generation || 0)
+        : session.input_ready === true || readiness === "ready",
       last_known_runtime: false,
       ...nativeRailFields,
       native_connected: workspaceRuntimeCommandable,
@@ -18527,14 +18560,16 @@ function buildRustTerminalAuthorityTerminalOrchestrators(payload) {
       ).trim();
       const terminalInstanceId = session.terminal_instance_id || session.instance_id || "";
       const agentId = normalizeWorkspaceLiveTerminalAgentId(session.agent_id || session.agent_kind) || WORKSPACE_TERMINAL_ROLE_GENERIC;
-      const terminalStatus = normalizeTerminalNativeRailState(session.terminal_status || session.status, "idle");
+      const canonicalState = terminalCanonicalStateFromFields(session);
+      const terminalStatus = canonicalState
+        || normalizeTerminalNativeRailState(session.terminal_status || session.status, "idle");
       const nativeRailState = normalizeTerminalNativeRailState(
-        session.native_rail_state,
+        canonicalState || session.native_rail_state,
         terminalRailStateFromActivityStatus(session.activity_status || terminalStatus, terminalStatus),
       );
       const nativeRailFields = getTerminalNativeRailStateFields(
         nativeRailState,
-        session.native_rail_label || "",
+        canonicalState ? session.canonical_badge_label : session.native_rail_label || "",
       );
       const readiness = normalizeTerminalNativeRailState(
         session.readiness,
@@ -18548,6 +18583,17 @@ function buildRustTerminalAuthorityTerminalOrchestrators(payload) {
         session.thread_id || session.target_thread_id || "",
       ).trim();
       return {
+        terminal_state_contract_version: session.terminal_state_contract_version,
+        canonical_state: canonicalState || undefined,
+        canonical_badge_label: canonicalState ? session.canonical_badge_label : undefined,
+        canonical_state_seq: session.canonical_state_seq,
+        prompt_state_seq: session.prompt_state_seq,
+        turn_active: session.turn_active,
+        turn_generation: session.turn_generation,
+        completed_turn_generation: session.completed_turn_generation,
+        active_interaction_id: session.active_interaction_id,
+        active_interaction_revision: session.active_interaction_revision,
+        interaction_actionable: session.interaction_actionable,
         agent_id: agentId,
         agent_kind: agentId,
         agent_label: agentId === WORKSPACE_TERMINAL_ROLE_GENERIC ? "Terminal" : getManagedAgentLabel(agentId),
@@ -18556,10 +18602,14 @@ function buildRustTerminalAuthorityTerminalOrchestrators(payload) {
         commandable: true,
         connected: true,
         display_name: displayName,
-        display_status: nativeRailFields.native_rail_label,
+        display_status: canonicalState ? session.canonical_badge_label : nativeRailFields.native_rail_label,
         execution_phase: session.execution_phase || "",
         index: safeIndex,
-        input_ready: session.input_ready === true || readiness === "ready",
+        input_ready: canonicalState
+          ? canonicalState === "idle"
+            && session.turn_active === false
+            && Number(session.completed_turn_generation || 0) === Number(session.turn_generation || 0)
+          : session.input_ready === true || readiness === "ready",
         native_connected: true,
         ...nativeRailFields,
         pane_id: paneId,
@@ -24549,7 +24599,7 @@ export default function App() {
     const workspaceId = String(event.workspace_id || "").trim();
     const terminalIndex = Number(event.terminal_index);
     if (!workspaceId || !Number.isInteger(terminalIndex)) {
-      return;
+      return { recorded: false, stale_rejected: false };
     }
 
     const type = String(event.type || event.event_type || "").trim().toLowerCase();
@@ -24561,18 +24611,27 @@ export default function App() {
       if (workspaceVisibleTerminalStatusRef.current.delete(key)) {
         setWorkspaceVisibleTerminalRevision((revision) => revision + 1);
       }
-      return;
+      return { recorded: true, stale_rejected: false };
     }
 
     const status = rawStatus || "idle";
     const previous = workspaceVisibleTerminalStatusRef.current.get(key) || {};
+    if (terminalCanonicalEventIsStale(previous, event)) {
+      return { recorded: false, stale_rejected: true };
+    }
+    const canonicalCohort = terminalCanonicalCohortForInstance(previous, event);
     const next = {
       ...previous,
+      ...canonicalCohort,
       activity_status: String(
         event.activity_status || event.native_rail_state || status,
       ).trim(),
       agent_id: String(event.agent_id || event.current_agent || previous.agent_id || "").trim(),
-      instance_id: event.instance_id ?? previous.instance_id ?? "",
+      instance_id: event.instance_id ?? event.terminal_instance_id ?? previous.instance_id ?? "",
+      terminal_process_epoch: event.terminal_process_epoch
+        ?? event.terminalProcessEpoch
+        ?? previous.terminal_process_epoch
+        ?? "",
       native_rail_label: String(event.native_rail_label || previous.native_rail_label || "").trim(),
       native_rail_state: String(event.native_rail_state || event.activity_status || status).trim(),
       pane_id: String(event.pane_id || previous.pane_id || "").trim(),
@@ -24589,6 +24648,7 @@ export default function App() {
       workspaceVisibleTerminalStatusRef.current.set(key, next);
       setWorkspaceVisibleTerminalRevision((revision) => revision + 1);
     }
+    return { recorded: true, stale_rejected: false };
   }, []);
 
   useEffect(() => {
@@ -34836,6 +34896,12 @@ export default function App() {
     liveSnapshot.sessions.forEach((session) => {
       const presenceWorkspace = findPresenceWorkspace(session);
       const presenceTerminal = findPresenceTerminal(presenceWorkspace, session);
+      const canonicalSource = terminalCanonicalStateFromFields(session)
+        ? session
+        : terminalCanonicalStateFromFields(presenceTerminal)
+          ? presenceTerminal
+          : null;
+      const canonicalState = terminalCanonicalStateFromFields(canonicalSource);
       const workspaceId = session.workspace_id || presenceWorkspace?.workspace_id || "";
       const terminalIndex = session.terminal_index ?? presenceTerminal?.terminal_index ?? null;
       const agentId = normalizeWorkspaceTerminalRole(
@@ -34906,18 +34972,19 @@ export default function App() {
           && !presenceBusyStatus
       );
       const activityStatus = String(
-        presenceInterruptedStatus
+        canonicalState
+          || (presenceInterruptedStatus
           ? "interrupted"
           : presenceSaysIdle
           ? "idle"
           : groundTruth.effectiveActivityStatus
             || session.activity_status
             || session.native_rail_state
-            || "",
+            || ""),
       ).trim().toLowerCase();
       const terminalWorkState = String(groundTruth.terminal_work_state || "").trim().toLowerCase();
       const presenceStatus = String(presenceTerminal?.status || "").trim().toLowerCase();
-      const visibleStatus = workspaceTerminalStatusFromActivityStatus(
+      const visibleStatus = canonicalState || workspaceTerminalStatusFromActivityStatus(
         activityStatus || presenceTerminal?.native_rail_state || presenceStatus || "",
         {
           fallbackStatus: presenceStatus || "idle",
@@ -34934,33 +35001,37 @@ export default function App() {
         terminalRailStateFromActivityStatus(activityStatus || visibleStatus, visibleStatus),
       );
       const isReady = Boolean(
-        groundTruth.agentInputReady
+        canonicalState === "idle"
+          || (!canonicalState && (groundTruth.agentInputReady
           || groundTruth.terminal_is_complete
           || readiness === "ready"
-          || ["idle", "ready"].includes(visibleStatus)
+          || ["idle", "ready"].includes(visibleStatus)))
       );
-      const isWorking = !presenceSaysIdle && Boolean(
+      const isWorking = canonicalState === "thinking" || (!canonicalState && !presenceSaysIdle && Boolean(
         ["compacting", "compaction", "thinking", "working", "running", "busy"].includes(visibleStatus)
           || readiness === "busy"
           || (
             Boolean(session.has_active_task || session.active_task)
             && (!presenceTerminal || !isReady)
           )
-      );
+      ));
       const promptingUserBlocksShutdown = terminalPromptingUserBlocksShutdown(groundTruth);
       const needsInput = Boolean(
-        session.parked
+        canonicalState === "uir"
+          || canonicalState === "paused"
+          || (!canonicalState && (session.parked
           || session.parked_prompt
           || groundTruth.terminal_is_parked
           || promptingUserBlocksShutdown
           || terminalWorkState === "parked"
           || (terminalWorkState === "prompting_user" && promptingUserBlocksShutdown)
-          || (!presenceSaysIdle && visibleStatus === "paused" && (groundTruth.terminal_is_parked || promptingUserBlocksShutdown))
+          || (!presenceSaysIdle && visibleStatus === "paused" && (groundTruth.terminal_is_parked || promptingUserBlocksShutdown))))
       );
       const hasError = Boolean(
-        visibleStatus === "error"
+        canonicalState === "error"
+          || (!canonicalState && (visibleStatus === "error"
           || terminalWorkState === "error"
-          || readiness === "error"
+          || readiness === "error"))
       );
       const risk = needsInput
         ? "needs_input"
@@ -37033,6 +37104,12 @@ export default function App() {
             ).trim().toLowerCase();
             const threadStatus = String(thread?.status || providerBinding?.status || "").trim().toLowerCase();
             const liveStatus = String(liveTerminal?.status || visibleStatus || threadStatus || "").trim().toLowerCase();
+            const canonicalSource = terminalCanonicalStateFromFields(liveTerminal)
+              ? liveTerminal
+              : terminalCanonicalStateFromFields(visibleTerminalStatus)
+                ? visibleTerminalStatus
+                : null;
+            const canonicalState = terminalCanonicalStateFromFields(canonicalSource);
             const stoppedLiveStatus = stoppedTerminalStatuses.includes(liveStatus)
               ? liveStatus
               : stoppedTerminalStatuses.includes(visibleStatus)
@@ -37040,7 +37117,13 @@ export default function App() {
                 : stoppedTerminalStatuses.includes(threadStatus)
                   ? threadStatus
                   : "";
-            const terminalLifecycle = stoppedLiveStatus ? "closed" : "open";
+            const terminalLifecycle = canonicalState === "closing"
+              ? "closing"
+              : ["closed", "offline"].includes(canonicalState)
+                ? "closed"
+                : stoppedLiveStatus
+                  ? "closed"
+                  : "open";
             const liveRailActivity = String(
               liveTerminal?.activity_status || visibleTerminalStatus?.activity_status || thread?.activity_status || "",
             ).trim().toLowerCase();
@@ -37052,7 +37135,7 @@ export default function App() {
             const statusActivity = rawActivity
               || (liveStatus === "error" ? "error" : "")
               || (liveStatus === "starting" ? "starting" : "");
-            const status = stoppedLiveStatus || (terminalLifecycle === "closed"
+            const status = canonicalState || stoppedLiveStatus || (terminalLifecycle === "closed"
               ? "exited"
               : workspaceTerminalStatusFromActivityStatus(statusActivity, {
                 fallbackStatus: "idle",
@@ -37061,12 +37144,18 @@ export default function App() {
                 terminal_is_prompting_user: terminalGroundTruth.terminal_is_prompting_user,
                 terminal_lifecycle: terminalLifecycle,
               }));
-            const readiness = terminalReadinessFromPresenceStatus(status);
-            const turnStatus = terminalTurnStatusFromActivityStatus(statusActivity || status, status);
-            const nativeRailState = stoppedTerminalStatuses.includes(status)
+            const readiness = terminalReadinessFromPresenceStatus(canonicalState || status);
+            const turnStatus = terminalTurnStatusFromActivityStatus(
+              canonicalState || statusActivity || status,
+              status,
+            );
+            const nativeRailState = canonicalState || (stoppedTerminalStatuses.includes(status)
               ? status
-              : terminalRailStateFromActivityStatus(statusActivity || status, status);
-            const nativeRailFields = getTerminalNativeRailStateFields(nativeRailState);
+              : terminalRailStateFromActivityStatus(statusActivity || status, status));
+            const nativeRailFields = getTerminalNativeRailStateFields(
+              nativeRailState,
+              canonicalState ? canonicalSource?.canonical_badge_label : "",
+            );
             const agentLabel = normalizedRole === WORKSPACE_TERMINAL_ROLE_GENERIC
               ? "Terminal"
               : getManagedAgentLabel(normalizedRole);
@@ -37114,7 +37203,24 @@ export default function App() {
                 || "",
             ) || 0;
             const terminalConnected = Boolean(terminalLifecycle === "open" && stoppedLiveStatus === "");
+            const terminalInputReady = canonicalState
+              ? canonicalState === "idle"
+                && canonicalSource?.turn_active === false
+                && Number(canonicalSource?.completed_turn_generation || 0)
+                  === Number(canonicalSource?.turn_generation || 0)
+              : terminalLifecycle === "open" && readiness === "ready";
             return {
+              terminal_state_contract_version: canonicalSource?.terminal_state_contract_version,
+              canonical_state: canonicalState || undefined,
+              canonical_badge_label: canonicalState ? canonicalSource?.canonical_badge_label : undefined,
+              canonical_state_seq: canonicalSource?.canonical_state_seq,
+              prompt_state_seq: canonicalSource?.prompt_state_seq,
+              turn_active: canonicalSource?.turn_active,
+              turn_generation: canonicalSource?.turn_generation,
+              completed_turn_generation: canonicalSource?.completed_turn_generation,
+              active_interaction_id: canonicalSource?.active_interaction_id,
+              active_interaction_revision: canonicalSource?.active_interaction_revision,
+              interaction_actionable: canonicalSource?.interaction_actionable,
               agent_id: normalizedRole,
               agent_kind: normalizedRole,
               agent_label: agentLabel,
@@ -37125,8 +37231,10 @@ export default function App() {
               color_slot: colorSlot,
               commandable: terminalConnected,
               connected: terminalConnected,
-              display_status: nativeRailState,
-              input_ready: Boolean(terminalLifecycle === "open" && readiness === "ready"),
+              display_status: canonicalState
+                ? String(canonicalSource?.canonical_badge_label ?? "")
+                : nativeRailState,
+              input_ready: Boolean(terminalInputReady),
               last_known_runtime: false,
               ...nativeRailFields,
               native_connected: terminalConnected,
@@ -45953,8 +46061,10 @@ export default function App() {
       }
       return null;
     };
-    const appControlTerminalStatusValues = (terminal) => [
-      terminal?.native_rail_state,
+    const appControlTerminalStatusValues = (terminal) => {
+      const canonicalState = terminalCanonicalStateFromFields(terminal);
+      if (canonicalState) return [canonicalState];
+      return [terminal?.native_rail_state,
       terminal?.activity_status,
       terminal?.execution_phase,
       terminal?.turn_status,
@@ -45963,8 +46073,10 @@ export default function App() {
       terminal?.status,
       terminal?.status_after,
       terminal?.terminal_lifecycle,
-      terminal?.session_state,
-    ].map((value) => String(value || "").trim().toLowerCase()).filter(Boolean);
+      terminal?.session_state]
+        .map((value) => String(value || "").trim().toLowerCase())
+        .filter(Boolean);
+    };
     const appControlTerminalLooksClosed = (terminal) => (
       appControlTerminalStatusValues(terminal).some((status) => (
         ["closed", "closing", "deactivated", "disabled", "exited", "no_session", "offline", "terminated"].includes(status)
@@ -51718,7 +51830,35 @@ export default function App() {
         };
       }
     }
-    recordWorkspaceVisibleTerminalStatus(lifecycleEvent);
+    const visibleStatusCacheResult = recordWorkspaceVisibleTerminalStatus(lifecycleEvent);
+    if (visibleStatusCacheResult?.stale_rejected) {
+      logTerminalStatus("frontend.terminal_status.settlement_side_effects_ignored", {
+        canonical_state: lifecycleEvent.canonical_state || "",
+        canonical_state_seq: lifecycleEvent.canonical_state_seq ?? "",
+        instance_id: lifecycleEvent.instance_id || "",
+        pane_id: lifecycleEvent.pane_id || "",
+        reason: "canonical_cache_stale_rejection",
+        source: lifecycleEvent.source || "",
+        thread_id: lifecycleEvent.thread_id || "",
+        turn_generation: lifecycleEvent.turn_generation ?? "",
+        workspace_id: lifecycleEvent.workspace_id || "",
+      });
+      return;
+    }
+    if (!terminalLifecycleSettlementSideEffectsAllowed(lifecycleEvent)) {
+      logTerminalStatus("frontend.terminal_status.settlement_side_effects_ignored", {
+        canonical_state: lifecycleEvent.canonical_state || "",
+        canonical_state_seq: lifecycleEvent.canonical_state_seq ?? "",
+        instance_id: lifecycleEvent.instance_id || "",
+        pane_id: lifecycleEvent.pane_id || "",
+        reason: "turn_settlement_rejected",
+        source: lifecycleEvent.source || "",
+        thread_id: lifecycleEvent.thread_id || "",
+        turn_generation: lifecycleEvent.turn_generation ?? "",
+        workspace_id: lifecycleEvent.workspace_id || "",
+      });
+      return;
+    }
 
     const lifecycleAgentId = String(
       lifecycleEvent.agent_id || lifecycleEvent.current_agent || "",
@@ -52878,9 +53018,10 @@ export default function App() {
       const inputReady = typeof payload.input_ready === "boolean"
         ? payload.input_ready
         : type === "provider-turn-completed" || type === "provider-turn-error";
+      const canonicalState = terminalCanonicalStateFromFields(payload);
       const payloadNativeRailState = payload.native_rail_state || "";
       const payloadActivityStatus = payload.activity_status || "";
-      const activityStatus = payloadNativeRailState
+      const activityStatus = canonicalState || payloadNativeRailState
         || (type === "provider-turn-interrupted"
           ? "interrupted"
           : payloadActivityStatus || (inputReady ? "idle" : "thinking"));
@@ -52909,7 +53050,9 @@ export default function App() {
         native_session_id: payload.native_session_id || payload.provider_session_id || "",
         native_session_kind: payload.native_session_id || payload.provider_session_id ? "session" : "",
         native_session_source: payload.native_session_id || payload.provider_session_id ? "cli-hook" : "",
-        native_rail_label: payload.native_rail_label || "",
+        native_rail_label: canonicalState
+          ? String(payload.canonical_badge_label ?? "")
+          : payload.native_rail_label || "",
         native_rail_state: activityStatus,
         provider_session_id: payload.provider_session_id || payload.native_session_id || "",
         source: hookSource,

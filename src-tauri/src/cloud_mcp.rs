@@ -20601,9 +20601,7 @@ fn cloud_mcp_apply_remote_agent_prompt_lever(
     let event = event.clone();
     tauri::async_runtime::spawn(async move {
         match crate::terminal_answer_agent_prompt_remote_command(app, event.clone()).await {
-            Ok(details)
-                if cloud_mcp_agent_prompt_answer_details_pending_confirmation(&details) =>
-            {
+            Ok(details) if cloud_mcp_agent_prompt_answer_details_pending_confirmation(&details) => {
                 let _ = cloud_mcp_send_remote_command_status_event(
                     &state,
                     &event,
@@ -23065,12 +23063,8 @@ fn cloud_mcp_apply_remote_local_script_lever(
 /// so a stray desktop-routed command does not hang.
 fn cloud_mcp_remote_device_lever_action(command_kind: &str) -> Option<&'static str> {
     match command_kind {
-        "app_show_window" | "show_window" | "open_app_window" | "app_open_window" => {
-            Some("show")
-        }
-        "app_hide_window" | "hide_window" | "app_background" | "hide_app_window" => {
-            Some("hide")
-        }
+        "app_show_window" | "show_window" | "open_app_window" | "app_open_window" => Some("show"),
+        "app_hide_window" | "hide_window" | "app_background" | "hide_app_window" => Some("hide"),
         "device_notify" | "notify_device" | "device_notification" | "send_notification" => {
             Some("notify")
         }
@@ -23080,9 +23074,7 @@ fn cloud_mcp_remote_device_lever_action(command_kind: &str) -> Option<&'static s
         | "switch_agent_account"
         | "agent_profile_switch"
         | "account_switch" => Some("account_switch"),
-        "agent_account_push" | "push_agent_account" | "account_push" => {
-            Some("agent_account_push")
-        }
+        "agent_account_push" | "push_agent_account" | "account_push" => Some("agent_account_push"),
         "terminal_output_status"
         | "terminal_status"
         | "terminal_output"
@@ -31375,7 +31367,8 @@ async fn cloud_mcp_send_terminal_io_message(
     let sender = cloud_mcp_termio_sender(state)
         .await
         .ok_or_else(|| "Cloud MCP websocket is unavailable.".to_string())?;
-    let envelope = cloud_mcp_terminal_io_envelope(state, request, target, kind, &id, payload).await?;
+    let envelope =
+        cloud_mcp_terminal_io_envelope(state, request, target, kind, &id, payload).await?;
     sender
         .send_json(envelope)
         .map_err(|_| "Cloud MCP websocket terminal sender is closed.".to_string())
@@ -31623,8 +31616,8 @@ async fn cloud_mcp_handle_terminal_io_message(
             cloud_mcp_schedule_terminal_remote_presence_reaper(state);
             cloud_mcp_schedule_terminal_remote_presence_emit(state, "termio_attach");
             let size = *instance.size.lock().await;
-            let requested_from = cloud_mcp_payload_u64(message, &["from", "f", "from_total_bytes"])
-                .unwrap_or(0);
+            let requested_from =
+                cloud_mcp_payload_u64(message, &["from", "f", "from_total_bytes"]).unwrap_or(0);
             let resnapshot = cloud_mcp_payload_bool(message, &["resnapshot"], false);
             let (total, retained_tail_bytes) = {
                 let output = instance.headless_output.lock().ok();
@@ -32408,11 +32401,15 @@ fn cloud_mcp_terminal_output_resume_replay(
     // against the tail entry directly because the replay frame requires a
     // non-empty tail buffer.
     let (tail_seq, tail_total_bytes) =
-        state.terminal_io_tail_by_stream.lock().ok().and_then(|tails| {
-            tails
-                .get(stream_key)
-                .map(|tail| (tail.seq, tail.total_bytes))
-        })?;
+        state
+            .terminal_io_tail_by_stream
+            .lock()
+            .ok()
+            .and_then(|tails| {
+                tails
+                    .get(stream_key)
+                    .map(|tail| (tail.seq, tail.total_bytes))
+            })?;
     if requested_from == tail_total_bytes && tail_total_bytes == headless_total_bytes {
         return Some((tail_seq, requested_from, Vec::new()));
     }
@@ -32569,10 +32566,7 @@ fn cloud_mcp_terminal_io_detach_origin(
 // None means no such origin exists and flow control is inactive (legacy
 // behavior). The nested lock order (subscriptions, then acked) is the only
 // place both are held at once; mutations elsewhere take them sequentially.
-fn cloud_mcp_terminal_io_flow_min_acked_n(
-    state: &CloudMcpState,
-    stream_key: &str,
-) -> Option<u64> {
+fn cloud_mcp_terminal_io_flow_min_acked_n(state: &CloudMcpState, stream_key: &str) -> Option<u64> {
     let subscriptions = state.terminal_io_stream_subscriptions.lock().ok()?;
     let attached = subscriptions.get(stream_key)?;
     let acked = state.terminal_io_acked_n_by_stream.lock().ok()?;
@@ -35022,6 +35016,7 @@ pub(crate) async fn cloud_mcp_mark_terminal_opened(
         "target_terminal_id": pane_id,
         "pane_id": pane_id,
         "terminal_instance_id": instance_id,
+        "terminal_process_epoch": metadata.terminal_process_epoch.as_str(),
         "terminal_index": metadata.terminal_index,
         "terminal_epoch": format!("{pane_id}:{instance_id}"),
         "terminal_name": terminal_display_name.clone(),
@@ -35033,6 +35028,17 @@ pub(crate) async fn cloud_mcp_mark_terminal_opened(
         "agent_kind": agent_kind,
         "agent_type": agent_kind,
         "provider": agent_kind,
+        "terminal_state_contract_version": 1,
+        "canonical_state": "starting",
+        "canonical_badge_label": "starting",
+        "canonical_state_seq": 1,
+        "prompt_state_seq": 0,
+        "turn_active": false,
+        "turn_generation": 0,
+        "completed_turn_generation": 0,
+        "active_interaction_id": null,
+        "active_interaction_revision": null,
+        "interaction_actionable": false,
         "event_type": "terminal.opened",
         "state": "starting",
         "status": "starting",
@@ -35196,6 +35202,7 @@ const CLOUD_MCP_TERMINAL_PROMPT_COHORT_FIELDS: &[&str] = &[
     "prompt_url",
     "provider_payload",
     "allows_free_text",
+    "manual_prompt_source",
     "manual_approval_required",
     "provider_blocked_for_user",
     "terminal_is_prompting_user",
@@ -35211,11 +35218,26 @@ const CLOUD_MCP_TERMINAL_PROMPT_COHORT_FIELDS: &[&str] = &[
     "approval_id",
     "permission_prompt_id",
     "permission_request_id",
+    "permission_mode",
+];
+
+const CLOUD_MCP_TERMINAL_CANONICAL_COHORT_FIELDS: &[&str] = &[
+    "terminal_state_contract_version",
+    "canonical_state",
+    "canonical_badge_label",
+    "canonical_state_seq",
+    "turn_active",
+    "turn_generation",
+    "completed_turn_generation",
+    "active_interaction_id",
+    "active_interaction_revision",
+    "interaction_actionable",
 ];
 
 const CLOUD_MCP_TERMINAL_PROMPT_OWNER_FIELDS: &[&str] = &[
     "terminal_instance_id",
     "instance_id",
+    "terminal_process_epoch",
     "terminal_epoch",
     "agent_kind",
     "agent_id",
@@ -35233,17 +35255,195 @@ fn cloud_mcp_terminal_prompt_state_seq(terminal: &Value) -> Option<u64> {
 }
 
 fn cloud_mcp_terminal_pane_id(terminal: &Value) -> Option<String> {
+    cloud_mcp_payload_text(terminal, &["pane_id", "terminal_id", "target_terminal_id"])
+}
+
+fn cloud_mcp_terminal_instance_id_text(terminal: &Value) -> Option<String> {
+    ["terminal_instance_id", "instance_id"]
+        .iter()
+        .find_map(|key| {
+            terminal.get(*key).and_then(|value| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| value.as_u64().map(|value| value.to_string()))
+                    .or_else(|| value.as_i64().map(|value| value.to_string()))
+            })
+        })
+}
+
+fn cloud_mcp_terminal_process_epoch(terminal: &Value) -> Option<String> {
     cloud_mcp_payload_text(
         terminal,
-        &["pane_id", "terminal_id", "target_terminal_id"],
+        &["terminal_process_epoch", "terminalProcessEpoch"],
     )
 }
 
+fn cloud_mcp_terminal_process_epoch_sequence(epoch: &str) -> Option<u64> {
+    epoch
+        .trim()
+        .split_once('-')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(epoch.trim())
+        .parse::<u64>()
+        .ok()
+}
+
+fn cloud_mcp_terminal_process_epoch_order(
+    existing: &Value,
+    incoming: &Value,
+) -> Option<std::cmp::Ordering> {
+    let existing = cloud_mcp_terminal_process_epoch(existing);
+    let incoming = cloud_mcp_terminal_process_epoch(incoming);
+    match (existing, incoming) {
+        (Some(existing), Some(incoming)) if existing == incoming => None,
+        (Some(existing), Some(incoming)) => {
+            let order = match (
+                cloud_mcp_terminal_process_epoch_sequence(&existing),
+                cloud_mcp_terminal_process_epoch_sequence(&incoming),
+            ) {
+                (Some(existing_sequence), Some(incoming_sequence)) => incoming_sequence
+                    .cmp(&existing_sequence)
+                    .then_with(|| incoming.cmp(&existing)),
+                _ => incoming.cmp(&existing),
+            };
+            (order != std::cmp::Ordering::Equal).then_some(order)
+        }
+        (None, Some(_)) => Some(std::cmp::Ordering::Greater),
+        _ => None,
+    }
+}
+
+fn cloud_mcp_terminals_share_exact_instance(left: &Value, right: &Value) -> bool {
+    let process_matches = match (
+        cloud_mcp_terminal_process_epoch(left),
+        cloud_mcp_terminal_process_epoch(right),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    };
+    process_matches
+        && matches!(
+            (
+                cloud_mcp_terminal_instance_id_text(left),
+                cloud_mcp_terminal_instance_id_text(right),
+            ),
+            (Some(left), Some(right)) if left == right
+        )
+}
+
+fn cloud_mcp_terminal_instance_order(existing: &Value, incoming: &Value) -> Option<std::cmp::Ordering> {
+    let existing = cloud_mcp_payload_u64(existing, &["terminal_instance_id", "instance_id"])?;
+    let incoming = cloud_mcp_payload_u64(incoming, &["terminal_instance_id", "instance_id"])?;
+    (existing > 0 && incoming > 0).then(|| incoming.cmp(&existing))
+}
+
+fn cloud_mcp_replace_terminal_cohort(target: &mut Value, source: &Value, fields: &[&str]) {
+    let (Some(target), Some(source)) = (target.as_object_mut(), source.as_object()) else {
+        return;
+    };
+    for key in fields {
+        if let Some(value) = source.get(*key) {
+            target.insert((*key).to_string(), value.clone());
+        } else {
+            target.remove(*key);
+        }
+    }
+}
+
+fn cloud_mcp_merge_terminal_state_cohort_aware(target: &mut Value, incoming: Value) {
+    if !target.is_object() || !incoming.is_object() {
+        *target = incoming;
+        return;
+    }
+    let process_epoch_order = cloud_mcp_terminal_process_epoch_order(target, &incoming);
+    if process_epoch_order == Some(std::cmp::Ordering::Less) {
+        return;
+    }
+    if process_epoch_order == Some(std::cmp::Ordering::Greater) {
+        *target = incoming;
+        return;
+    }
+    let same_instance = cloud_mcp_terminals_share_exact_instance(target, &incoming);
+    let numeric_instance_order = cloud_mcp_terminal_instance_order(target, &incoming);
+    if !same_instance && numeric_instance_order.is_some() {
+        if cloud_mcp_terminal_instance_order(target, &incoming)
+            == Some(std::cmp::Ordering::Less)
+        {
+            // The pane has already advanced past this retired instance.
+            return;
+        }
+        // A higher numeric instance within one process is a fresh cohort.
+        *target = incoming;
+        return;
+    }
+
+    let previous = target.clone();
+    let opaque_instance_changed = !same_instance
+        && cloud_mcp_terminal_instance_id_text(&previous)
+            != cloud_mcp_terminal_instance_id_text(&incoming);
+    let previous_canonical_seq = cloud_mcp_payload_u64(&previous, &["canonical_state_seq"]);
+    let incoming_canonical_seq = cloud_mcp_payload_u64(&incoming, &["canonical_state_seq"]);
+    let incoming_canonical_wins = match (previous_canonical_seq, incoming_canonical_seq) {
+        (Some(previous), Some(incoming)) => incoming > previous,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    let previous_prompt_seq = cloud_mcp_terminal_prompt_state_seq(&previous);
+    let incoming_prompt_seq = cloud_mcp_terminal_prompt_state_seq(&incoming);
+    let incoming_prompt_wins = match (previous_prompt_seq, incoming_prompt_seq) {
+        (Some(previous), Some(incoming)) => incoming > previous,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+
+    cloud_mcp_live_state_merge_object(target, incoming.clone());
+    if previous_canonical_seq.is_some() && !incoming_canonical_wins {
+        cloud_mcp_replace_terminal_cohort(
+            target,
+            &previous,
+            CLOUD_MCP_TERMINAL_CANONICAL_COHORT_FIELDS,
+        );
+    } else if incoming_canonical_wins {
+        cloud_mcp_replace_terminal_cohort(
+            target,
+            &incoming,
+            CLOUD_MCP_TERMINAL_CANONICAL_COHORT_FIELDS,
+        );
+    }
+    if previous_prompt_seq.is_some() && !incoming_prompt_wins {
+        cloud_mcp_replace_terminal_cohort(
+            target,
+            &previous,
+            CLOUD_MCP_TERMINAL_PROMPT_COHORT_FIELDS,
+        );
+    } else if incoming_prompt_wins {
+        cloud_mcp_replace_terminal_cohort(
+            target,
+            &incoming,
+            CLOUD_MCP_TERMINAL_PROMPT_COHORT_FIELDS,
+        );
+    }
+    if opaque_instance_changed && !incoming_prompt_wins {
+        cloud_mcp_replace_terminal_cohort(
+            target,
+            &previous,
+            CLOUD_MCP_TERMINAL_PROMPT_OWNER_FIELDS,
+        );
+    }
+}
+
 fn cloud_mcp_merge_cached_terminal_prompt_cohort(target: &mut Value, cached: &Value) {
+    if !cloud_mcp_terminals_share_exact_instance(target, cached) {
+        return;
+    }
     let Some(cached_seq) = cloud_mcp_terminal_prompt_state_seq(cached) else {
         return;
     };
-    if cloud_mcp_terminal_prompt_state_seq(target).is_some_and(|target_seq| target_seq > cached_seq) {
+    if cloud_mcp_terminal_prompt_state_seq(target).is_some_and(|target_seq| target_seq > cached_seq)
+    {
         return;
     }
     let (Some(target), Some(cached)) = (target.as_object_mut(), cached.as_object()) else {
@@ -35269,10 +35469,7 @@ fn cloud_mcp_preserve_cached_snapshot_prompt_cohorts(target: &mut Value, cached:
     else {
         return;
     };
-    let Some(target_workspaces) = target
-        .get_mut("workspaces")
-        .and_then(Value::as_array_mut)
-    else {
+    let Some(target_workspaces) = target.get_mut("workspaces").and_then(Value::as_array_mut) else {
         return;
     };
 
@@ -35313,6 +35510,7 @@ fn cloud_mcp_preserve_cached_snapshot_prompt_cohorts(target: &mut Value, cached:
                 .iter()
                 .filter(|candidate| {
                     cloud_mcp_terminal_pane_id(candidate).as_deref() == Some(pane_id.as_str())
+                        && cloud_mcp_terminals_share_exact_instance(target_terminal, candidate)
                 })
                 .max_by_key(|candidate| {
                     cloud_mcp_terminal_prompt_state_seq(candidate).unwrap_or_default()
@@ -35401,6 +35599,34 @@ fn cloud_mcp_mark_terminal_value_closed(
     let Some(object) = value.as_object_mut() else {
         return;
     };
+    let prompt_state_seq = object
+        .get("prompt_state_seq")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+        .saturating_add(1);
+    let canonical_state_seq = object
+        .get("canonical_state_seq")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+        .saturating_add(1);
+    object.insert("terminal_state_contract_version".to_string(), json!(1));
+    object.insert("canonical_state".to_string(), json!("closed"));
+    object.insert("canonical_badge_label".to_string(), json!("closed"));
+    object.insert(
+        "canonical_state_seq".to_string(),
+        json!(canonical_state_seq),
+    );
+    object.insert("prompt_state_seq".to_string(), json!(prompt_state_seq));
+    object.insert("turn_active".to_string(), json!(false));
+    object
+        .entry("turn_generation".to_string())
+        .or_insert_with(|| json!(0));
+    object
+        .entry("completed_turn_generation".to_string())
+        .or_insert_with(|| json!(0));
+    object.insert("active_interaction_id".to_string(), Value::Null);
+    object.insert("active_interaction_revision".to_string(), Value::Null);
+    object.insert("interaction_actionable".to_string(), json!(false));
     object.insert("status".to_string(), json!("closed"));
     object.insert("state".to_string(), json!("closed"));
     object.insert("activity_status".to_string(), json!("closed"));
@@ -35765,6 +35991,7 @@ async fn cloud_mcp_enqueue_terminal_closed_delta(
         .unwrap_or(agent_kind)
         .to_string();
     let terminal_nickname_text = terminal_nickname.unwrap_or_default();
+    let close_runtime = &close_context.runtime;
     let payload = json!({
         "source": "rust-diffforge-terminal-close",
         "event_kind": "terminal_state_update",
@@ -35785,6 +36012,7 @@ async fn cloud_mcp_enqueue_terminal_closed_delta(
         "target_terminal_id": pane_id,
         "pane_id": pane_id,
         "terminal_instance_id": instance_id,
+        "terminal_process_epoch": close_context.metadata.terminal_process_epoch.as_str(),
         "terminal_index": terminal_index,
         "terminal_epoch": format!("{pane_id}:{instance_id}"),
         "terminal_name": terminal_display_name.clone(),
@@ -35794,6 +36022,17 @@ async fn cloud_mcp_enqueue_terminal_closed_delta(
         "agent_kind": agent_kind,
         "agent_type": agent_kind,
         "provider": agent_kind,
+        "terminal_state_contract_version": 1,
+        "canonical_state": "closed",
+        "canonical_badge_label": "closed",
+        "canonical_state_seq": close_runtime.canonical_state_seq.saturating_add(1),
+        "prompt_state_seq": close_runtime.prompt_state_seq,
+        "turn_active": false,
+        "turn_generation": close_runtime.turn_generation,
+        "completed_turn_generation": close_runtime.completed_turn_generation,
+        "active_interaction_id": null,
+        "active_interaction_revision": null,
+        "interaction_actionable": false,
         "event_type": "terminal.closed",
         "state": "closed",
         "status": "closed",
@@ -36045,19 +36284,13 @@ pub(crate) fn cloud_mcp_terminal_output_has_working_indicator(cleaned_text: &str
         );
     ["Working (", "Working("]
         .into_iter()
-        .flat_map(|needle| {
-            cleaned_text
-                .match_indices(needle)
-                .map(|(index, _)| index)
-        })
+        .flat_map(|needle| cleaned_text.match_indices(needle).map(|(index, _)| index))
         .filter(|index| {
             *index == 0
                 || cleaned_text[..*index]
                     .chars()
                     .next_back()
-                    .is_none_or(|character| {
-                        !character.is_ascii_alphanumeric() && character != '_'
-                    })
+                    .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
         })
         .filter_map(|index| {
             lower[index..]
@@ -37971,7 +38204,7 @@ fn cloud_mcp_upsert_device_terminal_orchestrator(
         });
     } else if let Some(index) = existing_index {
         if let Some(existing) = orchestrators.get_mut(index) {
-            cloud_mcp_live_state_merge_object(existing, normalized);
+            cloud_mcp_merge_terminal_state_cohort_aware(existing, normalized);
         }
     } else {
         orchestrators.push(normalized);
@@ -38349,6 +38582,16 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
                     &["terminal_id", "target_terminal_id", "pane_id"],
                 );
                 let mut normalized = json!({
+                    "terminal_state_contract_version": terminal.get("terminal_state_contract_version").cloned().unwrap_or(Value::Null),
+                    "canonical_state": cloud_mcp_payload_text(terminal, &["canonical_state"]),
+                    "canonical_badge_label": cloud_mcp_payload_text(terminal, &["canonical_badge_label"]),
+                    "canonical_state_seq": terminal.get("canonical_state_seq").cloned().unwrap_or(Value::Null),
+                    "turn_active": terminal.get("turn_active").cloned().unwrap_or(Value::Null),
+                    "turn_generation": terminal.get("turn_generation").cloned().unwrap_or(Value::Null),
+                    "completed_turn_generation": terminal.get("completed_turn_generation").cloned().unwrap_or(Value::Null),
+                    "active_interaction_id": terminal.get("active_interaction_id").cloned().unwrap_or(Value::Null),
+                    "active_interaction_revision": terminal.get("active_interaction_revision").cloned().unwrap_or(Value::Null),
+                    "interaction_actionable": terminal.get("interaction_actionable").cloned().unwrap_or(Value::Null),
                     "presence_agent_id": cloud_mcp_payload_text(
                         terminal,
                         &["presence_agent_id", "id"],
@@ -38363,6 +38606,10 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
                     "terminal_name": terminal_nickname.clone(),
                     "terminal_nickname": terminal_nickname,
                     "terminal_index": terminal_index,
+                    "terminal_process_epoch": cloud_mcp_payload_text(
+                        terminal,
+                        &["terminal_process_epoch", "terminalProcessEpoch"],
+                    ),
                     "terminal_epoch": cloud_mcp_payload_text(terminal, &["terminal_epoch"]),
                     "terminal_instance_id": terminal_instance_id,
                     "terminal_lifecycle": cloud_mcp_payload_text(terminal, &["terminal_lifecycle", "lifecycle"]),
@@ -39069,6 +39316,10 @@ fn cloud_mcp_terminal_lifecycle_state(
 }
 
 fn cloud_mcp_terminal_value_projected_status(terminal: &Value, fallback_status: &str) -> String {
+    if cloud_mcp_payload_u64(terminal, &["terminal_state_contract_version"]) == Some(1) {
+        return cloud_mcp_payload_text(terminal, &["canonical_state"])
+            .unwrap_or_else(|| fallback_status.to_string());
+    }
     let status = cloud_mcp_payload_text(terminal, &["status", "state"])
         .unwrap_or_else(|| fallback_status.to_string());
     let activity_status =
@@ -39387,35 +39638,61 @@ async fn cloud_mcp_apply_terminal_state_to_device_live_snapshot(
         }
         let terminal_removes_from_snapshot = !workspace_runtime_shutdown
             && cloud_mcp_terminal_state_removes_from_live_snapshot(&terminal_value);
-        let existing_index = terminals.iter().position(|terminal| {
-            if workspace_runtime_shutdown && terminal_instance_id > 0 {
-                cloud_mcp_presence_terminal_matches_instance_for_close(
-                    terminal,
-                    &terminal_id,
-                    terminal_instance_id,
-                )
-            } else {
-                cloud_mcp_presence_terminal_matches_instance(
-                    terminal,
-                    &terminal_id,
-                    terminal_instance_id,
-                )
+        let current_instance_id = terminals
+            .iter()
+            .filter(|terminal| {
+                cloud_mcp_terminal_pane_id(terminal).as_deref() == Some(terminal_id.as_str())
+            })
+            .filter_map(|terminal| {
+                cloud_mcp_payload_u64(terminal, &["terminal_instance_id", "instance_id"])
+            })
+            .max()
+            .unwrap_or_default();
+        let retired_instance_delta = !workspace_runtime_shutdown
+            && terminal_instance_id > 0
+            && current_instance_id > terminal_instance_id;
+        if !retired_instance_delta {
+            if !workspace_runtime_shutdown
+                && terminal_instance_id > 0
+                && terminal_instance_id > current_instance_id
+            {
+                // A genuinely newer pane epoch retires all prior rows before
+                // its per-instance sequences restart from their low values.
+                terminals.retain(|terminal| {
+                    cloud_mcp_terminal_pane_id(terminal).as_deref()
+                        != Some(terminal_id.as_str())
+                });
             }
-        });
-        if terminal_removes_from_snapshot {
-            terminals.retain(|terminal| {
-                !cloud_mcp_presence_terminal_matches_instance(
-                    terminal,
-                    &terminal_id,
-                    terminal_instance_id,
-                )
+            let existing_index = terminals.iter().position(|terminal| {
+                if workspace_runtime_shutdown && terminal_instance_id > 0 {
+                    cloud_mcp_presence_terminal_matches_instance_for_close(
+                        terminal,
+                        &terminal_id,
+                        terminal_instance_id,
+                    )
+                } else {
+                    cloud_mcp_presence_terminal_matches_instance(
+                        terminal,
+                        &terminal_id,
+                        terminal_instance_id,
+                    )
+                }
             });
-        } else if let Some(existing_index) = existing_index {
-            if let Some(existing) = terminals.get_mut(existing_index) {
-                cloud_mcp_live_state_merge_object(existing, terminal_value);
+            if terminal_removes_from_snapshot {
+                terminals.retain(|terminal| {
+                    !cloud_mcp_presence_terminal_matches_instance(
+                        terminal,
+                        &terminal_id,
+                        terminal_instance_id,
+                    )
+                });
+            } else if let Some(existing_index) = existing_index {
+                if let Some(existing) = terminals.get_mut(existing_index) {
+                    cloud_mcp_merge_terminal_state_cohort_aware(existing, terminal_value);
+                }
+            } else if !workspace_runtime_shutdown {
+                terminals.push(terminal_value);
             }
-        } else if !workspace_runtime_shutdown {
-            terminals.push(terminal_value);
         }
         let terminal_count = terminals.len();
         let active_count = terminals
@@ -41056,6 +41333,22 @@ fn cloud_mcp_provider_command_catalog(provider: &str) -> Value {
     )
 }
 
+fn cloud_mcp_terminal_canonical_contract(payload: &TerminalActivityHookPayload) -> Value {
+    json!({
+        "terminal_state_contract_version": payload.terminal_state_contract_version,
+        "canonical_state": payload.canonical_state,
+        "canonical_badge_label": payload.canonical_badge_label,
+        "canonical_state_seq": payload.canonical_state_seq,
+        "turn_active": payload.turn_active,
+        "turn_generation": payload.turn_generation,
+        "completed_turn_generation": payload.completed_turn_generation,
+        "interaction_actionable": payload.interaction_actionable,
+        "active_interaction_id": payload.active_interaction_id,
+        "active_interaction_revision": payload.active_interaction_revision,
+        "prompt_state_seq": payload.prompt_state_seq,
+    })
+}
+
 pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
     state: &CloudMcpState,
     payload: &TerminalActivityHookPayload,
@@ -41090,17 +41383,21 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         .user_message
         .as_deref()
         .or(payload.message.as_deref());
-    let state_value = cloud_mcp_terminal_lifecycle_state(
-        &payload.event_type,
-        &payload.terminal_status,
-        &payload.native_rail_state,
-        &payload.readiness,
-        &payload.command_phase,
-        &payload.execution_phase,
-        &payload.turn_status,
-        Some(payload.terminal_is_prompting_user),
-        payload.prompt_id.as_deref(),
-    );
+    let state_value = if payload.terminal_state_contract_version == 1 {
+        payload.canonical_state.as_str()
+    } else {
+        cloud_mcp_terminal_lifecycle_state(
+            &payload.event_type,
+            &payload.terminal_status,
+            &payload.native_rail_state,
+            &payload.readiness,
+            &payload.command_phase,
+            &payload.execution_phase,
+            &payload.turn_status,
+            Some(payload.terminal_is_prompting_user),
+            payload.prompt_id.as_deref(),
+        )
+    };
     let turn_status = cloud_mcp_terminal_lifecycle_turn_status(
         &payload.event_type,
         &payload.turn_status,
@@ -41177,6 +41474,7 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         "target_terminal_id": terminal_id,
         "pane_id": terminal_id,
         "terminal_instance_id": payload.instance_id,
+        "terminal_process_epoch": payload.terminal_process_epoch.as_str(),
         "terminal_index": payload.terminal_index,
         "terminal_epoch": format!("{}:{}", terminal_id, payload.instance_id),
         "terminal_name": payload.terminal_name.as_str(),
@@ -41193,6 +41491,7 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         "command_catalog_revision": 1,
         "event_type": payload.event_type,
         "hook_event_name": payload.hook_event_name,
+        "turn_settlement_accepted": payload.turn_settlement_accepted,
         "state": state_value,
         "status": state_value,
         "activity_status": payload.native_rail_state.as_str(),
@@ -41209,7 +41508,6 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         "session_state": payload.session_state.as_str(),
         "input_ready": payload.input_ready,
         "status_seq": status_seq,
-        "prompt_state_seq": status_seq,
         "observed_at_ms": payload.observed_at_ms,
         "hook_timestamp_ms": payload.hook_timestamp_ms,
         "prompt_id": prompt_id,
@@ -41222,7 +41520,16 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         "prompt_default_option": payload.prompt_default_option.clone(),
         "prompt_ttl_ms": payload.prompt_ttl_ms,
         "prompt_options": prompt_options,
+        "prompt_questions": payload.prompt_questions.clone(),
+        "prompt_schema": payload.prompt_schema.clone(),
+        "prompt_url": payload.prompt_url.clone(),
+        "provider_payload": payload.provider_payload.clone(),
         "allows_free_text": payload.allows_free_text,
+        "approval_id": payload.approval_id.clone(),
+        "permission_prompt_id": payload.permission_prompt_id.clone(),
+        "permission_request_id": payload.permission_request_id.clone(),
+        "permission_mode": payload.permission_mode.clone(),
+        "manual_prompt_source": payload.manual_prompt_source.clone(),
         "manual_approval_required": payload.manual_approval_required,
         "provider_blocked_for_user": payload.provider_blocked_for_user,
         "terminal_is_prompting_user": terminal_is_prompting_user,
@@ -41255,6 +41562,9 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         "summary": terminal_state_summary,
         "ts_ms": cloud_mcp_now_ms()});
     if let Some(object) = delta.as_object_mut() {
+        if let Some(canonical) = cloud_mcp_terminal_canonical_contract(payload).as_object() {
+            object.extend(canonical.clone());
+        }
         if let Some(seq) = workspace_runtime_seq {
             object.insert("workspace_runtime_seq".to_string(), json!(seq));
         }
@@ -58826,9 +59136,15 @@ mod cloud_mcp_tests {
             (chunks[0].0, chunks[0].1),
             (40, 40 + CLOUD_MCP_TERMINAL_OUTPUT_REPLAY_CHUNK_BYTES as u64)
         );
-        assert_eq!(chunks[0].2.len(), CLOUD_MCP_TERMINAL_OUTPUT_REPLAY_CHUNK_BYTES);
+        assert_eq!(
+            chunks[0].2.len(),
+            CLOUD_MCP_TERMINAL_OUTPUT_REPLAY_CHUNK_BYTES
+        );
         assert_eq!((chunks[1].0, chunks[1].1), (chunks[0].1, total));
-        assert_eq!(chunks[1].2, &replay_bytes[CLOUD_MCP_TERMINAL_OUTPUT_REPLAY_CHUNK_BYTES..]);
+        assert_eq!(
+            chunks[1].2,
+            &replay_bytes[CLOUD_MCP_TERMINAL_OUTPUT_REPLAY_CHUNK_BYTES..]
+        );
         let ids = chunks
             .iter()
             .map(|(chunk_from, _, _)| format!("termio-replay-21-{seq}-{chunk_from}"))
@@ -58843,13 +59159,15 @@ mod cloud_mcp_tests {
                 .expect("caught-up viewer resumes");
         assert_eq!((caught_up_seq, caught_up_from), (2, total));
         assert!(caught_up_bytes.is_empty());
-        assert!(cloud_mcp_terminal_output_replay_chunks(caught_up_from, &caught_up_bytes)
-            .is_empty());
+        assert!(
+            cloud_mcp_terminal_output_replay_chunks(caught_up_from, &caught_up_bytes).is_empty()
+        );
 
         // Non-resume attaches keep the snapshot path: no `from` or an explicit
         // resnapshot must never yield a replay.
-        assert!(cloud_mcp_terminal_output_resume_replay(&state, stream_key, 0, false, total)
-            .is_none());
+        assert!(
+            cloud_mcp_terminal_output_resume_replay(&state, stream_key, 0, false, total).is_none()
+        );
         assert!(
             cloud_mcp_terminal_output_resume_replay(&state, stream_key, 40, true, total).is_none()
         );
@@ -58980,7 +59298,10 @@ mod cloud_mcp_tests {
         assert_eq!(retained.tail, b"first");
     }
 
-    fn termio_test_subscription(attachment_id: &str, last_seen_ms: u64) -> CloudMcpTerminalIoSubscription {
+    fn termio_test_subscription(
+        attachment_id: &str,
+        last_seen_ms: u64,
+    ) -> CloudMcpTerminalIoSubscription {
         CloudMcpTerminalIoSubscription {
             attachment_id: attachment_id.to_string(),
             last_seen_ms,
@@ -59159,7 +59480,8 @@ mod cloud_mcp_tests {
         let mut rx = termio_test_install_ws(&state);
         let stream_key = "device:workspace:pane:104".to_string();
         let target = cloud_mcp_terminal_io_target(&stream_key).expect("helper target");
-        let meta = json!({"q": 1, "seq": 1, "f": 0, "n": 4, "from_total_bytes": 0, "total_bytes": 4});
+        let meta =
+            json!({"q": 1, "seq": 1, "f": 0, "n": 4, "from_total_bytes": 0, "total_bytes": 4});
         // Capability unset: the shared payload helper (used by ALL four
         // attach/flow emit sites) produces a raw JSON variant with base64 b.
         tauri::async_runtime::block_on(cloud_mcp_send_terminal_io_payload_message(
@@ -59175,10 +59497,7 @@ mod cloud_mcp_tests {
         let outgoing = rx.try_recv().expect("json variant");
         assert!(!outgoing.is_binary());
         let frame = outgoing.to_frame_value();
-        assert_eq!(
-            frame["b"],
-            json!(general_purpose::STANDARD.encode(b"gate"))
-        );
+        assert_eq!(frame["b"], json!(general_purpose::STANDARD.encode(b"gate")));
         // Capability set: the SAME call produces a raw Binary variant.
         termio_test_set_binary(&state, true);
         tauri::async_runtime::block_on(cloud_mcp_send_terminal_io_payload_message(
@@ -59197,8 +59516,7 @@ mod cloud_mcp_tests {
             unreachable!();
         };
         assert_eq!(binary.kind, "termio.snapshot");
-        let (header, payload) =
-            cloud_mcp_termio_binary_decode(&binary.bytes).expect("valid frame");
+        let (header, payload) = cloud_mcp_termio_binary_decode(&binary.bytes).expect("valid frame");
         assert!(header.get("b").is_none());
         assert_eq!(payload, b"snap");
         // Over-cap payloads fall back to the JSON variant even with the
@@ -59262,7 +59580,13 @@ mod cloud_mcp_tests {
 
         // No ready capability: the publisher emits JSON.
         cloud_mcp_publish_terminal_output_delta(
-            &state, &output, workspace_id, pane_id, instance_id, 1, b"hello",
+            &state,
+            &output,
+            workspace_id,
+            pane_id,
+            instance_id,
+            1,
+            b"hello",
         );
         let legacy = rx.try_recv().expect("legacy frame");
         assert!(!legacy.is_binary());
@@ -59277,7 +59601,13 @@ mod cloud_mcp_tests {
         // header+payload reassemble to the exact JSON-path equivalent.
         termio_test_set_binary(&state, true);
         cloud_mcp_publish_terminal_output_delta(
-            &state, &output, workspace_id, pane_id, instance_id, 2, b"binary!",
+            &state,
+            &output,
+            workspace_id,
+            pane_id,
+            instance_id,
+            2,
+            b"binary!",
         );
         let outgoing = rx.try_recv().expect("binary frame");
         assert!(outgoing.is_binary());
@@ -59291,9 +59621,15 @@ mod cloud_mcp_tests {
         assert_eq!(payload, b"binary!");
         assert!(header.get("b").is_none());
         assert_eq!(header["kind"], json!("termio.output"));
-        assert_eq!(header["id"], json!(format!("termio-output-{instance_id}-2")));
+        assert_eq!(
+            header["id"],
+            json!(format!("termio-output-{instance_id}-2"))
+        );
         assert_eq!(header["sk"], json!(stream_key.as_str()));
-        assert_eq!((header["f"].as_u64(), header["n"].as_u64()), (Some(5), Some(12)));
+        assert_eq!(
+            (header["f"].as_u64(), header["n"].as_u64()),
+            (Some(5), Some(12))
+        );
         assert_eq!(header["q"], json!(2));
         // The binary header carries the same auth object as JSON frames.
         assert_eq!(header["auth"]["connection_id"], json!("conn-flow-test"));
@@ -59303,13 +59639,22 @@ mod cloud_mcp_tests {
             reassembled["b"],
             json!(general_purpose::STANDARD.encode(b"binary!"))
         );
-        assert_eq!(reassembled["contract"], json!(CLOUD_MCP_TERMINAL_IO_CONTRACT));
+        assert_eq!(
+            reassembled["contract"],
+            json!(CLOUD_MCP_TERMINAL_IO_CONTRACT)
+        );
 
         // Capability lost (reconnect to an older cloud): back to JSON on the
         // SAME stream — mixed encodings interleave with coherent offsets/ids.
         termio_test_set_binary(&state, false);
         cloud_mcp_publish_terminal_output_delta(
-            &state, &output, workspace_id, pane_id, instance_id, 3, b"json-again",
+            &state,
+            &output,
+            workspace_id,
+            pane_id,
+            instance_id,
+            3,
+            b"json-again",
         );
         let tail = rx.try_recv().expect("post-downgrade frame");
         assert!(!tail.is_binary());
@@ -59371,7 +59716,10 @@ mod cloud_mcp_tests {
             json!(format!("termio-flow-replay-102-1-{}", 200_000))
         );
         assert!(rx.try_recv().is_err());
-        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
+        assert_eq!(
+            cloud_mcp_terminal_output_emitted_n(&state, &stream_key),
+            total
+        );
 
         // Skip-forward snapshot rides the binary lane too, still unstamped.
         let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
@@ -59413,7 +59761,10 @@ mod cloud_mcp_tests {
             .unwrap()
             .is_empty());
         assert!(rx.try_recv().is_err());
-        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
+        assert_eq!(
+            cloud_mcp_terminal_output_emitted_n(&state, &stream_key),
+            total
+        );
     }
 
     fn termio_test_subscribe(state: &CloudMcpState, stream_key: &str, origin: &str) {
@@ -59451,7 +59802,11 @@ mod cloud_mcp_tests {
             "viewer-1",
             9,
         ));
-        assert!(state.terminal_io_acked_n_by_stream.lock().unwrap().is_empty());
+        assert!(state
+            .terminal_io_acked_n_by_stream
+            .lock()
+            .unwrap()
+            .is_empty());
         assert_eq!(state.terminal_io_acking_streams.load(Ordering::SeqCst), 0);
 
         assert!(cloud_mcp_terminal_io_record_output_ack_if_subscribed(
@@ -59497,7 +59852,11 @@ mod cloud_mcp_tests {
         assert_eq!(state.terminal_io_acking_streams.load(Ordering::SeqCst), 1);
         // Global clear resets both the map and the fast-path counter.
         cloud_mcp_clear_terminal_remote_presence_state(&state, "test_ack_clear_all");
-        assert!(state.terminal_io_acked_n_by_stream.lock().unwrap().is_empty());
+        assert!(state
+            .terminal_io_acked_n_by_stream
+            .lock()
+            .unwrap()
+            .is_empty());
         assert_eq!(state.terminal_io_acking_streams.load(Ordering::SeqCst), 0);
     }
 
@@ -59538,9 +59897,7 @@ mod cloud_mcp_tests {
             Some("attach-other"),
         ));
         assert!(cloud_mcp_terminal_io_origin_is_subscribed(
-            &state,
-            stream_key,
-            "viewer-d",
+            &state, stream_key, "viewer-d",
         ));
         assert_eq!(state.terminal_io_acking_streams.load(Ordering::SeqCst), 1);
         // A matching (or unscoped) detach removes the lease AND the origin's
@@ -59552,11 +59909,13 @@ mod cloud_mcp_tests {
             Some("attach-viewer-d"),
         ));
         assert!(!cloud_mcp_terminal_io_origin_is_subscribed(
-            &state,
-            stream_key,
-            "viewer-d",
+            &state, stream_key, "viewer-d",
         ));
-        assert!(state.terminal_io_acked_n_by_stream.lock().unwrap().is_empty());
+        assert!(state
+            .terminal_io_acked_n_by_stream
+            .lock()
+            .unwrap()
+            .is_empty());
         assert_eq!(state.terminal_io_acking_streams.load(Ordering::SeqCst), 0);
     }
 
@@ -59564,19 +59923,15 @@ mod cloud_mcp_tests {
     fn termio_flow_gate_pauses_on_slowest_attached_acking_origin() {
         let state = CloudMcpState::new();
         let stream_key = "device:workspace:pane:83".to_string();
-        state
-            .terminal_io_tail_by_stream
-            .lock()
-            .unwrap()
-            .insert(
-                stream_key.clone(),
-                CloudMcpTerminalIoTail {
-                    seq: 9,
-                    total_bytes: 400_000,
-                    tail: vec![b'x'; 8],
-                    emitted_n: 200_000,
-                },
-            );
+        state.terminal_io_tail_by_stream.lock().unwrap().insert(
+            stream_key.clone(),
+            CloudMcpTerminalIoTail {
+                seq: 9,
+                total_bytes: 400_000,
+                tail: vec![b'x'; 8],
+                emitted_n: 200_000,
+            },
+        );
         state
             .terminal_io_stream_subscriptions
             .lock()
@@ -59584,9 +59939,18 @@ mod cloud_mcp_tests {
             .insert(
                 stream_key.clone(),
                 HashMap::from([
-                    ("viewer-slow".to_string(), termio_test_subscription("a-slow", 10)),
-                    ("viewer-fast".to_string(), termio_test_subscription("a-fast", 20)),
-                    ("viewer-legacy".to_string(), termio_test_subscription("a-legacy", 30)),
+                    (
+                        "viewer-slow".to_string(),
+                        termio_test_subscription("a-slow", 10),
+                    ),
+                    (
+                        "viewer-fast".to_string(),
+                        termio_test_subscription("a-fast", 20),
+                    ),
+                    (
+                        "viewer-legacy".to_string(),
+                        termio_test_subscription("a-legacy", 30),
+                    ),
                 ]),
             );
         // Legacy stream: nobody acks, flow control never pauses.
@@ -59695,20 +60059,39 @@ mod cloud_mcp_tests {
 
         // Legacy live frame before any ack.
         cloud_mcp_publish_terminal_output_delta(
-            &state, &output, workspace_id, pane_id, instance_id, 1, b"hello",
+            &state,
+            &output,
+            workspace_id,
+            pane_id,
+            instance_id,
+            1,
+            b"hello",
         );
         let frame = termio_test_try_recv(&mut rx).expect("first live frame");
         assert_eq!(frame["kind"], json!("termio.output"));
-        assert_eq!((frame["f"].as_u64(), frame["n"].as_u64()), (Some(0), Some(5)));
+        assert_eq!(
+            (frame["f"].as_u64(), frame["n"].as_u64()),
+            (Some(0), Some(5))
+        );
 
         // The viewer starts acking; a window-sized burst still emits (the
         // window is measured on bytes outstanding BEFORE the frame).
         tauri::async_runtime::block_on(cloud_mcp_terminal_io_handle_output_ack(
-            &state, &output, &target, "viewer-flow", 5,
+            &state,
+            &output,
+            &target,
+            "viewer-flow",
+            5,
         ));
         let burst = vec![b'x'; 100 * 1024];
         cloud_mcp_publish_terminal_output_delta(
-            &state, &output, workspace_id, pane_id, instance_id, 2, &burst,
+            &state,
+            &output,
+            workspace_id,
+            pane_id,
+            instance_id,
+            2,
+            &burst,
         );
         let frame = termio_test_try_recv(&mut rx).expect("burst frame");
         assert_eq!(frame["n"].as_u64(), Some(5 + 100 * 1024));
@@ -59716,7 +60099,13 @@ mod cloud_mcp_tests {
         // Outstanding bytes now exceed the window: the next frame is PAUSED —
         // no enqueue, no gap frame — while journal and tail keep advancing.
         cloud_mcp_publish_terminal_output_delta(
-            &state, &output, workspace_id, pane_id, instance_id, 3, b"after-pause",
+            &state,
+            &output,
+            workspace_id,
+            pane_id,
+            instance_id,
+            3,
+            b"after-pause",
         );
         assert!(termio_test_try_recv(&mut rx).is_err());
         let total = output.lock().unwrap().total_bytes;
@@ -59756,7 +60145,11 @@ mod cloud_mcp_tests {
         assert_eq!(frame["q"], json!(3));
         assert_eq!(
             frame["id"],
-            json!(format!("termio-flow-replay-{}-3-{}", instance_id, 5 + 100 * 1024))
+            json!(format!(
+                "termio-flow-replay-{}-3-{}",
+                instance_id,
+                5 + 100 * 1024
+            ))
         );
         assert!(frame.get("origin_connection_id").is_none());
         let decoded = general_purpose::STANDARD
@@ -59764,7 +60157,10 @@ mod cloud_mcp_tests {
             .unwrap();
         assert_eq!(decoded, b"after-pause");
         assert!(termio_test_try_recv(&mut rx).is_err());
-        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
+        assert_eq!(
+            cloud_mcp_terminal_output_emitted_n(&state, &stream_key),
+            total
+        );
 
         // A duplicate ack is a no-op (lane already current).
         tauri::async_runtime::block_on(cloud_mcp_terminal_io_handle_output_ack(
@@ -59778,7 +60174,13 @@ mod cloud_mcp_tests {
 
         // Live emission continues after resume.
         cloud_mcp_publish_terminal_output_delta(
-            &state, &output, workspace_id, pane_id, instance_id, 4, b"live-again",
+            &state,
+            &output,
+            workspace_id,
+            pane_id,
+            instance_id,
+            4,
+            b"live-again",
         );
         let frame = termio_test_try_recv(&mut rx).expect("post-resume live frame");
         assert_eq!(frame["kind"], json!("termio.output"));
@@ -59793,12 +60195,8 @@ mod cloud_mcp_tests {
         let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
         let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
             .unwrap_or_else(|| "desktop-primary".to_string());
-        let stream_key = cloud_mcp_terminal_output_stream_key(
-            &device_id,
-            "workspace-snap",
-            "pane-snap",
-            92,
-        );
+        let stream_key =
+            cloud_mcp_terminal_output_stream_key(&device_id, "workspace-snap", "pane-snap", 92);
         let target = cloud_mcp_terminal_io_target(&stream_key).expect("snap stream target");
         // A small missing range (below the skip-forward bound) whose bytes
         // the tail nevertheless cannot reconstruct: the retained tail starts
@@ -59853,7 +60251,10 @@ mod cloud_mcp_tests {
             .unwrap()
             .is_empty());
         assert!(termio_test_try_recv(&mut rx).is_err());
-        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
+        assert_eq!(
+            cloud_mcp_terminal_output_emitted_n(&state, &stream_key),
+            total
+        );
     }
 
     #[test]
@@ -59867,17 +60268,12 @@ mod cloud_mcp_tests {
         // latest-wins decision still skips forward with one snapshot instead
         // of replaying the backlog.
         let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
-        let stream_key = cloud_mcp_terminal_output_stream_key(
-            &device_id,
-            "workspace-bound",
-            "pane-bound",
-            95,
-        );
+        let stream_key =
+            cloud_mcp_terminal_output_stream_key(&device_id, "workspace-bound", "pane-bound", 95);
         let target = cloud_mcp_terminal_io_target(&stream_key).expect("bound stream target");
         let emitted = 8_u64;
-        let over = vec![b'x'; emitted as usize
-            + CLOUD_MCP_TERMINAL_IO_SKIP_FORWARD_BYTES as usize
-            + 1];
+        let over =
+            vec![b'x'; emitted as usize + CLOUD_MCP_TERMINAL_IO_SKIP_FORWARD_BYTES as usize + 1];
         output.lock().unwrap().append(&over);
         let total = over.len() as u64;
         assert!(cloud_mcp_remember_terminal_output_tail(
@@ -59915,8 +60311,14 @@ mod cloud_mcp_tests {
             .decode(frame["b"].as_str().expect("snapshot carries vt bytes"))
             .unwrap()
             .is_empty());
-        assert!(termio_test_try_recv(&mut rx).is_err(), "one snapshot, no replay frames");
-        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
+        assert!(
+            termio_test_try_recv(&mut rx).is_err(),
+            "one snapshot, no replay frames"
+        );
+        assert_eq!(
+            cloud_mcp_terminal_output_emitted_n(&state, &stream_key),
+            total
+        );
 
         // Missing range EXACTLY at the bound: still a tail replay.
         let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
@@ -59970,7 +60372,10 @@ mod cloud_mcp_tests {
             (CLOUD_MCP_TERMINAL_IO_SKIP_FORWARD_BYTES as usize)
                 .div_ceil(CLOUD_MCP_TERMINAL_OUTPUT_REPLAY_CHUNK_BYTES)
         );
-        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
+        assert_eq!(
+            cloud_mcp_terminal_output_emitted_n(&state, &stream_key),
+            total
+        );
 
         // Structural pin: attach-path snapshots stay stamped with the
         // requesting attachment_id; the flow resume never stamps one.
@@ -60107,7 +60512,10 @@ mod cloud_mcp_tests {
         assert_eq!(frame["f"].as_u64(), Some(200_000));
         assert_eq!(frame["n"].as_u64(), Some(total));
         assert!(termio_test_try_recv(&mut rx).is_err());
-        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
+        assert_eq!(
+            cloud_mcp_terminal_output_emitted_n(&state, &stream_key),
+            total
+        );
         assert!(!cloud_mcp_terminal_output_flow_should_pause(
             &state,
             &stream_key
@@ -60135,12 +60543,8 @@ mod cloud_mcp_tests {
         let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
         let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
             .unwrap_or_else(|| "desktop-primary".to_string());
-        let stream_key = cloud_mcp_terminal_output_stream_key(
-            &device_id,
-            "workspace-deadtx",
-            "pane-deadtx",
-            98,
-        );
+        let stream_key =
+            cloud_mcp_terminal_output_stream_key(&device_id, "workspace-deadtx", "pane-deadtx", 98);
         let target = cloud_mcp_terminal_io_target(&stream_key).expect("deadtx stream target");
         // Multi-chunk missing range (> one 48KiB frame) so a mid-loop
         // failure would be observable as partial advancement.
@@ -60187,7 +60591,10 @@ mod cloud_mcp_tests {
             next_from = frame["n"].as_u64().expect("replay frame n");
         }
         assert_eq!(next_from, total);
-        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
+        assert_eq!(
+            cloud_mcp_terminal_output_emitted_n(&state, &stream_key),
+            total
+        );
 
         // Snapshot skip-forward path under a dead sender: same contract.
         let (dead_tx, dead_rx) = mpsc::unbounded_channel::<CloudMcpTermioOutbound>();
@@ -60236,7 +60643,10 @@ mod cloud_mcp_tests {
         ));
         let frame = termio_test_try_recv(&mut rx).expect("retried skip-forward snapshot");
         assert_eq!(frame["kind"], json!("termio.snapshot"));
-        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
+        assert_eq!(
+            cloud_mcp_terminal_output_emitted_n(&state, &stream_key),
+            total
+        );
     }
 
     #[test]
@@ -60310,7 +60720,10 @@ mod cloud_mcp_tests {
         }
         assert_eq!(frames, 3);
         assert_eq!(next_from, total);
-        assert_eq!(cloud_mcp_terminal_output_emitted_n(&state, &stream_key), total);
+        assert_eq!(
+            cloud_mcp_terminal_output_emitted_n(&state, &stream_key),
+            total
+        );
     }
 
     #[test]
@@ -60362,8 +60775,7 @@ mod cloud_mcp_tests {
             93,
         );
         let now_ms = cloud_mcp_now_ms();
-        let stale_ms =
-            now_ms.saturating_sub(TERMINAL_REMOTE_PRESENCE_STALE_ORIGIN_TTL_MS + 5_000);
+        let stale_ms = now_ms.saturating_sub(TERMINAL_REMOTE_PRESENCE_STALE_ORIGIN_TTL_MS + 5_000);
         state
             .terminal_io_stream_subscriptions
             .lock()
@@ -61898,7 +62310,20 @@ mod cloud_mcp_tests {
                     "workspace_root": "/repo/one",
                     "workspace_active": true,
                     "workspace_status": "active",
-                    "terminals": [{"terminal_id": "w1-terminal", "status": "running"}]
+                    "terminals": [{
+                        "terminal_id": "w1-terminal",
+                        "status": "running",
+                        "terminal_state_contract_version": 1,
+                        "canonical_state": "uir",
+                        "canonical_badge_label": "input required",
+                        "canonical_state_seq": 7,
+                        "turn_active": true,
+                        "turn_generation": 2,
+                        "completed_turn_generation": 1,
+                        "active_interaction_id": "uir:w1:7",
+                        "active_interaction_revision": 7,
+                        "interaction_actionable": true
+                    }]
                 }]),
                 None,
                 Some("workspace_activate_runtime".to_string()),
@@ -61939,6 +62364,11 @@ mod cloud_mcp_tests {
             .expect("W2 on activation wire");
         assert_eq!(w1["workspace_active"], json!(true));
         assert_eq!(w1["terminals"][0]["terminal_id"], json!("w1-terminal"));
+        assert_eq!(
+            w1["terminals"][0]["active_interaction_id"],
+            json!("uir:w1:7")
+        );
+        assert_eq!(w1["terminals"][0]["active_interaction_revision"], json!(7));
         assert_eq!(w2["workspace_active"], json!(true));
         assert_eq!(w2["terminals"][0]["terminal_id"], json!("w2-terminal"));
 
@@ -62998,6 +63428,7 @@ mod cloud_mcp_tests {
         TerminalActivityHookPayload {
             pane_id: "pane-1".to_string(),
             instance_id: 1,
+            terminal_process_epoch: "test-process-epoch".to_string(),
             workspace_id: "workspace-a".to_string(),
             workspace_name: "Workspace A".to_string(),
             terminal_index: Some(0),
@@ -63010,6 +63441,19 @@ mod cloud_mcp_tests {
             terminal_name: "Codex".to_string(),
             terminal_nickname: String::new(),
             provider: "codex".to_string(),
+            terminal_state_contract_version: 1,
+            canonical_state: "thinking".to_string(),
+            canonical_badge_label: "thinking".to_string(),
+            canonical_state_seq: 1,
+            prompt_state_seq: 0,
+            turn_generation: 1,
+            turn_generation_explicit: true,
+            completed_turn_generation: 0,
+            turn_active: true,
+            active_interaction_id: None,
+            active_interaction_revision: None,
+            interaction_actionable: false,
+            turn_settlement_accepted: false,
             event_type: event_type.to_string(),
             hook_event_name: event_type.to_string(),
             source: "test".to_string(),
@@ -63071,6 +63515,8 @@ mod cloud_mcp_tests {
             prompt_answer_option: None,
             interaction_id: None,
             interaction_revision: None,
+            event_interaction_id: None,
+            event_interaction_revision: None,
             interaction_source: None,
             interaction_response_mode: None,
             provider_request_id: None,
@@ -63089,6 +63535,34 @@ mod cloud_mcp_tests {
             observed_at_ms: 0,
             completion_evidence: String::new(),
         }
+    }
+
+    #[test]
+    fn terminal_canonical_contract_emits_all_version_one_fields_verbatim() {
+        let mut payload = agent_chat_status_hook_test_payload("provider-user-prompt-started");
+        payload.canonical_state = "uir".to_string();
+        payload.canonical_badge_label = "input required".to_string();
+        payload.canonical_state_seq = 41;
+        payload.turn_active = true;
+        payload.turn_generation = 7;
+        payload.completed_turn_generation = 6;
+        payload.active_interaction_id = Some("uir:41".to_string());
+        payload.active_interaction_revision = Some(41);
+        payload.interaction_actionable = true;
+        payload.prompt_state_seq = 9;
+        let contract = cloud_mcp_terminal_canonical_contract(&payload);
+
+        assert_eq!(contract["terminal_state_contract_version"], json!(1));
+        assert_eq!(contract["canonical_state"], json!("uir"));
+        assert_eq!(contract["canonical_badge_label"], json!("input required"));
+        assert_eq!(contract["canonical_state_seq"], json!(41));
+        assert_eq!(contract["turn_active"], json!(true));
+        assert_eq!(contract["turn_generation"], json!(7));
+        assert_eq!(contract["completed_turn_generation"], json!(6));
+        assert_eq!(contract["active_interaction_id"], json!("uir:41"));
+        assert_eq!(contract["active_interaction_revision"], json!(41));
+        assert_eq!(contract["interaction_actionable"], json!(true));
+        assert_eq!(contract["prompt_state_seq"], json!(9));
     }
 
     #[test]
@@ -63390,8 +63864,195 @@ mod cloud_mcp_tests {
         assert_eq!(terminal["terminal_is_prompting_user"], json!(true));
     }
 
+    #[tokio::test]
+    async fn terminal_state_cache_rejects_late_lower_sequence_open_cohorts() {
+        let state = CloudMcpState::new();
+        let runtime = json!({
+            "workspace_id": "workspace-a",
+            "workspace_name": "Workspace A",
+            "terminal_id": "pane-1",
+            "pane_id": "pane-1",
+            "terminal_instance_id": 7,
+            "terminal_state_contract_version": 1,
+            "canonical_state": "uir",
+            "canonical_badge_label": "input required",
+            "canonical_state_seq": 2,
+            "prompt_state_seq": 2,
+            "turn_active": true,
+            "turn_generation": 1,
+            "completed_turn_generation": 0,
+            "active_interaction_id": "uir:b",
+            "active_interaction_revision": 2,
+            "interaction_actionable": true,
+            "interaction_id": "uir:b",
+            "interaction_revision": 2,
+            "prompt_id": "prompt-b",
+            "prompt_options": [{"id": "continue"}],
+            "permission_mode": "acceptEdits",
+            "manual_prompt_source": "provider-b",
+            "provider_blocked_for_user": true,
+            "terminal_is_prompting_user": true,
+            "observed_at_ms": 10,
+        });
+        cloud_mcp_apply_terminal_state_to_device_live_snapshot(
+            &state,
+            &runtime,
+            "terminal_activity_hook",
+        )
+        .await;
+
+        let late_open = json!({
+            "workspace_id": "workspace-a",
+            "workspace_name": "Workspace A",
+            "terminal_id": "pane-1",
+            "pane_id": "pane-1",
+            "terminal_instance_id": 7,
+            "terminal_state_contract_version": 1,
+            "canonical_state": "starting",
+            "canonical_badge_label": "starting",
+            "canonical_state_seq": 1,
+            "prompt_state_seq": 0,
+            "turn_active": false,
+            "turn_generation": 0,
+            "completed_turn_generation": 0,
+            "active_interaction_id": null,
+            "active_interaction_revision": null,
+            "interaction_actionable": false,
+            "permission_mode": "plan",
+            "manual_prompt_source": "stale-a",
+            "provider_blocked_for_user": false,
+            "terminal_is_prompting_user": false,
+            "observed_at_ms": 20,
+        });
+        cloud_mcp_apply_terminal_state_to_device_live_snapshot(
+            &state,
+            &late_open,
+            "terminal_opened",
+        )
+        .await;
+
+        let snapshots = state.runtime_snapshots.lock().await;
+        let terminal = &snapshots
+            .workspace_terminals
+            .as_ref()
+            .expect("workspace terminals")["workspaces"][0]["terminals"][0];
+        assert_eq!(terminal["canonical_state"], json!("uir"));
+        assert_eq!(terminal["canonical_state_seq"], json!(2));
+        assert_eq!(terminal["active_interaction_id"], json!("uir:b"));
+        assert_eq!(terminal["prompt_state_seq"], json!(2));
+        assert_eq!(terminal["interaction_id"], json!("uir:b"));
+        assert_eq!(terminal["permission_mode"], json!("acceptEdits"));
+        assert_eq!(terminal["manual_prompt_source"], json!("provider-b"));
+        assert_eq!(terminal["terminal_is_prompting_user"], json!(true));
+    }
+
     #[test]
-    fn workspace_status_snapshot_preserves_pending_sequenced_prompt_cohort() {
+    fn terminal_cache_process_epoch_accepts_restart_instance_one_but_rejects_same_epoch_old() {
+        let mut retained = json!({
+            "pane_id": "pane-1",
+            "terminal_process_epoch": "00000000000000000200-process-a",
+            "terminal_instance_id": 8,
+            "terminal_state_contract_version": 1,
+            "canonical_state": "closed",
+            "canonical_badge_label": "closed",
+            "canonical_state_seq": 90,
+            "turn_active": false,
+            "turn_generation": 4,
+            "completed_turn_generation": 4,
+            "active_interaction_id": null,
+            "active_interaction_revision": null,
+            "interaction_actionable": false,
+            "prompt_state_seq": 90,
+            "prompt_id": "",
+            "terminal_is_prompting_user": false
+        });
+        let restarted = json!({
+            "pane_id": "pane-1",
+            "terminal_process_epoch": "00004000000000000001-00000000000000000100-process-b",
+            "terminal_instance_id": 1,
+            "terminal_state_contract_version": 1,
+            "canonical_state": "starting",
+            "canonical_badge_label": "starting",
+            "canonical_state_seq": 1,
+            "turn_active": false,
+            "turn_generation": 0,
+            "completed_turn_generation": 0,
+            "active_interaction_id": null,
+            "active_interaction_revision": null,
+            "interaction_actionable": false,
+            "prompt_state_seq": 0,
+            "terminal_is_prompting_user": false
+        });
+        cloud_mcp_merge_terminal_state_cohort_aware(&mut retained, restarted.clone());
+        assert_eq!(retained, restarted);
+
+        let mut same_epoch_current = json!({
+            "pane_id": "pane-1",
+            "terminal_process_epoch": "00004000000000000001-00000000000000000100-process-b",
+            "terminal_instance_id": 8,
+            "prompt_state_seq": 52,
+            "prompt_id": "prompt-new"
+        });
+        let delayed_old = json!({
+            "pane_id": "pane-1",
+            "terminal_process_epoch": "00004000000000000001-00000000000000000100-process-b",
+            "terminal_instance_id": 7,
+            "prompt_state_seq": 99,
+            "prompt_id": "prompt-old"
+        });
+        let expected = same_epoch_current.clone();
+        cloud_mcp_merge_terminal_state_cohort_aware(&mut same_epoch_current, delayed_old);
+        assert_eq!(same_epoch_current, expected);
+    }
+
+    #[test]
+    fn terminal_cache_process_epoch_order_is_antisymmetric_for_same_prefix_collisions() {
+        let epoch_a = json!({
+            "terminal_process_epoch": "00004000000000000001-00000000000000000100-process-a"
+        });
+        let epoch_b = json!({
+            "terminal_process_epoch": "00004000000000000001-00000000000000000100-process-b"
+        });
+
+        let a_to_b = cloud_mcp_terminal_process_epoch_order(&epoch_a, &epoch_b)
+            .expect("distinct epochs must have an order");
+        let b_to_a = cloud_mcp_terminal_process_epoch_order(&epoch_b, &epoch_a)
+            .expect("distinct epochs must have an order");
+        assert_eq!(a_to_b, b_to_a.reverse());
+    }
+
+    #[test]
+    fn terminal_cache_opaque_delayed_instance_uses_prompt_sequence() {
+        let mut current = json!({
+            "pane_id": "pane-1",
+            "terminal_instance_id": "instance-new",
+            "provider": "codex",
+            "prompt_state_seq": 52,
+            "prompt_id": "prompt-new",
+            "interaction_id": "uir:new",
+            "interaction_revision": 52,
+            "terminal_is_prompting_user": true
+        });
+        let delayed_old = json!({
+            "pane_id": "pane-1",
+            "terminal_instance_id": "instance-old",
+            "provider": "opencode",
+            "prompt_state_seq": 51,
+            "prompt_id": "prompt-old",
+            "interaction_id": "uir:old",
+            "interaction_revision": 9_999_999_u64,
+            "terminal_is_prompting_user": true
+        });
+        cloud_mcp_merge_terminal_state_cohort_aware(&mut current, delayed_old);
+        assert_eq!(current["terminal_instance_id"], json!("instance-new"));
+        assert_eq!(current["provider"], json!("codex"));
+        assert_eq!(current["prompt_state_seq"], json!(52));
+        assert_eq!(current["prompt_id"], json!("prompt-new"));
+        assert_eq!(current["interaction_id"], json!("uir:new"));
+    }
+
+    #[test]
+    fn workspace_status_snapshot_preserves_only_same_instance_prompt_cohort() {
         let cached_prompt = json!({
             "workspaces": [{
                 "workspace_id": "workspace-a",
@@ -63454,15 +64115,57 @@ mod cloud_mcp_tests {
 
         let terminal = &status_snapshot["workspaces"][0]["terminals"][0];
         assert_eq!(terminal["status"], json!("running"));
-        assert_eq!(terminal["terminal_instance_id"], json!(8));
-        assert_eq!(terminal["terminal_epoch"], json!("pane-1:8"));
-        assert_eq!(terminal["provider"], json!("codex"));
-        assert_eq!(terminal["prompt_state_seq"], json!(51));
-        assert_eq!(terminal["prompt_id"], json!("prompt-b"));
-        assert_eq!(terminal["prompt_options"], json!([{"id": "continue"}]));
-        assert_eq!(terminal["interaction_id"], json!("uir:b"));
-        assert_eq!(terminal["provider_request_id"], json!("request-b"));
+        assert_eq!(terminal["terminal_instance_id"], json!(7));
+        assert_eq!(terminal["terminal_epoch"], json!("pane-1:7"));
+        assert_eq!(terminal["provider"], json!("opencode"));
+        assert_eq!(terminal["prompt_state_seq"], json!(50));
+        assert_eq!(terminal["prompt_id"], json!("prompt-a"));
+        assert_eq!(terminal["interaction_id"], json!("uir:a"));
         assert_eq!(terminal["terminal_is_prompting_user"], json!(true));
+    }
+
+    #[test]
+    fn reopened_instance_prompt_never_inherits_closed_instance_cohort() {
+        let cached = json!({
+            "workspaces": [{
+                "workspace_id": "workspace-a",
+                "workspace_active": true,
+                "terminals": [{
+                    "pane_id": "pane-1",
+                    "terminal_instance_id": 7,
+                    "terminal_epoch": "pane-1:7",
+                    "prompt_state_seq": 90,
+                    "prompt_id": "old-prompt",
+                    "interaction_id": "uir:old",
+                    "interaction_revision": 90,
+                    "terminal_is_prompting_user": true
+                }]
+            }]
+        });
+        let mut reopened = json!({
+            "workspaces": [{
+                "workspace_id": "workspace-a",
+                "workspace_active": true,
+                "terminals": [{
+                    "pane_id": "pane-1",
+                    "terminal_instance_id": 8,
+                    "terminal_epoch": "pane-1:8",
+                    "prompt_state_seq": 1,
+                    "prompt_id": "new-prompt",
+                    "interaction_id": "uir:new",
+                    "interaction_revision": 1,
+                    "terminal_is_prompting_user": true
+                }]
+            }]
+        });
+
+        cloud_mcp_preserve_cached_snapshot_prompt_cohorts(&mut reopened, Some(&cached));
+
+        let terminal = &reopened["workspaces"][0]["terminals"][0];
+        assert_eq!(terminal["terminal_instance_id"], json!(8));
+        assert_eq!(terminal["prompt_state_seq"], json!(1));
+        assert_eq!(terminal["prompt_id"], json!("new-prompt"));
+        assert_eq!(terminal["interaction_id"], json!("uir:new"));
     }
 
     #[test]
@@ -63696,6 +64399,62 @@ mod cloud_mcp_tests {
             .expect("workspace terminals")["workspaces"][0];
         assert_eq!(workspace["active_count"], json!(0));
         assert_eq!(workspace["workspace_active"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn device_live_cache_rejects_retired_instance_delta_after_reopen() {
+        let state = CloudMcpState::new();
+        {
+            let mut snapshots = state.runtime_snapshots.lock().await;
+            snapshots.workspace_terminals = Some(json!({
+                "workspaces": [{
+                    "workspace_id": "workspace-a",
+                    "workspace_active": true,
+                    "active_count": 1,
+                    "terminal_count": 1,
+                    "terminals": [{
+                        "pane_id": "pane-1",
+                        "terminal_id": "pane-1",
+                        "terminal_instance_id": 8,
+                        "status": "awaiting_input",
+                        "prompt_state_seq": 2,
+                        "prompt_id": "prompt-b",
+                        "interaction_id": "uir:b",
+                        "terminal_is_prompting_user": true
+                    }]
+                }]
+            }));
+        }
+        let delayed_old = json!({
+            "event_kind": "terminal_state_update",
+            "workspace_id": "workspace-a",
+            "pane_id": "pane-1",
+            "terminal_instance_id": 7,
+            "status": "idle",
+            "prompt_state_seq": 99,
+            "prompt_id": "prompt-a",
+            "interaction_id": "uir:a",
+            "terminal_is_prompting_user": true,
+            "observed_at_ms": 4_000,
+        });
+
+        cloud_mcp_apply_terminal_state_to_device_live_snapshot(
+            &state,
+            &delayed_old,
+            "retired_instance_test",
+        )
+        .await;
+        let snapshots = state.runtime_snapshots.lock().await;
+        let terminals = snapshots
+            .workspace_terminals
+            .as_ref()
+            .expect("workspace terminals")["workspaces"][0]["terminals"]
+            .as_array()
+            .expect("terminal rows");
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0]["terminal_instance_id"], json!(8));
+        assert_eq!(terminals[0]["prompt_id"], json!("prompt-b"));
+        assert_eq!(terminals[0]["interaction_id"], json!("uir:b"));
     }
 
     #[test]
@@ -71848,10 +72607,11 @@ mod cloud_mcp_tests {
 
     #[test]
     fn terminal_output_classifier_treats_codex_apps_boot_as_startup_not_turn_work() {
-        let mcp_boot =
-            "> stale prompt\nBooting MCP server: codex_apps (12s • esc to interrupt)";
+        let mcp_boot = "> stale prompt\nBooting MCP server: codex_apps (12s • esc to interrupt)";
 
-        assert!(cloud_mcp_terminal_output_has_mcp_startup_indicator(mcp_boot));
+        assert!(cloud_mcp_terminal_output_has_mcp_startup_indicator(
+            mcp_boot
+        ));
         assert!(!cloud_mcp_terminal_output_has_working_indicator(mcp_boot));
         assert!(!cloud_mcp_terminal_output_has_working_indicator(
             "Networking (12s • esc to interrupt)"
@@ -71863,7 +72623,9 @@ mod cloud_mcp_tests {
         assert!(!cloud_mcp_terminal_output_looks_ready(mcp_boot));
 
         let real_working = "Working (12s • esc to interrupt)";
-        assert!(cloud_mcp_terminal_output_has_working_indicator(real_working));
+        assert!(cloud_mcp_terminal_output_has_working_indicator(
+            real_working
+        ));
         assert!(cloud_mcp_terminal_output_looks_active(real_working));
         assert!(cloud_mcp_terminal_output_looks_active(&format!(
             "{mcp_boot}\n{real_working}"

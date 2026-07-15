@@ -3762,9 +3762,7 @@ fn codex_managed_activity_hook_trust_records(
                 }
                 let current_hash = codex_hook_normalized_hash(event_label, matcher, handler)?;
                 records.push((
-                    format!(
-                        "{key_source}:{event_label}:{group_index}:{handler_index}"
-                    ),
+                    format!("{key_source}:{event_label}:{group_index}:{handler_index}"),
                     current_hash,
                 ));
             }
@@ -3772,7 +3770,9 @@ fn codex_managed_activity_hook_trust_records(
     }
 
     if records.is_empty() {
-        return Err("Codex hooks config contains no Diff Forge activity hooks to trust.".to_string());
+        return Err(
+            "Codex hooks config contains no Diff Forge activity hooks to trust.".to_string(),
+        );
     }
     Ok(records)
 }
@@ -3839,9 +3839,7 @@ fn codex_config_with_managed_hook_trust(
                     path.display()
                 )
             })?;
-        if entry.get("trusted_hash").and_then(toml::Value::as_str)
-            != Some(current_hash.as_str())
-        {
+        if entry.get("trusted_hash").and_then(toml::Value::as_str) != Some(current_hash.as_str()) {
             entry.insert(
                 "trusted_hash".to_string(),
                 toml::Value::String(current_hash.clone()),
@@ -3891,11 +3889,7 @@ fn persist_codex_managed_activity_hook_trust(
         }
     }
     for (path, bytes) in &updates {
-        agent_accounts_write_private_file_atomic_unlocked(
-            path,
-            bytes,
-            "Codex managed hook trust",
-        )?;
+        agent_accounts_write_private_file_atomic_unlocked(path, bytes, "Codex managed hook trust")?;
     }
     Ok(!updates.is_empty())
 }
@@ -4402,6 +4396,11 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
                 return 0;
             }
             Err(error) => {
+                let fallback_error_published = blocking_fallback.as_ref().is_some_and(|_| {
+                    let failure_record =
+                        diff_forge_activity_hook_transport_failure_record(&record, &error);
+                    diff_forge_activity_hook_append_record(&activity_path, &failure_record).is_ok()
+                });
                 write_diff_forge_activity_hook_debug(
                     &debug_path,
                     if blocking_fallback.is_some() {
@@ -4417,6 +4416,7 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
                     &activity_path,
                     json!({
                         "error": error,
+                        "fallback_error_published": fallback_error_published,
                         "hook_event_name": record.get("hook_event_name").and_then(Value::as_str).unwrap_or_default(),
                     }),
                 );
@@ -4428,6 +4428,12 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
         }
     }
     if let Some(response) = blocking_fallback {
+        let failure_record = diff_forge_activity_hook_transport_failure_record(
+            &record,
+            "Authenticated activity transport is unavailable.",
+        );
+        let fallback_error_published =
+            diff_forge_activity_hook_append_record(&activity_path, &failure_record).is_ok();
         write_diff_forge_activity_hook_debug(
             &debug_path,
             "blocking_transport_missing_failed_closed",
@@ -4438,6 +4444,7 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
             &terminal_index,
             &activity_path,
             json!({
+                "fallback_error_published": fallback_error_published,
                 "hook_event_name": record.get("hook_event_name").and_then(Value::as_str).unwrap_or_default(),
             }),
         );
@@ -4708,6 +4715,55 @@ fn diff_forge_activity_hook_blocking_fallback_response(record: &Value) -> Option
         }
         _ => None,
     }
+}
+
+fn diff_forge_activity_hook_transport_failure_record(record: &Value, reason: &str) -> Value {
+    let mut failure = record.as_object().cloned().unwrap_or_default();
+    let original_hook_event_name = record
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let observed_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    failure.insert("hook_event_name".to_string(), json!("TurnError"));
+    failure.insert(
+        "original_hook_event_name".to_string(),
+        json!(original_hook_event_name),
+    );
+    failure.insert(
+        "provider_code".to_string(),
+        json!("blocking_hook_transport_unavailable"),
+    );
+    failure.insert(
+        "safe_message".to_string(),
+        json!("Diff Forge could not establish its authenticated UIR transport."),
+    );
+    failure.insert("error".to_string(), json!(reason));
+    failure.insert("retryable".to_string(), json!(true));
+    failure.insert("provider_blocked_for_user".to_string(), json!(false));
+    failure.insert("terminal_is_prompting_user".to_string(), json!(false));
+    failure.insert("manual_approval_required".to_string(), json!(false));
+    failure.insert(
+        "completion_evidence".to_string(),
+        json!("blocking_hook_transport_unavailable"),
+    );
+    failure.insert("timestamp_ms".to_string(), json!(observed_at_ms));
+    Value::Object(failure)
+}
+
+fn diff_forge_activity_hook_append_record(path: &Path, record: &Value) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    file.write_all(format!("{record}\n").as_bytes())
+        .map_err(|error| error.to_string())
 }
 
 fn write_diff_forge_activity_hook_debug(
@@ -5860,6 +5916,14 @@ fn diff_forge_activity_hook_record_base(
         "approval_id": approval_id,
         "permission_prompt_id": permission_prompt_id,
         "permission_request_id": permission_request_id,
+        "interaction_id": hook_value(&[
+            "interaction_id",
+            "interactionId",
+        ]),
+        "interaction_revision": hook_value(&[
+            "interaction_revision",
+            "interactionRevision",
+        ]),
         "resolved_interaction_id": hook_value(&[
             "resolved_interaction_id",
             "resolvedInteractionId",
@@ -6624,7 +6688,9 @@ mod terminal_cli_tests {
         assert!(!coordinated
             .windows(2)
             .any(|pair| pair == ["--disable", "apps"]));
-        assert!(coordinated.iter().any(|arg| arg.contains("coordination-kernel")));
+        assert!(coordinated
+            .iter()
+            .any(|arg| arg.contains("coordination-kernel")));
         assert!(coordinated
             .iter()
             .any(|arg| arg.contains("workspace-mcp-gateway")));
@@ -7392,6 +7458,34 @@ mod terminal_cli_tests {
     }
 
     #[test]
+    fn opencode_stop_failure_normalization_preserves_original_interaction_identity() {
+        let record = diff_forge_activity_hook_record(
+            "opencode",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "StopFailure",
+                "session_id": "session-1",
+                "error_code": "permission_reply_failed",
+                "error": "reply failed",
+                "interactionId": "uir:opencode:session-1:permission:request-a:11",
+                "interactionRevision": 11,
+                "retryable": true
+            }),
+        );
+
+        assert_eq!(
+            record["interaction_id"],
+            json!("uir:opencode:session-1:permission:request-a:11")
+        );
+        assert_eq!(record["interaction_revision"], json!(11));
+        assert!(record["resolved_interaction_id"].is_null());
+        assert!(record["resolved_interaction_revision"].is_null());
+    }
+
+    #[test]
     fn activity_hook_record_preserves_native_question_and_schema_payloads() {
         let record = diff_forge_activity_hook_record(
             "claude",
@@ -7932,6 +8026,8 @@ mod terminal_cli_tests {
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("emitStop(sessionId"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("const IDLE_STOP_DELAY_MS = 1500"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("const emitQueues = new Map()"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("return previous.catch(() => {}).then(() => spawnHook(payload))"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("assistant_message_snapshot"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
             .contains("const assistantTextPartsByMessage = new Map()"));
@@ -7960,6 +8056,18 @@ mod terminal_cli_tests {
             .contains("await handlePendingPermission(sessionId, requestId, props, interactionAskFingerprint(props))"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
             .contains("hook_event_name: \"PermissionRequest\""));
+        assert_eq!(
+            DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+                .matches("interaction_id: interactionGeneration.interaction_id")
+                .count(),
+            4,
+        );
+        assert_eq!(
+            DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+                .matches("interaction_revision: interactionGeneration.interaction_revision")
+                .count(),
+            4,
+        );
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
             .contains("reconcilePendingPermissions(\"session.status\")"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
@@ -7981,8 +8089,9 @@ mod terminal_cli_tests {
             .contains("const pendingInteractionIds = new Map()"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
             .contains("const interactionAskFingerprint = (props)"));
-        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
-            .contains("scheduleHandledQuestionRevalidation"));
+        assert!(
+            DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("scheduleHandledQuestionRevalidation")
+        );
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
             .contains("scheduleNativeInteractionResolutionRevalidation"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
@@ -8353,6 +8462,26 @@ mod terminal_cli_tests {
             "hook_event_name": "PermissionRequest",
         }))
         .is_none());
+
+        let failure = diff_forge_activity_hook_transport_failure_record(
+            &json!({
+                "provider": "claude",
+                "hook_event_name": "PermissionRequest",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "provider_blocked_for_user": true,
+            }),
+            "transport timed out",
+        );
+        assert_eq!(failure["hook_event_name"], json!("TurnError"));
+        assert_eq!(
+            failure["provider_code"],
+            json!("blocking_hook_transport_unavailable")
+        );
+        assert_eq!(failure["provider_blocked_for_user"], json!(false));
+        assert_eq!(failure["terminal_is_prompting_user"], json!(false));
+        assert_eq!(failure["session_id"], json!("session-1"));
+        assert_eq!(failure["turn_id"], json!("turn-1"));
     }
 }
 
@@ -9251,14 +9380,16 @@ function spawnHook(payload) {
 function emit(payload) {
   if (!HOOK_BIN) return Promise.resolve(null);
   const hookName = String((payload && payload.hook_event_name) || "").toLowerCase();
+  const sessionKey = (payload && payload.session_id) || "global";
+  const previous = emitQueues.get(sessionKey) || Promise.resolve();
   if (hookName === "permissionrequest" || hookName === "userpromptrequired") {
     // Never head-of-line block the provider's resolution event behind a UIR
     // request that is intentionally waiting for the user. Native TUI, web,
-    // and push answers must be able to race and resolve one interaction.
-    return spawnHook(payload);
+    // and push answers must be able to race and resolve one interaction. The
+    // request still waits for already-enqueued session lifecycle events, so a
+    // prior idle Stop cannot be overtaken by the prompt it predates.
+    return previous.catch(() => {}).then(() => spawnHook(payload));
   }
-  const sessionKey = (payload && payload.session_id) || "global";
-  const previous = emitQueues.get(sessionKey) || Promise.resolve();
   const next = previous.catch(() => {}).then(() => spawnHook(payload));
   emitQueues.set(sessionKey, next);
   next.finally(() => {
@@ -9886,6 +10017,8 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
             session_id: sessionId,
             error_code: "permission_reply_failed",
             error: String((error && error.message) || error || "OpenCode permission reply failed."),
+            interaction_id: interactionGeneration.interaction_id,
+            interaction_revision: interactionGeneration.interaction_revision,
             retryable: true,
           });
         }
@@ -10396,6 +10529,8 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
               session_id: sessionId,
               error_code: "question_reply_failed",
               error: String((error && error.message) || error || "OpenCode question reply failed."),
+              interaction_id: interactionGeneration.interaction_id,
+              interaction_revision: interactionGeneration.interaction_revision,
               retryable: true,
             });
           }
@@ -13524,10 +13659,8 @@ fn run_agent_thread_turn_for_context(
     let working_directory = resolve_workspace_root_directory(request.working_directory.as_deref())?;
     let working_directory_text = working_directory.to_string_lossy().to_string();
     let mut launch_env_vars = env_vars.to_vec();
-    let resume_was_requested = terminal_clean_provider_session_id(Some(
-        &requested_provider_session_id,
-    ))
-    .is_some();
+    let resume_was_requested =
+        terminal_clean_provider_session_id(Some(&requested_provider_session_id)).is_some();
     let (launch_provider_session_id, codex_resume_home) = terminal_resolve_provider_resume_session(
         provider,
         terminal_clean_provider_session_id(Some(&requested_provider_session_id)),

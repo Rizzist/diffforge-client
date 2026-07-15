@@ -408,6 +408,11 @@ import {
   parseTerminalStateTimestampMs,
   shouldSuppressThreadPropThinking,
   terminalAgentUsesActivityHooks,
+  terminalCanonicalBadgePresentation,
+  terminalCanonicalCohortForInstance,
+  terminalCanonicalEventIsStale,
+  terminalCanonicalStateFromFields,
+  terminalLifecycleSettlementAccepted,
   terminalRailBadgePresentation,
   terminalRailStateFromExecutionPhase,
 } from "../terminalActivityState.js";
@@ -1506,6 +1511,10 @@ function terminalActivityHookEventTypeFromPayload(payload = {}) {
 }
 
 function terminalActivityStatusFromHookPayload(payload = {}, eventType = "") {
+  const canonicalState = terminalCanonicalStateFromFields(payload);
+  if (canonicalState) {
+    return canonicalState;
+  }
   const terminalPromptingUser = payload.terminal_is_prompting_user;
   if (
     terminalPromptingUser === true
@@ -2553,6 +2562,8 @@ function WorkspaceTerminal({
   const terminalThreadActivityStatusRef = useRef(terminalThreadActivityStatus);
   const workspaceThreadsLatestRef = useRef(workspaceThreads);
   const [terminalRuntimeActivityStatus, setTerminalRuntimeActivityStatus] = useState(terminalThreadActivityStatus);
+  const [terminalCanonicalProjection, setTerminalCanonicalProjection] = useState(null);
+  const terminalCanonicalProjectionRef = useRef(null);
   const terminalRuntimeActivityStatusRef = useRef(terminalThreadActivityStatus);
   const terminalThreadThinkingTraceSignatureRef = useRef("");
   const terminalThreadThinkingSinceRef = useRef(terminalThreadActivityStatus === "thinking" ? performance.now() : 0);
@@ -2705,6 +2716,8 @@ function WorkspaceTerminal({
     reason = "terminal_epoch_reset",
     thread_id: threadId = terminalThreadIdRef.current,
   } = {}) => {
+    terminalCanonicalProjectionRef.current = null;
+    setTerminalCanonicalProjection(null);
     const nextActivityStatus = normalizeTerminalEpochActivityStatus(activityStatus, agentId);
     terminalThreadThinkingSinceRef.current = 0;
     terminalThreadSubmittedPromptRef.current = null;
@@ -2726,6 +2739,20 @@ function WorkspaceTerminal({
         thread_id: threadId,
       }));
     }
+  };
+  const tombstoneTerminalCanonicalProjection = (type) => {
+    const current = terminalCanonicalProjectionRef.current || {};
+    const tombstone = {
+      ...terminalCanonicalCohortForInstance(current, {
+        instance_id: terminalInstanceIdRef.current || current.instance_id,
+        terminal_process_epoch: current.terminal_process_epoch || "",
+        type,
+      }),
+      instance_id: terminalInstanceIdRef.current || current.instance_id,
+      terminal_process_epoch: current.terminal_process_epoch || "",
+    };
+    terminalCanonicalProjectionRef.current = tombstone;
+    setTerminalCanonicalProjection(tombstone);
   };
   const markTerminalThreadActivityStatus = (status, options = {}) => {
     const nextStatus = String(status || "idle").trim().toLowerCase() || "idle";
@@ -3022,13 +3049,37 @@ function WorkspaceTerminal({
       if (!paneMatches || !workspaceMatches || !threadMatches || !instanceMatches || !terminalIndexMatches) {
         return;
       }
+      if (terminalCanonicalEventIsStale(terminalCanonicalProjectionRef.current || {}, payload)) {
+        return;
+      }
+      if (terminalCanonicalStateFromFields(payload)) {
+        const canonicalCohort = terminalCanonicalCohortForInstance(
+          terminalCanonicalProjectionRef.current || {},
+          payload,
+        );
+        const nextCanonicalProjection = terminalCanonicalStateFromFields(canonicalCohort)
+          || canonicalCohort.canonical_state_seq != null
+          || canonicalCohort.prompt_state_seq != null
+          ? {
+              ...canonicalCohort,
+              instance_id: payload.instance_id,
+              terminal_process_epoch: payload.terminal_process_epoch
+                || terminalCanonicalProjectionRef.current?.terminal_process_epoch
+                || "",
+            }
+          : null;
+        terminalCanonicalProjectionRef.current = nextCanonicalProjection;
+        setTerminalCanonicalProjection(nextCanonicalProjection);
+      }
 
       const started = eventType === "provider-turn-started"
         || eventType === "message-submitted"
         || eventType === "pending-prompt-sent";
-      const completed = eventType === "provider-turn-completed"
-        || eventType === "provider-turn-error"
-        || eventType === "provider-turn-interrupted";
+      const settlementAccepted = terminalLifecycleSettlementAccepted(payload);
+      const completed = (
+        (eventType === "provider-turn-completed" || eventType === "provider-turn-interrupted")
+        && settlementAccepted
+      ) || eventType === "provider-turn-error";
       const promptEventId = String(
         payload.prompt_event_id || payload.provider_turn_id || payload.turn_id || "",
       ).trim();
@@ -3061,6 +3112,19 @@ function WorkspaceTerminal({
           ? payloadTerminalIndex
           : currentTerminalIndex;
         listenerState.onThreadTerminalLifecycle({
+          terminal_state_contract_version: payload.terminal_state_contract_version,
+          canonical_state: payload.canonical_state,
+          canonical_badge_label: payload.canonical_badge_label,
+          canonical_state_seq: payload.canonical_state_seq,
+          prompt_state_seq: payload.prompt_state_seq,
+          turn_active: payload.turn_active,
+          turn_generation: payload.turn_generation,
+          completed_turn_generation: payload.completed_turn_generation,
+          terminal_process_epoch: payload.terminal_process_epoch,
+          active_interaction_id: payload.active_interaction_id,
+          active_interaction_revision: payload.active_interaction_revision,
+          interaction_actionable: payload.interaction_actionable,
+          turn_settlement_accepted: payload.turn_settlement_accepted,
           activity_status: nextActivityStatus,
           agent_id: payload.agent_id || payload.agent_kind || listenerState.terminal_agent_kind || "",
           command_phase: completed
@@ -16407,6 +16471,7 @@ function WorkspaceTerminal({
 
     setTerminalError("");
     terminalClosingRef.current = true;
+    tombstoneTerminalCanonicalProjection("closing");
     setTerminalClosing(true);
     setTerminalState("closing");
     setTerminalStatus({
@@ -16436,6 +16501,7 @@ function WorkspaceTerminal({
       terminalClosingRef.current = false;
       setTerminalClosing(false);
       const errorMessage = getErrorMessage(error, "Unable to close terminal.");
+      tombstoneTerminalCanonicalProjection("error");
       setTerminalState("error");
       setTerminalStatus({
         detail: errorMessage,
@@ -16459,6 +16525,7 @@ function WorkspaceTerminal({
     terminalClosingRef.current = false;
     setTerminalClosing(false);
     setTerminalClosed(true);
+    tombstoneTerminalCanonicalProjection("closed");
     setTerminalState("closed");
     setTerminalStatus({
       detail: "This pane is closed.",
@@ -17045,7 +17112,9 @@ function WorkspaceTerminal({
   const terminalStatusMode = isTerminalStatusErrorOverlay
     ? "detail"
     : terminalStatus?.mode || (terminalState === "starting" ? "compact" : "detail");
-  const terminalStateDebugPresentation = terminalRailBadgePresentation(resolveTerminalNativeRailState({
+  const terminalStateDebugPresentation = terminalCanonicalBadgePresentation(
+    terminalCanonicalProjection,
+  ) || terminalRailBadgePresentation(resolveTerminalNativeRailState({
     activity_status: terminalRuntimeActivityStatus || "idle",
     parked: Boolean(parkedPrompt),
     terminal_state: terminalState,
