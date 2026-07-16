@@ -73,10 +73,6 @@ const CLOUD_MCP_DEVICE_ID_FILE: &str = "device-id";
 const CLOUD_MCP_DEVICE_KEY_FILE: &str = "device-key";
 const CLOUD_MCP_ACCOUNT_SYNC_IDENTITY_FILE: &str = "account-sync-identity.json";
 const CLOUD_MCP_DELETED_WORKSPACE_IDS_FILE: &str = "workspace-deleted-ids.json";
-const DIFFFORGE_LOCAL_DEVICE_BRIDGE_PORT: u16 = 48_731;
-const DIFFFORGE_LOCAL_DEVICE_BRIDGE_PATH: &str = "/v1/device-proof";
-const DIFFFORGE_LOCAL_DEVICE_BRIDGE_MAX_REQUEST_BYTES: usize = 16 * 1024;
-const DIFFFORGE_LOCAL_DEVICE_BRIDGE_PROOF_TTL_MS: u64 = 30_000;
 const CLOUD_MCP_WORKSPACE_TODO_TEXT_MAX_CHARS: usize = 2_000_000;
 const CLOUD_MCP_WORKSPACE_TODO_MAX_ITEMS: usize = 120;
 const CLOUD_MCP_APP_CONTROL_WORKSPACE_ID: &str = "__diffforge_app_control__";
@@ -261,7 +257,6 @@ static CLOUD_MCP_OUTBOX_KNOWN_EMPTY: AtomicBool = AtomicBool::new(false);
 static CLOUD_MCP_OUTBOX_SCHEMA_PREPARED_PATHS: OnceLock<StdMutex<HashSet<PathBuf>>> =
     OnceLock::new();
 
-static CLOUD_MCP_LOCAL_DEVICE_BRIDGE_STARTED: AtomicBool = AtomicBool::new(false);
 static CLOUD_MCP_BACKGROUND_EVENT_SENDER: OnceLock<
     std::sync::mpsc::Sender<(String, CloudMcpOutboxRow)>,
 > = OnceLock::new();
@@ -25139,365 +25134,6 @@ fn cloud_mcp_desktop_device_profile() -> Value {
     profile
 }
 
-fn cloud_mcp_start_local_device_bridge() {
-    if CLOUD_MCP_LOCAL_DEVICE_BRIDGE_STARTED.swap(true, Ordering::SeqCst) {
-        return;
-    }
-
-    tauri::async_runtime::spawn(async {
-        if let Err(error) = cloud_mcp_local_device_bridge_loop().await {
-            eprintln!("Diff Forge local device bridge stopped: {error}");
-        }
-    });
-}
-
-async fn cloud_mcp_local_device_bridge_loop() -> Result<(), String> {
-    let listener = TcpListener::bind(("127.0.0.1", DIFFFORGE_LOCAL_DEVICE_BRIDGE_PORT))
-        .await
-        .map_err(|error| {
-            CLOUD_MCP_LOCAL_DEVICE_BRIDGE_STARTED.store(false, Ordering::SeqCst);
-            format!(
-                "unable to bind 127.0.0.1:{}: {error}",
-                DIFFFORGE_LOCAL_DEVICE_BRIDGE_PORT
-            )
-        })?;
-
-    loop {
-        let (stream, _) = listener
-            .accept()
-            .await
-            .map_err(|error| format!("unable to accept local bridge request: {error}"))?;
-        tauri::async_runtime::spawn(async move {
-            let _ = cloud_mcp_handle_local_device_bridge_request(stream).await;
-        });
-    }
-}
-
-async fn cloud_mcp_handle_local_device_bridge_request(mut stream: TcpStream) -> Result<(), String> {
-    let Some(request) = cloud_mcp_read_local_bridge_http_request(&mut stream).await else {
-        return cloud_mcp_write_local_bridge_response(
-            &mut stream,
-            400,
-            None,
-            json!({
-                "ok": false,
-                "error": "invalid_request",
-            }),
-        )
-        .await;
-    };
-
-    let origin = request
-        .headers
-        .get("origin")
-        .map(String::as_str)
-        .unwrap_or("");
-    let allowed_origin = cloud_mcp_local_bridge_allowed_origin(origin);
-    if request.method == "OPTIONS" {
-        return cloud_mcp_write_local_bridge_preflight(&mut stream, allowed_origin).await;
-    }
-
-    if request.method != "POST" || request.path != DIFFFORGE_LOCAL_DEVICE_BRIDGE_PATH {
-        return cloud_mcp_write_local_bridge_response(
-            &mut stream,
-            404,
-            allowed_origin,
-            json!({
-                "ok": false,
-                "error": "not_found",
-            }),
-        )
-        .await;
-    }
-
-    if allowed_origin.is_none() {
-        return cloud_mcp_write_local_bridge_response(
-            &mut stream,
-            403,
-            None,
-            json!({
-                "ok": false,
-                "error": "origin_not_allowed",
-            }),
-        )
-        .await;
-    }
-
-    let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
-    let nonce = cloud_mcp_payload_text(&body, &["nonce"])
-        .filter(|value| value.len() <= 160)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let web_device_id = cloud_mcp_payload_text(&body, &["web_device_id", "device_id"])
-        .filter(|value| value.len() <= 180)
-        .unwrap_or_else(|| "dashboard-web".to_string());
-    let web_session_id = cloud_mcp_payload_text(&body, &["web_session_id", "session_id"])
-        .filter(|value| value.len() <= 180)
-        .unwrap_or_default();
-
-    let proof = cloud_mcp_local_device_bridge_proof(&nonce, &web_device_id, &web_session_id);
-    cloud_mcp_write_local_bridge_response(
-        &mut stream,
-        200,
-        allowed_origin,
-        json!({
-            "ok": true,
-            "contract": "diffforge.local_device_bridge.v1",
-            "bridge_port": DIFFFORGE_LOCAL_DEVICE_BRIDGE_PORT,
-            "proof": proof,
-        }),
-    )
-    .await
-}
-
-fn cloud_mcp_local_device_bridge_proof(
-    nonce: &str,
-    web_device_id: &str,
-    web_session_id: &str,
-) -> Value {
-    let device_profile = cloud_mcp_desktop_device_profile();
-    let native_device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "machine_id"])
-        .unwrap_or_else(|| "rust-diffforge-desktop".to_string());
-    let native_device_name =
-        cloud_mcp_payload_text(&device_profile, &["device_name", "machine_name"])
-            .unwrap_or_else(|| "Diff Forge desktop".to_string());
-    let device_key_id =
-        cloud_mcp_payload_text(&device_profile, &["device_key_id"]).unwrap_or_default();
-    let device_public_key =
-        cloud_mcp_payload_text(&device_profile, &["device_public_key"]).unwrap_or_default();
-    let issued_at_ms = cloud_mcp_now_ms();
-    let expires_at_ms = issued_at_ms.saturating_add(DIFFFORGE_LOCAL_DEVICE_BRIDGE_PROOF_TTL_MS);
-    let signature = cloud_mcp_local_device_bridge_signature(
-        &native_device_id,
-        &device_key_id,
-        &device_public_key,
-        web_device_id,
-        web_session_id,
-        nonce,
-        issued_at_ms,
-        expires_at_ms,
-        DIFFFORGE_LOCAL_DEVICE_BRIDGE_PORT,
-    );
-    let (billing_scope_type, team_id) = cloud_mcp_process_account_scope();
-
-    json!({
-        "v": 1,
-        "contract": "diffforge.local_device_bridge.v1",
-        "source": "rust-diffforge",
-        "bridge_port": DIFFFORGE_LOCAL_DEVICE_BRIDGE_PORT,
-        "nonce": nonce,
-        "issued_at_ms": issued_at_ms,
-        "expires_at_ms": expires_at_ms,
-        "native_device_id": native_device_id,
-        "native_device_name": native_device_name,
-        "device_key_id": device_key_id,
-        "device_public_key": device_public_key,
-        "device_key_algorithm": "sha256-local-anchor-v1",
-        "platform": device_profile["platform"].clone(),
-        "form_factor": device_profile["form_factor"].clone(),
-        "client_kind": device_profile["client_kind"].clone(),
-        "client_type": device_profile["client_type"].clone(),
-        "connection_source": device_profile["connection_source"].clone(),
-        "billing_scope_type": billing_scope_type,
-        "team_id": team_id,
-        "web_device_id": web_device_id,
-        "web_session_id": web_session_id,
-        "signature_algorithm": "sha256-local-bridge-v1",
-        "signature": signature,
-    })
-}
-
-fn cloud_mcp_local_device_bridge_signature(
-    native_device_id: &str,
-    device_key_id: &str,
-    device_public_key: &str,
-    web_device_id: &str,
-    web_session_id: &str,
-    nonce: &str,
-    issued_at_ms: u64,
-    expires_at_ms: u64,
-    bridge_port: u16,
-) -> String {
-    let digest = Sha256::digest(
-        format!(
-            "diffforge-local-device-proof-v1\n{native_device_id}\n{device_key_id}\n{device_public_key}\n{web_device_id}\n{web_session_id}\n{nonce}\n{issued_at_ms}\n{expires_at_ms}\n{bridge_port}"
-        )
-        .as_bytes(),
-    );
-    format!("{digest:x}")
-}
-
-struct CloudMcpLocalBridgeRequest {
-    method: String,
-    path: String,
-    headers: HashMap<String, String>,
-    body: Vec<u8>,
-}
-
-async fn cloud_mcp_read_local_bridge_http_request(
-    stream: &mut TcpStream,
-) -> Option<CloudMcpLocalBridgeRequest> {
-    let mut buffer = Vec::with_capacity(2048);
-    let mut chunk = [0_u8; 2048];
-    let mut header_end = None;
-
-    loop {
-        let read = stream.read(&mut chunk).await.ok()?;
-        if read == 0 {
-            break;
-        }
-        buffer.extend_from_slice(&chunk[..read]);
-        if buffer.len() > DIFFFORGE_LOCAL_DEVICE_BRIDGE_MAX_REQUEST_BYTES {
-            return None;
-        }
-        if header_end.is_none() {
-            header_end = buffer.windows(4).position(|window| window == b"\r\n\r\n");
-        }
-        if let Some(end) = header_end {
-            let content_length = cloud_mcp_local_bridge_content_length(&buffer[..end])?;
-            let expected_len = end.saturating_add(4).saturating_add(content_length);
-            if buffer.len() >= expected_len {
-                break;
-            }
-        }
-    }
-
-    let header_end = header_end?;
-    let header_text = String::from_utf8_lossy(&buffer[..header_end]);
-    let mut lines = header_text.lines();
-    let request_line = lines.next()?.trim();
-    let mut request_parts = request_line.split_whitespace();
-    let method = request_parts.next()?.to_ascii_uppercase();
-    let path = request_parts
-        .next()
-        .unwrap_or("/")
-        .split('?')
-        .next()
-        .unwrap_or("/")
-        .to_string();
-    let mut headers = HashMap::new();
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
-    }
-    let content_length = headers
-        .get("content-length")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0)
-        .min(DIFFFORGE_LOCAL_DEVICE_BRIDGE_MAX_REQUEST_BYTES);
-    let body_start = header_end.saturating_add(4);
-    let body_end = body_start.saturating_add(content_length).min(buffer.len());
-    Some(CloudMcpLocalBridgeRequest {
-        method,
-        path,
-        headers,
-        body: buffer[body_start..body_end].to_vec(),
-    })
-}
-
-fn cloud_mcp_local_bridge_content_length(header_bytes: &[u8]) -> Option<usize> {
-    let header_text = String::from_utf8_lossy(header_bytes);
-    for line in header_text.lines().skip(1) {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        if name.trim().eq_ignore_ascii_case("content-length") {
-            return value
-                .trim()
-                .parse::<usize>()
-                .ok()
-                .filter(|value| *value <= DIFFFORGE_LOCAL_DEVICE_BRIDGE_MAX_REQUEST_BYTES);
-        }
-    }
-    Some(0)
-}
-
-fn cloud_mcp_local_bridge_allowed_origin(origin: &str) -> Option<String> {
-    let trimmed = origin.trim();
-    if trimmed.is_empty() || trimmed.len() > 256 {
-        return None;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("http://localhost:")
-        || lower.starts_with("http://127.0.0.1:")
-        || lower.starts_with("http://[::1]:")
-    {
-        return Some(trimmed.to_string());
-    }
-
-    let Some(rest) = lower.strip_prefix("https://") else {
-        return None;
-    };
-    let host = rest
-        .split('/')
-        .next()
-        .unwrap_or_default()
-        .split(':')
-        .next()
-        .unwrap_or_default();
-    if host == "diffforge.ai" || host.ends_with(".diffforge.ai") {
-        Some(trimmed.to_string())
-    } else {
-        None
-    }
-}
-
-async fn cloud_mcp_write_local_bridge_preflight(
-    stream: &mut TcpStream,
-    allowed_origin: Option<String>,
-) -> Result<(), String> {
-    let status = if allowed_origin.is_some() { 204 } else { 403 };
-    let origin_header = allowed_origin
-        .as_ref()
-        .map(|origin| format!("Access-Control-Allow-Origin: {origin}\r\n"))
-        .unwrap_or_default();
-    let response = format!(
-        "HTTP/1.1 {status} {}\r\n{origin_header}Access-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, X-DiffForge-Bridge\r\nAccess-Control-Allow-Private-Network: true\r\nAccess-Control-Max-Age: 300\r\nVary: Origin\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        if status == 204 {
-            "No Content"
-        } else {
-            "Forbidden"
-        },
-    );
-    stream
-        .write_all(response.as_bytes())
-        .await
-        .map_err(|error| format!("unable to write bridge preflight: {error}"))
-}
-
-async fn cloud_mcp_write_local_bridge_response(
-    stream: &mut TcpStream,
-    status: u16,
-    allowed_origin: Option<String>,
-    body: Value,
-) -> Result<(), String> {
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        403 => "Forbidden",
-        404 => "Not Found",
-        _ => "Internal Server Error",
-    };
-    let body = serde_json::to_vec(&body).unwrap_or_else(|_| b"{\"ok\":false}".to_vec());
-    let origin_header = allowed_origin
-        .as_ref()
-        .map(|origin| format!("Access-Control-Allow-Origin: {origin}\r\n"))
-        .unwrap_or_default();
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\n{origin_header}Access-Control-Allow-Private-Network: true\r\nVary: Origin\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len(),
-    );
-    stream
-        .write_all(response.as_bytes())
-        .await
-        .map_err(|error| format!("unable to write bridge response headers: {error}"))?;
-    stream
-        .write_all(&body)
-        .await
-        .map_err(|error| format!("unable to write bridge response body: {error}"))
-}
-
 #[tauri::command(rename_all = "snake_case")]
 async fn cloud_mcp_get_desktop_device_profile() -> Result<Value, String> {
     Ok(cloud_mcp_desktop_device_profile())
@@ -34996,6 +34632,17 @@ pub(crate) async fn cloud_mcp_mark_terminal_opened(
         .unwrap_or(metadata.agent_id.as_str())
         .to_string();
     let terminal_nickname_text = terminal_nickname.unwrap_or_default();
+    let launch_epoch = coordination
+        .and_then(|coordination| coordination.terminal_launch_epoch.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "{}:{pane_id}:{instance_id}",
+                metadata.terminal_process_epoch
+            )
+        });
     let payload = json!({
         "source": "rust-diffforge-terminal-open",
         "event_kind": "terminal_state_update",
@@ -35019,6 +34666,7 @@ pub(crate) async fn cloud_mcp_mark_terminal_opened(
         "terminal_process_epoch": metadata.terminal_process_epoch.as_str(),
         "terminal_index": metadata.terminal_index,
         "terminal_epoch": format!("{pane_id}:{instance_id}"),
+        "launch_epoch": launch_epoch,
         "terminal_name": terminal_display_name.clone(),
         "terminal_nickname": terminal_nickname_text,
         "thread_id": metadata.thread_id.as_str(),
@@ -35039,6 +34687,15 @@ pub(crate) async fn cloud_mcp_mark_terminal_opened(
         "active_interaction_id": null,
         "active_interaction_revision": null,
         "interaction_actionable": false,
+        "restart_intent_seq": 0,
+        "restart_intent_pending": false,
+        "restart_intent_state": "none",
+        "restart_mode": null,
+        "restart_target_role": null,
+        "restart_coordinator_id": null,
+        "restart_requested_at_ms": null,
+        "restart_deadline_at_ms": null,
+        "restart_force_action": null,
         "event_type": "terminal.opened",
         "state": "starting",
         "status": "starting",
@@ -35060,6 +34717,108 @@ pub(crate) async fn cloud_mcp_mark_terminal_opened(
         "reason": reason,
         "summary": "Terminal opened.",
         "ts_ms": now_ms});
+    cloud_mcp_publish_terminal_state_live_update(state, &payload, reason).await;
+}
+
+pub(crate) async fn cloud_mcp_sync_terminal_restart_intent_delta(
+    state: &CloudMcpState,
+    instance: &TerminalInstance,
+    intent: &TerminalPendingRestartIntent,
+    pending: bool,
+    intent_state: &str,
+    reason: &str,
+) {
+    let metadata = &instance.metadata;
+    let coordination = instance.coordination.as_ref();
+    let working_directory = instance.working_directory.as_ref();
+    let repo_root = cloud_mcp_terminal_repo_root_path(working_directory, coordination);
+    let req = cloud_mcp_repo_request(
+        workspace_path_display(&repo_root),
+        (!metadata.workspace_id.trim().is_empty()).then(|| metadata.workspace_id.clone()),
+        (!metadata.workspace_name.trim().is_empty()).then(|| metadata.workspace_name.clone()),
+    );
+    let runtime = terminal_runtime_snapshot(instance);
+    let projected = terminal_project_runtime(metadata, &runtime, false);
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let now_ms = cloud_mcp_now_ms();
+    let status_seq = cloud_mcp_next_terminal_lifecycle_seq(state, Some(now_ms));
+    let workspace_runtime_seq = cloud_mcp_next_workspace_runtime_seq(state, Some(now_ms));
+    let workspace_runtime_epoch = cloud_mcp_workspace_runtime_epoch(state);
+    let agent_id = cloud_mcp_terminal_agent_id(
+        &metadata.pane_id,
+        instance.id,
+        coordination,
+    );
+    let agent_kind = coordination
+        .map(|coordination| coordination.agent_kind.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| (!metadata.agent_kind.trim().is_empty()).then_some(metadata.agent_kind.as_str()))
+        .unwrap_or("terminal");
+    let force_action = (intent_state == "blocked").then(|| terminal_restart_intent_force_action(intent));
+    let payload = json!({
+        "source": "rust-diffforge-terminal-restart-intent",
+        "event_kind": "terminal_state_update",
+        "v": 1,
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "machine_id": device_profile["device_id"].clone(),
+        "repo_id": req.repo_id,
+        "workspace_root": req.root_display,
+        "workspace_active": true,
+        "workspace_id": req.workspace_id,
+        "workspace_name": req.workspace_name,
+        "workspace_status": "active",
+        "workspace_runtime_seq": workspace_runtime_seq,
+        "workspace_runtime_epoch": workspace_runtime_epoch,
+        "terminal_id": metadata.pane_id,
+        "target_terminal_id": metadata.pane_id,
+        "pane_id": metadata.pane_id,
+        "terminal_instance_id": instance.id,
+        "terminal_process_epoch": metadata.terminal_process_epoch,
+        "terminal_index": metadata.terminal_index,
+        "terminal_epoch": format!("{}:{}", metadata.pane_id, instance.id),
+        "launch_epoch": intent.launch_epoch,
+        "thread_id": metadata.thread_id,
+        "target_thread_id": metadata.thread_id,
+        "terminal_lifecycle": projected.terminal_lifecycle,
+        "agent_id": agent_id,
+        "agent_kind": agent_kind,
+        "agent_type": agent_kind,
+        "provider": agent_kind,
+        "terminal_state_contract_version": runtime.terminal_state_contract_version,
+        "canonical_state": runtime.canonical_state,
+        "canonical_badge_label": runtime.canonical_badge_label,
+        "canonical_state_seq": runtime.canonical_state_seq,
+        "prompt_state_seq": runtime.prompt_state_seq,
+        "turn_active": runtime.turn_active,
+        "turn_generation": runtime.turn_generation,
+        "completed_turn_generation": runtime.completed_turn_generation,
+        "active_interaction_id": runtime.active_interaction_id,
+        "active_interaction_revision": runtime.active_interaction_revision,
+        "interaction_actionable": runtime.interaction_actionable,
+        "state": runtime.canonical_state,
+        "status": runtime.canonical_state,
+        "activity_status": projected.native_rail_state,
+        "readiness": projected.readiness,
+        "turn_status": projected.turn_status,
+        "command_phase": runtime.command_phase,
+        "execution_phase": projected.execution_phase,
+        "input_ready": runtime.input_ready,
+        "restart_intent_seq": intent.restart_intent_seq,
+        "restart_intent_pending": pending,
+        "restart_intent_state": intent_state,
+        "restart_mode": intent.mode,
+        "restart_target_role": intent.target_role,
+        "restart_coordinator_id": intent.coordinator_id,
+        "restart_requested_at_ms": intent.requested_at_ms,
+        "restart_deadline_at_ms": intent.deadline_at_ms,
+        "restart_force_action": force_action,
+        "status_seq": status_seq,
+        "observed_at_ms": now_ms,
+        "reason": reason,
+        "summary": if intent_state == "blocked" { "Restart still blocked." } else { "Restart queued until idle." },
+        "ts_ms": now_ms,
+    });
     cloud_mcp_publish_terminal_state_live_update(state, &payload, reason).await;
 }
 
@@ -35234,6 +34993,18 @@ const CLOUD_MCP_TERMINAL_CANONICAL_COHORT_FIELDS: &[&str] = &[
     "interaction_actionable",
 ];
 
+const CLOUD_MCP_TERMINAL_RESTART_INTENT_COHORT_FIELDS: &[&str] = &[
+    "restart_intent_seq",
+    "restart_intent_pending",
+    "restart_intent_state",
+    "restart_mode",
+    "restart_target_role",
+    "restart_coordinator_id",
+    "restart_requested_at_ms",
+    "restart_deadline_at_ms",
+    "restart_force_action",
+];
+
 const CLOUD_MCP_TERMINAL_PROMPT_OWNER_FIELDS: &[&str] = &[
     "terminal_instance_id",
     "instance_id",
@@ -35398,6 +35169,18 @@ fn cloud_mcp_merge_terminal_state_cohort_aware(target: &mut Value, incoming: Val
         (None, Some(_)) => true,
         _ => false,
     };
+    let previous_restart_intent_seq =
+        cloud_mcp_payload_u64(&previous, &["restart_intent_seq"]);
+    let incoming_restart_intent_seq =
+        cloud_mcp_payload_u64(&incoming, &["restart_intent_seq"]);
+    let incoming_restart_intent_wins = match (
+        previous_restart_intent_seq,
+        incoming_restart_intent_seq,
+    ) {
+        (Some(previous), Some(incoming)) => incoming > previous,
+        (None, Some(_)) => true,
+        _ => false,
+    };
 
     cloud_mcp_live_state_merge_object(target, incoming.clone());
     if previous_canonical_seq.is_some() && !incoming_canonical_wins {
@@ -35431,6 +35214,19 @@ fn cloud_mcp_merge_terminal_state_cohort_aware(target: &mut Value, incoming: Val
             target,
             &previous,
             CLOUD_MCP_TERMINAL_PROMPT_OWNER_FIELDS,
+        );
+    }
+    if previous_restart_intent_seq.is_some() && !incoming_restart_intent_wins {
+        cloud_mcp_replace_terminal_cohort(
+            target,
+            &previous,
+            CLOUD_MCP_TERMINAL_RESTART_INTENT_COHORT_FIELDS,
+        );
+    } else if incoming_restart_intent_wins {
+        cloud_mcp_replace_terminal_cohort(
+            target,
+            &incoming,
+            CLOUD_MCP_TERMINAL_RESTART_INTENT_COHORT_FIELDS,
         );
     }
 }
@@ -36033,6 +35829,15 @@ async fn cloud_mcp_enqueue_terminal_closed_delta(
         "active_interaction_id": null,
         "active_interaction_revision": null,
         "interaction_actionable": false,
+        "restart_intent_seq": status_seq,
+        "restart_intent_pending": false,
+        "restart_intent_state": "cleared",
+        "restart_mode": null,
+        "restart_target_role": null,
+        "restart_coordinator_id": null,
+        "restart_requested_at_ms": null,
+        "restart_deadline_at_ms": null,
+        "restart_force_action": null,
         "event_type": "terminal.closed",
         "state": "closed",
         "status": "closed",

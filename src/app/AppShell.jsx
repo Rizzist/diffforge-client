@@ -109,6 +109,14 @@ import {
   normalizePermissionModeForProvider,
 } from "../terminals/permissionModeAutomation.js";
 import {
+  TERMINAL_SESSION_RESTART_MODES,
+  normalizeTerminalSessionRestartMode,
+  requestTerminalSessionRestart,
+  resolveTerminalSessionRestartRole,
+  terminalSessionRestartRemoteTimeoutMs,
+  terminalSessionRestartResultIsSuccessful,
+} from "../terminals/terminalSessionRestart.js";
+import {
   enqueuePaneControlOperation,
   paneControlOperationPending,
 } from "../terminals/paneControlQueue.js";
@@ -18212,6 +18220,9 @@ function normalizeTerminalLiveSessionsPayload(payload) {
           fork_from_provider_session_id: forkFromProviderSessionId,
           has_active_task: session.has_active_task === true || Boolean(activeTask),
           instance_id: instanceId,
+          launch_epoch: cleanAppCloseText(
+            session.launch_epoch || coordination?.terminal_launch_epoch,
+          ),
           input_ready: session.input_ready === true,
           native_rail_label: cleanAppCloseText(
             canonicalState ? session.canonical_badge_label : session.native_rail_label,
@@ -18224,6 +18235,14 @@ function normalizeTerminalLiveSessionsPayload(payload) {
           provider_session_id: providerSessionId,
           related_provider_session_ids: relatedProviderSessionIds,
           readiness,
+          restart_coordinator_id: cleanAppCloseText(session.restart_coordinator_id),
+          restart_deadline_at_ms: normalizeCloseCount(session.restart_deadline_at_ms),
+          restart_force_action: session.restart_force_action || null,
+          restart_intent_pending: session.restart_intent_pending === true,
+          restart_intent_seq: normalizeCloseCount(session.restart_intent_seq),
+          restart_intent_state: cleanAppCloseText(session.restart_intent_state, "none"),
+          restart_mode: cleanAppCloseText(session.restart_mode),
+          restart_target_role: cleanAppCloseText(session.restart_target_role),
           runtime_updated_at_ms: normalizeCloseCount(session.runtime_updated_at_ms),
           session_id: providerSessionId,
           session_mode: cleanAppCloseText(session.session_mode),
@@ -18427,6 +18446,7 @@ function buildRustTerminalAuthorityWorkspaces({
           && session.turn_active === false
           && Number(session.completed_turn_generation || 0) === Number(session.turn_generation || 0)
         : session.input_ready === true || readiness === "ready",
+      launch_epoch: session.launch_epoch || session.coordination?.terminal_launch_epoch || "",
       last_known_runtime: false,
       ...nativeRailFields,
       native_connected: workspaceRuntimeCommandable,
@@ -18434,6 +18454,14 @@ function buildRustTerminalAuthorityWorkspaces({
       pane_id: session.pane_id,
       provider_session_id: providerSessionId,
       readiness,
+      restart_coordinator_id: session.restart_coordinator_id || "",
+      restart_deadline_at_ms: session.restart_deadline_at_ms || 0,
+      restart_force_action: session.restart_force_action || null,
+      restart_intent_pending: session.restart_intent_pending === true,
+      restart_intent_seq: session.restart_intent_seq || 0,
+      restart_intent_state: session.restart_intent_state || "none",
+      restart_mode: session.restart_mode || "",
+      restart_target_role: session.restart_target_role || "",
       runtime_read_only: false,
       session_id: providerSessionId,
       session_state: session.session_state || (providerSessionId
@@ -40683,8 +40711,8 @@ export default function App() {
       if (activatedWorkspaceIdRef.current) {
         enabledWorkspaceIds.add(activatedWorkspaceIdRef.current);
       }
-      // Native inventory eligibility and the live presence check are both
-      // fail-closed; the final close remains atomic in terminal_restart_if_idle.
+      // Every pane uses the same foreground restart coordinator. Busy panes
+      // acquire a durable backend intent; idle panes close and reopen now.
       return restartProviderTerminalRows({
         enabledWorkspaceIds,
         provider: normalizedProvider,
@@ -40694,19 +40722,27 @@ export default function App() {
           target_terminal_index: terminalIndex,
         }).terminal,
         terminalPaneId: (terminal) => remoteControlTerminalText(terminal, ["pane_id", "terminal_id"]),
-        terminalIsIdle: (terminal) => assessRemoteControlTerminalIdle(terminal).idle,
-        restartIfIdle: ({ instanceId, launchEpoch, paneId }) => invoke("terminal_restart_if_idle", {
-          pane_id: paneId,
+        restartTerminalSession: ({
+          instanceId,
+          launchEpoch,
+          mode,
+          paneId,
+          provider: terminalProvider,
+          terminalIndex,
+          workspaceId,
+        }) => requestTerminalSessionRestart({
           instance_id: instanceId,
           launch_epoch: launchEpoch,
-        }).catch(() => null),
-        relaunchTerminal: ({ provider: terminalProvider, terminalIndex, workspaceId }) => changeWorkspaceTerminalRole({
-          backend_already_closed: true,
-          restart: true,
+          mode,
+          pane_id: paneId,
           role: terminalProvider,
           terminal_index: terminalIndex,
           workspace_id: workspaceId,
-        }),
+        }, {
+          coordinatorPrefix: "account-profile-restart",
+          resolveOnQueued: true,
+          timeoutMs: 130_000,
+        }).catch(() => null),
       });
     };
 
@@ -44964,30 +45000,35 @@ export default function App() {
         "terminal_switch_agent",
         "switch_terminal_agent",
       ].includes(normalizedKind)) {
-        const restartRequested = [
-          "terminal_restart",
-          "terminal_restart_agent",
-          "restart_terminal",
-          "restart_terminal_agent",
-        ].includes(normalizedKind) || remoteCommandBooleanField(event, [
-          "restart",
-          "terminal_restart",
-        ]);
-        const nextAgentId = normalizeManagedAgentProviderId(
-          agentId
-            || remoteCommandStringField(event, [
-              "target_agent_id",
-              "agent_id",
-              "provider",
-            ]),
-        );
+        const nextAgentId = resolveTerminalSessionRestartRole({
+          role: remoteCommandStringField(event, ["role"]),
+          target_agent_id: agentId || remoteCommandStringField(event, [
+            "target_agent_id",
+            "agent_id",
+            "provider",
+          ]),
+        });
         if (!nextAgentId) {
-          await recordRemoteCommandStatus(event, "failed", "Relaunch command did not include a supported agent (claude, codex, or opencode).", {
+          await recordRemoteCommandStatus(event, "failed", "Restart command did not include a supported role (Codex, Claude, OpenCode, or Terminal).", {
             command_id: commandId,
             command_kind: commandKind,
             workspace_id: workspaceId,
           });
           return;
+        }
+        const roleLabel = nextAgentId === "generic" ? "Terminal" : getManagedAgentLabel(nextAgentId);
+        if (nextAgentId !== "generic") {
+          const installedRole = (Array.isArray(agentStatusesRef.current) ? agentStatusesRef.current : [])
+            .find((status) => String(status?.id || "").trim().toLowerCase() === nextAgentId);
+          if (!installedRole?.installed) {
+            await recordRemoteCommandStatus(event, "failed", `${roleLabel} is not installed on this desktop.`, {
+              agent_id: nextAgentId,
+              command_id: commandId,
+              command_kind: commandKind,
+              workspace_id: workspaceId,
+            });
+            return;
+          }
         }
         const { terminal } = findRemoteControlTerminal(workspaceId, target);
         const terminalIndex = remoteControlTerminalNumber(terminal, ["terminal_index"]);
@@ -45000,61 +45041,169 @@ export default function App() {
           });
           return;
         }
-        const assessment = assessRemoteControlTerminalIdle(terminal);
-        const terminalBusy = Boolean(terminal)
-          && !assessment.idle
-          && !["already_closed", "unknown", "error", "failed", "timeout"].includes(assessment.reason);
-        if (terminalBusy) {
-          await recordRemoteCommandStatus(event, "blocked", "Terminal is busy; relaunch it after the current turn finishes.", {
-            assessment,
+        const terminalInstanceId = remoteControlTerminalNumber(terminal, [
+          "terminal_instance_id",
+          "instance_id",
+        ]);
+        const launchEpoch = remoteControlTerminalText(terminal, [
+          "launch_epoch",
+          "terminal_launch_epoch",
+        ]);
+        const targetPaneId = remoteControlTerminalText(terminal, [
+          "pane_id",
+          "terminal_id",
+          "target_terminal_id",
+        ]);
+        const requestedInstanceId = Number(remoteCommandStringField(event, [
+          "terminal_instance_id",
+          "instance_id",
+        ]) || 0);
+        const requestedLaunchEpoch = remoteCommandStringField(event, [
+          "launch_epoch",
+          "terminal_launch_epoch",
+        ]);
+        if (!terminalInstanceId || !launchEpoch || !targetPaneId) {
+          await recordRemoteCommandStatus(event, "failed", "Target terminal is missing its exact instance or launch identity.", {
             command_id: commandId,
             command_kind: commandKind,
-            terminal: remoteControlTerminalSummary(terminal, { reason: assessment.reason, ...target }),
-            workspace_id: workspaceId,
-          });
-          return;
-        }
-        const previousAgentId = remoteControlTerminalText(terminal, ["agent_id", "agent_kind"]);
-        const terminalLooksOpen = Boolean(terminal) && !remoteControlTerminalLooksClosed(terminal);
-        if (!restartRequested && previousAgentId && previousAgentId === nextAgentId && terminalLooksOpen) {
-          await recordRemoteCommandStatus(event, "completed", `Terminal is already running ${getManagedAgentLabel(nextAgentId)}.`, {
-            agent_id: nextAgentId,
-            command_id: commandId,
-            command_kind: commandKind,
+            terminal: remoteControlTerminalSummary(terminal, target),
             terminal_index: terminalIndex,
             workspace_id: workspaceId,
           });
           return;
         }
-        const threadId = remoteControlTerminalText(terminal, ["thread_id"]) || targetThreadId;
-        await recordRemoteCommandStatus(event, "running", restartRequested
-          ? `Restarting terminal as ${getManagedAgentLabel(nextAgentId)}.`
-          : `Relaunching terminal as ${getManagedAgentLabel(nextAgentId)}.`, {
+        if (!requestedInstanceId || !requestedLaunchEpoch) {
+          await recordRemoteCommandStatus(event, "failed", "Restart command must include the exact terminal instance and launch epoch.", {
+            command_id: commandId,
+            command_kind: commandKind,
+            requested_launch_epoch: requestedLaunchEpoch,
+            requested_terminal_instance_id: requestedInstanceId,
+            workspace_id: workspaceId,
+          });
+          return;
+        }
+        if (
+          requestedInstanceId !== terminalInstanceId
+          || requestedLaunchEpoch !== launchEpoch
+        ) {
+          await recordRemoteCommandStatus(event, "failed", "Restart command targets a stale terminal instance or launch epoch.", {
+            command_id: commandId,
+            command_kind: commandKind,
+            current_launch_epoch: launchEpoch,
+            current_terminal_instance_id: terminalInstanceId,
+            requested_launch_epoch: requestedLaunchEpoch,
+            requested_terminal_instance_id: requestedInstanceId,
+            workspace_id: workspaceId,
+          });
+          return;
+        }
+        const requestedRestartMode = String(
+          remoteCommandStringField(event, ["restart_mode", "mode"]),
+        ).trim().toLowerCase();
+        if (!Object.values(TERMINAL_SESSION_RESTART_MODES).includes(requestedRestartMode)) {
+          await recordRemoteCommandStatus(event, "failed", "Restart mode must be restart_now or restart_when_idle.", {
+            command_id: commandId,
+            command_kind: commandKind,
+            requested_mode: requestedRestartMode,
+            workspace_id: workspaceId,
+          });
+          return;
+        }
+        const restartMode = normalizeTerminalSessionRestartMode(requestedRestartMode);
+        const requestedRestartDeadlineMs = remoteCommandIntegerField(event, [
+          "deadline_ms",
+          "restart_deadline_ms",
+        ]) || undefined;
+        const previousAgentId = normalizeWorkspaceLiveTerminalAgentId(
+          remoteControlTerminalText(terminal, ["agent_id", "agent_kind", "agent_type"]),
+        );
+        await recordRemoteCommandStatus(event, "running", `Coordinating a fresh ${roleLabel} terminal session.`, {
           agent_id: nextAgentId,
           command_id: commandId,
           command_kind: commandKind,
+          launch_epoch: launchEpoch,
+          mode: restartMode,
           previousAgentId,
+          terminal_instance_id: terminalInstanceId,
           terminal_index: terminalIndex,
           workspace_id: workspaceId,
         });
-        // Same path as the desktop's own agent switcher: the role change
-        // closes the pane and the runtime relaunches it with the new CLI.
-        changeWorkspaceTerminalRole({
-          restart: restartRequested,
-          role: nextAgentId,
-          source: "remote_control_relaunch",
-          terminal_index: terminalIndex,
-          thread_id: threadId,
-          workspace_id: workspaceId,
-        });
-        await syncRemoteControlState("remote_terminal_relaunch_agent");
-        await recordRemoteCommandStatus(event, "completed", restartRequested
-          ? `Terminal restarted as ${getManagedAgentLabel(nextAgentId)} from the web dashboard.`
-          : `Terminal relaunched as ${getManagedAgentLabel(nextAgentId)} from the web dashboard.`, {
+        let progressStatus = Promise.resolve();
+        let result;
+        try {
+          result = await requestTerminalSessionRestart({
+            instance_id: terminalInstanceId,
+            launch_epoch: launchEpoch,
+            pane_id: targetPaneId,
+            role: nextAgentId,
+            mode: restartMode,
+            deadline_ms: requestedRestartDeadlineMs,
+            terminal_index: terminalIndex,
+            workspace_id: workspaceId,
+          }, {
+            coordinatorPrefix: `remote-${commandId || "restart"}`,
+            timeoutMs: terminalSessionRestartRemoteTimeoutMs(requestedRestartDeadlineMs),
+            onStatus: (status) => {
+              if (status.status === "queued") {
+                progressStatus = recordRemoteCommandStatus(
+                  event,
+                  "queued",
+                  "Terminal is busy; restart is queued until canonical idle.",
+                  {
+                    ...status,
+                    command_id: commandId,
+                    command_kind: commandKind,
+                  },
+                );
+              } else if (status.status === "running") {
+                progressStatus = recordRemoteCommandStatus(
+                  event,
+                  "running",
+                  "Opening the replacement terminal session.",
+                  {
+                    ...status,
+                    command_id: commandId,
+                    command_kind: commandKind,
+                  },
+                );
+              }
+            },
+          });
+          await progressStatus;
+        } catch (error) {
+          await recordRemoteCommandStatus(event, "failed", getErrorMessage(error, "Terminal restart coordinator timed out."), {
+            command_id: commandId,
+            command_kind: commandKind,
+            terminal_instance_id: terminalInstanceId,
+            workspace_id: workspaceId,
+          });
+          return;
+        }
+        if (!terminalSessionRestartResultIsSuccessful(result)) {
+          await recordRemoteCommandStatus(
+            event,
+            result?.status === "blocked" ? "blocked" : "failed",
+            result?.message || "Terminal restart did not complete.",
+            {
+              ...result,
+              command_id: commandId,
+              command_kind: commandKind,
+            },
+          );
+          return;
+        }
+        await syncRemoteControlState("remote_terminal_restart_coordinator_completed");
+        const restartCompletionMessage = result?.status === "superseded"
+          ? "Queued terminal restart was superseded by another terminal lifecycle action."
+          : `Fresh ${roleLabel} terminal session opened from the web dashboard.`;
+        await recordRemoteCommandStatus(event, "completed", restartCompletionMessage, {
           agent_id: nextAgentId,
           command_id: commandId,
           command_kind: commandKind,
+          launch_epoch: result.launch_epoch,
+          mode: restartMode,
           previousAgentId,
+          terminal_instance_id: result.instance_id,
           terminal: remoteControlTerminalSummary(terminal, target),
           terminal_index: terminalIndex,
           workspace_id: workspaceId,

@@ -136,6 +136,7 @@ struct WorkspaceAgentSessionHistoryItem {
     cwd: String,
     status: String,
     title: String,
+    has_user_message: bool,
     first_user_message: String,
     chat_sync: WorkspaceAgentSessionHistoryChatSync,
     resumable: bool,
@@ -423,6 +424,11 @@ fn workspace_agent_session_history_merge_item(
     workspace_agent_session_history_merge_text(&mut current.cwd, candidate.cwd.clone());
     workspace_agent_session_history_merge_text(&mut current.status, candidate.status.clone());
     workspace_agent_session_history_merge_text(&mut current.title, candidate.title.clone());
+    current.has_user_message |= candidate.has_user_message;
+    workspace_agent_session_history_merge_text(
+        &mut current.first_user_message,
+        candidate.first_user_message.clone(),
+    );
     workspace_agent_session_history_merge_text(&mut current.source, candidate.source.clone());
     if current.terminal_instance_id.is_none() {
         current.terminal_instance_id = candidate.terminal_instance_id;
@@ -634,6 +640,8 @@ fn workspace_threads_open_store(
                 cwd TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT '',
                 title TEXT NOT NULL DEFAULT '',
+                has_user_message INTEGER NOT NULL DEFAULT 0,
+                first_user_message TEXT NOT NULL DEFAULT '',
                 source TEXT NOT NULL DEFAULT '',
                 created_at_ms INTEGER NOT NULL,
                 latest_at_ms INTEGER NOT NULL,
@@ -680,6 +688,18 @@ fn workspace_threads_open_store(
         &connection,
         "workspace_agent_session_history",
         "coordination_mode",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    workspace_threads_add_column_if_missing(
+        &connection,
+        "workspace_agent_session_history",
+        "has_user_message",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    workspace_threads_add_column_if_missing(
+        &connection,
+        "workspace_agent_session_history",
+        "first_user_message",
         "TEXT NOT NULL DEFAULT ''",
     )?;
     connection
@@ -734,6 +754,44 @@ fn workspace_agent_session_history_upsert_blocking(
     let now = workspace_threads_now_millis();
     let (connection, root, _) = workspace_threads_open_store(root_directory, true)?;
     let root_display = workspace_path_display(&root);
+    let existing_evidence = match connection.query_row(
+        "SELECT has_user_message, first_user_message
+         FROM workspace_agent_session_history WHERE id = ?1",
+        rusqlite::params![id.as_str()],
+        |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, String>(1)?)),
+    ) {
+        Ok(value) => Some(value),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(error) => {
+            return Err(format!(
+                "Unable to read workspace session user-message evidence: {error}"
+            ));
+        }
+    };
+    let first_user_message = if let Some((true, preview)) = existing_evidence {
+        preview
+    } else {
+        let transcript_cwd = if record.cwd.trim().is_empty() {
+            root_display.as_str()
+        } else {
+            record.cwd.as_str()
+        };
+        agent_thread_local_first_user_message(
+            &provider,
+            visible_session_id.as_deref().unwrap_or_default(),
+            transcript_cwd,
+        )
+        .ok()
+        .flatten()
+        .map(|message| workspace_agent_session_history_clean_user_preview(&message))
+        .unwrap_or_default()
+    };
+    if first_user_message.trim().is_empty() {
+        // Session ids are often minted at process startup. Do not durably
+        // register that metadata-only shell; a later transcript/user-message
+        // observation will call this upsert again.
+        return Ok(false);
+    }
     let terminal_instance_id = record.terminal_instance_id.map(|value| value as i64);
     let title = workspace_threads_clean_optional_text(&record.title, 240);
     let status = workspace_threads_clean_optional_text(&record.status, 64);
@@ -779,12 +837,14 @@ fn workspace_agent_session_history_upsert_blocking(
                 cwd,
                 status,
                 title,
+                has_user_message,
+                first_user_message,
                 source,
                 created_at_ms,
                 latest_at_ms,
                 created_at,
                 updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?28)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, 1, ?25, ?26, ?27, ?28, ?29, ?29)
             ON CONFLICT(id) DO UPDATE SET
                 workspace_id = excluded.workspace_id,
                 workspace_root = excluded.workspace_root,
@@ -809,6 +869,8 @@ fn workspace_agent_session_history_upsert_blocking(
                 cwd = CASE WHEN excluded.cwd != '' THEN excluded.cwd ELSE workspace_agent_session_history.cwd END,
                 status = CASE WHEN excluded.status != '' THEN excluded.status ELSE workspace_agent_session_history.status END,
                 title = CASE WHEN excluded.title != '' THEN excluded.title ELSE workspace_agent_session_history.title END,
+                has_user_message = MAX(workspace_agent_session_history.has_user_message, excluded.has_user_message),
+                first_user_message = CASE WHEN workspace_agent_session_history.first_user_message != '' THEN workspace_agent_session_history.first_user_message ELSE excluded.first_user_message END,
                 source = CASE WHEN excluded.source != '' THEN excluded.source ELSE workspace_agent_session_history.source END,
                 created_at_ms = CASE WHEN workspace_agent_session_history.created_at_ms <= excluded.created_at_ms THEN workspace_agent_session_history.created_at_ms ELSE excluded.created_at_ms END,
                 latest_at_ms = CASE WHEN excluded.latest_at_ms >= workspace_agent_session_history.latest_at_ms THEN excluded.latest_at_ms ELSE workspace_agent_session_history.latest_at_ms END,
@@ -838,6 +900,7 @@ fn workspace_agent_session_history_upsert_blocking(
                 workspace_threads_clean_optional_text(&record.cwd, 2048),
                 status,
                 title,
+                first_user_message,
                 workspace_threads_clean_optional_text(&record.source, 128),
                 created_at_ms as i64,
                 observed_at_ms as i64,
@@ -849,106 +912,19 @@ fn workspace_agent_session_history_upsert_blocking(
 }
 
 const WORKSPACE_AGENT_SESSION_HISTORY_PREVIEW_CHARS: usize = 96;
-const WORKSPACE_AGENT_SESSION_HISTORY_TRANSCRIPT_LIMIT: usize = 160;
 
-fn workspace_agent_session_history_first_user_preview(
-    item: &WorkspaceAgentSessionHistoryItem,
-) -> String {
-    let Some(agent_id) = workspace_threads_clean_agent_id(&item.agent_id)
-        .or_else(|| workspace_threads_clean_agent_id(&item.provider))
-    else {
-        return String::new();
-    };
-    let Some(provider_session_id) = workspace_threads_clean_provider_session_id(
-        if item.provider_session_id.trim().is_empty() {
-            &item.native_session_id
-        } else {
-            &item.provider_session_id
-        },
-    ) else {
-        return String::new();
-    };
-    let cwd = if item.cwd.trim().is_empty() {
-        item.workspace_root.trim()
-    } else {
-        item.cwd.trim()
-    };
-    if cwd.is_empty() {
-        return String::new();
-    }
-
-    read_agent_thread_transcript(
-        &agent_id,
-        &provider_session_id,
-        cwd,
-        Some(item.workspace_id.as_str()),
-        WORKSPACE_AGENT_SESSION_HISTORY_TRANSCRIPT_LIMIT,
-    )
-    .ok()
-    .and_then(|transcript| {
-        transcript.messages.into_iter().find(|message| {
-            message.role.eq_ignore_ascii_case("user") && !message.text.trim().is_empty()
-        })
-    })
-    .map(|message| {
-        clean_codex_title(
-            message
-                .text
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" "),
-            "",
+fn workspace_agent_session_history_clean_user_preview(value: &str) -> String {
+    let preview = clean_codex_title(
+        value.split_whitespace().collect::<Vec<_>>().join(" "),
+        "",
+    );
+    if preview.chars().count() > WORKSPACE_AGENT_SESSION_HISTORY_PREVIEW_CHARS {
+        format!(
+            "{}...",
+            truncate_chars(&preview, WORKSPACE_AGENT_SESSION_HISTORY_PREVIEW_CHARS - 3).trim()
         )
-    })
-    .map(|preview| {
-        if preview.chars().count() > WORKSPACE_AGENT_SESSION_HISTORY_PREVIEW_CHARS {
-            format!(
-                "{}...",
-                truncate_chars(&preview, WORKSPACE_AGENT_SESSION_HISTORY_PREVIEW_CHARS - 3).trim()
-            )
-        } else {
-            preview
-        }
-    })
-    .unwrap_or_default()
-}
-
-fn workspace_agent_session_history_preview_cache_key(
-    item: &WorkspaceAgentSessionHistoryItem,
-) -> Option<String> {
-    let agent_id = workspace_threads_clean_agent_id(&item.agent_id)
-        .or_else(|| workspace_threads_clean_agent_id(&item.provider))?;
-    let provider_session_id = workspace_threads_clean_provider_session_id(
-        if item.provider_session_id.trim().is_empty() {
-            &item.native_session_id
-        } else {
-            &item.provider_session_id
-        },
-    )?;
-    let cwd = if item.cwd.trim().is_empty() {
-        item.workspace_root.trim()
     } else {
-        item.cwd.trim()
-    };
-    if cwd.is_empty() {
-        return None;
-    }
-    Some(format!("{agent_id}\n{provider_session_id}\n{cwd}"))
-}
-
-fn workspace_agent_session_history_enrich_previews(items: &mut [WorkspaceAgentSessionHistoryItem]) {
-    let mut previews = HashMap::<String, String>::new();
-    for item in items.iter_mut() {
-        let Some(key) = workspace_agent_session_history_preview_cache_key(item) else {
-            continue;
-        };
-        if let Some(preview) = previews.get(&key) {
-            item.first_user_message = preview.clone();
-            continue;
-        }
-        let preview = workspace_agent_session_history_first_user_preview(item);
-        item.first_user_message = preview.clone();
-        previews.insert(key, preview);
+        preview
     }
 }
 
@@ -1334,6 +1310,66 @@ fn workspace_agent_session_history_resume_cwd(item: &WorkspaceAgentSessionHistor
     }
 }
 
+fn workspace_agent_session_history_backfill_user_message_evidence(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+) -> Result<(), String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id, agent_id, provider,
+                    COALESCE(NULLIF(TRIM(provider_session_id), ''), TRIM(native_session_id)),
+                    COALESCE(NULLIF(TRIM(cwd), ''), TRIM(workspace_root))
+             FROM workspace_agent_session_history
+             WHERE workspace_id = ?1 AND has_user_message = 0",
+        )
+        .map_err(|error| format!("Unable to prepare session evidence backfill: {error}"))?;
+    let rows = statement
+        .query_map(rusqlite::params![workspace_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|error| format!("Unable to read session evidence backfill rows: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Unable to decode session evidence backfill row: {error}"))?;
+    drop(statement);
+
+    for (id, agent_id, provider, session_id, cwd) in rows {
+        let Some(provider) = workspace_threads_clean_agent_id(&provider)
+            .or_else(|| workspace_threads_clean_agent_id(&agent_id))
+        else {
+            continue;
+        };
+        if session_id.trim().is_empty() || cwd.trim().is_empty() {
+            continue;
+        }
+        let Some(message) = agent_thread_local_first_user_message(&provider, &session_id, &cwd)
+            .ok()
+            .flatten()
+        else {
+            continue;
+        };
+        let preview = workspace_agent_session_history_clean_user_preview(&message);
+        if preview.trim().is_empty() {
+            continue;
+        }
+        connection
+            .execute(
+                "UPDATE workspace_agent_session_history
+                 SET has_user_message = 1,
+                     first_user_message = CASE WHEN first_user_message = '' THEN ?2 ELSE first_user_message END
+                 WHERE id = ?1",
+                rusqlite::params![id, preview],
+            )
+            .map_err(|error| format!("Unable to persist session evidence backfill: {error}"))?;
+    }
+    Ok(())
+}
+
 fn workspace_agent_session_history_list_blocking(
     request: WorkspaceAgentSessionHistoryListRequest,
 ) -> Result<WorkspaceAgentSessionHistoryListResult, String> {
@@ -1344,6 +1380,10 @@ fn workspace_agent_session_history_list_blocking(
         workspace_threads_open_store(request.root_directory.as_deref(), true)?;
     let root_display = workspace_path_display(&root);
     let db_path_display = workspace_path_display(&db_path);
+    workspace_agent_session_history_backfill_user_message_evidence(
+        &connection,
+        workspace_id.as_str(),
+    )?;
     let mut statement = connection
         .prepare(
             "SELECT
@@ -1371,11 +1411,14 @@ fn workspace_agent_session_history_list_blocking(
                 cwd,
                 status,
                 title,
+                has_user_message,
+                first_user_message,
                 source,
                 created_at_ms,
                 latest_at_ms
             FROM workspace_agent_session_history
             WHERE workspace_id = ?1
+                AND has_user_message = 1
                 AND (TRIM(provider_session_id) != '' OR TRIM(native_session_id) != '')
                 AND (
                     (
@@ -1395,12 +1438,12 @@ fn workspace_agent_session_history_list_blocking(
                     .get::<_, Option<i64>>(18)?
                     .and_then(|value| u64::try_from(value).ok());
                 let created_at_ms = row
-                    .get::<_, i64>(25)
+                    .get::<_, i64>(27)
                     .ok()
                     .and_then(|value| u64::try_from(value).ok())
                     .unwrap_or(0);
                 let latest_at_ms = row
-                    .get::<_, i64>(26)
+                    .get::<_, i64>(28)
                     .ok()
                     .and_then(|value| u64::try_from(value).ok())
                     .unwrap_or(created_at_ms);
@@ -1429,11 +1472,12 @@ fn workspace_agent_session_history_list_blocking(
                     cwd: row.get(21)?,
                     status: row.get(22)?,
                     title: row.get(23)?,
-                    first_user_message: String::new(),
+                    has_user_message: row.get::<_, i64>(24)? != 0,
+                    first_user_message: row.get(25)?,
                     chat_sync: WorkspaceAgentSessionHistoryChatSync::default(),
                     resumable: true,
                     resume_unavailable_reason: String::new(),
-                    source: row.get(24)?,
+                    source: row.get(26)?,
                     created_at_ms,
                     latest_at_ms,
                 })
@@ -1448,11 +1492,13 @@ fn workspace_agent_session_history_list_blocking(
     }
     items.retain(workspace_agent_session_history_item_is_visible);
     items = workspace_agent_session_history_dedupe_items(items);
+    // Fast and full inventories share durable positive evidence. Metadata-only
+    // rows never consume a card/limit slot, and inventory does not perform
+    // per-row cloud transcript reads.
     items = workspace_agent_session_history_limit_with_fork_parents(items, limit);
     workspace_agent_session_history_enrich_resumability(&mut items);
     if !fast {
         workspace_agent_session_history_enrich_chat_sync(&mut items);
-        workspace_agent_session_history_enrich_previews(&mut items);
     }
     Ok(WorkspaceAgentSessionHistoryListResult {
         generated_at_ms: workspace_threads_now_millis_u64(),
@@ -2693,6 +2739,29 @@ async fn workspace_agent_session_history_list(
 mod workspace_threads_store_tests {
     use super::*;
 
+    struct WorkspaceThreadsTestEnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for WorkspaceThreadsTestEnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => env::set_var(self.key, value),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn set_workspace_threads_test_env_var(
+        key: &'static str,
+        value: &Path,
+    ) -> WorkspaceThreadsTestEnvVarGuard {
+        let previous = env::var_os(key);
+        env::set_var(key, value);
+        WorkspaceThreadsTestEnvVarGuard { key, previous }
+    }
+
     #[test]
     fn persisted_key_mapping_preserves_opaque_provider_payloads() {
         let runtime = json!({
@@ -2830,12 +2899,14 @@ mod workspace_threads_store_tests {
                     cwd,
                     status,
                     title,
+                    has_user_message,
+                    first_user_message,
                     source,
                     created_at_ms,
                     latest_at_ms,
                     created_at,
                     updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, '', ?8, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?22)",
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, '', ?8, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 1, 'Test user prompt', ?19, ?20, ?21, ?22, ?22)",
                 rusqlite::params![
                     id,
                     "workspace-session-history",
@@ -3005,9 +3076,15 @@ mod workspace_threads_store_tests {
 
     #[test]
     fn workspace_agent_session_history_round_trips_by_workspace() {
+        let _guard = agent_chat_session_sync_test_lock();
         let root = unique_workspace_threads_test_root("agent-session-history");
         fs::create_dir_all(&root).expect("create workspace root");
         let root_text = root.to_string_lossy().to_string();
+        let codex_home = root.join("codex-home");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create Codex sessions");
+        let _codex_home_guard =
+            set_workspace_threads_test_env_var("CODEX_HOME", &codex_home);
 
         let recorded = workspace_agent_session_history_upsert_blocking(
             Some(root_text.as_str()),
@@ -3090,6 +3167,32 @@ mod workspace_threads_store_tests {
         )
         .expect("list session history");
         assert!(result.items.is_empty());
+
+        let rollout = [
+            json!({
+                "type": "session_meta",
+                "timestamp": "2026-07-02T00:00:00Z",
+                "payload": {"id": "codex-provider-123", "cwd": root_text.as_str()}
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-07-02T00:00:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Build the session history"}]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(
+            sessions_dir.join("rollout-codex-provider-123.jsonl"),
+            format!("{rollout}\n"),
+        )
+        .expect("write Codex rollout");
 
         let updated = workspace_agent_session_history_upsert_blocking(
             Some(root_text.as_str()),
@@ -3288,12 +3391,14 @@ mod workspace_threads_store_tests {
                         cwd,
                         status,
                         title,
+                        has_user_message,
+                        first_user_message,
                         source,
                         created_at_ms,
                         latest_at_ms,
                         created_at,
                         updated_at
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21)",
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 1, 'Legacy user prompt', ?18, ?19, ?20, ?21, ?21)",
                     rusqlite::params![
                         id,
                         "workspace-session-history",

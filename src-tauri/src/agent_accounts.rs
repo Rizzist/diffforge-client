@@ -8062,6 +8062,14 @@ fn agent_accounts_build_stale_inventory(
                 "busy": busy,
                 "idle": restart_eligible,
                 "restart_eligible": restart_eligible,
+                "restart_intent_seq": live.get("restart_intent_seq").and_then(Value::as_u64).unwrap_or(0),
+                "restart_intent_pending": live.get("restart_intent_pending").and_then(Value::as_bool).unwrap_or(false),
+                "restart_intent_state": live.get("restart_intent_state").and_then(Value::as_str).unwrap_or("none"),
+                "restart_mode": live.get("restart_mode").cloned().unwrap_or(Value::Null),
+                "restart_target_role": live.get("restart_target_role").cloned().unwrap_or(Value::Null),
+                "restart_coordinator_id": live.get("restart_coordinator_id").cloned().unwrap_or(Value::Null),
+                "restart_deadline_at_ms": live.get("restart_deadline_at_ms").cloned().unwrap_or(Value::Null),
+                "restart_force_action": live.get("restart_force_action").cloned().unwrap_or(Value::Null),
                 "needs_restart": true,
                 "stamped_profile_id": stamped_profile_id,
                 "stamped_profile_label": stamp.get("profile_label").and_then(Value::as_str).unwrap_or_default(),
@@ -8125,6 +8133,8 @@ async fn agent_accounts_pane_profiles_for_state(state: &TerminalState) -> Value 
             .map(|(pane_id, instance)| {
                 let runtime = terminal_runtime_snapshot(instance);
                 let projected = terminal_project_runtime(&instance.metadata, &runtime, false);
+                let launch_epoch = terminal_instance_launch_epoch(instance);
+                let restart_intent = terminal_restart_intent_for_instance(state, instance);
                 let open = projected.terminal_lifecycle == "open";
                 let restart_eligible = agent_accounts_restart_eligible(
                     &projected.execution_phase,
@@ -8134,13 +8144,21 @@ async fn agent_accounts_pane_profiles_for_state(state: &TerminalState) -> Value 
                     pane_id.clone(),
                     json!({
                         "instance_id": instance.id,
-                        "launch_epoch": instance.coordination.as_ref().and_then(|coordination| coordination.terminal_launch_epoch.as_deref()),
+                        "launch_epoch": launch_epoch,
                         "workspace_id": instance.metadata.workspace_id.as_str(),
                         "workspace_label": instance.metadata.workspace_name.as_str(),
                         "terminal_index": instance.metadata.terminal_index,
                         "activity": projected.execution_phase,
                         "open": open,
                         "restart_eligible": restart_eligible,
+                        "restart_intent_seq": restart_intent.as_ref().map(|intent| intent.restart_intent_seq).unwrap_or(0),
+                        "restart_intent_pending": restart_intent.is_some(),
+                        "restart_intent_state": restart_intent.as_ref().map(|intent| intent.state.as_str()).unwrap_or("none"),
+                        "restart_mode": restart_intent.as_ref().map(|intent| intent.mode.as_str()),
+                        "restart_target_role": restart_intent.as_ref().map(|intent| intent.target_role.as_str()),
+                        "restart_coordinator_id": restart_intent.as_ref().map(|intent| intent.coordinator_id.as_str()),
+                        "restart_deadline_at_ms": restart_intent.as_ref().map(|intent| intent.deadline_at_ms),
+                        "restart_force_action": restart_intent.as_ref().and_then(|intent| (intent.state == "blocked").then(|| terminal_restart_intent_force_action(intent))),
                     }),
                 )
             })
@@ -9199,6 +9217,14 @@ mod agent_accounts_tests {
             "busy",
             "idle",
             "restart_eligible",
+            "restart_intent_seq",
+            "restart_intent_pending",
+            "restart_intent_state",
+            "restart_mode",
+            "restart_target_role",
+            "restart_coordinator_id",
+            "restart_deadline_at_ms",
+            "restart_force_action",
             "needs_restart",
             "stamped_profile_id",
             "stamped_profile_label",

@@ -30,6 +30,17 @@ import {
 import {
   TODO_QUEUE_SOURCE_TERMINAL_DIRECT,
 } from "../todoQueueSources.js";
+import {
+  TERMINAL_SESSION_RESTART_MODES,
+  TERMINAL_SESSION_RESTART_REPLACEMENT_OPEN_TIMEOUT_MS,
+  TERMINAL_SESSION_RESTART_REQUEST_EVENT,
+  createTerminalSessionRestartCoordinatorId,
+  emitTerminalSessionRestartResult,
+  normalizeTerminalSessionRestartMode,
+  normalizeTerminalSessionRestartRole,
+  resolveTerminalSessionOpenBinding,
+  terminalSessionRestartClearedResult,
+} from "../terminalSessionRestart.js";
 import { createTerminalOutputWorkerSession } from "./terminalOutputWorkerClient.js";
 import { SshClientPicker } from "../../ssh/SshClientPicker.jsx";
 import { guardXtermDuringPushToTalk } from "../xtermPushToTalkGuard.js";
@@ -2404,6 +2415,9 @@ function WorkspaceTerminal({
     setTerminalFontSize(next);
   }, [terminalIndex, workspace?.id]);
   const terminalInstanceIdRef = useRef(0);
+  const terminalLaunchEpochRef = useRef("");
+  const terminalOpenWaitersRef = useRef(new Map());
+  const activeRestartCoordinatorRef = useRef("");
   const agentLaunchEpochRef = useRef(agentLaunchEpoch);
   const agentLaunchReadyRef = useRef(agentLaunchReady);
   const submittedPendingPromptIdsRef = useRef(new Set());
@@ -6122,22 +6136,19 @@ function WorkspaceTerminal({
     let rendererMode = useWebglRenderer ? "webgl_pending" : "dom";
     let runtimeTerminalState = "starting";
     const preserveCoordinationForThisStart = preserveCoordinationOnNextOpenRef.current && !isGenericTerminal;
-    const forceFreshSessionForThisStart = (
+    const requestedFreshSessionForThisStart = (
       forceFreshSessionOnNextOpenRef.current
       || Boolean(thread?.fresh_session_started_at && !threadProviderSessionId)
-    ) && !isGenericTerminal;
-    const providerSessionOverrideForThisStart = forceFreshSessionForThisStart
-      ? ""
-      : String(providerSessionOverrideOnNextOpenRef.current || "").trim();
-    const forkFromProviderSessionIdForThisStart = forceFreshSessionForThisStart
-      ? ""
-      : String(forkFromProviderSessionOnNextOpenRef.current || "").trim();
-    const startupThreadProviderSessionId = (
-      forceFreshSessionForThisStart
-      || forkFromProviderSessionIdForThisStart
-    )
-      ? ""
-      : providerSessionOverrideForThisStart || threadProviderSessionId;
+    );
+    const sessionOpenBindingForThisStart = resolveTerminalSessionOpenBinding({
+      forceFreshSession: requestedFreshSessionForThisStart,
+      forkFromProviderSessionId: forkFromProviderSessionOnNextOpenRef.current,
+      providerSessionOverride: providerSessionOverrideOnNextOpenRef.current,
+      threadProviderSessionId,
+    });
+    const forceFreshSessionForThisStart = sessionOpenBindingForThisStart.fresh_session;
+    const forkFromProviderSessionIdForThisStart = sessionOpenBindingForThisStart.fork_from_provider_session_id;
+    const startupThreadProviderSessionId = sessionOpenBindingForThisStart.provider_session_id;
     const startupDefaultLaunch = isGenericTerminal
       ? { effort: "", model: "", speed: "" }
       : getTerminalStartupDefaultLaunch(terminalAgentKind, agentLaunchDefaults);
@@ -14540,6 +14551,26 @@ function WorkspaceTerminal({
           return;
         }
 
+        const openedLaunchEpoch = String(openResult?.launch_epoch || "").trim();
+        terminalLaunchEpochRef.current = openedLaunchEpoch;
+        for (const [coordinatorId, waiter] of terminalOpenWaitersRef.current.entries()) {
+          const replacedInstance = Number(terminalInstanceId || 0) !== Number(waiter.instance_id || 0);
+          const replacedLaunch = Boolean(openedLaunchEpoch)
+            && openedLaunchEpoch !== String(waiter.launch_epoch || "");
+          const openedRole = normalizeTerminalSessionRestartRole(terminalAgentKind);
+          const expectedRole = normalizeTerminalSessionRestartRole(waiter.role);
+          if ((!replacedInstance && !replacedLaunch) || (expectedRole && openedRole !== expectedRole)) {
+            continue;
+          }
+          terminalOpenWaitersRef.current.delete(coordinatorId);
+          window.clearTimeout(waiter.timer);
+          waiter.resolve({
+            agent_id: openedRole,
+            instance_id: terminalInstanceId,
+            launch_epoch: openedLaunchEpoch,
+          });
+        }
+
         outputDisplayMasker.setPaths({
           coreRepoPath: collapseFunctionalRepoPathToCoreRepoPath(
             openResult?.project_root || openResult?.working_directory || workingDirectory || "",
@@ -14638,6 +14669,7 @@ function WorkspaceTerminal({
           input_ready_at: openedInputReadyAt,
           input_ready_confidence: openedInputReady ? "terminal-open" : "",
           instance_id: terminalInstanceId,
+          launch_epoch: openedLaunchEpoch,
           model: openedProviderModel,
           model_source: openedProviderModelSource,
           reasoning_effort: startupThreadProviderEffort,
@@ -14704,6 +14736,7 @@ function WorkspaceTerminal({
           agent_id: agent?.id || terminalAgentKind,
           agentStarted: !shouldPrewarmShell,
           instance_id: terminalInstanceId,
+          launch_epoch: openedLaunchEpoch,
           model: startupThreadProviderModel,
           needsAgentStart: shouldPrewarmShell,
           pane_id: paneId,
@@ -16597,62 +16630,216 @@ function WorkspaceTerminal({
     return true;
   }, [onThreadTerminalLifecycle, terminalAgentKind, terminalIndex, workspace?.id]);
 
-  const restartTerminalAs = useCallback((roleId = terminalAgentKind) => {
-    if (terminalClosing) {
-      return;
-    }
+  const waitForReplacementTerminalOpen = useCallback((coordinatorId, identity) => (
+    new Promise((resolve, reject) => {
+      const timer = window.setTimeout(() => {
+        terminalOpenWaitersRef.current.delete(coordinatorId);
+        reject(new Error("Timed out waiting for the replacement terminal session to open."));
+      }, TERMINAL_SESSION_RESTART_REPLACEMENT_OPEN_TIMEOUT_MS);
+      terminalOpenWaitersRef.current.set(coordinatorId, {
+        ...identity,
+        reject,
+        resolve,
+        timer,
+      });
+    })
+  ), []);
 
-    const nextRoleId = String(roleId || terminalAgentKind).toLowerCase();
-    const nextSessionMode = defaultTerminalSessionModeForRole(nextRoleId);
-    terminalSessionModeRef.current = nextSessionMode;
-    terminalSessionModeExplicitRef.current = true;
-    setTerminalSessionMode(nextSessionMode);
-    setRestartRoleMenuOpen(false);
-
-    detachThreadForNewTerminalSession({
-      agent_id: terminalAgentKind,
-      instance_id: terminalInstanceIdRef.current || undefined,
+  const coordinateTerminalSessionRestart = useCallback(async (request = {}) => {
+    const coordinatorId = String(request.coordinator_id || "").trim()
+      || createTerminalSessionRestartCoordinatorId("terminal");
+    const mode = normalizeTerminalSessionRestartMode(request.mode);
+    const nextRoleId = normalizeTerminalSessionRestartRole(request.role || terminalAgentKind);
+    const currentInstanceId = Number(terminalInstanceIdRef.current || 0);
+    const currentLaunchEpoch = String(terminalLaunchEpochRef.current || "").trim();
+    const expectedInstanceId = Number(request.instance_id || currentInstanceId);
+    const expectedLaunchEpoch = String(request.launch_epoch || currentLaunchEpoch).trim();
+    const resultBase = {
+      coordinator_id: coordinatorId,
+      fresh_session: true,
+      mode,
       pane_id: paneId,
+      previous_instance_id: expectedInstanceId,
+      previous_launch_epoch: expectedLaunchEpoch,
+      role: nextRoleId,
       terminal_index: terminalIndex,
-      thread_id: terminalThreadIdRef.current || thread?.id || "",
       workspace_id: workspace?.id || "",
-    });
-    const nextThreadId = createWorkspaceThreadId(workspace?.id || "", terminalIndex);
+    };
+    const fail = (message, status = "failed") => {
+      const result = { ...resultBase, error: message, message, status };
+      emitTerminalSessionRestartResult(result);
+      if (status === "failed") {
+        setTerminalError(message);
+      }
+      return result;
+    };
 
-    if (nextRoleId && nextRoleId !== terminalAgentKind) {
-      pendingThreadStartingLifecycleRef.current = {
-        agent_id: nextRoleId,
-        pane_id: paneId,
-        repo_path: workingDirectory || "",
-        terminal_index: terminalIndex,
-        thread_id: nextThreadId,
-        workspace_id: workspace?.id || "",
-        workspace_name: workspace?.name || "",
-      };
-      terminalThreadIdRef.current = nextThreadId;
-      terminalThreadSlotKeyRef.current = String(Math.max(0, Number.parseInt(terminalIndex, 10) || 0) + 1);
-      resetTerminalReadinessForEpoch({
-        activity_status: "idle",
-        agent_id: nextRoleId,
-        instance_id: 0,
-        reason: "terminal_restart_role_change",
-        thread_id: nextThreadId,
-      });
-      onChangeTerminalRole?.({
-        role: nextRoleId,
-        source: "terminal_restart_menu_new_session",
-        startNewSession: true,
-        terminal_index: terminalIndex,
-        workspace_id: workspace?.id || "",
-      });
-      return;
+    if (!nextRoleId) {
+      return fail("Restart command did not include a supported terminal role.");
+    }
+    if (
+      terminalClosingRef.current
+      || (request.pane_id && String(request.pane_id) !== paneId)
+      || (request.workspace_id && String(request.workspace_id) !== String(workspace?.id || ""))
+      || (Number.isInteger(Number(request.terminal_index))
+        && Number(request.terminal_index) !== Number(terminalIndex))
+      || !currentInstanceId
+      || expectedInstanceId !== currentInstanceId
+      || (expectedLaunchEpoch && currentLaunchEpoch && expectedLaunchEpoch !== currentLaunchEpoch)
+    ) {
+      return fail("The requested terminal instance or launch epoch is stale.");
+    }
+    if (activeRestartCoordinatorRef.current && activeRestartCoordinatorRef.current !== coordinatorId) {
+      return fail("Another terminal restart coordinator is already running.");
     }
 
-    restartWithEmptyTerminalSession({
-      agent_id: nextRoleId || terminalAgentKind,
-      nextThreadId,
-      statusDetail: "Starting a new terminal session.",
-    });
+    if (mode === TERMINAL_SESSION_RESTART_MODES.WHEN_IDLE && !request.backend_already_closed) {
+      try {
+        const admission = await invoke("terminal_restart_if_idle", {
+          pane_id: paneId,
+          instance_id: currentInstanceId,
+          launch_epoch: currentLaunchEpoch,
+          target_role: nextRoleId,
+          coordinator_id: coordinatorId,
+          deadline_ms: Number(request.deadline_ms) || undefined,
+        });
+        if (admission?.queued) {
+          const queued = {
+            ...resultBase,
+            deadline_at_ms: admission.deadline_at_ms,
+            message: admission.reason === "restart_admission_contended"
+              ? "Restart queued while terminal admission settles."
+              : "Terminal is busy; restart queued until the current turn finishes.",
+            restart_intent_seq: admission.restart_intent_seq,
+            status: "queued",
+          };
+          emitTerminalSessionRestartResult(queued);
+          return queued;
+        }
+        if (!admission?.restarted) {
+          const rejectionMessage = admission?.reason === "restart_already_pending"
+            ? "Another restart is already queued for this terminal."
+            : admission?.reason === "not_authoritatively_busy_or_idle"
+              ? "Terminal restart is waiting for an authoritative idle transition."
+              : "Terminal restart was rejected because its identity changed.";
+          return fail(rejectionMessage);
+        }
+        request = { ...request, backend_already_closed: true };
+      } catch (error) {
+        return fail(getErrorMessage(error, "Unable to queue terminal restart."));
+      }
+    }
+
+    activeRestartCoordinatorRef.current = coordinatorId;
+    try {
+      const nextSessionMode = defaultTerminalSessionModeForRole(nextRoleId);
+      terminalSessionModeRef.current = nextSessionMode;
+      terminalSessionModeExplicitRef.current = true;
+      setTerminalSessionMode(nextSessionMode);
+      setRestartRoleMenuOpen(false);
+
+      // The shared coordinator owns the native restart sequence. A fresh
+      // thread id is minted before the exact old instance is closed, and the
+      // replacement open is not reported complete until the backend returns a
+      // different instance/launch identity.
+      detachThreadForNewTerminalSession({
+        agent_id: terminalAgentKind,
+        instance_id: currentInstanceId,
+        pane_id: paneId,
+        terminal_index: terminalIndex,
+        thread_id: terminalThreadIdRef.current || thread?.id || "",
+        workspace_id: workspace?.id || "",
+      });
+      const nextThreadId = createWorkspaceThreadId(workspace?.id || "", terminalIndex);
+      const replacementOpened = waitForReplacementTerminalOpen(coordinatorId, {
+        instance_id: currentInstanceId,
+        launch_epoch: currentLaunchEpoch,
+        role: nextRoleId,
+      });
+
+      if (!request.backend_already_closed) {
+        const closed = await invoke("terminal_close", {
+          pane_id: paneId,
+          instance_id: currentInstanceId,
+          preserve_coordination_session: false,
+          wait_for_cleanup: true,
+        });
+        if (closed !== true) {
+          throw new Error("The terminal identity changed before restart admission.");
+        }
+      }
+      emitTerminalSessionRestartResult({
+        ...resultBase,
+        message: "Opening a fresh terminal session.",
+        status: "running",
+      });
+
+      if (nextRoleId !== terminalAgentKind) {
+        // A role change must cross the same fresh-session gate as a same-role
+        // restart. Clear every historical binding before React remounts the
+        // pane for the new provider.
+        forceFreshSessionOnNextOpenRef.current = true;
+        providerSessionOverrideOnNextOpenRef.current = "";
+        forkFromProviderSessionOnNextOpenRef.current = "";
+        preserveCoordinationOnNextOpenRef.current = false;
+        pendingThreadStartingLifecycleRef.current = {
+          agent_id: nextRoleId,
+          pane_id: paneId,
+          repo_path: workingDirectory || "",
+          terminal_index: terminalIndex,
+          thread_id: nextThreadId,
+          workspace_id: workspace?.id || "",
+          workspace_name: workspace?.name || "",
+        };
+        terminalThreadIdRef.current = nextThreadId;
+        terminalThreadSlotKeyRef.current = String(Math.max(0, Number.parseInt(terminalIndex, 10) || 0) + 1);
+        resetTerminalReadinessForEpoch({
+          activity_status: "idle",
+          agent_id: nextRoleId,
+          instance_id: 0,
+          reason: "terminal_restart_role_change",
+          thread_id: nextThreadId,
+        });
+        onChangeTerminalRole?.({
+          backend_already_closed: true,
+          role: nextRoleId,
+          source: "terminal_session_restart_coordinator",
+          startNewSession: true,
+          terminal_index: terminalIndex,
+          workspace_id: workspace?.id || "",
+        });
+      } else {
+        restartWithEmptyTerminalSession({
+          agent_id: nextRoleId,
+          nextThreadId,
+          reason: "terminal_session_restart_coordinator",
+          statusDetail: "Starting a new terminal session.",
+        });
+      }
+
+      const opened = await replacementOpened;
+      const completed = {
+        ...resultBase,
+        agent_id: opened.agent_id,
+        instance_id: opened.instance_id,
+        launch_epoch: opened.launch_epoch,
+        message: "Fresh terminal session opened.",
+        status: "completed",
+      };
+      emitTerminalSessionRestartResult(completed);
+      return completed;
+    } catch (error) {
+      const waiter = terminalOpenWaitersRef.current.get(coordinatorId);
+      if (waiter) {
+        terminalOpenWaitersRef.current.delete(coordinatorId);
+        window.clearTimeout(waiter.timer);
+      }
+      return fail(getErrorMessage(error, "Unable to restart terminal session."));
+    } finally {
+      if (activeRestartCoordinatorRef.current === coordinatorId) {
+        activeRestartCoordinatorRef.current = "";
+      }
+    }
   }, [
     detachThreadForNewTerminalSession,
     onChangeTerminalRole,
@@ -16665,7 +16852,103 @@ function WorkspaceTerminal({
     workingDirectory,
     workspace?.id,
     workspace?.name,
+    waitForReplacementTerminalOpen,
   ]);
+
+  const restartTerminalAs = useCallback((roleId = terminalAgentKind) => {
+    coordinateTerminalSessionRestart({
+      mode: TERMINAL_SESSION_RESTART_MODES.NOW,
+      role: roleId,
+    });
+  }, [coordinateTerminalSessionRestart, terminalAgentKind]);
+
+  useEffect(() => {
+    const handleRestartRequest = (event) => {
+      const detail = event?.detail || {};
+      const targetIndex = Number(detail.terminal_index);
+      if (
+        (detail.pane_id && String(detail.pane_id) !== paneId)
+        || (detail.workspace_id && String(detail.workspace_id) !== String(workspace?.id || ""))
+        || (Number.isInteger(targetIndex) && targetIndex !== Number(terminalIndex))
+      ) {
+        return;
+      }
+      coordinateTerminalSessionRestart(detail);
+    };
+    window.addEventListener(TERMINAL_SESSION_RESTART_REQUEST_EVENT, handleRestartRequest);
+    return () => {
+      window.removeEventListener(TERMINAL_SESSION_RESTART_REQUEST_EVENT, handleRestartRequest);
+    };
+  }, [coordinateTerminalSessionRestart, paneId, terminalIndex, workspace?.id]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    listen("forge-terminal-restart-intent", (event) => {
+      if (disposed) {
+        return;
+      }
+      const detail = event?.payload || {};
+      if (String(detail.pane_id || "") !== paneId) {
+        return;
+      }
+      if (String(detail.restart_intent_state || "") === "cleared") {
+        emitTerminalSessionRestartResult(terminalSessionRestartClearedResult(detail, {
+          pane_id: paneId,
+          terminal_index: terminalIndex,
+          workspace_id: workspace?.id || "",
+        }));
+        return;
+      }
+      if (String(detail.restart_intent_state || "") === "blocked") {
+        const blocked = {
+          coordinator_id: detail.coordinator_id,
+          deadline_at_ms: detail.deadline_at_ms,
+          force_action: detail.restart_force_action,
+          fresh_session: true,
+          instance_id: detail.instance_id,
+          launch_epoch: detail.launch_epoch,
+          message: "Restart still blocked. Active work was not interrupted; choose Restart now to force it.",
+          mode: detail.mode,
+          pane_id: paneId,
+          restart_intent_seq: detail.restart_intent_seq,
+          role: detail.target_role,
+          status: "blocked",
+          terminal_index: terminalIndex,
+          workspace_id: workspace?.id || "",
+        };
+        setTerminalError(blocked.message);
+        emitTerminalSessionRestartResult(blocked);
+        return;
+      }
+      if (String(detail.restart_intent_state || "") !== "ready") {
+        return;
+      }
+      coordinateTerminalSessionRestart({
+        backend_already_closed: true,
+        coordinator_id: detail.coordinator_id,
+        instance_id: detail.instance_id,
+        launch_epoch: detail.launch_epoch,
+        mode: TERMINAL_SESSION_RESTART_MODES.NOW,
+        pane_id: paneId,
+        role: detail.target_role,
+        terminal_index: terminalIndex,
+        workspace_id: workspace?.id || "",
+      });
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [coordinateTerminalSessionRestart, paneId, terminalIndex, workspace?.id]);
 
   const terminalSplitModeId = String(terminalSplitMode || "both").trim().toLowerCase();
   const normalizedTerminalSplitLimit = Math.max(

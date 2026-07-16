@@ -1,16 +1,14 @@
 export async function restartStaleProviderTerminalsAcrossWorkspaces({
   enabledWorkspaceIds,
   provider,
-  relaunchTerminal,
   resolveTerminal,
-  restartIfIdle,
+  restartTerminalSession,
   staleRows,
-  terminalIsIdle,
   terminalPaneId,
 }) {
   const normalizedProvider = String(provider || "").trim().toLowerCase();
   if (!normalizedProvider) {
-    return { blocked: 0, restarted: 0, workspaces: [] };
+    return { blocked: 0, queued: 0, restarted: 0, workspaces: [] };
   }
   const enabled = new Set(
     [...(enabledWorkspaceIds || [])]
@@ -18,6 +16,7 @@ export async function restartStaleProviderTerminalsAcrossWorkspaces({
       .filter(Boolean),
   );
   let restarted = 0;
+  let queued = 0;
   let blocked = 0;
   const touchedWorkspaces = new Set();
 
@@ -33,9 +32,6 @@ export async function restartStaleProviderTerminalsAcrossWorkspaces({
     }
     if (
       row?.needs_restart === false
-      || row?.restart_eligible !== true
-      || row?.idle !== true
-      || row?.busy === true
     ) {
       blocked += 1;
       continue;
@@ -47,26 +43,34 @@ export async function restartStaleProviderTerminalsAcrossWorkspaces({
       blocked += 1;
       continue;
     }
-    if (!terminalIsIdle(terminal)) {
-      blocked += 1;
-      continue;
-    }
-
     const instanceId = Number(row?.instance_id);
     const launchEpoch = String(row?.launch_epoch || "").trim();
     if (!Number.isSafeInteger(instanceId) || instanceId <= 0 || !launchEpoch) {
       blocked += 1;
       continue;
     }
-    const guarded = await restartIfIdle({ instanceId, launchEpoch, paneId, row });
-    if (guarded?.restarted !== true) {
+    const result = await restartTerminalSession({
+      instanceId,
+      launchEpoch,
+      mode: "restart_when_idle",
+      paneId,
+      provider: normalizedProvider,
+      row,
+      terminalIndex,
+      workspaceId,
+    });
+    if (result?.status === "queued" || result?.queued === true) {
+      queued += 1;
+      touchedWorkspaces.add(workspaceId);
+      continue;
+    }
+    if (result?.status !== "completed") {
       blocked += 1;
       continue;
     }
-    relaunchTerminal({ paneId, provider: normalizedProvider, row, terminalIndex, workspaceId });
     restarted += 1;
     touchedWorkspaces.add(workspaceId);
   }
 
-  return { blocked, restarted, workspaces: [...touchedWorkspaces] };
+  return { blocked, queued, restarted, workspaces: [...touchedWorkspaces] };
 }

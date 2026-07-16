@@ -28,6 +28,10 @@ const TERMINAL_CODEX_AUTH_RECOVERY_DOWNSTREAM_QUEUE_MAX: usize = 128;
 const TERMINAL_CODEX_APP_SERVER_STARTUP_JITTER_MIN_MS: u64 = 20;
 const TERMINAL_CODEX_APP_SERVER_STARTUP_JITTER_SPAN_MS: u64 = 131;
 const TERMINAL_CODEX_HOOK_TRUST_RESPONSE_TIMEOUT_MS: u64 = 10_000;
+const TERMINAL_RESTART_INTENT_DEFAULT_DEADLINE_MS: u64 = 120_000;
+const TERMINAL_RESTART_INTENT_MIN_DEADLINE_MS: u64 = 5_000;
+const TERMINAL_RESTART_INTENT_MAX_DEADLINE_MS: u64 = 15 * 60_000;
+const TERMINAL_RESTART_INTENT_EVENT: &str = "forge-terminal-restart-intent";
 // Agent-start commands must never hang the frontend launch pipeline: a
 // wedged lifecycle holder (slow terminal_open, close teardown) or a stuck
 // pane future previously left the invoke pending forever, so panes sat at
@@ -4833,6 +4837,7 @@ fn terminal_effective_safety_state(
 struct TerminalLiveSessionSummary {
     pane_id: String,
     instance_id: u64,
+    launch_epoch: String,
     terminal_process_epoch: String,
     workspace_id: String,
     workspace_name: String,
@@ -4879,6 +4884,15 @@ struct TerminalLiveSessionSummary {
     runtime_event_type: String,
     runtime_hook_event_name: String,
     runtime_updated_at_ms: u64,
+    restart_intent_seq: u64,
+    restart_intent_pending: bool,
+    restart_intent_state: String,
+    restart_mode: Option<String>,
+    restart_target_role: Option<String>,
+    restart_coordinator_id: Option<String>,
+    restart_requested_at_ms: Option<u64>,
+    restart_deadline_at_ms: Option<u64>,
+    restart_force_action: Option<Value>,
     connectivity_state: String,
     attention_state: String,
     provider_health: String,
@@ -7341,17 +7355,512 @@ async fn remove_terminal_parked_prompts_for_close(
     removed
 }
 
+fn terminal_instance_launch_epoch(instance: &TerminalInstance) -> String {
+    instance
+        .coordination
+        .as_ref()
+        .and_then(|coordination| coordination.terminal_launch_epoch.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "{}:{}:{}",
+                instance.metadata.terminal_process_epoch, instance.metadata.pane_id, instance.id
+            )
+        })
+}
+
+fn terminal_restart_role(value: Option<&str>, instance: &TerminalInstance) -> Option<String> {
+    let requested = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(instance.metadata.agent_kind.as_str())
+        .to_ascii_lowercase()
+        .replace([' ', '_'], "-");
+    match requested.as_str() {
+        "codex" | "claude" | "opencode" => Some(requested),
+        "generic" | "shell" | "terminal" | "plain-shell" => Some("generic".to_string()),
+        _ => None,
+    }
+}
+
+fn terminal_instance_is_generic_shell(instance: &TerminalInstance) -> bool {
+    terminal_restart_role(None, instance).as_deref() == Some("generic")
+}
+
+#[cfg(unix)]
+fn terminal_generic_shell_foreground_process_running(
+    instance: &TerminalInstance,
+) -> Option<bool> {
+    if !terminal_instance_is_generic_shell(instance) {
+        return Some(false);
+    }
+    let shell_pid = {
+        let child = instance.child.try_lock().ok()?;
+        child.as_ref()?.process_id()?
+    };
+    let foreground_process_group = {
+        let master = instance.master.try_lock().ok()?;
+        master.process_group_leader()?
+    };
+    Some(foreground_process_group > 0 && foreground_process_group as u32 != shell_pid)
+}
+
+#[cfg(windows)]
+fn terminal_generic_shell_foreground_process_running(
+    instance: &TerminalInstance,
+) -> Option<bool> {
+    if !terminal_instance_is_generic_shell(instance) {
+        return Some(false);
+    }
+    // Windows does not expose the PTY foreground process group. Conservatively
+    // keep a generic-shell restart deferred while its shell owns any live
+    // descendant instead of risking termination of foreground work.
+    let shell_pid = {
+        let child = instance.child.try_lock().ok()?;
+        child.as_ref()?.process_id()?
+    };
+    let mut system = SysSystem::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        developer_process_refresh_kind(false),
+    );
+    let child_map = developer_child_map(&system);
+    Some(
+        child_map
+            .get(&shell_pid)
+            .is_some_and(|children| !children.is_empty()),
+    )
+}
+
+fn terminal_restart_has_running_foreground_process(instance: &TerminalInstance) -> bool {
+    terminal_instance_is_generic_shell(instance)
+        && terminal_generic_shell_foreground_process_running(instance).unwrap_or(true)
+}
+
+fn terminal_restart_intent_matches(
+    intent: &TerminalPendingRestartIntent,
+    pane_id: &str,
+    instance_id: u64,
+    launch_epoch: &str,
+) -> bool {
+    intent.pane_id == pane_id
+        && intent.instance_id == instance_id
+        && intent.launch_epoch == launch_epoch
+}
+
+fn terminal_restart_intent_for_instance(
+    state: &TerminalState,
+    instance: &TerminalInstance,
+) -> Option<TerminalPendingRestartIntent> {
+    let launch_epoch = terminal_instance_launch_epoch(instance);
+    state
+        .pending_restart_intents
+        .lock()
+        .ok()
+        .and_then(|intents| intents.get(&instance.metadata.pane_id).cloned())
+        .filter(|intent| {
+            terminal_restart_intent_matches(
+                intent,
+                &instance.metadata.pane_id,
+                instance.id,
+                &launch_epoch,
+            )
+        })
+}
+
+fn terminal_clear_restart_intent_exact(
+    state: &TerminalState,
+    pane_id: &str,
+    instance_id: u64,
+    launch_epoch: &str,
+) -> Option<TerminalPendingRestartIntent> {
+    let mut intents = state.pending_restart_intents.lock().ok()?;
+    let matches = intents.get(pane_id).is_some_and(|intent| {
+        terminal_restart_intent_matches(intent, pane_id, instance_id, launch_epoch)
+    });
+    matches.then(|| intents.remove(pane_id)).flatten()
+}
+
+fn terminal_clear_restart_intent_for_pane(
+    state: &TerminalState,
+    pane_id: &str,
+) -> Option<TerminalPendingRestartIntent> {
+    state
+        .pending_restart_intents
+        .lock()
+        .ok()
+        .and_then(|mut intents| intents.remove(pane_id))
+}
+
+fn terminal_take_restart_intents_for_closed_panes(
+    pending_restart_intents: &StdMutex<HashMap<String, TerminalPendingRestartIntent>>,
+    pane_ids: &HashSet<String>,
+    clear_all: bool,
+) -> Vec<TerminalPendingRestartIntent> {
+    let Ok(mut intents) = pending_restart_intents.lock() else {
+        return Vec::new();
+    };
+    let mut cleared = if clear_all {
+        intents.drain().map(|(_, intent)| intent).collect::<Vec<_>>()
+    } else {
+        pane_ids
+            .iter()
+            .filter_map(|pane_id| intents.remove(pane_id))
+            .collect::<Vec<_>>()
+    };
+    cleared.sort_by(|left, right| left.pane_id.cmp(&right.pane_id));
+    cleared
+}
+
+fn terminal_next_restart_intent_seq(state: &TerminalState) -> u64 {
+    state
+        .next_restart_intent_seq
+        .fetch_add(1, Ordering::SeqCst)
+        .max(1)
+}
+
+fn terminal_restart_intent_deadline_ms(now_ms: u64, requested_ms: Option<u64>) -> u64 {
+    now_ms.saturating_add(
+        requested_ms
+            .unwrap_or(TERMINAL_RESTART_INTENT_DEFAULT_DEADLINE_MS)
+            .clamp(
+                TERMINAL_RESTART_INTENT_MIN_DEADLINE_MS,
+                TERMINAL_RESTART_INTENT_MAX_DEADLINE_MS,
+            ),
+    )
+}
+
+fn terminal_restart_intent_force_action(intent: &TerminalPendingRestartIntent) -> Value {
+    json!({
+        "label": "Restart now",
+        "command_kind": "terminal_restart",
+        "args": {
+            "pane_id": intent.pane_id,
+            "terminal_instance_id": intent.instance_id,
+            "launch_epoch": intent.launch_epoch,
+            "role": intent.target_role,
+            "mode": "restart_now",
+        },
+    })
+}
+
+fn terminal_emit_restart_intent_event(
+    app: &AppHandle,
+    intent: &TerminalPendingRestartIntent,
+    status: &str,
+    pending: bool,
+    reason: &str,
+) {
+    let force_action = (status == "blocked").then(|| terminal_restart_intent_force_action(intent));
+    let _ = app.emit(
+        TERMINAL_RESTART_INTENT_EVENT,
+        json!({
+            "contract": "diffforge.terminal_restart_intent.v1",
+            "pane_id": intent.pane_id,
+            "instance_id": intent.instance_id,
+            "launch_epoch": intent.launch_epoch,
+            "target_role": intent.target_role,
+            "mode": intent.mode,
+            "coordinator_id": intent.coordinator_id,
+            "requested_at_ms": intent.requested_at_ms,
+            "deadline_at_ms": intent.deadline_at_ms,
+            "restart_intent_seq": intent.restart_intent_seq,
+            "restart_intent_pending": pending,
+            "restart_intent_state": status,
+            "restart_force_action": force_action,
+            "reason": reason,
+        }),
+    );
+}
+
+fn terminal_restart_intent_has_open_interaction(
+    state: &TerminalState,
+    pane_id: &str,
+    instance_id: u64,
+) -> bool {
+    state
+        .terminal_structured_interactions
+        .lock()
+        .map(|interactions| {
+            interactions.values().any(|interaction| {
+                interaction.pane_id == pane_id && interaction.instance_id == instance_id
+            })
+        })
+        .unwrap_or(true)
+}
+
+#[derive(Clone, Copy)]
+struct TerminalRestartIntentClassification {
+    genuinely_busy: bool,
+    canonical_eligible: bool,
+    generic_foreground_busy: bool,
+}
+
+fn terminal_restart_intent_classification(
+    state: &TerminalState,
+    instance: &TerminalInstance,
+) -> TerminalRestartIntentClassification {
+    let runtime = terminal_runtime_snapshot(instance);
+    let has_open_interaction = terminal_restart_intent_has_open_interaction(
+        state,
+        &instance.metadata.pane_id,
+        instance.id,
+    );
+    let generic_foreground_busy = terminal_restart_has_running_foreground_process(instance);
+    TerminalRestartIntentClassification {
+        genuinely_busy: runtime.turn_active
+            || runtime.active_interaction_id.is_some()
+            || has_open_interaction
+            || generic_foreground_busy,
+        canonical_eligible: runtime.canonical_state == "idle"
+            && !runtime.turn_active
+            && runtime.active_interaction_id.is_none()
+            && !runtime.interaction_actionable
+            && !has_open_interaction
+            && !generic_foreground_busy,
+        generic_foreground_busy,
+    }
+}
+
+fn terminal_restart_intent_canonical_eligible(
+    state: &TerminalState,
+    instance: &TerminalInstance,
+) -> bool {
+    terminal_restart_intent_classification(state, instance).canonical_eligible
+}
+
+fn terminal_mark_restart_intent_blocked(
+    app: &AppHandle,
+    pane_id: &str,
+    instance_id: u64,
+    launch_epoch: &str,
+    expected_seq: u64,
+    reason: &str,
+) {
+    let state = app.state::<TerminalState>();
+    let updated = state
+        .pending_restart_intents
+        .lock()
+        .ok()
+        .and_then(|mut intents| {
+            let intent = intents.get_mut(pane_id)?;
+            if intent.instance_id != instance_id
+                || intent.launch_epoch != launch_epoch
+                || intent.restart_intent_seq != expected_seq
+                || intent.state == "blocked"
+            {
+                return None;
+            }
+            intent.state = "blocked".to_string();
+            intent.restart_intent_seq = terminal_next_restart_intent_seq(state.inner());
+            Some(intent.clone())
+        });
+    let Some(intent) = updated else {
+        return;
+    };
+    terminal_emit_restart_intent_event(app, &intent, "blocked", true, reason);
+    let app = app.clone();
+    let reason = reason.to_string();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<TerminalState>();
+        let cloud_state = app.state::<CloudMcpState>();
+        let instance = {
+            let terminals = state.terminals.read().await;
+            terminals.get(&intent.pane_id).cloned()
+        };
+        if let Some(instance) = instance.filter(|instance| {
+            terminal_restart_intent_matches(
+                &intent,
+                &instance.metadata.pane_id,
+                instance.id,
+                &terminal_instance_launch_epoch(instance),
+            )
+        }) {
+            cloud_mcp_sync_terminal_restart_intent_delta(
+                cloud_state.inner(),
+                &instance,
+                &intent,
+                true,
+                "blocked",
+                &reason,
+            )
+            .await;
+        }
+    });
+}
+
+fn terminal_spawn_restart_intent_deadline(
+    app: AppHandle,
+    intent: TerminalPendingRestartIntent,
+) {
+    tauri::async_runtime::spawn(async move {
+        let delay_ms = intent.deadline_at_ms.saturating_sub(terminal_now_ms());
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+        // Deadline expiry and deferred firing share the lifecycle lock. Whichever
+        // wins first makes the terminal intent transition atomic: a blocked
+        // intent cannot be consumed by a reevaluator that was already waiting.
+        let state = app.state::<TerminalState>();
+        let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        terminal_mark_restart_intent_blocked(
+            &app,
+            &intent.pane_id,
+            intent.instance_id,
+            &intent.launch_epoch,
+            intent.restart_intent_seq,
+            "restart_intent_deadline_expired",
+        );
+    });
+}
+
+fn terminal_spawn_restart_intent_reevaluation(
+    app: AppHandle,
+    pane_id: String,
+    instance_id: u64,
+    reason: &'static str,
+) {
+    tauri::async_runtime::spawn(async move {
+        // Activity publication can still own a short-lived admission guard
+        // when its canonical transition is emitted. Retry exact-identity idle
+        // admission with bounded backoff so a one-off lock collision cannot
+        // strand a real intent until its deadline.
+        let mut retry_delay_ms = 10_u64;
+        loop {
+            tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+            let state = app.state::<TerminalState>();
+            let intent = {
+                let intents = match state.pending_restart_intents.lock() {
+                    Ok(intents) => intents,
+                    Err(_) => return,
+                };
+                intents.get(&pane_id).cloned()
+            };
+            let Some(intent) = intent.filter(|intent| {
+                intent.instance_id == instance_id && intent.state == "pending"
+            }) else {
+                return;
+            };
+            let instance = {
+                let terminals = state.terminals.read().await;
+                terminals.get(&pane_id).cloned()
+            };
+            let Some(instance) = instance.filter(|instance| {
+                instance.id == instance_id
+                    && terminal_instance_launch_epoch(instance) == intent.launch_epoch
+            }) else {
+                return;
+            };
+            let classification = terminal_restart_intent_classification(state.inner(), &instance);
+            if !classification.canonical_eligible {
+                if classification.generic_foreground_busy {
+                    // Generic shells have no managed-agent activity hook to
+                    // announce that `sleep`, a build, SSH, etc. returned to
+                    // the prompt. Poll the foreground process group until the
+                    // shell owns the TTY again or the intent deadline wins.
+                    retry_delay_ms = (retry_delay_ms.saturating_mul(2)).min(250);
+                    continue;
+                }
+                // A later canonical transition will start a fresh bounded
+                // retry loop if the terminal becomes eligible again.
+                return;
+            }
+            drop(instance);
+
+            let close_result = {
+                let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
+                let _lifecycle_guard = lifecycle_lock.lock().await;
+                // The deadline worker and all close/open paths serialize on the
+                // same lifecycle lock. Revalidate the exact pending claim only
+                // after acquiring it so a blocked, replaced, or superseded
+                // intent can never close the terminal.
+                let current_intent = {
+                    let intents = match state.pending_restart_intents.lock() {
+                        Ok(intents) => intents,
+                        Err(_) => return,
+                    };
+                    intents.get(&pane_id).cloned()
+                };
+                let Some(current_intent) = current_intent.filter(|current| {
+                    current.state == "pending"
+                        && current.restart_intent_seq == intent.restart_intent_seq
+                        && terminal_restart_intent_matches(
+                            current,
+                            &pane_id,
+                            instance_id,
+                            &intent.launch_epoch,
+                        )
+                }) else {
+                    return;
+                };
+                if terminal_now_ms() >= current_intent.deadline_at_ms {
+                    terminal_mark_restart_intent_blocked(
+                        &app,
+                        &pane_id,
+                        instance_id,
+                        &current_intent.launch_epoch,
+                        current_intent.restart_intent_seq,
+                        "restart_intent_deadline_expired",
+                    );
+                    return;
+                }
+                let cloud_state = app.state::<CloudMcpState>();
+                close_terminal_session(
+                    Some(app.clone()),
+                    state.inner(),
+                    Some(cloud_state.inner()),
+                    &pane_id,
+                    Some(instance_id),
+                    true,
+                    false,
+                    Some(&current_intent.launch_epoch),
+                )
+                .await
+            };
+            match close_result {
+                Ok(true) => return,
+                Ok(false) => {
+                    retry_delay_ms = (retry_delay_ms.saturating_mul(2)).min(250);
+                }
+                Err(error) => {
+                    log_terminal_status_event(
+                        "backend.terminal_restart_intent.reevaluation_error",
+                        json!({
+                            "error": clean_terminal_diagnostic_log_text(&error),
+                            "instance_id": instance_id,
+                            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                            "reason": reason,
+                        }),
+                    );
+                    retry_delay_ms = (retry_delay_ms.saturating_mul(2)).min(250);
+                }
+            }
+        }
+    });
+}
+
 fn terminal_restart_guard_allows(
     current_instance_id: u64,
     expected_instance_id: u64,
     current_launch_epoch: &str,
     expected_launch_epoch: &str,
-    execution_phase: &str,
+    canonical_state: &str,
+    turn_active: bool,
+    has_open_interaction: bool,
+    has_running_foreground_process: bool,
     terminal_lifecycle: &str,
 ) -> bool {
     current_instance_id == expected_instance_id
         && current_launch_epoch == expected_launch_epoch
-        && agent_accounts_restart_eligible(execution_phase, terminal_lifecycle)
+        && canonical_state == "idle"
+        && !turn_active
+        && !has_open_interaction
+        && !has_running_foreground_process
+        && terminal_lifecycle == "open"
 }
 
 async fn close_terminal_session(
@@ -7406,11 +7915,7 @@ async fn close_terminal_session(
             let runtime_handle = Arc::clone(&current.runtime);
             let active_task_handle = Arc::clone(&current.active_task);
             let input_queue_handle = Arc::clone(&current.input_queue);
-            let current_launch_epoch = current
-                .coordination
-                .as_ref()
-                .and_then(|coordination| coordination.terminal_launch_epoch.as_deref())
-                .unwrap_or_default();
+            let current_launch_epoch = terminal_instance_launch_epoch(current);
             if current_launch_epoch != expected_launch_epoch {
                 log_terminal_crash_forensics_event(
                     "backend.terminal_restart_if_idle.skip",
@@ -7462,13 +7967,25 @@ async fn close_terminal_session(
                 .get(pane_id)
                 .map(|current| current.metadata.clone())
                 .ok_or_else(|| "Terminal disappeared during guarded restart.".to_string())?;
+            let has_running_foreground_process = terminals
+                .get(pane_id)
+                .map(terminal_restart_has_running_foreground_process)
+                .unwrap_or(true);
             let projected = terminal_project_runtime(&metadata, &runtime, false);
+            let has_open_interaction = terminal_restart_intent_has_open_interaction(
+                state,
+                pane_id,
+                current_id,
+            );
             if !terminal_restart_guard_allows(
                 current_id,
                 instance_id.unwrap_or_default(),
-                current_launch_epoch,
+                &current_launch_epoch,
                 expected_launch_epoch,
-                &projected.execution_phase,
+                &runtime.canonical_state,
+                runtime.turn_active,
+                has_open_interaction,
+                has_running_foreground_process,
                 &projected.terminal_lifecycle,
             ) {
                 log_terminal_crash_forensics_event(
@@ -7476,6 +7993,7 @@ async fn close_terminal_session(
                     json!({
                         "activity": projected.execution_phase,
                         "expected_instance_id": instance_id,
+                        "has_running_foreground_process": has_running_foreground_process,
                         "pane_id": clean_terminal_diagnostic_log_text(pane_id),
                         "reason": "became_busy",
                     }),
@@ -7505,6 +8023,31 @@ async fn close_terminal_session(
 
     if let Some(instance) = instance {
         let cleanup_instance_id = instance.id;
+        let cleanup_launch_epoch = terminal_instance_launch_epoch(&instance);
+        if let Some(intent) = terminal_clear_restart_intent_exact(
+            state,
+            pane_id,
+            cleanup_instance_id,
+            &cleanup_launch_epoch,
+        ) {
+            if let Some(app) = app.as_ref() {
+                terminal_emit_restart_intent_event(
+                    app,
+                    &intent,
+                    if restart_if_idle_launch_epoch.is_some() {
+                        "ready"
+                    } else {
+                        "cleared"
+                    },
+                    false,
+                    if restart_if_idle_launch_epoch.is_some() {
+                        "restart_intent_eligible_closed"
+                    } else {
+                        "terminal_closed"
+                    },
+                );
+            }
+        }
         ssh_password_autofill_disarm_if_instance(pane_id, cleanup_instance_id);
         remove_terminal_parked_prompts_for_close(
             state,
@@ -7684,6 +8227,28 @@ async fn close_all_terminal_sessions(
                 .collect::<Vec<(String, TerminalInstance)>>()
         }
     };
+    let closed_pane_ids = instances
+        .iter()
+        .map(|(pane_id, _)| pane_id.clone())
+        .collect::<HashSet<_>>();
+    let cleared_restart_intents = terminal_take_restart_intents_for_closed_panes(
+        state.pending_restart_intents.as_ref(),
+        &closed_pane_ids,
+        target_workspace_id.is_none(),
+    );
+    for intent in &cleared_restart_intents {
+        terminal_emit_restart_intent_event(
+            &app,
+            intent,
+            "cleared",
+            false,
+            if target_workspace_id.is_some() {
+                "workspace_deactivated"
+            } else {
+                "terminal_close_all"
+            },
+        );
+    }
     let pty_pool = Arc::clone(&state.pty_pool);
     let cleanup_tracker = Arc::clone(&state.cleanup_tracker);
     let scoped_close = target_workspace_id.is_some();
@@ -7699,6 +8264,7 @@ async fn close_all_terminal_sessions(
         "backend.terminal_close_all.begin",
         json!({
             "active_count": closed,
+            "cleared_restart_intent_count": cleared_restart_intents.len(),
             "workspace_id": target_workspace_id.as_deref().unwrap_or(""),
             "warm_count": warm_total,
         }),
@@ -8992,6 +9558,16 @@ async fn terminal_open(
         );
     }
     let headless_output = Arc::clone(&instance.headless_output);
+    let launch_epoch = terminal_instance_launch_epoch(&instance);
+    if let Some(replaced_intent) = terminal_clear_restart_intent_for_pane(&state, &pane_id) {
+        terminal_emit_restart_intent_event(
+            &app,
+            &replaced_intent,
+            "cleared",
+            false,
+            "terminal_instance_replaced",
+        );
+    }
 
     let displaced_instance = state
         .terminals
@@ -9160,6 +9736,7 @@ async fn terminal_open(
     Ok(TerminalOpenResult {
         pane_id,
         instance_id,
+        launch_epoch,
         command,
         working_directory: workspace_path_display(&process_working_directory),
         project_root: workspace_path_display(&terminal_project_root),
@@ -18544,6 +19121,17 @@ fn apply_terminal_activity_hook_payload(
         &instance.metadata,
         &runtime_snapshot,
     );
+    if terminal_restart_intent_for_instance(terminal_state.inner(), instance)
+        .is_some_and(|intent| intent.state == "pending")
+        && terminal_restart_intent_canonical_eligible(terminal_state.inner(), instance)
+    {
+        terminal_spawn_restart_intent_reevaluation(
+            app.clone(),
+            payload.pane_id.clone(),
+            payload.instance_id,
+            "canonical_transition",
+        );
+    }
     if let Ok(mut launch_metadata) = instance.launch_metadata.lock() {
         if let Some(provider_error) = payload.provider_error.clone() {
             launch_metadata.provider_error = Some(provider_error);
@@ -27501,14 +28089,14 @@ async fn terminal_close(
     instance_id: Option<u64>,
     preserve_coordination_session: Option<bool>,
     wait_for_cleanup: Option<bool>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     validate_terminal_pane_id(&pane_id)?;
     let preserve_coordination_session = preserve_coordination_session.unwrap_or(false);
     let wait_for_cleanup = wait_for_cleanup.unwrap_or(false);
     let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
     let _lifecycle_guard = lifecycle_lock.lock().await;
 
-    close_terminal_session(
+    let closed = close_terminal_session(
         Some(app),
         &state,
         Some(cloud_mcp_state.inner()),
@@ -27520,7 +28108,7 @@ async fn terminal_close(
     )
     .await?;
 
-    Ok(())
+    Ok(closed)
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -27531,16 +28119,71 @@ async fn terminal_restart_if_idle(
     pane_id: String,
     instance_id: u64,
     launch_epoch: String,
+    target_role: Option<String>,
+    coordinator_id: Option<String>,
+    deadline_ms: Option<u64>,
 ) -> Result<Value, String> {
     validate_terminal_pane_id(&pane_id)?;
     let launch_epoch = launch_epoch.trim().to_string();
     if launch_epoch.is_empty() {
         return Err("A launch epoch is required for guarded terminal restart.".to_string());
     }
+    let coordinator_id = coordinator_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("restart-{}", uuid::Uuid::new_v4()));
+    let initial_instance = {
+        let terminals = state.terminals.read().await;
+        terminals.get(&pane_id).cloned()
+    };
+    let Some(initial_instance) = initial_instance.filter(|instance| {
+        instance.id == instance_id && terminal_instance_launch_epoch(instance) == launch_epoch
+    }) else {
+        return Ok(json!({
+            "contract": "diffforge.terminal_restart_if_idle.v2",
+            "pane_id": pane_id,
+            "instance_id": instance_id,
+            "launch_epoch": launch_epoch,
+            "restarted": false,
+            "queued": false,
+            "restart_intent_pending": false,
+            "status": "rejected",
+            "reason": "stale_identity",
+        }));
+    };
+    let target_role = terminal_restart_role(target_role.as_deref(), &initial_instance)
+        .ok_or_else(|| "Unsupported terminal restart role.".to_string())?;
     let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
     let _lifecycle_guard = lifecycle_lock.lock().await;
+    let existing_intent = state
+        .pending_restart_intents
+        .lock()
+        .map_err(|_| "Terminal restart intent state is unavailable.".to_string())?
+        .get(&pane_id)
+        .cloned();
+    if let Some(existing) = existing_intent.filter(|intent| {
+        terminal_restart_intent_matches(intent, &pane_id, instance_id, &launch_epoch)
+    }) {
+        let same_coordinator = existing.coordinator_id == coordinator_id
+            && existing.target_role == target_role;
+        return Ok(json!({
+            "contract": "diffforge.terminal_restart_if_idle.v2",
+            "pane_id": pane_id,
+            "instance_id": instance_id,
+            "launch_epoch": launch_epoch,
+            "coordinator_id": existing.coordinator_id,
+            "target_role": existing.target_role,
+            "deadline_at_ms": existing.deadline_at_ms,
+            "restart_intent_seq": existing.restart_intent_seq,
+            "restarted": false,
+            "queued": same_coordinator && existing.state == "pending",
+            "restart_intent_pending": true,
+            "status": if same_coordinator { existing.state } else { "rejected".to_string() },
+            "reason": if same_coordinator { "idempotent_existing_intent" } else { "restart_already_pending" },
+        }));
+    }
     let restarted = close_terminal_session(
-        Some(app),
+        Some(app.clone()),
         &state,
         Some(cloud_mcp_state.inner()),
         &pane_id,
@@ -27550,13 +28193,100 @@ async fn terminal_restart_if_idle(
         Some(&launch_epoch),
     )
     .await?;
+    if restarted {
+        return Ok(json!({
+            "contract": "diffforge.terminal_restart_if_idle.v2",
+            "pane_id": pane_id,
+            "instance_id": instance_id,
+            "launch_epoch": launch_epoch,
+            "restarted": true,
+            "queued": false,
+            "restart_intent_pending": false,
+            "status": "ready",
+            "reason": "idle_closed",
+        }));
+    }
+
+    let instance = {
+        let terminals = state.terminals.read().await;
+        terminals.get(&pane_id).cloned()
+    };
+    let Some(instance) = instance.filter(|instance| {
+        instance.id == instance_id && terminal_instance_launch_epoch(instance) == launch_epoch
+    }) else {
+        return Ok(json!({
+            "contract": "diffforge.terminal_restart_if_idle.v2",
+            "pane_id": pane_id,
+            "instance_id": instance_id,
+            "launch_epoch": launch_epoch,
+            "restarted": false,
+            "queued": false,
+            "restart_intent_pending": false,
+            "status": "rejected",
+            "reason": "stale_identity",
+        }));
+    };
+    // Classify from one runtime/interaction snapshot. A guarded close can also
+    // lose to a short admission transition that is neither authoritatively busy
+    // nor idle; retain a real intent in that case instead of dropping the
+    // request. The immediate reevaluator below resolves the transition.
+    let classification = terminal_restart_intent_classification(&state, &instance);
+    let now_ms = terminal_now_ms();
+    let intent_reason = if classification.genuinely_busy {
+        "terminal_busy"
+    } else if classification.canonical_eligible {
+        "restart_admission_contended"
+    } else {
+        "restart_admission_transition"
+    };
+    let intent = TerminalPendingRestartIntent {
+        pane_id: pane_id.clone(),
+        instance_id,
+        launch_epoch: launch_epoch.clone(),
+        target_role,
+        mode: "restart_when_idle".to_string(),
+        coordinator_id,
+        requested_at_ms: now_ms,
+        deadline_at_ms: terminal_restart_intent_deadline_ms(now_ms, deadline_ms),
+        restart_intent_seq: terminal_next_restart_intent_seq(&state),
+        state: "pending".to_string(),
+    };
+    state
+        .pending_restart_intents
+        .lock()
+        .map_err(|_| "Terminal restart intent state is unavailable.".to_string())?
+        .insert(pane_id.clone(), intent.clone());
+    terminal_emit_restart_intent_event(&app, &intent, "pending", true, intent_reason);
+    cloud_mcp_sync_terminal_restart_intent_delta(
+        cloud_mcp_state.inner(),
+        &instance,
+        &intent,
+        true,
+        "pending",
+        intent_reason,
+    )
+    .await;
+    terminal_spawn_restart_intent_deadline(app.clone(), intent.clone());
+    terminal_spawn_restart_intent_reevaluation(
+        app.clone(),
+        pane_id.clone(),
+        instance_id,
+        "restart_initial_admission_contended",
+    );
     Ok(json!({
-        "contract": "diffforge.terminal_restart_if_idle.v1",
+        "contract": "diffforge.terminal_restart_if_idle.v2",
         "pane_id": pane_id,
         "instance_id": instance_id,
         "launch_epoch": launch_epoch,
-        "restarted": restarted,
-        "reason": if restarted { "idle_closed" } else { "stale_or_busy" },
+        "coordinator_id": intent.coordinator_id,
+        "target_role": intent.target_role,
+        "deadline_at_ms": intent.deadline_at_ms,
+        "restart_intent_seq": intent.restart_intent_seq,
+        "restarted": false,
+        "queued": true,
+        "restart_intent_pending": true,
+        "status": "queued",
+        "reason": intent_reason,
     }))
 }
 
@@ -28164,10 +28894,13 @@ async fn terminal_live_sessions(
             instance.coordination.as_ref(),
         );
         let capabilities = terminal_session_capabilities(&metadata.agent_kind, &launch_metadata);
+        let launch_epoch = terminal_instance_launch_epoch(&instance);
+        let restart_intent = terminal_restart_intent_for_instance(&state, &instance);
 
         summaries.push(TerminalLiveSessionSummary {
             pane_id,
             instance_id: instance.id,
+            launch_epoch,
             terminal_process_epoch: metadata.terminal_process_epoch.clone(),
             workspace_id: metadata.workspace_id,
             workspace_name: metadata.workspace_name,
@@ -28214,6 +28947,29 @@ async fn terminal_live_sessions(
             runtime_event_type: runtime.event_type,
             runtime_hook_event_name: runtime.hook_event_name,
             runtime_updated_at_ms: runtime.updated_at_ms,
+            restart_intent_seq: restart_intent
+                .as_ref()
+                .map(|intent| intent.restart_intent_seq)
+                .unwrap_or(0),
+            restart_intent_pending: restart_intent.is_some(),
+            restart_intent_state: restart_intent
+                .as_ref()
+                .map(|intent| intent.state.clone())
+                .unwrap_or_else(|| "none".to_string()),
+            restart_mode: restart_intent.as_ref().map(|intent| intent.mode.clone()),
+            restart_target_role: restart_intent
+                .as_ref()
+                .map(|intent| intent.target_role.clone()),
+            restart_coordinator_id: restart_intent
+                .as_ref()
+                .map(|intent| intent.coordinator_id.clone()),
+            restart_requested_at_ms: restart_intent
+                .as_ref()
+                .map(|intent| intent.requested_at_ms),
+            restart_deadline_at_ms: restart_intent.as_ref().map(|intent| intent.deadline_at_ms),
+            restart_force_action: restart_intent.as_ref().and_then(|intent| {
+                (intent.state == "blocked").then(|| terminal_restart_intent_force_action(intent))
+            }),
             connectivity_state: "connected".to_string(),
             attention_state,
             provider_health,
@@ -28267,17 +29023,68 @@ mod terminal_tests {
     #[test]
     fn restart_if_idle_guard_aborts_on_busy_instance_or_epoch_race() {
         assert!(terminal_restart_guard_allows(
-            7, 7, "pane:7", "pane:7", "idle", "open"
+            7, 7, "pane:7", "pane:7", "idle", false, false, false, "open"
         ));
         assert!(!terminal_restart_guard_allows(
-            7, 7, "pane:7", "pane:7", "running", "open"
+            7, 7, "pane:7", "pane:7", "thinking", true, false, false, "open"
         ));
         assert!(!terminal_restart_guard_allows(
-            8, 7, "pane:8", "pane:7", "idle", "open"
+            7, 7, "pane:7", "pane:7", "idle", false, true, false, "open"
         ));
         assert!(!terminal_restart_guard_allows(
-            7, 7, "pane:new", "pane:7", "idle", "open"
+            7, 7, "pane:7", "pane:7", "idle", false, false, true, "open"
         ));
+        assert!(!terminal_restart_guard_allows(
+            8, 7, "pane:8", "pane:7", "idle", false, false, false, "open"
+        ));
+        assert!(!terminal_restart_guard_allows(
+            7, 7, "pane:new", "pane:7", "idle", false, false, false, "open"
+        ));
+    }
+
+    #[test]
+    fn close_all_restart_intent_cleanup_is_scoped_and_full_close_drains_orphans() {
+        let intent = |pane_id: &str, instance_id: u64| TerminalPendingRestartIntent {
+            pane_id: pane_id.to_string(),
+            instance_id,
+            launch_epoch: format!("{pane_id}:{instance_id}"),
+            target_role: "codex".to_string(),
+            mode: "restart_when_idle".to_string(),
+            coordinator_id: format!("coordinator-{pane_id}"),
+            requested_at_ms: 1,
+            deadline_at_ms: 10_000,
+            restart_intent_seq: instance_id,
+            state: "pending".to_string(),
+        };
+        let intents = StdMutex::new(HashMap::from([
+            ("pane-a".to_string(), intent("pane-a", 1)),
+            ("pane-b".to_string(), intent("pane-b", 2)),
+            ("orphan".to_string(), intent("orphan", 3)),
+        ]));
+
+        let cleared = terminal_take_restart_intents_for_closed_panes(
+            &intents,
+            &HashSet::from(["pane-a".to_string()]),
+            false,
+        );
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0].pane_id, "pane-a");
+        assert!(!intents.lock().unwrap().contains_key("pane-a"));
+        assert!(intents.lock().unwrap().contains_key("pane-b"));
+
+        let cleared = terminal_take_restart_intents_for_closed_panes(
+            &intents,
+            &HashSet::new(),
+            true,
+        );
+        assert_eq!(
+            cleared
+                .iter()
+                .map(|intent| intent.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["orphan", "pane-b"]
+        );
+        assert!(intents.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -28323,6 +29130,8 @@ mod terminal_tests {
         )])));
         let state = TerminalState {
             terminals: Arc::clone(&terminals),
+            pending_restart_intents: Arc::new(StdMutex::new(HashMap::new())),
+            next_restart_intent_seq: AtomicU64::new(1),
             terminal_input_queues: Arc::new(StdMutex::new(HashMap::new())),
             terminal_input_transport: Arc::new(StdMutex::new(None)),
             terminal_output_transport: Arc::new(StdMutex::new(None)),
@@ -28354,6 +29163,9 @@ mod terminal_tests {
                 task_id: "task-arrived-after-snapshot".to_string(),
                 title: "Busy now".to_string(),
             });
+            let mut runtime = TerminalRuntimeSnapshot::opened_idle(None);
+            runtime.turn_active = true;
+            *current.runtime.lock().unwrap() = runtime;
         }
         let restarted = close_terminal_session(
             None,
@@ -28412,6 +29224,7 @@ mod terminal_tests {
             source: "test-delayed-hook".to_string(),
             event_type: "provider-turn-started".to_string(),
             hook_event_name: "UserPromptSubmit".to_string(),
+            turn_active: true,
             updated_at_ms: terminal_now_ms(),
             ..TerminalRuntimeSnapshot::opened_idle(None)
         };
@@ -28457,6 +29270,176 @@ mod terminal_tests {
         // regression already closed its PTY, so do not poison parallel tests.
         std::mem::forget(state);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn generic_shell_restart_waits_for_foreground_process_to_return_to_prompt() {
+        let root = env::temp_dir().join(format!(
+            "restart-generic-foreground-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let warm = create_warm_shell_pty_in_directory(
+            PtySize {
+                rows: 12,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            &root,
+        )
+        .unwrap();
+        let metadata = TerminalInstanceMetadata {
+            pane_id: "pane-generic".to_string(),
+            agent_id: "generic".to_string(),
+            agent_kind: "generic".to_string(),
+            terminal_process_epoch: "test-process-epoch".to_string(),
+            ..TerminalInstanceMetadata::default()
+        };
+        let (instance, mut reader) = TerminalInstance::from_warm_shell(
+            51,
+            warm,
+            root.clone(),
+            false,
+            None,
+            TerminalSessionMode::General,
+            metadata,
+            TerminalLaunchRuntimeMetadata::default(),
+            false,
+        );
+        let reader_thread = thread::spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            while reader.read(&mut buffer).is_ok_and(|read| read > 0) {}
+        });
+        *instance.runtime.lock().unwrap() = TerminalRuntimeSnapshot::opened_idle(None);
+        let terminals = Arc::new(RwLock::new(HashMap::from([(
+            "pane-generic".to_string(),
+            instance.clone(),
+        )])));
+        let state = TerminalState {
+            terminals: Arc::clone(&terminals),
+            pending_restart_intents: Arc::new(StdMutex::new(HashMap::new())),
+            next_restart_intent_seq: AtomicU64::new(1),
+            terminal_input_queues: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_input_transport: Arc::new(StdMutex::new(None)),
+            terminal_output_transport: Arc::new(StdMutex::new(None)),
+            terminal_activity_transport: Arc::new(StdMutex::new(None)),
+            terminal_activity_transport_tokens: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_structured_interactions: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_structured_interaction_waiters: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_output_transport_subscribers: Arc::new(StdMutex::new(HashMap::new())),
+            parked_prompts: Arc::new(RwLock::new(HashMap::new())),
+            active_audio_input_target: Arc::new(StdMutex::new(None)),
+            audio_route_gate: Arc::new(StdMutex::new(TerminalAudioRouteGate::default())),
+            lifecycle_lock: Arc::new(Mutex::new(())),
+            pty_pool: Arc::new(PtyPool::new()),
+            cleanup_tracker: Arc::new(TerminalCleanupTracker::new()),
+            workspace_topology_cache: Arc::new(RwLock::new(HashMap::new())),
+            terminal_process_epoch: "test-process-epoch".to_string(),
+            next_terminal_instance_id: AtomicU64::new(52),
+            next_terminal_input_queue_id: AtomicU64::new(1),
+            next_terminal_output_subscriber_id: AtomicU64::new(1),
+        };
+
+        let outcome: Result<(), String> = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            {
+                let mut writer = instance.writer.lock().await;
+                writer
+                    .write_all(b"sleep 1\r")
+                    .map_err(|error| error.to_string())?;
+                writer.flush().map_err(|error| error.to_string())?;
+            }
+            let mut observed_foreground_process = false;
+            for _ in 0..150 {
+                if terminal_restart_has_running_foreground_process(&instance) {
+                    observed_foreground_process = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if !observed_foreground_process {
+                return Err("sleep never owned the PTY foreground group".to_string());
+            }
+            let busy_classification = terminal_restart_intent_classification(&state, &instance);
+            if !busy_classification.genuinely_busy
+                || !busy_classification.generic_foreground_busy
+                || busy_classification.canonical_eligible
+            {
+                return Err(
+                    "deferred admission classified foreground shell work as idle".to_string(),
+                );
+            }
+
+            let restarted = close_terminal_session(
+                None,
+                &state,
+                None,
+                "pane-generic",
+                Some(51),
+                true,
+                false,
+                Some("test-process-epoch:pane-generic:51"),
+            )
+            .await?;
+            if restarted || !terminals.read().await.contains_key("pane-generic") {
+                return Err("guarded restart killed foreground shell work".to_string());
+            }
+
+            let mut returned_to_prompt = false;
+            for _ in 0..300 {
+                if !terminal_restart_has_running_foreground_process(&instance) {
+                    returned_to_prompt = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if !returned_to_prompt {
+                return Err("shell did not regain the PTY foreground group".to_string());
+            }
+            let idle_classification = terminal_restart_intent_classification(&state, &instance);
+            if idle_classification.generic_foreground_busy
+                || !idle_classification.canonical_eligible
+            {
+                return Err("deferred admission did not recognize the returned prompt".to_string());
+            }
+
+            let restarted = close_terminal_session(
+                None,
+                &state,
+                None,
+                "pane-generic",
+                Some(51),
+                true,
+                true,
+                Some("test-process-epoch:pane-generic:51"),
+            )
+            .await?;
+            if !restarted || terminals.read().await.contains_key("pane-generic") {
+                return Err("truly idle generic shell did not restart".to_string());
+            }
+            Ok(())
+        }
+        .await;
+
+        if terminals.read().await.contains_key("pane-generic") {
+            let _ = close_terminal_session(
+                None,
+                &state,
+                None,
+                "pane-generic",
+                Some(51),
+                true,
+                true,
+                None,
+            )
+            .await;
+        }
+        std::mem::forget(state);
+        let _ = reader_thread.join();
+        let _ = fs::remove_dir_all(root);
+        assert!(outcome.is_ok(), "{}", outcome.unwrap_err());
     }
 
     fn codex_app_server_test_interaction(

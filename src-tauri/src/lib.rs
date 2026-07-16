@@ -602,6 +602,8 @@ struct TerminalWorkspaceTopologySnapshot {
 
 struct TerminalState {
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    pending_restart_intents: Arc<StdMutex<HashMap<String, TerminalPendingRestartIntent>>>,
+    next_restart_intent_seq: AtomicU64,
     terminal_input_queues: Arc<StdMutex<HashMap<String, TerminalInputQueueHandle>>>,
     terminal_input_transport: Arc<StdMutex<Option<TerminalInputTransportEndpoint>>>,
     terminal_output_transport: Arc<StdMutex<Option<TerminalOutputTransportEndpoint>>>,
@@ -1131,6 +1133,20 @@ struct TerminalRuntimeSnapshot {
     event_type: String,
     hook_event_name: String,
     updated_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TerminalPendingRestartIntent {
+    pane_id: String,
+    instance_id: u64,
+    launch_epoch: String,
+    target_role: String,
+    mode: String,
+    coordinator_id: String,
+    requested_at_ms: u64,
+    deadline_at_ms: u64,
+    restart_intent_seq: u64,
+    state: String,
 }
 
 #[derive(Clone, Default)]
@@ -2161,6 +2177,7 @@ struct TerminalStartAgentManyResult {
 struct TerminalOpenResult {
     pane_id: String,
     instance_id: u64,
+    launch_epoch: String,
     command: String,
     working_directory: String,
     project_root: String,
@@ -9673,9 +9690,7 @@ fn terminal_process_epoch_allocate_at(
         )
     })?;
 
-    Ok(format!(
-        "{sequence:020}-{timestamp_ms:020}-{unique_suffix}"
-    ))
+    Ok(format!("{sequence:020}-{timestamp_ms:020}-{unique_suffix}"))
 }
 
 fn terminal_process_epoch_allocate() -> Result<String, String> {
@@ -9703,12 +9718,14 @@ mod terminal_process_epoch_tests {
         let counter_path = root.join(TERMINAL_PROCESS_EPOCH_COUNTER_FILE);
 
         let first = terminal_process_epoch_allocate_at(&counter_path, 200, "process-a").unwrap();
-        let rollback =
-            terminal_process_epoch_allocate_at(&counter_path, 100, "process-b").unwrap();
+        let rollback = terminal_process_epoch_allocate_at(&counter_path, 100, "process-b").unwrap();
         let same_millisecond =
             terminal_process_epoch_allocate_at(&counter_path, 100, "process-c").unwrap();
 
-        assert!(rollback > first, "persistent counter must beat a clock rollback");
+        assert!(
+            rollback > first,
+            "persistent counter must beat a clock rollback"
+        );
         assert!(
             same_millisecond > rollback,
             "same-millisecond processes must have a strict total order"
@@ -9820,6 +9837,8 @@ fn run_app(daemon: bool) {
     builder = builder
         .manage(TerminalState {
             terminals: Arc::new(RwLock::new(HashMap::new())),
+            pending_restart_intents: Arc::new(StdMutex::new(HashMap::new())),
+            next_restart_intent_seq: AtomicU64::new(1),
             terminal_input_queues: Arc::new(StdMutex::new(HashMap::new())),
             terminal_input_transport: Arc::new(StdMutex::new(None)),
             terminal_output_transport: Arc::new(StdMutex::new(None)),
@@ -9900,7 +9919,6 @@ fn run_app(daemon: bool) {
             startup_settings_initialize(app.handle());
             tray_click_settings_initialize(app.handle());
             cloud_mcp_register_sync_status_app(app.handle());
-            cloud_mcp_start_local_device_bridge();
             let app_control_bridge_app = app.handle().clone();
             let app_control_bridge_state = app.state::<AppControlMcpState>().inner().clone();
             tauri::async_runtime::spawn(async move {

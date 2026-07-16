@@ -52,6 +52,11 @@ import {
   tokenomicsRowAgentProfileId,
   tokenomicsRowReferencesRemovedProfile,
 } from "./tokenomicsAccountRoster.js";
+import {
+  TERMINAL_SESSION_RESTART_MODES,
+  TERMINAL_SESSION_RESTART_REQUEST_EVENT,
+  createTerminalSessionRestartCoordinatorId,
+} from "../terminals/terminalSessionRestart.js";
 
 const TOKENOMICS_SCAN_PROGRESS_EVENT = "diffforge://tokenomics-scan-progress";
 const TOKENOMICS_UPDATED_EVENT = "diffforge://tokenomics-updated";
@@ -669,6 +674,23 @@ function AgentAccountsManager({ active = true }) {
     window.setTimeout(refresh, 800);
   }, [refresh]);
 
+  const requestBlockedRestartNow = useCallback((kind, row) => {
+    const forceArgs = row?.restart_force_action?.args || {};
+    window.dispatchEvent(new CustomEvent(TERMINAL_SESSION_RESTART_REQUEST_EVENT, {
+      detail: {
+        coordinator_id: createTerminalSessionRestartCoordinatorId("account-force-restart"),
+        instance_id: Number(forceArgs.terminal_instance_id || row?.instance_id || 0),
+        launch_epoch: String(forceArgs.launch_epoch || row?.launch_epoch || ""),
+        mode: TERMINAL_SESSION_RESTART_MODES.NOW,
+        pane_id: String(forceArgs.pane_id || row?.pane_id || ""),
+        role: String(forceArgs.role || row?.restart_target_role || kind),
+        terminal_index: Number(row?.terminal_index),
+        workspace_id: String(row?.workspace_id || ""),
+      },
+    }));
+    window.setTimeout(refresh, 800);
+  }, [refresh]);
+
   const beginLogin = useCallback((kind) => {
     if (loginPendingRef.current) return;
     loginPendingRef.current = kind;
@@ -906,11 +928,33 @@ function AgentAccountsManager({ active = true }) {
                   {[...staleByWorkspace.values()].map((workspace) => (
                     <AgentAccountStaleWorkspace key={workspace.id}>
                       <strong>{workspace.label}</strong>
-                      {workspace.rows.map((row) => (
-                        <span key={String(row?.pane_id || `${workspace.id}:${row?.terminal_index}`)}>
-                          {`Terminal ${Number(row?.terminal_index || 0) + 1} · ${row?.busy ? "busy — restart pending" : "idle — restart ready"}`}
-                        </span>
-                      ))}
+                      {workspace.rows.map((row) => {
+                        const restartIntentPending = row?.restart_intent_pending === true;
+                        const restartIntentBlocked = restartIntentPending
+                          && String(row?.restart_intent_state || "") === "blocked";
+                        const restartLabel = restartIntentBlocked
+                          ? "busy — restart blocked"
+                          : restartIntentPending
+                            ? row?.busy
+                              ? "busy — restart queued"
+                              : "restart queued"
+                            : row?.busy
+                              ? "busy"
+                              : "idle — restart ready";
+                        return (
+                          <span key={String(row?.pane_id || `${workspace.id}:${row?.terminal_index}`)}>
+                            {`Terminal ${Number(row?.terminal_index || 0) + 1} · ${restartLabel}`}
+                            {restartIntentBlocked ? (
+                              <AgentAccountRestartIdleButton
+                                onClick={() => requestBlockedRestartNow(kind, row)}
+                                type="button"
+                              >
+                                Restart now
+                              </AgentAccountRestartIdleButton>
+                            ) : null}
+                          </span>
+                        );
+                      })}
                     </AgentAccountStaleWorkspace>
                   ))}
                 </AgentAccountStaleInventory>

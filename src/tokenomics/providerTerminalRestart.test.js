@@ -3,9 +3,8 @@ import test from "node:test";
 
 import { restartStaleProviderTerminalsAcrossWorkspaces } from "./providerTerminalRestart.js";
 
-test("provider-wide restart spans enabled workspaces and leaves busy panes running", async () => {
-  const restartedPaneIds = [];
-  const relaunched = [];
+test("provider-wide restart spans enabled workspaces and queues busy panes", async () => {
+  const requested = [];
   const rows = [
     {
       busy: false,
@@ -61,20 +60,23 @@ test("provider-wide restart spans enabled workspaces and leaves busy panes runni
     enabledWorkspaceIds: new Set(["w1", "w2"]),
     provider: "codex",
     staleRows: rows,
-    resolveTerminal: ({ paneId }) => ({ pane_id: paneId, state: "idle" }),
+    resolveTerminal: ({ paneId, row }) => ({ pane_id: paneId, state: row.busy ? "busy" : "idle" }),
     terminalPaneId: (terminal) => terminal?.pane_id,
-    terminalIsIdle: (terminal) => terminal?.state === "idle",
-    restartIfIdle: async ({ paneId }) => {
-      restartedPaneIds.push(paneId);
-      return { restarted: true };
+    restartTerminalSession: async ({ mode, paneId, row }) => {
+      requested.push({ mode, paneId });
+      return row.busy ? { status: "queued" } : { status: "completed" };
     },
-    relaunchTerminal: ({ paneId, workspaceId }) => relaunched.push({ paneId, workspaceId }),
   });
 
-  assert.deepEqual(restartedPaneIds, ["pane-a", "pane-c"]);
-  assert.deepEqual(relaunched, [
-    { paneId: "pane-a", workspaceId: "w1" },
-    { paneId: "pane-c", workspaceId: "w2" },
+  assert.deepEqual(requested, [
+    { mode: "restart_when_idle", paneId: "pane-a" },
+    { mode: "restart_when_idle", paneId: "pane-b" },
+    { mode: "restart_when_idle", paneId: "pane-c" },
   ]);
-  assert.deepEqual(result, { blocked: 1, restarted: 2, workspaces: ["w1", "w2"] });
+  assert.deepEqual(result, {
+    blocked: 0,
+    queued: 1,
+    restarted: 2,
+    workspaces: ["w1", "w2"],
+  });
 });

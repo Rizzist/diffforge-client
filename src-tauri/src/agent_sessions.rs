@@ -8100,6 +8100,33 @@ fn read_agent_thread_transcript(
     })
 }
 
+/// Return durable, local evidence that a provider session is a real
+/// conversation. This intentionally scans the complete native source instead
+/// of the UI transcript tail and never falls back to cloud/network I/O.
+fn agent_thread_local_first_user_message(
+    agent_id: &str,
+    provider_session_id: &str,
+    cwd: &str,
+) -> Result<Option<String>, String> {
+    let messages = if agent_id == "claude" {
+        let (path, _, _) = find_claude_session(provider_session_id, cwd)?;
+        parse_claude_session(&path, usize::MAX)?.1
+    } else if agent_id == "opencode" {
+        let (session_id, title, session_cwd, _) =
+            find_opencode_session(provider_session_id, cwd)?;
+        parse_opencode_session(&session_id, &title, &session_cwd, usize::MAX)?.1
+    } else {
+        let (path, _, _) = find_codex_rollout(provider_session_id, cwd)?;
+        parse_codex_rollout(&path, usize::MAX)?.1
+    };
+    Ok(messages
+        .into_iter()
+        .find(|message| {
+            message.role.eq_ignore_ascii_case("user") && !message.text.trim().is_empty()
+        })
+        .map(|message| message.text))
+}
+
 fn agent_thread_transcript_signature(result: &CodexThreadTranscriptResult) -> String {
     let tail = result.messages.last();
     format!(

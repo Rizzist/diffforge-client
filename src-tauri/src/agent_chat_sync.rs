@@ -97,6 +97,96 @@ static AGENT_CHAT_SESSION_SYNC_BUILD_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaph
     OnceLock::new();
 static AGENT_CHAT_SESSION_SYNC_TURN_SUMMARY_CACHE: OnceLock<StdMutex<AgentChatTurnSummaryCache>> =
     OnceLock::new();
+static AGENT_CHAT_SESSION_USER_MESSAGE_EVIDENCE: OnceLock<StdMutex<HashSet<String>>> =
+    OnceLock::new();
+
+fn agent_chat_session_sync_nonempty_message_text(message: &Value) -> bool {
+    ["text", "content", "message", "body"]
+        .iter()
+        .filter_map(|key| message.get(*key))
+        .any(|value| match value {
+            Value::String(text) => !text.trim().is_empty(),
+            Value::Array(items) => items.iter().any(|item| match item {
+                Value::String(text) => !text.trim().is_empty(),
+                Value::Object(_) => agent_chat_session_sync_nonempty_message_text(item),
+                _ => false,
+            }),
+            Value::Object(_) => agent_chat_session_sync_nonempty_message_text(value),
+            _ => false,
+        })
+}
+
+fn agent_chat_session_sync_has_user_message(messages: &[Value]) -> bool {
+    messages.iter().any(|message| {
+        message
+            .get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|role| role.trim().eq_ignore_ascii_case("user"))
+            && agent_chat_session_sync_nonempty_message_text(message)
+    })
+}
+
+fn agent_chat_session_user_message_evidence_key(agent_id: &str, session_id: &str) -> String {
+    format!(
+        "{}\n{}",
+        agent_id.trim().to_ascii_lowercase(),
+        session_id.trim()
+    )
+}
+
+fn agent_chat_session_sync_source_has_user_message(source: &AgentChatSessionSyncSource) -> bool {
+    let key = agent_chat_session_user_message_evidence_key(&source.provider, &source.session_id);
+    let observed = agent_chat_session_sync_has_user_message(&source.thread_detail_messages)
+        || AGENT_CHAT_SESSION_USER_MESSAGE_EVIDENCE
+            .get_or_init(|| StdMutex::new(HashSet::new()))
+            .lock()
+            .map(|evidence| evidence.contains(&key))
+            .unwrap_or(false)
+        || agent_thread_local_first_user_message(&source.provider, &source.session_id, &source.cwd)
+            .ok()
+            .flatten()
+            .is_some_and(|message| !message.trim().is_empty());
+    if observed {
+        if let Ok(mut evidence) = AGENT_CHAT_SESSION_USER_MESSAGE_EVIDENCE
+            .get_or_init(|| StdMutex::new(HashSet::new()))
+            .lock()
+        {
+            evidence.insert(key);
+        }
+    }
+    observed
+}
+
+fn agent_chat_session_sync_result_has_user_message(
+    agent_id: &str,
+    result: &CodexThreadTranscriptResult,
+) -> bool {
+    if result.session_id.trim().is_empty() {
+        return false;
+    }
+    let key = agent_chat_session_user_message_evidence_key(agent_id, &result.session_id);
+    let observed = result.messages.iter().any(|message| {
+        message.role.trim().eq_ignore_ascii_case("user") && !message.text.trim().is_empty()
+    }) || agent_thread_transcript_result_is_cloud_backed(result)
+        || AGENT_CHAT_SESSION_USER_MESSAGE_EVIDENCE
+            .get_or_init(|| StdMutex::new(HashSet::new()))
+            .lock()
+            .map(|evidence| evidence.contains(&key))
+            .unwrap_or(false)
+        || agent_thread_local_first_user_message(agent_id, &result.session_id, &result.cwd)
+            .ok()
+            .flatten()
+            .is_some_and(|message| !message.trim().is_empty());
+    if observed {
+        if let Ok(mut evidence) = AGENT_CHAT_SESSION_USER_MESSAGE_EVIDENCE
+            .get_or_init(|| StdMutex::new(HashSet::new()))
+            .lock()
+        {
+            evidence.insert(key);
+        }
+    }
+    observed
+}
 
 #[derive(Clone, Copy, Default)]
 struct AgentChatSessionHistoryBackfillWorkspace {
@@ -3676,6 +3766,14 @@ fn agent_chat_session_sync_payloads(
         &source.session_id,
         &mut source.thread_detail_messages,
     );
+    // A provider-created id or metadata file is not, by itself, a resumable
+    // conversation. Fresh-session restart mints may only become durable/cloud
+    // inventory after a real transcript contains a non-empty user message.
+    if source.session_id.trim().is_empty()
+        || !agent_chat_session_sync_source_has_user_message(&source)
+    {
+        return Ok(Vec::new());
+    }
     let mut model_config = source.model_config.clone();
     if !context.model_id.trim().is_empty() {
         let model_id = if source.model_id.trim().is_empty() {
@@ -3991,6 +4089,9 @@ fn agent_chat_session_sync_spawn_from_result(
     let Some(provider) = agent_chat_session_sync_provider(agent_id) else {
         return;
     };
+    if !agent_chat_session_sync_result_has_user_message(provider, result) {
+        return;
+    }
     if context.workspace_id.trim().is_empty() {
         log_terminal_status_event(
             "backend.agent_chat_session_sync.history_missing_workspace",
@@ -4647,6 +4748,7 @@ mod agent_chat_session_sync_tests {
             cwd: String::new(),
             status: "idle".to_string(),
             title: "Test session".to_string(),
+            has_user_message: true,
             first_user_message: String::new(),
             chat_sync,
             resumable: true,
@@ -5261,6 +5363,15 @@ mod agent_chat_session_sync_tests {
                 "payload": {
                     "cwd": workspace_root_text.as_str(),
                     "model": real_model
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-07-02T00:00:01.500Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Generate the requested clip"}]
                 }
             }),
             json!({
