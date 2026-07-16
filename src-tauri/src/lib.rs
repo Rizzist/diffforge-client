@@ -9989,6 +9989,19 @@ fn run_app(daemon: bool) {
                         );
                     }
                 }
+                let daemon_workspace_catalog = if daemon {
+                    match cloud_mcp_prepare_daemon_startup_workspace_catalog(&cloud_mcp_app).await {
+                        Ok(workspaces) => Some(workspaces),
+                        Err(error) => {
+                            eprintln!(
+                                "diffforge daemon: unable to prepare authoritative workspace catalog: {error}"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 // Free accounts have no personal cloud instance, so skip the
                 // account websocket entirely (permanent-offline mode). Daemon
                 // mode always connects — it is a headless, cloud-first setup.
@@ -10000,6 +10013,20 @@ fn run_app(daemon: bool) {
                 } else {
                     false
                 };
+                if cloud_connected {
+                    if let Some(workspaces) = daemon_workspace_catalog {
+                        if let Err(error) = cloud_mcp_publish_daemon_startup_workspace_catalog(
+                            &cloud_mcp_state,
+                            workspaces,
+                        )
+                        .await
+                        {
+                            eprintln!(
+                                "diffforge daemon: unable to publish startup workspace catalog: {error}"
+                            );
+                        }
+                    }
+                }
                 if cloud_connected
                     && env::var_os("DIFFFORGE_PREWARM_CLOUD_VOICE_ON_STARTUP").is_some()
                 {

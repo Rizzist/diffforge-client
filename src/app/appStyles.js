@@ -2579,7 +2579,7 @@ export const WorkspaceStartupDetails = styled.div`
 `;
 
 export const DashboardShell = styled.main`
-  --workspace-rail-width: 192px;
+  --workspace-rail-width: 160px;
   --workspace-rail-collapsed-width: 56px;
   --workspace-rail-target-width: var(--workspace-rail-width);
 
@@ -2618,7 +2618,7 @@ export const DashboardShell = styled.main`
   }
 
   @media (max-width: 980px) {
-    --workspace-rail-width: 184px;
+    --workspace-rail-width: 152px;
 
     grid-template-columns: var(--workspace-rail-current-width, var(--workspace-rail-target-width)) minmax(0, 1fr);
   }
@@ -2639,8 +2639,8 @@ export const WorkspaceRail = styled.aside`
   display: grid;
   min-height: 0;
   grid-template-rows: minmax(0, 1fr) minmax(0, max-content);
-  gap: 10px;
-  padding: 10px;
+  gap: 8px;
+  padding: 8px;
   border-right: 1px solid rgba(var(--forge-tint-soft-rgb), 0.14);
   background:
     linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.035), rgba(var(--forge-tint-soft-rgb), 0.01)),
@@ -2671,14 +2671,14 @@ export const WorkspaceRail = styled.aside`
   /* Collapsing only narrows the rail: vertical metrics (gap, top/bottom
      padding) stay identical so icons never shift vertically between states. */
   &[data-collapsed="true"] {
-    padding: 10px 6px;
+    padding: 8px 6px;
   }
 
   @media (max-width: 760px) {
     min-height: auto;
     grid-template-rows: auto auto;
-    gap: 10px;
-    padding: 10px;
+    gap: 8px;
+    padding: 8px;
     border-right: 0;
     border-bottom: 1px solid var(--forge-border);
   }
@@ -2691,7 +2691,7 @@ export const RailTop = styled.div`
      column and push the (centered) header controls outside the collapsed rail. */
   grid-template-columns: minmax(0, 1fr);
   align-content: start;
-  gap: 9px;
+  gap: 7px;
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
@@ -2706,11 +2706,11 @@ export const RailTop = styled.div`
 
 export const RailHeader = styled.div`
   display: grid;
-  height: 24px;
+  height: 22px;
   min-width: 0;
-  grid-template-columns: minmax(0, 1fr) 24px 24px;
+  grid-template-columns: minmax(0, 1fr) 22px 22px;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   opacity: 1;
   animation: ${railContentReveal} 220ms cubic-bezier(0.2, 0.8, 0.2, 1) 80ms both;
   transition:
@@ -2718,16 +2718,16 @@ export const RailHeader = styled.div`
     grid-template-columns 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
 
   ${WorkspaceRail}[data-collapsed="true"] & {
-    grid-template-columns: 0 0 24px;
+    grid-template-columns: 0 0 22px;
     gap: 0;
     justify-content: center;
     justify-items: center;
   }
 
   @media (max-width: 760px) {
-    height: 24px;
-    grid-template-columns: minmax(0, 1fr) 24px 24px;
-    gap: 6px;
+    height: 22px;
+    grid-template-columns: minmax(0, 1fr) 22px 22px;
+    gap: 5px;
     justify-content: stretch;
     justify-items: stretch;
   }
@@ -2741,9 +2741,9 @@ export const RailSectionTitle = styled.button`
   color: var(--forge-text-disabled);
   background: transparent;
   cursor: pointer;
-  font-size: 10px;
-  font-weight: 760;
-  letter-spacing: 0.06em;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
   overflow: hidden;
   text-align: left;
@@ -2779,14 +2779,14 @@ export const RailSectionTitle = styled.button`
 
 export const RailCollapseButton = styled.button`
   display: inline-flex;
-  width: 24px;
-  height: 24px;
+  width: 22px;
+  height: 22px;
   align-items: center;
   justify-content: center;
   justify-self: end;
   padding: 0;
   border: 1px solid rgba(230, 236, 245, 0.08);
-  border-radius: 7px;
+  border-radius: 6px;
   color: var(--forge-text-muted);
   background:
     linear-gradient(180deg, rgba(230, 236, 245, 0.035), rgba(230, 236, 245, 0.012)),
@@ -2803,8 +2803,8 @@ export const RailCollapseButton = styled.button`
   svg {
     display: block;
     flex: 0 0 auto;
-    width: 14px;
-    height: 14px;
+    width: 13px;
+    height: 13px;
     margin: 0;
     transition: transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
   }
@@ -2870,14 +2870,14 @@ export const WorkspaceList = styled.div`
   display: grid;
   min-width: 0;
   max-width: none;
-  gap: 6px;
+  gap: 2px;
   /* RailTop owns scrolling; this stays a simple stack of workspace rows. */
   overflow: visible;
   padding-right: 2px;
   /* Fixed expanded width: while the rail animates, rows are CLIPPED by the
      rail instead of reflowing/wrapping every frame; visibility (not
      display:none) keeps the row reveal animations from restarting on expand. */
-  width: calc(var(--workspace-rail-width) - 20px);
+  width: calc(var(--workspace-rail-width) - 16px);
   opacity: 1;
   transition: opacity 150ms ease, visibility 0s;
 
@@ -2917,7 +2917,7 @@ export const WorkspaceRow = styled.div`
   &::after {
     position: absolute;
     inset: -2px;
-    border-radius: 10px;
+    border-radius: 8px;
     content: "";
     opacity: 0;
     pointer-events: none;
@@ -2933,7 +2933,7 @@ export const WorkspaceRow = styled.div`
 
   &::after {
     inset: 1px;
-    border-radius: 8px;
+    border-radius: 6px;
     background: linear-gradient(
       90deg,
       transparent 0%,
@@ -2972,13 +2972,13 @@ export const WorkspaceButton = styled.button`
   width: 100%;
   min-width: 0;
   max-width: 100%;
-  min-height: 38px;
-  grid-template-columns: 18px minmax(0, 1fr);
+  min-height: 30px;
+  grid-template-columns: 14px minmax(0, 1fr);
   align-items: stretch;
-  gap: 7px;
-  padding: 4px 8px 4px 7px;
+  gap: 6px;
+  padding: 3px 7px 3px 6px;
   border: 1px solid var(--workspace-card-border);
-  border-radius: 8px;
+  border-radius: 6px;
   box-sizing: border-box;
   color: var(--workspace-card-text);
   background: var(--workspace-card-bg);
@@ -2995,19 +2995,26 @@ export const WorkspaceButton = styled.button`
 
   strong {
     display: block;
-    max-height: 16px;
+    max-height: 15px;
     max-width: 100%;
     min-width: 0;
     overflow: hidden;
-    font-size: 12px;
-    font-weight: 720;
-    line-height: 1.1;
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 1.2;
+    letter-spacing: 0.01em;
     text-overflow: ellipsis;
     white-space: nowrap;
     transition:
       max-height 170ms cubic-bezier(0.2, 0.8, 0.2, 1),
       opacity 140ms ease,
       transform 170ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+
+  /* IDE-style selection: the selected entry's name goes bold (the status dot
+     stays runtime-driven; see WorkspaceAccent). */
+  &[data-selected="true"] strong {
+    font-weight: 700;
   }
 
   &[data-runtime="closed"] {
@@ -3078,7 +3085,7 @@ export const WorkspaceButton = styled.button`
   ${WorkspaceRow}:has(:focus-visible) & {
     border-color: var(--workspace-card-hover-border);
     background: var(--workspace-card-hover-bg);
-    padding-right: 34px;
+    padding-right: 30px;
   }
 
   &[data-selected="true"] {
@@ -3105,19 +3112,19 @@ export const WorkspaceButton = styled.button`
   }
 
   @media (max-width: 760px) {
-    grid-template-columns: 18px minmax(0, 1fr);
-    gap: 7px;
+    grid-template-columns: 14px minmax(0, 1fr);
+    gap: 6px;
     justify-items: stretch;
-    padding: 4px 8px 4px 7px;
+    padding: 3px 7px 3px 6px;
     text-align: left;
 
     ${WorkspaceRow}:hover &,
     ${WorkspaceRow}:has(:focus-visible) & {
-      padding-right: 34px;
+      padding-right: 30px;
     }
 
     strong {
-      max-height: 16px;
+      max-height: 15px;
       opacity: 1;
       transform: none;
     }
@@ -3129,23 +3136,26 @@ export const WorkspaceLabel = styled.div`
   position: relative;
   min-width: 0;
   max-width: 100%;
-  min-height: 28px;
+  min-height: 24px;
   overflow: hidden;
   align-content: center;
-  gap: 2px;
+  gap: 1px;
   transition:
     gap 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
     place-items 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
 
+  /* Muted branch/directory subtext line — smaller and lighter than the name,
+     like a repo list in an IDE. */
   > span:not([data-compact-glyph="true"]) {
     display: block;
-    max-height: 12px;
+    max-height: 11px;
     min-width: 0;
     overflow: hidden;
     color: var(--workspace-card-muted);
-    font-size: 10px;
-    font-weight: 650;
-    line-height: 1.15;
+    font-size: 9px;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    line-height: 1.2;
     text-overflow: ellipsis;
     white-space: nowrap;
     transition:
@@ -3167,10 +3177,10 @@ export const WorkspaceLabel = styled.div`
 
   @media (max-width: 760px) {
     place-items: initial;
-    gap: 2px;
+    gap: 1px;
 
     > span:not([data-compact-glyph="true"]) {
-      max-height: 12px;
+      max-height: 11px;
       opacity: 1;
       transform: none;
     }
@@ -3248,20 +3258,20 @@ export const WorkspaceCompactGlyph = styled.span.attrs({ "data-compact-glyph": "
 
 export const WorkspaceNotificationBadge = styled.span`
   position: absolute;
-  top: 5px;
-  right: 5px;
+  top: 4px;
+  right: 4px;
   display: inline-grid;
-  min-width: 16px;
-  height: 16px;
+  min-width: 14px;
+  height: 14px;
   place-items: center;
-  padding: 0 5px;
+  padding: 0 4px;
   border: 1px solid rgba(247, 181, 83, 0.38);
   border-radius: 999px;
   box-sizing: border-box;
   color: #fff8ea;
   background: #b85d19;
   box-shadow: 0 0 0 1px rgba(3, 5, 8, 0.74), 0 6px 14px rgba(184, 93, 25, 0.24);
-  font-size: 9px;
+  font-size: 8px;
   font-weight: 820;
   line-height: 1;
   pointer-events: none;
@@ -3278,7 +3288,7 @@ export const WorkspaceNotificationBadge = styled.span`
 
   ${WorkspaceRow}:hover &,
   ${WorkspaceRow}:has(:focus-visible) & {
-    right: 36px;
+    right: 32px;
   }
 
   &[data-variant="unread"] {
@@ -3311,16 +3321,16 @@ export const WorkspaceNotificationBadge = styled.span`
   }
 
   @media (max-width: 760px) {
-    top: 5px;
-    right: 5px;
-    min-width: 16px;
-    height: 16px;
-    padding: 0 5px;
-    font-size: 9px;
+    top: 4px;
+    right: 4px;
+    min-width: 14px;
+    height: 14px;
+    padding: 0 4px;
+    font-size: 8px;
 
     ${WorkspaceRow}:hover &,
     ${WorkspaceRow}:has(:focus-visible) & {
-      right: 36px;
+      right: 32px;
     }
   }
 `;
@@ -3330,12 +3340,12 @@ export const WorkspaceSettingsButton = styled.button`
   top: 50%;
   right: 4px;
   display: grid;
-  width: 28px;
-  height: 28px;
+  width: 24px;
+  height: 24px;
   place-items: center;
   padding: 0;
   border: 1px solid var(--forge-border);
-  border-radius: 8px;
+  border-radius: 6px;
   color: var(--forge-text-muted);
   background: #050607;
   opacity: 0;
@@ -3351,8 +3361,8 @@ export const WorkspaceSettingsButton = styled.button`
 
   svg {
     display: block;
-    width: 16px;
-    height: 16px;
+    width: 14px;
+    height: 14px;
     margin: auto;
   }
 
@@ -3400,7 +3410,7 @@ export const WorkspaceSettingsButton = styled.button`
 export const WorkspaceLifecycleButton = styled(WorkspaceSettingsButton)`
   right: auto;
   left: 2px;
-  border-radius: 7px;
+  border-radius: 6px;
   color: #d7e7ff;
   background:
     linear-gradient(180deg, rgba(17, 24, 39, 0.96), rgba(5, 6, 7, 0.98)),
@@ -3461,14 +3471,14 @@ export const WorkspaceLifecycleButton = styled(WorkspaceSettingsButton)`
 export const WorkspaceAccent = styled.span`
   align-self: center;
   justify-self: center;
-  width: 12px;
-  height: 12px;
-  /* Matches the landing page LiveAppDemo WorkspaceAccent: subtle grey square
-     at rest, solid blue with a light ring + glow when the workspace is live. */
+  width: 9px;
+  height: 9px;
+  /* IDE repo-list status dot: hollow ring (idle/closed), filled accent dot
+     (activating/activated), small solid neutral dot (selected-but-idle). */
   border: 1px solid rgba(144, 155, 170, 0.4);
-  border-radius: 3px;
+  border-radius: 50%;
   box-sizing: border-box;
-  background: rgba(144, 155, 170, 0.14);
+  background: transparent;
   box-shadow: none;
   transition:
     background 180ms ease,
@@ -3476,29 +3486,36 @@ export const WorkspaceAccent = styled.span`
     box-shadow 180ms ease,
     transform 180ms ease;
 
+  /* Selection alone must NOT light the status dot with a runtime accent —
+     only runtime state (activating/activated below) does. Selected-but-idle
+     entries get a small solid dot in the row's own text color instead, paired
+     with the bolded name on the button. */
+  ${WorkspaceButton}[data-selected="true"] & {
+    border-color: transparent;
+    background: var(--workspace-card-text);
+    transform: scale(0.62);
+  }
+
   ${WorkspaceButton}[data-runtime="activating"] & {
     border-color: rgba(216, 179, 106, 0.6);
     background: var(--workspace-card-status);
-    box-shadow: 0 0 8px rgba(216, 179, 106, 0.4);
-    transform: scale(1.08);
+    box-shadow: 0 0 6px rgba(216, 179, 106, 0.4);
+    transform: scale(1);
   }
 
   ${WorkspaceButton}[data-runtime="activated"] & {
     border-color: rgba(125, 176, 255, 0.7);
     background: #3b82f6;
-    box-shadow: 0 0 8px rgba(59, 130, 246, 0.55);
-    transform: scale(1.08);
+    box-shadow: 0 0 6px rgba(59, 130, 246, 0.55);
+    transform: scale(1);
   }
 
   /* Loopspace rows carry the loop theme: dark gold, not workspace blue. */
   ${WorkspaceButton}[data-space="loop"][data-runtime="activated"] & {
     border-color: rgba(255, 209, 102, 0.68);
     background: #d8b36a;
-    box-shadow: 0 0 8px rgba(216, 179, 106, 0.5);
+    box-shadow: 0 0 6px rgba(216, 179, 106, 0.5);
   }
-
-  /* Selection alone must NOT light the status square — only runtime state
-     (activating/activated above) does; selection is carried by the row. */
 
   ${WorkspaceRail}[data-collapsed="true"] & {
     position: absolute;
@@ -3524,7 +3541,7 @@ export const WorkspaceAccent = styled.span`
 
   @media (max-width: 760px) {
     position: static;
-    height: 10px;
+    height: 9px;
     opacity: 1;
     transform: none;
   }
@@ -3543,13 +3560,13 @@ const railSkeletonPulse = keyframes`
 
 export const RailRowSkeleton = styled.div`
   display: grid;
-  grid-template-columns: 18px minmax(0, 1fr);
-  gap: 7px;
+  grid-template-columns: 14px minmax(0, 1fr);
+  gap: 6px;
   align-items: center;
-  min-height: 38px;
-  padding: 4px 8px 4px 7px;
+  min-height: 30px;
+  padding: 3px 7px 3px 6px;
   border: 1px dashed rgba(144, 155, 170, 0.22);
-  border-radius: 8px;
+  border-radius: 6px;
   box-sizing: border-box;
   animation: ${railSkeletonPulse} 1.3s ease-in-out infinite;
 
@@ -3559,16 +3576,16 @@ export const RailRowSkeleton = styled.div`
 
   > span {
     display: block;
-    height: 10px;
+    height: 9px;
     max-width: 74%;
     border-radius: 4px;
     background: rgba(230, 236, 245, 0.08);
   }
 
   > span:first-child {
-    width: 18px;
-    height: 18px;
-    border-radius: 6px;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
   }
 
   &:nth-child(2) > span:last-child {
@@ -3582,21 +3599,21 @@ export const RailRowSkeleton = styled.div`
 
 export const WorkspaceMuted = styled.p`
   margin: 0;
-  padding: 8px 9px;
+  padding: 6px 8px;
   color: var(--forge-text-muted);
-  font-size: 12px;
-  font-weight: 650;
+  font-size: 11px;
+  font-weight: 550;
 `;
 
 export const RailFooter = styled.div`
   display: grid;
-  gap: 4px;
+  gap: 3px;
   min-height: 0;
   max-height: 100%;
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding-top: 8px;
+  padding-top: 6px;
   padding-right: 2px;
   scrollbar-gutter: stable;
   background: transparent;
@@ -3620,10 +3637,10 @@ export const RailFooter = styled.div`
 
 export const RailViewActions = styled.div`
   display: grid;
-  gap: 2px;
-  padding: 5px;
+  gap: 1px;
+  padding: 4px;
   border: 1px solid var(--forge-border);
-  border-radius: 10px;
+  border-radius: 8px;
   background:
     linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.018), transparent),
     rgba(230, 236, 245, 0.015);
@@ -3633,7 +3650,7 @@ export const RailViewActions = styled.div`
     background 160ms ease;
 
   ${WorkspaceRail}[data-collapsed="true"] & {
-    padding: 5px 3px;
+    padding: 4px 3px;
     border-color: rgba(230, 236, 245, 0.075);
   }
 
@@ -3647,11 +3664,11 @@ export const RailViewActions = styled.div`
 
 export const RailGlobalActions = styled.div`
   display: grid;
-  gap: 2px;
-  margin-top: 7px;
-  padding: 5px;
+  gap: 1px;
+  margin-top: 6px;
+  padding: 4px;
   border: 1px solid var(--forge-border);
-  border-radius: 10px;
+  border-radius: 8px;
   background:
     linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.018), transparent),
     rgba(230, 236, 245, 0.015);
@@ -3661,7 +3678,7 @@ export const RailGlobalActions = styled.div`
     background 160ms ease;
 
   ${WorkspaceRail}[data-collapsed="true"] & {
-    padding: 5px 3px;
+    padding: 4px 3px;
     border-color: rgba(230, 236, 245, 0.075);
   }
 
@@ -3679,19 +3696,19 @@ export const RailActionButton = styled.button`
   width: 100%;
   min-width: 0;
   max-width: 100%;
-  min-height: 32px;
-  grid-template-columns: 30px minmax(0, 1fr);
+  min-height: 26px;
+  grid-template-columns: 24px minmax(0, 1fr);
   align-items: center;
   gap: 0;
-  padding: 0 9px 0 5px;
+  padding: 0 8px 0 4px;
   border: 1px solid transparent;
-  border-radius: 8px;
+  border-radius: 6px;
   box-sizing: border-box;
   color: var(--forge-text-soft);
   background: transparent;
   overflow: hidden;
-  font-size: 12px;
-  font-weight: 720;
+  font-size: 11px;
+  font-weight: 550;
   text-align: left;
   transition:
     border-color 160ms ease,
@@ -3703,11 +3720,11 @@ export const RailActionButton = styled.button`
 
   &::before {
     position: absolute;
-    top: 7px;
-    bottom: 7px;
+    top: 5px;
+    bottom: 5px;
     left: 2px;
-    width: 3px;
-    border-radius: 3px;
+    width: 2px;
+    border-radius: 2px;
     background: transparent;
     content: "";
     transition:
@@ -3718,8 +3735,8 @@ export const RailActionButton = styled.button`
   svg {
     display: block;
     flex: 0 0 auto;
-    width: 15px;
-    height: 15px;
+    width: 14px;
+    height: 14px;
     justify-self: center;
     margin: 0;
     color: var(--forge-text-muted);
@@ -3794,8 +3811,8 @@ export const RailActionButton = styled.button`
   }
 
   &[data-scope="global"] {
-    min-height: 34px;
-    padding-left: 5px;
+    min-height: 26px;
+    padding-left: 4px;
     border-color: transparent;
     color: #98a3b1;
     background: transparent;
@@ -3884,13 +3901,13 @@ export const RailActionButton = styled.button`
     color: var(--forge-red);
   }
 
-  /* Collapsed keeps the SAME grid (30px icon column + collapsed label column)
+  /* Collapsed keeps the SAME grid (24px icon column + collapsed label column)
      and the SAME min-height: the icon lands dead-center because the button is
-     36px wide with symmetric 3px padding (3 + 30 + 3), and its position is a
+     38px wide with symmetric 7px padding (7 + 24 + 7), and its position is a
      pure function of the animating rail width — no grid flip, no jump, no
      vertical shift. */
   ${WorkspaceRail}[data-collapsed="true"] & {
-    padding: 0 3px;
+    padding: 0 7px;
   }
 
   /* No selection underline while collapsed — the active border/background on
@@ -3906,15 +3923,15 @@ export const RailActionButton = styled.button`
   }
 
   @media (max-width: 760px) {
-    min-height: 32px;
-    grid-template-columns: 30px minmax(0, 1fr);
+    min-height: 26px;
+    grid-template-columns: 24px minmax(0, 1fr);
     justify-items: stretch;
     gap: 0;
-    padding: 0 9px 0 5px;
+    padding: 0 8px 0 4px;
 
     &::before {
-      top: 8px;
-      bottom: 8px;
+      top: 6px;
+      bottom: 6px;
       left: 3px;
       width: 2px;
       height: auto;
@@ -3928,8 +3945,8 @@ export const RailActionButton = styled.button`
     }
 
     &[data-scope="global"] {
-      min-height: 34px;
-      padding-left: 5px;
+      min-height: 26px;
+      padding-left: 4px;
     }
   }
 `;
