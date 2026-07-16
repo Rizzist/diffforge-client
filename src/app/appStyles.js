@@ -2696,6 +2696,13 @@ export const RailTop = styled.div`
   overflow-x: hidden;
   overflow-y: auto;
   padding-bottom: 4px;
+  /* Bleed the row list to the rail's edges (negating WorkspaceRail's 8px
+     horizontal padding) so row hover/selection highlights are full-width —
+     square and edge-to-edge — instead of rounded insets. Row CONTENT stays
+     inset via each row's own horizontal padding (bumped below). overflow-x
+     now clips at the rail edge. */
+  margin-left: -8px;
+  margin-right: -8px;
 
   /* Collapsed keeps the (invisible) workspace list in layout; without this the
      rail top could scroll the header/expand button out of view. */
@@ -2976,9 +2983,9 @@ export const WorkspaceButton = styled.button`
   grid-template-columns: 14px minmax(0, 1fr);
   align-items: stretch;
   gap: 6px;
-  padding: 3px 7px 3px 6px;
+  padding: 3px 15px 3px 14px;
   border: 1px solid var(--workspace-card-border);
-  border-radius: 6px;
+  border-radius: 0;
   box-sizing: border-box;
   color: var(--workspace-card-text);
   background: var(--workspace-card-bg);
@@ -3085,7 +3092,7 @@ export const WorkspaceButton = styled.button`
   ${WorkspaceRow}:has(:focus-visible) & {
     border-color: var(--workspace-card-hover-border);
     background: var(--workspace-card-hover-bg);
-    padding-right: 30px;
+    padding-right: 38px;
   }
 
   &[data-selected="true"] {
@@ -3115,12 +3122,12 @@ export const WorkspaceButton = styled.button`
     grid-template-columns: 14px minmax(0, 1fr);
     gap: 6px;
     justify-items: stretch;
-    padding: 3px 7px 3px 6px;
+    padding: 3px 15px 3px 14px;
     text-align: left;
 
     ${WorkspaceRow}:hover &,
     ${WorkspaceRow}:has(:focus-visible) & {
-      padding-right: 30px;
+      padding-right: 38px;
     }
 
     strong {
@@ -3564,9 +3571,9 @@ export const RailRowSkeleton = styled.div`
   gap: 6px;
   align-items: center;
   min-height: 30px;
-  padding: 3px 7px 3px 6px;
+  padding: 3px 15px 3px 14px;
   border: 1px dashed rgba(144, 155, 170, 0.22);
-  border-radius: 6px;
+  border-radius: 0;
   box-sizing: border-box;
   animation: ${railSkeletonPulse} 1.3s ease-in-out infinite;
 
