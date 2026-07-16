@@ -3090,17 +3090,15 @@ export const WorkspaceButton = styled.button`
 
   ${WorkspaceRow}:hover &,
   ${WorkspaceRow}:has(:focus-visible) & {
-    border-color: var(--workspace-card-hover-border);
     background: var(--workspace-card-hover-bg);
     padding-right: 38px;
   }
 
   &[data-selected="true"] {
-    border-color: var(--workspace-card-selected-border);
+    /* Full-width selection band — no outline/ring. A flush left accent bar marks
+       the selection (the name also goes bold). */
     background: var(--workspace-card-selected-bg);
-    box-shadow:
-      0 0 0 1px var(--workspace-card-selected-ring),
-      inset 0 0 0 1px rgba(var(--forge-accent-soft-rgb), 0.08);
+    box-shadow: inset 2px 0 0 var(--workspace-card-selected-border);
   }
 
   ${WorkspaceRail}[data-collapsed="true"] & {
