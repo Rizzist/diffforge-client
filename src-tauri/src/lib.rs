@@ -4691,11 +4691,6 @@ fn workspace_activation_remote_intent_clear_if_matching(
     app: &AppHandle,
     workspace_id: &str,
 ) -> Result<(), String> {
-    let remote_intents = app_local_state_read(app, "remote-intents");
-    let pending = workspace_activation_text(&remote_intents, &["pendingActivationWorkspaceId"]);
-    if pending.as_deref() != Some(workspace_id) {
-        return Ok(());
-    }
     let patch = json!({
         "pendingActivationWorkspaceId": null,
         "pendingActivationReason": null,
@@ -4703,7 +4698,13 @@ fn workspace_activation_remote_intent_clear_if_matching(
         "pendingActivationSelectWorkspace": null,
         "pendingActivationWorkspaceTab": null,
     });
-    app_local_state_merge(app, "remote-intents", &patch)?;
+    app_local_state_clear_if_matching_serialized(
+        || app_local_state_read(app, "remote-intents"),
+        |current| app_local_state_write_with_mode_unlocked(app, "remote-intents", current, None),
+        "pendingActivationWorkspaceId",
+        workspace_id,
+        &patch,
+    )?;
     Ok(())
 }
 
@@ -8369,34 +8370,108 @@ pub(crate) fn app_local_state_write_with_mode(
     value: &Value,
     #[allow(unused_variables)] mode: Option<u32>,
 ) -> Result<(), String> {
+    app_local_state_store_serialized(|| {
+        app_local_state_write_with_mode_unlocked(app, key, value, mode)
+    })
+}
+
+fn app_local_state_unique_temp_path(path: &Path) -> PathBuf {
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("app-state.json");
+    path.with_file_name(format!(
+        "{file_name}.{}.{}.tmp",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ))
+}
+
+fn app_local_state_write_with_mode_unlocked(
+    app: &AppHandle,
+    key: &str,
+    value: &Value,
+    #[allow(unused_variables)] mode: Option<u32>,
+) -> Result<(), String> {
     let path = app_local_state_path(app, key)?;
     let serialized = serde_json::to_vec_pretty(value)
         .map_err(|error| format!("Unable to serialize app state: {error}"))?;
-    let temp_path = path.with_extension("json.tmp");
-    fs::write(&temp_path, serialized)
-        .map_err(|error| format!("Unable to write app state: {error}"))?;
+    let temp_path = app_local_state_unique_temp_path(&path);
+    if let Err(error) = fs::write(&temp_path, serialized) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("Unable to write app state: {error}"));
+    }
     #[cfg(unix)]
     if let Some(mode) = mode {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temp_path, fs::Permissions::from_mode(mode))
-            .map_err(|error| format!("Unable to secure app state permissions: {error}"))?;
+        if let Err(error) = fs::set_permissions(&temp_path, fs::Permissions::from_mode(mode)) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(format!("Unable to secure app state permissions: {error}"));
+        }
     }
-    fs::rename(&temp_path, &path)
-        .map_err(|error| format!("Unable to finalize app state: {error}"))?;
+    if let Err(error) = fs::rename(&temp_path, &path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("Unable to finalize app state: {error}"));
+    }
     Ok(())
 }
 
-/// Merge top-level keys into an app-local state object (creates it if absent).
-pub(crate) fn app_local_state_merge(
-    app: &AppHandle,
-    key: &str,
-    patch: &Value,
-) -> Result<Value, String> {
-    let mut current = match app_local_state_read(app, key) {
+fn app_local_state_writer_lock() -> &'static StdMutex<()> {
+    static APP_LOCAL_STATE_WRITER_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    APP_LOCAL_STATE_WRITER_LOCK.get_or_init(|| StdMutex::new(()))
+}
+
+fn app_local_state_store_serialized<WriteCurrent>(write_current: WriteCurrent) -> Result<(), String>
+where
+    WriteCurrent: FnOnce() -> Result<(), String>,
+{
+    let _guard = app_local_state_writer_lock()
+        .lock()
+        .map_err(|_| "App local state writer lock is unavailable.".to_string())?;
+    write_current()
+}
+
+fn app_local_state_update_serialized<ReadCurrent, WriteCurrent, UpdateCurrent>(
+    read_current: ReadCurrent,
+    write_current: WriteCurrent,
+    update_current: UpdateCurrent,
+) -> Result<Value, String>
+where
+    ReadCurrent: FnOnce() -> Value,
+    WriteCurrent: FnOnce(&Value) -> Result<(), String>,
+    UpdateCurrent: FnOnce(&mut Value) -> bool,
+{
+    let _guard = app_local_state_writer_lock()
+        .lock()
+        .map_err(|_| "App local state writer lock is unavailable.".to_string())?;
+    let mut current = match read_current() {
         Value::Object(map) => Value::Object(map),
         _ => json!({}),
     };
-    if let (Some(target), Some(source)) = (current.as_object_mut(), patch.as_object()) {
+    if update_current(&mut current) {
+        write_current(&current)?;
+    }
+    Ok(current)
+}
+
+/// Merge top-level keys into an app-local state object (creates it if absent).
+fn app_local_state_merge_serialized<ReadCurrent, WriteCurrent>(
+    read_current: ReadCurrent,
+    write_current: WriteCurrent,
+    patch: &Value,
+) -> Result<Value, String>
+where
+    ReadCurrent: FnOnce() -> Value,
+    WriteCurrent: FnOnce(&Value) -> Result<(), String>,
+{
+    app_local_state_update_serialized(read_current, write_current, |current| {
+        let Some(target) = current.as_object_mut() else {
+            return false;
+        };
+        let Some(source) = patch.as_object() else {
+            return false;
+        };
         for (patch_key, patch_value) in source {
             if patch_value.is_null() {
                 target.remove(patch_key);
@@ -8404,9 +8479,56 @@ pub(crate) fn app_local_state_merge(
                 target.insert(patch_key.clone(), patch_value.clone());
             }
         }
-    }
-    app_local_state_write(app, key, &current)?;
-    Ok(current)
+        true
+    })
+}
+
+fn app_local_state_clear_if_matching_serialized<ReadCurrent, WriteCurrent>(
+    read_current: ReadCurrent,
+    write_current: WriteCurrent,
+    compare_key: &str,
+    expected_value: &str,
+    clear_patch: &Value,
+) -> Result<Value, String>
+where
+    ReadCurrent: FnOnce() -> Value,
+    WriteCurrent: FnOnce(&Value) -> Result<(), String>,
+{
+    app_local_state_update_serialized(read_current, write_current, |current| {
+        let observed = current
+            .get(compare_key)
+            .and_then(Value::as_str)
+            .map(str::trim);
+        if observed != Some(expected_value) {
+            return false;
+        }
+        let Some(target) = current.as_object_mut() else {
+            return false;
+        };
+        let Some(source) = clear_patch.as_object() else {
+            return false;
+        };
+        for (patch_key, patch_value) in source {
+            if patch_value.is_null() {
+                target.remove(patch_key);
+            } else {
+                target.insert(patch_key.clone(), patch_value.clone());
+            }
+        }
+        true
+    })
+}
+
+pub(crate) fn app_local_state_merge(
+    app: &AppHandle,
+    key: &str,
+    patch: &Value,
+) -> Result<Value, String> {
+    app_local_state_merge_serialized(
+        || app_local_state_read(app, key),
+        |current| app_local_state_write_with_mode_unlocked(app, key, current, None),
+        patch,
+    )
 }
 
 fn app_local_state_public_value(key: &str, value: Value) -> Value {
@@ -8467,6 +8589,222 @@ async fn app_local_state_merge_command(
     })
     .await
     .map_err(|error| format!("App state merge worker failed: {error}"))?
+}
+
+#[cfg(test)]
+mod app_local_state_tests {
+    use super::*;
+    use std::sync::{mpsc as std_mpsc, Barrier};
+
+    fn read_test_file(path: &Path) -> Value {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .unwrap_or_else(|| json!({}))
+    }
+
+    fn write_test_file(path: &Path, value: &Value) -> Result<(), String> {
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(value)
+                .map_err(|error| format!("Unable to serialize test app state: {error}"))?,
+        )
+        .map_err(|error| format!("Unable to write test app state: {error}"))
+    }
+
+    fn merge_test_file(path: &Path, patch: &Value) -> Result<Value, String> {
+        app_local_state_merge_serialized(
+            || read_test_file(path),
+            |current| write_test_file(path, current),
+            patch,
+        )
+    }
+
+    #[test]
+    fn concurrent_remote_intent_patches_preserve_both_fields() {
+        let root = env::temp_dir().join(format!(
+            "diffforge-remote-intents-merge-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("remote-intents.json");
+        fs::write(&path, b"{}\n").unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+
+        let workspace_path = path.clone();
+        let workspace_barrier = Arc::clone(&barrier);
+        let workspace_patch = thread::spawn(move || {
+            workspace_barrier.wait();
+            merge_test_file(
+                &workspace_path,
+                &json!({"pendingActivationWorkspaceId": "workspace-b"}),
+            )
+            .unwrap();
+        });
+        let loopspace_path = path.clone();
+        let loopspace_barrier = Arc::clone(&barrier);
+        let loopspace_patch = thread::spawn(move || {
+            loopspace_barrier.wait();
+            merge_test_file(
+                &loopspace_path,
+                &json!({"selectedLoopspaceId": "loopspace-b", "spaceMode": "loopspaces"}),
+            )
+            .unwrap();
+        });
+
+        barrier.wait();
+        workspace_patch.join().unwrap();
+        loopspace_patch.join().unwrap();
+
+        let merged: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(merged["pendingActivationWorkspaceId"], json!("workspace-b"));
+        assert_eq!(merged["selectedLoopspaceId"], json!("loopspace-b"));
+        assert_eq!(merged["spaceMode"], json!("loopspaces"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_store_then_merge_preserves_gui_and_cloud_workspace_settings() {
+        let root = env::temp_dir().join(format!(
+            "diffforge-workspace-settings-store-merge-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("workspace-settings.json");
+        write_test_file(&path, &json!({})).unwrap();
+        let (store_entered_tx, store_entered_rx) = std_mpsc::channel();
+        let (release_store_tx, release_store_rx) = std_mpsc::channel();
+
+        let store_path = path.clone();
+        let store = thread::spawn(move || {
+            app_local_state_store_serialized(|| {
+                store_entered_tx.send(()).unwrap();
+                release_store_rx.recv().unwrap();
+                write_test_file(
+                    &store_path,
+                    &json!({
+                        "workspace-gui": {
+                            "root_directory": "/tmp/gui-workspace",
+                            "terminal_count": 2,
+                        },
+                    }),
+                )
+            })
+            .unwrap();
+        });
+        store_entered_rx.recv().unwrap();
+
+        let (merge_started_tx, merge_started_rx) = std_mpsc::channel();
+        let merge_path = path.clone();
+        let merge = thread::spawn(move || {
+            merge_started_tx.send(()).unwrap();
+            merge_test_file(
+                &merge_path,
+                &json!({
+                    "workspace-cloud": {
+                        "root_directory": "/tmp/cloud-workspace",
+                        "terminal_count": 1,
+                    },
+                }),
+            )
+            .unwrap();
+        });
+        merge_started_rx.recv().unwrap();
+        release_store_tx.send(()).unwrap();
+        store.join().unwrap();
+        merge.join().unwrap();
+
+        let persisted = read_test_file(&path);
+        assert_eq!(
+            persisted["workspace-gui"]["root_directory"],
+            json!("/tmp/gui-workspace")
+        );
+        assert_eq!(
+            persisted["workspace-cloud"]["root_directory"],
+            json!("/tmp/cloud-workspace")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compare_and_clear_does_not_erase_a_newer_pending_intent() {
+        let root = env::temp_dir().join(format!(
+            "diffforge-remote-intents-compare-clear-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("remote-intents.json");
+        write_test_file(
+            &path,
+            &json!({
+                "pendingActivationWorkspaceId": "workspace-a",
+                "pendingActivationReason": "remote-a",
+            }),
+        )
+        .unwrap();
+        let (clear_observed_tx, clear_observed_rx) = std_mpsc::channel();
+        let (release_clear_tx, release_clear_rx) = std_mpsc::channel();
+
+        let clear_path = path.clone();
+        let clear = thread::spawn(move || {
+            app_local_state_clear_if_matching_serialized(
+                || {
+                    let observed = read_test_file(&clear_path);
+                    clear_observed_tx.send(()).unwrap();
+                    release_clear_rx.recv().unwrap();
+                    observed
+                },
+                |current| write_test_file(&clear_path, current),
+                "pendingActivationWorkspaceId",
+                "workspace-a",
+                &json!({
+                    "pendingActivationWorkspaceId": null,
+                    "pendingActivationReason": null,
+                }),
+            )
+            .unwrap();
+        });
+        clear_observed_rx.recv().unwrap();
+
+        let (record_started_tx, record_started_rx) = std_mpsc::channel();
+        let record_path = path.clone();
+        let record = thread::spawn(move || {
+            record_started_tx.send(()).unwrap();
+            merge_test_file(
+                &record_path,
+                &json!({
+                    "pendingActivationWorkspaceId": "workspace-b",
+                    "pendingActivationReason": "remote-b",
+                }),
+            )
+            .unwrap();
+        });
+        record_started_rx.recv().unwrap();
+        release_clear_tx.send(()).unwrap();
+        clear.join().unwrap();
+        record.join().unwrap();
+
+        let persisted = read_test_file(&path);
+        assert_eq!(
+            persisted["pendingActivationWorkspaceId"],
+            json!("workspace-b")
+        );
+        assert_eq!(persisted["pendingActivationReason"], json!("remote-b"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn app_local_state_temp_paths_are_unique_siblings() {
+        let target = env::temp_dir()
+            .join("diffforge-app-local-state-temp-paths")
+            .join("workspace-settings.json");
+        let paths = (0..128)
+            .map(|_| app_local_state_unique_temp_path(&target))
+            .collect::<HashSet<_>>();
+        assert_eq!(paths.len(), 128);
+        assert!(paths.iter().all(|path| path.parent() == target.parent()));
+        assert!(paths.iter().all(|path| path != &target));
+    }
 }
 
 const TRAY_CLICK_ACTION_SNIP_STRIP: u8 = 0;

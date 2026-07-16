@@ -60,6 +60,7 @@ const TERMINAL_REMOTE_PRESENCE_REAPER_GRACE_MS: u64 = 1_000;
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT: &str = "cloud-mcp-workspace-todos-updated";
 const CLOUD_MCP_LOOPSPACES_UPDATED_EVENT: &str = "cloud-mcp-loopspaces-updated";
 const CLOUD_MCP_LOOPSPACES_CONTRACT: &str = "diffforge.loopspaces.v1";
+const CLOUD_MCP_REMOTE_INTENTS_STATE_KEY: &str = "remote-intents";
 const CLOUD_MCP_LOOPSPACE_TRIGGERS_UPDATED_EVENT: &str = "cloud-mcp-loopspace-triggers-updated";
 const CLOUD_MCP_LOOPSPACE_TRIGGERS_CONTRACT: &str = "diffforge.loopspace_triggers.v1";
 const CLOUD_MCP_ACCOUNT_ASSETS_UPDATED_EVENT: &str = "cloud-mcp-account-assets-updated";
@@ -627,6 +628,7 @@ struct CloudMcpAuthRuntime {
 
 #[derive(Default)]
 struct CloudMcpProcessAuthCache {
+    account_key: String,
     desktop_session_token: Option<String>,
     appwrite_jwt: Option<String>,
     appwrite_jwt_expires_ms: Option<u64>,
@@ -11521,6 +11523,23 @@ fn cloud_mcp_process_account_scope_key() -> String {
     cloud_mcp_account_scope_key_from_parts(&scope_type, team_id.as_deref())
 }
 
+fn cloud_mcp_account_cache_scope_key(account_key: &str) -> Option<String> {
+    let account_key = account_key.trim();
+    if account_key.is_empty() {
+        return None;
+    }
+    Some(if account_key.starts_with("account:") {
+        account_key.to_string()
+    } else {
+        format!("account:{account_key}")
+    })
+}
+
+fn cloud_mcp_process_account_cache_scope_key() -> Option<String> {
+    let cache = cloud_mcp_process_auth_cache().lock().ok()?;
+    cloud_mcp_account_cache_scope_key(&cache.account_key)
+}
+
 fn cloud_mcp_process_account_scope_payload() -> Value {
     let (scope_type, team_id) = cloud_mcp_process_account_scope();
     cloud_mcp_account_scope_payload_from_parts(&scope_type, team_id.as_deref())
@@ -14333,10 +14352,16 @@ fn cloud_mcp_loopspaces_payload(value: &Value) -> Value {
 }
 
 fn cloud_mcp_loopspace_scope_key(value: Option<&Value>) -> String {
-    value
-        .and_then(|payload| {
-            cloud_mcp_payload_text(payload, &["scope_key"])
-                .or_else(|| cloud_mcp_payload_text(payload, &["billing_scope_key"]))
+    // Loopspace mirrors are shared across desktop accounts on disk. Prefer
+    // the authenticated account identity over a wire/default billing scope
+    // so an account switch can never keep reading or replacing another
+    // account's rows under the legacy `personal` bucket.
+    cloud_mcp_process_account_cache_scope_key()
+        .or_else(|| {
+            value.and_then(|payload| {
+                cloud_mcp_payload_text(payload, &["scope_key"])
+                    .or_else(|| cloud_mcp_payload_text(payload, &["billing_scope_key"]))
+            })
         })
         .unwrap_or_else(cloud_mcp_process_account_scope_key)
 }
@@ -17391,11 +17416,18 @@ async fn cloud_mcp_apply_account_sync_resume_remote_commands(
             applied += 1;
             continue;
         }
+        let remote_command_account_key = state.auth.lock().await.account_key.clone();
         let remote_lever_handled = cloud_mcp_apply_remote_workspace_lever_for_dispatcher(
             &app,
             state,
             &event,
             webview_dispatcher_active,
+        ) || cloud_mcp_apply_remote_loopspace_lever_for_dispatcher(
+            &app,
+            state,
+            &event,
+            webview_dispatcher_active,
+            &remote_command_account_key,
         ) || orchestrator_pool_apply_remote_send_lever(&app, state, &event)
             || cloud_mcp_apply_remote_terminal_interrupt_lever(&app, state, &event)
             || cloud_mcp_apply_remote_terminal_lever(&app, state, &event)
@@ -20354,11 +20386,19 @@ async fn cloud_mcp_start_remote_command_listener(
             if cloud_mcp_apply_daemon_remote_command_guard(&state_clone, &event).await {
                 continue;
             }
+            let remote_command_account_key =
+                state_clone.auth.lock().await.account_key.clone();
             let remote_lever_handled = cloud_mcp_apply_remote_workspace_lever_for_dispatcher(
                 &app,
                 &state_clone,
                 &event,
                 webview_dispatcher_active,
+            ) || cloud_mcp_apply_remote_loopspace_lever_for_dispatcher(
+                &app,
+                &state_clone,
+                &event,
+                webview_dispatcher_active,
+                &remote_command_account_key,
             ) || orchestrator_pool_apply_remote_send_lever(&app, &state_clone, &event)
                 || cloud_mcp_apply_remote_terminal_interrupt_lever(&app, &state_clone, &event)
                 || cloud_mcp_apply_remote_terminal_lever(&app, &state_clone, &event)
@@ -22177,7 +22217,7 @@ fn cloud_mcp_apply_remote_workspace_lever_for_dispatcher(
                         if fallback_allowed {
                             let _ = app_local_state_merge(
                                 &app,
-                                "remote-intents",
+                                CLOUD_MCP_REMOTE_INTENTS_STATE_KEY,
                                 &json!({
                                     "pendingActivationWorkspaceId": workspace_id,
                                     "pendingActivationReason": "remote_control_headless_fallback",
@@ -22275,6 +22315,197 @@ fn cloud_mcp_apply_remote_workspace_lever_for_dispatcher(
         }
         _ => false,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloudMcpRemoteLoopspaceAction {
+    View,
+    Select,
+}
+
+fn cloud_mcp_remote_loopspace_action(command_kind: &str) -> Option<CloudMcpRemoteLoopspaceAction> {
+    match command_kind {
+        "loopspace_view" | "loops_view" | "show_loopspaces" | "open_loopspaces" => {
+            Some(CloudMcpRemoteLoopspaceAction::View)
+        }
+        "loopspace_select" | "select_loopspace" | "open_loopspace" => {
+            Some(CloudMcpRemoteLoopspaceAction::Select)
+        }
+        _ => None,
+    }
+}
+
+fn cloud_mcp_remote_loopspace_command(command_kind: &str) -> bool {
+    cloud_mcp_remote_loopspace_action(command_kind).is_some()
+}
+
+fn cloud_mcp_remote_loopspace_lever_handles(
+    event: &Value,
+    webview_dispatcher_active: bool,
+) -> bool {
+    !webview_dispatcher_active
+        && cloud_mcp_remote_loopspace_command(&cloud_mcp_remote_command_kind(event))
+}
+
+fn cloud_mcp_remote_loopspace_state_patch(
+    loopspace_id: Option<&str>,
+    updated_at_ms: u64,
+) -> Value {
+    let mut patch = json!({
+        "spaceMode": "loopspaces",
+        "spaceSelectionReason": "remote_control_headless",
+        "spaceSelectionUpdatedAtMs": updated_at_ms,
+    });
+    if let Some(loopspace_id) = loopspace_id
+        .map(str::trim)
+        .filter(|loopspace_id| !loopspace_id.is_empty())
+    {
+        patch["selectedLoopspaceId"] = json!(loopspace_id);
+    }
+    patch
+}
+
+async fn cloud_mcp_expected_account_guard(
+    state: &CloudMcpState,
+    expected_account_key: &str,
+) -> Option<OwnedMutexGuard<CloudMcpAuthRuntime>> {
+    let auth = Arc::clone(&state.auth).lock_owned().await;
+    (auth.account_key == expected_account_key).then_some(auth)
+}
+
+/// Headless actuation for remote Loopspaces navigation. When AppShell has an
+/// active dispatcher it remains the sole owner of the visible UI transition.
+fn cloud_mcp_apply_remote_loopspace_lever_for_dispatcher(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    event: &Value,
+    webview_dispatcher_active: bool,
+    expected_account_key: &str,
+) -> bool {
+    if !cloud_mcp_remote_loopspace_lever_handles(event, webview_dispatcher_active) {
+        return false;
+    }
+
+    let action = cloud_mcp_remote_loopspace_action(&cloud_mcp_remote_command_kind(event))
+        .expect("handled loopspace commands have an action");
+    let app = app.clone();
+    let state = state.clone();
+    let event = event.clone();
+    let account_key = expected_account_key.to_string();
+    tauri::async_runtime::spawn(async move {
+        // This is the account-switch mutation guard used by
+        // cloud_mcp_apply_desktop_auth_session. Keep it from the one account
+        // capture through the durable write and completed-status enqueue.
+        let Some(account_guard) = cloud_mcp_expected_account_guard(&state, &account_key).await
+        else {
+            log_cloud_sync_event(
+                "remote_command.loopspace_account_changed",
+                json!({
+                    "command_id": cloud_mcp_remote_command_id(&event),
+                    "command_kind": cloud_mcp_remote_command_kind(&event),
+                }),
+            );
+            return;
+        };
+        let loopspace_id = cloud_mcp_remote_command_field_text(
+            &event,
+            &["loopspace_id", "loopspaceId"],
+        )
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+        if account_key.trim().is_empty() {
+            let details = json!({
+                "reason": "loopspace_account_unavailable",
+                "loopspace_id": loopspace_id,
+                "space_mode": "loopspaces",
+            });
+            let _ = cloud_mcp_send_remote_command_status_event(
+                &state,
+                &event,
+                "failed",
+                "The current desktop account could not record this loopspace intent.",
+                Some(&details),
+            )
+            .await;
+            drop(account_guard);
+            return;
+        }
+
+        if action == CloudMcpRemoteLoopspaceAction::Select {
+            if loopspace_id.is_empty() {
+                let details = json!({
+                    "reason": "missing_loopspace_id",
+                    "space_mode": "loopspaces",
+                });
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state,
+                    &event,
+                    "failed",
+                    "Loopspace select requires a loopspace_id.",
+                    Some(&details),
+                )
+                .await;
+                drop(account_guard);
+                return;
+            }
+        }
+
+        let selected_loopspace_id = (action == CloudMcpRemoteLoopspaceAction::Select)
+            .then_some(loopspace_id.as_str());
+        let patch = cloud_mcp_remote_loopspace_state_patch(
+            selected_loopspace_id,
+            cloud_mcp_now_ms(),
+        );
+        if let Err(error) = app_local_state_merge(
+            &app,
+            CLOUD_MCP_REMOTE_INTENTS_STATE_KEY,
+            &patch,
+        ) {
+            let details = json!({
+                "reason": "local_state_write_failed",
+                "error": clean_terminal_telemetry_text(&error),
+                "loopspace_id": selected_loopspace_id,
+                "space_mode": "loopspaces",
+            });
+            let _ = cloud_mcp_send_remote_command_status_event(
+                &state,
+                &event,
+                "failed",
+                "Loopspace selection could not be recorded in local app state.",
+                Some(&details),
+            )
+            .await;
+            drop(account_guard);
+            return;
+        }
+
+        let details = json!({
+            "headless": true,
+            "loopspace_id": selected_loopspace_id,
+            "space_mode": "loopspaces",
+            "ui_selected": false,
+        });
+        let message = match action {
+            CloudMcpRemoteLoopspaceAction::View => {
+                "Loopspaces view recorded headless on this device."
+            }
+            CloudMcpRemoteLoopspaceAction::Select => {
+                "Loopspace selected headless on this device."
+            }
+        };
+        let _ = cloud_mcp_send_remote_command_status_event(
+            &state,
+            &event,
+            "completed",
+            message,
+            Some(&details),
+        )
+        .await;
+        drop(account_guard);
+    });
+    true
 }
 
 fn cloud_mcp_remote_workspace_activation_error_allows_pending(error: &str) -> bool {
@@ -26006,6 +26237,9 @@ fn cloud_mcp_remote_command_is_rust_owned_for_dispatcher(
     webview_dispatcher_active: bool,
 ) -> bool {
     let command_kind = cloud_mcp_remote_command_kind(event);
+    if cloud_mcp_remote_loopspace_command(&command_kind) {
+        return !webview_dispatcher_active;
+    }
     if webview_dispatcher_active
         && (cloud_mcp_remote_command_is_agent_prompt_answer(&command_kind)
             || cloud_mcp_remote_workspace_management_command(&command_kind))
@@ -39759,6 +39993,9 @@ async fn cloud_mcp_apply_desktop_auth_session(
         Some(plan_name),
         device_limit,
     );
+    if let Ok(mut cache) = cloud_mcp_process_auth_cache().lock() {
+        cache.account_key = account_key.clone();
+    }
     let registration_was_blocked = state
         .global_ws_registration_blocked
         .swap(false, Ordering::SeqCst);
@@ -61546,6 +61783,141 @@ mod cloud_mcp_tests {
             &json!({"command_kind": "workspace_activate"}),
             false,
         ));
+    }
+
+    #[test]
+    fn remote_loopspace_lever_handles_headless_and_defers_to_webview() {
+        for command_kind in [
+            "loopspace_view",
+            "loops_view",
+            "show_loopspaces",
+            "open_loopspaces",
+            "loopspace_select",
+            "select_loopspace",
+            "open_loopspace",
+        ] {
+            let event = json!({"command_kind": command_kind});
+            assert!(cloud_mcp_daemon_gui_block_message(command_kind).is_none());
+            assert!(cloud_mcp_remote_loopspace_lever_handles(&event, false));
+            assert!(!cloud_mcp_remote_loopspace_lever_handles(&event, true));
+            assert!(cloud_mcp_remote_command_is_rust_owned_for_dispatcher(
+                &event, false,
+            ));
+            assert!(!cloud_mcp_remote_command_is_rust_owned_for_dispatcher(
+                &event, true,
+            ));
+        }
+        assert!(!cloud_mcp_remote_loopspace_lever_handles(
+            &json!({"command_kind": "workspace_activate"}),
+            false,
+        ));
+    }
+
+    #[test]
+    fn remote_loopspace_state_patch_records_mode_and_optional_selection() {
+        let view_patch = cloud_mcp_remote_loopspace_state_patch(None, 41);
+        assert_eq!(view_patch["spaceMode"], json!("loopspaces"));
+        assert_eq!(view_patch["spaceSelectionUpdatedAtMs"], json!(41));
+        assert!(view_patch.get("selectedLoopspaceId").is_none());
+
+        let select_patch = cloud_mcp_remote_loopspace_state_patch(
+            Some(" stale-or-unknown-loopspace-intent "),
+            42,
+        );
+        assert_eq!(select_patch["spaceMode"], json!("loopspaces"));
+        assert_eq!(
+            select_patch["selectedLoopspaceId"],
+            json!("stale-or-unknown-loopspace-intent")
+        );
+        assert_eq!(select_patch["spaceSelectionUpdatedAtMs"], json!(42));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_loopspace_account_guard_orders_write_and_completion_before_switch() {
+        let state = CloudMcpState::new();
+        state.auth.lock().await.account_key = "account-a".to_string();
+        let expected_account_key = state.auth.lock().await.account_key.clone();
+        let persisted = Arc::new(StdMutex::new(HashMap::<String, Value>::new()));
+        let events = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let (write_entered_tx, write_entered_rx) = oneshot::channel();
+        let (release_write_tx, release_write_rx) = oneshot::channel();
+
+        let writer_state = state.clone();
+        let writer_persisted = Arc::clone(&persisted);
+        let writer_events = Arc::clone(&events);
+        let writer = tokio::spawn(async move {
+            let account_key = expected_account_key;
+            let account_guard = cloud_mcp_expected_account_guard(&writer_state, &account_key)
+                .await
+                .expect("account A should remain current until its guarded write completes");
+            write_entered_tx.send(()).unwrap();
+            release_write_rx.await.unwrap();
+            writer_persisted.lock().unwrap().insert(
+                account_key.clone(),
+                json!({
+                    "spaceMode": "loopspaces",
+                    "selectedLoopspaceId": "loopspace-a-only",
+                }),
+            );
+            writer_events
+                .lock()
+                .unwrap()
+                .push(format!("write:{account_key}"));
+            writer_events
+                .lock()
+                .unwrap()
+                .push(format!("completed:{account_key}"));
+            drop(account_guard);
+        });
+        write_entered_rx.await.unwrap();
+
+        let switch_state = state.clone();
+        let switch_events = Arc::clone(&events);
+        let (switch_attempted_tx, switch_attempted_rx) = oneshot::channel();
+        let switch = tokio::spawn(async move {
+            switch_attempted_tx.send(()).unwrap();
+            let mut auth = switch_state.auth.lock().await;
+            auth.account_key = "account-b".to_string();
+            switch_events
+                .lock()
+                .unwrap()
+                .push("switch:account-b".to_string());
+        });
+        switch_attempted_rx.await.unwrap();
+        release_write_tx.send(()).unwrap();
+        writer.await.unwrap();
+        switch.await.unwrap();
+
+        let persisted = persisted.lock().unwrap();
+        assert_eq!(
+            persisted["account-a"]["selectedLoopspaceId"],
+            json!("loopspace-a-only")
+        );
+        assert!(!persisted.contains_key("account-b"));
+        drop(persisted);
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["write:account-a", "completed:account-a", "switch:account-b"]
+        );
+        assert!(
+            cloud_mcp_expected_account_guard(&state, "account-a")
+                .await
+                .is_none(),
+            "a command captured for account A must abort if account B wins before the guard"
+        );
+    }
+
+    #[test]
+    fn loopspace_account_cache_scope_key_is_account_specific() {
+        assert_eq!(
+            cloud_mcp_account_cache_scope_key("account-a").as_deref(),
+            Some("account:account-a")
+        );
+        assert_eq!(
+            cloud_mcp_account_cache_scope_key(" account:account-b ").as_deref(),
+            Some("account:account-b")
+        );
+        assert_eq!(cloud_mcp_account_cache_scope_key(""), None);
     }
 
     #[test]

@@ -30514,7 +30514,7 @@ export default function App() {
   const selectLoopspaceFromRail = useCallback((loopspaceId) => {
     const loopspace = findLoopspaceById(loopspaces, loopspaceId);
     if (!loopspace) {
-      return;
+      return false;
     }
     cancelDeferredWorkspaceActivation();
     selectedWorkspaceIdRef.current = "";
@@ -30535,6 +30535,7 @@ export default function App() {
       immediate: true,
       telemetrySource: "loopspace_rail_select",
     });
+    return true;
   }, [cancelDeferredWorkspaceActivation, loopspaces, showView]);
 
   const deactivateWorkspace = useCallback(async (workspaceId, source = "manual") => {
@@ -41042,7 +41043,20 @@ export default function App() {
       REMOTE_NAVIGATION_COMMANDS.has(normalizeRemoteCommandName(commandKind))
     );
     const remoteCommandIsDeviceOnlyNavigationAction = (commandKind) => (
-      ["app_view_select", "select_app_view", "switch_app_view", "app_navigate", "app_open_view"]
+      [
+        "app_view_select",
+        "select_app_view",
+        "switch_app_view",
+        "app_navigate",
+        "app_open_view",
+        "loopspace_view",
+        "loops_view",
+        "show_loopspaces",
+        "open_loopspaces",
+        "loopspace_select",
+        "select_loopspace",
+        "open_loopspace",
+      ]
         .includes(normalizeRemoteCommandName(commandKind))
     );
     const remoteCommandWorkspaceTab = (event) => remoteCommandStringField(event, [
@@ -42569,6 +42583,65 @@ export default function App() {
           appView: nextView,
           command_id: commandId,
           command_kind: commandKind,
+        });
+        return;
+      }
+      if ([
+        "loopspace_view",
+        "loops_view",
+        "show_loopspaces",
+        "open_loopspaces",
+      ].includes(normalizedKind)) {
+        const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+        const rawShowWindow = event?.show_window ?? payload.show_window;
+        const shouldShowWindow = typeof rawShowWindow === "undefined"
+          ? true
+          : remoteCommandBooleanField(event, ["show_window"]);
+        if (shouldShowWindow) {
+          void invoke("app_exit_background").catch(() => {});
+        }
+        enterLoopspacesMode("remote_control_navigation");
+        await recordRemoteCommandStatus(event, "completed", "Opened Loopspaces on this desktop.", {
+          command_id: commandId,
+          command_kind: commandKind,
+        });
+        return;
+      }
+      if ([
+        "loopspace_select",
+        "select_loopspace",
+        "open_loopspace",
+      ].includes(normalizedKind)) {
+        const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+        const loopspaceId = remoteCommandStringField(event, ["loopspace_id", "loopspaceId"])
+          || String(payload.loopspace_id || payload.loopspaceId || "").trim();
+        if (!loopspaceId) {
+          await recordRemoteCommandStatus(event, "failed", "Loopspace select requires a loopspace_id.", {
+            command_id: commandId,
+            command_kind: commandKind,
+          });
+          return;
+        }
+        const rawShowWindow = event?.show_window ?? payload.show_window;
+        const shouldShowWindow = typeof rawShowWindow === "undefined"
+          ? true
+          : remoteCommandBooleanField(event, ["show_window"]);
+        if (shouldShowWindow) {
+          void invoke("app_exit_background").catch(() => {});
+        }
+        const didSelectLoopspace = selectLoopspaceFromRail(loopspaceId);
+        if (!didSelectLoopspace) {
+          await recordRemoteCommandStatus(event, "failed", "That loopspace is not available on this desktop.", {
+            command_id: commandId,
+            command_kind: commandKind,
+            loopspace_id: loopspaceId,
+          });
+          return;
+        }
+        await recordRemoteCommandStatus(event, "completed", `Selected loopspace ${loopspaceId} on this desktop.`, {
+          command_id: commandId,
+          command_kind: commandKind,
+          loopspace_id: loopspaceId,
         });
         return;
       }
@@ -46122,7 +46195,7 @@ export default function App() {
         removeAccountRestartListener();
       }
     };
-  }, [activateWorkspace, activeAccountScopeKey, addWorkspaceTerminal, agentStatuses, changeWorkspaceTerminalRole, closeWorkspaceTerminal, deactivateWorkspace, deleteWorkspaceFromForge, ensureWorkspaceActivated, logout, manageWorkspaceAgents, refreshAgentStatuses, requestWorkspaceActivation, requestWorkspaceTerminalFocus, rustTerminalAuthorityOrchestrators, showView, syncAgentInstallationsToCloud, workspaces]);
+  }, [activateWorkspace, activeAccountScopeKey, addWorkspaceTerminal, agentStatuses, changeWorkspaceTerminalRole, closeWorkspaceTerminal, deactivateWorkspace, deleteWorkspaceFromForge, ensureWorkspaceActivated, enterLoopspacesMode, logout, loopspaces, manageWorkspaceAgents, refreshAgentStatuses, requestWorkspaceActivation, requestWorkspaceTerminalFocus, rustTerminalAuthorityOrchestrators, selectLoopspaceFromRail, showView, syncAgentInstallationsToCloud, workspaces]);
 
   useEffect(() => {
     let disposed = false;
