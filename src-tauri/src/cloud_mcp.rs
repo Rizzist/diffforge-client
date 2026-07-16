@@ -27709,6 +27709,12 @@ fn cloud_mcp_desktop_device_profile() -> Value {
                     "os": platform,
                     "architecture": env::consts::ARCH,
                     "app_version": env!("CARGO_PKG_VERSION"),
+                    // Report the installed version + update state in presence so the
+                    // dashboard can always show the version and an Update button —
+                    // including for headless BYOC daemons that never open a webview
+                    // to publish it. The cloud folds `app_update` into device
+                    // live-state (hot_state::sanitize_app_update_state).
+                    "app_update": app_update_device_payload(),
                     "build_channel": if cfg!(debug_assertions) { "dev" } else { "stable" },
                     "form_factor": "desktop",
                     "device_type": "pc",
