@@ -132,6 +132,30 @@ fn run_command_capture(
     )
 }
 
+fn run_command_capture_with_started<S>(
+    binary: &str,
+    args: &[&str],
+    stdin_text: Option<&str>,
+    timeout: Duration,
+    working_directory: Option<&Path>,
+    on_started: S,
+) -> Result<CommandCapture, String>
+where
+    S: FnOnce(),
+{
+    run_command_capture_with_cancel_env_and_started(
+        binary,
+        args,
+        stdin_text,
+        timeout,
+        working_directory,
+        &[],
+        || false,
+        "Command canceled.",
+        on_started,
+    )
+}
+
 fn run_command_capture_with_env(
     binary: &str,
     args: &[&str],
@@ -183,11 +207,39 @@ fn run_command_capture_with_cancel_and_env<F>(
     timeout: Duration,
     working_directory: Option<&Path>,
     env_vars: &[(String, String)],
-    mut should_cancel: F,
+    should_cancel: F,
     canceled_message: &str,
 ) -> Result<CommandCapture, String>
 where
     F: FnMut() -> bool,
+{
+    run_command_capture_with_cancel_env_and_started(
+        binary,
+        args,
+        stdin_text,
+        timeout,
+        working_directory,
+        env_vars,
+        should_cancel,
+        canceled_message,
+        || {},
+    )
+}
+
+fn run_command_capture_with_cancel_env_and_started<F, S>(
+    binary: &str,
+    args: &[&str],
+    stdin_text: Option<&str>,
+    timeout: Duration,
+    working_directory: Option<&Path>,
+    env_vars: &[(String, String)],
+    mut should_cancel: F,
+    canceled_message: &str,
+    on_started: S,
+) -> Result<CommandCapture, String>
+where
+    F: FnMut() -> bool,
+    S: FnOnce(),
 {
     if app_shutdown_requested() {
         return Err(app_shutdown_blocked_message(binary));
@@ -237,6 +289,7 @@ where
                 format!("Unable to start {binary}: {error}")
             }
         })?;
+    on_started();
 
     if let Some(input) = stdin_text {
         if let Some(mut stdin) = child.stdin.take() {

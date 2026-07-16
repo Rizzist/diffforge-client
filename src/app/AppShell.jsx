@@ -5562,6 +5562,9 @@ function sanitizeCodingAgentStatusForCloud(status) {
           : installed
             ? "installed"
             : "missing";
+  const updateStage = safeCloudMcpText(status.update_stage ?? status.updateStage, "")
+    .toLowerCase()
+    .slice(0, 40);
   return {
     id,
     label: safeCloudMcpText(status.label || status.agent_label, provider.label).slice(0, 80),
@@ -5580,6 +5583,15 @@ function sanitizeCodingAgentStatusForCloud(status) {
     updating,
     operation: installing ? "installing" : updating ? "updating" : operation,
     package_status: packageStatus,
+    ...(updateStage
+      ? {
+        update_stage: updateStage,
+        update_stage_seq: Number(status.update_stage_seq ?? status.updateStageSeq) || 0,
+        update_to_version: safeCloudMcpText(status.update_to_version ?? status.updateToVersion, "").slice(0, 120),
+        update_error_reason: safeCloudMcpText(status.update_error_reason ?? status.updateErrorReason, "").slice(0, 240),
+        update_failed_stage: safeCloudMcpText(status.update_failed_stage ?? status.updateFailedStage, "").slice(0, 40),
+      }
+      : {}),
   };
 }
 
@@ -5682,6 +5694,19 @@ function normalizeCachedAgentStatus(status) {
       ? status.npmVersion.slice(0, 80)
       : defaults.npm_version,
     recommend_native_install: status.recommendNativeInstall !== false,
+    update_error_reason: typeof status.updateErrorReason === "string"
+      ? status.updateErrorReason.slice(0, 240)
+      : "",
+    update_failed_stage: typeof status.updateFailedStage === "string"
+      ? status.updateFailedStage.slice(0, 40)
+      : "",
+    update_stage: typeof status.updateStage === "string"
+      ? status.updateStage.slice(0, 40)
+      : "",
+    update_stage_seq: Number(status.updateStageSeq) || 0,
+    update_to_version: typeof status.updateToVersion === "string"
+      ? status.updateToVersion.slice(0, 120)
+      : "",
     version: typeof status.version === "string"
       ? status.version.slice(0, 120)
       : defaults.version,
@@ -5778,6 +5803,11 @@ function persistAgentStatusCache(statuses) {
       npmUpdateAvailable: Boolean(status.npm_update_available),
       npmVersion: typeof status.npm_version === "string" ? status.npm_version.slice(0, 80) : "",
       recommendNativeInstall: status.recommend_native_install !== false,
+      updateErrorReason: typeof status.update_error_reason === "string" ? status.update_error_reason.slice(0, 240) : "",
+      updateFailedStage: typeof status.update_failed_stage === "string" ? status.update_failed_stage.slice(0, 40) : "",
+      updateStage: typeof status.update_stage === "string" ? status.update_stage.slice(0, 40) : "",
+      updateStageSeq: Number(status.update_stage_seq) || 0,
+      updateToVersion: typeof status.update_to_version === "string" ? status.update_to_version.slice(0, 120) : "",
       version: typeof status.version === "string" ? status.version.slice(0, 120) : "",
     }));
 

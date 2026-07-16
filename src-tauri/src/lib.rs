@@ -1851,6 +1851,28 @@ enum AgentProvider {
     OpenCode,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct AgentUpdateProgress {
+    provider: String,
+    from_version: String,
+    to_version: String,
+    stage: String,
+    stage_seq: u64,
+    started_at_ms: u64,
+    updated_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failed_stage: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AgentInstallProgressSignal {
+    stage: &'static str,
+    error_reason: Option<String>,
+    failed_stage: Option<&'static str>,
+}
+
 #[derive(Clone, Copy)]
 struct AgentDefinition {
     id: &'static str,

@@ -4837,19 +4837,13 @@ async fn install_agent(provider: String) -> Result<AgentInstallResult, String> {
 }
 
 #[tauri::command(rename_all = "snake_case")]
-async fn update_agent(provider: String) -> Result<AgentInstallResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let provider = parse_agent_provider(&provider)?;
-        let result = update_agent_with_npm(provider);
-
-        if result.installed {
-            clear_agent_command_candidate_cache(provider);
-        }
-
-        Ok(result)
-    })
-    .await
-    .map_err(|error| format!("Unable to update terminal CLI: {error}"))?
+async fn update_agent(
+    app: AppHandle,
+    state: State<'_, CloudMcpState>,
+    provider: String,
+) -> Result<AgentInstallResult, String> {
+    let provider = parse_agent_provider(&provider)?;
+    cloud_mcp_execute_agent_update(&app, state.inner(), None, provider).await
 }
 
 #[tauri::command(rename_all = "snake_case")]

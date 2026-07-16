@@ -11598,6 +11598,17 @@ fn update_agent_with_npm(provider: AgentProvider) -> AgentInstallResult {
     run_agent_npm_install(provider, true)
 }
 
+fn update_agent_with_npm_progress<F>(
+    provider: AgentProvider,
+    target_version: &str,
+    emit: F,
+) -> AgentInstallResult
+where
+    F: FnMut(AgentInstallProgressSignal),
+{
+    run_agent_npm_install_with_progress(provider, true, Some(target_version), emit)
+}
+
 fn uninstall_agent_with_npm(provider: AgentProvider) -> AgentInstallResult {
     let definition = agent_definition(provider);
 
@@ -11766,9 +11777,67 @@ fn repair_agent_npm_postinstall(definition: AgentDefinition) -> bool {
 }
 
 fn run_agent_npm_install(provider: AgentProvider, is_update: bool) -> AgentInstallResult {
+    run_agent_npm_install_with_progress(provider, is_update, None, |_| {})
+}
+
+fn agent_version_is_at_least(installed_version: &str, target_version: &str) -> bool {
+    let installed = version_number_segments(installed_version);
+    let target = version_number_segments(target_version);
+    if installed.is_empty() || target.is_empty() {
+        return false;
+    }
+    let count = installed.len().max(target.len());
+    for index in 0..count {
+        let installed_segment = *installed.get(index).unwrap_or(&0);
+        let target_segment = *target.get(index).unwrap_or(&0);
+        if installed_segment != target_segment {
+            return installed_segment > target_segment;
+        }
+    }
+    true
+}
+
+#[derive(Default)]
+struct AgentInstallProgressPhases {
+    downloading_emitted: bool,
+    installing_emitted: bool,
+}
+
+impl AgentInstallProgressPhases {
+    fn begin_downloading(&mut self) -> bool {
+        if self.downloading_emitted {
+            return false;
+        }
+        self.downloading_emitted = true;
+        true
+    }
+
+    fn begin_installing(&mut self) -> bool {
+        if self.installing_emitted {
+            return false;
+        }
+        self.installing_emitted = true;
+        true
+    }
+}
+
+fn run_agent_npm_install_with_progress<F>(
+    provider: AgentProvider,
+    is_update: bool,
+    target_version: Option<&str>,
+    mut emit: F,
+) -> AgentInstallResult
+where
+    F: FnMut(AgentInstallProgressSignal),
+{
     let definition = agent_definition(provider);
 
     if npm_version().is_none() {
+        emit(AgentInstallProgressSignal {
+            stage: "failed",
+            error_reason: Some("npm was not found on PATH.".to_string()),
+            failed_stage: Some("downloading"),
+        });
         return AgentInstallResult {
             provider: definition.id,
             label: definition.label,
@@ -11784,13 +11853,30 @@ fn run_agent_npm_install(provider: AgentProvider, is_update: bool) -> AgentInsta
         };
     }
 
-    let run_npm_install = || {
-        run_command_capture(
+    let mut phases = AgentInstallProgressPhases::default();
+    let mut run_npm_install = || {
+        if phases.begin_downloading() {
+            emit(AgentInstallProgressSignal {
+                stage: "downloading",
+                error_reason: None,
+                failed_stage: None,
+            });
+        }
+        run_command_capture_with_started(
             npm_binary(),
             &["install", "-g", definition.install_package],
             None,
             Duration::from_secs(AGENT_INSTALL_TIMEOUT_SECS),
             None,
+            || {
+                if phases.begin_installing() {
+                    emit(AgentInstallProgressSignal {
+                        stage: "installing",
+                        error_reason: None,
+                        failed_stage: None,
+                    });
+                }
+            },
         )
     };
     let mut install = run_npm_install();
@@ -11802,9 +11888,15 @@ fn run_agent_npm_install(provider: AgentProvider, is_update: bool) -> AgentInsta
             }
         }
     }
+    drop(run_npm_install);
 
     match install {
         Ok(capture) if capture.exit_code == Some(0) => {
+            emit(AgentInstallProgressSignal {
+                stage: "verifying",
+                error_reason: None,
+                failed_stage: None,
+            });
             // npm exiting 0 is not enough: verify the binary really starts,
             // and try the package's own postinstall repair once before
             // reporting a corrupt install.
@@ -11812,6 +11904,11 @@ fn run_agent_npm_install(provider: AgentProvider, is_update: bool) -> AgentInsta
                 let repaired = repair_agent_npm_postinstall(definition)
                     && verify_agent_binary_runs(definition).is_ok();
                 if !repaired {
+                    emit(AgentInstallProgressSignal {
+                        stage: "failed",
+                        error_reason: Some(verify_error.clone()),
+                        failed_stage: Some("verifying"),
+                    });
                     return failed_agent_install_result(
                         definition,
                         &verify_error,
@@ -11820,6 +11917,38 @@ fn run_agent_npm_install(provider: AgentProvider, is_update: bool) -> AgentInsta
                     );
                 }
             }
+            if let Some(target_version) = target_version.filter(|value| !value.trim().is_empty()) {
+                let installed_version = npm_global_package_version(definition).unwrap_or_default();
+                if !agent_version_is_at_least(&installed_version, target_version) {
+                    let reason = if installed_version.is_empty() {
+                        format!(
+                            "{} version could not be re-probed after npm completed.",
+                            definition.label
+                        )
+                    } else {
+                        format!(
+                            "{} remained at {} after updating to target {}.",
+                            definition.label, installed_version, target_version
+                        )
+                    };
+                    emit(AgentInstallProgressSignal {
+                        stage: "failed",
+                        error_reason: Some(reason.clone()),
+                        failed_stage: Some("verifying"),
+                    });
+                    return failed_agent_install_result(
+                        definition,
+                        &reason,
+                        "The installed version did not reach the requested target.",
+                        if is_update { "update" } else { "install" },
+                    );
+                }
+            }
+            emit(AgentInstallProgressSignal {
+                stage: "complete",
+                error_reason: None,
+                failed_stage: None,
+            });
             AgentInstallResult {
                 provider: definition.id,
                 label: definition.label,
@@ -11838,18 +11967,46 @@ fn run_agent_npm_install(provider: AgentProvider, is_update: bool) -> AgentInsta
                 },
             }
         }
-        Ok(capture) => failed_agent_install_result(
-            definition,
-            &command_output_text(&capture.stdout, &capture.stderr),
-            "npm install returned a non-zero status.",
-            if is_update { "update" } else { "install" },
-        ),
-        Err(error) => failed_agent_install_result(
-            definition,
-            &error,
-            "Unable to run npm install.",
-            if is_update { "update" } else { "install" },
-        ),
+        Ok(capture) => {
+            let output = command_output_text(&capture.stdout, &capture.stderr);
+            let output_summary = first_output_line(&output)
+                .chars()
+                .take(512)
+                .collect::<String>();
+            let reason = if output_summary.is_empty() {
+                "npm install returned a non-zero status.".to_string()
+            } else {
+                output_summary
+            };
+            emit(AgentInstallProgressSignal {
+                stage: "failed",
+                error_reason: Some(reason),
+                failed_stage: Some("installing"),
+            });
+            failed_agent_install_result(
+                definition,
+                &output,
+                "npm install returned a non-zero status.",
+                if is_update { "update" } else { "install" },
+            )
+        }
+        Err(error) => {
+            emit(AgentInstallProgressSignal {
+                stage: "failed",
+                error_reason: Some(error.clone()),
+                failed_stage: Some(if phases.installing_emitted {
+                    "installing"
+                } else {
+                    "downloading"
+                }),
+            });
+            failed_agent_install_result(
+                definition,
+                &error,
+                "Unable to run npm install.",
+                if is_update { "update" } else { "install" },
+            )
+        }
     }
 }
 

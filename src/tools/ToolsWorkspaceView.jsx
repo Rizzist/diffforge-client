@@ -1454,6 +1454,25 @@ function timeAgo(value) {
   return `${Math.round(hours / 24)}d ago`;
 }
 
+// Live install/update stages emitted by the Rust updater; anything outside
+// this map ("complete", "failed", or no stage) falls back to normal row UI.
+const AGENT_UPDATE_STAGE_LABELS = {
+  queued: "Will update when idle",
+  downloading: "Downloading…",
+  installing: "Installing…",
+  verifying: "Verifying…",
+};
+
+function agentUpdateProgressFields(status) {
+  return {
+    update_stage: text(status?.update_stage || status?.updateStage).toLowerCase(),
+    update_stage_seq: Number(status?.update_stage_seq ?? status?.updateStageSeq) || 0,
+    update_to_version: text(status?.update_to_version || status?.updateToVersion),
+    update_error_reason: text(status?.update_error_reason || status?.updateErrorReason),
+    update_failed_stage: text(status?.update_failed_stage || status?.updateFailedStage),
+  };
+}
+
 function cliSnapshotFromStatuses(statuses) {
   return (Array.isArray(statuses) ? statuses : []).map((status) => ({
     agent_id: text(status?.provider || status?.id),
@@ -1464,6 +1483,7 @@ function cliSnapshotFromStatuses(statuses) {
     npm_package_version: text(status?.npm_package_version),
     npm_latest_version: text(status?.npm_latest_version),
     update_available: Boolean(status?.npm_update_available),
+    ...agentUpdateProgressFields(status),
     active_model: text(status?.active_model),
   }));
 }
@@ -2682,6 +2702,55 @@ function ToolsWorkspaceView({
     };
   }, []);
 
+  // The Rust updater emits per-stage progress (queued/downloading/installing/
+  // verifying/complete/failed) between inventory refreshes; merge each stage
+  // into the matching CLI status row so the list tracks the update live.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = null;
+    void listen("agent-update-progress", (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      const provider = text(payload.provider).toLowerCase();
+      const stage = text(payload.stage).toLowerCase();
+      if (!provider || !stage) {
+        return;
+      }
+      const stageSeq = Number(payload.stage_seq) || 0;
+      setCliStatuses((current) => (Array.isArray(current) ? current : []).map((status) => {
+        if (text(status?.provider || status?.id).toLowerCase() !== provider) {
+          return status;
+        }
+        const currentSeq = Number(status?.update_stage_seq ?? status?.updateStageSeq) || 0;
+        if (stageSeq && currentSeq && stageSeq < currentSeq) {
+          return status;
+        }
+        return {
+          ...status,
+          update_stage: stage,
+          update_stage_seq: stageSeq,
+          update_to_version: text(payload.to_version),
+          update_error_reason: text(payload.error_reason),
+          update_failed_stage: text(payload.failed_stage),
+        };
+      }));
+    }).then((dispose) => {
+      if (disposed) {
+        dispose();
+      } else {
+        unlisten = dispose;
+      }
+    }).catch(() => {});
+    return () => {
+      disposed = true;
+      if (typeof unlisten === "function") {
+        unlisten();
+      }
+    };
+  }, []);
+
   // Applies the next docs list locally right away, then asks Rust to save/delete
   // the underlying account document files and Cloud metadata.
   const persistSkillsLibrary = useCallback(async (nextSkills, forcedSkillIds = []) => {
@@ -3315,6 +3384,7 @@ function ToolsWorkspaceView({
     const agentRows = (Array.isArray(cliStatuses) ? cliStatuses : []).map((status) => {
       const provider = text(status?.provider || status?.id);
       const label = text(status?.label, provider);
+      const progress = agentUpdateProgressFields(status);
       return {
         busyAction: cliBusy[provider] || "",
         icon: null,
@@ -3327,6 +3397,11 @@ function ToolsWorkspaceView({
         searchText: `${label} ${provider}`.toLowerCase(),
         sub: "coding agent",
         update_available: Boolean(status?.npm_update_available),
+        updateErrorReason: progress.update_error_reason,
+        updateFailedStage: progress.update_failed_stage,
+        updateStage: progress.update_stage,
+        updateStageSeq: progress.update_stage_seq,
+        updateToVersion: progress.update_to_version,
         version: text(status?.version),
       };
     });
@@ -3342,6 +3417,11 @@ function ToolsWorkspaceView({
       searchText: `${entry.label} ${entry.binary}`.toLowerCase(),
       sub: entry.binary,
       update_available: false,
+      updateErrorReason: "",
+      updateFailedStage: "",
+      updateStage: "",
+      updateStageSeq: 0,
+      updateToVersion: "",
       version: "",
     }));
     return [...agentRows, ...catalogRows]
@@ -6831,6 +6911,16 @@ function ToolsWorkspaceView({
                   <CliList aria-label="CLI programs" role="list">
                     {cliRows.map((row) => {
                       const Icon = row.icon;
+                      const updateStageLabel = AGENT_UPDATE_STAGE_LABELS[row.updateStage] || "";
+                      const updateFailed = row.updateStage === "failed";
+                      const updateFailedDetail = updateFailed
+                        ? text(
+                          row.updateErrorReason,
+                          row.updateFailedStage
+                            ? `Update failed during ${row.updateFailedStage}.`
+                            : "Agent update failed.",
+                        )
+                        : "";
                       return (
                         <CliRow
                           data-installed={row.installed ? "true" : "false"}
@@ -6845,7 +6935,17 @@ function ToolsWorkspaceView({
                             {row.sub && <span>{row.sub}</span>}
                           </CliRowName>
                           <CliRowState>
-                            {row.busyAction ? (
+                            {updateStageLabel ? (
+                              <>
+                                <DocsExplorerSpinner aria-hidden="true" />
+                                <CliStateText
+                                  data-tone="busy"
+                                  title={row.updateToVersion ? `Updating to ${row.updateToVersion}` : undefined}
+                                >
+                                  {updateStageLabel}
+                                </CliStateText>
+                              </>
+                            ) : row.busyAction ? (
                               <CliStateText data-tone="busy">
                                 {row.busyAction === "install"
                                   ? "Installing…"
@@ -6863,7 +6963,7 @@ function ToolsWorkspaceView({
                                 >
                                   Uninstall
                                 </CliRowButton>
-                                {row.update_available && (
+                                {(row.update_available || updateFailed) && (
                                   <CliRowButton
                                     onClick={() => handleCliRowAction(row, "update")}
                                     type="button"
@@ -6871,9 +6971,15 @@ function ToolsWorkspaceView({
                                     Update
                                   </CliRowButton>
                                 )}
-                                <CliStateText data-tone="good">
-                                  {row.version ? `Installed · ${row.version}` : "Installed"}
-                                </CliStateText>
+                                {updateFailed ? (
+                                  <CliStateText data-tone="danger" title={updateFailedDetail}>
+                                    Update failed
+                                  </CliStateText>
+                                ) : (
+                                  <CliStateText data-tone="good">
+                                    {row.version ? `Installed · ${row.version}` : "Installed"}
+                                  </CliStateText>
+                                )}
                               </>
                             ) : row.manageable ? (
                               <>
@@ -9013,6 +9119,10 @@ const CliStateText = styled.span`
   &[data-tone="busy"] {
     color: rgba(240, 200, 140, 0.95);
     animation: ${cliBusyPulse} 1.2s ease-in-out infinite;
+  }
+
+  &[data-tone="danger"] {
+    color: rgba(250, 180, 180, 0.92);
   }
 `;
 

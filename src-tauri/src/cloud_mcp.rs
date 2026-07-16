@@ -19672,7 +19672,7 @@ async fn cloud_mcp_send_remote_command_status_event(
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "todo_workspace_id"])),
         "todo_device_id": cloud_mcp_payload_text(event, &["todo_device_id"])
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "todo_device_id"])),
-        "command_kind": cloud_mcp_remote_command_field_text(event, &["command_kind"]),
+        "command_kind": cloud_mcp_remote_command_kind(event),
         "intent_id": cloud_mcp_payload_text(event, &["intent_id"])
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "intent_id"])),
         "loop_runtime_run_id": cloud_mcp_payload_text(event, &["loop_runtime_run_id"])
@@ -20682,6 +20682,8 @@ pub(crate) fn cloud_mcp_start_architecture_event_sync(app: AppHandle, state: Clo
 }
 
 const CLOUD_MCP_AGENT_INVENTORY_EVENT: &str = "agent-inventory-changed";
+const CLOUD_MCP_AGENT_UPDATE_PROGRESS_EVENT: &str = "agent-update-progress";
+const CLOUD_MCP_AGENT_UPDATE_PROGRESS_STATE_KEY: &str = "agent-update-progress";
 const CLOUD_MCP_AGENT_INVENTORY_INITIAL_DELAY_SECS: u64 = 90;
 const CLOUD_MCP_AGENT_INVENTORY_FALLBACK_INTERVAL_SECS: u64 = 6 * 60 * 60;
 const CLOUD_MCP_AGENT_INVENTORY_WATCH_DEBOUNCE_MS: u64 = 10_000;
@@ -20691,6 +20693,246 @@ static CLOUD_MCP_AGENT_INVENTORY_WATCHER: OnceLock<StdMutex<Option<notify::Recom
     OnceLock::new();
 static CLOUD_MCP_AGENT_MODEL_CATALOGS: OnceLock<StdMutex<HashMap<String, AgentModelCatalog>>> =
     OnceLock::new();
+static CLOUD_MCP_AGENT_UPDATE_PROGRESS_FILE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static CLOUD_MCP_AGENT_UPDATE_IN_FLIGHT: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
+
+struct CloudMcpAgentUpdateRunGuard {
+    provider: String,
+}
+
+impl Drop for CloudMcpAgentUpdateRunGuard {
+    fn drop(&mut self) {
+        if let Ok(mut in_flight) = CLOUD_MCP_AGENT_UPDATE_IN_FLIGHT
+            .get_or_init(|| StdMutex::new(HashSet::new()))
+            .lock()
+        {
+            in_flight.remove(&self.provider);
+        }
+    }
+}
+
+fn cloud_mcp_try_begin_agent_update(provider: &str) -> Option<CloudMcpAgentUpdateRunGuard> {
+    let provider = provider.trim().to_ascii_lowercase();
+    let mut in_flight = CLOUD_MCP_AGENT_UPDATE_IN_FLIGHT
+        .get_or_init(|| StdMutex::new(HashSet::new()))
+        .lock()
+        .ok()?;
+    if !in_flight.insert(provider.clone()) {
+        return None;
+    }
+    Some(CloudMcpAgentUpdateRunGuard { provider })
+}
+
+fn agent_update_progress_begin(
+    previous: Option<&AgentUpdateProgress>,
+    provider: &str,
+    from_version: &str,
+    to_version: &str,
+    now_ms: u64,
+) -> AgentUpdateProgress {
+    AgentUpdateProgress {
+        provider: provider.to_string(),
+        from_version: from_version.to_string(),
+        to_version: to_version.to_string(),
+        stage: "available".to_string(),
+        stage_seq: previous
+            .map(|progress| progress.stage_seq)
+            .unwrap_or(0)
+            .saturating_add(1),
+        started_at_ms: now_ms,
+        updated_at_ms: now_ms,
+        error_reason: None,
+        failed_stage: None,
+    }
+}
+
+fn agent_update_progress_transition(
+    previous: &AgentUpdateProgress,
+    stage: &str,
+    now_ms: u64,
+    error_reason: Option<String>,
+    failed_stage: Option<&str>,
+) -> AgentUpdateProgress {
+    AgentUpdateProgress {
+        provider: previous.provider.clone(),
+        from_version: previous.from_version.clone(),
+        to_version: previous.to_version.clone(),
+        stage: stage.to_string(),
+        stage_seq: previous.stage_seq.saturating_add(1),
+        started_at_ms: previous.started_at_ms,
+        updated_at_ms: now_ms.max(previous.updated_at_ms),
+        error_reason: error_reason.filter(|reason| !reason.trim().is_empty()),
+        failed_stage: failed_stage.map(str::to_string),
+    }
+}
+
+fn agent_update_reconcile_progress(
+    previous: &AgentUpdateProgress,
+    installed_version: Option<&str>,
+    binary_error: Option<&str>,
+    now_ms: u64,
+) -> AgentUpdateProgress {
+    let installed_matches = installed_version
+        .is_some_and(|version| agent_version_is_at_least(version, &previous.to_version));
+    if installed_matches && binary_error.is_none() {
+        return agent_update_progress_transition(previous, "complete", now_ms, None, None);
+    }
+    let reason = binary_error.map(str::to_string).unwrap_or_else(|| {
+        installed_version.map_or_else(
+            || "Installed version could not be re-probed after restart.".to_string(),
+            |version| {
+                format!(
+                    "Installed version {version} did not reach target {} after restart.",
+                    previous.to_version
+                )
+            },
+        )
+    });
+    agent_update_progress_transition(
+        previous,
+        "failed",
+        now_ms,
+        Some(reason),
+        Some(&previous.stage),
+    )
+}
+
+fn cloud_mcp_agent_update_progresses(app: &AppHandle) -> HashMap<String, AgentUpdateProgress> {
+    app_local_state_read(app, CLOUD_MCP_AGENT_UPDATE_PROGRESS_STATE_KEY)
+        .get("providers")
+        .and_then(Value::as_object)
+        .map(|providers| {
+            providers
+                .iter()
+                .filter_map(|(provider, progress)| {
+                    serde_json::from_value::<AgentUpdateProgress>(progress.clone())
+                        .ok()
+                        .map(|progress| (provider.clone(), progress))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn cloud_mcp_agent_update_progress(
+    app: &AppHandle,
+    provider: &str,
+) -> Option<AgentUpdateProgress> {
+    let _guard = CLOUD_MCP_AGENT_UPDATE_PROGRESS_FILE_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .ok()?;
+    cloud_mcp_agent_update_progresses(app).remove(provider)
+}
+
+fn cloud_mcp_store_agent_update_progress(
+    app: &AppHandle,
+    progress: AgentUpdateProgress,
+) -> Result<AgentUpdateProgress, String> {
+    let _guard = CLOUD_MCP_AGENT_UPDATE_PROGRESS_FILE_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .map_err(|_| "Agent update progress lock is poisoned.".to_string())?;
+    let mut providers = cloud_mcp_agent_update_progresses(app);
+    providers.insert(progress.provider.clone(), progress.clone());
+    app_local_state_write(
+        app,
+        CLOUD_MCP_AGENT_UPDATE_PROGRESS_STATE_KEY,
+        &json!({ "providers": providers }),
+    )?;
+    Ok(progress)
+}
+
+fn cloud_mcp_begin_agent_update_progress(
+    app: &AppHandle,
+    provider: &str,
+    from_version: &str,
+    to_version: &str,
+) -> Result<AgentUpdateProgress, String> {
+    let previous = cloud_mcp_agent_update_progress(app, provider);
+    cloud_mcp_store_agent_update_progress(
+        app,
+        agent_update_progress_begin(
+            previous.as_ref(),
+            provider,
+            from_version,
+            to_version,
+            cloud_mcp_now_ms(),
+        ),
+    )
+}
+
+fn cloud_mcp_transition_agent_update_progress(
+    app: &AppHandle,
+    provider: &str,
+    stage: &str,
+    error_reason: Option<String>,
+    failed_stage: Option<&str>,
+) -> Result<AgentUpdateProgress, String> {
+    let previous = cloud_mcp_agent_update_progress(app, provider)
+        .ok_or_else(|| format!("No active {provider} update progress exists."))?;
+    cloud_mcp_store_agent_update_progress(
+        app,
+        agent_update_progress_transition(
+            &previous,
+            stage,
+            cloud_mcp_now_ms(),
+            error_reason,
+            failed_stage,
+        ),
+    )
+}
+
+fn cloud_mcp_merge_agent_update_progress_into_statuses(
+    statuses: &mut Value,
+    progresses: &HashMap<String, AgentUpdateProgress>,
+) {
+    let Some(statuses) = statuses.as_array_mut() else {
+        return;
+    };
+    for status in statuses {
+        let Some(provider) = cloud_mcp_payload_text(status, &["id", "agent_id"])
+            .map(|provider| provider.to_ascii_lowercase())
+        else {
+            continue;
+        };
+        let Some(progress) = progresses.get(&provider) else {
+            continue;
+        };
+        status["update_stage"] = json!(progress.stage);
+        status["update_stage_seq"] = json!(progress.stage_seq);
+        status["update_from_version"] = json!(progress.from_version);
+        status["update_to_version"] = json!(progress.to_version);
+        status["update_started_at_ms"] = json!(progress.started_at_ms);
+        status["update_updated_at_ms"] = json!(progress.updated_at_ms);
+        status["update_error_reason"] = progress
+            .error_reason
+            .as_ref()
+            .map_or(Value::Null, |reason| json!(reason));
+        status["update_failed_stage"] = progress
+            .failed_stage
+            .as_ref()
+            .map_or(Value::Null, |stage| json!(stage));
+    }
+}
+
+fn cloud_mcp_emit_agent_update_progress(app: &AppHandle, progress: &AgentUpdateProgress) {
+    let _ = app.emit(
+        CLOUD_MCP_AGENT_UPDATE_PROGRESS_EVENT,
+        json!({
+            "progress": progress,
+            "provider": progress.provider,
+            "from_version": progress.from_version,
+            "to_version": progress.to_version,
+            "stage": progress.stage,
+            "stage_seq": progress.stage_seq,
+            "started_at_ms": progress.started_at_ms,
+            "updated_at_ms": progress.updated_at_ms,
+            "error_reason": progress.error_reason,
+            "failed_stage": progress.failed_stage,
+        }),
+    );
+}
 
 fn cloud_mcp_agent_model_catalog_cache() -> &'static StdMutex<HashMap<String, AgentModelCatalog>> {
     CLOUD_MCP_AGENT_MODEL_CATALOGS.get_or_init(|| StdMutex::new(HashMap::new()))
@@ -20712,6 +20954,172 @@ fn cloud_mcp_latest_agent_model_catalog(agent_kind: &str) -> Option<AgentModelCa
 fn cloud_mcp_latest_agent_model_catalog_value(agent_kind: &str) -> Option<Value> {
     cloud_mcp_latest_agent_model_catalog(agent_kind)
         .and_then(|catalog| serde_json::to_value(catalog).ok())
+}
+
+async fn cloud_mcp_agent_update_status_payload(
+    app: &AppHandle,
+    state: &CloudMcpState,
+) -> Value {
+    let cached = {
+        let snapshots = state.runtime_snapshots.lock().await;
+        snapshots
+            .agent_installations
+            .as_ref()
+            .and_then(|snapshot| snapshot.get("coding_agents"))
+            .cloned()
+    };
+    let mut statuses = if let Some(cached) = cached.filter(Value::is_array) {
+        cached
+    } else {
+        agent_statuses()
+            .await
+            .ok()
+            .and_then(|statuses| serde_json::to_value(statuses).ok())
+            .unwrap_or_else(|| json!([]))
+    };
+    let progresses = {
+        let _guard = CLOUD_MCP_AGENT_UPDATE_PROGRESS_FILE_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .ok();
+        cloud_mcp_agent_update_progresses(app)
+    };
+    cloud_mcp_merge_agent_update_progress_into_statuses(&mut statuses, &progresses);
+    statuses
+}
+
+async fn cloud_mcp_publish_agent_update_progress(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    event: Option<&Value>,
+    progress: &AgentUpdateProgress,
+    reason: &str,
+) {
+    cloud_mcp_emit_agent_update_progress(app, progress);
+    if let Some(event) = event {
+        let (status, message) = match progress.stage.as_str() {
+            "queued" => (
+                "deferred",
+                format!("{} is in use — will update when idle.", progress.provider),
+            ),
+            "complete" => (
+                "completed",
+                format!(
+                    "{} updated to {}.",
+                    progress.provider, progress.to_version
+                ),
+            ),
+            "failed" => (
+                "failed",
+                progress
+                    .error_reason
+                    .clone()
+                    .unwrap_or_else(|| format!("{} update failed.", progress.provider)),
+            ),
+            _ => (
+                "running",
+                format!("{} update is {}.", progress.provider, progress.stage),
+            ),
+        };
+        let details = json!({
+            "agent_update_progress": progress,
+            "provider": progress.provider,
+            "from_version": progress.from_version,
+            "to_version": progress.to_version,
+            "stage": progress.stage,
+            "stage_seq": progress.stage_seq,
+            "started_at_ms": progress.started_at_ms,
+            "updated_at_ms": progress.updated_at_ms,
+            "error_reason": progress.error_reason,
+            "failed_stage": progress.failed_stage,
+            "reason": if progress.stage == "queued" { "provider_in_use" } else { "stage_transition" },
+            "will_update_when_idle": progress.stage == "queued",
+        });
+        let _ = cloud_mcp_send_remote_command_status_event(
+            state,
+            event,
+            status,
+            &message,
+            Some(&details),
+        )
+        .await;
+    }
+    let statuses = cloud_mcp_agent_update_status_payload(app, state).await;
+    let _ = cloud_mcp_sync_agent_installations_internal(
+        state,
+        String::new(),
+        None,
+        None,
+        statuses,
+        Some(reason.to_string()),
+    )
+    .await;
+}
+
+async fn cloud_mcp_enrich_agent_statuses_with_update_progress(
+    app: &AppHandle,
+    statuses: &mut Value,
+) {
+    let mut progresses = {
+        let _guard = CLOUD_MCP_AGENT_UPDATE_PROGRESS_FILE_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .ok();
+        cloud_mcp_agent_update_progresses(app)
+    };
+    let available = statuses
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|status| {
+            let update_available = cloud_mcp_payload_bool(
+                status,
+                &["npm_update_available", "update_available"],
+                false,
+            );
+            if !update_available {
+                return None;
+            }
+            let provider = cloud_mcp_payload_text(status, &["id", "agent_id"])?
+                .to_ascii_lowercase();
+            let from_version = cloud_mcp_payload_text(
+                status,
+                &["npm_package_version", "version"],
+            )
+            .unwrap_or_else(|| "unknown".to_string());
+            let to_version = cloud_mcp_payload_text(status, &["npm_latest_version"])?;
+            Some((provider, from_version, to_version))
+        })
+        .collect::<Vec<_>>();
+    for (provider, from_version, to_version) in available {
+        let current = progresses.get(&provider);
+        let active = current.is_some_and(|progress| {
+            matches!(
+                progress.stage.as_str(),
+                "queued" | "downloading" | "installing" | "verifying"
+            )
+        });
+        let should_begin = !active
+            && current.is_none_or(|progress| {
+                progress.to_version != to_version
+                    || !matches!(
+                        progress.stage.as_str(),
+                        "available" | "complete" | "failed"
+                    )
+            });
+        if should_begin {
+            if let Ok(progress) = cloud_mcp_begin_agent_update_progress(
+                app,
+                &provider,
+                &from_version,
+                &to_version,
+            ) {
+                cloud_mcp_emit_agent_update_progress(app, &progress);
+                progresses.insert(provider, progress);
+            }
+        }
+    }
+    cloud_mcp_merge_agent_update_progress_into_statuses(statuses, &progresses);
 }
 
 fn cloud_mcp_agent_model_catalog_contains_model(agent_kind: &str, model_id: &str) -> bool {
@@ -21745,6 +22153,7 @@ pub(crate) async fn cloud_mcp_agent_inventory_probe_and_sync(
         return;
     };
     let mut payload = serde_json::to_value(&statuses).unwrap_or_else(|_| json!([]));
+    cloud_mcp_enrich_agent_statuses_with_update_progress(app, &mut payload).await;
     cloud_mcp_refresh_agent_model_catalogs_from_status_payload(&payload, reason).await;
     cloud_mcp_enrich_agent_status_payload_with_cached_catalogs(&mut payload);
     let signature = format!("{:x}", Sha256::digest(payload.to_string().as_bytes()));
@@ -21777,6 +22186,62 @@ pub(crate) async fn cloud_mcp_agent_inventory_probe_and_sync(
     .await;
 }
 
+async fn cloud_mcp_reconcile_agent_updates_on_boot(app: &AppHandle, state: &CloudMcpState) {
+    let progresses = {
+        let _guard = CLOUD_MCP_AGENT_UPDATE_PROGRESS_FILE_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .ok();
+        cloud_mcp_agent_update_progresses(app)
+    };
+    for progress in progresses.into_values().filter(|progress| {
+        matches!(
+            progress.stage.as_str(),
+            "downloading" | "installing" | "verifying"
+        )
+    }) {
+        let Ok(provider) = parse_agent_provider(&progress.provider) else {
+            continue;
+        };
+        let definition = agent_definition(provider);
+        let probe = tauri::async_runtime::spawn_blocking(move || {
+            let installed_version = npm_global_package_version(definition);
+            let binary_error = verify_agent_binary_runs(definition).err();
+            (installed_version, binary_error)
+        })
+        .await;
+        let reconciled = match probe {
+            Ok((installed_version, binary_error)) => agent_update_reconcile_progress(
+                &progress,
+                installed_version.as_deref(),
+                binary_error.as_deref(),
+                cloud_mcp_now_ms(),
+            ),
+            Err(error) => agent_update_progress_transition(
+                &progress,
+                "failed",
+                cloud_mcp_now_ms(),
+                Some(format!(
+                    "{} update reconciliation worker failed: {error}",
+                    definition.label
+                )),
+                Some(&progress.stage),
+            ),
+        };
+        let Ok(reconciled) = cloud_mcp_store_agent_update_progress(app, reconciled) else {
+            continue;
+        };
+        cloud_mcp_publish_agent_update_progress(
+            app,
+            state,
+            None,
+            &reconciled,
+            "agent_update_boot_reconcile",
+        )
+        .await;
+    }
+}
+
 /// Headless agent inventory watcher: keeps the cloud (and an open webview)
 /// current when agents are installed/updated outside the app — for example
 /// `npm i -g @openai/codex` in a terminal — including in background mode.
@@ -21787,6 +22252,8 @@ pub(crate) fn cloud_mcp_start_agent_inventory_watcher(app: AppHandle, state: Clo
         let _ = tauri::async_runtime::spawn_blocking(move || {
             cloud_mcp_start_agent_inventory_fs_watcher(inventory_wake_for_setup)
         });
+
+        cloud_mcp_reconcile_agent_updates_on_boot(&app, &state).await;
 
         if !cloud_mcp_wait_for_background_scheduler_delay(Duration::from_secs(
             CLOUD_MCP_AGENT_INVENTORY_INITIAL_DELAY_SECS,
@@ -21865,6 +22332,259 @@ async fn cloud_mcp_active_provider_terminal_labels(app: &AppHandle, provider: &s
         .collect()
 }
 
+async fn cloud_mcp_execute_agent_update(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    event: Option<&Value>,
+    provider: AgentProvider,
+) -> Result<AgentInstallResult, String> {
+    let definition = agent_definition(provider);
+    let Some(_run_guard) = cloud_mcp_try_begin_agent_update(definition.id) else {
+        if let Some(event) = event {
+            let current = cloud_mcp_agent_update_progress(app, definition.id);
+            let details = json!({
+                "coalesced": true,
+                "provider": definition.id,
+                "agent_update_progress": current,
+            });
+            let _ = cloud_mcp_send_remote_command_status_event(
+                state,
+                event,
+                "completed",
+                &format!(
+                    "{} update was coalesced into the run already in progress.",
+                    definition.label
+                ),
+                Some(&details),
+            )
+            .await;
+        }
+        return Ok(AgentInstallResult {
+            provider: definition.id,
+            label: definition.label,
+            installed: true,
+            updated: false,
+            permission_denied: false,
+            command: definition.install_command,
+            native_install_url: definition.native_install_url,
+            message: format!("{} update is already in progress.", definition.label),
+        });
+    };
+
+    let target_hint = event.and_then(|event| {
+        cloud_mcp_remote_command_field_text(
+            event,
+            &[
+                "to_version",
+                "toVersion",
+                "latest_version",
+                "latestVersion",
+                "npm_latest_version",
+            ],
+        )
+    });
+    let versions = tauri::async_runtime::spawn_blocking(move || {
+        let from_version = npm_global_package_version(definition)
+            .unwrap_or_else(|| "unknown".to_string());
+        let to_version = target_hint
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| npm_latest_package_version(definition))
+            .unwrap_or_else(|| from_version.clone());
+        (from_version, to_version)
+    })
+    .await
+    .map_err(|error| format!("Unable to probe {} update versions: {error}", definition.label))?;
+    let progress = cloud_mcp_begin_agent_update_progress(
+        app,
+        definition.id,
+        &versions.0,
+        &versions.1,
+    )?;
+    cloud_mcp_publish_agent_update_progress(
+        app,
+        state,
+        event,
+        &progress,
+        "agent_update_available",
+    )
+    .await;
+
+    let lifecycle_lock = app.state::<TerminalState>().lifecycle_lock.clone();
+    let mut queued = false;
+    let update_lifecycle_guard = loop {
+        if app_shutdown_requested() {
+            let progress = cloud_mcp_transition_agent_update_progress(
+                app,
+                definition.id,
+                "failed",
+                Some("Agent update was cancelled because Diff Forge is shutting down.".to_string()),
+                Some(if queued { "queued" } else { "available" }),
+            )?;
+            cloud_mcp_publish_agent_update_progress(
+                app,
+                state,
+                event,
+                &progress,
+                "agent_update_cancelled",
+            )
+            .await;
+            return Err("Agent update was cancelled because Diff Forge is shutting down.".to_string());
+        }
+        let mut active_terminals =
+            cloud_mcp_active_provider_terminal_labels(app, definition.id).await;
+        if active_terminals.is_empty() {
+            let guard = lifecycle_lock.clone().lock_owned().await;
+            active_terminals =
+                cloud_mcp_active_provider_terminal_labels(app, definition.id).await;
+            if active_terminals.is_empty() {
+                break guard;
+            }
+            drop(guard);
+        }
+        if !queued {
+            let progress = cloud_mcp_transition_agent_update_progress(
+                app,
+                definition.id,
+                "queued",
+                None,
+                None,
+            )?;
+            cloud_mcp_publish_agent_update_progress(
+                app,
+                state,
+                event,
+                &progress,
+                "agent_update_waiting_for_idle",
+            )
+            .await;
+            queued = true;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+
+    let target_version = versions.1.clone();
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+    let update_task = tauri::async_runtime::spawn_blocking(move || {
+        update_agent_with_npm_progress(provider, &target_version, |signal| {
+            let _ = progress_tx.send(signal);
+        })
+    });
+    let mut progress_persistence_error = None;
+    while let Some(signal) = progress_rx.recv().await {
+        if progress_persistence_error.is_some() {
+            continue;
+        }
+        let progress = cloud_mcp_transition_agent_update_progress(
+            app,
+            definition.id,
+            signal.stage,
+            signal.error_reason,
+            signal.failed_stage,
+        );
+        match progress {
+            Ok(progress) => {
+                cloud_mcp_publish_agent_update_progress(
+                    app,
+                    state,
+                    event,
+                    &progress,
+                    &format!("agent_update_{}", signal.stage),
+                )
+                .await;
+            }
+            Err(error) => progress_persistence_error = Some(error),
+        }
+    }
+    let update_outcome = update_task.await;
+    if let Some(error) = progress_persistence_error {
+        let reason = format!(
+            "{} update progress could not be persisted: {error}",
+            definition.label
+        );
+        match cloud_mcp_transition_agent_update_progress(
+            app,
+            definition.id,
+            "failed",
+            Some(reason.clone()),
+            Some("installing"),
+        ) {
+            Ok(progress) => {
+                cloud_mcp_publish_agent_update_progress(
+                    app,
+                    state,
+                    event,
+                    &progress,
+                    "agent_update_progress_persistence_failed",
+                )
+                .await;
+            }
+            Err(_) => {
+                if let Some(event) = event {
+                    let _ = cloud_mcp_send_remote_command_status_event(
+                        state,
+                        event,
+                        "failed",
+                        &reason,
+                        Some(&json!({
+                            "provider": definition.id,
+                            "failed_stage": "installing",
+                            "error_reason": reason,
+                        })),
+                    )
+                    .await;
+                }
+            }
+        }
+        drop(update_lifecycle_guard);
+        cloud_mcp_agent_inventory_probe_and_sync(app, state, "agent_update_terminal", true).await;
+        return Err(reason);
+    }
+    let result = match update_outcome {
+        Ok(result) => result,
+        Err(error) => {
+            let reason = format!("{} update worker failed: {error}", definition.label);
+            let progress = cloud_mcp_transition_agent_update_progress(
+                app,
+                definition.id,
+                "failed",
+                Some(reason.clone()),
+                Some("installing"),
+            );
+            if let Ok(progress) = progress {
+                cloud_mcp_publish_agent_update_progress(
+                    app,
+                    state,
+                    event,
+                    &progress,
+                    "agent_update_worker_failed",
+                )
+                .await;
+            } else if let Some(event) = event {
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    state,
+                    event,
+                    "failed",
+                    &reason,
+                    Some(&json!({
+                        "provider": definition.id,
+                        "failed_stage": "installing",
+                        "error_reason": reason,
+                    })),
+                )
+                .await;
+            }
+            drop(update_lifecycle_guard);
+            return Err(reason);
+        }
+    };
+    drop(update_lifecycle_guard);
+    if result.installed {
+        clear_agent_command_candidate_cache(provider);
+    }
+    cloud_mcp_agent_inventory_probe_and_sync(app, state, "agent_update_terminal", true).await;
+    Ok(result)
+}
+
 #[cfg(test)]
 #[test]
 fn remote_agent_update_idle_gate_matches_provider_aliases_only() {
@@ -21884,6 +22604,179 @@ fn remote_agent_update_idle_gate_matches_provider_aliases_only() {
     assert!(cloud_mcp_provider_matches_terminal_metadata(
         "OpenCode", &metadata
     ));
+}
+
+#[cfg(test)]
+mod agent_update_progress_tests {
+    use super::*;
+
+    #[test]
+    fn successful_update_stages_are_strictly_monotonic() {
+        let mut progress = agent_update_progress_begin(None, "codex", "1.0.0", "1.1.0", 100);
+        let mut emitted = vec![progress.clone()];
+        for (index, stage) in [
+            "queued",
+            "downloading",
+            "installing",
+            "verifying",
+            "complete",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            progress = agent_update_progress_transition(
+                &progress,
+                stage,
+                101 + index as u64,
+                None,
+                None,
+            );
+            emitted.push(progress.clone());
+        }
+        assert_eq!(
+            emitted
+                .iter()
+                .map(|progress| progress.stage.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "available",
+                "queued",
+                "downloading",
+                "installing",
+                "verifying",
+                "complete",
+            ]
+        );
+        assert!(emitted
+            .windows(2)
+            .all(|pair| pair[0].stage_seq < pair[1].stage_seq));
+    }
+
+    #[test]
+    fn failed_install_is_terminal_with_stage_and_reason() {
+        let available = agent_update_progress_begin(None, "claude", "1.0.0", "1.1.0", 100);
+        let installing = agent_update_progress_transition(
+            &available,
+            "installing",
+            101,
+            None,
+            None,
+        );
+        let failed = agent_update_progress_transition(
+            &installing,
+            "failed",
+            102,
+            Some("npm exited 1".to_string()),
+            Some("installing"),
+        );
+        assert_eq!(failed.stage, "failed");
+        assert_eq!(failed.failed_stage.as_deref(), Some("installing"));
+        assert_eq!(failed.error_reason.as_deref(), Some("npm exited 1"));
+        assert!(failed.stage_seq > installing.stage_seq);
+    }
+
+    #[test]
+    fn concurrent_update_triggers_coalesce_to_one_run() {
+        let provider = format!("coalesce-test-{}", uuid::Uuid::new_v4());
+        let run_count = AtomicUsize::new(0);
+        let first = cloud_mcp_try_begin_agent_update(&provider);
+        if first.is_some() {
+            run_count.fetch_add(1, Ordering::SeqCst);
+        }
+        let second = cloud_mcp_try_begin_agent_update(&provider);
+        if second.is_some() {
+            run_count.fetch_add(1, Ordering::SeqCst);
+        }
+        assert!(first.is_some());
+        assert!(second.is_none());
+        assert_eq!(run_count.load(Ordering::SeqCst), 1);
+        drop(first);
+        assert!(cloud_mcp_try_begin_agent_update(&provider).is_some());
+    }
+
+    #[test]
+    fn boot_reconcile_settles_stuck_installing_progress() {
+        let stuck = AgentUpdateProgress {
+            provider: "opencode".to_string(),
+            from_version: "1.0.0".to_string(),
+            to_version: "1.1.0".to_string(),
+            stage: "installing".to_string(),
+            stage_seq: 9,
+            started_at_ms: 100,
+            updated_at_ms: 110,
+            error_reason: None,
+            failed_stage: None,
+        };
+        let complete = agent_update_reconcile_progress(&stuck, Some("1.1.0"), None, 120);
+        assert_eq!(complete.stage, "complete");
+        assert_eq!(complete.stage_seq, 10);
+        let failed =
+            agent_update_reconcile_progress(&stuck, Some("1.0.0"), None, 121);
+        assert_eq!(failed.stage, "failed");
+        assert_eq!(failed.failed_stage.as_deref(), Some("installing"));
+        assert_eq!(failed.stage_seq, 10);
+    }
+
+    #[test]
+    fn update_registry_is_generic_for_supported_agent_definitions() {
+        for (provider, id, package) in [
+            (AgentProvider::Codex, "codex", "@openai/codex"),
+            (AgentProvider::Claude, "claude", "@anthropic-ai/claude-code"),
+            (AgentProvider::OpenCode, "opencode", "opencode-ai"),
+        ] {
+            let definition = agent_definition(provider);
+            assert_eq!(definition.id, id);
+            assert_eq!(definition.install_package, package);
+            assert!(definition.install_command.contains(package));
+            let progress = agent_update_progress_begin(None, id, "1.0.0", "1.1.0", 1);
+            assert_eq!(progress.provider, id);
+        }
+    }
+
+    #[test]
+    fn coding_agent_sanitizer_carries_progress_contract() {
+        for provider in ["codex", "claude", "opencode"] {
+            let sanitized = cloud_mcp_sanitize_coding_agent_status(&json!({
+                "id": provider,
+                "installed": true,
+                "update_stage": "verifying",
+                "update_stage_seq": 55,
+                "update_from_version": "1.0.0",
+                "update_to_version": "1.1.0",
+                "update_started_at_ms": 100,
+                "update_updated_at_ms": 200,
+                "update_error_reason": "",
+            }))
+            .expect("sanitized coding agent");
+            assert_eq!(sanitized["id"], json!(provider));
+            assert_eq!(sanitized["update_stage"], json!("verifying"));
+            assert_eq!(sanitized["update_stage_seq"], json!(55));
+            assert_eq!(sanitized["update_to_version"], json!("1.1.0"));
+        }
+    }
+
+    #[test]
+    fn installed_version_comparison_accepts_equal_or_newer_only() {
+        assert!(agent_version_is_at_least("1.2.3", "1.2.3"));
+        assert!(agent_version_is_at_least("cli 1.3.0", "1.2.9"));
+        assert!(!agent_version_is_at_least("1.2.2", "1.2.3"));
+        assert!(!agent_version_is_at_least("Detected", "1.2.3"));
+    }
+
+    #[test]
+    fn npm_retry_does_not_regress_or_duplicate_install_phases() {
+        let mut phases = AgentInstallProgressPhases::default();
+        let mut emitted = Vec::new();
+        for _attempt in 0..2 {
+            if phases.begin_downloading() {
+                emitted.push("downloading");
+            }
+            if phases.begin_installing() {
+                emitted.push("installing");
+            }
+        }
+        assert_eq!(emitted, vec!["downloading", "installing"]);
+    }
 }
 
 fn cloud_mcp_apply_remote_agent_lever(
@@ -21928,72 +22821,30 @@ fn cloud_mcp_apply_remote_agent_lever(
             .await;
             return;
         }
-        let update_lifecycle_guard = if action == "update" {
-            let lifecycle_lock = app.state::<TerminalState>().lifecycle_lock.clone();
-            let mut deferred_status_sent = false;
-            loop {
-                if app_shutdown_requested() {
+        if action == "update" {
+            let parsed_provider = match parse_agent_provider(&provider) {
+                Ok(provider) => provider,
+                Err(error) => {
                     let _ = cloud_mcp_send_remote_command_status_event(
                         &state,
                         &event,
-                        "cancelled",
-                        "Deferred agent update was cancelled because Diff Forge is shutting down.",
+                        "failed",
+                        &error,
                         None,
                     )
                     .await;
                     return;
                 }
-
-                let mut active_terminals =
-                    cloud_mcp_active_provider_terminal_labels(&app, &provider).await;
-                if active_terminals.is_empty() {
-                    // Terminal opens/relaunches take this same lifecycle lock. Hold
-                    // it from the final idle recheck through npm so a new provider
-                    // session cannot race the binary replacement.
-                    let guard = lifecycle_lock.clone().lock_owned().await;
-                    if app_shutdown_requested() {
-                        drop(guard);
-                        let _ = cloud_mcp_send_remote_command_status_event(
-                            &state,
-                            &event,
-                            "cancelled",
-                            "Deferred agent update was cancelled because Diff Forge is shutting down.",
-                            None,
-                        )
-                        .await;
-                        return;
-                    }
-                    active_terminals =
-                        cloud_mcp_active_provider_terminal_labels(&app, &provider).await;
-                    if active_terminals.is_empty() {
-                        break Some(guard);
-                    }
-                    drop(guard);
-                }
-
-                if !deferred_status_sent {
-                    let details = json!({
-                        "reason": "provider_in_use",
-                        "provider": provider.clone(),
-                        "active_terminal_count": active_terminals.len(),
-                        "active_terminals": active_terminals,
-                        "will_update_when_idle": true,
-                    });
-                    let _ = cloud_mcp_send_remote_command_status_event(
-                        &state,
-                        &event,
-                        "deferred",
-                        &format!("{provider} is in use — will update when idle."),
-                        Some(&details),
-                    )
-                    .await;
-                    deferred_status_sent = true;
-                }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-        } else {
-            None
-        };
+            };
+            let _ = cloud_mcp_execute_agent_update(
+                &app,
+                &state,
+                Some(&event),
+                parsed_provider,
+            )
+            .await;
+            return;
+        }
         let _ = cloud_mcp_send_remote_command_status_event(
             &state,
             &event,
@@ -22004,10 +22855,8 @@ fn cloud_mcp_apply_remote_agent_lever(
         .await;
         let result = match action.as_str() {
             "install" => install_agent(provider.clone()).await,
-            "update" => update_agent(provider.clone()).await,
             _ => uninstall_agent(provider.clone()).await,
         };
-        drop(update_lifecycle_guard);
         let (status, message) = match &result {
             Ok(outcome) => {
                 let succeeded = if action == "uninstall" {
@@ -37721,6 +38570,26 @@ fn cloud_mcp_sanitize_coding_agent_status(agent: &Value) -> Option<Value> {
         "updating": updating,
         "operation": operation,
         "package_status": package_status});
+    for field in [
+        "update_stage",
+        "update_from_version",
+        "update_to_version",
+        "update_error_reason",
+        "update_failed_stage",
+    ] {
+        if let Some(value) = cloud_mcp_payload_text(agent, &[field]) {
+            sanitized[field] = json!(value);
+        }
+    }
+    for field in [
+        "update_stage_seq",
+        "update_started_at_ms",
+        "update_updated_at_ms",
+    ] {
+        if let Some(value) = agent.get(field).and_then(Value::as_u64) {
+            sanitized[field] = json!(value);
+        }
+    }
     if matches!(id.as_str(), "codex" | "claude") {
         if let Some(catalog) = agent
             .get("model_catalog")
