@@ -6140,10 +6140,15 @@ function WorkspaceTerminal({
       forceFreshSessionOnNextOpenRef.current
       || Boolean(thread?.fresh_session_started_at && !threadProviderSessionId)
     );
+    // Capture the pending provider-session override for THIS start before the ref
+    // is cleared below (~line 6185); the terminal start/open diagnostics reference
+    // it after that clear. (Fixes ReferenceError "Can't find variable:
+    // providerSessionOverrideForThisStart" — it was used but never declared.)
+    const providerSessionOverrideForThisStart = providerSessionOverrideOnNextOpenRef.current;
     const sessionOpenBindingForThisStart = resolveTerminalSessionOpenBinding({
       forceFreshSession: requestedFreshSessionForThisStart,
       forkFromProviderSessionId: forkFromProviderSessionOnNextOpenRef.current,
-      providerSessionOverride: providerSessionOverrideOnNextOpenRef.current,
+      providerSessionOverride: providerSessionOverrideForThisStart,
       threadProviderSessionId,
     });
     const forceFreshSessionForThisStart = sessionOpenBindingForThisStart.fresh_session;
