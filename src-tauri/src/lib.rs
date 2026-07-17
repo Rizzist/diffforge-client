@@ -10301,6 +10301,7 @@ fn run_app(daemon: bool) {
             tray_click_settings_initialize(app.handle());
             cloud_mcp_register_sync_status_app(app.handle());
             let cloud_mcp_state = app.state::<CloudMcpState>().inner().clone();
+            cloud_mcp_start_browser_binding_loopback(cloud_mcp_state.clone());
             let cloud_mcp_app = app.handle().clone();
             if daemon {
                 // Install the remote-command consumer synchronously during

@@ -37,6 +37,14 @@ const CLOUD_MCP_DEVICE_LIVE_CATALOG_RETRY_MAX_MS: u64 = 2_000;
 const CLOUD_MCP_DEVICE_LIVE_CATALOG_RETRY_MAX_ATTEMPTS: usize = 8;
 const CLOUD_MCP_MAX_BEARER_TOKEN_LENGTH: usize = 8192;
 const CLOUD_MCP_RUST_CLIENT_ID: &str = "rust-diffforge-agent";
+const CLOUD_MCP_BROWSER_BIND_LOOPBACK_ADDR: &str = "127.0.0.1:17832";
+const CLOUD_MCP_BROWSER_BIND_LOOPBACK_PATH: &str = "/v1/browser-device-binding";
+const CLOUD_MCP_BROWSER_BIND_MAX_REQUEST_BYTES: usize = 16 * 1024;
+const CLOUD_MCP_BROWSER_BIND_MAX_IN_FLIGHT_PER_SOURCE: usize = 4;
+const CLOUD_MCP_BROWSER_BIND_MAX_PER_SECOND_PER_SOURCE: usize = 8;
+const CLOUD_MCP_BROWSER_BIND_HARD_MAX_IN_FLIGHT: usize = 64;
+const CLOUD_MCP_BROWSER_BIND_HARD_MAX_PER_SECOND: usize = 128;
+const CLOUD_MCP_BROWSER_BIND_CLAIM_DEBOUNCE_MS: u64 = 2_000;
 const CLOUD_MCP_DESKTOP_USER_AGENT: &str = "DiffForgeDesktop/0.1";
 const CLOUD_MCP_REMOTE_COMMAND_EVENT: &str = "cloud-mcp-remote-command";
 const CLOUD_MCP_DEVICE_DELETED_EVENT: &str = "cloud-mcp-device-deleted";
@@ -31985,6 +31993,404 @@ async fn cloud_mcp_ws_request(
     .await
 }
 
+fn cloud_mcp_browser_bind_allowed_origins() -> BTreeSet<String> {
+    let mut origins = BTreeSet::from([
+        "https://diffforge.ai".to_string(),
+        "https://www.diffforge.ai".to_string(),
+        "http://localhost:3000".to_string(),
+        "http://127.0.0.1:3000".to_string(),
+    ]);
+    if let Ok(login_url) = reqwest::Url::parse(&desktop_web_login_url_base()) {
+        let origin = login_url.origin().ascii_serialization();
+        if origin != "null" {
+            origins.insert(origin);
+        }
+    }
+    origins
+}
+
+fn cloud_mcp_browser_bind_http_header<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    headers.lines().skip(1).find_map(|line| {
+        let (header_name, value) = line.split_once(':')?;
+        header_name
+            .trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| value.trim())
+    })
+}
+
+fn cloud_mcp_browser_bind_allowed_origin(headers: &str) -> Result<String, String> {
+    let origin = cloud_mcp_browser_bind_http_header(headers, "origin")
+        .ok_or_else(|| "Loopback browser binding request omitted Origin.".to_string())?;
+    let parsed = reqwest::Url::parse(origin)
+        .map_err(|_| "Loopback browser binding Origin is invalid.".to_string())?;
+    let normalized = parsed.origin().ascii_serialization();
+    if normalized == "null"
+        || normalized != origin
+        || !cloud_mcp_browser_bind_allowed_origins().contains(&normalized)
+    {
+        return Err("Loopback browser binding Origin is not allowed.".to_string());
+    }
+    Ok(normalized)
+}
+
+fn cloud_mcp_browser_bind_http_response(
+    status: &str,
+    body: &Value,
+    allowed_origin: Option<&str>,
+) -> Vec<u8> {
+    let body = body.to_string();
+    let cors_headers = allowed_origin
+        .map(|origin| {
+            format!(
+                "Access-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nAccess-Control-Allow-Private-Network: true\r\nVary: Origin\r\n"
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{cors_headers}Cache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+#[derive(Debug)]
+enum CloudMcpBrowserBindHttpRequest {
+    Preflight { origin: String },
+    Forward { origin: String, payload: Value },
+}
+
+#[derive(Debug)]
+struct CloudMcpBrowserBindHttpError {
+    status: &'static str,
+    message: String,
+}
+
+fn cloud_mcp_browser_bind_http_request(
+    buffer: &[u8],
+) -> Result<CloudMcpBrowserBindHttpRequest, CloudMcpBrowserBindHttpError> {
+    let request = std::str::from_utf8(buffer)
+        .map_err(|_| CloudMcpBrowserBindHttpError {
+            status: "400 Bad Request",
+            message: "Loopback browser binding request is not valid UTF-8.".to_string(),
+        })?;
+    let header_end = request
+        .find("\r\n\r\n")
+        .ok_or_else(|| CloudMcpBrowserBindHttpError {
+            status: "400 Bad Request",
+            message: "Loopback browser binding request is incomplete.".to_string(),
+        })?;
+    let headers = &request[..header_end];
+    let request_line = headers.lines().next().unwrap_or_default();
+    let preflight = request_line
+        == format!("OPTIONS {CLOUD_MCP_BROWSER_BIND_LOOPBACK_PATH} HTTP/1.1");
+    let post =
+        request_line == format!("POST {CLOUD_MCP_BROWSER_BIND_LOOPBACK_PATH} HTTP/1.1");
+    if !preflight && !post {
+        return Err(CloudMcpBrowserBindHttpError {
+            status: "400 Bad Request",
+            message: "Loopback browser binding endpoint only accepts POST and OPTIONS."
+                .to_string(),
+        });
+    }
+    let origin = cloud_mcp_browser_bind_allowed_origin(headers).map_err(|message| {
+        CloudMcpBrowserBindHttpError {
+            status: "403 Forbidden",
+            message,
+        }
+    })?;
+    if preflight {
+        return Ok(CloudMcpBrowserBindHttpRequest::Preflight { origin });
+    }
+    let content_length = cloud_mcp_browser_bind_http_header(headers, "content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| CloudMcpBrowserBindHttpError {
+            status: "400 Bad Request",
+            message: "Loopback browser binding request omitted Content-Length.".to_string(),
+        })?;
+    if content_length == 0 || content_length > CLOUD_MCP_BROWSER_BIND_MAX_REQUEST_BYTES {
+        return Err(CloudMcpBrowserBindHttpError {
+            status: "400 Bad Request",
+            message: "Loopback browser binding request body size is invalid.".to_string(),
+        });
+    }
+    let body = request.as_bytes().get(header_end + 4..).unwrap_or_default();
+    if body.len() != content_length {
+        return Err(CloudMcpBrowserBindHttpError {
+            status: "400 Bad Request",
+            message: "Loopback browser binding request body is incomplete.".to_string(),
+        });
+    }
+    let payload: Value =
+        serde_json::from_slice(body).map_err(|_| CloudMcpBrowserBindHttpError {
+            status: "400 Bad Request",
+            message: "Loopback browser binding request body is invalid JSON.".to_string(),
+        })?;
+    let claim = cloud_mcp_payload_text(&payload, &["claim", "binding_claim"])
+        .filter(|value| value.len() <= 256)
+        .ok_or_else(|| CloudMcpBrowserBindHttpError {
+            status: "400 Bad Request",
+            message: "Loopback browser binding request omitted its claim.".to_string(),
+        })?;
+    let web_device_id = cloud_mcp_payload_text(&payload, &["web_device_id", "webDeviceId"])
+        .filter(|value| value.len() <= 512)
+        .ok_or_else(|| CloudMcpBrowserBindHttpError {
+            status: "400 Bad Request",
+            message: "Loopback browser binding request omitted its web device id.".to_string(),
+        })?;
+    Ok(CloudMcpBrowserBindHttpRequest::Forward {
+        origin,
+        payload: json!({
+            "claim": claim,
+            "web_device_id": web_device_id,
+        }),
+    })
+}
+
+#[derive(Debug, Default)]
+struct CloudMcpBrowserBindLimiter {
+    in_flight: usize,
+    in_flight_by_source: HashMap<String, usize>,
+    recent_started: VecDeque<Instant>,
+    recent_started_by_source: HashMap<String, VecDeque<Instant>>,
+    recent_claims: HashMap<String, Instant>,
+}
+
+impl CloudMcpBrowserBindLimiter {
+    fn try_start(
+        limiter: &Arc<StdMutex<Self>>,
+        payload: &Value,
+    ) -> Result<Option<CloudMcpBrowserBindPermit>, &'static str> {
+        let claim = cloud_mcp_payload_text(payload, &["claim"])
+            .ok_or("Loopback browser binding claim is missing.")?;
+        let source = cloud_mcp_payload_text(payload, &["web_device_id"])
+            .ok_or("Loopback browser binding web device id is missing.")?;
+        let now = Instant::now();
+        let mut current = limiter
+            .lock()
+            .map_err(|_| "Loopback browser binding limiter is unavailable.")?;
+        current
+            .recent_started
+            .retain(|started| now.duration_since(*started) < Duration::from_secs(1));
+        current.recent_claims.retain(|_, started| {
+            now.duration_since(*started)
+                < Duration::from_millis(CLOUD_MCP_BROWSER_BIND_CLAIM_DEBOUNCE_MS)
+        });
+        current.recent_started_by_source.retain(|_, started| {
+            started.retain(|started| now.duration_since(*started) < Duration::from_secs(1));
+            !started.is_empty()
+        });
+        current
+            .in_flight_by_source
+            .retain(|_, in_flight| *in_flight > 0);
+
+        // Browser retries for an already-forwarded claim are successful no-ops. Checking this
+        // before every capacity gate prevents a single retrying claim from consuming shared
+        // headroom or receiving a misleading 429 while its first forward is still in progress.
+        if current.recent_claims.contains_key(&claim) {
+            return Ok(None);
+        }
+
+        let source_in_flight = current
+            .in_flight_by_source
+            .get(&source)
+            .copied()
+            .unwrap_or_default();
+        let source_recent_started = current
+            .recent_started_by_source
+            .get(&source)
+            .map(VecDeque::len)
+            .unwrap_or_default();
+        if source_in_flight >= CLOUD_MCP_BROWSER_BIND_MAX_IN_FLIGHT_PER_SOURCE
+            || source_recent_started >= CLOUD_MCP_BROWSER_BIND_MAX_PER_SECOND_PER_SOURCE
+        {
+            return Err("Loopback browser binding relay is busy for this browser identity.");
+        }
+        // The per-source limits provide ordinary fairness. These deliberately higher process
+        // ceilings are only a backstop for clients that rotate untrusted browser identities.
+        if current.in_flight >= CLOUD_MCP_BROWSER_BIND_HARD_MAX_IN_FLIGHT
+            || current.recent_started.len() >= CLOUD_MCP_BROWSER_BIND_HARD_MAX_PER_SECOND
+        {
+            return Err("Loopback browser binding relay reached its emergency capacity.");
+        }
+        current.in_flight += 1;
+        *current
+            .in_flight_by_source
+            .entry(source.clone())
+            .or_default() += 1;
+        current.recent_started.push_back(now);
+        current
+            .recent_started_by_source
+            .entry(source.clone())
+            .or_default()
+            .push_back(now);
+        current.recent_claims.insert(claim, now);
+        drop(current);
+        Ok(Some(CloudMcpBrowserBindPermit {
+            limiter: Arc::clone(limiter),
+            source,
+        }))
+    }
+}
+
+struct CloudMcpBrowserBindPermit {
+    limiter: Arc<StdMutex<CloudMcpBrowserBindLimiter>>,
+    source: String,
+}
+
+impl Drop for CloudMcpBrowserBindPermit {
+    fn drop(&mut self) {
+        let mut limiter = match self.limiter.lock() {
+            Ok(limiter) => limiter,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        limiter.in_flight = limiter.in_flight.saturating_sub(1);
+        if let Some(in_flight) = limiter.in_flight_by_source.get_mut(&self.source) {
+            *in_flight = in_flight.saturating_sub(1);
+            if *in_flight == 0 {
+                limiter.in_flight_by_source.remove(&self.source);
+            }
+        }
+    }
+}
+
+async fn cloud_mcp_browser_bind_read_request(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 2048];
+    loop {
+        let read = timeout(Duration::from_secs(2), stream.read(&mut chunk))
+            .await
+            .map_err(|_| "Loopback browser binding request timed out.".to_string())?
+            .map_err(|error| format!("Unable to read loopback browser binding request: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..read]);
+        if request.len() > CLOUD_MCP_BROWSER_BIND_MAX_REQUEST_BYTES {
+            return Err("Loopback browser binding request is too large.".to_string());
+        }
+        if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header_text = std::str::from_utf8(&request[..header_end])
+                .map_err(|_| "Loopback browser binding headers are invalid.".to_string())?;
+            let content_length = header_text.lines().skip(1).find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            });
+            let expected = header_end + 4 + content_length.unwrap_or(0);
+            if request.len() >= expected {
+                request.truncate(expected);
+                break;
+            }
+        }
+    }
+    Ok(request)
+}
+
+async fn cloud_mcp_browser_bind_forward(state: CloudMcpState, payload: Value) {
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let Some(native_device_id) = cloud_mcp_payload_text(&device_profile, &["device_id"])
+    else {
+        return;
+    };
+    let request = json!({
+        "claim": payload["claim"],
+        "current_web_device_id": payload["web_device_id"],
+        "native_device_id": native_device_id,
+        "proof_kind": "loopback_rendezvous",
+        "source": "rust-diffforge-loopback",
+        "web_device_id": payload["web_device_id"],
+    });
+    let _ = cloud_mcp_ws_request(&state, "device_bind_web_presence", &request).await;
+}
+
+async fn cloud_mcp_browser_bind_handle_connection(
+    state: CloudMcpState,
+    limiter: Arc<StdMutex<CloudMcpBrowserBindLimiter>>,
+    mut stream: TcpStream,
+) {
+    let response = match stream.peer_addr() {
+        Ok(peer) if peer.ip().is_loopback() => match cloud_mcp_browser_bind_read_request(&mut stream).await {
+            Ok(request) => match cloud_mcp_browser_bind_http_request(&request) {
+                Ok(CloudMcpBrowserBindHttpRequest::Preflight { origin }) => {
+                    cloud_mcp_browser_bind_http_response("204 No Content", &json!({}), Some(&origin))
+                }
+                Ok(CloudMcpBrowserBindHttpRequest::Forward { origin, payload }) => {
+                    match CloudMcpBrowserBindLimiter::try_start(&limiter, &payload) {
+                        Ok(Some(permit)) => {
+                            tauri::async_runtime::spawn(async move {
+                                let _permit = permit;
+                                cloud_mcp_browser_bind_forward(state, payload).await;
+                            });
+                            cloud_mcp_browser_bind_http_response(
+                                "202 Accepted",
+                                &json!({"accepted": true, "loopback": true}),
+                                Some(&origin),
+                            )
+                        }
+                        Ok(None) => cloud_mcp_browser_bind_http_response(
+                            "202 Accepted",
+                            &json!({
+                                "accepted": true,
+                                "deduplicated": true,
+                                "loopback": true,
+                            }),
+                            Some(&origin),
+                        ),
+                        Err(error) => cloud_mcp_browser_bind_http_response(
+                            "429 Too Many Requests",
+                            &json!({"accepted": false, "error": error}),
+                            Some(&origin),
+                        ),
+                    }
+                }
+                Err(error) => cloud_mcp_browser_bind_http_response(
+                    error.status,
+                    &json!({"accepted": false, "error": error.message}),
+                    None,
+                ),
+            },
+            Err(error) => cloud_mcp_browser_bind_http_response(
+                "400 Bad Request",
+                &json!({"accepted": false, "error": error}),
+                None,
+            ),
+        },
+        _ => cloud_mcp_browser_bind_http_response(
+            "403 Forbidden",
+            &json!({"accepted": false, "error": "Loopback access is required."}),
+            None,
+        ),
+    };
+    let _ = stream.write_all(&response).await;
+    let _ = stream.shutdown().await;
+}
+
+pub(crate) fn cloud_mcp_start_browser_binding_loopback(state: CloudMcpState) {
+    tauri::async_runtime::spawn(async move {
+        let listener = match TcpListener::bind(CLOUD_MCP_BROWSER_BIND_LOOPBACK_ADDR).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("diffforge: unable to start browser binding loopback endpoint: {error}");
+                return;
+            }
+        };
+        let limiter = Arc::new(StdMutex::new(CloudMcpBrowserBindLimiter::default()));
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+            tauri::async_runtime::spawn(cloud_mcp_browser_bind_handle_connection(
+                state.clone(),
+                Arc::clone(&limiter),
+                stream,
+            ));
+        }
+    });
+}
+
 async fn cloud_mcp_ws_request_with_timeout(
     state: &CloudMcpState,
     request_kind: &str,
@@ -61991,6 +62397,360 @@ mod cloud_mcp_tests {
     use super::*;
 
     static CLOUD_MCP_TEST_ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+
+    #[test]
+    fn browser_binding_loopback_accepts_only_claim_and_web_identity() {
+        let body = json!({
+            "claim": "opaque-one-use-claim",
+            "web_device_id": "web-browser-w",
+            "hostname": "must-not-be-used",
+            "native_device_id": "must-not-be-trusted",
+        })
+        .to_string();
+        let request = format!(
+            "POST {CLOUD_MCP_BROWSER_BIND_LOOPBACK_PATH} HTTP/1.1\r\nHost: {CLOUD_MCP_BROWSER_BIND_LOOPBACK_ADDR}\r\nOrigin: https://diffforge.ai\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let CloudMcpBrowserBindHttpRequest::Forward { origin, payload } =
+            cloud_mcp_browser_bind_http_request(request.as_bytes()).unwrap()
+        else {
+            panic!("allowlisted POST must forward");
+        };
+        assert_eq!(origin, "https://diffforge.ai");
+        let parsed = payload;
+        assert_eq!(parsed["claim"], json!("opaque-one-use-claim"));
+        assert_eq!(parsed["web_device_id"], json!("web-browser-w"));
+        assert!(parsed.get("hostname").is_none());
+        assert!(parsed.get("native_device_id").is_none());
+    }
+
+    #[test]
+    fn browser_binding_loopback_rejects_non_post_and_oversized_claims() {
+        let get_request = format!(
+            "GET {CLOUD_MCP_BROWSER_BIND_LOOPBACK_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        );
+        assert!(cloud_mcp_browser_bind_http_request(get_request.as_bytes()).is_err());
+
+        let body = json!({
+            "claim": "x".repeat(257),
+            "web_device_id": "web-browser-w",
+        })
+        .to_string();
+        let request = format!(
+            "POST {CLOUD_MCP_BROWSER_BIND_LOOPBACK_PATH} HTTP/1.1\r\nOrigin: https://diffforge.ai\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert!(cloud_mcp_browser_bind_http_request(request.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn browser_binding_loopback_rejects_bad_origin_before_forwarding() {
+        let body = json!({
+            "claim": "opaque-claim",
+            "web_device_id": "web-browser-w",
+        })
+        .to_string();
+        let request = format!(
+            "POST {CLOUD_MCP_BROWSER_BIND_LOOPBACK_PATH} HTTP/1.1\r\nOrigin: https://evil.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let error = cloud_mcp_browser_bind_http_request(request.as_bytes()).unwrap_err();
+        assert_eq!(error.status, "403 Forbidden");
+
+        let response = cloud_mcp_browser_bind_http_response(
+            error.status,
+            &json!({"accepted": false}),
+            None,
+        );
+        let response = String::from_utf8(response).unwrap();
+        assert!(!response.contains("Access-Control-Allow-Origin"));
+    }
+
+    #[test]
+    fn browser_binding_loopback_rejects_bad_origin_preflight() {
+        let request = format!(
+            "OPTIONS {CLOUD_MCP_BROWSER_BIND_LOOPBACK_PATH} HTTP/1.1\r\nOrigin: https://evil.example\r\nAccess-Control-Request-Method: POST\r\n\r\n"
+        );
+        let error = cloud_mcp_browser_bind_http_request(request.as_bytes()).unwrap_err();
+        assert_eq!(error.status, "403 Forbidden");
+    }
+
+    #[test]
+    fn browser_binding_loopback_allows_dashboard_preflight_with_exact_cors() {
+        let request = format!(
+            "OPTIONS {CLOUD_MCP_BROWSER_BIND_LOOPBACK_PATH} HTTP/1.1\r\nOrigin: http://localhost:3000\r\nAccess-Control-Request-Method: POST\r\n\r\n"
+        );
+        let CloudMcpBrowserBindHttpRequest::Preflight { origin } =
+            cloud_mcp_browser_bind_http_request(request.as_bytes()).unwrap()
+        else {
+            panic!("allowlisted OPTIONS must be accepted");
+        };
+        let response = cloud_mcp_browser_bind_http_response(
+            "204 No Content",
+            &json!({}),
+            Some(&origin),
+        );
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.contains("Access-Control-Allow-Origin: http://localhost:3000\r\n"));
+        assert!(!response.contains("Access-Control-Allow-Origin: *"));
+    }
+
+    #[test]
+    fn browser_binding_loopback_debounces_repeated_claim_without_reforwarding() {
+        let limiter = Arc::new(StdMutex::new(CloudMcpBrowserBindLimiter::default()));
+        let payload = json!({
+            "claim": "claim-debounce",
+            "web_device_id": "web-debounce",
+        });
+        let mut forwarded = 0;
+        let first = CloudMcpBrowserBindLimiter::try_start(&limiter, &payload)
+            .unwrap()
+            .expect("first-seen claim must be forwarded");
+        forwarded += 1;
+        for _ in 0..32 {
+            let duplicate = CloudMcpBrowserBindLimiter::try_start(&limiter, &payload).unwrap();
+            if duplicate.is_some() {
+                forwarded += 1;
+            }
+        }
+        assert_eq!(forwarded, 1);
+        assert_eq!(limiter.lock().unwrap().in_flight, 1);
+        drop(first);
+        let current = limiter.lock().unwrap();
+        assert_eq!(current.in_flight, 0);
+        assert!(current.in_flight_by_source.is_empty());
+    }
+
+    #[test]
+    fn browser_binding_loopback_flood_does_not_starve_distinct_honest_source() {
+        let limiter = Arc::new(StdMutex::new(CloudMcpBrowserBindLimiter::default()));
+        let repeated_payload = json!({
+            "claim": "attacker-repeated-claim",
+            "web_device_id": "web-attacker",
+        });
+        let mut attacker_permits = vec![CloudMcpBrowserBindLimiter::try_start(
+            &limiter,
+            &repeated_payload,
+        )
+        .unwrap()
+        .expect("the attacker's first claim may use its own budget")];
+        for _ in 0..32 {
+            assert!(CloudMcpBrowserBindLimiter::try_start(&limiter, &repeated_payload)
+                .unwrap()
+                .is_none());
+        }
+        for index in 1..CLOUD_MCP_BROWSER_BIND_MAX_IN_FLIGHT_PER_SOURCE {
+            attacker_permits.push(
+                CloudMcpBrowserBindLimiter::try_start(
+                    &limiter,
+                    &json!({
+                        "claim": format!("attacker-distinct-{index}"),
+                        "web_device_id": "web-attacker",
+                    }),
+                )
+                .unwrap()
+                .expect("attacker traffic may fill only its own in-flight budget"),
+            );
+        }
+        assert!(CloudMcpBrowserBindLimiter::try_start(&limiter, &repeated_payload)
+            .unwrap()
+            .is_none());
+        for index in 0..32 {
+            assert!(CloudMcpBrowserBindLimiter::try_start(
+                &limiter,
+                &json!({
+                    "claim": format!("attacker-garbage-{index}"),
+                    "web_device_id": "web-attacker",
+                }),
+            )
+            .is_err());
+        }
+
+        let honest_permit = CloudMcpBrowserBindLimiter::try_start(
+            &limiter,
+            &json!({
+                "claim": "honest-first-seen-claim",
+                "web_device_id": "web-honest",
+            }),
+        )
+        .unwrap()
+        .expect("an unrelated first-seen claim must still be forwarded");
+        assert_eq!(
+            limiter.lock().unwrap().in_flight,
+            CLOUD_MCP_BROWSER_BIND_MAX_IN_FLIGHT_PER_SOURCE + 1
+        );
+
+        drop(honest_permit);
+        drop(attacker_permits);
+        {
+            let current = limiter.lock().unwrap();
+            assert_eq!(current.in_flight, 0);
+            assert!(current.in_flight_by_source.is_empty());
+        }
+
+        // Releasing permits lets a flood continue until the source rate budget is exhausted.
+        // That source-local rejection must still leave an unrelated browser identity's budget
+        // untouched.
+        for index in CLOUD_MCP_BROWSER_BIND_MAX_IN_FLIGHT_PER_SOURCE
+            ..CLOUD_MCP_BROWSER_BIND_MAX_PER_SECOND_PER_SOURCE
+        {
+            let permit = CloudMcpBrowserBindLimiter::try_start(
+                &limiter,
+                &json!({
+                    "claim": format!("attacker-rate-garbage-{index}"),
+                    "web_device_id": "web-attacker",
+                }),
+            )
+            .unwrap()
+            .expect("attacker traffic below its source rate budget may be forwarded");
+            drop(permit);
+        }
+        for index in 0..32 {
+            assert!(CloudMcpBrowserBindLimiter::try_start(
+                &limiter,
+                &json!({
+                    "claim": format!("attacker-rate-overflow-{index}"),
+                    "web_device_id": "web-attacker",
+                }),
+            )
+            .is_err());
+        }
+        let honest_rate_permit = CloudMcpBrowserBindLimiter::try_start(
+            &limiter,
+            &json!({
+                "claim": "honest-first-seen-during-rate-flood",
+                "web_device_id": "web-honest",
+            }),
+        )
+        .unwrap()
+        .expect("a source-local rate flood must not reject an unrelated first-seen claim");
+        drop(honest_rate_permit);
+        let current = limiter.lock().unwrap();
+        assert_eq!(current.in_flight, 0);
+        assert!(current.in_flight_by_source.is_empty());
+    }
+
+    #[test]
+    fn browser_binding_loopback_hard_cap_bounds_rotating_sources() {
+        let limiter = Arc::new(StdMutex::new(CloudMcpBrowserBindLimiter::default()));
+        let mut permits = Vec::new();
+        for index in 0..CLOUD_MCP_BROWSER_BIND_HARD_MAX_IN_FLIGHT {
+            permits.push(
+                CloudMcpBrowserBindLimiter::try_start(
+                    &limiter,
+                    &json!({
+                        "claim": format!("rotating-claim-{index}"),
+                        "web_device_id": format!("rotating-web-{index}"),
+                    }),
+                )
+                .unwrap()
+                .expect("traffic below the emergency ceiling must be forwarded"),
+            );
+        }
+        assert!(CloudMcpBrowserBindLimiter::try_start(
+            &limiter,
+            &json!({
+                "claim": "rotating-over-cap",
+                "web_device_id": "rotating-web-over-cap",
+            }),
+        )
+        .is_err());
+        assert_eq!(
+            limiter.lock().unwrap().in_flight,
+            CLOUD_MCP_BROWSER_BIND_HARD_MAX_IN_FLIGHT
+        );
+        drop(permits);
+        assert_eq!(limiter.lock().unwrap().in_flight, 0);
+    }
+
+    #[test]
+    fn browser_binding_loopback_permit_releases_on_success_error_early_return_and_panic() {
+        fn assert_no_permit_leak(limiter: &Arc<StdMutex<CloudMcpBrowserBindLimiter>>) {
+            let current = limiter.lock().unwrap();
+            assert_eq!(current.in_flight, 0);
+            assert!(current.in_flight_by_source.is_empty());
+        }
+
+        fn return_early(limiter: &Arc<StdMutex<CloudMcpBrowserBindLimiter>>) {
+            let _permit = CloudMcpBrowserBindLimiter::try_start(
+                limiter,
+                &json!({
+                    "claim": "early-return-claim",
+                    "web_device_id": "early-return-web",
+                }),
+            )
+            .unwrap()
+            .expect("first-seen early-return claim must receive a permit");
+        }
+
+        fn return_error(
+            limiter: &Arc<StdMutex<CloudMcpBrowserBindLimiter>>,
+        ) -> Result<(), &'static str> {
+            let _permit = CloudMcpBrowserBindLimiter::try_start(
+                limiter,
+                &json!({
+                    "claim": "error-return-claim",
+                    "web_device_id": "error-return-web",
+                }),
+            )?
+            .ok_or("first-seen error-return claim was unexpectedly deduplicated")?;
+            Err("simulated forwarding error")
+        }
+
+        let limiter = Arc::new(StdMutex::new(CloudMcpBrowserBindLimiter::default()));
+        {
+            let _honest_permit = CloudMcpBrowserBindLimiter::try_start(
+                &limiter,
+                &json!({
+                    "claim": "honest-release-claim",
+                    "web_device_id": "honest-release-web",
+                }),
+            )
+            .unwrap()
+            .expect("honest claim must receive a permit");
+            let current = limiter.lock().unwrap();
+            assert_eq!(current.in_flight, 1);
+            assert_eq!(
+                current.in_flight_by_source.get("honest-release-web"),
+                Some(&1)
+            );
+        }
+        assert_no_permit_leak(&limiter);
+
+        return_early(&limiter);
+        assert_no_permit_leak(&limiter);
+
+        assert_eq!(return_error(&limiter), Err("simulated forwarding error"));
+        assert_no_permit_leak(&limiter);
+
+        assert!(CloudMcpBrowserBindLimiter::try_start(
+            &limiter,
+            &json!({"claim": "missing-source"}),
+        )
+        .is_err());
+        assert_no_permit_leak(&limiter);
+
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _permit = CloudMcpBrowserBindLimiter::try_start(
+                &limiter,
+                &json!({
+                    "claim": "panic-release-claim",
+                    "web_device_id": "panic-release-web",
+                }),
+            )
+            .unwrap()
+            .expect("panic-path claim must receive a permit");
+            panic!("simulated forwarding panic");
+        }));
+        assert!(panic_result.is_err());
+        assert_no_permit_leak(&limiter);
+
+        drop(CloudMcpBrowserBindPermit {
+            limiter: Arc::clone(&limiter),
+            source: "already-released-source".to_string(),
+        });
+        assert_no_permit_leak(&limiter);
+    }
 
     #[test]
     fn websocket_reconnect_parks_desktop_but_retries_daemon_indefinitely() {
