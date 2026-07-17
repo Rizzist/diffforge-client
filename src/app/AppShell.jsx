@@ -92,6 +92,8 @@ import {
   normalizeCreditWallet,
 } from "../tokenomics/tokenomicsFormat.js";
 import {
+  recordRestartedProviderTerminalClaim,
+  registerStaleTerminalLivePresence,
   restartStaleProviderTerminalsAcrossWorkspaces as restartProviderTerminalRows,
 } from "../tokenomics/providerTerminalRestart.js";
 import {
@@ -110,6 +112,7 @@ import {
 } from "../terminals/permissionModeAutomation.js";
 import {
   TERMINAL_SESSION_RESTART_MODES,
+  TERMINAL_SESSION_RESTART_RESULT_EVENT,
   normalizeTerminalSessionRestartMode,
   requestTerminalSessionRestart,
   resolveTerminalSessionRestartRole,
@@ -46183,6 +46186,59 @@ export default function App() {
     removeAccountRestartListener = () => {
       window.removeEventListener("diffforge:restart-stale-provider-terminals", handleAccountRestartRequest);
     };
+    // The tokenomics "needs restart" roster is reconciled against the CURRENT
+    // frontend terminal set: a backend stamp whose pane no longer exists in
+    // the workspace (closed pane, phantom index, app-control leak) must not
+    // keep a badge alive. Unknown workspace snapshots fail open so genuinely
+    // stale terminals in not-yet-hydrated workspaces never flicker out.
+    const releaseStaleTerminalPresence = registerStaleTerminalLivePresence(
+      ({ paneId, terminalIndex, workspaceId }) => {
+        const { presenceWorkspace, terminal } = findRemoteControlTerminal(workspaceId, {
+          target_terminal_id: paneId,
+          target_terminal_index: Number.isInteger(terminalIndex) ? terminalIndex : null,
+        });
+        if (!presenceWorkspace) {
+          return null;
+        }
+        if (!terminal) {
+          return false;
+        }
+        return String(terminal?.terminal_lifecycle || "").trim().toLowerCase() !== "closed";
+      },
+    );
+    // Any completed terminal restart adopts the account active at launch. If
+    // the pane's stale claim SURVIVES the restart (its launch stamp was never
+    // rewritten), record it as serviced so the tokenomics badge clears and
+    // the bulk "Restart N idle" flow cannot resurrect it.
+    const staleLedgerTimers = new Set();
+    const handleRestartResultForStaleLedger = (event) => {
+      const result = event?.detail || {};
+      if (String(result?.status || "") !== "completed") {
+        return;
+      }
+      const paneId = String(result?.pane_id || "").trim();
+      if (!paneId) {
+        return;
+      }
+      const timer = window.setTimeout(() => {
+        staleLedgerTimers.delete(timer);
+        if (disposed) {
+          return;
+        }
+        invoke("agent_accounts_pane_profiles").then((paneProfiles) => {
+          const rows = Array.isArray(paneProfiles?.stale_inventory)
+            ? paneProfiles.stale_inventory
+            : [];
+          rows.forEach((row) => {
+            if (String(row?.pane_id || "").trim() === paneId) {
+              recordRestartedProviderTerminalClaim(row);
+            }
+          });
+        }).catch(() => {});
+      }, 1500);
+      staleLedgerTimers.add(timer);
+    };
+    window.addEventListener(TERMINAL_SESSION_RESTART_RESULT_EVENT, handleRestartResultForStaleLedger);
     startRemoteCommandListener();
     return () => {
       disposed = true;
@@ -46198,6 +46254,10 @@ export default function App() {
       if (typeof removeAccountRestartListener === "function") {
         removeAccountRestartListener();
       }
+      releaseStaleTerminalPresence();
+      window.removeEventListener(TERMINAL_SESSION_RESTART_RESULT_EVENT, handleRestartResultForStaleLedger);
+      staleLedgerTimers.forEach((timer) => window.clearTimeout(timer));
+      staleLedgerTimers.clear();
     };
   }, [activateWorkspace, activeAccountScopeKey, addWorkspaceTerminal, agentStatuses, changeWorkspaceTerminalRole, closeWorkspaceTerminal, deactivateWorkspace, deleteWorkspaceFromForge, ensureWorkspaceActivated, enterLoopspacesMode, logout, loopspaces, manageWorkspaceAgents, refreshAgentStatuses, requestWorkspaceActivation, requestWorkspaceTerminalFocus, rustTerminalAuthorityOrchestrators, selectLoopspaceFromRail, showView, syncAgentInstallationsToCloud, workspaces]);
 

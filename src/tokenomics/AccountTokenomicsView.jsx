@@ -53,8 +53,13 @@ import {
   tokenomicsRowReferencesRemovedProfile,
 } from "./tokenomicsAccountRoster.js";
 import {
+  reconcileProviderTerminalStaleRows,
+  recordRestartedProviderTerminalClaim,
+} from "./providerTerminalRestart.js";
+import {
   TERMINAL_SESSION_RESTART_MODES,
   TERMINAL_SESSION_RESTART_REQUEST_EVENT,
+  TERMINAL_SESSION_RESTART_RESULT_EVENT,
   createTerminalSessionRestartCoordinatorId,
 } from "../terminals/terminalSessionRestart.js";
 
@@ -601,8 +606,10 @@ function AgentAccountsManager({ active = true }) {
   const [actionError, setActionError] = useState("");
   const [loginPendingKind, setLoginPendingKind] = useState("");
   const loginPendingRef = useRef("");
+  const staleInventoryRef = useRef([]);
   const confirmDeleteTimerRef = useRef(null);
   const loginPendingTimerRef = useRef(null);
+  const restartResultRefreshTimerRef = useRef(null);
 
   const refresh = useCallback(() => {
     Promise.all([
@@ -610,7 +617,14 @@ function AgentAccountsManager({ active = true }) {
       invoke("agent_accounts_pane_profiles").catch(() => null),
     ]).then(([state, panes]) => {
       setAccounts(state?.agents || null);
-      setStaleInventory(Array.isArray(panes?.stale_inventory) ? panes.stale_inventory : []);
+      // Reconcile against the current frontend terminal set + the completed
+      // restart ledger: phantom panes and already-restarted claims must not
+      // resurrect "needs restart" badges from a stale backend stamp.
+      const reconciled = reconcileProviderTerminalStaleRows(
+        Array.isArray(panes?.stale_inventory) ? panes.stale_inventory : [],
+      );
+      staleInventoryRef.current = reconciled;
+      setStaleInventory(reconciled);
     }).catch(() => {});
   }, []);
 
@@ -639,9 +653,47 @@ function AgentAccountsManager({ active = true }) {
       }
       unlisten = next;
     }).catch(() => {});
+    // A completed restart (from ANY entry point: this panel, the bulk
+    // "Restart N idle" flow, or the terminal's own restart menu) adopts the
+    // active account. Record the pane's current stale claims as serviced so
+    // the badge clears immediately and cannot be resurrected by a stale
+    // backend stamp, then re-poll once the replacement stamp settles.
+    const handleRestartResult = (event) => {
+      const result = event?.detail || {};
+      if (cancelled || String(result?.status || "") !== "completed") {
+        return;
+      }
+      const paneId = String(result?.pane_id || "").trim();
+      if (!paneId) {
+        return;
+      }
+      (staleInventoryRef.current || []).forEach((row) => {
+        if (String(row?.pane_id || "").trim() === paneId) {
+          recordRestartedProviderTerminalClaim(row);
+        }
+      });
+      const reconciled = reconcileProviderTerminalStaleRows(staleInventoryRef.current);
+      staleInventoryRef.current = reconciled;
+      setStaleInventory(reconciled);
+      if (restartResultRefreshTimerRef.current) {
+        window.clearTimeout(restartResultRefreshTimerRef.current);
+      }
+      restartResultRefreshTimerRef.current = window.setTimeout(() => {
+        restartResultRefreshTimerRef.current = null;
+        if (!cancelled) {
+          refresh();
+        }
+      }, 1200);
+    };
+    window.addEventListener(TERMINAL_SESSION_RESTART_RESULT_EVENT, handleRestartResult);
     return () => {
       cancelled = true;
       window.clearInterval(interval);
+      window.removeEventListener(TERMINAL_SESSION_RESTART_RESULT_EVENT, handleRestartResult);
+      if (restartResultRefreshTimerRef.current) {
+        window.clearTimeout(restartResultRefreshTimerRef.current);
+        restartResultRefreshTimerRef.current = null;
+      }
       if (confirmDeleteTimerRef.current) {
         window.clearTimeout(confirmDeleteTimerRef.current);
       }
