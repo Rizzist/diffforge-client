@@ -35341,7 +35341,9 @@ notifications = true
         assert!(resolved.turn_active);
         let mut after_resolution = active.clone();
         after_resolution.canonical_state = resolved.canonical_state;
+        after_resolution.canonical_badge_label = resolved.canonical_badge_label;
         after_resolution.canonical_state_seq = resolved.canonical_state_seq;
+        after_resolution.prompt_state_seq = resolved.prompt_state_seq;
         after_resolution.turn_generation = resolved.turn_generation;
         after_resolution.completed_turn_generation = resolved.completed_turn_generation;
         after_resolution.turn_active = resolved.turn_active;
@@ -35354,10 +35356,97 @@ notifications = true
         assert!(terminal_runtime_snapshot_has_unsettled_turn(
             &after_resolution
         ));
+
+        let mut tool_output = terminal_activity_hook_test_payload(
+            "provider-tool-completed",
+            "tool_completed",
+            "running",
+            false,
+            Some("session-a"),
+        );
+        tool_output.hook_event_name = "PostToolUse".to_string();
+        tool_output.turn_generation = after_resolution.turn_generation;
+        let after_tool_projection = terminal_reduce_canonical_state(
+            &after_resolution,
+            &tool_output,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(after_tool_projection.canonical_state, "thinking");
+        assert_eq!(
+            after_tool_projection.prompt_state_seq,
+            active.prompt_state_seq + 1
+        );
+        assert!(after_tool_projection.active_interaction_id.is_none());
+        assert!(after_tool_projection.active_interaction_revision.is_none());
+
+        let mut after_tool = after_resolution.clone();
+        after_tool.canonical_state = after_tool_projection.canonical_state;
+        after_tool.canonical_badge_label = after_tool_projection.canonical_badge_label;
+        after_tool.canonical_state_seq = after_tool_projection.canonical_state_seq;
+        after_tool.prompt_state_seq = after_tool_projection.prompt_state_seq;
+        after_tool.turn_generation = after_tool_projection.turn_generation;
+        after_tool.completed_turn_generation = after_tool_projection.completed_turn_generation;
+        after_tool.turn_active = after_tool_projection.turn_active;
+        after_tool.active_interaction_id = after_tool_projection.active_interaction_id;
+        after_tool.active_interaction_revision =
+            after_tool_projection.active_interaction_revision;
         let settled_after_resolution =
-            terminal_reduce_canonical_state(&after_resolution, &stop, None, false, false);
+            terminal_reduce_canonical_state(&after_tool, &stop, None, false, false);
         assert!(settled_after_resolution.completion_accepted);
         assert_eq!(settled_after_resolution.canonical_state, "idle");
+        assert!(!settled_after_resolution.turn_active);
+        assert!(settled_after_resolution.active_interaction_id.is_none());
+
+        let mut settled_runtime = after_tool;
+        settled_runtime.canonical_state = settled_after_resolution.canonical_state;
+        settled_runtime.canonical_badge_label = settled_after_resolution.canonical_badge_label;
+        settled_runtime.canonical_state_seq = settled_after_resolution.canonical_state_seq;
+        settled_runtime.prompt_state_seq = settled_after_resolution.prompt_state_seq;
+        settled_runtime.turn_generation = settled_after_resolution.turn_generation;
+        settled_runtime.completed_turn_generation =
+            settled_after_resolution.completed_turn_generation;
+        settled_runtime.turn_active = settled_after_resolution.turn_active;
+        settled_runtime.active_interaction_id = settled_after_resolution.active_interaction_id;
+        settled_runtime.active_interaction_revision =
+            settled_after_resolution.active_interaction_revision;
+
+        let mut next_interaction = interaction.clone();
+        next_interaction.interaction_id = "uir:next".to_string();
+        next_interaction.revision = interaction.revision + 1;
+        next_interaction.provider_request_id = "request-next".to_string();
+        let mut next_prompt = terminal_activity_hook_test_payload(
+            "provider-user-input-required",
+            "uir",
+            "awaiting_input",
+            false,
+            Some("session-a"),
+        );
+        next_prompt.hook_event_name = "UserPromptRequired".to_string();
+        next_prompt.provider_blocked_for_user = true;
+        next_prompt.terminal_is_prompting_user = true;
+        next_prompt.interaction_id = Some(next_interaction.interaction_id.clone());
+        next_prompt.interaction_revision = Some(next_interaction.revision);
+        next_prompt.event_interaction_id = next_prompt.interaction_id.clone();
+        next_prompt.event_interaction_revision = next_prompt.interaction_revision;
+        let reopened = terminal_reduce_canonical_state(
+            &settled_runtime,
+            &next_prompt,
+            Some(&next_interaction),
+            false,
+            true,
+        );
+        assert_eq!(reopened.canonical_state, "uir");
+        assert_eq!(reopened.active_interaction_id.as_deref(), Some("uir:next"));
+        assert_eq!(
+            reopened.active_interaction_revision,
+            Some(next_interaction.revision)
+        );
+        assert_eq!(
+            reopened.prompt_state_seq,
+            settled_runtime.prompt_state_seq + 1
+        );
     }
 
     #[test]

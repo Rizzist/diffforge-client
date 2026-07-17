@@ -59,31 +59,31 @@ pub(crate) fn native_attention_watching_workspace(workspace_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn diffforge_native_notify(
+fn diffforge_native_notify_with_outcome(
     app: &AppHandle,
     title: &str,
     body: &str,
     urgency: NativeNotificationUrgency,
     suppress_when_focused: bool,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if crate::daemon_mode_active() {
-        return Ok(());
+        return Ok(false);
     }
     let title = title.trim();
     if title.is_empty() {
         return Err("Native notification title is empty.".to_string());
     }
     if !native_notifications_enabled() {
-        return Ok(());
+        return Ok(false);
     }
     if suppress_when_focused && diffforge_main_window_focused(app) {
-        return Ok(());
+        return Ok(false);
     }
     let body = body.trim();
 
     #[cfg(target_os = "macos")]
     {
-        macos_user_notification_show(title, body, urgency)
+        macos_user_notification_show(title, body, urgency).map(|_| true)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -94,8 +94,26 @@ fn diffforge_native_notify(
         }
         builder
             .show()
+            .map(|_| true)
             .map_err(|error| format!("Unable to show native notification: {error}"))
     }
+}
+
+fn diffforge_native_notify(
+    app: &AppHandle,
+    title: &str,
+    body: &str,
+    urgency: NativeNotificationUrgency,
+    suppress_when_focused: bool,
+) -> Result<(), String> {
+    diffforge_native_notify_with_outcome(
+        app,
+        title,
+        body,
+        urgency,
+        suppress_when_focused,
+    )
+    .map(|_| ())
 }
 
 fn diffforge_main_window_focused(app: &AppHandle) -> bool {
@@ -130,14 +148,15 @@ mod macos_native_notifications {
         UNNotificationInterruptionLevel, UNNotificationPresentationOptions, UNNotificationRequest,
         UNNotificationSound, UNUserNotificationCenter, UNUserNotificationCenterDelegate,
     };
-    use std::sync::mpsc;
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
     use std::sync::OnceLock;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     const AUTH_TIMEOUT: Duration = Duration::from_secs(2);
+    const SUBMISSION_TIMEOUT: Duration = Duration::from_secs(2);
 
     static DELEGATE_PTR: OnceLock<usize> = OnceLock::new();
-    static AUTH_REQUESTED: OnceLock<bool> = OnceLock::new();
+    static AUTH_GRANTED: OnceLock<()> = OnceLock::new();
 
     define_class!(
         #[unsafe(super(NSObject))]
@@ -200,8 +219,22 @@ mod macos_native_notifications {
             &content,
             None,
         );
-        center.addNotificationRequest_withCompletionHandler(&request, None);
-        Ok(())
+        let (sender, receiver) = mpsc::channel();
+        let completion = RcBlock::new(move |error: *mut NSError| {
+            let outcome = if error.is_null() {
+                Ok(())
+            } else {
+                // SAFETY: UserNotifications owns this NSError for the duration
+                // of the completion callback; format it before returning.
+                let error = unsafe { &*error };
+                Err(format!(
+                    "Unable to display native notification: {error}"
+                ))
+            };
+            let _ = sender.send(outcome);
+        });
+        center.addNotificationRequest_withCompletionHandler(&request, Some(&completion));
+        wait_for_completion(receiver, SUBMISSION_TIMEOUT, "Native notification display")
     }
 
     fn install_delegate(center: &UNUserNotificationCenter) {
@@ -213,7 +246,7 @@ mod macos_native_notifications {
     }
 
     fn ensure_authorized(center: &UNUserNotificationCenter) -> Result<(), String> {
-        if AUTH_REQUESTED.get().copied() == Some(true) {
+        if AUTH_GRANTED.get().is_some() {
             return Ok(());
         }
 
@@ -222,15 +255,69 @@ mod macos_native_notifications {
             | UNAuthorizationOptions::Badge;
         let (sender, receiver) = mpsc::channel();
         let completion = RcBlock::new(move |granted: Bool, error: *mut NSError| {
-            let _ = sender.send(error.is_null() && granted.as_bool());
+            let outcome = if error.is_null() {
+                Ok(granted.as_bool())
+            } else {
+                // SAFETY: UserNotifications owns this NSError for the duration
+                // of the completion callback; format it before returning.
+                let error = unsafe { &*error };
+                Err(format!(
+                    "Unable to authorize native notifications: {error}"
+                ))
+            };
+            let _ = sender.send(outcome);
         });
         center.requestAuthorizationWithOptions_completionHandler(options, &completion);
-        let granted = receiver.recv_timeout(AUTH_TIMEOUT).unwrap_or(true);
-        let _ = AUTH_REQUESTED.set(granted);
+        let granted = wait_for_completion(
+            receiver,
+            AUTH_TIMEOUT,
+            "Native notification authorization",
+        )?;
         if granted {
+            let _ = AUTH_GRANTED.set(());
             Ok(())
         } else {
             Err("Native notification permission was not granted for Diff Forge AI.".to_string())
+        }
+    }
+
+    fn wait_for_completion<T>(
+        receiver: Receiver<Result<T, String>>,
+        timeout: Duration,
+        operation: &str,
+    ) -> Result<T, String> {
+        match receiver.recv_timeout(timeout) {
+            Ok(outcome) => outcome,
+            Err(RecvTimeoutError::Timeout) => Err(format!("{operation} timed out.")),
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(format!("{operation} completion handler disconnected."))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn async_completion_timeout_is_not_success() {
+            let (_sender, receiver) = mpsc::channel::<Result<(), String>>();
+            assert_eq!(
+                wait_for_completion(receiver, Duration::ZERO, "authorization"),
+                Err("authorization timed out.".to_string()),
+            );
+        }
+
+        #[test]
+        fn async_completion_error_is_forwarded() {
+            let (sender, receiver) = mpsc::channel();
+            sender
+                .send(Err::<(), _>("macOS rejected notification".to_string()))
+                .unwrap();
+            assert_eq!(
+                wait_for_completion(receiver, Duration::from_millis(1), "display"),
+                Err("macOS rejected notification".to_string()),
+            );
         }
     }
 }

@@ -8101,10 +8101,13 @@ mod terminal_cli_tests {
             DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("postSessionIdPermissionsPermissionId")
         );
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("handlePendingPermission"));
-        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("reconcilePendingPermissions"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("reconcilePendingInteractions"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("client.permission.list"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
-            .contains("opencodeFetch(serverUrl, \"/permission\", undefined, \"GET\")"));
+            .contains("opencodeFetch(serverUrl, \"/permission\", undefined, \"GET\", signal)"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("client.question.list"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("opencodeFetch(serverUrl, \"/question\", undefined, \"GET\", signal)"));
         assert!(
             DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("if (type === \"permission.asked\")")
         );
@@ -8125,19 +8128,51 @@ mod terminal_cli_tests {
             4,
         );
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
-            .contains("reconcilePendingPermissions(\"session.status\")"));
+            .contains("reconcilePendingInteractions(\"chat.message\")"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
-            .contains("reconcilePendingPermissions(\"session.idle\")"));
+            .contains("reconcilePendingInteractions(type)"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
-            .contains("clearInterval(permissionReconcileInterval)"));
+            .contains("reconcilePendingInteractions(\"session.status\")"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("reconcilePendingInteractions(\"session.idle\")"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("clearInterval(interactionReconcileInterval)"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("/question/${id}/reply"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
             .contains("hook_event_name: \"TranscriptChanged\""));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
-            .contains("permission_decision: record.props.reply"));
+            .contains("permission_decision: props.reply"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("permission.replied"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("interactionGenerations"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("takeInteractionGeneration"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("finishTrackedInteractionResolution"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("provider_pending_list_disappeared: true"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("generation.interaction_kind !== kind"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("generation.interaction_id !== capturedGeneration.interaction_id"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains(
+            "generation.interaction_revision !== capturedGeneration.interaction_revision"
+        ));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("const trackedHeads = new Map"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("const PROVIDER_INTERACTION_LIST_TIMEOUT_MS = 3_000"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("await finishNativeInteractionResolution(record, version)"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("currentQueue[0].interaction_revision !== record.interaction_revision"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("Never resolve a captured"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("validateProviderPendingInteractions"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("Object.keys(value).length === 0"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("new AbortController()"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("const providerInteractionListRequests = new Map()"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("ask_fingerprint: askFingerprint"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
             .contains("const HANDLED_INTERACTION_DEDUPE_TTL_MS = 90_000"));
@@ -8154,8 +8189,15 @@ mod terminal_cli_tests {
             .contains("const NATIVE_RESULT_REVALIDATION_TIMEOUT_MS = 90_000"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("newerGenerationQueued"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
-            .contains("handlePendingPermission(sessionId, requestId, props, askFingerprint)"));
-        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("livePermissionKeys"));
+            .contains("handlePendingQuestion("));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("const liveKeys = new Set()"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("turnGeneration(sessionId)"));
+        assert_eq!(
+            DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+                .matches("turnGeneration(sessionId) === idleTurnGeneration")
+                .count(),
+            2,
+        );
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("texts.join(\"\\n\")"));
         assert!(!DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains(
             "if (statusValue === \"idle\" || statusValue === \"cooldown\") {\n          emitStop(sessionId);"
@@ -9454,9 +9496,10 @@ function emit(payload) {
   return next;
 }
 
-async function opencodeFetch(serverUrl, path, body, method = "POST") {
+async function opencodeFetch(serverUrl, path, body, method = "POST", signal = undefined) {
   if (!serverUrl || typeof fetch !== "function") return false;
   const options = { method };
+  if (signal) options.signal = signal;
   if (method !== "GET") {
     options.headers = { "content-type": "application/json" };
     options.body = JSON.stringify(body || {});
@@ -9808,11 +9851,13 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
   const partKinds = new Map();
   const HANDLED_INTERACTION_DEDUPE_TTL_MS = 90_000;
   const NATIVE_RESULT_REVALIDATION_TIMEOUT_MS = 90_000;
+  const PROVIDER_INTERACTION_LIST_TIMEOUT_MS = 3_000;
   const handledInteractionIds = new Map();
   const pendingInteractionIds = new Map();
   const interactionGenerations = new Map();
   const interactionRevalidationTimers = new Set();
   const nativeInteractionResolutionRevalidations = new Map();
+  const providerInteractionListRequests = new Map();
   let lastInteractionRevision = 0;
   let lastHandledInteractionToken = 0;
   const rememberInteractionGeneration = (key, sessionId, kind, requestId, askFingerprint = "") => {
@@ -9822,6 +9867,10 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
       interaction_id: `uir:opencode:${sessionId}:${kind}:${requestId}:${lastInteractionRevision}`,
       interaction_revision: lastInteractionRevision,
       ask_fingerprint: askFingerprint,
+      interaction_key: key,
+      interaction_kind: kind,
+      request_id: requestId,
+      session_id: sessionId,
     };
     const queued = interactionGenerations.get(key) || [];
     queued.push(generation);
@@ -9909,6 +9958,10 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
     const turn = activeSessions.get(sessionId);
     return turn && !turn.settled ? turn : null;
   };
+	  const turnGeneration = (sessionId) => {
+	    if (!sessionId) return 0;
+	    return activeSessions.get(sessionId)?.turn_id || 0;
+	  };
 	  const startTurn = (sessionId, reason = "chat.message") => {
 	    if (!sessionId) return null;
 	    cancelPendingStop(sessionId);
@@ -10094,71 +10147,156 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
   };
   const pendingPermissionsFromResponse = (response) => {
     if (Array.isArray(response)) return response;
-    if (!response || typeof response !== "object") return [];
+    if (!response || typeof response !== "object") return null;
     for (const key of ["data", "permissions", "items", "result", "body"]) {
       if (Array.isArray(response[key])) return response[key];
     }
-    return [];
+    return null;
   };
   const pendingQuestionsFromResponse = (response) => {
     if (Array.isArray(response)) return response;
-    if (!response || typeof response !== "object") return [];
+    if (!response || typeof response !== "object") return null;
     for (const key of ["data", "items", "result", "body", "requests"]) {
       if (Array.isArray(response[key])) return response[key];
     }
-    return [];
+    return null;
   };
-  const providerInteractionStillPending = async (kind, sessionId, requestId) => {
+  const providerInteractionIdentity = (kind, value) => {
+    const props = value && typeof value === "object" ? value : {};
+    const sessionId = props.sessionID || props.sessionId || props.session_id || props.session?.id || "";
+    const requestId = kind === "permission"
+      ? props.id || props.permissionID || props.permissionId || props.requestID || props.requestId || ""
+      : props.id || props.questionID || props.questionId || props.requestID || props.requestId || "";
+    return { props, sessionId, requestId };
+  };
+  const validateProviderPendingInteractions = (kind, pending) => {
+    if (!Array.isArray(pending)) {
+      throw new Error(`OpenCode ${kind} list response is malformed.`);
+    }
+    for (const value of pending) {
+      if (
+        !value
+        || typeof value !== "object"
+        || Array.isArray(value)
+        || Object.keys(value).length === 0
+      ) {
+        throw new Error(`OpenCode ${kind} list response contains a malformed item.`);
+      }
+      const identity = providerInteractionIdentity(kind, value);
+      if (!nonEmptyString(identity.sessionId) || !nonEmptyString(identity.requestId)) {
+        throw new Error(`OpenCode ${kind} list response contains an unidentifiable item.`);
+      }
+    }
+    return pending;
+  };
+  const providerPendingInteractions = async (kind, signal) => {
     let response;
     if (kind === "permission") {
       if (client && client.permission && typeof client.permission.list === "function") {
         try {
-          response = await client.permission.list();
+          response = await client.permission.list(signal ? { signal } : undefined);
           if (response && response.error) throw response.error;
         } catch {
-          response = await opencodeFetch(serverUrl, "/permission", undefined, "GET");
+          response = await opencodeFetch(serverUrl, "/permission", undefined, "GET", signal);
         }
       } else {
-        response = await opencodeFetch(serverUrl, "/permission", undefined, "GET");
+        response = await opencodeFetch(serverUrl, "/permission", undefined, "GET", signal);
       }
-      return pendingPermissionsFromResponse(response).some((permission) => {
-        const props = permission && typeof permission === "object" ? permission : {};
-        const pendingSessionId = props.sessionID || props.sessionId || props.session_id || props.session?.id || "";
-        const pendingRequestId = props.id || props.permissionID || props.permissionId || props.requestID || props.requestId || "";
-        return pendingSessionId === sessionId && pendingRequestId === requestId;
-      });
+      if (response === false || response == null) {
+        throw new Error("OpenCode permission list API is unavailable.");
+      }
+      const pending = pendingPermissionsFromResponse(response);
+      if (!pending) throw new Error("OpenCode permission list response is malformed.");
+      return validateProviderPendingInteractions(kind, pending);
     }
     if (client && client.question && typeof client.question.list === "function") {
       try {
-        response = await client.question.list();
+        response = await client.question.list(signal ? { signal } : undefined);
         if (response && response.error) throw response.error;
       } catch {
-        response = await opencodeFetch(serverUrl, "/question", undefined, "GET");
+        response = await opencodeFetch(serverUrl, "/question", undefined, "GET", signal);
       }
     } else {
-      response = await opencodeFetch(serverUrl, "/question", undefined, "GET");
+      response = await opencodeFetch(serverUrl, "/question", undefined, "GET", signal);
     }
-    return pendingQuestionsFromResponse(response).some((question) => {
-      const props = question && typeof question === "object" ? question : {};
-      const pendingSessionId = props.sessionID || props.sessionId || props.session_id || props.session?.id || "";
-      const pendingRequestId = props.id || props.questionID || props.questionId || props.requestID || props.requestId || "";
-      return pendingSessionId === sessionId && pendingRequestId === requestId;
+    if (response === false || response == null) {
+      throw new Error("OpenCode question list API is unavailable.");
+    }
+    const pending = pendingQuestionsFromResponse(response);
+    if (!pending) throw new Error("OpenCode question list response is malformed.");
+    return validateProviderPendingInteractions(kind, pending);
+  };
+  const providerInteractionStillPending = async (kind, sessionId, requestId) => {
+    const pending = await providerPendingInteractionsWithTimeout(kind);
+    return pending.some((value) => {
+      const identity = providerInteractionIdentity(kind, value);
+      return identity.sessionId === sessionId && identity.requestId === requestId;
     });
   };
-  const finishNativeInteractionResolution = (record) => {
-    if (
-      !record
-      || nativeInteractionResolutionRevalidations.get(record.interaction_key) !== record
-    ) return;
+  const providerPendingInteractionRequest = (kind) => {
+    const existing = providerInteractionListRequests.get(kind);
+    if (existing) return existing;
+    const controller = typeof AbortController === "function"
+      ? new AbortController()
+      : null;
+    const request = {
+      controller,
+      promise: null,
+    };
+    request.promise = providerPendingInteractions(kind, controller?.signal);
+    providerInteractionListRequests.set(kind, request);
+    const clearRequest = () => {
+      if (providerInteractionListRequests.get(kind) === request) {
+        providerInteractionListRequests.delete(kind);
+      }
+    };
+    request.promise.then(clearRequest, clearRequest);
+    return request;
+  };
+  const providerPendingInteractionsWithTimeout = async (kind) => {
+    const request = providerPendingInteractionRequest(kind);
+    let timer = null;
+    try {
+      return await Promise.race([
+        request.promise,
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => {
+              if (providerInteractionListRequests.get(kind) === request) {
+                providerInteractionListRequests.delete(kind);
+              }
+              if (request.controller) request.controller.abort();
+              reject(new Error(`OpenCode ${kind} list API timed out.`));
+            },
+            PROVIDER_INTERACTION_LIST_TIMEOUT_MS,
+          );
+          if (typeof timer.unref === "function") timer.unref();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+  const finishTrackedInteractionResolution = (record) => {
+    if (!record || !record.interaction_key || !record.interaction_id) return;
     const queued = interactionGenerations.get(record.interaction_key) || [];
     if (
       !queued.length
       || queued[0].interaction_id !== record.interaction_id
+      || (record.interaction_revision
+        && queued[0].interaction_revision !== record.interaction_revision)
     ) {
-      nativeInteractionResolutionRevalidations.delete(record.interaction_key);
       return;
     }
-    nativeInteractionResolutionRevalidations.delete(record.interaction_key);
+    const nativeRevalidation = nativeInteractionResolutionRevalidations.get(record.interaction_key);
+    if (nativeRevalidation && nativeRevalidation.interaction_id === record.interaction_id) {
+      if (nativeRevalidation.timer) {
+        clearTimeout(nativeRevalidation.timer);
+        interactionRevalidationTimers.delete(nativeRevalidation.timer);
+        nativeRevalidation.timer = null;
+      }
+      nativeInteractionResolutionRevalidations.delete(record.interaction_key);
+    }
     const resolution = takeInteractionGeneration(record.interaction_key);
     const newerGenerationQueued = (
       interactionGenerations.get(record.interaction_key) || []
@@ -10183,19 +10321,58 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
         pendingInteractionIds.delete(record.interaction_key);
       }
     }
+    const props = record.props && typeof record.props === "object" ? record.props : {};
     emit({
-      hook_event_name: record.type === "permission.replied" ? "PermissionResult" : "ElicitationResult",
+      hook_event_name: record.interaction_kind === "permission" ? "PermissionResult" : "ElicitationResult",
       session_id: record.session_id,
       permission_request_id: record.request_id,
-      decision: record.type.endsWith("rejected")
-        || String(record.props.reply || record.props.response || "").toLowerCase() === "reject"
+      decision: String(record.type || "").endsWith("rejected")
+        || String(props.reply || props.response || "").toLowerCase() === "reject"
         ? "rejected"
         : "accepted",
-      permission_decision: record.props.reply || record.props.response || "",
-      provider_payload: record.props,
+      permission_decision: props.reply || props.response || "",
+      provider_payload: props,
       resolved_interaction_id: resolution.interaction_id,
       resolved_interaction_revision: resolution.interaction_revision,
     });
+  };
+  const finishNativeInteractionResolution = async (record, version) => {
+    if (
+      !record
+      || nativeInteractionResolutionRevalidations.get(record.interaction_key) !== record
+      || record.version !== version
+    ) return false;
+    const queued = interactionGenerations.get(record.interaction_key) || [];
+    if (
+      !queued.length
+      || queued[0].interaction_id !== record.interaction_id
+      || queued[0].interaction_revision !== record.interaction_revision
+    ) {
+      nativeInteractionResolutionRevalidations.delete(record.interaction_key);
+      return false;
+    }
+    // The first absent snapshot can race a provider request-id reuse. Require
+    // one final, fresh provider cycle immediately before emitting the captured
+    // generation's resolution. Malformed data and timeouts reject this path.
+    const stillPending = await providerInteractionStillPending(
+      record.interaction_kind,
+      record.session_id,
+      record.request_id,
+    );
+    const currentQueue = interactionGenerations.get(record.interaction_key) || [];
+    if (
+      nativeInteractionResolutionRevalidations.get(record.interaction_key) !== record
+      || record.version !== version
+      || !currentQueue.length
+      || currentQueue[0].interaction_id !== record.interaction_id
+      || currentQueue[0].interaction_revision !== record.interaction_revision
+    ) return false;
+    if (stillPending) {
+      nativeInteractionResolutionRevalidations.delete(record.interaction_key);
+      return false;
+    }
+    finishTrackedInteractionResolution(record);
+    return true;
   };
   const scheduleNativeInteractionResolutionRevalidation = (record) => {
     if (
@@ -10210,7 +10387,11 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
       if (record.timer === timer) record.timer = null;
       if (nativeInteractionResolutionRevalidations.get(record.interaction_key) !== record) return;
       const queued = interactionGenerations.get(record.interaction_key) || [];
-      if (!queued.length || queued[0].interaction_id !== record.interaction_id) {
+      if (
+        !queued.length
+        || queued[0].interaction_id !== record.interaction_id
+        || queued[0].interaction_revision !== record.interaction_revision
+      ) {
         nativeInteractionResolutionRevalidations.delete(record.interaction_key);
         return;
       }
@@ -10225,7 +10406,11 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
         record.in_flight = false;
         if (nativeInteractionResolutionRevalidations.get(record.interaction_key) !== record) return;
         const currentQueue = interactionGenerations.get(record.interaction_key) || [];
-        if (!currentQueue.length || currentQueue[0].interaction_id !== record.interaction_id) {
+        if (
+          !currentQueue.length
+          || currentQueue[0].interaction_id !== record.interaction_id
+          || currentQueue[0].interaction_revision !== record.interaction_revision
+        ) {
           nativeInteractionResolutionRevalidations.delete(record.interaction_key);
           return;
         }
@@ -10234,12 +10419,30 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
           return;
         }
         if (!currentStillPending) {
-          finishNativeInteractionResolution(record);
+          let finished = false;
+          try {
+            finished = await finishNativeInteractionResolution(record, version);
+          } catch {
+            // A failed final provider cycle is not proof of disappearance.
+          }
+          if (finished) return;
+          if (
+            nativeInteractionResolutionRevalidations.get(record.interaction_key) === record
+            && record.version === version
+          ) {
+            if (Date.now() >= record.deadline_at) {
+              nativeInteractionResolutionRevalidations.delete(record.interaction_key);
+            } else {
+              record.attempt += 1;
+              scheduleNativeInteractionResolutionRevalidation(record);
+            }
+          }
           return;
         }
         if (Date.now() >= record.deadline_at) {
-          // The provider still says the current generation is open, so this
-          // was a late result for an older reused request id.
+          // A reused provider request id can deliver the previous generation's
+          // reply after this generation opened. Never resolve a captured
+          // generation that the provider still reports as pending.
           nativeInteractionResolutionRevalidations.delete(record.interaction_key);
           return;
         }
@@ -10247,7 +10450,11 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
         record.in_flight = false;
         if (nativeInteractionResolutionRevalidations.get(record.interaction_key) !== record) return;
         const currentQueue = interactionGenerations.get(record.interaction_key) || [];
-        if (!currentQueue.length || currentQueue[0].interaction_id !== record.interaction_id) {
+        if (
+          !currentQueue.length
+          || currentQueue[0].interaction_id !== record.interaction_id
+          || currentQueue[0].interaction_revision !== record.interaction_revision
+        ) {
           nativeInteractionResolutionRevalidations.delete(record.interaction_key);
           return;
         }
@@ -10256,10 +10463,9 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
           return;
         }
         if (Date.now() >= record.deadline_at) {
-          // A native result is the strongest remaining signal when the
-          // provider's pending-list API stays unavailable. Resolve only the
-          // same generation that was open when that event arrived.
-          finishNativeInteractionResolution(record);
+          // An unavailable/malformed provider list is not an empty list and
+          // cannot prove that this generation disappeared.
+          nativeInteractionResolutionRevalidations.delete(record.interaction_key);
           return;
         }
       }
@@ -10284,7 +10490,9 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
       // so this native event is only its duplicate acknowledgement.
       return;
     }
-    const interactionId = queued[0].interaction_id;
+    const generation = queued[0];
+    const interactionId = generation.interaction_id;
+    const interactionRevision = generation.interaction_revision;
     const existing = nativeInteractionResolutionRevalidations.get(interactionKey);
     if (existing && existing.timer) {
       const existingTimer = existing.timer;
@@ -10292,11 +10500,14 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
       interactionRevalidationTimers.delete(existingTimer);
       if (existing.timer === existingTimer) existing.timer = null;
     }
-    const record = existing && existing.interaction_id === interactionId
+    const record = existing
+      && existing.interaction_id === interactionId
+      && existing.interaction_revision === interactionRevision
       ? existing
       : {
           interaction_key: interactionKey,
           interaction_id: interactionId,
+          interaction_revision: interactionRevision,
           in_flight: false,
           timer: null,
           version: 0,
@@ -10306,6 +10517,7 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
     record.session_id = sessionId;
     record.interaction_kind = interactionKind;
     record.request_id = requestId;
+    record.ask_fingerprint = generation.ask_fingerprint || "";
     record.attempt = 0;
     record.deadline_at = Date.now() + NATIVE_RESULT_REVALIDATION_TIMEOUT_MS;
     record.version += 1;
@@ -10331,63 +10543,238 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
     interactionRevalidationTimers.add(timer);
     if (typeof timer.unref === "function") timer.unref();
   };
-  let permissionReconciliationInFlight = false;
-  let permissionReconciliationStopped = false;
-  const reconcilePendingPermissions = async (reason) => {
-    if (permissionReconciliationStopped || permissionReconciliationInFlight) return;
-    permissionReconciliationInFlight = true;
+  const handlePendingQuestion = async (
+    sessionId,
+    promptId,
+    props = {},
+    type = "question.asked",
+    askFingerprint = "",
+  ) => {
+    noteActivity(sessionId, type);
+    const interactionKey = promptId ? `${sessionId}:question:${promptId}` : "";
+    if (
+      interactionKey
+      && (handledInteractionRecently(interactionKey, askFingerprint)
+        || pendingInteractionIds.has(interactionKey))
+    ) return;
+    if (interactionKey) pendingInteractionIds.set(interactionKey, "starting");
+    const interactionGeneration = rememberInteractionGeneration(
+      interactionKey,
+      sessionId,
+      "question",
+      promptId,
+      askFingerprint,
+    );
+    if (interactionKey) {
+      pendingInteractionIds.set(
+        interactionKey,
+        interactionGeneration.interaction_id || "starting",
+      );
+    }
     try {
-      let response;
-      if (client && client.permission && typeof client.permission.list === "function") {
+      const questions = Array.isArray(props.questions)
+        ? props.questions
+        : (props.question ? [props.question] : []);
+      const response = await emit({
+        hook_event_name: "UserPromptRequired",
+        session_id: sessionId,
+        requires_user_input: true,
+        provider_blocked_for_user: true,
+        permission_request_id: promptId || (sessionId ? `${type}:${sessionId}:${Date.now()}` : `${type}:${Date.now()}`),
+        prompting_user_kind: type.startsWith("selection.") ? "selection" : "question",
+        prompting_user_text: props.title || (questions[0] && questions[0].question) || props.description || "",
+        prompt_questions: questions,
+        prompt_options: props.options || props.choices || props.actions || [],
+        provider_payload: props,
+        interaction_id: interactionGeneration.interaction_id,
+        interaction_revision: interactionGeneration.interaction_revision,
+      });
+      if (promptId && response) {
         try {
-          response = await client.permission.list();
-          if (response && response.error) throw response.error;
-        } catch {
-          response = await opencodeFetch(serverUrl, "/permission", undefined, "GET");
+          await replyOpenCodeQuestion(client, serverUrl, promptId, response);
+          retireInteractionGeneration(
+            interactionKey,
+            interactionGeneration.interaction_id,
+          );
+          const handledToken = rememberHandledInteraction(interactionKey, askFingerprint);
+          scheduleHandledQuestionRevalidation(sessionId, promptId, interactionKey, handledToken);
+          emit({
+            hook_event_name: "ElicitationResult",
+            session_id: sessionId,
+            permission_request_id: promptId,
+            decision: response.rejected ? "rejected" : "accepted",
+            resolved_interaction_id: response._diffforge_interaction_id,
+            resolved_interaction_revision: response._diffforge_interaction_revision,
+          });
+        } catch (error) {
+          emit({
+            hook_event_name: "StopFailure",
+            session_id: sessionId,
+            error_code: "question_reply_failed",
+            error: String((error && error.message) || error || "OpenCode question reply failed."),
+            interaction_id: interactionGeneration.interaction_id,
+            interaction_revision: interactionGeneration.interaction_revision,
+            retryable: true,
+          });
         }
-      } else {
-        response = await opencodeFetch(serverUrl, "/permission", undefined, "GET");
       }
-      if (permissionReconciliationStopped) return;
-      const pendingPermissions = pendingPermissionsFromResponse(response);
-      const livePermissionKeys = new Set();
-      for (const permission of pendingPermissions) {
-        const props = permission && typeof permission === "object" ? permission : {};
-        const sessionId = props.sessionID || props.sessionId || props.session_id || props.session?.id || "";
-        const requestId = props.id || props.permissionID || props.permissionId || props.requestID || props.requestId || "";
-        const interactionKey = requestId ? `${sessionId}:permission:${requestId}` : "";
-        const askFingerprint = interactionAskFingerprint(props);
-        if (interactionKey) livePermissionKeys.add(interactionKey);
-        if (!requestId || (interactionKey && (handledInteractionRecently(interactionKey, askFingerprint) || pendingInteractionIds.has(interactionKey)))) continue;
-        handlePendingPermission(sessionId, requestId, props, askFingerprint).catch(() => {});
+    } finally {
+      const pendingGeneration = interactionKey
+        ? pendingInteractionIds.get(interactionKey)
+        : "";
+      if (
+        interactionKey
+        && (pendingGeneration === "starting"
+          || pendingGeneration === interactionGeneration.interaction_id)
+      ) {
+        pendingInteractionIds.delete(interactionKey);
       }
-      for (const interactionKey of handledInteractionIds.keys()) {
-        if (interactionKey.includes(":permission:") && !livePermissionKeys.has(interactionKey)) {
-          handledInteractionIds.delete(interactionKey);
+    }
+  };
+  let interactionReconciliationPromise = null;
+  let interactionReconciliationRequestedReason = "";
+  let interactionReconciliationStopped = false;
+  const reconcilePendingInteractionSnapshot = async (reason) => {
+    try {
+      const kinds = ["permission", "question"];
+      const trackedHeads = new Map(kinds.map((kind) => [kind, new Map()]));
+      for (const [interactionKey, queued] of interactionGenerations.entries()) {
+        const generation = queued && queued[0];
+        if (generation && trackedHeads.has(generation.interaction_kind)) {
+          trackedHeads
+            .get(generation.interaction_kind)
+            .set(interactionKey, {
+              interaction_id: generation.interaction_id,
+              interaction_revision: generation.interaction_revision,
+            });
+        }
+      }
+      const snapshots = await Promise.allSettled(
+        kinds.map((kind) => providerPendingInteractionsWithTimeout(kind)),
+      );
+      if (interactionReconciliationStopped) return;
+      for (let index = 0; index < kinds.length; index += 1) {
+        const snapshot = snapshots[index];
+        if (!snapshot || snapshot.status !== "fulfilled") continue;
+        const kind = kinds[index];
+        const live = snapshot.value;
+        const liveKeys = new Set();
+        for (const value of live) {
+          const identity = providerInteractionIdentity(kind, value);
+          if (identity.requestId) {
+            liveKeys.add(`${identity.sessionId}:${kind}:${identity.requestId}`);
+          }
+        }
+        for (const [interactionKey, capturedGeneration] of trackedHeads.get(kind)) {
+          const queued = interactionGenerations.get(interactionKey) || [];
+          const generation = queued[0];
+          if (
+            !generation
+            || generation.interaction_id !== capturedGeneration.interaction_id
+            || generation.interaction_revision !== capturedGeneration.interaction_revision
+            || generation.interaction_kind !== kind
+            || liveKeys.has(interactionKey)
+          ) continue;
+          finishTrackedInteractionResolution({
+            interaction_key: interactionKey,
+            interaction_id: generation.interaction_id,
+            interaction_revision: generation.interaction_revision,
+            interaction_kind: kind,
+            request_id: generation.request_id,
+            session_id: generation.session_id,
+            type: `${kind}.reconciled`,
+            props: {
+              provider_pending_list_disappeared: true,
+              reconciliation_reason: reason,
+            },
+          });
+        }
+        for (const interactionKey of Array.from(handledInteractionIds.keys())) {
+          if (interactionKey.includes(`:${kind}:`) && !liveKeys.has(interactionKey)) {
+            handledInteractionIds.delete(interactionKey);
+          }
+        }
+        for (const value of live) {
+          const identity = providerInteractionIdentity(kind, value);
+          if (!identity.requestId) continue;
+          const interactionKey = `${identity.sessionId}:${kind}:${identity.requestId}`;
+          const askFingerprint = interactionAskFingerprint(identity.props);
+          if (
+            handledInteractionRecently(interactionKey, askFingerprint)
+            || pendingInteractionIds.has(interactionKey)
+          ) continue;
+          if (kind === "permission") {
+            handlePendingPermission(
+              identity.sessionId,
+              identity.requestId,
+              identity.props,
+              askFingerprint,
+            ).catch(() => {});
+          } else {
+            handlePendingQuestion(
+              identity.sessionId,
+              identity.requestId,
+              identity.props,
+              "question.reconciled",
+              askFingerprint,
+            ).catch(() => {});
+          }
         }
       }
     } catch {
-      // Permission reconciliation is a recovery path; live provider events
+      // Interaction reconciliation is a recovery path; live provider events
       // remain authoritative when the SDK/server is temporarily unavailable.
-    } finally {
-      permissionReconciliationInFlight = false;
     }
   };
-  const startupPermissionReconcileTimer = setTimeout(
-    () => reconcilePendingPermissions("startup"),
+  const reconcilePendingInteractions = (reason) => {
+    if (interactionReconciliationStopped) return Promise.resolve();
+    interactionReconciliationRequestedReason = reason || "queued";
+    if (interactionReconciliationPromise) return interactionReconciliationPromise;
+    const run = async () => {
+      while (
+        !interactionReconciliationStopped
+        && interactionReconciliationRequestedReason
+      ) {
+        const nextReason = interactionReconciliationRequestedReason;
+        interactionReconciliationRequestedReason = "";
+        await reconcilePendingInteractionSnapshot(nextReason);
+      }
+    };
+    const pending = run();
+    interactionReconciliationPromise = pending;
+    pending.finally(() => {
+      if (interactionReconciliationPromise === pending) {
+        interactionReconciliationPromise = null;
+      }
+      if (
+        interactionReconciliationRequestedReason
+        && !interactionReconciliationStopped
+      ) {
+        reconcilePendingInteractions(interactionReconciliationRequestedReason);
+      }
+    });
+    return pending;
+  };
+  const startupInteractionReconcileTimer = setTimeout(
+    () => reconcilePendingInteractions("startup"),
     750
   );
-  const permissionReconcileInterval = setInterval(
-    () => reconcilePendingPermissions("interval"),
+  const interactionReconcileInterval = setInterval(
+    () => reconcilePendingInteractions("interval"),
     4000
   );
-  if (typeof startupPermissionReconcileTimer.unref === "function") startupPermissionReconcileTimer.unref();
-  if (typeof permissionReconcileInterval.unref === "function") permissionReconcileInterval.unref();
-  const stopPermissionReconciliation = () => {
-    if (permissionReconciliationStopped) return;
-    permissionReconciliationStopped = true;
-    clearTimeout(startupPermissionReconcileTimer);
-    clearInterval(permissionReconcileInterval);
+  if (typeof startupInteractionReconcileTimer.unref === "function") startupInteractionReconcileTimer.unref();
+  if (typeof interactionReconcileInterval.unref === "function") interactionReconcileInterval.unref();
+  const stopInteractionReconciliation = () => {
+    if (interactionReconciliationStopped) return;
+    interactionReconciliationStopped = true;
+    interactionReconciliationRequestedReason = "";
+    clearTimeout(startupInteractionReconcileTimer);
+    clearInterval(interactionReconcileInterval);
+    for (const request of providerInteractionListRequests.values()) {
+      if (request.controller) request.controller.abort();
+    }
+    providerInteractionListRequests.clear();
     for (const timer of interactionRevalidationTimers) clearTimeout(timer);
     interactionRevalidationTimers.clear();
   };
@@ -10395,6 +10782,7 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
     "chat.message": async (input, output) => {
       const sessionId = (input && input.sessionID) || "";
       const prompt = pickText(output && output.parts);
+      reconcilePendingInteractions("chat.message");
       const submitKeys = userPromptSubmitKeys(sessionId, "", prompt, "chat.message");
       if (userPromptAlreadySubmitted(submitKeys)) return;
       startTurn(sessionId, "chat.message");
@@ -10454,7 +10842,7 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
       const sessionId = eventSessionId(event);
 	      const props = (event && event.properties) || {};
 	      if (type === "server.instance.disposed" || type === "global.disposed") {
-	        stopPermissionReconciliation();
+	        stopInteractionReconciliation();
 	        return;
 	      }
 	      if (type === "message.updated" || type === "message.created") {
@@ -10462,6 +10850,7 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
         const role = rememberMessageRole(sessionId, message, props);
         if (role === "user") {
           emitUserPromptFromMessage(sessionId, message, props, type);
+          reconcilePendingInteractions(type);
         } else if (role === "assistant") {
           const completed = assistantMessageCompleted(message, props);
           const completionKey = completed ? assistantMessageCompletionKey(sessionId, message, props) : "";
@@ -10490,6 +10879,7 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
         const role = messageRoleForPart(sessionId, props, part);
         if (role === "user") {
           emitUserPromptFromMessage(sessionId, props.message || props.info || { id: messageId, parts: [part], role: "user" }, props, type);
+          reconcilePendingInteractions(type);
           return;
         }
         if (role !== "assistant") return;
@@ -10526,78 +10916,14 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
         await handlePendingPermission(sessionId, requestId, props, interactionAskFingerprint(props));
       }
 	      if (type === "question.ask" || type === "question.asked" || type === "selection.ask" || type === "selection.asked") {
-        noteActivity(sessionId, type);
         const promptId = props.id || props.questionID || props.questionId || props.promptID || props.promptId || props.selectionID || props.selectionId || "";
-        const interactionKey = promptId ? `${sessionId}:question:${promptId}` : "";
-        const askFingerprint = interactionAskFingerprint(props);
-        if (interactionKey && (handledInteractionRecently(interactionKey, askFingerprint) || pendingInteractionIds.has(interactionKey))) return;
-        if (interactionKey) pendingInteractionIds.set(interactionKey, "starting");
-        const interactionGeneration = rememberInteractionGeneration(
-          interactionKey,
+        await handlePendingQuestion(
           sessionId,
-          "question",
           promptId,
-          askFingerprint,
+          props,
+          type,
+          interactionAskFingerprint(props),
         );
-        if (interactionKey) {
-          pendingInteractionIds.set(
-            interactionKey,
-            interactionGeneration.interaction_id || "starting",
-          );
-        }
-        const questions = Array.isArray(props.questions)
-          ? props.questions
-          : (props.question ? [props.question] : []);
-        const response = await emit({
-          hook_event_name: "UserPromptRequired",
-          session_id: sessionId,
-          requires_user_input: true,
-          provider_blocked_for_user: true,
-          permission_request_id: promptId || (sessionId ? `${type}:${sessionId}:${Date.now()}` : `${type}:${Date.now()}`),
-          prompting_user_kind: type.startsWith("selection.") ? "selection" : "question",
-          prompting_user_text: props.title || (questions[0] && questions[0].question) || props.description || "",
-          prompt_questions: questions,
-          prompt_options: props.options || props.choices || props.actions || [],
-          provider_payload: props,
-          interaction_id: interactionGeneration.interaction_id,
-          interaction_revision: interactionGeneration.interaction_revision,
-        });
-        if (promptId && response) {
-          try {
-            await replyOpenCodeQuestion(client, serverUrl, promptId, response);
-            retireInteractionGeneration(
-              interactionKey,
-              interactionGeneration.interaction_id,
-            );
-            const handledToken = rememberHandledInteraction(interactionKey, askFingerprint);
-            scheduleHandledQuestionRevalidation(sessionId, promptId, interactionKey, handledToken);
-            emit({
-              hook_event_name: "ElicitationResult",
-              session_id: sessionId,
-              permission_request_id: promptId,
-              decision: response.rejected ? "rejected" : "accepted",
-              resolved_interaction_id: response._diffforge_interaction_id,
-              resolved_interaction_revision: response._diffforge_interaction_revision,
-            });
-          } catch (error) {
-            emit({
-              hook_event_name: "StopFailure",
-              session_id: sessionId,
-              error_code: "question_reply_failed",
-              error: String((error && error.message) || error || "OpenCode question reply failed."),
-              interaction_id: interactionGeneration.interaction_id,
-              interaction_revision: interactionGeneration.interaction_revision,
-              retryable: true,
-            });
-          }
-        }
-        if (
-          interactionKey
-          && pendingInteractionIds.get(interactionKey)
-            === interactionGeneration.interaction_id
-        ) {
-          pendingInteractionIds.delete(interactionKey);
-        }
       }
       if (type === "permission.replied" || type === "question.replied" || type === "question.rejected") {
         const requestId = props.id || props.permissionID || props.permissionId || props.questionID || props.questionId || props.requestID || props.requestId || "";
@@ -10674,7 +11000,6 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
         });
       }
       if (type === "session.status") {
-        reconcilePendingPermissions("session.status");
         // OpenCode >= 1.17 reports turn phases via session.status; treat a
         // return to idle/cooldown as a quiet-period completion candidate.
         // OpenCode can publish idle before the final message/tool events have
@@ -10687,8 +11012,30 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
             ? (raw.type || raw.phase || raw.state || raw.status)
             : raw) || ""
         ).toLowerCase();
-	        if (statusValue === "idle" || statusValue === "cooldown") {
-	          scheduleIdle(sessionId, "session.status");
+	        let statusReconciliation = null;
+	        if (
+	          statusValue
+	          && ![
+	            "awaiting_input",
+	            "awaiting_user",
+	            "needs_input",
+	            "paused",
+	            "prompting_user",
+	            "requires_input",
+	            "requires_user_input",
+	            "uir",
+	            "user_input_required",
+	            "waiting",
+	          ].includes(statusValue)
+	        ) {
+	          statusReconciliation = reconcilePendingInteractions("session.status");
+	        }
+        if (statusValue === "idle" || statusValue === "cooldown") {
+	          const idleTurnGeneration = turnGeneration(sessionId);
+	          if (statusReconciliation) await statusReconciliation;
+	          if (turnGeneration(sessionId) === idleTurnGeneration) {
+	            scheduleIdle(sessionId, "session.status");
+	          }
 	        } else if (statusValue === "retry") {
           noteActivity(sessionId, "session.status.retry");
           emit({
@@ -10706,8 +11053,11 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
 		        }
       }
       if (type === "session.idle") {
-	        reconcilePendingPermissions("session.idle");
-	        scheduleIdle(sessionId, "session.idle");
+	        const idleTurnGeneration = turnGeneration(sessionId);
+	        await reconcilePendingInteractions("session.idle");
+	        if (turnGeneration(sessionId) === idleTurnGeneration) {
+	          scheduleIdle(sessionId, "session.idle");
+	        }
 	      } else if (type === "session.error") {
         cancelPendingStop(sessionId);
         const turn = activeTurn(sessionId);

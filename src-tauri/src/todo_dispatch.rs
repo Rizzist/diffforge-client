@@ -21,8 +21,15 @@ const TODO_DISPATCH_APP_CONTROL_PANE_ID: &str = "forge-app-control-agent-termina
 
 static TODO_DISPATCH_RECEIPTS_CACHE: OnceLock<StdMutex<HashMap<String, Value>>> = OnceLock::new();
 static TODO_DISPATCH_DRAIN_NOTIFIED_AT: OnceLock<StdMutex<HashMap<String, u64>>> = OnceLock::new();
-static TODO_DISPATCH_ATTENTION_NOTIFIED_AT: OnceLock<StdMutex<HashMap<String, u64>>> =
-    OnceLock::new();
+#[derive(Default)]
+struct TodoDispatchAttentionNotificationState {
+    in_flight: HashSet<(String, u64)>,
+    notified_at: HashMap<(String, u64), u64>,
+}
+
+static TODO_DISPATCH_ATTENTION_NOTIFICATIONS: OnceLock<
+    StdMutex<TodoDispatchAttentionNotificationState>,
+> = OnceLock::new();
 static TODO_DISPATCH_APP_STARTED_MS: OnceLock<u64> = OnceLock::new();
 static TODO_STORE_ORPHAN_SWEEP_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
 static TODO_STORE_ORPHAN_SWEEP_DEBOUNCE_PENDING: AtomicBool = AtomicBool::new(false);
@@ -826,14 +833,15 @@ fn todo_dispatch_native_notify(app: &AppHandle, title: &str, body: &str) {
     let _ = diffforge_native_notify(app, title, body, NativeNotificationUrgency::Normal, true);
 }
 
-fn todo_dispatch_native_attention_notify(app: &AppHandle, title: &str, body: &str) {
-    let _ = diffforge_native_notify(
+fn todo_dispatch_native_attention_notify(app: &AppHandle, title: &str, body: &str) -> bool {
+    diffforge_native_notify_with_outcome(
         app,
         title,
         body,
         NativeNotificationUrgency::Attention,
         false,
-    );
+    )
+    .unwrap_or(false)
 }
 
 fn todo_dispatch_maybe_notify_drained(
@@ -1858,18 +1866,92 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
     outcome
 }
 
-fn todo_dispatch_attention_should_notify(key: String) -> bool {
+#[cfg(test)]
+fn todo_dispatch_attention_recently_notified(key: &(String, u64)) -> bool {
     let now = todo_dispatch_now_ms();
-    let dedupe = TODO_DISPATCH_ATTENTION_NOTIFIED_AT.get_or_init(|| StdMutex::new(HashMap::new()));
-    let Ok(mut map) = dedupe.lock() else {
-        return true;
+    let dedupe = TODO_DISPATCH_ATTENTION_NOTIFICATIONS
+        .get_or_init(|| StdMutex::new(TodoDispatchAttentionNotificationState::default()));
+    let Ok(mut state) = dedupe.lock() else {
+        return false;
     };
-    map.retain(|_, at| now.saturating_sub(*at) < TODO_DISPATCH_ATTENTION_DEDUPE_MS);
-    if map.contains_key(&key) {
+    state
+        .notified_at
+        .retain(|_, at| now.saturating_sub(*at) < TODO_DISPATCH_ATTENTION_DEDUPE_MS);
+    state.notified_at.contains_key(key)
+}
+
+fn todo_dispatch_attention_interaction_key_parts(
+    active_interaction_id: Option<&str>,
+    active_interaction_revision: Option<u64>,
+    event_interaction_id: Option<&str>,
+    event_interaction_revision: Option<u64>,
+) -> Option<(String, u64)> {
+    let pair = match (
+        active_interaction_id,
+        active_interaction_revision,
+    ) {
+        (Some(interaction_id), Some(revision)) => Some((interaction_id, revision)),
+        _ => match (event_interaction_id, event_interaction_revision) {
+            (Some(interaction_id), Some(revision)) => Some((interaction_id, revision)),
+            _ => None,
+        },
+    };
+    pair.and_then(|(interaction_id, revision)| {
+        let interaction_id = interaction_id.trim();
+        (!interaction_id.is_empty() && revision > 0)
+            .then(|| (interaction_id.to_string(), revision))
+    })
+}
+
+fn todo_dispatch_attention_interaction_key(
+    payload: &TerminalActivityHookPayload,
+) -> Option<(String, u64)> {
+    todo_dispatch_attention_interaction_key_parts(
+        payload.active_interaction_id.as_deref(),
+        payload.active_interaction_revision,
+        payload.interaction_id.as_deref(),
+        payload.interaction_revision,
+    )
+}
+
+fn todo_dispatch_try_attention_notification<F>(
+    key: (String, u64),
+    watched: bool,
+    notify: F,
+) -> bool
+where
+    F: FnOnce() -> bool,
+{
+    if watched {
         return false;
     }
-    map.insert(key, now);
-    true
+    let dedupe = TODO_DISPATCH_ATTENTION_NOTIFICATIONS
+        .get_or_init(|| StdMutex::new(TodoDispatchAttentionNotificationState::default()));
+    let claimed = if let Ok(mut state) = dedupe.lock() {
+        let now = todo_dispatch_now_ms();
+        state
+            .notified_at
+            .retain(|_, at| now.saturating_sub(*at) < TODO_DISPATCH_ATTENTION_DEDUPE_MS);
+        if state.notified_at.contains_key(&key) || state.in_flight.contains(&key) {
+            false
+        } else {
+            state.in_flight.insert(key.clone());
+            true
+        }
+    } else {
+        true
+    };
+    if !claimed {
+        return false;
+    }
+    let shown = notify();
+    if let Ok(mut state) = dedupe.lock() {
+        state.in_flight.remove(&key);
+        if shown {
+            state.notified_at.insert(key, todo_dispatch_now_ms());
+        }
+    }
+    shown
 }
 
 fn todo_dispatch_normalize_activity_hook_event_type(value: &str) -> String {
@@ -1920,25 +2002,14 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
         || matches!(
             event_type.as_str(),
             "provider-manual-approval-required" | "provider-user-input-required"
-        );
+    );
     if needs_attention {
-        let dedupe_key = format!(
-            "{}::{}::{}",
-            payload.pane_id,
-            event_type,
-            payload
-                .approval_id
-                .as_deref()
-                .or(payload.permission_request_id.as_deref())
-                .or(payload.tool_use_id.as_deref())
-                .unwrap_or("attention"),
-        );
         // Watching the workspace's terminals means the pane chip and in-app
         // attention cue are already on screen — a time-sensitive native
-        // banner on top of them is noise (it used to bypass focus entirely).
-        if todo_dispatch_attention_should_notify(dedupe_key)
-            && !native_attention_watching_workspace(payload.workspace_id.trim())
-        {
+        // banner on top of them is noise. Suppression must not claim the
+        // interaction generation's notification edge.
+        let watched = native_attention_watching_workspace(payload.workspace_id.trim());
+        let notify = || {
             let workspace_name = payload.workspace_name.trim();
             let title = "Diff Forge: approval required";
             let body = if workspace_name.is_empty() {
@@ -1946,7 +2017,12 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
             } else {
                 format!("A coding agent in {workspace_name} is waiting on a tool approval.")
             };
-            todo_dispatch_native_attention_notify(app, title, &body);
+            todo_dispatch_native_attention_notify(app, title, &body)
+        };
+        if let Some(dedupe_key) = todo_dispatch_attention_interaction_key(payload) {
+            todo_dispatch_try_attention_notification(dedupe_key, watched, notify);
+        } else if !watched {
+            notify();
         }
     }
 
@@ -7617,6 +7693,150 @@ fn chrono_like_now_iso() -> String {
 #[cfg(test)]
 mod todo_store_tests {
     use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn attention_notification_watched_suppression_does_not_consume_generation() {
+        let key = ("test-watched-attention-generation".to_string(), 101);
+        let calls = Cell::new(0_u8);
+
+        assert!(!todo_dispatch_try_attention_notification(
+            key.clone(),
+            true,
+            || {
+                calls.set(calls.get() + 1);
+                true
+            },
+        ));
+        assert_eq!(calls.get(), 0);
+        assert!(!todo_dispatch_attention_recently_notified(&key));
+
+        assert!(todo_dispatch_try_attention_notification(
+            key.clone(),
+            false,
+            || {
+                calls.set(calls.get() + 1);
+                true
+            },
+        ));
+        assert_eq!(calls.get(), 1);
+        assert!(todo_dispatch_attention_recently_notified(&key));
+        assert!(!todo_dispatch_try_attention_notification(key, false, || {
+            calls.set(calls.get() + 1);
+            true
+        }));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn attention_notification_only_consumes_generation_after_show() {
+        let key = ("test-failed-attention-generation".to_string(), 202);
+
+        assert!(!todo_dispatch_try_attention_notification(
+            key.clone(),
+            false,
+            || false,
+        ));
+        assert!(!todo_dispatch_attention_recently_notified(&key));
+        assert!(todo_dispatch_try_attention_notification(
+            key.clone(),
+            false,
+            || true,
+        ));
+        assert!(todo_dispatch_attention_recently_notified(&key));
+    }
+
+    #[test]
+    fn attention_notification_reserves_generation_while_show_is_in_flight() {
+        let key = ("test-concurrent-attention-generation".to_string(), 250);
+        let worker_key = key.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            todo_dispatch_try_attention_notification(worker_key, false, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                true
+            })
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first notification should enter the show path");
+
+        let duplicate_called = Cell::new(false);
+        assert!(!todo_dispatch_try_attention_notification(
+            key.clone(),
+            false,
+            || {
+                duplicate_called.set(true);
+                true
+            },
+        ));
+        assert!(!duplicate_called.get());
+
+        release_tx.send(()).unwrap();
+        assert!(worker.join().unwrap());
+        assert!(todo_dispatch_attention_recently_notified(&key));
+    }
+
+    #[test]
+    fn attention_notification_dedup_is_scoped_to_interaction_revision() {
+        let first = ("test-attention-edge".to_string(), 303);
+        let new_revision = ("test-attention-edge".to_string(), 304);
+        let new_interaction = ("test-attention-edge-next".to_string(), 303);
+
+        assert!(todo_dispatch_try_attention_notification(
+            first.clone(),
+            false,
+            || true,
+        ));
+        assert!(!todo_dispatch_try_attention_notification(
+            first,
+            false,
+            || true,
+        ));
+        assert!(todo_dispatch_try_attention_notification(
+            new_revision,
+            false,
+            || true,
+        ));
+        assert!(todo_dispatch_try_attention_notification(
+            new_interaction,
+            false,
+            || true,
+        ));
+    }
+
+    #[test]
+    fn attention_notification_key_uses_one_canonical_interaction_pair() {
+        assert_eq!(
+            todo_dispatch_attention_interaction_key_parts(
+                Some("uir:active"),
+                Some(401),
+                Some("uir:event"),
+                Some(400),
+            ),
+            Some(("uir:active".to_string(), 401)),
+        );
+        assert_eq!(
+            todo_dispatch_attention_interaction_key_parts(
+                Some("uir:active-without-revision"),
+                None,
+                Some("uir:event"),
+                Some(402),
+            ),
+            Some(("uir:event".to_string(), 402)),
+        );
+        assert_eq!(
+            todo_dispatch_attention_interaction_key_parts(
+                Some("uir:must-not-mix"),
+                None,
+                None,
+                Some(403),
+            ),
+            None,
+        );
+    }
 
     #[test]
     fn remote_intake_accepts_loop_send_message_aliases() {
