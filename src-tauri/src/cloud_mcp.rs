@@ -4713,6 +4713,32 @@ fn cloud_mcp_outbox_idempotency_key(
     payload_hash: &str,
     coalesce_key: Option<&str>,
 ) -> String {
+    let normalized_kind = event_kind.trim().to_ascii_lowercase();
+    if matches!(
+        normalized_kind.as_str(),
+        "remote_command_ack" | "remote_command_result"
+    ) {
+        let command_id =
+            cloud_mcp_payload_text(payload, &["command_id"]).unwrap_or_default();
+        let status = cloud_mcp_payload_text(payload, &["status", "run_status"])
+            .unwrap_or_else(|| "unknown".to_string())
+            .to_ascii_lowercase();
+        let status_event_id = cloud_mcp_payload_text(
+            payload,
+            &["status_event_id", "idempotency_key", "pid"],
+        )
+        .unwrap_or_default();
+        if !command_id.is_empty() {
+            // Remote-command statuses are an ordered event stream, not a
+            // replaceable command snapshot. Keep each lifecycle status in its
+            // own durable row while preserving per-status idempotency. A
+            // producer-provided status_event_id further distinguishes repeated
+            // events of the same status when that is intentional.
+            return format!(
+                "remote-command-status:{command_id}:{status}:{status_event_id}"
+            );
+        }
+    }
     if let Some(key) = cloud_mcp_payload_text(payload, &["pid", "idempotency_key"]) {
         return key;
     }
@@ -4721,7 +4747,6 @@ fn cloud_mcp_outbox_idempotency_key(
     {
         return key;
     }
-    let normalized_kind = event_kind.trim().to_ascii_lowercase();
     if normalized_kind == "script.inventory" || normalized_kind == "script_inventory" {
         let device_id =
             cloud_mcp_payload_text(payload, &["owner_device_id", "device_id"]).unwrap_or_default();
@@ -19819,6 +19844,7 @@ async fn cloud_mcp_send_remote_command_status_event(
         "repo_id": cloud_mcp_payload_text(event, &["repo_id"])
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "repo_id"])),
         "workspace_id": cloud_mcp_remote_command_field_text(event, &["workspace_id"]),
+        "status_event_id": cloud_mcp_payload_text(event, &["status_event_id", "idempotency_key"]),
         "status": status,
         "message": message,
         "rust_received_ms": now,
@@ -19883,9 +19909,11 @@ async fn cloud_mcp_send_remote_command_status_event(
             }),
         );
     });
+    let durable_status_id = cloud_mcp_payload_text(&payload, &["status_event_id"])
+        .unwrap_or_else(|| now.to_string());
     cloud_mcp_enqueue_background_sync(
         state,
-        format!("remote-command-status:{command_id}:{status}:{now}"),
+        format!("remote-command-status:{command_id}:{status}:{durable_status_id}"),
         status_kind,
         payload.clone(),
         cloud_mcp_outbox_priority_for_event(status_kind),
@@ -74003,6 +74031,148 @@ mod cloud_mcp_tests {
         assert_ne!(queued_key, cancelled_key);
         assert!(queued_key.contains("hash-queued"));
         assert!(cancelled_key.contains("hash-cancelled"));
+    }
+
+    #[test]
+    fn remote_command_status_outbox_keeps_each_lifecycle_status_distinct() {
+        let queued = json!({
+            "command_id": "command-1",
+            "status": "queued",
+            "status_event_id": "batch-1:queued",
+        });
+        let running = json!({
+            "command_id": "command-1",
+            "status": "running",
+            "status_event_id": "batch-1:running",
+        });
+        let completed = json!({
+            "command_id": "command-1",
+            "status": "completed",
+            "status_event_id": "batch-1:completed",
+        });
+
+        let queued_key =
+            cloud_mcp_outbox_idempotency_key("remote_command_ack", &queued, "hash", None);
+        let running_key =
+            cloud_mcp_outbox_idempotency_key("remote_command_ack", &running, "hash", None);
+        let completed_key =
+            cloud_mcp_outbox_idempotency_key("remote_command_result", &completed, "hash", None);
+
+        assert_eq!(
+            queued_key,
+            "remote-command-status:command-1:queued:batch-1:queued"
+        );
+        assert_eq!(
+            running_key,
+            "remote-command-status:command-1:running:batch-1:running"
+        );
+        assert_eq!(
+            completed_key,
+            "remote-command-status:command-1:completed:batch-1:completed"
+        );
+        assert_ne!(queued_key, running_key);
+        assert_ne!(running_key, completed_key);
+
+        let repeated_running = cloud_mcp_outbox_idempotency_key(
+            "remote_command_ack",
+            &running,
+            "different-payload-hash",
+            None,
+        );
+        assert_eq!(running_key, repeated_running);
+
+        let shared_explicit_key_queued = json!({
+            "command_id": "command-2",
+            "status": "queued",
+            "idempotency_key": "shared-command-key",
+        });
+        let shared_explicit_key_running = json!({
+            "command_id": "command-2",
+            "status": "running",
+            "idempotency_key": "shared-command-key",
+        });
+        assert_ne!(
+            cloud_mcp_outbox_idempotency_key(
+                "remote_command_ack",
+                &shared_explicit_key_queued,
+                "hash",
+                None,
+            ),
+            cloud_mcp_outbox_idempotency_key(
+                "remote_command_ack",
+                &shared_explicit_key_running,
+                "hash",
+                None,
+            ),
+            "a caller-supplied command key must not collapse distinct statuses",
+        );
+    }
+
+    #[test]
+    fn remote_command_status_outbox_persists_and_claims_all_statuses_in_order() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let cache_root = test_cloud_root("diffforge-remote-command-status-outbox-cache");
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        let events = [
+            (
+                "remote_command_ack",
+                json!({
+                    "command_id": "offline-command-1",
+                    "status": "queued",
+                    "status_event_id": "offline-command-1:queued",
+                }),
+            ),
+            (
+                "remote_command_ack",
+                json!({
+                    "command_id": "offline-command-1",
+                    "status": "running",
+                    "status_event_id": "offline-command-1:running",
+                }),
+            ),
+            (
+                "remote_command_result",
+                json!({
+                    "command_id": "offline-command-1",
+                    "status": "completed",
+                    "status_event_id": "offline-command-1:completed",
+                }),
+            ),
+        ];
+        let mut outbox_ids = Vec::new();
+        for (event_kind, payload) in &events {
+            let row = cloud_mcp_outbox_enqueue_event(
+                event_kind,
+                payload,
+                CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
+                "offline_remote_command_status_test",
+            )
+            .unwrap();
+            outbox_ids.push(row.outbox_id);
+        }
+        assert_eq!(outbox_ids.iter().collect::<HashSet<_>>().len(), 3);
+
+        let claimed = cloud_mcp_outbox_claim_due_rows(10).unwrap();
+        let statuses = claimed
+            .iter()
+            .filter_map(|row| serde_json::from_str::<Value>(&row.payload_json).ok())
+            .filter(|payload| payload["command_id"] == json!("offline-command-1"))
+            .filter_map(|payload| payload["status"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        assert_eq!(statuses, vec!["queued", "running", "completed"]);
+
+        // Model a successful reconnect drain. The production worker consumes
+        // this claimed vector sequentially, so acking it in-order proves all
+        // three durable rows survive offline storage through delivery.
+        for row in &claimed {
+            cloud_mcp_outbox_mark_acked(row, &json!({ "ok": true })).unwrap();
+        }
+        assert!(cloud_mcp_outbox_claim_due_rows(10).unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(cache_root);
     }
 
     #[test]

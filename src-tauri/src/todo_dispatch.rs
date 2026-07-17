@@ -35,6 +35,20 @@ static TODO_STORE_ORPHAN_SWEEP_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = Once
 static TODO_STORE_ORPHAN_SWEEP_DEBOUNCE_PENDING: AtomicBool = AtomicBool::new(false);
 static TODO_DISPATCH_WORKSPACE_ACTIVATION_ATTEMPTS: OnceLock<StdMutex<HashMap<String, u64>>> =
     OnceLock::new();
+static TODO_DISPATCH_LOOPSPACE_BATCH_LIFECYCLE: OnceLock<StdMutex<HashMap<String, String>>> =
+    OnceLock::new();
+static TODO_DISPATCH_LOOPSPACE_BATCH_PENDING_QUEUED_ACK: OnceLock<StdMutex<HashSet<String>>> =
+    OnceLock::new();
+
+#[derive(Clone, Debug)]
+struct TodoDispatchLoopspaceBatchLifecycle {
+    batch_id: String,
+    run_id: String,
+    status: String,
+    status_counts: Value,
+    children: Vec<Value>,
+    representative: Value,
+}
 
 fn todo_dispatch_now_ms() -> u64 {
     SystemTime::now()
@@ -2000,10 +2014,10 @@ fn todo_dispatch_activity_hook_settle_status(
     }
 }
 
-/// Observe terminal activity hook lifecycle payloads at their Rust emit site.
-/// Handles: attention notifications (approval / user input required) and
-/// settlement of submitted receipts on provider turn completion.
-pub(crate) fn todo_dispatch_observe_activity_hook(
+/// Propagate authoritative terminal readiness into the Rust dispatch runtime.
+/// This queue-boundary update must run for startup/recovery-derived events even
+/// when those events are not allowed to settle the currently submitted todo.
+pub(crate) fn todo_dispatch_observe_activity_hook_readiness(
     app: &AppHandle,
     payload: &TerminalActivityHookPayload,
 ) {
@@ -2013,6 +2027,18 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
     if todo_dispatch_activity_hook_should_wake_queue(payload, &event_type) {
         todo_dispatch_wake_background_dispatcher(app.clone());
     }
+}
+
+/// Observe terminal activity hook lifecycle payloads at their Rust emit site.
+/// Handles: readiness propagation, attention notifications (approval / user
+/// input required), and settlement of submitted receipts on provider turn
+/// completion.
+pub(crate) fn todo_dispatch_observe_activity_hook(
+    app: &AppHandle,
+    payload: &TerminalActivityHookPayload,
+) {
+    todo_dispatch_observe_activity_hook_readiness(app, payload);
+    let event_type = todo_dispatch_normalize_activity_hook_event_type(&payload.event_type);
 
     let needs_attention = payload.manual_approval_required
         || payload.terminal_is_prompting_user
@@ -2724,8 +2750,14 @@ async fn todo_store_startup_reconcile_finalize_queues(app: &AppHandle) -> usize 
             todo_dispatch_queue_write(&workspace_id, &current_items);
         }
         changed_count += corrections.len();
-        todo_store_push_corrections(app, &workspace_id, corrections, "app_restart_reconcile");
+        todo_store_push_corrections(
+            app,
+            &workspace_id,
+            corrections.clone(),
+            "app_restart_reconcile",
+        );
         todo_store_emit_changed(app, &workspace_id, "app_restart_reconcile", "store");
+        todo_dispatch_emit_loopspace_batch_lifecycles(app, &corrections);
     }
 
     let stale = cloud_mcp_todo_mirror_device_items_in_statuses(
@@ -2756,11 +2788,19 @@ async fn todo_store_startup_reconcile_finalize_queues(app: &AppHandle) -> usize 
         todo_store_set_item_status(&mut item, "interrupted", "app_restart");
         by_workspace.entry(workspace_id).or_default().push(item);
     }
+    let mut lifecycle_items = Vec::new();
     for (workspace_id, items) in by_workspace {
         changed_count += items.len();
-        todo_store_push_corrections(app, &workspace_id, items, "app_restart_reconcile");
+        lifecycle_items.extend(items.iter().cloned());
+        todo_store_push_corrections(
+            app,
+            &workspace_id,
+            items.clone(),
+            "app_restart_reconcile",
+        );
         todo_store_emit_changed(app, &workspace_id, "app_restart_reconcile", "store");
     }
+    todo_dispatch_emit_loopspace_batch_lifecycles(app, &lifecycle_items);
     changed_count
 }
 
@@ -5021,10 +5061,41 @@ fn todo_store_dispatch_workspace_ids(request: &Value) -> Vec<String> {
     ))
 }
 
-fn todo_store_dispatch_todo_drafts(request: &Value) -> Vec<Value> {
-    if let Some(items) = todo_store_dispatch_array_field(request, &["todo_items", "todos", "items"])
-    {
-        return items
+fn todo_store_dispatch_todo_drafts(request: &Value) -> Result<Vec<Value>, String> {
+    if let Some(items) = todo_store_dispatch_array_field(request, &["todo_items"]) {
+        let mut drafts = Vec::with_capacity(items.len());
+        for (index, item) in items.into_iter().enumerate() {
+            if item.is_object() {
+                let body = todo_store_draft_text(
+                    &item,
+                    &["text", "body", "message", "prompt", "long_text", "note_text"],
+                    TODO_STORE_DRAFT_TEXT_MAX_CHARS,
+                );
+                if body.is_empty() {
+                    return Err(format!(
+                        "todo_items[{}] requires usable todo text or body.",
+                        index
+                    ));
+                }
+                drafts.push(item);
+            } else {
+                let text = todo_store_normalize_draft_text(
+                    item.as_str().unwrap_or_default(),
+                    TODO_STORE_DRAFT_TEXT_MAX_CHARS,
+                );
+                if text.is_empty() {
+                    return Err(format!(
+                        "todo_items[{}] requires usable todo text or body.",
+                        index
+                    ));
+                }
+                drafts.push(json!({ "text": text }));
+            }
+        }
+        return Ok(drafts);
+    }
+    if let Some(items) = todo_store_dispatch_array_field(request, &["todos", "items"]) {
+        return Ok(items
             .into_iter()
             .filter_map(|item| {
                 if item.is_object() {
@@ -5034,55 +5105,351 @@ fn todo_store_dispatch_todo_drafts(request: &Value) -> Vec<Value> {
                     (!text.is_empty()).then(|| json!({ "text": text }))
                 }
             })
-            .collect();
+            .collect());
     }
-    let text = todo_dispatch_text(
-        request,
-        &[
-            "todo_lines",
-            "todos",
-            "items",
-            "text",
-            "prompt",
-            "message",
-            "body",
-        ],
-    );
-    text.lines()
+
+    // Legacy todo_lines/todos strings were historically line-oriented. Keep
+    // that wire contract while allowing a structured todo_items[{text}]
+    // payload to carry one intentionally multiline body.
+    let legacy_lines = todo_dispatch_text(request, &["todo_lines", "todos"]);
+    if !legacy_lines.is_empty() {
+        let normalized =
+            todo_store_normalize_draft_text(&legacy_lines, TODO_STORE_DRAFT_TEXT_MAX_CHARS);
+        return Ok(normalized
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(|line| json!({ "text": line }))
+            .collect());
+    }
+
+    let text = todo_dispatch_text(request, &["items", "text", "prompt", "message", "body"]);
+    let text = todo_store_normalize_draft_text(&text, TODO_STORE_DRAFT_TEXT_MAX_CHARS);
+    Ok(text
+        .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(|line| json!({ "text": line }))
-        .collect()
+        .collect())
 }
 
-fn todo_store_sanitize_loopspace_dispatch_draft(
+fn todo_store_normalize_loopspace_dispatch_draft(
     draft_object: &mut serde_json::Map<String, Value>,
     sequence: usize,
 ) {
-    for text_key in [
-        "body",
-        "items",
-        "long_text",
-        "message",
-        "name",
-        "note",
-        "note_text",
-        "prompt",
-        "text",
-        "title",
-        "todo_lines",
-        "todos",
-    ] {
-        draft_object.remove(text_key);
+    let draft = Value::Object(draft_object.clone());
+    let text = todo_store_draft_text(
+        &draft,
+        &[
+            "text",
+            "body",
+            "message",
+            "prompt",
+            "long_text",
+            "note_text",
+            "title",
+        ],
+        TODO_STORE_DRAFT_TEXT_MAX_CHARS,
+    );
+    if !text.is_empty() {
+        draft_object.insert("text".to_string(), json!(text));
     }
-    draft_object.insert(
-        "text".to_string(),
-        json!(format!("Loopspace Dispatch Todo run #{}", sequence)),
+    if todo_dispatch_text(&draft, &["title", "name"]).is_empty() {
+        draft_object.insert(
+            "title".to_string(),
+            json!(format!("Loopspace Dispatch Todo #{}", sequence)),
+        );
+    }
+}
+
+fn todo_dispatch_loopspace_batch_lifecycle_from_items(
+    items: &[Value],
+) -> Option<TodoDispatchLoopspaceBatchLifecycle> {
+    let representative = items.first()?.clone();
+    let run_id = todo_dispatch_text(&representative, &["loop_runtime_run_id", "run_id"]);
+    let batch_id = todo_dispatch_text(&representative, &["todo_batch_id", "batch_id"]);
+    if run_id.is_empty() || batch_id.is_empty() {
+        return None;
+    }
+
+    let mut queued = 0usize;
+    let mut running = 0usize;
+    let mut completed = 0usize;
+    let mut failed = 0usize;
+    let mut interrupted = 0usize;
+    let mut cancelled = 0usize;
+    let mut timed_out = 0usize;
+    let mut other = 0usize;
+    let mut children = items
+        .iter()
+        .filter(|item| {
+            todo_dispatch_text(item, &["loop_runtime_run_id", "run_id"]) == run_id
+                && todo_dispatch_text(item, &["todo_batch_id", "batch_id"]) == batch_id
+        })
+        .map(|item| {
+            let status = todo_store_item_status(item);
+            match status.as_str() {
+                "queued" | "listed" | "sending" | "dispatching" => queued += 1,
+                "running" | "submitted" | "paused" => running += 1,
+                "completed" => completed += 1,
+                "failed" => failed += 1,
+                "interrupted" => interrupted += 1,
+                "cancelled" => cancelled += 1,
+                "timed_out" => timed_out += 1,
+                _ => other += 1,
+            }
+            json!({
+                "command_id": todo_dispatch_text(item, &["command_id"]),
+                "dispatch_id": todo_dispatch_text(item, &["dispatch_id", "last_dispatch_id"]),
+                "status": status,
+                "todo_id": todo_dispatch_text(item, &["todo_id", "id"]),
+                "workspace_id": todo_dispatch_text(item, &["workspace_id", "target_workspace_id"]),
+            })
+        })
+        .collect::<Vec<_>>();
+    children.sort_by(|left, right| {
+        todo_dispatch_text(left, &["workspace_id"])
+            .cmp(&todo_dispatch_text(right, &["workspace_id"]))
+            .then_with(|| {
+                todo_dispatch_text(left, &["todo_id"]).cmp(&todo_dispatch_text(right, &["todo_id"]))
+            })
+    });
+    let total = children.len();
+    if total == 0 {
+        return None;
+    }
+    let settled = completed + failed + interrupted + cancelled + timed_out;
+    // Batch policy: a terminal callback is emitted only after every child is
+    // settled. Failure/cancellation/timeout dominates interruption, which in
+    // turn dominates success. Until then, the first submitted or settled child
+    // advances the aggregate to running while untouched children may remain queued.
+    let status = if settled == total {
+        if failed + cancelled + timed_out > 0 {
+            "failed"
+        } else if interrupted > 0 {
+            "interrupted"
+        } else if completed == total {
+            "completed"
+        } else {
+            "failed"
+        }
+    } else if running + settled > 0 {
+        "running"
+    } else {
+        "queued"
+    }
+    .to_string();
+    Some(TodoDispatchLoopspaceBatchLifecycle {
+        batch_id,
+        run_id,
+        status,
+        status_counts: json!({
+            "cancelled": cancelled,
+            "completed": completed,
+            "failed": failed,
+            "interrupted": interrupted,
+            "other": other,
+            "queued": queued,
+            "running": running,
+            "settled": settled,
+            "timed_out": timed_out,
+            "total": total,
+        }),
+        children,
+        representative,
+    })
+}
+
+fn todo_dispatch_loopspace_batch_lifecycle_items(item: &Value) -> Vec<Value> {
+    let run_id = todo_dispatch_text(item, &["loop_runtime_run_id", "run_id"]);
+    let batch_id = todo_dispatch_text(item, &["todo_batch_id", "batch_id"]);
+    if run_id.is_empty() || batch_id.is_empty() {
+        return Vec::new();
+    }
+    let _store_guard = todo_dispatch_queue_store_guard();
+    todo_dispatch_data_workspace_files("queues")
+        .into_iter()
+        .flat_map(|path| {
+            todo_dispatch_queue_read(&path)
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter(|candidate| {
+            todo_dispatch_text(candidate, &["loop_runtime_run_id", "run_id"]) == run_id
+                && todo_dispatch_text(candidate, &["todo_batch_id", "batch_id"]) == batch_id
+        })
+        .collect()
+}
+
+fn todo_dispatch_loopspace_batch_lifecycle_items_with_overrides(
+    item: &Value,
+    overrides: &[Value],
+) -> Vec<Value> {
+    let run_id = todo_dispatch_text(item, &["loop_runtime_run_id", "run_id"]);
+    let batch_id = todo_dispatch_text(item, &["todo_batch_id", "batch_id"]);
+    let mut items = todo_dispatch_loopspace_batch_lifecycle_items(item);
+    for override_item in overrides.iter().filter(|candidate| {
+        todo_dispatch_text(candidate, &["loop_runtime_run_id", "run_id"]) == run_id
+            && todo_dispatch_text(candidate, &["todo_batch_id", "batch_id"]) == batch_id
+    }) {
+        if let Some(existing) = items
+            .iter_mut()
+            .find(|candidate| todo_store_items_share_identity(candidate, override_item))
+        {
+            *existing = override_item.clone();
+        } else {
+            // Startup/orphan reconciliation can originate from a durable mirror
+            // row after its queue file disappeared. Include that corrected row
+            // in the aggregate instead of leaving the batch lifecycle running.
+            items.push(override_item.clone());
+        }
+    }
+    items
+}
+
+fn todo_dispatch_loopspace_batch_lifecycle_claim(
+    lifecycle: &TodoDispatchLoopspaceBatchLifecycle,
+) -> bool {
+    let state = TODO_DISPATCH_LOOPSPACE_BATCH_LIFECYCLE
+        .get_or_init(|| StdMutex::new(HashMap::new()));
+    let Ok(mut state) = state.lock() else {
+        return false;
+    };
+    let key = format!("{}:{}", lifecycle.run_id, lifecycle.batch_id);
+    let previous = state.get(&key).map(String::as_str).unwrap_or_default();
+    let previous_terminal = matches!(previous, "completed" | "failed" | "interrupted");
+    let next_rank = match lifecycle.status.as_str() {
+        "queued" => 0,
+        "running" => 1,
+        "completed" | "failed" | "interrupted" => 2,
+        _ => return false,
+    };
+    let previous_rank = match previous {
+        "running" => 1,
+        "completed" | "failed" | "interrupted" => 2,
+        _ => 0,
+    };
+    if previous_terminal || previous == lifecycle.status || next_rank < previous_rank {
+        return false;
+    }
+    state.insert(key, lifecycle.status.clone());
+    true
+}
+
+fn todo_dispatch_loopspace_batch_pending_queued_ack_key(run_id: &str, batch_id: &str) -> String {
+    format!("{}:{}", run_id.trim(), batch_id.trim())
+}
+
+fn todo_dispatch_loopspace_batch_pending_queued_ack_set(
+    run_id: &str,
+    batch_id: &str,
+    pending: bool,
+) {
+    if run_id.trim().is_empty() || batch_id.trim().is_empty() {
+        return;
+    }
+    let state = TODO_DISPATCH_LOOPSPACE_BATCH_PENDING_QUEUED_ACK
+        .get_or_init(|| StdMutex::new(HashSet::new()));
+    if let Ok(mut state) = state.lock() {
+        let key = todo_dispatch_loopspace_batch_pending_queued_ack_key(run_id, batch_id);
+        if pending {
+            state.insert(key);
+        } else {
+            state.remove(&key);
+        }
+    }
+}
+
+fn todo_dispatch_loopspace_batch_pending_queued_ack(run_id: &str, batch_id: &str) -> bool {
+    let state = TODO_DISPATCH_LOOPSPACE_BATCH_PENDING_QUEUED_ACK
+        .get_or_init(|| StdMutex::new(HashSet::new()));
+    state.lock().ok().is_some_and(|state| {
+        state.contains(&todo_dispatch_loopspace_batch_pending_queued_ack_key(
+            run_id, batch_id,
+        ))
+    })
+}
+
+fn todo_dispatch_emit_loopspace_batch_lifecycle_with_overrides(
+    app: &AppHandle,
+    item: &Value,
+    overrides: &[Value],
+) {
+    let run_id = todo_dispatch_text(item, &["loop_runtime_run_id", "run_id"]);
+    let batch_id = todo_dispatch_text(item, &["todo_batch_id", "batch_id"]);
+    // The queue can be picked up by an already-scheduled dispatcher while the
+    // command is still durably enqueueing its queued acknowledgement. Hold
+    // later lifecycle callbacks at this boundary, then recompute immediately
+    // after the queued acknowledgement is recorded.
+    if todo_dispatch_loopspace_batch_pending_queued_ack(&run_id, &batch_id) {
+        return;
+    }
+    let items = todo_dispatch_loopspace_batch_lifecycle_items_with_overrides(item, overrides);
+    let Some(lifecycle) = todo_dispatch_loopspace_batch_lifecycle_from_items(&items) else {
+        return;
+    };
+    if lifecycle.status == "queued" || !todo_dispatch_loopspace_batch_lifecycle_claim(&lifecycle) {
+        return;
+    }
+    let mut event = lifecycle.representative.clone();
+    let lifecycle_event_id = format!(
+        "loopspace-todo-batch:{}:{}:{}",
+        lifecycle.run_id, lifecycle.batch_id, lifecycle.status
     );
-    draft_object.insert(
-        "title".to_string(),
-        json!(format!("Loopspace Dispatch Todo #{}", sequence)),
-    );
+    if let Some(object) = event.as_object_mut() {
+        object.insert("command_id".to_string(), json!(lifecycle.run_id.clone()));
+        object.insert(
+            "command_kind".to_string(),
+            json!("loopspace_dispatch_todos"),
+        );
+        object.insert("status_event_id".to_string(), json!(lifecycle_event_id.clone()));
+        object.insert("todo_batch_id".to_string(), json!(lifecycle.batch_id.clone()));
+    }
+    let message = match lifecycle.status.as_str() {
+        "running" => "Loopspace todo batch started running.",
+        "completed" => "All todos in the Loopspace batch completed.",
+        "interrupted" => "The Loopspace todo batch was interrupted.",
+        _ => "The Loopspace todo batch failed.",
+    };
+    let details = json!({
+        "aggregate_policy": "all_settled_failure_then_interrupted_then_completed",
+        "child_todos": lifecycle.children,
+        "idempotency_key": lifecycle_event_id,
+        "status_counts": lifecycle.status_counts,
+        "todo_batch_id": lifecycle.batch_id,
+    });
+    let status = lifecycle.status;
+    let state = app.state::<CloudMcpState>().inner().clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = cloud_mcp_send_remote_command_status_event(
+            &state,
+            &event,
+            &status,
+            message,
+            Some(&details),
+        )
+        .await;
+    });
+}
+
+fn todo_dispatch_emit_loopspace_batch_lifecycle(app: &AppHandle, item: &Value) {
+    todo_dispatch_emit_loopspace_batch_lifecycle_with_overrides(app, item, &[]);
+}
+
+fn todo_dispatch_emit_loopspace_batch_lifecycles(app: &AppHandle, items: &[Value]) {
+    let mut emitted = HashSet::new();
+    for item in items {
+        let run_id = todo_dispatch_text(item, &["loop_runtime_run_id", "run_id"]);
+        let batch_id = todo_dispatch_text(item, &["todo_batch_id", "batch_id"]);
+        if run_id.is_empty() || batch_id.is_empty() {
+            continue;
+        }
+        if emitted.insert(format!("{run_id}:{batch_id}")) {
+            todo_dispatch_emit_loopspace_batch_lifecycle_with_overrides(app, item, items);
+        }
+    }
 }
 
 fn todo_store_dispatch_optional_i64(value: &Value, keys: &[&str]) -> Option<i64> {
@@ -5254,7 +5621,7 @@ async fn todo_store_dispatch_loopspace_batch(
     if workspace_ids.is_empty() {
         return Err("Dispatch todos requires at least one workspace id.".to_string());
     }
-    let todo_drafts = todo_store_dispatch_todo_drafts(&request);
+    let todo_drafts = todo_store_dispatch_todo_drafts(&request)?;
     if todo_drafts.is_empty() {
         return Err("Dispatch todos requires at least one todo.".to_string());
     }
@@ -5262,21 +5629,35 @@ async fn todo_store_dispatch_loopspace_batch(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "loopspace_dispatch_todos".to_string());
+    let loopspace_id = todo_dispatch_text(&request, &["loopspace_id"]);
+    let node_id = todo_dispatch_text(&request, &["node_id", "loop_runtime_node_id"]);
+    let requested_batch_id = todo_dispatch_text(&request, &["todo_batch_id", "batch_id"]);
+    let batch_id = if requested_batch_id.is_empty() {
+        format!(
+            "loopspace-{}-{}-{}",
+            todo_store_dispatch_batch_id_part(&loopspace_id, "loop"),
+            todo_store_dispatch_batch_id_part(&node_id, "node"),
+            uuid::Uuid::new_v4()
+        )
+    } else {
+        requested_batch_id
+    };
+    let loop_runtime_run_id = todo_dispatch_text(
+        &request,
+        &["loop_runtime_run_id", "run_id", "command_id"],
+    );
+    todo_dispatch_loopspace_batch_pending_queued_ack_set(
+        &loop_runtime_run_id,
+        &batch_id,
+        true,
+    );
+    let status_event = request.clone();
+    let worker_app = app.clone();
+    let worker_batch_id = batch_id.clone();
 
-    tauri::async_runtime::spawn_blocking(move || {
-        let loopspace_id = todo_dispatch_text(&request, &["loopspace_id"]);
-        let node_id = todo_dispatch_text(&request, &["node_id", "loop_runtime_node_id"]);
-        let requested_batch_id = todo_dispatch_text(&request, &["todo_batch_id", "batch_id"]);
-        let batch_id = if requested_batch_id.is_empty() {
-            format!(
-                "loopspace-{}-{}-{}",
-                todo_store_dispatch_batch_id_part(&loopspace_id, "loop"),
-                todo_store_dispatch_batch_id_part(&node_id, "node"),
-                uuid::Uuid::new_v4()
-            )
-        } else {
-            requested_batch_id
-        };
+    let result = tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        let app = worker_app;
+        let batch_id = worker_batch_id;
         let mut base = serde_json::Map::new();
         for (target_key, source_keys) in [
             ("device_id", &["device_id", "source_device_id"][..]),
@@ -5362,7 +5743,7 @@ async fn todo_store_dispatch_loopspace_batch(
                     &mut draft_object,
                     &terminal_selector,
                 );
-                todo_store_sanitize_loopspace_dispatch_draft(&mut draft_object, sequence);
+                todo_store_normalize_loopspace_dispatch_draft(&mut draft_object, sequence);
                 let requested_todo_id = todo_dispatch_text(
                     &Value::Object(draft_object.clone()),
                     &["id", "todo_id", "command_id"],
@@ -5455,20 +5836,115 @@ async fn todo_store_dispatch_loopspace_batch(
             }));
         }
 
-        if total_queued > 0 {
-            todo_dispatch_wake_background_dispatcher(app.clone());
+        let batch_lifecycle = todo_dispatch_loopspace_batch_lifecycle_from_items(&all_items);
+        if let Some(lifecycle) = batch_lifecycle.as_ref() {
+            if lifecycle.status == "queued" {
+                let _ = todo_dispatch_loopspace_batch_lifecycle_claim(lifecycle);
+            }
         }
+        let child_todos = batch_lifecycle
+            .as_ref()
+            .map(|lifecycle| lifecycle.children.clone())
+            .unwrap_or_default();
+        let status_counts = batch_lifecycle
+            .as_ref()
+            .map(|lifecycle| lifecycle.status_counts.clone())
+            .unwrap_or_else(|| json!({
+                "queued": total_queued,
+                "settled": 0,
+                "total": total_queued,
+            }));
 
         Ok(json!({
             "ok": true,
             "batch_id": batch_id.clone(),
             "todo_batch_id": batch_id,
             "queued_count": total_queued,
+            "child_todos": child_todos,
+            "status_counts": status_counts,
             "items": all_items,
             "workspaces": workspace_results}))
     })
     .await
-    .map_err(|error| format!("Loopspace todo dispatch worker failed: {error}"))?
+    .map_err(|error| format!("Loopspace todo dispatch worker failed: {error}"));
+    let result = match result {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            todo_dispatch_loopspace_batch_pending_queued_ack_set(
+                &loop_runtime_run_id,
+                &batch_id,
+                false,
+            );
+            return Err(error);
+        }
+        Err(error) => {
+            todo_dispatch_loopspace_batch_pending_queued_ack_set(
+                &loop_runtime_run_id,
+                &batch_id,
+                false,
+            );
+            return Err(error);
+        }
+    };
+
+    let queued_count = result
+        .get("queued_count")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let loopspace_id = todo_dispatch_text(&status_event, &["loopspace_id"]);
+    if queued_count > 0 && !loop_runtime_run_id.is_empty() && !loopspace_id.is_empty() {
+        let batch_id = todo_dispatch_text(&result, &["todo_batch_id", "batch_id"]);
+        let lifecycle_event_id = format!(
+            "loopspace-todo-batch:{loop_runtime_run_id}:{batch_id}:queued"
+        );
+        let mut queued_event = status_event.clone();
+        if let Some(object) = queued_event.as_object_mut() {
+            object.insert("status_event_id".to_string(), json!(lifecycle_event_id.clone()));
+        }
+        let workspace_count = result
+            .get("workspaces")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default();
+        let details = json!({
+            "child_todos": result.get("child_todos").cloned().unwrap_or_else(|| json!([])),
+            "command_kind": "loopspace_dispatch_todos",
+            "idempotency_key": lifecycle_event_id,
+            "queued_count": queued_count,
+            "status_counts": result.get("status_counts").cloned().unwrap_or_else(|| json!({})),
+            "todo_batch_id": result.get("todo_batch_id").cloned().unwrap_or(Value::Null),
+            "workspace_count": workspace_count,
+        });
+        let state = app.state::<CloudMcpState>().inner().clone();
+        let _ = cloud_mcp_send_remote_command_status_event(
+            &state,
+            &queued_event,
+            "queued",
+            &format!(
+                "Queued {queued_count} todo{} across {workspace_count} workspace{}.",
+                if queued_count == 1 { "" } else { "s" },
+                if workspace_count == 1 { "" } else { "s" },
+            ),
+            Some(&details),
+        )
+        .await;
+    }
+    todo_dispatch_loopspace_batch_pending_queued_ack_set(
+        &loop_runtime_run_id,
+        &batch_id,
+        false,
+    );
+    if let Some(item) = result
+        .get("items")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+    {
+        todo_dispatch_emit_loopspace_batch_lifecycle(&app, item);
+    }
+    if queued_count > 0 {
+        todo_dispatch_wake_background_dispatcher(app);
+    }
+    Ok(result)
 }
 
 fn todo_store_apply_update_patch(item: &mut Value, patch: &Value) -> bool {
@@ -5633,6 +6109,7 @@ async fn todo_store_cancel(
         move || {
             let _store_guard = todo_dispatch_queue_store_guard();
             let mut matched_item: Option<Value> = None;
+            let mut lifecycle_items = Vec::new();
             let mut interrupt_pane_id = String::new();
             let mut interrupt_instance_id: Option<u64> = None;
             if let Some(path) = todo_dispatch_data_path("queues", &workspace_id) {
@@ -5686,6 +6163,7 @@ async fn todo_store_cancel(
                     vec![item.clone()],
                     "todo_store_cancel",
                 );
+                lifecycle_items.push(item.clone());
             } else {
                 // Not in the device store: the row the user is looking at lives in
                 // the cloud mirror (stale "running" from a dead session or another
@@ -5699,9 +6177,10 @@ async fn todo_store_cancel(
                         todo_store_push_corrections(
                             &app,
                             &workspace_id,
-                            vec![item],
+                            vec![item.clone()],
                             "todo_store_cancel_correction",
                         );
+                        lifecycle_items.push(item);
                         corrected = true;
                         break;
                     }
@@ -5720,13 +6199,16 @@ async fn todo_store_cancel(
                     todo_store_push_corrections(
                         &app,
                         &workspace_id,
-                        vec![item],
+                        vec![item.clone()],
                         "todo_store_cancel_correction",
                     );
+                    lifecycle_items.push(item);
                     corrected = true;
                 }
             }
             todo_store_emit_changed(&app, &workspace_id, "todo_store_cancel", "store");
+            drop(_store_guard);
+            todo_dispatch_emit_loopspace_batch_lifecycles(&app, &lifecycle_items);
             Ok::<Value, String>(json!({
                 "ok": true,
                 "workspace_id": workspace_id,
@@ -6208,6 +6690,7 @@ async fn todo_store_queue_all(
 async fn todo_store_orphan_sweep_tick(app: &AppHandle) {
     let now_ms = todo_dispatch_now_ms();
     let _store_guard = todo_dispatch_queue_store_guard();
+    let mut lifecycle_items = Vec::new();
 
     for path in todo_dispatch_data_workspace_files("queues") {
         let snapshot = todo_dispatch_queue_read(&path);
@@ -6253,8 +6736,14 @@ async fn todo_store_orphan_sweep_tick(app: &AppHandle) {
             continue;
         }
         todo_dispatch_queue_write(&workspace_id, &items);
-        todo_store_push_corrections(app, &workspace_id, flipped, "todo_store_orphan_sweep");
+        todo_store_push_corrections(
+            app,
+            &workspace_id,
+            flipped.clone(),
+            "todo_store_orphan_sweep",
+        );
         todo_store_emit_changed(app, &workspace_id, "todo_store_orphan_sweep", "store");
+        lifecycle_items.extend(flipped);
     }
 
     // Device-local mirror rows stuck running/sending that the queue store no
@@ -6290,9 +6779,17 @@ async fn todo_store_orphan_sweep_tick(app: &AppHandle) {
         by_workspace.entry(workspace_id).or_default().push(item);
     }
     for (workspace_id, items) in by_workspace {
-        todo_store_push_corrections(app, &workspace_id, items, "todo_store_orphan_sweep");
+        todo_store_push_corrections(
+            app,
+            &workspace_id,
+            items.clone(),
+            "todo_store_orphan_sweep",
+        );
         todo_store_emit_changed(app, &workspace_id, "todo_store_orphan_sweep", "store");
+        lifecycle_items.extend(items);
     }
+    drop(_store_guard);
+    todo_dispatch_emit_loopspace_batch_lifecycles(app, &lifecycle_items);
 }
 
 /// App-start reconciliation: queued todos are durable and must not be swept
@@ -7405,6 +7902,7 @@ fn todo_dispatch_queue_mark_settled(
             item
         })
         .collect::<Vec<_>>();
+    let lifecycle_item = settled_items.first().cloned();
     if changed {
         todo_dispatch_queue_write(workspace_id, &next_items);
         todo_store_orphan_sweep_trigger("todo_queue_backend_settled");
@@ -7455,6 +7953,10 @@ fn todo_dispatch_queue_mark_settled(
                 "reason": "todo_queue_backend_settled",
             }),
         );
+    }
+    drop(_store_guard);
+    if let (Some(app), Some(item)) = (app, lifecycle_item.as_ref()) {
+        todo_dispatch_emit_loopspace_batch_lifecycle(app, item);
     }
 }
 
@@ -9065,38 +9567,33 @@ mod todo_store_tests {
     }
 
     #[test]
-    fn loopspace_dispatch_draft_sanitizer_keeps_terminal_text_identity_only() {
-        let mut draft = json!({
-            "body": "body content",
-            "items": ["hidden item"],
-            "message": "message content",
-            "note": { "text": "note content" },
-            "prompt": "prompt content",
-            "text": "todo content",
-            "title": "title content",
-            "todo_lines": "line content",
-            "todos": ["todo content"]
-        })
-        .as_object()
-        .cloned()
-        .expect("draft object");
+    fn loopspace_dispatch_structured_body_survives_store_and_pty_preparation() {
+        let full_body = "1. Audit the startup transition.\n\n2. Preserve this explanatory paragraph exactly, including hard line breaks.\n   - Verify the queued todo wakes immediately.\n   - Report the lifecycle result.";
+        let request = json!({
+            "todo_items": [{ "text": full_body }],
+        });
+        let drafts = todo_store_dispatch_todo_drafts(&request).unwrap();
+        assert_eq!(drafts.len(), 1, "one structured todo must remain one item");
 
-        todo_store_sanitize_loopspace_dispatch_draft(&mut draft, 2);
+        let mut draft = drafts[0].as_object().cloned().expect("draft object");
+        todo_store_normalize_loopspace_dispatch_draft(&mut draft, 1);
+        let item = todo_store_build_created_item(
+            "workspace-1",
+            &Value::Object(draft),
+            "loopspace_dispatch_todos_remote_command",
+        )
+        .expect("dispatch todo should create");
+        assert_eq!(item["text"], full_body);
+        assert_eq!(item["title"], "Loopspace Dispatch Todo #1");
 
-        let value = Value::Object(draft);
-        assert_eq!(value["text"], "Loopspace Dispatch Todo run #2");
-        assert_eq!(value["title"], "Loopspace Dispatch Todo #2");
-        for key in [
-            "body",
-            "items",
-            "message",
-            "note",
-            "prompt",
-            "todo_lines",
-            "todos",
-        ] {
-            assert!(value.get(key).is_none(), "{key} should be removed");
-        }
+        let terminal_body = todo_dispatch_backend_item_text(&item);
+        assert_eq!(terminal_body, full_body);
+        let terminal_input = todo_dispatch_prepared_terminal_input(
+            &TodoDispatchPreparedPrompt::text_only(terminal_body),
+            "\r",
+        );
+        assert!(terminal_input.contains(full_body));
+        assert!(terminal_input.ends_with('\r'));
     }
 
     #[test]
@@ -9114,12 +9611,35 @@ mod todo_store_tests {
             vec!["workspace-a".to_string(), "workspace-b".to_string()]
         );
         assert_eq!(
-            todo_store_dispatch_todo_drafts(&request),
+            todo_store_dispatch_todo_drafts(&request).unwrap(),
             vec![
                 json!({ "text": "First todo" }),
                 json!({ "text": "Second todo" })
             ]
         );
+
+        let structured = json!({
+            "todo_items": [{
+                "text": "1. First line\n\n2. Second paragraph"
+            }],
+            "todos": ["legacy", "split", "items"]
+        });
+        assert_eq!(
+            todo_store_dispatch_todo_drafts(&structured).unwrap(),
+            vec![json!({ "text": "1. First line\n\n2. Second paragraph" })]
+        );
+        for legacy in [
+            json!({ "todos": "First todo\nSecond todo" }),
+            json!({ "text": "First todo\nSecond todo" }),
+        ] {
+            assert_eq!(
+                todo_store_dispatch_todo_drafts(&legacy).unwrap(),
+                vec![
+                    json!({ "text": "First todo" }),
+                    json!({ "text": "Second todo" })
+                ]
+            );
+        }
         assert_eq!(
             todo_store_dispatch_optional_i64(
                 &request,
@@ -9127,6 +9647,123 @@ mod todo_store_tests {
             ),
             Some(2)
         );
+    }
+
+    #[test]
+    fn loopspace_dispatch_rejects_empty_structured_todo_item() {
+        let error = todo_store_dispatch_todo_drafts(&json!({
+            "todo_items": [{}],
+        }))
+        .unwrap_err();
+        assert!(error.contains("todo_items[0]"));
+        assert!(error.contains("usable todo text or body"));
+
+        let title_only = todo_store_dispatch_todo_drafts(&json!({
+            "todo_items": [{"title": "Run identity, not a body"}],
+        }));
+        assert!(title_only.is_err());
+    }
+
+    #[test]
+    fn loopspace_dispatch_batch_lifecycle_aggregates_children_monotonically() {
+        let run_id = format!("run-{}", uuid::Uuid::new_v4());
+        let batch_id = format!("batch-{}", uuid::Uuid::new_v4());
+        let item = |workspace_id: &str, todo_id: &str, status: &str| {
+            json!({
+                "command_id": todo_id,
+                "command_kind": "loopspace_dispatch_todos",
+                "dispatch_id": format!("{todo_id}-dispatch"),
+                "loop_runtime_run_id": run_id,
+                "loopspace_id": "loopspace-1",
+                "status": status,
+                "todo_batch_id": batch_id,
+                "todo_id": todo_id,
+                "todo_status": status,
+                "workspace_id": workspace_id,
+            })
+        };
+
+        let queued_items = vec![
+            item("workspace-a", "todo-a", "queued"),
+            item("workspace-b", "todo-b", "queued"),
+        ];
+        let queued =
+            todo_dispatch_loopspace_batch_lifecycle_from_items(&queued_items).expect("queued");
+        assert_eq!(queued.status, "queued");
+        assert_eq!(queued.status_counts["queued"], 2);
+        assert_eq!(queued.children.len(), 2);
+        todo_dispatch_loopspace_batch_pending_queued_ack_set(&run_id, &batch_id, true);
+        assert!(todo_dispatch_loopspace_batch_pending_queued_ack(
+            &run_id, &batch_id
+        ));
+        todo_dispatch_loopspace_batch_pending_queued_ack_set(&run_id, &batch_id, false);
+        assert!(!todo_dispatch_loopspace_batch_pending_queued_ack(
+            &run_id, &batch_id
+        ));
+        assert!(todo_dispatch_loopspace_batch_lifecycle_claim(&queued));
+        assert!(!todo_dispatch_loopspace_batch_lifecycle_claim(&queued));
+
+        let partly_running = vec![
+            item("workspace-a", "todo-a", "running"),
+            item("workspace-b", "todo-b", "queued"),
+        ];
+        let running = todo_dispatch_loopspace_batch_lifecycle_from_items(&partly_running)
+            .expect("running");
+        assert_eq!(running.status, "running");
+        assert!(todo_dispatch_loopspace_batch_lifecycle_claim(&running));
+
+        let partly_completed = vec![
+            item("workspace-a", "todo-a", "completed"),
+            item("workspace-b", "todo-b", "queued"),
+        ];
+        assert_eq!(
+            todo_dispatch_loopspace_batch_lifecycle_from_items(&partly_completed)
+                .unwrap()
+                .status,
+            "running",
+            "a partial batch must not complete",
+        );
+
+        let completed_items = vec![
+            item("workspace-a", "todo-a", "completed"),
+            item("workspace-b", "todo-b", "completed"),
+        ];
+        let completed = todo_dispatch_loopspace_batch_lifecycle_from_items(&completed_items)
+            .expect("completed");
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.status_counts["settled"], 2);
+        assert!(todo_dispatch_loopspace_batch_lifecycle_claim(&completed));
+        assert!(!todo_dispatch_loopspace_batch_lifecycle_claim(&running));
+
+        let failed_items = vec![
+            item("workspace-a", "todo-a", "failed"),
+            item("workspace-b", "todo-b", "completed"),
+        ];
+        assert_eq!(
+            todo_dispatch_loopspace_batch_lifecycle_from_items(&failed_items)
+                .unwrap()
+                .status,
+            "failed",
+        );
+        let interrupted_items = vec![
+            item("workspace-a", "todo-a", "interrupted"),
+            item("workspace-b", "todo-b", "completed"),
+        ];
+        assert_eq!(
+            todo_dispatch_loopspace_batch_lifecycle_from_items(&interrupted_items)
+                .unwrap()
+                .status,
+            "interrupted",
+        );
+        let cancelled_items = vec![
+            item("workspace-a", "todo-a", "completed"),
+            item("workspace-b", "todo-b", "cancelled"),
+        ];
+        let cancelled = todo_dispatch_loopspace_batch_lifecycle_from_items(&cancelled_items)
+            .expect("cancelled child settles batch");
+        assert_eq!(cancelled.status, "failed");
+        assert_eq!(cancelled.status_counts["cancelled"], 1);
+        assert_eq!(cancelled.status_counts["settled"], 2);
     }
 
     fn loopspace_dispatch_post_batch_test_item(
@@ -13620,6 +14257,7 @@ async fn todo_dispatch_backend_submit_swarm(
             "todo_queue_swarm_run_started",
         );
         todo_store_emit_changed(app, workspace_id, "todo_queue_swarm_run_started", "store");
+        todo_dispatch_emit_loopspace_batch_lifecycle(app, &running_item);
         todo_dispatch_enqueue_todo_sync_commit(
             app,
             workspace_id,
@@ -14142,6 +14780,7 @@ async fn todo_dispatch_backend_submit(
             "todo_queue_backend_submit",
         );
         todo_store_emit_changed(app, workspace_id, "todo_queue_backend_submit", "store");
+        todo_dispatch_emit_loopspace_batch_lifecycle(app, &running_item);
         todo_dispatch_enqueue_todo_sync_commit(
             app,
             workspace_id,

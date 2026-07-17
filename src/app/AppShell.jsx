@@ -46237,27 +46237,13 @@ export default function App() {
                 },
               });
               const queuedCount = Number(result?.queued_count || 0);
-              const workspaceCount = Array.isArray(result?.workspaces) ? result.workspaces.length : 0;
               setWorkspaceToolPaneMode(TODO_QUEUE_PANE_MODE_NORMAL);
               if (queuedCount > 0) {
                 playNotificationSfx("todo.arrived");
               }
-              await recordRemoteCommandStatus(
-                event,
-                "queued",
-                `Queued ${queuedCount} todo${queuedCount === 1 ? "" : "s"} across ${workspaceCount} workspace${workspaceCount === 1 ? "" : "s"}.`,
-                {
-                  command_id: commandId,
-                  command_kind: "loopspace_dispatch_todos",
-                  queued_count: queuedCount,
-                  target_terminal_id: targetTerminalId,
-                  target_terminal_index: targetTerminalIndex,
-                  target_terminal_mode: targetTerminalMode,
-                  target_thread_id: targetThreadId,
-                  todo_batch_id: result?.todo_batch_id || result?.batch_id || "",
-                  workspace_count: workspaceCount,
-                },
-              );
+              // Rust persists the batch and sends the queued callback before
+              // waking the dispatcher, so a fast terminal submission cannot
+              // race this acknowledgement and regress running back to queued.
             } catch (error) {
               await recordRemoteCommandStatus(
                 event,
@@ -46400,9 +46386,6 @@ export default function App() {
           }
           const targetWorkspace = findWorkspaceById(workspaces, workspaceId);
           text = await hydrateRemoteCommandTodoText(event, workspaceId, text);
-          if (!text && dispatchTodosAction && loopRuntimeRunId) {
-            text = "Loopspace Dispatch Todo run";
-          }
           if (!text) {
             await recordRemoteCommandStatus(event, "failed", "Remote command did not include a task message.", {
               command_id: commandId,
@@ -49993,7 +49976,7 @@ export default function App() {
                 "Edges must use legal node contract ports: triggers expose out; run_script/send_message/dispatch_todos/notify_device expose exec, success, failure, interrupt; document_read/document_write expose docs; asset_read/asset_write expose assets; most executable targets accept in. Specify from_port and to_port on connect operations, especially from action nodes.",
                 "Supported add_node kinds are document_read, document_write, asset_read, asset_write, run_script, send_message, dispatch_todos, notify_device, and step. Resource nodes use doc_refs or asset_refs for selected inputs, create_name for generated outputs, h for height, and target_mode for selection/create behavior.",
                 "send_message is the action region for terminal-orchestrator/coding-agent messages. dispatch_todos is the action region for queued workspace todos; it uses target_workspace_ids and todo_lines, target_terminal_mode auto|pinned, optional target_terminal_id/index/name, target_agent_id, model, reasoning_effort, and speed. dispatch_todos can be direct with no child steps or can contain internal step checkpoints parented to the dispatch_todos node, exactly like send_message.",
-                "Loopspace packets use compact LS/1 lines instead of verbose JSON. When executing a Dispatch Todo with loop_runtime_run_id, the initial todo carries run identity only, not the child loop contents. Pass the runtime ids to coordination-kernel.start_task, wait for its response, and use the LS/1 run_context in loopspace_run_context to resolve only the connected subloop slice, the main Dispatch Todo action for direct runs or the first/current child checkpoint for stepped runs, and the exact docs/assets read-write resources. After each local checkpoint, call record_loopspace_step_progress, wait for the response, and follow next_checkpoint.",
+                "Loopspace packets use compact LS/1 lines instead of verbose JSON. When executing a Dispatch Todo with loop_runtime_run_id, the initial todo contains the complete dispatched todo body together with the run identity. Pass the runtime ids to coordination-kernel.start_task, wait for its response, and use the LS/1 run_context in loopspace_run_context to resolve only the connected subloop slice, the main Dispatch Todo action for direct runs or the first/current child checkpoint for stepped runs, and the exact docs/assets read-write resources. After each local checkpoint, call record_loopspace_step_progress, wait for the response, and follow next_checkpoint.",
                 "notify_device sends a native/push notification when reached and uses optional device_id (empty targets all account devices), title, body, url, and delivery auto|native|push; title/body support {{loop_name}}, {{node_title}}, {{from_node}}, {{branch}}, {{device_name}}, {{run_id}}, and {{date}} template variables.",
                 "document_write accepts operation append|replace|prepend|create_if_missing|delete and optional content_template for deterministic webhook/body writes without an agent. asset_write accepts operation add_version|replace|create_if_missing|delete and optional content_template for deterministic webhook/body assets without an agent.",
                 "To guide an internal action substep, connect step.success -> run_script.in, send_message.in, dispatch_todos.in, or notify_device.in when a completed substep should start another action; connect document_read.docs or document_write.docs -> step.in for readable document context, asset_read.assets or asset_write.assets -> step.in for readable asset context, step.docs -> document_write.in for document generation, and step.assets -> asset_write.in for asset generation.",

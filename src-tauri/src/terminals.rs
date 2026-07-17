@@ -1611,7 +1611,19 @@ fn terminal_runtime_apply_activity_payload(
         == "provider_turn_error"
         || payload.provider_error.is_some())
         && !projection.error_accepted;
-    let terminal_event_rejected = completion_rejected || interrupt_rejected || error_rejected;
+    let prompt_ready_recovery_rejected = matches!(
+        terminal_projection_text(&previous.canonical_state, "starting").as_str(),
+        "error" | "interrupted"
+    ) && terminal_projection_text(&payload.event_type, "") == "terminal_input_ready"
+        && !terminal_canonical_prompt_ready_recovery_correlates(
+            &previous,
+            payload,
+            open_structured_interaction,
+        );
+    let terminal_event_rejected = completion_rejected
+        || interrupt_rejected
+        || error_rejected
+        || prompt_ready_recovery_rejected;
     let active_state_override = projection.turn_active
         && (payload.input_ready
             || terminal_projection_state_is_idle(&payload.activity_status)
@@ -1704,7 +1716,9 @@ fn terminal_runtime_apply_activity_payload(
         } else {
             payload.command_phase.clone()
         },
-        input_ready: if projection.turn_active {
+        input_ready: if terminal_event_rejected {
+            previous.input_ready
+        } else if projection.turn_active {
             false
         } else {
             projection.completion_accepted || payload.input_ready
@@ -1780,7 +1794,11 @@ fn terminal_runtime_apply_activity_payload(
         } else {
             payload.hook_event_name.clone()
         },
-        updated_at_ms: payload.observed_at_ms,
+        updated_at_ms: if terminal_event_rejected {
+            previous.updated_at_ms
+        } else {
+            payload.observed_at_ms
+        },
     };
     *runtime = snapshot.clone();
     (snapshot, projection)
@@ -2401,6 +2419,73 @@ fn terminal_canonical_error_correlates(
     }
 }
 
+fn terminal_canonical_prompt_ready_recovery_correlates(
+    previous: &TerminalRuntimeSnapshot,
+    payload: &TerminalActivityHookPayload,
+    open_structured_interaction: Option<&TerminalStructuredInteraction>,
+) -> bool {
+    let previous_state = terminal_projection_text(&previous.canonical_state, "starting");
+    if !matches!(previous_state.as_str(), "error" | "interrupted")
+        || previous.turn_active
+        || previous.active_interaction_id.is_some()
+        || open_structured_interaction.is_some()
+        || terminal_projection_text(&payload.event_type, "") != "terminal_input_ready"
+        || !payload.input_ready
+        || !terminal_projection_state_is_idle(&payload.activity_status)
+    {
+        return false;
+    }
+
+    // Prompt-ready recovery is allowed to clear an interrupted/error gate only
+    // for the exact turn that observed the prompt. Backend prompt observers
+    // freeze this generation on their synthesized event; requiring an explicit
+    // generation prevents an older delayed observation from being rebound to
+    // whichever turn happens to be current when the event is ingested.
+    if !payload.turn_generation_explicit || payload.turn_generation != previous.turn_generation {
+        return false;
+    }
+
+    let previous_turn = previous
+        .provider_turn_id
+        .as_deref()
+        .or(previous.turn_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let candidate_turn = payload
+        .provider_turn_id
+        .as_deref()
+        .or(payload.turn_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if match (previous_turn, candidate_turn) {
+        (Some(previous_turn), Some(candidate_turn)) => previous_turn != candidate_turn,
+        (None, None) => false,
+        _ => true,
+    } {
+        return false;
+    }
+
+    let previous_session = previous
+        .provider_session_id
+        .as_deref()
+        .or(previous.native_session_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let candidate_session = payload
+        .provider_session_id
+        .as_deref()
+        .or(payload.native_session_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (previous_session, candidate_session) {
+        (Some(previous_session), Some(candidate_session)) => {
+            previous_session == candidate_session
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 fn terminal_canonical_transition_allowed(previous: &str, next: &str) -> bool {
     if previous == next {
         return true;
@@ -2417,6 +2502,8 @@ fn terminal_canonical_transition_allowed(previous: &str, next: &str) -> bool {
             | ("thinking", "idle")
             | ("uir", "idle")
             | ("paused", "idle")
+            | ("interrupted", "idle")
+            | ("error", "idle")
             | ("thinking", "interrupted")
             | ("uir", "interrupted")
             | ("paused", "interrupted")
@@ -2483,6 +2570,11 @@ fn terminal_reduce_canonical_state(
             authoritative_event,
             open_structured_interaction,
         );
+    let prompt_ready_recovery = terminal_canonical_prompt_ready_recovery_correlates(
+        previous_runtime,
+        authoritative_event,
+        open_structured_interaction,
+    );
 
     let mut turn_generation = previous_runtime.turn_generation;
     let mut completed_turn_generation = previous_runtime.completed_turn_generation;
@@ -2512,6 +2604,10 @@ fn terminal_reduce_canonical_state(
     if error_accepted {
         turn_active = false;
     }
+    if prompt_ready_recovery {
+        completed_turn_generation = turn_generation;
+        turn_active = false;
+    }
 
     let mut next_state = if close_event {
         "closing"
@@ -2520,6 +2616,8 @@ fn terminal_reduce_canonical_state(
     } else if interrupt_accepted {
         "interrupted"
     } else if completion_accepted && completed_turn_generation == turn_generation {
+        "idle"
+    } else if prompt_ready_recovery {
         "idle"
     } else if prompt_event {
         "uir"
@@ -7188,24 +7286,6 @@ fn spawn_terminal_reader(
     rust_readiness_observer_enabled: bool,
     mut reader: Box<dyn Read + Send>,
 ) {
-    fn terminal_headless_tail_has_prompt_marker(
-        headless_output: &Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
-    ) -> bool {
-        let Ok(output) = headless_output.lock() else {
-            return false;
-        };
-        let tail = output.tail.iter().copied().collect::<Vec<_>>();
-        if tail.is_empty() {
-            return false;
-        }
-        let start = tail.len().saturating_sub(TERMINAL_STARTUP_READY_SCAN_BYTES);
-        let text = String::from_utf8_lossy(&tail[start..]);
-        let mut recent_lines = text.lines().rev().take(8).collect::<Vec<_>>();
-        recent_lines.reverse();
-        let recent_text = recent_lines.join("\n");
-        terminal_output_current_prompt_marker(&recent_text)
-    }
-
     async fn observe_terminal_prompt_ready(
         app: AppHandle,
         terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
@@ -7307,6 +7387,7 @@ fn spawn_terminal_reader(
             "provider": instance.metadata.agent_kind.clone(),
             "source": recovery_source,
             "timestamp": crate::coordination::kernel::now_rfc3339(),
+            "turn_generation": runtime.turn_generation,
         });
         if let Some(object) = event.as_object_mut() {
             if let Some(provider_session_id) = runtime
@@ -7426,6 +7507,9 @@ fn spawn_terminal_reader(
         let output_pane_id = reader_pane_id.clone();
         let output_workspace_id = workspace_id.clone();
         let output_subscribers = Arc::clone(&output_subscribers);
+        let output_prompt_ready_observer_in_flight =
+            Arc::clone(&prompt_ready_observer_in_flight);
+        let output_readiness_terminals = Arc::clone(&terminals);
         let output_sender_handle = thread::spawn(move || {
             let mut pending = Vec::with_capacity(TERMINAL_OUTPUT_COALESCE_MAX_BYTES);
             let mut pending_started_at: Option<Instant> = None;
@@ -7542,6 +7626,36 @@ fn spawn_terminal_reader(
                     cloud_output_seq,
                     &frame,
                 );
+                // Prompt readiness is evaluated only after this frame has
+                // advanced the headless journal. Checking in the PTY reader
+                // before publication misses a prompt marker delivered in the
+                // final chunk when no later output arrives.
+                if rust_readiness_observer_enabled
+                    && terminal_headless_tail_has_prompt_marker(&output_headless_output)
+                    && output_prompt_ready_observer_in_flight
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    let readiness_app = output_app.clone();
+                    let readiness_terminals = Arc::clone(&output_readiness_terminals);
+                    let readiness_cloud_state = output_cloud_mcp_state.clone();
+                    let readiness_headless_output = Arc::clone(&output_headless_output);
+                    let readiness_pane_id = output_pane_id.clone();
+                    let readiness_observer_in_flight =
+                        Arc::clone(&output_prompt_ready_observer_in_flight);
+                    tauri::async_runtime::spawn(async move {
+                        observe_terminal_prompt_ready(
+                            readiness_app,
+                            readiness_terminals,
+                            readiness_cloud_state,
+                            readiness_headless_output,
+                            readiness_pane_id,
+                            instance_id,
+                        )
+                        .await;
+                        readiness_observer_in_flight.store(false, Ordering::Release);
+                    });
+                }
                 let coalesced_ms = terminal_diagnostic_elapsed_ms(frame_started_at);
                 forensics_frames += 1;
                 forensics_source_chunks += source_chunks;
@@ -7711,32 +7825,6 @@ fn spawn_terminal_reader(
                 }
                 Ok(bytes_read) => {
                     let chunk = &buffer[..bytes_read];
-                    if rust_readiness_observer_enabled
-                        && terminal_headless_tail_has_prompt_marker(&headless_output)
-                        && prompt_ready_observer_in_flight
-                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                            .is_ok()
-                    {
-                        let readiness_app = app.clone();
-                        let readiness_terminals = Arc::clone(&terminals);
-                        let readiness_cloud_state = cloud_mcp_state.clone();
-                        let readiness_headless_output = Arc::clone(&headless_output);
-                        let readiness_pane_id = reader_pane_id.clone();
-                        let readiness_observer_in_flight =
-                            Arc::clone(&prompt_ready_observer_in_flight);
-                        tauri::async_runtime::spawn(async move {
-                            observe_terminal_prompt_ready(
-                                readiness_app,
-                                readiness_terminals,
-                                readiness_cloud_state,
-                                readiness_headless_output,
-                                readiness_pane_id,
-                                instance_id,
-                            )
-                            .await;
-                            readiness_observer_in_flight.store(false, Ordering::Release);
-                        });
-                    }
                     let auth_failure_debounce_elapsed = auth_failure_last_marked_at
                         .map(|marked_at| marked_at.elapsed() >= Duration::from_secs(30))
                         .unwrap_or(true);
@@ -20164,6 +20252,7 @@ fn apply_terminal_activity_hook_payload(
         .await;
     });
     if terminal_activity_hook_should_skip_todo_settlement(event, source) {
+        todo_dispatch_observe_activity_hook_readiness(app, &payload);
         log_terminal_status_event(
             "backend.terminal_activity_hook.todo_settlement_skipped",
             json!({
@@ -36137,6 +36226,98 @@ notifications = true
     }
 
     #[test]
+    fn canonical_reducer_recovers_interrupted_and_startup_error_to_idle_for_same_session() {
+        for previous_state in ["interrupted", "error"] {
+            let mut runtime = TerminalRuntimeSnapshot::opened_idle(Some("session-1".to_string()));
+            runtime.canonical_state = previous_state.to_string();
+            runtime.canonical_badge_label = previous_state.to_string();
+            runtime.canonical_state_seq = 4;
+            runtime.turn_generation = 1;
+            runtime.completed_turn_generation = 1;
+            runtime.turn_active = false;
+            runtime.input_ready = false;
+
+            let ready = terminal_activity_hook_test_payload(
+                "terminal-input-ready",
+                "idle",
+                "ready",
+                true,
+                Some("session-1"),
+            );
+            let mut ready = ready;
+            ready.turn_generation = runtime.turn_generation;
+            let projection =
+                terminal_reduce_canonical_state(&runtime, &ready, None, false, false);
+            assert_eq!(projection.canonical_state, "idle", "{previous_state}");
+            assert!(!projection.turn_active, "{previous_state}");
+            assert_eq!(
+                projection.completed_turn_generation,
+                projection.turn_generation,
+                "{previous_state}",
+            );
+
+            let mut mismatched = terminal_activity_hook_test_payload(
+                "terminal-input-ready",
+                "idle",
+                "ready",
+                true,
+                Some("different-session"),
+            );
+            mismatched.turn_generation = runtime.turn_generation;
+            let rejected =
+                terminal_reduce_canonical_state(&runtime, &mismatched, None, false, false);
+            assert_eq!(
+                rejected.canonical_state, previous_state,
+                "a stale session must not recover {previous_state}",
+            );
+
+            let mut stale_generation = ready.clone();
+            stale_generation.turn_generation = runtime.turn_generation.saturating_sub(1);
+            let rejected = terminal_reduce_canonical_state(
+                &runtime,
+                &stale_generation,
+                None,
+                false,
+                false,
+            );
+            assert_eq!(
+                rejected.canonical_state, previous_state,
+                "a stale turn generation must not recover {previous_state}",
+            );
+
+            let mut identified_runtime = runtime.clone();
+            identified_runtime.provider_turn_id = Some("turn-current".to_string());
+            identified_runtime.turn_id = Some("turn-current".to_string());
+            let mut stale_turn = ready.clone();
+            stale_turn.provider_turn_id = Some("turn-old".to_string());
+            stale_turn.turn_id = Some("turn-old".to_string());
+            let rejected = terminal_reduce_canonical_state(
+                &identified_runtime,
+                &stale_turn,
+                None,
+                false,
+                false,
+            );
+            assert_eq!(
+                rejected.canonical_state, previous_state,
+                "a stale turn id must not recover {previous_state}",
+            );
+
+            let mut same_turn = ready.clone();
+            same_turn.provider_turn_id = Some("turn-current".to_string());
+            same_turn.turn_id = Some("turn-current".to_string());
+            let recovered = terminal_reduce_canonical_state(
+                &identified_runtime,
+                &same_turn,
+                None,
+                false,
+                false,
+            );
+            assert_eq!(recovered.canonical_state, "idle", "{previous_state}");
+        }
+    }
+
+    #[test]
     fn backend_interrupt_lifecycle_applies_authoritative_runtime_state() {
         let root = env::temp_dir().join(format!(
             "terminal-interrupt-runtime-{}",
@@ -36215,6 +36396,70 @@ notifications = true
         assert!(!runtime.input_ready);
         assert!(runtime.input_ready_at.is_none());
 
+        let mut newer_interrupted = runtime.clone();
+        newer_interrupted.turn_generation = 2;
+        newer_interrupted.completed_turn_generation = 2;
+        newer_interrupted.provider_turn_id = Some("turn-2".to_string());
+        newer_interrupted.turn_id = Some("turn-2".to_string());
+        newer_interrupted.source = "newer-interrupt".to_string();
+        newer_interrupted.updated_at_ms = 2;
+        *instance.runtime.lock().unwrap() = newer_interrupted.clone();
+
+        let stale_ready_payload = terminal_activity_hook_payload(
+            &instance,
+            &json!({
+                "hook_event_name": "PromptReadyAfterInterrupt",
+                "provider": "codex",
+                "session_id": "session-1",
+                "turn_generation": 1,
+                "turn_id": "turn-1",
+                "source": "backend-interrupt-prompt-ready",
+            }),
+        )
+        .unwrap();
+        let (stale_runtime, stale_projection) = terminal_runtime_apply_activity_payload(
+            &instance,
+            &stale_ready_payload,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(stale_projection.canonical_state, "interrupted");
+        assert_eq!(stale_runtime.canonical_state, "interrupted");
+        assert_eq!(stale_runtime.activity_status, "interrupted");
+        assert_eq!(stale_runtime.command_phase, "interrupted");
+        assert!(!stale_runtime.input_ready);
+        assert_eq!(stale_runtime.provider_turn_id.as_deref(), Some("turn-2"));
+        assert_eq!(stale_runtime.turn_id.as_deref(), Some("turn-2"));
+        assert_eq!(stale_runtime.source, "newer-interrupt");
+        assert_eq!(stale_runtime.event_type, newer_interrupted.event_type);
+        assert_eq!(stale_runtime.updated_at_ms, newer_interrupted.updated_at_ms);
+
+        let current_ready_payload = terminal_activity_hook_payload(
+            &instance,
+            &json!({
+                "hook_event_name": "PromptReadyAfterInterrupt",
+                "provider": "codex",
+                "session_id": "session-1",
+                "turn_generation": 2,
+                "turn_id": "turn-2",
+                "source": "backend-interrupt-prompt-ready",
+            }),
+        )
+        .unwrap();
+        let (current_ready_runtime, _) = terminal_runtime_apply_activity_payload(
+            &instance,
+            &current_ready_payload,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(current_ready_runtime.canonical_state, "idle");
+        assert_eq!(current_ready_runtime.provider_turn_id.as_deref(), Some("turn-2"));
+        assert!(current_ready_runtime.input_ready);
+
+        *instance.runtime.lock().unwrap() = runtime.clone();
+
         let provider_stop_event = json!({
             "hook_event_name": "Stop",
             "provider": "codex",
@@ -36237,6 +36482,7 @@ notifications = true
             "hook_event_name": "PromptReadyAfterInterrupt",
             "provider": "codex",
             "session_id": "session-1",
+            "turn_generation": 1,
             "turn_id": "turn-1",
             "source": "backend-interrupt-prompt-ready",
         });
@@ -36819,6 +37065,31 @@ notifications = true
             false,
         ));
         assert!(!terminal_activity_hook_should_ignore_startup_idle_candidate(&startup_idle, true,));
+    }
+
+    #[test]
+    fn startup_recovery_excludes_settlement_but_still_qualifies_for_queue_wake() {
+        let event = json!({
+            "hook_event_name": "PromptReadyAfterStartupError",
+            "source": "backend-startup-error-prompt-ready",
+        });
+        let payload = terminal_activity_hook_test_payload(
+            "terminal-input-ready",
+            "idle",
+            "ready",
+            true,
+            Some("session-1"),
+        );
+        let event_type = todo_dispatch_normalize_activity_hook_event_type(&payload.event_type);
+
+        assert!(terminal_activity_hook_should_skip_todo_settlement(
+            &event,
+            "backend-startup-error-prompt-ready",
+        ));
+        assert!(todo_dispatch_activity_hook_should_wake_queue(
+            &payload,
+            &event_type,
+        ));
     }
 
     #[test]
@@ -37839,6 +38110,19 @@ notifications = true
         assert!(terminal_output_current_prompt_marker(
             "Booting MCP server: codex_apps (12s • esc to interrupt)\n> "
         ));
+    }
+
+    #[test]
+    fn prompt_ready_scan_includes_the_current_final_pty_frame() {
+        let headless_output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::default()));
+        headless_output
+            .lock()
+            .unwrap()
+            .append(b"Booting MCP server: codex_apps\n");
+        assert!(!terminal_headless_tail_has_prompt_marker(&headless_output));
+
+        headless_output.lock().unwrap().append(b"> ");
+        assert!(terminal_headless_tail_has_prompt_marker(&headless_output));
     }
 
     #[test]
