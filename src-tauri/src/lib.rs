@@ -1141,6 +1141,8 @@ struct TerminalPendingRestartIntent {
     instance_id: u64,
     launch_epoch: String,
     target_role: String,
+    fresh_session: bool,
+    provider_session_id: Option<String>,
     mode: String,
     coordinator_id: String,
     requested_at_ms: u64,
@@ -1261,6 +1263,10 @@ struct TerminalInstance {
     metadata: TerminalInstanceMetadata,
     runtime: Arc<StdMutex<TerminalRuntimeSnapshot>>,
     launch_metadata: Arc<StdMutex<TerminalLaunchRuntimeMetadata>>,
+    // Prepared PTYs freeze their provider account at terminal_open. Deferred
+    // and legacy starts must reuse this exact binding instead of sampling the
+    // account that happens to be active when the later start command arrives.
+    launch_account_binding: Option<TerminalProviderLaunchAccountBinding>,
     // Managed Codex panes run the stock TUI against a per-terminal local
     // app-server gateway.  The gateway is deliberately separate from the PTY:
     // terminal rendering/input remain native while structured JSON-RPC server
@@ -1649,6 +1655,7 @@ impl TerminalInstance {
         session_mode: TerminalSessionMode,
         metadata: TerminalInstanceMetadata,
         launch_metadata: TerminalLaunchRuntimeMetadata,
+        launch_account_binding: Option<TerminalProviderLaunchAccountBinding>,
         app_control_mcp_requested: bool,
     ) -> (Self, Box<dyn Read + Send>) {
         let WarmPty {
@@ -1690,6 +1697,7 @@ impl TerminalInstance {
                 metadata,
                 runtime: Arc::new(StdMutex::new(initial_runtime)),
                 launch_metadata: Arc::new(StdMutex::new(launch_metadata)),
+                launch_account_binding,
                 codex_gateway: Arc::new(StdMutex::new(None)),
                 app_control_mcp_requested,
             },
@@ -2183,6 +2191,7 @@ struct TerminalStartAgentPaneResult {
     instance_id: Option<u64>,
     model: Option<String>,
     model_source: Option<String>,
+    effective_provider_session_id: Option<String>,
     started: bool,
     skipped: bool,
     message: String,
@@ -10918,6 +10927,7 @@ fn run_app(daemon: bool) {
             workspace_git_generate_commit_message,
             workspace_git_commit_and_push,
             workspace_initialize_git,
+            terminal_provider_session_exists,
             terminal_open,
             terminal_record_provider_session,
             terminal_start_agent,

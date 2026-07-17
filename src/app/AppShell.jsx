@@ -113,6 +113,7 @@ import {
   normalizeTerminalSessionRestartMode,
   requestTerminalSessionRestart,
   resolveTerminalSessionRestartRole,
+  resolveTerminalStartedSessionBinding,
   terminalSessionRestartRemoteTimeoutMs,
   terminalSessionRestartResultIsSuccessful,
 } from "../terminals/terminalSessionRestart.js";
@@ -54477,16 +54478,14 @@ export default function App() {
             thread_id: request.thread_id || "",
           });
 
-          const requestedStartProviderSessionId = String(request.provider_session_id || "").trim();
           const forkFromProviderSessionId = String(request.fork_from_provider_session_id || "").trim();
-          const shouldSuppressOpenCodeAliasSession = String(request.provider || "").trim().toLowerCase() === "opencode"
-            && requestedStartProviderSessionId
-            && !requestedStartProviderSessionId.startsWith("ses_");
-          const startedProviderSessionId = forkFromProviderSessionId
-            ? ""
-            : shouldSuppressOpenCodeAliasSession
-              ? ""
-              : requestedStartProviderSessionId;
+          const startedSessionBinding = resolveTerminalStartedSessionBinding({
+            forkFromProviderSessionId,
+            paneResult,
+            provider: request.provider,
+            requestedProviderSessionId: request.provider_session_id,
+          });
+          const startedProviderSessionId = startedSessionBinding.provider_session_id;
           const terminalLifecycleEvent = {
             activity_status: "idle",
             agent_id: request.provider,
@@ -54499,12 +54498,12 @@ export default function App() {
             model: startedModel,
             model_source: startedModelSource,
             native_session_id: startedProviderSessionId,
-            native_session_id_cleared: Boolean(forkFromProviderSessionId),
+            native_session_id_cleared: startedSessionBinding.provider_session_id_cleared,
             native_session_kind: startedProviderSessionId ? "session" : "",
             native_session_source: startedProviderSessionId ? "session-restore" : "",
             pane_id: paneResult.pane_id,
             provider_session_id: startedProviderSessionId,
-            provider_session_id_cleared: Boolean(forkFromProviderSessionId),
+            provider_session_id_cleared: startedSessionBinding.provider_session_id_cleared,
             shared_history_id: request.shared_history_id || "",
             status: "active",
             status_truth: "complete",

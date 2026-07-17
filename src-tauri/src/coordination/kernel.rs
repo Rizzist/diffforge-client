@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
     env, fs,
     io::{Read, Write},
@@ -25983,13 +25984,54 @@ fn codex_prepare_private_home(
     )?;
     write_text_file_atomic(&home.join("config.toml"), &config)?;
 
+    let frozen_launch = codex_launch_auth_home_is_bound();
+    let frozen_launch_requires_auth = codex_launch_auth_home_requires_auth();
     let Some(source_home) = codex_user_home_for_auth_bridge() else {
+        if frozen_launch {
+            codex_remove_stale_managed_auth(home)?;
+            if frozen_launch_requires_auth {
+                return Err(
+                    "The frozen Codex launch has no isolated authentication source.".to_string(),
+                );
+            }
+            return Ok(());
+        }
         return Ok(());
     };
+    if frozen_launch && !source_home.home.join("auth.json").is_file() {
+        codex_remove_stale_managed_auth(home)?;
+        if frozen_launch_requires_auth {
+            return Err("The frozen Codex authentication source is unavailable.".to_string());
+        }
+        return Ok(());
+    }
     for file_name in ["auth.json", "installation_id", "version.json"] {
         codex_bridge_private_home_file(&source_home.home, home, file_name)?;
     }
     Ok(())
+}
+
+fn codex_remove_stale_managed_auth(private_home: &Path) -> Result<(), String> {
+    let destination = private_home.join("auth.json");
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            fs::remove_file(&destination).map_err(|error| {
+                format!(
+                    "Unable to remove stale managed Codex auth {}: {error}",
+                    destination.display()
+                )
+            })
+        }
+        Ok(_) => Err(format!(
+            "Managed Codex auth path is not a file: {}.",
+            destination.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Unable to inspect managed Codex auth {}: {error}",
+            destination.display()
+        )),
+    }
 }
 
 fn codex_private_home_base_config(
@@ -26188,7 +26230,74 @@ struct CodexAuthBridgeSource {
     home: PathBuf,
 }
 
+thread_local! {
+    // A terminal launch captures its account before coordination work starts.
+    // The explicit stack lets nested/test callers distinguish "no launch
+    // override" from "this frozen launch intentionally has no auth home".
+    static CODEX_LAUNCH_AUTH_HOME_STACK: RefCell<Vec<CodexLaunchAuthHomeBinding>> = const {
+        RefCell::new(Vec::new())
+    };
+}
+
+#[derive(Clone)]
+struct CodexLaunchAuthHomeBinding {
+    home: Option<PathBuf>,
+    require_auth: bool,
+}
+
+struct CodexLaunchAuthHomeGuard;
+
+impl Drop for CodexLaunchAuthHomeGuard {
+    fn drop(&mut self) {
+        CODEX_LAUNCH_AUTH_HOME_STACK.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+    }
+}
+
+pub(crate) fn with_codex_launch_auth_home<T>(
+    frozen_home: Option<&Path>,
+    operation: impl FnOnce() -> T,
+) -> T {
+    with_codex_launch_auth_home_requirement(frozen_home, true, operation)
+}
+
+pub(crate) fn with_codex_launch_auth_home_requirement<T>(
+    frozen_home: Option<&Path>,
+    require_auth: bool,
+    operation: impl FnOnce() -> T,
+) -> T {
+    CODEX_LAUNCH_AUTH_HOME_STACK.with(|stack| {
+        stack.borrow_mut().push(CodexLaunchAuthHomeBinding {
+            home: frozen_home.map(Path::to_path_buf),
+            require_auth,
+        });
+    });
+    let _guard = CodexLaunchAuthHomeGuard;
+    operation()
+}
+
+fn codex_launch_auth_home_is_bound() -> bool {
+    CODEX_LAUNCH_AUTH_HOME_STACK.with(|stack| !stack.borrow().is_empty())
+}
+
+fn codex_launch_auth_home_requires_auth() -> bool {
+    CODEX_LAUNCH_AUTH_HOME_STACK.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .is_some_and(|binding| binding.require_auth)
+    })
+}
+
 fn codex_user_home_for_auth_bridge() -> Option<CodexAuthBridgeSource> {
+    if let Some(frozen_binding) =
+        CODEX_LAUNCH_AUTH_HOME_STACK.with(|stack| stack.borrow().last().cloned())
+    {
+        return frozen_binding
+            .home
+            .map(|home| CodexAuthBridgeSource { home });
+    }
     // Prefer a stable agent-account snapshot. Every managed home links to the
     // one authoritative auth.json; independent refresh-token copies are never
     // created.
@@ -30268,6 +30377,97 @@ mod tests {
             fs::read_to_string(source.join("auth.json")).unwrap(),
             "account-c"
         );
+    }
+
+    #[test]
+    fn managed_codex_auth_bridge_uses_the_frozen_launch_source() {
+        let account_a = temp_repo("codex_auth_bridge_frozen_account_a");
+        let account_b = temp_repo("codex_auth_bridge_frozen_account_b");
+        let managed = temp_repo("codex_auth_bridge_frozen_managed");
+        fs::write(account_a.join("auth.json"), "account-a").unwrap();
+        fs::write(account_b.join("auth.json"), "account-b").unwrap();
+
+        with_codex_launch_auth_home(Some(&account_a), || {
+            let source = codex_user_home_for_auth_bridge().expect("frozen auth source");
+            assert_eq!(source.home, account_a);
+            codex_bridge_private_home_file(&source.home, &managed, "auth.json").unwrap();
+        });
+
+        // A later launch may freeze B, but it cannot retroactively relink the
+        // already prepared A home.
+        with_codex_launch_auth_home(Some(&account_b), || {
+            assert_eq!(
+                codex_user_home_for_auth_bridge()
+                    .expect("second frozen auth source")
+                    .home,
+                account_b
+            );
+        });
+        assert_eq!(
+            fs::read_to_string(managed.join("auth.json")).unwrap(),
+            "account-a"
+        );
+    }
+
+    #[test]
+    fn managed_codex_auth_bridge_fails_closed_and_clears_a_stale_link() {
+        let account_a = temp_repo("codex_auth_bridge_missing_frozen_account_a");
+        let account_b = temp_repo("codex_auth_bridge_stale_account_b");
+        let managed = temp_repo("codex_auth_bridge_stale_managed");
+        let repo = temp_repo("codex_auth_bridge_stale_repo");
+        fs::write(account_b.join("auth.json"), "account-b").unwrap();
+        codex_bridge_private_home_file(&account_b, &managed, "auth.json").unwrap();
+        assert_eq!(
+            fs::read_to_string(managed.join("auth.json")).unwrap(),
+            "account-b"
+        );
+        let managed_mcp = codex_config_toml_with_gateway_tools_and_global_servers(
+            "/opt/diffforge",
+            &["--coordination-mcp-proxy".to_string()],
+            &[],
+            &[],
+        );
+
+        let error = with_codex_launch_auth_home(Some(&account_a), || {
+            codex_prepare_private_home(
+                &managed,
+                &repo,
+                &repo,
+                "bounded_direct_edit",
+                &managed_mcp,
+                &[],
+            )
+        })
+        .unwrap_err();
+
+        assert!(error.contains("frozen Codex authentication source"));
+        assert!(fs::symlink_metadata(managed.join("auth.json")).is_err());
+    }
+
+    #[test]
+    fn fresh_managed_codex_home_allows_interactive_auth_without_a_source_store() {
+        let managed = temp_repo("codex_auth_bridge_fresh_managed");
+        let repo = temp_repo("codex_auth_bridge_fresh_repo");
+        let managed_mcp = codex_config_toml_with_gateway_tools_and_global_servers(
+            "/opt/diffforge",
+            &["--coordination-mcp-proxy".to_string()],
+            &[],
+            &[],
+        );
+
+        with_codex_launch_auth_home_requirement(None, false, || {
+            codex_prepare_private_home(
+                &managed,
+                &repo,
+                &repo,
+                "bounded_direct_edit",
+                &managed_mcp,
+                &[],
+            )
+        })
+        .expect("a fresh Codex CLI must open so the user can authenticate");
+        assert!(managed.join("config.toml").is_file());
+        assert!(!managed.join("auth.json").exists());
     }
 
     #[test]

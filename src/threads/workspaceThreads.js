@@ -1222,6 +1222,15 @@ function workspaceTerminalNicknameInUse(entry, nickname, options = {}) {
     return false;
   }
 
+  const disallowedNicknameKeys = new Set(
+    (Array.isArray(options.disallowedNicknames) ? options.disallowedNicknames : [])
+      .map(terminalNicknameKey)
+      .filter(Boolean),
+  );
+  if (disallowedNicknameKeys.has(key)) {
+    return true;
+  }
+
   const excludeThreadId = cleanText(options.excludeThreadId || options.thread_id);
   const excludeTerminalKey = terminalSessionKey(options.excludeTerminalIndex ?? options.terminal_index);
 
@@ -5231,6 +5240,7 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
       workspaceTerminalNicknameFromRecord(existing),
     ],
     {
+      disallowedNicknames: options.disallowedNicknames,
       excludeTerminalIndex: terminalIndex,
       excludeThreadId: nextThreadId,
     },
@@ -5666,7 +5676,16 @@ export function updateWorkspaceActiveTerminal(state, event = {}) {
     : entry.threads[restoredThreadId]
       ? restoredThreadId
       : "";
+  const mostRecentRetiredThread = !threadId
+    ? Object.values(entry.threads)
+      .filter((candidate) => (
+        getThreadTerminalIndex(candidate) === terminalIndex
+        && ["closed", "exited"].includes(cleanText(candidate?.status).toLowerCase())
+      ))
+      .sort((left, right) => getThreadRestoreTimestamp(right) - getThreadRestoreTimestamp(left))[0]
+    : null;
   const terminal = upsertActiveTerminal(entry, event, {
+    disallowedNicknames: [workspaceTerminalNicknameFromRecord(mostRecentRetiredThread)],
     status: event.status || "active",
     thread_id: threadId,
   });
@@ -7924,6 +7943,7 @@ function getWorkspaceThreadForTerminalIndexFromEntry(entry, terminalIndex) {
   return Object.values(entry.threads)
     .filter((thread) => (
       getThreadTerminalIndex(thread) === safeTerminalIndex
+      && !["closed", "exited"].includes(cleanText(thread?.status).toLowerCase())
       && getWorkspaceThreadHasSession(thread)
     ))
     .sort((left, right) => getThreadRestoreTimestamp(right) - getThreadRestoreTimestamp(left))[0] || null;

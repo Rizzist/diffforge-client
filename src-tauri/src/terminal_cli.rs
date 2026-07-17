@@ -3346,7 +3346,8 @@ fn extend_terminal_activity_env_vars(
     terminal_index: Option<u16>,
     provider_id: &str,
     activity_transport: Option<&TerminalActivityTransportEndpoint>,
-) {
+    launch_account_binding: Option<&TerminalProviderLaunchAccountBinding>,
+) -> Result<(), String> {
     if let Some(workspace_root) = workspace_root {
         set_terminal_env_var(
             env_vars,
@@ -3366,18 +3367,67 @@ fn extend_terminal_activity_env_vars(
         env_vars.retain(|(existing_key, _)| existing_key != &key);
         env_vars.push((key, value));
     }
-    // Account profile binding: stamps the pane with the active agent account
-    // and injects CLAUDE_CONFIG_DIR / CODEX_HOME for non-default profiles.
-    // Every agent spawn and relaunch path funnels through here, so switching
-    // accounts applies to the next spawn without an app restart.
-    agent_accounts_apply_spawn_env(
-        env_vars,
+    // Resume/open resolution captures a provider account before asynchronous
+    // launch work begins. Apply only that frozen provider environment here;
+    // the pane stamp is committed after the process/PTY launch succeeds.
+    if agent_accounts_supported_kind(provider_id).is_some() {
+        let provider_binding = launch_account_binding
+            .filter(|binding| binding.matches_provider_id(provider_id))
+            .ok_or_else(|| {
+                format!(
+                    "Unable to build the {provider_id} launch environment without a frozen account binding."
+                )
+            })?;
+        provider_binding.apply_to_env(env_vars);
+    }
+    Ok(())
+}
+
+fn stamp_terminal_launch_account(
+    pane_id: &str,
+    instance_id: u64,
+    launch_epoch: &str,
+    provider_id: &str,
+    workspace_id: Option<&str>,
+    terminal_index: Option<u16>,
+    launch_account_binding: &TerminalProviderLaunchAccountBinding,
+    workspace_trust: Option<&Value>,
+) {
+    let Some(account_binding) = launch_account_binding
+        .matches_provider_id(provider_id)
+        .then(|| launch_account_binding.captured_account())
+        .flatten()
+    else {
+        return;
+    };
+    agent_accounts_stamp_captured_spawn(
         pane_id,
+        Some(instance_id),
+        Some(launch_epoch),
         provider_id,
         workspace_id,
         None,
         terminal_index,
+        account_binding,
+        workspace_trust,
     );
+}
+
+fn prepare_terminal_launch_account(
+    env_vars: &[(String, String)],
+    provider_id: &str,
+    launch_account_binding: &TerminalProviderLaunchAccountBinding,
+) -> Result<Option<Value>, String> {
+    let account_binding = launch_account_binding
+        .matches_provider_id(provider_id)
+        .then(|| launch_account_binding.captured_account())
+        .flatten()
+        .ok_or_else(|| {
+            format!(
+                "Unable to freeze the {provider_id} account for this terminal launch."
+            )
+        })?;
+    agent_accounts_prepare_captured_spawn(env_vars, account_binding)
 }
 
 fn set_terminal_env_var(env_vars: &mut Vec<(String, String)>, key: &str, value: &str) {
@@ -3454,6 +3504,7 @@ fn apply_codex_resume_home_env(
     env_vars: &mut Vec<(String, String)>,
     source_home: &str,
     provider_session_id: &str,
+    launch_account_binding: Option<&TerminalProviderLaunchAccountBinding>,
 ) -> Result<(), String> {
     let source_home = source_home.trim();
     if source_home.is_empty() {
@@ -3468,21 +3519,26 @@ fn apply_codex_resume_home_env(
                 .filter(|value| !value.is_empty())
         })
         .map(ToString::to_string);
-    if let Some(managed_home) = managed_home {
+    let frozen_account_home = launch_account_binding
+        .and_then(TerminalProviderLaunchAccountBinding::codex_auth_home)
+        .map(Path::to_path_buf);
+    let launch_home = managed_home
+        .map(PathBuf::from)
+        .or(frozen_account_home)
+        .unwrap_or_else(|| PathBuf::from(source_home));
+    if launch_home != Path::new(source_home) {
         materialize_codex_rollout_in_managed_home(
             provider_session_id,
             Path::new(source_home),
-            Path::new(&managed_home),
+            &launch_home,
         )?;
-        // Resume/fork may originate in a global home or another coordinated
-        // slot. The new pane's managed home remains authoritative so its MCP
-        // identity and permission roots cannot be inherited from the source.
-        set_terminal_env_var(env_vars, "CODEX_HOME", &managed_home);
-        set_terminal_env_var(env_vars, "DIFFFORGE_CODEX_HOME", &managed_home);
-        return Ok(());
     }
-    set_terminal_env_var(env_vars, "CODEX_HOME", source_home);
-    set_terminal_env_var(env_vars, "DIFFFORGE_CODEX_HOME", source_home);
+    let launch_home = launch_home.to_string_lossy();
+    // Resume/fork may originate in a global home, another account profile, or
+    // another coordinated slot. It contributes only the rollout; the frozen
+    // account/managed home remains authoritative for auth and policy.
+    set_terminal_env_var(env_vars, "CODEX_HOME", &launch_home);
+    set_terminal_env_var(env_vars, "DIFFFORGE_CODEX_HOME", &launch_home);
     Ok(())
 }
 
@@ -13816,13 +13872,23 @@ fn run_agent_thread_turn_for_context(
     let working_directory = resolve_workspace_root_directory(request.working_directory.as_deref())?;
     let working_directory_text = working_directory.to_string_lossy().to_string();
     let mut launch_env_vars = env_vars.to_vec();
+    let launch_account_binding = TerminalProviderLaunchAccountBinding::capture(provider);
+    launch_account_binding.validate_frozen_account(provider, true)?;
+    launch_account_binding.apply_to_env(&mut launch_env_vars);
+    let _workspace_trust = prepare_terminal_launch_account(
+        &launch_env_vars,
+        definition.id,
+        &launch_account_binding,
+    )?;
     let resume_was_requested =
         terminal_clean_provider_session_id(Some(&requested_provider_session_id)).is_some();
-    let (launch_provider_session_id, codex_resume_home) = terminal_resolve_provider_resume_session(
-        provider,
-        terminal_clean_provider_session_id(Some(&requested_provider_session_id)),
-        &working_directory_text,
-    );
+    let (launch_provider_session_id, codex_resume_home) =
+        terminal_resolve_provider_resume_session_for_binding(
+            provider,
+            terminal_clean_provider_session_id(Some(&requested_provider_session_id)),
+            &working_directory_text,
+            &launch_account_binding,
+        );
     if matches!(provider, AgentProvider::Claude)
         && resume_was_requested
         && launch_provider_session_id.is_none()
@@ -13834,6 +13900,7 @@ fn run_agent_thread_turn_for_context(
             &mut launch_env_vars,
             home,
             launch_provider_session_id.as_deref().unwrap_or_default(),
+            Some(&launch_account_binding),
         )?;
     }
     let launch_provider_session_id = launch_provider_session_id.unwrap_or_default();

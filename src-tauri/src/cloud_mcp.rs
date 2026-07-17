@@ -37640,6 +37640,8 @@ pub(crate) async fn cloud_mcp_sync_terminal_restart_intent_delta(
         "restart_intent_state": intent_state,
         "restart_mode": intent.mode,
         "restart_target_role": intent.target_role,
+        "restart_fresh_session": intent.fresh_session,
+        "restart_provider_session_id": intent.provider_session_id,
         "restart_coordinator_id": intent.coordinator_id,
         "restart_requested_at_ms": intent.requested_at_ms,
         "restart_deadline_at_ms": intent.deadline_at_ms,

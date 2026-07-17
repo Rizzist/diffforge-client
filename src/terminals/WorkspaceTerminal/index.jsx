@@ -36,10 +36,14 @@ import {
   TERMINAL_SESSION_RESTART_REQUEST_EVENT,
   createTerminalSessionRestartCoordinatorId,
   emitTerminalSessionRestartResult,
+  getTerminalRestartMenuActions,
   normalizeTerminalSessionRestartMode,
   normalizeTerminalSessionRestartRole,
+  probeTerminalSessionForRestart,
+  resolveTerminalRestartOpenPlan,
   resolveTerminalSessionOpenBinding,
   terminalSessionRestartClearedResult,
+  terminalSessionRestartReadyRequest,
 } from "../terminalSessionRestart.js";
 import { createTerminalOutputWorkerSession } from "./terminalOutputWorkerClient.js";
 import { SshClientPicker } from "../../ssh/SshClientPicker.jsx";
@@ -2448,6 +2452,7 @@ function WorkspaceTerminal({
   const startAgentInPrewarmedTerminalRef = useRef(null);
   const blankStartupProbeCountRef = useRef(0);
   const terminalClosingRef = useRef(false);
+  const terminalExplicitCloseEpochRef = useRef(0);
   const terminalThemeRefreshTimerRef = useRef(0);
   const lastTerminalThemeRefreshKeyRef = useRef("");
   const preserveCoordinationOnNextCleanupRef = useRef(false);
@@ -6135,10 +6140,16 @@ function WorkspaceTerminal({
     // Tauri's WebView can corrupt xterm's WebGL glyph atlas during rapid multi-pane resize.
     let rendererMode = useWebglRenderer ? "webgl_pending" : "dom";
     let runtimeTerminalState = "starting";
-    const preserveCoordinationForThisStart = preserveCoordinationOnNextOpenRef.current && !isGenericTerminal;
+    let preserveCoordinationForThisStart = preserveCoordinationOnNextOpenRef.current && !isGenericTerminal;
     const requestedFreshSessionForThisStart = (
       forceFreshSessionOnNextOpenRef.current
       || Boolean(thread?.fresh_session_started_at && !threadProviderSessionId)
+      || Boolean(
+        !isGenericTerminal
+          && !terminalThreadIdRef.current
+          && !threadProviderSessionId
+          && !providerSessionOverrideOnNextOpenRef.current,
+      )
     );
     // Capture the pending provider-session override for THIS start before the ref
     // is cleared below (~line 6185); the terminal start/open diagnostics reference
@@ -6151,9 +6162,11 @@ function WorkspaceTerminal({
       providerSessionOverride: providerSessionOverrideForThisStart,
       threadProviderSessionId,
     });
-    const forceFreshSessionForThisStart = sessionOpenBindingForThisStart.fresh_session;
+    let forceFreshSessionForThisStart = sessionOpenBindingForThisStart.fresh_session;
     const forkFromProviderSessionIdForThisStart = sessionOpenBindingForThisStart.fork_from_provider_session_id;
-    const startupThreadProviderSessionId = sessionOpenBindingForThisStart.provider_session_id;
+    let startupThreadProviderSessionId = sessionOpenBindingForThisStart.provider_session_id;
+    const requestedStartupProviderSessionIdForThisStart = startupThreadProviderSessionId;
+    let providerSessionMissingForThisStart = false;
     const startupDefaultLaunch = isGenericTerminal
       ? { effort: "", model: "", speed: "" }
       : getTerminalStartupDefaultLaunch(terminalAgentKind, agentLaunchDefaults);
@@ -6163,26 +6176,26 @@ function WorkspaceTerminal({
         && terminalAgentKind === "opencode"
         && !threadProviderModel,
     );
-    const startupThreadProviderModel = isGenericTerminal
+    let startupThreadProviderModel = isGenericTerminal
       ? ""
       : threadProviderModel || (startupProviderSessionSuppressesDefaultModel ? "" : startupDefaultModel);
-    const startupThreadProviderModelSource = threadProviderModel
+    let startupThreadProviderModelSource = threadProviderModel
       ? "session-restore"
       : startupThreadProviderModel
         ? "settings-default"
         : "";
-    const startupThreadProviderLaunch = startupThreadProviderModel
+    let startupThreadProviderLaunch = startupThreadProviderModel
       ? resolveAgentLaunchDefaultForModel(
         terminalAgentKind,
         agentLaunchDefaults,
         startupThreadProviderModel,
       )
       : { effort: "", speed: "" };
-    const startupThreadProviderEffort = startupThreadProviderLaunch.effort || "";
-    const startupThreadProviderSpeed = startupThreadProviderLaunch.speed || "";
+    let startupThreadProviderEffort = startupThreadProviderLaunch.effort || "";
+    let startupThreadProviderSpeed = startupThreadProviderLaunch.speed || "";
     const startupPermissionMode = isGenericTerminal ? "" : String(permissionMode || "").trim();
     const startupThreadId = terminalThreadIdRef.current;
-    const startupSlotKey = forceFreshSessionForThisStart
+    let startupSlotKey = forceFreshSessionForThisStart
       ? String(Math.max(0, Number.parseInt(terminalIndex, 10) || 0) + 1)
       : terminalThreadSlotKeyRef.current;
     preserveCoordinationOnNextOpenRef.current = false;
@@ -6453,6 +6466,7 @@ function WorkspaceTerminal({
       }
 
       runtimeTerminalState = state;
+      terminalStateRef.current = state;
       if (state === "running") {
         terminalRunningSinceRef.current = terminalRunningSinceRef.current || performance.now();
       } else if (state === "starting" || state === "blocked" || state === "closed" || state === "error") {
@@ -11156,6 +11170,77 @@ function WorkspaceTerminal({
     async function startTerminal() {
       try {
         setPaneStage("starting", "Preparing Terminal", "Creating terminal session.");
+        if (
+          !isGenericTerminal
+          && startupThreadProviderSessionId
+          && !forkFromProviderSessionIdForThisStart
+          && !forceFreshSessionForThisStart
+        ) {
+          let providerSessionExists = false;
+          try {
+            providerSessionExists = await invoke("terminal_provider_session_exists", {
+              agent_id: terminalAgentKind,
+              provider_session_id: startupThreadProviderSessionId,
+              working_directory: workingDirectory || "",
+              ...(preserveCoordinationForThisStart ? {
+                pane_id: paneId,
+              } : {}),
+            }) === true;
+          } catch (error) {
+            logThreadBridgeDiagnostic("frontend.thread_provider_session.existence_check_error", {
+              agent_id: terminalAgentKind,
+              error: getErrorMessage(error, "Unable to verify provider session."),
+              pane_id: paneId,
+              terminal_index: terminalIndex,
+              thread_id: startupThreadId || "",
+              workspace_id: workspace?.id || "",
+            });
+          }
+
+          if (isDisposed) {
+            return;
+          }
+
+          const validatedBinding = resolveTerminalSessionOpenBinding({
+            providerSessionExists,
+            providerSessionOverride: startupThreadProviderSessionId,
+          });
+          if (validatedBinding.provider_session_missing) {
+            providerSessionMissingForThisStart = true;
+            forceFreshSessionForThisStart = true;
+            preserveCoordinationForThisStart = false;
+            startupThreadProviderSessionId = "";
+            startupThreadProviderModel = isGenericTerminal ? "" : startupDefaultModel;
+            startupThreadProviderModelSource = startupThreadProviderModel ? "settings-default" : "";
+            startupThreadProviderLaunch = startupThreadProviderModel
+              ? resolveAgentLaunchDefaultForModel(
+                terminalAgentKind,
+                agentLaunchDefaults,
+                startupThreadProviderModel,
+              )
+              : { effort: "", speed: "" };
+            startupThreadProviderEffort = startupThreadProviderLaunch.effort || "";
+            startupThreadProviderSpeed = startupThreadProviderLaunch.speed || "";
+            startupSlotKey = String(Math.max(0, Number.parseInt(terminalIndex, 10) || 0) + 1);
+            terminalThreadSlotKeyRef.current = startupSlotKey;
+            setTerminalLaunchInfo(null);
+            terminalStartupSnapshotRef.current = {
+              ...(terminalStartupSnapshotRef.current || {}),
+              forceFreshSessionForThisStart: true,
+              preserveCoordinationForThisStart: false,
+              startupSlotKey,
+              startupThreadProviderSessionId: "",
+            };
+            logThreadBridgeDiagnostic("frontend.thread_provider_session.missing_fallback_fresh", {
+              agent_id: terminalAgentKind,
+              pane_id: paneId,
+              providerSessionPresent: true,
+              terminal_index: terminalIndex,
+              thread_id: startupThreadId || "",
+              workspace_id: workspace?.id || "",
+            });
+          }
+        }
         const outputDisplayMasker = createCoreRepoNameDisplayMasker({
           coreRepoPath: collapseFunctionalRepoPathToCoreRepoPath(workingDirectory || ""),
         });
@@ -14607,7 +14692,7 @@ function WorkspaceTerminal({
           openResult?.fork_from_provider_session_id || forkFromProviderSessionIdForThisStart || "",
         ).trim();
         const openedProviderSessionDropped = Boolean(
-          startupThreadProviderSessionId
+          requestedStartupProviderSessionIdForThisStart
             && !openedProviderSessionId
             && !openedForkFromProviderSessionId,
         );
@@ -14660,6 +14745,7 @@ function WorkspaceTerminal({
           backendNativeSessionPresent: Boolean(openedNativeSessionId),
           backendProviderSessionReturned: backendReturnedProviderSession,
           openedProviderSessionDropped,
+          providerSessionMissingForThisStart,
           terminal_index: terminalIndex,
           workspace_id: workspace?.id || "",
         });
@@ -16508,6 +16594,7 @@ function WorkspaceTerminal({
     }
 
     setTerminalError("");
+    terminalExplicitCloseEpochRef.current += 1;
     terminalClosingRef.current = true;
     tombstoneTerminalCanonicalProjection("closing");
     setTerminalClosing(true);
@@ -16659,9 +16746,18 @@ function WorkspaceTerminal({
     const currentLaunchEpoch = String(terminalLaunchEpochRef.current || "").trim();
     const expectedInstanceId = Number(request.instance_id || currentInstanceId);
     const expectedLaunchEpoch = String(request.launch_epoch || currentLaunchEpoch).trim();
+    const explicitCloseEpochAtStart = terminalExplicitCloseEpochRef.current;
+    const requestedResumeProviderSessionId = String(
+      request.provider_session_id || threadProviderSessionId || "",
+    ).trim();
+    let restartFreshSession = Boolean(
+      request.fresh_session !== false
+        || nextRoleId !== terminalAgentKind
+        || !requestedResumeProviderSessionId,
+    );
     const resultBase = {
       coordinator_id: coordinatorId,
-      fresh_session: true,
+      fresh_session: restartFreshSession,
       mode,
       pane_id: paneId,
       previous_instance_id: expectedInstanceId,
@@ -16677,6 +16773,22 @@ function WorkspaceTerminal({
         setTerminalError(message);
       }
       return result;
+    };
+    const explicitCloseWon = () => (
+      terminalClosingRef.current
+      || terminalExplicitCloseEpochRef.current !== explicitCloseEpochAtStart
+    );
+    const supersedeForExplicitClose = () => {
+      const waiter = terminalOpenWaitersRef.current.get(coordinatorId);
+      if (waiter) {
+        terminalOpenWaitersRef.current.delete(coordinatorId);
+        window.clearTimeout(waiter.timer);
+        waiter.resolve?.({ cancelled: true });
+      }
+      return fail(
+        "Restart was cancelled because this terminal was explicitly closed.",
+        "superseded",
+      );
     };
 
     if (!nextRoleId) {
@@ -16698,6 +16810,39 @@ function WorkspaceTerminal({
       return fail("Another terminal restart coordinator is already running.");
     }
 
+    let providerSessionExists = restartFreshSession ? null : false;
+    if (!restartFreshSession) {
+      try {
+        const probeResult = await probeTerminalSessionForRestart(
+          () => invoke("terminal_provider_session_exists", {
+            agent_id: nextRoleId,
+            provider_session_id: requestedResumeProviderSessionId,
+            working_directory: workingDirectory || "",
+            pane_id: paneId,
+            instance_id: currentInstanceId,
+          }),
+          explicitCloseWon,
+        );
+        providerSessionExists = probeResult.provider_session_exists;
+        if (probeResult.explicit_close_requested) {
+          return supersedeForExplicitClose();
+        }
+      } catch (error) {
+        logThreadBridgeDiagnostic("frontend.thread_provider_session.restart_existence_check_error", {
+          agent_id: nextRoleId,
+          error: getErrorMessage(error, "Unable to verify provider session."),
+          pane_id: paneId,
+          terminal_index: terminalIndex,
+          thread_id: terminalThreadIdRef.current || thread?.id || "",
+          workspace_id: workspace?.id || "",
+        });
+      }
+      if (providerSessionExists !== true) {
+        restartFreshSession = true;
+        resultBase.fresh_session = true;
+      }
+    }
+
     if (mode === TERMINAL_SESSION_RESTART_MODES.WHEN_IDLE && !request.backend_already_closed) {
       try {
         const admission = await invoke("terminal_restart_if_idle", {
@@ -16705,9 +16850,14 @@ function WorkspaceTerminal({
           instance_id: currentInstanceId,
           launch_epoch: currentLaunchEpoch,
           target_role: nextRoleId,
+          fresh_session: restartFreshSession,
+          provider_session_id: restartFreshSession ? undefined : requestedResumeProviderSessionId,
           coordinator_id: coordinatorId,
           deadline_ms: Number(request.deadline_ms) || undefined,
         });
+        if (explicitCloseWon()) {
+          return supersedeForExplicitClose();
+        }
         if (admission?.queued) {
           const queued = {
             ...resultBase,
@@ -16737,45 +16887,112 @@ function WorkspaceTerminal({
 
     activeRestartCoordinatorRef.current = coordinatorId;
     try {
+      if (explicitCloseWon()) {
+        return supersedeForExplicitClose();
+      }
+
+      const openPlan = resolveTerminalRestartOpenPlan({
+        backendAlreadyClosed: Boolean(request.backend_already_closed),
+        currentInstanceId: Number(terminalInstanceIdRef.current || 0),
+        currentLaunchEpoch: String(terminalLaunchEpochRef.current || "").trim(),
+        expectedInstanceId: currentInstanceId,
+        expectedLaunchEpoch: currentLaunchEpoch,
+        explicitCloseRequested: explicitCloseWon(),
+        providerSessionExists,
+        requestedFreshSession: restartFreshSession,
+        terminalClosing: terminalClosingRef.current,
+        terminalState: terminalStateRef.current,
+      });
+      if (!openPlan.open_terminal) {
+        return supersedeForExplicitClose();
+      }
+      restartFreshSession = openPlan.fresh_session;
+      resultBase.fresh_session = restartFreshSession;
+      const backendAlreadyClosed = Boolean(
+        request.backend_already_closed || !openPlan.instance_current,
+      );
+
       const nextSessionMode = defaultTerminalSessionModeForRole(nextRoleId);
       terminalSessionModeRef.current = nextSessionMode;
       terminalSessionModeExplicitRef.current = true;
       setTerminalSessionMode(nextSessionMode);
       setRestartRoleMenuOpen(false);
 
-      // The shared coordinator owns the native restart sequence. A fresh
-      // thread id is minted before the exact old instance is closed, and the
-      // replacement open is not reported complete until the backend returns a
-      // different instance/launch identity.
-      detachThreadForNewTerminalSession({
-        agent_id: terminalAgentKind,
-        instance_id: currentInstanceId,
-        pane_id: paneId,
-        terminal_index: terminalIndex,
-        thread_id: terminalThreadIdRef.current || thread?.id || "",
-        workspace_id: workspace?.id || "",
-      });
-      const nextThreadId = createWorkspaceThreadId(workspace?.id || "", terminalIndex);
       const replacementOpened = waitForReplacementTerminalOpen(coordinatorId, {
         instance_id: currentInstanceId,
         launch_epoch: currentLaunchEpoch,
         role: nextRoleId,
       });
 
-      if (!request.backend_already_closed) {
-        const closed = await invoke("terminal_close", {
-          pane_id: paneId,
-          instance_id: currentInstanceId,
-          preserve_coordination_session: false,
-          wait_for_cleanup: true,
-        });
-        if (closed !== true) {
-          throw new Error("The terminal identity changed before restart admission.");
+      if (!backendAlreadyClosed && openPlan.close_existing) {
+        let closeSucceeded = false;
+        try {
+          closeSucceeded = await invoke("terminal_close", {
+            pane_id: paneId,
+            instance_id: currentInstanceId,
+            preserve_coordination_session: !restartFreshSession,
+            wait_for_cleanup: true,
+          }) === true;
+        } catch (error) {
+          logThreadBridgeDiagnostic("frontend.terminal_restart.close_stale_fallback_fresh", {
+            agent_id: nextRoleId,
+            error: getErrorMessage(error, "Unable to close the previous terminal instance."),
+            instance_id: currentInstanceId,
+            pane_id: paneId,
+            terminal_index: terminalIndex,
+            workspace_id: workspace?.id || "",
+          });
+        }
+        if (explicitCloseWon()) {
+          return supersedeForExplicitClose();
+        }
+        if (!closeSucceeded) {
+          const closeFallbackPlan = resolveTerminalRestartOpenPlan({
+            closeSucceeded: false,
+            currentInstanceId: Number(terminalInstanceIdRef.current || 0),
+            currentLaunchEpoch: String(terminalLaunchEpochRef.current || "").trim(),
+            expectedInstanceId: currentInstanceId,
+            expectedLaunchEpoch: currentLaunchEpoch,
+            explicitCloseRequested: explicitCloseWon(),
+            providerSessionExists,
+            requestedFreshSession: restartFreshSession,
+            terminalClosing: terminalClosingRef.current,
+            terminalState: terminalStateRef.current,
+          });
+          if (!closeFallbackPlan.open_terminal) {
+            return supersedeForExplicitClose();
+          }
+          restartFreshSession = closeFallbackPlan.fresh_session;
+          resultBase.fresh_session = closeFallbackPlan.fresh_session;
         }
       }
+
+      if (explicitCloseWon()) {
+        return supersedeForExplicitClose();
+      }
+
+      // Fresh restarts detach the historical terminal generation only after
+      // the probe and close attempt settle. That lets a PTY which exits during
+      // the awaited probe safely switch to a new empty thread instead of
+      // forgetting the old thread and then failing before any replacement open.
+      if (restartFreshSession) {
+        detachThreadForNewTerminalSession({
+          agent_id: terminalAgentKind,
+          instance_id: currentInstanceId,
+          pane_id: paneId,
+          terminal_index: terminalIndex,
+          thread_id: terminalThreadIdRef.current || thread?.id || "",
+          workspace_id: workspace?.id || "",
+        });
+      }
+      const nextThreadId = restartFreshSession
+        ? createWorkspaceThreadId(workspace?.id || "", terminalIndex)
+        : String(terminalThreadIdRef.current || thread?.id || "").trim();
       emitTerminalSessionRestartResult({
         ...resultBase,
-        message: "Opening a fresh terminal session.",
+        message: restartFreshSession
+          ? "Opening a fresh terminal session."
+          : "Restarting with the current provider session.",
         status: "running",
       });
 
@@ -16813,22 +17030,55 @@ function WorkspaceTerminal({
           terminal_index: terminalIndex,
           workspace_id: workspace?.id || "",
         });
-      } else {
+      } else if (restartFreshSession) {
         restartWithEmptyTerminalSession({
           agent_id: nextRoleId,
           nextThreadId,
           reason: "terminal_session_restart_coordinator",
           statusDetail: "Starting a new terminal session.",
         });
+      } else {
+        setTerminalClosed(false);
+        terminalClosingRef.current = false;
+        preserveCoordinationOnNextCleanupRef.current = true;
+        preserveCoordinationOnNextOpenRef.current = true;
+        forceFreshSessionOnNextOpenRef.current = false;
+        providerSessionOverrideOnNextOpenRef.current = requestedResumeProviderSessionId;
+        forkFromProviderSessionOnNextOpenRef.current = "";
+        terminalThreadIdRef.current = nextThreadId;
+        resetTerminalReadinessForEpoch({
+          activity_status: "idle",
+          agent_id: nextRoleId,
+          instance_id: 0,
+          reason: "terminal_restart_with_provider_session",
+          thread_id: nextThreadId,
+        });
+        setTerminalClosing(false);
+        setTerminalState("starting");
+        setTerminalError("");
+        setTerminalLaunchInfo(null);
+        setParkedPrompt(null);
+        parkedPromptRef.current = null;
+        setTerminalStatus({
+          detail: "Restarting with the current provider session.",
+          title: "Restarting Session",
+          visible: true,
+        });
+        setRestartKey((key) => key + 1);
       }
 
       const opened = await replacementOpened;
+      if (explicitCloseWon()) {
+        return supersedeForExplicitClose();
+      }
       const completed = {
         ...resultBase,
         agent_id: opened.agent_id,
         instance_id: opened.instance_id,
         launch_epoch: opened.launch_epoch,
-        message: "Fresh terminal session opened.",
+        message: restartFreshSession
+          ? "Fresh terminal session opened."
+          : "Terminal restarted with the current provider session.",
         status: "completed",
       };
       emitTerminalSessionRestartResult(completed);
@@ -16854,18 +17104,28 @@ function WorkspaceTerminal({
     terminalClosing,
     terminalIndex,
     thread,
+    threadProviderSessionId,
     workingDirectory,
     workspace?.id,
     workspace?.name,
     waitForReplacementTerminalOpen,
   ]);
 
-  const restartTerminalAs = useCallback((roleId = terminalAgentKind) => {
+  const currentRestartProviderSessionId = String(
+    threadProviderSessionId
+      || terminalLaunchInfo?.provider_session_id
+      || terminalLaunchInfo?.native_session_id
+      || "",
+  ).trim();
+  const restartTerminalAs = useCallback((roleId = terminalAgentKind, options = {}) => {
+    const freshSession = options.freshSession !== false;
     coordinateTerminalSessionRestart({
+      fresh_session: freshSession,
       mode: TERMINAL_SESSION_RESTART_MODES.NOW,
+      provider_session_id: freshSession ? "" : currentRestartProviderSessionId,
       role: roleId,
     });
-  }, [coordinateTerminalSessionRestart, terminalAgentKind]);
+  }, [coordinateTerminalSessionRestart, currentRestartProviderSessionId, terminalAgentKind]);
 
   useEffect(() => {
     const handleRestartRequest = (event) => {
@@ -16910,7 +17170,7 @@ function WorkspaceTerminal({
           coordinator_id: detail.coordinator_id,
           deadline_at_ms: detail.deadline_at_ms,
           force_action: detail.restart_force_action,
-          fresh_session: true,
+          fresh_session: detail.fresh_session !== false,
           instance_id: detail.instance_id,
           launch_epoch: detail.launch_epoch,
           message: "Restart still blocked. Active work was not interrupted; choose Restart now to force it.",
@@ -16929,17 +17189,11 @@ function WorkspaceTerminal({
       if (String(detail.restart_intent_state || "") !== "ready") {
         return;
       }
-      coordinateTerminalSessionRestart({
-        backend_already_closed: true,
-        coordinator_id: detail.coordinator_id,
-        instance_id: detail.instance_id,
-        launch_epoch: detail.launch_epoch,
-        mode: TERMINAL_SESSION_RESTART_MODES.NOW,
+      coordinateTerminalSessionRestart(terminalSessionRestartReadyRequest(detail, {
         pane_id: paneId,
-        role: detail.target_role,
         terminal_index: terminalIndex,
         workspace_id: workspace?.id || "",
-      });
+      }));
     })
       .then((nextUnlisten) => {
         if (disposed) {
@@ -17619,6 +17873,10 @@ function WorkspaceTerminal({
     && !fullscreenThreadUiViewActive;
   const restartMenuAgentKind = terminalAgentKind;
   const restartRoleOptions = getTerminalRoleSwitchOptions(agentStatuses);
+  const restartMenuActions = getTerminalRestartMenuActions(restartRoleOptions, {
+    currentRoleId: restartMenuAgentKind,
+    hasProviderSession: Boolean(currentRestartProviderSessionId),
+  });
   const shellLauncherRailAgentKind = isGenericTerminal
     && shellLauncherSelectedAgentId !== SHELL_LAUNCHER_MODE_TERMINAL
       ? shellLauncherSelectedAgentId
@@ -17921,27 +18179,26 @@ function WorkspaceTerminal({
               <ButtonRefreshIcon aria-hidden="true" />
             </TerminalRestartButton>
               <TerminalRestartDropdown data-align={restartMenuAlign} data-open={restartRoleMenuOpen ? "true" : "false"} role="menu">
-                {restartRoleOptions.map((option) => {
-                  const optionSelected = option.id === restartMenuAgentKind;
+                {restartMenuActions.map((action) => {
+                  const optionSelected = action.role_id === restartMenuAgentKind;
                   return (
                     <TerminalRestartOption
-                      data-role={option.id}
+                      data-restart-session={action.fresh_session ? "fresh" : "resume"}
+                      data-role={action.role_id}
                       data-selected={optionSelected ? "true" : "false"}
-                      key={option.id}
-                      onClick={() => restartTerminalAs(option.id)}
+                      key={action.id}
+                      onClick={() => restartTerminalAs(action.role_id, {
+                        freshSession: action.fresh_session,
+                      })}
                       role="menuitem"
-                      title={threadsViewActive ? `Start new ${option.label} session` : `Restart as ${option.label}`}
+                      title={action.fresh_session
+                        ? action.role_id === restartMenuAgentKind
+                          ? "Restart with a fresh empty provider session"
+                          : `Restart as ${action.role_label}`
+                        : `Restart ${action.role_label} with the current provider session`}
                       type="button"
                     >
-                      <strong>
-                        {threadsViewActive
-                          ? option.id === restartMenuAgentKind
-                            ? `Restart ${option.label}`
-                            : `New ${option.label} session`
-                          : option.id === terminalAgentKind
-                            ? `Restart ${option.label}`
-                            : option.label}
-                      </strong>
+                      <strong>{action.label}</strong>
                     </TerminalRestartOption>
                   );
                 })}

@@ -32,6 +32,11 @@ const TERMINAL_RESTART_INTENT_DEFAULT_DEADLINE_MS: u64 = 120_000;
 const TERMINAL_RESTART_INTENT_MIN_DEADLINE_MS: u64 = 5_000;
 const TERMINAL_RESTART_INTENT_MAX_DEADLINE_MS: u64 = 15 * 60_000;
 const TERMINAL_RESTART_INTENT_EVENT: &str = "forge-terminal-restart-intent";
+// A resume binding is captured before a busy restart is queued. Keep it past
+// the longest admission deadline so the ready event can still reopen against
+// the pane's frozen account instead of falling back to the mutable active one.
+const TERMINAL_FROZEN_RESUME_BINDING_TTL_MS: u64 =
+    TERMINAL_RESTART_INTENT_MAX_DEADLINE_MS + 2 * 60_000;
 // Agent-start commands must never hang the frontend launch pipeline: a
 // wedged lifecycle holder (slow terminal_open, close teardown) or a stuck
 // pane future previously left the invoke pending forever, so panes sat at
@@ -645,6 +650,123 @@ fn terminal_clean_provider_session_id(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+fn terminal_provider_session_exists_on_device(
+    agent_id: &str,
+    provider_session_id: &str,
+    working_directory: &str,
+    account_binding: Option<&TerminalProviderLaunchAccountBinding>,
+) -> Result<bool, String> {
+    let Some(provider_session_id) = terminal_clean_provider_session_id(Some(provider_session_id))
+    else {
+        return Ok(false);
+    };
+    let provider = terminal_launch_provider(agent_id, Some(agent_id))?;
+    if let Some(account_binding) = account_binding {
+        account_binding.validate_frozen_account(provider, true)?;
+        return Ok(terminal_resolve_provider_resume_session_for_binding(
+            provider,
+            Some(provider_session_id),
+            working_directory,
+            account_binding,
+        )
+        .0
+        .is_some());
+    }
+    Ok(match provider {
+        AgentProvider::Codex => {
+            resolve_codex_resume_session(&provider_session_id, working_directory).is_ok()
+        }
+        AgentProvider::Claude => {
+            resolve_claude_resume_session(&provider_session_id, working_directory).is_ok()
+        }
+        AgentProvider::OpenCode => {
+            resolve_opencode_resume_session(&provider_session_id, working_directory).is_ok()
+        }
+    })
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn terminal_provider_session_exists(
+    state: State<'_, TerminalState>,
+    agent_id: String,
+    provider_session_id: String,
+    working_directory: String,
+    pane_id: Option<String>,
+    instance_id: Option<u64>,
+) -> Result<bool, String> {
+    let provider = terminal_launch_provider(&agent_id, Some(&agent_id))?;
+    let pane_id = pane_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let Some(pane_id) = pane_id.as_deref() {
+        validate_terminal_pane_id(pane_id)?;
+    }
+    let (frozen_binding, frozen_instance_id) = if let Some(pane_id) = pane_id.as_deref() {
+        let live_instance = {
+            let terminals = state.terminals.read().await;
+            terminals.get(pane_id).cloned()
+        };
+        if let Some(instance) = live_instance {
+            if instance_id.is_some_and(|expected| expected != instance.id) {
+                return Err("The provider session probe targets a stale terminal instance.".to_string());
+            }
+            let binding = instance
+                .launch_account_binding
+                .as_ref()
+                .filter(|binding| binding.matches_provider_id(agent_definition(provider).id))
+                .cloned()
+                .ok_or_else(|| {
+                    "The terminal has no frozen provider account binding for this session probe."
+                        .to_string()
+                })?;
+            (binding, instance.id)
+        } else {
+            let binding = terminal_frozen_resume_binding(
+                pane_id,
+                instance_id,
+                provider,
+                &provider_session_id,
+                false,
+            )
+            .ok_or_else(|| {
+                "The frozen provider account binding is no longer available for this session probe."
+                    .to_string()
+            })?;
+            (binding, instance_id.unwrap_or_default())
+        }
+    } else {
+        (TerminalProviderLaunchAccountBinding::default(), 0)
+    };
+    let has_frozen_binding = pane_id.is_some();
+    let binding_for_probe = has_frozen_binding.then_some(frozen_binding.clone());
+    let agent_id_for_probe = agent_id.clone();
+    let provider_session_id_for_probe = provider_session_id.clone();
+    let exists = tauri::async_runtime::spawn_blocking(move || {
+        terminal_provider_session_exists_on_device(
+            &agent_id_for_probe,
+            &provider_session_id_for_probe,
+            &working_directory,
+            binding_for_probe.as_ref(),
+        )
+    })
+    .await
+    .map_err(|error| format!("Provider session existence check failed: {error}"))??;
+    if let Some(pane_id) = pane_id.as_deref() {
+        if exists {
+            terminal_store_frozen_resume_binding(
+                pane_id,
+                frozen_instance_id,
+                provider,
+                &provider_session_id,
+                &frozen_binding,
+            );
+        } else {
+            terminal_clear_frozen_resume_binding(pane_id);
+        }
+    }
+    Ok(exists)
+}
+
 fn terminal_provider_session_id_is_recordable_for_agent(
     agent_id: &str,
     agent_kind: &str,
@@ -723,65 +845,417 @@ fn terminal_claude_resume_unavailable_message() -> String {
         .to_string()
 }
 
-fn terminal_resolve_provider_resume_session(
+#[derive(Clone)]
+enum TerminalProviderLaunchAccountBinding {
+    Claude {
+        home: Option<PathBuf>,
+        account: Option<AgentAccountsLaunchAccountBinding>,
+    },
+    OpenCode {
+        data_home: Option<PathBuf>,
+        db_path: Option<PathBuf>,
+        account: Option<AgentAccountsLaunchAccountBinding>,
+    },
+    Unmanaged {
+        account: Option<AgentAccountsLaunchAccountBinding>,
+    },
+}
+
+#[derive(Clone)]
+struct TerminalFrozenResumeBinding {
+    account_binding: TerminalProviderLaunchAccountBinding,
+    captured_at_ms: u64,
+    instance_id: u64,
+    provider_id: String,
+    provider_session_id: String,
+}
+
+static TERMINAL_FROZEN_RESUME_BINDINGS: OnceLock<
+    StdMutex<HashMap<String, TerminalFrozenResumeBinding>>,
+> = OnceLock::new();
+
+fn terminal_frozen_resume_bindings(
+) -> &'static StdMutex<HashMap<String, TerminalFrozenResumeBinding>> {
+    TERMINAL_FROZEN_RESUME_BINDINGS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn terminal_store_frozen_resume_binding(
+    pane_id: &str,
+    instance_id: u64,
+    provider: AgentProvider,
+    provider_session_id: &str,
+    account_binding: &TerminalProviderLaunchAccountBinding,
+) {
+    let provider_id = agent_definition(provider).id;
+    if let Ok(mut bindings) = terminal_frozen_resume_bindings().lock() {
+        let now_ms = terminal_now_ms();
+        bindings.retain(|_, binding| {
+            now_ms.saturating_sub(binding.captured_at_ms)
+                <= TERMINAL_FROZEN_RESUME_BINDING_TTL_MS
+        });
+        bindings.insert(
+            pane_id.to_string(),
+            TerminalFrozenResumeBinding {
+                account_binding: account_binding.clone(),
+                captured_at_ms: now_ms,
+                instance_id,
+                provider_id: provider_id.to_string(),
+                provider_session_id: provider_session_id.to_string(),
+            },
+        );
+    }
+}
+
+fn terminal_frozen_resume_binding(
+    pane_id: &str,
+    instance_id: Option<u64>,
+    provider: AgentProvider,
+    provider_session_id: &str,
+    take: bool,
+) -> Option<TerminalProviderLaunchAccountBinding> {
+    let provider_id = agent_definition(provider).id;
+    let mut bindings = terminal_frozen_resume_bindings().lock().ok()?;
+    let now_ms = terminal_now_ms();
+    bindings.retain(|_, binding| {
+        now_ms.saturating_sub(binding.captured_at_ms)
+            <= TERMINAL_FROZEN_RESUME_BINDING_TTL_MS
+    });
+    let matches = bindings.get(pane_id).is_some_and(|binding| {
+        binding.provider_id == provider_id
+            && binding.provider_session_id == provider_session_id
+            && instance_id.is_none_or(|instance_id| binding.instance_id == instance_id)
+    });
+    if !matches {
+        return None;
+    }
+    if take {
+        bindings.remove(pane_id).map(|binding| binding.account_binding)
+    } else {
+        bindings
+            .get(pane_id)
+            .map(|binding| binding.account_binding.clone())
+    }
+}
+
+fn terminal_clear_frozen_resume_binding(pane_id: &str) {
+    if let Ok(mut bindings) = terminal_frozen_resume_bindings().lock() {
+        bindings.remove(pane_id);
+    }
+}
+
+impl Default for TerminalProviderLaunchAccountBinding {
+    fn default() -> Self {
+        Self::Unmanaged { account: None }
+    }
+}
+
+fn terminal_opencode_launch_data_home(
+    selected_data_home: Option<PathBuf>,
+    native_data_home: Option<&Path>,
+) -> Option<PathBuf> {
+    selected_data_home
+        .or_else(|| {
+            native_data_home
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+        })
+}
+
+impl TerminalProviderLaunchAccountBinding {
+    fn capture(provider: AgentProvider) -> Self {
+        match provider {
+            AgentProvider::Claude => {
+                let account = agent_accounts_capture_launch_account_binding("claude");
+                let home = account
+                    .as_ref()
+                    .and_then(|binding| binding.profile_home.clone())
+                    .or_else(|| {
+                        account
+                            .as_ref()
+                            .is_some_and(|binding| {
+                                binding.profile_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID
+                            })
+                            .then(claude_home_dir)
+                            .flatten()
+                    });
+                Self::Claude { home, account }
+            }
+            AgentProvider::OpenCode => {
+                let account = agent_accounts_capture_launch_account_binding("opencode");
+                if account.is_none() {
+                    // Keep the provider boundary fail-closed if account
+                    // binding is ever unavailable: no DB may be resolved from
+                    // an identity that the spawn cannot also carry.
+                    return Self::OpenCode {
+                        data_home: None,
+                        db_path: None,
+                        account: None,
+                    };
+                }
+                let selected_data_home = account
+                    .as_ref()
+                    .and_then(|binding| binding.selected_profile_dir.clone());
+                if let Some(profile_dir) = selected_data_home.as_deref() {
+                    let _ = agent_accounts_migrate_opencode_profile_layout(profile_dir);
+                }
+                let native_data_homes = opencode_native_data_home();
+                let native_data_home =
+                    opencode_native_data_home_for_launch(&native_data_homes);
+                let db_path = opencode_db_path_for_launch_roots(
+                    selected_data_home.clone(),
+                    native_data_homes,
+                );
+                let data_home = terminal_opencode_launch_data_home(
+                    selected_data_home,
+                    native_data_home.as_deref(),
+                );
+                Self::OpenCode {
+                    data_home,
+                    db_path,
+                    account,
+                }
+            }
+            AgentProvider::Codex => Self::Unmanaged {
+                account: agent_accounts_capture_launch_account_binding("codex"),
+            },
+        }
+    }
+
+    fn captured_account(&self) -> Option<&AgentAccountsLaunchAccountBinding> {
+        match self {
+            Self::Claude { account, .. }
+            | Self::OpenCode { account, .. }
+            | Self::Unmanaged { account } => account.as_ref(),
+        }
+    }
+
+    fn provider_kind(&self) -> Option<&'static str> {
+        self.captured_account().map(|account| account.kind)
+    }
+
+    fn matches_provider_id(&self, provider_id: &str) -> bool {
+        agent_accounts_supported_kind(provider_id)
+            .zip(self.provider_kind())
+            .is_some_and(|(provider, captured)| provider == captured)
+    }
+
+    fn codex_auth_home(&self) -> Option<&Path> {
+        match self {
+            Self::Unmanaged { account } => account
+                .as_ref()
+                .and_then(|account| account.profile_home.as_deref()),
+            _ => None,
+        }
+    }
+
+    fn validate_frozen_account(
+        &self,
+        provider: AgentProvider,
+        resume_requires_auth_store: bool,
+    ) -> Result<(), String> {
+        if !resume_requires_auth_store {
+            return Ok(());
+        }
+        let definition = agent_definition(provider);
+        let account = self
+            .captured_account()
+            .filter(|account| account.kind == definition.id)
+            .ok_or_else(|| {
+                format!(
+                    "Unable to freeze the active {} account for launch.",
+                    definition.label
+                )
+            })?;
+        if account.auth_revision.trim().is_empty() {
+            return Err(format!(
+                "The frozen {} account has no stable authentication revision.",
+                definition.label
+            ));
+        }
+        let auth_path = match provider {
+            AgentProvider::Claude => account
+                .profile_home
+                .as_deref()
+                .map(|home| home.join(".credentials.json")),
+            AgentProvider::Codex => account
+                .profile_home
+                .as_deref()
+                .map(|home| home.join("auth.json")),
+            AgentProvider::OpenCode => account
+                .selected_profile_dir
+                .as_deref()
+                .map(|home| home.join("opencode").join("auth.json")),
+        }
+        .ok_or_else(|| {
+            format!(
+                "The frozen {} account has no isolated authentication home.",
+                definition.label
+            )
+        })?;
+        if !auth_path.is_file() {
+            return Err(format!(
+                "The frozen {} authentication store is unavailable.",
+                definition.label
+            ));
+        }
+        Ok(())
+    }
+
+    fn apply_to_env(&self, env_vars: &mut Vec<(String, String)>) {
+        match self {
+            Self::Claude { home, .. } => {
+                env_vars.retain(|(key, _)| key != "CLAUDE_CONFIG_DIR");
+                if let Some(home) = home {
+                    env_vars.push((
+                        "CLAUDE_CONFIG_DIR".to_string(),
+                        home.to_string_lossy().to_string(),
+                    ));
+                }
+            }
+            Self::OpenCode { data_home, .. } => {
+                env_vars.retain(|(key, _)| key != "OPENCODE_DATA_DIR" && key != "XDG_DATA_HOME");
+                // Deferred launches run inside an already-open warm shell.
+                // Empty overrides are required when the captured launch is
+                // the native/default profile; merely removing vector entries
+                // would leave a previously selected profile exported in that
+                // shell. OpenCode treats empty XDG overrides as unset/default.
+                if let Some(data_home) = data_home {
+                    env_vars.push((
+                        "XDG_DATA_HOME".to_string(),
+                        data_home.to_string_lossy().to_string(),
+                    ));
+                } else {
+                    env_vars.push(("XDG_DATA_HOME".to_string(), String::new()));
+                }
+            }
+            // A coordination-managed home remains the process home, but an
+            // unmanaged resume source is only a rollout source. The process
+            // itself must use the captured account home even when the session
+            // was discovered elsewhere.
+            Self::Unmanaged { account } => {
+                let managed_home = env_vars.iter().rev().find_map(|(key, value)| {
+                    (key == "DIFFFORGE_CODEX_HOME")
+                        .then_some(value.trim())
+                        .filter(|value| !value.is_empty())
+                });
+                let launch_home = managed_home.map(PathBuf::from).or_else(|| {
+                    account
+                        .as_ref()
+                        .and_then(|binding| binding.profile_home.clone())
+                });
+                if let Some(home) = launch_home {
+                    env_vars.retain(|(key, _)| key != "CODEX_HOME");
+                    env_vars.push((
+                        "CODEX_HOME".to_string(),
+                        home.to_string_lossy().to_string(),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn terminal_launch_account_binding_for_instance(
+    instance: &TerminalInstance,
+    provider: AgentProvider,
+) -> TerminalProviderLaunchAccountBinding {
+    let provider_id = agent_definition(provider).id;
+    instance
+        .launch_account_binding
+        .as_ref()
+        .filter(|binding| binding.matches_provider_id(provider_id))
+        .cloned()
+        .unwrap_or_else(|| TerminalProviderLaunchAccountBinding::capture(provider))
+}
+
+fn terminal_resolve_provider_resume_session_for_binding(
     provider: AgentProvider,
     requested_resume_session_id: Option<String>,
     working_directory: &str,
+    account_binding: &TerminalProviderLaunchAccountBinding,
 ) -> (Option<String>, Option<String>) {
     let Some(requested_session_id) = requested_resume_session_id else {
         return (None, None);
     };
 
-    match provider {
-        AgentProvider::Codex => {
-            match resolve_codex_resume_session(&requested_session_id, working_directory) {
-                Ok((session_id, home)) => {
-                    let _ = prepare_codex_rollout_for_resume(&session_id, working_directory);
-                    (Some(session_id), Some(home.to_string_lossy().to_string()))
-                }
-                Err(error) => {
-                    log_terminal_status_event(
-                        "backend.terminal_provider_session.resume_drop",
-                        json!({
-                            "error": clean_terminal_diagnostic_log_text(&error),
-                            "provider": "codex",
-                        }),
-                    );
-                    (None, None)
-                }
-            }
-        }
-        AgentProvider::Claude => {
-            match resolve_claude_resume_session(&requested_session_id, working_directory) {
-                Ok(session_id) => (Some(session_id), None),
-                Err(error) => {
-                    log_terminal_status_event(
-                        "backend.terminal_provider_session.resume_drop",
-                        json!({
-                            "error": clean_terminal_diagnostic_log_text(&error),
-                            "provider": "claude",
-                        }),
-                    );
-                    (None, None)
-                }
-            }
-        }
-        AgentProvider::OpenCode => {
-            match resolve_opencode_resume_session(&requested_session_id, working_directory) {
-                Ok(session_id) => (Some(session_id), None),
-                Err(error) => {
-                    log_terminal_status_event(
-                        "backend.terminal_provider_session.resume_drop",
-                        json!({
-                            "error": clean_terminal_diagnostic_log_text(&error),
-                            "provider": "opencode",
-                        }),
-                    );
-                    (None, None)
-                }
-            }
+    let resolved = match (provider, account_binding) {
+        (AgentProvider::Claude, TerminalProviderLaunchAccountBinding::Claude { home, .. }) => home
+            .as_deref()
+            .ok_or_else(|| "Unable to locate the active Claude Code home.".to_string())
+            .and_then(|home| {
+                resolve_claude_resume_session_in_home(
+                    &requested_session_id,
+                    working_directory,
+                    home,
+                )
+            })
+            .map(|session_id| (session_id, None)),
+        (
+            AgentProvider::OpenCode,
+            TerminalProviderLaunchAccountBinding::OpenCode { db_path, .. },
+        ) => db_path
+            .as_deref()
+            .ok_or_else(|| "Unable to locate OpenCode database.".to_string())
+            .and_then(|db_path| {
+                resolve_opencode_resume_session_in_db(
+                    db_path,
+                    &requested_session_id,
+                    working_directory,
+                )
+            })
+            .map(|session_id| (session_id, None)),
+        (AgentProvider::Codex, _) => account_binding
+            .codex_auth_home()
+            .ok_or_else(|| "Unable to locate the frozen Codex account home.".to_string())
+            .and_then(|home| {
+                resolve_codex_resume_session_for_auth_home(
+                    &requested_session_id,
+                    working_directory,
+                    home,
+                )
+            })
+            .map(|(session_id, home)| {
+                (session_id, Some(home.to_string_lossy().to_string()))
+            }),
+        _ => Err("Provider launch binding does not match the requested provider.".to_string()),
+    };
+
+    match resolved {
+        Ok((session_id, home)) => (Some(session_id), home),
+        Err(error) => {
+            log_terminal_status_event(
+                "backend.terminal_provider_session.resume_drop",
+                json!({
+                    "error": clean_terminal_diagnostic_log_text(&error),
+                    "provider": agent_definition(provider).id,
+                }),
+            );
+            (None, None)
         }
     }
+}
+
+fn terminal_session_last_model_for_binding(
+    provider: AgentProvider,
+    session_id: &str,
+    codex_source_home: Option<&str>,
+    account_binding: &TerminalProviderLaunchAccountBinding,
+) -> Option<String> {
+    let transcript = match (provider, account_binding) {
+        (AgentProvider::Claude, TerminalProviderLaunchAccountBinding::Claude { home, .. }) => {
+            claude_session_transcript_path_in_home(home.as_deref()?, session_id)?
+        }
+        (AgentProvider::Codex, _) => codex_session_transcript_path_in_home(
+            Path::new(codex_source_home?.trim()),
+            session_id,
+        )?,
+        (
+            AgentProvider::OpenCode,
+            TerminalProviderLaunchAccountBinding::OpenCode { db_path, .. },
+        ) => return opencode_session_last_model_in_db(session_id, db_path.as_deref()?),
+        _ => return None,
+    };
+    jsonl_tail_last_model(provider, &transcript)
 }
 
 #[derive(Clone, Default)]
@@ -2915,8 +3389,29 @@ fn spawn_terminal_codex_session_discovery(
             }
 
             let cwd = instance.working_directory.to_string_lossy().to_string();
+            let Some(auth_home) = instance
+                .launch_account_binding
+                .as_ref()
+                .and_then(TerminalProviderLaunchAccountBinding::codex_auth_home)
+                .map(Path::to_path_buf)
+            else {
+                log_terminal_status_event(
+                    "backend.terminal_provider_session.codex_discovery_error",
+                    json!({
+                        "error": "missing frozen Codex auth home",
+                        "instance_id": instance_id,
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                        "source": source.clone(),
+                    }),
+                );
+                break;
+            };
             let discovered = match tauri::async_runtime::spawn_blocking(move || {
-                discover_latest_codex_session_for_cwd(&cwd, launched_at_ms)
+                discover_latest_codex_session_for_cwd_in_auth_home(
+                    &cwd,
+                    launched_at_ms,
+                    &auth_home,
+                )
             })
             .await
             {
@@ -3041,19 +3536,37 @@ fn spawn_terminal_non_codex_session_discovery_for_prompt(
             let cwd = instance.working_directory.to_string_lossy().to_string();
             let prompt_for_discovery = prompt.clone();
             let agent_for_discovery = agent_id.clone();
+            let launch_account_binding = instance.launch_account_binding.clone();
             let discovered = tauri::async_runtime::spawn_blocking(move || {
-                if agent_for_discovery == "claude" {
-                    discover_claude_session_by_prompt(
+                match (agent_for_discovery.as_str(), launch_account_binding.as_ref()) {
+                    (
+                        "claude",
+                        Some(TerminalProviderLaunchAccountBinding::Claude {
+                            home: Some(home),
+                            ..
+                        }),
+                    ) => discover_claude_session_by_prompt_in_home(
                         &prompt_for_discovery,
                         &cwd,
                         CODEX_TRANSCRIPT_DEFAULT_LIMIT,
-                    )
-                } else {
-                    discover_opencode_session_by_prompt(
+                        home,
+                    ),
+                    (
+                        "opencode",
+                        Some(TerminalProviderLaunchAccountBinding::OpenCode {
+                            db_path: Some(db_path),
+                            ..
+                        }),
+                    ) => discover_opencode_session_by_prompt_in_db(
                         &prompt_for_discovery,
                         &cwd,
                         CODEX_TRANSCRIPT_DEFAULT_LIMIT,
-                    )
+                        db_path,
+                    ),
+                    _ => Err(
+                        "The terminal has no frozen provider session store for discovery."
+                            .to_string(),
+                    ),
                 }
             })
             .await
@@ -3124,6 +3637,17 @@ fn spawn_terminal_non_codex_session_discovery_for_prompt(
     });
 }
 
+type TerminalLaunchResult = (
+    Vec<String>,
+    Vec<String>,
+    String,
+    Option<String>,
+    TerminalProviderResolvedLaunchOptions,
+    Option<String>,
+    Option<String>,
+    TerminalProviderLaunchAccountBinding,
+);
+
 fn terminal_launch(
     kind: &str,
     provider: Option<String>,
@@ -3131,19 +3655,27 @@ fn terminal_launch(
     provider_session_id: Option<String>,
     fork_from_provider_session_id: Option<String>,
     working_directory: &str,
-) -> Result<
-    (
-        Vec<String>,
-        Vec<String>,
-        String,
-        Option<String>,
-        TerminalProviderResolvedLaunchOptions,
-        Option<String>,
-        Option<String>,
-    ),
-    String,
-> {
+) -> Result<TerminalLaunchResult, String> {
     let provider = terminal_launch_provider(kind, provider.as_deref())?;
+    let account_binding = TerminalProviderLaunchAccountBinding::capture(provider);
+    terminal_launch_with_account_binding(
+        provider,
+        launch_options,
+        provider_session_id,
+        fork_from_provider_session_id,
+        working_directory,
+        account_binding,
+    )
+}
+
+fn terminal_launch_with_account_binding(
+    provider: AgentProvider,
+    launch_options: TerminalProviderLaunchOptions,
+    provider_session_id: Option<String>,
+    fork_from_provider_session_id: Option<String>,
+    working_directory: &str,
+    account_binding: TerminalProviderLaunchAccountBinding,
+) -> Result<TerminalLaunchResult, String> {
     let definition = agent_definition(provider);
     let requested_resume_session_id = provider_session_id
         .as_deref()
@@ -3154,20 +3686,22 @@ fn terminal_launch(
         .and_then(|session_id| terminal_clean_provider_session_id(Some(session_id)));
     let is_fork_launch = requested_fork_session_id.is_some();
     let (source_session_id, codex_resume_home) = if is_fork_launch {
-        let (session_id, codex_resume_home) = terminal_resolve_provider_resume_session(
+        let (session_id, codex_resume_home) = terminal_resolve_provider_resume_session_for_binding(
             provider,
             requested_fork_session_id,
             working_directory,
+            &account_binding,
         );
         let Some(session_id) = session_id else {
             return Err(terminal_provider_session_fork_error(provider));
         };
         (Some(session_id), codex_resume_home)
     } else {
-        terminal_resolve_provider_resume_session(
+        terminal_resolve_provider_resume_session_for_binding(
             provider,
             requested_resume_session_id,
             working_directory,
+            &account_binding,
         )
     };
     if !is_fork_launch
@@ -3189,7 +3723,14 @@ fn terminal_launch(
     // default so a reopened terminal continues on the same model.
     let session_model = source_session_id
         .as_deref()
-        .and_then(|session_id| agent_session_last_model(provider, session_id))
+        .and_then(|session_id| {
+            terminal_session_last_model_for_binding(
+                provider,
+                session_id,
+                codex_resume_home.as_deref(),
+                &account_binding,
+            )
+        })
         .and_then(|model| normalize_forge_model(Some(model)).ok().flatten());
     let request_model = normalize_forge_model(launch_options.model)?;
     let mut resolved_launch = match session_model {
@@ -3234,7 +3775,94 @@ fn terminal_launch(
         } else {
             source_session_id
         },
+        account_binding,
     ))
+}
+
+fn terminal_launch_with_resume_fallback(
+    kind: &str,
+    provider: Option<String>,
+    launch_options: TerminalProviderLaunchOptions,
+    provider_session_id: Option<String>,
+    fork_from_provider_session_id: Option<String>,
+    working_directory: &str,
+) -> Result<(TerminalLaunchResult, bool), String> {
+    let launch_provider = terminal_launch_provider(kind, provider.as_deref())?;
+    let account_binding = TerminalProviderLaunchAccountBinding::capture(launch_provider);
+    terminal_launch_with_resume_fallback_for_binding(
+        launch_provider,
+        kind,
+        launch_options,
+        provider_session_id,
+        fork_from_provider_session_id,
+        working_directory,
+        account_binding,
+    )
+}
+
+fn terminal_launch_with_resume_fallback_for_binding(
+    launch_provider: AgentProvider,
+    kind: &str,
+    launch_options: TerminalProviderLaunchOptions,
+    provider_session_id: Option<String>,
+    fork_from_provider_session_id: Option<String>,
+    working_directory: &str,
+    account_binding: TerminalProviderLaunchAccountBinding,
+) -> Result<(TerminalLaunchResult, bool), String> {
+    let resume_was_requested = terminal_clean_provider_session_id(provider_session_id.as_deref())
+        .is_some()
+        && terminal_clean_provider_session_id(fork_from_provider_session_id.as_deref()).is_none();
+    let first_attempt = terminal_launch_with_account_binding(
+        launch_provider,
+        launch_options.clone(),
+        provider_session_id,
+        fork_from_provider_session_id.clone(),
+        working_directory,
+        account_binding.clone(),
+    );
+
+    match first_attempt {
+        Ok(launch) if resume_was_requested && launch.6.is_none() => {
+            log_terminal_status_event(
+                "backend.terminal_provider_session.resume_fallback_fresh",
+                json!({
+                    "provider": clean_terminal_diagnostic_log_text(kind),
+                    "reason": "resume_resolution_missing",
+                }),
+            );
+            terminal_launch_with_account_binding(
+                launch_provider,
+                launch_options,
+                None,
+                fork_from_provider_session_id,
+                working_directory,
+                account_binding,
+            )
+            .map(|fresh_launch| (fresh_launch, true))
+        }
+        Ok(launch) => Ok((launch, false)),
+        Err(error)
+            if resume_was_requested && error == terminal_claude_resume_unavailable_message() =>
+        {
+            log_terminal_status_event(
+                "backend.terminal_provider_session.resume_fallback_fresh",
+                json!({
+                    "provider": clean_terminal_diagnostic_log_text(kind),
+                    "reason": "resume_resolution_error",
+                }),
+            );
+            terminal_launch_with_account_binding(
+                launch_provider,
+                launch_options,
+                None,
+                fork_from_provider_session_id,
+                working_directory,
+                account_binding,
+            )
+            .map(|fresh_launch| (fresh_launch, true))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn remove_terminal_instance_if_current(
@@ -4377,6 +5005,7 @@ fn cleanup_terminal_instance_with_context(
         runtime: _,
         launch_metadata: _,
         codex_gateway,
+        launch_account_binding: _,
         app_control_mcp_requested: _,
     } = instance;
     terminal_codex_hook_trust_discovery_clear(&metadata.pane_id, id);
@@ -4889,6 +5518,8 @@ struct TerminalLiveSessionSummary {
     restart_intent_state: String,
     restart_mode: Option<String>,
     restart_target_role: Option<String>,
+    restart_fresh_session: Option<bool>,
+    restart_provider_session_id: Option<String>,
     restart_coordinator_id: Option<String>,
     restart_requested_at_ms: Option<u64>,
     restart_deadline_at_ms: Option<u64>,
@@ -6392,6 +7023,8 @@ async fn prepare_terminal_coordination_launch(
     workspace_id: Option<String>,
     workspace_name: Option<String>,
     enforcement_mode: &'static str,
+    launch_account_binding: TerminalProviderLaunchAccountBinding,
+    resume_requires_auth_store: bool,
 ) -> Result<
     (
         crate::coordination::models::TerminalCoordinationContext,
@@ -6434,19 +7067,27 @@ async fn prepare_terminal_coordination_launch(
             });
         let agent_kind = launch_provider_id.as_str();
         let agent_name = label.clone();
-        match coordination_kernel.prepare_terminal_context_for_slot(
-            &agent_name,
-            agent_kind,
-            &terminal_slot_key,
-            Some(&launch_pty_id),
-            workspace_id.as_deref(),
-            workspace_name.as_deref(),
-            None,
-            None,
-            None,
-            Some(&terminal_launch_epoch),
-            Some(enforcement_mode),
-        ) {
+        let frozen_codex_auth_home = launch_account_binding.codex_auth_home();
+        let context_result = crate::coordination::kernel::with_codex_launch_auth_home_requirement(
+            frozen_codex_auth_home,
+            resume_requires_auth_store,
+            || {
+                coordination_kernel.prepare_terminal_context_for_slot(
+                    &agent_name,
+                    agent_kind,
+                    &terminal_slot_key,
+                    Some(&launch_pty_id),
+                    workspace_id.as_deref(),
+                    workspace_name.as_deref(),
+                    None,
+                    None,
+                    None,
+                    Some(&terminal_launch_epoch),
+                    Some(enforcement_mode),
+                )
+            },
+        );
+        match context_result {
             Ok(context) => {
                 if let Err(error) = validate_terminal_isolated_worktree_context(&context, &label) {
                     let coordination = terminal_coordination_session_from_context(&context);
@@ -7385,6 +8026,22 @@ fn terminal_restart_role(value: Option<&str>, instance: &TerminalInstance) -> Op
     }
 }
 
+fn terminal_restart_session_binding(
+    current_role: &str,
+    target_role: &str,
+    fresh_session: Option<bool>,
+    provider_session_id: Option<&str>,
+) -> (bool, Option<String>) {
+    let provider_session_id = terminal_clean_provider_session_id(provider_session_id);
+    let fresh_session = fresh_session.unwrap_or(true)
+        || target_role != current_role
+        || provider_session_id.is_none();
+    (
+        fresh_session,
+        (!fresh_session).then_some(provider_session_id).flatten(),
+    )
+}
+
 fn terminal_instance_is_generic_shell(instance: &TerminalInstance) -> bool {
     terminal_restart_role(None, instance).as_deref() == Some("generic")
 }
@@ -7543,6 +8200,8 @@ fn terminal_restart_intent_force_action(intent: &TerminalPendingRestartIntent) -
             "launch_epoch": intent.launch_epoch,
             "role": intent.target_role,
             "mode": "restart_now",
+            "fresh_session": intent.fresh_session,
+            "provider_session_id": intent.provider_session_id,
         },
     })
 }
@@ -7563,6 +8222,8 @@ fn terminal_emit_restart_intent_event(
             "instance_id": intent.instance_id,
             "launch_epoch": intent.launch_epoch,
             "target_role": intent.target_role,
+            "fresh_session": intent.fresh_session,
+            "provider_session_id": intent.provider_session_id,
             "mode": intent.mode,
             "coordinator_id": intent.coordinator_id,
             "requested_at_ms": intent.requested_at_ms,
@@ -8994,10 +9655,15 @@ async fn terminal_open(
     };
     let plain_shell =
         terminal_request_is_plain_shell(&kind, provider.as_deref(), request.plain_shell);
+    let frozen_launch_provider = if plain_shell {
+        None
+    } else {
+        Some(terminal_launch_provider(&kind, provider.as_deref())?)
+    };
     if plain_shell && requested_fork_provider_session_id.is_some() {
         return Err("Shell terminals do not have provider sessions to fork.".to_string());
     }
-    let fresh_session = request.fresh_session.unwrap_or(false) && !plain_shell;
+    let mut fresh_session = request.fresh_session.unwrap_or(false) && !plain_shell;
     let working_directory_request = request.working_directory;
     let workspace_root_was_empty_at_selection = request
         .workspace_root_was_empty_at_selection
@@ -9055,6 +9721,110 @@ async fn terminal_open(
         }),
     );
 
+    let working_directory = if app_control_mcp_requested {
+        resolve_app_control_terminal_working_directory(working_directory_request.as_deref())
+    } else {
+        resolve_workspace_root_directory(working_directory_request.as_deref())
+    }?;
+    let working_directory_text = working_directory.to_string_lossy().to_string();
+    let mut terminal_project_root = working_directory.clone();
+    let mut process_working_directory = workspace_path_for_process(&working_directory);
+    let mut launch_worktree: Option<Value> = None;
+    let mut coordination_context: Option<crate::coordination::models::TerminalCoordinationContext> =
+        None;
+
+    let frozen_resume_account_binding = if !fresh_session {
+        frozen_launch_provider.and_then(|provider| {
+            requested_fork_provider_session_id
+                .as_deref()
+                .or(requested_provider_session_id.as_deref())
+                .and_then(|session_id| {
+                    terminal_frozen_resume_binding(
+                        &pane_id,
+                        None,
+                        provider,
+                        session_id,
+                        true,
+                    )
+                })
+        })
+    } else {
+        terminal_clear_frozen_resume_binding(&pane_id);
+        None
+    };
+    if requested_provider_session_id.is_none() && requested_fork_provider_session_id.is_none() {
+        terminal_clear_frozen_resume_binding(&pane_id);
+    }
+
+    let (launch, resume_fell_back_fresh) = if is_prewarm_pty || plain_shell {
+        (
+            (
+                Vec::new(),
+                Vec::new(),
+                "Prepared PTY".to_string(),
+                None,
+                TerminalProviderResolvedLaunchOptions::default(),
+                None,
+                if requested_fork_provider_session_id.is_some() {
+                    None
+                } else {
+                    requested_provider_session_id.clone()
+                },
+                match provider.as_deref() {
+                    Some(provider) => frozen_resume_account_binding.clone().unwrap_or_else(|| {
+                        TerminalProviderLaunchAccountBinding::capture(
+                            parse_agent_provider(provider)
+                                .expect("terminal provider was validated before launch"),
+                        )
+                    }),
+                    None => TerminalProviderLaunchAccountBinding::default(),
+                },
+            ),
+            false,
+        )
+    } else if let Some(account_binding) = frozen_resume_account_binding {
+        terminal_launch_with_resume_fallback_for_binding(
+            frozen_launch_provider.expect("agent launch provider"),
+            &kind,
+            launch_options,
+            requested_provider_session_id.clone(),
+            requested_fork_provider_session_id.clone(),
+            &working_directory_text,
+            account_binding,
+        )?
+    } else {
+        terminal_launch_with_resume_fallback(
+            &kind,
+            provider.clone(),
+            launch_options,
+            requested_provider_session_id.clone(),
+            requested_fork_provider_session_id.clone(),
+            &working_directory_text,
+        )?
+    };
+    fresh_session = fresh_session || resume_fell_back_fresh;
+    let (
+        command_candidates,
+        args,
+        label,
+        codex_resume_home,
+        resolved_launch,
+        codex_resume_session_id,
+        effective_provider_session_id,
+        launch_account_binding,
+    ) = launch;
+    if let Some(provider) = frozen_launch_provider {
+        launch_account_binding.validate_frozen_account(
+            provider,
+            requested_provider_session_id.is_some()
+                || requested_fork_provider_session_id.is_some(),
+        )?;
+    }
+
+    // Resolve (and, when necessary, downgrade) the provider resume before the
+    // existing pane is closed. A late transcript/account change can therefore
+    // only change this launch to fresh; it can never strand the pane after a
+    // resume-resolution error.
     let preserve_coordination_session = request.preserve_coordination_session.unwrap_or(false)
         && !fresh_session
         && session_mode.should_prepare_coordination();
@@ -9100,51 +9870,6 @@ async fn terminal_open(
         }
     }
     ensure_app_not_shutting_down("terminal open")?;
-
-    let working_directory = if app_control_mcp_requested {
-        resolve_app_control_terminal_working_directory(working_directory_request.as_deref())
-    } else {
-        resolve_workspace_root_directory(working_directory_request.as_deref())
-    }?;
-    let working_directory_text = working_directory.to_string_lossy().to_string();
-    let mut terminal_project_root = working_directory.clone();
-    let mut process_working_directory = workspace_path_for_process(&working_directory);
-    let mut launch_worktree: Option<Value> = None;
-    let mut coordination_context: Option<crate::coordination::models::TerminalCoordinationContext> =
-        None;
-
-    let (
-        command_candidates,
-        args,
-        label,
-        codex_resume_home,
-        resolved_launch,
-        codex_resume_session_id,
-        effective_provider_session_id,
-    ) = if is_prewarm_pty || plain_shell {
-        (
-            Vec::new(),
-            Vec::new(),
-            "Prepared PTY".to_string(),
-            None,
-            TerminalProviderResolvedLaunchOptions::default(),
-            None,
-            if requested_fork_provider_session_id.is_some() {
-                None
-            } else {
-                requested_provider_session_id.clone()
-            },
-        )
-    } else {
-        terminal_launch(
-            &kind,
-            provider,
-            launch_options,
-            requested_provider_session_id.clone(),
-            requested_fork_provider_session_id.clone(),
-            &working_directory_text,
-        )?
-    };
     let instance_id = request.instance_id.filter(|id| *id > 0).unwrap_or_else(|| {
         state
             .next_terminal_instance_id
@@ -9198,7 +9923,7 @@ async fn terminal_open(
         };
         let (context, worktree, prepared_working_directory) = prepare_terminal_coordination_launch(
             coordination_pty_id,
-            terminal_launch_epoch,
+            terminal_launch_epoch.clone(),
             coordination_working_directory,
             working_directory.clone(),
             kind.clone(),
@@ -9208,6 +9933,9 @@ async fn terminal_open(
             workspace_id.clone(),
             workspace_name.clone(),
             coordination_target.enforcement_mode,
+            launch_account_binding.clone(),
+            effective_provider_session_id.is_some()
+                || requested_fork_provider_session_id.is_some(),
         )
         .await?;
         process_working_directory = prepared_working_directory;
@@ -9243,6 +9971,7 @@ async fn terminal_open(
                 &mut coordination_env_vars,
                 home,
                 codex_resume_session_id.as_deref().unwrap_or_default(),
+                Some(&launch_account_binding),
             )?;
         }
         let activity_provider_id = provider_for_coordination
@@ -9264,12 +9993,24 @@ async fn terminal_open(
             terminal_index,
             activity_provider_id,
             activity_transport.as_ref(),
-        );
+            Some(&launch_account_binding),
+        )?;
         if terminal_coordination.is_some() {
             coordination_env_vars
                 .extend(cloud_mcp_runtime_env_vars(cloud_mcp_state.inner()).await?);
         }
-        match create_warm_shell_pty_in_directory_with_env(
+        let launch_workspace_trust = if launch_account_binding
+            .matches_provider_id(activity_provider_id)
+        {
+            prepare_terminal_launch_account(
+                &coordination_env_vars,
+                activity_provider_id,
+                &launch_account_binding,
+            )?
+        } else {
+            None
+        };
+        let warm_pty = match create_warm_shell_pty_in_directory_with_env(
             size,
             &process_working_directory,
             &coordination_env_vars,
@@ -9278,7 +10019,20 @@ async fn terminal_open(
             Err(error) => {
                 return Err(error);
             }
+        };
+        if is_prewarm_pty && launch_account_binding.matches_provider_id(activity_provider_id) {
+            stamp_terminal_launch_account(
+                &pane_id,
+                instance_id,
+                &terminal_launch_epoch,
+                activity_provider_id,
+                workspace_id.as_deref(),
+                terminal_index,
+                &launch_account_binding,
+                launch_workspace_trust.as_ref(),
+            );
         }
+        warm_pty
     } else {
         ensure_app_not_shutting_down("terminal open")?;
         let Some(command_path) = choose_terminal_command_path(&command_candidates) else {
@@ -9347,6 +10101,7 @@ async fn terminal_open(
                 &mut coordination_env_vars,
                 home,
                 codex_resume_session_id.as_deref().unwrap_or_default(),
+                Some(&launch_account_binding),
             )?;
         }
         extend_terminal_activity_env_vars(
@@ -9358,7 +10113,8 @@ async fn terminal_open(
             terminal_index,
             launch_provider_id,
             activity_transport.as_ref(),
-        );
+            Some(&launch_account_binding),
+        )?;
         coordination_env_vars.extend(cloud_mcp_runtime_env_vars(cloud_mcp_state.inner()).await?);
         let mut launch_env_vars = match terminal_env_vars_with_opencode_tui_config(
             launch_provider_id,
@@ -9408,6 +10164,12 @@ async fn terminal_open(
                 return Err(error);
             }
         };
+
+        let launch_workspace_trust = prepare_terminal_launch_account(
+            &launch_env_vars,
+            launch_provider_id,
+            &launch_account_binding,
+        )?;
 
         if launch_provider_id.to_ascii_lowercase().contains("codex") {
             launch_env_vars.retain(|(key, _)| key != "DIFFFORGE_CODEX_APP_SERVER_UIR");
@@ -9474,6 +10236,17 @@ async fn terminal_open(
             }
         };
 
+        stamp_terminal_launch_account(
+            &pane_id,
+            instance_id,
+            &terminal_launch_epoch,
+            launch_provider_id,
+            workspace_id.as_deref(),
+            terminal_index,
+            &launch_account_binding,
+            launch_workspace_trust.as_ref(),
+        );
+
         command = command_path;
         agent_started = true;
         warm_pty
@@ -9521,6 +10294,9 @@ async fn terminal_open(
         effective_session_mode,
         terminal_metadata,
         launch_metadata,
+        launch_account_binding
+            .captured_account()
+            .map(|_| launch_account_binding.clone()),
         app_control_mcp_requested,
     );
     if let Some(gateway) = codex_gateway_for_instance.take() {
@@ -10126,6 +10902,13 @@ async fn resolve_app_control_mcp_launch(
     )))
 }
 
+async fn terminal_claim_legacy_agent_start(
+    instance: &TerminalInstance,
+) -> Option<tokio::sync::MutexGuard<'_, bool>> {
+    let agent_started = instance.agent_started.lock().await;
+    (!*agent_started).then_some(agent_started)
+}
+
 #[tauri::command(rename_all = "snake_case")]
 async fn terminal_start_agent(
     app: AppHandle,
@@ -10160,6 +10943,18 @@ async fn terminal_start_agent(
     };
     terminal_append_provider_launch_args(provider, &mut args, &launch);
 
+    let Some(instance) = get_terminal_instance_if_current(&state, &pane_id, instance_id).await?
+    else {
+        return Err("Terminal session is not running.".to_string());
+    };
+    // Linearize duplicate legacy starts before any account env/stamp, gateway,
+    // trust, or cloud work. A no-op start must leave the running process and
+    // its original pane identity untouched.
+    let Some(mut agent_started) = terminal_claim_legacy_agent_start(&instance).await else {
+        return Ok(());
+    };
+    let launch_account_binding = terminal_launch_account_binding_for_instance(&instance, provider);
+    launch_account_binding.validate_frozen_account(provider, false)?;
     let command_candidates = agent_command_candidates(definition);
     let command_path = choose_terminal_command_path(&command_candidates).ok_or_else(|| {
         format!(
@@ -10167,11 +10962,6 @@ async fn terminal_start_agent(
             definition.label
         )
     })?;
-
-    let Some(instance) = get_terminal_instance_if_current(&state, &pane_id, instance_id).await?
-    else {
-        return Err("Terminal session is not running.".to_string());
-    };
     if instance.coordination.is_none() && instance.session_mode.should_prepare_coordination() {
         return Err(
             "Deferred agent start is blocked because this terminal has no coordination session."
@@ -10256,7 +11046,8 @@ async fn terminal_start_agent(
         instance.metadata.terminal_index,
         definition.id,
         activity_transport.as_ref(),
-    );
+        Some(&launch_account_binding),
+    )?;
     coordination_env_vars.extend(cloud_mcp_runtime_env_vars(cloud_mcp_state.inner()).await?);
     let mut launch_env_vars =
         terminal_env_vars_with_opencode_tui_config(definition.id, &coordination_env_vars)?;
@@ -10273,6 +11064,11 @@ async fn terminal_start_agent(
         &launch_env_vars,
         instance.coordination.as_ref(),
         launch.permission_mode.as_deref(),
+    )?;
+    let launch_workspace_trust = prepare_terminal_launch_account(
+        &launch_env_vars,
+        definition.id,
+        &launch_account_binding,
     )?;
     let mut codex_gateway = None;
     if definition.id == "codex" {
@@ -10331,15 +11127,6 @@ async fn terminal_start_agent(
         return Err("Terminal launch input is too large.".to_string());
     }
 
-    let mut agent_started = instance.agent_started.lock().await;
-
-    if *agent_started {
-        if let Some(gateway) = codex_gateway.take() {
-            gateway.shutdown();
-        }
-        return Ok(());
-    }
-
     let mut writer = instance.writer.lock().await;
     if definition.id == "codex" {
         terminal_codex_hook_trust_discovery_set(
@@ -10359,8 +11146,27 @@ async fn terminal_start_agent(
         return Err(error);
     }
     *agent_started = true;
+    stamp_terminal_launch_account(
+        &pane_id,
+        instance.id,
+        &terminal_instance_launch_epoch(&instance),
+        definition.id,
+        Some(instance.metadata.workspace_id.as_str()),
+        instance.metadata.terminal_index,
+        &launch_account_binding,
+        launch_workspace_trust.as_ref(),
+    );
     drop(writer);
     drop(agent_started);
+    {
+        let mut terminals = state.terminals.write().await;
+        if let Some(current) = terminals
+            .get_mut(&pane_id)
+            .filter(|current| current.id == instance.id)
+        {
+            current.launch_account_binding = Some(launch_account_binding.clone());
+        }
+    }
     if let Some(gateway) = codex_gateway.take() {
         terminal_replace_codex_gateway(&instance, gateway)?;
     }
@@ -10391,6 +11197,7 @@ async fn start_terminal_agent_in_prepared_pty(
             instance_id,
             model: None,
             model_source: None,
+            effective_provider_session_id: None,
             started: false,
             skipped: true,
             message: app_shutdown_blocked_message("terminal agent batch start"),
@@ -10403,6 +11210,7 @@ async fn start_terminal_agent_in_prepared_pty(
             instance_id,
             model: None,
             model_source: None,
+            effective_provider_session_id: None,
             started: false,
             skipped: true,
             message: error,
@@ -10417,6 +11225,7 @@ async fn start_terminal_agent_in_prepared_pty(
                 instance_id,
                 model: None,
                 model_source: None,
+                effective_provider_session_id: None,
                 started: false,
                 skipped: true,
                 message: error,
@@ -10445,17 +11254,34 @@ async fn start_terminal_agent_in_prepared_pty(
             instance_id,
             model: None,
             model_source: None,
+            effective_provider_session_id: None,
             started: false,
             skipped: true,
             message: "Terminal session is not running.".to_string(),
         };
     };
+    let launch_account_binding = terminal_launch_account_binding_for_instance(&instance, provider);
+    if let Err(error) = launch_account_binding
+        .validate_frozen_account(provider, resume_was_requested || is_fork_launch)
+    {
+        return TerminalStartAgentPaneResult {
+            pane_id,
+            instance_id: Some(instance.id),
+            model: None,
+            model_source: None,
+            effective_provider_session_id: None,
+            started: false,
+            skipped: false,
+            message: error,
+        };
+    }
     let working_directory_text = terminal_provider_session_binding_root(&instance);
     let (source_session_id, codex_resume_home) = if is_fork_launch {
-        let (session_id, codex_resume_home) = terminal_resolve_provider_resume_session(
+        let (session_id, codex_resume_home) = terminal_resolve_provider_resume_session_for_binding(
             provider,
             requested_fork_session_id,
             &working_directory_text,
+            &launch_account_binding,
         );
         let Some(session_id) = session_id else {
             return TerminalStartAgentPaneResult {
@@ -10463,6 +11289,7 @@ async fn start_terminal_agent_in_prepared_pty(
                 instance_id: Some(instance.id),
                 model: None,
                 model_source: None,
+                effective_provider_session_id: None,
                 started: false,
                 skipped: true,
                 message: terminal_provider_session_fork_error(provider),
@@ -10470,10 +11297,11 @@ async fn start_terminal_agent_in_prepared_pty(
         };
         (Some(session_id), codex_resume_home)
     } else {
-        terminal_resolve_provider_resume_session(
+        terminal_resolve_provider_resume_session_for_binding(
             provider,
             requested_resume_session_id,
             &working_directory_text,
+            &launch_account_binding,
         )
     };
     if !is_fork_launch
@@ -10481,15 +11309,19 @@ async fn start_terminal_agent_in_prepared_pty(
         && resume_was_requested
         && source_session_id.is_none()
     {
-        return TerminalStartAgentPaneResult {
-            pane_id,
-            instance_id: Some(instance.id),
-            model: None,
-            model_source: None,
-            started: false,
-            skipped: true,
-            message: terminal_claude_resume_unavailable_message(),
-        };
+        // The warm shell is already open. Losing the Claude transcript or
+        // switching accounts between frontend preflight and this launch gate
+        // must start Claude fresh in that PTY instead of leaving a prepared
+        // terminal with no agent.
+        log_terminal_status_event(
+            "backend.terminal_provider_session.resume_fallback_fresh",
+            json!({
+                "instance_id": instance.id,
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                "provider": "claude",
+                "reason": "prewarmed_resume_resolution_missing",
+            }),
+        );
     }
     let mut args = if is_fork_launch {
         terminal_provider_fork_args(provider, source_session_id.as_deref())
@@ -10501,7 +11333,14 @@ async fn start_terminal_agent_in_prepared_pty(
     // transcript outranks the caller's default (it sees `/model` switches).
     let session_model = source_session_id
         .as_deref()
-        .and_then(|session_id| agent_session_last_model(provider, session_id))
+        .and_then(|session_id| {
+            terminal_session_last_model_for_binding(
+                provider,
+                session_id,
+                codex_resume_home.as_deref(),
+                &launch_account_binding,
+            )
+        })
         .and_then(|model| normalize_forge_model(Some(model)).ok().flatten());
     let request_model = match normalize_forge_model(request.model) {
         Ok(model) => model,
@@ -10511,6 +11350,7 @@ async fn start_terminal_agent_in_prepared_pty(
                 instance_id,
                 model: None,
                 model_source: None,
+                effective_provider_session_id: None,
                 started: false,
                 skipped: true,
                 message: error,
@@ -10545,6 +11385,7 @@ async fn start_terminal_agent_in_prepared_pty(
                     instance_id,
                     model: None,
                     model_source: None,
+                    effective_provider_session_id: None,
                     started: false,
                     skipped: true,
                     message: error,
@@ -10563,6 +11404,7 @@ async fn start_terminal_agent_in_prepared_pty(
                 instance_id,
                 model: None,
                 model_source: None,
+                effective_provider_session_id: None,
                 started: false,
                 skipped: true,
                 message: error,
@@ -10578,6 +11420,7 @@ async fn start_terminal_agent_in_prepared_pty(
                     instance_id,
                     model: None,
                     model_source: None,
+                    effective_provider_session_id: None,
                     started: false,
                     skipped: true,
                     message: error,
@@ -10592,6 +11435,7 @@ async fn start_terminal_agent_in_prepared_pty(
             instance_id,
             model: None,
             model_source: None,
+            effective_provider_session_id: None,
             started: false,
             skipped: true,
             message: "Terminal session was replaced before agent start.".to_string(),
@@ -10604,6 +11448,7 @@ async fn start_terminal_agent_in_prepared_pty(
             instance_id: Some(instance.id),
             model: None,
             model_source: None,
+            effective_provider_session_id: None,
             started: false,
             skipped: true,
             message:
@@ -10615,11 +11460,13 @@ async fn start_terminal_agent_in_prepared_pty(
     let mut agent_started_guard = instance.agent_started.lock().await;
 
     if *agent_started_guard {
+        let runtime = terminal_runtime_snapshot(&instance);
         return TerminalStartAgentPaneResult {
             pane_id,
             instance_id: Some(instance.id),
             model: None,
             model_source: None,
+            effective_provider_session_id: runtime.provider_session_id,
             started: false,
             skipped: true,
             message: "Terminal agent has already been started.".to_string(),
@@ -10636,6 +11483,7 @@ async fn start_terminal_agent_in_prepared_pty(
                 instance_id: Some(instance.id),
                 model: None,
                 model_source: None,
+                effective_provider_session_id: None,
                 started: false,
                 skipped: false,
                 message: format!(
@@ -10695,6 +11543,7 @@ async fn start_terminal_agent_in_prepared_pty(
                         instance_id: Some(instance.id),
                         model: None,
                         model_source: None,
+                        effective_provider_session_id: None,
                         started: false,
                         skipped: false,
                         message: error,
@@ -10715,6 +11564,7 @@ async fn start_terminal_agent_in_prepared_pty(
                         instance_id: Some(instance.id),
                         model: None,
                         model_source: None,
+                        effective_provider_session_id: None,
                         started: false,
                         skipped: false,
                         message: error,
@@ -10734,6 +11584,7 @@ async fn start_terminal_agent_in_prepared_pty(
                     instance_id: Some(instance.id),
                     model: None,
                     model_source: None,
+                    effective_provider_session_id: None,
                     started: false,
                     skipped: false,
                     message: error,
@@ -10748,6 +11599,7 @@ async fn start_terminal_agent_in_prepared_pty(
                 instance_id: Some(instance.id),
                 model: None,
                 model_source: None,
+                effective_provider_session_id: None,
                 started: false,
                 skipped: false,
                 message: error,
@@ -10763,19 +11615,21 @@ async fn start_terminal_agent_in_prepared_pty(
                 &mut coordination_env_vars,
                 home,
                 source_session_id.as_deref().unwrap_or_default(),
+                Some(&launch_account_binding),
             ) {
                 return TerminalStartAgentPaneResult {
                     pane_id,
                     instance_id: Some(instance.id),
                     model: None,
                     model_source: None,
+                    effective_provider_session_id: None,
                     started: false,
                     skipped: false,
                     message: error,
                 };
             }
         }
-        extend_terminal_activity_env_vars(
+        if let Err(error) = extend_terminal_activity_env_vars(
             &mut coordination_env_vars,
             Some(instance.working_directory.as_ref()),
             &pane_id,
@@ -10784,7 +11638,19 @@ async fn start_terminal_agent_in_prepared_pty(
             instance.metadata.terminal_index,
             definition.id,
             activity_transport.as_ref(),
-        );
+            Some(&launch_account_binding),
+        ) {
+            return TerminalStartAgentPaneResult {
+                pane_id,
+                instance_id: Some(instance.id),
+                model: None,
+                model_source: None,
+                effective_provider_session_id: None,
+                started: false,
+                skipped: false,
+                message: error,
+            };
+        }
         let cloud_env_vars = match cloud_mcp_runtime_env_vars(&cloud_mcp_state).await {
             Ok(env_vars) => env_vars,
             Err(error) => {
@@ -10793,6 +11659,7 @@ async fn start_terminal_agent_in_prepared_pty(
                     instance_id: Some(instance.id),
                     model: None,
                     model_source: None,
+                    effective_provider_session_id: None,
                     started: false,
                     skipped: false,
                     message: error,
@@ -10820,6 +11687,7 @@ async fn start_terminal_agent_in_prepared_pty(
                         instance_id: Some(instance.id),
                         model: None,
                         model_source: None,
+                        effective_provider_session_id: None,
                         started: false,
                         skipped: false,
                         message: error,
@@ -10842,6 +11710,7 @@ async fn start_terminal_agent_in_prepared_pty(
                         instance_id: Some(instance.id),
                         model: None,
                         model_source: None,
+                        effective_provider_session_id: None,
                         started: false,
                         skipped: false,
                         message: error,
@@ -10874,6 +11743,26 @@ async fn start_terminal_agent_in_prepared_pty(
                     instance_id: Some(instance.id),
                     model: None,
                     model_source: None,
+                    effective_provider_session_id: None,
+                    started: false,
+                    skipped: false,
+                    message: error,
+                };
+            }
+        };
+        let launch_workspace_trust = match prepare_terminal_launch_account(
+            &launch_env_vars,
+            definition.id,
+            &launch_account_binding,
+        ) {
+            Ok(workspace_trust) => workspace_trust,
+            Err(error) => {
+                return TerminalStartAgentPaneResult {
+                    pane_id,
+                    instance_id: Some(instance.id),
+                    model: None,
+                    model_source: None,
+                    effective_provider_session_id: None,
                     started: false,
                     skipped: false,
                     message: error,
@@ -10922,6 +11811,7 @@ async fn start_terminal_agent_in_prepared_pty(
                         instance_id: Some(instance.id),
                         model: None,
                         model_source: None,
+                        effective_provider_session_id: None,
                         started: false,
                         skipped: false,
                         message: format!(
@@ -10947,6 +11837,7 @@ async fn start_terminal_agent_in_prepared_pty(
                 instance_id: Some(instance.id),
                 model: None,
                 model_source: None,
+                effective_provider_session_id: None,
                 started: false,
                 skipped: false,
                 message: "Terminal launch input is too large.".to_string(),
@@ -10967,6 +11858,16 @@ async fn start_terminal_agent_in_prepared_pty(
         match write_agent_start_input_to_writer(writer.as_mut(), &input, "terminal agent launch") {
             Ok(()) => {
                 *agent_started_guard = true;
+                stamp_terminal_launch_account(
+                    &pane_id,
+                    instance.id,
+                    &terminal_instance_launch_epoch(&instance),
+                    definition.id,
+                    Some(instance.metadata.workspace_id.as_str()),
+                    instance.metadata.terminal_index,
+                    &launch_account_binding,
+                    launch_workspace_trust.as_ref(),
+                );
                 if let Some(gateway) = codex_gateway.take() {
                     if let Err(error) = terminal_replace_codex_gateway(&instance, gateway) {
                         return TerminalStartAgentPaneResult {
@@ -10974,6 +11875,7 @@ async fn start_terminal_agent_in_prepared_pty(
                             instance_id: Some(instance.id),
                             model: None,
                             model_source: None,
+                            effective_provider_session_id: None,
                             started: false,
                             skipped: false,
                             message: error,
@@ -11038,6 +11940,7 @@ async fn start_terminal_agent_in_prepared_pty(
                     instance_id: Some(instance.id),
                     model: resolved_launch.model,
                     model_source: resolved_launch.model_source,
+                    effective_provider_session_id,
                     started: true,
                     skipped: false,
                     message: "Agent started.".to_string(),
@@ -11053,6 +11956,7 @@ async fn start_terminal_agent_in_prepared_pty(
                     instance_id: Some(instance.id),
                     model: None,
                     model_source: None,
+                    effective_provider_session_id: None,
                     started: false,
                     skipped: false,
                     message: error,
@@ -11065,6 +11969,7 @@ async fn start_terminal_agent_in_prepared_pty(
         instance_id: Some(instance.id),
         model: None,
         model_source: None,
+        effective_provider_session_id: None,
         started: false,
         skipped: true,
         message: "Terminal shell is not available for deferred agent launch.".to_string(),
@@ -11127,6 +12032,7 @@ async fn terminal_start_agent_many(
                     instance_id,
                     model: None,
                     model_source: None,
+                    effective_provider_session_id: None,
                     started: false,
                     skipped: false,
                     message: "Terminal agent start timed out; it will be retried automatically."
@@ -11146,6 +12052,7 @@ async fn terminal_start_agent_many(
                 instance_id: None,
                 model: None,
                 model_source: None,
+                effective_provider_session_id: None,
                 started: false,
                 skipped: false,
                 message: format!("Unable to join terminal agent start task: {error}"),
@@ -28120,6 +29027,8 @@ async fn terminal_restart_if_idle(
     instance_id: u64,
     launch_epoch: String,
     target_role: Option<String>,
+    fresh_session: Option<bool>,
+    provider_session_id: Option<String>,
     coordinator_id: Option<String>,
     deadline_ms: Option<u64>,
 ) -> Result<Value, String> {
@@ -28151,8 +29060,16 @@ async fn terminal_restart_if_idle(
             "reason": "stale_identity",
         }));
     };
+    let current_role = terminal_restart_role(None, &initial_instance)
+        .ok_or_else(|| "Unsupported current terminal restart role.".to_string())?;
     let target_role = terminal_restart_role(target_role.as_deref(), &initial_instance)
         .ok_or_else(|| "Unsupported terminal restart role.".to_string())?;
+    let (fresh_session, provider_session_id) = terminal_restart_session_binding(
+        &current_role,
+        &target_role,
+        fresh_session,
+        provider_session_id.as_deref(),
+    );
     let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
     let _lifecycle_guard = lifecycle_lock.lock().await;
     let existing_intent = state
@@ -28165,7 +29082,9 @@ async fn terminal_restart_if_idle(
         terminal_restart_intent_matches(intent, &pane_id, instance_id, &launch_epoch)
     }) {
         let same_coordinator = existing.coordinator_id == coordinator_id
-            && existing.target_role == target_role;
+            && existing.target_role == target_role
+            && existing.fresh_session == fresh_session
+            && existing.provider_session_id == provider_session_id;
         return Ok(json!({
             "contract": "diffforge.terminal_restart_if_idle.v2",
             "pane_id": pane_id,
@@ -28173,6 +29092,8 @@ async fn terminal_restart_if_idle(
             "launch_epoch": launch_epoch,
             "coordinator_id": existing.coordinator_id,
             "target_role": existing.target_role,
+            "fresh_session": existing.fresh_session,
+            "provider_session_id": existing.provider_session_id,
             "deadline_at_ms": existing.deadline_at_ms,
             "restart_intent_seq": existing.restart_intent_seq,
             "restarted": false,
@@ -28201,6 +29122,8 @@ async fn terminal_restart_if_idle(
             "launch_epoch": launch_epoch,
             "restarted": true,
             "queued": false,
+            "fresh_session": fresh_session,
+            "provider_session_id": provider_session_id,
             "restart_intent_pending": false,
             "status": "ready",
             "reason": "idle_closed",
@@ -28244,6 +29167,8 @@ async fn terminal_restart_if_idle(
         instance_id,
         launch_epoch: launch_epoch.clone(),
         target_role,
+        fresh_session,
+        provider_session_id,
         mode: "restart_when_idle".to_string(),
         coordinator_id,
         requested_at_ms: now_ms,
@@ -28280,6 +29205,8 @@ async fn terminal_restart_if_idle(
         "launch_epoch": launch_epoch,
         "coordinator_id": intent.coordinator_id,
         "target_role": intent.target_role,
+        "fresh_session": intent.fresh_session,
+        "provider_session_id": intent.provider_session_id,
         "deadline_at_ms": intent.deadline_at_ms,
         "restart_intent_seq": intent.restart_intent_seq,
         "restarted": false,
@@ -28960,6 +29887,12 @@ async fn terminal_live_sessions(
             restart_target_role: restart_intent
                 .as_ref()
                 .map(|intent| intent.target_role.clone()),
+            restart_fresh_session: restart_intent
+                .as_ref()
+                .map(|intent| intent.fresh_session),
+            restart_provider_session_id: restart_intent
+                .as_ref()
+                .and_then(|intent| intent.provider_session_id.clone()),
             restart_coordinator_id: restart_intent
                 .as_ref()
                 .map(|intent| intent.coordinator_id.clone()),
@@ -29043,12 +29976,48 @@ mod terminal_tests {
     }
 
     #[test]
+    fn queued_restart_session_binding_preserves_resume_and_clears_fresh() {
+        assert!(
+            TERMINAL_FROZEN_RESUME_BINDING_TTL_MS > TERMINAL_RESTART_INTENT_MAX_DEADLINE_MS
+        );
+        assert_eq!(
+            terminal_restart_session_binding(
+                "codex",
+                "codex",
+                Some(false),
+                Some("session-a")
+            ),
+            (false, Some("session-a".to_string()))
+        );
+        assert_eq!(
+            terminal_restart_session_binding(
+                "codex",
+                "codex",
+                Some(true),
+                Some("session-a")
+            ),
+            (true, None)
+        );
+        assert_eq!(
+            terminal_restart_session_binding(
+                "codex",
+                "claude",
+                Some(false),
+                Some("session-a")
+            ),
+            (true, None)
+        );
+    }
+
+    #[test]
     fn close_all_restart_intent_cleanup_is_scoped_and_full_close_drains_orphans() {
         let intent = |pane_id: &str, instance_id: u64| TerminalPendingRestartIntent {
             pane_id: pane_id.to_string(),
             instance_id,
             launch_epoch: format!("{pane_id}:{instance_id}"),
             target_role: "codex".to_string(),
+            fresh_session: false,
+            provider_session_id: Some(format!("session-{instance_id}")),
             mode: "restart_when_idle".to_string(),
             coordinator_id: format!("coordinator-{pane_id}"),
             requested_at_ms: 1,
@@ -29122,6 +30091,7 @@ mod terminal_tests {
             TerminalSessionMode::General,
             metadata,
             TerminalLaunchRuntimeMetadata::default(),
+            None,
             false,
         );
         let terminals = Arc::new(RwLock::new(HashMap::from([(
@@ -29306,6 +30276,7 @@ mod terminal_tests {
             TerminalSessionMode::General,
             metadata,
             TerminalLaunchRuntimeMetadata::default(),
+            None,
             false,
         );
         let reader_thread = thread::spawn(move || {
@@ -31786,6 +32757,260 @@ notifications = true
     }
 
     #[test]
+    fn fresh_provider_launches_do_not_require_an_existing_auth_store() {
+        let missing_account = |kind| AgentAccountsLaunchAccountBinding {
+            kind,
+            profile_id: AGENT_ACCOUNTS_DEFAULT_PROFILE_ID.to_string(),
+            profile_label: "Default".to_string(),
+            auth_revision: String::new(),
+            profile_home: None,
+            selected_profile_dir: None,
+        };
+        let bindings = [
+            (
+                AgentProvider::Claude,
+                TerminalProviderLaunchAccountBinding::Claude {
+                    home: None,
+                    account: Some(missing_account("claude")),
+                },
+            ),
+            (
+                AgentProvider::Codex,
+                TerminalProviderLaunchAccountBinding::Unmanaged {
+                    account: Some(missing_account("codex")),
+                },
+            ),
+            (
+                AgentProvider::OpenCode,
+                TerminalProviderLaunchAccountBinding::OpenCode {
+                    data_home: None,
+                    db_path: None,
+                    account: Some(missing_account("opencode")),
+                },
+            ),
+        ];
+
+        for (provider, binding) in bindings {
+            binding
+                .validate_frozen_account(provider, false)
+                .expect("fresh and deferred starts must reach the provider login UI");
+            assert!(
+                binding.validate_frozen_account(provider, true).is_err(),
+                "a real resume still fails closed without its captured auth store"
+            );
+            let launch = terminal_launch_with_account_binding(
+                provider,
+                TerminalProviderLaunchOptions::default(),
+                None,
+                None,
+                ".",
+                binding,
+            )
+            .expect("fresh launch planning must not require credentials");
+            assert!(launch.6.is_none());
+        }
+    }
+
+    #[test]
+    fn frozen_restart_binding_survives_close_and_is_claimed_once() {
+        let pane_id = format!("pane-frozen-resume-{}", uuid::Uuid::new_v4());
+        let binding = TerminalProviderLaunchAccountBinding::Unmanaged {
+            account: Some(AgentAccountsLaunchAccountBinding {
+                kind: "codex",
+                profile_id: "account-a".to_string(),
+                profile_label: "Account A".to_string(),
+                auth_revision: "revision-a".to_string(),
+                profile_home: Some(PathBuf::from("/account-a")),
+                selected_profile_dir: Some(PathBuf::from("/account-a")),
+            }),
+        };
+        terminal_store_frozen_resume_binding(
+            &pane_id,
+            41,
+            AgentProvider::Codex,
+            "session-a",
+            &binding,
+        );
+        let claimed = terminal_frozen_resume_binding(
+            &pane_id,
+            None,
+            AgentProvider::Codex,
+            "session-a",
+            true,
+        )
+        .expect("the verified pane binding must cross the close/reopen boundary");
+        assert_eq!(
+            claimed.captured_account().unwrap().profile_id,
+            "account-a"
+        );
+        assert!(terminal_frozen_resume_binding(
+            &pane_id,
+            None,
+            AgentProvider::Codex,
+            "session-a",
+            true,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn prepared_pty_reuses_the_account_frozen_when_the_shell_was_prewarmed() {
+        let root = env::temp_dir().join(format!(
+            "prepared-pty-frozen-account-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let profile_a = root.join("profile-a");
+        let profile_b = root.join("profile-b");
+        fs::create_dir_all(&profile_a).unwrap();
+        fs::create_dir_all(&profile_b).unwrap();
+        let warm = create_warm_shell_pty_in_directory(
+            PtySize {
+                rows: 12,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            &root,
+        )
+        .unwrap();
+        let frozen = TerminalProviderLaunchAccountBinding::Unmanaged {
+            account: Some(AgentAccountsLaunchAccountBinding {
+                kind: "codex",
+                profile_id: "account-a".to_string(),
+                profile_label: "Account A".to_string(),
+                auth_revision: "revision-a".to_string(),
+                profile_home: Some(profile_a.clone()),
+                selected_profile_dir: Some(profile_a.clone()),
+            }),
+        };
+        let (instance, _reader) = TerminalInstance::from_warm_shell(
+            91,
+            warm,
+            root.clone(),
+            false,
+            None,
+            TerminalSessionMode::Free,
+            TerminalInstanceMetadata {
+                pane_id: "pane-prewarmed-a".to_string(),
+                agent_id: "codex".to_string(),
+                agent_kind: "codex".to_string(),
+                ..TerminalInstanceMetadata::default()
+            },
+            TerminalLaunchRuntimeMetadata::default(),
+            Some(frozen),
+            false,
+        );
+
+        let selected =
+            terminal_launch_account_binding_for_instance(&instance, AgentProvider::Codex);
+        assert_eq!(
+            selected.captured_account().unwrap().profile_id,
+            "account-a"
+        );
+        let mut env_vars = vec![(
+            "CODEX_HOME".to_string(),
+            profile_b.to_string_lossy().to_string(),
+        )];
+        selected.apply_to_env(&mut env_vars);
+        assert_eq!(
+            env_vars.iter().rev().find_map(|(key, value)| {
+                (key == "CODEX_HOME").then_some(value.as_str())
+            }),
+            Some(profile_a.to_string_lossy().as_ref())
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn duplicate_legacy_start_keeps_the_running_process_stamp() {
+        let root = env::temp_dir().join(format!(
+            "duplicate-legacy-start-account-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let pane_id = format!("pane-duplicate-start-{}", uuid::Uuid::new_v4());
+        let binding = |profile_id: &str, revision: &str| {
+            TerminalProviderLaunchAccountBinding::Unmanaged {
+                account: Some(AgentAccountsLaunchAccountBinding {
+                    kind: "codex",
+                    profile_id: profile_id.to_string(),
+                    profile_label: profile_id.to_string(),
+                    auth_revision: revision.to_string(),
+                    profile_home: Some(root.join(profile_id)),
+                    selected_profile_dir: Some(root.join(profile_id)),
+                }),
+            }
+        };
+        let account_a = binding("account-a", "revision-a");
+        let account_b = binding("account-b", "revision-b");
+        stamp_terminal_launch_account(
+            &pane_id,
+            101,
+            &format!("{pane_id}:101"),
+            "codex",
+            Some("workspace-a"),
+            Some(0),
+            &account_a,
+            None,
+        );
+        let warm = create_warm_shell_pty_in_directory(
+            PtySize {
+                rows: 12,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            &root,
+        )
+        .unwrap();
+        let (instance, reader) = TerminalInstance::from_warm_shell(
+            101,
+            warm,
+            root.clone(),
+            true,
+            None,
+            TerminalSessionMode::Free,
+            TerminalInstanceMetadata {
+                pane_id: pane_id.clone(),
+                agent_id: "codex".to_string(),
+                agent_kind: "codex".to_string(),
+                ..TerminalInstanceMetadata::default()
+            },
+            TerminalLaunchRuntimeMetadata::default(),
+            Some(account_a),
+            false,
+        );
+
+        // This is the exact gate used by terminal_start_agent. A duplicate
+        // request cannot reach binding capture, trust, launch, or stamping.
+        if terminal_claim_legacy_agent_start(&instance).await.is_some() {
+            stamp_terminal_launch_account(
+                &pane_id,
+                101,
+                &format!("{pane_id}:101"),
+                "codex",
+                Some("workspace-a"),
+                Some(0),
+                &account_b,
+                None,
+            );
+        }
+
+        let stamp = agent_accounts_pane_profile_stamp(&pane_id).unwrap();
+        assert_eq!(stamp["profile_id"], json!("account-a"));
+        assert_eq!(stamp["auth_revision"], json!("revision-a"));
+        if let Ok(mut panes) = AGENT_ACCOUNTS_PANE_PROFILES
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+        {
+            panes.remove(&pane_id);
+        }
+        drop(instance);
+        drop(reader);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn provider_resume_args_are_provider_specific() {
         assert_eq!(
             terminal_provider_resume_args(AgentProvider::Codex, Some("codex-session-1")),
@@ -31822,6 +33047,256 @@ notifications = true
             Ok(_) => panic!("missing local Claude session must not launch"),
             Err(error) => assert_eq!(error, terminal_claude_resume_unavailable_message()),
         }
+    }
+
+    #[test]
+    fn terminal_open_launch_resolution_falls_back_fresh_for_every_provider() {
+        let nonce = uuid::Uuid::new_v4();
+        let cwd = env::temp_dir()
+            .join(format!("diffforge-missing-provider-resume-{nonce}"))
+            .to_string_lossy()
+            .to_string();
+        let cases = [
+            ("claude", format!("{nonce}")),
+            ("codex", format!("{nonce}")),
+            ("opencode", format!("ses_missing_{nonce}")),
+        ];
+
+        for (provider, session_id) in cases {
+            let (launch, fell_back_fresh) = terminal_launch_with_resume_fallback(
+                provider,
+                Some(provider.to_string()),
+                TerminalProviderLaunchOptions::default(),
+                Some(session_id.clone()),
+                None,
+                &cwd,
+            )
+            .unwrap_or_else(|error| panic!("{provider} fresh fallback failed: {error}"));
+
+            assert!(fell_back_fresh, "{provider} must downgrade a missing resume to fresh");
+            assert!(
+                !launch.1.contains(&session_id),
+                "{provider} fresh launch must not include the requested resume session"
+            );
+            assert_eq!(launch.6, None, "{provider} fresh launch must clear the provider session");
+        }
+    }
+
+    #[test]
+    fn absent_explicit_opencode_xdg_is_missing_and_falls_back_fresh() {
+        let _guard = OPENCODE_DB_TEST_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        let root = env::temp_dir().join(format!(
+            "diffforge-opencode-absent-xdg-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let custom_xdg = root.join("custom-xdg");
+        let custom_data_home = custom_xdg.join("opencode");
+        let native_data_home = home.join(".local").join("share").join("opencode");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&native_data_home).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        let session_id = "ses_profile_authority_12345678";
+
+        let create_session_db = |db_path: &Path| {
+            if let Some(parent) = db_path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            let connection = rusqlite::Connection::open(db_path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE session (
+                        id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        directory TEXT NOT NULL,
+                        time_updated INTEGER NOT NULL
+                    );",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO session (id, title, directory, time_updated) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        session_id,
+                        "Profile authority session",
+                        workspace.to_string_lossy().to_string(),
+                        100i64,
+                    ],
+                )
+                .unwrap();
+        };
+        let native_db = native_data_home.join("opencode.db");
+        create_session_db(&native_db);
+
+        let explicit_candidates =
+            opencode_native_data_home_from(Some(custom_xdg.clone()), Some(home.clone()));
+        assert_eq!(explicit_candidates, vec![custom_data_home.clone()]);
+        assert!(
+            !custom_data_home.exists(),
+            "the regression requires the authoritative XDG profile directory to be absent"
+        );
+        let explicit_db =
+            opencode_db_path_for_launch_roots(None, explicit_candidates.clone());
+        assert_eq!(
+            explicit_db, None,
+            "an absent explicit XDG database is authoritative missing"
+        );
+        assert_eq!(
+            resolve_opencode_resume_session_in_db(
+                &native_db,
+                session_id,
+                workspace.to_string_lossy().as_ref(),
+            )
+            .as_deref(),
+            Ok(session_id),
+            "the fallback profile contains the session and would be a wrong-account resume"
+        );
+
+        let explicit_binding = TerminalProviderLaunchAccountBinding::OpenCode {
+            data_home: Some(custom_xdg.clone()),
+            db_path: explicit_db,
+            account: None,
+        };
+        let (fresh_launch, fell_back_fresh) =
+            terminal_launch_with_resume_fallback_for_binding(
+                AgentProvider::OpenCode,
+                "opencode",
+                TerminalProviderLaunchOptions::default(),
+                Some(session_id.to_string()),
+                None,
+                workspace.to_string_lossy().as_ref(),
+                explicit_binding,
+            )
+            .unwrap();
+        assert!(fell_back_fresh);
+        assert!(!fresh_launch.1.iter().any(|arg| arg == session_id));
+        assert_eq!(fresh_launch.6, None);
+        assert!(matches!(
+            fresh_launch.7,
+            TerminalProviderLaunchAccountBinding::OpenCode {
+                data_home: Some(ref data_home),
+                db_path: None,
+                ..
+            } if data_home == &custom_xdg
+        ));
+
+        create_session_db(&custom_data_home.join("opencode.db"));
+        let explicit_db = opencode_db_path_for_launch_roots(None, explicit_candidates)
+            .expect("custom XDG database");
+        let (resume_launch, fell_back_fresh) =
+            terminal_launch_with_resume_fallback_for_binding(
+                AgentProvider::OpenCode,
+                "opencode",
+                TerminalProviderLaunchOptions::default(),
+                Some(session_id.to_string()),
+                None,
+                workspace.to_string_lossy().as_ref(),
+                TerminalProviderLaunchAccountBinding::OpenCode {
+                    data_home: Some(custom_xdg),
+                    db_path: Some(explicit_db),
+                    account: None,
+                },
+            )
+            .unwrap();
+        assert!(!fell_back_fresh);
+        assert!(resume_launch.1.iter().any(|arg| arg == session_id));
+        assert_eq!(resume_launch.6.as_deref(), Some(session_id));
+
+        let default_candidates = opencode_native_data_home_from(None, Some(home));
+        assert_eq!(default_candidates.first(), Some(&native_data_home));
+        assert_eq!(
+            opencode_db_path_for_launch_roots(None, default_candidates),
+            Some(native_db),
+            "the default native profile remains available when XDG_DATA_HOME is not set"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolved_account_binding_overrides_a_later_spawn_profile_change() {
+        let claude_home = PathBuf::from("/captured/claude-profile");
+        let claude_binding = TerminalProviderLaunchAccountBinding::Claude {
+            home: Some(claude_home.clone()),
+            account: None,
+        };
+        let mut claude_env = vec![(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/later/claude-profile".to_string(),
+        )];
+        claude_binding.apply_to_env(&mut claude_env);
+        assert_eq!(
+            claude_env,
+            vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                claude_home.to_string_lossy().to_string(),
+            )]
+        );
+
+        let opencode_home = PathBuf::from("/captured/opencode-profile");
+        let opencode_binding = TerminalProviderLaunchAccountBinding::OpenCode {
+            data_home: Some(opencode_home.clone()),
+            db_path: None,
+            account: None,
+        };
+        let mut opencode_env = vec![
+            (
+                "XDG_DATA_HOME".to_string(),
+                "/later/opencode-profile".to_string(),
+            ),
+            (
+                "OPENCODE_DATA_DIR".to_string(),
+                "/later/opencode-data".to_string(),
+            ),
+        ];
+        opencode_binding.apply_to_env(&mut opencode_env);
+        assert_eq!(
+            opencode_env,
+            vec![(
+                "XDG_DATA_HOME".to_string(),
+                opencode_home.to_string_lossy().to_string(),
+            )]
+        );
+
+        let mut default_opencode_env = vec![(
+            "XDG_DATA_HOME".to_string(),
+            "/previously-selected-profile".to_string(),
+        )];
+        TerminalProviderLaunchAccountBinding::OpenCode {
+            data_home: None,
+            db_path: None,
+            account: None,
+        }
+        .apply_to_env(&mut default_opencode_env);
+        assert_eq!(
+            default_opencode_env,
+            vec![("XDG_DATA_HOME".to_string(), String::new())],
+            "default deferred launches must clear a selected profile inherited by the warm shell",
+        );
+        let default_launch_input = terminal_agent_start_input_with_env_in_directory(
+            "opencode",
+            &[],
+            Path::new("."),
+            &default_opencode_env,
+        );
+        #[cfg(not(windows))]
+        assert!(default_launch_input.contains("export XDG_DATA_HOME=''\n"));
+        #[cfg(windows)]
+        assert!(default_launch_input.contains("$env:XDG_DATA_HOME = ''\r"));
+
+        let custom_native_root = PathBuf::from("/custom/native-data");
+        assert_eq!(
+            terminal_opencode_launch_data_home(
+                None,
+                Some(&custom_native_root.join("opencode")),
+            ),
+            Some(custom_native_root),
+            "a custom native XDG root must stay pinned even before its first database exists",
+        );
     }
 
     #[test]
@@ -32616,7 +34091,12 @@ notifications = true
             ),
         ];
 
-        apply_codex_resume_home_env(&mut env_vars, &source_home.to_string_lossy(), session_id)
+        apply_codex_resume_home_env(
+            &mut env_vars,
+            &source_home.to_string_lossy(),
+            session_id,
+            None,
+        )
             .unwrap();
 
         for key in ["CODEX_HOME", "DIFFFORGE_CODEX_HOME"] {
@@ -32647,6 +34127,7 @@ notifications = true
             &mut env_vars,
             &source_home.to_string_lossy(),
             "unused-without-managed-home",
+            None,
         )
         .unwrap();
 
@@ -34388,6 +35869,7 @@ notifications = true
             TerminalSessionMode::General,
             metadata,
             TerminalLaunchRuntimeMetadata::default(),
+            None,
             false,
         );
         *instance.runtime.lock().unwrap() = TerminalRuntimeSnapshot {

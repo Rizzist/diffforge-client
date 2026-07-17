@@ -2431,6 +2431,62 @@ test("closed session-backed thread restores by terminal index after persistence"
   assert.equal(restoredThread?.provider_bindings.codex.native_session_id, sessionId);
 });
 
+test("explicitly closed terminal does not revive its identity, session, or nickname on a new open", () => {
+  const workspaceId = "workspace-new-terminal-after-close";
+  const oldThreadId = "thread-closed-generation";
+  const oldSessionId = "claude-session-closed-generation";
+  const active = materializeWorkspaceThreadForTerminal({}, {
+    agent_id: "claude",
+    instance_id: 1,
+    native_session_id: oldSessionId,
+    pane_id: "pane-closed-generation",
+    provider_session_id: oldSessionId,
+    status: "active",
+    terminal_index: 0,
+    terminal_nickname: "Ali",
+    thread_id: oldThreadId,
+    type: "message-submitted",
+    user_message: "old terminal",
+    workspace_id: workspaceId,
+  });
+  const closed = markWorkspaceThreadTerminalDetached(active, {
+    agent_id: "claude",
+    instance_id: 1,
+    pane_id: "pane-closed-generation",
+    remember_terminal_thread: false,
+    status: "closed",
+    terminal_index: 0,
+    thread_id: oldThreadId,
+    workspace_id: workspaceId,
+  });
+
+  assert.equal(closed[workspaceId].terminals[0], undefined);
+  assert.equal(closed[workspaceId].terminal_thread_ids[0], undefined);
+  assert.equal(getWorkspaceThreadForTerminalIndex(closed, workspaceId, 0), null);
+
+  const reopened = updateWorkspaceActiveTerminal(closed, {
+    agent_id: "claude",
+    fresh_session: true,
+    instance_id: 2,
+    native_session_id: "",
+    pane_id: "pane-new-generation",
+    provider_session_id: "",
+    provider_session_id_cleared: true,
+    status: "active",
+    terminal_index: 0,
+    type: "opened",
+    workspace_id: workspaceId,
+  });
+  const newTerminal = reopened[workspaceId].terminals[0];
+  const newThread = reopened[workspaceId].threads[newTerminal.thread_id];
+
+  assert.notEqual(newThread.id, oldThreadId);
+  assert.equal(newThread.transcript_session_id || "", "");
+  assert.equal(newThread.provider_bindings.claude.native_session_id, "");
+  assert.ok(newThread.fresh_session_started_at);
+  assert.notEqual(newTerminal.terminal_nickname, "Ali");
+});
+
 test("live terminal thread selection prefers the current provider session over a cached terminal thread", () => {
   const workspaceId = "workspace-live-selection-session";
   const staleThreadId = "thread-stale-terminal-session";

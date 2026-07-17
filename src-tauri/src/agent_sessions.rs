@@ -1001,12 +1001,12 @@ fn jsonl_tail_last_model(provider: AgentProvider, path: &Path) -> Option<String>
     last
 }
 
-fn claude_session_transcript_path(session_id: &str) -> Option<PathBuf> {
+fn claude_session_transcript_path_in_home(home: &Path, session_id: &str) -> Option<PathBuf> {
     let session_id = session_id.trim();
     if session_id.is_empty() {
         return None;
     }
-    let projects_dir = claude_home_dir()?.join("projects");
+    let projects_dir = home.join("projects");
     for entry in fs::read_dir(&projects_dir).ok()?.flatten() {
         let path = entry.path().join(format!("{session_id}.jsonl"));
         if path.exists() {
@@ -1016,12 +1016,16 @@ fn claude_session_transcript_path(session_id: &str) -> Option<PathBuf> {
     None
 }
 
-fn codex_session_transcript_path(session_id: &str) -> Option<PathBuf> {
+fn claude_session_transcript_path(session_id: &str) -> Option<PathBuf> {
+    claude_session_transcript_path_in_home(&claude_home_dir()?, session_id)
+}
+
+fn codex_session_transcript_path_in_home(home: &Path, session_id: &str) -> Option<PathBuf> {
     let session_id = session_id.trim();
     if session_id.is_empty() {
         return None;
     }
-    let sessions_dir = codex_home_dir()?.join("sessions");
+    let sessions_dir = home.join("sessions");
     let mut files = Vec::new();
     collect_codex_rollout_files(&sessions_dir, &mut files);
     let mut matches = files
@@ -1034,6 +1038,10 @@ fn codex_session_transcript_path(session_id: &str) -> Option<PathBuf> {
         .collect::<Vec<_>>();
     sort_rollouts_newest_first(&mut matches);
     matches.into_iter().next()
+}
+
+fn codex_session_transcript_path(session_id: &str) -> Option<PathBuf> {
+    codex_session_transcript_path_in_home(&codex_home_dir()?, session_id)
 }
 
 /// Resolves the model a provider session was last using, straight from the
@@ -1085,14 +1093,13 @@ fn opencode_model_from_value(value: &Value) -> Option<String> {
 /// tail-scan for Claude/Codex. Prefers the most recent assistant message's
 /// model (captures in-session `/model` switches), falling back to the
 /// `session.model` column.
-fn opencode_session_last_model(session_id: &str) -> Option<String> {
+fn opencode_session_last_model_in_db(session_id: &str, db_path: &Path) -> Option<String> {
     let session_id = clean_codex_id(session_id);
     if session_id.is_empty() {
         return None;
     }
-    let db_path = opencode_db_path()?;
     let connection =
-        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .ok()?;
 
     if let Ok(mut statement) = connection.prepare(
@@ -1130,6 +1137,10 @@ fn opencode_session_last_model(session_id: &str) -> Option<String> {
     }
 
     None
+}
+
+fn opencode_session_last_model(session_id: &str) -> Option<String> {
+    opencode_session_last_model_in_db(session_id, &opencode_db_path()?)
 }
 
 fn sort_rollouts_newest_first(files: &mut [PathBuf]) {
@@ -3391,6 +3402,56 @@ pub(crate) fn discover_latest_codex_session_for_cwd(
     Ok(None)
 }
 
+fn discover_latest_codex_session_for_cwd_in_auth_home(
+    cwd: &str,
+    not_before_ms: u64,
+    auth_home: &Path,
+) -> Result<Option<CodexObservedSession>, String> {
+    let mut homes = codex_home_candidates(cwd)
+        .into_iter()
+        .filter(|candidate| candidate == auth_home || codex_homes_share_auth(candidate, auth_home))
+        .collect::<Vec<_>>();
+    if !homes.iter().any(|candidate| candidate == auth_home) {
+        homes.push(auth_home.to_path_buf());
+    }
+    let mut files = Vec::new();
+    for home in homes {
+        collect_codex_rollout_files(&home.join("sessions"), &mut files);
+    }
+    sort_rollouts_newest_first(&mut files);
+    let threshold_ms = not_before_ms.saturating_sub(30_000);
+    for path in files {
+        let modified_at_ms = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .map(system_time_to_unix_ms)
+            .unwrap_or(0);
+        if modified_at_ms > 0 && modified_at_ms < threshold_ms {
+            continue;
+        }
+        let Some(meta) = codex_rollout_meta(&path) else {
+            continue;
+        };
+        if meta.session_id.is_empty()
+            || (!cwd.trim().is_empty() && !agent_paths_match(&meta.cwd, cwd))
+        {
+            continue;
+        }
+        let session_title = first_non_empty_title(&[
+            meta.title.clone(),
+            codex_session_index_title(&meta.session_id),
+        ]);
+        return Ok(Some(CodexObservedSession {
+            session_id: meta.session_id,
+            session_title,
+            rollout_path: path.to_string_lossy().to_string(),
+            cwd: meta.cwd,
+            latest_timestamp: meta.latest_timestamp,
+            modified_at_ms,
+        }));
+    }
+    Ok(None)
+}
+
 fn push_codex_message(
     messages: &mut Vec<CodexThreadTranscriptMessage>,
     seen: &mut HashSet<String>,
@@ -4881,6 +4942,126 @@ mod agent_sessions_tests {
     }
 
     #[test]
+    fn opencode_launch_db_never_falls_back_past_the_selected_profile() {
+        let _guard = OPENCODE_DB_TEST_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        let root = unique_test_dir("opencode-selected-profile-db");
+        let selected_profile = root.join("selected-profile");
+        let native_data_home = root.join("native-data").join("opencode");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&selected_profile).unwrap();
+        fs::create_dir_all(&native_data_home).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+
+        let native_db = native_data_home.join("opencode.db");
+        {
+            let connection = rusqlite::Connection::open(&native_db).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE session (
+                        id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        directory TEXT NOT NULL,
+                        time_updated INTEGER NOT NULL
+                    );",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO session (id, title, directory, time_updated) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        "ses_native_only_12345678",
+                        "Native-only session",
+                        workspace.to_string_lossy().to_string(),
+                        100i64,
+                    ],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            opencode_db_path_for_launch_roots(
+                Some(selected_profile.clone()),
+                vec![native_data_home.clone()],
+            ),
+            None,
+            "a selected profile without opencode.db must be authoritative missing",
+        );
+        assert_eq!(
+            opencode_db_path_for_launch_roots(None, vec![native_data_home.clone()]),
+            Some(native_db.clone()),
+            "the same native database remains valid for the default launch profile",
+        );
+        let custom_native_home = root.join("custom-xdg").join("opencode");
+        fs::create_dir_all(&custom_native_home).unwrap();
+        assert_eq!(
+            opencode_db_path_for_launch_roots(
+                None,
+                vec![custom_native_home, native_data_home.clone()],
+            ),
+            None,
+            "the authoritative default XDG home must not fall through to another native account",
+        );
+
+        let selected_data_home = selected_profile.join("opencode");
+        fs::create_dir_all(&selected_data_home).unwrap();
+        let selected_db = selected_data_home.join("opencode.db");
+        {
+            let connection = rusqlite::Connection::open(&selected_db).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE session (
+                        id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        directory TEXT NOT NULL,
+                        time_updated INTEGER NOT NULL
+                    );",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO session (id, title, directory, time_updated) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        "ses_selected_12345678",
+                        "Selected-profile session",
+                        workspace.to_string_lossy().to_string(),
+                        200i64,
+                    ],
+                )
+                .unwrap();
+        }
+
+        let resolved_db = opencode_db_path_for_launch_roots(
+            Some(selected_profile),
+            vec![native_data_home],
+        )
+        .expect("selected profile database");
+        assert_eq!(resolved_db, selected_db);
+        assert_eq!(
+            find_opencode_session_in_db(
+                &resolved_db,
+                "ses_selected_12345678",
+                workspace.to_string_lossy().as_ref(),
+            )
+            .unwrap()
+            .0,
+            "ses_selected_12345678",
+            "a session genuinely present in the selected profile must still resume",
+        );
+        assert!(find_opencode_session_in_db(
+            &resolved_db,
+            "ses_native_only_12345678",
+            workspace.to_string_lossy().as_ref(),
+        )
+        .is_err());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn codex_resume_sanitizer_removes_only_unresumable_image_response_items() {
         let image_event = json!({
             "type": "event_msg",
@@ -4919,6 +5100,127 @@ mod agent_sessions_tests {
         assert!(sanitized.contains("Created."));
         assert!(!sanitized.contains("image_generation_call"));
         assert!(!sanitized.contains("base64-image"));
+    }
+
+    #[test]
+    fn codex_frozen_auth_home_ignores_a_later_account_candidate() {
+        let root = unique_test_dir("codex-frozen-auth-resume");
+        let account_a = root.join("account-a");
+        let account_b = root.join("account-b");
+        let sessions_a = account_a.join("sessions").join("2026").join("07").join("16");
+        let sessions_b = account_b.join("sessions").join("2026").join("07").join("16");
+        fs::create_dir_all(&sessions_a).unwrap();
+        fs::create_dir_all(&sessions_b).unwrap();
+        fs::write(account_a.join("auth.json"), "account-a").unwrap();
+        fs::write(account_b.join("auth.json"), "account-b").unwrap();
+        let session_id = "0198-frozen-codex-account-a";
+        let session_meta = |cwd: &str| {
+            json!({
+                "type": "session_meta",
+                "timestamp": "2026-07-16T12:00:00Z",
+                "payload": { "id": session_id, "cwd": cwd }
+            })
+            .to_string()
+        };
+        let unsafe_image = json!({
+            "type": "response_item",
+            "payload": {
+                "type": "image_generation_call",
+                "id": "ig_account_a",
+                "result": "must-be-removed"
+            }
+        })
+        .to_string();
+        let rollout_a = sessions_a.join(format!("rollout-{session_id}.jsonl"));
+        let rollout_b = sessions_b.join(format!("rollout-{session_id}.jsonl"));
+        fs::write(
+            &rollout_a,
+            format!("{}\n{}\n", session_meta("/workspace-a"), unsafe_image),
+        )
+        .unwrap();
+        fs::write(&rollout_b, format!("{}\n", session_meta("/workspace-b"))).unwrap();
+
+        let (resolved, source_home) =
+            resolve_codex_resume_session_for_auth_home_from_candidates(
+                session_id,
+                &account_a,
+                vec![account_b.clone(), account_a.clone()],
+            )
+            .expect("resolve only inside the frozen account's homes");
+
+        assert_eq!(resolved, session_id);
+        assert_eq!(source_home, account_a);
+        assert!(!fs::read_to_string(&rollout_a)
+            .unwrap()
+            .contains("must-be-removed"));
+        assert!(fs::read_to_string(&rollout_b)
+            .unwrap()
+            .contains("/workspace-b"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_same_account_atomic_refresh_keeps_the_managed_home_eligible() {
+        let root = unique_test_dir("codex-same-account-refresh-managed-home");
+        let account_home = root.join("account-a");
+        let managed_home = root.join("managed-a");
+        let sessions = managed_home
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("17");
+        fs::create_dir_all(&account_home).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        let auth = |account_id: &str, refresh_token: &str| {
+            serde_json::to_vec(&json!({
+                "tokens": {
+                    "chatgpt_account_id": account_id,
+                    "refresh_token": refresh_token,
+                }
+            }))
+            .unwrap()
+        };
+        let account_auth = account_home.join("auth.json");
+        let managed_auth = managed_home.join("auth.json");
+        fs::write(&account_auth, auth("account-a", "refresh-old")).unwrap();
+        fs::hard_link(&account_auth, &managed_auth).unwrap();
+
+        // Model Windows' hard-link fallback after an atomic token refresh: the
+        // selected profile now names a new file object while the managed home
+        // still names the old object. Both remain the same immutable account.
+        let refreshed_auth = account_home.join("auth.refreshed.json");
+        fs::write(&refreshed_auth, auth("account-a", "refresh-new")).unwrap();
+        fs::remove_file(&account_auth).unwrap();
+        fs::rename(&refreshed_auth, &account_auth).unwrap();
+        assert!(codex_homes_share_auth(&managed_home, &account_home));
+
+        let session_id = "0198-same-account-refresh-session";
+        fs::write(
+            sessions.join(format!("rollout-{session_id}.jsonl")),
+            json!({
+                "type": "session_meta",
+                "timestamp": "2026-07-17T12:00:00Z",
+                "payload": { "id": session_id, "cwd": "/workspace-a" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (resolved, source_home) =
+            resolve_codex_resume_session_for_auth_home_from_candidates(
+                session_id,
+                &account_home,
+                vec![managed_home.clone()],
+            )
+            .expect("same-account managed session remains resumable after refresh");
+        assert_eq!(resolved, session_id);
+        assert_eq!(source_home, managed_home);
+
+        fs::write(&account_auth, auth("account-b", "refresh-b")).unwrap();
+        assert!(
+            !codex_homes_share_auth(&managed_home, &account_home),
+            "a genuinely different account must stay excluded"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5858,7 +6160,11 @@ fn prepare_codex_rollout_for_resume(provider_session_id: &str, cwd: &str) -> Res
     }
 
     let (path, _, _) = find_codex_rollout(provider_session_id, cwd)?;
-    let body = fs::read_to_string(&path)
+    prepare_codex_rollout_path_for_resume(&path)
+}
+
+fn prepare_codex_rollout_path_for_resume(path: &Path) -> Result<usize, String> {
+    let body = fs::read_to_string(path)
         .map_err(|error| format!("Unable to read Codex rollout {}: {error}", path.display()))?;
     let (sanitized, removed) = sanitize_codex_rollout_for_resume(&body);
     if removed > 0 {
@@ -5871,6 +6177,113 @@ fn prepare_codex_rollout_for_resume(provider_session_id: &str, cwd: &str) -> Res
     }
 
     Ok(removed)
+}
+
+fn codex_auth_account_identity(auth_path: &Path) -> Option<String> {
+    let auth = fs::read(auth_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())?;
+    let identity = agent_accounts_codex_stable_identity_from_auth(&auth);
+    (!identity.is_empty()).then_some(identity)
+}
+
+fn codex_homes_share_auth(left: &Path, right: &Path) -> bool {
+    let left = left.join("auth.json");
+    let right = right.join("auth.json");
+    if !left.is_file() || !right.is_file() {
+        return false;
+    }
+    match (
+        codex_auth_account_identity(&left),
+        codex_auth_account_identity(&right),
+    ) {
+        (Some(left), Some(right)) => return left == right,
+        (Some(_), None) | (None, Some(_)) => return false,
+        (None, None) => {}
+    }
+    if matches!(
+            (left.canonicalize(), right.canonicalize()),
+            (Ok(left), Ok(right)) if left == right
+        )
+    {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        return matches!(
+            (fs::metadata(left), fs::metadata(right)),
+            (Ok(left), Ok(right)) if left.dev() == right.dev() && left.ino() == right.ino()
+        );
+    }
+    #[cfg(windows)]
+    {
+        // Managed Codex auth falls back to a hard link when symlinks are not
+        // permitted. Match the coordination kernel's stable Windows
+        // same-file check so that home remains eligible for frozen-account
+        // resume/model discovery.
+        return same_file::is_same_file(left, right).unwrap_or(false);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+fn resolve_codex_resume_session_for_auth_home(
+    provider_session_id: &str,
+    cwd: &str,
+    auth_home: &Path,
+) -> Result<(String, PathBuf), String> {
+    resolve_codex_resume_session_for_auth_home_from_candidates(
+        provider_session_id,
+        auth_home,
+        codex_home_candidates(cwd),
+    )
+}
+
+fn resolve_codex_resume_session_for_auth_home_from_candidates(
+    provider_session_id: &str,
+    auth_home: &Path,
+    candidates: Vec<PathBuf>,
+) -> Result<(String, PathBuf), String> {
+    let requested_session_id = clean_codex_id(provider_session_id);
+    if requested_session_id.is_empty() {
+        return Err("Codex rollout transcript has no resumable session id.".to_string());
+    }
+    let mut homes = candidates
+        .into_iter()
+        .filter(|candidate| candidate == auth_home || codex_homes_share_auth(candidate, auth_home))
+        .collect::<Vec<_>>();
+    if !homes.iter().any(|candidate| candidate == auth_home) {
+        homes.push(auth_home.to_path_buf());
+    }
+    let mut files = Vec::new();
+    for home in &homes {
+        collect_codex_rollout_files(&home.join("sessions"), &mut files);
+    }
+    sort_rollouts_newest_first(&mut files);
+    for path in files {
+        let name_match = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(&requested_session_id));
+        let Some(meta) = codex_rollout_meta(&path) else {
+            continue;
+        };
+        if !name_match && meta.session_id != requested_session_id {
+            continue;
+        }
+        if meta.session_id.trim().is_empty() {
+            return Err("Codex rollout transcript has no resumable session id.".to_string());
+        }
+        prepare_codex_rollout_path_for_resume(&path)?;
+        let source_home = codex_home_from_rollout_path(&path).ok_or_else(|| {
+            "Codex rollout transcript is not inside a sessions directory.".to_string()
+        })?;
+        return Ok((meta.session_id, source_home));
+    }
+    Err("No Codex transcript matched this thread session in the frozen account homes.".to_string())
 }
 
 fn find_codex_rollout_in_home(
@@ -6080,8 +6493,10 @@ fn collect_claude_session_files(root: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-fn collect_claude_candidate_files(cwd: &str) -> Result<Vec<PathBuf>, String> {
-    let homes = claude_home_candidates();
+fn collect_claude_candidate_files_in_homes(
+    cwd: &str,
+    homes: &[PathBuf],
+) -> Result<Vec<PathBuf>, String> {
     if homes.is_empty() {
         return Err("Unable to locate Claude Code home.".to_string());
     }
@@ -6114,6 +6529,10 @@ fn collect_claude_candidate_files(cwd: &str) -> Result<Vec<PathBuf>, String> {
         return Err("No Claude Code transcripts were found.".to_string());
     }
     Ok(files)
+}
+
+fn collect_claude_candidate_files(cwd: &str) -> Result<Vec<PathBuf>, String> {
+    collect_claude_candidate_files_in_homes(cwd, &claude_home_candidates())
 }
 
 fn claude_file_meta(path: &Path) -> Option<CodexRolloutMeta> {
@@ -6785,18 +7204,33 @@ fn parse_claude_session(
     Ok((meta, messages))
 }
 
-fn opencode_native_data_home() -> Vec<PathBuf> {
+fn opencode_native_data_home_from(
+    selected_xdg_data_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(value) = env::var_os("XDG_DATA_HOME") {
-        candidates.push(PathBuf::from(value).join("opencode"));
-    }
-    if let Some(home) = user_home_dir() {
+    if let Some(data_home) = selected_xdg_data_home {
+        // An explicit XDG_DATA_HOME is OpenCode's authoritative native
+        // profile even before the directory or database has been created.
+        // Appending native defaults here would let preflight see (and resume)
+        // a different account than the launched process can access.
+        candidates.push(data_home.join("opencode"));
+    } else if let Some(home) = home {
         candidates.push(home.join(".local").join("share").join("opencode"));
         candidates.push(home.join("AppData").join("Roaming").join("opencode"));
         candidates.push(home.join("AppData").join("Local").join("opencode"));
     }
     candidates.dedup();
     candidates
+}
+
+fn opencode_native_data_home() -> Vec<PathBuf> {
+    opencode_native_data_home_from(
+        env::var_os("XDG_DATA_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+        user_home_dir(),
+    )
 }
 
 fn opencode_data_home() -> Vec<PathBuf> {
@@ -6808,11 +7242,37 @@ fn opencode_data_home() -> Vec<PathBuf> {
     candidates
 }
 
-fn opencode_db_path() -> Option<PathBuf> {
-    opencode_data_home()
-        .into_iter()
-        .map(|path| path.join("opencode.db"))
+fn opencode_native_data_home_for_launch(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates
+        .iter()
         .find(|path| path.exists())
+        .cloned()
+        .or_else(|| candidates.first().cloned())
+}
+
+fn opencode_db_path_for_launch_roots(
+    active_profile_root: Option<PathBuf>,
+    native_data_homes: Vec<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(profile_root) = active_profile_root {
+        let selected_profile_db = profile_root.join("opencode").join("opencode.db");
+        return selected_profile_db.is_file().then_some(selected_profile_db);
+    }
+
+    let native_data_home = opencode_native_data_home_for_launch(&native_data_homes)?;
+    let native_db = native_data_home.join("opencode.db");
+    native_db.is_file().then_some(native_db)
+}
+
+fn opencode_db_path() -> Option<PathBuf> {
+    // A captured OpenCode profile is launched with XDG_DATA_HOME bound to the
+    // selected profile root. Resume validation must therefore stop at that
+    // root even when it has no database; falling through to the native store
+    // would report a session the launched process cannot see.
+    opencode_db_path_for_launch_roots(
+        agent_accounts_active_profile_dir("opencode").map(PathBuf::from),
+        opencode_native_data_home(),
+    )
 }
 
 fn opencode_timestamp(value: i64) -> String {
@@ -7208,12 +7668,20 @@ fn opencode_message_role(data: &Value) -> String {
 
 fn find_opencode_session(
     provider_session_id: &str,
-    _cwd: &str,
+    cwd: &str,
 ) -> Result<(String, String, String, String), String> {
     let db_path =
         opencode_db_path().ok_or_else(|| "Unable to locate OpenCode database.".to_string())?;
+    find_opencode_session_in_db(&db_path, provider_session_id, cwd)
+}
+
+fn find_opencode_session_in_db(
+    db_path: &Path,
+    provider_session_id: &str,
+    _cwd: &str,
+) -> Result<(String, String, String, String), String> {
     let connection =
-        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|error| {
                 format!(
                     "Unable to open OpenCode database {}: {error}",
@@ -7247,6 +7715,24 @@ fn find_opencode_session(
 
 fn resolve_opencode_resume_session(provider_session_id: &str, cwd: &str) -> Result<String, String> {
     let (session_id, _, session_cwd, _) = find_opencode_session(provider_session_id, cwd)?;
+    validate_opencode_resume_session(session_id, session_cwd, cwd)
+}
+
+fn resolve_opencode_resume_session_in_db(
+    db_path: &Path,
+    provider_session_id: &str,
+    cwd: &str,
+) -> Result<String, String> {
+    let (session_id, _, session_cwd, _) =
+        find_opencode_session_in_db(db_path, provider_session_id, cwd)?;
+    validate_opencode_resume_session(session_id, session_cwd, cwd)
+}
+
+fn validate_opencode_resume_session(
+    session_id: String,
+    session_cwd: String,
+    cwd: &str,
+) -> Result<String, String> {
     let session_id = clean_codex_id(session_id);
     if session_id.trim().is_empty() {
         return Err("OpenCode session row has no resumable session id.".to_string());
@@ -7349,7 +7835,22 @@ fn discover_claude_session_by_prompt(
     cwd: &str,
     max_messages: usize,
 ) -> Result<CodexThreadTranscriptResult, String> {
-    let files = collect_claude_candidate_files(cwd)?;
+    discover_claude_session_by_prompt_in_home(
+        expected_user_message,
+        cwd,
+        max_messages,
+        &claude_home_for_launch()
+            .ok_or_else(|| "Unable to locate Claude Code home.".to_string())?,
+    )
+}
+
+fn discover_claude_session_by_prompt_in_home(
+    expected_user_message: &str,
+    cwd: &str,
+    max_messages: usize,
+    home: &Path,
+) -> Result<CodexThreadTranscriptResult, String> {
+    let files = collect_claude_candidate_files_in_homes(cwd, &[home.to_path_buf()])?;
 
     for path in files {
         let Some(initial_meta) = claude_file_meta(&path) else {
@@ -7412,8 +7913,17 @@ fn discover_opencode_session_by_prompt(
 ) -> Result<CodexThreadTranscriptResult, String> {
     let db_path =
         opencode_db_path().ok_or_else(|| "Unable to locate OpenCode database.".to_string())?;
+    discover_opencode_session_by_prompt_in_db(expected_user_message, cwd, max_messages, &db_path)
+}
+
+fn discover_opencode_session_by_prompt_in_db(
+    expected_user_message: &str,
+    cwd: &str,
+    max_messages: usize,
+    db_path: &Path,
+) -> Result<CodexThreadTranscriptResult, String> {
     let connection =
-        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|error| {
                 format!(
                     "Unable to open OpenCode database {}: {error}",
@@ -7446,7 +7956,7 @@ fn discover_opencode_session_by_prompt(
             continue;
         }
         let Ok((parsed_meta, messages)) =
-            parse_opencode_session(&session_id, &title, &session_cwd, max_messages)
+            parse_opencode_session_in_db(db_path, &session_id, &title, &session_cwd, max_messages)
         else {
             continue;
         };
@@ -7480,8 +7990,18 @@ fn parse_opencode_session(
 ) -> Result<(CodexRolloutMeta, Vec<CodexThreadTranscriptMessage>), String> {
     let db_path =
         opencode_db_path().ok_or_else(|| "Unable to locate OpenCode database.".to_string())?;
+    parse_opencode_session_in_db(&db_path, session_id, _title, cwd, max_messages)
+}
+
+fn parse_opencode_session_in_db(
+    db_path: &Path,
+    session_id: &str,
+    _title: &str,
+    cwd: &str,
+    max_messages: usize,
+) -> Result<(CodexRolloutMeta, Vec<CodexThreadTranscriptMessage>), String> {
     let connection =
-        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|error| {
                 format!(
                     "Unable to open OpenCode database {}: {error}",

@@ -1466,12 +1466,7 @@ fn agent_accounts_persist_opencode_identity(home: &Path, identity: &str) -> bool
 /// Canonical OpenCode data home (where auth.json + opencode.db live). Prefers an
 /// existing candidate, else the first by OpenCode's own resolution order.
 fn agent_accounts_opencode_default_home() -> Option<PathBuf> {
-    let candidates = opencode_native_data_home();
-    candidates
-        .iter()
-        .find(|path| path.exists())
-        .cloned()
-        .or_else(|| candidates.into_iter().next())
+    opencode_native_data_home_for_launch(&opencode_native_data_home())
 }
 
 static AGENT_ACCOUNTS_REGISTRY_LAST_GOOD: OnceLock<StdMutex<Option<Value>>> = OnceLock::new();
@@ -2361,7 +2356,7 @@ fn agent_accounts_auth_revision_for_profile(
         };
         state_path
             .as_deref()
-            .and_then(agent_accounts_auth_file_signature)
+            .and_then(agent_accounts_claude_identity_state_signature)
             .unwrap_or_default()
     } else {
         String::new()
@@ -2372,6 +2367,17 @@ fn agent_accounts_auth_revision_for_profile(
     cloud_mcp_short_hash(&format!(
         "{kind}:{profile_id}:{auth_signature}:{provider_state_signature}"
     ))
+}
+
+fn agent_accounts_claude_identity_state_signature(path: &Path) -> Option<String> {
+    let snapshot = agent_accounts_read_stable_file(path)?;
+    let mut value = serde_json::from_slice::<Value>(&snapshot.bytes).ok()?;
+    // Workspace onboarding/trust is launch policy, not authentication.
+    // Excluding it keeps a launch from invalidating its own captured auth
+    // revision when preflight adds the final cwd to `projects`.
+    value.as_object_mut()?.remove("projects");
+    let normalized = serde_json::to_vec(&value).ok()?;
+    Some(cloud_mcp_short_hash(&String::from_utf8_lossy(&normalized)))
 }
 
 fn agent_accounts_auth_issue_is_current(
@@ -2668,123 +2674,176 @@ pub(crate) fn agent_accounts_codex_home_for_launch() -> Option<PathBuf> {
     agent_accounts_default_profile_home_for_launch("codex")
 }
 
-fn agent_accounts_bind_opencode_env(env_vars: &mut Vec<(String, String)>, xdg_root: &Path) {
-    env_vars.retain(|(key, _)| key != "OPENCODE_DATA_DIR" && key != "XDG_DATA_HOME");
-    env_vars.push((
-        "XDG_DATA_HOME".to_string(),
-        xdg_root.to_string_lossy().to_string(),
-    ));
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AgentAccountsLaunchAccountBinding {
+    kind: &'static str,
+    profile_id: String,
+    profile_label: String,
+    auth_revision: String,
+    profile_home: Option<PathBuf>,
+    selected_profile_dir: Option<PathBuf>,
 }
 
-/// Spawn-time account binding: stamps the pane with the active profile and
-/// injects the CLI home override for non-default profiles. Called from
-/// `extend_terminal_activity_env_vars`, which every agent spawn/relaunch
-/// path funnels through — switching never needs an app restart because the
-/// account is resolved fresh at each spawn.
-pub(crate) fn agent_accounts_apply_spawn_env(
-    env_vars: &mut Vec<(String, String)>,
+fn agent_accounts_capture_launch_account_binding(
+    provider_id: &str,
+) -> Option<AgentAccountsLaunchAccountBinding> {
+    let kind = agent_accounts_supported_kind(provider_id)?;
+    for _ in 0..3 {
+        let before_registry = agent_accounts_registry_read();
+        let (before_active_profile_id, _) = agent_accounts_kind_entry(&before_registry, kind);
+        let (profile_id, profile_label) = agent_accounts_launch_profile_label(kind);
+        let registry = agent_accounts_registry_read();
+        let (active_profile_id, _) = agent_accounts_kind_entry(&registry, kind);
+        // A concurrent account switch can land between the launch-label read
+        // and the registry snapshot. Retry instead of ever combining A's
+        // identity with B's filesystem root.
+        if before_active_profile_id != active_profile_id
+            || (active_profile_id != AGENT_ACCOUNTS_DEFAULT_PROFILE_ID
+                && active_profile_id != profile_id)
+        {
+            continue;
+        }
+        let profile = agent_accounts_profile_for_id(&registry, kind, &profile_id);
+        let profile_home = profile
+            .as_ref()
+            .and_then(agent_accounts_profile_dir)
+            .filter(|path| agent_accounts_profile_auth_path(kind, path).is_file());
+        // A selected/captured profile whose auth store disappeared must not
+        // silently fall through to the mutable provider-native store. The
+        // caller will fail this launch (or recapture at a later boundary)
+        // instead of running one account and stamping another.
+        if profile_id != AGENT_ACCOUNTS_DEFAULT_PROFILE_ID && profile_home.is_none() {
+            continue;
+        }
+        // The Default selector can resolve to a captured effective profile.
+        // In that case the captured profile root, not the mutable native
+        // OpenCode XDG store, is the launch authority. Key this decision from
+        // the effective profile id returned above rather than from the raw
+        // registry selector.
+        let selected_profile_dir = (profile_id != AGENT_ACCOUNTS_DEFAULT_PROFILE_ID)
+            .then(|| profile_home.clone())
+            .flatten();
+        // Keep the identity revision aligned with the migrated auth file that
+        // the captured OpenCode launch root will expose.
+        if kind == "opencode" {
+            if let Some(dir) = selected_profile_dir.as_deref() {
+                let _ = agent_accounts_migrate_opencode_profile_layout(dir);
+            }
+        }
+        let auth_revision =
+            agent_accounts_auth_revision_for_profile(kind, &profile_id, profile.as_ref());
+        return Some(AgentAccountsLaunchAccountBinding {
+            kind,
+            profile_id,
+            profile_label,
+            auth_revision,
+            profile_home,
+            selected_profile_dir,
+        });
+    }
+
+    // Do not let sustained account churn degrade a fresh spawn into an
+    // unstamped, inherited native environment. Take one final registry
+    // snapshot and bind every launch field to the account selected in that
+    // snapshot. A later switch may make this pane stale (and restartable), but
+    // cannot split its process environment from its recorded pane identity.
+    let registry = agent_accounts_registry_read();
+    let (profile_id, profiles) = agent_accounts_kind_entry(&registry, kind);
+    let profile = profiles.iter().find(|profile| {
+        agent_accounts_profile_id(profile).as_deref() == Some(profile_id.as_str())
+    });
+    let profile_label = if profile_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
+        "Default".to_string()
+    } else {
+        profile
+            .map(agent_accounts_profile_display_label)
+            .unwrap_or_else(|| "Account".to_string())
+    };
+    let profile_home = profile
+        .and_then(agent_accounts_profile_dir)
+        .filter(|path| agent_accounts_profile_auth_path(kind, path).is_file());
+    if profile_id != AGENT_ACCOUNTS_DEFAULT_PROFILE_ID && profile_home.is_none() {
+        return None;
+    }
+    let selected_profile_dir = (profile_id != AGENT_ACCOUNTS_DEFAULT_PROFILE_ID)
+        .then(|| profile_home.clone())
+        .flatten();
+    if kind == "opencode" {
+        if let Some(dir) = selected_profile_dir.as_deref() {
+            let _ = agent_accounts_migrate_opencode_profile_layout(dir);
+        }
+    }
+    let auth_revision = agent_accounts_auth_revision_for_profile(kind, &profile_id, profile);
+    Some(AgentAccountsLaunchAccountBinding {
+        kind,
+        profile_id,
+        profile_label,
+        auth_revision,
+        profile_home,
+        selected_profile_dir,
+    })
+}
+
+fn agent_accounts_stamp_spawn(
     pane_id: &str,
+    instance_id: Option<u64>,
+    launch_epoch: Option<&str>,
+    workspace_id: Option<&str>,
+    workspace_label: Option<&str>,
+    terminal_index: Option<u16>,
+    account_binding: &AgentAccountsLaunchAccountBinding,
+    workspace_trust: Option<&Value>,
+) {
+    let kind = account_binding.kind;
+    let registry = AGENT_ACCOUNTS_PANE_PROFILES.get_or_init(|| StdMutex::new(HashMap::new()));
+    if let Ok(mut map) = registry.lock() {
+        if map.len() > 400 {
+            map.clear();
+        }
+        map.insert(
+            pane_id.to_string(),
+            json!({
+                "kind": kind,
+                "profile_id": account_binding.profile_id,
+                "profile_label": account_binding.profile_label,
+                "auth_revision": account_binding.auth_revision,
+                "instance_id": instance_id,
+                "launch_epoch": launch_epoch.unwrap_or_default(),
+                "workspace_id": workspace_id.unwrap_or_default(),
+                "workspace_label": workspace_label.unwrap_or_default(),
+                "terminal_index": terminal_index,
+                "workspace_trust_state": workspace_trust.as_ref().and_then(|value| value.get("state")).cloned().unwrap_or_else(|| json!("unknown")),
+                "workspace_trust_source": workspace_trust.as_ref().and_then(|value| value.get("source")).cloned().unwrap_or_else(|| json!("provider_native_state")),
+                "stamped_at_ms": todo_dispatch_now_ms(),
+            }),
+        );
+    }
+}
+
+fn agent_accounts_stamp_captured_spawn(
+    pane_id: &str,
+    instance_id: Option<u64>,
+    launch_epoch: Option<&str>,
     provider_id: &str,
     workspace_id: Option<&str>,
     workspace_label: Option<&str>,
     terminal_index: Option<u16>,
+    account_binding: &AgentAccountsLaunchAccountBinding,
+    workspace_trust: Option<&Value>,
 ) {
-    let Some(kind) = agent_accounts_supported_kind(provider_id) else {
+    if agent_accounts_supported_kind(provider_id) != Some(account_binding.kind) {
         return;
-    };
-    // Migrate before computing the launch revision. Otherwise the first
-    // post-upgrade OpenCode pane can be stamped with an empty legacy-path
-    // revision and immediately appear stale after the migration below.
-    if kind == "opencode" {
-        if let Some(dir) = agent_accounts_active_profile_dir(kind) {
-            let _ = agent_accounts_migrate_opencode_profile_layout(Path::new(&dir));
-        }
     }
-    let (active_id, active_label) = agent_accounts_launch_profile_label(kind);
-    let auth_revision = agent_accounts_active_auth_revision(kind);
-    let workspace_trust = if kind == "claude" {
-        // Claude trust must wait until the actual interactive launch boundary:
-        // only then are the final CLAUDE_CONFIG_DIR/HOME and canonical PTY cwd
-        // known. In particular, this function also runs while preparing warm
-        // shells, which must never pre-trust a directory on their own.
-        Some(json!({
-            "state": "pending",
-            "source": "interactive_launch_preflight",
-        }))
-    } else {
-        env_vars
-            .iter()
-            .find_map(|(key, value)| {
-                matches!(
-                    key.as_str(),
-                    "COORDINATION_REPO_PATH" | "DIFFFORGE_WORKSPACE_ROOT"
-                )
-                .then_some(value.as_str())
-            })
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|workspace_root| {
-                // PTY output is intentionally never inspected to infer or resolve trust.
-                agent_accounts_reconcile_workspace_trust_for(kind, Path::new(workspace_root))
-                    .unwrap_or_else(|error| json!({ "state": "failed", "message": error, "source": "provider_native_state" }))
-            })
-    };
-    {
-        let registry = AGENT_ACCOUNTS_PANE_PROFILES.get_or_init(|| StdMutex::new(HashMap::new()));
-        if let Ok(mut map) = registry.lock() {
-            if map.len() > 400 {
-                map.clear();
-            }
-            map.insert(
-                pane_id.to_string(),
-                json!({
-                    "kind": kind,
-                    "profile_id": active_id,
-                    "profile_label": active_label,
-                    "auth_revision": auth_revision,
-                    "workspace_id": workspace_id.unwrap_or_default(),
-                    "workspace_label": workspace_label.unwrap_or_default(),
-                    "terminal_index": terminal_index,
-                    "workspace_trust_state": workspace_trust.as_ref().and_then(|value| value.get("state")).cloned().unwrap_or_else(|| json!("unknown")),
-                    "workspace_trust_source": workspace_trust.as_ref().and_then(|value| value.get("source")).cloned().unwrap_or_else(|| json!("provider_native_state")),
-                    "stamped_at_ms": todo_dispatch_now_ms(),
-                }),
-            );
-        }
-    }
-    match kind {
-        "claude" => {
-            let Some(dir) = agent_accounts_profile_home_for_launch(kind) else {
-                return;
-            };
-            env_vars.retain(|(key, _)| key != "CLAUDE_CONFIG_DIR");
-            env_vars.push((
-                "CLAUDE_CONFIG_DIR".to_string(),
-                dir.to_string_lossy().to_string(),
-            ));
-        }
-        "opencode" => {
-            let Some(dir) = agent_accounts_active_profile_dir(kind) else {
-                return;
-            };
-            let dir = PathBuf::from(dir);
-            let _ = agent_accounts_migrate_opencode_profile_layout(&dir);
-            agent_accounts_bind_opencode_env(env_vars, &dir);
-        }
-        _ => {
-            let Some(dir) = agent_accounts_codex_home_for_launch() else {
-                return;
-            };
-            let dir = dir.to_string_lossy().to_string();
-            // Coordinated Codex panes already run a Diff Forge managed
-            // CODEX_HOME (hook profiles live there); their auth re-links from
-            // the active profile via the kernel's auth bridge instead.
-            let managed = env_vars.iter().any(|(key, _)| key == "CODEX_HOME");
-            if !managed {
-                env_vars.push(("CODEX_HOME".to_string(), dir));
-            }
-        }
-    }
+    agent_accounts_stamp_spawn(
+        pane_id,
+        instance_id,
+        launch_epoch,
+        workspace_id,
+        workspace_label,
+        terminal_index,
+        account_binding,
+        workspace_trust,
+    );
 }
 
 // ---- Automatic account capture --------------------------------------------
@@ -6771,15 +6830,32 @@ fn agent_accounts_ensure_codex_file_auth_store(home: &Path) -> Result<(), String
     Ok(())
 }
 
-fn agent_accounts_reconcile_workspace_trust_for(
-    kind: &'static str,
-    workspace_root: &Path,
-) -> Result<Value, String> {
+fn agent_accounts_workspace_trust_root(workspace_root: &Path) -> Result<PathBuf, String> {
     let workspace_root =
         fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
     if !workspace_root.is_dir() {
         return Err("Workspace trust requires an existing project directory.".to_string());
     }
+    Ok(workspace_root)
+}
+
+fn agent_accounts_claude_state_path_for_home(profile_home: &Path) -> PathBuf {
+    if profile_home.file_name().and_then(|value| value.to_str()) == Some(".claude") {
+        profile_home
+            .parent()
+            .unwrap_or(profile_home)
+            .join(".claude.json")
+    } else {
+        profile_home.join(".claude.json")
+    }
+}
+
+fn agent_accounts_reconcile_workspace_trust_in_home(
+    kind: &'static str,
+    provider_home: Option<&Path>,
+    workspace_root: &Path,
+) -> Result<Value, String> {
+    let workspace_root = agent_accounts_workspace_trust_root(workspace_root)?;
     match kind {
         "opencode" => Ok(json!({
             "contract": "diffforge.provider_workspace_trust.v1",
@@ -6789,17 +6865,10 @@ fn agent_accounts_reconcile_workspace_trust_for(
             "source": "provider_native_state",
         })),
         "claude" => {
-            let profile_home = agent_accounts_active_home_for_kind(kind)
-                .ok_or_else(|| "Unable to resolve the active Claude profile home.".to_string())?;
-            let state_path =
-                if profile_home.file_name().and_then(|value| value.to_str()) == Some(".claude") {
-                    profile_home
-                        .parent()
-                        .unwrap_or(&profile_home)
-                        .join(".claude.json")
-                } else {
-                    profile_home.join(".claude.json")
-                };
+            let profile_home = provider_home.ok_or_else(|| {
+                "Unable to resolve the frozen Claude profile home.".to_string()
+            })?;
+            let state_path = agent_accounts_claude_state_path_for_home(profile_home);
             let key = workspace_root.to_string_lossy().to_string();
             let outcome = ensure_claude_workspace_trust_in_config(&state_path, &workspace_root)?;
             if outcome == ClaudeWorkspaceTrustMergeOutcome::SkippedInvalidConfig {
@@ -6821,29 +6890,17 @@ fn agent_accounts_reconcile_workspace_trust_for(
             }))
         }
         _ => {
-            let mut homes = Vec::new();
-            if let Some(home) = agent_accounts_active_home_for_kind("codex") {
-                homes.push(home);
-            }
-            if let Some(home) = agent_accounts_default_home("codex") {
-                if !homes.contains(&home) {
-                    homes.push(home);
-                }
-            }
-            if homes.is_empty() {
-                return Err("Unable to resolve the active Codex home.".to_string());
-            }
-            for home in homes {
-                let path = home.join("config.toml");
-                let current = fs::read_to_string(&path).unwrap_or_default();
-                let next = agent_accounts_upsert_codex_trust(&current, &workspace_root);
-                if next != current {
-                    agent_accounts_write_private_file_atomic(
-                        &path,
-                        next.as_bytes(),
-                        "Codex workspace trust",
-                    )?;
-                }
+            let home = provider_home
+                .ok_or_else(|| "Unable to resolve the frozen Codex home.".to_string())?;
+            let path = home.join("config.toml");
+            let current = fs::read_to_string(&path).unwrap_or_default();
+            let next = agent_accounts_upsert_codex_trust(&current, &workspace_root);
+            if next != current {
+                agent_accounts_write_private_file_atomic(
+                    &path,
+                    next.as_bytes(),
+                    "Codex workspace trust",
+                )?;
             }
             Ok(json!({
                 "contract": "diffforge.provider_workspace_trust.v1",
@@ -6854,6 +6911,107 @@ fn agent_accounts_reconcile_workspace_trust_for(
             }))
         }
     }
+}
+
+fn agent_accounts_launch_env_home<'a>(
+    env_vars: &'a [(String, String)],
+    key: &str,
+) -> Option<&'a Path> {
+    env_vars
+        .iter()
+        .rev()
+        .find_map(|(candidate, value)| {
+            (candidate == key)
+                .then_some(value.trim())
+                .filter(|value| !value.is_empty())
+        })
+        .map(Path::new)
+}
+
+fn agent_accounts_reconcile_workspace_trust_for_launch(
+    account_binding: &AgentAccountsLaunchAccountBinding,
+    env_vars: &[(String, String)],
+    workspace_root: &Path,
+) -> Result<Value, String> {
+    let provider_home = match account_binding.kind {
+        "claude" => agent_accounts_launch_env_home(env_vars, "CLAUDE_CONFIG_DIR")
+            .or(account_binding.profile_home.as_deref())
+            .map(Path::to_path_buf),
+        "codex" => agent_accounts_launch_env_home(env_vars, "CODEX_HOME")
+            .or(account_binding.profile_home.as_deref())
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                (account_binding.profile_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID)
+                    .then(|| agent_accounts_default_home("codex"))
+                    .flatten()
+            }),
+        _ => account_binding.selected_profile_dir.clone(),
+    };
+    agent_accounts_reconcile_workspace_trust_in_home(
+        account_binding.kind,
+        provider_home.as_deref(),
+        workspace_root,
+    )
+}
+
+fn agent_accounts_launch_workspace_root(env_vars: &[(String, String)]) -> Option<&Path> {
+    // The final provider cwd is authoritative. Coordinated launches also
+    // carry COORDINATION_REPO_PATH, but their process may run in an isolated
+    // worktree; trusting only the repository would still prompt in that cwd.
+    ["DIFFFORGE_WORKSPACE_ROOT", "COORDINATION_REPO_PATH"]
+        .into_iter()
+        .find_map(|key| agent_accounts_launch_env_home(env_vars, key))
+}
+
+/// Resolve provider trust before the gateway/process is started, using only
+/// the already-frozen account home and final launch environment. The returned
+/// value is later committed verbatim into the pane stamp; stamping itself is
+/// intentionally side-effect free and happens only after a successful launch.
+fn agent_accounts_prepare_captured_spawn(
+    env_vars: &[(String, String)],
+    account_binding: &AgentAccountsLaunchAccountBinding,
+) -> Result<Option<Value>, String> {
+    let Some(workspace_root) = agent_accounts_launch_workspace_root(env_vars) else {
+        return Ok(None);
+    };
+    agent_accounts_reconcile_workspace_trust_for_launch(
+        account_binding,
+        env_vars,
+        workspace_root,
+    )
+    .map(Some)
+}
+
+fn agent_accounts_reconcile_workspace_trust_for(
+    kind: &'static str,
+    workspace_root: &Path,
+) -> Result<Value, String> {
+    if kind == "opencode" {
+        return agent_accounts_reconcile_workspace_trust_in_home(kind, None, workspace_root);
+    }
+
+    let mut homes = Vec::new();
+    if let Some(home) = agent_accounts_active_home_for_kind(kind) {
+        homes.push(home);
+    }
+    if let Some(home) = agent_accounts_default_home(kind) {
+        if !homes.contains(&home) {
+            homes.push(home);
+        }
+    }
+    if homes.is_empty() {
+        return Err(format!("Unable to resolve the active {kind} home."));
+    }
+
+    let mut result = None;
+    for home in homes {
+        result = Some(agent_accounts_reconcile_workspace_trust_in_home(
+            kind,
+            Some(&home),
+            workspace_root,
+        )?);
+    }
+    result.ok_or_else(|| format!("Unable to resolve the active {kind} home."))
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -8012,6 +8170,22 @@ fn agent_accounts_build_stale_inventory(
             // Closed panes can leave a bounded historical launch stamp behind;
             // the provider-wide restart inventory is live-terminal state only.
             let live = live_panes.get(pane_id)?;
+            let stamped_instance_id = stamp.get("instance_id").and_then(Value::as_u64);
+            let live_instance_id = live.get("instance_id").and_then(Value::as_u64)?;
+            if stamped_instance_id.is_some_and(|instance_id| instance_id != live_instance_id) {
+                return None;
+            }
+            let stamped_launch_epoch = stamp
+                .get("launch_epoch")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let live_launch_epoch = live
+                .get("launch_epoch")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())?;
+            if !stamped_launch_epoch.is_empty() && stamped_launch_epoch != live_launch_epoch {
+                return None;
+            }
             let open = live
                 .get("open")
                 .and_then(Value::as_bool)
@@ -8035,11 +8209,8 @@ fn agent_accounts_build_stale_inventory(
                 .get("terminal_index")
                 .and_then(Value::as_u64)
                 .or_else(|| stamp.get("terminal_index").and_then(Value::as_u64));
-            let instance_id = live.get("instance_id").and_then(Value::as_u64)?;
-            let launch_epoch = live
-                .get("launch_epoch")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())?;
+            let instance_id = live_instance_id;
+            let launch_epoch = live_launch_epoch;
             let restart_eligible = live
                 .get("restart_eligible")
                 .and_then(Value::as_bool)
@@ -8113,13 +8284,27 @@ async fn agent_accounts_pane_profiles_for_state(state: &TerminalState) -> Value 
                 .collect::<serde_json::Map<String, Value>>()
         })
         .unwrap_or_default();
-    let (claude_active, claude_label) = agent_accounts_launch_profile_label("claude");
-    let (codex_active, codex_label) = agent_accounts_launch_profile_label("codex");
-    let (opencode_active, opencode_label) = agent_accounts_launch_profile_label("opencode");
+    let active_identity = |kind| {
+        agent_accounts_capture_launch_account_binding(kind)
+            .map(|binding| {
+                json!({
+                    "profile_id": binding.profile_id,
+                    "profile_label": binding.profile_label,
+                    "auth_revision": binding.auth_revision,
+                })
+            })
+            .unwrap_or_else(|| {
+                json!({
+                    "profile_id": AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+                    "profile_label": "Default",
+                    "auth_revision": "",
+                })
+            })
+    };
     let active = json!({
-        "claude": { "profile_id": claude_active, "profile_label": claude_label, "auth_revision": agent_accounts_active_auth_revision("claude") },
-        "codex": { "profile_id": codex_active, "profile_label": codex_label, "auth_revision": agent_accounts_active_auth_revision("codex") },
-        "opencode": { "profile_id": opencode_active, "profile_label": opencode_label, "auth_revision": agent_accounts_active_auth_revision("opencode") },
+        "claude": active_identity("claude"),
+        "codex": active_identity("codex"),
+        "opencode": active_identity("opencode"),
     });
     let auth = json!({
         "claude": agent_accounts_kind_auth_statuses(&registry, "claude"),
@@ -8156,6 +8341,8 @@ async fn agent_accounts_pane_profiles_for_state(state: &TerminalState) -> Value 
                         "restart_intent_state": restart_intent.as_ref().map(|intent| intent.state.as_str()).unwrap_or("none"),
                         "restart_mode": restart_intent.as_ref().map(|intent| intent.mode.as_str()),
                         "restart_target_role": restart_intent.as_ref().map(|intent| intent.target_role.as_str()),
+                        "restart_fresh_session": restart_intent.as_ref().map(|intent| intent.fresh_session),
+                        "restart_provider_session_id": restart_intent.as_ref().and_then(|intent| intent.provider_session_id.as_deref()),
                         "restart_coordinator_id": restart_intent.as_ref().map(|intent| intent.coordinator_id.as_str()),
                         "restart_deadline_at_ms": restart_intent.as_ref().map(|intent| intent.deadline_at_ms),
                         "restart_force_action": restart_intent.as_ref().and_then(|intent| (intent.state == "blocked").then(|| terminal_restart_intent_force_action(intent))),
@@ -9331,7 +9518,12 @@ mod agent_accounts_tests {
             ("OPENCODE_DATA_DIR".to_string(), "legacy".to_string()),
             ("XDG_DATA_HOME".to_string(), "stale".to_string()),
         ];
-        agent_accounts_bind_opencode_env(&mut env_vars, &root);
+        TerminalProviderLaunchAccountBinding::OpenCode {
+            data_home: Some(root.clone()),
+            db_path: None,
+            account: None,
+        }
+        .apply_to_env(&mut env_vars);
         assert_eq!(
             env_vars,
             vec![(
@@ -10767,14 +10959,11 @@ mod agent_accounts_tests {
         let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data);
 
         let mut env_vars = Vec::new();
-        agent_accounts_apply_spawn_env(
-            &mut env_vars,
-            "pane-test-claude",
-            "claude",
-            Some("workspace-a"),
-            Some("Workspace A"),
-            Some(2),
-        );
+        let captured = TerminalProviderLaunchAccountBinding::capture(AgentProvider::Claude);
+        captured
+            .validate_frozen_account(AgentProvider::Claude, true)
+            .unwrap();
+        captured.apply_to_env(&mut env_vars);
         let launch_dir = env_vars
             .iter()
             .find_map(|(key, value)| (key == "CLAUDE_CONFIG_DIR").then(|| PathBuf::from(value)))
@@ -10790,29 +10979,826 @@ mod agent_accounts_tests {
             fs::read_to_string(launch_dir.join(".claude.json")).unwrap(),
             test_claude_state_for_email("dev@example.com")
         );
-        let expected_profile_id = launch_dir.file_name().and_then(|value| value.to_str());
-        let panes = AGENT_ACCOUNTS_PANE_PROFILES
+        stamp_terminal_launch_account(
+            "pane-test-claude",
+            1,
+            "pane-test-claude:1",
+            "claude",
+            Some("workspace-a"),
+            Some(2),
+            &captured,
+            None,
+        );
+        let stamp = agent_accounts_pane_profile_stamp("pane-test-claude").unwrap();
+        assert_eq!(
+            stamp["profile_id"].as_str(),
+            launch_dir.file_name().and_then(|value| value.to_str())
+        );
+        if let Ok(mut panes) = AGENT_ACCOUNTS_PANE_PROFILES
             .get_or_init(|| StdMutex::new(HashMap::new()))
             .lock()
-            .unwrap();
-        assert_eq!(
-            panes["pane-test-claude"]["profile_id"].as_str(),
-            expected_profile_id
-        );
+        {
+            panes.remove("pane-test-claude");
+        }
     }
 
     #[test]
-    fn spawn_env_skips_unsupported_providers() {
+    fn claude_frozen_launch_keeps_env_trust_stamp_and_inventory_on_account_a() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_claude_frozen_launch_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let data = root.join("data");
+        let workspace = root.join("workspace");
+        let profile_a = root.join("profile-a");
+        let profile_b = root.join("profile-b");
+        for profile in [&profile_a, &profile_b] {
+            fs::create_dir_all(profile).unwrap();
+            fs::write(profile.join(".credentials.json"), "{\"token\":\"ready\"}").unwrap();
+        }
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(
+            profile_a.join(".claude.json"),
+            test_claude_state_for_email("a@example.test"),
+        )
+        .unwrap();
+        fs::write(
+            profile_b.join(".claude.json"),
+            test_claude_state_for_email("b@example.test"),
+        )
+        .unwrap();
+        let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data);
+        let registry_for = |active_profile_id: &str| {
+            json!({
+                "agents": {
+                    "claude": {
+                        "active_profile_id": active_profile_id,
+                        "profiles": [
+                            { "id": "account-a", "label": "Account A", "dir": profile_a.to_string_lossy() },
+                            { "id": "account-b", "label": "Account B", "dir": profile_b.to_string_lossy() }
+                        ]
+                    }
+                }
+            })
+        };
+        agent_accounts_registry_write(&registry_for("account-a")).unwrap();
+        let captured = TerminalProviderLaunchAccountBinding::capture(AgentProvider::Claude);
+        agent_accounts_registry_write(&registry_for("account-b")).unwrap();
+
+        let pane_id = format!("pane-claude-frozen-{}", uuid::Uuid::new_v4());
         let mut env_vars = Vec::new();
-        agent_accounts_apply_spawn_env(
+        extend_terminal_activity_env_vars(
             &mut env_vars,
-            "pane-test-unsupported",
-            "generic",
+            Some(&workspace),
+            &pane_id,
+            71,
+            Some("workspace-a"),
+            Some(1),
+            "claude",
             None,
-            None,
-            None,
+            Some(&captured),
+        )
+        .unwrap();
+        let workspace_trust =
+            prepare_terminal_launch_account(&env_vars, "claude", &captured).unwrap();
+        stamp_terminal_launch_account(
+            &pane_id,
+            71,
+            "pane-claude-frozen:71",
+            "claude",
+            Some("workspace-a"),
+            Some(1),
+            &captured,
+            workspace_trust.as_ref(),
         );
-        assert!(env_vars.is_empty());
+
+        assert_eq!(
+            env_vars.iter().find_map(|(key, value)| {
+                (key == "CLAUDE_CONFIG_DIR").then_some(value.as_str())
+            }),
+            Some(profile_a.to_string_lossy().as_ref())
+        );
+        let trusted_a = serde_json::from_slice::<Value>(
+            &fs::read(profile_a.join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        let workspace_key = fs::canonicalize(&workspace)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(
+            trusted_a["projects"][&workspace_key]["hasTrustDialogAccepted"],
+            json!(true)
+        );
+        let untouched_b = serde_json::from_slice::<Value>(
+            &fs::read(profile_b.join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(untouched_b["projects"].get(&workspace_key).is_none());
+
+        let stamp = agent_accounts_pane_profile_stamp(&pane_id).expect("Claude pane stamp");
+        assert_eq!(stamp["profile_id"], json!("account-a"));
+        assert_eq!(stamp["workspace_trust_state"], json!("resolved"));
+        let active_b = agent_accounts_capture_launch_account_binding("claude").unwrap();
+        let inventory = agent_accounts_build_stale_inventory(
+            &[(pane_id.clone(), stamp)]
+                .into_iter()
+                .collect::<serde_json::Map<String, Value>>(),
+            &json!({
+                "claude": {
+                    "profile_id": active_b.profile_id,
+                    "profile_label": active_b.profile_label,
+                    "auth_revision": active_b.auth_revision,
+                }
+            }),
+            &[(
+                pane_id.clone(),
+                json!({
+                    "instance_id": 71,
+                    "launch_epoch": "pane-claude-frozen:71",
+                    "workspace_id": "workspace-a",
+                    "workspace_label": "Workspace A",
+                    "terminal_index": 1,
+                    "activity": "idle",
+                    "open": true,
+                    "restart_eligible": true,
+                }),
+            )]
+            .into_iter()
+            .collect::<HashMap<_, _>>(),
+        );
+        assert_eq!(inventory[0]["stamped_profile_id"], json!("account-a"));
+        assert_eq!(inventory[0]["target_profile_id"], json!("account-b"));
+        assert_eq!(
+            agent_accounts_device_live_state_payload(inventory)
+                ["stale_terminal_inventory"][0]["stamped_profile_id"],
+            json!("account-a")
+        );
+
+        if let Ok(mut panes) = AGENT_ACCOUNTS_PANE_PROFILES
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+        {
+            panes.remove(&pane_id);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_workspace_trust_does_not_change_the_frozen_auth_revision() {
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_claude_trust_revision_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let profile = root.join("profile");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&profile).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(profile.join(".credentials.json"), r#"{"token":"account-a"}"#).unwrap();
+        fs::write(
+            profile.join(".claude.json"),
+            test_claude_state_for_email("a@example.test"),
+        )
+        .unwrap();
+        let profile_value = json!({
+            "id": "account-a",
+            "label": "Account A",
+            "dir": profile.to_string_lossy(),
+        });
+        let before =
+            agent_accounts_auth_revision_for_profile("claude", "account-a", Some(&profile_value));
+
+        agent_accounts_reconcile_workspace_trust_in_home(
+            "claude",
+            Some(&profile),
+            &workspace,
+        )
+        .unwrap();
+        let after =
+            agent_accounts_auth_revision_for_profile("claude", "account-a", Some(&profile_value));
+
+        assert!(!before.is_empty());
+        assert_eq!(after, before);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_inventory_never_joins_a_stamp_to_a_replacement_instance() {
+        let pane_id = "pane-reused-after-account-switch".to_string();
+        let panes = [(pane_id.clone(), json!({
+            "kind": "codex",
+            "profile_id": "account-a",
+            "profile_label": "Account A",
+            "auth_revision": "revision-a",
+            "instance_id": 41,
+            "launch_epoch": "pane-reused-after-account-switch:41",
+        }))]
+        .into_iter()
+        .collect::<serde_json::Map<String, Value>>();
+        let active = json!({
+            "codex": {
+                "profile_id": "account-b",
+                "profile_label": "Account B",
+                "auth_revision": "revision-b",
+            }
+        });
+        let replacement = [(pane_id.clone(), json!({
+            "instance_id": 42,
+            "launch_epoch": "pane-reused-after-account-switch:42",
+            "workspace_id": "workspace-a",
+            "terminal_index": 0,
+            "activity": "idle",
+            "open": true,
+        }))]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        assert!(agent_accounts_build_stale_inventory(&panes, &active, &replacement).is_empty());
+        let original = [(pane_id, json!({
+            "instance_id": 41,
+            "launch_epoch": "pane-reused-after-account-switch:41",
+            "workspace_id": "workspace-a",
+            "terminal_index": 0,
+            "activity": "idle",
+            "open": true,
+        }))]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+        let inventory = agent_accounts_build_stale_inventory(&panes, &active, &original);
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0]["stamped_profile_id"], json!("account-a"));
+    }
+
+    #[test]
+    fn opencode_effective_default_launch_uses_captured_xdg_after_native_auth_changes() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_opencode_effective_default_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let data = root.join("data");
+        let xdg_root = root.join("native-xdg");
+        let native_store = xdg_root.join("opencode");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&native_store).unwrap();
+        let auth_a = r#"{"provider":{"type":"oauth","access":"access-a","refresh":"refresh-a","accountId":"account-a"}}"#;
+        let auth_b = r#"{"provider":{"type":"oauth","access":"access-b","refresh":"refresh-b","accountId":"account-b"}}"#;
+        fs::write(native_store.join("auth.json"), auth_a).unwrap();
+        let _home_env = ScopedAgentAccountsEnv::set("HOME", &home);
+        let _xdg_env = ScopedAgentAccountsEnv::set("XDG_DATA_HOME", &xdg_root);
+        let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data);
+
+        let captured = TerminalProviderLaunchAccountBinding::capture(AgentProvider::OpenCode);
+        let account = captured.captured_account().expect("captured effective default");
+        assert_ne!(account.profile_id, AGENT_ACCOUNTS_DEFAULT_PROFILE_ID);
+        let captured_root = account
+            .selected_profile_dir
+            .as_ref()
+            .expect("captured OpenCode XDG root")
+            .clone();
+        assert_ne!(captured_root, xdg_root);
+        assert_eq!(
+            fs::read_to_string(captured_root.join("opencode/auth.json")).unwrap(),
+            auth_a
+        );
+
+        fs::write(native_store.join("auth.json"), auth_b).unwrap();
+        let mut env_vars = Vec::new();
+        captured.apply_to_env(&mut env_vars);
+        assert_eq!(
+            env_vars.iter().find_map(|(key, value)| {
+                (key == "XDG_DATA_HOME").then_some(value.as_str())
+            }),
+            Some(captured_root.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            fs::read_to_string(captured_root.join("opencode/auth.json")).unwrap(),
+            auth_a,
+            "the frozen store must not follow the rewritten native auth.json"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_workspace_trust_uses_frozen_home_after_active_account_switch() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_codex_frozen_trust_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let data = root.join("data");
+        let workspace = root.join("workspace");
+        let profile_a = root.join("profile-a");
+        let profile_b = root.join("profile-b");
+        for profile in [&profile_a, &profile_b] {
+            fs::create_dir_all(profile).unwrap();
+            fs::write(profile.join("config.toml"), "# account config\n").unwrap();
+        }
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(
+            profile_a.join("auth.json"),
+            test_codex_auth_for_account("a@example.test", "account-a", "refresh-a"),
+        )
+        .unwrap();
+        fs::write(
+            profile_b.join("auth.json"),
+            test_codex_auth_for_account("b@example.test", "account-b", "refresh-b"),
+        )
+        .unwrap();
+        let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data);
+        let registry_for = |active_profile_id: &str| {
+            json!({
+                "agents": {
+                    "codex": {
+                        "active_profile_id": active_profile_id,
+                        "profiles": [
+                            { "id": "account-a", "label": "Account A", "dir": profile_a.to_string_lossy() },
+                            { "id": "account-b", "label": "Account B", "dir": profile_b.to_string_lossy() }
+                        ]
+                    }
+                }
+            })
+        };
+        agent_accounts_registry_write(&registry_for("account-a")).unwrap();
+        let captured = TerminalProviderLaunchAccountBinding::capture(AgentProvider::Codex);
+        agent_accounts_registry_write(&registry_for("account-b")).unwrap();
+
+        let pane_id = format!("pane-codex-frozen-trust-{}", uuid::Uuid::new_v4());
+        let mut env_vars = Vec::new();
+        extend_terminal_activity_env_vars(
+            &mut env_vars,
+            Some(&workspace),
+            &pane_id,
+            81,
+            Some("workspace-a"),
+            Some(2),
+            "codex",
+            None,
+            Some(&captured),
+        )
+        .unwrap();
+        let workspace_trust =
+            prepare_terminal_launch_account(&env_vars, "codex", &captured).unwrap();
+        stamp_terminal_launch_account(
+            &pane_id,
+            81,
+            "pane-codex-frozen-trust:81",
+            "codex",
+            Some("workspace-a"),
+            Some(2),
+            &captured,
+            workspace_trust.as_ref(),
+        );
+
+        let canonical_workspace = fs::canonicalize(&workspace).unwrap();
+        let config_a = fs::read_to_string(profile_a.join("config.toml")).unwrap();
+        let config_b = fs::read_to_string(profile_b.join("config.toml")).unwrap();
+        assert!(config_a.contains(&canonical_workspace.to_string_lossy().to_string()));
+        assert_eq!(config_b, "# account config\n");
+        let stamp = agent_accounts_pane_profile_stamp(&pane_id).unwrap();
+        assert_eq!(stamp["profile_id"], json!("account-a"));
+        assert_eq!(stamp["workspace_trust_state"], json!("resolved"));
+
+        if let Ok(mut panes) = AGENT_ACCOUNTS_PANE_PROFILES
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+        {
+            panes.remove(&pane_id);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn launch_account_capture_rejects_unsupported_providers() {
+        assert!(agent_accounts_capture_launch_account_binding("generic").is_none());
+    }
+
+    #[test]
+    fn captured_resume_account_survives_switch_before_spawn_everywhere() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_captured_resume_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let data = root.join("data");
+        let workspace = root.join("workspace");
+        let profile_a = root.join("profile-a");
+        let profile_b = root.join("profile-b");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(profile_a.join("opencode")).unwrap();
+        fs::create_dir_all(profile_b.join("opencode")).unwrap();
+        fs::write(
+            profile_a.join("opencode").join("auth.json"),
+            r#"{"provider":{"type":"oauth","accountId":"account-a"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            profile_b.join("opencode").join("auth.json"),
+            r#"{"provider":{"type":"oauth","accountId":"account-b"}}"#,
+        )
+        .unwrap();
+        let session_id = "ses_captured_account_a_12345678";
+        let db_path = profile_a.join("opencode").join("opencode.db");
+        {
+            let connection = rusqlite::Connection::open(&db_path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE session (
+                        id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        directory TEXT NOT NULL,
+                        time_updated INTEGER NOT NULL
+                    );",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO session (id, title, directory, time_updated) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        session_id,
+                        "Captured account A session",
+                        workspace.to_string_lossy().to_string(),
+                        100i64,
+                    ],
+                )
+                .unwrap();
+        }
+
+        let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data);
+        let registry_for = |active_profile_id: &str| {
+            json!({
+                "agents": {
+                    "opencode": {
+                        "active_profile_id": active_profile_id,
+                        "profiles": [
+                            {
+                                "id": "account-a",
+                                "label": "Account A",
+                                "dir": profile_a.to_string_lossy(),
+                            },
+                            {
+                                "id": "account-b",
+                                "label": "Account B",
+                                "dir": profile_b.to_string_lossy(),
+                            }
+                        ]
+                    }
+                }
+            })
+        };
+        agent_accounts_registry_write(&registry_for("account-a")).unwrap();
+
+        let captured = TerminalProviderLaunchAccountBinding::capture(AgentProvider::OpenCode);
+        let (resolved_session_id, _) = terminal_resolve_provider_resume_session_for_binding(
+            AgentProvider::OpenCode,
+            Some(session_id.to_string()),
+            workspace.to_string_lossy().as_ref(),
+            &captured,
+        );
+        assert_eq!(resolved_session_id.as_deref(), Some(session_id));
+        let captured_revision = captured
+            .captured_account()
+            .expect("captured OpenCode account")
+            .auth_revision
+            .clone();
+
+        // This is the race boundary from the regression: resolution completed
+        // under A, then the process-global active account changed to B before
+        // the activity env and pane inventory were stamped.
+        agent_accounts_registry_write(&registry_for("account-b")).unwrap();
+        assert_eq!(
+            agent_accounts_capture_launch_account_binding("opencode")
+                .expect("current OpenCode account")
+                .profile_id,
+            "account-b"
+        );
+
+        let pane_id = format!("pane-captured-account-{}", uuid::Uuid::new_v4());
+        let mut env_vars = vec![(
+            "XDG_DATA_HOME".to_string(),
+            profile_b.to_string_lossy().to_string(),
+        )];
+        extend_terminal_activity_env_vars(
+            &mut env_vars,
+            Some(&workspace),
+            &pane_id,
+            42,
+            Some("workspace-a"),
+            Some(3),
+            "opencode",
+            None,
+            Some(&captured),
+        )
+        .unwrap();
+        let workspace_trust =
+            prepare_terminal_launch_account(&env_vars, "opencode", &captured).unwrap();
+        stamp_terminal_launch_account(
+            &pane_id,
+            42,
+            "captured-account-a:42",
+            "opencode",
+            Some("workspace-a"),
+            Some(3),
+            &captured,
+            workspace_trust.as_ref(),
+        );
+        assert_eq!(
+            env_vars
+                .iter()
+                .find_map(|(key, value)| (key == "XDG_DATA_HOME").then_some(value.as_str())),
+            Some(profile_a.to_string_lossy().as_ref()),
+            "the process env must remain bound to captured account A"
+        );
+
+        let stamp = agent_accounts_pane_profile_stamp(&pane_id).expect("pane account stamp");
+        assert_eq!(stamp["profile_id"], json!("account-a"));
+        assert_eq!(stamp["profile_label"], json!("Account A"));
+        assert_eq!(stamp["auth_revision"], json!(captured_revision));
+
+        let panes = [(pane_id.clone(), stamp)]
+            .into_iter()
+            .collect::<serde_json::Map<String, Value>>();
+        let active_b = agent_accounts_capture_launch_account_binding("opencode")
+            .expect("active account B binding");
+        let active = json!({
+            "opencode": {
+                "profile_id": active_b.profile_id,
+                "profile_label": active_b.profile_label,
+                "auth_revision": active_b.auth_revision,
+            }
+        });
+        let live_panes = [(
+            pane_id.clone(),
+            json!({
+                "instance_id": 42,
+                "launch_epoch": "captured-account-a:42",
+                "workspace_id": "workspace-a",
+                "workspace_label": "Workspace A",
+                "terminal_index": 3,
+                "activity": "idle",
+                "open": true,
+                "restart_eligible": true,
+            }),
+        )]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+        let inventory = agent_accounts_build_stale_inventory(&panes, &active, &live_panes);
+        assert_eq!(inventory.len(), 1, "switching to B must request an A-to-B restart");
+        assert_eq!(inventory[0]["stamped_profile_id"], json!("account-a"));
+        assert_eq!(inventory[0]["target_profile_id"], json!("account-b"));
+        assert_eq!(inventory[0]["restart_eligible"], json!(true));
+
+        let cloud_live_state = agent_accounts_device_live_state_payload(inventory);
+        assert_eq!(
+            cloud_live_state["stale_terminal_inventory"][0]["stamped_profile_id"],
+            json!("account-a"),
+            "cloud live state must identify the running pane as captured account A"
+        );
+        assert_eq!(
+            cloud_live_state["stale_terminal_inventory"][0]["target_profile_id"],
+            json!("account-b")
+        );
+
+        if let Ok(mut panes) = AGENT_ACCOUNTS_PANE_PROFILES
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+        {
+            panes.remove(&pane_id);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_captured_resume_account_survives_switch_before_spawn_everywhere() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_codex_captured_resume_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let data = root.join("data");
+        let workspace = root.join("workspace");
+        let profile_a = root.join("profile-a");
+        let profile_b = root.join("profile-b");
+        let sessions_a = profile_a.join("sessions").join("2026").join("07").join("16");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&sessions_a).unwrap();
+        fs::create_dir_all(&profile_b).unwrap();
+        fs::write(
+            profile_a.join("auth.json"),
+            test_codex_auth_for_account("a@example.test", "account-a", "refresh-a"),
+        )
+        .unwrap();
+        fs::write(
+            profile_b.join("auth.json"),
+            test_codex_auth_for_account("b@example.test", "account-b", "refresh-b"),
+        )
+        .unwrap();
+        let session_id = "0198-captured-codex-account-a";
+        let rollout_path = sessions_a.join(format!(
+            "rollout-2026-07-16T00-00-00-{session_id}.jsonl"
+        ));
+        fs::write(
+            &rollout_path,
+            format!(
+                "{{\"timestamp\":\"2026-07-16T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"cwd\":{}}}}}\n",
+                serde_json::to_string(workspace.to_string_lossy().as_ref()).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data);
+        let _codex_home_env = ScopedAgentAccountsEnv::set("CODEX_HOME", &profile_a);
+        let registry_for = |active_profile_id: &str| {
+            json!({
+                "agents": {
+                    "codex": {
+                        "active_profile_id": active_profile_id,
+                        "profiles": [
+                            {
+                                "id": "account-a",
+                                "label": "Account A",
+                                "dir": profile_a.to_string_lossy(),
+                            },
+                            {
+                                "id": "account-b",
+                                "label": "Account B",
+                                "dir": profile_b.to_string_lossy(),
+                            }
+                        ]
+                    }
+                }
+            })
+        };
+        agent_accounts_registry_write(&registry_for("account-a")).unwrap();
+
+        let captured = TerminalProviderLaunchAccountBinding::capture(AgentProvider::Codex);
+        assert!(matches!(
+            &captured,
+            TerminalProviderLaunchAccountBinding::Unmanaged { .. }
+        ));
+        let mut fresh_env_vars = Vec::new();
+        captured.apply_to_env(&mut fresh_env_vars);
+        assert_eq!(
+            fresh_env_vars.as_slice(),
+            &[(
+                "CODEX_HOME".to_string(),
+                profile_a.to_string_lossy().to_string()
+            )],
+            "fresh unmanaged Codex launches must still seed their captured profile home"
+        );
+        let (resolved_session_id, codex_resume_home) =
+            terminal_resolve_provider_resume_session_for_binding(
+                AgentProvider::Codex,
+                Some(session_id.to_string()),
+                workspace.to_string_lossy().as_ref(),
+                &captured,
+            );
+        assert_eq!(resolved_session_id.as_deref(), Some(session_id));
+        assert_eq!(
+            codex_resume_home.as_deref(),
+            Some(profile_a.to_string_lossy().as_ref())
+        );
+        let captured_revision = captured
+            .captured_account()
+            .expect("captured Codex account")
+            .auth_revision
+            .clone();
+
+        // Resume resolution and CODEX_HOME selection completed under A. The
+        // active account changes to B before the actual spawn/stamp boundary.
+        agent_accounts_registry_write(&registry_for("account-b")).unwrap();
+        assert_eq!(
+            agent_accounts_capture_launch_account_binding("codex")
+                .expect("current Codex account")
+                .profile_id,
+            "account-b"
+        );
+
+        let pane_id = format!("pane-codex-captured-account-{}", uuid::Uuid::new_v4());
+        let mut env_vars = Vec::new();
+        apply_codex_resume_home_env(
+            &mut env_vars,
+            codex_resume_home.as_deref().unwrap(),
+            session_id,
+            Some(&captured),
+        )
+        .unwrap();
+        extend_terminal_activity_env_vars(
+            &mut env_vars,
+            Some(&workspace),
+            &pane_id,
+            42,
+            Some("workspace-a"),
+            Some(3),
+            "codex",
+            None,
+            Some(&captured),
+        )
+        .unwrap();
+        let workspace_trust =
+            prepare_terminal_launch_account(&env_vars, "codex", &captured).unwrap();
+        stamp_terminal_launch_account(
+            &pane_id,
+            42,
+            "codex-captured-account-a:42",
+            "codex",
+            Some("workspace-a"),
+            Some(3),
+            &captured,
+            workspace_trust.as_ref(),
+        );
+        for key in ["CODEX_HOME", "DIFFFORGE_CODEX_HOME"] {
+            assert_eq!(
+                env_vars
+                    .iter()
+                    .find_map(|(env_key, value)| (env_key == key).then_some(value.as_str())),
+                Some(profile_a.to_string_lossy().as_ref()),
+                "{key} must remain pinned to captured account A"
+            );
+        }
+
+        let stamp = agent_accounts_pane_profile_stamp(&pane_id).expect("pane account stamp");
+        assert_eq!(stamp["profile_id"], json!("account-a"));
+        assert_eq!(stamp["profile_label"], json!("Account A"));
+        assert_eq!(stamp["auth_revision"], json!(captured_revision));
+
+        let panes = [(pane_id.clone(), stamp)]
+            .into_iter()
+            .collect::<serde_json::Map<String, Value>>();
+        let active_b = agent_accounts_capture_launch_account_binding("codex")
+            .expect("active account B binding");
+        let active = json!({
+            "codex": {
+                "profile_id": active_b.profile_id,
+                "profile_label": active_b.profile_label,
+                "auth_revision": active_b.auth_revision,
+            }
+        });
+        let live_panes = [(
+            pane_id.clone(),
+            json!({
+                "instance_id": 42,
+                "launch_epoch": "codex-captured-account-a:42",
+                "workspace_id": "workspace-a",
+                "workspace_label": "Workspace A",
+                "terminal_index": 3,
+                "activity": "idle",
+                "open": true,
+                "restart_eligible": true,
+            }),
+        )]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+        let inventory = agent_accounts_build_stale_inventory(&panes, &active, &live_panes);
+        assert_eq!(
+            inventory.len(),
+            1,
+            "switching to B must leave the running A pane stale-detectable"
+        );
+        assert_eq!(inventory[0]["stamped_profile_id"], json!("account-a"));
+        assert_eq!(inventory[0]["target_profile_id"], json!("account-b"));
+        assert_eq!(inventory[0]["restart_eligible"], json!(true));
+
+        let cloud_live_state = agent_accounts_device_live_state_payload(inventory);
+        assert_eq!(
+            cloud_live_state["stale_terminal_inventory"][0]["stamped_profile_id"],
+            json!("account-a"),
+            "cloud live state must identify the running Codex pane as captured account A"
+        );
+        assert_eq!(
+            cloud_live_state["stale_terminal_inventory"][0]["target_profile_id"],
+            json!("account-b")
+        );
+
+        if let Ok(mut panes) = AGENT_ACCOUNTS_PANE_PROFILES
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+        {
+            panes.remove(&pane_id);
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -10824,8 +11810,24 @@ mod agent_accounts_tests {
         // Even if an active codex profile existed, a coordination-managed
         // CODEX_HOME must win; this asserts the guard path compiles and the
         // managed entry survives untouched.
-        let mut env_vars = vec![("CODEX_HOME".to_string(), "/tmp/managed".to_string())];
-        agent_accounts_apply_spawn_env(&mut env_vars, "pane-test-codex", "codex", None, None, None);
+        let mut env_vars = vec![
+            ("CODEX_HOME".to_string(), "/tmp/managed".to_string()),
+            (
+                "DIFFFORGE_CODEX_HOME".to_string(),
+                "/tmp/managed".to_string(),
+            ),
+        ];
+        TerminalProviderLaunchAccountBinding::Unmanaged {
+            account: Some(AgentAccountsLaunchAccountBinding {
+                kind: "codex",
+                profile_id: "account-a".to_string(),
+                profile_label: "Account A".to_string(),
+                auth_revision: "revision-a".to_string(),
+                profile_home: Some(PathBuf::from("/tmp/account-a")),
+                selected_profile_dir: Some(PathBuf::from("/tmp/account-a")),
+            }),
+        }
+        .apply_to_env(&mut env_vars);
         assert_eq!(
             env_vars
                 .iter()
