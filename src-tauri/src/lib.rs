@@ -10291,6 +10291,21 @@ fn run_app(daemon: bool) {
             startup_settings_initialize(app.handle());
             tray_click_settings_initialize(app.handle());
             cloud_mcp_register_sync_status_app(app.handle());
+            let cloud_mcp_state = app.state::<CloudMcpState>().inner().clone();
+            let cloud_mcp_app = app.handle().clone();
+            if daemon {
+                // Install the remote-command consumer synchronously during
+                // setup, before any background worker can open the daemon
+                // websocket and forward its first command.
+                if let Err(error) = cloud_mcp_ensure_remote_command_listener(
+                    cloud_mcp_app.clone(),
+                    cloud_mcp_state.clone(),
+                ) {
+                    eprintln!(
+                        "diffforge daemon: unable to start remote command listener: {error}"
+                    );
+                }
+            }
             let app_control_bridge_app = app.handle().clone();
             let app_control_bridge_state = app.state::<AppControlMcpState>().inner().clone();
             tauri::async_runtime::spawn(async move {
@@ -10300,8 +10315,6 @@ fn run_app(daemon: bool) {
                 )
                 .await;
             });
-            let cloud_mcp_state = app.state::<CloudMcpState>().inner().clone();
-            let cloud_mcp_app = app.handle().clone();
             desktop_auth_start_renewal_loop(app.handle().clone(), cloud_mcp_state.clone());
             tauri::async_runtime::spawn(async move {
                 // Restore the persisted desktop session before the first

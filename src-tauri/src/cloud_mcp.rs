@@ -20041,21 +20041,33 @@ async fn cloud_mcp_record_client_action_ack(
     .await
 }
 
-#[tauri::command(rename_all = "snake_case")]
-async fn cloud_mcp_start_remote_command_listener(
-    app: AppHandle,
-    state: State<'_, CloudMcpState>,
-) -> Result<Value, String> {
+fn cloud_mcp_subscribe_remote_command_listener(
+    state: &CloudMcpState,
+) -> Option<tokio::sync::broadcast::Receiver<Value>> {
+    // Subscribe before publishing the started flag. Concurrent callers may
+    // briefly create a spare receiver, but only the guard winner keeps one and
+    // starts a consumer. Once started is observable, the retained receiver is
+    // already installed and can buffer the first websocket event.
+    let ws_events = state.global_ws_events.subscribe();
     if state
         .remote_command_listener_started
         .swap(true, Ordering::SeqCst)
     {
-        return Ok(json!({"ok": true, "already_running": true}));
+        None
+    } else {
+        Some(ws_events)
     }
+}
 
-    let state_clone = state.inner().clone();
-    cloud_mcp_start_global_ws(&state_clone).await;
-    let mut ws_events = state.global_ws_events.subscribe();
+pub(crate) fn cloud_mcp_ensure_remote_command_listener(
+    app: AppHandle,
+    state: CloudMcpState,
+) -> Result<Value, String> {
+    let Some(mut ws_events) = cloud_mcp_subscribe_remote_command_listener(&state) else {
+        return Ok(json!({"ok": true, "already_running": true}));
+    };
+
+    let state_clone = state.clone();
     tauri::async_runtime::spawn(async move {
         loop {
             if crate::app_shutdown_requested() {
@@ -20456,6 +20468,17 @@ async fn cloud_mcp_start_remote_command_listener(
         }
     });
     Ok(json!({"ok": true, "started": true}))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn cloud_mcp_start_remote_command_listener(
+    app: AppHandle,
+    state: State<'_, CloudMcpState>,
+) -> Result<Value, String> {
+    let state = state.inner().clone();
+    let result = cloud_mcp_ensure_remote_command_listener(app, state.clone())?;
+    cloud_mcp_start_global_ws(&state).await;
+    Ok(result)
 }
 
 const CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT: usize = 24;
@@ -22051,7 +22074,7 @@ fn cloud_mcp_remote_workspace_management_lever_handles(
 }
 
 fn cloud_mcp_apply_remote_workspace_management_lever_for_dispatcher(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     state: &CloudMcpState,
     event: &Value,
     webview_dispatcher_active: bool,
@@ -22060,7 +22083,12 @@ fn cloud_mcp_apply_remote_workspace_management_lever_for_dispatcher(
     if !cloud_mcp_remote_workspace_management_lever_handles(event, webview_dispatcher_active) {
         return false;
     }
-    let app = app.clone();
+    if matches!(command_kind.as_str(), "workspace_create" | "create_workspace")
+        && app.is_none()
+    {
+        return false;
+    }
+    let app = app.cloned();
     let state = state.clone();
     let event = event.clone();
     tauri::async_runtime::spawn(async move {
@@ -22071,7 +22099,10 @@ fn cloud_mcp_apply_remote_workspace_management_lever_for_dispatcher(
                 cloud_mcp_execute_remote_workspace_directory_browse(&event).await
             }
             "workspace_create" | "create_workspace" => {
-                cloud_mcp_execute_remote_workspace_create(&app, &state, &event).await
+                let Some(app) = app.as_ref() else {
+                    return;
+                };
+                cloud_mcp_execute_remote_workspace_create(app, &state, &event).await
             }
             _ => return,
         };
@@ -22089,7 +22120,7 @@ fn cloud_mcp_apply_remote_workspace_lever_for_dispatcher(
     webview_dispatcher_active: bool,
 ) -> bool {
     if cloud_mcp_apply_remote_workspace_management_lever_for_dispatcher(
-        app,
+        Some(app),
         state,
         event,
         webview_dispatcher_active,
@@ -61799,6 +61830,90 @@ mod cloud_mcp_tests {
     }
 
     #[test]
+    fn remote_command_listener_is_subscribed_before_daemon_websocket_connect() {
+        let cloud_source = include_str!("cloud_mcp.rs");
+        let subscribe_body = cloud_source
+            .split("fn cloud_mcp_subscribe_remote_command_listener")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("pub(crate) fn cloud_mcp_ensure_remote_command_listener")
+                    .next()
+            })
+            .expect("listener subscription helper precedes ensure");
+        let subscribe_index = subscribe_body
+            .find("global_ws_events.subscribe()")
+            .expect("broadcast subscription");
+        let started_index = subscribe_body
+            .find("remote_command_listener_started")
+            .expect("idempotence guard");
+        assert!(
+            subscribe_index < started_index,
+            "the receiver must exist before listener startup is published"
+        );
+
+        let ensure_body = cloud_source
+            .split("pub(crate) fn cloud_mcp_ensure_remote_command_listener")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("#[tauri::command(rename_all = \"snake_case\")]\nasync fn cloud_mcp_start_remote_command_listener")
+                    .next()
+            })
+            .expect("internal listener ensure precedes GUI wrapper");
+        let listener_index = ensure_body
+            .find("cloud_mcp_subscribe_remote_command_listener")
+            .expect("ensure claims the listener subscription");
+        let consumer_index = ensure_body
+            .find("tauri::async_runtime::spawn")
+            .expect("ensure starts the listener consumer");
+        assert!(listener_index < consumer_index);
+
+        let gui_wrapper = cloud_source
+            .split("async fn cloud_mcp_start_remote_command_listener")
+            .nth(1)
+            .and_then(|rest| rest.split("const CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT").next())
+            .expect("GUI listener wrapper");
+        let gui_listener_index = gui_wrapper
+            .find("cloud_mcp_ensure_remote_command_listener")
+            .expect("GUI wrapper ensures the listener");
+        let gui_websocket_index = gui_wrapper
+            .find("cloud_mcp_start_global_ws")
+            .expect("GUI wrapper preserves websocket startup");
+        assert!(gui_listener_index < gui_websocket_index);
+
+        let lib_source = include_str!("lib.rs");
+        let run_app_source = lib_source
+            .split("fn run_app(daemon: bool)")
+            .nth(1)
+            .expect("run_app source");
+        let daemon_startup = run_app_source
+            .split("let cloud_mcp_state = app.state::<CloudMcpState>()")
+            .nth(1)
+            .and_then(|rest| rest.split("if cloud_connected {").next())
+            .expect("daemon cloud startup span");
+        let daemon_listener_index = daemon_startup
+            .find("cloud_mcp_ensure_remote_command_listener")
+            .expect("daemon installs the remote command listener");
+        let daemon_connect_index = daemon_startup
+            .find("cloud_mcp_connect_state")
+            .expect("daemon connects cloud state");
+        let first_background_start_index = daemon_startup
+            .find("desktop_auth_start_renewal_loop")
+            .expect("daemon starts background cloud workers");
+        let first_async_spawn_index = daemon_startup
+            .find("tauri::async_runtime::spawn")
+            .expect("daemon setup starts async workers");
+        assert!(
+            daemon_listener_index < daemon_connect_index,
+            "daemon listener installation must precede websocket connect"
+        );
+        assert!(
+            daemon_listener_index < first_background_start_index,
+            "daemon listener installation must precede background cloud workers"
+        );
+        assert!(daemon_listener_index < first_async_spawn_index);
+    }
+
+    #[test]
     fn remote_loopspace_lever_handles_headless_and_defers_to_webview() {
         for command_kind in [
             "loopspace_view",
@@ -62511,7 +62626,7 @@ mod cloud_mcp_tests {
     }
 
     #[tokio::test]
-    async fn remote_workspace_directory_browse_emits_completed_and_failed_outcomes() {
+    async fn remote_command_listener_answers_headless_workspace_directory_browse() {
         let _guard = CLOUD_MCP_TEST_ENV_LOCK
             .get_or_init(|| StdMutex::new(()))
             .lock()
@@ -62521,29 +62636,70 @@ mod cloud_mcp_tests {
         fs::create_dir_all(data_root.join("child-directory")).unwrap();
         let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
         let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        let (state, mut rx) = workspace_consistency_connected_state().await;
+        assert!(
+            !todo_dispatch_webview_dispatcher_active(),
+            "the integration path must run without a webview heartbeat"
+        );
+        let mut listener_events = cloud_mcp_subscribe_remote_command_listener(&state)
+            .expect("first listener subscription");
+        assert_eq!(state.global_ws_events.receiver_count(), 1);
+        assert!(
+            cloud_mcp_subscribe_remote_command_listener(&state).is_none(),
+            "a repeated GUI/daemon start must not install another listener"
+        );
+        assert_eq!(state.global_ws_events.receiver_count(), 1);
+
+        let target_device_id = cloud_mcp_payload_text(
+            &cloud_mcp_desktop_device_profile(),
+            &["device_id"],
+        )
+        .expect("desktop device id");
         let event = json!({
+            "event_kind": "remote_command_requested",
             "command_id": "browse-completed-test",
             "command_kind": "workspace_directory_browse",
+            "target_device_id": target_device_id,
             "request": {"path": data_root.to_string_lossy()},
         });
-        let outcome = cloud_mcp_execute_remote_workspace_directory_browse(&event).await;
-        assert_eq!(outcome.status, "completed");
-        assert_eq!(
-            outcome.message,
-            "Workspace directory listing loaded from the desktop."
-        );
-        assert_eq!(outcome.details["command_id"], json!("browse-completed-test"));
-        assert!(outcome.details["directories"]
-            .as_array()
-            .is_some_and(|directories| directories.contains(&json!("child-directory"))));
-
-        let (state, mut rx) = workspace_consistency_connected_state().await;
-        let send_state = state.clone();
-        let send_event = event.clone();
-        let send = tokio::spawn(async move {
-            cloud_mcp_send_remote_workspace_command_outcome(&send_state, &send_event, outcome)
-                .await;
+        let listener_state = state.clone();
+        let listener = tokio::spawn(async move {
+            let event = timeout(Duration::from_secs(3), listener_events.recv())
+                .await
+                .expect("injected remote command")
+                .expect("listener broadcast remains open");
+            assert!(cloud_mcp_remote_command_matches_device(&event));
+            let webview_dispatcher_active = todo_dispatch_webview_dispatcher_active();
+            assert!(!webview_dispatcher_active);
+            cloud_mcp_send_remote_command_status_event(
+                &listener_state,
+                &event,
+                "received",
+                "Remote command received by desktop.",
+                None,
+            )
+            .await
+            .expect("remote command receipt");
+            assert!(
+                cloud_mcp_apply_remote_workspace_management_lever_for_dispatcher(
+                    None,
+                    &listener_state,
+                    &event,
+                    webview_dispatcher_active,
+                ),
+                "the production headless workspace lever handles directory browse"
+            );
         });
+
+        state
+            .global_ws_events
+            .send(event)
+            .expect("listener receives injected command");
+        let receipt = workspace_consistency_capture_and_ack(&state, &mut rx).await;
+        assert_eq!(
+            receipt["request"]["event_kind"],
+            json!("remote_command_ack")
+        );
         let envelope = workspace_consistency_capture_and_ack(&state, &mut rx).await;
         assert_eq!(
             envelope["request"]["event_kind"],
@@ -62554,7 +62710,10 @@ mod cloud_mcp_tests {
             envelope["request"]["payload"]["details"]["command_kind"],
             json!("workspace_directory_browse")
         );
-        send.await.unwrap();
+        assert!(envelope["request"]["payload"]["details"]["directories"]
+            .as_array()
+            .is_some_and(|directories| directories.contains(&json!("child-directory"))));
+        listener.await.unwrap();
 
         let failed = cloud_mcp_execute_remote_workspace_directory_browse(&json!({
             "command_id": "browse-failed-test",
