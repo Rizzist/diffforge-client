@@ -795,29 +795,25 @@ pub(crate) async fn app_update_remote_now(app: AppHandle) -> Value {
     }
 
     if app_update_staged_info().is_some() {
-        if daemon_mode {
-            let gate_result =
-                app_update_automatic_restart_auth_gate(&app, "remote_app_update_now_ack").await;
-            let newly_queued = app_update_spawn_remote_restart_when_idle(app.clone());
-            if let Err(error) = gate_result {
-                return app_update_remote_restart_gate_response(daemon_mode, newly_queued, &error);
-            }
-            return app_update_remote_restart_queued_response(daemon_mode, newly_queued);
+        // A remote "update now" on an already-staged update must actually restart to
+        // apply it — on GUI desktops too, not only headless/daemon devices. The remote
+        // restart button was a no-op in GUI mode before. Restart-when-idle avoids
+        // interrupting active work, and the auth gate still applies.
+        let gate_result =
+            app_update_automatic_restart_auth_gate(&app, "remote_app_update_now_ack").await;
+        let newly_queued = app_update_spawn_remote_restart_when_idle(app.clone());
+        if let Err(error) = gate_result {
+            return app_update_remote_restart_gate_response(daemon_mode, newly_queued, &error);
         }
-        return json!({
-            "ok": true,
-            "daemon_mode": daemon_mode,
-            "queued": false,
-            "restart_when_idle": false,
-            "app_update": app_update_device_payload(),
-            "status": app_update_status_snapshot(),
-        });
+        return app_update_remote_restart_queued_response(daemon_mode, newly_queued);
     }
 
     let download_result = app_update_download(app.clone()).await;
     let mut remote_restart_queued = None;
     let mut remote_restart_gate_error = None;
-    if daemon_mode && download_result.is_ok() && app_update_staged_info().is_some() {
+    if download_result.is_ok() && app_update_staged_info().is_some() {
+        // Restart-to-apply after a remote-triggered download applies to GUI desktops
+        // too, not just daemon devices (restart-when-idle + auth gate).
         remote_restart_gate_error =
             app_update_automatic_restart_auth_gate(&app, "remote_app_update_now_ack")
                 .await
