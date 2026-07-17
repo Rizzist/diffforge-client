@@ -1889,6 +1889,123 @@ const AGENT_ACCOUNTS_CHANGED_EVENT = "agent-accounts-changed";
    the agent account profile it spawned under. When the active profile for
    its agent kind changes, the pane keeps working on its old account — this
    chip just says so, and that a restart adopts the new one. Never forced. */
+// Top-right overlay on the terminal surface that lists the subagents this
+// coding agent has spawned — one compact row per subagent, live status dot +
+// label. Polls the lightweight terminal_subagents_snapshot command (scoped to
+// this exact pane; see the Rust extraction fix). Only Claude Code and Codex
+// surface subagent lifecycle; OpenCode returns empty, so the overlay hides
+// itself. Not in the button rail — floats over the surface, non-interactive.
+function terminalSubagentStatusColor(status) {
+  const value = String(status || "").toLowerCase();
+  if (value === "done" || value === "completed") {
+    return "rgba(74, 222, 128, 0.95)"; // green — finished
+  }
+  if (value === "failed" || value === "error") {
+    return "rgba(248, 113, 113, 0.95)"; // red — failed
+  }
+  if (value === "awaiting_instruction" || value === "blocked") {
+    return "rgba(251, 191, 36, 0.97)"; // amber — waiting on input
+  }
+  return "rgba(96, 165, 250, 0.97)"; // blue — running/active
+}
+
+function TerminalSubagentOverlay({ pane_id: paneId, agent_kind: agentKind }) {
+  const [subagents, setSubagents] = useState([]);
+
+  useEffect(() => {
+    const kind = String(agentKind || "").toLowerCase();
+    const supported = kind.includes("claude") || kind.includes("codex");
+    const safePaneId = String(paneId || "").trim();
+    if (!supported || !safePaneId) {
+      setSubagents([]);
+      return undefined;
+    }
+    let cancelled = false;
+    const poll = () => {
+      invoke("terminal_subagents_snapshot", { paneId: safePaneId })
+        .then((rows) => {
+          if (!cancelled) {
+            setSubagents(Array.isArray(rows) ? rows : []);
+          }
+        })
+        .catch(() => {});
+    };
+    poll();
+    const interval = window.setInterval(poll, 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [agentKind, paneId]);
+
+  if (!subagents.length) {
+    return null;
+  }
+
+  return (
+    <div
+      aria-label="Subagents"
+      style={{
+        position: "absolute",
+        top: 8,
+        right: 8,
+        zIndex: 24,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "flex-end",
+        gap: 3,
+        maxWidth: 240,
+        pointerEvents: "none",
+      }}
+    >
+      {subagents.slice(0, 8).map((sub, index) => {
+        const label =
+          String(sub.label || sub.agent_type || sub.description || "subagent").trim() || "subagent";
+        const status = String(sub.status || "").toLowerCase();
+        const running = !(status === "done" || status === "completed" || status === "failed");
+        const color = terminalSubagentStatusColor(status);
+        return (
+          <div
+            key={sub.id || `${label}-${index}`}
+            title={`${label}${sub.description ? ` — ${sub.description}` : ""} · ${status || "running"}`}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              maxWidth: "100%",
+              padding: "3px 9px",
+              borderRadius: 999,
+              fontSize: 10,
+              fontWeight: 650,
+              lineHeight: 1,
+              color: "rgba(226, 232, 240, 0.94)",
+              background: "rgba(15, 23, 42, 0.74)",
+              border: "1px solid rgba(148, 163, 184, 0.24)",
+              backdropFilter: "blur(6px)",
+              WebkitBackdropFilter: "blur(6px)",
+              whiteSpace: "nowrap",
+              opacity: running ? 1 : 0.62,
+            }}
+          >
+            <span
+              aria-hidden="true"
+              style={{
+                width: 6,
+                height: 6,
+                borderRadius: 999,
+                flex: "0 0 auto",
+                background: color,
+                boxShadow: running ? `0 0 5px ${color}` : "none",
+              }}
+            />
+            <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{label}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function TerminalAccountStaleChip({ pane_id: paneId, agent_kind: agentKind }) {
   const [status, setStatus] = useState(null);
 
@@ -18294,6 +18411,7 @@ function WorkspaceTerminal({
         ) : (
           <>
             {xtermSurface}
+            <TerminalSubagentOverlay agent_kind={terminalAgentKind} pane_id={paneId} />
             {shellLauncherUiViewShouldRender && (
               <TerminalInlineUiView
                 aria-hidden={terminalUiViewActive ? undefined : "true"}
