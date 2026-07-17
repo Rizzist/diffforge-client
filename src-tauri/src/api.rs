@@ -4826,7 +4826,7 @@ async fn install_agent(provider: String) -> Result<AgentInstallResult, String> {
         let provider = parse_agent_provider(&provider)?;
         let result = install_agent_with_npm(provider);
 
-        if result.installed {
+        if result.ok && result.installed {
             clear_agent_command_candidate_cache(provider);
         }
 
@@ -4843,7 +4843,41 @@ async fn update_agent(
     provider: String,
 ) -> Result<AgentInstallResult, String> {
     let provider = parse_agent_provider(&provider)?;
-    cloud_mcp_execute_agent_update(&app, state.inner(), None, provider).await
+    cloud_mcp_execute_agent_update(
+        &app,
+        state.inner(),
+        None,
+        provider,
+        AgentUpdateExecution::Standard,
+    )
+    .await
+}
+
+/// Explicit Settings action only. The remote/headless update path never calls
+/// this command and always selects `AgentUpdateExecution::Standard`.
+#[tauri::command(rename_all = "snake_case")]
+async fn retry_update_agent_as_administrator(
+    app: AppHandle,
+    state: State<'_, CloudMcpState>,
+    provider: String,
+) -> Result<AgentInstallResult, String> {
+    let provider = parse_agent_provider(&provider)?;
+    cloud_mcp_execute_agent_update(
+        &app,
+        state.inner(),
+        None,
+        provider,
+        AgentUpdateExecution::ManualElevated,
+    )
+    .await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn cancel_agent_update(provider: String) -> Result<bool, String> {
+    let provider = parse_agent_provider(&provider)?;
+    Ok(cloud_mcp_request_agent_update_cancel(
+        agent_definition(provider).id,
+    ))
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -4852,7 +4886,7 @@ async fn uninstall_agent(provider: String) -> Result<AgentInstallResult, String>
         let provider = parse_agent_provider(&provider)?;
         let result = uninstall_agent_with_npm(provider);
 
-        if !result.installed {
+        if result.ok && !result.installed {
             clear_agent_command_candidate_cache(provider);
         }
 

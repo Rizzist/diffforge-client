@@ -62,6 +62,12 @@ fn main() {
             &helper_args,
         ));
     }
+    if args.get(1).map(String::as_str) == Some("--agent-update-elevated-helper") {
+        let helper_args = args.drain(2..).collect::<Vec<_>>();
+        std::process::exit(rust_diffforge_lib::run_agent_update_elevated_helper(
+            &helper_args,
+        ));
+    }
     if args.get(1).map(String::as_str) == Some("--claude-worktree-guard") {
         let guard_args = args.drain(2..).collect::<Vec<_>>();
         std::process::exit(rust_diffforge_lib::run_claude_worktree_guard(&guard_args));

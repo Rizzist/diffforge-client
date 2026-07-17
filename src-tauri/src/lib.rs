@@ -1935,13 +1935,22 @@ struct AgentRuntimeStatus {
     recommend_native_install: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct AgentInstallResult {
     provider: &'static str,
     label: &'static str,
+    ok: bool,
     installed: bool,
     updated: bool,
     permission_denied: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failed_stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
+    stderr: String,
+    installed_version: String,
     command: &'static str,
     native_install_url: &'static str,
     message: String,
@@ -10547,6 +10556,8 @@ fn run_app(daemon: bool) {
             disconnect_agent,
             install_agent,
             update_agent,
+            retry_update_agent_as_administrator,
+            cancel_agent_update,
             uninstall_agent,
             tools_check_cli_binaries,
             tools_run_cli_action,

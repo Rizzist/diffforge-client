@@ -22922,6 +22922,12 @@ export const AgentInstallMessage = styled.p`
     color: #e5bd83;
     background: rgba(223, 165, 90, 0.08);
   }
+
+  &[data-tone="error"] {
+    border-color: rgba(248, 113, 113, 0.38);
+    color: var(--forge-red, #f87171);
+    background: rgba(248, 113, 113, 0.1);
+  }
 `;
 
 export const AgentActions = styled.div`

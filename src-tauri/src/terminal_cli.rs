@@ -79,14 +79,78 @@ fn looks_like_permission_error(output: &str) -> bool {
         "administrator",
     ]
     .iter()
-    .any(|needle| output.contains(needle))
+        .any(|needle| output.contains(needle))
+}
+
+const AGENT_INSTALL_STDERR_LIMIT: usize = 2_048;
+
+fn bounded_agent_install_stderr(stderr: &str) -> String {
+    stderr
+        .trim()
+        .chars()
+        .take(AGENT_INSTALL_STDERR_LIMIT)
+        .collect()
+}
+
+fn elevated_launch_was_cancelled(error_code: u32) -> bool {
+    // ERROR_CANCELLED: the user dismissed or rejected the Windows UAC prompt.
+    error_code == 1_223
+}
+
+#[cfg(test)]
+#[test]
+fn issue_17_agent_install_failure_is_structured_and_stderr_is_bounded() {
+    let definition = agent_definition(AgentProvider::Codex);
+    let stderr = format!("npm ERR! code EACCES {}", "x".repeat(AGENT_INSTALL_STDERR_LIMIT * 2));
+    let result = failed_agent_install_result(
+        definition,
+        &stderr,
+        &stderr,
+        "npm failed",
+        "update",
+        "installing",
+        Some(1),
+        "npm_failed",
+    );
+    assert!(!result.ok);
+    assert!(result.permission_denied);
+    assert_eq!(result.error_kind.as_deref(), Some("permission_denied"));
+    assert_eq!(result.failed_stage.as_deref(), Some("installing"));
+    assert_eq!(result.exit_code, Some(1));
+    assert!(result.stderr.chars().count() <= AGENT_INSTALL_STDERR_LIMIT);
+    assert!(result.installed_version.is_empty());
+}
+
+#[cfg(test)]
+#[test]
+fn issue_17_windows_uac_cancel_code_is_classified() {
+    assert!(elevated_launch_was_cancelled(1_223));
+    assert!(!elevated_launch_was_cancelled(5));
+    assert!(elevated_agent_update_helper_output_path("0123456789abcdef0123456789abcdef").is_some());
+    assert!(elevated_agent_update_helper_output_path("../../arbitrary-file").is_none());
+    let result = failed_elevated_agent_update_result(
+        agent_definition(AgentProvider::Codex),
+        "Administrator approval was cancelled; the update was not run.",
+        "Administrator approval was cancelled; the update was not run.",
+        "installing",
+        None,
+        "elevation_cancelled",
+    );
+    assert!(!result.ok);
+    assert!(!result.permission_denied);
+    assert_eq!(result.error_kind.as_deref(), Some("elevation_cancelled"));
+    assert!(result.message.contains("cancelled"));
 }
 
 fn failed_agent_install_result(
     definition: AgentDefinition,
     output: &str,
+    stderr: &str,
     fallback_message: &str,
     operation: &str,
+    failed_stage: &str,
+    exit_code: Option<i32>,
+    fallback_error_kind: &str,
 ) -> AgentInstallResult {
     let permission_denied = looks_like_permission_error(output);
     let first_line = first_output_line(output);
@@ -99,14 +163,24 @@ fn failed_agent_install_result(
     AgentInstallResult {
         provider: definition.id,
         label: definition.label,
+        ok: false,
         installed: false,
         updated: false,
         permission_denied,
+        error_kind: Some(if permission_denied {
+            "permission_denied".to_string()
+        } else {
+            fallback_error_kind.to_string()
+        }),
+        failed_stage: Some(failed_stage.to_string()),
+        exit_code,
+        stderr: bounded_agent_install_stderr(stderr),
+        installed_version: String::new(),
         command: definition.install_command,
         native_install_url: definition.native_install_url,
         message: if permission_denied {
             format!(
-                "{} {operation} was blocked by npm permissions. Close running {} terminals, then retry from an elevated app or fix the npm global prefix.",
+                "{} {operation} was blocked by npm permissions. Close running {} terminals, then retry as administrator or move npm global packages to a user-writable prefix.",
                 definition.label, definition.label
             )
         } else {
@@ -12022,9 +12096,15 @@ fn uninstall_agent_with_npm(provider: AgentProvider) -> AgentInstallResult {
         return AgentInstallResult {
             provider: definition.id,
             label: definition.label,
+            ok: false,
             installed: false,
             updated: false,
             permission_denied: false,
+            error_kind: Some("npm_unavailable".to_string()),
+            failed_stage: Some("uninstalling".to_string()),
+            exit_code: None,
+            stderr: String::new(),
+            installed_version: String::new(),
             command: definition.install_command,
             native_install_url: definition.native_install_url,
             message: format!(
@@ -12046,9 +12126,15 @@ fn uninstall_agent_with_npm(provider: AgentProvider) -> AgentInstallResult {
         Ok(capture) if capture.exit_code == Some(0) => AgentInstallResult {
             provider: definition.id,
             label: definition.label,
+            ok: true,
             installed: false,
             updated: false,
             permission_denied: false,
+            error_kind: None,
+            failed_stage: None,
+            exit_code: capture.exit_code,
+            stderr: bounded_agent_install_stderr(&capture.stderr),
+            installed_version: String::new(),
             command: definition.install_command,
             native_install_url: definition.native_install_url,
             message: format!("{} npm package was uninstalled.", definition.label),
@@ -12059,9 +12145,19 @@ fn uninstall_agent_with_npm(provider: AgentProvider) -> AgentInstallResult {
             AgentInstallResult {
                 provider: definition.id,
                 label: definition.label,
+                ok: false,
                 installed: true,
                 updated: false,
                 permission_denied,
+                error_kind: Some(if permission_denied {
+                    "permission_denied".to_string()
+                } else {
+                    "npm_failed".to_string()
+                }),
+                failed_stage: Some("uninstalling".to_string()),
+                exit_code: capture.exit_code,
+                stderr: bounded_agent_install_stderr(&capture.stderr),
+                installed_version: npm_global_package_version(definition).unwrap_or_default(),
                 command: definition.install_command,
                 native_install_url: definition.native_install_url,
                 message: if stderr.is_empty() {
@@ -12074,9 +12170,15 @@ fn uninstall_agent_with_npm(provider: AgentProvider) -> AgentInstallResult {
         Err(error) => AgentInstallResult {
             provider: definition.id,
             label: definition.label,
+            ok: false,
             installed: true,
             updated: false,
             permission_denied: false,
+            error_kind: Some("process_error".to_string()),
+            failed_stage: Some("uninstalling".to_string()),
+            exit_code: None,
+            stderr: bounded_agent_install_stderr(&error),
+            installed_version: npm_global_package_version(definition).unwrap_or_default(),
             command: definition.install_command,
             native_install_url: definition.native_install_url,
             message: format!("npm uninstall failed: {error}"),
@@ -12227,6 +12329,446 @@ impl AgentInstallProgressPhases {
     }
 }
 
+fn verify_completed_agent_install(
+    definition: AgentDefinition,
+    target_version: Option<&str>,
+) -> Result<String, String> {
+    // npm exiting 0 is not enough: verify the binary really starts, and try
+    // the package's own postinstall repair once before reporting corruption.
+    if let Err(verify_error) = verify_agent_binary_runs(definition) {
+        let repaired = repair_agent_npm_postinstall(definition)
+            && verify_agent_binary_runs(definition).is_ok();
+        if !repaired {
+            return Err(verify_error);
+        }
+    }
+
+    let installed_version = npm_global_package_version(definition).unwrap_or_default();
+    if installed_version.trim().is_empty() {
+        return Err(format!(
+            "{} version could not be re-probed after npm completed.",
+            definition.label
+        ));
+    }
+    if let Some(target_version) = target_version.filter(|value| !value.trim().is_empty()) {
+        if !agent_version_is_at_least(&installed_version, target_version) {
+            return Err(format!(
+                "{} remained at {} after updating to target {}.",
+                definition.label, installed_version, target_version
+            ));
+        }
+    }
+    Ok(installed_version)
+}
+
+#[cfg(windows)]
+enum ElevatedNpmLaunchOutcome {
+    Exited {
+        exit_code: i32,
+        stderr: String,
+        detail: String,
+    },
+    Cancelled,
+    Failed { reason: String, stderr: String },
+}
+
+#[derive(Deserialize, Serialize)]
+struct ElevatedAgentUpdateHelperOutput {
+    exit_code: Option<i32>,
+    stderr: String,
+    error: String,
+}
+
+fn elevated_agent_update_helper_output_path(nonce: &str) -> Option<PathBuf> {
+    let nonce = nonce.trim();
+    if nonce.len() != 32 || !nonce.chars().all(|character| character.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(env::temp_dir().join(format!(
+        "diffforge-agent-update-elevated-{nonce}.json"
+    )))
+}
+
+/// Internal subprocess mode used only by the Windows `runas` launcher below.
+/// It accepts a provider from the fixed registry plus a validated nonce, runs
+/// exactly that provider's global npm install, and writes a bounded result to
+/// a fixed temp-file name. It cannot accept arbitrary commands or paths.
+#[cfg(windows)]
+pub fn run_agent_update_elevated_helper(args: &[String]) -> i32 {
+    if args.len() != 2 {
+        return 2;
+    }
+    let provider = match parse_agent_provider(&args[0]) {
+        Ok(provider) => provider,
+        Err(_) => return 2,
+    };
+    let Some(output_path) = elevated_agent_update_helper_output_path(&args[1]) else {
+        return 2;
+    };
+    let definition = agent_definition(provider);
+    let output = match run_command_capture(
+        npm_binary(),
+        &["install", "-g", definition.install_package],
+        None,
+        Duration::from_secs(AGENT_INSTALL_TIMEOUT_SECS),
+        None,
+    ) {
+        Ok(capture) => {
+            let combined = command_output_text(&capture.stdout, &capture.stderr);
+            ElevatedAgentUpdateHelperOutput {
+                exit_code: capture.exit_code,
+                stderr: bounded_agent_install_stderr(&capture.stderr),
+                error: if capture.exit_code == Some(0) {
+                    String::new()
+                } else {
+                    first_output_line(&combined).chars().take(512).collect()
+                },
+            }
+        }
+        Err(error) => ElevatedAgentUpdateHelperOutput {
+            exit_code: None,
+            stderr: bounded_agent_install_stderr(&error),
+            error,
+        },
+    };
+    let Ok(json) = serde_json::to_vec(&output) else {
+        return 3;
+    };
+    let write_result = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output_path)
+        .and_then(|mut file| file.write_all(&json));
+    if write_result.is_err() {
+        return 3;
+    }
+    0
+}
+
+#[cfg(not(windows))]
+pub fn run_agent_update_elevated_helper(_args: &[String]) -> i32 {
+    2
+}
+
+/// Elevates a narrowly-scoped mode of this executable rather than npm or an
+/// arbitrary shell command. The helper captures bounded stderr for the parent.
+#[cfg(windows)]
+fn run_windows_agent_npm_update_as_administrator(
+    definition: AgentDefinition,
+) -> ElevatedNpmLaunchOutcome {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, GetLastError, WAIT_OBJECT_0},
+        System::Threading::{GetExitCodeProcess, WaitForSingleObject},
+        UI::{
+            Shell::{
+                ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+            },
+            WindowsAndMessaging::SW_HIDE,
+        },
+    };
+
+    let executable = match env::current_exe() {
+        Ok(executable) => executable,
+        Err(error) => {
+            return ElevatedNpmLaunchOutcome::Failed {
+                reason: format!("Unable to locate the Diff Forge update helper: {error}"),
+                stderr: String::new(),
+            };
+        }
+    };
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let output_path = elevated_agent_update_helper_output_path(&nonce)
+        .expect("generated elevated update nonce must be valid");
+    let verb = "runas\0".encode_utf16().collect::<Vec<_>>();
+    let file = executable
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let parameters = format!(
+        "--agent-update-elevated-helper {} {}\0",
+        definition.id, nonce
+    )
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    let mut execute = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+        lpVerb: verb.as_ptr(),
+        lpFile: file.as_ptr(),
+        lpParameters: parameters.as_ptr(),
+        nShow: SW_HIDE,
+        ..Default::default()
+    };
+    // SAFETY: every pointer above references a NUL-terminated buffer that
+    // remains alive for the call; the returned process handle is closed below.
+    if unsafe { ShellExecuteExW(&mut execute) } == 0 {
+        let code = unsafe { GetLastError() };
+        return if elevated_launch_was_cancelled(code) {
+            ElevatedNpmLaunchOutcome::Cancelled
+        } else {
+            ElevatedNpmLaunchOutcome::Failed {
+                reason: format!(
+                    "Unable to start the administrator npm retry (Windows error {code})."
+                ),
+                stderr: String::new(),
+            }
+        };
+    }
+    if execute.hProcess.is_null() {
+        return ElevatedNpmLaunchOutcome::Failed {
+            reason: "Windows did not return a process handle for the administrator npm retry."
+                .to_string(),
+            stderr: String::new(),
+        };
+    }
+
+    let wait_result = unsafe {
+        WaitForSingleObject(
+            execute.hProcess,
+            AGENT_INSTALL_TIMEOUT_SECS.saturating_mul(1_000) as u32,
+        )
+    };
+    if wait_result != WAIT_OBJECT_0 {
+        unsafe { CloseHandle(execute.hProcess) };
+        return ElevatedNpmLaunchOutcome::Failed {
+            reason: "The administrator npm retry did not finish before the update timeout."
+                .to_string(),
+            stderr: String::new(),
+        };
+    }
+    let mut exit_code = 0_u32;
+    let read_exit_code = unsafe { GetExitCodeProcess(execute.hProcess, &mut exit_code) };
+    unsafe { CloseHandle(execute.hProcess) };
+    if read_exit_code == 0 {
+        return ElevatedNpmLaunchOutcome::Failed {
+            reason: "Windows could not read the administrator npm retry exit code.".to_string(),
+            stderr: String::new(),
+        };
+    }
+    if exit_code != 0 {
+        let _ = fs::remove_file(&output_path);
+        return ElevatedNpmLaunchOutcome::Failed {
+            reason: format!("The administrator update helper exited with status {exit_code}."),
+            stderr: String::new(),
+        };
+    }
+    let output = fs::read_to_string(&output_path)
+        .map_err(|error| format!("Unable to read the administrator update result: {error}"))
+        .and_then(|json| {
+            serde_json::from_str::<ElevatedAgentUpdateHelperOutput>(&json)
+                .map_err(|error| format!("Unable to parse the administrator update result: {error}"))
+        });
+    let _ = fs::remove_file(&output_path);
+    match output {
+        Ok(output) => match output.exit_code {
+            Some(exit_code) => ElevatedNpmLaunchOutcome::Exited {
+                exit_code,
+                stderr: output.stderr,
+                detail: output.error,
+            },
+            None => ElevatedNpmLaunchOutcome::Failed {
+                reason: if output.error.trim().is_empty() {
+                    "The administrator npm process did not report an exit code.".to_string()
+                } else {
+                    output.error
+                },
+                stderr: output.stderr,
+            },
+        },
+        Err(reason) => ElevatedNpmLaunchOutcome::Failed {
+            reason,
+            stderr: String::new(),
+        },
+    }
+}
+
+fn failed_elevated_agent_update_result(
+    definition: AgentDefinition,
+    reason: &str,
+    stderr: &str,
+    failed_stage: &str,
+    exit_code: Option<i32>,
+    error_kind: &str,
+) -> AgentInstallResult {
+    let mut result = failed_agent_install_result(
+        definition,
+        reason,
+        stderr,
+        reason,
+        "update",
+        failed_stage,
+        exit_code,
+        error_kind,
+    );
+    // Words such as "administrator" describe this explicit elevation flow;
+    // they are not evidence that the elevated process itself was denied.
+    result.permission_denied = false;
+    result.error_kind = Some(error_kind.to_string());
+    result.message = reason.to_string();
+    result
+}
+
+fn update_agent_with_npm_as_administrator_progress<F>(
+    provider: AgentProvider,
+    target_version: &str,
+    mut emit: F,
+) -> AgentInstallResult
+where
+    F: FnMut(AgentInstallProgressSignal),
+{
+    let definition = agent_definition(provider);
+
+    #[cfg(not(windows))]
+    {
+        let _ = target_version;
+        let reason = "Administrator retry is only available on Windows.".to_string();
+        emit(AgentInstallProgressSignal {
+            stage: "failed",
+            error_reason: Some(reason.clone()),
+            failed_stage: Some("installing"),
+        });
+        return failed_elevated_agent_update_result(
+            definition,
+            &reason,
+            &reason,
+            "installing",
+            None,
+            "elevation_unsupported",
+        );
+    }
+
+    #[cfg(windows)]
+    {
+        emit(AgentInstallProgressSignal {
+            stage: "downloading",
+            error_reason: None,
+            failed_stage: None,
+        });
+        emit(AgentInstallProgressSignal {
+            stage: "installing",
+            error_reason: None,
+            failed_stage: None,
+        });
+        let (exit_code, elevated_stderr) =
+            match run_windows_agent_npm_update_as_administrator(definition) {
+            ElevatedNpmLaunchOutcome::Exited {
+                exit_code: 0,
+                stderr,
+                ..
+            } => (0, stderr),
+            ElevatedNpmLaunchOutcome::Exited {
+                exit_code,
+                stderr,
+                detail,
+            } => {
+                let detail = first_output_line(&detail);
+                let stderr_summary = first_output_line(&stderr);
+                let reason = if !detail.is_empty() {
+                    format!("Administrator npm update failed: {detail}")
+                } else if stderr_summary.is_empty() {
+                    format!("Administrator npm update exited with status {exit_code}.")
+                } else {
+                    format!("Administrator npm update failed: {stderr_summary}")
+                };
+                emit(AgentInstallProgressSignal {
+                    stage: "failed",
+                    error_reason: Some(reason.clone()),
+                    failed_stage: Some("installing"),
+                });
+                return failed_elevated_agent_update_result(
+                    definition,
+                    &reason,
+                    &stderr,
+                    "installing",
+                    Some(exit_code),
+                    "npm_failed",
+                );
+            }
+            ElevatedNpmLaunchOutcome::Cancelled => {
+                let reason = "Administrator approval was cancelled; the update was not run.";
+                emit(AgentInstallProgressSignal {
+                    stage: "failed",
+                    error_reason: Some(reason.to_string()),
+                    failed_stage: Some("installing"),
+                });
+                return failed_elevated_agent_update_result(
+                    definition,
+                    reason,
+                    reason,
+                    "installing",
+                    None,
+                    "elevation_cancelled",
+                );
+            }
+            ElevatedNpmLaunchOutcome::Failed { reason, stderr } => {
+                emit(AgentInstallProgressSignal {
+                    stage: "failed",
+                    error_reason: Some(reason.clone()),
+                    failed_stage: Some("installing"),
+                });
+                return failed_elevated_agent_update_result(
+                    definition,
+                    &reason,
+                    &stderr,
+                    "installing",
+                    None,
+                    "elevation_failed",
+                );
+            }
+        };
+        emit(AgentInstallProgressSignal {
+            stage: "verifying",
+            error_reason: None,
+            failed_stage: None,
+        });
+        match verify_completed_agent_install(definition, Some(target_version)) {
+            Ok(installed_version) => {
+                emit(AgentInstallProgressSignal {
+                    stage: "complete",
+                    error_reason: None,
+                    failed_stage: None,
+                });
+                AgentInstallResult {
+                    provider: definition.id,
+                    label: definition.label,
+                    ok: true,
+                    installed: true,
+                    updated: true,
+                    permission_denied: false,
+                    error_kind: None,
+                    failed_stage: None,
+                    exit_code: Some(exit_code),
+                    stderr: bounded_agent_install_stderr(&elevated_stderr),
+                    installed_version: installed_version.clone(),
+                    command: definition.install_command,
+                    native_install_url: definition.native_install_url,
+                    message: format!(
+                        "{} updated successfully to version {}.",
+                        definition.label, installed_version
+                    ),
+                }
+            }
+            Err(reason) => {
+                emit(AgentInstallProgressSignal {
+                    stage: "failed",
+                    error_reason: Some(reason.clone()),
+                    failed_stage: Some("verifying"),
+                });
+                failed_elevated_agent_update_result(
+                    definition,
+                    &reason,
+                    &elevated_stderr,
+                    "verifying",
+                    Some(exit_code),
+                    "verification_failed",
+                )
+            }
+        }
+    }
+}
+
 fn run_agent_npm_install_with_progress<F>(
     provider: AgentProvider,
     is_update: bool,
@@ -12247,9 +12789,15 @@ where
         return AgentInstallResult {
             provider: definition.id,
             label: definition.label,
+            ok: false,
             installed: false,
             updated: false,
             permission_denied: false,
+            error_kind: Some("npm_unavailable".to_string()),
+            failed_stage: Some("downloading".to_string()),
+            exit_code: None,
+            stderr: String::new(),
+            installed_version: String::new(),
             command: definition.install_command,
             native_install_url: definition.native_install_url,
             message: format!(
@@ -12303,40 +12851,9 @@ where
                 error_reason: None,
                 failed_stage: None,
             });
-            // npm exiting 0 is not enough: verify the binary really starts,
-            // and try the package's own postinstall repair once before
-            // reporting a corrupt install.
-            if let Err(verify_error) = verify_agent_binary_runs(definition) {
-                let repaired = repair_agent_npm_postinstall(definition)
-                    && verify_agent_binary_runs(definition).is_ok();
-                if !repaired {
-                    emit(AgentInstallProgressSignal {
-                        stage: "failed",
-                        error_reason: Some(verify_error.clone()),
-                        failed_stage: Some("verifying"),
-                    });
-                    return failed_agent_install_result(
-                        definition,
-                        &verify_error,
-                        "The npm package installed but its binary does not run (likely an interrupted download). Try again on a stable connection.",
-                        if is_update { "update" } else { "install" },
-                    );
-                }
-            }
-            if let Some(target_version) = target_version.filter(|value| !value.trim().is_empty()) {
-                let installed_version = npm_global_package_version(definition).unwrap_or_default();
-                if !agent_version_is_at_least(&installed_version, target_version) {
-                    let reason = if installed_version.is_empty() {
-                        format!(
-                            "{} version could not be re-probed after npm completed.",
-                            definition.label
-                        )
-                    } else {
-                        format!(
-                            "{} remained at {} after updating to target {}.",
-                            definition.label, installed_version, target_version
-                        )
-                    };
+            let installed_version = match verify_completed_agent_install(definition, target_version) {
+                Ok(installed_version) => installed_version,
+                Err(reason) => {
                     emit(AgentInstallProgressSignal {
                         stage: "failed",
                         error_reason: Some(reason.clone()),
@@ -12345,11 +12862,15 @@ where
                     return failed_agent_install_result(
                         definition,
                         &reason,
-                        "The installed version did not reach the requested target.",
+                        &capture.stderr,
+                        "The installed version could not be verified after npm completed.",
                         if is_update { "update" } else { "install" },
+                        "verifying",
+                        capture.exit_code,
+                        "verification_failed",
                     );
                 }
-            }
+            };
             emit(AgentInstallProgressSignal {
                 stage: "complete",
                 error_reason: None,
@@ -12358,17 +12879,26 @@ where
             AgentInstallResult {
                 provider: definition.id,
                 label: definition.label,
+                ok: true,
                 installed: true,
                 updated: is_update,
                 permission_denied: false,
+                error_kind: None,
+                failed_stage: None,
+                exit_code: capture.exit_code,
+                stderr: bounded_agent_install_stderr(&capture.stderr),
+                installed_version: installed_version.clone(),
                 command: definition.install_command,
                 native_install_url: definition.native_install_url,
                 message: if is_update {
-                    format!("{} npm package is up to date.", definition.label)
+                    format!(
+                        "{} updated successfully to version {}.",
+                        definition.label, installed_version
+                    )
                 } else {
                     format!(
-                        "{} installed with npm. Recheck status, then connect your account.",
-                        definition.label
+                        "{} version {} installed with npm. Recheck status, then connect your account.",
+                        definition.label, installed_version
                     )
                 },
             }
@@ -12392,8 +12922,12 @@ where
             failed_agent_install_result(
                 definition,
                 &output,
+                &capture.stderr,
                 "npm install returned a non-zero status.",
                 if is_update { "update" } else { "install" },
+                "installing",
+                capture.exit_code,
+                "npm_failed",
             )
         }
         Err(error) => {
@@ -12409,8 +12943,16 @@ where
             failed_agent_install_result(
                 definition,
                 &error,
+                &error,
                 "Unable to run npm install.",
                 if is_update { "update" } else { "install" },
+                if phases.installing_emitted {
+                    "installing"
+                } else {
+                    "downloading"
+                },
+                None,
+                "process_error",
             )
         }
     }

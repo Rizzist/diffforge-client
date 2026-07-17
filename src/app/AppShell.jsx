@@ -67,6 +67,16 @@ import {
   resolveAgentLaunchDefaultForModel,
 } from "../agents/agentLaunchDefaults.js";
 import { buildAgentChatChangeEffortCommand } from "../agents/agentRemoteConfig.js";
+import {
+  AGENT_UPDATE_QUEUE_TIMEOUT_MS,
+  agentPackageResultSucceeded,
+  agentUpdateCanRetryAsAdministrator,
+  agentUpdateMessageLooksPermissionDenied,
+  agentUpdateProgressIsBusy,
+  agentUpdateProgressMessage,
+  agentUpdateResultSucceeded,
+  normalizeAgentUpdateProgress,
+} from "../agents/agentUpdateUi.js";
 import { collapseFunctionalRepoPathToCoreRepoPath } from "../terminals/coreRepoNameDisplay";
 import {
   TERMINAL_AGENT_COLOR_HEX_BY_SLOT,
@@ -24046,6 +24056,7 @@ export default function App() {
   const [startupAgentUpdateMessage, setStartupAgentUpdateMessage] = useState("");
   const [agentInstallState, setAgentInstallState] = useState({});
   const [agentInstallResults, setAgentInstallResults] = useState({});
+  const [agentUpdateProgress, setAgentUpdateProgress] = useState({});
   const [agentDisconnectState, setAgentDisconnectState] = useState({});
   const [agentActionResults, setAgentActionResults] = useState({});
   const [agentLaunchDefaults, setAgentLaunchDefaults] = useState(readAgentLaunchDefaultsSettings);
@@ -24317,6 +24328,8 @@ export default function App() {
   const viewTransitionTimeoutRef = useRef(null);
   const agentStatusCacheHitRef = useRef(agentStatuses.some((agent) => agent.cached));
   const agentStatusesRef = useRef(agentStatuses);
+  const manualAgentUpdateProvidersRef = useRef(new Set());
+  const agentUpdateQueueTimeoutsRef = useRef(new Map());
   const agentInitialStatusUserRef = useRef("");
   const previousAccountScopeKeyRef = useRef("");
   const startupAgentFlowIdRef = useRef(0);
@@ -32022,6 +32035,82 @@ export default function App() {
     };
   }, []);
 
+  // Settings consumes the same Rust-owned progress stream as Tools. Manual
+  // updates also own a bounded queued wait: after the visible timeout we ask
+  // Rust to cancel its active-terminal gate and settle the local spinner.
+  useEffect(() => {
+    let disposed = false;
+    const clearQueueTimeout = (provider) => {
+      const timeoutId = agentUpdateQueueTimeoutsRef.current.get(provider);
+      if (timeoutId) {
+        window.clearTimeout(timeoutId);
+        agentUpdateQueueTimeoutsRef.current.delete(provider);
+      }
+    };
+    const unsubscribe = listenShared("agent-update-progress", (event) => {
+      if (disposed) {
+        return;
+      }
+      const progress = normalizeAgentUpdateProgress(event?.payload);
+      if (!progress) {
+        return;
+      }
+      setAgentUpdateProgress((current) => {
+        const currentSeq = Number(current[progress.provider]?.stage_seq) || 0;
+        if (progress.stage_seq && currentSeq && progress.stage_seq < currentSeq) {
+          return current;
+        }
+        return { ...current, [progress.provider]: progress };
+      });
+
+      if (progress.stage !== "queued" || !manualAgentUpdateProvidersRef.current.has(progress.provider)) {
+        clearQueueTimeout(progress.provider);
+        return;
+      }
+      if (agentUpdateQueueTimeoutsRef.current.has(progress.provider)) {
+        return;
+      }
+      const timeoutId = window.setTimeout(() => {
+        agentUpdateQueueTimeoutsRef.current.delete(progress.provider);
+        const message = `${progress.provider} update timed out while waiting for active terminals to close.`;
+        setAgentUpdateProgress((current) => ({
+          ...current,
+          [progress.provider]: {
+            ...(current[progress.provider] || progress),
+            stage: "failed",
+            failed_stage: "queued",
+            error_reason: message,
+          },
+        }));
+        setAgentInstallResults((current) => ({
+          ...current,
+          [progress.provider]: {
+            source: "npm-update",
+            ok: false,
+            installed: false,
+            updated: false,
+            permission_denied: false,
+            error_kind: "queued_timeout",
+            failed_stage: "queued",
+            installed_version: "",
+            message,
+          },
+        }));
+        setAgentInstallState((current) => ({ ...current, [progress.provider]: "idle" }));
+        void invoke("cancel_agent_update", { provider: progress.provider }).catch(() => {});
+      }, AGENT_UPDATE_QUEUE_TIMEOUT_MS);
+      agentUpdateQueueTimeoutsRef.current.set(progress.provider, timeoutId);
+    });
+    return () => {
+      disposed = true;
+      unsubscribe();
+      for (const timeoutId of agentUpdateQueueTimeoutsRef.current.values()) {
+        window.clearTimeout(timeoutId);
+      }
+      agentUpdateQueueTimeoutsRef.current.clear();
+    };
+  }, []);
+
   useEffect(() => {
     syncAgentInstallationsToCloud(agentStatuses, "workspace_context_ready");
   }, [
@@ -32229,17 +32318,23 @@ export default function App() {
       const result = await invoke("install_agent", { provider });
       setAgentInstallResults((results) => ({ ...results, [provider]: { ...result, source: "npm" } }));
 
-      if (result?.installed) {
+      if (result?.ok === true && result?.installed === true) {
         refreshedStatuses = await refreshAgentStatuses();
       }
     } catch (error) {
+      const message = getErrorMessage(error, "Unable to install terminal CLI.");
       setAgentInstallResults((results) => ({
         ...results,
         [provider]: {
           source: "npm",
+          ok: false,
           installed: false,
-          permission_denied: false,
-          message: getErrorMessage(error, "Unable to install terminal CLI."),
+          updated: false,
+          permission_denied: agentUpdateMessageLooksPermissionDenied(message),
+          error_kind: "invoke_error",
+          failed_stage: "installing",
+          installed_version: "",
+          message,
         },
       }));
     } finally {
@@ -32248,7 +32343,8 @@ export default function App() {
     }
   }, [agentStatuses, refreshAgentStatuses, syncAgentInstallationsToCloud]);
 
-  const updateAgentWithNpm = useCallback(async (provider) => {
+  const runManualAgentUpdate = useCallback(async (provider, command = "update_agent") => {
+    manualAgentUpdateProvidersRef.current.add(provider);
     setAgentInstallState((state) => ({ ...state, [provider]: "updating" }));
     syncAgentInstallationsToCloud(agentStatusesRef.current || agentStatuses, "agent_update_start", { [provider]: "updating" });
     setAgentStatusError("");
@@ -32257,30 +32353,100 @@ export default function App() {
       delete nextResults[provider];
       return nextResults;
     });
+    setAgentUpdateProgress((current) => {
+      const next = { ...current };
+      delete next[provider];
+      return next;
+    });
 
     let refreshedStatuses = null;
     try {
-      const result = await invoke("update_agent", { provider });
+      const result = await invoke(command, { provider });
       setAgentInstallResults((results) => ({ ...results, [provider]: { ...result, source: "npm-update" } }));
 
-      if (result?.installed) {
+      if (agentUpdateResultSucceeded(result)) {
         refreshedStatuses = await refreshAgentStatuses();
       }
     } catch (error) {
+      const message = getErrorMessage(error, "Unable to update terminal CLI.");
       setAgentInstallResults((results) => ({
         ...results,
         [provider]: {
           source: "npm-update",
+          ok: false,
           installed: false,
-          permission_denied: false,
-          message: getErrorMessage(error, "Unable to update terminal CLI."),
+          updated: false,
+          permission_denied: agentUpdateMessageLooksPermissionDenied(message),
+          error_kind: "invoke_error",
+          failed_stage: "installing",
+          installed_version: "",
+          message,
         },
       }));
     } finally {
+      manualAgentUpdateProvidersRef.current.delete(provider);
+      const queueTimeoutId = agentUpdateQueueTimeoutsRef.current.get(provider);
+      if (queueTimeoutId) {
+        window.clearTimeout(queueTimeoutId);
+        agentUpdateQueueTimeoutsRef.current.delete(provider);
+      }
       setAgentInstallState((state) => ({ ...state, [provider]: "idle" }));
       syncAgentInstallationsToCloud(refreshedStatuses || agentStatusesRef.current || agentStatuses, "agent_update_idle", { [provider]: "idle" });
     }
   }, [agentStatuses, refreshAgentStatuses, syncAgentInstallationsToCloud]);
+
+  const updateAgentWithNpm = useCallback((provider) => (
+    runManualAgentUpdate(provider, "update_agent")
+  ), [runManualAgentUpdate]);
+
+  const retryAgentUpdateAsAdministrator = useCallback((provider) => (
+    runManualAgentUpdate(provider, "retry_update_agent_as_administrator")
+  ), [runManualAgentUpdate]);
+
+  const cancelManualAgentUpdate = useCallback((provider) => {
+    const queueTimeoutId = agentUpdateQueueTimeoutsRef.current.get(provider);
+    if (queueTimeoutId) {
+      window.clearTimeout(queueTimeoutId);
+      agentUpdateQueueTimeoutsRef.current.delete(provider);
+    }
+    const message = "Update cancelled while waiting for active terminals to close.";
+    setAgentUpdateProgress((current) => ({
+      ...current,
+      [provider]: {
+        ...(current[provider] || { provider }),
+        stage: "failed",
+        failed_stage: "queued",
+        error_reason: message,
+      },
+    }));
+    setAgentInstallResults((current) => ({
+      ...current,
+      [provider]: {
+        source: "npm-update",
+        ok: false,
+        installed: false,
+        updated: false,
+        permission_denied: false,
+        error_kind: "cancelled",
+        failed_stage: "queued",
+        installed_version: "",
+        message,
+      },
+    }));
+    setAgentInstallState((current) => ({ ...current, [provider]: "idle" }));
+    void invoke("cancel_agent_update", { provider }).catch((error) => {
+      const cancelMessage = getErrorMessage(error, "Unable to cancel the queued update.");
+      setAgentInstallResults((current) => ({
+        ...current,
+        [provider]: {
+          ...(current[provider] || {}),
+          ok: false,
+          error_kind: "cancel_failed",
+          message: cancelMessage,
+        },
+      }));
+    });
+  }, []);
 
   const finishStartupAgentGate = useCallback((statuses = agentStatuses, reason = "complete") => {
     const nextStatuses = Array.isArray(statuses) && statuses.length ? statuses : agentStatuses;
@@ -32322,13 +32488,19 @@ export default function App() {
         const result = await invoke("update_agent", { provider: agent.id });
         setAgentInstallResults((results) => ({ ...results, [agent.id]: { ...result, source: "npm-update" } }));
       } catch (error) {
+        const message = getErrorMessage(error, "Unable to update terminal CLI.");
         setAgentInstallResults((results) => ({
           ...results,
           [agent.id]: {
             source: "npm-update",
+            ok: false,
             installed: false,
-            permission_denied: false,
-            message: getErrorMessage(error, "Unable to update terminal CLI."),
+            updated: false,
+            permission_denied: agentUpdateMessageLooksPermissionDenied(message),
+            error_kind: "invoke_error",
+            failed_stage: "installing",
+            installed_version: "",
+            message,
           },
         }));
       } finally {
@@ -32351,8 +32523,10 @@ export default function App() {
         ...results,
         [agent.id]: {
           source: "native",
+          ok: false,
           installed: false,
           permission_denied: false,
+          error_kind: "configuration_error",
           message: "Native installer page is not configured.",
         },
       }));
@@ -32369,6 +32543,7 @@ export default function App() {
         ...results,
         [agent.id]: {
           source: "native",
+          ok: true,
           installed: false,
           permission_denied: false,
           message: `Opened ${agent.native_install_label || guide.native_install_label}. Recheck after install finishes.`,
@@ -32379,8 +32554,10 @@ export default function App() {
         ...results,
         [agent.id]: {
           source: "native",
+          ok: false,
           installed: false,
           permission_denied: false,
+          error_kind: "open_failed",
           message: getErrorMessage(error, "Unable to open native installer page."),
         },
       }));
@@ -42654,7 +42831,9 @@ export default function App() {
         setAgentInstallResults((results) => ({ ...results, [provider]: { ...result, source, remote: true } }));
         const nextStatuses = await refreshAgentStatuses();
         refreshedStatuses = nextStatuses;
-        const completed = Boolean(result?.installed);
+        const completed = updating
+          ? agentUpdateResultSucceeded(result)
+          : Boolean(result?.ok === true && result?.installed === true);
         await recordRemoteCommandStatus(
           event,
           completed ? "completed" : "failed",
@@ -42678,8 +42857,13 @@ export default function App() {
           [provider]: {
             source,
             remote: true,
+            ok: false,
             installed: false,
-            permission_denied: false,
+            updated: false,
+            permission_denied: agentUpdateMessageLooksPermissionDenied(message),
+            error_kind: "invoke_error",
+            failed_stage: updating ? "installing" : "downloading",
+            installed_version: "",
             message,
           },
         }));
@@ -56989,9 +57173,12 @@ export default function App() {
                     <AgentCardGrid>
                       {agentStatuses.map((agent) => {
                         const installResult = agentInstallResults[agent.id];
+                        const updateProgress = agentUpdateProgress[agent.id];
+                        const updateProgressMessage = agentUpdateProgressMessage(updateProgress, agent.label);
                         const actionResult = agentActionResults[agent.id];
                         const isInstallingAgent = agentInstallState[agent.id] === "installing";
-                        const isUpdatingAgent = agentInstallState[agent.id] === "updating";
+                        const isUpdatingAgent = agentInstallState[agent.id] === "updating"
+                          || agentUpdateProgressIsBusy(updateProgress);
                         const isPackageActionBusy = isInstallingAgent || isUpdatingAgent;
                         const isDisconnectingAgent = agentDisconnectState[agent.id] === "disconnecting";
                         const needsInstallMessage = `${agent.label} needs to be installed before this action.`;
@@ -57019,11 +57206,16 @@ export default function App() {
                           : installResult?.source === "npm-update" && installResult.permission_denied
                             ? "Retry update"
                             : "Update with npm";
-                        const installMessageTone = installResult?.installed
+                        const installResultSucceeded = agentPackageResultSucceeded(installResult);
+                        const installMessageTone = installResultSucceeded
                           ? "success"
-                          : installResult?.permission_denied
-                            ? "warning"
-                            : "neutral";
+                          : "error";
+                        const canRetryAsAdministrator = agentUpdateCanRetryAsAdministrator(
+                          installResult,
+                          TERMINAL_IS_WINDOWS_HOST,
+                        );
+                        const canCancelQueuedUpdate = updateProgress?.stage === "queued"
+                          && manualAgentUpdateProvidersRef.current.has(agent.id);
                         const launchDefault = getAgentLaunchDefault(agent.id, agentLaunchDefaults);
                         const launchModelCatalog = agent?.model_catalog || null;
                         const launchModelOptions = getAgentLaunchModelOptions(agent.id, launchModelCatalog);
@@ -57088,7 +57280,10 @@ export default function App() {
                                   </AgentPermissionHint>
                                 )}
                                 {installResult?.message && (
-                                  <AgentInstallMessage data-tone={installMessageTone}>
+                                  <AgentInstallMessage
+                                    data-tone={installMessageTone}
+                                    role={installResultSucceeded ? undefined : "alert"}
+                                  >
                                     {installResult.message}
                                   </AgentInstallMessage>
                                 )}
@@ -57113,15 +57308,44 @@ export default function App() {
                                     {isUpdatingAgent ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
                                     <span>{npmUpdateLabel}</span>
                                   </SecondaryButton>
+                                  {canRetryAsAdministrator && (
+                                    <SecondaryButton
+                                      disabled={isPackageActionBusy}
+                                      onClick={() => retryAgentUpdateAsAdministrator(agent.id)}
+                                      type="button"
+                                    >
+                                      <ButtonRefreshIcon aria-hidden="true" />
+                                      <span>Retry as administrator</span>
+                                    </SecondaryButton>
+                                  )}
+                                  {canCancelQueuedUpdate && (
+                                    <SecondaryButton
+                                      onClick={() => cancelManualAgentUpdate(agent.id)}
+                                      type="button"
+                                    >
+                                      <span>Cancel update</span>
+                                    </SecondaryButton>
+                                  )}
                                 </AgentInstallActions>
                                 <AgentInstallCommand>{agent.install_command}</AgentInstallCommand>
+                                {updateProgressMessage && (
+                                  <AgentInstallMessage
+                                    data-tone={updateProgress?.stage === "failed" ? "error" : "neutral"}
+                                    role={updateProgress?.stage === "failed" ? "alert" : "status"}
+                                  >
+                                    {updateProgressMessage}
+                                  </AgentInstallMessage>
+                                )}
                                 {installResult?.permission_denied && (
                                   <AgentPermissionHint>
-                                    Close running terminals, then retry from an elevated app/terminal or move npm global packages to a user-writable prefix.
+                                    Close running terminals, then retry as administrator or move npm global packages to a user-writable prefix.
                                   </AgentPermissionHint>
                                 )}
                                 {installResult?.message && (
-                                  <AgentInstallMessage data-tone={installMessageTone}>
+                                  <AgentInstallMessage
+                                    data-tone={installMessageTone}
+                                    role={installResultSucceeded ? undefined : "alert"}
+                                  >
                                     {installResult.message}
                                   </AgentInstallMessage>
                                 )}

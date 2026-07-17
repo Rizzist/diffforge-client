@@ -22679,6 +22679,7 @@ const CLOUD_MCP_AGENT_UPDATE_PROGRESS_STATE_KEY: &str = "agent-update-progress";
 const CLOUD_MCP_AGENT_INVENTORY_INITIAL_DELAY_SECS: u64 = 90;
 const CLOUD_MCP_AGENT_INVENTORY_FALLBACK_INTERVAL_SECS: u64 = 6 * 60 * 60;
 const CLOUD_MCP_AGENT_INVENTORY_WATCH_DEBOUNCE_MS: u64 = 10_000;
+const CLOUD_MCP_AGENT_ADMIN_RETRY_TTL_SECS: u64 = 5 * 60;
 
 static CLOUD_MCP_AGENT_INVENTORY_SIGNATURE: OnceLock<StdMutex<String>> = OnceLock::new();
 static CLOUD_MCP_AGENT_INVENTORY_WATCHER: OnceLock<StdMutex<Option<notify::RecommendedWatcher>>> =
@@ -22687,6 +22688,10 @@ static CLOUD_MCP_AGENT_MODEL_CATALOGS: OnceLock<StdMutex<HashMap<String, AgentMo
     OnceLock::new();
 static CLOUD_MCP_AGENT_UPDATE_PROGRESS_FILE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static CLOUD_MCP_AGENT_UPDATE_IN_FLIGHT: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
+static CLOUD_MCP_AGENT_UPDATE_CANCEL_REQUESTED: OnceLock<StdMutex<HashSet<String>>> =
+    OnceLock::new();
+static CLOUD_MCP_AGENT_ADMIN_RETRY_ALLOWED: OnceLock<StdMutex<HashMap<String, Instant>>> =
+    OnceLock::new();
 
 struct CloudMcpAgentUpdateRunGuard {
     provider: String,
@@ -22700,6 +22705,12 @@ impl Drop for CloudMcpAgentUpdateRunGuard {
         {
             in_flight.remove(&self.provider);
         }
+        if let Ok(mut cancellations) = CLOUD_MCP_AGENT_UPDATE_CANCEL_REQUESTED
+            .get_or_init(|| StdMutex::new(HashSet::new()))
+            .lock()
+        {
+            cancellations.remove(&self.provider);
+        }
     }
 }
 
@@ -22712,7 +22723,73 @@ fn cloud_mcp_try_begin_agent_update(provider: &str) -> Option<CloudMcpAgentUpdat
     if !in_flight.insert(provider.clone()) {
         return None;
     }
+    if let Ok(mut cancellations) = CLOUD_MCP_AGENT_UPDATE_CANCEL_REQUESTED
+        .get_or_init(|| StdMutex::new(HashSet::new()))
+        .lock()
+    {
+        cancellations.remove(&provider);
+    }
     Some(CloudMcpAgentUpdateRunGuard { provider })
+}
+
+fn cloud_mcp_request_agent_update_cancel(provider: &str) -> bool {
+    let provider = provider.trim().to_ascii_lowercase();
+    let in_flight = CLOUD_MCP_AGENT_UPDATE_IN_FLIGHT
+        .get_or_init(|| StdMutex::new(HashSet::new()))
+        .lock()
+        .is_ok_and(|updates| updates.contains(&provider));
+    if !in_flight {
+        return false;
+    }
+    CLOUD_MCP_AGENT_UPDATE_CANCEL_REQUESTED
+        .get_or_init(|| StdMutex::new(HashSet::new()))
+        .lock()
+        .is_ok_and(|mut cancellations| cancellations.insert(provider))
+}
+
+fn cloud_mcp_agent_update_cancel_requested(provider: &str) -> bool {
+    CLOUD_MCP_AGENT_UPDATE_CANCEL_REQUESTED
+        .get_or_init(|| StdMutex::new(HashSet::new()))
+        .lock()
+        .is_ok_and(|cancellations| cancellations.contains(provider))
+}
+
+fn cloud_mcp_revoke_agent_admin_retry(provider: &str) {
+    if let Ok(mut allowed) = CLOUD_MCP_AGENT_ADMIN_RETRY_ALLOWED
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+    {
+        allowed.remove(&provider.trim().to_ascii_lowercase());
+    }
+}
+
+fn cloud_mcp_grant_agent_admin_retry(provider: &str) {
+    if !cfg!(target_os = "windows") {
+        return;
+    }
+    if let Ok(mut allowed) = CLOUD_MCP_AGENT_ADMIN_RETRY_ALLOWED
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+    {
+        allowed.insert(provider.trim().to_ascii_lowercase(), Instant::now());
+    }
+}
+
+fn agent_admin_retry_grant_is_fresh(granted_at: Instant, now: Instant) -> bool {
+    now.checked_duration_since(granted_at)
+        .is_some_and(|elapsed| elapsed <= Duration::from_secs(CLOUD_MCP_AGENT_ADMIN_RETRY_TTL_SECS))
+}
+
+fn cloud_mcp_consume_agent_admin_retry(provider: &str) -> bool {
+    if !cfg!(target_os = "windows") {
+        return false;
+    }
+    CLOUD_MCP_AGENT_ADMIN_RETRY_ALLOWED
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|mut allowed| allowed.remove(&provider.trim().to_ascii_lowercase()))
+        .is_some_and(|granted_at| agent_admin_retry_grant_is_fresh(granted_at, Instant::now()))
 }
 
 fn agent_update_progress_begin(
@@ -24324,12 +24401,32 @@ async fn cloud_mcp_active_provider_terminal_labels(app: &AppHandle, provider: &s
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentUpdateExecution {
+    Standard,
+    ManualElevated,
+}
+
+fn agent_update_should_use_interactive_elevation(
+    execution: AgentUpdateExecution,
+    has_remote_event: bool,
+) -> bool {
+    execution == AgentUpdateExecution::ManualElevated && !has_remote_event
+}
+
 async fn cloud_mcp_execute_agent_update(
     app: &AppHandle,
     state: &CloudMcpState,
     event: Option<&Value>,
     provider: AgentProvider,
+    execution: AgentUpdateExecution,
 ) -> Result<AgentInstallResult, String> {
+    let use_interactive_elevation =
+        agent_update_should_use_interactive_elevation(execution, event.is_some());
+    if execution == AgentUpdateExecution::ManualElevated && !use_interactive_elevation {
+        return Err("Interactive administrator approval is not allowed for remote updates."
+            .to_string());
+    }
     let definition = agent_definition(provider);
     let Some(_run_guard) = cloud_mcp_try_begin_agent_update(definition.id) else {
         if let Some(event) = event {
@@ -24342,7 +24439,7 @@ async fn cloud_mcp_execute_agent_update(
             let _ = cloud_mcp_send_remote_command_status_event(
                 state,
                 event,
-                "completed",
+                "deferred",
                 &format!(
                     "{} update was coalesced into the run already in progress.",
                     definition.label
@@ -24354,14 +24451,34 @@ async fn cloud_mcp_execute_agent_update(
         return Ok(AgentInstallResult {
             provider: definition.id,
             label: definition.label,
+            ok: false,
             installed: true,
             updated: false,
             permission_denied: false,
+            error_kind: Some("coalesced".to_string()),
+            failed_stage: Some("queued".to_string()),
+            exit_code: None,
+            stderr: String::new(),
+            installed_version: String::new(),
             command: definition.install_command,
             native_install_url: definition.native_install_url,
             message: format!("{} update is already in progress.", definition.label),
         });
     };
+    match execution {
+        AgentUpdateExecution::Standard => {
+            // A new normal attempt invalidates any older permission failure.
+            cloud_mcp_revoke_agent_admin_retry(definition.id);
+        }
+        AgentUpdateExecution::ManualElevated => {
+            if !cloud_mcp_consume_agent_admin_retry(definition.id) {
+                return Err(format!(
+                    "{} administrator retry is no longer available. Run the normal update again first.",
+                    definition.label
+                ));
+            }
+        }
+    }
 
     let target_hint = event.and_then(|event| {
         cloud_mcp_remote_command_field_text(
@@ -24422,6 +24539,47 @@ async fn cloud_mcp_execute_agent_update(
             .await;
             return Err("Agent update was cancelled because Diff Forge is shutting down.".to_string());
         }
+        if cloud_mcp_agent_update_cancel_requested(definition.id) {
+            let reason = format!(
+                "{} update was cancelled while waiting for active terminals to close.",
+                definition.label
+            );
+            let progress = cloud_mcp_transition_agent_update_progress(
+                app,
+                definition.id,
+                "failed",
+                Some(reason.clone()),
+                Some(if queued { "queued" } else { "available" }),
+            )?;
+            cloud_mcp_publish_agent_update_progress(
+                app,
+                state,
+                event,
+                &progress,
+                "agent_update_cancelled",
+            )
+            .await;
+            return Ok(AgentInstallResult {
+                provider: definition.id,
+                label: definition.label,
+                ok: false,
+                installed: true,
+                updated: false,
+                permission_denied: false,
+                error_kind: Some("cancelled".to_string()),
+                failed_stage: Some(if queued {
+                    "queued".to_string()
+                } else {
+                    "available".to_string()
+                }),
+                exit_code: None,
+                stderr: String::new(),
+                installed_version: versions.0.clone(),
+                command: definition.install_command,
+                native_install_url: definition.native_install_url,
+                message: reason,
+            });
+        }
         let mut active_terminals =
             cloud_mcp_active_provider_terminal_labels(app, definition.id).await;
         if active_terminals.is_empty() {
@@ -24429,6 +24587,10 @@ async fn cloud_mcp_execute_agent_update(
             active_terminals =
                 cloud_mcp_active_provider_terminal_labels(app, definition.id).await;
             if active_terminals.is_empty() {
+                if cloud_mcp_agent_update_cancel_requested(definition.id) {
+                    drop(guard);
+                    continue;
+                }
                 break guard;
             }
             drop(guard);
@@ -24457,9 +24619,14 @@ async fn cloud_mcp_execute_agent_update(
     let target_version = versions.1.clone();
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
     let update_task = tauri::async_runtime::spawn_blocking(move || {
-        update_agent_with_npm_progress(provider, &target_version, |signal| {
+        let emit = |signal| {
             let _ = progress_tx.send(signal);
-        })
+        };
+        if use_interactive_elevation {
+            update_agent_with_npm_as_administrator_progress(provider, &target_version, emit)
+        } else {
+            update_agent_with_npm_progress(provider, &target_version, emit)
+        }
     });
     let mut progress_persistence_error = None;
     while let Some(signal) = progress_rx.recv().await {
@@ -24570,8 +24737,11 @@ async fn cloud_mcp_execute_agent_update(
         }
     };
     drop(update_lifecycle_guard);
-    if result.installed {
+    if result.ok && result.installed {
         clear_agent_command_candidate_cache(provider);
+    }
+    if execution == AgentUpdateExecution::Standard && result.permission_denied {
+        cloud_mcp_grant_agent_admin_retry(definition.id);
     }
     cloud_mcp_agent_inventory_probe_and_sync(app, state, "agent_update_terminal", true).await;
     Ok(result)
@@ -24687,6 +24857,30 @@ mod agent_update_progress_tests {
     }
 
     #[test]
+    fn issue_17_queued_update_cancellation_is_scoped_to_the_active_run() {
+        let provider = format!("cancel-test-{}", uuid::Uuid::new_v4());
+        let guard = cloud_mcp_try_begin_agent_update(&provider).expect("active update guard");
+        assert!(cloud_mcp_request_agent_update_cancel(&provider));
+        assert!(cloud_mcp_agent_update_cancel_requested(&provider));
+        drop(guard);
+        assert!(!cloud_mcp_agent_update_cancel_requested(&provider));
+        assert!(!cloud_mcp_request_agent_update_cancel(&provider));
+    }
+
+    #[test]
+    fn issue_17_administrator_retry_grant_is_short_lived() {
+        let now = Instant::now();
+        assert!(agent_admin_retry_grant_is_fresh(
+            now - Duration::from_secs(CLOUD_MCP_AGENT_ADMIN_RETRY_TTL_SECS),
+            now,
+        ));
+        assert!(!agent_admin_retry_grant_is_fresh(
+            now - Duration::from_secs(CLOUD_MCP_AGENT_ADMIN_RETRY_TTL_SECS + 1),
+            now,
+        ));
+    }
+
+    #[test]
     fn boot_reconcile_settles_stuck_installing_progress() {
         let stuck = AgentUpdateProgress {
             provider: "opencode".to_string(),
@@ -24769,6 +24963,22 @@ mod agent_update_progress_tests {
         }
         assert_eq!(emitted, vec!["downloading", "installing"]);
     }
+
+    #[test]
+    fn issue_17_remote_update_execution_never_allows_interactive_elevation() {
+        assert!(!agent_update_should_use_interactive_elevation(
+            AgentUpdateExecution::Standard,
+            true,
+        ));
+        assert!(!agent_update_should_use_interactive_elevation(
+            AgentUpdateExecution::ManualElevated,
+            true,
+        ));
+        assert!(agent_update_should_use_interactive_elevation(
+            AgentUpdateExecution::ManualElevated,
+            false,
+        ));
+    }
 }
 
 fn cloud_mcp_apply_remote_agent_lever(
@@ -24833,6 +25043,7 @@ fn cloud_mcp_apply_remote_agent_lever(
                 &state,
                 Some(&event),
                 parsed_provider,
+                AgentUpdateExecution::Standard,
             )
             .await;
             return;
@@ -24852,9 +25063,9 @@ fn cloud_mcp_apply_remote_agent_lever(
         let (status, message) = match &result {
             Ok(outcome) => {
                 let succeeded = if action == "uninstall" {
-                    !outcome.installed
+                    outcome.ok && !outcome.installed
                 } else {
-                    outcome.installed
+                    outcome.ok && outcome.installed
                 };
                 if succeeded {
                     (
