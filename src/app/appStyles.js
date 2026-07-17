@@ -5099,6 +5099,12 @@ const loopspaceActiveEdge = keyframes`
   to { stroke-dashoffset: 0; }
 `;
 
+/* dasharray 8 7 => period 15; -30 is two full periods for a seamless loop. */
+const loopspaceLiveEdgeFlow = keyframes`
+  from { stroke-dashoffset: 0; }
+  to { stroke-dashoffset: -30; }
+`;
+
 export const LoopspaceGraphEdgePath = styled.path`
   fill: none;
   stroke: rgba(255, 209, 102, 0.62);
@@ -5139,12 +5145,27 @@ export const LoopspaceGraphEdgePath = styled.path`
     stroke-width: 3;
   }
 
+  /* Edges touching a node that is live in the current run keep their branch
+     color but flow like the nextjs Loops mirror. */
+  &[data-live="true"] {
+    stroke-width: 2.5;
+    stroke-dasharray: 8 7;
+    animation: ${loopspaceLiveEdgeFlow} 1.15s linear infinite;
+  }
+
   &[data-active="true"] {
     stroke: rgba(134, 239, 172, 0.94);
     stroke-width: 3;
     stroke-dasharray: 10 8;
     filter: drop-shadow(0 0 14px rgba(134, 239, 172, 0.38));
     animation: ${loopspaceActiveEdge} 1s linear infinite;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    &[data-live="true"],
+    &[data-active="true"] {
+      animation: none;
+    }
   }
 
   html[data-forge-theme="light"] & {
@@ -5687,6 +5708,20 @@ export const LoopspaceDispatchTodoEmpty = styled.div`
   }
 `;
 
+export const LoopspaceDispatchTodoMore = styled.span`
+  justify-self: start;
+  padding: 0 3px;
+  color: rgba(226, 232, 240, 0.5);
+  font-size: 9px;
+  font-weight: 850;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+
+  html[data-forge-theme="light"] & {
+    color: #94a3b8;
+  }
+`;
+
 export const LoopspaceGraphNodeOutputPorts = styled.div`
   position: absolute;
   top: var(--loopspace-node-output-y, 50%);
@@ -6094,6 +6129,61 @@ export const LoopspaceGraphNodeDeviceDot = styled.i`
   &[data-status="awaiting_device"] {
     background: #facc15;
     box-shadow: 0 0 0 3px rgba(250, 204, 21, 0.14);
+  }
+`;
+
+const loopspaceTargetQueueingPulse = keyframes`
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+`;
+
+/* Dispatch-todos target chain chip: device → workspace (→ terminal), resolved
+   to friendly names. The terminal segment is omitted entirely for the
+   "any terminal" (empty) selection. */
+export const LoopspaceGraphNodeTargetPath = styled(LoopspaceGraphNodeDeviceBadge)`
+  span {
+    min-width: 0;
+    flex: 0 1 auto;
+  }
+
+  span[data-muted="true"] {
+    color: rgba(248, 250, 252, 0.45);
+  }
+
+  em {
+    flex: none;
+    margin-left: 2px;
+    padding: 2px 6px;
+    border-radius: 999px;
+    color: rgba(var(--loop-node-accent), 0.95);
+    background: rgba(var(--loop-node-accent), 0.14);
+    font-size: 8.5px;
+    font-style: normal;
+    font-weight: 900;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    animation: ${loopspaceTargetQueueingPulse} 1.15s ease-in-out infinite;
+  }
+
+  html[data-forge-theme="light"] & span[data-muted="true"] {
+    color: #94a3b8;
+  }
+
+  html[data-forge-theme="light"] & em {
+    color: color-mix(in srgb, rgb(var(--loop-node-accent)) 65%, #0f172a);
+  }
+`;
+
+export const LoopspaceGraphNodeTargetArrow = styled.i`
+  flex: none;
+  color: rgba(var(--loop-node-accent), 0.8);
+  font-size: 9.5px;
+  font-style: normal;
+  font-weight: 900;
+  line-height: 1;
+
+  html[data-forge-theme="light"] & {
+    color: color-mix(in srgb, rgb(var(--loop-node-accent)) 65%, #0f172a);
   }
 `;
 

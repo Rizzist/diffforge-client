@@ -597,8 +597,11 @@ import {
   LoopspaceGraphNodeSelectDevice,
   LoopspaceGraphNodeDeviceBadge,
   LoopspaceGraphNodeDeviceDot,
+  LoopspaceGraphNodeTargetArrow,
+  LoopspaceGraphNodeTargetPath,
   LoopspaceDispatchTodoCarousel,
   LoopspaceDispatchTodoEmpty,
+  LoopspaceDispatchTodoMore,
   LoopspaceDispatchTodoNumber,
   LoopspaceDispatchTodoRow,
   LoopspaceDispatchTerminalDot,
@@ -6639,6 +6642,104 @@ function buildLoopspaceDispatchTerminalOptions(workspaceTerminalsWorkspaces = []
   ));
 }
 
+// Resolve a dispatch-todos target chain (device → workspaces → terminal) into
+// human-readable labels using the same catalogs the settings inspector uses.
+// Raw ids are last-resort fallbacks only, and an empty terminal selection
+// means "any terminal" and yields NO terminal label at all.
+function loopspaceDispatchTodosTargetSummary({
+  accountDeviceRows = [],
+  deviceLookup = null,
+  deviceOptions = [],
+  draft = null,
+  localDesktopProfile = null,
+  workspaceRows = [],
+  workspaceTerminalsWorkspaces = [],
+} = {}) {
+  const safeDraft = draft || {};
+  const deviceId = String(safeDraft.device_id || "").trim();
+  const deviceOption = deviceId
+    ? (safeCloudMcpArray(deviceOptions).find((option) => (
+      option.id === deviceId || loopspaceGraphDeviceOptionMatches(option, deviceId)
+    )) || null)
+    : null;
+  const deviceRow = deviceId
+    ? (deviceLookup?.get?.(deviceId.toLowerCase()) || null)
+    : (localDesktopProfile || null);
+  const localDeviceLabel = String(
+    localDesktopProfile?.display_name || localDesktopProfile?.device_label || localDesktopProfile?.device_name || localDesktopProfile?.name || "",
+  ).trim();
+  const deviceLabel = deviceId
+    ? String(
+      deviceOption?.label || safeDraft.device_label || deviceRow?.display_name || deviceRow?.device_label || deviceRow?.device_name || deviceRow?.name || deviceId,
+    ).trim()
+    : (localDeviceLabel || "Current device");
+  const deviceStatus = deviceId
+    ? (deviceRow ? loopspaceGraphDeviceStatus(deviceRow) : (deviceOption?.status || "offline"))
+    : "online";
+  const targetIsLocalDevice = loopspaceDispatchTargetIsLocalDevice(
+    deviceId,
+    localDesktopProfile,
+    accountDeviceRows,
+  );
+  const selectedAccountDevice = loopspaceDispatchSelectedDeviceRow(accountDeviceRows, deviceId);
+  const remoteWorkspaceRows = targetIsLocalDevice
+    ? []
+    : loopspaceDispatchWorkspaceRowsFromAccountDevice(selectedAccountDevice);
+  const resolvedWorkspaceRows = targetIsLocalDevice
+    ? safeCloudMcpArray(workspaceRows)
+    : remoteWorkspaceRows;
+  const workspaceIds = loopspaceDispatchTodosSplitList(safeDraft.target_workspace_ids);
+  const workspaceNameById = new Map();
+  resolvedWorkspaceRows.forEach((workspace) => {
+    const id = String(workspace?.id || workspace?.workspace_id || "").trim();
+    if (!id || workspaceNameById.has(id)) return;
+    workspaceNameById.set(
+      id,
+      String(workspace?.name || workspace?.workspace_name || id).trim() || id,
+    );
+  });
+  const workspaceLabels = workspaceIds.map((id) => workspaceNameById.get(id) || id);
+  const workspaceLabel = workspaceLabels.length
+    ? `${workspaceLabels[0]}${workspaceLabels.length > 1 ? ` +${workspaceLabels.length - 1}` : ""}`
+    : "";
+  const terminalPaneId = String(safeDraft.target_terminal_id || "").trim();
+  const terminalName = String(safeDraft.target_terminal_name || "").trim();
+  const terminalIndexRaw = String(safeDraft.target_terminal_index || "").trim();
+  const hasTerminalSelection = Boolean(terminalPaneId || terminalName || terminalIndexRaw);
+  let terminalLabel = "";
+  if (hasTerminalSelection) {
+    const terminalOptions = buildLoopspaceDispatchTerminalOptions(
+      targetIsLocalDevice ? workspaceTerminalsWorkspaces : remoteWorkspaceRows,
+      workspaceIds,
+    );
+    const terminalMatch = terminalOptions.find((option) => (
+      (terminalPaneId && (option.pane_id === terminalPaneId || option.provider_session_id === terminalPaneId))
+        || (terminalIndexRaw !== ""
+          && String(option.terminal_index) === terminalIndexRaw
+          && (workspaceIds.length !== 1 || option.workspace_id === workspaceIds[0]))
+        || (terminalName && option.name === terminalName)
+    )) || null;
+    const terminalIndexNumber = Number(terminalIndexRaw);
+    terminalLabel = String(
+      terminalMatch?.name
+        || terminalName
+        || (terminalIndexRaw !== "" && Number.isInteger(terminalIndexNumber)
+          ? `Terminal ${terminalIndexNumber + 1}`
+          : "")
+        || terminalPaneId,
+    ).trim();
+  }
+  return {
+    deviceLabel,
+    deviceStatus,
+    hasTerminalSelection,
+    terminalLabel,
+    workspaceCount: workspaceIds.length,
+    workspaceLabel,
+    workspaceLabels,
+  };
+}
+
 const LOOPSPACE_NOTIFY_DEVICE_DELIVERY_OPTIONS = [
   { value: "auto", label: "Auto (native, then push)" },
   { value: "native", label: "Native only" },
@@ -12369,12 +12470,27 @@ function LoopspaceRuntimeView({
     };
     const branch = loopspaceGraphEdgeBranch(edge);
     const isActiveEdge = activeRuntimeStatus && runtimeHeadEdgeId && edge.id === runtimeHeadEdgeId;
+    // Like the nextjs Loops mirror: any edge touching a node that is live in
+    // the current run flows with a dash animation (the exact runtime-head edge
+    // keeps its stronger data-active treatment).
+    const edgeEndpointRuntimeLive = (nodeId) => {
+      const state = nodeId ? runtimeStateByNodeId.get(nodeId) : null;
+      if (!state) return false;
+      if (runtimeHeadRunId && state.run_id && state.run_id !== runtimeHeadRunId) return false;
+      return LOOPSPACE_RUNTIME_SIGNAL_ACTIVE_STATUSES.has(
+        normalizeLoopspaceNodeRuntimeStatus(state.status),
+      );
+    };
+    const isLiveEdge = !isActiveEdge
+      && activeRuntimeStatus
+      && (edgeEndpointRuntimeLive(edge.from) || edgeEndpointRuntimeLive(edge.to));
     const edgeLabel = edge.label || loopspaceGraphPortLabel(branch || edgeFromPort);
     return (
       <g key={edge.id}>
         <LoopspaceGraphEdgePath
           d={loopspaceGraphPathBetween(fromPoint, toPoint)}
           data-active={isActiveEdge ? "true" : undefined}
+          data-live={isLiveEdge ? "true" : undefined}
           data-branch={branch || undefined}
           onPointerDown={(event) => {
             if (!event.altKey) return;
@@ -13664,9 +13780,10 @@ function LoopspaceRuntimeView({
                 const dispatchTodosWorkspaceCount = isDispatchTodosNode
                   ? loopspaceDispatchTodosSplitList(dispatchTodosDraft.target_workspace_ids).length
                   : 0;
-                const dispatchTodosTodoCount = isDispatchTodosNode
-                  ? loopspaceDispatchTodosLinesFromText(dispatchTodosDraft.todo_lines).length
-                  : 0;
+                const dispatchTodosLines = isDispatchTodosNode
+                  ? loopspaceDispatchTodosLinesFromText(dispatchTodosDraft.todo_lines)
+                  : [];
+                const dispatchTodosTodoCount = dispatchTodosLines.length;
                 const dispatchTodosRows = isDispatchTodosNode
                   ? loopspaceDispatchTodoCarouselRows(
                     workspaceTodos,
@@ -13676,15 +13793,20 @@ function LoopspaceRuntimeView({
                   )
                   : [];
                 const dispatchTodosPending = isDispatchTodosNode && dispatchTodosPendingNodeId === node.id;
-                const dispatchTodosTargetLabel = isDispatchTodosNode
-                  ? dispatchTodosDraft.target_terminal_id
-                    ? `Terminal ${dispatchTodosDraft.target_terminal_id}`
-                    : dispatchTodosDraft.target_terminal_name
-                      ? `Terminal ${dispatchTodosDraft.target_terminal_name}`
-                      : dispatchTodosWorkspaceCount
-                        ? `${dispatchTodosWorkspaceCount} workspace${dispatchTodosWorkspaceCount === 1 ? "" : "s"}`
-                        : "Choose workspaces"
-                  : "";
+                // Resolve device → workspace → terminal into readable names via
+                // the same catalogs the settings inspector uses. "Any terminal"
+                // (empty selection) intentionally yields no terminal label.
+                const dispatchTodosTarget = isDispatchTodosNode
+                  ? loopspaceDispatchTodosTargetSummary({
+                    accountDeviceRows: loopspaceGraphAccountDeviceRows,
+                    deviceLookup: loopspaceGraphDeviceLookup,
+                    deviceOptions: loopspaceGraphDeviceOptions,
+                    draft: dispatchTodosDraft,
+                    localDesktopProfile,
+                    workspaceRows: workspaces,
+                    workspaceTerminalsWorkspaces,
+                  })
+                  : null;
                 const sendMessageRuntimeState = isActionRegion
                   ? runtimeStateByNodeId.get(node.id)
                   : null;
@@ -13819,7 +13941,9 @@ function LoopspaceRuntimeView({
                       : isDispatchTodosNode
                         ? [
                             dispatchTodosTodoCount ? `${dispatchTodosTodoCount} todo${dispatchTodosTodoCount === 1 ? "" : "s"}` : "Queued todos",
-                            dispatchTodosTargetLabel,
+                            dispatchTodosWorkspaceCount
+                              ? `${dispatchTodosWorkspaceCount} workspace${dispatchTodosWorkspaceCount === 1 ? "" : "s"}`
+                              : "",
                           ].filter(Boolean).join(" - ")
                         : isNotifyDeviceNode
                           ? [
@@ -14001,17 +14125,36 @@ function LoopspaceRuntimeView({
                       ) : null}
                       {isDispatchTodosNode ? (
                         <>
-                          <LoopspaceGraphNodeDeviceBadge
+                          <LoopspaceGraphNodeTargetPath
                             title={[
-                              dispatchTodosTargetLabel,
-                              dispatchTodosDraft.device_label || dispatchTodosDraft.device_id,
+                              dispatchTodosTarget.deviceLabel,
+                              dispatchTodosTarget.workspaceLabels.join(", "),
+                              dispatchTodosTarget.terminalLabel || "Any terminal",
                               dispatchTodosDraft.target_agent_id,
-                            ].filter(Boolean).join(" - ")}
+                            ].filter(Boolean).join(" → ")}
                           >
-                            <Send aria-hidden="true" />
-                            <span>{dispatchTodosPending ? "Queueing" : dispatchTodosTargetLabel}</span>
-                          </LoopspaceGraphNodeDeviceBadge>
-                          {dispatchTodosRows.length && !isActionRegion ? (
+                            <Devices aria-hidden="true" />
+                            <LoopspaceGraphNodeDeviceDot
+                              aria-hidden="true"
+                              data-status={dispatchTodosTarget.deviceStatus || "offline"}
+                            />
+                            <span>{dispatchTodosTarget.deviceLabel}</span>
+                            <LoopspaceGraphNodeTargetArrow aria-hidden="true">→</LoopspaceGraphNodeTargetArrow>
+                            {dispatchTodosTarget.workspaceLabel ? (
+                              <span>{dispatchTodosTarget.workspaceLabel}</span>
+                            ) : (
+                              <span data-muted="true">Choose workspaces</span>
+                            )}
+                            {dispatchTodosTarget.terminalLabel ? (
+                              <>
+                                <LoopspaceGraphNodeTargetArrow aria-hidden="true">→</LoopspaceGraphNodeTargetArrow>
+                                <Terminal aria-hidden="true" />
+                                <span>{dispatchTodosTarget.terminalLabel}</span>
+                              </>
+                            ) : null}
+                            {dispatchTodosPending ? <em>Queueing</em> : null}
+                          </LoopspaceGraphNodeTargetPath>
+                          {dispatchTodosRows.length ? (
                             <LoopspaceDispatchTodoCarousel aria-label="Dispatched todo status">
                               {dispatchTodosRows.map((row) => (
                                 <LoopspaceDispatchTodoRow
@@ -14027,12 +14170,26 @@ function LoopspaceRuntimeView({
                                 </LoopspaceDispatchTodoRow>
                               ))}
                             </LoopspaceDispatchTodoCarousel>
+                          ) : dispatchTodosLines.length ? (
+                            <LoopspaceDispatchTodoCarousel aria-label="Configured todos">
+                              {dispatchTodosLines.slice(0, 3).map((line, lineIndex) => (
+                                <LoopspaceDispatchTodoRow key={`todo-line-${lineIndex}`}>
+                                  <LoopspaceDispatchTodoStatusDot
+                                    aria-label="todo"
+                                    data-status="todo"
+                                  />
+                                  <LoopspaceDispatchTodoNumber>{lineIndex + 1}</LoopspaceDispatchTodoNumber>
+                                  <span>{line}</span>
+                                </LoopspaceDispatchTodoRow>
+                              ))}
+                              {dispatchTodosLines.length > 3 ? (
+                                <LoopspaceDispatchTodoMore>
+                                  +{dispatchTodosLines.length - 3} more
+                                </LoopspaceDispatchTodoMore>
+                              ) : null}
+                            </LoopspaceDispatchTodoCarousel>
                           ) : (
-                            <LoopspaceDispatchTodoEmpty>
-                              {dispatchTodosTodoCount
-                                ? `${dispatchTodosTodoCount} todo${dispatchTodosTodoCount === 1 ? "" : "s"} configured`
-                                : "No todos configured"}
-                            </LoopspaceDispatchTodoEmpty>
+                            <LoopspaceDispatchTodoEmpty>No todos configured</LoopspaceDispatchTodoEmpty>
                           )}
                         </>
                       ) : null}
