@@ -7,6 +7,7 @@ const CLOUD_VOICE_AGENT_SERVER_RECONNECT_GRACE_MS: u64 = 15_000;
 const CLOUD_VOICE_AGENT_TEXT_CONNECT_TIMEOUT_SECS: u64 = 40;
 const CLOUD_VOICE_AGENT_CONTRACT: &str = "diffforge.voice_agent.v1";
 const CLOUD_VOICE_AGENT_WS_PATH: &str = "/v1/voice/ws";
+const ORCHESTRATOR_VOICE_HISTORY_DIR: &str = "voice-history";
 const CLOUD_DICTATION_CONTRACT: &str = "diffforge.voice_dictation.v1";
 const CLOUD_DICTATION_WS_PATH: &str = "/v1/voice/dictation/ws";
 const CLOUD_DICTATION_POLISH_PATH: &str = "/v1/voice/dictation/polish";
@@ -10361,6 +10362,55 @@ fn cloud_voice_agent_llm_orchestrator_policy() -> Value {
     })
 }
 
+fn resolve_cloud_voice_agent_origin_directory(
+    workspace_root: &str,
+) -> Result<PathBuf, String> {
+    let workspace_root = workspace_root.trim();
+    resolve_app_control_terminal_working_directory(
+        (!workspace_root.is_empty()).then_some(workspace_root),
+    )
+}
+
+#[cfg(test)]
+mod cloud_voice_agent_origin_tests {
+    use super::*;
+
+    #[test]
+    fn device_voice_origin_allows_home_and_no_selected_workspace() {
+        let home = user_home_dir().expect("test user home should be available");
+        let resolved_home =
+            resolve_cloud_voice_agent_origin_directory(home.to_string_lossy().as_ref()).unwrap();
+        assert!(resolved_home.is_dir());
+
+        let resolved_default = resolve_cloud_voice_agent_origin_directory("").unwrap();
+        assert!(resolved_default.is_dir());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn device_voice_origin_allows_filesystem_and_user_collection_roots() {
+        let mut origins = vec![PathBuf::from("/")];
+        origins.extend(
+            [PathBuf::from("/Users"), PathBuf::from("/home")]
+                .into_iter()
+                .filter(|directory| directory.is_dir()),
+        );
+
+        for origin in origins {
+            let resolved = resolve_cloud_voice_agent_origin_directory(
+                origin.to_string_lossy().as_ref(),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "device voice origin {} should bypass workspace policy: {error}",
+                    origin.display()
+                )
+            });
+            assert!(resolved.is_dir());
+        }
+    }
+}
+
 fn voice_history_safe_workspace_id(value: &str) -> String {
     let mut safe = value
         .trim()
@@ -10380,15 +10430,12 @@ fn voice_history_safe_workspace_id(value: &str) -> String {
     safe
 }
 
-fn voice_history_path(root_directory: Option<&str>, workspace_id: &str) -> Result<PathBuf, String> {
-    let root = resolve_workspace_root_directory(root_directory)?;
-    let agents_dir = coordination::db::coordination_workspace_state_root(&root);
-    fs::create_dir_all(&agents_dir)
-        .map_err(|error| format!("Unable to create workspace state directory: {error}"))?;
-    if coordination::db::coordination_state_root_is_visible(&root, &agents_dir) {
-        let _ = ensure_workspace_agents_gitignore(&root);
-    }
-    let history_dir = agents_dir.join("voice-history");
+fn voice_history_path(app: &AppHandle, workspace_id: &str) -> Result<PathBuf, String> {
+    let history_dir = device_data_path(
+        app,
+        Path::new(ORCHESTRATOR_VOICE_HISTORY_DIR),
+        DeviceDataMigrationStrategy::PreferNewest,
+    )?;
     fs::create_dir_all(&history_dir)
         .map_err(|error| format!("Unable to create voice history directory: {error}"))?;
     Ok(history_dir.join(format!(
@@ -10398,15 +10445,20 @@ fn voice_history_path(root_directory: Option<&str>, workspace_id: &str) -> Resul
 }
 
 fn read_orchestrator_voice_history_blocking(
+    app: &AppHandle,
     request: OrchestratorVoiceHistoryReadRequest,
 ) -> Result<OrchestratorVoiceHistoryReadResult, String> {
-    let workspace_id = clean_cloud_voice_agent_text(Some(request.workspace_id), 160);
+    let OrchestratorVoiceHistoryReadRequest {
+        _root_directory: _,
+        workspace_id,
+    } = request;
+    let workspace_id = clean_cloud_voice_agent_text(Some(workspace_id), 160);
     let workspace_id = if workspace_id.is_empty() {
         "default".to_string()
     } else {
         workspace_id
     };
-    let path = voice_history_path(request.root_directory.as_deref(), &workspace_id)?;
+    let path = voice_history_path(app, &workspace_id)?;
     let items = match fs::read_to_string(&path) {
         Ok(contents) => serde_json::from_str::<Value>(&contents).unwrap_or_else(|_| json!([])),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!([]),
@@ -10420,16 +10472,22 @@ fn read_orchestrator_voice_history_blocking(
 }
 
 fn write_orchestrator_voice_history_blocking(
+    app: &AppHandle,
     request: OrchestratorVoiceHistoryWriteRequest,
 ) -> Result<OrchestratorVoiceHistoryWriteResult, String> {
-    let workspace_id = clean_cloud_voice_agent_text(Some(request.workspace_id), 160);
+    let OrchestratorVoiceHistoryWriteRequest {
+        _root_directory: _,
+        workspace_id,
+        items,
+    } = request;
+    let workspace_id = clean_cloud_voice_agent_text(Some(workspace_id), 160);
     let workspace_id = if workspace_id.is_empty() {
         "default".to_string()
     } else {
         workspace_id
     };
-    let path = voice_history_path(request.root_directory.as_deref(), &workspace_id)?;
-    let items = match request.items {
+    let path = voice_history_path(app, &workspace_id)?;
+    let items = match items {
         Value::Array(items) => Value::Array(items.into_iter().take(24).collect()),
         _ => json!([]),
     };
@@ -10449,20 +10507,26 @@ fn write_orchestrator_voice_history_blocking(
 
 #[tauri::command(rename_all = "snake_case")]
 async fn read_orchestrator_voice_history(
+    app: AppHandle,
     request: OrchestratorVoiceHistoryReadRequest,
 ) -> Result<OrchestratorVoiceHistoryReadResult, String> {
-    tauri::async_runtime::spawn_blocking(move || read_orchestrator_voice_history_blocking(request))
-        .await
-        .map_err(|error| format!("Unable to load voice history: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        read_orchestrator_voice_history_blocking(&app, request)
+    })
+    .await
+    .map_err(|error| format!("Unable to load voice history: {error}"))?
 }
 
 #[tauri::command(rename_all = "snake_case")]
 async fn write_orchestrator_voice_history(
+    app: AppHandle,
     request: OrchestratorVoiceHistoryWriteRequest,
 ) -> Result<OrchestratorVoiceHistoryWriteResult, String> {
-    tauri::async_runtime::spawn_blocking(move || write_orchestrator_voice_history_blocking(request))
-        .await
-        .map_err(|error| format!("Unable to persist voice history: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        write_orchestrator_voice_history_blocking(&app, request)
+    })
+    .await
+    .map_err(|error| format!("Unable to persist voice history: {error}"))?
 }
 
 fn is_expected_cloud_voice_agent_close_error(error: &str) -> bool {
@@ -11630,11 +11694,7 @@ async fn start_cloud_voice_agent_stream(
     let workspace_id = clean_cloud_voice_agent_text(workspace_id, 120);
     let workspace_name = clean_cloud_voice_agent_text(workspace_name, 240);
     let workspace_root = clean_cloud_voice_agent_text(workspace_root, 2048);
-    let resolved_workspace_root = if workspace_root.is_empty() {
-        resolve_workspace_root_directory(None)?
-    } else {
-        resolve_workspace_root_directory(Some(&workspace_root))?
-    };
+    let resolved_workspace_root = resolve_cloud_voice_agent_origin_directory(&workspace_root)?;
     let workspace_root = workspace_path_display(&resolved_workspace_root);
     let repo_id = clean_cloud_voice_agent_text(repo_id, 160);
     let repo_id = if !repo_id.is_empty() {
@@ -12249,11 +12309,7 @@ async fn send_cloud_voice_agent_text_message(
     let workspace_id = clean_cloud_voice_agent_text(workspace_id, 120);
     let workspace_name = clean_cloud_voice_agent_text(workspace_name, 240);
     let workspace_root = clean_cloud_voice_agent_text(workspace_root, 2048);
-    let resolved_workspace_root = if workspace_root.is_empty() {
-        resolve_workspace_root_directory(None)?
-    } else {
-        resolve_workspace_root_directory(Some(&workspace_root))?
-    };
+    let resolved_workspace_root = resolve_cloud_voice_agent_origin_directory(&workspace_root)?;
     let workspace_root = workspace_path_display(&resolved_workspace_root);
     let repo_id = clean_cloud_voice_agent_text(repo_id, 160);
     let repo_id = if !repo_id.is_empty() {

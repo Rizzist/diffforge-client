@@ -2890,18 +2890,47 @@ mod workspace_files_tests {
     }
 
     #[test]
-    fn app_control_terminal_allows_user_home_while_workspace_terminal_rejects_it() {
+    fn device_level_resolver_allows_non_workspace_origins_while_workspace_guard_rejects_them() {
         let home = user_home_dir().expect("test user home should be available");
-        let home_text = home.to_string_lossy().to_string();
+        let mut device_origins = vec![home];
 
-        assert!(resolve_workspace_root_directory(Some(&home_text)).is_err());
+        #[cfg(not(windows))]
+        {
+            device_origins.push(PathBuf::from("/"));
+            device_origins.extend(
+                [PathBuf::from("/Users"), PathBuf::from("/home")]
+                    .into_iter()
+                    .filter(|directory| directory.is_dir()),
+            );
+        }
 
-        let orchestrator_directory =
-            resolve_app_control_terminal_working_directory(Some(&home_text)).unwrap();
-        let expected_home = home.canonicalize().unwrap_or(home);
+        for origin in device_origins {
+            let origin_text = origin.to_string_lossy().to_string();
+            assert!(
+                resolve_workspace_root_directory(Some(&origin_text)).is_err(),
+                "strict workspace resolution unexpectedly allowed {}",
+                origin.display()
+            );
+
+            let orchestrator_directory =
+                resolve_app_control_terminal_working_directory(Some(&origin_text)).unwrap();
+            let expected = visible_workspace_root_for_directory(
+                &origin.canonicalize().unwrap_or(origin),
+            );
+            assert_eq!(
+                normalized_path_key(&orchestrator_directory),
+                normalized_path_key(&expected),
+                "device-level resolution changed {}",
+                origin_text
+            );
+        }
+
+        let default_origin = resolve_app_control_terminal_working_directory(None).unwrap();
+        assert!(default_origin.is_dir());
+        let blank_origin = resolve_app_control_terminal_working_directory(Some("  ")).unwrap();
         assert_eq!(
-            normalized_path_key(&orchestrator_directory),
-            normalized_path_key(&expected_home)
+            normalized_path_key(&blank_origin),
+            normalized_path_key(&default_origin)
         );
     }
 

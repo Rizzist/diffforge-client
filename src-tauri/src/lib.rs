@@ -2825,7 +2825,8 @@ struct CloudVoiceAgentStartStatus {
 
 #[derive(Deserialize)]
 struct OrchestratorVoiceHistoryReadRequest {
-    root_directory: Option<String>,
+    #[serde(rename = "root_directory")]
+    _root_directory: Option<String>,
     workspace_id: String,
 }
 
@@ -2838,7 +2839,8 @@ struct OrchestratorVoiceHistoryReadResult {
 
 #[derive(Deserialize)]
 struct OrchestratorVoiceHistoryWriteRequest {
-    root_directory: Option<String>,
+    #[serde(rename = "root_directory")]
+    _root_directory: Option<String>,
     workspace_id: String,
     items: Value,
 }
