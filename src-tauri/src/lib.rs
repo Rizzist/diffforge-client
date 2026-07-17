@@ -45,6 +45,7 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
 };
 
+mod codex_config;
 pub mod coordination;
 mod energy_impact;
 

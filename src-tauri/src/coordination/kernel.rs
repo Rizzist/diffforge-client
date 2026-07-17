@@ -15,6 +15,8 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::codex_config::{codex_project_path_from_header, CodexProjectPath};
+
 use super::{
     alignment,
     db::{
@@ -25807,6 +25809,16 @@ fn write_text_file_atomic(path: &Path, value: &str) -> Result<(), String> {
     write_bytes_atomic(path, value.as_bytes())
 }
 
+fn write_managed_codex_config_atomic(path: &Path, value: &str) -> Result<(), String> {
+    toml::from_str::<toml::Value>(value).map_err(|error| {
+        format!(
+            "Unable to parse generated managed Codex config {}: {error}",
+            path.display()
+        )
+    })?;
+    write_text_file_atomic(path, value)
+}
+
 fn json_file_matches(path: &Path, value: &Value) -> bool {
     serde_json::to_vec_pretty(value)
         .ok()
@@ -25927,7 +25939,7 @@ fn prepare_managed_codex_profile_for_terminal(
     if !json_file_matches(&hooks_path, &hooks_json) {
         write_json_file_atomic(&hooks_path, &hooks_json)?;
     }
-    write_text_file_atomic(&profile_path, &config)?;
+    write_managed_codex_config_atomic(&profile_path, &config)?;
 
     Ok(ManagedCodexProfileLaunch {
         profile: Some(profile),
@@ -25982,7 +25994,7 @@ fn codex_prepare_private_home(
         Some(managed_mcp_config),
         inherited_global_mcp_servers,
     )?;
-    write_text_file_atomic(&home.join("config.toml"), &config)?;
+    write_managed_codex_config_atomic(&home.join("config.toml"), &config)?;
 
     let frozen_launch = codex_launch_auth_home_is_bound();
     let frozen_launch_requires_auth = codex_launch_auth_home_requires_auth();
@@ -26051,11 +26063,14 @@ fn codex_private_home_base_config(
         append_codex_trusted_project_entries(&mut config, &body, &mut seen);
     }
 
-    config = ensure_codex_project_trust_entry(&config, repo_path);
-    config = ensure_codex_project_trust_entry(&config, write_root);
+    append_codex_project_trust_entry(&mut config, repo_path, &mut seen);
+    append_codex_project_trust_entry(&mut config, write_root, &mut seen);
     if codex_architecture_graphs_write_enabled(enforcement_mode) {
-        config =
-            ensure_codex_project_trust_entry(&config, &codex_architecture_graphs_root(repo_path));
+        append_codex_project_trust_entry(
+            &mut config,
+            &codex_architecture_graphs_root(repo_path),
+            &mut seen,
+        );
     }
     if !config.ends_with('\n') {
         config.push('\n');
@@ -26112,7 +26127,7 @@ pub(crate) fn codex_managed_home_set_app_control_instructions(
             path.display()
         )
     })?;
-    write_text_file_atomic(&path, &next)
+    write_managed_codex_config_atomic(&path, &next)
 }
 
 fn codex_private_home_project_trust_source_paths(home: &Path) -> Vec<PathBuf> {
@@ -26173,21 +26188,20 @@ fn push_unique_codex_config_path(
 fn append_codex_trusted_project_entries(
     config: &mut String,
     body: &str,
-    seen_sections: &mut HashSet<String>,
+    seen_projects: &mut HashSet<String>,
 ) {
     let lines = body.lines().collect::<Vec<_>>();
     let mut index = 0;
     while index < lines.len() {
-        let Some(section) = toml_section_name(lines[index]) else {
+        let Some(path) = codex_project_path_from_header(lines[index]) else {
             index += 1;
             continue;
         };
-        if !section.starts_with("projects.") {
+        let Some(project) = CodexProjectPath::parse(&path) else {
             index += 1;
             continue;
-        }
+        };
 
-        let header = lines[index].trim();
         index += 1;
         let mut trusted = false;
         while index < lines.len() && toml_section_name(lines[index]).is_none() {
@@ -26197,15 +26211,35 @@ fn append_codex_trusted_project_entries(
             index += 1;
         }
 
-        if trusted && seen_sections.insert(section) {
-            if !config.trim().is_empty() {
-                config.push('\n');
-            }
-            config.push_str(header);
-            config.push('\n');
-            config.push_str("trust_level = \"trusted\"\n");
+        if trusted && seen_projects.insert(project.identity.clone()) {
+            append_codex_project_trust_table(config, &project);
         }
     }
+}
+
+fn append_codex_project_trust_entry(
+    config: &mut String,
+    path: &Path,
+    seen_projects: &mut HashSet<String>,
+) {
+    let Some(project) = CodexProjectPath::parse(&process_path_text(path)) else {
+        return;
+    };
+    if seen_projects.insert(project.identity.clone()) {
+        append_codex_project_trust_table(config, &project);
+    }
+}
+
+fn append_codex_project_trust_table(config: &mut String, project: &CodexProjectPath) {
+    if !config.trim().is_empty() {
+        if !config.ends_with('\n') {
+            config.push('\n');
+        }
+        config.push('\n');
+    }
+    config.push_str(&project.table_header());
+    config.push('\n');
+    config.push_str("trust_level = \"trusted\"\n");
 }
 
 fn codex_project_trust_line_is_trusted(line: &str) -> bool {
@@ -26445,11 +26479,15 @@ fn codex_managed_profile_config(
     hooks_config: Option<&str>,
 ) -> Result<String, String> {
     let mut config = "cli_auth_credentials_store = \"file\"\n".to_string();
-    config = ensure_codex_project_trust_entry(&config, repo_path);
-    config = ensure_codex_project_trust_entry(&config, write_root);
+    let mut seen = HashSet::new();
+    append_codex_project_trust_entry(&mut config, repo_path, &mut seen);
+    append_codex_project_trust_entry(&mut config, write_root, &mut seen);
     if codex_architecture_graphs_write_enabled(enforcement_mode) {
-        config =
-            ensure_codex_project_trust_entry(&config, &codex_architecture_graphs_root(repo_path));
+        append_codex_project_trust_entry(
+            &mut config,
+            &codex_architecture_graphs_root(repo_path),
+            &mut seen,
+        );
     }
     config = append_codex_managed_permission_profile(
         config,
@@ -26729,14 +26767,12 @@ fn codex_managed_git_launch_self_test(
         "[[hooks.SubagentStart]]",
         "[[hooks.SubagentStop]]",
         "--diff-forge-activity-hook",
-        &format!(
-            "[projects.\"{}\"]",
-            toml_escape(&process_path_text(repo_path))
-        ),
-        &format!(
-            "[projects.\"{}\"]",
-            toml_escape(&process_path_text(write_root))
-        ),
+        &CodexProjectPath::parse(&process_path_text(repo_path))
+            .map(|path| path.table_header())
+            .unwrap_or_default(),
+        &CodexProjectPath::parse(&process_path_text(write_root))
+            .map(|path| path.table_header())
+            .unwrap_or_default(),
     ] {
         if !config.contains(expected) {
             missing.push(format!("profile missing {expected}"));
@@ -26921,33 +26957,6 @@ fn toml_section_name(line: &str) -> Option<String> {
     }
     let section = trimmed.trim_start_matches('[').trim_end_matches(']').trim();
     (!section.is_empty()).then(|| section.to_string())
-}
-
-fn ensure_codex_project_trust_entry(body: &str, path: &Path) -> String {
-    let path = process_path_text(path);
-    if path.trim().is_empty() || codex_config_has_project_entry(body, &path) {
-        return body.to_string();
-    }
-    let mut next = body.trim_end().to_string();
-    if !next.is_empty() {
-        next.push_str("\n\n");
-    }
-    next.push_str(&format!(
-        "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
-        toml_escape(&path)
-    ));
-    next
-}
-
-fn codex_config_has_project_entry(body: &str, path: &str) -> bool {
-    body.lines().any(|line| {
-        let Some(section) = toml_section_name(line) else {
-            return false;
-        };
-        section == format!("projects.\"{}\"", toml_escape(path))
-            || section == format!("projects.'{}'", path.replace('\'', "\\'"))
-            || section == format!("projects.{path}")
-    })
 }
 
 fn bytes_file_matches(path: &Path, bytes: &[u8]) -> bool {
@@ -30676,6 +30685,149 @@ enabled = true
         assert!(!config.contains("mcp_servers"));
         assert!(!config.contains("plugins."));
         assert!(!config.contains("custom ="));
+    }
+
+    #[test]
+    fn managed_codex_project_trust_dedupes_windows_header_aliases() {
+        let inherited = r#"[projects."C:\\Users\\X\\Repo"]
+trust_level = "trusted"
+
+[projects.'c:/users/x/repo/']
+trust_level = "trusted"
+
+[projects.'\\?\C:\USERS\X\REPO\']
+trust_level = "trusted"
+
+[projects.'\\?\UNC\Server\Share\Repo\']
+trust_level = "trusted"
+
+[projects.'//server/share/repo/']
+trust_level = "trusted"
+
+[projects."C:\\Users\\O'Reilly\\Repo"]
+trust_level = "trusted"
+"#;
+        let mut config = String::new();
+        let mut seen = HashSet::new();
+        append_codex_trusted_project_entries(&mut config, inherited, &mut seen);
+        append_codex_project_trust_entry(&mut config, Path::new(r"C:/Users/X/Repo/"), &mut seen);
+
+        let parsed = toml::from_str::<toml::Value>(&config).unwrap();
+        let projects = parsed["projects"].as_table().unwrap();
+        assert_eq!(projects.len(), 3);
+        assert!(config.contains(r"[projects.'C:\Users\X\Repo']"));
+        assert!(config.contains(r"[projects.'\\Server\Share\Repo']"));
+        assert!(config.contains(r#"[projects."C:\\Users\\O'Reilly\\Repo"]"#));
+        for expected in [
+            r"C:\Users\X\Repo",
+            r"\\Server\Share\Repo",
+            r"C:\Users\O'Reilly\Repo",
+        ] {
+            let identity = CodexProjectPath::parse(expected).unwrap().identity;
+            assert_eq!(
+                projects
+                    .keys()
+                    .filter(|path| CodexProjectPath::parse(path)
+                        .is_some_and(|path| path.identity == identity))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn managed_codex_project_trust_preserves_windows_roots_while_deduping_aliases() {
+        let inherited = r#"[projects.'C:\']
+trust_level = "trusted"
+
+[projects.'c:/']
+trust_level = "trusted"
+
+[projects.'\\?\C:\']
+trust_level = "trusted"
+
+[projects.'\\Server\Share']
+trust_level = "trusted"
+
+[projects.'//server/share/']
+trust_level = "trusted"
+
+[projects.'\\?\UNC\SERVER\SHARE\']
+trust_level = "trusted"
+"#;
+        let mut config = String::new();
+        let mut seen = HashSet::new();
+        append_codex_trusted_project_entries(&mut config, inherited, &mut seen);
+
+        let parsed = toml::from_str::<toml::Value>(&config).unwrap();
+        let projects = parsed["projects"].as_table().unwrap();
+        assert_eq!(projects.len(), 2);
+        assert!(projects.contains_key(r"C:\"));
+        assert!(projects.contains_key(r"\\Server\Share\"));
+        assert!(config.contains(r"[projects.'C:\']"));
+        assert!(config.contains(r"[projects.'\\Server\Share\']"));
+    }
+
+    #[test]
+    fn managed_codex_sibling_merge_survives_app_control_reserialization() {
+        let coordinated = temp_repo("managed_codex_reserialized_sibling");
+        let home = coordinated.join("slot-a");
+        let sibling = coordinated.join("slot-b");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        let project_header = r#"[projects."C:\\Users\\X\\Repo"]
+trust_level = "trusted"
+"#;
+        fs::write(home.join("config.toml"), project_header).unwrap();
+        fs::write(sibling.join("config.toml"), project_header).unwrap();
+        codex_managed_home_set_app_control_instructions(&sibling, true).unwrap();
+        let reserialized = fs::read_to_string(sibling.join("config.toml")).unwrap();
+        assert!(reserialized.contains(r"[projects.'C:\Users\X\Repo']"));
+
+        let trust_sources = with_codex_launch_auth_home_requirement(None, false, || {
+            codex_private_home_project_trust_source_paths(&home)
+        });
+        let repo = temp_repo("managed_codex_reserialized_sibling_repo");
+        let config = codex_private_home_base_config(
+            &trust_sources,
+            &repo,
+            &repo,
+            "bounded_direct_edit",
+            None,
+            &[],
+        )
+        .unwrap();
+        let parsed = toml::from_str::<toml::Value>(&config).unwrap();
+        let projects = parsed["projects"].as_table().unwrap();
+        let identity = CodexProjectPath::parse(r"C:\Users\X\Repo")
+            .unwrap()
+            .identity;
+
+        assert_eq!(
+            projects
+                .keys()
+                .filter(|path| CodexProjectPath::parse(path)
+                    .is_some_and(|path| path.identity == identity))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn managed_codex_config_validation_preserves_existing_file_on_parse_failure() {
+        let home = temp_repo("managed_codex_validation");
+        let path = home.join("config.toml");
+        let original = "model = \"gpt-5\"\n";
+        fs::write(&path, original).unwrap();
+
+        let error = write_managed_codex_config_atomic(
+            &path,
+            "[projects.'C:\\Repo']\ntrust_level = \"trusted\"\n[projects.\"C:\\\\Repo\"]\ntrust_level = \"trusted\"\n",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("Unable to parse generated managed Codex config"));
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
     }
 
     #[test]

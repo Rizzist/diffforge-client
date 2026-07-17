@@ -6750,37 +6750,65 @@ fn agent_accounts_active_home_for_kind(kind: &'static str) -> Option<PathBuf> {
     agent_accounts_profile_home_for_launch(kind).or_else(|| agent_accounts_default_home(kind))
 }
 
-fn agent_accounts_toml_escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
 fn agent_accounts_upsert_codex_trust(body: &str, workspace_root: &Path) -> String {
-    let path = workspace_root.to_string_lossy();
-    let header = format!("[projects.\"{}\"]", agent_accounts_toml_escape(&path));
-    let mut lines = body.lines().map(str::to_string).collect::<Vec<_>>();
-    if let Some(start) = lines.iter().position(|line| line.trim() == header) {
-        let end = lines[start + 1..]
-            .iter()
-            .position(|line| line.trim_start().starts_with('['))
-            .map(|offset| start + 1 + offset)
-            .unwrap_or(lines.len());
-        if let Some(index) = (start + 1..end).find(|index| {
-            lines[*index]
+    let Some(project) = crate::codex_config::CodexProjectPath::parse(&workspace_root.to_string_lossy())
+    else {
+        return body.to_string();
+    };
+    let lines = body.lines().collect::<Vec<_>>();
+    let mut output_lines = Vec::with_capacity(lines.len() + 2);
+    let mut found = false;
+    let mut index = 0;
+    while index < lines.len() {
+        let Some(path) = crate::codex_config::codex_project_path_from_header(lines[index]) else {
+            output_lines.push(lines[index].to_string());
+            index += 1;
+            continue;
+        };
+        let Some(existing) = crate::codex_config::CodexProjectPath::parse(&path) else {
+            output_lines.push(lines[index].to_string());
+            index += 1;
+            continue;
+        };
+        if existing.identity != project.identity {
+            output_lines.push(lines[index].to_string());
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        index += 1;
+        while index < lines.len() && !lines[index].trim_start().starts_with('[') {
+            index += 1;
+        }
+        if found {
+            continue;
+        }
+        found = true;
+        output_lines.push(project.table_header());
+        output_lines.push("trust_level = \"trusted\"".to_string());
+        for line in &lines[start + 1..index] {
+            let is_trust = line
                 .split_once('=')
-                .is_some_and(|(key, _)| key.trim() == "trust_level")
-        }) {
-            lines[index] = "trust_level = \"trusted\"".to_string();
-        } else {
-            lines.insert(start + 1, "trust_level = \"trusted\"".to_string());
+                .is_some_and(|(key, _)| key.trim() == "trust_level");
+            if !is_trust {
+                output_lines.push((*line).to_string());
+            }
         }
-    } else {
-        if !lines.is_empty() && !lines.last().is_some_and(|line| line.trim().is_empty()) {
-            lines.push(String::new());
-        }
-        lines.push(header);
-        lines.push("trust_level = \"trusted\"".to_string());
     }
-    let mut output = lines.join("\n");
+
+    if !found {
+        if !output_lines.is_empty()
+            && !output_lines
+                .last()
+                .is_some_and(|line| line.trim().is_empty())
+        {
+            output_lines.push(String::new());
+        }
+        output_lines.push(project.table_header());
+        output_lines.push("trust_level = \"trusted\"".to_string());
+    }
+    let mut output = output_lines.join("\n");
     output.push('\n');
     output
 }
@@ -6896,6 +6924,12 @@ fn agent_accounts_reconcile_workspace_trust_in_home(
             let current = fs::read_to_string(&path).unwrap_or_default();
             let next = agent_accounts_upsert_codex_trust(&current, &workspace_root);
             if next != current {
+                toml::from_str::<toml::Value>(&next).map_err(|error| {
+                    format!(
+                        "Unable to parse updated Codex workspace trust config {}: {error}",
+                        path.display()
+                    )
+                })?;
                 agent_accounts_write_private_file_atomic(
                     &path,
                     next.as_bytes(),
@@ -8398,14 +8432,69 @@ mod agent_accounts_tests {
     #[test]
     fn codex_workspace_trust_upsert_is_idempotent_and_overrides_untrusted() {
         let root = Path::new("/tmp/diff-forge trust/project");
+        let header = crate::codex_config::CodexProjectPath::parse(&root.to_string_lossy())
+            .unwrap()
+            .table_header();
         let original = format!(
-            "model = \"gpt-5\"\n\n[projects.\"{}\"]\ntrust_level = \"untrusted\"\n",
-            agent_accounts_toml_escape(&root.to_string_lossy()),
+            "model = \"gpt-5\"\n\n{header}\ntrust_level = \"untrusted\"\n",
         );
         let trusted = agent_accounts_upsert_codex_trust(&original, root);
         assert!(trusted.contains("trust_level = \"trusted\""));
         assert!(!trusted.contains("trust_level = \"untrusted\""));
         assert_eq!(agent_accounts_upsert_codex_trust(&trusted, root), trusted);
+    }
+
+    #[test]
+    fn codex_workspace_trust_upsert_dedupes_windows_path_aliases() {
+        let original = r#"model = "gpt-5"
+
+[projects."C:\\Users\\X\\Repo"]
+trust_level = "untrusted"
+first = true
+
+[projects.'c:/users/x/repo/']
+trust_level = "trusted"
+"#;
+        let root = Path::new(r"\\?\C:\Users\X\Repo\");
+        let trusted = agent_accounts_upsert_codex_trust(original, root);
+        let parsed = toml::from_str::<toml::Value>(&trusted).unwrap();
+        let projects = parsed["projects"].as_table().unwrap();
+        let expected = crate::codex_config::CodexProjectPath::parse(r"C:\Users\X\Repo").unwrap();
+        let matching = projects
+            .keys()
+            .filter(|path| {
+                crate::codex_config::CodexProjectPath::parse(path)
+                    .is_some_and(|path| path.identity == expected.identity)
+            })
+            .count();
+
+        assert_eq!(matching, 1);
+        assert!(trusted.contains(r"[projects.'C:\Users\X\Repo']"));
+        assert_eq!(
+            projects[r"C:\Users\X\Repo"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+        assert_eq!(projects[r"C:\Users\X\Repo"]["first"].as_bool(), Some(true));
+        assert_eq!(agent_accounts_upsert_codex_trust(&trusted, root), trusted);
+    }
+
+    #[test]
+    fn codex_workspace_trust_upsert_emits_unc_and_apostrophe_paths_safely() {
+        let unc = Path::new(r"\\?\UNC\Server\Share\Repo\");
+        let with_unc = agent_accounts_upsert_codex_trust("", unc);
+        assert!(with_unc.contains(r"[projects.'\\Server\Share\Repo']"));
+
+        let apostrophe = Path::new(r"\\?\C:\Users\O'Reilly\Repo\");
+        let trusted = agent_accounts_upsert_codex_trust(&with_unc, apostrophe);
+        let parsed = toml::from_str::<toml::Value>(&trusted).unwrap();
+        let projects = parsed["projects"].as_table().unwrap();
+
+        assert_eq!(projects.len(), 2);
+        assert!(trusted.contains(r#"[projects."C:\\Users\\O'Reilly\\Repo"]"#));
+        assert_eq!(
+            projects[r"C:\Users\O'Reilly\Repo"]["trust_level"].as_str(),
+            Some("trusted")
+        );
     }
 
     struct ScopedAgentAccountsEnv {
