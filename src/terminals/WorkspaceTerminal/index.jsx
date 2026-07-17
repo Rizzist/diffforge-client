@@ -11074,12 +11074,19 @@ function WorkspaceTerminal({
         if (resetWebgl) {
           resetTerminalWebglRenderer(reason);
         }
-        try {
-          terminal.clearTextureAtlas?.();
-        } catch (_error) {
-          // Best effort: the DOM renderer has no atlas and older builds may not
-          // expose this; the forced resize/refresh below still recovers paint.
-        }
+        // Do NOT clear the texture atlas here. @xterm/addon-webgl keeps a
+        // MODULE-GLOBAL glyph atlas (CharAtlasCache) shared by every terminal
+        // with the same font+theme — which all coding harnesses (Codex, Claude
+        // Code, OpenCode) match. terminal.clearTextureAtlas() wipes that SHARED
+        // atlas and bumps its page version while rebuilding only THIS terminal's
+        // render model; peer terminals then re-upload the cleared atlas but keep
+        // vertex data pointing at the old glyph coordinates, scrambling their
+        // glyphs (the "Codex colors leaking into Claude Code" corruption). The
+        // resize controller already treats atlas-clear as a no-op for this exact
+        // reason; reveal-recovery must not bypass it. Recovery here is
+        // instance-local instead: the first pass disposes+recreates THIS
+        // terminal's WebglAddon (resetWebgl above / attachDeferredWebgl below),
+        // plus the forced resize + full refresh — no shared-atlas mutation.
         void resizeController?.resizeNow(reason, {
           force: true,
           forceNative: true,
