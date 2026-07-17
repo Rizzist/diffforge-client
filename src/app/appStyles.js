@@ -2715,8 +2715,8 @@ export const RailTop = styled.div`
     height: 0;
   }
 
-  /* Collapsed keeps the (invisible) workspace list in layout; without this the
-     rail top could scroll the header/expand button out of view. */
+  /* Collapsed pins the rail top (no scrolling) so the header/expand button
+     can never scroll out of view above the icon rows. */
   ${WorkspaceRail}[data-collapsed="true"] & {
     overflow-y: hidden;
   }
@@ -2976,20 +2976,20 @@ export const WorkspaceList = styled.div`
   gap: 2px;
   /* RailTop owns scrolling; this stays a simple stack of workspace rows. */
   overflow: visible;
-  /* Fixed expanded width: while the rail animates, rows are CLIPPED by the
-     rail instead of reflowing/wrapping every frame; visibility (not
-     display:none) keeps the row reveal animations from restarting on expand.
-     Full rail width (RailTop bleeds to both edges) so row hover/selection
-     highlights run flush to the left AND right rail edges — row content stays
-     inset via each row's own padding. */
+  /* Fixed expanded width: while the rail expands, rows are CLIPPED by the
+     rail instead of reflowing/wrapping every frame. Full rail width (RailTop
+     bleeds to both edges) so row hover/selection highlights run flush to the
+     left AND right rail edges — row content stays inset via each row's own
+     padding. */
   width: var(--workspace-rail-width);
-  opacity: 1;
-  transition: opacity 150ms ease, visibility 0s;
 
+  /* Collapsed rail: rows stay visible as a compact icon rail. Width follows
+     the (animating) rail instead of the fixed expanded width so each row's
+     glyph re-centers inside the narrow column instead of keeping the
+     wide-rail left-aligned layout and getting clipped at the collapsed
+     edge. */
   ${WorkspaceRail}[data-collapsed="true"] & {
-    visibility: hidden;
-    opacity: 0;
-    transition: opacity 150ms ease, visibility 0s 150ms;
+    width: auto;
   }
 
   @media (max-width: 760px) {
@@ -3095,6 +3095,7 @@ export const WorkspaceButton = styled.button`
     border-color 160ms ease,
     color 160ms ease,
     gap 190ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    min-height 220ms cubic-bezier(0.2, 0.8, 0.2, 1),
     padding 220ms cubic-bezier(0.2, 0.8, 0.2, 1),
     grid-template-columns 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
 
@@ -3147,6 +3148,14 @@ export const WorkspaceButton = styled.button`
     --workspace-card-status-border: rgba(var(--forge-accent-soft-rgb), 0.42);
     --workspace-card-hover-bg: rgba(125, 160, 205, 0.055);
     --workspace-card-hover-border: rgba(125, 160, 205, 0.16);
+  }
+
+  /* Loopspace rows carry the loop theme: the status color goes dark gold
+     (matching WorkspaceAccent's loop rule), not workspace blue — the collapsed
+     glyph's corner status dot reads from this. */
+  &[data-space="loop"][data-runtime="activated"] {
+    --workspace-card-status: #d8b36a;
+    --workspace-card-status-border: rgba(216, 179, 106, 0.44);
   }
 
   html[data-forge-theme="light"] & {
@@ -3341,6 +3350,15 @@ export const WorkspaceCompactGlyph = styled.span.attrs({ "data-compact-glyph": "
   ${WorkspaceRail}[data-collapsed="true"] & {
     width: 28px;
     height: 28px;
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  /* Runtime status re-attaches to the icon while collapsed: the glyph's
+     corner dot stands in for the expanded row's status column so state stays
+     glanceable on the centered tile. */
+  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceButton}[data-runtime="activating"] &::after,
+  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceButton}[data-runtime="activated"] &::after {
     opacity: 1;
     transform: scale(1);
   }
@@ -3697,6 +3715,18 @@ export const RailRowSkeleton = styled.div`
     max-width: 56%;
   }
 
+  /* Collapsed: a single centered placeholder dot — the wide-rail dot+bar
+     layout would sit left-aligned and clipped inside the icon rail. */
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    grid-template-columns: minmax(0, 1fr);
+    justify-items: center;
+    padding: 4px;
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] & > span:not(:first-child) {
+    display: none;
+  }
+
   @media (prefers-reduced-motion: reduce) {
     animation: none;
   }
@@ -3708,6 +3738,11 @@ export const WorkspaceMuted = styled.p`
   color: var(--forge-text-muted);
   font-size: 11px;
   font-weight: 550;
+
+  /* No room for prose in the collapsed icon rail. */
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    display: none;
+  }
 `;
 
 export const RailFooter = styled.div`
@@ -3730,9 +3765,19 @@ export const RailFooter = styled.div`
     gap 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
     padding 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
 
-  /* The 2px scrollbar clearance skews the collapsed icon groups off-center. */
+  /* Collapsed: both the 2px scrollbar clearance AND the reserved
+     classic-scrollbar gutter (scrollbar-gutter: stable + the app's 9px
+     scrollbar) would skew the icon groups off-center in the 56px column, so
+     drop them; wheel/trackpad scrolling still works with the bar hidden. */
   ${WorkspaceRail}[data-collapsed="true"] & {
     padding-right: 0;
+    scrollbar-gutter: auto;
+    scrollbar-width: none;
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] &::-webkit-scrollbar {
+    width: 0;
+    height: 0;
   }
 
   html[data-forge-theme="light"] & {
@@ -4008,11 +4053,12 @@ export const RailActionButton = styled.button`
 
   /* Collapsed keeps the SAME grid (24px icon column + collapsed label column)
      and the SAME min-height: the icon lands dead-center because the button is
-     38px wide with symmetric 7px padding (7 + 24 + 7), and its position is a
-     pure function of the animating rail width — no grid flip, no jump, no
-     vertical shift. */
+     35px wide (43px rail content - the group's 8px border+padding) with
+     symmetric 5.5px padding around the 24px icon column (5.5 + 24 + 5.5), and
+     its position is a pure function of the animating rail width — no grid
+     flip, no jump, no vertical shift. */
   ${WorkspaceRail}[data-collapsed="true"] & {
-    padding: 0 7px;
+    padding: 0 5.5px;
   }
 
   /* No selection underline while collapsed — the active border/background on

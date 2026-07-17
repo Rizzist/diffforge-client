@@ -55423,9 +55423,10 @@ export default function App() {
                         )}
                       </RailCollapseButton>
                     </RailHeader>
-                    <WorkspaceList
-                      aria-hidden={workspaceRailCollapsed ? "true" : undefined}
-                    >
+                    {/* Rows stay visible (and interactive) as centered icon
+                        tiles when the rail is collapsed, so the list is never
+                        aria-hidden. */}
+                    <WorkspaceList>
                       {loopspacesModeActive ? (
                         <>
                           {loopspaces.map((loopspace) => (
