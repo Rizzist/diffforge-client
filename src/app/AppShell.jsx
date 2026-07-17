@@ -36,6 +36,10 @@ import { onRuntimeProfilerRender } from "../diagnostics/commitProfiler.js";
 import { authStore, DEFAULT_AUTH_MESSAGE, useAuthSnapshot } from "../authStore";
 import { listenShared, waitSharedListenerReady } from "./sharedTauriEvents.js";
 import {
+  normalizeLoopspaceTodoWorkspaceIds,
+  resolveLoopspaceTodoTerminalSelectors,
+} from "./loopspaceTodoDispatchTargets.js";
+import {
   buildPcbProjectInventory,
   buildVideoProjectInventory,
   findWorkspaceProjectMatch,
@@ -10334,6 +10338,26 @@ function LoopspaceRuntimeView({
     const batchId = loopspaceDispatchTodosBatchId(loopspaceId, node, normalized);
     const loopRuntimeRunId = loopspaceDispatchTodosRunId(loopspaceId, node);
     const targetTerminalIndex = Number.parseInt(normalized.target_terminal_index, 10);
+    const selectedDevice = loopspaceDispatchSelectedDeviceRow(
+      loopspaceGraphAccountDeviceRows,
+      normalized.device_id,
+    );
+    const targetIsLocalDevice = loopspaceDispatchTargetIsLocalDevice(
+      normalized.device_id,
+      localDesktopProfile,
+      loopspaceGraphAccountDeviceRows,
+    );
+    const targetTerminalSelectors = resolveLoopspaceTodoTerminalSelectors({
+      targetTerminalId: normalized.target_terminal_id,
+      targetTerminalIndex: Number.isFinite(targetTerminalIndex) ? targetTerminalIndex : null,
+      targetTerminalMode: normalized.target_terminal_mode,
+      targetTerminalName: normalized.target_terminal_name,
+      targetThreadId: normalized.target_thread_id,
+      targetWorkspaceIds: workspaceIds,
+      terminalWorkspaces: targetIsLocalDevice
+        ? workspaceTerminalsWorkspaces
+        : loopspaceDispatchWorkspaceRowsFromAccountDevice(selectedDevice),
+    });
     setDispatchTodosPendingNodeId(nodeId);
     setRuntimeError("");
     try {
@@ -10403,6 +10427,7 @@ function LoopspaceRuntimeView({
             || normalized.target_terminal_name
           ) ? "pinned" : "auto",
           target_terminal_name: normalized.target_terminal_name,
+          target_terminal_selectors: targetTerminalSelectors,
           target_thread_id: normalized.target_thread_id,
           todo_batch_id: batchId,
           todo_lines: normalized.todo_lines,
@@ -10438,6 +10463,7 @@ function LoopspaceRuntimeView({
     loopspaceId,
     onActivateWorkspaceForTodoDispatch,
     updateDispatchTodosNodeProps,
+    workspaceTerminalsWorkspaces,
   ]);
 
   const openLoopspaceGraphNodeSettings = useCallback((node) => {
@@ -45530,6 +45556,11 @@ export default function App() {
           const commandId = durableCommandId
             || `remote-command-${Date.now()}-${Math.random().toString(16).slice(2)}`;
           const commandKind = remoteCommandKind(event);
+          const dispatchTodosAction = [
+            "dispatch_todos",
+            "loopspace_dispatch_todos",
+            "loopspace_workspace_todo_dispatch",
+          ].includes(normalizeRemoteCommandName(commandKind));
           logBigViewSyncDiagnosticEvent("remote_control.trigger_received", {
             command_id: commandId,
             command_kind: commandKind,
@@ -45556,7 +45587,7 @@ export default function App() {
           });
           const sendMessageTask = remoteCommandIsSendMessageTask(commandKind);
           let text = remoteCommandText(event);
-          const workspaceId = sendMessageTask ? "" : remoteCommandWorkspaceId(event);
+          const workspaceId = sendMessageTask || dispatchTodosAction ? "" : remoteCommandWorkspaceId(event);
           const todoDispatchId = remoteCommandStringField(event, [
             "todo_dispatch_id",
           ]);
@@ -45646,7 +45677,7 @@ export default function App() {
               || Number.isInteger(targetTerminalIndex)
               || targetTerminalName,
           );
-          const resolvedRemoteTarget = workspaceId && hasExplicitRemoteTarget
+          const resolvedRemoteTarget = !dispatchTodosAction && workspaceId && hasExplicitRemoteTarget
             ? findRemoteControlTerminal(workspaceId, {
               target_terminal_id: targetTerminalId,
               target_terminal_index: targetTerminalIndex,
@@ -45713,11 +45744,6 @@ export default function App() {
           const navigationAction = remoteCommandIsNavigationAction(commandKind);
           const deviceOnlyNavigationAction = remoteCommandIsDeviceOnlyNavigationAction(commandKind);
           const terminalOrchestratorMessageAction = sendMessageTask;
-          const dispatchTodosAction = [
-            "dispatch_todos",
-            "loopspace_dispatch_todos",
-            "loopspace_workspace_todo_dispatch",
-          ].includes(normalizeRemoteCommandName(commandKind));
           const attachmentStageAction = [
             "chat_attachment_stage",
             "chat_attachments_stage",
@@ -45730,7 +45756,7 @@ export default function App() {
             "provider_restart_when_idle",
           ].includes(normalizeRemoteCommandName(commandKind));
           const receiptWorkspaceId = workspaceId
-            || (terminalOrchestratorMessageAction
+            || (terminalOrchestratorMessageAction || dispatchTodosAction
               ? DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID
               : agentPackageAction || deviceOnlyNavigationAction || attachmentStageAction || providerWideRestartAction
                 ? "device"
@@ -45750,6 +45776,7 @@ export default function App() {
             && !agentPackageAction
             && !deviceOnlyNavigationAction
             && !terminalOrchestratorMessageAction
+            && !dispatchTodosAction
             && !attachmentStageAction
           ) {
             await recordRemoteCommandStatus(
@@ -45814,6 +45841,95 @@ export default function App() {
                 .map(([key]) => key);
               staleKeys.forEach((key) => plansByRunId.delete(key));
             }
+          }
+          if (dispatchTodosAction) {
+            const targetTerminalMode = remoteCommandStringField(event, [
+              "target_terminal_mode",
+              "terminal_mode",
+            ]) || (hasTerminalTarget ? "pinned" : "auto");
+            const targetWorkspaceIdValues = remoteCommandArrayField(event, [
+              "target_workspace_ids",
+              "workspace_ids",
+              "workspaces",
+            ]);
+            const targetWorkspaceIds = normalizeLoopspaceTodoWorkspaceIds(
+              targetWorkspaceIdValues.length
+                ? targetWorkspaceIdValues
+                : remoteCommandStringField(event, [
+                  "target_workspace_ids",
+                  "workspace_ids",
+                  "target_workspace_id",
+                  "workspace_id",
+                ]),
+            );
+            const workspaceTerminalSelectors = resolveLoopspaceTodoTerminalSelectors({
+              targetTerminalId,
+              targetTerminalIndex,
+              targetTerminalMode,
+              targetTerminalName,
+              targetThreadId,
+              targetWorkspaceIds,
+              terminalWorkspaces: workspaceTerminalsWorkspacesRef.current || [],
+            });
+            try {
+              const result = await invoke("todo_store_dispatch_loopspace_batch", {
+                reason: "loopspace_dispatch_todos_remote_command",
+                request: {
+                  ...event,
+                  command_id: commandId,
+                  command_kind: "loopspace_dispatch_todos",
+                  loop_runtime_edge_id: loopRuntimeEdgeId,
+                  loop_runtime_node_id: loopRuntimeNodeId,
+                  loop_runtime_run_id: loopRuntimeRunId,
+                  loopspace_id: loopspaceRuntimeId,
+                  target_terminal_mode: targetTerminalMode,
+                  trigger_id: triggerRuntimeId,
+                  trigger_run_id: triggerRunRuntimeId,
+                  ...(targetTerminalId ? { target_terminal_id: targetTerminalId } : {}),
+                  ...(Number.isInteger(targetTerminalIndex) ? {
+                    target_terminal_index: targetTerminalIndex,
+                  } : {}),
+                  ...(targetTerminalName ? { target_terminal_name: targetTerminalName } : {}),
+                  target_terminal_selectors: workspaceTerminalSelectors,
+                  ...(targetThreadId ? { target_thread_id: targetThreadId } : {}),
+                  workspace_ids: targetWorkspaceIds,
+                },
+              });
+              const queuedCount = Number(result?.queued_count || 0);
+              const workspaceCount = Array.isArray(result?.workspaces) ? result.workspaces.length : 0;
+              setWorkspaceToolPaneMode(TODO_QUEUE_PANE_MODE_NORMAL);
+              if (queuedCount > 0) {
+                playNotificationSfx("todo.arrived");
+              }
+              await recordRemoteCommandStatus(
+                event,
+                "queued",
+                `Queued ${queuedCount} todo${queuedCount === 1 ? "" : "s"} across ${workspaceCount} workspace${workspaceCount === 1 ? "" : "s"}.`,
+                {
+                  command_id: commandId,
+                  command_kind: "loopspace_dispatch_todos",
+                  queued_count: queuedCount,
+                  target_terminal_id: targetTerminalId,
+                  target_terminal_index: targetTerminalIndex,
+                  target_terminal_mode: targetTerminalMode,
+                  target_thread_id: targetThreadId,
+                  todo_batch_id: result?.todo_batch_id || result?.batch_id || "",
+                  workspace_count: workspaceCount,
+                },
+              );
+            } catch (error) {
+              await recordRemoteCommandStatus(
+                event,
+                "failed",
+                getErrorMessage(error, "Unable to dispatch loopspace todos."),
+                {
+                  command_id: commandId,
+                  command_kind: "loopspace_dispatch_todos",
+                  loop_runtime_run_id: loopRuntimeRunId,
+                },
+              );
+            }
+            return;
           }
           if (terminalOrchestratorMessageAction) {
             if (!text) {

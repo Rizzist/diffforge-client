@@ -1060,6 +1060,7 @@ fn todo_dispatch_post_injection_message_ack_kind(
 enum TodoDispatchRemoteIntakeScopeDecision {
     Continue,
     MissingScope,
+    DeferLoopspaceTodoBatch,
     IgnoreOrchestratorSend,
     RustOrchestratorSend,
 }
@@ -1070,8 +1071,20 @@ fn todo_dispatch_remote_intake_scope_decision_for_webview(
     workspace_id: &str,
     webview_dispatcher_active: bool,
 ) -> TodoDispatchRemoteIntakeScopeDecision {
+    let command_kind = command_kind
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['.', ' ', '-'], "_");
+    if matches!(
+        command_kind.as_str(),
+        "dispatch_todos"
+            | "loopspace_dispatch_todos"
+            | "loopspace_workspace_todo_dispatch"
+    ) {
+        return TodoDispatchRemoteIntakeScopeDecision::DeferLoopspaceTodoBatch;
+    }
     if (workspace_id.is_empty() || todo_dispatch_is_app_control_workspace_id(workspace_id))
-        && todo_dispatch_remote_command_is_orchestrator_send_message(command_kind)
+        && todo_dispatch_remote_command_is_orchestrator_send_message(&command_kind)
     {
         return if webview_dispatcher_active {
             TodoDispatchRemoteIntakeScopeDecision::IgnoreOrchestratorSend
@@ -1254,6 +1267,10 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
         &workspace_id,
         todo_dispatch_webview_dispatcher_active(),
     ) {
+        TodoDispatchRemoteIntakeScopeDecision::DeferLoopspaceTodoBatch => {
+            // The webview owns list expansion and calls the Rust batch primitive.
+            return None;
+        }
         TodoDispatchRemoteIntakeScopeDecision::IgnoreOrchestratorSend => {
             // Orchestrator-targeted sends have no workspace scope; failing them
             // here makes cloud kill the loop runtime run while delivery still
@@ -2350,17 +2367,45 @@ fn todo_dispatch_queue_read(path: &Path) -> Value {
 }
 
 fn todo_store_enforce_terminal_id_assignment(item: &mut Value) {
-    let direct_terminal_id =
-        todo_dispatch_text(item, &["target_terminal_id", "terminal_id", "pane_id"]);
-    let remote_terminal_id = item
-        .get("remote_command")
-        .map(|remote| todo_dispatch_text(remote, &["target_terminal_id", "terminal_id", "pane_id"]))
-        .unwrap_or_default();
-    let target_terminal_id = if direct_terminal_id.is_empty() {
-        remote_terminal_id
-    } else {
+    let direct_terminal_id = todo_dispatch_text(item, &["target_terminal_id"]);
+    let direct_terminal_index = todo_dispatch_i64(item, &["target_terminal_index"]);
+    let direct_terminal_name = todo_dispatch_text(item, &["target_terminal_name"]);
+    let direct_thread_id = todo_dispatch_text(item, &["target_thread_id"]);
+    let has_direct_selector = !direct_terminal_id.is_empty()
+        || direct_terminal_index.is_some()
+        || !direct_terminal_name.is_empty()
+        || !direct_thread_id.is_empty();
+    let remote = item.get("remote_command");
+    let target_terminal_id = if has_direct_selector {
         direct_terminal_id
+    } else {
+        remote
+            .map(|value| todo_dispatch_text(value, &["target_terminal_id"]))
+            .unwrap_or_default()
     };
+    let target_terminal_index = if has_direct_selector {
+        direct_terminal_index
+    } else {
+        remote.and_then(|value| todo_dispatch_i64(value, &["target_terminal_index"]))
+    };
+    let target_terminal_name = if has_direct_selector {
+        direct_terminal_name
+    } else {
+        remote
+            .map(|value| todo_dispatch_text(value, &["target_terminal_name"]))
+            .unwrap_or_default()
+    };
+    let target_thread_id = if has_direct_selector {
+        direct_thread_id
+    } else {
+        remote
+            .map(|value| todo_dispatch_text(value, &["target_thread_id"]))
+            .unwrap_or_default()
+    };
+    let has_terminal_selector = !target_terminal_id.is_empty()
+        || target_terminal_index.is_some()
+        || !target_terminal_name.is_empty()
+        || !target_thread_id.is_empty();
     let target_keys = [
         "target_color_slot",
         "target_terminal_color",
@@ -2373,15 +2418,40 @@ fn todo_store_enforce_terminal_id_assignment(item: &mut Value) {
         "user_pinned_target",
     ];
     if let Some(object) = item.as_object_mut() {
-        if target_terminal_id.is_empty() {
+        if !has_terminal_selector {
             for key in target_keys {
                 object.remove(key);
             }
         } else {
-            object.insert(
-                "target_terminal_id".to_string(),
-                json!(target_terminal_id.clone()),
-            );
+            for key in [
+                "target_terminal_id",
+                "target_terminal_index",
+                "target_terminal_name",
+                "target_thread_id",
+            ] {
+                object.remove(key);
+            }
+            if !target_terminal_id.is_empty() {
+                object.insert(
+                    "target_terminal_id".to_string(),
+                    json!(target_terminal_id.clone()),
+                );
+            }
+            if let Some(index) = target_terminal_index {
+                object.insert("target_terminal_index".to_string(), json!(index));
+            }
+            if !target_terminal_name.is_empty() {
+                object.insert(
+                    "target_terminal_name".to_string(),
+                    json!(target_terminal_name.clone()),
+                );
+            }
+            if !target_thread_id.is_empty() {
+                object.insert(
+                    "target_thread_id".to_string(),
+                    json!(target_thread_id.clone()),
+                );
+            }
             object.insert("target_explicit".to_string(), json!(true));
             object.insert("explicit_target".to_string(), json!(true));
             object.insert("user_pinned_target".to_string(), json!(true));
@@ -2390,12 +2460,37 @@ fn todo_store_enforce_terminal_id_assignment(item: &mut Value) {
             .get_mut("remote_command")
             .and_then(Value::as_object_mut)
         {
-            if target_terminal_id.is_empty() {
+            if !has_terminal_selector {
                 for key in target_keys {
                     remote.remove(key);
                 }
             } else {
-                remote.insert("target_terminal_id".to_string(), json!(target_terminal_id));
+                for key in [
+                    "target_terminal_id",
+                    "target_terminal_index",
+                    "target_terminal_name",
+                    "target_thread_id",
+                ] {
+                    remote.remove(key);
+                }
+                if !target_terminal_id.is_empty() {
+                    remote.insert(
+                        "target_terminal_id".to_string(),
+                        json!(target_terminal_id),
+                    );
+                }
+                if let Some(index) = target_terminal_index {
+                    remote.insert("target_terminal_index".to_string(), json!(index));
+                }
+                if !target_terminal_name.is_empty() {
+                    remote.insert(
+                        "target_terminal_name".to_string(),
+                        json!(target_terminal_name),
+                    );
+                }
+                if !target_thread_id.is_empty() {
+                    remote.insert("target_thread_id".to_string(), json!(target_thread_id));
+                }
             }
         }
     }
@@ -5023,6 +5118,129 @@ fn todo_store_dispatch_insert_text(
     }
 }
 
+fn todo_store_dispatch_terminal_selector_from_value(
+    value: &Value,
+    include_terminal_id: bool,
+) -> serde_json::Map<String, Value> {
+    let target_terminal_id = include_terminal_id
+        .then(|| todo_dispatch_text(value, &["target_terminal_id", "terminal_id", "pane_id"]))
+        .unwrap_or_default();
+    let target_terminal_index = todo_store_dispatch_optional_i64(
+        value,
+        &["target_terminal_index", "terminal_index"],
+    );
+    let target_terminal_name =
+        todo_dispatch_text(value, &["target_terminal_name", "terminal_name"]);
+    let target_thread_id = todo_dispatch_text(value, &["target_thread_id", "thread_id"]);
+    let has_selector = !target_terminal_id.is_empty()
+        || target_terminal_index.is_some()
+        || !target_terminal_name.is_empty()
+        || !target_thread_id.is_empty();
+    let mut selector = serde_json::Map::new();
+    selector.insert(
+        "target_terminal_mode".to_string(),
+        json!(if has_selector { "pinned" } else { "auto" }),
+    );
+    if !target_terminal_id.is_empty() {
+        selector.insert(
+            "target_terminal_id".to_string(),
+            json!(target_terminal_id),
+        );
+    }
+    if let Some(index) = target_terminal_index {
+        selector.insert("target_terminal_index".to_string(), json!(index));
+    }
+    if !target_terminal_name.is_empty() {
+        selector.insert(
+            "target_terminal_name".to_string(),
+            json!(target_terminal_name),
+        );
+    }
+    if !target_thread_id.is_empty() {
+        selector.insert("target_thread_id".to_string(), json!(target_thread_id));
+    }
+    if has_selector {
+        selector.insert("target_explicit".to_string(), json!(true));
+        selector.insert("explicit_target".to_string(), json!(true));
+        selector.insert("user_pinned_target".to_string(), json!(true));
+    }
+    selector
+}
+
+fn todo_store_dispatch_terminal_selector_for_workspace(
+    request: &Value,
+    workspace_id: &str,
+    workspace_count: usize,
+) -> serde_json::Map<String, Value> {
+    if let Some(selectors) = todo_store_dispatch_array_field(
+        request,
+        &["target_terminal_selectors", "workspace_terminal_selectors"],
+    ) {
+        return selectors
+            .iter()
+            .find(|selector| {
+                todo_dispatch_text(
+                    selector,
+                    &["workspace_id", "target_workspace_id", "id"],
+                ) == workspace_id
+            })
+            .map(|selector| todo_store_dispatch_terminal_selector_from_value(selector, true))
+            .unwrap_or_else(|| {
+                todo_store_dispatch_terminal_selector_from_value(&json!({}), false)
+            });
+    }
+
+    let target_terminal_id =
+        todo_dispatch_text(request, &["target_terminal_id", "terminal_id", "pane_id"]);
+    let target_terminal_workspace_id = todo_dispatch_text(
+        request,
+        &[
+            "target_terminal_workspace_id",
+            "terminal_workspace_id",
+        ],
+    );
+    let include_terminal_id = target_terminal_id.is_empty()
+        || workspace_count == 1
+        || (!target_terminal_workspace_id.is_empty()
+            && target_terminal_workspace_id == workspace_id);
+    todo_store_dispatch_terminal_selector_from_value(request, include_terminal_id)
+}
+
+fn todo_store_dispatch_apply_terminal_selector(
+    object: &mut serde_json::Map<String, Value>,
+    selector: &serde_json::Map<String, Value>,
+) {
+    let selector_keys = [
+        "target_terminal_id",
+        "terminal_id",
+        "pane_id",
+        "target_terminal_index",
+        "terminal_index",
+        "target_terminal_mode",
+        "terminal_mode",
+        "target_terminal_name",
+        "terminal_name",
+        "target_thread_id",
+        "thread_id",
+        "target_explicit",
+        "explicit_target",
+        "user_pinned_target",
+    ];
+    for key in selector_keys {
+        object.remove(key);
+    }
+    if let Some(remote_command) = object
+        .get_mut("remote_command")
+        .and_then(Value::as_object_mut)
+    {
+        for key in selector_keys {
+            remote_command.remove(key);
+        }
+        remote_command.extend(selector.clone());
+    }
+    object.extend(selector.clone());
+}
+
 #[tauri::command(rename_all = "snake_case")]
 async fn todo_store_dispatch_loopspace_batch(
     app: AppHandle,
@@ -5059,27 +5277,11 @@ async fn todo_store_dispatch_loopspace_batch(
         } else {
             requested_batch_id
         };
-        let target_terminal_index = todo_store_dispatch_optional_i64(
-            &request,
-            &["target_terminal_index", "terminal_index"],
-        );
-        let target_terminal_id =
-            todo_dispatch_text(&request, &["target_terminal_id", "terminal_id", "pane_id"]);
-
         let mut base = serde_json::Map::new();
         for (target_key, source_keys) in [
             ("device_id", &["device_id", "source_device_id"][..]),
             ("target_device_id", &["target_device_id", "device_id"][..]),
             ("target_agent_id", &["target_agent_id", "agent_id"][..]),
-            (
-                "target_terminal_id",
-                &["target_terminal_id", "terminal_id", "pane_id"][..],
-            ),
-            (
-                "target_terminal_name",
-                &["target_terminal_name", "terminal_name"][..],
-            ),
-            ("target_thread_id", &["target_thread_id", "thread_id"][..]),
             ("model", &["model", "model_id"][..]),
             ("reasoning_effort", &["reasoning_effort", "effort"][..]),
             ("effort", &["effort", "reasoning_effort"][..]),
@@ -5104,10 +5306,6 @@ async fn todo_store_dispatch_loopspace_batch(
                 "command_kind",
                 &["command_kind", "kind", "type", "action"][..],
             ),
-            (
-                "target_terminal_mode",
-                &["target_terminal_mode", "terminal_mode"][..],
-            ),
         ] {
             todo_store_dispatch_insert_text(&mut base, &request, target_key, source_keys);
         }
@@ -5116,25 +5314,6 @@ async fn todo_store_dispatch_loopspace_batch(
                 "command_kind".to_string(),
                 json!("loopspace_dispatch_todos"),
             );
-        }
-        let default_target_terminal_mode = if !target_terminal_id.is_empty() {
-            "pinned"
-        } else {
-            "auto"
-        };
-        if !base.contains_key("target_terminal_mode") {
-            base.insert(
-                "target_terminal_mode".to_string(),
-                json!(default_target_terminal_mode),
-            );
-        }
-        if let Some(index) = target_terminal_index.filter(|_| !target_terminal_id.is_empty()) {
-            base.insert("target_terminal_index".to_string(), json!(index));
-        }
-        if !target_terminal_id.is_empty() {
-            base.insert("target_explicit".to_string(), json!(true));
-            base.insert("explicit_target".to_string(), json!(true));
-            base.insert("user_pinned_target".to_string(), json!(true));
         }
         base.insert("batch_id".to_string(), json!(batch_id.clone()));
         base.insert("todo_batch_id".to_string(), json!(batch_id.clone()));
@@ -5148,11 +5327,17 @@ async fn todo_store_dispatch_loopspace_batch(
         let mut workspace_results = Vec::new();
         let mut total_queued = 0usize;
 
+        let workspace_count = workspace_ids.len();
         for workspace_id in workspace_ids {
             let workspace_id = workspace_id.trim().to_string();
             if workspace_id.is_empty() || todo_dispatch_workspace_is_deleted(&workspace_id) {
                 continue;
             }
+            let terminal_selector = todo_store_dispatch_terminal_selector_for_workspace(
+                &request,
+                &workspace_id,
+                workspace_count,
+            );
             let mut stored_items = todo_dispatch_data_path("queues", &workspace_id)
                 .map(|path| {
                     todo_dispatch_queue_read(&path)
@@ -5173,6 +5358,10 @@ async fn todo_store_dispatch_loopspace_batch(
                         draft_object.insert(key.clone(), value.clone());
                     }
                 }
+                todo_store_dispatch_apply_terminal_selector(
+                    &mut draft_object,
+                    &terminal_selector,
+                );
                 todo_store_sanitize_loopspace_dispatch_draft(&mut draft_object, sequence);
                 let requested_todo_id = todo_dispatch_text(
                     &Value::Object(draft_object.clone()),
@@ -7892,6 +8081,34 @@ mod todo_store_tests {
     }
 
     #[test]
+    fn remote_intake_defers_loopspace_todo_batches_without_singular_workspace() {
+        for command_kind in [
+            "dispatch_todos",
+            "loopspace.dispatch-todos",
+            "loopspace_workspace_todo_dispatch",
+        ] {
+            assert_eq!(
+                todo_dispatch_remote_intake_scope_decision_for_webview(
+                    command_kind,
+                    "looprun-1",
+                    "",
+                    true,
+                ),
+                TodoDispatchRemoteIntakeScopeDecision::DeferLoopspaceTodoBatch
+            );
+            assert_eq!(
+                todo_dispatch_remote_intake_scope_decision_for_webview(
+                    command_kind,
+                    "looprun-1",
+                    "",
+                    false,
+                ),
+                TodoDispatchRemoteIntakeScopeDecision::DeferLoopspaceTodoBatch
+            );
+        }
+    }
+
+    #[test]
     fn todo_dispatch_intake_keeps_workspace_send_message_in_queue_flow() {
         let event = json!({
             "command_kind": "terminal_orchestrator_send_message",
@@ -8880,6 +9097,221 @@ mod todo_store_tests {
         ] {
             assert!(value.get(key).is_none(), "{key} should be removed");
         }
+    }
+
+    #[test]
+    fn loopspace_dispatch_batch_parses_workspace_todo_and_terminal_contract() {
+        let request = json!({
+            "payload": {
+                "target_workspace_ids": ["workspace-a", "workspace-b", "workspace-a"],
+                "todo_lines": "First todo\nSecond todo",
+                "target_terminal_index": "2"
+            }
+        });
+
+        assert_eq!(
+            todo_store_dispatch_workspace_ids(&request),
+            vec!["workspace-a".to_string(), "workspace-b".to_string()]
+        );
+        assert_eq!(
+            todo_store_dispatch_todo_drafts(&request),
+            vec![
+                json!({ "text": "First todo" }),
+                json!({ "text": "Second todo" })
+            ]
+        );
+        assert_eq!(
+            todo_store_dispatch_optional_i64(
+                &request,
+                &["target_terminal_index", "terminal_index"]
+            ),
+            Some(2)
+        );
+    }
+
+    fn loopspace_dispatch_post_batch_test_item(
+        request: &Value,
+        workspace_id: &str,
+        workspace_count: usize,
+    ) -> Value {
+        let selector = todo_store_dispatch_terminal_selector_for_workspace(
+            request,
+            workspace_id,
+            workspace_count,
+        );
+        let mut draft = json!({
+            "command_kind": "loopspace_dispatch_todos",
+            "id": format!("todo-{workspace_id}"),
+            "source": "loopspace-dispatch-todos",
+            "text": "Run the dispatched todo"
+        })
+        .as_object()
+        .cloned()
+        .expect("dispatch draft object");
+        todo_store_dispatch_apply_terminal_selector(&mut draft, &selector);
+        todo_store_build_created_item(
+            workspace_id,
+            &Value::Object(draft),
+            "loopspace_dispatch_test",
+        )
+        .expect("post-batch item")
+    }
+
+    #[test]
+    fn loopspace_dispatch_batch_assigns_index_within_each_workspace() {
+        let request = json!({
+            "target_terminal_selectors": [
+                { "workspace_id": "workspace-a", "target_terminal_index": 2 },
+                { "workspace_id": "workspace-b", "target_terminal_index": 2 }
+            ]
+        });
+        let item_a = loopspace_dispatch_post_batch_test_item(&request, "workspace-a", 2);
+        let selector_b = todo_store_dispatch_terminal_selector_for_workspace(
+            &request,
+            "workspace-b",
+            2,
+        );
+        let mut stale_b_draft = json!({
+            "command_kind": "loopspace_dispatch_todos",
+            "id": "todo-workspace-b",
+            "remote_command": {
+                "target_terminal_id": "pane-a-2",
+                "target_terminal_index": 2
+            },
+            "source": "loopspace-dispatch-todos",
+            "target_terminal_id": "pane-a-2",
+            "target_terminal_index": 2,
+            "text": "Run the dispatched todo"
+        })
+        .as_object()
+        .cloned()
+        .expect("workspace-b stale dispatch draft");
+        todo_store_dispatch_apply_terminal_selector(&mut stale_b_draft, &selector_b);
+        let item_b = todo_store_build_created_item(
+            "workspace-b",
+            &Value::Object(stale_b_draft),
+            "loopspace_dispatch_test",
+        )
+        .expect("workspace-b post-batch item");
+        let entries_a = vec![
+            json!({ "pane_id": "pane-a-0", "terminal_index": 0 }),
+            json!({ "pane_id": "pane-a-2", "terminal_index": 2 }),
+        ];
+        let entries_b = vec![
+            json!({ "pane_id": "pane-b-0", "terminal_index": 0 }),
+            json!({ "pane_id": "pane-b-2", "terminal_index": 2 }),
+        ];
+
+        assert_eq!(item_a["target_terminal_index"], 2);
+        assert_eq!(item_b["target_terminal_index"], 2);
+        assert!(item_b["remote_command"]
+            .get("target_terminal_id")
+            .is_none());
+        assert_eq!(
+            todo_dispatch_backend_pick_target_from_entries(&entries_a, &item_a)
+                .map(|entry| todo_dispatch_text(&entry, &["pane_id"])),
+            Some("pane-a-2".to_string())
+        );
+        assert_eq!(
+            todo_dispatch_backend_pick_target_from_entries(&entries_b, &item_b)
+                .map(|entry| todo_dispatch_text(&entry, &["pane_id"])),
+            Some("pane-b-2".to_string())
+        );
+    }
+
+    #[test]
+    fn loopspace_dispatch_batch_scopes_pane_id_to_its_workspace() {
+        let request = json!({
+            "target_terminal_selectors": [
+                {
+                    "workspace_id": "workspace-a",
+                    "target_terminal_id": "pane-a-2",
+                    "target_terminal_index": 2
+                },
+                { "workspace_id": "workspace-b", "target_terminal_mode": "auto" }
+            ]
+        });
+        let item_a = loopspace_dispatch_post_batch_test_item(&request, "workspace-a", 2);
+        let selector_b = todo_store_dispatch_terminal_selector_for_workspace(
+            &request,
+            "workspace-b",
+            2,
+        );
+        let mut stale_b_draft = json!({
+            "command_kind": "loopspace_dispatch_todos",
+            "id": "todo-workspace-b",
+            "remote_command": {
+                "pane_id": "pane-a-2",
+                "target_terminal_index": 2
+            },
+            "source": "loopspace-dispatch-todos",
+            "pane_id": "pane-a-2",
+            "target_terminal_index": 2,
+            "text": "Run the dispatched todo"
+        })
+        .as_object()
+        .cloned()
+        .expect("workspace-b stale dispatch draft");
+        todo_store_dispatch_apply_terminal_selector(&mut stale_b_draft, &selector_b);
+        let item_b = todo_store_build_created_item(
+            "workspace-b",
+            &Value::Object(stale_b_draft),
+            "loopspace_dispatch_test",
+        )
+        .expect("workspace-b post-batch item");
+        let entries_a = vec![json!({ "pane_id": "pane-a-2", "terminal_index": 2 })];
+        let entries_b = vec![json!({ "pane_id": "pane-b-0", "terminal_index": 0 })];
+
+        assert_eq!(item_a["target_terminal_id"], "pane-a-2");
+        assert!(item_b.get("target_terminal_id").is_none());
+        assert!(item_b.get("target_terminal_index").is_none());
+        assert!(item_b["remote_command"]
+            .get("target_terminal_id")
+            .is_none());
+        assert!(item_b["remote_command"].get("pane_id").is_none());
+        assert_eq!(
+            todo_dispatch_backend_pick_target_from_entries(&entries_a, &item_a)
+                .map(|entry| todo_dispatch_text(&entry, &["pane_id"])),
+            Some("pane-a-2".to_string())
+        );
+        assert_eq!(
+            todo_dispatch_backend_pick_target_from_entries(&entries_b, &item_b)
+                .map(|entry| todo_dispatch_text(&entry, &["pane_id"])),
+            Some("pane-b-0".to_string())
+        );
+    }
+
+    #[test]
+    fn loopspace_dispatch_batch_keeps_any_terminal_per_workspace() {
+        let request = json!({
+            "target_terminal_selectors": [
+                { "workspace_id": "workspace-a", "target_terminal_mode": "auto" },
+                { "workspace_id": "workspace-b", "target_terminal_mode": "auto" }
+            ]
+        });
+        let item_a = loopspace_dispatch_post_batch_test_item(&request, "workspace-a", 2);
+        let item_b = loopspace_dispatch_post_batch_test_item(&request, "workspace-b", 2);
+
+        assert_eq!(item_a["target_terminal_mode"], "auto");
+        assert_eq!(item_b["target_terminal_mode"], "auto");
+        assert!(item_a.get("target_terminal_id").is_none());
+        assert!(item_b.get("target_terminal_id").is_none());
+        assert_eq!(
+            todo_dispatch_backend_pick_target_from_entries(
+                &[json!({ "pane_id": "pane-a-0", "terminal_index": 0 })],
+                &item_a,
+            )
+            .map(|entry| todo_dispatch_text(&entry, &["pane_id"])),
+            Some("pane-a-0".to_string())
+        );
+        assert_eq!(
+            todo_dispatch_backend_pick_target_from_entries(
+                &[json!({ "pane_id": "pane-b-0", "terminal_index": 0 })],
+                &item_b,
+            )
+            .map(|entry| todo_dispatch_text(&entry, &["pane_id"])),
+            Some("pane-b-0".to_string())
+        );
     }
 
     #[test]
@@ -11636,7 +12068,7 @@ mod todo_dispatch_backend_tests {
     }
 
     #[test]
-    fn backend_target_picker_requires_terminal_id_and_treats_other_hints_as_generic() {
+    fn backend_target_picker_resolves_index_name_and_thread_without_terminal_id() {
         let entries = vec![
             json!({
                 "agent_id": "codex",
@@ -11660,7 +12092,7 @@ mod todo_dispatch_backend_tests {
                 &json!({ "target_thread_id": "thread-b" }),
             )
             .map(|entry| todo_dispatch_text(&entry, &["pane_id"])),
-            Some("pane-a".to_string()),
+            Some("pane-b".to_string()),
         );
         assert_eq!(
             todo_dispatch_backend_pick_target_from_entries(
@@ -11668,7 +12100,7 @@ mod todo_dispatch_backend_tests {
                 &json!({ "target_terminal_index": 1 }),
             )
             .map(|entry| todo_dispatch_text(&entry, &["pane_id"])),
-            Some("pane-a".to_string()),
+            Some("pane-b".to_string()),
         );
         assert_eq!(
             todo_dispatch_backend_pick_target_from_entries(
@@ -11676,7 +12108,7 @@ mod todo_dispatch_backend_tests {
                 &json!({ "target_terminal_name": " build   claude " }),
             )
             .map(|entry| todo_dispatch_text(&entry, &["pane_id"])),
-            Some("pane-a".to_string()),
+            Some("pane-b".to_string()),
         );
         assert_eq!(
             todo_dispatch_backend_pick_target_from_entries(
@@ -11694,7 +12126,7 @@ mod todo_dispatch_backend_tests {
     }
 
     #[test]
-    fn todo_store_drops_terminal_assignment_fields_without_terminal_id() {
+    fn todo_store_retains_terminal_assignment_fields_without_terminal_id() {
         let mut generic = json!({
             "id": "todo-generic",
             "target_explicit": true,
@@ -11708,12 +12140,12 @@ mod todo_dispatch_backend_tests {
             }
         });
         todo_store_enforce_terminal_id_assignment(&mut generic);
-        assert!(generic.get("target_terminal_index").is_none());
-        assert!(generic.get("target_thread_id").is_none());
-        assert!(generic.get("target_explicit").is_none());
-        assert!(generic["remote_command"]
-            .get("target_terminal_index")
-            .is_none());
+        assert_eq!(generic["target_terminal_index"], 2);
+        assert_eq!(generic["target_terminal_name"], "orange terminal");
+        assert_eq!(generic["target_thread_id"], "thread-2");
+        assert_eq!(generic["target_explicit"], true);
+        assert_eq!(generic["remote_command"]["target_terminal_index"], 2);
+        assert_eq!(generic["remote_command"]["target_thread_id"], "thread-2");
 
         let mut targeted = json!({
             "id": "todo-targeted",
@@ -12584,6 +13016,14 @@ fn todo_dispatch_backend_swarm_target(item: &Value, workspace_id: Option<&str>) 
     Some(target)
 }
 
+fn todo_dispatch_backend_terminal_name_key(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
 fn todo_dispatch_backend_pick_target_from_entries(
     entries: &[Value],
     item: &Value,
@@ -12595,6 +13035,14 @@ fn todo_dispatch_backend_pick_target_from_entries(
         return None;
     }
     let target_pane = todo_dispatch_text(item, &["target_terminal_id", "terminal_id", "pane_id"]);
+    let target_thread = todo_dispatch_text(item, &["target_thread_id", "thread_id"]);
+    let target_index = todo_dispatch_i64(item, &["target_terminal_index", "terminal_index"]);
+    let target_name = todo_dispatch_backend_terminal_name_key(&todo_dispatch_text(
+        item,
+        &["target_terminal_name", "terminal_name"],
+    ));
+    let has_equivalent_selector =
+        !target_thread.is_empty() || target_index.is_some() || !target_name.is_empty();
     let target_agent =
         todo_dispatch_backend_agent_value(item, &["target_agent_id", "agent_id", "agent_kind"]);
     let target_agent = if target_agent.is_empty() {
@@ -12615,6 +13063,42 @@ fn todo_dispatch_backend_pick_target_from_entries(
                 // longer live, do not silently redirect the todo by index,
                 // name, thread, or array position.
                 None
+            } else if has_equivalent_selector {
+                entries
+                    .iter()
+                    .find(|entry| {
+                        !target_thread.is_empty()
+                            && todo_dispatch_text(entry, &["thread_id", "target_thread_id"])
+                                == target_thread
+                    })
+                    .or_else(|| {
+                        target_index.and_then(|index| {
+                            entries.iter().find(|entry| {
+                                todo_dispatch_i64(entry, &["terminal_index", "index"])
+                                    == Some(index)
+                            })
+                        })
+                    })
+                    .or_else(|| {
+                        (!target_name.is_empty()).then(|| {
+                            entries.iter().find(|entry| {
+                                [
+                                    "terminal_nickname",
+                                    "terminal_name",
+                                    "display_name",
+                                    "agent_display_name",
+                                    "name",
+                                ]
+                                .iter()
+                                .any(|key| {
+                                    todo_dispatch_backend_terminal_name_key(
+                                        entry.get(*key).and_then(Value::as_str).unwrap_or_default(),
+                                    ) == target_name
+                                })
+                            })
+                        })
+                        .flatten()
+                    })
             } else if let Some(agent) = target_agent.as_deref() {
                 entries.iter().find(|entry| {
                     todo_dispatch_backend_agent_value(entry, &["agent_id"]) == agent
