@@ -46,6 +46,7 @@ import { Security } from "@styled-icons/material-rounded/Security";
 import { Settings } from "@styled-icons/material-rounded/Settings";
 import { ContentCut } from "@styled-icons/material-rounded/ContentCut";
 import { SmartToy } from "@styled-icons/material-rounded/SmartToy";
+import { SyncAlt } from "@styled-icons/material-rounded/SyncAlt";
 import { Terminal as TerminalIcon } from "@styled-icons/material-rounded/Terminal";
 import { TerminalFill as AgentTerminalGlyph } from "@styled-icons/bootstrap/TerminalFill";
 import { LayoutSplit } from "@styled-icons/bootstrap/LayoutSplit";
@@ -2703,6 +2704,16 @@ export const RailTop = styled.div`
      now clips at the rail edge. */
   margin-left: -8px;
   margin-right: -8px;
+  /* Overlay-style scrolling: the app's classic 9px scrollbar would carve a
+     gutter out of this container and clip the full-bleed rows (and the rows'
+     hover controls) short of the rail's right edge. Hide it here — wheel and
+     trackpad scrolling still work. */
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+  }
 
   /* Collapsed keeps the (invisible) workspace list in layout; without this the
      rail top could scroll the header/expand button out of view. */
@@ -2718,6 +2729,10 @@ export const RailHeader = styled.div`
   grid-template-columns: minmax(0, 1fr) 22px 22px;
   align-items: center;
   gap: 5px;
+  /* RailTop bleeds to the rail edges for full-width rows, so the header
+     re-insets itself: 14px left matches the rows' content inset, 6px right
+     keeps the collapse button off the rail's right edge. */
+  padding: 0 6px 0 14px;
   opacity: 1;
   animation: ${railContentReveal} 220ms cubic-bezier(0.2, 0.8, 0.2, 1) 80ms both;
   transition:
@@ -2727,6 +2742,7 @@ export const RailHeader = styled.div`
   ${WorkspaceRail}[data-collapsed="true"] & {
     grid-template-columns: 0 0 22px;
     gap: 0;
+    padding: 0;
     justify-content: center;
     justify-items: center;
   }
@@ -2873,6 +2889,86 @@ export const RailCreateWorkspaceButton = styled(RailCollapseButton)`
   }
 `;
 
+/* Groups the section title with the space-mode switch glyph in the header's
+   leading (1fr) column. Deliberately no min-width/overflow clamp: the header
+   budget is tight ("WORKSPACES" ~74px vs an ~85px column), so if the label +
+   glyph outgrow the column by a hair on wider font metrics they borrow from
+   the 5px column gap instead of clipping the label. The collapsed rail
+   squeezes both children to zero width (see below), not this wrapper. */
+export const RailTitleGroup = styled.div`
+  display: flex;
+  align-items: center;
+`;
+
+/* Workspaces <-> Loopspaces switcher right of the section title, mirroring the
+   live demo's inline "⇄" affordance (RailModeButton's glyph): a bare muted
+   glyph — the header has no room for another 22px chrome button beside the
+   title. Collapsed rail hides it the same way the title hides (max-width to
+   0), keeping the header collapse animation intact. */
+export const RailSpaceModeSwitchButton = styled.button`
+  display: inline-flex;
+  flex: 0 0 auto;
+  width: 11px;
+  max-width: 11px;
+  height: 18px;
+  align-items: center;
+  justify-content: center;
+  margin: 0 0 0 4px;
+  padding: 0;
+  border: 0;
+  color: var(--forge-text-disabled);
+  background: transparent;
+  cursor: pointer;
+  line-height: 0;
+  opacity: 0.85;
+  overflow: hidden;
+  transition:
+    color 160ms ease,
+    max-width 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    margin 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 150ms ease;
+
+  svg {
+    display: block;
+    flex: 0 0 auto;
+  }
+
+  &:hover,
+  &:focus-visible {
+    color: var(--forge-accent-soft);
+    opacity: 1;
+    outline: none;
+  }
+
+  &[data-mode="loopspaces"] {
+    color: var(--forge-amber);
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    max-width: 0;
+    margin-left: 0;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  /* The 152px rail (below 980px) has no slack left of the "+" button; the
+     title itself stays the mode toggle there. */
+  @media (max-width: 980px) {
+    max-width: 0;
+    margin-left: 0;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  /* Below 760px the rail spans the full window width again. */
+  @media (max-width: 760px) {
+    max-width: 11px;
+    margin-left: 4px;
+    opacity: 0.85;
+    pointer-events: auto;
+  }
+`;
+
 export const WorkspaceList = styled.div`
   display: grid;
   min-width: 0;
@@ -2880,11 +2976,13 @@ export const WorkspaceList = styled.div`
   gap: 2px;
   /* RailTop owns scrolling; this stays a simple stack of workspace rows. */
   overflow: visible;
-  padding-right: 2px;
   /* Fixed expanded width: while the rail animates, rows are CLIPPED by the
      rail instead of reflowing/wrapping every frame; visibility (not
-     display:none) keeps the row reveal animations from restarting on expand. */
-  width: calc(var(--workspace-rail-width) - 16px);
+     display:none) keeps the row reveal animations from restarting on expand.
+     Full rail width (RailTop bleeds to both edges) so row hover/selection
+     highlights run flush to the left AND right rail edges — row content stays
+     inset via each row's own padding. */
+  width: var(--workspace-rail-width);
   opacity: 1;
   transition: opacity 150ms ease, visibility 0s;
 
@@ -3095,10 +3193,9 @@ export const WorkspaceButton = styled.button`
   }
 
   &[data-selected="true"] {
-    /* Full-width selection band — no outline/ring. A flush left accent bar marks
-       the selection (the name also goes bold). */
+    /* Full-width selection band — just a clean tinted background, no
+       outline/ring/accent bar (the name also goes bold). */
     background: var(--workspace-card-selected-bg);
-    box-shadow: inset 2px 0 0 var(--workspace-card-selected-border);
   }
 
   ${WorkspaceRail}[data-collapsed="true"] & {
@@ -3414,7 +3511,10 @@ export const WorkspaceSettingsButton = styled.button`
 
 export const WorkspaceLifecycleButton = styled(WorkspaceSettingsButton)`
   right: auto;
-  left: 2px;
+  /* Seat the hover cross centered over the status dot (dot center sits at
+     x = 21px: the row's 14px content inset + half the 14px accent column) so
+     the dot is fully covered instead of peeking out beside the button. */
+  left: 9px;
   border-radius: 6px;
   color: #d7e7ff;
   background:
@@ -24691,6 +24791,12 @@ export const ButtonRailCollapseIcon = styled(KeyboardDoubleArrowLeft)`
 
 export const ButtonRailExpandIcon = styled(KeyboardDoubleArrowRight)`
   ${buttonIconSize}
+`;
+
+export const ButtonRailSpaceModeIcon = styled(SyncAlt)`
+  width: 11px;
+  height: 11px;
+  flex: 0 0 auto;
 `;
 
 export const FileChevronIcon = styled(ChevronRight)`

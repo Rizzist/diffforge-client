@@ -523,6 +523,8 @@ import {
   RailHeader,
   RailTop,
   RailSectionTitle,
+  RailTitleGroup,
+  RailSpaceModeSwitchButton,
   RailCollapseButton,
   RailCreateWorkspaceButton,
   WorkspaceList,
@@ -979,6 +981,7 @@ import {
   ButtonCheckIcon,
   ButtonRailCollapseIcon,
   ButtonRailExpandIcon,
+  ButtonRailSpaceModeIcon,
   FileChevronIcon,
   FileExpandIcon,
   FileFolderTreeIcon,
@@ -55364,19 +55367,34 @@ export default function App() {
                 >
                   <RailTop>
                     <RailHeader>
-                      <RailSectionTitle
-                        aria-label={railSpaceModeTitle}
-                        aria-pressed={loopspacesModeActive}
-                        data-mode={spaceMode}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          toggleRailSpaceMode();
-                        }}
-                        title={railSpaceModeTitle}
-                        type="button"
-                      >
-                        {railSpaceModeLabel}
-                      </RailSectionTitle>
+                      <RailTitleGroup>
+                        <RailSectionTitle
+                          aria-label={railSpaceModeTitle}
+                          aria-pressed={loopspacesModeActive}
+                          data-mode={spaceMode}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            toggleRailSpaceMode();
+                          }}
+                          title={railSpaceModeTitle}
+                          type="button"
+                        >
+                          {railSpaceModeLabel}
+                        </RailSectionTitle>
+                        <RailSpaceModeSwitchButton
+                          aria-label={railSpaceModeTitle}
+                          aria-pressed={loopspacesModeActive}
+                          data-mode={spaceMode}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            toggleRailSpaceMode();
+                          }}
+                          title={railSpaceModeTitle}
+                          type="button"
+                        >
+                          <ButtonRailSpaceModeIcon aria-hidden="true" />
+                        </RailSpaceModeSwitchButton>
+                      </RailTitleGroup>
                       <RailCreateWorkspaceButton
                         aria-label={loopspacesModeActive ? "Create loop" : "Create workspace"}
                         onClick={(event) => {
