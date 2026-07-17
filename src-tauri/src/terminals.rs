@@ -25247,9 +25247,16 @@ fn terminal_write_source_is_permission_config(prompt_event_source: Option<&str>)
         })
 }
 
+fn terminal_write_source_is_idle_escape(prompt_event_source: Option<&str>) -> bool {
+    prompt_event_source
+        .map(|source| terminal_projection_text(source, ""))
+        .is_some_and(|source| matches!(source.as_str(), "terminal_idle_escape" | "terminal-idle-escape"))
+}
+
 fn terminal_write_source_suppresses_prompt_tracking(prompt_event_source: Option<&str>) -> bool {
     terminal_write_source_is_model_change(prompt_event_source)
         || terminal_write_source_is_permission_config(prompt_event_source)
+        || terminal_write_source_is_idle_escape(prompt_event_source)
 }
 
 fn terminal_write_escape_should_interrupt(
@@ -25262,6 +25269,22 @@ fn terminal_write_escape_should_interrupt(
         && coordination_active
         && !terminal_write_is_prompt_answer(prompt_event_source, todo_action)
         && !terminal_write_source_suppresses_prompt_tracking(prompt_event_source)
+}
+
+fn terminal_runtime_accepts_interrupt(runtime: &TerminalRuntimeSnapshot) -> bool {
+    runtime.turn_active
+        && !runtime.input_ready
+        && matches!(
+            terminal_projection_text(&runtime.canonical_state, "").as_str(),
+            "thinking" | "uir" | "paused"
+        )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TerminalInterruptOutcome {
+    InterruptApplied,
+    IdleNoop,
 }
 
 fn terminal_permission_config_input_is_allowed(data: &str) -> bool {
@@ -25671,13 +25694,32 @@ async fn terminal_write_inner(
         .is_some_and(|interaction| {
             terminal_structured_answer_bypasses_interrupt(&interaction, &data)
         });
-    let escape_should_interrupt = !structured_answer_bypasses_interrupt
+    let escape_interrupt_candidate = !structured_answer_bypasses_interrupt
         && terminal_write_escape_should_interrupt(
             &data,
             instance.coordination.is_some(),
             prompt_event_source.as_deref(),
             todo_action.as_deref(),
         );
+    let escape_should_interrupt = if escape_interrupt_candidate {
+        let interrupt_runtime = terminal_runtime_snapshot(&instance);
+        let accepts_interrupt = terminal_runtime_accepts_interrupt(&interrupt_runtime);
+        if !accepts_interrupt {
+            log_terminal_status_event(
+                "backend.terminal_write.escape_idle_fallthrough",
+                json!({
+                    "canonical_state": interrupt_runtime.canonical_state,
+                    "input_ready": interrupt_runtime.input_ready,
+                    "instance_id": instance.id,
+                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    "turn_active": interrupt_runtime.turn_active,
+                }),
+            );
+        }
+        accepts_interrupt
+    } else {
+        false
+    };
     if escape_should_interrupt {
         let active_task_id = instance
             .active_task
@@ -25686,7 +25728,7 @@ async fn terminal_write_inner(
             .as_ref()
             .map(|task| task.task_id.clone());
         write_terminal_interrupt_escape(&instance).await?;
-        publish_terminal_provider_turn_interrupted(
+        let publish_outcome = publish_terminal_provider_turn_interrupted(
             &app,
             state,
             cloud_mcp_state,
@@ -25694,6 +25736,9 @@ async fn terminal_write_inner(
             "escape_key",
         )
         .await?;
+        if publish_outcome == TerminalInterruptOutcome::IdleNoop {
+            return Ok(());
+        }
         mark_terminal_active_task_interrupted(
             cloud_mcp_state,
             &pane_id,
@@ -28507,8 +28552,21 @@ async fn publish_terminal_provider_turn_interrupted(
     cloud_mcp_state: &CloudMcpState,
     instance: &TerminalInstance,
     reason: &str,
-) -> Result<(), String> {
+) -> Result<TerminalInterruptOutcome, String> {
     let runtime = terminal_runtime_snapshot(instance);
+    if !terminal_runtime_accepts_interrupt(&runtime) {
+        log_terminal_status_event(
+            "backend.terminal_interrupt.publish_idle_noop",
+            json!({
+                "canonical_state": runtime.canonical_state,
+                "input_ready": runtime.input_ready,
+                "instance_id": instance.id,
+                "reason": clean_terminal_diagnostic_log_text(reason),
+                "turn_active": runtime.turn_active,
+            }),
+        );
+        return Ok(TerminalInterruptOutcome::IdleNoop);
+    }
     let event = terminal_activity_watchdog_event(
         instance,
         &runtime,
@@ -28533,9 +28591,23 @@ async fn publish_terminal_provider_turn_interrupted(
         || applied.command_phase != "interrupted"
         || applied.input_ready
     {
+        if !terminal_runtime_accepts_interrupt(&applied) {
+            log_terminal_status_event(
+                "backend.terminal_interrupt.reducer_race_noop",
+                json!({
+                    "canonical_state": applied.canonical_state,
+                    "event_type": applied.event_type,
+                    "input_ready": applied.input_ready,
+                    "instance_id": instance.id,
+                    "reason": clean_terminal_diagnostic_log_text(reason),
+                    "turn_active": applied.turn_active,
+                }),
+            );
+            return Ok(TerminalInterruptOutcome::IdleNoop);
+        }
         return Err("Unable to publish terminal interrupt runtime state.".to_string());
     }
-    Ok(())
+    Ok(TerminalInterruptOutcome::InterruptApplied)
 }
 
 async fn mark_terminal_active_task_interrupted(
@@ -28645,10 +28717,25 @@ async fn interrupt_terminal_parked_prompts(
 
 #[derive(Serialize)]
 struct TerminalInterruptAgentResult {
+    outcome: TerminalInterruptOutcome,
+    session_found: bool,
     interrupted_active_task: bool,
     interrupted_parked_prompt_count: usize,
     interrupted_todo_count: usize,
     wrote_escape: bool,
+}
+
+impl TerminalInterruptAgentResult {
+    fn idle_noop(session_found: bool, wrote_escape: bool) -> Self {
+        Self {
+            outcome: TerminalInterruptOutcome::IdleNoop,
+            session_found,
+            interrupted_active_task: false,
+            interrupted_parked_prompt_count: 0,
+            interrupted_todo_count: 0,
+            wrote_escape,
+        }
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -28706,14 +28793,26 @@ async fn terminal_interrupt_agent_inner(
     validate_terminal_pane_id(&pane_id)?;
     let Some(instance) = get_terminal_instance_if_current(state, &pane_id, instance_id).await?
     else {
-        return Ok(TerminalInterruptAgentResult {
-            interrupted_active_task: false,
-            interrupted_parked_prompt_count: 0,
-            interrupted_todo_count: 0,
-            wrote_escape: false,
-        });
+        return Ok(TerminalInterruptAgentResult::idle_noop(false, false));
     };
     let reason = reason.unwrap_or_else(|| "escape_key".to_string());
+
+    let runtime_before_write = terminal_runtime_snapshot(&instance);
+    if !terminal_runtime_accepts_interrupt(&runtime_before_write) {
+        log_terminal_status_event(
+            "backend.terminal_interrupt.idle_noop",
+            json!({
+                "canonical_state": runtime_before_write.canonical_state,
+                "input_ready": runtime_before_write.input_ready,
+                "instance_id": instance.id,
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                "reason": clean_terminal_diagnostic_log_text(&reason),
+                "stage": "before_write",
+                "turn_active": runtime_before_write.turn_active,
+            }),
+        );
+        return Ok(TerminalInterruptAgentResult::idle_noop(true, false));
+    }
 
     let active_task_id = instance
         .active_task
@@ -28722,8 +28821,29 @@ async fn terminal_interrupt_agent_inner(
         .as_ref()
         .map(|task| task.task_id.clone());
     write_terminal_interrupt_escape(&instance).await?;
-    publish_terminal_provider_turn_interrupted(app, state, cloud_mcp_state, &instance, &reason)
-        .await?;
+    let runtime_before_publish = terminal_runtime_snapshot(&instance);
+    if !terminal_runtime_accepts_interrupt(&runtime_before_publish) {
+        log_terminal_status_event(
+            "backend.terminal_interrupt.idle_noop",
+            json!({
+                "canonical_state": runtime_before_publish.canonical_state,
+                "input_ready": runtime_before_publish.input_ready,
+                "instance_id": instance.id,
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                "reason": clean_terminal_diagnostic_log_text(&reason),
+                "stage": "before_publish",
+                "turn_active": runtime_before_publish.turn_active,
+                "wrote_escape": true,
+            }),
+        );
+        return Ok(TerminalInterruptAgentResult::idle_noop(true, true));
+    }
+    let publish_outcome =
+        publish_terminal_provider_turn_interrupted(app, state, cloud_mcp_state, &instance, &reason)
+            .await?;
+    if publish_outcome == TerminalInterruptOutcome::IdleNoop {
+        return Ok(TerminalInterruptAgentResult::idle_noop(true, true));
+    }
     let interrupted_active_task = mark_terminal_active_task_interrupted(
         cloud_mcp_state,
         &pane_id,
@@ -28760,6 +28880,8 @@ async fn terminal_interrupt_agent_inner(
     );
 
     Ok(TerminalInterruptAgentResult {
+        outcome: TerminalInterruptOutcome::InterruptApplied,
+        session_found: true,
         interrupted_active_task,
         interrupted_parked_prompt_count,
         interrupted_todo_count,
@@ -33564,6 +33686,91 @@ notifications = true
             Some("remote-permission-config"),
             None
         ));
+    }
+
+    #[test]
+    fn terminal_interrupt_acceptance_matches_canonical_reducer_condition() {
+        for canonical_state in ["thinking", "uir", "paused"] {
+            let mut runtime = TerminalRuntimeSnapshot::opened_idle(None);
+            runtime.canonical_state = canonical_state.to_string();
+            runtime.turn_active = true;
+            runtime.input_ready = false;
+            assert!(
+                terminal_runtime_accepts_interrupt(&runtime),
+                "{canonical_state} should accept an active interrupt"
+            );
+
+            runtime.input_ready = true;
+            assert!(!terminal_runtime_accepts_interrupt(&runtime));
+            runtime.input_ready = false;
+            runtime.turn_active = false;
+            assert!(!terminal_runtime_accepts_interrupt(&runtime));
+        }
+
+        for canonical_state in [
+            "starting",
+            "idle",
+            "interrupted",
+            "error",
+            "closing",
+            "closed",
+            "offline",
+        ] {
+            let mut runtime = TerminalRuntimeSnapshot::opened_idle(None);
+            runtime.canonical_state = canonical_state.to_string();
+            runtime.turn_active = true;
+            runtime.input_ready = false;
+            assert!(
+                !terminal_runtime_accepts_interrupt(&runtime),
+                "{canonical_state} must not accept an interrupt"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_interrupt_lone_escape_promotion_requires_eligible_runtime() {
+        let idle = TerminalRuntimeSnapshot::opened_idle(None);
+        assert!(terminal_write_escape_should_interrupt(
+            "\x1b", true, None, None
+        ));
+        assert!(terminal_write_source_is_idle_escape(Some(
+            "terminal-idle-escape"
+        )));
+        assert!(!terminal_write_escape_should_interrupt(
+            "\x1b",
+            true,
+            Some("terminal-idle-escape"),
+            None
+        ));
+        assert!(!terminal_runtime_accepts_interrupt(&idle));
+
+        let mut thinking = idle;
+        thinking.canonical_state = "thinking".to_string();
+        thinking.turn_active = true;
+        thinking.input_ready = false;
+        assert!(terminal_runtime_accepts_interrupt(&thinking));
+    }
+
+    #[test]
+    fn terminal_interrupt_result_serializes_typed_outcome() {
+        let idle_noop = TerminalInterruptAgentResult::idle_noop(true, false);
+        assert_eq!(
+            serde_json::to_value(idle_noop).unwrap()["outcome"],
+            json!("idle_noop")
+        );
+
+        let applied = TerminalInterruptAgentResult {
+            outcome: TerminalInterruptOutcome::InterruptApplied,
+            session_found: true,
+            interrupted_active_task: false,
+            interrupted_parked_prompt_count: 0,
+            interrupted_todo_count: 0,
+            wrote_escape: true,
+        };
+        assert_eq!(
+            serde_json::to_value(applied).unwrap()["outcome"],
+            json!("interrupt_applied")
+        );
     }
 
     #[test]

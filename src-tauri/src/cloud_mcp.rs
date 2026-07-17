@@ -25152,13 +25152,24 @@ fn cloud_mcp_apply_remote_terminal_interrupt_lever(
         )
         .await
         {
-            Ok(result) if result.wrote_escape => {
+            Ok(result) if result.outcome == TerminalInterruptOutcome::InterruptApplied => {
                 let details = serde_json::to_value(&result).unwrap_or_else(|_| json!({}));
                 let _ = cloud_mcp_send_remote_command_status_event(
                     &state,
                     &event,
                     "completed",
                     "Escape interrupt sent to the terminal headless.",
+                    Some(&details),
+                )
+                .await;
+            }
+            Ok(result) if result.session_found => {
+                let details = serde_json::to_value(&result).unwrap_or_else(|_| json!({}));
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state,
+                    &event,
+                    "completed",
+                    "Terminal was already idle; interrupt was a benign no-op.",
                     Some(&details),
                 )
                 .await;

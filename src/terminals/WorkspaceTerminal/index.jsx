@@ -1221,6 +1221,7 @@ async function saveTerminalImageAttachments(attachments) {
 const WORKSPACE_FILE_OPEN_EVENT = "diffforge:workspace-file-open";
 const TERMINAL_FOCUS_REQUEST_EVENT = "diffforge:terminal-focus-request";
 const TERMINAL_CONTROL_UI_SUPPRESSION_EVENT = "diffforge:terminal-control-ui-suppression";
+const TERMINAL_IDLE_ESCAPE_SOURCE = "terminal-idle-escape";
 const TERMINAL_CONTROL_UI_SUPPRESSION_DEFAULT_MS = 10000;
 const TERMINAL_CODING_AGENT_INPUT_READY_DELAY_MS = 15000;
 const TERMINAL_CODING_AGENT_READY_RECONCILE_QUIET_MS = 850;
@@ -1569,6 +1570,15 @@ function terminalActivityStatusFromHookPayload(payload = {}, eventType = "") {
     return "idle";
   }
   return "";
+}
+
+function terminalCanonicalActivityAcceptsInterrupt(fields = {}) {
+  const canonicalState = terminalCanonicalStateFromFields(fields);
+  const turnActive = fields?.turn_active ?? fields?.turnActive;
+  const inputReady = fields?.input_ready ?? fields?.inputReady;
+  return turnActive === true
+    && inputReady === false
+    && ["thinking", "uir", "paused"].includes(canonicalState);
 }
 
 function formatTerminalNativeRailLabel(value) {
@@ -3081,6 +3091,7 @@ function WorkspaceTerminal({
           || canonicalCohort.prompt_state_seq != null
           ? {
               ...canonicalCohort,
+              input_ready: payload.input_ready,
               instance_id: payload.instance_id,
               terminal_process_epoch: payload.terminal_process_epoch
                 || terminalCanonicalProjectionRef.current?.terminal_process_epoch
@@ -14269,6 +14280,15 @@ function WorkspaceTerminal({
             return false;
           }
 
+          if (
+            !isGenericTerminal
+            && !terminalCanonicalActivityAcceptsInterrupt(
+              terminalCanonicalProjectionRef.current || {},
+            )
+          ) {
+            return false;
+          }
+
           event.preventDefault();
           event.stopPropagation?.();
           event.stopImmediatePropagation?.();
@@ -14280,6 +14300,42 @@ function WorkspaceTerminal({
               reason: "escape_key",
             }).then((result) => {
               if (isDisposed) {
+                return;
+              }
+              const interruptOutcome = String(result?.outcome || "").trim().toLowerCase();
+              if (interruptOutcome !== "interrupt_applied") {
+                const shouldForwardIdleEscape = result?.session_found === true
+                  && result?.wrote_escape !== true;
+                logBigViewSyncDiagnosticEvent("tui.escape.interrupt_idle_noop", {
+                  forwarded_to_pty: shouldForwardIdleEscape,
+                  instance_id: terminalInstanceId,
+                  outcome: interruptOutcome || "idle_noop",
+                  pane_id: paneId,
+                  source,
+                  terminal_index: terminalIndex,
+                  workspace_id: workspace?.id || "",
+                  wrote_escape: Boolean(result?.wrote_escape),
+                });
+                if (shouldForwardIdleEscape) {
+                  Promise.resolve(flushTerminalInput("escape_idle_noop_flush_before"))
+                    .then(() => invoke("terminal_write", {
+                      data: "\x1b",
+                      instance_id: terminalInstanceIdRef.current || terminalInstanceId,
+                      pane_id: paneId,
+                      prompt_event_source: TERMINAL_IDLE_ESCAPE_SOURCE,
+                      thread_id: terminalThreadIdRef.current || undefined,
+                    }))
+                    .catch((error) => {
+                      logBigViewSyncDiagnosticEvent("tui.escape.idle_noop_forward_error", {
+                        instance_id: terminalInstanceId,
+                        message: getErrorMessage(error, "Unable to forward idle Escape."),
+                        pane_id: paneId,
+                        source,
+                        terminal_index: terminalIndex,
+                        workspace_id: workspace?.id || "",
+                      });
+                    });
+                }
                 return;
               }
               const interruptedActiveTask = Boolean(
@@ -14326,7 +14382,14 @@ function WorkspaceTerminal({
               });
             }).catch((error) => {
               if (!isDisposed) {
-                setTerminalError(getErrorMessage(error, "Unable to interrupt terminal agent."));
+                logBigViewSyncDiagnosticEvent("tui.escape.interrupt_error", {
+                  instance_id: terminalInstanceId,
+                  message: getErrorMessage(error, "Unable to interrupt terminal agent."),
+                  pane_id: paneId,
+                  source,
+                  terminal_index: terminalIndex,
+                  workspace_id: workspace?.id || "",
+                });
               }
             });
             return true;
