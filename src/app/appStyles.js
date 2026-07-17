@@ -3540,6 +3540,14 @@ export const WorkspaceLifecycleButton = styled(WorkspaceSettingsButton)`
     #050607;
   transform: translate(-4px, -50%) scale(0.92);
 
+  /* Tighter than the settings gear: grow the cross 2px (14 -> 16) so it sits
+     ~1px closer to each edge (less internal padding), while the 24px hit-box
+     and dot-cover positioning stay the same. */
+  svg {
+    width: 16px;
+    height: 16px;
+  }
+
   &[data-runtime="closed"] {
     color: #8fb7ff;
   }
