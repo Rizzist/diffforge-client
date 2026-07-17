@@ -953,10 +953,19 @@ async fn terminal_activity_snapshot(
         .iter()
         .find(|root| root.pane_id == pane_id)
         .cloned();
-    let activity_events_path = terminal_root
+    let expected_instance_id = terminal_root
         .as_ref()
-        .map(|root| terminal_activity_events_path(&pane_id, root.instance_id))
-        .unwrap_or_else(|| terminal_activity_events_path(&pane_id, 0));
+        .map(|root| root.instance_id)
+        .unwrap_or(0);
+    let expected_workspace_id = terminal_root
+        .as_ref()
+        .map(|root| root.workspace_id.as_str())
+        .unwrap_or_default();
+    let activity_events_path = terminal_activity_events_path(
+        &pane_id,
+        expected_instance_id,
+        Some(expected_workspace_id),
+    );
     let activity_events_path_text = activity_events_path.to_string_lossy().to_string();
     let process_snapshot = collect_developer_process_snapshot(
         state.inner(),
@@ -1008,6 +1017,9 @@ async fn terminal_activity_snapshot(
             .as_ref()
             .map(|root| root.agent_kind.as_str())
             .unwrap_or_default(),
+        &pane_id,
+        expected_instance_id,
+        expected_workspace_id,
     );
 
     Ok(TerminalActivitySnapshot {
@@ -1045,6 +1057,51 @@ async fn terminal_activity_snapshot(
         total_cpu_percent,
         total_memory_bytes,
     })
+}
+
+/// Lightweight companion to `terminal_activity_snapshot`: returns only the
+/// subagents an agent has spawned inside a terminal, read from the harness hook
+/// events (SubagentStart/SubagentStop/Task). No OS process scan — this is cheap
+/// enough to poll for the per-terminal subagent overlay. Empty for harnesses
+/// that don't surface subagent lifecycle (e.g. plain OpenCode sessions).
+#[tauri::command]
+async fn terminal_subagents_snapshot(
+    terminal_state: State<'_, TerminalState>,
+    pane_id: String,
+) -> Result<Vec<TerminalActivitySubagent>, String> {
+    let pane_id = pane_id.trim().to_string();
+    validate_terminal_pane_id(&pane_id)?;
+
+    let terminal_roots = developer_terminal_process_roots(terminal_state.inner()).await;
+    let terminal_root = terminal_roots
+        .iter()
+        .find(|root| root.pane_id == pane_id)
+        .cloned();
+    let expected_instance_id = terminal_root
+        .as_ref()
+        .map(|root| root.instance_id)
+        .unwrap_or(0);
+    let expected_workspace_id = terminal_root
+        .as_ref()
+        .map(|root| root.workspace_id.as_str())
+        .unwrap_or_default();
+    let activity_events_path = terminal_activity_events_path(
+        &pane_id,
+        expected_instance_id,
+        Some(expected_workspace_id),
+    );
+
+    let subagents = terminal_activity_subagents_from_events(
+        &activity_events_path,
+        terminal_root
+            .as_ref()
+            .map(|root| root.agent_kind.as_str())
+            .unwrap_or_default(),
+        &pane_id,
+        expected_instance_id,
+        expected_workspace_id,
+    );
+    Ok(subagents)
 }
 
 async fn developer_terminal_process_roots(
@@ -1426,6 +1483,9 @@ fn terminal_activity_subagent_event_status(event_key: &str, event: &Value) -> St
 fn terminal_activity_subagents_from_events(
     activity_events_path: &Path,
     fallback_provider: &str,
+    expected_pane_id: &str,
+    expected_instance_id: u64,
+    expected_workspace_id: &str,
 ) -> Vec<TerminalActivitySubagent> {
     let Ok(body) = fs::read_to_string(activity_events_path) else {
         return Vec::new();
@@ -1436,6 +1496,14 @@ fn terminal_activity_subagents_from_events(
         let Ok(event) = serde_json::from_str::<Value>(line) else {
             continue;
         };
+        if !terminal_activity_event_matches_terminal(
+            &event,
+            expected_pane_id,
+            expected_instance_id,
+            expected_workspace_id,
+        ) {
+            continue;
+        }
         let event_name = event["event_name"]
             .as_str()
             .or_else(|| event["hook_event_name"].as_str())
@@ -1554,6 +1622,33 @@ fn terminal_activity_subagents_from_events(
             .then_with(|| left.label.cmp(&right.label))
     });
     values
+}
+
+fn terminal_activity_event_matches_terminal(
+    event: &Value,
+    expected_pane_id: &str,
+    expected_instance_id: u64,
+    expected_workspace_id: &str,
+) -> bool {
+    if let Some(value) = event.get("pane_id") {
+        if value.as_str() != Some(expected_pane_id) {
+            return false;
+        }
+    }
+    if let Some(value) = event.get("instance_id") {
+        let instance_id = value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|value| value.parse::<u64>().ok()));
+        if instance_id != Some(expected_instance_id) {
+            return false;
+        }
+    }
+    if let Some(value) = event.get("workspace_id") {
+        if value.as_str() != Some(expected_workspace_id) {
+            return false;
+        }
+    }
+    true
 }
 
 fn terminal_activity_subagent_label(agent_type: &str, description: &str) -> String {
@@ -5150,13 +5245,127 @@ mod developer_process_docker_tests {
         .join("\n");
         fs::write(&path, body).unwrap();
 
-        let subagents = terminal_activity_subagents_from_events(&path, "claude");
+        let subagents =
+            terminal_activity_subagents_from_events(&path, "claude", "pane-1", 7, "workspace-a");
         let _ = fs::remove_file(&path);
 
         assert_eq!(subagents.len(), 1);
         assert_eq!(subagents[0].label, "Halley");
         assert_eq!(subagents[0].status, "awaiting_instruction");
         assert_eq!(subagents[0].last_message, "Approve database inspection");
+    }
+
+    #[test]
+    fn terminal_activity_subagents_drop_mismatched_terminal_events() {
+        let path = std::env::temp_dir().join(format!(
+            "diffforge-subagent-scope-{}.jsonl",
+            uuid::Uuid::new_v4(),
+        ));
+        let event = |agent_id: &str, pane_id: Option<&str>, instance_id: Option<u64>, workspace_id: Option<&str>| {
+            let mut event = json!({
+                "timestamp_ms": 1000,
+                "event_name": "SubagentStart",
+                "provider": "claude",
+                "agent_id": agent_id,
+                "agent_type": agent_id,
+            });
+            if let Some(pane_id) = pane_id {
+                event["pane_id"] = json!(pane_id);
+            }
+            if let Some(instance_id) = instance_id {
+                event["instance_id"] = json!(instance_id);
+            }
+            if let Some(workspace_id) = workspace_id {
+                event["workspace_id"] = json!(workspace_id);
+            }
+            event.to_string()
+        };
+        let body = [
+            event("matching", Some("pane-1"), Some(7), Some("workspace-a")),
+            event("wrong-pane", Some("pane-2"), Some(7), Some("workspace-a")),
+            event("wrong-instance", Some("pane-1"), Some(8), Some("workspace-a")),
+            event("wrong-workspace", Some("pane-1"), Some(7), Some("workspace-b")),
+            event("legacy-unstamped", None, None, None),
+        ]
+        .join("\n");
+        fs::write(&path, body).unwrap();
+
+        let subagents =
+            terminal_activity_subagents_from_events(&path, "claude", "pane-1", 7, "workspace-a");
+        let _ = fs::remove_file(&path);
+        let agent_ids = subagents
+            .iter()
+            .map(|subagent| subagent.agent_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(agent_ids.len(), 2);
+        assert!(agent_ids.contains(&"matching"));
+        assert!(agent_ids.contains(&"legacy-unstamped"));
+    }
+
+    #[test]
+    fn terminal_activity_subagents_are_isolated_between_workspace_files() {
+        let suffix = uuid::Uuid::new_v4();
+        let workspace_a = format!("workspace-a-{suffix}");
+        let workspace_b = format!("workspace-b-{suffix}");
+        let path_a = terminal_activity_events_path("pane-1", 7, Some(&workspace_a));
+        let path_b = terminal_activity_events_path("pane-1", 7, Some(&workspace_b));
+        fs::create_dir_all(path_a.parent().unwrap()).unwrap();
+        let event = |agent_id: &str, workspace_id: &str| {
+            json!({
+                "timestamp_ms": 1000,
+                "event_name": "SubagentStart",
+                "provider": "claude",
+                "pane_id": "pane-1",
+                "instance_id": 7,
+                "workspace_id": workspace_id,
+                "agent_id": agent_id,
+                "agent_type": agent_id,
+                "_diffforge_transport_delivered": true,
+            })
+            .to_string()
+        };
+        fs::write(&path_a, event("agent-a", &workspace_a)).unwrap();
+        fs::write(&path_b, event("agent-b", &workspace_b)).unwrap();
+
+        let subagents_a =
+            terminal_activity_subagents_from_events(&path_a, "claude", "pane-1", 7, &workspace_a);
+        let subagents_b =
+            terminal_activity_subagents_from_events(&path_b, "claude", "pane-1", 7, &workspace_b);
+        let _ = fs::remove_file(&path_a);
+        let _ = fs::remove_file(&path_b);
+
+        assert_ne!(path_a, path_b);
+        assert_eq!(subagents_a.len(), 1);
+        assert_eq!(subagents_a[0].agent_id, "agent-a");
+        assert_eq!(subagents_b.len(), 1);
+        assert_eq!(subagents_b[0].agent_id, "agent-b");
+    }
+
+    #[test]
+    fn terminal_activity_subagents_are_empty_without_subagent_events() {
+        let path = std::env::temp_dir().join(format!(
+            "diffforge-subagent-empty-{}.jsonl",
+            uuid::Uuid::new_v4(),
+        ));
+        fs::write(
+            &path,
+            json!({
+                "timestamp_ms": 1000,
+                "event_name": "SessionStart",
+                "pane_id": "pane-1",
+                "instance_id": 7,
+                "workspace_id": "workspace-a",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let subagents =
+            terminal_activity_subagents_from_events(&path, "claude", "pane-1", 7, "workspace-a");
+        let _ = fs::remove_file(&path);
+
+        assert!(subagents.is_empty());
     }
 
     #[test]

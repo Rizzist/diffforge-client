@@ -10563,6 +10563,7 @@ fn run_app(daemon: bool) {
             tools_check_cli_binaries,
             tools_run_cli_action,
             terminal_activity_snapshot,
+            terminal_subagents_snapshot,
             kill_developer_process,
             forge_working_directory,
             validate_workspace_root_directory,

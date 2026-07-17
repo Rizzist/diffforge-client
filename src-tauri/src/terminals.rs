@@ -4879,10 +4879,18 @@ fn terminal_coordination_session_from_context(
     }
 }
 
-fn clear_terminal_activity_hook_files(pane_id: &str, instance_id: u64) {
-    let events_path = terminal_activity_events_path(pane_id, instance_id);
+fn clear_terminal_activity_hook_files(
+    pane_id: &str,
+    instance_id: u64,
+    workspace_id: Option<&str>,
+) {
+    let events_path = terminal_activity_events_path(pane_id, instance_id, workspace_id);
     let _ = fs::remove_file(&events_path);
-    let _ = fs::remove_file(terminal_activity_debug_path(pane_id, instance_id));
+    let _ = fs::remove_file(terminal_activity_debug_path(
+        pane_id,
+        instance_id,
+        workspace_id,
+    ));
     let _ = fs::remove_file(diff_forge_claude_hook_correlation_state_path(&events_path));
     let _ = fs::remove_file(diff_forge_claude_hook_correlation_lock_path(&events_path));
 }
@@ -4898,7 +4906,6 @@ fn refresh_codex_activity_hook_profile_for_launch(
     if !provider_id.to_ascii_lowercase().contains("codex") || coordination.is_none() {
         return false;
     }
-    clear_terminal_activity_hook_files(pane_id, instance_id);
     match refresh_codex_activity_hook_profile_for_terminal(
         coordination,
         provider_id,
@@ -4911,8 +4918,8 @@ fn refresh_codex_activity_hook_profile_for_launch(
             log_terminal_status_event(
                 "backend.terminal_activity_hook.profile_scoped",
                 json!({
-                    "activity_debug_path": terminal_activity_debug_path(pane_id, instance_id).to_string_lossy().to_string(),
-                    "activity_events_path": terminal_activity_events_path(pane_id, instance_id).to_string_lossy().to_string(),
+                    "activity_debug_path": terminal_activity_debug_path(pane_id, instance_id, workspace_id).to_string_lossy().to_string(),
+                    "activity_events_path": terminal_activity_events_path(pane_id, instance_id, workspace_id).to_string_lossy().to_string(),
                     "auto_trusted": true,
                     "instance_id": instance_id,
                     "pane_id": clean_terminal_diagnostic_log_text(pane_id),
@@ -9963,7 +9970,7 @@ async fn terminal_open(
             .next_terminal_instance_id
             .fetch_add(1, Ordering::Relaxed)
     });
-    clear_terminal_activity_hook_files(&pane_id, instance_id);
+    clear_terminal_activity_hook_files(&pane_id, instance_id, workspace_id.as_deref());
     let activity_transport = match terminal_activity_transport_for_terminal(
         app.clone(),
         state.inner(),
@@ -10514,6 +10521,7 @@ async fn terminal_open(
         cloud_mcp_state.inner().clone(),
         pane_id.clone(),
         instance_id,
+        terminal_metadata_for_log.workspace_id.clone(),
         activity_hook_poll_ms,
     );
     if terminal_metadata_is_codex(&terminal_metadata_for_log) {
@@ -11084,6 +11092,11 @@ async fn terminal_start_agent(
             None
         }
     };
+    clear_terminal_activity_hook_files(
+        &pane_id,
+        instance.id,
+        Some(instance.metadata.workspace_id.as_str()),
+    );
     let codex_hook_trust_bypass = refresh_codex_activity_hook_profile_for_launch(
         instance.coordination.as_ref(),
         definition.id,
@@ -11580,6 +11593,11 @@ async fn start_terminal_agent_in_prepared_pty(
                 ),
             };
         };
+        clear_terminal_activity_hook_files(
+            &pane_id,
+            instance.id,
+            Some(instance.metadata.workspace_id.as_str()),
+        );
         let codex_hook_trust_bypass = refresh_codex_activity_hook_profile_for_launch(
             instance.coordination.as_ref(),
             definition.id,
@@ -20526,10 +20544,13 @@ fn spawn_terminal_activity_hook_watcher(
     cloud_mcp_state: CloudMcpState,
     pane_id: String,
     instance_id: u64,
+    workspace_id: String,
     poll_ms: u64,
 ) {
-    let activity_events_path = terminal_activity_events_path(&pane_id, instance_id);
-    let activity_debug_path = terminal_activity_debug_path(&pane_id, instance_id);
+    let activity_events_path =
+        terminal_activity_events_path(&pane_id, instance_id, Some(&workspace_id));
+    let activity_debug_path =
+        terminal_activity_debug_path(&pane_id, instance_id, Some(&workspace_id));
     tauri::async_runtime::spawn(async move {
         let mut offset = 0u64;
         let mut debug_offset = 0u64;
@@ -20773,6 +20794,9 @@ fn spawn_terminal_activity_hook_watcher(
                                 let Ok(event) = serde_json::from_str::<Value>(line) else {
                                     continue;
                                 };
+                                if terminal_activity_hook_event_was_transport_delivered(&event) {
+                                    continue;
+                                }
                                 process_terminal_activity_hook_event(
                                     &app,
                                     &terminals,
@@ -20903,6 +20927,13 @@ fn spawn_terminal_activity_hook_watcher(
         };
         terminal_structured_interaction_clear_superseded(&pane_id, instance_id);
     });
+}
+
+fn terminal_activity_hook_event_was_transport_delivered(event: &Value) -> bool {
+    event
+        .get("_diffforge_transport_delivered")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn terminal_prompt_submitted_source_is_authoritative(
@@ -39251,6 +39282,35 @@ notifications = true
             42,
             None,
             None,
+        ));
+    }
+
+    #[test]
+    fn terminal_activity_launch_reset_removes_previous_session_files() {
+        let pane_id = format!("pane-reset-{}", uuid::Uuid::new_v4());
+        let workspace_id = format!("workspace-reset-{}", uuid::Uuid::new_v4());
+        let events_path = terminal_activity_events_path(&pane_id, 42, Some(&workspace_id));
+        let debug_path = terminal_activity_debug_path(&pane_id, 42, Some(&workspace_id));
+        fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+        fs::write(&events_path, b"old-session-subagent").unwrap();
+        fs::write(&debug_path, b"old-session-debug").unwrap();
+
+        clear_terminal_activity_hook_files(&pane_id, 42, Some(&workspace_id));
+
+        assert!(!events_path.exists());
+        assert!(!debug_path.exists());
+    }
+
+    #[test]
+    fn terminal_activity_watcher_skips_transport_history_records() {
+        assert!(terminal_activity_hook_event_was_transport_delivered(
+            &json!({ "_diffforge_transport_delivered": true })
+        ));
+        assert!(!terminal_activity_hook_event_was_transport_delivered(
+            &json!({ "_diffforge_transport_delivered": false })
+        ));
+        assert!(!terminal_activity_hook_event_was_transport_delivered(
+            &json!({})
         ));
     }
 

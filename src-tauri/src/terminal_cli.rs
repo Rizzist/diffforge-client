@@ -3262,8 +3262,8 @@ fn diff_forge_scoped_activity_hook_command(
     activity_transport: Option<&TerminalActivityTransportEndpoint>,
 ) -> String {
     let command_path = coordination.mcp_command.as_str();
-    let events_path = terminal_activity_events_path(pane_id, instance_id);
-    let debug_path = terminal_activity_debug_path(pane_id, instance_id);
+    let events_path = terminal_activity_events_path(pane_id, instance_id, workspace_id);
+    let debug_path = terminal_activity_debug_path(pane_id, instance_id, workspace_id);
     let instance_id = instance_id.to_string();
     let terminal_index = terminal_index
         .map(|index| index.to_string())
@@ -3327,7 +3327,11 @@ fn diff_forge_scoped_activity_hook_command(
     }
 }
 
-fn terminal_activity_events_path(pane_id: &str, instance_id: u64) -> PathBuf {
+fn terminal_activity_events_path(
+    pane_id: &str,
+    instance_id: u64,
+    workspace_id: Option<&str>,
+) -> PathBuf {
     let safe_pane_id = pane_id
         .chars()
         .map(|ch| {
@@ -3338,13 +3342,25 @@ fn terminal_activity_events_path(pane_id: &str, instance_id: u64) -> PathBuf {
             }
         })
         .collect::<String>();
+    let workspace_id = workspace_id.unwrap_or_default().trim();
+    let workspace_scope = if workspace_id.is_empty() {
+        "unscoped".to_string()
+    } else {
+        format!("{:x}", Sha256::digest(workspace_id.as_bytes()))
+    };
     env::temp_dir()
         .join("diffforge-terminal-activity")
-        .join(format!("{safe_pane_id}-{instance_id}.jsonl"))
+        .join(format!(
+            "{workspace_scope}-{safe_pane_id}-{instance_id}.jsonl"
+        ))
 }
 
-fn terminal_activity_debug_path(pane_id: &str, instance_id: u64) -> PathBuf {
-    let mut path = terminal_activity_events_path(pane_id, instance_id);
+fn terminal_activity_debug_path(
+    pane_id: &str,
+    instance_id: u64,
+    workspace_id: Option<&str>,
+) -> PathBuf {
+    let mut path = terminal_activity_events_path(pane_id, instance_id, workspace_id);
     path.set_extension("debug.jsonl");
     path
 }
@@ -3357,7 +3373,7 @@ fn terminal_activity_env_vars(
     provider_id: &str,
     activity_transport: Option<&TerminalActivityTransportEndpoint>,
 ) -> Vec<(String, String)> {
-    let activity_path = terminal_activity_events_path(pane_id, instance_id);
+    let activity_path = terminal_activity_events_path(pane_id, instance_id, workspace_id);
     let mut env_vars = vec![
         (
             "DIFFFORGE_TERMINAL_PANE_ID".to_string(),
@@ -3387,7 +3403,7 @@ fn terminal_activity_env_vars(
         ),
         (
             "DIFFFORGE_ACTIVITY_DEBUG_PATH".to_string(),
-            terminal_activity_debug_path(pane_id, instance_id)
+            terminal_activity_debug_path(pane_id, instance_id, workspace_id)
                 .to_string_lossy()
                 .to_string(),
         ),
@@ -4381,11 +4397,15 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
     let activity_path =
         terminal_cli_arg_or_env(args, "--events-path", &["DIFFFORGE_ACTIVITY_EVENTS_PATH"])
             .map(PathBuf::from)
-            .unwrap_or_else(|| terminal_activity_events_path(&pane_id, instance_id));
+            .unwrap_or_else(|| {
+                terminal_activity_events_path(&pane_id, instance_id, Some(&workspace_id))
+            });
     let debug_path =
         terminal_cli_arg_or_env(args, "--debug-path", &["DIFFFORGE_ACTIVITY_DEBUG_PATH"])
             .map(PathBuf::from)
-            .unwrap_or_else(|| terminal_activity_debug_path(&pane_id, instance_id));
+            .unwrap_or_else(|| {
+                terminal_activity_debug_path(&pane_id, instance_id, Some(&workspace_id))
+            });
     let activity_transport = diff_forge_activity_hook_transport_config(args);
 
     if activity_transport.is_none() {
@@ -4518,6 +4538,26 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
     if let Some(transport) = activity_transport.as_ref() {
         match send_diff_forge_activity_hook_transport(transport, &record) {
             Ok(hook_response) => {
+                // Keep a read-only history for snapshots/overlays even when
+                // the authenticated transport handled the live event. The
+                // watcher recognizes this marker and will not apply it twice.
+                let mut history_record = record.clone();
+                history_record["_diffforge_transport_delivered"] = json!(true);
+                if let Err(error) =
+                    diff_forge_activity_hook_append_record(&activity_path, &history_record)
+                {
+                    write_diff_forge_activity_hook_debug(
+                        &debug_path,
+                        "transport_history_write_error",
+                        &provider,
+                        &pane_id,
+                        instance_id,
+                        &workspace_id,
+                        &terminal_index,
+                        &activity_path,
+                        json!({ "error": error }),
+                    );
+                }
                 if let Some(hook_response) = hook_response {
                     if let Ok(response) = serde_json::to_string(&hook_response) {
                         println!("{response}");
@@ -6494,6 +6534,40 @@ fn diff_forge_activity_hook_record_with_persisted_claude_state(
 #[cfg(test)]
 mod terminal_cli_tests {
     use super::*;
+
+    #[test]
+    fn terminal_activity_paths_are_scoped_by_workspace() {
+        let first = terminal_activity_events_path("pane-1", 7, Some("workspace-a"));
+        let second = terminal_activity_events_path("pane-1", 7, Some("workspace-b"));
+        let same_workspace = terminal_activity_events_path("pane-1", 7, Some("workspace-a"));
+
+        assert_ne!(first, second);
+        assert_eq!(first, same_workspace);
+        assert_eq!(first.extension().and_then(|value| value.to_str()), Some("jsonl"));
+        assert_eq!(
+            terminal_activity_debug_path("pane-1", 7, Some("workspace-a"))
+                .extension()
+                .and_then(|value| value.to_str()),
+            Some("jsonl")
+        );
+    }
+
+    #[test]
+    fn activity_hook_record_stamps_terminal_identity() {
+        let record = diff_forge_activity_hook_record(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-a",
+            "2",
+            &json!({ "hook_event_name": "SubagentStart", "agent_id": "agent-1" }),
+        );
+
+        assert_eq!(record["pane_id"], "pane-1");
+        assert_eq!(record["instance_id"], 7);
+        assert_eq!(record["workspace_id"], "workspace-a");
+        assert_eq!(record["terminal_index"], "2");
+    }
 
     #[test]
     fn claude_workspace_trust_merge_preserves_state_and_is_missing_file_safe() {
