@@ -25,7 +25,11 @@ const CLOUD_MCP_ROUTE_INITIALIZING_DEFAULT_POLL_MS: u64 = 2_500;
 const CLOUD_MCP_DIRECT_ROUTE_NO_OFFER_RETRY_ATTEMPTS: u64 = 3;
 const CLOUD_MCP_DIRECT_ROUTE_NO_OFFER_RETRY_DELAY_MS: u64 = 1_500;
 const CLOUD_MCP_WS_READY_TIMEOUT_SECS: u64 = 30;
-const CLOUD_MCP_WS_KEEPALIVE_INTERVAL_SECS: u64 = 30;
+// 15s (down from 30s) so cloud liveness has margin against the 45s stale even
+// behind a proxy that drops WS Ping/Pong (leaving only this app-level keepalive
+// to refresh inbound), matches the web's fast presence cadence more closely, and
+// lets the client detect a dead server sooner via its own silence watchdog.
+const CLOUD_MCP_WS_KEEPALIVE_INTERVAL_SECS: u64 = 15;
 const CLOUD_MCP_WS_SILENCE_WATCHDOG_SECS: u64 = 45;
 const CLOUD_MCP_APPWRITE_JWT_DEFAULT_TTL_SECS: u64 = 840;
 const CLOUD_MCP_APPWRITE_JWT_MIN_TTL_SECS: u64 = 60;
@@ -12471,7 +12475,13 @@ pub(crate) fn cloud_mcp_send_shutdown_goodbye_blocking() {
     if !CLOUD_MCP_GLOBAL_WS_LIVE.load(Ordering::Acquire) {
         return;
     }
-    cloud_mcp_shutdown_goodbye_notify().notify_waiters();
+    // notify_one() STORES a permit, so if the ws loop is mid-await inside a
+    // select arm when we fire (not currently parked on `.notified()`), the
+    // wakeup is not lost — it fires on the loop's next iteration and the goodbye
+    // + Close frame is sent. notify_waiters() only wakes CURRENT waiters and
+    // would drop the signal in that race, leaving the socket to be reaped by the
+    // cloud's stale-transport timeout instead of a clean, instant Close.
+    cloud_mcp_shutdown_goodbye_notify().notify_one();
     for _ in 0..20 {
         if CLOUD_MCP_SHUTDOWN_GOODBYE_SENT.load(Ordering::Acquire)
             || !CLOUD_MCP_GLOBAL_WS_LIVE.load(Ordering::Acquire)
