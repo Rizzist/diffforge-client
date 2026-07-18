@@ -1996,8 +1996,14 @@ fn desktop_auth_percent_encode_query_component(value: &str) -> String {
     encoded
 }
 
-fn desktop_auth_login_url(state: &str) -> String {
+fn desktop_auth_login_url(state: &str, device_bind: Option<&str>) -> String {
     let mut pairs = vec![("state".to_string(), state.to_string())];
+    if let Some(device_bind) = device_bind
+        .map(str::trim)
+        .filter(|value| value.starts_with("dbt1.") && value.len() <= 4_096)
+    {
+        pairs.push(("device_bind".to_string(), device_bind.to_string()));
+    }
     pairs.push((
         "desktop_callback_scheme".to_string(),
         desktop_auth_callback_scheme().to_string(),
@@ -2210,7 +2216,10 @@ async fn desktop_auth_snapshot_command(app: AppHandle) -> Result<Value, String> 
 }
 
 #[tauri::command(rename_all = "snake_case")]
-async fn desktop_auth_start_login(app: AppHandle) -> Result<Value, String> {
+async fn desktop_auth_start_login(
+    app: AppHandle,
+    cloud_mcp_state: State<'_, CloudMcpState>,
+) -> Result<Value, String> {
     let state = desktop_auth_new_state();
     let snapshot = desktop_auth_persist_snapshot(
         &app,
@@ -2222,8 +2231,18 @@ async fn desktop_auth_start_login(app: AppHandle) -> Result<Value, String> {
             "pendingState": state,
         }),
     )?;
+    // A fresh install or unavailable cloud session must never block the
+    // existing desktop sign-in. When the authenticated native websocket is
+    // ready, mint a 120-second one-use opaque binding token for this N.
+    let device_bind = tokio::time::timeout(
+        Duration::from_millis(2_500),
+        cloud_mcp_mint_device_binding_token(cloud_mcp_state.inner()),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok);
     Ok(json!({
-        "login_url": desktop_auth_login_url(&state),
+        "login_url": desktop_auth_login_url(&state, device_bind.as_deref()),
         "snapshot": desktop_auth_public_snapshot(&snapshot),
     }))
 }
@@ -3852,7 +3871,7 @@ mod desktop_auth_tests {
     #[test]
     fn desktop_auth_login_url_uses_snake_case_query_keys() {
         let url =
-            reqwest::Url::parse(&desktop_auth_login_url("state-123")).expect("desktop login URL");
+            reqwest::Url::parse(&desktop_auth_login_url("state-123", None)).expect("desktop login URL");
         let query = url
             .query_pairs()
             .map(|(key, value)| (key.into_owned(), value.into_owned()))
@@ -3886,6 +3905,25 @@ mod desktop_auth_tests {
         ] {
             assert!(!query.contains_key(key), "found camelCase query key {key}");
         }
+    }
+
+    #[test]
+    fn desktop_auth_login_url_carries_only_opaque_device_binding_token() {
+        let token = "dbt1.c2lnbmVkLWRldmljZS1iaW5kaW5nLXRva2Vu.signature01234567890123456789012345678901";
+        let url = reqwest::Url::parse(&desktop_auth_login_url("state-123", Some(token)))
+            .expect("desktop login URL");
+        let query = url
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(query.get("device_bind").map(String::as_str), Some(token));
+
+        let without_invalid = reqwest::Url::parse(&desktop_auth_login_url(
+            "state-123",
+            Some("native-device-id"),
+        ))
+        .expect("desktop login URL");
+        assert!(!without_invalid.query_pairs().any(|(key, _)| key == "device_bind"));
     }
 
     #[test]

@@ -32391,6 +32391,31 @@ pub(crate) fn cloud_mcp_start_browser_binding_loopback(state: CloudMcpState) {
     });
 }
 
+pub(crate) async fn cloud_mcp_mint_device_binding_token(
+    state: &CloudMcpState,
+) -> Result<String, String> {
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let native_device_id = cloud_mcp_payload_text(&device_profile, &["device_id"])
+        .ok_or_else(|| "The native device identity is unavailable.".to_string())?;
+    let response = cloud_mcp_ws_request_with_timeout(
+        state,
+        "device_binding_token_mint",
+        &json!({
+            "native_device_id": native_device_id,
+            "source": "rust-diffforge-desktop-login",
+        }),
+        Duration::from_secs(2),
+    )
+    .await?;
+    cloud_mcp_payload_text(
+        &response,
+        &["data", "device_bind"],
+    )
+    .or_else(|| cloud_mcp_payload_text(&response, &["device_bind"]))
+    .filter(|value| value.starts_with("dbt1.") && value.len() <= 4_096)
+    .ok_or_else(|| "Cloud did not return a valid device binding token.".to_string())
+}
+
 async fn cloud_mcp_ws_request_with_timeout(
     state: &CloudMcpState,
     request_kind: &str,
