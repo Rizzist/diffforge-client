@@ -84,6 +84,12 @@ const DEVICE_ALIAS_KEYS = [
   "browser_device_id",
   "matched_device_id",
   "requested_target_device_id",
+  // Server-side fold linking fields: an identity-migrated row (new native id or
+  // a durable-web standalone card) still merges with its canonical device
+  // instead of rendering as a duplicate.
+  "card_id",
+  "physical_device_id",
+  "bound_native_device_id",
   "device_aliases",
   "replaced_web_device_ids",
 ];

@@ -893,6 +893,116 @@ test("account devices rows mirror dashboard registry with live overlays", () => 
   assert.equal(phone?.liveState, "offline");
 });
 
+test("identity-migrated registry rows sharing card_id collapse to one device", () => {
+  // A machine that re-registered under a new native id (same physical device,
+  // same card_id) must render as ONE card even when a stale row under the old
+  // id is still present in the feed — the server-fold linking fields dedupe it.
+  const rows = buildAccountLiveDeviceRows({
+    knownDevices: [
+      {
+        device_id: "desktop-m87shcl",
+        card_id: "card-win-1",
+        physical_device_id: "card-win-1",
+        device_name: "DESKTOP-M87SHCL",
+        platform: "windows",
+        registered: true,
+        native_connected: true,
+        status: "connected",
+      },
+      {
+        device_id: "desktop-m87shcl-new",
+        card_id: "card-win-1",
+        physical_device_id: "card-win-1",
+        device_name: "DESKTOP-M87SHCL",
+        platform: "windows",
+        registered: true,
+        native_connected: true,
+        status: "connected",
+      },
+    ],
+    deviceLiveState: {
+      account_device_live_state_snapshot: {
+        registered_devices: {
+          items: [
+            {
+              device_id: "desktop-m87shcl-new",
+              card_id: "card-win-1",
+              physical_device_id: "card-win-1",
+              device_name: "DESKTOP-M87SHCL",
+              platform: "windows",
+              registered: true,
+              native_connected: true,
+              status: "connected",
+            },
+          ],
+        },
+      },
+    },
+    maxRows: "all",
+  });
+  const windows = rows.filter((row) => row.device_name === "DESKTOP-M87SHCL");
+  assert.equal(windows.length, 1);
+});
+
+test("accumulated snapshots across workspace switches keep one row per physical device", () => {
+  // Reproduces the workspace-switch duplication: each switch republishes a
+  // fresh account snapshot, and (pre-fix) prior rows were re-injected forever.
+  // Feed every raw item ever seen (mirroring that re-injection); with the
+  // server-fold linking fields (card_id/physical_device_id), an id migration
+  // across snapshots collapses instead of spawning a duplicate card.
+  const macItem = {
+    device_id: "desktop-local",
+    card_id: "card-mac-1",
+    physical_device_id: "card-mac-1",
+    device_name: "Syed's MacBook Air",
+    platform: "macos",
+    registered: true,
+    native_connected: true,
+    status: "connected",
+  };
+  const winItem = (k) => ({
+    device_id: k < 2 ? "desktop-m87shcl" : "desktop-m87shcl-new",
+    card_id: "card-win-1",
+    physical_device_id: "card-win-1",
+    device_name: "DESKTOP-M87SHCL",
+    platform: "windows",
+    registered: true,
+    native_connected: true,
+    status: "connected",
+  });
+  const seenItems = [];
+  for (let k = 0; k < 5; k += 1) {
+    const items = [macItem, winItem(k)];
+    seenItems.push(...items);
+    const rows = buildAccountLiveDeviceRows({
+      knownDevices: seenItems.slice(),
+      deviceLiveState: {
+        account_device_live_state_snapshot: {
+          registered_devices: { items },
+        },
+      },
+      localProfile: {
+        device_id: "desktop-local",
+        card_id: "card-mac-1",
+        device_name: "This device",
+        platform: "macos",
+      },
+      maxRows: "all",
+    });
+    const names = rows.map((row) => row.device_name);
+    assert.equal(
+      rows.length,
+      2,
+      `iteration ${k}: expected exactly 2 device rows, got ${rows.length} (${names.join(", ")})`,
+    );
+    assert.equal(
+      new Set(names).size,
+      names.length,
+      `iteration ${k}: duplicate device names ${names.join(", ")}`,
+    );
+  }
+});
+
 test("account devices rows include an unmatched local profile with registered inventory", () => {
   const rows = buildAccountLiveDeviceRows({
     deviceLiveState: {

@@ -4340,6 +4340,12 @@ const CLOUD_DEVICE_ALIAS_KEYS = [
   "current_web_device_id",
   "matched_device_id",
   "requested_target_device_id",
+  // Server-side fold linking fields: keep a row that migrated identity (new
+  // native id, or a durable-web standalone card) merging with its canonical
+  // device instead of splitting into a duplicate card.
+  "card_id",
+  "physical_device_id",
+  "bound_native_device_id",
   "device_aliases",
   "replaced_web_device_ids",
 ];
@@ -4622,6 +4628,14 @@ function normalizeCloudConnectedDevice(device, index = 0, options = {}) {
     device.device_id || device.machine_id || device.id,
     "",
   ).toLowerCase();
+  if (!deviceId) {
+    // An id-less candidate (its id lived only in a container map key that the
+    // Object.values walk discarded). Synthesizing `${name}:${index}` would mint
+    // a NEW device key on every event as the index shifts, inserting a fresh
+    // duplicate card per snapshot. Drop it — well-formed cloud device rows
+    // always carry a device id, and identity must never derive from an index.
+    return null;
+  }
   const displayName = safeCloudMcpText(
     device.display_name || device.label || device.device_name || device.machine_name || device.hostname || device.name || device.device_model,
     index === 0 ? "Diff Forge client" : `Device ${index + 1}`,
@@ -4687,7 +4701,7 @@ function normalizeCloudConnectedDevice(device, index = 0, options = {}) {
     client_kind: device.client_kind || device.client_type || "",
     connected,
     device_aliases: deviceAliases,
-    device_id: deviceId || `${normalizeCloudDeviceText(displayName) || "device"}:${index}`,
+    device_id: deviceId,
     display_name: displayName,
     form_factor: formFactor,
     form_factor_label: safeCloudMcpText(
@@ -17062,14 +17076,28 @@ function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PR
     : previous?.deviceLiveState && typeof previous.deviceLiveState === "object"
       ? previous.deviceLiveState
       : null;
+  // Latest-snapshot-authoritative, matching the next-diffforge dashboard which
+  // replaces its registry wholesale each message. When this update carries a
+  // fresh device inventory (every account-live-state event and runtime-status
+  // update derives connectedDevices/knownDevices from the current snapshot), do
+  // NOT re-inject the previous rows: a device that migrated identity (new native
+  // id, or a durable-web standalone row when the server fold flickers) has no
+  // shared alias with its prior row, so re-injection keeps the stale row forever
+  // and a new row appears on every switch — the duplicate-cards bug — while the
+  // stale row's OR-merged liveness also latches surfaces on (the both-lit bug).
+  // Inventory continuity across delta events already comes from the Rust
+  // registry merge upstream, so the UI union is redundant. Prior rows are
+  // retained only when an update carries no inventory at all.
+  const hasFreshInventory =
+    Array.isArray(progress?.connectedDevices) || Array.isArray(progress?.knownDevices);
   const knownDevices = mergeCloudDeviceProgressRows(
-    previous?.knownDevices,
+    hasFreshInventory ? [] : previous?.knownDevices,
     rawKnownDevices,
     deviceLiveState,
     48,
   );
   const connectedDevices = mergeCloudDeviceProgressRows(
-    previous?.connectedDevices,
+    hasFreshInventory ? [] : previous?.connectedDevices,
     progressConnectedDevices,
     deviceLiveState,
     12,

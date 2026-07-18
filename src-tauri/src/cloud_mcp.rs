@@ -13908,6 +13908,13 @@ fn cloud_mcp_registry_item_aliases(item: &Value) -> Vec<String> {
         &["web_presence", "target_device_id"],
         &["surfaces", "native", "device_id"],
         &["surfaces", "web", "device_id"],
+        // Server-side fold linking fields: keep an identity-migrated row (new
+        // native id, or a durable-web standalone card) sharing an alias with its
+        // canonical device so the merge collapses them instead of accumulating a
+        // duplicate registry item.
+        &["card_id"],
+        &["physical_device_id"],
+        &["bound_native_device_id"],
     ];
     for path in paths {
         if let Some(value) = cloud_mcp_payload_text(item, path) {
@@ -13920,11 +13927,86 @@ fn cloud_mcp_registry_item_aliases(item: &Value) -> Vec<String> {
     aliases
 }
 
-fn cloud_mcp_registry_item_key(item: &Value, index: usize) -> String {
-    cloud_mcp_registry_item_aliases(item)
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| format!("registry-item-{index}"))
+// The strong physical identifiers a registry item folds by. Two items whose
+// strong ids are both present but share none are different machines; a shared
+// weak alias (e.g. a recycled web id) must not merge them.
+fn cloud_mcp_registry_item_strong_ids(item: &Value) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for key in ["card_id", "physical_device_id", "bound_native_device_id"] {
+        if let Some(value) = cloud_mcp_payload_text(item, &[key]) {
+            let value = value.trim().to_ascii_lowercase();
+            if !value.is_empty() {
+                ids.insert(value);
+            }
+        }
+    }
+    ids
+}
+
+fn cloud_mcp_registry_items_strong_id_conflict(
+    left: &HashSet<String>,
+    right: &HashSet<String>,
+) -> bool {
+    !left.is_empty() && !right.is_empty() && left.is_disjoint(right)
+}
+
+// Merge one registry item into `merged` by ALIAS INTERSECTION rather than a
+// single leading-alias key. A device that migrated identity (new native id, or a
+// durable-web standalone card) keeps a secondary alias (card_id /
+// physical_device_id / another id) in common with its prior row, so it collapses
+// into one item instead of persisting a duplicate. A single canonical row can
+// also BRIDGE several previously-disjoint stale rows, so every compatible slot
+// is folded into the earliest one; strong-id conflicts block an over-merge of
+// two genuinely different devices. `alias_sets[i]` mirrors the accumulated alias
+// set of `merged[i]`.
+fn cloud_mcp_push_or_merge_registry_item(
+    merged: &mut Vec<Value>,
+    alias_sets: &mut Vec<HashSet<String>>,
+    item: &Value,
+) {
+    let aliases: HashSet<String> = cloud_mcp_registry_item_aliases(item).into_iter().collect();
+    if aliases.is_empty() {
+        alias_sets.push(aliases);
+        merged.push(item.clone());
+        return;
+    }
+    let item_strong = cloud_mcp_registry_item_strong_ids(item);
+    let mut positions = Vec::<usize>::new();
+    for (index, existing) in alias_sets.iter().enumerate() {
+        if existing.is_disjoint(&aliases) {
+            continue;
+        }
+        let existing_strong = merged
+            .get(index)
+            .map(cloud_mcp_registry_item_strong_ids)
+            .unwrap_or_default();
+        if cloud_mcp_registry_items_strong_id_conflict(&existing_strong, &item_strong) {
+            continue;
+        }
+        positions.push(index);
+    }
+    let Some(&target) = positions.first() else {
+        alias_sets.push(aliases);
+        merged.push(item.clone());
+        return;
+    };
+    // Fold every other bridged slot into the earliest, then drop the extras
+    // (highest index first so lower indices stay valid). positions is ascending,
+    // so `target` is the smallest and never shifts.
+    for &position in positions.iter().skip(1) {
+        let folded = merged[position].clone();
+        merged[target] = cloud_mcp_merge_registry_object(&merged[target], &folded);
+        let folded_aliases = cloud_mcp_registry_item_aliases(&merged[target]);
+        alias_sets[target].extend(folded_aliases);
+    }
+    for &position in positions.iter().skip(1).rev() {
+        merged.remove(position);
+        alias_sets.remove(position);
+    }
+    // Apply the new item LAST so its (freshest) identity and fields win.
+    merged[target] = cloud_mcp_merge_registry_object(&merged[target], item);
+    alias_sets[target].extend(aliases);
+    alias_sets[target].extend(cloud_mcp_registry_item_aliases(&merged[target]));
 }
 
 fn cloud_mcp_registry_array_non_empty(value: &Value, key: &str) -> bool {
@@ -14012,31 +14094,19 @@ fn cloud_mcp_merge_registry_items(
 
     let mut deleted = cloud_mcp_registry_deleted_ids(previous_registry);
     deleted.extend(cloud_mcp_registry_deleted_ids(next_registry));
-    let mut by_key = HashMap::<String, Value>::new();
-    let mut order = Vec::<String>::new();
+    let mut merged = Vec::<Value>::new();
+    let mut alias_sets = Vec::<HashSet<String>>::new();
 
-    for (index, item) in previous_items.into_iter().flatten().enumerate() {
-        let key = cloud_mcp_registry_item_key(item, index);
-        if !by_key.contains_key(&key) {
-            order.push(key.clone());
-        }
-        by_key.insert(key, item.clone());
+    for item in previous_items.into_iter().flatten() {
+        cloud_mcp_push_or_merge_registry_item(&mut merged, &mut alias_sets, item);
     }
-
-    for (index, item) in next_items.into_iter().flatten().enumerate() {
-        let key = cloud_mcp_registry_item_key(item, index);
-        if let Some(previous_item) = by_key.get(&key) {
-            by_key.insert(key, cloud_mcp_merge_registry_object(previous_item, item));
-        } else {
-            order.push(key.clone());
-            by_key.insert(key, item.clone());
-        }
+    for item in next_items.into_iter().flatten() {
+        cloud_mcp_push_or_merge_registry_item(&mut merged, &mut alias_sets, item);
     }
 
     Some(
-        order
+        merged
             .into_iter()
-            .filter_map(|key| by_key.remove(&key))
             .filter(|item| !cloud_mcp_registry_item_is_deleted(item, &deleted))
             .collect(),
     )
@@ -72428,6 +72498,129 @@ mod cloud_mcp_tests {
         assert_eq!(
             merged.get("device_registry"),
             merged.get("registered_devices")
+        );
+    }
+
+    #[test]
+    fn account_live_state_merge_collapses_identity_migrated_device() {
+        // A machine that re-registers under a new native id (same physical
+        // device, same card_id) must collapse into ONE registry item across the
+        // previous-cache/next-snapshot merge, not accumulate a duplicate card.
+        // The merge keys by any-alias intersection, and card_id/physical_device_id
+        // are the shared linking fields.
+        let previous = json!({
+            "registered_devices": {
+                "source": "next_agents_devices",
+                "count": 1,
+                "registered_count": 1,
+                "items": [
+                    {
+                        "device_id": "desktop-m87shcl",
+                        "card_id": "card-win-1",
+                        "physical_device_id": "card-win-1",
+                        "display_name": "DESKTOP-M87SHCL",
+                        "registered": true,
+                        "connected": true,
+                        "native_connected": true
+                    }
+                ]
+            }
+        });
+        let next = json!({
+            "registered_devices": {
+                "source": "cloud_hot_state",
+                "count": 1,
+                "registered_count": 1,
+                "items": [
+                    {
+                        "device_id": "desktop-m87shcl-new",
+                        "card_id": "card-win-1",
+                        "physical_device_id": "card-win-1",
+                        "display_name": "DESKTOP-M87SHCL",
+                        "registered": true,
+                        "connected": true,
+                        "native_connected": true
+                    }
+                ]
+            },
+            "registered_device_count": 1,
+            "known_device_count": 1
+        });
+
+        let merged = cloud_mcp_merge_account_live_state_snapshot(Some(&previous), next);
+        let items = merged["registered_devices"]["items"]
+            .as_array()
+            .expect("merged items");
+        assert_eq!(
+            items.len(),
+            1,
+            "an identity-migrated device sharing card_id must not duplicate"
+        );
+        // The freshest identity wins the merged row.
+        assert_eq!(items[0]["device_id"], json!("desktop-m87shcl-new"));
+    }
+
+    #[test]
+    fn account_live_state_merge_bridges_previously_disjoint_rows() {
+        // Two stale rows for one machine can be alias-disjoint (an old native id
+        // row and a durable-web standalone row). A fresh canonical row that
+        // carries BOTH the card id and the web id bridges them, and all three
+        // must collapse into a single card — not just the first match.
+        let previous = json!({
+            "registered_devices": {
+                "items": [
+                    { "device_id": "native-old", "card_id": "card-x", "registered": true },
+                    { "device_id": "web-w", "web_device_id": "web-w", "registered": true }
+                ]
+            }
+        });
+        let next = json!({
+            "registered_devices": {
+                "items": [
+                    {
+                        "device_id": "native-new",
+                        "card_id": "card-x",
+                        "web_device_id": "web-w",
+                        "display_name": "Bridged Mac",
+                        "registered": true
+                    }
+                ]
+            }
+        });
+        let merged = cloud_mcp_merge_account_live_state_snapshot(Some(&previous), next);
+        let items = merged["registered_devices"]["items"]
+            .as_array()
+            .expect("merged items");
+        assert_eq!(items.len(), 1, "a bridging row must collapse all matches");
+        assert_eq!(items[0]["device_id"], json!("native-new"));
+    }
+
+    #[test]
+    fn account_live_state_merge_does_not_over_merge_conflicting_strong_ids() {
+        // Two DIFFERENT machines that happen to share a weak alias (a recycled
+        // web id) but carry conflicting card ids must stay as two cards.
+        let previous = json!({
+            "registered_devices": {
+                "items": [
+                    { "device_id": "dev-a", "card_id": "card-a", "web_device_id": "shared-web", "registered": true }
+                ]
+            }
+        });
+        let next = json!({
+            "registered_devices": {
+                "items": [
+                    { "device_id": "dev-b", "card_id": "card-b", "web_device_id": "shared-web", "registered": true }
+                ]
+            }
+        });
+        let merged = cloud_mcp_merge_account_live_state_snapshot(Some(&previous), next);
+        let items = merged["registered_devices"]["items"]
+            .as_array()
+            .expect("merged items");
+        assert_eq!(
+            items.len(),
+            2,
+            "conflicting card ids must not merge on a shared weak alias"
         );
     }
 
