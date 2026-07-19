@@ -10140,6 +10140,13 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
     if (!sessionId) return;
     const messageId = messageIdForMessage(message, props);
     const prompt = textFromMessage(message);
+    // Injected context (system reminders, environment notes) is NOT a user
+    // prompt: it must never become a todo, settle a receipt, or open a turn.
+    const promptHead = String(prompt || "").trimStart().toLowerCase();
+    if (promptHead.startsWith("<system-reminder")
+      || promptHead.startsWith("&lt;system-reminder")
+      || promptHead.startsWith("<environment_context")
+      || promptHead.startsWith("<instructions")) return;
     const submitKeys = userPromptSubmitKeys(sessionId, messageId, prompt, reason);
     if (userPromptAlreadySubmitted(submitKeys)) return;
     ensureTurn(sessionId, reason);
@@ -10931,6 +10938,13 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
       const sessionId = (input && input.sessionID) || "";
       const prompt = pickText(output && output.parts);
       reconcilePendingInteractions("chat.message");
+      // Injected context (system reminders, environment notes) is NOT a user
+      // prompt — never a todo, never a turn.
+      const promptHead = String(prompt || "").trimStart().toLowerCase();
+      if (promptHead.startsWith("<system-reminder")
+        || promptHead.startsWith("&lt;system-reminder")
+        || promptHead.startsWith("<environment_context")
+        || promptHead.startsWith("<instructions")) return;
       const submitKeys = userPromptSubmitKeys(sessionId, "", prompt, "chat.message");
       if (userPromptAlreadySubmitted(submitKeys)) return;
       startTurn(sessionId, "chat.message");

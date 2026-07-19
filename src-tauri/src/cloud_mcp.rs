@@ -29537,6 +29537,19 @@ fn cloud_mcp_device_live_unit_event_kind(event_kind: &str) -> bool {
     )
 }
 
+/// DB-only scope for the durable device-live sync-state rows: acks are valid
+/// only against the CLOUD INSTANCE that issued them. A snapshot acked by one
+/// cloud (production) must never read as current against another (a local
+/// rig, or a deploy that rolled account state back) — that wedge froze
+/// workspace terminal statuses until an app restart forced a lifecycle
+/// replay. Wire payloads keep the plain scope; only the local table is
+/// cloud-scoped.
+fn cloud_mcp_device_live_sync_db_scope(scope_key: &str) -> String {
+    let cloud = cloud_mcp_base_url();
+    let cloud = cloud.trim().trim_end_matches('/').to_ascii_lowercase();
+    format!("{scope_key}@{cloud}")
+}
+
 fn cloud_mcp_device_live_sync_identity_from_payload(
     payload: &Value,
 ) -> Option<(String, String, String, String, String, String)> {
@@ -29610,6 +29623,7 @@ fn cloud_mcp_device_live_mark_sync_pending(payload: &Value) -> Result<(), String
     else {
         return Ok(());
     };
+    let scope_key = cloud_mcp_device_live_sync_db_scope(&scope_key);
     let conn = cloud_mcp_open_outbox_conn()?;
     let now = cloud_mcp_now_ms() as i64;
     conn.execute(
@@ -29668,6 +29682,7 @@ fn cloud_mcp_device_live_sync_state_matches_from_conn(
     else {
         return Ok(CloudMcpDeviceLiveSyncStateMatch::Missing);
     };
+    let scope_key = cloud_mcp_device_live_sync_db_scope(&scope_key);
     let current = conn
         .query_row(
             &format!(
@@ -29722,6 +29737,7 @@ fn cloud_mcp_device_live_mark_sync_acked_from_payload(
     {
         return Ok(false);
     }
+    let scope_key = cloud_mcp_device_live_sync_db_scope(&scope_key);
     let now = cloud_mcp_now_ms() as i64;
     conn.execute(
         &format!(
@@ -29790,6 +29806,7 @@ fn cloud_mcp_device_live_sync_decision(
     else {
         return Ok(CloudMcpDeviceLiveSyncDecision::Enqueue);
     };
+    let scope_key = cloud_mcp_device_live_sync_db_scope(&scope_key);
     let conn = cloud_mcp_open_outbox_conn()?;
     let state = conn
         .query_row(
