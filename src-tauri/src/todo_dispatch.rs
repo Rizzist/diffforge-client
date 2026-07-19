@@ -12906,6 +12906,7 @@ mod todo_dispatch_backend_tests {
             event_type: "test".to_string(),
             hook_event_name: "test".to_string(),
             updated_at_ms: 1,
+            waiting_origin_ms: 0,
         }
     }
 

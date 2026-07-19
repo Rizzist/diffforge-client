@@ -1134,6 +1134,12 @@ struct TerminalRuntimeSnapshot {
     event_type: String,
     hook_event_name: String,
     updated_at_ms: u64,
+    /// ORIGIN timestamp (hook CLI fire time) of the event that parked the
+    /// session in WAITING; zero outside waiting. Ordering checks compare
+    /// candidate origins against this, never `updated_at_ms` — ingestion
+    /// time moves on unrelated writes (provider-session recording) and lives
+    /// on a different clock than hook fire time.
+    waiting_origin_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1216,6 +1222,7 @@ impl TerminalRuntimeSnapshot {
             event_type: "opened".to_string(),
             hook_event_name: "TerminalOpen".to_string(),
             updated_at_ms: now_ms,
+            waiting_origin_ms: 0,
         }
     }
 

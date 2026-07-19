@@ -1560,6 +1560,7 @@ fn terminal_runtime_mark_closing(instance: &TerminalInstance, source: &str) {
     runtime.event_type = "terminal-closing".to_string();
     runtime.hook_event_name = "Close".to_string();
     runtime.updated_at_ms = terminal_now_ms();
+    runtime.waiting_origin_ms = 0;
 }
 
 fn terminal_runtime_apply_provider_session_id(
@@ -1807,9 +1808,40 @@ fn terminal_runtime_apply_activity_payload(
         } else {
             payload.observed_at_ms
         },
+        waiting_origin_ms: terminal_next_waiting_origin_ms(
+            &previous,
+            payload,
+            &projection,
+            terminal_event_rejected,
+        ),
     };
     *runtime = snapshot.clone();
     (snapshot, projection)
+}
+
+/// Next `waiting_origin_ms` after an event: an accepted park stamps the
+/// parking event's ORIGIN (hook fire time; max() keeps a stale re-park from
+/// rewinding the ordering identity), rejected events and continued waiting
+/// preserve it, and leaving waiting clears it.
+fn terminal_next_waiting_origin_ms(
+    previous: &TerminalRuntimeSnapshot,
+    payload: &TerminalActivityHookPayload,
+    projection: &TerminalCanonicalProjection,
+    terminal_event_rejected: bool,
+) -> u64 {
+    if terminal_event_rejected {
+        previous.waiting_origin_ms
+    } else if projection.waiting_accepted {
+        previous.waiting_origin_ms.max(if payload.hook_timestamp_ms > 0 {
+            payload.hook_timestamp_ms
+        } else {
+            payload.observed_at_ms
+        })
+    } else if projection.canonical_state == "waiting" {
+        previous.waiting_origin_ms
+    } else {
+        0
+    }
 }
 
 fn terminal_runtime_snapshot_is_starting(runtime: &TerminalRuntimeSnapshot) -> bool {
@@ -2399,18 +2431,49 @@ fn terminal_canonical_stop_correlates(
     // tasks + a polled JSONL fallback), so a delayed Stop from an OLDER turn
     // can arrive after WAITING began. The event's ORIGIN timestamp (stamped
     // by the hook CLI at fire time) discriminates: only a stop that fired
-    // AFTER the waiting entry (previous.updated_at_ms) may use the exemption.
-    // A missing stamp (synthetic/test events) is treated as current.
+    // at/after the waiting entry's ORIGIN (`waiting_origin_ms`, same clock
+    // domain — never ingestion-time `updated_at_ms`) may act. Every
+    // legitimate producer stamps fire time, so an unstamped candidate fails.
     let event_origin_ms = if payload.hook_timestamp_ms > 0 {
         payload.hook_timestamp_ms
     } else {
         payload.observed_at_ms
     };
-    let ordered_after_waiting = event_origin_ms == 0 || event_origin_ms >= previous.updated_at_ms;
-    let waiting_awaits_future_turn = explicit_session_match
-        && ordered_after_waiting
-        && terminal_projection_text(&previous.canonical_state, "") == "waiting";
+    let ordered_after_waiting =
+        terminal_waiting_origin_ordered(event_origin_ms, previous.waiting_origin_ms);
+    let waiting_previous = terminal_projection_text(&previous.canonical_state, "") == "waiting";
+    if waiting_previous && terminal_projection_text(&payload.event_type, "") == "provider_turn_completed" {
+        // Settling WAITING always consults the ordering gate: absent turn ids
+        // must not slip through the `turn_matches` missing-field default, and
+        // matching ids are no proof against a delayed duplicate. Turn ids are
+        // advisory here — session identity plus origin ordering decide.
+        return generation_matches && explicit_session_match && ordered_after_waiting;
+    }
+    let waiting_awaits_future_turn =
+        explicit_session_match && ordered_after_waiting && waiting_previous;
     generation_matches && session_matches && (turn_matches || waiting_awaits_future_turn)
+}
+
+/// ORIGIN timestamp of a raw hook event: the hook CLI stamps `timestamp_ms`
+/// at fire time; `ts_ms`/`observed_at_ms` cover synthetic emitters. Zero
+/// means the producer never stamped an origin.
+fn terminal_event_origin_ms(event: &Value) -> u64 {
+    event
+        .get("timestamp_ms")
+        .and_then(Value::as_u64)
+        .or_else(|| event.get("ts_ms").and_then(Value::as_u64))
+        .or_else(|| event.get("observed_at_ms").and_then(Value::as_u64))
+        .unwrap_or(0)
+}
+
+/// WAITING ordering gate: a candidate may act on a waiting session only when
+/// it carries a real origin stamp at/after the waiting entry's origin. An
+/// unstamped candidate FAILS closed (all legitimate producers stamp fire
+/// time); an unstamped waiting entry cannot discriminate and accepts any
+/// stamped candidate.
+fn terminal_waiting_origin_ordered(candidate_origin_ms: u64, waiting_origin_ms: u64) -> bool {
+    candidate_origin_ms > 0
+        && (waiting_origin_ms == 0 || candidate_origin_ms >= waiting_origin_ms)
 }
 
 fn terminal_canonical_error_correlates(
@@ -15308,6 +15371,7 @@ fn emit_terminal_prompt_submitted_activity_started(
         event_type: "provider-turn-started".to_string(),
         hook_event_name: "BackendPromptSubmit".to_string(),
         updated_at_ms: now_ms,
+        waiting_origin_ms: 0,
     };
     let projected_runtime = terminal_project_runtime(&metadata, &synthetic_runtime, false);
     let mut payload = TerminalActivityHookPayload {
@@ -18254,6 +18318,7 @@ fn terminal_activity_hook_payload(
             event_type: event_type.to_string(),
             hook_event_name: hook_event_name.clone(),
             updated_at_ms: now_ms,
+            waiting_origin_ms: current_runtime.waiting_origin_ms,
         },
         terminal_is_prompting_user,
     );
@@ -19554,18 +19619,15 @@ fn terminal_activity_hook_schedule_final_stop_quiesce(
             // WAITING awaits a FUTURE turn's stop: the background continuation
             // mints a new turn id, so a turn mismatch must not cancel the
             // buffered final Stop when the session is waiting AND the event
-            // FIRED after waiting began (origin ts from the hook CLI). The
-            // session-changed check above already rejected foreign sessions.
+            // FIRED at/after the waiting entry's ORIGIN (hook CLI stamps
+            // `timestamp_ms` at fire time). Unstamped candidates fail closed.
+            // The session-changed check above already rejected foreign
+            // sessions.
             let runtime_waiting =
                 terminal_projection_text(&runtime.canonical_state, "") == "waiting";
-            let candidate_origin_ms = candidate
-                .event
-                .get("ts_ms")
-                .and_then(Value::as_u64)
-                .or_else(|| candidate.event.get("observed_at_ms").and_then(Value::as_u64))
-                .unwrap_or(0);
+            let candidate_origin_ms = terminal_event_origin_ms(&candidate.event);
             let ordered_after_waiting =
-                candidate_origin_ms == 0 || candidate_origin_ms >= runtime.updated_at_ms;
+                terminal_waiting_origin_ordered(candidate_origin_ms, runtime.waiting_origin_ms);
             if !(runtime_waiting && ordered_after_waiting) {
                 log_terminal_status_event(
                     "backend.terminal_activity_hook.idle_quiesce_cancelled",
@@ -37596,10 +37658,14 @@ notifications = true
         assert!(projection.completion_accepted);
 
         // Durable ordering: a same-session new-turn Stop whose ORIGIN
-        // timestamp predates the waiting entry is a delayed stale stop and
-        // must NOT settle; the same stop with a fresh origin settles.
+        // timestamp predates the WAITING ENTRY's ORIGIN is a delayed stale
+        // stop and must NOT settle; the same stop with a fresh origin
+        // settles. `updated_at_ms` (ingestion clock, bumped by unrelated
+        // writes like provider-session recording) plays NO part — the fresh
+        // origin below is far older than it and still settles.
         let mut ordered_runtime = waiting_runtime.clone();
-        ordered_runtime.updated_at_ms = 100;
+        ordered_runtime.waiting_origin_ms = 100;
+        ordered_runtime.updated_at_ms = 999_999;
         let mut stale_stop = waiting_test_payload("provider-turn-completed", false);
         stale_stop.provider_turn_id = Some("turn-old".to_string());
         stale_stop.turn_id = Some("turn-old".to_string());
@@ -37655,6 +37721,125 @@ notifications = true
         assert!(!terminal_activity_watchdog_runtime_is_stale_hot_candidate(
             &waiting_runtime
         ));
+    }
+
+    /// Round-5 hardening: settling WAITING always consults the origin gate.
+    /// Turnless Stops must not dodge it via the `turn_matches` missing-field
+    /// default, matching turn ids are no proof against a delayed duplicate,
+    /// and unstamped candidates fail closed.
+    #[test]
+    fn waiting_settle_gate_holds_turnless_and_unstamped_stops() {
+        let mut waiting_runtime = waiting_test_runtime_thinking();
+        waiting_runtime.canonical_state = "waiting".to_string();
+        waiting_runtime.waiting_origin_ms = 100;
+
+        // Turnless same-session Stop with a STALE origin: previously settled
+        // through the absent-turn-id default; must hold waiting.
+        let mut turnless_stale = waiting_test_payload("provider-turn-completed", false);
+        turnless_stale.provider_turn_id = None;
+        turnless_stale.turn_id = None;
+        turnless_stale.hook_timestamp_ms = 50;
+        let projection = terminal_reduce_canonical_state(
+            &waiting_runtime,
+            &turnless_stale,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(
+            projection.canonical_state, "waiting",
+            "turnless stale stop must not settle waiting"
+        );
+        assert!(!projection.completion_accepted);
+
+        // The same turnless Stop with a fresh origin settles.
+        let mut turnless_fresh = turnless_stale.clone();
+        turnless_fresh.hook_timestamp_ms = 150;
+        let projection = terminal_reduce_canonical_state(
+            &waiting_runtime,
+            &turnless_fresh,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(projection.canonical_state, "idle");
+        assert!(projection.completion_accepted);
+
+        // Unstamped candidate (no fire time, no observed time): every
+        // legitimate producer stamps origin, so even a matching turn id
+        // fails closed and holds waiting.
+        let mut unstamped = waiting_test_payload("provider-turn-completed", false);
+        unstamped.hook_timestamp_ms = 0;
+        unstamped.observed_at_ms = 0;
+        let projection =
+            terminal_reduce_canonical_state(&waiting_runtime, &unstamped, None, false, false);
+        assert_eq!(
+            projection.canonical_state, "waiting",
+            "unstamped stop must fail the origin gate closed"
+        );
+        assert!(!projection.completion_accepted);
+
+        // Raw-event origin reader (quiesce-gate parity): the hook CLI stamps
+        // `timestamp_ms` at fire time and it must be seen first.
+        assert_eq!(terminal_event_origin_ms(&json!({ "timestamp_ms": 42 })), 42);
+        assert_eq!(terminal_event_origin_ms(&json!({ "ts_ms": 41 })), 41);
+        assert_eq!(
+            terminal_event_origin_ms(&json!({ "observed_at_ms": 40 })),
+            40
+        );
+        assert_eq!(terminal_event_origin_ms(&json!({})), 0);
+        assert!(terminal_waiting_origin_ordered(150, 100));
+        assert!(!terminal_waiting_origin_ordered(50, 100));
+        assert!(!terminal_waiting_origin_ordered(0, 100));
+        assert!(!terminal_waiting_origin_ordered(0, 0));
+        assert!(terminal_waiting_origin_ordered(1, 0));
+    }
+
+    /// The waiting ordering identity is stamped from the PARKING event's
+    /// ORIGIN (hook fire time), survives rejected events and continued
+    /// waiting, never rewinds on a stale re-park, and clears on exit.
+    #[test]
+    fn waiting_origin_stamps_from_parking_event_and_clears_on_exit() {
+        let thinking = waiting_test_runtime_thinking();
+        let mut park = waiting_test_payload("provider-turn-waiting", true);
+        park.hook_timestamp_ms = 500;
+        let projection = terminal_reduce_canonical_state(&thinking, &park, None, false, false);
+        assert!(projection.waiting_accepted);
+        assert_eq!(
+            terminal_next_waiting_origin_ms(&thinking, &park, &projection, false),
+            500
+        );
+
+        let mut waiting_runtime = thinking.clone();
+        waiting_runtime.canonical_state = "waiting".to_string();
+        waiting_runtime.waiting_origin_ms = 500;
+
+        // A stale re-park must not rewind the ordering identity.
+        let mut stale_repark = waiting_test_payload("provider-turn-waiting", true);
+        stale_repark.hook_timestamp_ms = 200;
+        let projection =
+            terminal_reduce_canonical_state(&waiting_runtime, &stale_repark, None, false, false);
+        assert_eq!(
+            terminal_next_waiting_origin_ms(&waiting_runtime, &stale_repark, &projection, false),
+            500
+        );
+
+        // Rejected events preserve the identity untouched.
+        assert_eq!(
+            terminal_next_waiting_origin_ms(&waiting_runtime, &stale_repark, &projection, true),
+            500
+        );
+
+        // Settling clears it.
+        let mut final_stop = waiting_test_payload("provider-turn-completed", false);
+        final_stop.hook_timestamp_ms = 600;
+        let projection =
+            terminal_reduce_canonical_state(&waiting_runtime, &final_stop, None, false, false);
+        assert!(projection.completion_accepted);
+        assert_eq!(
+            terminal_next_waiting_origin_ms(&waiting_runtime, &final_stop, &projection, false),
+            0
+        );
     }
 
     #[test]
