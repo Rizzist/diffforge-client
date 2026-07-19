@@ -37,6 +37,8 @@ function canonicalCohort(overrides = {}) {
     active_interaction_id: null,
     active_interaction_revision: null,
     interaction_actionable: false,
+    background_task_counts: undefined,
+    background_work_active: undefined,
     ...overrides,
   };
 }
@@ -91,6 +93,8 @@ test("canonical cache resets when a pane receives a new terminal instance", () =
     active_interaction_id: undefined,
     active_interaction_revision: undefined,
     interaction_actionable: undefined,
+    background_task_counts: undefined,
+    background_work_active: undefined,
   });
   assert.equal(terminalCanonicalStateFromFields(reset), "");
 });

@@ -7,6 +7,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
 
 import { FormMessage } from "../app/appStyles";
+import {
+  getTodoQueueSessionRefValues,
+  normalizeTodoQueueTerminalReceipts,
+} from "../terminals/todoQueueSources.js";
 
 const TERMINAL_TODO_PLAN_UPDATED_EVENT = "forge-terminal-todo-plan-updated";
 const PLAN_SNAPSHOT_CACHE_LIMIT = 80;
@@ -22,6 +26,7 @@ const EMPTY_TARGET = Object.freeze({
   pane_id: "",
   repo_path: "",
   session_id: "",
+  instance_id: "",
   task_id: "",
   terminal_index: null,
   workspace_id: "",
@@ -250,17 +255,7 @@ function todoSessionDiffersFromTerminal(item, terminalSessionId) {
 }
 
 function sessionRefValues(value) {
-  const object = value && typeof value === "object" && !Array.isArray(value) ? value : {};
-  const refs = new Set();
-  [
-    object.provider_session_id,
-    object.native_session_id,
-    object.session_id,
-  ].forEach((candidate) => {
-    const cleaned = cleanText(candidate);
-    if (cleaned) refs.add(cleaned);
-  });
-  return refs;
+  return getTodoQueueSessionRefValues(value);
 }
 
 function valueHasSessionRef(value, sessionId) {
@@ -300,46 +295,8 @@ function filterPlanSnapshotForSession(snapshot, sessionId) {
   };
 }
 
-// Pane ids embed the agent kind that was active at dispatch time
-// (workspace-terminal-<ws>-<index>-<agentKind>), so receipts recorded before an
-// agent switch live under a different suffix than the terminal's current pane
-// id. Strip the trailing agent segment so a terminal slot keeps its todo
-// history across agent changes.
-function terminalPaneIdentity(paneId) {
-  const pane = cleanText(paneId);
-  if (!pane) return "";
-  const match = pane.match(/^(.*-\d+)-[a-z][a-z0-9_-]*$/i);
-  return match ? match[1] : pane;
-}
-
 function normalizeTerminalReceipts(receipts, paneId, options = {}) {
-  const pane = terminalPaneIdentity(paneId);
-  const sessionId = cleanText(options.session_id);
-  if (!pane || !receipts || typeof receipts !== "object" || Array.isArray(receipts)) {
-    return [];
-  }
-  return Object.entries(receipts)
-    .map(([key, receipt]) => {
-      if (!receipt || typeof receipt !== "object") return null;
-      if (terminalPaneIdentity(receipt.pane_id) !== pane) return null;
-      const receivedAtMs = Number(receipt.received_at_ms) || 0;
-      const updatedAtMs = Number(receipt.updated_at_ms) || receivedAtMs;
-      if (!receivedAtMs && !updatedAtMs) return null;
-      const commandId = cleanText(receipt.command_id) || cleanText(key);
-      const itemId = cleanText(receipt.item_id);
-      const receiptSessions = sessionRefValues(receipt);
-      return {
-        command_id: commandId,
-        item_id: itemId,
-        received_at_ms: receivedAtMs || updatedAtMs,
-        session_id: Array.from(receiptSessions)[0] || sessionId,
-        status: cleanText(receipt.status).toLowerCase() || "queued",
-        text: cleanText(receipt.text),
-        updated_at_ms: updatedAtMs,
-      };
-    })
-    .filter(Boolean)
-    .sort((left, right) => right.received_at_ms - left.received_at_ms);
+  return normalizeTodoQueueTerminalReceipts(receipts, paneId, options);
 }
 
 function stepStatusLabel(status) {
@@ -722,6 +679,7 @@ export default function PlansWorkspaceView({
   const snapshotAgentId = targetMatchesActiveRepo ? target.agent_id || "" : "";
   const snapshotPaneId = targetMatchesActiveRepo ? target.pane_id || "" : "";
   const snapshotSessionId = targetMatchesActiveRepo ? target.session_id || "" : "";
+  const snapshotInstanceId = targetMatchesActiveRepo ? target.instance_id || "" : "";
   const snapshotTaskId = targetMatchesActiveRepo ? target.task_id || "" : "";
   const workspaceId = target.workspace_id || workspace?.id || "";
   const hasSnapshotScope = Boolean(activeRepoPath && (snapshotTaskId || snapshotSessionId || snapshotPaneId || snapshotAgentId));
@@ -809,13 +767,13 @@ export default function PlansWorkspaceView({
     }
     return terminalTodoItems[0];
   }, [selectedTodoKey, terminalTodoItems]);
-  const openedTodoIsNewest = Boolean(openedTodo) && openedTodo === terminalTodoItems[0];
+  const openedTodoIsCurrent = Boolean(openedTodo?.is_current);
   const openedTodoLinkedPlan = planForTodo(openedTodo);
   // The newest todo also claims the terminal's active unlinked plan: plan ids
   // and todo ids can come from different creation paths (voice, kernel), and
   // an in-flight plan on this terminal belongs to the current todo.
   const openedTodoPlan = openedTodoLinkedPlan
-    || (openedTodoIsNewest && fallbackPlan && !planIsTerminal(fallbackPlan) ? fallbackPlan : null);
+    || (openedTodoIsCurrent && fallbackPlan && !planIsTerminal(fallbackPlan) ? fallbackPlan : null);
   const displayedPlan = openedTodo ? openedTodoPlan : fallbackPlan;
   const displayedPlanId = planIdentity(displayedPlan);
   const displayedPlanCanContinue = planCanContinue(displayedPlan);
@@ -916,6 +874,7 @@ export default function PlansWorkspaceView({
     const applyReceipts = (receipts) => {
       if (cancelled) return;
       setTerminalTodoItems(normalizeTerminalReceipts(receipts, paneId, {
+        instance_id: snapshotInstanceId,
         session_id: snapshotSessionId,
       }));
     };
@@ -948,7 +907,7 @@ export default function PlansWorkspaceView({
       window.clearInterval(intervalId);
       if (typeof unlisten === "function") unlisten();
     };
-  }, [snapshotSessionId, target.pane_id, workspaceId]);
+  }, [snapshotInstanceId, snapshotSessionId, target.pane_id, workspaceId]);
 
   // Relative "sent x ago" labels and live running durations stay current.
   useEffect(() => {
@@ -1304,7 +1263,7 @@ export default function PlansWorkspaceView({
         {openedTodo && (
           <TodoCard>
             <TodoCardHeader>
-              <TodoCardLabel>{openedTodoIsNewest ? "Current todo" : "Todo"}</TodoCardLabel>
+              <TodoCardLabel>{openedTodoIsCurrent ? "Current todo" : "Todo"}</TodoCardLabel>
               <TodoCardActions>
                 {openedTodoCanRelaunch && (
                   <SessionButton
@@ -1455,7 +1414,7 @@ export default function PlansWorkspaceView({
                 const kind = receiptStatusKind(item.status);
                 const duration = receiptDurationParts(item, nowMs);
                 const hasPlan = Boolean(planForTodo(item))
-                  || (index === 0 && Boolean(fallbackPlan && !planIsTerminal(fallbackPlan)));
+                  || (item.is_current && Boolean(fallbackPlan && !planIsTerminal(fallbackPlan)));
                 const itemSessionId = todoReceiptSessionId(item);
                 const canRelaunchSession = todoSessionDiffersFromTerminal(item, snapshotSessionId);
                 return (

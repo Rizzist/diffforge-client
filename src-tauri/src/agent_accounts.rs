@@ -37,6 +37,9 @@ const AGENT_ACCOUNT_PUSH_BLOB_TTL_MS: u64 = 5 * 60 * 1000;
 const AGENT_ACCOUNT_PUSH_APPLIED_MAX: usize = 256;
 
 static AGENT_ACCOUNTS_PANE_PROFILES: OnceLock<StdMutex<HashMap<String, Value>>> = OnceLock::new();
+static AGENT_ACCOUNTS_PANE_SESSION_IDENTITIES: OnceLock<
+    StdMutex<HashMap<(String, u64, String), Value>>,
+> = OnceLock::new();
 static AGENT_ACCOUNT_PUSH_PENDING: OnceLock<StdMutex<HashMap<String, AgentAccountPushPending>>> =
     OnceLock::new();
 static AGENT_ACCOUNT_PUSH_KEY_FILE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
@@ -2844,6 +2847,75 @@ fn agent_accounts_stamp_captured_spawn(
         account_binding,
         workspace_trust,
     );
+}
+
+/// Capture the account identity once, when the running CLI announces a
+/// provider SessionStart. Correlating by pane, PTY instance, and provider
+/// session prevents later hooks from an old/manual relaunch from overwriting
+/// the identity of the session currently projected by the terminal runtime.
+fn agent_accounts_observe_terminal_provider_identity(
+    pane_id: &str,
+    instance_id: u64,
+    provider_id: &str,
+    hook_event_name: &str,
+    provider_session_id: Option<&str>,
+    event: &Value,
+) {
+    let hook = terminal_activity_hook_name_key(hook_event_name);
+    if !matches!(hook.as_str(), "sessionstart" | "sessionstarted") {
+        return;
+    }
+    let Some(kind) = agent_accounts_supported_kind(provider_id) else {
+        return;
+    };
+    let session_id = provider_session_id.map(str::trim).unwrap_or_default();
+    if session_id.is_empty() {
+        return;
+    }
+    let provider_account_key = event
+        .get("provider_account_identity")
+        .and_then(|identity| identity.get("provider_account_key"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !tokenomics_provider_account_key_is_unknown(key));
+    let Some(provider_account_key) = provider_account_key else {
+        return;
+    };
+    let identities = AGENT_ACCOUNTS_PANE_SESSION_IDENTITIES
+        .get_or_init(|| StdMutex::new(HashMap::new()));
+    if let Ok(mut identities) = identities.lock() {
+        // A pane can relaunch Claude repeatedly without replacing its PTY.
+        // Keep only its newest SessionStart so delayed events from the prior
+        // provider session can never become live again.
+        identities.retain(|(existing_pane_id, _, _), _| existing_pane_id != pane_id);
+        identities.insert(
+            (pane_id.to_string(), instance_id, session_id.to_string()),
+            json!({
+                "kind": kind,
+                "provider_account_key": provider_account_key,
+            }),
+        );
+    }
+}
+
+fn agent_accounts_terminal_provider_identity(
+    pane_id: &str,
+    instance_id: u64,
+    provider_session_id: Option<&str>,
+) -> Option<Value> {
+    let session_id = provider_session_id.map(str::trim).unwrap_or_default();
+    if session_id.is_empty() {
+        return None;
+    }
+    AGENT_ACCOUNTS_PANE_SESSION_IDENTITIES
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|identities| {
+            identities
+                .get(&(pane_id.to_string(), instance_id, session_id.to_string()))
+                .cloned()
+        })
 }
 
 // ---- Automatic account capture --------------------------------------------
@@ -8167,6 +8239,25 @@ fn agent_accounts_restart_eligible(execution_phase: &str, terminal_lifecycle: &s
         )
 }
 
+fn agent_accounts_live_identity_matches_target(kind: &str, live: &Value, target: &Value) -> bool {
+    let live_identity = live.get("provider_account_identity");
+    let live_kind = live_identity
+        .and_then(|identity| identity.get("kind"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let live_key = live_identity
+        .and_then(|identity| identity.get("provider_account_key"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let target_key = target
+        .get("provider_account_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    live_kind == kind && !live_key.is_empty() && !target_key.is_empty() && live_key == target_key
+}
+
 fn agent_accounts_build_stale_inventory(
     panes: &serde_json::Map<String, Value>,
     active: &Value,
@@ -8225,6 +8316,14 @@ fn agent_accounts_build_stale_inventory(
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
             if !open {
+                return None;
+            }
+            // A CLI relaunched inside the same PTY keeps the pane instance and
+            // launch epoch, so its original spawn stamp cannot prove which
+            // account is live. The hook-derived provider session's transcript
+            // home is stronger evidence: once it resolves to the selected
+            // account, reconcile the stale stamp even while the pane is busy.
+            if agent_accounts_live_identity_matches_target(kind, live, target) {
                 return None;
             }
             let workspace_id = live
@@ -8321,10 +8420,20 @@ async fn agent_accounts_pane_profiles_for_state(state: &TerminalState) -> Value 
     let active_identity = |kind| {
         agent_accounts_capture_launch_account_binding(kind)
             .map(|binding| {
+                let provider_account_key = if kind == "claude" {
+                    agent_accounts_profile_identity(kind, binding.profile_home.as_deref())
+                        .get("tokenomics_account_key")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                } else {
+                    String::new()
+                };
                 json!({
                     "profile_id": binding.profile_id,
                     "profile_label": binding.profile_label,
                     "auth_revision": binding.auth_revision,
+                    "provider_account_key": provider_account_key,
                 })
             })
             .unwrap_or_else(|| {
@@ -8359,6 +8468,11 @@ async fn agent_accounts_pane_profiles_for_state(state: &TerminalState) -> Value 
                     &projected.execution_phase,
                     &projected.terminal_lifecycle,
                 );
+                let provider_account_identity = agent_accounts_terminal_provider_identity(
+                    pane_id,
+                    instance.id,
+                    runtime.provider_session_id.as_deref(),
+                );
                 (
                     pane_id.clone(),
                     json!({
@@ -8380,15 +8494,24 @@ async fn agent_accounts_pane_profiles_for_state(state: &TerminalState) -> Value 
                         "restart_coordinator_id": restart_intent.as_ref().map(|intent| intent.coordinator_id.as_str()),
                         "restart_deadline_at_ms": restart_intent.as_ref().map(|intent| intent.deadline_at_ms),
                         "restart_force_action": restart_intent.as_ref().and_then(|intent| (intent.state == "blocked").then(|| terminal_restart_intent_force_action(intent))),
+                        "provider_account_identity": provider_account_identity,
                     }),
                 )
             })
             .collect::<HashMap<_, _>>()
     };
     let inventory = agent_accounts_build_stale_inventory(&panes, &active, &live_panes);
+    let mut active_for_response = active;
+    if let Some(targets) = active_for_response.as_object_mut() {
+        for target in targets.values_mut() {
+            if let Some(target) = target.as_object_mut() {
+                target.remove("provider_account_key");
+            }
+        }
+    }
     json!({
         "panes": panes,
-        "active": active,
+        "active": active_for_response,
         "auth": auth,
         "stale_inventory": inventory,
     })
@@ -9534,6 +9657,165 @@ trust_level = "trusted"
             Value::Array(inventory),
             "the secret-free native inventory is the provider_accounts sync source"
         );
+    }
+
+    #[test]
+    fn stale_inventory_clears_when_busy_terminal_reports_target_account_identity() {
+        let panes = json!({
+            "pane-matching": {
+                "kind": "claude",
+                "profile_id": "old-profile",
+                "profile_label": "Old",
+                "auth_revision": "old-revision",
+                "instance_id": 41,
+                "launch_epoch": "pane-matching:41"
+            },
+            "pane-mismatched": {
+                "kind": "claude",
+                "profile_id": "old-profile",
+                "profile_label": "Old",
+                "auth_revision": "old-revision",
+                "instance_id": 42,
+                "launch_epoch": "pane-mismatched:42"
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let active = json!({
+            "claude": {
+                "profile_id": "target-profile",
+                "profile_label": "Default",
+                "auth_revision": "target-revision",
+                "provider_account_key": "anthropic:claude:target"
+            }
+        });
+        let live = HashMap::from([
+            (
+                "pane-matching".to_string(),
+                json!({
+                    "instance_id": 41,
+                    "launch_epoch": "pane-matching:41",
+                    "workspace_id": "workspace-a",
+                    "terminal_index": 0,
+                    "activity": "running",
+                    "open": true,
+                    "restart_eligible": false,
+                    "provider_account_identity": {
+                        "kind": "claude",
+                        "provider_account_key": "anthropic:claude:target"
+                    }
+                }),
+            ),
+            (
+                "pane-mismatched".to_string(),
+                json!({
+                    "instance_id": 42,
+                    "launch_epoch": "pane-mismatched:42",
+                    "workspace_id": "workspace-a",
+                    "terminal_index": 1,
+                    "activity": "running",
+                    "open": true,
+                    "restart_eligible": false,
+                    "provider_account_identity": {
+                        "kind": "claude",
+                        "provider_account_key": "anthropic:claude:other"
+                    }
+                }),
+            ),
+        ]);
+
+        let inventory = agent_accounts_build_stale_inventory(&panes, &active, &live);
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0]["pane_id"], "pane-mismatched");
+        assert_eq!(inventory[0]["busy"], true);
+    }
+
+    #[test]
+    fn live_identity_is_bound_to_session_start_and_exact_provider_session() {
+        let pane_id = format!("pane-live-identity-{}", uuid::Uuid::new_v4());
+        let instance_id = 73;
+        let target = json!({
+            "provider_account_identity": {
+                "provider_account_key": "anthropic:claude:target"
+            }
+        });
+        let other = json!({
+            "provider_account_identity": {
+                "provider_account_key": "anthropic:claude:other"
+            }
+        });
+
+        agent_accounts_observe_terminal_provider_identity(
+            &pane_id,
+            instance_id,
+            "claude",
+            "SessionStart",
+            Some("session-a"),
+            &target,
+        );
+        assert_eq!(
+            agent_accounts_terminal_provider_identity(
+                &pane_id,
+                instance_id,
+                Some("session-a")
+            )
+            .unwrap()["provider_account_key"],
+            "anthropic:claude:target"
+        );
+
+        // Later activity from the same process must not rewrite the identity
+        // captured when the provider session loaded its credentials.
+        agent_accounts_observe_terminal_provider_identity(
+            &pane_id,
+            instance_id,
+            "claude",
+            "Stop",
+            Some("session-a"),
+            &other,
+        );
+        assert_eq!(
+            agent_accounts_terminal_provider_identity(
+                &pane_id,
+                instance_id,
+                Some("session-a")
+            )
+            .unwrap()["provider_account_key"],
+            "anthropic:claude:target"
+        );
+
+        // A manual relaunch inside the same PTY gets a distinct session key;
+        // the runtime selects only that session's captured identity.
+        agent_accounts_observe_terminal_provider_identity(
+            &pane_id,
+            instance_id,
+            "claude",
+            "SessionStart",
+            Some("session-b"),
+            &other,
+        );
+        assert_eq!(
+            agent_accounts_terminal_provider_identity(
+                &pane_id,
+                instance_id,
+                Some("session-b")
+            )
+            .unwrap()["provider_account_key"],
+            "anthropic:claude:other"
+        );
+        assert!(agent_accounts_terminal_provider_identity(
+            &pane_id,
+            instance_id + 1,
+            Some("session-b")
+        )
+        .is_none());
+
+        if let Ok(mut identities) = AGENT_ACCOUNTS_PANE_SESSION_IDENTITIES
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+        {
+            identities.retain(|(candidate, _, _), _| candidate != &pane_id);
+        }
     }
 
     #[test]

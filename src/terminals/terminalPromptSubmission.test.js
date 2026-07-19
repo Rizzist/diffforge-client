@@ -5,6 +5,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  terminalPromptIsLocalSlashCommand,
   terminalPromptSubmittedPayloadIsAuthoritative,
 } from "./terminalPromptSubmission.js";
 import {
@@ -199,4 +200,40 @@ test("panel agent prompt submit keeps agent mode open and drives shared activity
   const overlaySubmitBody = overlaySource.slice(overlaySubmitStart, overlaySubmitEnd);
   assert.match(overlaySubmitBody, /runOverlayAction\("submitted"/);
   assert.doesNotMatch(overlaySubmitBody, /closeRef\.current\?\.\(\)/);
+});
+
+test("local slash command detection never synthesizes thinking for command-shaped input", () => {
+  // Command-shaped leading tokens (^/[A-Za-z0-9_:-]+(\s|$)), with or without
+  // arguments or surrounding whitespace, are local CLI slash commands.
+  for (const command of [
+    "/model",
+    "/model gpt-5.1-codex high",
+    "  /clear",
+    "/status\n",
+    "/agents:review",
+    "/mcp-list",
+  ]) {
+    assert.equal(
+      terminalPromptIsLocalSlashCommand(command),
+      true,
+      `expected ${JSON.stringify(command)} to read as a local slash command`,
+    );
+  }
+
+  // A bare slash, a path-like token, and ordinary prompts are not commands, so
+  // their turn still flips to thinking normally.
+  for (const prompt of [
+    "/",
+    "/ hello",
+    "/foo/bar",
+    "please refactor the parser",
+    "halve the pricing numbers",
+    "",
+  ]) {
+    assert.equal(
+      terminalPromptIsLocalSlashCommand(prompt),
+      false,
+      `expected ${JSON.stringify(prompt)} to remain a normal prompt`,
+    );
+  }
 });

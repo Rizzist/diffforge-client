@@ -22332,6 +22332,7 @@ function TerminalView({
       return {
         agent_id: liveTerminal?.agent_id || coordination.agent_id || thread?.current_agent || fallbackRole || "",
         db_path: projectTarget?.db_path || "",
+        instance_id: liveTerminal?.instance_id || "",
         mount_id: projectTarget?.mount_id || "",
         pane_id: paneId,
         repo_path: projectTarget?.repo_path || terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
@@ -22388,6 +22389,7 @@ function TerminalView({
 	      return {
 	        agent_id: "",
 	        db_path: fallbackProjectTarget?.db_path || "",
+	        instance_id: "",
 	        mount_id: fallbackProjectTarget?.mount_id || "",
 	        pane_id: activePaneId || "",
 	        repo_path: fallbackProjectTarget?.repo_path || terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",

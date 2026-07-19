@@ -4457,7 +4457,7 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
         );
         return 0;
     };
-    let record = diff_forge_activity_hook_record_with_persisted_claude_state(
+    let mut record = diff_forge_activity_hook_record_with_persisted_claude_state(
         &provider,
         &pane_id,
         instance_id,
@@ -4466,10 +4466,6 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
         &hook_input,
         &activity_path,
     );
-    let codex_app_server_uir_active = provider.to_ascii_lowercase().contains("codex")
-        && env::var("DIFFFORGE_CODEX_APP_SERVER_UIR")
-            .ok()
-            .is_some_and(|value| terminal_env_truthy(&value));
     let record_hook_key = record
         .get("hook_event_name")
         .and_then(Value::as_str)
@@ -4478,6 +4474,15 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
         .filter(|character| character.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect::<String>();
+    if matches!(record_hook_key.as_str(), "sessionstart" | "sessionstarted") {
+        if let Some(identity) = tokenomics_process_provider_account_identity(&provider) {
+            record["provider_account_identity"] = identity;
+        }
+    }
+    let codex_app_server_uir_active = provider.to_ascii_lowercase().contains("codex")
+        && env::var("DIFFFORGE_CODEX_APP_SERVER_UIR")
+            .ok()
+            .is_some_and(|value| terminal_env_truthy(&value));
     let record_tool_key = record
         .get("tool_name")
         .and_then(Value::as_str)
@@ -8297,6 +8302,18 @@ mod terminal_cli_tests {
             .contains("finishTrackedInteractionResolution"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
             .contains("provider_pending_list_disappeared: true"));
+        // Drain-all reconciliation: when a provider request disappears from
+        // the pending list, EVERY queued generation of that interaction key
+        // must resolve (oldest-first, newest-last) — a head-only resolution
+        // strands the Rust-side latch on the newest generation.
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("let drainBudget = queued.length"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("interaction_id: current.interaction_id"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("interaction_revision: current.interaction_revision"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("if (remaining[0] === current) break;"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
             .contains("generation.interaction_kind !== kind"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
@@ -10830,19 +10847,33 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
             || generation.interaction_kind !== kind
             || liveKeys.has(interactionKey)
           ) continue;
-          finishTrackedInteractionResolution({
-            interaction_key: interactionKey,
-            interaction_id: generation.interaction_id,
-            interaction_revision: generation.interaction_revision,
-            interaction_kind: kind,
-            request_id: generation.request_id,
-            session_id: generation.session_id,
-            type: `${kind}.reconciled`,
-            props: {
-              provider_pending_list_disappeared: true,
-              reconciliation_reason: reason,
-            },
-          });
+          // Drain ALL queued generations: the provider request left the
+          // pending list, so every generation of this interaction key is
+          // resolved. Emit oldest-first so the NEWEST generation's resolution
+          // lands last — Rust latches the newest generation, and a head-only
+          // resolution (process killed/replaced before the next pass) would
+          // strand that latch in UIR forever.
+          let drainBudget = queued.length;
+          while (drainBudget > 0) {
+            const current = (interactionGenerations.get(interactionKey) || [])[0];
+            if (!current || current.interaction_kind !== kind) break;
+            drainBudget -= 1;
+            finishTrackedInteractionResolution({
+              interaction_key: interactionKey,
+              interaction_id: current.interaction_id,
+              interaction_revision: current.interaction_revision,
+              interaction_kind: kind,
+              request_id: current.request_id,
+              session_id: current.session_id,
+              type: `${kind}.reconciled`,
+              props: {
+                provider_pending_list_disappeared: true,
+                reconciliation_reason: reason,
+              },
+            });
+            const remaining = interactionGenerations.get(interactionKey) || [];
+            if (remaining[0] === current) break;
+          }
         }
         for (const interactionKey of Array.from(handledInteractionIds.keys())) {
           if (interactionKey.includes(`:${kind}:`) && !liveKeys.has(interactionKey)) {

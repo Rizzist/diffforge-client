@@ -4642,6 +4642,28 @@ fn tokenomics_claude_profile_auth_value(profile_dir: &Path) -> Option<Value> {
     }))
 }
 
+/// Resolve the Claude identity visible to the hook process at SessionStart.
+/// Hooks inherit the CLI's effective CLAUDE_CONFIG_DIR, including an inline
+/// binding used to relaunch Claude inside an existing PTY. Only the opaque
+/// Tokenomics key is attached to the local activity record.
+fn tokenomics_process_provider_account_identity(provider_id: &str) -> Option<Value> {
+    if agent_accounts_supported_kind(provider_id) != Some("claude") {
+        return None;
+    }
+    let auth_value = match env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(config_dir) => tokenomics_claude_profile_auth_value(&PathBuf::from(config_dir)),
+        None => tokenomics_claude_auth_value(),
+    }?;
+    let account = tokenomics_provider_account_from_auth("anthropic", "claude", Some(&auth_value));
+    (!tokenomics_provider_account_key_is_unknown(&account.key)).then(|| {
+        json!({
+            "provider": "anthropic",
+            "agent_kind": "claude",
+            "provider_account_key": account.key,
+        })
+    })
+}
+
 /// Identity-first account for a captured Claude profile, mirroring the Codex
 /// profile path: resolve the profile dir's own oauth identity so usage keys
 /// to the SAME account hash wherever that login runs (default home or
@@ -19335,6 +19357,29 @@ mod tokenomics_tests {
 
         let previous = env::var_os("XDG_DATA_HOME");
         env::set_var("XDG_DATA_HOME", &dir);
+        // Isolate the agent-accounts registry too: on a dev machine a real
+        // captured OpenCode profile would otherwise outrank the test's XDG
+        // store (ingestion resolves the LAUNCH profile authority first).
+        // Model production shape: an active profile whose root IS this test
+        // store, so the profile-authority path resolves the fixture db.
+        let previous_data_dir = env::var_os("RUST_DIFFFORGE_DATA_DIR");
+        env::set_var("RUST_DIFFFORGE_DATA_DIR", &dir);
+        fs::write(
+            dir.join("agent-accounts.json"),
+            serde_json::to_string(&serde_json::json!({
+                "agents": {
+                    "opencode": {
+                        "active_profile_id": "prof-scan-test",
+                        "profiles": [{
+                            "id": "prof-scan-test",
+                            "dir": dir.to_string_lossy(),
+                        }],
+                    },
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
 
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
@@ -19378,6 +19423,10 @@ mod tokenomics_tests {
         match previous {
             Some(value) => env::set_var("XDG_DATA_HOME", value),
             None => env::remove_var("XDG_DATA_HOME"),
+        }
+        match previous_data_dir {
+            Some(value) => env::set_var("RUST_DIFFFORGE_DATA_DIR", value),
+            None => env::remove_var("RUST_DIFFFORGE_DATA_DIR"),
         }
         let _ = fs::remove_dir_all(&dir);
     }

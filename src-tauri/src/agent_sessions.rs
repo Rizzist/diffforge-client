@@ -1322,6 +1322,26 @@ fn clean_codex_title(value: impl AsRef<str>, fallback: &str) -> String {
         .unwrap_or_default()
         .trim()
         .to_string();
+    // Injected-context wrappers are NOT user prompts and never make a title:
+    // fall through to the next candidate. Session lists were showing
+    // "<local-command-caveat>Caveat: ..." (Claude /slash-command sessions)
+    // and "<system-reminder>Note: ..." (opencode) as session names.
+    let lowered = title.to_ascii_lowercase();
+    if [
+        "<local-command-caveat",
+        "<local-command-stdout",
+        "<command-name",
+        "<command-message",
+        "<system-reminder",
+        "&lt;system-reminder",
+        "<environment_context",
+        "<instructions",
+    ]
+    .iter()
+    .any(|prefix| lowered.starts_with(prefix))
+    {
+        return fallback.to_string();
+    }
     if title.is_empty() {
         fallback.to_string()
     } else if title.chars().count() > 96 {
@@ -7234,8 +7254,15 @@ fn opencode_native_data_home() -> Vec<PathBuf> {
 }
 
 fn opencode_data_home() -> Vec<PathBuf> {
-    let mut candidates = agent_accounts_active_profile_dir("opencode")
-        .map(|profile_root| vec![PathBuf::from(profile_root).join("opencode")])
+    // Launch authority, not the raw registry selector: the Default selector
+    // can resolve to a CAPTURED effective profile whose root the launched
+    // process actually writes (XDG_DATA_HOME). Reading only
+    // agent_accounts_active_profile_dir here made Session History tail the
+    // native ~/.local/share/opencode store while new sessions landed in the
+    // captured profile — they never appeared. Mirrors the claude ingestion
+    // paths, which already use the launch-home helper.
+    let mut candidates = agent_accounts_profile_home_for_launch("opencode")
+        .map(|profile_root| vec![profile_root.join("opencode")])
         .unwrap_or_default();
     candidates.extend(opencode_native_data_home());
     candidates.dedup();
@@ -7268,9 +7295,10 @@ fn opencode_db_path() -> Option<PathBuf> {
     // A captured OpenCode profile is launched with XDG_DATA_HOME bound to the
     // selected profile root. Resume validation must therefore stop at that
     // root even when it has no database; falling through to the native store
-    // would report a session the launched process cannot see.
+    // would report a session the launched process cannot see. Resolved via
+    // the LAUNCH authority (Default selector may bind a captured profile).
     opencode_db_path_for_launch_roots(
-        agent_accounts_active_profile_dir("opencode").map(PathBuf::from),
+        agent_accounts_profile_home_for_launch("opencode"),
         opencode_native_data_home(),
     )
 }

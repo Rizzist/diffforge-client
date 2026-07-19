@@ -7969,7 +7969,7 @@ fn todo_dispatch_queue_mark_settled(
 }
 
 pub(crate) fn todo_dispatch_mark_active_for_pane_interrupted(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     workspace_id: &str,
     pane_id: &str,
     reason: &str,
@@ -8009,7 +8009,7 @@ pub(crate) fn todo_dispatch_mark_active_for_pane_interrupted(
                 object.insert("updated_at_ms".to_string(), json!(todo_dispatch_now_ms()));
             }
             let _ = todo_dispatch_record_receipt_internal(
-                Some(app),
+                app,
                 workspace_id,
                 receipt,
                 "terminal_interrupt_settled",
@@ -8024,7 +8024,7 @@ pub(crate) fn todo_dispatch_mark_active_for_pane_interrupted(
         if command_id.trim().is_empty() {
             continue;
         }
-        todo_dispatch_queue_mark_settled(Some(app), workspace_id, &command_id, "interrupted");
+        todo_dispatch_queue_mark_settled(app, workspace_id, &command_id, "interrupted");
         settled.insert(command_id);
     }
 
@@ -9271,6 +9271,96 @@ mod todo_store_tests {
             todo_dispatch_active_queue_item_ids_for_pane_from_items(&items, "pane-a"),
             vec!["command-new".to_string(), "old-running".to_string()]
         );
+    }
+
+    #[test]
+    fn todo_dispatch_pane_interruption_settles_active_receipt_and_queue_item() {
+        let workspace_id = format!("test-pane-interrupt-{}", uuid::Uuid::new_v4());
+        let receipt_path = todo_dispatch_store_path(&workspace_id);
+        let queue_path = todo_dispatch_data_path("queues", &workspace_id);
+        todo_dispatch_queue_write(
+            &workspace_id,
+            &[
+                json!({
+                    "id": "todo-pane-a",
+                    "remote_command": { "command_id": "command-pane-a" },
+                    "status": "running",
+                    "target_terminal_id": "pane-a",
+                    "text": "old running todo",
+                    "todo_status": "running",
+                    "workspace_id": workspace_id,
+                }),
+                json!({
+                    "id": "todo-pane-b",
+                    "remote_command": { "command_id": "command-pane-b" },
+                    "status": "running",
+                    "target_terminal_id": "pane-b",
+                    "text": "other pane",
+                    "todo_status": "running",
+                    "workspace_id": workspace_id,
+                }),
+            ],
+        );
+        todo_dispatch_record_receipt_internal(
+            None,
+            &workspace_id,
+            json!({
+                "command_id": "command-pane-a",
+                "item_id": "todo-pane-a",
+                "pane_id": "pane-a",
+                "provider_session_id": "old-provider-session",
+                "status": "running",
+                "text": "old running todo",
+            }),
+            "test_running_receipt",
+        )
+        .unwrap();
+
+        let settled = todo_dispatch_mark_active_for_pane_interrupted(
+            None,
+            &workspace_id,
+            "pane-a",
+            "terminal_restart",
+        );
+
+        assert_eq!(settled, 1);
+        let receipts = todo_dispatch_load(&workspace_id);
+        assert_eq!(
+            receipts["command-pane-a"]["status"].as_str(),
+            Some("interrupted")
+        );
+        assert_eq!(
+            receipts["command-pane-a"]["status_reason"].as_str(),
+            Some("terminal_restart")
+        );
+        let queue_items = queue_path
+            .as_ref()
+            .map(|path| todo_dispatch_queue_read(path))
+            .and_then(|snapshot| snapshot.get("items").and_then(Value::as_array).cloned())
+            .unwrap_or_default();
+        let pane_a = queue_items
+            .iter()
+            .find(|item| todo_dispatch_queue_item_command_id(item) == "command-pane-a")
+            .expect("pane-a item");
+        let pane_b = queue_items
+            .iter()
+            .find(|item| todo_dispatch_queue_item_command_id(item) == "command-pane-b")
+            .expect("pane-b item");
+        assert_eq!(todo_store_item_status(pane_a), "interrupted");
+        assert_eq!(todo_store_item_status(pane_b), "running");
+
+        if let Some(path) = receipt_path {
+            let _ = fs::remove_file(path);
+        }
+        if let Some(path) = queue_path {
+            let _ = fs::remove_file(path);
+        }
+        if let Ok(mut cache) = TODO_DISPATCH_RECEIPTS_CACHE
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+        {
+            cache.remove(&todo_dispatch_safe_workspace_id(&workspace_id));
+        }
     }
 
     #[test]
@@ -14692,9 +14782,11 @@ async fn todo_dispatch_backend_submit(
             "item_id": item_id,
             "pane_id": pane_id,
             "prompt_event_id": prompt_event_id.clone(),
+            "provider_session_id": target_provider_session_id.unwrap_or_default(),
             "submitted_at": submitted_at.clone(),
             "status": "submitted",
             "status_reason": "todo_queue_backend_submit",
+            "terminal_instance_id": instance.id,
             "attachment_count": prepared.attachments.len(),
             "attachment_delivery": if prepared.attachments.is_empty() { "none" } else { "native_bracketed_paste" },
             "text": prompt.chars().take(180).collect::<String>(),

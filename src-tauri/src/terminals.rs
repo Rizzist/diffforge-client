@@ -2357,13 +2357,10 @@ fn terminal_canonical_interaction_actionable(
     })
 }
 
-fn terminal_canonical_exact_resolution(
-    previous: &TerminalRuntimeSnapshot,
-    payload: &TerminalActivityHookPayload,
-) -> bool {
+fn terminal_canonical_resolution_event(payload: &TerminalActivityHookPayload) -> bool {
     let event_type = terminal_projection_text(&payload.event_type, "");
     let hook = terminal_activity_hook_name_key(&payload.hook_event_name);
-    let resolution_event = matches!(
+    matches!(
         event_type.as_str(),
         "provider_user_prompt_answered" | "provider_user_prompt_completed"
     ) || matches!(
@@ -2373,8 +2370,32 @@ fn terminal_canonical_exact_resolution(
             | "permissionresolved"
             | "elicitationresult"
             | "elicitationresolved"
-    );
-    resolution_event
+    )
+}
+
+/// Resolution request identity carried by the event itself, mirroring the
+/// raw-event key priority used by the structured store's reconcile path.
+/// Only meaningful on PRE-overlay payloads: the open-interaction overlay
+/// rewrites these fields to describe the surviving interaction.
+fn terminal_activity_payload_resolution_request_id(
+    payload: &TerminalActivityHookPayload,
+) -> Option<String> {
+    payload
+        .permission_request_id
+        .clone()
+        .or_else(|| payload.permission_prompt_id.clone())
+        .or_else(|| payload.approval_id.clone())
+        .or_else(|| payload.prompt_id.clone())
+        .or_else(|| payload.tool_use_id.clone())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn terminal_canonical_exact_resolution(
+    previous: &TerminalRuntimeSnapshot,
+    payload: &TerminalActivityHookPayload,
+) -> bool {
+    terminal_canonical_resolution_event(payload)
         && previous.active_interaction_id.is_some()
         && previous.active_interaction_revision.is_some()
         && previous.active_interaction_id.as_deref() == payload.event_interaction_id.as_deref()
@@ -2688,10 +2709,70 @@ fn terminal_reduce_canonical_state(
     let prompt_accepts_missing_turn = prompt_event
         && !previous_runtime.turn_active
         && matches!(previous_state.as_str(), "starting" | "idle");
+    // Request-id fallback for provider-API (OpenCode) interactions: the
+    // plugin's resolution may name an older queued generation of the SAME
+    // provider request (killed/replaced CLI mid-drain), while the runtime
+    // latched the newest generation. When the resolution matches the OPEN
+    // interaction under the structured store's matcher (exact id/revision, or
+    // provider-request identity for `provider_api`), it resolves that
+    // interaction. Only pre-overlay resolution frames qualify: the overlay
+    // stamps prompting fields (and the open interaction's request ids) onto
+    // passive frames, so `terminal_is_prompting_user` gates out poisoned
+    // request identity. Claude/Codex blocking-hook interactions never take
+    // this path (matcher keeps them strict exact-match).
+    let resolution_resolves_open_interaction = !authoritative_event.terminal_is_prompting_user
+        && authoritative_event.event_interaction_id.is_some()
+        && terminal_canonical_resolution_event(authoritative_event)
+        && open_structured_interaction.is_some_and(|interaction| {
+            terminal_structured_interaction_matches_resolution(
+                interaction,
+                authoritative_event.event_interaction_id.as_deref(),
+                authoritative_event.event_interaction_revision,
+                terminal_activity_payload_resolution_request_id(authoritative_event).as_deref(),
+            )
+        });
+    // Tool-execution evidence: a permission prompt bound to a specific tool
+    // use (interaction identity == stamped tool_use_id) is proven ANSWERED
+    // when the same tool use is observed executing — the user answered inside
+    // the TUI and no resolution event will ever arrive. Two forms qualify:
+    // the OPEN interaction verified directly against this tool event, or —
+    // when the structured store already verified the binding, removed the
+    // interaction, and normalized the resolved identity onto the event — an
+    // exact latch-identity match carried by the tool hook itself. Unrelated
+    // tool activity never matches either form.
+    let tool_evidence_hook = matches!(
+        terminal_activity_hook_name_key(&authoritative_event.hook_event_name).as_str(),
+        "pretooluse" | "posttooluse"
+    );
+    let tool_evidence_resolution = tool_evidence_hook
+        && (open_structured_interaction.is_some_and(|interaction| {
+            previous_runtime.active_interaction_id.as_deref()
+                == Some(interaction.interaction_id.as_str())
+                && previous_runtime.active_interaction_revision == Some(interaction.revision)
+                && terminal_structured_interaction_tool_evidence_resolves(
+                    interaction,
+                    authoritative_event,
+                )
+        }) || (open_structured_interaction.is_none()
+            && authoritative_event.event_interaction_id.is_some()
+            && previous_runtime.active_interaction_id.is_some()
+            && previous_runtime.active_interaction_id.as_deref()
+                == authoritative_event.event_interaction_id.as_deref()
+            && previous_runtime.active_interaction_revision
+                == authoritative_event.event_interaction_revision));
     let exact_resolution =
-        terminal_canonical_exact_resolution(previous_runtime, authoritative_event);
-    let distinct_open_interaction_remains =
-        open_structured_interaction.is_some_and(|interaction| {
+        terminal_canonical_exact_resolution(previous_runtime, authoritative_event)
+            || tool_evidence_resolution
+            || (resolution_resolves_open_interaction
+                && open_structured_interaction.is_some_and(|interaction| {
+                    previous_runtime.active_interaction_id.as_deref()
+                        == Some(interaction.interaction_id.as_str())
+                        && previous_runtime.active_interaction_revision
+                            == Some(interaction.revision)
+                }));
+    let distinct_open_interaction_remains = !resolution_resolves_open_interaction
+        && !tool_evidence_resolution
+        && open_structured_interaction.is_some_and(|interaction| {
             authoritative_event.event_interaction_id.as_deref()
                 != Some(interaction.interaction_id.as_str())
                 || authoritative_event.event_interaction_revision != Some(interaction.revision)
@@ -9008,6 +9089,21 @@ async fn close_terminal_session(
             "terminal_close",
         )
         .await;
+        // The agent process behind this pane is going away: any structured
+        // interaction (UIR) it opened can never be answered or resolved by a
+        // successor process, so it must not survive the boundary.
+        let cleared_structured_interactions =
+            terminal_structured_interaction_clear_pane(state, pane_id);
+        if cleared_structured_interactions > 0 {
+            log_terminal_status_event(
+                "backend.terminal_structured_interaction.cleared_on_close",
+                json!({
+                    "cleared": cleared_structured_interactions,
+                    "instance_id": cleanup_instance_id,
+                    "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                }),
+            );
+        }
         log_terminal_crash_forensics_event(
             "backend.terminal_close.removed",
             json!({
@@ -9043,6 +9139,17 @@ async fn close_terminal_session(
             "detached",
             "terminal_close:terminal_detached",
             None,
+        );
+        let todo_interrupt_reason = if restart_if_idle_launch_epoch.is_some() {
+            "terminal_restart"
+        } else {
+            "terminal_close"
+        };
+        todo_dispatch_mark_active_for_pane_interrupted(
+            app.as_ref(),
+            &instance.metadata.workspace_id,
+            pane_id,
+            todo_interrupt_reason,
         );
         todo_store_orphan_sweep_trigger("terminal_close");
         let cleanup_tracker = Arc::clone(&state.cleanup_tracker);
@@ -9246,6 +9353,14 @@ async fn close_all_terminal_sessions(
             "detached",
             format!("{close_reason}:terminal_detached"),
             None,
+        );
+    }
+    for (pane_id, instance) in &instances {
+        todo_dispatch_mark_active_for_pane_interrupted(
+            Some(&app),
+            &instance.metadata.workspace_id,
+            pane_id,
+            close_reason,
         );
     }
     if closed > 0 {
@@ -10167,6 +10282,22 @@ async fn terminal_open(
             .fetch_add(1, Ordering::Relaxed)
     });
     clear_terminal_activity_hook_files(&pane_id, instance_id, workspace_id.as_deref());
+    // Fresh-instance boundary: the close above normally clears these, but an
+    // open that found no live instance to close (crashed/replaced process)
+    // must still guarantee the new agent process inherits no UIR latch —
+    // especially when the open request reuses the previous instance id.
+    let cleared_structured_interactions =
+        terminal_structured_interaction_clear_pane(state.inner(), &pane_id);
+    if cleared_structured_interactions > 0 {
+        log_terminal_status_event(
+            "backend.terminal_structured_interaction.cleared_on_open",
+            json!({
+                "cleared": cleared_structured_interactions,
+                "instance_id": instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+            }),
+        );
+    }
     let activity_transport = match terminal_activity_transport_for_terminal(
         app.clone(),
         state.inner(),
@@ -15298,6 +15429,38 @@ async fn terminal_try_emit_app_fork_request(
     true
 }
 
+/// Detects a local CLI slash command shaped like `^/[A-Za-z0-9_:-]+(\s|$)`
+/// (`/model`, `/clear`, `/model gpt-5.1`, `/status`, …). Claude Code, Codex,
+/// and OpenCode handle these entirely in-process: they print a result, never
+/// call the provider API, and never fire a UserPromptSubmit hook. Synthesizing
+/// a turn-started/thinking snapshot for one would wedge the pane in "thinking"
+/// until a watchdog because no Stop ever arrives. The command-shape check keeps
+/// ordinary prompts that merely contain a slash (a bare "/", a "/foo/bar" path)
+/// out of scope so their turn still synthesizes normally. A slash command that
+/// *does* start a real turn (a skill that prompts the model) still flips to
+/// thinking via the CLI's own UserPromptSubmit/PreToolUse hook evidence, which
+/// arrives independently of this synthetic emitter.
+fn terminal_prompt_is_local_slash_command(prompt: &str) -> bool {
+    let trimmed = prompt.trim_start();
+    let mut chars = trimmed.chars();
+    if chars.next() != Some('/') {
+        return false;
+    }
+    let mut token_len = 0usize;
+    for ch in chars {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':' | '-') {
+            token_len += 1;
+            continue;
+        }
+        // First char after the command token: a real slash command is followed
+        // by whitespace and arguments ("/model gpt-5"). Anything else (a '/'
+        // continuing a path, other punctuation) is not command-shaped.
+        return token_len > 0 && ch.is_whitespace();
+    }
+    // Reached end of input: "/model" with no trailing argument.
+    token_len > 0
+}
+
 fn terminal_prompt_submitted_should_emit_synthetic_activity(
     metadata: &TerminalInstanceMetadata,
     prompt_source: &str,
@@ -15365,6 +15528,33 @@ fn emit_terminal_prompt_submitted_activity_started(
     }
     let prompt = prompt.trim();
     if prompt.is_empty() {
+        return;
+    }
+    if terminal_prompt_is_local_slash_command(prompt) {
+        // Local slash commands are resolved inside the CLI without a provider
+        // turn or UserPromptSubmit hook, so synthesizing "thinking" here would
+        // strand the pane until a watchdog. Leave the canonical state untouched
+        // (idle stays idle). Callers that also settle todo/pending-prompt
+        // receipts (emit_terminal_prompt_submitted) run those independently of
+        // this emitter, so a deliberately queued "/…" prompt is still marked
+        // delivered — only the premature turn synthesis is suppressed.
+        log_terminal_status_event(
+            "backend.terminal.prompt_submitted_slash_command_no_synthetic_activity",
+            json!({
+                "agent_id": metadata.agent_id.clone(),
+                "agent_kind": metadata.agent_kind.clone(),
+                "instance_id": instance.id,
+                "pane_id": metadata.pane_id.clone(),
+                "prompt_len": prompt.len(),
+                "prompt_source": prompt_source,
+                "status_truth": "slash_command_local_no_turn",
+                "thread_id": thread_id_override
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(metadata.thread_id.as_str()),
+                "workspace_id": metadata.workspace_id.clone(),
+            }),
+        );
         return;
     }
     let now_ms = terminal_now_ms();
@@ -17978,6 +18168,14 @@ fn terminal_activity_hook_payload(
     );
     let hook_key = terminal_activity_hook_name_key(&hook_event_name);
     let provider_session_id = terminal_activity_hook_provider_session_id(event);
+    agent_accounts_observe_terminal_provider_identity(
+        &metadata.pane_id,
+        instance.id,
+        &provider,
+        &hook_event_name,
+        provider_session_id.as_deref(),
+        event,
+    );
     let provider_turn_id = terminal_activity_hook_string(event, &["turn_id"]).or_else(|| {
         terminal_activity_hook_is_prompt_submit_key(&hook_key)
             .then(|| format!("hook-turn-{}-{event_time_ms}", metadata.pane_id))
@@ -19844,11 +20042,79 @@ fn terminal_structured_interaction_matches_resolution(
     resolved_interaction_revision: Option<u64>,
     resolved_request_id: Option<&str>,
 ) -> bool {
-    resolved_interaction_id == Some(interaction.interaction_id.as_str())
+    let exact = resolved_interaction_id == Some(interaction.interaction_id.as_str())
         && resolved_interaction_revision == Some(interaction.revision)
         && resolved_request_id.is_none_or(|request_id| {
             interaction.provider_request_id == request_id || interaction.prompt_id == request_id
+        });
+    if exact {
+        return true;
+    }
+    // Provider-API interactions (OpenCode permission/question prompts) resolve
+    // by polling the provider's pending list from an injected plugin process.
+    // That process can be killed or replaced mid-drain, so its resolution may
+    // name an OLDER queued generation (drifted interaction id/revision) of the
+    // SAME provider request. The provider request id is the durable identity
+    // for these prompts, so an explicitly correlated resolution that matches
+    // it resolves the open interaction despite generation drift. Blocking-hook
+    // interactions (Claude/Codex) keep strict exact-match: their transport is
+    // synchronous and request ids can be reused across generations. An
+    // UNcorrelated resolution (no resolved interaction id) must keep using the
+    // answer-confirmation path, never this fallback.
+    interaction.response_mode == "provider_api"
+        && resolved_interaction_id.is_some()
+        && resolved_request_id.is_some_and(|request_id| {
+            !request_id.trim().is_empty()
+                && (interaction.provider_request_id == request_id
+                    || interaction.prompt_id == request_id)
         })
+}
+
+/// Tool-execution evidence resolves a latched permission prompt: answering a
+/// prompt INSIDE the provider TUI emits no resolution event, but when the
+/// prompt is BOUND to a specific tool use (the hook bridge stamps the
+/// correlated `tool_use_id` as the prompt's request identity) and that SAME
+/// tool use is observed executing, the provider necessarily accepted an
+/// answer. PostToolUse is unconditional proof (a tool result can only exist
+/// after the permission settled); PreToolUse counts only with an origin
+/// strictly AFTER the prompt's own origin, because the same-id PreToolUse
+/// that triggered the prompt can arrive late on the unordered hook transport
+/// (and a replay carries an equal stamp). Unbound prompts never resolve on
+/// tool activity — unrelated tool noise must not melt the UIR latch.
+fn terminal_structured_interaction_tool_evidence_resolves(
+    interaction: &TerminalStructuredInteraction,
+    payload: &TerminalActivityHookPayload,
+) -> bool {
+    if payload.terminal_is_prompting_user {
+        return false;
+    }
+    let hook = terminal_activity_hook_name_key(&payload.hook_event_name);
+    if !matches!(hook.as_str(), "pretooluse" | "posttooluse") {
+        return false;
+    }
+    let Some(tool_use_id) = payload
+        .tool_use_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let bound_to_tool = interaction.provider_request_id == tool_use_id
+        || interaction.prompt_id == tool_use_id
+        || interaction.prompt_metadata.permission_request_id.as_deref() == Some(tool_use_id);
+    if !bound_to_tool {
+        return false;
+    }
+    if hook == "posttooluse" {
+        return true;
+    }
+    let event_origin_ms = if payload.hook_timestamp_ms > 0 {
+        payload.hook_timestamp_ms
+    } else {
+        payload.observed_at_ms
+    };
+    event_origin_ms > 0 && event_origin_ms > interaction.revision
 }
 
 fn terminal_structured_interaction_authoritative_open<'a>(
@@ -19914,7 +20180,7 @@ fn terminal_activity_payload_overlay_open_interaction(
 fn terminal_structured_interaction_reconcile(
     app: &AppHandle,
     event: &Value,
-    payload: &TerminalActivityHookPayload,
+    payload: &mut TerminalActivityHookPayload,
 ) -> bool {
     let state = app.state::<TerminalState>();
     let Ok(mut interactions) = state.terminal_structured_interactions.lock() else {
@@ -20101,6 +20367,7 @@ fn terminal_structured_interaction_reconcile(
         let same_terminal_open = interactions.values().any(|interaction| {
             interaction.pane_id == payload.pane_id && interaction.instance_id == payload.instance_id
         });
+        let mut tool_evidence_resolved = false;
         let removed_ids = interactions
             .iter()
             .filter_map(|(id, interaction)| {
@@ -20119,11 +20386,20 @@ fn terminal_structured_interaction_reconcile(
                             resolved_request_id.as_deref(),
                         )
                 };
+                // Tool-execution evidence proves a TUI-answered prompt even
+                // through blocking transports: the bound tool use is running,
+                // so the provider itself already accepted an answer.
+                let tool_evidence = !provider_error
+                    && terminal_structured_interaction_tool_evidence_resolves(interaction, payload);
                 let lifecycle_can_close = terminal_structured_interaction_lifecycle_can_close(
                     interaction,
                     provider_resolved_interaction,
-                );
-                (same_terminal && same_resolution && lifecycle_can_close).then(|| id.clone())
+                ) || tool_evidence;
+                let closes = same_terminal && same_resolution && lifecycle_can_close;
+                if closes && tool_evidence {
+                    tool_evidence_resolved = true;
+                }
+                closes.then(|| id.clone())
             })
             .collect::<Vec<_>>();
         let explicitly_correlated_resolution =
@@ -20178,6 +20454,26 @@ fn terminal_structured_interaction_reconcile(
                     terminal_codex_hook_trust_is_catalog_request(&interaction.provider_request_id)
                 })
             });
+        // A request-id fallback match can remove a NEWER generation than the
+        // one the resolution named (revision drift), and tool-execution
+        // evidence removes an interaction the event never named at all. The
+        // canonical runtime latched that newest generation, and its
+        // exact-resolution gate only clears an exact identity match — so
+        // normalize the resolution's identity onto the newest interaction
+        // actually removed here.
+        let newest_removed_identity = (provider_resolved_interaction || tool_evidence_resolved)
+            .then(|| {
+                removed_ids
+                    .iter()
+                    .filter_map(|id| interactions.get(id))
+                    .max_by(|left, right| {
+                        left.revision
+                            .cmp(&right.revision)
+                            .then_with(|| left.interaction_id.cmp(&right.interaction_id))
+                    })
+                    .map(|interaction| (interaction.interaction_id.clone(), interaction.revision))
+            })
+            .flatten();
         terminal_structured_interaction_record_superseded(
             &payload.pane_id,
             payload.instance_id,
@@ -20185,6 +20481,29 @@ fn terminal_structured_interaction_reconcile(
         );
         interactions.retain(|id, _| !removed_ids.contains(id));
         drop(interactions);
+        if let Some((resolved_interaction_id, resolved_interaction_revision)) =
+            newest_removed_identity
+        {
+            if payload.event_interaction_id.as_deref() != Some(resolved_interaction_id.as_str())
+                || payload.event_interaction_revision != Some(resolved_interaction_revision)
+            {
+                log_terminal_status_event(
+                    "backend.terminal_structured_interaction.resolution_identity_normalized",
+                    json!({
+                        "instance_id": payload.instance_id,
+                        "pane_id": payload.pane_id,
+                        "reported_interaction_id": payload.event_interaction_id,
+                        "reported_interaction_revision": payload.event_interaction_revision,
+                        "resolved_interaction_id": resolved_interaction_id,
+                        "resolved_interaction_revision": resolved_interaction_revision,
+                    }),
+                );
+                payload.interaction_id = Some(resolved_interaction_id.clone());
+                payload.interaction_revision = Some(resolved_interaction_revision);
+                payload.event_interaction_id = Some(resolved_interaction_id);
+                payload.event_interaction_revision = Some(resolved_interaction_revision);
+            }
+        }
         if resolved_codex_hook_trust {
             terminal_codex_hook_trust_discovery_set(
                 &payload.pane_id,
@@ -20249,6 +20568,57 @@ fn terminal_structured_interaction_remove_terminal_from_map(
         interaction.pane_id != pane_id || interaction.instance_id != instance_id
     });
     removed
+}
+
+fn terminal_structured_interaction_remove_pane_from_map(
+    interactions: &mut HashMap<String, TerminalStructuredInteraction>,
+    pane_id: &str,
+) -> Vec<String> {
+    let removed = interactions
+        .iter()
+        .filter_map(|(id, interaction)| (interaction.pane_id == pane_id).then(|| id.clone()))
+        .collect::<Vec<_>>();
+    interactions.retain(|_, interaction| interaction.pane_id != pane_id);
+    removed
+}
+
+/// CLI-process boundary: when a pane's agent process is closed, restarted, or
+/// replaced, every structured interaction it opened is owned by a process
+/// that no longer exists. Clearing pane-wide (ANY instance) guarantees a
+/// fresh instance in the same pane — including one that reuses a supplied
+/// instance id — can never re-latch a previous process's UIR, and stops
+/// orphaned rows from blocking restart classification or leaking.
+fn terminal_structured_interaction_clear_pane(state: &TerminalState, pane_id: &str) -> usize {
+    let removed_ids = state
+        .terminal_structured_interactions
+        .lock()
+        .ok()
+        .map(|mut interactions| {
+            let instance_ids = interactions
+                .values()
+                .filter(|interaction| interaction.pane_id == pane_id)
+                .map(|interaction| interaction.instance_id)
+                .collect::<HashSet<_>>();
+            for instance_id in instance_ids {
+                terminal_structured_interaction_record_superseded(
+                    pane_id,
+                    instance_id,
+                    interactions.values().filter(|interaction| {
+                        interaction.pane_id == pane_id && interaction.instance_id == instance_id
+                    }),
+                );
+            }
+            terminal_structured_interaction_remove_pane_from_map(&mut interactions, pane_id)
+        })
+        .unwrap_or_default();
+    if !removed_ids.is_empty() {
+        if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
+            for id in &removed_ids {
+                waiters.remove(id);
+            }
+        }
+    }
+    removed_ids.len()
 }
 
 fn terminal_structured_interaction_clear_terminal(
@@ -20350,7 +20720,7 @@ fn apply_terminal_activity_hook_payload(
             }),
         );
     }
-    if terminal_structured_interaction_reconcile(app, event, &payload) {
+    if terminal_structured_interaction_reconcile(app, event, &mut payload) {
         return;
     }
     terminal_activity_hook_reconcile_prompt_state(&mut payload);
@@ -26203,7 +26573,7 @@ async fn terminal_write_inner(
         )
         .await?;
         todo_dispatch_mark_active_for_pane_interrupted(
-            &app,
+            Some(&app),
             &instance.metadata.workspace_id,
             &pane_id,
             "escape_key",
@@ -29318,7 +29688,7 @@ async fn terminal_interrupt_agent_inner(
     )
     .await?;
     let interrupted_todo_count = todo_dispatch_mark_active_for_pane_interrupted(
-        app,
+        Some(app),
         &instance.metadata.workspace_id,
         &pane_id,
         &reason,
@@ -33901,6 +34271,60 @@ notifications = true
     }
 
     #[test]
+    fn slash_command_submit_never_synthesizes_thinking() {
+        // Command-shaped leading tokens (^/[A-Za-z0-9_:-]+(\s|$)) are local
+        // slash commands, with or without arguments or surrounding whitespace.
+        assert!(terminal_prompt_is_local_slash_command("/model"));
+        assert!(terminal_prompt_is_local_slash_command(
+            "/model gpt-5.1-codex high"
+        ));
+        assert!(terminal_prompt_is_local_slash_command("  /clear"));
+        assert!(terminal_prompt_is_local_slash_command("/status\n"));
+        assert!(terminal_prompt_is_local_slash_command("/agents:review"));
+        assert!(terminal_prompt_is_local_slash_command("/mcp-list"));
+        // Bare slashes, path-like tokens, and ordinary prompts are not commands.
+        assert!(!terminal_prompt_is_local_slash_command("/"));
+        assert!(!terminal_prompt_is_local_slash_command("/ hello"));
+        assert!(!terminal_prompt_is_local_slash_command("/foo/bar"));
+        assert!(!terminal_prompt_is_local_slash_command(
+            "please refactor the parser"
+        ));
+        assert!(!terminal_prompt_is_local_slash_command(
+            "halve the pricing numbers"
+        ));
+
+        // For every hook-driven agent the plain-prompt gate opens (an ordinary
+        // prompt would synthesize thinking), but the slash-command guard keeps
+        // the emitter shut so a local command like /model leaves the pane idle.
+        for agent_kind in ["claude", "codex", "opencode"] {
+            let metadata = TerminalInstanceMetadata {
+                agent_kind: agent_kind.to_string(),
+                ..TerminalInstanceMetadata::default()
+            };
+            let base_gate_open = terminal_prompt_submitted_should_emit_synthetic_activity(
+                &metadata,
+                "terminal_write_prompt_submit",
+            );
+            assert!(
+                base_gate_open,
+                "{agent_kind} must qualify for synthetic activity on ordinary prompts",
+            );
+            // Mirror the emitter's combined decision: gate open AND not a slash
+            // command. A /model submit must resolve to "do not synthesize".
+            assert!(
+                !(base_gate_open && !terminal_prompt_is_local_slash_command("/model")),
+                "{agent_kind} /model must not synthesize a turn-started/thinking snapshot",
+            );
+            // A genuine prompt on the same terminal still synthesizes thinking.
+            assert!(
+                base_gate_open
+                    && !terminal_prompt_is_local_slash_command("please refactor the parser"),
+                "{agent_kind} ordinary prompt must still synthesize thinking",
+            );
+        }
+    }
+
+    #[test]
     fn codex_inline_model_command_is_recognized_but_picker_source_is_distinct() {
         let input = format!("/model gpt-5.1-codex high{TERMINAL_ENTER_SEQUENCE}");
         let command = terminal_codex_model_change_request_from_input(&input)
@@ -35832,6 +36256,402 @@ notifications = true
         assert_eq!(emitted_json["permission_mode"], json!("acceptEdits"));
         assert_eq!(emitted_json["manual_prompt_source"], json!("provider-b"));
         assert_eq!(emitted_json["prompt_options"][0]["id"], json!("continue"));
+    }
+
+    fn opencode_provider_api_test_interaction(revision: u64) -> TerminalStructuredInteraction {
+        TerminalStructuredInteraction {
+            interaction_id: format!("uir:opencode:session-1:permission:req-1:{revision}"),
+            revision,
+            pane_id: "pane-1".to_string(),
+            instance_id: 1,
+            provider: "opencode".to_string(),
+            provider_request_id: "req-1".to_string(),
+            prompt_id: "req-1".to_string(),
+            hook_event_name: "PermissionRequest".to_string(),
+            response_mode: "provider_api".to_string(),
+            awaiting_provider_confirmation: false,
+            claimed_option_id: None,
+            options: vec![TerminalActivityHookPromptOption {
+                id: "allow_once".to_string(),
+                label: "Allow once".to_string(),
+                description: None,
+                value: Some("allow_once".to_string()),
+                danger: Some(false),
+            }],
+            permission_suggestions: None,
+            prompt_questions: None,
+            prompt_schema: None,
+            provider_payload: Some(json!({"permission": "bash"})),
+            prompt_metadata: TerminalStructuredInteractionPromptMetadata::default(),
+        }
+    }
+
+    #[test]
+    fn opencode_request_id_resolution_clears_uir_latch_despite_generation_drift() {
+        // The runtime latched the NEWEST plugin generation; the plugin was
+        // killed/replaced mid-drain and its resolution names an OLDER queued
+        // generation of the SAME provider request.
+        let newest = opencode_provider_api_test_interaction(105);
+        let mut active = TerminalRuntimeSnapshot::opened_idle(Some("session-1".to_string()));
+        active.canonical_state = "uir".to_string();
+        active.canonical_badge_label = "input required".to_string();
+        active.canonical_state_seq = 12;
+        active.prompt_state_seq = 6;
+        active.turn_generation = 2;
+        active.turn_active = true;
+        active.active_interaction_id = Some(newest.interaction_id.clone());
+        active.active_interaction_revision = Some(newest.revision);
+        active.interaction_actionable = true;
+
+        let mut resolution = terminal_activity_hook_test_payload(
+            "provider-user-prompt-answered",
+            "thinking",
+            "running",
+            false,
+            Some("session-1"),
+        );
+        resolution.hook_event_name = "PermissionResult".to_string();
+        resolution.permission_request_id = Some("req-1".to_string());
+        resolution.interaction_id =
+            Some("uir:opencode:session-1:permission:req-1:83".to_string());
+        resolution.interaction_revision = Some(83);
+        resolution.event_interaction_id = resolution.interaction_id.clone();
+        resolution.event_interaction_revision = resolution.interaction_revision;
+
+        let resolved =
+            terminal_reduce_canonical_state(&active, &resolution, Some(&newest), false, false);
+        assert_eq!(resolved.canonical_state, "thinking");
+        assert!(resolved.active_interaction_id.is_none());
+        assert!(resolved.active_interaction_revision.is_none());
+        assert!(!resolved.interaction_actionable);
+        assert_eq!(resolved.prompt_state_seq, active.prompt_state_seq + 1);
+
+        // Without request identity the drifted resolution must hold the latch.
+        let mut uncorrelated = resolution.clone();
+        uncorrelated.permission_request_id = None;
+        let held =
+            terminal_reduce_canonical_state(&active, &uncorrelated, Some(&newest), false, false);
+        assert_eq!(held.canonical_state, "uir");
+        assert_eq!(
+            held.active_interaction_id.as_deref(),
+            Some(newest.interaction_id.as_str())
+        );
+        assert_eq!(held.active_interaction_revision, Some(newest.revision));
+
+        // A wrong request identity never resolves the open interaction.
+        let mut wrong_request = resolution.clone();
+        wrong_request.permission_request_id = Some("req-other".to_string());
+        let held_wrong =
+            terminal_reduce_canonical_state(&active, &wrong_request, Some(&newest), false, false);
+        assert_eq!(held_wrong.canonical_state, "uir");
+        assert_eq!(
+            held_wrong.active_interaction_id.as_deref(),
+            Some(newest.interaction_id.as_str())
+        );
+
+        // An overlaid (prompting) frame carries the open interaction's own
+        // request ids; it must never masquerade as a resolution.
+        let mut overlaid = resolution.clone();
+        terminal_activity_payload_overlay_open_interaction(&mut overlaid, &newest);
+        overlaid.event_interaction_id =
+            Some("uir:opencode:session-1:permission:req-1:83".to_string());
+        overlaid.event_interaction_revision = Some(83);
+        let held_overlaid =
+            terminal_reduce_canonical_state(&active, &overlaid, Some(&newest), false, false);
+        assert_eq!(held_overlaid.canonical_state, "uir");
+        assert_eq!(
+            held_overlaid.active_interaction_id.as_deref(),
+            Some(newest.interaction_id.as_str())
+        );
+
+        // Claude blocking-hook interactions stay strict exact-match: the same
+        // drift shape must hold the latch.
+        let mut blocking = newest.clone();
+        blocking.response_mode = "blocking_hook".to_string();
+        blocking.provider = "claude".to_string();
+        let held_blocking =
+            terminal_reduce_canonical_state(&active, &resolution, Some(&blocking), false, false);
+        assert_eq!(held_blocking.canonical_state, "uir");
+        assert_eq!(
+            held_blocking.active_interaction_id.as_deref(),
+            Some(blocking.interaction_id.as_str())
+        );
+
+        // Exact-identity resolutions still settle blocking-hook interactions.
+        let mut exact = resolution.clone();
+        exact.permission_request_id = Some("req-1".to_string());
+        exact.interaction_id = Some(blocking.interaction_id.clone());
+        exact.interaction_revision = Some(blocking.revision);
+        exact.event_interaction_id = Some(blocking.interaction_id.clone());
+        exact.event_interaction_revision = Some(blocking.revision);
+        let resolved_blocking =
+            terminal_reduce_canonical_state(&active, &exact, Some(&blocking), false, false);
+        assert_eq!(resolved_blocking.canonical_state, "thinking");
+        assert!(resolved_blocking.active_interaction_id.is_none());
+    }
+
+    #[test]
+    fn pane_process_boundary_clears_structured_interactions_for_every_instance() {
+        // A pane restart/replacement removes EVERY structured interaction the
+        // pane's previous processes opened — including rows from an older
+        // instance id — so a fresh instance (even one reusing the same
+        // instance id) can never re-latch a dead process's UIR.
+        let mut interactions = HashMap::new();
+        let previous_process = opencode_provider_api_test_interaction(83);
+        let mut older_instance = opencode_provider_api_test_interaction(41);
+        older_instance.instance_id = 7;
+        let mut other_pane = opencode_provider_api_test_interaction(90);
+        other_pane.pane_id = "pane-2".to_string();
+        interactions.insert(
+            previous_process.interaction_id.clone(),
+            previous_process.clone(),
+        );
+        interactions.insert(older_instance.interaction_id.clone(), older_instance);
+        interactions.insert(other_pane.interaction_id.clone(), other_pane.clone());
+
+        let removed =
+            terminal_structured_interaction_remove_pane_from_map(&mut interactions, "pane-1");
+        assert_eq!(removed.len(), 2);
+        assert_eq!(interactions.len(), 1);
+        assert!(interactions.contains_key(&other_pane.interaction_id));
+        // The reused instance id no longer resolves an authoritative open
+        // interaction, so overlay/relatch has nothing to re-derive UIR from.
+        assert!(terminal_structured_interaction_authoritative_open(
+            interactions.values(),
+            "pane-1",
+            previous_process.instance_id,
+        )
+        .is_none());
+        assert!(terminal_structured_interaction_authoritative_open(
+            interactions.values(),
+            "pane-2",
+            other_pane.instance_id,
+        )
+        .is_some());
+
+        // The fresh instance's runtime starts without any interaction latch
+        // and re-derives canonical state from readiness evidence.
+        let fresh = TerminalRuntimeSnapshot::opened_starting(None, "terminal-open");
+        assert_eq!(fresh.canonical_state, "starting");
+        assert!(fresh.active_interaction_id.is_none());
+        assert!(fresh.active_interaction_revision.is_none());
+        assert!(!fresh.interaction_actionable);
+        let ready = terminal_activity_hook_test_payload(
+            "terminal-input-ready",
+            "idle",
+            "ready",
+            true,
+            Some("session-2"),
+        );
+        let projected = terminal_reduce_canonical_state(&fresh, &ready, None, false, false);
+        assert_eq!(projected.canonical_state, "idle");
+        assert!(projected.active_interaction_id.is_none());
+        assert!(!projected.interaction_actionable);
+    }
+
+    fn claude_blocking_tool_test_interaction(
+        tool_use_id: &str,
+        revision: u64,
+    ) -> TerminalStructuredInteraction {
+        TerminalStructuredInteraction {
+            interaction_id: format!("uir:claude:pane-1:1:session-1:{tool_use_id}"),
+            revision,
+            pane_id: "pane-1".to_string(),
+            instance_id: 1,
+            provider: "claude".to_string(),
+            provider_request_id: tool_use_id.to_string(),
+            prompt_id: tool_use_id.to_string(),
+            hook_event_name: "PermissionRequest".to_string(),
+            response_mode: "blocking_hook".to_string(),
+            awaiting_provider_confirmation: false,
+            claimed_option_id: None,
+            options: vec![TerminalActivityHookPromptOption {
+                id: "allow_once".to_string(),
+                label: "Allow once".to_string(),
+                description: None,
+                value: Some("allow_once".to_string()),
+                danger: Some(false),
+            }],
+            permission_suggestions: None,
+            prompt_questions: None,
+            prompt_schema: None,
+            provider_payload: Some(json!({"tool_name": "Edit"})),
+            prompt_metadata: TerminalStructuredInteractionPromptMetadata {
+                permission_request_id: Some(tool_use_id.to_string()),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn tool_evidence_predicate_requires_bound_tool_use_and_post_answer_origin() {
+        let interaction = claude_blocking_tool_test_interaction("toolu-1", 1_000);
+        let mut tool_done = terminal_activity_hook_test_payload(
+            "provider-tool-completed",
+            "tool_completed",
+            "running",
+            false,
+            Some("session-1"),
+        );
+        tool_done.hook_event_name = "PostToolUse".to_string();
+        tool_done.tool_use_id = Some("toolu-1".to_string());
+        tool_done.hook_timestamp_ms = 2_000;
+        assert!(terminal_structured_interaction_tool_evidence_resolves(
+            &interaction,
+            &tool_done,
+        ));
+
+        // Unrelated tool activity never resolves the prompt.
+        let mut other_tool = tool_done.clone();
+        other_tool.tool_use_id = Some("toolu-2".to_string());
+        assert!(!terminal_structured_interaction_tool_evidence_resolves(
+            &interaction,
+            &other_tool,
+        ));
+
+        // Absent tool identity: never guess.
+        let mut no_tool_id = tool_done.clone();
+        no_tool_id.tool_use_id = None;
+        assert!(!terminal_structured_interaction_tool_evidence_resolves(
+            &interaction,
+            &no_tool_id,
+        ));
+
+        // A prompting frame is not evidence of execution.
+        let mut prompting = tool_done.clone();
+        prompting.terminal_is_prompting_user = true;
+        assert!(!terminal_structured_interaction_tool_evidence_resolves(
+            &interaction,
+            &prompting,
+        ));
+
+        // PreToolUse: the same-id event that TRIGGERED the prompt can arrive
+        // late (or replay with an equal stamp); only a strictly later origin
+        // proves a post-answer execution.
+        let mut pre_tool = tool_done.clone();
+        pre_tool.hook_event_name = "PreToolUse".to_string();
+        pre_tool.hook_timestamp_ms = 1_000;
+        assert!(!terminal_structured_interaction_tool_evidence_resolves(
+            &interaction,
+            &pre_tool,
+        ));
+        pre_tool.hook_timestamp_ms = 1_500;
+        assert!(terminal_structured_interaction_tool_evidence_resolves(
+            &interaction,
+            &pre_tool,
+        ));
+        pre_tool.hook_timestamp_ms = 0;
+        pre_tool.observed_at_ms = 0;
+        assert!(!terminal_structured_interaction_tool_evidence_resolves(
+            &interaction,
+            &pre_tool,
+        ));
+    }
+
+    #[test]
+    fn claude_tool_evidence_resolves_tui_answered_permission_and_unblocks_stop() {
+        // Claude permission prompt answered INSIDE the TUI: no resolution
+        // event ever arrives, but the bound tool use starts executing.
+        let interaction = claude_blocking_tool_test_interaction("toolu-1", 1_000);
+        let mut active = TerminalRuntimeSnapshot::opened_idle(Some("session-1".to_string()));
+        active.canonical_state = "uir".to_string();
+        active.canonical_badge_label = "input required".to_string();
+        active.canonical_state_seq = 9;
+        active.prompt_state_seq = 4;
+        active.turn_generation = 2;
+        active.turn_active = true;
+        active.active_interaction_id = Some(interaction.interaction_id.clone());
+        active.active_interaction_revision = Some(interaction.revision);
+        active.interaction_actionable = true;
+
+        let mut tool_done = terminal_activity_hook_test_payload(
+            "provider-tool-completed",
+            "tool_completed",
+            "running",
+            false,
+            Some("session-1"),
+        );
+        tool_done.hook_event_name = "PostToolUse".to_string();
+        tool_done.tool_use_id = Some("toolu-1".to_string());
+        tool_done.hook_timestamp_ms = 2_000;
+        tool_done.turn_generation = active.turn_generation;
+
+        let resolved =
+            terminal_reduce_canonical_state(&active, &tool_done, Some(&interaction), false, false);
+        assert_eq!(resolved.canonical_state, "thinking");
+        assert!(resolved.active_interaction_id.is_none());
+        assert!(resolved.active_interaction_revision.is_none());
+        assert!(!resolved.interaction_actionable);
+        assert_eq!(resolved.prompt_state_seq, active.prompt_state_seq + 1);
+        assert!(resolved.turn_active);
+
+        // A DIFFERENT tool use never melts the latch.
+        let mut other_tool = tool_done.clone();
+        other_tool.tool_use_id = Some("toolu-2".to_string());
+        let held =
+            terminal_reduce_canonical_state(&active, &other_tool, Some(&interaction), false, false);
+        assert_eq!(held.canonical_state, "uir");
+        assert_eq!(
+            held.active_interaction_id.as_deref(),
+            Some(interaction.interaction_id.as_str())
+        );
+        assert_eq!(held.active_interaction_revision, Some(interaction.revision));
+
+        // A late/replayed PreToolUse with the prompt's own origin holds too.
+        let mut replayed_pre_tool = tool_done.clone();
+        replayed_pre_tool.hook_event_name = "PreToolUse".to_string();
+        replayed_pre_tool.hook_timestamp_ms = interaction.revision;
+        let held_replay = terminal_reduce_canonical_state(
+            &active,
+            &replayed_pre_tool,
+            Some(&interaction),
+            false,
+            false,
+        );
+        assert_eq!(held_replay.canonical_state, "uir");
+
+        // Store-normalized form: reconcile already verified the binding,
+        // removed the interaction, and stamped the resolved identity onto the
+        // tool event — the exact latch match must clear without the open row.
+        let mut stamped = tool_done.clone();
+        stamped.event_interaction_id = Some(interaction.interaction_id.clone());
+        stamped.event_interaction_revision = Some(interaction.revision);
+        let resolved_stamped =
+            terminal_reduce_canonical_state(&active, &stamped, None, false, false);
+        assert_eq!(resolved_stamped.canonical_state, "thinking");
+        assert!(resolved_stamped.active_interaction_id.is_none());
+
+        // While the latch is held, a generationless Stop stays refused.
+        let mut stop = terminal_activity_hook_test_payload(
+            "provider-turn-completed",
+            "idle",
+            "completed",
+            true,
+            Some("session-1"),
+        );
+        stop.turn_generation_explicit = false;
+        stop.turn_generation = active.turn_generation;
+        let blocked =
+            terminal_reduce_canonical_state(&active, &stop, Some(&interaction), false, false);
+        assert!(!blocked.completion_accepted);
+        assert_eq!(blocked.canonical_state, "uir");
+
+        // After tool-evidence resolution, the SAME generationless Stop
+        // settles the turn normally.
+        let mut after = active.clone();
+        after.canonical_state = resolved.canonical_state.clone();
+        after.canonical_badge_label = resolved.canonical_badge_label.clone();
+        after.canonical_state_seq = resolved.canonical_state_seq;
+        after.prompt_state_seq = resolved.prompt_state_seq;
+        after.turn_generation = resolved.turn_generation;
+        after.completed_turn_generation = resolved.completed_turn_generation;
+        after.turn_active = resolved.turn_active;
+        after.active_interaction_id = resolved.active_interaction_id.clone();
+        after.active_interaction_revision = resolved.active_interaction_revision;
+        let settled = terminal_reduce_canonical_state(&after, &stop, None, false, false);
+        assert!(settled.completion_accepted);
+        assert_eq!(settled.canonical_state, "idle");
+        assert!(!settled.turn_active);
     }
 
     #[test]
@@ -38734,7 +39554,7 @@ notifications = true
     }
 
     #[test]
-    fn structured_resolution_requires_exact_interaction_revision() {
+    fn structured_resolution_matches_exact_or_provider_request_identity() {
         let interaction = TerminalStructuredInteraction {
             interaction_id: "uir:permission-1".to_string(),
             revision: 8,
@@ -38760,15 +39580,56 @@ notifications = true
             Some(8),
             Some("permission-1"),
         ));
-        assert!(!terminal_structured_interaction_matches_resolution(
+        // Provider-API interactions accept an explicitly correlated
+        // resolution whose provider request id matches, even when the
+        // generation identity drifted (killed/replaced plugin mid-drain).
+        assert!(terminal_structured_interaction_matches_resolution(
             &interaction,
             Some("uir:permission-1"),
             Some(7),
             Some("permission-1"),
         ));
-        assert!(!terminal_structured_interaction_matches_resolution(
+        assert!(terminal_structured_interaction_matches_resolution(
             &interaction,
             Some("uir:permission-old"),
+            Some(8),
+            Some("permission-1"),
+        ));
+        // No request identity: drifted generations stay rejected.
+        assert!(!terminal_structured_interaction_matches_resolution(
+            &interaction,
+            Some("uir:permission-1"),
+            Some(7),
+            None,
+        ));
+        // Wrong request identity never matches.
+        assert!(!terminal_structured_interaction_matches_resolution(
+            &interaction,
+            Some("uir:permission-1"),
+            Some(7),
+            Some("permission-other"),
+        ));
+        // Uncorrelated resolutions (no resolved interaction id) must keep
+        // using the answer-confirmation path, not the request-id fallback.
+        assert!(!terminal_structured_interaction_matches_resolution(
+            &interaction,
+            None,
+            None,
+            Some("permission-1"),
+        ));
+        // Blocking-hook (Claude/Codex) interactions stay strict exact-match.
+        let mut blocking = interaction.clone();
+        blocking.response_mode = "blocking_hook".to_string();
+        blocking.provider = "claude".to_string();
+        assert!(!terminal_structured_interaction_matches_resolution(
+            &blocking,
+            Some("uir:permission-1"),
+            Some(7),
+            Some("permission-1"),
+        ));
+        assert!(terminal_structured_interaction_matches_resolution(
+            &blocking,
+            Some("uir:permission-1"),
             Some(8),
             Some("permission-1"),
         ));

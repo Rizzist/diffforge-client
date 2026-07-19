@@ -276,6 +276,18 @@ function terminalCanonicalCohortFields(fields = {}) {
       "interaction_actionable",
       "interactionActionable",
     ),
+    // WAITING visual cue: what the session is waiting on (shells/subagents/
+    // monitors). Rides the canonical cohort so passive frames keep the latch.
+    background_task_counts: terminalCanonicalOwnField(
+      fields,
+      "background_task_counts",
+      "backgroundTaskCounts",
+    ),
+    background_work_active: terminalCanonicalOwnField(
+      fields,
+      "background_work_active",
+      "backgroundWorkActive",
+    ),
   };
 }
 

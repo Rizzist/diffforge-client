@@ -9,6 +9,7 @@ import {
   TODO_QUEUE_SOURCE_VOICE_PLAN,
   getTodoQueueAutoQueueSourceForSource,
   getTodoQueueDirectTargetTerminalIndexCandidate,
+  normalizeTodoQueueTerminalReceipts,
   getTodoQueueTerminalTargetIdCandidate,
   getTodoQueueLifecycleSourceForSource,
   getTodoQueuePromptEventSourceForSource,
@@ -51,6 +52,52 @@ test("Next todo_create defaults to list-only instead of auto-queueing", () => {
 test("explicit listed status stays list-only for compatible remote commands", () => {
   assert.equal(todoQueueRemoteCommandIsListOnly({ command_kind: "create_task", status: "listed" }), true);
   assert.equal(todoQueueRemoteCommandIsListOnly({ command_kind: "create_task", status: "running" }), false);
+});
+
+test("sessionless restarted terminal does not claim stale running todo receipt", () => {
+  const items = normalizeTodoQueueTerminalReceipts({
+    "cmd-1": {
+      command_id: "cmd-1",
+      item_id: "todo-1",
+      pane_id: "workspace-terminal-ws-0-claude",
+      provider_session_id: "old-provider-session",
+      received_at_ms: 1000,
+      status: "running",
+      text: "Still displayed as history",
+    },
+  }, "workspace-terminal-ws-0-claude", {
+    instance_id: "new-instance",
+    session_id: "",
+  });
+
+  assert.equal(items.length, 1);
+  assert.equal(items[0].is_current, false);
+  assert.equal(items[0].status, "interrupted");
+  assert.equal(items[0].original_status, "running");
+  assert.equal(items[0].stale_active, true);
+});
+
+test("running todo receipt is current only for matching live provider session", () => {
+  const items = normalizeTodoQueueTerminalReceipts({
+    "cmd-1": {
+      command_id: "cmd-1",
+      item_id: "todo-1",
+      pane_id: "workspace-terminal-ws-0-claude",
+      provider_session_id: "live-provider-session",
+      received_at_ms: 1000,
+      status: "running",
+      terminal_instance_id: "instance-1",
+      text: "Live todo",
+    },
+  }, "workspace-terminal-ws-0-claude", {
+    instance_id: "instance-1",
+    session_id: "live-provider-session",
+  });
+
+  assert.equal(items.length, 1);
+  assert.equal(items[0].is_current, true);
+  assert.equal(items[0].status, "running");
+  assert.equal(items[0].stale_active, false);
 });
 
 test("remote control source is preserved through queued auto dispatch", () => {

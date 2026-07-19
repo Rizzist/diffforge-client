@@ -41695,6 +41695,8 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
                     "active_interaction_id": terminal.get("active_interaction_id").cloned().unwrap_or(Value::Null),
                     "active_interaction_revision": terminal.get("active_interaction_revision").cloned().unwrap_or(Value::Null),
                     "interaction_actionable": terminal.get("interaction_actionable").cloned().unwrap_or(Value::Null),
+                    "background_task_counts": terminal.get("background_task_counts").or_else(|| terminal.get("backgroundTaskCounts")).cloned().unwrap_or(Value::Null),
+                    "background_work_active": terminal.get("background_work_active").or_else(|| terminal.get("backgroundWorkActive")).cloned().unwrap_or(Value::Null),
                     "presence_agent_id": cloud_mcp_payload_text(
                         terminal,
                         &["presence_agent_id", "id"],
@@ -44015,6 +44017,7 @@ fn cloud_mcp_agent_chat_status_hook_is_relevant(
             event_type.as_str(),
             "provider_turn_started"
                 | "provider_turn_completed"
+                | "provider_turn_waiting"
                 | "provider_turn_error"
                 | "provider_turn_interrupted"
                 | "provider_permission_requested"
@@ -44029,10 +44032,11 @@ fn cloud_mcp_agent_chat_status_hook_is_relevant(
                 | "awaiting_user"
                 | "needs_input"
                 | "prompting_user"
+                | "background_waiting"
         )
         || matches!(
             state_value,
-            "paused" | "idle" | "error" | "interrupted" | "closed"
+            "paused" | "idle" | "error" | "interrupted" | "closed" | "waiting"
         )
         || matches!(
             turn_status,
@@ -44441,7 +44445,7 @@ fn cloud_mcp_provider_command_catalog(provider: &str) -> Value {
 }
 
 fn cloud_mcp_terminal_canonical_contract(payload: &TerminalActivityHookPayload) -> Value {
-    json!({
+    let mut contract = json!({
         "terminal_state_contract_version": payload.terminal_state_contract_version,
         "canonical_state": payload.canonical_state,
         "canonical_badge_label": payload.canonical_badge_label,
@@ -44453,7 +44457,29 @@ fn cloud_mcp_terminal_canonical_contract(payload: &TerminalActivityHookPayload) 
         "active_interaction_id": payload.active_interaction_id,
         "active_interaction_revision": payload.active_interaction_revision,
         "prompt_state_seq": payload.prompt_state_seq,
-    })
+    });
+    // WAITING visual cue for the dashboard: what the session is waiting ON.
+    // Only attached when evidence exists — absent counts must not zero a
+    // dashboard latch.
+    if let Some(counts) = payload.background_task_counts {
+        if let Some(object) = contract.as_object_mut() {
+            object.insert(
+                "background_task_counts".to_string(),
+                json!({
+                    "shells": counts.shells,
+                    "subagents": counts.subagents,
+                    "monitors": counts.monitors,
+                    "other": counts.other,
+                    "total": counts.total(),
+                }),
+            );
+            object.insert(
+                "background_work_active".to_string(),
+                json!(payload.background_work_active),
+            );
+        }
+    }
+    contract
 }
 
 pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(

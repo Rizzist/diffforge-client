@@ -20,8 +20,86 @@ const TODO_QUEUE_REMOTE_LISTED_STATUSES = new Set([
   "unqueued",
 ]);
 
+const TODO_QUEUE_ACTIVE_RECEIPT_STATUSES = new Set([
+  "accepted",
+  "active",
+  "dispatching",
+  "dispatched",
+  "in-progress",
+  "in_progress",
+  "processing",
+  "running",
+  "sending",
+  "submitted",
+]);
+
 export function normalizeTodoQueueSourceValue(value) {
   return String(value || "").trim();
+}
+
+export function getTodoQueueSessionRefValues(value = {}) {
+  const object = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const refs = new Set();
+  [
+    object.provider_session_id,
+    object.native_session_id,
+    object.session_id,
+  ].forEach((candidate) => {
+    const cleaned = normalizeTodoQueueSourceValue(candidate);
+    if (cleaned) refs.add(cleaned);
+  });
+  return refs;
+}
+
+export function getTodoQueueTerminalPaneIdentity(paneId) {
+  const pane = normalizeTodoQueueSourceValue(paneId);
+  if (!pane) return "";
+  const match = pane.match(/^(.*-\d+)-[a-z][a-z0-9_-]*$/i);
+  return match ? match[1] : pane;
+}
+
+export function normalizeTodoQueueTerminalReceipts(receipts, paneId, options = {}) {
+  const pane = getTodoQueueTerminalPaneIdentity(paneId);
+  const liveSessionId = normalizeTodoQueueSourceValue(options.session_id);
+  const liveInstanceId = normalizeTodoQueueSourceValue(options.instance_id);
+  if (!pane || !receipts || typeof receipts !== "object" || Array.isArray(receipts)) {
+    return [];
+  }
+  return Object.entries(receipts)
+    .map(([key, receipt]) => {
+      if (!receipt || typeof receipt !== "object") return null;
+      if (getTodoQueueTerminalPaneIdentity(receipt.pane_id) !== pane) return null;
+      const receivedAtMs = Number(receipt.received_at_ms) || 0;
+      const updatedAtMs = Number(receipt.updated_at_ms) || receivedAtMs;
+      if (!receivedAtMs && !updatedAtMs) return null;
+      const commandId = normalizeTodoQueueSourceValue(receipt.command_id) || normalizeTodoQueueSourceValue(key);
+      const itemId = normalizeTodoQueueSourceValue(receipt.item_id);
+      const receiptSessions = getTodoQueueSessionRefValues(receipt);
+      const receiptInstanceId = normalizeTodoQueueSourceValue(
+        receipt.terminal_instance_id || receipt.target_terminal_instance_id || receipt.instance_id,
+      );
+      const rawStatus = normalizeTodoQueueSourceValue(receipt.status).toLowerCase() || "queued";
+      const active = TODO_QUEUE_ACTIVE_RECEIPT_STATUSES.has(rawStatus);
+      const sessionMatches = Boolean(liveSessionId && receiptSessions.has(liveSessionId));
+      const instanceKnownStale = Boolean(liveInstanceId && receiptInstanceId && receiptInstanceId !== liveInstanceId);
+      const isCurrent = Boolean(active && sessionMatches && !instanceKnownStale);
+      const staleActive = Boolean(active && !isCurrent);
+      return {
+        command_id: commandId,
+        item_id: itemId,
+        is_current: isCurrent,
+        original_status: staleActive ? rawStatus : "",
+        received_at_ms: receivedAtMs || updatedAtMs,
+        session_id: Array.from(receiptSessions)[0] || liveSessionId,
+        stale_active: staleActive,
+        status: staleActive ? "interrupted" : rawStatus,
+        terminal_instance_id: receiptInstanceId,
+        text: normalizeTodoQueueSourceValue(receipt.text),
+        updated_at_ms: updatedAtMs,
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => right.received_at_ms - left.received_at_ms);
 }
 
 export function getTodoQueueTerminalTargetIdCandidate(item = {}) {

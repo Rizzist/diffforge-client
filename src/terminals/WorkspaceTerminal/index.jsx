@@ -629,6 +629,7 @@ import {
 } from "./threadRuntime.js";
 import { logTerminalStatus } from "../terminalStatusLog.js";
 import {
+  terminalPromptIsLocalSlashCommand,
   terminalPromptSubmittedPayloadIsAuthoritative,
 } from "../terminalPromptSubmission.js";
 
@@ -4802,7 +4803,16 @@ function WorkspaceTerminal({
       textLength: text.length,
       workspace_id: workspace?.id || "",
     });
-    if (latestThread.id === terminalThreadIdRef.current) {
+    // Local CLI slash commands (/model, /clear, …) are resolved inside the
+    // agent without a provider turn or UserPromptSubmit hook, so optimistically
+    // flipping to "thinking" would strand the pane in that state until a
+    // watchdog. The keystrokes are still sent (below) so the CLI runs the
+    // command; only the premature turn synthesis is suppressed. A slash command
+    // that does start a real turn still flips to thinking via the CLI's own
+    // hook evidence, which arrives independently of this optimistic path.
+    const isLocalSlashCommand = terminalAgentUsesActivityHooks(agentId)
+      && terminalPromptIsLocalSlashCommand(text);
+    if (latestThread.id === terminalThreadIdRef.current && !isLocalSlashCommand) {
       markTerminalThreadActivityStatus("thinking", {
         forceNewTurn: true,
         reason: "bigview_thread_submit",
@@ -4843,27 +4853,31 @@ function WorkspaceTerminal({
       throw new Error("This thread cannot send without a live coding-agent TUI.");
     }
 
-    onThreadTerminalLifecycle?.({
-      agent_id: agentId,
-      instance_id: binding.instance_id,
-      message_created_at: startedAt,
-      message_id: promptId,
-      message_source: "bigview-submit",
-      pane_id: binding.pane_id,
-      prompt_epoch: submittedPromptRecord?.prompt_epoch || 0,
-      prompt_event_id: promptId,
-      prompt_event_submitted_at: startedAt,
-      repo_path: latestThread.coordination?.worktree_path || workingDirectory || "",
-      source: "bigview-submit",
-      status: "active",
-      terminal_index: latestThread.terminal_index ?? binding.terminal_index,
-      thread_id: latestThread.id,
-      turn_id: turnId,
-      type: "message-submitted",
-      user_message: text,
-      workspace_id: workspaceId,
-      workspace_name: targetWorkspace?.name || workspace?.name || "",
-    });
+    if (!isLocalSlashCommand) {
+      // `message-submitted` maps to "thinking" in the activity reducer, so it
+      // is suppressed for local slash commands alongside the direct flip above.
+      onThreadTerminalLifecycle?.({
+        agent_id: agentId,
+        instance_id: binding.instance_id,
+        message_created_at: startedAt,
+        message_id: promptId,
+        message_source: "bigview-submit",
+        pane_id: binding.pane_id,
+        prompt_epoch: submittedPromptRecord?.prompt_epoch || 0,
+        prompt_event_id: promptId,
+        prompt_event_submitted_at: startedAt,
+        repo_path: latestThread.coordination?.worktree_path || workingDirectory || "",
+        source: "bigview-submit",
+        status: "active",
+        terminal_index: latestThread.terminal_index ?? binding.terminal_index,
+        thread_id: latestThread.id,
+        turn_id: turnId,
+        type: "message-submitted",
+        user_message: text,
+        workspace_id: workspaceId,
+        workspace_name: targetWorkspace?.name || workspace?.name || "",
+      });
+    }
     logBigViewSyncDiagnosticEvent("bigview.submit.materialized_local_turn", {
       agent_id: agentId,
       bindingInstanceId: binding.instance_id,
@@ -5224,7 +5238,7 @@ function WorkspaceTerminal({
         textLength: text.length,
         workspace_id: workspaceId,
       });
-    } else {
+    } else if (!isLocalSlashCommand) {
       onThreadTerminalLifecycle?.({
         activity_status: "thinking",
         agent_id: agentId,
