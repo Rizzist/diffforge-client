@@ -576,6 +576,12 @@ function mergeDeviceSurfaceBoolean(previous, next, key) {
     if (previous?.registered && !next?.registered && (left === true || left === false)) {
       return left;
     }
+    // A web-identity echo merging into a canonical device row may LIGHT its
+    // surfaces but never darken them: the canonical row's own v2 stamp is
+    // the authority for its badges.
+    if (next?.web_only === true && previous?.web_only !== true && (left === true || left === false)) {
+      return left;
+    }
     return false;
   }
   if (left === true || left === false) return left;
@@ -1215,13 +1221,20 @@ function foldWebOnlyDeviceRows(devicesById, workspacesByDevice) {
     ) {
       return;
     }
+    // Alias-proven folds only for REGISTERED web rows: the server's fold
+    // links (device_aliases / proven web ids) are the presence-v2 authority.
+    // The single-candidate guesses below exist for UNREGISTERED ephemeral
+    // echoes only — a registered standalone web/mobile device is its own
+    // card and must never be swallowed by a heuristic.
     const targetEntry = canonicalEntries.find(([, candidate]) => (
       aliasesIntersect(candidate.device_aliases, device.device_aliases)
-    )) || (canonicalWithWeb.length === 1
-      ? canonicalWithWeb[0]
-      : (!hasRegisteredInventory && canonicalEntries.length === 1)
-        ? canonicalEntries[0]
-        : null);
+    )) || (device.registered
+      ? null
+      : (canonicalWithWeb.length === 1
+        ? canonicalWithWeb[0]
+        : (!hasRegisteredInventory && canonicalEntries.length === 1)
+          ? canonicalEntries[0]
+          : null));
     if (!targetEntry) {
       if (deviceNameIsGeneric(device.device_name)) {
         removeWorkspaceEntriesForDevice(workspacesByDevice, deviceId);
@@ -1243,6 +1256,12 @@ function foldWebOnlyDeviceRows(devicesById, workspacesByDevice) {
       platform_icon: currentTargetDevice.platform_icon,
       platform_label: currentTargetDevice.platform_label,
       serverSeen: Boolean(currentTargetDevice.serverSeen || device.serverSeen),
+      // Folds LIGHT the target's WEB badge, never darken it: an offline
+      // folded row must not drag web_connected=false over a v2-stamped lit
+      // target (presence truth is the stamped item, not the echo).
+      web_connected: device.web_connected === true
+        ? true
+        : currentTargetDevice.web_connected,
       web_only: false,
     });
     devicesById.set(targetDeviceId, {

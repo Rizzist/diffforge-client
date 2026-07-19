@@ -1702,3 +1702,67 @@ test("presence v2 prod shape: linked browser lights the device WEB badge; discon
   assert.equal(darkMac?.native_connected, false);
   assert.equal(darkMac?.web_connected, false);
 });
+
+test("presence v2: registered standalone web/mobile rows are never heuristic-folded", () => {
+  // A REGISTERED web-identity device (mobile browser, second PC's browser) is
+  // its own card. Only alias-proven folds (server fold links) may collapse a
+  // web row into a native device — the single-web-lit-canonical guess must
+  // not swallow registered inventory, and a fold must never DARKEN the
+  // target's lit WEB badge.
+  const rows = buildAccountLiveDeviceRows({
+    deviceLiveState: {
+      account_device_live_state_snapshot: {
+        registered_devices: {
+          items: [
+            {
+              device_id: "desktop-local",
+              device_name: "Syed's MacBook Air",
+              platform: "macos",
+              form_factor: "desktop",
+              client_kind: "desktop",
+              registered: true,
+              status: "connected",
+              native_connected: true,
+              web_connected: true,
+              device_aliases: ["desktop-local", "web-macos-chrome"],
+            },
+            {
+              device_id: "web-macos-chrome",
+              device_name: "macOS web browser",
+              platform: "macos",
+              form_factor: "pc",
+              client_kind: "web",
+              registered: true,
+              status: "connected",
+              native_connected: false,
+              web_connected: false,
+            },
+            {
+              device_id: "web-samsung",
+              device_name: "Samsung Galaxy S23 Ultra",
+              platform: "android",
+              form_factor: "mobile",
+              client_kind: "web",
+              registered: true,
+              status: "offline",
+              native_connected: false,
+              web_connected: false,
+            },
+          ],
+        },
+      },
+    },
+  });
+  const ids = rows.map((row) => row.device_id).sort();
+  assert.deepEqual(ids, ["desktop-local", "web-samsung"]);
+  const mac = rows.find((row) => row.device_id === "desktop-local");
+  assert.equal(mac?.native_connected, true);
+  assert.equal(
+    mac?.web_connected,
+    true,
+    "an alias-proven fold must not darken the stamped WEB badge",
+  );
+  const samsung = rows.find((row) => row.device_id === "web-samsung");
+  assert.equal(samsung?.registered, true);
+  assert.equal(samsung?.web_connected, false);
+});

@@ -2371,10 +2371,32 @@ fn terminal_canonical_stop_correlates(
     };
     // WAITING awaits a FUTURE turn's stop: the background continuation may
     // mint a new turn id with no intermediate event updating the runtime, so
-    // a turn-id mismatch alone must not reject the stop — generation and
-    // session matching stay required.
-    let waiting_awaits_future_turn =
-        terminal_projection_text(&previous.canonical_state, "") == "waiting";
+    // a turn-id mismatch alone must not reject the stop. The exemption is
+    // deliberately narrow: generation equality stays required AND the session
+    // must match EXPLICITLY (both sides present and equal) — a session-less
+    // stray can never settle a waiting turn. Residual (accepted): a delayed
+    // generationless Stop from an OLDER turn of the SAME session is
+    // indistinguishable from the awaited one; hook transport is ordered, so
+    // in practice the next same-session Stop after waiting IS the completion.
+    let explicit_session_match = matches!(
+        (
+            previous
+                .provider_session_id
+                .as_deref()
+                .or(previous.native_session_id.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            payload
+                .provider_session_id
+                .as_deref()
+                .or(payload.native_session_id.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+        ),
+        (Some(previous_session), Some(candidate_session)) if previous_session == candidate_session
+    );
+    let waiting_awaits_future_turn = explicit_session_match
+        && terminal_projection_text(&previous.canonical_state, "") == "waiting";
     generation_matches && session_matches && (turn_matches || waiting_awaits_future_turn)
 }
 
@@ -17697,7 +17719,11 @@ fn terminal_activity_hook_payload(
                         "waiting",
                         "active",
                         "background_waiting",
-                        true,
+                        // input_ready FALSE by contract: the prompt is visibly
+                        // available, but the session is still working — the
+                        // runtime, interrupt guards, dispatch and agent-chat
+                        // sync must all see one consistent busy-shaped state.
+                        false,
                         "cli_hook_stop_background_waiting",
                     )
                 } else {
@@ -37456,7 +37482,7 @@ notifications = true
             event_type,
             activity_status,
             "completed",
-            event_type != "provider-turn-started",
+            event_type == "provider-turn-completed",
             Some("session-waiting"),
         );
         payload.background_work_active = background;
